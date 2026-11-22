@@ -1,0 +1,9 @@
+[package]
+name = "win64-abi"
+description = "Proc-macro shim that maps extern \"win64\" modules to extern \"C\" when compiling natively for non-x86_64 targets (aarch64-apple-darwin)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true

@@ -1,0 +1,34 @@
+# Alan Wake 2 (v1.2.10, Epic) target manifest for the Port Factory.
+
+[app]
+id = "alan-wake-2"
+name = "Alan Wake 2"
+exe = "AlanWake2.exe"
+win_dir = "C:\\Games\\AlanWake2"
+log_name = "AlanWake2.log"
+computer_name = "AW2PORT"
+
+[runtime]
+# Required for statically lifted exe shards + 8 pinned guest DLL lifts.
+preferred_base_retry = true
+# V8 9.4.146.24 ships inside Coherent Gameface; --jitless prevents guest RWX codegen.
+v8_jitless = true
+# Preserve saves from legacy ~/Library/Application Support/AW2Port/drive_c/users/*/AppData/Local/Remedy.
+legacy_remedy_migration = true
+# Builtin physx3_x64.dll stubs PxScene::raycast/sweep/overlap as no-op ret0; use the
+# game's shipping retail PhysX 3.4 DLLs via ARM64 JIT for real terrain/character collision.
+builtin_overrides = "-physx3_x64.dll,-physx3common_x64.dll,-physx3cooking_x64.dll,-pxfoundation_x64.dll"
+# Epic Launcher offline-mode user ID so EOS_EpicAccountId_FromString/IsValid succeeds
+# (required for gamepad InputContext binding) while keeping the Default-Epic-User save folder.
+args = "-epicuserid=Default-Epic-User"
+
+[storage]
+# Optional storage optimizer metadata (`port-factory optimize-assets` / `ios-bundle --optimize-storage`).
+archive_repacker = "aw2-data"
+archive_dir = "data_pack2"
+keep_dlls = ["cohtml.WindowsDesktop.dll", "cohtml_icuuc.dll", "RenoirCore.WindowsDesktop.dll", "MediaDecoders.WindowsDesktop.dll", "v8.dll", "v8_libbase.dll", "v8_libplatform.dll", "PhysX3_x64.dll", "PhysX3Common_x64.dll", "PhysX3Cooking_x64.dll", "PxFoundation_x64.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll"]
+
+[ios]
+# First-launch iOS graphics defaults: Metal 4 FX Temporal (800x368 -> 1600x736, 2.0x)
+# with Low GI/SDF/SSAO/SSR/foliage for smooth Apple Silicon mobile FPS & <6 GiB Jetsam headroom.
+seed_file = "ios-renderer.ini -> AppData/Local/Remedy/AlanWake2/renderer.ini"

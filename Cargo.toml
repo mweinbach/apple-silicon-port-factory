@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/win64-abi",
+    "crates/bink2-codec",
+    "games/alan-wake-2/crates/aw2-data",
+    "crates/dxil-metal",
+    "crates/pe-image",
+    "crates/port-factory",
+    "crates/win32-rt",
+    "crates/x86-runtime",
+    "games/alan-wake-2/crates/aw2-game",
+    "crates/port-loader",
+    "crates/wwise-audio",
+    "crates/d3d12-metal",
+    "crates/d3d12-replay",
+]
+exclude = ["third_party"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mweinbach/apple-silicon-port-factory"
+description = "Experimental clean-room Windows x86-64 to Apple Silicon / Metal 4 game porting runtime and toolkit"
+publish = false
+
+[workspace.dependencies]
+win64-abi = { path = "crates/win64-abi" }
+bink2-codec = { path = "crates/bink2-codec" }
+aw2-data = { path = "games/alan-wake-2/crates/aw2-data" }
+# default-features = false: the loader-side D3D12 layer must not pull in the CLI/aw2-data
+# (`tools`); tools that want it (the CLI itself) enable it explicitly.
+dxil-metal = { path = "crates/dxil-metal", default-features = false }
+pe-image = { path = "crates/pe-image" }
+port-factory = { path = "crates/port-factory" }
+win32-rt = { path = "crates/win32-rt" }
+x86-runtime = { path = "crates/x86-runtime" }
+aw2-game = { path = "games/alan-wake-2/crates/aw2-game", default-features = false }
+d3d12-metal = { path = "crates/d3d12-metal" }
+wwise-audio = { path = "crates/wwise-audio" }
+goblin = "0.9"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel"] }
+naga = { version = "30.0.1", default-features = false, features = ["spv-in", "wgsl-in", "msl-out"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+# Address-keyed park/unpark: implements CRITICAL_SECTION / SRWLOCK / CONDITION_VARIABLE /
+# WaitOnAddress whose state must live inside Windows-owned memory (win32-rt).
+parking_lot_core = "0.9"
+# Client-side TLS 1.2 / 1.3 engine for Windows Schannel (secur32.dll) with embedded WebPKI roots
+# (zero external dylibs, 100% SSD-portable across Apple Silicon Macs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[profile.dev]
+opt-level = 1
+panic = "abort"
+incremental = false
+
+[profile.dev.package.aw2-game]
+# With all 8 guest DLLs lifted full-image alongside AlanWake2.exe (~353k entries),
+# opt-level = 0 produces a ~2.0 GiB Mach-O (__text 1.93 GiB, __eh_frame > 16 MiB),
+# hitting macOS's 2 GiB CS_CodeDirectory limit. opt-level = 1 across 256 CGUs keeps
+# the binary ~550 MiB and __eh_frame compact.
+opt-level = 1
+debug = 0
+codegen-units = 256
+
+[profile.test]
+incremental = false
+
+[profile.test.package.aw2-game]
+opt-level = 1
+debug = 0
+codegen-units = 256
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[profile.release.package.aw2-game]
+# aw2-game holds the emulator/JIT runtime, the hand-written ns replacements and the
+# lifted shards. At opt-level 0 trivial helpers (f32::from_bits, read_unaligned,
+# Range::next) stay real calls: gameplay ran at ~11-15 fps. opt-level 2 with 256
+# codegen units builds in ~8.5 min (vs ~6 min) and runs gameplay at ~50 fps.
+opt-level = 2
+debug = 0
+codegen-units = 256

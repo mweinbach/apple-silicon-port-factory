@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required on iOS for large 64-bit Windows PE virtual address spaces and D3D12 heaps -->
+    <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+    <true/>
+    <!-- Raises per-app jetsam memory ceiling on iPadOS / modern iPhone Pro devices -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>

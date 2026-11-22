@@ -1,0 +1,50 @@
+[package]
+name = "win32-rt"
+description = "Rust implementations of the Windows APIs imported by AlanWake2.exe and its bundled DLLs (hybrid runtime)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Optional AW2 statically-linked Wwise 2022.1 hook/oracle bridge (`audio/{akrec,akoracle,harness,aktrace}`).
+wwise-bridge = ["dep:wwise-audio", "wwise-audio?/northlight"]
+
+[dependencies]
+win64-abi.workspace = true
+bink2-codec.workspace = true
+wwise-audio = { workspace = true, optional = true }
+pe-image.workspace = true
+libc.workspace = true
+log.workspace = true
+parking_lot_core.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+
+# Apple platform backends (macOS + iOS): QuartzCore (`CAMetalLayer`),
+# Foundation, D3D12->Metal 4, GameController + CoreHaptics.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSDate", "NSRunLoop", "NSNotification", "NSObject", "NSArray", "NSThread", "NSValue", "NSProcessInfo"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-core-foundation"] }
+# D3D12 -> Metal (src/d3d12, src/dxgi): COM shims over d3d12-metal.
+block2 = "0.6"
+d3d12-metal.workspace = true
+dxil-metal = { workspace = true, default-features = false }
+# XInput / raw mouse (src/misc/xinput1_4.rs, src/macos/gamepad.rs):
+# GameController.framework (Xbox/DualSense/MFi pads, GCMouse raw deltas) and
+# CoreHaptics for rumble through GCDeviceHaptics.
+objc2-game-controller = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-haptics", "GCController", "GCDevice", "GCDeviceBattery", "GCDeviceHaptics", "GCExtendedGamepad", "GCControllerElement", "GCControllerButtonInput", "GCControllerAxisInput", "GCControllerDirectionPad", "GCPhysicalInputProfile", "GCMouse", "GCMouseInput", "GCDeviceCursor"] }
+objc2-core-haptics = { version = "0.3", default-features = false, features = ["std", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
+
+# macOS-only AppKit window-system backend (NSApplication, NSWindow, NSView,
+# NSEvent, NSScreen, NSPasteboard). iOS uses UIKit/host-surface binding instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-quartz-core", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSFont", "NSProgressIndicator", "NSResponder", "NSRunningApplication", "NSTextField", "NSWindow", "NSView", "NSEvent", "NSScreen", "NSCursor", "NSGraphics", "NSColor", "NSTrackingArea", "NSMenu", "NSMenuItem", "NSImage", "NSPasteboard", "NSText", "NSGraphicsContext"] }
+
+# Real-controller test: needs the process main thread for AppKit /
+# GameController, hence no libtest harness. Skips unless AW2_TEST_GAMEPAD=1.
+[[test]]
+name = "gamepad_device"
+harness = false

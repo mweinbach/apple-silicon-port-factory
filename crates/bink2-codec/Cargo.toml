@@ -1,0 +1,9 @@
+[package]
+name = "bink2-codec"
+description = "Clean-room native Rust Bink 2 (KB2f..KB2n) decoder and hardware HEVC (KB2v) container codec"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+log.workspace = true

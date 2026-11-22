@@ -1,0 +1,40 @@
+[package]
+name = "dxil-metal"
+description = "DXIL -> Metal shader pipeline via Apple's Metal Shader Converter (libmetalirconverter.dylib, dlopen'd)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+# `tools` enables the `dxil-metal` CLI (prewarm), which reads AW2's .binrfx bundles via
+# aw2-data. Default enables only the universal Metal 4 pipeline (no game-data dependency).
+default = ["metal"]
+tools = ["dep:aw2-data"]
+# `pso_cache`: Metal 4 pipeline-state cache (MTL4Compiler + MTL4Archive). The D3D12 layer enables it.
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+
+[dependencies]
+log.workspace = true
+naga.workspace = true
+aw2-data = { workspace = true, optional = true }
+objc2 = { version = "0.6", optional = true, features = ["exception"] }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject", "NSURL", "NSProcessInfo"] }
+
+[dev-dependencies]
+aw2-data.workspace = true
+# GPU tests (tests/gpu_*.rs) run converted shaders on Metal directly.
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject", "NSURL"] }
+
+[[bin]]
+name = "dxil-metal"
+path = "src/bin/dxil-metal.rs"
+required-features = ["tools"]
+
+# Out-of-process converter worker spawned by the x86_64 loader (build it natively: `cargo build
+# -p dxil-metal --bin dxil-metald`). Needs no game data.
+[[bin]]
+name = "dxil-metald"
+path = "src/bin/dxil-metald.rs"

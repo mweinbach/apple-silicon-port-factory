@@ -1,0 +1,23 @@
+[package]
+name = "d3d12-metal"
+description = "D3D12 semantics on Metal: arch-neutral core types, Metal 4 backend, call trace (used by the hybrid runtime's COM layer and by native replay tools)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+log.workspace = true
+dxil-metal = { workspace = true, default-features = false, features = ["metal"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject", "NSURL"] }
+objc2-metal = "0.3"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-core-foundation", "objc2-metal"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+
+[dev-dependencies]
+aw2-data.workspace = true

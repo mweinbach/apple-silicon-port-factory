@@ -1,0 +1,16 @@
+# Overwatch 2 (Steam AppID 2357570) target manifest for the Port Factory.
+# Runs on the thin universal `port-runner` binary (~17 MB, zero AW2 shards).
+
+[app]
+id = "overwatch"
+name = "Overwatch"
+exe = "Overwatch.exe"
+win_dir = "C:\\Games\\Overwatch"
+log_name = "Overwatch.log"
+computer_name = "WIN64PORT"
+steam_app_id = "2357570"
+
+[runtime]
+preferred_base_retry = false
+v8_jitless = false
+legacy_remedy_migration = false

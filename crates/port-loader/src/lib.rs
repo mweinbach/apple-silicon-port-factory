@@ -1,0 +1,1603 @@
+//! `port-loader`: universal native ARM64 Windows x86-64 PE loader & runtime host
+//! (`port-runner`), with optional per-game decompilation target support (`aw2-loader`
+//! under `--features aw2`).
+//!
+//! Maps Windows x86-64 PE executables and DLLs natively on `aarch64-apple-darwin`
+//! (or legacy `x86_64` under Rosetta 2). Windows APIs are provided by `win32-rt`;
+//! bundled third-party DLLs from the game directory are loaded as PEs and executed via
+//! `x86-runtime`'s ARM64/NEON block JIT and persistent `.aot` cache.
+#![cfg_attr(test, allow(linker_messages))]
+
+win64_abi::win64_mods! {
+    #[cfg(feature = "aw2-core")]
+    mod aw2_hooks;
+    mod builtin_image;
+    mod hooks;
+    mod live_ctl;
+    mod loader;
+    mod signals;
+    mod symbols;
+    mod target;
+    mod thunks;
+}
+
+pub mod ios_host;
+
+pub fn run_cli() {
+    init_boot_log();
+    if let Err(e) = real_main() {
+        let msg = format!("port-runner fatal startup error: {e:#}");
+        boot_log_line(&msg);
+        eprintln!("{msg}");
+        write_last_crash(&msg);
+        show_startup_error_alert(&msg);
+        std::process::exit(1);
+    }
+}
+
+struct Args {
+    manifest_path: Option<std::path::PathBuf>,
+    game_dir: std::path::PathBuf,
+    exe: String,
+    pe_path: Option<std::path::PathBuf>,
+    drive_c_dir: Option<std::path::PathBuf>,
+    extra_mounts: Vec<String>,
+    trace: bool,
+    no_run: bool,
+    no_avx: bool,
+    no_builtin_overrides: bool,
+    no_aw2_hooks: bool,
+    ops_report: bool,
+    list_exports: bool,
+    call_export: Option<String>,
+    prewarm_aot: bool,
+    prewarm_shaders: bool,
+    emit_static_o: Option<std::path::PathBuf>,
+    aot_to_o: Option<std::path::PathBuf>,
+    out_path: Option<std::path::PathBuf>,
+    static_platform: String,
+    aot_max_funcs: usize,
+    aot_dir: Option<std::path::PathBuf>,
+    audio_harness: bool,
+    diff_test: bool,
+    game_args: Vec<String>,
+    explicit_game_dir: bool,
+    explicit_exe: bool,
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-aw2-hooks] [--no-avx] [--audio-harness] [--diff-test] [-- ARGS...]\n\
+         \n\
+           --manifest FILE         declarative game.toml manifest (default: auto-discover ../Resources/game.toml or $PORT_MANIFEST)\n\
+           --game-dir DIR          game/library directory (default: bundled ../Resources/Game, $PORT_GAME_DIR / $AW2_GAME_DIR, or current dir)\n\
+           --exe NAME              executable or DLL inside the game dir\n\
+           --pe PATH               direct path to any Windows x86-64 .exe or .dll file\n\
+           --drive-c DIR           custom Windows C:\\ prefix directory (default: $TRANSLATOR_HOME / $AW2_DRIVE_C)\n\
+           --mount WIN=HOST        mount a Windows drive or folder to a host directory (repeatable, or $PORT_MOUNTS / $AW2_MOUNTS)\n\
+           --prewarm-aot           offline-precompile relocatable ARM64 .aot block caches for all mapped PEs and exit\n\
+           --prewarm-shaders       precompile recorded Tier-1 shaders & Metal 4 PSOs for this GPU/OS build and exit\n\
+           --emit-static-o DIR     offline-compile all mapped PEs into signed-ready ARM64 Mach-O .aot.o objects in DIR and exit\n\
+           --aot-to-o FILE.aot     convert an existing v5 .aot cache file into an ARM64 Mach-O .o (use with --out FILE.o)\n\
+           --out PATH              output path for --aot-to-o\n\
+           --static-platform PLAT  Mach-O platform for --emit-static-o / --aot-to-o: ios (default), ios-sim, macos\n\
+           --aot-max-funcs N       cap discovered PE function roots per module during --prewarm-aot (0 = all)\n\
+           --aot-dir DIR           override AOT block-cache directory ($PORT_AOT_DIR / $AW2_DLL_AOT_DIR)\n\
+           --ops-report            analyze target PE against the x86-64 -> ARM64 ops database\n\
+           --list-exports          list exported functions of the target PE and exit\n\
+           --call-export SYM       initialize target DLL/EXE and invoke export SYM (or #ORD) with optional integer/string args after `--`\n\
+           --no-builtin-overrides  load real PE DLLs from directory instead of builtin overrides ($PORT_BUILTIN_OVERRIDES=0)\n\
+           --no-aw2-hooks          do not apply optional AW2 VA replacement hooks (automatic for non-AW2 binaries)\n\
+           --trace                 log every call through an import (target `trace`)\n\
+           --no-run                map + resolve only; report unresolved imports and exit\n\
+           --no-avx                do not re-exec with ROSETTA_ADVERTISE_AVX=1\n\
+           --audio-harness         (aw2 feature) after CRT init, replace WinMain with the Wwise audio harness\n\
+           --diff-test             run differential tests (original vs Rust) and exit\n\
+         \n\
+         Env vars: PORT_AOT_DIR, PORT_BUILTIN_OVERRIDES, PORT_HEADLESS, PORT_SYMBOLS, PORT_AOT_DYLIB (legacy AW2_* aliases supported)\n\
+         Logging:  RUST_LOG (default `info`), e.g. RUST_LOG=info,stub=warn,trace=info"
+    );
+    std::process::exit(2);
+}
+
+fn default_game_dir() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("PORT_GAME_DIR")
+        .or_else(|| std::env::var_os("AW2_GAME_DIR"))
+        .filter(|p| !p.is_empty())
+    {
+        return p.into();
+    }
+    if let Some(bundled) = target::TargetManifest::bundled_game_dir() {
+        return bundled;
+    }
+    std::path::PathBuf::from(".")
+}
+
+fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
+    let mut a = Args {
+        manifest_path: None,
+        game_dir: default_game_dir(),
+        exe: if cfg!(feature = "aw2-core") { "AlanWake2.exe".into() } else { String::new() },
+        pe_path: None,
+        drive_c_dir: None,
+        extra_mounts: Vec::new(),
+        trace: false,
+        no_run: false,
+        no_avx: false,
+        no_builtin_overrides: false,
+        no_aw2_hooks: false,
+        ops_report: false,
+        list_exports: false,
+        call_export: None,
+        prewarm_aot: false,
+        prewarm_shaders: false,
+        emit_static_o: None,
+        aot_to_o: None,
+        out_path: None,
+        static_platform: "ios".into(),
+        aot_max_funcs: 0,
+        aot_dir: None,
+        audio_harness: std::env::var_os("AW2_AUDIO_HARNESS").is_some_and(|v| v == "1"),
+        diff_test: false,
+        game_args: Vec::new(),
+        explicit_game_dir: false,
+        explicit_exe: false,
+    };
+    let mut it = iter.into_iter().peekable();
+    // `cargo runner -- ...` / `cargo loader -- ...` passes a leading `--` through; ignore it.
+    if it.peek().is_some_and(|s| s == "--") {
+        it.next();
+    }
+    while let Some(s) = it.next() {
+        match s.as_str() {
+            "--manifest" => {
+                a.manifest_path = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--game-dir" => {
+                a.game_dir = it.next().unwrap_or_else(|| usage()).into();
+                a.explicit_game_dir = true;
+            }
+            "--exe" => {
+                a.exe = it.next().unwrap_or_else(|| usage());
+                a.explicit_exe = true;
+            }
+            "--pe" => {
+                let p = std::path::PathBuf::from(it.next().unwrap_or_else(|| usage()));
+                if !a.explicit_game_dir {
+                    if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        a.game_dir = parent.to_path_buf();
+                    } else {
+                        a.game_dir = std::path::PathBuf::from(".");
+                    }
+                }
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    a.exe = name.to_string();
+                    a.explicit_exe = true;
+                }
+                a.pe_path = Some(p);
+            }
+            "--drive-c" => {
+                a.drive_c_dir = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--mount" => {
+                a.extra_mounts.push(it.next().unwrap_or_else(|| usage()));
+            }
+            "--prewarm-aot" => a.prewarm_aot = true,
+            "--prewarm-shaders" => a.prewarm_shaders = true,
+            "--emit-static-o" => {
+                a.emit_static_o = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--aot-to-o" => {
+                a.aot_to_o = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--out" => {
+                a.out_path = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--static-platform" => {
+                a.static_platform = it.next().unwrap_or_else(|| usage());
+            }
+            "--aot-max-funcs" => {
+                let raw = it.next().unwrap_or_else(|| usage());
+                a.aot_max_funcs = raw.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --aot-max-funcs value {raw:?}");
+                    usage()
+                });
+            }
+            "--aot-dir" => {
+                a.aot_dir = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
+            "--trace" => a.trace = true,
+            "--no-run" => a.no_run = true,
+            "--no-avx" => a.no_avx = true,
+            "--no-builtin-overrides" => a.no_builtin_overrides = true,
+            "--no-aw2-hooks" => a.no_aw2_hooks = true,
+            "--ops-report" => a.ops_report = true,
+            "--list-exports" => a.list_exports = true,
+            "--call-export" => a.call_export = Some(it.next().unwrap_or_else(|| usage())),
+            "--audio-harness" => a.audio_harness = true,
+            "--diff-test" => a.diff_test = true,
+            "--" => {
+                a.game_args.extend(it.by_ref());
+            }
+            "-h" | "--help" => usage(),
+            s if s.starts_with("-psn_") => {}
+            "-NSDocumentRevisionsDebugMode" => {
+                let _ = it.next();
+            }
+            other => {
+                eprintln!("unknown argument {other:?}");
+                usage()
+            }
+        }
+    }
+    a
+}
+
+/// Rosetta only advertises AVX/AVX2/FMA/BMI in CPUID when this variable is
+/// set at process start, so re-exec ourselves with it. Only probes `0x140000000`
+/// ASLR retry when `preferred_base_retry` is true (e.g. AW2 with absolute-VA lifts).
+fn ensure_avx_env(args: &Args, preferred_base_retry: bool) {
+    if preferred_base_retry {
+        unsafe {
+            let p = libc::mmap(
+                0x1_4000_0000 as *mut libc::c_void,
+                0x0400_0000,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            if p != libc::MAP_FAILED {
+                libc::munmap(p, 0x0400_0000);
+            }
+            let tries: u32 = std::env::var("AW2_ASLR_RETRY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            boot_log_line(&format!(
+                "mmap probe for 0x140000000 returned 0x{:x} (AW2_ASLR_RETRY={tries})",
+                p as usize
+            ));
+            if p as usize != 0x1_4000_0000 {
+                if tries < 16 {
+                    if let Ok(exe) = std::env::current_exe() {
+                        boot_log_line(&format!(
+                            "0x140000000 occupied (got 0x{:x}), re-execing ({}/16): {}",
+                            p as usize,
+                            tries + 1,
+                            exe.display()
+                        ));
+                        use std::os::unix::process::CommandExt;
+                        let err = std::process::Command::new(exe)
+                            .args(std::env::args_os().skip(1))
+                            .env("AW2_ASLR_RETRY", (tries + 1).to_string())
+                            .exec();
+                        boot_log_line(&format!("re-exec with AW2_ASLR_RETRY failed: {err}"));
+                    }
+                } else {
+                    boot_log_line("warning: 0x140000000 still occupied after 16 ASLR retries; continuing with relocated base");
+                }
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::os::unix::process::CommandExt;
+        if args.no_avx || std::env::var_os("ROSETTA_ADVERTISE_AVX").is_some() {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        boot_log_line("re-execing x86_64 binary with ROSETTA_ADVERTISE_AVX=1");
+        let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("ROSETTA_ADVERTISE_AVX", "1").exec();
+        eprintln!("warning: re-exec with ROSETTA_ADVERTISE_AVX=1 failed: {err}");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = args;
+}
+
+fn translated() -> bool {
+    let mut v: libc::c_int = 0;
+    let mut sz = std::mem::size_of::<libc::c_int>();
+    let name = std::ffi::CString::new("sysctl.proc_translated").unwrap();
+    unsafe { libc::sysctlbyname(name.as_ptr(), &mut v as *mut _ as *mut libc::c_void, &mut sz, std::ptr::null_mut(), 0) == 0 && v == 1 }
+}
+
+fn setup_filesystem(game_dir: &std::path::Path, game_win_dir: &str, args: &Args) -> anyhow::Result<()> {
+    use win32_rt::path;
+    let translator_root = path::init_translator_mounts(args.drive_c_dir.as_deref())?;
+    path::add_mount(game_win_dir, game_dir);
+    if let Ok(env_mounts) = std::env::var("PORT_MOUNTS").or_else(|_| std::env::var("AW2_MOUNTS")) {
+        for spec in env_mounts.split(';').filter(|s| !s.trim().is_empty()) {
+            let (win, host) = path::add_mount_spec(spec).map_err(|e| anyhow::anyhow!(e))?;
+            log::info!("mount {win} -> {}", host.display());
+        }
+    }
+    for spec in &args.extra_mounts {
+        let (win, host) = path::add_mount_spec(spec).map_err(|e| anyhow::anyhow!(e))?;
+        log::info!("mount {win} -> {}", host.display());
+    }
+    path::set_cwd(game_win_dir);
+    log::info!("Translator root -> {}", translator_root.display());
+    log::info!("Z:\\ -> /");
+    log::info!("{game_win_dir} -> {}", game_dir.display());
+    Ok(())
+}
+
+/// Exe image range for debuggers (tools/debug/lldb_aw2.py reads these).
+#[no_mangle]
+pub static AW2_EXE_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static AW2_EXE_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Set to non-zero by the debugger (tools/lldb.sh) to release
+/// `AW2_WAIT_DEBUGGER`.
+#[no_mangle]
+pub static AW2_DEBUGGER_GO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Debugger hook (tools/lldb.sh): called once the exe and its static
+/// imports are mapped and replacement hooks/probes are installed, before any
+/// Windows code (DLL init, TLS callbacks, entry point) runs.
+///
+/// With `AW2_WAIT_DEBUGGER=<seconds>` the loader waits here (polling
+/// `AW2_DEBUGGER_GO`, at most that long) so a debugger can attach to the
+/// running process and set breakpoints by exe VA. Attaching to a running
+/// process is the supported way: launching under lldb wedged Rosetta's
+/// oahd once (see tools/README.md, Debugging).
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn aw2_debug_image_mapped(exe_base: usize, exe_size: usize) {
+    use std::sync::atomic::Ordering;
+    AW2_EXE_BASE.store(exe_base, Ordering::SeqCst);
+    AW2_EXE_SIZE.store(exe_size, Ordering::SeqCst);
+    let Some(secs) = std::env::var("PORT_WAIT_DEBUGGER")
+        .or_else(|_| std::env::var("AW2_WAIT_DEBUGGER"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let pid = std::process::id();
+    log::warn!("WAIT_DEBUGGER: waiting up to {secs} s for a debugger: pid {pid} (tools/lldb.sh -p {pid})");
+    eprintln!("port-runner: waiting for debugger, pid {pid}");
+    let t0 = std::time::Instant::now();
+    while AW2_DEBUGGER_GO.load(Ordering::SeqCst) == 0 && t0.elapsed().as_secs() < secs {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if AW2_DEBUGGER_GO.load(Ordering::SeqCst) == 0 {
+        log::warn!("WAIT_DEBUGGER: no debugger after {secs} s, continuing");
+    }
+}
+
+fn raise_fd_limit() {
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            let old_cur = rl.rlim_cur;
+            let target: libc::rlim_t = 65536;
+            let new_cur = if rl.rlim_max == libc::RLIM_INFINITY {
+                target.max(old_cur)
+            } else {
+                target.min(rl.rlim_max).max(old_cur)
+            };
+            if new_cur > old_cur {
+                rl.rlim_cur = new_cur;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+                    log::info!("RLIMIT_NOFILE raised: {old_cur} -> {new_cur} (max={})", rl.rlim_max);
+                } else {
+                    log::warn!("setrlimit(RLIMIT_NOFILE, {new_cur}) failed: errno={}", *libc::__error());
+                }
+            } else {
+                log::info!("RLIMIT_NOFILE: cur={old_cur} max={}", rl.rlim_max);
+            }
+        }
+    }
+}
+
+static BOOT_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static BOOT_LOG_TEE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+fn log_dir_path() -> std::path::PathBuf {
+    if let Some(d) = std::env::var_os("PORT_LOG_DIR")
+        .or_else(|| std::env::var_os("AW2_LOG_DIR"))
+        .filter(|s| !s.is_empty())
+    {
+        return d.into();
+    }
+    let dir_name = win32_rt::config::app_config().log_dir_name;
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        return home.join("Library/Logs").join(&dir_name);
+    }
+    std::path::PathBuf::from("/tmp").join(&dir_name)
+}
+
+fn sysctl_str(name: &str) -> String {
+    let Ok(cname) = std::ffi::CString::new(name) else { return String::new() };
+    let mut buf = [0u8; 256];
+    let mut sz = buf.len();
+    unsafe {
+        if libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, &mut sz, std::ptr::null_mut(), 0) == 0 && sz > 0 {
+            let end = buf[..sz].iter().position(|&b| b == 0).unwrap_or(sz);
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+    }
+    String::new()
+}
+
+pub fn boot_log_line(msg: &str) {
+    use std::io::Write;
+    let Some(path) = BOOT_LOG_PATH.get() else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let _ = writeln!(f, "[{secs:.3} pid={} boot] {msg}", std::process::id());
+        let _ = f.flush();
+    }
+}
+
+fn write_last_crash(msg: &str) {
+    let dir = log_dir_path();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("last-crash.txt"), format!("{msg}\n"));
+}
+
+fn is_headless_env() -> bool {
+    std::env::var("PORT_HEADLESS")
+        .or_else(|_| std::env::var("AW2_HEADLESS"))
+        .is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+}
+
+fn show_startup_error_alert(msg: &str) {
+    if cfg!(target_os = "ios")
+        || is_headless_env()
+        || std::env::args().any(|a| {
+            matches!(
+                a.as_str(),
+                "--no-run"
+                    | "--diff-test"
+                    | "--prewarm-aot"
+                    | "--prewarm-shaders"
+                    | "--emit-static-o"
+                    | "--aot-to-o"
+                    | "--list-exports"
+                    | "--ops-report"
+            )
+        })
+    {
+        return;
+    }
+    let app_name = win32_rt::config::app_config().app_name;
+    let log_path = BOOT_LOG_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| log_dir_path().join("port-runner.log"));
+    let body = format!(
+        "{msg}\n\nLog file:\n{}",
+        log_path.display()
+    );
+    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    let title = format!("{app_name} Failed to Start").replace('"', "\\\"");
+    let script = format!(
+        "display alert \"{title}\" message \"{escaped}\" as critical buttons {{\"OK\"}} default button \"OK\""
+    );
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .status();
+}
+
+fn init_boot_log() {
+    let manifest = target::TargetManifest::discover(None);
+    let log_file_name = manifest
+        .as_ref()
+        .and_then(|m| m.log_name.clone())
+        .unwrap_or_else(|| {
+            if cfg!(feature = "aw2-core") {
+                "AlanWake2.log".to_string()
+            } else {
+                "port-runner.log".to_string()
+            }
+        });
+    let log_dir = log_dir_path();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(&log_file_name);
+    let prev_name = format!("{}.prev.log", log_file_name.trim_end_matches(".log"));
+    let is_retry = std::env::var_os("PORT_ASLR_RETRY").is_some()
+        || std::env::var_os("AW2_ASLR_RETRY").is_some()
+        || std::env::var_os("PORT_LOG_APPEND").is_some()
+        || std::env::var_os("AW2_LOG_APPEND").is_some();
+
+    if !is_retry {
+        if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 0) {
+            let _ = std::fs::copy(&log_path, log_dir.join(prev_name));
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!is_retry)
+        .append(is_retry)
+        .open(&log_path)
+        .ok();
+
+    let tmp_link = std::path::PathBuf::from("/tmp").join(&log_file_name);
+    let _ = std::fs::remove_file(&tmp_link);
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(&log_path, &tmp_link);
+
+    let _ = BOOT_LOG_PATH.set(log_path.clone());
+    std::env::set_var("PORT_LOG_APPEND", "1");
+    std::env::set_var("AW2_LOG_APPEND", "1");
+
+    // CLI inspection / offline prewarm modes must keep stdout/stderr connected to the
+    // caller (even when piped or launched as a subprocess where isatty(2) == 0).
+    let cli_stdout_mode = std::env::args().any(|a| {
+        matches!(
+            a.as_str(),
+            "--prewarm-aot"
+                | "--prewarm-shaders"
+                | "--emit-static-o"
+                | "--aot-to-o"
+                | "--list-exports"
+                | "--ops-report"
+                | "--no-run"
+                | "--diff-test"
+                | "--call-export"
+                | "-h"
+                | "--help"
+        )
+    });
+
+    unsafe {
+        let is_tty = libc::isatty(2) != 0;
+        let cwd_root = std::env::current_dir().is_ok_and(|p| p == std::path::Path::new("/"));
+        if cwd_root {
+            let _ = std::env::set_current_dir(&log_dir);
+        }
+        if let Some(f) = file {
+            if !is_tty && !cli_stdout_mode {
+                use std::os::fd::AsRawFd;
+                libc::dup2(f.as_raw_fd(), 1);
+                libc::dup2(f.as_raw_fd(), 2);
+            } else if let Ok(dup_f) = f.try_clone() {
+                let _ = BOOT_LOG_TEE.set(std::sync::Mutex::new(dup_f));
+            }
+        }
+    }
+
+    let os_ver = sysctl_str("kern.osproductversion");
+    let os_build = sysctl_str("kern.osversion");
+    let hw_model = sysctl_str("hw.model");
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    let argv: Vec<String> = std::env::args().collect();
+    let banner = manifest
+        .as_ref()
+        .and_then(|m| m.name.as_deref())
+        .unwrap_or(if cfg!(feature = "aw2-core") { "Alan Wake 2" } else { "port-runner" });
+    boot_log_line(&format!(
+        "=== {banner} startup (pid={} ppid={} arch={} rosetta={} macOS={} ({}) model={} retry={:?}) ===",
+        std::process::id(),
+        unsafe { libc::getppid() },
+        std::env::consts::ARCH,
+        translated(),
+        os_ver,
+        os_build,
+        hw_model,
+        std::env::var("AW2_ASLR_RETRY").ok(),
+    ));
+    boot_log_line(&format!("exe={exe:?} cwd={cwd:?} argv={argv:?}"));
+    boot_log_line(&format!("log_file={}", log_path.display()));
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let thread = std::thread::current();
+        let tname = thread.name().unwrap_or("<unnamed>");
+        let msg = format!("PANIC on thread '{tname}': {info}\nBacktrace:\n{bt}");
+        boot_log_line(&msg);
+        write_last_crash(&msg);
+        eprintln!("{msg}");
+        prev_hook(info);
+    }));
+}
+
+/// Feed the x86-64 interpreter profile (`x86_runtime::emu_prof`) into hitch reports
+/// and the periodic `out/hitch/emu-prof-<pid>.log`.
+fn register_emu_profiler() {
+    use win32_rt::hitch::{FuncStartFn, SymbolizeFn};
+    use x86_runtime::emu_prof;
+    win32_rt::crash::set_guest_state_hook(x86_runtime::emu::current_guest_state);
+    win32_rt::kernel32::memory::set_code_region_hook(x86_runtime::emu::note_code_region);
+    if emu_prof::level() == 0 {
+        return;
+    }
+    fn frame(out: &mut String, fs: FuncStartFn<'_>, sym: SymbolizeFn<'_>) {
+        emu_prof::append_frame_report(out, &emu_prof::Resolver { func_start: fs, symbolize: sym });
+    }
+    fn cumulative(out: &mut String, fs: FuncStartFn<'_>, sym: SymbolizeFn<'_>) {
+        emu_prof::append_cumulative_report(out, &emu_prof::Resolver { func_start: fs, symbolize: sym });
+    }
+    win32_rt::hitch::set_cpu_profiler(win32_rt::hitch::CpuProfilerHooks {
+        frame_report: frame,
+        cumulative_report: cumulative,
+        on_frame: emu_prof::on_frame,
+    });
+}
+
+fn bridge_port_env_vars() {
+    // Mirror universal PORT_* env vars into legacy AW2_* aliases consumed by
+    // lower-level crates (`win32-rt`, `dxil-metal`, `loader.rs`, `symbols.rs`).
+    for (primary, legacy) in [
+        ("PORT_AOT_DIR", "AW2_DLL_AOT_DIR"),
+        ("PORT_BUILTIN_OVERRIDES", "AW2_BUILTIN_OVERRIDES"),
+        ("PORT_HEADLESS", "AW2_HEADLESS"),
+        ("PORT_SYMBOLS", "AW2_SYMBOLS"),
+        ("PORT_AOT_DYLIB", "AW2_AOT_DYLIB"),
+        ("PORT_V8_JITLESS", "AW2_V8_JITLESS"),
+        ("PORT_GAME_DIR", "AW2_GAME_DIR"),
+        ("PORT_SHADER_CACHE", "AW2_SHADER_CACHE"),
+        ("PORT_PSO_CACHE", "AW2_PSO_CACHE"),
+        ("PORT_PSO_MAX_ARCHIVES", "AW2_PSO_MAX_ARCHIVES"),
+        ("PORT_SHADER_MANIFEST", "AW2_SHADER_MANIFEST"),
+        ("PORT_PSO_MANIFEST", "AW2_PSO_MANIFEST"),
+        ("PORT_SHADERD", "AW2_SHADERD"),
+        ("PORT_REGISTRY_TSV", "AW2_REGISTRY_TSV"),
+    ] {
+        if let Some(val) = std::env::var_os(primary).filter(|v| !v.is_empty()) {
+            std::env::set_var(legacy, val);
+        }
+    }
+}
+
+fn print_aot_prewarm_summary(reports: &[x86_runtime::emu::AotPrewarmReport]) {
+    println!("=== Offline AOT Block-Cache Prewarm Summary ===");
+    if reports.is_empty() {
+        println!("  (no mapped PE modules)");
+        return;
+    }
+    println!(
+        "  {:<32} {:>8} {:>9} {:>12}  {}",
+        "MODULE", "ROOTS", "BLOCKS", "CODE BYTES", "CACHE PATH / STATUS"
+    );
+    println!("  {}", "-".repeat(100));
+    let mut prewarmed = 0usize;
+    let mut skipped = 0usize;
+    let mut total_roots = 0usize;
+    let mut total_blocks = 0usize;
+    let mut total_bytes = 0usize;
+    for r in reports {
+        total_roots += r.roots;
+        total_blocks += r.blocks;
+        total_bytes += r.code_bytes;
+        let status = if let Some(ref p) = r.cache_path {
+            prewarmed += 1;
+            p.display().to_string()
+        } else {
+            skipped += 1;
+            format!(
+                "SKIPPED ({})",
+                r.skipped_reason.as_deref().unwrap_or("unknown reason")
+            )
+        };
+        println!(
+            "  {:<32} {:>8} {:>9} {:>12}  {}",
+            r.module, r.roots, r.blocks, r.code_bytes, status
+        );
+    }
+    println!("  {}", "-".repeat(100));
+    println!(
+        "  Total: {} module(s) prewarmed, {} skipped, {} root(s), {} ARM64 block(s), {} bytes ({} KiB)",
+        prewarmed,
+        skipped,
+        total_roots,
+        total_blocks,
+        total_bytes,
+        total_bytes >> 10
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+fn print_static_macho_summary(reports: &[x86_runtime::emu::static_macho::StaticMachoReport]) {
+    println!("=== Static ARM64 Mach-O (.aot.o) Emission Summary ===");
+    if reports.is_empty() {
+        println!("  (no static Mach-O objects emitted)");
+        return;
+    }
+    println!(
+        "  {:<28} {:<8} {:>8} {:>7} {:>8} {:>10}  {}",
+        "MODULE", "PLAT", "BLOCKS", "SKIP", "LINKS", "OBJ BYTES", "OUTPUT PATH"
+    );
+    println!("  {}", "-".repeat(106));
+    let mut total_blocks = 0usize;
+    let mut total_skipped = 0usize;
+    let mut total_links = 0usize;
+    let mut total_bytes = 0usize;
+    for r in reports {
+        total_blocks += r.emitted_blocks;
+        total_skipped += r.skipped_reloc_blocks;
+        total_links += r.linked_direct;
+        total_bytes += r.object_bytes;
+        println!(
+            "  {:<28} {:<8} {:>8} {:>7} {:>8} {:>10}  {}",
+            r.module_name,
+            r.platform,
+            r.emitted_blocks,
+            r.skipped_reloc_blocks,
+            r.linked_direct,
+            r.object_bytes,
+            r.output_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<memory>".into())
+        );
+    }
+    println!("  {}", "-".repeat(106));
+    println!(
+        "  Total: {} object(s), {} ARM64 block(s) ({} skipped reloc), {} direct link(s), {} bytes ({} KiB)",
+        reports.len(),
+        total_blocks,
+        total_skipped,
+        total_links,
+        total_bytes,
+        total_bytes >> 10
+    );
+}
+
+/// Ensure the C-ABI static AOT symbols required by linked `.aot.o` objects stay alive
+/// in static archives (`libport_loader.a`) even under aggressive linker dead-stripping.
+#[inline(never)]
+fn anchor_static_aot_symbols() {
+    let reg = x86_runtime::emu::exec_mem::port_static_aot_register_desc as *const () as usize;
+    std::hint::black_box(reg);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let hx = x86_runtime::emu::port_static_aot_host_xfer as *const () as usize;
+        std::hint::black_box(hx);
+    }
+}
+
+fn real_main() -> anyhow::Result<()> {
+    run_with_args(parse_args(), false)
+}
+
+fn init_embedded_log() {
+    let log_dir = log_dir_path();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("port-runner.log");
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        let _ = BOOT_LOG_PATH.set(log_path);
+        let _ = BOOT_LOG_TEE.set(std::sync::Mutex::new(f));
+    }
+}
+
+pub(crate) fn run_embedded(args: Args) -> anyhow::Result<()> {
+    init_embedded_log();
+    run_with_args(args, true)
+}
+
+fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
+    use anyhow::{bail, Context};
+    use win32_rt as w;
+
+    anchor_static_aot_symbols();
+    raise_fd_limit();
+    if let Some(ref aot_in) = args.aot_to_o {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use x86_runtime::emu::static_macho::{
+                emit_macho_object_from_aot_file, MachoPlatform,
+            };
+            let plat = MachoPlatform::parse(&args.static_platform).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --static-platform {:?} (expected ios, ios-sim, or macos)",
+                    args.static_platform
+                )
+            })?;
+            let out_path = args.out_path.clone().unwrap_or_else(|| aot_in.with_extension("aot.o"));
+            let rep = emit_macho_object_from_aot_file(aot_in, &out_path, plat)
+                .map_err(anyhow::Error::msg)?;
+            print_static_macho_summary(&[rep]);
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = aot_in;
+            bail!("--aot-to-o requires an aarch64 host");
+        }
+    }
+    let mut temp_static_aot_stage: Option<std::path::PathBuf> = None;
+    if let Some(ref out_dir) = args.emit_static_o {
+        // Static signed __TEXT cannot self-patch runtime literal slots or LSE2 traps:
+        // emit position-independent blocks with zero literal relocations and inline unaligned TSO.
+        std::env::set_var("AW2_JIT_PLAINCALL", "0");
+        std::env::set_var("PORT_JIT_LSE2_TRAP", "0");
+        std::env::set_var("PORT_HEADLESS", "1");
+        std::env::set_var("AW2_HEADLESS", "1");
+        if args.aot_dir.is_none() {
+            let stage = out_dir.join(format!(".aot-stage-{}", std::process::id()));
+            std::fs::create_dir_all(&stage)?;
+            std::env::set_var("PORT_AOT_DIR", &stage);
+            temp_static_aot_stage = Some(stage);
+        }
+    }
+    if let Some(ref dir) = args.aot_dir {
+        std::env::set_var("PORT_AOT_DIR", dir);
+    }
+    let manifest = target::TargetManifest::discover(args.manifest_path.as_deref());
+    if let Some(m) = &manifest {
+        if !args.explicit_exe {
+            if let Some(exe) = &m.exe {
+                args.exe = exe.clone();
+            }
+        }
+        if let Some(app_id) = &m.steam_app_id {
+            if std::env::var_os("STEAM_APPID").is_none() {
+                std::env::set_var("STEAM_APPID", app_id);
+                std::env::set_var("SteamAppId", app_id);
+                std::env::set_var("SteamGameId", app_id);
+            }
+        }
+        if let Some(ov) = &m.builtin_overrides {
+            if !ov.is_empty()
+                && std::env::var_os("PORT_BUILTIN_OVERRIDES").is_none()
+                && std::env::var_os("AW2_BUILTIN_OVERRIDES").is_none()
+            {
+                std::env::set_var("PORT_BUILTIN_OVERRIDES", ov);
+            }
+        }
+        if let Some(aot) = &m.aot_dylibs {
+            if !aot.is_empty()
+                && std::env::var_os("PORT_AOT_DYLIB").is_none()
+                && std::env::var_os("AW2_AOT_DYLIB").is_none()
+            {
+                std::env::set_var("PORT_AOT_DYLIB", aot);
+            }
+        }
+        if m.v8_jitless == Some(true)
+            && std::env::var_os("PORT_V8_JITLESS").is_none()
+            && std::env::var_os("AW2_V8_JITLESS").is_none()
+        {
+            std::env::set_var("PORT_V8_JITLESS", "1");
+        }
+    }
+    if args.no_builtin_overrides {
+        std::env::set_var("PORT_BUILTIN_OVERRIDES", "0");
+    }
+    if args.prewarm_aot || args.prewarm_shaders || args.emit_static_o.is_some() {
+        std::env::set_var("PORT_HEADLESS", "1");
+        std::env::set_var("AW2_HEADLESS", "1");
+    } else if args.list_exports || args.call_export.is_some() || args.no_run {
+        if std::env::var_os("PORT_HEADLESS").is_none() && std::env::var_os("AW2_HEADLESS").is_none() {
+            std::env::set_var("PORT_HEADLESS", "1");
+        }
+    }
+    if let Some(ref drive_c) = args.drive_c_dir {
+        std::env::set_var("TRANSLATOR_HOME", drive_c);
+        std::env::set_var("AW2_DRIVE_C", drive_c);
+    }
+    bridge_port_env_vars();
+
+    if args.prewarm_shaders {
+        let rep = d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, false)
+            .map_err(anyhow::Error::msg)?;
+        println!("=== Metal 4 Shader & PSO Prewarm Summary ===");
+        println!("  Device / OS      : {}", if rep.device_identity.is_empty() { "(no manifests found)" } else { &rep.device_identity });
+        println!("  Cold Device      : {}", rep.was_cold_device);
+        println!("  Tier-1 Shaders   : {}/{} ready ({} failed)", rep.tier1_compiled, rep.tier1_total, rep.tier1_failed);
+        println!("  Metal 4 PSOs     : {}/{} compiled ({} failed)", rep.pso_compiled, rep.pso_total, rep.pso_failed);
+        if let Some(p) = &rep.archive_written {
+            println!("  Archive Written  : {}", p.display());
+        }
+        println!("  Elapsed          : {} ms", rep.elapsed_ms);
+        return Ok(());
+    }
+
+    if args.pe_path.is_none() && args.exe.is_empty() {
+        bail!("no target executable specified (pass --pe PATH, --manifest FILE, or --game-dir DIR --exe NAME)");
+    }
+
+    let norm = pe_image::normalize_dll_name(&args.exe);
+    let is_aw2_exe = cfg!(feature = "aw2-core") && !args.no_aw2_hooks && norm.eq_ignore_ascii_case("alanwake2.exe");
+    let preferred_base_retry = manifest
+        .as_ref()
+        .and_then(|m| m.preferred_base_retry)
+        .unwrap_or(is_aw2_exe);
+    if !embedded_host {
+        ensure_avx_env(&args, preferred_base_retry);
+    }
+    {
+        use std::io::Write;
+        let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+        builder.format(|buf, record| {
+            let ts = buf.timestamp_millis();
+            let line = format!("[{ts} {:5} {}] {}\n", record.level(), record.target(), record.args());
+            if let Some(m) = BOOT_LOG_TEE.get() {
+                if let Ok(mut f) = m.lock() {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+            buf.write_all(line.as_bytes())
+        });
+        let _ = builder.try_init();
+    }
+    raise_fd_limit();
+
+    x86_runtime::exe::set_gs_reader(w::teb::gs_read);
+    #[cfg(not(target_arch = "x86_64"))]
+    if let Some((ts, te)) = crate::builtin_image::host_text_range() {
+        x86_runtime::exe::set_host_text_range(ts, te);
+    }
+    w::set_guest_dispatcher(x86_runtime::exe::call_va8);
+    w::set_native_va_registrar(x86_runtime::exe::register_native_va);
+    for d in w::builtin_dlls() {
+        for e in d.exports {
+            let p = e.ptr.0 as usize;
+            if crate::builtin_image::is_host_code(p) {
+                x86_runtime::exe::register_native_va(p as u64, p);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let leaf7 = std::arch::x86_64::__cpuid_count(7, 0);
+        log::info!(
+            "port-runner: arch=x86_64 Rosetta={} AVX2={} ROSETTA_ADVERTISE_AVX={:?}",
+            translated(),
+            leaf7.ebx & (1 << 5) != 0,
+            std::env::var("ROSETTA_ADVERTISE_AVX").ok()
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        log::info!(
+            "port-runner: arch={} Rosetta={} (native Apple Silicon)",
+            std::env::consts::ARCH,
+            translated()
+        );
+    }
+
+    let game_dir = args.game_dir.canonicalize().with_context(|| format!("game dir {}", args.game_dir.display()))?;
+    let exe_host = match &args.pe_path {
+        Some(p) => p.canonicalize().with_context(|| format!("pe path {}", p.display()))?,
+        None => game_dir.join(&args.exe),
+    };
+    if !exe_host.is_file() {
+        bail!("{} not found", exe_host.display());
+    }
+    let exe_stem = std::path::Path::new(&args.exe)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Game")
+        .to_string();
+    let display_name = manifest
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| if is_aw2_exe { "Alan Wake 2".to_string() } else { exe_stem.clone() });
+    let game_win_dir = manifest
+        .as_ref()
+        .and_then(|m| m.win_dir.clone())
+        .unwrap_or_else(|| format!("C:\\Games\\{exe_stem}"));
+    let computer_name = manifest
+        .as_ref()
+        .and_then(|m| m.computer_name.clone())
+        .unwrap_or_else(|| if is_aw2_exe { "AW2PORT".into() } else { "WIN64PORT".into() });
+    let legacy_remedy_migration = manifest
+        .as_ref()
+        .and_then(|m| m.legacy_remedy_migration)
+        .unwrap_or(is_aw2_exe);
+    w::config::set_app_config(w::config::AppConfig {
+        app_name: display_name,
+        computer_name,
+        log_dir_name: if is_aw2_exe { "AW2Port".into() } else { "Translator".into() },
+        legacy_remedy_migration,
+    });
+    #[cfg(feature = "aw2-core")]
+    if is_aw2_exe {
+        aw2_game::register_aw2_runtime();
+        aw2_hooks::install();
+    }
+    live_ctl::install();
+    setup_filesystem(&game_dir, &game_win_dir, &args)?;
+
+    // Process-wide Windows state.
+    let exe_win = format!("{game_win_dir}\\{}", args.exe);
+    let mut cmdline = format!("\"{exe_win}\"");
+    for a in &args.game_args {
+        if a.contains(' ') {
+            cmdline.push_str(&format!(" \"{a}\""));
+        } else {
+            cmdline.push(' ');
+            cmdline.push_str(a);
+        }
+    }
+    w::process::init(w::process::ProcessConfig { exe_path: exe_win.clone(), cmdline: cmdline.clone() });
+    w::process::init_env(&[]);
+    unsafe { w::teb::set_process_parameters(&exe_win, &cmdline, &format!("{game_win_dir}\\"), w::process::env_block_w()) };
+    w::teb::map_kuser_shared_data();
+
+    let l = loader::init(game_dir.clone(), game_win_dir.clone(), args.trace);
+    signals::install_handlers();
+    register_emu_profiler();
+
+    // Map the target PE (.exe or .dll) and, recursively, all statically imported DLLs.
+    let pe_data = std::fs::read(&exe_host)?;
+    if args.ops_report {
+        #[cfg(feature = "cli")]
+        {
+            let prof = port_factory::scanner::scan_pe_bytes(&norm, &pe_data)?;
+            print!("{}", port_factory::scanner::format_profile_report(&prof, 8));
+        }
+        #[cfg(not(feature = "cli"))]
+        {
+            bail!("--ops-report requires building `port-loader` with the `cli` feature enabled");
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let exe = l.load_pe(&exe_host, &norm, exe_win.clone(), None)?;
+    // fndb symbol tables for symbolize()/crash reports (background parse; skipped in offline prewarm).
+    if !args.prewarm_aot && args.emit_static_o.is_none() {
+        symbols::preload();
+    }
+    let pe = pe_image::Pe::parse(&pe_data)?;
+    let h = &pe.headers;
+    x86_runtime::exe::set_preferred_base(h.image_base, h.size_of_image as u64);
+    x86_runtime::exe::set_base(exe.base);
+    unsafe { w::teb::set_image_base(exe.base, h.subsystem) };
+    w::thread::DEFAULT_STACK_SIZE.store((h.stack_reserve as usize).max(0x10_0000), std::sync::atomic::Ordering::Relaxed);
+    let mods = l.modules();
+    log::info!(
+        "loaded {} modules ({} PE, {} builtin) in {:?}; {} unresolved imports have trap thunks",
+        mods.len(),
+        mods.iter().filter(|m| !m.is_builtin()).count(),
+        mods.iter().filter(|m| m.is_builtin()).count(),
+        t0.elapsed(),
+        l.traps.load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    if args.list_exports {
+        let exports = l.export_list(&exe);
+        println!("=== Exports of {} ({} entries, base=0x{:x}) ===", norm, exports.len(), exe.base);
+        for (ord, name, addr) in exports {
+            println!("  #{:<5} 0x{:012x} (rva 0x{:08x})  {}", ord, addr, addr - exe.base, name);
+        }
+        return Ok(());
+    }
+
+    if is_aw2_exe {
+        #[cfg(feature = "aw2-core")]
+        {
+            let n = hooks::apply_registry(exe.base)?;
+            log::info!("{n} replacement hooks applied");
+        }
+    } else {
+        #[cfg(not(feature = "aw2-core"))]
+        hooks::init_generic_hooks(exe.base);
+        #[cfg(feature = "aw2-core")]
+        hooks::install_try_thunk();
+        if let Ok(aot_dylibs) =
+            std::env::var("PORT_AOT_DYLIB").or_else(|_| std::env::var("AW2_AOT_DYLIB"))
+        {
+            for dylib_path in aot_dylibs.split(':').filter(|s| !s.trim().is_empty()) {
+                if let Ok(cpath) = std::ffi::CString::new(dylib_path.trim()) {
+                    unsafe {
+                        let handle = libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+                        if !handle.is_null() {
+                            type SetBaseFn = extern "C" fn(u64);
+                            type CountFn = extern "C" fn() -> usize;
+                            type GetEntryFn = extern "C" fn(usize, *mut u32, *mut u32) -> usize;
+                            type FullyLoweredFn = extern "C" fn(usize) -> bool;
+
+                            let set_base_sym = libc::dlsym(handle, c"aw2_aot_set_image_base".as_ptr());
+                            let count_sym = libc::dlsym(handle, c"aw2_aot_function_count".as_ptr());
+                            let entry_sym = libc::dlsym(handle, c"aw2_aot_get_entry".as_ptr());
+                            let fully_lowered_sym =
+                                libc::dlsym(handle, c"aw2_aot_entry_fully_lowered".as_ptr());
+
+                            if !set_base_sym.is_null() && !count_sym.is_null() && !entry_sym.is_null() {
+                                let fname = std::path::Path::new(dylib_path.trim())
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("");
+                                let stem = fname
+                                    .strip_prefix("lib")
+                                    .unwrap_or(fname)
+                                    .strip_suffix("_aot.dylib")
+                                    .unwrap_or(fname)
+                                    .to_ascii_lowercase();
+                                let target_mod = mods.iter().find(|m| {
+                                    !m.is_builtin() && {
+                                        let mn = m.name.to_ascii_lowercase();
+                                        let mstem = mn
+                                            .strip_suffix(".exe")
+                                            .or_else(|| mn.strip_suffix(".dll"))
+                                            .unwrap_or(&mn)
+                                            .chars()
+                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                                            .collect::<String>();
+                                        mstem == stem
+                                    }
+                                });
+                                let Some(target_mod) = target_mod else {
+                                    log::info!(
+                                        "skipping AOT module {} (module '{}' not yet mapped at startup)",
+                                        dylib_path,
+                                        stem
+                                    );
+                                    continue;
+                                };
+                                let mod_base = target_mod.base as u64;
+                                let set_base: SetBaseFn = std::mem::transmute(set_base_sym);
+                                let get_count: CountFn = std::mem::transmute(count_sym);
+                                let get_entry: GetEntryFn = std::mem::transmute(entry_sym);
+                                let is_fully_lowered: Option<FullyLoweredFn> =
+                                    if fully_lowered_sym.is_null() {
+                                        None
+                                    } else {
+                                        Some(std::mem::transmute(fully_lowered_sym))
+                                    };
+                                set_base(mod_base);
+                                let count = get_count();
+                                let mut registered = 0usize;
+                                let mut skipped_partial = 0usize;
+                                for idx in 0..count {
+                                    // Never register partially lowered prototype AOT entries:
+                                    // leave them for the full ARM64 block JIT + `.aot` cache.
+                                    if let Some(check) = is_fully_lowered {
+                                        if !check(idx) {
+                                            skipped_partial += 1;
+                                            continue;
+                                        }
+                                    }
+                                    let mut begin_rva = 0u32;
+                                    let mut end_rva = 0u32;
+                                    let fn_ptr = get_entry(idx, &mut begin_rva, &mut end_rva);
+                                    if fn_ptr != 0 && begin_rva != 0 {
+                                        x86_runtime::exe::register_native_va(
+                                            mod_base + begin_rva as u64,
+                                            fn_ptr,
+                                        );
+                                        registered += 1;
+                                    }
+                                }
+                                log::info!(
+                                    "loaded AOT module {} for {} ({registered} native ARM64 AOT functions registered, {skipped_partial} partial skipped to JIT for base 0x{:x})",
+                                    dylib_path,
+                                    target_mod.name,
+                                    mod_base
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        log::info!(
+            "module {norm} (base=0x{:x}, preferred=0x{:x}): running via hybrid AOT + x86-64 -> ARM64 translator",
+            exe.base,
+            h.image_base
+        );
+    }
+    if let Some(ref out_dir) = args.emit_static_o {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use x86_runtime::emu::static_macho::{
+                emit_macho_object_from_aot_file, MachoPlatform,
+            };
+            let plat = MachoPlatform::parse(&args.static_platform).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --static-platform {:?} (expected ios, ios-sim, or macos)",
+                    args.static_platform
+                )
+            })?;
+            std::fs::create_dir_all(out_dir)?;
+            let prewarm_reports = x86_runtime::emu::aot_prewarm_all_mapped(args.aot_max_funcs);
+            print_aot_prewarm_summary(&prewarm_reports);
+            let mut obj_reports = Vec::new();
+            for r in &prewarm_reports {
+                let Some(ref aot_path) = r.cache_path else {
+                    continue;
+                };
+                let safe_stem: String = r
+                    .module
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+                    .collect();
+                let obj_path = out_dir.join(format!("{safe_stem}.aot.o"));
+                let rep = emit_macho_object_from_aot_file(aot_path, &obj_path, plat)
+                    .map_err(anyhow::Error::msg)?;
+                obj_reports.push(rep);
+            }
+            if let Some(ref stage) = temp_static_aot_stage {
+                let _ = std::fs::remove_dir_all(stage);
+            }
+            print_static_macho_summary(&obj_reports);
+            if obj_reports.is_empty() {
+                bail!("--emit-static-o: no modules produced static Mach-O objects");
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (out_dir, temp_static_aot_stage);
+            bail!("--emit-static-o requires an aarch64 host");
+        }
+    }
+    if args.prewarm_aot {
+        let reports = x86_runtime::emu::aot_prewarm_all_mapped(args.aot_max_funcs);
+        print_aot_prewarm_summary(&reports);
+        return Ok(());
+    }
+    if args.diff_test {
+        let (pass, fail) = hooks::run_difftests();
+        log::info!("--diff-test: {pass} passed, {fail} failed");
+        std::process::exit(if fail == 0 { 0 } else { 1 });
+    }
+    hooks::apply_probes(exe.base)?;
+    hooks::start_reporter();
+    #[cfg(feature = "aw2-core")]
+    if args.audio_harness {
+        // CRT startup runs normally; WinMain (0x141856b20, called from
+        // __scrt_common_main_seh) is replaced by the audio test driver.
+        const WINMAIN: (usize, usize) = (0x1_4185_6b20, 0x1_4185_84de);
+        let at = exe.base + (WINMAIN.0 - 0x1_4000_0000);
+        hooks::install(at, Some(at + (WINMAIN.1 - WINMAIN.0)), w::audio::harness::winmain as *const () as usize, libc::PROT_READ | libc::PROT_EXEC)?;
+        log::info!("--audio-harness: WinMain @0x{at:x} -> win32_rt::audio::harness::winmain");
+    }
+    // AK API recorder (AW2_AK_RECORD=<trace.akt>; no-op when unset, AW2 exe only).
+    #[cfg(feature = "aw2-core")]
+    if is_aw2_exe {
+        w::audio::akrec::install_from_env(&mut |at, end, target| {
+            hooks::install(at, end, target, libc::PROT_READ | libc::PROT_EXEC).map(|p| p.trampoline).map_err(|e| e.to_string())
+        })
+        .map_err(anyhow::Error::msg)?;
+    }
+
+    aw2_debug_image_mapped(exe.base, exe.size);
+
+    if args.no_run {
+        let u = l.unresolved.lock().unwrap();
+        let mut per: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for s in u.iter() {
+            let (d, n) = s.split_once('!').unwrap();
+            per.entry(d).or_default().push(n);
+        }
+        for (d, ns) in per {
+            log::info!("unresolved {d} ({}): {}", ns.len(), ns.join(" "));
+        }
+        log::info!("--no-run: not executing");
+        return Ok(());
+    }
+
+    // Everything Windows-side runs on a Windows thread whose stack size comes
+    // from the PE header: DLL init (dependency order), exe TLS callbacks, entry.
+    let stack = (h.stack_reserve as usize).max(0x20_0000);
+    // AppKit must own the process main thread on macOS: set up NSApplication before
+    // any Windows code or native first-launch shader progress UI runs
+    // (no-op with PORT_HEADLESS=1 / AW2_HEADLESS=1, and skipped when UIKit already
+    // owns the main thread in embedded iOS host mode).
+    if !embedded_host {
+        w::macos::init_main_thread();
+    }
+
+    // On first launch on a new Mac or after a macOS update (0 cached MTL4Archives for this
+    // GPU+OS build), compile any recorded shader/PSO manifests in parallel before starting
+    // the Windows entry point — showing a native macOS progress window in GUI launches so
+    // double-clicked `.app` bundles never look frozen during first-time shader compilation.
+    if args.call_export.is_none() {
+        let mode = std::env::var("PORT_PREWARM_SHADERS").unwrap_or_default();
+        let lower = mode.trim().to_ascii_lowercase();
+        if lower != "0" && lower != "off" {
+            let only_if_cold = !(lower == "1" || lower == "force");
+            if let Some(device_id) = d3d12_metal::metal::pso_manifest::prewarm_needed(only_if_cold) {
+                let res = if w::macos::active() {
+                    let app_name = w::config::app_config().app_name;
+                    w::macos::progress_window_open(
+                        format!("{app_name} — Preparing Shaders"),
+                        format!("Compiling Metal 4 shaders for {device_id}..."),
+                        0,
+                    );
+                    let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let done_flag_bg = done_flag.clone();
+                    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let bg = std::thread::spawn(move || {
+                        let r = d3d12_metal::metal::pso_manifest::prewarm_for_current_device_with_progress(
+                            None,
+                            only_if_cold,
+                            |p| {
+                                let prev = last_tick.load(std::sync::atomic::Ordering::Relaxed);
+                                if p.done == 0
+                                    || p.done >= p.total
+                                    || p.done.saturating_sub(prev) >= 4
+                                    || p.total <= 32
+                                {
+                                    last_tick.store(p.done, std::sync::atomic::Ordering::Relaxed);
+                                    w::macos::progress_window_update(
+                                        format!(
+                                            "{}: {} / {} ({})",
+                                            p.stage, p.done, p.total, p.device_identity
+                                        ),
+                                        p.done,
+                                        p.total,
+                                    );
+                                }
+                            },
+                        );
+                        done_flag_bg.store(true, std::sync::atomic::Ordering::Release);
+                        r
+                    });
+                    let _ = w::macos::run_main_loop(&|| {
+                        done_flag.load(std::sync::atomic::Ordering::Acquire).then_some(0)
+                    });
+                    w::macos::progress_window_close();
+                    bg.join().unwrap_or_else(|_| Err("shader prewarm thread panicked".into()))
+                } else {
+                    d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, only_if_cold)
+                };
+                match res {
+                    Ok(rep) if !rep.skipped_warm && (rep.tier1_total > 0 || rep.pso_total > 0) => {
+                        log::info!(
+                            "cold-device shader prewarm for {}: tier1 {}/{}, pso {}/{} in {} ms",
+                            rep.device_identity,
+                            rep.tier1_compiled,
+                            rep.tier1_total,
+                            rep.pso_compiled,
+                            rep.pso_total,
+                            rep.elapsed_ms
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("cold-device shader prewarm skipped: {e}"),
+                }
+            }
+        }
+    }
+    if let Some(export_spec) = args.call_export.clone() {
+        let call_args = args.game_args.clone();
+        let exe_mod = exe.clone();
+        log::info!("starting initial thread for --call-export {export_spec:?} (stack 0x{stack:x})");
+        let th = w::thread::spawn(
+            Box::new(move || {
+                let l = loader::get();
+                if !l.run_pending_init(true) {
+                    log::error!("DLL initialization failed");
+                    w::process::exit_process(0xC000_0142);
+                }
+                let Some(fn_addr) = l.resolve_export(&exe_mod, &export_spec) else {
+                    log::error!("export {export_spec:?} not found in {}", exe_mod.name);
+                    w::process::exit_process(2);
+                };
+                let mut gpr = [0u64; 8];
+                let mut c_strings: Vec<std::ffi::CString> = Vec::new();
+                for (i, raw) in call_args.iter().take(8).enumerate() {
+                    if let Some(s) = raw.strip_prefix("s:") {
+                        let cs = std::ffi::CString::new(s).unwrap_or_default();
+                        gpr[i] = cs.as_ptr() as u64;
+                        c_strings.push(cs);
+                    } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                        gpr[i] = u64::from_str_radix(hex, 16).unwrap_or(0);
+                    } else if let Ok(v) = raw.parse::<u64>() {
+                        gpr[i] = v;
+                    } else if let Ok(v) = raw.parse::<i64>() {
+                        gpr[i] = v as u64;
+                    } else {
+                        let cs = std::ffi::CString::new(raw.as_str()).unwrap_or_default();
+                        gpr[i] = cs.as_ptr() as u64;
+                        c_strings.push(cs);
+                    }
+                }
+                log::info!(
+                    "calling {}!{} @0x{:x} with args=[0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
+                    exe_mod.name,
+                    export_spec,
+                    fn_addr,
+                    gpr[0],
+                    gpr[1],
+                    gpr[2],
+                    gpr[3],
+                );
+                let t_call = std::time::Instant::now();
+                let ret = unsafe {
+                    x86_runtime::exe::call_va8(
+                        fn_addr as u64,
+                        gpr[0],
+                        gpr[1],
+                        gpr[2],
+                        gpr[3],
+                        gpr[4],
+                        gpr[5],
+                        gpr[6],
+                        gpr[7],
+                    )
+                };
+                let elapsed = t_call.elapsed();
+                drop(c_strings);
+                let cstr_preview = try_preview_cstr(ret as usize);
+                if let Some(s) = cstr_preview {
+                    println!(
+                        "{}!{} returned 0x{:x} ({} / {:?}) in {:?}",
+                        exe_mod.name, export_spec, ret, ret, s, elapsed
+                    );
+                } else {
+                    println!(
+                        "{}!{} returned 0x{:x} (u64={} i64={}) in {:?}",
+                        exe_mod.name, export_spec, ret, ret, ret as i64, elapsed
+                    );
+                }
+                w::process::exit_process(0)
+            }),
+            stack,
+            false,
+            true,
+        )?;
+        let code = w::macos::run_main_loop(&|| th.exit_code());
+        w::process::exit_process(code);
+    }
+
+    log::info!("starting initial thread (stack 0x{stack:x})");
+    let th = w::thread::spawn(
+        Box::new(|| {
+            let l = loader::get();
+            if !l.run_pending_init(true) {
+                log::error!("DLL initialization failed");
+                w::process::exit_process(0xC000_0142); // STATUS_DLL_INIT_FAILED
+            }
+            let code = l.run_exe();
+            log::info!("entry point returned {code}");
+            w::process::exit_process(code)
+        }),
+        stack,
+        false,
+        true,
+    )?;
+    if embedded_host {
+        // Embedded host (iOS UIApplication): UIKit owns the main thread; wait on this
+        // background boot thread until the initial Windows thread finishes.
+        let code = loop {
+            if let Some(c) = th.exit_code() {
+                break c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        log::info!("port-ios: Windows process exited with code {code}");
+        w::process::run_exit_hooks();
+        return Ok(());
+    }
+    // The main thread now runs the AppKit event loop until the Windows
+    // process exits (ExitProcess usually ends the process before that).
+    let code = w::macos::run_main_loop(&|| th.exit_code());
+    w::process::exit_process(code);
+}
+
+fn try_preview_cstr(addr: usize) -> Option<String> {
+    use win32_rt::kernel32::memory::{query, MEM_COMMIT, PAGE_NOACCESS};
+    let is_readable = |a: usize| -> bool {
+        query(a).is_some_and(|m| m.state == MEM_COMMIT && m.protect != 0 && m.protect != PAGE_NOACCESS)
+    };
+    if addr < 0x10000 || !is_readable(addr) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for i in 0..128usize {
+        if !is_readable(addr + i) {
+            return None;
+        }
+        let b = unsafe { *((addr + i) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        if !(0x20..=0x7E).contains(&b) {
+            return None;
+        }
+        bytes.push(b);
+    }
+    if bytes.is_empty() {
+        None
+    } else {
+        String::from_utf8(bytes).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_prewarm_aot_flags() {
+        let a = parse_args_from(
+            [
+                "--pe",
+                "/tmp/game/sample.dll",
+                "--prewarm-aot",
+                "--aot-max-funcs",
+                "128",
+                "--aot-dir",
+                "/tmp/aot-cache",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert!(a.prewarm_aot);
+        assert_eq!(a.aot_max_funcs, 128);
+        assert_eq!(a.aot_dir, Some(std::path::PathBuf::from("/tmp/aot-cache")));
+        assert_eq!(a.pe_path, Some(std::path::PathBuf::from("/tmp/game/sample.dll")));
+        assert_eq!(a.game_dir, std::path::PathBuf::from("/tmp/game"));
+        assert_eq!(a.exe, "sample.dll");
+    }
+
+    #[test]
+    fn parse_prewarm_shaders_flag() {
+        let a = parse_args_from(["--prewarm-shaders"].into_iter().map(String::from));
+        assert!(a.prewarm_shaders);
+        assert!(!a.prewarm_aot);
+    }
+
+    #[test]
+    fn parse_static_macho_flags() {
+        let a = parse_args_from(
+            [
+                "--pe",
+                "/tmp/game/sample.dll",
+                "--emit-static-o",
+                "/tmp/ios-aot",
+                "--static-platform",
+                "ios-sim",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert_eq!(a.emit_static_o, Some(std::path::PathBuf::from("/tmp/ios-aot")));
+        assert_eq!(a.static_platform, "ios-sim");
+
+        let b = parse_args_from(
+            [
+                "--aot-to-o",
+                "/tmp/sample.aot",
+                "--out",
+                "/tmp/sample.aot.o",
+                "--static-platform",
+                "macos",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert_eq!(b.aot_to_o, Some(std::path::PathBuf::from("/tmp/sample.aot")));
+        assert_eq!(b.out_path, Some(std::path::PathBuf::from("/tmp/sample.aot.o")));
+        assert_eq!(b.static_platform, "macos");
+    }
+
+    #[test]
+    fn bridge_port_env_vars_populates_legacy_aliases() {
+        let prev_port = std::env::var_os("PORT_AOT_DIR");
+        let prev_legacy = std::env::var_os("AW2_DLL_AOT_DIR");
+        std::env::set_var("PORT_AOT_DIR", "/tmp/port-bridge-aot");
+        std::env::remove_var("AW2_DLL_AOT_DIR");
+        bridge_port_env_vars();
+        assert_eq!(
+            std::env::var_os("AW2_DLL_AOT_DIR"),
+            Some(std::ffi::OsString::from("/tmp/port-bridge-aot"))
+        );
+        match prev_port {
+            Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+            None => std::env::remove_var("PORT_AOT_DIR"),
+        }
+        match prev_legacy {
+            Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+            None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+        }
+    }
+}

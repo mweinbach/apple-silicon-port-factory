@@ -1,0 +1,295 @@
+#![allow(unused_imports, unused_variables, unused_mut, unused_assignments, non_snake_case, dead_code, clippy::all, unreachable_code, unused_parens)]
+use super::super::Lifted;
+use super::*;
+
+pub static ENTRIES: &[Lifted] = &[
+    Lifted::new(0x7001ea5040, fn_7001ea5040 as *const (), 0), // +0x1040 sub_1040
+    Lifted::new(0x7001ea5080, fn_7001ea5080 as *const (), 0), // +0x1080 sub_1080
+    Lifted::new(0x7001ea50b0, fn_7001ea50b0 as *const (), 0), // +0x10b0 sub_10b0
+    Lifted::new(0x7001ea50e0, fn_7001ea50e0 as *const (), 0), // +0x10e0 sub_10e0
+    Lifted::new(0x7001ea5160, fn_7001ea5160 as *const (), 0), // +0x1160 sub_1160
+    Lifted::new(0x7001ea51b0, tpl_0 as *const (), 1), // +0x11b0 sub_11b0
+    Lifted::new(0x7001ea51d0, tpl_1::<0xfffffffffffffff0, 0x10, 0xffffffffffffffe0, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20> as *const (), 3), // +0x11d0 sub_11d0
+    Lifted::new(0x7001ea52c0, fn_7001ea52c0 as *const (), 2), // +0x12c0 sub_12c0
+    Lifted::new(0x7001ea5570, fn_7001ea5570 as *const (), 2), // +0x1570 sub_1570
+    Lifted::new(0x7001ea59a0, tpl_0 as *const (), 1), // +0x19a0 sub_19a0
+    Lifted::new(0x7001ea59c0, tpl_1::<0xfffffffffffffff0, 0x10, 0xffffffffffffffe0, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20> as *const (), 3), // +0x19c0 sub_19c0
+    Lifted::new(0x7001ea5ab0, fn_7001ea5ab0 as *const (), 2), // +0x1ab0 sub_1ab0
+    Lifted::new(0x7001ea5d60, fn_7001ea5d60 as *const (), 2), // +0x1d60 sub_1d60
+    Lifted::new(0x7001ea6180, fn_7001ea6180 as *const (), 1), // +0x2180 sub_2180
+    Lifted::new(0x7001ea6200, fn_7001ea6200 as *const (), 1), // +0x2200 __telemetry_main_invoke_trigger
+    Lifted::new(0x7001ea6270, fn_7001ea6270 as *const (), 3), // +0x2270 strchr
+    Lifted::new(0x7001ea62f0, fn_7001ea62f0 as *const (), 3), // +0x22f0 strrchr
+    Lifted::new(0x7001ea6430, fn_7001ea6430 as *const (), 3), // +0x2430 strstr
+    Lifted::new(0x7001ea6620, fn_7001ea6620 as *const (), 3), // +0x2620 wcschr
+    Lifted::new(0x7001ea66a0, fn_7001ea66a0 as *const (), 3), // +0x26a0 wcsrchr
+    Lifted::new(0x7001ea6750, fn_7001ea6750 as *const (), 3), // +0x2750 wcsstr
+    Lifted::new(0x7001ea69e0, fn_7001ea69e0 as *const (), 0), // +0x29e0 _IsExceptionObjectToBeDestroyed
+    Lifted::new(0x7001ea6a10, fn_7001ea6a10 as *const (), 1), // +0x2a10 _SetWinRTOutOfMemoryExceptionCallback
+    Lifted::new(0x7001ea6a20, fn_7001ea6a20 as *const (), 1), // +0x2a20 __AdjustPointer
+    Lifted::new(0x7001ea6a50, fn_7001ea6a50 as *const (), 0), // +0x2a50 __FrameUnwindFilter
+    Lifted::new(0x7001ea6ac0, fn_7001ea6ac0 as *const (), 0), // +0x2ac0 __GetPlatformExceptionInfo
+    Lifted::new(0x7001ea6b20, fn_7001ea6b20 as *const (), 0), // +0x2b20 __current_exception
+    Lifted::new(0x7001ea6b40, fn_7001ea6b40 as *const (), 0), // +0x2b40 __current_exception_context
+    Lifted::new(0x7001ea6b60, fn_7001ea6b60 as *const (), 0), // +0x2b60 __processing_throw
+    Lifted::new(0x7001ea6b80, fn_7001ea6b80 as *const (), 0), // +0x2b80 __std_terminate
+    Lifted::new(0x7001ea6b90, fn_7001ea6b90 as *const (), 0), // +0x2b90 _is_exception_typeof
+    Lifted::new(0x7001ea6c38, fn_7001ea6c38 as *const (), 0), // +0x2c38 sub_2c38
+    Lifted::new(0x7001ea6e1c, fn_7001ea6e1c as *const (), 0), // +0x2e1c sub_2e1c
+    Lifted::new(0x7001ea7004, fn_7001ea7004 as *const (), 0), // +0x3004 sub_3004
+    Lifted::new(0x7001ea70c8, fn_7001ea70c8 as *const (), 0), // +0x30c8 sub_30c8
+    Lifted::new(0x7001ea718c, fn_7001ea718c as *const (), 0), // +0x318c sub_318c
+    Lifted::new(0x7001ea7260, fn_7001ea7260 as *const (), 0), // +0x3260 sub_3260
+    Lifted::new(0x7001ea7334, fn_7001ea7334 as *const (), 2), // +0x3334 sub_3334
+    Lifted::new(0x7001ea77f8, fn_7001ea77f8 as *const (), 2), // +0x37f8 sub_37f8
+    Lifted::new(0x7001ea7cf0, fn_7001ea7cf0 as *const (), 2), // +0x3cf0 sub_3cf0
+    Lifted::new(0x7001ea7f60, fn_7001ea7f60 as *const (), 2), // +0x3f60 sub_3f60
+    Lifted::new(0x7001ea8258, fn_7001ea8258 as *const (), 0), // +0x4258 sub_4258
+    Lifted::new(0x7001ea8398, fn_7001ea8398 as *const (), 0), // +0x4398 sub_4398
+    Lifted::new(0x7001ea84e4, fn_7001ea84e4 as *const (), 0), // +0x44e4 sub_44e4
+    Lifted::new(0x7001ea870c, fn_7001ea870c as *const (), 0), // +0x470c sub_470c
+    Lifted::new(0x7001ea89a0, fn_7001ea89a0 as *const (), 0), // +0x49a0 sub_49a0
+    Lifted::new(0x7001ea89ec, fn_7001ea89ec as *const (), 2), // +0x49ec sub_49ec
+    Lifted::new(0x7001ea8a70, fn_7001ea8a70 as *const (), 3), // +0x4a70 sub_4a70
+    Lifted::new(0x7001ea8b54, tpl_2::<0x7001eb7458, 0x8, 0x7001eaa870, 0x7001eb7488> as *const (), 2), // +0x4b54 sub_4b54
+    Lifted::new(0x7001ea8b90, fn_7001ea8b90 as *const (), 1), // +0x4b90 sub_4b90
+    Lifted::new(0x7001ea8bb0, fn_7001ea8bb0 as *const (), 2), // +0x4bb0 sub_4bb0
+    Lifted::new(0x7001ea8c00, fn_7001ea8c00 as *const (), 0), // +0x4c00 sub_4c00
+    Lifted::new(0x7001ea8c50, fn_7001ea8c50 as *const (), 0), // +0x4c50 sub_4c50
+    Lifted::new(0x7001ea8e40, fn_7001ea8e40 as *const (), 0), // +0x4e40 sub_4e40
+    Lifted::new(0x7001ea9090, fn_7001ea9090 as *const (), 3), // +0x5090 sub_5090
+    Lifted::new(0x7001ea9224, fn_7001ea9224 as *const (), 0), // +0x5224 sub_5224
+    Lifted::new(0x7001ea92a8, fn_7001ea92a8 as *const (), 0), // +0x52a8 sub_52a8
+    Lifted::new(0x7001ea92d8, fn_7001ea92d8 as *const (), 0), // +0x52d8 sub_52d8
+    Lifted::new(0x7001ea9464, fn_7001ea9464 as *const (), 2), // +0x5464 sub_5464
+    Lifted::new(0x7001ea9768, fn_7001ea9768 as *const (), 0), // +0x5768 sub_5768
+    Lifted::new(0x7001ea9800, fn_7001ea9800 as *const (), 0), // +0x5800 sub_5800
+    Lifted::new(0x7001ea98f0, fn_7001ea98f0 as *const (), 0), // +0x58f0 sub_58f0
+    Lifted::new(0x7001ea9978, fn_7001ea9978 as *const (), 1), // +0x5978 sub_5978
+    Lifted::new(0x7001ea9a14, fn_7001ea9a14 as *const (), 0), // +0x5a14 sub_5a14
+    Lifted::new(0x7001ea9a20, fn_7001ea9a20 as *const (), 0), // +0x5a20 sub_5a20
+    Lifted::new(0x7001ea9a30, fn_7001ea9a30 as *const (), 2), // +0x5a30 sub_5a30
+    Lifted::new(0x7001ea9b00, fn_7001ea9b00 as *const (), 2), // +0x5b00 sub_5b00
+    Lifted::new(0x7001ea9bb0, fn_7001ea9bb0 as *const (), 1), // +0x5bb0 sub_5bb0
+    Lifted::alias(0x7001ea9bd0, fn_7001ea7004 as *const (), 0, 0x3004), // +0x5bd0 __BuildCatchObject (thunk -> +0x3004)
+    Lifted::alias(0x7001ea9be0, fn_7001ea6c38 as *const (), 0, 0x2c38), // +0x5be0 __BuildCatchObjectHelper (thunk -> +0x2c38)
+    Lifted::alias(0x7001ea9bf0, fn_7001ea8258 as *const (), 0, 0x4258), // +0x5bf0 __TypeMatch (thunk -> +0x4258)
+    Lifted::new(0x7001ea9c00, fn_7001ea9c00 as *const (), 0), // +0x5c00 __CxxDetectRethrow
+    Lifted::new(0x7001ea9e40, fn_7001ea9e40 as *const (), 1), // +0x5e40 __CxxQueryExceptionSize
+    Lifted::new(0x7001ea9e50, fn_7001ea9e50 as *const (), 0), // +0x5e50 __CxxRegisterExceptionObject
+    Lifted::new(0x7001ea9f00, fn_7001ea9f00 as *const (), 0), // +0x5f00 __CxxUnregisterExceptionObject
+    Lifted::new(0x7001eaa028, tpl_2::<0x7001eb7458, 0x8, 0x7001eaa870, 0x7001eb74e0> as *const (), 2), // +0x6028 sub_6028
+    Lifted::new(0x7001eaa064, tpl_2::<0x7001eb7458, 0x8, 0x7001eaa870, 0x7001eb74b0> as *const (), 2), // +0x6064 sub_6064
+    Lifted::new(0x7001eaa0a0, tpl_2::<0x7001eb7458, 0x8, 0x7001eaa870, 0x7001eb74c8> as *const (), 2), // +0x60a0 sub_60a0
+    Lifted::new(0x7001eaa0dc, fn_7001eaa0dc as *const (), 1), // +0x60dc sub_60dc
+    Lifted::new(0x7001eaa260, fn_7001eaa260 as *const (), 1), // +0x6260 sub_6260
+    Lifted::new(0x7001eaa398, fn_7001eaa398 as *const (), 1), // +0x6398 sub_6398
+    Lifted::new(0x7001eaa5a4, tpl_4::<0x10, 0x7001eb74e0, 0x8> as *const (), 1), // +0x65a4 sub_65a4
+    Lifted::new(0x7001eaa5bc, tpl_4::<0x10, 0x7001eb74b0, 0x8> as *const (), 1), // +0x65bc sub_65bc
+    Lifted::new(0x7001eaa5d4, tpl_4::<0x10, 0x7001eb74c8, 0x8> as *const (), 1), // +0x65d4 sub_65d4
+    Lifted::new(0x7001eaa5f0, fn_7001eaa5f0 as *const (), 0), // +0x65f0 __RTCastToVoid
+    Lifted::new(0x7001eaa650, fn_7001eaa650 as *const (), 0), // +0x6650 __RTDynamicCast
+    Lifted::new(0x7001eaa7c0, fn_7001eaa7c0 as *const (), 0), // +0x67c0 __RTtypeid
+    Lifted::new(0x7001eaa870, fn_7001eaa870 as *const (), 0), // +0x6870 __std_exception_copy
+    Lifted::new(0x7001eaa900, fn_7001eaa900 as *const (), 0), // +0x6900 __std_exception_destroy
+    Lifted::new(0x7001eaa950, fn_7001eaa950 as *const (), 1), // +0x6950 __std_type_info_compare
+    Lifted::new(0x7001eaa980, fn_7001eaa980 as *const (), 0), // +0x6980 __std_type_info_destroy_list
+    Lifted::new(0x7001eaa9b0, fn_7001eaa9b0 as *const (), 1), // +0x69b0 __std_type_info_hash
+    Lifted::new(0x7001eaa9f0, fn_7001eaa9f0 as *const (), 2), // +0x69f0 __std_type_info_name
+    Lifted::new(0x7001eaabc0, fn_7001eaabc0 as *const (), 0), // +0x6bc0 __uncaught_exception
+    Lifted::new(0x7001eaabe0, fn_7001eaabe0 as *const (), 0), // +0x6be0 __uncaught_exceptions
+    Lifted::new(0x7001eaac00, fn_7001eaac00 as *const (), 0), // +0x6c00 _get_unexpected
+    Lifted::new(0x7001eaac30, fn_7001eaac30 as *const (), 0), // +0x6c30 set_unexpected
+    Lifted::new(0x7001eaac60, fn_7001eaac60 as *const (), 0), // +0x6c60 unexpected
+    Lifted::new(0x7001eaac80, fn_7001eaac80 as *const (), 0), // +0x6c80 _set_se_translator
+    Lifted::new(0x7001eaacb0, fn_7001eaacb0 as *const (), 0), // +0x6cb0 sub_6cb0
+    Lifted::new(0x7001eaace0, fn_7001eaace0 as *const (), 0), // +0x6ce0 sub_6ce0
+    Lifted::new(0x7001eaacf4, fn_7001eaacf4 as *const (), 0), // +0x6cf4 sub_6cf4
+    Lifted::new(0x7001eaad04, fn_7001eaad04 as *const (), 0), // +0x6d04 sub_6d04
+    Lifted::new(0x7001eaad20, fn_7001eaad20 as *const (), 0), // +0x6d20 sub_6d20
+    Lifted::new(0x7001eaad68, tpl_5::<0x7001ebc288, 0x7001eb70b0> as *const (), 0), // +0x6d68 sub_6d68
+    Lifted::new(0x7001eaad84, fn_7001eaad84 as *const (), 0), // +0x6d84 sub_6d84
+    Lifted::new(0x7001eaadbc, tpl_5::<0x7001ebc288, 0x7001eb70b8> as *const (), 0), // +0x6dbc sub_6dbc
+    Lifted::new(0x7001eaade0, fn_7001eaade0 as *const (), 0), // +0x6de0 sub_6de0
+    Lifted::new(0x7001eaae00, fn_7001eaae00 as *const (), 0), // +0x6e00 sub_6e00
+    Lifted::new(0x7001eaae48, fn_7001eaae48 as *const (), 0), // +0x6e48 sub_6e48
+    Lifted::new(0x7001eaae64, fn_7001eaae64 as *const (), 0), // +0x6e64 sub_6e64
+    Lifted::new(0x7001eaaf28, fn_7001eaaf28 as *const (), 0), // +0x6f28 sub_6f28
+    Lifted::new(0x7001eaaf78, fn_7001eaaf78 as *const (), 0), // +0x6f78 sub_6f78
+    Lifted::new(0x7001eaafc0, fn_7001eaafc0 as *const (), 0), // +0x6fc0 sub_6fc0
+    Lifted::new(0x7001eaafe4, fn_7001eaafe4 as *const (), 0), // +0x6fe4 sub_6fe4
+    Lifted::new(0x7001eab134, fn_7001eab134 as *const (), 0), // +0x7134 sub_7134
+    Lifted::new(0x7001eab17c, fn_7001eab17c as *const (), 0), // +0x717c sub_717c
+    Lifted::new(0x7001eab1c4, fn_7001eab1c4 as *const (), 0), // +0x71c4 sub_71c4
+    Lifted::new(0x7001eab20c, fn_7001eab20c as *const (), 0), // +0x720c sub_720c
+    Lifted::new(0x7001eab260, fn_7001eab260 as *const (), 0), // +0x7260 __vcrt_InitializeCriticalSectionEx
+    Lifted::new(0x7001eab2d0, tpl_6::<0x7001eb7078> as *const (), 2), // +0x72d0 __vcrt_GetModuleFileNameW
+    Lifted::new(0x7001eab2e0, tpl_6::<0x7001eb7070> as *const (), 2), // +0x72e0 __vcrt_GetModuleHandleW
+    Lifted::new(0x7001eab2f0, tpl_6::<0x7001eb7108> as *const (), 2), // +0x72f0 __vcrt_LoadLibraryExW
+    Lifted::new(0x7001eab300, fn_7001eab300 as *const (), 1), // +0x7300 _get_purecall_handler
+    Lifted::new(0x7001eab310, fn_7001eab310 as *const (), 0), // +0x7310 _purecall
+    Lifted::new(0x7001eab330, fn_7001eab330 as *const (), 1), // +0x7330 _set_purecall_handler
+    Lifted::new(0x7001eab33c, tpl_7::<0x8, 0x7001eab494> as *const (), 0), // +0x733c sub_733c
+    Lifted::new(0x7001eab37c, tpl_7::<0x8, 0x7001eab538> as *const (), 0), // +0x737c sub_737c
+    Lifted::new(0x7001eab3bc, fn_7001eab3bc as *const (), 0), // +0x73bc sub_73bc
+    Lifted::new(0x7001eab430, fn_7001eab430 as *const (), 0), // +0x7430 sub_7430
+    Lifted::new(0x7001eab494, fn_7001eab494 as *const (), 0), // +0x7494 sub_7494
+    Lifted::new(0x7001eab538, fn_7001eab538 as *const (), 0), // +0x7538 sub_7538
+    Lifted::new(0x7001eab5d0, fn_7001eab5d0 as *const (), 0), // +0x75d0 sub_75d0
+    Lifted::new(0x7001eab680, fn_7001eab680 as *const (), 0), // +0x7680 sub_7680
+    Lifted::new(0x7001eab6ac, fn_7001eab6ac as *const (), 0), // +0x76ac sub_76ac
+    Lifted::new(0x7001eab730, fn_7001eab730 as *const (), 0), // +0x7730 sub_7730
+    Lifted::new(0x7001eab7d8, fn_7001eab7d8 as *const (), 0), // +0x77d8 sub_77d8
+    Lifted::new(0x7001eab860, fn_7001eab860 as *const (), 0), // +0x7860 sub_7860
+    Lifted::new(0x7001eab914, fn_7001eab914 as *const (), 0), // +0x7914 sub_7914
+    Lifted::new(0x7001eab940, fn_7001eab940 as *const (), 1), // +0x7940 sub_7940
+    Lifted::new(0x7001eab970, fn_7001eab970 as *const (), 1), // +0x7970 sub_7970
+    Lifted::new(0x7001eab9b0, tpl_8::<0x8, 0x7001eaba60> as *const (), 0), // +0x79b0 sub_79b0
+    Lifted::new(0x7001eab9dc, tpl_8::<0x8, 0x7001eabae0> as *const (), 0), // +0x79dc sub_79dc
+    Lifted::new(0x7001eaba08, fn_7001eaba08 as *const (), 0), // +0x7a08 sub_7a08
+    Lifted::new(0x7001eaba34, fn_7001eaba34 as *const (), 0), // +0x7a34 sub_7a34
+    Lifted::new(0x7001eaba60, fn_7001eaba60 as *const (), 0), // +0x7a60 sub_7a60
+    Lifted::new(0x7001eabae0, fn_7001eabae0 as *const (), 0), // +0x7ae0 sub_7ae0
+    Lifted::new(0x7001eabb38, fn_7001eabb38 as *const (), 0), // +0x7b38 sub_7b38
+    Lifted::new(0x7001eabba4, fn_7001eabba4 as *const (), 0), // +0x7ba4 sub_7ba4
+    Lifted::new(0x7001eabbfc, fn_7001eabbfc as *const (), 0), // +0x7bfc sub_7bfc
+    Lifted::new(0x7001eabc54, fn_7001eabc54 as *const (), 3), // +0x7c54 sub_7c54
+    Lifted::new(0x7001eabca0, fn_7001eabca0 as *const (), 2), // +0x7ca0 sub_7ca0
+    Lifted::new(0x7001eacc5c, fn_7001eacc5c as *const (), 0), // +0x8c5c sub_8c5c
+    Lifted::new(0x7001eaccac, fn_7001eaccac as *const (), 0), // +0x8cac sub_8cac
+    Lifted::new(0x7001eacd3c, fn_7001eacd3c as *const (), 0), // +0x8d3c sub_8d3c
+    Lifted::new(0x7001eacec0, fn_7001eacec0 as *const (), 2), // +0x8ec0 sub_8ec0
+    Lifted::new(0x7001ead00c, fn_7001ead00c as *const (), 0), // +0x900c sub_900c
+    Lifted::new(0x7001ead0a8, fn_7001ead0a8 as *const (), 0), // +0x90a8 sub_90a8
+    Lifted::new(0x7001ead178, fn_7001ead178 as *const (), 2), // +0x9178 sub_9178
+    Lifted::new(0x7001ead3d4, fn_7001ead3d4 as *const (), 2), // +0x93d4 sub_93d4
+    Lifted::new(0x7001ead4cc, fn_7001ead4cc as *const (), 2), // +0x94cc sub_94cc
+    Lifted::new(0x7001eadad0, fn_7001eadad0 as *const (), 0), // +0x9ad0 sub_9ad0
+    Lifted::new(0x7001eadbf0, fn_7001eadbf0 as *const (), 2), // +0x9bf0 sub_9bf0
+    Lifted::new(0x7001eae538, fn_7001eae538 as *const (), 2), // +0xa538 sub_a538
+    Lifted::new(0x7001eae934, fn_7001eae934 as *const (), 0), // +0xa934 sub_a934
+    Lifted::new(0x7001eaea7c, fn_7001eaea7c as *const (), 1), // +0xaa7c sub_aa7c
+    Lifted::new(0x7001eaeadc, fn_7001eaeadc as *const (), 2), // +0xaadc sub_aadc
+    Lifted::new(0x7001eaecd8, fn_7001eaecd8 as *const (), 2), // +0xacd8 sub_acd8
+    Lifted::new(0x7001eaee00, fn_7001eaee00 as *const (), 2), // +0xae00 sub_ae00
+    Lifted::new(0x7001eaf06c, fn_7001eaf06c as *const (), 0), // +0xb06c sub_b06c
+    Lifted::new(0x7001eaf12c, fn_7001eaf12c as *const (), 2), // +0xb12c sub_b12c
+    Lifted::new(0x7001eaf294, fn_7001eaf294 as *const (), 2), // +0xb294 sub_b294
+    Lifted::new(0x7001eaf7d0, fn_7001eaf7d0 as *const (), 1), // +0xb7d0 sub_b7d0
+    Lifted::new(0x7001eaf7e0, fn_7001eaf7e0 as *const (), 1), // +0xb7e0 sub_b7e0
+    Lifted::new(0x7001eaf7f0, fn_7001eaf7f0 as *const (), 0), // +0xb7f0 sub_b7f0
+    Lifted::new(0x7001eaf820, fn_7001eaf820 as *const (), 0), // +0xb820 sub_b820
+    Lifted::new(0x7001eaf860, fn_7001eaf860 as *const (), 1), // +0xb860 sub_b860
+    Lifted::new(0x7001eaf874, fn_7001eaf874 as *const (), 0), // +0xb874 sub_b874
+    Lifted::new(0x7001eaf8d8, fn_7001eaf8d8 as *const (), 0), // +0xb8d8 sub_b8d8
+    Lifted::new(0x7001eaf96c, fn_7001eaf96c as *const (), 0), // +0xb96c sub_b96c
+    Lifted::new(0x7001eaf9fc, fn_7001eaf9fc as *const (), 2), // +0xb9fc sub_b9fc
+    Lifted::new(0x7001eafa60, fn_7001eafa60 as *const (), 1), // +0xba60 sub_ba60
+    Lifted::new(0x7001eafabc, fn_7001eafabc as *const (), 2), // +0xbabc sub_babc
+    Lifted::new(0x7001eb0458, fn_7001eb0458 as *const (), 2), // +0xc458 sub_c458
+    Lifted::new(0x7001eb0550, fn_7001eb0550 as *const (), 2), // +0xc550 sub_c550
+    Lifted::new(0x7001eb0808, fn_7001eb0808 as *const (), 2), // +0xc808 sub_c808
+    Lifted::new(0x7001eb09d4, fn_7001eb09d4 as *const (), 2), // +0xc9d4 sub_c9d4
+    Lifted::new(0x7001eb0bbc, fn_7001eb0bbc as *const (), 2), // +0xcbbc sub_cbbc
+    Lifted::new(0x7001eb0d98, fn_7001eb0d98 as *const (), 0), // +0xcd98 sub_cd98
+    Lifted::new(0x7001eb0dcc, fn_7001eb0dcc as *const (), 2), // +0xcdcc sub_cdcc
+    Lifted::new(0x7001eb1284, fn_7001eb1284 as *const (), 2), // +0xd284 sub_d284
+    Lifted::new(0x7001eb13c8, fn_7001eb13c8 as *const (), 0), // +0xd3c8 sub_d3c8
+    Lifted::new(0x7001eb1450, fn_7001eb1450 as *const (), 1), // +0xd450 sub_d450
+    Lifted::new(0x7001eb14a0, fn_7001eb14a0 as *const (), 1), // +0xd4a0 sub_d4a0
+    Lifted::new(0x7001eb14c0, fn_7001eb14c0 as *const (), 0), // +0xd4c0 sub_d4c0
+    Lifted::new(0x7001eb14f0, fn_7001eb14f0 as *const (), 0), // +0xd4f0 sub_d4f0
+    Lifted::new(0x7001eb1540, fn_7001eb1540 as *const (), 1), // +0xd540 sub_d540
+    Lifted::new(0x7001eb1578, fn_7001eb1578 as *const (), 0), // +0xd578 sub_d578
+    Lifted::new(0x7001eb1688, fn_7001eb1688 as *const (), 0), // +0xd688 sub_d688
+    Lifted::new(0x7001eb1718, fn_7001eb1718 as *const (), 0), // +0xd718 sub_d718
+    Lifted::new(0x7001eb1764, fn_7001eb1764 as *const (), 2), // +0xd764 sub_d764
+    Lifted::new(0x7001eb1984, fn_7001eb1984 as *const (), 0), // +0xd984 sub_d984
+    Lifted::new(0x7001eb1c34, fn_7001eb1c34 as *const (), 2), // +0xdc34 sub_dc34
+    Lifted::new(0x7001eb2184, fn_7001eb2184 as *const (), 2), // +0xe184 sub_e184
+    Lifted::new(0x7001eb22f0, fn_7001eb22f0 as *const (), 1), // +0xe2f0 sub_e2f0
+    Lifted::new(0x7001eb2314, fn_7001eb2314 as *const (), 0), // +0xe314 sub_e314
+    Lifted::new(0x7001eb26d0, fn_7001eb26d0 as *const (), 0), // +0xe6d0 sub_e6d0
+    Lifted::new(0x7001eb2824, fn_7001eb2824 as *const (), 0), // +0xe824 sub_e824
+    Lifted::new(0x7001eb28fc, fn_7001eb28fc as *const (), 2), // +0xe8fc sub_e8fc
+    Lifted::new(0x7001eb2974, fn_7001eb2974 as *const (), 1), // +0xe974 sub_e974
+    Lifted::new(0x7001eb29b8, fn_7001eb29b8 as *const (), 0), // +0xe9b8 sub_e9b8
+    Lifted::new(0x7001eb2b3c, fn_7001eb2b3c as *const (), 2), // +0xeb3c sub_eb3c
+    Lifted::new(0x7001eb2bb8, fn_7001eb2bb8 as *const (), 2), // +0xebb8 sub_ebb8
+    Lifted::new(0x7001eb2dc4, fn_7001eb2dc4 as *const (), 2), // +0xedc4 sub_edc4
+    Lifted::new(0x7001eb30a0, tpl_9::<0xc> as *const (), 1), // +0xf0a0 sub_f0a0
+    Lifted::new(0x7001eb30b0, fn_7001eb30b0 as *const (), 1), // +0xf0b0 sub_f0b0
+    Lifted::new(0x7001eb30c0, fn_7001eb30c0 as *const (), 0), // +0xf0c0 sub_f0c0
+    Lifted::new(0x7001eb30f0, fn_7001eb30f0 as *const (), 0), // +0xf0f0 sub_f0f0
+    Lifted::new(0x7001eb3140, tpl_9::<0x10> as *const (), 1), // +0xf140 sub_f140
+    Lifted::new(0x7001eb3144, fn_7001eb3144 as *const (), 2), // +0xf144 sub_f144
+    Lifted::new(0x7001eb3260, fn_7001eb3260 as *const (), 1), // +0xf260 sub_f260
+    Lifted::new(0x7001eb3270, tpl_9::<0x18> as *const (), 1), // +0xf270 sub_f270
+    Lifted::new(0x7001eb3274, fn_7001eb3274 as *const (), 1), // +0xf274 sub_f274
+    Lifted::new(0x7001eb3280, fn_7001eb3280 as *const (), 0), // +0xf280 __unDName
+    Lifted::new(0x7001eb32b0, fn_7001eb32b0 as *const (), 2), // +0xf2b0 __unDNameEx
+    Lifted::new(0x7001eb33a0, fn_7001eb33a0 as *const (), 0), // +0xf3a0 sub_f3a0
+    Lifted::new(0x7001eb33f8, fn_7001eb33f8 as *const (), 0), // +0xf3f8 sub_f3f8
+    Lifted::new(0x7001eb349c, fn_7001eb349c as *const (), 0), // +0xf49c sub_f49c
+    Lifted::new(0x7001eb34c4, fn_7001eb34c4 as *const (), 0), // +0xf4c4 sub_f4c4
+    Lifted::new(0x7001eb34f0, fn_7001eb34f0 as *const (), 1), // +0xf4f0 sub_f4f0
+    Lifted::new(0x7001eb34fc, fn_7001eb34fc as *const (), 0), // +0xf4fc sub_f4fc
+    Lifted::new(0x7001eb3538, tpl_10::<0x7001eb3548> as *const (), 0), // +0xf538 sub_f538
+    Lifted::new(0x7001eb3540, tpl_10::<0x7001eb35b0> as *const (), 0), // +0xf540 sub_f540
+    Lifted::new(0x7001eb3548, fn_7001eb3548 as *const (), 0), // +0xf548 sub_f548
+    Lifted::new(0x7001eb35b0, fn_7001eb35b0 as *const (), 1), // +0xf5b0 sub_f5b0
+    Lifted::new(0x7001eb3960, fn_7001eb3960 as *const (), 0), // +0xf960 sub_f960
+    Lifted::new(0x7001eb39c4, fn_7001eb39c4 as *const (), 1), // +0xf9c4 sub_f9c4
+    Lifted::new(0x7001eb3af8, fn_7001eb3af8 as *const (), 0), // +0xfaf8 sub_faf8
+    Lifted::new(0x7001eb3b24, fn_7001eb3b24 as *const (), 1), // +0xfb24 sub_fb24
+    Lifted::new(0x7001eb3b2c, fn_7001eb3b2c as *const (), 0), // +0xfb2c sub_fb2c
+    Lifted::new(0x7001eb3b90, fn_7001eb3b90 as *const (), 0), // +0xfb90 sub_fb90
+    Lifted::new(0x7001eb3c94, fn_7001eb3c94 as *const (), 1), // +0xfc94 sub_fc94
+    Lifted::new(0x7001eb3cb8, fn_7001eb3cb8 as *const (), 2), // +0xfcb8 sub_fcb8
+    Lifted::new(0x7001eb3dec, fn_7001eb3dec as *const (), 2), // +0xfdec sub_fdec
+    Lifted::new(0x7001eb417c, fn_7001eb417c as *const (), 1), // +0x1017c sub_1017c
+    Lifted::new(0x7001eb4340, fn_7001eb4340 as *const (), 0), // +0x10340 _CreateFrameInfo
+    Lifted::new(0x7001eb4380, fn_7001eb4380 as *const (), 0), // +0x10380 _FindAndUnlinkFrame
+    Lifted::new(0x7001eb43d4, tpl_11::<0x7001eaae48, 0x60> as *const (), 0), // +0x103d4 sub_103d4
+    Lifted::new(0x7001eb43e8, tpl_11::<0x7001eaae48, 0x68> as *const (), 0), // +0x103e8 sub_103e8
+    Lifted::new(0x7001eb43fc, tpl_12::<0x7001eaae48, 0x60> as *const (), 0), // +0x103fc sub_103fc
+    Lifted::new(0x7001eb4414, tpl_12::<0x7001eaae48, 0x68> as *const (), 0), // +0x10414 sub_10414
+    Lifted::new(0x7001eb44c8, fn_7001eb44c8 as *const (), 0), // +0x104c8 sub_104c8
+    Lifted::new(0x7001eb4588, fn_7001eb4588 as *const (), 0), // +0x10588 sub_10588
+    Lifted::new(0x7001eb4600, fn_7001eb4600 as *const (), 0), // +0x10600 sub_10600
+    Lifted::new(0x7001eb4640, fn_7001eb4640 as *const (), 1), // +0x10640 sub_10640
+    Lifted::new(0x7001eb47f0, fn_7001eb47f0 as *const (), 0), // +0x107f0 sub_107f0
+    Lifted::new(0x7001eb4824, fn_7001eb4824 as *const (), 0), // +0x10824 sub_10824
+    Lifted::new(0x7001eb4844, fn_7001eb4844 as *const (), 0), // +0x10844 sub_10844
+    Lifted::new(0x7001eb48a0, fn_7001eb48a0 as *const (), 0), // +0x108a0 sub_108a0
+    Lifted::new(0x7001eb4940, fn_7001eb4940 as *const (), 0), // +0x10940 sub_10940
+    Lifted::new(0x7001eb4960, fn_7001eb4960 as *const (), 1), // +0x10960 sub_10960
+    Lifted::new(0x7001eb49b0, fn_7001eb49b0 as *const (), 0), // +0x109b0 sub_109b0
+    Lifted::new(0x7001eb4a00, fn_7001eb4a00 as *const (), 1), // +0x10a00 sub_10a00
+    Lifted::new(0x7001eb4a2c, fn_7001eb4a2c as *const (), 0), // +0x10a2c sub_10a2c
+    Lifted::new(0x7001eb4ad8, fn_7001eb4ad8 as *const (), 0), // +0x10ad8 sub_10ad8
+    Lifted::new(0x7001eb4ee0, fn_7001eb4ee0 as *const (), 2), // +0x10ee0 sub_10ee0
+    Lifted::new(0x7001eb4f00, tpl_6::<0x7001eb71a8> as *const (), 2), // +0x10f00 sub_10f00
+    Lifted::new(0x7001eb4f20, fn_7001eb4f20 as *const (), 3), // +0x10f20 memchr
+    Lifted::new(0x7001eb4fc0, fn_7001eb4fc0 as *const (), 1), // +0x10fc0 memcmp
+    Lifted::new(0x7001eb50b0, tpl_0 as *const (), 1), // +0x110b0 sub_110b0
+    Lifted::new(0x7001eb50c0, fn_7001eb50c0 as *const (), 2), // +0x110c0 memmove
+    Lifted::new(0x7001eb5750, fn_7001eb5750 as *const (), 1), // +0x11750 sub_11750
+    Lifted::new(0x7001eb5760, fn_7001eb5760 as *const (), 2), // +0x11760 memset
+    Lifted::new(0x7001eb5af0, fn_7001eb5af0 as *const (), 0), // +0x11af0 sub_11af0
+    Lifted::new(0x7001eb5b87, fn_7001eb5b87 as *const (), 0), // +0x11b87 sub_11b87
+    Lifted::new(0x7001eb5ba3, fn_7001eb5ba3 as *const (), 0), // +0x11ba3 sub_11ba3
+    Lifted::new(0x7001eb5bc8, fn_7001eb5bc8 as *const (), 0), // +0x11bc8 sub_11bc8
+    Lifted::new(0x7001eb5c4e, fn_7001eb5c4e as *const (), 0), // +0x11c4e sub_11c4e
+    Lifted::new(0x7001eb5c7d, fn_7001eb5c7d as *const (), 0), // +0x11c7d sub_11c7d
+    Lifted::new(0x7001eb5d0e, fn_7001eb5d0e as *const (), 0), // +0x11d0e sub_11d0e
+    Lifted::new(0x7001eb5d24, fn_7001eb5d24 as *const (), 0), // +0x11d24 sub_11d24
+    Lifted::new(0x7001eb5d47, fn_7001eb5d47 as *const (), 0), // +0x11d47 sub_11d47
+    Lifted::new(0x7001eb5d5d, fn_7001eb5d5d as *const (), 0), // +0x11d5d sub_11d5d
+    Lifted::new(0x7001eb5d80, fn_7001eb5d80 as *const (), 0), // +0x11d80 sub_11d80
+    Lifted::new(0x7001eb5da0, fn_7001eb5da0 as *const (), 1), // +0x11da0 sub_11da0
+    Lifted::new(0x7001eb5dc0, fn_7001eb5dc0 as *const (), 1), // +0x11dc0 sub_11dc0
+    Lifted::new(0x7001eb5dec, fn_7001eb5dec as *const (), 0), // +0x11dec sub_11dec
+    Lifted::new(0x7001eb5e02, fn_7001eb5e02 as *const (), 0), // +0x11e02 sub_11e02
+    Lifted::new(0x7001eb5ea5, fn_7001eb5ea5 as *const (), 0), // +0x11ea5 sub_11ea5
+];

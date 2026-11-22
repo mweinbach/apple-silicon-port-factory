@@ -1,0 +1,583 @@
+//! End-to-end tests over an in-memory trace.
+
+use d3d12_metal::trace::{encode_input_layout, Call, GraphicsPipeline, InputElement as TraceInput, Record, U32s, U64s, Writer};
+use dxil_metal::root_signature::flags::DESCRIPTOR_RANGE_OFFSET_APPEND;
+use dxil_metal::*;
+
+use crate::replay::{self, Backend, Handled, Kind, NullBackend, Objects};
+use crate::{shaders, stats};
+
+const FIXTURE: &[u8] = include_bytes!("../../dxil-metal/tests/fixtures/static_samplers.cs.dxil");
+
+/// The fixture is written unsigned; sign it like the game's shaders are.
+fn fixture_cs() -> Vec<u8> {
+    let mut b = FIXTURE.to_vec();
+    let size = u32::from_le_bytes(b[24..28].try_into().unwrap()) as usize;
+    let sum = hash::dxbc_checksum(&b[20..size]);
+    b[4..20].copy_from_slice(&sum);
+    b
+}
+
+/// t0 table, root UAV u0, static samplers s0/s1: what the fixture uses.
+fn root_signature_blob() -> Vec<u8> {
+    let range = DescriptorRange {
+        range_type: DescriptorRangeType::Srv,
+        num_descriptors: 1,
+        base_shader_register: 0,
+        register_space: 0,
+        flags: 0,
+        offset_in_descriptors_from_table_start: DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let s = |reg| StaticSampler { address_u: 3, address_v: 3, address_w: 3, shader_register: reg, ..Default::default() };
+    RootSignatureDesc {
+        version: RootSignatureVersion::V1_1,
+        parameters: vec![
+            RootParameter { kind: RootParameterKind::DescriptorTable(vec![range]), visibility: 0 },
+            RootParameter {
+                kind: RootParameterKind::Descriptor(RootDescriptorKind::Uav, RootDescriptor { shader_register: 0, register_space: 0, flags: 0 }),
+                visibility: 0,
+            },
+        ],
+        static_samplers: vec![s(0), s(1)],
+        flags: 0,
+    }
+    .to_blob()
+}
+
+fn put(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// D3D12_BLEND_DESC with RT0 = opaque (IndependentBlendEnable = FALSE), optionally with a
+/// logic op Metal can't do.
+fn blend_blob(logic_and: bool) -> Vec<u8> {
+    let mut b = vec![0u8; 328];
+    let rt = 8;
+    for (off, v) in [(8, 2), (12, 1), (16, 1), (20, 2), (24, 1), (28, 1), (32, 4)] {
+        put(&mut b, rt + off, v); // ONE, ZERO, ADD, ONE, ZERO, ADD, NOOP
+    }
+    b[rt + 36] = 0xF;
+    if logic_and {
+        put(&mut b, rt + 4, 1); // LogicOpEnable
+        put(&mut b, rt + 32, 6); // D3D12_LOGIC_OP_AND
+    }
+    b
+}
+
+/// D3D12_RASTERIZER_DESC: solid, cull back, depth clip.
+fn raster_blob(conservative: bool) -> Vec<u8> {
+    let mut b = vec![0u8; 44];
+    put(&mut b, 0, 3);
+    put(&mut b, 4, 3);
+    put(&mut b, 24, 1);
+    put(&mut b, 40, conservative as u32);
+    b
+}
+
+/// D3D12_DEPTH_STENCIL_DESC: depth LESS with writes, stencil off.
+fn depth_blob() -> Vec<u8> {
+    let mut b = vec![0u8; 52];
+    put(&mut b, 0, 1);
+    put(&mut b, 4, 1);
+    put(&mut b, 8, 2);
+    for face in [20, 36] {
+        for (k, v) in [1, 1, 1, 8].into_iter().enumerate() {
+            put(&mut b, face + 4 * k, v);
+        }
+    }
+    b
+}
+
+fn input_layout(slot: u32) -> Vec<u8> {
+    let e = |name: &str, format, offset| TraceInput {
+        semantic_name: name.into(),
+        semantic_index: 0,
+        format,
+        input_slot: slot,
+        aligned_byte_offset: offset,
+        input_slot_class: 0,
+        instance_data_step_rate: 0,
+    };
+    // R32G32B32_FLOAT at 0, R32G32_FLOAT appended (-> 12).
+    encode_input_layout(&[e("POSITION", 6, 0), e("TEXCOORD", 16, 0xFFFF_FFFF)])
+}
+
+struct Blobs {
+    cs: Vec<u8>,
+    rs: Vec<u8>,
+    blend: Vec<u8>,
+    blend_logic: Vec<u8>,
+    raster: Vec<u8>,
+    raster_cons: Vec<u8>,
+    depth: Vec<u8>,
+    il: Vec<u8>,
+    il_bad: Vec<u8>,
+}
+
+impl Blobs {
+    fn new() -> Self {
+        Self {
+            cs: fixture_cs(),
+            rs: root_signature_blob(),
+            blend: blend_blob(false),
+            blend_logic: blend_blob(true),
+            raster: raster_blob(false),
+            raster_cons: raster_blob(true),
+            depth: depth_blob(),
+            il: input_layout(0),
+            il_bad: input_layout(30),
+        }
+    }
+}
+
+const DEV: u64 = 0x1000;
+const RS: u64 = 0x2000;
+const CPSO: u64 = 0x3000;
+const GOOD: u64 = 0x3100;
+const BAD: u64 = 0x3200;
+const ALLOC: u64 = 0x4000;
+const LIST: u64 = 0x5000;
+const QUEUE: u64 = 0x6000;
+const SWAP: u64 = 0x7000;
+const BACKBUFFER: u64 = 0x7100;
+
+fn gfx<'a>(b: &'a Blobs, good: bool, rtv: &'a [u32]) -> GraphicsPipeline<'a> {
+    GraphicsPipeline {
+        root_signature: RS,
+        vs: &[],
+        ps: &[],
+        ds: &[],
+        hs: &[],
+        gs: &[],
+        stream_output: &[],
+        blend: if good { &b.blend } else { &b.blend_logic },
+        sample_mask: !0,
+        rasterizer: if good { &b.raster } else { &b.raster_cons },
+        raster_version: 0,
+        depth_stencil: &b.depth,
+        depth_stencil_version: 0,
+        input_layout: if good { &b.il } else { &b.il_bad },
+        ib_strip_cut_value: 0,
+        primitive_topology_type: 3,
+        rtv_formats: U32s::from_slice(rtv),
+        dsv_format: 40,
+        sample_count: 1,
+        sample_quality: 0,
+        node_mask: 0,
+        flags: 0,
+    }
+}
+
+const GOOD_RTV: [u32; 2] = [28, 57]; // R8G8B8A8_UNORM, R16_UINT
+const BAD_RTV: [u32; 1] = [0xFFFF];
+const LISTS: [u64; 1] = [LIST];
+
+fn calls(b: &Blobs) -> Vec<Call<'_>> {
+    vec![
+        /* 0 */ Call::CreateDevice { device: DEV, feature_level: 0xc200 },
+        /* 1 */ Call::CreateRootSignature { device: DEV, root_signature: RS, blob: &b.rs },
+        /* 2 */ Call::CreateComputePipelineState { device: DEV, pso: CPSO, root_signature: RS, cs: &b.cs, flags: 0 },
+        /* 3 */ Call::CreateGraphicsPipelineState { device: DEV, pso: GOOD, desc: gfx(b, true, &GOOD_RTV) },
+        /* 4 */ Call::CreateGraphicsPipelineState { device: DEV, pso: BAD, desc: gfx(b, false, &BAD_RTV) },
+        /* 5 */ Call::CreateCommandAllocator { device: DEV, allocator: ALLOC, list_type: 0 },
+        /* 6 */ Call::CreateCommandList { device: DEV, list: LIST, list_type: 0, allocator: ALLOC, initial_pso: 0 },
+        /* 7 */ Call::SetComputeRootSignature { list: LIST, root_signature: RS },
+        /* 8 */ Call::SetPipelineState { list: LIST, pso: CPSO },
+        /* 9 */ Call::Dispatch { list: LIST, x: 1, y: 1, z: 1 },
+        /* 10 */ Call::Close { list: LIST },
+        /* 11 */ Call::Dispatch { list: LIST, x: 1, y: 1, z: 1 }, // closed list
+        /* 12 */ Call::CreateCommandQueue { device: DEV, queue: QUEUE, desc: &[0; 16] },
+        /* 13 */ Call::ExecuteCommandLists { queue: QUEUE, lists: U64s::from_slice(&LISTS) },
+        /* 14 */ Call::Release { object: CPSO },
+        /* 15 */ Call::Reset { list: LIST, allocator: ALLOC, pso: CPSO }, // released PSO
+        /* 16 */ Call::DrawInstanced { list: LIST, vertex_count: 3, instance_count: 1, start_vertex: 0, start_instance: 0 }, // PSO gone, no RS
+        /* 17 */ Call::Release { object: 0xdead }, // unknown
+        /* 18 */ Call::CreateSwapChain { queue: QUEUE, swapchain: SWAP, desc: &[0; 48] },
+        /* 19 */ Call::GetSwapChainBuffer { swapchain: SWAP, index: 0, resource: BACKBUFFER },
+        /* 20 */ Call::GetSwapChainBuffer { swapchain: SWAP, index: 0, resource: BACKBUFFER }, // same pointer again: fine
+        /* 21 */ Call::Present { swapchain: SWAP, sync_interval: 1, flags: 0 },
+        /* 22 */ Call::FrameEnd { frame: 0 },
+    ]
+}
+
+fn trace_bytes(b: &Blobs) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new()).unwrap();
+    for c in calls(b) {
+        w.write(&c, 0).unwrap();
+    }
+    w.into_inner()
+}
+
+#[test]
+fn stats_pass() {
+    let b = Blobs::new();
+    let t = trace_bytes(&b);
+    let s = stats::stats(&t, None).unwrap();
+    assert_eq!(s.records, 23);
+    assert_eq!((s.frames, s.dispatches, s.draws), (1, 2, 1));
+    assert_eq!((s.created, s.released), (9, 2));
+    assert!(!s.truncated && s.decode_errors.is_empty());
+    assert_eq!(s.per_op["CreateGraphicsPipelineState"], 2);
+    let text = s.to_string();
+    assert!(text.contains("frames 1"), "{text}");
+
+    let until = stats::stats(&t, Some(4)).unwrap();
+    assert_eq!(until.records, 5);
+
+    let mut out = Vec::new();
+    stats::dump(&t[..t.len() - 2], None, &mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(out.lines().count(), 23, "{out}"); // 22 records + truncation note
+    assert!(out.contains("CreateComputePipelineState") && out.contains("items>"), "{out}");
+    assert!(out.ends_with("(trace truncated: torn final record)\n"));
+}
+
+#[test]
+fn replay_validation() {
+    let b = Blobs::new();
+    let t = trace_bytes(&b);
+    let rep = replay::replay(&t, &mut NullBackend, None, 100).unwrap();
+    let msgs: Vec<String> = rep.warnings.items.iter().map(|(i, m)| format!("#{i}: {m}")).collect();
+    let has = |i: u64, s: &str| rep.warnings.items.iter().any(|(j, m)| *j == i && m.contains(s));
+    assert!(has(11, "is closed"), "{msgs:#?}");
+    assert!(has(15, "was released"), "{msgs:#?}");
+    assert!(has(16, "is gone"), "{msgs:#?}");
+    assert!(has(16, "no graphics root signature"), "{msgs:#?}");
+    assert!(has(17, "unknown id"), "{msgs:#?}");
+    assert_eq!(rep.warnings.total, 5, "{msgs:#?}");
+    assert_eq!((rep.records, rep.frames, rep.done, rep.released), (23, 1, 23, 1));
+    // The live table at the end: everything but the released compute PSO.
+    assert_eq!(rep.live_at_end.get(&Kind::ComputePso), None);
+    assert_eq!(rep.live_at_end[&Kind::GraphicsPso], 2);
+    assert_eq!(rep.live_at_end[&Kind::Resource], 1);
+
+    // Backends see creations before the call and releases after it.
+    struct Probe(Vec<String>);
+    impl Backend for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn call(&mut self, rec: &Record, objs: &Objects) -> Result<Handled, String> {
+            match rec.call {
+                Call::CreateComputePipelineState { pso, .. } | Call::Release { object: pso } if pso == CPSO => {
+                    self.0.push(format!("{}:{:?}", rec.call.name(), objs.get(pso).map(|o| o.kind)));
+                }
+                Call::Dispatch { .. } => return Err("not yet".into()),
+                _ => {}
+            }
+            Ok(if matches!(rec.call, Call::Present { .. }) { Handled::Skipped } else { Handled::Done })
+        }
+    }
+    let mut probe = Probe(vec![]);
+    let rep = replay::replay(&t, &mut probe, Some(21), 100).unwrap();
+    assert_eq!(probe.0, ["CreateComputePipelineState:Some(ComputePso)", "Release:Some(ComputePso)"]);
+    assert_eq!(rep.failed.total, 2);
+    assert_eq!(rep.skipped["Present"], 1);
+    assert_eq!(rep.records, 22);
+}
+
+#[test]
+fn graphics_state_translation() {
+    let b = Blobs::new();
+    let (st, unsupported) = shaders::translate_graphics_state(&gfx(&b, true, &GOOD_RTV)).unwrap();
+    assert!(unsupported.is_empty());
+    assert_eq!(st.int_rt_mask, 0b10);
+    assert_eq!(st.input_layout[1].aligned_byte_offset, 12);
+    assert_eq!(st.color_formats.len(), 2);
+    assert!(!st.blend.dual_source && !st.blend.attachments[0].enabled);
+    assert!(st.raster.depth_clip == objc2_metal::MTLDepthClipMode::Clip);
+
+    let errs = shaders::translate_graphics_state(&gfx(&b, false, &BAD_RTV)).unwrap_err();
+    let joined = errs.join("\n");
+    assert!(joined.contains("RT0 format"), "{joined}");
+    assert!(joined.contains("vertex buffer slot 30"), "{joined}");
+
+    let mut short = gfx(&b, true, &GOOD_RTV);
+    short.blend = &b.blend[..100];
+    assert!(shaders::translate_graphics_state(&short).unwrap_err()[0].contains("BlendDesc"));
+}
+
+#[test]
+fn bytecode_detection() {
+    assert_eq!(shaders::bytecode_kind(&fixture_cs()), shaders::Bytecode::Dxil);
+    let sm5 = dxbc::build_container(&[(*b"ISGN", &[0; 8]), (*b"SHEX", &[0; 16])]);
+    assert_eq!(shaders::bytecode_kind(&sm5), shaders::Bytecode::Dxbc);
+    assert_eq!(shaders::bytecode_kind(b"garbage"), shaders::Bytecode::Unknown);
+}
+
+#[test]
+fn shaders_pass() {
+    if !converter_available() {
+        eprintln!("skipping: metal shader converter not available");
+        return;
+    }
+    let b = Blobs::new();
+    let t = trace_bytes(&b);
+    let p = ShaderPipeline::new(CacheConfig::memory_only()).unwrap();
+    let rep = shaders::validate(&t, &p, &shaders::Options { jobs: 2, ..Default::default() }).unwrap();
+    let text = rep.to_string();
+    assert_eq!((rep.root_signatures, rep.root_signature_failures.total), (1, 0), "{text}");
+    assert_eq!((rep.graphics, rep.compute), (2, 1), "{text}");
+    assert_eq!(rep.stages_compiled, 1, "{text}");
+    // Both graphics PSOs fail (no vertex shader / bad state); the compute PSO converts.
+    assert_eq!(rep.pipelines_failed, 2, "{text}");
+    assert!(rep.failures.items.iter().all(|(i, _)| *i == 3 || *i == 4), "{text}");
+    assert!(rep.failures.items.iter().any(|(i, m)| *i == 3 && m.contains("no vertex shader")), "{text}");
+    assert_eq!(rep.unsupported.get("blend logic ops"), Some(&1), "{text}");
+    assert_eq!(rep.unsupported.get("conservative rasterization"), Some(&1), "{text}");
+}
+
+// ---- mesh-shader PSOs -------------------------------------------------------------------------
+
+fn signed(b: &[u8]) -> Vec<u8> {
+    let mut v = b.to_vec();
+    dxbc::sign_container(&mut v).unwrap();
+    v
+}
+
+/// Root signature + mesh PSO (AS/MS/PS fixture from d3d12-metal) + a DispatchMesh, plus one
+/// DispatchMesh with a graphics PSO bound (a validation warning).
+fn mesh_trace(b: &Blobs, amp: &[u8], ms: &[u8], ps: &[u8], rs: &[u8]) -> Vec<u8> {
+    let rtv = [28u32];
+    let desc = GraphicsPipeline {
+        root_signature: 0x20,
+        vs: &[],
+        ps,
+        ds: &[],
+        hs: &[],
+        gs: &[],
+        stream_output: &[],
+        blend: &b.blend,
+        sample_mask: !0,
+        rasterizer: &b.raster,
+        raster_version: 0,
+        depth_stencil: &b.depth,
+        depth_stencil_version: 0,
+        input_layout: &[],
+        ib_strip_cut_value: 0,
+        primitive_topology_type: 0,
+        rtv_formats: U32s::from_slice(&rtv),
+        dsv_format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        node_mask: 0,
+        flags: 0,
+    };
+    let calls = [
+        Call::CreateDevice { device: 1, feature_level: 0xc200 },
+        Call::CreateCommandAllocator { device: 1, allocator: 2, list_type: 0 },
+        Call::CreateRootSignature { device: 1, root_signature: 0x20, blob: rs },
+        Call::CreateMeshPipelineState { device: 1, pso: 0x30, amplification: amp, mesh: ms, desc },
+        // Root signature 0: the fixture's resources don't match the mesh root signature.
+        Call::CreateComputePipelineState { device: 1, pso: 0x31, root_signature: 0, cs: &b.cs, flags: 0 },
+        Call::CreateCommandList { device: 1, list: 0x40, list_type: 0, allocator: 2, initial_pso: 0x30 },
+        Call::SetGraphicsRootSignature { list: 0x40, root_signature: 0x20 },
+        Call::DispatchMesh { list: 0x40, x: 1, y: 1, z: 1 },
+        Call::SetPipelineState { list: 0x40, pso: 0x31 },
+        Call::DispatchMesh { list: 0x40, x: 1, y: 1, z: 1 },
+        Call::Close { list: 0x40 },
+    ];
+    let mut w = Writer::new(Vec::new()).unwrap();
+    for c in &calls {
+        w.write(c, 0).unwrap();
+    }
+    w.into_inner()
+}
+
+const MESH_AS: &[u8] = include_bytes!("../../d3d12-metal/tests/fixtures/mesh.as.dxil");
+const MESH_MS: &[u8] = include_bytes!("../../d3d12-metal/tests/fixtures/mesh.ms.dxil");
+const MESH_PS: &[u8] = include_bytes!("../../d3d12-metal/tests/fixtures/mesh.ps.dxil");
+
+#[test]
+fn mesh_pso_validation() {
+    let b = Blobs::new();
+    let (amp, ms, ps) = (signed(MESH_AS), signed(MESH_MS), signed(MESH_PS));
+    let rs = RootSignatureDesc::from_blob(&amp).unwrap().to_blob();
+    let t = mesh_trace(&b, &amp, &ms, &ps, &rs);
+
+    let s = stats::stats(&t, None).unwrap();
+    assert_eq!(s.draws, 2);
+    let rep = replay::replay(&t, &mut NullBackend, None, 50).unwrap();
+    let w: Vec<&String> = rep.warnings.items.iter().map(|(_, m)| m).collect();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("DispatchMesh") && w[0].contains("ComputePso"), "{w:?}");
+
+    if !converter_available() {
+        eprintln!("skipping shader part: metal shader converter not available");
+        return;
+    }
+    let p = ShaderPipeline::new(CacheConfig::memory_only()).unwrap();
+    let rep = shaders::validate(&t, &p, &shaders::Options { jobs: 2, ..Default::default() }).unwrap();
+    let text = rep.to_string();
+    assert_eq!((rep.mesh, rep.compute, rep.pipelines_failed), (1, 1, 0), "{text}");
+    // AS + MS + PS, and the compute shader.
+    assert_eq!(rep.stages_compiled, 4, "{text}");
+}
+
+#[test]
+fn accel_trace_validation() {
+    let srcs = [0x4_0001_0000u64];
+    let calls = [
+        Call::CreateDevice { device: 1, feature_level: 0xc200 },
+        Call::CreateCommandAllocator { device: 1, allocator: 2, list_type: 0 },
+        Call::CreateCommandList { device: 1, list: 3, list_type: 0, allocator: 2, initial_pso: 0 },
+        Call::BuildRaytracingAccelerationStructure {
+            list: 3,
+            dest: 0x4_0001_0000,
+            source: 0,
+            scratch: 0x4_0002_0000,
+            inputs_type: 1,
+            flags: 4,
+            num_descs: 1,
+            descs_layout: 0,
+            instances_va: 0,
+            geometries: &[0; 56],
+            postbuild: &[0; 16],
+        },
+        Call::EmitRaytracingAccelerationStructurePostbuildInfo {
+            list: 3,
+            dest_buffer: 0x4_0003_0000,
+            info_type: 0,
+            sources: U64s::from_slice(&srcs),
+        },
+        Call::CopyRaytracingAccelerationStructure {
+            list: 3,
+            dest: 0x4_0004_0000,
+            source: 0x4_0001_0000,
+            mode: 1,
+        },
+        Call::Close { list: 3 },
+        // Copy on a closed list should warn.
+        Call::CopyRaytracingAccelerationStructure {
+            list: 3,
+            dest: 0x4_0004_0000,
+            source: 0x4_0001_0000,
+            mode: 1,
+        },
+    ];
+    let mut w = Writer::new(Vec::new()).unwrap();
+    for c in &calls {
+        w.write(c, 0).unwrap();
+    }
+    let t = w.into_inner();
+    let rep = replay::replay(&t, &mut NullBackend, None, 50).unwrap();
+    assert_eq!(rep.records, 8);
+    assert_eq!(rep.warnings.total, 1, "{:?}", rep.warnings.items);
+    assert!(rep.warnings.items[0].1.contains("is closed"));
+}
+
+#[test]
+fn rt_pipeline_trace_validation() {
+    let rs = root_signature_blob();
+    let calls = [
+        Call::CreateDevice { device: 1, feature_level: 0xc200 },
+        Call::CreateCommandAllocator { device: 1, allocator: 2, list_type: 0 },
+        Call::CreateRootSignature { device: 1, root_signature: 0x20, blob: &rs },
+        Call::CreateStateObject {
+            device: 1,
+            state_object: 0x100,
+            state_object_type: 0,
+            num_subobjects: 2,
+            num_exports: 3,
+            num_hit_groups: 1,
+        },
+        Call::AddToStateObject {
+            device: 1,
+            state_object: 0x101,
+            base: 0x100,
+            state_object_type: 3,
+            num_subobjects: 4,
+            num_exports: 4,
+            num_hit_groups: 2,
+        },
+        Call::CreateCommandList { device: 1, list: 3, list_type: 0, allocator: 2, initial_pso: 0 },
+        Call::SetComputeRootSignature { list: 3, root_signature: 0x20 },
+        Call::SetPipelineState1 { list: 3, state_object: 0x101 },
+        Call::DispatchRays {
+            list: 3,
+            width: 64,
+            height: 64,
+            depth: 1,
+            desc: &[0; 104],
+        },
+        Call::Release { object: 0x101 },
+        // DispatchRays after releasing the bound StateObject should warn.
+        Call::DispatchRays {
+            list: 3,
+            width: 64,
+            height: 64,
+            depth: 1,
+            desc: &[0; 104],
+        },
+        Call::Close { list: 3 },
+    ];
+    let mut w = Writer::new(Vec::new()).unwrap();
+    for c in &calls {
+        w.write(c, 0).unwrap();
+    }
+    let t = w.into_inner();
+    let s = stats::stats(&t, None).unwrap();
+    assert_eq!(s.dispatches, 2);
+    assert_eq!(s.created, 6);
+    assert_eq!(s.released, 1);
+
+    let rep = replay::replay(&t, &mut NullBackend, None, 50).unwrap();
+    assert_eq!(rep.records, 12);
+    assert_eq!(rep.created.get(&Kind::StateObject), Some(&2));
+    assert_eq!(rep.live_at_end.get(&Kind::StateObject), Some(&1));
+    assert_eq!(rep.warnings.total, 1, "{:?}", rep.warnings.items);
+    assert!(rep.warnings.items[0].1.contains("DispatchRays") && rep.warnings.items[0].1.contains("is gone"));
+}
+
+#[test]
+fn predication_clear_state_stencil_and_clear_rects_validation() {
+    let b = Blobs::new();
+    let rect_bytes = [1u8, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0]; // 16-byte Rect { left: 1, top: 2, right: 5, bottom: 6 }
+    let calls = [
+        /* 0 */ Call::CreateDevice { device: DEV, feature_level: 0xc200 },
+        /* 1 */ Call::CreateRootSignature { device: DEV, root_signature: RS, blob: &b.rs },
+        /* 2 */ Call::CreateGraphicsPipelineState { device: DEV, pso: GOOD, desc: gfx(&b, true, &GOOD_RTV) },
+        /* 3 */ Call::CreateComputePipelineState { device: DEV, pso: CPSO, root_signature: RS, cs: &b.cs, flags: 0 },
+        /* 4 */ Call::CreateCommittedResource {
+            device: DEV,
+            resource: 0x2200,
+            heap_properties: &[1, 0, 0, 0],
+            heap_flags: 0,
+            desc: &[0; 56],
+            initial_state: 0,
+            clear_value: None,
+            gpu_va: 0x4_0000_0000,
+        },
+        /* 5 */ Call::CreateCommandAllocator { device: DEV, allocator: ALLOC, list_type: 0 },
+        /* 6 */ Call::CreateCommandList { device: DEV, list: LIST, list_type: 0, allocator: ALLOC, initial_pso: GOOD },
+        /* 7 */ Call::SetGraphicsRootSignature { list: LIST, root_signature: RS },
+        /* 8 */ Call::OMSetFrontAndBackStencilRef { list: LIST, front: 0x12, back: 0x34 },
+        /* 9 */ Call::SetPredication { list: LIST, buffer: 0x2200, aligned_offset: 64, operation: 0 },
+        /* 10 */ Call::ClearRenderTargetView { list: LIST, rtv: 0x9000, color: [0.0, 1.0, 0.0, 1.0], rects: &rect_bytes },
+        /* 11 */ Call::ClearDepthStencilView { list: LIST, dsv: 0x9100, flags: 3, depth: 1.0, stencil: 0x7F, rects: &rect_bytes },
+        /* 12 */ Call::DrawInstanced { list: LIST, vertex_count: 3, instance_count: 1, start_vertex: 0, start_instance: 0 },
+        // ClearState binds CPSO and clears graphics_root_signature / compute_root_signature.
+        /* 13 */ Call::ClearState { list: LIST, pso: CPSO },
+        // Dispatch without re-setting compute root signature should warn.
+        /* 14 */ Call::Dispatch { list: LIST, x: 1, y: 1, z: 1 },
+        /* 15 */ Call::SetComputeRootSignature { list: LIST, root_signature: RS },
+        /* 16 */ Call::Dispatch { list: LIST, x: 1, y: 1, z: 1 },
+        // Disable predication (buffer = 0).
+        /* 17 */ Call::SetPredication { list: LIST, buffer: 0, aligned_offset: 0, operation: 0 },
+        // Malformed ClearRenderTargetView rects blob (7 bytes, not a multiple of 16) should warn.
+        /* 18 */ Call::ClearRenderTargetView { list: LIST, rtv: 0x9000, color: [0.0; 4], rects: &[1, 2, 3, 4, 5, 6, 7] },
+        /* 19 */ Call::Close { list: LIST },
+    ];
+    let mut w = Writer::new(Vec::new()).unwrap();
+    for c in &calls {
+        w.write(c, 0).unwrap();
+    }
+    let t = w.into_inner();
+    let rep = replay::replay(&t, &mut NullBackend, None, 50).unwrap();
+    assert_eq!(rep.records, 20);
+    assert_eq!(rep.decode_errors.total, 0);
+    assert_eq!(rep.warnings.total, 2, "{:?}", rep.warnings.items);
+    assert!(rep.warnings.items.iter().any(|(i, m)| *i == 14 && m.contains("no compute root signature")), "{:?}", rep.warnings.items);
+    assert!(rep.warnings.items.iter().any(|(i, m)| *i == 18 && m.contains("rects blob")), "{:?}", rep.warnings.items);
+}
+

@@ -1,0 +1,1844 @@
+// Included into `emu_jit_ext.rs`: native arm64/NEON code generation for `K_VAES_RR..=K_PCMPSTR`
+// (`115..=124`), completing 100% native arm64/NEON coverage across all `FastOp` kinds.
+
+impl Asm {
+    fn tbz(&mut self, t: u32, bit: u32) -> usize {
+        self.emit(0x3600_0000 | (bit >> 5) << 31 | (bit & 31) << 19 | t);
+        self.pos - 1
+    }
+    fn v_aese(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4E28_4800 | vn << 5 | vd);
+    }
+    fn v_aesd(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4E28_5800 | vn << 5 | vd);
+    }
+    fn v_aesmc(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4E28_6800 | vn << 5 | vd);
+    }
+    fn v_aesimc(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4E28_7800 | vn << 5 | vd);
+    }
+    fn v_rev64_4s(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4EA0_0800 | vn << 5 | vd);
+    }
+    fn v_sha256h(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_4000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha256h2(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_5000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha256su0(&mut self, vd: u32, vn: u32) {
+        self.emit(0x5E28_2800 | vn << 5 | vd);
+    }
+    fn v_sha256su1(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_6000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha1c(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_0000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha1p(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_1000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha1m(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5E00_2000 | vm << 16 | vn << 5 | vd);
+    }
+    fn v_sha1su1(&mut self, vd: u32, vn: u32) {
+        self.emit(0x5E28_1800 | vn << 5 | vd);
+    }
+    fn v_fcvtl_h(&mut self, q: bool, vd: u32, vn: u32) {
+        self.emit(0x0E21_7800 | (q as u32) << 30 | vn << 5 | vd);
+    }
+    fn v_fcvtn_h(&mut self, q: bool, vd: u32, vn: u32) {
+        self.emit(0x0E21_6800 | (q as u32) << 30 | vn << 5 | vd);
+    }
+    fn ldaxr(&mut self, bits: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x085F_FC00 | sz << 30 | rn << 5 | rt);
+    }
+    fn stlxr(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x0800_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
+    }
+    fn ldaxp_x(&mut self, rt: u32, rt2: u32, rn: u32) {
+        self.emit(0xC87F_8000 | rt2 << 10 | rn << 5 | rt);
+    }
+    fn stlxp_x(&mut self, rs: u32, rt: u32, rt2: u32, rn: u32) {
+        self.emit(0xC820_8000 | rs << 16 | rt2 << 10 | rn << 5 | rt);
+    }
+    fn clrex(&mut self) {
+        self.emit(0xD503_3F5F);
+    }
+    fn ldr_reg(&mut self, bits: u32, signed: bool, rt: u32, rn: u32, rm: u32, shift: bool) {
+        let sz = (bits / 8).trailing_zeros();
+        let opc = if signed { 0b10 } else { 0b01 };
+        let s = (shift as u32) << 12;
+        self.emit(0x3820_6800 | sz << 30 | opc << 22 | rm << 16 | s | rn << 5 | rt);
+    }
+}
+
+impl Tr<'_> {
+    /// Load an 8-bit source operand for `K_HI8` into `dst` (zero-extended to 64 bits).
+    fn rd_hi8_src(&mut self, k: usize, op: &FastOp, spec: u8, dst: u32) -> Option<u32> {
+        if spec & 0x40 != 0 {
+            let a = self.addr_into(op, XA);
+            self.load(k, dst, a, 8, Self::chk_of(op));
+            Some(a)
+        } else if spec & 0x20 != 0 {
+            self.a.mov_imm(false, dst, op.imm & 0xFF);
+            None
+        } else {
+            let idx = spec & 0x0F;
+            if spec & 0x80 != 0 {
+                self.a.ubfx(dst, g(idx), 8, 8);
+            } else {
+                self.a.ubfm(false, dst, g(idx), 0, 7);
+            }
+            None
+        }
+    }
+
+    /// Write an 8/16/32/64-bit result for `K_HI8` according to `spec`.
+    fn wr_hi8_dst(&mut self, spec: u8, w: u8, val: u32, mem_addr: Option<u32>) {
+        if spec & 0x40 != 0 {
+            self.store_checked_addr(val, mem_addr.unwrap(), 8);
+        } else if spec & 0x80 != 0 {
+            let idx = spec & 0x0F;
+            self.a.bfm(true, g(idx), val, 56, 7);
+            self.set_lb(idx, 64);
+        } else {
+            self.wr_gpr(spec & 0x0F, w, val);
+        }
+    }
+
+    fn emit_more_op(&mut self, k: usize, op: &FastOp) {
+        use fast::*;
+        let w = op.w;
+        let wb = w as u32;
+        let la = self.live[k + 1];
+        match op.kind {
+            K_VAES_RR | K_VAES_RM => {
+                let sub = op.x & 0x3F;
+                let imm8 = op.imm as u8;
+                if op.kind == K_VAES_RM {
+                    let a = self.addr_into(op, XA);
+                    if Self::chk_of(op) == Chk::Full {
+                        let se = self.side_exit_here(k);
+                        self.range_check_to(a, se);
+                    }
+                    self.a.ldr(64, T0, a, 0);
+                    self.a.ldr(64, T1, a, 8);
+                    if mem::tso() {
+                        self.a.dmb_ishld();
+                    }
+                    self.a.fmov_gf(true, 1, T0);
+                    self.a.v_ins_d(1, 1, T1);
+                } else {
+                    self.xsrc(1, op.r1);
+                }
+                if sub <= 3 {
+                    self.xsrc(0, (op.imm >> 8) as u8);
+                }
+                match sub {
+                    0 => {
+                        self.a.v_zero(2);
+                        self.a.v_aese(0, 2);
+                        self.a.v_aesmc(0, 0);
+                        self.a.v_eor(0, 0, 1);
+                    }
+                    1 => {
+                        self.a.v_zero(2);
+                        self.a.v_aese(0, 2);
+                        self.a.v_eor(0, 0, 1);
+                    }
+                    2 => {
+                        self.a.v_zero(2);
+                        self.a.v_aesd(0, 2);
+                        self.a.v_aesimc(0, 0);
+                        self.a.v_eor(0, 0, 1);
+                    }
+                    3 => {
+                        self.a.v_zero(2);
+                        self.a.v_aesd(0, 2);
+                        self.a.v_eor(0, 0, 1);
+                    }
+                    4 => {
+                        self.a.v_aesimc(0, 1);
+                    }
+                    _ => {
+                        self.a.v_zero(2);
+                        self.a.v_aese(1, 2);
+                        self.a.mov_imm(true, T0, 0x040B_0E01_0B0E_0104);
+                        self.a.mov_imm(true, T1, 0x0C03_0609_0306_090C);
+                        self.a.fmov_gf(true, 2, T0);
+                        self.a.v_ins_d(2, 1, T1);
+                        self.a.v_tbl1(0, 1, 2);
+                        self.a.mov_imm(true, T0, (imm8 as u64) << 32);
+                        self.a.v_dup(3, 2, T0);
+                        self.a.v_eor(0, 0, 2);
+                    }
+                }
+                self.vstore_dst(op);
+            }
+            K_VCVT_PH => {
+                let sub = op.x & 0x1F;
+                let mem = (op.x & 0x20) != 0;
+                if sub == 0 {
+                    // Vcvtph2ps
+                    let is_256 = (op.w & 3) == VM_V256;
+                    if mem {
+                        let a = self.addr_into(op, XA);
+                        if is_256 {
+                            if Self::chk_of(op) == Chk::Full {
+                                let se = self.side_exit_here(k);
+                                self.range_check_to(a, se);
+                            }
+                            self.a.ldr(64, T0, a, 0);
+                            self.a.ldr(64, T1, a, 8);
+                            if mem::tso() {
+                                self.a.dmb_ishld();
+                            }
+                            self.a.fmov_gf(true, 0, T0);
+                            self.a.v_ins_d(0, 1, T1);
+                        } else {
+                            self.load(k, T0, a, 64, Self::chk_of(op));
+                            self.a.fmov_gf(true, 0, T0);
+                        }
+                    } else {
+                        self.xsrc(0, op.r1);
+                    }
+                    if is_256 {
+                        self.a.v_fcvtl_h(true, 1, 0);
+                    }
+                    self.a.v_fcvtl_h(false, 0, 0);
+                    self.xwrite(op.r0, 0);
+                    if is_256 {
+                        self.write_ymm_hi(op.r0, 1);
+                    } else {
+                        self.clear_ymm_hi(op.r0);
+                    }
+                } else {
+                    // Vcvtps2ph
+                    let src_256 = op.w != 0;
+                    let s = (op.r1 as u32 & 15) * 16;
+                    self.xsrc(0, op.r1);
+                    if src_256 {
+                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + s);
+                    }
+                    let rmode = (op.imm as u8) & 3;
+                    if rmode != 0 {
+                        self.a.v_frint(false, rmode, 0, 0);
+                        if src_256 {
+                            self.a.v_frint(false, rmode, 1, 1);
+                        }
+                    }
+                    self.a.v_fcvtn_h(false, 0, 0);
+                    if src_256 {
+                        self.a.v_fcvtn_h(true, 0, 1);
+                    }
+                    if mem {
+                        let a = self.addr_into(op, XA);
+                        if src_256 {
+                            let chk = Self::chk_of(op);
+                            if chk == Chk::Full {
+                                let se = self.side_exit_here(k);
+                                self.range_check_to(a, se);
+                            }
+                            self.a.fmov_fg(true, T0, 0);
+                            self.a.v_umov_d(T1, 0, 1);
+                            if mem::tso() && (chk != Chk::Stack || stack_tso()) {
+                                self.a.dmb_ishst();
+                            }
+                            self.a.str(64, T0, a, 0);
+                            self.a.str(64, T1, a, 8);
+                        } else {
+                            self.a.fmov_fg(true, T0, 0);
+                            self.store(k, T0, a, 64, Self::chk_of(op));
+                        }
+                    } else {
+                        self.xwrite(op.r0, 0);
+                        self.clear_ymm_hi(op.r0);
+                    }
+                }
+            }
+            K_VMASKMOV => {
+                let is_store = (op.x & 0x20) != 0;
+                let is_256 = (op.w & 3) == VM_V256;
+                let is_q = (op.w & 4) != 0;
+                let (lg, ebits, esz, per_lane) = if is_q {
+                    (3u32, 64u32, 8u32, 2u32)
+                } else {
+                    (2, 32, 4, 4)
+                };
+                let d_or_s = (op.r0 as u32 & 15) * 16;
+                let m_off = (op.r1 as u32 & 15) * 16;
+                let base_a = self.addr_into(op, T5);
+                if base_a != T5 {
+                    self.a.mov_rr(true, T5, base_a);
+                }
+                self.xsrc(2, op.r1);
+                if is_256 {
+                    self.a.ldr(128, 3, XCPU, OFF_YMM_HI + m_off);
+                }
+                let halves = if is_256 { 2u32 } else { 1u32 };
+                if !is_store {
+                    self.a.v_zero(0);
+                    self.a.v_zero(1);
+                    for h in 0..halves {
+                        for lane in 0..per_lane {
+                            self.a.v_umov_elem(lg, T1, 2 + h, lane);
+                            let skip = self.a.tbz(T1, ebits - 1);
+                            let off_bytes = h * 16 + lane * esz;
+                            self.a.add_imm(true, XA, T5, off_bytes as i64);
+                            self.load(k, T0, XA, ebits, Chk::Full);
+                            self.a.v_ins_elem(lg, h, lane, T0);
+                            self.a.bind(skip);
+                        }
+                    }
+                    self.xwrite(op.r0, 0);
+                    if is_256 {
+                        self.write_ymm_hi(op.r0, 1);
+                    } else {
+                        self.clear_ymm_hi(op.r0);
+                    }
+                } else {
+                    self.xsrc(0, op.r0);
+                    if is_256 {
+                        self.a.ldr(128, 1, XCPU, OFF_YMM_HI + d_or_s);
+                    }
+                    for h in 0..halves {
+                        for lane in 0..per_lane {
+                            self.a.v_umov_elem(lg, T1, 2 + h, lane);
+                            let skip = self.a.tbz(T1, ebits - 1);
+                            self.a.v_umov_elem(lg, T0, h, lane);
+                            let off_bytes = h * 16 + lane * esz;
+                            self.a.add_imm(true, XA, T5, off_bytes as i64);
+                            self.store(k, T0, XA, ebits, Chk::Full);
+                            self.a.bind(skip);
+                        }
+                    }
+                }
+            }
+            K_SYS_MISC => {
+                let sub = op.x & 0x3F;
+                match sub {
+                    0 => {
+                        // Lahf
+                        self.flush_flags(FC | FZ | FS | FP);
+                        self.a.ldr(8, T0, XCPU, OFF_SF);
+                        self.a.lsl_i(false, T0, T0, 7);
+                        self.a.ldr(8, T1, XCPU, OFF_ZF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 6);
+                        self.a.ldr(8, T1, XCPU, OFF_PFV);
+                        self.a.fmov_gf(false, 0, T1);
+                        self.a.v_cnt_8b(0, 0);
+                        self.a.fmov_fg(false, T1, 0);
+                        self.a.logic_ri(false, 2, T1, T1, enc_logic_imm(1, false).unwrap());
+                        self.a.ubfm(false, T1, T1, 0, 0);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 2);
+                        self.a.ldr(8, T1, XCPU, OFF_CF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 0);
+                        self.a.movz(false, T1, 2, 0);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 0);
+                        self.a.bfm(true, g(0), T0, 56, 7);
+                        self.set_lb(0, 64);
+                    }
+                    1 => {
+                        // Sahf
+                        self.a.ubfx(T0, g(0), 8, 8);
+                        if la & FS != 0 {
+                            self.a.ubfx(T1, T0, 7, 1);
+                            self.a.str(8, T1, XCPU, OFF_SF);
+                        }
+                        if la & FZ != 0 {
+                            self.a.ubfx(T1, T0, 6, 1);
+                            self.a.str(8, T1, XCPU, OFF_ZF);
+                        }
+                        if la & FC != 0 {
+                            self.a.ubfx(T1, T0, 0, 1);
+                            self.a.str(8, T1, XCPU, OFF_CF);
+                        }
+                        if la & FP != 0 {
+                            self.a.ubfx(T1, T0, 2, 1);
+                            self.a.logic_ri(false, 2, T1, T1, enc_logic_imm(1, false).unwrap());
+                            self.a.str(8, T1, XCPU, OFF_PFV);
+                        }
+                        self.fs.host &= !(FC | FZ | FS | FP);
+                        self.fs.mem = (self.fs.mem & !(FC | FZ | FS | FP)) | (la & (FC | FZ | FS | FP));
+                    }
+                    2 => {
+                        // Pushf / Pushfq
+                        self.flush_flags(FALL);
+                        self.a.movz(false, T0, 0x202, 0);
+                        self.a.ldr(8, T1, XCPU, OFF_CF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 0);
+                        self.a.ldr(8, T1, XCPU, OFF_PFV);
+                        self.a.fmov_gf(false, 0, T1);
+                        self.a.v_cnt_8b(0, 0);
+                        self.a.fmov_fg(false, T1, 0);
+                        self.a.logic_ri(false, 2, T1, T1, enc_logic_imm(1, false).unwrap());
+                        self.a.ubfm(false, T1, T1, 0, 0);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 2);
+                        self.a.ldr(8, T1, XCPU, OFF_ZF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 6);
+                        self.a.ldr(8, T1, XCPU, OFF_SF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 7);
+                        self.a.ldr(8, T1, XCPU, OFF_DF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 10);
+                        self.a.ldr(8, T1, XCPU, OFF_OF);
+                        self.a.logic_rr(false, 1, T0, T0, T1, 0, 11);
+                        self.a.addsub_ri(true, true, false, XA, g(4), wb / 8, false);
+                        self.store(k, T0, XA, wb, if wb == 64 { Chk::Stack } else { Chk::Full });
+                        self.a.mov_rr(true, g(4), XA);
+                    }
+                    3 => {
+                        // Popf / Popfq
+                        self.load(k, T0, g(4), wb, if wb == 64 { Chk::Stack } else { Chk::Full });
+                        self.a.addsub_ri(true, false, false, g(4), g(4), wb / 8, false);
+                        self.a.ubfx(T1, T0, 0, 1);
+                        self.a.str(8, T1, XCPU, OFF_CF);
+                        self.a.ubfx(T1, T0, 2, 1);
+                        self.a.logic_ri(false, 2, T1, T1, enc_logic_imm(1, false).unwrap());
+                        self.a.str(8, T1, XCPU, OFF_PFV);
+                        self.a.ubfx(T1, T0, 6, 1);
+                        self.a.str(8, T1, XCPU, OFF_ZF);
+                        self.a.ubfx(T1, T0, 7, 1);
+                        self.a.str(8, T1, XCPU, OFF_SF);
+                        self.a.ubfx(T1, T0, 10, 1);
+                        self.a.str(8, T1, XCPU, OFF_DF);
+                        self.a.ubfx(T1, T0, 11, 1);
+                        self.a.str(8, T1, XCPU, OFF_OF);
+                        self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
+                    }
+                    4 => {
+                        // Stmxcsr / Vstmxcsr
+                        let a = self.addr_into(op, XA);
+                        self.a.ldr(32, T0, XCPU, OFF_MXCSR);
+                        self.store(k, T0, a, 32, Self::chk_of(op));
+                    }
+                    5 => {
+                        // Fnstcw
+                        let a = self.addr_into(op, XA);
+                        self.a.mov_imm(false, T0, 0x037F);
+                        self.store(k, T0, a, 16, Self::chk_of(op));
+                    }
+                    6 => {
+                        // Xlatb
+                        self.a.ubfm(true, T0, g(0), 0, 7);
+                        self.a.addsub_rr(true, false, false, XA, g(3), T0, 0);
+                        self.load(k, T1, XA, 8, Chk::Full);
+                        self.wr_gpr(0, 8, T1);
+                    }
+                    7 => {
+                        // Xgetbv
+                        self.a.movz(true, g(0), 7, 0);
+                        self.a.movz(true, g(2), 0, 0);
+                        self.set_lb(0, 64);
+                        self.set_lb(2, 64);
+                    }
+                    8 => {
+                        // Rdtsc / Rdtscp
+                        self.a.movz(true, g(0), 0x1000, 0);
+                        self.a.movz(true, g(2), 0, 0);
+                        self.set_lb(0, 64);
+                        self.set_lb(2, 64);
+                        if w != 0 {
+                            self.a.movz(true, g(1), 0, 0);
+                            self.set_lb(1, 64);
+                        }
+                    }
+                    9 => {
+                        // Cpuid
+                        self.flush_flags(self.live[k]);
+                        self.fs.host = 0;
+                        self.a.mov_rr(false, T0, g(0)); // leaf = eax
+                        let mut exits = Vec::new();
+                        let table: &[(u32, u32, u32, u32, u32)] = &[
+                            (0, 7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+                            (1, 0x0009_06ea, 0x0010_0800, 0x7ed8_3223, 0x178b_8111),
+                            (7, 0, 0x200c_07a9, 0, 0),
+                            (0x8000_0000, 0x8000_0008, 0, 0, 0),
+                            (0x8000_0001, 0, 0, 0x0000_0161, 0x2810_0800),
+                            (0x8000_0002, 0x6c70_7041, 0x6953_2065, 0x6f63_696c, 0x2d4d_206e),
+                            (0x8000_0003, 0x6972_6553, 0x2820_7365, 0x2032_5741, 0x6974_614e),
+                            (0x8000_0004, 0x4120_6576, 0x3436_4d52, 0x2020_2029, 0x2020_2020),
+                        ];
+                        for &(leaf, ra, rb, rc, rd_v) in table {
+                            self.a.mov_imm(false, T1, leaf as u64);
+                            self.a.addsub_rr(false, true, true, ZR, T0, T1, 0);
+                            let next = self.a.bcond(NE);
+                            self.a.mov_imm(false, g(0), ra as u64);
+                            self.a.mov_imm(false, g(3), rb as u64);
+                            self.a.mov_imm(false, g(1), rc as u64);
+                            self.a.mov_imm(false, g(2), rd_v as u64);
+                            exits.push(self.a.b());
+                            self.a.bind(next);
+                        }
+                        self.a.movz(true, g(0), 0, 0);
+                        self.a.movz(true, g(3), 0, 0);
+                        self.a.movz(true, g(1), 0, 0);
+                        self.a.movz(true, g(2), 0, 0);
+                        for e in exits {
+                            self.a.bind(e);
+                        }
+                        self.set_lb(0, 64);
+                        self.set_lb(1, 64);
+                        self.set_lb(2, 64);
+                        self.set_lb(3, 64);
+                    }
+                    10 => {
+                        // 16-bit push
+                        match w {
+                            0 => self.a.ubfm(false, T0, g(op.r0), 0, 15),
+                            1 => {
+                                let a = self.addr_into(op, XA);
+                                self.load(k, T0, a, 16, Self::chk_of(op));
+                            }
+                            _ => self.a.mov_imm(false, T0, op.imm & 0xFFFF),
+                        }
+                        self.a.addsub_ri(true, true, false, XA, g(4), 2, false);
+                        self.store(k, T0, XA, 16, Chk::Full);
+                        self.a.mov_rr(true, g(4), XA);
+                    }
+                    11 => {
+                        // 16-bit pop
+                        self.load(k, T0, g(4), 16, Chk::Full);
+                        if w == 0 {
+                            self.a.addsub_ri(true, false, false, g(4), g(4), 2, false);
+                            self.wr_gpr(op.r0, 16, T0);
+                        } else {
+                            self.a.addsub_ri(true, false, false, g(4), g(4), 2, false);
+                            let a = self.addr_into(op, XA);
+                            self.a.addsub_ri(true, true, false, g(4), g(4), 2, false);
+                            self.store(k, T0, a, 16, Self::chk_of(op));
+                            self.a.addsub_ri(true, false, false, g(4), g(4), 2, false);
+                        }
+                    }
+                    12 => {
+                        // Enter imm16, 0: push rbp; mov rbp, rsp; sub rsp, imm16
+                        self.a.addsub_ri(true, true, false, XA, g(4), 8, false);
+                        self.store(k, g(5), XA, 64, Chk::Stack);
+                        self.a.mov_rr(true, g(5), XA);
+                        if op.imm != 0 {
+                            self.a.mov_imm(true, T0, op.imm & 0xFFFF);
+                            self.a.addsub_rr(true, true, false, g(4), XA, T0, 0);
+                        } else {
+                            self.a.mov_rr(true, g(4), XA);
+                        }
+                        self.set_lb(4, 64);
+                        self.set_lb(5, 64);
+                    }
+                    13 => {
+                        // Rdrand / Rdseed: dst = non-zero pseudo-entropy, CF = 1, OF=SF=ZF=AF=PF=0
+                        self.a.mov_imm(true, T0, 0x9E37_79B9_7F4A_7C15);
+                        self.wr_gpr(op.r0, op.w, T0);
+                        self.a.movz(false, T1, 1, 0);
+                        self.a.str(8, T1, XCPU, OFF_CF);
+                        self.a.str(8, ZR, XCPU, OFF_ZF);
+                        self.a.str(8, ZR, XCPU, OFF_SF);
+                        self.a.str(8, ZR, XCPU, OFF_OF);
+                        self.a.str(8, ZR, XCPU, OFF_PFV);
+                        self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
+                    }
+                    14 => {
+                        // Ldmxcsr / Vldmxcsr: update `Cpu::jx.mxcsr` and sync ARM64 hardware
+                        // `FPCR` (FZ = bit 24 when FTZ|DAZ set, RMode = bits 23:22 from MXCSR
+                        // RC bits 14:13) without disturbing host NZCV flags. Skip serializing
+                        // `msr fpcr` when unchanged.
+                        let a = self.addr_into(op, XA);
+                        self.load(k, T0, a, 32, Self::chk_of(op));
+                        self.a.ubfm(false, T0, T0, 0, 15);
+                        self.a.str(32, T0, XCPU, OFF_MXCSR);
+                        // RMode: MXCSR[13] -> FPCR[23], MXCSR[14] -> FPCR[22]
+                        self.a.ubfx(T1, T0, 13, 1);
+                        self.a.lsl_i(true, T1, T1, 23);
+                        self.a.ubfx(T2, T0, 14, 1);
+                        self.a.logic_rr(true, 1, T1, T1, T2, 0, 22);
+                        // FZ: (MXCSR[15] | MXCSR[6]) -> FPCR[24]
+                        self.a.ubfx(T2, T0, 15, 1);
+                        self.a.ubfx(T3, T0, 6, 1);
+                        self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
+                        self.a.logic_rr(true, 1, T1, T1, T2, 0, 24);
+                        // Preserve non-[24:22] bits of FPCR and skip `msr` if already equal.
+                        self.a.mrs_fpcr(T2);
+                        self.a.logic_ri(true, 0, T3, T2, enc_logic_imm(!(7u64 << 22), true).unwrap());
+                        self.a.logic_rr(true, 1, T1, T3, T1, 0, 0);
+                        self.a.logic_rr(true, 2, T3, T2, T1, 0, 0);
+                        let same = self.a.cbz(true, T3);
+                        self.a.msr_fpcr(T1);
+                        self.a.bind(same);
+                    }
+                    _ => {}
+                }
+            }
+            K_HI8 => self.emit_hi8_op(k, op),
+            K_STRING => self.emit_string_op(k, op),
+            K_BIT_EXT => self.emit_bit_ext_op(k, op),
+            K_ATOMIC => self.emit_atomic_op(k, op),
+            K_PCMPSTR => self.emit_pcmpstr_op(k, op),
+            K_VSHA_RR | K_VSHA_RM => {
+                let sub = op.x & 0x3F;
+                if op.kind == K_VSHA_RM {
+                    let a = self.addr_into(op, XA);
+                    if Self::chk_of(op) == Chk::Full {
+                        let se = self.side_exit_here(k);
+                        self.range_check_to(a, se);
+                    }
+                    self.a.ldr(64, T0, a, 0);
+                    self.a.ldr(64, T1, a, 8);
+                    if mem::tso() {
+                        self.a.dmb_ishld();
+                    }
+                    self.a.fmov_gf(true, 1, T0);
+                    self.a.v_ins_d(1, 1, T1);
+                } else {
+                    self.xsrc(1, op.r1);
+                }
+                self.xsrc(0, op.r0);
+                match sub {
+                    0 => {
+                        // Sha1rnds4 xmm1, xmm2/m128, imm8
+                        let func = (op.imm as u8) & 3;
+                        let k_val: u32 = match func {
+                            0 => 0x5A82_7999,
+                            1 => 0x6ED9_EBA1,
+                            2 => 0x8F1B_BCDC,
+                            _ => 0xCA62_C1D6,
+                        };
+                        self.a.v_rev64_4s(0, 0);
+                        self.a.v_ext(0, 0, 0, 8);
+                        self.a.v_rev64_4s(1, 1);
+                        self.a.v_ext(1, 1, 1, 8);
+                        self.a.mov_imm(false, T0, k_val as u64);
+                        self.a.v_dup(2, 2, T0);
+                        self.a.neon_3same(false, 2, 16, 1, 1, 2); // add v1.4s, v1.4s, v2.4s
+                        self.a.v_zero(2);
+                        match func {
+                            0 => self.a.v_sha1c(0, 2, 1),
+                            2 => self.a.v_sha1m(0, 2, 1),
+                            _ => self.a.v_sha1p(0, 2, 1),
+                        }
+                        self.a.v_rev64_4s(0, 0);
+                        self.a.v_ext(0, 0, 0, 8);
+                    }
+                    1 => {
+                        // Sha1nexte xmm1, xmm2/m128
+                        self.a.v_umov_elem(2, T0, 0, 3);
+                        self.a.ror_i(false, T0, T0, 2);
+                        self.a.v_umov_elem(2, T1, 1, 3);
+                        self.a.addsub_rr(false, false, false, T0, T0, T1, 0);
+                        self.a.v_mov(0, 1);
+                        self.a.v_ins_s(0, 3, T0);
+                    }
+                    2 => {
+                        // Sha1msg1 xmm1, xmm2/m128
+                        self.a.v_ext(2, 1, 0, 8);
+                        self.a.v_eor(0, 0, 2);
+                    }
+                    3 => {
+                        // Sha1msg2 xmm1, xmm2/m128
+                        self.a.v_rev64_4s(0, 0);
+                        self.a.v_ext(0, 0, 0, 8);
+                        self.a.v_rev64_4s(1, 1);
+                        self.a.v_ext(1, 1, 1, 8);
+                        self.a.v_sha1su1(0, 1);
+                        self.a.v_rev64_4s(0, 0);
+                        self.a.v_ext(0, 0, 0, 8);
+                    }
+                    4 => {
+                        // Sha256rnds2 xmm1, xmm2/m128, <XMM0>
+                        self.xsrc(6, 0);
+                        self.a.v_rev64_4s(2, 0);
+                        self.a.v_rev64_4s(3, 1);
+                        self.a.v_zip1(3, 4, 3, 2);
+                        self.a.v_zip2(3, 5, 3, 2);
+                        self.a.v_mov(3, 5);
+                        self.a.v_sha256h(5, 4, 6);
+                        self.a.v_sha256h2(4, 3, 6);
+                        self.a.v_zip2(3, 0, 4, 5);
+                        self.a.v_rev64_4s(0, 0);
+                    }
+                    5 => {
+                        // Sha256msg1 xmm1, xmm2/m128
+                        self.a.v_sha256su0(0, 1);
+                    }
+                    _ => {
+                        // Sha256msg2 xmm1, xmm2/m128
+                        self.a.v_zero(2);
+                        self.a.v_zip2(3, 3, 2, 1);
+                        self.a.v_sha256su1(0, 2, 3);
+                    }
+                }
+                self.xwrite(op.r0, 0);
+            }
+            _ => unreachable!("unsupported op kind {}", op.kind),
+        }
+    }
+
+    fn emit_hi8_op(&mut self, k: usize, op: &FastOp) {
+        let sub = op.x & 0x3F;
+        let la = self.live[k + 1];
+        match sub {
+            0 => {
+                // mov
+                let _ = self.rd_hi8_src(k, op, op.r1, T0);
+                let dst_a = if op.r0 & 0x40 != 0 {
+                    let a = self.addr_into(op, XA);
+                    if Self::chk_of(op) == Chk::Full {
+                        let se = self.side_exit_here(k);
+                        self.range_check_to(a, se);
+                    }
+                    Some(a)
+                } else {
+                    None
+                };
+                self.wr_hi8_dst(op.r0, op.w, T0, dst_a);
+            }
+            1 => {
+                // movzx
+                let _ = self.rd_hi8_src(k, op, op.r1, T0);
+                self.wr_hi8_dst(op.r0, op.w, T0, None);
+            }
+            2 => {
+                // movsx
+                let _ = self.rd_hi8_src(k, op, op.r1, T0);
+                self.a.sbfm(true, T0, T0, 0, 7);
+                self.wr_hi8_dst(op.r0, op.w, T0, None);
+            }
+            3..=11 => {
+                // add(3), sub(4), and(5), or(6), xor(7), cmp(8), test(9), adc(10), sbb(11)
+                let a_sub = sub - 3;
+                if matches!(a_sub, 7 | 8) {
+                    self.flag_reg(FC, T6);
+                }
+                let dst_a = self.rd_hi8_src(k, op, op.r0, T3);
+                let _ = self.rd_hi8_src(k, op, op.r1, T4);
+                let writes = !matches!(a_sub, 5 | 6);
+                let need_nzcv = la & FNZCV != 0;
+                let need_pf = la & FP != 0;
+                if matches!(a_sub, 7 | 8) {
+                    let is_sub = a_sub == 8;
+                    self.a.addsub_rr(false, is_sub, false, T5, T3, T4, 0);
+                    self.a.addsub_rr(false, is_sub, false, T5, T5, T6, 0);
+                    self.a.ubfm(false, T2, T5, 0, 7);
+                    if need_nzcv {
+                        if la & FC != 0 {
+                            self.a.ubfx(XS, T5, 8, 1);
+                            self.a.str(8, XS, XCPU, OFF_CF);
+                        }
+                        if la & FZ != 0 {
+                            self.a.clz(true, XS, T2);
+                            self.a.lsr_i(true, XS, XS, 6);
+                            self.a.str(8, XS, XCPU, OFF_ZF);
+                        }
+                        if la & FS != 0 {
+                            self.a.ubfx(XS, T2, 7, 1);
+                            self.a.str(8, XS, XCPU, OFF_SF);
+                        }
+                        if la & FO != 0 {
+                            if is_sub {
+                                self.a.logic_rr(false, 2, T4, T3, T4, 0, 0);
+                                self.a.logic_rr(false, 2, T3, T3, T2, 0, 0);
+                            } else {
+                                self.a.logic_rr(false, 2, T3, T3, T2, 0, 0);
+                                self.a.logic_rr(false, 2, T4, T4, T2, 0, 0);
+                            }
+                            self.a.logic_rr(false, 0, T3, T3, T4, 0, 0);
+                            self.a.ubfx(XS, T3, 7, 1);
+                            self.a.str(8, XS, XCPU, OFF_OF);
+                        }
+                    }
+                    if writes {
+                        self.wr_hi8_dst(op.r0, 8, T2, dst_a);
+                    }
+                    if need_pf {
+                        self.a.str(8, T2, XCPU, OFF_PFV);
+                    }
+                    self.fs = FlagState {
+                        src: Src::None,
+                        host: 0,
+                        mem: (self.fs.mem & !FALL) | (la & FALL),
+                    };
+                } else {
+                    self.a.lsl_i(true, T3, T3, 56);
+                    self.a.lsl_i(true, T4, T4, 56);
+                    match a_sub {
+                        0 => self.a.addsub_rr(true, false, true, T5, T3, T4, 0),
+                        1 | 5 => self.a.addsub_rr(true, true, true, T5, T3, T4, 0),
+                        2 | 6 => self.a.logic_rr(true, 3, T5, T3, T4, 0, 0),
+                        3 => {
+                            self.a.logic_rr(true, 1, T5, T3, T4, 0, 0);
+                            self.a.logic_rr(true, 3, ZR, T5, T5, 0, 0);
+                        }
+                        _ => {
+                            self.a.logic_rr(true, 2, T5, T3, T4, 0, 0);
+                            self.a.logic_rr(true, 3, ZR, T5, T5, 0, 0);
+                        }
+                    }
+                    self.a.lsr_i(true, T2, T5, 56);
+                    if writes {
+                        self.wr_hi8_dst(op.r0, 8, T2, dst_a);
+                    }
+                    if need_pf {
+                        self.a.str(8, T2, XCPU, OFF_PFV);
+                    }
+                    self.fs.mem &= !FALL;
+                    if need_pf {
+                        self.fs.mem |= FP;
+                    }
+                    self.fs.host = if need_nzcv { la & FNZCV } else { 0 };
+                    self.fs.src = match a_sub {
+                        0 => Src::Add,
+                        1 | 5 => Src::Sub,
+                        _ => Src::Logic,
+                    };
+                }
+            }
+            12 | 13 => {
+                // inc / dec
+                let dec = sub == 13;
+                if la & FC != 0 && self.fs.host & FC != 0 && self.fs.mem & FC == 0 {
+                    self.flush_flags(FC);
+                }
+                let _ = self.rd_hi8_src(k, op, op.r0, T3);
+                self.a.lsl_i(true, T3, T3, 56);
+                self.a.mov_imm(true, T4, 1u64 << 56);
+                self.a.addsub_rr(true, dec, true, T5, T3, T4, 0);
+                self.a.lsr_i(true, T2, T5, 56);
+                self.wr_hi8_dst(op.r0, 8, T2, None);
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !(FZ | FS | FO | FP);
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & (FZ | FS | FO);
+                self.fs.src = Src::IncDec;
+            }
+            14 => {
+                // not
+                let _ = self.rd_hi8_src(k, op, op.r0, T0);
+                self.a.emit(0x2A20_03E0 | T0 << 16 | 31 << 5 | T0);
+                self.wr_hi8_dst(op.r0, 8, T0, None);
+            }
+            15 => {
+                // neg
+                let _ = self.rd_hi8_src(k, op, op.r0, T3);
+                self.a.lsl_i(true, T3, T3, 56);
+                self.a.addsub_rr(true, true, true, T5, ZR, T3, 0);
+                self.a.lsr_i(true, T2, T5, 56);
+                self.wr_hi8_dst(op.r0, 8, T2, None);
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Sub;
+            }
+            16..=20 => {
+                // shl(16), shr(17), sar(18), rol(19), ror(20)
+                self.flush_flags(la);
+                let _ = self.rd_hi8_src(k, op, op.r0, T0);
+                if op.r1 & 0x20 != 0 {
+                    self.a.mov_imm(false, T6, op.imm & 31);
+                } else {
+                    self.a.logic_ri(false, 0, T6, g(1), enc_logic_imm(31, false).unwrap());
+                }
+                let skip = self.a.cbz(false, T6);
+                if sub <= 18 {
+                    let mut of_zero = false;
+                    match sub {
+                        16 => {
+                            self.a.shiftv(true, 8, T4, T0, T6);
+                            self.a.ubfx(T2, T4, 8, 1);
+                            self.a.ubfm(true, T1, T4, 0, 7);
+                            self.a.ubfx(T3, T1, 7, 1);
+                            self.a.logic_rr(true, 2, T3, T3, T2, 0, 0);
+                        }
+                        17 => {
+                            self.a.shiftv(true, 9, T1, T0, T6);
+                            self.a.addsub_ri(true, true, false, T4, T6, 1, false);
+                            self.a.shiftv(true, 9, T2, T0, T4);
+                            self.a.ubfx(T2, T2, 0, 1);
+                            self.a.ubfx(T3, T0, 7, 1);
+                        }
+                        _ => {
+                            self.a.sbfm(true, XS, T0, 0, 7);
+                            self.a.shiftv(true, 10, T1, XS, T6);
+                            self.a.ubfm(true, T1, T1, 0, 7);
+                            self.a.addsub_ri(true, true, false, T4, T6, 1, false);
+                            self.a.shiftv(true, 10, T2, XS, T4);
+                            self.a.ubfx(T2, T2, 0, 1);
+                            of_zero = true;
+                        }
+                    }
+                    self.shift_flags(la, 8, of_zero);
+                } else {
+                    let ror = sub == 20;
+                    if ror {
+                        self.a.logic_ri(false, 0, T4, T6, enc_logic_imm(7, false).unwrap());
+                    } else {
+                        self.a.addsub_rr(false, true, false, T4, ZR, T6, 0);
+                        self.a.logic_ri(false, 0, T4, T4, enc_logic_imm(7, false).unwrap());
+                    }
+                    self.a.lsl_i(false, T2, T0, 8);
+                    self.a.logic_rr(false, 1, T2, T0, T2, 0, 0);
+                    self.a.shiftv(false, 9, T1, T2, T4);
+                    self.a.ubfm(false, T1, T1, 0, 7);
+                    self.a.ubfx(T2, T1, 7, 1);
+                    if ror {
+                        self.a.ubfx(T3, T1, 6, 1);
+                        self.a.logic_rr(false, 2, T3, T2, T3, 0, 0);
+                        self.a.str(8, T2, XCPU, OFF_CF);
+                        self.a.str(8, T3, XCPU, OFF_OF);
+                    } else {
+                        self.a.ubfx(T4, T1, 0, 1);
+                        self.a.logic_rr(false, 2, T3, T2, T4, 0, 0);
+                        self.a.str(8, T4, XCPU, OFF_CF);
+                        self.a.str(8, T3, XCPU, OFF_OF);
+                    }
+                }
+                self.wr_hi8_dst(op.r0, 8, T1, None);
+                self.a.bind(skip);
+                self.fs = FlagState {
+                    src: Src::None,
+                    host: 0,
+                    mem: (self.fs.mem & !FALL) | (la & FALL),
+                };
+            }
+            21 => {
+                // setcc
+                let c = self.cond((op.imm as u8) & 0x3F);
+                match c {
+                    Cond::Host(cnd) => self.a.cset(T0, cnd),
+                    Cond::Reg(r, inv) => {
+                        if inv {
+                            self.a.logic_ri(false, 2, T0, r, enc_logic_imm(1, false).unwrap());
+                        } else {
+                            self.a.mov_rr(false, T0, r);
+                        }
+                    }
+                    Cond::Const(b) => self.a.movz(false, T0, b as u32, 0),
+                }
+                self.wr_hi8_dst(op.r0, 8, T0, None);
+            }
+            22 => {
+                // xchg
+                let _ = self.rd_hi8_src(k, op, op.r0, T0);
+                let _ = self.rd_hi8_src(k, op, op.r1, T1);
+                self.wr_hi8_dst(op.r0, 8, T1, None);
+                self.wr_hi8_dst(op.r1, 8, T0, None);
+            }
+            23 => {
+                // xadd
+                let _ = self.rd_hi8_src(k, op, op.r0, T0);
+                let _ = self.rd_hi8_src(k, op, op.r1, T1);
+                self.a.lsl_i(true, T3, T0, 56);
+                self.a.lsl_i(true, T4, T1, 56);
+                self.a.addsub_rr(true, false, true, T5, T3, T4, 0);
+                self.a.lsr_i(true, T2, T5, 56);
+                self.wr_hi8_dst(op.r0, 8, T2, None);
+                self.wr_hi8_dst(op.r1, 8, T0, None);
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Add;
+            }
+            _ => {
+                // cmpxchg
+                self.a.ubfm(false, T0, g(0), 0, 7); // AL
+                let _ = self.rd_hi8_src(k, op, op.r0, T1);
+                let _ = self.rd_hi8_src(k, op, op.r1, T6);
+                self.a.lsl_i(true, T3, T0, 56);
+                self.a.lsl_i(true, T4, T1, 56);
+                self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
+                self.a.lsr_i(true, T2, T5, 56);
+                let neq = self.a.bcond(NE);
+                self.wr_hi8_dst(op.r0, 8, T6, None);
+                let done = self.a.b();
+                self.a.bind(neq);
+                self.wr_gpr(0, 8, T1);
+                self.a.bind(done);
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Sub;
+            }
+        }
+    }
+
+    fn emit_string_op(&mut self, k: usize, op: &FastOp) {
+        let wb = op.w as u32;
+        let step_bytes = wb / 8;
+        let op_k = op.x & 7;
+        let rep_mode = (op.x >> 3) & 3;
+        let la = self.live[k + 1];
+        if op_k >= 3 && rep_mode != 0 {
+            self.flush_flags(la);
+        }
+        // T4 = signed step (+step_bytes if DF==0 else -step_bytes)
+        self.a.movz(true, T4, step_bytes, 0);
+        self.a.ldr(8, T5, XCPU, OFF_DF);
+        let df_clear = self.a.cbz(false, T5);
+        self.a.addsub_rr(true, true, false, T4, ZR, T4, 0);
+        self.a.bind(df_clear);
+
+        let skip_rep = if rep_mode != 0 {
+            Some(self.a.cbz(true, g(1)))
+        } else {
+            None
+        };
+        let loop_top = self.a.pos;
+        match op_k {
+            0 => {
+                // movs
+                self.load(k, T0, g(6), wb, Chk::Full);
+                self.store(k, T0, g(7), wb, Chk::Full);
+                self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
+                self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
+            }
+            1 => {
+                // stos
+                self.store(k, g(0), g(7), wb, Chk::Full);
+                self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
+            }
+            2 => {
+                // lods
+                self.load(k, T0, g(6), wb, Chk::Full);
+                self.wr_gpr(0, op.w, T0);
+                self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
+            }
+            3 => {
+                // scas: acc - [rdi]
+                self.load(k, T1, g(7), wb, Chk::Full);
+                self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
+                let sh = 64 - wb;
+                if wb == 64 {
+                    self.a.addsub_rr(true, true, true, T2, g(0), T1, 0);
+                } else if wb == 32 {
+                    self.a.addsub_rr(false, true, true, T2, g(0), T1, 0);
+                } else {
+                    self.a.lsl_i(true, T0, g(0), sh);
+                    self.a.lsl_i(true, T1, T1, sh);
+                    self.a.addsub_rr(true, true, true, T3, T0, T1, 0);
+                    self.a.lsr_i(true, T2, T3, sh);
+                }
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Sub;
+                if rep_mode != 0 {
+                    self.flush_flags(la);
+                }
+            }
+            _ => {
+                // cmps: [rsi] - [rdi]
+                self.load(k, T0, g(6), wb, Chk::Full);
+                self.load(k, T1, g(7), wb, Chk::Full);
+                self.a.addsub_rr(true, false, false, g(6), g(6), T4, 0);
+                self.a.addsub_rr(true, false, false, g(7), g(7), T4, 0);
+                let sh = 64 - wb;
+                if wb == 64 {
+                    self.a.addsub_rr(true, true, true, T2, T0, T1, 0);
+                } else if wb == 32 {
+                    self.a.addsub_rr(false, true, true, T2, T0, T1, 0);
+                } else {
+                    self.a.lsl_i(true, T0, T0, sh);
+                    self.a.lsl_i(true, T1, T1, sh);
+                    self.a.addsub_rr(true, true, true, T3, T0, T1, 0);
+                    self.a.lsr_i(true, T2, T3, sh);
+                }
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Sub;
+                if rep_mode != 0 {
+                    self.flush_flags(la);
+                }
+            }
+        }
+        if rep_mode != 0 {
+            self.a.addsub_ri(true, true, false, g(1), g(1), 1, false);
+            let done_rcx = self.a.cbz(true, g(1));
+            if op_k >= 3 {
+                // repe (rep_mode==1) continues while EQ; repne (rep_mode==2) continues while NE.
+                let cont_cond = if rep_mode == 1 { EQ } else { NE };
+                let br = self.a.bcond(cont_cond);
+                self.a.patch(br, loop_top);
+            } else {
+                let br = self.a.b();
+                self.a.patch(br, loop_top);
+            }
+            self.a.bind(done_rcx);
+            self.set_lb(1, 64);
+        }
+        if let Some(s) = skip_rep {
+            self.a.bind(s);
+        }
+    }
+
+    fn emit_bit_ext_op(&mut self, k: usize, op: &FastOp) {
+        let wb = op.w as u32;
+        let sub = op.x & 0x0F;
+        let mem = (op.x & 0x20) != 0;
+        let imm_cnt = (op.x & 0x10) != 0;
+        let la = self.live[k + 1];
+        if sub <= 1 {
+            // Pdep (0) / Pext (1)
+            let x = wb == 64;
+            self.a.mov_rr(x, T0, g(op.imm as u8));
+            if mem {
+                let a = self.addr_into(op, XA);
+                self.load(k, T1, a, wb, Self::chk_of(op));
+            } else {
+                self.a.mov_rr(x, T1, g(op.r1));
+            }
+            self.a.movz(true, T2, 0, 0); // res = 0
+            if sub == 0 {
+                let done = self.a.cbz(true, T1);
+                let loop_top = self.a.pos;
+                self.a.addsub_rr(true, true, false, T3, ZR, T1, 0);
+                self.a.logic_rr(true, 0, T3, T1, T3, 0, 0); // T3 = m & -m
+                self.a.ubfx(T4, T0, 0, 1);
+                self.a.addsub_rr(true, true, false, T4, ZR, T4, 0);
+                self.a.logic_rr(true, 0, T4, T3, T4, 0, 0);
+                self.a.logic_rr(true, 1, T2, T2, T4, 0, 0);
+                self.a.lsr_i(true, T0, T0, 1);
+                self.a.bic_rr(true, T1, T1, T3);
+                let back = self.a.cbnz(true, T1);
+                self.a.patch(back, loop_top);
+                self.a.bind(done);
+            } else {
+                self.a.movz(true, T5, 1, 0); // out_bit = 1
+                let done = self.a.cbz(true, T1);
+                let loop_top = self.a.pos;
+                self.a.addsub_rr(true, true, false, T3, ZR, T1, 0);
+                self.a.logic_rr(true, 0, T3, T1, T3, 0, 0);
+                self.a.logic_rr(true, 0, T4, T0, T3, 0, 0);
+                self.a.clz(true, T4, T4);
+                self.a.lsr_i(true, T4, T4, 6);
+                self.a.logic_ri(false, 2, T4, T4, enc_logic_imm(1, false).unwrap());
+                self.a.addsub_rr(true, true, false, T4, ZR, T4, 0);
+                self.a.logic_rr(true, 0, T4, T5, T4, 0, 0);
+                self.a.logic_rr(true, 1, T2, T2, T4, 0, 0);
+                self.a.lsl_i(true, T5, T5, 1);
+                self.a.bic_rr(true, T1, T1, T3);
+                let back = self.a.cbnz(true, T1);
+                self.a.patch(back, loop_top);
+                self.a.bind(done);
+            }
+            self.wr_gpr(op.r0, op.w, T2);
+        } else {
+            // Rcl (2) / Rcr (3)
+            self.flush_flags(la | FC);
+            let rcl = sub == 2;
+            let addr = if mem {
+                let a = self.addr_into(op, XA);
+                self.load(k, T0, a, wb, Self::chk_of(op));
+                Some(a)
+            } else {
+                let u = self.ua(op.r0, wb);
+                if u != T0 {
+                    self.a.mov_rr(true, T0, u);
+                }
+                None
+            };
+            let mask = if wb == 64 { 63u64 } else { 31u64 };
+            if imm_cnt {
+                self.a.mov_imm(false, T6, op.imm & mask);
+            } else {
+                self.a.logic_ri(false, 0, T6, g(1), enc_logic_imm(mask, false).unwrap());
+            }
+            let skip = self.a.cbz(false, T6);
+            if wb == 8 || wb == 16 {
+                let m = wb + 1;
+                self.a.movz(false, T2, m, 0);
+                self.a.udiv(false, T3, T6, T2);
+                self.a.msub(false, T6, T3, T2, T6);
+            }
+            self.a.ldr(8, T1, XCPU, OFF_CF);
+            let done_loop = self.a.cbz(false, T6);
+            let loop_top = self.a.pos;
+            if rcl {
+                self.a.ubfx(T2, T0, wb - 1, 1);
+                self.a.lsl_i(true, T0, T0, 1);
+                self.a.logic_rr(true, 1, T0, T0, T1, 0, 0);
+                if wb < 64 {
+                    self.a.ubfm(true, T0, T0, 0, wb - 1);
+                }
+                self.a.mov_rr(false, T1, T2);
+            } else {
+                self.a.ubfx(T2, T0, 0, 1);
+                self.a.lsr_i(true, T0, T0, 1);
+                self.a.lsl_i(true, T3, T1, wb - 1);
+                self.a.logic_rr(true, 1, T0, T0, T3, 0, 0);
+                self.a.mov_rr(false, T1, T2);
+            }
+            self.a.addsub_ri(false, true, false, T6, T6, 1, false);
+            let back = self.a.cbnz(false, T6);
+            self.a.patch(back, loop_top);
+            self.a.bind(done_loop);
+            if let Some(a) = addr {
+                self.store_checked_addr(T0, a, wb);
+            } else {
+                self.wr_gpr(op.r0, op.w, T0);
+            }
+            self.a.str(8, T1, XCPU, OFF_CF);
+            if la & FO != 0 {
+                self.a.ubfx(T2, T0, wb - 1, 1);
+                if rcl {
+                    self.a.logic_rr(false, 2, T3, T2, T1, 0, 0);
+                } else {
+                    self.a.ubfx(T4, T0, wb - 2, 1);
+                    self.a.logic_rr(false, 2, T3, T2, T4, 0, 0);
+                }
+                self.a.str(8, T3, XCPU, OFF_OF);
+            }
+            self.a.bind(skip);
+            self.fs = FlagState {
+                src: Src::None,
+                host: 0,
+                mem: (self.fs.mem & !FALL) | (la & FALL),
+            };
+        }
+    }
+
+    fn emit_atomic_op(&mut self, k: usize, op: &FastOp) {
+        let sub = op.x & 0x3F;
+        let wb = op.w as u32;
+        let la = self.live[k + 1];
+        let a = self.addr_into(op, XA);
+        if a != XA {
+            self.a.mov_rr(true, XA, a);
+        }
+        if Self::chk_of(op) == Chk::Full {
+            let se = self.side_exit_here(k);
+            self.range_check_to(XA, se);
+        }
+        match sub {
+            0..=8 | 13 | 14 => {
+                // 0..4: add/sub/and/or/xor, 5..6: inc/dec, 7..8: not/neg, 13: xchg, 14: xadd
+                if matches!(sub, 5 | 6) && la & FC != 0 && self.fs.host & FC != 0 && self.fs.mem & FC == 0 {
+                    self.flush_flags(FC);
+                }
+                if op.r0 != 0 {
+                    self.a.mov_imm(true, T1, op.imm);
+                } else if matches!(sub, 0..=4 | 13 | 14) {
+                    self.a.mov_rr(true, T1, g(op.r1));
+                }
+                let align_mask = (wb / 8 - 1) as u64;
+                let unaligned = if wb > 8 {
+                    self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
+                    Some(self.a.cbnz(true, XS))
+                } else {
+                    None
+                };
+                let retry = self.a.pos;
+                self.a.ldaxr(wb, T0, XA);
+                match sub {
+                    0 | 14 => self.a.addsub_rr(wb == 64, false, false, T2, T0, T1, 0),
+                    1 => self.a.addsub_rr(wb == 64, true, false, T2, T0, T1, 0),
+                    2 => self.a.logic_rr(wb == 64, 0, T2, T0, T1, 0, 0),
+                    3 => self.a.logic_rr(wb == 64, 1, T2, T0, T1, 0, 0),
+                    4 => self.a.logic_rr(wb == 64, 2, T2, T0, T1, 0, 0),
+                    5 => self.a.addsub_ri(wb == 64, false, false, T2, T0, 1, false),
+                    6 => self.a.addsub_ri(wb == 64, true, false, T2, T0, 1, false),
+                    7 => self.a.emit(sf(wb == 64) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
+                    8 => self.a.addsub_rr(wb == 64, true, false, T2, ZR, T0, 0),
+                    _ => self.a.mov_rr(wb == 64, T2, T1), // xchg
+                }
+                self.a.stlxr(wb, T3, T2, XA);
+                let fail = self.a.cbnz(false, T3);
+                self.a.patch(fail, retry);
+                if let Some(u_fix) = unaligned {
+                    let done = self.a.b();
+                    self.a.bind(u_fix);
+                    self.a.ldr(wb, T0, XA, 0);
+                    self.a.dmb_ishld();
+                    match sub {
+                        0 | 14 => self.a.addsub_rr(wb == 64, false, false, T2, T0, T1, 0),
+                        1 => self.a.addsub_rr(wb == 64, true, false, T2, T0, T1, 0),
+                        2 => self.a.logic_rr(wb == 64, 0, T2, T0, T1, 0, 0),
+                        3 => self.a.logic_rr(wb == 64, 1, T2, T0, T1, 0, 0),
+                        4 => self.a.logic_rr(wb == 64, 2, T2, T0, T1, 0, 0),
+                        5 => self.a.addsub_ri(wb == 64, false, false, T2, T0, 1, false),
+                        6 => self.a.addsub_ri(wb == 64, true, false, T2, T0, 1, false),
+                        7 => self.a.emit(sf(wb == 64) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
+                        8 => self.a.addsub_rr(wb == 64, true, false, T2, ZR, T0, 0),
+                        _ => self.a.mov_rr(wb == 64, T2, T1),
+                    }
+                    self.a.dmb_ish();
+                    self.a.str(wb, T2, XA, 0);
+                    self.a.bind(done);
+                }
+                if matches!(sub, 13 | 14) {
+                    self.wr_gpr(op.r1, op.w, T0);
+                }
+                if !matches!(sub, 7 | 13) {
+                    let sh = 64 - wb;
+                    if wb >= 32 {
+                        let x = wb == 64;
+                        match sub {
+                            0 | 14 => self.a.addsub_rr(x, false, true, T5, T0, T1, 0),
+                            1 => self.a.addsub_rr(x, true, true, T5, T0, T1, 0),
+                            2 => self.a.logic_rr(x, 3, T5, T0, T1, 0, 0),
+                            3 | 4 => self.a.logic_rr(x, 3, ZR, T2, T2, 0, 0),
+                            5 => self.a.addsub_ri(x, false, true, T5, T0, 1, false),
+                            6 => self.a.addsub_ri(x, true, true, T5, T0, 1, false),
+                            _ => self.a.addsub_rr(x, true, true, T5, ZR, T0, 0),
+                        }
+                    } else {
+                        self.a.lsl_i(true, T3, T0, sh);
+                        match sub {
+                            0 | 1 | 2 | 14 => {
+                                self.a.lsl_i(true, T4, T1, sh);
+                                if sub == 0 || sub == 14 {
+                                    self.a.addsub_rr(true, false, true, T5, T3, T4, 0);
+                                } else if sub == 1 {
+                                    self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
+                                } else {
+                                    self.a.logic_rr(true, 3, T5, T3, T4, 0, 0);
+                                }
+                            }
+                            3 | 4 => {
+                                self.a.lsl_i(true, T5, T2, sh);
+                                self.a.logic_rr(true, 3, ZR, T5, T5, 0, 0);
+                            }
+                            5 | 6 => {
+                                self.a.mov_imm(true, T4, 1u64 << sh);
+                                self.a.addsub_rr(true, sub == 6, true, T5, T3, T4, 0);
+                            }
+                            _ => self.a.addsub_rr(true, true, true, T5, ZR, T3, 0),
+                        }
+                    }
+                    if la & FP != 0 {
+                        self.a.str(8, T2, XCPU, OFF_PFV);
+                    }
+                    if matches!(sub, 5 | 6) {
+                        self.fs.mem &= !(FZ | FS | FO | FP);
+                        if la & FP != 0 {
+                            self.fs.mem |= FP;
+                        }
+                        self.fs.host = la & (FZ | FS | FO);
+                        self.fs.src = Src::IncDec;
+                    } else {
+                        self.fs.mem &= !FALL;
+                        if la & FP != 0 {
+                            self.fs.mem |= FP;
+                        }
+                        self.fs.host = la & FNZCV;
+                        self.fs.src = match sub {
+                            0 | 14 => Src::Add,
+                            1 | 8 => Src::Sub,
+                            _ => Src::Logic,
+                        };
+                    }
+                }
+            }
+            9..=12 => {
+                // Memory bt(9), bts(10), btr(11), btc(12)
+                if op.r0 != 0 {
+                    // Immediate bit index
+                    let b = (op.imm as u32) & (wb - 1);
+                    self.a.movz(false, T1, b, 0);
+                } else {
+                    // Register bit offset: signed offset across memory elements
+                    self.a.sbfm(true, T2, g(op.r1), 0, wb - 1);
+                    self.a.logic_ri(false, 0, T1, T2, enc_logic_imm((wb - 1) as u64, false).unwrap());
+                    let sh = wb.trailing_zeros();
+                    self.a.asr_i(true, T2, T2, sh);
+                    let elem_sh = (wb / 8).trailing_zeros();
+                    self.a.addsub_rr(true, false, false, XA, XA, T2, elem_sh);
+                    if Self::chk_of(op) == Chk::Full {
+                        let se = self.side_exit_here(k);
+                        self.range_check_to(XA, se);
+                    }
+                }
+                if sub == 9 {
+                    self.load(k, T0, XA, wb, Chk::Align);
+                    self.a.shiftv(true, 9, T3, T0, T1);
+                    self.a.ubfx(T3, T3, 0, 1);
+                    self.a.str(8, T3, XCPU, OFF_CF);
+                } else {
+                    self.a.movz(true, T4, 1, 0);
+                    self.a.shiftv(true, 8, T4, T4, T1);
+                    let align_mask = (wb / 8 - 1) as u64;
+                    let unaligned = if wb > 8 {
+                        self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
+                        Some(self.a.cbnz(true, XS))
+                    } else {
+                        None
+                    };
+                    let retry = self.a.pos;
+                    self.a.ldaxr(wb, T0, XA);
+                    match sub {
+                        10 => self.a.logic_rr(true, 1, T2, T0, T4, 0, 0),
+                        11 => self.a.bic_rr(true, T2, T0, T4),
+                        _ => self.a.logic_rr(true, 2, T2, T0, T4, 0, 0),
+                    }
+                    self.a.stlxr(wb, T3, T2, XA);
+                    let fail = self.a.cbnz(false, T3);
+                    self.a.patch(fail, retry);
+                    if let Some(u_fix) = unaligned {
+                        let done = self.a.b();
+                        self.a.bind(u_fix);
+                        self.a.ldr(wb, T0, XA, 0);
+                        self.a.dmb_ishld();
+                        match sub {
+                            10 => self.a.logic_rr(true, 1, T2, T0, T4, 0, 0),
+                            11 => self.a.bic_rr(true, T2, T0, T4),
+                            _ => self.a.logic_rr(true, 2, T2, T0, T4, 0, 0),
+                        }
+                        self.a.dmb_ish();
+                        self.a.str(wb, T2, XA, 0);
+                        self.a.bind(done);
+                    }
+                    self.a.shiftv(true, 9, T3, T0, T1);
+                    self.a.ubfx(T3, T3, 0, 1);
+                    self.a.str(8, T3, XCPU, OFF_CF);
+                }
+                self.fs.host &= !FC;
+                self.fs.mem |= FC;
+            }
+            15 => {
+                // cmpxchg [mem], r1
+                self.a.mov_rr(true, T1, g(op.r1));
+                let align_mask = (wb / 8 - 1) as u64;
+                let unaligned = if wb > 8 {
+                    self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
+                    Some(self.a.cbnz(true, XS))
+                } else {
+                    None
+                };
+                let retry = self.a.pos;
+                self.a.ldaxr(wb, T0, XA);
+                let sh = 64 - wb;
+                if wb == 64 {
+                    self.a.addsub_rr(true, true, true, T2, g(0), T0, 0);
+                } else if wb == 32 {
+                    self.a.addsub_rr(false, true, true, T2, g(0), T0, 0);
+                } else {
+                    self.a.lsl_i(true, T3, g(0), sh);
+                    self.a.lsl_i(true, T4, T0, sh);
+                    self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
+                    self.a.lsr_i(true, T2, T5, sh);
+                }
+                let mismatch = self.a.bcond(NE);
+                self.a.stlxr(wb, T3, T1, XA);
+                let fail = self.a.cbnz(false, T3);
+                self.a.patch(fail, retry);
+                let done = self.a.b();
+                self.a.bind(mismatch);
+                self.a.clrex();
+                self.wr_gpr(0, op.w, T0);
+                if let Some(u_fix) = unaligned {
+                    let after_u = self.a.b();
+                    self.a.bind(u_fix);
+                    self.a.ldr(wb, T0, XA, 0);
+                    self.a.dmb_ishld();
+                    if wb == 64 {
+                        self.a.addsub_rr(true, true, true, T2, g(0), T0, 0);
+                    } else if wb == 32 {
+                        self.a.addsub_rr(false, true, true, T2, g(0), T0, 0);
+                    } else {
+                        self.a.lsl_i(true, T3, g(0), sh);
+                        self.a.lsl_i(true, T4, T0, sh);
+                        self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
+                        self.a.lsr_i(true, T2, T5, sh);
+                    }
+                    let u_mis = self.a.bcond(NE);
+                    self.a.dmb_ish();
+                    self.a.str(wb, T1, XA, 0);
+                    let u_done = self.a.b();
+                    self.a.bind(u_mis);
+                    self.wr_gpr(0, op.w, T0);
+                    self.a.bind(u_done);
+                    self.a.bind(after_u);
+                }
+                self.a.bind(done);
+                if la & FP != 0 {
+                    self.a.str(8, T2, XCPU, OFF_PFV);
+                }
+                self.fs.mem &= !FALL;
+                if la & FP != 0 {
+                    self.fs.mem |= FP;
+                }
+                self.fs.host = la & FNZCV;
+                self.fs.src = Src::Sub;
+            }
+            16 => {
+                // cmpxchg8b [mem]
+                self.a.ubfm(true, T0, g(0), 0, 31);
+                self.a.lsl_i(true, T1, g(2), 32);
+                self.a.logic_rr(true, 1, T0, T0, T1, 0, 0); // expected = edx:eax
+                self.a.ubfm(true, T1, g(3), 0, 31);
+                self.a.lsl_i(true, T2, g(1), 32);
+                self.a.logic_rr(true, 1, T1, T1, T2, 0, 0); // desired = ecx:ebx
+                self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(7, true).unwrap());
+                let unaligned = self.a.cbnz(true, XS);
+                let retry = self.a.pos;
+                self.a.ldaxr(64, T2, XA);
+                self.a.addsub_rr(true, true, true, ZR, T2, T0, 0);
+                let mismatch = self.a.bcond(NE);
+                self.a.stlxr(64, T3, T1, XA);
+                let fail = self.a.cbnz(false, T3);
+                self.a.patch(fail, retry);
+                self.a.movz(false, T4, 1, 0);
+                self.a.str(8, T4, XCPU, OFF_ZF);
+                let done = self.a.b();
+                self.a.bind(mismatch);
+                self.a.clrex();
+                let store_actual = self.a.b();
+                self.a.bind(unaligned);
+                self.a.ldr(64, T2, XA, 0);
+                self.a.dmb_ishld();
+                self.a.addsub_rr(true, true, true, ZR, T2, T0, 0);
+                let u_mis = self.a.bcond(NE);
+                self.a.dmb_ish();
+                self.a.str(64, T1, XA, 0);
+                self.a.movz(false, T4, 1, 0);
+                self.a.str(8, T4, XCPU, OFF_ZF);
+                let u_done = self.a.b();
+                self.a.bind(u_mis);
+                self.a.bind(store_actual);
+                self.a.mov_rr(false, g(0), T2);
+                self.a.lsr_i(true, g(2), T2, 32);
+                self.set_lb(0, 32);
+                self.set_lb(2, 32);
+                self.a.str(8, ZR, XCPU, OFF_ZF);
+                self.a.bind(u_done);
+                self.a.bind(done);
+                self.fs.host &= !FZ;
+                self.fs.mem |= FZ;
+            }
+            _ => {
+                // cmpxchg16b [mem]
+                self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(15, true).unwrap());
+                let unaligned = self.a.cbnz(true, XS);
+                let retry = self.a.pos;
+                self.a.ldaxp_x(T0, T1, XA);
+                self.a.logic_rr(true, 2, T2, T0, g(0), 0, 0);
+                self.a.logic_rr(true, 2, T3, T1, g(2), 0, 0);
+                self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
+                let mismatch = self.a.cbnz(true, T2);
+                self.a.stlxp_x(T4, g(3), g(1), XA);
+                let fail = self.a.cbnz(false, T4);
+                self.a.patch(fail, retry);
+                self.a.movz(false, T4, 1, 0);
+                self.a.str(8, T4, XCPU, OFF_ZF);
+                let done = self.a.b();
+                self.a.bind(mismatch);
+                self.a.clrex();
+                let store_actual = self.a.b();
+                self.a.bind(unaligned);
+                self.a.ldr(64, T0, XA, 0);
+                self.a.ldr(64, T1, XA, 8);
+                self.a.dmb_ishld();
+                self.a.logic_rr(true, 2, T2, T0, g(0), 0, 0);
+                self.a.logic_rr(true, 2, T3, T1, g(2), 0, 0);
+                self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
+                let u_mis = self.a.cbnz(true, T2);
+                self.a.dmb_ish();
+                self.a.str(64, g(3), XA, 0);
+                self.a.str(64, g(1), XA, 8);
+                self.a.movz(false, T4, 1, 0);
+                self.a.str(8, T4, XCPU, OFF_ZF);
+                let u_done = self.a.b();
+                self.a.bind(u_mis);
+                self.a.bind(store_actual);
+                self.a.mov_rr(true, g(0), T0);
+                self.a.mov_rr(true, g(2), T1);
+                self.set_lb(0, 64);
+                self.set_lb(2, 64);
+                self.a.str(8, ZR, XCPU, OFF_ZF);
+                self.a.bind(u_done);
+                self.a.bind(done);
+                self.fs.host &= !FZ;
+                self.fs.mem |= FZ;
+            }
+        }
+    }
+
+    fn emit_pcmpstr_op(&mut self, k: usize, op: &FastOp) {
+        let is_exp = (op.x & 1) != 0;
+        let is_msk = (op.x & 2) != 0;
+        let mem = (op.x & 0x20) != 0;
+        let imm = op.imm as u8;
+        let is_words = (imm & 1) != 0;
+        let is_signed = (imm & 2) != 0;
+        let n_elems: u32 = if is_words { 8 } else { 16 };
+        let ebits: u32 = if is_words { 16 } else { 8 };
+        let sh_elem = is_words;
+
+        if mem {
+            let a = self.addr_into(op, XA);
+            if Self::chk_of(op) == Chk::Full {
+                let se = self.side_exit_here(k);
+                self.range_check_to(a, se);
+            }
+            self.a.ldr(64, T0, a, 0);
+            self.a.ldr(64, T1, a, 8);
+            if mem::tso() {
+                self.a.dmb_ishld();
+            }
+            self.a.fmov_gf(true, 1, T0);
+            self.a.v_ins_d(1, 1, T1);
+        } else {
+            self.xsrc(1, op.r1);
+        }
+        self.xsrc(0, op.r0);
+        // Spill v0 (a) at [sp] and v1 (b) at [sp + 16]; borrow x7 (XRAS) as temp inside the loop.
+        const P7: u32 = 7;
+        if self.ras_miss != 0 {
+            self.a.str(64, XRAS, XCPU, OFF_RAS);
+        }
+        self.a.addsub_ri(true, true, false, 31, 31, 32, false);
+        self.a.str(128, 0, 31, 0);
+        self.a.str(128, 1, 31, 16);
+        self.a.addsub_ri(true, false, false, XA, 31, 0, false); // XA = &a[0]
+        self.a.addsub_ri(true, false, false, XS, 31, 16, false); // XS = &b[0]
+
+        // Compute T0 = a_len, T1 = b_len.
+        if is_exp {
+            for (dst, src_g) in [(T0, g(0)), (T1, g(2))] {
+                self.a.sbfm(false, dst, src_g, 0, 31);
+                let pos = self.a.tbz(dst, 31);
+                self.a.addsub_rr(false, true, false, dst, ZR, dst, 0);
+                self.a.bind(pos);
+                self.a.movz(false, T2, n_elems, 0);
+                self.a.addsub_rr(false, true, true, ZR, dst, T2, 0);
+                self.a.csel(false, dst, T2, dst, HI);
+            }
+        } else {
+            for (dst, base_ptr) in [(T0, XA), (T1, XS)] {
+                self.a.movz(false, dst, 0, 0);
+                let top = self.a.pos;
+                self.a.addsub_ri(false, true, true, ZR, dst, n_elems, false);
+                let end = self.a.bcond(HS);
+                self.a.ldr_reg(ebits, false, T2, base_ptr, dst, sh_elem);
+                let found_zero = self.a.cbz(false, T2);
+                self.a.addsub_ri(false, false, false, dst, dst, 1, false);
+                let back = self.a.b();
+                self.a.patch(back, top);
+                self.a.bind(end);
+                self.a.bind(found_zero);
+            }
+        }
+
+        // Compute T2 = int_res1 across j in 0..n_elems.
+        self.a.movz(false, T2, 0, 0); // int_res1 = 0
+        self.a.movz(false, T3, 0, 0); // j = 0
+        let j_top = self.a.pos;
+        let j_limit = if matches!((imm >> 2) & 3, 0 | 1) { T1 } else { ZR };
+        if j_limit == T1 {
+            self.a.addsub_rr(false, true, true, ZR, T3, T1, 0);
+        } else {
+            self.a.addsub_ri(false, true, true, ZR, T3, n_elems, false);
+        }
+        let j_done = self.a.bcond(HS);
+
+        match (imm >> 2) & 3 {
+            0 => {
+                // Equal Any
+                self.a.ldr_reg(ebits, is_signed, T5, XS, T3, sh_elem); // bj
+                self.a.movz(false, T4, 0, 0); // i = 0
+                let i_top = self.a.pos;
+                self.a.addsub_rr(false, true, true, ZR, T4, T0, 0);
+                let i_done = self.a.bcond(HS);
+                self.a.ldr_reg(ebits, is_signed, T6, XA, T4, sh_elem); // ai
+                self.a.addsub_rr(false, true, true, ZR, T5, T6, 0);
+                let neq = self.a.bcond(NE);
+                self.a.movz(false, P7, 1, 0);
+                self.a.shiftv(false, 8, P7, P7, T3);
+                self.a.logic_rr(false, 1, T2, T2, P7, 0, 0);
+                let brk = self.a.b();
+                self.a.bind(neq);
+                self.a.addsub_ri(false, false, false, T4, T4, 1, false);
+                let back = self.a.b();
+                self.a.patch(back, i_top);
+                self.a.bind(i_done);
+                self.a.bind(brk);
+            }
+            1 => {
+                // Ranges
+                self.a.ldr_reg(ebits, is_signed, T5, XS, T3, sh_elem); // bj
+                self.a.movz(false, T4, 0, 0); // i = 0
+                let i_top = self.a.pos;
+                self.a.addsub_ri(false, false, false, T6, T4, 1, false);
+                self.a.addsub_rr(false, true, true, ZR, T6, T0, 0);
+                let i_done = self.a.bcond(HS);
+                self.a.ldr_reg(ebits, is_signed, P7, XA, T4, sh_elem); // a[i]
+                self.a.addsub_rr(false, true, true, ZR, T5, P7, 0);
+                let lt_lo = self.a.bcond(LT);
+                self.a.ldr_reg(ebits, is_signed, P7, XA, T6, sh_elem); // a[i+1]
+                self.a.addsub_rr(false, true, true, ZR, T5, P7, 0);
+                let gt_hi = self.a.bcond(GT);
+                self.a.movz(false, P7, 1, 0);
+                self.a.shiftv(false, 8, P7, P7, T3);
+                self.a.logic_rr(false, 1, T2, T2, P7, 0, 0);
+                let brk = self.a.b();
+                self.a.bind(lt_lo);
+                self.a.bind(gt_hi);
+                self.a.addsub_ri(false, false, false, T4, T4, 2, false);
+                let back = self.a.b();
+                self.a.patch(back, i_top);
+                self.a.bind(i_done);
+                self.a.bind(brk);
+            }
+            2 => {
+                // Equal Each
+                self.a.addsub_rr(false, true, true, ZR, T3, T0, 0);
+                let a_in = self.a.bcond(LO);
+                // j >= a_len: match iff j >= b_len
+                self.a.addsub_rr(false, true, true, ZR, T3, T1, 0);
+                let no_match1 = self.a.bcond(LO);
+                self.a.movz(false, P7, 1, 0);
+                self.a.shiftv(false, 8, P7, P7, T3);
+                self.a.logic_rr(false, 1, T2, T2, P7, 0, 0);
+                let done1 = self.a.b();
+                self.a.bind(a_in);
+                // j < a_len: match iff j < b_len && a[j] == b[j]
+                self.a.addsub_rr(false, true, true, ZR, T3, T1, 0);
+                let no_match2 = self.a.bcond(HS);
+                self.a.ldr_reg(ebits, is_signed, T5, XA, T3, sh_elem);
+                self.a.ldr_reg(ebits, is_signed, T6, XS, T3, sh_elem);
+                self.a.addsub_rr(false, true, true, ZR, T5, T6, 0);
+                let no_match3 = self.a.bcond(NE);
+                self.a.movz(false, P7, 1, 0);
+                self.a.shiftv(false, 8, P7, P7, T3);
+                self.a.logic_rr(false, 1, T2, T2, P7, 0, 0);
+                self.a.bind(no_match1);
+                self.a.bind(no_match2);
+                self.a.bind(no_match3);
+                self.a.bind(done1);
+            }
+            _ => {
+                // Equal Ordered
+                self.a.movz(false, T4, 0, 0); // k = 0
+                let k_top = self.a.pos;
+                self.a.addsub_rr(false, false, false, T5, T3, T4, 0); // j + k
+                self.a.addsub_ri(false, true, true, ZR, T5, n_elems, false);
+                let k_matched = self.a.bcond(HS);
+                self.a.addsub_rr(false, true, true, ZR, T4, T0, 0); // k >= a_len
+                let k_matched2 = self.a.bcond(HS);
+                self.a.addsub_rr(false, true, true, ZR, T5, T1, 0); // j + k >= b_len
+                let k_failed = self.a.bcond(HS);
+                self.a.ldr_reg(ebits, is_signed, T6, XA, T4, sh_elem);
+                self.a.ldr_reg(ebits, is_signed, P7, XS, T5, sh_elem);
+                self.a.addsub_rr(false, true, true, ZR, T6, P7, 0);
+                let k_failed2 = self.a.bcond(NE);
+                self.a.addsub_ri(false, false, false, T4, T4, 1, false);
+                let back = self.a.b();
+                self.a.patch(back, k_top);
+                self.a.bind(k_matched);
+                self.a.bind(k_matched2);
+                self.a.movz(false, P7, 1, 0);
+                self.a.shiftv(false, 8, P7, P7, T3);
+                self.a.logic_rr(false, 1, T2, T2, P7, 0, 0);
+                self.a.bind(k_failed);
+                self.a.bind(k_failed2);
+            }
+        }
+        self.a.addsub_ri(false, false, false, T3, T3, 1, false);
+        let j_back = self.a.b();
+        self.a.patch(j_back, j_top);
+        self.a.bind(j_done);
+
+        // Restore sp (+32) and XRAS.
+        self.a.addsub_ri(true, false, false, 31, 31, 32, false);
+        if self.ras_miss != 0 {
+            self.a.ldr(64, XRAS, XCPU, OFF_RAS);
+        }
+
+        // Polarity -> int_res2 in T2.
+        let mask_all = if is_words { 0x00FFu32 } else { 0xFFFFu32 };
+        self.a.movz(false, T3, mask_all, 0);
+        match (imm >> 4) & 3 {
+            1 => {
+                self.a.bic_rr(false, T2, T3, T2);
+            }
+            3 => {
+                self.a.movz(false, T4, 1, 0);
+                self.a.shiftv(false, 8, T4, T4, T1);
+                self.a.addsub_ri(false, true, false, T4, T4, 1, false); // (1 << b_len) - 1
+                self.a.logic_rr(false, 2, T2, T2, T4, 0, 0);
+                self.a.logic_rr(false, 0, T2, T2, T3, 0, 0);
+            }
+            _ => {
+                self.a.logic_rr(false, 0, T2, T2, T3, 0, 0);
+            }
+        }
+
+        if is_msk {
+            if (imm & 0x40) == 0 {
+                self.a.fmov_gf(true, 0, T2);
+            } else {
+                self.a.v_zero(0);
+                let lg = if is_words { 1u32 } else { 0u32 };
+                self.a.mov_imm(false, T4, 0xFFFF);
+                for lane in 0..n_elems {
+                    let skip = self.a.tbz(T2, lane);
+                    self.a.v_ins_elem(lg, 0, lane, T4);
+                    self.a.bind(skip);
+                }
+            }
+            self.xwrite(0, 0);
+            self.clear_ymm_hi(0);
+        } else {
+            let zero_res = self.a.cbz(false, T2);
+            if (imm & 0x40) != 0 {
+                self.a.clz(false, T4, T2);
+                self.a.movz(false, T5, 31, 0);
+                self.a.addsub_rr(false, true, false, g(1), T5, T4, 0);
+            } else {
+                self.a.rbit(false, T4, T2);
+                self.a.clz(false, g(1), T4);
+            }
+            let idx_done = self.a.b();
+            self.a.bind(zero_res);
+            self.a.movz(false, g(1), n_elems, 0);
+            self.a.bind(idx_done);
+            self.set_lb(1, 64);
+        }
+
+        // Flags: CF = (int_res2 != 0), ZF = (b_len < n), SF = (a_len < n), OF = (int_res2 & 1), PF = 0.
+        self.a.clz(true, T4, T2);
+        self.a.lsr_i(true, T4, T4, 6);
+        self.a.logic_ri(false, 2, T4, T4, enc_logic_imm(1, false).unwrap());
+        self.a.str(8, T4, XCPU, OFF_CF);
+        self.a.addsub_ri(false, true, true, ZR, T1, n_elems, false);
+        self.a.cset(T4, LO);
+        self.a.str(8, T4, XCPU, OFF_ZF);
+        self.a.addsub_ri(false, true, true, ZR, T0, n_elems, false);
+        self.a.cset(T4, LO);
+        self.a.str(8, T4, XCPU, OFF_SF);
+        self.a.ubfx(T4, T2, 0, 1);
+        self.a.str(8, T4, XCPU, OFF_OF);
+        self.a.movz(false, T4, 1, 0);
+        self.a.str(8, T4, XCPU, OFF_PFV);
+        self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
+    }
+}

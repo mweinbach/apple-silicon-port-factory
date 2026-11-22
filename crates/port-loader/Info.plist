@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded into the aw2-loader binary (__TEXT,__info_plist, see build.rs)
+     so the unbundled executable gets a bundle identity: Retina backing
+     (NSHighResolutionCapable), the Game Mode category, and a stable name in
+     the Dock / menu bar. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.portfactory.runner</string>
+	<key>CFBundleName</key>
+	<string>Port Runner</string>
+	<key>CFBundleDisplayName</key>
+	<string>Port Runner</string>
+	<key>CFBundleExecutable</key>
+	<string>aw2-loader</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
+</dict>
+</plist>

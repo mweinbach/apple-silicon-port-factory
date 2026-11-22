@@ -1,0 +1,13 @@
+[package]
+name = "aw2-data"
+description = "Northlight data formats: .rmdtoc/.rmdblob VFS, LZ4, .binrfx shader bundles, .tex/DDS, string tables"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bink2-codec.workspace = true
+
+[[bin]]
+name = "aw2-data"
+path = "src/main.rs"

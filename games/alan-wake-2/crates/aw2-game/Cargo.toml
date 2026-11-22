@@ -1,0 +1,22 @@
+[package]
+name = "aw2-game"
+description = "Rust reimplementation of Remedy's Northlight engine + Alan Wake 2 game code, decompiled function by function"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["shards", "dll-shards"]
+shards = []
+dll-shards = []
+
+[dependencies]
+win64-abi.workspace = true
+win32-rt.workspace = true
+x86-runtime.workspace = true
+iced-x86.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# Randomized translator-vs-interpreter tests assemble guest code with the code assembler.
+iced-x86 = { workspace = true, features = ["code_asm"] }

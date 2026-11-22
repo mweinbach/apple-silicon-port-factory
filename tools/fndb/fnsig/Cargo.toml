@@ -1,0 +1,18 @@
+[package]
+name = "fnsig"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Normalized x86-64 function features (exe and COFF reference objects) for fndb library identification"
+
+# Standalone tool, deliberately not a member of the root workspace.
+[workspace]
+
+[dependencies]
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
+object = { version = "0.37", default-features = false, features = ["read_core", "coff", "pe", "archive", "std"] }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+debug = false

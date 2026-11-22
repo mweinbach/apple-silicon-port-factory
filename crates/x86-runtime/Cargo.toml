@@ -1,0 +1,16 @@
+[package]
+name = "x86-runtime"
+description = "Universal native ARM64 x86-64 execution runtime: interpreter, ARM64 block JIT, persistent .aot machine-code cache, VA dispatch, CallCtx, LiftedFrame, NEON/TSO simd_ops, MSVC FH4/SEH eh_rt, and PE DLL lifting runtime"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+win64-abi.workspace = true
+win32-rt.workspace = true
+iced-x86.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# Randomized translator-vs-interpreter tests assemble guest code with the code assembler.
+iced-x86 = { workspace = true, features = ["code_asm"] }

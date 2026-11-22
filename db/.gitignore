@@ -1,0 +1,5 @@
+# Generated, large, regenerated from the local game install (see tools/README.md)
+*.sqlite
+*.sqlite-journal
+ghidra_names.tsv
+ghidra_functions.jsonl

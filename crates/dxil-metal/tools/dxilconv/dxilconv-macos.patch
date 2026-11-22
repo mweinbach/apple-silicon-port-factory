@@ -1,0 +1,451 @@
+diff --git a/projects/CMakeLists.txt b/projects/CMakeLists.txt
+index 9f361a95..77413b6e 100644
+--- a/projects/CMakeLists.txt
++++ b/projects/CMakeLists.txt
+@@ -3,9 +3,9 @@ set(DXC_PROJECTS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+ 
+ if(WIN32)
+ add_subdirectory(include/Tracing) # DxcRuntimeEtw target
++endif (WIN32)
+ 
++# aw2-port: dxilconv builds on non-Windows hosts too.
+ if(HLSL_BUILD_DXILCONV)
+   add_subdirectory(dxilconv)
+ endif (HLSL_BUILD_DXILCONV)
+-
+-endif (WIN32)
+diff --git a/projects/dxilconv/CMakeLists.txt b/projects/dxilconv/CMakeLists.txt
+index db7804dc..14a04f0a 100644
+--- a/projects/dxilconv/CMakeLists.txt
++++ b/projects/dxilconv/CMakeLists.txt
+@@ -19,11 +19,9 @@ macro(add_dxilconv_project_test_library name)
+ endmacro(add_dxilconv_project_test_library)
+ 
+ 
+-if(WIN32)
+-  add_subdirectory(lib)
+-  add_subdirectory(tools)
+-  if (HLSL_INCLUDE_TESTS)
+-    add_subdirectory(unittests)
+-    add_subdirectory(test)
+-  endif (HLSL_INCLUDE_TESTS)
++add_subdirectory(lib)
++add_subdirectory(tools)
++if(WIN32 AND HLSL_INCLUDE_TESTS)
++  add_subdirectory(unittests)
++  add_subdirectory(test)
+ endif()
+\ No newline at end of file
+diff --git a/projects/dxilconv/include/DxbcConverter.h b/projects/dxilconv/include/DxbcConverter.h
+index 968beaeb..ae094dc2 100644
+--- a/projects/dxilconv/include/DxbcConverter.h
++++ b/projects/dxilconv/include/DxbcConverter.h
+@@ -14,6 +14,19 @@
+ 
+ #include "dxc/dxcapi.h"
+ 
++#ifndef _WIN32
++// aw2-port: SAL annotations WinAdapter doesn't define.
++#ifndef _In_reads_bytes_
++#define _In_reads_bytes_(x)
++#endif
++#ifndef _Outptr_result_bytebuffer_maybenull_
++#define _Outptr_result_bytebuffer_maybenull_(x)
++#endif
++#ifndef _Outptr_result_maybenull_z_
++#define _Outptr_result_maybenull_z_
++#endif
++#endif
++
+ #ifndef _MSC_VER
+ extern "C"
+ #endif
+@@ -29,8 +42,13 @@ extern "C"
+                                                         _In_ REFIID riid,
+                                                         _Out_ LPVOID *ppv);
+ 
++#ifdef _WIN32
+ struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) IDxbcConverter
+     : public IUnknown {
++#else
++CROSS_PLATFORM_UUIDOF(IDxbcConverter, "5F956ED5-78D1-4B15-8247-F7187614A041")
++struct IDxbcConverter : public IUnknown {
++#endif
+   /// Create DXIL container out of DXBC shader blob.
+   virtual HRESULT STDMETHODCALLTYPE Convert(
+       _In_reads_bytes_(DxbcSize) LPCVOID pDxbc, _In_ UINT32 DxbcSize,
+@@ -51,8 +69,12 @@ struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) IDxbcConverter
+       _Outptr_result_maybenull_z_ LPWSTR *ppDiag) = 0;
+ };
+ 
+-__declspec(selectany) extern const CLSID
+-    CLSID_DxbcConverter = {/* 4900391E-B752-4EDD-A885-6FB76E25ADDB */
++#ifdef _WIN32
++__declspec(selectany) extern
++#else
++static
++#endif
++    const CLSID CLSID_DxbcConverter = {/* 4900391E-B752-4EDD-A885-6FB76E25ADDB */
+                            0x4900391e,
+                            0xb752,
+                            0x4edd,
+diff --git a/projects/dxilconv/include/Support/DXIncludes.h b/projects/dxilconv/include/Support/DXIncludes.h
+index 4ff1ea73..ee1b4c8a 100644
+--- a/projects/dxilconv/include/Support/DXIncludes.h
++++ b/projects/dxilconv/include/Support/DXIncludes.h
+@@ -16,6 +16,23 @@
+ // This is a platform-specific file.
+ // Do not add LLVM/Clang or DXIL files to this file.
+ // clang-format off
++#ifndef _WIN32
++// aw2-port: non-Windows hosts use DXC's WinAdapter and the DirectX-Headers copies of the
++// D3D headers; the few D3D10/D3D11 definitions dxilconv needs are in DXNonWin.h.
++#include "dxc/Support/WinIncludes.h"
++// DirectX-Headers' d3dcommon.h (D3D_NAME & co.) expects the MIDL `interface` keyword.
++#pragma push_macro("interface")
++#undef interface
++#define interface struct
++#include <d3dcommon.h>
++#pragma pop_macro("interface")
++#include "Support/DXNonWin.h"
++#include "DxbcSignatures.h"
++#ifndef DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE
++#include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
++#endif
++#include "ShaderBinary/ShaderBinary.h"
++#else
+ // Includes on Windows are highly order dependent.
+ #define NOMINMAX 1
+ #define WIN32_LEAN_AND_MEAN 1
+@@ -37,4 +54,5 @@
+ #endif
+ 
+ #include "ShaderBinary/ShaderBinary.h"
++#endif // _WIN32
+ // clang-format on
+diff --git a/projects/dxilconv/include/Support/DXNonWin.h b/projects/dxilconv/include/Support/DXNonWin.h
+new file mode 100644
+index 00000000..10b7f0e4
+--- /dev/null
++++ b/projects/dxilconv/include/Support/DXNonWin.h
+@@ -0,0 +1,110 @@
++///////////////////////////////////////////////////////////////////////////////
++//                                                                           //
++// DXNonWin.h                                                                //
++// This file is distributed under the University of Illinois Open Source     //
++// License. See LICENSE.TXT for details.                                     //
++//                                                                           //
++// aw2-port: the few Windows SDK definitions dxilconv uses that neither DXC's //
++// WinAdapter nor DirectX-Headers provide on non-Windows hosts.              //
++//                                                                           //
++///////////////////////////////////////////////////////////////////////////////
++
++#pragma once
++
++#ifndef _WIN32
++
++#include <climits>
++#include <cstdint>
++#include <cstring>
++
++// d3d11.h / d3d10.h constants.
++#ifndef D3D11_SHADER_MAX_INTERFACES
++#define D3D11_SHADER_MAX_INTERFACES (253)
++#endif
++#ifndef D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
++#define D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT (14)
++#endif
++#ifndef D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT
++#define D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT (16)
++#endif
++#ifndef D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
++#define D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT (128)
++#endif
++#ifndef D3D11_COMMONSHADER_TEMP_REGISTER_COUNT
++#define D3D11_COMMONSHADER_TEMP_REGISTER_COUNT (4096)
++#endif
++#ifndef D3D10_REQ_CONSTANT_BUFFER_ELEMENT_COUNT
++#define D3D10_REQ_CONSTANT_BUFFER_ELEMENT_COUNT (4096)
++#endif
++
++// basetsd.h types WinAdapter lacks.
++typedef int64_t INT64;
++
++#ifndef CONST
++#define CONST const
++#endif
++#ifndef _UI8_MAX
++#define _UI8_MAX 0xffu
++#endif
++
++#ifndef __override
++#define __override
++#endif
++
++// windows.h min/max (the sources call them unqualified).
++#include <algorithm>
++using std::max;
++using std::min;
++
++// Legacy SAL annotations.
++#ifndef __in_range
++#define __in_range(lo, hi)
++#endif
++#ifndef __in_ecount
++#define __in_ecount(n)
++#endif
++#ifndef __out_ecount
++#define __out_ecount(n)
++#endif
++#ifndef __field_ecount_part
++#define __field_ecount_part(size, init)
++#endif
++
++// strsafe.h
++#ifndef StringCchCopyA
++inline HRESULT StringCchCopyA(char *dst, size_t n, const char *src) {
++  if (n == 0)
++    return E_INVALIDARG;
++  size_t len = strnlen(src, n);
++  if (len == n) {
++    memcpy(dst, src, n - 1);
++    dst[n - 1] = 0;
++    return E_INVALIDARG; // STRSAFE_E_INSUFFICIENT_BUFFER
++  }
++  memcpy(dst, src, len + 1);
++  return S_OK;
++}
++#endif
++
++// ETW tracing (Windows-only) compiles away.
++#define DxcRuntimeEtw_DxcTranslate_Start()
++#define DxcRuntimeEtw_DxcTranslate_Stop(hr) (void)(hr)
++#define DxcRuntimeEtw_DxcTranslate_TranslateStats(...)
++
++// Timing for the (compiled-away) translate stats.
++#include <time.h>
++inline BOOL QueryPerformanceCounter(LARGE_INTEGER *t) {
++  t->QuadPart = (LONGLONG)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++  return TRUE;
++}
++inline BOOL QueryPerformanceFrequency(LARGE_INTEGER *f) {
++  f->QuadPart = 1000000000;
++  return TRUE;
++}
++
++// MSVC intrinsics.
++#ifndef __assume
++#define __assume(x) __builtin_assume(x)
++#endif
++
++#endif // !_WIN32
+diff --git a/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt b/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
+index 9da22af3..1759b12d 100644
+--- a/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
++++ b/projects/dxilconv/lib/DxbcConverter/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Build DxbcConverter.lib.
+ 
+-find_package(D3D12 REQUIRED)
++if(WIN32)
++  find_package(D3D12 REQUIRED)
++endif()
+ 
+ add_dxilconv_project_library(DxbcConverter
+   DxbcConverter.cpp
+@@ -12,7 +14,10 @@ target_link_libraries(DxbcConverter PUBLIC
+   ShaderBinary
+ )
+ 
+-add_dependencies(DxbcConverter intrinsics_gen DxcRuntimeEtw DxilConvPasses)
++add_dependencies(DxbcConverter intrinsics_gen DxilConvPasses)
++if(WIN32)
++  add_dependencies(DxbcConverter DxcRuntimeEtw)
++endif()
+ 
+ target_include_directories(DxbcConverter
+ PUBLIC
+diff --git a/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h b/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
+index 7f19b875..8495b983 100644
+--- a/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
++++ b/projects/dxilconv/lib/DxbcConverter/DxbcConverterImpl.h
+@@ -45,7 +45,9 @@
+ 
+ #include "Support/DXIncludes.h"
+ #include "dxc/Support/microcom.h"
++#ifdef _WIN32
+ #include <atlbase.h>
++#endif
+ 
+ #include "dxc/Support/FileIOHelper.h"
+ #include "dxc/dxcapi.h"
+@@ -57,7 +59,9 @@
+ 
+ #include "dxc/DxilContainer/DxilPipelineStateValidation.h"
+ 
++#ifdef _WIN32
+ #include "Tracing/DxcRuntimeEtw.h"
++#endif
+ 
+ #include <algorithm>
+ #include <map>
+diff --git a/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt b/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
+index 386c3819..6d207503 100644
+--- a/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
++++ b/projects/dxilconv/lib/ShaderBinary/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Build ShaderBinary.lib.
+ 
+-find_package(D3D12 REQUIRED)
++if(WIN32)
++  find_package(D3D12 REQUIRED)
++endif()
+ 
+ add_dxilconv_project_library(ShaderBinary
+   ShaderBinary.cpp
+diff --git a/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h b/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
+index 360230b8..af704ac1 100644
+--- a/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
++++ b/projects/dxilconv/lib/ShaderBinary/ShaderBinaryIncludes.h
+@@ -9,6 +9,7 @@
+ 
+ #pragma once
+ // clang-format off
++#ifdef _WIN32
+ // Includes on Windows are highly order dependent.
+ #include "windows.h"
+ 
+@@ -20,6 +21,18 @@
+ #include <d3d12.h>
+ #define D3DX12_NO_STATE_OBJECT_HELPERS
+ #include "dxc/Support/d3dx12.h"
++#else
++#include <assert.h>
++#include <float.h>
++#include "dxc/Support/WinIncludes.h"
++// DirectX-Headers' d3dcommon.h (D3D_NAME & co.) expects the MIDL `interface` keyword.
++#pragma push_macro("interface")
++#undef interface
++#define interface struct
++#include <d3dcommon.h>
++#pragma pop_macro("interface")
++#include "Support/DXNonWin.h"
++#endif
+ #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
+ #include "ShaderBinary/ShaderBinary.h"
+ // clang-format on
+diff --git a/projects/dxilconv/tools/CMakeLists.txt b/projects/dxilconv/tools/CMakeLists.txt
+index 2bb766a4..3b61855c 100644
+--- a/projects/dxilconv/tools/CMakeLists.txt
++++ b/projects/dxilconv/tools/CMakeLists.txt
+@@ -1,2 +1,5 @@
+ add_subdirectory(dxilconv)
+-add_subdirectory(dxbc2dxil)
++# aw2-port: the dxbc2dxil CLI is Windows-only (LoadLibrary, wide paths); use the library.
++if(WIN32)
++  add_subdirectory(dxbc2dxil)
++endif()
+diff --git a/projects/dxilconv/tools/dxbc2dxil/CMakeLists.txt b/projects/dxilconv/tools/dxbc2dxil/CMakeLists.txt
+index e5b8c9a3..71cc35b1 100644
+--- a/projects/dxilconv/tools/dxbc2dxil/CMakeLists.txt
++++ b/projects/dxilconv/tools/dxbc2dxil/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # Builds dxbc2dxil.exe
+ 
+-find_package(D3D12 REQUIRED)
++if(WIN32)
++  find_package(D3D12 REQUIRED)
++endif()
+ 
+ add_dxilconv_project_executable(dxbc2dxil
+   dxbc2dxil.cpp
+diff --git a/projects/dxilconv/tools/dxbc2dxil/dxbc2dxil.cpp b/projects/dxilconv/tools/dxbc2dxil/dxbc2dxil.cpp
+index c485709c..06de5f43 100644
+--- a/projects/dxilconv/tools/dxbc2dxil/dxbc2dxil.cpp
++++ b/projects/dxilconv/tools/dxbc2dxil/dxbc2dxil.cpp
+@@ -25,7 +25,9 @@
+ 
+ #include "Support/DXIncludes.h"
+ #include "dxc/Support/microcom.h"
++#ifdef _WIN32
+ #include <atlbase.h>
++#endif
+ 
+ #include "dxc/Support/FileIOHelper.h"
+ 
+diff --git a/projects/dxilconv/tools/dxilconv/CMakeLists.txt b/projects/dxilconv/tools/dxilconv/CMakeLists.txt
+index 3c1ce507..cf11c64c 100644
+--- a/projects/dxilconv/tools/dxilconv/CMakeLists.txt
++++ b/projects/dxilconv/tools/dxilconv/CMakeLists.txt
+@@ -4,8 +4,10 @@ set(SHARED_LIBRARY TRUE)
+ 
+ add_dxilconv_project_library(dxilconv SHARED
+   dxilconv.cpp
+-  dxilconv.def
+ )
++if(WIN32)
++  target_sources(dxilconv PRIVATE dxilconv.def)
++endif()
+ 
+ target_link_libraries(dxilconv PRIVATE
+   DxbcConverter
+@@ -23,4 +25,6 @@ set_target_properties(dxilconv
+   OUTPUT_NAME "dxilconv"
+ )
+ 
+-add_dependencies(dxilconv DxcEtw)
++if(WIN32)
++  add_dependencies(dxilconv DxcEtw)
++endif()
+diff --git a/projects/dxilconv/tools/dxilconv/dxilconv.cpp b/projects/dxilconv/tools/dxilconv/dxilconv.cpp
+index 73d7f3df..ccc07d7b 100644
+--- a/projects/dxilconv/tools/dxilconv/dxilconv.cpp
++++ b/projects/dxilconv/tools/dxilconv/dxilconv.cpp
+@@ -16,14 +16,23 @@
+ #include "dxc/Support/Global.h"
+ #include "dxc/Support/WinIncludes.h"
+ 
++#ifdef _WIN32
+ #include "Tracing/DxcRuntimeEtw.h"
++#endif
+ 
++#ifdef _WIN32
+ #define DXC_API_IMPORT
++#else
++// aw2-port: export the entry points (the build uses -fvisibility=hidden).
++#define DXC_API_IMPORT __attribute__((visibility("default")))
++#endif
+ 
+ #include "dxc/config.h"
+ #include "dxc/dxcisense.h"
+ #include "dxc/dxctools.h"
++#ifdef _WIN32
+ #include "dxcetw.h"
++#endif
+ 
+ #include "DxbcConverter.h"
+ 
+@@ -107,6 +116,18 @@ Cleanup:
+   return hr;
+ }
+ 
++#ifndef _WIN32
++// aw2-port: library constructor/destructor instead of DllMain (as in DXCompiler.cpp).
++HRESULT __attribute__((constructor)) DllMain() { return InitMaybeFail(); }
++
++void __attribute__((destructor)) DllShutdown() {
++  DxcSetThreadMallocToDefault();
++  ::llvm::sys::fs::CleanupPerThreadFileSystem();
++  ::llvm::llvm_shutdown();
++  DxcClearThreadMalloc();
++  DxcCleanupThreadMalloc();
++}
++#else
+ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD Reason, LPVOID) {
+   if (Reason == DLL_PROCESS_ATTACH) {
+     EventRegisterMicrosoft_Windows_DxcRuntime_API();
+@@ -135,3 +156,4 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD Reason, LPVOID) {
+ 
+   return TRUE;
+ }
++#endif // _WIN32

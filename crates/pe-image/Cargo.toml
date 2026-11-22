@@ -1,0 +1,10 @@
+[package]
+name = "pe-image"
+description = "PE32+ parsing helpers (sections, relocations, imports, delay imports, exports, TLS, .pdata) on top of goblin"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+goblin.workspace = true
+anyhow.workspace = true

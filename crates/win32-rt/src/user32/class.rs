@@ -1,0 +1,345 @@
+//! Window classes: `RegisterClass[Ex][A|W]`, `UnregisterClass`, `GetClassInfo`.
+//!
+//! One process-wide table. Classes are looked up by atom or by
+//! case-insensitive name (the `hInstance` part of the key is ignored, which
+//! only matters for apps registering the same name from two modules).
+
+use super::*;
+use crate::types::*;
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub const CS_DBLCLKS: u32 = 0x0008;
+
+#[derive(Debug)]
+pub struct Class {
+    pub atom: ATOM,
+    pub name: String,
+    pub style: u32,
+    pub wndproc: usize,
+    pub cls_extra: i32,
+    pub wnd_extra: i32,
+    pub instance: usize,
+    pub icon: usize,
+    pub cursor: Mutex<usize>,
+    pub background: usize,
+    pub unicode: bool,
+}
+
+struct Table {
+    next_atom: ATOM,
+    classes: Vec<Arc<Class>>,
+}
+
+fn table() -> &'static Mutex<Table> {
+    static T: OnceLock<Mutex<Table>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(Table { next_atom: 0xC000, classes: Vec::new() }))
+}
+
+/// Class name argument: an atom (`MAKEINTATOM`) or a string.
+pub enum ClassName {
+    Atom(ATOM),
+    Name(String),
+}
+
+impl ClassName {
+    pub unsafe fn from_w(p: LPCWSTR) -> ClassName {
+        if is_int_resource(p) {
+            ClassName::Atom(p as usize as ATOM)
+        } else {
+            ClassName::Name(crate::strings::from_wide(p))
+        }
+    }
+    pub unsafe fn from_a(p: LPCSTR) -> ClassName {
+        if is_int_resource(p as *const u16) {
+            ClassName::Atom(p as usize as ATOM)
+        } else {
+            ClassName::Name(crate::strings::from_ansi(p))
+        }
+    }
+}
+
+impl std::fmt::Display for ClassName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClassName::Atom(a) => write!(f, "#{a:#x}"),
+            ClassName::Name(n) => write!(f, "{n:?}"),
+        }
+    }
+}
+
+pub fn find(name: &ClassName) -> Option<Arc<Class>> {
+    let t = table().lock().unwrap();
+    t.classes
+        .iter()
+        .find(|c| match name {
+            ClassName::Atom(a) => c.atom == *a,
+            ClassName::Name(n) => c.name.eq_ignore_ascii_case(n),
+        })
+        .cloned()
+}
+
+pub struct ClassDesc {
+    pub name: String,
+    pub style: u32,
+    pub wndproc: usize,
+    pub cls_extra: i32,
+    pub wnd_extra: i32,
+    pub instance: usize,
+    pub icon: usize,
+    pub cursor: usize,
+    pub background: usize,
+    pub unicode: bool,
+}
+
+pub fn register(d: ClassDesc) -> ATOM {
+    if d.wndproc == 0 || d.cls_extra < 0 || d.wnd_extra < 0 {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    let mut t = table().lock().unwrap();
+    if t.classes.iter().any(|c| c.name.eq_ignore_ascii_case(&d.name)) {
+        set_error(e::CLASS_ALREADY_EXISTS);
+        return 0;
+    }
+    let atom = t.next_atom;
+    t.next_atom += 1;
+    log::debug!("RegisterClass {:?} atom {atom:#x} style {:#x} wndproc {:#x}", d.name, d.style, d.wndproc);
+    t.classes.push(Arc::new(Class {
+        atom,
+        name: d.name,
+        style: d.style,
+        wndproc: d.wndproc,
+        cls_extra: d.cls_extra,
+        wnd_extra: d.wnd_extra,
+        instance: d.instance,
+        icon: d.icon,
+        cursor: Mutex::new(d.cursor),
+        background: d.background,
+        unicode: d.unicode,
+    }));
+    atom
+}
+
+/// `WNDCLASSW` / `WNDCLASSA` (identical layout; string pointer types differ).
+#[repr(C)]
+pub struct WNDCLASS {
+    pub style: u32,
+    pub wndproc: usize,
+    pub cls_extra: i32,
+    pub wnd_extra: i32,
+    pub instance: usize,
+    pub icon: usize,
+    pub cursor: usize,
+    pub background: usize,
+    pub menu_name: usize,
+    pub class_name: usize,
+}
+const _: () = assert!(std::mem::size_of::<WNDCLASS>() == 72);
+
+/// `WNDCLASSEXW` / `WNDCLASSEXA`.
+#[repr(C)]
+pub struct WNDCLASSEX {
+    pub cb_size: u32,
+    pub style: u32,
+    pub wndproc: usize,
+    pub cls_extra: i32,
+    pub wnd_extra: i32,
+    pub instance: usize,
+    pub icon: usize,
+    pub cursor: usize,
+    pub background: usize,
+    pub menu_name: usize,
+    pub class_name: usize,
+    pub icon_sm: usize,
+}
+const _: () = assert!(std::mem::size_of::<WNDCLASSEX>() == 80);
+
+unsafe fn class_name_string(p: usize, unicode: bool) -> Option<String> {
+    if p == 0 {
+        return None;
+    }
+    if is_int_resource(p as *const u16) {
+        // Registering by atom name is legal but unusual; give it a stable name.
+        return Some(format!("#{}", p));
+    }
+    Some(if unicode { crate::strings::from_wide(p as *const u16) } else { crate::strings::from_ansi(p as *const u8) })
+}
+
+unsafe fn register_common(c: &WNDCLASS, unicode: bool) -> ATOM {
+    let Some(name) = class_name_string(c.class_name, unicode) else {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    };
+    register(ClassDesc {
+        name,
+        style: c.style,
+        wndproc: c.wndproc,
+        cls_extra: c.cls_extra,
+        wnd_extra: c.wnd_extra,
+        instance: c.instance,
+        icon: c.icon,
+        cursor: c.cursor,
+        background: c.background,
+        unicode,
+    })
+}
+
+unsafe fn ex_to_plain(c: &WNDCLASSEX) -> WNDCLASS {
+    WNDCLASS {
+        style: c.style,
+        wndproc: c.wndproc,
+        cls_extra: c.cls_extra,
+        wnd_extra: c.wnd_extra,
+        instance: c.instance,
+        icon: c.icon,
+        cursor: c.cursor,
+        background: c.background,
+        menu_name: c.menu_name,
+        class_name: c.class_name,
+    }
+}
+
+pub unsafe extern "win64" fn RegisterClassW(c: *const WNDCLASS) -> ATOM {
+    if c.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    register_common(&*c, true)
+}
+
+pub unsafe extern "win64" fn RegisterClassA(c: *const WNDCLASS) -> ATOM {
+    if c.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    register_common(&*c, false)
+}
+
+pub unsafe extern "win64" fn RegisterClassExW(c: *const WNDCLASSEX) -> ATOM {
+    if c.is_null() || (*c).cb_size as usize != std::mem::size_of::<WNDCLASSEX>() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    register_common(&ex_to_plain(&*c), true)
+}
+
+pub unsafe extern "win64" fn RegisterClassExA(c: *const WNDCLASSEX) -> ATOM {
+    if c.is_null() || (*c).cb_size as usize != std::mem::size_of::<WNDCLASSEX>() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    register_common(&ex_to_plain(&*c), false)
+}
+
+fn unregister(name: ClassName) -> BOOL {
+    let Some(c) = find(&name) else {
+        set_error(e::CLASS_DOES_NOT_EXIST);
+        return FALSE;
+    };
+    if super::window::any_window_of_class(c.atom) {
+        set_error(e::CLASS_HAS_WINDOWS);
+        return FALSE;
+    }
+    table().lock().unwrap().classes.retain(|x| x.atom != c.atom);
+    TRUE
+}
+
+pub unsafe extern "win64" fn UnregisterClassW(name: LPCWSTR, _inst: HINSTANCE) -> BOOL {
+    unregister(ClassName::from_w(name))
+}
+
+pub unsafe extern "win64" fn UnregisterClassA(name: LPCSTR, _inst: HINSTANCE) -> BOOL {
+    unregister(ClassName::from_a(name))
+}
+
+unsafe fn fill_info(c: &Class, out: *mut WNDCLASSEX, ex: bool) {
+    if ex {
+        let o = &mut *out;
+        o.style = c.style;
+        o.wndproc = c.wndproc;
+        o.cls_extra = c.cls_extra;
+        o.wnd_extra = c.wnd_extra;
+        o.instance = c.instance;
+        o.icon = c.icon;
+        o.cursor = *c.cursor.lock().unwrap();
+        o.background = c.background;
+        o.menu_name = 0;
+        o.icon_sm = c.icon;
+        // class_name is left as passed in by the caller (documented behaviour).
+    } else {
+        let o = &mut *(out as *mut WNDCLASS);
+        o.style = c.style;
+        o.wndproc = c.wndproc;
+        o.cls_extra = c.cls_extra;
+        o.wnd_extra = c.wnd_extra;
+        o.instance = c.instance;
+        o.icon = c.icon;
+        o.cursor = *c.cursor.lock().unwrap();
+        o.background = c.background;
+        o.menu_name = 0;
+    }
+}
+
+unsafe fn get_class_info(name: ClassName, out: *mut WNDCLASSEX, ex: bool) -> BOOL {
+    if out.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    match find(&name) {
+        Some(c) => {
+            fill_info(&c, out, ex);
+            c.atom as BOOL
+        }
+        None => {
+            set_error(e::CLASS_DOES_NOT_EXIST);
+            FALSE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn GetClassInfoExW(_inst: HINSTANCE, name: LPCWSTR, out: *mut WNDCLASSEX) -> BOOL {
+    get_class_info(ClassName::from_w(name), out, true)
+}
+
+pub unsafe extern "win64" fn GetClassInfoW(_inst: HINSTANCE, name: LPCWSTR, out: *mut WNDCLASS) -> BOOL {
+    get_class_info(ClassName::from_w(name), out as *mut WNDCLASSEX, false)
+}
+
+pub unsafe extern "win64" fn GetClassInfoExA(_inst: HINSTANCE, name: LPCSTR, out: *mut WNDCLASSEX) -> BOOL {
+    get_class_info(ClassName::from_a(name), out, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "win64" fn proc_(_h: usize, _m: u32, _w: WPARAM, _l: LPARAM) -> LRESULT {
+        0
+    }
+
+    #[test]
+    fn register_find_unregister() {
+        let name = crate::strings::to_wide_z("Aw2TestClassA");
+        let wc = WNDCLASS {
+            style: CS_DBLCLKS,
+            wndproc: proc_ as *const () as usize,
+            cls_extra: 0,
+            wnd_extra: 8,
+            instance: 0,
+            icon: 0,
+            cursor: 0,
+            background: 0,
+            menu_name: 0,
+            class_name: name.as_ptr() as usize,
+        };
+        unsafe {
+            let a = RegisterClassW(&wc);
+            assert!(a >= 0xC000);
+            assert_eq!(RegisterClassW(&wc), 0, "duplicate registration must fail");
+            assert_eq!(find(&ClassName::Atom(a)).unwrap().wnd_extra, 8);
+            assert!(find(&ClassName::Name("aw2testclassa".into())).is_some());
+            assert_eq!(UnregisterClassW(name.as_ptr(), std::ptr::null_mut()), TRUE);
+            assert!(find(&ClassName::Atom(a)).is_none());
+        }
+    }
+}

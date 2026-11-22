@@ -1,0 +1,40 @@
+[build]
+# The user-level sccache wrapper fails inside long sandbox TMPDIRs
+# ("path must be shorter than SUN_LEN"). Disable it for this repo.
+rustc-wrapper = ""
+
+# Hybrid runtime: exceptions raised below a Rust replacement cross the Rust frames by
+# following the rbp chain to the hook shim's fence (win32-rt unwind.rs, ADVICE_SEH.md),
+# and crash reports walk host frames the same way. Keep frame pointers in every profile.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "force-frame-pointers=yes"]
+runner = "tools/rosetta_run.sh"
+
+# iOS / iPadOS Apple Silicon targets (A14+ / M1+: Metal 4 + ARMv8.4-A FEAT_LSE + FEAT_LRCPC).
+# Rust's built-in `aarch64-apple-ios` defaults to Apple A7 (ARMv8.0-A), which lacks LSE/RCPC.
+[target.aarch64-apple-ios]
+rustflags = ["-C", "target-cpu=apple-a14"]
+
+[target.aarch64-apple-ios-sim]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
+[alias]
+# Universal native ARM64 game runner & factory CLI (fast builds, zero AW2 shards).
+runner = "run -p port-loader --bin port-runner --target aarch64-apple-darwin --"
+runner-build = "build -p port-loader --bin port-runner --target aarch64-apple-darwin"
+ios-lib = "build --release -p port-loader --lib --no-default-features --target aarch64-apple-ios"
+ios-sim-lib = "build --release -p port-loader --lib --no-default-features --target aarch64-apple-ios-sim"
+factory-test = "test -p pe-image -p dxil-metal -p wwise-audio -p x86-runtime -p port-factory -p port-loader --lib --target aarch64-apple-darwin"
+opsdb = "run -p port-factory --bin port-factory --"
+x86-verify = "run --release -p x86-runtime --bin x86-verify --target aarch64-apple-darwin --"
+# Alan Wake 2 full target (links aw2-game + lifted shards + Wwise native bridge).
+loader = "run -p port-loader --features aw2 --bin aw2-loader --target aarch64-apple-darwin --"
+loader-build = "build -p port-loader --features aw2 --bin aw2-loader --target aarch64-apple-darwin"
+native-loader = "run -p port-loader --features aw2 --bin aw2-loader --target aarch64-apple-darwin --"
+native-build = "build -p port-loader --features aw2 --bin aw2-loader --target aarch64-apple-darwin"
+native-test = "test -p pe-image -p port-factory -p win32-rt -p x86-runtime -p aw2-game -p port-loader --features aw2 --target aarch64-apple-darwin"
+data = "run -p aw2-data --bin aw2-data --"
+# Legacy x86_64 hybrid runtime under Rosetta 2.
+rosetta-loader = "run -p port-loader --features aw2 --bin aw2-loader --target x86_64-apple-darwin --"
+rosetta-build = "build -p port-loader --features aw2 --bin aw2-loader --target x86_64-apple-darwin"
+hybrid-test = "test -p pe-image -p win32-rt -p x86-runtime -p aw2-game -p port-loader --features aw2 --target x86_64-apple-darwin"

@@ -1,0 +1,61 @@
+[package]
+name = "wwise-audio"
+description = "Universal Wwise 2022.1 (bank v145) .bnk parser, .wem Vorbis/PCM decoders, DSP graph, and runtime (optional Northlight VFS adapter)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+northlight = ["dep:aw2-data"]
+
+[dependencies]
+aw2-data = { workspace = true, optional = true }
+# Pure-Rust Vorbis I decoder. Wwise Vorbis packets/setup are rebuilt into standard Vorbis
+# (ww2ogg/vgmstream algorithm) and fed to lewton's packet-level API (no Ogg framing needed).
+lewton = { version = "0.10", default-features = false }
+
+[[bin]]
+name = "wwise-audio"
+path = "src/bin/wwise-audio/main.rs"
+required-features = ["northlight"]
+
+[[test]]
+name = "real_data"
+required-features = ["northlight"]
+
+[[test]]
+name = "vorbis_floor"
+required-features = ["northlight"]
+
+[[example]]
+name = "bus_rtpcs"
+required-features = ["northlight"]
+
+[[example]]
+name = "bus_tree"
+required-features = ["northlight"]
+
+[[example]]
+name = "find_id"
+required-features = ["northlight"]
+
+[[example]]
+name = "fx_wiring"
+required-features = ["northlight"]
+
+[[example]]
+name = "node_chain"
+required-features = ["northlight"]
+
+[[example]]
+name = "pcm_bank"
+required-features = ["northlight"]
+
+[[example]]
+name = "prop_values"
+required-features = ["northlight"]
+
+[[example]]
+name = "ranseq_values"
+required-features = ["northlight"]

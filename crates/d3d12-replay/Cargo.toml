@@ -1,0 +1,16 @@
+[package]
+name = "d3d12-replay"
+description = "Native arm64 tool for AW2_D3D12_TRACE call traces: stats, dump, offline shader/PSO validation, and replay through a pluggable backend"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+d3d12-metal.workspace = true
+dxil-metal = { workspace = true, features = ["metal"] }
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = "0.3"

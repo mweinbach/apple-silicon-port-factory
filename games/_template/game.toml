@@ -1,0 +1,40 @@
+# Starter target manifest template for Apple Silicon Port Factory.
+#
+# Copy this file to `games/<your-game-id>/game.toml` and fill in the fields below.
+# Most Windows x86-64 games run on the universal `port-runner` binary with zero custom Rust code:
+#
+#   cargo runner -- --manifest games/<your-game-id>/game.toml --game-dir /path/to/Game --prewarm-aot
+#   cargo runner -- --manifest games/<your-game-id>/game.toml --game-dir /path/to/Game
+#
+# Never commit game binaries, assets, or personal filesystem paths.
+
+[app]
+# Short kebab-case identifier (matches directory name under `games/<id>/`)
+id = "my-game"
+# Human-readable display name (used for window title, logs, and .app bundle naming)
+name = "My Game"
+# Main Windows x86-64 executable filename inside `--game-dir`
+exe = "MyGame.exe"
+# Virtual Windows directory mounted to `--game-dir` inside `~/Translator`
+win_dir = "C:\\Games\\MyGame"
+# Boot/runtime log filename under ~/Library/Logs/Translator/
+log_name = "MyGame.log"
+# Virtual Windows computer name returned by GetComputerName*
+computer_name = "WIN64PORT"
+# Optional Steam AppID (enables `steam_api64.dll` IPC integration & `steam-port` lookup)
+# steam_app_id = "123456"
+
+[runtime]
+# Set true only if the binary relies on loading at its preferred PE ImageBase
+preferred_base_retry = false
+# Set true for games embedding V8 (e.g. Coherent Gameface) so V8 runs without guest RWX JIT
+v8_jitless = false
+# Legacy Alan Wake 2 save-directory migration (always false for new games)
+legacy_remedy_migration = false
+# Optional comma-separated builtin DLL override controls:
+#   - Prefix with `-` to force loading the game's own shipping PE DLL via x86-runtime
+#     (e.g. "-physx3_x64.dll,-bink2w64.dll")
+#   - Use "0" to disable all builtin overrides for game-shipped DLLs
+# builtin_overrides = ""
+# Optional default command-line arguments appended to the Windows command line
+# args = ""
