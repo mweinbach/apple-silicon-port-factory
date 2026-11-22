@@ -192,18 +192,35 @@ Key host paths and env vars:
 
 ---
 
-## Standard workflows
+## Standard workflows & repo skills
+
+Detailed step-by-step runbooks live in `.agents/skills/`:
+
+| Skill | When to use it |
+|---|---|
+| `bring-up-game` | Auditing a new Windows game, writing `games/<id>/game.toml`, prewarming `.aot`, and triaging boot blockers |
+| `implement-win32-api` | Implementing or fixing Win32, CRT, COM, or middleware exports in `crates/win32-rt` |
+| `implement-x86-op` | Adding, promoting, or fixing x86-64 → ARM64/NEON instructions in `crates/x86-runtime` and `ops_db` |
+| `debug-runtime-and-nan` | Hunting CPU/NaN/MXCSR/AOT/crash bugs with `runtime-audit`, `verify-x86`, `live-probe`, `bisect-runtime`, `nan-trace`, Rosetta `oracle`, and `tools/lldb.sh` |
+| `graphics-metal4` | Working on D3D12, D3D11, Vulkan→MoltenVK, Metal 4, MetalFX, or `d3d12-replay` |
+| `shader-pipeline` | Working on `crates/dxil-metal`, `dxil-metald`, `libdxilconv`, `naga`, Tier-1/Tier-2 PSO caches, and `PsoManifest` |
+| `package-macos-and-ios` | Building & verifying portable macOS `.app` bundles, iOS `.app`/`.ipa` (static `.aot.o`), Steam ports, `optimize-assets`, and `ios/PortHost` |
+| `audio-and-windowing` | Working on AppKit/UIKit windowing & deadlock rules, raw input, gamepads/DualSense HID, WASAPI→CoreAudio, and `wwise-audio` |
+| `profile-and-verify` | Profiling boot/CPU/hitches/GPU passes and running pre-PR boundary, `cargo opsdb -- doctor`, and test gates |
+| `decompile-function` | Bespoke Alan Wake 2 function decompilation under `games/alan-wake-2/crates/aw2-game` |
 
 ### Bringing up a new Windows game
 
+See `.agents/skills/bring-up-game/SKILL.md`. In short:
 1. Audit the install first:
    ```sh
    cargo opsdb -- scan /path/to/game/
    cargo opsdb -- win32-audit /path/to/game/
    cargo opsdb -- anticheat-audit /path/to/game/Game.exe
    cargo opsdb -- app-audit /path/to/game/Game.exe
+   cargo opsdb -- runtime-audit /path/to/game/
    ```
-2. Create `games/<id>/game.toml` (copy `games/overwatch/game.toml` as a template). Set `name`,
+2. Create `games/<id>/game.toml` (copy `games/_template/game.toml` as a template). Set `name`,
    `exe`, `win_dir`, optional `steam_app_id`, and runtime flags.
 3. Prewarm the ARM64 `.aot` cache and boot with `port-runner`:
    ```sh
