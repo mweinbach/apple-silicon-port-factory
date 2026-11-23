@@ -1,0 +1,75 @@
+name: CI
+
+# Runs the gates the pull-request template asks contributors to run locally.
+#
+# Everything here works from a plain clone on a GitHub-hosted runner: no Git LFS, no game
+# files, no Metal Shader Converter and no physical GPU. The Metal 4 GPU tests, the audio
+# tests and the end-to-end tests that drive a window need real Apple Silicon hardware and
+# are not part of this workflow; run them locally (see CONTRIBUTING.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Audit submodules, db storage, crate boundaries, tracked binaries and personal paths
+        run: .agents/skills/audit-repo-hygiene/scripts/audit_repo_hygiene.sh
+
+  test:
+    name: Build and test (macOS arm64)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show toolchain
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          xcodebuild -version
+          rustc -Vv
+          cargo -V
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Catalog drift check (db/*.tsv match the source)
+        run: cargo opsdb -- doctor
+      - name: Build the universal runner
+        run: cargo runner-build
+      - name: Unit tests
+        run: cargo factory-test -- --test-threads=1
+      - name: AOT multi-module verification
+        run: >-
+          cargo test -p x86-runtime --test aot_multi_module_verify
+          --target aarch64-apple-darwin -- --test-threads=1
+      - name: Check the Alan Wake 2 crate against shared signatures
+        run: cargo check -p aw2-game --no-default-features --target aarch64-apple-darwin
+
+  ios:
+    name: iOS library check
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the iOS target
+        run: rustup target add aarch64-apple-ios
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check the port-loader library for iOS
+        run: cargo check -p port-loader --lib --no-default-features --target aarch64-apple-ios
