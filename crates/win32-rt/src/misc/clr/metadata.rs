@@ -1291,24 +1291,8 @@ impl AssemblyImage {
         if start <= end { start..end } else { start..start }
     }
 
-    /// Range of 1-based `Property` RIDs owned by 1-based `typedef_rid`.
-    pub fn type_property_range(&self, typedef_rid: u32) -> std::ops::Range<u32> {
-        for (i, pm) in self.property_maps.iter().enumerate() {
-            if pm.parent == typedef_rid {
-                let start = pm.property_list.max(1);
-                let end = self
-                    .property_maps
-                    .get(i + 1)
-                    .map(|n| n.property_list)
-                    .unwrap_or(self.properties.len() as u32 + 1)
-                    .min(self.properties.len() as u32 + 1);
-                return if start <= end { start..end } else { start..start };
-            }
-        }
-        1..1
-    }
-
     /// Getter and setter `MethodDef` RIDs (1-based) for a 1-based `property_rid`.
+    #[cfg(test)]
     pub fn property_accessors(&self, property_rid: u32) -> (Option<u32>, Option<u32>) {
         let prop_tok = ((table::PROPERTY as u32) << 24) | property_rid;
         let mut getter = None;
@@ -1324,26 +1308,6 @@ impl AssemblyImage {
             }
         }
         (getter, setter)
-    }
-
-    /// Resolve `ImplMap` P/Invoke info `(dll_name, entry_name, mapping_flags)` for a 1-based `MethodDef` RID.
-    pub fn method_pinvoke(&self, method_rid: u32) -> Option<(String, String, u16)> {
-        let m_tok = ((table::METHOD_DEF as u32) << 24) | method_rid;
-        let row = self.impl_maps.iter().find(|r| r.member_forwarded == m_tok)?;
-        let mr = self
-            .module_refs
-            .get(row.import_scope.saturating_sub(1) as usize)?;
-        let dll = self.get_string(mr.name).to_string();
-        let imp = self.get_string(row.import_name);
-        let entry = if imp.is_empty() {
-            self.method_defs
-                .get(method_rid.saturating_sub(1) as usize)
-                .map(|m| self.get_string(m.name).to_string())
-                .unwrap_or_default()
-        } else {
-            imp.to_string()
-        };
-        Some((dll, entry, row.mapping_flags))
     }
 
     /// Look up `(namespace, name)` for a `TypeDef`, `TypeRef`, or `TypeSpec` token.

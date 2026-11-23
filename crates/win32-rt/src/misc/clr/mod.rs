@@ -176,7 +176,7 @@ unsafe fn marshal_win64_arg_to_cil(
         SigType::String => {
             if raw == 0 {
                 CilVal::Obj(0)
-            } else if vm.heap.objects.contains_key(&(raw as usize)) {
+            } else if vm.heap.contains_untrusted(raw as usize) {
                 CilVal::Obj(raw as usize)
             } else {
                 let s = if wide_strings {
@@ -1432,7 +1432,7 @@ pub unsafe fn mono_runtime_invoke(
         if sig.has_this && !sig.explicit_this {
             let cls = &vm.classes[m.class_id];
             if cls.is_value_type && !obj.is_null() {
-                args.push(CilVal::ManagedPtr(vm::ManagedAddr::Raw(obj as usize)));
+                args.push(CilVal::RawPtr(obj as usize));
             } else {
                 args.push(CilVal::Obj(obj as usize));
             }
@@ -1506,7 +1506,17 @@ pub unsafe fn mono_string_to_utf8(string_obj: *mut c_void) -> *mut c_char {
     if string_obj.is_null() {
         return std::ptr::null_mut();
     }
-    let Some(s) = lock_vm().heap.read_string(string_obj as usize) else {
+    let Some(s) = ({
+        let vm = lock_vm();
+        if matches!(
+            vm.heap.get_untrusted(string_obj as usize),
+            Some(vm::HeapObjKind::String)
+        ) {
+            vm.heap.read_string(string_obj as usize)
+        } else {
+            None
+        }
+    }) else {
         return std::ptr::null_mut();
     };
     let bytes = s.as_bytes();
@@ -1525,7 +1535,7 @@ pub unsafe fn mono_string_chars(string_obj: *mut c_void) -> *mut u16 {
     }
     let vm = lock_vm();
     if !matches!(
-        vm.heap.objects.get(&(string_obj as usize)),
+        vm.heap.get_untrusted(string_obj as usize),
         Some(vm::HeapObjKind::String)
     ) {
         return std::ptr::null_mut();
@@ -1539,7 +1549,7 @@ pub unsafe fn mono_string_length(string_obj: *mut c_void) -> i32 {
     }
     let vm = lock_vm();
     if !matches!(
-        vm.heap.objects.get(&(string_obj as usize)),
+        vm.heap.get_untrusted(string_obj as usize),
         Some(vm::HeapObjKind::String)
     ) {
         return 0;
@@ -1561,7 +1571,7 @@ pub fn mono_runtime_object_init(this_obj: *mut c_void) {
     }
     let ctor_mid = {
         let vm = lock_vm();
-        let Some(cid) = vm.object_class_id(this_obj as usize) else {
+        let Some(cid) = vm.object_class_id_untrusted(this_obj as usize) else {
             return;
         };
         vm.find_method_in_class(cid, ".ctor", 0)
@@ -1596,7 +1606,7 @@ pub fn mono_object_unbox(obj: *mut c_void) -> *mut c_void {
         return std::ptr::null_mut();
     }
     let vm = lock_vm();
-    if !vm.heap.objects.contains_key(&(obj as usize)) {
+    if !vm.heap.contains_untrusted(obj as usize) {
         return std::ptr::null_mut();
     }
     (obj as usize + MONO_OBJECT_HEADER_SIZE) as *mut c_void
@@ -1607,7 +1617,7 @@ pub fn mono_object_get_class(obj: *mut c_void) -> *mut c_void {
         return std::ptr::null_mut();
     }
     let vm = lock_vm();
-    vm.object_class_id(obj as usize)
+    vm.object_class_id_untrusted(obj as usize)
         .map_or(std::ptr::null_mut(), |cid| vm.classes[cid].mono_class as *mut c_void)
 }
 
@@ -1625,8 +1635,8 @@ pub unsafe fn mono_value_box(klass: *mut c_void, val: *mut c_void) -> *mut c_voi
         .primitive_sig
         .clone()
         .unwrap_or(SigType::ValueType(0));
-    let bytes = std::slice::from_raw_parts(val as *const u8, sz).to_vec();
-    vm.heap.alloc_boxed(vt, cid, sig, &bytes) as *mut c_void
+    let bytes = std::slice::from_raw_parts(val as *const u8, sz);
+    vm.heap.alloc_boxed(vt, cid, sig, bytes) as *mut c_void
 }
 
 pub unsafe fn mono_field_get_value(obj: *mut c_void, field: *mut c_void, val: *mut c_void) {
@@ -1639,8 +1649,7 @@ pub unsafe fn mono_field_get_value(obj: *mut c_void, field: *mut c_void, val: *m
     };
     let f = &vm.fields[fid];
     if f.is_static || obj.is_null() {
-        let bytes = vm::cil_val_to_bytes(&f.sig, f.static_value);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), val as *mut u8, bytes.len());
+        vm::write_sig_to_ptr(&f.sig, val as *mut u8, f.static_value);
     } else {
         let src = (obj as usize + MONO_OBJECT_HEADER_SIZE + f.struct_offset) as *const u8;
         std::ptr::copy_nonoverlapping(src, val as *mut u8, f.size);
@@ -1727,7 +1736,7 @@ pub unsafe fn mono_array_length(array: *mut c_void) -> usize {
         return 0;
     }
     let vm = lock_vm();
-    match vm.heap.objects.get(&(array as usize)) {
+    match vm.heap.get_untrusted(array as usize) {
         Some(vm::HeapObjKind::Array { length, .. }) => *length,
         _ => 0,
     }
@@ -1743,7 +1752,7 @@ pub unsafe fn mono_array_addr_with_size(
     }
     let vm = lock_vm();
     if !matches!(
-        vm.heap.objects.get(&(array as usize)),
+        vm.heap.get_untrusted(array as usize),
         Some(vm::HeapObjKind::Array { .. })
     ) {
         return std::ptr::null_mut();
