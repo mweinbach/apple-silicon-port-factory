@@ -62,10 +62,29 @@ pub fn default_mask(n: u16) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleType {
     F32,
+    F64,
     I16,
     I24,     // 3-byte packed
     I32,     // 32-bit container (valid bits may be 24)
     U8,
+}
+
+impl SampleType {
+    #[inline]
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            SampleType::U8 => 1,
+            SampleType::I16 => 2,
+            SampleType::I24 => 3,
+            SampleType::I32 | SampleType::F32 => 4,
+            SampleType::F64 => 8,
+        }
+    }
+
+    #[inline]
+    pub const fn is_float(self) -> bool {
+        matches!(self, SampleType::F32 | SampleType::F64)
+    }
 }
 
 /// Parsed, validated stream format.
@@ -141,6 +160,7 @@ impl WaveFormat {
         let bits = wf.wBitsPerSample;
         let sample = match (tag, bits) {
             (WAVE_FORMAT_IEEE_FLOAT, 32) => SampleType::F32,
+            (WAVE_FORMAT_IEEE_FLOAT, 64) => SampleType::F64,
             (WAVE_FORMAT_PCM, 8) => SampleType::U8,
             (WAVE_FORMAT_PCM, 16) => SampleType::I16,
             (WAVE_FORMAT_PCM, 24) => SampleType::I24,
@@ -181,13 +201,13 @@ impl WaveFormat {
     }
 
     pub fn to_extensible(&self) -> WAVEFORMATEXTENSIBLE {
-        let sub = if self.sample == SampleType::F32 { KSDATAFORMAT_SUBTYPE_IEEE_FLOAT } else { KSDATAFORMAT_SUBTYPE_PCM };
+        let sub = if self.sample.is_float() { KSDATAFORMAT_SUBTYPE_IEEE_FLOAT } else { KSDATAFORMAT_SUBTYPE_PCM };
         WAVEFORMATEXTENSIBLE {
             Format: WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_EXTENSIBLE,
                 nChannels: self.channels,
                 nSamplesPerSec: self.rate,
-                nAvgBytesPerSec: self.rate * self.block_align as u32,
+                nAvgBytesPerSec: self.rate.saturating_mul(self.block_align as u32),
                 nBlockAlign: self.block_align,
                 wBitsPerSample: self.bits,
                 cbSize: 22,
@@ -198,9 +218,135 @@ impl WaveFormat {
         }
     }
 
+    /// Build a plain `WAVEFORMATEX` representation (`cbSize = 0` for non-extensible,
+    /// `cbSize = 22` for extensible).
+    pub fn to_wfx(&self) -> WAVEFORMATEX {
+        let tag = if self.extensible {
+            WAVE_FORMAT_EXTENSIBLE
+        } else if self.sample.is_float() {
+            WAVE_FORMAT_IEEE_FLOAT
+        } else {
+            WAVE_FORMAT_PCM
+        };
+        WAVEFORMATEX {
+            wFormatTag: tag,
+            nChannels: self.channels,
+            nSamplesPerSec: self.rate,
+            nAvgBytesPerSec: self.rate.saturating_mul(self.block_align as u32),
+            nBlockAlign: self.block_align,
+            wBitsPerSample: self.bits,
+            cbSize: if self.extensible { 22 } else { 0 },
+        }
+    }
+
+    /// Serialized byte size (`40` for `WAVEFORMATEXTENSIBLE`, `18` for `WAVEFORMATEX`).
+    #[inline]
+    pub const fn encoded_size(&self) -> usize {
+        if self.extensible {
+            std::mem::size_of::<WAVEFORMATEXTENSIBLE>()
+        } else {
+            std::mem::size_of::<WAVEFORMATEX>()
+        }
+    }
+
+    /// Write `WAVEFORMATEX` (18 bytes), `WAVEFORMATEXTENSIBLE` (40 bytes), or legacy
+    /// 16-byte `PCMWAVEFORMAT` (when non-extensible integer PCM and `max_bytes == 16`)
+    /// unaligned into `ptr`. Returns `Some(bytes_written)` on success or `None` if
+    /// `ptr` is null or `max_bytes` is insufficient.
+    pub unsafe fn write_to(&self, ptr: *mut u8, max_bytes: usize) -> Option<usize> {
+        if ptr.is_null() {
+            return None;
+        }
+        if self.extensible {
+            let req = std::mem::size_of::<WAVEFORMATEXTENSIBLE>();
+            if max_bytes < req {
+                return None;
+            }
+            std::ptr::write_unaligned(ptr as *mut WAVEFORMATEXTENSIBLE, self.to_extensible());
+            Some(req)
+        } else if !self.sample.is_float() && max_bytes == 16 {
+            let wfx = self.to_wfx();
+            let raw: [u8; 18] = std::mem::transmute(wfx);
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), ptr, 16);
+            Some(16)
+        } else {
+            let req = std::mem::size_of::<WAVEFORMATEX>();
+            if max_bytes < req {
+                return None;
+            }
+            std::ptr::write_unaligned(ptr as *mut WAVEFORMATEX, self.to_wfx());
+            Some(req)
+        }
+    }
+
     /// Bytes of the extensible struct (for blobs / WAV headers).
     pub fn extensible_bytes(&self) -> [u8; 40] {
         unsafe { std::mem::transmute(self.to_extensible()) }
+    }
+}
+
+/// Decode a single little-endian PCM or IEEE float sample to normalized `f32`
+/// (`[-1.0, 1.0]`, replacing non-finite float values or truncated inputs with `0.0`).
+#[inline]
+pub fn decode_pcm_sample_f32(kind: SampleType, bytes: &[u8]) -> f32 {
+    match kind {
+        SampleType::U8 => {
+            if bytes.is_empty() {
+                0.0
+            } else {
+                (bytes[0] as f32 - 128.0) / 128.0
+            }
+        }
+        SampleType::I16 => {
+            if bytes.len() < 2 {
+                0.0
+            } else {
+                i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0
+            }
+        }
+        SampleType::I24 => {
+            if bytes.len() < 3 {
+                0.0
+            } else {
+                (i32::from_le_bytes([0, bytes[0], bytes[1], bytes[2]]) >> 8) as f32 / 8_388_608.0
+            }
+        }
+        SampleType::I32 => {
+            if bytes.len() < 4 {
+                0.0
+            } else {
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32 / 2_147_483_648.0
+            }
+        }
+        SampleType::F32 => {
+            if bytes.len() < 4 {
+                0.0
+            } else {
+                let v = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if v.is_finite() { v } else { 0.0 }
+            }
+        }
+        SampleType::F64 => {
+            if bytes.len() < 8 {
+                0.0
+            } else {
+                let v = f64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]) as f32;
+                if v.is_finite() { v } else { 0.0 }
+            }
+        }
+    }
+}
+
+/// Decode all complete little-endian samples of `kind` from `raw` into `out` (cleared first).
+pub fn decode_pcm_buffer_f32(kind: SampleType, raw: &[u8], out: &mut Vec<f32>) {
+    let bps = kind.bytes_per_sample();
+    let count = raw.len() / bps;
+    out.clear();
+    out.reserve(count);
+    for chunk in raw[..count * bps].chunks_exact(bps) {
+        out.push(decode_pcm_sample_f32(kind, chunk));
     }
 }
 
@@ -212,6 +358,9 @@ pub fn to_f32(fmt: &WaveFormat, src: &[u8], frames: usize, out: &mut Vec<f32>) {
     match fmt.sample {
         SampleType::F32 => {
             out.extend(src[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        }
+        SampleType::F64 => {
+            out.extend(src[..n * 8].chunks_exact(8).map(|b| decode_pcm_sample_f32(SampleType::F64, b)));
         }
         SampleType::I16 => {
             out.extend(src[..n * 2].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0));
@@ -226,6 +375,113 @@ pub fn to_f32(fmt: &WaveFormat, src: &[u8], frames: usize, out: &mut Vec<f32>) {
             out.extend(src[..n].iter().map(|&b| (b as f32 - 128.0) / 128.0));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared 3D audio vector helpers (`D3DVECTOR` / `FMOD_VECTOR` / `X3DAUDIO_VECTOR` / OpenAL)
+// ---------------------------------------------------------------------------
+
+/// Win64 ABI-compatible 3D audio vector (`#[repr(C)] { x, y, z }`, 12 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vec3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<Vec3>() == 12);
+
+impl Vec3 {
+    pub const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
+
+    #[inline]
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    #[inline]
+    pub const fn from_array(a: [f32; 3]) -> Self {
+        Self { x: a[0], y: a[1], z: a[2] }
+    }
+
+    #[inline]
+    pub const fn to_array(self) -> [f32; 3] {
+        [self.x, self.y, self.z]
+    }
+
+    #[inline]
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+}
+
+impl From<[f32; 3]> for Vec3 {
+    #[inline]
+    fn from(a: [f32; 3]) -> Self {
+        Self::from_array(a)
+    }
+}
+
+impl From<Vec3> for [f32; 3] {
+    #[inline]
+    fn from(v: Vec3) -> Self {
+        v.to_array()
+    }
+}
+
+#[inline]
+pub fn vec3_add(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+#[inline]
+pub fn vec3_sub(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+}
+
+#[inline]
+pub fn vec3_scale(v: Vec3, s: f32) -> Vec3 {
+    Vec3 { x: v.x * s, y: v.y * s, z: v.z * s }
+}
+
+#[inline]
+pub fn vec3_dot(a: Vec3, b: Vec3) -> f32 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+#[inline]
+pub fn vec3_cross(a: Vec3, b: Vec3) -> Vec3 {
+    Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+
+#[inline]
+pub fn vec3_len_sq(v: Vec3) -> f32 {
+    vec3_dot(v, v)
+}
+
+#[inline]
+pub fn vec3_len(v: Vec3) -> f32 {
+    vec3_dot(v, v).sqrt()
+}
+
+#[inline]
+pub fn vec3_normalize(v: Vec3) -> Option<Vec3> {
+    let l = vec3_len(v);
+    if !l.is_finite() || l < 1e-6 {
+        None
+    } else {
+        Some(Vec3 { x: v.x / l, y: v.y / l, z: v.z / l })
+    }
+}
+
+#[inline]
+pub fn vec3_is_finite(v: Vec3) -> bool {
+    v.is_finite()
 }
 
 const M3DB: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -439,5 +695,98 @@ mod tests {
     fn mono_upmix() {
         let m = channel_matrix(1, 4, 2, 3);
         assert_eq!(m, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn f64_roundtrip_write_to_and_pcm_decoder() {
+        // WaveFormat::from_ptr + to_extensible + to_f32 for IEEE float64.
+        let f64_fmt = WaveFormat {
+            rate: 48_000,
+            channels: 2,
+            bits: 64,
+            valid_bits: 64,
+            block_align: 16,
+            mask: 0x3,
+            sample: SampleType::F64,
+            extensible: true,
+        };
+        assert_eq!(f64_fmt.encoded_size(), 40);
+        assert_eq!(f64_fmt.sample.bytes_per_sample(), 8);
+        assert!(f64_fmt.sample.is_float());
+
+        // Write extensible unaligned at odd offset and parse back.
+        let mut raw_buf = [0u8; 64];
+        unsafe {
+            let unaligned = raw_buf.as_mut_ptr().add(3);
+            assert_eq!(f64_fmt.write_to(unaligned, 39), None);
+            assert_eq!(f64_fmt.write_to(std::ptr::null_mut(), 64), None);
+            assert_eq!(f64_fmt.write_to(unaligned, 40), Some(40));
+            let parsed = WaveFormat::from_ptr(unaligned as *const WAVEFORMATEX).unwrap();
+            assert_eq!(parsed, f64_fmt);
+        }
+
+        // Non-extensible PCM16: 16-byte PCMWAVEFORMAT and 18-byte WAVEFORMATEX.
+        let pcm16 = WaveFormat {
+            rate: 44_100,
+            channels: 2,
+            bits: 16,
+            valid_bits: 16,
+            block_align: 4,
+            mask: 0x3,
+            sample: SampleType::I16,
+            extensible: false,
+        };
+        assert_eq!(pcm16.encoded_size(), 18);
+        unsafe {
+            let unaligned = raw_buf.as_mut_ptr().add(1);
+            assert_eq!(pcm16.write_to(unaligned, 15), None);
+            assert_eq!(pcm16.write_to(unaligned, 16), Some(16));
+            assert_eq!(pcm16.write_to(unaligned, 18), Some(18));
+            let parsed = WaveFormat::from_ptr(unaligned as *const WAVEFORMATEX).unwrap();
+            assert_eq!(parsed, pcm16);
+        }
+
+        // Single-sample and buffer decoders across all 6 SampleTypes + NaN/short guards.
+        assert_eq!(decode_pcm_sample_f32(SampleType::U8, &[128]), 0.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::U8, &[0]), -1.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::I16, &16384i16.to_le_bytes()), 0.5);
+        assert_eq!(decode_pcm_sample_f32(SampleType::I24, &[0x00, 0x00, 0x80]), -1.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::I32, &i32::MIN.to_le_bytes()), -1.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::F32, &0.25f32.to_le_bytes()), 0.25);
+        assert_eq!(decode_pcm_sample_f32(SampleType::F32, &f32::NAN.to_le_bytes()), 0.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::F64, &(-0.75f64).to_le_bytes()), -0.75);
+        assert_eq!(decode_pcm_sample_f32(SampleType::F64, &f64::INFINITY.to_le_bytes()), 0.0);
+        assert_eq!(decode_pcm_sample_f32(SampleType::F64, &[0u8; 4]), 0.0);
+
+        let f64_bytes: Vec<u8> = [0.5f64, -0.25, f64::NAN, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut out = Vec::new();
+        to_f32(&f64_fmt, &f64_bytes, 2, &mut out);
+        assert_eq!(out, vec![0.5, -0.25, 0.0, 1.0]);
+        decode_pcm_buffer_f32(SampleType::F64, &f64_bytes, &mut out);
+        assert_eq!(out, vec![0.5, -0.25, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn vec3_math_helpers() {
+        let a = Vec3::new(3.0, 4.0, 0.0);
+        let b = Vec3::from([1.0, 0.0, 0.0]);
+        assert_eq!(vec3_add(a, b), Vec3::new(4.0, 4.0, 0.0));
+        assert_eq!(vec3_sub(a, b), Vec3::new(2.0, 4.0, 0.0));
+        assert_eq!(vec3_scale(b, 2.5), Vec3::new(2.5, 0.0, 0.0));
+        assert_eq!(vec3_dot(a, b), 3.0);
+        assert_eq!(vec3_cross(Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)), Vec3::new(0.0, 0.0, 1.0));
+        assert!((vec3_len(a) - 5.0).abs() < 1e-6);
+        assert!((vec3_len_sq(a) - 25.0).abs() < 1e-6);
+
+        let n = vec3_normalize(a).unwrap();
+        assert!((n.x - 0.6).abs() < 1e-6 && (n.y - 0.8).abs() < 1e-6 && n.z == 0.0);
+        assert_eq!(vec3_normalize(Vec3::ZERO), None);
+        assert_eq!(vec3_normalize(Vec3::new(f32::NAN, 1.0, 0.0)), None);
+        assert!(vec3_is_finite(a));
+        assert!(!vec3_is_finite(Vec3::new(0.0, f32::INFINITY, 0.0)));
+        assert_eq!(<[f32; 3]>::from(a), [3.0, 4.0, 0.0]);
     }
 }

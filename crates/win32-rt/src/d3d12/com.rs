@@ -23,94 +23,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
-// GUID
+// GUID (re-exported from canonical `crate::com`)
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Guid {
-    pub d1: u32,
-    pub d2: u16,
-    pub d3: u16,
-    pub d4: [u8; 8],
-}
+pub use crate::com::{
+    guid, iid_name, name_iid, Guid, PrivateData, DXGI_ERROR_MORE_DATA, DXGI_ERROR_NOT_FOUND,
+    IID_IUnknown, WKPDID_D3DDebugObjectName, WKPDID_D3DDebugObjectNameW,
+};
 
-const fn hex(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => panic!("bad hex digit in GUID"),
-    }
-}
-
-const fn hexn(s: &[u8], at: usize, n: usize) -> u64 {
-    let mut v = 0u64;
-    let mut i = 0;
-    while i < n {
-        v = (v << 4) | hex(s[at + i]) as u64;
-        i += 1;
-    }
-    v
-}
-
-/// Parse `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"` at compile time.
-pub const fn guid(s: &str) -> Guid {
-    let b = s.as_bytes();
-    assert!(b.len() == 36);
-    let mut d4 = [0u8; 8];
-    d4[0] = hexn(b, 19, 2) as u8;
-    d4[1] = hexn(b, 21, 2) as u8;
-    let mut i = 0;
-    while i < 6 {
-        d4[2 + i] = hexn(b, 24 + 2 * i, 2) as u8;
-        i += 1;
-    }
-    Guid { d1: hexn(b, 0, 8) as u32, d2: hexn(b, 9, 4) as u16, d3: hexn(b, 14, 4) as u16, d4 }
-}
-
-impl Guid {
-    pub unsafe fn read(p: *const Guid) -> Option<Guid> {
-        if p.is_null() {
-            None
-        } else {
-            Some(std::ptr::read_unaligned(p))
-        }
-    }
-}
-
-impl std::fmt::Debug for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-            self.d1, self.d2, self.d3, self.d4[0], self.d4[1], self.d4[2], self.d4[3], self.d4[4], self.d4[5], self.d4[6], self.d4[7]
-        )?;
-        if let Some(n) = iid_name(self) {
-            write!(f, " {n}")?;
-        }
-        Ok(())
-    }
-}
-
-static IID_NAMES: Mutex<Vec<(Guid, &'static str)>> = Mutex::new(Vec::new());
-
-/// Register a human-readable name for logs.
-pub fn name_iid(g: Guid, n: &'static str) {
-    let mut v = IID_NAMES.lock().unwrap();
-    if !v.iter().any(|(x, _)| *x == g) {
-        v.push((g, n));
-    }
-}
-
-pub fn iid_name(g: &Guid) -> Option<&'static str> {
-    IID_NAMES.lock().unwrap().iter().find(|(x, _)| x == g).map(|(_, n)| *n)
-}
-
-pub const IID_IUnknown: Guid = guid("00000000-0000-0000-c000-000000000046");
-
-pub const DXGI_ERROR_NOT_FOUND: HRESULT = 0x887A_0002u32 as i32;
-pub const DXGI_ERROR_MORE_DATA: HRESULT = 0x887A_0003u32 as i32;
 pub const DXGI_ERROR_UNSUPPORTED: HRESULT = 0x887A_0004u32 as i32;
 pub const DXGI_ERROR_INVALID_CALL: HRESULT = 0x887A_0001u32 as i32;
 pub const DXGI_ERROR_WAS_STILL_DRAWING: HRESULT = 0x887A_000Au32 as i32;
@@ -274,28 +194,6 @@ pub fn build_vtable(iface: &str, slots: &[(&str, Option<*const ()>)]) -> *const 
 // Objects
 // ---------------------------------------------------------------------------
 
-/// Private data attached via `SetPrivateData` / `SetPrivateDataInterface`.
-#[derive(Default)]
-pub struct PrivateData {
-    entries: Vec<(Guid, PrivEntry)>,
-}
-
-enum PrivEntry {
-    Bytes(Vec<u8>),
-    Iface(*mut c_void),
-}
-unsafe impl Send for PrivEntry {}
-
-impl Drop for PrivateData {
-    fn drop(&mut self) {
-        for (_, e) in self.entries.drain(..) {
-            if let PrivEntry::Iface(p) = e {
-                unsafe { com_release(p) };
-            }
-        }
-    }
-}
-
 /// Per-class description: the vtable and the IIDs answered by QueryInterface.
 pub struct Class {
     pub name: &'static str,
@@ -364,27 +262,17 @@ impl<T: ComClass> Obj<T> {
     }
 }
 
-/// Call IUnknown::AddRef through the vtable of any COM pointer.
+/// Call IUnknown::AddRef through the vtable of any COM pointer (guest or native).
 pub unsafe fn com_add_ref(p: *mut c_void) -> u32 {
-    if p.is_null() {
-        return 0;
-    }
-    let f: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(1));
-    f(p)
+    crate::com::com_call_add_ref(p)
 }
 
 pub unsafe fn com_release(p: *mut c_void) -> u32 {
-    if p.is_null() {
-        return 0;
-    }
-    let f: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(2));
-    f(p)
+    crate::com::com_call_release(p)
 }
 
 pub unsafe fn com_query(p: *mut c_void, iid: &Guid, out: *mut *mut c_void) -> HRESULT {
-    let f: unsafe extern "win64" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT =
-        std::mem::transmute(*(*(p as *const *const usize)));
-    f(p, iid, out)
+    crate::com::com_call_qi(p, iid as *const Guid, out)
 }
 
 // Generic IUnknown / private-data method bodies, monomorphized per class.
@@ -422,90 +310,27 @@ pub unsafe extern "win64" fn release<T: ComClass>(this: *mut Obj<T>) -> u32 {
     n
 }
 
-/// WKPDID_D3DDebugObjectName / ...NameW: names set through private data.
-pub const WKPDID_D3DDebugObjectName: Guid = guid("429b8c22-9188-4b0c-8742-acb0bf85c200");
-pub const WKPDID_D3DDebugObjectNameW: Guid = guid("4cca5fd8-921f-42c8-8566-70caf2a9b741");
-
 pub unsafe extern "win64" fn set_private_data<T: ComClass>(this: *mut Obj<T>, g: *const Guid, size: u32, data: *const c_void) -> HRESULT {
-    let Some(g) = Guid::read(g) else { return E_INVALIDARG };
     let mut pd = (*this).private.lock().unwrap();
-    if let Some(i) = pd.entries.iter().position(|(k, _)| *k == g) {
-        let (_, e) = pd.entries.remove(i);
-        if let PrivEntry::Iface(p) = e {
-            com_release(p);
+    let hr = pd.set_private_data(g, size, data);
+    if hr == S_OK {
+        if let Some(gv) = Guid::read(g) {
+            if gv == WKPDID_D3DDebugObjectName || gv == WKPDID_D3DDebugObjectNameW {
+                *(*this).name.lock().unwrap() = pd.debug_name().map(str::to_string);
+            }
         }
     }
-    if data.is_null() || size == 0 {
-        return S_OK;
-    }
-    let bytes = std::slice::from_raw_parts(data as *const u8, size as usize).to_vec();
-    if g == WKPDID_D3DDebugObjectName {
-        *(*this).name.lock().unwrap() = Some(String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string());
-    } else if g == WKPDID_D3DDebugObjectNameW {
-        let w: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        *(*this).name.lock().unwrap() = Some(String::from_utf16_lossy(&w).trim_end_matches('\0').to_string());
-    }
-    pd.entries.push((g, PrivEntry::Bytes(bytes)));
-    S_OK
+    hr
 }
 
 pub unsafe extern "win64" fn set_private_data_interface<T: ComClass>(this: *mut Obj<T>, g: *const Guid, p: *mut c_void) -> HRESULT {
-    let Some(g) = Guid::read(g) else { return E_INVALIDARG };
-    let mut pd = (*this).private.lock().unwrap();
-    if let Some(i) = pd.entries.iter().position(|(k, _)| *k == g) {
-        let (_, e) = pd.entries.remove(i);
-        if let PrivEntry::Iface(old) = e {
-            com_release(old);
-        }
-    }
-    if !p.is_null() {
-        com_add_ref(p);
-        pd.entries.push((g, PrivEntry::Iface(p)));
-    }
-    S_OK
+    (*this).private.lock().unwrap().set_private_data_interface(g, p)
 }
 
 pub const DXGI_ERROR_NOT_FOUND_PRIV: HRESULT = DXGI_ERROR_NOT_FOUND;
 
 pub unsafe extern "win64" fn get_private_data<T: ComClass>(this: *mut Obj<T>, g: *const Guid, size: *mut u32, data: *mut c_void) -> HRESULT {
-    let Some(g) = Guid::read(g) else { return E_INVALIDARG };
-    if size.is_null() {
-        return E_INVALIDARG;
-    }
-    let pd = (*this).private.lock().unwrap();
-    let Some((_, e)) = pd.entries.iter().find(|(k, _)| *k == g) else {
-        *size = 0;
-        return DXGI_ERROR_NOT_FOUND;
-    };
-    match e {
-        PrivEntry::Bytes(b) => {
-            if data.is_null() {
-                *size = b.len() as u32;
-                return S_OK;
-            }
-            if (*size as usize) < b.len() {
-                *size = b.len() as u32;
-                return DXGI_ERROR_MORE_DATA;
-            }
-            std::ptr::copy_nonoverlapping(b.as_ptr(), data as *mut u8, b.len());
-            *size = b.len() as u32;
-            S_OK
-        }
-        PrivEntry::Iface(p) => {
-            if data.is_null() {
-                *size = 8;
-                return S_OK;
-            }
-            if *size < 8 {
-                *size = 8;
-                return DXGI_ERROR_MORE_DATA;
-            }
-            com_add_ref(*p);
-            *(data as *mut *mut c_void) = *p;
-            *size = 8;
-            S_OK
-        }
-    }
+    (*this).private.lock().unwrap().get_private_data(g, size, data)
 }
 
 /// Write an interface pointer to `out` after QI'ing `obj` for `riid`.
@@ -577,11 +402,12 @@ pub unsafe fn read_wstr(p: *const u16) -> String {
 
 /// `ID3D12Object::SetName`: also visible as WKPDID_D3DDebugObjectNameW.
 pub unsafe extern "win64" fn set_name<T: ComClass>(this: *mut Obj<T>, name: *const u16) -> HRESULT {
-    let s = read_wstr(name);
-    let mut w: Vec<u16> = s.encode_utf16().collect();
-    w.push(0);
-    let bytes = std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2);
-    set_private_data::<T>(this, &WKPDID_D3DDebugObjectNameW, bytes.len() as u32, bytes.as_ptr() as *const c_void)
+    let mut pd = (*this).private.lock().unwrap();
+    let hr = pd.set_name(name);
+    if hr == S_OK {
+        *(*this).name.lock().unwrap() = pd.debug_name().map(str::to_string);
+    }
+    hr
 }
 
 /// The process-wide ID3D12Device (D3D12 devices are singletons per adapter).

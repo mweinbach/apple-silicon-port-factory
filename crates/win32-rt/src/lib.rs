@@ -25,6 +25,8 @@ win64_abi::win64_mods! {
     pub mod bridge;
     pub mod types;
     pub mod strings;
+    pub(crate) mod com;
+    pub(crate) mod net_tls;
     pub mod teb;
     pub mod handles;
     pub mod park;

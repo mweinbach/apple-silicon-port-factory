@@ -1133,6 +1133,131 @@ pub unsafe extern "win64" fn QueryDepthSList(h: *mut SListHeader) -> u16 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared host-side reentrant mutex (`ReentrantLock`) for subsystem DLLs
+// ---------------------------------------------------------------------------
+
+/// Reentrant host mutex keyed by `std::thread::ThreadId`, usable directly in
+/// `static` items (`const fn new()`). Shared by `mfplat.rs` (`IMFAttributes`
+/// `LockStore`/`UnlockStore`) and `bink2w64.rs` (`BinkUtilMutex`).
+#[allow(dead_code)]
+pub(crate) struct ReentrantLock {
+    state: std::sync::Mutex<(Option<std::thread::ThreadId>, u32)>,
+    cv: std::sync::Condvar,
+}
+
+#[allow(dead_code)]
+impl ReentrantLock {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new((None, 0)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn lock(&self) {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(owner) = st.0 {
+            if owner == me {
+                st.1 = st.1.saturating_add(1);
+                return;
+            }
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.0 = Some(me);
+        st.1 = 1;
+    }
+
+    pub(crate) fn try_lock(&self) -> bool {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match st.0 {
+            None => {
+                st.0 = Some(me);
+                st.1 = 1;
+                true
+            }
+            Some(owner) if owner == me => {
+                st.1 = st.1.saturating_add(1);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    pub(crate) fn lock_timeout(&self, timeout: Duration) -> bool {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.0 == Some(me) {
+            st.1 = st.1.saturating_add(1);
+            return true;
+        }
+        if st.0.is_none() {
+            st.0 = Some(me);
+            st.1 = 1;
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        while st.0.is_some() {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next_st, res) = self
+                .cv
+                .wait_timeout(st, rem)
+                .unwrap_or_else(|e| e.into_inner());
+            st = next_st;
+            if st.0.is_none() {
+                break;
+            }
+            if res.timed_out() {
+                return false;
+            }
+        }
+        st.0 = Some(me);
+        st.1 = 1;
+        true
+    }
+
+    /// Release one recursion level. Returns `true` if the current thread owned the lock.
+    pub(crate) fn unlock(&self) -> bool {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.0 != Some(me) || st.1 == 0 {
+            return false;
+        }
+        st.1 -= 1;
+        if st.1 == 0 {
+            st.0 = None;
+            self.cv.notify_one();
+        }
+        true
+    }
+
+    /// Execute `f` while holding this reentrant lock, unlocking on exit/unwind.
+    pub(crate) fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.lock();
+        struct Guard<'a>(&'a ReentrantLock);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.unlock();
+            }
+        }
+        let _g = Guard(self);
+        f()
+    }
+}
+
+impl Default for ReentrantLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,5 +1590,61 @@ mod tests {
             assert_eq!(InterlockedFlushSList(uh), &mut a as *mut Node as *mut c_void);
             assert_eq!(QueryDepthSList(uh), 0);
         }
+    }
+
+    #[test]
+    fn reentrant_lock_recursion_timeout_and_contention() {
+        let lock = Arc::new(ReentrantLock::new());
+        assert!(!lock.unlock(), "unlocking unowned lock must return false");
+
+        // Same-thread reentrancy via lock / try_lock / with_lock.
+        lock.lock();
+        assert!(lock.try_lock());
+        let nested = lock.with_lock(|| 42u32);
+        assert_eq!(nested, 42);
+
+        // Other thread sees try_lock == false, lock_timeout == false, unlock == false.
+        let l2 = lock.clone();
+        let probe = std::thread::spawn(move || {
+            assert!(!l2.try_lock());
+            assert!(!l2.lock_timeout(Duration::from_millis(15)));
+            assert!(!l2.unlock());
+        });
+        probe.join().unwrap();
+
+        // Still requires 2 unlocks (one for lock(), one for try_lock()).
+        assert!(lock.unlock());
+        let l3 = lock.clone();
+        let probe2 = std::thread::spawn(move || !l3.try_lock());
+        assert!(probe2.join().unwrap(), "must remain held after 1 of 2 unlocks");
+        assert!(lock.unlock());
+        assert!(!lock.unlock());
+
+        // Multi-threaded mutual exclusion + recursion stress.
+        let counter = Arc::new(std::cell::UnsafeCell::new(0u64));
+        struct SyncCounter(Arc<std::cell::UnsafeCell<u64>>);
+        unsafe impl Send for SyncCounter {}
+        unsafe impl Sync for SyncCounter {}
+        let shared = Arc::new(SyncCounter(counter));
+
+        let hs: Vec<_> = (0..6)
+            .map(|_| {
+                let l = lock.clone();
+                let sc = shared.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        l.with_lock(|| {
+                            l.with_lock(|| unsafe {
+                                *sc.0.get() += 1;
+                            });
+                        });
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(unsafe { *shared.0.get() }, 6000);
     }
 }

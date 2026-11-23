@@ -1199,6 +1199,129 @@ impl KObject for Opaque {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Generic typed handle registry (`HandleTable<T>`) for subsystem DLLs
+// ---------------------------------------------------------------------------
+
+/// Thread-safe, `const`-constructible handle table keyed by monotonically
+/// allocated `usize` IDs (`base + k * step`).
+///
+/// Replaces per-DLL `Mutex<HashMap<usize, T>> + AtomicUsize` boilerplate across
+/// WinHTTP, libcurl, Crypt32, FMOD, OpenAL, Bink2, Schannel, etc.
+#[allow(dead_code)]
+pub(crate) struct HandleTable<T> {
+    next: AtomicUsize,
+    step: usize,
+    map: Mutex<Option<HashMap<usize, T>>>,
+}
+
+#[allow(dead_code)]
+impl<T> HandleTable<T> {
+    /// Create a new table allocating handle IDs starting at `base` with stride `step`
+    /// (clamped to `>= 1`). Usable directly in `static` items without `OnceLock`.
+    pub(crate) const fn new(base: usize, step: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(if base == 0 { 1 } else { base }),
+            step: if step == 0 { 1 } else { step },
+            map: Mutex::new(None),
+        }
+    }
+
+    fn alloc_id(&self) -> usize {
+        loop {
+            let id = self.next.fetch_add(self.step, Ordering::Relaxed);
+            if id != 0 && id != usize::MAX {
+                return id;
+            }
+        }
+    }
+
+    /// Insert `val` under a freshly allocated handle ID and return the ID.
+    pub(crate) fn insert(&self, val: T) -> usize {
+        let id = self.alloc_id();
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(HashMap::new).insert(id, val);
+        id
+    }
+
+    /// Insert `val` at a caller-chosen key, returning any previously stored value.
+    pub(crate) fn insert_at(&self, id: usize, val: T) -> Option<T> {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(HashMap::new).insert(id, val)
+    }
+
+    /// Clone the value stored at `id`, if present.
+    pub(crate) fn get_cloned(&self, id: usize) -> Option<T>
+    where
+        T: Clone,
+    {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()?.get(&id).cloned()
+    }
+
+    /// Borrow the value stored at `id` while holding the table lock.
+    pub(crate) fn with<R>(&self, id: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let val = g.as_ref()?.get(&id)?;
+        Some(f(val))
+    }
+
+    /// Mutably borrow the value stored at `id` while holding the table lock.
+    pub(crate) fn with_mut<R>(&self, id: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let val = g.as_mut()?.get_mut(&id)?;
+        Some(f(val))
+    }
+
+    /// Remove and return the value stored at `id` (dropped outside the table lock).
+    pub(crate) fn remove(&self, id: usize) -> Option<T> {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_mut()?.remove(&id)
+    }
+
+    /// Remove all entries from the table, dropping them outside the table lock.
+    pub(crate) fn clear(&self) {
+        let old = {
+            let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            g.take()
+        };
+        drop(old);
+    }
+
+    /// Retain only entries satisfying `predicate`.
+    pub(crate) fn retain(&self, mut predicate: impl FnMut(&usize, &mut T) -> bool) {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_mut() {
+            m.retain(|k, v| predicate(k, v));
+        }
+    }
+
+    /// True if `id` is currently present in the table.
+    pub(crate) fn contains(&self, id: usize) -> bool {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().is_some_and(|m| m.contains_key(&id))
+    }
+
+    /// Number of live entries currently in the table.
+    pub(crate) fn len(&self) -> usize {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map_or(0, HashMap::len)
+    }
+
+    /// True when the table holds no live entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Snapshot all currently live handle IDs.
+    pub(crate) fn keys(&self) -> Vec<usize> {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,5 +1483,60 @@ mod tests {
         assert!(matches!(wait_for(&objs, true, 0, false), WaitResult::Timeout));
         assert!(ev1.try_take(), "auto-reset event must remain signaled after wait_all rollback");
         assert!(sem.try_take(), "semaphore unit must remain available after wait_all rollback");
+    }
+
+    #[test]
+    fn handle_table_crud_stride_and_clear_outside_lock() {
+        let tbl: HandleTable<String> = HandleTable::new(0x5000, 4);
+        assert!(tbl.is_empty());
+        assert_eq!(tbl.len(), 0);
+
+        let h1 = tbl.insert("alpha".to_string());
+        let h2 = tbl.insert("beta".to_string());
+        assert_eq!(h1, 0x5000);
+        assert_eq!(h2, 0x5004);
+        assert_eq!(tbl.len(), 2);
+        assert!(tbl.contains(h1));
+        assert_eq!(tbl.get_cloned(h1).as_deref(), Some("alpha"));
+        assert_eq!(tbl.with(h2, |s| s.len()), Some(4));
+        assert_eq!(
+            tbl.with_mut(h2, |s| {
+                s.push('!');
+                s.clone()
+            })
+            .as_deref(),
+            Some("beta!")
+        );
+        assert_eq!(tbl.get_cloned(h2).as_deref(), Some("beta!"));
+        assert_eq!(tbl.get_cloned(0x9999), None);
+
+        tbl.retain(|&k, _| k == h2);
+        assert_eq!(tbl.len(), 1);
+        assert!(!tbl.contains(h1));
+        assert_eq!(tbl.keys(), vec![h2]);
+
+        assert_eq!(tbl.remove(h2).as_deref(), Some("beta!"));
+        assert!(tbl.is_empty());
+
+        // insert_at + clear dropping entries cleanly.
+        assert!(tbl.insert_at(0x7777, "pinned".to_string()).is_none());
+        assert_eq!(tbl.insert_at(0x7777, "replaced".to_string()).as_deref(), Some("pinned"));
+        assert_eq!(tbl.len(), 1);
+        tbl.clear();
+        assert!(tbl.is_empty());
+
+        // Verify Drop during clear() runs outside the table lock (no deadlock).
+        static DROP_TBL: HandleTable<DropProbe> = HandleTable::new(0x100, 1);
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                assert_eq!(DROP_TBL.len(), 0);
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let _ = DROP_TBL.insert(DropProbe(ran.clone()));
+        DROP_TBL.clear();
+        assert!(ran.load(Ordering::Acquire));
     }
 }
