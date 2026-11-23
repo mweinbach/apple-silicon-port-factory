@@ -102,6 +102,12 @@ struct FdInfo {
     /// Translation disabled for ttys/pipes.
     raw: bool,
     temporary: bool,
+    /// Associated Win32 HANDLE and whether the CRT fd owns closing that handle.
+    /// - `Some((h, true))`: created via `_open_osfhandle(h, flags)` -> `_close(fd)`
+    ///   closes the Win32 `FileObj` handle (which closes the underlying POSIX fd once).
+    /// - `Some((h, false))`: lazily wrapped non-owning `FileObj` created by `_get_osfhandle(fd)`
+    ///   -> `_close(fd)` closes the wrapper handle and then `libc::close(fd)`.
+    osf_handle: Option<(usize, bool)>,
 }
 
 static FDS: Mutex<Option<HashMap<i32, (FdInfo, Option<std::path::PathBuf>)>>> = Mutex::new(None);
@@ -119,7 +125,7 @@ fn fd_info(fd: i32) -> FdInfo {
         let mut st: libc::stat = std::mem::zeroed();
         libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG
     };
-    let i = FdInfo { text: true, raw, temporary: false };
+    let i = FdInfo { text: true, raw, temporary: false, osf_handle: None };
     if (0..=2).contains(&fd) {
         m.insert(fd, (i, None));
     }
@@ -186,7 +192,7 @@ fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
     if oflag & (O_WTEXT | O_U16TEXT | O_U8TEXT) != 0 {
         stub!("Unicode text modes (0x{oflag:x}) treated as plain text mode");
     }
-    set_fd_info(fd, FdInfo { text, raw: false, temporary: oflag & O_TEMPORARY != 0 }, Some(host.to_path_buf()));
+    set_fd_info(fd, FdInfo { text, raw: false, temporary: oflag & O_TEMPORARY != 0, osf_handle: None }, Some(host.to_path_buf()));
     fd
 }
 
@@ -249,7 +255,19 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
         return bad_fd();
     }
     let ent = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&fd);
-    let r = libc::close(fd);
+    let mut r = 0;
+    let mut closed_via_handle = false;
+    if let Some((info, _)) = &ent {
+        if let Some((h, owns_handle)) = info.osf_handle {
+            let _ = crate::handles::close(h as crate::types::HANDLE);
+            if owns_handle {
+                closed_via_handle = true;
+            }
+        }
+    }
+    if !closed_via_handle {
+        r = libc::close(fd);
+    }
     if let Some((i, Some(p))) = ent {
         if i.temporary {
             let _ = std::fs::remove_file(p);
@@ -261,6 +279,97 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
     } else {
         0
     }
+}
+
+/// Associate a CRT file descriptor with an existing Win32 file/pipe HANDLE,
+/// transferring ownership of `osfhandle` to the returned CRT fd (so `_close(fd)`
+/// closes the Win32 handle and underlying OS fd once).
+pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32 {
+    use crate::kernel32::file::{file_fd_and_kind, FileKind};
+    use crate::types::{HANDLE, INVALID_HANDLE_VALUE};
+    let h = osfhandle as HANDLE;
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        errno::set(EBADF);
+        return -1;
+    }
+    let Some((raw_fd, kind)) = file_fd_and_kind(h) else {
+        errno::set(EBADF);
+        return -1;
+    };
+    if !fd_valid(raw_fd) {
+        errno::set(EBADF);
+        return -1;
+    }
+    if (flags & O_APPEND) != 0 {
+        let cur = libc::fcntl(raw_fd, libc::F_GETFL);
+        if cur >= 0 {
+            let _ = libc::fcntl(raw_fd, libc::F_SETFL, cur | libc::O_APPEND);
+        }
+    }
+    let text = if (flags & O_BINARY) != 0 {
+        false
+    } else if (flags & (O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT)) != 0 {
+        true
+    } else {
+        false
+    };
+    let raw = kind != FileKind::Disk;
+    set_fd_info(
+        raw_fd,
+        FdInfo {
+            text,
+            raw,
+            temporary: false,
+            osf_handle: Some((osfhandle as usize, true)),
+        },
+        None,
+    );
+    raw_fd
+}
+
+/// Return the Win32 HANDLE backing a CRT file descriptor without transferring ownership.
+pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
+    use crate::kernel32::file::{classify_host_fd, std_handle, wrap_non_owned_fd};
+    if !fd_valid(fd) {
+        errno::set(EBADF);
+        return -1;
+    }
+    {
+        let mut g = FDS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if let Some((info, _)) = m.get(&fd) {
+            if let Some((h, _)) = info.osf_handle {
+                if crate::handles::get(h as crate::types::HANDLE).is_some() {
+                    return h as isize;
+                }
+            }
+        }
+    }
+    if (0..=2).contains(&fd) {
+        return std_handle(fd as usize) as isize;
+    }
+    let kind = classify_host_fd(fd);
+    let h = wrap_non_owned_fd(fd, kind, format!("crt://fd/{fd}"), 0xC000_0000);
+    let mut g = FDS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some((info, _)) = m.get_mut(&fd) {
+        info.osf_handle = Some((h as usize, false));
+    } else {
+        let raw = kind != crate::kernel32::file::FileKind::Disk;
+        m.insert(
+            fd,
+            (
+                FdInfo {
+                    text: true,
+                    raw,
+                    temporary: false,
+                    osf_handle: Some((h as usize, false)),
+                },
+                None,
+            ),
+        );
+    }
+    h as isize
 }
 
 /// Raw read with CRLF->LF translation in text mode.
@@ -408,7 +517,7 @@ pub unsafe extern "win64" fn _dup(fd: i32) -> i32 {
         return -1;
     }
     let i = fd_info(fd);
-    set_fd_info(n, FdInfo { temporary: false, ..i }, None);
+    set_fd_info(n, FdInfo { temporary: false, osf_handle: None, ..i }, None);
     n
 }
 
@@ -421,7 +530,7 @@ pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
         return -1;
     }
     let i = fd_info(fd);
-    set_fd_info(fd2, FdInfo { temporary: false, ..i }, None);
+    set_fd_info(fd2, FdInfo { temporary: false, osf_handle: None, ..i }, None);
     0
 }
 
@@ -1434,7 +1543,7 @@ pub unsafe extern "win64" fn tmpfile() -> *mut FILE {
         return std::ptr::null_mut();
     }
     libc::unlink(c.as_ptr());
-    set_fd_info(fd, FdInfo { text: false, raw: false, temporary: false }, None);
+    set_fd_info(fd, FdInfo { text: false, raw: false, temporary: false, osf_handle: None }, None);
     let _l = Locked::new();
     new_stream(fd, &ModeFlags { oflag: O_RDWR | O_BINARY, readable: true, writable: true })
 }
@@ -1479,6 +1588,73 @@ mod tests {
             assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), b"abc\n");
             assert!(fopen(b"T:\\missing\\x\0".as_ptr(), b"r\0".as_ptr()).is_null());
             assert_eq!(errno::get(), ENOENT);
+        }
+    }
+
+    #[test]
+    fn osfhandle_open_get_and_ownership() {
+        use crate::kernel32::file::{CreateFileW, ReadFile, WriteFile};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        let dir = std::env::temp_dir().join(format!("aw2_osf_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("O:\\", &dir);
+        unsafe {
+            // Invalid handles / fds fail with EBADF and -1.
+            assert_eq!(_open_osfhandle(-1, O_BINARY), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(-1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(9999), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            // Create a Win32 file handle, transfer ownership to CRT via _open_osfhandle.
+            let p = crate::strings::to_wide_z("O:\\osf.bin");
+            let h = CreateFileW(
+                p.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                3,
+                std::ptr::null_mut(),
+                2, // CREATE_ALWAYS
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            let fd = _open_osfhandle(h as isize, O_BINARY);
+            assert!(fd >= 0);
+            // _get_osfhandle returns the exact underlying Win32 handle.
+            assert_eq!(_get_osfhandle(fd), h as isize);
+
+            // Write via CRT _write, read back via Win32 ReadFile after lseek!
+            assert_eq!(_write(fd, b"hello-osf".as_ptr() as *const c_void, 9), 9);
+            assert_eq!(_lseeki64(fd, 0, 0), 0);
+            let mut rbuf = [0u8; 16];
+            let mut got = 0u32;
+            assert_eq!(ReadFile(h, rbuf.as_mut_ptr() as *mut c_void, 9, &mut got, std::ptr::null_mut()), TRUE);
+            assert_eq!(got, 9);
+            assert_eq!(&rbuf[..9], b"hello-osf");
+
+            // Closing the CRT fd closes the owned Win32 HANDLE cleanly once.
+            assert_eq!(_close(fd), 0);
+            assert!(crate::handles::get(h).is_none());
+            assert_eq!(_get_osfhandle(fd), -1);
+
+            // Reverse direction: open via CRT _open, wrap lazily via _get_osfhandle, write via WriteFile, close via _close.
+            let fd2 = _open(b"O:\\crt.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            assert!(fd2 >= 0);
+            let h2 = _get_osfhandle(fd2) as HANDLE;
+            assert_ne!(h2, INVALID_HANDLE_VALUE);
+            assert_eq!(_get_osfhandle(fd2), h2 as isize); // cached
+            let mut written = 0u32;
+            assert_eq!(WriteFile(h2, b"from-win32".as_ptr() as *const c_void, 10, &mut written, std::ptr::null_mut()), TRUE);
+            assert_eq!(written, 10);
+            assert_eq!(_close(fd2), 0);
+            assert!(crate::handles::get(h2).is_none());
+            assert_eq!(std::fs::read(dir.join("crt.bin")).unwrap(), b"from-win32");
+
+            // Standard descriptors return valid std handles.
+            assert_ne!(_get_osfhandle(1), -1);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

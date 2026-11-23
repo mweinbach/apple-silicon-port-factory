@@ -530,9 +530,13 @@ impl<T> Guarded<T> {
     }
 }
 
+pub const HANDLE_FLAG_INHERIT: u32 = 0x1;
+pub const HANDLE_FLAG_PROTECT_FROM_CLOSE: u32 = 0x2;
+
 struct Table {
     next: usize,
     map: HashMap<usize, Arc<dyn KObject>>,
+    flags: HashMap<usize, u32>,
 }
 
 /// The handle table behind an [`RwLock`]: concurrent `handles::get` misses take
@@ -541,15 +545,56 @@ struct Table {
 #[inline]
 fn table() -> &'static RwLock<Table> {
     static TABLE: OnceLock<RwLock<Table>> = OnceLock::new();
-    TABLE.get_or_init(|| RwLock::new(Table { next: 0x100, map: HashMap::new() }))
+    TABLE.get_or_init(|| RwLock::new(Table { next: 0x100, map: HashMap::new(), flags: HashMap::new() }))
 }
 
 pub fn insert(obj: Arc<dyn KObject>) -> HANDLE {
+    insert_with_flags(obj, 0)
+}
+
+pub fn insert_with_flags(obj: Arc<dyn KObject>, flags: u32) -> HANDLE {
     let mut t = table().write().unwrap();
     let h = t.next;
     t.next += 4;
     t.map.insert(h, obj);
+    if flags != 0 {
+        t.flags.insert(h, flags & (HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE));
+    }
     h as HANDLE
+}
+
+pub fn get_flags(h: HANDLE) -> Option<u32> {
+    if h == CURRENT_PROCESS || h == CURRENT_THREAD {
+        return Some(0);
+    }
+    let t = table().read().unwrap();
+    if !t.map.contains_key(&(h as usize)) {
+        return None;
+    }
+    Some(t.flags.get(&(h as usize)).copied().unwrap_or(0))
+}
+
+pub fn set_flags(h: HANDLE, mask: u32, flags: u32) -> bool {
+    if h == CURRENT_PROCESS || h == CURRENT_THREAD {
+        return true;
+    }
+    let mut t = table().write().unwrap();
+    if !t.map.contains_key(&(h as usize)) {
+        return false;
+    }
+    let cur = t.flags.get(&(h as usize)).copied().unwrap_or(0);
+    let next = (cur & !mask) | (flags & mask);
+    let next = next & (HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE);
+    if next == 0 {
+        t.flags.remove(&(h as usize));
+    } else {
+        t.flags.insert(h as usize, next);
+    }
+    true
+}
+
+pub fn is_protected_from_close(h: HANDLE) -> bool {
+    get_flags(h).is_some_and(|f| (f & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0)
 }
 
 pub const CURRENT_PROCESS: HANDLE = usize::MAX as HANDLE; // -1
@@ -627,8 +672,12 @@ pub fn close(h: HANDLE) -> bool {
     // Drop the object (arbitrary Drop code) after releasing the table write lock.
     let removed = {
         let mut t = table().write().unwrap();
+        if t.flags.get(&(h as usize)).is_some_and(|&f| (f & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0) {
+            return false;
+        }
         let r = t.map.remove(&(h as usize));
         if let Some(ref obj) = r {
+            t.flags.remove(&(h as usize));
             if is_hcache_type(&**obj) {
                 SYNC_CLOSE_GEN.fetch_add(1, Ordering::Release);
             }

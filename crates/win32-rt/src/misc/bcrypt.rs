@@ -1675,6 +1675,23 @@ pub unsafe extern "win64" fn BCryptGenRandom(_alg: *mut c_void, buf: *mut u8, le
     STATUS_SUCCESS
 }
 
+/// `bcryptprimitives.dll!ProcessPrng(PVOID pbData, SIZE_T cbData) -> BOOL`.
+/// Uses the shared deterministic-entropy hook (when active in difftests) and
+/// falls back to Darwin `arc4random_buf` (identical on macOS and iOS).
+pub unsafe extern "win64" fn ProcessPrng(buf: *mut u8, len: usize) -> crate::types::BOOL {
+    if len == 0 {
+        return crate::types::TRUE;
+    }
+    if buf.is_null() {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return crate::types::FALSE;
+    }
+    if !crate::det_entropy::fill(buf, len) {
+        libc::arc4random_buf(buf as *mut c_void, len);
+    }
+    crate::types::TRUE
+}
+
 pub unsafe extern "win64" fn BCryptOpenAlgorithmProvider(out: *mut *mut c_void, alg_id: *const u16, _impl: *const u16, flags: u32) -> i32 {
     if out.is_null() || alg_id.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -3358,6 +3375,33 @@ mod tests {
             assert_eq!(BCryptDestroyKey(h_pub), STATUS_SUCCESS);
             assert_eq!(BCryptDestroyKey(h_key), STATUS_SUCCESS);
             assert_eq!(BCryptCloseAlgorithmProvider(h_rsa, 0), STATUS_SUCCESS);
+        }
+    }
+
+    #[test]
+    fn process_prng_entropy_and_errors() {
+        unsafe {
+            assert_eq!(ProcessPrng(std::ptr::null_mut(), 0), crate::types::TRUE);
+            assert_eq!(ProcessPrng(std::ptr::null_mut(), 16), crate::types::FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_PARAMETER);
+
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            crate::det_entropy::reset(0);
+            assert_eq!(ProcessPrng(a.as_mut_ptr(), a.len()), crate::types::TRUE);
+            assert_eq!(ProcessPrng(b.as_mut_ptr(), b.len()), crate::types::TRUE);
+            assert_ne!(a, [0u8; 32]);
+            assert_ne!(a, b);
+
+            // Deterministic entropy hook must be respected identically to BCryptGenRandom.
+            let mut d1 = [0u8; 24];
+            let mut d2 = [0u8; 24];
+            crate::det_entropy::reset(0x1234_5678);
+            assert_eq!(ProcessPrng(d1.as_mut_ptr(), d1.len()), crate::types::TRUE);
+            crate::det_entropy::reset(0x1234_5678);
+            assert_eq!(BCryptGenRandom(std::ptr::null_mut(), d2.as_mut_ptr(), d2.len() as u32, 0), STATUS_SUCCESS);
+            crate::det_entropy::reset(0);
+            assert_eq!(d1, d2);
         }
     }
 }

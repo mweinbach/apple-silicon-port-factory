@@ -1092,6 +1092,10 @@ pub unsafe extern "win64" fn CancelWaitableTimer(h: HANDLE) -> BOOL {
 }
 
 pub unsafe extern "win64" fn CloseHandle(h: HANDLE) -> BOOL {
+    if handles::is_protected_from_close(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     if crate::kernel32::file::close_handle_hook(h) || handles::close(h) {
         TRUE
     } else {
@@ -1107,7 +1111,7 @@ pub unsafe extern "win64" fn DuplicateHandle(
     _tp: HANDLE,
     out: *mut HANDLE,
     _access: u32,
-    _inherit: BOOL,
+    inherit: BOOL,
     options: u32,
 ) -> BOOL {
     const DUPLICATE_CLOSE_SOURCE: u32 = 1;
@@ -1115,7 +1119,7 @@ pub unsafe extern "win64" fn DuplicateHandle(
         thread::current_thread_object().map(|t| t as Arc<dyn KObject>)
     } else if src == handles::CURRENT_PROCESS {
         if !out.is_null() {
-            *out = handles::CURRENT_PROCESS;
+            std::ptr::write_unaligned(out, handles::CURRENT_PROCESS);
         }
         return TRUE;
     } else {
@@ -1123,8 +1127,9 @@ pub unsafe extern "win64" fn DuplicateHandle(
     };
     match obj {
         Some(o) => {
+            let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
             if !out.is_null() {
-                *out = handles::insert(o);
+                std::ptr::write_unaligned(out, handles::insert_with_flags(o, flags));
             }
             if options & DUPLICATE_CLOSE_SOURCE != 0 {
                 handles::close(src);
@@ -1138,13 +1143,37 @@ pub unsafe extern "win64" fn DuplicateHandle(
     }
 }
 
-pub unsafe extern "win64" fn SetHandleInformation(_h: HANDLE, _m: u32, _f: u32) -> BOOL {
-    TRUE
+pub unsafe extern "win64" fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> BOOL {
+    let valid_mask = handles::HANDLE_FLAG_INHERIT | handles::HANDLE_FLAG_PROTECT_FROM_CLOSE;
+    if (mask & !valid_mask) != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if handles::set_flags(h, mask, flags)
+        || crate::misc::ws2_32::set_socket_handle_flags(h, mask, flags)
+    {
+        TRUE
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        FALSE
+    }
 }
 
-pub unsafe extern "win64" fn GetHandleInformation(_h: HANDLE, f: *mut u32) -> BOOL {
-    *f = 0;
-    TRUE
+pub unsafe extern "win64" fn GetHandleInformation(h: HANDLE, f: *mut u32) -> BOOL {
+    if f.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    match handles::get_flags(h).or_else(|| crate::misc::ws2_32::get_socket_handle_flags(h)) {
+        Some(v) => {
+            std::ptr::write_unaligned(f, v);
+            TRUE
+        }
+        None => {
+            set_err(err::ERROR_INVALID_HANDLE);
+            FALSE
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

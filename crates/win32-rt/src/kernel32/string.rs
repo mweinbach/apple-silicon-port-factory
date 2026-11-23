@@ -1360,6 +1360,294 @@ pub unsafe extern "win64" fn GetCalendarInfoW(_lcid: u32, cal: u32, ty: u32, out
     GetCalendarInfoEx(std::ptr::null(), cal, std::ptr::null(), ty, out, cap, val)
 }
 
+// ---------------------------------------------------------------------------
+// PathCch* (`api-ms-win-core-path-l1-1-0.dll` / `kernelbase.dll`)
+// ---------------------------------------------------------------------------
+
+const PATHCCH_ALLOW_LONG_PATHS: u32 = 0x0000_0001;
+const PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS: u32 = 0x0000_0002;
+const PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS: u32 = 0x0000_0004;
+const PATHCCH_DO_NOT_NORMALIZE_SEGMENTS: u32 = 0x0000_0008;
+const PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH: u32 = 0x0000_0010;
+const PATHCCH_ENSURE_TRAILING_SLASH: u32 = 0x0000_0020;
+const PATHCCH_MAX_CCH: usize = 0x8000;
+const MAX_PATH_CCH: usize = 260;
+const STRSAFE_E_INSUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
+const HRESULT_FILENAME_EXCED_RANGE: HRESULT = 0x8007_00CEu32 as i32;
+
+fn is_ascii_alpha_u16(c: u16) -> bool {
+    (b'A' as u16..=b'Z' as u16).contains(&c) || (b'a' as u16..=b'z' as u16).contains(&c)
+}
+
+fn is_sep_u16(c: u16) -> bool {
+    c == b'\\' as u16 || c == b'/' as u16
+}
+
+fn eq_ascii_ci(slice: &[u16], ascii: &[u8]) -> bool {
+    slice.len() == ascii.len()
+        && slice.iter().zip(ascii.iter()).all(|(&w, &b)| {
+            w < 128 && (w as u8).eq_ignore_ascii_case(&b)
+        })
+}
+
+/// Compute the root length (in UTF-16 code units) for `PathCchSkipRoot`.
+/// Returns `None` if `s` has no recognized Windows root prefix.
+fn pathcch_root_len(s: &[u16]) -> Option<usize> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    // Extended-length `\\?\` or `\\.\`
+    if n >= 4
+        && s[0] == b'\\' as u16
+        && s[1] == b'\\' as u16
+        && (s[2] == b'?' as u16 || s[2] == b'.' as u16)
+        && s[3] == b'\\' as u16
+    {
+        let rest = &s[4..];
+        // `\\?\UNC\server\share[\]`
+        if rest.len() >= 4 && eq_ascii_ci(&rest[..4], b"UNC\\") {
+            let mut i = 8;
+            // server
+            let srv_start = i;
+            while i < n && s[i] != b'\\' as u16 {
+                i += 1;
+            }
+            if i == srv_start {
+                return Some(8);
+            }
+            if i < n {
+                i += 1; // skip '\'
+                let share_start = i;
+                while i < n && s[i] != b'\\' as u16 {
+                    i += 1;
+                }
+                if i > share_start && i < n && s[i] == b'\\' as u16 {
+                    i += 1;
+                }
+            }
+            return Some(i);
+        }
+        // `\\?\X:[\]`
+        if rest.len() >= 2 && is_ascii_alpha_u16(rest[0]) && rest[1] == b':' as u16 {
+            return Some(if rest.len() >= 3 && rest[2] == b'\\' as u16 { 7 } else { 6 });
+        }
+        // `\\?\Volume{...}[\]` or device name `\\.\Device[\]`
+        let mut i = 4;
+        while i < n && s[i] != b'\\' as u16 {
+            i += 1;
+        }
+        if i < n && s[i] == b'\\' as u16 {
+            i += 1;
+        }
+        return Some(i);
+    }
+    // UNC `\\server\share[\]`
+    if n >= 2 && s[0] == b'\\' as u16 && s[1] == b'\\' as u16 {
+        let mut i = 2;
+        let srv_start = i;
+        while i < n && s[i] != b'\\' as u16 {
+            i += 1;
+        }
+        if i == srv_start {
+            return Some(2);
+        }
+        if i < n {
+            i += 1; // skip '\'
+            while i < n && s[i] != b'\\' as u16 {
+                i += 1;
+            }
+            if i < n && s[i] == b'\\' as u16 {
+                i += 1;
+            }
+        }
+        return Some(i);
+    }
+    // Drive root `X:\` or `X:`
+    if n >= 2 && is_ascii_alpha_u16(s[0]) && s[1] == b':' as u16 {
+        return Some(if n >= 3 && is_sep_u16(s[2]) { 3 } else { 2 });
+    }
+    // Single leading backslash `\`
+    if s[0] == b'\\' as u16 {
+        return Some(1);
+    }
+    None
+}
+
+pub unsafe extern "win64" fn PathCchSkipRoot(psz_path: LPCWSTR, ppsz_root_end: *mut LPCWSTR) -> HRESULT {
+    if ppsz_root_end.is_null() {
+        return E_INVALIDARG;
+    }
+    std::ptr::write_unaligned(ppsz_root_end, std::ptr::null());
+    if psz_path.is_null() {
+        return E_INVALIDARG;
+    }
+    let len = wcslen(psz_path);
+    let slice = std::slice::from_raw_parts(psz_path, len);
+    match pathcch_root_len(slice) {
+        Some(off) => {
+            std::ptr::write_unaligned(ppsz_root_end, psz_path.add(off));
+            S_OK
+        }
+        None => E_INVALIDARG,
+    }
+}
+
+fn canonicalize_pathcch(raw: &str, flags: u32) -> String {
+    let keep_segments = (flags & PATHCCH_DO_NOT_NORMALIZE_SEGMENTS) != 0;
+    let normalized = raw.replace('/', "\\");
+    let wide: Vec<u16> = normalized.encode_utf16().collect();
+    let root_len = pathcch_root_len(&wide).unwrap_or(0);
+    let root_str = String::from_utf16_lossy(&wide[..root_len]);
+    let rest_str = String::from_utf16_lossy(&wide[root_len..]);
+
+    let has_drive_only_root = root_str.len() == 2 && root_str.as_bytes()[1] == b':';
+    let rooted = !root_str.is_empty() && !has_drive_only_root;
+
+    let mut segs: Vec<&str> = Vec::new();
+    for part in rest_str.split('\\') {
+        if part.is_empty() {
+            continue;
+        }
+        if !keep_segments {
+            if part == "." {
+                continue;
+            }
+            if part == ".." {
+                if let Some(&last) = segs.last() {
+                    if last != ".." {
+                        segs.pop();
+                        continue;
+                    }
+                }
+                if rooted {
+                    continue;
+                }
+                segs.push("..");
+                continue;
+            }
+        }
+        segs.push(part);
+    }
+
+    let mut out = root_str;
+    if !segs.is_empty() {
+        if !out.is_empty() && !out.ends_with('\\') && !has_drive_only_root {
+            out.push('\\');
+        }
+        out.push_str(&segs.join("\\"));
+    }
+
+    let want_ext = (flags & PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH) != 0
+        || ((flags & PATHCCH_ALLOW_LONG_PATHS) != 0 && out.encode_utf16().count() >= MAX_PATH_CCH);
+    if want_ext && !out.starts_with("\\\\?\\") && !out.starts_with("\\\\.\\") {
+        let b = out.as_bytes();
+        if out.starts_with("\\\\") {
+            out = format!("\\\\?\\UNC\\{}", &out[2..]);
+        } else if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            out = format!("\\\\?\\{out}");
+        }
+    }
+
+    if (flags & PATHCCH_ENSURE_TRAILING_SLASH) != 0 && !out.is_empty() && !out.ends_with('\\') {
+        out.push('\\');
+    }
+    out
+}
+
+pub unsafe extern "win64" fn PathCchCombineEx(
+    psz_path_out: LPWSTR,
+    cch_path_out: usize,
+    psz_path_in: LPCWSTR,
+    psz_more: LPCWSTR,
+    dw_flags: u32,
+) -> HRESULT {
+    let valid_flags = PATHCCH_ALLOW_LONG_PATHS
+        | PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS
+        | PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS
+        | PATHCCH_DO_NOT_NORMALIZE_SEGMENTS
+        | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH
+        | PATHCCH_ENSURE_TRAILING_SLASH;
+    if psz_path_out.is_null() || cch_path_out == 0 || cch_path_out > PATHCCH_MAX_CCH {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & !valid_flags) != 0 {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS) != 0
+        && (dw_flags & PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS) != 0
+    {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & PATHCCH_ALLOW_LONG_PATHS) != 0
+        && (dw_flags & PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH) != 0
+    {
+        return E_INVALIDARG;
+    }
+
+    let p_in = from_wide_opt(psz_path_in).unwrap_or_default();
+    let p_more = from_wide_opt(psz_more).unwrap_or_default();
+
+    let combined = if p_in.is_empty() && p_more.is_empty() {
+        String::new()
+    } else if p_in.is_empty() {
+        p_more
+    } else if p_more.is_empty() {
+        p_in
+    } else {
+        let more_norm = p_more.replace('/', "\\");
+        let more_w: Vec<u16> = more_norm.encode_utf16().collect();
+        let in_norm = p_in.replace('/', "\\");
+        let in_w: Vec<u16> = in_norm.encode_utf16().collect();
+        if let Some(mroot) = pathcch_root_len(&more_w) {
+            if mroot == 1 && more_norm.starts_with('\\') && !more_norm.starts_with("\\\\") {
+                // Single leading backslash: combine with root of `psz_path_in`.
+                if let Some(iroot) = pathcch_root_len(&in_w) {
+                    let root_part = String::from_utf16_lossy(&in_w[..iroot]);
+                    let trimmed_more = more_norm.trim_start_matches('\\');
+                    if root_part.ends_with('\\') {
+                        format!("{root_part}{trimmed_more}")
+                    } else {
+                        format!("{root_part}\\{trimmed_more}")
+                    }
+                } else {
+                    more_norm
+                }
+            } else {
+                // Fully rooted `psz_more` replaces `psz_path_in`.
+                more_norm
+            }
+        } else if in_norm.ends_with('\\') {
+            format!("{in_norm}{more_norm}")
+        } else {
+            format!("{in_norm}\\{more_norm}")
+        }
+    };
+
+    let result = if combined.is_empty() {
+        String::new()
+    } else {
+        canonicalize_pathcch(&combined, dw_flags)
+    };
+    let wide: Vec<u16> = result.encode_utf16().collect();
+    let long_allowed = (dw_flags
+        & (PATHCCH_ALLOW_LONG_PATHS
+            | PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS
+            | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH))
+        != 0;
+    if !long_allowed && wide.len() + 1 > MAX_PATH_CCH {
+        std::ptr::write_unaligned(psz_path_out, 0);
+        return HRESULT_FILENAME_EXCED_RANGE;
+    }
+    if wide.len() + 1 > cch_path_out {
+        std::ptr::write_unaligned(psz_path_out, 0);
+        return STRSAFE_E_INSUFFICIENT_BUFFER;
+    }
+    std::ptr::copy_nonoverlapping(wide.as_ptr(), psz_path_out, wide.len());
+    std::ptr::write_unaligned(psz_path_out.add(wide.len()), 0);
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,5 +1683,55 @@ mod tests {
         assert_eq!(format_picture("dddd, MMMM d, yyyy", &st), "Friday, October 27, 2023");
         assert_eq!(format_picture("h:mm:ss tt", &st), "1:05:09 PM");
         assert_eq!(format_picture("'at' HH", &st), "at 13");
+    }
+    #[test]
+    fn path_cch_skip_root_and_combine() {
+        unsafe {
+            let p1 = to_wide_z("C:\\Users\\alice\\file.txt");
+            let mut end: LPCWSTR = std::ptr::null();
+            assert_eq!(PathCchSkipRoot(p1.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "Users\\alice\\file.txt");
+
+            let unc = to_wide_z("\\\\server\\share\\dir\\a.bin");
+            assert_eq!(PathCchSkipRoot(unc.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "dir\\a.bin");
+
+            let ext_unc = to_wide_z("\\\\?\\UNC\\srv\\shr\\sub");
+            assert_eq!(PathCchSkipRoot(ext_unc.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "sub");
+
+            let rel = to_wide_z("relative\\path");
+            assert_eq!(PathCchSkipRoot(rel.as_ptr(), &mut end), E_INVALIDARG);
+            assert!(end.is_null());
+
+            let mut out = [0u16; 512];
+            let base = to_wide_z("C:\\Games\\App\\bin");
+            let more = to_wide_z("..\\data\\./cfg.ini");
+            assert_eq!(PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), more.as_ptr(), 0), S_OK);
+            assert_eq!(from_wide(out.as_ptr()), "C:\\Games\\App\\data\\cfg.ini");
+
+            // Leading single backslash keeps root of pszPathIn
+            let root_rel = to_wide_z("\\Windows\\System32");
+            assert_eq!(
+                PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), root_rel.as_ptr(), PATHCCH_ENSURE_TRAILING_SLASH),
+                S_OK
+            );
+            assert_eq!(from_wide(out.as_ptr()), "C:\\Windows\\System32\\");
+
+            // Extended length prefix
+            assert_eq!(
+                PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), more.as_ptr(), PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH),
+                S_OK
+            );
+            assert_eq!(from_wide(out.as_ptr()), "\\\\?\\C:\\Games\\App\\data\\cfg.ini");
+
+            // Insufficient buffer
+            let mut tiny = [0u16; 8];
+            assert_eq!(
+                PathCchCombineEx(tiny.as_mut_ptr(), tiny.len(), base.as_ptr(), more.as_ptr(), 0),
+                STRSAFE_E_INSUFFICIENT_BUFFER
+            );
+            assert_eq!(tiny[0], 0);
+        }
     }
 }

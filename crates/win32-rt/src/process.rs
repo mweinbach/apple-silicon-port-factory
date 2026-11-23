@@ -11,6 +11,76 @@ pub struct ProcessConfig {
 
 static CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 static MANIFEST_GAME_ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static RUNNER_EXE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Register the host `port-runner` binary path used by `CreateProcessW` on macOS
+/// to spawn real Windows x86-64 child processes.
+pub fn set_runner_exe(path: std::path::PathBuf) {
+    *RUNNER_EXE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+/// Resolve the host `port-runner` binary path for child guest process launch.
+pub fn runner_exe() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("PORT_RUNNER_EXE") {
+        let pb = std::path::PathBuf::from(p.trim());
+        if !pb.as_os_str().is_empty() && pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Some(pb) = RUNNER_EXE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        let stem = cur.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem == "port-runner" || stem == "aw2-loader" {
+            return Some(cur);
+        }
+    }
+    None
+}
+
+/// Replace the entire Windows environment block (used when booting a child process
+/// launched via `CreateProcessW` with a custom or inherited Windows environment).
+pub fn replace_env(mut vars: Vec<(String, String)>) {
+    vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
+    vars.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    *INITIAL_ENV.lock().unwrap() = vars.clone();
+    *ENV.lock().unwrap() = vars;
+    ENV_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    ENV_INIT_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Length-prefixed serialization of `(key, value)` pairs for passing a Windows
+/// environment block across `CreateProcessW` -> `port-runner` without temp files.
+pub fn encode_env_list(vars: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in vars {
+        out.push_str(&format!("{}:{}:{}{}", k.len(), v.len(), k, v));
+    }
+    out
+}
+
+/// Decode the format produced by [`encode_env_list`].
+pub fn decode_env_list(raw: &str) -> Option<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let (klen_s, after_k) = rest.split_once(':')?;
+        let (vlen_s, after_v) = after_k.split_once(':')?;
+        let klen: usize = klen_s.parse().ok()?;
+        let vlen: usize = vlen_s.parse().ok()?;
+        if after_v.len() < klen.checked_add(vlen)? {
+            return None;
+        }
+        let k = after_v.get(..klen)?.to_string();
+        let v = after_v.get(klen..klen + vlen)?.to_string();
+        vars.push((k, v));
+        rest = after_v.get(klen + vlen..)?;
+    }
+    Some(vars)
+}
 
 /// Register default guest command-line arguments from a declarative `game.toml`
 /// manifest (`[runtime] args = "..."`). Merged into the Windows command line by
@@ -202,15 +272,15 @@ pub fn split_cmdline(s: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 static ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static INITIAL_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// Initialize the Windows environment. We do NOT pass the host environment
 /// through wholesale (host paths would confuse Windows code); only a
 /// Windows-looking base set plus `AW2ENV_<NAME>=value` overrides.
 pub fn init_env(extra: &[(String, String)]) {
-    let mut e = ENV.lock().unwrap();
     let user = std::env::var("USER").unwrap_or_else(|_| "player".into());
     let computer = crate::config::app_config().computer_name;
-    let base: Vec<(String, String)> = vec![
+    let mut vars: Vec<(String, String)> = vec![
         ("ALLUSERSPROFILE".into(), "C:\\ProgramData".into()),
         ("APPDATA".into(), format!("C:\\users\\{user}\\AppData\\Roaming")),
         ("CommonProgramFiles".into(), "C:\\Program Files\\Common Files".into()),
@@ -239,16 +309,18 @@ pub fn init_env(extra: &[(String, String)]) {
         ("USERPROFILE".into(), format!("C:\\users\\{user}")),
         ("windir".into(), "C:\\Windows".into()),
     ];
-    e.clear();
-    e.extend(base);
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix("PORT_ENV_").or_else(|| k.strip_prefix("AW2ENV_")) {
-            e.push((name.to_string(), v));
+            vars.push((name.to_string(), v));
         }
     }
-    e.extend(extra.iter().cloned());
-    e.sort_by_key(|(k, _)| k.to_ascii_uppercase());
-    e.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    vars.extend(extra.iter().cloned());
+    vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
+    vars.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    *INITIAL_ENV.lock().unwrap() = vars.clone();
+    *ENV.lock().unwrap() = vars;
+    ENV_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    ENV_INIT_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 pub fn get_env(name: &str) -> Option<String> {
@@ -262,13 +334,24 @@ pub fn set_env(name: &str, value: Option<&str>) {
         e.push((name.to_string(), v.to_string()));
         e.sort_by_key(|(k, _)| k.to_ascii_uppercase());
     }
-    ENV_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ENV_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 pub static ENV_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Generation counter incremented only on process environment initialization
+/// (`init_env` / `replace_env`), never on runtime `set_env` mutations.
+pub static ENV_INIT_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn env_vars() -> Vec<(String, String)> {
     ENV.lock().unwrap().clone()
+}
+
+pub fn initial_env_vars() -> Vec<(String, String)> {
+    INITIAL_ENV.lock().unwrap().clone()
+}
+
+pub fn env_init_gen() -> u32 {
+    ENV_INIT_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Build a fresh double-NUL-terminated UTF-16 environment block (caller frees with libc::free).
