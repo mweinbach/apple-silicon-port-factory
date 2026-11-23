@@ -1,3 +1,22 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:fd9cefe29a3faa8e8ea1485fe7a261c3f357c6d2d82d9c5a0a61c5e1636d2b1f
-size 2465
+# Manual function ownership labels for tools/fndb.sh (never overwritten by the classifier).
+# Columns (tab-separated): va  owner  lib  note
+#   owner: remedy | thirdparty | crt | unknown
+#   lib:   library for thirdparty/crt (std, rapidjson, sparsehash, Luau, AK, ...); 'remedy' for Remedy code
+# `tools/fndb.sh owner-eval` classifies these with overrides disabled to measure precision.
+va	owner	lib	note
+0x1401e1a40	thirdparty	std	MSVC STL _Traits_find_first_of (verified by boot-time probe)
+0x1401e22e0	thirdparty	std	MSVC STL _Traits_find_last_of (verified by boot-time probe)
+0x1401fa730	thirdparty	sparsehash	sparsehash find_position (verified by boot-time probe)
+0x140204cc0	thirdparty	std	std::_Fnv1a_append_bytes / std::hash (verified by boot-time probe)
+0x141372450	thirdparty	std	std::sort _Med3 (verified by boot-time probe)
+0x1413a1800	thirdparty	sparsehash	sparsehash find_position (verified by boot-time probe)
+0x1413c21b0	thirdparty	rapidjson	rapidjson GenericValue::GetDouble (verified by boot-time probe)
+0x1413c5010	thirdparty	rapidjson	rapidjson (verified by boot-time probe)
+0x141484ec0	thirdparty	mimalloc	mimalloc 2.1.2 _mi_page_malloc: pops page->free (+0x10), ++used (+0x18), zeroes xblock_size (+0x1c) unless free_is_zero (+0xf bit0); falls back to _mi_malloc_generic. Layout matches third_party/mimalloc types.h
+0x142533200	thirdparty	mimalloc	mimalloc 2.1.2 _mi_free_generic(segment, page, is_local, p): out-of-line path of the mi_free fast path inlined in Remedy code (segment thread_id at +0x100, page flags +0xe)
+0x142535070	thirdparty	mimalloc	mimalloc 2.1.2 mi_heap_malloc_aligned (inlined _zero_aligned_at chain): size<=128 && align<=size fast path via _mi_page_malloc, MI_ALIGNMENT_MAX 16 MB, sets page has_aligned (flags |= 2)
+0x1425371a0	thirdparty	mimalloc	mimalloc 2.1.2 _mi_page_retire(page): called by the inlined mi_free fast path when page->used reaches 0
+0x142537280	thirdparty	mimalloc	mimalloc 2.1.2 _mi_malloc_generic(heap, size, zero, huge_alignment): slow path of _mi_page_malloc and the aligned allocator
+0x1425375a0	thirdparty	mimalloc	mimalloc 2.1.2 option init (mi_option_init): references "mimalloc_%s" env-option strings; option-name table matches v2.1.2 exactly (limit_os_alloc, decommit_extend_delay present; 2.1.4 options absent)
+0x142537a30	thirdparty	mimalloc	mimalloc 2.1.2 _mi_warning_message ("mimalloc: warning: ")
+0x142537ad0	thirdparty	mimalloc	mimalloc 2.1.2 _mi_error_message ("mimalloc: error: ")

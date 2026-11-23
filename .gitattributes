@@ -1,2 +1,10 @@
-# Track catalog and analysis TSV databases with Git LFS
-db/*.tsv filter=lfs diff=lfs merge=lfs -text
+# Catalogs under db/ are plain text, so pull requests show real diffs and a clone without
+# Git LFS can build, test and run `cargo opsdb -- doctor`.
+#
+# Only the large Alan Wake 2 analysis tables below live in Git LFS. Add a table here once it
+# grows past 1 MiB (`audit_repo_hygiene.sh` enforces that limit).
+db/progress.tsv filter=lfs diff=lfs merge=lfs -text
+db/throws.tsv filter=lfs diff=lfs merge=lfs -text
+db/dll_progress.tsv filter=lfs diff=lfs merge=lfs -text
+db/ret_liveness.tsv filter=lfs diff=lfs merge=lfs -text
+db/ret_liveness_dll.tsv filter=lfs diff=lfs merge=lfs -text

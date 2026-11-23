@@ -16,15 +16,16 @@ else
   fail "rustup not found (https://rustup.rs)"
 fi
 
-# 2. Git LFS check for db/*.tsv
-if command -v git-lfs >/dev/null 2>&1; then
-  if head -n 1 db/win32_apis.tsv 2>/dev/null | grep -q '^version https://git-lfs.github.com/spec/v1'; then
-    warn "db/*.tsv are Git LFS pointers — run: git lfs pull"
+# 2. Git LFS check. Catalogs under db/ are plain text; only the large Alan Wake 2 analysis
+#    tables (db/progress.tsv, db/throws.tsv, ...) are stored in Git LFS.
+if head -n 1 db/progress.tsv 2>/dev/null | grep -q '^version https://git-lfs.github.com/spec/v1'; then
+  if command -v git-lfs >/dev/null 2>&1; then
+    warn "Alan Wake 2 analysis tables are Git LFS pointers (only needed for AW2 work) — run: git lfs pull"
   else
-    ok "Git LFS data files materialized"
+    warn "git-lfs not found; only needed for Alan Wake 2 work (brew install git-lfs && git lfs install && git lfs pull)"
   fi
 else
-  warn "git-lfs not found (install with: brew install git-lfs && git lfs install && git lfs pull)"
+  ok "Git LFS analysis tables materialized"
 fi
 
 # 3. Optional third_party references (no git submodules; fetched via plain git clone)

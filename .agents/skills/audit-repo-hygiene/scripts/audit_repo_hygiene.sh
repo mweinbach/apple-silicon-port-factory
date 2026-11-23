@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only repository hygiene, crate boundary, copyright, privacy, and Git LFS audit.
+# Read-only repository hygiene, crate boundary, copyright, privacy, and db/*.tsv storage audit.
 # Usage:
 #   .agents/skills/audit-repo-hygiene/scripts/audit_repo_hygiene.sh [--staged] [--doctor]
 set -euo pipefail
@@ -45,18 +45,29 @@ else
     ok "Zero gitlink entries"
 fi
 
-# 2. Git LFS check for db/*.tsv
-echo "[2/6] Checking Git LFS tracking for db/*.tsv..."
+# 2. db/*.tsv storage: catalogs are plain text (reviewable diffs, no Git LFS needed to build,
+#    test or run doctor); only large analysis tables go to Git LFS.
+echo "[2/6] Checking db/*.tsv storage (plain-text catalogs, Git LFS for large tables)..."
 LFS_BAD=0
+LFS_LIMIT=$((1024 * 1024))
+PLAIN_CATALOGS=" db/ops_x86_to_arm64.tsv db/win32_apis.tsv db/shader_formats.tsv db/game_profiles.tsv "
 while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     ATTR="$(git check-attr filter -- "$f" | awk -F': ' '{print $NF}')"
-    if [[ "$ATTR" != "lfs" ]]; then
-        fail "$f is not tracked by Git LFS (filter=$ATTR)"
+    if [[ "$ATTR" == "lfs" ]]; then
+        if [[ "$PLAIN_CATALOGS" == *" $f "* ]]; then
+            fail "$f is in Git LFS; doctor-checked catalogs must stay plain text"
+            LFS_BAD=1
+        fi
+        continue
+    fi
+    SIZE="$(git cat-file -s ":$f" 2>/dev/null || echo 0)"
+    if (( SIZE > LFS_LIMIT )); then
+        fail "$f is $SIZE bytes of plain text; add tables over 1 MiB to Git LFS in .gitattributes"
         LFS_BAD=1
     fi
 done < <(git ls-files 'db/*.tsv')
-[[ $LFS_BAD -eq 0 ]] && ok "All tracked db/*.tsv files match .gitattributes filter=lfs"
+[[ $LFS_BAD -eq 0 ]] && ok "db catalogs are plain text; tables over 1 MiB are in Git LFS"
 
 # 3. Hard crate boundaries
 echo "[3/6] Checking crate architectural boundaries..."

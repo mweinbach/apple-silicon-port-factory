@@ -1,3 +1,5 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:75f56f818e12031d0595088d38188e881725d8b6892a851c35b9abab2968ca26
-size 690
+# Reviewed, explained shadow diffs (applied by target/review/exec/shadow_report.py; never by the oracle itself).
+# va	max_ranges	max_bytes	reason	[regs: return registers whose diff is explained, e.g. xmm0]
+va	max_ranges	max_bytes	reason	regs
+0x1420a9960	1	4	x86 copies 16 B from [rsp+0x60] into job+0x18 incl. 4 B of uninitialised stack padding at job+0x22 (mov eax,[rsp+0x3a]; mov [rsp+0x6a],eax); Rust writes extra_id as u64 (zeros). Consumers read the u16 only.
+0x14223c160	0	0	x86 never writes xmm0 (returns a pointer in rax); xmm0 at ret is whatever callees (host imports via IAT) left: G 0, N the incoming 1.0f. Only caller 142238694 does not read xmm0; 14223c4e0 just forwards.	xmm0

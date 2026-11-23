@@ -21,7 +21,8 @@ Related docs: [End Goal](END_GOAL.md) · [What's Next](WHATS_NEXT.md) · [ToDos]
   ./scripts/install_metal_shader_converter.sh
   ```
   Installs to `~/.local/opt/metal-shaderconverter` (override with `METAL_IRCONVERTER_DYLIB`).
-- **Git LFS** (required to pull `db/*.tsv` catalogs):
+- **Git LFS** (optional; only the large Alan Wake 2 analysis tables such as `db/progress.tsv` and
+  `db/throws.tsv` live there — the catalogs that `cargo opsdb -- doctor` checks are plain text):
   ```sh
   brew install git-lfs && git lfs install && git lfs pull
   ```
