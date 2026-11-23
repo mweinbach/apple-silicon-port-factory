@@ -92,6 +92,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "log",
+ "port-manifest",
  "win32-rt",
  "win64-abi",
  "x86-runtime",
@@ -697,6 +698,7 @@ dependencies = [
  "dxil-metal",
  "iced-x86",
  "pe-image",
+ "port-manifest",
 ]
 
 [[package]]
@@ -712,9 +714,17 @@ dependencies = [
  "log",
  "pe-image",
  "port-factory",
+ "port-manifest",
  "win32-rt",
  "win64-abi",
  "x86-runtime",
+]
+
+[[package]]
+name = "port-manifest"
+version = "0.1.0"
+dependencies = [
+ "pe-image",
 ]
 
 [[package]]
@@ -1015,6 +1025,7 @@ dependencies = [
  "objc2-quartz-core",
  "parking_lot_core",
  "pe-image",
+ "port-manifest",
  "rustls",
  "webpki-roots",
  "win64-abi",
@@ -1127,6 +1138,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "log",
+ "port-manifest",
  "win32-rt",
  "win64-abi",
 ]

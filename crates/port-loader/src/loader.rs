@@ -126,6 +126,8 @@ pub struct Loader {
     pub game_dir: PathBuf,
     pub game_win_dir: String,
     pub trace: bool,
+    routing: port_manifest::DllRoutingTable,
+    v8_jitless: bool,
     modules: RwLock<Vec<Arc<Module>>>,
     /// Modules mapped + resolved but not yet initialized (dependency order),
     /// tagged with a sequence number so a nested LoadLibrary only initializes
@@ -150,22 +152,42 @@ pub fn get() -> &'static Loader {
     LOADER.get().expect("loader not initialized")
 }
 
-pub fn init(game_dir: PathBuf, game_win_dir: String, trace: bool) -> &'static Loader {
-    let l = Loader {
-        game_dir,
-        game_win_dir,
-        trace,
-        modules: RwLock::new(Vec::new()),
-        pending_init: Mutex::new(Vec::new()),
-        pending_seq: std::sync::atomic::AtomicU64::new(0),
-        tls_modules: RwLock::new(Vec::new()),
-        next_tls: AtomicU32::new(0),
-        lock: ReentrantLock::new(),
-        exe: OnceLock::new(),
-        trace_cache: Mutex::new(HashMap::new()),
-        traps: AtomicU32::new(0),
-        unresolved: Mutex::new(Default::default()),
-    };
+impl Loader {
+    fn new_instance(
+        game_dir: PathBuf,
+        game_win_dir: String,
+        trace: bool,
+        routing: port_manifest::DllRoutingTable,
+        v8_jitless: bool,
+    ) -> Self {
+        Loader {
+            game_dir,
+            game_win_dir,
+            trace,
+            routing,
+            v8_jitless,
+            modules: RwLock::new(Vec::new()),
+            pending_init: Mutex::new(Vec::new()),
+            pending_seq: std::sync::atomic::AtomicU64::new(0),
+            tls_modules: RwLock::new(Vec::new()),
+            next_tls: AtomicU32::new(0),
+            lock: ReentrantLock::new(),
+            exe: OnceLock::new(),
+            trace_cache: Mutex::new(HashMap::new()),
+            traps: AtomicU32::new(0),
+            unresolved: Mutex::new(Default::default()),
+        }
+    }
+}
+
+pub fn init_with_routing(
+    game_dir: PathBuf,
+    game_win_dir: String,
+    trace: bool,
+    routing: port_manifest::DllRoutingTable,
+    v8_jitless: bool,
+) -> &'static Loader {
+    let l = Loader::new_instance(game_dir, game_win_dir, trace, routing, v8_jitless);
     if LOADER.set(l).is_err() {
         panic!("loader::init called twice");
     }
@@ -174,86 +196,17 @@ pub fn init(game_dir: PathBuf, game_win_dir: String, trace: bool) -> &'static Lo
     l
 }
 
-/// Game-dir DLLs replaced by native ARM64 builtins (when a builtin exists).
-/// The Streamline interposer would otherwise wrap D3D12/DXGI and load NVIDIA
-/// plugins; ours forwards the graphics exports and reports every sl feature
-/// unsupported. Video decoders (`bink2w64.dll`, `mediadecoders.windowsdesktop.dll`)
-/// run our native AOT Rust implementations rather than JITing the x86-64 DLLs.
-const BUILTIN_OVERRIDES: &[&str] = &[
-    "sl.interposer.dll",
-    "eossdk-win64-shipping.dll",
-    "steam_api64.dll",
-    "steam_api.dll",
-    "dstorage.dll",
-    "dstoragecore.dll",
-    "nvapi64.dll",
-    "nvapi.dll",
-    "amd_ags_x64.dll",
-    "nvngx_dlss.dll",
-    "_nvngx.dll",
-    "nvngx_dlssg.dll",
-    "nvngx_dlssd.dll",
-    "libxess.dll",
-    "libxess_dx12.dll",
-    "libxess_dx11.dll",
-    "bink2w64.dll",
-    "mediadecoders.windowsdesktop.dll",
-    "tbb12.dll",
-    "tbb.dll",
-    "tbbmalloc.dll",
-    "lz4.dll",
-    "gameinput.dll",
-    "mscoree.dll",
-    "hostfxr.dll",
-    "coreclr.dll",
-    "mono-2.0-bdwgc.dll",
-    "libcurl.dll",
-    "zlib1.dll",
-    "v8_zlib.dll",
-    "amd_fidelityfx_loader_dx12.dll",
-    "cohtml_icuuc.dll",
-    "xaudio2_9redist.dll",
-    "nri.dll",
-    "nvcloth_x64.dll",
-    "libprotobuf.dll",
-    // Note: `nrd.dll` is intentionally NOT overridden here because games shipping a retail
-    // NRD binary have full ARM64 JIT coverage and embedded shaders (the native builtin
-    // `nrd.dll` still acts as a fallback when no game-dir PE is present).
-    // Note: PhysX 3.4 DLLs (physx3_x64, physx3common_x64, physx3cooking_x64, pxfoundation_x64)
-    // are intentionally NOT overridden here so games shipping retail PhysX run the real
-    // collision/rigid-body solver via x86-runtime rather than the minimal physx3 builtin shell.
-];
-
-fn is_builtin_override_with(norm: &str, extra: Option<&str>) -> bool {
-    if let Some(extra) = extra {
-        let extra = extra.trim();
-        if extra == "0" || extra.eq_ignore_ascii_case("none") || extra.eq_ignore_ascii_case("false") {
-            return false;
-        }
-        if extra.eq_ignore_ascii_case("all") || extra == "1" {
-            return true;
-        }
-        for tok in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some(neg) = tok.strip_prefix('-').or_else(|| tok.strip_prefix('!')) {
-                if pe_image::normalize_dll_name(neg.trim()) == norm {
-                    return false;
-                }
-            } else if pe_image::normalize_dll_name(tok) == norm {
-                return true;
-            }
-        }
-    }
-    BUILTIN_OVERRIDES.contains(&norm)
-}
-
-fn is_builtin_override(norm: &str) -> bool {
+#[allow(dead_code)]
+pub fn init(game_dir: PathBuf, game_win_dir: String, trace: bool) -> &'static Loader {
     let extra = std::env::var("PORT_BUILTIN_OVERRIDES")
         .or_else(|_| std::env::var("AW2_BUILTIN_OVERRIDES"))
         .ok();
-    is_builtin_override_with(norm, extra.as_deref())
+    let routing = port_manifest::DllRoutingTable::from_legacy_override_spec(extra.as_deref());
+    init_with_routing(game_dir, game_win_dir, trace, routing, false)
 }
 
 /// How a DLL name resolves.
+#[derive(Debug, PartialEq, Eq)]
 enum Source {
     GameDir(PathBuf),
     Builtin(String),
@@ -327,22 +280,10 @@ impl Loader {
         })
     }
 
-    /// Decide where a DLL comes from: API sets and known system DLLs are
-    /// builtin; anything present in the game dir is loaded as a PE; an
-    /// explicit path is honoured if it maps to a host file.
-    fn classify(&self, name: &str) -> Option<Source> {
-        let norm = pe_image::normalize_dll_name(name);
-        if norm.starts_with("api-ms-win-") || norm.starts_with("ext-ms-win-") {
-            return Some(Source::Builtin(w::canonical_dll(&norm)));
-        }
-        if is_builtin_override(&norm) && w::find_builtin(&norm).is_some() {
-            if self.find_in_game_dir(&norm).is_some() {
-                log::info!("{norm}: using the builtin instead of the game-dir PE (builtin override list)");
-            }
-            return Some(Source::Builtin(w::canonical_dll(&norm)));
-        }
-        if let Some(p) = self.find_in_game_dir(&norm) {
-            return Some(Source::GameDir(p));
+    /// Locate a guest PE file in `game_dir` or at an explicit non-System32 Windows path.
+    fn find_guest_pe(&self, name: &str, norm: &str) -> Option<PathBuf> {
+        if let Some(p) = self.find_in_game_dir(norm) {
+            return Some(p);
         }
         if name.contains('\\') || name.contains('/') {
             // Never load our materialized builtin PE images in C:\Windows\System32\
@@ -351,27 +292,76 @@ impl Loader {
             let win_up = win_abs.to_ascii_uppercase();
             let in_sysdir = win_up.starts_with("C:\\WINDOWS\\SYSTEM32\\")
                 || win_up.starts_with("C:\\WINDOWS\\SYSWOW64\\");
-            if !(in_sysdir && w::find_builtin(&norm).is_some()) {
+            if !(in_sysdir && w::find_builtin(norm).is_some()) {
                 if let Some(h) = w::path::to_host(name) {
                     if h.is_file() {
-                        return Some(Source::GameDir(h));
+                        return Some(h);
                     }
                 }
             }
         }
-        if w::find_builtin(&norm).is_some() {
-            let bname = if norm.starts_with("api-ms-win-")
-                || norm.starts_with("ext-ms-win-")
-                || norm == "vcruntime140_1.dll"
-                || norm.starts_with("ucrtbase")
-            {
-                w::canonical_dll(&norm)
-            } else {
-                norm
-            };
-            return Some(Source::Builtin(bname));
-        }
         None
+    }
+
+    /// Decide where a DLL comes from using the active [`port_manifest::DllRoutingTable`]:
+    /// API sets always map to builtins; explicit `Disabled`/`Alias`/`Builtin`/`GuestOnly`/`Guest`
+    /// policies govern game-dir PEs vs native ARM64 builtins.
+    fn classify(&self, name: &str) -> Option<Source> {
+        self.classify_with_depth(name, 0)
+    }
+
+    fn classify_with_depth(&self, name: &str, depth: u8) -> Option<Source> {
+        let norm = pe_image::normalize_dll_name(name);
+        if norm.starts_with("api-ms-win-") || norm.starts_with("ext-ms-win-") {
+            return Some(Source::Builtin(w::canonical_dll(&norm)));
+        }
+        match self.routing.route(&norm) {
+            port_manifest::DllRoute::Disabled => {
+                log::info!("{norm}: disabled by DLL routing policy");
+                None
+            }
+            port_manifest::DllRoute::Alias(target) => {
+                if depth >= 4 {
+                    log::warn!("{norm}: DLL alias chain exceeded depth limit at {target}");
+                    return None;
+                }
+                self.classify_with_depth(&target, depth + 1)
+            }
+            port_manifest::DllRoute::Builtin { provider } => {
+                let target = match provider {
+                    Some(p) => w::canonical_dll(&p),
+                    None => w::canonical_dll(&norm),
+                };
+                if w::find_builtin(&target).is_some() {
+                    if self.find_in_game_dir(&norm).is_some() {
+                        log::info!(
+                            "{norm}: using builtin {target} instead of the game-dir PE (DLL routing policy)"
+                        );
+                    }
+                    return Some(Source::Builtin(target));
+                }
+                self.find_guest_pe(name, &norm).map(Source::GameDir)
+            }
+            port_manifest::DllRoute::GuestOnly => self.find_guest_pe(name, &norm).map(Source::GameDir),
+            port_manifest::DllRoute::Guest => {
+                if let Some(p) = self.find_guest_pe(name, &norm) {
+                    return Some(Source::GameDir(p));
+                }
+                if w::find_builtin(&norm).is_some() {
+                    let bname = if norm.starts_with("api-ms-win-")
+                        || norm.starts_with("ext-ms-win-")
+                        || norm == "vcruntime140_1.dll"
+                        || norm.starts_with("ucrtbase")
+                    {
+                        w::canonical_dll(&norm)
+                    } else {
+                        norm
+                    };
+                    return Some(Source::Builtin(bname));
+                }
+                None
+            }
+        }
     }
 
     /// Load (or reference) a DLL by name. `static_import` modules that are
@@ -867,12 +857,9 @@ impl Loader {
                 }
                 log::debug!("{}: DllMain done", m.name);
             }
-            // V8 9.4 `--jitless` injection: only apply when explicitly requested or running AW2.
-            if m.name == "v8.dll"
-                && (x86_runtime::exe::aw2_registry_active()
-                    || std::env::var("AW2_V8_JITLESS").is_ok_and(|v| v.trim() == "1"))
-                && v8_jitless_enabled(std::env::var("AW2_V8_JITLESS").ok().as_deref())
-            {
+            // V8 9.4 `--jitless` injection: honor manifest/plugin `v8_jitless` default and
+            // `PORT_V8_JITLESS` / `AW2_V8_JITLESS` environment overrides (including `=0` opt-out).
+            if m.name == "v8.dll" && self.should_apply_v8_jitless() {
                 self.apply_v8_jitless(&m);
             }
             let e = m.ldr.load(Ordering::Relaxed);
@@ -882,7 +869,15 @@ impl Loader {
         }
     }
 
-    /// Default (`AW2_V8_JITLESS` not `0`): pass `--jitless` to the game's V8 (9.4.146.24) through its exported
+    fn should_apply_v8_jitless(&self) -> bool {
+        let env_val = std::env::var("PORT_V8_JITLESS")
+            .or_else(|_| std::env::var("AW2_V8_JITLESS"))
+            .ok();
+        should_apply_v8_jitless_with(self.v8_jitless, env_val.as_deref())
+    }
+
+    /// Default (`v8_jitless = true` or `PORT_V8_JITLESS=1`, unless disabled with `=0`): pass
+    /// `--jitless` to the game's V8 (9.4.146.24) through its exported
     /// `v8::V8::SetFlagsFromString(const char*, size_t)`, after v8.dll's DllMain and before
     /// cohtml calls `v8::V8::Initialize`. `V8::InitializeOncePerProcessImpl` then runs
     /// `FlagList::EnforceFlagImplications` (no-opt, no-sparkplug, regexp_interpret_all,
@@ -997,7 +992,10 @@ impl Loader {
                     }
                 }
                 if !m.is_dll() {
-                    s.push_str(&format!(" [va 0x{:x}]", 0x1_4000_0000u64 + rva as u64));
+                    s.push_str(&format!(
+                        " [va 0x{:x}]",
+                        x86_runtime::exe::preferred_base() + rva as u64
+                    ));
                 }
                 if let Some(name) = sym {
                     s.push(' ');
@@ -1052,6 +1050,16 @@ static V8_JITLESS_ARG: &[u8] = b"--jitless";
 fn v8_jitless_enabled(v: Option<&str>) -> bool {
     !v.map(str::trim)
         .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("no"))
+}
+
+fn should_apply_v8_jitless_with(configured: bool, env_val: Option<&str>) -> bool {
+    if let Some(raw) = env_val {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return v8_jitless_enabled(Some(t));
+        }
+    }
+    configured
 }
 
 /// Call a guest `void f(const char*, size_t)` (Win64 ABI).
@@ -1161,6 +1169,9 @@ impl w::LoaderOps for Loader {
     fn get_module_handle(&self, name: Option<&str>) -> Option<usize> {
         let Some(name) = name else { return self.exe.get().map(|m| m.base) };
         let norm = pe_image::normalize_dll_name(name);
+        if self.routing.is_disabled(&norm) {
+            return None;
+        }
         if let Some(m) = self.find_loaded(&norm) {
             return Some(m.base);
         }
@@ -1168,7 +1179,14 @@ impl w::LoaderOps for Loader {
         if matches!(norm.as_str(), "kernel32.dll" | "kernelbase.dll" | "ntdll.dll") {
             return self.load(&norm, false).ok().map(|m| m.base);
         }
-        let canon = w::canonical_dll(&norm);
+        let routed = self.routing.resolve_target_dll(&norm);
+        if self.routing.is_disabled(&routed) {
+            return None;
+        }
+        if let Some(m) = self.find_loaded(&routed) {
+            return Some(m.base);
+        }
+        let canon = w::canonical_dll(&routed);
         if let Some(m) = self.find_loaded(&canon) {
             return Some(m.base);
         }
@@ -1310,7 +1328,7 @@ impl w::LoaderOps for Loader {
 mod tests {
     use super::*;
 
-    /// `AW2_V8_JITLESS` is on unless explicitly disabled.
+    /// `PORT_V8_JITLESS` / `AW2_V8_JITLESS` overrides manifest/plugin `v8_jitless` defaults.
     #[test]
     fn v8_jitless_knob() {
         for on in [None, Some(""), Some("1"), Some("true"), Some("ON"), Some(" yes "), Some("2")] {
@@ -1319,26 +1337,113 @@ mod tests {
         for off in ["0", "false", "OFF", " no "] {
             assert!(!v8_jitless_enabled(Some(off)), "{off:?}");
         }
+        assert!(should_apply_v8_jitless_with(true, None));
+        assert!(should_apply_v8_jitless_with(true, Some("")));
+        assert!(!should_apply_v8_jitless_with(true, Some("0")));
+        assert!(!should_apply_v8_jitless_with(true, Some("false")));
+        assert!(!should_apply_v8_jitless_with(false, None));
+        assert!(should_apply_v8_jitless_with(false, Some("1")));
+        assert!(should_apply_v8_jitless_with(false, Some("true")));
     }
 
-    /// Native ARM64 video decoders (`bink2w64.dll`, `mediadecoders.windowsdesktop.dll`)
-    /// are builtin-overridden by default so games run ahead-of-time native Rust
-    /// decoders, while explicit `PORT_BUILTIN_OVERRIDES` opt-out still works.
+    /// `DllRoutingTable` policies (`Builtin`, `Guest`, `GuestOnly`, `Disabled`, `Alias`, and
+    /// legacy `-foo.dll` / `!foo.dll` / `0` specs) drive `Loader::classify` accurately.
     #[test]
-    fn video_decoders_builtin_overridden_by_default() {
-        assert!(is_builtin_override_with("bink2w64.dll", None));
-        assert!(is_builtin_override_with("mediadecoders.windowsdesktop.dll", None));
-        assert!(is_builtin_override_with("sl.interposer.dll", None));
-        assert!(is_builtin_override_with("nri.dll", None));
-        assert!(is_builtin_override_with("nvcloth_x64.dll", None));
-        assert!(!is_builtin_override_with("nrd.dll", None));
-        assert!(!is_builtin_override_with("bink2w64.dll", Some("-bink2w64.dll")));
-        assert!(!is_builtin_override_with(
-            "mediadecoders.windowsdesktop.dll",
-            Some("!mediadecoders.windowsdesktop.dll")
-        ));
-        assert!(!is_builtin_override_with("sl.interposer.dll", Some("-sl.interposer.dll")));
-        assert!(!is_builtin_override_with("sl.interposer.dll", Some("0")));
+    fn dll_routing_table_classification() {
+        let dir = std::env::temp_dir().join(format!("port-loader-route-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create dummy PE files on disk for game-dir presence tests.
+        for fname in ["bink2w64.dll", "nrd.dll", "strict_present.dll", "disabled_present.dll"] {
+            std::fs::write(dir.join(fname), b"MZ").unwrap();
+        }
+
+        // 1. Default routing + legacy env overrides (`-foo.dll`, `!foo.dll`, `0`).
+        let default_tbl = port_manifest::DllRoutingTable::new();
+        assert!(default_tbl.is_builtin_override("bink2w64.dll"));
+        assert!(default_tbl.is_builtin_override("mediadecoders.windowsdesktop.dll"));
+        assert!(default_tbl.is_builtin_override("sl.interposer.dll"));
+        assert!(default_tbl.is_builtin_override("nri.dll"));
+        assert!(default_tbl.is_builtin_override("nvcloth_x64.dll"));
+        assert!(!default_tbl.is_builtin_override("nrd.dll"));
+
+        assert!(!port_manifest::DllRoutingTable::from_legacy_override_spec(Some("-bink2w64.dll"))
+            .is_builtin_override("bink2w64.dll"));
+        assert!(!port_manifest::DllRoutingTable::from_legacy_override_spec(Some(
+            "!mediadecoders.windowsdesktop.dll"
+        ))
+        .is_builtin_override("mediadecoders.windowsdesktop.dll"));
+        assert!(!port_manifest::DllRoutingTable::from_legacy_override_spec(Some("-sl.interposer.dll"))
+            .is_builtin_override("sl.interposer.dll"));
+        assert!(!port_manifest::DllRoutingTable::from_legacy_override_spec(Some("0"))
+            .is_builtin_override("sl.interposer.dll"));
+
+        // 2. Full manifest routing matrix via Loader::classify().
+        let manifest = port_manifest::GameManifest::parse(
+            r#"
+[dlls]
+"disabled_present.dll" = "disabled"
+"strict_missing.dll" = "guest-only"
+"strict_present.dll" = "guest-only"
+"custom_video.dll" = "builtin:bink2w64.dll"
+"alias_bink.dll" = "alias:bink2w64.dll"
+"alias_disabled.dll" = "alias:disabled_present.dll"
+"cycle_a.dll" = "alias:cycle_b.dll"
+"cycle_b.dll" = "alias:cycle_a.dll"
+"#,
+        );
+        let routing = manifest.routing_table(&[], None);
+        let l = Loader::new_instance(dir.clone(), "C:\\Game".into(), false, routing, false);
+
+        // Builtin override beats game-dir PE.
+        assert_eq!(l.classify("bink2w64.dll"), Some(Source::Builtin("bink2w64.dll".into())));
+        // Explicit Builtin { provider } redirects to provider builtin.
+        assert_eq!(l.classify("custom_video.dll"), Some(Source::Builtin("bink2w64.dll".into())));
+        // Guest prefers game-dir PE when present, falls back to builtin when absent.
+        assert_eq!(l.classify("nrd.dll"), Some(Source::GameDir(dir.join("nrd.dll"))));
+        assert_eq!(l.classify("kernel32.dll"), Some(Source::Builtin("kernel32.dll".into())));
+        // GuestOnly uses game-dir PE when present, NEVER falls back to builtin even if builtin exists.
+        assert_eq!(
+            l.classify("strict_present.dll"),
+            Some(Source::GameDir(dir.join("strict_present.dll")))
+        );
+        assert_eq!(l.classify("strict_missing.dll"), None);
+        // Verify GuestOnly suppresses builtin fallback for a known builtin DLL too.
+        let strict_k32 = port_manifest::GameManifest::parse("[dlls]\n\"kernel32.dll\" = \"guest-only\"\n");
+        let l_strict = Loader::new_instance(
+            dir.clone(),
+            "C:\\Game".into(),
+            false,
+            strict_k32.routing_table(&[], None),
+            false,
+        );
+        assert_eq!(l_strict.classify("kernel32.dll"), None);
+        // Disabled refuses to load even when PE exists in game dir.
+        assert_eq!(l.classify("disabled_present.dll"), None);
+        // Alias resolves target routing and terminates cycles cleanly.
+        assert_eq!(l.classify("alias_bink.dll"), Some(Source::Builtin("bink2w64.dll".into())));
+        assert_eq!(l.classify("alias_disabled.dll"), None);
+        assert_eq!(l.classify("cycle_a.dll"), None);
+        // Verify LoaderOps::get_module_handle respects alias, builtin provider, and disabled routes.
+        {
+            use win32_rt::LoaderOps as _;
+            let bink = l.load("bink2w64.dll", false).expect("load bink2w64 builtin");
+            assert_eq!(l.get_module_handle(Some("alias_bink.dll")), Some(bink.base));
+            assert_eq!(l.get_module_handle(Some("custom_video.dll")), Some(bink.base));
+            assert_eq!(l.get_module_handle(Some("disabled_present.dll")), None);
+            assert_eq!(l.get_module_handle(Some("alias_disabled.dll")), None);
+        }
+        // Legacy `-bink2w64.dll` env override flips bink2w64.dll back to game-dir PE.
+        let l_neg = Loader::new_instance(
+            dir.clone(),
+            "C:\\Game".into(),
+            false,
+            manifest.routing_table(&[], Some("-bink2w64.dll")),
+            false,
+        );
+        assert_eq!(l_neg.classify("bink2w64.dll"), Some(Source::GameDir(dir.join("bink2w64.dll"))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every builtin export reachable through the synthesized export

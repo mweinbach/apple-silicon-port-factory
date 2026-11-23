@@ -57,6 +57,7 @@ win64_abi::win64_mods! {
 
 pub mod config;
 pub mod det_entropy;
+pub mod middleware;
 pub mod shadow;
 /// Cross-Apple platform backend alias (`AppKit` on macOS, `UIKit`/host-surface on iOS).
 pub use macos as platform;
@@ -246,7 +247,7 @@ pub fn builtin_dlls() -> &'static [BuiltinDll] {
     })
 }
 
-/// Map API-set and alias DLL names to the builtin module that implements them.
+/// Map API-set and alias DLL names to the canonical builtin module that implements them.
 /// Input may be any case, with or without directory / `.dll`.
 pub fn canonical_dll(dll: &str) -> String {
     let n = pe_image::normalize_dll_name(dll);
@@ -257,122 +258,7 @@ pub fn canonical_dll(dll: &str) -> String {
             }
         }
     }
-    if n.starts_with("api-ms-win-crt-") {
-        return "ucrtbase.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-registry-")
-        || n.starts_with("api-ms-win-service-")
-        || n.starts_with("api-ms-win-eventing-")
-        || n.starts_with("api-ms-win-security-")
-    {
-        return "advapi32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-com-") || n.starts_with("api-ms-win-core-winrt-") {
-        return "ole32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-version-") {
-        return "version.dll".into();
-    }
-    if n.starts_with("api-ms-win-shcore-") || n == "shcore.dll" {
-        return "user32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-")
-        || n.starts_with("api-ms-win-appmodel-")
-        || n == "kernelbase.dll"
-        || n == "psapi.dll"
-    {
-        // Core API sets and PSAPI forwarders live in kernelbase/kernel32 on Windows;
-        // we serve them from the kernel32 table (which also covers the ntdll forwarders).
-        return "kernel32.dll".into();
-    }
-    if n.starts_with("ext-ms-win-") {
-        return n;
-    }
-    if n == "xinput1_3.dll" || n == "xinput9_1_0.dll" || n == "xinput1_2.dll" || n == "xinput1_1.dll" {
-        return "xinput1_4.dll".into();
-    }
-    if n == "xaudio2_9.dll" || n == "xaudio2_8.dll" || n == "xaudio2_7.dll" {
-        return "xaudio2_9redist.dll".into();
-    }
-    if n == "mediadecoders.windowsdesktop.dll" {
-        return "mediadecoders_windowsdesktop.dll".into();
-    }
-    if n == "cohtml.windowsdesktop.dll" {
-        return "cohtml_windowsdesktop.dll".into();
-    }
-    if n == "vulkan-1.dll" {
-        return "vulkan_1.dll".into();
-    }
-    if n == "d3dcompiler_43.dll" || n == "d3dcompiler_46.dll" {
-        return "d3dcompiler_47.dll".into();
-    }
-    if n == "mono-2.0-bdwgc.dll" || n == "mono.dll" || n == "mono-2.0-sgen.dll" {
-        return "mono_2_0_bdwgc.dll".into();
-    }
-    if n == "mscoreei.dll" {
-        return "mscoree.dll".into();
-    }
-    if n == "clr.dll" {
-        return "coreclr.dll".into();
-    }
-    if n == "steam_api.dll" {
-        return "steam_api64.dll".into();
-    }
-    if n == "dstoragecore.dll" {
-        return "dstorage.dll".into();
-    }
-    if n == "nvapi.dll" {
-        return "nvapi64.dll".into();
-    }
-    if n == "_nvngx.dll" || n == "nvngx_dlssg.dll" || n == "nvngx_dlssd.dll" {
-        return "nvngx_dlss.dll".into();
-    }
-    if n == "libxess_dx12.dll" {
-        return "libxess.dll".into();
-    }
-    if n == "fmod64.dll" || n == "fmodstudio.dll" || n == "fmodstudio64.dll" {
-        return "fmod.dll".into();
-    }
-    if n.starts_with("oo2core_") && n.ends_with(".dll") {
-        return "oo2core_9_win64.dll".into();
-    }
-    if n == "tbb12.dll" || n == "tbb.dll" {
-        return "tbbmalloc.dll".into();
-    }
-    if n == "libzstd.dll" {
-        return "zstd.dll".into();
-    }
-    if n == "ffx_fsr3_x64.dll" || n == "ffx_fsr2_api_x64.dll" || n == "amd_fidelityfx_dx12.dll" {
-        return "amd_fidelityfx_loader_dx12.dll".into();
-    }
-    if n == "wsock32.dll" {
-        return "ws2_32.dll".into();
-    }
-    if n == "shlwapi.dll" {
-        return "shell32.dll".into();
-    }
-    if n == "comctl32.dll" {
-        return "uxtheme.dll".into();
-    }
-    if n == "sfc.dll" || n == "sfc_os.dll" || n == "tbs.dll" {
-        return "wintrust.dll".into();
-    }
-    if n == "cfgmgr32.dll" || n.starts_with("api-ms-win-devices-config-") {
-        return "setupapi.dll".into();
-    }
-    if n == "nvlowlatencyvk.dll" {
-        return "vulkan_1.dll".into();
-    }
-    if n == "sensapi.dll" || n == "wininet.dll" {
-        return "winhttp.dll".into();
-    }
-    if n == "userenv.dll" {
-        return "advapi32.dll".into();
-    }
-    if n == "sspicli.dll" || n == "security.dll" {
-        return "secur32.dll".into();
-    }
-    n
+    port_manifest::canonical_dll(&n)
 }
 
 pub fn find_builtin(dll: &str) -> Option<&'static BuiltinDll> {

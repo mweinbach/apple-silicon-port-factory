@@ -17,12 +17,14 @@ win64_abi::win64_mods! {
     pub mod dll_native;
     pub mod exe_route_diff;
     pub mod ns;
+    pub mod plugin;
     pub mod registry;
     pub mod simd_ops;
     #[cfg(feature = "shards")]
     pub mod shards;
 }
 
+pub use plugin::register_plugin;
 pub use x86_runtime::diff_eq;
 
 /// Register all Alan Wake 2–specific tables and hooks with [`x86_runtime`].

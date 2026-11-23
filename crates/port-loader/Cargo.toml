@@ -17,7 +17,7 @@ crate-type = ["rlib", "staticlib"]
 # Enable `aw2` to link the full `aw2-game` (hand-decompiled `ns/` + lifted shards) + Wwise bridge.
 default = ["cli"]
 cli = ["dep:port-factory"]
-aw2-core = ["dep:aw2-game", "win32-rt/wwise-bridge"]
+aw2-core = ["dep:aw2-game", "aw2-game/wwise-bridge", "win32-rt/wwise-bridge"]
 aw2 = ["aw2-core", "aw2-game/shards", "aw2-game/dll-shards"]
 
 [[bin]]
@@ -33,6 +33,7 @@ required-features = ["aw2-core"]
 anyhow.workspace = true
 win64-abi.workspace = true
 pe-image.workspace = true
+port-manifest.workspace = true
 port-factory = { workspace = true, optional = true }
 d3d12-metal.workspace = true
 win32-rt.workspace = true

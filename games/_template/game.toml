@@ -17,8 +17,10 @@ name = "My Game"
 exe = "MyGame.exe"
 # Virtual Windows directory mounted to `--game-dir` inside `~/Translator`
 win_dir = "C:\\Games\\MyGame"
-# Boot/runtime log filename under ~/Library/Logs/Translator/
+# Boot/runtime log filename under ~/Library/Logs/<log_dir>/
 log_name = "MyGame.log"
+# Optional log directory name under ~/Library/Logs/ (defaults to "Translator")
+# log_dir = "Translator"
 # Virtual Windows computer name returned by GetComputerName*
 computer_name = "WIN64PORT"
 # Optional Steam AppID (enables `steam_api64.dll` IPC integration & `steam-port` lookup)
@@ -31,10 +33,36 @@ preferred_base_retry = false
 v8_jitless = false
 # Legacy Alan Wake 2 save-directory migration (always false for new games)
 legacy_remedy_migration = false
-# Optional comma-separated builtin DLL override controls:
-#   - Prefix with `-` to force loading the game's own shipping PE DLL via x86-runtime
-#     (e.g. "-physx3_x64.dll,-bink2w64.dll")
-#   - Use "0" to disable all builtin overrides for game-shipped DLLs
-# builtin_overrides = ""
+# Optional AOT block-cache directory (relative paths resolve next to this game.toml)
+# aot_dir = "aot-cache"
 # Optional default command-line arguments appended to the Windows command line
 # args = ""
+# Legacy comma-separated builtin DLL override spec (still supported; prefer [middleware.*] and [dlls]):
+#   - Prefix with `-` to load the game's shipping PE DLL via x86-runtime
+#   - Use "0" to disable all builtin overrides for game-shipped DLLs
+# builtin_overrides = ""
+
+# Standardized multi-version middleware routing (`[middleware.<family>]`).
+# Supported modes: "builtin", "builtin:<provider.dll>", "guest", "guest-only", "disabled", "alias:<target.dll>".
+#
+# Example: NVIDIA PhysX ("3.4" | "4.1" | "5.x")
+# [middleware.physx]
+# version = "4.1"
+# mode = "guest"
+#
+# Example: FMOD Studio / Core ("1.10" | "2.00" | "2.02")
+# [middleware.fmod]
+# version = "2.02"
+# mode = "builtin"
+#
+# Example: Steamworks / DirectStorage / Bink
+# [middleware.steam]
+# mode = "builtin"
+
+# Fine-grained per-DLL routing overrides (`[dlls]` takes precedence over `[middleware.*]`).
+# [dlls]
+# "nrd.dll" = "guest"
+# "strict_plugin.dll" = "guest-only"
+# "telemetry.dll" = "disabled"
+# "legacy_input.dll" = "alias:xinput1_4.dll"
+# "custom_video.dll" = "builtin:bink2w64.dll"

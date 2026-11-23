@@ -24,6 +24,7 @@ win64_abi::win64_mods! {
     pub mod emu;
     pub mod emu_prof;
     pub mod exe;
+    pub mod game_plugin;
     pub mod hooks;
     pub mod jobprof;
     pub mod lift_ops;

@@ -24,7 +24,7 @@ runner = "run -p port-loader --bin port-runner --target aarch64-apple-darwin --"
 runner-build = "build -p port-loader --bin port-runner --target aarch64-apple-darwin"
 ios-lib = "build --release -p port-loader --lib --no-default-features --target aarch64-apple-ios"
 ios-sim-lib = "build --release -p port-loader --lib --no-default-features --target aarch64-apple-ios-sim"
-factory-test = "test -p pe-image -p dxil-metal -p wwise-audio -p x86-runtime -p port-factory -p port-loader --lib --target aarch64-apple-darwin"
+factory-test = "test -p pe-image -p port-manifest -p dxil-metal -p wwise-audio -p x86-runtime -p port-factory -p port-loader --lib --target aarch64-apple-darwin"
 opsdb = "run -p port-factory --bin port-factory --"
 x86-verify = "run --release -p x86-runtime --bin x86-verify --target aarch64-apple-darwin --"
 # Alan Wake 2 full target (links aw2-game + lifted shards + Wwise native bridge).

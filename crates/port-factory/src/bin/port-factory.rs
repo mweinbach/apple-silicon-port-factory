@@ -47,7 +47,7 @@ use port_factory::storage_opt::{
     StorageOptOptions, StorageOptProfile,
 };
 use port_factory::vfs::WinFs;
-use port_factory::win32_db::{audit_pe_imports, Win32Category, Win32Database};
+use port_factory::win32_db::{audit_pe_imports, format_audit_report, Win32Category, Win32Database};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -535,23 +535,7 @@ fn cmd_win32_audit(args: &[String]) -> Result<()> {
         };
         total_imports += audit.total_imports;
         total_resolved += audit.resolved_win32;
-        println!(
-            "=== Win32 Import Audit: {} ({}/{} resolved = {:.2}%) ===",
-            audit.binary_name,
-            audit.resolved_win32,
-            audit.total_imports,
-            audit.coverage_pct()
-        );
-        for (cat, cnt) in &audit.resolved_by_category {
-            println!("  {:24} : {:>5}", cat.as_str(), cnt);
-        }
-        if !audit.unresolved.is_empty() {
-            println!("  Unresolved ({}):", audit.unresolved.len());
-            for (dll, sym) in audit.unresolved.iter().take(200) {
-                println!("    {dll}!{sym}");
-            }
-        }
-        println!();
+        println!("{}", format_audit_report(&audit));
     }
     if files.len() > 1 && total_imports > 0 {
         println!(

@@ -9,10 +9,12 @@ publish.workspace = true
 default = ["shards", "dll-shards"]
 shards = []
 dll-shards = []
+wwise-bridge = ["win32-rt/wwise-bridge"]
 
 [dependencies]
 win64-abi.workspace = true
 win32-rt.workspace = true
+port-manifest.workspace = true
 x86-runtime.workspace = true
 iced-x86.workspace = true
 log.workspace = true

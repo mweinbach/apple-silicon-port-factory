@@ -1,0 +1,11 @@
+[package]
+name = "port-manifest"
+description = "Shared declarative game manifest (game.toml), multi-version middleware catalog, canonical DLL mapping, and DLL routing tables for Apple Silicon Port Factory"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+pe-image.workspace = true

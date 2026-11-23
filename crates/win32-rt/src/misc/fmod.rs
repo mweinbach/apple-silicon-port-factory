@@ -2982,7 +2982,8 @@ pub unsafe extern "win64" fn FMOD_System_GetVersion(
     if version_out.is_null() {
         return FMOD_ERR_INVALID_PARAM;
     }
-    write_out(version_out, FMOD_VERSION);
+    let version = crate::middleware::active_version_tag("fmod").unwrap_or(FMOD_VERSION);
+    write_out(version_out, version);
     FMOD_OK
 }
 
@@ -10771,6 +10772,46 @@ mod tests {
             assert_eq!(FMOD_Studio_System_UnloadAll(studio), FMOD_OK);
             assert_eq!(FMOD_Studio_Bank_IsValid(bank), 0);
             assert_eq!(FMOD_Studio_System_Release(studio), FMOD_OK);
+        }
+    }
+
+    #[test]
+    fn fmod_get_version_respects_middleware_config() {
+        struct ResetFmod;
+        impl Drop for ResetFmod {
+            fn drop(&mut self) {
+                crate::middleware::clear_family_version("fmod");
+            }
+        }
+        let _reset = ResetFmod;
+
+        unsafe {
+            let mut sys = 0usize;
+            assert_eq!(FMOD_System_Create(&mut sys, 0), FMOD_OK);
+            assert_ne!(sys, 0);
+
+            let mut ver = 0u32;
+            crate::middleware::clear_family_version("fmod");
+            assert_eq!(FMOD_System_GetVersion(sys, &mut ver), FMOD_OK);
+            assert_eq!(ver, FMOD_VERSION);
+
+            crate::middleware::set_family_version("fmod", "1.10");
+            assert_eq!(FMOD_System_GetVersion(sys, &mut ver), FMOD_OK);
+            assert_eq!(ver, 0x0001_1000);
+
+            crate::middleware::set_family_version("fmod", "2.00");
+            assert_eq!(FMOD_System_GetVersion(sys, &mut ver), FMOD_OK);
+            assert_eq!(ver, 0x0002_0000);
+
+            crate::middleware::set_family_version("fmod", "2.02");
+            assert_eq!(FMOD_System_GetVersion(sys, &mut ver), FMOD_OK);
+            assert_eq!(ver, 0x0002_0200);
+
+            crate::middleware::clear_family_version("fmod");
+            assert_eq!(FMOD_System_GetVersion(sys, &mut ver), FMOD_OK);
+            assert_eq!(ver, FMOD_VERSION);
+
+            assert_eq!(FMOD_System_Release(sys), FMOD_OK);
         }
     }
 }

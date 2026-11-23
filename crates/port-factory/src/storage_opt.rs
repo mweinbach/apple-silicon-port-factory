@@ -75,90 +75,34 @@ pub struct ManifestStorageConfig {
     pub archive_dir: Option<String>,
 }
 
-/// Parse `[storage]` and negative `[runtime].builtin_overrides` entries from a `game.toml` string.
+/// Parse `[storage]`, negative `[runtime].builtin_overrides`, `[middleware.*]`,
+/// and `[dlls]` guest protections from a `game.toml` string via `port-manifest`.
 pub fn parse_manifest_storage_config(toml_text: &str) -> ManifestStorageConfig {
-    let mut cfg = ManifestStorageConfig::default();
-    let mut section = String::new();
-    for raw_line in toml_text.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = sec.trim().to_ascii_lowercase();
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let key = k.trim().to_ascii_lowercase();
-        let val = v.trim();
-        let qualified = if section.is_empty() {
-            key
-        } else {
-            format!("{section}.{key}")
-        };
-        match qualified.as_str() {
-            "storage.keep_dlls" => {
-                for item in parse_toml_string_list(val) {
-                    let norm = item.to_ascii_lowercase();
-                    if !norm.is_empty() && !cfg.keep_dlls.contains(&norm) {
-                        cfg.keep_dlls.push(norm);
-                    }
-                }
-            }
-            "storage.archive_repacker" => {
-                let s = val.trim_matches('"').trim_matches('\'').trim();
-                if !s.is_empty() {
-                    cfg.archive_repacker = Some(s.to_string());
-                }
-            }
-            "storage.archive_dir" => {
-                let s = val
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim()
-                    .trim_matches('/')
-                    .trim_matches('\\');
-                if !s.is_empty() {
-                    cfg.archive_dir = Some(s.replace('\\', "/"));
-                }
-            }
-            "runtime.builtin_overrides" | "builtin_overrides" => {
-                // Negative entries (`-physx3_x64.dll`) explicitly force the shipping guest DLL!
-                let inner = val.trim_matches('"').trim_matches('\'');
-                for tok in inner.split(',') {
-                    let t = tok.trim();
-                    if let Some(guest_dll) = t.strip_prefix('-') {
-                        let norm = guest_dll.trim().to_ascii_lowercase();
-                        if !norm.is_empty() && !cfg.keep_dlls.contains(&norm) {
-                            cfg.keep_dlls.push(norm);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cfg
-}
+    let manifest = port_manifest::GameManifest::parse(toml_text);
+    let keep_dlls = manifest.effective_keep_dlls().into_iter().collect();
+    let archive_repacker = manifest
+        .storage
+        .archive_repacker
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let archive_dir = manifest
+        .storage
+        .archive_dir
+        .as_deref()
+        .map(|s| {
+            s.trim()
+                .trim_matches('/')
+                .trim_matches('\\')
+                .replace('\\', "/")
+        })
+        .filter(|s| !s.is_empty());
 
-fn parse_toml_string_list(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim();
-    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        inner
-            .split(',')
-            .map(|s| s.trim().trim_matches('"').trim_matches('\'').trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        trimmed
-            .trim_matches('"')
-            .trim_matches('\'')
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+    ManifestStorageConfig {
+        keep_dlls,
+        archive_repacker,
+        archive_dir,
     }
 }
 
@@ -335,57 +279,27 @@ impl StorageOptReport {
 /// `--strip-unused-dlls` is enabled.
 ///
 /// Any DLL listed in `keep_dlls` (e.g. compiled into static `.aot.o`, declared in
-/// `[storage].keep_dlls`, or forced guest via `-foo.dll` in `builtin_overrides`) is ALWAYS kept.
+/// `[storage].keep_dlls`, or forced guest via `-foo.dll` / `[middleware.*]` / `[dlls]`)
+/// is ALWAYS kept.
 pub fn should_strip_pc_dll(file_name: &str, keep_dlls: &BTreeSet<String>) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    if !lower.ends_with(".dll") {
-        return false;
-    }
-    if keep_dlls.contains(&lower) {
-        return false;
-    }
+    port_manifest::DllRoutingTable::new().should_strip_pc_dll(file_name, keep_dlls)
+}
 
-    // Exact PC-only GPU vendor / debug / runtime-builtin-superseded DLLs.
-    const EXACT_STRIP: &[&str] = &[
-        "d3d12.dll",
-        "d3d12core.dll",
-        "d3d12sdklayers.dll",
-        "dxcompiler.dll",
-        "dxil.dll",
-        "dstorage.dll",
-        "dstoragecore.dll",
-        "nrd.dll",
-        "nri.dll",
-        "nv_cluster_builder.dll",
-        "nvapi64.dll",
-        "nvcuda.dll",
-        "opencl.dll",
-        "bink2w64.dll",
-        "eossdk-win64-shipping.dll",
-        "xaudio2_9redist.dll",
-        "libcurl.dll",
-        "libprotobuf.dll",
-        "zlib1.dll",
-        "v8_zlib.dll",
-        "nvcloth_x64.dll",
-        "apex_clothing_x64.dll",
-        "apexframework_x64.dll",
-    ];
-    if EXACT_STRIP.contains(&lower.as_str()) {
-        return true;
+/// Manifest-aware variant of [`should_strip_pc_dll`] that applies the full
+/// [`port_manifest::DllRoutingTable`] (including `Disabled` and `Guest`/`GuestOnly`
+/// routes) alongside `[storage].keep_dlls` and `extra_keep_dlls`.
+pub fn should_strip_pc_dll_for_manifest(
+    file_name: &str,
+    manifest: &port_manifest::GameManifest,
+    extra_keep_dlls: &BTreeSet<String>,
+) -> bool {
+    let mut keep = manifest.effective_keep_dlls();
+    for d in extra_keep_dlls {
+        keep.insert(d.to_ascii_lowercase());
     }
-
-    // Prefix families for NVIDIA DLSS/Streamline/NVTX, AMD FSR/AGS, Razer Chroma, D3DCompiler.
-    const PREFIX_STRIP: &[&str] = &[
-        "nvngx_",
-        "sl.",
-        "nvtoolsext",
-        "amd_fidelityfx_",
-        "amd_ags_",
-        "cchromaeditorlibrary",
-        "d3dcompiler_",
-    ];
-    PREFIX_STRIP.iter().any(|p| lower.starts_with(p))
+    manifest
+        .routing_table(&[], None)
+        .should_strip_pc_dll(file_name, &keep)
 }
 
 /// Result of lossless 2D DDS mipmap capping ([`cap_dds_mipmaps`]).
@@ -1028,6 +942,36 @@ archive_dir = "data_pack2"
         assert!(!should_strip_pc_dll("v8.dll", &opts.keep_dlls));
         assert!(!should_strip_pc_dll("PhysX3_x64.dll", &opts.keep_dlls));
         assert!(!should_strip_pc_dll("RenoirCore.WindowsDesktop.dll", &opts.keep_dlls));
+    }
+
+    #[test]
+    fn parse_manifest_storage_config_protects_middleware_and_dlls_guest_routes() {
+        let toml = r#"
+[middleware.physx]
+version = "4.1"
+mode = "guest"
+
+[dlls]
+"nrd.dll" = "guest"
+"unused_vendor.dll" = "disabled"
+"#;
+        let cfg = parse_manifest_storage_config(toml);
+        assert!(cfg.keep_dlls.contains(&"physx_64.dll".to_string()));
+        assert!(cfg.keep_dlls.contains(&"physxcommon_64.dll".to_string()));
+        assert!(cfg.keep_dlls.contains(&"physxcooking_64.dll".to_string()));
+        assert!(cfg.keep_dlls.contains(&"physxfoundation_64.dll".to_string()));
+        assert!(cfg.keep_dlls.contains(&"nrd.dll".to_string()));
+
+        let mut opts = StorageOptOptions::from_profile(StorageOptProfile::High);
+        opts.apply_manifest_config(&cfg);
+        assert!(!should_strip_pc_dll("NRD.dll", &opts.keep_dlls));
+        assert!(!should_strip_pc_dll("PhysX_64.dll", &opts.keep_dlls));
+
+        let manifest = port_manifest::GameManifest::parse(toml);
+        let empty = BTreeSet::new();
+        assert!(!should_strip_pc_dll_for_manifest("NRD.dll", &manifest, &empty));
+        assert!(!should_strip_pc_dll_for_manifest("PhysX_64.dll", &manifest, &empty));
+        assert!(should_strip_pc_dll_for_manifest("unused_vendor.dll", &manifest, &empty));
     }
 
     #[test]

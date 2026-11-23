@@ -1,28 +1,118 @@
-//! Alan Wake 2–specific Win32 middleware & autoplay hooks.
+//! Alan Wake 2 [`GamePlugin`] implementation, middleware hooks, and opt-in diagnostic tracers.
 //!
-//! Kept strictly outside `win32-rt` and installed ONLY when launching `AlanWake2.exe`,
-//! so generic games running through the loader never dereference AW2 VAs or trigger AW2
-//! UI/menu transitions.
+//! Houses all Alan Wake 2–specific hooks (`cohtml`, `physx3`, `AW2_AUTO_PLAY`,
+//! `AW2_CAMERA_TRACE`, replacement registry metadata, and optional `wwise-bridge`
+//! post-map hooks) inside `aw2-game` so the universal `x86-runtime` and `port-loader`
+//! crates stay 100% game-agnostic.
 
-use win32_rt as w;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use win32_rt as w;
+use x86_runtime::game_plugin::{
+    GamePlugin, GamePluginDefaults, GamePostMapContext, ReplacementSet,
+};
 
-/// Default PhysX DLL override list for Alan Wake 2: builtin `physx3_x64.dll` stubs
-/// `PxScene::raycast`/`sweep`/`overlap` as `ret0`, so use the game's shipping PhysX 3.4
-/// PEs via ARM64 JIT whenever the user has not set `PORT_BUILTIN_OVERRIDES`/`AW2_BUILTIN_OVERRIDES`.
-const AW2_DEFAULT_PHYSX_OVERRIDES: &str =
-    "-physx3_x64.dll,-physx3common_x64.dll,-physx3cooking_x64.dll,-pxfoundation_x64.dll";
+/// Alan Wake 2 [`GamePlugin`] implementation.
+pub struct Aw2Plugin;
+
+/// Static singleton instance of [`Aw2Plugin`].
+pub static AW2_PLUGIN: Aw2Plugin = Aw2Plugin;
+
+/// Register [`AW2_PLUGIN`] with `x86-runtime`'s global plugin registry.
+pub fn register_plugin() {
+    x86_runtime::game_plugin::register_plugin(&AW2_PLUGIN);
+}
+
+/// Default PhysX DLL routes for Alan Wake 2: builtin `physx3_x64.dll` stubs
+/// `PxScene::raycast`/`sweep`/`overlap` as `ret0`, so route the game's shipping
+/// PhysX 3.4 PEs through guest ARM64 JIT by default.
+const AW2_DEFAULT_DLL_ROUTES: &[(&str, &str)] = &[
+    ("physx3_x64.dll", "guest"),
+    ("physx3common_x64.dll", "guest"),
+    ("physx3cooking_x64.dll", "guest"),
+    ("pxfoundation_x64.dll", "guest"),
+];
+
+/// VAs with non-standard calling conventions that must be excluded from automated hooking.
+const AW2_SPECIAL_ABI_VAS: &[u64] = &[
+    0x1_4183_53d0,
+    0x1_4183_5480,
+    0x1_4254_7700,
+    0x1_4254_7720,
+];
+
+impl GamePlugin for Aw2Plugin {
+    fn id(&self) -> &'static str {
+        "alan-wake-2"
+    }
+
+    fn matches(&self, manifest_id: Option<&str>, exe_norm: &str) -> bool {
+        manifest_id.is_some_and(|id| id.eq_ignore_ascii_case("alan-wake-2"))
+            || exe_norm.eq_ignore_ascii_case("alanwake2.exe")
+    }
+
+    fn defaults(&self) -> GamePluginDefaults {
+        GamePluginDefaults {
+            app_name: "Alan Wake 2",
+            exe: "AlanWake2.exe",
+            log_name: "AlanWake2.log",
+            log_dir: "AW2Port",
+            computer_name: "AW2PORT",
+            preferred_base_retry: true,
+            legacy_remedy_migration: true,
+            v8_jitless: true,
+            dll_routes: AW2_DEFAULT_DLL_ROUTES,
+        }
+    }
+
+    fn on_pre_load(&self) {
+        crate::register_aw2_runtime();
+        install_middleware_hooks();
+    }
+
+    fn replacements(&self) -> Option<ReplacementSet> {
+        Some(ReplacementSet {
+            base: crate::registry::base().collect(),
+            all: crate::registry::all().collect(),
+            total_count: crate::registry::count(),
+            float_return_vas: crate::registry::FLOAT_RETURN,
+            special_abi_vas: AW2_SPECIAL_ABI_VAS,
+            preferred_exe_base: 0x1_4000_0000,
+        })
+    }
+
+    fn on_post_map(&self, ctx: &mut GamePostMapContext<'_>) -> Result<(), String> {
+        #[cfg(feature = "wwise-bridge")]
+        {
+            if ctx.audio_harness {
+                // CRT startup runs normally; WinMain (0x141856b20, called from
+                // __scrt_common_main_seh) is replaced by the audio test driver.
+                const WINMAIN: (u64, u64) = (0x1_4185_6b20, 0x1_4185_84de);
+                let at = ctx
+                    .exe_base
+                    .wrapping_add(WINMAIN.0.wrapping_sub(ctx.preferred_exe_base) as usize);
+                let len = (WINMAIN.1 - WINMAIN.0) as usize;
+                let target = w::audio::harness::winmain as *const () as usize;
+                (ctx.install_hook)(at, Some(at.wrapping_add(len)), target)?;
+                log::info!(
+                    "--audio-harness: WinMain @0x{at:x} -> win32_rt::audio::harness::winmain"
+                );
+            }
+            w::audio::akrec::install_from_env(ctx.install_hook)?;
+            Ok(())
+        }
+        #[cfg(not(feature = "wwise-bridge"))]
+        {
+            let _ = ctx;
+            Ok(())
+        }
+    }
+}
 
 /// Install all Alan Wake 2–specific middleware hooks (`cohtml`, `physx3`, `AW2_AUTO_PLAY`,
 /// and opt-in `AW2_CAMERA_TRACE=1` diagnostics).
-pub fn install() {
-    if std::env::var_os("PORT_BUILTIN_OVERRIDES").is_none()
-        && std::env::var_os("AW2_BUILTIN_OVERRIDES").is_none()
-    {
-        std::env::set_var("AW2_BUILTIN_OVERRIDES", AW2_DEFAULT_PHYSX_OVERRIDES);
-    }
+fn install_middleware_hooks() {
     w::misc::cohtml_windowsdesktop::set_view_hook(Box::new(Aw2CohtmlHook::default()));
     w::misc::physx3_x64::set_completion_task_hook(aw2_physx_completion_task_hook);
     if std::env::var_os("AW2_AUTO_PLAY").is_some_and(|v| v != "0")
@@ -146,16 +236,47 @@ unsafe fn fire_new_game_event(handler: usize) -> bool {
     }
     // Copy (world, session, jump_point) InplaceString<64> fields from UIMainMenuLevelsData
     // into UIMainMenuState (+0x08, +0x90, +0x118) via 0x14240aa00.
-    let _ = w::call_guest8(0x14240aa00, (menu_state + 0x08) as u64, levels_data as u64, 0, 0, 0, 0, 0, 0);
-    let _ = w::call_guest8(0x14240aa00, (menu_state + 0x90) as u64, start_pts as u64, 0, 0, 0, 0, 0, 0);
-    let _ = w::call_guest8(0x14240aa00, (menu_state + 0x118) as u64, (start_pts + 0x48) as u64, 0, 0, 0, 0, 0, 0);
+    let _ = w::call_guest8(
+        0x14240aa00,
+        (menu_state + 0x08) as u64,
+        levels_data as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let _ = w::call_guest8(
+        0x14240aa00,
+        (menu_state + 0x90) as u64,
+        start_pts as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let _ = w::call_guest8(
+        0x14240aa00,
+        (menu_state + 0x118) as u64,
+        (start_pts + 0x48) as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
     std::ptr::write_unaligned((menu_state + 0x1a0) as *mut u8, 0);
     std::ptr::write_unaligned((menu_state + 0x1a1) as *mut u8, 0);
     std::ptr::write_unaligned((menu_state + 0x1a2) as *mut u16, 1);
     std::ptr::write_unaligned(menu_state as *mut i32, 1);
     let loading_env_id = std::ptr::read_unaligned(0x143c8cee0usize as *const u16) as usize;
     if loading_env_id != 0xffff {
-        let loading_state = std::ptr::read_unaligned((env_table + loading_env_id * 8) as *const usize);
+        let loading_state =
+            std::ptr::read_unaligned((env_table + loading_env_id * 8) as *const usize);
         if loading_state != 0 {
             std::ptr::write_unaligned((loading_state + 0x158) as *mut u8, 1);
         }
@@ -181,9 +302,12 @@ impl w::misc::cohtml_windowsdesktop::CohtmlViewHook for Aw2CohtmlHook {
                 let ecs_world = std::ptr::read_unaligned((root_ptr + 8) as *const usize);
                 if ecs_world != 0 {
                     let env_table = std::ptr::read_unaligned((ecs_world + 0x580e0) as *const usize);
-                    let splash_env_id = std::ptr::read_unaligned(0x143c8cf64usize as *const u16) as usize;
+                    let splash_env_id =
+                        std::ptr::read_unaligned(0x143c8cf64usize as *const u16) as usize;
                     if env_table != 0 && splash_env_id != 0xffff {
-                        let splash_env = std::ptr::read_unaligned((env_table + splash_env_id * 8) as *const usize);
+                        let splash_env = std::ptr::read_unaligned(
+                            (env_table + splash_env_id * 8) as *const usize,
+                        );
                         if splash_env != 0 {
                             std::ptr::write_unaligned((splash_env + 3) as *mut u8, 1);
                         }
@@ -193,14 +317,27 @@ impl w::misc::cohtml_windowsdesktop::CohtmlViewHook for Aw2CohtmlHook {
         }
         let (fire_setup, h_bot, h_cont, h_setup, try_new_game) = {
             let map = self.views.lock().unwrap();
-            let Some(st) = map.get(&view_id) else { return };
-            let fs = st.first_time_setup_completed_handler != 0 && advance_count >= 10 && advance_count % 30 == 10;
-            let ng = if st.on_new_game_selected_handler != 0 && !st.new_game_fired && advance_count >= 90 {
+            let Some(st) = map.get(&view_id) else {
+                return;
+            };
+            let fs = st.first_time_setup_completed_handler != 0
+                && advance_count >= 10
+                && advance_count % 30 == 10;
+            let ng = if st.on_new_game_selected_handler != 0
+                && !st.new_game_fired
+                && advance_count >= 90
+            {
                 st.on_new_game_selected_handler
             } else {
                 0
             };
-            (fs, st.splash_scroll_bottom_handler, st.splash_scroll_continue_handler, st.first_time_setup_completed_handler, ng)
+            (
+                fs,
+                st.splash_scroll_bottom_handler,
+                st.splash_scroll_continue_handler,
+                st.first_time_setup_completed_handler,
+                ng,
+            )
         };
         if fire_setup {
             w::misc::cohtml_windowsdesktop::fire_event_0(h_bot);
@@ -237,19 +374,30 @@ impl w::misc::cohtml_windowsdesktop::CohtmlViewHook for Aw2CohtmlHook {
     unsafe fn on_trigger_event(&self, view_id: u32, advance_count: u32, _event_name: Option<&str>) {
         let (fire_setup, h_bot, h_cont, h_setup, try_new_game) = {
             let mut map = self.views.lock().unwrap();
-            let Some(st) = map.get_mut(&view_id) else { return };
+            let Some(st) = map.get_mut(&view_id) else {
+                return;
+            };
             let fs = if st.first_time_setup_completed_handler != 0 && !st.setup_fired {
                 st.setup_fired = true;
                 true
             } else {
                 false
             };
-            let ng = if st.on_new_game_selected_handler != 0 && !st.new_game_fired && advance_count >= 20 {
+            let ng = if st.on_new_game_selected_handler != 0
+                && !st.new_game_fired
+                && advance_count >= 20
+            {
                 st.on_new_game_selected_handler
             } else {
                 0
             };
-            (fs, st.splash_scroll_bottom_handler, st.splash_scroll_continue_handler, st.first_time_setup_completed_handler, ng)
+            (
+                fs,
+                st.splash_scroll_bottom_handler,
+                st.splash_scroll_continue_handler,
+                st.first_time_setup_completed_handler,
+                ng,
+            )
         };
         if fire_setup {
             w::misc::cohtml_windowsdesktop::fire_event_0(h_bot);
@@ -279,7 +427,12 @@ fn aw2_auto_play_step(hwnd: usize, frame: u32) {
     if frame == 30 {
         xinput1_4::backend_connect(
             0,
-            DeviceInfo { name: "AW2 Virtual Controller".into(), wireless: false, rumble: false, battery: None },
+            DeviceInfo {
+                name: "AW2 Virtual Controller".into(),
+                wireless: false,
+                rumble: false,
+                battery: None,
+            },
         );
     }
     if frame >= 60 {
@@ -287,46 +440,160 @@ fn aw2_auto_play_step(hwnd: usize, frame: u32) {
         if frame < 560 {
             let pt = POINT { x: 640, y: 360 };
             if phase == 0 {
-                input::native_key(NativeKey { mac: 0x24, down: true, repeat: false, chars: vec![0x0D] });
-                input::native_key(NativeKey { mac: 0x31, down: true, repeat: false, chars: vec![0x20] });
-                input::native_key(NativeKey { mac: 0x0E, down: true, repeat: false, chars: vec![b'e' as u16] });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: true,
+                    repeat: false,
+                    chars: vec![0x0D],
+                });
+                input::native_key(NativeKey {
+                    mac: 0x31,
+                    down: true,
+                    repeat: false,
+                    chars: vec![0x20],
+                });
+                input::native_key(NativeKey {
+                    mac: 0x0E,
+                    down: true,
+                    repeat: false,
+                    chars: vec![b'e' as u16],
+                });
                 if hwnd != 0 {
-                    input::native_mouse(NativeMouse::Move { hwnd, client: Some(pt), screen: pt, dx: 1.0, dy: 0.0 });
-                    input::native_mouse(NativeMouse::Button { hwnd, client: Some(pt), screen: pt, button: MouseButton::Left, down: true, clicks: 1 });
+                    input::native_mouse(NativeMouse::Move {
+                        hwnd,
+                        client: Some(pt),
+                        screen: pt,
+                        dx: 1.0,
+                        dy: 0.0,
+                    });
+                    input::native_mouse(NativeMouse::Button {
+                        hwnd,
+                        client: Some(pt),
+                        screen: pt,
+                        button: MouseButton::Left,
+                        down: true,
+                        clicks: 1,
+                    });
                 }
-                xinput1_4::backend_update(0, Gamepad { buttons: btn::A, ..Default::default() });
+                xinput1_4::backend_update(
+                    0,
+                    Gamepad {
+                        buttons: btn::A,
+                        ..Default::default()
+                    },
+                );
             } else if phase == 6 {
-                input::native_key(NativeKey { mac: 0x24, down: false, repeat: false, chars: Vec::new() });
-                input::native_key(NativeKey { mac: 0x31, down: false, repeat: false, chars: vec![] });
-                input::native_key(NativeKey { mac: 0x0E, down: false, repeat: false, chars: vec![] });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: false,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
+                input::native_key(NativeKey {
+                    mac: 0x31,
+                    down: false,
+                    repeat: false,
+                    chars: vec![],
+                });
+                input::native_key(NativeKey {
+                    mac: 0x0E,
+                    down: false,
+                    repeat: false,
+                    chars: vec![],
+                });
                 if hwnd != 0 {
-                    input::native_mouse(NativeMouse::Button { hwnd, client: Some(pt), screen: pt, button: MouseButton::Left, down: false, clicks: 1 });
+                    input::native_mouse(NativeMouse::Button {
+                        hwnd,
+                        client: Some(pt),
+                        screen: pt,
+                        button: MouseButton::Left,
+                        down: false,
+                        clicks: 1,
+                    });
                 }
                 xinput1_4::backend_update(0, Gamepad::default());
             }
         } else if frame < 760 {
             if phase == 0 {
-                input::native_key(NativeKey { mac: 0x7D, down: true, repeat: false, chars: Vec::new() });
-                xinput1_4::backend_update(0, Gamepad { buttons: btn::DPAD_DOWN, ..Default::default() });
+                input::native_key(NativeKey {
+                    mac: 0x7D,
+                    down: true,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
+                xinput1_4::backend_update(
+                    0,
+                    Gamepad {
+                        buttons: btn::DPAD_DOWN,
+                        ..Default::default()
+                    },
+                );
             } else if phase == 5 {
-                input::native_key(NativeKey { mac: 0x7D, down: false, repeat: false, chars: Vec::new() });
+                input::native_key(NativeKey {
+                    mac: 0x7D,
+                    down: false,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
                 xinput1_4::backend_update(0, Gamepad::default());
             } else if phase == 15 {
-                input::native_key(NativeKey { mac: 0x24, down: true, repeat: false, chars: vec![0x0D] });
-                xinput1_4::backend_update(0, Gamepad { buttons: btn::A, ..Default::default() });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: true,
+                    repeat: false,
+                    chars: vec![0x0D],
+                });
+                xinput1_4::backend_update(
+                    0,
+                    Gamepad {
+                        buttons: btn::A,
+                        ..Default::default()
+                    },
+                );
             } else if phase == 22 {
-                input::native_key(NativeKey { mac: 0x24, down: false, repeat: false, chars: Vec::new() });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: false,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
                 xinput1_4::backend_update(0, Gamepad::default());
             }
         } else {
             let skip_phase = (frame - 760) % 140;
             if skip_phase == 0 {
-                input::native_key(NativeKey { mac: 0x24, down: true, repeat: false, chars: vec![0x0D] });
-                input::native_key(NativeKey { mac: 0x31, down: true, repeat: false, chars: vec![0x20] });
-                xinput1_4::backend_update(0, Gamepad { buttons: btn::A, ..Default::default() });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: true,
+                    repeat: false,
+                    chars: vec![0x0D],
+                });
+                input::native_key(NativeKey {
+                    mac: 0x31,
+                    down: true,
+                    repeat: false,
+                    chars: vec![0x20],
+                });
+                xinput1_4::backend_update(
+                    0,
+                    Gamepad {
+                        buttons: btn::A,
+                        ..Default::default()
+                    },
+                );
             } else if skip_phase == 120 {
-                input::native_key(NativeKey { mac: 0x24, down: false, repeat: false, chars: Vec::new() });
-                input::native_key(NativeKey { mac: 0x31, down: false, repeat: false, chars: Vec::new() });
+                input::native_key(NativeKey {
+                    mac: 0x24,
+                    down: false,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
+                input::native_key(NativeKey {
+                    mac: 0x31,
+                    down: false,
+                    repeat: false,
+                    chars: Vec::new(),
+                });
                 xinput1_4::backend_update(0, Gamepad::default());
             }
         }
@@ -534,7 +801,14 @@ mod cam_trace {
                     .map(Mutex::new)
                     .ok()
             });
-        let _ = CFG.set(Config { verbose, walk, skip, exit_at, unhook, log_file });
+        let _ = CFG.set(Config {
+            verbose,
+            walk,
+            skip,
+            exit_at,
+            unhook,
+            log_file,
+        });
         let _ = WALK_ST.set(Mutex::new(WalkState {
             active_cc_frames: 0,
             started_frame: None,
@@ -604,17 +878,49 @@ mod cam_trace {
 
         let p1 = a1 as usize;
         let p4 = a4 as usize;
-        let pos_in = if p1 != 0 { exe::rd::<[u32; 3]>(p1 + 0xa0) } else { [0; 3] };
-        let vel_in = if p4 != 0 { exe::rd::<[u32; 3]>(p4) } else { [0; 3] };
+        let pos_in = if p1 != 0 {
+            exe::rd::<[u32; 3]>(p1 + 0xa0)
+        } else {
+            [0; 3]
+        };
+        let vel_in = if p4 != 0 {
+            exe::rd::<[u32; 3]>(p4)
+        } else {
+            [0; 3]
+        };
 
         let orig = ORIG_CC_STEP.load(Ordering::Acquire);
         let ret = if orig != 0 {
             let f: unsafe extern "win64" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = core::mem::transmute(orig);
             f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
         } else {
-            exe::call_va12(VA_CC_STEP | ORIG_TAG, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, 0)
+            exe::call_va12(
+                VA_CC_STEP | ORIG_TAG,
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+                a8,
+                a9,
+                a10,
+                a11,
+                0,
+            )
         };
 
         // Prefer recording the player (`p9 != 0`), or any controller if no `p9 != 0` seen yet.
@@ -626,7 +932,11 @@ mod cam_trace {
             let on_ground = exe::rd::<u8>(p1 + 0x19) as u32;
             let status = exe::rd::<u32>(p1 + 0xb4);
             let p78 = exe::rd::<usize>(p1 + 0x78);
-            let px_scene = if p78 != 0 { exe::rd::<usize>(p78) } else { 0 };
+            let px_scene = if p78 != 0 {
+                exe::rd::<usize>(p78)
+            } else {
+                0
+            };
             LAST_CC_PTR.store(p1, Ordering::Relaxed);
             LAST_PX_SCENE.store(px_scene, Ordering::Relaxed);
             LAST_POS_IN_X.store(pos_in[0], Ordering::Relaxed);
@@ -703,8 +1013,16 @@ mod cam_trace {
         a7: u64,
         a8: u64,
     ) -> u64 {
-        let start = if a2 != 0 { exe::rd::<[f32; 3]>(a2 as usize) } else { [0.0; 3] };
-        let end = if a3 != 0 { exe::rd::<[f32; 3]>(a3 as usize) } else { [0.0; 3] };
+        let start = if a2 != 0 {
+            exe::rd::<[f32; 3]>(a2 as usize)
+        } else {
+            [0.0; 3]
+        };
+        let end = if a3 != 0 {
+            exe::rd::<[f32; 3]>(a3 as usize)
+        } else {
+            [0.0; 3]
+        };
         let ret = call_orig8(&ORIG_RAYCAST, VA_RAYCAST, a1, a2, a3, a4, a5, a6, a7, a8);
         let hit = (ret & 0xff) != 0;
         RAY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -715,7 +1033,11 @@ mod cam_trace {
             DOWN_RAY_CALLS.fetch_add(1, Ordering::Relaxed);
             if hit {
                 DOWN_RAY_HITS.fetch_add(1, Ordering::Relaxed);
-                let hy = if a5 != 0 { exe::rd::<f32>((a5 as usize) + 0x30) } else { 0.0 };
+                let hy = if a5 != 0 {
+                    exe::rd::<f32>((a5 as usize) + 0x30)
+                } else {
+                    0.0
+                };
                 LAST_DRAY_HY.store(hy.to_bits(), Ordering::Relaxed);
                 LAST_DRAY_HIT.store(1, Ordering::Relaxed);
             } else {
@@ -789,7 +1111,18 @@ mod cam_trace {
         a7: u64,
         a8: u64,
     ) -> u64 {
-        let ret = call_orig8(&ORIG_FILTER_POST, VA_FILTER_POST, a1, a2, a3, a4, a5, a6, a7, a8);
+        let ret = call_orig8(
+            &ORIG_FILTER_POST,
+            VA_FILTER_POST,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+        );
         FILTER_POST_CALLS.fetch_add(1, Ordering::Relaxed);
         ret
     }
@@ -804,7 +1137,18 @@ mod cam_trace {
         a7: u64,
         a8: u64,
     ) -> u64 {
-        let ret = call_orig8(&ORIG_CC_FILTER_PRE, VA_CC_FILTER_PRE, a1, a2, a3, a4, a5, a6, a7, a8);
+        let ret = call_orig8(
+            &ORIG_CC_FILTER_PRE,
+            VA_CC_FILTER_PRE,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+        );
         CC_FILTER_PRE_CALLS.fetch_add(1, Ordering::Relaxed);
         if (ret as u32) != 0 {
             CC_FILTER_PRE_NZ.fetch_add(1, Ordering::Relaxed);
@@ -840,10 +1184,24 @@ mod cam_trace {
         a7: u64,
         a8: u64,
     ) -> u64 {
-        let ret = call_orig8(&ORIG_CAPS_SWEEP, VA_CAPS_SWEEP, a1, a2, a3, a4, a5, a6, a7, a8);
+        let ret = call_orig8(
+            &ORIG_CAPS_SWEEP,
+            VA_CAPS_SWEEP,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+        );
         CAPS_CALLS.fetch_add(1, Ordering::Relaxed);
         if ret != 0 {
-            LAST_CAPS_B60.store(exe::rd::<u8>((ret as usize) + 0x60) as u32, Ordering::Relaxed);
+            LAST_CAPS_B60.store(
+                exe::rd::<u8>((ret as usize) + 0x60) as u32,
+                Ordering::Relaxed,
+            );
         }
         ret
     }
@@ -899,25 +1257,87 @@ mod cam_trace {
                 if orig != 0 { "rust" } else { "jit" }
             ));
         };
-        wrap(VA_CC_STEP, &ORIG_CC_STEP, wrap_cc_step as *const () as usize, "cc_step");
-        wrap(VA_FILL_CACHE, &ORIG_FILL_CACHE, wrap_fill_cache as *const () as usize, "fill_cache");
-        wrap(VA_CACHE_CB, &ORIG_CACHE_CB, wrap_cache_cb as *const () as usize, "cache_cb");
-        wrap(VA_RAYCAST, &ORIG_RAYCAST, wrap_raycast as *const () as usize, "raycast");
-        wrap(VA_SWEEP, &ORIG_SWEEP, wrap_sweep as *const () as usize, "sweep");
-        wrap(VA_OVERLAP, &ORIG_OVERLAP, wrap_overlap as *const () as usize, "overlap");
-        wrap(VA_FILTER_PRE, &ORIG_FILTER_PRE, wrap_filter_pre as *const () as usize, "filter_pre");
-        wrap(VA_FILTER_POST, &ORIG_FILTER_POST, wrap_filter_post as *const () as usize, "filter_post");
-        wrap(VA_CC_FILTER_PRE, &ORIG_CC_FILTER_PRE, wrap_cc_filter_pre as *const () as usize, "cc_filter_pre");
-        wrap(VA_SDF_SOLVE, &ORIG_SDF_SOLVE, wrap_sdf_solve as *const () as usize, "sdf_solve");
-        wrap(VA_CAPS_SWEEP, &ORIG_CAPS_SWEEP, wrap_caps_sweep as *const () as usize, "caps_sweep");
-        wrap(VA_CULL_LOD, &ORIG_CULL_LOD, wrap_cull_lod as *const () as usize, "cull_lod");
+        wrap(
+            VA_CC_STEP,
+            &ORIG_CC_STEP,
+            wrap_cc_step as *const () as usize,
+            "cc_step",
+        );
+        wrap(
+            VA_FILL_CACHE,
+            &ORIG_FILL_CACHE,
+            wrap_fill_cache as *const () as usize,
+            "fill_cache",
+        );
+        wrap(
+            VA_CACHE_CB,
+            &ORIG_CACHE_CB,
+            wrap_cache_cb as *const () as usize,
+            "cache_cb",
+        );
+        wrap(
+            VA_RAYCAST,
+            &ORIG_RAYCAST,
+            wrap_raycast as *const () as usize,
+            "raycast",
+        );
+        wrap(
+            VA_SWEEP,
+            &ORIG_SWEEP,
+            wrap_sweep as *const () as usize,
+            "sweep",
+        );
+        wrap(
+            VA_OVERLAP,
+            &ORIG_OVERLAP,
+            wrap_overlap as *const () as usize,
+            "overlap",
+        );
+        wrap(
+            VA_FILTER_PRE,
+            &ORIG_FILTER_PRE,
+            wrap_filter_pre as *const () as usize,
+            "filter_pre",
+        );
+        wrap(
+            VA_FILTER_POST,
+            &ORIG_FILTER_POST,
+            wrap_filter_post as *const () as usize,
+            "filter_post",
+        );
+        wrap(
+            VA_CC_FILTER_PRE,
+            &ORIG_CC_FILTER_PRE,
+            wrap_cc_filter_pre as *const () as usize,
+            "cc_filter_pre",
+        );
+        wrap(
+            VA_SDF_SOLVE,
+            &ORIG_SDF_SOLVE,
+            wrap_sdf_solve as *const () as usize,
+            "sdf_solve",
+        );
+        wrap(
+            VA_CAPS_SWEEP,
+            &ORIG_CAPS_SWEEP,
+            wrap_caps_sweep as *const () as usize,
+            "caps_sweep",
+        );
+        wrap(
+            VA_CULL_LOD,
+            &ORIG_CULL_LOD,
+            wrap_cull_lod as *const () as usize,
+            "cull_lod",
+        );
     }
 
     pub fn on_present(hwnd: usize, frame: u32) {
         if frame == 1 || !HOOKS_INSTALLED.load(Ordering::Acquire) {
             install_va_wrappers();
         }
-        let Some(cfg) = CFG.get() else { return };
+        let Some(cfg) = CFG.get() else {
+            return;
+        };
 
         let cc_calls = CC_CALLS.swap(0, Ordering::Relaxed);
         let cc_p9 = CC_P9_CALLS.swap(0, Ordering::Relaxed);
@@ -949,7 +1369,11 @@ mod cam_trace {
         let (cam_ptr, cam_pos, cam_dir) = {
             let live_cp = unsafe {
                 let slot = exe::ptr::<usize>(CAM_STATE_PTR_VA) as usize;
-                if in_pe_image(slot) { exe::rd::<usize>(slot) } else { 0 }
+                if in_pe_image(slot) {
+                    exe::rd::<usize>(slot)
+                } else {
+                    0
+                }
             };
             if live_cp != 0 {
                 unsafe {
@@ -1038,12 +1462,21 @@ mod cam_trace {
                             && !WALK_OVERRIDES_AUTOPLAY.swap(true, Ordering::Relaxed)
                         {
                             w::user32::input::native_key(w::user32::input::NativeKey {
-                                mac: 0x24, down: false, repeat: false, chars: Vec::new(),
+                                mac: 0x24,
+                                down: false,
+                                repeat: false,
+                                chars: Vec::new(),
                             });
                             w::user32::input::native_key(w::user32::input::NativeKey {
-                                mac: 0x31, down: false, repeat: false, chars: Vec::new(),
+                                mac: 0x31,
+                                down: false,
+                                repeat: false,
+                                chars: Vec::new(),
                             });
-                            w::misc::xinput1_4::backend_update(0, w::misc::xinput1_4::Gamepad::default());
+                            w::misc::xinput1_4::backend_update(
+                                0,
+                                w::misc::xinput1_4::Gamepad::default(),
+                            );
                         }
                         frame >= start && frame < end
                     }
@@ -1051,12 +1484,21 @@ mod cam_trace {
                         if st.active_cc_frames >= delay {
                             if !WALK_OVERRIDES_AUTOPLAY.swap(true, Ordering::Relaxed) {
                                 w::user32::input::native_key(w::user32::input::NativeKey {
-                                    mac: 0x24, down: false, repeat: false, chars: Vec::new(),
+                                    mac: 0x24,
+                                    down: false,
+                                    repeat: false,
+                                    chars: Vec::new(),
                                 });
                                 w::user32::input::native_key(w::user32::input::NativeKey {
-                                    mac: 0x31, down: false, repeat: false, chars: Vec::new(),
+                                    mac: 0x31,
+                                    down: false,
+                                    repeat: false,
+                                    chars: Vec::new(),
                                 });
-                                w::misc::xinput1_4::backend_update(0, w::misc::xinput1_4::Gamepad::default());
+                                w::misc::xinput1_4::backend_update(
+                                    0,
+                                    w::misc::xinput1_4::Gamepad::default(),
+                                );
                             }
                             let s = *st.started_frame.get_or_insert(frame);
                             frame >= s && frame < s.saturating_add(dur)
@@ -1071,7 +1513,11 @@ mod cam_trace {
                         mac: 0x0D, // VK_W
                         down: want_w,
                         repeat: false,
-                        chars: if want_w { vec![b'w' as u16] } else { Vec::new() },
+                        chars: if want_w {
+                            vec![b'w' as u16]
+                        } else {
+                            Vec::new()
+                        },
                     });
                     emit_line(&format!(
                         "walk_input frame={frame} W={}",
@@ -1137,12 +1583,24 @@ mod cam_trace {
                  swp={sweep_hits}/{sweep_calls} ovl={overlap_hits}/{overlap_calls} \
                  flt=({fp_nz}/{fp_calls},{fpost_calls},cc={ccfp_nz}/{ccfp_calls})",
                 if holding_w { 1 } else { 0 },
-                cam_pos[0], cam_pos[1], cam_pos[2],
-                cam_dir[0], cam_dir[1], cam_dir[2],
-                pin[0], pin[1], pin[2],
-                pout[0], pout[1], pout[2],
-                vin[0], vin[1], vin[2],
-                vout[0], vout[1], vout[2],
+                cam_pos[0],
+                cam_pos[1],
+                cam_pos[2],
+                cam_dir[0],
+                cam_dir[1],
+                cam_dir[2],
+                pin[0],
+                pin[1],
+                pin[2],
+                pout[0],
+                pout[1],
+                pout[2],
+                vin[0],
+                vin[1],
+                vin[2],
+                vout[0],
+                vout[1],
+                vout[2],
             ));
         }
 

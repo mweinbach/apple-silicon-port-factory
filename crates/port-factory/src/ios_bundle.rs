@@ -23,6 +23,7 @@ use crate::storage_opt::{
     optimize_game_assets, parse_manifest_storage_config, StorageOptOptions, StorageOptReport,
 };
 use anyhow::{bail, Context, Result};
+use port_manifest::GameManifest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -378,29 +379,14 @@ pub fn render_xcodegen_spec(
         game_toml.display()
     )];
     if let (Some(dir), Ok(text)) = (game_toml.parent(), fs::read_to_string(game_toml)) {
-        let mut in_ios = false;
-        for raw_line in text.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                in_ios = sec.trim().eq_ignore_ascii_case("ios");
-                continue;
-            }
-            if !in_ios {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("seed_file") {
-                    let val = v.trim().trim_matches('"').trim_matches('\'');
-                    if let Some((src_rel, _)) = val.split_once("->") {
-                        let seed = dir.join(src_rel.trim());
-                        if seed.is_file() {
-                            resources.push(format!(
-                                "      - path: \"{}\"\n        buildPhase: resources",
-                                seed.display()
-                            ));
-                        }
-                    }
-                }
+        let manifest = GameManifest::parse(&text);
+        for (src_rel, _) in &manifest.ios_seed_files {
+            let seed = dir.join(src_rel);
+            if seed.is_file() {
+                resources.push(format!(
+                    "      - path: \"{}\"\n        buildPhase: resources",
+                    seed.display()
+                ));
             }
         }
     }
@@ -470,50 +456,19 @@ targets:
     )
 }
 
-#[derive(Default)]
-struct SimpleManifest {
-    id: Option<String>,
-    name: Option<String>,
-    exe: Option<String>,
-}
-
-fn parse_simple_manifest(text: &str) -> SimpleManifest {
-    let mut out = SimpleManifest::default();
-    let mut section = String::new();
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = sec.trim().to_ascii_lowercase();
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else { continue };
-        let key = k.trim().to_ascii_lowercase();
-        let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        let qualified = if section.is_empty() { key } else { format!("{section}.{key}") };
-        match qualified.as_str() {
-            "id" | "app.id" => out.id = Some(val),
-            "name" | "app.name" => out.name = Some(val),
-            "exe" | "app.exe" => out.exe = Some(val),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn resolve_input(opts: &IosBundleOptions) -> Result<(PathBuf, PathBuf, String, Option<PathBuf>, SimpleManifest)> {
+fn resolve_input(opts: &IosBundleOptions) -> Result<(PathBuf, PathBuf, String, Option<PathBuf>, GameManifest)> {
     let src = fs::canonicalize(&opts.source)
         .with_context(|| format!("resolving source {}", opts.source.display()))?;
     let mut manifest_path = opts.manifest_override.clone();
-    let mut manifest = SimpleManifest::default();
+    let mut manifest = GameManifest::default();
+    let mut loaded_manifest = false;
 
     let (game_dir, primary_exe) = if src.is_file() {
         let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         if ext == "toml" {
             let text = fs::read_to_string(&src)?;
-            manifest = parse_simple_manifest(&text);
+            manifest = GameManifest::parse(&text);
+            loaded_manifest = true;
             manifest_path = Some(src.clone());
             let dir = src.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
             let exe_name = opts
@@ -545,7 +500,8 @@ fn resolve_input(opts: &IosBundleOptions) -> Result<(PathBuf, PathBuf, String, O
         }
         if let Some(ref mp) = manifest_path {
             if let Ok(text) = fs::read_to_string(mp) {
-                manifest = parse_simple_manifest(&text);
+                manifest = GameManifest::parse(&text);
+                loaded_manifest = true;
             }
         }
         let exe_name = opts.exe_override.clone().or_else(|| manifest.exe.clone());
@@ -584,10 +540,10 @@ fn resolve_input(opts: &IosBundleOptions) -> Result<(PathBuf, PathBuf, String, O
         bail!("source path does not exist: {}", src.display());
     };
 
-    if manifest.name.is_none() && manifest.exe.is_none() {
+    if !loaded_manifest {
         if let Some(ref mp) = manifest_path {
             if let Ok(text) = fs::read_to_string(mp) {
-                manifest = parse_simple_manifest(&text);
+                manifest = GameManifest::parse(&text);
             }
         }
     }
@@ -781,43 +737,30 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
     if let Some(ref src_m) = manifest_src {
         fs::copy(src_m, &bundled_manifest)
             .with_context(|| format!("copying manifest {}", src_m.display()))?;
-        if let (Some(src_dir), Ok(text)) = (src_m.parent(), fs::read_to_string(src_m)) {
-            let mut in_ios = false;
-            for raw_line in text.lines() {
-                let line = raw_line.split('#').next().unwrap_or("").trim();
-                if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                    in_ios = sec.trim().eq_ignore_ascii_case("ios");
-                    continue;
-                }
-                if !in_ios {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("seed_file") {
-                        let val = v.trim().trim_matches('"').trim_matches('\'');
-                        if let Some((src_rel, _)) = val.split_once("->") {
-                            let src_rel = src_rel.trim();
-                            let src_file = src_dir.join(src_rel);
-                            if src_file.is_file() {
-                                let dst_file = app_dir.join(src_rel);
-                                if let Some(parent) = dst_file.parent() {
-                                    let _ = fs::create_dir_all(parent);
-                                }
-                                fs::copy(&src_file, &dst_file).with_context(|| {
-                                    format!("copying iOS seed file {}", src_file.display())
-                                })?;
-                            }
-                        }
+        if let Some(src_dir) = src_m.parent() {
+            for (src_rel, _) in &parsed_manifest.ios_seed_files {
+                let src_file = src_dir.join(src_rel);
+                if src_file.is_file() {
+                    let dst_file = app_dir.join(src_rel);
+                    if let Some(parent) = dst_file.parent() {
+                        let _ = fs::create_dir_all(parent);
                     }
+                    fs::copy(&src_file, &dst_file).with_context(|| {
+                        format!("copying iOS seed file {}", src_file.display())
+                    })?;
                 }
             }
         }
     } else {
-        let win_dir = format!("C:\\\\Games\\\\{exec_name}");
-        let toml = format!(
-            "[app]\nid = \"{slug}\"\nname = \"{title}\"\nexe = \"{exe_rel}\"\nwin_dir = \"{win_dir}\"\n\n[runtime]\npreferred_base_retry = false\n"
-        );
-        fs::write(&bundled_manifest, toml)?;
+        let fallback_manifest = GameManifest {
+            id: Some(slug.clone()),
+            name: Some(title.clone()),
+            exe: Some(exe_rel.clone()),
+            win_dir: Some(format!("C:\\Games\\{exec_name}")),
+            preferred_base_retry: Some(false),
+            ..GameManifest::default()
+        };
+        fs::write(&bundled_manifest, fallback_manifest.to_toml())?;
     }
 
     // 2. Build (or reuse) `libport_loader.a` for the requested iOS target.
@@ -1409,7 +1352,7 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
     }
     if has_game_toml {
         if let Ok(text) = fs::read_to_string(&game_toml_path) {
-            let m = parse_simple_manifest(&text);
+            let m = GameManifest::parse(&text);
             if let Some(exe_rel) = m.exe {
                 bundled_exe_present = game_dir.join(&exe_rel).is_file();
                 if !bundled_exe_present {

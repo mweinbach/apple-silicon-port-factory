@@ -9,8 +9,6 @@
 #![cfg_attr(test, allow(linker_messages))]
 
 win64_abi::win64_mods! {
-    #[cfg(feature = "aw2-core")]
-    mod aw2_hooks;
     mod builtin_image;
     mod hooks;
     mod live_ctl;
@@ -23,7 +21,15 @@ win64_abi::win64_mods! {
 
 pub mod ios_host;
 
+/// Register any compiled-in optional [`x86_runtime::game_plugin::GamePlugin`] implementations.
+/// Idempotent (deduplicated by plugin ID).
+fn register_builtin_plugins() {
+    #[cfg(feature = "aw2-core")]
+    aw2_game::register_plugin();
+}
+
 pub fn run_cli() {
+    register_builtin_plugins();
     init_boot_log();
     if let Err(e) = real_main() {
         let msg = format!("port-runner fatal startup error: {e:#}");
@@ -46,7 +52,7 @@ struct Args {
     no_run: bool,
     no_avx: bool,
     no_builtin_overrides: bool,
-    no_aw2_hooks: bool,
+    no_game_hooks: bool,
     ops_report: bool,
     list_exports: bool,
     call_export: Option<String>,
@@ -67,7 +73,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-aw2-hooks] [--no-avx] [--audio-harness] [--diff-test] [-- ARGS...]\n\
+        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-game-hooks] [--no-avx] [--audio-harness] [--diff-test] [-- ARGS...]\n\
          \n\
            --manifest FILE         declarative game.toml manifest (default: auto-discover ../Resources/game.toml or $PORT_MANIFEST)\n\
            --game-dir DIR          game/library directory (default: bundled ../Resources/Game, $PORT_GAME_DIR / $AW2_GAME_DIR, or current dir)\n\
@@ -87,11 +93,11 @@ fn usage() -> ! {
            --list-exports          list exported functions of the target PE and exit\n\
            --call-export SYM       initialize target DLL/EXE and invoke export SYM (or #ORD) with optional integer/string args after `--`\n\
            --no-builtin-overrides  load real PE DLLs from directory instead of builtin overrides ($PORT_BUILTIN_OVERRIDES=0)\n\
-           --no-aw2-hooks          do not apply optional AW2 VA replacement hooks (automatic for non-AW2 binaries)\n\
+           --no-game-hooks         disable optional compiled-in game plugin hooks/replacements (alias: --no-aw2-hooks)\n\
            --trace                 log every call through an import (target `trace`)\n\
            --no-run                map + resolve only; report unresolved imports and exit\n\
            --no-avx                do not re-exec with ROSETTA_ADVERTISE_AVX=1\n\
-           --audio-harness         (aw2 feature) after CRT init, replace WinMain with the Wwise audio harness\n\
+           --audio-harness         enable plugin audio test harness when supported by the active game plugin\n\
            --diff-test             run differential tests (original vs Rust) and exit\n\
          \n\
          Env vars: PORT_AOT_DIR, PORT_BUILTIN_OVERRIDES, PORT_HEADLESS, PORT_SYMBOLS, PORT_AOT_DYLIB (legacy AW2_* aliases supported)\n\
@@ -107,7 +113,7 @@ fn default_game_dir() -> std::path::PathBuf {
     {
         return p.into();
     }
-    if let Some(bundled) = target::TargetManifest::bundled_game_dir() {
+    if let Some(bundled) = target::bundled_game_dir() {
         return bundled;
     }
     std::path::PathBuf::from(".")
@@ -121,7 +127,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
     let mut a = Args {
         manifest_path: None,
         game_dir: default_game_dir(),
-        exe: if cfg!(feature = "aw2-core") { "AlanWake2.exe".into() } else { String::new() },
+        exe: x86_runtime::game_plugin::primary_default_exe()
+            .unwrap_or_default()
+            .to_string(),
         pe_path: None,
         drive_c_dir: None,
         extra_mounts: Vec::new(),
@@ -129,7 +137,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         no_run: false,
         no_avx: false,
         no_builtin_overrides: false,
-        no_aw2_hooks: false,
+        no_game_hooks: false,
         ops_report: false,
         list_exports: false,
         call_export: None,
@@ -214,7 +222,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
             "--no-run" => a.no_run = true,
             "--no-avx" => a.no_avx = true,
             "--no-builtin-overrides" => a.no_builtin_overrides = true,
-            "--no-aw2-hooks" => a.no_aw2_hooks = true,
+            "--no-game-hooks" | "--no-aw2-hooks" => a.no_game_hooks = true,
             "--ops-report" => a.ops_report = true,
             "--list-exports" => a.list_exports = true,
             "--call-export" => a.call_export = Some(it.next().unwrap_or_else(|| usage())),
@@ -402,18 +410,22 @@ fn raise_fd_limit() {
 static BOOT_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 static BOOT_LOG_TEE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
-fn log_dir_path() -> std::path::PathBuf {
+fn log_dir_path_for(dir_name: &str) -> std::path::PathBuf {
     if let Some(d) = std::env::var_os("PORT_LOG_DIR")
         .or_else(|| std::env::var_os("AW2_LOG_DIR"))
         .filter(|s| !s.is_empty())
     {
         return d.into();
     }
-    let dir_name = win32_rt::config::app_config().log_dir_name;
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        return home.join("Library/Logs").join(&dir_name);
+        return home.join("Library/Logs").join(dir_name);
     }
-    std::path::PathBuf::from("/tmp").join(&dir_name)
+    std::path::PathBuf::from("/tmp").join(dir_name)
+}
+
+fn log_dir_path() -> std::path::PathBuf {
+    let dir_name = win32_rt::config::app_config().log_dir_name;
+    log_dir_path_for(&dir_name)
 }
 
 fn sysctl_str(name: &str) -> String {
@@ -493,18 +505,38 @@ fn show_startup_error_alert(msg: &str) {
 }
 
 fn init_boot_log() {
-    let manifest = target::TargetManifest::discover(None);
+    register_builtin_plugins();
+    let manifest = target::discover(None);
+    let boot_exe_norm = manifest
+        .as_ref()
+        .and_then(|m| m.exe.as_deref())
+        .or_else(|| x86_runtime::game_plugin::primary_default_exe())
+        .map(pe_image::normalize_dll_name)
+        .unwrap_or_default();
+    let boot_defaults = x86_runtime::game_plugin::find_plugin(
+        manifest.as_ref().and_then(|m| m.id.as_deref()),
+        &boot_exe_norm,
+    )
+    .map(|p| p.defaults());
     let log_file_name = manifest
         .as_ref()
         .and_then(|m| m.log_name.clone())
-        .unwrap_or_else(|| {
-            if cfg!(feature = "aw2-core") {
-                "AlanWake2.log".to_string()
-            } else {
-                "port-runner.log".to_string()
-            }
-        });
-    let log_dir = log_dir_path();
+        .or_else(|| {
+            boot_defaults
+                .map(|d| d.log_name.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "port-runner.log".to_string());
+    let log_dir_name = manifest
+        .as_ref()
+        .and_then(|m| m.log_dir.clone())
+        .or_else(|| {
+            boot_defaults
+                .map(|d| d.log_dir.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| win32_rt::config::app_config().log_dir_name);
+    let log_dir = log_dir_path_for(&log_dir_name);
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join(&log_file_name);
     let prev_name = format!("{}.prev.log", log_file_name.trim_end_matches(".log"));
@@ -581,7 +613,8 @@ fn init_boot_log() {
     let banner = manifest
         .as_ref()
         .and_then(|m| m.name.as_deref())
-        .unwrap_or(if cfg!(feature = "aw2-core") { "Alan Wake 2" } else { "port-runner" });
+        .or_else(|| boot_defaults.map(|d| d.app_name).filter(|s| !s.is_empty()))
+        .unwrap_or("port-runner");
     boot_log_line(&format!(
         "=== {banner} startup (pid={} ppid={} arch={} rosetta={} macOS={} ({}) model={} retry={:?}) ===",
         std::process::id(),
@@ -784,6 +817,7 @@ fn init_embedded_log() {
 }
 
 pub(crate) fn run_embedded(args: Args) -> anyhow::Result<()> {
+    register_builtin_plugins();
     init_embedded_log();
     run_with_args(args, true)
 }
@@ -792,6 +826,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use win32_rt as w;
 
+    register_builtin_plugins();
     anchor_static_aot_symbols();
     raise_fd_limit();
     if let Some(ref aot_in) = args.aot_to_o {
@@ -836,7 +871,10 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if let Some(ref dir) = args.aot_dir {
         std::env::set_var("PORT_AOT_DIR", dir);
     }
-    let manifest = target::TargetManifest::discover(args.manifest_path.as_deref());
+    let (manifest, manifest_dir) = match target::discover_with_path(args.manifest_path.as_deref()) {
+        Some((m, path)) => (Some(m), path.parent().map(|d| d.to_path_buf())),
+        None => (None, None),
+    };
     if let Some(m) = &manifest {
         if !args.explicit_exe {
             if let Some(exe) = &m.exe {
@@ -850,12 +888,20 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                 std::env::set_var("SteamGameId", app_id);
             }
         }
-        if let Some(ov) = &m.builtin_overrides {
-            if !ov.is_empty()
-                && std::env::var_os("PORT_BUILTIN_OVERRIDES").is_none()
-                && std::env::var_os("AW2_BUILTIN_OVERRIDES").is_none()
+        if let Some(aot_dir) = &m.aot_dir {
+            let trimmed = aot_dir.trim();
+            if !trimmed.is_empty()
+                && args.aot_dir.is_none()
+                && std::env::var_os("PORT_AOT_DIR").is_none()
+                && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
             {
-                std::env::set_var("PORT_BUILTIN_OVERRIDES", ov);
+                let p = std::path::PathBuf::from(trimmed);
+                let resolved = if p.is_relative() {
+                    manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
+                } else {
+                    p
+                };
+                std::env::set_var("PORT_AOT_DIR", resolved);
             }
         }
         if let Some(aot) = &m.aot_dylibs {
@@ -866,15 +912,6 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                 std::env::set_var("PORT_AOT_DYLIB", aot);
             }
         }
-        if m.v8_jitless == Some(true)
-            && std::env::var_os("PORT_V8_JITLESS").is_none()
-            && std::env::var_os("AW2_V8_JITLESS").is_none()
-        {
-            std::env::set_var("PORT_V8_JITLESS", "1");
-        }
-    }
-    if args.no_builtin_overrides {
-        std::env::set_var("PORT_BUILTIN_OVERRIDES", "0");
     }
     if args.prewarm_aot || args.prewarm_shaders || args.emit_static_o.is_some() {
         std::env::set_var("PORT_HEADLESS", "1");
@@ -910,11 +947,20 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
 
     let norm = pe_image::normalize_dll_name(&args.exe);
-    let is_aw2_exe = cfg!(feature = "aw2-core") && !args.no_aw2_hooks && norm.eq_ignore_ascii_case("alanwake2.exe");
+    let plugin = if args.no_game_hooks {
+        None
+    } else {
+        x86_runtime::game_plugin::find_plugin(
+            manifest.as_ref().and_then(|m| m.id.as_deref()),
+            &norm,
+        )
+    };
+    let plugin_defaults = plugin.map(|p| p.defaults());
     let preferred_base_retry = manifest
         .as_ref()
         .and_then(|m| m.preferred_base_retry)
-        .unwrap_or(is_aw2_exe);
+        .or_else(|| plugin_defaults.map(|d| d.preferred_base_retry))
+        .unwrap_or(false);
     if !embedded_host {
         ensure_avx_env(&args, preferred_base_retry);
     }
@@ -987,7 +1033,12 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     let display_name = manifest
         .as_ref()
         .and_then(|m| m.name.clone())
-        .unwrap_or_else(|| if is_aw2_exe { "Alan Wake 2".to_string() } else { exe_stem.clone() });
+        .or_else(|| {
+            plugin_defaults
+                .map(|d| d.app_name.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| exe_stem.clone());
     let game_win_dir = manifest
         .as_ref()
         .and_then(|m| m.win_dir.clone())
@@ -995,21 +1046,56 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     let computer_name = manifest
         .as_ref()
         .and_then(|m| m.computer_name.clone())
-        .unwrap_or_else(|| if is_aw2_exe { "AW2PORT".into() } else { "WIN64PORT".into() });
+        .or_else(|| {
+            plugin_defaults
+                .map(|d| d.computer_name.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "WIN64PORT".into());
+    let log_dir_name = manifest
+        .as_ref()
+        .and_then(|m| m.log_dir.clone())
+        .or_else(|| {
+            plugin_defaults
+                .map(|d| d.log_dir.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "Translator".into());
     let legacy_remedy_migration = manifest
         .as_ref()
         .and_then(|m| m.legacy_remedy_migration)
-        .unwrap_or(is_aw2_exe);
+        .or_else(|| plugin_defaults.map(|d| d.legacy_remedy_migration))
+        .unwrap_or(false);
+    let v8_jitless = manifest
+        .as_ref()
+        .and_then(|m| m.v8_jitless)
+        .or_else(|| plugin_defaults.map(|d| d.v8_jitless))
+        .unwrap_or(false);
     w::config::set_app_config(w::config::AppConfig {
         app_name: display_name,
         computer_name,
-        log_dir_name: if is_aw2_exe { "AW2Port".into() } else { "Translator".into() },
+        log_dir_name,
         legacy_remedy_migration,
     });
-    #[cfg(feature = "aw2-core")]
-    if is_aw2_exe {
-        aw2_game::register_aw2_runtime();
-        aw2_hooks::install();
+    if let Some(m) = &manifest {
+        w::middleware::configure_from_manifest(m);
+    }
+    let env_override: Option<String> = if args.no_builtin_overrides {
+        Some("0".to_string())
+    } else {
+        std::env::var("PORT_BUILTIN_OVERRIDES")
+            .or_else(|_| std::env::var("AW2_BUILTIN_OVERRIDES"))
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let plugin_dll_routes = plugin_defaults.map_or(&[][..], |d| d.dll_routes);
+    let routing = match &manifest {
+        Some(m) => m.routing_table(plugin_dll_routes, env_override.as_deref()),
+        None => port_manifest::GameManifest::default()
+            .routing_table(plugin_dll_routes, env_override.as_deref()),
+    };
+    if let Some(p) = plugin {
+        p.on_pre_load();
     }
     live_ctl::install();
     setup_filesystem(&game_dir, &game_win_dir, &args)?;
@@ -1030,7 +1116,13 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     unsafe { w::teb::set_process_parameters(&exe_win, &cmdline, &format!("{game_win_dir}\\"), w::process::env_block_w()) };
     w::teb::map_kuser_shared_data();
 
-    let l = loader::init(game_dir.clone(), game_win_dir.clone(), args.trace);
+    let l = loader::init_with_routing(
+        game_dir.clone(),
+        game_win_dir.clone(),
+        args.trace,
+        routing,
+        v8_jitless,
+    );
     signals::install_handlers();
     register_emu_profiler();
 
@@ -1078,17 +1170,12 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if is_aw2_exe {
-        #[cfg(feature = "aw2-core")]
-        {
-            let n = hooks::apply_registry(exe.base)?;
-            log::info!("{n} replacement hooks applied");
-        }
+    let active_replacements = plugin.and_then(|p| p.replacements());
+    if let Some(ref reps) = active_replacements {
+        let n = hooks::apply_registry(exe.base, reps)?;
+        log::info!("{n} replacement hooks applied");
     } else {
-        #[cfg(not(feature = "aw2-core"))]
         hooks::init_generic_hooks(exe.base);
-        #[cfg(feature = "aw2-core")]
-        hooks::install_try_thunk();
         if let Ok(aot_dylibs) =
             std::env::var("PORT_AOT_DYLIB").or_else(|_| std::env::var("AW2_AOT_DYLIB"))
         {
@@ -1243,28 +1330,25 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if args.diff_test {
-        let (pass, fail) = hooks::run_difftests();
+        let (pass, fail) = hooks::run_difftests(active_replacements.as_ref());
         log::info!("--diff-test: {pass} passed, {fail} failed");
         std::process::exit(if fail == 0 { 0 } else { 1 });
     }
     hooks::apply_probes(exe.base)?;
     hooks::start_reporter();
-    #[cfg(feature = "aw2-core")]
-    if args.audio_harness {
-        // CRT startup runs normally; WinMain (0x141856b20, called from
-        // __scrt_common_main_seh) is replaced by the audio test driver.
-        const WINMAIN: (usize, usize) = (0x1_4185_6b20, 0x1_4185_84de);
-        let at = exe.base + (WINMAIN.0 - 0x1_4000_0000);
-        hooks::install(at, Some(at + (WINMAIN.1 - WINMAIN.0)), w::audio::harness::winmain as *const () as usize, libc::PROT_READ | libc::PROT_EXEC)?;
-        log::info!("--audio-harness: WinMain @0x{at:x} -> win32_rt::audio::harness::winmain");
-    }
-    // AK API recorder (AW2_AK_RECORD=<trace.akt>; no-op when unset, AW2 exe only).
-    #[cfg(feature = "aw2-core")]
-    if is_aw2_exe {
-        w::audio::akrec::install_from_env(&mut |at, end, target| {
-            hooks::install(at, end, target, libc::PROT_READ | libc::PROT_EXEC).map(|p| p.trampoline).map_err(|e| e.to_string())
-        })
-        .map_err(anyhow::Error::msg)?;
+    if let Some(p) = plugin {
+        let mut install_fn = |at: usize, end: Option<usize>, target: usize| {
+            hooks::install(at, end, target, libc::PROT_READ | libc::PROT_EXEC)
+                .map(|patch| patch.trampoline)
+                .map_err(|e| e.to_string())
+        };
+        let mut ctx = x86_runtime::game_plugin::GamePostMapContext {
+            exe_base: exe.base,
+            preferred_exe_base: h.image_base,
+            audio_harness: args.audio_harness,
+            install_hook: &mut install_fn,
+        };
+        p.on_post_map(&mut ctx).map_err(anyhow::Error::msg)?;
     }
 
     aw2_debug_image_mapped(exe.base, exe.size);
@@ -1578,6 +1662,17 @@ mod tests {
         assert_eq!(b.aot_to_o, Some(std::path::PathBuf::from("/tmp/sample.aot")));
         assert_eq!(b.out_path, Some(std::path::PathBuf::from("/tmp/sample.aot.o")));
         assert_eq!(b.static_platform, "macos");
+    }
+
+    #[test]
+    fn parse_no_game_hooks_and_legacy_alias() {
+        let a = parse_args_from(["--no-game-hooks"].into_iter().map(String::from));
+        assert!(a.no_game_hooks);
+        let b = parse_args_from(["--no-aw2-hooks"].into_iter().map(String::from));
+        assert!(b.no_game_hooks);
+        let c = parse_args_from(["--no-builtin-overrides"].into_iter().map(String::from));
+        assert!(c.no_builtin_overrides);
+        assert!(!c.no_game_hooks);
     }
 
     #[test]

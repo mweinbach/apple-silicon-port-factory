@@ -12,5 +12,6 @@ path = "src/bin/port-factory.rs"
 anyhow.workspace = true
 bink2-codec.workspace = true
 pe-image.workspace = true
+port-manifest.workspace = true
 dxil-metal.workspace = true
 iced-x86.workspace = true

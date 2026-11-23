@@ -6,6 +6,7 @@ name = "Alan Wake 2"
 exe = "AlanWake2.exe"
 win_dir = "C:\\Games\\AlanWake2"
 log_name = "AlanWake2.log"
+log_dir = "AW2Port"
 computer_name = "AW2PORT"
 
 [runtime]
@@ -15,12 +16,22 @@ preferred_base_retry = true
 v8_jitless = true
 # Preserve saves from legacy ~/Library/Application Support/AW2Port/drive_c/users/*/AppData/Local/Remedy.
 legacy_remedy_migration = true
-# Builtin physx3_x64.dll stubs PxScene::raycast/sweep/overlap as no-op ret0; use the
-# game's shipping retail PhysX 3.4 DLLs via ARM64 JIT for real terrain/character collision.
-builtin_overrides = "-physx3_x64.dll,-physx3common_x64.dll,-physx3cooking_x64.dll,-pxfoundation_x64.dll"
 # Epic Launcher offline-mode user ID so EOS_EpicAccountId_FromString/IsValid succeeds
 # (required for gamepad InputContext binding) while keeping the Default-Epic-User save folder.
 args = "-epicuserid=Default-Epic-User"
+
+[middleware.physx]
+# Builtin physx3_x64.dll stubs PxScene::raycast/sweep/overlap as no-op ret0; use the
+# game's shipping retail PhysX 3.4 DLLs via ARM64 JIT for real terrain/character collision.
+version = "3.4"
+mode = "guest"
+
+[middleware.bink]
+version = "2"
+mode = "builtin"
+
+[middleware.eos]
+mode = "builtin"
 
 [storage]
 # Optional storage optimizer metadata (`port-factory optimize-assets` / `ios-bundle --optimize-storage`).

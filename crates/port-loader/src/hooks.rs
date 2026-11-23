@@ -59,8 +59,6 @@
 //! language handler ([`try_handler`]) claims matching MSVC C++ exceptions for
 //! Rust (docs/design/ADVICE_SEH.md §3.3).
 
-#![cfg_attr(not(feature = "aw2-core"), allow(dead_code))]
-
 use crate::thunks;
 use anyhow::{bail, Result};
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, FlowControl, Instruction, InstructionBlock};
@@ -69,7 +67,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const JMP_LEN: usize = 5;
-const PREFERRED_EXE_BASE: u64 = 0x1_4000_0000;
+static PREFERRED_EXE_BASE: AtomicU64 = AtomicU64::new(0x1_4000_0000);
 /// Bit tag on non-`x86_64` trampoline addresses so direct calls to `orig` in
 /// differential tests trap into `signals::handler` and execute the original
 /// guest `x86-64` instructions via `emu_run_with_xmm`.
@@ -682,8 +680,12 @@ pub fn install_ex(addr: usize, func_end: Option<usize>, dest: Dest, count: bool,
     Ok(Patch { at: addr, len: patch_len, trampoline: tramp, counter })
 }
 
+fn va_to_addr_with(exe_base: usize, preferred_base: u64, va: u64) -> usize {
+    (exe_base as i64 + (va as i64 - preferred_base as i64)) as usize
+}
+
 fn va_to_addr(exe_base: usize, va: u64) -> usize {
-    (exe_base as i64 + (va as i64 - PREFERRED_EXE_BASE as i64)) as usize
+    va_to_addr_with(exe_base, PREFERRED_EXE_BASE.load(Ordering::Relaxed), va)
 }
 
 /// `.pdata` lookup for an actual address: `Some((begin, end))` of the
@@ -795,14 +797,20 @@ fn temp_unpatch(token: usize) {
     }
 }
 
-/// Apply every replacement from the aw2-game registry to the mapped exe.
-#[cfg(feature = "aw2-core")]
-pub fn apply_registry(exe_base: usize) -> Result<usize> {
-    apply_registry_with(exe_base, &loader_lookup, libc::PROT_READ | libc::PROT_EXEC)
+/// Apply every replacement from a [`x86_runtime::game_plugin::ReplacementSet`] to the mapped exe.
+pub fn apply_registry(
+    exe_base: usize,
+    set: &x86_runtime::game_plugin::ReplacementSet,
+) -> Result<usize> {
+    apply_registry_with(exe_base, set, &loader_lookup, libc::PROT_READ | libc::PROT_EXEC)
 }
 
-#[cfg(feature = "aw2-core")]
-fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> Result<usize> {
+fn apply_registry_with(
+    exe_base: usize,
+    set: &x86_runtime::game_plugin::ReplacementSet,
+    lookup: FnLookup,
+    restore_prot: i32,
+) -> Result<usize> {
     let default_hook_shards = cfg!(not(target_arch = "x86_64"));
     let hook_shards = std::env::var_os("AW2_HOOK_SHARDS")
         .map_or(default_hook_shards, |v| v != "0")
@@ -817,23 +825,23 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
         .unwrap_or(u64::MAX);
     let has_va_filter = std::env::var_os("AW2_HOOK_MIN_VA").is_some()
         || std::env::var_os("AW2_HOOK_MAX_VA").is_some();
-    let is_special_abi = |va: u64| {
-        matches!(
-            va,
-            0x1_4183_53d0 | 0x1_4183_5480 | 0x1_4254_7700 | 0x1_4254_7720
-        )
-    };
+    let is_special_abi = |va: u64| set.special_abi_vas.contains(&va);
     let mut reps: Vec<&'static x86_runtime::registry_types::Replacement> = if hook_shards {
-        aw2_game::registry::all()
+        set.all
+            .iter()
+            .copied()
             .filter(|r| !is_special_abi(r.va))
             .filter(|r| (!has_va_filter && r.diff.is_some()) || (r.va >= min_va && r.va <= max_va))
             .collect()
     } else {
-        aw2_game::registry::base()
+        set.base
+            .iter()
+            .copied()
             .filter(|r| !is_special_abi(r.va) && r.va >= min_va && r.va <= max_va)
             .collect()
     };
     reps.sort_by_key(|r| r.va);
+    PREFERRED_EXE_BASE.store(set.preferred_exe_base, Ordering::Relaxed);
     x86_runtime::exe::set_aw2_registry_active(true);
     x86_runtime::exe::set_base(exe_base);
     EXE_BASE.store(exe_base, Ordering::Relaxed);
@@ -845,7 +853,7 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
         }
     }
     if std::env::var_os("AW2_HOOK_LINT").is_some_and(|v| v != "0") {
-        hook_lint();
+        hook_lint(set);
     }
     install_try_thunk();
     x86_runtime::exe::set_trampoline_lookup(trampoline_for);
@@ -856,10 +864,12 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (lookup, restore_prot, build_shim, place_shim, hook_va);
+        let pref = set.preferred_exe_base;
+        let iat_window_end = pref.saturating_add(0x0300_0000);
         let is_unverified_iat_thunk = |r: &x86_runtime::registry_types::Replacement| -> bool {
             r.diff.is_none()
-                && (0x1_4000_0000..0x1_4300_0000).contains(&r.va)
-                && unsafe { x86_runtime::exe::rd::<u16>(va_to_addr(exe_base, r.va)) == 0x25ff }
+                && (pref..iat_window_end).contains(&r.va)
+                && unsafe { x86_runtime::exe::rd::<u16>(va_to_addr_with(exe_base, pref, r.va)) == 0x25ff }
         };
         let native_count = reps
             .iter()
@@ -871,7 +881,7 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
                 .map(|r| (r.va, r.ptr as usize)),
         );
         for r in &reps {
-            let addr = va_to_addr(exe_base, r.va);
+            let addr = va_to_addr_with(exe_base, pref, r.va);
             record_trampoline(r.va, addr | ORIG_TRAMPOLINE_TAG);
         }
         let guest_jit = reps.iter().filter(|r| x86_runtime::simd_ops::is_aot_va_stub(r.ptr)).count();
@@ -886,7 +896,7 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
         log::info!(
             "registered {} compiled native replacement functions in VA dispatch table ({} total in shards, {} guest-JIT, {} import thunks routed to their targets: {} host, {} guest DLL)",
             native_count,
-            aw2_game::registry::count(),
+            set.total_count,
             guest_jit,
             thunks_host + thunks_guest,
             thunks_host,
@@ -901,8 +911,8 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
             || std::env::var_os("AW2_PROBE").is_some();
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let batched_span = if !reps.is_empty() && restore_prot != rwx {
-            let first_page = va_to_addr(exe_base, reps.first().unwrap().va) & !0xFFF;
-            let last_end = (va_to_addr(exe_base, reps.last().unwrap().va) + 64 + 0xFFF) & !0xFFF;
+            let first_page = va_to_addr_with(exe_base, set.preferred_exe_base, reps.first().unwrap().va) & !0xFFF;
+            let last_end = (va_to_addr_with(exe_base, set.preferred_exe_base, reps.last().unwrap().va) + 64 + 0xFFF) & !0xFFF;
             let span = last_end.saturating_sub(first_page);
             if span > 0 && unsafe { libc::mprotect(first_page as *mut libc::c_void, span, rwx) } == 0 {
                 Some((first_page, span))
@@ -917,7 +927,7 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
         let mut hooked_count = 0usize;
         let mut hook_err = None;
         for r in &reps {
-            let float_ret = aw2_game::registry::FLOAT_RETURN.contains(&r.va);
+            let float_ret = set.float_return_vas.contains(&r.va);
             let fence = FENCES && (fence_all || r.throws != x86_runtime::registry_types::Throws::No);
             let shim = place_shim(&build_shim(r.ptr as usize, float_ret, fence));
             let p = match hook_va(exe_base, r.va, r.name, Dest::Fixed(shim), count_hooks, lookup, loop_prot) {
@@ -958,19 +968,22 @@ fn apply_registry_with(exe_base: usize, lookup: FnLookup, restore_prot: i32) -> 
             return Err(e);
         }
         log::info!(
-            "hooked {} functions from aw2-game registry ({} fenced, {} total registered in shards)",
+            "hooked {} functions from game replacement registry ({} fenced, {} total registered in shards)",
             hooked_count,
             fenced_count,
-            aw2_game::registry::count()
+            set.total_count
         );
         Ok(hooked_count)
     }
 }
 
-/// Set up generic (non-AW2) exe hook state: patcher + try thunk + trampoline lookup.
-#[cfg(not(feature = "aw2-core"))]
+/// Set up generic exe hook state (when no plugin [`ReplacementSet`] is active):
+/// preferred base + patcher + try thunk + trampoline lookup.
 pub fn init_generic_hooks(exe_base: usize) {
-    let _ = (temp_patch, temp_unpatch, build_shim, place_shim);
+    let pref = x86_runtime::exe::preferred_base();
+    if pref != 0 {
+        PREFERRED_EXE_BASE.store(pref, Ordering::Relaxed);
+    }
     EXE_BASE.store(exe_base, Ordering::Relaxed);
     x86_runtime::difftest::set_patcher(temp_patch, temp_unpatch);
     install_try_thunk();
@@ -1088,7 +1101,7 @@ pub fn start_reporter() {
 
 /// Run every registry differential test (original via trampoline vs Rust).
 /// Returns (passed, failed). Entries without a `diff` function are skipped.
-pub fn run_difftests() -> (usize, usize) {
+pub fn run_difftests(set: Option<&x86_runtime::game_plugin::ReplacementSet>) -> (usize, usize) {
     // AOT translation caches for the mapped images (AW2_DLL_AOT / AW2_DLL_AOT_BUILD).
     x86_runtime::emu::aot_activate();
     let _ = win32_rt::teb::map_kuser_shared_data();
@@ -1106,7 +1119,6 @@ pub fn run_difftests() -> (usize, usize) {
         }
     }
     let (mut pass, mut fail) = (0, 0);
-    #[allow(unused_variables)]
     let diff_shards = std::env::var_os("AW2_DIFF_SHARDS").is_some_and(|v| v != "0");
     let diff_limit: usize = std::env::var("AW2_DIFF_LIMIT")
         .ok()
@@ -1116,8 +1128,7 @@ pub fn run_difftests() -> (usize, usize) {
         .ok()
         .map(|s| s.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect())
         .unwrap_or_default();
-    #[cfg(feature = "aw2-core")]
-    {
+    if let Some(set) = set {
         let selected = |r: &x86_runtime::registry_types::Replacement| {
             only.is_empty()
                 || only.iter().any(|t| {
@@ -1125,7 +1136,7 @@ pub fn run_difftests() -> (usize, usize) {
                     u64::from_str_radix(&tv, 16).is_ok_and(|v| v == r.va) || r.name.to_ascii_lowercase().contains(t.as_str())
                 })
         };
-        for r in aw2_game::registry::all() {
+        for &r in &set.all {
             if pass + fail >= diff_limit {
                 break;
             }
@@ -1206,33 +1217,34 @@ pub fn run_difftests() -> (usize, usize) {
     // Exe guest-entry routing (`aw2_game::exe_route_diff`): import thunks and special-ABI CRT
     // helpers routed natively vs the exe's original x86 under the emulator.
     #[cfg(all(feature = "aw2-core", not(target_arch = "x86_64")))]
-    for d in aw2_game::exe_route_diff::difftests() {
-        if pass + fail >= diff_limit {
-            break;
-        }
-        if !only.is_empty() && !only.iter().any(|t| d.name.contains(t.as_str())) {
-            continue;
-        }
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (d.run)() }));
-        match res {
-            Ok(Ok(cases)) => {
-                log::info!("difftest ok   {} (exe route): {cases} cases (pass={})", d.name, pass + 1);
-                pass += 1;
+    if set.is_some() {
+        for d in aw2_game::exe_route_diff::difftests() {
+            if pass + fail >= diff_limit {
+                break;
             }
-            Ok(Err(e)) if e.starts_with(x86_runtime::difftest::SKIP) => log::warn!("difftest skip {}: {e}", d.name),
-            Ok(Err(e)) => {
-                log::error!("difftest FAIL {}: {e}", d.name);
-                fail += 1;
+            if !only.is_empty() && !only.iter().any(|t| d.name.contains(t.as_str())) {
+                continue;
             }
-            Err(_) => {
-                log::error!("difftest PANIC {}", d.name);
-                fail += 1;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (d.run)() }));
+            match res {
+                Ok(Ok(cases)) => {
+                    log::info!("difftest ok   {} (exe route): {cases} cases (pass={})", d.name, pass + 1);
+                    pass += 1;
+                }
+                Ok(Err(e)) if e.starts_with(x86_runtime::difftest::SKIP) => log::warn!("difftest skip {}: {e}", d.name),
+                Ok(Err(e)) => {
+                    log::error!("difftest FAIL {}: {e}", d.name);
+                    fail += 1;
+                }
+                Err(_) => {
+                    log::error!("difftest PANIC {}", d.name);
+                    fail += 1;
+                }
             }
         }
     }
-    #[cfg(feature = "aw2-core")]
-    {
-        let lint_errors = hook_lint().errors;
+    if let Some(set) = set {
+        let lint_errors = hook_lint(set).errors;
         if lint_errors > 0 {
             log::error!("difftest: hook-lint reported {lint_errors} error(s) (logged at hook time), counted as failures");
             fail += lint_errors;
@@ -1261,6 +1273,8 @@ const TRY_CALL: bool = true;
 
 #[cfg(feature = "aw2-core")]
 const THROWS_TSV: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../db/throws.tsv"));
+#[cfg(not(feature = "aw2-core"))]
+const THROWS_TSV: &str = "";
 
 // Mask bits from tools/fndb/canthrow.py.
 const T_CXX: u32 = 1;
@@ -1359,46 +1373,54 @@ struct LintSummary {
     warnings: usize,
 }
 
-/// Lint the registry once (cached) and log the findings. Errors are logged as warnings here
-/// (dev boots keep going); [`run_difftests`] turns them into failures.
-#[cfg(feature = "aw2-core")]
-fn hook_lint() -> LintSummary {
-    static ONCE: std::sync::OnceLock<LintSummary> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| {
-        let facts = parse_throws_tsv(THROWS_TSV);
-        let mut s = LintSummary::default();
-        for r in aw2_game::registry::all() {
-            let Some(f) = facts.get(&r.va) else {
-                log::warn!("hook-lint {} @0x{:x}: no row in db/throws.tsv (run tools/fndb.sh sync)", r.name, r.va);
-                s.warnings += 1;
-                continue;
-            };
-            for (lvl, msg) in lint_rule(r.throws, f) {
-                match lvl {
-                    LintLevel::Error => {
-                        log::warn!("hook-lint ERROR {} @0x{:x}: {msg} (fails --diff-test)", r.name, r.va);
-                        s.errors += 1;
-                    }
-                    LintLevel::Warn => {
-                        if r.diff.is_some() {
-                            log::warn!("hook-lint {} @0x{:x}: {msg}", r.name, r.va);
-                        } else {
-                            log::debug!("hook-lint {} @0x{:x}: {msg}", r.name, r.va);
-                        }
-                        s.warnings += 1;
-                    }
-                    LintLevel::Debug => log::debug!("hook-lint {} @0x{:x}: {msg}", r.name, r.va),
+fn hook_lint_with_tsv(
+    set: &x86_runtime::game_plugin::ReplacementSet,
+    tsv: &'static str,
+) -> LintSummary {
+    if tsv.is_empty() {
+        log::info!("hook-lint: no throws table embedded; skipping");
+        return LintSummary::default();
+    }
+    let facts = parse_throws_tsv(tsv);
+    let mut s = LintSummary::default();
+    for &r in &set.all {
+        let Some(f) = facts.get(&r.va) else {
+            log::warn!("hook-lint {} @0x{:x}: no row in db/throws.tsv (run tools/fndb.sh sync)", r.name, r.va);
+            s.warnings += 1;
+            continue;
+        };
+        for (lvl, msg) in lint_rule(r.throws, f) {
+            match lvl {
+                LintLevel::Error => {
+                    log::warn!("hook-lint ERROR {} @0x{:x}: {msg} (fails --diff-test)", r.name, r.va);
+                    s.errors += 1;
                 }
+                LintLevel::Warn => {
+                    if r.diff.is_some() {
+                        log::warn!("hook-lint {} @0x{:x}: {msg}", r.name, r.va);
+                    } else {
+                        log::debug!("hook-lint {} @0x{:x}: {msg}", r.name, r.va);
+                    }
+                    s.warnings += 1;
+                }
+                LintLevel::Debug => log::debug!("hook-lint {} @0x{:x}: {msg}", r.name, r.va),
             }
         }
-        log::info!(
-            "hook-lint: {} replacements, {} error(s), {} warning(s) (fences: {FENCES}, try_call: {TRY_CALL})",
-            aw2_game::registry::count(),
-            s.errors,
-            s.warnings
-        );
-        s
-    })
+    }
+    log::info!(
+        "hook-lint: {} replacements, {} error(s), {} warning(s) (fences: {FENCES}, try_call: {TRY_CALL})",
+        set.total_count,
+        s.errors,
+        s.warnings
+    );
+    s
+}
+
+/// Lint the registry once (cached) and log the findings. Errors are logged as warnings here
+/// (dev boots keep going); [`run_difftests`] turns them into failures.
+fn hook_lint(set: &x86_runtime::game_plugin::ReplacementSet) -> LintSummary {
+    static ONCE: std::sync::OnceLock<LintSummary> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| hook_lint_with_tsv(set, THROWS_TSV))
 }
 
 #[cfg(test)]
@@ -1621,7 +1643,7 @@ mod tests {
     /// Hooks every registry replacement in a minimally mapped AlanWake2.exe
     /// and runs the differential tests (original trampoline vs Rust).
     /// Skipped when the game is not installed.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "aw2-core", target_arch = "x86_64"))]
     #[test]
     fn registry_difftests_against_exe() {
         let Some(dir) = std::env::var_os("PORT_GAME_DIR")
@@ -1644,8 +1666,12 @@ mod tests {
             let f = pe_image::find_runtime_function(&pdata, rva)?;
             Some((base + f.begin_rva as usize, base + f.end_rva as usize))
         };
-        let n = apply_registry_with(base, &lookup, RWX).unwrap();
-        let (pass, fail) = run_difftests();
+        aw2_game::register_plugin();
+        let reps = x86_runtime::game_plugin::find_plugin(Some("alan-wake-2"), "alanwake2.exe")
+            .and_then(|p| p.replacements())
+            .expect("aw2 replacements");
+        let n = apply_registry_with(base, &reps, &lookup, RWX).unwrap();
+        let (pass, fail) = run_difftests(Some(&reps));
         eprintln!("difftests: {n} hooks, {pass} passed, {fail} failed");
         assert_eq!(fail, 0, "differential tests failed (see log)");
     }
@@ -2015,11 +2041,37 @@ mod tests {
         assert_eq!(worst(Throws::Discard, &f(0, 0, "none")), Some(LintLevel::Warn));
     }
 
+    #[test]
+    fn hook_lint_generic_replacement_set() {
+        use x86_runtime::game_plugin::ReplacementSet;
+        use x86_runtime::registry_types::Replacement;
+
+        static OK_FN: Replacement = Replacement::draft(0x1_4000_1000, "demo::ok_fn", std::ptr::null());
+        static BAD_FN: Replacement = Replacement::draft(0x1_4000_2000, "demo::bad_fn", std::ptr::null());
+        let set = ReplacementSet {
+            base: vec![&OK_FN, &BAD_FN],
+            all: vec![&OK_FN, &BAD_FN],
+            total_count: 2,
+            float_return_vas: &[],
+            special_abi_vas: &[],
+            preferred_exe_base: 0x1_4000_0000,
+        };
+        let tsv = "va\tmask_direct\tmask_all\teh\twitness\n0x140001000\t0\t0\tnone\t\n0x140002000\t1\t1\tnone\tthrower\n";
+        let summary = hook_lint_with_tsv(&set, tsv);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.warnings, 0);
+        assert_eq!(hook_lint_with_tsv(&set, "").errors, 0);
+    }
+
     #[cfg(feature = "aw2-core")]
     #[test]
     fn hook_lint_registry_clean() {
+        aw2_game::register_plugin();
+        let reps = x86_runtime::game_plugin::find_plugin(Some("alan-wake-2"), "alanwake2.exe")
+            .and_then(|p| p.replacements())
+            .expect("aw2 replacements");
         let facts = parse_throws_tsv(THROWS_TSV);
-        for r in aw2_game::registry::all() {
+        for &r in &reps.all {
             let f = facts.get(&r.va).unwrap_or_else(|| panic!("0x{:x} {} missing from db/throws.tsv (tools/fndb.sh sync)", r.va, r.name));
             let errs: Vec<_> = lint_rule(r.throws, f).into_iter().filter(|(l, _)| *l == LintLevel::Error).collect();
             assert!(errs.is_empty(), "0x{:x} {}: {:?}", r.va, r.name, errs);

@@ -31,6 +31,7 @@ use crate::scanner::collect_pe_files;
 use crate::win32_db::{audit_pe_imports, Win32Database};
 use anyhow::{bail, Context, Result};
 use pe_image::{ExportTarget, Pe};
+use port_manifest::GameManifest;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
@@ -2050,7 +2051,7 @@ pub fn list_packaged_bundles(workspace_root: &Path) -> Vec<PackagedBundleInfo> {
 
             let game_exe = fs::read_to_string(res.join("game.toml"))
                 .ok()
-                .and_then(|s| parse_toml_string_field(&s, "app", "exe"))
+                .and_then(|s| GameManifest::parse(&s).exe)
                 .unwrap_or_default();
 
             let aot_modules = fs::read_dir(res.join("AotCache"))
@@ -2780,48 +2781,27 @@ pub fn generate_game_manifest_toml(
     exe_rel: &str,
     app_id: &str,
 ) -> String {
-    format!(
-        "[app]\nid = \"{ident_lower}\"\nname = \"{clean_title}\"\nexe = \"{exe_rel}\"\nwin_dir = \"C:\\\\Games\\\\{exec_ident}\"\nlog_name = \"{exec_ident}.log\"\nsteam_app_id = \"{app_id}\"\n\n[runtime]\naot_dir = \"AotCache\"\npreferred_base_retry = false\nv8_jitless = false\n",
-        ident_lower = exec_ident.to_ascii_lowercase(),
-        clean_title = clean_title.replace('\\', "\\\\").replace('"', "\\\""),
-        exe_rel = exe_rel.replace('\\', "\\\\").replace('"', "\\\""),
-        exec_ident = exec_ident,
-        app_id = app_id.replace('\\', "\\\\").replace('"', "\\\""),
-    )
-}
-
-fn parse_toml_string_field(content: &str, section: &str, key: &str) -> Option<String> {
-    let mut cur_section = String::new();
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            cur_section = sec.trim().to_string();
-            continue;
-        }
-        if cur_section != section {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == key {
-                let v = v.trim();
-                let v = v.split('#').next().unwrap_or(v).trim();
-                if let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    return Some(inner.replace("\\\\", "\\").replace("\\\"", "\""));
-                }
-            }
-        }
+    GameManifest {
+        id: Some(exec_ident.to_ascii_lowercase()),
+        name: Some(clean_title.to_string()),
+        exe: Some(exe_rel.to_string()),
+        win_dir: Some(format!("C:\\Games\\{exec_ident}")),
+        log_name: Some(format!("{exec_ident}.log")),
+        steam_app_id: Some(app_id.to_string()),
+        aot_dir: Some("AotCache".to_string()),
+        preferred_base_retry: Some(false),
+        v8_jitless: Some(false),
+        ..GameManifest::default()
     }
-    None
+    .to_toml()
 }
 
 /// Look up a curated declarative manifest under `<workspace_root>/games/*/game.toml` matching
 /// `app_id` (when non-empty and not `"custom"`) or `exe_rel` / executable filename.
 ///
-/// Preserves curated `[runtime]` settings (e.g. `builtin_overrides`), updates `exe = "..."` to
-/// `exe_rel` if the bundled relative path differs, and ensures `aot_dir = "AotCache"` is set.
+/// Preserves curated `[runtime]`, `[middleware.*]`, `[dlls]`, `[storage]`, and `[ios]`
+/// sections, updates `exe = "..."` to `exe_rel` if the bundled relative path differs, and
+/// ensures `aot_dir = "AotCache"` is set.
 pub fn find_repo_game_manifest(
     workspace_root: &Path,
     app_id: &str,
@@ -2852,20 +2832,20 @@ pub fn find_repo_game_manifest(
         .and_then(|s| s.to_str())
         .unwrap_or(&want_exe_rel);
 
-    let mut matched_content: Option<String> = None;
+    let mut matched: Option<GameManifest> = None;
     for manifest_path in entries {
         let Ok(content) = fs::read_to_string(&manifest_path) else {
             continue;
         };
-        let m_app_id = parse_toml_string_field(&content, "app", "steam_app_id");
-        let m_exe = parse_toml_string_field(&content, "app", "exe");
+        let parsed = GameManifest::parse(&content);
 
         let by_id = want_app_id.is_some_and(|want| {
-            m_app_id
+            parsed
+                .steam_app_id
                 .as_deref()
                 .is_some_and(|got| got.eq_ignore_ascii_case(want))
         });
-        let by_exe = m_exe.as_deref().is_some_and(|got| {
+        let by_exe = parsed.exe.as_deref().is_some_and(|got| {
             let got_norm = got.replace('\\', "/");
             let got_name = Path::new(&got_norm)
                 .file_name()
@@ -2876,63 +2856,19 @@ pub fn find_repo_game_manifest(
         });
 
         if by_id || by_exe {
-            matched_content = Some(content);
+            matched = Some(parsed);
             if by_id {
                 break;
             }
         }
     }
 
-    let raw = matched_content?;
-    let has_aot_dir = parse_toml_string_field(&raw, "runtime", "aot_dir").is_some();
-    let escaped_exe = want_exe_rel.replace('\\', "\\\\").replace('"', "\\\"");
-
-    let mut out_lines: Vec<String> = Vec::new();
-    let mut cur_section = String::new();
-    let mut saw_runtime_section = false;
-    let mut injected_aot_dir = has_aot_dir;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if let Some(sec) = trimmed
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-        {
-            if cur_section == "runtime" && !injected_aot_dir {
-                out_lines.push("aot_dir = \"AotCache\"".to_string());
-                injected_aot_dir = true;
-            }
-            cur_section = sec.trim().to_string();
-            if cur_section == "runtime" {
-                saw_runtime_section = true;
-            }
-            out_lines.push(line.to_string());
-            continue;
-        }
-        if cur_section == "app" {
-            if let Some((k, _)) = trimmed.split_once('=') {
-                if k.trim() == "exe" {
-                    out_lines.push(format!("exe = \"{escaped_exe}\""));
-                    continue;
-                }
-            }
-        }
-        out_lines.push(line.to_string());
+    let mut manifest = matched?;
+    manifest.exe = Some(want_exe_rel);
+    if manifest.aot_dir.is_none() {
+        manifest.aot_dir = Some("AotCache".to_string());
     }
-
-    if !injected_aot_dir {
-        if !saw_runtime_section {
-            out_lines.push(String::new());
-            out_lines.push("[runtime]".to_string());
-        }
-        out_lines.push("aot_dir = \"AotCache\"".to_string());
-    }
-
-    let mut result = out_lines.join("\n");
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    Some(result)
+    Some(manifest.to_toml())
 }
 
 /// Copy portable Tier-1 shader caches (`ir*`, `manifest/`, `pso/pso_manifest/`) from `src_root`
@@ -4186,8 +4122,10 @@ pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
     let manifest_path = resources_dir.join("game.toml");
     if manifest_path.is_file() {
         let content = fs::read_to_string(&manifest_path).unwrap_or_default();
-        let exe_field = parse_toml_string_field(&content, "app", "exe").unwrap_or_default();
-        let overrides = parse_toml_string_field(&content, "runtime", "builtin_overrides")
+        let parsed = GameManifest::parse(&content);
+        let exe_field = parsed.exe.unwrap_or_default();
+        let overrides = parsed
+            .builtin_overrides
             .unwrap_or_else(|| "(none)".to_string());
         push(
             &mut checks,
@@ -5641,7 +5579,28 @@ Load command 10
         fs::create_dir_all(&game_dir).unwrap();
         fs::write(
             game_dir.join("game.toml"),
-            "[app]\nid = \"sample\"\nname = \"Sample\"\nexe = \"Sample.exe\"\nsteam_app_id = \"424242\"\n\n[runtime]\nbuiltin_overrides = \"-bink2w64.dll\"\n",
+            r#"[app]
+id = "sample"
+name = "Sample"
+exe = "Sample.exe"
+steam_app_id = "424242"
+
+[runtime]
+builtin_overrides = "-bink2w64.dll"
+
+[middleware.physx]
+version = "4.1"
+mode = "guest"
+
+[dlls]
+"nrd.dll" = "guest"
+
+[storage]
+keep_dlls = ["v8.dll"]
+
+[ios]
+seed_file = "ios.ini -> AppData/Local/Sample/ios.ini"
+"#,
         )
         .unwrap();
 
@@ -5650,6 +5609,13 @@ Load command 10
         assert!(adopted.contains("exe = \"Bin/Sample.exe\""));
         assert!(adopted.contains("builtin_overrides = \"-bink2w64.dll\""));
         assert!(adopted.contains("aot_dir = \"AotCache\""));
+        assert!(adopted.contains("[middleware.physx]"));
+        assert!(adopted.contains("version = \"4.1\""));
+        assert!(adopted.contains("\"nrd.dll\" = \"guest\""));
+        assert!(adopted.contains("[storage]"));
+        assert!(adopted.contains("\"v8.dll\""));
+        assert!(adopted.contains("[ios]"));
+        assert!(adopted.contains("ios.ini -> AppData/Local/Sample/ios.ini"));
 
         let by_exe = find_repo_game_manifest(&root.0, "custom", "Sample.exe")
             .expect("should match repo manifest by exe basename");

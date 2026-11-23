@@ -14,3 +14,9 @@ steam_app_id = "2357570"
 preferred_base_retry = false
 v8_jitless = false
 legacy_remedy_migration = false
+
+[middleware.steam]
+mode = "builtin"
+
+[middleware.dstorage]
+mode = "builtin"

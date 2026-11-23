@@ -8,6 +8,8 @@
 
 use anyhow::{Context, Result};
 use pe_image::{ImportName, Pe};
+pub use port_manifest::canonical_dll;
+use port_manifest::{detect_middleware_from_dlls, DetectedMiddleware};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
@@ -99,130 +101,6 @@ pub struct Win32ApiEntry {
     pub category: Win32Category,
     pub rust_path: String,
     pub source_file: String,
-}
-
-/// Wine-style DLL & Windows API-set canonicalizer.
-pub fn canonical_dll(dll: &str) -> String {
-    let n = pe_image::normalize_dll_name(dll);
-    if n.starts_with("api-ms-win-crt-") {
-        return "ucrtbase.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-registry-")
-        || n.starts_with("api-ms-win-service-")
-        || n.starts_with("api-ms-win-eventing-")
-        || n.starts_with("api-ms-win-security-")
-    {
-        return "advapi32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-com-") || n.starts_with("api-ms-win-core-winrt-") {
-        return "ole32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-version-") {
-        return "version.dll".into();
-    }
-    if n.starts_with("api-ms-win-shcore-") || n == "shcore.dll" {
-        return "user32.dll".into();
-    }
-    if n.starts_with("api-ms-win-core-")
-        || n.starts_with("api-ms-win-appmodel-")
-        || n == "kernelbase.dll"
-        || n == "psapi.dll"
-    {
-        return "kernel32.dll".into();
-    }
-    if n == "xinput1_3.dll"
-        || n == "xinput9_1_0.dll"
-        || n == "xinput1_2.dll"
-        || n == "xinput1_1.dll"
-    {
-        return "xinput1_4.dll".into();
-    }
-    if n == "xaudio2_9.dll" || n == "xaudio2_8.dll" || n == "xaudio2_7.dll" {
-        return "xaudio2_9redist.dll".into();
-    }
-    if n == "mediadecoders.windowsdesktop.dll" {
-        return "mediadecoders_windowsdesktop.dll".into();
-    }
-    if n == "cohtml.windowsdesktop.dll" {
-        return "cohtml_windowsdesktop.dll".into();
-    }
-    if n == "vulkan-1.dll" {
-        return "vulkan_1.dll".into();
-    }
-    if n == "d3dcompiler_43.dll" || n == "d3dcompiler_46.dll" {
-        return "d3dcompiler_47.dll".into();
-    }
-    if n == "mono-2.0-bdwgc.dll" || n == "mono.dll" || n == "mono-2.0-sgen.dll" {
-        return "mono_2_0_bdwgc.dll".into();
-    }
-    if n == "mscoreei.dll" {
-        return "mscoree.dll".into();
-    }
-    if n == "clr.dll" {
-        return "coreclr.dll".into();
-    }
-    if n == "steam_api.dll" {
-        return "steam_api64.dll".into();
-    }
-    if n == "dstoragecore.dll" {
-        return "dstorage.dll".into();
-    }
-    if n == "nvapi.dll" {
-        return "nvapi64.dll".into();
-    }
-    if n == "_nvngx.dll"
-        || n == "nvngx_dlssg.dll"
-        || n == "nvngx_dlssd.dll"
-        || n == "libxess.dll"
-        || n == "libxess_dx12.dll"
-    {
-        return "nvngx_dlss.dll".into();
-    }
-    if n == "fmod64.dll"
-        || n == "fmodstudio.dll"
-        || n == "fmodstudio64.dll"
-        || n == "openal32.dll"
-    {
-        return "fmod.dll".into();
-    }
-    if (n.starts_with("oo2core_") && n.ends_with(".dll"))
-        || n == "tbb12.dll"
-        || n == "tbb.dll"
-        || n == "tbbmalloc.dll"
-        || n == "zstd.dll"
-        || n == "libzstd.dll"
-        || n == "lz4.dll"
-    {
-        return "oo2core_9_win64.dll".into();
-    }
-    if n == "ffx_fsr3_x64.dll" || n == "ffx_fsr2_api_x64.dll" || n == "amd_fidelityfx_dx12.dll" {
-        return "amd_fidelityfx_loader_dx12.dll".into();
-    }
-    if n == "wsock32.dll" {
-        return "ws2_32.dll".into();
-    }
-    if n == "shlwapi.dll" {
-        return "shell32.dll".into();
-    }
-    if n == "comctl32.dll" {
-        return "uxtheme.dll".into();
-    }
-    if n == "sfc.dll" || n == "sfc_os.dll" || n == "tbs.dll" {
-        return "wintrust.dll".into();
-    }
-    if n == "cfgmgr32.dll" || n.starts_with("api-ms-win-devices-config-") {
-        return "setupapi.dll".into();
-    }
-    if n == "nvlowlatencyvk.dll" {
-        return "vulkan_1.dll".into();
-    }
-    if n == "sensapi.dll" || n == "wininet.dll" {
-        return "winhttp.dll".into();
-    }
-    if n == "userenv.dll" {
-        return "advapi32.dll".into();
-    }
-    n
 }
 
 /// Complete in-memory index of the Win32 API database.
@@ -425,6 +303,7 @@ pub struct Win32ImportAudit {
     pub resolved_win32: usize,
     pub resolved_by_category: BTreeMap<Win32Category, usize>,
     pub unresolved: Vec<(String, String)>,
+    pub detected_middleware: Vec<DetectedMiddleware>,
 }
 
 impl Win32ImportAudit {
@@ -435,6 +314,53 @@ impl Win32ImportAudit {
             (self.resolved_win32 as f64 * 100.0) / (self.total_imports as f64)
         }
     }
+
+    pub fn format_report(&self) -> String {
+        format_audit_report(self)
+    }
+}
+
+/// Format a [`Win32ImportAudit`] report, including resolved category counts,
+/// detected multi-version middleware, and unresolved imports.
+pub fn format_audit_report(audit: &Win32ImportAudit) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== Win32 Import Audit: {} ({}/{} resolved = {:.2}%) ===",
+        audit.binary_name,
+        audit.resolved_win32,
+        audit.total_imports,
+        audit.coverage_pct()
+    );
+    for (cat, cnt) in &audit.resolved_by_category {
+        let _ = writeln!(out, "  {:24} : {:>5}", cat.as_str(), cnt);
+    }
+    if !audit.detected_middleware.is_empty() {
+        let _ = writeln!(
+            out,
+            "  Detected Middleware ({}):",
+            audit.detected_middleware.len()
+        );
+        for mw in &audit.detected_middleware {
+            let _ = writeln!(
+                out,
+                "    {} ({}) v{} [default: {}] <- {}",
+                mw.family.display_name,
+                mw.family.id,
+                mw.version.version,
+                mw.family.default_mode.as_str(),
+                mw.matched_dlls.join(", ")
+            );
+        }
+    }
+    if !audit.unresolved.is_empty() {
+        let _ = writeln!(out, "  Unresolved ({}):", audit.unresolved.len());
+        for (dll, sym) in audit.unresolved.iter().take(200) {
+            let _ = writeln!(out, "    {dll}!{sym}");
+        }
+    }
+    out
 }
 
 /// Audit all regular and delay-load imports of a PE image against [`Win32Database`].
@@ -451,6 +377,7 @@ pub fn audit_pe_imports(
         resolved_win32: 0,
         resolved_by_category: BTreeMap::new(),
         unresolved: Vec::new(),
+        detected_middleware: Vec::new(),
     };
 
     let mut all_dlls = pe.imports().unwrap_or_default();
@@ -458,8 +385,10 @@ pub fn audit_pe_imports(
         all_dlls.extend(delay);
     }
 
+    let mut imported_dlls = Vec::with_capacity(all_dlls.len());
     for imp in all_dlls {
         let norm_dll = pe_image::normalize_dll_name(&imp.dll);
+        imported_dlls.push(norm_dll.clone());
         for ent in &imp.entries {
             audit.total_imports += 1;
             if let Some(hit) = db.resolve(&norm_dll, &ent.name) {
@@ -481,6 +410,8 @@ pub fn audit_pe_imports(
             audit.unresolved.push((norm_dll.clone(), ent.name.to_string()));
         }
     }
+    audit.detected_middleware =
+        detect_middleware_from_dlls(imported_dlls.iter().map(String::as_str));
     Ok(audit)
 }
 
@@ -772,4 +703,46 @@ fn parse_ordinals(src: &str) -> Vec<(u16, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_dll_matches_port_manifest_truth() {
+        assert_eq!(canonical_dll("libxess.dll"), "libxess.dll");
+        assert_eq!(canonical_dll("openal32.dll"), "openal32.dll");
+        assert_eq!(canonical_dll("tbb12.dll"), "tbbmalloc.dll");
+        assert_eq!(canonical_dll("libzstd.dll"), "zstd.dll");
+        assert_eq!(canonical_dll("lz4.dll"), "lz4.dll");
+        assert_eq!(canonical_dll("sspicli.dll"), "secur32.dll");
+    }
+
+    #[test]
+    fn format_audit_report_includes_detected_middleware() {
+        let mut resolved_by_category = BTreeMap::new();
+        resolved_by_category.insert(Win32Category::CoreOs, 12);
+        let audit = Win32ImportAudit {
+            binary_name: "Sample.exe".to_string(),
+            total_imports: 14,
+            resolved_win32: 12,
+            resolved_by_category,
+            unresolved: vec![("custom.dll".to_string(), "MissingFn".to_string())],
+            detected_middleware: detect_middleware_from_dlls([
+                "PhysX3_x64.dll",
+                "PxFoundation_x64.dll",
+                "nvngx_dlss.dll",
+            ]),
+        };
+
+        let report = format_audit_report(&audit);
+        assert!(report.contains("=== Win32 Import Audit: Sample.exe (12/14 resolved = 85.71%) ==="));
+        assert!(report.contains("CORE_OS"));
+        assert!(report.contains("Detected Middleware (2):"));
+        assert!(report.contains("NVIDIA PhysX (physx) v3.4 [default: guest] <- physx3_x64.dll, pxfoundation_x64.dll"));
+        assert!(report.contains("NVIDIA DLSS / Streamline (dlss) v2 [default: builtin] <- nvngx_dlss.dll"));
+        assert!(report.contains("Unresolved (1):"));
+        assert!(report.contains("custom.dll!MissingFn"));
+    }
 }

@@ -6,6 +6,7 @@ members = [
     "games/alan-wake-2/crates/aw2-data",
     "crates/dxil-metal",
     "crates/pe-image",
+    "crates/port-manifest",
     "crates/port-factory",
     "crates/win32-rt",
     "crates/x86-runtime",
@@ -33,6 +34,7 @@ aw2-data = { path = "games/alan-wake-2/crates/aw2-data" }
 # (`tools`); tools that want it (the CLI itself) enable it explicitly.
 dxil-metal = { path = "crates/dxil-metal", default-features = false }
 pe-image = { path = "crates/pe-image" }
+port-manifest = { path = "crates/port-manifest" }
 port-factory = { path = "crates/port-factory" }
 win32-rt = { path = "crates/win32-rt" }
 x86-runtime = { path = "crates/x86-runtime" }
