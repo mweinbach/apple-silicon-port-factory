@@ -207,6 +207,7 @@ Detailed step-by-step runbooks live in `.agents/skills/`:
 | `package-macos-and-ios` | Building & verifying portable macOS `.app` bundles, iOS `.app`/`.ipa` (static `.aot.o`), Steam ports, `optimize-assets`, and `ios/PortHost` |
 | `audio-and-windowing` | Working on AppKit/UIKit windowing & deadlock rules, raw input, gamepads/DualSense HID, WASAPI→CoreAudio, and `wwise-audio` |
 | `profile-and-verify` | Profiling boot/CPU/hitches/GPU passes and running pre-PR boundary, `cargo opsdb -- doctor`, and test gates |
+| `audit-repo-hygiene` | Auditing copyright/privacy hygiene, crate boundaries, Git LFS `db/*.tsv`, and zero-submodule cleanliness before PRs or pushes |
 | `decompile-function` | Bespoke Alan Wake 2 function decompilation under `games/alan-wake-2/crates/aw2-game` |
 
 ### Bringing up a new Windows game

@@ -1,16 +1,29 @@
 ---
 name: package-macos-and-ios
-description: Package, optimize storage for, sign, and verify self-contained macOS .app bundles, iOS/iPadOS .app or .ipa bundles (zero MAP_JIT static .aot.o), Steam game ports, external SSD exports, and ios/PortHost changes via port-factory. Use when running steam-port, steam-convert, bundle-verify, ios-bundle, ios-verify, aot-static-obj, optimize-assets, or editing ios/PortHost or bink2-codec.
+description: Package, optimize storage for, sign, deploy, and verify self-contained macOS .app bundles, iOS/iPadOS .app or .ipa bundles (zero MAP_JIT static .aot.o), physical iPhone/iPad devicectl installs, Steam game ports, external SSD exports, and ios/PortHost changes via port-factory. Use when running steam-port, steam-convert, bundle-verify, ios-bundle, ios-verify, aot-static-obj, optimize-assets, deploying to an iPhone/iPad, or editing ios/PortHost or bink2-codec.
 ---
 
 # Package Portable macOS `.app` & iOS `.app`/`.ipa` Bundles
 
-Never commit `.app/`, `.ipa`, game binaries/assets, signing certificates, or personal `/Users/`
-or `/Volumes/` paths.
+Never commit `.app/`, `.ipa`, game binaries/assets, signing profiles, or personal `/Users/<name>`
+or `/Volumes/` paths. Read [ios_device_and_storage.md](./references/ios_device_and_storage.md) for
+the full physical iPhone/iPad `xcodebuild` + `devicectl` deploy recipe, `ios/PortHost` C FFI
+table, multi-bank `.aot.o` linker rules, and `KB2v` HEVC container layout.
 
-## 1. macOS Portable `.app` & Steam Workflow
+## 1. Self-Contained Bundling Invariants (macOS & iOS)
 
-End-to-end Steam download → `.app` → verify → external SSD export:
+1. **Bundle all game binaries, DLLs, assets, manifests, and portable shaders inside the `.app`:**
+   - macOS: `<App>.app/Contents/Resources/{game.toml,Game/,AotCache/,ShaderCache/}`
+   - iOS (flat bundle): `<App>.app/{game.toml,Game/,ShaderCache/,Info.plist,PkgInfo}`
+   - Do **not** depend on ad-hoc `~/Documents/Game` mapping workarounds for packaged apps.
+2. **Keep bundle directories strictly read-only at runtime** so `codesign --verify --deep --strict`
+   never breaks after launch. Seed caches pass via `PORT_AOT_FALLBACK_DIR`,
+   `PORT_SHADER_CACHE_FALLBACK`, and `PORT_PSO_MANIFEST_FALLBACK`; all mutable saves/caches write
+   into the user container (`~/Translator` on macOS, `~/Library/Application Support/Translator` on iOS).
+3. **Never bundle host-specific `*.mtl4a` files** — ship portable `LC_UUID`-keyed Tier-1 `.aw2s` +
+   `pso_manifest/records.p2m` so cold devices prewarm their own GPU's `MTL4Archive` automatically.
+
+## 2. macOS Portable `.app` & Steam Workflow
 
 ```sh
 # One-time setup: install native ARM64 SteamRE/DepotDownloader
@@ -25,88 +38,65 @@ cargo opsdb -- steam-port <AppID_or_Title> --qr --copy-to /Volumes/MySSD
 cargo opsdb -- steam-convert /path/to/Game --format app --copy-game --max-fns 0 \
   --bundle-shader-cache --out out/apps/MyGame.app
 
-# Verify portability & export to SSD (also available via interactive UI: `cargo opsdb -- launcher`)
+# Verify portability & export to SSD (or launch interactive UI: `cargo opsdb -- launcher`)
 cargo opsdb -- bundles
 cargo opsdb -- bundle-verify out/apps/MyGame.app
 cargo opsdb -- bundle-export out/apps/MyGame.app /Volumes/MySSD
 ```
 
-### Critical macOS Portability Invariants
-- **`Contents/Resources/` MUST stay strictly read-only** so `codesign --verify --deep --strict`
-  never breaks after launch. Bundles pass seed paths via `PORT_AOT_FALLBACK_DIR`,
-  `PORT_SHADER_CACHE_FALLBACK`, and `PORT_PSO_MANIFEST_FALLBACK`, routing all writes to `$HOME`.
-- **Never bundle host-specific `*.mtl4a` files** — ship portable Tier-1 `.aw2s` (`LC_UUID`-keyed)
-  + `pso_manifest/records.p2m` so a new Mac prewarms its own GPU's `MTL4Archive` automatically.
-- **Self-contained `Contents/Frameworks/`:** Stage `libmetalirconverter.dylib` (plus optional
-  `libdxilconv.dylib` / `libMoltenVK.dylib`) with normalized `minos <= 15.x` and `@rpath` install
-  names, alongside release `port-runner` and `dxil-metald` under `Contents/MacOS/`.
-- **Cold Finder launch:** The native launcher must work under `env_clear()` with zero developer
-  environment variables set.
+- `Contents/Frameworks/` must stage `libmetalirconverter.dylib` (plus optional `libdxilconv.dylib`
+  / `libMoltenVK.dylib`) with normalized `minos <= 15.x` and `@rpath` install names alongside
+  release `port-runner` and `dxil-metald` in `Contents/MacOS/`, booting cleanly under `env_clear()`.
+- *(For the bespoke Alan Wake 2 macOS bundle, use `./scripts/package_app.sh [--copy-to ...]`.)*
 
-*(For the bespoke Alan Wake 2 `.app` bundle, use `./scripts/package_app.sh [--copy-to ...]`.)*
+## 3. iOS / iPadOS Zero-`MAP_JIT` `.app` / `.ipa` & Physical Device Deploy
 
-## 2. iOS / iPadOS Zero-`MAP_JIT` `.app` / `.ipa` Workflow
-
-Non-jailbroken iOS apps cannot map writable+executable `MAP_JIT` pages. All guest `.exe`/`.dll`
-code compiles offline on macOS into Apple-signed ARM64 Mach-O relocatable `.aot.o` objects
-(`crates/x86-runtime/src/emu/static_macho.rs`) linked straight into the signed `__TEXT` segment:
+Non-jailbroken iOS apps cannot map `MAP_JIT` pages. Compile every guest `.exe`/`.dll` offline on
+macOS into Apple-signed ARM64 Mach-O `.aot.o` objects (`x86-runtime/src/emu/static_macho.rs`)
+linked directly into signed `__TEXT`:
 
 ```sh
-# Build universal static library (target-cpu=apple-a14 / apple-m1 in .cargo/config.toml)
+# 1. Build universal runner + release iOS static library
+cargo runner-build
 IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo ios-lib       # target/aarch64-apple-ios/release/libport_loader.a
-IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo ios-sim-lib   # target/aarch64-apple-ios-sim/release/libport_loader.a
+# (Or `cargo ios-sim-lib` for Apple Silicon iOS Simulator)
 
-# Emit standalone signed static ARM64 .aot.o objects from a PE or v5 .aot cache
+# 2. Emit signed static ARM64 .aot.o objects (multi-bank GOT veneers, zero BRANCH26)
 cargo opsdb -- aot-static-obj /path/to/Game.exe --out out/ios-aot --platform ios
-# (or: cargo runner -- --pe /path/to/Game.exe --emit-static-o out/ios-aot --static-platform ios)
+# (or: cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game --emit-static-o out/ios-aot --static-platform ios)
 
-# One-command iOS device .ipa (+ optional XcodeGen project.yml) with storage optimization
+# 3. One-command iOS device .ipa (+ optional XcodeGen project.yml) or Simulator .app
 cargo opsdb -- ios-bundle /path/to/Game \
-  --target device \
-  --out out/ios/MyGame.ipa \
+  --target device --release \
   --manifest games/<id>/game.toml \
-  --release \
   --bundle-shader-cache \
   --optimize-storage high \
   --sign "Apple Development: ..." \
   --provisioning-profile /path/to/profile.mobileprovision \
-  --xcode-project
+  --out out/ios/MyGame.ipa --xcode-project
 
-# Apple Silicon iOS Simulator .app (fast local iteration)
-cargo opsdb -- ios-bundle /path/to/Game --target sim --out out/ios/MyGame.app
-
-# Verify iOS bundle (ARM64 iOS Mach-O platform tag, static AOT count, zero macOS leaks / .mtl4a bloat)
 cargo opsdb -- ios-verify out/ios/MyGame.ipa
+
+# 4. Install onto connected physical iPhone / iPad via devicectl
+xcrun devicectl list devices
+xcrun devicectl device install app --device <DEVICE_UDID> /path/to/MyGame.app
 ```
 
-### iOS Host & Flat Bundle Layout (`ios/PortHost/`)
-- Flat layout: `<App>.app/{game.toml, Game/, ShaderCache/, Info.plist, PkgInfo}` (first-launch
-  config seeding via `[ios] seed_file = "<bundle_rel> -> <drive_c_rel>"` in `game.toml`).
-- `ios/PortHost/` Swift files: `PortHostApp.swift`, `MetalSurfaceView.swift` (`CAMetalLayer` via
-  `port_ios_attach_surface`), `TouchOverlayView.swift` (virtual XInput slot 0 + touch-as-mouse),
-  `KeyboardBridge.swift` (`GCKeyboard` + `UIKeyInput` software keyboard), `PhoneHaptics.swift`
-  (`CHHapticEngine` Taptic Engine passthrough yielding to physical `GCDeviceHaptics`).
-- `crates/port-loader/src/ios_host.rs` and `ios/PortHost/PortHost-Bridging-Header.h` define the C
-  FFI boundary — keep signatures in exact lockstep when changing either side.
-- On iOS, `dxil-metal` runs in `BackendKind::CacheOnly` (all shaders must be precompiled on macOS
-  into `ShaderCache/`).
+Keep `crates/port-loader/src/ios_host.rs` and `ios/PortHost/PortHost-Bridging-Header.h` in exact
+lockstep when editing the Swift host. On iOS, `dxil-metal` runs in `BackendKind::CacheOnly` (all
+shaders must be precompiled on macOS into `ShaderCache/`).
 
-## 3. Universal Storage Optimization (`optimize-assets` & `bink2-codec`)
-
-Reduce footprint & iOS Jetsam VRAM on any Windows game directory (`crates/port-factory/src/storage_opt.rs`):
+## 4. Universal Storage Optimization (`optimize-assets` & `bink2-codec`)
 
 ```sh
 cargo opsdb -- optimize-assets /path/to/Game --out /path/to/Game_Opt \
   --manifest games/<id>/game.toml --profile compact --dry-run
 ```
 
-- **Profiles:** `none`, `lossless` (strip unused PC DLLs + language filter + archive slack),
-  `high` (+ 1080p `KB2v` hardware-HEVC VideoToolbox Bink2 + 2K lossless DDS mip cap), `compact`
-  (+ 720p `KB2v` HEVC + 1K DDS mip cap).
-- **Safety rules:** Unused PC DLL stripping always preserves DLLs compiled into static `.aot.o`,
-  negative `[runtime].builtin_overrides` entries (`-foo.dll`), and `[storage].keep_dlls`.
-- **Archive delegation:** Game-specific packed archives delegate via `[storage].archive_repacker`
-  + `archive_dir` in `game.toml` — never add game archive parsers into `crates/port-factory`.
+- **Profiles:** `none`, `lossless`, `high` (1080p `KB2v` VideoToolbox HEVC + 2K DDS mip cap),
+  `compact` (720p `KB2v` HEVC + 1K DDS mip cap).
+- Always preserves static `.aot.o` DLLs, negative `[runtime].builtin_overrides`, and
+  `[storage].keep_dlls`; delegates game-specific archive repacking via `[storage].archive_repacker`.
 
 ## Verification Checklist
 
@@ -118,5 +108,3 @@ cargo test -p bink2-codec --target aarch64-apple-darwin
 IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo ios-sim-lib
 cargo factory-test -- --test-threads=1
 ```
-
-See `ios/PortHost/README.md` and `docs/OPS_DB.md` for details.

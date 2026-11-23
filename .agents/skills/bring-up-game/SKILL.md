@@ -14,38 +14,37 @@ bypass kernel anti-cheat or DRM. Flag anti-cheat/DRM honestly.
 
 ## Step 1 — Audit the Game Install Offline
 
-Run the full factory audit battery on the user's legally owned Windows game directory before
-booting:
+Run the bundled 7-step offline audit script ([audit_game.sh](./scripts/audit_game.sh)) on the
+user's legally owned Windows game directory before booting:
 
 ```sh
-cargo opsdb -- scan /path/to/Game --record
-cargo opsdb -- win32-audit /path/to/Game
-cargo opsdb -- anticheat-audit /path/to/Game/Game.exe
-cargo opsdb -- dotnet-audit /path/to/Game
-cargo opsdb -- app-audit /path/to/Game/Game.exe
-cargo opsdb -- game-profiles /path/to/Game/Game.exe
-cargo opsdb -- runtime-audit /path/to/Game
+.agents/skills/bring-up-game/scripts/audit_game.sh /path/to/Game [MainGame.exe] [--record]
 ```
 
-What to look for:
+What to inspect in the output:
 - **Anti-cheat / DRM (`anticheat-audit`):** Kernel drivers (Vanguard, kernel EAC/BattlEye,
   Ricochet) or anti-tamper watchdogs must be reported honestly as blockers/caveats.
-- **Missing Win32/CRT/middleware exports (`win32-audit`):** Note unresolved DLLs/exports needed at
-  startup. Prefer letting real shipping compression/physics DLLs (`oo2core_*`, `zstd`, `lz4`,
-  `PhysX3*`) run on `x86-runtime` rather than stubbing them.
-- **Graphics API (`app-audit`):** Identify D3D12, D3D11 (needs `libdxilconv.dylib` for SM 4/5), or
-  Vulkan (needs `libMoltenVK.dylib`).
-- **Runtime hazards (`runtime-audit`):** Note `ldmxcsr`/FTZ/DAZ, x87, AVX narrowing, RWX/JIT code
-  (V8/Cohtml → set `v8_jitless = true`; .NET ReadyToRun → inspect with `dotnet-audit`).
-- **Steam installs:** If the game came from Steam, run `cargo opsdb -- steam-postinstall /path/to/Game`
-  to extract `installscript.vdf` registry keys and check `_CommonRedist`.
+- **Unresolved imports (`win32-audit`):** Identify missing startup DLLs/exports. Check
+  [game_toml_schema.md](./references/game_toml_schema.md) for which DLLs are overridden by native
+  ARM64 builtins (`BUILTIN_OVERRIDES`) vs run as retail PEs via ARM64 JIT (`PhysX3*`, `nrd.dll`,
+  compression DLLs `oo2core_*`/`zstd`).
+- **Graphics API (`app-audit`):** D3D12, D3D11 (needs `libdxilconv.dylib` for SM 4/5), or Vulkan
+  (needs `libMoltenVK.dylib`).
+- **.NET / Unity (`dotnet-audit`):** `win32-rt` includes a pure-Rust ECMA-335 CLR/CIL fallback
+  (`hostfxr`/`coreclr`/`mscoree`/`mono-2.0-bdwgc`) in addition to host `dlopen`; check for
+  ReadyToRun images (`--strip-r2r`).
+- **Runtime hazards (`runtime-audit`):** Note `ldmxcsr` FTZ/DAZ, x87, AVX 256→128 narrowing,
+  approx FP, `LOCK` atomics, or RWX/JIT code (V8/Cohtml → set `v8_jitless = true`).
+- **Steam installs:** Run `cargo opsdb -- steam-postinstall /path/to/Game` to extract
+  `installscript.vdf` registry keys and check `_CommonRedist`.
 
 ## Step 2 — Create `games/<id>/game.toml`
 
-Copy `games/_template/game.toml` to `games/<id>/game.toml` (also see `games/overwatch/game.toml`
-and `games/alan-wake-2/game.toml` for real examples).
+Copy `games/_template/game.toml` to `games/<id>/game.toml` (see `games/overwatch/game.toml`,
+`games/alan-wake-2/game.toml`, and the complete schema + `BUILTIN_OVERRIDES` table in
+[game_toml_schema.md](./references/game_toml_schema.md)).
 
-All keys parsed by `crates/port-loader/src/target.rs` and `crates/port-factory/src/storage_opt.rs`:
+Minimal template:
 
 ```toml
 [app]
@@ -61,25 +60,14 @@ computer_name = "WIN64PORT"
 preferred_base_retry = false
 v8_jitless = false
 legacy_remedy_migration = false
-# Prefix with `-` to force the game's shipping PE DLL via x86-runtime instead of a builtin:
-# builtin_overrides = "-physx3_x64.dll,-bink2w64.dll"
-# Or "0" to disable all builtin overrides for game-shipped DLLs.
+# Negate specific builtins with `-foo.dll` (or `"0"` for all) to run the game's retail PE via JIT:
+# builtin_overrides = "-physx3_x64.dll"
 # args = "-windowed"
-
-# Optional: for `optimize-assets` / `ios-bundle --optimize-storage`
-# [storage]
-# keep_dlls = ["custom_middleware.dll"]
-# archive_repacker = "..."
-# archive_dir = "..."
-
-# Optional: first-launch config files copied into drive_c on iOS if absent
-# [ios]
-# seed_file = "ios-config.ini -> AppData/Local/MyGame/settings.ini"
 ```
 
 ## Step 3 — Dry-Run Imports & Prewarm ARM64 `.aot` Cache
 
-Build the thin universal runner (~15 s, zero AW2 shards) and verify load-time imports + offline AOT:
+Build the thin universal runner (~15 s, zero AW2 shards) and precompile ARM64 `.aot` blocks:
 
 ```sh
 cargo runner-build
@@ -87,35 +75,31 @@ cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game --ops-r
 cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game --prewarm-aot
 ```
 
-- Override AOT thread count with `PORT_AOT_THREADS=<N>` or cache path with `--aot-dir <DIR>` /
-  `PORT_AOT_DIR`.
-- Check virtual path resolution without booting via `cargo opsdb -- vfs-resolve "<WIN_PATH>"`.
+- Control thread count with `PORT_AOT_THREADS=<N>` or cache directory with `--aot-dir` /
+  `PORT_AOT_DIR`. Test VFS mappings without booting via `cargo opsdb -- vfs-resolve "<WIN_PATH>"`.
 
 ## Step 4 — Boot & Triage Blockers One at a Time
 
-Start headless first for fast iteration, then windowed:
+Start headless first, then windowed:
 
 ```sh
 PORT_HEADLESS=1 cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game
-# Windowed interactive run:
 cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game
 ```
 
-Add `--trace` to log every resolved import call (`RUST_LOG=trace=info`). Check crash reports in
-`out/crash/crash-<pid>-<time>.txt` and hitch/stall logs in `out/hitch/hitch-<pid>.log`.
+Add `--trace` to log resolved imports (`RUST_LOG=trace=info`). Check `out/crash/crash-*.txt` and
+`out/hitch/hitch-*.log`. Route each blocker to the appropriate skill:
 
-Route each blocker to the right skill and crate:
-
-| Symptom | Next Skill & Action |
+| Symptom | Skill & Action |
 |---|---|
-| `UNIMPLEMENTED foo.dll!Bar` or broken Win32/COM/CRT call | Use `implement-win32-api` (`crates/win32-rt` + `cargo opsdb -- win32-sync`) |
-| Unhandled or hot `GENERIC_INTERP` x86 opcode | Use `implement-x86-op` (`crates/x86-runtime` + `cargo opsdb -- sync`) |
-| Wrong math, NaN physics/geometry, AOT/JIT crash, hang | Use `debug-runtime-and-nan` (`verify-x86`, `live-probe`, `bisect-runtime`, `nan-trace`) |
-| Shader conversion / PSO compile error or stutter | Use `shader-pipeline` (`crates/dxil-metal`, `dxil-metald`, `pso_manifest`) |
-| Metal validation error (`MTL_DEBUG_LAYER=1`), black frame, D3D11/D3D12/Vulkan bug | Use `graphics-metal4` (`crates/d3d12-metal`, `win32-rt/src/{d3d11,d3d12,misc/vulkan_1.rs}`) |
-| Window freeze, broken mouse/gamepad, silent/glitchy audio | Use `audio-and-windowing` (`win32-rt/src/{user32,macos,audio}`, `crates/wwise-audio`) |
+| `UNIMPLEMENTED foo.dll!Bar`, wrong ABI/COM/middleware behavior | `implement-win32-api` (`crates/win32-rt` + `cargo opsdb -- win32-sync`) |
+| Unhandled or hot `GENERIC_INTERP` x86 opcode | `implement-x86-op` (`crates/x86-runtime` + `cargo opsdb -- sync`) |
+| Wrong math, NaN physics/geometry, AOT/JIT crash, hang | `debug-runtime-and-nan` (`verify-x86`, `live-probe`, `bisect-runtime`, `nan-trace`) |
+| Shader conversion / `D3DCompile` / PSO stutter | `shader-pipeline` (`crates/dxil-metal`, `dxil-metald`, `d3dcompiler_47`) |
+| Metal validation error (`MTL_DEBUG_LAYER=1`), black frame, D3D11/D3D12/Vulkan/upscaler bug | `graphics-metal4` (`crates/d3d12-metal`, `win32-rt/src/{d3d11,d3d12,misc/vulkan_1.rs}`) |
+| Window freeze, broken mouse/gamepad/IME, silent/glitchy audio | `audio-and-windowing` (`win32-rt/src/{user32,macos,audio,misc/{fmod,xaudio2_9redist}}`) |
 
-Once the game renders frames, capture automated smoke verification with `live-probe`:
+Once frames render, capture repeatable smoke verification with `live-probe`:
 
 ```sh
 cargo opsdb -- live-probe \
@@ -132,10 +116,8 @@ cargo opsdb -- live-probe \
 ```sh
 cargo runner-build
 cargo factory-test -- --test-threads=1
-cargo opsdb -- doctor
+.agents/skills/audit-repo-hygiene/scripts/audit_repo_hygiene.sh --staged --doctor
 ```
 
-- Confirm `games/<id>/game.toml` contains zero personal paths or game binaries.
-- Package as a portable `.app` / `.ipa` using the `package-macos-and-ios` skill once playable.
-- Commit manifest cleanly as `games: add manifest for <title>` (and document honest status/caveats
-  in `docs/STATUS.md` / `docs/TODOS.md` if applicable).
+- Package as a self-contained macOS `.app` or iOS `.ipa` using `package-macos-and-ios` once playable.
+- Commit cleanly (`games: add manifest for <title>`) and record honest caveats in `docs/STATUS.md`.
