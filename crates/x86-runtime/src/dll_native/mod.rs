@@ -503,8 +503,11 @@ pub(crate) fn register_chkstk_vas(base: usize, size: usize, vas: &[u64]) {
 #[inline]
 pub fn is_dll_chkstk(va: u64) -> bool {
     use std::sync::atomic::Ordering;
-    let lo = CHKSTK_LO.load(Ordering::Acquire);
     let span = CHKSTK_SPAN.load(Ordering::Acquire);
+    if span == 0 {
+        return false;
+    }
+    let lo = CHKSTK_LO.load(Ordering::Acquire);
     if va.wrapping_sub(lo) >= span {
         return false;
     }
@@ -614,8 +617,11 @@ pub(crate) fn register_stack_pos_vas(base: usize, size: usize, vas: &[u64]) {
 #[inline]
 pub fn is_dll_stack_pos(va: u64) -> bool {
     use std::sync::atomic::Ordering;
-    let lo = STACK_POS_LO.load(Ordering::Acquire);
     let span = STACK_POS_SPAN.load(Ordering::Acquire);
+    if span == 0 {
+        return false;
+    }
+    let lo = STACK_POS_LO.load(Ordering::Acquire);
     if va.wrapping_sub(lo) >= span {
         return false;
     }

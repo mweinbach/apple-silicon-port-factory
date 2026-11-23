@@ -256,14 +256,22 @@ fn aot_stub_addrs(vbase: usize, o: &AotStubOffs) -> StubAddrs {
 }
 
 /// Translate the guest block at `ip` in AOT emission mode, as if placed at `vaddr` in an
-/// AOT region at `vbase` with stubs `offs`; `scratch` is reused between calls. None = not
-/// translatable (the JIT handles it at run time exactly as today).
-pub(super) unsafe fn aot_translate(bc: *mut BlockCache, ip: u64, vaddr: usize, vbase: usize, offs: &AotStubOffs, scratch: &mut Vec<u32>) -> Option<AotBlock> {
+/// AOT region at `vbase` with stubs `offs`; `scratch` and `tr_scratch` are reused between calls.
+/// None = not translatable (the JIT handles it at run time exactly as today).
+pub(super) unsafe fn aot_translate(
+    bc: *mut BlockCache,
+    ip: u64,
+    vaddr: usize,
+    vbase: usize,
+    offs: &AotStubOffs,
+    scratch: &mut Vec<u32>,
+    tr_scratch: &mut TrScratch,
+) -> Option<AotBlock> {
     if mem::in_jit(to_mapped_addr(ip)) {
         return None;
     }
     RESOLVE_REC.with(|r| *r.borrow_mut() = Some(Vec::new()));
-    let r = aot_translate_rec(bc, ip, vaddr, vbase, offs, scratch);
+    let r = aot_translate_rec(bc, ip, vaddr, vbase, offs, scratch, tr_scratch);
     let assume = RESOLVE_REC.with(|r| r.borrow_mut().take()).unwrap_or_default();
     r.map(|mut b| {
         b.assume = assume;
@@ -271,39 +279,48 @@ pub(super) unsafe fn aot_translate(bc: *mut BlockCache, ip: u64, vaddr: usize, v
     })
 }
 
-unsafe fn aot_translate_rec(bc: *mut BlockCache, ip: u64, vaddr: usize, vbase: usize, offs: &AotStubOffs, scratch: &mut Vec<u32>) -> Option<AotBlock> {
-    let p = prep_block(bc, ip)?;
+unsafe fn aot_translate_rec(
+    bc: *mut BlockCache,
+    ip: u64,
+    vaddr: usize,
+    vbase: usize,
+    offs: &AotStubOffs,
+    scratch: &mut Vec<u32>,
+    tr_scratch: &mut TrScratch,
+) -> Option<AotBlock> {
+    let p = prep_block_with(bc, ip, &mut tr_scratch.info_factory)?;
     let cap = MAX_BLOCK_BYTES / 4;
     scratch.clear();
     scratch.resize(cap, 0);
     let st = aot_stub_addrs(vbase, offs);
     let ops = &p.ops[..p.k];
-    let mut tr = new_tr(Asm::new(scratch.as_mut_ptr(), vaddr, cap), ops, &p, &st, true);
+    let mut tr = new_tr(Asm::new(scratch.as_mut_ptr(), vaddr, cap), ops, &p, &st, true, tr_scratch);
     let main = tr.translate(p.term, p.live_out);
     let cold_code_end = tr.cold_code_end as u32;
     let n = tr.a.pos;
     let overflow = tr.a.overflow;
-    let links = core::mem::take(&mut tr.links);
-    let link_conds = core::mem::take(&mut tr.link_conds);
-    let relocs = core::mem::take(&mut tr.relocs);
-    drop(tr);
     if overflow {
+        tr.return_scratch(tr_scratch);
         return None;
     }
     let words = scratch[..n].to_vec();
     // Every link site was bound to its out-of-line fallback (`Tr::translate`): recover it
     // from the site's imm26, and attach any hot conditional branch pointing at `site`.
-    let links = links
-        .into_iter()
-        .map(|(site, target)| {
+    let links = tr
+        .links
+        .iter()
+        .map(|&(site, target)| {
             let off = (((words[site] << 6) as i32) >> 6) as i64;
-            let cond = link_conds
+            let cond = tr
+                .link_conds
                 .iter()
                 .find(|&&(s, _)| s == site)
                 .map_or(u32::MAX, |&(_, c)| c as u32);
             (site as u32, (site as i64 + off) as u32, cond, target)
         })
         .collect();
+    let relocs = if tr.relocs.is_empty() { Vec::new() } else { tr.relocs.clone() };
+    tr.return_scratch(tr_scratch);
     Some(AotBlock {
         words,
         main: main as u32,

@@ -54,7 +54,7 @@ use super::BlockCache;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 
 use super::exec_mem::{alloc_jit, icache_invalidate, jit_writable, jit_write_protect};
 
@@ -104,6 +104,14 @@ fn prewarm_threads() -> usize {
     let default = std::thread::available_parallelism().map_or(1, |n| n.get());
     let raw = env_u32_any(&["PORT_AOT_THREADS", "AW2_DLL_AOT_THREADS"], 0) as usize;
     (if raw == 0 { default } else { raw }).clamp(1, 64)
+}
+
+/// Conservative worker-thread count for live background `.aot` builds (`PORT_AOT=2`),
+/// leaving plenty of headroom for active game threads while still parallelizing builds.
+fn bg_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let conservative = if cores > 1 { (cores / 2).clamp(2, 4) } else { 1 };
+    conservative.min(prewarm_threads()).max(1)
 }
 
 /// `PORT_AOT_JUMPTABLES` / `AW2_DLL_AOT_JUMPTABLES` (default 1): enable RIP-relative switch /
@@ -1569,6 +1577,7 @@ impl ChunkAssembler {
 
 /// Translate `ips` (sorted, deduplicated) in AOT emission mode into an image laid out for a
 /// region at `vbase`. Blocks the translator rejects are skipped (the JIT handles them).
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn build_image(bc: *mut BlockCache, ips: &[u64], vbase: usize) -> Option<Image> {
     build_image_with_limits(bc, ips, vbase, AOT_BANK_SPAN, MAX_CODE)
 }
@@ -1585,8 +1594,9 @@ unsafe fn build_image_with_limits(
     let mut img = Image { stubs: offs, ..Image::default() };
     let mut asm = ChunkAssembler::with_limits(bank_span, max_code);
     let mut scratch = Vec::new();
+    let mut tr_scratch = jit::TrScratch::new();
     for &ip in ips {
-        if let Some(b) = jit::aot_translate(bc, ip, vbase + PARALLEL_VOFF, vbase, &offs, &mut scratch) {
+        if let Some(b) = jit::aot_translate(bc, ip, vbase + PARALLEL_VOFF, vbase, &offs, &mut scratch, &mut tr_scratch) {
             if !asm.push(&mut img, &offs, ip, PARALLEL_VOFF, b) {
                 break;
             }
@@ -1670,6 +1680,7 @@ unsafe fn build_image_with_threads_and_limits(
                 .spawn_scoped(scope, move || {
                     let bcp: *mut BlockCache = &mut **local_bc;
                     let mut scratch = Vec::with_capacity(jit::AOT_MAX_BLOCK_BYTES / 4);
+                    let mut tr_scratch = jit::TrScratch::new();
                     let mut done: Vec<(usize, Vec<(u64, jit::AotBlock)>)> = Vec::new();
                     loop {
                         let ci = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -1686,6 +1697,7 @@ unsafe fn build_image_with_threads_and_limits(
                                 vbase,
                                 &offs,
                                 &mut scratch,
+                                &mut tr_scratch,
                             ) {
                                 out.push((ip, b));
                             }
@@ -4487,6 +4499,7 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
         }
         let mut vbc: Option<Box<BlockCache>> = None;
         let mut scratch = Vec::new();
+        let mut tr_scratch = jit::TrScratch::new();
         for (mi, bi, rw) in revive {
             for &(slot, h) in &rw {
                 (*(slot as *const AtomicU64)).store(h, Ordering::Relaxed);
@@ -4497,7 +4510,7 @@ unsafe fn revalidate_dir(d: &mut Dir) -> usize {
                 let bc = vbc.get_or_insert_with(|| Box::new(BlockCache::new()));
                 let bcp: *mut BlockCache = &mut **bc;
                 let bank_vbase = m.host_addr(m.img.bank_of_off(b.code_off));
-                if let Err(e) = verify_block(bcp, bank_vbase, &m.img, &b, &mut scratch) {
+                if let Err(e) = verify_block(bcp, bank_vbase, &m.img, &b, &mut scratch, &mut tr_scratch) {
                     log::warn!("emu aot: {}: revived block {:#x} fails verify: {e}", m.name, b.ip);
                     m.dead[bi].store(DEAD_PERM, Ordering::Release);
                     continue;
@@ -4655,13 +4668,20 @@ const SLOT_DISABLED: u64 = u64::MAX;
 
 /// Re-translate block `b` at its final address inside its stub bank (`bank_vbase`) and
 /// compare it with the image.
-unsafe fn verify_block(bc: *mut BlockCache, bank_vbase: usize, img: &Image, b: &BlockEnt, scratch: &mut Vec<u32>) -> Result<(), String> {
+unsafe fn verify_block(
+    bc: *mut BlockCache,
+    bank_vbase: usize,
+    img: &Image,
+    b: &BlockEnt,
+    scratch: &mut Vec<u32>,
+    tr_scratch: &mut jit::TrScratch,
+) -> Result<(), String> {
     let ho = b.code_off;
     let co = b.cold_off;
     let bank_off = img.bank_of_off(ho);
     let ho_rel = (ho - bank_off) as usize;
     let co_rel = (co - bank_off) as usize;
-    let Some(mut t) = jit::aot_translate(bc, b.ip, bank_vbase + ho_rel, bank_vbase, &img.stubs, scratch) else {
+    let Some(mut t) = jit::aot_translate(bc, b.ip, bank_vbase + ho_rel, bank_vbase, &img.stubs, scratch, tr_scratch) else {
         return Err("no longer translatable".into());
     };
     if t.words.len() != b.words as usize || t.main != b.main || t.guest != b.guest || t.host_entry != b.host_entry {
@@ -4801,6 +4821,7 @@ unsafe fn install_image(name: &str, base: usize, size: usize, img: Image, verify
         return None;
     };
     let region = p as usize;
+    let mut lse2_slots: Vec<usize> = Vec::with_capacity(nbanks);
     for bi in 0..nbanks {
         let rt_base = region + bank_rt_offs[bi];
         let bank_len = banks_snap[bi].1 - banks_snap[bi].0;
@@ -4811,7 +4832,9 @@ unsafe fn install_image(name: &str, base: usize, size: usize, img: Image, verify
         // Guard `b_reach` (±128 MiB) so `patch_lse2_unaligned` can reach every slot in the slab
         // from every instruction in this bank.
         if code_lo < code_hi && reach(code_lo, slab_hi) && reach(slab_hi, code_lo) {
-            jit::register_lse2_region(code_lo, code_hi, slab_lo, slab_hi);
+            if let Some(slot) = jit::register_lse2_region(code_lo, code_hi, slab_lo, slab_hi) {
+                lse2_slots.push(slot);
+            }
         }
     }
     let t0 = std::time::Instant::now();
@@ -4838,6 +4861,10 @@ unsafe fn install_image(name: &str, base: usize, size: usize, img: Image, verify
         let rt_base = region + bank_rt_offs[bi];
         if jit::aot_emit_stubs(rt_base as *mut u32, rt_base) != Some(m.img.stubs) {
             drop(w);
+            for slot in lse2_slots {
+                jit::unregister_lse2_region(slot);
+            }
+            super::exec_mem::free_jit(region as *mut u8, len);
             log::warn!("emu aot: {name}: shared stub layout differs from the cache (bank {bi}); ignored");
             return None;
         }
@@ -4915,6 +4942,7 @@ unsafe fn install_image(name: &str, base: usize, size: usize, img: Image, verify
         let mut bc = Box::new(BlockCache::new());
         let bcp: *mut BlockCache = &mut *bc;
         let mut scratch = Vec::new();
+        let mut tr_scratch = jit::TrScratch::new();
         for bi in 0..n {
             let b = m.img.blocks[bi];
             if m.dead[bi].load(Ordering::Relaxed) != 0 || m.slot_held[bi] || !verify.picks(b.ip) {
@@ -4922,7 +4950,7 @@ unsafe fn install_image(name: &str, base: usize, size: usize, img: Image, verify
             }
             verified += 1;
             let bank_vbase = m.host_addr(m.img.bank_of_off(b.code_off));
-            if let Err(e) = verify_block(bcp, bank_vbase, &m.img, &b, &mut scratch) {
+            if let Err(e) = verify_block(bcp, bank_vbase, &m.img, &b, &mut scratch, &mut tr_scratch) {
                 if bad_verify < 8 {
                     log::warn!("emu aot: {name}: verify mismatch in block {:#x}: {e}", b.ip);
                 }
@@ -5243,6 +5271,8 @@ struct BgJob {
 
 /// Pending jobs and whether the builder thread is running (both under this lock).
 static BG: Mutex<(Vec<BgJob>, bool)> = Mutex::new((Vec::new(), false));
+/// Wakes [`bg_main`] immediately when new jobs (e.g. late `LoadLibrary` install jobs) arrive.
+static BG_CV: Condvar = Condvar::new();
 
 /// A loaded cache is rebuilt for the next run when more than 1/`BG_STALE_DIV` of the
 /// module's profiled blocks, or more than `BG_STALE_MAX` of them, are not in it.
@@ -5278,9 +5308,13 @@ fn bg_job(name: &str, base: usize, size: usize, key: AotKey, loaded: Option<&[u6
 
 /// Queue `jobs` for the builder thread (started on demand; exits when the queue is empty).
 fn bg_enqueue(jobs: Vec<BgJob>) {
+    if jobs.is_empty() {
+        return;
+    }
     let mut g = BG.lock().unwrap_or_else(|e| e.into_inner());
     g.0.extend(jobs);
-    if g.1 || g.0.is_empty() {
+    if g.1 {
+        BG_CV.notify_one();
         return;
     }
     g.1 = true;
@@ -5293,42 +5327,44 @@ fn bg_enqueue(jobs: Vec<BgJob>) {
 }
 
 /// Builder thread: jobs whose result is installed now first (utility QoS); next-run
-/// rebuilds wait until [`bg_delay`] after the first activation and run at background QoS.
+/// rebuilds wait until [`bg_delay`] after the first activation (woken immediately via
+/// [`BG_CV`] if a late-loaded install job arrives) and run at background QoS.
 fn bg_main() {
-    let mut bc = Box::new(BlockCache::new());
-    let bcp: *mut BlockCache = &mut *bc;
+    let mut pool = WorkerCaches::new();
     let mut qos = 0;
     loop {
         let job = {
             let mut g = BG.lock().unwrap_or_else(|e| e.into_inner());
-            if g.0.is_empty() {
-                g.1 = false;
-                return;
+            loop {
+                if g.0.is_empty() {
+                    g.1 = false;
+                    return;
+                }
+                if let Some(i) = g.0.iter().position(|j| j.install) {
+                    break g.0.remove(i);
+                }
+                let wait = bg_wait();
+                if wait.is_zero() {
+                    break g.0.remove(0);
+                }
+                let (next_g, _) = BG_CV.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner());
+                g = next_g;
             }
-            match g.0.iter().position(|j| j.install) {
-                Some(i) => Some(g.0.remove(i)),
-                None if bg_wait().is_zero() => Some(g.0.remove(0)),
-                None => None,
-            }
-        };
-        let Some(job) = job else {
-            // Re-checked every second: an install job (late LoadLibrary) goes first.
-            std::thread::sleep(bg_wait().min(std::time::Duration::from_secs(1)));
-            continue;
         };
         let want = if job.install { QOS_CLASS_UTILITY } else { QOS_CLASS_BACKGROUND };
         if want != qos {
             set_qos(want);
             qos = want;
         }
-        unsafe { bg_build(bcp, job) };
+        unsafe { bg_build(&mut pool, job) };
     }
 }
 
-/// Build `job`'s module from its profile on this (background) thread; discard the result if
-/// the image's code changed since activation; write the cache (flagged for verification at
-/// its first load, [`FLAG_VERIFY_PENDING`]); install it if requested.
-unsafe fn bg_build(bcp: *mut BlockCache, job: BgJob) {
+/// Build `job`'s module from its profile on this (background) thread using a conservative
+/// thread pool (`bg_threads()`); discard the result if the image's code changed since
+/// activation; write the cache (flagged for verification at its first load,
+/// [`FLAG_VERIFY_PENDING`]); install it if requested.
+unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob) {
     let BgJob { name, base, size, key, install } = job;
     if super::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!("emu aot: {name}: overlaps run-time generated/modified code; skipping background AOT build");
@@ -5337,12 +5373,14 @@ unsafe fn bg_build(bcp: *mut BlockCache, job: BgJob) {
     let t0 = std::time::Instant::now();
     let prof = read_profile(&name, &key.image_hash);
     let depth = aot_closure_depth();
+    let bcp = pool.get_one();
     let (ips, _) = discover(bcp, base, size, &prof, depth);
     if super::mem::jit_overlaps(base, base.wrapping_add(size)) {
         log::info!("emu aot: {name}: became run-time modified during discovery; aborting background AOT build");
         return;
     }
-    let Some(img) = build_image(bcp, &ips, BUILD_VBASE) else {
+    let build_threads = if ips.len() >= PARALLEL_MIN_BLOCKS { bg_threads() } else { 1 };
+    let Some(img) = build_image_with_threads(pool, &ips, BUILD_VBASE, build_threads) else {
         log::error!("emu aot: {name}: shared stubs don't fit; not built");
         return;
     };

@@ -22,7 +22,9 @@ pub(super) struct JitScratch {
     pub ctx_ras_cell: usize,
     pub aot_dir: usize,
     pub aot_probe_hits: u64,
-    pub _pad_xmm: u16,
+    pub _pad_xmm: u8,
+    /// Maintain `Cpu::last_bits` in `fast::Cpu::rset` (mirrors `PORT_JIT_LAST_BITS`).
+    pub lb_on: u8,
     pub ymm_dirty: u16,
     pub mxcsr: u32,
 }
@@ -46,6 +48,7 @@ impl Default for JitScratch {
             aot_dir: 0,
             aot_probe_hits: 0,
             _pad_xmm: 0,
+            lb_on: 1,
             ymm_dirty: 0,
             mxcsr: 0x1F80,
         }
@@ -96,6 +99,11 @@ impl JitCache {
     #[allow(dead_code)]
     #[inline(always)]
     pub(super) unsafe fn cache_qpc_host(_table: usize, _target: u64, _qpc_state: usize) {}
+
+    #[inline(always)]
+    pub(super) unsafe fn lookup_fast_hit(&self, _ip: u64) -> Option<usize> {
+        None
+    }
 
     #[inline(always)]
     pub(super) unsafe fn lookup(&mut self, _ip: u64, _bc: *mut BlockCache) -> Option<usize> {

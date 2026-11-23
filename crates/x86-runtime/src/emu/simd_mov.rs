@@ -114,9 +114,9 @@ pub(super) mod vops {
     pub(in crate::emu) fn store_vec_dst(cpu: &mut Cpu, ins: &Instruction, d: usize, ymm: bool, lo: u128, hi: u128) {
         cpu.xmm[d] = lo;
         if ymm {
-            cpu.ymm_hi[d] = hi;
+            cpu.set_ymm_hi(d, hi);
         } else if Cpu::is_vex(ins) {
-            cpu.ymm_hi[d] = 0;
+            cpu.clear_ymm_hi_reg(d);
         }
     }
 
@@ -2772,7 +2772,7 @@ impl Cpu {
                         }
                     };
                     cpu.xmm[d] = pick(imm & 0xF);
-                    cpu.ymm_hi[d] = pick((imm >> 4) & 0xF);
+                    cpu.set_ymm_hi(d, pick((imm >> 4) & 0xF));
                 }
             }
             Mnemonic::Vinsertf128 | Mnemonic::Vinserti128 => {
@@ -2784,10 +2784,10 @@ impl Cpu {
                     let hi = cpu.ymm_hi[s1];
                     if imm == 0 {
                         cpu.xmm[d] = inserted;
-                        cpu.ymm_hi[d] = hi;
+                        cpu.set_ymm_hi(d, hi);
                     } else {
                         cpu.xmm[d] = lo;
-                        cpu.ymm_hi[d] = inserted;
+                        cpu.set_ymm_hi(d, inserted);
                     }
                 }
             }
@@ -2799,7 +2799,7 @@ impl Cpu {
                     OpKind::Register => {
                         if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
                             cpu.xmm[d] = val;
-                            cpu.ymm_hi[d] = 0;
+                            cpu.clear_ymm_hi_reg(d);
                         }
                     }
                     OpKind::Memory => {
@@ -2957,7 +2957,7 @@ impl Cpu {
                     let s2_lo = vops::xmm_idx_fast(ins.op_register(s2_op)).map_or(0, |i| cpu.xmm[i] & 0xFFFF_FFFF_FFFF_FFFF);
                     cpu.xmm[d] = (cpu.xmm[s1_idx] & 0xFFFF_FFFF_FFFF_FFFF) | (s2_lo << 64);
                     if mn == Mnemonic::Vmovlhps {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }
@@ -2971,7 +2971,7 @@ impl Cpu {
                     let s2_hi = vops::xmm_idx_fast(ins.op_register(s2_op)).map_or(0, |i| cpu.xmm[i] >> 64);
                     cpu.xmm[d] = (cpu.xmm[s1_idx] & !0xFFFF_FFFF_FFFF_FFFFu128) | s2_hi;
                     if mn == Mnemonic::Vmovhlps {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }
@@ -3016,14 +3016,14 @@ impl Cpu {
                                 cpu.xmm[d]
                             };
                             cpu.xmm[d] = (hi & !0xFFFF_FFFF_FFFF_FFFF) | (cpu.xmm[s] & 0xFFFF_FFFF_FFFF_FFFF);
-                            cpu.ymm_hi[d] = 0;
+                            cpu.clear_ymm_hi_reg(d);
                         }
                     }
                     (OpKind::Register, OpKind::Memory) => {
                         if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
                             let a = cpu.eff_addr(ins);
                             cpu.xmm[d] = cpu.read_mem(a, 64) as u128;
-                            cpu.ymm_hi[d] = 0;
+                            cpu.clear_ymm_hi_reg(d);
                         }
                     }
                     (OpKind::Memory, OpKind::Register) => {
@@ -3549,7 +3549,11 @@ impl Cpu {
                     };
                     let out = vops::pbroadcast(val, elem_bits);
                     cpu.xmm[d] = out;
-                    cpu.ymm_hi[d] = if ymm { out } else { 0 };
+                    if ymm {
+                        cpu.set_ymm_hi(d, out);
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
                 }
             }
             Mnemonic::Pshufb | Mnemonic::Vpshufb => {
@@ -3594,11 +3598,11 @@ impl Cpu {
                 cpu.set_pf(false);
             }
             Mnemonic::Vzeroupper => {
-                cpu.ymm_hi = [0; 16];
+                cpu.clear_all_ymm_hi();
             }
             Mnemonic::Vzeroall => {
                 cpu.xmm = [0; 16];
-                cpu.ymm_hi = [0; 16];
+                cpu.clear_all_ymm_hi();
             }
             Mnemonic::Roundss | Mnemonic::Vroundss => {
                 if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
@@ -3755,7 +3759,7 @@ impl Cpu {
                     OpKind::Register => {
                         if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
                             cpu.xmm[d] = packed;
-                            cpu.ymm_hi[d] = 0;
+                            cpu.clear_ymm_hi_reg(d);
                         }
                     }
                     OpKind::Memory => {
@@ -3788,7 +3792,7 @@ impl Cpu {
                             };
                             cpu.xmm[d] = (lo as u128) | ((hi as u128) << 64);
                             if Cpu::is_vex(ins) {
-                                cpu.ymm_hi[d] = 0;
+                                cpu.clear_ymm_hi_reg(d);
                             }
                         }
                     }
@@ -3814,7 +3818,7 @@ impl Cpu {
                             };
                             cpu.xmm[d] = (lo as u128) | ((hi as u128) << 64);
                             if Cpu::is_vex(ins) {
-                                cpu.ymm_hi[d] = 0;
+                                cpu.clear_ymm_hi_reg(d);
                             }
                         }
                     }
@@ -4118,7 +4122,7 @@ impl Cpu {
                         }
                         cpu.xmm[0] = m128;
                     }
-                    cpu.ymm_hi[0] = 0;
+                    cpu.clear_ymm_hi_reg(0);
                 } else {
                     let idx = if int_res2 == 0 {
                         n as u64
@@ -4164,7 +4168,7 @@ impl Cpu {
                         vops::cvtpd2dq(lo, hi, src_256, trunc)
                     };
                     if Cpu::is_vex(ins) {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }

@@ -1977,7 +1977,9 @@ impl Cpu {
         let i = i as usize & 15;
         let k = (w >> 4) as usize & 7;
         self.gpr[i] = (self.gpr[i] & W_KEEP[k]) | (val & W_MASK[k]);
-        self.last_bits[i] = W_LAST[k];
+        if self.jx.lb_on != 0 {
+            self.last_bits[i] = W_LAST[k];
+        }
     }
 
     #[cold]
@@ -2235,7 +2237,7 @@ fn unpack<T: Copy + Default, const N: usize>(a: u128, b: u128, hi: bool) -> u128
 }
 
 /// `K_VSHUF_*` sub-ops. Mirrors the generic handlers (shift-count clamping, byte shifts, ...).
-#[inline(always)]
+#[inline(never)]
 fn vshuf(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
     let ic = imm as u64;
     let bc = b as u64;
@@ -2533,7 +2535,7 @@ fn sh_q(v: u128, cnt: u64, left: bool) -> u128 {
 }
 
 /// `K_VINT_*` sub-ops (NEON-accelerated on `aarch64`, exact portable fallback elsewhere).
-#[inline(always)]
+#[inline(never)]
 fn vint(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -2767,7 +2769,7 @@ fn vint(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
 }
 
 /// `K_VFP_*` sub-ops (NEON-accelerated on `aarch64` with exact x86 NaN/rounding fallback).
-#[inline(always)]
+#[inline(never)]
 fn vfp(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -3011,7 +3013,7 @@ impl Cpu {
             VM_LEG => self.xmm[d] = lo,
             VM_V128 => {
                 self.xmm[d] = lo;
-                self.ymm_hi[d] = 0;
+                self.clear_ymm_hi_reg(d);
             }
             _ => {
                 let hi_imm = if IS_VSHUF {
@@ -3030,7 +3032,7 @@ impl Cpu {
                 };
                 let hi = f(sub, self.ymm_hi[s1], b_lane_hi, hi_imm);
                 self.xmm[d] = lo;
-                self.ymm_hi[d] = hi;
+                self.set_ymm_hi(d, hi);
             }
         }
     }
@@ -3249,7 +3251,7 @@ pub(super) unsafe fn exec(cpu: &mut Cpu, op: &FastOp) -> Fx {
         }
         K_RET => {
             let rsp = cpu.gpr[4];
-            let ret_addr = super::rd::<u64>(rsp as usize);
+            let ret_addr = cpu.read_mem(rsp, 64);
             cpu.gpr[4] = rsp.wrapping_add(8 + op.imm);
             cpu.rip = ret_addr;
         }
@@ -3347,7 +3349,7 @@ pub(super) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
             let d = op.r0 as usize & 15;
             cpu.xmm[d] = if op.imm == 64 { v as u128 } else { v as u32 as u128 };
             if op.w & 3 == VM_V128 {
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             }
         }
         K_MOVD_GX => {
@@ -3366,7 +3368,7 @@ pub(super) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
                 (base & !0xFFFF_FFFF_FFFF_FFFF) | ((iv as f64).to_bits() as u128)
             };
             if op.w & 3 == VM_V128 {
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             }
         }
         K_COMI_RR | K_COMI_RM => {
@@ -3442,7 +3444,7 @@ pub(super) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
                 cpu.gpr[2] = (cpu.gpr[2] & !0xFFFF) | hi;
             }
         },
-        K_VZU => cpu.ymm_hi = [0; 16],
+        K_VZU => cpu.clear_all_ymm_hi(),
         K_BSF_RR | K_BSF_RM => {
             let v = if op.kind == K_BSF_RR { cpu.rget(op.r1, w) } else { cpu.read_mem(cpu.faddr(op), w as u32) };
             cpu.cf = v == 0;

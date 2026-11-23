@@ -1097,7 +1097,7 @@ impl Tr<'_> {
 
     /// Out-of-line NaN fixups (after the main path).
     fn emit_cold_nan(&mut self) {
-        let cold = core::mem::take(&mut self.cold);
+        let mut cold = core::mem::take(&mut self.cold);
         for c in &cold {
             self.a.bind(c.fix);
             if !c.unary {
@@ -1111,6 +1111,8 @@ impl Tr<'_> {
             self.a.b();
             self.a.patch(here, c.back);
         }
+        cold.clear();
+        self.cold = cold;
     }
 
     // --- AW2_JIT_RETLIT ---
@@ -1184,8 +1186,9 @@ impl Tr<'_> {
             while self.a.pos % 4 != 0 {
                 self.a.emit(0xD503_201F); // nop (16-byte align for ldr q)
             }
-            let lits128 = core::mem::take(&mut self.lits128);
-            let mut pool128: Vec<(u64, u64, usize)> = Vec::new();
+            let mut lits128 = core::mem::take(&mut self.lits128);
+            let mut pool128 = core::mem::take(&mut self.pool128);
+            pool128.clear();
             for &(at, lo, hi) in &lits128 {
                 let slot = match pool128.iter().find(|&&(plo, phi, _)| plo == lo && phi == hi) {
                     Some(&(_, _, s)) => s,
@@ -1201,6 +1204,10 @@ impl Tr<'_> {
                 };
                 self.a.patch_ldr_lit(at, slot);
             }
+            lits128.clear();
+            self.lits128 = lits128;
+            pool128.clear();
+            self.pool128 = pool128;
         }
         if self.lits.is_empty() && self.rlits.is_empty() {
             return;
@@ -1208,8 +1215,9 @@ impl Tr<'_> {
         if self.a.pos % 2 != 0 {
             self.a.emit(0xD503_201F); // nop (padding)
         }
-        let lits = core::mem::take(&mut self.lits);
-        let mut pool: Vec<(u64, usize)> = Vec::new();
+        let mut lits = core::mem::take(&mut self.lits);
+        let mut pool = core::mem::take(&mut self.pool);
+        pool.clear();
         for &(at, v) in &lits {
             let slot = match pool.iter().find(|&&(pv, _)| pv == v) {
                 Some(&(_, s)) => s,
@@ -1223,7 +1231,11 @@ impl Tr<'_> {
             };
             self.a.patch_ldr_lit(at, slot);
         }
-        let rlits = core::mem::take(&mut self.rlits);
+        lits.clear();
+        self.lits = lits;
+        pool.clear();
+        self.pool = pool;
+        let mut rlits = core::mem::take(&mut self.rlits);
         for &(at, v, r) in &rlits {
             let s = self.a.pos;
             self.a.emit(v as u32);
@@ -1231,5 +1243,7 @@ impl Tr<'_> {
             self.a.patch_ldr_lit(at, s);
             self.relocs.push(AotReloc { word: s as u32, ..r });
         }
+        rlits.clear();
+        self.rlits = rlits;
     }
 }

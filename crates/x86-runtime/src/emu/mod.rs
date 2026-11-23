@@ -1506,6 +1506,31 @@ impl Cpu {
         self.jx.mxcsr
     }
 
+    /// Write `self.ymm_hi[d] = v` and maintain the `self.jx.ymm_dirty` bitmask incrementally.
+    #[inline(always)]
+    pub(super) fn set_ymm_hi(&mut self, d: usize, v: u128) {
+        self.ymm_hi[d] = v;
+        if v != 0 {
+            self.jx.ymm_dirty |= 1u16 << d;
+        } else {
+            self.jx.ymm_dirty &= !(1u16 << d);
+        }
+    }
+
+    /// Zero `self.ymm_hi[d]` and clear bit `d` in `self.jx.ymm_dirty`.
+    #[inline(always)]
+    pub(super) fn clear_ymm_hi_reg(&mut self, d: usize) {
+        self.ymm_hi[d] = 0;
+        self.jx.ymm_dirty &= !(1u16 << d);
+    }
+
+    /// Zero all 16 `self.ymm_hi` upper halves (`vzeroupper`/`vzeroall`) and clear `self.jx.ymm_dirty`.
+    #[inline(always)]
+    pub(super) fn clear_all_ymm_hi(&mut self) {
+        self.ymm_hi = [0; 16];
+        self.jx.ymm_dirty = 0;
+    }
+
     pub fn new_zeroed() -> Self {
         Self {
             gpr: [0; 16],
@@ -1530,6 +1555,10 @@ const RET_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_0000;
 #[cfg(target_arch = "aarch64")]
 pub(super) const FPCR_GUEST_MASK: u64 = 7u64 << 22;
 
+/// Bits of guest x86 `MXCSR` that affect ARM64 `FPCR`: `FTZ` (bit 15), `RC` (bits 14:13), `DAZ` (bit 6).
+/// When `(mxcsr & MXCSR_FPCR_MASK) == 0` (including the `0x1F80` default), `mxcsr_to_fpcr(mxcsr) == 0`.
+pub(super) const MXCSR_FPCR_MASK: u32 = 0xE040;
+
 /// Convert x86-64 `MXCSR` control bits (`FTZ`=15, `DAZ`=6, `RC`=14:13) to ARM64 `FPCR`
 /// (`FZ`=24, `RMode`=23:22). Note `RMode` swaps `RM`/`RP` relative to `MXCSR.RC`:
 /// `RC 00->00 (RN), 01->10 (RM), 10->01 (RP), 11->11 (RZ)`.
@@ -1553,6 +1582,7 @@ pub(super) fn read_fpcr() -> u64 {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
 #[inline(always)]
 pub(super) fn read_fpcr() -> u64 {
     0
@@ -1567,6 +1597,7 @@ pub(super) fn write_fpcr(v: u64) {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
 #[inline(always)]
 pub(super) fn write_fpcr(_v: u64) {}
 
@@ -1588,29 +1619,55 @@ pub(super) fn apply_guest_mxcsr_hw(mxcsr: u32) {
 
 /// RAII guard for one guest execution region (`emu_run_region`): installs the guest thread's
 /// `MXCSR` into hardware `FPCR` on entry and writes back `Cpu::jx.mxcsr` + restores the host's
-/// saved `FPCR` on exit (including EH unwinds).
+/// saved `FPCR` on exit (including EH unwinds). Skips `mrs`/`msr fpcr` completely on the
+/// common path where `MXCSR` has default rounding/FTZ/DAZ bits (`(mxcsr & 0xE040) == 0`).
 struct GuestFpcrGuard {
     mxcsr_ptr: *const u32,
-    saved_host_fpcr: u64,
+    entry_mxcsr: u32,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    saved_host_fpcr: Option<u64>,
 }
 
 impl GuestFpcrGuard {
     #[inline(always)]
     unsafe fn enter(mxcsr_ptr: *const u32) -> Self {
-        let saved_host_fpcr = read_fpcr();
-        apply_guest_mxcsr_hw(*mxcsr_ptr);
-        Self { mxcsr_ptr, saved_host_fpcr }
+        let entry_mxcsr = *mxcsr_ptr;
+        #[cfg(target_arch = "aarch64")]
+        let saved_host_fpcr = if (entry_mxcsr & MXCSR_FPCR_MASK) != 0 {
+            let saved = read_fpcr();
+            let target = (saved & !FPCR_GUEST_MASK) | mxcsr_to_fpcr(entry_mxcsr);
+            if target != saved {
+                write_fpcr(target);
+            }
+            Some(saved)
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let saved_host_fpcr = None;
+        Self { mxcsr_ptr, entry_mxcsr, saved_host_fpcr }
     }
 }
 
 impl Drop for GuestFpcrGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe {
-            win32_rt::ucrt::runtime::set_guest_mxcsr(*self.mxcsr_ptr);
+        let cur_m = unsafe { *self.mxcsr_ptr };
+        if cur_m != self.entry_mxcsr {
+            win32_rt::ucrt::runtime::set_guest_mxcsr(cur_m);
         }
-        if read_fpcr() != self.saved_host_fpcr {
-            write_fpcr(self.saved_host_fpcr);
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(saved) = self.saved_host_fpcr {
+                if read_fpcr() != saved {
+                    write_fpcr(saved);
+                }
+            } else if (cur_m & MXCSR_FPCR_MASK) != 0 {
+                let cur = read_fpcr();
+                if (cur & FPCR_GUEST_MASK) != 0 {
+                    write_fpcr(cur & !FPCR_GUEST_MASK);
+                }
+            }
         }
     }
 }
@@ -1626,9 +1683,10 @@ struct HostFpcrGuard {
 impl HostFpcrGuard {
     #[inline(always)]
     unsafe fn enter(mxcsr_ptr: *mut u32) -> Self {
-        win32_rt::ucrt::runtime::set_guest_mxcsr(*mxcsr_ptr);
+        let m = *mxcsr_ptr;
+        win32_rt::ucrt::runtime::set_guest_mxcsr(m);
         #[cfg(target_arch = "aarch64")]
-        {
+        if (m & MXCSR_FPCR_MASK) != 0 {
             let cur = read_fpcr();
             if (cur & FPCR_GUEST_MASK) != 0 {
                 write_fpcr(cur & !FPCR_GUEST_MASK);
@@ -1645,12 +1703,15 @@ impl Drop for HostFpcrGuard {
         unsafe {
             *self.mxcsr_ptr = m;
         }
-        apply_guest_mxcsr_hw(m);
+        if (m & MXCSR_FPCR_MASK) != 0 {
+            apply_guest_mxcsr_hw(m);
+        }
     }
 }
 
-/// Lightweight RAII guard for direct leaf host calls (`host_call_asm`): clears guest `FPCR`
-/// bits (`FZ`/`RMode`) while host code runs (no-op if already 0) and restores on return.
+/// Lightweight RAII guard for direct leaf host calls (`plain_host_call_asm`/`xfer_plain`/public
+/// host dispatch): clears guest `FPCR` bits (`FZ`/`RMode`) while host code runs (no-op if
+/// already 0) and restores on return.
 struct ClearFpcrGuard(#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] Option<u64>);
 
 impl ClearFpcrGuard {
@@ -1665,6 +1726,16 @@ impl ClearFpcrGuard {
             }
         }
         Self(None)
+    }
+
+    /// Fast path when guest `mxcsr` is known: skips `mrs fpcr` when `(mxcsr & MXCSR_FPCR_MASK) == 0`.
+    #[inline(always)]
+    fn enter_for_mxcsr(mxcsr: u32) -> Self {
+        if (mxcsr & MXCSR_FPCR_MASK) != 0 {
+            Self::enter()
+        } else {
+            Self(None)
+        }
     }
 }
 
@@ -1752,16 +1823,11 @@ std::thread_local! {
 }
 
 /// Precise guest faults (target/review/exec/g18/seh_guard_plan.md): set only by the dll_lift
-/// difftest child (`AW2_DLL_DIFF_PRECISE=1`), default off. In this mode an interpreted run
-/// (the translator and fast-op chains are off for it; the translator itself is unchanged)
-/// snapshots the CPU before every instruction; an access outside `[0x10000, 2^47)` (null
-/// page, non-canonical: the ones the emulator detects) is deferred to the end of the
-/// instruction, which is then undone (CPU back to the snapshot, rip = the instruction) and
-/// STATUS_ACCESS_VIOLATION is dispatched from that exact guest state through the frame-based
-/// handlers ([`guest_fault_dispatch`]), as Windows does for the hardware fault: an `__except`
-/// of a guest frame lands in this region. Without it (the default) such an access reads 0 /
-/// is dropped or raises to the unhandled path ([`cold_bad_addr`]).
-static PRECISE_FAULTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// difftest child (`AW2_DLL_DIFF_PRECISE=1`) or `regfile::run_oracle`, default off.
+/// Bit 0 = global [`set_precise_faults`] flag; bits 1..31 = active non-test oracle depth
+/// ([`enter_precise_oracle`]/[`leave_precise_oracle`]) so production builds never pay a TLS
+/// `_tlv_get_addr` call on every guest memory store.
+static PRECISE_FAULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The guest time-stamp counter: `rdtsc` / `rdtscp` return this constant (edx:eax; rdtscp
 /// ecx = TSC_AUX = 0) on every emulator path (interpreter, the fast path's generic fallback,
@@ -1778,9 +1844,28 @@ pub fn guest_rdtsc() -> u64 {
 
 /// Turn precise guest faults on / off for runs that start afterwards (difftest child only).
 pub fn set_precise_faults(on: bool) {
-    PRECISE_FAULTS.store(on, core::sync::atomic::Ordering::Relaxed);
+    if on {
+        PRECISE_FAULTS.fetch_or(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        PRECISE_FAULTS.fetch_and(!1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
+/// Increment active non-test oracle precise-fault depth (`regfile::run_oracle`).
+#[cfg(not(test))]
+#[inline]
+pub(super) fn enter_precise_oracle() {
+    PRECISE_FAULTS.fetch_add(2, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Decrement active non-test oracle precise-fault depth (`regfile::run_oracle`).
+#[cfg(not(test))]
+#[inline]
+pub(super) fn leave_precise_oracle() {
+    PRECISE_FAULTS.fetch_sub(2, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
 std::thread_local! {
     /// Lib tests: precise guest faults on this thread only (tests run in parallel).
     static PRECISE_LOCAL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -1793,9 +1878,16 @@ pub(crate) fn set_precise_faults_local(on: bool) {
 }
 
 /// Whether runs starting now use precise guest faults.
-#[inline]
+#[inline(always)]
 pub fn precise_faults() -> bool {
-    PRECISE_FAULTS.load(core::sync::atomic::Ordering::Relaxed) || PRECISE_LOCAL.with(|p| p.get())
+    #[cfg(test)]
+    {
+        PRECISE_FAULTS.load(core::sync::atomic::Ordering::Relaxed) != 0 || PRECISE_LOCAL.with(|p| p.get())
+    }
+    #[cfg(not(test))]
+    {
+        PRECISE_FAULTS.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
 }
 
 /// Access violations dispatched from guest instruction boundaries (precise mode), process-wide.
@@ -2176,9 +2268,9 @@ impl Cpu {
     fn vdst(&mut self, ins: &Instruction, d: usize, lo: u128, hi: u128) {
         self.xmm[d] = lo;
         if Self::is_ymm(ins.op_register(0)) {
-            self.ymm_hi[d] = hi;
+            self.set_ymm_hi(d, hi);
         } else if Self::is_vex(ins) {
-            self.ymm_hi[d] = 0;
+            self.clear_ymm_hi_reg(d);
         }
     }
 
@@ -2186,7 +2278,7 @@ impl Cpu {
     #[inline(always)]
     fn vex128_zero_upper(&mut self, ins: &Instruction, d: usize) {
         if Self::is_vex(ins) && !Self::is_ymm(ins.op_register(0)) {
-            self.ymm_hi[d] = 0;
+            self.clear_ymm_hi_reg(d);
         }
     }
 
@@ -2657,8 +2749,12 @@ struct BlkEntry {
     /// Non-zero epoch matching [`BlockCache::fast_gen`] when this block is provably safe to
     /// chain directly inside [`interp_burst`] without re-checking host/JIT/route tables.
     fast_gen: u32,
-    /// Reserved padding (keeps `BlkEntry` a 32-byte power-of-two stride).
-    _pad: u64,
+    /// Direct block-chaining cache: `index` slot + 1 for the last taken branch/call/ret target
+    /// (`0` = unset). Always validated against `(ip, fast_gen)` before use.
+    taken_slot: u32,
+    /// Direct block-chaining cache: `index` slot + 1 for the fallthrough target (`0` = unset).
+    /// Always validated against `(ip, fast_gen)` before use.
+    fall_slot: u32,
 }
 const _: () = assert!(core::mem::size_of::<BlkEntry>() == 32);
 
@@ -2903,7 +2999,8 @@ impl BlockCache {
             len: n as u32,
             gen,
             fast_gen: 0,
-            _pad: 0,
+            taken_slot: 0,
+            fall_slot: 0,
         };
         Ok((start, n))
     }
@@ -3349,6 +3446,7 @@ pub unsafe fn call_host_dispatched(
     xmm: [u128; 4],
     stack_args: [u64; 8],
 ) -> (u64, u128) {
+    let _fpcr = ClearFpcrGuard::enter();
     call_host_dispatched_in(crate::callctx::ctx(), target_va, host_fn, flags, &gpr, &xmm, &stack_args)
 }
 
@@ -3388,7 +3486,7 @@ pub(crate) unsafe fn call_host_dispatched_in(
     } else {
         match tls_xmm {
             Some(v) => v,
-            None if is_game_repl => xmm[0],
+            None if is_game_repl || (flags & DF_PLAIN != 0) => xmm[0],
             None => raw_q0,
         }
     };
@@ -3426,12 +3524,14 @@ unsafe fn call_host_with_xmm_raw(
     xmm: [u128; 4],
     stack_args: [u64; 8],
 ) -> (u64, u128) {
+    let _fpcr = ClearFpcrGuard::enter();
     crate::simd_ops::set_tls_xmm_in(xmm);
     host_call_asm(host_fn, &gpr, &xmm, &stack_args)
 }
 
 /// The register-level host call: `x0..x7` = `gpr`, `q0..q3` = `xmm`, stack args 9..16 at
-/// `[sp]`, returning `(x0, q0)`. Does not touch the per-thread XMM forwarding state.
+/// `[sp]`, returning `(x0, q0)`. Does not touch the per-thread XMM forwarding state or
+/// hardware `FPCR` (callers must hold [`HostFpcrGuard`] or [`ClearFpcrGuard`]).
 #[inline(always)]
 unsafe fn host_call_asm(
     host_fn: usize,
@@ -3439,7 +3539,6 @@ unsafe fn host_call_asm(
     xmm: &[u128; 4],
     stack_args: &[u64; 8],
 ) -> (u64, u128) {
-    let _fpcr = ClearFpcrGuard::enter();
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::uint64x2_t;
@@ -3543,9 +3642,9 @@ unsafe fn plain_host_call_asm(cpu: &mut Cpu, host_fn: usize, args_rsp: u64) {
         rd::<u64>(r + 0x30),
         rd::<u64>(r + 0x38),
     ];
-    let (rax, q0) = host_call_asm(host_fn, &gpr, &[0u128; 4], &[0u64; 8]);
+    let _fpcr = ClearFpcrGuard::enter_for_mxcsr(cpu.jx.mxcsr);
+    let (rax, _q0) = host_call_asm(host_fn, &gpr, &[0u128; 4], &[0u64; 8]);
     cpu.gpr[0] = rax;
-    cpu.xmm[0] = q0;
     cpu.last_bits[0] = 64;
     #[cfg(test)]
     TEST_PLAIN_HOST_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
@@ -4219,6 +4318,7 @@ unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
     } else {
         [0u128; 4]
     };
+    let _fpcr = ClearFpcrGuard::enter_for_mxcsr(cpu.jx.mxcsr);
     let (rax, q0) = host_call_asm(h, &gpr, &xmm, &[0; 8]);
     if bail && rax == 0 {
         return false;
@@ -4236,23 +4336,28 @@ unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
     #[cfg(test)]
     TEST_XFER_PLAIN.with(|c| c.set(c.get() + 1));
     cpu.gpr[0] = rax;
-    cpu.xmm[0] = q0;
+    if needs_xmm {
+        cpu.xmm[0] = q0;
+    }
     cpu.last_bits[0] = 64;
     true
 }
 
-/// After a host call from translated code: refresh `Cpu::jx.ymm_dirty` (nested guest calls
-/// may have touched `ymm_hi`) and keep running translated code unless the host dispatch
-/// table changed meanwhile (translations embed host-callable decisions).
+/// After a host call from translated code: keep running translated code unless the host
+/// dispatch table changed meanwhile (translations embed host-callable decisions).
+/// `Cpu::jx.ymm_dirty` is maintained incrementally across interpreter and translated writes
+/// (nested `emu_run_region` runs use their own `Cpu`), so no 256-byte `ymm_hi` scan is needed.
 #[inline]
 fn jit_xfer_done(cpu: &mut Cpu) -> u64 {
-    let mut yd = 0u16;
+    #[cfg(debug_assertions)]
     for i in 0..16 {
-        if cpu.ymm_hi[i] != 0 {
-            yd |= 1 << i;
-        }
+        debug_assert!(
+            cpu.ymm_hi[i] == 0 || (cpu.jx.ymm_dirty & (1u16 << i)) != 0,
+            "ymm_dirty stale at reg {i} after jit_host_xfer: ymm_hi={:#x}, ymm_dirty={:#x}",
+            cpu.ymm_hi[i],
+            cpu.jx.ymm_dirty
+        );
     }
-    cpu.jx.ymm_dirty = yd;
     if crate::exe::va_gen() as u64 != cpu.jx.ctx_vagen {
         jit::EXIT_RIP
     } else {
@@ -4355,9 +4460,44 @@ struct BurstExit {
     next_left: usize,
 }
 
-/// Compute the mode-flags word for [`BlockCache::sync_fast_gen`].
+/// Whether `fast::Cpu::rset` must maintain `Cpu::last_bits` (needed only when `DF_GAME_REPL`
+/// hooks or differential verification / tests are active).
 #[inline(always)]
-fn burst_mode_flags(jit_ptr: *const jit::JitCache, jit_on: bool, dll_gate: (u64, u64)) -> u32 {
+fn fast_last_bits_on(verify: bool) -> bool {
+    if cfg!(test) || verify {
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        jit::last_bits_enabled()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        crate::exe::aw2_registry_active()
+    }
+}
+
+/// Compute the loop-invariant portion of the mode-flags word for [`BlockCache::sync_fast_gen`].
+#[inline(always)]
+fn burst_base_mode_flags(jit_on: bool, dll_gate: (u64, u64)) -> u32 {
+    let gate_hash = (((dll_gate.0 >> 12) ^ (dll_gate.1 >> 12)) as u32) << 16;
+    #[cfg(not(test))]
+    let fast_bit = u32::from(fast_enabled()) << 11;
+    #[cfg(test)]
+    let fast_bit = 0u32;
+    (u32::from(jit_on) << 4)
+        | (u32::from(crate::exe::aw2_registry_active()) << 5)
+        | (u32::from(exe_route_off()) << 6)
+        | (u32::from(dll_route_enabled()) << 7)
+        | (u32::from(dll_chkstk_enabled()) << 8)
+        | (u32::from(dll_stack_pos_enabled()) << 9)
+        | fast_bit
+        | gate_hash
+}
+
+/// Combine [`burst_base_mode_flags`] with per-burst dynamic bits (`jit_tag`, `aot`, test overrides).
+#[inline(always)]
+fn burst_mode_flags_from_base(base: u32, jit_ptr: *const jit::JitCache) -> u32 {
     #[cfg(target_arch = "aarch64")]
     let jit_tag = unsafe { (*jit_ptr).mode_tag() as u32 };
     #[cfg(not(target_arch = "aarch64"))]
@@ -4370,36 +4510,30 @@ fn burst_mode_flags(jit_ptr: *const jit::JitCache, jit_on: bool, dll_gate: (u64,
     #[cfg(not(target_arch = "aarch64"))]
     let aot_on = 0u32;
     #[cfg(test)]
-    let test_bits = (u32::from(DLL_CHKSTK_OFF.with(|c| c.get())) << 12)
+    let test_bits = (u32::from(fast_enabled()) << 11)
+        | (u32::from(DLL_CHKSTK_OFF.with(|c| c.get())) << 12)
         | (u32::from(DLL_STACK_POS_OFF.with(|c| c.get())) << 13)
         | (u32::from(regfile::test_off()) << 14);
     #[cfg(not(test))]
     let test_bits = 0u32;
-    let gate_hash = (((dll_gate.0 >> 12) ^ (dll_gate.1 >> 12)) as u32) << 16;
-    (jit_tag & 0xF)
-        | (u32::from(jit_on) << 4)
-        | (u32::from(crate::exe::aw2_registry_active()) << 5)
-        | (u32::from(exe_route_off()) << 6)
-        | (u32::from(dll_route_enabled()) << 7)
-        | (u32::from(dll_chkstk_enabled()) << 8)
-        | (u32::from(dll_stack_pos_enabled()) << 9)
-        | (aot_on << 10)
-        | (u32::from(fast_enabled()) << 11)
-        | test_bits
-        | gate_hash
+    base | (jit_tag & 0xF) | (aot_on << 10) | test_bits
 }
 
 /// Compact out-of-line interpreter burst loop: executes pre-decoded [`fast::FastOp`] blocks
-/// and chains directly across 0-hash self-loops and stamped 32-byte [`BlkEntry`] slots for
-/// `jcc`, `jmp`, `call`, `ret`, and fallthrough up to `budget` ops (`<= INTERP_BURST_BUDGET`).
+/// and chains directly across 0-hash self-loops, cached direct `(taken_slot, fall_slot)` edges,
+/// and stamped 32-byte [`BlkEntry`] slots for `jcc`, `jmp`, `call`, `ret`, and fallthrough up
+/// to `budget` ops (`<= INTERP_BURST_BUDGET`).
 ///
 /// Only entered on blocks stamped with `fast_gen` (guaranteed `e.gen == 0`, non-generic start,
-/// sticky-interpreted, non-host, non-hook/chkstk/IAT/DLL-stub). Exits cleanly back to
-/// `emu_run_region` on index miss, `K_GENERIC`, host/special transfer, budget expiry, or fault.
+/// sticky-interpreted, non-host, non-hook/chkstk/IAT/DLL-stub). Straight-line non-branch runs
+/// omit per-op `cpu.rip` stores and `(*nx).ip == cpu.rip` checks, materializing `cpu.rip` at
+/// block ends, branches, calls, and exits. Exits cleanly back to `emu_run_region` on index
+/// miss, `K_GENERIC`, host/special transfer, budget expiry, or fault.
 #[inline(never)]
 unsafe fn interp_burst(
     cpu: &mut Cpu,
     blocks_ptr: *mut BlockCache,
+    mut cur_slot: usize,
     cur_off: usize,
     cur_len: usize,
     fast_gen: u32,
@@ -4409,7 +4543,7 @@ unsafe fn interp_burst(
     TEST_INTERP_BURSTS.with(|c| c.set(c.get().wrapping_add(1)));
 
     let ops_base = (*blocks_ptr).ops.as_ptr();
-    let index_base = (*blocks_ptr).index.as_ptr();
+    let index_base = (*blocks_ptr).index.as_mut_ptr();
     let mut blk_start = ops_base.add(cur_off);
     let mut blk_ip = (*blk_start).ip;
     let mut blk_len = cur_len;
@@ -4417,11 +4551,54 @@ unsafe fn interp_burst(
     let mut left = cur_len - 1;
     let mut n = 0u32;
 
+    macro_rules! resolve_chain {
+        ($target:expr, $is_fall:expr) => {{
+            let tgt: u64 = $target;
+            if tgt == blk_ip {
+                Some((cur_slot, blk_start, blk_len))
+            } else {
+                let cur_ent = index_base.add(cur_slot);
+                let cached = if $is_fall { (*cur_ent).fall_slot } else { (*cur_ent).taken_slot };
+                let mut hit: Option<(usize, *const fast::FastOp, usize)> = None;
+                if cached != 0 {
+                    let s = (cached - 1) as usize;
+                    let e = *index_base.add(s);
+                    if e.ip == tgt && e.fast_gen == fast_gen {
+                        let ptr = ops_base.add(e.off as usize);
+                        if (*ptr).ip == tgt {
+                            hit = Some((s, ptr, e.len as usize));
+                        }
+                    }
+                }
+                if hit.is_none() {
+                    let s = BlockCache::slot(tgt);
+                    let e = *index_base.add(s);
+                    if e.ip == tgt && e.fast_gen == fast_gen {
+                        let ptr = ops_base.add(e.off as usize);
+                        if (*ptr).ip == tgt {
+                            let enc = (s + 1) as u32;
+                            if $is_fall {
+                                (*cur_ent).fall_slot = enc;
+                            } else {
+                                (*cur_ent).taken_slot = enc;
+                            }
+                            hit = Some((s, ptr, e.len as usize));
+                        }
+                    }
+                }
+                hit
+            }
+        }};
+    }
+
     loop {
+        if left == 0 {
+            cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
+        }
         let mut fx = fast::exec(cpu, &*op);
         n += 1;
         if matches!(fx, fast::Fx::FuseJcc) {
-            // `fast::fuse` guarantees the next slot of this block is the paired `K_JCC`.
+            // `fast::fuse` guarantees the next slot of this block is the paired `K_JCC` (end of block).
             op = op.add(1);
             left -= 1;
             cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
@@ -4432,21 +4609,20 @@ unsafe fn interp_burst(
             fast::Fx::Done => {
                 if left != 0 {
                     let nx = op.add(1);
-                    if (*nx).ip == cpu.rip {
-                        if n < budget && (*nx).kind != fast::K_GENERIC {
-                            op = nx;
-                            left -= 1;
-                            cpu.rip = (*nx).ip.wrapping_add((*nx).len as u64);
-                            continue;
-                        }
-                        return BurstExit {
-                            fx: fast::Fx::Done,
-                            steps: n,
-                            last_ip: (*op).ip,
-                            next_off: nx.offset_from(ops_base) as usize,
-                            next_left: left,
-                        };
+                    debug_assert_eq!((*nx).ip, (*op).ip.wrapping_add((*op).len as u64));
+                    if n < budget && (*nx).kind != fast::K_GENERIC {
+                        op = nx;
+                        left -= 1;
+                        continue;
                     }
+                    cpu.rip = (*nx).ip;
+                    return BurstExit {
+                        fx: fast::Fx::Done,
+                        steps: n,
+                        last_ip: (*op).ip,
+                        next_off: nx.offset_from(ops_base) as usize,
+                        next_left: left,
+                    };
                 }
                 if n >= budget {
                     return BurstExit {
@@ -4458,28 +4634,17 @@ unsafe fn interp_burst(
                     };
                 }
                 let target = cpu.rip;
-                if target == blk_ip {
+                let is_fall = target == (*op).ip.wrapping_add((*op).len as u64);
+                if let Some((slot, ptr, len)) = resolve_chain!(target, is_fall) {
                     #[cfg(test)]
                     TEST_INTERP_BURST_CHAINS.with(|c| c.set(c.get().wrapping_add(1)));
-                    op = blk_start;
-                    left = blk_len - 1;
-                    cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
+                    cur_slot = slot;
+                    blk_ip = target;
+                    blk_start = ptr;
+                    blk_len = len;
+                    op = ptr;
+                    left = len - 1;
                     continue;
-                }
-                let e = *index_base.add(BlockCache::slot(target));
-                if e.ip == target && e.fast_gen == fast_gen {
-                    let ptr = ops_base.add(e.off as usize);
-                    if (*ptr).ip == target {
-                        #[cfg(test)]
-                        TEST_INTERP_BURST_CHAINS.with(|c| c.set(c.get().wrapping_add(1)));
-                        blk_ip = target;
-                        blk_start = ptr;
-                        blk_len = e.len as usize;
-                        op = ptr;
-                        left = blk_len - 1;
-                        cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
-                        continue;
-                    }
                 }
                 return BurstExit {
                     fx: fast::Fx::Done,
@@ -4491,28 +4656,17 @@ unsafe fn interp_burst(
             }
             fast::Fx::JccNear(target) | fast::Fx::Jmp(target) => {
                 if n < budget {
-                    if target == blk_ip {
+                    if let Some((slot, ptr, len)) = resolve_chain!(target, false) {
                         #[cfg(test)]
                         TEST_INTERP_BURST_CHAINS.with(|c| c.set(c.get().wrapping_add(1)));
-                        op = blk_start;
-                        left = blk_len - 1;
-                        cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
+                        cpu.rip = target;
+                        cur_slot = slot;
+                        blk_ip = target;
+                        blk_start = ptr;
+                        blk_len = len;
+                        op = ptr;
+                        left = len - 1;
                         continue;
-                    }
-                    let e = *index_base.add(BlockCache::slot(target));
-                    if e.ip == target && e.fast_gen == fast_gen {
-                        let ptr = ops_base.add(e.off as usize);
-                        if (*ptr).ip == target {
-                            #[cfg(test)]
-                            TEST_INTERP_BURST_CHAINS.with(|c| c.set(c.get().wrapping_add(1)));
-                            blk_ip = target;
-                            blk_start = ptr;
-                            blk_len = e.len as usize;
-                            op = ptr;
-                            left = blk_len - 1;
-                            cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
-                            continue;
-                        }
                     }
                 }
                 return BurstExit {
@@ -4526,33 +4680,19 @@ unsafe fn interp_burst(
             fast::Fx::Call(target) => {
                 if n < budget {
                     let new_rsp = cpu.gpr[4].wrapping_sub(8);
-                    if (0x1_0000..0x8000_0000_0000).contains(&(new_rsp as usize)) {
-                        let next_blk = if target == blk_ip {
-                            Some((blk_start, blk_len))
-                        } else {
-                            let e = *index_base.add(BlockCache::slot(target));
-                            if e.ip == target && e.fast_gen == fast_gen {
-                                let ptr = ops_base.add(e.off as usize);
-                                if (*ptr).ip == target {
-                                    Some((ptr, e.len as usize))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((ptr, len)) = next_blk {
+                    if regfile_ext::is_valid_guest_range(new_rsp, 8) {
+                        if let Some((slot, ptr, len)) = resolve_chain!(target, false) {
                             #[cfg(test)]
                             TEST_INTERP_BURST_CHAINS.with(|c| c.set(c.get().wrapping_add(1)));
                             cpu.gpr[4] = new_rsp;
                             cpu.write_mem(new_rsp, 64, cpu.rip);
+                            cpu.rip = target;
+                            cur_slot = slot;
                             blk_ip = target;
                             blk_start = ptr;
                             blk_len = len;
                             op = ptr;
                             left = len - 1;
-                            cpu.rip = (*op).ip.wrapping_add((*op).len as u64);
                             continue;
                         }
                     }
@@ -4646,15 +4786,6 @@ unsafe fn emu_run_region(
     };
     let _sp_guard = SpGuard { sp_ptr, saved_sp, saved_teb_stack };
     let (caller_rsp, rsp_limit) = take_incoming_rsp();
-    let mut hi_args = [0u64; 16];
-    if caller_rsp != 0 {
-        for i in 0..16 {
-            let addr = caller_rsp.wrapping_add(0x80 + (i as u64) * 8);
-            if addr.wrapping_add(8) <= rsp_limit {
-                hi_args[i] = rd::<u64>(addr as usize);
-            }
-        }
-    }
 
     wr::<u64>(sp_top as usize, RET_SENTINEL);
     wr::<u64>((sp_top + 0x08) as usize, 0);
@@ -4668,8 +4799,14 @@ unsafe fn emu_run_region(
     for i in 0..8 {
         wr::<u64>((sp_top + 0x48 + (i as u64) * 8) as usize, stack_args[i]);
     }
-    for i in 0..16 {
-        wr::<u64>((sp_top + 0x88 + (i as u64) * 8) as usize, hi_args[i]);
+    // Only populate high stack args [sp_top+0x88..sp_top+0x108) when forwarding from a guest/lifted
+    // caller frame (`caller_rsp != 0`); direct `emu_run*` callers pass at most 16 args.
+    if caller_rsp != 0 {
+        for i in 0..16 {
+            let addr = caller_rsp.wrapping_add(0x80 + (i as u64) * 8);
+            let v = if addr.wrapping_add(8) <= rsp_limit { rd::<u64>(addr as usize) } else { 0 };
+            wr::<u64>((sp_top + 0x88 + (i as u64) * 8) as usize, v);
+        }
     }
 
     let mut cpu = Cpu {
@@ -4736,6 +4873,7 @@ unsafe fn emu_run_region(
     let (ops_base, ins_base): (*const fast::FastOp, *const Instruction) =
         ((*blocks_ptr).ops.as_ptr(), (*blocks_ptr).arena.as_ptr());
     let verify = verify_enabled();
+    cpu.jx.lb_on = u8::from(fast_last_bits_on(verify));
     // Translated code bypasses per-instruction verification and mnemonic counting.
     // Precise guest faults (difftest child only): interpreted, one instruction at a time.
     let precise = precise_faults();
@@ -4754,6 +4892,7 @@ unsafe fn emu_run_region(
     // Mapped-DLL span with IAT directories: guest block starts in it that are import stubs
     // go to their slot target (`dll_stub_route`). A zero span when routing is off.
     let dll_gate = dll_route_gate();
+    let burst_base_flags = burst_base_mode_flags(jit_on, dll_gate);
     let mut route_hops: usize = 0;
 
     while cpu.rip != RET_SENTINEL && cpu.rip != 0 && g.steps < MAX_STEPS && route_hops < MAX_STEPS {
@@ -4772,83 +4911,110 @@ unsafe fn emu_run_region(
             }
         }
         let cur_ip = cpu.rip;
-        if in_exe_gate(exe_gate, cur_ip) {
-            let route = exe_route(&mut cpu, cur_ip, entry_ip);
-            if route != ExeRoute::None {
-                if let Some(r) = apply_exe_route(&mut cpu, route, entry_ip, blocks_ptr, sp_ptr, prof) {
-                    return r;
-                }
-                route_hops += 1;
-                continue;
+        let nan_step = nan_inst && crate::diag::nan_trace_covers(cur_ip);
+        // Hot-path bypass: a valid compiled block in `JitCache` (not `static_only`, no bound
+        // static AOT, matching `va_gen`/`aot_epoch`/`static_aot_gen`) already passed `prep_block`
+        // / `aot::check_block`, which rejects `dll_chkstk`, `dll_stack_pos`, `regfile`, and
+        // `dll_stub` VAs. Skip the 5 routing probes when outside `exe_gate` and no `SKIP_VA` is armed.
+        let fast_jit_code = if jit_on
+            && !jit_skip
+            && !nan_step
+            && !in_exe_gate(exe_gate, cur_ip)
+            && !regfile::has_skip_armed()
+        {
+            #[cfg(test)]
+            let test_routed = is_routed_dll_chkstk(cur_ip)
+                || is_routed_dll_stack_pos(cur_ip)
+                || lookup_routed_regfile(cur_ip).is_some();
+            #[cfg(not(test))]
+            let test_routed = false;
+            if test_routed {
+                None
+            } else {
+                (*jit_ptr).lookup_fast_hit(cur_ip)
             }
-        }
-        if is_routed_dll_chkstk(cur_ip) {
-            if let Some(r) = dll_chkstk_tail(&mut cpu, sp_ptr) {
-                return r;
-            }
-            route_hops += 1;
-            continue;
-        }
-        if is_routed_dll_stack_pos(cur_ip) {
-            if let Some(r) = dll_stack_pos_tail(&mut cpu) {
-                return r;
-            }
-            route_hops += 1;
-            continue;
-        }
-        if regfile::take_skip(cur_ip) {
-            jit_skip = true;
-        } else if let Some((rf, blk)) = lookup_routed_regfile(cur_ip) {
-            let ex = regfile::run_chain(&mut cpu, rf, blk);
-            match ex.kind {
-                regfile::RF_RET => {
-                    if ex.va == RET_SENTINEL || ex.va == 0 {
-                        if ex.va == 0 && entry_ip != 0 {
-                            note_null_call();
-                        }
-                        return (cpu.abi_gpr(0), cpu.xmm[0]);
-                    }
-                    cpu.rip = ex.va;
-                    route_hops += 1;
-                    continue;
-                }
-                regfile::RF_JUMP => {
-                    if ex.va == RET_SENTINEL || ex.va == 0 {
-                        if ex.va == 0 && entry_ip != 0 {
-                            note_null_call();
-                        }
-                        return (cpu.abi_gpr(0), cpu.xmm[0]);
-                    }
-                    if let Some(r) = apply_xfer_tail(&mut cpu, ex.va, false, entry_ip, blocks_ptr, sp_ptr, prof) {
+        } else {
+            None
+        };
+        if fast_jit_code.is_none() {
+            if in_exe_gate(exe_gate, cur_ip) {
+                let route = exe_route(&mut cpu, cur_ip, entry_ip);
+                if route != ExeRoute::None {
+                    if let Some(r) = apply_exe_route(&mut cpu, route, entry_ip, blocks_ptr, sp_ptr, prof) {
                         return r;
                     }
                     route_hops += 1;
                     continue;
                 }
-                regfile::RF_CALL => {
-                    if let Some(r) = apply_xfer_tail(&mut cpu, ex.va, true, entry_ip, blocks_ptr, sp_ptr, prof) {
+            }
+            if is_routed_dll_chkstk(cur_ip) {
+                if let Some(r) = dll_chkstk_tail(&mut cpu, sp_ptr) {
+                    return r;
+                }
+                route_hops += 1;
+                continue;
+            }
+            if is_routed_dll_stack_pos(cur_ip) {
+                if let Some(r) = dll_stack_pos_tail(&mut cpu) {
+                    return r;
+                }
+                route_hops += 1;
+                continue;
+            }
+            if regfile::take_skip(cur_ip) {
+                jit_skip = true;
+            } else if let Some((rf, blk)) = lookup_routed_regfile(cur_ip) {
+                let ex = regfile::run_chain(&mut cpu, rf, blk);
+                match ex.kind {
+                    regfile::RF_RET => {
+                        if ex.va == RET_SENTINEL || ex.va == 0 {
+                            if ex.va == 0 && entry_ip != 0 {
+                                note_null_call();
+                            }
+                            return (cpu.abi_gpr(0), cpu.xmm[0]);
+                        }
+                        cpu.rip = ex.va;
+                        route_hops += 1;
+                        continue;
+                    }
+                    regfile::RF_JUMP => {
+                        if ex.va == RET_SENTINEL || ex.va == 0 {
+                            if ex.va == 0 && entry_ip != 0 {
+                                note_null_call();
+                            }
+                            return (cpu.abi_gpr(0), cpu.xmm[0]);
+                        }
+                        if let Some(r) = apply_xfer_tail(&mut cpu, ex.va, false, entry_ip, blocks_ptr, sp_ptr, prof) {
+                            return r;
+                        }
+                        route_hops += 1;
+                        continue;
+                    }
+                    regfile::RF_CALL => {
+                        if let Some(r) = apply_xfer_tail(&mut cpu, ex.va, true, entry_ip, blocks_ptr, sp_ptr, prof) {
+                            return r;
+                        }
+                        route_hops += 1;
+                        continue;
+                    }
+                    _ => {
+                        cpu.rip = ex.va;
+                        regfile::arm_skip(ex.va);
+                        jit_skip = true;
+                        route_hops += 1;
+                        continue;
+                    }
+                }
+            }
+            if cur_ip.wrapping_sub(dll_gate.0) < dll_gate.1 {
+                if let Some(t) = dll_stub_route(cur_ip) {
+                    // The stub's `jmp [slot]`: host target = host tail call, guest = plain jump.
+                    if let Some(r) = apply_fx(&mut cpu, fast::Fx::Jmp(t), entry_ip, blocks_ptr, sp_ptr, prof) {
                         return r;
                     }
                     route_hops += 1;
                     continue;
                 }
-                _ => {
-                    cpu.rip = ex.va;
-                    regfile::arm_skip(ex.va);
-                    jit_skip = true;
-                    route_hops += 1;
-                    continue;
-                }
-            }
-        }
-        if cur_ip.wrapping_sub(dll_gate.0) < dll_gate.1 {
-            if let Some(t) = dll_stub_route(cur_ip) {
-                // The stub's `jmp [slot]`: host target = host tail call, guest = plain jump.
-                if let Some(r) = apply_fx(&mut cpu, fast::Fx::Jmp(t), entry_ip, blocks_ptr, sp_ptr, prof) {
-                    return r;
-                }
-                route_hops += 1;
-                continue;
             }
         }
         g.steps += 1;
@@ -4866,7 +5032,6 @@ unsafe fn emu_run_region(
             }
         }
         let skipped_jit = core::mem::take(&mut jit_skip);
-        let nan_step = nan_inst && crate::diag::nan_trace_covers(cur_ip);
         if jit_on && !skipped_jit && !nan_step {
             if g.sample_left <= BLK_MAX_INSNS as u32 {
                 // Take the profiler sample now rather than interpreting up to a block's
@@ -4880,7 +5045,7 @@ unsafe fn emu_run_region(
                 }
             }
             let after_rip_exit = core::mem::take(&mut jstats_rip);
-            if let Some(code) = (*jit_ptr).lookup(cur_ip, blocks_ptr) {
+            if let Some(code) = fast_jit_code.or_else(|| (*jit_ptr).lookup(cur_ip, blocks_ptr)) {
                 let mut budget = g.sample_left as i64 - 1;
                 if nan_inst {
                     budget = budget.min(4096);
@@ -4960,7 +5125,7 @@ unsafe fn emu_run_region(
                 if !verify && !prof_mnem_fast && !precise && !nan_step {
                     let burst_ok = if !prof_mnem && !jstats && !skipped_jit {
                         if let Some((slot, blk_len)) = head_slot {
-                            let mflags = burst_mode_flags(jit_ptr, jit_on, dll_gate);
+                            let mflags = burst_mode_flags_from_base(burst_base_flags, jit_ptr);
                             let fast_gen = (*blocks_ptr).sync_fast_gen(mflags);
                             let ent = &mut *(*blocks_ptr).index.as_mut_ptr().add(slot);
                             if ent.ip == cur_ip
@@ -4989,7 +5154,7 @@ unsafe fn emu_run_region(
                                     safe
                                 };
                                 if stamped {
-                                    Some((blk_len, fast_gen))
+                                    Some((slot, blk_len, fast_gen))
                                 } else {
                                     None
                                 }
@@ -5002,7 +5167,7 @@ unsafe fn emu_run_region(
                     } else {
                         None
                     };
-                    if let Some((blk_len, fast_gen)) = burst_ok {
+                    if let Some((slot, blk_len, fast_gen)) = burst_ok {
                         let step_cap = (MAX_STEPS - g.steps + 1).min(u32::MAX as usize) as u32;
                         let burst_budget = INTERP_BURST_BUDGET
                             .min(g.sample_left.max(1))
@@ -5011,6 +5176,7 @@ unsafe fn emu_run_region(
                         let exit = interp_burst(
                             &mut cpu,
                             blocks_ptr,
+                            slot,
                             cur_off,
                             blk_len,
                             fast_gen,
@@ -5190,7 +5356,7 @@ unsafe fn emu_run_region(
             }
             Mnemonic::Ret => {
                 let rsp = cpu.gpr[4];
-                let ret_addr = rd::<u64>(rsp as usize);
+                let ret_addr = cpu.read_mem(rsp, 64);
                 let imm = if ins.op_count() > 0 { ins.immediate16() as u64 } else { 0 };
                 cpu.gpr[4] = rsp.wrapping_add(8 + imm);
                 cpu.rip = ret_addr;

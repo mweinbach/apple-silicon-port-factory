@@ -66,19 +66,39 @@ std::thread_local! {
     static REGFILE_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
+/// Count of threads with a non-zero `SKIP_VA` armed (`0` on the common path so `take_skip`
+/// avoids a TLS `_tlv_get_addr` lookup on every `emu_run_region` iteration).
+static SKIP_ARMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+pub(super) fn has_skip_armed() -> bool {
+    SKIP_ARMED.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 #[inline(always)]
 pub(super) fn arm_skip(va: u64) {
-    SKIP_VA.with(|c| c.set(va));
+    SKIP_VA.with(|c| {
+        let prev = c.replace(va);
+        if prev == 0 && va != 0 {
+            SKIP_ARMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else if prev != 0 && va == 0 {
+            SKIP_ARMED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }
 
 #[inline(always)]
 pub(super) fn take_skip(va: u64) -> bool {
+    if SKIP_ARMED.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
     SKIP_VA.with(|c| {
         let s = c.get();
         if s == 0 {
             return false;
         }
         c.set(0);
+        SKIP_ARMED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         s == va
     })
 }
@@ -917,7 +937,19 @@ impl<'a> Rf<'a> {
 /// precise-fault semantics without calling out into downstream runtime targets (stopping at
 /// `call` after pushing `next_ip` with `RegfileExit::call(tgt)`).
 pub unsafe fn run_oracle(cpu: &mut super::Cpu, start_va: u64, lo: u64, hi: u64) -> RegfileExit {
+    #[cfg(test)]
     let prev_prec = super::PRECISE_LOCAL.with(|p| p.replace(true));
+    #[cfg(not(test))]
+    let _prec_guard = {
+        super::enter_precise_oracle();
+        struct OraclePreciseGuard;
+        impl Drop for OraclePreciseGuard {
+            fn drop(&mut self) {
+                super::leave_precise_oracle();
+            }
+        }
+        OraclePreciseGuard
+    };
     super::FAULT_PENDING.with(|p| p.set(None));
     super::regfile_ext::x87_reset();
     cpu.rip = start_va;
@@ -1051,6 +1083,7 @@ pub unsafe fn run_oracle(cpu: &mut super::Cpu, start_va: u64, lo: u64, hi: u64) 
             break RegfileExit::fault(cpu.rip);
         }
     };
+    #[cfg(test)]
     super::PRECISE_LOCAL.with(|p| p.set(prev_prec));
     res
 }

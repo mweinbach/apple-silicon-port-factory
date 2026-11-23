@@ -1587,7 +1587,7 @@ unsafe fn exec_pcmpstr_op(cpu: &mut Cpu, op: &FastOp) {
             }
             cpu.xmm[0] = m128;
         }
-        cpu.ymm_hi[0] = 0;
+        cpu.clear_ymm_hi_reg(0);
     } else {
         let idx = if int_res2 == 0 {
             n as u64
@@ -1621,7 +1621,7 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
             };
             cpu.xmm[d] = aes_op_128(sub, state, src, op.imm as u8);
             if (op.w & 3) == VM_V128 {
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             }
         }
         K_VCVT_PH => {
@@ -1654,7 +1654,11 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     }
                 }
                 cpu.xmm[d] = d_lo;
-                cpu.ymm_hi[d] = if is_256 { d_hi } else { 0 };
+                if is_256 {
+                    cpu.set_ymm_hi(d, d_hi);
+                } else {
+                    cpu.clear_ymm_hi_reg(d);
+                }
             } else {
                 // Vcvtps2ph
                 let is_256 = op.w != 0;
@@ -1682,7 +1686,7 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 } else {
                     let d = op.r0 as usize & 15;
                     cpu.xmm[d] = packed;
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
             }
         }
@@ -1711,7 +1715,11 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     }
                 }
                 cpu.xmm[reg] = out[0];
-                cpu.ymm_hi[reg] = if is_256 { out[1] } else { 0 };
+                if is_256 {
+                    cpu.set_ymm_hi(reg, out[1]);
+                } else {
+                    cpu.clear_ymm_hi_reg(reg);
+                }
             } else {
                 let (s_lo, s_hi) = (cpu.xmm[reg], if is_256 { cpu.ymm_hi[reg] } else { 0 });
                 for i in 0..n {

@@ -361,8 +361,11 @@ pub(crate) fn clear_regfile_va_for_test(va: u64) {
 #[inline]
 pub fn lookup_regfile(va: u64) -> Option<(crate::emu::regfile::RegfileFn, u32)> {
     use std::sync::atomic::Ordering;
-    let lo = REGFILE_LO.load(Ordering::Acquire);
     let hi = REGFILE_HI.load(Ordering::Acquire);
+    if hi == 0 {
+        return None;
+    }
+    let lo = REGFILE_LO.load(Ordering::Acquire);
     if hi <= lo || va.wrapping_sub(lo) >= hi - lo {
         return None;
     }

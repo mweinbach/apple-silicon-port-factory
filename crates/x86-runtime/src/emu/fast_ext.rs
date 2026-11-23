@@ -685,7 +685,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     cpu.xmm[op.r1 as usize & 15]
                 };
                 cpu.xmm[d] = val;
-                cpu.ymm_hi[d] = val;
+                cpu.set_ymm_hi(d, val);
             } else {
                 let ebits = 8u32 << lg;
                 let raw = if op.x & 0x20 != 0 {
@@ -707,7 +707,11 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     _ => (raw as u128) | ((raw as u128) << 64),
                 };
                 cpu.xmm[d] = out;
-                cpu.ymm_hi[d] = if mode == VM_V256 { out } else { 0 };
+                if mode == VM_V256 {
+                    cpu.set_ymm_hi(d, out);
+                } else {
+                    cpu.clear_ymm_hi_reg(d);
+                }
             }
         }
         K_PMOVX => {
@@ -727,9 +731,9 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
             let (out_lo, out_hi) = pmovx_exec(sub, raw, mode == VM_V256);
             cpu.xmm[d] = out_lo;
             if mode == VM_V256 {
-                cpu.ymm_hi[d] = out_hi;
+                cpu.set_ymm_hi(d, out_hi);
             } else if mode == VM_V128 {
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             }
         }
         K_VCVT_PD => {
@@ -759,9 +763,9 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 let hi = if mode == VM_V256 { cvt(2) | (cvt(3) << 64) } else { 0 };
                 cpu.xmm[d] = lo;
                 if mode == VM_V256 {
-                    cpu.ymm_hi[d] = hi;
+                    cpu.set_ymm_hi(d, hi);
                 } else if mode == VM_V128 {
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
             } else {
                 let (lo, hi) = if mem {
@@ -785,7 +789,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 let i3 = if src_256 { cvt((hi >> 64) as u64) } else { 0 };
                 cpu.xmm[d] = i0 | (i1 << 32) | (i2 << 64) | (i3 << 96);
                 if mode != VM_LEG {
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
             }
         }
@@ -819,7 +823,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 let neg_acc = fop == 1 || fop == 3;
                 let res = (if neg_mul { -m1 } else { m1 }).mul_add(m2, if neg_acc { -acc } else { acc });
                 cpu.xmm[d] = (v1_lo & !0xFFFF_FFFF) | (res.to_bits() as u128);
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             } else if ty == 1 {
                 let x1 = f64::from_bits(v1_lo as u64);
                 let x2 = f64::from_bits(v2_lo as u64);
@@ -832,15 +836,23 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 let neg_acc = fop == 1 || fop == 3;
                 let res = (if neg_mul { -m1 } else { m1 }).mul_add(m2, if neg_acc { -acc } else { acc });
                 cpu.xmm[d] = (v1_lo & !0xFFFF_FFFF_FFFF_FFFF) | (res.to_bits() as u128);
-                cpu.ymm_hi[d] = 0;
+                cpu.clear_ymm_hi_reg(d);
             } else if ty == 2 {
                 let (v1_hi, v2_hi) = if is_256 { (cpu.ymm_hi[d], cpu.ymm_hi[s2]) } else { (0, 0) };
                 cpu.xmm[d] = vfma_ps_128(ord, fop, v1_lo, v2_lo, v3_lo);
-                cpu.ymm_hi[d] = if is_256 { vfma_ps_128(ord, fop, v1_hi, v2_hi, v3_hi) } else { 0 };
+                if is_256 {
+                    cpu.set_ymm_hi(d, vfma_ps_128(ord, fop, v1_hi, v2_hi, v3_hi));
+                } else {
+                    cpu.clear_ymm_hi_reg(d);
+                }
             } else {
                 let (v1_hi, v2_hi) = if is_256 { (cpu.ymm_hi[d], cpu.ymm_hi[s2]) } else { (0, 0) };
                 cpu.xmm[d] = vfma_pd_128(ord, fop, v1_lo, v2_lo, v3_lo);
-                cpu.ymm_hi[d] = if is_256 { vfma_pd_128(ord, fop, v1_hi, v2_hi, v3_hi) } else { 0 };
+                if is_256 {
+                    cpu.set_ymm_hi(d, vfma_pd_128(ord, fop, v1_hi, v2_hi, v3_hi));
+                } else {
+                    cpu.clear_ymm_hi_reg(d);
+                }
             }
         }
         K_VBLENDV_RR | K_VBLENDV_RM => {
@@ -862,12 +874,12 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 VM_LEG => cpu.xmm[d] = res_lo,
                 VM_V128 => {
                     cpu.xmm[d] = res_lo;
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
                 _ => {
                     let res_hi = vblendv_128(lg, cpu.ymm_hi[s1], b_hi, cpu.ymm_hi[m_idx]);
                     cpu.xmm[d] = res_lo;
-                    cpu.ymm_hi[d] = res_hi;
+                    cpu.set_ymm_hi(d, res_hi);
                 }
             }
         }
@@ -1034,7 +1046,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     let q: [u64; 4] = [s_lo as u64, (s_lo >> 64) as u64, s_hi as u64, (s_hi >> 64) as u64];
                     let r: [u64; 4] = core::array::from_fn(|i| q[((imm >> (2 * i)) & 3) as usize]);
                     cpu.xmm[d] = (r[0] as u128) | ((r[1] as u128) << 64);
-                    cpu.ymm_hi[d] = (r[2] as u128) | ((r[3] as u128) << 64);
+                    cpu.set_ymm_hi(d, (r[2] as u128) | ((r[3] as u128) << 64));
                 }
                 1 => {
                     // Vpermd / Vpermps
@@ -1053,7 +1065,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     let r: [u32; 8] = core::array::from_fn(|i| tab[(idx[i] & 7) as usize]);
                     let (lo, hi) = super::dwords_ymm(&r);
                     cpu.xmm[d] = lo;
-                    cpu.ymm_hi[d] = hi;
+                    cpu.set_ymm_hi(d, hi);
                 }
                 2 => {
                     // Vperm2f128 / Vperm2i128
@@ -1081,7 +1093,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                         }
                     };
                     cpu.xmm[d] = pick(imm & 0xF);
-                    cpu.ymm_hi[d] = pick((imm >> 4) & 0xF);
+                    cpu.set_ymm_hi(d, pick((imm >> 4) & 0xF));
                 }
                 3 => {
                     // Vinsertf128 / Vinserti128
@@ -1096,10 +1108,10 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     };
                     if imm == 0 {
                         cpu.xmm[d] = inserted;
-                        cpu.ymm_hi[d] = hi;
+                        cpu.set_ymm_hi(d, hi);
                     } else {
                         cpu.xmm[d] = lo;
-                        cpu.ymm_hi[d] = inserted;
+                        cpu.set_ymm_hi(d, inserted);
                     }
                 }
                 4 => {
@@ -1111,13 +1123,13 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     } else {
                         let d = op.r0 as usize & 15;
                         cpu.xmm[d] = val;
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
                 _ => {
                     // Vzeroall
                     cpu.xmm = [0; 16];
-                    cpu.ymm_hi = [0; 16];
+                    cpu.clear_all_ymm_hi();
                 }
             }
         }

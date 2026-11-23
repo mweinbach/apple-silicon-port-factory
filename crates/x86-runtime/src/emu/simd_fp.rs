@@ -191,7 +191,7 @@ impl Cpu {
                             | Mnemonic::Vaesimc
                             | Mnemonic::Vaeskeygenassist
                     ) {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }
@@ -203,7 +203,7 @@ impl Cpu {
                         _ => 0,
                     };
                     cpu.xmm[d] = val;
-                    cpu.ymm_hi[d] = val;
+                    cpu.set_ymm_hi(d, val);
                 }
             }
             Mnemonic::Rsqrtss | Mnemonic::Vrsqrtss | Mnemonic::Rcpss | Mnemonic::Vrcpss => {
@@ -224,7 +224,7 @@ impl Cpu {
                     let r = if is_rsqrt { 1.0f32 / sse_sqrt32(x) } else { 1.0f32 / x };
                     cpu.xmm[d] = (hi & !0xFFFF_FFFF) | (r.to_bits() as u128);
                     if matches!(mn, Mnemonic::Vrsqrtss | Mnemonic::Vrcpss) {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }
@@ -300,7 +300,7 @@ impl Cpu {
                         cpu.xmm[d] = (a_vec & !0xFFFF_FFFF_FFFF_FFFF) | mask;
                     }
                     if matches!(mn, Mnemonic::Vcmpss | Mnemonic::Vcmpsd) {
-                        cpu.ymm_hi[d] = 0;
+                        cpu.clear_ymm_hi_reg(d);
                     }
                 }
             }
@@ -419,7 +419,7 @@ impl Cpu {
                     let rhs = if neg_acc { -acc } else { acc };
                     let res = lhs.mul_add(m2, rhs);
                     cpu.xmm[d] = (cpu.xmm[d] & !0xFFFF_FFFF) | (res.to_bits() as u128);
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
             }
             Mnemonic::Vfmadd132sd
@@ -478,7 +478,7 @@ impl Cpu {
                     let rhs = if neg_acc { -acc } else { acc };
                     let res = lhs.mul_add(m2, rhs);
                     cpu.xmm[d] = (cpu.xmm[d] & !0xFFFF_FFFF_FFFF_FFFF) | (res.to_bits() as u128);
-                    cpu.ymm_hi[d] = 0;
+                    cpu.clear_ymm_hi_reg(d);
                 }
             }
             Mnemonic::Vfmadd132ps
@@ -539,7 +539,11 @@ impl Cpu {
                         _ => 0,
                     };
                     cpu.xmm[d] = vops::fma_ps(m1.0, m2.0, acc.0, neg_mul, acc_mode);
-                    cpu.ymm_hi[d] = if ymm { vops::fma_ps(m1.1, m2.1, acc.1, neg_mul, acc_mode) } else { 0 };
+                    if ymm {
+                        cpu.set_ymm_hi(d, vops::fma_ps(m1.1, m2.1, acc.1, neg_mul, acc_mode));
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
                 }
             }
             Mnemonic::Vfmadd132pd
@@ -600,7 +604,11 @@ impl Cpu {
                         _ => 0,
                     };
                     cpu.xmm[d] = vops::fma_pd(m1.0, m2.0, acc.0, neg_mul, acc_mode);
-                    cpu.ymm_hi[d] = if ymm { vops::fma_pd(m1.1, m2.1, acc.1, neg_mul, acc_mode) } else { 0 };
+                    if ymm {
+                        cpu.set_ymm_hi(d, vops::fma_pd(m1.1, m2.1, acc.1, neg_mul, acc_mode));
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
                 }
             }
             Mnemonic::Unpckhps | Mnemonic::Vunpckhps | Mnemonic::Punpckhdq | Mnemonic::Vpunpckhdq => {
@@ -1176,7 +1184,7 @@ impl Cpu {
                     let (t_lo, t_hi) = vops::load_vec_op(cpu, ins, 2, true);
                     let (lo, hi) = vops::vpermd_ymm(i_lo, i_hi, t_lo, t_hi);
                     cpu.xmm[d] = lo;
-                    cpu.ymm_hi[d] = hi;
+                    cpu.set_ymm_hi(d, hi);
                 }
             }
             Mnemonic::Vpermq | Mnemonic::Vpermpd => {
@@ -1192,7 +1200,7 @@ impl Cpu {
                     ];
                     let (lo, hi) = qwords_ymm(&r);
                     cpu.xmm[d] = lo;
-                    cpu.ymm_hi[d] = hi;
+                    cpu.set_ymm_hi(d, hi);
                 }
             }
             Mnemonic::Vpsllvd | Mnemonic::Vpsrlvd | Mnemonic::Vpsravd => {
@@ -1205,7 +1213,11 @@ impl Cpu {
                         _ => 2,
                     };
                     cpu.xmm[d] = vops::vpshift_vd(a_lo, c_lo, kind);
-                    cpu.ymm_hi[d] = if ymm { vops::vpshift_vd(a_hi, c_hi, kind) } else { 0 };
+                    if ymm {
+                        cpu.set_ymm_hi(d, vops::vpshift_vd(a_hi, c_hi, kind));
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
                 }
             }
             Mnemonic::Vpsllvq | Mnemonic::Vpsrlvq => {
@@ -1214,7 +1226,11 @@ impl Cpu {
                     let (c_lo, c_hi) = vops::load_vec_op(cpu, ins, 2, ymm);
                     let is_shr = mn == Mnemonic::Vpsrlvq;
                     cpu.xmm[d] = vops::vpshift_vq(a_lo, c_lo, is_shr);
-                    cpu.ymm_hi[d] = if ymm { vops::vpshift_vq(a_hi, c_hi, is_shr) } else { 0 };
+                    if ymm {
+                        cpu.set_ymm_hi(d, vops::vpshift_vq(a_hi, c_hi, is_shr));
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
                 }
             }
             Mnemonic::Pushf | Mnemonic::Pushfq => {

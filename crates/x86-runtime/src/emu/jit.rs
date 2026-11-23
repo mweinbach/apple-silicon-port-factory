@@ -71,7 +71,9 @@ pub(super) struct JitScratch {
     /// `lookup_*` misses served from [`Self::aot_dir`] (drained by [`JitCache::run`]).
     pub aot_probe_hits: u64,
     /// Reserved padding (keeps `ymm_dirty` 2-byte aligned).
-    pub _pad_xmm: u16,
+    pub _pad_xmm: u8,
+    /// Non-zero when `fast::Cpu::rset` should maintain `Cpu::last_bits` (mirrors `PORT_JIT_LAST_BITS` / verify).
+    pub lb_on: u8,
     /// Bitmask of `Cpu::ymm_hi[0..16]` registers that may be non-zero (0 = all upper halves
     /// zero, allowing VEX-128 ops to skip per-op `Cpu::ymm_hi` zeroing stores).
     pub ymm_dirty: u16,
@@ -102,6 +104,7 @@ impl Default for JitScratch {
             aot_dir: 0,
             aot_probe_hits: 0,
             _pad_xmm: 0,
+            lb_on: 1,
             ymm_dirty: 0,
             mxcsr: 0x1F80,
             #[cfg(test)]
@@ -684,6 +687,139 @@ fn gpr_writes(ins: &iced_x86::Instruction, f: &mut iced_x86::InstructionInfoFact
         }
     }
     m
+}
+
+/// Fast-path GPR write bitmask derived directly from pre-decoded [`FastOp`] metadata without
+/// invoking `iced_x86::InstructionInfoFactory::info`. Returns `None` for rare/implicit-register
+/// kinds so callers fall back to [`gpr_writes`].
+#[inline]
+fn fast_gpr_writes(op: &FastOp, ins: &iced_x86::Instruction) -> Option<u16> {
+    use fast::*;
+    let r0 = 1u16 << (op.r0 & 15);
+    Some(match op.kind {
+        K_NOP => {
+            // `rol r, 0` and `rdsspd`/`rdsspq` can also lower to `K_NOP`; only short-circuit true `nop`.
+            if ins.mnemonic() == iced_x86::Mnemonic::Nop {
+                0
+            } else {
+                return None;
+            }
+        }
+        K_MOV_MR
+        | K_MOV_MI
+        | K_ALU_MR
+        | K_ALU_MI
+        | K_CMPJ_RR
+        | K_CMPJ_RI
+        | K_CMPJ_RM
+        | K_JCC
+        | K_JMP
+        | K_JMP_R
+        | K_JMP_M
+        | K_VSHUF_RR
+        | K_VSHUF_RM
+        | K_VINT_RR
+        | K_VINT_RM
+        | K_VFP_RR
+        | K_VFP_RM
+        | K_VST
+        | K_MOVD_XG
+        | K_CVTSI_R
+        | K_CVTSI_M
+        | K_COMI_RR
+        | K_COMI_RM
+        | K_INC_M
+        | K_DEC_M
+        | K_VZU
+        | K_BT_RR
+        | K_BT_RI
+        | K_SETCC_M
+        | K_FLAG_OP
+        | K_SHIFT_MI
+        | K_SHIFT_MCL
+        | K_ROT_MI
+        | K_ROT_MCL
+        | K_MOVBE_MR
+        | K_VBROADCAST
+        | K_PMOVX
+        | K_VCVT_PD
+        | K_VFMA_RR
+        | K_VFMA_RM
+        | K_VBLENDV_RR
+        | K_VBLENDV_RM
+        | K_VTEST_RR
+        | K_VTEST_RM
+        | K_YMM_LANE
+        | K_VAES_RR
+        | K_VAES_RM
+        | K_VCVT_PH
+        | K_VMASKMOV
+        | K_VSHA_RR
+        | K_VSHA_RM => 0,
+        K_ALU_RR | K_ALU_RI | K_ALU_RM => {
+            if matches!(op.x & 0x3F, A_CMP | A_TEST) {
+                0
+            } else {
+                r0
+            }
+        }
+        K_MOV_RR
+        | K_MOV_RM
+        | K_MOV_RI
+        | K_MOVZX_RR
+        | K_MOVZX_RM
+        | K_MOVSX_RR
+        | K_MOVSX_RM
+        | K_LEA
+        | K_INC_R
+        | K_DEC_R
+        | K_SHIFT_RI
+        | K_SHIFT_RCL
+        | K_CMOV_RR
+        | K_CMOV_RM
+        | K_SETCC_R
+        | K_MOVD_GX
+        | K_CVTF2I_R
+        | K_CVTF2I_M
+        | K_IMUL_RR
+        | K_IMUL_RM
+        | K_IMUL_RRI
+        | K_IMUL_RMI
+        | K_NEG_R
+        | K_NOT_R
+        | K_BSF_RR
+        | K_BSF_RM
+        | K_ROT_RI
+        | K_BSWAP_R
+        | K_BSR_RR
+        | K_BSR_RM
+        | K_TZCNT_RR
+        | K_TZCNT_RM
+        | K_LZCNT_RR
+        | K_LZCNT_RM
+        | K_POPCNT_RR
+        | K_POPCNT_RM
+        | K_BIT_RR
+        | K_BIT_RI
+        | K_SHD_RI
+        | K_SHD_RCL
+        | K_ROT_RCL
+        | K_MOVBE_RM
+        | K_MOVMSK => r0,
+        K_BMI_RR | K_BMI_RM => {
+            if (op.x & 0x3F) == 10 {
+                // `mulx r0, r1, src` writes both destination GPRs.
+                r0 | (1u16 << (op.r1 & 15))
+            } else {
+                r0
+            }
+        }
+        K_PUSH_R | K_PUSH_I | K_PUSH_M | K_POP_M | K_RET | K_CALL | K_CALL_R | K_CALL_M => 1u16 << 4,
+        K_POP_R => r0 | (1u16 << 4),
+        K_LEAVE => (1u16 << 4) | (1u16 << 5),
+        K_XCHG_RR | K_XADD_RR => r0 | (1u16 << (op.r1 & 15)),
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1283,7 +1419,7 @@ fn patch_branch(ins: u32, off: i64) -> u32 {
 // Translation cache.
 // ---------------------------------------------------------------------------------------------
 
-use super::exec_mem::{alloc_jit, icache_invalidate, jit_writable, jit_write_protect};
+use super::exec_mem::{alloc_jit, free_jit, icache_invalidate, jit_writable, jit_write_protect};
 
 const CODE_SIZE: usize = 128 << 20;
 /// Tail of each `JitCache` `MAP_JIT` region reserved for 16-byte exact-TSO unaligned LSE2
@@ -1296,6 +1432,12 @@ const CODE_LIMIT: usize = CODE_SIZE - JIT_LSE2_SLAB;
 const MAX_LSE2_REGIONS: usize = 128;
 
 struct Lse2Region {
+    /// Lock-free seqlock state (mod 4):
+    /// - `0`: FREE (reusable slot)
+    /// - `1`: WRITING (claimed by `register_lse2_region`)
+    /// - `2`: LIVE (readable by signal handlers)
+    /// - `3`: UNREGISTERING (being cleared by `unregister_lse2_region`)
+    seq: core::sync::atomic::AtomicUsize,
     code_lo: core::sync::atomic::AtomicUsize,
     code_hi: core::sync::atomic::AtomicUsize,
     slab_cur: core::sync::atomic::AtomicUsize,
@@ -1305,6 +1447,7 @@ struct Lse2Region {
 impl Lse2Region {
     const fn new() -> Self {
         Self {
+            seq: core::sync::atomic::AtomicUsize::new(0),
             code_lo: core::sync::atomic::AtomicUsize::new(0),
             code_hi: core::sync::atomic::AtomicUsize::new(0),
             slab_cur: core::sync::atomic::AtomicUsize::new(0),
@@ -1314,23 +1457,59 @@ impl Lse2Region {
 }
 
 static LSE2_REGIONS: [Lse2Region; MAX_LSE2_REGIONS] = [const { Lse2Region::new() }; MAX_LSE2_REGIONS];
+/// High-water mark of ever-used slots in `LSE2_REGIONS` (`<= MAX_LSE2_REGIONS`).
 static LSE2_REGION_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Register `[code_lo, code_hi)` with paired patch slab `[slab_lo, slab_hi)` (same `MAP_JIT`
-/// mapping, within ±128 MiB). Returns the slot index if registered.
+/// mapping, within ±128 MiB). Claims any FREE slot (recycling slots released via
+/// [`unregister_lse2_region`]) in a lock-free, async-signal-safe manner.
 pub(super) fn register_lse2_region(code_lo: usize, code_hi: usize, slab_lo: usize, slab_hi: usize) -> Option<usize> {
     use core::sync::atomic::Ordering;
-    let idx = LSE2_REGION_N.fetch_add(1, Ordering::AcqRel);
+    for (idx, r) in LSE2_REGIONS.iter().enumerate() {
+        let s = r.seq.load(Ordering::Acquire);
+        if (s & 3) != 0 {
+            continue;
+        }
+        if r.seq
+            .compare_exchange(s, s.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        r.code_lo.store(code_lo, Ordering::Relaxed);
+        r.code_hi.store(code_hi, Ordering::Relaxed);
+        r.slab_cur.store(slab_lo, Ordering::Relaxed);
+        r.slab_end.store(slab_hi, Ordering::Relaxed);
+        LSE2_REGION_N.fetch_max(idx + 1, Ordering::Release);
+        // Publish LIVE (state 2) with Release so signal handlers observing `seq == s + 2` see all fields.
+        r.seq.store(s.wrapping_add(2), Ordering::Release);
+        return Some(idx);
+    }
+    None
+}
+
+/// Unregister a previously registered LSE2 slot so it can be safely recycled by a future
+/// thread/module without tearing concurrent async-signal-handler readers.
+pub(super) fn unregister_lse2_region(idx: usize) {
+    use core::sync::atomic::{fence, Ordering};
     if idx >= MAX_LSE2_REGIONS {
-        return None;
+        return;
     }
     let r = &LSE2_REGIONS[idx];
-    r.code_lo.store(code_lo, Ordering::Relaxed);
-    r.slab_cur.store(slab_lo, Ordering::Relaxed);
-    r.slab_end.store(slab_hi, Ordering::Relaxed);
-    // Publish last with Release so signal handlers observing `code_hi != 0` see all fields.
-    r.code_hi.store(code_hi, Ordering::Release);
-    Some(idx)
+    let s = r.seq.load(Ordering::Acquire);
+    if (s & 3) != 2 {
+        return;
+    }
+    // Transition LIVE (2) -> UNREGISTERING (3); signal handlers reject any slot whose `seq & 3 != 2`
+    // or whose `seq` changed across their read fence.
+    r.seq.store(s.wrapping_add(1), Ordering::Release);
+    fence(Ordering::SeqCst);
+    r.code_hi.store(0, Ordering::Relaxed);
+    r.code_lo.store(0, Ordering::Relaxed);
+    r.slab_cur.store(0, Ordering::Relaxed);
+    r.slab_end.store(0, Ordering::Relaxed);
+    // Transition UNREGISTERING (3) -> FREE (0) so a new registration may reclaim this slot.
+    r.seq.store(s.wrapping_add(2), Ordering::Release);
 }
 
 /// Reset a `JitCache` slot's patch slab cursor when the thread flushes its code buffer.
@@ -1345,24 +1524,31 @@ fn reset_lse2_slab(idx: usize, slab_lo: usize) {
 /// (`ldur; dmb ishld; b pc+4` or `dmb ishst; stur; b pc+4`). Subsequent executions of `pc`
 /// run natively with zero `SIGBUS` traps while preserving exact x86 TSO semantics.
 pub(super) unsafe fn patch_lse2_unaligned(pc: usize, insn: u32) -> bool {
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{fence, AtomicU32, Ordering};
     if !jit_writable() {
         return false;
     }
     let n = LSE2_REGION_N.load(Ordering::Acquire).min(MAX_LSE2_REGIONS);
-    let mut found = None;
+    let mut found: Option<(&Lse2Region, usize, usize)> = None;
     for r in &LSE2_REGIONS[..n] {
-        let hi = r.code_hi.load(Ordering::Acquire);
-        if hi == 0 {
+        let s1 = r.seq.load(Ordering::Acquire);
+        if (s1 & 3) != 2 {
             continue;
         }
+        let hi = r.code_hi.load(Ordering::Relaxed);
         let lo = r.code_lo.load(Ordering::Relaxed);
+        let slab_end = r.slab_end.load(Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let s2 = r.seq.load(Ordering::Relaxed);
+        if s1 != s2 || hi == 0 {
+            continue;
+        }
         if pc >= lo && pc < hi {
-            found = Some(r);
+            found = Some((r, s1, slab_end));
             break;
         }
     }
-    let Some(r) = found else {
+    let Some((r, seq_live, slab_end)) = found else {
         return false;
     };
     // Already patched concurrently by another thread?
@@ -1390,7 +1576,9 @@ pub(super) unsafe fn patch_lse2_unaligned(pc: usize, insn: u32) -> bool {
         return false;
     };
     let isl = r.slab_cur.fetch_add(16, Ordering::AcqRel);
-    let slab_end = r.slab_end.load(Ordering::Relaxed);
+    if r.seq.load(Ordering::Acquire) != seq_live {
+        return false;
+    }
     if isl.saturating_add(16) > slab_end || !b_reach(pc, isl) || !b_reach(isl + 8, pc + 4) {
         return false;
     }
@@ -1507,6 +1695,25 @@ pub(super) struct JitCache {
     aot_epoch: u32,
     /// Slot index in [`LSE2_REGIONS`] for this cache's unaligned-LSE2 patch slab.
     lse2_slot: Option<usize>,
+    /// Reusable per-thread translation scratch buffers + `iced_x86::InstructionInfoFactory`.
+    tr_scratch: TrScratch,
+}
+
+impl Drop for JitCache {
+    fn drop(&mut self) {
+        if let Some(slot) = self.lse2_slot.take() {
+            unregister_lse2_region(slot);
+        }
+        if !self.mem.is_null() {
+            unsafe { free_jit(self.mem, CODE_SIZE) };
+            self.mem = core::ptr::null_mut();
+        }
+        if !self.ras_ring.is_null() {
+            let layout = std::alloc::Layout::from_size_align(RAS_BYTES, RAS_BYTES).unwrap();
+            unsafe { std::alloc::dealloc(self.ras_ring as *mut u8, layout) };
+            self.ras_ring = core::ptr::null_mut();
+        }
+    }
 }
 
 /// Shadow return-address stack entries (16 bytes each; the ring is 64 KiB).
@@ -1549,6 +1756,41 @@ impl JitCache {
             compile_ns: 0,
             aot_epoch: 0,
             lse2_slot: None,
+            tr_scratch: TrScratch::new(),
+        }
+    }
+
+    /// Ultra-fast read-only probe for a live, already-compiled dynamic JIT/AOT block at `ip`.
+    /// Returns `Some(code)` only when `self` is in dynamic JIT mode (no static AOT bound),
+    /// all generation counters (`va_gen`, `aot_epoch`, `static_aot_gen`) are current, and
+    /// `index[jslot(ip)]` holds a validated entry for `ip`. Because every such entry passed
+    /// [`prep_block_with`] or [`super::aot::check_block`] under the current `va_gen`, callers
+    /// can bypass the per-block DLL/regfile/IAT routing checks on a hit.
+    #[inline(always)]
+    pub(super) unsafe fn lookup_fast_hit(&self, ip: u64) -> Option<usize> {
+        if self.disabled
+            || self.static_only
+            || self.mem.is_null()
+            || self.enter == 0
+            || self.index.is_empty()
+            || super::exec_mem::has_bound_static_aot()
+        {
+            return None;
+        }
+        if crate::diag::jit_filter_active() && !crate::diag::jit_allows(ip) {
+            return None;
+        }
+        if self.va_gen != crate::exe::va_gen()
+            || self.aot_epoch != super::aot::epoch()
+            || self.static_aot_gen != super::exec_mem::static_aot_gen()
+        {
+            return None;
+        }
+        let e = self.index.get_unchecked(jslot(ip));
+        if e.ip == ip && e.code != 0 && (e.gen == 0 || e.gen == mem::code_gen()) {
+            Some(e.code as usize)
+        } else {
+            None
         }
     }
 
@@ -1590,7 +1832,13 @@ impl JitCache {
         self.no_jit = v;
         self.disabled = false;
         if v {
-            self.mem = core::ptr::null_mut();
+            if let Some(slot) = self.lse2_slot.take() {
+                unregister_lse2_region(slot);
+            }
+            if !self.mem.is_null() {
+                unsafe { free_jit(self.mem, CODE_SIZE) };
+                self.mem = core::ptr::null_mut();
+            }
             self.meta = Box::new([]);
             if self.index.is_empty() {
                 self.index = unsafe { super::zeroed_slice::<JEnt>(JLEN) };
@@ -1749,7 +1997,7 @@ impl JitCache {
         self.aot_epoch = super::aot::epoch();
         self.hot = hot_threshold();
         let ring = if ras_enabled() {
-            // Leaked with the code buffer (thread-lifetime, like the translations).
+            // Released in `Drop for JitCache` along with the `MAP_JIT` code buffer.
             std::alloc::alloc(std::alloc::Layout::from_size_align(RAS_BYTES, RAS_BYTES).unwrap()) as *mut [u64; 2]
         } else {
             core::ptr::null_mut()
@@ -1960,13 +2208,17 @@ impl JitCache {
         } else {
             0
         };
-        let mut yd = 0u16;
+        // `cpu.jx.ymm_dirty` is maintained incrementally across interpreter and translated writes;
+        // skip the 256-byte `cpu.ymm_hi` scan on every `JitCache::run()`.
+        #[cfg(debug_assertions)]
         for i in 0..16 {
-            if cpu.ymm_hi[i] != 0 {
-                yd |= 1 << i;
-            }
+            debug_assert!(
+                cpu.ymm_hi[i] == 0 || (cpu.jx.ymm_dirty & (1u16 << i)) != 0,
+                "ymm_dirty stale at reg {i} on JitCache::run(): ymm_hi={:#x}, ymm_dirty={:#x}",
+                cpu.ymm_hi[i],
+                cpu.jx.ymm_dirty
+            );
         }
-        cpu.jx.ymm_dirty = yd;
         if !self.ras_ring.is_null() {
             cpu.jx.ras = self.ras_top;
             cpu.jx.ctx_ras_cell = &mut self.ras_top as *mut u64 as usize;
@@ -2047,6 +2299,7 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.aot_dir = 0;
+        // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
         let mut yd = 0u16;
         for i in 0..16 {
             if cpu.ymm_hi[i] != 0 {
@@ -2242,7 +2495,7 @@ impl JitCache {
 
     unsafe fn translate_jit(&mut self, ip: u64, bc: *mut BlockCache) -> Option<usize> {
         let s = jslot(ip);
-        let Some(p) = prep_block(bc, ip) else {
+        let Some(p) = prep_block_with(bc, ip, &mut self.tr_scratch.info_factory) else {
             let ent = JEnt { ip, hits: NOJIT, ..JEnt::default() };
             self.index[s] = ent;
             self.compiled.insert(ip, (ent, JMeta::default()));
@@ -2260,12 +2513,12 @@ impl JitCache {
         let start = self.cursor;
         let base = self.mem.add(start) as *mut u32;
         let st = self.stub_addrs();
-        let mut tr = new_tr(Asm::new(base, base as usize, MAX_BLOCK_BYTES / 4), ops, &p, &st, false);
+        let mut tr = new_tr(Asm::new(base, base as usize, MAX_BLOCK_BYTES / 4), ops, &p, &st, false, &mut self.tr_scratch);
         let _main_words = tr.translate(p.term, p.live_out);
         let words = tr.a.pos;
         let overflow = tr.a.overflow;
-        let links = core::mem::take(&mut tr.links);
-        drop(tr);
+        let mut links = core::mem::take(&mut tr.links);
+        tr.return_scratch(&mut self.tr_scratch);
         #[cfg(test)]
         if !overflow {
             TEST_DUMP.with(|d| {
@@ -2276,6 +2529,8 @@ impl JitCache {
             });
         }
         if overflow {
+            links.clear();
+            self.tr_scratch.links = links;
             jit_write_protect(true);
             log::warn!("emu jit: block at {ip:#x} exceeded the per-block code limit; interpreting it");
             let ent = JEnt { ip, hits: NOJIT, ..JEnt::default() };
@@ -2285,10 +2540,11 @@ impl JitCache {
         }
         let code = self.mem as usize + start;
         self.cursor = (start + words * 4 + 15) & !15;
-        let mut patched: Vec<usize> = Vec::new();
+        let mut patched = core::mem::take(&mut self.tr_scratch.patched);
+        patched.clear();
         // This block's own direct links (far AOT targets go through a 16-byte branch island).
         let mut far_sites = 0u64;
-        for (site_pos, target) in links {
+        for &(site_pos, target) in &links {
             let site = code + site_pos * 4;
             match self.linkable(target) {
                 Some(tc) if b_reach(site, tc) => {
@@ -2309,6 +2565,8 @@ impl JitCache {
                 }
             }
         }
+        links.clear();
+        self.tr_scratch.links = links;
         if far_sites != 0 && super::jit_stats::enabled() {
             super::jit_stats::aot_event(super::jit_stats::TW_FAR, far_sites);
         }
@@ -2334,9 +2592,11 @@ impl JitCache {
         self.compiled.insert(ip, (ent, meta));
         jit_write_protect(true);
         icache_invalidate(code as *mut u8, words * 4);
-        for site in patched {
+        for &site in &patched {
             icache_invalidate(site as *mut u8, 4);
         }
+        patched.clear();
+        self.tr_scratch.patched = patched;
         if gen == 0 {
             super::aot::profile_note(ip);
         }
@@ -2395,6 +2655,17 @@ pub(super) struct Prep {
 /// Decode and analyse the block at `ip`; None = not translatable (decode error, no
 /// supported prefix, `__chkstk`).
 pub(super) unsafe fn prep_block(bc: *mut BlockCache, ip: u64) -> Option<Prep> {
+    let mut f = iced_x86::InstructionInfoFactory::new();
+    prep_block_with(bc, ip, &mut f)
+}
+
+/// [`prep_block`] reusing a caller-owned `InstructionInfoFactory` (eliminating per-block
+/// heap/struct construction) and fast-pathing GPR write masks for common [`FastOp`] kinds.
+unsafe fn prep_block_with(
+    bc: *mut BlockCache,
+    ip: u64,
+    f: &mut iced_x86::InstructionInfoFactory,
+) -> Option<Prep> {
     let mut dummy = 0u64;
     let (off, n) = BlockCache::get(bc, ip, &mut dummy).ok()?;
     let mut ops = [FastOp::default(); BLK_MAX_INSNS];
@@ -2417,9 +2688,18 @@ pub(super) unsafe fn prep_block(bc: *mut BlockCache, ip: u64) -> Option<Prep> {
     // (`arena[off + i]` is the decoded instruction of `ops[i]`).
     let mut wr = [0u16; BLK_MAX_INSNS];
     if memchk_mask() & 12 != 0 {
-        let mut f = iced_x86::InstructionInfoFactory::new();
         for (i, w) in wr.iter_mut().enumerate().take(k) {
-            *w = gpr_writes(&(&(*bc).arena)[off + i], &mut f);
+            let ins = &(&(*bc).arena)[off + i];
+            let mask = fast_gpr_writes(&ops[i], ins).unwrap_or_else(|| gpr_writes(ins, f));
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                mask,
+                gpr_writes(ins, f),
+                "fast_gpr_writes mismatch for kind={} ins={:?}",
+                ops[i].kind,
+                ins
+            );
+            *w = mask;
         }
     }
     // Successor flag needs (may decode further blocks; `ops` is a private copy).
@@ -2516,20 +2796,90 @@ pub(super) unsafe fn prep_block(bc: *mut BlockCache, ip: u64) -> Option<Prep> {
     Some(Prep { ops, k, host, wr, term, target_host: resolved[0], lazy, edge, live_out })
 }
 
+/// Reusable per-thread / per-worker scratch vectors + `InstructionInfoFactory` for block
+/// translation (`JitCache::translate_jit` and `aot_translate`), avoiding ~13 fresh heap
+/// allocations per translated block.
+pub(super) struct TrScratch {
+    info_factory: iced_x86::InstructionInfoFactory,
+    side_exits: Vec<SideExit>,
+    slow: Vec<SlowMem>,
+    links: Vec<(usize, u64)>,
+    cond_links: Vec<(usize, u64)>,
+    link_conds: Vec<(usize, usize)>,
+    ymm_colds: Vec<(usize, usize, u16)>,
+    cold: Vec<ColdNan>,
+    lits: Vec<(usize, u64)>,
+    lits128: Vec<(usize, u64, u64)>,
+    pool: Vec<(u64, usize)>,
+    pool128: Vec<(u64, u64, usize)>,
+    rlits: Vec<(usize, u64, AotReloc)>,
+    relocs: Vec<AotReloc>,
+    patched: Vec<usize>,
+}
+
+impl TrScratch {
+    pub(super) fn new() -> Self {
+        Self {
+            info_factory: iced_x86::InstructionInfoFactory::new(),
+            side_exits: Vec::new(),
+            slow: Vec::new(),
+            links: Vec::new(),
+            cond_links: Vec::new(),
+            link_conds: Vec::new(),
+            ymm_colds: Vec::new(),
+            cold: Vec::new(),
+            lits: Vec::new(),
+            lits128: Vec::new(),
+            pool: Vec::new(),
+            pool128: Vec::new(),
+            rlits: Vec::new(),
+            relocs: Vec::new(),
+            patched: Vec::new(),
+        }
+    }
+}
+
 /// A fresh translator for `ops` (the prefix of `p.ops`) emitting into `a`; `aot`: AOT
 /// emission mode (host-pointer literals always in the pool and recorded as relocations).
-fn new_tr<'a>(a: Asm, ops: &'a [FastOp], p: &Prep, st: &StubAddrs, aot: bool) -> Tr<'a> {
+/// Borrows reusable vector capacities from `sc`; call [`Tr::return_scratch`] when done.
+fn new_tr<'a>(a: Asm, ops: &'a [FastOp], p: &Prep, st: &StubAddrs, aot: bool, sc: &mut TrScratch) -> Tr<'a> {
+    let mut side_exits = core::mem::take(&mut sc.side_exits);
+    let mut slow = core::mem::take(&mut sc.slow);
+    let mut links = core::mem::take(&mut sc.links);
+    let mut cond_links = core::mem::take(&mut sc.cond_links);
+    let mut link_conds = core::mem::take(&mut sc.link_conds);
+    let mut ymm_colds = core::mem::take(&mut sc.ymm_colds);
+    let mut cold = core::mem::take(&mut sc.cold);
+    let mut lits = core::mem::take(&mut sc.lits);
+    let mut lits128 = core::mem::take(&mut sc.lits128);
+    let mut pool = core::mem::take(&mut sc.pool);
+    let mut pool128 = core::mem::take(&mut sc.pool128);
+    let mut rlits = core::mem::take(&mut sc.rlits);
+    let mut relocs = core::mem::take(&mut sc.relocs);
+    side_exits.clear();
+    slow.clear();
+    links.clear();
+    cond_links.clear();
+    link_conds.clear();
+    ymm_colds.clear();
+    cold.clear();
+    lits.clear();
+    lits128.clear();
+    pool.clear();
+    pool128.clear();
+    rlits.clear();
+    relocs.clear();
     Tr {
         a,
         ops,
         live: [0; BLK_MAX_INSNS + 1],
         fs: FlagState { src: Src::None, host: 0, mem: FALL },
         lb: [LB_NONE; 16],
-        side_exits: Vec::new(),
-        slow: Vec::new(),
-        links: Vec::new(),
-        cond_links: Vec::new(),
-        link_conds: Vec::new(),
+        side_exits,
+        slow,
+        links,
+        cond_links,
+        link_conds,
         cold_code_end: 0,
         exit: st.exit,
         lookup_rip: st.lookup_rip,
@@ -2551,7 +2901,7 @@ fn new_tr<'a>(a: Asm, ops: &'a [FastOp], p: &Prep, st: &StubAddrs, aot: bool) ->
         xon: xmmreg_enabled(),
         xpin: xmm_pin_enabled(),
         ymm_clean: 0,
-        ymm_colds: Vec::new(),
+        ymm_colds,
         xmm_hi32_zero: 0,
         xmm_hi64_zero: 0,
         xmm_hi32_live: [0xFFFF; BLK_MAX_INSNS + 1],
@@ -2565,16 +2915,18 @@ fn new_tr<'a>(a: Asm, ops: &'a [FastOp], p: &Prep, st: &StubAddrs, aot: bool) ->
         lb_on: last_bits_enabled(),
         xv: if xmm_pin_enabled() { 0xFFFF } else { 0 },
         xd: 0,
-        cold: Vec::new(),
+        cold,
         retlit: retlit_enabled(),
-        lits: Vec::new(),
-        lits128: Vec::new(),
+        lits,
+        lits128,
+        pool,
+        pool128,
         lazy: p.lazy,
         edge: p.edge,
         pf: PF_NONE,
         aot,
-        rlits: Vec::new(),
-        relocs: Vec::new(),
+        rlits,
+        relocs,
     }
 }
 
@@ -3021,6 +3373,7 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     a.stp_x(12, 13, 31, 32);
     a.stp_x(14, 15, 31, 48);
     a.stp_x(30, T3, 31, 64);
+    a.str(64, 1, 31, 88); // preserve tagged host pointer (bit 1 = needs_xmm) across blr
     let no_xmm_in = a.tbz(1, 1);
     if xpin {
         a.v_mov(0, 16);
@@ -3032,6 +3385,9 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
         a.ldp_q(2, 3, XCPU, (OFF_XMM + 32) as i32);
     }
     a.bind(no_xmm_in);
+    // AAPCS64 designates `v16..v31` as caller-saved; even integer-only `DF_PLAIN` builtins
+    // (e.g. `memcpy`/`memset` via NEON or LLVM auto-vectorized Rust) can clobber `v16..v31`,
+    // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
     if let Some(sp_pos) = spill_xmm {
         let sp_addr = a.addr_of(sp_pos);
         a.bl_to(sp_addr);
@@ -3044,11 +3400,18 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     }
     a.ldp_x(4, 5, g(4), 0x20);
     a.ldp_x(6, 7, g(4), 0x30);
+    // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
+    a.ldr(32, XS, XCPU, OFF_MXCSR);
+    a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
+    a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
+    a.str(64, ZR, 31, 80); // saved_fpcr = 0
+    let fpcr_plain_def = a.cbz(false, XS);
     a.mrs_fpcr(XS);
     a.str(64, XS, 31, 80);
     let fpcr_plain_z = a.cbz(true, XS);
     a.msr_fpcr(ZR);
     a.bind(fpcr_plain_z);
+    a.bind(fpcr_plain_def);
     a.blr(XA);
     a.ldr(64, XS, 31, 80);
     let fpcr_plain_r = a.cbz(true, XS);
@@ -3061,10 +3424,17 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     if let Some(rl_pos) = reload_xmm {
         let rl_addr = a.addr_of(rl_pos);
         a.bl_to(rl_addr);
+    }
+    // Only write `q0` back to guest `xmm0` for float-ABI (`needs_xmm`, bit 1 == 1) callees;
+    // integer-only `DF_PLAIN` builtins preserve guest `xmm0` rather than overwriting it with leftover `q0`.
+    a.ldr(64, XS, 31, 88);
+    let no_xmm_out = a.tbz(XS, 1);
+    if xpin {
         a.v_mov(16, 0);
     } else {
         a.str(128, 0, XCPU, OFF_XMM);
     }
+    a.bind(no_xmm_out);
     if ras {
         a.ldr(64, XRAS, XCPU, OFF_RAS);
     }
@@ -3147,6 +3517,7 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     a.stp_x(12, 13, 31, 32);
     a.stp_x(14, 15, 31, 48);
     a.stp_x(30, T3, 31, 64);
+    a.str(64, 1, 31, 88); // preserve tagged host pointer (bit 1 = needs_xmm) across blr
     let no_xmm_in_jmp = a.tbz(1, 1);
     if xpin {
         a.v_mov(0, 16);
@@ -3158,6 +3529,8 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
         a.ldp_q(2, 3, XCPU, (OFF_XMM + 32) as i32);
     }
     a.bind(no_xmm_in_jmp);
+    // AAPCS64 designates `v16..v31` as caller-saved (clobbered by NEON `memcpy`/`memset`/Rust),
+    // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
     if let Some(sp_pos) = spill_xmm {
         let sp_addr = a.addr_of(sp_pos);
         a.bl_to(sp_addr);
@@ -3170,11 +3543,18 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     }
     a.ldp_x(4, 5, g(4), 0x20);
     a.ldp_x(6, 7, g(4), 0x30);
+    // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
+    a.ldr(32, XS, XCPU, OFF_MXCSR);
+    a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
+    a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
+    a.str(64, ZR, 31, 80); // saved_fpcr = 0
+    let fpcr_pj_def = a.cbz(false, XS);
     a.mrs_fpcr(XS);
     a.str(64, XS, 31, 80);
     let fpcr_pj_z = a.cbz(true, XS);
     a.msr_fpcr(ZR);
     a.bind(fpcr_pj_z);
+    a.bind(fpcr_pj_def);
     a.blr(XA);
     a.ldr(64, XS, 31, 80);
     let fpcr_pj_r = a.cbz(true, XS);
@@ -3187,10 +3567,16 @@ fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>) {
     if let Some(rl_pos) = reload_xmm {
         let rl_addr = a.addr_of(rl_pos);
         a.bl_to(rl_addr);
+    }
+    // Only write `q0` back to guest `xmm0` for float-ABI (`needs_xmm`, bit 1 == 1) callees.
+    a.ldr(64, XS, 31, 88);
+    let no_xmm_out_jmp = a.tbz(XS, 1);
+    if xpin {
         a.v_mov(16, 0);
     } else {
         a.str(128, 0, XCPU, OFF_XMM);
     }
+    a.bind(no_xmm_out_jmp);
     if ras {
         a.ldr(64, XRAS, XCPU, OFF_RAS);
     }
@@ -3871,6 +4257,9 @@ struct Tr<'a> {
     lits: Vec<(usize, u64)>,
     /// 16-byte `ldr qt, <literal>` sites `(site_word, lo64, hi64)` (16B-aligned pool).
     lits128: Vec<(usize, u64, u64)>,
+    /// Reusable deduplication pools for [`Self::emit_lits`].
+    pool: Vec<(u64, usize)>,
+    pool128: Vec<(u64, u64, usize)>,
     /// `AW2_JIT_FLAGLAZY` (see `jit_lazy.rs`).
     lazy: bool,
     /// Per-edge successor flag needs and `last_bits` kills.
@@ -4094,7 +4483,7 @@ impl Tr<'_> {
             self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * n) as u32, false);
             self.exit_side(self.ops[0].ip);
         }
-        let slow = core::mem::take(&mut self.slow);
+        let mut slow = core::mem::take(&mut self.slow);
         for s in &slow {
             self.a.bind(s.fix);
             if let Some(se) = s.exit {
@@ -4116,8 +4505,10 @@ impl Tr<'_> {
             self.a.b();
             self.a.patch(here, s.back);
         }
-        let ymm_colds = core::mem::take(&mut self.ymm_colds);
-        for (fix, back, mask) in ymm_colds {
+        slow.clear();
+        self.slow = slow;
+        let mut ymm_colds = core::mem::take(&mut self.ymm_colds);
+        for &(fix, back, mask) in &ymm_colds {
             self.a.bind(fix);
             self.a.movz(false, XA, mask as u32, 0);
             self.a.bl_to(self.clear_ymm_hi);
@@ -4125,8 +4516,10 @@ impl Tr<'_> {
             self.a.b();
             self.a.patch(here, back);
         }
+        ymm_colds.clear();
+        self.ymm_colds = ymm_colds;
         self.emit_cold_nan();
-        let ses = core::mem::take(&mut self.side_exits);
+        let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
             if se.fix == usize::MAX {
                 continue;
@@ -4146,13 +4539,17 @@ impl Tr<'_> {
             self.exit_side(self.ops[se.k].ip);
             (self.fs, self.lb, self.pf) = saved;
         }
-        let cond_links = core::mem::take(&mut self.cond_links);
+        ses.clear();
+        self.side_exits = ses;
+        let mut cond_links = core::mem::take(&mut self.cond_links);
         for &(cond_site, target) in &cond_links {
             self.a.bind(cond_site);
             let site = self.a.b();
             self.links.push((site, target));
             self.link_conds.push((site, cond_site));
         }
+        cond_links.clear();
+        self.cond_links = cond_links;
         let links = core::mem::take(&mut self.links);
         for &(site, target) in &links {
             self.a.bind(site);
@@ -4163,6 +4560,36 @@ impl Tr<'_> {
         self.cold_code_end = self.a.pos;
         self.emit_lits();
         main
+    }
+
+    /// Return all reusable scratch `Vec` buffers back to `sc` (cleared, preserving heap capacity).
+    fn return_scratch(mut self, sc: &mut TrScratch) {
+        self.side_exits.clear();
+        self.slow.clear();
+        self.links.clear();
+        self.cond_links.clear();
+        self.link_conds.clear();
+        self.ymm_colds.clear();
+        self.cold.clear();
+        self.lits.clear();
+        self.lits128.clear();
+        self.pool.clear();
+        self.pool128.clear();
+        self.rlits.clear();
+        self.relocs.clear();
+        sc.side_exits = self.side_exits;
+        sc.slow = self.slow;
+        sc.links = self.links;
+        sc.cond_links = self.cond_links;
+        sc.link_conds = self.link_conds;
+        sc.ymm_colds = self.ymm_colds;
+        sc.cold = self.cold;
+        sc.lits = self.lits;
+        sc.lits128 = self.lits128;
+        sc.pool = self.pool;
+        sc.pool128 = self.pool128;
+        sc.rlits = self.rlits;
+        sc.relocs = self.relocs;
     }
 
     /// Store `rip` and exit with `EXIT_SIDE` (interpreter runs that instruction itself).
@@ -4574,6 +5001,9 @@ impl Tr<'_> {
             }
             self.a.bind(slow);
         }
+        // AAPCS64 designates `v16..v31` as caller-saved; even integer-only `DF_PLAIN` builtins
+        // (e.g. NEON `memcpy`/`memset` or LLVM auto-vectorized Rust) can clobber `v16..v31`,
+        // so pinned XMM registers must always be spilled before `blr` and reloaded afterward.
         if self.xpin {
             self.a.bl_to(self.spill_xmm);
         }
@@ -4600,11 +5030,18 @@ impl Tr<'_> {
         self.a.stp_x(12, 13, 31, 32);
         self.a.stp_x(14, 15, 31, 48);
         self.mov_host_lit(XA, h, hva, bail.is_some(), src);
+        // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
+        self.a.ldr(32, XS, XCPU, OFF_MXCSR);
+        self.a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
+        self.a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
+        self.a.str(64, ZR, 31, 64); // saved_fpcr = 0
+        let fpcr_def = self.a.cbz(false, XS);
         self.a.mrs_fpcr(XS);
         self.a.str(64, XS, 31, 64);
         let fpcr_zero = self.a.cbz(true, XS);
         self.a.msr_fpcr(ZR);
         self.a.bind(fpcr_zero);
+        self.a.bind(fpcr_def);
         self.a.blr(XA);
         self.a.ldr(64, XS, 31, 64);
         let fpcr_keep = self.a.cbz(true, XS);
@@ -4630,10 +5067,14 @@ impl Tr<'_> {
             self.a.bind(ok);
         }
         self.a.mov_rr(true, g(0), 0);
-        if self.xpin {
-            self.a.v_mov(16, 0);
-        } else {
-            self.a.str(128, 0, XCPU, OFF_XMM);
+        // Only write `q0` back to guest `xmm0` for float-ABI (`needs_xmm`) callees; integer-only
+        // `DF_PLAIN` builtins preserve guest `xmm0` instead of clobbering it with leftover `q0`.
+        if needs_xmm {
+            if self.xpin {
+                self.a.v_mov(16, 0);
+            } else {
+                self.a.str(128, 0, XCPU, OFF_XMM);
+            }
         }
         self.set_lb(0, 64);
         self.flush_lb();
@@ -4714,8 +5155,9 @@ impl Tr<'_> {
         if memchk_mask() & 4 == 0 {
             return;
         }
-        // (base, base version, op, disp) in program order.
-        let mut acc: Vec<(u8, u16, usize, i64)> = Vec::new();
+        // (base, base version, op, disp) in program order (fixed stack arrays, zero heap allocs).
+        let mut acc = [(0u8, 0u16, 0usize, 0i64); BLK_MAX_INSNS];
+        let mut acc_n = 0usize;
         let mut ver = [0u16; 16];
         for k in 0..self.ops.len() {
             let op = self.ops[k];
@@ -4748,7 +5190,8 @@ impl Tr<'_> {
             };
             let b = op.base;
             if kind_ok && b < RNONE && b != 4 && op.index == RNONE && (-4095..=4095).contains(&op.disp) {
-                acc.push((b, ver[b as usize], k, op.disp));
+                acc[acc_n] = (b, ver[b as usize], k, op.disp);
+                acc_n += 1;
             }
             let w = self.wr[k];
             for (r, v) in ver.iter_mut().enumerate() {
@@ -4758,17 +5201,19 @@ impl Tr<'_> {
             }
         }
         let mut id = 0u8;
-        let mut done = vec![false; acc.len()];
-        for i in 0..acc.len() {
+        let mut done = [false; BLK_MAX_INSNS];
+        let mut mem = [0usize; BLK_MAX_INSNS];
+        for i in 0..acc_n {
             if done[i] || id >= 64 {
                 continue;
             }
             let (b, v, _, _) = acc[i];
             // Members: same base value, greedily while the span stays within 4 KiB (with
             // 32 bytes for the widest 256-bit vector access).
-            let mut mem = vec![i];
+            mem[0] = i;
+            let mut mem_n = 1usize;
             let (mut lo, mut hi) = (acc[i].3, acc[i].3);
-            for j in i + 1..acc.len() {
+            for j in i + 1..acc_n {
                 if done[j] || acc[j].0 != b || acc[j].1 != v {
                     continue;
                 }
@@ -4777,12 +5222,13 @@ impl Tr<'_> {
                     continue;
                 }
                 (lo, hi) = (nl, nh);
-                mem.push(j);
+                mem[mem_n] = j;
+                mem_n += 1;
             }
-            if mem.len() < 2 {
+            if mem_n < 2 {
                 continue;
             }
-            for (n, &j) in mem.iter().enumerate() {
+            for (n, &j) in mem[..mem_n].iter().enumerate() {
                 done[j] = true;
                 let k = acc[j].2;
                 self.grp[k] = if n == 0 { Grp::Lead { lo: (lo - acc[j].3) as i16, id } } else { Grp::Member { id } };
@@ -7452,6 +7898,55 @@ mod tests {
             assert!(!jc.static_only);
             assert_eq!(jc.enter, 0);
             assert!(jc.is_interp_sticky(ip));
+        }
+    }
+
+    #[test]
+    fn lse2_regions_recycle_and_jit_cache_drop_reclaims_slots() {
+        // 1. Direct register/unregister cycle well past MAX_LSE2_REGIONS (128).
+        let mut first_batch = Vec::new();
+        for i in 0..8usize {
+            let base = 0x5_0000_0000usize + i * 0x10_0000;
+            let slot = register_lse2_region(base, base + 0x8_0000, base + 0x8_0000, base + 0xC_0000)
+                .expect("initial LSE2 slot available");
+            first_batch.push(slot);
+        }
+        for &slot in &first_batch {
+            unregister_lse2_region(slot);
+        }
+        // Repeatedly register and unregister more times than MAX_LSE2_REGIONS; every iteration must succeed.
+        for i in 0..(MAX_LSE2_REGIONS + 64) {
+            let base = 0x5_1000_0000usize + (i & 0xFF) * 0x10_0000;
+            let slot = register_lse2_region(base, base + 0x8_0000, base + 0x8_0000, base + 0xC_0000)
+                .expect("LSE2 slot must be recycled after unregister");
+            unregister_lse2_region(slot);
+        }
+        // Re-claiming 8 slots must reuse slots within `0..MAX_LSE2_REGIONS`.
+        let mut second_batch = Vec::new();
+        for i in 0..8usize {
+            let base = 0x5_2000_0000usize + i * 0x10_0000;
+            let slot = register_lse2_region(base, base + 0x8_0000, base + 0x8_0000, base + 0xC_0000)
+                .expect("recycled batch slot available");
+            assert!(slot < MAX_LSE2_REGIONS);
+            second_batch.push(slot);
+        }
+        for &slot in &second_batch {
+            unregister_lse2_region(slot);
+        }
+
+        // 2. Creating, warming, and dropping > MAX_LSE2_REGIONS JitCache instances must reclaim
+        //    both MAP_JIT buffers and LSE2_REGIONS slots on every Drop.
+        if jit_writable() {
+            for iter in 0..(MAX_LSE2_REGIONS + 16) {
+                let mut jc = JitCache::new();
+                unsafe { jc.warm() };
+                assert!(!jc.mem.is_null(), "iter {iter}: MAP_JIT allocation failed (leak?)");
+                assert!(
+                    jc.lse2_slot.is_some(),
+                    "iter {iter}: LSE2_REGIONS slot exhausted (Drop failed to unregister)"
+                );
+                drop(jc);
+            }
         }
     }
 }
