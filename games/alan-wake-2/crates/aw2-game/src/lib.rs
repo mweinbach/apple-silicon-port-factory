@@ -29,6 +29,20 @@ pub use x86_runtime::diff_eq;
 
 /// Register all Alan Wake 2–specific tables and hooks with [`x86_runtime`].
 pub fn register_aw2_runtime() {
+    x86_runtime::hooks::register_exe_crt_routes(x86_runtime::hooks::ExeCrtRoutes {
+        chkstk_va: 0x1_4183_5480,
+        check_cookie_va: 0x1_4183_53d0,
+        security_cookie_va: 0x1_4382_2fc0,
+        report_gsfailure_va: 0x1_4183_5cc8,
+        guard_dispatch_va: 0x1_4254_7700,
+        guard_dispatch_thunk_va: 0x1_4254_7720,
+    });
+    x86_runtime::hooks::register_game_repl_window(
+        0x1_4000_0000,
+        0x1_4600_0000,
+        0x1_4000_0000,
+        0x1_4300_0000,
+    );
     x86_runtime::hooks::register_float_return_vas(registry::FLOAT_RETURN);
     x86_runtime::hooks::register_lean_targets_provider(|| {
         registry::all()

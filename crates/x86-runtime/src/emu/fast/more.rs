@@ -1,21 +1,28 @@
-// Included into `emu_fast_ext.rs`: native lowering and execution for `K_VAES_RR..=K_PCMPSTR`
-// (`115..=124`), covering AES, F16C, masked vector moves, system/flag/MXCSR/x87 CW/16-bit stack,
-// high-byte GPRs (`AH`/`CH`/`DH`/`BH`), string ops (`rep movs/stos/lods/scas/cmps`),
-// `pdep`/`pext`/`rcl`/`rcr`, `lock`/atomic RMW + `cmpxchg8b`/`16b`, and `pcmpistri/m`/`pcmpestri/m`.
+//! Native lowering and execution for `K_VAES_RR..=K_VSHA_RM` (`115..=126`), covering AES, F16C,
+//! masked vector moves, system/flag/MXCSR/x87 CW/16-bit stack, high-byte GPRs (`AH`/`CH`/`DH`/`BH`),
+//! string ops (`rep movs/stos/lods/scas/cmps`), `pdep`/`pext`/`rcl`/`rcr`, `lock`/atomic RMW +
+//! `cmpxchg8b`/`16b`, `pcmpistri/m`/`pcmpestri/m`, and Intel SHA-NI.
 
-pub(super) const K_VAES_RR: u8 = 115;
-pub(super) const K_VAES_RM: u8 = 116;
-pub(super) const K_VCVT_PH: u8 = 117;
-pub(super) const K_VMASKMOV: u8 = 118;
-pub(super) const K_SYS_MISC: u8 = 119;
-pub(super) const K_HI8: u8 = 120;
-pub(super) const K_STRING: u8 = 121;
-pub(super) const K_BIT_EXT: u8 = 122;
-pub(super) const K_ATOMIC: u8 = 123;
-pub(super) const K_PCMPSTR: u8 = 124;
+use super::decode::{gpr_of, imm_of, is_w, lower_v, mem_bits, put_mem, vmode, xreg};
+use super::exec::sext;
+use super::*;
+use crate::emu::simd_kernels as sk;
+use crate::emu::{Cpu, OpKind, Register};
+use iced_x86::{EncodingKind, Instruction};
+
+pub(in crate::emu) const K_VAES_RR: u8 = 115;
+pub(in crate::emu) const K_VAES_RM: u8 = 116;
+pub(in crate::emu) const K_VCVT_PH: u8 = 117;
+pub(in crate::emu) const K_VMASKMOV: u8 = 118;
+pub(in crate::emu) const K_SYS_MISC: u8 = 119;
+pub(in crate::emu) const K_HI8: u8 = 120;
+pub(in crate::emu) const K_STRING: u8 = 121;
+pub(in crate::emu) const K_BIT_EXT: u8 = 122;
+pub(in crate::emu) const K_ATOMIC: u8 = 123;
+pub(in crate::emu) const K_PCMPSTR: u8 = 124;
 /// Intel SHA-NI (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`, `sha256rnds2`, `sha256msg1`, `sha256msg2`).
-pub(super) const K_VSHA_RR: u8 = 125;
-pub(super) const K_VSHA_RM: u8 = 126;
+pub(in crate::emu) const K_VSHA_RR: u8 = 125;
+pub(in crate::emu) const K_VSHA_RM: u8 = 126;
 
 fn lower_hi8_ins(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     use iced_x86::Mnemonic as M;
@@ -246,7 +253,7 @@ fn lower_hi8_ins(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     }
 }
 
-fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
+pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     use iced_x86::Mnemonic as M;
     if let Some(h) = lower_hi8_ins(ins, f) {
         return Some(h);
@@ -671,204 +678,6 @@ fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     Some(f)
 }
 
-#[inline(always)]
-fn f16_to_f32_bits(h: u16) -> u32 {
-    let sign = ((h as u32) & 0x8000) << 16;
-    let exp = ((h >> 10) & 0x1F) as u32;
-    let mant = (h & 0x03FF) as u32;
-    if exp == 0 {
-        if mant == 0 {
-            sign
-        } else {
-            let f = (mant as f32) * (1.0 / 16777216.0);
-            sign | f.to_bits()
-        }
-    } else if exp == 0x1F {
-        sign | 0x7F80_0000 | (mant << 13)
-    } else {
-        sign | ((exp + 112) << 23) | (mant << 13)
-    }
-}
-
-#[inline(always)]
-fn f32_to_f16_bits(bits: u32) -> u16 {
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mant = bits & 0x007F_FFFF;
-    if exp == 0xFF {
-        if mant != 0 {
-            sign | 0x7E00 | ((mant >> 13) as u16)
-        } else {
-            sign | 0x7C00
-        }
-    } else if exp > 142 {
-        sign | 0x7C00
-    } else if exp < 113 {
-        // Subnormal half-precision range: smallest normal f16 is 2^-14 (f32 exp 113),
-        // half-way to smallest subnormal 2^-24 is 2^-25 (f32 exp 102).
-        if exp < 102 {
-            sign
-        } else {
-            let sig = mant | 0x0080_0000;
-            let tot = (126 - exp) as u32; // 14..=24
-            let q = sig >> tot;
-            let half = 1u32 << (tot - 1);
-            let rem = sig & ((1u32 << tot) - 1);
-            let round_up = rem > half || (rem == half && (q & 1) != 0);
-            sign | ((q + round_up as u32) as u16)
-        }
-    } else {
-        let e = ((exp - 112) as u16) << 10;
-        let m = ((mant + 0x0FFF + ((mant >> 13) & 1)) >> 13) as u16;
-        sign | (e + m)
-    }
-}
-
-/// Hardware-accelerated (ARMv8 Crypto `aes` extension) or portable AES-NI 128-bit op.
-#[inline(always)]
-fn aes_op_128(sub: u8, state: u128, src: u128, imm8: u8) -> u128 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        use core::arch::aarch64::*;
-        unsafe {
-            let va = u128_to_u8x16(state);
-            let vb = u128_to_u8x16(src);
-            let zero = vdupq_n_u8(0);
-            return match sub {
-                0 => core::mem::transmute(veorq_u8(vaesmcq_u8(vaeseq_u8(va, zero)), vb)),
-                1 => core::mem::transmute(veorq_u8(vaeseq_u8(va, zero), vb)),
-                2 => core::mem::transmute(veorq_u8(vaesimcq_u8(vaesdq_u8(va, zero)), vb)),
-                3 => core::mem::transmute(veorq_u8(vaesdq_u8(va, zero), vb)),
-                4 => core::mem::transmute(vaesimcq_u8(vb)),
-                _ => {
-                    // AESKEYGENASSIST: SubBytes via `vaeseq_u8(src, 0)`, then undo ShiftRows
-                    // while duplicating/rotating words 1 and 3, and XOR with `[0, rcon, 0, rcon]`.
-                    const SHUF: [u8; 16] = [4, 1, 14, 11, 1, 14, 11, 4, 12, 9, 6, 3, 9, 6, 3, 12];
-                    let e = vaeseq_u8(vb, zero);
-                    let w = vqtbl1q_u8(e, vld1q_u8(SHUF.as_ptr()));
-                    let rcon = imm8 as u32;
-                    let rc: [u32; 4] = [0, rcon, 0, rcon];
-                    let out = veorq_u32(vreinterpretq_u32_u8(w), vld1q_u32(rc.as_ptr()));
-                    core::mem::transmute(out)
-                }
-            };
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    {
-        const SBOX: [u8; 256] = [
-            0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-            0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-            0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-            0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-            0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-            0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-            0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-            0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-            0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-            0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-            0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-            0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-            0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-            0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-            0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-            0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-        ];
-        const INV_SBOX: [u8; 256] = [
-            0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
-            0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
-            0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
-            0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
-            0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
-            0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
-            0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
-            0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
-            0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
-            0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
-            0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
-            0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
-            0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
-            0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
-            0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
-            0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
-        ];
-        let xtime = |x: u8| -> u8 { (x << 1) ^ if (x & 0x80) != 0 { 0x1b } else { 0 } };
-        let gmul = |mut a: u8, mut b: u8| -> u8 {
-            let mut p = 0u8;
-            for _ in 0..8 {
-                if (b & 1) != 0 {
-                    p ^= a;
-                }
-                a = xtime(a);
-                b >>= 1;
-            }
-            p
-        };
-        let inv_mix_cols = |st: &mut [u8; 16]| {
-            for c in 0..4 {
-                let i = c * 4;
-                let (s0, s1, s2, s3) = (st[i], st[i + 1], st[i + 2], st[i + 3]);
-                st[i] = gmul(s0, 0x0e) ^ gmul(s1, 0x0b) ^ gmul(s2, 0x0d) ^ gmul(s3, 0x09);
-                st[i + 1] = gmul(s0, 0x09) ^ gmul(s1, 0x0e) ^ gmul(s2, 0x0b) ^ gmul(s3, 0x0d);
-                st[i + 2] = gmul(s0, 0x0d) ^ gmul(s1, 0x09) ^ gmul(s2, 0x0e) ^ gmul(s3, 0x0b);
-                st[i + 3] = gmul(s0, 0x0b) ^ gmul(s1, 0x0d) ^ gmul(s2, 0x09) ^ gmul(s3, 0x0e);
-            }
-        };
-        match sub {
-            4 => {
-                let mut st = src.to_le_bytes();
-                inv_mix_cols(&mut st);
-                u128::from_le_bytes(st)
-            }
-            5 => {
-                let rcon = imm8 as u32;
-                let sub_word = |w: u32| -> u32 {
-                    (SBOX[(w & 0xFF) as usize] as u32)
-                        | ((SBOX[((w >> 8) & 0xFF) as usize] as u32) << 8)
-                        | ((SBOX[((w >> 16) & 0xFF) as usize] as u32) << 16)
-                        | ((SBOX[((w >> 24) & 0xFF) as usize] as u32) << 24)
-                };
-                let t1 = sub_word((src >> 32) as u32);
-                let t3 = sub_word((src >> 96) as u32);
-                let w1 = t1.rotate_right(8) ^ rcon;
-                let w3 = t3.rotate_right(8) ^ rcon;
-                (t1 as u128) | ((w1 as u128) << 32) | ((t3 as u128) << 64) | ((w3 as u128) << 96)
-            }
-            _ => {
-                let is_dec = sub >= 2;
-                let is_last = (sub & 1) != 0;
-                let mut st = state.to_le_bytes();
-                let tmp = st;
-                if !is_dec {
-                    const SR: [usize; 16] = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11];
-                    for i in 0..16 {
-                        st[i] = SBOX[tmp[SR[i]] as usize];
-                    }
-                    if !is_last {
-                        for c in 0..4 {
-                            let i = c * 4;
-                            let (s0, s1, s2, s3) = (st[i], st[i + 1], st[i + 2], st[i + 3]);
-                            st[i] = xtime(s0) ^ xtime(s1) ^ s1 ^ s2 ^ s3;
-                            st[i + 1] = s0 ^ xtime(s1) ^ xtime(s2) ^ s2 ^ s3;
-                            st[i + 2] = s0 ^ s1 ^ xtime(s2) ^ xtime(s3) ^ s3;
-                            st[i + 3] = xtime(s0) ^ s0 ^ s1 ^ s2 ^ xtime(s3);
-                        }
-                    }
-                } else {
-                    const ISR: [usize; 16] = [0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3];
-                    for i in 0..16 {
-                        st[i] = INV_SBOX[tmp[ISR[i]] as usize];
-                    }
-                    if !is_last {
-                        inv_mix_cols(&mut st);
-                    }
-                }
-                u128::from_le_bytes(st) ^ src
-            }
-        }
-    }
-}
-
 /// Fast native execution of `K_STRING` (`movs`/`stos`/`lods`/`scas`/`cmps`, with `rep`/`repe`/`repne`).
 #[inline(never)]
 unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
@@ -886,11 +695,11 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                 if !cpu.df {
                     let (src, dst) = (cpu.gpr[6], cpu.gpr[7]);
                     if let Some(total) = total_u64.and_then(|t| usize::try_from(t).ok()) {
-                        if super::regfile_ext::is_valid_guest_range(src, total)
-                            && super::regfile_ext::is_valid_guest_range(dst, total)
+                        if crate::emu::regfile_ext::is_valid_guest_range(src, total)
+                            && crate::emu::regfile_ext::is_valid_guest_range(dst, total)
                         {
                             let dist = dst.wrapping_sub(src);
-                            if super::mem::tso() {
+                            if crate::emu::mem::tso() {
                                 core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                             }
                             if dist == 0 || dist >= total as u64 {
@@ -916,12 +725,12 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                                     cpu.write_mem(dst.wrapping_add(i * elem_bytes), ebits, v);
                                 }
                             }
-                            if super::mem::tso() {
+                            if crate::emu::mem::tso() {
                                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                             }
                             let dst_end = dst.wrapping_add(total as u64);
-                            if super::mem::jit_overlaps(dst as usize, dst_end as usize) {
-                                super::mem::note_code_region(dst as usize, dst_end as usize);
+                            if crate::emu::mem::jit_overlaps(dst as usize, dst_end as usize) {
+                                crate::emu::mem::note_code_region(dst as usize, dst_end as usize);
                             }
                             cpu.gpr[6] = src.wrapping_add(total as u64);
                             cpu.gpr[7] = dst_end;
@@ -954,8 +763,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         // strictly below `src` within `total` bytes (tail-period replication).
                         let no_tail_rep = dst >= src || src.wrapping_sub(dst) >= total_u;
                         if no_tail_rep
-                            && super::regfile_ext::is_valid_guest_range(src_lo, total)
-                            && super::regfile_ext::is_valid_guest_range(dst_lo, total)
+                            && crate::emu::regfile_ext::is_valid_guest_range(src_lo, total)
+                            && crate::emu::regfile_ext::is_valid_guest_range(dst_lo, total)
                         {
                             Some((src_lo, dst_lo, dst_hi, total, total_u))
                         } else {
@@ -963,15 +772,15 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     });
                     if let Some((src_lo, dst_lo, dst_hi, total, total_u)) = bulk_ok {
-                        if super::mem::tso() {
+                        if crate::emu::mem::tso() {
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                         }
                         core::ptr::copy(src_lo as *const u8, dst_lo as *mut u8, total);
-                        if super::mem::tso() {
+                        if crate::emu::mem::tso() {
                             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                         }
-                        if super::mem::jit_overlaps(dst_lo as usize, dst_hi as usize) {
-                            super::mem::note_code_region(dst_lo as usize, dst_hi as usize);
+                        if crate::emu::mem::jit_overlaps(dst_lo as usize, dst_hi as usize) {
+                            crate::emu::mem::note_code_region(dst_lo as usize, dst_hi as usize);
                         }
                         cpu.gpr[6] = src.wrapping_sub(total_u);
                         cpu.gpr[7] = dst.wrapping_sub(total_u);
@@ -1007,14 +816,14 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         let hi = dst.checked_add(elem_bytes)?;
                         (hi.checked_sub(total_u)?, hi)
                     };
-                    if super::regfile_ext::is_valid_guest_range(dst_lo, total) {
+                    if crate::emu::regfile_ext::is_valid_guest_range(dst_lo, total) {
                         Some((dst_lo, dst_hi, total, total_u))
                     } else {
                         None
                     }
                 });
                 if let Some((dst_lo, dst_hi, total, total_u)) = bulk_range {
-                    if super::mem::tso() {
+                    if crate::emu::mem::tso() {
                         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                     }
                     let b = val as u8;
@@ -1062,8 +871,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                             rem -= step;
                         }
                     }
-                    if super::mem::jit_overlaps(dst_lo as usize, dst_hi as usize) {
-                        super::mem::note_code_region(dst_lo as usize, dst_hi as usize);
+                    if crate::emu::mem::jit_overlaps(dst_lo as usize, dst_hi as usize) {
+                        crate::emu::mem::note_code_region(dst_lo as usize, dst_hi as usize);
                     }
                     cpu.gpr[7] = if !cpu.df {
                         dst.wrapping_add(total_u)
@@ -1115,12 +924,12 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                 while rem > 0 {
                     let page_rem = 4096usize - (ptr & 0xFFF) as usize;
                     let safe_len = page_rem.min(rem.min(usize::MAX as u64) as usize);
-                    if safe_len >= 16 && super::regfile_ext::is_valid_guest_range(ptr, safe_len) {
+                    if safe_len >= 16 && crate::emu::regfile_ext::is_valid_guest_range(ptr, safe_len) {
                         let chunks = safe_len / 16;
                         let mut hit = false;
                         for _ in 0..chunks {
                             let v = vld1q_u8(ptr as *const u8);
-                            let mask = neon_movemask_u8(core::mem::transmute(vceqq_u8(v, vacc)));
+                            let mask = sk::pmovmskb(core::mem::transmute(vceqq_u8(v, vacc))) as u32;
                             let stop_mask = if stop_on_eq { mask } else { (!mask) & 0xFFFF };
                             if stop_mask != 0 {
                                 let idx = stop_mask.trailing_zeros() as u64;
@@ -1152,7 +961,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     }
                 }
-                if super::mem::tso() {
+                if crate::emu::mem::tso() {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 }
                 cpu.gpr[7] = ptr;
@@ -1211,15 +1020,15 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                     let page_rem = (4096usize - (p1 & 0xFFF) as usize).min(4096usize - (p2 & 0xFFF) as usize);
                     let safe_len = page_rem.min(rem.min(usize::MAX as u64) as usize);
                     if safe_len >= 16
-                        && super::regfile_ext::is_valid_guest_range(p1, safe_len)
-                        && super::regfile_ext::is_valid_guest_range(p2, safe_len)
+                        && crate::emu::regfile_ext::is_valid_guest_range(p1, safe_len)
+                        && crate::emu::regfile_ext::is_valid_guest_range(p2, safe_len)
                     {
                         let chunks = safe_len / 16;
                         let mut hit = false;
                         for _ in 0..chunks {
                             let va = vld1q_u8(p1 as *const u8);
                             let vb = vld1q_u8(p2 as *const u8);
-                            let mask = neon_movemask_u8(core::mem::transmute(vceqq_u8(va, vb)));
+                            let mask = sk::pmovmskb(core::mem::transmute(vceqq_u8(va, vb))) as u32;
                             let stop_mask = if stop_on_eq { mask } else { (!mask) & 0xFFFF };
                             if stop_mask != 0 {
                                 let idx = stop_mask.trailing_zeros() as u64;
@@ -1256,7 +1065,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
                         }
                     }
                 }
-                if super::mem::tso() {
+                if crate::emu::mem::tso() {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 }
                 cpu.gpr[6] = p1;
@@ -1298,316 +1107,8 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
     }
 }
 
-/// Fast native execution of `K_PCMPSTR` (`pcmpistri`/`pcmpistrm`/`pcmpestri`/`pcmpestrm`) with
-/// NEON-accelerated byte paths on `aarch64`.
 #[inline(never)]
-unsafe fn exec_pcmpstr_op(cpu: &mut Cpu, op: &FastOp) {
-    let flags = op.x & 0x3F;
-    let is_explicit = (flags & 1) != 0;
-    let is_mask = (flags & 2) != 0;
-    let is_mem = (flags & 0x20) != 0;
-    let a = cpu.xmm[op.r0 as usize & 15];
-    let b = if is_mem {
-        cpu.read_u128(cpu.faddr(op))
-    } else {
-        cpu.xmm[op.r1 as usize & 15]
-    };
-    let imm = op.imm as u8;
-    let is_words = (imm & 0x01) != 0;
-    let is_signed = (imm & 0x02) != 0;
-    let n: usize = if is_words { 8 } else { 16 };
-    let agg = (imm >> 2) & 0x03;
-
-    let (a_len, b_len, int_res1) = if !is_words {
-        let ab = a.to_le_bytes();
-        let bb = b.to_le_bytes();
-        #[cfg(target_arch = "aarch64")]
-        let (a_len, b_len) = {
-            use core::arch::aarch64::*;
-            if is_explicit {
-                (
-                    (cpu.gpr[0] as i32).unsigned_abs().min(16) as usize,
-                    (cpu.gpr[2] as i32).unsigned_abs().min(16) as usize,
-                )
-            } else {
-                let z = vdupq_n_u8(0);
-                let za = neon_movemask_u8(core::mem::transmute(vceqq_u8(u128_to_u8x16(a), z)));
-                let zb = neon_movemask_u8(core::mem::transmute(vceqq_u8(u128_to_u8x16(b), z)));
-                (
-                    if za == 0 { 16 } else { za.trailing_zeros() as usize },
-                    if zb == 0 { 16 } else { zb.trailing_zeros() as usize },
-                )
-            }
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let (a_len, b_len) = if is_explicit {
-            (
-                (cpu.gpr[0] as i32).unsigned_abs().min(16) as usize,
-                (cpu.gpr[2] as i32).unsigned_abs().min(16) as usize,
-            )
-        } else {
-            (
-                ab.iter().position(|&x| x == 0).unwrap_or(16),
-                bb.iter().position(|&x| x == 0).unwrap_or(16),
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let valid_a: u16 = if a_len >= 16 { 0xFFFF } else { (1u16 << a_len) - 1 };
-        #[cfg(target_arch = "aarch64")]
-        let valid_b: u16 = if b_len >= 16 { 0xFFFF } else { (1u16 << b_len) - 1 };
-        let res1: u16 = match agg {
-            0 => {
-                // Equal Any
-                if a_len == 0 || b_len == 0 {
-                    0
-                } else {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use core::arch::aarch64::*;
-                        let vb = u128_to_u8x16(b);
-                        let mut acc = vceqq_u8(vb, vdupq_n_u8(ab[0]));
-                        for i in 1..a_len {
-                            acc = vorrq_u8(acc, vceqq_u8(vb, vdupq_n_u8(ab[i])));
-                        }
-                        (neon_movemask_u8(core::mem::transmute(acc)) as u16) & valid_b
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        let mut r = 0u16;
-                        for j in 0..b_len {
-                            if ab[..a_len].contains(&bb[j]) {
-                                r |= 1u16 << j;
-                            }
-                        }
-                        r
-                    }
-                }
-            }
-            1 => {
-                // Ranges
-                if a_len < 2 || b_len == 0 {
-                    0
-                } else {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use core::arch::aarch64::*;
-                        let vb = u128_to_u8x16(b);
-                        let mut acc = vdupq_n_u8(0);
-                        let mut i = 0;
-                        if is_signed {
-                            let s_vb = vreinterpretq_s8_u8(vb);
-                            while i + 1 < a_len {
-                                let lo = vdupq_n_s8(ab[i] as i8);
-                                let hi = vdupq_n_s8(ab[i + 1] as i8);
-                                let in_r = vandq_u8(vcgeq_s8(s_vb, lo), vcleq_s8(s_vb, hi));
-                                acc = vorrq_u8(acc, in_r);
-                                i += 2;
-                            }
-                        } else {
-                            while i + 1 < a_len {
-                                let lo = vdupq_n_u8(ab[i]);
-                                let hi = vdupq_n_u8(ab[i + 1]);
-                                let in_r = vandq_u8(vcgeq_u8(vb, lo), vcleq_u8(vb, hi));
-                                acc = vorrq_u8(acc, in_r);
-                                i += 2;
-                            }
-                        }
-                        (neon_movemask_u8(core::mem::transmute(acc)) as u16) & valid_b
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        let mut r = 0u16;
-                        for j in 0..b_len {
-                            let mut i = 0;
-                            while i + 1 < a_len {
-                                let ok = if is_signed {
-                                    (bb[j] as i8) >= (ab[i] as i8) && (bb[j] as i8) <= (ab[i + 1] as i8)
-                                } else {
-                                    bb[j] >= ab[i] && bb[j] <= ab[i + 1]
-                                };
-                                if ok {
-                                    r |= 1u16 << j;
-                                    break;
-                                }
-                                i += 2;
-                            }
-                        }
-                        r
-                    }
-                }
-            }
-            2 => {
-                // Equal Each
-                #[cfg(target_arch = "aarch64")]
-                {
-                    use core::arch::aarch64::*;
-                    let eq = neon_movemask_u8(core::mem::transmute(vceqq_u8(u128_to_u8x16(a), u128_to_u8x16(b)))) as u16;
-                    (eq & valid_a & valid_b) | (!valid_a & !valid_b)
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    let mut r = 0u16;
-                    for j in 0..16 {
-                        let m = if j < a_len && j < b_len {
-                            ab[j] == bb[j]
-                        } else {
-                            j >= a_len && j >= b_len
-                        };
-                        if m {
-                            r |= 1u16 << j;
-                        }
-                    }
-                    r
-                }
-            }
-            _ => {
-                // Equal Ordered
-                let mut r = 0u16;
-                for j in 0..16 {
-                    let mut m = true;
-                    let lim = a_len.min(16 - j);
-                    if lim > 0 && j + lim > b_len {
-                        m = false;
-                    } else {
-                        for k in 0..lim {
-                            if ab[k] != bb[j + k] {
-                                m = false;
-                                break;
-                            }
-                        }
-                    }
-                    if m {
-                        r |= 1u16 << j;
-                    }
-                }
-                r
-            }
-        };
-        (a_len, b_len, res1)
-    } else {
-        // 16-bit word elements (n = 8)
-        let aw: [u16; 8] = ln(a);
-        let bw: [u16; 8] = ln(b);
-        let (a_len, b_len) = if is_explicit {
-            (
-                (cpu.gpr[0] as i32).unsigned_abs().min(8) as usize,
-                (cpu.gpr[2] as i32).unsigned_abs().min(8) as usize,
-            )
-        } else {
-            (
-                aw.iter().position(|&x| x == 0).unwrap_or(8),
-                bw.iter().position(|&x| x == 0).unwrap_or(8),
-            )
-        };
-        let mut res1 = 0u16;
-        match agg {
-            0 => {
-                for j in 0..b_len {
-                    if aw[..a_len].contains(&bw[j]) {
-                        res1 |= 1u16 << j;
-                    }
-                }
-            }
-            1 => {
-                for j in 0..b_len {
-                    let mut i = 0;
-                    while i + 1 < a_len {
-                        let ok = if is_signed {
-                            (bw[j] as i16) >= (aw[i] as i16) && (bw[j] as i16) <= (aw[i + 1] as i16)
-                        } else {
-                            bw[j] >= aw[i] && bw[j] <= aw[i + 1]
-                        };
-                        if ok {
-                            res1 |= 1u16 << j;
-                            break;
-                        }
-                        i += 2;
-                    }
-                }
-            }
-            2 => {
-                for j in 0..8 {
-                    let m = if j < a_len && j < b_len {
-                        aw[j] == bw[j]
-                    } else {
-                        j >= a_len && j >= b_len
-                    };
-                    if m {
-                        res1 |= 1u16 << j;
-                    }
-                }
-            }
-            _ => {
-                for j in 0..8 {
-                    let mut m = true;
-                    let lim = a_len.min(8 - j);
-                    if lim > 0 && j + lim > b_len {
-                        m = false;
-                    } else {
-                        for k in 0..lim {
-                            if aw[k] != bw[j + k] {
-                                m = false;
-                                break;
-                            }
-                        }
-                    }
-                    if m {
-                        res1 |= 1u16 << j;
-                    }
-                }
-            }
-        }
-        (a_len, b_len, res1)
-    };
-
-    let mask_all: u16 = if n == 16 { 0xFFFF } else { 0x00FF };
-    let valid_b_mask: u16 = if b_len >= 16 { 0xFFFF } else { (1u16 << b_len) - 1 };
-    let int_res2: u16 = match (imm >> 4) & 0x03 {
-        1 => (!int_res1) & mask_all,
-        3 => (int_res1 ^ valid_b_mask) & mask_all,
-        _ => int_res1 & mask_all,
-    };
-    if is_mask {
-        if (imm & 0x40) == 0 {
-            cpu.xmm[0] = int_res2 as u128;
-        } else if is_words {
-            let mut m128 = 0u128;
-            for j in 0..8 {
-                if (int_res2 & (1u16 << j)) != 0 {
-                    m128 |= 0xFFFFu128 << (j * 16);
-                }
-            }
-            cpu.xmm[0] = m128;
-        } else {
-            let mut m128 = 0u128;
-            for j in 0..16 {
-                if (int_res2 & (1u16 << j)) != 0 {
-                    m128 |= 0xFFu128 << (j * 8);
-                }
-            }
-            cpu.xmm[0] = m128;
-        }
-        cpu.clear_ymm_hi_reg(0);
-    } else {
-        let idx = if int_res2 == 0 {
-            n as u64
-        } else if (imm & 0x40) != 0 {
-            (15 - int_res2.leading_zeros()) as u64
-        } else {
-            int_res2.trailing_zeros() as u64
-        };
-        cpu.gpr[1] = idx;
-        cpu.last_bits[1] = 64;
-    }
-    cpu.cf = int_res2 != 0;
-    cpu.zf = b_len < n;
-    cpu.sf = a_len < n;
-    cpu.of = (int_res2 & 1) != 0;
-    cpu.set_pf(false);
-}
-
-#[inline(never)]
-unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
+pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
     match op.kind {
         K_VAES_RR | K_VAES_RM => {
             let d = op.r0 as usize & 15;
@@ -1619,7 +1120,7 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
             } else {
                 cpu.xmm[op.r1 as usize & 15]
             };
-            cpu.xmm[d] = aes_op_128(sub, state, src, op.imm as u8);
+            cpu.xmm[d] = sk::aes_op_128(sub, state, src, op.imm as u8);
             if (op.w & 3) == VM_V128 {
                 cpu.clear_ymm_hi_reg(d);
             }
@@ -1641,18 +1142,7 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 } else {
                     cpu.xmm[op.r1 as usize & 15]
                 };
-                let mut d_lo = 0u128;
-                for lane in 0..4 {
-                    let h = ((raw >> (lane * 16)) & 0xFFFF) as u16;
-                    d_lo |= (f16_to_f32_bits(h) as u128) << (lane * 32);
-                }
-                let mut d_hi = 0u128;
-                if is_256 {
-                    for lane in 0..4 {
-                        let h = ((raw >> ((lane + 4) * 16)) & 0xFFFF) as u16;
-                        d_hi |= (f16_to_f32_bits(h) as u128) << (lane * 32);
-                    }
-                }
+                let (d_lo, d_hi) = sk::vcvtph2ps(raw, is_256);
                 cpu.xmm[d] = d_lo;
                 if is_256 {
                     cpu.set_ymm_hi(d, d_hi);
@@ -1663,19 +1153,8 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 // Vcvtps2ph
                 let is_256 = op.w != 0;
                 let s = op.r1 as usize & 15;
-                let lo = cpu.xmm[s];
-                let mut packed = 0u128;
-                for lane in 0..4 {
-                    let w32 = (lo >> (lane * 32)) as u32;
-                    packed |= (f32_to_f16_bits(w32) as u128) << (lane * 16);
-                }
-                if is_256 {
-                    let hi = cpu.ymm_hi[s];
-                    for lane in 0..4 {
-                        let w32 = (hi >> (lane * 32)) as u32;
-                        packed |= (f32_to_f16_bits(w32) as u128) << ((lane + 4) * 16);
-                    }
-                }
+                let (lo, hi) = (cpu.xmm[s], if is_256 { cpu.ymm_hi[s] } else { 0 });
+                let packed = sk::vcvtps2ph(lo, hi, is_256);
                 if mem {
                     let a = cpu.faddr(op);
                     if is_256 {
@@ -1796,8 +1275,8 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 }
                 8 => {
                     // Rdtsc / Rdtscp (must match `GUEST_TSC` across interpreter, JIT, and lifted code)
-                    cpu.gpr[0] = super::GUEST_TSC & 0xFFFF_FFFF;
-                    cpu.gpr[2] = super::GUEST_TSC >> 32;
+                    cpu.gpr[0] = crate::emu::GUEST_TSC & 0xFFFF_FFFF;
+                    cpu.gpr[2] = crate::emu::GUEST_TSC >> 32;
                     cpu.last_bits[0] = 64;
                     cpu.last_bits[2] = 64;
                     if op.w != 0 {
@@ -1934,7 +1413,7 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     // Ldmxcsr / Vldmxcsr
                     let m = (cpu.read_mem(cpu.faddr(op), 32) as u32) & 0xFFFF;
                     cpu.jx.mxcsr = m;
-                    super::apply_guest_mxcsr_hw(m);
+                    crate::emu::apply_guest_mxcsr_hw(m);
                 }
                 _ => {}
             }
@@ -2300,8 +1779,8 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     // Cmpxchg16b (17)
                     let expected = ((cpu.gpr[2] as u128) << 64) | (cpu.gpr[0] as u128);
                     let desired = ((cpu.gpr[1] as u128) << 64) | (cpu.gpr[3] as u128);
-                    let fast = if addr & 15 == 0 && super::regfile_ext::is_valid_guest_range(addr, 16) {
-                        super::cas128_full(addr, expected, desired)
+                    let fast = if addr & 15 == 0 && crate::emu::regfile_ext::is_valid_guest_range(addr, 16) {
+                        crate::emu::cas128_full(addr, expected, desired)
                     } else {
                         None
                     };
@@ -2326,7 +1805,19 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 }
             }
         }
-        K_PCMPSTR => exec_pcmpstr_op(cpu, op),
+        K_PCMPSTR => {
+            let flags = op.x & 0x3F;
+            let is_explicit = (flags & 1) != 0;
+            let is_mask = (flags & 2) != 0;
+            let is_mem = (flags & 0x20) != 0;
+            let a = cpu.xmm[op.r0 as usize & 15];
+            let b = if is_mem {
+                cpu.read_u128(cpu.faddr(op))
+            } else {
+                cpu.xmm[op.r1 as usize & 15]
+            };
+            sk::pcmpstr(cpu, a, b, op.imm as u8, is_explicit, is_mask);
+        }
         K_VSHA_RR | K_VSHA_RM => {
             let d = op.r0 as usize & 15;
             let src1 = cpu.xmm[d];
@@ -2336,13 +1827,13 @@ unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 cpu.xmm[op.r1 as usize & 15]
             };
             cpu.xmm[d] = match op.x & 0x3F {
-                0 => super::simd_fp::sha1rnds4(src1, src2, op.imm as u8),
-                1 => super::simd_fp::sha1nexte(src1, src2),
-                2 => super::simd_fp::sha1msg1(src1, src2),
-                3 => super::simd_fp::sha1msg2(src1, src2),
-                4 => super::simd_fp::sha256rnds2(src1, src2, cpu.xmm[0]),
-                5 => super::simd_fp::sha256msg1(src1, src2),
-                _ => super::simd_fp::sha256msg2(src1, src2),
+                0 => sk::sha1rnds4(src1, src2, op.imm as u8),
+                1 => sk::sha1nexte(src1, src2),
+                2 => sk::sha1msg1(src1, src2),
+                3 => sk::sha1msg2(src1, src2),
+                4 => sk::sha256rnds2(src1, src2, cpu.xmm[0]),
+                5 => sk::sha256msg1(src1, src2),
+                _ => sk::sha256msg2(src1, src2),
             };
         }
         _ => {}

@@ -1,37 +1,48 @@
-// AOT translation cache, translator side (`AW2_DLL_AOT`; directory, file format and
-// loading live in `aot.rs`). Included into `jit.rs`.
-//
-// An AOT block is the JIT's translation of the same block (`prep_block` + `Tr`, identical
-// analysis) emitted in AOT mode:
-// - into a scratch buffer, as if placed at its final address in an AOT region whose shared
-//   stubs sit at offset 0 (`Asm::vbase`; stub branches are PC-relative, so the code is
-//   valid wherever the region lands);
-// - host function pointers (`plain_call`) from private literal slots, recorded as
-//   relocations against the guest VA they were resolved for;
-// - direct-link sites recorded with their out-of-line fallback (built unlinked);
-// - every host-callable decision (`resolved_host`) recorded as an assumption.
+//! AOT translation cache, translator side (`AW2_DLL_AOT`; directory, file format and
+//! loading live in [`crate::emu::aot`]).
+//!
+//! An AOT block is the JIT's translation of the same block (`prep_block` + `Tr`, identical
+//! analysis) emitted in AOT mode:
+//! - into a scratch buffer, as if placed at its final address in an AOT region whose shared
+//!   stubs sit at offset 0 (`Asm::vbase`; stub branches are PC-relative, so the code is
+//!   valid wherever the region lands);
+//! - host function pointers (`plain_call`) from private literal slots, recorded as
+//!   relocations against the guest VA they were resolved for;
+//! - direct-link sites recorded with their out-of-line fallback (built unlinked);
+//! - every host-callable decision (`resolved_host`) recorded as an assumption.
+
+use super::cache::{
+    new_tr, prep_block_with, StubAddrs, TrScratch, MAX_BLOCK_BYTES, RESOLVE_REC, STUBS_BYTES,
+};
+use super::emit::Asm;
+use super::lazy::flaglazy_enabled;
+use super::stubs::{emit_stubs, emit_stubs_cfg, hostcall_enabled, plaincall_enabled, StubCfg};
+use super::translate::stack_tso;
+use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled};
+use super::*;
+use crate::emu::{mem, to_mapped_addr, BlockCache, BLK_MAX_INSNS};
 
 /// Word offsets of the shared stubs at the start of an AOT region: enter, exit,
 /// lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm,
 /// clear_ymm_hi (`u32::MAX` = not emitted).
-pub(super) type AotStubOffs = [u32; 10];
+pub(in crate::emu) type AotStubOffs = [u32; 10];
 
 /// Bytes reserved for the stubs at the start of an AOT region.
-pub(super) const AOT_STUBS_BYTES: usize = STUBS_BYTES;
+pub(in crate::emu) const AOT_STUBS_BYTES: usize = STUBS_BYTES;
 
 /// Upper bound on one block's code (scratch buffer size).
-pub(super) const AOT_MAX_BLOCK_BYTES: usize = MAX_BLOCK_BYTES;
+pub(in crate::emu) const AOT_MAX_BLOCK_BYTES: usize = MAX_BLOCK_BYTES;
 
 /// [`AotReloc::kind`]: the slot holds `inline_host_fn(va).0` (whose `.1` must equal `bail`).
-pub(super) const RELOC_HOST_FN: u8 = 0;
+pub(in crate::emu) const RELOC_HOST_FN: u8 = 0;
 /// [`AotReloc::kind`]: the slot holds `va` itself (an import slot's value, `src` != 0).
-pub(super) const RELOC_SLOT_VAL: u8 = 1;
+pub(in crate::emu) const RELOC_SLOT_VAL: u8 = 1;
 /// [`AotReloc::kind`]: the slot holds `win32_rt::kernel32::time::qpc_fast_state_ptr()`.
-pub(super) const RELOC_QPC_STATE: u8 = 2;
+pub(in crate::emu) const RELOC_QPC_STATE: u8 = 2;
 
 /// A relocated 8-byte literal-pool slot of an AOT block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct AotReloc {
+pub(in crate::emu) struct AotReloc {
     /// Pool slot word (block-relative).
     pub word: u32,
     /// [`RELOC_HOST_FN`] / [`RELOC_SLOT_VAL`].
@@ -44,7 +55,7 @@ pub(super) struct AotReloc {
 }
 
 /// One block translated in AOT emission mode (word positions are block-relative).
-pub(super) struct AotBlock {
+pub(in crate::emu) struct AotBlock {
     pub words: Vec<u32>,
     /// Words on the main path.
     pub main: u32,
@@ -116,7 +127,7 @@ unsafe fn emit_static_stubs_inner(
 /// byte offset of the `bl 0` instruction that must receive an `ARM64_RELOC_BRANCH26`
 /// relocation pointing to `_port_static_aot_host_xfer` (single-bank direct relocation mode).
 #[cfg(test)]
-pub(super) unsafe fn emit_static_stubs(
+pub(in crate::emu) unsafe fn emit_static_stubs(
     buf: *mut u32,
     vbase: usize,
     knobs: u64,
@@ -140,7 +151,7 @@ pub(super) unsafe fn emit_static_stubs(
 /// Because every bank's `host_xfer` call resolves via a ±4 GiB GOT load rather than a
 /// ±128 MiB `ARM64_RELOC_BRANCH26`, `ld64` links 300–500+ MiB multi-bank `.aot.o` images
 /// cleanly with zero branch-range relocation errors. Returns `(emitted_offs, veneer_byte_off)`.
-pub(super) unsafe fn emit_static_stubs_with_veneer(
+pub(in crate::emu) unsafe fn emit_static_stubs_with_veneer(
     buf: *mut u32,
     vbase: usize,
     knobs: u64,
@@ -177,7 +188,7 @@ pub(super) unsafe fn emit_static_stubs_with_veneer(
 /// Test-only: emit live (`static_pic = false`) and static GOT-veneer (`static_pic = true`) stubs
 /// for an arbitrary `knobs` vector and return `(live_words, veneer_end_bytes)`.
 #[cfg(test)]
-pub(super) unsafe fn test_emit_stubs_and_veneer_for_knobs(
+pub(in crate::emu) unsafe fn test_emit_stubs_and_veneer_for_knobs(
     knobs: u64,
     count_probe: bool,
     count_plain: bool,
@@ -218,7 +229,7 @@ pub(super) unsafe fn test_emit_stubs_and_veneer_for_knobs(
 }
 
 /// Emit the shared stubs into `buf` (writable, [`AOT_STUBS_BYTES`]), executing at `vbase`.
-pub(super) unsafe fn aot_emit_stubs(buf: *mut u32, vbase: usize) -> Option<AotStubOffs> {
+pub(in crate::emu) unsafe fn aot_emit_stubs(buf: *mut u32, vbase: usize) -> Option<AotStubOffs> {
     let mut a = Asm::new(buf, vbase, STUBS_BYTES / 4);
     let st = emit_stubs(&mut a, ras_enabled());
     if a.overflow {
@@ -258,7 +269,7 @@ fn aot_stub_addrs(vbase: usize, o: &AotStubOffs) -> StubAddrs {
 /// Translate the guest block at `ip` in AOT emission mode, as if placed at `vaddr` in an
 /// AOT region at `vbase` with stubs `offs`; `scratch` and `tr_scratch` are reused between calls.
 /// None = not translatable (the JIT handles it at run time exactly as today).
-pub(super) unsafe fn aot_translate(
+pub(in crate::emu) unsafe fn aot_translate(
     bc: *mut BlockCache,
     ip: u64,
     vaddr: usize,
@@ -335,7 +346,7 @@ unsafe fn aot_translate_rec(
 
 /// Codegen knob vector for the AOT key: every input of the translation / `emit_stubs`
 /// that is not guest memory or host-callable state (those are hashed / assumed).
-pub(super) fn aot_knob_bits() -> u64 {
+pub(in crate::emu) fn aot_knob_bits() -> u64 {
     let bits: [(u32, u64); 25] = [
         (0, ras_enabled() as u64),
         (1, flags_dead_mask() as u64), // 2 bits
@@ -351,7 +362,7 @@ pub(super) fn aot_knob_bits() -> u64 {
         (15, mem::tso() as u64),
         (16, stack_tso() as u64),
         (17, crate::exe::aw2_registry_active() as u64),
-        (18, super::fast_enabled() as u64),
+        (18, crate::emu::fast_enabled() as u64),
         (19, (BLK_MAX_INSNS as u64) & 0xFF), // 8 bits
         (27, aot_probe_enabled() as u64),
         (28, 3u64), // codegen rev 3 (2 bits: 28..29)

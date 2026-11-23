@@ -1,23 +1,9 @@
 //! SSE/AVX floating-point, FMA, AES, BMI, x87, and system instruction execution for [`super::Cpu`].
 
-use super::simd_mov::vops;
+use super::simd_kernels as vops;
+#[cfg(test)]
+pub(super) use super::simd_kernels::{sha1nexte, sha256rnds2};
 use super::*;
-
-const CRC32C_TABLE: [u32; 256] = {
-    let mut t = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut b = 0;
-        while b < 8 {
-            c = if (c & 1) != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 };
-            b += 1;
-        }
-        t[i] = c;
-        i += 1;
-    }
-    t
-};
 
 impl Cpu {
     #[inline]
@@ -37,151 +23,28 @@ impl Cpu {
             | Mnemonic::Vaesimc
             | Mnemonic::Aeskeygenassist
             | Mnemonic::Vaeskeygenassist => {
-                const SBOX: [u8; 256] = [
-                    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-                    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-                    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-                    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-                    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-                    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-                    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-                    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-                    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-                    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-                    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-                    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-                    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-                    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-                    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-                    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-                ];
-                const INV_SBOX: [u8; 256] = [
-                    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
-                    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
-                    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
-                    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
-                    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
-                    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
-                    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
-                    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
-                    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
-                    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
-                    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
-                    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
-                    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
-                    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
-                    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
-                    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
-                ];
-                let xtime = |x: u8| -> u8 { (x << 1) ^ (if (x & 0x80) != 0 { 0x1b } else { 0 }) };
-                let gmul = |mut a: u8, mut b: u8| -> u8 {
-                    let mut p = 0u8;
-                    for _ in 0..8 {
-                        if (b & 1) != 0 {
-                            p ^= a;
-                        }
-                        a = xtime(a);
-                        b >>= 1;
-                    }
-                    p
-                };
-                let inv_mix_cols = |st: &mut [u8; 16]| {
-                    for c in 0..4 {
-                        let i = c * 4;
-                        let (s0, s1, s2, s3) = (st[i], st[i + 1], st[i + 2], st[i + 3]);
-                        st[i] = gmul(s0, 0x0e) ^ gmul(s1, 0x0b) ^ gmul(s2, 0x0d) ^ gmul(s3, 0x09);
-                        st[i + 1] = gmul(s0, 0x09) ^ gmul(s1, 0x0e) ^ gmul(s2, 0x0b) ^ gmul(s3, 0x0d);
-                        st[i + 2] = gmul(s0, 0x0d) ^ gmul(s1, 0x09) ^ gmul(s2, 0x0e) ^ gmul(s3, 0x0b);
-                        st[i + 3] = gmul(s0, 0x0b) ^ gmul(s1, 0x0d) ^ gmul(s2, 0x09) ^ gmul(s3, 0x0e);
-                    }
-                };
                 if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
-                    match mn {
-                        Mnemonic::Aesimc | Mnemonic::Vaesimc => {
-                            let src = match ins.op_kind(1) {
-                                OpKind::Register => vops::xmm_idx_fast(ins.op_register(1)).map_or(0, |i| cpu.xmm[i]),
-                                OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
-                                _ => 0,
-                            };
-                            let mut st = src.to_le_bytes();
-                            inv_mix_cols(&mut st);
-                            cpu.xmm[d] = u128::from_le_bytes(st);
-                        }
-                        Mnemonic::Aeskeygenassist | Mnemonic::Vaeskeygenassist => {
-                            let src = match ins.op_kind(1) {
-                                OpKind::Register => vops::xmm_idx_fast(ins.op_register(1)).map_or(0, |i| cpu.xmm[i]),
-                                OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
-                                _ => 0,
-                            };
-                            let rcon = ins.immediate8() as u32;
-                            let x1 = ((src >> 32) & 0xFFFF_FFFF) as u32;
-                            let x3 = ((src >> 96) & 0xFFFF_FFFF) as u32;
-                            let sub_word = |w: u32| -> u32 {
-                                let b0 = SBOX[(w & 0xFF) as usize] as u32;
-                                let b1 = SBOX[((w >> 8) & 0xFF) as usize] as u32;
-                                let b2 = SBOX[((w >> 16) & 0xFF) as usize] as u32;
-                                let b3 = SBOX[((w >> 24) & 0xFF) as usize] as u32;
-                                b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-                            };
-                            let t1 = sub_word(x1);
-                            let t3 = sub_word(x3);
-                            let w0 = t1;
-                            let w1 = t1.rotate_right(8) ^ rcon;
-                            let w2 = t3;
-                            let w3 = t3.rotate_right(8) ^ rcon;
-                            cpu.xmm[d] = (w0 as u128)
-                                | ((w1 as u128) << 32)
-                                | ((w2 as u128) << 64)
-                                | ((w3 as u128) << 96);
-                        }
+                    let (sub, state, src_op, imm8) = match mn {
+                        Mnemonic::Aesimc | Mnemonic::Vaesimc => (4u8, 0u128, 1u32, 0u8),
+                        Mnemonic::Aeskeygenassist | Mnemonic::Vaeskeygenassist => (5, 0, 1, ins.immediate8()),
                         _ => {
                             let (s1_op, s2_op) = if ins.op_count() >= 3 { (1, 2) } else { (0, 1) };
-                            let state = vops::xmm_idx_fast(ins.op_register(s1_op)).map_or(0, |i| cpu.xmm[i]);
-                            let rkey = match ins.op_kind(s2_op) {
-                                OpKind::Register => vops::xmm_idx_fast(ins.op_register(s2_op)).map_or(0, |i| cpu.xmm[i]),
-                                OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
-                                _ => 0,
+                            let st = vops::xmm_idx_fast(ins.op_register(s1_op)).map_or(0, |i| cpu.xmm[i]);
+                            let sub = match mn {
+                                Mnemonic::Aesenc | Mnemonic::Vaesenc => 0,
+                                Mnemonic::Aesenclast | Mnemonic::Vaesenclast => 1,
+                                Mnemonic::Aesdec | Mnemonic::Vaesdec => 2,
+                                _ => 3,
                             };
-                            let mut st = state.to_le_bytes();
-                            let is_dec = matches!(
-                                mn,
-                                Mnemonic::Aesdec | Mnemonic::Vaesdec | Mnemonic::Aesdeclast | Mnemonic::Vaesdeclast
-                            );
-                            let is_last = matches!(
-                                mn,
-                                Mnemonic::Aesenclast | Mnemonic::Vaesenclast | Mnemonic::Aesdeclast | Mnemonic::Vaesdeclast
-                            );
-                            if !is_dec {
-                                // ShiftRows then SubBytes
-                                let tmp = st;
-                                let sr: [usize; 16] = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11];
-                                for i in 0..16 {
-                                    st[i] = SBOX[tmp[sr[i]] as usize];
-                                }
-                                if !is_last {
-                                    for c in 0..4 {
-                                        let i = c * 4;
-                                        let (s0, s1, s2, s3) = (st[i], st[i + 1], st[i + 2], st[i + 3]);
-                                        st[i] = xtime(s0) ^ xtime(s1) ^ s1 ^ s2 ^ s3;
-                                        st[i + 1] = s0 ^ xtime(s1) ^ xtime(s2) ^ s2 ^ s3;
-                                        st[i + 2] = s0 ^ s1 ^ xtime(s2) ^ xtime(s3) ^ s3;
-                                        st[i + 3] = xtime(s0) ^ s0 ^ s1 ^ s2 ^ xtime(s3);
-                                    }
-                                }
-                            } else {
-                                // InvShiftRows then InvSubBytes
-                                let tmp = st;
-                                let isr: [usize; 16] = [0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3];
-                                for i in 0..16 {
-                                    st[i] = INV_SBOX[tmp[isr[i]] as usize];
-                                }
-                                if !is_last {
-                                    inv_mix_cols(&mut st);
-                                }
-                            }
-                            cpu.xmm[d] = u128::from_le_bytes(st) ^ rkey;
+                            (sub, st, s2_op, 0)
                         }
-                    }
+                    };
+                    let src = match ins.op_kind(src_op) {
+                        OpKind::Register => vops::xmm_idx_fast(ins.op_register(src_op)).map_or(0, |i| cpu.xmm[i]),
+                        OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
+                        _ => 0,
+                    };
+                    cpu.xmm[d] = vops::aes_op_128(sub, state, src, imm8);
                     if matches!(
                         mn,
                         Mnemonic::Vaesenc
@@ -350,16 +213,8 @@ impl Cpu {
                     let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);
                     let (b_lo, b_hi) = vops::load_vec_op(cpu, ins, s2_op, ymm);
                     let imm = cpu.read_op(ins, imm_op, 8) as u8;
-                    let q0 = ((a_lo >> (((imm & 1) as u32) * 64)) as u64) as u128;
-                    let q1 = ((b_lo >> ((((imm >> 1) & 1) as u32) * 64)) as u64) as u128;
-                    let lo = q0 | (q1 << 64);
-                    let hi = if ymm {
-                        let q2 = ((a_hi >> ((((imm >> 2) & 1) as u32) * 64)) as u64) as u128;
-                        let q3 = ((b_hi >> ((((imm >> 3) & 1) as u32) * 64)) as u64) as u128;
-                        q2 | (q3 << 64)
-                    } else {
-                        0
-                    };
+                    let lo = vops::shufpd(a_lo, b_lo, imm);
+                    let hi = if ymm { vops::shufpd(a_hi, b_hi, imm >> 2) } else { 0 };
                     vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
                 }
             }
@@ -904,20 +759,9 @@ impl Cpu {
                     let (s1_op, s2_op, imm_op) = if ins.op_count() >= 4 { (1, 2, 3) } else { (0, 1, 2) };
                     let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);
                     let (b_lo, b_hi) = vops::load_vec_op(cpu, ins, s2_op, ymm);
-                    let imm = cpu.read_op(ins, imm_op, 8) as u32;
-                    let align128 = |va: u128, vb: u128| -> u128 {
-                        if imm >= 32 {
-                            0
-                        } else if imm >= 16 {
-                            va >> ((imm - 16) * 8)
-                        } else if imm == 0 {
-                            vb
-                        } else {
-                            (vb >> (imm * 8)) | (va << ((16 - imm) * 8))
-                        }
-                    };
-                    let lo = align128(a_lo, b_lo);
-                    let hi = if ymm { align128(a_hi, b_hi) } else { 0 };
+                    let imm = cpu.read_op(ins, imm_op, 8) as u8;
+                    let lo = vops::palignr(a_lo, b_lo, imm);
+                    let hi = if ymm { vops::palignr(a_hi, b_hi, imm) } else { 0 };
                     vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
                 }
             }
@@ -954,23 +798,8 @@ impl Cpu {
                     let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);
                     let (b_lo, b_hi) = vops::load_vec_op(cpu, ins, s2_op, ymm);
                     let imm = cpu.read_op(ins, imm_op, 8) as u8;
-                    let clmul128 = |va: u128, vb: u128| -> u128 {
-                        let x = if (imm & 0x01) != 0 { (va >> 64) as u64 } else { va as u64 };
-                        let y = if (imm & 0x10) != 0 { (vb >> 64) as u64 } else { vb as u64 };
-                        let mut res = 0u128;
-                        let mut xx = x as u128;
-                        let mut yy = y;
-                        while yy != 0 {
-                            if (yy & 1) != 0 {
-                                res ^= xx;
-                            }
-                            xx <<= 1;
-                            yy >>= 1;
-                        }
-                        res
-                    };
-                    let lo = clmul128(a_lo, b_lo);
-                    let hi = if ymm { clmul128(a_hi, b_hi) } else { 0 };
+                    let lo = vops::pclmulqdq(a_lo, b_lo, imm);
+                    let hi = if ymm { vops::pclmulqdq(a_hi, b_hi, imm) } else { 0 };
                     vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
                 }
             }
@@ -1135,15 +964,9 @@ impl Cpu {
                 }
             }
             Mnemonic::Crc32 => {
-                // SSE4.2 CRC32C (Castagnoli, reflected polynomial 0x82F63B78) via 256-entry LUT.
                 let src_bits = Cpu::op_bits(ins, 1);
                 let v = cpu.read_op(ins, 1, src_bits);
-                let mut crc = cpu.read_op(ins, 0, 32) as u32;
-                let nbytes = src_bits >> 3;
-                for i in 0..nbytes {
-                    let b = ((v >> (8 * i)) as u8) as u32;
-                    crc = CRC32C_TABLE[((crc ^ b) & 0xFF) as usize] ^ (crc >> 8);
-                }
+                let crc = vops::crc32c_step(cpu.read_op(ins, 0, 32) as u32, v, src_bits);
                 let dst_bits = Cpu::op_bits(ins, 0);
                 cpu.write_op(ins, 0, dst_bits, crc as u64);
             }
@@ -1190,15 +1013,7 @@ impl Cpu {
             Mnemonic::Vpermq | Mnemonic::Vpermpd => {
                 if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
                     let (s_lo, s_hi) = vops::load_vec_op(cpu, ins, 1, true);
-                    let imm = cpu.read_op(ins, 2, 8) as u32;
-                    let q = ymm_qwords(s_lo, s_hi);
-                    let r: [u64; 4] = [
-                        q[(imm & 3) as usize],
-                        q[((imm >> 2) & 3) as usize],
-                        q[((imm >> 4) & 3) as usize],
-                        q[((imm >> 6) & 3) as usize],
-                    ];
-                    let (lo, hi) = qwords_ymm(&r);
+                    let (lo, hi) = vops::vpermq(s_lo, s_hi, cpu.read_op(ins, 2, 8) as u8);
                     cpu.xmm[d] = lo;
                     cpu.set_ymm_hi(d, hi);
                 }
@@ -1361,13 +1176,13 @@ impl Cpu {
                         _ => 0,
                     };
                     let res = match mn {
-                        Mnemonic::Sha1rnds4 => sha1rnds4(src1, src2, ins.immediate8()),
-                        Mnemonic::Sha1nexte => sha1nexte(src1, src2),
-                        Mnemonic::Sha1msg1 => sha1msg1(src1, src2),
-                        Mnemonic::Sha1msg2 => sha1msg2(src1, src2),
-                        Mnemonic::Sha256rnds2 => sha256rnds2(src1, src2, cpu.xmm[0]),
-                        Mnemonic::Sha256msg1 => sha256msg1(src1, src2),
-                        _ => sha256msg2(src1, src2),
+                        Mnemonic::Sha1rnds4 => vops::sha1rnds4(src1, src2, ins.immediate8()),
+                        Mnemonic::Sha1nexte => vops::sha1nexte(src1, src2),
+                        Mnemonic::Sha1msg1 => vops::sha1msg1(src1, src2),
+                        Mnemonic::Sha1msg2 => vops::sha1msg2(src1, src2),
+                        Mnemonic::Sha256rnds2 => vops::sha256rnds2(src1, src2, cpu.xmm[0]),
+                        Mnemonic::Sha256msg1 => vops::sha256msg1(src1, src2),
+                        _ => vops::sha256msg2(src1, src2),
                     };
                     // Legacy SSE encoding: preserves upper 128 bits (`ymm_hi[d]`).
                     cpu.xmm[d] = res;
@@ -1377,134 +1192,6 @@ impl Cpu {
         }
         true
     }
-}
-
-#[inline(always)]
-fn sha_lanes(v: u128) -> [u32; 4] {
-    [v as u32, (v >> 32) as u32, (v >> 64) as u32, (v >> 96) as u32]
-}
-
-#[inline(always)]
-fn sha_pack(w: [u32; 4]) -> u128 {
-    (w[0] as u128)
-        | ((w[1] as u128) << 32)
-        | ((w[2] as u128) << 64)
-        | ((w[3] as u128) << 96)
-}
-
-/// Intel SDM `SHA1RNDS4 xmm1, xmm2/m128, imm8`.
-pub(super) fn sha1rnds4(src1: u128, src2: u128, imm8: u8) -> u128 {
-    let [mut d, mut c, mut b, mut a] = sha_lanes(src1);
-    let [w3, w2, w1, w0e] = sha_lanes(src2);
-    let func = imm8 & 3;
-    let k: u32 = match func {
-        0 => 0x5A82_7999,
-        1 => 0x6ED9_EBA1,
-        2 => 0x8F1B_BCDC,
-        _ => 0xCA62_C1D6,
-    };
-    let f = |b: u32, c: u32, d: u32| -> u32 {
-        match func {
-            0 => (b & c) ^ ((!b) & d),
-            1 | 3 => b ^ c ^ d,
-            _ => (b & c) ^ (b & d) ^ (c & d),
-        }
-    };
-    // Round 0: W0E already includes E_0.
-    let a1 = f(b, c, d).wrapping_add(a.rotate_left(5)).wrapping_add(w0e).wrapping_add(k);
-    let mut e = d;
-    d = c;
-    c = b.rotate_left(30);
-    b = a;
-    a = a1;
-    for w in [w1, w2, w3] {
-        let an = f(b, c, d)
-            .wrapping_add(a.rotate_left(5))
-            .wrapping_add(w)
-            .wrapping_add(e)
-            .wrapping_add(k);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = an;
-    }
-    sha_pack([d, c, b, a])
-}
-
-/// Intel SDM `SHA1NEXTE xmm1, xmm2/m128`.
-pub(super) fn sha1nexte(src1: u128, src2: u128) -> u128 {
-    let tmp = ((src1 >> 96) as u32).rotate_left(30);
-    let [s0, s1, s2, s3] = sha_lanes(src2);
-    sha_pack([s0, s1, s2, s3.wrapping_add(tmp)])
-}
-
-/// Intel SDM `SHA1MSG1 xmm1, xmm2/m128`.
-pub(super) fn sha1msg1(src1: u128, src2: u128) -> u128 {
-    let [w3, w2, w1, w0] = sha_lanes(src1);
-    let [_, _, w5, w4] = sha_lanes(src2);
-    sha_pack([w5 ^ w3, w4 ^ w2, w3 ^ w1, w2 ^ w0])
-}
-
-/// Intel SDM `SHA1MSG2 xmm1, xmm2/m128`.
-pub(super) fn sha1msg2(src1: u128, src2: u128) -> u128 {
-    let [s0, s1, s2, s3] = sha_lanes(src1);
-    let [w15, w14, w13, _] = sha_lanes(src2);
-    let w16 = (s3 ^ w13).rotate_left(1);
-    let w17 = (s2 ^ w14).rotate_left(1);
-    let w18 = (s1 ^ w15).rotate_left(1);
-    let w19 = (s0 ^ w16).rotate_left(1);
-    sha_pack([w19, w18, w17, w16])
-}
-
-/// Intel SDM `SHA256RNDS2 xmm1, xmm2/m128, <XMM0>`.
-pub(super) fn sha256rnds2(src1: u128, src2: u128, xmm0: u128) -> u128 {
-    let [mut h, mut g, mut d, mut c] = sha_lanes(src1);
-    let [mut f, mut e, mut b, mut a] = sha_lanes(src2);
-    let wk = [xmm0 as u32, (xmm0 >> 32) as u32];
-    for w in wk {
-        let ch = (e & f) ^ ((!e) & g);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let t1 = ch.wrapping_add(s1).wrapping_add(w).wrapping_add(h);
-        let a_new = t1.wrapping_add(maj).wrapping_add(s0);
-        let e_new = t1.wrapping_add(d);
-        h = g;
-        g = f;
-        f = e;
-        e = e_new;
-        d = c;
-        c = b;
-        b = a;
-        a = a_new;
-    }
-    sha_pack([f, e, b, a])
-}
-
-/// Intel SDM `SHA256MSG1 xmm1, xmm2/m128`.
-pub(super) fn sha256msg1(src1: u128, src2: u128) -> u128 {
-    let [w0, w1, w2, w3] = sha_lanes(src1);
-    let w4 = src2 as u32;
-    let s0 = |x: u32| x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
-    sha_pack([
-        w0.wrapping_add(s0(w1)),
-        w1.wrapping_add(s0(w2)),
-        w2.wrapping_add(s0(w3)),
-        w3.wrapping_add(s0(w4)),
-    ])
-}
-
-/// Intel SDM `SHA256MSG2 xmm1, xmm2/m128`.
-pub(super) fn sha256msg2(src1: u128, src2: u128) -> u128 {
-    let [s0, s1, s2, s3] = sha_lanes(src1);
-    let [_, _, w14, w15] = sha_lanes(src2);
-    let sig1 = |x: u32| x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10);
-    let w16 = s0.wrapping_add(sig1(w14));
-    let w17 = s1.wrapping_add(sig1(w15));
-    let w18 = s2.wrapping_add(sig1(w16));
-    let w19 = s3.wrapping_add(sig1(w17));
-    sha_pack([w16, w17, w18, w19])
 }
 
 #[cfg(test)]

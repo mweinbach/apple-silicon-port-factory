@@ -1,7 +1,15 @@
-// Included into `emu_jit.rs`: native arm64/NEON translation for `K_VBROADCAST..=K_LOOP` (`101..=114`).
+//! Native arm64/NEON translation for `K_VBROADCAST..=K_YMM_LANE` (`101..=114`)
+//! and dispatch into `super::more` for `K_VAES_RR..=K_VSHA_RM`.
+
+use super::emit::{enc_logic_imm, sf, Asm};
+use super::translate::{stack_tso, Chk, FlagState, Src, Tr};
+use super::xmm::xh;
+use super::*;
+use crate::emu::fast::{self, FastOp};
+use crate::emu::mem;
 
 impl Asm {
-    fn v_xtl(&mut self, u: bool, sz: u32, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_xtl(&mut self, u: bool, sz: u32, q: bool, vd: u32, vn: u32) {
         self.emit(
             0x0F00_A400
                 | (q as u32) << 30
@@ -11,38 +19,38 @@ impl Asm {
                 | vd,
         );
     }
-    fn v_fcvtl(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtl(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0E61_7800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn v_fcvtn(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtn(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0E61_6800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn v_scvtf_2d(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_scvtf_2d(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E61_D800 | vn << 5 | vd);
     }
-    fn v_fcvtzs_2d(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtzs_2d(&mut self, vd: u32, vn: u32) {
         self.emit(0x4EE1_B800 | vn << 5 | vd);
     }
-    fn v_xtn_2s(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_xtn_2s(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0EA1_2800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn s_fneg(&mut self, is_f64: bool, vd: u32, vn: u32) {
+    pub(super) fn s_fneg(&mut self, is_f64: bool, vd: u32, vn: u32) {
         self.emit(0x1E21_4000 | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
-    fn s_fmadd(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32, va: u32) {
+    pub(super) fn s_fmadd(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32, va: u32) {
         self.emit(0x1F00_0000 | (is_f64 as u32) << 22 | vm << 16 | va << 10 | vn << 5 | vd);
     }
-    fn v_fneg(&mut self, is_f64: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fneg(&mut self, is_f64: bool, vd: u32, vn: u32) {
         self.emit(0x6EA0_F800 | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
-    fn v_fmla(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_fmla(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E20_CC00 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn bics_rr(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
+    pub(super) fn bics_rr(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
         let opc = if s { 3u32 } else { 0 };
         self.emit(0x0A20_0000 | sf(x) | opc << 29 | m << 16 | n << 5 | d);
     }
-    fn crc32c(&mut self, sw: u32, d: u32, n: u32, m: u32) {
+    pub(super) fn crc32c(&mut self, sw: u32, d: u32, n: u32, m: u32) {
         let (x, sz) = match sw {
             8 => (false, 0),
             16 => (false, 1),
@@ -54,7 +62,7 @@ impl Asm {
 }
 
 impl Tr<'_> {
-    fn emit_cvtpd2dq_lane(&mut self, trunc: bool, vd: u32, vn: u32) {
+    pub(super) fn emit_cvtpd2dq_lane(&mut self, trunc: bool, vd: u32, vn: u32) {
         // Never alias `src == vd`: `v_fcvtzs_2d(vd, src)` overwrites `vd` with the i64
         // result BEFORE the range checks (`v_fcmgt` / `v_fcmge`) inspect `src`. When
         // `trunc && vd == vn`, copy `vn` to scratch `v5` first so negative inputs (whose
@@ -85,7 +93,7 @@ impl Tr<'_> {
         self.a.v_mov(vd, 3);
     }
 
-    fn emit_vfma_lane(&mut self, ty: u8, ord: u8, fop: u8) {
+    pub(super) fn emit_vfma_lane(&mut self, ty: u8, ord: u8, fop: u8) {
         // v0 = v1(d), v2 = v2(s2), v1 = v3(s3). Result in v0.
         let (m1, m2, acc) = match ord {
             0 => (0u32, 1u32, 2u32),
@@ -151,7 +159,7 @@ impl Tr<'_> {
         }
     }
 
-    fn ext_op_more(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn ext_op_more(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let w = op.w;
         let wb = w as u32;
@@ -1079,5 +1087,3 @@ impl Tr<'_> {
         }
     }
 }
-
-include!("jit_more.rs");

@@ -1,34 +1,41 @@
-// Included into `emu_fast.rs`: extended lowering and execution for `K_VBROADCAST..=K_LOOP`
-// (`101..=114`) so that 100% of instructions handled by the emulator lower to `FastOp` kinds.
+//! Extended lowering and execution for `K_VBROADCAST..=K_LOOP` (`101..=114`) routed through
+//! [`crate::emu::simd_kernels`].
+
+use super::decode::{gpr_of, is_w, mem_bits, put_mem, vmem_code, vmode, xreg};
+use super::more::{exec_ext_all_remaining, lower_all_remaining};
+use super::*;
+use crate::emu::simd_kernels as sk;
+use crate::emu::{Cpu, OpKind};
+use iced_x86::{Instruction, Mnemonic};
 
 /// `(v)pbroadcastb/w/d/q`, `(v)broadcastss/sd`, `vbroadcastf128/i128`.
-pub(super) const K_VBROADCAST: u8 = 101;
+pub(in crate::emu) const K_VBROADCAST: u8 = 101;
 /// `(v)pmovsxbw/bd/bq/wd/wq/dq` and `(v)pmovzxbw/bd/bq/wd/wq/dq` (128-bit and 256-bit).
-pub(super) const K_PMOVX: u8 = 102;
+pub(in crate::emu) const K_PMOVX: u8 = 102;
 /// `(v)cvtps2pd`, `(v)cvtdq2pd`, `(v)cvtpd2ps`, `(v)cvttpd2dq`, `(v)cvtpd2dq`.
-pub(super) const K_VCVT_PD: u8 = 103;
+pub(in crate::emu) const K_VCVT_PD: u8 = 103;
 /// All 72 FMA mnemonics (`vfmadd/fmsub/fnmadd/fnmsub/fmaddsub/fmsubadd` `132/213/231` `ss/sd/ps/pd`).
-pub(super) const K_VFMA_RR: u8 = 104;
-pub(super) const K_VFMA_RM: u8 = 105;
+pub(in crate::emu) const K_VFMA_RR: u8 = 104;
+pub(in crate::emu) const K_VFMA_RM: u8 = 105;
 /// Variable blends: `(v)blendvps`, `(v)blendvpd`, `(v)pblendvb`.
-pub(super) const K_VBLENDV_RR: u8 = 106;
-pub(super) const K_VBLENDV_RM: u8 = 107;
+pub(in crate::emu) const K_VBLENDV_RR: u8 = 106;
+pub(in crate::emu) const K_VBLENDV_RM: u8 = 107;
 /// Vector test: `(v)ptest`, `vtestps`, `vtestpd`.
-pub(super) const K_VTEST_RR: u8 = 108;
-pub(super) const K_VTEST_RM: u8 = 109;
+pub(in crate::emu) const K_VTEST_RR: u8 = 108;
+pub(in crate::emu) const K_VTEST_RM: u8 = 109;
 /// BMI1/BMI2/ADX/CRC32 integer ops (`andn`, `shlx`, `shrx`, `sarx`, `rorx`, `blsr`, `blsmsk`,
 /// `blsi`, `bzhi`, `bextr`, `mulx`, `adcx`, `adox`, `crc32`).
-pub(super) const K_BMI_RR: u8 = 110;
-pub(super) const K_BMI_RM: u8 = 111;
+pub(in crate::emu) const K_BMI_RR: u8 = 110;
+pub(in crate::emu) const K_BMI_RM: u8 = 111;
 /// 256-bit lane ops: `vpermq`/`vpermpd`, `vpermd`/`vpermps`, `vperm2f128`/`vperm2i128`,
 /// `vinsertf128`/`vinserti128`, `vextractf128`/`vextracti128`, `vzeroall`.
-pub(super) const K_YMM_LANE: u8 = 112;
+pub(in crate::emu) const K_YMM_LANE: u8 = 112;
 /// Universal pre-decoded `Instruction` fast op (atomic `lock` RMW, `cmpxchg8b`/`16b`, string ops,
 /// `aes*`, `vcvtph2ps`/`vcvtps2ph`, `vmaskmov*`, `pcmpistri/m`, `pdep`/`pext`, `rcl`/`rcr`,
 /// `lahf`/`sahf`, `pushfq`/`popfq`, `cpuid`/`rdtsc`/`xgetbv`, MXCSR/x87 CW, high-byte GPR forms).
-pub(super) const K_INSN: u8 = 113;
+pub(in crate::emu) const K_INSN: u8 = 113;
 /// `jrcxz` (`sub=0`), `jecxz` (`sub=1`), `loop` (`sub=2`), `loope` (`sub=3`), `loopne` (`sub=4`).
-pub(super) const K_LOOP: u8 = 114;
+pub(in crate::emu) const K_LOOP: u8 = 114;
 
 fn fma_desc(mn: Mnemonic) -> Option<(u8, u8, u8)> {
     use iced_x86::Mnemonic as M;
@@ -102,7 +109,7 @@ fn fma_desc(mn: Mnemonic) -> Option<(u8, u8, u8)> {
     Some(r)
 }
 
-fn lower_more(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
+pub(super) fn lower_more(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     use iced_x86::Mnemonic as M;
     let mn = ins.mnemonic();
     let n = ins.op_count();
@@ -671,7 +678,7 @@ fn lower_more(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     Some(f)
 }
 
-unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
+pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
     let w = op.w;
     match op.kind {
         K_VBROADCAST => {
@@ -693,19 +700,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 } else {
                     cpu.xmm[op.r1 as usize & 15] as u64
                 };
-                let out: u128 = match lg {
-                    0 => u128::from_ne_bytes([raw as u8; 16]),
-                    1 => {
-                        let w16 = (raw as u16) as u128;
-                        w16.wrapping_mul(0x0001_0001_0001_0001_0001_0001_0001_0001u128)
-                    }
-                    2 => {
-                        let d32 = (raw as u32) as u64;
-                        let q64 = d32 | (d32 << 32);
-                        (q64 as u128) | ((q64 as u128) << 64)
-                    }
-                    _ => (raw as u128) | ((raw as u128) << 64),
-                };
+                let out = sk::pbroadcast(raw as u128, ebits);
                 cpu.xmm[d] = out;
                 if mode == VM_V256 {
                     cpu.set_ymm_hi(d, out);
@@ -728,7 +723,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
             } else {
                 cpu.xmm[op.r1 as usize & 15]
             };
-            let (out_lo, out_hi) = pmovx_exec(sub, raw, mode == VM_V256);
+            let (out_lo, out_hi) = sk::pmovsx_zx(raw, sub, mode == VM_V256);
             cpu.xmm[d] = out_lo;
             if mode == VM_V256 {
                 cpu.set_ymm_hi(d, out_hi);
@@ -753,14 +748,11 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 } else {
                     cpu.xmm[op.r1 as usize & 15]
                 };
-                let from_int = sub == 1;
-                let cvt = |lane: u32| -> u128 {
-                    let w32 = (raw >> (lane * 32)) as u32;
-                    let f = if from_int { w32 as i32 as f64 } else { f32::from_bits(w32) as f64 };
-                    f.to_bits() as u128
+                let (lo, hi) = if sub == 1 {
+                    sk::cvtdq2pd(raw, mode == VM_V256)
+                } else {
+                    sk::cvtps2pd(raw, mode == VM_V256)
                 };
-                let lo = cvt(0) | (cvt(1) << 64);
-                let hi = if mode == VM_V256 { cvt(2) | (cvt(3) << 64) } else { 0 };
                 cpu.xmm[d] = lo;
                 if mode == VM_V256 {
                     cpu.set_ymm_hi(d, hi);
@@ -777,17 +769,11 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     let s = op.r1 as usize & 15;
                     (cpu.xmm[s], cpu.ymm_hi[s])
                 };
-                let to_ps = sub == 2;
-                let trunc = sub == 3;
-                let cvt = |bits: u64| -> u128 {
-                    let f = f64::from_bits(bits);
-                    if to_ps { (f as f32).to_bits() as u128 } else { sse_cvt_i32(f, trunc) as u128 }
+                cpu.xmm[d] = if sub == 2 {
+                    sk::cvtpd2ps(lo, hi, src_256)
+                } else {
+                    sk::cvtpd2dq(lo, hi, src_256, sub == 3)
                 };
-                let i0 = cvt(lo as u64);
-                let i1 = cvt((lo >> 64) as u64);
-                let i2 = if src_256 { cvt(hi as u64) } else { 0 };
-                let i3 = if src_256 { cvt((hi >> 64) as u64) } else { 0 };
-                cpu.xmm[d] = i0 | (i1 << 32) | (i2 << 64) | (i3 << 96);
                 if mode != VM_LEG {
                     cpu.clear_ymm_hi_reg(d);
                 }
@@ -869,7 +855,12 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 (cpu.xmm[s2], if mode == VM_V256 { cpu.ymm_hi[s2] } else { 0 })
             };
             let m_lo = cpu.xmm[m_idx];
-            let res_lo = vblendv_128(lg, a_lo, b_lo, m_lo);
+            let blend_fn: fn(u128, u128, u128) -> u128 = match lg {
+                0 => sk::blendvb,
+                2 => sk::blendvps,
+                _ => sk::blendvpd,
+            };
+            let res_lo = blend_fn(a_lo, b_lo, m_lo);
             match mode {
                 VM_LEG => cpu.xmm[d] = res_lo,
                 VM_V128 => {
@@ -877,7 +868,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     cpu.clear_ymm_hi_reg(d);
                 }
                 _ => {
-                    let res_hi = vblendv_128(lg, cpu.ymm_hi[s1], b_hi, cpu.ymm_hi[m_idx]);
+                    let res_hi = blend_fn(cpu.ymm_hi[s1], b_hi, cpu.ymm_hi[m_idx]);
                     cpu.xmm[d] = res_lo;
                     cpu.set_ymm_hi(d, res_hi);
                 }
@@ -1023,7 +1014,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     let src_bits = wb;
                     let dst_bits = op.imm as u8;
                     let v = if mem { cpu.read_mem(cpu.faddr(op), src_bits) } else { cpu.rget(op.r1, w) };
-                    let crc = crc32c_step(cpu.rget(op.r0, 32) as u32, v, src_bits);
+                    let crc = sk::crc32c_step(cpu.rget(op.r0, 32) as u32, v, src_bits);
                     cpu.rset(op.r0, dst_bits, crc as u64);
                 }
             }
@@ -1042,11 +1033,9 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                         let s = op.r1 as usize & 15;
                         (cpu.xmm[s], cpu.ymm_hi[s])
                     };
-                    let imm = op.imm as u32;
-                    let q: [u64; 4] = [s_lo as u64, (s_lo >> 64) as u64, s_hi as u64, (s_hi >> 64) as u64];
-                    let r: [u64; 4] = core::array::from_fn(|i| q[((imm >> (2 * i)) & 3) as usize]);
-                    cpu.xmm[d] = (r[0] as u128) | ((r[1] as u128) << 64);
-                    cpu.set_ymm_hi(d, (r[2] as u128) | ((r[3] as u128) << 64));
+                    let (lo, hi) = sk::vpermq(s_lo, s_hi, op.imm as u8);
+                    cpu.xmm[d] = lo;
+                    cpu.set_ymm_hi(d, hi);
                 }
                 1 => {
                     // Vpermd / Vpermps
@@ -1060,10 +1049,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                         let s = op.r1 as usize & 15;
                         (cpu.xmm[s], cpu.ymm_hi[s])
                     };
-                    let idx = super::ymm_dwords(i_lo, i_hi);
-                    let tab = super::ymm_dwords(t_lo, t_hi);
-                    let r: [u32; 8] = core::array::from_fn(|i| tab[(idx[i] & 7) as usize]);
-                    let (lo, hi) = super::dwords_ymm(&r);
+                    let (lo, hi) = sk::vpermd_ymm(i_lo, i_hi, t_lo, t_hi);
                     cpu.xmm[d] = lo;
                     cpu.set_ymm_hi(d, hi);
                 }
@@ -1080,20 +1066,9 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                         let s2 = op.r1 as usize & 15;
                         (cpu.xmm[s2], cpu.ymm_hi[s2])
                     };
-                    let pick = |ctrl: u8| -> u128 {
-                        if ctrl & 0x8 != 0 {
-                            0
-                        } else {
-                            match ctrl & 0x3 {
-                                0 => s1_lo,
-                                1 => s1_hi,
-                                2 => s2_lo,
-                                _ => s2_hi,
-                            }
-                        }
-                    };
-                    cpu.xmm[d] = pick(imm & 0xF);
-                    cpu.set_ymm_hi(d, pick((imm >> 4) & 0xF));
+                    let (lo, hi) = sk::vperm2_128(s1_lo, s1_hi, s2_lo, s2_hi, imm);
+                    cpu.xmm[d] = lo;
+                    cpu.set_ymm_hi(d, hi);
                 }
                 3 => {
                     // Vinsertf128 / Vinserti128
@@ -1137,7 +1112,7 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
             let ins = if op.imm != 0 && (*(op.imm as *const Instruction)).ip() == op.ip {
                 *(op.imm as *const Instruction)
             } else {
-                let mapped = super::to_mapped_addr(op.ip);
+                let mapped = crate::emu::to_mapped_addr(op.ip);
                 let slice = core::slice::from_raw_parts(mapped as *const u8, op.len as usize);
                 let mut dec = iced_x86::Decoder::with_ip(64, slice, op.ip, iced_x86::DecoderOptions::NONE);
                 dec.decode()
@@ -1169,182 +1144,6 @@ unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
     }
 }
 
-/// Sign/zero-extend packed vector lanes for `K_PMOVX` (`pmovsx*`/`pmovzx*`), using NEON
-/// widening moves on `aarch64`.
-#[inline(always)]
-fn pmovx_exec(sub: u8, raw: u128, is_256: bool) -> (u128, u128) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        unsafe {
-            let v = u128_to_u8x16(raw);
-            return match sub {
-                0 => {
-                    let s = vreinterpretq_s8_u8(v);
-                    (
-                        core::mem::transmute(vmovl_s8(vget_low_s8(s))),
-                        if is_256 { core::mem::transmute(vmovl_high_s8(s)) } else { 0 },
-                    )
-                }
-                1 => (
-                    core::mem::transmute(vmovl_u8(vget_low_u8(v))),
-                    if is_256 { core::mem::transmute(vmovl_high_u8(v)) } else { 0 },
-                ),
-                2 => {
-                    let w = vmovl_s8(vget_low_s8(vreinterpretq_s8_u8(v)));
-                    (
-                        core::mem::transmute(vmovl_s16(vget_low_s16(w))),
-                        if is_256 { core::mem::transmute(vmovl_high_s16(w)) } else { 0 },
-                    )
-                }
-                3 => {
-                    let w = vmovl_u8(vget_low_u8(v));
-                    (
-                        core::mem::transmute(vmovl_u16(vget_low_u16(w))),
-                        if is_256 { core::mem::transmute(vmovl_high_u16(w)) } else { 0 },
-                    )
-                }
-                4 => {
-                    let w = vmovl_s8(vget_low_s8(vreinterpretq_s8_u8(v)));
-                    let d = vmovl_s16(vget_low_s16(w));
-                    (
-                        core::mem::transmute(vmovl_s32(vget_low_s32(d))),
-                        if is_256 { core::mem::transmute(vmovl_high_s32(d)) } else { 0 },
-                    )
-                }
-                5 => {
-                    let w = vmovl_u8(vget_low_u8(v));
-                    let d = vmovl_u16(vget_low_u16(w));
-                    (
-                        core::mem::transmute(vmovl_u32(vget_low_u32(d))),
-                        if is_256 { core::mem::transmute(vmovl_high_u32(d)) } else { 0 },
-                    )
-                }
-                6 => {
-                    let s = vreinterpretq_s16_u8(v);
-                    (
-                        core::mem::transmute(vmovl_s16(vget_low_s16(s))),
-                        if is_256 { core::mem::transmute(vmovl_high_s16(s)) } else { 0 },
-                    )
-                }
-                7 => {
-                    let u = vreinterpretq_u16_u8(v);
-                    (
-                        core::mem::transmute(vmovl_u16(vget_low_u16(u))),
-                        if is_256 { core::mem::transmute(vmovl_high_u16(u)) } else { 0 },
-                    )
-                }
-                8 => {
-                    let d = vmovl_s16(vget_low_s16(vreinterpretq_s16_u8(v)));
-                    (
-                        core::mem::transmute(vmovl_s32(vget_low_s32(d))),
-                        if is_256 { core::mem::transmute(vmovl_high_s32(d)) } else { 0 },
-                    )
-                }
-                9 => {
-                    let d = vmovl_u16(vget_low_u16(vreinterpretq_u16_u8(v)));
-                    (
-                        core::mem::transmute(vmovl_u32(vget_low_u32(d))),
-                        if is_256 { core::mem::transmute(vmovl_high_u32(d)) } else { 0 },
-                    )
-                }
-                10 => {
-                    let s = vreinterpretq_s32_u8(v);
-                    (
-                        core::mem::transmute(vmovl_s32(vget_low_s32(s))),
-                        if is_256 { core::mem::transmute(vmovl_high_s32(s)) } else { 0 },
-                    )
-                }
-                _ => {
-                    let u = vreinterpretq_u32_u8(v);
-                    (
-                        core::mem::transmute(vmovl_u32(vget_low_u32(u))),
-                        if is_256 { core::mem::transmute(vmovl_high_u32(u)) } else { 0 },
-                    )
-                }
-            };
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let (src_bits, dst_bits, signed): (u32, u32, bool) = match sub {
-            0 => (8, 16, true),
-            1 => (8, 16, false),
-            2 => (8, 32, true),
-            3 => (8, 32, false),
-            4 => (8, 64, true),
-            5 => (8, 64, false),
-            6 => (16, 32, true),
-            7 => (16, 32, false),
-            8 => (16, 64, true),
-            9 => (16, 64, false),
-            10 => (32, 64, true),
-            _ => (32, 64, false),
-        };
-        let per_lane = (128 / dst_bits) as usize;
-        let dst_mask = if dst_bits == 64 { u64::MAX as u128 } else { (1u128 << dst_bits) - 1 };
-        let src_mask = (1u128 << src_bits) - 1;
-        let ext = |idx: usize| -> u128 {
-            let v = ((raw >> (idx as u32 * src_bits)) & src_mask) as u64;
-            let e = if signed { sext(v, src_bits as u8) } else { v };
-            (e as u128) & dst_mask
-        };
-        let mut lo = 0u128;
-        for i in 0..per_lane {
-            lo |= ext(i) << (i as u32 * dst_bits);
-        }
-        let mut hi = 0u128;
-        if is_256 {
-            for i in 0..per_lane {
-                hi |= ext(per_lane + i) << (i as u32 * dst_bits);
-            }
-        }
-        (lo, hi)
-    }
-}
-
-/// Variable lane blend (`pblendvb` / `blendvps` / `blendvpd`) on one 128-bit lane.
-#[inline(always)]
-fn vblendv_128(lg: usize, va: u128, vb: u128, vm: u128) -> u128 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        unsafe {
-            let a = u128_to_u8x16(va);
-            let b = u128_to_u8x16(vb);
-            let m = u128_to_u8x16(vm);
-            return match lg {
-                0 => {
-                    let sel = vreinterpretq_u8_s8(vshrq_n_s8::<7>(vreinterpretq_s8_u8(m)));
-                    core::mem::transmute(vbslq_u8(sel, b, a))
-                }
-                2 => {
-                    let sel = vreinterpretq_u32_s32(vshrq_n_s32::<31>(vreinterpretq_s32_u8(m)));
-                    core::mem::transmute(vbslq_u32(sel, vreinterpretq_u32_u8(b), vreinterpretq_u32_u8(a)))
-                }
-                _ => {
-                    let sel = vreinterpretq_u64_s64(vshrq_n_s64::<63>(vreinterpretq_s64_u8(m)));
-                    core::mem::transmute(vbslq_u64(sel, vreinterpretq_u64_u8(b), vreinterpretq_u64_u8(a)))
-                }
-            };
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let ebits = 8u32 << lg;
-        let count = 128 / ebits;
-        let mask = if ebits == 64 { u64::MAX as u128 } else { (1u128 << ebits) - 1 };
-        let mut r = 0u128;
-        for i in 0..count {
-            let sh = i * ebits;
-            let take_b = ((vm >> (sh + ebits - 1)) & 1) != 0;
-            let elem = ((if take_b { vb } else { va }) >> sh) & mask;
-            r |= elem << sh;
-        }
-        r
-    }
-}
-
 /// Packed single-precision FMA on one 128-bit lane.
 #[inline(always)]
 fn vfma_ps_128(ord: u8, fop: u8, x1: u128, x2: u128, x3: u128) -> u128 {
@@ -1360,7 +1159,7 @@ fn vfma_ps_128(ord: u8, fop: u8, x1: u128, x2: u128, x3: u128) -> u128 {
         1 => (x2, x1, x3),
         _ => (x2, x3, x1),
     };
-    super::simd_mov::vops::fma_ps(m1, m2, acc, neg_mul, acc_mode)
+    sk::fma_ps(m1, m2, acc, neg_mul, acc_mode)
 }
 
 /// Packed double-precision FMA on one 128-bit lane.
@@ -1378,32 +1177,5 @@ fn vfma_pd_128(ord: u8, fop: u8, x1: u128, x2: u128, x3: u128) -> u128 {
         1 => (x2, x1, x3),
         _ => (x2, x3, x1),
     };
-    super::simd_mov::vops::fma_pd(m1, m2, acc, neg_mul, acc_mode)
+    sk::fma_pd(m1, m2, acc, neg_mul, acc_mode)
 }
-
-/// SSE4.2 CRC32C step (hardware `crc32c*` when `target_feature = "crc"`, portable fallback on iOS/other).
-#[inline(always)]
-fn crc32c_step(crc: u32, v: u64, src_bits: u32) -> u32 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
-    unsafe {
-        match src_bits {
-            8 => core::arch::aarch64::__crc32cb(crc, v as u8),
-            16 => core::arch::aarch64::__crc32ch(crc, v as u16),
-            32 => core::arch::aarch64::__crc32cw(crc, v as u32),
-            _ => core::arch::aarch64::__crc32cd(crc, v),
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "crc")))]
-    {
-        let mut c = crc;
-        for i in 0..src_bits / 8 {
-            c ^= ((v >> (8 * i)) as u8) as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 };
-            }
-        }
-        c
-    }
-}
-
-include!("fast_more.rs");

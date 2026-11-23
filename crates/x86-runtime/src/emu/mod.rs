@@ -20,6 +20,7 @@ mod fast;
 mod mem;
 pub mod regfile;
 pub mod regfile_ext;
+mod simd_kernels;
 mod simd_mov;
 mod simd_fp;
 #[cfg(target_arch = "aarch64")]
@@ -2566,36 +2567,6 @@ impl Cpu {
         self.df = ((f >> 10) & 1) != 0;
         self.of = ((f >> 11) & 1) != 0;
     }
-}
-
-/// Split a YMM value `(bits 127:0, bits 255:128)` into 8 dwords.
-#[inline(always)]
-fn ymm_dwords(lo: u128, hi: u128) -> [u32; 8] {
-    core::array::from_fn(|i| if i < 4 { (lo >> (32 * i)) as u32 } else { (hi >> (32 * (i - 4))) as u32 })
-}
-
-/// Inverse of [`ymm_dwords`].
-#[inline(always)]
-fn dwords_ymm(d: &[u32; 8]) -> (u128, u128) {
-    let mut lo = 0u128;
-    let mut hi = 0u128;
-    for i in 0..4 {
-        lo |= (d[i] as u128) << (32 * i);
-        hi |= (d[i + 4] as u128) << (32 * i);
-    }
-    (lo, hi)
-}
-
-/// Split a YMM value into 4 qwords.
-#[inline(always)]
-fn ymm_qwords(lo: u128, hi: u128) -> [u64; 4] {
-    [lo as u64, (lo >> 64) as u64, hi as u64, (hi >> 64) as u64]
-}
-
-/// Inverse of [`ymm_qwords`].
-#[inline(always)]
-fn qwords_ymm(q: &[u64; 4]) -> (u128, u128) {
-    ((q[0] as u128) | ((q[1] as u128) << 64), (q[2] as u128) | ((q[3] as u128) << 64))
 }
 
 const GUEST_STACK_QWORDS: usize = 1024 * 1024; // 8 MB per thread

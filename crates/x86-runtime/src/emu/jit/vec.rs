@@ -1,79 +1,86 @@
-// Included into `emu_jit.rs`: NEON encodings and native x86->arm64 vector translation
-// for `K_VSHUF_RR`/`K_VSHUF_RM`, `K_VINT_RR`/`K_VINT_RM`, and `K_VFP_RR`/`K_VFP_RM`.
+//! NEON encodings and native x86->arm64 vector translation for
+//! `K_VSHUF_RR`/`K_VSHUF_RM`, `K_VINT_RR`/`K_VINT_RM`, `K_VFP_RR`/`K_VFP_RM`,
+//! and extended integer/stack/flag fast ops (`K_BSWAP_R..=K_PEXTR`).
+
+use super::emit::{enc_logic_imm, sf, Asm};
+use super::translate::{stack_tso, Chk, Cond, FlagState, Src, Tr};
+use super::*;
+use crate::emu::fast::{self, FastOp};
+use crate::emu::mem;
 
 impl Asm {
-    fn adcs(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
+    pub(super) fn adcs(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
         self.emit(0x1A00_0000 | sf(x) | (s as u32) << 29 | m << 16 | n << 5 | d);
     }
-    fn sbcs(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
+    pub(super) fn sbcs(&mut self, x: bool, s: bool, d: u32, n: u32, m: u32) {
         self.emit(0x5A00_0000 | sf(x) | (s as u32) << 29 | m << 16 | n << 5 | d);
     }
-    fn bic_rr(&mut self, x: bool, d: u32, n: u32, m: u32) {
+    pub(super) fn bic_rr(&mut self, x: bool, d: u32, n: u32, m: u32) {
         self.emit(0x0A20_0000 | sf(x) | m << 16 | n << 5 | d);
     }
-    fn rorv(&mut self, x: bool, d: u32, n: u32, m: u32) {
+    pub(super) fn rorv(&mut self, x: bool, d: u32, n: u32, m: u32) {
         self.emit(0x1AC0_2C00 | sf(x) | m << 16 | n << 5 | d);
     }
-    fn v_cnt_8b(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_cnt_8b(&mut self, vd: u32, vn: u32) {
         self.emit(0x0E20_5800 | vn << 5 | vd);
     }
-    fn v_addv_8b(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_addv_8b(&mut self, vd: u32, vn: u32) {
         self.emit(0x0E31_B800 | vn << 5 | vd);
     }
-    fn v_addv_4s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_addv_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4EB1_B800 | vn << 5 | vd);
     }
-    fn rev16_w(&mut self, d: u32, n: u32) {
+    pub(super) fn rev16_w(&mut self, d: u32, n: u32) {
         self.emit(0x5AC0_0400 | n << 5 | d);
     }
-    fn v_abs(&mut self, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_abs(&mut self, size: u32, vd: u32, vn: u32) {
         self.emit(0x4E20_B800 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_neg(&mut self, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_neg(&mut self, size: u32, vd: u32, vn: u32) {
         self.emit(0x6E20_B800 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_cmlt0(&mut self, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_cmlt0(&mut self, size: u32, vd: u32, vn: u32) {
         self.emit(0x4E20_A800 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_cmeq0(&mut self, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_cmeq0(&mut self, size: u32, vd: u32, vn: u32) {
         self.emit(0x4E20_9800 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_ins_elem(&mut self, lg: u32, vd: u32, lane: u32, rn: u32) {
+    pub(super) fn v_ins_elem(&mut self, lg: u32, vd: u32, lane: u32, rn: u32) {
         let imm5 = (lane << (lg + 1)) | (1u32 << lg);
         self.emit(0x4E00_1C00 | imm5 << 16 | rn << 5 | vd);
     }
-    fn v_umov_elem(&mut self, lg: u32, rd: u32, vn: u32, lane: u32) {
+    pub(super) fn v_umov_elem(&mut self, lg: u32, rd: u32, vn: u32, lane: u32) {
         let q = (lg == 3) as u32;
         let imm5 = (lane << (lg + 1)) | (1u32 << lg);
         self.emit(0x0E00_3C00 | q << 30 | imm5 << 16 | vn << 5 | rd);
     }
-    fn neon_3same(&mut self, u: bool, size: u32, opcode: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn neon_3same(&mut self, u: bool, size: u32, opcode: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E20_0400 | (u as u32) << 29 | (size & 3) << 22 | vm << 16 | opcode << 11 | vn << 5 | vd);
     }
-    fn v_and(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_and(&mut self, vd: u32, vn: u32, vm: u32) {
         self.neon_3same(false, 0, 3, vd, vn, vm);
     }
-    fn v_bic(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_bic(&mut self, vd: u32, vn: u32, vm: u32) {
         self.neon_3same(false, 1, 3, vd, vn, vm);
     }
-    fn v_orr(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_orr(&mut self, vd: u32, vn: u32, vm: u32) {
         self.neon_3same(false, 2, 3, vd, vn, vm);
     }
-    fn v_eor(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_eor(&mut self, vd: u32, vn: u32, vm: u32) {
         self.neon_3same(true, 0, 3, vd, vn, vm);
     }
-    fn v_bsl(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_bsl(&mut self, vd: u32, vn: u32, vm: u32) {
         self.neon_3same(true, 1, 3, vd, vn, vm);
     }
-    fn v_mov(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_mov(&mut self, vd: u32, vn: u32) {
         if vd != vn {
             self.v_orr(vd, vn, vn);
         }
     }
-    fn v_zero(&mut self, vd: u32) {
+    pub(super) fn v_zero(&mut self, vd: u32) {
         self.v_eor(vd, vd, vd);
     }
-    fn zero128(&mut self, base: u32, off: u32) {
+    pub(super) fn zero128(&mut self, base: u32, off: u32) {
         if off % 8 == 0 && off <= 504 {
             self.stp_x(ZR, ZR, base, off as i32);
         } else {
@@ -81,79 +88,79 @@ impl Asm {
             self.str(64, ZR, base, off + 8);
         }
     }
-    fn v_ins_d(&mut self, vd: u32, idx: u32, rn: u32) {
+    pub(super) fn v_ins_d(&mut self, vd: u32, idx: u32, rn: u32) {
         let imm5 = ((idx & 1) << 4) | 0b1000;
         self.emit(0x4E00_1C00 | imm5 << 16 | rn << 5 | vd);
     }
-    fn v_ins_s(&mut self, vd: u32, idx: u32, rn: u32) {
+    pub(super) fn v_ins_s(&mut self, vd: u32, idx: u32, rn: u32) {
         let imm5 = ((idx & 3) << 3) | 0b0100;
         self.emit(0x4E00_1C00 | imm5 << 16 | rn << 5 | vd);
     }
-    fn v_umov_d(&mut self, rd: u32, vn: u32, idx: u32) {
+    pub(super) fn v_umov_d(&mut self, rd: u32, vn: u32, idx: u32) {
         let imm5 = ((idx & 1) << 4) | 0b1000;
         self.emit(0x4E00_3C00 | imm5 << 16 | vn << 5 | rd);
     }
-    fn v_dup(&mut self, size: u32, vd: u32, rn: u32) {
+    pub(super) fn v_dup(&mut self, size: u32, vd: u32, rn: u32) {
         let imm5 = 1u32 << (size & 3);
         self.emit(0x4E00_0C00 | imm5 << 16 | rn << 5 | vd);
     }
     /// `dup vd.4s, vn.s[lane]` (broadcast 32-bit lane across 128-bit vector).
-    fn v_dup_lane_s(&mut self, vd: u32, vn: u32, lane: u32) {
+    pub(super) fn v_dup_lane_s(&mut self, vd: u32, vn: u32, lane: u32) {
         let imm5 = ((lane & 3) << 3) | 0b0100;
         self.emit(0x4E00_0400 | imm5 << 16 | vn << 5 | vd);
     }
-    fn v_zip1(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_zip1(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E00_3800 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_zip2(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_zip2(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E00_7800 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_uzp1(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_uzp1(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E00_1800 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_uzp2(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_uzp2(&mut self, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E00_5800 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_tbl1(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_tbl1(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E00_0000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_tbl2(&mut self, vd: u32, vn_pair: u32, vm: u32) {
+    pub(super) fn v_tbl2(&mut self, vd: u32, vn_pair: u32, vm: u32) {
         self.emit(0x4E00_2000 | vm << 16 | vn_pair << 5 | vd);
     }
-    fn v_ext(&mut self, vd: u32, vn: u32, vm: u32, imm4: u32) {
+    pub(super) fn v_ext(&mut self, vd: u32, vn: u32, vm: u32, imm4: u32) {
         self.emit(0x6E00_0000 | vm << 16 | (imm4 & 15) << 11 | vn << 5 | vd);
     }
-    fn v_sqxtn(&mut self, q: bool, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_sqxtn(&mut self, q: bool, size: u32, vd: u32, vn: u32) {
         self.emit(0x0E21_4800 | (q as u32) << 30 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_sqxtun(&mut self, q: bool, size: u32, vd: u32, vn: u32) {
+    pub(super) fn v_sqxtun(&mut self, q: bool, size: u32, vd: u32, vn: u32) {
         self.emit(0x2E21_2800 | (q as u32) << 30 | (size & 3) << 22 | vn << 5 | vd);
     }
-    fn v_shl_i(&mut self, ebits: u32, vd: u32, vn: u32, shift: u32) {
+    pub(super) fn v_shl_i(&mut self, ebits: u32, vd: u32, vn: u32, shift: u32) {
         let imm = ebits + shift;
         self.emit(0x4F00_5400 | imm << 16 | vn << 5 | vd);
     }
-    fn v_shr_i(&mut self, u: bool, ebits: u32, vd: u32, vn: u32, shift: u32) {
+    pub(super) fn v_shr_i(&mut self, u: bool, ebits: u32, vd: u32, vn: u32, shift: u32) {
         let imm = 2 * ebits - shift;
         self.emit(0x4F00_0400 | (u as u32) << 29 | imm << 16 | vn << 5 | vd);
     }
-    fn v_smull(&mut self, q: bool, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_smull(&mut self, q: bool, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x0E20_C000 | (q as u32) << 30 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_umull(&mut self, q: bool, size: u32, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_umull(&mut self, q: bool, size: u32, vd: u32, vn: u32, vm: u32) {
         self.emit(0x2E20_C000 | (q as u32) << 30 | (size & 3) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_rshrn15_h(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_rshrn15_h(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0F11_8C00 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn v_sxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_sxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0F08_A400 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn v_uxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_uxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x2F08_A400 | (q as u32) << 30 | vn << 5 | vd);
     }
     // --- scalar / packed FP ---
-    fn s_farith(&mut self, is_f64: bool, op: u8, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn s_farith(&mut self, is_f64: bool, op: u8, vd: u32, vn: u32, vm: u32) {
         let opc = match op {
             0 => 0x1E20_2800, // fadd
             1 => 0x1E20_3800, // fsub
@@ -162,13 +169,13 @@ impl Asm {
         };
         self.emit(opc | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn s_fsqrt(&mut self, is_f64: bool, vd: u32, vn: u32) {
+    pub(super) fn s_fsqrt(&mut self, is_f64: bool, vd: u32, vn: u32) {
         self.emit(0x1E21_C000 | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
-    fn s_fcsel(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32, cond: u32) {
+    pub(super) fn s_fcsel(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32, cond: u32) {
         self.emit(0x1E20_0C00 | (is_f64 as u32) << 22 | vm << 16 | cond << 12 | vn << 5 | vd);
     }
-    fn v_farith(&mut self, is_f64: bool, op: u8, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_farith(&mut self, is_f64: bool, op: u8, vd: u32, vn: u32, vm: u32) {
         let opc = match op {
             0 => 0x4E20_D400, // fadd
             1 => 0x4EA0_D400, // fsub
@@ -177,25 +184,25 @@ impl Asm {
         };
         self.emit(opc | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_fcmeq(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_fcmeq(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x4E20_E400 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_fcmge(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_fcmge(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x6E20_E400 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_fcmgt(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_fcmgt(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x6EA0_E400 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_faddp(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_faddp(&mut self, is_f64: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x6E20_D400 | (is_f64 as u32) << 22 | vm << 16 | vn << 5 | vd);
     }
-    fn v_fsqrt(&mut self, is_f64: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fsqrt(&mut self, is_f64: bool, vd: u32, vn: u32) {
         self.emit(0x6EA1_F800 | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
-    fn v_not(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_not(&mut self, vd: u32, vn: u32) {
         self.emit(0x6E20_5800 | vn << 5 | vd);
     }
-    fn s_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
+    pub(super) fn s_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
         let arm_rmode: u32 = match x86_rmode & 3 {
             0 => 0, // ties-even (frintn)
             1 => 2, // floor (frintm)
@@ -204,7 +211,7 @@ impl Asm {
         };
         self.emit(0x1E24_4000 | (is_f64 as u32) << 22 | arm_rmode << 15 | vn << 5 | vd);
     }
-    fn v_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
+    pub(super) fn v_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
         let opc: u32 = match x86_rmode & 3 {
             0 => 0x4E21_8800, // frintn
             1 => 0x4E21_9800, // frintm (floor)
@@ -213,25 +220,25 @@ impl Asm {
         };
         self.emit(opc | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
-    fn v_uabdl_b(&mut self, q: bool, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_uabdl_b(&mut self, q: bool, vd: u32, vn: u32, vm: u32) {
         self.emit(0x2E20_7000 | (q as u32) << 30 | vm << 16 | vn << 5 | vd);
     }
-    fn v_uaddlv_h(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_uaddlv_h(&mut self, vd: u32, vn: u32) {
         self.emit(0x6E70_3800 | vn << 5 | vd);
     }
-    fn v_pmull_1q(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_pmull_1q(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x0EE0_E000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_uminv_s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_uminv_s(&mut self, vd: u32, vn: u32) {
         self.emit(0x6EB1_A800 | vn << 5 | vd);
     }
-    fn v_scvtf_4s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_scvtf_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E21_D800 | vn << 5 | vd);
     }
-    fn v_frintn_4s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_frintn_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E21_8800 | vn << 5 | vd);
     }
-    fn v_fcvtzs_4s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtzs_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4EA1_B800 | vn << 5 | vd);
     }
 }
@@ -340,7 +347,7 @@ fn shuf_tbl_mask(sub: u8, imm: u8) -> (u64, u64) {
 
 impl Tr<'_> {
     /// Load `b` for a V-form op into `v1` (and `v7` for the upper 128-bit lane if `VM_V256`).
-    fn vload_b(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn vload_b(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let mem_form = matches!(op.kind, K_VSHUF_RM | K_VINT_RM | K_VFP_RM);
         let is_256 = (op.w & 3) == VM_V256;
@@ -416,7 +423,7 @@ impl Tr<'_> {
     }
 
     /// Store 128-bit result `v0` (and `v6` as low lane when `is_256`) according to `op.w & 3`.
-    fn vstore_dst(&mut self, op: &FastOp) {
+    pub(super) fn vstore_dst(&mut self, op: &FastOp) {
         use fast::*;
         match op.w & 3 {
             VM_LEG => self.xwrite(op.r0, 0),
@@ -432,7 +439,7 @@ impl Tr<'_> {
     }
 
     /// Emit one 128-bit lane of `K_VSHUF_*` on `(v0 = a, v1 = b) -> v0`.
-    fn emit_vshuf_lane(&mut self, sub: u8, imm8: u8) {
+    pub(super) fn emit_vshuf_lane(&mut self, sub: u8, imm8: u8) {
         use fast::*;
         let ic = imm8 as u32;
         match sub {
@@ -634,7 +641,7 @@ impl Tr<'_> {
     }
 
     /// Emit one 128-bit lane of `K_VINT_*` on `(v0 = a, v1 = b) -> v0`.
-    fn emit_vint_lane(&mut self, sub: u8, imm8: u8) {
+    pub(super) fn emit_vint_lane(&mut self, sub: u8, imm8: u8) {
         use fast::*;
         match sub {
             VI_PADDB => self.a.neon_3same(false, 0, 16, 0, 0, 1),
@@ -800,7 +807,7 @@ impl Tr<'_> {
     }
 
     /// Emit vector FP comparison predicate (`pred & 0x0F`, see `sse_cmp_pred`) on `(v0, v1) -> v2`.
-    fn emit_vcmp_pred(&mut self, is_f64: bool, pred: u8) {
+    pub(super) fn emit_vcmp_pred(&mut self, is_f64: bool, pred: u8) {
         let p = pred & 0x0F;
         match p & 7 {
             0 => {
@@ -895,7 +902,7 @@ impl Tr<'_> {
     /// Given `v0 = a`, `v1 = b`, and `v2 = arm64 result r`, replaces any NaN lane of `v2`
     /// with `a | qbit` if `a` is NaN (and `!unary_b`), else `b | qbit` if `b` is NaN,
     /// else `-qNaN` (`0xFFC0_0000` / `0xFFF8_0000_0000_0000`).
-    fn emit_x86_nan_fixup(&mut self, is_d: bool, unary_b: bool) {
+    pub(super) fn emit_x86_nan_fixup(&mut self, is_d: bool, unary_b: bool) {
         let sz = if is_d { 3u32 } else { 2u32 };
         let qbit = if is_d { 0x0008_0000_0000_0000u64 } else { 0x0040_0000u64 };
         let indef = if is_d { 0xFFF8_0000_0000_0000u64 } else { 0xFFC0_0000u64 };
@@ -920,7 +927,7 @@ impl Tr<'_> {
 
     /// Vector NaN check on `v2` (any NaN lane -> [`Self::emit_x86_nan_fixup`] inline;
     /// `v0 = a`, `v1 = b`). Uses only vector ops + `cbnz`, so NZCV is untouched.
-    fn emit_vnan_check_fix(&mut self, is_d: bool, unary_b: bool) {
+    pub(super) fn emit_vnan_check_fix(&mut self, is_d: bool, unary_b: bool) {
         if self.fast_nan {
             return;
         }
@@ -933,7 +940,7 @@ impl Tr<'_> {
     }
 
     /// Emit one 128-bit lane of `K_VFP_*` on `(v0 = a, v1 = b) -> v0`.
-    fn emit_vfp_lane(&mut self, sub: u8, imm8: u8) {
+    pub(super) fn emit_vfp_lane(&mut self, sub: u8, imm8: u8) {
         use fast::*;
         match sub {
             // minss / maxss / minsd / maxsd: fcmp + fcsel (caller already flushed NZCV).
@@ -1196,7 +1203,7 @@ impl Tr<'_> {
     }
 
     /// Translate any `K_VSHUF_*`, `K_VINT_*`, or `K_VFP_*` instruction natively to arm64 NEON.
-    fn vop(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn vop(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let sub = op.x & 0x3F;
         let imm8 = op.imm as u8;
@@ -1242,7 +1249,7 @@ impl Tr<'_> {
     }
 
     /// Translate extended integer/stack/flag fast ops (`K_BSWAP_R..=K_FLAG_OP`) to native arm64.
-    fn ext_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn ext_op(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let w = op.w;
         let wb = w as u32;
@@ -2133,7 +2140,7 @@ impl Tr<'_> {
         }
     }
 
-    fn mul1_div(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn mul1_div(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let w = op.w;
         let wb = w as u32;
@@ -2360,7 +2367,7 @@ impl Tr<'_> {
 impl Asm {
     /// Emit a variable shift (`VS_PSRLW..=VS_PSLLQ`) on `v0` by the 64-bit count in `v1.d[0]`
     /// without touching host NZCV.
-    fn flush_flags_and_shift_vec(&mut self, size: u32, ebits: u64, left: bool, arith: bool) {
+    pub(super) fn flush_flags_and_shift_vec(&mut self, size: u32, ebits: u64, left: bool, arith: bool) {
         self.fmov_fg(true, T0, 1); // T0 = count (u64)
         if arith {
             // Clamp unsigned count to `ebits - 1`: if `T0 >= ebits`, use `ebits - 1`.

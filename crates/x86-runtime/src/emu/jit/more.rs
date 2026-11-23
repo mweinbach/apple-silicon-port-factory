@@ -1,74 +1,80 @@
-// Included into `emu_jit_ext.rs`: native arm64/NEON code generation for `K_VAES_RR..=K_PCMPSTR`
-// (`115..=124`), completing 100% native arm64/NEON coverage across all `FastOp` kinds.
+//! Native arm64/NEON code generation for `K_VAES_RR..=K_VSHA_RM` (`115..=126`),
+//! completing 100% native arm64/NEON coverage across all `FastOp` kinds.
+
+use super::emit::{enc_logic_imm, sf, Asm};
+use super::translate::{stack_tso, Chk, Cond, FlagState, Src, Tr};
+use super::*;
+use crate::emu::fast::{self, FastOp};
+use crate::emu::mem;
 
 impl Asm {
-    fn tbz(&mut self, t: u32, bit: u32) -> usize {
+    pub(super) fn tbz(&mut self, t: u32, bit: u32) -> usize {
         self.emit(0x3600_0000 | (bit >> 5) << 31 | (bit & 31) << 19 | t);
         self.pos - 1
     }
-    fn v_aese(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_aese(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E28_4800 | vn << 5 | vd);
     }
-    fn v_aesd(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_aesd(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E28_5800 | vn << 5 | vd);
     }
-    fn v_aesmc(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_aesmc(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E28_6800 | vn << 5 | vd);
     }
-    fn v_aesimc(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_aesimc(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E28_7800 | vn << 5 | vd);
     }
-    fn v_rev64_4s(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_rev64_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4EA0_0800 | vn << 5 | vd);
     }
-    fn v_sha256h(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha256h(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_4000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha256h2(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha256h2(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_5000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha256su0(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_sha256su0(&mut self, vd: u32, vn: u32) {
         self.emit(0x5E28_2800 | vn << 5 | vd);
     }
-    fn v_sha256su1(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha256su1(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_6000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha1c(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha1c(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_0000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha1p(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha1p(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_1000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha1m(&mut self, vd: u32, vn: u32, vm: u32) {
+    pub(super) fn v_sha1m(&mut self, vd: u32, vn: u32, vm: u32) {
         self.emit(0x5E00_2000 | vm << 16 | vn << 5 | vd);
     }
-    fn v_sha1su1(&mut self, vd: u32, vn: u32) {
+    pub(super) fn v_sha1su1(&mut self, vd: u32, vn: u32) {
         self.emit(0x5E28_1800 | vn << 5 | vd);
     }
-    fn v_fcvtl_h(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtl_h(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0E21_7800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn v_fcvtn_h(&mut self, q: bool, vd: u32, vn: u32) {
+    pub(super) fn v_fcvtn_h(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0E21_6800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    fn ldaxr(&mut self, bits: u32, rt: u32, rn: u32) {
+    pub(super) fn ldaxr(&mut self, bits: u32, rt: u32, rn: u32) {
         let sz = (bits / 8).trailing_zeros();
         self.emit(0x085F_FC00 | sz << 30 | rn << 5 | rt);
     }
-    fn stlxr(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+    pub(super) fn stlxr(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
         let sz = (bits / 8).trailing_zeros();
         self.emit(0x0800_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
-    fn ldaxp_x(&mut self, rt: u32, rt2: u32, rn: u32) {
+    pub(super) fn ldaxp_x(&mut self, rt: u32, rt2: u32, rn: u32) {
         self.emit(0xC87F_8000 | rt2 << 10 | rn << 5 | rt);
     }
-    fn stlxp_x(&mut self, rs: u32, rt: u32, rt2: u32, rn: u32) {
+    pub(super) fn stlxp_x(&mut self, rs: u32, rt: u32, rt2: u32, rn: u32) {
         self.emit(0xC820_8000 | rs << 16 | rt2 << 10 | rn << 5 | rt);
     }
-    fn clrex(&mut self) {
+    pub(super) fn clrex(&mut self) {
         self.emit(0xD503_3F5F);
     }
-    fn ldr_reg(&mut self, bits: u32, signed: bool, rt: u32, rn: u32, rm: u32, shift: bool) {
+    pub(super) fn ldr_reg(&mut self, bits: u32, signed: bool, rt: u32, rn: u32, rm: u32, shift: bool) {
         let sz = (bits / 8).trailing_zeros();
         let opc = if signed { 0b10 } else { 0b01 };
         let s = (shift as u32) << 12;
@@ -78,7 +84,7 @@ impl Asm {
 
 impl Tr<'_> {
     /// Load an 8-bit source operand for `K_HI8` into `dst` (zero-extended to 64 bits).
-    fn rd_hi8_src(&mut self, k: usize, op: &FastOp, spec: u8, dst: u32) -> Option<u32> {
+    pub(super) fn rd_hi8_src(&mut self, k: usize, op: &FastOp, spec: u8, dst: u32) -> Option<u32> {
         if spec & 0x40 != 0 {
             let a = self.addr_into(op, XA);
             self.load(k, dst, a, 8, Self::chk_of(op));
@@ -98,7 +104,7 @@ impl Tr<'_> {
     }
 
     /// Write an 8/16/32/64-bit result for `K_HI8` according to `spec`.
-    fn wr_hi8_dst(&mut self, spec: u8, w: u8, val: u32, mem_addr: Option<u32>) {
+    pub(super) fn wr_hi8_dst(&mut self, spec: u8, w: u8, val: u32, mem_addr: Option<u32>) {
         if spec & 0x40 != 0 {
             self.store_checked_addr(val, mem_addr.unwrap(), 8);
         } else if spec & 0x80 != 0 {
@@ -110,7 +116,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_more_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_more_op(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let w = op.w;
         let wb = w as u32;
@@ -674,7 +680,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_hi8_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_hi8_op(&mut self, k: usize, op: &FastOp) {
         let sub = op.x & 0x3F;
         let la = self.live[k + 1];
         match sub {
@@ -980,7 +986,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_string_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_string_op(&mut self, k: usize, op: &FastOp) {
         let wb = op.w as u32;
         let step_bytes = wb / 8;
         let op_k = op.x & 7;
@@ -1100,7 +1106,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_bit_ext_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_bit_ext_op(&mut self, k: usize, op: &FastOp) {
         let wb = op.w as u32;
         let sub = op.x & 0x0F;
         let mem = (op.x & 0x20) != 0;
@@ -1226,7 +1232,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_atomic_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_atomic_op(&mut self, k: usize, op: &FastOp) {
         let sub = op.x & 0x3F;
         let wb = op.w as u32;
         let la = self.live[k + 1];
@@ -1582,7 +1588,7 @@ impl Tr<'_> {
         }
     }
 
-    fn emit_pcmpstr_op(&mut self, k: usize, op: &FastOp) {
+    pub(super) fn emit_pcmpstr_op(&mut self, k: usize, op: &FastOp) {
         let is_exp = (op.x & 1) != 0;
         let is_msk = (op.x & 2) != 0;
         let mem = (op.x & 0x20) != 0;

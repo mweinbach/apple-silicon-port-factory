@@ -348,8 +348,9 @@ fn dead_return_bits_are_ret_dead_not_equal() {
 #[test]
 fn parking_lot_bucket_table_is_found() {
     let k = leak_buf(8);
-    // WakeConditionVariable unparks through parking_lot_core (creates the table).
-    unsafe { win32_rt::sync::WakeConditionVariable(k as *mut core::ffi::c_void) };
+    // WakeByAddressSingle unparks through parking_lot_core (creates the table;
+    // WakeConditionVariable now fast-paths zero waiters without touching parking_lot_core).
+    unsafe { win32_rt::sync::WakeByAddressSingle(k as *mut core::ffi::c_void) };
     memmap::parking_lot_sym();
     let r = unsafe { memmap::parking_lot_buckets() };
     let (lo, hi) = r.expect("parking_lot_core HASHTABLE symbol / table");
