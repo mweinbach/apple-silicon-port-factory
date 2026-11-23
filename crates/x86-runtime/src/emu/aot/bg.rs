@@ -166,7 +166,7 @@ const EVICT_CAP: u64 = 4 << 30;
 /// `*.tmp<pid>` files, with size and mtime (loads bump a cache's mtime: [`touch`]).
 fn cache_files(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
     let mut v = Vec::new();
-    for d in [dir.to_path_buf(), dir.join("profile")] {
+    for d in [dir.to_path_buf(), dir.join("profile"), dir.join("callbacks")] {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let p = e.path();
@@ -401,7 +401,13 @@ unsafe fn bg_build(pool: &mut WorkerCaches, job: BgJob) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let prof = read_profile(&name, &key.image_hash);
+    let mut prof = read_profile(&name, &key.image_hash);
+    let replayed = super::callbacks::load_replayed_callback_roots(&name, base, size);
+    if !replayed.is_empty() {
+        prof.extend(replayed.into_iter().map(|c| c.rva));
+        prof.sort_unstable();
+        prof.dedup();
+    }
     let depth = aot_closure_depth();
     let bcp = pool.get_one();
     let (ips, _) = discover(bcp, base, size, &prof, depth);

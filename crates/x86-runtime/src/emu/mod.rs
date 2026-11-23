@@ -229,7 +229,23 @@ pub fn aot_profile_dump() {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub use aot::{aot_cached_preferred_base, aot_prewarm_all_mapped, AotPrewarmReport};
+pub use aot::{
+    aot_cached_preferred_base, aot_prewarm_all_mapped, discover_all_callback_roots,
+    flush_runtime_callbacks, image_fingerprint, record_runtime_callback, AotPrewarmReport,
+    CallbackKind, CallbackRoot, ImageFingerprint,
+};
+
+/// True if guest block `ip` is currently backed by a live AOT translation (dynamic or static).
+#[cfg(target_arch = "aarch64")]
+pub fn aot_has_block(ip: u64) -> bool {
+    aot::find(ip).is_some()
+}
+
+/// True if guest block `ip` is currently backed by a live AOT translation (always false on non-aarch64).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn aot_has_block(_ip: u64) -> bool {
+    false
+}
 
 /// Look up the compiled `image_base` of a matching dynamic `.aot` cache (no-op on non-aarch64 hosts).
 #[cfg(not(target_arch = "aarch64"))]

@@ -1300,6 +1300,10 @@ pub(super) struct Mapped {
     /// Image hash at activation (`AW2_JIT_PROFILE`): names the profile file, so it matches
     /// the build-time key even if the code is patched later.
     pub(super) phash: Option<[u64; 2]>,
+    /// Relocation-invariant image fingerprint for runtime callback RVA replay.
+    pub(super) fingerprint: Option<super::callbacks::ImageFingerprint>,
+    /// Cached executable section ranges `[start, end)` for O(1) code-vs-data checks.
+    pub(super) exec: Vec<(usize, usize)>,
 }
 
 pub(super) static MAPPED: Mutex<Vec<Mapped>> = Mutex::new(Vec::new());
@@ -1307,13 +1311,28 @@ pub(super) static MAPPED: Mutex<Vec<Mapped>> = Mutex::new(Vec::new());
 /// A PE image was mapped, relocated and import-bound (loader).
 pub fn module_mapped(name: &str, base: usize, size: usize) {
     let _ = bind_static_aot_module(name, base, size);
+    let norm = name.to_ascii_lowercase();
+    let fingerprint = unsafe { super::callbacks::image_fingerprint(base, size) };
+    let exec = unsafe { super::format::exec_sections(base, size) };
     if let Ok(mut v) = MAPPED.lock() {
+        if let Some(existing) = v
+            .iter_mut()
+            .find(|m| m.name == norm && m.base == base && m.size == size)
+        {
+            existing.active = false;
+            existing.phash = None;
+            existing.fingerprint = fingerprint;
+            existing.exec = exec;
+            return;
+        }
         v.push(Mapped {
-            name: name.to_ascii_lowercase(),
+            name: norm,
             base,
             size,
             active: false,
             phash: None,
+            fingerprint,
+            exec,
         });
     }
 }

@@ -170,6 +170,8 @@ pub(crate) unsafe fn land(r: *mut EhLink, ctx: &Context) -> ! {
             b.copy_from_slice(&ctx.flt_save[FLT_XMM0 + 16 * i..FLT_XMM0 + 16 * (i + 1)]);
             *x = u128::from_le_bytes(b);
         }
+        #[cfg(target_arch = "aarch64")]
+        super::aot::record_runtime_callback(ctx.rip, super::aot::CallbackKind::EhContinuation);
         (*(*e).landing.get()).write(Landing { gpr: ctx.gpr, xmm, rip: ctx.rip, eflags: ctx.eflags });
         anchor::jump((*(*e).anchor.get()).as_ptr(), 1)
     }

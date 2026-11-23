@@ -224,6 +224,14 @@ pub fn set_host_text_range(start: usize, end: usize) {
     bump_va_gen();
 }
 
+/// True if `addr` lies inside the recorded host Mach-O `__TEXT,__text` range.
+#[inline]
+pub fn in_host_text(addr: usize) -> bool {
+    let s = HOST_TEXT_START.load(Ordering::Acquire);
+    let e = HOST_TEXT_END.load(Ordering::Acquire);
+    s < e && addr >= s && addr < e
+}
+
 /// Register a native host function pointer `ptr` for preferred-base `va`.
 pub fn register_native_va(va: u64, ptr: usize) {
     if va_table_insert(va_table(), va, ptr) {

@@ -11,6 +11,7 @@
 
 mod bg;
 mod builder;
+pub mod callbacks;
 mod cfg_discover;
 mod format;
 mod jumptable;
@@ -28,6 +29,10 @@ pub use builder::{aot_prewarm_all_mapped, AotPrewarmReport};
 pub(super) use builder::VerifyAotBatch;
 #[cfg(test)]
 pub(super) use builder::{build_image_for_test, build_image_for_test_with_limits};
+pub use callbacks::{
+    discover_all_callback_roots, flush_runtime_callbacks, image_fingerprint,
+    record_runtime_callback, CallbackKind, CallbackRoot, ImageFingerprint,
+};
 pub(super) use cfg_discover::discover_blocks_for_verify;
 pub use format::aot_cached_preferred_base;
 #[cfg_attr(not(test), allow(unused_imports))]

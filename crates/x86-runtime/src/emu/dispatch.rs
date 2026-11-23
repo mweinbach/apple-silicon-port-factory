@@ -263,6 +263,8 @@ unsafe fn call_va8_bridge(
             return r_gpr;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    super::aot::record_runtime_callback(clean_va, super::aot::CallbackKind::GenericCallback);
     set_incoming_rsp(out_rsp, out_limit);
     let (r_gpr, r_xmm) = emu_run_full_rax(to_mapped_addr(clean_va) as u64, gpr, xmm, s_extra, prev_rax);
     crate::simd_ops::replace_rax_in(prev_rax);
