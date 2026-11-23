@@ -459,6 +459,11 @@ pub fn plain_builtin_fns() -> &'static [usize] {
             sync::DeleteCriticalSection as *const () as usize,
             sync::WakeConditionVariable as *const () as usize,
             sync::WakeAllConditionVariable as *const () as usize,
+            sync::SleepConditionVariableCS as *const () as usize,
+            sync::SleepConditionVariableSRW as *const () as usize,
+            sync::WaitOnAddress as *const () as usize,
+            sync::WakeByAddressSingle as *const () as usize,
+            sync::WakeByAddressAll as *const () as usize,
             ntdll::RtlZeroMemory as *const () as usize,
             ntdll::RtlFillMemory as *const () as usize,
             ntdll::RtlMoveMemory as *const () as usize,
@@ -969,6 +974,11 @@ mod tests {
             ("msvcrt.dll", "memset"),
             ("msvcrt.dll", "memcmp"),
             ("msvcrt.dll", "memchr"),
+            ("kernel32.dll", "WaitOnAddress"),
+            ("kernel32.dll", "WakeByAddressSingle"),
+            ("kernel32.dll", "WakeByAddressAll"),
+            ("kernel32.dll", "SleepConditionVariableCS"),
+            ("kernel32.dll", "SleepConditionVariableSRW"),
         ] {
             let p = lookup(dll, sym).unwrap_or_else(|| panic!("missing {dll}!{sym}")) as usize;
             assert!(plain.contains(&p), "{dll}!{sym} missing from plain_builtin_fns");

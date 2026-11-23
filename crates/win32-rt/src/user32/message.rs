@@ -136,11 +136,13 @@ fn now_ms() -> u64 {
 /// The calling Win32 thread's queue, created on first use (as Windows
 /// creates it on the first user32 call that needs one).
 pub fn current_queue() -> Arc<Queue> {
+    let tid = crate::teb::thread_id();
     CURRENT.with(|c| {
         if let Some(q) = &*c.borrow() {
-            return q.clone();
+            if q.tid == tid {
+                return q.clone();
+            }
         }
-        let tid = crate::teb::thread_id();
         let q = queues()
             .lock()
             .unwrap()
@@ -181,7 +183,7 @@ impl Queue {
         let bits = f(st);
         st.wake |= bits;
         drop(g);
-        handles::notify_waiters();
+        handles::notify_object_key(self as *const Queue as usize, usize::MAX);
     }
 
     pub fn post(&self, m: MSG) {
@@ -293,6 +295,9 @@ impl Waitable for QueueWaiter {
     fn acquire(&self, _g: &WaitGuard, _tid: u32) -> bool {
         false
     }
+    fn wait_key(&self) -> usize {
+        Arc::as_ptr(&self.q) as usize
+    }
 }
 
 fn status_bits(st: &QState) -> u32 {
@@ -354,7 +359,7 @@ fn run_sent(s: Sent) {
                 let g = handles::wait_lock();
                 *rep.result.get(&g) = Some(r);
                 drop(g);
-                handles::notify_waiters();
+                handles::notify_object_key(&*rep as *const Reply as usize, usize::MAX);
             }
         }
     }
@@ -954,7 +959,7 @@ pub unsafe extern "win64" fn MsgWaitForMultipleObjectsEx(n: u32, hs: *const HAND
         set_error(e::INVALID_PARAMETER);
         return WAIT_FAILED;
     }
-    let mut objs: Vec<Arc<dyn KObject>> = Vec::with_capacity(n as usize + 1);
+    let mut objs = handles::WaitableList::with_capacity(n as usize + 1);
     for &h in std::slice::from_raw_parts(hs, n as usize) {
         match handles::get(h) {
             Some(o) if o.waitable().is_some() => objs.push(o),
@@ -965,12 +970,16 @@ pub unsafe extern "win64" fn MsgWaitForMultipleObjectsEx(n: u32, hs: *const HAND
         }
     }
     let q = current_queue();
-    if flags & MWMO_WAITALL != 0 {
-        // Wait-all with the queue: wait for the handles, then for input.
-        stub!("MsgWaitForMultipleObjectsEx(MWMO_WAITALL): handles first, then queue");
+    let wait_all = flags & MWMO_WAITALL != 0;
+    let any_available = flags & MWMO_INPUTAVAILABLE != 0;
+    if wait_all {
+        if mask != 0 || n == 0 {
+            objs.push(Arc::new(QueueWaiter { q, mask, any_available }));
+        }
+    } else {
+        objs.push(Arc::new(QueueWaiter { q, mask: mask | QS_SENDMESSAGE, any_available }));
     }
-    objs.push(Arc::new(QueueWaiter { q, mask: mask | QS_SENDMESSAGE, any_available: flags & MWMO_INPUTAVAILABLE != 0 }));
-    match handles::wait_for(&objs, false, ms, flags & MWMO_ALERTABLE != 0) {
+    match handles::wait_for(objs.as_slice(), wait_all, ms, flags & MWMO_ALERTABLE != 0) {
         WaitResult::Object(i) => WAIT_OBJECT_0 + i as u32,
         WaitResult::Abandoned(i) => WAIT_ABANDONED_0 + i as u32,
         WaitResult::Timeout => WAIT_TIMEOUT,
@@ -1037,6 +1046,38 @@ mod tests {
             assert_eq!(m.message, wm::TIMER);
             assert_eq!(m.wparam, id);
             assert_eq!(KillTimer(std::ptr::null_mut(), id), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn msg_wait_all_requires_both_handle_and_message() {
+        std::thread::spawn(|| unsafe {
+            let mut m = MSG::default();
+            PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            let tid = crate::teb::thread_id();
+            let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            // 1. Only the event is signaled -> MWMO_WAITALL must time out.
+            assert_eq!(crate::kernel32::threads::SetEvent(ev), TRUE);
+            let r1 = MsgWaitForMultipleObjectsEx(1, &ev, 20, QS_POSTMESSAGE, MWMO_WAITALL | MWMO_INPUTAVAILABLE);
+            assert_eq!(r1, WAIT_TIMEOUT);
+
+            // 2. Only a message is queued (event reset) -> MWMO_WAITALL must time out.
+            assert_eq!(crate::kernel32::threads::ResetEvent(ev), TRUE);
+            assert_eq!(PostThreadMessageW(tid, wm::USER + 10, 1, 2), TRUE);
+            let r2 = MsgWaitForMultipleObjectsEx(1, &ev, 20, QS_POSTMESSAGE, MWMO_WAITALL | MWMO_INPUTAVAILABLE);
+            assert_eq!(r2, WAIT_TIMEOUT);
+
+            // 3. Both event and message satisfied -> MWMO_WAITALL succeeds.
+            assert_eq!(crate::kernel32::threads::SetEvent(ev), TRUE);
+            let r3 = MsgWaitForMultipleObjectsEx(1, &ev, 1_000, QS_POSTMESSAGE, MWMO_WAITALL | MWMO_INPUTAVAILABLE);
+            assert_eq!(r3, WAIT_OBJECT_0);
+
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+            crate::teb::uninstall();
         })
         .join()
         .unwrap();

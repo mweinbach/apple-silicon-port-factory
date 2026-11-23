@@ -16,11 +16,13 @@
 //! the scheduler thread in `__psynch_cvbroad`. [`notify_waiters`] still wakes
 //! everyone for state owned by other modules (threads, APCs, message queues).
 
+use crate::park::{Parker, WordLock};
 use crate::types::*;
 use std::any::Any;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use crate::park::Parker;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,7 +35,8 @@ pub trait KObject: Any + Send + Sync {
     }
 }
 
-/// State is only accessed while holding [`WAIT_LOCK`] (passed as `&WaitGuard`).
+/// State is only accessed while holding [`WAIT_LOCK`] (passed as `&WaitGuard`),
+/// except lock-free objects (`Event`, `Semaphore`) which synchronize via atomics.
 pub trait Waitable {
     /// Would a wait by thread `tid` be satisfied right now?
     fn is_signaled(&self, g: &WaitGuard, tid: u32) -> bool;
@@ -42,12 +45,83 @@ pub trait Waitable {
     fn acquire(&self, g: &WaitGuard, tid: u32) -> bool;
     /// Consume the signal if the object is signaled: `Some(abandoned)`, or
     /// `None`. Objects whose state can also change without `WAIT_LOCK`
-    /// (semaphore units) check and consume atomically.
+    /// (semaphore units, events) check and consume atomically.
     fn try_acquire(&self, g: &WaitGuard, tid: u32) -> Option<bool> {
         if self.is_signaled(g, tid) {
             Some(self.acquire(g, tid))
         } else {
             None
+        }
+    }
+    /// Wake identity key for targeted notifications. Defaults to the object's
+    /// concrete address; wrapper waitables (e.g. `user32::message::QueueWaiter`)
+    /// override this to return the underlying target's address.
+    fn wait_key(&self) -> usize {
+        obj_key(self)
+    }
+}
+
+/// Small-buffer container for resolved waitable objects: stores up to 8 handles
+/// inline on the stack (avoiding a heap `Vec` allocation on every
+/// `WaitForMultipleObjects` / `MsgWaitForMultipleObjectsEx` call).
+pub enum WaitableList {
+    Inline {
+        buf: [MaybeUninit<Arc<dyn KObject>>; 8],
+        len: usize,
+    },
+    Heap(Vec<Arc<dyn KObject>>),
+}
+
+impl WaitableList {
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        if cap <= 8 {
+            WaitableList::Inline {
+                buf: [const { MaybeUninit::uninit() }; 8],
+                len: 0,
+            }
+        } else {
+            WaitableList::Heap(Vec::with_capacity(cap))
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, obj: Arc<dyn KObject>) {
+        match self {
+            WaitableList::Inline { buf, len } if *len < 8 => {
+                buf[*len].write(obj);
+                *len += 1;
+            }
+            WaitableList::Inline { buf, len } => {
+                let mut v = Vec::with_capacity(*len + 1);
+                for slot in &mut buf[..*len] {
+                    v.push(unsafe { slot.assume_init_read() });
+                }
+                *len = 0;
+                v.push(obj);
+                *self = WaitableList::Heap(v);
+            }
+            WaitableList::Heap(v) => v.push(obj),
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Arc<dyn KObject>] {
+        match self {
+            WaitableList::Inline { buf, len } => unsafe {
+                std::slice::from_raw_parts(buf.as_ptr() as *const Arc<dyn KObject>, *len)
+            },
+            WaitableList::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Drop for WaitableList {
+    fn drop(&mut self) {
+        if let WaitableList::Inline { buf, len } = self {
+            for slot in &mut buf[..*len] {
+                unsafe { slot.assume_init_drop() };
+            }
         }
     }
 }
@@ -70,7 +144,7 @@ impl Drop for WaitGuard<'_> {
     }
 }
 
-static WAIT_LOCK: crate::park::WordLock = crate::park::WordLock::new();
+static WAIT_LOCK: WordLock = WordLock::new();
 
 #[inline]
 pub fn wait_lock() -> WaitGuard<'static> {
@@ -78,143 +152,218 @@ pub fn wait_lock() -> WaitGuard<'static> {
     WaitGuard { _l: std::marker::PhantomData, _not_send: std::marker::PhantomData }
 }
 
-/// One per OS thread (pooled, never freed). `park` is armed with
-/// `WAIT_LOCK` held and slept on after releasing it. Everything else is
-/// read lock-free by notifiers: the wait
-/// fields are written under `WAIT_LOCK` before the owner sleeps, and a
-/// notifier only acts on a state change it made under `WAIT_LOCK` afterwards,
-/// so the mutex orders the two.
+/// Per-thread wait state (one `Arc<Waiter>` per OS thread, freed when the thread exits).
 struct Waiter {
     park: Parker,
-    /// The slot belongs to a live thread.
-    owned: AtomicBool,
-    /// Registered for a wait (between [`Registration::new`] and its drop).
+    /// Registered for an active wait.
     active: AtomicBool,
-    /// Match every object (alertable sleep, or more than `MAX_KEYS` objects).
-    any: AtomicBool,
     /// Single object, not wait-all: one budgeted wake satisfies it.
     single: AtomicBool,
-    nkeys: AtomicUsize,
-    /// Object identities (`Arc` data pointers).
-    keys: [AtomicUsize; MAX_KEYS],
-    /// A wake has been sent and not yet observed (cleared, under
-    /// `WAIT_LOCK`, right before the owner sleeps again). Budgeted wakes skip
-    /// waiters with a pending wake so they reach a different thread.
+    /// A wake has been sent and not yet observed (cleared right before re-checking
+    /// and sleeping). Budgeted wakes skip waiters with a pending wake so they reach
+    /// a different thread.
     notified: AtomicBool,
 }
 
-const MAX_KEYS: usize = 8;
-const MAX_WAITERS: usize = 1024;
-
 impl Waiter {
+    fn new() -> Self {
+        Waiter {
+            park: Parker::new(),
+            active: AtomicBool::new(false),
+            single: AtomicBool::new(false),
+            notified: AtomicBool::new(false),
+        }
+    }
+}
+
+const MAX_KEYS: usize = 8;
+const WAIT_BUCKETS: usize = 64;
+
+struct WaitBucket {
+    lock: WordLock,
+    /// Fast lock-free count of entries currently in this bucket.
+    count: AtomicUsize,
+    entries: UnsafeCell<Vec<(usize, Arc<Waiter>)>>,
+}
+
+unsafe impl Sync for WaitBucket {}
+
+impl WaitBucket {
+    const fn new() -> Self {
+        WaitBucket {
+            lock: WordLock::new(),
+            count: AtomicUsize::new(0),
+            entries: UnsafeCell::new(Vec::new()),
+        }
+    }
+
     #[inline]
-    fn matches(&self, key: usize) -> bool {
-        if self.any.load(Ordering::Relaxed) {
-            return true;
+    fn insert(&self, key: usize, w: Arc<Waiter>) {
+        self.lock.lock();
+        unsafe { (*self.entries.get()).push((key, w)) };
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.lock.unlock();
+    }
+
+    #[inline]
+    fn remove(&self, key: usize, w: &Arc<Waiter>) {
+        self.lock.lock();
+        let entries = unsafe { &mut *self.entries.get() };
+        if let Some(pos) = entries.iter().position(|(k, e)| *k == key && Arc::ptr_eq(e, w)) {
+            entries.swap_remove(pos);
+            self.count.fetch_sub(1, Ordering::SeqCst);
         }
-        let n = self.nkeys.load(Ordering::Relaxed).min(MAX_KEYS);
-        self.keys[..n].iter().any(|k| k.load(Ordering::Relaxed) == key)
+        self.lock.unlock();
     }
 }
 
-/// Append-only pool of per-thread waiters: notifiers scan it without taking
-/// any lock, so no syscall ever runs under a lock that waiters also need.
-static SLOTS: [AtomicPtr<Waiter>; MAX_WAITERS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_WAITERS];
-static NSLOTS: AtomicUsize = AtomicUsize::new(0);
+static BUCKETS: [WaitBucket; WAIT_BUCKETS] = [const { WaitBucket::new() }; WAIT_BUCKETS];
+/// Overflow bucket for waits on > `MAX_KEYS` (8) objects at once.
+static ANY_WAITERS: WaitBucket = WaitBucket::new();
+/// Alertable waiters keyed by Windows `tid` (used by `notify_thread_apc`).
+static ALERTABLE_WAITERS: WaitBucket = WaitBucket::new();
 
-fn acquire_waiter() -> &'static Waiter {
-    let n = NSLOTS.load(Ordering::Acquire).min(MAX_WAITERS);
-    for s in &SLOTS[..n] {
-        let p = s.load(Ordering::Acquire);
-        if !p.is_null() {
-            let w = unsafe { &*p };
-            if w.owned.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                return w;
-            }
-        }
-    }
-    let w: &'static Waiter = Box::leak(Box::new(Waiter {
-        park: Parker::new(),
-        owned: AtomicBool::new(true),
-        active: AtomicBool::new(false),
-        any: AtomicBool::new(false),
-        single: AtomicBool::new(false),
-        nkeys: AtomicUsize::new(0),
-        keys: [const { AtomicUsize::new(0) }; MAX_KEYS],
-        notified: AtomicBool::new(false),
-    }));
-    let i = NSLOTS.fetch_add(1, Ordering::AcqRel);
-    assert!(i < MAX_WAITERS, "handles: more than {MAX_WAITERS} concurrent waiting threads");
-    SLOTS[i].store(w as *const Waiter as *mut Waiter, Ordering::Release);
-    w
-}
-
-struct WaiterHolder(&'static Waiter);
-impl Drop for WaiterHolder {
-    fn drop(&mut self) {
-        self.0.active.store(false, Ordering::Release);
-        self.0.owned.store(false, Ordering::Release);
-    }
+#[inline]
+fn bucket_of(key: usize) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) & (WAIT_BUCKETS - 1)
 }
 
 thread_local! {
-    static WAITER: WaiterHolder = WaiterHolder(acquire_waiter());
+    static WAITER: Arc<Waiter> = Arc::new(Waiter::new());
 }
 
-#[inline]
-fn for_each_waiter(mut f: impl FnMut(&'static Waiter) -> bool) {
-    let n = NSLOTS.load(Ordering::Acquire).min(MAX_WAITERS);
-    for s in &SLOTS[..n] {
-        let p = s.load(Ordering::Acquire);
-        if p.is_null() {
-            continue;
+/// Small stack buffer for collecting waiters to unpark outside any bucket lock.
+struct WakeBatch {
+    inline: [Option<Arc<Waiter>>; 16],
+    len: usize,
+    extra: Vec<Arc<Waiter>>,
+}
+
+impl WakeBatch {
+    #[inline]
+    fn new() -> Self {
+        WakeBatch {
+            inline: [const { None }; 16],
+            len: 0,
+            extra: Vec::new(),
         }
-        let w = unsafe { &*p };
-        if w.active.load(Ordering::Acquire) && !f(w) {
-            break;
+    }
+
+    #[inline]
+    fn push(&mut self, w: Arc<Waiter>) {
+        if self.len < 16 {
+            self.inline[self.len] = Some(w);
+            self.len += 1;
+        } else {
+            self.extra.push(w);
+        }
+    }
+
+    #[inline]
+    fn unpark_all(mut self) {
+        for slot in &mut self.inline[..self.len] {
+            if let Some(w) = slot.take() {
+                w.park.unpark();
+            }
+        }
+        for w in self.extra {
+            w.park.unpark();
         }
     }
 }
 
 #[inline]
-fn wake(w: &Waiter) {
-    w.notified.store(true, Ordering::Release);
-    w.park.unpark();
-}
-
-/// Call after changing any waitable state (while or after holding the lock).
-/// Wakes every blocked thread; objects in this file use [`notify_object`].
-pub fn notify_waiters() {
-    for_each_waiter(|w| {
-        wake(w);
-        true
-    });
-}
-
-/// Wake waiters of the object at `key` (see [`obj_key`]). Single-object
-/// waiters are woken at most `budget` at a time (those with a wake already
-/// pending don't count); multi-object / wait-all waiters are always woken
-/// since they re-check the combined condition.
-fn notify_object(key: usize, mut budget: usize) {
-    for_each_waiter(|w| {
-        if !w.matches(key) {
-            return true;
-        }
-        if w.single.load(Ordering::Relaxed) {
-            if budget == 0 || w.notified.swap(true, Ordering::AcqRel) {
-                return true;
+fn collect_matching(bucket: &WaitBucket, match_key: Option<usize>, budget: &mut usize, batch: &mut WakeBatch) {
+    if bucket.count.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    bucket.lock.lock();
+    let entries = unsafe { &*bucket.entries.get() };
+    for (k, w) in entries.iter() {
+        if let Some(target) = match_key {
+            if *k != target {
+                continue;
             }
-            budget -= 1;
-            w.park.unpark();
-        } else {
-            wake(w);
         }
-        true
-    });
+        if !w.active.load(Ordering::Acquire) {
+            continue;
+        }
+        if match_key.is_some() && w.single.load(Ordering::Relaxed) {
+            if *budget == 0 || w.notified.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            *budget -= 1;
+            batch.push(Arc::clone(w));
+        } else {
+            w.notified.store(true, Ordering::Release);
+            batch.push(Arc::clone(w));
+        }
+    }
+    bucket.lock.unlock();
+}
+
+/// Wake every blocked thread across all wait buckets (fallback for external
+/// waitables that do not use targeted [`notify_object_key`] / [`notify_thread_apc`]).
+pub fn notify_waiters() {
+    let mut batch = WakeBatch::new();
+    let mut unlimited = usize::MAX;
+    collect_matching(&ANY_WAITERS, None, &mut unlimited, &mut batch);
+    collect_matching(&ALERTABLE_WAITERS, None, &mut unlimited, &mut batch);
+    for b in &BUCKETS {
+        collect_matching(b, None, &mut unlimited, &mut batch);
+    }
+    batch.unpark_all();
+}
+
+/// Wake waiters registered on the specific waitable object identified by `key`
+/// (`Waitable::wait_key`). Single-object waiters are woken at most `budget` at a
+/// time (skipping any with a pending wake); multi-object / wait-all waiters are
+/// always woken so they re-check their combined condition.
+pub fn notify_object_key(key: usize, mut budget: usize) {
+    // StoreLoad barrier pairing with `Registration::arm()`'s SeqCst fence so
+    // any preceding state store (Event/Semaphore/Queue/Mutex/Thread) is strictly
+    // ordered against our bucket count / waiter visibility checks.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let b = &BUCKETS[bucket_of(key)];
+    let has_b = b.count.load(Ordering::Acquire) != 0;
+    let has_any = ANY_WAITERS.count.load(Ordering::Acquire) != 0;
+    if !has_b && !has_any {
+        return;
+    }
+    let mut batch = WakeBatch::new();
+    if has_b {
+        collect_matching(b, Some(key), &mut budget, &mut batch);
+    }
+    if has_any {
+        let mut unlimited = usize::MAX;
+        collect_matching(&ANY_WAITERS, None, &mut unlimited, &mut batch);
+    }
+    batch.unpark_all();
+}
+
+/// Wake ONLY the specific thread `tid` if it is currently blocked in an
+/// alertable wait or alertable sleep (used by `thread::queue_apc`).
+pub fn notify_thread_apc(tid: u32) {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if ALERTABLE_WAITERS.count.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut batch = WakeBatch::new();
+    let target = tid as usize;
+    ALERTABLE_WAITERS.lock.lock();
+    let entries = unsafe { &*ALERTABLE_WAITERS.entries.get() };
+    for (k, w) in entries.iter() {
+        if *k == target && w.active.load(Ordering::Acquire) {
+            w.notified.store(true, Ordering::Release);
+            batch.push(Arc::clone(w));
+        }
+    }
+    ALERTABLE_WAITERS.lock.unlock();
+    batch.unpark_all();
 }
 
 #[inline]
-fn obj_key<T: ?Sized>(p: *const T) -> usize {
+pub fn obj_key<T: ?Sized>(p: *const T) -> usize {
     p as *const () as usize
 }
 
@@ -234,85 +383,135 @@ fn sem_cascade() -> bool {
 /// always woken; among single-object waiters, one is woken unless one already
 /// has a wake pending (it will pass the wake on once it takes its unit).
 fn notify_semaphore(key: usize) {
-    let mut pending = false;
-    let mut cand: Option<&'static Waiter> = None;
-    for_each_waiter(|w| {
-        if !w.matches(key) {
-            return true;
-        }
-        if w.single.load(Ordering::Relaxed) {
-            if w.notified.load(Ordering::Acquire) {
-                pending = true;
-            } else if cand.is_none() {
-                cand = Some(w);
-            }
-        } else {
-            wake(w);
-        }
-        true
-    });
-    if !pending {
-        if let Some(w) = cand {
-            if !w.notified.swap(true, Ordering::AcqRel) {
-                w.park.unpark();
-            }
-        }
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let b = &BUCKETS[bucket_of(key)];
+    let has_b = b.count.load(Ordering::Acquire) != 0;
+    let has_any = ANY_WAITERS.count.load(Ordering::Acquire) != 0;
+    if !has_b && !has_any {
+        return;
     }
+    let mut batch = WakeBatch::new();
+    if has_b {
+        let mut pending = false;
+        let mut cand: Option<Arc<Waiter>> = None;
+        b.lock.lock();
+        let entries = unsafe { &*b.entries.get() };
+        for (k, w) in entries.iter() {
+            if *k != key || !w.active.load(Ordering::Acquire) {
+                continue;
+            }
+            if w.single.load(Ordering::Relaxed) {
+                if w.notified.load(Ordering::Acquire) {
+                    pending = true;
+                } else if cand.is_none() {
+                    cand = Some(Arc::clone(w));
+                }
+            } else {
+                w.notified.store(true, Ordering::Release);
+                batch.push(Arc::clone(w));
+            }
+        }
+        if !pending {
+            if let Some(w) = cand {
+                if !w.notified.swap(true, Ordering::AcqRel) {
+                    batch.push(w);
+                }
+            }
+        }
+        b.lock.unlock();
+    }
+    if has_any {
+        let mut unlimited = usize::MAX;
+        collect_matching(&ANY_WAITERS, None, &mut unlimited, &mut batch);
+    }
+    batch.unpark_all();
 }
 
-/// Registration of the current thread for the duration of one wait. Created
-/// and dropped with `WAIT_LOCK` held.
+/// Registration of the current thread for the duration of one wait.
 struct Registration {
-    waiter: &'static Waiter,
-    /// Pool slot borrowed without TLS (wait during thread teardown).
-    temp: bool,
-    /// The object, when this is a single-object wait (`single`).
-    key: usize,
+    waiter: Arc<Waiter>,
+    keys: [usize; MAX_KEYS],
+    nkeys: usize,
+    in_any: bool,
+    alertable_tid: Option<u32>,
     single: bool,
     /// The wait consumed a signal; otherwise a pending targeted wake must be
-    /// passed on when we leave.
+    /// passed on to one other waiter when we leave.
     consumed: bool,
 }
 
 impl Registration {
-    fn new(objs: &[Arc<dyn KObject>], wait_all: bool) -> Self {
-        let (waiter, temp) = match WAITER.try_with(|h| h.0) {
-            Ok(w) => (w, false),
-            Err(_) => (acquire_waiter(), true),
-        };
-        let any = objs.is_empty() || objs.len() > MAX_KEYS;
-        let nkeys = if any { 0 } else { objs.len() };
-        for (k, o) in waiter.keys.iter().zip(objs.iter()).take(nkeys) {
-            k.store(obj_key(Arc::as_ptr(o)), Ordering::Relaxed);
-        }
-        let single = nkeys == 1 && !wait_all;
-        waiter.nkeys.store(nkeys, Ordering::Relaxed);
-        waiter.any.store(any, Ordering::Relaxed);
+    fn new(objs: &[Arc<dyn KObject>], wait_all: bool, alertable: bool, tid: u32) -> Self {
+        let waiter = WAITER.try_with(Arc::clone).unwrap_or_else(|_| Arc::new(Waiter::new()));
+        let single = objs.len() == 1 && !wait_all;
         waiter.single.store(single, Ordering::Relaxed);
         waiter.notified.store(false, Ordering::Relaxed);
         waiter.active.store(true, Ordering::Release);
-        let key = if nkeys > 0 { obj_key(Arc::as_ptr(&objs[0])) } else { 0 };
-        Registration { waiter, temp, key, single, consumed: false }
+
+        let mut keys = [0usize; MAX_KEYS];
+        let mut nkeys = 0usize;
+        let mut in_any = false;
+
+        if objs.len() > MAX_KEYS {
+            in_any = true;
+            ANY_WAITERS.insert(0, Arc::clone(&waiter));
+        } else {
+            for o in objs {
+                let k = o.waitable().unwrap().wait_key();
+                if !keys[..nkeys].contains(&k) {
+                    keys[nkeys] = k;
+                    nkeys += 1;
+                    BUCKETS[bucket_of(k)].insert(k, Arc::clone(&waiter));
+                }
+            }
+        }
+
+        let alertable_tid = if alertable {
+            ALERTABLE_WAITERS.insert(tid as usize, Arc::clone(&waiter));
+            Some(tid)
+        } else {
+            None
+        };
+
+        Registration {
+            waiter,
+            keys,
+            nkeys,
+            in_any,
+            alertable_tid,
+            single,
+            consumed: false,
+        }
     }
 
-    /// Before sleeping (with `WAIT_LOCK` held, after the state re-check).
+    /// Arm before checking condition / sleeping. Includes a SeqCst fence so
+    /// lock-free notifiers (`Event::set`, `Semaphore::release`, `queue_apc`)
+    /// are strictly ordered against our subsequent state check.
+    #[inline]
     fn arm(&self) {
         self.waiter.notified.store(false, Ordering::Release);
         self.waiter.park.arm();
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         self.waiter.active.store(false, Ordering::Release);
-        // A budgeted wake aimed at us (e.g. one semaphore unit) that we are
-        // not going to use (timeout, APC) must reach another waiter. Only
-        // single-object waiters receive budgeted wakes.
-        if self.single && !self.consumed && self.waiter.notified.load(Ordering::Acquire) {
-            notify_object(self.key, usize::MAX);
+        if self.in_any {
+            ANY_WAITERS.remove(0, &self.waiter);
+        } else {
+            for &k in &self.keys[..self.nkeys] {
+                BUCKETS[bucket_of(k)].remove(k, &self.waiter);
+            }
         }
-        if self.temp {
-            self.waiter.owned.store(false, Ordering::Release);
+        if let Some(tid) = self.alertable_tid {
+            ALERTABLE_WAITERS.remove(tid as usize, &self.waiter);
+        }
+        // A budgeted wake aimed at us (e.g. one semaphore unit or auto-reset event)
+        // that we are not going to use (timeout, APC) must reach one other waiter.
+        if self.single && !self.consumed && self.waiter.notified.load(Ordering::Acquire) {
+            notify_object_key(self.keys[0], 1);
         }
     }
 }
@@ -356,12 +555,18 @@ pub fn insert(obj: Arc<dyn KObject>) -> HANDLE {
 pub const CURRENT_PROCESS: HANDLE = usize::MAX as HANDLE; // -1
 pub const CURRENT_THREAD: HANDLE = (usize::MAX - 1) as HANDLE; // -2
 
+#[inline]
+fn is_hcache_type(o: &dyn KObject) -> bool {
+    let any = o.as_any();
+    any.is::<Semaphore>() || any.is::<Event>() || any.is::<MutexObj>() || any.is::<WaitableTimer>()
+}
+
 pub fn get(h: HANDLE) -> Option<Arc<dyn KObject>> {
     if h == CURRENT_THREAD {
         return crate::thread::current_thread_object().map(|t| t as Arc<dyn KObject>);
     }
     let hv = h as usize;
-    let gen = CLOSE_GEN.load(Ordering::Acquire);
+    let gen = SYNC_CLOSE_GEN.load(Ordering::Acquire);
     let slot = (hv >> 2) & (HCACHE_LEN - 1);
     if let Ok(Some(o)) = HCACHE.try_with(|c| {
         let e = unsafe { &(*c.get())[slot] };
@@ -376,8 +581,7 @@ pub fn get(h: HANDLE) -> Option<Arc<dyn KObject>> {
     let o = table().read().unwrap().map.get(&hv).cloned()?;
     // Only synchronization objects (trivial Drop: a cached reference may
     // outlive CloseHandle until the entry is next touched).
-    let any = o.as_any();
-    if any.is::<Semaphore>() || any.is::<Event>() || any.is::<MutexObj>() || any.is::<WaitableTimer>() {
+    if is_hcache_type(&*o) {
         let _ = HCACHE.try_with(|c| {
             let old = unsafe {
                 std::mem::replace(&mut (*c.get())[slot], HEntry { h: hv, gen, obj: Some(o.clone()) })
@@ -388,10 +592,10 @@ pub fn get(h: HANDLE) -> Option<Arc<dyn KObject>> {
     Some(o)
 }
 
-/// Bumped by every [`close`] (after the table removal, still under the write
-/// lock). Handle values are never reused, so a per-thread cache entry stays
-/// valid until then.
-static CLOSE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bumped ONLY when a cached synchronization handle (`Semaphore`, `Event`,
+/// `MutexObj`, `WaitableTimer`) is closed, so closing files/pipes/mappings
+/// never flushes every thread's 128-entry `HCACHE`.
+static SYNC_CLOSE_GEN: AtomicU64 = AtomicU64::new(0);
 const HCACHE_LEN: usize = 128;
 
 struct HEntry {
@@ -424,8 +628,10 @@ pub fn close(h: HANDLE) -> bool {
     let removed = {
         let mut t = table().write().unwrap();
         let r = t.map.remove(&(h as usize));
-        if r.is_some() {
-            CLOSE_GEN.fetch_add(1, Ordering::Release);
+        if let Some(ref obj) = r {
+            if is_hcache_type(&**obj) {
+                SYNC_CLOSE_GEN.fetch_add(1, Ordering::Release);
+            }
         }
         r
     };
@@ -450,127 +656,248 @@ pub enum WaitResult {
     IoCompletion,
 }
 
-/// Generic WaitForMultipleObjects. `timeout_ms == INFINITE` waits forever.
-pub fn wait_for(objs: &[Arc<dyn KObject>], wait_all: bool, timeout_ms: u32, alertable: bool) -> WaitResult {
+/// Lock-free single-object wait for `Semaphore` or `Event` (non-alertable):
+/// never touches the global `WAIT_LOCK`, only the object's sharded waiter bucket.
+fn wait_single_lockfree(obj: &Arc<dyn KObject>, timeout: Option<Duration>) -> Option<WaitResult> {
+    enum FastObj<'a> {
+        Sem(&'a Semaphore),
+        Ev(&'a Event),
+    }
+    let fast = if let Some(s) = obj.as_any().downcast_ref::<Semaphore>() {
+        FastObj::Sem(s)
+    } else if let Some(e) = obj.as_any().downcast_ref::<Event>() {
+        FastObj::Ev(e)
+    } else {
+        return None;
+    };
+    let key = obj.waitable().unwrap().wait_key();
+    let try_one = || match fast {
+        FastObj::Sem(s) => s.try_take(),
+        FastObj::Ev(e) => e.try_take(),
+    };
+    let pass_on_sem = || match fast {
+        FastObj::Sem(s) => sem_cascade() && s.count.load(Ordering::Acquire) > 0,
+        FastObj::Ev(_) => false,
+    };
+
+    if try_one() {
+        return Some(WaitResult::Object(0));
+    }
+    if matches!(timeout, Some(d) if d.is_zero()) {
+        return Some(WaitResult::Timeout);
+    }
+
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
+    let mut reg = Registration::new(std::slice::from_ref(obj), false, false, 0);
+    loop {
+        reg.arm();
+        if try_one() {
+            reg.consumed = true;
+            let pass_on = pass_on_sem();
+            drop(reg);
+            if pass_on {
+                notify_semaphore(key);
+            }
+            return Some(WaitResult::Object(0));
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Some(WaitResult::Timeout);
+        }
+        reg.waiter.park.park(deadline);
+    }
+}
+
+/// Try to satisfy `objs` once under `WAIT_LOCK`. Returns `Some((res, pass_on_key))`.
+fn try_satisfy_locked(
+    objs: &[Arc<dyn KObject>],
+    wait_all: bool,
+    g: &WaitGuard,
+    tid: u32,
+) -> Option<(WaitResult, Option<usize>)> {
+    if wait_all {
+        if objs.iter().all(|o| o.waitable().unwrap().is_signaled(g, tid)) {
+            // Lock-free objects (Semaphore, auto-reset Event) can change without
+            // WAIT_LOCK: acquire them first, all-or-nothing with rollback.
+            let mut taken_sems = 0usize;
+            let mut taken_evs = 0usize;
+            let mut ok = true;
+            for o in objs {
+                if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
+                    if !s.try_take() {
+                        ok = false;
+                        break;
+                    }
+                    taken_sems += 1;
+                } else if let Some(e) = o.as_any().downcast_ref::<Event>() {
+                    if !e.try_take() {
+                        ok = false;
+                        break;
+                    }
+                    if !e.manual_reset {
+                        taken_evs += 1;
+                    }
+                }
+            }
+            if ok {
+                let mut abandoned = false;
+                for o in objs {
+                    if !o.as_any().is::<Semaphore>() && !o.as_any().is::<Event>() {
+                        abandoned |= o.waitable().unwrap().acquire(g, tid);
+                    }
+                }
+                let res = if abandoned { WaitResult::Abandoned(0) } else { WaitResult::Object(0) };
+                return Some((res, None));
+            }
+            for o in objs {
+                if taken_sems == 0 && taken_evs == 0 {
+                    break;
+                }
+                if taken_sems > 0 {
+                    if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
+                        s.untake(g);
+                        taken_sems -= 1;
+                        continue;
+                    }
+                }
+                if taken_evs > 0 {
+                    if let Some(e) = o.as_any().downcast_ref::<Event>() {
+                        if !e.manual_reset {
+                            e.untake();
+                            taken_evs -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    } else {
+        for (i, o) in objs.iter().enumerate() {
+            let w = o.waitable().unwrap();
+            if let Some(ab) = w.try_acquire(g, tid) {
+                let pass_on = (sem_cascade()
+                    && objs.len() == 1
+                    && o.as_any().is::<Semaphore>()
+                    && w.is_signaled(g, tid))
+                .then(|| w.wait_key());
+                let res = if ab { WaitResult::Abandoned(i) } else { WaitResult::Object(i) };
+                return Some((res, pass_on));
+            }
+        }
+        None
+    }
+}
+
+/// Generic WaitForMultipleObjects with sub-millisecond `Option<Duration>` timeout
+/// (`None` = INFINITE).
+pub fn wait_for_duration(
+    objs: &[Arc<dyn KObject>],
+    wait_all: bool,
+    timeout: Option<Duration>,
+    alertable: bool,
+) -> WaitResult {
     for o in objs {
         if o.waitable().is_none() {
             log::warn!("wait on non-waitable object type {}", o.type_name());
             return WaitResult::Failed(err::ERROR_INVALID_HANDLE);
         }
     }
+    if objs.len() == 1 && !wait_all && !alertable {
+        if let Some(r) = wait_single_lockfree(&objs[0], timeout) {
+            return r;
+        }
+    }
     let tid = crate::teb::thread_id();
-    let deadline = (timeout_ms != INFINITE).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+    if alertable && crate::thread::has_pending_apc() {
+        crate::thread::run_pending_apcs();
+        return WaitResult::IoCompletion;
+    }
     let mut g = wait_lock();
-    let mut wait_scope: Option<crate::hitch::Scope> = None;
-    // Declared after `g`: dropped (unregistered) while the lock is held.
-    let mut reg_: Option<Registration> = None;
+    if let Some((res, pass_on)) = try_satisfy_locked(objs, wait_all, &g, tid) {
+        drop(g);
+        if let Some(k) = pass_on {
+            notify_semaphore(k);
+        }
+        return res;
+    }
+    if matches!(timeout, Some(d) if d.is_zero()) {
+        return WaitResult::Timeout;
+    }
+
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, objs.len() as u64);
+    let mut reg = Registration::new(objs, wait_all, alertable, tid);
     loop {
+        // Arm BEFORE re-checking state so lock-free notifiers (Event::set,
+        // Semaphore::release, queue_apc) racing with us cannot lose a wakeup.
+        reg.arm();
         if alertable && crate::thread::has_pending_apc() {
-            drop(reg_);
+            drop(reg);
             drop(g);
-            drop(wait_scope);
             crate::thread::run_pending_apcs();
             return WaitResult::IoCompletion;
         }
-        if wait_all {
-            if objs.iter().all(|o| o.waitable().unwrap().is_signaled(&g, tid)) {
-                // Semaphore units can vanish without the lock: take those
-                // first, all or nothing; the rest cannot change under it.
-                let mut taken = 0usize;
-                let mut ok = true;
-                for o in objs {
-                    if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
-                        if !s.try_take() {
-                            ok = false;
-                            break;
-                        }
-                        taken += 1;
-                    }
-                }
-                if ok {
-                    let mut abandoned = false;
-                    for o in objs {
-                        if !o.as_any().is::<Semaphore>() {
-                            abandoned |= o.waitable().unwrap().acquire(&g, tid);
-                        }
-                    }
-                    if let Some(r) = reg_.as_mut() {
-                        r.consumed = true;
-                    }
-                    return if abandoned { WaitResult::Abandoned(0) } else { WaitResult::Object(0) };
-                }
-                for o in objs {
-                    if taken == 0 {
-                        break;
-                    }
-                    if let Some(s) = o.as_any().downcast_ref::<Semaphore>() {
-                        s.untake(&g);
-                        taken -= 1;
-                    }
-                }
+        if let Some((res, pass_on)) = try_satisfy_locked(objs, wait_all, &g, tid) {
+            reg.consumed = true;
+            drop(reg);
+            drop(g);
+            if let Some(k) = pass_on {
+                notify_semaphore(k);
             }
-        } else {
-            for (i, o) in objs.iter().enumerate() {
-                let w = o.waitable().unwrap();
-                if let Some(ab) = w.try_acquire(&g, tid) {
-                    // Cascade: units left over -> hand one wake on from here
-                    // (the releaser only woke us).
-                    let pass_on = sem_cascade()
-                        && objs.len() == 1
-                        && o.as_any().is::<Semaphore>()
-                        && w.is_signaled(&g, tid);
-                    if let Some(r) = reg_.as_mut() {
-                        r.consumed = true;
-                    }
-                    if pass_on {
-                        drop(reg_);
-                        drop(g);
-                        notify_semaphore(obj_key(Arc::as_ptr(o)));
-                    }
-                    return if ab { WaitResult::Abandoned(i) } else { WaitResult::Object(i) };
-                }
-            }
+            return res;
         }
-        if timeout_ms == 0 {
-            return WaitResult::Timeout;
-        }
-        if wait_scope.is_none() {
-            wait_scope = Some(crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, objs.len() as u64));
-        }
-        let r = reg_.get_or_insert_with(|| Registration::new(objs, wait_all));
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return WaitResult::Timeout;
         }
-        r.arm();
-        let park = &r.waiter.park;
+        let park = Arc::clone(&reg.waiter);
         drop(g);
-        park.park(deadline);
+        park.park.park(deadline);
         g = wait_lock();
+    }
+}
+
+/// Generic WaitForMultipleObjects. `timeout_ms == INFINITE` waits forever.
+pub fn wait_for(objs: &[Arc<dyn KObject>], wait_all: bool, timeout_ms: u32, alertable: bool) -> WaitResult {
+    let timeout = (timeout_ms != INFINITE).then(|| Duration::from_millis(timeout_ms as u64));
+    wait_for_duration(objs, wait_all, timeout, alertable)
+}
+
+/// Sleep that can be interrupted by APCs (`SleepEx` / `NtDelayExecution` alertable).
+/// Registers only in `ALERTABLE_WAITERS` keyed by `tid` (never `WAIT_LOCK` or `ANY_WAITERS`).
+pub fn alertable_sleep_duration(timeout: Option<Duration>) -> bool {
+    if crate::thread::has_pending_apc() {
+        crate::thread::run_pending_apcs();
+        return true;
+    }
+    if matches!(timeout, Some(d) if d.is_zero()) {
+        std::thread::yield_now();
+        if crate::thread::has_pending_apc() {
+            crate::thread::run_pending_apcs();
+            return true;
+        }
+        return false;
+    }
+    let tid = crate::teb::thread_id();
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let reg = Registration::new(&[], false, true, tid);
+    loop {
+        reg.arm();
+        if crate::thread::has_pending_apc() {
+            drop(reg);
+            crate::thread::run_pending_apcs();
+            return true;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return false;
+        }
+        reg.waiter.park.park(deadline);
     }
 }
 
 /// Sleep that can be interrupted by APCs (SleepEx alertable).
 pub fn alertable_sleep(timeout_ms: u32) -> bool {
-    let deadline = (timeout_ms != INFINITE).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
-    let mut g = wait_lock();
-    let mut reg_: Option<Registration> = None;
-    loop {
-        if crate::thread::has_pending_apc() {
-            drop(reg_);
-            drop(g);
-            crate::thread::run_pending_apcs();
-            return true;
-        }
-        let r = reg_.get_or_insert_with(|| Registration::new(&[], false));
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return false;
-        }
-        r.arm();
-        let park = &r.waiter.park;
-        drop(g);
-        park.park(deadline);
-        g = wait_lock();
-    }
+    let timeout = (timeout_ms != INFINITE).then(|| Duration::from_millis(timeout_ms as u64));
+    alertable_sleep_duration(timeout)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,24 +906,39 @@ pub fn alertable_sleep(timeout_ms: u32) -> bool {
 
 pub struct Event {
     pub manual_reset: bool,
-    pub signaled: Guarded<bool>,
+    signaled: AtomicBool,
     pub name: Option<String>,
 }
 
 impl Event {
     pub fn new(manual_reset: bool, initial: bool, name: Option<String>) -> Self {
-        Event { manual_reset, signaled: Guarded::new(initial), name }
+        Event { manual_reset, signaled: AtomicBool::new(initial), name }
     }
+
+    #[inline]
+    pub fn try_take(&self) -> bool {
+        if self.manual_reset {
+            self.signaled.load(Ordering::Acquire)
+        } else {
+            self.signaled.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        }
+    }
+
+    #[inline]
+    fn untake(&self) {
+        if !self.manual_reset {
+            self.signaled.store(true, Ordering::Release);
+            notify_object_key(obj_key(self), 1);
+        }
+    }
+
     pub fn set(&self) {
-        let g = wait_lock();
-        *self.signaled.get(&g) = true;
-        drop(g);
+        self.signaled.store(true, Ordering::Release);
         // An auto-reset event satisfies exactly one wait.
-        notify_object(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
+        notify_object_key(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
     }
     pub fn reset(&self) {
-        let g = wait_lock();
-        *self.signaled.get(&g) = false;
+        self.signaled.store(false, Ordering::Release);
     }
     /// PulseEvent: release current waiters then reset. Approximated by
     /// set + (yield) + reset.
@@ -620,14 +962,15 @@ impl KObject for Event {
 }
 
 impl Waitable for Event {
-    fn is_signaled(&self, g: &WaitGuard, _tid: u32) -> bool {
-        *self.signaled.get(g)
+    fn is_signaled(&self, _g: &WaitGuard, _tid: u32) -> bool {
+        self.signaled.load(Ordering::Acquire)
     }
-    fn acquire(&self, g: &WaitGuard, _tid: u32) -> bool {
-        if !self.manual_reset {
-            *self.signaled.get(g) = false;
-        }
+    fn acquire(&self, _g: &WaitGuard, _tid: u32) -> bool {
+        self.try_take();
         false
+    }
+    fn try_acquire(&self, _g: &WaitGuard, _tid: u32) -> Option<bool> {
+        self.try_take().then_some(false)
     }
 }
 
@@ -673,17 +1016,15 @@ impl MutexObj {
         if s.1 == 0 {
             s.0 = 0;
             drop(g);
-            notify_object(obj_key(self), 1);
+            notify_object_key(obj_key(self), 1);
         }
         true
     }
 }
 
-/// Count is atomic: [`Semaphore::try_take`] consumes a unit without `WAIT_LOCK`
-/// (the job workers' `WaitForSingleObject` on a semaphore that already has
-/// units). Increments stay under `WAIT_LOCK`: a waiter re-checks the count and
-/// registers under the lock, so a release cannot slip between the two. A
-/// lock-free take only ever lowers the count, which cannot strand a waiter.
+/// Lock-free semaphore count: both [`Semaphore::try_take`] and
+/// [`Semaphore::release`] update `count` atomically without taking `WAIT_LOCK`,
+/// ordering against sharded waiter buckets via a `SeqCst` fence.
 pub struct Semaphore {
     count: std::sync::atomic::AtomicI32,
     pub max: i32,
@@ -736,11 +1077,11 @@ impl Semaphore {
     /// Return a unit taken by a wait-all that could not complete (lock held).
     fn untake(&self, _g: &WaitGuard) {
         self.count.fetch_add(1, Ordering::Release);
+        notify_object_key(obj_key(self), 1);
     }
 
     /// Returns previous count or None if it would exceed max.
     pub fn release(&self, n: i32) -> Option<i32> {
-        let g = wait_lock();
         let mut prev = self.count.load(Ordering::Relaxed);
         loop {
             if n <= 0 || prev.checked_add(n).map_or(true, |v| v > self.max) {
@@ -751,11 +1092,10 @@ impl Semaphore {
                 Err(v) => prev = v,
             }
         }
-        drop(g);
         if sem_cascade() {
             notify_semaphore(obj_key(self));
         } else {
-            notify_object(obj_key(self), n as usize);
+            notify_object_key(obj_key(self), n as usize);
         }
         Some(prev)
     }
@@ -785,7 +1125,24 @@ impl WaitableTimer {
         *self.generation.get(&g) += 1;
     }
 
-    pub fn fire(&self, gen: u64, apc: Option<( crate::thread::ApcProc, usize, Arc<crate::thread::ThreadObj> )>) -> bool {
+    /// Notify waiters registered specifically on this timer.
+    pub fn notify(&self) {
+        notify_object_key(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
+    }
+
+    /// Mark timer signaled if `gen` still matches and wake waiters.
+    pub fn fire_signaled(&self, gen: u64) -> bool {
+        let g = wait_lock();
+        if *self.generation.get(&g) != gen {
+            return false;
+        }
+        *self.signaled.get(&g) = true;
+        drop(g);
+        self.notify();
+        true
+    }
+
+    pub fn fire(&self, gen: u64, apc: Option<(crate::thread::ApcProc, usize, Arc<crate::thread::ThreadObj>)>) -> bool {
         let g = wait_lock();
         if *self.generation.get(&g) != gen {
             return false;
@@ -796,7 +1153,7 @@ impl WaitableTimer {
             // queue_apc wakes the target's alertable wait itself.
             crate::thread::queue_apc(target, proc_, param);
         }
-        notify_object(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
+        self.notify();
         true
     }
 }
@@ -856,21 +1213,30 @@ mod tests {
         // First get populates HCACHE for WaitableTimer.
         let got1 = get(h).expect("handle must resolve");
         assert!(Arc::ptr_eq(&got1, &timer));
-        let gen_before = CLOSE_GEN.load(Ordering::Acquire);
+        let gen_before = SYNC_CLOSE_GEN.load(Ordering::Acquire);
         let cached = HCACHE.with(|c| {
             let e = unsafe { &(*c.get())[slot] };
             e.h == hv && e.gen == gen_before && e.obj.as_ref().is_some_and(|o| Arc::ptr_eq(o, &timer))
         });
         assert!(cached, "WaitableTimer should be cached in HCACHE");
 
+        // Closing a non-sync handle must NOT bump SYNC_CLOSE_GEN or flush HCACHE.
+        let non_sync = insert(Arc::new(Opaque("file_like")));
+        assert!(close(non_sync));
+        assert_eq!(
+            SYNC_CLOSE_GEN.load(Ordering::Acquire),
+            gen_before,
+            "closing non-sync handle must not bump SYNC_CLOSE_GEN"
+        );
+
         // Second get hits HCACHE and returns the same object.
         let got2 = get(h).expect("cached handle must resolve");
         assert!(Arc::ptr_eq(&got2, &timer));
 
-        // close() removes from TABLE and bumps CLOSE_GEN to invalidate HCACHE.
+        // close() removes from TABLE and bumps SYNC_CLOSE_GEN to invalidate HCACHE.
         assert!(close(h));
         assert!(!close(h));
-        assert!(CLOSE_GEN.load(Ordering::Acquire) > gen_before);
+        assert!(SYNC_CLOSE_GEN.load(Ordering::Acquire) > gen_before);
         assert!(get(h).is_none(), "closed WaitableTimer must not be returned from HCACHE");
     }
 
@@ -972,5 +1338,27 @@ mod tests {
             assert!(close(*hv as HANDLE));
             assert!(get(*hv as HANDLE).is_none());
         }
+    }
+
+    #[test]
+    fn waitable_list_inline_and_spill_and_wait_all_rollback() {
+        let mut list = WaitableList::with_capacity(4);
+        for _ in 0..8 {
+            list.push(Arc::new(Event::new(true, false, None)));
+        }
+        assert!(matches!(list, WaitableList::Inline { len: 8, .. }));
+        assert_eq!(list.as_slice().len(), 8);
+        list.push(Arc::new(Event::new(true, false, None)));
+        assert!(matches!(list, WaitableList::Heap(_)));
+        assert_eq!(list.as_slice().len(), 9);
+
+        // wait_all rollback must restore both auto-reset Event and Semaphore when another object is unsignaled.
+        let ev1 = Arc::new(Event::new(false, true, None));
+        let sem = Arc::new(Semaphore::new(1, 1, None));
+        let ev2 = Arc::new(Event::new(true, false, None));
+        let objs: [Arc<dyn KObject>; 3] = [ev1.clone(), sem.clone(), ev2.clone()];
+        assert!(matches!(wait_for(&objs, true, 0, false), WaitResult::Timeout));
+        assert!(ev1.try_take(), "auto-reset event must remain signaled after wait_all rollback");
+        assert!(sem.try_take(), "semaphore unit must remain available after wait_all rollback");
     }
 }

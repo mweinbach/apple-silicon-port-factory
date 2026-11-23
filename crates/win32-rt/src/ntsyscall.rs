@@ -371,14 +371,7 @@ pub unsafe extern "win64" fn dispatch_nt_syscall(
             r9 as *const c_void,
         ),
         ssn::NT_WAIT_FOR_SINGLE_OBJECT => {
-            let timeout_ptr = r8 as *const i64;
-            let ms = if timeout_ptr.is_null() {
-                u32::MAX
-            } else {
-                let v = *timeout_ptr;
-                if v < 0 { ((-v) / 10_000) as u32 } else { 0 }
-            };
-            crate::kernel32::threads::WaitForSingleObject(r10 as HANDLE, ms) as NTSTATUS
+            ntdll::NtWaitForSingleObject(r10 as HANDLE, rdx as u8, r8 as *const i64)
         }
         ssn::NT_SET_EVENT => {
             if crate::kernel32::threads::SetEvent(r10 as HANDLE) != 0 {

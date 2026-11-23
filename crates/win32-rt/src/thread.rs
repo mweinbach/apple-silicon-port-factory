@@ -6,8 +6,8 @@ use crate::teb;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 pub type ThreadProc = unsafe extern "win64" fn(*mut c_void) -> u32;
 pub type ApcProc = unsafe extern "win64" fn(usize);
@@ -41,6 +41,8 @@ pub struct ThreadObj {
     pub teb: AtomicUsize,
     pub exit_code: Guarded<Option<u32>>,
     pub apcs: Mutex<Vec<(ApcProc, usize)>>,
+    /// Lock-free mirror of `!apcs.is_empty()` for zero-overhead `has_pending_apc()`.
+    pub has_apc: AtomicBool,
     pub name: Mutex<String>,
     suspend: Mutex<SuspendState>,
     resume_cv: Condvar,
@@ -61,6 +63,7 @@ impl ThreadObj {
             teb: AtomicUsize::new(0),
             exit_code: Guarded::new(None),
             apcs: Mutex::new(Vec::new()),
+            has_apc: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             suspend: Mutex::new(SuspendState {
                 count: suspended as u32,
@@ -255,9 +258,58 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<ThreadObj>>> = const { RefCell::new(None) };
     static ACT_SLOT: Cell<*const ThreadObj> = const { Cell::new(std::ptr::null()) };
     static FLS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Custom mmap stack allocation `(base_ptr, total_len)` owned by a `thread::spawn`ed
+    /// thread, handed off to the stack reaper on exit.
+    static STACK_ALLOC: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 static THREADS: Mutex<Vec<Arc<ThreadObj>>> = Mutex::new(Vec::new());
+
+/// Take the current thread's `ThreadObj` context (for cooperative fiber handoff).
+pub(crate) fn take_current_thread_context() -> Option<Arc<ThreadObj>> {
+    ACT_SLOT.with(|c| c.set(std::ptr::null()));
+    CURRENT.with(|c| c.borrow_mut().take())
+}
+
+/// Install a `ThreadObj` context on the current OS thread (for cooperative fiber handoff).
+pub(crate) fn install_current_thread_context(obj: Option<Arc<ThreadObj>>) {
+    let ptr = obj.as_ref().map_or(std::ptr::null(), |o| &**o as *const ThreadObj);
+    ACT_SLOT.with(|c| c.set(ptr));
+    CURRENT.with(|c| *c.borrow_mut() = obj);
+}
+
+struct ReapReq {
+    pthread: usize,
+    mem: usize,
+    len: usize,
+}
+
+fn stack_reaper_tx() -> &'static Mutex<mpsc::Sender<ReapReq>> {
+    static TX: OnceLock<Mutex<mpsc::Sender<ReapReq>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ReapReq>();
+        let _ = std::thread::Builder::new()
+            .name("win32-stack-reaper".into())
+            .spawn(move || {
+                while let Ok(req) = rx.recv() {
+                    unsafe {
+                        // `pthread_join` guarantees the thread has completely exited
+                        // and is no longer executing on its custom mmap stack before munmap.
+                        let _ = libc::pthread_join(req.pthread as libc::pthread_t, std::ptr::null_mut());
+                        libc::munmap(req.mem as *mut c_void, req.len);
+                    }
+                }
+            });
+        Mutex::new(tx)
+    })
+}
+
+fn enqueue_current_stack_reap() {
+    if let Some((mem, len)) = STACK_ALLOC.with(|c| c.take()) {
+        let pthread = unsafe { libc::pthread_self() as usize };
+        let _ = stack_reaper_tx().lock().unwrap().send(ReapReq { pthread, mem, len });
+    }
+}
 
 /// Fast, allocation-free entry into a tracked thread activity. Returns previous `(kind, start_ns, arg)`.
 #[inline(always)]
@@ -327,6 +379,8 @@ pub static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 struct StartInfo {
     obj: Arc<ThreadObj>,
     body: Box<dyn FnOnce() -> u32 + Send>,
+    stack_mem: usize,
+    stack_total: usize,
     stack_lo: usize,
     stack_hi: usize,
     is_initial: bool,
@@ -348,13 +402,14 @@ pub fn spawn(
     if NO_SPAWN.load(Ordering::Relaxed) {
         return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
     }
-    let page = 0x1000;
+    let page = 0x4000usize;
     let size = ((stack_size.max(8 * 1024 * 1024)) + page - 1) & !(page - 1);
-    let guard = 4 * page;
+    let guard = page;
+    let total = size + guard;
     unsafe {
         let mem = libc::mmap(
             std::ptr::null_mut(),
-            size + guard,
+            total,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
@@ -369,15 +424,28 @@ pub fn spawn(
         let obj = ThreadObj::new(suspended);
         obj.tid.store(teb::alloc_tid() as usize, Ordering::Relaxed);
         THREADS.lock().unwrap().push(obj.clone());
-        let info = Box::new(StartInfo { obj: obj.clone(), body, stack_lo: lo, stack_hi: hi, is_initial });
+        let info = Box::new(StartInfo {
+            obj: obj.clone(),
+            body,
+            stack_mem: mem as usize,
+            stack_total: total,
+            stack_lo: lo,
+            stack_hi: hi,
+            is_initial,
+        });
+        let info_ptr = Box::into_raw(info);
         let mut attr: libc::pthread_attr_t = std::mem::zeroed();
         libc::pthread_attr_init(&mut attr);
         pthread_attr_setstack(&mut attr, lo as *mut c_void, size);
-        libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+        // Keep joinable so the stack reaper can `pthread_join` and safely `munmap`
+        // the custom mmap stack after the thread has completely exited.
+        libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_JOINABLE);
         let mut th: libc::pthread_t = std::mem::zeroed();
-        let rc = libc::pthread_create(&mut th, &attr, thread_main, Box::into_raw(info) as *mut c_void);
+        let rc = libc::pthread_create(&mut th, &attr, thread_main, info_ptr as *mut c_void);
         libc::pthread_attr_destroy(&mut attr);
         if rc != 0 {
+            drop(Box::from_raw(info_ptr));
+            libc::munmap(mem, total);
             THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, &obj));
             obj.mark_exiting();
             return Err(std::io::Error::from_raw_os_error(rc));
@@ -389,6 +457,7 @@ pub fn spawn(
 
 extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
     let info = unsafe { Box::from_raw(arg as *mut StartInfo) };
+    STACK_ALLOC.with(|c| c.set(Some((info.stack_mem, info.stack_total))));
     if let Some(h) = THREAD_START_HOOK.get() {
         h();
     }
@@ -398,6 +467,7 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
     impl Drop for ExitGuard {
         fn drop(&mut self) {
             self.0.mark_exiting();
+            enqueue_current_stack_reap();
         }
     }
     let _exit_guard = ExitGuard(obj.clone());
@@ -416,7 +486,7 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
 }
 
 /// Thread teardown: FLS callbacks, DLL_THREAD_DETACH, signal waiters, release
-/// the borrowed TSD slots.
+/// the borrowed TSD slots, and schedule custom stack reclamation.
 pub fn finish_current_thread(code: u32) {
     if let Some(obj) = current_thread_object() {
         obj.mark_exiting();
@@ -430,11 +500,12 @@ pub fn finish_current_thread(code: u32) {
         }
     }
     if let Some(obj) = current_thread_object() {
+        obj.pthread.store(0, Ordering::Release);
         {
             let g = handles::wait_lock();
             *obj.exit_code.get(&g) = Some(code);
         }
-        handles::notify_waiters();
+        handles::notify_object_key(&*obj as *const ThreadObj as usize, usize::MAX);
         obj.teb.store(0, Ordering::Relaxed);
         THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, &obj));
     }
@@ -445,6 +516,7 @@ pub fn finish_current_thread(code: u32) {
             teb::free_teb(t);
         }
     }
+    enqueue_current_stack_reap();
 }
 
 /// `ExitThread` from Windows code: tear down and exit the host thread.
@@ -453,8 +525,13 @@ pub fn exit_current_thread(code: u32) -> ! {
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }
 
+#[inline(always)]
 pub fn has_pending_apc() -> bool {
-    current_thread_object().is_some_and(|t| !t.apcs.lock().unwrap().is_empty())
+    let p = ACT_SLOT.with(|c| c.get());
+    if p.is_null() {
+        return false;
+    }
+    unsafe { (*p).has_apc.load(Ordering::Acquire) }
 }
 
 pub fn run_pending_apcs() {
@@ -463,9 +540,14 @@ pub fn run_pending_apcs() {
             let next = {
                 let mut q = t.apcs.lock().unwrap();
                 if q.is_empty() {
+                    t.has_apc.store(false, Ordering::Release);
                     None
                 } else {
-                    Some(q.remove(0))
+                    let item = q.remove(0);
+                    if q.is_empty() {
+                        t.has_apc.store(false, Ordering::Release);
+                    }
+                    Some(item)
                 }
             };
             match next {
@@ -479,12 +561,14 @@ pub fn run_pending_apcs() {
 }
 
 pub fn queue_apc(t: &ThreadObj, f: ApcProc, param: usize) {
-    t.apcs.lock().unwrap().push((f, param));
-    // The APC queue isn't guarded by the wait lock: pass through it so a
-    // waiter that checked the queue before the push is already registered
-    // and asleep (and so receives the wake) by the time we notify.
-    drop(handles::wait_lock());
-    handles::notify_waiters();
+    {
+        let mut q = t.apcs.lock().unwrap();
+        q.push((f, param));
+        t.has_apc.store(true, Ordering::Release);
+    }
+    // `notify_thread_apc` issues a SeqCst fence before checking ALERTABLE_WAITERS,
+    // waking ONLY this specific thread if it is in an alertable wait.
+    handles::notify_thread_apc(t.tid.load(Ordering::Relaxed) as u32);
 }
 
 // ---------------------------------------------------------------------------
@@ -548,47 +632,56 @@ pub unsafe fn tls_slot_ptr(t: *mut u8, i: u32, create: bool) -> Option<*mut usiz
 }
 
 // ---------------------------------------------------------------------------
-// FLS (fiber-local storage; we have one fiber per thread)
+// FLS (fiber-local storage; lock-free slot validity & callback lookup)
 // ---------------------------------------------------------------------------
 
 pub type FlsCallback = unsafe extern "win64" fn(*mut c_void);
-static FLS_SLOTS: Mutex<Vec<Option<Option<FlsCallback>>>> = Mutex::new(Vec::new());
+const MAX_FLS_SLOTS: usize = 4096;
+static FLS_ALLOC_LOCK: Mutex<()> = Mutex::new(());
+static FLS_ALLOCATED: [AtomicBool; MAX_FLS_SLOTS] = [const { AtomicBool::new(false) }; MAX_FLS_SLOTS];
+static FLS_CALLBACKS: [AtomicUsize; MAX_FLS_SLOTS] = [const { AtomicUsize::new(0) }; MAX_FLS_SLOTS];
 pub const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
 
 pub fn fls_alloc(cb: Option<FlsCallback>) -> u32 {
-    let mut s = FLS_SLOTS.lock().unwrap();
-    if let Some(i) = s.iter().position(|x| x.is_none()) {
-        s[i] = Some(cb);
-        return i as u32;
+    let _g = FLS_ALLOC_LOCK.lock().unwrap();
+    for i in 0..MAX_FLS_SLOTS {
+        if !FLS_ALLOCATED[i].load(Ordering::Relaxed) {
+            FLS_CALLBACKS[i].store(cb.map_or(0, |f| f as usize), Ordering::Relaxed);
+            FLS_ALLOCATED[i].store(true, Ordering::Release);
+            return i as u32;
+        }
     }
-    if s.len() >= 4096 {
-        return FLS_OUT_OF_INDEXES;
-    }
-    s.push(Some(cb));
-    (s.len() - 1) as u32
+    FLS_OUT_OF_INDEXES
 }
 
 pub fn fls_free(i: u32) -> bool {
+    let idx = i as usize;
+    if idx >= MAX_FLS_SLOTS {
+        return false;
+    }
     let cb = {
-        let mut s = FLS_SLOTS.lock().unwrap();
-        match s.get_mut(i as usize) {
-            Some(x @ Some(_)) => x.take().unwrap(),
-            _ => return false,
+        let _g = FLS_ALLOC_LOCK.lock().unwrap();
+        if !FLS_ALLOCATED[idx].load(Ordering::Relaxed) {
+            return false;
         }
+        let cb = FLS_CALLBACKS[idx].swap(0, Ordering::Relaxed);
+        FLS_ALLOCATED[idx].store(false, Ordering::Release);
+        cb
     };
     // Windows calls the callback for the current thread's value (all threads, really).
     let v = fls_get(i);
     fls_set(i, 0);
-    if let (Some(cb), true) = (cb, v != 0) {
+    if cb != 0 && v != 0 {
         unsafe {
-            crate::call_guest8(cb as usize, v as u64, 0, 0, 0, 0, 0, 0, 0);
+            crate::call_guest8(cb, v as u64, 0, 0, 0, 0, 0, 0, 0);
         }
     }
     true
 }
 
+#[inline]
 pub fn fls_valid(i: u32) -> bool {
-    FLS_SLOTS.lock().unwrap().get(i as usize).is_some_and(|x| x.is_some())
+    FLS_ALLOCATED.get(i as usize).is_some_and(|a| a.load(Ordering::Acquire))
 }
 
 pub fn fls_get(i: u32) -> usize {
@@ -607,14 +700,16 @@ pub fn fls_set(i: u32, v: usize) {
 
 fn run_fls_callbacks() {
     let vals: Vec<usize> = FLS.with(|f| std::mem::take(&mut *f.borrow_mut()));
-    let slots = FLS_SLOTS.lock().unwrap().clone();
     for (i, v) in vals.into_iter().enumerate() {
-        if v == 0 {
+        if v == 0 || i >= MAX_FLS_SLOTS {
             continue;
         }
-        if let Some(Some(Some(cb))) = slots.get(i) {
-            unsafe {
-                crate::call_guest8(*cb as usize, v as u64, 0, 0, 0, 0, 0, 0, 0);
+        if FLS_ALLOCATED[i].load(Ordering::Acquire) {
+            let cb = FLS_CALLBACKS[i].load(Ordering::Acquire);
+            if cb != 0 {
+                unsafe {
+                    crate::call_guest8(cb, v as u64, 0, 0, 0, 0, 0, 0, 0);
+                }
             }
         }
     }
@@ -680,15 +775,38 @@ pub mod sched {
         unsafe { thread_resume(port) }
     }
 
+    fn cached_timebase() -> (u32, u32) {
+        static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        *TB.get_or_init(|| {
+            let mut tb = Timebase { numer: 0, denom: 0 };
+            unsafe { mach_timebase_info(&mut tb) };
+            (tb.numer, tb.denom)
+        })
+    }
+
+    fn thread_priority_disabled() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var("AW2_THREAD_PRIORITY").is_ok_and(|v| v == "0"))
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn ios_normal_qos_initiated() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cfg!(target_os = "ios")
+                && std::env::var("PORT_IOS_NORMAL_QOS")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("initiated"))
+        })
+    }
+
     /// Nanoseconds -> mach absolute time units (1:1 under Rosetta, 125/3 ns
     /// per tick on native Apple silicon).
     pub fn ns_to_abs(ns: u64) -> u32 {
-        let mut tb = Timebase { numer: 0, denom: 0 };
-        unsafe { mach_timebase_info(&mut tb) };
-        if tb.numer == 0 || tb.denom == 0 {
+        let (numer, denom) = cached_timebase();
+        if numer == 0 || denom == 0 {
             return ns.min(u32::MAX as u64) as u32;
         }
-        (ns as u128 * tb.denom as u128 / tb.numer as u128).min(u32::MAX as u128) as u32
+        (ns as u128 * denom as u128 / numer as u128).min(u32::MAX as u128) as u32
     }
 
     /// Mach thread port of the current thread (no reference to release).
@@ -759,12 +877,10 @@ pub mod sched {
     pub fn apply_self_qos(prio: i32) {
         #[cfg(target_vendor = "apple")]
         {
-            if std::env::var("AW2_THREAD_PRIORITY").is_ok_and(|v| v == "0") {
+            if thread_priority_disabled() {
                 return;
             }
-            let normal_initiated = cfg!(target_os = "ios")
-                && std::env::var("PORT_IOS_NORMAL_QOS")
-                    .is_ok_and(|v| v.eq_ignore_ascii_case("initiated"));
+            let normal_initiated = ios_normal_qos_initiated();
             let (qos, rel) = match prio {
                 i32::MIN..=-2 => (libc::qos_class_t::QOS_CLASS_UTILITY, 0),
                 -1 => (libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0),
@@ -788,7 +904,7 @@ pub mod sched {
     pub fn promote_current_thread_interactive() {
         #[cfg(target_vendor = "apple")]
         {
-            if std::env::var("AW2_THREAD_PRIORITY").is_ok_and(|v| v == "0") {
+            if thread_priority_disabled() {
                 return;
             }
             unsafe {
@@ -800,7 +916,7 @@ pub mod sched {
     /// `SetThreadPriority`: apply the Win32 priority to the host thread.
     /// `AW2_THREAD_PRIORITY=0` keeps the old record-only behaviour.
     pub fn apply_win_priority(t: &ThreadObj, prio: i32) -> Result<(), i32> {
-        if std::env::var("AW2_THREAD_PRIORITY").is_ok_and(|v| v == "0") {
+        if thread_priority_disabled() {
             return Ok(());
         }
         if super::current_thread_object().is_some_and(|c| std::ptr::eq(&*c, t)) {

@@ -474,7 +474,8 @@ pub fn map_kuser_shared_data() -> bool {
             .name("kuser-shared-data".into())
             .spawn(move || loop {
                 update_kuser_times(k_addr as *mut u8);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // Windows default system clock tick is 15.625 ms (64 Hz).
+                std::thread::sleep(std::time::Duration::from_micros(15_625));
             })
             .ok();
         direct
@@ -493,9 +494,13 @@ pub fn kuser_shadow_page() -> *const u8 {
 }
 
 unsafe fn write_ksystem_time(p: *mut u8, v: u64) {
-    // High2Time first, then LowPart, then High1Time (reader protocol).
+    // High2Time first, then LowPart, then High1Time (Windows reader protocol).
+    // Release fences prevent ARM64 store reordering so readers loading
+    // High1 -> Low -> High2 cannot observe a torn 64-bit timestamp.
     std::ptr::write_volatile(p.add(8) as *mut i32, (v >> 32) as i32);
+    std::sync::atomic::fence(Ordering::Release);
     std::ptr::write_volatile(p as *mut u32, v as u32);
+    std::sync::atomic::fence(Ordering::Release);
     std::ptr::write_volatile(p.add(4) as *mut i32, (v >> 32) as i32);
 }
 

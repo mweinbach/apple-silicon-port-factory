@@ -3,9 +3,12 @@
 //! WaitOnAddress, SLIST. Blocking uses `parking_lot_core` keyed by address.
 
 use crate::types::*;
-use parking_lot_core::{park, unpark_all, unpark_one, ParkResult, DEFAULT_PARK_TOKEN, DEFAULT_UNPARK_TOKEN};
+use parking_lot_core::{
+    park, unpark_all, unpark_filter, unpark_one, FilterOp, ParkResult, ParkToken, UnparkToken,
+    DEFAULT_PARK_TOKEN, DEFAULT_UNPARK_TOKEN,
+};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering::*};
 use std::time::{Duration, Instant};
 
 fn deadline(ms: u32) -> Option<Instant> {
@@ -86,18 +89,52 @@ pub unsafe extern "win64" fn DeleteCriticalSection(_cs: *mut CriticalSection) {}
 pub unsafe extern "win64" fn EnterCriticalSection(cs: *mut CriticalSection) {
     let tid = crate::teb::thread_id() as usize;
     if (cs as usize) & 7 != 0 {
-        let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = cs as usize;
         let base = cs as *mut u8;
-        let own = std::ptr::read_unaligned(base.add(0x10) as *const usize);
-        if own == tid {
-            let r = std::ptr::read_unaligned(base.add(0x0c) as *const i32);
-            std::ptr::write_unaligned(base.add(0x0c) as *mut i32, r.wrapping_add(1));
-            return;
+        {
+            let _g = unaligned_lock(key);
+            let own = std::ptr::read_unaligned(base.add(0x10) as *const usize);
+            if own == tid {
+                let r = std::ptr::read_unaligned(base.add(0x0c) as *const i32);
+                std::ptr::write_unaligned(base.add(0x0c) as *mut i32, r.wrapping_add(1));
+                return;
+            }
+            let lc = std::ptr::read_unaligned(base.add(0x08) as *const i32);
+            if lc == -1 {
+                std::ptr::write_unaligned(base.add(0x08) as *mut i32, 0);
+                std::ptr::write_unaligned(base.add(0x10) as *mut usize, tid);
+                std::ptr::write_unaligned(base.add(0x0c) as *mut i32, 1);
+                return;
+            }
+            // Mark contended so LeaveCriticalSection wakes a waiter.
+            std::ptr::write_unaligned(base.add(0x08) as *mut i32, 1);
         }
-        std::ptr::write_unaligned(base.add(0x08) as *mut i32, 0);
-        std::ptr::write_unaligned(base.add(0x10) as *mut usize, tid);
-        std::ptr::write_unaligned(base.add(0x0c) as *mut i32, 1);
-        return;
+        let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
+        loop {
+            park(
+                key,
+                || {
+                    let _g = unaligned_lock(key);
+                    std::ptr::read_unaligned(base.add(0x08) as *const i32) == 1
+                },
+                || {},
+                |_, _| {},
+                DEFAULT_PARK_TOKEN,
+                None,
+            );
+            let _g = unaligned_lock(key);
+            let lc = std::ptr::read_unaligned(base.add(0x08) as *const i32);
+            if lc == -1 {
+                // Keep lock_count = 1 (contended) in case other waiters are still parked.
+                std::ptr::write_unaligned(base.add(0x08) as *mut i32, 1);
+                std::ptr::write_unaligned(base.add(0x10) as *mut usize, tid);
+                std::ptr::write_unaligned(base.add(0x0c) as *mut i32, 1);
+                return;
+            }
+            if lc != 1 {
+                std::ptr::write_unaligned(base.add(0x08) as *mut i32, 1);
+            }
+        }
     }
     let cs = &*cs;
     if cs.owning_thread.load(Relaxed) == tid {
@@ -114,7 +151,7 @@ pub unsafe extern "win64" fn EnterCriticalSection(cs: *mut CriticalSection) {
 pub unsafe extern "win64" fn TryEnterCriticalSection(cs: *mut CriticalSection) -> BOOL {
     let tid = crate::teb::thread_id() as usize;
     if (cs as usize) & 7 != 0 {
-        let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = unaligned_lock(cs as usize);
         let base = cs as *mut u8;
         let own = std::ptr::read_unaligned(base.add(0x10) as *const usize);
         if own == tid {
@@ -148,18 +185,22 @@ pub unsafe extern "win64" fn TryEnterCriticalSection(cs: *mut CriticalSection) -
 #[inline(never)]
 pub unsafe extern "win64" fn LeaveCriticalSection(cs: *mut CriticalSection) {
     if (cs as usize) & 7 != 0 {
-        let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = cs as *mut u8;
-        let r = std::ptr::read_unaligned(base.add(0x0c) as *const i32);
-        std::ptr::write_unaligned(base.add(0x0c) as *mut i32, r.wrapping_sub(1));
-        if r != 1 {
-            return;
-        }
-        std::ptr::write_unaligned(base.add(0x10) as *mut usize, 0);
-        let lc = std::ptr::read_unaligned(base.add(0x08) as *const i32);
-        std::ptr::write_unaligned(base.add(0x08) as *mut i32, -1);
-        if lc == 1 {
-            unpark_one(cs as usize, |_| DEFAULT_UNPARK_TOKEN);
+        let key = cs as usize;
+        let wake = {
+            let _g = unaligned_lock(key);
+            let base = cs as *mut u8;
+            let r = std::ptr::read_unaligned(base.add(0x0c) as *const i32);
+            std::ptr::write_unaligned(base.add(0x0c) as *mut i32, r.wrapping_sub(1));
+            if r != 1 {
+                return;
+            }
+            std::ptr::write_unaligned(base.add(0x10) as *mut usize, 0);
+            let lc = std::ptr::read_unaligned(base.add(0x08) as *const i32);
+            std::ptr::write_unaligned(base.add(0x08) as *mut i32, -1);
+            lc == 1
+        };
+        if wake {
+            unpark_one(key, |_| DEFAULT_UNPARK_TOKEN);
         }
         return;
     }
@@ -173,13 +214,52 @@ pub unsafe extern "win64" fn LeaveCriticalSection(cs: *mut CriticalSection) {
     }
 }
 
+/// Alignment-safe check for `RtlIsCriticalSectionLockedByThread`.
+pub(crate) unsafe fn is_cs_locked_by_thread(cs: *const CriticalSection, tid: usize) -> bool {
+    if (cs as usize) & 7 != 0 {
+        let _g = unaligned_lock(cs as usize);
+        let own = std::ptr::read_unaligned((cs as *const u8).add(0x10) as *const usize);
+        own == tid
+    } else {
+        (*cs).owning_thread.load(Relaxed) == tid
+    }
+}
+
+#[inline]
+unsafe fn cs_get_recursion(cs: *mut CriticalSection) -> i32 {
+    if (cs as usize) & 7 != 0 {
+        let _g = unaligned_lock(cs as usize);
+        std::ptr::read_unaligned((cs as *const u8).add(0x0c) as *const i32)
+    } else {
+        (*cs).recursion_count.load(Relaxed)
+    }
+}
+
+#[inline]
+unsafe fn cs_set_recursion(cs: *mut CriticalSection, val: i32) {
+    if (cs as usize) & 7 != 0 {
+        let _g = unaligned_lock(cs as usize);
+        std::ptr::write_unaligned((cs as *mut u8).add(0x0c) as *mut i32, val);
+    } else {
+        (*cs).recursion_count.store(val, Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Alignment-safe pointer-sized atomic word helper (x86_64 allows unaligned
 // SRWLOCK / CONDITION_VARIABLE / INIT_ONCE in byte buffers; arm64 hardware
 // atomics fault on <8-byte alignment).
 // ---------------------------------------------------------------------------
 
-static UNALIGNED_SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const UNALIGNED_SHARDS: usize = 64;
+static UNALIGNED_SYNC_LOCKS: [std::sync::Mutex<()>; UNALIGNED_SHARDS] =
+    [const { std::sync::Mutex::new(()) }; UNALIGNED_SHARDS];
+
+#[inline]
+fn unaligned_lock(addr: usize) -> std::sync::MutexGuard<'static, ()> {
+    let idx = (addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) & (UNALIGNED_SHARDS - 1);
+    UNALIGNED_SYNC_LOCKS[idx].lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Copy, Clone)]
 struct AtomicWord(*mut usize);
@@ -198,7 +278,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).load(order)
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             std::ptr::read_unaligned(self.0)
         }
     }
@@ -207,7 +287,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).store(val, order);
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             std::ptr::write_unaligned(self.0, val);
         }
     }
@@ -222,7 +302,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).compare_exchange(current, new, success, failure)
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             let prev = std::ptr::read_unaligned(self.0);
             if prev == current {
                 std::ptr::write_unaligned(self.0, new);
@@ -247,7 +327,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).fetch_and(val, order)
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             let prev = std::ptr::read_unaligned(self.0);
             std::ptr::write_unaligned(self.0, prev & val);
             prev
@@ -258,7 +338,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).fetch_add(val, order)
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             let prev = std::ptr::read_unaligned(self.0);
             std::ptr::write_unaligned(self.0, prev.wrapping_add(val));
             prev
@@ -269,7 +349,7 @@ impl AtomicWord {
         if (self.0 as usize) & 7 == 0 {
             (&*(self.0 as *const AtomicUsize)).fetch_sub(val, order)
         } else {
-            let _g = UNALIGNED_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = unaligned_lock(self.0 as usize);
             let prev = std::ptr::read_unaligned(self.0);
             std::ptr::write_unaligned(self.0, prev.wrapping_sub(val));
             prev
@@ -278,48 +358,179 @@ impl AtomicWord {
 }
 
 // ---------------------------------------------------------------------------
-// SRWLOCK (pointer-sized): bit0 writer, bit1 parked, readers counted from bit 2.
+// SRWLOCK (pointer-sized):
+//   bit 0: SRW_WRITER          (held exclusively)
+//   bit 1: SRW_PARKED          (one or more threads parked)
+//   bit 2: SRW_WAITING_WRITER  (writer waiting -> new readers yield)
+//   bits 3..: reader count     (step SRW_READER = 8)
 // ---------------------------------------------------------------------------
 
 const SRW_WRITER: usize = 1;
 const SRW_PARKED: usize = 2;
-const SRW_READER: usize = 4;
-const SRW_READERS_MASK: usize = !3;
+const SRW_WAITING_WRITER: usize = 4;
+const SRW_READER: usize = 8;
+const SRW_READERS_MASK: usize = !7;
+
+const SRW_TOKEN_READER: ParkToken = ParkToken(0);
+const SRW_TOKEN_WRITER: ParkToken = ParkToken(1);
+const SRW_UNPARK_ALLOW_READER: UnparkToken = UnparkToken(1);
+const SRW_UNPARK_WRITER_HANDOFF: UnparkToken = UnparkToken(2);
 
 #[inline]
 unsafe fn srw(p: *mut c_void) -> AtomicWord {
     AtomicWord::from_ptr(p)
 }
 
-unsafe fn srw_park(lock: AtomicWord, blocked: impl Fn(usize) -> bool) {
+unsafe fn srw_park_writer(lock: AtomicWord) -> bool {
     let s = lock.load(Relaxed);
-    if !blocked(s) {
-        return;
+    if s & (SRW_WRITER | SRW_READERS_MASK) == 0 {
+        return false;
     }
-    if s & SRW_PARKED == 0 {
-        if lock.compare_exchange(s, s | SRW_PARKED, Relaxed, Relaxed).is_err() {
-            return;
-        }
+    let want = s | SRW_PARKED | SRW_WAITING_WRITER;
+    if s != want && lock.compare_exchange(s, want, Relaxed, Relaxed).is_err() {
+        return false;
     }
     let key = lock.addr();
     let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
-    park(
+    let r = park(
         key,
         || {
             let s = lock.load(Relaxed);
-            s & SRW_PARKED != 0 && blocked(s)
+            (s & (SRW_PARKED | SRW_WAITING_WRITER) == (SRW_PARKED | SRW_WAITING_WRITER))
+                && (s & (SRW_WRITER | SRW_READERS_MASK) != 0)
         },
         || {},
         |_, _| {},
-        DEFAULT_PARK_TOKEN,
+        SRW_TOKEN_WRITER,
         None,
     );
+    matches!(r, ParkResult::Unparked(tok) if tok == SRW_UNPARK_WRITER_HANDOFF)
+}
+
+unsafe fn srw_park_reader(lock: AtomicWord, block_mask: usize) -> bool {
+    let s = lock.load(Relaxed);
+    if s & block_mask == 0 {
+        return false;
+    }
+    if s & SRW_PARKED == 0 && lock.compare_exchange(s, s | SRW_PARKED, Relaxed, Relaxed).is_err() {
+        return false;
+    }
+    let key = lock.addr();
+    let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
+    let r = park(
+        key,
+        || {
+            let s = lock.load(Relaxed);
+            s & SRW_PARKED != 0 && (s & block_mask != 0)
+        },
+        || {},
+        |_, _| {},
+        SRW_TOKEN_READER,
+        None,
+    );
+    matches!(r, ParkResult::Unparked(tok) if tok == SRW_UNPARK_ALLOW_READER)
 }
 
 #[cold]
 unsafe fn srw_wake(lock: AtomicWord) {
-    if lock.fetch_and(!SRW_PARKED, Relaxed) & SRW_PARKED != 0 {
-        unpark_all(lock.addr(), DEFAULT_UNPARK_TOKEN);
+    use std::cell::Cell;
+    // Writer-priority wake: if SRW_WAITING_WRITER is set, scan strictly for the first waiting
+    // writer (skipping any readers queued ahead of it) and keep SRW_WAITING_WRITER set across the
+    // wake so barging readers cannot starve the woken writer before it acquires SRW_WRITER.
+    let prefer_writer = lock.load(Relaxed) & SRW_WAITING_WRITER != 0;
+    let woke_writer = Cell::new(false);
+    let woke_reader = Cell::new(false);
+    let has_remaining_writer = Cell::new(false);
+    let retry_readers = Cell::new(false);
+    unpark_filter(
+        lock.addr(),
+        |token| {
+            if token == SRW_TOKEN_WRITER {
+                if woke_writer.get() || woke_reader.get() {
+                    has_remaining_writer.set(true);
+                    FilterOp::Skip
+                } else {
+                    woke_writer.set(true);
+                    FilterOp::Unpark
+                }
+            } else if prefer_writer || woke_writer.get() {
+                FilterOp::Skip
+            } else {
+                woke_reader.set(true);
+                FilterOp::Unpark
+            }
+        },
+        |res| {
+            let mut clear = 0usize;
+            if !res.have_more_threads {
+                clear |= SRW_PARKED;
+                if !woke_writer.get() {
+                    clear |= SRW_WAITING_WRITER;
+                }
+            } else if !woke_writer.get() && !has_remaining_writer.get() {
+                clear |= SRW_WAITING_WRITER;
+                if prefer_writer {
+                    retry_readers.set(true);
+                }
+            }
+            if clear != 0 {
+                lock.fetch_and(!clear, Relaxed);
+            }
+            if woke_writer.get() {
+                SRW_UNPARK_WRITER_HANDOFF
+            } else if woke_reader.get() {
+                SRW_UNPARK_ALLOW_READER
+            } else {
+                DEFAULT_UNPARK_TOKEN
+            }
+        },
+    );
+    // SRW_WAITING_WRITER was set (e.g., from a prior handoff) but no writer remained in the queue;
+    // wake any queued readers now that SRW_WAITING_WRITER has been cleared.
+    if retry_readers.get() {
+        let woke_writer2 = Cell::new(false);
+        let woke_reader2 = Cell::new(false);
+        let has_remaining_writer2 = Cell::new(false);
+        unpark_filter(
+            lock.addr(),
+            |token| {
+                if token == SRW_TOKEN_WRITER {
+                    if woke_writer2.get() || woke_reader2.get() {
+                        has_remaining_writer2.set(true);
+                        FilterOp::Skip
+                    } else {
+                        woke_writer2.set(true);
+                        FilterOp::Unpark
+                    }
+                } else if woke_writer2.get() {
+                    FilterOp::Skip
+                } else {
+                    woke_reader2.set(true);
+                    FilterOp::Unpark
+                }
+            },
+            |res| {
+                let mut clear = 0usize;
+                if !res.have_more_threads {
+                    clear |= SRW_PARKED;
+                    if !woke_writer2.get() {
+                        clear |= SRW_WAITING_WRITER;
+                    }
+                } else if !woke_writer2.get() && !has_remaining_writer2.get() {
+                    clear |= SRW_WAITING_WRITER;
+                }
+                if clear != 0 {
+                    lock.fetch_and(!clear, Relaxed);
+                }
+                if woke_writer2.get() {
+                    SRW_UNPARK_WRITER_HANDOFF
+                } else if woke_reader2.get() {
+                    SRW_UNPARK_ALLOW_READER
+                } else {
+                    DEFAULT_UNPARK_TOKEN
+                }
+            },
+        );
     }
 }
 
@@ -338,10 +549,16 @@ pub unsafe extern "win64" fn TryAcquireSRWLockExclusive(p: *mut c_void) -> BOOLE
 pub unsafe extern "win64" fn AcquireSRWLockExclusive(p: *mut c_void) {
     let l = srw(p);
     let mut spins = 0;
+    let mut owns_waiting_bit = false;
     loop {
         let s = l.load(Relaxed);
         if s & (SRW_WRITER | SRW_READERS_MASK) == 0 {
-            if l.compare_exchange_weak(s, s | SRW_WRITER, Acquire, Relaxed).is_ok() {
+            let next = if owns_waiting_bit && (s & SRW_PARKED == 0) {
+                (s & !SRW_WAITING_WRITER) | SRW_WRITER
+            } else {
+                s | SRW_WRITER
+            };
+            if l.compare_exchange_weak(s, next, Acquire, Relaxed).is_ok() {
                 return;
             }
             continue;
@@ -351,7 +568,10 @@ pub unsafe extern "win64" fn AcquireSRWLockExclusive(p: *mut c_void) {
             std::hint::spin_loop();
             continue;
         }
-        srw_park(l, |s| s & (SRW_WRITER | SRW_READERS_MASK) != 0);
+        if srw_park_writer(l) {
+            owns_waiting_bit = true;
+        }
+        spins = 0;
     }
 }
 
@@ -368,7 +588,7 @@ pub unsafe extern "win64" fn ReleaseSRWLockExclusive(p: *mut c_void) {
 pub unsafe extern "win64" fn TryAcquireSRWLockShared(p: *mut c_void) -> BOOLEAN {
     let l = srw(p);
     let mut s = l.load(Relaxed);
-    while s & SRW_WRITER == 0 {
+    while s & (SRW_WRITER | SRW_WAITING_WRITER) == 0 {
         match l.compare_exchange_weak(s, s + SRW_READER, Acquire, Relaxed) {
             Ok(_) => return 1,
             Err(v) => s = v,
@@ -381,9 +601,15 @@ pub unsafe extern "win64" fn TryAcquireSRWLockShared(p: *mut c_void) -> BOOLEAN 
 pub unsafe extern "win64" fn AcquireSRWLockShared(p: *mut c_void) {
     let l = srw(p);
     let mut spins = 0;
+    let mut allow_bypass = false;
     loop {
+        let block_mask = if allow_bypass {
+            SRW_WRITER
+        } else {
+            SRW_WRITER | SRW_WAITING_WRITER
+        };
         let s = l.load(Relaxed);
-        if s & SRW_WRITER == 0 {
+        if s & block_mask == 0 {
             if l.compare_exchange_weak(s, s + SRW_READER, Acquire, Relaxed).is_ok() {
                 return;
             }
@@ -394,7 +620,8 @@ pub unsafe extern "win64" fn AcquireSRWLockShared(p: *mut c_void) {
             std::hint::spin_loop();
             continue;
         }
-        srw_park(l, |s| s & SRW_WRITER != 0);
+        allow_bypass = srw_park_reader(l, block_mask);
+        spins = 0;
     }
 }
 
@@ -408,14 +635,29 @@ pub unsafe extern "win64" fn ReleaseSRWLockShared(p: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
-// CONDITION_VARIABLE (pointer-sized sequence counter).
+// CONDITION_VARIABLE (pointer-sized):
+//   low 24 bits: active waiter count (0-waiter fast path skips parking_lot_core)
+//   upper bits:  sequence counter
 // ---------------------------------------------------------------------------
 
+const CV_WAITERS_MASK: usize = 0x00FF_FFFF;
+const CV_SEQ_SHIFT: u32 = 24;
+const CV_SEQ_INC: usize = 1usize << CV_SEQ_SHIFT;
+
 unsafe fn cv_wait(cv: *mut c_void, ms: u32, release: impl FnOnce(), reacquire: impl FnOnce()) -> BOOL {
-    let seq = AtomicWord::from_ptr(cv);
-    let s0 = seq.load(Acquire);
+    let word = AtomicWord::from_ptr(cv);
+    let s0 = word.fetch_add(1, SeqCst);
+    let seq0 = s0 >> CV_SEQ_SHIFT;
     release();
-    let r = park(cv as usize, || seq.load(Relaxed) == s0, || {}, |_, _| {}, DEFAULT_PARK_TOKEN, deadline(ms));
+    let r = park(
+        cv as usize,
+        || (word.load(Relaxed) >> CV_SEQ_SHIFT) == seq0,
+        || {},
+        |_, _| {},
+        DEFAULT_PARK_TOKEN,
+        deadline(ms),
+    );
+    word.fetch_sub(1, Release);
     reacquire();
     if let ParkResult::TimedOut = r {
         crate::teb::set_last_error(err::ERROR_TIMEOUT);
@@ -429,18 +671,18 @@ pub unsafe extern "win64" fn InitializeConditionVariable(cv: *mut c_void) {
 }
 
 pub unsafe extern "win64" fn SleepConditionVariableCS(cv: *mut c_void, cs: *mut CriticalSection, ms: u32) -> BOOL {
-    // Windows releases the CS fully (it must be held exactly once).
-    let rec = (*cs).recursion_count.load(Relaxed);
+    // Windows releases the CS fully (and restores recursion count on reacquire).
+    let rec = cs_get_recursion(cs);
     cv_wait(
         cv,
         ms,
         || {
-            (*cs).recursion_count.store(1, Relaxed);
-            LeaveCriticalSection(cs)
+            cs_set_recursion(cs, 1);
+            LeaveCriticalSection(cs);
         },
         || {
             EnterCriticalSection(cs);
-            (*cs).recursion_count.store(rec, Relaxed);
+            cs_set_recursion(cs, rec);
         },
     )
 }
@@ -459,13 +701,25 @@ pub unsafe extern "win64" fn SleepConditionVariableSRW(cv: *mut c_void, lock: *m
 
 #[inline(never)]
 pub unsafe extern "win64" fn WakeConditionVariable(cv: *mut c_void) {
-    AtomicWord::from_ptr(cv).fetch_add(1, Release);
+    // Pair with waiter's `fetch_add(1, SeqCst)` even when caller wrote predicate
+    // without a SeqCst barrier.
+    std::sync::atomic::fence(SeqCst);
+    let w = AtomicWord::from_ptr(cv);
+    if (w.load(Acquire) & CV_WAITERS_MASK) == 0 {
+        return;
+    }
+    w.fetch_add(CV_SEQ_INC, Release);
     unpark_one(cv as usize, |_| DEFAULT_UNPARK_TOKEN);
 }
 
 #[inline(never)]
 pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut c_void) {
-    AtomicWord::from_ptr(cv).fetch_add(1, Release);
+    std::sync::atomic::fence(SeqCst);
+    let w = AtomicWord::from_ptr(cv);
+    if (w.load(Acquire) & CV_WAITERS_MASK) == 0 {
+        return;
+    }
+    w.fetch_add(CV_SEQ_INC, Release);
     unpark_all(cv as usize, DEFAULT_UNPARK_TOKEN);
 }
 
@@ -637,10 +891,9 @@ pub unsafe extern "win64" fn WakeByAddressAll(addr: *mut c_void) {
 // ---------------------------------------------------------------------------
 // Interlocked SLIST (x64 SLIST_HEADER, 16 bytes):
 //   low u64: Depth:16 | Sequence:48     high u64: Reserved:4 | NextEntry:60 (ptr >> 4)
-// Implemented with a global lock (layout-faithful, not lock-free).
+// Lock-free 128-bit CAS on 16-byte-aligned headers on aarch64 (caspal / ldaxp+stlxp);
+// sharded fallback lock for unaligned headers or non-aarch64 hosts.
 // ---------------------------------------------------------------------------
-
-static SLIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[repr(C, align(16))]
 pub struct SListHeader {
@@ -648,67 +901,236 @@ pub struct SListHeader {
     hi: u64,
 }
 
-impl SListHeader {
-    fn depth(&self) -> u16 {
-        self.lo as u16
+#[inline(always)]
+fn slist_depth(lo: u64) -> u16 {
+    lo as u16
+}
+#[inline(always)]
+fn slist_seq(lo: u64) -> u64 {
+    lo >> 16
+}
+#[inline(always)]
+fn slist_next(hi: u64) -> *mut *mut c_void {
+    ((hi >> 4) << 4) as *mut *mut c_void
+}
+#[inline(always)]
+fn slist_pack(next: *mut *mut c_void, depth: u16, seq: u64) -> (u64, u64) {
+    (depth as u64 | (seq << 16), (next as u64 >> 4) << 4)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[inline]
+unsafe fn cas128(ptr: *mut u64, mut exp_lo: u64, mut exp_hi: u64, new_lo: u64, new_hi: u64) -> Result<(), (u64, u64)> {
+    let orig_lo = exp_lo;
+    let orig_hi = exp_hi;
+    std::arch::asm!(
+        "caspal x0, x1, x2, x3, [{ptr}]",
+        ptr = in(reg) ptr,
+        inout("x0") exp_lo,
+        inout("x1") exp_hi,
+        in("x2") new_lo,
+        in("x3") new_hi,
+        options(nostack, preserves_flags),
+    );
+    if exp_lo == orig_lo && exp_hi == orig_hi {
+        Ok(())
+    } else {
+        Err((exp_lo, exp_hi))
     }
-    fn seq(&self) -> u64 {
-        self.lo >> 16
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_feature = "lse")))]
+#[inline]
+unsafe fn cas128(ptr: *mut u64, exp_lo: u64, exp_hi: u64, new_lo: u64, new_hi: u64) -> Result<(), (u64, u64)> {
+    let cur_lo: u64;
+    let cur_hi: u64;
+    std::arch::asm!(
+        "1:",
+        "ldaxp {cur_lo}, {cur_hi}, [{ptr}]",
+        "cmp {cur_lo}, {exp_lo}",
+        "ccmp {cur_hi}, {exp_hi}, #0, eq",
+        "b.ne 2f",
+        "stlxp {status:w}, {new_lo}, {new_hi}, [{ptr}]",
+        "cbnz {status:w}, 1b",
+        "b 3f",
+        "2:",
+        "clrex",
+        "3:",
+        ptr = in(reg) ptr,
+        exp_lo = in(reg) exp_lo,
+        exp_hi = in(reg) exp_hi,
+        new_lo = in(reg) new_lo,
+        new_hi = in(reg) new_hi,
+        cur_lo = out(reg) cur_lo,
+        cur_hi = out(reg) cur_hi,
+        status = out(reg) _,
+        options(nostack),
+    );
+    if cur_lo == exp_lo && cur_hi == exp_hi {
+        Ok(())
+    } else {
+        Err((cur_lo, cur_hi))
     }
-    fn next(&self) -> *mut *mut c_void {
-        ((self.hi >> 4) << 4) as *mut *mut c_void
-    }
-    fn set(&mut self, next: *mut *mut c_void, depth: u16, seq: u64) {
-        self.lo = depth as u64 | (seq << 16);
-        self.hi = (next as u64 >> 4) << 4;
-    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn load128_acquire(h: *const SListHeader) -> (u64, u64) {
+    let p = h as *const AtomicU64;
+    let hi = (*p.add(1)).load(Acquire);
+    let lo = (*p).load(Acquire);
+    (lo, hi)
+}
+
+#[inline]
+unsafe fn read_slist_unaligned(h: *const SListHeader) -> (u64, u64) {
+    let p = h as *const u64;
+    (std::ptr::read_unaligned(p), std::ptr::read_unaligned(p.add(1)))
+}
+
+#[inline]
+unsafe fn write_slist_unaligned(h: *mut SListHeader, lo: u64, hi: u64) {
+    let p = h as *mut u64;
+    std::ptr::write_unaligned(p, lo);
+    std::ptr::write_unaligned(p.add(1), hi);
 }
 
 pub unsafe extern "win64" fn InitializeSListHead(h: *mut SListHeader) {
-    (*h).lo = 0;
-    (*h).hi = 0;
+    if (h as usize) & 15 == 0 {
+        let p = h as *const AtomicU64;
+        (*p).store(0, Release);
+        (*p.add(1)).store(0, Release);
+    } else {
+        let _g = unaligned_lock(h as usize);
+        write_slist_unaligned(h, 0, 0);
+    }
 }
 
 pub unsafe extern "win64" fn InterlockedPushEntrySList(h: *mut SListHeader, e: *mut *mut c_void) -> *mut c_void {
-    let _g = SLIST_LOCK.lock().unwrap();
-    let old = (*h).next();
-    *e = old as *mut c_void;
-    let (d, s) = ((*h).depth(), (*h).seq());
-    (*h).set(e, d.wrapping_add(1), s.wrapping_add(1));
+    #[cfg(target_arch = "aarch64")]
+    if (h as usize) & 15 == 0 {
+        let (mut lo, mut hi) = load128_acquire(h);
+        loop {
+            let old = slist_next(hi);
+            std::ptr::write_unaligned(e, old as *mut c_void);
+            let (new_lo, new_hi) = slist_pack(e, slist_depth(lo).wrapping_add(1), slist_seq(lo).wrapping_add(1));
+            match cas128(h as *mut u64, lo, hi, new_lo, new_hi) {
+                Ok(()) => return old as *mut c_void,
+                Err((c_lo, c_hi)) => {
+                    lo = c_lo;
+                    hi = c_hi;
+                }
+            }
+        }
+    }
+    let _g = unaligned_lock(h as usize);
+    let (lo, hi) = read_slist_unaligned(h);
+    let old = slist_next(hi);
+    std::ptr::write_unaligned(e, old as *mut c_void);
+    let (new_lo, new_hi) = slist_pack(e, slist_depth(lo).wrapping_add(1), slist_seq(lo).wrapping_add(1));
+    write_slist_unaligned(h, new_lo, new_hi);
     old as *mut c_void
 }
 
-pub unsafe extern "win64" fn InterlockedPushListSListEx(h: *mut SListHeader, first: *mut *mut c_void, last: *mut *mut c_void, count: u32) -> *mut c_void {
-    let _g = SLIST_LOCK.lock().unwrap();
-    let old = (*h).next();
-    *last = old as *mut c_void;
-    let (d, s) = ((*h).depth(), (*h).seq());
-    (*h).set(first, d.wrapping_add(count as u16), s.wrapping_add(1));
+pub unsafe extern "win64" fn InterlockedPushListSListEx(
+    h: *mut SListHeader,
+    first: *mut *mut c_void,
+    last: *mut *mut c_void,
+    count: u32,
+) -> *mut c_void {
+    #[cfg(target_arch = "aarch64")]
+    if (h as usize) & 15 == 0 {
+        let (mut lo, mut hi) = load128_acquire(h);
+        loop {
+            let old = slist_next(hi);
+            std::ptr::write_unaligned(last, old as *mut c_void);
+            let (new_lo, new_hi) =
+                slist_pack(first, slist_depth(lo).wrapping_add(count as u16), slist_seq(lo).wrapping_add(1));
+            match cas128(h as *mut u64, lo, hi, new_lo, new_hi) {
+                Ok(()) => return old as *mut c_void,
+                Err((c_lo, c_hi)) => {
+                    lo = c_lo;
+                    hi = c_hi;
+                }
+            }
+        }
+    }
+    let _g = unaligned_lock(h as usize);
+    let (lo, hi) = read_slist_unaligned(h);
+    let old = slist_next(hi);
+    std::ptr::write_unaligned(last, old as *mut c_void);
+    let (new_lo, new_hi) =
+        slist_pack(first, slist_depth(lo).wrapping_add(count as u16), slist_seq(lo).wrapping_add(1));
+    write_slist_unaligned(h, new_lo, new_hi);
     old as *mut c_void
 }
 
 pub unsafe extern "win64" fn InterlockedPopEntrySList(h: *mut SListHeader) -> *mut c_void {
-    let _g = SLIST_LOCK.lock().unwrap();
-    let first = (*h).next();
+    #[cfg(target_arch = "aarch64")]
+    if (h as usize) & 15 == 0 {
+        let (mut lo, mut hi) = load128_acquire(h);
+        loop {
+            let first = slist_next(hi);
+            if first.is_null() {
+                return std::ptr::null_mut();
+            }
+            let next = std::ptr::read_unaligned(first) as *mut *mut c_void;
+            let (new_lo, new_hi) = slist_pack(next, slist_depth(lo).wrapping_sub(1), slist_seq(lo).wrapping_add(1));
+            match cas128(h as *mut u64, lo, hi, new_lo, new_hi) {
+                Ok(()) => return first as *mut c_void,
+                Err((c_lo, c_hi)) => {
+                    lo = c_lo;
+                    hi = c_hi;
+                }
+            }
+        }
+    }
+    let _g = unaligned_lock(h as usize);
+    let (lo, hi) = read_slist_unaligned(h);
+    let first = slist_next(hi);
     if first.is_null() {
         return std::ptr::null_mut();
     }
-    let next = *first as *mut *mut c_void;
-    let (d, s) = ((*h).depth(), (*h).seq());
-    (*h).set(next, d.wrapping_sub(1), s.wrapping_add(1));
+    let next = std::ptr::read_unaligned(first) as *mut *mut c_void;
+    let (new_lo, new_hi) = slist_pack(next, slist_depth(lo).wrapping_sub(1), slist_seq(lo).wrapping_add(1));
+    write_slist_unaligned(h, new_lo, new_hi);
     first as *mut c_void
 }
 
 pub unsafe extern "win64" fn InterlockedFlushSList(h: *mut SListHeader) -> *mut c_void {
-    let _g = SLIST_LOCK.lock().unwrap();
-    let first = (*h).next();
-    let s = (*h).seq();
-    (*h).set(std::ptr::null_mut(), 0, s.wrapping_add(1));
+    #[cfg(target_arch = "aarch64")]
+    if (h as usize) & 15 == 0 {
+        let (mut lo, mut hi) = load128_acquire(h);
+        loop {
+            let first = slist_next(hi);
+            if first.is_null() {
+                return std::ptr::null_mut();
+            }
+            let (new_lo, new_hi) = slist_pack(std::ptr::null_mut(), 0, slist_seq(lo).wrapping_add(1));
+            match cas128(h as *mut u64, lo, hi, new_lo, new_hi) {
+                Ok(()) => return first as *mut c_void,
+                Err((c_lo, c_hi)) => {
+                    lo = c_lo;
+                    hi = c_hi;
+                }
+            }
+        }
+    }
+    let _g = unaligned_lock(h as usize);
+    let (lo, hi) = read_slist_unaligned(h);
+    let first = slist_next(hi);
+    let (new_lo, new_hi) = slist_pack(std::ptr::null_mut(), 0, slist_seq(lo).wrapping_add(1));
+    write_slist_unaligned(h, new_lo, new_hi);
     first as *mut c_void
 }
 
 pub unsafe extern "win64" fn QueryDepthSList(h: *mut SListHeader) -> u16 {
-    (*h).depth()
+    if (h as usize) & 15 == 0 {
+        slist_depth((*(h as *const AtomicU64)).load(Acquire))
+    } else {
+        let _g = unaligned_lock(h as usize);
+        slist_depth(read_slist_unaligned(h).0)
+    }
 }
 
 #[cfg(test)]
@@ -828,6 +1250,220 @@ mod tests {
             assert_eq!(InterlockedPopEntrySList(&mut h), &mut b as *mut E as *mut c_void);
             assert_eq!(InterlockedPopEntrySList(&mut h), &mut a as *mut E as *mut c_void);
             assert!(InterlockedPopEntrySList(&mut h).is_null());
+        }
+    }
+
+    #[test]
+    fn unaligned_critical_section_mutual_exclusion() {
+        #[repr(align(16))]
+        struct Buf([u8; 64]);
+        struct Shared(std::cell::UnsafeCell<(Buf, Buf, u64, u32)>);
+        unsafe impl Sync for Shared {}
+        unsafe impl Send for Shared {}
+
+        let s = Arc::new(Shared(std::cell::UnsafeCell::new((Buf([0; 64]), Buf([0; 64]), 0, 0))));
+        unsafe {
+            let p = s.0.get();
+            let cs = (*p).0.0.as_mut_ptr().add(1) as *mut CriticalSection;
+            assert_ne!((cs as usize) & 7, 0);
+            InitializeCriticalSection(cs);
+            let cv = (*p).1.0.as_mut_ptr().add(3) as *mut c_void;
+            assert_ne!((cv as usize) & 7, 0);
+            InitializeConditionVariable(cv);
+        }
+
+        // 1. Multi-threaded mutual exclusion + recursion on unaligned CRITICAL_SECTION.
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || unsafe {
+                    let p = s.0.get();
+                    let cs = (*p).0.0.as_mut_ptr().add(1) as *mut CriticalSection;
+                    let tid = crate::teb::thread_id() as usize;
+                    for _ in 0..4_000 {
+                        EnterCriticalSection(cs);
+                        assert!(is_cs_locked_by_thread(cs, tid));
+                        assert_eq!(TryEnterCriticalSection(cs), TRUE); // recursive
+                        let v = (*p).2;
+                        std::hint::spin_loop();
+                        (*p).2 = v + 1;
+                        LeaveCriticalSection(cs);
+                        LeaveCriticalSection(cs);
+                    }
+                    crate::teb::uninstall();
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(unsafe { (*s.0.get()).2 }, 32_000);
+
+        // 2. SleepConditionVariableCS with recursive unaligned CS + unaligned CV.
+        let s2 = s.clone();
+        let waiter = std::thread::spawn(move || unsafe {
+            let p = s2.0.get();
+            let cs = (*p).0.0.as_mut_ptr().add(1) as *mut CriticalSection;
+            let cv = (*p).1.0.as_mut_ptr().add(3) as *mut c_void;
+            EnterCriticalSection(cs);
+            EnterCriticalSection(cs); // recursion depth = 2
+            while (*p).3 == 0 {
+                assert_eq!(SleepConditionVariableCS(cv, cs, INFINITE), TRUE);
+            }
+            assert_eq!(cs_get_recursion(cs), 2);
+            LeaveCriticalSection(cs);
+            LeaveCriticalSection(cs);
+            crate::teb::uninstall();
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        unsafe {
+            let p = s.0.get();
+            let cs = (*p).0.0.as_mut_ptr().add(1) as *mut CriticalSection;
+            let cv = (*p).1.0.as_mut_ptr().add(3) as *mut c_void;
+            EnterCriticalSection(cs);
+            (*p).3 = 1;
+            LeaveCriticalSection(cs);
+            WakeConditionVariable(cv);
+        }
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn srw_writer_priority_and_clean_state() {
+        use std::sync::atomic::AtomicBool;
+        let lock = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+
+        // Continuous readers holding overlapping shared locks.
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let l = lock.clone();
+                let st = stop.clone();
+                std::thread::spawn(move || unsafe {
+                    let p = &*l as *const AtomicUsize as *mut c_void;
+                    while !st.load(Relaxed) {
+                        AcquireSRWLockShared(p);
+                        std::thread::sleep(Duration::from_micros(200));
+                        ReleaseSRWLockShared(p);
+                    }
+                    crate::teb::uninstall();
+                })
+            })
+            .collect();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let l_w = lock.clone();
+        let wd = writer_done.clone();
+        let writer = std::thread::spawn(move || unsafe {
+            let p = &*l_w as *const AtomicUsize as *mut c_void;
+            for _ in 0..20 {
+                AcquireSRWLockExclusive(p);
+                ReleaseSRWLockExclusive(p);
+            }
+            wd.store(true, Release);
+            crate::teb::uninstall();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writer_done.load(Acquire) {
+            assert!(Instant::now() < deadline, "SRWLock writer starved by continuous readers");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Release);
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(lock.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn cv_zero_waiter_wake_fast_path() {
+        let mut cv: usize = 0;
+        let p = &mut cv as *mut usize as *mut c_void;
+        unsafe {
+            InitializeConditionVariable(p);
+            // Zero-waiter wakes must be a no-op without modifying the CV word.
+            WakeConditionVariable(p);
+            WakeAllConditionVariable(p);
+            assert_eq!(cv, 0);
+        }
+    }
+
+    #[test]
+    fn slist_concurrent_push_pop_and_unaligned() {
+        #[repr(C, align(16))]
+        struct Node {
+            _next: *mut c_void,
+            _tag: usize,
+        }
+        struct SharedHeader(std::cell::UnsafeCell<SListHeader>);
+        unsafe impl Sync for SharedHeader {}
+        unsafe impl Send for SharedHeader {}
+
+        let hdr = Arc::new(SharedHeader(std::cell::UnsafeCell::new(SListHeader { lo: 0, hi: 0 })));
+        unsafe { InitializeSListHead(hdr.0.get()) };
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 512;
+        let popped = Arc::new(AtomicUsize::new(0));
+        // Keep all nodes alive until every thread finishes to avoid ABA use-after-free.
+        let mut pools: Vec<Box<[Node]>> = (0..THREADS)
+            .map(|t| {
+                (0..PER_THREAD)
+                    .map(|i| Node { _next: std::ptr::null_mut(), _tag: t * PER_THREAD + i })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect();
+        let raw_pools: Vec<usize> = pools.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+
+        let hs: Vec<_> = raw_pools
+            .into_iter()
+            .map(|base| {
+                let hdr = hdr.clone();
+                let popped = popped.clone();
+                std::thread::spawn(move || unsafe {
+                    let h = hdr.0.get();
+                    let nodes = base as *mut Node;
+                    for i in 0..PER_THREAD {
+                        let n = nodes.add(i);
+                        InterlockedPushEntrySList(h, n as *mut *mut c_void);
+                        if i % 2 == 1 && !InterlockedPopEntrySList(h).is_null() {
+                            popped.fetch_add(1, Relaxed);
+                        }
+                    }
+                    while !InterlockedPopEntrySList(h).is_null() {
+                        popped.fetch_add(1, Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(popped.load(Acquire), THREADS * PER_THREAD);
+        assert_eq!(unsafe { QueryDepthSList(hdr.0.get()) }, 0);
+        assert!(unsafe { InterlockedPopEntrySList(hdr.0.get()) }.is_null());
+        drop(pools);
+
+        // Unaligned SListHeader fallback path.
+        #[repr(align(16))]
+        struct Raw([u8; 32]);
+        let mut raw = Raw([0u8; 32]);
+        unsafe {
+            let uh = raw.0.as_mut_ptr().add(1) as *mut SListHeader;
+            assert_ne!((uh as usize) & 15, 0);
+            InitializeSListHead(uh);
+            let mut a = Node { _next: std::ptr::null_mut(), _tag: 1 };
+            let mut b = Node { _next: std::ptr::null_mut(), _tag: 2 };
+            InterlockedPushEntrySList(uh, &mut a as *mut Node as _);
+            InterlockedPushEntrySList(uh, &mut b as *mut Node as _);
+            assert_eq!(QueryDepthSList(uh), 2);
+            assert_eq!(InterlockedPopEntrySList(uh), &mut b as *mut Node as *mut c_void);
+            assert_eq!(InterlockedFlushSList(uh), &mut a as *mut Node as *mut c_void);
+            assert_eq!(QueryDepthSList(uh), 0);
         }
     }
 }

@@ -860,11 +860,12 @@ fn watchdog_loop() {
     let base_stall_ns = cfg().stall_threshold_ns;
     let mut watched_frame = u32::MAX;
     let mut next_threshold_ns = base_stall_ns;
+    let idle_sleep = Duration::from_nanos((base_stall_ns / 2).clamp(100_000_000, 500_000_000));
 
     loop {
-        std::thread::sleep(Duration::from_millis(50));
         let last_ns = LAST_PRESENT_NS.load(Ordering::Relaxed);
         if last_ns == 0 {
+            std::thread::sleep(idle_sleep);
             continue;
         }
         let frame = CURRENT_FRAME.load(Ordering::Relaxed);
@@ -875,6 +876,11 @@ fn watchdog_loop() {
         let now = now_ns();
         let elapsed_ns = now.saturating_sub(last_ns);
         if elapsed_ns < next_threshold_ns {
+            let remaining = next_threshold_ns - elapsed_ns;
+            // Sleep until the current threshold could fire, capped at `base_stall_ns`
+            // so a new frame stalling right after wake is still detected promptly.
+            let sleep_ns = remaining.min(base_stall_ns).max(50_000_000);
+            std::thread::sleep(Duration::from_nanos(sleep_ns));
             continue;
         }
         report_live_stall(frame, elapsed_ns, now);

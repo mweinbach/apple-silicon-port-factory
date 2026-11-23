@@ -429,7 +429,7 @@ impl OutputStream {
                 .name("wwise-audio-pump".into())
                 .spawn(move || {
                     while !s.quit.load(Ordering::Acquire) {
-                        if s.sema.wait_ms(20) && s.started.load(Ordering::Acquire) {
+                        if s.sema.wait() && !s.quit.load(Ordering::Acquire) && s.started.load(Ordering::Acquire) {
                             s.signal_event();
                         }
                     }
@@ -521,18 +521,12 @@ impl Drop for OutputStream {
 // CoreFoundation / libdispatch involved).
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-struct MachTimespec {
-    tv_sec: u32,
-    tv_nsec: i32,
-}
-
 extern "C" {
     static mach_task_self_: u32;
     fn semaphore_create(task: u32, sem: *mut u32, policy: i32, value: i32) -> i32;
     fn semaphore_destroy(task: u32, sem: u32) -> i32;
     fn semaphore_signal(sem: u32) -> i32;
-    fn semaphore_timedwait(sem: u32, wait: MachTimespec) -> i32;
+    fn semaphore_wait(sem: u32) -> i32;
 }
 
 struct Semaphore(u32);
@@ -548,10 +542,9 @@ impl Semaphore {
     fn signal(&self) {
         unsafe { semaphore_signal(self.0) };
     }
-    /// True if signalled, false on timeout (or interruption).
-    fn wait_ms(&self, ms: u32) -> bool {
-        let t = MachTimespec { tv_sec: ms / 1000, tv_nsec: ((ms % 1000) * 1_000_000) as i32 };
-        unsafe { semaphore_timedwait(self.0, t) == 0 }
+    /// Block until signalled (returns false on interruption/abort).
+    fn wait(&self) -> bool {
+        unsafe { semaphore_wait(self.0) == 0 }
     }
 }
 

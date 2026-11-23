@@ -180,19 +180,19 @@ unsafe fn deliver_to(cb: usize, n: &Note) {
 /// Call every registered client (each AddRef'd for the duration, so an
 /// `UnregisterEndpointNotificationCallback` from inside a callback is safe).
 fn deliver(n: &Note) {
-    type Unk = unsafe extern "win64" fn(usize) -> u32;
-    let clients: Vec<usize> = {
-        let g = NOTIFY_CLIENTS.lock().unwrap();
-        for &c in g.iter() {
-            unsafe { std::mem::transmute::<usize, Unk>(slot(c, 1))(c) };
+    // Snapshot and release NOTIFY_CLIENTS before invoking any guest COM methods
+    // (AddRef / On* / Release), preventing lock inversion if guest code re-enters.
+    let clients: Vec<usize> = NOTIFY_CLIENTS.lock().unwrap().clone();
+    for &c in &clients {
+        unsafe {
+            crate::call_guest8(slot(c, 1), c as u64, 0, 0, 0, 0, 0, 0, 0);
         }
-        g.clone()
-    };
+    }
     log::info!(target: "audio", "IMMNotificationClient x{}: {n:?}", clients.len());
     for c in clients {
         unsafe {
             deliver_to(c, n);
-            std::mem::transmute::<usize, Unk>(slot(c, 2))(c);
+            crate::call_guest8(slot(c, 2), c as u64, 0, 0, 0, 0, 0, 0, 0);
         }
     }
 }

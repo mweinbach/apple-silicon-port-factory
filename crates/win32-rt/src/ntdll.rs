@@ -456,10 +456,51 @@ pub unsafe extern "win64" fn NtQueryTimerResolution(min: *mut u32, max: *mut u32
     STATUS_SUCCESS
 }
 
+/// Convert an NT `PLARGE_INTEGER` timeout/interval (100ns units; negative = relative,
+/// positive = absolute UTC FILETIME, null = infinite) into an `Option<Duration>`.
+/// Preserves sub-millisecond non-zero intervals (minimum 1 µs) so callers do not
+/// silently truncate short relative waits to 0 ms.
+unsafe fn nt_timeout_to_duration(timeout: *const i64) -> Option<std::time::Duration> {
+    if timeout.is_null() {
+        return None;
+    }
+    let v = std::ptr::read_unaligned(timeout);
+    if v == 0 {
+        return Some(std::time::Duration::ZERO);
+    }
+    if v < 0 {
+        let nanos = v.unsigned_abs().saturating_mul(100).max(1_000);
+        Some(std::time::Duration::from_nanos(nanos))
+    } else {
+        let now = now_filetime() as i64;
+        if v <= now {
+            Some(std::time::Duration::ZERO)
+        } else {
+            let delta_100ns = (v - now) as u64;
+            let nanos = delta_100ns.saturating_mul(100).max(1_000);
+            Some(std::time::Duration::from_nanos(nanos))
+        }
+    }
+}
+
 pub unsafe extern "win64" fn NtDelayExecution(alertable: u8, interval: *const i64) -> NTSTATUS {
-    let v = *interval;
-    let ms = if v < 0 { ((-v) / 10_000) as u32 } else { ((v - now_filetime() as i64).max(0) / 10_000) as u32 };
-    crate::kernel32::time::SleepEx(ms, alertable as BOOL);
+    if interval.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let dur = nt_timeout_to_duration(interval);
+    if alertable != 0 {
+        if crate::handles::alertable_sleep_duration(dur) {
+            return 0x0000_00C0; // STATUS_USER_APC
+        }
+        return STATUS_SUCCESS;
+    }
+    match dur {
+        None => loop {
+            std::thread::park();
+        },
+        Some(d) if d.is_zero() => std::thread::yield_now(),
+        Some(d) => std::thread::sleep(d),
+    }
     STATUS_SUCCESS
 }
 
@@ -577,8 +618,7 @@ pub unsafe extern "win64" fn RtlIsCriticalSectionLockedByThread(cs: *const crate
     if cs.is_null() {
         return 0;
     }
-    let tid = teb::thread_id() as usize;
-    ((*cs).owning_thread.load(std::sync::atomic::Ordering::Relaxed) == tid) as u32
+    crate::sync::is_cs_locked_by_thread(cs, teb::thread_id() as usize) as u32
 }
 pub unsafe extern "win64" fn RtlAcquireSRWLockExclusive(p: *mut c_void) {
     crate::sync::AcquireSRWLockExclusive(p)
@@ -1774,22 +1814,38 @@ pub unsafe extern "win64" fn NtWaitForSingleObject(
     alertable: u8,
     timeout: *const i64,
 ) -> NTSTATUS {
-    let ms = if timeout.is_null() {
-        u32::MAX
-    } else {
-        let t = std::ptr::read_unaligned(timeout);
-        if t < 0 {
-            ((-t) / 10_000).min(u32::MAX as i64 - 1) as u32
-        } else {
-            0
+    let dur = nt_timeout_to_duration(timeout);
+    if handle == crate::handles::CURRENT_PROCESS {
+        if alertable != 0 {
+            if crate::handles::alertable_sleep_duration(dur) {
+                return 0x0000_00C0; // STATUS_USER_APC
+            }
+            return 0x0000_0102; // STATUS_TIMEOUT
         }
+        match dur {
+            None => loop {
+                std::thread::park();
+            },
+            Some(d) if d.is_zero() => {}
+            Some(d) => std::thread::sleep(d),
+        }
+        return 0x0000_0102; // STATUS_TIMEOUT
+    }
+    let Some(obj) = crate::handles::get(handle) else {
+        return STATUS_INVALID_HANDLE;
     };
-    let r = crate::kernel32::threads::WaitForSingleObjectEx(handle, ms, (alertable != 0) as BOOL);
+    let r = crate::handles::wait_for_duration(
+        std::slice::from_ref(&obj),
+        false,
+        dur,
+        alertable != 0,
+    );
     match r {
-        WAIT_OBJECT_0 => STATUS_SUCCESS,
-        WAIT_TIMEOUT => 0x0000_0102,
-        WAIT_IO_COMPLETION => 0x0000_00C0,
-        _ => STATUS_INVALID_HANDLE,
+        crate::handles::WaitResult::Object(_) => STATUS_SUCCESS,
+        crate::handles::WaitResult::Abandoned(_) => 0x0000_0080, // STATUS_ABANDONED_WAIT_0
+        crate::handles::WaitResult::Timeout => 0x0000_0102,      // STATUS_TIMEOUT
+        crate::handles::WaitResult::IoCompletion => 0x0000_00C0, // STATUS_USER_APC
+        crate::handles::WaitResult::Failed(_) => STATUS_INVALID_HANDLE,
     }
 }
 
@@ -2140,6 +2196,101 @@ mod tests {
             crate::kernel32::threads::CloseHandle(mh);
             crate::kernel32::threads::CloseHandle(fh);
             let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    #[test]
+    fn nt_delay_execution_sub_ms_and_wait_syscall_status() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        unsafe {
+            assert_eq!(NtDelayExecution(0, std::ptr::null()), STATUS_INVALID_PARAMETER);
+
+            // Sub-millisecond non-zero relative interval (-5000 * 100ns = 500 us) must sleep instead of truncating to 0.
+            let sub_ms: i64 = -5_000;
+            let t0 = Instant::now();
+            assert_eq!(NtDelayExecution(0, &sub_ms), STATUS_SUCCESS);
+            assert!(t0.elapsed() >= Duration::from_micros(100), "sub-ms NtDelayExecution truncated to 0");
+
+            // Positive absolute FILETIME timeout on NtWaitForSingleObject (~15 ms in the future).
+            let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+            let abs_deadline = (now_filetime() as i64) + 150_000;
+            let t1 = Instant::now();
+            let st_abs = NtWaitForSingleObject(ev, 0, &abs_deadline);
+            assert_eq!(st_abs, 0x0000_0102); // STATUS_TIMEOUT
+            assert!(t1.elapsed() >= Duration::from_millis(5));
+
+            // Direct ntsyscall NT_WAIT_FOR_SINGLE_OBJECT maps statuses cleanly.
+            let zero: i64 = 0;
+            let st_to = crate::ntsyscall::dispatch_nt_syscall(
+                crate::ntsyscall::ssn::NT_WAIT_FOR_SINGLE_OBJECT,
+                ev as u64,
+                0,
+                &zero as *const i64 as u64,
+                0,
+                0,
+            );
+            assert_eq!(st_to, 0x0000_0102);
+
+            assert_eq!(crate::kernel32::threads::SetEvent(ev), TRUE);
+            let st_ok = crate::ntsyscall::dispatch_nt_syscall(
+                crate::ntsyscall::ssn::NT_WAIT_FOR_SINGLE_OBJECT,
+                ev as u64,
+                0,
+                &zero as *const i64 as u64,
+                0,
+                0,
+            );
+            assert_eq!(st_ok, STATUS_SUCCESS);
+
+            let st_bad = crate::ntsyscall::dispatch_nt_syscall(
+                crate::ntsyscall::ssn::NT_WAIT_FOR_SINGLE_OBJECT,
+                0xDEAD_BEEFu64,
+                0,
+                &zero as *const i64 as u64,
+                0,
+                0,
+            );
+            assert_eq!(st_bad, STATUS_INVALID_HANDLE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+
+            // Direct ntsyscall NT_WAIT_FOR_SINGLE_OBJECT honors alertable=1 -> STATUS_USER_APC (0xC0).
+            unsafe extern "win64" fn apc_cb(param: usize) {
+                (*(param as *const AtomicBool)).store(true, Ordering::Release);
+            }
+            let apc_ran = std::sync::Arc::new(AtomicBool::new(false));
+            let apc_flag = apc_ran.clone();
+            let thr = crate::thread::spawn(
+                Box::new(move || {
+                    let ev2 = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+                    let cur = crate::thread::current_thread_object().unwrap();
+                    crate::thread::queue_apc(&cur, apc_cb, std::sync::Arc::as_ptr(&apc_flag) as usize);
+                    let wait_50ms: i64 = -500_000;
+                    let st = crate::ntsyscall::dispatch_nt_syscall(
+                        crate::ntsyscall::ssn::NT_WAIT_FOR_SINGLE_OBJECT,
+                        ev2 as u64,
+                        1, // alertable
+                        &wait_50ms as *const i64 as u64,
+                        0,
+                        0,
+                    );
+                    assert_eq!(crate::kernel32::threads::CloseHandle(ev2), TRUE);
+                    st as u32
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn alertable ntsyscall test thread");
+            let th = crate::handles::insert(thr);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(th, 5_000), WAIT_OBJECT_0);
+            let mut exit_st = 0u32;
+            assert_eq!(crate::kernel32::threads::GetExitCodeThread(th, &mut exit_st), TRUE);
+            assert_eq!(exit_st, 0x0000_00C0); // STATUS_USER_APC
+            assert!(apc_ran.load(Ordering::Acquire));
+            assert_eq!(crate::kernel32::threads::CloseHandle(th), TRUE);
         }
     }
 }

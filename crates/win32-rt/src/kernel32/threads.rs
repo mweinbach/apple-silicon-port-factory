@@ -418,7 +418,11 @@ pub unsafe extern "win64" fn FlsSetValue(i: u32, v: *mut c_void) -> BOOL {
 
 enum FiberCmd {
     Idle,
-    Resume { teb: *mut u8 },
+    Resume {
+        teb: *mut u8,
+        thread_obj: Option<Arc<ThreadObj>>,
+        caller: Option<(Arc<FiberSync>, usize)>,
+    },
     Exit,
 }
 
@@ -462,6 +466,9 @@ struct Fiber {
     pthread: Option<libc::pthread_t>,
     stack_base: usize,
     stack_limit: usize,
+    /// Most recent fiber that switched into this one, so returning from a fiber
+    /// start routine cleanly resumes the caller instead of deadlocking.
+    last_caller: Option<(Arc<FiberSync>, usize)>,
 }
 
 struct FiberStart {
@@ -474,15 +481,56 @@ extern "C" fn fiber_thread_main(arg: *mut c_void) -> *mut c_void {
     let start_info = unsafe { Box::from_raw(arg as *mut FiberStart) };
     match start_info.sync.wait() {
         FiberCmd::Exit | FiberCmd::Idle => return std::ptr::null_mut(),
-        FiberCmd::Resume { teb } => unsafe {
+        FiberCmd::Resume { teb, thread_obj, caller } => unsafe {
             let me = libc::pthread_self();
             let hi = libc::pthread_get_stackaddr_np(me) as usize;
             let lo = hi.saturating_sub(libc::pthread_get_stacksize_np(me));
-            teb::set_field(teb, teb::off::STACK_BASE, hi);
-            teb::set_field(teb, teb::off::STACK_LIMIT, lo);
-            teb::install(teb);
+            if !teb.is_null() {
+                teb::set_field(teb, teb::off::STACK_BASE, hi);
+                teb::set_field(teb, teb::off::STACK_LIMIT, lo);
+                let my_fiber = teb::field::<usize>(teb, teb::off::FIBER_DATA) as *mut Fiber;
+                if !my_fiber.is_null() {
+                    (*my_fiber).stack_base = hi;
+                    (*my_fiber).stack_limit = lo;
+                    (*my_fiber).last_caller = caller;
+                }
+                teb::install(teb);
+            }
+            thread::install_current_thread_context(thread_obj);
             let _ = crate::call_guest8(start_info.start, start_info.param as u64, 0, 0, 0, 0, 0, 0, 0);
-            teb::uninstall();
+            // Fiber start routine returned without calling `SwitchToFiber`:
+            // hand TEB + ThreadObj back to the most recent caller fiber so it
+            // resumes cleanly instead of deadlocking.
+            let cur_teb = teb::current_raw();
+            let cur_obj = thread::take_current_thread_context();
+            let cur_fiber = if cur_teb.is_null() {
+                std::ptr::null_mut()
+            } else {
+                teb::field::<usize>(cur_teb, teb::off::FIBER_DATA) as *mut Fiber
+            };
+            let resume_caller = if !cur_fiber.is_null() {
+                (*cur_fiber).last_caller.take()
+            } else {
+                None
+            };
+            if let Some((caller_sync, caller_ptr)) = resume_caller {
+                if !cur_teb.is_null() {
+                    let cp = caller_ptr as *mut Fiber;
+                    if (*cp).stack_base != 0 {
+                        teb::set_field(cur_teb, teb::off::STACK_BASE, (*cp).stack_base);
+                        teb::set_field(cur_teb, teb::off::STACK_LIMIT, (*cp).stack_limit);
+                    }
+                    teb::set_fiber_data(cur_teb, caller_ptr);
+                }
+                teb::uninstall();
+                caller_sync.send(FiberCmd::Resume {
+                    teb: cur_teb,
+                    thread_obj: cur_obj,
+                    caller: None,
+                });
+            } else {
+                teb::uninstall();
+            }
         },
     }
     std::ptr::null_mut()
@@ -515,6 +563,7 @@ pub unsafe extern "win64" fn ConvertThreadToFiberEx(param: *mut c_void, _flags: 
         pthread: None,
         stack_base,
         stack_limit,
+        last_caller: None,
     })) as usize;
     if !t.is_null() {
         teb::set_fiber_data(t, fiber);
@@ -578,6 +627,7 @@ pub unsafe extern "win64" fn CreateFiberEx(
         pthread: Some(tid),
         stack_base: 0,
         stack_limit: 0,
+        last_caller: None,
     })) as *mut c_void
 }
 
@@ -630,13 +680,22 @@ pub unsafe extern "win64" fn SwitchToFiber(fiber: *mut c_void) {
     }
     let old_sync = Arc::clone(&(*old_ptr).sync);
     let new_sync = Arc::clone(&(*new_ptr).sync);
+    let thr_obj = thread::take_current_thread_context();
     teb::uninstall();
-    new_sync.send(FiberCmd::Resume { teb: t });
+    new_sync.send(FiberCmd::Resume {
+        teb: t,
+        thread_obj: thr_obj,
+        caller: Some((Arc::clone(&old_sync), old_ptr as usize)),
+    });
     match old_sync.wait() {
-        FiberCmd::Resume { teb: resumed_teb } => {
+        FiberCmd::Resume { teb: resumed_teb, thread_obj: resumed_obj, caller } => {
+            if caller.is_some() {
+                (*old_ptr).last_caller = caller;
+            }
             if !resumed_teb.is_null() {
                 teb::install(resumed_teb);
             }
+            thread::install_current_thread_context(resumed_obj);
         }
         FiberCmd::Exit | FiberCmd::Idle => {
             libc::pthread_exit(std::ptr::null_mut());
@@ -839,10 +898,107 @@ pub unsafe extern "win64" fn OpenWaitableTimerW(_access: u32, _inherit: BOOL, na
     named_open::<handles::WaitableTimer>(from_wide_opt(name))
 }
 
+struct TimerApcData {
+    routine: usize,
+    user_arg: usize,
+}
+
 unsafe extern "win64" fn timer_apc_adapter(arg: usize) {
-    let (routine, user_arg) = *(arg as *const (handles::TimerApcRoutine, *mut c_void));
+    let data = Arc::from_raw(arg as *const TimerApcData);
     let ft = now_filetime();
-    routine(user_arg, ft as u32, (ft >> 32) as u32);
+    crate::call_guest8(
+        data.routine,
+        data.user_arg as u64,
+        ft as u32 as u64,
+        (ft >> 32) as u32 as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+}
+
+struct ScheduledWaitableTimer {
+    due: std::time::Instant,
+    timer: std::sync::Weak<handles::WaitableTimer>,
+    timer_ptr: usize,
+    generation: u64,
+    period: Option<std::time::Duration>,
+    apc: Option<(Arc<TimerApcData>, Arc<ThreadObj>)>,
+}
+
+impl PartialEq for ScheduledWaitableTimer {
+    fn eq(&self, other: &Self) -> bool {
+        self.due == other.due && self.timer_ptr == other.timer_ptr && self.generation == other.generation
+    }
+}
+impl Eq for ScheduledWaitableTimer {}
+impl PartialOrd for ScheduledWaitableTimer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledWaitableTimer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.due.cmp(&self.due) // min-heap by due time
+    }
+}
+
+struct WaitableTimerSched {
+    heap: std::sync::Mutex<std::collections::BinaryHeap<ScheduledWaitableTimer>>,
+    cv: std::sync::Condvar,
+}
+
+fn waitable_timer_sched() -> &'static WaitableTimerSched {
+    static S: std::sync::OnceLock<&'static WaitableTimerSched> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let s: &'static WaitableTimerSched = Box::leak(Box::new(WaitableTimerSched {
+            heap: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
+            cv: std::sync::Condvar::new(),
+        }));
+        std::thread::Builder::new()
+            .name("win32-waitable-timer".into())
+            .spawn(move || loop {
+                let entry = {
+                    let mut h = s.heap.lock().unwrap();
+                    loop {
+                        let now = std::time::Instant::now();
+                        match h.peek() {
+                            None => h = s.cv.wait(h).unwrap(),
+                            Some(e) if e.due > now => {
+                                let d = e.due - now;
+                                h = s.cv.wait_timeout(h, d).unwrap().0;
+                            }
+                            Some(_) => break h.pop().unwrap(),
+                        }
+                    }
+                };
+                if let Some(timer) = entry.timer.upgrade() {
+                    if timer.fire_signaled(entry.generation) {
+                        if let Some((ref data, ref target)) = entry.apc {
+                            let raw = Arc::into_raw(Arc::clone(data)) as usize;
+                            thread::queue_apc(target, timer_apc_adapter, raw);
+                        }
+                        if let Some(p) = entry.period {
+                            let next_due = (entry.due + p).max(std::time::Instant::now());
+                            let mut h = s.heap.lock().unwrap();
+                            h.push(ScheduledWaitableTimer {
+                                due: next_due,
+                                timer: entry.timer,
+                                timer_ptr: entry.timer_ptr,
+                                generation: entry.generation,
+                                period: entry.period,
+                                apc: entry.apc,
+                            });
+                            s.cv.notify_one();
+                        }
+                    }
+                }
+            })
+            .expect("spawn win32-waitable-timer thread");
+        s
+    })
 }
 
 pub unsafe extern "win64" fn SetWaitableTimer(
@@ -861,14 +1017,14 @@ pub unsafe extern "win64" fn SetWaitableTimer(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let v = *due_time;
+    let v = std::ptr::read_unaligned(due_time);
     let delay = if v < 0 {
-        std::time::Duration::from_nanos((-v) as u64 * 100)
+        std::time::Duration::from_nanos(v.unsigned_abs().saturating_mul(100))
     } else if v == 0 {
         std::time::Duration::ZERO
     } else {
         let now = now_filetime() as i64;
-        std::time::Duration::from_nanos((v - now).max(0) as u64 * 100)
+        std::time::Duration::from_nanos(((v - now).max(0) as u64).saturating_mul(100))
     };
     let gen = {
         let g = handles::wait_lock();
@@ -879,36 +1035,35 @@ pub unsafe extern "win64" fn SetWaitableTimer(
     };
     let apc = completion_routine.and_then(|cb| {
         let target = thread::current_thread_object()?;
-        let boxed = Box::into_raw(Box::new((cb, arg_to_completion))) as usize;
-        Some((timer_apc_adapter as thread::ApcProc, boxed, target))
+        let data = Arc::new(TimerApcData {
+            routine: cb as usize,
+            user_arg: arg_to_completion as usize,
+        });
+        Some((data, target))
     });
+    let timer_ptr = Arc::as_ptr(&timer) as usize;
     if delay.is_zero() && period == 0 {
-        if let Some((proc_, param, ref target)) = apc {
-            thread::queue_apc(target, proc_, param);
+        if let Some((ref data, ref target)) = apc {
+            let raw = Arc::into_raw(Arc::clone(data)) as usize;
+            thread::queue_apc(target, timer_apc_adapter, raw);
         }
-        handles::notify_waiters();
+        timer.notify();
         return TRUE;
     }
     let period_dur = (period > 0).then(|| std::time::Duration::from_millis(period as u64));
-    std::thread::Builder::new()
-        .name("aw2-wait-timer".into())
-        .spawn(move || {
-            if !delay.is_zero() {
-                std::thread::sleep(delay);
-            }
-            if !timer.fire(gen, apc.clone()) {
-                return;
-            }
-            if let Some(p) = period_dur {
-                loop {
-                    std::thread::sleep(p);
-                    if !timer.fire(gen, apc.clone()) {
-                        break;
-                    }
-                }
-            }
-        })
-        .ok();
+    let s = waitable_timer_sched();
+    let mut heap = s.heap.lock().unwrap();
+    heap.retain(|e| e.timer_ptr != timer_ptr);
+    heap.push(ScheduledWaitableTimer {
+        due: std::time::Instant::now() + delay,
+        timer: Arc::downgrade(&timer),
+        timer_ptr,
+        generation: gen,
+        period: period_dur,
+        apc,
+    });
+    drop(heap);
+    s.cv.notify_one();
     TRUE
 }
 
@@ -930,6 +1085,9 @@ pub unsafe extern "win64" fn CancelWaitableTimer(h: HANDLE) -> BOOL {
         return FALSE;
     };
     timer.cancel();
+    let timer_ptr = Arc::as_ptr(&timer) as usize;
+    let s = waitable_timer_sched();
+    s.heap.lock().unwrap().retain(|e| e.timer_ptr != timer_ptr);
     TRUE
 }
 
@@ -993,15 +1151,15 @@ pub unsafe extern "win64" fn GetHandleInformation(_h: HANDLE, f: *mut u32) -> BO
 // Waiting
 // ---------------------------------------------------------------------------
 
-fn resolve_waitables(hs: &[HANDLE]) -> Result<Vec<Arc<dyn KObject>>, u32> {
-    hs.iter()
-        .map(|&h| {
-            if h == handles::CURRENT_PROCESS {
-                return Err(err::ERROR_INVALID_HANDLE);
-            }
-            handles::get(h).ok_or(err::ERROR_INVALID_HANDLE)
-        })
-        .collect()
+fn resolve_waitables(hs: &[HANDLE]) -> Result<handles::WaitableList, u32> {
+    let mut out = handles::WaitableList::with_capacity(hs.len());
+    for &h in hs {
+        if h == handles::CURRENT_PROCESS {
+            return Err(err::ERROR_INVALID_HANDLE);
+        }
+        out.push(handles::get(h).ok_or(err::ERROR_INVALID_HANDLE)?);
+    }
+    Ok(out)
 }
 
 fn wait_result_code(r: WaitResult) -> u32 {
@@ -1035,6 +1193,10 @@ pub unsafe extern "win64" fn WaitForSingleObjectEx(h: HANDLE, ms: u32, alertable
                     if s.try_take() {
                         return WAIT_OBJECT_0;
                     }
+                } else if let Some(e) = obj.as_any().downcast_ref::<Event>() {
+                    if e.try_take() {
+                        return WAIT_OBJECT_0;
+                    }
                 }
             }
             let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
@@ -1063,7 +1225,7 @@ pub unsafe extern "win64" fn WaitForMultipleObjectsEx(n: u32, hs: *const HANDLE,
     match resolve_waitables(hs) {
         Ok(objs) => {
             let t0 = if ms != 0 { crate::hitch::span_begin() } else { 0 };
-            let r = wait_result_code(handles::wait_for(&objs, all != 0, ms, alertable != 0));
+            let r = wait_result_code(handles::wait_for(objs.as_slice(), all != 0, ms, alertable != 0));
             crate::hitch::span_end(t0, crate::hitch::SPAN_OBJ_WAIT);
             r
         }
@@ -1304,6 +1466,141 @@ mod tests {
             assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
             assert!(resumed_self.load(Ordering::Acquire));
             assert_eq!(CloseHandle(h), TRUE);
+        }
+    }
+
+    #[test]
+    fn fiber_return_resumes_caller_and_preserves_thread_context() {
+        use std::sync::atomic::AtomicBool;
+
+        struct ReturnState {
+            expected_tid: u32,
+            ran: AtomicBool,
+            saw_thread_obj: AtomicBool,
+        }
+        unsafe extern "win64" fn returning_fiber(param: *mut c_void) {
+            let st = &*(param as *const ReturnState);
+            assert_eq!(GetCurrentThreadId(), st.expected_tid);
+            assert_eq!(IsThreadAFiber(), TRUE);
+            st.saw_thread_obj.store(thread::current_thread_object().is_some(), Ordering::Release);
+            st.ran.store(true, Ordering::Release);
+            // Return directly without calling SwitchToFiber: caller must resume cleanly.
+        }
+
+        let obj = thread::spawn(
+            Box::new(|| unsafe {
+                let tid = GetCurrentThreadId();
+                assert!(thread::current_thread_object().is_some());
+                let main_f = ConvertThreadToFiber(0xBEEF as *mut c_void);
+                assert!(!main_f.is_null());
+
+                let state = ReturnState {
+                    expected_tid: tid,
+                    ran: AtomicBool::new(false),
+                    saw_thread_obj: AtomicBool::new(false),
+                };
+                let child = CreateFiber(0, Some(returning_fiber), &state as *const ReturnState as *mut c_void);
+                assert!(!child.is_null());
+
+                SwitchToFiber(child);
+
+                assert!(state.ran.load(Ordering::Acquire));
+                assert!(state.saw_thread_obj.load(Ordering::Acquire));
+                assert_eq!(GetCurrentThreadId(), tid);
+                assert!(thread::current_thread_object().is_some());
+                assert_eq!(IsThreadAFiber(), TRUE);
+
+                DeleteFiber(child);
+                assert_eq!(ConvertFiberToThread(), TRUE);
+                assert_eq!(IsThreadAFiber(), FALSE);
+                123
+            }),
+            64 * 1024,
+            false,
+            false,
+        )
+        .expect("spawn fiber test thread");
+        let h = handles::insert(obj);
+        unsafe {
+            assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+            let mut code = 0u32;
+            assert_eq!(GetExitCodeThread(h, &mut code), TRUE);
+            assert_eq!(code, 123);
+            assert_eq!(CloseHandle(h), TRUE);
+        }
+    }
+
+    #[test]
+    fn waitable_timer_shared_scheduler_and_apc() {
+        use std::sync::atomic::AtomicUsize;
+
+        unsafe extern "win64" fn on_timer_apc(arg: *mut c_void, _lo: u32, _hi: u32) {
+            let slot = &*(arg as *const AtomicUsize);
+            slot.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let obj = thread::spawn(
+            Box::new(|| unsafe {
+                let h = CreateWaitableTimerW(std::ptr::null_mut(), TRUE, std::ptr::null());
+                assert!(!h.is_null());
+
+                // Arm then cancel before expiration -> must time out.
+                let due_cancel = -500_000i64; // 50 ms
+                assert_eq!(SetWaitableTimer(h, &due_cancel, 0, None, std::ptr::null_mut(), FALSE), TRUE);
+                assert_eq!(CancelWaitableTimer(h), TRUE);
+                assert_eq!(WaitForSingleObject(h, 15), WAIT_TIMEOUT);
+
+                // Re-arm with APC routine (15 ms relative) and enter alertable sleep.
+                let hits = AtomicUsize::new(0);
+                let due_fire = -150_000i64; // 15 ms
+                assert_eq!(
+                    SetWaitableTimer(
+                        h,
+                        &due_fire,
+                        0,
+                        Some(on_timer_apc),
+                        &hits as *const AtomicUsize as *mut c_void,
+                        FALSE,
+                    ),
+                    TRUE
+                );
+                assert!(handles::alertable_sleep(5_000), "alertable sleep should wake for timer APC");
+                assert_eq!(hits.load(Ordering::Acquire), 1);
+                assert_eq!(WaitForSingleObject(h, 0), WAIT_OBJECT_0);
+                assert_eq!(CloseHandle(h), TRUE);
+                0
+            }),
+            64 * 1024,
+            false,
+            false,
+        )
+        .expect("spawn waitable timer test thread");
+        let h = handles::insert(obj);
+        unsafe {
+            assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(h), TRUE);
+        }
+    }
+
+    #[test]
+    fn fls_lockfree_alloc_get_set_free() {
+        use std::sync::atomic::AtomicUsize;
+
+        unsafe extern "win64" fn fls_dtor(val: *mut c_void) {
+            let slot = &*(val as *const AtomicUsize);
+            slot.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            let called = AtomicUsize::new(0);
+            let idx = FlsAlloc(Some(fls_dtor));
+            assert_ne!(idx, thread::FLS_OUT_OF_INDEXES);
+            assert_eq!(FlsSetValue(idx, &called as *const AtomicUsize as *mut c_void), TRUE);
+            assert_eq!(FlsGetValue(idx), &called as *const AtomicUsize as *mut c_void);
+            assert_eq!(FlsFree(idx), TRUE);
+            assert_eq!(called.load(Ordering::Acquire), 1);
+            assert!(FlsGetValue(idx).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
         }
     }
 }
