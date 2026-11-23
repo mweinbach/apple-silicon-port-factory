@@ -2799,3 +2799,117 @@ fn callback_roots_fingerprint_relocation_replay_and_stale_invalidation() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression for PR #2 review finding: `Loader::load_pe_with_opts` rewrites
+/// `OptionalHeader.ImageBase` to the actual mapped base after applying DIR64 relocations.
+/// `image_fingerprint` must normalize relocated executable-section immediates against the
+/// mapped base (module-relative offset) so distinct mappings of the same PE produce the
+/// exact same fingerprint and replay persisted callback roots, while still rejecting both
+/// modified non-relocated code bytes and modified DIR64 target RVAs.
+#[test]
+fn image_fingerprint_dir64_normalizes_with_rewritten_optional_header_image_base() {
+    use super::callbacks::{
+        clear_runtime_callbacks_for_test, flush_runtime_callbacks, image_fingerprint,
+        load_replayed_callback_roots, record_runtime_callback, CallbackKind, CallbackRoot,
+    };
+
+    let dir = test_dir("cb-fp-header-rewrite");
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+    clear_runtime_callbacks_for_test();
+
+    // Helper: fill synthetic PE with a DIR64 relocation in `.text` (0x1082 -> target_rva)
+    // and optionally rewrite OptionalHeader.ImageBase (opt + 24 = 0x98 + 24) to the mapped base,
+    // matching `Loader::load_pe_with_opts` lines 1048-1055.
+    let build_mapped = |buf: &mut [u8], extra_text_byte: u8, dir64_target_rva: u64, rewrite_opt_base: bool| {
+        fill_callback_plugin_pe(buf, 0x6700_0042, extra_text_byte);
+        let mapped_base = buf.as_ptr() as u64;
+        // Overwrite the DIR64 relocated slot @ 0x1082 with `mapped_base + dir64_target_rva`.
+        buf[0x1082..0x108A].copy_from_slice(&mapped_base.wrapping_add(dir64_target_rva).to_le_bytes());
+        if rewrite_opt_base {
+            let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
+            buf[e_lfanew + 24 + 24..e_lfanew + 24 + 32].copy_from_slice(&mapped_base.to_le_bytes());
+        }
+    };
+
+    let mut img_a = vec![0u8; 0x4000];
+    let mut img_b = vec![0u8; 0x4000];
+    let mut img_unrewritten = vec![0u8; 0x4000];
+    let mut img_stale_code = vec![0u8; 0x4000];
+    let mut img_stale_reloc_target = vec![0u8; 0x4000];
+
+    build_mapped(&mut img_a, 7, 0x2700, true);
+    build_mapped(&mut img_b, 7, 0x2700, true);
+    build_mapped(&mut img_unrewritten, 7, 0x2700, false);
+    build_mapped(&mut img_stale_code, 9, 0x2700, true);
+    build_mapped(&mut img_stale_reloc_target, 7, 0x2708, true);
+
+    let ba = img_a.as_ptr() as usize;
+    let bb = img_b.as_ptr() as usize;
+    let bu = img_unrewritten.as_ptr() as usize;
+    let bsc = img_stale_code.as_ptr() as usize;
+    let bsr = img_stale_reloc_target.as_ptr() as usize;
+    assert_ne!(ba, bb);
+
+    // Confirm OptionalHeader.ImageBase really was rewritten to each distinct mapped base.
+    let read_opt_base = |buf: &[u8]| -> u64 {
+        let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
+        u64::from_le_bytes(buf[e_lfanew + 24 + 24..e_lfanew + 24 + 32].try_into().unwrap())
+    };
+    assert_eq!(read_opt_base(&img_a), ba as u64);
+    assert_eq!(read_opt_base(&img_b), bb as u64);
+    assert_ne!(read_opt_base(&img_a), read_opt_base(&img_b));
+
+    let fp_a = unsafe { image_fingerprint(ba, img_a.len()) }.expect("fp_a");
+    let fp_b = unsafe { image_fingerprint(bb, img_b.len()) }.expect("fp_b");
+    let fp_u = unsafe { image_fingerprint(bu, img_unrewritten.len()) }.expect("fp_u");
+    let fp_sc = unsafe { image_fingerprint(bsc, img_stale_code.len()) }.expect("fp_sc");
+    let fp_sr = unsafe { image_fingerprint(bsr, img_stale_reloc_target.len()) }.expect("fp_sr");
+
+    assert_eq!(
+        fp_a, fp_b,
+        "distinct mappings with rewritten OptionalHeader.ImageBase and DIR64 code reloc must share fingerprint"
+    );
+    assert_eq!(
+        fp_a, fp_u,
+        "rewritten and unrewritten OptionalHeader.ImageBase must normalize to the same module-relative fingerprint"
+    );
+    assert_ne!(fp_a, fp_sc, "non-relocated code change must invalidate fingerprint");
+    assert_ne!(fp_a, fp_sr, "DIR64 relocated target RVA change must invalidate fingerprint");
+
+    // Record runtime callback at `ba` (with rewritten OptionalHeader.ImageBase) and replay at `bb`.
+    let mod_name = "cb_hdr_rewrite_test.dll";
+    module_mapped(mod_name, ba, img_a.len());
+    assert!(record_runtime_callback(ba as u64 + 0x1340, CallbackKind::Worker));
+    flush_runtime_callbacks();
+
+    let replayed_b = unsafe { load_replayed_callback_roots(mod_name, bb, img_b.len()) };
+    assert!(
+        replayed_b.contains(&CallbackRoot { rva: 0x1340, kind: CallbackKind::Worker }),
+        "recorded runtime root must replay at second mapping with rewritten ImageBase: {replayed_b:?}"
+    );
+    assert!(
+        unsafe { load_replayed_callback_roots(mod_name, bsc, img_stale_code.len()) }.is_empty(),
+        "stale code bytes must reject replayed roots"
+    );
+    assert!(
+        unsafe { load_replayed_callback_roots(mod_name, bsr, img_stale_reloc_target.len()) }.is_empty(),
+        "stale DIR64 relocated target RVA must reject replayed roots"
+    );
+
+    if let Ok(mut m) = MAPPED.lock() {
+        m.retain(|x| x.name != mod_name);
+    }
+    clear_runtime_callbacks_for_test();
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

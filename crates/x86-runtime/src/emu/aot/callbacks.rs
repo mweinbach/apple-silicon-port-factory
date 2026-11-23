@@ -146,7 +146,6 @@ pub unsafe fn image_fingerprint(base: usize, size: usize) -> Option<ImageFingerp
     let timestamp = rd32(nt + 8);
     let opt_sz = rd16(nt + 20) as usize;
     let entry_rva = rd32(opt + 16);
-    let opt_base = rd64(opt + 24);
     let size_of_image = rd32(opt + 56);
     let size_of_headers = rd32(opt + 60);
     let checksum = rd32(opt + 64);
@@ -174,13 +173,17 @@ pub unsafe fn image_fingerprint(base: usize, size: usize) -> Option<ImageFingerp
         h.word(rd32(e + 36) as u64); // Characteristics
     }
 
-    // Collect DIR64 base-relocation RVAs inside executable sections so we can normalize
-    // relocated 64-bit immediates back to `opt_base` before hashing.
+    // Collect base-relocation slots inside executable sections so we can normalize relocated
+    // pointers/immediates to module-relative offsets (`val - base`) before hashing.
+    // Subtracting the actual mapped `base` yields `(disk_val - preferred_base)` regardless of
+    // where the image is mapped and regardless of whether the loader rewrote
+    // `OptionalHeader.ImageBase` to `base` after applying relocations.
     let exec = exec_sections(base, size);
-    let mut exec_dir64: Vec<u32> = Vec::new();
+    let mut exec_relocs: Vec<(u32, u8)> = Vec::new();
     if let Some((dir_rva, dir_len)) = data_dir(base, size, 5).filter(|&(r, _)| r != 0) {
         if let Some(dir_end) = (dir_rva as u64).checked_add(dir_len as u64) {
             if dir_end <= size as u64 {
+                const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
                 const IMAGE_REL_BASED_DIR64: u16 = 10;
                 let mut off = dir_rva as u64;
                 while off.checked_add(8).is_some_and(|e| e <= dir_end) {
@@ -198,13 +201,18 @@ pub unsafe fn image_fingerprint(base: usize, size: usize) -> Option<ImageFingerp
                     let n_entries = ((block_size - 8) / 2) as u64;
                     for i in 0..n_entries {
                         let entry = rd16((off + 8 + i * 2) as usize);
-                        if (entry >> 12) != IMAGE_REL_BASED_DIR64 {
-                            continue;
-                        }
+                        let width: u8 = match entry >> 12 {
+                            IMAGE_REL_BASED_DIR64 => 8,
+                            IMAGE_REL_BASED_HIGHLOW => 4,
+                            _ => continue,
+                        };
                         if let Some(slot_rva) = page_rva.checked_add((entry & 0x0FFF) as u32) {
                             let va = base + slot_rva as usize;
-                            if exec.iter().any(|&(s, e)| va >= s && va.saturating_add(8) <= e) {
-                                exec_dir64.push(slot_rva);
+                            if exec
+                                .iter()
+                                .any(|&(s, e)| va >= s && va.saturating_add(width as usize) <= e)
+                            {
+                                exec_relocs.push((slot_rva, width));
                             }
                         }
                     }
@@ -213,24 +221,24 @@ pub unsafe fn image_fingerprint(base: usize, size: usize) -> Option<ImageFingerp
             }
         }
     }
-    exec_dir64.sort_unstable();
-    exec_dir64.dedup();
+    exec_relocs.sort_unstable();
+    exec_relocs.dedup_by_key(|&mut (rva, _)| rva);
 
-    let reloc_delta = (base as u64).wrapping_sub(opt_base);
     for (s, e) in exec {
         let sec_rva = (s - base) as u32;
         let sec_end_rva = (e - base) as u32;
         h.word(sec_rva as u64);
         h.word((sec_end_rva - sec_rva) as u64);
 
-        let lo_idx = exec_dir64.partition_point(|&r| r < sec_rva);
-        let hi_idx = exec_dir64.partition_point(|&r| r < sec_end_rva);
-        if lo_idx == hi_idx || reloc_delta == 0 {
+        let lo_idx = exec_relocs.partition_point(|&(r, _)| r < sec_rva);
+        let hi_idx = exec_relocs.partition_point(|&(r, _)| r < sec_end_rva);
+        if lo_idx == hi_idx {
             h.bytes(core::slice::from_raw_parts(s as *const u8, e - s));
         } else {
             let mut cur = sec_rva;
-            for &slot in &exec_dir64[lo_idx..hi_idx] {
-                if slot < cur || slot.saturating_add(8) > sec_end_rva {
+            for &(slot, width) in &exec_relocs[lo_idx..hi_idx] {
+                let w = width as u32;
+                if slot < cur || slot.saturating_add(w) > sec_end_rva {
                     continue;
                 }
                 if slot > cur {
@@ -239,10 +247,13 @@ pub unsafe fn image_fingerprint(base: usize, size: usize) -> Option<ImageFingerp
                         (slot - cur) as usize,
                     ));
                 }
-                let raw_val = rd64(slot as usize);
-                let canon_val = raw_val.wrapping_sub(reloc_delta);
+                let canon_val = if width == 8 {
+                    rd64(slot as usize).wrapping_sub(base as u64)
+                } else {
+                    rd32(slot as usize).wrapping_sub(base as u32) as u64
+                };
                 h.word(canon_val);
-                cur = slot + 8;
+                cur = slot + w;
             }
             if cur < sec_end_rva {
                 h.bytes(core::slice::from_raw_parts(
