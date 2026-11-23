@@ -62,8 +62,9 @@ pub fn list_mounts() -> Vec<(String, PathBuf)> {
 }
 
 /// Default standardized Translator root directory (`~/Translator` on macOS,
-/// `~/Documents/Translator` on iOS where `$HOME` itself is read-only),
-/// overridable via `TRANSLATOR_HOME` or `AW2_DRIVE_C`.
+/// `~/Library/Application Support/Translator` on iOS where `$HOME` is read-only
+/// and `Documents/` should stay untouched), overridable via `TRANSLATOR_HOME`
+/// or `AW2_DRIVE_C`.
 pub fn default_translator_root() -> PathBuf {
     if let Some(p) = std::env::var_os("TRANSLATOR_HOME").or_else(|| std::env::var_os("AW2_DRIVE_C")) {
         return PathBuf::from(p);
@@ -72,7 +73,7 @@ pub fn default_translator_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     if cfg!(target_os = "ios") {
-        home.join("Documents").join("Translator")
+        home.join("Library").join("Application Support").join("Translator")
     } else {
         home.join("Translator")
     }
@@ -96,6 +97,25 @@ fn copy_dir_recursive_if_missing(src: &Path, dst: &Path) {
             copy_dir_recursive_if_missing(&sp, &dp);
         } else if ft.is_file() && !dp.exists() {
             let _ = std::fs::copy(&sp, &dp);
+        }
+    }
+}
+
+/// On iOS, preserve any existing user saves/settings from older installs that used
+/// `~/Documents/Translator` by copying missing files into `root` (`~/Library/Application Support/Translator`).
+pub fn migrate_legacy_ios_translator_root(root: &Path) {
+    if !cfg!(target_os = "ios") {
+        return;
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let legacy_docs = home.join("Documents").join("Translator");
+        if legacy_docs.is_dir() && legacy_docs != root {
+            for rel in ["AppData", "Saved Games", "Documents", "ProgramData"] {
+                let src = legacy_docs.join(rel);
+                if src.is_dir() {
+                    copy_dir_recursive_if_missing(&src, &root.join(rel));
+                }
+            }
         }
     }
 }
@@ -148,6 +168,10 @@ pub fn init_translator_mounts(override_root: Option<&Path>) -> std::io::Result<P
         "drive_c",
     ] {
         std::fs::create_dir_all(root.join(rel))?;
+    }
+
+    if override_root.is_none() {
+        migrate_legacy_ios_translator_root(&root);
     }
 
     // Optional legacy migration from `~/Library/Application Support/AW2Port/drive_c`

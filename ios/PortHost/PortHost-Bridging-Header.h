@@ -11,7 +11,7 @@ extern "C" {
 
 /// Optional startup paths passed to `port_ios_start_background`.
 /// Any field may be NULL to auto-discover `<App>.app/game.toml`, `<App>.app/Game`,
-/// and `~/Documents/Translator`.
+/// and `~/Library/Application Support/Translator`.
 typedef struct PortIosConfig {
     const char *game_dir;
     const char *exe_name;

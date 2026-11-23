@@ -67,10 +67,6 @@
     <true/>
     <key>CADisableMinimumFrameDurationOnPhone</key>
     <true/>
-    <key>UIFileSharingEnabled</key>
-    <true/>
-    <key>LSSupportsOpeningDocumentsInPlace</key>
-    <true/>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationLandscapeLeft</string>

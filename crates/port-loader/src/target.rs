@@ -137,9 +137,8 @@ impl TargetManifest {
         m
     }
 
-    /// Resolve a default game directory next to a manifest if inside a `.app` bundle
-    /// (`<exe_dir>/Game` on flat iOS bundles, `<exe_dir>/../Resources/Game` on macOS,
-    /// or `~/Documents/Game` on iOS when assets are staged via Files/Finder/`devicectl`).
+    /// Resolve a default game directory next to a manifest inside a self-contained `.app` bundle
+    /// (`<exe_dir>/Game` on flat iOS bundles, `<exe_dir>/../Resources/Game` on macOS `.app` bundles).
     pub fn bundled_game_dir() -> Option<PathBuf> {
         let non_empty_dir = |p: &Path| -> bool {
             p.is_dir()
@@ -155,26 +154,6 @@ impl TargetManifest {
                     if non_empty_dir(&bundled) {
                         return Some(bundled);
                     }
-                }
-            }
-        }
-        #[cfg(target_os = "ios")]
-        if let Some(home) = std::env::var_os("HOME") {
-            let docs = Path::new(&home).join("Documents");
-            let docs_game = docs.join("Game");
-            if non_empty_dir(&docs_game) {
-                return Some(docs_game);
-            }
-            // Also accept game files dropped directly into the Files/Finder Documents root.
-            if let Ok(rd) = std::fs::read_dir(&docs) {
-                let has_exe = rd.flatten().any(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
-                });
-                if has_exe {
-                    return Some(docs);
                 }
             }
         }

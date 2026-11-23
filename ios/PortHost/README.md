@@ -38,7 +38,7 @@ Reference UIKit / `CAMetalLayer` wrapper that embeds the universal Apple runtime
     `port_ios_keyboard_state(hardware_connected, software_visible, software_height_px)`.
 - **Background runtime thread (`port_ios_start_background`)**: boots the Windows PE loader,
   `win32-rt` (UIKit host surface, `RemoteIO` + `AVAudioSession`, `GameController` + `CoreHaptics`,
-  `~/Documents/Translator` sandboxed `C:\`), `d3d12-metal` (Metal 4 + MetalFX), `dxil-metal`
+  `~/Library/Application Support/Translator` sandboxed `C:\`), `d3d12-metal` (Metal 4 + MetalFX), `dxil-metal`
   (`BackendKind::CacheOnly`), and `x86-runtime`.
 - **Flat iOS `.app` bundle layout**:
   - `<App>.app/game.toml` — declarative game manifest

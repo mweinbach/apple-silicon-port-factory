@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Optional startup configuration passed from Swift/Objective-C to
 /// [`port_ios_start_background`]. Any pointer may be `NULL` (or empty) to use
 /// standard flat iOS bundle discovery (`<App>.app/game.toml`, `<App>.app/Game`,
-/// `~/Documents/Translator`).
+/// `~/Library/Application Support/Translator`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PortIosConfig {
@@ -33,7 +33,7 @@ pub struct PortIosConfig {
     pub exe_name: *const c_char,
     /// Optional path to `game.toml`.
     pub manifest_path: *const c_char,
-    /// Optional writable `C:\` root override (defaults to `~/Documents/Translator` on iOS).
+    /// Optional writable `C:\` root override (defaults to `~/Library/Application Support/Translator` on iOS).
     pub drive_c_dir: *const c_char,
 }
 
@@ -209,11 +209,10 @@ fn seed_ios_default_files(manifest_override: Option<&std::path::Path>, drive_c_o
     };
     let drive_c = drive_c_override
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("TRANSLATOR_HOME").filter(|v| !v.is_empty()).map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Documents").join("Translator")));
-    let Some(drive_c) = drive_c else {
-        return;
-    };
+        .unwrap_or_else(win32_rt::path::default_translator_root);
+    if drive_c_override.is_none() {
+        win32_rt::path::migrate_legacy_ios_translator_root(&drive_c);
+    }
     for (src_rel, dst_rel) in &manifest.ios_seed_files {
         let src = bundle_dir.join(src_rel);
         let dst = drive_c.join(dst_rel);

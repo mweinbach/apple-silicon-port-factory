@@ -1952,7 +1952,6 @@ pub fn port_steam_game(
         target: convert_target,
         format: ConversionFormat::MacOsApp,
         output_path: Some(app_bundle.clone()),
-        symlink_game: false,
         precompile_shaders: opts.precompile_shaders,
         max_aot_functions: 0,
         bundle_shader_cache_from: None,
@@ -2318,7 +2317,6 @@ pub struct SteamConvertOptions {
     pub target: String,
     pub format: ConversionFormat,
     pub output_path: Option<PathBuf>,
-    pub symlink_game: bool,
     pub precompile_shaders: bool,
     pub max_aot_functions: usize,
     /// Optional host shader cache root (e.g. `~/Translator/ShaderCache`) whose portable
@@ -3495,7 +3493,6 @@ pub fn convert_steam_game(
                 &clean_title,
                 &exec_ident,
                 &out_app,
-                opts.symlink_game,
                 opts.precompile_shaders,
                 opts.max_aot_functions,
                 opts.bundle_shader_cache_from.as_deref(),
@@ -3513,7 +3510,6 @@ fn package_macos_game_bundle(
     clean_title: &str,
     exec_ident: &str,
     out_app: &Path,
-    symlink_game: bool,
     precompile_shaders: bool,
     max_aot_functions: usize,
     bundle_shader_cache_from: Option<&Path>,
@@ -3588,60 +3584,52 @@ fn package_macos_game_bundle(
     // 4. Apply Post-Install (`steam_appid.txt` + `steam_registry.tsv`)
     let post = apply_post_install(&entry.install_dir, &entry.app_id, &resources_dir)?;
 
-    // 5. Link or Copy the game directory into `Contents/Resources/Game`
+    // 5. Copy/clone all game files (EXEs, DLLs, assets) into `Contents/Resources/Game`
     let bundle_game_dir = resources_dir.join("Game");
-    if symlink_game {
-        if bundle_game_dir.exists() || bundle_game_dir.is_symlink() {
+    let same_dir = fs::canonicalize(&entry.install_dir)
+        .ok()
+        .zip(fs::canonicalize(&bundle_game_dir).ok())
+        .is_some_and(|(a, b)| a == b);
+    if !same_dir {
+        if bundle_game_dir.is_symlink() {
             let _ = fs::remove_file(&bundle_game_dir);
+        } else if bundle_game_dir.exists() {
             let _ = fs::remove_dir_all(&bundle_game_dir);
         }
-        std::os::unix::fs::symlink(&entry.install_dir, &bundle_game_dir)?;
-    } else {
-        let same_dir = fs::canonicalize(&entry.install_dir)
-            .ok()
-            .zip(fs::canonicalize(&bundle_game_dir).ok())
-            .is_some_and(|(a, b)| a == b);
-        if !same_dir {
-            if bundle_game_dir.is_symlink() {
-                let _ = fs::remove_file(&bundle_game_dir);
-            } else if bundle_game_dir.exists() {
-                let _ = fs::remove_dir_all(&bundle_game_dir);
-            }
-            let status = Command::new("cp")
+        let status = Command::new("cp")
+            .args([
+                "-Rc",
+                &format!("{}/", entry.install_dir.display()),
+                &bundle_game_dir.to_string_lossy(),
+            ])
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            let _ = fs::remove_dir_all(&bundle_game_dir);
+            let status_plain = Command::new("cp")
                 .args([
-                    "-Rc",
+                    "-R",
                     &format!("{}/", entry.install_dir.display()),
                     &bundle_game_dir.to_string_lossy(),
                 ])
-                .status();
-            if !status.is_ok_and(|s| s.success()) {
-                let _ = fs::remove_dir_all(&bundle_game_dir);
-                let status_plain = Command::new("cp")
-                    .args([
-                        "-R",
-                        &format!("{}/", entry.install_dir.display()),
-                        &bundle_game_dir.to_string_lossy(),
-                    ])
-                    .status()
-                    .with_context(|| {
-                        format!(
-                            "copying game assets from {} to {}",
-                            entry.install_dir.display(),
-                            bundle_game_dir.display()
-                        )
-                    })?;
-                if !status_plain.success() {
-                    bail!(
-                        "failed to copy game assets into {}",
+                .status()
+                .with_context(|| {
+                    format!(
+                        "copying game assets from {} to {}",
+                        entry.install_dir.display(),
                         bundle_game_dir.display()
-                    );
-                }
+                    )
+                })?;
+            if !status_plain.success() {
+                bail!(
+                    "failed to copy game assets into {}",
+                    bundle_game_dir.display()
+                );
             }
-            // Strip DepotDownloader internal staging metadata from the packaged `.app` copy.
-            let _ = fs::remove_dir_all(bundle_game_dir.join(".DepotDownloader"));
         }
-        let _ = apply_post_install(&entry.install_dir, &entry.app_id, &bundle_game_dir);
+        // Strip DepotDownloader internal staging metadata from the packaged `.app` copy.
+        let _ = fs::remove_dir_all(bundle_game_dir.join(".DepotDownloader"));
     }
+    let _ = apply_post_install(&entry.install_dir, &entry.app_id, &bundle_game_dir);
 
     // 6. Shader Pre-Compilation & optional portable Tier-1 cache copy into `Contents/Resources/ShaderCache`
     let mut shaders_converted = 0usize;
@@ -4222,7 +4210,7 @@ pub fn verify_app_bundle(app_path: &Path) -> Result<BundleVerifyReport> {
             &mut checks,
             "game_payload",
             BundleCheckStatus::Fail,
-            "Contents/Resources/Game is a symlink (not portable to an SSD; re-run with --copy-game)"
+            "Contents/Resources/Game is a symlink (all game EXEs, DLLs, and assets must be bundled inside the .app)"
                 .to_string(),
         ),
         Ok(m) if m.is_dir() => push(
@@ -4754,7 +4742,7 @@ pub fn write_steam_browser_html(report: &SteamLibraryScanReport, out_path: &Path
             .and_then(|s| s.to_str())
             .unwrap_or("macOS Bundle");
         let cmd_app = format!(
-            "cargo opsdb -- steam-convert {} --format app --symlink-game",
+            "cargo opsdb -- steam-convert {} --format app",
             g.app_id
         );
         let cmd_aot = format!(

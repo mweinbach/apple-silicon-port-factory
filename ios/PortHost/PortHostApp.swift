@@ -65,7 +65,7 @@ final class PortViewController: UIViewController {
         launched = true
 
         // Pass NULL to auto-discover `<App>.app/game.toml`, `<App>.app/Game`,
-        // `<App>.app/ShaderCache`, and `~/Documents/Translator`.
+        // `<App>.app/ShaderCache`, and `~/Library/Application Support/Translator`.
         let rc = port_ios_start_background(nil)
         if rc != 0 {
             NSLog("PortHost: port_ios_start_background returned %d", rc)

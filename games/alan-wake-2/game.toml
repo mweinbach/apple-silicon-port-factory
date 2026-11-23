@@ -26,7 +26,7 @@ args = "-epicuserid=Default-Epic-User"
 # Optional storage optimizer metadata (`port-factory optimize-assets` / `ios-bundle --optimize-storage`).
 archive_repacker = "aw2-data"
 archive_dir = "data_pack2"
-keep_dlls = ["cohtml.WindowsDesktop.dll", "cohtml_icuuc.dll", "RenoirCore.WindowsDesktop.dll", "MediaDecoders.WindowsDesktop.dll", "v8.dll", "v8_libbase.dll", "v8_libplatform.dll", "PhysX3_x64.dll", "PhysX3Common_x64.dll", "PhysX3Cooking_x64.dll", "PxFoundation_x64.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll"]
+keep_dlls = ["NRD.dll", "cohtml.WindowsDesktop.dll", "cohtml_icuuc.dll", "RenoirCore.WindowsDesktop.dll", "MediaDecoders.WindowsDesktop.dll", "v8.dll", "v8_libbase.dll", "v8_libplatform.dll", "PhysX3_x64.dll", "PhysX3Common_x64.dll", "PhysX3Cooking_x64.dll", "PxFoundation_x64.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll"]
 
 [ios]
 # First-launch iOS graphics defaults: Metal 4 FX Temporal (800x368 -> 1600x736, 2.0x)

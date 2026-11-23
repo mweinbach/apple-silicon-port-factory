@@ -117,8 +117,6 @@ pub struct IosBundleOptions {
     pub release: bool,
     /// Minimum iOS deployment target (default: `"17.0"`).
     pub deployment_target: String,
-    /// Copy game directory contents into `<App>.app/Game` (default: `true`).
-    pub copy_game: bool,
     /// Offline-compile mapped PEs into signed static ARM64 `.aot.o` objects and link them (default: `true`).
     pub emit_static_aot: bool,
     /// Cap discovered PE function roots per module during static AOT compilation (0 = all).
@@ -138,11 +136,9 @@ pub struct IosBundleOptions {
     /// When `true`, also emit a ready-to-open XcodeGen `project.yml` next to `out_path`.
     pub emit_xcodegen_spec: bool,
     /// Optional generalized storage optimization pass applied while staging game assets
-    /// (`--optimize-storage lossless|high|compact`, `--hevc-videos`, `--max-tex-dim`, etc.).
+    /// directly inside `<App>.app/Game/` (`--optimize-storage lossless|high|compact`,
+    /// `--hevc-videos`, `--max-tex-dim`, etc.).
     pub storage_opt: Option<StorageOptOptions>,
-    /// Optional external staging directory for optimized game assets when `copy_game == false`
-    /// (e.g. staging a slim `Documents/Game/` folder for AAA games pushed via Finder/`devicectl`).
-    pub optimized_game_out: Option<PathBuf>,
 }
 
 impl IosBundleOptions {
@@ -158,7 +154,6 @@ impl IosBundleOptions {
             out_path,
             release: false,
             deployment_target: "17.0".to_string(),
-            copy_game: true,
             emit_static_aot: true,
             aot_max_funcs: 0,
             extra_aot_objs: Vec::new(),
@@ -168,7 +163,6 @@ impl IosBundleOptions {
             provisioning_profile: None,
             emit_xcodegen_spec: false,
             storage_opt: None,
-            optimized_game_out: None,
         }
     }
 }
@@ -341,10 +335,6 @@ pub fn render_ios_info_plist(
     <key>GCSupportsGameMode</key>
     <true/>
     <key>CADisableMinimumFrameDurationOnPhone</key>
-    <true/>
-    <key>UIFileSharingEnabled</key>
-    <true/>
-    <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
     <key>UISupportedInterfaceOrientations</key>
     <array>
@@ -985,7 +975,7 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
             .with_context(|| format!("copying provisioning profile {}", prof.display()))?;
     }
 
-    // 6. Copy or optimize game files into `<App>.app/Game/` (or optional external `Documents/Game/` stage).
+    // 6. Always copy or optimize all game files (EXEs, DLLs, assets) directly inside `<App>.app/Game/`.
     let bundle_game_dir = app_dir.join("Game");
     let mut storage_opt_report: Option<StorageOptReport> = None;
     let active_sopt = opts.storage_opt.as_ref().filter(|o| o.is_enabled()).map(|base| {
@@ -1009,30 +999,14 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
         sopt
     });
 
-    if opts.copy_game {
-        let skip_self = fs::canonicalize(&app_dir).ok();
-        if let Some(ref sopt) = active_sopt {
-            let rep = optimize_game_assets(&game_dir, &bundle_game_dir, sopt, skip_self.as_deref())
-                .with_context(|| format!("optimizing game files from {}", game_dir.display()))?;
-            storage_opt_report = Some(rep);
-        } else {
-            copy_dir_recursive(&game_dir, &bundle_game_dir, skip_self.as_deref())
-                .with_context(|| format!("copying game files from {}", game_dir.display()))?;
-        }
+    let skip_self = fs::canonicalize(&app_dir).ok();
+    if let Some(ref sopt) = active_sopt {
+        let rep = optimize_game_assets(&game_dir, &bundle_game_dir, sopt, skip_self.as_deref())
+            .with_context(|| format!("optimizing game files from {}", game_dir.display()))?;
+        storage_opt_report = Some(rep);
     } else {
-        fs::create_dir_all(&bundle_game_dir)?;
-        if let (Some(ref sopt), Some(ref ext_out)) = (&active_sopt, &opts.optimized_game_out) {
-            let skip_self = fs::canonicalize(&app_dir).ok();
-            let rep = optimize_game_assets(&game_dir, ext_out, sopt, skip_self.as_deref())
-                .with_context(|| {
-                    format!(
-                        "optimizing game files from {} into {}",
-                        game_dir.display(),
-                        ext_out.display()
-                    )
-                })?;
-            storage_opt_report = Some(rep);
-        }
+        copy_dir_recursive(&game_dir, &bundle_game_dir, skip_self.as_deref())
+            .with_context(|| format!("copying game files from {}", game_dir.display()))?;
     }
 
     // 7. Precompile embedded PE shaders & copy optional portable Tier-1 ShaderCache (no `*.mtl4a`).
@@ -1133,7 +1107,7 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
             &opts.workspace_root,
             &persisted_objs,
             &bundled_manifest,
-            if opts.copy_game { Some(&bundle_game_dir) } else { None },
+            Some(&bundle_game_dir),
             Some(&shader_cache_dir),
             opts.release,
         );
@@ -1238,6 +1212,25 @@ fn count_shader_files(dir: &Path, portable: &mut usize, mtl4a: &mut usize) {
 /// Verify an iOS `.app` bundle or `.ipa` archive for ARM64 iOS Mach-O platform validity,
 /// embedded static AOT modules, zero macOS framework leaks, flat bundle layout, portable
 /// shader cache hygiene (zero host-specific `*.mtl4a` files), and valid code signature.
+fn read_plist_as_xml(path: &Path) -> Result<String, String> {
+    let raw = fs::read(path).map_err(|e| e.to_string())?;
+    if raw.starts_with(b"bplist") {
+        let out = Command::new("/usr/bin/plutil")
+            .args(["-convert", "xml1", "-o", "-"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("plutil failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "plutil -convert xml1 failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        return String::from_utf8(out.stdout).map_err(|e| e.to_string());
+    }
+    String::from_utf8(raw).map_err(|e| e.to_string())
+}
+
 pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
     if !path.exists() {
         bail!("bundle not found: {}", path.display());
@@ -1305,7 +1298,7 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
 
     let mut issues = Vec::new();
     let plist_path = app_dir.join("Info.plist");
-    let plist_xml = match fs::read_to_string(&plist_path) {
+    let plist_xml = match read_plist_as_xml(&plist_path) {
         Ok(s) => s,
         Err(e) => {
             issues.push(format!("missing Info.plist: {e}"));
@@ -1325,6 +1318,11 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
     }
     if !plist_xml.is_empty() && !plist_xml.contains("<key>UIApplicationSceneManifest</key>") {
         issues.push("Info.plist missing UIApplicationSceneManifest (required for UIScene lifecycle on iOS 26+)".into());
+    }
+    if plist_xml.contains("<key>UIFileSharingEnabled</key>")
+        || plist_xml.contains("<key>LSSupportsOpeningDocumentsInPlace</key>")
+    {
+        issues.push("Info.plist exposes Documents file sharing; game payloads must be bundled inside Game/".into());
     }
 
     let exec_path = app_dir.join(&executable_name);
@@ -1388,8 +1386,16 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
         issues.push("missing flat bundle game.toml".into());
     }
     let game_dir = app_dir.join("Game");
-    let has_game_dir = game_dir.is_dir();
-    if !has_game_dir {
+    let game_meta = fs::symlink_metadata(&game_dir).ok();
+    let has_game_dir = game_meta
+        .as_ref()
+        .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
+    if game_meta
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_symlink())
+    {
+        issues.push("Game/ must be a real bundled directory inside the .app, not a symlink".into());
+    } else if !has_game_dir {
         issues.push("missing flat bundle Game/ directory".into());
     }
     let mut bundled_exe_present = false;
@@ -1398,12 +1404,15 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
             .ok()
             .and_then(|mut rd| rd.next())
             .is_some();
+    if has_game_dir && !game_dir_has_files {
+        issues.push("Game/ directory is empty (all game EXEs, DLLs, and assets must be bundled inside the .app)".into());
+    }
     if has_game_toml {
         if let Ok(text) = fs::read_to_string(&game_toml_path) {
             let m = parse_simple_manifest(&text);
             if let Some(exe_rel) = m.exe {
                 bundled_exe_present = game_dir.join(&exe_rel).is_file();
-                if game_dir_has_files && !bundled_exe_present {
+                if !bundled_exe_present {
                     issues.push(format!("Game/{exe_rel} referenced by game.toml is missing"));
                 }
             }
@@ -1532,8 +1541,8 @@ mod tests {
         assert!(plist.contains("<string>arm64</string>"));
         assert!(plist.contains("<string>metal</string>"));
         assert!(plist.contains("<string>iphoneos</string>"));
-        assert!(plist.contains("<key>UIFileSharingEnabled</key>"));
-        assert!(plist.contains("<key>LSSupportsOpeningDocumentsInPlace</key>"));
+        assert!(!plist.contains("<key>UIFileSharingEnabled</key>"));
+        assert!(!plist.contains("<key>LSSupportsOpeningDocumentsInPlace</key>"));
 
         let yaml = render_xcodegen_spec(
             "TestGame",
@@ -1581,7 +1590,21 @@ mod tests {
         assert_eq!(rep.host_mtl4a_files, 1);
         assert!(rep.issues.iter().any(|i| i.contains("platform is macOS")));
         assert!(rep.issues.iter().any(|i| i.contains("missing flat bundle game.toml")));
+        assert!(rep.issues.iter().any(|i| i.contains("Game/ directory is empty")));
         assert!(rep.issues.iter().any(|i| i.contains("host-specific *.mtl4a")));
+
+        // Also ensure Documents file sharing keys and symlinked Game/ fail verification.
+        let bad_plist = render_ios_info_plist("Bad", "BadBin", "com.portfactory.bad", "17.0", IosTarget::Device)
+            .replace("</dict>", "    <key>UIFileSharingEnabled</key>\n    <true/>\n</dict>");
+        fs::write(app.join("Info.plist"), bad_plist).unwrap();
+        let ext_dir = tmp.join("ExternalGame");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::remove_dir_all(app.join("Game")).unwrap();
+        std::os::unix::fs::symlink(&ext_dir, app.join("Game")).unwrap();
+        let rep2 = verify_ios_bundle(&app).unwrap();
+        assert!(!rep2.ok());
+        assert!(rep2.issues.iter().any(|i| i.contains("Documents file sharing")));
+        assert!(rep2.issues.iter().any(|i| i.contains("not a symlink")));
         let _ = fs::remove_dir_all(&tmp);
     }
 

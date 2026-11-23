@@ -164,10 +164,6 @@ fn fallback_cache_roots() -> Vec<PathBuf> {
     }
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(Path::new(&home).join("Library/Caches/port-factory/shaders"));
-        if cfg!(target_os = "ios") {
-            roots.push(Path::new(&home).join("Documents/ShaderCache"));
-            roots.push(Path::new(&home).join("Documents/Translator/ShaderCache"));
-        }
     }
     roots
 }

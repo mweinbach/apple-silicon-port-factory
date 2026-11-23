@@ -84,7 +84,7 @@ fn usage() -> ! {
                                                 Offline-precompile relocatable ARM64 .aot block caches via port-runner\n\
            aot-static-obj <PE_OR_AOT> --out <DIR_OR_O> [--platform ios|ios-sim|macos] [--game-dir DIR] [--max-funcs N]\n\
                                                 Compile PE or v5 .aot into Apple-signed ARM64 Mach-O .aot.o object(s) (zero MAP_JIT)\n\
-           ios-bundle <PE_OR_DIR_OR_TOML> --out <PATH.app|PATH.ipa> [--target device|sim] [--title NAME] [--bundle-id ID] [--exe NAME] [--manifest FILE] [--release] [--deployment-target 17.0] [--no-copy-game] [--no-static-aot] [--aot-max-funcs N] [--extra-aot-obj FILE.o] [--no-precompile-shaders] [--bundle-shader-cache [DIR]] [--optimize-storage none|lossless|high|compact] [--hevc-videos] [--no-hevc-videos] [--video-max-height N] [--video-bitrate KBPS] [--max-tex-dim N] [--strip-unused-dlls] [--keep-lang CODE] [--strip-dlc] [--opt-jobs N] [--optimized-game-out DIR] [--opt-dry-run] [--sign ID] [--provisioning-profile FILE] [--xcode-project]\n\
+           ios-bundle <PE_OR_DIR_OR_TOML> --out <PATH.app|PATH.ipa> [--target device|sim] [--title NAME] [--bundle-id ID] [--exe NAME] [--manifest FILE] [--release] [--deployment-target 17.0] [--no-static-aot] [--aot-max-funcs N] [--extra-aot-obj FILE.o] [--no-precompile-shaders] [--bundle-shader-cache [DIR]] [--optimize-storage none|lossless|high|compact] [--hevc-videos] [--no-hevc-videos] [--video-max-height N] [--video-bitrate KBPS] [--max-tex-dim N] [--strip-unused-dlls] [--keep-lang CODE] [--strip-dlc] [--opt-jobs N] [--opt-dry-run] [--sign ID] [--provisioning-profile FILE] [--xcode-project]\n\
                                                 One-command iOS / iOS Simulator .app or .ipa packager with signed static .aot.o, Tier-1 shaders & optional storage optimization\n\
            ios-verify <PATH.app|PATH.ipa>       Verify an iOS .app bundle or .ipa archive (ARM64 iOS Mach-O, static AOT, shaders, signature)\n\
            optimize-assets <SRC_DIR> --out <DST_DIR> [--profile lossless|high|compact] [--manifest FILE] [--hevc-videos] [--no-hevc-videos] [--video-max-height N] [--video-bitrate KBPS] [--max-tex-dim N] [--strip-unused-dlls] [--keep-lang CODE] [--strip-dlc] [--jobs N] [--dry-run]\n\
@@ -100,7 +100,7 @@ fn usage() -> ! {
                                                 Download or repair a Windows x64 Steam depot & run post-install setup\n\
            steam-postinstall <GAME_DIR> [--appid ID] [--out DIR]\n\
                                                 Extract installscript.vdf registry & satisfy _CommonRedist\n\
-           steam-convert <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--copy-game|--symlink-game] [--max-fns N] [--bundle-shader-cache [DIR]]\n\
+           steam-convert <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--max-fns N] [--bundle-shader-cache [DIR]]\n\
                                                 One-click convert a Steam game or steam.exe to macOS .app / AOT\n\
            steam-port <APPID_OR_NAME> [--qr | --user ACCOUNT] [--validate] [--skip-download] [--out PATH.app] [--copy-to /Volumes/SSD] [--dry-run]\n\
                                                 Full end-to-end pipeline: Steam download -> .app bundle -> verify -> optional SSD copy\n\
@@ -905,7 +905,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     let mut manifest_override: Option<PathBuf> = None;
     let mut release = false;
     let mut deployment_target = "17.0".to_string();
-    let mut copy_game = true;
     let mut emit_static_aot = true;
     let mut aot_max_funcs = 0usize;
     let mut extra_aot_objs: Vec<PathBuf> = Vec::new();
@@ -915,7 +914,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     let mut provisioning_profile: Option<PathBuf> = None;
     let mut emit_xcodegen_spec = false;
     let mut storage_opt = StorageOptOptions::from_profile(StorageOptProfile::None);
-    let mut optimized_game_out: Option<PathBuf> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -951,7 +949,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
                 i += 1;
                 deployment_target = args.get(i).unwrap_or_else(|| usage()).clone();
             }
-            "--no-copy-game" => copy_game = false,
             "--no-static-aot" => emit_static_aot = false,
             "--aot-max-funcs" | "--max-funcs" => {
                 i += 1;
@@ -1020,10 +1017,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
                 let raw = args.get(i).unwrap_or_else(|| usage());
                 storage_opt.jobs = raw.parse().with_context(|| format!("invalid --opt-jobs {raw:?}"))?;
             }
-            "--optimized-game-out" => {
-                i += 1;
-                optimized_game_out = Some(PathBuf::from(args.get(i).unwrap_or_else(|| usage())));
-            }
             "--opt-dry-run" => storage_opt.dry_run = true,
             "--sign" | "--codesign" => {
                 i += 1;
@@ -1062,7 +1055,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     opts.manifest_override = manifest_override;
     opts.release = release;
     opts.deployment_target = deployment_target;
-    opts.copy_game = copy_game;
     opts.emit_static_aot = emit_static_aot;
     opts.aot_max_funcs = aot_max_funcs;
     opts.extra_aot_objs = extra_aot_objs;
@@ -1074,7 +1066,6 @@ fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     if storage_opt.is_enabled() {
         opts.storage_opt = Some(storage_opt.clone());
     }
-    opts.optimized_game_out = optimized_game_out;
 
     let rep = build_ios_bundle(&opts)?;
     println!("=== iOS Bundle Built ===");
@@ -2238,13 +2229,12 @@ fn cmd_steam_postinstall(args: &[String]) -> Result<()> {
 fn cmd_steam_convert(args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!(
-            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH] [--symlink-game]"
+            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH]"
         );
     }
     let mut target: Option<String> = None;
     let mut format = ConversionFormat::MacOsApp;
     let mut output_path: Option<PathBuf> = None;
-    let mut symlink_game = false;
     let mut precompile_shaders = true;
     let mut max_aot_functions = 2000usize;
     let mut bundle_shader_cache_from: Option<PathBuf> = None;
@@ -2267,11 +2257,7 @@ fn cmd_steam_convert(args: &[String]) -> Result<()> {
                 i += 2;
             }
             "--copy-game" => {
-                symlink_game = false;
-                i += 1;
-            }
-            "--symlink-game" => {
-                symlink_game = true;
+                // Self-contained copy into `Contents/Resources/Game` is always enabled.
                 i += 1;
             }
             "--no-shaders" => {
@@ -2308,7 +2294,6 @@ fn cmd_steam_convert(args: &[String]) -> Result<()> {
         target,
         format,
         output_path,
-        symlink_game,
         precompile_shaders,
         max_aot_functions,
         bundle_shader_cache_from,
