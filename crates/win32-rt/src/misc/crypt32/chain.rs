@@ -1,0 +1,1030 @@
+//! Certificate chain engine, WebPKI chain verification, policy checks, and
+//! time-validity evaluation for `crypt32.dll`.
+
+use super::asn1::{
+    cert_eku_oids, der_item_children, parse_cert_der_parts, parse_der_item, CertDerParts,
+};
+use super::store::{lookup_cert_for_chain, store_certs_der, ERROR_CALL_NOT_IMPLEMENTED};
+use crate::handles::HandleTable;
+use crate::misc::wintrust::{
+    self, CertChainContext, CertChainElement, CertContext, CertInfo, CertSimpleChain,
+    CertTrustStatus, OwnedCertContext,
+};
+use crate::net_tls::{
+    self, SECURITY_FLAG_IGNORE_CERT_CN_INVALID, SECURITY_FLAG_IGNORE_CERT_DATE_INVALID,
+    SECURITY_FLAG_IGNORE_UNKNOWN_CA,
+};
+use crate::types::*;
+use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use std::ffi::c_void;
+use std::sync::Arc;
+
+pub(super) const CERT_CHAIN_POLICY_BASE: usize = 1;
+pub(super) const CERT_CHAIN_POLICY_AUTHENTICODE: usize = 2;
+const CERT_CHAIN_POLICY_AUTHENTICODE_TS: usize = 3;
+pub(super) const CERT_CHAIN_POLICY_SSL: usize = 4;
+
+// CERT_CHAIN_POLICY_PARA.dwFlags
+pub(super) const CERT_CHAIN_POLICY_IGNORE_NOT_TIME_VALID_FLAG: u32 = 0x0000_0001;
+const CERT_CHAIN_POLICY_IGNORE_ALL_NOT_TIME_VALID_FLAGS: u32 = 0x0000_0007;
+pub(super) const CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG: u32 = 0x0000_0010;
+const CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG: u32 = 0x0000_0020;
+const CERT_CHAIN_POLICY_IGNORE_INVALID_NAME_FLAG: u32 = 0x0000_0040;
+
+// Windows CERT_E_* verification status codes
+pub(crate) const CERT_E_EXPIRED: u32 = 0x800B_0101;
+pub(crate) const CERT_E_UNTRUSTEDROOT: u32 = 0x800B_0109;
+pub(crate) const CERT_E_CHAINING: u32 = 0x800B_010A;
+pub(crate) const CERT_E_REVOKED: u32 = 0x800B_010C;
+pub(crate) const CERT_E_CN_NO_MATCH: u32 = 0x800B_010F;
+pub(crate) const CERT_E_WRONG_USAGE: u32 = 0x800B_0110;
+
+// CERT_TRUST_STATUS.dwErrorStatus bits
+const CERT_TRUST_IS_NOT_TIME_VALID: u32 = 0x0000_0001;
+const CERT_TRUST_IS_REVOKED: u32 = 0x0000_0004;
+const CERT_TRUST_IS_UNTRUSTED_ROOT: u32 = 0x0000_0020;
+const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
+const CERT_TRUST_IS_NOT_VALID_FOR_USAGE: u32 = 0x0000_0010;
+
+// ---------------------------------------------------------------------------
+// Chain engine & chain registries (backed by `HandleTable`)
+// ---------------------------------------------------------------------------
+
+struct RegisteredEngine {
+    exclusive_roots_der: Option<Vec<Vec<u8>>>,
+    additional_certs_der: Vec<Vec<u8>>,
+}
+
+struct RegisteredChain {
+    _certs: Vec<OwnedCertContext>,
+    _elements: Vec<Box<CertChainElement>>,
+    _element_ptrs: Box<[*const CertChainElement]>,
+    _simple_chain: Box<CertSimpleChain>,
+    _simple_chain_ptrs: Box<[*const CertSimpleChain]>,
+    _chain_context: Box<CertChainContext>,
+    chain_der: Vec<Vec<u8>>,
+    element_times: Vec<(u64, u64)>,
+    verify_filetime: Option<u64>,
+    exclusive_roots_der: Option<Vec<Vec<u8>>>,
+    extra_roots_der: Vec<Vec<u8>>,
+    default_chain_error: u32,
+}
+
+unsafe impl Send for RegisteredChain {}
+
+static ENGINES: HandleTable<RegisteredEngine> = HandleTable::new(0x5200_0001, 1);
+static CHAINS: HandleTable<RegisteredChain> = HandleTable::new(0x5400_0001, 1);
+
+// ---------------------------------------------------------------------------
+// Time, hostname, signature, and WebPKI verification helpers
+// ---------------------------------------------------------------------------
+
+fn now_filetime() -> u64 {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (dur.as_secs().saturating_add(11_644_473_600))
+        .saturating_mul(10_000_000)
+        .saturating_add((dur.subsec_nanos() / 100) as u64)
+}
+
+fn filetime_to_unix_time(ft: u64) -> Option<UnixTime> {
+    const EPOCH_DIFF_100NS: u64 = 11_644_473_600u64 * 10_000_000;
+    let unix_100ns = ft.checked_sub(EPOCH_DIFF_100NS)?;
+    let secs = unix_100ns / 10_000_000;
+    let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
+    Some(UnixTime::since_unix_epoch(std::time::Duration::new(
+        secs, nanos,
+    )))
+}
+
+fn dns_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pat = pattern.trim_end_matches('.').to_ascii_lowercase();
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if pat.is_empty() || h.is_empty() {
+        return false;
+    }
+    if pat == h {
+        return true;
+    }
+    // RFC 6125 leftmost single-label wildcard (*.example.com)
+    if let Some(suffix) = pat.strip_prefix("*.") {
+        if suffix.contains('*') || !suffix.contains('.') {
+            return false;
+        }
+        if let Some(prefix) = h.strip_suffix(suffix).and_then(|p| p.strip_suffix('.')) {
+            return !prefix.is_empty() && !prefix.contains('.');
+        }
+    }
+    false
+}
+
+/// Check whether `leaf_der` matches `server_name` (DNS or IP) per RFC 6125:
+/// checks SAN (`2.5.29.17`) `dNSName` / `iPAddress`, falling back to Subject CN
+/// only when no SAN extension is present.
+fn cert_matches_hostname(leaf_der: &[u8], server_name: &str) -> bool {
+    let Some(parts) = parse_cert_der_parts(leaf_der) else {
+        return false;
+    };
+    let clean = server_name
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if clean.is_empty() {
+        return false;
+    }
+    let ip_query: Option<std::net::IpAddr> = clean.parse().ok();
+
+    const OID_SAN: &[u8] = &[0x55, 0x1D, 0x11];
+    let mut saw_san = false;
+    for (oid, _, val) in &parts.extensions {
+        if *oid != OID_SAN {
+            continue;
+        }
+        saw_san = true;
+        let Some((seq, _)) = parse_der_item(val) else {
+            continue;
+        };
+        if seq.tag != 0x30 {
+            continue;
+        }
+        let Some(entries) = der_item_children(seq.val) else {
+            continue;
+        };
+        for entry in entries {
+            match entry.tag {
+                0x82 if ip_query.is_none() => {
+                    if let Ok(dns) = std::str::from_utf8(entry.val) {
+                        if dns_pattern_matches(dns, clean) {
+                            return true;
+                        }
+                    }
+                }
+                0x87 => {
+                    if let Some(ip) = ip_query {
+                        let matched = match (ip, entry.val.len()) {
+                            (std::net::IpAddr::V4(v4), 4) => v4.octets() == entry.val,
+                            (std::net::IpAddr::V6(v6), 16) => v6.octets() == entry.val,
+                            _ => false,
+                        };
+                        if matched {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if saw_san {
+        return false;
+    }
+    // Fallback to Subject CN when no SAN extension exists.
+    if let Some(cn) = wintrust::extract_dn_attr(parts.subject_raw, &[0x55, 0x04, 0x03]) {
+        if ip_query.is_some() {
+            return cn.trim().eq_ignore_ascii_case(clean);
+        }
+        return dns_pattern_matches(&cn, clean);
+    }
+    false
+}
+
+pub(super) fn verify_cert_sig_with_spki(
+    child: &CertDerParts<'_>,
+    spki_alg_inner: &[u8],
+    spki_key_bits: &[u8],
+) -> bool {
+    let provider = net_tls::crypto_provider();
+    for alg in provider.signature_verification_algorithms.all {
+        if alg.public_key_alg_id().as_ref() == spki_alg_inner
+            && alg.signature_alg_id().as_ref() == child.sig_alg_inner
+            && alg
+                .verify_signature(spki_key_bits, child.tbs_raw, child.sig_bits)
+                .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify cryptographic chain signatures from `chain_der[0]` up to a trusted root
+/// without requiring TLS `serverAuth` EKU (used by `CERT_CHAIN_POLICY_BASE` and
+/// `CERT_CHAIN_POLICY_AUTHENTICODE`).
+fn verify_chain_signatures_to_roots(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+) -> bool {
+    if chain_der.is_empty() {
+        return false;
+    }
+    // Collect candidate trust anchors as (subject_inner, spki_inner, spki_alg_inner, spki_key_bits).
+    let mut root_parts: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    let push_root_der = |dst: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>, der: &[u8]| {
+        if let Some(p) = parse_cert_der_parts(der) {
+            dst.push((
+                p.subject_inner.to_vec(),
+                p.spki_inner.to_vec(),
+                p.spki_alg_inner.to_vec(),
+                p.spki_key_bits.to_vec(),
+            ));
+        }
+    };
+    if let Some(excl) = exclusive_roots_der {
+        for der in excl {
+            push_root_der(&mut root_parts, der);
+        }
+    } else {
+        for der in extra_roots_der {
+            push_root_der(&mut root_parts, der);
+        }
+        for ta in webpki_roots::TLS_SERVER_ROOTS {
+            if let Ok(kids) = der_item_children(ta.subject_public_key_info.as_ref()).ok_or(()) {
+                if kids.len() >= 2
+                    && kids[0].tag == 0x30
+                    && kids[1].tag == 0x03
+                    && !kids[1].val.is_empty()
+                {
+                    root_parts.push((
+                        ta.subject.as_ref().to_vec(),
+                        ta.subject_public_key_info.as_ref().to_vec(),
+                        kids[0].val.to_vec(),
+                        kids[1].val[1..].to_vec(),
+                    ));
+                }
+            }
+        }
+    }
+    if root_parts.is_empty() {
+        return false;
+    }
+
+    let parsed: Vec<Option<CertDerParts<'_>>> = chain_der
+        .iter()
+        .map(|d| parse_cert_der_parts(d))
+        .collect();
+    let Some(mut cur) = parsed[0].as_ref() else {
+        return false;
+    };
+
+    // Walk up to 16 chain links looking for a trusted root.
+    let mut visited = vec![false; chain_der.len()];
+    visited[0] = true;
+    for _ in 0..16 {
+        // Direct match: cur itself is a trusted root (same subject + SPKI).
+        if root_parts.iter().any(|(subj, spki, _, _)| {
+            subj.as_slice() == cur.subject_inner && spki.as_slice() == cur.spki_inner
+        }) {
+            return true;
+        }
+        // Signed directly by a trusted root?
+        if root_parts.iter().any(|(subj, _, alg, key)| {
+            subj.as_slice() == cur.issuer_inner && verify_cert_sig_with_spki(cur, alg, key)
+        }) {
+            return true;
+        }
+        // Otherwise look for an intermediate issuer in chain_der.
+        let mut next_idx = None;
+        for (i, cand) in parsed.iter().enumerate() {
+            if visited[i] {
+                continue;
+            }
+            if let Some(p) = cand.as_ref() {
+                if p.subject_inner == cur.issuer_inner
+                    && verify_cert_sig_with_spki(cur, p.spki_alg_inner, p.spki_key_bits)
+                {
+                    next_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(ni) = next_idx else {
+            return false;
+        };
+        visited[ni] = true;
+        cur = parsed[ni].as_ref().unwrap();
+    }
+    false
+}
+
+/// Map a `rustls::Error` from `WebPkiServerVerifier::verify_server_cert` to a Windows `CERT_E_*` code.
+pub(crate) fn map_rustls_cert_error(err: &rustls::Error, ignore_hostname: bool) -> u32 {
+    match err {
+        rustls::Error::InvalidCertificate(cert_err) => match cert_err {
+            rustls::CertificateError::Expired
+            | rustls::CertificateError::NotValidYet
+            | rustls::CertificateError::ExpiredContext { .. }
+            | rustls::CertificateError::NotValidYetContext { .. } => CERT_E_EXPIRED,
+            rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::NotValidForNameContext { .. } => {
+                if ignore_hostname {
+                    0
+                } else {
+                    CERT_E_CN_NO_MATCH
+                }
+            }
+            rustls::CertificateError::Revoked => CERT_E_REVOKED,
+            rustls::CertificateError::InvalidPurpose
+            | rustls::CertificateError::InvalidPurposeContext { .. } => CERT_E_WRONG_USAGE,
+            _ => CERT_E_UNTRUSTEDROOT,
+        },
+        _ => CERT_E_CHAINING,
+    }
+}
+
+fn cert_error_to_trust_status(cert_error: u32) -> u32 {
+    match cert_error {
+        0 => 0,
+        CERT_E_EXPIRED => CERT_TRUST_IS_NOT_TIME_VALID,
+        CERT_E_REVOKED => CERT_TRUST_IS_REVOKED,
+        CERT_E_UNTRUSTEDROOT => CERT_TRUST_IS_UNTRUSTED_ROOT,
+        CERT_E_WRONG_USAGE => CERT_TRUST_IS_NOT_VALID_FOR_USAGE,
+        CERT_E_CHAINING => CERT_TRUST_IS_PARTIAL_CHAIN,
+        // Hostname mismatch is evaluated at SSL policy time, not raw chain status.
+        CERT_E_CN_NO_MATCH => 0,
+        _ => CERT_TRUST_IS_UNTRUSTED_ROOT,
+    }
+}
+
+/// Verify an X.509 certificate chain (`[leaf, intermediates...]`) using `rustls`'s WebPKI
+/// verifier against either an exclusive root store or the embedded `webpki-roots` bundle.
+/// Returns `0` on success or a Windows `CERT_E_*` error code on failure.
+fn verify_chain_webpki_at(
+    chain_der: &[Vec<u8>],
+    server_name: Option<&str>,
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+    ignore_hostname: bool,
+    at_time: UnixTime,
+) -> u32 {
+    let Some((leaf, intermediates)) = chain_der.split_first() else {
+        return CERT_E_CHAINING;
+    };
+    let roots = if let Some(excl) = exclusive_roots_der {
+        let mut s = rustls::RootCertStore::empty();
+        for der in excl {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    } else if extra_roots_der.is_empty() {
+        net_tls::root_cert_store()
+    } else {
+        let mut s = (*net_tls::root_cert_store()).clone();
+        for der in extra_roots_der {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    };
+    if roots.is_empty() {
+        return CERT_E_UNTRUSTEDROOT;
+    }
+    let verifier = match net_tls::build_webpki_verifier(roots) {
+        Ok(v) => v,
+        Err(_) => return CERT_E_UNTRUSTEDROOT,
+    };
+
+    let (sname, effective_ignore_host) = match server_name.map(str::trim).filter(|s| !s.is_empty())
+    {
+        Some(host) => {
+            let clean = host.trim_start_matches('[').trim_end_matches(']');
+            match ServerName::try_from(clean.to_string()) {
+                Ok(sn) => (sn, ignore_hostname),
+                Err(_) => {
+                    if ignore_hostname {
+                        (
+                            ServerName::try_from("localhost".to_string()).unwrap(),
+                            true,
+                        )
+                    } else {
+                        return CERT_E_CN_NO_MATCH;
+                    }
+                }
+            }
+        }
+        None => (
+            ServerName::try_from("localhost".to_string()).unwrap(),
+            true,
+        ),
+    };
+
+    let end_entity = CertificateDer::from(leaf.as_slice());
+    let inters: Vec<CertificateDer<'_>> = intermediates
+        .iter()
+        .map(|d| CertificateDer::from(d.as_slice()))
+        .collect();
+    match verifier.verify_server_cert(&end_entity, &inters, &sname, &[], at_time) {
+        Ok(_) => 0,
+        Err(ref e) => map_rustls_cert_error(e, effective_ignore_host),
+    }
+}
+
+/// Evaluate WebPKI chain trust for a manually-validated TLS peer chain against
+/// the embedded `webpki-roots` bundle plus optional `SCHANNEL_CRED.hRootStore` roots.
+pub(crate) fn verify_peer_chain_error(
+    chain_der: &[Vec<u8>],
+    server_name: Option<&str>,
+    extra_roots_der: &[Vec<u8>],
+    ignore_hostname: bool,
+) -> u32 {
+    verify_chain_webpki_at(
+        chain_der,
+        server_name,
+        None,
+        extra_roots_der,
+        ignore_hostname,
+        UnixTime::now(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Certificate Chain Engine & Policy Verification implementations
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct CertChainPolicyPara {
+    pub(super) cb_size: u32,
+    pub(super) dw_flags: u32,
+    pub(super) pv_extra_policy_para: *const c_void,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct CertChainPolicyStatus {
+    pub(super) cb_size: u32,
+    pub(super) dw_error: u32,
+    pub(super) l_chain_index: i32,
+    pub(super) l_element_index: i32,
+    pub(super) pv_extra_policy_status: *mut c_void,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SslExtraCertChainPolicyPara {
+    pub(super) cb_size: u32,
+    pub(super) dw_auth_type: u32,
+    pub(super) fdw_checks: u32,
+    pub(super) pwsz_server_name: *const u16,
+}
+
+fn trust_status_to_cert_error(dw_error_status: u32) -> u32 {
+    if dw_error_status == 0 {
+        0
+    } else if (dw_error_status & CERT_TRUST_IS_REVOKED) != 0 {
+        CERT_E_REVOKED
+    } else if (dw_error_status & CERT_TRUST_IS_NOT_TIME_VALID) != 0 {
+        CERT_E_EXPIRED
+    } else if (dw_error_status & CERT_TRUST_IS_UNTRUSTED_ROOT) != 0 {
+        CERT_E_UNTRUSTEDROOT
+    } else if (dw_error_status & CERT_TRUST_IS_NOT_VALID_FOR_USAGE) != 0 {
+        CERT_E_WRONG_USAGE
+    } else if (dw_error_status & CERT_TRUST_IS_PARTIAL_CHAIN) != 0 {
+        CERT_E_CHAINING
+    } else {
+        CERT_E_UNTRUSTEDROOT
+    }
+}
+
+unsafe fn extract_external_chain(
+    p_chain_context: *const c_void,
+) -> Option<(Vec<Vec<u8>>, Vec<(u64, u64)>, u32)> {
+    let ctx = std::ptr::read_unaligned(p_chain_context as *const CertChainContext);
+    if ctx.c_chain == 0 || ctx.rgp_chain.is_null() {
+        return None;
+    }
+    let simple_ptr = std::ptr::read_unaligned(ctx.rgp_chain);
+    if simple_ptr.is_null() {
+        return None;
+    }
+    let simple = std::ptr::read_unaligned(simple_ptr);
+    if simple.c_element == 0 || simple.rgp_element.is_null() {
+        return None;
+    }
+    let mut ders = Vec::with_capacity(simple.c_element as usize);
+    let mut times = Vec::with_capacity(simple.c_element as usize);
+    for i in 0..simple.c_element as usize {
+        let el_ptr = std::ptr::read_unaligned(simple.rgp_element.add(i));
+        if el_ptr.is_null() {
+            continue;
+        }
+        let el = std::ptr::read_unaligned(el_ptr);
+        if el.p_cert_context.is_null() {
+            continue;
+        }
+        let cc = std::ptr::read_unaligned(el.p_cert_context);
+        if cc.pb_cert_encoded.is_null() || cc.cb_cert_encoded == 0 {
+            continue;
+        }
+        let der =
+            std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize).to_vec();
+        let (nb, na) = if !cc.p_cert_info.is_null() {
+            let ci = std::ptr::read_unaligned(cc.p_cert_info);
+            (ci.not_before, ci.not_after)
+        } else {
+            (0, 0)
+        };
+        ders.push(der);
+        times.push((nb, na));
+    }
+    if ders.is_empty() {
+        return None;
+    }
+    Some((
+        ders,
+        times,
+        trust_status_to_cert_error(ctx.trust_status.dw_error_status),
+    ))
+}
+
+pub(super) unsafe fn cert_create_certificate_chain_engine_impl(
+    p_config: *const c_void,
+    ph_chain_engine: *mut *mut c_void,
+) -> BOOL {
+    if p_config.is_null() || ph_chain_engine.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let base = p_config as *const u8;
+    let cb_size = std::ptr::read_unaligned(base as *const u32);
+    if cb_size < 0x40 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let h_restricted_root = std::ptr::read_unaligned(base.add(0x08) as *const *mut c_void);
+    let c_additional = std::ptr::read_unaligned(base.add(0x20) as *const u32);
+    let rgh_additional = std::ptr::read_unaligned(base.add(0x28) as *const *const *mut c_void);
+    let h_exclusive_root = if cb_size >= 0x48 {
+        std::ptr::read_unaligned(base.add(0x40) as *const *mut c_void)
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let exclusive_roots_der = if !h_exclusive_root.is_null() {
+        Some(store_certs_der(h_exclusive_root))
+    } else if !h_restricted_root.is_null() {
+        Some(store_certs_der(h_restricted_root))
+    } else {
+        None
+    };
+
+    let mut additional_certs_der = Vec::new();
+    if c_additional > 0 && !rgh_additional.is_null() {
+        for i in 0..c_additional as usize {
+            let store_h = std::ptr::read_unaligned(rgh_additional.add(i));
+            additional_certs_der.extend(store_certs_der(store_h));
+        }
+    }
+
+    let id = ENGINES.insert(RegisteredEngine {
+        exclusive_roots_der,
+        additional_certs_der,
+    });
+    std::ptr::write_unaligned(ph_chain_engine, id as *mut c_void);
+    TRUE
+}
+
+pub(super) fn cert_free_certificate_chain_engine_impl(engine: *mut c_void) {
+    if engine.is_null() {
+        return;
+    }
+    if ENGINES.remove(engine as usize).is_none() {
+        stub!("CertFreeCertificateChainEngine({engine:p}): foreign engine ignored");
+    }
+}
+
+pub(super) unsafe fn cert_get_certificate_chain_impl(
+    h_chain_engine: *mut c_void,
+    p_cert_context: *const c_void,
+    p_time: *const c_void,
+    h_additional_store: *mut c_void,
+    pp_chain_context: *mut *mut c_void,
+) -> BOOL {
+    if p_cert_context.is_null() || pp_chain_context.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let verify_filetime = if p_time.is_null() {
+        None
+    } else {
+        Some(std::ptr::read_unaligned(p_time as *const u64))
+    };
+    let verify_unix = verify_filetime
+        .and_then(filetime_to_unix_time)
+        .unwrap_or_else(UnixTime::now);
+    let check_ft = verify_filetime.unwrap_or_else(now_filetime);
+
+    let (mut chain_der, peer_verify) =
+        if let Some(pair) = lookup_cert_for_chain(p_cert_context as usize) {
+            pair
+        } else {
+            let cc = std::ptr::read_unaligned(p_cert_context as *const CertContext);
+            if cc.pb_cert_encoded.is_null() || cc.cb_cert_encoded == 0 {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let der = std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize);
+            (vec![der.to_vec()], None)
+        };
+
+    let (exclusive_roots_der, engine_extra) =
+        if !h_chain_engine.is_null() && (h_chain_engine as usize) > 1 {
+            ENGINES
+                .with(h_chain_engine as usize, |eng| {
+                    (
+                        eng.exclusive_roots_der.clone(),
+                        eng.additional_certs_der.clone(),
+                    )
+                })
+                .unwrap_or((None, Vec::new()))
+        } else {
+            (None, Vec::new())
+        };
+
+    let mut extra_roots_der = peer_verify
+        .as_ref()
+        .map(|v| v.extra_roots_der.clone())
+        .unwrap_or_default();
+    extra_roots_der.extend(engine_extra);
+
+    // Include any intermediates from hAdditionalStore (without duplicating leaf or intermediates).
+    for der in store_certs_der(h_additional_store) {
+        if !chain_der.iter().any(|c| c == &der) {
+            chain_der.push(der);
+        }
+    }
+
+    // Verify chain trust (ignoring hostname here; hostname is checked in CertVerifyCertificateChainPolicy).
+    let default_chain_error = if exclusive_roots_der.is_none() {
+        if let Some(ref pv) = peer_verify {
+            if verify_filetime.is_some() {
+                verify_chain_webpki_at(&chain_der, None, None, &extra_roots_der, true, verify_unix)
+            } else if pv.cert_error == CERT_E_CN_NO_MATCH {
+                0
+            } else {
+                pv.cert_error
+            }
+        } else {
+            verify_chain_webpki_at(&chain_der, None, None, &extra_roots_der, true, verify_unix)
+        }
+    } else {
+        extra_roots_der.clear();
+        verify_chain_webpki_at(
+            &chain_der,
+            None,
+            exclusive_roots_der.as_deref(),
+            &[],
+            true,
+            verify_unix,
+        )
+    };
+
+    let mut owned_certs = Vec::with_capacity(chain_der.len());
+    let mut element_times = Vec::with_capacity(chain_der.len());
+    for der in &chain_der {
+        if let Some(c) = wintrust::build_owned_cert_context(der, std::ptr::null_mut()) {
+            let ci = &*(*c.as_ptr()).p_cert_info;
+            element_times.push((ci.not_before, ci.not_after));
+            owned_certs.push(c);
+        }
+    }
+    if owned_certs.is_empty() {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    let mut trust_err_bits = cert_error_to_trust_status(default_chain_error);
+    let mut elements = Vec::with_capacity(owned_certs.len());
+    let mut element_ptrs = Vec::with_capacity(owned_certs.len());
+    for (idx, cert) in owned_certs.iter().enumerate() {
+        let info_status = if cert.is_self_signed() {
+            0x0000_0108
+        } else {
+            0x0000_0100
+        };
+        let (nb, na) = element_times[idx];
+        let time_bad = (nb > 0 && check_ft < nb) || (na > 0 && check_ft > na);
+        let mut elem_err = if idx == 0 { trust_err_bits } else { 0 };
+        if time_bad {
+            elem_err |= CERT_TRUST_IS_NOT_TIME_VALID;
+            trust_err_bits |= CERT_TRUST_IS_NOT_TIME_VALID;
+        }
+        let el = Box::new(CertChainElement {
+            cb_size: std::mem::size_of::<CertChainElement>() as u32,
+            p_cert_context: cert.as_ptr(),
+            trust_status: CertTrustStatus {
+                dw_error_status: elem_err,
+                dw_info_status: info_status,
+            },
+            p_revocation_info: std::ptr::null_mut(),
+            p_issuance_usage: std::ptr::null_mut(),
+            p_application_usage: std::ptr::null_mut(),
+            pwsz_extended_error_info: std::ptr::null(),
+        });
+        element_ptrs.push(&*el as *const CertChainElement);
+        elements.push(el);
+    }
+
+    let element_ptrs = element_ptrs.into_boxed_slice();
+    let simple_chain = Box::new(CertSimpleChain {
+        cb_size: std::mem::size_of::<CertSimpleChain>() as u32,
+        trust_status: CertTrustStatus {
+            dw_error_status: trust_err_bits,
+            dw_info_status: 0,
+        },
+        c_element: elements.len() as u32,
+        rgp_element: element_ptrs.as_ptr(),
+        p_trust_list_info: std::ptr::null_mut(),
+        f_has_revocation_freshness_time: 0,
+        dw_revocation_freshness_time: 0,
+    });
+    let simple_chain_ptrs = vec![&*simple_chain as *const CertSimpleChain].into_boxed_slice();
+    let chain_context = Box::new(CertChainContext {
+        cb_size: std::mem::size_of::<CertChainContext>() as u32,
+        trust_status: CertTrustStatus {
+            dw_error_status: trust_err_bits,
+            dw_info_status: 0,
+        },
+        c_chain: 1,
+        rgp_chain: simple_chain_ptrs.as_ptr(),
+        c_lower_quality_chain_context: 0,
+        rgp_lower_quality_chain_context: std::ptr::null_mut(),
+        f_has_revocation_freshness_time: 0,
+        dw_revocation_freshness_time: 0,
+        dw_create_flags: 0,
+        chain_id: [0; 16],
+    });
+    let ctx_ptr = &*chain_context as *const CertChainContext as usize;
+
+    let _ = CHAINS.insert_at(
+        ctx_ptr,
+        RegisteredChain {
+            _certs: owned_certs,
+            _elements: elements,
+            _element_ptrs: element_ptrs,
+            _simple_chain: simple_chain,
+            _simple_chain_ptrs: simple_chain_ptrs,
+            _chain_context: chain_context,
+            chain_der,
+            element_times,
+            verify_filetime,
+            exclusive_roots_der,
+            extra_roots_der,
+            default_chain_error,
+        },
+    );
+    std::ptr::write_unaligned(pp_chain_context, ctx_ptr as *mut c_void);
+    TRUE
+}
+
+pub(super) fn cert_free_certificate_chain_impl(chain: *mut c_void) {
+    if chain.is_null() {
+        return;
+    }
+    if CHAINS.remove(chain as usize).is_none() {
+        stub!("CertFreeCertificateChain({chain:p}): foreign chain ignored");
+    }
+}
+
+pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
+    psz_policy_oid: *const u8,
+    p_chain_context: *const c_void,
+    p_policy_para: *const c_void,
+    p_policy_status: *mut c_void,
+) -> BOOL {
+    if p_chain_context.is_null() || p_policy_status.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let policy_id = psz_policy_oid as usize;
+    if policy_id != CERT_CHAIN_POLICY_BASE
+        && policy_id != CERT_CHAIN_POLICY_AUTHENTICODE
+        && policy_id != CERT_CHAIN_POLICY_AUTHENTICODE_TS
+        && policy_id != CERT_CHAIN_POLICY_SSL
+    {
+        stub!("CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE");
+        crate::teb::set_last_error(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+
+    let (chain_der, element_times, verify_ft, exclusive_roots, extra_roots, default_chain_error) =
+        if let Some(found) = CHAINS.with(p_chain_context as usize, |c| {
+            (
+                c.chain_der.clone(),
+                c.element_times.clone(),
+                c.verify_filetime,
+                c.exclusive_roots_der.clone(),
+                c.extra_roots_der.clone(),
+                c.default_chain_error,
+            )
+        }) {
+            found
+        } else {
+            let Some((ders, times, ext_err)) = extract_external_chain(p_chain_context) else {
+                crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+                return FALSE;
+            };
+            (ders, times, None, None, Vec::new(), ext_err)
+        };
+
+    let (dw_flags, extra_ptr) = if !p_policy_para.is_null() {
+        let para = std::ptr::read_unaligned(p_policy_para as *const CertChainPolicyPara);
+        (para.dw_flags, para.pv_extra_policy_para)
+    } else {
+        (0, std::ptr::null())
+    };
+
+    let mut fdw_checks = 0u32;
+    let mut server_name: Option<String> = None;
+    if policy_id == CERT_CHAIN_POLICY_SSL && !extra_ptr.is_null() {
+        let ssl = std::ptr::read_unaligned(extra_ptr as *const SslExtraCertChainPolicyPara);
+        fdw_checks = ssl.fdw_checks;
+        if ssl.cb_size >= 0x18 && !ssl.pwsz_server_name.is_null() {
+            let s = crate::strings::from_wide(ssl.pwsz_server_name);
+            if !s.is_empty() {
+                server_name = Some(s);
+            }
+        }
+    }
+
+    let ignore_cn = (fdw_checks & SECURITY_FLAG_IGNORE_CERT_CN_INVALID) != 0
+        || (dw_flags & CERT_CHAIN_POLICY_IGNORE_INVALID_NAME_FLAG) != 0;
+    let ignore_ca = (fdw_checks & SECURITY_FLAG_IGNORE_UNKNOWN_CA) != 0
+        || (dw_flags & CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG) != 0;
+    let ignore_date = (fdw_checks & SECURITY_FLAG_IGNORE_CERT_DATE_INVALID) != 0
+        || (dw_flags & CERT_CHAIN_POLICY_IGNORE_NOT_TIME_VALID_FLAG) != 0
+        || (dw_flags & CERT_CHAIN_POLICY_IGNORE_ALL_NOT_TIME_VALID_FLAGS)
+            == CERT_CHAIN_POLICY_IGNORE_ALL_NOT_TIME_VALID_FLAGS;
+    let ignore_usage = (dw_flags & CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG) != 0;
+
+    let check_ft = verify_ft.unwrap_or_else(now_filetime);
+    let verify_unix = verify_ft
+        .and_then(filetime_to_unix_time)
+        .unwrap_or_else(UnixTime::now);
+    let first_time_invalid_idx = element_times
+        .iter()
+        .position(|&(nb, na)| (nb > 0 && check_ft < nb) || (na > 0 && check_ft > na));
+
+    let (err_code, elem_idx): (u32, i32) = match policy_id {
+        CERT_CHAIN_POLICY_SSL => {
+            let mut raw = verify_chain_webpki_at(
+                &chain_der,
+                server_name.as_deref(),
+                exclusive_roots.as_deref(),
+                &extra_roots,
+                ignore_cn,
+                verify_unix,
+            );
+            if (raw == CERT_E_UNTRUSTEDROOT && ignore_ca)
+                || (raw == CERT_E_EXPIRED && ignore_date)
+                || (raw == CERT_E_CN_NO_MATCH && ignore_cn)
+                || (raw == CERT_E_WRONG_USAGE && ignore_usage)
+            {
+                raw = 0;
+            }
+            // Independent post-checks ensure ignoring one error (e.g. ALLOW_UNKNOWN_CA)
+            // never silently masks an un-ignored expiration or hostname mismatch!
+            if raw == 0 {
+                if !ignore_date {
+                    if let Some(ti) = first_time_invalid_idx {
+                        (CERT_E_EXPIRED, ti as i32)
+                    } else if let Some(ref host) = server_name {
+                        if !ignore_cn
+                            && !chain_der
+                                .first()
+                                .is_some_and(|leaf| cert_matches_hostname(leaf, host))
+                        {
+                            (CERT_E_CN_NO_MATCH, 0)
+                        } else {
+                            (0, -1)
+                        }
+                    } else {
+                        (0, -1)
+                    }
+                } else if let Some(ref host) = server_name {
+                    if !ignore_cn
+                        && !chain_der
+                            .first()
+                            .is_some_and(|leaf| cert_matches_hostname(leaf, host))
+                    {
+                        (CERT_E_CN_NO_MATCH, 0)
+                    } else {
+                        (0, -1)
+                    }
+                } else {
+                    (0, -1)
+                }
+            } else {
+                let ei = if raw == CERT_E_EXPIRED {
+                    first_time_invalid_idx.unwrap_or(0) as i32
+                } else {
+                    0
+                };
+                (raw, ei)
+            }
+        }
+        CERT_CHAIN_POLICY_AUTHENTICODE | CERT_CHAIN_POLICY_AUTHENTICODE_TS => {
+            const OID_CODE_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+            const OID_TIME_STAMPING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+            let req_eku = if policy_id == CERT_CHAIN_POLICY_AUTHENTICODE_TS {
+                OID_TIME_STAMPING
+            } else {
+                OID_CODE_SIGNING
+            };
+            let usage_bad = !ignore_usage
+                && chain_der
+                    .first()
+                    .and_then(|d| cert_eku_oids(d))
+                    .is_some_and(|oids| {
+                        !oids.is_empty()
+                            && !oids
+                                .iter()
+                                .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
+                    });
+            let trust_ok = default_chain_error == 0
+                || verify_chain_signatures_to_roots(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                );
+            if default_chain_error == CERT_E_REVOKED {
+                (CERT_E_REVOKED, 0)
+            } else if usage_bad {
+                (CERT_E_WRONG_USAGE, 0)
+            } else if !ignore_date && first_time_invalid_idx.is_some() {
+                (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
+            } else if !trust_ok && !ignore_ca {
+                (
+                    if default_chain_error == CERT_E_CHAINING {
+                        CERT_E_CHAINING
+                    } else {
+                        CERT_E_UNTRUSTEDROOT
+                    },
+                    0,
+                )
+            } else {
+                (0, -1)
+            }
+        }
+        CERT_CHAIN_POLICY_BASE => {
+            let trust_ok = default_chain_error == 0
+                || verify_chain_signatures_to_roots(
+                    &chain_der,
+                    exclusive_roots.as_deref(),
+                    &extra_roots,
+                );
+            if default_chain_error == CERT_E_REVOKED {
+                (CERT_E_REVOKED, 0)
+            } else if !ignore_date && first_time_invalid_idx.is_some() {
+                (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
+            } else if !trust_ok && !ignore_ca {
+                (
+                    if default_chain_error == CERT_E_CHAINING {
+                        CERT_E_CHAINING
+                    } else {
+                        CERT_E_UNTRUSTEDROOT
+                    },
+                    0,
+                )
+            } else {
+                (0, -1)
+            }
+        }
+        _ => unreachable!(),
+    };
+
+    let mut status = std::ptr::read_unaligned(p_policy_status as *const CertChainPolicyStatus);
+    status.dw_error = err_code;
+    status.l_chain_index = if err_code == 0 { -1 } else { 0 };
+    status.l_element_index = elem_idx;
+    std::ptr::write_unaligned(p_policy_status as *mut CertChainPolicyStatus, status);
+    log::debug!(
+        "CertVerifyCertificateChainPolicy(oid={policy_id}, host={server_name:?}) -> dwError={err_code:#010x} (elem={elem_idx})"
+    );
+    TRUE
+}
+
+pub(super) unsafe fn cert_verify_time_validity_impl(
+    p_time_to_verify: *const c_void,
+    p_cert_info: *const c_void,
+) -> i32 {
+    if p_cert_info.is_null() {
+        return 0;
+    }
+    let ci = std::ptr::read_unaligned(p_cert_info as *const CertInfo);
+    let t = if p_time_to_verify.is_null() {
+        now_filetime()
+    } else {
+        std::ptr::read_unaligned(p_time_to_verify as *const u64)
+    };
+    if ci.not_before > 0 && t < ci.not_before {
+        -1
+    } else if ci.not_after > 0 && t > ci.not_after {
+        1
+    } else {
+        0
+    }
+}
