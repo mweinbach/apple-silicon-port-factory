@@ -115,6 +115,11 @@ struct SocketMeta {
     listening: bool,
     connecting: bool,
     connected: bool,
+    /// Guest-visible nonblocking state (`ioctlsocket(FIONBIO)` / `WSAEventSelect`).
+    /// The underlying POSIX fd is kept permanently `O_NONBLOCK` so overlapped and
+    /// reactor I/O never block in Darwin XNU `sosend` and never toggle `F_SETFL`
+    /// concurrently with other operations.
+    guest_nonblocking: bool,
     handle_flags: u32,
 }
 
@@ -123,7 +128,7 @@ static NEXT_SOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 static SOCKETS: LazyLock<Mutex<HashMap<usize, SocketMeta>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 const DUP_SOCK_MAGIC_MASK: u32 = 0xD05C_0000;
 static NEXT_DUP_TOKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-static DUP_SOCKETS: LazyLock<Mutex<HashMap<u32, (i32, i32, i32, i32, bool, bool)>>> =
+static DUP_SOCKETS: LazyLock<Mutex<HashMap<u32, (i32, i32, i32, i32, bool, bool, bool)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CANCEL_HOOK_INIT: OnceLock<()> = OnceLock::new();
 
@@ -228,9 +233,91 @@ fn set_nosigpipe(fd: i32) {
     }
 }
 
-fn register_fd(fd: i32, family: i32, sock_type: i32, protocol: i32, bound: bool, connected: bool) -> usize {
-    // Suppress SIGPIPE on Darwin sockets.
+fn set_fd_nonblocking(fd: i32) {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 && (fl & libc::O_NONBLOCK) == 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn is_guest_nonblocking(s: usize) -> bool {
+    lookup_meta(s).is_some_and(|m| m.guest_nonblocking)
+}
+
+unsafe fn socket_timeout_duration(fd: i32, opt: libc::c_int) -> Option<std::time::Duration> {
+    let mut tv: libc::timeval = std::mem::zeroed();
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    if libc::getsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        opt,
+        &mut tv as *mut libc::timeval as *mut c_void,
+        &mut len,
+    ) != 0
+    {
+        return None;
+    }
+    if tv.tv_sec <= 0 && tv.tv_usec <= 0 {
+        None
+    } else {
+        Some(std::time::Duration::new(
+            tv.tv_sec.max(0) as u64,
+            (tv.tv_usec.max(0) as u32) * 1000,
+        ))
+    }
+}
+
+/// Wait for `events` (`POLLIN` / `POLLOUT`) on an always-`O_NONBLOCK` socket to emulate
+/// guest blocking mode, respecting `SO_RCVTIMEO` / `SO_SNDTIMEO` when `timeout_opt` is given.
+unsafe fn wait_socket_ready(fd: i32, events: i16, timeout_opt: Option<libc::c_int>) -> Result<(), i32> {
+    let deadline = timeout_opt
+        .and_then(|opt| socket_timeout_duration(fd, opt))
+        .map(|d| std::time::Instant::now() + d);
+    loop {
+        let poll_ms: libc::c_int = match deadline {
+            None => -1,
+            Some(dl) => {
+                let now = std::time::Instant::now();
+                if now >= dl {
+                    return Err(libc::ETIMEDOUT);
+                }
+                (dl - now).as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+            }
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let pr = libc::poll(&mut pfd, 1, poll_ms);
+        if pr < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            if e == libc::EINTR {
+                continue;
+            }
+            return Err(e);
+        }
+        if pr == 0 {
+            return Err(libc::ETIMEDOUT);
+        }
+        return Ok(());
+    }
+}
+
+fn register_fd_with_mode(
+    fd: i32,
+    family: i32,
+    sock_type: i32,
+    protocol: i32,
+    bound: bool,
+    connected: bool,
+    guest_nonblocking: bool,
+) -> usize {
+    // Suppress SIGPIPE on Darwin sockets and keep the underlying fd permanently O_NONBLOCK.
     set_nosigpipe(fd);
+    set_fd_nonblocking(fd);
     CANCEL_HOOK_INIT.get_or_init(|| {
         register_external_cancel_hook(ws2_cancel_io_hook);
     });
@@ -246,11 +333,16 @@ fn register_fd(fd: i32, family: i32, sock_type: i32, protocol: i32, bound: bool,
             listening: false,
             connecting: false,
             connected,
+            guest_nonblocking,
             handle_flags: crate::handles::HANDLE_FLAG_INHERIT,
         },
     );
     register_external_io_handle(h as HANDLE);
     h
+}
+
+fn register_fd(fd: i32, family: i32, sock_type: i32, protocol: i32, bound: bool, connected: bool) -> usize {
+    register_fd_with_mode(fd, family, sock_type, protocol, bound, connected, false)
 }
 
 pub(crate) fn set_socket_handle_flags(h: HANDLE, mask: u32, flags: u32) -> bool {
@@ -922,8 +1014,8 @@ unsafe fn try_open_duplicated_socket(info: *const c_void) -> Option<usize> {
     if (token & 0xFFFF_0000) != DUP_SOCK_MAGIC_MASK {
         return None;
     }
-    let (fd, family, ty, proto, bound, connected) = DUP_SOCKETS.lock().unwrap().remove(&token)?;
-    Some(register_fd(fd, family, ty, proto, bound, connected))
+    let (fd, family, ty, proto, bound, connected, guest_nb) = DUP_SOCKETS.lock().unwrap().remove(&token)?;
+    Some(register_fd_with_mode(fd, family, ty, proto, bound, connected, guest_nb))
 }
 
 pub unsafe extern "win64" fn WSASocketW(
@@ -992,7 +1084,18 @@ unsafe fn duplicate_socket_into_info(s: usize, pid: u32, info: *mut u8, struct_l
     DUP_SOCKETS
         .lock()
         .unwrap()
-        .insert(token, (dup_fd, meta.family, meta.sock_type, meta.protocol, meta.bound, meta.connected));
+        .insert(
+            token,
+            (
+                dup_fd,
+                meta.family,
+                meta.sock_type,
+                meta.protocol,
+                meta.bound,
+                meta.connected,
+                meta.guest_nonblocking,
+            ),
+        );
 
     std::ptr::write_bytes(info, 0, struct_len);
     (info.add(76) as *mut i32).write_unaligned(win_af); // iAddressFamily
@@ -1061,12 +1164,32 @@ pub unsafe extern "win64" fn accept(s: usize, addr: *mut u8, addrlen: *mut i32) 
         return err(WSAENOTSOCK, INVALID_SOCKET);
     };
     let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-    let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let cfd = libc::accept(meta.fd, &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr, &mut slen);
+    let mut slen: libc::socklen_t;
+    let cfd = loop {
+        slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let r = libc::accept(
+            meta.fd,
+            &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut slen,
+        );
+        if r >= 0 {
+            break r;
+        }
+        let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+        if raw_e == libc::EINTR {
+            continue;
+        }
+        if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+            if let Err(we) = wait_socket_ready(meta.fd, libc::POLLIN, Some(libc::SO_RCVTIMEO)) {
+                event_select_rearm_accept(s);
+                return err(errno_to_wsa(we), INVALID_SOCKET);
+            }
+            continue;
+        }
+        event_select_rearm_accept(s);
+        return err(errno_to_wsa(raw_e), INVALID_SOCKET);
+    };
     event_select_rearm_accept(s);
-    if cfd < 0 {
-        return err(last_errno_wsa(), INVALID_SOCKET);
-    }
     if !addr.is_null() && !addrlen.is_null() {
         let _ = posix_to_win_sockaddr(&storage as *const libc::sockaddr_storage as *const libc::sockaddr, slen, addr, addrlen);
     }
@@ -1076,26 +1199,46 @@ pub unsafe extern "win64" fn accept(s: usize, addr: *mut u8, addrlen: *mut i32) 
 }
 
 pub unsafe extern "win64" fn connect(s: usize, name: *const u8, namelen: i32) -> i32 {
-    let Some(fd) = lookup_fd(s) else {
+    let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
+    let fd = meta.fd;
     let (storage, plen) = match win_to_posix_sockaddr(name, namelen) {
         Ok(v) => v,
         Err(e) => return err(e, SOCKET_ERROR),
     };
     if libc::connect(fd, &storage as *const libc::sockaddr_storage as *const libc::sockaddr, plen) != 0 {
         let raw_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-        let wsa = errno_to_wsa(raw_errno);
         if raw_errno == libc::EINPROGRESS {
-            if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
-                m.connecting = true;
-                m.connected = false;
+            if is_guest_nonblocking(s) {
+                if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    m.connecting = true;
+                    m.connected = false;
+                }
+                event_select_on_connect_pending(s);
+                return err(WSAEWOULDBLOCK, SOCKET_ERROR);
             }
-            event_select_on_connect_pending(s);
+            // Guest-blocking connect on an always-O_NONBLOCK underlying fd: wait for completion.
+            if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, None) {
+                let wsa = errno_to_wsa(we);
+                event_select_on_connect_complete(s, wsa as i32);
+                return err(wsa, SOCKET_ERROR);
+            }
+            let so_err = query_so_error(fd);
+            if so_err != 0 {
+                let wsa = errno_to_wsa(so_err);
+                if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    m.connecting = false;
+                    m.connected = false;
+                }
+                event_select_on_connect_complete(s, wsa as i32);
+                return err(wsa, SOCKET_ERROR);
+            }
         } else {
+            let wsa = errno_to_wsa(raw_errno);
             event_select_on_connect_complete(s, wsa as i32);
+            return err(wsa, SOCKET_ERROR);
         }
-        return err(wsa, SOCKET_ERROR);
     }
     if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
         m.connecting = false;
@@ -1292,16 +1435,22 @@ pub unsafe extern "win64" fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> 
     const WIN_FIONBIO: u32 = 0x8004_667E;
     const WIN_FIONREAD: u32 = 0x4004_667F;
     let mut val = std::ptr::read_unaligned(argp) as i32;
-    let rc = match cmd as u32 {
-        WIN_FIONBIO => libc::ioctl(fd, libc::FIONBIO, &mut val),
-        WIN_FIONREAD => libc::ioctl(fd, libc::FIONREAD, &mut val),
-        _ => return err(WSAEINVAL, SOCKET_ERROR),
-    };
-    if rc != 0 {
-        return err(last_errno_wsa(), SOCKET_ERROR);
+    match cmd as u32 {
+        WIN_FIONBIO => {
+            if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
+                m.guest_nonblocking = val != 0;
+            }
+            return 0;
+        }
+        WIN_FIONREAD => {
+            if libc::ioctl(fd, libc::FIONREAD, &mut val) != 0 {
+                return err(last_errno_wsa(), SOCKET_ERROR);
+            }
+            std::ptr::write_unaligned(argp, val as u32);
+            0
+        }
+        _ => err(WSAEINVAL, SOCKET_ERROR),
     }
-    std::ptr::write_unaligned(argp, val as u32);
-    0
 }
 
 pub unsafe extern "win64" fn WSAIoctl(
@@ -1383,15 +1532,27 @@ pub unsafe extern "win64" fn send(s: usize, buf: *const u8, len: i32, flags: i32
     let Some(fd) = lookup_fd(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
-    let n = libc::send(fd, buf as *const c_void, len.max(0) as usize, flags);
-    if n < 0 {
-        let wsa = last_errno_wsa();
+    loop {
+        let n = libc::send(fd, buf as *const c_void, len.max(0) as usize, flags);
+        if n >= 0 {
+            return n as i32;
+        }
+        let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+        if raw_e == libc::EINTR {
+            continue;
+        }
+        if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+            if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO)) {
+                return err(errno_to_wsa(we), SOCKET_ERROR);
+            }
+            continue;
+        }
+        let wsa = errno_to_wsa(raw_e);
         if wsa == WSAEWOULDBLOCK {
             event_select_rearm_write(s);
         }
         return err(wsa, SOCKET_ERROR);
     }
-    n as i32
 }
 
 pub unsafe extern "win64" fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32 {
@@ -1405,34 +1566,80 @@ pub unsafe extern "win64" fn sendto(s: usize, buf: *const u8, len: i32, flags: i
         Ok(v) => v,
         Err(e) => return err(e, SOCKET_ERROR),
     };
-    let n = libc::sendto(
-        fd,
-        buf as *const c_void,
-        len.max(0) as usize,
-        flags,
-        &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
-        plen,
-    );
-    if n < 0 {
-        let wsa = last_errno_wsa();
+    loop {
+        let n = libc::sendto(
+            fd,
+            buf as *const c_void,
+            len.max(0) as usize,
+            flags,
+            &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+            plen,
+        );
+        if n >= 0 {
+            return n as i32;
+        }
+        let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+        if raw_e == libc::EINTR {
+            continue;
+        }
+        if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+            if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO)) {
+                return err(errno_to_wsa(we), SOCKET_ERROR);
+            }
+            continue;
+        }
+        let wsa = errno_to_wsa(raw_e);
         if wsa == WSAEWOULDBLOCK {
             event_select_rearm_write(s);
         }
         return err(wsa, SOCKET_ERROR);
     }
-    n as i32
 }
 
 pub unsafe extern "win64" fn recv(s: usize, buf: *mut u8, len: i32, flags: i32) -> i32 {
-    let Some(fd) = lookup_fd(s) else {
+    let Some(meta) = lookup_meta(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
-    let n = libc::recv(fd, buf as *mut c_void, len.max(0) as usize, flags);
-    event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
-    if n < 0 {
-        return err(last_errno_wsa(), SOCKET_ERROR);
+    let fd = meta.fd;
+    let total_want = len.max(0) as usize;
+    let wait_all = (flags & libc::MSG_WAITALL) != 0
+        && meta.sock_type == libc::SOCK_STREAM
+        && !meta.guest_nonblocking
+        && (flags & libc::MSG_PEEK) == 0;
+    let mut got_total = 0usize;
+    loop {
+        let ptr = buf.add(got_total) as *mut c_void;
+        let rem = total_want - got_total;
+        let n = libc::recv(fd, ptr, rem, flags & !libc::MSG_WAITALL);
+        if n >= 0 {
+            let k = n as usize;
+            got_total += k;
+            if !wait_all || k == 0 || got_total >= total_want {
+                event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
+                return got_total as i32;
+            }
+            continue;
+        }
+        let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+        if raw_e == libc::EINTR {
+            continue;
+        }
+        if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+            if let Err(we) = wait_socket_ready(fd, libc::POLLIN, Some(libc::SO_RCVTIMEO)) {
+                event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
+                if got_total > 0 {
+                    return got_total as i32;
+                }
+                return err(errno_to_wsa(we), SOCKET_ERROR);
+            }
+            continue;
+        }
+        event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
+        if got_total > 0 {
+            return got_total as i32;
+        }
+        return err(errno_to_wsa(raw_e), SOCKET_ERROR);
     }
-    n as i32
 }
 
 pub unsafe extern "win64" fn recvfrom(
@@ -1447,19 +1654,35 @@ pub unsafe extern "win64" fn recvfrom(
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
     let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-    let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let n = libc::recvfrom(
-        fd,
-        buf as *mut c_void,
-        len.max(0) as usize,
-        flags,
-        if from.is_null() { std::ptr::null_mut() } else { &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr },
-        if from.is_null() { std::ptr::null_mut() } else { &mut slen },
-    );
+    let mut slen: libc::socklen_t;
+    let n = loop {
+        slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let r = libc::recvfrom(
+            fd,
+            buf as *mut c_void,
+            len.max(0) as usize,
+            flags,
+            if from.is_null() { std::ptr::null_mut() } else { &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr },
+            if from.is_null() { std::ptr::null_mut() } else { &mut slen },
+        );
+        if r >= 0 {
+            break r;
+        }
+        let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+        if raw_e == libc::EINTR {
+            continue;
+        }
+        if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+            if let Err(we) = wait_socket_ready(fd, libc::POLLIN, Some(libc::SO_RCVTIMEO)) {
+                event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
+                return err(errno_to_wsa(we), SOCKET_ERROR);
+            }
+            continue;
+        }
+        event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
+        return err(errno_to_wsa(raw_e), SOCKET_ERROR);
+    };
     event_select_rearm_read(s, (flags & libc::MSG_OOB) != 0);
-    if n < 0 {
-        return err(last_errno_wsa(), SOCKET_ERROR);
-    }
     if !from.is_null() && !fromlen.is_null() {
         let _ = posix_to_win_sockaddr(&storage as *const libc::sockaddr_storage as *const libc::sockaddr, slen, from, fromlen);
     }
@@ -1566,62 +1789,51 @@ unsafe fn step_overlapped_send(
     pflags: i32,
     to: Option<&(libc::sockaddr_storage, libc::socklen_t)>,
 ) -> OverlappedSendStep {
-    // On Darwin XNU, `sendmsg(..., MSG_DONTWAIT)` on a blocking socket can still block in
-    // `sosend` when the payload exceeds `SO_SNDBUF`. Temporarily enable `O_NONBLOCK` around
-    // the nonblocking send step when not already set, and restore it before returning.
-    let orig_fl = libc::fcntl(fd, libc::F_GETFL);
-    let added_nb = orig_fl >= 0 && (orig_fl & libc::O_NONBLOCK) == 0;
-    if added_nb {
-        let _ = libc::fcntl(fd, libc::F_SETFL, orig_fl | libc::O_NONBLOCK);
-    }
-
-    let res = if is_stream {
+    // Underlying socket fds are kept permanently `O_NONBLOCK` (while guest blocking mode
+    // lives in `SocketMeta.guest_nonblocking`), so `sendmsg_bufs_from` is genuinely
+    // nonblocking on Darwin XNU with zero `F_SETFL` toggling races under concurrency.
+    if is_stream {
         if *sent_so_far >= total_len {
-            OverlappedSendStep::Complete(*sent_so_far)
-        } else {
-            loop {
-                let n = sendmsg_bufs_from(fd, bufs, *sent_so_far, pflags | libc::MSG_DONTWAIT, to);
-                if n > 0 {
-                    *sent_so_far += n as usize;
-                    if *sent_so_far >= total_len {
-                        break OverlappedSendStep::Complete(*sent_so_far);
-                    }
-                } else if n == 0 {
-                    break OverlappedSendStep::Error(libc::EPIPE);
-                } else {
-                    let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
-                    if raw_e == libc::EINTR {
-                        continue;
-                    }
-                    if raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK {
-                        break OverlappedSendStep::Pending;
-                    }
-                    break OverlappedSendStep::Error(raw_e);
+            return OverlappedSendStep::Complete(*sent_so_far);
+        }
+        while *sent_so_far < total_len {
+            let n = sendmsg_bufs_from(fd, bufs, *sent_so_far, pflags | libc::MSG_DONTWAIT, to);
+            if n > 0 {
+                *sent_so_far += n as usize;
+                if *sent_so_far >= total_len {
+                    return OverlappedSendStep::Complete(*sent_so_far);
                 }
+            } else if n == 0 {
+                return OverlappedSendStep::Error(libc::EPIPE);
+            } else {
+                let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+                if raw_e == libc::EINTR {
+                    continue;
+                }
+                if raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK {
+                    return OverlappedSendStep::Pending;
+                }
+                return OverlappedSendStep::Error(raw_e);
             }
         }
+        OverlappedSendStep::Complete(*sent_so_far)
     } else {
         loop {
             let n = sendmsg_bufs_from(fd, bufs, 0, pflags | libc::MSG_DONTWAIT, to);
             if n >= 0 {
                 *sent_so_far = n as usize;
-                break OverlappedSendStep::Complete(n as usize);
+                return OverlappedSendStep::Complete(n as usize);
             }
             let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
             if raw_e == libc::EINTR {
                 continue;
             }
             if raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK {
-                break OverlappedSendStep::Pending;
+                return OverlappedSendStep::Pending;
             }
-            break OverlappedSendStep::Error(raw_e);
+            return OverlappedSendStep::Error(raw_e);
         }
-    };
-
-    if added_nb {
-        let _ = libc::fcntl(fd, libc::F_SETFL, orig_fl);
     }
-    res
 }
 
 unsafe fn recvmsg_bufs(
@@ -1672,14 +1884,27 @@ pub unsafe extern "win64" fn WSASend(
     };
     let pflags = win_msg_flags_to_posix(flags);
     if overlapped.is_null() {
-        let n = sendmsg_bufs(fd, &bufs, pflags, None);
-        if n < 0 {
-            let wsa = last_errno_wsa();
+        let n = loop {
+            let r = sendmsg_bufs(fd, &bufs, pflags, None);
+            if r >= 0 {
+                break r;
+            }
+            let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            if raw_e == libc::EINTR {
+                continue;
+            }
+            if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+                if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO)) {
+                    return err(errno_to_wsa(we), SOCKET_ERROR);
+                }
+                continue;
+            }
+            let wsa = errno_to_wsa(raw_e);
             if wsa == WSAEWOULDBLOCK {
                 event_select_rearm_write(s);
             }
             return err(wsa, SOCKET_ERROR);
-        }
+        };
         if !sent.is_null() {
             std::ptr::write_unaligned(sent, n as u32);
         }
@@ -1771,14 +1996,27 @@ pub unsafe extern "win64" fn WSASendTo(
     };
     let pflags = win_msg_flags_to_posix(flags);
     if overlapped.is_null() {
-        let n = sendmsg_bufs(fd, &bufs, pflags, Some(&dest));
-        if n < 0 {
-            let wsa = last_errno_wsa();
+        let n = loop {
+            let r = sendmsg_bufs(fd, &bufs, pflags, Some(&dest));
+            if r >= 0 {
+                break r;
+            }
+            let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            if raw_e == libc::EINTR {
+                continue;
+            }
+            if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+                if let Err(we) = wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO)) {
+                    return err(errno_to_wsa(we), SOCKET_ERROR);
+                }
+                continue;
+            }
+            let wsa = errno_to_wsa(raw_e);
             if wsa == WSAEWOULDBLOCK {
                 event_select_rearm_write(s);
             }
             return err(wsa, SOCKET_ERROR);
-        }
+        };
         if !sent.is_null() {
             std::ptr::write_unaligned(sent, n as u32);
         }
@@ -1870,11 +2108,26 @@ pub unsafe extern "win64" fn WSARecv(
     let pflags = win_msg_flags_to_posix(fl);
     if overlapped.is_null() {
         let mut msg_flags = 0i32;
-        let n = recvmsg_bufs(fd, &bufs, pflags, None, &mut msg_flags);
+        let n = loop {
+            let r = recvmsg_bufs(fd, &bufs, pflags, None, &mut msg_flags);
+            if r >= 0 {
+                break r;
+            }
+            let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            if raw_e == libc::EINTR {
+                continue;
+            }
+            if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+                if let Err(we) = wait_socket_ready(fd, libc::POLLIN, Some(libc::SO_RCVTIMEO)) {
+                    event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
+                    return err(errno_to_wsa(we), SOCKET_ERROR);
+                }
+                continue;
+            }
+            event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
+            return err(errno_to_wsa(raw_e), SOCKET_ERROR);
+        };
         event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
-        if n < 0 {
-            return err(last_errno_wsa(), SOCKET_ERROR);
-        }
         if !flags.is_null() {
             let out_fl = if (msg_flags & libc::MSG_TRUNC) != 0 { 0x8000 } else { 0 };
             std::ptr::write_unaligned(flags, out_fl);
@@ -1997,11 +2250,27 @@ pub unsafe extern "win64" fn WSARecvFrom(
     let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     if overlapped.is_null() {
         let mut msg_flags = 0i32;
-        let n = recvmsg_bufs(fd, &bufs, pflags, Some((&mut storage, &mut slen)), &mut msg_flags);
+        let n = loop {
+            slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let r = recvmsg_bufs(fd, &bufs, pflags, Some((&mut storage, &mut slen)), &mut msg_flags);
+            if r >= 0 {
+                break r;
+            }
+            let raw_e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            if raw_e == libc::EINTR {
+                continue;
+            }
+            if (raw_e == libc::EAGAIN || raw_e == libc::EWOULDBLOCK) && !is_guest_nonblocking(s) {
+                if let Err(we) = wait_socket_ready(fd, libc::POLLIN, Some(libc::SO_RCVTIMEO)) {
+                    event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
+                    return err(errno_to_wsa(we), SOCKET_ERROR);
+                }
+                continue;
+            }
+            event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
+            return err(errno_to_wsa(raw_e), SOCKET_ERROR);
+        };
         event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
-        if n < 0 {
-            return err(last_errno_wsa(), SOCKET_ERROR);
-        }
         if !fromlen.is_null() {
             let _ = posix_to_win_sockaddr(
                 &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
@@ -2799,9 +3068,8 @@ fn event_select_inherit_accept(parent: usize, child: usize, child_fd: i32, sock_
     if mask == 0 {
         return;
     }
-    let mut nb: i32 = 1;
-    unsafe {
-        libc::ioctl(child_fd, libc::FIONBIO, &mut nb);
+    if let Some(m) = SOCKETS.lock().unwrap().get_mut(&child) {
+        m.guest_nonblocking = true;
     }
     st.entries.insert(
         child,
@@ -2910,9 +3178,8 @@ pub unsafe extern "win64" fn WSAEventSelect(s: usize, h_event_object: HANDLE, l_
         return 0;
     }
     // Windows WSAEventSelect automatically puts the socket into non-blocking mode.
-    let mut nb: i32 = 1;
-    if libc::ioctl(meta.fd, libc::FIONBIO, &mut nb) != 0 {
-        return err(last_errno_wsa(), SOCKET_ERROR);
+    if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
+        m.guest_nonblocking = true;
     }
     let is_stream = meta.sock_type == libc::SOCK_STREAM;
     let write_armed = (l_network_events & FD_WRITE) != 0 && (!is_stream || meta.connected);
@@ -3078,8 +3345,12 @@ impl TransmitState {
                 if e == libc::EINTR {
                     continue;
                 }
-                if nonblocking && (e == libc::EAGAIN || e == libc::EWOULDBLOCK) {
-                    return Ok(false);
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    if nonblocking {
+                        return Ok(false);
+                    }
+                    wait_socket_ready(fd, libc::POLLOUT, Some(libc::SO_SNDTIMEO))?;
+                    continue;
                 }
                 return Err(e);
             }
@@ -3152,7 +3423,6 @@ enum AsyncOpKind {
         send_len: u32,
         sent_so_far: u32,
         connected: bool,
-        restore_blocking: bool,
     },
     TransmitFile(TransmitState),
     Recv {
@@ -3316,20 +3586,7 @@ fn async_io_enqueue(op: PendingSocketOp) {
     wake_fd_write(ww);
 }
 
-fn cleanup_cancelled_op(op: &PendingSocketOp) {
-    if let AsyncOpKind::ConnectEx {
-        restore_blocking: true,
-        ..
-    } = op.kind
-    {
-        unsafe {
-            let fl = libc::fcntl(op.poll_fd, libc::F_GETFL);
-            if fl >= 0 {
-                let _ = libc::fcntl(op.poll_fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
-            }
-        }
-    }
-}
+fn cleanup_cancelled_op(_op: &PendingSocketOp) {}
 
 fn async_io_cancel_socket_and_sync(s: usize) {
     let cancelled: Vec<PendingSocketOp> = {
@@ -3438,41 +3695,28 @@ unsafe fn try_accept_nonblocking(
     storage: &mut libc::sockaddr_storage,
     slen: &mut libc::socklen_t,
 ) -> Result<i32, i32> {
-    let orig = libc::fcntl(fd, libc::F_GETFL);
-    let added_nb = orig >= 0 && (orig & libc::O_NONBLOCK) == 0;
-    if added_nb {
-        let _ = libc::fcntl(fd, libc::F_SETFL, orig | libc::O_NONBLOCK);
-    }
+    // Underlying socket fds are permanently O_NONBLOCK.
     let cfd = libc::accept(
         fd,
         storage as *mut libc::sockaddr_storage as *mut libc::sockaddr,
         slen,
     );
-    let saved_errno = if cfd < 0 {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL)
-    } else {
-        0
-    };
-    if added_nb {
-        let _ = libc::fcntl(fd, libc::F_SETFL, orig);
-    }
     if cfd >= 0 {
         Ok(cfd)
     } else {
-        Err(saved_errno)
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL))
     }
 }
 
 unsafe fn bind_accepted_fd(s_accept: usize, accepted_fd: i32) -> Result<i32, u32> {
     set_nosigpipe(accepted_fd);
+    set_fd_nonblocking(accepted_fd);
     let mut socks = SOCKETS.lock().unwrap();
     let Some(m) = socks.get_mut(&s_accept) else {
         let _ = libc::close(accepted_fd);
         return Err(WSAENOTSOCK);
     };
     let target_fd = m.fd;
-    let orig_flags = libc::fcntl(target_fd, libc::F_GETFL);
-    let was_nonblocking = orig_flags >= 0 && (orig_flags & libc::O_NONBLOCK) != 0;
     if accepted_fd != target_fd {
         if libc::dup2(accepted_fd, target_fd) < 0 {
             let e = last_errno_wsa();
@@ -3481,17 +3725,7 @@ unsafe fn bind_accepted_fd(s_accept: usize, accepted_fd: i32) -> Result<i32, u32
         }
         let _ = libc::close(accepted_fd);
     }
-    let cur_flags = libc::fcntl(target_fd, libc::F_GETFL);
-    if cur_flags >= 0 {
-        let desired = if was_nonblocking {
-            cur_flags | libc::O_NONBLOCK
-        } else {
-            cur_flags & !libc::O_NONBLOCK
-        };
-        if desired != cur_flags {
-            let _ = libc::fcntl(target_fd, libc::F_SETFL, desired);
-        }
-    }
+    set_fd_nonblocking(target_fd);
     m.bound = true;
     m.listening = false;
     m.connecting = false;
@@ -3556,8 +3790,7 @@ unsafe fn reuse_socket_fd(s: usize) -> Result<(), u32> {
         return Err(last_errno_wsa());
     }
     set_nosigpipe(new_fd);
-    let orig_flags = libc::fcntl(m.fd, libc::F_GETFL);
-    let was_nonblocking = orig_flags >= 0 && (orig_flags & libc::O_NONBLOCK) != 0;
+    set_fd_nonblocking(new_fd);
     if new_fd != m.fd {
         if libc::dup2(new_fd, m.fd) < 0 {
             let e = last_errno_wsa();
@@ -3566,12 +3799,7 @@ unsafe fn reuse_socket_fd(s: usize) -> Result<(), u32> {
         }
         let _ = libc::close(new_fd);
     }
-    if was_nonblocking {
-        let cur = libc::fcntl(m.fd, libc::F_GETFL);
-        if cur >= 0 {
-            let _ = libc::fcntl(m.fd, libc::F_SETFL, cur | libc::O_NONBLOCK);
-        }
-    }
+    set_fd_nonblocking(m.fd);
     m.bound = false;
     m.listening = false;
     m.connecting = false;
@@ -3697,17 +3925,9 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
             send_len,
             sent_so_far,
             connected,
-            restore_blocking,
         } => {
             if !*connected {
                 let so_err = query_so_error(op.poll_fd);
-                if *restore_blocking {
-                    let fl = libc::fcntl(op.poll_fd, libc::F_GETFL);
-                    if fl >= 0 {
-                        let _ = libc::fcntl(op.poll_fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
-                    }
-                    *restore_blocking = false;
-                }
                 if so_err != 0 {
                     if let Some(m) = SOCKETS.lock().unwrap().get_mut(&op.socket_handle) {
                         m.connecting = false;
@@ -4166,20 +4386,12 @@ unsafe extern "win64" fn ext_connect_ex(
         Err(e) => return err(e, FALSE),
     };
 
-    let orig_flags = libc::fcntl(meta.fd, libc::F_GETFL);
-    let restore_blocking = orig_flags >= 0 && (orig_flags & libc::O_NONBLOCK) == 0;
-    if restore_blocking {
-        let _ = libc::fcntl(meta.fd, libc::F_SETFL, orig_flags | libc::O_NONBLOCK);
-    }
     let rc = libc::connect(
         meta.fd,
         &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
         plen,
     );
     if rc == 0 {
-        if restore_blocking {
-            let _ = libc::fcntl(meta.fd, libc::F_SETFL, orig_flags);
-        }
         if let Some(m) = SOCKETS.lock().unwrap().get_mut(&s) {
             m.connecting = false;
             m.connected = true;
@@ -4224,7 +4436,6 @@ unsafe extern "win64" fn ext_connect_ex(
                             send_len,
                             sent_so_far,
                             connected: true,
-                            restore_blocking: false,
                         },
                     });
                     return err(WSA_IO_PENDING, FALSE);
@@ -4260,15 +4471,11 @@ unsafe extern "win64" fn ext_connect_ex(
                 send_len,
                 sent_so_far: 0,
                 connected: false,
-                restore_blocking,
             },
         });
         return err(WSA_IO_PENDING, FALSE);
     }
 
-    if restore_blocking {
-        let _ = libc::fcntl(meta.fd, libc::F_SETFL, orig_flags);
-    }
     err(errno_to_wsa(raw_e), FALSE)
 }
 
@@ -5777,6 +5984,141 @@ mod tests {
 
             assert_eq!(closesocket(u_rx), 0);
             assert_eq!(closesocket(u_tx), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_overlapped_wsasend_preserves_guest_mode_and_cancels_cleanly() {
+        use crate::kernel32::file::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus};
+        use crate::kernel32::threads::CloseHandle;
+
+        const WIN_FIONBIO: i32 = 0x8004_667Eu32 as i32;
+
+        unsafe {
+            let mut wsadata = [0u8; 408];
+            assert_eq!(WSAStartup(0x0202, wsadata.as_mut_ptr()), 0);
+
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            let mut sa = loopback_sa(0);
+            assert_eq!(bind(srv, sa.as_ptr(), 16), 0);
+            assert_eq!(listen(srv, 4), 0);
+            let mut slen = 16i32;
+            assert_eq!(getsockname(srv, sa.as_mut_ptr(), &mut slen), 0);
+
+            let cli = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            let small_buf: i32 = 16 * 1024;
+            let _ = setsockopt(cli, 0xFFFF, 0x1001, &small_buf as *const i32 as *const u8, 4);
+            assert_eq!(connect(cli, sa.as_ptr(), 16), 0);
+            let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+            let _ = setsockopt(acc, 0xFFFF, 0x1002, &small_buf as *const i32 as *const u8, 4);
+            // Set short SO_RCVTIMEO on both sockets so any blocking recv test is strictly bounded.
+            let rcv_timeout_ms: u32 = 40;
+            assert_eq!(
+                setsockopt(cli, 0xFFFF, 0x1006 /* SO_RCVTIMEO */, &rcv_timeout_ms as *const u32 as *const u8, 4),
+                0
+            );
+            assert_eq!(CreateIoCompletionPort(cli as HANDLE, iocp, 0xCC01, 0), iocp);
+
+            // Underlying POSIX fd stays permanently O_NONBLOCK while guest mode starts blocking.
+            let cli_fd = lookup_fd(cli).unwrap();
+            assert_ne!(libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            assert!(!is_guest_nonblocking(cli));
+
+            // Issue two competing large overlapped WSASend operations on the same socket.
+            // Neither may block even though guest mode is blocking and no reader is draining yet.
+            let mut buf_a = vec![0x41u8; 384 * 1024];
+            let mut buf_b = vec![0x42u8; 256 * 1024];
+            let wb_a = WsaBuf { len: buf_a.len() as u32, buf: buf_a.as_mut_ptr() };
+            let wb_b = WsaBuf { len: buf_b.len() as u32, buf: buf_b.as_mut_ptr() };
+            let mut ov_a: OVERLAPPED = std::mem::zeroed();
+            let mut ov_b: OVERLAPPED = std::mem::zeroed();
+            let mut sent_a = 0u32;
+            let mut sent_b = 0u32;
+
+            assert_eq!(
+                WSASend(cli, &wb_a, 1, &mut sent_a, 0, &mut ov_a as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            assert_eq!(
+                WSASend(cli, &wb_b, 1, &mut sent_b, 0, &mut ov_b as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            // While both overlapped sends are pending, verify guest FIONBIO toggle works accurately
+            // and never clears underlying O_NONBLOCK:
+            // 1. In guest blocking mode, recv on empty peer hits bounded SO_RCVTIMEO -> WSAETIMEDOUT.
+            let mut tmp = [0u8; 8];
+            assert_eq!(recv(cli, tmp.as_mut_ptr(), 8, 0), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAETIMEDOUT as i32);
+
+            // 2. Toggle guest FIONBIO=1 -> recv returns WSAEWOULDBLOCK immediately.
+            let mut nb: u32 = 1;
+            assert_eq!(ioctlsocket(cli, WIN_FIONBIO, &mut nb), 0);
+            assert!(is_guest_nonblocking(cli));
+            assert_eq!(recv(cli, tmp.as_mut_ptr(), 8, 0), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAEWOULDBLOCK as i32);
+
+            // 3. Toggle guest FIONBIO=0 -> guest blocking mode restored, underlying fd still O_NONBLOCK.
+            nb = 0;
+            assert_eq!(ioctlsocket(cli, WIN_FIONBIO, &mut nb), 0);
+            assert!(!is_guest_nonblocking(cli));
+            assert_ne!(libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+
+            // Cancel second pending send (ov_b) cleanly while letting first pending send (ov_a) finish.
+            assert_eq!(CancelIoEx(cli as HANDLE, &mut ov_b), TRUE);
+
+            // Bounded drain of acc so ov_a makes progress and completes.
+            let drain_handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut total = 0usize;
+                let mut rbuf = [0u8; 8192];
+                let tmo: u32 = 100;
+                let _ = setsockopt(acc, 0xFFFF, 0x1006, &tmo as *const u32 as *const u8, 4);
+                while total < 384 * 1024 && std::time::Instant::now() < deadline {
+                    let n = recv(acc, rbuf.as_mut_ptr(), rbuf.len() as i32, 0);
+                    if n > 0 {
+                        total += n as usize;
+                    } else if n == 0 {
+                        break;
+                    }
+                }
+                total
+            });
+
+            let mut saw_a = false;
+            let mut saw_b_cancelled = false;
+            for _ in 0..2 {
+                let mut bytes = 0u32;
+                let mut key = 0usize;
+                let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+                let ok = GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 5000);
+                assert_eq!(key, 0xCC01);
+                if ov_out == &mut ov_b as *mut OVERLAPPED {
+                    assert_eq!(ok, FALSE);
+                    assert_eq!(crate::teb::last_error(), WSA_OPERATION_ABORTED);
+                    saw_b_cancelled = true;
+                } else if ov_out == &mut ov_a as *mut OVERLAPPED {
+                    assert_eq!(ok, TRUE);
+                    assert_eq!(bytes as usize, 384 * 1024);
+                    saw_a = true;
+                } else {
+                    panic!("unexpected overlapped {ov_out:p}");
+                }
+            }
+            assert!(saw_a && saw_b_cancelled);
+            let drained = drain_handle.join().unwrap();
+            assert!(drained >= 384 * 1024, "expected at least 384 KiB drained, got {drained}");
+
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(cli), 0);
+            assert_eq!(closesocket(srv), 0);
+            assert_eq!(CloseHandle(iocp), TRUE);
         }
     }
 }
