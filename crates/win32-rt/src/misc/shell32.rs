@@ -1397,6 +1397,345 @@ pub unsafe extern "win64" fn StrStrIA(first: LPCSTR, srch: LPCSTR) -> LPSTR {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `SHCreateItemFromParsingName` & `IShellItem` (filesystem items)
+// ---------------------------------------------------------------------------
+
+const SIGDN_NORMALDISPLAY: u32 = 0x0000_0000;
+const SIGDN_PARENTRELATIVEPARSING: u32 = 0x8001_8001;
+const SIGDN_DESKTOPABSOLUTEPARSING: u32 = 0x8002_8000;
+const SIGDN_PARENTRELATIVEEDITING: u32 = 0x8003_1001;
+const SIGDN_DESKTOPABSOLUTEEDITING: u32 = 0x8004_C000;
+const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
+const SIGDN_URL: u32 = 0x8006_8000;
+const SIGDN_PARENTRELATIVEFORADDRESSBAR: u32 = 0x8007_C001;
+const SIGDN_PARENTRELATIVE: u32 = 0x8008_0001;
+const SIGDN_PARENTRELATIVEFORUI: u32 = 0x8009_4001;
+
+#[inline]
+const fn hresult_from_win32(code: u32) -> HRESULT {
+    if code == 0 {
+        S_OK
+    } else {
+        ((code & 0x0000_FFFF) | 0x8007_0000) as HRESULT
+    }
+}
+
+/// Reject virtual shell namespaces, CLSID parsing paths, URI schemes, and UNC network shares
+/// before falling through to the local Windows VFS.
+fn is_unsupported_shell_namespace(raw: &str) -> bool {
+    let s = raw.trim_start();
+    if s.starts_with("::{") || s.starts_with(":::{") {
+        return true;
+    }
+    if s.starts_with("\\\\") || s.starts_with("//") {
+        // Allow extended-length local/device prefixes handled by `crate::path::normalize`.
+        let up = s.replace('/', "\\").to_ascii_uppercase();
+        if !(up.starts_with("\\\\?\\") || up.starts_with("\\\\.\\")) {
+            return true;
+        }
+    }
+    if s.contains("://") {
+        return true;
+    }
+    if let Some(colon) = s.find(':') {
+        // A single ASCII letter before ':' is a Windows drive spec (e.g. `C:\...`);
+        // multi-character prefixes before ':' (e.g. `shell:`, `ms-settings:`, `knownfolder:`)
+        // are namespace/URI schemes we do not implement.
+        if colon >= 2 {
+            let scheme = &s[..colon];
+            if !scheme.contains('\\')
+                && !scheme.contains('/')
+                && scheme
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn shell_item_leaf_name(win_path: &str) -> String {
+    let trimmed = win_path.trim_end_matches(['\\', '/']);
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        return format!("{}\\", trimmed.to_ascii_uppercase());
+    }
+    trimmed
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(win_path)
+        .to_string()
+}
+
+fn shell_item_parent_win_path(win_path: &str) -> Option<String> {
+    let trimmed = win_path.trim_end_matches('\\');
+    // Drive root (`C:` / `C:\`) has no filesystem parent (its parent is virtual "This PC").
+    if trimmed.len() <= 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let pos = trimmed.rfind('\\')?;
+    let parent = &trimmed[..pos];
+    if parent.len() == 2 && parent.as_bytes()[1] == b':' {
+        Some(format!("{parent}\\"))
+    } else if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
+    }
+}
+
+fn format_file_url(win_path: &str) -> String {
+    let mut out = String::from("file:///");
+    for ch in win_path.chars() {
+        match ch {
+            '\\' => out.push('/'),
+            ' ' => out.push_str("%20"),
+            '%' => out.push_str("%25"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+unsafe fn alloc_cotask_wide(s: &str) -> *mut u16 {
+    let wide = crate::strings::to_wide_z(s);
+    let bytes = wide.len().saturating_mul(2);
+    let p = crate::misc::ole32::CoTaskMemAlloc(bytes) as *mut u16;
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+    p
+}
+
+struct ShellItem {
+    win_path: String,
+}
+
+unsafe extern "win64" fn shell_item_qi(
+    this: *mut crate::com::ComObj<ShellItem>,
+    riid: *const u8,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    crate::com::qi_helper_bytes(this, riid, ppv, &[crate::com::IID_IShellItem])
+}
+
+unsafe extern "win64" fn shell_item_bind_to_handler(
+    _this: *mut crate::com::ComObj<ShellItem>,
+    _pbc: *mut c_void,
+    _bhid: *const u8,
+    _riid: *const u8,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(ppv);
+    E_NOINTERFACE
+}
+
+unsafe extern "win64" fn shell_item_get_parent(
+    this: *mut crate::com::ComObj<ShellItem>,
+    ppsi: *mut *mut c_void,
+) -> HRESULT {
+    if ppsi.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(ppsi);
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(parent_win) = shell_item_parent_win_path(&(*this).inner.win_path) else {
+        return E_NOTIMPL;
+    };
+    let Some(parent_host) = crate::path::to_host(&parent_win) else {
+        return hresult_from_win32(err::ERROR_PATH_NOT_FOUND);
+    };
+    if std::fs::metadata(&parent_host).is_err() {
+        return hresult_from_win32(err::ERROR_PATH_NOT_FOUND);
+    }
+    let parent = crate::com::ComObj::new(shell_item_vtbl(), ShellItem { win_path: parent_win });
+    std::ptr::write_unaligned(ppsi, parent as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn shell_item_get_display_name(
+    this: *mut crate::com::ComObj<ShellItem>,
+    sigdn_name: u32,
+    ppsz_name: *mut LPWSTR,
+) -> HRESULT {
+    if ppsz_name.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(ppsz_name, std::ptr::null_mut());
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    let win_path = &(*this).inner.win_path;
+    let text = match sigdn_name {
+        SIGDN_FILESYSPATH | SIGDN_DESKTOPABSOLUTEPARSING | SIGDN_DESKTOPABSOLUTEEDITING => {
+            win_path.clone()
+        }
+        SIGDN_NORMALDISPLAY
+        | SIGDN_PARENTRELATIVEPARSING
+        | SIGDN_PARENTRELATIVEEDITING
+        | SIGDN_PARENTRELATIVEFORADDRESSBAR
+        | SIGDN_PARENTRELATIVE
+        | SIGDN_PARENTRELATIVEFORUI => shell_item_leaf_name(win_path),
+        SIGDN_URL => format_file_url(win_path),
+        _ => return E_INVALIDARG,
+    };
+    let ptr = alloc_cotask_wide(&text);
+    if ptr.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    std::ptr::write_unaligned(ppsz_name, ptr);
+    S_OK
+}
+
+unsafe extern "win64" fn shell_item_get_attributes(
+    this: *mut crate::com::ComObj<ShellItem>,
+    sfgao_mask: u32,
+    psfgao_attribs: *mut u32,
+) -> HRESULT {
+    if psfgao_attribs.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(psfgao_attribs, 0);
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(info) = query_file_info(&(*this).inner.win_path, 0, SHGFI_ATTRIBUTES, 0) else {
+        return hresult_from_win32(err::ERROR_FILE_NOT_FOUND);
+    };
+    let matched = info.sfgao & sfgao_mask;
+    std::ptr::write_unaligned(psfgao_attribs, matched);
+    if matched == sfgao_mask { S_OK } else { S_FALSE }
+}
+
+unsafe extern "win64" fn shell_item_compare(
+    this: *mut crate::com::ComObj<ShellItem>,
+    psi: *mut c_void,
+    _hint: u32,
+    pi_order: *mut i32,
+) -> HRESULT {
+    if pi_order.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(pi_order, 0);
+    if this.is_null() || psi.is_null() {
+        return E_INVALIDARG;
+    }
+    if psi == this as *mut c_void {
+        return S_OK;
+    }
+    let other_path = if let Some(other) =
+        crate::com::com_from_iface::<ShellItem>(psi, shell_item_vtbl())
+    {
+        other.inner.win_path.clone()
+    } else {
+        let mut name_ptr: LPWSTR = std::ptr::null_mut();
+        let hr = crate::com::com_call_slot(
+            psi,
+            5,
+            SIGDN_FILESYSPATH as u64,
+            &mut name_ptr as *mut LPWSTR as u64,
+            0,
+        );
+        if hr < 0 || name_ptr.is_null() {
+            return if hr < 0 { hr } else { E_FAIL };
+        }
+        let s = crate::path::normalize(&from_wide(name_ptr));
+        crate::misc::ole32::CoTaskMemFree(name_ptr as *mut c_void);
+        s
+    };
+    let a = (*this).inner.win_path.to_ascii_lowercase();
+    let b = other_path.to_ascii_lowercase();
+    match a.cmp(&b) {
+        std::cmp::Ordering::Equal => {
+            std::ptr::write_unaligned(pi_order, 0);
+            S_OK
+        }
+        std::cmp::Ordering::Less => {
+            std::ptr::write_unaligned(pi_order, -1);
+            S_FALSE
+        }
+        std::cmp::Ordering::Greater => {
+            std::ptr::write_unaligned(pi_order, 1);
+            S_FALSE
+        }
+    }
+}
+
+fn shell_item_vtbl() -> *const usize {
+    static VTBL: std::sync::OnceLock<[usize; 8]> = std::sync::OnceLock::new();
+    let vtbl = VTBL.get_or_init(|| {
+        [
+            shell_item_qi as *const () as usize,
+            crate::com::com_add_ref::<ShellItem> as *const () as usize,
+            crate::com::com_release::<ShellItem> as *const () as usize,
+            shell_item_bind_to_handler as *const () as usize,
+            shell_item_get_parent as *const () as usize,
+            shell_item_get_display_name as *const () as usize,
+            shell_item_get_attributes as *const () as usize,
+            shell_item_compare as *const () as usize,
+        ]
+    });
+    static REG: std::sync::Once = std::sync::Once::new();
+    REG.call_once(|| unsafe {
+        crate::com::register_host_vtable(crate::com::IID_IShellItem, vtbl.as_ptr(), vtbl.len());
+    });
+    vtbl.as_ptr()
+}
+
+pub unsafe extern "win64" fn SHCreateItemFromParsingName(
+    psz_path: LPCWSTR,
+    _pbc: *mut c_void,
+    riid: *const u8,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(ppv);
+    if psz_path.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(req_iid) = crate::com::read_guid_from_bytes(riid) else {
+        return E_POINTER;
+    };
+    let raw = from_wide(psz_path);
+    if raw.is_empty() {
+        return E_INVALIDARG;
+    }
+    if is_unsupported_shell_namespace(&raw) {
+        stub!("SHCreateItemFromParsingName: unsupported shell namespace {raw:?}");
+        return E_NOTIMPL;
+    }
+    let win_path = crate::path::absolute(&raw);
+    let Some(host_path) = crate::path::to_host(&win_path) else {
+        return hresult_from_win32(err::ERROR_PATH_NOT_FOUND);
+    };
+    if let Err(e) = std::fs::metadata(&host_path) {
+        return if e.kind() == std::io::ErrorKind::NotFound {
+            hresult_from_win32(err::ERROR_FILE_NOT_FOUND)
+        } else {
+            hresult_from_win32(io_err_win32(&e) as u32)
+        };
+    }
+    if req_iid != crate::com::IID_IUnknown && req_iid != crate::com::IID_IShellItem {
+        return E_NOINTERFACE;
+    }
+    let item = crate::com::ComObj::new(shell_item_vtbl(), ShellItem { win_path });
+    std::ptr::write_unaligned(ppv, item as *mut c_void);
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,6 +1929,267 @@ mod tests {
             std::ptr::write_unaligned(sei.as_mut_ptr() as *mut u32, 112u32);
             assert_eq!(ShellExecuteExA(sei.as_mut_ptr()), FALSE);
             assert_eq!(std::ptr::read_unaligned(sei.as_ptr().add(56) as *const usize), SE_ERR_NOASSOC);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sh_create_item_from_parsing_name_and_ishellitem() {
+        let root = std::env::temp_dir().join(format!("win32_shellitem_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+        std::fs::write(root.join("sub/report.txt"), b"shell item contents").unwrap();
+        crate::path::add_mount("S:\\ItemTest", &root);
+
+        unsafe {
+            let iid_item = crate::com::IID_IShellItem.to_bytes();
+            let iid_unk = crate::com::IID_IUnknown.to_bytes();
+            let iid_bogus = crate::com::guid("11111111-2222-3333-4444-555555555555").to_bytes();
+
+            // 1. Existing file item via translated VFS path (forward slashes + extended prefix normalize cleanly).
+            let file_w = crate::strings::to_wide_z("S:/ItemTest/sub/report.txt");
+            let mut item_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    file_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut item_ptr
+                ),
+                S_OK
+            );
+            assert!(!item_ptr.is_null());
+
+            // Interface & host vtable registration check in `crate::com`.
+            let desc = crate::com::lookup_interface(&crate::com::IID_IShellItem)
+                .expect("IShellItem registered in COM interface registry");
+            assert_eq!(desc.name, "IShellItem");
+            assert!(desc.host_vtbl.is_some());
+
+            // 2. Identity & refcounting via IUnknown / IShellItem QI.
+            let mut unk_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_call_qi(item_ptr, &crate::com::IID_IUnknown, &mut unk_ptr),
+                S_OK
+            );
+            assert_eq!(unk_ptr, item_ptr);
+            let mut item_ptr2: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_call_qi(unk_ptr, &crate::com::IID_IShellItem, &mut item_ptr2),
+                S_OK
+            );
+            assert_eq!(item_ptr2, item_ptr);
+            let mut bogus_ptr: *mut c_void = 0x1usize as *mut c_void;
+            assert_eq!(
+                crate::com::com_call_qi_bytes(item_ptr, iid_bogus.as_ptr(), &mut bogus_ptr),
+                E_NOINTERFACE
+            );
+            assert!(bogus_ptr.is_null());
+            assert_eq!(crate::com::com_call_release(item_ptr2), 2);
+            assert_eq!(crate::com::com_call_release(unk_ptr), 1);
+
+            // 3. GetDisplayName ownership (CoTaskMemAlloc -> CoTaskMemFree) across SIGDN variants.
+            let read_and_free_name = |obj: *mut c_void, sigdn: u32| -> String {
+                let mut name_ptr: LPWSTR = std::ptr::null_mut();
+                let hr = crate::com::com_call_slot(
+                    obj,
+                    5,
+                    sigdn as u64,
+                    &mut name_ptr as *mut LPWSTR as u64,
+                    0,
+                );
+                assert_eq!(hr, S_OK);
+                assert!(!name_ptr.is_null());
+                let s = from_wide(name_ptr);
+                crate::misc::ole32::CoTaskMemFree(name_ptr as *mut c_void);
+                s
+            };
+            assert_eq!(read_and_free_name(item_ptr, SIGDN_FILESYSPATH), "S:\\ItemTest\\sub\\report.txt");
+            assert_eq!(read_and_free_name(item_ptr, SIGDN_DESKTOPABSOLUTEPARSING), "S:\\ItemTest\\sub\\report.txt");
+            assert_eq!(read_and_free_name(item_ptr, SIGDN_NORMALDISPLAY), "report.txt");
+            assert_eq!(read_and_free_name(item_ptr, SIGDN_PARENTRELATIVEPARSING), "report.txt");
+            assert_eq!(read_and_free_name(item_ptr, SIGDN_URL), "file:///S:/ItemTest/sub/report.txt");
+
+            let mut bad_name: LPWSTR = 0x1usize as LPWSTR;
+            assert_eq!(
+                crate::com::com_call_slot(
+                    item_ptr,
+                    5,
+                    0xDEAD_BEEFu64,
+                    &mut bad_name as *mut LPWSTR as u64,
+                    0,
+                ),
+                E_INVALIDARG
+            );
+            assert!(bad_name.is_null());
+
+            // 4. GetAttributes on file vs folder.
+            let mut file_attrs: u32 = 0;
+            assert_eq!(
+                crate::com::com_call_slot(
+                    item_ptr,
+                    6,
+                    (SFGAO_FILESYSTEM | SFGAO_FOLDER) as u64,
+                    &mut file_attrs as *mut u32 as u64,
+                    0,
+                ),
+                S_FALSE
+            );
+            assert_eq!(file_attrs, SFGAO_FILESYSTEM);
+
+            let mut fs_only: u32 = 0;
+            assert_eq!(
+                crate::com::com_call_slot(
+                    item_ptr,
+                    6,
+                    SFGAO_FILESYSTEM as u64,
+                    &mut fs_only as *mut u32 as u64,
+                    0,
+                ),
+                S_OK
+            );
+            assert_eq!(fs_only, SFGAO_FILESYSTEM);
+
+            // 5. GetParent + Compare against a directly created directory item (case-insensitive).
+            let mut parent_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_call_slot(item_ptr, 4, &mut parent_ptr as *mut *mut c_void as u64, 0, 0),
+                S_OK
+            );
+            assert!(!parent_ptr.is_null());
+            assert_eq!(read_and_free_name(parent_ptr, SIGDN_FILESYSPATH), "S:\\ItemTest\\sub");
+            assert_eq!(read_and_free_name(parent_ptr, SIGDN_NORMALDISPLAY), "sub");
+
+            let mut dir_attrs: u32 = 0;
+            assert_eq!(
+                crate::com::com_call_slot(
+                    parent_ptr,
+                    6,
+                    (SFGAO_FILESYSTEM | SFGAO_FOLDER | SFGAO_HASSUBFOLDER) as u64,
+                    &mut dir_attrs as *mut u32 as u64,
+                    0,
+                ),
+                S_OK
+            );
+            assert_eq!(dir_attrs, SFGAO_FILESYSTEM | SFGAO_FOLDER | SFGAO_HASSUBFOLDER);
+
+            let dir_w = crate::strings::to_wide_z("\\\\?\\s:\\itemtest\\SUB");
+            let mut direct_dir_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    dir_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_unk.as_ptr(),
+                    &mut direct_dir_ptr
+                ),
+                S_OK
+            );
+            let mut order: i32 = 99;
+            assert_eq!(
+                crate::com::com_call_slot(
+                    parent_ptr,
+                    7,
+                    direct_dir_ptr as u64,
+                    0,
+                    &mut order as *mut i32 as u64,
+                ),
+                S_OK
+            );
+            assert_eq!(order, 0);
+
+            assert_eq!(
+                crate::com::com_call_slot(
+                    parent_ptr,
+                    7,
+                    item_ptr as u64,
+                    0,
+                    &mut order as *mut i32 as u64,
+                ),
+                S_FALSE
+            );
+            assert_ne!(order, 0);
+
+            // 6. BindToHandler returns honest E_NOINTERFACE.
+            let mut bound: *mut c_void = 0x1usize as *mut c_void;
+            assert_eq!(
+                crate::com::com_call_slot_raw(
+                    item_ptr,
+                    3,
+                    &[
+                        0,
+                        iid_bogus.as_ptr() as u64,
+                        iid_bogus.as_ptr() as u64,
+                        &mut bound as *mut *mut c_void as u64
+                    ]
+                )
+                .unwrap() as HRESULT,
+                E_NOINTERFACE
+            );
+            assert!(bound.is_null());
+
+            assert_eq!(crate::com::com_call_release(direct_dir_ptr), 0);
+            assert_eq!(crate::com::com_call_release(parent_ptr), 0);
+            assert_eq!(crate::com::com_call_release(item_ptr), 0);
+
+            // 7. Missing filesystem items, unmounted drives, unsupported IIDs, and unsupported namespaces fail honestly.
+            let missing_w = crate::strings::to_wide_z("S:\\ItemTest\\sub\\missing.txt");
+            let mut out: *mut c_void = 0x1usize as *mut c_void;
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    missing_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut out
+                ),
+                hresult_from_win32(err::ERROR_FILE_NOT_FOUND)
+            );
+            assert!(out.is_null());
+
+            let unmounted_w = crate::strings::to_wide_z("Q:\\NoSuchDrive\\file.txt");
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    unmounted_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut out
+                ),
+                hresult_from_win32(err::ERROR_PATH_NOT_FOUND)
+            );
+            assert!(out.is_null());
+
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    file_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_bogus.as_ptr(),
+                    &mut out
+                ),
+                E_NOINTERFACE
+            );
+            assert!(out.is_null());
+
+            for unsupported in [
+                "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+                "::{645FF040-5081-101B-9F08-00AA002F954E}",
+                "http://example.com/file.txt",
+                "ms-settings:display",
+                "\\\\server\\share\\file.txt",
+            ] {
+                let w = crate::strings::to_wide_z(unsupported);
+                out = 0x1usize as *mut c_void;
+                assert_eq!(
+                    SHCreateItemFromParsingName(
+                        w.as_ptr(),
+                        std::ptr::null_mut(),
+                        iid_item.as_ptr(),
+                        &mut out
+                    ),
+                    E_NOTIMPL,
+                    "expected E_NOTIMPL for unsupported namespace {unsupported}"
+                );
+                assert!(out.is_null());
+            }
         }
 
         let _ = std::fs::remove_dir_all(&root);

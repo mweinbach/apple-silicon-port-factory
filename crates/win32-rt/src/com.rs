@@ -203,6 +203,30 @@ pub fn iid_name(g: &Guid) -> Option<&'static str> {
 }
 
 pub const IID_IUnknown: Guid = guid("00000000-0000-0000-c000-000000000046");
+pub const IID_IClassFactory: Guid = guid("00000001-0000-0000-c000-000000000046");
+pub const IID_IMalloc: Guid = guid("00000002-0000-0000-c000-000000000046");
+pub const IID_IMarshal: Guid = guid("00000003-0000-0000-c000-000000000046");
+pub const IID_IStream: Guid = guid("0000000c-0000-0000-c000-000000000046");
+pub const IID_ISequentialStream: Guid = guid("0c733a30-2a1c-11ce-ade5-00aa0044773d");
+pub const IID_IAgileObject: Guid = guid("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90");
+pub const IID_IDispatch: Guid = guid("00020400-0000-0000-c000-000000000046");
+pub const IID_IClassFactory2: Guid = guid("b196b28f-bab4-101a-b69c-00aa00341d07");
+pub const IID_IInspectable: Guid = guid("af86e2e0-b12d-4c6a-9c5a-d7aa65101e90");
+pub const IID_IActivationFactory: Guid = guid("00000035-0000-0000-c000-000000000046");
+pub const IID_IConnectionPointContainer: Guid = guid("b196b284-bab4-101a-b69c-00aa00341d07");
+pub const IID_IEnumConnectionPoints: Guid = guid("b196b285-bab4-101a-b69c-00aa00341d07");
+pub const IID_IConnectionPoint: Guid = guid("b196b286-bab4-101a-b69c-00aa00341d07");
+pub const IID_IEnumConnections: Guid = guid("b196b287-bab4-101a-b69c-00aa00341d07");
+pub const IID_IPropertyValue: Guid = guid("4bd682dd-7554-40e9-9a9b-82654ede7e62");
+pub const IID_IPropertyValueStatics: Guid = guid("629bdbc8-d932-4ff4-96b9-8d96c5c1e858");
+pub const IID_IUriRuntimeClass: Guid = guid("9e365e57-48b2-4160-956f-c7385120bbfc");
+pub const IID_IUriRuntimeClassFactory: Guid = guid("44a9796f-723e-4fdf-a218-033e75b0c084");
+pub const IID_IShellItem: Guid = guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+
+pub const CONNECT_E_NOCONNECTION: HRESULT = 0x8004_0200u32 as i32;
+#[allow(dead_code)]
+pub const CONNECT_E_ADVISELIMIT: HRESULT = 0x8004_0201u32 as i32;
+pub const CONNECT_E_CANNOTCONNECT: HRESULT = 0x8004_0202u32 as i32;
 
 /// `WKPDID_D3DDebugObjectName` / `WKPDID_D3DDebugObjectNameW`: names set through private data.
 pub const WKPDID_D3DDebugObjectName: Guid = guid("429b8c22-9188-4b0c-8742-acb0bf85c200");
@@ -849,6 +873,1250 @@ impl PrivateData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Typed COM interface & callback registry (IID + vtable slot metadata)
+// ---------------------------------------------------------------------------
+
+/// Return type category for a COM vtable slot descriptor.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComReturnKind {
+    HResult,
+    U32,
+    U64,
+    Void,
+}
+
+/// Argument type category for a COM vtable slot parameter (excluding `this`).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComArgKind {
+    Ptr,
+    GuidPtr,
+    OutPtr,
+    U32,
+    I32,
+    U64,
+    I64,
+    Bool,
+    HString,
+}
+
+/// Metadata describing one COM vtable slot.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComSlotDesc {
+    pub slot: usize,
+    pub name: &'static str,
+    /// Number of Win64 parameters beyond `this` (0..=7).
+    pub arity: usize,
+    pub args: &'static [ComArgKind],
+    pub ret: ComReturnKind,
+}
+
+/// Metadata describing a COM/WinRT interface, its vtable slots, and optional host vtable pointer.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct ComInterfaceDesc {
+    pub iid: Guid,
+    pub name: &'static str,
+    pub base_iid: Option<Guid>,
+    pub slots: &'static [ComSlotDesc],
+    pub host_vtbl: Option<usize>,
+}
+
+const SLOTS_IUNKNOWN: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 0,
+        name: "QueryInterface",
+        arity: 2,
+        args: &[ComArgKind::GuidPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 1,
+        name: "AddRef",
+        arity: 0,
+        args: &[],
+        ret: ComReturnKind::U32,
+    },
+    ComSlotDesc {
+        slot: 2,
+        name: "Release",
+        arity: 0,
+        args: &[],
+        ret: ComReturnKind::U32,
+    },
+];
+
+const SLOTS_ICLASSFACTORY: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "CreateInstance",
+        arity: 3,
+        args: &[ComArgKind::Ptr, ComArgKind::GuidPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "LockServer",
+        arity: 1,
+        args: &[ComArgKind::Bool],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_ICLASSFACTORY2: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 5,
+        name: "GetLicInfo",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "RequestLicKey",
+        arity: 2,
+        args: &[ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "CreateInstanceLic",
+        arity: 5,
+        args: &[
+            ComArgKind::Ptr,
+            ComArgKind::Ptr,
+            ComArgKind::GuidPtr,
+            ComArgKind::Ptr,
+            ComArgKind::OutPtr,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IINSPECTABLE: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "GetIids",
+        arity: 2,
+        args: &[ComArgKind::OutPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "GetRuntimeClassName",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "GetTrustLevel",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IACTIVATIONFACTORY: &[ComSlotDesc] = &[ComSlotDesc {
+    slot: 6,
+    name: "ActivateInstance",
+    arity: 1,
+    args: &[ComArgKind::OutPtr],
+    ret: ComReturnKind::HResult,
+}];
+
+const SLOTS_ICONNECTIONPOINTCONTAINER: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "EnumConnectionPoints",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "FindConnectionPoint",
+        arity: 2,
+        args: &[ComArgKind::GuidPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_ICONNECTIONPOINT: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "GetConnectionInterface",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "GetConnectionPointContainer",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "Advise",
+        arity: 2,
+        args: &[ComArgKind::Ptr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "Unadvise",
+        arity: 1,
+        args: &[ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "EnumConnections",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IENUM_GENERIC: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "Next",
+        arity: 3,
+        args: &[ComArgKind::U32, ComArgKind::OutPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "Skip",
+        arity: 1,
+        args: &[ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "Reset",
+        arity: 0,
+        args: &[],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "Clone",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IDISPATCH: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "GetTypeInfoCount",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "GetTypeInfo",
+        arity: 3,
+        args: &[ComArgKind::U32, ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "GetIDsOfNames",
+        arity: 5,
+        args: &[
+            ComArgKind::GuidPtr,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::U32,
+            ComArgKind::OutPtr,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "Invoke",
+        arity: 7,
+        args: &[
+            ComArgKind::I32,
+            ComArgKind::GuidPtr,
+            ComArgKind::U32,
+            ComArgKind::U32,
+            ComArgKind::Ptr,
+            ComArgKind::OutPtr,
+            ComArgKind::OutPtr,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IMARSHAL: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "GetUnmarshalClass",
+        arity: 6,
+        args: &[
+            ComArgKind::GuidPtr,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::OutPtr,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "GetMarshalSizeMax",
+        arity: 6,
+        args: &[
+            ComArgKind::GuidPtr,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::OutPtr,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "MarshalInterface",
+        arity: 6,
+        args: &[
+            ComArgKind::Ptr,
+            ComArgKind::GuidPtr,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+            ComArgKind::Ptr,
+            ComArgKind::U32,
+        ],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "UnmarshalInterface",
+        arity: 3,
+        args: &[ComArgKind::Ptr, ComArgKind::GuidPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "ReleaseMarshalData",
+        arity: 1,
+        args: &[ComArgKind::Ptr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 8,
+        name: "DisconnectObject",
+        arity: 1,
+        args: &[ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_ISEQUENTIALSTREAM: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "Read",
+        arity: 3,
+        args: &[ComArgKind::OutPtr, ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "Write",
+        arity: 3,
+        args: &[ComArgKind::Ptr, ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_ISTREAM: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 5,
+        name: "Seek",
+        arity: 3,
+        args: &[ComArgKind::I64, ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "SetSize",
+        arity: 1,
+        args: &[ComArgKind::U64],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "CopyTo",
+        arity: 4,
+        args: &[ComArgKind::Ptr, ComArgKind::U64, ComArgKind::OutPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 8,
+        name: "Commit",
+        arity: 1,
+        args: &[ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 9,
+        name: "Revert",
+        arity: 0,
+        args: &[],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 10,
+        name: "LockRegion",
+        arity: 3,
+        args: &[ComArgKind::U64, ComArgKind::U64, ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 11,
+        name: "UnlockRegion",
+        arity: 3,
+        args: &[ComArgKind::U64, ComArgKind::U64, ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 12,
+        name: "Stat",
+        arity: 2,
+        args: &[ComArgKind::OutPtr, ComArgKind::U32],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 13,
+        name: "Clone",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IMALLOC: &[ComSlotDesc] = &[
+    ComSlotDesc { slot: 3, name: "Alloc", arity: 1, args: &[ComArgKind::U64], ret: ComReturnKind::U64 },
+    ComSlotDesc { slot: 4, name: "Realloc", arity: 2, args: &[ComArgKind::Ptr, ComArgKind::U64], ret: ComReturnKind::U64 },
+    ComSlotDesc { slot: 5, name: "Free", arity: 1, args: &[ComArgKind::Ptr], ret: ComReturnKind::Void },
+    ComSlotDesc { slot: 6, name: "GetSize", arity: 1, args: &[ComArgKind::Ptr], ret: ComReturnKind::U64 },
+    ComSlotDesc { slot: 7, name: "DidAlloc", arity: 1, args: &[ComArgKind::Ptr], ret: ComReturnKind::U32 },
+    ComSlotDesc { slot: 8, name: "HeapMinimize", arity: 0, args: &[], ret: ComReturnKind::Void },
+];
+
+const SLOTS_IURI_FACTORY: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 6,
+        name: "CreateUri",
+        arity: 2,
+        args: &[ComArgKind::HString, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "CreateWithRelativeUri",
+        arity: 3,
+        args: &[ComArgKind::HString, ComArgKind::HString, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+const SLOTS_IURI: &[ComSlotDesc] = &[
+    ComSlotDesc { slot: 6, name: "get_AbsoluteUri", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 7, name: "get_DisplayUri", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 8, name: "get_Domain", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 9, name: "get_Extension", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 10, name: "get_Fragment", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 11, name: "get_Host", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 12, name: "get_Password", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 13, name: "get_Path", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 14, name: "get_Query", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 15, name: "get_QueryParsed", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 16, name: "get_RawUri", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 17, name: "get_SchemeName", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 18, name: "get_UserName", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 19, name: "get_Port", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 20, name: "get_Suspicious", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 21, name: "Equals", arity: 2, args: &[ComArgKind::Ptr, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 22, name: "CombineUri", arity: 2, args: &[ComArgKind::HString, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+];
+
+const SLOTS_IPROPERTYVALUE: &[ComSlotDesc] = &[
+    ComSlotDesc { slot: 6, name: "get_Type", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 7, name: "get_IsNumericScalar", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 8, name: "GetUInt8", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 9, name: "GetInt16", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 10, name: "GetUInt16", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 11, name: "GetInt32", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 12, name: "GetUInt32", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 13, name: "GetInt64", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 14, name: "GetUInt64", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 15, name: "GetSingle", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 16, name: "GetDouble", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 17, name: "GetChar16", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 18, name: "GetBoolean", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 19, name: "GetString", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 20, name: "GetGuid", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+];
+
+const SLOTS_IPROPERTYVALUESTATICS: &[ComSlotDesc] = &[
+    ComSlotDesc { slot: 6, name: "CreateEmpty", arity: 1, args: &[ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 7, name: "CreateUInt8", arity: 2, args: &[ComArgKind::U32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 8, name: "CreateInt16", arity: 2, args: &[ComArgKind::I32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 9, name: "CreateUInt16", arity: 2, args: &[ComArgKind::U32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 10, name: "CreateInt32", arity: 2, args: &[ComArgKind::I32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 11, name: "CreateUInt32", arity: 2, args: &[ComArgKind::U32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 12, name: "CreateInt64", arity: 2, args: &[ComArgKind::I64, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 13, name: "CreateUInt64", arity: 2, args: &[ComArgKind::U64, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 14, name: "CreateSingle", arity: 2, args: &[ComArgKind::U32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 15, name: "CreateDouble", arity: 2, args: &[ComArgKind::U64, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 16, name: "CreateChar16", arity: 2, args: &[ComArgKind::U32, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 17, name: "CreateBoolean", arity: 2, args: &[ComArgKind::Bool, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 18, name: "CreateString", arity: 2, args: &[ComArgKind::HString, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 19, name: "CreateInspectable", arity: 2, args: &[ComArgKind::Ptr, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+    ComSlotDesc { slot: 20, name: "CreateGuid", arity: 2, args: &[ComArgKind::GuidPtr, ComArgKind::OutPtr], ret: ComReturnKind::HResult },
+];
+
+const SLOTS_ISHELLITEM: &[ComSlotDesc] = &[
+    ComSlotDesc {
+        slot: 3,
+        name: "BindToHandler",
+        arity: 4,
+        args: &[ComArgKind::Ptr, ComArgKind::GuidPtr, ComArgKind::GuidPtr, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 4,
+        name: "GetParent",
+        arity: 1,
+        args: &[ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 5,
+        name: "GetDisplayName",
+        arity: 2,
+        args: &[ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 6,
+        name: "GetAttributes",
+        arity: 2,
+        args: &[ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+    ComSlotDesc {
+        slot: 7,
+        name: "Compare",
+        arity: 3,
+        args: &[ComArgKind::Ptr, ComArgKind::U32, ComArgKind::OutPtr],
+        ret: ComReturnKind::HResult,
+    },
+];
+
+fn builtin_interface_descs() -> Vec<ComInterfaceDesc> {
+    vec![
+        ComInterfaceDesc { iid: IID_IUnknown, name: "IUnknown", base_iid: None, slots: SLOTS_IUNKNOWN, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IClassFactory, name: "IClassFactory", base_iid: Some(IID_IUnknown), slots: SLOTS_ICLASSFACTORY, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IClassFactory2, name: "IClassFactory2", base_iid: Some(IID_IClassFactory), slots: SLOTS_ICLASSFACTORY2, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IMalloc, name: "IMalloc", base_iid: Some(IID_IUnknown), slots: SLOTS_IMALLOC, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IMarshal, name: "IMarshal", base_iid: Some(IID_IUnknown), slots: SLOTS_IMARSHAL, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_ISequentialStream, name: "ISequentialStream", base_iid: Some(IID_IUnknown), slots: SLOTS_ISEQUENTIALSTREAM, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IStream, name: "IStream", base_iid: Some(IID_ISequentialStream), slots: SLOTS_ISTREAM, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IAgileObject, name: "IAgileObject", base_iid: Some(IID_IUnknown), slots: &[], host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IDispatch, name: "IDispatch", base_iid: Some(IID_IUnknown), slots: SLOTS_IDISPATCH, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IInspectable, name: "IInspectable", base_iid: Some(IID_IUnknown), slots: SLOTS_IINSPECTABLE, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IActivationFactory, name: "IActivationFactory", base_iid: Some(IID_IInspectable), slots: SLOTS_IACTIVATIONFACTORY, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IConnectionPointContainer, name: "IConnectionPointContainer", base_iid: Some(IID_IUnknown), slots: SLOTS_ICONNECTIONPOINTCONTAINER, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IConnectionPoint, name: "IConnectionPoint", base_iid: Some(IID_IUnknown), slots: SLOTS_ICONNECTIONPOINT, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IEnumConnectionPoints, name: "IEnumConnectionPoints", base_iid: Some(IID_IUnknown), slots: SLOTS_IENUM_GENERIC, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IEnumConnections, name: "IEnumConnections", base_iid: Some(IID_IUnknown), slots: SLOTS_IENUM_GENERIC, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IPropertyValue, name: "IPropertyValue", base_iid: Some(IID_IInspectable), slots: SLOTS_IPROPERTYVALUE, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IPropertyValueStatics, name: "IPropertyValueStatics", base_iid: Some(IID_IInspectable), slots: SLOTS_IPROPERTYVALUESTATICS, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IUriRuntimeClass, name: "IUriRuntimeClass", base_iid: Some(IID_IInspectable), slots: SLOTS_IURI, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IUriRuntimeClassFactory, name: "IUriRuntimeClassFactory", base_iid: Some(IID_IInspectable), slots: SLOTS_IURI_FACTORY, host_vtbl: None },
+        ComInterfaceDesc { iid: IID_IShellItem, name: "IShellItem", base_iid: Some(IID_IUnknown), slots: SLOTS_ISHELLITEM, host_vtbl: None },
+    ]
+}
+
+fn interface_registry() -> &'static Mutex<Vec<ComInterfaceDesc>> {
+    static REG: OnceLock<Mutex<Vec<ComInterfaceDesc>>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let builtins = builtin_interface_descs();
+        for d in &builtins {
+            name_iid(d.iid, d.name);
+        }
+        Mutex::new(builtins)
+    })
+}
+
+/// Register (or update) a typed COM/WinRT interface descriptor by IID.
+#[allow(dead_code)]
+pub fn register_interface(desc: ComInterfaceDesc) {
+    name_iid(desc.iid, desc.name);
+    let mut reg = interface_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = reg.iter_mut().find(|d| d.iid == desc.iid) {
+        let prev_vtbl = existing.host_vtbl;
+        *existing = desc;
+        if existing.host_vtbl.is_none() {
+            existing.host_vtbl = prev_vtbl;
+        }
+    } else {
+        reg.push(desc);
+    }
+}
+
+/// Register a host COM vtable's function pointers with `VA_DISPATCH` AND associate
+/// the vtable address with `iid` in the COM interface registry.
+#[allow(dead_code)]
+pub unsafe fn register_host_vtable(iid: Guid, vtbl: *const usize, slot_count: usize) {
+    if vtbl.is_null() || slot_count == 0 {
+        return;
+    }
+    let slice = std::slice::from_raw_parts(vtbl, slot_count);
+    register_vtable_ptrs(slice);
+    let mut reg = interface_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = reg.iter_mut().find(|d| d.iid == iid) {
+        existing.host_vtbl = Some(vtbl as usize);
+    } else {
+        reg.push(ComInterfaceDesc {
+            iid,
+            name: iid_name(&iid).unwrap_or("UnknownCOM"),
+            base_iid: Some(IID_IUnknown),
+            slots: &[],
+            host_vtbl: Some(vtbl as usize),
+        });
+    }
+}
+
+/// Look up a COM interface descriptor by IID.
+#[allow(dead_code)]
+pub fn lookup_interface(iid: &Guid) -> Option<ComInterfaceDesc> {
+    interface_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|d| d.iid == *iid)
+        .copied()
+}
+
+/// Look up a COM interface descriptor by its registered host vtable pointer.
+#[allow(dead_code)]
+pub fn lookup_interface_by_host_vtbl(vtbl: *const usize) -> Option<ComInterfaceDesc> {
+    let addr = vtbl as usize;
+    if addr == 0 {
+        return None;
+    }
+    interface_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|d| d.host_vtbl == Some(addr))
+        .copied()
+}
+
+/// Resolve a COM vtable slot descriptor by `(iid, slot)`, walking `base_iid` inheritance.
+#[allow(dead_code)]
+pub fn lookup_slot(iid: &Guid, slot: usize) -> Option<ComSlotDesc> {
+    let reg = interface_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cur = Some(*iid);
+    for _ in 0..16 {
+        let g = cur?;
+        let desc = reg.iter().find(|d| d.iid == g)?;
+        if let Some(s) = desc.slots.iter().find(|s| s.slot == slot) {
+            return Some(*s);
+        }
+        cur = desc.base_iid;
+    }
+    None
+}
+
+/// Resolve a COM vtable slot descriptor by `(iid, method_name)`, walking `base_iid` inheritance.
+#[allow(dead_code)]
+pub fn lookup_slot_by_name(iid: &Guid, method_name: &str) -> Option<ComSlotDesc> {
+    let reg = interface_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cur = Some(*iid);
+    for _ in 0..16 {
+        let g = cur?;
+        let desc = reg.iter().find(|d| d.iid == g)?;
+        if let Some(s) = desc.slots.iter().find(|s| s.name == method_name) {
+            return Some(*s);
+        }
+        cur = desc.base_iid;
+    }
+    None
+}
+
+/// Invoke a typed COM interface vtable slot on a guest or host object, validating
+/// interface/slot registration and argument arity before calling through `call_guest8`.
+/// Always reads vtable and slot pointers with `read_unaligned`.
+#[allow(dead_code)]
+pub unsafe fn com_invoke_interface_slot(
+    obj: *mut c_void,
+    iid: &Guid,
+    slot: usize,
+    args: &[u64],
+) -> Result<u64, HRESULT> {
+    if obj.is_null() {
+        return Err(E_POINTER);
+    }
+    let Some(slot_desc) = lookup_slot(iid, slot) else {
+        return Err(if lookup_interface(iid).is_some() { E_NOTIMPL } else { E_NOINTERFACE });
+    };
+    if args.len() != slot_desc.arity || slot_desc.arity > 7 {
+        return Err(E_INVALIDARG);
+    }
+    let vtbl = std::ptr::read_unaligned(obj as *const *const usize);
+    if vtbl.is_null() {
+        return Err(E_POINTER);
+    }
+    let method = std::ptr::read_unaligned(vtbl.add(slot));
+    if method == 0 {
+        return Err(E_NOTIMPL);
+    }
+    let a = |i: usize| args.get(i).copied().unwrap_or(0);
+    Ok(crate::call_guest8(
+        method,
+        obj as u64,
+        a(0),
+        a(1),
+        a(2),
+        a(3),
+        a(4),
+        a(5),
+        a(6),
+    ))
+}
+
+/// Invoke a typed COM interface method by name on a guest or host object.
+#[allow(dead_code)]
+pub unsafe fn com_invoke_interface_method(
+    obj: *mut c_void,
+    iid: &Guid,
+    method_name: &str,
+    args: &[u64],
+) -> Result<u64, HRESULT> {
+    let Some(slot_desc) = lookup_slot_by_name(iid, method_name) else {
+        return Err(if lookup_interface(iid).is_some() { E_NOTIMPL } else { E_NOINTERFACE });
+    };
+    com_invoke_interface_slot(obj, iid, slot_desc.slot, args)
+}
+
+/// Convenience wrapper for `HRESULT`-returning COM slots via [`com_invoke_interface_slot`].
+#[allow(dead_code)]
+pub unsafe fn com_invoke_hresult(
+    obj: *mut c_void,
+    iid: &Guid,
+    slot: usize,
+    args: &[u64],
+) -> HRESULT {
+    match com_invoke_interface_slot(obj, iid, slot, args) {
+        Ok(raw) => raw as HRESULT,
+        Err(hr) => hr,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reusable Host `IConnectionPointContainer` / `IConnectionPoint` for guest sinks
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConnectData {
+    pub punk: *mut c_void,
+    pub cookie: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(std::mem::size_of::<ConnectData>() == 16);
+
+#[allow(dead_code)]
+pub struct ConnectionPointCore {
+    sink_iid: Guid,
+    next_cookie: AtomicU32,
+    sinks: Mutex<Vec<(u32, std::sync::Arc<ComPtr>)>>,
+}
+
+#[allow(dead_code)]
+impl ConnectionPointCore {
+    pub fn new(sink_iid: Guid) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            sink_iid,
+            next_cookie: AtomicU32::new(1),
+            sinks: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn sink_iid(&self) -> Guid {
+        self.sink_iid
+    }
+
+    pub fn sink_count(&self) -> usize {
+        self.sinks.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Snapshot currently advised guest sinks under lock, drop the lock, and
+    /// invoke `slot` on each sink through [`com_invoke_interface_slot`].
+    pub unsafe fn broadcast_slot(&self, slot: usize, args: &[u64]) -> Vec<(u32, Result<u64, HRESULT>)> {
+        let snapshot: Vec<(u32, std::sync::Arc<ComPtr>)> = {
+            let g = self.sinks.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter().map(|(c, p)| (*c, std::sync::Arc::clone(p))).collect()
+        };
+        let mut results = Vec::with_capacity(snapshot.len());
+        for (cookie, sink) in snapshot {
+            let r = com_invoke_interface_slot(sink.as_ptr(), &self.sink_iid, slot, args);
+            results.push((cookie, r));
+        }
+        results
+    }
+}
+
+struct CpInner {
+    core: std::sync::Arc<ConnectionPointCore>,
+    container: Option<std::sync::Arc<CpcCore>>,
+}
+
+struct CpcCore {
+    points: Vec<std::sync::Arc<ConnectionPointCore>>,
+}
+
+struct EnumConnInner {
+    items: Vec<(u32, std::sync::Arc<ComPtr>)>,
+    cursor: Mutex<usize>,
+}
+
+struct EnumCpInner {
+    points: Vec<std::sync::Arc<ConnectionPointCore>>,
+    container: std::sync::Arc<CpcCore>,
+    cursor: Mutex<usize>,
+}
+
+unsafe extern "win64" fn enum_conn_qi(
+    this: *mut ComObj<EnumConnInner>,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    qi_helper(this, riid, ppv, &[IID_IEnumConnections])
+}
+
+unsafe extern "win64" fn enum_conn_next(
+    this: *mut ComObj<EnumConnInner>,
+    c_conn: u32,
+    rgcd: *mut ConnectData,
+    pc_fetched: *mut u32,
+) -> HRESULT {
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, 0);
+    }
+    if c_conn > 0 && rgcd.is_null() {
+        return E_POINTER;
+    }
+    let inner = ComObj::inner(this);
+    let slice: Vec<(u32, std::sync::Arc<ComPtr>)> = {
+        let mut cur = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let avail = inner.items.len().saturating_sub(*cur);
+        let take = (c_conn as usize).min(avail);
+        let out: Vec<_> = inner.items[*cur..*cur + take]
+            .iter()
+            .map(|(c, p)| (*c, std::sync::Arc::clone(p)))
+            .collect();
+        *cur += take;
+        out
+    };
+    for (i, (cookie, ptr)) in slice.iter().enumerate() {
+        com_call_add_ref(ptr.as_ptr());
+        std::ptr::write_unaligned(
+            rgcd.add(i),
+            ConnectData {
+                punk: ptr.as_ptr(),
+                cookie: *cookie,
+                _pad: 0,
+            },
+        );
+    }
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, slice.len() as u32);
+    }
+    if slice.len() == c_conn as usize { S_OK } else { S_FALSE }
+}
+
+unsafe extern "win64" fn enum_conn_skip(this: *mut ComObj<EnumConnInner>, c_conn: u32) -> HRESULT {
+    let inner = ComObj::inner(this);
+    let mut cur = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let target = cur.saturating_add(c_conn as usize);
+    if target <= inner.items.len() {
+        *cur = target;
+        S_OK
+    } else {
+        *cur = inner.items.len();
+        S_FALSE
+    }
+}
+
+unsafe extern "win64" fn enum_conn_reset(this: *mut ComObj<EnumConnInner>) -> HRESULT {
+    *ComObj::inner(this).cursor.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    S_OK
+}
+
+unsafe extern "win64" fn enum_conn_clone(
+    this: *mut ComObj<EnumConnInner>,
+    pp_enum: *mut *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_POINTER;
+    }
+    let inner = ComObj::inner(this);
+    let cur = *inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let cloned = ComObj::new(
+        enum_conn_vtbl(),
+        EnumConnInner {
+            items: inner.items.clone(),
+            cursor: Mutex::new(cur),
+        },
+    );
+    std::ptr::write_unaligned(pp_enum, cloned as *mut c_void);
+    S_OK
+}
+
+fn enum_conn_vtbl() -> *const usize {
+    static VT: OnceLock<[usize; 7]> = OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                enum_conn_qi as *const () as usize,
+                com_add_ref::<EnumConnInner> as *const () as usize,
+                com_release::<EnumConnInner> as *const () as usize,
+                enum_conn_next as *const () as usize,
+                enum_conn_skip as *const () as usize,
+                enum_conn_reset as *const () as usize,
+                enum_conn_clone as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { register_host_vtable(IID_IEnumConnections, ptr, 7) };
+    ptr
+}
+
+unsafe extern "win64" fn cp_qi(
+    this: *mut ComObj<CpInner>,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    qi_helper(this, riid, ppv, &[IID_IConnectionPoint])
+}
+
+unsafe extern "win64" fn cp_get_connection_interface(
+    this: *mut ComObj<CpInner>,
+    p_iid: *mut Guid,
+) -> HRESULT {
+    if p_iid.is_null() {
+        return E_POINTER;
+    }
+    write_guid(p_iid, ComObj::inner(this).core.sink_iid);
+    S_OK
+}
+
+unsafe extern "win64" fn cp_get_cpc(
+    this: *mut ComObj<CpInner>,
+    pp_cpc: *mut *mut c_void,
+) -> HRESULT {
+    if pp_cpc.is_null() {
+        return E_POINTER;
+    }
+    write_null_out(pp_cpc);
+    let Some(cpc) = &ComObj::inner(this).container else {
+        return E_NOINTERFACE;
+    };
+    let obj = ComObj::new(cpc_vtbl(), std::sync::Arc::clone(cpc));
+    std::ptr::write_unaligned(pp_cpc, obj as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn cp_advise(
+    this: *mut ComObj<CpInner>,
+    p_unk_sink: *mut c_void,
+    pdw_cookie: *mut u32,
+) -> HRESULT {
+    if pdw_cookie.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(pdw_cookie, 0);
+    if p_unk_sink.is_null() {
+        return E_POINTER;
+    }
+    let core = &ComObj::inner(this).core;
+    // QueryInterface on guest sink OUTSIDE any lock.
+    let mut sink_iface: *mut c_void = std::ptr::null_mut();
+    let hr = com_call_qi(p_unk_sink, &core.sink_iid, &mut sink_iface);
+    if hr < 0 || sink_iface.is_null() {
+        return CONNECT_E_CANNOTCONNECT;
+    }
+    let Some(sink_ptr) = ComPtr::from_raw(sink_iface) else {
+        return CONNECT_E_CANNOTCONNECT;
+    };
+    let cookie = core.next_cookie.fetch_add(1, Ordering::Relaxed);
+    core.sinks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((cookie, std::sync::Arc::new(sink_ptr)));
+    std::ptr::write_unaligned(pdw_cookie, cookie);
+    S_OK
+}
+
+unsafe extern "win64" fn cp_unadvise(this: *mut ComObj<CpInner>, dw_cookie: u32) -> HRESULT {
+    let core = &ComObj::inner(this).core;
+    let removed = {
+        let mut sinks = core.sinks.lock().unwrap_or_else(|e| e.into_inner());
+        sinks
+            .iter()
+            .position(|(c, _)| *c == dw_cookie)
+            .map(|i| sinks.remove(i))
+    };
+    // Drop the removed Arc<ComPtr> (invoking guest Release) strictly OUTSIDE the lock.
+    match removed {
+        Some(entry) => {
+            drop(entry);
+            S_OK
+        }
+        None => CONNECT_E_NOCONNECTION,
+    }
+}
+
+unsafe extern "win64" fn cp_enum_connections(
+    this: *mut ComObj<CpInner>,
+    pp_enum: *mut *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_POINTER;
+    }
+    let items: Vec<(u32, std::sync::Arc<ComPtr>)> = {
+        let g = ComObj::inner(this).core.sinks.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().map(|(c, p)| (*c, std::sync::Arc::clone(p))).collect()
+    };
+    let obj = ComObj::new(enum_conn_vtbl(), EnumConnInner { items, cursor: Mutex::new(0) });
+    std::ptr::write_unaligned(pp_enum, obj as *mut c_void);
+    S_OK
+}
+
+fn cp_vtbl() -> *const usize {
+    static VT: OnceLock<[usize; 8]> = OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                cp_qi as *const () as usize,
+                com_add_ref::<CpInner> as *const () as usize,
+                com_release::<CpInner> as *const () as usize,
+                cp_get_connection_interface as *const () as usize,
+                cp_get_cpc as *const () as usize,
+                cp_advise as *const () as usize,
+                cp_unadvise as *const () as usize,
+                cp_enum_connections as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { register_host_vtable(IID_IConnectionPoint, ptr, 8) };
+    ptr
+}
+
+unsafe extern "win64" fn enum_cp_qi(
+    this: *mut ComObj<EnumCpInner>,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    qi_helper(this, riid, ppv, &[IID_IEnumConnectionPoints])
+}
+
+unsafe extern "win64" fn enum_cp_next(
+    this: *mut ComObj<EnumCpInner>,
+    c_conn: u32,
+    pp_cp: *mut *mut c_void,
+    pc_fetched: *mut u32,
+) -> HRESULT {
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, 0);
+    }
+    if c_conn > 0 && pp_cp.is_null() {
+        return E_POINTER;
+    }
+    let inner = ComObj::inner(this);
+    let mut cur = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let avail = inner.points.len().saturating_sub(*cur);
+    let take = (c_conn as usize).min(avail);
+    for i in 0..take {
+        let obj = ComObj::new(
+            cp_vtbl(),
+            CpInner {
+                core: std::sync::Arc::clone(&inner.points[*cur + i]),
+                container: Some(std::sync::Arc::clone(&inner.container)),
+            },
+        );
+        std::ptr::write_unaligned(pp_cp.add(i), obj as *mut c_void);
+    }
+    *cur += take;
+    if !pc_fetched.is_null() {
+        std::ptr::write_unaligned(pc_fetched, take as u32);
+    }
+    if take == c_conn as usize { S_OK } else { S_FALSE }
+}
+
+unsafe extern "win64" fn enum_cp_skip(this: *mut ComObj<EnumCpInner>, c_conn: u32) -> HRESULT {
+    let inner = ComObj::inner(this);
+    let mut cur = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let target = cur.saturating_add(c_conn as usize);
+    if target <= inner.points.len() {
+        *cur = target;
+        S_OK
+    } else {
+        *cur = inner.points.len();
+        S_FALSE
+    }
+}
+
+unsafe extern "win64" fn enum_cp_reset(this: *mut ComObj<EnumCpInner>) -> HRESULT {
+    *ComObj::inner(this).cursor.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    S_OK
+}
+
+unsafe extern "win64" fn enum_cp_clone(
+    this: *mut ComObj<EnumCpInner>,
+    pp_enum: *mut *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_POINTER;
+    }
+    let inner = ComObj::inner(this);
+    let cur = *inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let cloned = ComObj::new(
+        enum_cp_vtbl(),
+        EnumCpInner {
+            points: inner.points.clone(),
+            container: std::sync::Arc::clone(&inner.container),
+            cursor: Mutex::new(cur),
+        },
+    );
+    std::ptr::write_unaligned(pp_enum, cloned as *mut c_void);
+    S_OK
+}
+
+fn enum_cp_vtbl() -> *const usize {
+    static VT: OnceLock<[usize; 7]> = OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                enum_cp_qi as *const () as usize,
+                com_add_ref::<EnumCpInner> as *const () as usize,
+                com_release::<EnumCpInner> as *const () as usize,
+                enum_cp_next as *const () as usize,
+                enum_cp_skip as *const () as usize,
+                enum_cp_reset as *const () as usize,
+                enum_cp_clone as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { register_host_vtable(IID_IEnumConnectionPoints, ptr, 7) };
+    ptr
+}
+
+unsafe extern "win64" fn cpc_qi(
+    this: *mut ComObj<std::sync::Arc<CpcCore>>,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    qi_helper(this, riid, ppv, &[IID_IConnectionPointContainer])
+}
+
+unsafe extern "win64" fn cpc_enum_cps(
+    this: *mut ComObj<std::sync::Arc<CpcCore>>,
+    pp_enum: *mut *mut c_void,
+) -> HRESULT {
+    if pp_enum.is_null() {
+        return E_POINTER;
+    }
+    let core = ComObj::inner(this);
+    let obj = ComObj::new(
+        enum_cp_vtbl(),
+        EnumCpInner {
+            points: core.points.clone(),
+            container: std::sync::Arc::clone(core),
+            cursor: Mutex::new(0),
+        },
+    );
+    std::ptr::write_unaligned(pp_enum, obj as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn cpc_find_cp(
+    this: *mut ComObj<std::sync::Arc<CpcCore>>,
+    riid: *const Guid,
+    pp_cp: *mut *mut c_void,
+) -> HRESULT {
+    if pp_cp.is_null() {
+        return E_POINTER;
+    }
+    write_null_out(pp_cp);
+    let Some(iid) = read_guid(riid) else {
+        return E_POINTER;
+    };
+    let core = ComObj::inner(this);
+    let Some(cp) = core.points.iter().find(|p| p.sink_iid == iid) else {
+        return CONNECT_E_NOCONNECTION;
+    };
+    let obj = ComObj::new(
+        cp_vtbl(),
+        CpInner {
+            core: std::sync::Arc::clone(cp),
+            container: Some(std::sync::Arc::clone(core)),
+        },
+    );
+    std::ptr::write_unaligned(pp_cp, obj as *mut c_void);
+    S_OK
+}
+
+fn cpc_vtbl() -> *const usize {
+    static VT: OnceLock<[usize; 5]> = OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                cpc_qi as *const () as usize,
+                com_add_ref::<std::sync::Arc<CpcCore>> as *const () as usize,
+                com_release::<std::sync::Arc<CpcCore>> as *const () as usize,
+                cpc_enum_cps as *const () as usize,
+                cpc_find_cp as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { register_host_vtable(IID_IConnectionPointContainer, ptr, 5) };
+    ptr
+}
+
+/// Create a host `IConnectionPointContainer` COM object exposing the given connection points.
+#[allow(dead_code)]
+pub fn create_connection_point_container(
+    points: Vec<std::sync::Arc<ConnectionPointCore>>,
+) -> *mut c_void {
+    let core = std::sync::Arc::new(CpcCore { points });
+    ComObj::new(cpc_vtbl(), core) as *mut c_void
+}
+
+/// Create a standalone host `IConnectionPoint` COM object backed by `core`.
+#[allow(dead_code)]
+pub fn create_connection_point(core: std::sync::Arc<ConnectionPointCore>) -> *mut c_void {
+    ComObj::new(cp_vtbl(), CpInner { core, container: None }) as *mut c_void
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +2340,210 @@ mod tests {
             // Drop PrivateData -> releases last ref.
             drop(pd);
             assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn typed_interface_registry_and_connection_point_guest_sink_dispatch() {
+        const IID_TEST_EVENT_SINK: Guid = guid("11223344-5566-7788-99aa-bbccddeeff00");
+        const SINK_SLOTS: &[ComSlotDesc] = &[ComSlotDesc {
+            slot: 3,
+            name: "OnNotify",
+            arity: 2,
+            args: &[ComArgKind::U32, ComArgKind::U64],
+            ret: ComReturnKind::HResult,
+        }];
+
+        register_interface(ComInterfaceDesc {
+            iid: IID_TEST_EVENT_SINK,
+            name: "ITestEventSink",
+            base_iid: Some(IID_IUnknown),
+            slots: SINK_SLOTS,
+            host_vtbl: None,
+        });
+
+        // Verify IID + slot lookup (both own slot and inherited IUnknown slots).
+        assert_eq!(lookup_interface(&IID_TEST_EVENT_SINK).unwrap().name, "ITestEventSink");
+        assert_eq!(lookup_slot(&IID_TEST_EVENT_SINK, 0).unwrap().name, "QueryInterface");
+        assert_eq!(lookup_slot(&IID_TEST_EVENT_SINK, 3).unwrap().name, "OnNotify");
+        assert_eq!(lookup_slot_by_name(&IID_TEST_EVENT_SINK, "OnNotify").unwrap().slot, 3);
+        assert_eq!(lookup_slot(&IID_IActivationFactory, 6).unwrap().name, "ActivateInstance");
+        assert_eq!(lookup_slot(&IID_IActivationFactory, 4).unwrap().name, "GetRuntimeClassName");
+
+        // Build a guest-style COM sink with vtable + refcount + callback log.
+        #[repr(C)]
+        struct GuestSink {
+            vtbl: *const usize,
+            refs: AtomicU32,
+            events: Mutex<Vec<(u32, u64)>>,
+        }
+
+        unsafe extern "win64" fn sink_qi(
+            this: *mut GuestSink,
+            riid: *const Guid,
+            ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            if ppv.is_null() {
+                return E_POINTER;
+            }
+            write_null_out(ppv);
+            let Some(g) = read_guid(riid) else {
+                return E_POINTER;
+            };
+            if g == IID_IUnknown || g == IID_TEST_EVENT_SINK {
+                (*this).refs.fetch_add(1, Ordering::AcqRel);
+                std::ptr::write_unaligned(ppv, this as *mut c_void);
+                S_OK
+            } else {
+                E_NOINTERFACE
+            }
+        }
+
+        unsafe extern "win64" fn sink_add_ref(this: *mut GuestSink) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+
+        unsafe extern "win64" fn sink_release(this: *mut GuestSink) -> u32 {
+            (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+
+        unsafe extern "win64" fn sink_on_notify(
+            this: *mut GuestSink,
+            code: u32,
+            payload: u64,
+        ) -> HRESULT {
+            (*this).events.lock().unwrap().push((code, payload));
+            S_OK
+        }
+
+        let sink_vtbl: [usize; 4] = [
+            sink_qi as *const () as usize,
+            sink_add_ref as *const () as usize,
+            sink_release as *const () as usize,
+            sink_on_notify as *const () as usize,
+        ];
+        let mut sink = GuestSink {
+            vtbl: sink_vtbl.as_ptr(),
+            refs: AtomicU32::new(1),
+            events: Mutex::new(Vec::new()),
+        };
+        let sink_ptr = (&mut sink as *mut GuestSink) as *mut c_void;
+
+        unsafe {
+            // Arity validation rejects wrong argument counts cleanly.
+            assert_eq!(
+                com_invoke_interface_slot(sink_ptr, &IID_TEST_EVENT_SINK, 3, &[1]),
+                Err(E_INVALIDARG)
+            );
+            assert_eq!(
+                com_invoke_interface_slot(sink_ptr, &IID_TEST_EVENT_SINK, 99, &[]),
+                Err(E_NOTIMPL)
+            );
+
+            // Direct typed method invocation via call_guest8.
+            assert_eq!(
+                com_invoke_interface_method(sink_ptr, &IID_TEST_EVENT_SINK, "OnNotify", &[7, 0xCAFE]),
+                Ok(S_OK as u64)
+            );
+            assert_eq!(sink.events.lock().unwrap().clone(), vec![(7, 0xCAFE)]);
+
+            // Host IConnectionPointContainer -> FindConnectionPoint -> Advise -> broadcast -> Unadvise.
+            let cp_core = ConnectionPointCore::new(IID_TEST_EVENT_SINK);
+            let cpc = create_connection_point_container(vec![std::sync::Arc::clone(&cp_core)]);
+            assert_eq!(
+                lookup_interface_by_host_vtbl(cpc_vtbl()).unwrap().iid,
+                IID_IConnectionPointContainer
+            );
+
+            // Unknown sink IID -> CONNECT_E_NOCONNECTION.
+            let mut bad_cp: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                com_invoke_hresult(
+                    cpc,
+                    &IID_IConnectionPointContainer,
+                    4,
+                    &[&IID_TEST_UNKNOWN as *const Guid as u64, &mut bad_cp as *mut *mut c_void as u64]
+                ),
+                CONNECT_E_NOCONNECTION
+            );
+
+            // FindConnectionPoint for IID_TEST_EVENT_SINK.
+            let mut cp_iface: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                com_invoke_hresult(
+                    cpc,
+                    &IID_IConnectionPointContainer,
+                    4,
+                    &[&IID_TEST_EVENT_SINK as *const Guid as u64, &mut cp_iface as *mut *mut c_void as u64]
+                ),
+                S_OK
+            );
+            assert!(!cp_iface.is_null());
+
+            // Advise guest sink -> QI adds ref (1 -> 2), returns cookie.
+            let mut cookie = 0u32;
+            assert_eq!(
+                com_invoke_hresult(
+                    cp_iface,
+                    &IID_IConnectionPoint,
+                    5,
+                    &[sink_ptr as u64, &mut cookie as *mut u32 as u64]
+                ),
+                S_OK
+            );
+            assert_ne!(cookie, 0);
+            assert_eq!(sink.refs.load(Ordering::Acquire), 2);
+            assert_eq!(cp_core.sink_count(), 1);
+
+            // Broadcast invokes guest sink slot 3 with locks dropped.
+            let res = cp_core.broadcast_slot(3, &[42, 0x1234_5678]);
+            assert_eq!(res, vec![(cookie, Ok(S_OK as u64))]);
+            assert_eq!(
+                sink.events.lock().unwrap().clone(),
+                vec![(7, 0xCAFE), (42, 0x1234_5678)]
+            );
+
+            // EnumConnections yields our advised sink.
+            let mut enum_conn: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                com_invoke_hresult(
+                    cp_iface,
+                    &IID_IConnectionPoint,
+                    7,
+                    &[&mut enum_conn as *mut *mut c_void as u64]
+                ),
+                S_OK
+            );
+            let mut cd = ConnectData { punk: std::ptr::null_mut(), cookie: 0, _pad: 0 };
+            let mut fetched = 0u32;
+            assert_eq!(
+                com_invoke_hresult(
+                    enum_conn,
+                    &IID_IEnumConnections,
+                    3,
+                    &[1, &mut cd as *mut ConnectData as u64, &mut fetched as *mut u32 as u64]
+                ),
+                S_OK
+            );
+            assert_eq!(fetched, 1);
+            assert_eq!(cd.cookie, cookie);
+            assert_eq!(cd.punk, sink_ptr);
+            assert_eq!(com_call_release(cd.punk), 2);
+            assert_eq!(com_call_release(enum_conn), 0);
+
+            // Unadvise releases sink ref back to 1.
+            assert_eq!(
+                com_invoke_hresult(cp_iface, &IID_IConnectionPoint, 6, &[cookie as u64]),
+                S_OK
+            );
+            assert_eq!(sink.refs.load(Ordering::Acquire), 1);
+            assert_eq!(
+                com_invoke_hresult(cp_iface, &IID_IConnectionPoint, 6, &[cookie as u64]),
+                CONNECT_E_NOCONNECTION
+            );
+
+            assert_eq!(com_call_release(cp_iface), 0);
+            assert_eq!(com_call_release(cpc), 0);
         }
     }
 }

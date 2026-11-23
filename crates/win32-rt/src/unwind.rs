@@ -502,13 +502,50 @@ struct DynTable {
 unsafe impl Send for DynTable {}
 static DYN_TABLES: Mutex<Vec<DynTable>> = Mutex::new(Vec::new());
 
+#[derive(Clone, Copy)]
+struct DynCallbackTable {
+    table_id: u64,
+    base: u64,
+    len: u32,
+    callback: usize,
+    context: usize,
+    guest_image_backed: bool,
+}
+static DYN_CALLBACKS: Mutex<Vec<DynCallbackTable>> = Mutex::new(Vec::new());
+
+type GetRuntimeFunctionCallback =
+    unsafe extern "win64" fn(u64, *const c_void) -> *const RuntimeFunction;
+
+#[inline]
+fn is_guest_callback_addr(addr: usize) -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        in_pe_image(addr as u64) || crate::kernel32::memory::is_guest_vm_addr(addr)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        in_pe_image(addr as u64)
+    }
+}
+
 pub unsafe extern "win64" fn RtlAddFunctionTable(table: *const RuntimeFunction, count: u32, base: u64) -> u8 {
-    DYN_TABLES.lock().unwrap().push(DynTable { table, count, base });
+    if table.is_null() || count == 0 {
+        return 0;
+    }
+    DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner()).push(DynTable { table, count, base });
     1
 }
 
 pub unsafe extern "win64" fn RtlDeleteFunctionTable(table: *const RuntimeFunction) -> u8 {
-    let mut t = DYN_TABLES.lock().unwrap();
+    let raw = table as u64;
+    // Windows marks callback table identifiers with both low bits set (TableIdentifier & 3 == 3).
+    if (raw & 3) == 3 {
+        let mut cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = cbs.len();
+        cbs.retain(|d| d.table_id != raw);
+        return (cbs.len() != n) as u8;
+    }
+    let mut t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     let n = t.len();
     t.retain(|d| d.table != table);
     (t.len() != n) as u8
@@ -525,18 +562,18 @@ pub unsafe extern "win64" fn RtlAddGrowableFunctionTable(
     if dynamic_table.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
-    DYN_TABLES.lock().unwrap().push(DynTable {
+    DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner()).push(DynTable {
         table,
         count: entry_count,
         base: range_base as u64,
     });
-    *dynamic_table = table as *mut c_void;
+    std::ptr::write_unaligned(dynamic_table, table as *mut c_void);
     0 // STATUS_SUCCESS
 }
 
 pub unsafe extern "win64" fn RtlGrowFunctionTable(dynamic_table: *mut c_void, new_entry_count: u32) {
     let table = dynamic_table as *const RuntimeFunction;
-    let mut t = DYN_TABLES.lock().unwrap();
+    let mut t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(d) = t.iter_mut().find(|d| d.table == table) {
         d.count = new_entry_count;
     }
@@ -547,29 +584,111 @@ pub unsafe extern "win64" fn RtlDeleteGrowableFunctionTable(dynamic_table: *mut 
 }
 
 pub unsafe extern "win64" fn RtlInstallFunctionTableCallback(
-    _table_id: u64,
-    _base: u64,
-    _len: u32,
-    _cb: *const c_void,
-    _ctx: *const c_void,
+    table_id: u64,
+    base: u64,
+    len: u32,
+    cb: *const c_void,
+    ctx: *const c_void,
     _dll: *const u16,
 ) -> u8 {
-    stub!("function table callbacks not supported (JIT code will not unwind)");
+    // Windows requires the two low-order bits of TableIdentifier to be set, non-zero range
+    // without overflow, and a non-null callback pointer.
+    if (table_id & 3) != 3 || len == 0 || cb.is_null() || base.checked_add(len as u64).is_none() {
+        return 0;
+    }
+    let cb_addr = cb as usize;
+    let guest_image_backed = in_pe_image(cb_addr as u64);
+    let mut cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    if cbs.iter().any(|d| d.table_id == table_id) {
+        return 0;
+    }
+    cbs.push(DynCallbackTable {
+        table_id,
+        base,
+        len,
+        callback: cb_addr,
+        context: ctx as usize,
+        guest_image_backed,
+    });
     1
+}
+
+thread_local! {
+    static ACTIVE_CALLBACK_LOOKUPS: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ActiveCallbackGuard;
+impl Drop for ActiveCallbackGuard {
+    fn drop(&mut self) {
+        ACTIVE_CALLBACK_LOOKUPS.with(|s| {
+            let _ = s.borrow_mut().pop();
+        });
+    }
+}
+
+unsafe fn invoke_function_table_callback(entry: DynCallbackTable, pc: u64) -> *const RuntimeFunction {
+    if entry.guest_image_backed || is_guest_callback_addr(entry.callback) {
+        crate::call_guest8_seh(
+            entry.callback,
+            pc,
+            entry.context as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ) as *const RuntimeFunction
+    } else {
+        let f: GetRuntimeFunctionCallback = std::mem::transmute(entry.callback);
+        f(pc, entry.context as *const c_void)
+    }
 }
 
 pub fn lookup_function_entry(pc: u64) -> Option<(u64, *const RuntimeFunction)> {
     {
-        let t = DYN_TABLES.lock().unwrap();
+        let t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
         for d in t.iter() {
-            if pc < d.base || pc - d.base > u32::MAX as u64 {
+            if d.table.is_null() || d.count == 0 || pc < d.base || pc - d.base > u32::MAX as u64 {
                 continue;
             }
             let rva = (pc - d.base) as u32;
-            let s = unsafe { std::slice::from_raw_parts(d.table, d.count as usize) };
-            if let Some(f) = s.iter().find(|f| rva >= f.begin_rva && rva < f.end_rva) {
-                return Some((d.base, f as *const _));
+            for i in 0..d.count as usize {
+                let p = unsafe { d.table.add(i) };
+                let f = unsafe { std::ptr::read_unaligned(p) };
+                if rva >= f.begin_rva && rva < f.end_rva {
+                    return Some((d.base, p));
+                }
             }
+        }
+    }
+    let matching_callbacks: Vec<DynCallbackTable> = {
+        let cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        cbs.iter()
+            .copied()
+            .filter(|d| pc >= d.base && pc < d.base.saturating_add(d.len as u64))
+            .collect()
+    };
+    const MAX_CALLBACK_REENTRY_DEPTH: usize = 16;
+    for entry in matching_callbacks {
+        let can_enter = ACTIVE_CALLBACK_LOOKUPS.with(|s| {
+            let mut active = s.borrow_mut();
+            if active.len() >= MAX_CALLBACK_REENTRY_DEPTH
+                || active.contains(&(entry.table_id, pc))
+            {
+                return false;
+            }
+            active.push((entry.table_id, pc));
+            true
+        });
+        if !can_enter {
+            continue;
+        }
+        let _guard = ActiveCallbackGuard;
+        let rf = unsafe { invoke_function_table_callback(entry, pc) };
+        if !rf.is_null() {
+            return Some((entry.base, rf));
         }
     }
     crate::try_loader()?.lookup_function_entry(pc)
@@ -579,7 +698,7 @@ pub unsafe extern "win64" fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, _hi
     match lookup_function_entry(pc) {
         Some((b, f)) => {
             if !base.is_null() {
-                *base = b;
+                std::ptr::write_unaligned(base, b);
             }
             f
         }
@@ -2753,4 +2872,322 @@ pub unsafe extern "win64" fn dispatch_hardware_exception(rec: *mut ExceptionReco
     let mut c = *ctx;
     dispatch_exception(&mut *rec, &mut c);
     restore_context(&c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn rtl_install_function_table_callback_lookup_delete_out_of_range_and_reentry() {
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static LAST_PC: AtomicUsize = AtomicUsize::new(0);
+        static LAST_CTX: AtomicUsize = AtomicUsize::new(0);
+        static NESTED_BASE_SEEN: AtomicUsize = AtomicUsize::new(0);
+        static NESTED_RF_SEEN: AtomicUsize = AtomicUsize::new(0);
+        static SELF_REENTRY_RF: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static DYNAMIC_NESTED_OK: AtomicUsize = AtomicUsize::new(0);
+
+        static RF_PRIMARY: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x100,
+            end_rva: 0x200,
+            unwind_rva: 0x1000,
+        };
+        static RF_SECONDARY: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x040,
+            end_rva: 0x080,
+            unwind_rva: 0x2000,
+        };
+        static RF_TEMP: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x010,
+            end_rva: 0x050,
+            unwind_rva: 0x3000,
+        };
+
+        const BASE_PRIMARY: u64 = 0x7000_0000;
+        const LEN_PRIMARY: u32 = 0x4000;
+        const TID_PRIMARY: u64 = 0x7000_0000 | 3;
+
+        const BASE_SECONDARY: u64 = 0x7001_0000;
+        const LEN_SECONDARY: u32 = 0x2000;
+        const TID_SECONDARY: u64 = 0x7001_0000 | 3;
+
+        const BASE_TEMP: u64 = 0x7002_0000;
+        const LEN_TEMP: u32 = 0x1000;
+        const TID_TEMP: u64 = 0x7002_0000 | 3;
+
+        const BASE_GUEST_IMG: u64 = 0x7003_0000;
+        const LEN_GUEST_IMG: u32 = 0x1000;
+        const TID_GUEST_IMG: u64 = 0x7003_0000 | 3;
+
+        unsafe extern "win64" fn temp_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            if pc == BASE_TEMP + 0x20 && ctx as usize == 0x55AA {
+                &RF_TEMP
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe extern "win64" fn secondary_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            if pc >= BASE_SECONDARY + 0x40 && pc < BASE_SECONDARY + 0x80 && ctx as usize == 0x2222 {
+                &RF_SECONDARY
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe extern "win64" fn primary_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            LAST_PC.store(pc as usize, Ordering::SeqCst);
+            LAST_CTX.store(ctx as usize, Ordering::SeqCst);
+
+            // Reentry test: while inside callback (locks MUST be dropped!), perform:
+            // 1) lookup into another callback table,
+            // 2) install + lookup + delete of a temporary callback table,
+            // 3) self-reentry lookup on our own exact (table_id, pc) without deadlock or recursion blowup.
+            if ctx as usize == 0xCAFE_BABE {
+                let mut nested_base = 0u64;
+                let nested_rf = RtlLookupFunctionEntry(
+                    BASE_SECONDARY + 0x50,
+                    &mut nested_base,
+                    std::ptr::null_mut(),
+                );
+                NESTED_BASE_SEEN.store(nested_base as usize, Ordering::SeqCst);
+                NESTED_RF_SEEN.store(nested_rf as usize, Ordering::SeqCst);
+
+                let installed = RtlInstallFunctionTableCallback(
+                    TID_TEMP,
+                    BASE_TEMP,
+                    LEN_TEMP,
+                    temp_cb as *const c_void,
+                    0x55AAusize as *const c_void,
+                    std::ptr::null(),
+                );
+                let mut tb = 0u64;
+                let trf = RtlLookupFunctionEntry(BASE_TEMP + 0x20, &mut tb, std::ptr::null_mut());
+                let deleted = RtlDeleteFunctionTable(TID_TEMP as *const RuntimeFunction);
+                if installed == 1
+                    && tb == BASE_TEMP
+                    && trf == (&RF_TEMP as *const RuntimeFunction)
+                    && deleted == 1
+                {
+                    DYNAMIC_NESTED_OK.store(1, Ordering::SeqCst);
+                }
+
+                let self_rf = RtlLookupFunctionEntry(pc, std::ptr::null_mut(), std::ptr::null_mut());
+                SELF_REENTRY_RF.store(self_rf as usize, Ordering::SeqCst);
+            }
+
+            if pc >= BASE_PRIMARY + 0x100 && pc < BASE_PRIMARY + 0x200 {
+                &RF_PRIMARY
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe extern "win64" fn guest_img_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            if pc == BASE_GUEST_IMG + 0x150 && ctx as usize == 0x7777 {
+                &RF_PRIMARY
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe {
+            CALL_COUNT.store(0, Ordering::SeqCst);
+            LAST_PC.store(0, Ordering::SeqCst);
+            LAST_CTX.store(0, Ordering::SeqCst);
+            NESTED_BASE_SEEN.store(0, Ordering::SeqCst);
+            NESTED_RF_SEEN.store(0, Ordering::SeqCst);
+            SELF_REENTRY_RF.store(usize::MAX, Ordering::SeqCst);
+            DYNAMIC_NESTED_OK.store(0, Ordering::SeqCst);
+
+            // 1. Validation: TableIdentifier must have low 2 bits == 3, len > 0, cb != null, no overflow.
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    BASE_PRIMARY, // low 2 bits == 0 -> rejected
+                    BASE_PRIMARY,
+                    LEN_PRIMARY,
+                    primary_cb as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    BASE_PRIMARY,
+                    0, // zero length -> rejected
+                    primary_cb as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    BASE_PRIMARY,
+                    LEN_PRIMARY,
+                    std::ptr::null(), // null callback -> rejected
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    u64::MAX - 4,
+                    0x100, // base + len overflows -> rejected
+                    primary_cb as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+
+            // 2. Install primary & secondary callback ranges; duplicate TableIdentifier is rejected.
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    BASE_PRIMARY,
+                    LEN_PRIMARY,
+                    primary_cb as *const c_void,
+                    0x1111usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                1
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    BASE_PRIMARY,
+                    LEN_PRIMARY,
+                    primary_cb as *const c_void,
+                    0x1111usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_SECONDARY,
+                    BASE_SECONDARY,
+                    LEN_SECONDARY,
+                    secondary_cb as *const c_void,
+                    0x2222usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                1
+            );
+
+            // 3. Out-of-range lookups return NULL and must NOT invoke the callback.
+            let mut out_base = 0xDEAD_BEEFu64;
+            assert!(
+                RtlLookupFunctionEntry(BASE_PRIMARY - 1, &mut out_base, std::ptr::null_mut())
+                    .is_null()
+            );
+            assert!(
+                RtlLookupFunctionEntry(
+                    BASE_PRIMARY + LEN_PRIMARY as u64,
+                    &mut out_base,
+                    std::ptr::null_mut()
+                )
+                .is_null()
+            );
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 0);
+
+            // 4. In-range lookup invokes callback with exact (ControlPc, Context) and returns (entry, base).
+            let rf = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x120,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rf, &RF_PRIMARY as *const RuntimeFunction);
+            assert_eq!(out_base, BASE_PRIMARY);
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(LAST_PC.load(Ordering::SeqCst), (BASE_PRIMARY + 0x120) as usize);
+            assert_eq!(LAST_CTX.load(Ordering::SeqCst), 0x1111);
+
+            // In-range PC where callback returns NULL yields NULL.
+            let rf_none = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x010,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert!(rf_none.is_null());
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+
+            // 5. Delete primary and re-install with reentry context to verify lock-free reentry.
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 0);
+            assert!(
+                RtlLookupFunctionEntry(BASE_PRIMARY + 0x120, &mut out_base, std::ptr::null_mut())
+                    .is_null()
+            );
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_PRIMARY,
+                    BASE_PRIMARY,
+                    LEN_PRIMARY,
+                    primary_cb as *const c_void,
+                    0xCAFE_BABEusize as *const c_void,
+                    std::ptr::null(),
+                ),
+                1
+            );
+            let rf_re = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x140,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rf_re, &RF_PRIMARY as *const RuntimeFunction);
+            assert_eq!(out_base, BASE_PRIMARY);
+            assert_eq!(NESTED_BASE_SEEN.load(Ordering::SeqCst), BASE_SECONDARY as usize);
+            assert_eq!(
+                NESTED_RF_SEEN.load(Ordering::SeqCst),
+                &RF_SECONDARY as *const RuntimeFunction as usize
+            );
+            assert_eq!(DYNAMIC_NESTED_OK.load(Ordering::SeqCst), 1);
+            assert_eq!(SELF_REENTRY_RF.load(Ordering::SeqCst), 0);
+
+            // 6. Guest image-backed callback tracking + EH-aware dispatch (`call_guest8_seh`).
+            let cb_va = guest_img_cb as *const () as u64;
+            register_test_image(cb_va, 0x100);
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_GUEST_IMG,
+                    BASE_GUEST_IMG,
+                    LEN_GUEST_IMG,
+                    guest_img_cb as *const c_void,
+                    0x7777usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                1
+            );
+            {
+                let cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = cbs.iter().find(|d| d.table_id == TID_GUEST_IMG).unwrap();
+                assert!(entry.guest_image_backed);
+            }
+            let mut img_base = 0u64;
+            let img_rf = RtlLookupFunctionEntry(
+                BASE_GUEST_IMG + 0x150,
+                &mut img_base,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(img_rf, &RF_PRIMARY as *const RuntimeFunction);
+            assert_eq!(img_base, BASE_GUEST_IMG);
+
+            // Clean up all installed test tables.
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_SECONDARY as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_GUEST_IMG as *const RuntimeFunction), 1);
+        }
+    }
 }

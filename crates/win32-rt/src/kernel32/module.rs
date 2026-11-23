@@ -4,13 +4,148 @@ use crate::strings::*;
 use crate::types::*;
 use crate::ProcName;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
+
+// ---------------------------------------------------------------------------
+// LoadLibraryEx / DLL search path flags & process-wide search state
+// ---------------------------------------------------------------------------
+
+pub const DONT_RESOLVE_DLL_REFERENCES: u32 = 0x0000_0001;
+pub const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x0000_0002;
+pub const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+pub const LOAD_IGNORE_CODE_AUTHZ_LEVEL: u32 = 0x0000_0010;
+pub const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x0000_0020;
+pub const LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE: u32 = 0x0000_0040;
+pub const LOAD_LIBRARY_REQUIRE_SIGNED_TARGET: u32 = 0x0000_0080;
+pub const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
+pub const LOAD_LIBRARY_SEARCH_APPLICATION_DIR: u32 = 0x0000_0200;
+pub const LOAD_LIBRARY_SEARCH_USER_DIRS: u32 = 0x0000_0400;
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+pub const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+pub const LOAD_LIBRARY_SAFE_CURRENT_DIRS: u32 = 0x0000_2000;
+
+/// Valid flags accepted by `SetDefaultDllDirectories`.
+pub const VALID_DEFAULT_DLL_DIRECTORIES_MASK: u32 = LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+    | LOAD_LIBRARY_SEARCH_USER_DIRS
+    | LOAD_LIBRARY_SEARCH_SYSTEM32
+    | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+
+/// Search-directory override flags accepted by `LoadLibraryExW`.
+pub const LOAD_LIBRARY_SEARCH_FLAGS_MASK: u32 = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+    | LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+    | LOAD_LIBRARY_SEARCH_USER_DIRS
+    | LOAD_LIBRARY_SEARCH_SYSTEM32
+    | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+
+/// Datafile / image-resource mapping flags (skip imports, TLS, and DllMain).
+pub const DATAFILE_LOAD_FLAGS_MASK: u32 =
+    LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+
+/// Snapshot of the process-wide Win32 DLL search-path state configured via
+/// `SetDefaultDllDirectories`, `AddDllDirectory`, `RemoveDllDirectory`, and
+/// `SetDllDirectoryW/A`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DllSearchConfig {
+    /// Non-zero `LOAD_LIBRARY_SEARCH_*` mask set by `SetDefaultDllDirectories`, if any.
+    pub default_dirs_mask: Option<u32>,
+    /// Legacy `SetDllDirectoryW/A` state:
+    /// - `None`: default (CWD is included in standard legacy search order)
+    /// - `Some(None)`: `SetDllDirectory("")` removed CWD from standard search order
+    /// - `Some(Some(win_dir))`: `SetDllDirectory(dir)` replaced CWD with `win_dir`
+    pub legacy_dll_dir: Option<Option<String>>,
+    /// User directories added via `AddDllDirectory` (normalized Windows paths).
+    pub added_dirs: Vec<String>,
+}
+
+struct DllSearchState {
+    default_dirs_mask: Option<u32>,
+    legacy_dll_dir: Option<Option<String>>,
+    added_dirs: Vec<(usize, String)>,
+}
+
+impl DllSearchState {
+    const fn new() -> Self {
+        Self {
+            default_dirs_mask: None,
+            legacy_dll_dir: None,
+            added_dirs: Vec::new(),
+        }
+    }
+}
+
+static DLL_SEARCH_STATE: RwLock<DllSearchState> = RwLock::new(DllSearchState::new());
+static NEXT_DLL_DIR_COOKIE: AtomicUsize = AtomicUsize::new(0x1_0000);
+
+/// Snapshot current process-wide DLL search configuration for the PE loader.
+pub fn dll_search_config() -> DllSearchConfig {
+    let st = DLL_SEARCH_STATE.read().unwrap();
+    DllSearchConfig {
+        default_dirs_mask: st.default_dirs_mask,
+        legacy_dll_dir: st.legacy_dll_dir.clone(),
+        added_dirs: st.added_dirs.iter().map(|(_, dir)| dir.clone()).collect(),
+    }
+}
+
+/// Reset process-wide DLL search-path state to Windows startup defaults (for tests).
+pub fn reset_dll_search_state() {
+    let mut st = DLL_SEARCH_STATE.write().unwrap();
+    st.default_dirs_mask = None;
+    st.legacy_dll_dir = None;
+    st.added_dirs.clear();
+}
+
+/// True if `p` is a syntactically absolute Windows path (`C:\...`, `\\server\...`,
+/// or `\\?\C:\...` / `\??\C:\...` / `\Device\HarddiskVolume...\...`).
+pub fn is_absolute_win_path(p: &str) -> bool {
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let norm = crate::path::normalize(trimmed);
+    let b = norm.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+        || norm.starts_with("\\\\")
+}
+
+/// Validate `LoadLibraryExW` flag combinations against documented Windows rules.
+pub fn validate_load_library_flags(name: &str, flags: u32) -> Result<(), u32> {
+    // LOAD_WITH_ALTERED_SEARCH_PATH cannot be combined with any LOAD_LIBRARY_SEARCH_* flag.
+    if (flags & LOAD_WITH_ALTERED_SEARCH_PATH) != 0
+        && (flags & LOAD_LIBRARY_SEARCH_FLAGS_MASK) != 0
+    {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires a fully qualified path.
+    if (flags & LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) != 0 && !is_absolute_win_path(name) {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+    Ok(())
+}
 
 fn set_err(e: u32) {
     crate::teb::set_last_error(e);
 }
 
 pub unsafe fn load_library(name: &str, flags: u32) -> HMODULE {
-    match crate::loader().load_library(name, flags) {
+    load_library_with_search_path(name, flags, None)
+}
+
+pub unsafe fn load_library_with_search_path(
+    name: &str,
+    flags: u32,
+    search_path: Option<&str>,
+) -> HMODULE {
+    if name.is_empty() {
+        set_err(err::ERROR_MOD_NOT_FOUND);
+        return std::ptr::null_mut();
+    }
+    if let Err(e) = validate_load_library_flags(name, flags) {
+        log::warn!("LoadLibraryEx({name:?}, 0x{flags:x}) invalid flags: error {e}");
+        set_err(e);
+        return std::ptr::null_mut();
+    }
+    match crate::loader().load_library_with_search_path(name, flags, search_path) {
         Ok(h) => h as HMODULE,
         Err(e) => {
             log::warn!("LoadLibrary({name:?}, 0x{flags:x}) failed: error {e}");
@@ -21,19 +156,39 @@ pub unsafe fn load_library(name: &str, flags: u32) -> HMODULE {
 }
 
 pub unsafe extern "win64" fn LoadLibraryA(name: LPCSTR) -> HMODULE {
-    load_library(&from_ansi(name), 0)
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    load_library(&read_ansi_z(name, DEFAULT_MAX_STR_LEN), 0)
 }
 pub unsafe extern "win64" fn LoadLibraryW(name: LPCWSTR) -> HMODULE {
-    load_library(&from_wide(name), 0)
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    load_library(&read_wide_z(name, DEFAULT_MAX_STR_LEN), 0)
 }
-pub unsafe extern "win64" fn LoadLibraryExA(name: LPCSTR, _file: HANDLE, flags: u32) -> HMODULE {
-    load_library(&from_ansi(name), flags)
+pub unsafe extern "win64" fn LoadLibraryExA(name: LPCSTR, file: HANDLE, flags: u32) -> HMODULE {
+    if name.is_null() || !file.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    load_library(&read_ansi_z(name, DEFAULT_MAX_STR_LEN), flags)
 }
-pub unsafe extern "win64" fn LoadLibraryExW(name: LPCWSTR, _file: HANDLE, flags: u32) -> HMODULE {
-    load_library(&from_wide(name), flags)
+pub unsafe extern "win64" fn LoadLibraryExW(name: LPCWSTR, file: HANDLE, flags: u32) -> HMODULE {
+    if name.is_null() || !file.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    load_library(&read_wide_z(name, DEFAULT_MAX_STR_LEN), flags)
 }
 pub unsafe extern "win64" fn LoadPackagedLibrary(name: LPCWSTR, _r: u32) -> HMODULE {
-    load_library(&from_wide(name), 0)
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    load_library(&read_wide_z(name, DEFAULT_MAX_STR_LEN), 0)
 }
 
 pub unsafe extern "win64" fn FreeLibrary(h: HMODULE) -> BOOL {
@@ -103,10 +258,21 @@ pub unsafe extern "win64" fn GetModuleHandleExW(flags: u32, name: LPCWSTR, out: 
 }
 
 pub unsafe extern "win64" fn GetProcAddress(h: HMODULE, name: LPCSTR) -> *const c_void {
+    if name.is_null() {
+        set_err(err::ERROR_PROC_NOT_FOUND);
+        return std::ptr::null();
+    }
+    let owned_name: String;
     let pn = if (name as usize) < 0x10000 {
         ProcName::Ordinal(name as usize as u16)
     } else {
-        ProcName::Name(std::str::from_utf8_unchecked(cstr_slice(name)))
+        let bytes = read_ansi_bytes_z(name, DEFAULT_MAX_STR_LEN);
+        let Ok(s) = String::from_utf8(bytes) else {
+            set_err(err::ERROR_PROC_NOT_FOUND);
+            return std::ptr::null();
+        };
+        owned_name = s;
+        ProcName::Name(owned_name.as_str())
     };
     let h = if h.is_null() { crate::loader().get_module_handle(None).unwrap_or(0) } else { h as usize };
     match crate::loader().get_proc_address(h, pn) {
@@ -285,20 +451,72 @@ pub unsafe extern "win64" fn GetMappedFileNameA(p: HANDLE, addr: *mut c_void, bu
     K32GetMappedFileNameA(p, addr, buf, size)
 }
 
-pub unsafe extern "win64" fn SetDllDirectoryW(_p: LPCWSTR) -> BOOL {
+fn set_dll_directory_impl(dir: Option<String>) -> BOOL {
+    let mut st = DLL_SEARCH_STATE.write().unwrap();
+    match dir {
+        None => {
+            // NULL resets to default search order (restores CWD, clears legacy dir).
+            st.legacy_dll_dir = None;
+        }
+        Some(s) if s.is_empty() => {
+            // Empty string removes CWD from the default DLL search order.
+            st.legacy_dll_dir = Some(None);
+        }
+        Some(s) => {
+            let abs = crate::path::absolute(&s);
+            st.legacy_dll_dir = Some(Some(abs));
+        }
+    }
+    set_err(err::ERROR_SUCCESS);
     TRUE
 }
-pub unsafe extern "win64" fn SetDllDirectoryA(_p: LPCSTR) -> BOOL {
+
+pub unsafe extern "win64" fn SetDllDirectoryW(p: LPCWSTR) -> BOOL {
+    set_dll_directory_impl(read_wide_z_opt(p, DEFAULT_MAX_STR_LEN))
+}
+pub unsafe extern "win64" fn SetDllDirectoryA(p: LPCSTR) -> BOOL {
+    set_dll_directory_impl(read_ansi_z_opt(p, DEFAULT_MAX_STR_LEN))
+}
+pub unsafe extern "win64" fn SetDefaultDllDirectories(directory_flags: u32) -> BOOL {
+    if directory_flags == 0 || (directory_flags & !VALID_DEFAULT_DLL_DIRECTORIES_MASK) != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    DLL_SEARCH_STATE.write().unwrap().default_dirs_mask = Some(directory_flags);
+    set_err(err::ERROR_SUCCESS);
     TRUE
 }
-pub unsafe extern "win64" fn SetDefaultDllDirectories(_f: u32) -> BOOL {
-    TRUE
+pub unsafe extern "win64" fn AddDllDirectory(new_directory: LPCWSTR) -> *mut c_void {
+    let Some(raw) = read_wide_z_opt(new_directory, DEFAULT_MAX_STR_LEN) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !is_absolute_win_path(trimmed) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let norm = crate::path::normalize(trimmed);
+    let cookie = NEXT_DLL_DIR_COOKIE.fetch_add(1, Ordering::Relaxed);
+    DLL_SEARCH_STATE.write().unwrap().added_dirs.push((cookie, norm));
+    set_err(err::ERROR_SUCCESS);
+    cookie as *mut c_void
 }
-pub unsafe extern "win64" fn AddDllDirectory(_p: LPCWSTR) -> *mut c_void {
-    1 as *mut c_void
-}
-pub unsafe extern "win64" fn RemoveDllDirectory(_c: *mut c_void) -> BOOL {
-    TRUE
+pub unsafe extern "win64" fn RemoveDllDirectory(cookie: *mut c_void) -> BOOL {
+    if cookie.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let id = cookie as usize;
+    let mut st = DLL_SEARCH_STATE.write().unwrap();
+    if let Some(pos) = st.added_dirs.iter().position(|(c, _)| *c == id) {
+        st.added_dirs.remove(pos);
+        set_err(err::ERROR_SUCCESS);
+        TRUE
+    } else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        FALSE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +623,12 @@ unsafe fn res_first(dir: usize) -> Option<u32> {
 }
 
 unsafe fn find_resource(h: HMODULE, ty: ResId, name: ResId, lang: u16) -> *mut c_void {
-    let base = if h.is_null() { crate::loader().get_module_handle(None).unwrap_or(0) } else { h as usize };
+    // Strip low 2 datafile/image-resource tag bits (`LDR_IS_DATAFILE` / `LDR_IS_IMAGEMAPPING`).
+    let base = if h.is_null() {
+        crate::loader().get_module_handle(None).unwrap_or(0)
+    } else {
+        (h as usize) & !3
+    };
     let Some((rva, _)) = data_dir(base, 2) else {
         set_err(err::ERROR_RESOURCE_DATA_NOT_FOUND);
         return std::ptr::null_mut();
@@ -451,8 +674,12 @@ pub unsafe extern "win64" fn LoadResource(h: HMODULE, res: *mut c_void) -> *mut 
     if res.is_null() {
         return std::ptr::null_mut();
     }
-    let base = if h.is_null() { crate::loader().get_module_handle(None).unwrap_or(0) } else { h as usize };
-    (base + *(res as *const u32) as usize) as *mut c_void
+    let base = if h.is_null() {
+        crate::loader().get_module_handle(None).unwrap_or(0)
+    } else {
+        (h as usize) & !3
+    };
+    (base + std::ptr::read_unaligned(res as *const u32) as usize) as *mut c_void
 }
 
 pub unsafe extern "win64" fn LockResource(h: *mut c_void) -> *mut c_void {
@@ -597,6 +824,322 @@ mod tests {
             assert!(cur.is_null());
 
             ReleaseActCtx(h);
+        }
+    }
+
+    #[test]
+    fn dll_directory_search_state_validation_and_lifecycle() {
+        reset_dll_search_state();
+        unsafe {
+            // 1. SetDefaultDllDirectories rejects 0 and invalid flags (including DLL_LOAD_DIR).
+            assert_eq!(SetDefaultDllDirectories(0), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(SetDefaultDllDirectories(0x8000_0000), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Valid combinations succeed.
+            assert_eq!(
+                SetDefaultDllDirectories(
+                    LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS
+                ),
+                TRUE
+            );
+            assert_eq!(
+                dll_search_config().default_dirs_mask,
+                Some(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS)
+            );
+
+            assert_eq!(SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS), TRUE);
+            assert_eq!(
+                dll_search_config().default_dirs_mask,
+                Some(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            );
+
+            // 2. AddDllDirectory rejects NULL, empty, whitespace, and relative paths.
+            assert!(AddDllDirectory(std::ptr::null()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            let empty = to_wide_z("");
+            assert!(AddDllDirectory(empty.as_ptr()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            let rel = to_wide_z("plugins\\sub");
+            assert!(AddDllDirectory(rel.as_ptr()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Valid absolute paths return unique non-null cookies and normalize separators.
+            let dir1 = to_wide_z("C:/Game/plugins/one");
+            let dir2 = to_wide_z("C:\\Game\\plugins\\two");
+            let c1 = AddDllDirectory(dir1.as_ptr());
+            let c2 = AddDllDirectory(dir2.as_ptr());
+            assert!(!c1.is_null() && !c2.is_null() && c1 != c2);
+            assert_eq!(
+                dll_search_config().added_dirs,
+                vec!["C:\\Game\\plugins\\one", "C:\\Game\\plugins\\two"]
+            );
+
+            // RemoveDllDirectory removes valid cookies and rejects invalid/already-removed cookies.
+            assert_eq!(RemoveDllDirectory(std::ptr::null_mut()), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(RemoveDllDirectory(0xDEADusize as *mut c_void), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(RemoveDllDirectory(c1), TRUE);
+            assert_eq!(dll_search_config().added_dirs, vec!["C:\\Game\\plugins\\two"]);
+
+            // Double removal fails with ERROR_INVALID_PARAMETER.
+            assert_eq!(RemoveDllDirectory(c1), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(RemoveDllDirectory(c2), TRUE);
+            assert!(dll_search_config().added_dirs.is_empty());
+
+            // 3. SetDllDirectoryW/A: set directory, empty removes CWD, NULL restores default.
+            let leg = to_wide_z("C:\\Legacy\\Bin");
+            assert_eq!(SetDllDirectoryW(leg.as_ptr()), TRUE);
+            assert_eq!(
+                dll_search_config().legacy_dll_dir,
+                Some(Some("C:\\Legacy\\Bin".to_string()))
+            );
+
+            assert_eq!(SetDllDirectoryW(empty.as_ptr()), TRUE);
+            assert_eq!(dll_search_config().legacy_dll_dir, Some(None));
+
+            assert_eq!(SetDllDirectoryW(std::ptr::null()), TRUE);
+            assert_eq!(dll_search_config().legacy_dll_dir, None);
+
+            let leg_a = b"C:\\LegacyA\\Bin\0";
+            assert_eq!(SetDllDirectoryA(leg_a.as_ptr()), TRUE);
+            assert_eq!(
+                dll_search_config().legacy_dll_dir,
+                Some(Some("C:\\LegacyA\\Bin".to_string()))
+            );
+            assert_eq!(SetDllDirectoryA(std::ptr::null()), TRUE);
+            assert_eq!(dll_search_config().legacy_dll_dir, None);
+        }
+        reset_dll_search_state();
+    }
+
+    #[test]
+    fn load_library_flag_validation_and_ldr_bounded_strings() {
+        use std::sync::{Mutex, OnceLock};
+
+        struct RecordedCall {
+            name: String,
+            flags: u32,
+            search_path: Option<String>,
+        }
+        struct MockLoader {
+            calls: Mutex<Vec<RecordedCall>>,
+        }
+        impl crate::LoaderOps for MockLoader {
+            fn load_library(&self, name: &str, flags: u32) -> Result<usize, u32> {
+                self.load_library_with_search_path(name, flags, None)
+            }
+            fn load_library_with_search_path(
+                &self,
+                name: &str,
+                flags: u32,
+                search_path: Option<&str>,
+            ) -> Result<usize, u32> {
+                self.calls.lock().unwrap().push(RecordedCall {
+                    name: name.to_string(),
+                    flags,
+                    search_path: search_path.map(str::to_string),
+                });
+                if name.eq_ignore_ascii_case("mock_plugin.dll") {
+                    Ok(0x1000_0000)
+                } else {
+                    Err(err::ERROR_MOD_NOT_FOUND)
+                }
+            }
+            fn free_library(&self, hmod: usize) -> bool {
+                hmod == 0x1000_0000
+            }
+            fn get_module_handle(&self, name: Option<&str>) -> Option<usize> {
+                match name {
+                    // Never return an unmapped fake pointer for `None`: other unit tests in the
+                    // same process may call `FindResourceW(NULL, ...)` against this OnceLock loader.
+                    None => None,
+                    Some(n) if n.eq_ignore_ascii_case("mock_plugin.dll") => Some(0x1000_0000),
+                    _ => None,
+                }
+            }
+            fn get_proc_address(&self, hmod: usize, name: ProcName<'_>) -> Option<usize> {
+                if hmod != 0x1000_0000 {
+                    return None;
+                }
+                match name {
+                    ProcName::Name("ExactSym") => Some(0x1000_1111),
+                    ProcName::Name("DataSym") => Some(0x1000_2222),
+                    ProcName::Ordinal(42) => Some(0x1000_3333),
+                    _ => None,
+                }
+            }
+            fn module_path(&self, hmod: Option<usize>) -> Option<String> {
+                match hmod {
+                    Some(0x1000_0000) => Some("C:\\Game\\mock_plugin.dll".into()),
+                    _ => None,
+                }
+            }
+            fn module_from_address(&self, _addr: usize) -> Option<usize> {
+                None
+            }
+            fn thread_attach(&self, _teb: *mut u8, _is_initial: bool) {}
+            fn thread_detach(&self, _teb: *mut u8) {}
+            fn lookup_function_entry(
+                &self,
+                _pc: u64,
+            ) -> Option<(u64, *const pe_image::RuntimeFunction)> {
+                None
+            }
+            fn disable_thread_library_calls(&self, _hmod: usize) -> bool {
+                true
+            }
+            fn symbolize(&self, addr: usize) -> String {
+                format!("0x{addr:x}")
+            }
+        }
+
+        static MOCK: OnceLock<&'static MockLoader> = OnceLock::new();
+        let mock = *MOCK.get_or_init(|| {
+            let leaked: &'static MockLoader = Box::leak(Box::new(MockLoader {
+                calls: Mutex::new(Vec::new()),
+            }));
+            if crate::try_loader().is_none() {
+                crate::set_loader(leaked);
+            }
+            leaked
+        });
+
+        unsafe {
+            // Invalid flag combination: LOAD_WITH_ALTERED_SEARCH_PATH + LOAD_LIBRARY_SEARCH_*
+            let name_w = to_wide_z("C:\\Game\\mock_plugin.dll");
+            let h_bad = LoadLibraryExW(
+                name_w.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            );
+            assert!(h_bad.is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Invalid flag combination: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR with non-absolute path
+            let rel_w = to_wide_z("plugins\\mock_plugin.dll");
+            let h_rel = LoadLibraryExW(
+                rel_w.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            );
+            assert!(h_rel.is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Non-null hFile fails with ERROR_INVALID_PARAMETER.
+            let h_file = LoadLibraryExW(name_w.as_ptr(), 1usize as HANDLE, 0);
+            assert!(h_file.is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Null name fails with ERROR_INVALID_PARAMETER.
+            assert!(LoadLibraryW(std::ptr::null()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // LdrGetProcedureAddress honors ANSI_STRING.Length (non-NUL-terminated slice!).
+            let non_nul_buf = b"ExactSymTRAILING_GARBAGE";
+            #[repr(C)]
+            struct AnsiString {
+                len: u16,
+                max: u16,
+                pad: u32,
+                buf: *const u8,
+            }
+            let ansi = AnsiString {
+                len: 8, // "ExactSym" only!
+                max: non_nul_buf.len() as u16,
+                pad: 0,
+                buf: non_nul_buf.as_ptr(),
+            };
+            let mut out_fn: *const c_void = std::ptr::null();
+            let st = crate::ntdll::LdrGetProcedureAddress(
+                0x1000_0000 as HMODULE,
+                &ansi as *const AnsiString as *const u8,
+                0,
+                &mut out_fn,
+            );
+            assert_eq!(st, crate::ntdll::STATUS_SUCCESS);
+            assert_eq!(out_fn as usize, 0x1000_1111);
+
+            // LdrGetProcedureAddress by ordinal
+            out_fn = std::ptr::null();
+            let st_ord = crate::ntdll::LdrGetProcedureAddress(
+                0x1000_0000 as HMODULE,
+                std::ptr::null(),
+                42,
+                &mut out_fn,
+            );
+            assert_eq!(st_ord, crate::ntdll::STATUS_SUCCESS);
+            assert_eq!(out_fn as usize, 0x1000_3333);
+
+            // Missing symbol -> STATUS_ENTRYPOINT_NOT_FOUND
+            let st_miss = crate::ntdll::LdrGetProcedureAddress(
+                0x1000_0000 as HMODULE,
+                std::ptr::null(),
+                99,
+                &mut out_fn,
+            );
+            assert_eq!(st_miss, 0xC000_0139u32 as i32);
+            assert!(out_fn.is_null());
+
+            // LdrGetDllHandle honors UNICODE_STRING.len (non-NUL-terminated slice!).
+            let non_nul_w: Vec<u16> = "mock_plugin.dllGARBAGE".encode_utf16().collect();
+            let us_mod = crate::ntdll::UNICODE_STRING {
+                len: ("mock_plugin.dll".len() * 2) as u16,
+                max: (non_nul_w.len() * 2) as u16,
+                buf: non_nul_w.as_ptr() as *mut u16,
+            };
+            let mut got_h: HMODULE = std::ptr::null_mut();
+            assert_eq!(
+                crate::ntdll::LdrGetDllHandle(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &us_mod,
+                    &mut got_h
+                ),
+                crate::ntdll::STATUS_SUCCESS
+            );
+            assert_eq!(got_h as usize, 0x1000_0000);
+
+            // LdrLoadDll forwards PathToFile search hint and bit-0 search flags pointer.
+            let search_hint = to_wide_z("C:\\CustomSearch;C:\\AltSearch");
+            let mut ldr_h: HMODULE = std::ptr::null_mut();
+            let fl = LOAD_LIBRARY_SEARCH_USER_DIRS;
+            assert_eq!(
+                crate::ntdll::LdrLoadDll(search_hint.as_ptr(), &fl, &us_mod, &mut ldr_h),
+                crate::ntdll::STATUS_SUCCESS
+            );
+            assert_eq!(ldr_h as usize, 0x1000_0000);
+
+            let bit0_flags: u32 = LOAD_LIBRARY_SEARCH_SYSTEM32;
+            let bit0_ptr = ((&bit0_flags as *const u32 as usize) | 1) as LPCWSTR;
+            assert_eq!(
+                crate::ntdll::LdrLoadDll(bit0_ptr, std::ptr::null(), &us_mod, &mut ldr_h),
+                crate::ntdll::STATUS_SUCCESS
+            );
+            let calls = mock.calls.lock().unwrap();
+            assert!(calls.len() >= 2);
+            let c_hint = &calls[calls.len() - 2];
+            assert_eq!(c_hint.name, "mock_plugin.dll");
+            assert_eq!(c_hint.flags, LOAD_LIBRARY_SEARCH_USER_DIRS);
+            assert_eq!(
+                c_hint.search_path.as_deref(),
+                Some("C:\\CustomSearch;C:\\AltSearch")
+            );
+            let c_bit0 = &calls[calls.len() - 1];
+            assert_eq!(c_bit0.flags, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            assert_eq!(c_bit0.search_path, None);
         }
     }
 }

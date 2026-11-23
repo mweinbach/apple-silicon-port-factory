@@ -693,6 +693,8 @@ fn free_window(hwnd: usize) {
     }
     super::input::forget_window(hwnd);
     super::misc::forget_device_notifications(hwnd);
+    crate::misc::uxtheme::forget_window_subclasses(hwnd);
+    super::dialog::forget_dialog(hwnd);
 }
 
 pub unsafe fn create_window_w(
@@ -1627,7 +1629,7 @@ fn siblings_of(hwnd: usize) -> Vec<usize> {
     children_of(parent)
 }
 
-fn children_of(parent: usize) -> Vec<usize> {
+pub(crate) fn children_of(parent: usize) -> Vec<usize> {
     let t = table().read().unwrap();
     let mut v: Vec<usize> = t
         .map

@@ -345,6 +345,16 @@ impl std::fmt::Display for ProcName<'_> {
 pub trait LoaderOps: Send + Sync {
     /// `LoadLibraryExW` semantics. Returns the HMODULE or a Win32 error code.
     fn load_library(&self, name: &str, flags: u32) -> Result<usize, u32>;
+    /// `LdrLoadDll` semantics with an optional semicolon-separated search path hint (`PathToFile`).
+    fn load_library_with_search_path(
+        &self,
+        name: &str,
+        flags: u32,
+        search_path: Option<&str>,
+    ) -> Result<usize, u32> {
+        let _ = search_path;
+        self.load_library(name, flags)
+    }
     fn free_library(&self, hmod: usize) -> bool;
     /// `None` = the main executable.
     fn get_module_handle(&self, name: Option<&str>) -> Option<usize>;

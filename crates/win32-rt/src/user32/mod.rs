@@ -40,6 +40,7 @@
 pub mod class;
 pub mod cursor;
 pub mod defproc;
+pub mod dialog;
 pub mod input;
 pub mod keymap;
 pub mod message;
@@ -139,6 +140,11 @@ pub mod wm {
     pub const SETCURSOR: u32 = 0x0020;
     pub const MOUSEACTIVATE: u32 = 0x0021;
     pub const GETMINMAXINFO: u32 = 0x0024;
+    pub const NEXTDLGCTL: u32 = 0x0028;
+    pub const VKEYTOITEM: u32 = 0x002E;
+    pub const CHARTOITEM: u32 = 0x002F;
+    pub const QUERYDRAGICON: u32 = 0x0037;
+    pub const COMPAREITEM: u32 = 0x0039;
     pub const WINDOWPOSCHANGING: u32 = 0x0046;
     pub const WINDOWPOSCHANGED: u32 = 0x0047;
     pub const DISPLAYCHANGE: u32 = 0x007E;
@@ -150,6 +156,10 @@ pub mod wm {
     pub const NCHITTEST: u32 = 0x0084;
     pub const NCPAINT: u32 = 0x0085;
     pub const NCACTIVATE: u32 = 0x0086;
+    pub const GETDLGCODE: u32 = 0x0087;
+    pub const BM_GETCHECK: u32 = 0x00F0;
+    pub const BM_SETCHECK: u32 = 0x00F1;
+    pub const BM_CLICK: u32 = 0x00F5;
     pub const INPUT: u32 = 0x00FF;
     pub const KEYDOWN: u32 = 0x0100;
     pub const KEYUP: u32 = 0x0101;
@@ -158,8 +168,12 @@ pub mod wm {
     pub const SYSKEYDOWN: u32 = 0x0104;
     pub const SYSKEYUP: u32 = 0x0105;
     pub const SYSCHAR: u32 = 0x0106;
+    pub const INITDIALOG: u32 = 0x0110;
+    pub const COMMAND: u32 = 0x0111;
     pub const SYSCOMMAND: u32 = 0x0112;
     pub const TIMER: u32 = 0x0113;
+    pub const CTLCOLORMSGBOX: u32 = 0x0132;
+    pub const CTLCOLORSTATIC: u32 = 0x0138;
     pub const MOUSEMOVE: u32 = 0x0200;
     pub const LBUTTONDOWN: u32 = 0x0201;
     pub const LBUTTONUP: u32 = 0x0202;
@@ -202,6 +216,8 @@ pub mod ws {
     pub const THICKFRAME: u32 = 0x0004_0000;
     pub const MINIMIZEBOX: u32 = 0x0002_0000;
     pub const MAXIMIZEBOX: u32 = 0x0001_0000;
+    pub const GROUP: u32 = 0x0002_0000;
+    pub const TABSTOP: u32 = 0x0001_0000;
     pub const EX_TOPMOST: u32 = 0x0000_0008;
     pub const EX_TOOLWINDOW: u32 = 0x0000_0080;
     pub const EX_NOACTIVATE: u32 = 0x0800_0000;
@@ -209,11 +225,13 @@ pub mod ws {
 
 /// Errors used by user32.
 pub mod e {
+    pub const INVALID_DATA: u32 = 13;
     pub const INVALID_WINDOW_HANDLE: u32 = 1400;
     pub const CANNOT_FIND_WND_CLASS: u32 = 1407;
     pub const CLASS_ALREADY_EXISTS: u32 = 1410;
     pub const CLASS_DOES_NOT_EXIST: u32 = 1411;
     pub const CLASS_HAS_WINDOWS: u32 = 1412;
+    pub const CONTROL_ID_NOT_FOUND: u32 = 1421;
     pub const INVALID_THREAD_ID: u32 = 1444;
     pub const WINDOW_OF_OTHER_THREAD: u32 = 1408;
     pub const INVALID_PARAMETER: u32 = 87;
@@ -223,6 +241,7 @@ pub mod e {
     pub const NOT_SUPPORTED: u32 = 50;
     pub const CALL_NOT_IMPLEMENTED: u32 = 120;
     pub const RESOURCE_TYPE_NOT_FOUND: u32 = 1813;
+    pub const RESOURCE_NAME_NOT_FOUND: u32 = 1814;
     pub const TIMEOUT: u32 = 1460;
     pub const INVALID_CURSOR_HANDLE: u32 = 1402;
 }

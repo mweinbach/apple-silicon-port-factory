@@ -1506,39 +1506,6 @@ pub unsafe extern "win64" fn GetClipboardFormatNameA(fmt: u32, buf: LPSTR, max_c
 }
 
 // ---------------------------------------------------------------------------
-// Dialogs (resource dialogs are not supported)
-// ---------------------------------------------------------------------------
-
-pub unsafe extern "win64" fn DialogBoxParamW(inst: HINSTANCE, tmpl: LPCWSTR, _parent: HWND, _proc: usize, _lp: LPARAM) -> isize {
-    let n = if is_int_resource(tmpl) { format!("#{}", tmpl as usize) } else { crate::strings::from_wide(tmpl) };
-    stub!("DialogBoxParamW({:#x}, {n:?}): dialog resources not supported -> -1", inst as usize);
-    set_error(e::CALL_NOT_IMPLEMENTED);
-    -1
-}
-
-pub unsafe extern "win64" fn DialogBoxParamA(inst: HINSTANCE, tmpl: LPCSTR, parent: HWND, proc_: usize, lp: LPARAM) -> isize {
-    let _ = (tmpl, parent, proc_, lp);
-    stub!("DialogBoxParamA({:#x}): dialog resources not supported -> -1", inst as usize);
-    set_error(e::CALL_NOT_IMPLEMENTED);
-    -1
-}
-
-pub unsafe extern "win64" fn EndDialog(_hwnd: HWND, _result: isize) -> BOOL {
-    set_error(e::INVALID_WINDOW_HANDLE);
-    FALSE
-}
-
-pub unsafe extern "win64" fn GetDlgItem(_hwnd: HWND, _id: i32) -> HWND {
-    set_error(e::INVALID_WINDOW_HANDLE);
-    std::ptr::null_mut()
-}
-
-pub unsafe extern "win64" fn SetDlgItemTextW(_hwnd: HWND, _id: i32, _text: LPCWSTR) -> BOOL {
-    set_error(e::INVALID_WINDOW_HANDLE);
-    FALSE
-}
-
-// ---------------------------------------------------------------------------
 // DPI awareness (always per-monitor aware v2; see the Retina policy)
 // ---------------------------------------------------------------------------
 
@@ -1614,31 +1581,6 @@ pub unsafe extern "win64" fn AllowSetForegroundWindow(_pid: u32) -> BOOL {
 
 pub unsafe extern "win64" fn GetWindowTextLengthA(hwnd: HWND) -> i32 {
     crate::user32::window::GetWindowTextLengthW(hwnd)
-}
-
-pub unsafe extern "win64" fn SetDlgItemTextA(_hwnd: HWND, _id: i32, _text: LPCSTR) -> BOOL {
-    FALSE
-}
-
-pub unsafe extern "win64" fn SetDlgItemInt(
-    _hwnd: HWND,
-    _id: i32,
-    _value: u32,
-    _signed: BOOL,
-) -> BOOL {
-    FALSE
-}
-
-pub unsafe extern "win64" fn GetDlgItemInt(
-    _hwnd: HWND,
-    _id: i32,
-    translated: *mut BOOL,
-    _signed: BOOL,
-) -> u32 {
-    if !translated.is_null() {
-        *translated = FALSE;
-    }
-    0
 }
 
 pub unsafe extern "win64" fn CharLowerBuffW(lpsz: LPWSTR, cch_length: u32) -> u32 {
@@ -1738,6 +1680,152 @@ pub unsafe extern "win64" fn MessageBoxW(_hwnd: HWND, text: LPCWSTR, caption: LP
 
 pub unsafe extern "win64" fn MessageBoxA(_hwnd: HWND, text: LPCSTR, caption: LPCSTR, ty: u32) -> i32 {
     message_box(crate::strings::from_ansi_opt(text), crate::strings::from_ansi_opt(caption), ty)
+}
+
+const RT_STRING: usize = 6;
+
+/// Load a string resource from `hinstance`'s `RT_STRING` table (16 strings per block).
+///
+/// Follows the Win32 `LoadStringW` contract:
+/// * `block_id = (u_id >> 4) + 1`, `index = u_id & 0x0F`.
+/// * When `cch_buffer_max == 0`, writes a read-only `*const u16` pointer directly into
+///   the resource block at `*(lp_buffer as *mut *const u16)` and returns the UTF-16 code-unit
+///   length (without NUL termination).
+/// * When `cch_buffer_max > 0`, copies up to `cch_buffer_max - 1` UTF-16 code units, writes
+///   a trailing NUL terminator, and returns the number of copied code units (excluding NUL).
+pub unsafe extern "win64" fn LoadStringW(
+    hinstance: HINSTANCE,
+    u_id: u32,
+    lp_buffer: LPWSTR,
+    cch_buffer_max: i32,
+) -> i32 {
+    if lp_buffer.is_null() || cch_buffer_max < 0 {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    let block_id = ((u_id >> 4) as usize).wrapping_add(1);
+    let index = (u_id & 0x0F) as usize;
+    if block_id == 0 || block_id > 0xFFFF {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    }
+    if hinstance.is_null() && crate::try_loader().is_none() {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        set_error(e::RESOURCE_TYPE_NOT_FOUND);
+        return 0;
+    }
+    let hres = crate::kernel32::module::FindResourceW(
+        hinstance,
+        block_id as LPCWSTR,
+        RT_STRING as LPCWSTR,
+    );
+    if hres.is_null() {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        return 0;
+    }
+    let byte_size = crate::kernel32::module::SizeofResource(hinstance, hres) as usize;
+    let hglob = crate::kernel32::module::LoadResource(hinstance, hres);
+    if hglob.is_null() {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        set_error(crate::types::err::ERROR_RESOURCE_DATA_NOT_FOUND);
+        return 0;
+    }
+    let ptr = crate::kernel32::module::LockResource(hglob) as *const u8;
+    if ptr.is_null() || byte_size < 2 {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        set_error(crate::types::err::ERROR_RESOURCE_DATA_NOT_FOUND);
+        return 0;
+    }
+
+    let mut off = 0usize;
+    let mut str_ptr: *const u16 = std::ptr::null();
+    let mut str_len = 0usize;
+    for i in 0..=index {
+        let Some(after_len) = off.checked_add(2) else {
+            set_error(e::INVALID_DATA);
+            return 0;
+        };
+        if after_len > byte_size {
+            if cch_buffer_max > 0 {
+                std::ptr::write_unaligned(lp_buffer, 0);
+            } else {
+                std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+            }
+            set_error(crate::types::err::ERROR_RESOURCE_DATA_NOT_FOUND);
+            return 0;
+        }
+        let entry_len = std::ptr::read_unaligned(ptr.add(off) as *const u16) as usize;
+        off = after_len;
+        let Some(entry_bytes) = entry_len.checked_mul(2) else {
+            set_error(e::INVALID_DATA);
+            return 0;
+        };
+        let Some(after_str) = off.checked_add(entry_bytes) else {
+            set_error(e::INVALID_DATA);
+            return 0;
+        };
+        if after_str > byte_size {
+            if cch_buffer_max > 0 {
+                std::ptr::write_unaligned(lp_buffer, 0);
+            } else {
+                std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+            }
+            set_error(crate::types::err::ERROR_RESOURCE_DATA_NOT_FOUND);
+            return 0;
+        }
+        if i == index {
+            str_ptr = ptr.add(off) as *const u16;
+            str_len = entry_len;
+            break;
+        }
+        off = after_str;
+    }
+
+    if str_len == 0 {
+        if cch_buffer_max > 0 {
+            std::ptr::write_unaligned(lp_buffer, 0);
+        } else {
+            std::ptr::write_unaligned(lp_buffer as *mut *const u16, std::ptr::null());
+        }
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    }
+
+    if cch_buffer_max == 0 {
+        std::ptr::write_unaligned(lp_buffer as *mut *const u16, str_ptr);
+        set_error(0);
+        return str_len.min(i32::MAX as usize) as i32;
+    }
+
+    let copy_len = str_len.min((cch_buffer_max - 1) as usize);
+    for i in 0..copy_len {
+        let ch = std::ptr::read_unaligned(str_ptr.add(i));
+        std::ptr::write_unaligned(lp_buffer.add(i), ch);
+    }
+    std::ptr::write_unaligned(lp_buffer.add(copy_len), 0);
+    set_error(0);
+    copy_len as i32
 }
 
 #[cfg(test)]
@@ -2188,6 +2276,178 @@ mod tests {
             assert_eq!(UnhookWindowsHookEx(h_gm_outer), TRUE);
             assert_eq!(UnhookWindowsHookEx(h_cwp), TRUE);
             let _ = super::super::window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Build a minimal mapped PE32+ image containing an `.rsrc` `RT_STRING` directory
+    /// with the supplied `(block_id, [16 strings])` blocks.
+    fn build_pe_with_string_blocks(blocks: &[(u16, [&str; 16])]) -> Vec<u8> {
+        const NT_OFF: usize = 0x80;
+        const RSRC_RVA: usize = 0x1000;
+        let mut img = vec![0u8; 0x4000];
+        let wr16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        let wr32 = |buf: &mut [u8], off: usize, v: u32| {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+
+        // DOS + NT PE32+ headers sufficient for `kernel32::module::FindResourceW`.
+        wr16(&mut img, 0, 0x5A4D);
+        wr32(&mut img, 0x3C, NT_OFF as u32);
+        wr32(&mut img, NT_OFF, 0x0000_4550);
+        let opt = NT_OFF + 0x18;
+        wr16(&mut img, opt, 0x020B);
+        let img_size = img.len() as u32;
+        wr32(&mut img, opt + 56, img_size); // SizeOfImage
+        wr32(&mut img, opt + 108, 16); // NumberOfRvaAndSizes
+        wr32(&mut img, opt + 112 + 2 * 8, RSRC_RVA as u32); // DataDirectory[2].RVA
+        wr32(&mut img, opt + 112 + 2 * 8 + 4, 0x2000); // DataDirectory[2].Size
+
+        // Resource tree layout inside RSRC_RVA:
+        // [0x000] Root dir (1 entry: RT_STRING = 6 -> type_dir)
+        // [0x020] Type dir (blocks.len() entries: block_id -> lang_dir[i])
+        // [lang_base + i*0x20] Lang dir (1 entry: 0x0409 -> data_entry[i])
+        // [data_entry_base + i*0x10] IMAGE_RESOURCE_DATA_ENTRY (rva, size, 0, 0)
+        // [payload_cursor..] Packed RT_STRING blocks
+        let type_dir_off = 0x20usize;
+        let type_dir_size = 16 + blocks.len() * 8;
+        let lang_base = (type_dir_off + type_dir_size + 15) & !15;
+        let data_entry_base = lang_base + blocks.len() * 0x20;
+        let mut payload_off = (data_entry_base + blocks.len() * 0x10 + 15) & !15;
+
+        // Root directory: 1 integer ID entry (RT_STRING = 6).
+        wr16(&mut img, RSRC_RVA + 14, 1);
+        wr32(&mut img, RSRC_RVA + 16, RT_STRING as u32);
+        wr32(&mut img, RSRC_RVA + 20, 0x8000_0000 | type_dir_off as u32);
+
+        // Type directory: one entry per block_id.
+        wr16(&mut img, RSRC_RVA + type_dir_off + 14, blocks.len() as u16);
+        for (i, (block_id, entries)) in blocks.iter().enumerate() {
+            let lang_off = lang_base + i * 0x20;
+            let data_ent_off = data_entry_base + i * 0x10;
+
+            wr32(&mut img, RSRC_RVA + type_dir_off + 16 + i * 8, *block_id as u32);
+            wr32(&mut img, RSRC_RVA + type_dir_off + 20 + i * 8, 0x8000_0000 | lang_off as u32);
+
+            // Lang directory: 1 entry (en-US 0x0409 -> leaf data entry).
+            wr16(&mut img, RSRC_RVA + lang_off + 14, 1);
+            wr32(&mut img, RSRC_RVA + lang_off + 16, 0x0409);
+            wr32(&mut img, RSRC_RVA + lang_off + 20, data_ent_off as u32);
+
+            let mut block_bytes = Vec::new();
+            for s in entries {
+                let units: Vec<u16> = s.encode_utf16().collect();
+                block_bytes.extend_from_slice(&(units.len() as u16).to_le_bytes());
+                for u in units {
+                    block_bytes.extend_from_slice(&u.to_le_bytes());
+                }
+            }
+            let data_rva = RSRC_RVA + payload_off;
+            img[data_rva..data_rva + block_bytes.len()].copy_from_slice(&block_bytes);
+            wr32(&mut img, RSRC_RVA + data_ent_off, data_rva as u32);
+            wr32(&mut img, RSRC_RVA + data_ent_off + 4, block_bytes.len() as u32);
+            payload_off = (payload_off + block_bytes.len() + 15) & !15;
+        }
+        img
+    }
+
+    #[test]
+    fn load_string_w_blocks_truncation_and_zero_buffer_pointer() {
+        let mut blk1 = [""; 16];
+        blk1[0] = "ZeroId";
+        blk1[5] = "Hello, Win32!";
+        blk1[15] = "LastInBlock1";
+
+        let mut blk2 = [""; 16];
+        blk2[0] = "BlockTwoFirst";
+        blk2[3] = "Héllo — 世界";
+
+        let img = build_pe_with_string_blocks(&[(1, blk1), (2, blk2)]);
+
+        std::thread::spawn(move || unsafe {
+            let hinst = img.as_ptr() as HINSTANCE;
+            let img_len = img.len();
+            // 1. Block 1 entries (IDs 0, 5, 15).
+            let mut buf = [0xBEEFu16; 64];
+            assert_eq!(LoadStringW(hinst, 0, buf.as_mut_ptr(), buf.len() as i32), 6);
+            assert_eq!(read_wide_unaligned(buf.as_ptr()), "ZeroId");
+
+            assert_eq!(LoadStringW(hinst, 5, buf.as_mut_ptr(), buf.len() as i32), 13);
+            assert_eq!(read_wide_unaligned(buf.as_ptr()), "Hello, Win32!");
+
+            assert_eq!(LoadStringW(hinst, 15, buf.as_mut_ptr(), buf.len() as i32), 12);
+            assert_eq!(read_wide_unaligned(buf.as_ptr()), "LastInBlock1");
+
+            // 2. Block 2 entries (ID 16 -> block 2 index 0; ID 19 -> block 2 index 3).
+            assert_eq!(LoadStringW(hinst, 16, buf.as_mut_ptr(), buf.len() as i32), 13);
+            assert_eq!(read_wide_unaligned(buf.as_ptr()), "BlockTwoFirst");
+
+            let unicode_expected: Vec<u16> = "Héllo — 世界".encode_utf16().collect();
+            assert_eq!(
+                LoadStringW(hinst, 19, buf.as_mut_ptr(), buf.len() as i32),
+                unicode_expected.len() as i32
+            );
+            assert_eq!(read_wide_unaligned(buf.as_ptr()), "Héllo — 世界");
+
+            // 3. Truncation: cch_buffer_max = 6 copies 5 chars + NUL; cch_buffer_max = 1 writes only NUL.
+            let mut small = [0xAAAAu16; 8];
+            assert_eq!(LoadStringW(hinst, 5, small.as_mut_ptr(), 6), 5);
+            assert_eq!(read_wide_unaligned(small.as_ptr()), "Hello");
+            assert_eq!(small[5], 0);
+            assert_eq!(small[6], 0xAAAA);
+
+            let mut one = [0xAAAAu16; 2];
+            assert_eq!(LoadStringW(hinst, 5, one.as_mut_ptr(), 1), 0);
+            assert_eq!(one[0], 0);
+            assert_eq!(one[1], 0xAAAA);
+
+            // 4. Zero-buffer read-only pointer mode (`cch_buffer_max == 0`):
+            //    writes `*const u16` into `lp_buffer` pointing directly inside the resource block.
+            let mut ro_ptr: *const u16 = std::ptr::null();
+            let ro_len = LoadStringW(
+                hinst,
+                19,
+                &mut ro_ptr as *mut *const u16 as LPWSTR,
+                0,
+            );
+            assert_eq!(ro_len, unicode_expected.len() as i32);
+            assert!(!ro_ptr.is_null());
+            let img_lo = hinst as usize;
+            let img_hi = img_lo + img_len;
+            assert!(
+                (ro_ptr as usize) >= img_lo && (ro_ptr as usize) < img_hi,
+                "zero-buffer pointer must point into the PE resource block"
+            );
+            let ro_slice: Vec<u16> = (0..ro_len as usize)
+                .map(|i| std::ptr::read_unaligned(ro_ptr.add(i)))
+                .collect();
+            assert_eq!(String::from_utf16(&ro_slice).unwrap(), "Héllo — 世界");
+
+            // 5. Empty slot in existing block and missing block return 0 with resource error.
+            let mut empty_out: *const u16 = 0x1234usize as *const u16;
+            assert_eq!(
+                LoadStringW(hinst, 2, &mut empty_out as *mut *const u16 as LPWSTR, 0),
+                0
+            );
+            assert!(empty_out.is_null());
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            buf[0] = b'X' as u16;
+            assert_eq!(LoadStringW(hinst, 2, buf.as_mut_ptr(), 16), 0);
+            assert_eq!(buf[0], 0);
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            assert_eq!(LoadStringW(hinst, 999, buf.as_mut_ptr(), 16), 0);
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            // 6. Invalid parameters: null buffer or negative capacity.
+            assert_eq!(LoadStringW(hinst, 5, std::ptr::null_mut(), 16), 0);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+            assert_eq!(LoadStringW(hinst, 5, buf.as_mut_ptr(), -1), 0);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
         })
         .join()
         .unwrap();
