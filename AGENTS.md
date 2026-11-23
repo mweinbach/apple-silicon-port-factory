@@ -8,7 +8,8 @@ Rust, converts shaders to Metal, and renders on Metal 4 with **no Wine, CrossOve
 runtime**.
 
 It started as an Alan Wake 2 port and grew into a general-purpose, single-repo runtime (zero git
-submodules; `db/*.tsv` tracked in Git LFS). The universal engine lives under `crates/`; everything
+submodules; `db/` catalogs are plain text, with only the large Alan Wake 2 analysis tables in Git
+LFS). The universal engine lives under `crates/`; everything
 specific to a single game lives under `games/<id>/` (including `games/overwatch/`,
 `games/alan-wake-2/`, and starter template `games/_template/game.toml`). Nothing in this repo
 distributes game binaries or assets.
@@ -207,7 +208,7 @@ Detailed step-by-step runbooks live in `.agents/skills/`:
 | `package-macos-and-ios` | Building & verifying portable macOS `.app` bundles, iOS `.app`/`.ipa` (static `.aot.o`), Steam ports, `optimize-assets`, and `ios/PortHost` |
 | `audio-and-windowing` | Working on AppKit/UIKit windowing & deadlock rules, raw input, gamepads/DualSense HID, WASAPI→CoreAudio, and `wwise-audio` |
 | `profile-and-verify` | Profiling boot/CPU/hitches/GPU passes and running pre-PR boundary, `cargo opsdb -- doctor`, and test gates |
-| `audit-repo-hygiene` | Auditing copyright/privacy hygiene, crate boundaries, Git LFS `db/*.tsv`, and zero-submodule cleanliness before PRs or pushes |
+| `audit-repo-hygiene` | Auditing copyright/privacy hygiene, crate boundaries, `db/*.tsv` storage (plain-text catalogs, Git LFS for large tables), and zero-submodule cleanliness before PRs or pushes |
 | `decompile-function` | Bespoke Alan Wake 2 function decompilation under `games/alan-wake-2/crates/aw2-game` |
 
 ### Bringing up a new Windows game
@@ -256,7 +257,10 @@ Before you finish a change or commit:
    `objc2-metal` and zero `aw2-data`; `port-runner` has zero `aw2-game` or `aw2-data`.
 2. **Real verification** — Run the narrowest tests that cover your change, plus `cargo factory-test
    -- --test-threads=1` and `cargo runner-build` for cross-cutting edits. If you touched `win32-rt`
-   exports, run `cargo opsdb -- win32-sync`.
+   exports, run `cargo opsdb -- win32-sync`. CI (`.github/workflows/ci.yml`) repeats the hygiene
+   audit, `doctor`, `runner-build`, `factory-test`, the AOT verify test, the `aw2-game` check and
+   an iOS library check on every pull request, but it has no physical GPU: Metal 4, audio and
+   end-to-end tests still have to be run locally.
 3. **Zero warnings in code you touched** — Fix unused helpers, dead code, and compiler warnings
    before committing.
 4. **Small, clear commits** — Format: `<area>: <imperative summary>` (`factory`, `x86-runtime`,

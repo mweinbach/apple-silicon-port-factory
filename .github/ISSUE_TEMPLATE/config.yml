@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Project board
+    url: https://mweinbach.craft.me/aspc-whats-next
+    about: What is being worked on, known issues and proposed optimizations. Check here before filing.

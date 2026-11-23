@@ -67,7 +67,8 @@ Win32, x86-64, or graphics fixes in the universal crates:
      ```sh
      cargo opsdb -- win32-sync
      ```
-     Commit the updated `db/win32_apis.tsv` (tracked via Git LFS) with your change.
+     Commit the updated `db/win32_apis.tsv` with your change (it is plain text, so the diff
+     shows exactly which exports were added).
    - **Missing or buggy x86-64 instruction:**
      Implement it in `crates/x86-runtime/`, add unit/differential tests, and sync `db/ops_x86_to_arm64.tsv`
      if you added a new catalog entry (`cargo opsdb -- sync`).
@@ -98,6 +99,11 @@ cargo test -p d3d12-metal --lib --target aarch64-apple-darwin -- --test-threads=
 cargo test -p win32-rt --lib --target aarch64-apple-darwin -- d3d11 misc::vulkan_1 --test-threads=1
 cargo check -p aw2-game --no-default-features --target aarch64-apple-darwin
 ```
+
+Continuous integration (`.github/workflows/ci.yml`) runs the repo hygiene audit, checks 1–3 above,
+the AOT multi-module verification test, the `aw2-game` check and an iOS library check on every
+pull request. It runs on GitHub-hosted runners without a physical GPU, so the Metal 4, audio and
+end-to-end tests in step 4 still need to be run locally on Apple Silicon hardware.
 
 Use small, focused commits following `<area>: <imperative summary>` (for example:
 `win32: implement GetFileInformationByHandleEx`, `x86-runtime: lower vpermq in ARM64 JIT`,

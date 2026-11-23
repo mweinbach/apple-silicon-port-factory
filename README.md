@@ -1,5 +1,10 @@
 # Apple Silicon Port Factory (Experimental)
 
+[![CI](https://github.com/mweinbach/apple-silicon-port-factory/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mweinbach/apple-silicon-port-factory/actions/workflows/ci.yml)
+
+**[Project board](https://mweinbach.craft.me/aspc-whats-next)** — what is being worked on, known
+issues, and proposed optimizations, each tied to the code it would touch.
+
 > [!WARNING]
 > **Experimental Research Project — Bring Your Own Legally Owned Games Only**
 >
@@ -24,8 +29,8 @@
 
 ## Architecture
 
-This is a single, self-contained monorepo (zero git submodules; large `db/*.tsv` analysis tables
-are stored via Git LFS). Universal runtime code lives in `crates/`; per-game manifests and
+This is a single, self-contained monorepo (zero git submodules; `db/` catalogs are plain text and
+only the large Alan Wake 2 analysis tables are stored via Git LFS). Universal runtime code lives in `crates/`; per-game manifests and
 opt-in game targets live in `games/<id>/` (currently including **Overwatch** and **Alan Wake 2**,
 plus a starter template at [`games/_template/game.toml`](games/_template/game.toml)).
 
@@ -69,12 +74,16 @@ plus a starter template at [`games/_template/game.toml`](games/_template/game.to
 
 ## Prerequisites & Quick Start
 
-1. **Clone with Git LFS** (required to materialize `db/*.tsv`):
+1. **Clone the repository.** Git LFS is optional: the universal runner, the test suite and
+   `cargo opsdb -- doctor` work from a plain clone. Only the large Alan Wake 2 analysis tables
+   (`db/progress.tsv`, `db/throws.tsv`, `db/dll_progress.tsv`, `db/ret_liveness*.tsv`) live in
+   Git LFS.
    ```sh
-   brew install git-lfs
-   git lfs install
    git clone https://github.com/mweinbach/apple-silicon-port-factory.git
    cd apple-silicon-port-factory
+
+   # Only for Alan Wake 2 decompilation work:
+   brew install git-lfs && git lfs install && git lfs pull
    ```
 2. **Install Apple Metal Shader Converter 4.0.1** (downloaded from Apple Developer) and verify
    host prerequisites:
@@ -140,6 +149,7 @@ We want this framework to be easy to expand — adding support for a new game us
 
 ## Documentation
 
+- **Project board:** [current work, known issues and proposed optimizations](https://mweinbach.craft.me/aspc-whats-next)
 - **Contributing & agent guide:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md)
 - **Direction & planning:** [End Goal](docs/END_GOAL.md) · [What's Needed](docs/WHATS_NEEDED.md) · [What's Next](docs/WHATS_NEXT.md) · [ToDos](docs/TODOS.md)
 - **Current status & roadmap:** [docs/STATUS.md](docs/STATUS.md) · [docs/ROADMAP.md](docs/ROADMAP.md)
