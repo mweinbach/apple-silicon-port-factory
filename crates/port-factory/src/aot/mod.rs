@@ -9,10 +9,12 @@
 //! - [`operands`]: Register, memory effective-address, and condition-code
 //!   expression builders.
 
+pub mod abi;
 pub mod lower;
 pub mod operands;
 pub mod runtime;
 
+use self::abi::{classify_iat_abi, discover_pe_callback_roots, IatCallAbi};
 use self::lower::{is_block_terminator, is_valid_rust_ident, lower_instruction};
 use self::runtime::{emit_aot_runtime_prelude, emit_function_directory, emit_import_table};
 use crate::win32_db::{canonical_dll, Win32Database};
@@ -35,6 +37,18 @@ pub struct AotImportBinding {
     /// Resolved `win32_rt::...` Rust function path, if implemented in our Win32 layer.
     pub rust_path: Option<String>,
     pub category: String,
+    /// Classified Win64 calling-convention bridge (`IntArgs(0..=12)` vs honest `Fallback`).
+    pub call_abi: IatCallAbi,
+}
+
+/// One discovered executable callback or EH continuation root in the PE image.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AotCallbackRoot {
+    pub rva: u32,
+    pub kind: &'static str,
+    /// `true` for EH continuation landing pads (`GuardEHContinuationTable`, `C_SCOPE_TABLE.JumpTarget`),
+    /// which have distinct mid-frame resume context and are NOT emitted as standalone callable functions.
+    pub is_eh_continuation: bool,
 }
 
 /// Metadata for a single lifted function in the PE image.
@@ -61,6 +75,10 @@ pub struct AotModuleOutput {
     pub entry_rva: u32,
     pub functions: Vec<AotFunctionMeta>,
     pub imports: Vec<AotImportBinding>,
+    /// Statically discovered executable callback/unwind/CRT/COM-sink/EH-continuation roots.
+    pub callback_roots: Vec<AotCallbackRoot>,
+    /// EH continuation RVAs kept distinct from standalone callable `functions`.
+    pub eh_continuations: Vec<u32>,
     pub total_instructions: usize,
     pub lowered_instructions: usize,
     pub fallback_instructions: usize,
@@ -140,6 +158,7 @@ pub fn compile_pe_bytes_to_rust(
                 ),
                 None => (None, "UNRESOLVED".to_string()),
             };
+            let call_abi = classify_iat_abi(&canon, &sym);
             imports_by_rva.insert(
                 entry.iat_rva,
                 AotImportBinding {
@@ -149,6 +168,7 @@ pub fn compile_pe_bytes_to_rust(
                     symbol: sym,
                     rust_path,
                     category,
+                    call_abi,
                 },
             );
         }
@@ -226,6 +246,55 @@ pub fn compile_pe_bytes_to_rust(
         }
     }
 
+    let mut iat_thunks: HashMap<u32, u32> = HashMap::new();
+    for &(sec_lo, sec_hi) in &exec_ranges {
+        let len = (sec_hi - sec_lo) as usize;
+        if let Ok(code) = pe.bytes_at(sec_lo, len) {
+            let mut pos = 0usize;
+            while pos + 6 <= code.len() {
+                if code[pos] == 0xFF && code[pos + 1] == 0x25 {
+                    let begin_rva = sec_lo.wrapping_add(pos as u32);
+                    let disp = i32::from_le_bytes([
+                        code[pos + 2],
+                        code[pos + 3],
+                        code[pos + 4],
+                        code[pos + 5],
+                    ]);
+                    let next_rva = begin_rva.wrapping_add(6);
+                    let target_rva = (next_rva as i64 + disp as i64) as u32;
+                    if imports_by_rva.contains_key(&target_rva) {
+                        iat_thunks.insert(begin_rva, target_rva);
+                    }
+                    pos += 6;
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+    }
+
+    // 3b. Discover static executable callback roots (TLS, Load Config CFG / EH continuations,
+    // `.pdata` unwind handlers & scope tables, `.CRT*` ctor/dtor arrays, DIR64 relocs, and
+    // static registration call sites like `ReadFileEx` arg5 `[rsp+0x20]`, `CreateThread`,
+    // `SetWindowSubclass`, `FlsAlloc`, `atexit`, `_initterm`, `RegisterClassExW`, COM sinks).
+    let callback_roots = discover_pe_callback_roots(
+        &pe,
+        &exec_ranges,
+        &imports_by_rva,
+        &iat_thunks,
+    );
+    let mut eh_continuation_set: BTreeSet<u32> = BTreeSet::new();
+    for cb in &callback_roots {
+        if cb.is_eh_continuation {
+            // EH continuations resume mid-frame with restored context; NEVER emit as
+            // standalone 4-arg callable functions — keep distinct and inject as block leaders.
+            eh_continuation_set.insert(cb.rva);
+        } else if is_exec_rva(cb.rva) {
+            seed_starts.insert(cb.rva);
+        }
+    }
+    let eh_continuations: Vec<u32> = eh_continuation_set.iter().copied().collect();
+
     let all_known_starts: Vec<u32> = fn_bounds
         .keys()
         .copied()
@@ -279,7 +348,6 @@ pub fn compile_pe_bytes_to_rust(
 
     let known_fn_rvas: BTreeSet<u32> = selected_fns.iter().map(|&(b, _)| b).collect();
 
-    let mut iat_thunks: HashMap<u32, u32> = HashMap::new();
     for (&begin_rva, _) in &fn_bounds {
         if let Ok(b) = pe.bytes_at(begin_rva, 6) {
             if b[0] == 0xFF && b[1] == 0x25 {
@@ -338,6 +406,7 @@ pub fn compile_pe_bytes_to_rust(
             &known_fn_rvas,
             &iat_thunks,
             &imports_by_rva,
+            &eh_continuation_set,
             opts,
         )?;
         total_insns += fn_meta.instruction_count;
@@ -347,8 +416,14 @@ pub fn compile_pe_bytes_to_rust(
         functions_meta.push(fn_meta);
     }
 
-    // 6. Emit module-level dispatch and export lookup tables.
-    emit_function_directory(&mut src, &functions_meta, &pe.sections)?;
+    // 6. Emit module-level dispatch, export, callback-root, and EH-continuation tables.
+    emit_function_directory(
+        &mut src,
+        &functions_meta,
+        &pe.sections,
+        &callback_roots,
+        &eh_continuations,
+    )?;
 
     Ok(AotModuleOutput {
         binary_name: binary_name.to_string(),
@@ -357,6 +432,8 @@ pub fn compile_pe_bytes_to_rust(
         entry_rva: pe.headers.entry_rva,
         functions: functions_meta,
         imports: imports_by_rva.into_values().collect(),
+        callback_roots,
+        eh_continuations,
         total_instructions: total_insns,
         lowered_instructions: total_lowered,
         fallback_instructions: total_fallback,
@@ -417,6 +494,7 @@ fn lift_function(
     known_fn_rvas: &BTreeSet<u32>,
     iat_thunks: &HashMap<u32, u32>,
     imports_by_rva: &BTreeMap<u32, AotImportBinding>,
+    eh_continuations: &BTreeSet<u32>,
     opts: &AotOptions,
 ) -> Result<(AotFunctionMeta, String)> {
     let rust_ident = format!("fn_rva_{begin_rva:08x}");
@@ -424,11 +502,18 @@ fn lift_function(
 
     if let Some(iat_rva) = iat_thunk_rva {
         let imp = &imports_by_rva[&iat_rva];
+        let thunk_exact = matches!(imp.call_abi, IatCallAbi::IntArgs(n) if n <= 4);
         writeln!(
             out,
-            "// IAT Thunk 0x{begin_rva:08X} -> {}!{} (IAT 0x{iat_rva:08X},win32={:?})",
-            imp.canonical_dll, imp.symbol, imp.rust_path
+            "// IAT Thunk 0x{begin_rva:08X} -> {}!{} (IAT 0x{iat_rva:08X}, win32={:?}, abi={:?})",
+            imp.canonical_dll, imp.symbol, imp.rust_path, imp.call_abi
         )?;
+        if !thunk_exact {
+            writeln!(
+                out,
+                "// [AOT_FALLBACK] standalone 4-GPR thunk cannot forward >4/float/variadic args (direct callers inline call_iat_args)"
+            )?;
+        }
         if opts.emit_win64_abi_attr {
             writeln!(out, "#[cfg_attr(feature = \"win64-abi\", win64_abi::win64_abi)]")?;
         }
@@ -447,8 +532,8 @@ fn lift_function(
                 iat_thunk_rva: Some(iat_rva),
                 block_count: 1,
                 instruction_count: 1,
-                lowered_instructions: 1,
-                fallback_instructions: 0,
+                lowered_instructions: usize::from(thunk_exact),
+                fallback_instructions: usize::from(!thunk_exact),
             },
             out,
         ));
@@ -473,6 +558,11 @@ fn lift_function(
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     leaders.insert(begin_rva);
     let insn_rvas: BTreeSet<u32> = insns.iter().map(|&(r, _)| r).collect();
+    for &eh_rva in eh_continuations.range(begin_rva..end_rva) {
+        if insn_rvas.contains(&eh_rva) {
+            leaders.insert(eh_rva);
+        }
+    }
 
     for &(_rva, ref ins) in &insns {
         let next_rva = (ins.next_ip() - image_base) as u32;
@@ -756,6 +846,299 @@ fn main() {{
         assert!(
             run_out.status.success() && stdout.contains("AOT_ZLIB_OK"),
             "AOT execution failed: stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    /// Build a minimal valid PE32+ file in memory exercising:
+    /// - Exported `invoke_readfile_ex` calling `kernel32.dll!ReadFileEx` with a 5th stack
+    ///   argument `[rsp + 0x20]` pointing to a private module-relative callback (`0x1100`)
+    /// - Exported `invoke_sprintf` calling `ucrtbase.dll!sprintf` (variadic -> honest fallback)
+    /// - `.CRT$XCA` constructor pointer (`0x1140`)
+    /// - `.pdata` `UNW_FLAG_EHANDLER` unwind handler (`0x1180`) + `C_SCOPE_TABLE` jump target
+    ///   (`0x1040`, EH continuation inside `invoke_readfile_ex`)
+    /// - Load Config `GuardEHContinuationTable` entry (`0x1040`, distinct from callable fns)
+    fn build_callback_and_5arg_pe_fixture() -> Vec<u8> {
+        let mut raw = vec![0u8; 0x3000];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        let base: u64 = 0x1_8000_0000;
+
+        // DOS + NT headers (file layout == RVA layout with 0x1000 alignment).
+        w16(&mut raw, 0, 0x5A4D);
+        w32(&mut raw, 0x3C, 0x80);
+        w32(&mut raw, 0x80, 0x0000_4550);
+        w16(&mut raw, 0x84, 0x8664); // AMD64
+        w16(&mut raw, 0x86, 3); // 3 sections: .text, .rdata, .CRT$XCA
+        w16(&mut raw, 0x94, 240); // SizeOfOptionalHeader
+        w16(&mut raw, 0x96, 0x2022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
+        let opt = 0x98;
+        w16(&mut raw, opt, 0x20B); // PE32+
+        w32(&mut raw, opt + 16, 0x1000); // AddressOfEntryPoint
+        w64(&mut raw, opt + 24, base); // ImageBase
+        w32(&mut raw, opt + 32, 0x1000); // SectionAlignment
+        w32(&mut raw, opt + 36, 0x1000); // FileAlignment
+        w32(&mut raw, opt + 56, 0x4000); // SizeOfImage
+        w32(&mut raw, opt + 60, 0x400); // SizeOfHeaders
+        w32(&mut raw, opt + 108, 16); // NumberOfRvaAndSizes
+
+        // Data directories:
+        // [0] Export @ 0x2000 (size 0x100)
+        w32(&mut raw, opt + 112, 0x2000);
+        w32(&mut raw, opt + 116, 0x100);
+        // [1] Import @ 0x2100 (size 0x100)
+        w32(&mut raw, opt + 112 + 8, 0x2100);
+        w32(&mut raw, opt + 112 + 12, 0x100);
+        // [3] Exception (.pdata) @ 0x2300 (size 12)
+        w32(&mut raw, opt + 112 + 3 * 8, 0x2300);
+        w32(&mut raw, opt + 112 + 3 * 8 + 4, 12);
+        // [10] Load Config @ 0x2400 (size 0x140)
+        w32(&mut raw, opt + 112 + 10 * 8, 0x2400);
+        w32(&mut raw, opt + 112 + 10 * 8 + 4, 0x140);
+
+        // Section headers @ opt + 240 = 0x188
+        let sec = opt + 240;
+        let put_sec = |b: &mut [u8], idx: usize, name: &[u8; 8], rva: u32, sz: u32, ch: u32| {
+            let o = sec + idx * 40;
+            b[o..o + 8].copy_from_slice(name);
+            w32(b, o + 8, sz); // VirtualSize
+            w32(b, o + 12, rva); // VirtualAddress
+            w32(b, o + 16, sz); // SizeOfRawData
+            w32(b, o + 20, rva); // PointerToRawData (1:1 with RVA)
+            w32(b, o + 36, ch);
+        };
+        put_sec(&mut raw, 0, b".text\0\0\0", 0x1000, 0x1000, 0x6000_0020);
+        put_sec(&mut raw, 1, b".rdata\0\0", 0x2000, 0x0800, 0x4000_0040);
+        put_sec(&mut raw, 2, b".CRT$XCA", 0x2800, 0x0200, 0x4000_0040);
+
+        // --- .rdata: Exports @ 0x2000 ---
+        // Exported functions:
+        //   ord 1: invoke_readfile_ex @ 0x1000
+        //   ord 2: invoke_sprintf     @ 0x1080
+        w32(&mut raw, 0x2000 + 16, 1); // Base ordinal
+        w32(&mut raw, 0x2000 + 20, 2); // NumberOfFunctions
+        w32(&mut raw, 0x2000 + 24, 2); // NumberOfNames
+        w32(&mut raw, 0x2000 + 28, 0x2040); // AddressOfFunctions
+        w32(&mut raw, 0x2000 + 32, 0x2050); // AddressOfNames
+        w32(&mut raw, 0x2000 + 36, 0x2060); // AddressOfNameOrdinals
+        w32(&mut raw, 0x2040, 0x1000);
+        w32(&mut raw, 0x2044, 0x1080);
+        w32(&mut raw, 0x2050, 0x2070);
+        w32(&mut raw, 0x2054, 0x2090);
+        w16(&mut raw, 0x2060, 0);
+        w16(&mut raw, 0x2062, 1);
+        raw[0x2070..0x2070 + 19].copy_from_slice(b"invoke_readfile_ex\0");
+        raw[0x2090..0x2090 + 15].copy_from_slice(b"invoke_sprintf\0");
+
+        // --- .rdata: Imports @ 0x2100 ---
+        // Descriptor 0: kernel32.dll -> ReadFileEx (IAT @ 0x2200, ILT @ 0x2180)
+        // Descriptor 1: ucrtbase.dll -> sprintf    (IAT @ 0x2210, ILT @ 0x2190)
+        w32(&mut raw, 0x2100, 0x2180); // OriginalFirstThunk
+        w32(&mut raw, 0x2100 + 12, 0x21A0); // Name: kernel32.dll
+        w32(&mut raw, 0x2100 + 16, 0x2200); // FirstThunk (IAT)
+        w32(&mut raw, 0x2114, 0x2190); // OriginalFirstThunk
+        w32(&mut raw, 0x2114 + 12, 0x21B0); // Name: ucrtbase.dll
+        w32(&mut raw, 0x2114 + 16, 0x2210); // FirstThunk (IAT)
+        // ILT & IAT entries pointing to Hint/Name
+        w64(&mut raw, 0x2180, 0x21C0);
+        w64(&mut raw, 0x2200, 0x21C0);
+        w64(&mut raw, 0x2190, 0x21D8);
+        w64(&mut raw, 0x2210, 0x21D8);
+        raw[0x21A0..0x21A0 + 13].copy_from_slice(b"kernel32.dll\0");
+        raw[0x21B0..0x21B0 + 13].copy_from_slice(b"ucrtbase.dll\0");
+        raw[0x21C2..0x21C2 + 11].copy_from_slice(b"ReadFileEx\0");
+        raw[0x21DA..0x21DA + 8].copy_from_slice(b"sprintf\0");
+
+        // --- .rdata: .pdata @ 0x2300 + UNWIND_INFO @ 0x2320 ---
+        // Function 0x1000..0x1060 has UNW_FLAG_EHANDLER, handler @ 0x1180,
+        // and C_SCOPE_TABLE JumpTarget (EH continuation) @ 0x1040.
+        w32(&mut raw, 0x2300, 0x1000);
+        w32(&mut raw, 0x2304, 0x1060);
+        w32(&mut raw, 0x2308, 0x2320);
+        raw[0x2320] = 0x01 | (1 << 3); // Version=1, Flags=UNW_FLAG_EHANDLER
+        w32(&mut raw, 0x2324, 0x1180); // ExceptionHandler RVA
+        w32(&mut raw, 0x2328, 1); // C_SCOPE_TABLE Count = 1
+        w32(&mut raw, 0x232C, 0x1004); // Scope Begin
+        w32(&mut raw, 0x2330, 0x1030); // Scope End
+        w32(&mut raw, 0x2334, 1); // EXCEPTION_EXECUTE_HANDLER
+        w32(&mut raw, 0x2338, 0x1040); // JumpTarget (EH continuation!)
+
+        // --- .rdata: Load Config @ 0x2400 with GuardEHContinuationTable @ 0x2560 ---
+        w32(&mut raw, 0x2400, 0x140); // Size
+        w32(&mut raw, 0x2400 + 0x90, 0x0040_0000); // IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT
+        w64(&mut raw, 0x2400 + 0x110, base + 0x2560); // GuardEHContinuationTable VA
+        w64(&mut raw, 0x2400 + 0x118, 1); // GuardEHContinuationCount
+        w32(&mut raw, 0x2560, 0x1040); // EH continuation RVA inside 0x1000..0x1060
+
+        // --- .CRT$XCA @ 0x2800: constructor pointer -> 0x1140 ---
+        w64(&mut raw, 0x2800, base + 0x1140);
+
+        // --- .text @ 0x1000: invoke_readfile_ex(h, buf, len, ovl) ---
+        // sub rsp, 0x38                      ; 48 83 EC 38 (4B @ 0x1000)
+        // lea rax, [rip + (0x1100 - 0x100B)] ; 48 8D 05 F5 00 00 00 (7B @ 0x1004, next=0x100B)
+        // mov [rsp + 0x20], rax              ; 48 89 44 24 20 (5B @ 0x100B, next=0x1010)
+        // call qword ptr [rip + (0x2200 - 0x1016)] ; FF 15 EA 11 00 00 (6B @ 0x1010, next=0x1016)
+        // add rsp, 0x38                      ; 48 83 C4 38 (4B @ 0x1016, next=0x101A)
+        // ret                                ; C3 (1B @ 0x101A)
+        let mut fn0 = Vec::new();
+        fn0.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+        let disp_cb = (0x1100i32 - 0x100Bi32).to_le_bytes();
+        fn0.extend_from_slice(&[0x48, 0x8D, 0x05, disp_cb[0], disp_cb[1], disp_cb[2], disp_cb[3]]);
+        fn0.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        let disp_iat = (0x2200i32 - 0x1016i32).to_le_bytes();
+        fn0.extend_from_slice(&[0xFF, 0x15, disp_iat[0], disp_iat[1], disp_iat[2], disp_iat[3]]);
+        fn0.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0xC3]);
+        raw[0x1000..0x1000 + fn0.len()].copy_from_slice(&fn0);
+        // EH continuation landing pad @ 0x1040 (inside 0x1000..0x1060): mov eax, 0xE4; add rsp, 0x38; ret
+        raw[0x1040..0x104A].copy_from_slice(&[0xB8, 0xE4, 0x00, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x38, 0xC3]);
+
+        // --- .text @ 0x1080: invoke_sprintf(dst, fmt, val) -> calls variadic sprintf IAT @ 0x2210 ---
+        // sub rsp, 0x28; call [rip + (0x2210 - 0x108A)]; add rsp, 0x28; ret
+        let disp_sp = (0x2210i32 - 0x108Ai32).to_le_bytes();
+        let fn_sp = [
+            0x48, 0x83, 0xEC, 0x28,
+            0xFF, 0x15, disp_sp[0], disp_sp[1], disp_sp[2], disp_sp[3],
+            0x48, 0x83, 0xC4, 0x28,
+            0xC3,
+        ];
+        raw[0x1080..0x1080 + fn_sp.len()].copy_from_slice(&fn_sp);
+
+        // --- .text @ 0x1100: private ReadFileEx APC completion callback ---
+        // Returns rcx + rdx + r8 (error_code + bytes_transferred + overlapped_tag)
+        // mov rax, rcx; add rax, rdx; add rax, r8; ret
+        raw[0x1100..0x110A].copy_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0x01, 0xD0, 0x4C, 0x01, 0xC0, 0xC3]);
+
+        // --- .text @ 0x1140: CRT constructor ---
+        // mov eax, 0x42; ret
+        raw[0x1140..0x1146].copy_from_slice(&[0xB8, 0x42, 0x00, 0x00, 0x00, 0xC3]);
+
+        // --- .text @ 0x1180: Unwind handler ---
+        // mov eax, 1; ret
+        raw[0x1180..0x1186].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+
+        raw
+    }
+
+    #[test]
+    fn aot_emitter_discovers_callback_roots_handles_5arg_readfileex_and_flags_variadic_fallback() {
+        let pe_bytes = build_callback_and_5arg_pe_fixture();
+        let db = Win32Database::default();
+        let mut opts = AotOptions::default();
+        opts.emit_win64_abi_attr = false;
+        let out = compile_pe_bytes_to_rust("cb_plugin.dll", &pe_bytes, &db, &opts)
+            .expect("compile synthetic callback plugin");
+
+        // 1. Callback roots discovered statically without execution:
+        assert!(
+            out.callback_roots.iter().any(|c| c.rva == 0x1100 && c.kind == "apc" && !c.is_eh_continuation),
+            "expected ReadFileEx 5th-arg stack callback 0x1100 in {:?}",
+            out.callback_roots
+        );
+        assert!(
+            out.callback_roots.iter().any(|c| c.rva == 0x1140 && c.kind == "crt_ctor_dtor" && !c.is_eh_continuation),
+            "expected .CRT$XCA ctor 0x1140 in {:?}",
+            out.callback_roots
+        );
+        assert!(
+            out.callback_roots.iter().any(|c| c.rva == 0x1180 && c.kind == "unwind_handler" && !c.is_eh_continuation),
+            "expected .pdata unwind handler 0x1180 in {:?}",
+            out.callback_roots
+        );
+        assert!(
+            out.eh_continuations.contains(&0x1040),
+            "expected EH continuation 0x1040 in {:?}",
+            out.eh_continuations
+        );
+        // EH continuation MUST NOT be emitted as a standalone callable function in AOT_FUNCTIONS.
+        assert!(
+            !out.functions.iter().any(|f| f.begin_rva == 0x1040),
+            "EH continuation 0x1040 must stay distinct from standalone callable AOT_FUNCTIONS"
+        );
+        // Private ReadFileEx callback, CRT ctor, and unwind handler ARE emitted as callable fns.
+        assert!(out.functions.iter().any(|f| f.begin_rva == 0x1100));
+        assert!(out.functions.iter().any(|f| f.begin_rva == 0x1140));
+        assert!(out.functions.iter().any(|f| f.begin_rva == 0x1180));
+
+        // 2. ABI discipline:
+        //    - invoke_readfile_ex (5-arg ReadFileEx via call_iat_args(..., 5)) is fully lowered!
+        //    - invoke_sprintf (variadic sprintf) is honestly marked fallback (NOT fully_lowered)!
+        let f_read = out.functions.iter().find(|f| f.begin_rva == 0x1000).unwrap();
+        assert_eq!(f_read.fallback_instructions, 0, "ReadFileEx 5-arg bridge must be exact");
+        let f_sprintf = out.functions.iter().find(|f| f.begin_rva == 0x1080).unwrap();
+        assert!(
+            f_sprintf.fallback_instructions > 0,
+            "variadic sprintf must be marked honest fallback"
+        );
+
+        // 3. Compile and natively execute the generated Rust on ARM64 to prove ReadFileEx's
+        //    5th stack argument pointer (`[rsp + 0x20]`) arrives intact and invokes 0x1100!
+        let tmp_dir = std::env::temp_dir().join(format!("port_aot_5arg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let src_file = tmp_dir.join("cb_plugin_runner.rs");
+        let bin_file = tmp_dir.join("cb_plugin_runner");
+
+        let mut runner = out.rust_source.clone();
+        writeln!(
+            runner,
+            r#"
+static mut SEEN_ARGS: [u64; 5] = [0; 5];
+
+extern "C" fn mock_read_file_ex(h: u64, buf: u64, len: u64, ovl: u64, completion: u64) -> u64 {{
+    unsafe {{
+        SEEN_ARGS = [h, buf, len, ovl, completion];
+        // Invoke the 5th argument (module-relative callback VA) through lookup_aot_function!
+        let base = image_base();
+        let rva = (completion - base) as u32;
+        let cb = lookup_aot_function(rva).expect("completion callback 0x1100 lifted");
+        cb(0, len, ovl, 0)
+    }}
+}}
+
+fn main() {{
+    let mut img = vec![0u8; 0x4000];
+    let base = img.as_mut_ptr() as u64;
+    set_image_base(base);
+    // Patch ReadFileEx IAT slot @ 0x2200 with our 5-arg native host mock.
+    unsafe {{
+        wr64(base + 0x2200, mock_read_file_ex as *const () as usize as u64);
+    }}
+    let res = invoke_readfile_ex(0x11, 0x2200, 128, 7);
+    let seen = unsafe {{ SEEN_ARGS }};
+    assert_eq!(seen[0], 0x11);
+    assert_eq!(seen[1], 0x2200);
+    assert_eq!(seen[2], 128);
+    assert_eq!(seen[3], 7);
+    assert_eq!(seen[4], base + 0x1100, "5th stack arg lpCompletionRoutine must be base + 0x1100");
+    assert_eq!(res, 135, "callback(0, 128, 7) must return 135");
+    assert_eq!(AOT_EH_CONTINUATIONS, &[0x1040]);
+    println!("AOT_5ARG_CALLBACK_OK res={{res}}");
+}}
+"#
+        )
+        .unwrap();
+
+        std::fs::write(&src_file, &runner).unwrap();
+        let status = Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "-C",
+                "opt-level=1",
+                src_file.to_str().unwrap(),
+                "-o",
+                bin_file.to_str().unwrap(),
+            ])
+            .status()
+            .expect("invoke rustc on generated 5-arg callback plugin");
+        assert!(status.success(), "rustc failed on generated 5-arg plugin");
+
+        let run_out = Command::new(&bin_file).output().expect("run 5-arg plugin");
+        let stdout = String::from_utf8_lossy(&run_out.stdout);
+        let stderr = String::from_utf8_lossy(&run_out.stderr);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert!(
+            run_out.status.success() && stdout.contains("AOT_5ARG_CALLBACK_OK res=135"),
+            "native ARM64 execution failed: stdout={stdout} stderr={stderr}"
         );
     }
 }

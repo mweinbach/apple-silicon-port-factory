@@ -39,7 +39,7 @@ pub fn cmd_scan(args: &[String]) -> Result<()> {
         files.extend(collect_pe_files(p)?);
     }
     if files.is_empty() {
-        bail!("no .exe or .dll files found in {:?}", paths);
+        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
     }
     let mut profiles = Vec::new();
     for f in &files {
@@ -82,7 +82,7 @@ pub fn cmd_win32_audit(args: &[String]) -> Result<()> {
         files.extend(collect_pe_files(p)?);
     }
     if files.is_empty() {
-        bail!("no .exe or .dll files found in {:?}", paths);
+        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
     }
 
     let root = workspace_root();
@@ -378,7 +378,7 @@ pub fn cmd_app_audit(args: &[String]) -> Result<()> {
         files.extend(collect_pe_files(p)?);
     }
     if files.is_empty() {
-        bail!("no .exe or .dll files found in {:?}", paths);
+        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
     }
     let mut profiles = Vec::new();
     for f in &files {
@@ -430,7 +430,7 @@ pub fn cmd_anticheat_audit(args: &[String]) -> Result<()> {
         files.extend(collect_pe_files(p)?);
     }
     if files.is_empty() {
-        bail!("no .exe or .dll files found in {:?}", paths);
+        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
     }
     for f in &files {
         if let Ok(rep) = audit_pe_anticheat(f) {

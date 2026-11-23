@@ -5,10 +5,13 @@ advapi32.dll	AllocateLocallyUniqueId	-	CORE_OS	win32_rt::advapi32::AllocateLocal
 advapi32.dll	ChangeServiceConfig2W	-	CORE_OS	win32_rt::advapi32::ChangeServiceConfig2W	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CheckTokenMembership	-	CORE_OS	win32_rt::advapi32::CheckTokenMembership	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CloseServiceHandle	-	CORE_OS	win32_rt::advapi32::CloseServiceHandle	crates/win32-rt/src/advapi32.rs
+advapi32.dll	ControlService	-	CORE_OS	win32_rt::advapi32::ControlService	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ConvertSidToStringSidA	-	CORE_OS	win32_rt::advapi32::ConvertSidToStringSidA	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ConvertSidToStringSidW	-	CORE_OS	win32_rt::advapi32::ConvertSidToStringSidW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ConvertStringSecurityDescriptorToSecurityDescriptorA	-	CORE_OS	win32_rt::advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorA	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ConvertStringSecurityDescriptorToSecurityDescriptorW	-	CORE_OS	win32_rt::advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	CreateServiceA	-	CORE_OS	win32_rt::advapi32::CreateServiceA	crates/win32-rt/src/advapi32.rs
+advapi32.dll	CreateServiceW	-	CORE_OS	win32_rt::advapi32::CreateServiceW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CredDeleteW	-	CORE_OS	win32_rt::advapi32::CredDeleteW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CredFree	-	CORE_OS	win32_rt::advapi32::CredFree	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CredReadW	-	CORE_OS	win32_rt::advapi32::CredReadW	crates/win32-rt/src/advapi32.rs
@@ -31,6 +34,7 @@ advapi32.dll	CryptImportKey	-	CORE_OS	win32_rt::advapi32::CryptImportKey	crates/
 advapi32.dll	CryptReleaseContext	-	CORE_OS	win32_rt::advapi32::CryptReleaseContext	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CryptSetHashParam	-	CORE_OS	win32_rt::advapi32::CryptSetHashParam	crates/win32-rt/src/advapi32.rs
 advapi32.dll	CryptSignHashW	-	CORE_OS	win32_rt::advapi32::CryptSignHashW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	DeleteService	-	CORE_OS	win32_rt::advapi32::DeleteService	crates/win32-rt/src/advapi32.rs
 advapi32.dll	DeregisterEventSource	-	CORE_OS	win32_rt::advapi32::DeregisterEventSource	crates/win32-rt/src/advapi32.rs
 advapi32.dll	DuplicateToken	-	CORE_OS	win32_rt::advapi32::DuplicateToken	crates/win32-rt/src/advapi32.rs
 advapi32.dll	DuplicateTokenEx	-	CORE_OS	win32_rt::advapi32::DuplicateTokenEx	crates/win32-rt/src/advapi32.rs
@@ -46,6 +50,8 @@ advapi32.dll	GetSecurityInfo	-	CORE_OS	win32_rt::advapi32::GetSecurityInfo	crate
 advapi32.dll	GetTokenInformation	-	CORE_OS	win32_rt::advapi32::GetTokenInformation	crates/win32-rt/src/advapi32.rs
 advapi32.dll	GetUserNameA	-	CORE_OS	win32_rt::advapi32::GetUserNameA	crates/win32-rt/src/advapi32.rs
 advapi32.dll	GetUserNameW	-	CORE_OS	win32_rt::advapi32::GetUserNameW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	GetUserProfileDirectoryA	-	CORE_OS	win32_rt::advapi32::GetUserProfileDirectoryA	crates/win32-rt/src/advapi32.rs
+advapi32.dll	GetUserProfileDirectoryW	-	CORE_OS	win32_rt::advapi32::GetUserProfileDirectoryW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ImpersonateLoggedOnUser	-	CORE_OS	win32_rt::advapi32::ImpersonateLoggedOnUser	crates/win32-rt/src/advapi32.rs
 advapi32.dll	InitializeSecurityDescriptor	-	CORE_OS	win32_rt::advapi32::InitializeSecurityDescriptor	crates/win32-rt/src/advapi32.rs
 advapi32.dll	LookupPrivilegeValueA	-	CORE_OS	win32_rt::advapi32::LookupPrivilegeValueA	crates/win32-rt/src/advapi32.rs
@@ -94,6 +100,10 @@ advapi32.dll	RegQueryValueExW	-	CORE_OS	win32_rt::advapi32::RegQueryValueExW	cra
 advapi32.dll	RegSetValueExA	-	CORE_OS	win32_rt::advapi32::RegSetValueExA	crates/win32-rt/src/advapi32.rs
 advapi32.dll	RegSetValueExW	-	CORE_OS	win32_rt::advapi32::RegSetValueExW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	RegisterEventSourceW	-	CORE_OS	win32_rt::advapi32::RegisterEventSourceW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	RegisterServiceCtrlHandlerA	-	CORE_OS	win32_rt::advapi32::RegisterServiceCtrlHandlerA	crates/win32-rt/src/advapi32.rs
+advapi32.dll	RegisterServiceCtrlHandlerExA	-	CORE_OS	win32_rt::advapi32::RegisterServiceCtrlHandlerExA	crates/win32-rt/src/advapi32.rs
+advapi32.dll	RegisterServiceCtrlHandlerExW	-	CORE_OS	win32_rt::advapi32::RegisterServiceCtrlHandlerExW	crates/win32-rt/src/advapi32.rs
+advapi32.dll	RegisterServiceCtrlHandlerW	-	CORE_OS	win32_rt::advapi32::RegisterServiceCtrlHandlerW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	ReportEventW	-	CORE_OS	win32_rt::advapi32::ReportEventW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	RevertToSelf	-	CORE_OS	win32_rt::advapi32::RevertToSelf	crates/win32-rt/src/advapi32.rs
 advapi32.dll	SetEntriesInAclW	-	CORE_OS	win32_rt::advapi32::SetEntriesInAclW	crates/win32-rt/src/advapi32.rs
@@ -101,6 +111,9 @@ advapi32.dll	SetNamedSecurityInfoW	-	CORE_OS	win32_rt::advapi32::SetNamedSecurit
 advapi32.dll	SetSecurityDescriptorDacl	-	CORE_OS	win32_rt::advapi32::SetSecurityDescriptorDacl	crates/win32-rt/src/advapi32.rs
 advapi32.dll	SetSecurityDescriptorSacl	-	CORE_OS	win32_rt::advapi32::SetSecurityDescriptorSacl	crates/win32-rt/src/advapi32.rs
 advapi32.dll	SetSecurityInfo	-	CORE_OS	win32_rt::advapi32::SetSecurityInfo	crates/win32-rt/src/advapi32.rs
+advapi32.dll	SetServiceStatus	-	CORE_OS	win32_rt::advapi32::SetServiceStatus	crates/win32-rt/src/advapi32.rs
+advapi32.dll	StartServiceCtrlDispatcherA	-	CORE_OS	win32_rt::advapi32::StartServiceCtrlDispatcherA	crates/win32-rt/src/advapi32.rs
+advapi32.dll	StartServiceCtrlDispatcherW	-	CORE_OS	win32_rt::advapi32::StartServiceCtrlDispatcherW	crates/win32-rt/src/advapi32.rs
 advapi32.dll	SystemFunction036	-	CORE_OS	win32_rt::advapi32::SystemFunction036	crates/win32-rt/src/advapi32.rs
 amd_ags_x64.dll	agsCheckDriverVersion	-	GRAPHICS_MEDIA_AUDIO	win32_rt::misc::amd_ags_x64::agsCheckDriverVersion	crates/win32-rt/src/misc/amd_ags_x64.rs
 amd_ags_x64.dll	agsDeInitialize	-	GRAPHICS_MEDIA_AUDIO	win32_rt::misc::amd_ags_x64::agsDeInitialize	crates/win32-rt/src/misc/amd_ags_x64.rs
@@ -160,6 +173,7 @@ bcrypt.dll	BCryptOpenAlgorithmProvider	-	CORE_OS	win32_rt::misc::bcrypt::BCryptO
 bcrypt.dll	BCryptSetProperty	-	CORE_OS	win32_rt::misc::bcrypt::BCryptSetProperty	crates/win32-rt/src/misc/bcrypt.rs
 bcrypt.dll	BCryptSignHash	-	CORE_OS	win32_rt::misc::bcrypt::BCryptSignHash	crates/win32-rt/src/misc/bcrypt.rs
 bcrypt.dll	BCryptVerifySignature	-	CORE_OS	win32_rt::misc::bcrypt::BCryptVerifySignature	crates/win32-rt/src/misc/bcrypt.rs
+bcrypt.dll	ProcessPrng	-	CORE_OS	win32_rt::misc::bcrypt::ProcessPrng	crates/win32-rt/src/misc/bcrypt.rs
 bink2w64.dll	BinkAllocateFrameBuffers	-	ENGINE_MIDDLEWARE	win32_rt::misc::bink2w64::BinkAllocateFrameBuffers	crates/win32-rt/src/misc/bink2w64.rs
 bink2w64.dll	BinkClose	-	ENGINE_MIDDLEWARE	win32_rt::misc::bink2w64::BinkClose	crates/win32-rt/src/misc/bink2w64.rs
 bink2w64.dll	BinkCloseTrack	-	ENGINE_MIDDLEWARE	win32_rt::misc::bink2w64::BinkCloseTrack	crates/win32-rt/src/misc/bink2w64.rs
@@ -954,6 +968,7 @@ kernel32.dll	DeleteCriticalSection	-	CORE_OS	win32_rt::sync::DeleteCriticalSecti
 kernel32.dll	DeleteFiber	-	CORE_OS	win32_rt::kernel32::threads::DeleteFiber	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	DeleteFileA	-	CORE_OS	win32_rt::kernel32::file::DeleteFileA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	DeleteFileW	-	CORE_OS	win32_rt::kernel32::file::DeleteFileW	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	DeleteProcThreadAttributeList	-	CORE_OS	win32_rt::kernel32::process::DeleteProcThreadAttributeList	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	DeleteTimerQueue	-	CORE_OS	win32_rt::kernel32::threadpool::DeleteTimerQueue	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	DeleteTimerQueueEx	-	CORE_OS	win32_rt::kernel32::threadpool::DeleteTimerQueueEx	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	DeleteTimerQueueTimer	-	CORE_OS	win32_rt::kernel32::threadpool::DeleteTimerQueueTimer	crates/win32-rt/src/kernel32/threadpool.rs
@@ -1012,6 +1027,7 @@ kernel32.dll	FreeLibrary	-	CORE_OS	win32_rt::kernel32::module::FreeLibrary	crate
 kernel32.dll	FreeLibraryAndExitThread	-	CORE_OS	win32_rt::kernel32::module::FreeLibraryAndExitThread	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	FreeLibraryWhenCallbackReturns	-	CORE_OS	win32_rt::kernel32::module::FreeLibraryWhenCallbackReturns	crates/win32-rt/src/kernel32/module.rs
 kernel32.dll	FreeResource	-	CORE_OS	win32_rt::kernel32::module::FreeResource	crates/win32-rt/src/kernel32/module.rs
+kernel32.dll	GenerateConsoleCtrlEvent	-	CORE_OS	win32_rt::kernel32::file::GenerateConsoleCtrlEvent	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetACP	-	CORE_OS	win32_rt::kernel32::string::GetACP	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetActiveProcessorCount	-	CORE_OS	win32_rt::kernel32::sysinfo::GetActiveProcessorCount	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GetActiveProcessorGroupCount	-	CORE_OS	win32_rt::kernel32::sysinfo::GetActiveProcessorGroupCount	crates/win32-rt/src/kernel32/sysinfo.rs
@@ -1110,6 +1126,7 @@ kernel32.dll	GetNumaProcessorNode	-	CORE_OS	win32_rt::kernel32::sysinfo::GetNuma
 kernel32.dll	GetNumaProcessorNodeEx	-	CORE_OS	win32_rt::kernel32::sysinfo::GetNumaProcessorNodeEx	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	GetNumberFormatEx	-	CORE_OS	win32_rt::kernel32::string::GetNumberFormatEx	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetNumberFormatW	-	CORE_OS	win32_rt::kernel32::string::GetNumberFormatW	crates/win32-rt/src/kernel32/string.rs
+kernel32.dll	GetNumberOfConsoleInputEvents	-	CORE_OS	win32_rt::kernel32::file::GetNumberOfConsoleInputEvents	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetOEMCP	-	CORE_OS	win32_rt::kernel32::string::GetOEMCP	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	GetOverlappedResult	-	CORE_OS	win32_rt::kernel32::file::GetOverlappedResult	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	GetOverlappedResultEx	-	CORE_OS	win32_rt::kernel32::file::GetOverlappedResultEx	crates/win32-rt/src/kernel32/file.rs
@@ -1235,6 +1252,7 @@ kernel32.dll	InitializeConditionVariable	-	CORE_OS	win32_rt::sync::InitializeCon
 kernel32.dll	InitializeCriticalSection	-	CORE_OS	win32_rt::sync::InitializeCriticalSection	crates/win32-rt/src/sync.rs
 kernel32.dll	InitializeCriticalSectionAndSpinCount	-	CORE_OS	win32_rt::sync::InitializeCriticalSectionAndSpinCount	crates/win32-rt/src/sync.rs
 kernel32.dll	InitializeCriticalSectionEx	-	CORE_OS	win32_rt::sync::InitializeCriticalSectionEx	crates/win32-rt/src/sync.rs
+kernel32.dll	InitializeProcThreadAttributeList	-	CORE_OS	win32_rt::kernel32::process::InitializeProcThreadAttributeList	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	InitializeSListHead	-	CORE_OS	win32_rt::sync::InitializeSListHead	crates/win32-rt/src/sync.rs
 kernel32.dll	InitializeSRWLock	-	CORE_OS	win32_rt::sync::InitializeSRWLock	crates/win32-rt/src/sync.rs
 kernel32.dll	InterlockedFlushSList	-	CORE_OS	win32_rt::sync::InterlockedFlushSList	crates/win32-rt/src/sync.rs
@@ -1315,6 +1333,8 @@ kernel32.dll	OpenThread	-	CORE_OS	win32_rt::kernel32::threads::OpenThread	crates
 kernel32.dll	OpenWaitableTimerW	-	CORE_OS	win32_rt::kernel32::threads::OpenWaitableTimerW	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	OutputDebugStringA	-	CORE_OS	win32_rt::kernel32::process::OutputDebugStringA	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	OutputDebugStringW	-	CORE_OS	win32_rt::kernel32::process::OutputDebugStringW	crates/win32-rt/src/kernel32/process.rs
+kernel32.dll	PathCchCombineEx	-	CORE_OS	win32_rt::kernel32::string::PathCchCombineEx	crates/win32-rt/src/kernel32/string.rs
+kernel32.dll	PathCchSkipRoot	-	CORE_OS	win32_rt::kernel32::string::PathCchSkipRoot	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	PeekNamedPipe	-	CORE_OS	win32_rt::kernel32::file::PeekNamedPipe	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	PostQueuedCompletionStatus	-	CORE_OS	win32_rt::kernel32::file::PostQueuedCompletionStatus	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	PrefetchVirtualMemory	-	CORE_OS	win32_rt::kernel32::memory::PrefetchVirtualMemory	crates/win32-rt/src/kernel32/memory.rs
@@ -1344,6 +1364,7 @@ kernel32.dll	ReadConsoleA	-	CORE_OS	win32_rt::kernel32::file::ReadConsoleA	crate
 kernel32.dll	ReadConsoleW	-	CORE_OS	win32_rt::kernel32::file::ReadConsoleW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	ReadDirectoryChangesW	-	CORE_OS	win32_rt::kernel32::file::ReadDirectoryChangesW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	ReadFile	-	CORE_OS	win32_rt::kernel32::file::ReadFile	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	ReadFileEx	-	CORE_OS	win32_rt::kernel32::file::ReadFileEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	ReadProcessMemory	-	CORE_OS	win32_rt::kernel32::memory::ReadProcessMemory	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	ReclaimVirtualMemory	-	CORE_OS	win32_rt::kernel32::memory::ReclaimVirtualMemory	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	RegisterApplicationRestart	-	CORE_OS	win32_rt::kernel32::process::RegisterApplicationRestart	crates/win32-rt/src/kernel32/process.rs
@@ -1481,6 +1502,7 @@ kernel32.dll	UnmapViewOfFile2	-	CORE_OS	win32_rt::kernel32::file::UnmapViewOfFil
 kernel32.dll	UnmapViewOfFileEx	-	CORE_OS	win32_rt::kernel32::file::UnmapViewOfFileEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	UnregisterWait	-	CORE_OS	win32_rt::kernel32::threadpool::UnregisterWait	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	UnregisterWaitEx	-	CORE_OS	win32_rt::kernel32::threadpool::UnregisterWaitEx	crates/win32-rt/src/kernel32/threadpool.rs
+kernel32.dll	UpdateProcThreadAttribute	-	CORE_OS	win32_rt::kernel32::process::UpdateProcThreadAttribute	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	VerSetConditionMask	-	CORE_OS	win32_rt::kernel32::sysinfo::VerSetConditionMask	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	VerifyVersionInfoA	-	CORE_OS	win32_rt::kernel32::sysinfo::VerifyVersionInfoA	crates/win32-rt/src/kernel32/sysinfo.rs
 kernel32.dll	VerifyVersionInfoW	-	CORE_OS	win32_rt::kernel32::sysinfo::VerifyVersionInfoW	crates/win32-rt/src/kernel32/sysinfo.rs
@@ -1519,6 +1541,7 @@ kernel32.dll	WideCharToMultiByte	-	CORE_OS	win32_rt::kernel32::string::WideCharT
 kernel32.dll	WriteConsoleA	-	CORE_OS	win32_rt::kernel32::file::WriteConsoleA	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	WriteConsoleW	-	CORE_OS	win32_rt::kernel32::file::WriteConsoleW	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	WriteFile	-	CORE_OS	win32_rt::kernel32::file::WriteFile	crates/win32-rt/src/kernel32/file.rs
+kernel32.dll	WriteFileEx	-	CORE_OS	win32_rt::kernel32::file::WriteFileEx	crates/win32-rt/src/kernel32/file.rs
 kernel32.dll	WriteProcessMemory	-	CORE_OS	win32_rt::kernel32::memory::WriteProcessMemory	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	lstrcatW	-	CORE_OS	win32_rt::kernel32::string::lstrcatW	crates/win32-rt/src/kernel32/string.rs
 kernel32.dll	lstrcmpA	-	CORE_OS	win32_rt::kernel32::string::lstrcmpA	crates/win32-rt/src/kernel32/string.rs
@@ -2170,6 +2193,7 @@ ntdll.dll	KiUserExceptionDispatcher	-	CORE_OS	win32_rt::ntdll::KiUserExceptionDi
 ntdll.dll	LdrAddRefDll	-	CORE_OS	win32_rt::ntdll::LdrAddRefDll	crates/win32-rt/src/ntdll.rs
 ntdll.dll	LdrGetDllHandle	-	CORE_OS	win32_rt::ntdll::LdrGetDllHandle	crates/win32-rt/src/ntdll.rs
 ntdll.dll	LdrGetProcedureAddress	-	CORE_OS	win32_rt::ntdll::LdrGetProcedureAddress	crates/win32-rt/src/ntdll.rs
+ntdll.dll	LdrGetProcedureAddressEx	-	CORE_OS	win32_rt::ntdll::LdrGetProcedureAddressEx	crates/win32-rt/src/ntdll.rs
 ntdll.dll	LdrInitializeThunk	-	CORE_OS	win32_rt::ntdll::LdrInitializeThunk	crates/win32-rt/src/ntdll.rs
 ntdll.dll	LdrLoadDll	-	CORE_OS	win32_rt::ntdll::LdrLoadDll	crates/win32-rt/src/ntdll.rs
 ntdll.dll	LdrLockLoaderLock	-	CORE_OS	win32_rt::ntdll::LdrLockLoaderLock	crates/win32-rt/src/ntdll.rs
@@ -2363,6 +2387,8 @@ ole32.dll	CoInitialize	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoInitialize	cr
 ole32.dll	CoInitializeEx	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoInitializeEx	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	CoInitializeSecurity	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoInitializeSecurity	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	CoLockObjectExternal	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoLockObjectExternal	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	CoRegisterClassObject	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoRegisterClassObject	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	CoRevokeClassObject	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoRevokeClassObject	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	CoSetProxyBlanket	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoSetProxyBlanket	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	CoTaskMemAlloc	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoTaskMemAlloc	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	CoTaskMemFree	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::CoTaskMemFree	crates/win32-rt/src/misc/ole32.rs
@@ -2377,6 +2403,7 @@ ole32.dll	PropVariantClear	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::PropVariant
 ole32.dll	RegisterDragDrop	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RegisterDragDrop	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	ReleaseStgMedium	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::ReleaseStgMedium	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RevokeDragDrop	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RevokeDragDrop	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	RoActivateInstance	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RoActivateInstance	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RoGetActivationFactory	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RoGetActivationFactory	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RoInitialize	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RoInitialize	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	RoUninitialize	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::RoUninitialize	crates/win32-rt/src/misc/ole32.rs
@@ -2384,7 +2411,10 @@ ole32.dll	StringFromGUID2	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::StringFromGU
 ole32.dll	WindowsCreateString	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsCreateString	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	WindowsCreateStringReference	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsCreateStringReference	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	WindowsDeleteString	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsDeleteString	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	WindowsDuplicateString	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsDuplicateString	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	WindowsGetStringLen	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsGetStringLen	crates/win32-rt/src/misc/ole32.rs
 ole32.dll	WindowsGetStringRawBuffer	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsGetStringRawBuffer	crates/win32-rt/src/misc/ole32.rs
+ole32.dll	WindowsIsStringEmpty	-	WINDOW_INPUT_COM	win32_rt::misc::ole32::WindowsIsStringEmpty	crates/win32-rt/src/misc/ole32.rs
 oleaut32.dll	SafeArrayAccessData	23	WINDOW_INPUT_COM	win32_rt::misc::oleaut32::SafeArrayAccessData	crates/win32-rt/src/misc/oleaut32.rs
 oleaut32.dll	SafeArrayCopy	27	WINDOW_INPUT_COM	win32_rt::misc::oleaut32::SafeArrayCopy	crates/win32-rt/src/misc/oleaut32.rs
 oleaut32.dll	SafeArrayCreate	15	WINDOW_INPUT_COM	win32_rt::misc::oleaut32::SafeArrayCreate	crates/win32-rt/src/misc/oleaut32.rs
@@ -2751,6 +2781,7 @@ shell32.dll	PathStripPathW	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::PathStrip
 shell32.dll	SHChangeNotify	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHChangeNotify	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHCreateDirectoryExA	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHCreateDirectoryExA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHCreateDirectoryExW	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHCreateDirectoryExW	crates/win32-rt/src/misc/shell32.rs
+shell32.dll	SHCreateItemFromParsingName	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHCreateItemFromParsingName	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHFileOperationA	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHFileOperationA	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHFileOperationW	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHFileOperationW	crates/win32-rt/src/misc/shell32.rs
 shell32.dll	SHGetFileInfoA	-	WINDOW_INPUT_COM	win32_rt::misc::shell32::SHGetFileInfoA	crates/win32-rt/src/misc/shell32.rs
@@ -2905,6 +2936,7 @@ ucrtbase.dll	__control87_2	-	CRT_STL	win32_rt::ucrt::runtime::__control87_2	crat
 ucrtbase.dll	__daylight	-	CRT_STL	win32_rt::ucrt::time::__daylight	crates/win32-rt/src/ucrt/time.rs
 ucrtbase.dll	__doserrno	-	CRT_STL	win32_rt::ucrt::errno::__doserrno	crates/win32-rt/src/ucrt/errno.rs
 ucrtbase.dll	__dstbias	-	CRT_STL	win32_rt::ucrt::time::__dstbias	crates/win32-rt/src/ucrt/time.rs
+ucrtbase.dll	__fpe_flt_rounds	-	CRT_STL	win32_rt::ucrt::runtime::__fpe_flt_rounds	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	__fpecode	-	CRT_STL	win32_rt::ucrt::runtime::__fpecode	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	__isascii	-	CRT_STL	win32_rt::ucrt::string::__isascii	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	__iscsym	-	CRT_STL	win32_rt::ucrt::string::__iscsym	crates/win32-rt/src/ucrt/string.rs
@@ -3047,8 +3079,11 @@ ucrtbase.dll	_get_dstbias	-	CRT_STL	win32_rt::ucrt::time::_get_dstbias	crates/wi
 ucrtbase.dll	_get_errno	-	CRT_STL	win32_rt::ucrt::errno::_get_errno	crates/win32-rt/src/ucrt/errno.rs
 ucrtbase.dll	_get_fmode	-	CRT_STL	win32_rt::ucrt::stdio::_get_fmode	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_get_heap_handle	-	CRT_STL	win32_rt::ucrt::heap::_get_heap_handle	crates/win32-rt/src/ucrt/heap.rs
+ucrtbase.dll	_get_initial_narrow_environment	-	CRT_STL	win32_rt::ucrt::runtime::_get_initial_narrow_environment	crates/win32-rt/src/ucrt/runtime.rs
+ucrtbase.dll	_get_initial_wide_environment	-	CRT_STL	win32_rt::ucrt::runtime::_get_initial_wide_environment	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_get_invalid_parameter_handler	-	CRT_STL	win32_rt::ucrt::runtime::_get_invalid_parameter_handler	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_get_narrow_winmain_command_line	-	CRT_STL	win32_rt::ucrt::runtime::_get_narrow_winmain_command_line	crates/win32-rt/src/ucrt/runtime.rs
+ucrtbase.dll	_get_osfhandle	-	CRT_STL	win32_rt::ucrt::stdio::_get_osfhandle	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_get_pgmptr	-	CRT_STL	win32_rt::ucrt::runtime::_get_pgmptr	crates/win32-rt/src/ucrt/runtime.rs
 ucrtbase.dll	_get_stream_buffer_pointers	-	CRT_STL	win32_rt::ucrt::stdio::_get_stream_buffer_pointers	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_get_terminate	-	CRT_STL	win32_rt::ucrt::runtime::_get_terminate	crates/win32-rt/src/ucrt/runtime.rs
@@ -3133,6 +3168,7 @@ ucrtbase.dll	_mktime64	-	CRT_STL	win32_rt::ucrt::time::_mktime64	crates/win32-rt
 ucrtbase.dll	_msize	-	CRT_STL	win32_rt::ucrt::heap::_msize	crates/win32-rt/src/ucrt/heap.rs
 ucrtbase.dll	_msize_base	-	CRT_STL	win32_rt::ucrt::heap::_msize_base	crates/win32-rt/src/ucrt/heap.rs
 ucrtbase.dll	_open	-	CRT_STL	win32_rt::ucrt::stdio::_open	crates/win32-rt/src/ucrt/stdio.rs
+ucrtbase.dll	_open_osfhandle	-	CRT_STL	win32_rt::ucrt::stdio::_open_osfhandle	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putc_nolock	-	CRT_STL	win32_rt::ucrt::stdio::_putc_nolock	crates/win32-rt/src/ucrt/stdio.rs
 ucrtbase.dll	_putenv	-	CRT_STL	win32_rt::ucrt::env::_putenv	crates/win32-rt/src/ucrt/env.rs
 ucrtbase.dll	_putenv_s	-	CRT_STL	win32_rt::ucrt::env::_putenv_s	crates/win32-rt/src/ucrt/env.rs
@@ -3590,6 +3626,7 @@ user32.dll	CallWindowProcW	-	WINDOW_INPUT_COM	win32_rt::user32::message::CallWin
 user32.dll	ChangeDisplaySettingsExW	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::ChangeDisplaySettingsExW	crates/win32-rt/src/user32/monitor.rs
 user32.dll	ChangeDisplaySettingsW	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::ChangeDisplaySettingsW	crates/win32-rt/src/user32/monitor.rs
 user32.dll	CharLowerBuffW	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CharLowerBuffW	crates/win32-rt/src/user32/misc.rs
+user32.dll	CheckDlgButton	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::CheckDlgButton	crates/win32-rt/src/user32/dialog.rs
 user32.dll	CheckMenuItem	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CheckMenuItem	crates/win32-rt/src/user32/misc.rs
 user32.dll	ClientToScreen	-	WINDOW_INPUT_COM	win32_rt::user32::window::ClientToScreen	crates/win32-rt/src/user32/window.rs
 user32.dll	ClipCursor	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::ClipCursor	crates/win32-rt/src/user32/cursor.rs
@@ -3599,6 +3636,10 @@ user32.dll	CopyImage	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::CopyImage	crat
 user32.dll	CopyRect	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CopyRect	crates/win32-rt/src/user32/misc.rs
 user32.dll	CountClipboardFormats	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CountClipboardFormats	crates/win32-rt/src/user32/misc.rs
 user32.dll	CreateCursor	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::CreateCursor	crates/win32-rt/src/user32/cursor.rs
+user32.dll	CreateDialogIndirectParamA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::CreateDialogIndirectParamA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	CreateDialogIndirectParamW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::CreateDialogIndirectParamW	crates/win32-rt/src/user32/dialog.rs
+user32.dll	CreateDialogParamA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::CreateDialogParamA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	CreateDialogParamW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::CreateDialogParamW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	CreateIcon	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::CreateIcon	crates/win32-rt/src/user32/cursor.rs
 user32.dll	CreateIconFromResourceEx	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::CreateIconFromResourceEx	crates/win32-rt/src/user32/cursor.rs
 user32.dll	CreateIconIndirect	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::CreateIconIndirect	crates/win32-rt/src/user32/cursor.rs
@@ -3606,6 +3647,8 @@ user32.dll	CreateMenu	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CreateMenu	crat
 user32.dll	CreatePopupMenu	-	WINDOW_INPUT_COM	win32_rt::user32::misc::CreatePopupMenu	crates/win32-rt/src/user32/misc.rs
 user32.dll	CreateWindowExA	-	WINDOW_INPUT_COM	win32_rt::user32::window::CreateWindowExA	crates/win32-rt/src/user32/window.rs
 user32.dll	CreateWindowExW	-	WINDOW_INPUT_COM	win32_rt::user32::window::CreateWindowExW	crates/win32-rt/src/user32/window.rs
+user32.dll	DefDlgProcA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DefDlgProcA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	DefDlgProcW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DefDlgProcW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	DefRawInputProc	-	WINDOW_INPUT_COM	win32_rt::user32::input::DefRawInputProc	crates/win32-rt/src/user32/input.rs
 user32.dll	DefWindowProcA	-	WINDOW_INPUT_COM	win32_rt::user32::defproc::DefWindowProcA	crates/win32-rt/src/user32/defproc.rs
 user32.dll	DefWindowProcW	-	WINDOW_INPUT_COM	win32_rt::user32::defproc::DefWindowProcW	crates/win32-rt/src/user32/defproc.rs
@@ -3614,8 +3657,10 @@ user32.dll	DestroyCursor	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::DestroyCur
 user32.dll	DestroyIcon	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::DestroyIcon	crates/win32-rt/src/user32/cursor.rs
 user32.dll	DestroyMenu	-	WINDOW_INPUT_COM	win32_rt::user32::misc::DestroyMenu	crates/win32-rt/src/user32/misc.rs
 user32.dll	DestroyWindow	-	WINDOW_INPUT_COM	win32_rt::user32::window::DestroyWindow	crates/win32-rt/src/user32/window.rs
-user32.dll	DialogBoxParamA	-	WINDOW_INPUT_COM	win32_rt::user32::misc::DialogBoxParamA	crates/win32-rt/src/user32/misc.rs
-user32.dll	DialogBoxParamW	-	WINDOW_INPUT_COM	win32_rt::user32::misc::DialogBoxParamW	crates/win32-rt/src/user32/misc.rs
+user32.dll	DialogBoxIndirectParamA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DialogBoxIndirectParamA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	DialogBoxIndirectParamW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DialogBoxIndirectParamW	crates/win32-rt/src/user32/dialog.rs
+user32.dll	DialogBoxParamA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DialogBoxParamA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	DialogBoxParamW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::DialogBoxParamW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	DispatchMessageA	-	WINDOW_INPUT_COM	win32_rt::user32::message::DispatchMessageA	crates/win32-rt/src/user32/message.rs
 user32.dll	DispatchMessageW	-	WINDOW_INPUT_COM	win32_rt::user32::message::DispatchMessageW	crates/win32-rt/src/user32/message.rs
 user32.dll	DisplayConfigGetDeviceInfo	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::DisplayConfigGetDeviceInfo	crates/win32-rt/src/user32/monitor.rs
@@ -3626,7 +3671,7 @@ user32.dll	EmptyClipboard	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EmptyClipbo
 user32.dll	EnableMenuItem	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EnableMenuItem	crates/win32-rt/src/user32/misc.rs
 user32.dll	EnableNonClientDpiScaling	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EnableNonClientDpiScaling	crates/win32-rt/src/user32/misc.rs
 user32.dll	EnableWindow	-	WINDOW_INPUT_COM	win32_rt::user32::window::EnableWindow	crates/win32-rt/src/user32/window.rs
-user32.dll	EndDialog	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EndDialog	crates/win32-rt/src/user32/misc.rs
+user32.dll	EndDialog	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::EndDialog	crates/win32-rt/src/user32/dialog.rs
 user32.dll	EndPaint	-	WINDOW_INPUT_COM	win32_rt::user32::window::EndPaint	crates/win32-rt/src/user32/window.rs
 user32.dll	EnumChildWindows	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EnumChildWindows	crates/win32-rt/src/user32/misc.rs
 user32.dll	EnumClipboardFormats	-	WINDOW_INPUT_COM	win32_rt::user32::misc::EnumClipboardFormats	crates/win32-rt/src/user32/misc.rs
@@ -3668,8 +3713,11 @@ user32.dll	GetDC	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetDC	crates/win32
 user32.dll	GetDCEx	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetDCEx	crates/win32-rt/src/user32/window.rs
 user32.dll	GetDesktopWindow	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetDesktopWindow	crates/win32-rt/src/user32/window.rs
 user32.dll	GetDisplayConfigBufferSizes	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::GetDisplayConfigBufferSizes	crates/win32-rt/src/user32/monitor.rs
-user32.dll	GetDlgItem	-	WINDOW_INPUT_COM	win32_rt::user32::misc::GetDlgItem	crates/win32-rt/src/user32/misc.rs
-user32.dll	GetDlgItemInt	-	WINDOW_INPUT_COM	win32_rt::user32::misc::GetDlgItemInt	crates/win32-rt/src/user32/misc.rs
+user32.dll	GetDlgCtrlID	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetDlgCtrlID	crates/win32-rt/src/user32/dialog.rs
+user32.dll	GetDlgItem	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetDlgItem	crates/win32-rt/src/user32/dialog.rs
+user32.dll	GetDlgItemInt	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetDlgItemInt	crates/win32-rt/src/user32/dialog.rs
+user32.dll	GetDlgItemTextA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetDlgItemTextA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	GetDlgItemTextW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetDlgItemTextW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	GetDoubleClickTime	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetDoubleClickTime	crates/win32-rt/src/user32/window.rs
 user32.dll	GetDpiForMonitor	-	WINDOW_INPUT_COM	win32_rt::user32::misc::GetDpiForMonitor	crates/win32-rt/src/user32/misc.rs
 user32.dll	GetDpiForSystem	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetDpiForSystem	crates/win32-rt/src/user32/window.rs
@@ -3700,6 +3748,7 @@ user32.dll	GetMessageTime	-	WINDOW_INPUT_COM	win32_rt::user32::message::GetMessa
 user32.dll	GetMessageW	-	WINDOW_INPUT_COM	win32_rt::user32::message::GetMessageW	crates/win32-rt/src/user32/message.rs
 user32.dll	GetMonitorInfoA	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::GetMonitorInfoA	crates/win32-rt/src/user32/monitor.rs
 user32.dll	GetMonitorInfoW	-	WINDOW_INPUT_COM	win32_rt::user32::monitor::GetMonitorInfoW	crates/win32-rt/src/user32/monitor.rs
+user32.dll	GetNextDlgTabItem	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::GetNextDlgTabItem	crates/win32-rt/src/user32/dialog.rs
 user32.dll	GetParent	-	WINDOW_INPUT_COM	win32_rt::user32::window::GetParent	crates/win32-rt/src/user32/window.rs
 user32.dll	GetPhysicalCursorPos	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::GetPhysicalCursorPos	crates/win32-rt/src/user32/cursor.rs
 user32.dll	GetProcessDpiAwareness	-	WINDOW_INPUT_COM	win32_rt::user32::misc::GetProcessDpiAwareness	crates/win32-rt/src/user32/misc.rs
@@ -3752,6 +3801,9 @@ user32.dll	IntersectRect	-	WINDOW_INPUT_COM	win32_rt::user32::misc::IntersectRec
 user32.dll	InvalidateRect	-	WINDOW_INPUT_COM	win32_rt::user32::window::InvalidateRect	crates/win32-rt/src/user32/window.rs
 user32.dll	IsChild	-	WINDOW_INPUT_COM	win32_rt::user32::window::IsChild	crates/win32-rt/src/user32/window.rs
 user32.dll	IsClipboardFormatAvailable	-	WINDOW_INPUT_COM	win32_rt::user32::misc::IsClipboardFormatAvailable	crates/win32-rt/src/user32/misc.rs
+user32.dll	IsDialogMessageA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::IsDialogMessageA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	IsDialogMessageW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::IsDialogMessageW	crates/win32-rt/src/user32/dialog.rs
+user32.dll	IsDlgButtonChecked	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::IsDlgButtonChecked	crates/win32-rt/src/user32/dialog.rs
 user32.dll	IsIconic	-	WINDOW_INPUT_COM	win32_rt::user32::window::IsIconic	crates/win32-rt/src/user32/window.rs
 user32.dll	IsProcessDPIAware	-	WINDOW_INPUT_COM	win32_rt::user32::misc::IsProcessDPIAware	crates/win32-rt/src/user32/misc.rs
 user32.dll	IsRectEmpty	-	WINDOW_INPUT_COM	win32_rt::user32::misc::IsRectEmpty	crates/win32-rt/src/user32/misc.rs
@@ -3768,6 +3820,7 @@ user32.dll	LoadImageA	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::LoadImageA	cr
 user32.dll	LoadImageW	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::LoadImageW	crates/win32-rt/src/user32/cursor.rs
 user32.dll	LoadKeyboardLayoutA	-	WINDOW_INPUT_COM	win32_rt::user32::input::LoadKeyboardLayoutA	crates/win32-rt/src/user32/input.rs
 user32.dll	LoadKeyboardLayoutW	-	WINDOW_INPUT_COM	win32_rt::user32::input::LoadKeyboardLayoutW	crates/win32-rt/src/user32/input.rs
+user32.dll	LoadStringW	-	WINDOW_INPUT_COM	win32_rt::user32::misc::LoadStringW	crates/win32-rt/src/user32/misc.rs
 user32.dll	MapVirtualKeyA	-	WINDOW_INPUT_COM	win32_rt::user32::input::MapVirtualKeyA	crates/win32-rt/src/user32/input.rs
 user32.dll	MapVirtualKeyExW	-	WINDOW_INPUT_COM	win32_rt::user32::input::MapVirtualKeyExW	crates/win32-rt/src/user32/input.rs
 user32.dll	MapVirtualKeyW	-	WINDOW_INPUT_COM	win32_rt::user32::input::MapVirtualKeyW	crates/win32-rt/src/user32/input.rs
@@ -3809,6 +3862,8 @@ user32.dll	ReleaseDC	-	WINDOW_INPUT_COM	win32_rt::user32::window::ReleaseDC	crat
 user32.dll	RemoveMenu	-	WINDOW_INPUT_COM	win32_rt::user32::misc::RemoveMenu	crates/win32-rt/src/user32/misc.rs
 user32.dll	ReplyMessage	-	WINDOW_INPUT_COM	win32_rt::user32::message::ReplyMessage	crates/win32-rt/src/user32/message.rs
 user32.dll	ScreenToClient	-	WINDOW_INPUT_COM	win32_rt::user32::window::ScreenToClient	crates/win32-rt/src/user32/window.rs
+user32.dll	SendDlgItemMessageA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::SendDlgItemMessageA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	SendDlgItemMessageW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::SendDlgItemMessageW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	SendInput	-	WINDOW_INPUT_COM	win32_rt::user32::misc::SendInput	crates/win32-rt/src/user32/misc.rs
 user32.dll	SendMessageA	-	WINDOW_INPUT_COM	win32_rt::user32::message::SendMessageA	crates/win32-rt/src/user32/message.rs
 user32.dll	SendMessageTimeoutW	-	WINDOW_INPUT_COM	win32_rt::user32::message::SendMessageTimeoutW	crates/win32-rt/src/user32/message.rs
@@ -3820,9 +3875,9 @@ user32.dll	SetClassLongPtrW	-	WINDOW_INPUT_COM	win32_rt::user32::window::SetClas
 user32.dll	SetClipboardData	-	WINDOW_INPUT_COM	win32_rt::user32::misc::SetClipboardData	crates/win32-rt/src/user32/misc.rs
 user32.dll	SetCursor	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::SetCursor	crates/win32-rt/src/user32/cursor.rs
 user32.dll	SetCursorPos	-	WINDOW_INPUT_COM	win32_rt::user32::cursor::SetCursorPos	crates/win32-rt/src/user32/cursor.rs
-user32.dll	SetDlgItemInt	-	WINDOW_INPUT_COM	win32_rt::user32::misc::SetDlgItemInt	crates/win32-rt/src/user32/misc.rs
-user32.dll	SetDlgItemTextA	-	WINDOW_INPUT_COM	win32_rt::user32::misc::SetDlgItemTextA	crates/win32-rt/src/user32/misc.rs
-user32.dll	SetDlgItemTextW	-	WINDOW_INPUT_COM	win32_rt::user32::misc::SetDlgItemTextW	crates/win32-rt/src/user32/misc.rs
+user32.dll	SetDlgItemInt	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::SetDlgItemInt	crates/win32-rt/src/user32/dialog.rs
+user32.dll	SetDlgItemTextA	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::SetDlgItemTextA	crates/win32-rt/src/user32/dialog.rs
+user32.dll	SetDlgItemTextW	-	WINDOW_INPUT_COM	win32_rt::user32::dialog::SetDlgItemTextW	crates/win32-rt/src/user32/dialog.rs
 user32.dll	SetFocus	-	WINDOW_INPUT_COM	win32_rt::user32::input::SetFocus	crates/win32-rt/src/user32/input.rs
 user32.dll	SetForegroundWindow	-	WINDOW_INPUT_COM	win32_rt::user32::input::SetForegroundWindow	crates/win32-rt/src/user32/input.rs
 user32.dll	SetLayeredWindowAttributes	-	WINDOW_INPUT_COM	win32_rt::user32::window::SetLayeredWindowAttributes	crates/win32-rt/src/user32/window.rs
@@ -3880,9 +3935,11 @@ user32.dll	WaitMessage	-	WINDOW_INPUT_COM	win32_rt::user32::message::WaitMessage
 user32.dll	WindowFromPoint	-	WINDOW_INPUT_COM	win32_rt::user32::window::WindowFromPoint	crates/win32-rt/src/user32/window.rs
 user32.dll	wsprintfA	-	WINDOW_INPUT_COM	win32_rt::user32::misc::wsprintfA	crates/win32-rt/src/user32/misc.rs
 uxtheme.dll	CloseThemeData	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::CloseThemeData	crates/win32-rt/src/misc/uxtheme.rs
+uxtheme.dll	DefSubclassProc	413	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::DefSubclassProc	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	DrawThemeBackground	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::DrawThemeBackground	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	GetThemeColor	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::GetThemeColor	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	GetThemeSysColor	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::GetThemeSysColor	crates/win32-rt/src/misc/uxtheme.rs
+uxtheme.dll	GetWindowSubclass	411	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::GetWindowSubclass	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	InitCommonControls	17	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::InitCommonControls	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	InitCommonControlsEx	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::InitCommonControlsEx	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	IsAppThemed	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::IsAppThemed	crates/win32-rt/src/misc/uxtheme.rs
@@ -3890,6 +3947,8 @@ uxtheme.dll	IsThemeActive	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::IsThemeAct
 uxtheme.dll	OpenThemeData	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::OpenThemeData	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	OpenThemeDataEx	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::OpenThemeDataEx	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	OpenThemeDataForDpi	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::OpenThemeDataForDpi	crates/win32-rt/src/misc/uxtheme.rs
+uxtheme.dll	RemoveWindowSubclass	412	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::RemoveWindowSubclass	crates/win32-rt/src/misc/uxtheme.rs
+uxtheme.dll	SetWindowSubclass	410	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::SetWindowSubclass	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	SetWindowTheme	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::SetWindowTheme	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	TaskDialogIndirect	345	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::TaskDialogIndirect	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	_TrackMouseEvent	-	WINDOW_INPUT_COM	win32_rt::misc::uxtheme::_TrackMouseEvent	crates/win32-rt/src/misc/uxtheme.rs

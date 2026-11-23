@@ -47,9 +47,38 @@ pub fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
     if pe_path.is_none() && manifest_path.is_none() {
         usage();
     }
-    if let Some(ref pe) = pe_path {
-        if !pe.is_file() {
-            bail!("PE file not found: {}", pe.display());
+    // Allow passing a package/game directory directly to `aot-prewarm <DIR>`:
+    // discover the primary x86-64 PE (`.exe` preferred, else first plugin PE) and set `--game-dir`.
+    if let Some(ref pe) = pe_path.clone() {
+        if pe.is_dir() {
+            if game_dir.is_none() {
+                game_dir = Some(pe.clone());
+            }
+            if manifest_path.is_some() {
+                pe_path = None;
+            } else {
+                let discovered = port_factory::scanner::collect_pe_files(pe)?;
+                let primary = discovered
+                    .iter()
+                    .find(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                    })
+                    .or_else(|| discovered.first())
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {}",
+                            pe.display()
+                        )
+                    })?;
+                pe_path = Some(primary);
+            }
+        } else if !pe.is_file() {
+            bail!("PE file or directory not found: {}", pe.display());
+        } else if !port_factory::scanner::is_valid_x64_pe_file(pe) {
+            bail!("not a valid x86-64 PE32+ binary: {}", pe.display());
         }
     }
     if let Some(ref mp) = manifest_path {

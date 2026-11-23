@@ -1,7 +1,7 @@
 //! Emits the standalone AOT runtime prelude, Import Address Table (IAT)
 //! bindings, and function/export/section lookup directories.
 
-use super::{AotFunctionMeta, AotImportBinding};
+use super::{AotCallbackRoot, AotFunctionMeta, AotImportBinding};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -66,6 +66,13 @@ pub struct AotSectionEntry {{
     pub characteristics: u32,
 }}
 
+#[derive(Clone, Copy)]
+pub struct AotCallbackRootEntry {{
+    pub rva: u32,
+    pub kind: &'static str,
+    pub is_eh_continuation: bool,
+}}
+
 #[inline(always)]
 unsafe fn rd128(addr: u64) -> u128 {{ (addr as *const u128).read_unaligned() }}
 #[inline(always)]
@@ -82,6 +89,65 @@ unsafe fn call_indirect(target: u64, rcx: u64, rdx: u64, r8: u64, r9: u64) -> u6
     }}
     let f: extern "C" fn(u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
     f(rcx, rdx, r8, r9)
+}}
+
+/// Invoke a resolved Win64 integer/pointer IAT target with `arity` (0..=12) arguments,
+/// reading stack arguments `5..=arity` from `[rsp + stack_base + 8*(i - 4)]` (e.g.
+/// `stack_base = 0x20` for `call` where `ReadFileEx`'s 5th pointer `lpCompletionRoutine`
+/// lives at `[rsp + 0x20]`, or `0x28` for a tail `jmp`).
+#[inline(always)]
+unsafe fn call_indirect_args(
+    target: u64,
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    rsp: u64,
+    stack_base: u64,
+    arity: u8,
+) -> u64 {{
+    let base = image_base();
+    if target >= base && target < base + SIZE_OF_IMAGE as u64 {{
+        let rva = (target - base) as u32;
+        if let Some(f) = lookup_aot_function(rva) {{
+            return f(rcx, rdx, r8, r9);
+        }}
+    }}
+    if arity <= 4 || rsp == 0 {{
+        let f: extern "C" fn(u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9);
+    }}
+    let a5 = rd64(rsp.wrapping_add(stack_base));
+    if arity == 5 {{
+        let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9, a5);
+    }}
+    let a6 = rd64(rsp.wrapping_add(stack_base + 8));
+    if arity == 6 {{
+        let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9, a5, a6);
+    }}
+    let a7 = rd64(rsp.wrapping_add(stack_base + 16));
+    if arity == 7 {{
+        let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9, a5, a6, a7);
+    }}
+    let a8 = rd64(rsp.wrapping_add(stack_base + 24));
+    if arity == 8 {{
+        let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9, a5, a6, a7, a8);
+    }}
+    let a9 = rd64(rsp.wrapping_add(stack_base + 32));
+    let a10 = if arity >= 10 {{ rd64(rsp.wrapping_add(stack_base + 40)) }} else {{ 0 }};
+    if arity <= 10 {{
+        let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = core::mem::transmute(target as usize);
+        return f(rcx, rdx, r8, r9, a5, a6, a7, a8, a9, a10);
+    }}
+    let a11 = rd64(rsp.wrapping_add(stack_base + 48));
+    let a12 = if arity >= 12 {{ rd64(rsp.wrapping_add(stack_base + 56)) }} else {{ 0 }};
+    let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        core::mem::transmute(target as usize);
+    f(rcx, rdx, r8, r9, a5, a6, a7, a8, a9, a10, a11, a12)
 }}
 
 static SYSCALL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -179,10 +245,23 @@ pub(super) fn emit_import_table(
     )?;
     writeln!(
         out,
+        "    call_iat_args(iat_rva, rcx, rdx, r8, r9, 0, 0, 4)"
+    )?;
+    writeln!(out, "}}\n")?;
+
+    writeln!(
+        out,
+        "#[inline(always)]\nunsafe fn call_iat_args(iat_rva: u32, rcx: u64, rdx: u64, r8: u64, r9: u64, rsp: u64, stack_base: u64, arity: u8) -> u64 {{"
+    )?;
+    writeln!(
+        out,
         "    let slot_va = image_base().wrapping_add(iat_rva as u64);"
     )?;
     writeln!(out, "    let target = rd64(slot_va);")?;
-    writeln!(out, "    call_indirect(target, rcx, rdx, r8, r9)")?;
+    writeln!(
+        out,
+        "    call_indirect_args(target, rcx, rdx, r8, r9, rsp, stack_base, arity)"
+    )?;
     writeln!(out, "}}\n")?;
     Ok(())
 }
@@ -191,6 +270,8 @@ pub(super) fn emit_function_directory(
     out: &mut String,
     functions: &[AotFunctionMeta],
     sections: &[pe_image::Section],
+    callback_roots: &[AotCallbackRoot],
+    eh_continuations: &[u32],
 ) -> Result<()> {
     writeln!(out, "pub static AOT_FUNCTIONS: &[AotFunctionEntry] = &[")?;
     for f in functions {
@@ -221,6 +302,25 @@ pub(super) fn emit_function_directory(
             "    AotSectionEntry {{ name: {:?}, rva: 0x{:08X}, virtual_size: 0x{:08X}, characteristics: 0x{:08X} }},",
             s.name, s.rva, s.mem_size(), s.characteristics
         )?;
+    }
+    writeln!(out, "];\n")?;
+
+    writeln!(
+        out,
+        "pub static AOT_CALLBACK_ROOTS: &[AotCallbackRootEntry] = &["
+    )?;
+    for cb in callback_roots {
+        writeln!(
+            out,
+            "    AotCallbackRootEntry {{ rva: 0x{:08X}, kind: {:?}, is_eh_continuation: {} }},",
+            cb.rva, cb.kind, cb.is_eh_continuation
+        )?;
+    }
+    writeln!(out, "];\n")?;
+
+    writeln!(out, "pub static AOT_EH_CONTINUATIONS: &[u32] = &[")?;
+    for &rva in eh_continuations {
+        writeln!(out, "    0x{:08X},", rva)?;
     }
     writeln!(out, "];\n")?;
 
