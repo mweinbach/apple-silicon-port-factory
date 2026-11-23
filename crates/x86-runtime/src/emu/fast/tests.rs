@@ -268,7 +268,7 @@ fn fast_neon_scasb_differential() {
         for &cnt in &[0usize, 1, 7, 15, 16, 17, 32, 37, 80] {
             for &match_pos in &[None, Some(0usize), Some(7), Some(15), Some(16), Some(31), Some(36)] {
                 for &off in &[0usize, 1, 3, 15] {
-                    diff_seq(&format!("{name}_c{cnt}_m{match_pos:?}_o{off}"), code, 512, 64, |cpu, a, _| {
+                    diff_seq(&format!("{name}_c{cnt}_m{match_pos:?}_o{off}"), code, 1024, 64, |cpu, a, _| {
                         let is_repe = name.starts_with("repe_");
                         let fill = if is_repe { 0x41u8 } else { 0x80u8 };
                         a.as_mut_slice().fill(fill);

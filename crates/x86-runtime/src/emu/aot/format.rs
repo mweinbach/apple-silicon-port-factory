@@ -66,7 +66,7 @@ impl H128 {
 pub(super) fn codegen_hash() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        const SRC: [&[u8]; 23] = [
+        const SRC: [&[u8]; 29] = [
             include_bytes!("../jit.rs"),
             include_bytes!("../jit/emit.rs"),
             include_bytes!("../jit/cache.rs"),
@@ -85,6 +85,12 @@ pub(super) fn codegen_hash() -> u64 {
             include_bytes!("../fast/ext.rs"),
             include_bytes!("../fast/more.rs"),
             include_bytes!("../mod.rs"),
+            include_bytes!("../routes.rs"),
+            include_bytes!("../dispatch.rs"),
+            include_bytes!("../cpu.rs"),
+            include_bytes!("../block_cache.rs"),
+            include_bytes!("../interp.rs"),
+            include_bytes!("../generic_ops.rs"),
             include_bytes!("../mem.rs"),
             include_bytes!("../simd_kernels.rs"),
             include_bytes!("../simd_mov.rs"),

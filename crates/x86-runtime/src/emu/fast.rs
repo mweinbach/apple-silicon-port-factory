@@ -29,10 +29,12 @@ mod tests;
 
 pub(super) use decode::{fuse, lower};
 pub(super) use exec::{exec, run_chain, verifiable};
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
 pub(super) use ext::{
     K_BMI_RM, K_BMI_RR, K_INSN, K_LOOP, K_PMOVX, K_VBLENDV_RM, K_VBLENDV_RR, K_VBROADCAST,
     K_VCVT_PD, K_VFMA_RM, K_VFMA_RR, K_VTEST_RM, K_VTEST_RR, K_YMM_LANE,
 };
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
 pub(super) use more::{
     K_ATOMIC, K_BIT_EXT, K_HI8, K_PCMPSTR, K_STRING, K_SYS_MISC, K_VAES_RM, K_VAES_RR, K_VCVT_PH,
     K_VMASKMOV, K_VSHA_RM, K_VSHA_RR,
