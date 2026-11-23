@@ -73,6 +73,8 @@ pub struct ManifestStorageConfig {
     pub archive_repacker: Option<String>,
     /// Optional relative directory handled directly by `archive_repacker` (e.g. `"data_pack2"`).
     pub archive_dir: Option<String>,
+    /// Resolved DLL routing table from the manifest (honors `[dlls]` `disabled` and `[middleware.*]`).
+    pub routing: Option<port_manifest::DllRoutingTable>,
 }
 
 /// Parse `[storage]`, negative `[runtime].builtin_overrides`, `[middleware.*]`,
@@ -80,6 +82,7 @@ pub struct ManifestStorageConfig {
 pub fn parse_manifest_storage_config(toml_text: &str) -> ManifestStorageConfig {
     let manifest = port_manifest::GameManifest::parse(toml_text);
     let keep_dlls = manifest.effective_keep_dlls().into_iter().collect();
+    let routing = Some(manifest.routing_table(&[], None));
     let archive_repacker = manifest
         .storage
         .archive_repacker
@@ -103,6 +106,7 @@ pub fn parse_manifest_storage_config(toml_text: &str) -> ManifestStorageConfig {
         keep_dlls,
         archive_repacker,
         archive_dir,
+        routing,
     }
 }
 
@@ -140,6 +144,8 @@ pub struct StorageOptOptions {
     pub archive_dir: Option<String>,
     /// Workspace root used to locate or build workspace repacker binaries.
     pub workspace_root: Option<PathBuf>,
+    /// Optional manifest-derived DLL routing table used when stripping unused PC DLLs.
+    pub routing: Option<port_manifest::DllRoutingTable>,
 }
 
 impl Default for StorageOptOptions {
@@ -171,6 +177,7 @@ impl StorageOptOptions {
                 archive_repacker: None,
                 archive_dir: None,
                 workspace_root: None,
+                routing: None,
             },
             StorageOptProfile::Lossless => Self {
                 profile,
@@ -189,6 +196,7 @@ impl StorageOptOptions {
                 archive_repacker: None,
                 archive_dir: None,
                 workspace_root: None,
+                routing: None,
             },
             StorageOptProfile::High => Self {
                 profile,
@@ -207,6 +215,7 @@ impl StorageOptOptions {
                 archive_repacker: None,
                 archive_dir: None,
                 workspace_root: None,
+                routing: None,
             },
             StorageOptProfile::Compact => Self {
                 profile,
@@ -225,6 +234,7 @@ impl StorageOptOptions {
                 archive_repacker: None,
                 archive_dir: None,
                 workspace_root: None,
+                routing: None,
             },
         }
     }
@@ -248,6 +258,9 @@ impl StorageOptOptions {
         }
         if self.archive_dir.is_none() {
             self.archive_dir = cfg.archive_dir.clone();
+        }
+        if self.routing.is_none() {
+            self.routing = cfg.routing.clone();
         }
     }
 }
@@ -588,7 +601,12 @@ pub fn optimize_game_assets(
     for (sp, rel, len) in all_files {
         report.total_bytes_before = report.total_bytes_before.saturating_add(len);
         let fname = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if opts.strip_unused_dlls && should_strip_pc_dll(fname, &opts.keep_dlls) {
+        let strip_dll = opts.strip_unused_dlls
+            && match &opts.routing {
+                Some(routing) => routing.should_strip_pc_dll(fname, &opts.keep_dlls),
+                None => should_strip_pc_dll(fname, &opts.keep_dlls),
+            };
+        if strip_dll {
             report.dlls_stripped += 1;
             report.dll_bytes_saved = report.dll_bytes_saved.saturating_add(len);
             continue;
@@ -989,14 +1007,20 @@ mode = "guest"
 
         let mut opts = StorageOptOptions::from_profile(StorageOptProfile::Compact);
         opts.keep_dlls.insert("v8.dll".to_string());
+        let manifest_cfg = parse_manifest_storage_config(
+            "[dlls]\n\"custom_disabled.dll\" = \"disabled\"\n",
+        );
+        opts.apply_manifest_config(&manifest_cfg);
+        fs::write(src.join("custom_disabled.dll"), vec![0u8; 2048]).unwrap();
         let rep = optimize_game_assets(&src, &dst, &opts, None).unwrap();
 
-        assert_eq!(rep.dlls_stripped, 1);
-        assert_eq!(rep.dll_bytes_saved, 4096);
+        assert_eq!(rep.dlls_stripped, 2);
+        assert_eq!(rep.dll_bytes_saved, 4096 + 2048);
         assert_eq!(rep.textures_capped, 1);
         assert!(dst.join("game.exe").is_file());
         assert!(dst.join("v8.dll").is_file());
         assert!(!dst.join("nvngx_dlss.dll").exists());
+        assert!(!dst.join("custom_disabled.dll").exists());
         let out_dds = fs::read(dst.join("textures/hero.dds")).unwrap();
         assert_eq!(u32::from_le_bytes(out_dds[16..20].try_into().unwrap()), 1024);
         assert!(rep.total_bytes_after < rep.total_bytes_before);

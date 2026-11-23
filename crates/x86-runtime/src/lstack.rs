@@ -574,7 +574,12 @@ pub(crate) unsafe fn raise_stack_overflow(what: Overflow) -> ! {
             c.ls_hlo.get()
         );
     }
-    win32_rt::unwind::RaiseException(STATUS_STACK_OVERFLOW as u64, win32_rt::unwind::EXCEPTION_NONCONTINUABLE as u64, 0, 0, 0, 0);
+    win32_rt::unwind::raise_exception_raw(
+        STATUS_STACK_OVERFLOW as u64,
+        win32_rt::unwind::EXCEPTION_NONCONTINUABLE as u64,
+        0,
+        0,
+    );
     log::error!("lstack: STATUS_STACK_OVERFLOW (noncontinuable) was continued");
     std::process::abort()
 }

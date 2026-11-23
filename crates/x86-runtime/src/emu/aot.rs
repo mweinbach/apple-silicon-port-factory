@@ -5018,6 +5018,107 @@ fn unlinked_reasons(d: &Dir, mi: usize) -> [usize; 4] {
     miss
 }
 
+/// Fast header-only read of `(module_name, AotKey)` from the first bytes of a `.aot` cache
+/// file (no full-file read or checksum verification; full integrity checks still run on load).
+fn peek_cache_header(path: &Path) -> Option<(String, AotKey)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 320];
+    let n = f.read(&mut buf).ok()?;
+    let mut r = Rd { b: &buf[..n], p: 0 };
+    if r.take(8)? != MAGIC {
+        return None;
+    }
+    let version = r.u32()?;
+    if version != FORMAT_VERSION_V5 && version != FORMAT_VERSION {
+        return None;
+    }
+    let _flags = r.u32()?;
+    let mut k = [0u64; 6];
+    for v in k.iter_mut() {
+        *v = r.u64()?;
+    }
+    let key = AotKey {
+        image_hash: [k[0], k[1]],
+        image_base: k[2],
+        image_size: k[3],
+        codegen_hash: k[4],
+        knobs: k[5],
+    };
+    let nlen = r.u32()? as usize;
+    let name = String::from_utf8(r.take(nlen)?.to_vec()).ok()?;
+    Some((name, key))
+}
+
+fn read_cached_preferred_base_in(
+    primary_dir: &Path,
+    fallback_dirs: &[PathBuf],
+    name: &str,
+    image_size: usize,
+    want_codegen_hash: u64,
+) -> Option<usize> {
+    if image_size == 0 || name.is_empty() {
+        return None;
+    }
+    let prefix = format!("{name}-");
+    let dirs = core::iter::once(primary_dir).chain(fallback_dirs.iter().map(PathBuf::as_path));
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut best: Option<(std::time::SystemTime, usize)> = None;
+        for entry in rd.flatten() {
+            let fname = entry.file_name();
+            let Some(s) = fname.to_str() else {
+                continue;
+            };
+            if !s.starts_with(&prefix) || !s.ends_with(".aot") {
+                continue;
+            }
+            let p = entry.path();
+            let Some((mod_name, key)) = peek_cache_header(&p) else {
+                continue;
+            };
+            if mod_name == name
+                && key.image_size == image_size as u64
+                && key.codegen_hash == want_codegen_hash
+                && key.image_base != 0
+            {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if best.is_none_or(|(prev_t, _)| mtime > prev_t) {
+                    best = Some((mtime, key.image_base as usize));
+                }
+            }
+        }
+        if let Some((_, base)) = best {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// If a valid dynamic `.aot` cache exists for PE image `name` matching `image_size` and the
+/// current codegen version, return the `image_base` it was compiled for so the PE loader can
+/// prefer mapping the module at that exact base (avoiding ASLR-induced AOT cache misses).
+///
+/// Side-effect free: never initializes `aot_mode()` or creates crash-guard session locks.
+pub fn aot_cached_preferred_base(name: &str, image_size: usize) -> Option<usize> {
+    if building() || image_size == 0 {
+        return None;
+    }
+    if env_var_any(&["PORT_AOT", "AW2_DLL_AOT"])
+        .is_some_and(|v| v.trim() == "0")
+    {
+        return None;
+    }
+    let primary = cache_dir();
+    let fallbacks = fallback_cache_dirs_for(&primary);
+    read_cached_preferred_base_in(&primary, &fallbacks, name, image_size, codegen_hash())
+}
+
 fn read_cache_file_in(
     primary_dir: &Path,
     fallback_dirs: &[PathBuf],
@@ -8172,4 +8273,57 @@ fn aot_lea_rip_leaf_discovery_and_text_data_rejection() {
             );
         }
     }
+}
+
+#[test]
+fn cached_preferred_base_reads_matching_header_only() {
+    let dir = std::env::temp_dir().join(format!("port-aot-prefbase-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let primary = dir.join("primary");
+    let fallback = dir.join("fallback");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&fallback).unwrap();
+
+    let cg = codegen_hash();
+    let fb_key = AotKey {
+        image_hash: [1, 2],
+        image_base: 0x1_4000_0000,
+        image_size: 0x0487_6000,
+        codegen_hash: cg,
+        knobs: 0,
+    };
+    let fb_path = fallback.join(format!("overwatch.exe-{:016x}.aot", fb_key.id()));
+    std::fs::write(&fb_path, encode("overwatch.exe", &fb_key, &Image::default(), 0)).unwrap();
+
+    // Fallback hit when primary is empty
+    assert_eq!(
+        read_cached_preferred_base_in(&primary, std::slice::from_ref(&fallback), "overwatch.exe", 0x0487_6000, cg),
+        Some(0x1_4000_0000)
+    );
+    // Wrong size or wrong codegen hash must not match
+    assert_eq!(
+        read_cached_preferred_base_in(&primary, std::slice::from_ref(&fallback), "overwatch.exe", 0x0400_0000, cg),
+        None
+    );
+    assert_eq!(
+        read_cached_preferred_base_in(&primary, std::slice::from_ref(&fallback), "overwatch.exe", 0x0487_6000, cg ^ 1),
+        None
+    );
+
+    // Primary overrides fallback
+    let pri_key = AotKey {
+        image_hash: [3, 4],
+        image_base: 0x1_5000_0000,
+        image_size: 0x0487_6000,
+        codegen_hash: cg,
+        knobs: 0,
+    };
+    let pri_path = primary.join(format!("overwatch.exe-{:016x}.aot", pri_key.id()));
+    std::fs::write(&pri_path, encode("overwatch.exe", &pri_key, &Image::default(), 0)).unwrap();
+    assert_eq!(
+        read_cached_preferred_base_in(&primary, std::slice::from_ref(&fallback), "overwatch.exe", 0x0487_6000, cg),
+        Some(0x1_5000_0000)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

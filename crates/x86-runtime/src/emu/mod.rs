@@ -102,7 +102,13 @@ pub fn aot_profile_dump() {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub use aot::{aot_prewarm_all_mapped, AotPrewarmReport};
+pub use aot::{aot_cached_preferred_base, aot_prewarm_all_mapped, AotPrewarmReport};
+
+/// Look up the compiled `image_base` of a matching dynamic `.aot` cache (no-op on non-aarch64 hosts).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn aot_cached_preferred_base(_name: &str, _image_size: usize) -> Option<usize> {
+    None
+}
 
 /// Outcome of profile-free offline `.aot` block-cache precompilation for one mapped PE module.
 #[cfg(not(target_arch = "aarch64"))]
@@ -667,11 +673,9 @@ unsafe fn dll_chkstk_exec(
     let raise = win32_rt::unwind::RaiseException as *const () as usize;
     let lsa = crate::lstack::anchor_enter(crate::callctx::ctx(), *sp_ptr);
     let _ = eh::callout(cpu, raise, *sp_ptr, move || {
-        win32_rt::unwind::RaiseException(
+        win32_rt::unwind::raise_exception_raw(
             crate::lstack::STATUS_STACK_OVERFLOW as u64,
             win32_rt::unwind::EXCEPTION_NONCONTINUABLE as u64,
-            0,
-            0,
             0,
             0,
         );
@@ -725,6 +729,7 @@ pub(super) fn is_routed_dll_stack_pos(va: u64) -> bool {
 /// Host `call_va8` fast path for [`is_routed_dll_stack_pos`]: returns the exact `sp_top` guest
 /// stack coordinate that [`emu_run_region`] would establish (`state.sp - lifted_depth - 328`
 /// aligned to `16n + 8`) without entering the interpreter loop.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
 unsafe fn dll_stack_pos_va8(c: &crate::callctx::CallCtx) -> u64 {
     let lifted = crate::lstack::lifted_depth(c) as u64;
@@ -806,6 +811,7 @@ pub(super) fn lookup_routed_regfile(va: u64) -> Option<(regfile::RegfileFn, u32)
 }
 
 /// `va` is a registered and enabled `DF_REGFILE` entry.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
 pub(super) fn is_routed_regfile(va: u64) -> bool {
     lookup_routed_regfile(va).is_some()
@@ -1377,6 +1383,7 @@ pub(crate) unsafe fn shadow_lean_xmm(
 
 /// Shadow probe runs (forked children only): the guest original of `va` the way
 /// [`call_va8_bridge`] runs an ORIG (bit 46) call, after the caller's rsp window is restored.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub(crate) unsafe fn shadow_run_guest(
     entry: u64,
     rsp_window: (u64, u64),
@@ -1526,6 +1533,7 @@ pub(super) const FPCR_GUEST_MASK: u64 = 7u64 << 22;
 /// Convert x86-64 `MXCSR` control bits (`FTZ`=15, `DAZ`=6, `RC`=14:13) to ARM64 `FPCR`
 /// (`FZ`=24, `RMode`=23:22). Note `RMode` swaps `RM`/`RP` relative to `MXCSR.RC`:
 /// `RC 00->00 (RN), 01->10 (RM), 10->01 (RP), 11->11 (RZ)`.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
 pub(super) fn mxcsr_to_fpcr(mxcsr: u32) -> u64 {
     let rc_lo = ((mxcsr >> 13) & 1) as u64;
@@ -1643,7 +1651,7 @@ impl Drop for HostFpcrGuard {
 
 /// Lightweight RAII guard for direct leaf host calls (`host_call_asm`): clears guest `FPCR`
 /// bits (`FZ`/`RMode`) while host code runs (no-op if already 0) and restores on return.
-struct ClearFpcrGuard(Option<u64>);
+struct ClearFpcrGuard(#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] Option<u64>);
 
 impl ClearFpcrGuard {
     #[inline(always)]
@@ -1810,13 +1818,11 @@ unsafe fn guest_fault_dispatch(cpu: &mut Cpu, sp_ptr: *mut u64, addr: u64, write
     let info = [write as u64, addr];
     let lsa = crate::lstack::anchor_enter(crate::callctx::ctx(), *sp_ptr);
     let _ = eh::callout(cpu, raise, *sp_ptr, move || {
-        win32_rt::unwind::RaiseException(
+        win32_rt::unwind::raise_exception_raw(
             win32_rt::unwind::STATUS_ACCESS_VIOLATION as u64,
             0,
             2,
             info.as_ptr() as u64,
-            0,
-            0,
         );
         (0, 0)
     });

@@ -320,7 +320,12 @@ impl EhFrame {
         let info = [write as u64, a];
         unsafe {
             self.catching(site_va, || {
-                win32_rt::unwind::RaiseException(STATUS_ACCESS_VIOLATION as u64, 0, 2, info.as_ptr() as u64, 0, 0);
+                win32_rt::unwind::raise_exception_raw(
+                    STATUS_ACCESS_VIOLATION as u64,
+                    0,
+                    2,
+                    info.as_ptr() as u64,
+                );
             })
         }
     }

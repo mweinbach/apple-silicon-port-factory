@@ -542,6 +542,7 @@ impl Loader {
         let size = (h.size_of_image as usize + PAGE - 1) & !(PAGE - 1);
         let pref = force_base
             .or_else(|| x86_runtime::emu::exec_mem::static_aot_preferred_base(norm))
+            .or_else(|| x86_runtime::emu::aot_cached_preferred_base(norm, size))
             .unwrap_or(h.image_base as usize);
         let base = unsafe { map_image_memory(pref, size, !h.relocs_stripped()) }
             .ok_or_else(|| anyhow!("{norm}: cannot map 0x{size:x} bytes (preferred 0x{pref:x})"))?;

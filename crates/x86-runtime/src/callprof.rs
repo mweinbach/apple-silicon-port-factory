@@ -126,13 +126,13 @@ fn short(s: &str) -> String {
 pub fn hit(c: &crate::callctx::CallCtx, va_raw: u64, dispatch: (usize, u32), entry: u8) {
     let fp: usize;
     // SAFETY: reads this function's own frame pointer.
+    #[cfg(target_arch = "aarch64")]
     unsafe {
-        #[cfg(target_arch = "aarch64")]
         core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            fp = 0;
-        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        fp = 0;
     }
     if VA_MODE.load(Ordering::Relaxed) {
         // SAFETY: frame pointers are always kept on aarch64 macOS; the walk is bounded.

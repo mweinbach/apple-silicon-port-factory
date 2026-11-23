@@ -82,7 +82,14 @@ unsafe fn uc_pc(uc: *mut libc::c_void) -> u64 {
     if mc.is_null() {
         0
     } else {
-        (*mc).__ss.__pc
+        #[cfg(target_arch = "aarch64")]
+        {
+            (*mc).__ss.__pc
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            (*mc).__ss.__rip
+        }
     }
 }
 
@@ -94,7 +101,14 @@ unsafe fn uc_lr(uc: *mut libc::c_void) -> u64 {
     if mc.is_null() {
         0
     } else {
-        (*mc).__ss.__lr
+        #[cfg(target_arch = "aarch64")]
+        {
+            (*mc).__ss.__lr
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            0
+        }
     }
 }
 

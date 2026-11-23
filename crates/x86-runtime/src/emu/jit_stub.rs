@@ -58,11 +58,15 @@ pub(super) const EXIT_JMP: u64 = 2;
 pub(super) const EXIT_JCC: u64 = 3;
 pub(super) const EXIT_SIDE: u64 = 4;
 
-#[cfg(test)]
 pub(super) fn force(_mode: u8) {}
 
 pub(super) fn enabled() -> bool {
     false
+}
+
+#[allow(dead_code)]
+pub(super) fn inline_host_fn_kind(_t: u64) -> Option<(usize, bool, bool)> {
+    None
 }
 
 #[allow(dead_code)]
@@ -76,6 +80,22 @@ impl JitCache {
     pub(super) fn new() -> Self {
         JitCache
     }
+
+    pub(super) unsafe fn warm(&mut self) {}
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(super) unsafe fn cache_plain_host(
+        _table: usize,
+        _target: u64,
+        _host_fn: usize,
+        _needs_xmm: bool,
+    ) {
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(super) unsafe fn cache_qpc_host(_table: usize, _target: u64, _qpc_state: usize) {}
 
     #[inline(always)]
     pub(super) unsafe fn lookup(&mut self, _ip: u64, _bc: *mut BlockCache) -> Option<usize> {

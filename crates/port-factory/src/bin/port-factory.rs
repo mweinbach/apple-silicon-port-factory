@@ -80,9 +80,9 @@ fn usage() -> ! {
                                                 Statically AOT-compile an x86-64 .exe/.dll to native Rust\n\
            aot-crate <PE_FILE> --out <DIR> [--name CRATE]\n\
                                                 Generate a standalone, zero-dependency embeddable Rust crate\n\
-           aot-prewarm <PE_FILE> [--game-dir DIR] [--aot-dir DIR] [--max-funcs N]\n\
+           aot-prewarm [PE_FILE] [--manifest FILE] [--game-dir DIR] [--aot-dir DIR] [--max-funcs N]\n\
                                                 Offline-precompile relocatable ARM64 .aot block caches via port-runner\n\
-           aot-static-obj <PE_OR_AOT> --out <DIR_OR_O> [--platform ios|ios-sim|macos] [--game-dir DIR] [--max-funcs N]\n\
+           aot-static-obj [PE_OR_AOT] --out <DIR_OR_O> [--platform ios|ios-sim|macos] [--manifest FILE] [--game-dir DIR] [--max-funcs N]\n\
                                                 Compile PE or v5 .aot into Apple-signed ARM64 Mach-O .aot.o object(s) (zero MAP_JIT)\n\
            ios-bundle <PE_OR_DIR_OR_TOML> --out <PATH.app|PATH.ipa> [--target device|sim] [--title NAME] [--bundle-id ID] [--exe NAME] [--manifest FILE] [--release] [--deployment-target 17.0] [--no-static-aot] [--aot-max-funcs N] [--extra-aot-obj FILE.o] [--no-precompile-shaders] [--bundle-shader-cache [DIR]] [--optimize-storage none|lossless|high|compact] [--hevc-videos] [--no-hevc-videos] [--video-max-height N] [--video-bitrate KBPS] [--max-tex-dim N] [--strip-unused-dlls] [--keep-lang CODE] [--strip-dlc] [--opt-jobs N] [--opt-dry-run] [--sign ID] [--provisioning-profile FILE] [--xcode-project]\n\
                                                 One-command iOS / iOS Simulator .app or .ipa packager with signed static .aot.o, Tier-1 shaders & optional storage optimization\n\
@@ -738,6 +738,7 @@ fn find_or_build_port_runner(workspace_root: &Path) -> Result<PathBuf> {
 
 fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
     let mut pe_path: Option<PathBuf> = None;
+    let mut manifest_path: Option<PathBuf> = None;
     let mut game_dir: Option<PathBuf> = None;
     let mut aot_dir: Option<PathBuf> = None;
     let mut max_funcs: Option<usize> = None;
@@ -745,6 +746,9 @@ fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--manifest" => {
+                manifest_path = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
             "--game-dir" => {
                 game_dir = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())));
             }
@@ -760,19 +764,31 @@ fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument {other:?}"),
         }
     }
-    let Some(pe_path) = pe_path else {
+    if pe_path.is_none() && manifest_path.is_none() {
         usage();
-    };
-    if !pe_path.is_file() {
-        bail!("PE file not found: {}", pe_path.display());
+    }
+    if let Some(ref pe) = pe_path {
+        if !pe.is_file() {
+            bail!("PE file not found: {}", pe.display());
+        }
+    }
+    if let Some(ref mp) = manifest_path {
+        if !mp.is_file() {
+            bail!("manifest file not found: {}", mp.display());
+        }
     }
 
     let runner = find_or_build_port_runner(&workspace_root())?;
     let mut cmd = std::process::Command::new(&runner);
+    if let Some(ref mp) = manifest_path {
+        cmd.arg("--manifest").arg(mp);
+    }
     if let Some(ref gd) = game_dir {
         cmd.arg("--game-dir").arg(gd);
     }
-    cmd.arg("--pe").arg(&pe_path);
+    if let Some(ref pe) = pe_path {
+        cmd.arg("--pe").arg(pe);
+    }
     cmd.arg("--prewarm-aot");
     if let Some(ref dir) = aot_dir {
         cmd.arg("--aot-dir").arg(dir);
@@ -797,6 +813,7 @@ fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
 
 fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
     let mut input: Option<PathBuf> = None;
+    let mut manifest_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut platform = "ios".to_string();
     let mut game_dir: Option<PathBuf> = None;
@@ -805,6 +822,9 @@ fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--manifest" => {
+                manifest_path = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
             "--out" | "-o" => {
                 out_path = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())));
             }
@@ -823,19 +843,27 @@ fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
             other => bail!("unexpected argument {other:?}"),
         }
     }
-    let Some(input) = input else {
+    if input.is_none() && manifest_path.is_none() {
         usage();
-    };
-    if !input.is_file() {
-        bail!("input file not found: {}", input.display());
+    }
+    if let Some(ref inp) = input {
+        if !inp.is_file() {
+            bail!("input file not found: {}", inp.display());
+        }
+    }
+    if let Some(ref mp) = manifest_path {
+        if !mp.is_file() {
+            bail!("manifest file not found: {}", mp.display());
+        }
     }
     let is_aot = input
-        .extension()
+        .as_ref()
+        .and_then(|p| p.extension())
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("aot"));
     let out_target = out_path.unwrap_or_else(|| {
         if is_aot {
-            input.with_extension("aot.o")
+            input.as_ref().unwrap().with_extension("aot.o")
         } else {
             PathBuf::from("out/static-aot")
         }
@@ -845,18 +873,22 @@ fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
     let mut cmd = std::process::Command::new(&runner);
     if is_aot {
         cmd.arg("--aot-to-o")
-            .arg(&input)
+            .arg(input.as_ref().unwrap())
             .arg("--out")
             .arg(&out_target)
             .arg("--static-platform")
             .arg(&platform);
     } else {
+        if let Some(ref mp) = manifest_path {
+            cmd.arg("--manifest").arg(mp);
+        }
         if let Some(ref gd) = game_dir {
             cmd.arg("--game-dir").arg(gd);
         }
-        cmd.arg("--pe")
-            .arg(&input)
-            .arg("--emit-static-o")
+        if let Some(ref inp) = input {
+            cmd.arg("--pe").arg(inp);
+        }
+        cmd.arg("--emit-static-o")
             .arg(&out_target)
             .arg("--static-platform")
             .arg(&platform);

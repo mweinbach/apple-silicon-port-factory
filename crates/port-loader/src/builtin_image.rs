@@ -399,6 +399,7 @@ pub fn host_binary_base() -> usize {
 }
 
 /// `[start, end)` address range of the host loader binary's `__TEXT,__text` section.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub fn host_text_range() -> Option<(usize, usize)> {
     text_range_of(host_binary_base())
 }

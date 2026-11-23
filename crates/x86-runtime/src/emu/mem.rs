@@ -329,6 +329,7 @@ pub(super) fn code_gen() -> u32 {
 }
 
 /// Address of the executable-memory generation counter (read by translated code).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(super) fn code_gen_ptr() -> usize {
     &CODE_GEN as *const AtomicU32 as usize
 }

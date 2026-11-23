@@ -1351,7 +1351,9 @@ unsafe fn exec_pcmpstr_op(cpu: &mut Cpu, op: &FastOp) {
                 bb.iter().position(|&x| x == 0).unwrap_or(16),
             )
         };
+        #[cfg(target_arch = "aarch64")]
         let valid_a: u16 = if a_len >= 16 { 0xFFFF } else { (1u16 << a_len) - 1 };
+        #[cfg(target_arch = "aarch64")]
         let valid_b: u16 = if b_len >= 16 { 0xFFFF } else { (1u16 << b_len) - 1 };
         let res1: u16 = match agg {
             0 => {

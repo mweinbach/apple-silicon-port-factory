@@ -245,49 +245,87 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
     a
 }
 
+/// Fast header-only peek of a PE32+ file's `(image_base, page_aligned_size_of_image, is_dll)`.
+fn peek_pe_preferred_window(path: &std::path::Path) -> Option<(usize, usize, bool)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = f.read(&mut buf).ok()?;
+    if n < 0x40 || &buf[0..2] != b"MZ" {
+        return None;
+    }
+    let lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
+    if lfanew.checked_add(24 + 64)? > n || &buf[lfanew..lfanew + 4] != b"PE\0\0" {
+        return None;
+    }
+    let characteristics = u16::from_le_bytes(buf[lfanew + 22..lfanew + 24].try_into().ok()?);
+    let is_dll = (characteristics & 0x2000) != 0;
+    let opt = lfanew + 24;
+    let magic = u16::from_le_bytes(buf[opt..opt + 2].try_into().ok()?);
+    if magic != 0x20B {
+        return None;
+    }
+    let image_base = u64::from_le_bytes(buf[opt + 24..opt + 32].try_into().ok()?) as usize;
+    let size_of_image = u32::from_le_bytes(buf[opt + 56..opt + 60].try_into().ok()?) as usize;
+    let aligned_size = (size_of_image + loader::PAGE - 1) & !(loader::PAGE - 1);
+    (image_base != 0 && aligned_size != 0).then_some((image_base, aligned_size, is_dll))
+}
+
 /// Rosetta only advertises AVX/AVX2/FMA/BMI in CPUID when this variable is
-/// set at process start, so re-exec ourselves with it. Only probes `0x140000000`
-/// ASLR retry when `preferred_base_retry` is true (e.g. AW2 with absolute-VA lifts).
-fn ensure_avx_env(args: &Args, preferred_base_retry: bool) {
-    if preferred_base_retry {
-        unsafe {
-            let p = libc::mmap(
-                0x1_4000_0000 as *mut libc::c_void,
-                0x0400_0000,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
-            if p != libc::MAP_FAILED {
-                libc::munmap(p, 0x0400_0000);
-            }
-            let tries: u32 = std::env::var("AW2_ASLR_RETRY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            boot_log_line(&format!(
-                "mmap probe for 0x140000000 returned 0x{:x} (AW2_ASLR_RETRY={tries})",
-                p as usize
-            ));
-            if p as usize != 0x1_4000_0000 {
-                if tries < 16 {
-                    if let Ok(exe) = std::env::current_exe() {
+/// set at process start, so re-exec ourselves with it. Also probes the target
+/// EXE's preferred base window `(probe_base, probe_size)` when deterministic
+/// placement is requested (lifted shards, offline AOT prewarming, or matching
+/// `.aot` caches), retrying ASLR if macOS placed host mappings there.
+fn ensure_avx_env(args: &Args, probe_window: Option<(usize, usize)>) {
+    let no_retry = std::env::var("PORT_NO_BASE_RETRY").is_ok_and(|v| v == "1");
+    if let (false, Some((probe_base, probe_size))) = (no_retry, probe_window) {
+        if (0x1_0000_0000..0x1_7F00_0000).contains(&probe_base)
+            && probe_size > 0
+            && probe_base.checked_add(probe_size).is_some_and(|e| e <= 0x1_7F00_0000)
+        {
+            unsafe {
+                let p = libc::mmap(
+                    probe_base as *mut libc::c_void,
+                    probe_size,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                if p != libc::MAP_FAILED {
+                    libc::munmap(p, probe_size);
+                }
+                let tries: u32 = std::env::var("AW2_ASLR_RETRY")
+                    .or_else(|_| std::env::var("PORT_ASLR_RETRY"))
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                boot_log_line(&format!(
+                    "mmap probe for 0x{probe_base:x}+0x{probe_size:x} returned 0x{:x} (AW2_ASLR_RETRY={tries})",
+                    p as usize
+                ));
+                if p as usize != probe_base {
+                    if tries < 16 {
+                        if let Ok(exe) = std::env::current_exe() {
+                            boot_log_line(&format!(
+                                "0x{probe_base:x}+0x{probe_size:x} occupied (got 0x{:x}), re-execing ({}/16): {}",
+                                p as usize,
+                                tries + 1,
+                                exe.display()
+                            ));
+                            use std::os::unix::process::CommandExt;
+                            let err = std::process::Command::new(exe)
+                                .args(std::env::args_os().skip(1))
+                                .env("AW2_ASLR_RETRY", (tries + 1).to_string())
+                                .env("PORT_ASLR_RETRY", (tries + 1).to_string())
+                                .exec();
+                            boot_log_line(&format!("re-exec with AW2_ASLR_RETRY failed: {err}"));
+                        }
+                    } else {
                         boot_log_line(&format!(
-                            "0x140000000 occupied (got 0x{:x}), re-execing ({}/16): {}",
-                            p as usize,
-                            tries + 1,
-                            exe.display()
+                            "warning: 0x{probe_base:x}+0x{probe_size:x} still occupied after 16 ASLR retries; continuing with relocated base"
                         ));
-                        use std::os::unix::process::CommandExt;
-                        let err = std::process::Command::new(exe)
-                            .args(std::env::args_os().skip(1))
-                            .env("AW2_ASLR_RETRY", (tries + 1).to_string())
-                            .exec();
-                        boot_log_line(&format!("re-exec with AW2_ASLR_RETRY failed: {err}"));
                     }
-                } else {
-                    boot_log_line("warning: 0x140000000 still occupied after 16 ASLR retries; continuing with relocated base");
                 }
             }
         }
@@ -504,9 +542,23 @@ fn show_startup_error_alert(msg: &str) {
         .status();
 }
 
+fn cli_manifest_arg() -> Option<std::path::PathBuf> {
+    let mut it = std::env::args_os().skip(1);
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--manifest" {
+            return it.next().map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
 fn init_boot_log() {
     register_builtin_plugins();
-    let manifest = target::discover(None);
+    let explicit_manifest = cli_manifest_arg();
+    let manifest = target::discover(explicit_manifest.as_deref());
     let boot_exe_norm = manifest
         .as_ref()
         .and_then(|m| m.exe.as_deref())
@@ -962,7 +1014,33 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         .or_else(|| plugin_defaults.map(|d| d.preferred_base_retry))
         .unwrap_or(false);
     if !embedded_host {
-        ensure_avx_env(&args, preferred_base_retry);
+        let probe_pe_path = args
+            .pe_path
+            .clone()
+            .unwrap_or_else(|| args.game_dir.join(&args.exe));
+        let pe_win = peek_pe_preferred_window(&probe_pe_path);
+        let probe_window = match pe_win {
+            Some((pe_base, pe_size, false)) => {
+                let aot_base = x86_runtime::emu::exec_mem::static_aot_preferred_base(&norm)
+                    .or_else(|| x86_runtime::emu::aot_cached_preferred_base(&norm, pe_size));
+                let prewarm_exe = args.prewarm_aot || args.emit_static_o.is_some();
+                let live_run = !args.no_run && !args.list_exports && !args.ops_report;
+                if preferred_base_retry || prewarm_exe || (live_run && aot_base.is_some()) {
+                    let target_base = aot_base.unwrap_or(pe_base);
+                    let target_size = if preferred_base_retry {
+                        pe_size.max(0x0400_0000)
+                    } else {
+                        pe_size
+                    };
+                    Some((target_base, target_size))
+                } else {
+                    None
+                }
+            }
+            Some(_) => None,
+            None => preferred_base_retry.then_some((0x1_4000_0000, 0x0400_0000)),
+        };
+        ensure_avx_env(&args, probe_window);
     }
     {
         use std::io::Write;

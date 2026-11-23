@@ -71,6 +71,7 @@ static PREFERRED_EXE_BASE: AtomicU64 = AtomicU64::new(0x1_4000_0000);
 /// Bit tag on non-`x86_64` trampoline addresses so direct calls to `orig` in
 /// differential tests trap into `signals::handler` and execute the original
 /// guest `x86-64` instructions via `emu_run_with_xmm`.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 pub const ORIG_TRAMPOLINE_TAG: usize = 1usize << 46;
 
 static TRAMPOLINES: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);

@@ -2423,6 +2423,25 @@ pub unsafe fn backtrace_chain(ctx: &Context, cur: Cur, max: usize) -> Vec<u64> {
 
 context_capturing_export!(RaiseException => raise_exception_impl);
 
+/// Cross-architecture Rust helper to invoke [`RaiseException`] with 4 Win64 parameters.
+///
+/// On `x86_64`, [`RaiseException`] is a `#[naked]` asm entry point with 0 Rust parameters
+/// that reads `rcx`/`rdx`/`r8`/`r9` directly from registers; on non-`x86_64`, it is a
+/// regular 6-argument `extern "win64"` function.
+#[inline(never)]
+pub unsafe fn raise_exception_raw(code: u64, flags: u64, nargs: u64, args_ptr: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f: unsafe extern "win64" fn(u64, u64, u64, u64) =
+            std::mem::transmute(RaiseException as *const ());
+        f(code, flags, nargs, args_ptr);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        RaiseException(code, flags, nargs, args_ptr, 0, 0);
+    }
+}
+
 /// `fn(&ExceptionRecord)` called for an MSVC C++ exception (`0xE06D7363`) the dispatch
 /// could not deliver (the walk stopped at a frame without a record, e.g. a Rust API calling
 /// a guest callback, or no frame caught it), before the unhandled-exception path; or 0. Set

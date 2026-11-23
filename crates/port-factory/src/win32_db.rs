@@ -647,13 +647,20 @@ fn scan_extra_exports_and_ordinals(
         }
     }
 
-    // Parse `Export { name: "...", ptr: ... }` inside `EXTRA_EXPORTS`.
-    if let Some((_, after)) = src.split_once("EXTRA_EXPORTS") {
-        let body = after
+    // Parse `Export { name: "...", ptr: ... }` inside `pub static EXTRA_EXPORTS: &[...] = &[ ... ];`.
+    // Anchor on the `static EXTRA_EXPORTS` declaration and split after `=` so comments or
+    // earlier code referencing `EXTRA_EXPORTS` never shadow the table.
+    let extra_after = src
+        .split_once("pub static EXTRA_EXPORTS")
+        .or_else(|| src.split_once("static EXTRA_EXPORTS"))
+        .map(|(_, after)| after);
+    if let Some(after) = extra_after {
+        let init = after.split_once('=').map(|(_, rhs)| rhs).unwrap_or(after);
+        let body = init
             .split_once("&[")
             .and_then(|(_, b)| b.split_once("];"))
             .map(|(b, _)| b)
-            .unwrap_or(after);
+            .unwrap_or(init);
         for part in body.split("name:") {
             let trimmed = part.trim_start();
             if let Some(rest) = trimmed.strip_prefix('"') {
@@ -678,10 +685,14 @@ fn scan_extra_exports_and_ordinals(
 
 fn parse_ordinals(src: &str) -> Vec<(u16, String)> {
     let mut out = Vec::new();
-    let Some((_, after)) = src.split_once("ORDINALS") else {
+    let Some((_, after)) = src
+        .split_once("pub static ORDINALS")
+        .or_else(|| src.split_once("static ORDINALS"))
+    else {
         return out;
     };
-    let Some((_, list_body)) = after.split_once("&[") else {
+    let init = after.split_once('=').map(|(_, rhs)| rhs).unwrap_or(after);
+    let Some((_, list_body)) = init.split_once("&[") else {
         return out;
     };
     let Some((body, _)) = list_body.split_once("];") else {
@@ -744,5 +755,28 @@ mod tests {
         assert!(report.contains("NVIDIA DLSS / Streamline (dlss) v2 [default: builtin] <- nvngx_dlss.dll"));
         assert!(report.contains("Unresolved (1):"));
         assert!(report.contains("custom.dll!MissingFn"));
+    }
+
+    #[test]
+    fn extra_exports_scanner_finds_tables_after_earlier_references() {
+        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf();
+        let db = Win32Database::from_workspace_src(&ws).unwrap();
+        let pb_count = db.entries.iter().filter(|e| e.dll == "libprotobuf.dll").count();
+        assert!(
+            pb_count >= 122,
+            "expected >= 122 libprotobuf.dll EXTRA_EXPORTS, found {pb_count}"
+        );
+        assert!(db
+            .entries
+            .iter()
+            .any(|e| e.dll == "libxess.dll" && e.symbol == "xessSetJitterScale"));
+        assert!(db
+            .entries
+            .iter()
+            .any(|e| e.dll == "d2d1.dll" && e.symbol == "D2D1MakeRotateMatrix"));
     }
 }
