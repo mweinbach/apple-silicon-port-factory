@@ -44,6 +44,12 @@ pub struct GameManifest {
     pub v8_jitless: Option<bool>,
     pub legacy_remedy_migration: Option<bool>,
     pub args: Option<String>,
+    /// Optional relative paths (within the package/game dir) to bundled plugin PEs
+    /// (`.dll`, `.pyd`, `.node`, `.ocx`) to include during offline AOT prewarming.
+    pub bundled_plugins: Vec<String>,
+    /// Optional relative subdirectories (within the package/game dir) containing
+    /// bundled plugins to scan during offline AOT prewarming.
+    pub plugin_dirs: Vec<String>,
 
     // [dlls]
     pub dlls: BTreeMap<String, DllRoute>,
@@ -291,16 +297,18 @@ impl GameManifest {
         };
 
         if qualified == "storage.keep_dlls" {
-            if raw_val.starts_with('[') {
-                self.storage.keep_dlls = parse_string_array(raw_val);
-            } else {
-                let val = unquote(raw_val);
-                self.storage.keep_dlls = val
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
+            self.storage.keep_dlls = parse_string_list_value(raw_val);
+            return;
+        }
+        if matches!(
+            qualified.as_str(),
+            "bundled_plugins" | "runtime.bundled_plugins"
+        ) {
+            self.bundled_plugins = parse_string_list_value(raw_val);
+            return;
+        }
+        if matches!(qualified.as_str(), "plugin_dirs" | "runtime.plugin_dirs") {
+            self.plugin_dirs = parse_string_list_value(raw_val);
             return;
         }
 
@@ -381,7 +389,9 @@ impl GameManifest {
             || self.builtin_overrides.is_some()
             || self.aot_dylibs.is_some()
             || self.aot_dir.is_some()
-            || self.args.is_some();
+            || self.args.is_some()
+            || !self.bundled_plugins.is_empty()
+            || !self.plugin_dirs.is_empty();
         if has_runtime {
             start_section(&mut out, "runtime");
             push_opt_bool(&mut out, "preferred_base_retry", self.preferred_base_retry);
@@ -399,6 +409,8 @@ impl GameManifest {
             push_opt_str(&mut out, "aot_dylibs", self.aot_dylibs.as_deref());
             push_opt_str(&mut out, "aot_dir", self.aot_dir.as_deref());
             push_opt_str(&mut out, "args", self.args.as_deref());
+            push_string_array(&mut out, "bundled_plugins", &self.bundled_plugins);
+            push_string_array(&mut out, "plugin_dirs", &self.plugin_dirs);
         }
 
         for (family, sel) in &self.middleware {
@@ -676,6 +688,35 @@ fn escape_toml_str(s: &str) -> String {
     out
 }
 
+fn parse_string_list_value(raw_val: &str) -> Vec<String> {
+    if raw_val.starts_with('[') {
+        parse_string_array(raw_val)
+    } else {
+        let val = unquote(raw_val);
+        val.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+}
+
+fn push_string_array(out: &mut String, key: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    out.push_str(key);
+    out.push_str(" = [");
+    for (idx, item) in items.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(&escape_toml_str(item));
+        out.push('"');
+    }
+    out.push_str("]\n");
+}
+
 fn push_opt_str(out: &mut String, key: &str, val: Option<&str>) {
     if let Some(v) = val {
         out.push_str(&format!("{key} = \"{}\"\n", escape_toml_str(v)));
@@ -831,6 +872,11 @@ keep_dlls = [
             v8_jitless: Some(false),
             legacy_remedy_migration: Some(false),
             args: Some("-lang \"en US\" -flag=1".into()),
+            bundled_plugins: vec![
+                "plugins/ext.pyd".into(),
+                "native/addon.node".into(),
+            ],
+            plugin_dirs: vec!["plugins".into(), "controls".into()],
             dlls: BTreeMap::new(),
             middleware: BTreeMap::new(),
             storage: StorageManifestConfig {

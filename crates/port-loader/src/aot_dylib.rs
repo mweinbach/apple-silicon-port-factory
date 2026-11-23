@@ -45,6 +45,9 @@ pub(crate) fn load_aot_dylibs(mods: &[Arc<Module>]) {
                                 let mstem = mn
                                     .strip_suffix(".exe")
                                     .or_else(|| mn.strip_suffix(".dll"))
+                                    .or_else(|| mn.strip_suffix(".pyd"))
+                                    .or_else(|| mn.strip_suffix(".node"))
+                                    .or_else(|| mn.strip_suffix(".ocx"))
                                     .unwrap_or(&mn)
                                     .chars()
                                     .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
