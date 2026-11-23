@@ -3223,154 +3223,63 @@ pub unsafe extern "win64" fn vkGetDeviceImageSparseMemoryRequirementsKHR(
 // In Win64, a `VkCommandBuffer` in slot 1 occupies `rcx` (`x0`) and subsequent
 // `float` arguments occupy positional `xmm1..xmm3` (`v1..v3`), NOT `xmm0..xmm2`.
 // Native ARM64 MoltenVK (`extern "C"`) reads its first float arguments from
-// `s0..s2` (`v0..v2`). The `aarch64` signatures below declare a dummy `_xmm0: f32`
-// so `s1..s3` map directly to Win64 `xmm1..xmm3` before forwarding to MoltenVK.
+// `s0..s2` (`v0..v2`). `crate::win64_bridge!` unpacks Win64 GPR/XMM slots on
+// `aarch64` and forwards typed `f32` arguments straight to MoltenVK.
 // ---------------------------------------------------------------------------
 
-unsafe fn cmd_set_line_width_impl(cmd_buf: usize, line_width: f32) {
-    if cmd_buf == 0 {
-        return;
-    }
-    let Some(vk) = vulkan_backend() else {
-        return;
+macro_rules! vk_cmd_float_bridge {
+    (
+        export $export_name:ident => $impl_fn:ident($sym:literal; $($arg:ident : $ty:ty),+ $(,)?)
+    ) => {
+        vk_cmd_float_bridge!($impl_fn($sym; $($arg : $ty),+));
+        #[cfg(target_arch = "aarch64")]
+        pub(crate) use $impl_fn::bridge as $export_name;
+        #[cfg(not(target_arch = "aarch64"))]
+        pub(crate) use $impl_fn as $export_name;
     };
-    if let Some(ptr) = vk.any_device_or_instance_or_dlsym_ptr(c"vkCmdSetLineWidth") {
-        let f: unsafe extern "C" fn(usize, f32) = std::mem::transmute(ptr);
-        f(cmd_buf, line_width);
-    }
+    (
+        $impl_fn:ident($sym:literal; $($arg:ident : $ty:ty),+ $(,)?)
+    ) => {
+        pub(crate) unsafe extern "win64" fn $impl_fn(cmd_buf: usize, $($arg: $ty),+) {
+            if cmd_buf == 0 {
+                return;
+            }
+            let Some(vk) = vulkan_backend() else {
+                return;
+            };
+            if let Some(ptr) = vk.any_device_or_instance_or_dlsym_ptr($sym) {
+                let f: unsafe extern "C" fn(usize, $($ty),+) = std::mem::transmute(ptr);
+                f(cmd_buf, $($arg),+);
+            }
+        }
+        crate::win64_bridge!(fn $impl_fn(usize, $($ty),+) -> ());
+    };
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-pub unsafe extern "win64" fn vkCmdSetLineWidth(cmd_buf: usize, line_width: f32) {
-    cmd_set_line_width_impl(cmd_buf, line_width);
-}
-
-#[cfg(target_arch = "aarch64")]
-pub unsafe extern "win64" fn vkCmdSetLineWidth(cmd_buf: usize, _xmm0: f32, line_width: f32) {
-    cmd_set_line_width_impl(cmd_buf, line_width);
-}
-
-unsafe fn cmd_set_depth_bias_impl(
-    cmd_buf: usize,
+// @exports vkCmdSetLineWidth vkCmdSetDepthBias vkCmdSetDepthBounds
+vk_cmd_float_bridge!(export vkCmdSetLineWidth => cmd_set_line_width_impl(
+    c"vkCmdSetLineWidth";
+    line_width: f32,
+));
+vk_cmd_float_bridge!(export vkCmdSetDepthBias => cmd_set_depth_bias_impl(
+    c"vkCmdSetDepthBias";
     depth_bias_constant_factor: f32,
     depth_bias_clamp: f32,
     depth_bias_slope_factor: f32,
-) {
-    if cmd_buf == 0 {
-        return;
-    }
-    let Some(vk) = vulkan_backend() else {
-        return;
-    };
-    if let Some(ptr) = vk.any_device_or_instance_or_dlsym_ptr(c"vkCmdSetDepthBias") {
-        let f: unsafe extern "C" fn(usize, f32, f32, f32) = std::mem::transmute(ptr);
-        f(
-            cmd_buf,
-            depth_bias_constant_factor,
-            depth_bias_clamp,
-            depth_bias_slope_factor,
-        );
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-pub unsafe extern "win64" fn vkCmdSetDepthBias(
-    cmd_buf: usize,
-    depth_bias_constant_factor: f32,
-    depth_bias_clamp: f32,
-    depth_bias_slope_factor: f32,
-) {
-    cmd_set_depth_bias_impl(
-        cmd_buf,
-        depth_bias_constant_factor,
-        depth_bias_clamp,
-        depth_bias_slope_factor,
-    );
-}
-
-#[cfg(target_arch = "aarch64")]
-pub unsafe extern "win64" fn vkCmdSetDepthBias(
-    cmd_buf: usize,
-    _xmm0: f32,
-    depth_bias_constant_factor: f32,
-    depth_bias_clamp: f32,
-    depth_bias_slope_factor: f32,
-) {
-    cmd_set_depth_bias_impl(
-        cmd_buf,
-        depth_bias_constant_factor,
-        depth_bias_clamp,
-        depth_bias_slope_factor,
-    );
-}
-
-unsafe fn cmd_set_depth_bounds_impl(
-    cmd_buf: usize,
+));
+vk_cmd_float_bridge!(export vkCmdSetDepthBounds => cmd_set_depth_bounds_impl(
+    c"vkCmdSetDepthBounds";
     min_depth_bounds: f32,
     max_depth_bounds: f32,
-) {
-    if cmd_buf == 0 {
-        return;
-    }
-    let Some(vk) = vulkan_backend() else {
-        return;
-    };
-    if let Some(ptr) = vk.any_device_or_instance_or_dlsym_ptr(c"vkCmdSetDepthBounds") {
-        let f: unsafe extern "C" fn(usize, f32, f32) = std::mem::transmute(ptr);
-        f(cmd_buf, min_depth_bounds, max_depth_bounds);
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-pub unsafe extern "win64" fn vkCmdSetDepthBounds(
-    cmd_buf: usize,
-    min_depth_bounds: f32,
-    max_depth_bounds: f32,
-) {
-    cmd_set_depth_bounds_impl(cmd_buf, min_depth_bounds, max_depth_bounds);
-}
-
-#[cfg(target_arch = "aarch64")]
-pub unsafe extern "win64" fn vkCmdSetDepthBounds(
-    cmd_buf: usize,
-    _xmm0: f32,
-    min_depth_bounds: f32,
-    max_depth_bounds: f32,
-) {
-    cmd_set_depth_bounds_impl(cmd_buf, min_depth_bounds, max_depth_bounds);
-}
-
-unsafe fn cmd_set_extra_primitive_overestimation_size_ext_impl(cmd_buf: usize, size: f32) {
-    if cmd_buf == 0 {
-        return;
-    }
-    let Some(vk) = vulkan_backend() else {
-        return;
-    };
-    if let Some(ptr) =
-        vk.any_device_or_instance_or_dlsym_ptr(c"vkCmdSetExtraPrimitiveOverestimationSizeEXT")
-    {
-        let f: unsafe extern "C" fn(usize, f32) = std::mem::transmute(ptr);
-        f(cmd_buf, size);
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-unsafe extern "win64" fn tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT(
-    cmd_buf: usize,
+));
+vk_cmd_float_bridge!(cmd_set_extra_primitive_overestimation_size_ext_impl(
+    c"vkCmdSetExtraPrimitiveOverestimationSizeEXT";
     size: f32,
-) {
-    cmd_set_extra_primitive_overestimation_size_ext_impl(cmd_buf, size);
-}
-
+));
 #[cfg(target_arch = "aarch64")]
-unsafe extern "win64" fn tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT(
-    cmd_buf: usize,
-    _xmm0: f32,
-    size: f32,
-) {
-    cmd_set_extra_primitive_overestimation_size_ext_impl(cmd_buf, size);
-}
+use cmd_set_extra_primitive_overestimation_size_ext_impl::bridge as tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT;
+#[cfg(not(target_arch = "aarch64"))]
+use cmd_set_extra_primitive_overestimation_size_ext_impl as tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT;
 
 // ---------------------------------------------------------------------------
 // Dynamic proc-addr interceptors (surface sync + VkAllocationCallbacks safety)
@@ -3573,177 +3482,128 @@ unsafe extern "win64" fn tramp_vkCreateDeferredOperationKHR(
     res
 }
 
-macro_rules! vk_device_create_tramps {
-    ($($tramp:ident => $sym:literal),* $(,)?) => {
+macro_rules! define_device_proc_interceptors {
+    (
+        direct { $($dir_name:literal => $dir_fn:ident),* $(,)? }
+        create { $($c_tramp:ident => $c_name:literal),* $(,)? }
+        destroy { $($d_tramp:ident => $d_name:literal),* $(,)? }
+    ) => {
         $(
             #[allow(non_snake_case)]
-            unsafe extern "win64" fn $tramp(
+            unsafe extern "win64" fn $c_tramp(
                 device: usize,
                 create_info: *const c_void,
                 allocator: *const c_void,
                 out_handle: *mut u64,
             ) -> i32 {
-                forward_device_create_u64($sym, device, create_info, allocator, out_handle)
+                const SYM: &CStr = match CStr::from_bytes_with_nul(concat!($c_name, "\0").as_bytes()) {
+                    Ok(s) => s,
+                    Err(_) => unreachable!(),
+                };
+                forward_device_create_u64(SYM, device, create_info, allocator, out_handle)
             }
         )*
-    };
-}
 
-macro_rules! vk_device_destroy_tramps {
-    ($($tramp:ident => $sym:literal),* $(,)?) => {
         $(
             #[allow(non_snake_case)]
-            unsafe extern "win64" fn $tramp(
+            unsafe extern "win64" fn $d_tramp(
                 device: usize,
                 handle: u64,
                 allocator: *const c_void,
             ) {
-                forward_device_destroy_u64($sym, device, handle, allocator);
+                const SYM: &CStr = match CStr::from_bytes_with_nul(concat!($d_name, "\0").as_bytes()) {
+                    Ok(s) => s,
+                    Err(_) => unreachable!(),
+                };
+                forward_device_destroy_u64(SYM, device, handle, allocator);
             }
         )*
+
+        /// Returns our ABI-bridged / allocator-sanitizing / surface-syncing wrapper for a device-level
+        /// Vulkan entrypoint (called ONLY after confirming MoltenVK exposes the symbol for the device or
+        /// instance).
+        fn intercepted_device_proc(name: &str) -> Option<*const ()> {
+            match name {
+                $($dir_name => Some($dir_fn as *const ()),)*
+                $($c_name => Some($c_tramp as *const ()),)*
+                $($d_name => Some($d_tramp as *const ()),)*
+                _ => None,
+            }
+        }
     };
 }
 
-vk_device_create_tramps! {
-    tramp_vkAllocateMemory => c"vkAllocateMemory",
-    tramp_vkCreateEvent => c"vkCreateEvent",
-    tramp_vkCreateQueryPool => c"vkCreateQueryPool",
-    tramp_vkCreateBuffer => c"vkCreateBuffer",
-    tramp_vkCreateBufferView => c"vkCreateBufferView",
-    tramp_vkCreateImage => c"vkCreateImage",
-    tramp_vkCreateImageView => c"vkCreateImageView",
-    tramp_vkCreatePipelineCache => c"vkCreatePipelineCache",
-    tramp_vkCreatePipelineLayout => c"vkCreatePipelineLayout",
-    tramp_vkCreateSampler => c"vkCreateSampler",
-    tramp_vkCreateDescriptorSetLayout => c"vkCreateDescriptorSetLayout",
-    tramp_vkCreateDescriptorPool => c"vkCreateDescriptorPool",
-    tramp_vkCreateFramebuffer => c"vkCreateFramebuffer",
-    tramp_vkCreateRenderPass => c"vkCreateRenderPass",
-    tramp_vkCreateRenderPass2 => c"vkCreateRenderPass2",
-    tramp_vkCreateRenderPass2KHR => c"vkCreateRenderPass2KHR",
-    tramp_vkCreateSamplerYcbcrConversion => c"vkCreateSamplerYcbcrConversion",
-    tramp_vkCreateSamplerYcbcrConversionKHR => c"vkCreateSamplerYcbcrConversionKHR",
-    tramp_vkCreateDescriptorUpdateTemplate => c"vkCreateDescriptorUpdateTemplate",
-    tramp_vkCreateDescriptorUpdateTemplateKHR => c"vkCreateDescriptorUpdateTemplateKHR",
-    tramp_vkCreatePrivateDataSlot => c"vkCreatePrivateDataSlot",
-    tramp_vkCreatePrivateDataSlotEXT => c"vkCreatePrivateDataSlotEXT",
-}
-
-vk_device_destroy_tramps! {
-    tramp_vkFreeMemory => c"vkFreeMemory",
-    tramp_vkDestroyEvent => c"vkDestroyEvent",
-    tramp_vkDestroyQueryPool => c"vkDestroyQueryPool",
-    tramp_vkDestroyBuffer => c"vkDestroyBuffer",
-    tramp_vkDestroyBufferView => c"vkDestroyBufferView",
-    tramp_vkDestroyImage => c"vkDestroyImage",
-    tramp_vkDestroyPipelineCache => c"vkDestroyPipelineCache",
-    tramp_vkDestroyPipeline => c"vkDestroyPipeline",
-    tramp_vkDestroyPipelineLayout => c"vkDestroyPipelineLayout",
-    tramp_vkDestroySampler => c"vkDestroySampler",
-    tramp_vkDestroyDescriptorSetLayout => c"vkDestroyDescriptorSetLayout",
-    tramp_vkDestroyDescriptorPool => c"vkDestroyDescriptorPool",
-    tramp_vkDestroyFramebuffer => c"vkDestroyFramebuffer",
-    tramp_vkDestroyRenderPass => c"vkDestroyRenderPass",
-    tramp_vkDestroySamplerYcbcrConversion => c"vkDestroySamplerYcbcrConversion",
-    tramp_vkDestroySamplerYcbcrConversionKHR => c"vkDestroySamplerYcbcrConversionKHR",
-    tramp_vkDestroyDescriptorUpdateTemplate => c"vkDestroyDescriptorUpdateTemplate",
-    tramp_vkDestroyDescriptorUpdateTemplateKHR => c"vkDestroyDescriptorUpdateTemplateKHR",
-    tramp_vkDestroyPrivateDataSlot => c"vkDestroyPrivateDataSlot",
-    tramp_vkDestroyPrivateDataSlotEXT => c"vkDestroyPrivateDataSlotEXT",
-    tramp_vkDestroyDeferredOperationKHR => c"vkDestroyDeferredOperationKHR",
-}
-
-/// Returns our ABI-bridged / allocator-sanitizing / surface-syncing wrapper for a device-level
-/// Vulkan entrypoint (called ONLY after confirming MoltenVK exposes the symbol for the device or
-/// instance).
-fn intercepted_device_proc(name: &str) -> Option<*const ()> {
-    match name {
+define_device_proc_interceptors! {
+    direct {
         // Float-argument Win64 -> AAPCS64 ABI adapters
-        "vkCmdSetLineWidth" => Some(vkCmdSetLineWidth as *const ()),
-        "vkCmdSetDepthBias" => Some(vkCmdSetDepthBias as *const ()),
-        "vkCmdSetDepthBounds" => Some(vkCmdSetDepthBounds as *const ()),
-        "vkCmdSetExtraPrimitiveOverestimationSizeEXT" => {
-            Some(tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT as *const ())
-        }
-
+        "vkCmdSetLineWidth" => vkCmdSetLineWidth,
+        "vkCmdSetDepthBias" => vkCmdSetDepthBias,
+        "vkCmdSetDepthBounds" => vkCmdSetDepthBounds,
+        "vkCmdSetExtraPrimitiveOverestimationSizeEXT" => tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
         // Surface-syncing + allocator-sanitizing swapchain procs
-        "vkCreateSwapchainKHR" => Some(vkCreateSwapchainKHR as *const ()),
-        "vkDestroySwapchainKHR" => Some(vkDestroySwapchainKHR as *const ()),
-
+        "vkCreateSwapchainKHR" => vkCreateSwapchainKHR,
+        "vkDestroySwapchainKHR" => vkDestroySwapchainKHR,
         // Already-exported allocator-sanitizing device procs
-        "vkCreateShaderModule" => Some(vkCreateShaderModule as *const ()),
-        "vkDestroyShaderModule" => Some(vkDestroyShaderModule as *const ()),
-        "vkCreateCommandPool" => Some(vkCreateCommandPool as *const ()),
-        "vkDestroyCommandPool" => Some(vkDestroyCommandPool as *const ()),
-        "vkCreateSemaphore" => Some(vkCreateSemaphore as *const ()),
-        "vkDestroySemaphore" => Some(vkDestroySemaphore as *const ()),
-        "vkCreateFence" => Some(vkCreateFence as *const ()),
-        "vkDestroyFence" => Some(vkDestroyFence as *const ()),
-        "vkDestroyImageView" => Some(vkDestroyImageView as *const ()),
-
-        // Dynamic allocator-sanitizing device create/destroy procs
-        "vkAllocateMemory" => Some(tramp_vkAllocateMemory as *const ()),
-        "vkFreeMemory" => Some(tramp_vkFreeMemory as *const ()),
-        "vkCreateEvent" => Some(tramp_vkCreateEvent as *const ()),
-        "vkDestroyEvent" => Some(tramp_vkDestroyEvent as *const ()),
-        "vkCreateQueryPool" => Some(tramp_vkCreateQueryPool as *const ()),
-        "vkDestroyQueryPool" => Some(tramp_vkDestroyQueryPool as *const ()),
-        "vkCreateBuffer" => Some(tramp_vkCreateBuffer as *const ()),
-        "vkDestroyBuffer" => Some(tramp_vkDestroyBuffer as *const ()),
-        "vkCreateBufferView" => Some(tramp_vkCreateBufferView as *const ()),
-        "vkDestroyBufferView" => Some(tramp_vkDestroyBufferView as *const ()),
-        "vkCreateImage" => Some(tramp_vkCreateImage as *const ()),
-        "vkDestroyImage" => Some(tramp_vkDestroyImage as *const ()),
-        "vkCreateImageView" => Some(tramp_vkCreateImageView as *const ()),
-        "vkCreatePipelineCache" => Some(tramp_vkCreatePipelineCache as *const ()),
-        "vkDestroyPipelineCache" => Some(tramp_vkDestroyPipelineCache as *const ()),
-        "vkCreateGraphicsPipelines" => Some(tramp_vkCreateGraphicsPipelines as *const ()),
-        "vkCreateComputePipelines" => Some(tramp_vkCreateComputePipelines as *const ()),
-        "vkDestroyPipeline" => Some(tramp_vkDestroyPipeline as *const ()),
-        "vkCreatePipelineLayout" => Some(tramp_vkCreatePipelineLayout as *const ()),
-        "vkDestroyPipelineLayout" => Some(tramp_vkDestroyPipelineLayout as *const ()),
-        "vkCreateSampler" => Some(tramp_vkCreateSampler as *const ()),
-        "vkDestroySampler" => Some(tramp_vkDestroySampler as *const ()),
-        "vkCreateDescriptorSetLayout" => Some(tramp_vkCreateDescriptorSetLayout as *const ()),
-        "vkDestroyDescriptorSetLayout" => Some(tramp_vkDestroyDescriptorSetLayout as *const ()),
-        "vkCreateDescriptorPool" => Some(tramp_vkCreateDescriptorPool as *const ()),
-        "vkDestroyDescriptorPool" => Some(tramp_vkDestroyDescriptorPool as *const ()),
-        "vkCreateFramebuffer" => Some(tramp_vkCreateFramebuffer as *const ()),
-        "vkDestroyFramebuffer" => Some(tramp_vkDestroyFramebuffer as *const ()),
-        "vkCreateRenderPass" => Some(tramp_vkCreateRenderPass as *const ()),
-        "vkDestroyRenderPass" => Some(tramp_vkDestroyRenderPass as *const ()),
-        "vkCreateRenderPass2" => Some(tramp_vkCreateRenderPass2 as *const ()),
-        "vkCreateRenderPass2KHR" => Some(tramp_vkCreateRenderPass2KHR as *const ()),
-        "vkCreateSamplerYcbcrConversion" => Some(tramp_vkCreateSamplerYcbcrConversion as *const ()),
-        "vkCreateSamplerYcbcrConversionKHR" => {
-            Some(tramp_vkCreateSamplerYcbcrConversionKHR as *const ())
-        }
-        "vkDestroySamplerYcbcrConversion" => {
-            Some(tramp_vkDestroySamplerYcbcrConversion as *const ())
-        }
-        "vkDestroySamplerYcbcrConversionKHR" => {
-            Some(tramp_vkDestroySamplerYcbcrConversionKHR as *const ())
-        }
-        "vkCreateDescriptorUpdateTemplate" => {
-            Some(tramp_vkCreateDescriptorUpdateTemplate as *const ())
-        }
-        "vkCreateDescriptorUpdateTemplateKHR" => {
-            Some(tramp_vkCreateDescriptorUpdateTemplateKHR as *const ())
-        }
-        "vkDestroyDescriptorUpdateTemplate" => {
-            Some(tramp_vkDestroyDescriptorUpdateTemplate as *const ())
-        }
-        "vkDestroyDescriptorUpdateTemplateKHR" => {
-            Some(tramp_vkDestroyDescriptorUpdateTemplateKHR as *const ())
-        }
-        "vkCreatePrivateDataSlot" => Some(tramp_vkCreatePrivateDataSlot as *const ()),
-        "vkCreatePrivateDataSlotEXT" => Some(tramp_vkCreatePrivateDataSlotEXT as *const ()),
-        "vkDestroyPrivateDataSlot" => Some(tramp_vkDestroyPrivateDataSlot as *const ()),
-        "vkDestroyPrivateDataSlotEXT" => Some(tramp_vkDestroyPrivateDataSlotEXT as *const ()),
-        "vkCreateDeferredOperationKHR" => Some(tramp_vkCreateDeferredOperationKHR as *const ()),
-        "vkDestroyDeferredOperationKHR" => Some(tramp_vkDestroyDeferredOperationKHR as *const ()),
-
-        _ => None,
+        "vkCreateShaderModule" => vkCreateShaderModule,
+        "vkDestroyShaderModule" => vkDestroyShaderModule,
+        "vkCreateCommandPool" => vkCreateCommandPool,
+        "vkDestroyCommandPool" => vkDestroyCommandPool,
+        "vkCreateSemaphore" => vkCreateSemaphore,
+        "vkDestroySemaphore" => vkDestroySemaphore,
+        "vkCreateFence" => vkCreateFence,
+        "vkDestroyFence" => vkDestroyFence,
+        "vkDestroyImageView" => vkDestroyImageView,
+        // Multi-handle / custom-signature allocator-sanitizing device procs
+        "vkCreateGraphicsPipelines" => tramp_vkCreateGraphicsPipelines,
+        "vkCreateComputePipelines" => tramp_vkCreateComputePipelines,
+        "vkCreateDeferredOperationKHR" => tramp_vkCreateDeferredOperationKHR,
+    }
+    create {
+        tramp_vkAllocateMemory => "vkAllocateMemory",
+        tramp_vkCreateEvent => "vkCreateEvent",
+        tramp_vkCreateQueryPool => "vkCreateQueryPool",
+        tramp_vkCreateBuffer => "vkCreateBuffer",
+        tramp_vkCreateBufferView => "vkCreateBufferView",
+        tramp_vkCreateImage => "vkCreateImage",
+        tramp_vkCreateImageView => "vkCreateImageView",
+        tramp_vkCreatePipelineCache => "vkCreatePipelineCache",
+        tramp_vkCreatePipelineLayout => "vkCreatePipelineLayout",
+        tramp_vkCreateSampler => "vkCreateSampler",
+        tramp_vkCreateDescriptorSetLayout => "vkCreateDescriptorSetLayout",
+        tramp_vkCreateDescriptorPool => "vkCreateDescriptorPool",
+        tramp_vkCreateFramebuffer => "vkCreateFramebuffer",
+        tramp_vkCreateRenderPass => "vkCreateRenderPass",
+        tramp_vkCreateRenderPass2 => "vkCreateRenderPass2",
+        tramp_vkCreateRenderPass2KHR => "vkCreateRenderPass2KHR",
+        tramp_vkCreateSamplerYcbcrConversion => "vkCreateSamplerYcbcrConversion",
+        tramp_vkCreateSamplerYcbcrConversionKHR => "vkCreateSamplerYcbcrConversionKHR",
+        tramp_vkCreateDescriptorUpdateTemplate => "vkCreateDescriptorUpdateTemplate",
+        tramp_vkCreateDescriptorUpdateTemplateKHR => "vkCreateDescriptorUpdateTemplateKHR",
+        tramp_vkCreatePrivateDataSlot => "vkCreatePrivateDataSlot",
+        tramp_vkCreatePrivateDataSlotEXT => "vkCreatePrivateDataSlotEXT",
+    }
+    destroy {
+        tramp_vkFreeMemory => "vkFreeMemory",
+        tramp_vkDestroyEvent => "vkDestroyEvent",
+        tramp_vkDestroyQueryPool => "vkDestroyQueryPool",
+        tramp_vkDestroyBuffer => "vkDestroyBuffer",
+        tramp_vkDestroyBufferView => "vkDestroyBufferView",
+        tramp_vkDestroyImage => "vkDestroyImage",
+        tramp_vkDestroyPipelineCache => "vkDestroyPipelineCache",
+        tramp_vkDestroyPipeline => "vkDestroyPipeline",
+        tramp_vkDestroyPipelineLayout => "vkDestroyPipelineLayout",
+        tramp_vkDestroySampler => "vkDestroySampler",
+        tramp_vkDestroyDescriptorSetLayout => "vkDestroyDescriptorSetLayout",
+        tramp_vkDestroyDescriptorPool => "vkDestroyDescriptorPool",
+        tramp_vkDestroyFramebuffer => "vkDestroyFramebuffer",
+        tramp_vkDestroyRenderPass => "vkDestroyRenderPass",
+        tramp_vkDestroySamplerYcbcrConversion => "vkDestroySamplerYcbcrConversion",
+        tramp_vkDestroySamplerYcbcrConversionKHR => "vkDestroySamplerYcbcrConversionKHR",
+        tramp_vkDestroyDescriptorUpdateTemplate => "vkDestroyDescriptorUpdateTemplate",
+        tramp_vkDestroyDescriptorUpdateTemplateKHR => "vkDestroyDescriptorUpdateTemplateKHR",
+        tramp_vkDestroyPrivateDataSlot => "vkDestroyPrivateDataSlot",
+        tramp_vkDestroyPrivateDataSlotEXT => "vkDestroyPrivateDataSlotEXT",
+        tramp_vkDestroyDeferredOperationKHR => "vkDestroyDeferredOperationKHR",
     }
 }
 
@@ -3767,16 +3627,6 @@ fn intercepted_instance_or_device_proc(name: &str) -> Option<*const ()> {
 // Honest NVLL_VK_NO_IMPLEMENTATION (-3) on non-NVIDIA Apple Silicon GPUs.
 // ---------------------------------------------------------------------------
 
-pub unsafe extern "win64" fn NvLL_VK_Initialize() -> i32 {
-    crate::stub!("NvLL_VK_Initialize -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_Unload() -> i32 {
-    crate::stub!("NvLL_VK_Unload -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
 pub unsafe extern "win64" fn NvLL_VK_InitLowLatencyDevice(
     _vk_device: usize,
     signal_sem: *mut u64,
@@ -3788,53 +3638,17 @@ pub unsafe extern "win64" fn NvLL_VK_InitLowLatencyDevice(
     NVLL_VK_NO_IMPLEMENTATION
 }
 
-pub unsafe extern "win64" fn NvLL_VK_DestroyLowLatencyDevice(_vk_device: usize) -> i32 {
-    crate::stub!("NvLL_VK_DestroyLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_SetSleepMode(
-    _vk_device: usize,
-    _sleep_mode_params: *const c_void,
-) -> i32 {
-    crate::stub!("NvLL_VK_SetSleepMode -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_Sleep(_vk_device: usize, _signal_val: u64) -> i32 {
-    crate::stub!("NvLL_VK_Sleep -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_GetSleepStatus(
-    _vk_device: usize,
-    _status: *mut c_void,
-) -> i32 {
-    crate::stub!("NvLL_VK_GetSleepStatus -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_SetLatencyMarker(
-    _vk_device: usize,
-    _marker: *const c_void,
-) -> i32 {
-    crate::stub!("NvLL_VK_SetLatencyMarker -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_GetLatency(_vk_device: usize, _timings: *mut c_void) -> i32 {
-    crate::stub!("NvLL_VK_GetLatency -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
-
-pub unsafe extern "win64" fn NvLL_VK_NotifyOutOfBandQueue(
-    _vk_device: usize,
-    _queue: usize,
-    _queue_type: u32,
-) -> i32 {
-    crate::stub!("NvLL_VK_NotifyOutOfBandQueue -> NVLL_VK_NO_IMPLEMENTATION (-3)");
-    NVLL_VK_NO_IMPLEMENTATION
-}
+crate::failing!(i32 = NVLL_VK_NO_IMPLEMENTATION, err 0;
+    NvLL_VK_Initialize,
+    NvLL_VK_Unload,
+    NvLL_VK_DestroyLowLatencyDevice,
+    NvLL_VK_SetSleepMode,
+    NvLL_VK_Sleep,
+    NvLL_VK_GetSleepStatus,
+    NvLL_VK_SetLatencyMarker,
+    NvLL_VK_GetLatency,
+    NvLL_VK_NotifyOutOfBandQueue,
+);
 
 #[cfg(test)]
 mod tests {
@@ -5022,10 +4836,13 @@ mod tests {
         unsafe {
             #[cfg(target_arch = "aarch64")]
             {
-                vkCmdSetLineWidth(0, f32::NAN, 1.0);
-                vkCmdSetDepthBias(0, f32::NAN, 0.0, 0.0, 0.0);
-                vkCmdSetDepthBounds(0, f32::NAN, 0.0, 1.0);
-                tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT(0, f32::NAN, 0.0);
+                let f1 = f64::from_bits(1.0f32.to_bits() as u64);
+                vkCmdSetLineWidth(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, f64::NAN, f1, 0.0, 0.0);
+                vkCmdSetDepthBias(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, f64::NAN, 0.0, 0.0, 0.0);
+                vkCmdSetDepthBounds(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, f64::NAN, 0.0, f1, 0.0);
+                tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT(
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, f64::NAN, 0.0, 0.0, 0.0,
+                );
             }
             #[cfg(not(target_arch = "aarch64"))]
             {

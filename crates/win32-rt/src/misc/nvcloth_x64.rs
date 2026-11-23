@@ -3658,6 +3658,325 @@ unsafe extern "win64" fn factory_extract_rest_positions(
 }
 
 // ---------------------------------------------------------------------------
+// Declarative helpers for null-checked vtable getters/setters
+// ---------------------------------------------------------------------------
+
+/// Null-checked getter on any NvCloth C++ object (`SwFabric`, `SwSolver`, `SwCloth`).
+macro_rules! nvcloth_getters {
+    ($obj_ty:ty; $(
+        $name:ident -> $ret:ty = $default:expr; |$obj:ident| $body:expr
+    ),* $(,)?) => {
+        $(
+            unsafe extern "win64" fn $name(this: *const $obj_ty) -> $ret {
+                if this.is_null() {
+                    $default
+                } else {
+                    let $obj = unsafe { &*this };
+                    $body
+                }
+            }
+        )*
+    };
+}
+
+/// Null-checked scalar getter/setter pair on `NvClothSolver` (with `win64_bridge!` for `f32`).
+macro_rules! solver_prop {
+    (f32 $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvClothSolver, val: f32) {
+            if !this.is_null() {
+                unsafe { (*this).$field = val };
+            }
+        }
+        crate::win64_bridge!(fn $setter(*mut NvClothSolver, f32) -> ());
+
+        unsafe extern "win64" fn $getter(this: *const NvClothSolver) -> f32 {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+    ($ty:ty; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvClothSolver, val: $ty) {
+            if !this.is_null() {
+                unsafe { (*this).$field = val };
+            }
+        }
+
+        unsafe extern "win64" fn $getter(this: *const NvClothSolver) -> $ty {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+}
+
+/// Null-checked sret `[f32; 3]` getter/setter pair on `NvCloth` (wakes cloth on change).
+macro_rules! cloth_vec3_prop {
+    ($($setter:ident / $getter:ident => $field:ident, default $default:expr),* $(,)?) => {
+        $(
+            unsafe extern "win64" fn $setter(this: *mut NvCloth, v: *const [f32; 3]) {
+                if !this.is_null() && !v.is_null() {
+                    let val = unsafe { v.read_unaligned() };
+                    let cloth = unsafe { &mut *this };
+                    if val != cloth.$field {
+                        cloth.$field = val;
+                        cloth.wake_up();
+                    }
+                }
+            }
+
+            unsafe extern "win64" fn $getter(
+                this: *const NvCloth,
+                sret_out: *mut [f32; 3],
+            ) -> *mut [f32; 3] {
+                if !sret_out.is_null() {
+                    let v = if this.is_null() {
+                        $default
+                    } else {
+                        unsafe { (*this).$field }
+                    };
+                    unsafe { sret_out.write_unaligned(v) };
+                }
+                sret_out
+            }
+        )*
+    };
+}
+
+/// Null-checked sret `[f32; 3]` log2(1 - d) getter/setter pair on `NvCloth` (wakes on change).
+macro_rules! cloth_log_drag_prop {
+    ($($setter:ident / $getter:ident => $field:ident),* $(,)?) => {
+        $(
+            unsafe extern "win64" fn $setter(this: *mut NvCloth, v: *const [f32; 3]) {
+                if !this.is_null() && !v.is_null() {
+                    let d = unsafe { v.read_unaligned() };
+                    let val = safe_log2_v3(v3_sub([1.0; 3], d));
+                    let cloth = unsafe { &mut *this };
+                    if val != cloth.$field {
+                        cloth.$field = val;
+                        cloth.wake_up();
+                    }
+                }
+            }
+
+            unsafe extern "win64" fn $getter(
+                this: *const NvCloth,
+                sret_out: *mut [f32; 3],
+            ) -> *mut [f32; 3] {
+                if !sret_out.is_null() {
+                    let v = if this.is_null() {
+                        [0.0; 3]
+                    } else {
+                        v3_sub([1.0; 3], safe_exp2_v3(unsafe { (*this).$field }))
+                    };
+                    unsafe { sret_out.write_unaligned(v) };
+                }
+                sret_out
+            }
+        )*
+    };
+}
+
+/// Null-checked `f32` getter/setter pair on `NvCloth` with `win64_bridge!` on the setter.
+macro_rules! cloth_f32_prop {
+    (wake; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvCloth, val: f32) {
+            if !this.is_null() {
+                let cloth = unsafe { &mut *this };
+                if val != cloth.$field {
+                    cloth.$field = val;
+                    cloth.wake_up();
+                }
+            }
+        }
+        crate::win64_bridge!(fn $setter(*mut NvCloth, f32) -> ());
+
+        unsafe extern "win64" fn $getter(this: *const NvCloth) -> f32 {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+    (plain; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvCloth, val: f32) {
+            if !this.is_null() {
+                unsafe { (*this).$field = val };
+            }
+        }
+        crate::win64_bridge!(fn $setter(*mut NvCloth, f32) -> ());
+
+        unsafe extern "win64" fn $getter(this: *const NvCloth) -> f32 {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+    (log; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvCloth, coeff: f32) {
+            if !this.is_null() {
+                let val = safe_log2(1.0 - coeff);
+                let cloth = unsafe { &mut *this };
+                if val != cloth.$field {
+                    cloth.$field = val;
+                    cloth.wake_up();
+                }
+            }
+        }
+        crate::win64_bridge!(fn $setter(*mut NvCloth, f32) -> ());
+
+        unsafe extern "win64" fn $getter(this: *const NvCloth) -> f32 {
+            if this.is_null() {
+                $default
+            } else {
+                1.0 - safe_exp2(unsafe { (*this).$field })
+            }
+        }
+    };
+}
+
+/// Null-checked non-float scalar getter/setter pair on `NvCloth`.
+macro_rules! cloth_scalar_prop {
+    (wake; $ty:ty; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvCloth, val: $ty) {
+            if !this.is_null() {
+                let cloth = unsafe { &mut *this };
+                if val != cloth.$field {
+                    cloth.$field = val;
+                    cloth.wake_up();
+                }
+            }
+        }
+
+        unsafe extern "win64" fn $getter(this: *const NvCloth) -> $ty {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+    (plain; $ty:ty; $setter:ident / $getter:ident => $field:ident, default $default:expr) => {
+        unsafe extern "win64" fn $setter(this: *mut NvCloth, val: $ty) {
+            if !this.is_null() {
+                unsafe { (*this).$field = val };
+            }
+        }
+
+        unsafe extern "win64" fn $getter(this: *const NvCloth) -> $ty {
+            if this.is_null() {
+                $default
+            } else {
+                unsafe { (*this).$field }
+            }
+        }
+    };
+}
+
+/// Null-checked `*const [f32; 3]` reference-returning getter on `NvCloth`.
+macro_rules! cloth_vec3_ref_getters {
+    ($($name:ident => $($field:ident).+),* $(,)?) => {
+        $(
+            unsafe extern "win64" fn $name(this: *const NvCloth) -> *const [f32; 3] {
+                if this.is_null() {
+                    static ZERO: [f32; 3] = [0.0, 0.0, 0.0];
+                    &ZERO
+                } else {
+                    unsafe { &(*this).$($field).+ }
+                }
+            }
+        )*
+    };
+}
+
+/// Null-checked `MappedRangePxVec4` particle-buffer sret getter on `NvCloth`.
+macro_rules! cloth_particle_range_getters {
+    ($($name:ident => $field:ident),* $(,)?) => {
+        $(
+            unsafe extern "win64" fn $name(
+                this: *mut NvCloth,
+                sret_out: *mut MappedRangePxVec4,
+            ) -> *mut MappedRangePxVec4 {
+                if !sret_out.is_null() {
+                    let (begin, end) = if this.is_null() {
+                        (std::ptr::null_mut(), std::ptr::null_mut())
+                    } else {
+                        let cloth = unsafe { &mut *this };
+                        if cloth.$field.is_empty() {
+                            (std::ptr::null_mut(), std::ptr::null_mut())
+                        } else {
+                            let ptr = cloth.$field.as_mut_ptr();
+                            let end_ptr = unsafe { ptr.add(cloth.$field.len()) };
+                            (ptr, end_ptr)
+                        }
+                    };
+                    unsafe {
+                        sret_out.write_unaligned(MappedRangePxVec4 {
+                            begin,
+                            end,
+                            cloth: this,
+                            lock_fn: cloth_lock_particles as *const () as usize,
+                            lock_adj: 0,
+                            lock_pad: 0,
+                            unlock_fn: cloth_unlock_particles as *const () as usize,
+                            unlock_adj: 0,
+                            unlock_pad: 0,
+                        });
+                    }
+                }
+                sret_out
+            }
+        )*
+    };
+}
+
+/// Null-checked `ConstraintsPair` get/clear/count triplet on `NvCloth`.
+macro_rules! cloth_constraint_pair_methods {
+    ($get:ident / $clear:ident / $num:ident => $field:ident) => {
+        unsafe extern "win64" fn $get(
+            this: *mut NvCloth,
+            sret_out: *mut PxRange<[f32; 4]>,
+        ) -> *mut PxRange<[f32; 4]> {
+            if !sret_out.is_null() {
+                let (begin, end) = if this.is_null() {
+                    (std::ptr::null_mut(), std::ptr::null_mut())
+                } else {
+                    let cloth = unsafe { &mut *this };
+                    cloth.wake_up();
+                    let n = cloth.current_particles.len();
+                    cloth.$field.push(n)
+                };
+                unsafe { sret_out.write_unaligned(PxRange { begin, end }) };
+            }
+            sret_out
+        }
+
+        unsafe extern "win64" fn $clear(this: *mut NvCloth) {
+            if !this.is_null() {
+                let cloth = unsafe { &mut *this };
+                cloth.$field.clear();
+                cloth.wake_up();
+            }
+        }
+
+        unsafe extern "win64" fn $num(this: *const NvCloth) -> u32 {
+            if this.is_null() {
+                0
+            } else {
+                unsafe { (*this).$field.start.len() as u32 }
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // SwFabric Vtable Implementations (Slots 0..11)
 // ---------------------------------------------------------------------------
 
@@ -3668,76 +3987,17 @@ unsafe extern "win64" fn fabric_dtor(this: *mut NvClothFabric, flags: u32) -> *m
     this
 }
 
-unsafe extern "win64" fn fabric_get_factory(this: *const NvClothFabric) -> *mut NvClothFactory {
-    if this.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*this).factory }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_phases(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).phases.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_restvalues(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).restvalues.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_stiffness_values(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).stiffness_values.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_sets(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).sets.len().saturating_sub(1) as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_indices(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).indices.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_particles(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).num_particles }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_tethers(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).tethers.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn fabric_get_num_triangles(this: *const NvClothFabric) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { ((*this).triangles.len() / 3) as u32 }
-    }
+nvcloth_getters! {
+    NvClothFabric;
+    fabric_get_factory -> *mut NvClothFactory = std::ptr::null_mut(); |f| f.factory,
+    fabric_get_num_phases -> u32 = 0; |f| f.phases.len() as u32,
+    fabric_get_num_restvalues -> u32 = 0; |f| f.restvalues.len() as u32,
+    fabric_get_num_stiffness_values -> u32 = 0; |f| f.stiffness_values.len() as u32,
+    fabric_get_num_sets -> u32 = 0; |f| f.sets.len().saturating_sub(1) as u32,
+    fabric_get_num_indices -> u32 = 0; |f| f.indices.len() as u32,
+    fabric_get_num_particles -> u32 = 0; |f| f.num_particles,
+    fabric_get_num_tethers -> u32 = 0; |f| f.tethers.len() as u32,
+    fabric_get_num_triangles -> u32 = 0; |f| (f.triangles.len() / 3) as u32,
 }
 
 unsafe extern "win64" fn fabric_scale_restvalues(this: *mut NvClothFabric, scale: f32) {
@@ -3821,25 +4081,13 @@ unsafe extern "win64" fn solver_remove_cloth(this: *mut NvClothSolver, cloth: *m
     }
 }
 
-unsafe extern "win64" fn solver_get_num_cloths(this: *const NvClothSolver) -> i32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).cloths.len() as i32 }
-    }
-}
-
-unsafe extern "win64" fn solver_get_cloth_list(this: *const NvClothSolver) -> *const *mut NvCloth {
-    if this.is_null() {
-        std::ptr::null()
-    } else {
-        let solver = unsafe { &*this };
-        if solver.cloths.is_empty() {
-            std::ptr::null()
-        } else {
-            solver.cloths.as_ptr()
-        }
-    }
+nvcloth_getters! {
+    NvClothSolver;
+    solver_get_num_cloths -> i32 = 0; |s| s.cloths.len() as i32,
+    solver_get_cloth_list -> *const *mut NvCloth = std::ptr::null(); |s| {
+        if s.cloths.is_empty() { std::ptr::null() } else { s.cloths.as_ptr() }
+    },
+    solver_get_simulation_chunk_count -> i32 = 0; |s| s.simulated_cloths.len() as i32,
 }
 
 unsafe extern "win64" fn solver_begin_simulation(this: *mut NvClothSolver, dt: f32) -> u8 {
@@ -3877,62 +4125,9 @@ unsafe extern "win64" fn solver_end_simulation(this: *mut NvClothSolver) {
     }
 }
 
-unsafe extern "win64" fn solver_get_simulation_chunk_count(this: *const NvClothSolver) -> i32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).simulated_cloths.len() as i32 }
-    }
-}
-
-unsafe extern "win64" fn solver_set_inter_collision_distance(this: *mut NvClothSolver, d: f32) {
-    if !this.is_null() {
-        unsafe { (*this).inter_collision_distance = d };
-    }
-}
-crate::win64_bridge!(fn solver_set_inter_collision_distance(*mut NvClothSolver, f32) -> ());
-
-unsafe extern "win64" fn solver_get_inter_collision_distance(this: *const NvClothSolver) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).inter_collision_distance }
-    }
-}
-
-unsafe extern "win64" fn solver_set_inter_collision_stiffness(this: *mut NvClothSolver, s: f32) {
-    if !this.is_null() {
-        unsafe { (*this).inter_collision_stiffness = s };
-    }
-}
-crate::win64_bridge!(fn solver_set_inter_collision_stiffness(*mut NvClothSolver, f32) -> ());
-
-unsafe extern "win64" fn solver_get_inter_collision_stiffness(this: *const NvClothSolver) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        unsafe { (*this).inter_collision_stiffness }
-    }
-}
-
-unsafe extern "win64" fn solver_set_inter_collision_nb_iterations(
-    this: *mut NvClothSolver,
-    n: u32,
-) {
-    if !this.is_null() {
-        unsafe { (*this).inter_collision_iterations = n };
-    }
-}
-
-unsafe extern "win64" fn solver_get_inter_collision_nb_iterations(
-    this: *const NvClothSolver,
-) -> u32 {
-    if this.is_null() {
-        1
-    } else {
-        unsafe { (*this).inter_collision_iterations }
-    }
-}
+solver_prop!(f32 solver_set_inter_collision_distance / solver_get_inter_collision_distance => inter_collision_distance, default 0.0);
+solver_prop!(f32 solver_set_inter_collision_stiffness / solver_get_inter_collision_stiffness => inter_collision_stiffness, default 1.0);
+solver_prop!(u32; solver_set_inter_collision_nb_iterations / solver_get_inter_collision_nb_iterations => inter_collision_iterations, default 1);
 
 unsafe extern "win64" fn solver_set_inter_collision_filter(
     this: *mut NvClothSolver,
@@ -3974,100 +4169,39 @@ unsafe extern "win64" fn cloth_clone(
     unsafe { factory_clone(factory, this) }
 }
 
-unsafe extern "win64" fn cloth_get_fabric(this: *const NvCloth) -> *mut NvClothFabric {
-    if this.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*this).fabric }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_factory(this: *const NvCloth) -> *mut NvClothFactory {
-    if this.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*this).factory }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_num_particles(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).num_particles }
-    }
+nvcloth_getters! {
+    NvCloth;
+    cloth_get_fabric -> *mut NvClothFabric = std::ptr::null_mut(); |c| c.fabric,
+    cloth_get_factory -> *mut NvClothFactory = std::ptr::null_mut(); |c| c.factory,
+    cloth_get_num_particles -> u32 = 0; |c| c.num_particles,
+    cloth_get_previous_iteration_dt -> f32 = 0.0; |c| c.prev_iter_dt,
+    cloth_get_solver_frequency -> f32 = 300.0; |c| c.solver_frequency,
+    cloth_get_acceleration_filter_width -> u32 = 0; |c| c.iter_dt_avg.size(),
+    cloth_get_num_spheres -> u32 = 0; |c| c.start_collision_spheres.len() as u32,
+    cloth_get_num_capsules -> u32 = 0; |c| c.capsule_indices.len() as u32,
+    cloth_get_num_planes -> u32 = 0; |c| c.start_collision_planes.len() as u32,
+    cloth_get_num_convexes -> u32 = 0; |c| c.convex_masks.len() as u32,
+    cloth_get_num_triangles -> u32 = 0; |c| (c.start_collision_triangles.len() / 3) as u32,
+    cloth_is_continuous_collision_enabled -> u8 = 0; |c| c.enable_continuous_collision as u8,
+    cloth_get_num_virtual_particles -> u32 = 0; |c| c.virtual_particle_indices.len() as u32,
+    cloth_get_num_virtual_particle_weights -> u32 = 0; |c| c.virtual_particle_weights.len() as u32,
+    cloth_get_motion_constraint_scale -> f32 = 1.0; |c| c.motion_constraint_scale,
+    cloth_get_motion_constraint_bias -> f32 = 0.0; |c| c.motion_constraint_bias,
+    cloth_get_num_particle_accelerations -> u32 = 0; |c| c.particle_accelerations.len() as u32,
+    cloth_get_num_self_collision_indices -> u32 = 0; |c| c.self_collision_indices.len() as u32,
+    cloth_get_num_rest_positions -> u32 = 0; |c| c.rest_positions.len() as u32,
+    cloth_get_sleep_pass_count -> u32 = 0; |c| c.sleep_pass_counter,
+    cloth_is_asleep -> u8 = 0; |c| c.is_sleeping() as u8,
+    cloth_is_sleeping -> u8 = 0; |c| c.is_sleeping() as u8,
 }
 
 unsafe extern "win64" fn cloth_lock_particles(_this: *const NvCloth) {}
 
 unsafe extern "win64" fn cloth_unlock_particles(_this: *const NvCloth) {}
 
-unsafe extern "win64" fn cloth_get_current_particles(
-    this: *mut NvCloth,
-    sret_out: *mut MappedRangePxVec4,
-) -> *mut MappedRangePxVec4 {
-    if !sret_out.is_null() {
-        let (begin, end) = if this.is_null() {
-            (std::ptr::null_mut(), std::ptr::null_mut())
-        } else {
-            let cloth = unsafe { &mut *this };
-            if cloth.current_particles.is_empty() {
-                (std::ptr::null_mut(), std::ptr::null_mut())
-            } else {
-                let ptr = cloth.current_particles.as_mut_ptr();
-                let end_ptr = unsafe { ptr.add(cloth.current_particles.len()) };
-                (ptr, end_ptr)
-            }
-        };
-        unsafe {
-            sret_out.write_unaligned(MappedRangePxVec4 {
-                begin,
-                end,
-                cloth: this,
-                lock_fn: cloth_lock_particles as *const () as usize,
-                lock_adj: 0,
-                lock_pad: 0,
-                unlock_fn: cloth_unlock_particles as *const () as usize,
-                unlock_adj: 0,
-                unlock_pad: 0,
-            });
-        }
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_get_previous_particles(
-    this: *mut NvCloth,
-    sret_out: *mut MappedRangePxVec4,
-) -> *mut MappedRangePxVec4 {
-    if !sret_out.is_null() {
-        let (begin, end) = if this.is_null() {
-            (std::ptr::null_mut(), std::ptr::null_mut())
-        } else {
-            let cloth = unsafe { &mut *this };
-            if cloth.previous_particles.is_empty() {
-                (std::ptr::null_mut(), std::ptr::null_mut())
-            } else {
-                let ptr = cloth.previous_particles.as_mut_ptr();
-                let end_ptr = unsafe { ptr.add(cloth.previous_particles.len()) };
-                (ptr, end_ptr)
-            }
-        };
-        unsafe {
-            sret_out.write_unaligned(MappedRangePxVec4 {
-                begin,
-                end,
-                cloth: this,
-                lock_fn: cloth_lock_particles as *const () as usize,
-                lock_adj: 0,
-                lock_pad: 0,
-                unlock_fn: cloth_unlock_particles as *const () as usize,
-                unlock_adj: 0,
-                unlock_pad: 0,
-            });
-        }
-    }
-    sret_out
+cloth_particle_range_getters! {
+    cloth_get_current_particles => current_particles,
+    cloth_get_previous_particles => previous_particles,
 }
 
 unsafe extern "win64" fn cloth_get_gpu_particles(
@@ -4102,13 +4236,10 @@ unsafe extern "win64" fn cloth_set_rotation(this: *mut NvCloth, rot: *const [f32
     }
 }
 
-unsafe extern "win64" fn cloth_get_translation(this: *const NvCloth) -> *const [f32; 3] {
-    if this.is_null() {
-        static ZERO: [f32; 3] = [0.0, 0.0, 0.0];
-        &ZERO
-    } else {
-        unsafe { &(*this).target_motion.p }
-    }
+cloth_vec3_ref_getters! {
+    cloth_get_translation => target_motion.p,
+    cloth_get_bbox_center => bbox_center,
+    cloth_get_bbox_scale => bbox_scale,
 }
 
 unsafe extern "win64" fn cloth_get_rotation(this: *const NvCloth) -> *const [f32; 4] {
@@ -4159,197 +4290,18 @@ unsafe extern "win64" fn cloth_ignore_velocity_discontinuity(this: *mut NvCloth)
     }
 }
 
-unsafe extern "win64" fn cloth_get_previous_iteration_dt(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).prev_iter_dt }
-    }
+cloth_vec3_prop! {
+    cloth_set_gravity / cloth_get_gravity => gravity, default [0.0; 3],
+    cloth_set_linear_inertia / cloth_get_linear_inertia => linear_inertia, default [1.0; 3],
+    cloth_set_angular_inertia / cloth_get_angular_inertia => angular_inertia, default [1.0; 3],
+    cloth_set_centrifugal_inertia / cloth_get_centrifugal_inertia => centrifugal_inertia, default [1.0; 3],
+    cloth_set_wind_velocity / cloth_get_wind_velocity => wind, default [0.0; 3],
 }
 
-unsafe extern "win64" fn cloth_set_gravity(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let g = unsafe { v.read_unaligned() };
-        let cloth = unsafe { &mut *this };
-        if g != cloth.gravity {
-            cloth.gravity = g;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_gravity(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [0.0; 3]
-        } else {
-            unsafe { (*this).gravity }
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_damping(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let d = unsafe { v.read_unaligned() };
-        let val = safe_log2_v3(v3_sub([1.0; 3], d));
-        let cloth = unsafe { &mut *this };
-        if val != cloth.log_damping {
-            cloth.log_damping = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_damping(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [0.0; 3]
-        } else {
-            v3_sub([1.0; 3], safe_exp2_v3(unsafe { (*this).log_damping }))
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_linear_drag(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let d = unsafe { v.read_unaligned() };
-        let val = safe_log2_v3(v3_sub([1.0; 3], d));
-        let cloth = unsafe { &mut *this };
-        if val != cloth.linear_log_drag {
-            cloth.linear_log_drag = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_linear_drag(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [0.0; 3]
-        } else {
-            v3_sub([1.0; 3], safe_exp2_v3(unsafe { (*this).linear_log_drag }))
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_angular_drag(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let d = unsafe { v.read_unaligned() };
-        let val = safe_log2_v3(v3_sub([1.0; 3], d));
-        let cloth = unsafe { &mut *this };
-        if val != cloth.angular_log_drag {
-            cloth.angular_log_drag = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_angular_drag(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [0.0; 3]
-        } else {
-            v3_sub([1.0; 3], safe_exp2_v3(unsafe { (*this).angular_log_drag }))
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_linear_inertia(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let val = unsafe { v.read_unaligned() };
-        let cloth = unsafe { &mut *this };
-        if val != cloth.linear_inertia {
-            cloth.linear_inertia = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_linear_inertia(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [1.0; 3]
-        } else {
-            unsafe { (*this).linear_inertia }
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_angular_inertia(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let val = unsafe { v.read_unaligned() };
-        let cloth = unsafe { &mut *this };
-        if val != cloth.angular_inertia {
-            cloth.angular_inertia = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_angular_inertia(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [1.0; 3]
-        } else {
-            unsafe { (*this).angular_inertia }
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_centrifugal_inertia(this: *mut NvCloth, v: *const [f32; 3]) {
-    if !this.is_null() && !v.is_null() {
-        let val = unsafe { v.read_unaligned() };
-        let cloth = unsafe { &mut *this };
-        if val != cloth.centrifugal_inertia {
-            cloth.centrifugal_inertia = val;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_centrifugal_inertia(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [1.0; 3]
-        } else {
-            unsafe { (*this).centrifugal_inertia }
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
+cloth_log_drag_prop! {
+    cloth_set_damping / cloth_get_damping => log_damping,
+    cloth_set_linear_drag / cloth_get_linear_drag => linear_log_drag,
+    cloth_set_angular_drag / cloth_get_angular_drag => angular_log_drag,
 }
 
 unsafe extern "win64" fn cloth_set_solver_frequency(this: *mut NvCloth, freq: f32) {
@@ -4364,44 +4316,29 @@ unsafe extern "win64" fn cloth_set_solver_frequency(this: *mut NvCloth, freq: f3
 }
 crate::win64_bridge!(fn cloth_set_solver_frequency(*mut NvCloth, f32) -> ());
 
-unsafe extern "win64" fn cloth_get_solver_frequency(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        300.0
-    } else {
-        unsafe { (*this).solver_frequency }
-    }
-}
+cloth_f32_prop!(wake; cloth_set_stiffness_frequency / cloth_get_stiffness_frequency => stiffness_frequency, default 10.0);
+cloth_f32_prop!(wake; cloth_set_collision_mass_scale / cloth_get_collision_mass_scale => collision_mass_scale, default 0.0);
+cloth_f32_prop!(plain; cloth_set_friction / cloth_get_friction => friction, default 0.0);
+cloth_f32_prop!(wake; cloth_set_tether_constraint_scale / cloth_get_tether_constraint_scale => tether_constraint_scale, default 1.0);
+cloth_f32_prop!(log; cloth_set_tether_constraint_stiffness / cloth_get_tether_constraint_stiffness => tether_constraint_log_stiffness, default 1.0);
+cloth_f32_prop!(log; cloth_set_motion_constraint_stiffness / cloth_get_motion_constraint_stiffness => motion_constraint_log_stiffness, default 1.0);
+cloth_f32_prop!(log; cloth_set_drag_coefficient / cloth_get_drag_coefficient => drag_log_coefficient, default 0.0);
+cloth_f32_prop!(log; cloth_set_lift_coefficient / cloth_get_lift_coefficient => lift_log_coefficient, default 0.0);
+cloth_f32_prop!(wake; cloth_set_fluid_density / cloth_get_fluid_density => fluid_density, default 1.0);
+cloth_f32_prop!(wake; cloth_set_self_collision_distance / cloth_get_self_collision_distance => self_collision_distance, default 0.0);
+cloth_f32_prop!(log; cloth_set_self_collision_stiffness / cloth_get_self_collision_stiffness => self_collision_log_stiffness, default 1.0);
+cloth_f32_prop!(wake; cloth_set_sleep_threshold / cloth_get_sleep_threshold => sleep_threshold, default 0.0);
 
-unsafe extern "win64" fn cloth_set_stiffness_frequency(this: *mut NvCloth, freq: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if freq != cloth.stiffness_frequency {
-            cloth.stiffness_frequency = freq;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_stiffness_frequency(*mut NvCloth, f32) -> ());
+cloth_scalar_prop!(wake; u32; cloth_set_sleep_test_interval / cloth_get_sleep_test_interval => sleep_test_interval, default u32::MAX);
+cloth_scalar_prop!(wake; u32; cloth_set_sleep_after_count / cloth_get_sleep_after_count => sleep_after_count, default u32::MAX);
+cloth_scalar_prop!(plain; *mut u8; cloth_set_user_data / cloth_get_user_data => user_data, default std::ptr::null_mut());
 
-unsafe extern "win64" fn cloth_get_stiffness_frequency(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        10.0
-    } else {
-        unsafe { (*this).stiffness_frequency }
-    }
-}
+cloth_constraint_pair_methods!(cloth_get_motion_constraints / cloth_clear_motion_constraints / cloth_get_num_motion_constraints => motion_constraints);
+cloth_constraint_pair_methods!(cloth_get_separation_constraints / cloth_clear_separation_constraints / cloth_get_num_separation_constraints => separation_constraints);
 
 unsafe extern "win64" fn cloth_set_acceleration_filter_width(this: *mut NvCloth, n: u32) {
     if !this.is_null() {
         unsafe { (*this).iter_dt_avg.resize(n as usize) };
-    }
-}
-
-unsafe extern "win64" fn cloth_get_acceleration_filter_width(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).iter_dt_avg.size() }
     }
 }
 
@@ -4606,14 +4543,6 @@ unsafe extern "win64" fn cloth_set_spheres_range(
     cloth.wake_up();
 }
 
-unsafe extern "win64" fn cloth_get_num_spheres(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).start_collision_spheres.len() as u32 }
-    }
-}
-
 unsafe extern "win64" fn cloth_set_capsules(
     this: *mut NvCloth,
     capsules_range: *const PxRange<u32>,
@@ -4635,14 +4564,6 @@ unsafe extern "win64" fn cloth_set_capsules(
     let pairs = (0..count).map(|i| [raw[2 * i], raw[2 * i + 1]]);
     cloth.capsule_indices.splice(f..l, pairs);
     cloth.wake_up();
-}
-
-unsafe extern "win64" fn cloth_get_num_capsules(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).capsule_indices.len() as u32 }
-    }
 }
 
 unsafe extern "win64" fn cloth_set_planes_start_target(
@@ -4724,14 +4645,6 @@ unsafe extern "win64" fn cloth_set_planes_range(
     cloth.wake_up();
 }
 
-unsafe extern "win64" fn cloth_get_num_planes(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).start_collision_planes.len() as u32 }
-    }
-}
-
 unsafe extern "win64" fn cloth_set_convexes(
     this: *mut NvCloth,
     masks_range: *const PxRange<u32>,
@@ -4750,14 +4663,6 @@ unsafe extern "win64" fn cloth_set_convexes(
     let count = raw.len().min(max_add);
     cloth.convex_masks.splice(f..l, raw[..count].iter().copied());
     cloth.wake_up();
-}
-
-unsafe extern "win64" fn cloth_get_num_convexes(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).convex_masks.len() as u32 }
-    }
 }
 
 unsafe extern "win64" fn cloth_set_triangles_start_target(
@@ -4821,22 +4726,6 @@ unsafe extern "win64" fn cloth_set_triangles_range(
     cloth.wake_up();
 }
 
-unsafe extern "win64" fn cloth_get_num_triangles(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { ((*this).start_collision_triangles.len() / 3) as u32 }
-    }
-}
-
-unsafe extern "win64" fn cloth_is_continuous_collision_enabled(this: *const NvCloth) -> u8 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).enable_continuous_collision as u8 }
-    }
-}
-
 unsafe extern "win64" fn cloth_enable_continuous_collision(this: *mut NvCloth, enable: u8) {
     if !this.is_null() {
         let b = enable != 0;
@@ -4845,40 +4734,6 @@ unsafe extern "win64" fn cloth_enable_continuous_collision(this: *mut NvCloth, e
             cloth.enable_continuous_collision = b;
             cloth.wake_up();
         }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_collision_mass_scale(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).collision_mass_scale }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_collision_mass_scale(this: *mut NvCloth, scale: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if scale != cloth.collision_mass_scale {
-            cloth.collision_mass_scale = scale;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_collision_mass_scale(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_set_friction(this: *mut NvCloth, friction: f32) {
-    if !this.is_null() {
-        unsafe { (*this).friction = friction };
-    }
-}
-crate::win64_bridge!(fn cloth_set_friction(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_friction(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).friction }
     }
 }
 
@@ -4904,98 +4759,6 @@ unsafe extern "win64" fn cloth_set_virtual_particles(
         .collect();
 }
 
-unsafe extern "win64" fn cloth_get_num_virtual_particles(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).virtual_particle_indices.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_num_virtual_particle_weights(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).virtual_particle_weights.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_tether_constraint_scale(this: *mut NvCloth, scale: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if scale != cloth.tether_constraint_scale {
-            cloth.tether_constraint_scale = scale;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_tether_constraint_scale(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_tether_constraint_scale(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        unsafe { (*this).tether_constraint_scale }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_tether_constraint_stiffness(
-    this: *mut NvCloth,
-    stiffness: f32,
-) {
-    if !this.is_null() {
-        let val = safe_log2(1.0 - stiffness);
-        let cloth = unsafe { &mut *this };
-        if val != cloth.tether_constraint_log_stiffness {
-            cloth.tether_constraint_log_stiffness = val;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_tether_constraint_stiffness(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_tether_constraint_stiffness(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        1.0 - safe_exp2(unsafe { (*this).tether_constraint_log_stiffness })
-    }
-}
-
-unsafe extern "win64" fn cloth_get_motion_constraints(
-    this: *mut NvCloth,
-    sret_out: *mut PxRange<[f32; 4]>,
-) -> *mut PxRange<[f32; 4]> {
-    if !sret_out.is_null() {
-        let (begin, end) = if this.is_null() {
-            (std::ptr::null_mut(), std::ptr::null_mut())
-        } else {
-            let cloth = unsafe { &mut *this };
-            cloth.wake_up();
-            let n = cloth.current_particles.len();
-            cloth.motion_constraints.push(n)
-        };
-        unsafe { sret_out.write_unaligned(PxRange { begin, end }) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_clear_motion_constraints(this: *mut NvCloth) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        cloth.motion_constraints.clear();
-        cloth.wake_up();
-    }
-}
-
-unsafe extern "win64" fn cloth_get_num_motion_constraints(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).motion_constraints.start.len() as u32 }
-    }
-}
-
 unsafe extern "win64" fn cloth_set_motion_constraint_scale_bias(
     this: *mut NvCloth,
     scale: f32,
@@ -5011,79 +4774,6 @@ unsafe extern "win64" fn cloth_set_motion_constraint_scale_bias(
     }
 }
 crate::win64_bridge!(fn cloth_set_motion_constraint_scale_bias(*mut NvCloth, f32, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_motion_constraint_scale(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        unsafe { (*this).motion_constraint_scale }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_motion_constraint_bias(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).motion_constraint_bias }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_motion_constraint_stiffness(
-    this: *mut NvCloth,
-    stiffness: f32,
-) {
-    if !this.is_null() {
-        let val = safe_log2(1.0 - stiffness);
-        let cloth = unsafe { &mut *this };
-        if val != cloth.motion_constraint_log_stiffness {
-            cloth.motion_constraint_log_stiffness = val;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_motion_constraint_stiffness(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_motion_constraint_stiffness(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        1.0 - safe_exp2(unsafe { (*this).motion_constraint_log_stiffness })
-    }
-}
-
-unsafe extern "win64" fn cloth_get_separation_constraints(
-    this: *mut NvCloth,
-    sret_out: *mut PxRange<[f32; 4]>,
-) -> *mut PxRange<[f32; 4]> {
-    if !sret_out.is_null() {
-        let (begin, end) = if this.is_null() {
-            (std::ptr::null_mut(), std::ptr::null_mut())
-        } else {
-            let cloth = unsafe { &mut *this };
-            cloth.wake_up();
-            let n = cloth.current_particles.len();
-            cloth.separation_constraints.push(n)
-        };
-        unsafe { sret_out.write_unaligned(PxRange { begin, end }) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_clear_separation_constraints(this: *mut NvCloth) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        cloth.separation_constraints.clear();
-        cloth.wake_up();
-    }
-}
-
-unsafe extern "win64" fn cloth_get_num_separation_constraints(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).separation_constraints.start.len() as u32 }
-    }
-}
 
 unsafe extern "win64" fn cloth_clear_interpolation(this: *mut NvCloth) {
     if !this.is_null() {
@@ -5135,138 +4825,6 @@ unsafe extern "win64" fn cloth_clear_particle_accelerations(this: *mut NvCloth) 
     }
 }
 
-unsafe extern "win64" fn cloth_get_num_particle_accelerations(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).particle_accelerations.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_wind_velocity(this: *mut NvCloth, wind: *const [f32; 3]) {
-    if !this.is_null() && !wind.is_null() {
-        let w = unsafe { wind.read_unaligned() };
-        let cloth = unsafe { &mut *this };
-        if w != cloth.wind {
-            cloth.wind = w;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_wind_velocity(
-    this: *const NvCloth,
-    sret_out: *mut [f32; 3],
-) -> *mut [f32; 3] {
-    if !sret_out.is_null() {
-        let v = if this.is_null() {
-            [0.0; 3]
-        } else {
-            unsafe { (*this).wind }
-        };
-        unsafe { sret_out.write_unaligned(v) };
-    }
-    sret_out
-}
-
-unsafe extern "win64" fn cloth_set_drag_coefficient(this: *mut NvCloth, coeff: f32) {
-    if !this.is_null() {
-        let val = safe_log2(1.0 - coeff);
-        let cloth = unsafe { &mut *this };
-        if val != cloth.drag_log_coefficient {
-            cloth.drag_log_coefficient = val;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_drag_coefficient(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_drag_coefficient(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        1.0 - safe_exp2(unsafe { (*this).drag_log_coefficient })
-    }
-}
-
-unsafe extern "win64" fn cloth_set_lift_coefficient(this: *mut NvCloth, coeff: f32) {
-    if !this.is_null() {
-        let val = safe_log2(1.0 - coeff);
-        let cloth = unsafe { &mut *this };
-        if val != cloth.lift_log_coefficient {
-            cloth.lift_log_coefficient = val;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_lift_coefficient(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_lift_coefficient(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        1.0 - safe_exp2(unsafe { (*this).lift_log_coefficient })
-    }
-}
-
-unsafe extern "win64" fn cloth_set_fluid_density(this: *mut NvCloth, density: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if density != cloth.fluid_density {
-            cloth.fluid_density = density;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_fluid_density(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_fluid_density(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        unsafe { (*this).fluid_density }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_self_collision_distance(this: *mut NvCloth, distance: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if distance != cloth.self_collision_distance {
-            cloth.self_collision_distance = distance;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_self_collision_distance(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_self_collision_distance(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).self_collision_distance }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_self_collision_stiffness(this: *mut NvCloth, stiffness: f32) {
-    if !this.is_null() {
-        let val = safe_log2(1.0 - stiffness);
-        let cloth = unsafe { &mut *this };
-        if val != cloth.self_collision_log_stiffness {
-            cloth.self_collision_log_stiffness = val;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_self_collision_stiffness(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_self_collision_stiffness(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        1.0
-    } else {
-        1.0 - safe_exp2(unsafe { (*this).self_collision_log_stiffness })
-    }
-}
-
 unsafe extern "win64" fn cloth_set_self_collision_indices(
     this: *mut NvCloth,
     indices: *const PxRange<u32>,
@@ -5275,14 +4833,6 @@ unsafe extern "win64" fn cloth_set_self_collision_indices(
         let cloth = unsafe { &mut *this };
         cloth.self_collision_indices = unsafe { read_range_vec(indices) };
         cloth.wake_up();
-    }
-}
-
-unsafe extern "win64" fn cloth_get_num_self_collision_indices(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).self_collision_indices.len() as u32 }
     }
 }
 
@@ -5297,103 +4847,6 @@ unsafe extern "win64" fn cloth_set_rest_positions(
     }
 }
 
-unsafe extern "win64" fn cloth_get_num_rest_positions(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).rest_positions.len() as u32 }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_bbox_center(this: *const NvCloth) -> *const [f32; 3] {
-    if this.is_null() {
-        static ZERO: [f32; 3] = [0.0, 0.0, 0.0];
-        &ZERO
-    } else {
-        unsafe { &(*this).bbox_center }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_bbox_scale(this: *const NvCloth) -> *const [f32; 3] {
-    if this.is_null() {
-        static ZERO: [f32; 3] = [0.0, 0.0, 0.0];
-        &ZERO
-    } else {
-        unsafe { &(*this).bbox_scale }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_sleep_threshold(this: *mut NvCloth, threshold: f32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if threshold != cloth.sleep_threshold {
-            cloth.sleep_threshold = threshold;
-            cloth.wake_up();
-        }
-    }
-}
-crate::win64_bridge!(fn cloth_set_sleep_threshold(*mut NvCloth, f32) -> ());
-
-unsafe extern "win64" fn cloth_get_sleep_threshold(this: *const NvCloth) -> f32 {
-    if this.is_null() {
-        0.0
-    } else {
-        unsafe { (*this).sleep_threshold }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_sleep_test_interval(this: *mut NvCloth, interval: u32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if interval != cloth.sleep_test_interval {
-            cloth.sleep_test_interval = interval;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_sleep_test_interval(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        u32::MAX
-    } else {
-        unsafe { (*this).sleep_test_interval }
-    }
-}
-
-unsafe extern "win64" fn cloth_set_sleep_after_count(this: *mut NvCloth, count: u32) {
-    if !this.is_null() {
-        let cloth = unsafe { &mut *this };
-        if count != cloth.sleep_after_count {
-            cloth.sleep_after_count = count;
-            cloth.wake_up();
-        }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_sleep_after_count(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        u32::MAX
-    } else {
-        unsafe { (*this).sleep_after_count }
-    }
-}
-
-unsafe extern "win64" fn cloth_get_sleep_pass_count(this: *const NvCloth) -> u32 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).sleep_pass_counter }
-    }
-}
-
-unsafe extern "win64" fn cloth_is_asleep(this: *const NvCloth) -> u8 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).is_sleeping() as u8 }
-    }
-}
-
 unsafe extern "win64" fn cloth_put_to_sleep(this: *mut NvCloth) {
     if !this.is_null() {
         let cloth = unsafe { &mut *this };
@@ -5404,28 +4857,6 @@ unsafe extern "win64" fn cloth_put_to_sleep(this: *mut NvCloth) {
 unsafe extern "win64" fn cloth_wake_up(this: *mut NvCloth) {
     if !this.is_null() {
         unsafe { (*this).wake_up() };
-    }
-}
-
-unsafe extern "win64" fn cloth_set_user_data(this: *mut NvCloth, data: *mut u8) {
-    if !this.is_null() {
-        unsafe { (*this).user_data = data };
-    }
-}
-
-unsafe extern "win64" fn cloth_get_user_data(this: *const NvCloth) -> *mut u8 {
-    if this.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*this).user_data }
-    }
-}
-
-unsafe extern "win64" fn cloth_is_sleeping(this: *const NvCloth) -> u8 {
-    if this.is_null() {
-        0
-    } else {
-        unsafe { (*this).is_sleeping() as u8 }
     }
 }
 
