@@ -980,7 +980,7 @@ mod tests {
         l_empty.begin(&a_empty).unwrap();
         l_empty.barrier_list(&[Barrier::Uav(0)]);
         l_empty.close().unwrap();
-        assert_eq!(l_empty.has_commands(), !l_empty.opt_empty_enc_elide);
+        assert_eq!(l_empty.has_commands(), !l_empty.opts.opt_empty_enc_elide);
         assert!(!l_empty.has_gpu_work_recorded());
 
         // 2) Record 3 real-GPU dependent Blit submissions (`up -> mid0 -> mid1 -> rb`).
