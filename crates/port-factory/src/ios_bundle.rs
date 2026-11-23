@@ -17,8 +17,13 @@
 //!    platform tags, embedded static AOT modules, zero macOS framework leaks, zero host-specific
 //!    `*.mtl4a` shader cache bloat, valid `game.toml`, and valid code signature.
 
+use crate::bundle_common::{
+    codesign_verify_deep_strict, codesign_with_identity, copy_dir_recursive, copy_ios_shader_cache,
+    extract_plist_string, find_or_build_host_port_runner, otool_linked_libs, scan_shader_cache,
+    TempDirGuard,
+};
 use crate::gpu_shaders::precompile_shaders_for_paths;
-use crate::steam_library::{copy_ios_shader_cache, sanitize_game_title};
+use crate::steam_library::sanitize_game_title;
 use crate::storage_opt::{
     optimize_game_assets, parse_manifest_storage_config, StorageOptOptions, StorageOptReport,
 };
@@ -592,82 +597,6 @@ fn ensure_ios_staticlib(workspace_root: &Path, target: IosTarget, release: bool,
     Ok(lib_path)
 }
 
-fn ensure_host_port_runner(workspace_root: &Path) -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("PORT_RUNNER").filter(|v| !v.is_empty()) {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Ok(pb);
-        }
-    }
-    let mut existing: Vec<(PathBuf, std::time::SystemTime)> = [
-        "target/aarch64-apple-darwin/release/port-runner",
-        "target/aarch64-apple-darwin/debug/port-runner",
-        "target/release/port-runner",
-        "target/debug/port-runner",
-    ]
-    .iter()
-    .map(|rel| workspace_root.join(rel))
-    .filter(|p| p.is_file())
-    .map(|p| {
-        let mt = p
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        (p, mt)
-    })
-    .collect();
-    existing.sort_by_key(|(_, mt)| std::cmp::Reverse(*mt));
-    if let Some((newest, _)) = existing.into_iter().next() {
-        return Ok(newest);
-    }
-    let status = Command::new("cargo")
-        .current_dir(workspace_root)
-        .args([
-            "build",
-            "-p",
-            "port-loader",
-            "--bin",
-            "port-runner",
-            "--target",
-            "aarch64-apple-darwin",
-        ])
-        .status()
-        .context("building host port-runner for static Mach-O AOT emission")?;
-    if !status.success() {
-        bail!("building host port-runner failed with status {status}");
-    }
-    let p = workspace_root.join("target/aarch64-apple-darwin/debug/port-runner");
-    if !p.is_file() {
-        bail!("host port-runner binary not found at {}", p.display());
-    }
-    Ok(p)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path, skip_canon: Option<&Path>) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == ".DepotDownloader" || name == ".DS_Store" {
-            continue;
-        }
-        let sp = entry.path();
-        if let Some(skip) = skip_canon {
-            if fs::canonicalize(&sp).ok().as_deref() == Some(skip) {
-                continue;
-            }
-        }
-        let dp = dst.join(&name);
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            copy_dir_recursive(&sp, &dp, skip_canon)?;
-        } else if ft.is_file() {
-            fs::copy(&sp, &dp)?;
-        }
-    }
-    Ok(())
-}
-
 /// Package a Windows x86-64 executable/game directory into a complete iOS `.app` or `.ipa`
 /// bundle with statically linked signed ARM64 `.aot.o` code and precompiled Tier-1 shaders.
 pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
@@ -702,21 +631,8 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("ipa"));
 
-    let stage_root = std::env::temp_dir().join(format!(
-        "port-ios-bundle-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
-    fs::create_dir_all(&stage_root)?;
-    struct CleanStage(PathBuf);
-    impl Drop for CleanStage {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _clean = CleanStage(stage_root.clone());
+    let stage_guard = TempDirGuard::create_unique("port-ios-bundle")?;
+    let stage_root = stage_guard.path().to_path_buf();
 
     let app_dir = if is_ipa {
         stage_root.join("Payload").join(format!("{title}.app"))
@@ -778,7 +694,7 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
     let mut aot_objects: Vec<PathBuf> = opts.extra_aot_objs.clone();
     let aot_stage_dir = stage_root.join("aot_objs");
     if opts.emit_static_aot {
-        let runner = ensure_host_port_runner(&opts.workspace_root)?;
+        let runner = find_or_build_host_port_runner(&opts.workspace_root)?;
         fs::create_dir_all(&aot_stage_dir)?;
         let mut cmd = Command::new(&runner);
         cmd.arg("--manifest")
@@ -973,16 +889,11 @@ pub fn build_ios_bundle(opts: &IosBundleOptions) -> Result<IosBundleReport> {
 
     // 8. Code-sign the `<App>.app` bundle.
     let identity = opts.codesign_identity.as_deref().unwrap_or("-");
-    let mut cs = Command::new("codesign");
-    cs.args(["--force", "--sign", identity]);
     // Device builds attach the extended-virtual-addressing + increased-memory-limit entitlements.
     // iOS Simulator rejects restricted `com.apple.developer.kernel.*` entitlements on ad-hoc signed
     // bundles, so Simulator bundles use plain ad-hoc signing.
-    if opts.target == IosTarget::Device && entitlements.is_file() {
-        cs.arg("--entitlements").arg(&entitlements);
-    }
-    cs.arg(&app_dir);
-    let cs_out = cs.output().context("running codesign on iOS .app bundle")?;
+    let sign_entitlements = (opts.target == IosTarget::Device).then_some(entitlements.as_path());
+    let cs_out = codesign_with_identity(&app_dir, identity, sign_entitlements)?;
     let signed = cs_out.status.success();
     if !signed {
         bail!(
@@ -1126,32 +1037,6 @@ fn parse_macho_header_platform(bytes: &[u8]) -> Result<(String, u32, String)> {
     Ok((arch, plat_id, plat_name))
 }
 
-fn plist_string_value(xml: &str, key: &str) -> Option<String> {
-    let needle = format!("<key>{key}</key>");
-    let idx = xml.find(&needle)?;
-    let rest = &xml[idx + needle.len()..];
-    let start = rest.find("<string>")? + "<string>".len();
-    let tail = &rest[start..];
-    let end = tail.find("</string>")?;
-    Some(tail[..end].trim().to_string())
-}
-
-fn count_shader_files(dir: &Path, portable: &mut usize, mtl4a: &mut usize) {
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            count_shader_files(&p, portable, mtl4a);
-        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("aw2s") {
-                *portable += 1;
-            } else if ext.eq_ignore_ascii_case("mtl4a") {
-                *mtl4a += 1;
-            }
-        }
-    }
-}
-
 /// Verify an iOS `.app` bundle or `.ipa` archive for ARM64 iOS Mach-O platform validity,
 /// embedded static AOT modules, zero macOS framework leaks, flat bundle layout, portable
 /// shader cache hygiene (zero host-specific `*.mtl4a` files), and valid code signature.
@@ -1184,16 +1069,9 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("ipa"));
 
-    let mut temp_extract: Option<PathBuf> = None;
-    let app_dir = if is_ipa {
-        let tmp = std::env::temp_dir().join(format!(
-            "port-ios-verify-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        fs::create_dir_all(&tmp)?;
+    let (app_dir, _temp_extract): (PathBuf, Option<TempDirGuard>) = if is_ipa {
+        let guard = TempDirGuard::create_unique("port-ios-verify")?;
+        let tmp = guard.path().to_path_buf();
         let out = Command::new("/usr/bin/unzip")
             .args(["-qq"])
             .arg(path)
@@ -1202,7 +1080,6 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
             .output()
             .context("extracting .ipa via /usr/bin/unzip")?;
         if !out.status.success() {
-            let _ = fs::remove_dir_all(&tmp);
             bail!(
                 "unzip failed on {}: {}",
                 path.display(),
@@ -1220,24 +1097,12 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
                 })
             })
             .ok_or_else(|| {
-                let _ = fs::remove_dir_all(&tmp);
                 anyhow::anyhow!("{} does not contain Payload/<App>.app", path.display())
             })?;
-        temp_extract = Some(tmp);
-        found
+        (found, Some(guard))
     } else {
-        path.to_path_buf()
+        (path.to_path_buf(), None)
     };
-
-    struct Cleanup(Option<PathBuf>);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.0 {
-                let _ = fs::remove_dir_all(p);
-            }
-        }
-    }
-    let _cleanup = Cleanup(temp_extract);
 
     let mut issues = Vec::new();
     let plist_path = app_dir.join("Info.plist");
@@ -1248,8 +1113,8 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
             String::new()
         }
     };
-    let bundle_id = plist_string_value(&plist_xml, "CFBundleIdentifier").unwrap_or_default();
-    let executable_name = plist_string_value(&plist_xml, "CFBundleExecutable").unwrap_or_default();
+    let bundle_id = extract_plist_string(&plist_xml, "CFBundleIdentifier").unwrap_or_default();
+    let executable_name = extract_plist_string(&plist_xml, "CFBundleExecutable").unwrap_or_default();
     if bundle_id.is_empty() {
         issues.push("Info.plist missing CFBundleIdentifier".into());
     }
@@ -1305,13 +1170,10 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
                     .count();
             }
         }
-        if let Ok(ot_out) = Command::new("otool").arg("-L").arg(&exec_path).output() {
-            if ot_out.status.success() {
-                let text = String::from_utf8_lossy(&ot_out.stdout);
-                for forbidden in ["AppKit.framework", "IOKit.framework", "CoreAudio.framework"] {
-                    if text.contains(forbidden) {
-                        macos_framework_leaks.push(forbidden.to_string());
-                    }
+        if let Ok(Some(deps)) = otool_linked_libs(&exec_path, None) {
+            for forbidden in ["AppKit.framework", "IOKit.framework", "CoreAudio.framework"] {
+                if deps.iter().any(|d| d.contains(forbidden)) {
+                    macos_framework_leaks.push(forbidden.to_string());
                 }
             }
         }
@@ -1362,24 +1224,16 @@ pub fn verify_ios_bundle(path: &Path) -> Result<IosBundleVerifyReport> {
         }
     }
 
-    let mut portable_shader_files = 0usize;
-    let mut host_mtl4a_files = 0usize;
-    count_shader_files(
-        &app_dir.join("ShaderCache"),
-        &mut portable_shader_files,
-        &mut host_mtl4a_files,
-    );
+    let shader_scan = scan_shader_cache(&app_dir.join("ShaderCache"), &app_dir);
+    let portable_shader_files = shader_scan.aw2s_files;
+    let host_mtl4a_files = shader_scan.mtl4a_files.len();
     if host_mtl4a_files > 0 {
         issues.push(format!(
             "ShaderCache contains {host_mtl4a_files} host-specific *.mtl4a archive(s) (not portable to iOS)"
         ));
     }
 
-    let codesign_ok = Command::new("codesign")
-        .args(["--verify", "--deep", "--strict"])
-        .arg(&app_dir)
-        .output()
-        .is_ok_and(|o| o.status.success());
+    let codesign_ok = codesign_verify_deep_strict(&app_dir).is_ok_and(|o| o.status.success());
 
     Ok(IosBundleVerifyReport {
         bundle_path: path.to_path_buf(),

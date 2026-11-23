@@ -401,13 +401,7 @@ pub fn check_or_fix_db_tsvs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDirGuard(PathBuf);
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::bundle_common::TempDirGuard;
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -425,7 +419,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp db dir");
-        TempDirGuard(dir)
+        TempDirGuard::new(dir)
     }
 
     #[test]
@@ -434,7 +428,7 @@ mod tests {
         let tmp = make_temp_db_dir("missing_and_sync");
 
         // 1. Empty db_dir -> all 4 TSVs reported missing, check mode fails without creating files.
-        let missing_rep = check_or_fix_db_tsvs(&root, &tmp.0, false).unwrap();
+        let missing_rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
         assert_eq!(missing_rep.items.len(), 4);
         assert!(missing_rep.has_drift());
         assert_eq!(missing_rep.drifted_items().len(), 4);
@@ -454,7 +448,7 @@ mod tests {
         assert!(err_msg.contains("game_profiles.tsv"));
 
         // 2. Fix mode writes all 4 canonical TSVs cleanly.
-        let fixed_rep = check_or_fix_db_tsvs(&root, &tmp.0, true).unwrap();
+        let fixed_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
         assert!(!fixed_rep.has_drift());
         assert!(fixed_rep.ensure_clean().is_ok());
         for item in &fixed_rep.items {
@@ -463,7 +457,7 @@ mod tests {
         }
 
         // 3. Subsequent check mode passes with all 4 InSync.
-        let clean_rep = check_or_fix_db_tsvs(&root, &tmp.0, false).unwrap();
+        let clean_rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
         assert!(!clean_rep.has_drift());
         assert!(clean_rep.ensure_clean().is_ok());
         for item in &clean_rep.items {
@@ -477,7 +471,7 @@ mod tests {
         let tmp = make_temp_db_dir("individual_drift");
 
         // Seed all 4 canonical TSVs cleanly first.
-        let seeded = check_or_fix_db_tsvs(&root, &tmp.0, true).unwrap();
+        let seeded = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
         assert!(seeded.ensure_clean().is_ok());
 
         for target_file in [
@@ -486,13 +480,13 @@ mod tests {
             "shader_formats.tsv",
             "game_profiles.tsv",
         ] {
-            let p = tmp.0.join(target_file);
+            let p = tmp.path().join(target_file);
             let orig = fs::read_to_string(&p).unwrap();
             let mutated = format!("{orig}STALE_DRIFT_SENTINEL\tdummy\n");
             fs::write(&p, &mutated).unwrap();
 
             // Check mode must fail and flag ONLY `target_file`, without mutating disk!
-            let rep = check_or_fix_db_tsvs(&root, &tmp.0, false).unwrap();
+            let rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
             assert!(rep.has_drift(), "expected drift for {target_file}");
             let drifted = rep.drifted_items();
             assert_eq!(
@@ -519,10 +513,10 @@ mod tests {
             assert_eq!(fs::read_to_string(&p).unwrap(), mutated);
 
             // Fix mode repairs only `target_file`, leaving the other 3 untouched/InSync.
-            let fix_rep = check_or_fix_db_tsvs(&root, &tmp.0, true).unwrap();
+            let fix_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
             assert!(fix_rep.ensure_clean().is_ok());
             assert_eq!(fs::read_to_string(&p).unwrap(), orig);
-            let check_after = check_or_fix_db_tsvs(&root, &tmp.0, false).unwrap();
+            let check_after = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
             assert!(check_after.ensure_clean().is_ok());
         }
     }

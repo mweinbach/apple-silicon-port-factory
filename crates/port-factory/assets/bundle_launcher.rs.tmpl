@@ -1,0 +1,230 @@
+fn main() {
+    let current_exe = std::env::current_exe().expect("resolve current_exe");
+    let macos_dir = current_exe.parent().expect("Contents/MacOS");
+    let contents_dir = macos_dir.parent().expect("Contents");
+    let resources_dir = contents_dir.join("Resources");
+    let frameworks_dir = contents_dir.join("Frameworks");
+
+    let bundled_manifest = resources_dir.join("game.toml");
+    let bundled_aot_dir = resources_dir.join("AotCache");
+    let bundled_shader_cache = resources_dir.join("ShaderCache");
+    let bundled_shader_manifest = bundled_shader_cache.join("manifest");
+    let bundled_pso_manifest = bundled_shader_cache.join("pso").join("pso_manifest");
+    let bundled_registry_tsv = resources_dir.join("steam_registry.tsv");
+    let bundled_shaderd = macos_dir.join("dxil-metald");
+    let bundled_msc = frameworks_dir.join("libmetalirconverter.dylib");
+    let bundled_dxilconv = frameworks_dir.join("libdxilconv.dylib");
+    let bundled_moltenvk = frameworks_dir.join("libMoltenVK.dylib");
+
+    fn dir_is_writable(dir: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn access(path: *const std::ffi::c_char, amode: i32) -> i32;
+            }
+            const W_OK: i32 = 2;
+            let mut cur = Some(dir);
+            while let Some(p) = cur {
+                if p.exists() {
+                    let Ok(cstr) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) else {
+                        return false;
+                    };
+                    return unsafe { access(cstr.as_ptr(), W_OK) == 0 };
+                }
+                cur = p.parent();
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            true
+        }
+    }
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--aot-info") {
+        println!("=== Native ARM64 Game Bundle Launcher: __CLEAN_TITLE__ ===");
+        println!("  Steam AppID            : __APP_ID__");
+        println!("  Original PE Executable : __EXE_REL__");
+        println!("  Preferred ImageBase    : 0x__IMAGE_BASE_HEX__ (SizeOfImage: 0x__SIZE_OF_IMAGE_HEX__)");
+        println!("  AOT Dylib Functions    : __AOT_FN_COUNT__");
+        println!("  AOT Dylib              : __AOT_DYLIB_NAME__");
+        println!("  Bundled Manifest (TOML): {}", bundled_manifest.is_file());
+        println!("  Bundled AotCache Dir   : {}", bundled_aot_dir.is_dir());
+        println!("  Bundled Shader Helper  : {}", bundled_shaderd.is_file());
+        println!("  Bundled Metal IR Conv  : {}", bundled_msc.is_file());
+        println!("  Bundled DXILConv (DX11): {}", bundled_dxilconv.is_file());
+        println!("  Bundled MoltenVK (VK)  : {}", bundled_moltenvk.is_file());
+        return;
+    }
+
+    let game_dir = resources_dir.join("Game");
+    let target_pe = game_dir.join(__EXE_REL_DEBUG__);
+    let loader_bin = macos_dir.join("port-runner");
+
+    // Best-effort strip Gatekeeper quarantine xattrs on executables/dylibs when copied from an
+    // external SSD or another Mac, only when the bundle is writable (skipping read-only installs).
+    if dir_is_writable(macos_dir) {
+        let _ = std::process::Command::new("/usr/bin/xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(macos_dir)
+            .arg(&frameworks_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    let mut aot_dylibs = Vec::new();
+    let primary_aot_name: &str = __AOT_DYLIB_NAME_DEBUG__;
+    if !primary_aot_name.is_empty() {
+        let primary_aot = frameworks_dir.join(primary_aot_name);
+        if primary_aot.is_file() {
+            aot_dylibs.push(primary_aot.to_string_lossy().into_owned());
+        }
+    }
+    let extra_list: &[&str] = &__EXTRA_AOT_DYLIBS_DEBUG__;
+    for &extra in extra_list {
+        let p = frameworks_dir.join(extra);
+        if p.is_file() {
+            aot_dylibs.push(p.to_string_lossy().into_owned());
+        }
+    }
+
+    let dyld_fallback = match std::env::var("DYLD_FALLBACK_LIBRARY_PATH") {
+        Ok(existing) if !existing.trim().is_empty() => {
+            format!("{}:{existing}", frameworks_dir.display())
+        }
+        _ => format!(
+            "{}:/opt/homebrew/lib:/usr/local/lib:/usr/lib",
+            frameworks_dir.display()
+        ),
+    };
+
+    let bundled_path = match std::env::var("PATH") {
+        Ok(existing) if !existing.trim().is_empty() => {
+            format!("{}:{existing}", macos_dir.display())
+        }
+        _ => format!(
+            "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+            macos_dir.display()
+        ),
+    };
+
+    let env_unset = |key: &str| {
+        std::env::var_os(key).filter(|v| !v.is_empty()).is_none()
+    };
+
+    let mut cmd = std::process::Command::new(&loader_bin);
+    cmd.arg("--game-dir")
+        .arg(&game_dir)
+        .arg("--pe")
+        .arg(&target_pe)
+        .args(&args)
+        .env("STEAM_APPID", __APP_ID_DEBUG__)
+        .env("SteamAppId", __APP_ID_DEBUG__)
+        .env("SteamGameId", __APP_ID_DEBUG__)
+        .env("PATH", &bundled_path)
+        .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_fallback);
+
+    if env_unset("PORT_GAME_DIR") {
+        cmd.env("PORT_GAME_DIR", &game_dir);
+    }
+    if bundled_manifest.is_file() && env_unset("PORT_MANIFEST") {
+        cmd.env("PORT_MANIFEST", &bundled_manifest);
+    }
+    if env_unset("PORT_AOT_FALLBACK_DIR") {
+        cmd.env("PORT_AOT_FALLBACK_DIR", &bundled_aot_dir);
+    }
+    if env_unset("PORT_SHADER_CACHE_FALLBACK") {
+        cmd.env("PORT_SHADER_CACHE_FALLBACK", &bundled_shader_cache);
+    }
+    if env_unset("PORT_SHADER_MANIFEST_FALLBACK") {
+        cmd.env("PORT_SHADER_MANIFEST_FALLBACK", &bundled_shader_manifest);
+    }
+    if env_unset("PORT_PSO_MANIFEST_FALLBACK") {
+        cmd.env("PORT_PSO_MANIFEST_FALLBACK", &bundled_pso_manifest);
+    }
+
+    // Keep signed `.app/Contents/Resources/` strictly immutable during normal user launches on
+    // any Mac (e.g. read-only `/Applications` or App Translocation): read prewarmed `.aot` and
+    // `.aw2s` / manifests via `*_FALLBACK*` above, and write new runtime caches + per-GPU/OS
+    // Metal 4 PSO archives to the user's writable cache directories. During explicit
+    // `--prewarm-aot` packaging or headless `env_clear()` (no `HOME`), write into the bundle if
+    // writable or fall back to a per-app temp cache dir if read-only.
+    let prewarm_bundle = args.iter().any(|a| a == "--prewarm-aot");
+    let user_home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let fallback_tmp_root = std::env::temp_dir().join(format!("port-factory-cache-{}", __APP_ID_DEBUG__));
+    let writable_aot_dir = if !prewarm_bundle {
+        if let Some(ref home) = user_home {
+            home.join("Library/Caches/port-factory/aot")
+        } else if dir_is_writable(&bundled_aot_dir) {
+            bundled_aot_dir.clone()
+        } else {
+            fallback_tmp_root.join("aot")
+        }
+    } else if dir_is_writable(&bundled_aot_dir) {
+        bundled_aot_dir.clone()
+    } else {
+        fallback_tmp_root.join("aot")
+    };
+    let writable_shader_cache = if !prewarm_bundle {
+        if let Some(ref home) = user_home {
+            home.join("Translator/ShaderCache")
+        } else if dir_is_writable(&bundled_shader_cache) {
+            bundled_shader_cache.clone()
+        } else {
+            fallback_tmp_root.join("ShaderCache")
+        }
+    } else if dir_is_writable(&bundled_shader_cache) {
+        bundled_shader_cache.clone()
+    } else {
+        fallback_tmp_root.join("ShaderCache")
+    };
+
+    if env_unset("PORT_AOT_DIR") {
+        cmd.env("PORT_AOT_DIR", &writable_aot_dir);
+    }
+    if env_unset("AW2_DLL_AOT_DIR") {
+        cmd.env("AW2_DLL_AOT_DIR", &writable_aot_dir);
+    }
+    if !aot_dylibs.is_empty() && env_unset("PORT_AOT_DYLIB") {
+        cmd.env("PORT_AOT_DYLIB", aot_dylibs.join(":"));
+    }
+    if env_unset("PORT_REGISTRY_TSV") {
+        cmd.env("PORT_REGISTRY_TSV", &bundled_registry_tsv);
+    }
+    if env_unset("AW2_REGISTRY_TSV") {
+        cmd.env("AW2_REGISTRY_TSV", &bundled_registry_tsv);
+    }
+    if env_unset("PORT_SHADER_CACHE") {
+        cmd.env("PORT_SHADER_CACHE", &writable_shader_cache);
+    }
+    if env_unset("AW2_SHADER_CACHE") {
+        cmd.env("AW2_SHADER_CACHE", &writable_shader_cache);
+    }
+    if bundled_shaderd.is_file() {
+        if env_unset("PORT_SHADERD") {
+            cmd.env("PORT_SHADERD", &bundled_shaderd);
+        }
+        if env_unset("AW2_SHADERD") {
+            cmd.env("AW2_SHADERD", &bundled_shaderd);
+        }
+    }
+    if bundled_msc.is_file() && env_unset("METAL_IRCONVERTER_DYLIB") {
+        cmd.env("METAL_IRCONVERTER_DYLIB", &bundled_msc);
+    }
+    if bundled_dxilconv.is_file() && env_unset("AW2_DXILCONV") {
+        cmd.env("AW2_DXILCONV", &bundled_dxilconv);
+    }
+    if bundled_moltenvk.is_file() && env_unset("PORT_VULKAN_DYLIB") {
+        cmd.env("PORT_VULKAN_DYLIB", &bundled_moltenvk);
+    }
+
+    use std::os::unix::process::CommandExt;
+    let err = cmd.exec();
+    eprintln!("Failed to exec {}: {err}", loader_bin.display());
+    std::process::exit(1);
+}

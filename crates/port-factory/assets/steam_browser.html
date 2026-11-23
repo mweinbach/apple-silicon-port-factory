@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Port Factory — Steam &amp; PC Game Library Converter</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #151c28;
+    --border: #263248;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --green: #10b981;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 28px;
+  }
+  h1 { margin: 0 0 6px 0; font-size: 26px; }
+  .subtitle { color: var(--muted); font-size: 14px; }
+  .search-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 16px;
+    border-radius: 8px;
+    width: 320px;
+    font-size: 14px;
+  }
+  .cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+    gap: 18px;
+    margin-bottom: 36px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .source-pill, .appid-pill {
+    background: #1e293b;
+    color: var(--accent);
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    margin-right: 6px;
+  }
+  .readiness-pill {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .card h3 { margin: 8px 0 12px 0; font-size: 20px; }
+  .meta-grid {
+    display: grid;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+  .meta-grid strong { color: var(--text); }
+  code {
+    background: #0f172a;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px;
+  }
+  .action-bar { display: flex; gap: 10px; }
+  button {
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+    transition: opacity 0.15s;
+  }
+  button:hover { opacity: 0.9; }
+  .btn-primary { background: var(--accent); color: #082f49; }
+  .btn-secondary { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
+  .btn-small { background: #1e293b; color: var(--accent); border: 1px solid var(--border); padding: 6px 12px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  th, td {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  th { background: #0f172a; color: var(--muted); font-weight: 600; }
+  .status-installed { color: var(--green); font-weight: 600; }
+  .status-cloud { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Port Factory — Steam &amp; PC Game Library One-Click Converter</h1>
+    <div class="subtitle">Account: __USER_BANNER__ &bull; __INSTALLED_COUNT__ Installed Targets &bull; __OWNED_COUNT__ Owned Steam Games</div>
+  </div>
+  <input type="text" id="filterInput" class="search-box" placeholder="Search games, AppID, or engine..." oninput="filterGames(this.value)">
+</header>
+
+<h2>Installed Games &amp; Clients Ready for One-Click Conversion</h2>
+<div class="cards-grid">
+  __INSTALLED_ROWS__
+</div>
+
+<h2>Owned Steam Library (__OWNED_COUNT__ Games — One-Click Windows x64 Depot Download + Convert)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>AppID</th>
+      <th>Title</th>
+      <th>Engine / Translation Pipeline</th>
+      <th>Status</th>
+      <th>Playtime / Cache</th>
+      <th>One-Click Action</th>
+    </tr>
+  </thead>
+  <tbody>
+    __OWNED_ROWS__
+  </tbody>
+</table>
+
+<script>
+function copyCmd(cmd, btn) {
+  navigator.clipboard.writeText(cmd);
+  const orig = btn.innerText;
+  btn.innerText = "Copied CLI Command!";
+  setTimeout(() => { btn.innerText = orig; }, 1800);
+}
+function filterGames(q) {
+  const s = q.toLowerCase().trim();
+  document.querySelectorAll('.installed-card, .owned-row').forEach(el => {
+    const match = el.dataset.name.includes(s) || el.dataset.id.includes(s) || el.innerText.toLowerCase().includes(s);
+    el.style.display = match ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

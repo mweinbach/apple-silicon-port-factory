@@ -19,7 +19,9 @@ win64_abi::win64_mods! {
     mod thunks;
 }
 
+mod aot_dylib;
 pub mod ios_host;
+mod shader_prewarm;
 
 /// Register any compiled-in optional [`x86_runtime::game_plugin::GamePlugin`] implementations.
 /// Idempotent (deduplicated by plugin ID).
@@ -1254,103 +1256,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         log::info!("{n} replacement hooks applied");
     } else {
         hooks::init_generic_hooks(exe.base);
-        if let Ok(aot_dylibs) =
-            std::env::var("PORT_AOT_DYLIB").or_else(|_| std::env::var("AW2_AOT_DYLIB"))
-        {
-            for dylib_path in aot_dylibs.split(':').filter(|s| !s.trim().is_empty()) {
-                if let Ok(cpath) = std::ffi::CString::new(dylib_path.trim()) {
-                    unsafe {
-                        let handle = libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-                        if !handle.is_null() {
-                            type SetBaseFn = extern "C" fn(u64);
-                            type CountFn = extern "C" fn() -> usize;
-                            type GetEntryFn = extern "C" fn(usize, *mut u32, *mut u32) -> usize;
-                            type FullyLoweredFn = extern "C" fn(usize) -> bool;
-
-                            let set_base_sym = libc::dlsym(handle, c"aw2_aot_set_image_base".as_ptr());
-                            let count_sym = libc::dlsym(handle, c"aw2_aot_function_count".as_ptr());
-                            let entry_sym = libc::dlsym(handle, c"aw2_aot_get_entry".as_ptr());
-                            let fully_lowered_sym =
-                                libc::dlsym(handle, c"aw2_aot_entry_fully_lowered".as_ptr());
-
-                            if !set_base_sym.is_null() && !count_sym.is_null() && !entry_sym.is_null() {
-                                let fname = std::path::Path::new(dylib_path.trim())
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("");
-                                let stem = fname
-                                    .strip_prefix("lib")
-                                    .unwrap_or(fname)
-                                    .strip_suffix("_aot.dylib")
-                                    .unwrap_or(fname)
-                                    .to_ascii_lowercase();
-                                let target_mod = mods.iter().find(|m| {
-                                    !m.is_builtin() && {
-                                        let mn = m.name.to_ascii_lowercase();
-                                        let mstem = mn
-                                            .strip_suffix(".exe")
-                                            .or_else(|| mn.strip_suffix(".dll"))
-                                            .unwrap_or(&mn)
-                                            .chars()
-                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                                            .collect::<String>();
-                                        mstem == stem
-                                    }
-                                });
-                                let Some(target_mod) = target_mod else {
-                                    log::info!(
-                                        "skipping AOT module {} (module '{}' not yet mapped at startup)",
-                                        dylib_path,
-                                        stem
-                                    );
-                                    continue;
-                                };
-                                let mod_base = target_mod.base as u64;
-                                let set_base: SetBaseFn = std::mem::transmute(set_base_sym);
-                                let get_count: CountFn = std::mem::transmute(count_sym);
-                                let get_entry: GetEntryFn = std::mem::transmute(entry_sym);
-                                let is_fully_lowered: Option<FullyLoweredFn> =
-                                    if fully_lowered_sym.is_null() {
-                                        None
-                                    } else {
-                                        Some(std::mem::transmute(fully_lowered_sym))
-                                    };
-                                set_base(mod_base);
-                                let count = get_count();
-                                let mut registered = 0usize;
-                                let mut skipped_partial = 0usize;
-                                for idx in 0..count {
-                                    // Never register partially lowered prototype AOT entries:
-                                    // leave them for the full ARM64 block JIT + `.aot` cache.
-                                    if let Some(check) = is_fully_lowered {
-                                        if !check(idx) {
-                                            skipped_partial += 1;
-                                            continue;
-                                        }
-                                    }
-                                    let mut begin_rva = 0u32;
-                                    let mut end_rva = 0u32;
-                                    let fn_ptr = get_entry(idx, &mut begin_rva, &mut end_rva);
-                                    if fn_ptr != 0 && begin_rva != 0 {
-                                        x86_runtime::exe::register_native_va(
-                                            mod_base + begin_rva as u64,
-                                            fn_ptr,
-                                        );
-                                        registered += 1;
-                                    }
-                                }
-                                log::info!(
-                                    "loaded AOT module {} for {} ({registered} native ARM64 AOT functions registered, {skipped_partial} partial skipped to JIT for base 0x{:x})",
-                                    dylib_path,
-                                    target_mod.name,
-                                    mod_base
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        aot_dylib::load_aot_dylibs(&mods);
         log::info!(
             "module {norm} (base=0x{:x}, preferred=0x{:x}): running via hybrid AOT + x86-64 -> ARM64 translator",
             exe.base,
@@ -1461,72 +1367,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     // the Windows entry point — showing a native macOS progress window in GUI launches so
     // double-clicked `.app` bundles never look frozen during first-time shader compilation.
     if args.call_export.is_none() {
-        let mode = std::env::var("PORT_PREWARM_SHADERS").unwrap_or_default();
-        let lower = mode.trim().to_ascii_lowercase();
-        if lower != "0" && lower != "off" {
-            let only_if_cold = !(lower == "1" || lower == "force");
-            if let Some(device_id) = d3d12_metal::metal::pso_manifest::prewarm_needed(only_if_cold) {
-                let res = if w::macos::active() {
-                    let app_name = w::config::app_config().app_name;
-                    w::macos::progress_window_open(
-                        format!("{app_name} — Preparing Shaders"),
-                        format!("Compiling Metal 4 shaders for {device_id}..."),
-                        0,
-                    );
-                    let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let done_flag_bg = done_flag.clone();
-                    let last_tick = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let bg = std::thread::spawn(move || {
-                        let r = d3d12_metal::metal::pso_manifest::prewarm_for_current_device_with_progress(
-                            None,
-                            only_if_cold,
-                            |p| {
-                                let prev = last_tick.load(std::sync::atomic::Ordering::Relaxed);
-                                if p.done == 0
-                                    || p.done >= p.total
-                                    || p.done.saturating_sub(prev) >= 4
-                                    || p.total <= 32
-                                {
-                                    last_tick.store(p.done, std::sync::atomic::Ordering::Relaxed);
-                                    w::macos::progress_window_update(
-                                        format!(
-                                            "{}: {} / {} ({})",
-                                            p.stage, p.done, p.total, p.device_identity
-                                        ),
-                                        p.done,
-                                        p.total,
-                                    );
-                                }
-                            },
-                        );
-                        done_flag_bg.store(true, std::sync::atomic::Ordering::Release);
-                        r
-                    });
-                    let _ = w::macos::run_main_loop(&|| {
-                        done_flag.load(std::sync::atomic::Ordering::Acquire).then_some(0)
-                    });
-                    w::macos::progress_window_close();
-                    bg.join().unwrap_or_else(|_| Err("shader prewarm thread panicked".into()))
-                } else {
-                    d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, only_if_cold)
-                };
-                match res {
-                    Ok(rep) if !rep.skipped_warm && (rep.tier1_total > 0 || rep.pso_total > 0) => {
-                        log::info!(
-                            "cold-device shader prewarm for {}: tier1 {}/{}, pso {}/{} in {} ms",
-                            rep.device_identity,
-                            rep.tier1_compiled,
-                            rep.tier1_total,
-                            rep.pso_compiled,
-                            rep.pso_total,
-                            rep.elapsed_ms
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("cold-device shader prewarm skipped: {e}"),
-                }
-            }
-        }
+        shader_prewarm::run_cold_device_prewarm();
     }
     if let Some(export_spec) = args.call_export.clone() {
         let call_args = args.game_args.clone();

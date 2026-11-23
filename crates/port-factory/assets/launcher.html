@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Port Factory — Steam &amp; macOS .app Launcher</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #131924;
+    --panel-2: #1a2232;
+    --border: #273247;
+    --text: #e6edf7;
+    --muted: #93a4be;
+    --accent: #38bdf8;
+    --green: #10b981;
+    --amber: #f59e0b;
+    --red: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    padding: 18px 26px;
+    border-bottom: 1px solid var(--border);
+    background: #0f141e;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .brand h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  .brand .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+  }
+  .pill.ok { color: var(--green); border-color: #10b98155; background: #10b98118; }
+  .pill.warn { color: var(--amber); border-color: #f59e0b55; background: #f59e0b18; }
+  .pill.fail { color: var(--red); border-color: #ef444455; background: #ef444418; }
+  select, input[type="text"] {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 11px;
+    font-size: 13px;
+  }
+  button {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 13px;
+    font-size: 12.5px;
+    font-weight: 600;
+    transition: opacity 0.12s, background 0.12s;
+  }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #052538; }
+  .btn-green { background: var(--green); color: #04281d; }
+  .btn-secondary { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .btn-danger { background: #ef444422; color: #fca5a5; border-color: #ef444455; }
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 440px;
+    gap: 18px;
+    padding: 20px 26px 36px;
+    max-width: 1640px;
+    margin: 0 auto;
+  }
+  @media (max-width: 1120px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab {
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 8px 14px;
+    border-radius: 9px;
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .tab.active { background: #38bdf81f; color: var(--accent); border-color: #38bdf866; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { margin: 0 0 12px 0; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card h3 { margin: 0; font-size: 15px; }
+  .meta { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+  .meta code { color: #cbd5e1; background: #0c111b; padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; word-break: break-all; }
+  .actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; background: #101622; }
+  .console-wrap {
+    position: sticky;
+    top: 84px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  pre.console {
+    margin: 0;
+    background: #070a10;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    height: 440px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.2;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #dbeafe;
+  }
+  .job-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 10px;
+    border-radius: 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .job-row.selected { border-color: var(--accent); }
+  .verify-list { margin-top: 8px; display: grid; gap: 4px; font-size: 12px; }
+  .verify-item { display: flex; gap: 8px; align-items: baseline; padding: 4px 8px; border-radius: 6px; background: #0c111b; }
+  .verify-tag { font-weight: 700; min-width: 38px; font-family: ui-monospace, Menlo, monospace; }
+  .verify-tag.pass { color: var(--green); }
+  .verify-tag.warn { color: var(--amber); }
+  .verify-tag.fail { color: var(--red); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Port Factory Launcher</h1>
+    <div class="sub" id="statusLine">Scanning local Steam libraries, bundles &amp; external SSDs...</div>
+  </div>
+  <div class="controls">
+    <span id="ddBadge" class="pill warn">DepotDownloader: checking...</span>
+    <button id="installDdBtn" class="btn-primary hidden" onclick="setupSteam()">Install ARM64 DepotDownloader</button>
+    <label style="font-size:12px;color:var(--muted)">Auth:
+      <select id="authMode">
+        <option value="qr">Steam Mobile QR Code (--qr)</option>
+        <option value="terminal">Interactive Terminal (Password / 2FA)</option>
+      </select>
+    </label>
+    <label style="font-size:12px;color:var(--muted)">SSD Target:
+      <select id="ssdSelect"><option value="">No external SSD mounted</option></select>
+    </label>
+    <button class="btn-secondary" onclick="refreshState()">Refresh</button>
+  </div>
+</header>
+
+<div class="layout">
+  <div>
+    <div class="tabs">
+      <button class="tab active" id="tab-bundles" onclick="showTab('bundles')">Packaged .app Bundles (<span id="count-bundles">0</span>)</button>
+      <button class="tab" id="tab-installed" onclick="showTab('installed')">Installed Games (<span id="count-installed">0</span>)</button>
+      <button class="tab" id="tab-steam" onclick="showTab('steam')">Steam Library &amp; Download (<span id="count-owned">0</span>)</button>
+    </div>
+
+    <div id="view-bundles" class="panel">
+      <h2>Packaged macOS .app Bundles (Ready to Verify, Launch, or Copy to SSD)</h2>
+      <div id="bundlesGrid" class="cards"></div>
+    </div>
+
+    <div id="view-installed" class="panel hidden">
+      <h2>Installed PC Games Discovered on This Mac</h2>
+      <div id="installedGrid" class="cards"></div>
+    </div>
+
+    <div id="view-steam" class="panel hidden">
+      <h2>Download &amp; Port Any Windows x64 Steam Game</h2>
+      <div class="toolbar">
+        <input type="text" id="customAppId" placeholder="Enter any Steam AppID (e.g. 2357570, 870780, 620)..." style="min-width:300px">
+        <button class="btn-secondary" onclick="downloadCustom(false)">Download Win64</button>
+        <button class="btn-primary" onclick="portCustom()">Download &amp; Convert to .app</button>
+      </div>
+      <div class="toolbar">
+        <input type="text" id="steamSearch" placeholder="Filter owned Steam library by title, AppID, or engine..." oninput="renderOwned()" style="flex:1;min-width:260px">
+      </div>
+      <div style="overflow:auto;max-height:560px">
+        <table>
+          <thead>
+            <tr>
+              <th>AppID</th>
+              <th>Title</th>
+              <th>Status</th>
+              <th>Playtime</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ownedBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="console-wrap">
+    <div class="panel">
+      <h2>
+        <span id="consoleTitle">Live Activity Console</span>
+        <span style="display:flex;gap:6px">
+          <span id="consoleStatus" class="pill">Idle</span>
+          <button id="cancelJobBtn" class="btn-danger hidden" onclick="cancelActiveJob()">Cancel</button>
+        </span>
+      </h2>
+      <pre id="consoleOut" class="console">Ready. Pick a game to download, update, convert to .app, verify, or copy to an external SSD.
+
+Tip: With "Steam Mobile QR Code (--qr)", DepotDownloader prints a scannable QR code right here — no password needed.
+For password/email 2FA login, switch Auth to "Interactive Terminal".</pre>
+    </div>
+
+    <div class="panel">
+      <h2>Recent Jobs</h2>
+      <div id="jobsList" style="font-size:12px;color:var(--muted)">No jobs run in this session yet.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const PF_TOKEN = "__PF_TOKEN__";
+let appState = null;
+let activeJobId = null;
+let pollTimer = null;
+let verifyResults = {};
+
+function fmtBytes(b) {
+  if (!b) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = b, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i >= 3 ? 1 : 0) + " " + units[i];
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function showTab(name) {
+  for (const t of ["bundles", "installed", "steam"]) {
+    document.getElementById("view-" + t).classList.toggle("hidden", t !== name);
+    document.getElementById("tab-" + t).classList.toggle("active", t === name);
+  }
+}
+
+async function apiPost(path, payload) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-PF-Token": PF_TOKEN },
+    body: JSON.stringify(payload || {})
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+function getAuthPayload() {
+  const mode = document.getElementById("authMode").value;
+  const user = (appState && appState.users && appState.users[0]) ? appState.users[0].account_name : "";
+  return { qr: mode === "qr", terminal: mode === "terminal", username: user };
+}
+
+function getSelectedSsd() {
+  return document.getElementById("ssdSelect").value || "";
+}
+
+async function refreshState() {
+  try {
+    const res = await fetch("/api/state");
+    appState = await res.json();
+    renderAll();
+  } catch (e) {
+    document.getElementById("statusLine").textContent = "Error loading state: " + e.message;
+  }
+}
+
+function renderAll() {
+  const s = appState;
+  const acct = s.users.length ? `${s.users[0].persona_name} (${s.users[0].account_name})` : "No local Steam login detected";
+  document.getElementById("statusLine").textContent = `Account: ${acct} • ${s.bundles.length} .app bundle(s) • ${s.installed.length} installed • ${s.owned.length} owned Steam games`;
+
+  const ddBadge = document.getElementById("ddBadge");
+  const installBtn = document.getElementById("installDdBtn");
+  if (s.depot_downloader) {
+    ddBadge.className = "pill ok";
+    ddBadge.textContent = "DepotDownloader: Ready";
+    ddBadge.title = s.depot_downloader;
+    installBtn.classList.add("hidden");
+  } else {
+    ddBadge.className = "pill warn";
+    ddBadge.textContent = "DepotDownloader: Not Installed";
+    installBtn.classList.remove("hidden");
+  }
+
+  const ssdSel = document.getElementById("ssdSelect");
+  const prevSsd = ssdSel.value;
+  if (s.volumes.length) {
+    ssdSel.innerHTML = s.volumes.map(v =>
+      `<option value="${esc(v.path)}">${esc(v.name)} (${fmtBytes(v.free_bytes)} free)</option>`
+    ).join("");
+    if (prevSsd) ssdSel.value = prevSsd;
+  } else {
+    ssdSel.innerHTML = `<option value="">No external SSD mounted</option>`;
+  }
+
+  document.getElementById("count-bundles").textContent = s.bundles.length;
+  document.getElementById("count-installed").textContent = s.installed.length;
+  document.getElementById("count-owned").textContent = s.owned.length;
+
+  renderBundles();
+  renderInstalled();
+  renderOwned();
+  renderJobs();
+}
+
+function renderBundles() {
+  const el = document.getElementById("bundlesGrid");
+  if (!appState.bundles.length) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:13px">No .app bundles in out/apps/ yet. Convert an installed game or download one from the Steam Library tab.</div>`;
+    return;
+  }
+  el.innerHTML = appState.bundles.map(b => {
+    const fws = [
+      b.has_metal_irconverter ? "MSC" : null,
+      b.has_dxilconv ? "DXILConv" : null,
+      b.has_moltenvk ? "MoltenVK" : null,
+    ].filter(Boolean).join(", ") || "none";
+    const v = verifyResults[b.path];
+    let vHtml = "";
+    if (v) {
+      const badge = v.passed
+        ? `<span class="pill ok">SSD READY (${v.checks.length} checks)</span>`
+        : `<span class="pill fail">${v.fail_count} FAIL(s)</span>`;
+      vHtml = `<div style="margin-top:6px">${badge}<div class="verify-list">` +
+        v.checks.map(c => `<div class="verify-item"><span class="verify-tag ${c.status}">${c.status.toUpperCase()}</span><span><strong>${esc(c.name)}</strong>: ${esc(c.detail)}</span></div>`).join("") +
+        `</div></div>`;
+    }
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <h3>${esc(b.name)}.app</h3>
+        <span class="pill ${b.is_symlinked_game ? 'warn' : 'ok'}">${fmtBytes(b.size_bytes)}</span>
+      </div>
+      <div class="meta">
+        <div><strong>Runtime:</strong> <code>${esc(b.runtime)}</code>${b.game_exe ? ` • <strong>PE:</strong> <code>${esc(b.game_exe)}</code>` : ""}</div>
+        <div><strong>Frameworks:</strong> ${esc(fws)} • <strong>AOT Modules:</strong> ${b.aot_modules}</div>
+        <div><code>${esc(b.path)}</code></div>
+      </div>
+      <div class="actions">
+        <button class="btn-green" onclick="launchApp(${esc(JSON.stringify(b.path))})">Launch</button>
+        <button class="btn-primary" onclick="verifyBundle(${esc(JSON.stringify(b.path))})">Verify Portability</button>
+        <button class="btn-secondary" onclick="exportBundle(${esc(JSON.stringify(b.path))})">Copy to SSD</button>
+        <button class="btn-secondary" onclick="revealPath(${esc(JSON.stringify(b.path))})">Reveal</button>
+      </div>
+      ${vHtml}
+    </div>`;
+  }).join("");
+}
+
+function renderInstalled() {
+  const el = document.getElementById("installedGrid");
+  if (!appState.installed.length) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:13px">No installed games found yet.</div>`;
+    return;
+  }
+  el.innerHTML = appState.installed.map(g => {
+    const isNumericSteam = /^\d+$/.test(g.app_id);
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <h3>${esc(g.name)}</h3>
+        <span class="pill ${g.readiness_pct >= 99 ? 'ok' : 'warn'}">${g.readiness_pct.toFixed(1)}% Ready</span>
+      </div>
+      <div class="meta">
+        <div><strong>Source:</strong> ${esc(g.source)} • <strong>AppID:</strong> <code>${esc(g.app_id)}</code></div>
+        <div><strong>Platform:</strong> ${esc(g.platform)} (${fmtBytes(g.size_bytes)})${g.primary_exe ? ` • <code>${esc(g.primary_exe)}</code>` : ""}</div>
+        <div><strong>Engine:</strong> ${esc(g.engine_profile)}</div>
+        <div><code>${esc(g.install_dir)}</code></div>
+      </div>
+      <div class="actions">
+        ${g.is_windows ? `<button class="btn-primary" onclick="convertGame(${esc(JSON.stringify(g.app_id === 'custom' ? g.install_dir : g.app_id))}, ${esc(JSON.stringify(g.name))})">Convert to .app</button>` : ""}
+        ${isNumericSteam && g.is_windows ? `<button class="btn-secondary" onclick="downloadGame(${esc(JSON.stringify(g.app_id))}, true, ${esc(JSON.stringify(g.install_dir))})">Update / Repair via Steam</button>` : ""}
+        <button class="btn-secondary" onclick="revealPath(${esc(JSON.stringify(g.install_dir))})">Reveal</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderOwned() {
+  const q = (document.getElementById("steamSearch").value || "").toLowerCase().trim();
+  const rows = appState.owned.filter(o =>
+    !q || String(o.app_id).includes(q) || o.title.toLowerCase().includes(q) || o.engine_hint.toLowerCase().includes(q)
+  );
+  const body = document.getElementById("ownedBody");
+  body.innerHTML = rows.slice(0, 150).map(o => {
+    const hrs = (o.playtime_minutes / 60).toFixed(1);
+    const st = o.installed
+      ? `<span class="pill ok">Installed (${esc(o.install_source || "Local")})</span>`
+      : `<span class="pill">Cloud</span>`;
+    return `<tr>
+      <td><code>${o.app_id}</code></td>
+      <td><strong>${esc(o.title)}</strong><div style="font-size:11px;color:var(--muted)">${esc(o.engine_hint)}</div></td>
+      <td>${st}</td>
+      <td>${hrs} hr</td>
+      <td style="white-space:nowrap">
+        <button class="btn-secondary" onclick="downloadGame('${o.app_id}', false, '')">Download Win64</button>
+        <button class="btn-primary" onclick="portGame('${o.app_id}')">Port to .app</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function renderJobs() {
+  const el = document.getElementById("jobsList");
+  if (!appState.jobs.length) {
+    el.textContent = "No jobs run in this session yet.";
+    return;
+  }
+  el.innerHTML = appState.jobs.map(j => {
+    const cls = j.status === "succeeded" ? "ok" : (j.status === "failed" ? "fail" : "warn");
+    return `<div class="job-row ${j.id === activeJobId ? 'selected' : ''}" onclick="selectJob(${j.id})">
+      <span>#${j.id} ${esc(j.title)}</span>
+      <span class="pill ${cls}">${esc(j.status)}</span>
+    </div>`;
+  }).join("");
+}
+
+function startPollingJob(id) {
+  activeJobId = id;
+  if (pollTimer) clearInterval(pollTimer);
+  pollJobOnce();
+  pollTimer = setInterval(pollJobOnce, 500);
+}
+
+function selectJob(id) {
+  startPollingJob(id);
+}
+
+async function pollJobOnce() {
+  if (!activeJobId) return;
+  try {
+    const res = await fetch("/api/jobs/" + activeJobId);
+    const job = await res.json();
+    document.getElementById("consoleTitle").textContent = `#${job.id} ${job.title}`;
+    const st = document.getElementById("consoleStatus");
+    st.textContent = job.status;
+    st.className = "pill " + (job.status === "succeeded" ? "ok" : (job.status === "failed" ? "fail" : "warn"));
+    document.getElementById("cancelJobBtn").classList.toggle("hidden", job.status !== "running");
+    const pre = document.getElementById("consoleOut");
+    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
+    pre.textContent = job.logs || "";
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+    if (job.status !== "running") {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      refreshState();
+    }
+  } catch (_) {}
+}
+
+async function setupSteam() {
+  const r = await apiPost("/api/setup-steam", {});
+  startPollingJob(r.job_id);
+  refreshState();
+}
+
+async function downloadGame(target, validate, dir) {
+  const auth = getAuthPayload();
+  const r = await apiPost("/api/download", { target, validate, dir, ...auth });
+  if (r.terminal) {
+    document.getElementById("consoleOut").textContent = r.message + "\nComplete Steam login/2FA in Terminal.app, then click Refresh.";
+  } else {
+    startPollingJob(r.job_id);
+  }
+  refreshState();
+}
+
+function downloadCustom(validate) {
+  const t = document.getElementById("customAppId").value.trim();
+  if (!t) return alert("Enter a Steam AppID or game title first.");
+  downloadGame(t, validate, "");
+}
+
+async function convertGame(target, title) {
+  const r = await apiPost("/api/convert", { target, title });
+  startPollingJob(r.job_id);
+  refreshState();
+}
+
+async function portGame(target) {
+  const auth = getAuthPayload();
+  const copy_to = getSelectedSsd();
+  const r = await apiPost("/api/port", { target, copy_to, ...auth });
+  if (r.terminal) {
+    document.getElementById("consoleOut").textContent = r.message + "\nComplete Steam login/2FA in Terminal.app; the .app will be packaged & verified automatically.";
+  } else {
+    startPollingJob(r.job_id);
+  }
+  refreshState();
+}
+
+function portCustom() {
+  const t = document.getElementById("customAppId").value.trim();
+  if (!t) return alert("Enter a Steam AppID or game title first.");
+  portGame(t);
+}
+
+async function verifyBundle(path) {
+  document.getElementById("consoleOut").textContent = "Verifying " + path + "...";
+  try {
+    const r = await apiPost("/api/verify", { path });
+    verifyResults[path] = r;
+    renderBundles();
+    const lines = r.checks.map(c => `[${c.status.toUpperCase()}] ${c.name}: ${c.detail}`);
+    document.getElementById("consoleOut").textContent = `=== bundle-verify ${path} ===\n` + lines.join("\n") + `\n\nPassed: ${r.passed}`;
+  } catch (e) {
+    document.getElementById("consoleOut").textContent = "Verify error: " + e.message;
+  }
+}
+
+async function exportBundle(path) {
+  const dest = getSelectedSsd();
+  if (!dest) {
+    const manual = prompt("No external SSD detected under /Volumes/. Enter destination folder path:");
+    if (!manual) return;
+    const r = await apiPost("/api/export", { path, dest: manual });
+    startPollingJob(r.job_id);
+    return;
+  }
+  const r = await apiPost("/api/export", { path, dest });
+  startPollingJob(r.job_id);
+  refreshState();
+}
+
+async function launchApp(path) {
+  try {
+    await apiPost("/api/launch", { path });
+    document.getElementById("consoleOut").textContent = "Launched " + path;
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function revealPath(path) {
+  try { await apiPost("/api/reveal", { path }); } catch (e) { alert(e.message); }
+}
+
+async function cancelActiveJob() {
+  if (!activeJobId) return;
+  await apiPost(`/api/jobs/${activeJobId}/cancel`, {});
+  pollJobOnce();
+}
+
+refreshState();
+</script>
+</body>
+</html>
