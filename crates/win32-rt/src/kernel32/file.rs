@@ -78,8 +78,6 @@ const ERROR_NOTIFY_ENUM_DIR: u32 = 1022;
 #[cfg(target_vendor = "apple")]
 const DARWIN_O_EVTONLY: libc::c_int = 0x8000;
 #[cfg(target_vendor = "apple")]
-const DARWIN_F_SETNOSIGPIPE: libc::c_int = 73;
-#[cfg(target_vendor = "apple")]
 const DARWIN_SO_NOSIGPIPE: libc::c_int = 0x1022;
 
 fn ntstatus_to_win32_local(s: usize) -> u32 {
@@ -101,15 +99,6 @@ fn set_cloexec(fd: i32) {
             let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         }
     }
-}
-
-fn set_nosigpipe_pipe(fd: i32) {
-    #[cfg(target_vendor = "apple")]
-    unsafe {
-        let _ = libc::fcntl(fd, DARWIN_F_SETNOSIGPIPE, 1);
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    let _ = fd;
 }
 
 fn set_nosigpipe_sock(fd: i32) {
@@ -926,15 +915,19 @@ fn drain_peek_buf(f: &FileObj, dst: &mut [u8]) -> usize {
     k
 }
 
-/// Try a non-blocking read on a pipe/socket fd without toggling `O_NONBLOCK` on
-/// a potentially shared descriptor.
+/// Try a genuinely nonblocking read on a pipe/socket fd.
+/// - For `AF_UNIX` `SOCK_STREAM` pipes (`CreatePipe`, `CreateNamedPipeW`/`A`), uses per-call
+///   `recv(..., MSG_DONTWAIT)` without ever modifying open-file-description status flags
+///   (`O_NONBLOCK`), so `DuplicateHandle` and inherited/redirected child stdio stay blocking.
+/// - For external POSIX `S_IFIFO` descriptors (`ENOTSOCK`), ensures `O_NONBLOCK` is enabled
+///   (without toggling it back off) so `read()` can never block the caller or shared pipe reactor.
 /// Returns `Ok(Some(n))` (`n == 0` means EOF/broken pipe), `Ok(None)` if would block,
 /// or `Err(errno)`.
 unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<Option<usize>, i32> {
     if n == 0 {
         return Ok(Some(0));
     }
-    // Try MSG_DONTWAIT first for socketpair-backed named pipes.
+    // Try MSG_DONTWAIT first for socketpair-backed anonymous and named pipes.
     loop {
         let r = libc::recv(fd, buf as *mut c_void, n, libc::MSG_DONTWAIT);
         if r >= 0 {
@@ -952,32 +945,17 @@ unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<O
         }
         return Err(e);
     }
-    // Anonymous POSIX pipe: poll(0) + FIONREAD tells us how much is readable without blocking.
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    let pr = loop {
-        let r = libc::poll(&mut pfd, 1, 0);
-        if r < 0 && last_errno() == libc::EINTR {
-            continue;
-        }
-        break r;
-    };
-    if pr < 0 {
+    // External POSIX FIFO fallback: ensure O_NONBLOCK is set once (never toggled off) so
+    // competing readers cannot cause a blocking read() between readiness check and read.
+    let fl = libc::fcntl(fd, libc::F_GETFL);
+    if fl < 0 {
         return Err(last_errno());
     }
-    if pr == 0 || (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) == 0 {
-        return Ok(None);
+    if (fl & libc::O_NONBLOCK) == 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) != 0 {
+        return Err(last_errno());
     }
-    let mut avail: libc::c_int = 0;
-    let has_fionread = libc::ioctl(fd, libc::FIONREAD, &mut avail) == 0;
-    if has_fionread && avail == 0 {
-        if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-            return Ok(Some(0)); // EOF / broken pipe
-        }
-        return Ok(None);
-    }
-    let to_read = if has_fionread && avail > 0 { n.min(avail as usize) } else { n };
     loop {
-        let r = libc::read(fd, buf as *mut c_void, to_read);
+        let r = libc::read(fd, buf as *mut c_void, n);
         if r >= 0 {
             return Ok(Some(r as usize));
         }
@@ -992,15 +970,25 @@ unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<O
     }
 }
 
-/// Try a non-blocking write on a pipe/socket fd.
+/// Try a genuinely nonblocking write on a pipe/socket fd.
+/// On Darwin XNU, `AF_UNIX` `SOCK_STREAM` ignores `MSG_DONTWAIT` on `send()` when `O_NONBLOCK`
+/// is clear and blocks in `sosend`; enabling `O_NONBLOCK` once (never toggling it back off) on
+/// the write fd guarantees nonblocking `write()` for both socketpair-backed pipes and raw
+/// `S_IFIFO` descriptors, while synchronous `WriteFile`/`ReadFile` handle `EAGAIN` via `poll`.
 /// Returns `Ok(Some(n))`, `Ok(None)` if would block, or `Err(errno)`.
 unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Result<Option<usize>, i32> {
     if n == 0 {
         return Ok(Some(0));
     }
-    // Try MSG_DONTWAIT first for socketpair-backed named pipes.
+    let fl = libc::fcntl(fd, libc::F_GETFL);
+    if fl < 0 {
+        return Err(last_errno());
+    }
+    if (fl & libc::O_NONBLOCK) == 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) != 0 {
+        return Err(last_errno());
+    }
     loop {
-        let r = libc::send(fd, buf as *const c_void, n, libc::MSG_DONTWAIT);
+        let r = libc::write(fd, buf as *const c_void, n);
         if r >= 0 {
             return Ok(Some(r as usize));
         }
@@ -1011,52 +999,8 @@ unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Resul
         if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
             return Ok(None);
         }
-        if e == libc::ENOTSOCK {
-            break;
-        }
         return Err(e);
     }
-    // Anonymous POSIX pipe: check POLLOUT first; temporarily set O_NONBLOCK only for large writes.
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    let pr = loop {
-        let r = libc::poll(&mut pfd, 1, 0);
-        if r < 0 && last_errno() == libc::EINTR {
-            continue;
-        }
-        break r;
-    };
-    if pr < 0 {
-        return Err(last_errno());
-    }
-    if pr == 0 {
-        return Ok(None);
-    }
-    if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 && (pfd.revents & libc::POLLOUT) == 0 {
-        return Err(libc::EPIPE);
-    }
-    let old_fl = libc::fcntl(fd, libc::F_GETFL);
-    let toggled = old_fl >= 0 && (old_fl & libc::O_NONBLOCK) == 0;
-    if toggled {
-        let _ = libc::fcntl(fd, libc::F_SETFL, old_fl | libc::O_NONBLOCK);
-    }
-    let res = loop {
-        let r = libc::write(fd, buf as *const c_void, n);
-        if r >= 0 {
-            break Ok(Some(r as usize));
-        }
-        let e = last_errno();
-        if e == libc::EINTR {
-            continue;
-        }
-        if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-            break Ok(None);
-        }
-        break Err(e);
-    };
-    if toggled {
-        let _ = libc::fcntl(fd, libc::F_SETFL, old_fl);
-    }
-    res
 }
 
 pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut OVERLAPPED) -> BOOL {
@@ -1130,11 +1074,22 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                 }
             }
         }
-        // Synchronous blocking pipe read.
+        // Synchronous blocking pipe read (also waits via poll if fd has O_NONBLOCK).
         let r = loop {
             let k = libc::read(fd, buf, n as usize);
-            if k < 0 && last_errno() == libc::EINTR {
-                continue;
+            if k < 0 {
+                let e = last_errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                    let pr = libc::poll(&mut pfd, 1, -1);
+                    if pr < 0 && last_errno() != libc::EINTR {
+                        break -1;
+                    }
+                    continue;
+                }
             }
             break k;
         };
@@ -1289,13 +1244,23 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
             complete_overlapped_io(h, ov, STATUS_SUCCESS, written_so_far, true);
             return TRUE;
         }
-        // Synchronous blocking pipe write (write full buffer).
+        // Synchronous blocking pipe write (write full buffer; waits via poll if fd has O_NONBLOCK).
         let mut done = 0usize;
         while done < n as usize {
             let r = libc::write(fd, (buf as *const u8).add(done) as *const c_void, n as usize - done);
             if r < 0 {
                 let e = last_errno();
                 if e == libc::EINTR {
+                    continue;
+                }
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                    let pr = libc::poll(&mut pfd, 1, -1);
+                    if pr < 0 && last_errno() != libc::EINTR {
+                        let pe = last_errno();
+                        set_err(if pe == libc::EPIPE || pe == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(pe) });
+                        return FALSE;
+                    }
                     continue;
                 }
                 set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
@@ -4622,9 +4587,19 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
         }
     };
 
-    // Check if buffered changes already exist from between consecutive ReadDirectoryChangesW calls.
-    let immediate: Option<(usize, usize)> = {
-        let mut st = watcher.state.lock().unwrap();
+    let tid = teb::thread_id();
+    // Atomically check buffered changes and, if none match, enqueue the request under a single
+    // `watcher.state` lock acquisition so kqueue events arriving concurrently cannot be stranded
+    // in `pending_changes`. Prepare pending OVERLAPPED state BEFORE enqueuing so the watcher
+    // thread can safely complete immediately after we drop the lock, and release the lock BEFORE
+    // delivering any completion notification.
+    let consume_buffered = |st: &mut DirWatcherState| -> Option<(usize, usize)> {
+        while st.requests.front().is_some_and(|r| r.completed.load(Ordering::Acquire)) {
+            st.requests.pop_front();
+        }
+        if !st.requests.is_empty() {
+            return None;
+        }
         if st.overflow {
             st.overflow = false;
             st.pending_changes.clear();
@@ -4648,33 +4623,6 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
         }
     };
 
-    if let Some((status, bytes)) = immediate {
-        if ov.is_null() {
-            if !ret.is_null() {
-                std::ptr::write_unaligned(ret, bytes as u32);
-            }
-            if status == STATUS_SUCCESS {
-                set_err(0);
-                return TRUE;
-            }
-            set_err(ntstatus_to_win32_local(status));
-            return FALSE;
-        }
-        if !cb.is_null() {
-            let caller = crate::thread::ensure_current_thread_object();
-            let cb_fn: crate::thread::IoCompletionRoutine = std::mem::transmute(cb);
-            store_ov_internal_high(ov, bytes);
-            store_ov_internal(ov, status);
-            crate::thread::queue_io_completion_apc(&caller, cb_fn, ntstatus_to_win32_local(status), bytes as u32, ov as usize);
-            set_err(0);
-            return TRUE;
-        }
-        let _ = complete_overlapped_io(h, ov, status, bytes, false);
-        set_err(0);
-        return TRUE;
-    }
-
-    let tid = teb::thread_id();
     if ov.is_null() {
         let done = Arc::new((Mutex::new(None), Condvar::new()));
         let req = Arc::new(DirWatchRequest {
@@ -4685,7 +4633,26 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
             completed: AtomicBool::new(false),
             delivery: DirWatchDelivery::Sync { done: Arc::clone(&done), tid },
         });
-        watcher.state.lock().unwrap().requests.push_back(req);
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            if !ret.is_null() {
+                std::ptr::write_unaligned(ret, bytes as u32);
+            }
+            if status == STATUS_SUCCESS {
+                set_err(0);
+                return TRUE;
+            }
+            set_err(ntstatus_to_win32_local(status));
+            return FALSE;
+        }
         // Drop `Arc<FileObj>` before blocking so `CloseHandle(h)` can drop & cancel cleanly.
         drop(f);
         let (m, cv) = &*done;
@@ -4710,6 +4677,7 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
         let caller = crate::thread::ensure_current_thread_object();
         let cb_fn: crate::thread::IoCompletionRoutine = std::mem::transmute(cb);
         // APC delivery mode: do NOT touch `ov.h_event` or post to IOCP/TpIo.
+        // Publish STATUS_PENDING before `req` can be observed by the watcher thread.
         store_ov_internal_high(ov, 0);
         store_ov_internal(ov, STATUS_PENDING);
         let req = Arc::new(DirWatchRequest {
@@ -4718,12 +4686,31 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
             len: len as usize,
             filter,
             completed: AtomicBool::new(false),
-            delivery: DirWatchDelivery::Apc { ov: ov as usize, cb: cb_fn, thread: caller, tid },
+            delivery: DirWatchDelivery::Apc {
+                ov: ov as usize,
+                cb: cb_fn,
+                thread: Arc::clone(&caller),
+                tid,
+            },
         });
-        watcher.state.lock().unwrap().requests.push_back(req);
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            store_ov_internal_high(ov, bytes);
+            store_ov_internal(ov, status);
+            crate::thread::queue_io_completion_apc(&caller, cb_fn, ntstatus_to_win32_local(status), bytes as u32, ov as usize);
+        }
         set_err(0);
         TRUE
     } else {
+        // Publish pending state before `req` can be observed by the watcher thread.
         f.io_event.reset();
         prepare_overlapped_pending(ov);
         let req = Arc::new(DirWatchRequest {
@@ -4734,7 +4721,18 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
             completed: AtomicBool::new(false),
             delivery: DirWatchDelivery::Overlapped { ov: ov as usize, tid },
         });
-        watcher.state.lock().unwrap().requests.push_back(req);
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            let _ = complete_overlapped_io(h, ov, status, bytes, false);
+        }
         // Windows `ReadDirectoryChangesW` returns non-zero (TRUE) for async overlapped start!
         set_err(0);
         TRUE
@@ -5380,20 +5378,42 @@ fn connect_named_pipe_client(
     Err(ERROR_PIPE_BUSY)
 }
 
-pub unsafe extern "win64" fn CreatePipe(rd: *mut HANDLE, wr: *mut HANDLE, sec: *mut c_void, _size: u32) -> BOOL {
+pub unsafe extern "win64" fn CreatePipe(rd: *mut HANDLE, wr: *mut HANDLE, sec: *mut c_void, size: u32) -> BOOL {
     if rd.is_null() || wr.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    // Use an AF_UNIX SOCK_STREAM socketpair so overlapped/reactor/peek reads & writes can use
+    // per-syscall `MSG_DONTWAIT` without ever modifying shared `O_NONBLOCK` status flags on
+    // duplicated (`DuplicateHandle`) or child-inherited (`CreateProcessW`) descriptors.
     let mut fds = [0i32; 2];
-    if libc::pipe(fds.as_mut_ptr()) != 0 {
+    if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0 {
         set_err(errno_to_win32(last_errno()));
         return FALSE;
     }
-    set_cloexec(fds[0]);
-    set_cloexec(fds[1]);
-    set_nosigpipe_pipe(fds[0]);
-    set_nosigpipe_pipe(fds[1]);
+    let buf_sz: libc::c_int = if size == 0 {
+        65_536
+    } else {
+        (size as i64).clamp(4096, 262_144) as libc::c_int
+    };
+    for &fd in &fds {
+        set_cloexec(fd);
+        set_nosigpipe_sock(fd);
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_sz as *const libc::c_int as *const c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_sz as *const libc::c_int as *const c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
     let hflags = sec_attr_inherit_flags(sec);
     let r = FileObj::new(File::from_raw_fd(fds[0]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_READ, 0);
     let w = FileObj::new(File::from_raw_fd(fds[1]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_WRITE, 0);
@@ -5474,13 +5494,28 @@ pub unsafe extern "win64" fn PeekNamedPipe(
     }
     let total_avail = pb.len().saturating_add(kernel_avail.max(0) as usize);
 
-    // If nothing buffered in userspace or kernel, detect peer close (POLLHUP) as ERROR_BROKEN_PIPE.
+    // If nothing buffered in userspace or kernel, detect peer close (POLLHUP / EOF) as ERROR_BROKEN_PIPE.
     if total_avail == 0 {
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         let pr = libc::poll(&mut pfd, 1, 0);
-        if pr > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-            set_err(err::ERROR_BROKEN_PIPE);
-            return FALSE;
+        if pr > 0 {
+            if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                set_err(err::ERROR_BROKEN_PIPE);
+                return FALSE;
+            }
+            if (pfd.revents & libc::POLLIN) != 0 {
+                let mut probe = 0u8;
+                let rr = libc::recv(
+                    fd,
+                    &mut probe as *mut u8 as *mut c_void,
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                );
+                if rr == 0 {
+                    set_err(err::ERROR_BROKEN_PIPE);
+                    return FALSE;
+                }
+            }
         }
     }
 
@@ -7286,6 +7321,361 @@ mod tests {
             assert_eq!(CloseHandle(iocp), TRUE);
             assert_eq!(CloseHandle(rd2), TRUE);
             assert_eq!(CloseHandle(wr2), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_nonblocking_read_never_stalls_reactor_on_competing_reader_and_preserves_sync_eof() {
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+
+        unsafe {
+            // (a) CreatePipe + DuplicateHandle competing reader must never block the shared
+            // PipeIoReactor or stall unrelated pipes, and must never set O_NONBLOCK on the fd.
+            let (mut rd_a, mut wr_a) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let (mut rd_b, mut wr_b) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd_a, &mut wr_a, std::ptr::null_mut(), 0), TRUE);
+            assert_eq!(CreatePipe(&mut rd_b, &mut wr_b, std::ptr::null_mut(), 0), TRUE);
+
+            let cur_proc = handles::CURRENT_PROCESS;
+            let mut rd_a_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(cur_proc, rd_a, cur_proc, &mut rd_a_dup, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */),
+                TRUE
+            );
+            assert!(!rd_a_dup.is_null());
+
+            let (fd_a, _) = file_fd_and_kind(rd_a).unwrap();
+            let (fd_a_dup, _) = file_fd_and_kind(rd_a_dup).unwrap();
+            // Empty nonblocking read returns Ok(None) immediately and leaves O_NONBLOCK clear.
+            let mut probe = [0u8; 8];
+            assert_eq!(try_nonblocking_pipe_read(fd_a, probe.as_mut_ptr(), probe.len()), Ok(None));
+            assert_eq!(libc::fcntl(fd_a, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            assert_eq!(libc::fcntl(fd_a_dup, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+
+            let iocp = CreateIoCompletionPort(rd_a, std::ptr::null_mut(), 0xA001, 1);
+            assert!(!iocp.is_null());
+            assert_eq!(CreateIoCompletionPort(rd_b, iocp, 0xB002, 0), iocp);
+
+            // Race Pipe A's overlapped reactor read against a competing reader on rd_a_dup,
+            // while verifying Pipe B's overlapped read completes promptly without stalling.
+            for iter in 0..25usize {
+                let mut buf_a = [0u8; 16];
+                let mut ov_a: OVERLAPPED = std::mem::zeroed();
+                let mut got_a = 0u32;
+                assert_eq!(ReadFile(rd_a, buf_a.as_mut_ptr() as *mut c_void, 16, &mut got_a, &mut ov_a), FALSE);
+                assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+                let mut buf_b = [0u8; 16];
+                let mut ov_b: OVERLAPPED = std::mem::zeroed();
+                let mut got_b = 0u32;
+                assert_eq!(ReadFile(rd_b, buf_b.as_mut_ptr() as *mut c_void, 16, &mut got_b, &mut ov_b), FALSE);
+                assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+                // Write 1 byte to Pipe A, then immediately try to steal it via the duplicate handle.
+                let mut wn = 0u32;
+                let byte = [(iter & 0xFF) as u8];
+                assert_eq!(WriteFile(wr_a, byte.as_ptr() as *const c_void, 1, &mut wn, std::ptr::null_mut()), TRUE);
+                let mut stolen = [0u8; 4];
+                let stole = matches!(try_nonblocking_pipe_read(fd_a_dup, stolen.as_mut_ptr(), 4), Ok(Some(1)));
+
+                // Write to unrelated Pipe B: if the reactor blocked on Pipe A after losing the
+                // race, Pipe B's completion would hang!
+                let tag = b"pipe-b!";
+                assert_eq!(WriteFile(wr_b, tag.as_ptr() as *const c_void, tag.len() as u32, &mut wn, std::ptr::null_mut()), TRUE);
+
+                // If the duplicate handle stole the byte, cancel Pipe A's still-pending read;
+                // CancelIoEx must return immediately without blocking on a stuck reactor!
+                if stole {
+                    let _ = CancelIoEx(rd_a, &mut ov_a);
+                }
+
+                let mut saw_a = false;
+                let mut saw_b = false;
+                for _ in 0..2 {
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    let ok = GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000);
+                    if p_key == 0xB002 {
+                        assert_eq!(ok, TRUE);
+                        assert_eq!(p_ov, &mut ov_b as *mut OVERLAPPED);
+                        assert_eq!(p_bytes as usize, tag.len());
+                        assert_eq!(&buf_b[..tag.len()], tag);
+                        saw_b = true;
+                    } else if p_key == 0xA001 {
+                        assert_eq!(p_ov, &mut ov_a as *mut OVERLAPPED);
+                        if ok == TRUE {
+                            assert_eq!(p_bytes, 1);
+                            assert_eq!(buf_a[0], byte[0]);
+                        } else {
+                            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                        }
+                        saw_a = true;
+                    } else {
+                        panic!("unexpected IOCP key {p_key:#x}");
+                    }
+                }
+                assert!(saw_a && saw_b);
+            }
+
+            // (b) Synchronous ReadFile on duplicate pipe handle still blocks for data and
+            // reports ERROR_BROKEN_PIPE cleanly when the write end closes.
+            assert_eq!(libc::fcntl(fd_a_dup, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            let dup_addr = rd_a_dup as usize;
+            let sync_reader = std::thread::spawn(move || {
+                let mut out = [0u8; 32];
+                let mut n1 = 0u32;
+                let ok1 = ReadFile(dup_addr as HANDLE, out.as_mut_ptr() as *mut c_void, 32, &mut n1, std::ptr::null_mut());
+                assert_eq!(ok1, TRUE);
+                let first = out[..n1 as usize].to_vec();
+                let mut n2 = 0u32;
+                let ok2 = ReadFile(dup_addr as HANDLE, out.as_mut_ptr() as *mut c_void, 32, &mut n2, std::ptr::null_mut());
+                assert_eq!(ok2, FALSE);
+                (first, teb::last_error())
+            });
+            let msg = b"sync-wait-ok";
+            let mut wn = 0u32;
+            assert_eq!(WriteFile(wr_a, msg.as_ptr() as *const c_void, msg.len() as u32, &mut wn, std::ptr::null_mut()), TRUE);
+            assert_eq!(CloseHandle(wr_a), TRUE);
+            let (first, eof_err) = sync_reader.join().unwrap();
+            assert_eq!(&first, msg);
+            assert_eq!(eof_err, err::ERROR_BROKEN_PIPE);
+
+            assert_eq!(CloseHandle(rd_a_dup), TRUE);
+            assert_eq!(CloseHandle(rd_a), TRUE);
+            assert_eq!(CloseHandle(rd_b), TRUE);
+            assert_eq!(CloseHandle(wr_b), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+
+            // (c) External raw POSIX S_IFIFO fallback: nonblocking read never blocks on empty
+            // FIFO, and synchronous ReadFile still waits for data and returns ERROR_BROKEN_PIPE on EOF.
+            let mut raw_fds = [-1i32; 2];
+            assert_eq!(libc::pipe(raw_fds.as_mut_ptr()), 0);
+            set_cloexec(raw_fds[0]);
+            set_cloexec(raw_fds[1]);
+            let h_fifo_rd = handles::insert(Arc::new(FileObj::new(
+                File::from_raw_fd(raw_fds[0]),
+                FileKind::Pipe,
+                "\\\\.\\pipe\\raw-fifo-rd".into(),
+                None,
+                GENERIC_READ,
+                0,
+            )));
+            let h_fifo_wr = handles::insert(Arc::new(FileObj::new(
+                File::from_raw_fd(raw_fds[1]),
+                FileKind::Pipe,
+                "\\\\.\\pipe\\raw-fifo-wr".into(),
+                None,
+                GENERIC_WRITE,
+                0,
+            )));
+            assert_eq!(try_nonblocking_pipe_read(raw_fds[0], probe.as_mut_ptr(), 8), Ok(None));
+
+            let fifo_rd_addr = h_fifo_rd as usize;
+            let fifo_sync = std::thread::spawn(move || {
+                let mut b = [0u8; 16];
+                let mut n1 = 0u32;
+                assert_eq!(ReadFile(fifo_rd_addr as HANDLE, b.as_mut_ptr() as *mut c_void, 16, &mut n1, std::ptr::null_mut()), TRUE);
+                let got = b[..n1 as usize].to_vec();
+                let mut n2 = 0u32;
+                assert_eq!(ReadFile(fifo_rd_addr as HANDLE, b.as_mut_ptr() as *mut c_void, 16, &mut n2, std::ptr::null_mut()), FALSE);
+                (got, teb::last_error())
+            });
+            assert_eq!(WriteFile(h_fifo_wr, b"fifo-ok".as_ptr() as *const c_void, 7, &mut wn, std::ptr::null_mut()), TRUE);
+            assert_eq!(CloseHandle(h_fifo_wr), TRUE);
+            let (fifo_got, fifo_eof_err) = fifo_sync.join().unwrap();
+            assert_eq!(&fifo_got, b"fifo-ok");
+            assert_eq!(fifo_eof_err, err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(h_fifo_rd), TRUE);
+        }
+    }
+
+    #[test]
+    fn read_directory_changes_atomic_buffered_and_live_registration_all_modes() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        let dir = std::env::temp_dir().join(format!("win32_rt_dirwatch_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("W:\\", std::path::Path::new("/"));
+        let win_dir = to_wide_z(&format!("W:{}", dir.to_string_lossy().replace('/', "\\")));
+        let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+
+        unsafe {
+            let open_dir = || {
+                let h = CreateFileW(
+                    win_dir.as_ptr(),
+                    GENERIC_READ,
+                    7,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000, // FILE_FLAG_OVERLAPPED
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let wait_for_buffered = |h: HANDLE| {
+                let f = get_file(h).unwrap();
+                let w = f.dir_watcher.lock().unwrap().clone().expect("watcher started");
+                let dl = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < dl {
+                    if !w.state.lock().unwrap().pending_changes.is_empty() {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("timed out waiting for watcher to buffer filesystem change");
+            };
+
+            // (a) Event-before-register (buffered change consumed atomically) across Sync, APC, and Overlapped+IOCP.
+            let h = open_dir();
+            let iocp = CreateIoCompletionPort(h, std::ptr::null_mut(), 0xD777, 1);
+            assert!(!iocp.is_null());
+
+            // Prime the watcher with one live overlapped watch so DirWatcher is running.
+            let mut buf = [0u8; 4096];
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov, std::ptr::null()),
+                TRUE
+            );
+            std::fs::write(dir.join("prime.txt"), b"0").unwrap();
+            let mut p_bytes = 0u32;
+            let mut p_key = 0usize;
+            let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+            assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+
+            // 1. Buffered -> Overlapped+IOCP: mutate while NO request is registered, wait until
+            // buffered, then register overlapped read; must complete immediately with NO extra mutation.
+            std::fs::write(dir.join("buffered_ov.txt"), b"1").unwrap();
+            wait_for_buffered(h);
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov, std::ptr::null()),
+                TRUE
+            );
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 2000), TRUE);
+            assert_eq!(p_key, 0xD777);
+            assert_eq!(p_ov, &mut ov as *mut OVERLAPPED);
+            assert_eq!(WaitForSingleObject(ev, 1000), WAIT_OBJECT_0);
+            let recs = parse_notify_records(&buf, p_bytes as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_ov.txt"), "got {recs:?}");
+
+            // 2. Buffered -> APC: mutate while NO request is registered, wait until buffered, then
+            // register APC read; must queue APC immediately without touching ov.h_event.
+            static ATOMIC_APC_CALLS: AtomicU32 = AtomicU32::new(0);
+            static ATOMIC_APC_BYTES: AtomicU32 = AtomicU32::new(0);
+            static ATOMIC_APC_OV: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "win64" fn atomic_apc_cb(err_code: u32, bytes: u32, ov_addr: usize) {
+                assert_eq!(err_code, 0);
+                ATOMIC_APC_BYTES.store(bytes, Ordering::Release);
+                ATOMIC_APC_OV.store(ov_addr, Ordering::Release);
+                ATOMIC_APC_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+            ATOMIC_APC_CALLS.store(0, Ordering::Release);
+            let apc_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_apc: OVERLAPPED = std::mem::zeroed();
+            ov_apc.h_event = apc_ev;
+            std::fs::write(dir.join("buffered_apc.txt"), b"2").unwrap();
+            wait_for_buffered(h);
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    filter,
+                    std::ptr::null_mut(),
+                    &mut ov_apc,
+                    atomic_apc_cb as *const c_void,
+                ),
+                TRUE
+            );
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(ATOMIC_APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(ATOMIC_APC_OV.load(Ordering::Acquire), &mut ov_apc as *mut OVERLAPPED as usize);
+            assert_eq!(WaitForSingleObject(apc_ev, 0), WAIT_TIMEOUT, "APC mode must not signal ov.h_event");
+            let recs = parse_notify_records(&buf, ATOMIC_APC_BYTES.load(Ordering::Acquire) as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_apc.txt"), "got {recs:?}");
+
+            // 3. Buffered -> Sync: mutate while NO request is registered, wait until buffered, then
+            // call synchronous ReadDirectoryChangesW; must return immediately with the buffered record.
+            std::fs::write(dir.join("buffered_sync.txt"), b"3").unwrap();
+            wait_for_buffered(h);
+            let mut sync_bytes = 0u32;
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, &mut sync_bytes, std::ptr::null_mut(), std::ptr::null()),
+                TRUE
+            );
+            let recs = parse_notify_records(&buf, sync_bytes as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_sync.txt"), "got {recs:?}");
+
+            // (b) Concurrent mutation-vs-registration stress across Sync, APC, and Overlapped+IOCP:
+            // exercises both event-before-register and register-before-event with zero hangs.
+            for i in 0..10usize {
+                let name = format!("race_ov_{i}.txt");
+                let p = dir.join(&name);
+                let mut ov_r: OVERLAPPED = std::mem::zeroed();
+                let t = std::thread::spawn(move || {
+                    std::fs::write(p, b"r").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov_r, std::ptr::null()),
+                    TRUE
+                );
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+                assert_eq!(p_ov, &mut ov_r as *mut OVERLAPPED);
+                t.join().unwrap();
+
+                let name_a = format!("race_apc_{i}.txt");
+                let pa = dir.join(&name_a);
+                ATOMIC_APC_CALLS.store(0, Ordering::Release);
+                let mut ov_ra: OVERLAPPED = std::mem::zeroed();
+                let ta = std::thread::spawn(move || {
+                    std::fs::write(pa, b"a").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(
+                        h,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len() as u32,
+                        FALSE,
+                        filter,
+                        std::ptr::null_mut(),
+                        &mut ov_ra,
+                        atomic_apc_cb as *const c_void,
+                    ),
+                    TRUE
+                );
+                assert_eq!(SleepEx(3000, TRUE), WAIT_IO_COMPLETION);
+                assert_eq!(ATOMIC_APC_CALLS.load(Ordering::Acquire), 1);
+                ta.join().unwrap();
+
+                let name_s = format!("race_sync_{i}.txt");
+                let ps = dir.join(&name_s);
+                let mut sb = 0u32;
+                let ts = std::thread::spawn(move || {
+                    std::fs::write(ps, b"s").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, &mut sb, std::ptr::null_mut(), std::ptr::null()),
+                    TRUE
+                );
+                assert!(sb > 0);
+                ts.join().unwrap();
+            }
+
+            assert_eq!(CloseHandle(apc_ev), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(h), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
