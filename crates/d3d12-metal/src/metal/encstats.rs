@@ -3,7 +3,9 @@
 //! Relaxed atomic increments only; [`dump`] logs per-frame averages since the
 //! previous dump.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicU8;
 
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {
@@ -183,14 +185,73 @@ counters!(
 
 pub type Counter = AtomicU64;
 
+/// Fast relaxed gate controlling whether counter increments and stat-only
+/// diagnostic re-evaluations run.
+///
+/// Starts `true` under `#[cfg(test)]` so all unit tests observe exact counter
+/// increments; in non-test builds it is lazily initialized from `AW2_ENC_STATS`
+/// (`!= "0"`) so production runs avoid cross-core atomic RMW false sharing when
+/// encoder statistics are disabled.
+#[cfg(test)]
+pub static ENABLED: AtomicBool = AtomicBool::new(true);
+#[cfg(not(test))]
+pub static ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+static INIT_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(not(test))]
+#[cold]
+#[inline(never)]
+fn init_enabled() -> bool {
+    let on = std::env::var_os("AW2_ENC_STATS").is_some_and(|v| v != "0");
+    ENABLED.store(on, Relaxed);
+    INIT_STATE.store(if on { 2 } else { 1 }, Relaxed);
+    on
+}
+
+/// Fast-path check: true when `AW2_ENC_STATS` is enabled (or during unit tests).
+#[inline(always)]
+pub fn active() -> bool {
+    #[cfg(test)]
+    {
+        ENABLED.load(Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        match INIT_STATE.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => init_enabled(),
+        }
+    }
+}
+
 #[inline(always)]
 pub fn inc(c: &AtomicU64) {
-    c.fetch_add(1, Relaxed);
+    if active() {
+        c.fetch_add(1, Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn add(c: &AtomicU64, n: u64) {
+    if active() {
+        c.fetch_add(n, Relaxed);
+    }
 }
 
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_ENC_STATS").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("AW2_ENC_STATS").is_some_and(|v| v != "0");
+        #[cfg(not(test))]
+        {
+            ENABLED.store(on, Relaxed);
+            INIT_STATE.store(if on { 2 } else { 1 }, Relaxed);
+        }
+        on
+    })
 }
 
 /// Log per-frame averages over the last `frames` frames and reset.
@@ -207,5 +268,40 @@ pub fn dump(frames: u64) {
 #[cfg(test)]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    L.lock().unwrap_or_else(|e| e.into_inner())
+    let g = L.lock().unwrap_or_else(|e| e.into_inner());
+    ENABLED.store(true, Relaxed);
+    g
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inc_and_add_are_gated_by_enabled_flag() {
+        let _lock = test_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ENABLED.store(true, Relaxed);
+            }
+        }
+        let _restore = Restore;
+
+        let local = AtomicU64::new(0);
+        assert!(active());
+        inc(&local);
+        add(&local, 5);
+        assert_eq!(local.load(Relaxed), 6);
+
+        ENABLED.store(false, Relaxed);
+        assert!(!active());
+        inc(&local);
+        add(&local, 10);
+        assert_eq!(local.load(Relaxed), 6, "counters must not mutate when ENABLED is false");
+
+        ENABLED.store(true, Relaxed);
+        inc(&local);
+        assert_eq!(local.load(Relaxed), 7);
+    }
 }

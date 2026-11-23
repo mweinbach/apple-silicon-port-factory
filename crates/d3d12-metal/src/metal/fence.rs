@@ -98,9 +98,6 @@ impl Fence {
         let enq_ns = self.pending_sig_ns.load(Ordering::Acquire);
         if polls >= 8 || now_ns.saturating_sub(enq_ns) >= 500_000 {
             super::queue::Queue::flush_fence_signals_by_addr(q_addr);
-            if self.ev.signaledValue() < pv {
-                let _ = self.ev.waitUntilSignaledValue_timeoutMS(pv, 1);
-            }
             return self.ev.signaledValue();
         }
         raw

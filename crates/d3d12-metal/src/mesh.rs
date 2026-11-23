@@ -109,6 +109,10 @@ pub struct MeshPipeline {
     pub as_access: Option<crate::metal::pipeline::ComputeAccess>,
     pub ms_access: crate::metal::pipeline::ComputeAccess,
     pub ps_access: Option<crate::metal::pipeline::ComputeAccess>,
+    /// Embedded handle-kind profiles (eliminating `HK_PROFILE_REGISTRY.read()` on draw).
+    pub as_hk_profile: Option<crate::metal::pipeline::HandleKindProfile>,
+    pub ms_hk_profile: crate::metal::pipeline::HandleKindProfile,
+    pub ps_hk_profile: Option<crate::metal::pipeline::HandleKindProfile>,
 }
 unsafe impl Send for MeshPipeline {}
 unsafe impl Sync for MeshPipeline {}
@@ -194,7 +198,7 @@ impl MeshPipeline {
         }
 
         let desc = MTL4MeshRenderPipelineDescriptor::new();
-        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal mesh pso v1");
+        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal mesh pso v2");
         if let Some(a) = &amplification {
             desc.setObjectFunctionDescriptor(Some(&shader_function_descriptor(&*library(a)?, a)));
             key.u128(a.key);
@@ -247,7 +251,8 @@ impl MeshPipeline {
         }
         unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
         desc.setAlphaToCoverageState(if blend.alpha_to_coverage { MTL4AlphaToCoverageState::Enabled } else { MTL4AlphaToCoverageState::Disabled });
-        key.bytes(format!("{blend:?}|{:?}|{}|{payload_bytes}", d.rtv_formats, d.sample_count).as_bytes());
+        crate::metal::pipeline::RenderPsoStateKey::new(blend, &d.rtv_formats, d.sample_count, payload_bytes)
+            .write_to(&mut key);
         let mut pso_key = key.finish();
         if immut_opt {
             pso_key ^= crate::metal::pipeline::IMMUTABLE_OPT_KEY_SALT;
@@ -257,72 +262,50 @@ impl MeshPipeline {
         }
 
         let pso = cache.render_pipeline(Some(pso_key), &desc).map_err(|e| format!("mesh render pipeline: {e}"))?;
+        let ms_sum = crate::metal::pipeline::ShaderStageSummary::new(d.mesh, &mesh, &rs);
+        let as_sum = amplification
+            .as_ref()
+            .zip(d.amplification)
+            .map(|(a, b)| (a, b, crate::metal::pipeline::ShaderStageSummary::new(b, a, &rs)));
+        let ps_sum = pixel
+            .as_ref()
+            .zip(d.pixel)
+            .map(|(p, b)| (p, b, crate::metal::pipeline::ShaderStageSummary::new(b, p, &rs)));
         let msc_usage = crate::metal::pipeline::msc_stage_usage();
         let sm66_gfx = crate::metal::pipeline::sm66_gfx_stage_exact();
         let base_use_msc = pso_opt_v2 || msc_usage;
-        let dxil_pre_raster = crate::metal::pipeline::stage_reads_resources_with(&mesh, d.mesh, false)
-            | amplification
-                .as_ref()
-                .zip(d.amplification)
-                .map_or(0, |(a, b)| crate::metal::pipeline::stage_reads_resources_with(a, b, false));
+        let dxil_pre_raster = ms_sum.stage_reads_resources(&mesh, false)
+            | as_sum.as_ref().map_or(0, |(a, _, s)| s.stage_reads_resources(a, false));
         let base_pre_raster = if base_use_msc {
-            crate::metal::pipeline::stage_reads_resources_with(&mesh, d.mesh, true)
-                | amplification
-                    .as_ref()
-                    .zip(d.amplification)
-                    .map_or(0, |(a, b)| crate::metal::pipeline::stage_reads_resources_with(a, b, true))
+            ms_sum.stage_reads_resources(&mesh, true)
+                | as_sum.as_ref().map_or(0, |(a, _, s)| s.stage_reads_resources(a, true))
         } else {
             dxil_pre_raster
         };
-        let sm66_pre_raster_reads = crate::metal::pipeline::stage_srv_uav_classes(&mesh, d.mesh, &rs, true)
-            | amplification
-                .as_ref()
-                .zip(d.amplification)
-                .map_or(0, |(a, b)| crate::metal::pipeline::stage_srv_uav_classes(a, b, &rs, true));
-        let dxil_ms_as_cbv = crate::metal::pipeline::stage_may_read_cbv_buffer_with(&mesh, d.mesh, &rs, false)
-            || amplification
-                .as_ref()
-                .zip(d.amplification)
-                .is_some_and(|(a, b)| crate::metal::pipeline::stage_may_read_cbv_buffer_with(a, b, &rs, false));
-        let sm66_ms_as_reads_cbv = crate::metal::pipeline::stage_may_read_cbv_buffer_with(&mesh, d.mesh, &rs, true)
-            || amplification
-                .as_ref()
-                .zip(d.amplification)
-                .is_some_and(|(a, b)| crate::metal::pipeline::stage_may_read_cbv_buffer_with(a, b, &rs, true));
-        let ms_as_writes_uav = crate::metal::pipeline::shader_writes_uav(&mesh, d.mesh, true)
-            || amplification
-                .as_ref()
-                .zip(d.amplification)
-                .is_some_and(|(a, b)| crate::metal::pipeline::shader_writes_uav(a, b, true));
-        let ps_writes_uav = pixel
-            .as_ref()
-            .zip(d.pixel)
-            .is_some_and(|(p, b)| crate::metal::pipeline::shader_writes_uav(p, b, true));
-        if pixel
-            .as_ref()
-            .zip(d.pixel)
-            .is_some_and(|(p, b)| crate::metal::pipeline::shader_writes_buf_uav(p, b))
-        {
+        let sm66_pre_raster_reads = ms_sum.stage_srv_uav_classes(&mesh, &rs, true)
+            | as_sum.as_ref().map_or(0, |(a, _, s)| s.stage_srv_uav_classes(a, &rs, true));
+        let dxil_ms_as_cbv = ms_sum.stage_may_read_cbv(&rs, false)
+            || as_sum.as_ref().is_some_and(|(_, _, s)| s.stage_may_read_cbv(&rs, false));
+        let sm66_ms_as_reads_cbv = ms_sum.stage_may_read_cbv(&rs, true)
+            || as_sum.as_ref().is_some_and(|(_, _, s)| s.stage_may_read_cbv(&rs, true));
+        let ms_as_writes_uav = ms_sum.shader_writes_uav(true)
+            || as_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(true));
+        let ps_writes_uav = ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(true));
+        if ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_buf_uav()) {
             crate::metal::pipeline::note_frag_buf_write();
         }
         let sm66_writes_uav = ms_as_writes_uav || ps_writes_uav;
-        let dxil_writes_uav = crate::metal::pipeline::shader_writes_uav(&mesh, d.mesh, false)
-            || amplification
-                .as_ref()
-                .zip(d.amplification)
-                .is_some_and(|(a, b)| crate::metal::pipeline::shader_writes_uav(a, b, false))
-            || pixel
-                .as_ref()
-                .zip(d.pixel)
-                .is_some_and(|(p, b)| crate::metal::pipeline::shader_writes_uav(p, b, false));
+        let dxil_writes_uav = ms_sum.shader_writes_uav(false)
+            || as_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(false))
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(false));
         let base_writes_uav = if base_use_msc { sm66_writes_uav } else { dxil_writes_uav };
         let pre_raster_reads = if sm66_gfx { sm66_pre_raster_reads } else { base_pre_raster };
         let writes_uav = if sm66_gfx { sm66_writes_uav } else { base_writes_uav };
-        let (ps_srv_uav_classes, ps_read_classes) = match pixel.as_ref().zip(d.pixel) {
-            Some((p, b)) => {
-                let srv_uav = crate::metal::pipeline::stage_srv_uav_classes(p, b, &rs, true);
+        let (ps_srv_uav_classes, ps_read_classes) = match &ps_sum {
+            Some((p, _, s)) => {
+                let srv_uav = s.stage_srv_uav_classes(p, &rs, true);
                 let mut m = srv_uav;
-                if crate::metal::pipeline::stage_may_read_cbv_buffer_with(p, b, &rs, true) {
+                if s.stage_may_read_cbv(&rs, true) {
                     m |= crate::metal::pipeline::READS_BUF;
                 }
                 (srv_uav, m)
@@ -330,26 +313,13 @@ impl MeshPipeline {
             None => (0, 0),
         };
         let uses_uav = writes_uav
-            || crate::metal::pipeline::shader_uses_uav(&mesh, d.mesh, &rs)
-            || amplification
-                .as_ref()
-                .zip(d.amplification)
-                .is_some_and(|(a, b)| crate::metal::pipeline::shader_uses_uav(a, b, &rs))
-            || pixel
-                .as_ref()
-                .zip(d.pixel)
-                .is_some_and(|(p, b)| crate::metal::pipeline::shader_uses_uav(p, b, &rs));
+            || ms_sum.shader_uses_uav(&rs)
+            || as_sum.as_ref().is_some_and(|(_, _, s)| s.shader_uses_uav(&rs))
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_uses_uav(&rs));
         let both_classes = crate::metal::pipeline::READS_TEX | crate::metal::pipeline::READS_BUF;
-        let msc_proven = crate::metal::pipeline::metallib_res_desc_heap_unused(&mesh.metallib)
-            && crate::metal::pipeline::msc_resource_usages(&mesh).is_some()
-            && amplification.as_ref().is_none_or(|a| {
-                crate::metal::pipeline::metallib_res_desc_heap_unused(&a.metallib)
-                    && crate::metal::pipeline::msc_resource_usages(a).is_some()
-            })
-            && pixel.as_ref().is_none_or(|p| {
-                crate::metal::pipeline::metallib_res_desc_heap_unused(&p.metallib)
-                    && crate::metal::pipeline::msc_resource_usages(p).is_some()
-            });
+        let msc_proven = ms_sum.msc_proven()
+            && as_sum.as_ref().is_none_or(|(_, _, s)| s.msc_proven())
+            && ps_sum.as_ref().is_none_or(|(_, _, s)| s.msc_proven());
         let sm66_narrowed = sm66_pre_raster_reads != dxil_pre_raster
             || sm66_ms_as_reads_cbv != dxil_ms_as_cbv
             || sm66_writes_uav != dxil_writes_uav
@@ -364,16 +334,21 @@ impl MeshPipeline {
         {
             crate::metal::encstats::inc(&crate::metal::encstats::c::msc_stage_usage_hit);
         }
-        let as_access = amplification
-            .as_ref()
-            .zip(d.amplification)
-            .map(|(a, b)| crate::metal::pipeline::ComputeAccess::for_stage_shader(b, &rs, a, false));
-        let ms_access =
-            crate::metal::pipeline::ComputeAccess::for_stage_shader(d.mesh, &rs, &mesh, false);
-        let ps_access = pixel
-            .as_ref()
-            .zip(d.pixel)
-            .map(|(p, b)| crate::metal::pipeline::ComputeAccess::for_stage_shader(b, &rs, p, false));
+        let (as_access, as_hk_profile) = match &as_sum {
+            Some((a, b, s)) => {
+                let (acc, hk) = s.for_stage(b, &rs, a, false);
+                (Some(acc), Some(hk))
+            }
+            None => (None, None),
+        };
+        let (ms_access, ms_hk_profile) = ms_sum.for_stage(d.mesh, &rs, &mesh, false);
+        let (ps_access, ps_hk_profile) = match &ps_sum {
+            Some((p, b, s)) => {
+                let (acc, hk) = s.for_stage(b, &rs, p, false);
+                (Some(acc), Some(hk))
+            }
+            None => (None, None),
+        };
         let ds = if d.dsv_format == 0 { DepthStencilState::without_depth_stencil() } else { d.depth_stencil };
         Ok(MeshPipeline {
             pre_raster_reads,
@@ -390,6 +365,9 @@ impl MeshPipeline {
             as_access,
             ms_access,
             ps_access,
+            as_hk_profile,
+            ms_hk_profile,
+            ps_hk_profile,
             pso,
             rs,
             raster: d.raster,

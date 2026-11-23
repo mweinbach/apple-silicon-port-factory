@@ -1100,6 +1100,17 @@ fn same_viewport(a: &MTLViewport, b: &MTLViewport) -> bool {
         && a.zfar.to_bits() == b.zfar.to_bits()
 }
 
+/// Dirty bitmask bits for `GfxState.dirty` so updating one dynamic field (e.g. a
+/// viewport or scissor) skips re-evaluating PSO, raster, depth-stencil, blend, and stencil.
+const GFX_DIRTY_PSO: u8 = 1 << 0;
+const GFX_DIRTY_VIEWPORTS: u8 = 1 << 1;
+const GFX_DIRTY_SCISSORS: u8 = 1 << 2;
+const GFX_DIRTY_BLEND: u8 = 1 << 3;
+const GFX_DIRTY_STENCIL: u8 = 1 << 4;
+const GFX_DIRTY_DEPTH_BOUNDS: u8 = 1 << 5;
+const GFX_DIRTY_SHARED: u8 = GFX_DIRTY_VIEWPORTS | GFX_DIRTY_SCISSORS | GFX_DIRTY_BLEND | GFX_DIRTY_STENCIL;
+const GFX_DIRTY_ALL: u8 = GFX_DIRTY_PSO | GFX_DIRTY_SHARED | GFX_DIRTY_DEPTH_BOUNDS;
+
 /// Per-open-render-encoder state cache (`AW2_FAST_ENC_STATE=1`).
 #[derive(Default)]
 struct EncRenderCache {
@@ -1174,6 +1185,7 @@ impl EncRenderCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     fn apply_shared(
         &mut self,
         e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
@@ -1185,87 +1197,121 @@ impl EncRenderCache {
         stencil_back_ref: u32,
         fast: bool,
     ) {
-        let sr = (stencil_ref, stencil_back_ref);
-        if fast && self.stencil_refs == Some(sr) {
-            stats::inc(&stats::c::enc_state_skip);
-        } else {
-            if stencil_ref == stencil_back_ref {
-                e.setStencilReferenceValue(stencil_ref);
+        self.apply_shared_dirty(
+            e,
+            size,
+            GFX_DIRTY_SHARED,
+            viewports,
+            scissors,
+            blend_factor,
+            stencil_ref,
+            stencil_back_ref,
+            fast,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_shared_dirty(
+        &mut self,
+        e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+        size: (usize, usize),
+        dirty: u8,
+        viewports: &[MTLViewport],
+        scissors: &[Rect],
+        blend_factor: [f32; 4],
+        stencil_ref: u32,
+        stencil_back_ref: u32,
+        fast: bool,
+    ) {
+        if (dirty & GFX_DIRTY_STENCIL) != 0 {
+            let sr = (stencil_ref, stencil_back_ref);
+            if fast && self.stencil_refs == Some(sr) {
+                stats::inc(&stats::c::enc_state_skip);
             } else {
-                e.setStencilFrontReferenceValue_backReferenceValue(stencil_ref, stencil_back_ref);
+                if stencil_ref == stencil_back_ref {
+                    e.setStencilReferenceValue(stencil_ref);
+                } else {
+                    e.setStencilFrontReferenceValue_backReferenceValue(stencil_ref, stencil_back_ref);
+                }
+                self.stencil_refs = Some(sr);
             }
-            self.stencil_refs = Some(sr);
         }
 
-        let bb = blend_factor.map(f32::to_bits);
-        if fast && self.blend_bits == Some(bb) {
-            stats::inc(&stats::c::enc_state_skip);
-        } else {
-            e.setBlendColorRed_green_blue_alpha(
-                blend_factor[0],
-                blend_factor[1],
-                blend_factor[2],
-                blend_factor[3],
-            );
-            self.blend_bits = Some(bb);
-        }
-
-        let full = [MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: size.0 as f64,
-            height: size.1 as f64,
-            znear: 0.0,
-            zfar: 1.0,
-        }];
-        let eff_vps: &[MTLViewport] = if viewports.is_empty() { &full } else { viewports };
-        let vp_same = fast
-            && self.viewports.len() == eff_vps.len()
-            && self.viewports.iter().zip(eff_vps).all(|(a, b)| same_viewport(a, b));
-        if vp_same {
-            stats::inc(&stats::c::enc_state_skip);
-        } else {
-            unsafe {
-                e.setViewports_count(
-                    std::ptr::NonNull::new(eff_vps.as_ptr() as *mut MTLViewport).unwrap(),
-                    eff_vps.len(),
+        if (dirty & GFX_DIRTY_BLEND) != 0 {
+            let bb = blend_factor.map(f32::to_bits);
+            if fast && self.blend_bits == Some(bb) {
+                stats::inc(&stats::c::enc_state_skip);
+            } else {
+                e.setBlendColorRed_green_blue_alpha(
+                    blend_factor[0],
+                    blend_factor[1],
+                    blend_factor[2],
+                    blend_factor[3],
                 );
+                self.blend_bits = Some(bb);
             }
-            self.viewports.clear();
-            self.viewports.extend_from_slice(eff_vps);
         }
 
-        let mut sc_buf = [MTLScissorRect { x: 0, y: 0, width: size.0, height: size.1 }; 16];
-        let sc_len = if scissors.is_empty() {
-            1
-        } else {
-            let n = scissors.len().min(sc_buf.len());
-            for (dst, r) in sc_buf[..n].iter_mut().zip(&scissors[..n]) {
-                let x = (r.left.max(0) as usize).min(size.0);
-                let y = (r.top.max(0) as usize).min(size.1);
-                let r_ = (r.right.max(0) as usize).min(size.0);
-                let b = (r.bottom.max(0) as usize).min(size.1);
-                *dst = MTLScissorRect { x, y, width: r_.saturating_sub(x), height: b.saturating_sub(y) };
+        if (dirty & GFX_DIRTY_VIEWPORTS) != 0 {
+            let full = [MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: size.0 as f64,
+                height: size.1 as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            }];
+            let eff_vps: &[MTLViewport] = if viewports.is_empty() { &full } else { viewports };
+            let vp_same = fast
+                && self.viewports.len() == eff_vps.len()
+                && self.viewports.iter().zip(eff_vps).all(|(a, b)| same_viewport(a, b));
+            if vp_same {
+                stats::inc(&stats::c::enc_state_skip);
+            } else {
+                unsafe {
+                    e.setViewports_count(
+                        std::ptr::NonNull::new(eff_vps.as_ptr() as *mut MTLViewport).unwrap(),
+                        eff_vps.len(),
+                    );
+                }
+                self.viewports.clear();
+                self.viewports.extend_from_slice(eff_vps);
             }
-            n
-        };
-        let eff_scs = &sc_buf[..sc_len];
-        let sc_same = fast
-            && self.scissors.len() == eff_scs.len()
-            && self.scissors.iter().zip(eff_scs).all(|(a, b)| {
-                a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
-            });
-        if sc_same {
-            stats::inc(&stats::c::enc_state_skip);
-        } else {
-            unsafe {
-                e.setScissorRects_count(
-                    std::ptr::NonNull::new(eff_scs.as_ptr() as *mut MTLScissorRect).unwrap(),
-                    sc_len,
-                );
+        }
+
+        if (dirty & GFX_DIRTY_SCISSORS) != 0 {
+            let mut sc_buf = [MTLScissorRect { x: 0, y: 0, width: size.0, height: size.1 }; 16];
+            let sc_len = if scissors.is_empty() {
+                1
+            } else {
+                let n = scissors.len().min(sc_buf.len());
+                for (dst, r) in sc_buf[..n].iter_mut().zip(&scissors[..n]) {
+                    let x = (r.left.max(0) as usize).min(size.0);
+                    let y = (r.top.max(0) as usize).min(size.1);
+                    let r_ = (r.right.max(0) as usize).min(size.0);
+                    let b = (r.bottom.max(0) as usize).min(size.1);
+                    *dst = MTLScissorRect { x, y, width: r_.saturating_sub(x), height: b.saturating_sub(y) };
+                }
+                n
+            };
+            let eff_scs = &sc_buf[..sc_len];
+            let sc_same = fast
+                && self.scissors.len() == eff_scs.len()
+                && self.scissors.iter().zip(eff_scs).all(|(a, b)| {
+                    a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+                });
+            if sc_same {
+                stats::inc(&stats::c::enc_state_skip);
+            } else {
+                unsafe {
+                    e.setScissorRects_count(
+                        std::ptr::NonNull::new(eff_scs.as_ptr() as *mut MTLScissorRect).unwrap(),
+                        sc_len,
+                    );
+                }
+                self.scissors.clear();
+                self.scissors.extend_from_slice(eff_scs);
             }
-            self.scissors.clear();
-            self.scissors.extend_from_slice(eff_scs);
         }
     }
 }
@@ -1517,6 +1563,49 @@ impl CsBindCache {
         if want_spans {
             self.read_spans.extend_from_slice(read_spans);
         }
+    }
+}
+
+/// Per-command-list token-validated cache of resolved graphics draw bindings
+/// (`pre_exact`, `ps_exact`, and `uav_exact`), mirroring [`CsBindCache`].
+/// Eliminates repeated `res_registry().read()` locks across consecutive draws
+/// with unchanged bindings and merges pass-hazard, exact-bind, and UAV-write
+/// lookups into a single registry read lock on cache miss.
+#[derive(Default)]
+struct GfxBindCache {
+    valid: bool,
+    pso_ptr: usize,
+    flags: u8,
+    reg_gen: u64,
+    heap0_base: u64,
+    tokens: Vec<u64>,
+    pre_unb: u8,
+    ps_unb: u8,
+    uav_unb: bool,
+    pre_slot_failed: bool,
+    pre_va_failed: bool,
+    ps_slot_failed: bool,
+    pre_exact: Vec<usize>,
+    ps_exact: Vec<usize>,
+    uav_exact: Vec<usize>,
+}
+
+impl GfxBindCache {
+    #[inline]
+    fn matches(
+        &self,
+        pso_ptr: usize,
+        flags: u8,
+        reg_gen: u64,
+        heap0_base: u64,
+        tokens: &[u64],
+    ) -> bool {
+        self.valid
+            && self.pso_ptr == pso_ptr
+            && self.flags == flags
+            && self.reg_gen == reg_gen
+            && self.heap0_base == heap0_base
+            && self.tokens == tokens
     }
 }
 
@@ -2399,6 +2488,9 @@ pub struct CommandList {
     util_table: Option<Retained<MtlArgumentTable>>,
     /// Lazily allocated fence updated before opaque MetalFX passes (`MTL4FX*Scaler::setFence:`).
     mfx_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
+    /// Deferred post-MetalFX fence wait folded into the next encoder's `begin_barrier`
+    /// (or flushed in `close()` if MetalFX was the last operation on the command buffer).
+    pending_mfx_wait_fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
     rt_keep: Option<Arc<Mutex<Vec<crate::rt::accel::Retired>>>>,
     icb_scratch: Option<Arc<Mutex<UploadRing>>>,
     icbs: Option<Arc<Mutex<super::indirect_icb::IcbRing>>>,
@@ -2416,6 +2508,23 @@ pub struct CommandList {
     icb_prepass_flushing: bool,
     cs_bind_cache: CsBindCache,
     cs_bind_tokens: Vec<u64>,
+    gfx_bind_cache: GfxBindCache,
+    gfx_bind_tokens: Vec<u64>,
+    /// Scratch buffers reused across `ResourceBarrier` calls to eliminate per-barrier allocations.
+    bar_scratch_res: Vec<usize>,
+    bar_scratch_rt_frag: Vec<(usize, MTLStages)>,
+    bar_scratch_soft: [Vec<(usize, MTLStages, MTLStages)>; 2],
+    bar_scratch_read_soft: [Vec<(usize, MTLStages, MTLStages)>; 2],
+    bar_scratch_cs_mid: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
+    bar_scratch_read_cs_mid: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
+    bar_scratch_active: Vec<Barrier>,
+    bar_scratch_pt: Vec<(usize, MTLStages)>,
+    bar_scratch_n_soft: [Vec<(usize, MTLStages, MTLStages)>; 2],
+    bar_scratch_n_cs_mid: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
+    bar_scratch_exact_pt: Vec<(usize, MTLStages)>,
+    bar_scratch_rp_pt: Vec<(usize, MTLStages)>,
+    bar_scratch_ib_adds: Vec<(MTLStages, MTLStages, OblKind, Option<Vec<SubRange>>)>,
+    bar_scratch_ib_uav_adds: Vec<(usize, MTLStages, MTLStages, OblKind, Option<Vec<SubRange>>)>,
     /// Per-encoder GPU timestamps of this recording (`AW2_PASS_TIMING`), lazily acquired on first `pt_open`.
     pt: Option<pt::PassLog>,
     pt_armed: bool,
@@ -2531,8 +2640,8 @@ pub struct GfxState {
     /// A kept `Barrier::Uav` or `Transition(_, _, UAV)` occurred in the open draw pass;
     /// any subsequent UAV-accessing draw must split the pass first.
     pass_uav_hazard: bool,
-    /// Dynamic state must be re-applied to the render encoder.
-    dirty: bool,
+    /// Dynamic state dirty bitmask (`GFX_DIRTY_*`) that must be re-applied to the render encoder.
+    dirty: u8,
     /// Render target size of the draw pass.
     pass_size: (usize, usize),
 }
@@ -2559,7 +2668,7 @@ impl Default for GfxState {
             draw_pass: false,
             pass_uav: false,
             pass_uav_hazard: false,
-            dirty: true,
+            dirty: GFX_DIRTY_ALL,
             pass_size: (0, 0),
         }
     }
@@ -2751,6 +2860,7 @@ impl CommandList {
             gfx: GfxState::default(),
             util_table: None,
             mfx_fence: None,
+            pending_mfx_wait_fence: None,
             rt_keep: None,
             icb_scratch: None,
             icbs: None,
@@ -2764,6 +2874,22 @@ impl CommandList {
             icb_prepass_flushing: false,
             cs_bind_cache: CsBindCache::default(),
             cs_bind_tokens: Vec::new(),
+            gfx_bind_cache: GfxBindCache::default(),
+            gfx_bind_tokens: Vec::new(),
+            bar_scratch_res: Vec::new(),
+            bar_scratch_rt_frag: Vec::new(),
+            bar_scratch_soft: [Vec::new(), Vec::new()],
+            bar_scratch_read_soft: [Vec::new(), Vec::new()],
+            bar_scratch_cs_mid: Vec::new(),
+            bar_scratch_read_cs_mid: Vec::new(),
+            bar_scratch_active: Vec::new(),
+            bar_scratch_pt: Vec::new(),
+            bar_scratch_n_soft: [Vec::new(), Vec::new()],
+            bar_scratch_n_cs_mid: Vec::new(),
+            bar_scratch_exact_pt: Vec::new(),
+            bar_scratch_rp_pt: Vec::new(),
+            bar_scratch_ib_adds: Vec::new(),
+            bar_scratch_ib_uav_adds: Vec::new(),
             pt: None,
             pt_armed: false,
             diag_last_kind: "none",
@@ -2855,6 +2981,7 @@ impl CommandList {
         self.compute_root.dedup = on;
         self.gfx_root.dedup = on;
         self.enc_render_cache.reset();
+        self.gfx.dirty = GFX_DIRTY_ALL;
         self.last_draw_params_len = 0;
         self.last_draw_params_va = 0;
     }
@@ -3824,7 +3951,389 @@ impl CommandList {
         false
     }
 
-    fn gfx_uav_overlaps_pass_hazard(&mut self, p: &GraphicsPipeline, patch_root_invalid: bool) -> bool {
+    fn extract_stage_bind_tokens(
+        access: &super::pipeline::ComputeAccess,
+        root: &RootState,
+        heap0: Option<(u64, u64, usize)>,
+        include_reads: bool,
+        tokens: &mut Vec<u64>,
+    ) -> bool {
+        if access.heap_indexed_or_unknown {
+            return true;
+        }
+        if let Some(slots) = &access.uav_slots {
+            if !slots.is_empty() && !Self::extract_compute_slot_tokens(slots, root, heap0, tokens) {
+                return false;
+            }
+        }
+        if include_reads && !access.bounded_read_slots.is_empty()
+            && !Self::extract_compute_slot_tokens(&access.bounded_read_slots, root, heap0, tokens)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Resolve a graphics draw's pre-raster, pixel, and UAV-write bindings into
+    /// `self.gfx_bind_cache`, taking ZERO `res_registry` locks on a token-cache hit
+    /// and at most ONE `res_registry` read lock on a cache miss (merging hazard,
+    /// exact stage-bind, and UAV-write lookups together).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_gfx_binds_cached(
+        &mut self,
+        p: &GraphicsPipeline,
+        indexed: bool,
+        indirect: bool,
+        patch_root_invalid: bool,
+        patch_vb: bool,
+        patch_ib: bool,
+        indirect_vas: Option<&[u64]>,
+        do_gfx: bool,
+        do_uav: bool,
+    ) {
+        let pso_ptr = p as *const GraphicsPipeline as usize;
+        let do_uav_eff = do_uav && !patch_root_invalid;
+        let flags: u8 = (indexed as u8)
+            | ((indirect as u8) << 1)
+            | ((patch_root_invalid as u8) << 2)
+            | ((patch_vb as u8) << 3)
+            | ((patch_ib as u8) << 4)
+            | ((do_gfx as u8) << 5)
+            | ((do_uav_eff as u8) << 6);
+        let reg_gen = super::resource::res_registry_gen();
+        let heap0_base = self.heaps[0];
+
+        let mut tokens = std::mem::take(&mut self.gfx_bind_tokens);
+        tokens.clear();
+        let mut tokens_ok = true;
+        if !patch_root_invalid {
+            if do_gfx || (do_uav_eff && p.vs_writes_uav) {
+                tokens_ok &= Self::extract_stage_bind_tokens(
+                    &p.vs_access,
+                    &self.gfx_root,
+                    self.heap0_cpu,
+                    do_gfx,
+                    &mut tokens,
+                );
+            }
+            if tokens_ok {
+                if let Some(ps_acc) = &p.ps_access {
+                    if do_gfx || (do_uav_eff && p.ps_writes_uav) {
+                        tokens_ok &= Self::extract_stage_bind_tokens(
+                            ps_acc,
+                            &self.gfx_root,
+                            self.heap0_cpu,
+                            do_gfx,
+                            &mut tokens,
+                        );
+                    }
+                }
+            }
+        }
+        if tokens_ok && do_gfx {
+            if p.vertex_slots != 0 && !patch_vb {
+                let mut vm = p.vertex_slots;
+                while vm != 0 {
+                    let slot = vm.trailing_zeros() as usize;
+                    vm &= vm - 1;
+                    if slot < MAX_VERTEX_SLOTS as usize {
+                        tokens.push(self.gfx.vbs[slot].0);
+                    }
+                }
+            }
+            if indexed && !patch_ib {
+                tokens.push(self.gfx.ib.map_or(0, |(va, _, _)| va));
+            }
+            if indirect {
+                match indirect_vas {
+                    Some(vas) => {
+                        tokens.push(vas.len() as u64);
+                        tokens.extend_from_slice(vas);
+                    }
+                    None => tokens.push(u64::MAX),
+                }
+            }
+            tokens.push(self.predication.map_or(0, |pr| pr.gpu_va));
+        }
+
+        if tokens_ok && self.gfx_bind_cache.matches(pso_ptr, flags, reg_gen, heap0_base, &tokens) {
+            self.gfx_bind_tokens = tokens;
+            return;
+        }
+
+        let mut scratch = std::mem::take(&mut self.ib_scratch_op);
+        let gfx_root = &self.gfx_root;
+        let heap0 = self.heap0_cpu;
+        let vbs = self.gfx.vbs;
+        let ib = self.gfx.ib;
+        let pred = self.predication;
+        let cache = &mut self.gfx_bind_cache;
+        cache.pre_exact.clear();
+        cache.ps_exact.clear();
+        cache.uav_exact.clear();
+        let mut pre_unb = 0u8;
+        let mut ps_unb = 0u8;
+        let mut uav_unb = patch_root_invalid;
+        let mut pre_slot_failed = false;
+        let mut pre_va_failed = false;
+        let mut ps_slot_failed = false;
+
+        let has_slots = !patch_root_invalid
+            && ((do_gfx
+                && (p.vs_access.uav_slots.as_ref().is_some_and(|s| !s.is_empty())
+                    || !p.vs_access.bounded_read_slots.is_empty()
+                    || p.ps_access.as_ref().is_some_and(|a| {
+                        a.uav_slots.as_ref().is_some_and(|s| !s.is_empty())
+                            || !a.bounded_read_slots.is_empty()
+                    })))
+                || (do_uav_eff
+                    && ((p.vs_writes_uav
+                        && p.vs_access.uav_slots.as_ref().is_some_and(|s| !s.is_empty()))
+                        || (p.ps_writes_uav
+                            && p.ps_access
+                                .as_ref()
+                                .is_some_and(|a| a.uav_slots.as_ref().is_some_and(|s| !s.is_empty()))))));
+        let has_vas = do_gfx
+            && ((p.vertex_slots != 0 && !patch_vb && {
+                let mut vm = p.vertex_slots;
+                let mut any = false;
+                while vm != 0 {
+                    let slot = vm.trailing_zeros() as usize;
+                    vm &= vm - 1;
+                    if slot < MAX_VERTEX_SLOTS as usize && vbs[slot].0 != 0 {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            }) || (indexed && !patch_ib && ib.is_some_and(|(va, _, _)| va != 0))
+                || (indirect && indirect_vas.is_some_and(|vas| vas.iter().any(|&va| va != 0)))
+                || pred.is_some_and(|pr| pr.gpu_va != 0));
+
+        let resolved_gen = if has_slots || has_vas {
+            super::resource::with_resource_registry(|reg| {
+                if do_gfx {
+                    let (pu, pf) = Self::resolve_stage_access_with_reg(
+                        reg,
+                        &p.vs_access,
+                        gfx_root,
+                        heap0,
+                        patch_root_invalid,
+                        &mut scratch,
+                        &mut cache.pre_exact,
+                    );
+                    pre_unb = pu;
+                    pre_slot_failed = pf;
+                    if p.vertex_slots != 0 {
+                        if patch_vb {
+                            pre_unb |= super::pipeline::READS_BUF;
+                            pre_va_failed = true;
+                        } else {
+                            let mut vm = p.vertex_slots;
+                            while vm != 0 {
+                                let slot = vm.trailing_zeros() as usize;
+                                vm &= vm - 1;
+                                if slot < MAX_VERTEX_SLOTS as usize {
+                                    let (va, _, _) = vbs[slot];
+                                    if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                                        pre_unb |= super::pipeline::READS_BUF;
+                                        pre_va_failed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if indexed {
+                        if patch_ib {
+                            pre_unb |= super::pipeline::READS_BUF;
+                            pre_va_failed = true;
+                        } else if let Some((va, _, _)) = ib {
+                            if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                                pre_unb |= super::pipeline::READS_BUF;
+                                pre_va_failed = true;
+                            }
+                        }
+                    }
+                    if indirect {
+                        if let Some(vas) = indirect_vas {
+                            for &va in vas {
+                                if va != 0 && !reg.push_buffer_va(va, &mut cache.pre_exact) {
+                                    pre_unb |= super::pipeline::READS_BUF;
+                                    pre_va_failed = true;
+                                }
+                            }
+                        } else {
+                            pre_unb |= super::pipeline::READS_BUF;
+                            pre_va_failed = true;
+                        }
+                    }
+                    if let Some(pr) = pred {
+                        if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, &mut cache.pre_exact) {
+                            pre_unb |= super::pipeline::READS_BUF;
+                            pre_va_failed = true;
+                        }
+                    }
+                    match &p.ps_access {
+                        Some(ps_acc) => {
+                            let (psu, psf) = Self::resolve_stage_access_with_reg(
+                                reg,
+                                ps_acc,
+                                gfx_root,
+                                heap0,
+                                patch_root_invalid,
+                                &mut scratch,
+                                &mut cache.ps_exact,
+                            );
+                            ps_unb = psu;
+                            ps_slot_failed = psf;
+                        }
+                        None => {
+                            if p.ps_read_classes != 0 || p.ps_writes_uav {
+                                ps_unb = p.ps_read_classes
+                                    | if p.ps_writes_uav {
+                                        super::pipeline::READS_BUF | super::pipeline::READS_TEX
+                                    } else {
+                                        0
+                                    };
+                                ps_slot_failed = true;
+                            }
+                        }
+                    }
+                } else {
+                    pre_slot_failed = true;
+                    ps_slot_failed = true;
+                }
+                if do_uav_eff {
+                    if p.vs_writes_uav
+                        && Self::resolve_uav_write_with_reg(
+                            reg,
+                            &p.vs_access,
+                            gfx_root,
+                            heap0,
+                            &mut scratch,
+                            &mut cache.uav_exact,
+                        )
+                    {
+                        uav_unb = true;
+                    }
+                    if p.ps_writes_uav {
+                        match &p.ps_access {
+                            Some(ps_acc) => {
+                                if Self::resolve_uav_write_with_reg(
+                                    reg,
+                                    ps_acc,
+                                    gfx_root,
+                                    heap0,
+                                    &mut scratch,
+                                    &mut cache.uav_exact,
+                                ) {
+                                    uav_unb = true;
+                                }
+                            }
+                            None => uav_unb = true,
+                        }
+                    }
+                }
+                super::resource::res_registry_gen()
+            })
+        } else {
+            // Fast path: no root/table slots or buffer VAs require registry lookup.
+            if do_gfx {
+                let stage_no_slot_unb = |acc: &super::pipeline::ComputeAccess| -> (u8, bool) {
+                    if acc.heap_indexed_or_unknown {
+                        return (super::pipeline::READS_BUF | super::pipeline::READS_TEX, true);
+                    }
+                    if patch_root_invalid {
+                        return (acc.uav_classes | acc.read_classes, true);
+                    }
+                    let mut u = acc.unbounded_srv_classes;
+                    if acc.uav_slots.is_none() {
+                        u |= acc.uav_classes;
+                    }
+                    if acc.read_slots.is_none()
+                        && acc.unbounded_srv_classes == 0
+                        && acc.bounded_read_slots.is_empty()
+                        && acc.read_classes != 0
+                    {
+                        u |= acc.read_classes;
+                    }
+                    (u, false)
+                };
+                let (pu, pf) = stage_no_slot_unb(&p.vs_access);
+                pre_unb = pu;
+                pre_slot_failed = pf;
+                if (p.vertex_slots != 0 && patch_vb)
+                    || (indexed && patch_ib)
+                    || (indirect && indirect_vas.is_none())
+                {
+                    pre_unb |= super::pipeline::READS_BUF;
+                    pre_va_failed = true;
+                }
+                match &p.ps_access {
+                    Some(ps_acc) => {
+                        let (psu, psf) = stage_no_slot_unb(ps_acc);
+                        ps_unb = psu;
+                        ps_slot_failed = psf;
+                    }
+                    None => {
+                        if p.ps_read_classes != 0 || p.ps_writes_uav {
+                            ps_unb = p.ps_read_classes
+                                | if p.ps_writes_uav {
+                                    super::pipeline::READS_BUF | super::pipeline::READS_TEX
+                                } else {
+                                    0
+                                };
+                            ps_slot_failed = true;
+                        }
+                    }
+                }
+            } else {
+                pre_slot_failed = true;
+                ps_slot_failed = true;
+            }
+            if do_uav_eff {
+                let stage_uav_unb = |acc: &super::pipeline::ComputeAccess| -> bool {
+                    acc.heap_indexed_or_unknown || acc.uav_slots.is_none()
+                };
+                if p.vs_writes_uav && stage_uav_unb(&p.vs_access) {
+                    uav_unb = true;
+                }
+                if p.ps_writes_uav {
+                    match &p.ps_access {
+                        Some(ps_acc) => {
+                            if stage_uav_unb(ps_acc) {
+                                uav_unb = true;
+                            }
+                        }
+                        None => uav_unb = true,
+                    }
+                }
+            }
+            reg_gen
+        };
+
+        cache.pre_unb = pre_unb;
+        cache.ps_unb = ps_unb;
+        cache.uav_unb = uav_unb;
+        cache.pre_slot_failed = pre_slot_failed;
+        cache.pre_va_failed = pre_va_failed;
+        cache.ps_slot_failed = ps_slot_failed;
+        if tokens_ok {
+            cache.valid = true;
+            cache.pso_ptr = pso_ptr;
+            cache.flags = flags;
+            cache.reg_gen = resolved_gen;
+            cache.heap0_base = heap0_base;
+            std::mem::swap(&mut cache.tokens, &mut tokens);
+        } else {
+            cache.valid = false;
+        }
+        self.gfx_bind_tokens = tokens;
+        self.ib_scratch_op = scratch;
+    }
+
+    #[inline]
+    fn gfx_cached_overlaps_pass_hazard(&self, patch_root_invalid: bool) -> bool {
         if self.pass_uav_hazard_all || patch_root_invalid {
             return true;
         }
@@ -3835,71 +4344,90 @@ impl CommandList {
         for &r in &self.pass_uav_hazard_res {
             hazard_classes |= res_class(r);
         }
-        let mut scratch = std::mem::take(&mut self.ib_scratch_op);
-        let gfx_root = &self.gfx_root;
-        let heap0 = self.heap0_cpu;
-        let hazard_res = &self.pass_uav_hazard_res;
-        let vbs = self.gfx.vbs;
-        let ib = self.gfx.ib;
-        let pred = self.predication;
-        let hit = super::resource::with_resource_registry(|reg| {
-            if Self::stage_access_overlaps_hazard(reg, &p.vs_access, gfx_root, heap0, hazard_res, hazard_classes, &mut scratch) {
-                return true;
+        if ((self.gfx_bind_cache.pre_unb | self.gfx_bind_cache.ps_unb) & hazard_classes) != 0 {
+            return true;
+        }
+        self.gfx_bind_cache
+            .pre_exact
+            .iter()
+            .chain(self.gfx_bind_cache.ps_exact.iter())
+            .any(|r| self.pass_uav_hazard_res.contains(r))
+    }
+
+    #[inline]
+    fn apply_gfx_bind_cache_to_cur_draw(&mut self, p: &GraphicsPipeline) {
+        const ALL_BUF_HK: u32 = super::resource::HK_RAW_STRUCT_BUF
+            | super::resource::HK_TYPED_BUF
+            | super::resource::HK_CBV_BUF;
+        let (pre_hk, ps_hk, mut pre_unb_hk, mut ps_unb_hk) = self.gfx_pso_stage_hk(p);
+        if self.gfx_bind_cache.pre_slot_failed {
+            pre_unb_hk |= pre_hk;
+        }
+        if self.gfx_bind_cache.pre_va_failed {
+            pre_unb_hk |= ALL_BUF_HK;
+        }
+        if self.gfx_bind_cache.ps_slot_failed {
+            ps_unb_hk |= ps_hk;
+        }
+        self.cur_draw_pre_exact.clear();
+        self.cur_draw_pre_exact.extend_from_slice(&self.gfx_bind_cache.pre_exact);
+        self.cur_draw_ps_exact.clear();
+        self.cur_draw_ps_exact.extend_from_slice(&self.gfx_bind_cache.ps_exact);
+        self.cur_draw_pre_unb = self.gfx_bind_cache.pre_unb;
+        self.cur_draw_pre_unb_hk = pre_unb_hk;
+        self.cur_draw_ps_unb = self.gfx_bind_cache.ps_unb;
+        self.cur_draw_ps_unb_hk = ps_unb_hk;
+        self.cur_draw_exact_valid = true;
+    }
+
+    #[inline]
+    fn commit_gfx_bind_cache_to_enc(&mut self, p: &GraphicsPipeline) {
+        const ALL_BUF_HK: u32 = super::resource::HK_RAW_STRUCT_BUF
+            | super::resource::HK_TYPED_BUF
+            | super::resource::HK_CBV_BUF;
+        let (pre_hk, ps_hk, mut pre_unb_hk, mut ps_unb_hk) = self.gfx_pso_stage_hk(p);
+        if self.gfx_bind_cache.pre_slot_failed {
+            pre_unb_hk |= pre_hk;
+        }
+        if self.gfx_bind_cache.pre_va_failed {
+            pre_unb_hk |= ALL_BUF_HK;
+        }
+        if self.gfx_bind_cache.ps_slot_failed {
+            ps_unb_hk |= ps_hk;
+        }
+        self.enc_pre_raster_unbounded_classes |= self.gfx_bind_cache.pre_unb;
+        self.enc_pre_raster_unb_hk |= pre_unb_hk;
+        for &r in &self.gfx_bind_cache.pre_exact {
+            if r != 0 {
+                unsafe { (*(r as *const Resource)).mark_gpu_used() };
             }
-            match &p.ps_access {
-                Some(ps_acc) => {
-                    if Self::stage_access_overlaps_hazard(reg, ps_acc, gfx_root, heap0, hazard_res, hazard_classes, &mut scratch) {
-                        return true;
-                    }
-                }
-                None => {
-                    if p.ps_writes_uav || (p.ps_read_classes & hazard_classes) != 0 {
-                        return true;
-                    }
-                }
+            if !self.enc_pre_raster_exact_res.contains(&r) {
+                self.enc_pre_raster_exact_res.push(r);
             }
-            if (hazard_classes & super::pipeline::READS_BUF) != 0 {
-                let mut vm = p.vertex_slots;
-                while vm != 0 {
-                    let slot = vm.trailing_zeros() as usize;
-                    vm &= vm - 1;
-                    if slot < MAX_VERTEX_SLOTS as usize {
-                        let (va, _, _) = vbs[slot];
-                        if va != 0 {
-                            scratch.clear();
-                            if !reg.push_buffer_va(va, &mut scratch)
-                                || scratch.iter().any(|r| hazard_res.contains(r))
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                if let Some((va, _, _)) = ib {
-                    if va != 0 {
-                        scratch.clear();
-                        if !reg.push_buffer_va(va, &mut scratch)
-                            || scratch.iter().any(|r| hazard_res.contains(r))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                if let Some(pr) = pred {
-                    if pr.gpu_va != 0 {
-                        scratch.clear();
-                        if !reg.push_buffer_va(pr.gpu_va, &mut scratch)
-                            || scratch.iter().any(|r| hazard_res.contains(r))
-                        {
-                            return true;
-                        }
-                    }
-                }
+        }
+        self.enc_ps_unbounded_classes |= self.gfx_bind_cache.ps_unb;
+        self.enc_ps_unb_hk |= ps_unb_hk;
+        for &r in &self.gfx_bind_cache.ps_exact {
+            if r != 0 {
+                unsafe { (*(r as *const Resource)).mark_gpu_used() };
             }
-            false
-        });
-        self.ib_scratch_op = scratch;
-        hit
+            if !self.enc_ps_exact_res.contains(&r) {
+                self.enc_ps_exact_res.push(r);
+            }
+        }
+    }
+
+    #[inline]
+    fn commit_gfx_bind_cache_uav_writes(&mut self, patch_root_invalid: bool) {
+        if patch_root_invalid || self.enc_uav_write_unbounded || self.gfx_bind_cache.uav_unb {
+            self.enc_uav_write_unbounded = true;
+            return;
+        }
+        for &r in &self.gfx_bind_cache.uav_exact {
+            if r != 0 && !self.enc_uav_write_exact_res.contains(&r) {
+                self.enc_uav_write_exact_res.push(r);
+            }
+        }
     }
 
     fn mesh_uav_overlaps_pass_hazard(&mut self, p: &crate::mesh::MeshPipeline, indirect: bool) -> bool {
@@ -3942,40 +4470,6 @@ impl CommandList {
         });
         self.ib_scratch_op = scratch;
         hit
-    }
-
-    fn record_gfx_uav_write_exact(&mut self, p: &GraphicsPipeline, patch_root_invalid: bool) {
-        if patch_root_invalid || self.enc_uav_write_unbounded {
-            self.enc_uav_write_unbounded = true;
-            return;
-        }
-        let mut scratch = std::mem::take(&mut self.ib_scratch_op);
-        let gfx_root = &self.gfx_root;
-        let heap0 = self.heap0_cpu;
-        let dst = &mut self.enc_uav_write_exact_res;
-        let unb = super::resource::with_resource_registry(|reg| {
-            let mut u = false;
-            if p.vs_writes_uav
-                && Self::resolve_uav_write_with_reg(reg, &p.vs_access, gfx_root, heap0, &mut scratch, dst)
-            {
-                u = true;
-            }
-            if p.ps_writes_uav {
-                match &p.ps_access {
-                    Some(ps_acc) => {
-                        if Self::resolve_uav_write_with_reg(reg, ps_acc, gfx_root, heap0, &mut scratch, dst) {
-                            u = true;
-                        }
-                    }
-                    None => u = true,
-                }
-            }
-            u
-        });
-        if unb {
-            self.enc_uav_write_unbounded = true;
-        }
-        self.ib_scratch_op = scratch;
     }
 
     fn record_mesh_uav_write_exact(&mut self, p: &crate::mesh::MeshPipeline, indirect: bool) {
@@ -4035,148 +4529,42 @@ impl CommandList {
         let eff_reads = self.effective_gfx_pre_raster_reads(p, indexed, indirect);
         let srv_uav_pre_reads = self.gfx_pso_srv_uav_pre_raster_reads(p);
         let (pre_hk, ps_hk, mut pre_unb_hk, mut ps_unb_hk) = self.gfx_pso_stage_hk(p);
-        let mut pre_exact = Vec::new();
-        let mut ps_exact = Vec::new();
-        let mut uav_exact = Vec::new();
-        let mut pre_unb = 0u8;
-        let mut ps_unb = 0u8;
-        let mut uav_unb = patch_root_invalid;
-        if self.opt_gfx_desc_table_exact || (writes_uav && self.opt_rp_split_exact_keep) {
-            let mut scratch = std::mem::take(&mut self.ib_scratch_op);
-            let gfx_root = &self.gfx_root;
-            let heap0 = self.heap0_cpu;
-            let vbs = self.gfx.vbs;
-            let ib = self.gfx.ib;
-            let pred = self.predication;
-            let do_gfx_exact = self.opt_gfx_desc_table_exact;
-            let do_uav_exact = writes_uav && self.opt_rp_split_exact_keep && !patch_root_invalid;
-            let mut pre_slot_failed = false;
-            let mut pre_va_failed = false;
-            let mut ps_slot_failed = false;
-            super::resource::with_resource_registry(|reg| {
-                if do_gfx_exact {
-                    let (pu, pf) = Self::resolve_stage_access_with_reg(
-                        reg,
-                        &p.vs_access,
-                        gfx_root,
-                        heap0,
-                        patch_root_invalid,
-                        &mut scratch,
-                        &mut pre_exact,
-                    );
-                    pre_unb = pu;
-                    pre_slot_failed = pf;
-                    if p.vertex_slots != 0 {
-                        if patch_vb {
-                            pre_unb |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        } else {
-                            let mut vm = p.vertex_slots;
-                            while vm != 0 {
-                                let slot = vm.trailing_zeros() as usize;
-                                vm &= vm - 1;
-                                if slot < MAX_VERTEX_SLOTS as usize {
-                                    let (va, _, _) = vbs[slot];
-                                    if va != 0 && !reg.push_buffer_va(va, &mut pre_exact) {
-                                        pre_unb |= super::pipeline::READS_BUF;
-                                        pre_va_failed = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if indexed {
-                        if patch_ib {
-                            pre_unb |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        } else if let Some((va, _, _)) = ib {
-                            if va != 0 && !reg.push_buffer_va(va, &mut pre_exact) {
-                                pre_unb |= super::pipeline::READS_BUF;
-                                pre_va_failed = true;
-                            }
-                        }
-                    }
-                    if indirect {
-                        if let Some(vas) = indirect_vas {
-                            for &va in vas {
-                                if va != 0 && !reg.push_buffer_va(va, &mut pre_exact) {
-                                    pre_unb |= super::pipeline::READS_BUF;
-                                    pre_va_failed = true;
-                                }
-                            }
-                        } else {
-                            pre_unb |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        }
-                    }
-                    if let Some(pr) = pred {
-                        if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, &mut pre_exact) {
-                            pre_unb |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        }
-                    }
-                    match &p.ps_access {
-                        Some(ps_acc) => {
-                            let (psu, psf) = Self::resolve_stage_access_with_reg(
-                                reg,
-                                ps_acc,
-                                gfx_root,
-                                heap0,
-                                patch_root_invalid,
-                                &mut scratch,
-                                &mut ps_exact,
-                            );
-                            ps_unb = psu;
-                            ps_slot_failed = psf;
-                        }
-                        None => {
-                            if p.ps_read_classes != 0 || p.ps_writes_uav {
-                                ps_unb = p.ps_read_classes
-                                    | if p.ps_writes_uav {
-                                        super::pipeline::READS_BUF | super::pipeline::READS_TEX
-                                    } else {
-                                        0
-                                    };
-                                ps_slot_failed = true;
-                            }
-                        }
-                    }
-                } else {
-                    pre_slot_failed = true;
-                    ps_slot_failed = true;
-                }
-                if do_uav_exact {
-                    if p.vs_writes_uav
-                        && Self::resolve_uav_write_with_reg(reg, &p.vs_access, gfx_root, heap0, &mut scratch, &mut uav_exact)
-                    {
-                        uav_unb = true;
-                    }
-                    if p.ps_writes_uav {
-                        match &p.ps_access {
-                            Some(ps_acc) => {
-                                if Self::resolve_uav_write_with_reg(reg, ps_acc, gfx_root, heap0, &mut scratch, &mut uav_exact) {
-                                    uav_unb = true;
-                                }
-                            }
-                            None => uav_unb = true,
-                        }
-                    }
-                }
-            });
-            if pre_slot_failed {
+        let do_gfx = self.opt_gfx_desc_table_exact;
+        let do_uav = writes_uav && self.opt_rp_split_exact_keep;
+        let (pre_unb, pre_exact, ps_unb, ps_exact, uav_unb, uav_exact) = if do_gfx || do_uav {
+            self.resolve_gfx_binds_cached(
+                p,
+                indexed,
+                indirect,
+                patch_root_invalid,
+                patch_vb,
+                patch_ib,
+                indirect_vas,
+                do_gfx,
+                do_uav,
+            );
+            if self.gfx_bind_cache.pre_slot_failed {
                 pre_unb_hk |= pre_hk;
             }
-            if pre_va_failed {
+            if self.gfx_bind_cache.pre_va_failed {
                 pre_unb_hk |= ALL_BUF_HK;
             }
-            if ps_slot_failed {
+            if self.gfx_bind_cache.ps_slot_failed {
                 ps_unb_hk |= ps_hk;
             }
-            self.ib_scratch_op = scratch;
+            (
+                self.gfx_bind_cache.pre_unb,
+                self.gfx_bind_cache.pre_exact.clone(),
+                self.gfx_bind_cache.ps_unb,
+                self.gfx_bind_cache.ps_exact.clone(),
+                self.gfx_bind_cache.uav_unb,
+                self.gfx_bind_cache.uav_exact.clone(),
+            )
         } else {
             pre_unb_hk = pre_hk;
             ps_unb_hk = ps_hk;
-        }
+            (0, Vec::new(), 0, Vec::new(), patch_root_invalid, Vec::new())
+        };
         DrawSegExact {
             eff_reads,
             srv_uav_pre_reads,
@@ -4201,10 +4589,11 @@ impl CommandList {
 
     #[inline]
     fn stage_profile_hk_and_unb(
+        embedded: super::pipeline::HandleKindProfile,
         sh: &dxil_metal::CompiledShader,
         acc: &super::pipeline::ComputeAccess,
     ) -> (u32, u32) {
-        let p = super::pipeline::shader_handle_kind_profile(sh, acc);
+        let p = super::pipeline::resolve_pso_hk_profile(embedded, sh, acc);
         let full = p.read_kinds | p.uav_srv_kinds | p.uav_write_kinds;
         let unb = if acc.heap_indexed_or_unknown {
             full
@@ -4235,9 +4624,14 @@ impl CommandList {
         if !self.hk_any_active() {
             return (0, 0, 0, 0);
         }
-        let (pre_hk, pre_unb_hk) = Self::stage_profile_hk_and_unb(&p.vs, &p.vs_access);
+        let (pre_hk, pre_unb_hk) = Self::stage_profile_hk_and_unb(p.vs_hk_profile, &p.vs, &p.vs_access);
         let (ps_hk, ps_unb_hk) = match (&p.ps, &p.ps_access) {
-            (Some(ps), Some(acc)) => Self::stage_profile_hk_and_unb(ps, acc),
+            (Some(ps), Some(acc)) => {
+                let emb = p
+                    .ps_hk_profile
+                    .unwrap_or_else(|| super::pipeline::HandleKindProfile::OPAQUE.intersect_access(acc));
+                Self::stage_profile_hk_and_unb(emb, ps, acc)
+            }
             (Some(_), None) => (super::resource::HK_ALL, super::resource::HK_ALL),
             (None, _) => (0, 0),
         };
@@ -4249,156 +4643,32 @@ impl CommandList {
         if !self.hk_any_active() {
             return (0, 0, 0, 0);
         }
-        let (mut pre_hk, mut pre_unb_hk) = Self::stage_profile_hk_and_unb(&p.mesh, &p.ms_access);
+        let (mut pre_hk, mut pre_unb_hk) =
+            Self::stage_profile_hk_and_unb(p.ms_hk_profile, &p.mesh, &p.ms_access);
         if let Some(as_sh) = &p.amplification {
             let (ah, auh) = match &p.as_access {
-                Some(acc) => Self::stage_profile_hk_and_unb(as_sh, acc),
+                Some(acc) => {
+                    let emb = p
+                        .as_hk_profile
+                        .unwrap_or_else(|| super::pipeline::HandleKindProfile::OPAQUE.intersect_access(acc));
+                    Self::stage_profile_hk_and_unb(emb, as_sh, acc)
+                }
                 None => (super::resource::HK_ALL, super::resource::HK_ALL),
             };
             pre_hk |= ah;
             pre_unb_hk |= auh;
         }
         let (ps_hk, ps_unb_hk) = match (&p.pixel, &p.ps_access) {
-            (Some(ps), Some(acc)) => Self::stage_profile_hk_and_unb(ps, acc),
+            (Some(ps), Some(acc)) => {
+                let emb = p
+                    .ps_hk_profile
+                    .unwrap_or_else(|| super::pipeline::HandleKindProfile::OPAQUE.intersect_access(acc));
+                Self::stage_profile_hk_and_unb(emb, ps, acc)
+            }
             (Some(_), None) => (super::resource::HK_ALL, super::resource::HK_ALL),
             (None, _) => (0, 0),
         };
         (pre_hk, ps_hk, pre_unb_hk, ps_unb_hk)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_cur_draw_gfx_exact(
-        &mut self,
-        p: &GraphicsPipeline,
-        indexed: bool,
-        indirect: bool,
-        patch_root_invalid: bool,
-        patch_vb: bool,
-        patch_ib: bool,
-        indirect_vas: Option<&[u64]>,
-    ) {
-        const ALL_BUF_HK: u32 = super::resource::HK_RAW_STRUCT_BUF
-            | super::resource::HK_TYPED_BUF
-            | super::resource::HK_CBV_BUF;
-        let (pre_hk, ps_hk, mut pre_unb_hk, mut ps_unb_hk) = self.gfx_pso_stage_hk(p);
-        self.cur_draw_pre_exact.clear();
-        self.cur_draw_ps_exact.clear();
-        let mut scratch = std::mem::take(&mut self.ib_scratch_op);
-        let gfx_root = &self.gfx_root;
-        let heap0 = self.heap0_cpu;
-        let vbs = self.gfx.vbs;
-        let ib = self.gfx.ib;
-        let pred = self.predication;
-        let exact_pre = &mut self.cur_draw_pre_exact;
-        let exact_ps = &mut self.cur_draw_ps_exact;
-        let mut pre_slot_failed = false;
-        let mut pre_va_failed = false;
-        let mut ps_slot_failed = false;
-        let (pre_unb, ps_unb) = super::resource::with_resource_registry(|reg| {
-            let (mut pre_u, pf) = Self::resolve_stage_access_with_reg(
-                reg,
-                &p.vs_access,
-                gfx_root,
-                heap0,
-                patch_root_invalid,
-                &mut scratch,
-                exact_pre,
-            );
-            pre_slot_failed = pf;
-            if p.vertex_slots != 0 {
-                if patch_vb {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                } else {
-                    let mut vm = p.vertex_slots;
-                    while vm != 0 {
-                        let slot = vm.trailing_zeros() as usize;
-                        vm &= vm - 1;
-                        if slot < MAX_VERTEX_SLOTS as usize {
-                            let (va, _, _) = vbs[slot];
-                            if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                                pre_u |= super::pipeline::READS_BUF;
-                                pre_va_failed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if indexed {
-                if patch_ib {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                } else if let Some((va, _, _)) = ib {
-                    if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                        pre_u |= super::pipeline::READS_BUF;
-                        pre_va_failed = true;
-                    }
-                }
-            }
-            if indirect {
-                if let Some(vas) = indirect_vas {
-                    for &va in vas {
-                        if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                            pre_u |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        }
-                    }
-                } else {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                }
-            }
-            if let Some(pr) = pred {
-                if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, exact_pre) {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                }
-            }
-            let ps_u = match &p.ps_access {
-                Some(ps_acc) => {
-                    let (psu, psf) = Self::resolve_stage_access_with_reg(
-                        reg,
-                        ps_acc,
-                        gfx_root,
-                        heap0,
-                        patch_root_invalid,
-                        &mut scratch,
-                        exact_ps,
-                    );
-                    ps_slot_failed = psf;
-                    psu
-                }
-                None => {
-                    if p.ps_read_classes != 0 || p.ps_writes_uav {
-                        ps_slot_failed = true;
-                        p.ps_read_classes
-                            | if p.ps_writes_uav {
-                                super::pipeline::READS_BUF | super::pipeline::READS_TEX
-                            } else {
-                                0
-                            }
-                    } else {
-                        0
-                    }
-                }
-            };
-            (pre_u, ps_u)
-        });
-        if pre_slot_failed {
-            pre_unb_hk |= pre_hk;
-        }
-        if pre_va_failed {
-            pre_unb_hk |= ALL_BUF_HK;
-        }
-        if ps_slot_failed {
-            ps_unb_hk |= ps_hk;
-        }
-        self.cur_draw_pre_unb = pre_unb;
-        self.cur_draw_pre_unb_hk = pre_unb_hk;
-        self.cur_draw_ps_unb = ps_unb;
-        self.cur_draw_ps_unb_hk = ps_unb_hk;
-        self.cur_draw_exact_valid = true;
-        self.ib_scratch_op = scratch;
     }
 
     fn resolve_cur_draw_mesh_exact(&mut self, p: &crate::mesh::MeshPipeline, indirect: bool) {
@@ -4519,150 +4789,6 @@ impl CommandList {
                 self.enc_ps_exact_res.push(r);
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_gfx_stage_exact_binds(
-        &mut self,
-        p: &GraphicsPipeline,
-        indexed: bool,
-        indirect: bool,
-        patch_root_invalid: bool,
-        patch_vb: bool,
-        patch_ib: bool,
-        indirect_vas: Option<&[u64]>,
-    ) {
-        const ALL_BUF_HK: u32 = super::resource::HK_RAW_STRUCT_BUF
-            | super::resource::HK_TYPED_BUF
-            | super::resource::HK_CBV_BUF;
-        let (pre_hk, ps_hk, mut pre_unb_hk, mut ps_unb_hk) = self.gfx_pso_stage_hk(p);
-        let mut scratch = std::mem::take(&mut self.ib_scratch_op);
-        let gfx_root = &self.gfx_root;
-        let heap0 = self.heap0_cpu;
-        let vbs = self.gfx.vbs;
-        let ib = self.gfx.ib;
-        let pred = self.predication;
-        let pre_start = self.enc_pre_raster_exact_res.len();
-        let ps_start = self.enc_ps_exact_res.len();
-        let exact_pre = &mut self.enc_pre_raster_exact_res;
-        let exact_ps = &mut self.enc_ps_exact_res;
-        let mut pre_slot_failed = false;
-        let mut pre_va_failed = false;
-        let mut ps_slot_failed = false;
-        let (pre_unb, ps_unb) = super::resource::with_resource_registry(|reg| {
-            let (mut pre_u, pf) = Self::resolve_stage_access_with_reg(
-                reg,
-                &p.vs_access,
-                gfx_root,
-                heap0,
-                patch_root_invalid,
-                &mut scratch,
-                exact_pre,
-            );
-            pre_slot_failed = pf;
-            if p.vertex_slots != 0 {
-                if patch_vb {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                } else {
-                    let mut vm = p.vertex_slots;
-                    while vm != 0 {
-                        let slot = vm.trailing_zeros() as usize;
-                        vm &= vm - 1;
-                        if slot < MAX_VERTEX_SLOTS as usize {
-                            let (va, _, _) = vbs[slot];
-                            if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                                pre_u |= super::pipeline::READS_BUF;
-                                pre_va_failed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if indexed {
-                if patch_ib {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                } else if let Some((va, _, _)) = ib {
-                    if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                        pre_u |= super::pipeline::READS_BUF;
-                        pre_va_failed = true;
-                    }
-                }
-            }
-            if indirect {
-                if let Some(vas) = indirect_vas {
-                    for &va in vas {
-                        if va != 0 && !reg.push_buffer_va(va, exact_pre) {
-                            pre_u |= super::pipeline::READS_BUF;
-                            pre_va_failed = true;
-                        }
-                    }
-                } else {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                }
-            }
-            if let Some(pr) = pred {
-                if pr.gpu_va != 0 && !reg.push_buffer_va(pr.gpu_va, exact_pre) {
-                    pre_u |= super::pipeline::READS_BUF;
-                    pre_va_failed = true;
-                }
-            }
-            let ps_u = match &p.ps_access {
-                Some(ps_acc) => {
-                    let (psu, psf) = Self::resolve_stage_access_with_reg(
-                        reg,
-                        ps_acc,
-                        gfx_root,
-                        heap0,
-                        patch_root_invalid,
-                        &mut scratch,
-                        exact_ps,
-                    );
-                    ps_slot_failed = psf;
-                    psu
-                }
-                None => {
-                    if p.ps_read_classes != 0 || p.ps_writes_uav {
-                        ps_slot_failed = true;
-                        p.ps_read_classes
-                            | if p.ps_writes_uav {
-                                super::pipeline::READS_BUF | super::pipeline::READS_TEX
-                            } else {
-                                0
-                            }
-                    } else {
-                        0
-                    }
-                }
-            };
-            (pre_u, ps_u)
-        });
-        for &r in &self.enc_pre_raster_exact_res[pre_start..] {
-            if r != 0 {
-                unsafe { (*(r as *const Resource)).mark_gpu_used() };
-            }
-        }
-        for &r in &self.enc_ps_exact_res[ps_start..] {
-            if r != 0 {
-                unsafe { (*(r as *const Resource)).mark_gpu_used() };
-            }
-        }
-        if pre_slot_failed {
-            pre_unb_hk |= pre_hk;
-        }
-        if pre_va_failed {
-            pre_unb_hk |= ALL_BUF_HK;
-        }
-        if ps_slot_failed {
-            ps_unb_hk |= ps_hk;
-        }
-        self.enc_pre_raster_unbounded_classes |= pre_unb;
-        self.enc_pre_raster_unb_hk |= pre_unb_hk;
-        self.enc_ps_unbounded_classes |= ps_unb;
-        self.enc_ps_unb_hk |= ps_unb_hk;
-        self.ib_scratch_op = scratch;
     }
 
     fn record_mesh_stage_exact_binds(&mut self, p: &crate::mesh::MeshPipeline, indirect: bool) {
@@ -4866,10 +4992,12 @@ impl CommandList {
         ran: MTLStages,
         had_uav_gfx: bool,
     ) -> MTLStages {
-        let legacy = self.rp_kept_item_touch_stages_with(kw, ran, had_uav_gfx, false);
         let mut cur = if !self.opt_ps_srv_class_exact {
-            legacy
+            self.rp_kept_item_touch_stages_with(kw, ran, had_uav_gfx, false)
+        } else if !stats::active() {
+            self.rp_kept_item_touch_stages_with(kw, ran, had_uav_gfx, true)
         } else {
+            let legacy = self.rp_kept_item_touch_stages_with(kw, ran, had_uav_gfx, false);
             let exact = self.rp_kept_item_touch_stages_with(kw, ran, had_uav_gfx, true);
             if exact != legacy {
                 stats::inc(&stats::c::ps_srv_class_exact);
@@ -6545,6 +6673,8 @@ impl CommandList {
         self.icb_prepass_pending = false;
         self.icb_prepass_flushing = false;
         self.cs_bind_cache.valid = false;
+        self.gfx_bind_cache.valid = false;
+        self.pending_mfx_wait_fence = None;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
         self.compute_root.dedup = self.opt_fast_enc_state;
@@ -6566,6 +6696,7 @@ impl CommandList {
         self.end_encoder();
         self.cur_draw_exact_valid = false;
         self.cs_bind_cache.valid = false;
+        self.gfx_bind_cache.valid = false;
         self.cs_hk_profile = super::pipeline::HandleKindProfile::OPAQUE;
         self.compute_root = RootState::default();
         self.gfx_root = RootState::default();
@@ -7217,6 +7348,7 @@ impl CommandList {
             return Err("command list is not open".into());
         }
         let flushed = self.flush_clears(&stats::c::cf_close, |_| true);
+        self.flush_pending_mfx_wait_fence();
         if self.list_barrier_tight_active() {
             self.emit_close_producer_barriers();
         }
@@ -7320,6 +7452,19 @@ impl CommandList {
         render: bool,
         opening_pre_raster_reads: u8,
     ) {
+        if let Some(f) = self.pending_mfx_wait_fence.take() {
+            let wait_stages = if render {
+                PRE_RASTER | MTLStages::Fragment
+            } else {
+                COMPUTE_STAGES
+            };
+            enc.waitForFence_beforeEncoderStages(&f, wait_stages);
+            enc.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                wait_stages,
+                MTLStages::All,
+                MTL4VisibilityOptions::Device,
+            );
+        }
         let clear_cap = if render {
             self.opening_clear_frag_cap.take()
         } else {
@@ -8601,7 +8746,10 @@ impl CommandList {
             }
         }
         self.ib_stages = self.ib_sub[0].stages | self.ib_sub[1].stages | self.ib_sub[2].stages;
-        if before_enc.contains(MTLStages::Dispatch) && need_after.contains(MTLStages::Dispatch) {
+        if !(self.opt_ib_substage_narrow && !self.is_copy_queue_light())
+            && before_enc.contains(MTLStages::Dispatch)
+            && need_after.contains(MTLStages::Dispatch)
+        {
             self.ib_disp_uav.copy_from(&self.ib_sub[0].disp_uav);
             self.ib_disp_read.copy_from(&self.ib_sub[0].disp_read);
             if self.cs_intra_safe_active() {
@@ -9205,16 +9353,15 @@ impl CommandList {
         }
         if let Some((after, before)) = sync {
             let mid_on = self.mid_qb_stagesync_active();
-            let base_after = self.unsatisfied_mid_qb_after(after, before);
             let eff_after = if self.render_dom_exact_active() {
                 let u = self.unsatisfied_enc_after_for_req(after, before, &sync_req, mid_on);
                 let f = self.fold_dominated_after(u, &sync_req);
-                if f != base_after {
+                if stats::active() && f != self.unsatisfied_mid_qb_after(after, before) {
                     stats::inc(&stats::c::render_dom_fold);
                 }
                 f
             } else {
-                base_after
+                self.unsatisfied_mid_qb_after(after, before)
             };
             if eff_after.is_empty() {
                 stats::inc(&stats::c::stagesync_skip);
@@ -10412,69 +10559,72 @@ impl CommandList {
             }
         }
         self.ib_stages |= op_stage & COMPUTE_STAGES;
-        if op_stage.contains(MTLStages::Dispatch) {
-            Self::ib_merge_set(&mut self.ib_disp_uav, disp_uav);
-            Self::ib_merge_set(&mut self.ib_disp_read, disp_read_or_touch);
-            if self.opt_cs_intra_barrier_v2 || self.cs_intra_safe_active() {
-                merge_cls(&mut self.ib_disp_uav_cls, &mut self.ib_disp_read_cls);
-            }
-            if let Some(ex) = exact {
-                let ex_ro_hk = ex.hk.ro_srv_kinds
-                    | if (ex.exact_read_only_classes & super::pipeline::READS_BUF) != 0 {
-                        ex.hk.read_kinds & super::resource::HK_CBV_BUF
-                    } else {
-                        0
-                    };
-                self.ib_disp_uav_classes |= ex.uav_classes;
-                self.ib_disp_read_classes |= ex.read_classes;
-                self.ib_disp_uav_srv_classes |= ex.uav_srv_classes;
-                self.ib_disp_uav_hk |= ex.hk.uav_write_kinds;
-                self.ib_disp_ro_hk |= ex_ro_hk;
-                self.ib_disp_read_hk |= ex.hk.read_kinds;
-                self.ib_disp_uav_srv_hk |= ex.hk.uav_srv_kinds;
-            } else if let Some((u_cls, rw_cls, u_hk, ro_hk)) = util_exact_cls_hk {
-                self.ib_disp_uav_classes |= u_cls;
-                self.ib_disp_read_classes |= rw_cls;
-                self.ib_disp_uav_srv_classes |= rw_cls;
-                self.ib_disp_uav_hk |= u_hk;
-                self.ib_disp_ro_hk |= ro_hk;
-                self.ib_disp_read_hk |= u_hk | ro_hk;
-                self.ib_disp_uav_srv_hk |= u_hk | ro_hk;
-            } else {
-                self.ib_disp_uav_classes |= BOTH_CLASSES;
-                self.ib_disp_read_classes |= BOTH_CLASSES;
-                self.ib_disp_uav_srv_classes |= BOTH_CLASSES;
-                self.ib_disp_uav_hk |= super::resource::HK_ALL;
-                self.ib_disp_ro_hk |= super::resource::HK_ALL;
-                self.ib_disp_read_hk |= super::resource::HK_ALL;
-                self.ib_disp_uav_srv_hk |= super::resource::HK_ALL;
-            }
-            if subrange_on {
-                if let Some(us) = exact.and_then(|ex| ex.uav_spans) {
-                    Self::ib_merge_spans_exact(&mut self.ib_disp_uav_spans, us);
-                } else {
-                    Self::ib_merge_spans_whole(&mut self.ib_disp_uav_spans, disp_uav);
+        let sub_narrow = self.opt_ib_substage_narrow && !self.is_copy_queue_light();
+        if !sub_narrow {
+            if op_stage.contains(MTLStages::Dispatch) {
+                Self::ib_merge_set(&mut self.ib_disp_uav, disp_uav);
+                Self::ib_merge_set(&mut self.ib_disp_read, disp_read_or_touch);
+                if self.opt_cs_intra_barrier_v2 || self.cs_intra_safe_active() {
+                    merge_cls(&mut self.ib_disp_uav_cls, &mut self.ib_disp_read_cls);
                 }
-                if let Some(rs) = exact.and_then(|ex| ex.bounded_read_spans) {
-                    Self::ib_merge_spans_exact(&mut self.ib_disp_read_spans, rs);
-                    if let Some(ex) = exact {
-                        if !ex.full_read_exact {
-                            self.ib_unbounded_read_classes |= ex.unbounded_srv_classes;
+                if let Some(ex) = exact {
+                    let ex_ro_hk = ex.hk.ro_srv_kinds
+                        | if (ex.exact_read_only_classes & super::pipeline::READS_BUF) != 0 {
+                            ex.hk.read_kinds & super::resource::HK_CBV_BUF
+                        } else {
+                            0
+                        };
+                    self.ib_disp_uav_classes |= ex.uav_classes;
+                    self.ib_disp_read_classes |= ex.read_classes;
+                    self.ib_disp_uav_srv_classes |= ex.uav_srv_classes;
+                    self.ib_disp_uav_hk |= ex.hk.uav_write_kinds;
+                    self.ib_disp_ro_hk |= ex_ro_hk;
+                    self.ib_disp_read_hk |= ex.hk.read_kinds;
+                    self.ib_disp_uav_srv_hk |= ex.hk.uav_srv_kinds;
+                } else if let Some((u_cls, rw_cls, u_hk, ro_hk)) = util_exact_cls_hk {
+                    self.ib_disp_uav_classes |= u_cls;
+                    self.ib_disp_read_classes |= rw_cls;
+                    self.ib_disp_uav_srv_classes |= rw_cls;
+                    self.ib_disp_uav_hk |= u_hk;
+                    self.ib_disp_ro_hk |= ro_hk;
+                    self.ib_disp_read_hk |= u_hk | ro_hk;
+                    self.ib_disp_uav_srv_hk |= u_hk | ro_hk;
+                } else {
+                    self.ib_disp_uav_classes |= BOTH_CLASSES;
+                    self.ib_disp_read_classes |= BOTH_CLASSES;
+                    self.ib_disp_uav_srv_classes |= BOTH_CLASSES;
+                    self.ib_disp_uav_hk |= super::resource::HK_ALL;
+                    self.ib_disp_ro_hk |= super::resource::HK_ALL;
+                    self.ib_disp_read_hk |= super::resource::HK_ALL;
+                    self.ib_disp_uav_srv_hk |= super::resource::HK_ALL;
+                }
+                if subrange_on {
+                    if let Some(us) = exact.and_then(|ex| ex.uav_spans) {
+                        Self::ib_merge_spans_exact(&mut self.ib_disp_uav_spans, us);
+                    } else {
+                        Self::ib_merge_spans_whole(&mut self.ib_disp_uav_spans, disp_uav);
+                    }
+                    if let Some(rs) = exact.and_then(|ex| ex.bounded_read_spans) {
+                        Self::ib_merge_spans_exact(&mut self.ib_disp_read_spans, rs);
+                        if let Some(ex) = exact {
+                            if !ex.full_read_exact {
+                                self.ib_unbounded_read_classes |= ex.unbounded_srv_classes;
+                            }
+                        }
+                    } else {
+                        Self::ib_merge_spans_whole(&mut self.ib_disp_read_spans, disp_read_or_touch);
+                        if disp_read_or_touch.is_none() {
+                            self.ib_unbounded_read_classes |= BOTH_CLASSES;
                         }
                     }
-                } else {
-                    Self::ib_merge_spans_whole(&mut self.ib_disp_read_spans, disp_read_or_touch);
-                    if disp_read_or_touch.is_none() {
-                        self.ib_unbounded_read_classes |= BOTH_CLASSES;
-                    }
                 }
             }
-        }
-        if op_stage.contains(MTLStages::Blit) {
-            Self::ib_merge_set(&mut self.ib_blit_touch, disp_read_or_touch);
-        }
-        if op_stage.contains(MTLStages::AccelerationStructure) {
-            Self::ib_merge_set(&mut self.ib_as_touch, disp_read_or_touch);
+            if op_stage.contains(MTLStages::Blit) {
+                Self::ib_merge_set(&mut self.ib_blit_touch, disp_read_or_touch);
+            }
+            if op_stage.contains(MTLStages::AccelerationStructure) {
+                Self::ib_merge_set(&mut self.ib_as_touch, disp_read_or_touch);
+            }
         }
         if self.opt_ib_substage_narrow || self.is_copy_queue_light() {
             let merge_cls_on = self.opt_cs_intra_barrier_v2 || self.cs_intra_safe_active();
@@ -11111,7 +11261,8 @@ impl CommandList {
         let mut uav_all = false;
         let mut had_uav_item = false;
         let mut only_uav_items = true;
-        let mut res: Vec<usize> = Vec::new();
+        let mut res = std::mem::take(&mut self.bar_scratch_res);
+        res.clear();
         let vs_buf_defer = self.vs_buf_defer_exact_active();
         let defer_cs_mid_v2 = self.cs_mid_qb_exact_v2_active();
         let track_cs_mid_v3 = (self.opt_cs_mid_qb_defer_v3
@@ -11149,12 +11300,17 @@ impl CommandList {
             && masked_mode
             && !copy_light;
         let track_frag_rt = self.clear_isolate_active() && masked_mode && !copy_light;
-        let mut local_rt_frag: Vec<(usize, S)> = Vec::new();
+        let mut local_rt_frag = std::mem::take(&mut self.bar_scratch_rt_frag);
+        local_rt_frag.clear();
         let mut local_non_rt_frag = S::empty();
         let mut local_rt_poison = false;
-        let mut local_soft_items: [Vec<(usize, S, S)>; 2] = [Vec::new(), Vec::new()];
+        let mut local_soft_items = std::mem::take(&mut self.bar_scratch_soft);
+        local_soft_items[0].clear();
+        local_soft_items[1].clear();
         let mut local_soft_poison = [false; 2];
-        let mut read_soft_items: [Vec<(usize, S, S)>; 2] = [Vec::new(), Vec::new()];
+        let mut read_soft_items = std::mem::take(&mut self.bar_scratch_read_soft);
+        read_soft_items[0].clear();
+        read_soft_items[1].clear();
         let mut read_soft_poison = [false; 2];
         let allow_all_soft =
             self.opt_cs_to_ps_overlap_v2 || self.gfx_to_ps_overlap_active() || self.list_rsplit_v2_active();
@@ -11180,12 +11336,17 @@ impl CommandList {
                 }
             }
         };
-        let mut cs_mid_items: Vec<(usize, S, S, S)> = Vec::new();
-        let mut read_cs_mid_items: Vec<(usize, S, S, S)> = Vec::new();
+        let mut cs_mid_items = std::mem::take(&mut self.bar_scratch_cs_mid);
+        cs_mid_items.clear();
+        let mut read_cs_mid_items = std::mem::take(&mut self.bar_scratch_read_cs_mid);
+        read_cs_mid_items.clear();
         let mut uav0_disp_after = S::empty();
         let track_exact_clear = self.opt_clear_overlap_exact && masked_mode && !copy_light && !self.in_list_gfx_non_clear;
-        let mut active_items: Vec<Barrier> = Vec::new();
-        let mut batch_pt = self.uav_passthrough.clone();
+        let mut active_items = std::mem::take(&mut self.bar_scratch_active);
+        active_items.clear();
+        let mut batch_pt = std::mem::take(&mut self.bar_scratch_pt);
+        batch_pt.clear();
+        batch_pt.extend_from_slice(&self.uav_passthrough);
         const SRV_UAV: u32 = 0x8 | 0x40;
         const VS_BUF_SOFT: u32 = 0x1 | 0x2 | 0x200;
         for b in items {
@@ -11495,6 +11656,16 @@ impl CommandList {
             None
         };
         if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
+            self.restore_bar_scratch(
+                res,
+                local_rt_frag,
+                local_soft_items,
+                read_soft_items,
+                cs_mid_items,
+                read_cs_mid_items,
+                active_items,
+                batch_pt,
+            );
             return;
         }
         let mut kept_render = false;
@@ -11717,11 +11888,16 @@ impl CommandList {
                     let mut nb = S::empty();
                     let mut nsoft = [S::empty(); 2];
                     let mut nsplit = SplitPend::default();
-                    let mut n_soft_items: [Vec<(usize, S, S)>; 2] = [Vec::new(), Vec::new()];
+                    let mut n_soft_items = std::mem::take(&mut self.bar_scratch_n_soft);
+                    n_soft_items[0].clear();
+                    n_soft_items[1].clear();
                     let mut n_soft_poison = [false; 2];
-                    let mut n_cs_mid_items: Vec<(usize, S, S, S)> = Vec::new();
+                    let mut n_cs_mid_items = std::mem::take(&mut self.bar_scratch_n_cs_mid);
+                    n_cs_mid_items.clear();
                     let mut n_uav0_disp_after = S::empty();
-                    let mut exact_pt = self.uav_passthrough.clone();
+                    let mut exact_pt = std::mem::take(&mut self.bar_scratch_exact_pt);
+                    exact_pt.clear();
+                    exact_pt.extend_from_slice(&self.uav_passthrough);
                     let mut deferred_any = false;
                     let allow_all_cs_mid = self.opt_cs_mid_qb_unpoison_v4
                         || self.opt_cs_mid_qb_res_defer_v5
@@ -11900,23 +12076,40 @@ impl CommandList {
                     {
                         stats::inc(&stats::c::clear_overlap_exact);
                     }
-                    batch_pt = exact_pt;
+                    std::mem::swap(&mut batch_pt, &mut exact_pt);
+                    exact_pt.clear();
+                    self.bar_scratch_exact_pt = exact_pt;
                     after = na;
                     before = nb;
                     soft = nsoft;
                     local_split = nsplit;
-                    local_soft_items = n_soft_items;
+                    std::mem::swap(&mut local_soft_items, &mut n_soft_items);
+                    n_soft_items[0].clear();
+                    n_soft_items[1].clear();
+                    self.bar_scratch_n_soft = n_soft_items;
                     local_soft_poison = n_soft_poison;
-                    cs_mid_items = n_cs_mid_items;
+                    std::mem::swap(&mut cs_mid_items, &mut n_cs_mid_items);
+                    n_cs_mid_items.clear();
+                    self.bar_scratch_n_cs_mid = n_cs_mid_items;
                     uav0_disp_after = n_uav0_disp_after;
                     local_rt_poison = true;
                     if after.is_empty() || (before | soft[0] | soft[1]).is_empty() {
-                        self.uav_passthrough = batch_pt;
+                        std::mem::swap(&mut self.uav_passthrough, &mut batch_pt);
+                        self.restore_bar_scratch(
+                            res,
+                            local_rt_frag,
+                            local_soft_items,
+                            read_soft_items,
+                            cs_mid_items,
+                            read_cs_mid_items,
+                            active_items,
+                            batch_pt,
+                        );
                         return;
                     }
                 }
             }
-            self.uav_passthrough = batch_pt;
+            std::mem::swap(&mut self.uav_passthrough, &mut batch_pt);
             if self.opt_subrange_uav_barrier
                 && masked_mode
                 && only_uav_items
@@ -11975,6 +12168,16 @@ impl CommandList {
                     }
                 }
                 stats::inc(&stats::c::cs_uav_mid_skip);
+                self.restore_bar_scratch(
+                    res,
+                    local_rt_frag,
+                    local_soft_items,
+                    read_soft_items,
+                    cs_mid_items,
+                    read_cs_mid_items,
+                    active_items,
+                    batch_pt,
+                );
                 return;
             }
         }
@@ -12036,7 +12239,7 @@ impl CommandList {
                     }
                 }
                 if collect_pend_cs {
-                    for (r, da, ba, aa) in read_cs_mid_items {
+                    for &(r, da, ba, aa) in &read_cs_mid_items {
                         Self::push_cs_mid_obl_into(&mut self.pend_cs_items, r, da, ba, aa, req);
                     }
                 }
@@ -12086,7 +12289,7 @@ impl CommandList {
             }
             let mid_on = self.mid_qb_stagesync_active();
             let sg = self.stage_gen;
-            for (r, da, ba, aa) in cs_mid_items {
+            for &(r, da, ba, aa) in &cs_mid_items {
                 let mut uda = S::empty();
                 let mut uba = S::empty();
                 let mut uaa = S::empty();
@@ -12147,7 +12350,7 @@ impl CommandList {
                     }
                 }
             }
-            for (r, da, ba, aa) in cs_mid_items {
+            for &(r, da, ba, aa) in &cs_mid_items {
                 self.push_cs_mid_res_obl(r, da, ba, aa, req);
             }
         } else {
@@ -12274,14 +12477,14 @@ impl CommandList {
                     if self.needs_barrier || all_res || uav_all || had_flushed_clears || before == S::All {
                         self.cs_mid_v3_poisoned = [true; 3];
                     } else {
-                        for (r, da, ba, aa) in cs_mid_items {
+                        for &(r, da, ba, aa) in &cs_mid_items {
                             Self::push_cs_mid_obl_into(&mut self.cs_mid_v3_items, r, da, ba, aa, req);
                         }
                     }
                 } else if self.needs_barrier || all_res || had_flushed_clears {
                     self.cs_mid_v3_poisoned = [true; 3];
                 } else {
-                    for (r, da, ba, aa) in cs_mid_items {
+                    for &(r, da, ba, aa) in &cs_mid_items {
                         Self::push_cs_mid_obl_into(&mut self.cs_mid_v3_items, r, da, ba, aa, req);
                     }
                     if uav_all {
@@ -12327,6 +12530,49 @@ impl CommandList {
                 }
             }
         }
+        self.restore_bar_scratch(
+            res,
+            local_rt_frag,
+            local_soft_items,
+            read_soft_items,
+            cs_mid_items,
+            read_cs_mid_items,
+            active_items,
+            batch_pt,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn restore_bar_scratch(
+        &mut self,
+        mut res: Vec<usize>,
+        mut local_rt_frag: Vec<(usize, MTLStages)>,
+        mut local_soft_items: [Vec<(usize, MTLStages, MTLStages)>; 2],
+        mut read_soft_items: [Vec<(usize, MTLStages, MTLStages)>; 2],
+        mut cs_mid_items: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
+        mut read_cs_mid_items: Vec<(usize, MTLStages, MTLStages, MTLStages)>,
+        mut active_items: Vec<Barrier>,
+        mut batch_pt: Vec<(usize, MTLStages)>,
+    ) {
+        res.clear();
+        local_rt_frag.clear();
+        local_soft_items[0].clear();
+        local_soft_items[1].clear();
+        read_soft_items[0].clear();
+        read_soft_items[1].clear();
+        cs_mid_items.clear();
+        read_cs_mid_items.clear();
+        active_items.clear();
+        batch_pt.clear();
+        self.bar_scratch_res = res;
+        self.bar_scratch_rt_frag = local_rt_frag;
+        self.bar_scratch_soft = local_soft_items;
+        self.bar_scratch_read_soft = read_soft_items;
+        self.bar_scratch_cs_mid = cs_mid_items;
+        self.bar_scratch_read_cs_mid = read_cs_mid_items;
+        self.bar_scratch_active = active_items;
+        self.bar_scratch_pt = batch_pt;
     }
 
     fn collect_buf_uav_spans(&self, rk: usize) -> Option<Vec<SubRange>> {
@@ -12427,6 +12673,8 @@ impl CommandList {
         let msc_class = self.msc_class_active();
         let sub_narrow = self.opt_ib_substage_narrow && !self.is_copy_queue_light();
         let subrange_on = self.opt_subrange_uav_barrier;
+        let mut pending_adds = std::mem::take(&mut self.bar_scratch_ib_adds);
+        let mut pending_uav_adds = std::mem::take(&mut self.bar_scratch_ib_uav_adds);
         for b in items {
             match *b {
                 Barrier::Transition(r, s0, s1) => {
@@ -12480,7 +12728,7 @@ impl CommandList {
                         let mut any_after = false;
                         let mut any_class_filtered = false;
                         let mut any_v2_filtered = false;
-                        let mut pending_adds: Vec<(S, S, OblKind, Option<Vec<SubRange>>)> = Vec::new();
+                        pending_adds.clear();
                         for &(ci, cbit) in &CS_SUB_BITS {
                             if !cs_before.contains(cbit) {
                                 continue;
@@ -12677,7 +12925,7 @@ impl CommandList {
                             }
                             stats::inc(&stats::c::ib_skip_touch);
                         } else {
-                            for (ia, cb, kd, sp) in pending_adds {
+                            for (ia, cb, kd, sp) in pending_adds.drain(..) {
                                 self.ib_add_obl_spans_tight(r, ia, cb, kd, sp);
                             }
                         }
@@ -12900,7 +13148,7 @@ impl CommandList {
                         let mut any_v2 = false;
                         let uav_cap = if uav_unb_exact { 512 } else { 32 };
                         let mut expanded_v44 = false;
-                        let mut pending_uav_adds: Vec<(usize, S, S, OblKind, Option<Vec<SubRange>>)> = Vec::new();
+                        pending_uav_adds.clear();
                         for &(ci, cbit) in &[(0usize, S::Dispatch), (2usize, S::AccelerationStructure)] {
                             let sub = &self.ib_sub[ci];
                             let cand = (S::Dispatch | S::AccelerationStructure) & sub.stages;
@@ -13073,7 +13321,7 @@ impl CommandList {
                             }
                             stats::inc(&stats::c::ib_skip_touch);
                         } else {
-                            for (rk, ia, cb, kd, sp) in pending_uav_adds {
+                            for (rk, ia, cb, kd, sp) in pending_uav_adds.drain(..) {
                                 self.ib_add_obl_spans_tight(rk, ia, cb, kd, sp);
                             }
                         }
@@ -13279,6 +13527,10 @@ impl CommandList {
                 }
             }
         }
+        pending_adds.clear();
+        self.bar_scratch_ib_adds = pending_adds;
+        pending_uav_adds.clear();
+        self.bar_scratch_ib_uav_adds = pending_uav_adds;
     }
 
     /// Whether `items` can be ordered inside the open draw pass (see
@@ -13385,7 +13637,9 @@ impl CommandList {
                 }
             }
         };
-        let mut rp_pt = self.uav_passthrough.clone();
+        let mut rp_pt = std::mem::take(&mut self.bar_scratch_rp_pt);
+        rp_pt.clear();
+        rp_pt.extend_from_slice(&self.uav_passthrough);
         let mut any = false;
         for b in items {
             match *b {
@@ -13614,6 +13868,8 @@ impl CommandList {
                 Barrier::Full => {}
             }
         }
+        rp_pt.clear();
+        self.bar_scratch_rp_pt = rp_pt;
         any
     }
 
@@ -13699,16 +13955,6 @@ impl CommandList {
                 stats::inc(&stats::c::render_split_sync);
             }
             let mid_on = self.mid_qb_stagesync_active();
-            let base_vtx = if orig_vtx.is_empty() {
-                MTLStages::empty()
-            } else {
-                self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
-            };
-            let base_frag = if orig_frag.is_empty() {
-                MTLStages::empty()
-            } else {
-                self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
-            };
             let (eff_vtx, eff_frag) = if dom_exact {
                 let ev = if orig_vtx.is_empty() {
                     MTLStages::empty()
@@ -13722,11 +13968,33 @@ impl CommandList {
                     let u = self.unsatisfied_enc_after_for_req(orig_frag, MTLStages::Fragment, &frag_req, mid_on);
                     self.fold_dominated_after(u, &frag_req)
                 };
-                if ev != base_vtx || ef != base_frag {
-                    stats::inc(&stats::c::render_dom_fold);
+                if stats::active() {
+                    let base_vtx = if orig_vtx.is_empty() {
+                        MTLStages::empty()
+                    } else {
+                        self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                    };
+                    let base_frag = if orig_frag.is_empty() {
+                        MTLStages::empty()
+                    } else {
+                        self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
+                    };
+                    if ev != base_vtx || ef != base_frag {
+                        stats::inc(&stats::c::render_dom_fold);
+                    }
                 }
                 (ev, ef)
             } else {
+                let base_vtx = if orig_vtx.is_empty() {
+                    MTLStages::empty()
+                } else {
+                    self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                };
+                let base_frag = if orig_frag.is_empty() {
+                    MTLStages::empty()
+                } else {
+                    self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
+                };
                 (base_vtx, base_frag)
             };
             if (eff_vtx | eff_frag).is_empty() {
@@ -14100,14 +14368,12 @@ impl CommandList {
                     };
                     self.opening_clear_frag_cap = None;
                     if r.is_ok() {
-                        stats::c::clear_pass_merged.fetch_add((layers - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                        stats::add(&stats::c::clear_pass_merged, (layers - 1) as u64);
                         if !self.opt_clear_pass_fold_v2 {
                             if self.opt_clear_isolate_coalesce {
-                                stats::c::clear_isolate_coalesce
-                                    .fetch_add((layers - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                                stats::add(&stats::c::clear_isolate_coalesce, (layers - 1) as u64);
                             } else if self.opt_clear_zero_qb_coalesce {
-                                stats::c::clear_zero_qb_coalesce
-                                    .fetch_add((layers - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                                stats::add(&stats::c::clear_zero_qb_coalesce, (layers - 1) as u64);
                             }
                         }
                     } else if first_err.is_ok() {
@@ -14234,14 +14500,12 @@ impl CommandList {
                 }
             }
             stats::inc(&stats::c::clear_pass);
-            stats::c::clear_pass_merged.fetch_add((merged_count - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+            stats::add(&stats::c::clear_pass_merged, (merged_count - 1) as u64);
             if !self.opt_clear_pass_fold_v2 {
                 if self.opt_clear_isolate_coalesce {
-                    stats::c::clear_isolate_coalesce
-                        .fetch_add((merged_count - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                    stats::add(&stats::c::clear_isolate_coalesce, (merged_count - 1) as u64);
                 } else if self.opt_clear_zero_qb_coalesce {
-                    stats::c::clear_zero_qb_coalesce
-                        .fetch_add((merged_count - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                    stats::add(&stats::c::clear_zero_qb_coalesce, (merged_count - 1) as u64);
                 }
             }
             if self.opt_clear_pass_fold_v2 || self.clear_isolate_active() {
@@ -14576,10 +14840,29 @@ impl CommandList {
         if self.opt_fast_bind_pso {
             e.setArgumentTable(Some(&t));
         }
+        let mut stack_vas = [0u64; 32];
+        let mut heap_vas: Vec<u64> = Vec::new();
+        let item_vas: &[u64] = if items.len() <= stack_vas.len() {
+            {
+                let mut r = ring.lock().unwrap();
+                for (dst, (_, _, p, _)) in stack_vas.iter_mut().zip(&items) {
+                    *dst = r.upload(super::clear::bytes_of(p), 256)?;
+                }
+            }
+            &stack_vas[..items.len()]
+        } else {
+            heap_vas.reserve(items.len());
+            {
+                let mut r = ring.lock().unwrap();
+                for (_, _, p, _) in &items {
+                    heap_vas.push(r.upload(super::clear::bytes_of(p), 256)?);
+                }
+            }
+            &heap_vas
+        };
         let mut last_pso_ptr: usize = 0;
-        for (_rk, view, p, name) in items {
+        for ((_rk, view, p, name), &pa) in items.into_iter().zip(item_vas.iter()) {
             let (pso, tg) = super::clear::kernel_for_dispatch(name, self.opt_fast_bind_pso)?;
-            let pa = ring.lock().unwrap().upload(super::clear::bytes_of(&p), 256)?;
             unsafe {
                 t.setAddress_atIndex(pa, 0);
                 t.setTexture_atIndex(view.gpuResourceID(), 0);
@@ -15501,12 +15784,13 @@ impl CommandList {
         self.heaps = [resource, sampler];
         self.heap0_cpu = (resource != 0).then(|| super::descriptor::resolve_shader_heap(resource)).flatten();
         self.cs_bind_cache.valid = false;
+        self.gfx_bind_cache.valid = false;
     }
 
     /// `SetPipelineState` with a compute PSO.
     pub fn set_compute_pipeline(&mut self, p: Arc<ComputePipeline>) {
         if self.hk_any_active() {
-            self.cs_hk_profile = super::pipeline::shader_handle_kind_profile(&p.shader, &p.access);
+            self.cs_hk_profile = super::pipeline::resolve_pso_hk_profile(p.hk_profile, &p.shader, &p.access);
         }
         if super::gpunan::is_capturing() {
             self.diag_last_kind = "cs";
@@ -16267,9 +16551,10 @@ impl CommandList {
         if self.gfx.pso.as_ref().is_some_and(|c| Arc::ptr_eq(c, &p)) {
             return;
         }
+        self.gfx_bind_cache.valid = false;
         self.gfx.pso = Some(p);
         self.gfx.mesh = None;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_PSO;
     }
 
     /// `SetPipelineState` with a mesh-shader PSO.
@@ -16282,9 +16567,10 @@ impl CommandList {
         if self.gfx.mesh.as_ref().is_some_and(|c| Arc::ptr_eq(c, &p)) {
             return;
         }
+        self.gfx_bind_cache.valid = false;
         self.gfx.mesh = Some(p);
         self.gfx.pso = None;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_PSO;
     }
 
     /// `OMSetRenderTargets`: a draw after this opens a new render pass.
@@ -16306,7 +16592,7 @@ impl CommandList {
 
     pub fn set_viewports(&mut self, v: Vec<MTLViewport>) {
         self.gfx.viewports = v;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_VIEWPORTS;
     }
 
     /// Set D3D12 viewports without exposing `objc2_metal::MTLViewport` to callers.
@@ -16342,25 +16628,25 @@ impl CommandList {
     }
     pub fn set_scissors(&mut self, r: Vec<Rect>) {
         self.gfx.scissors = r;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_SCISSORS;
     }
     pub fn set_blend_factor(&mut self, f: [f32; 4]) {
         self.gfx.blend_factor = f;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_BLEND;
     }
     pub fn set_stencil_ref(&mut self, r: u32) {
         self.gfx.stencil_ref = r;
         self.gfx.stencil_back_ref = r;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_STENCIL;
     }
     pub fn set_front_and_back_stencil_ref(&mut self, front: u32, back: u32) {
         self.gfx.stencil_ref = front;
         self.gfx.stencil_back_ref = back;
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_STENCIL;
     }
     pub fn set_depth_bounds(&mut self, min: f32, max: f32) {
         self.gfx.depth_bounds = (min, max);
-        self.gfx.dirty = true;
+        self.gfx.dirty |= GFX_DIRTY_DEPTH_BOUNDS;
     }
 
     /// `DiscardResource`: the contents become undefined, so the next render
@@ -16642,7 +16928,7 @@ impl CommandList {
         self.gfx.open_rtvs = rtvs;
         self.gfx.open_dsv = dsv;
         self.gfx.had_target_rebind = false;
-        self.gfx.dirty = true;
+        self.gfx.dirty = GFX_DIRTY_ALL;
         self.gfx.pass_size = size;
         if let Some(m) = self.pt_cur() {
             (m.w, m.h) = (size.0 as u32, size.1 as u32);
@@ -16651,24 +16937,37 @@ impl CommandList {
     }
 
     fn apply_dynamic(&mut self, e: &ProtocolObject<dyn MTL4RenderCommandEncoder>, p: &GraphicsPipeline, size: (usize, usize)) {
-        if !self.gfx.dirty {
+        let dirty = std::mem::replace(&mut self.gfx.dirty, 0);
+        if dirty == 0 {
             return;
         }
-        self.gfx.dirty = false;
         let fast = self.opt_fast_enc_state;
-        self.enc_render_cache.apply_pso(e, &p.pso, fast);
-        self.enc_render_cache.apply_raster(e, &p.raster, fast);
-        self.enc_render_cache.apply_ds(e, &p.depth_stencil, fast);
-        self.enc_render_cache.apply_shared(
-            e,
-            size,
-            &self.gfx.viewports,
-            &self.gfx.scissors,
-            self.gfx.blend_factor,
-            self.gfx.stencil_ref,
-            self.gfx.stencil_back_ref,
-            fast,
-        );
+        if (dirty & GFX_DIRTY_PSO) != 0 {
+            self.enc_render_cache.apply_pso(e, &p.pso, fast);
+            self.enc_render_cache.apply_raster(e, &p.raster, fast);
+            self.enc_render_cache.apply_ds(e, &p.depth_stencil, fast);
+        } else if fast && stats::active() {
+            stats::add(&stats::c::enc_state_skip, 3);
+        }
+        if (dirty & GFX_DIRTY_SHARED) != 0 {
+            self.enc_render_cache.apply_shared_dirty(
+                e,
+                size,
+                dirty,
+                &self.gfx.viewports,
+                &self.gfx.scissors,
+                self.gfx.blend_factor,
+                self.gfx.stencil_ref,
+                self.gfx.stencil_back_ref,
+                fast,
+            );
+        }
+        if fast && stats::active() {
+            let clean_shared = (GFX_DIRTY_SHARED & !dirty).count_ones() as u64;
+            if clean_shared > 0 {
+                stats::add(&stats::c::enc_state_skip, clean_shared);
+            }
+        }
     }
 
     fn apply_shared_dynamic_snap(e: &ProtocolObject<dyn MTL4RenderCommandEncoder>, d: &DynSnapshot, size: (usize, usize)) {
@@ -16850,16 +17149,6 @@ impl CommandList {
                         stats::inc(&stats::c::render_split_sync);
                     }
                     let mid_on = self.mid_qb_stagesync_active();
-                    let base_vtx = if orig_vtx.is_empty() {
-                        MTLStages::empty()
-                    } else {
-                        self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
-                    };
-                    let base_frag = if orig_frag.is_empty() {
-                        MTLStages::empty()
-                    } else {
-                        self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
-                    };
                     let (eff_vtx, eff_frag) = if dom_exact {
                         let ev = if orig_vtx.is_empty() {
                             MTLStages::empty()
@@ -16873,11 +17162,33 @@ impl CommandList {
                             let u = self.unsatisfied_enc_after_for_req(orig_frag, MTLStages::Fragment, &frag_req, mid_on);
                             self.fold_dominated_after(u, &frag_req)
                         };
-                        if ev != base_vtx || ef != base_frag {
-                            stats::inc(&stats::c::render_dom_fold);
+                        if stats::active() {
+                            let base_vtx = if orig_vtx.is_empty() {
+                                MTLStages::empty()
+                            } else {
+                                self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                            };
+                            let base_frag = if orig_frag.is_empty() {
+                                MTLStages::empty()
+                            } else {
+                                self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
+                            };
+                            if ev != base_vtx || ef != base_frag {
+                                stats::inc(&stats::c::render_dom_fold);
+                            }
                         }
                         (ev, ef)
                     } else {
+                        let base_vtx = if orig_vtx.is_empty() {
+                            MTLStages::empty()
+                        } else {
+                            self.unsatisfied_mid_qb_after(orig_vtx, PRE_RASTER)
+                        };
+                        let base_frag = if orig_frag.is_empty() {
+                            MTLStages::empty()
+                        } else {
+                            self.unsatisfied_mid_qb_after(orig_frag, MTLStages::Fragment)
+                        };
                         (base_vtx, base_frag)
                     };
                     if (eff_vtx | eff_frag).is_empty() {
@@ -17062,16 +17373,15 @@ impl CommandList {
             }
             if let Some((after, before)) = sync {
                 let mid_on = self.mid_qb_stagesync_active();
-                let base_after = self.unsatisfied_mid_qb_after(after, before);
                 let eff_after = if dom_exact {
                     let u = self.unsatisfied_enc_after_for_req(after, before, &sync_req, mid_on);
                     let f = self.fold_dominated_after(u, &sync_req);
-                    if f != base_after {
+                    if stats::active() && f != self.unsatisfied_mid_qb_after(after, before) {
                         stats::inc(&stats::c::render_dom_fold);
                     }
                     f
                 } else {
-                    base_after
+                    self.unsatisfied_mid_qb_after(after, before)
                 };
                 if eff_after.is_empty() {
                     stats::inc(&stats::c::stagesync_skip);
@@ -17301,15 +17611,53 @@ impl CommandList {
                             super::indirect_icb::kernel_v3_clamped(),
                         ) {
                             ce.setComputePipelineState(pk);
-                            for chunk in prep_items.chunks(super::indirect_icb::MAX_PREP_BATCH) {
-                                let mut batch = super::indirect_icb::PrepBatch {
-                                    n_items: chunk.len() as u32,
-                                    ..Default::default()
-                                };
-                                batch.items[..chunk.len()].copy_from_slice(chunk);
-                                let used = 16 + chunk.len() * std::mem::size_of::<super::indirect_icb::PrepItem>();
-                                let bytes = &super::clear::bytes_of(&batch)[..used];
-                                if let Ok(b_va) = ring_arc.lock().unwrap().upload(bytes, 256) {
+                            let n_chunks = prep_items.len().div_ceil(super::indirect_icb::MAX_PREP_BATCH);
+                            let mut stack_vas = [0u64; 8];
+                            let mut heap_vas: Vec<u64> = Vec::new();
+                            let chunk_vas: &[u64] = if n_chunks <= stack_vas.len() {
+                                {
+                                    let mut r = ring_arc.lock().unwrap();
+                                    for (dst, chunk) in stack_vas
+                                        .iter_mut()
+                                        .zip(prep_items.chunks(super::indirect_icb::MAX_PREP_BATCH))
+                                    {
+                                        let mut batch = super::indirect_icb::PrepBatch {
+                                            n_items: chunk.len() as u32,
+                                            ..Default::default()
+                                        };
+                                        batch.items[..chunk.len()].copy_from_slice(chunk);
+                                        let used = 16
+                                            + chunk.len()
+                                                * std::mem::size_of::<super::indirect_icb::PrepItem>();
+                                        let bytes = &super::clear::bytes_of(&batch)[..used];
+                                        *dst = r.upload(bytes, 256).unwrap_or(0);
+                                    }
+                                }
+                                &stack_vas[..n_chunks]
+                            } else {
+                                heap_vas.reserve(n_chunks);
+                                {
+                                    let mut r = ring_arc.lock().unwrap();
+                                    for chunk in prep_items.chunks(super::indirect_icb::MAX_PREP_BATCH) {
+                                        let mut batch = super::indirect_icb::PrepBatch {
+                                            n_items: chunk.len() as u32,
+                                            ..Default::default()
+                                        };
+                                        batch.items[..chunk.len()].copy_from_slice(chunk);
+                                        let used = 16
+                                            + chunk.len()
+                                                * std::mem::size_of::<super::indirect_icb::PrepItem>();
+                                        let bytes = &super::clear::bytes_of(&batch)[..used];
+                                        heap_vas.push(r.upload(bytes, 256).unwrap_or(0));
+                                    }
+                                }
+                                &heap_vas
+                            };
+                            for (chunk, &b_va) in prep_items
+                                .chunks(super::indirect_icb::MAX_PREP_BATCH)
+                                .zip(chunk_vas.iter())
+                            {
+                                if b_va != 0 {
                                     self.set_table_addr(b_va, 0);
                                     ce.dispatchThreadgroups_threadsPerThreadgroup(
                                         MTLSize { width: chunk.len().div_ceil(64), height: 1, depth: 1 },
@@ -17367,7 +17715,7 @@ impl CommandList {
                     self.compute_pso_bound = false;
                     self.pt_note_util(pt::synth::EI_EXPAND, n_dispatches);
                     self.note_stage_ran(MTLStages::Dispatch);
-                    stats::c::icb_prepass_cs.fetch_add(icb_count as u64, std::sync::atomic::Ordering::Relaxed);
+                    stats::add(&stats::c::icb_prepass_cs, icb_count as u64);
                     let any_ps = segs
                         .iter()
                         .any(|s| matches!(s.op, DrawOp::Icb { .. }) && s.pso.ps.is_some());
@@ -17591,7 +17939,7 @@ impl CommandList {
                 MTL4VisibilityOptions::Device,
             );
             if icb_count > 1 {
-                stats::c::icb_hoist_saved.fetch_add((icb_count - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                stats::add(&stats::c::icb_hoist_saved, (icb_count - 1) as u64);
             }
             if let Some(o) = &self.occlusion {
                 let mode = if o.binary { MTLVisibilityResultMode::Boolean } else { MTLVisibilityResultMode::Counting };
@@ -17713,11 +18061,60 @@ impl CommandList {
             if !fast {
                 self.enc_render_cache.reset();
             }
-            self.gfx.dirty = true;
+            self.gfx.dirty = GFX_DIRTY_ALL;
         }
     }
 
+    /// Flush dirty graphics root arguments and/or upload `RuntimeDrawParams` under a
+    /// single `UploadRing` lock (zero locks when neither is dirty).
     #[inline]
+    fn flush_gfx_root_and_draw_params(
+        &mut self,
+        needs_draw_params: bool,
+        params: &[u8],
+    ) -> Result<(u64, u64), String> {
+        let need_root = self.gfx_root.rs.is_some() && self.gfx_root.is_dirty();
+        let (need_params, cached_pa) = if !needs_draw_params {
+            (false, 0)
+        } else if self.opt_fast_enc_state
+            && self.last_draw_params_va != 0
+            && params.len() <= 20
+            && self.last_draw_params_len as usize == params.len()
+            && self.last_draw_params[..params.len()] == *params
+        {
+            stats::inc(&stats::c::enc_state_skip);
+            (false, self.last_draw_params_va)
+        } else {
+            (true, 0)
+        };
+        if !need_root && !need_params {
+            let root = if self.gfx_root.rs.is_some() { self.gfx_root.bound } else { 0 };
+            return Ok((root, cached_pa));
+        }
+        let ring = self.ring.as_ref().ok_or("command list is not open")?;
+        let mut r = ring.lock().unwrap();
+        let root = if need_root {
+            self.gfx_root.flush(&mut r)?
+        } else if self.gfx_root.rs.is_some() {
+            self.gfx_root.bound
+        } else {
+            0
+        };
+        let pa = if need_params {
+            let va = r.upload(params, 16)?;
+            if params.len() <= 20 {
+                self.last_draw_params[..params.len()].copy_from_slice(params);
+                self.last_draw_params_len = params.len() as u8;
+                self.last_draw_params_va = va;
+            }
+            va
+        } else {
+            cached_pa
+        };
+        Ok((root, pa))
+    }
+
+    #[cfg(test)]
     fn upload_draw_params(&mut self, params: &[u8]) -> Result<u64, String> {
         if self.opt_fast_enc_state
             && self.last_draw_params_va != 0
@@ -17749,12 +18146,7 @@ impl CommandList {
             Some(pr) if t.is_native() => pr,
             _ => return Err(format!("primitive topology {} needs emulation (adjacency/fan/patch), not implemented", self.gfx.topology)),
         };
-        let root = self.flush_root(false)?;
-        let pa = if p.needs_draw_params {
-            self.upload_draw_params(params)?
-        } else {
-            0
-        };
+        let (root, pa) = self.flush_gfx_root_and_draw_params(p.needs_draw_params, params)?;
         let ia = super::binding::static_index_type_va(indexed.unwrap_or(NON_INDEXED_DRAW))?;
         if self.icb_prepass_pending {
             let meta = self.snapshot_gfx_seg_exact(&p, indexed.is_some(), false, false, false, false, Some(&[]));
@@ -17767,8 +18159,24 @@ impl CommandList {
         if p.vs_writes_uav && self.list_unwaited_vtx_frag {
             eff_reads |= super::pipeline::READS_TEX;
         }
-        if self.need_pre_open_cur_draw_exact() {
-            self.resolve_cur_draw_gfx_exact(&p, indexed.is_some(), false, false, false, false, Some(&[]));
+        let need_pre_open = self.need_pre_open_cur_draw_exact();
+        let do_gfx = need_pre_open || self.opt_gfx_desc_table_exact;
+        let do_uav = writes_uav && self.opt_rp_split_exact_keep;
+        if do_gfx || do_uav {
+            self.resolve_gfx_binds_cached(
+                &p,
+                indexed.is_some(),
+                false,
+                false,
+                false,
+                false,
+                Some(&[]),
+                do_gfx,
+                do_uav,
+            );
+        }
+        if need_pre_open {
+            self.apply_gfx_bind_cache_to_cur_draw(&p);
         } else {
             self.cur_draw_exact_valid = false;
         }
@@ -17803,11 +18211,11 @@ impl CommandList {
             if self.cur_draw_exact_valid {
                 self.commit_cur_draw_exact_to_enc();
             } else {
-                self.record_gfx_stage_exact_binds(&p, indexed.is_some(), false, false, false, false, Some(&[]));
+                self.commit_gfx_bind_cache_to_enc(&p);
             }
         }
         if writes_uav && self.opt_rp_split_exact_keep {
-            self.record_gfx_uav_write_exact(&p, false);
+            self.commit_gfx_bind_cache_uav_writes(false);
         }
         self.gfx.pass_uav |= writes_uav;
         if writes_uav {
@@ -17854,17 +18262,29 @@ impl CommandList {
             _ => return Err(format!("primitive topology {} needs emulation (adjacency/fan/patch), not implemented", self.gfx.topology)),
         };
         self.pt_split();
-        let root = self.flush_root(false)?;
-        let pa = if p.needs_draw_params {
-            self.upload_draw_params(params)?
-        } else {
-            0
-        };
+        let (root, pa) = self.flush_gfx_root_and_draw_params(p.needs_draw_params, params)?;
         let ia = super::binding::static_index_type_va(indexed.unwrap_or(NON_INDEXED_DRAW))?;
         let writes_uav = self.gfx_pso_writes_uav(&p);
+        let check_hazard = self.gfx.pass_uav_hazard && self.opt_rp_split_exact_keep && (writes_uav || p.uses_uav);
+        let need_pre_open = self.need_pre_open_cur_draw_exact();
+        let do_gfx = check_hazard || need_pre_open || self.opt_gfx_desc_table_exact;
+        let do_uav = writes_uav && self.opt_rp_split_exact_keep;
+        if do_gfx || do_uav {
+            self.resolve_gfx_binds_cached(
+                &p,
+                indexed.is_some(),
+                indirect,
+                indirect,
+                indirect,
+                indirect,
+                if indirect { None } else { Some(&[]) },
+                do_gfx,
+                do_uav,
+            );
+        }
         if self.gfx.pass_uav_hazard {
             if self.opt_rp_split_exact_keep {
-                if (writes_uav || p.uses_uav) && self.gfx_uav_overlaps_pass_hazard(&p, indirect) {
+                if (writes_uav || p.uses_uav) && self.gfx_cached_overlaps_pass_hazard(indirect) {
                     stats::inc(&stats::c::rb_uav_split);
                     self.end_encoder();
                 } else if writes_uav {
@@ -17879,16 +18299,8 @@ impl CommandList {
         if p.vs_writes_uav && self.list_unwaited_vtx_frag {
             eff_reads |= super::pipeline::READS_TEX;
         }
-        if self.need_pre_open_cur_draw_exact() {
-            self.resolve_cur_draw_gfx_exact(
-                &p,
-                indexed.is_some(),
-                indirect,
-                indirect,
-                indirect,
-                indirect,
-                if indirect { None } else { Some(&[]) },
-            );
+        if need_pre_open {
+            self.apply_gfx_bind_cache_to_cur_draw(&p);
         } else {
             self.cur_draw_exact_valid = false;
         }
@@ -17923,19 +18335,11 @@ impl CommandList {
             if self.cur_draw_exact_valid {
                 self.commit_cur_draw_exact_to_enc();
             } else {
-                self.record_gfx_stage_exact_binds(
-                    &p,
-                    indexed.is_some(),
-                    indirect,
-                    indirect,
-                    indirect,
-                    indirect,
-                    if indirect { None } else { Some(&[]) },
-                );
+                self.commit_gfx_bind_cache_to_enc(&p);
             }
         }
         if writes_uav && self.opt_rp_split_exact_keep {
-            self.record_gfx_uav_write_exact(&p, indirect);
+            self.commit_gfx_bind_cache_uav_writes(indirect);
         }
         self.render_mid_barrier(&e);
         self.gfx.pass_uav |= writes_uav;
@@ -18056,10 +18460,18 @@ impl CommandList {
         };
 
         self.pt_split();
-        let root = self.flush_root(false)?;
         let ring = self.ring.clone().ok_or("command list is not open")?;
-        let (params_va, info_va, vbs_va) = {
+        let (root, params_va, info_va, vbs_va) = {
             let mut r = ring.lock().unwrap();
+            let root = if self.gfx_root.rs.is_some() {
+                if self.gfx_root.is_dirty() {
+                    self.gfx_root.flush(&mut r)?
+                } else {
+                    self.gfx_root.bound
+                }
+            } else {
+                0
+            };
             let pa = r.upload(draw_params, 16)?;
             let ia = r.upload(&draw_info.to_bytes(), 16)?;
             let mut vb_bytes = [0u8; 31 * 16];
@@ -18069,7 +18481,7 @@ impl CommandList {
                 vb_bytes[s * 16..(s + 1) * 16].copy_from_slice(&rv.to_bytes());
             }
             let va = r.upload(&vb_bytes, 16)?;
-            (pa, ia, va)
+            (root, pa, ia, va)
         };
 
         let writes_uav = self.gfx_pso_writes_uav(&p);
@@ -18144,30 +18556,47 @@ impl CommandList {
             let layout = super::indirect::IndirectLayout { stride: 16, work: super::indirect::Work::Draw, work_offset: 0, patches: Vec::new(), vb_offsets: Vec::new(), ib_offset: None };
             return self.execute_indirect(&layout, 1, a, None, None);
         }
-        let batch_hazard = self.gfx.pass_uav_hazard && self.gfx.pso.clone().is_some_and(|p| {
-            let w = self.gfx_pso_writes_uav(&p);
-            if self.opt_rp_split_exact_keep {
-                (w || p.uses_uav) && self.gfx_uav_overlaps_pass_hazard(&p, false)
-            } else {
-                w
-            }
-        });
-        if !self.icb_segs.is_empty() && !batch_hazard {
-            let (pso, prim, dyn_idx, bind, deferred_meta) = self.begin_draw_batched(None, &args.to_bytes())?;
-            self.icb_segs.push(DrawSeg {
-                pso,
-                dyn_idx,
-                deferred_meta,
-                op: DrawOp::Draw {
-                    bind,
-                    prim,
-                    first_vertex: first_vertex as usize,
-                    vertices: vertices as usize,
-                    instances: instances as usize,
-                    first_instance: first_instance as usize,
-                },
+        if !self.icb_segs.is_empty() {
+            let batch_hazard = self.gfx.pass_uav_hazard && self.gfx.pso.clone().is_some_and(|p| {
+                let w = self.gfx_pso_writes_uav(&p);
+                if self.opt_rp_split_exact_keep {
+                    if !(w || p.uses_uav) {
+                        false
+                    } else {
+                        self.resolve_gfx_binds_cached(
+                            &p,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            Some(&[]),
+                            true,
+                            w && self.opt_rp_split_exact_keep,
+                        );
+                        self.gfx_cached_overlaps_pass_hazard(false)
+                    }
+                } else {
+                    w
+                }
             });
-            return Ok(());
+            if !batch_hazard {
+                let (pso, prim, dyn_idx, bind, deferred_meta) = self.begin_draw_batched(None, &args.to_bytes())?;
+                self.icb_segs.push(DrawSeg {
+                    pso,
+                    dyn_idx,
+                    deferred_meta,
+                    op: DrawOp::Draw {
+                        bind,
+                        prim,
+                        first_vertex: first_vertex as usize,
+                        vertices: vertices as usize,
+                        instances: instances as usize,
+                        first_instance: first_instance as usize,
+                    },
+                });
+                return Ok(());
+            }
         }
         let (e, _p, prim) = self.begin_draw(None, &args.to_bytes())?;
         unsafe { e.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(prim, first_vertex as usize, vertices as usize, instances as usize, first_instance as usize) };
@@ -18203,36 +18632,53 @@ impl CommandList {
             let layout = super::indirect::IndirectLayout { stride: 20, work: super::indirect::Work::DrawIndexed, work_offset: 0, patches: Vec::new(), vb_offsets: Vec::new(), ib_offset: None };
             return self.execute_indirect(&layout, 1, a, None, None);
         }
-        let batch_hazard = self.gfx.pass_uav_hazard && self.gfx.pso.clone().is_some_and(|p| {
-            let w = self.gfx_pso_writes_uav(&p);
-            if self.opt_rp_split_exact_keep {
-                (w || p.uses_uav) && self.gfx_uav_overlaps_pass_hazard(&p, false)
-            } else {
-                w
-            }
-        });
-        if !self.icb_segs.is_empty() && !batch_hazard {
-            let (pso, prim, dyn_idx, bind, deferred_meta) = self.begin_draw_batched(Some(f.ir), &args.to_bytes())?;
-            if !crate::topology::strip_cut_matches(pso.strip_cut, fmt, self.gfx.topology) {
-                log::debug!(target: "d3d", "DrawIndexedInstanced: strip-cut value {} differs from Metal's restart rule (topology {}, format {fmt})", pso.strip_cut, self.gfx.topology);
-            }
-            self.icb_segs.push(DrawSeg {
-                pso,
-                dyn_idx,
-                deferred_meta,
-                op: DrawOp::DrawIndexed {
-                    bind,
-                    prim,
-                    indices: indices as usize,
-                    index_type: f.mtl,
-                    ib_va: addr + off,
-                    ib_len: (size as u64 - off) as usize,
-                    instances: instances as usize,
-                    base_vertex: base_vertex as isize,
-                    first_instance: first_instance as usize,
-                },
+        if !self.icb_segs.is_empty() {
+            let batch_hazard = self.gfx.pass_uav_hazard && self.gfx.pso.clone().is_some_and(|p| {
+                let w = self.gfx_pso_writes_uav(&p);
+                if self.opt_rp_split_exact_keep {
+                    if !(w || p.uses_uav) {
+                        false
+                    } else {
+                        self.resolve_gfx_binds_cached(
+                            &p,
+                            true,
+                            false,
+                            false,
+                            false,
+                            false,
+                            Some(&[]),
+                            true,
+                            w && self.opt_rp_split_exact_keep,
+                        );
+                        self.gfx_cached_overlaps_pass_hazard(false)
+                    }
+                } else {
+                    w
+                }
             });
-            return Ok(());
+            if !batch_hazard {
+                let (pso, prim, dyn_idx, bind, deferred_meta) = self.begin_draw_batched(Some(f.ir), &args.to_bytes())?;
+                if !crate::topology::strip_cut_matches(pso.strip_cut, fmt, self.gfx.topology) {
+                    log::debug!(target: "d3d", "DrawIndexedInstanced: strip-cut value {} differs from Metal's restart rule (topology {}, format {fmt})", pso.strip_cut, self.gfx.topology);
+                }
+                self.icb_segs.push(DrawSeg {
+                    pso,
+                    dyn_idx,
+                    deferred_meta,
+                    op: DrawOp::DrawIndexed {
+                        bind,
+                        prim,
+                        indices: indices as usize,
+                        index_type: f.mtl,
+                        ib_va: addr + off,
+                        ib_len: (size as u64 - off) as usize,
+                        instances: instances as usize,
+                        base_vertex: base_vertex as isize,
+                        first_instance: first_instance as usize,
+                    },
+                });
+                return Ok(());
+            }
         }
         let (e, p, prim) = self.begin_draw(Some(f.ir), &args.to_bytes())?;
         if !crate::topology::strip_cut_matches(p.strip_cut, fmt, self.gfx.topology) {
@@ -18274,7 +18720,7 @@ impl CommandList {
         }
         let compute = l.work == Work::Dispatch;
         stats::inc(&stats::c::ei_calls);
-        stats::c::ei_max_count.fetch_add(max_count as u64, std::sync::atomic::Ordering::Relaxed);
+        stats::add(&stats::c::ei_max_count, max_count as u64);
         // Validate the work state before encoding anything.
         let index = if l.work == Work::DrawIndexed && l.ib_offset.is_none() {
             let (addr, size, fmt) = self.gfx.ib.ok_or("indirect indexed draw without an index buffer")?;
@@ -18332,12 +18778,21 @@ impl CommandList {
                 let rs = root.rs.as_ref().ok_or("ExecuteIndirect with root argument changes but no root signature")?;
                 (rs.layout().size, l.kernel_patches(rs.layout())?)
             };
-            let template = self.flush_root(compute)?;
             let ts = indirect::tlab_stride(tlab_size);
             let ring = self.ring.clone().ok_or("command list is not open")?;
             let out_slots = if gpu_ib.is_some() { 2usize } else { 1usize };
             let (out, tout, params) = {
                 let mut r = ring.lock().unwrap();
+                let root_state = if compute { &mut self.compute_root } else { &mut self.gfx_root };
+                let template = if root_state.rs.is_some() {
+                    if root_state.is_dirty() {
+                        root_state.flush(&mut r)?
+                    } else {
+                        root_state.bound
+                    }
+                } else {
+                    0
+                };
                 let (out, _) = r.alloc(ws as usize * max_count as usize * out_slots, 16)?;
                 let tout = if patches.is_empty() { 0 } else { r.alloc(ts as usize * max_count as usize, 256)?.0 };
                 let (zero_word, zero_n) = l.work.zero();
@@ -18697,7 +19152,7 @@ impl CommandList {
                     pso.access.uav_srv_classes
                 };
                 let mut hk = if self.opt_sm66_handle_kind_exact {
-                    super::pipeline::shader_handle_kind_profile(&pso.shader, &pso.access)
+                    super::pipeline::resolve_pso_hk_profile(pso.hk_profile, &pso.shader, &pso.access)
                 } else {
                     super::pipeline::HandleKindProfile::OPAQUE
                 };
@@ -18801,7 +19256,7 @@ impl CommandList {
         let (e, p, prim) = self.begin_draw_ext(default_ir, &[0u8; 20], true)?;
         let ia16 = super::binding::static_index_type_va(f16.ir).unwrap_or(0);
         let ia32 = super::binding::static_index_type_va(f32.ir).unwrap_or(0);
-        stats::c::ei_draws.fetch_add(max_count as u64 * if gpu_ib.is_some() { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        stats::add(&stats::c::ei_draws, max_count as u64 * if gpu_ib.is_some() { 2 } else { 1 });
         for i in 0..max_count as u64 {
             let cmd_bytes = args_cpu.and_then(|b| b.get((i as usize) * (l.stride as usize)..));
             let cmd_ib = if gpu_ib.is_some() {
@@ -18904,7 +19359,7 @@ impl CommandList {
         has_patches: bool,
         tlab_stride: u32,
         needs_draw_params: bool,
-    ) -> Result<(Retained<super::indirect_icb::MtlIcb>, u64), String> {
+    ) -> Result<(Retained<super::indirect_icb::MtlIcb>, u64, u64), String> {
         let (icb, location) = self
             .icbs
             .as_ref()
@@ -18927,10 +19382,25 @@ impl CommandList {
                 q.args_out = sr.alloc(32 * max_count as usize, 32)?.0;
             }
         }
+        // Coalesce graphics root flush + `IcbParams` upload under a single `ring` lock.
         let ring = self.ring.clone().ok_or("command list is not open")?;
-        let params = ring.lock().unwrap().upload(q.bytes(), 256)?;
+        let (params, root) = {
+            let mut r = ring.lock().unwrap();
+            let root = if self.gfx_root.rs.is_some() {
+                if self.gfx_root.is_dirty() {
+                    self.gfx_root.flush(&mut r)?
+                } else {
+                    self.gfx_root.bound
+                }
+            } else {
+                0
+            };
+            q.tlab_in = root;
+            q.tlab_static = root;
+            (r.upload(q.bytes(), 256)?, root)
+        };
         self.enc_icb_cmds = self.enc_icb_cmds.saturating_add(max_count);
-        Ok((icb, params))
+        Ok((icb, params, root))
     }
 
     /// `ExecuteIndirect` draws encoded on the GPU into an indirect command
@@ -18963,14 +19433,13 @@ impl CommandList {
             let rs = self.gfx_root.rs.as_ref().ok_or("ExecuteIndirect with root argument changes but no root signature")?;
             (rs.layout().size, l.kernel_patches(rs.layout())?)
         };
-        let root = self.flush_root(false)?;
         let ts = indirect::tlab_stride(tlab_size);
         let zero_va = super::binding::static_index_type_va(0)?;
         let mut q = IcbParams {
             args,
             count: count.unwrap_or(0),
-            tlab_in: root,
-            tlab_static: root,
+            tlab_in: 0,
+            tlab_static: 0,
             pred: self.predication.map_or(0, |pr| pr.gpu_va),
             pred_op: self.predication.map_or(0, |pr| pr.op),
             heap: self.heaps[0],
@@ -19073,7 +19542,7 @@ impl CommandList {
                             || ((q.count != 0 || q.pred != 0) && max_count > 64))));
             let args_bytes = (max_count as u64).saturating_mul(l.stride as u64);
             if can_prepass {
-                let (icb, params) = self.alloc_icb_params(
+                let (icb, params, _root) = self.alloc_icb_params(
                     &mut q,
                     max_count,
                     need_vb_binds,
@@ -19117,9 +19586,27 @@ impl CommandList {
             } else {
                 indirect_icb::expander_with(&p.rtv_formats, p.sample_count, true)?
             };
+            let check_hazard = self.gfx.pass_uav_hazard && self.opt_rp_split_exact_keep && (writes_uav || p.uses_uav);
+            let need_pre_open = self.need_pre_open_cur_draw_exact();
+            let do_gfx = check_hazard || need_pre_open || self.opt_gfx_desc_table_exact;
+            let do_uav = writes_uav && self.opt_rp_split_exact_keep;
+            let ind_vas = [args, q.count, q.pred];
+            if do_gfx || do_uav {
+                self.resolve_gfx_binds_cached(
+                    &p,
+                    q.indexed != 0,
+                    true,
+                    non_const_patch,
+                    !l.vb_offsets.is_empty(),
+                    l.ib_offset.is_some(),
+                    Some(&ind_vas),
+                    do_gfx,
+                    do_uav,
+                );
+            }
             if self.gfx.pass_uav_hazard {
                 if self.opt_rp_split_exact_keep {
-                    if (writes_uav || p.uses_uav) && self.gfx_uav_overlaps_pass_hazard(&p, non_const_patch) {
+                    if (writes_uav || p.uses_uav) && self.gfx_cached_overlaps_pass_hazard(non_const_patch) {
                         stats::inc(&stats::c::rb_uav_split);
                         self.end_encoder();
                     } else if writes_uav {
@@ -19134,16 +19621,8 @@ impl CommandList {
             if p.vs_writes_uav && self.list_unwaited_vtx_frag {
                 eff_reads |= super::pipeline::READS_TEX;
             }
-            if self.need_pre_open_cur_draw_exact() {
-                self.resolve_cur_draw_gfx_exact(
-                    &p,
-                    q.indexed != 0,
-                    true,
-                    non_const_patch,
-                    !l.vb_offsets.is_empty(),
-                    l.ib_offset.is_some(),
-                    Some(&[args, q.count, q.pred]),
-                );
+            if need_pre_open {
+                self.apply_gfx_bind_cache_to_cur_draw(&p);
             } else {
                 self.cur_draw_exact_valid = false;
             }
@@ -19160,7 +19639,7 @@ impl CommandList {
                     return Err(err);
                 }
             };
-            let (icb, params) = self.alloc_icb_params(
+            let (icb, params, _root) = self.alloc_icb_params(
                 &mut q,
                 max_count,
                 need_vb_binds,
@@ -19186,19 +19665,11 @@ impl CommandList {
                 if self.cur_draw_exact_valid {
                     self.commit_cur_draw_exact_to_enc();
                 } else {
-                    self.record_gfx_stage_exact_binds(
-                        &p,
-                        q.indexed != 0,
-                        true,
-                        non_const_patch,
-                        !l.vb_offsets.is_empty(),
-                        l.ib_offset.is_some(),
-                        Some(&[args, q.count, q.pred]),
-                    );
+                    self.commit_gfx_bind_cache_to_enc(&p);
                 }
             }
             if writes_uav && self.opt_rp_split_exact_keep {
-                self.record_gfx_uav_write_exact(&p, non_const_patch);
+                self.commit_gfx_bind_cache_uav_writes(non_const_patch);
             }
             self.gfx.pass_uav |= writes_uav;
             if writes_uav {
@@ -19260,7 +19731,7 @@ impl CommandList {
                 indirect_icb::expander_with(&p.rtv_formats, p.sample_count, use_v2)?
             };
             let (e, _p, _prim) = self.begin_draw_ext(None, &[0u8; 20], true)?;
-            let (icb, params) = self.alloc_icb_params(
+            let (icb, params, root) = self.alloc_icb_params(
                 &mut q,
                 max_count,
                 need_vb_binds,
@@ -19292,7 +19763,7 @@ impl CommandList {
                 indirect_icb::kernel_with(use_v2)?
             };
             let e = self.compute().ok_or("compute encoder")?;
-            let (icb, params) = self.alloc_icb_params(
+            let (icb, params, _root) = self.alloc_icb_params(
                 &mut q,
                 max_count,
                 need_vb_binds,
@@ -19330,7 +19801,7 @@ impl CommandList {
         e.setArgumentTable_atStages(&self.table, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
         self.enc_render_cache.mesh_stages_bound = false;
         self.invalidate_table_cache();
-        self.gfx.dirty = true;
+        self.gfx.dirty = GFX_DIRTY_ALL;
         Ok(())
     }
 }
@@ -19528,6 +19999,7 @@ impl CommandList {
         }
 
         if super::gpunan::is_capturing() && self.open {
+            self.flush_pending_mfx_wait_fence();
             self.end_encoder();
             let _ = super::gpunan::encode_scan_resource(&self.cb, params.color, "upscale_in_color", "upscale", 0, 0, 0, 0);
             let _ = super::gpunan::encode_scan_resource(&self.cb, params.motion, "upscale_in_mv", "upscale", 0, 0, 0, 0);
@@ -19541,6 +20013,7 @@ impl CommandList {
         }
         if self.try_upscale_temporal_metalfx(params, &sv, &dv, x0, y0, w, h, s_fmt, d_fmt, &touch, tight_stages)? {
             if super::gpunan::is_capturing() && self.open {
+                self.flush_pending_mfx_wait_fence();
                 self.end_encoder();
                 let _ = super::gpunan::encode_scan_resource(&self.cb, params.output, "upscale_out_tmfx", "upscale", 0, 0, 0, 0);
                 self.need_full(FullWhy::ClearUav);
@@ -19891,53 +20364,95 @@ impl CommandList {
         Ok(true)
     }
 
-    /// Close any open encoder and emit a full Metal 4 queue consumer barrier +
-    /// `MTLFence` update + producer barrier before an opaque `MTL4FX*Scaler` pass.
-    ///
-    /// In Metal 4, resources are untracked and `MTL4FX*Scaler::encodeToCommandBuffer:`
-    /// encodes its own internal passes directly onto the command buffer. Waiting on
-    /// `MTLStages::All -> Dispatch`, updating our reusable `MTLFence` after `Dispatch`
-    /// (valid compute-encoder stage per `MTL4CommandEncoder.h`), and emitting
-    /// `All -> All` producer visibility guarantees all prior depth, motion, color,
-    /// exposure, and reactive-mask writes are complete and visible to MetalFX.
+    /// Emit a full Metal 4 queue consumer barrier + `MTLFence` update + producer barrier
+    /// before an opaque `MTL4FX*Scaler` pass, folding directly into any already-open
+    /// compute or render encoder to avoid spawning an empty fence-only compute encoder.
     fn sync_queue_before_metalfx(&mut self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
-        self.end_encoder();
+        if !self.icb_segs.is_empty() {
+            self.flush_draw_batch(false);
+        }
         if self.mfx_fence.is_none() {
             self.mfx_fence = super::device().and_then(|d| d.dev.newFence());
         }
-        if let Some(e) = self.cb.computeCommandEncoder() {
-            e.barrierAfterQueueStages_beforeStages_visibilityOptions(
-                MTLStages::All,
-                MTLStages::Dispatch,
-                MTL4VisibilityOptions::Device,
-            );
-            if let Some(f) = &self.mfx_fence {
-                e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
+        let pending_wait = self.pending_mfx_wait_fence.take();
+        match &self.enc {
+            Encoder::Compute(e) => {
+                let e = e.clone();
+                if let Some(wf) = pending_wait {
+                    e.waitForFence_beforeEncoderStages(&wf, MTLStages::Dispatch);
+                }
+                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Dispatch,
+                    MTL4VisibilityOptions::Device,
+                );
+                e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                    COMPUTE_STAGES,
+                    MTLStages::Dispatch,
+                    MTL4VisibilityOptions::Device,
+                );
+                if let Some(f) = &self.mfx_fence {
+                    e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
+                }
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::All,
+                    MTL4VisibilityOptions::Device,
+                );
+                self.end_encoder();
             }
-            e.barrierAfterStages_beforeQueueStages_visibilityOptions(
-                MTLStages::All,
-                MTLStages::All,
-                MTL4VisibilityOptions::Device,
-            );
-            e.endEncoding();
+            Encoder::Render(e) => {
+                let e = e.clone();
+                if let Some(wf) = pending_wait {
+                    e.waitForFence_beforeEncoderStages(&wf, MTLStages::Fragment);
+                }
+                e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::Fragment,
+                    MTL4VisibilityOptions::Device,
+                );
+                if let Some(f) = &self.mfx_fence {
+                    e.updateFence_afterEncoderStages(f, MTLStages::Fragment);
+                }
+                e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                    MTLStages::All,
+                    MTLStages::All,
+                    MTL4VisibilityOptions::Device,
+                );
+                self.end_encoder();
+            }
+            Encoder::None => {
+                if let Some(e) = self.cb.computeCommandEncoder() {
+                    if let Some(wf) = pending_wait {
+                        e.waitForFence_beforeEncoderStages(&wf, MTLStages::Dispatch);
+                    }
+                    e.barrierAfterQueueStages_beforeStages_visibilityOptions(
+                        MTLStages::All,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    if let Some(f) = &self.mfx_fence {
+                        e.updateFence_afterEncoderStages(f, MTLStages::Dispatch);
+                    }
+                    e.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                        MTLStages::All,
+                        MTLStages::All,
+                        MTL4VisibilityOptions::Device,
+                    );
+                    e.endEncoding();
+                }
+            }
         }
         self.mfx_fence.clone()
     }
 
-    /// Record that an opaque `MTL4FX*Scaler` pass ran directly on `self.cb` outside
-    /// our normal encoder lifecycle.
-    ///
-    /// Waits on the `MTLFence` that MetalFX updated upon completion and chains it to
-    /// subsequent queue stages (`waitForFence(Dispatch)` + `barrierAfterStages(Dispatch, All)`
-    /// per `MTL4CommandEncoder.h`), invalidates all prior `stage_sync` dominance entries,
-    /// advances every `stage_gen`, clears compute UAV passthrough caches, and arms a full
-    /// `MTLStages::All -> MTLStages::All` (`Device` visibility) queue barrier for the very
-    /// next encoder so post-upscale consumers (and scratch blits) can never race with
-    /// MetalFX's internal compute/render/neural passes.
-    fn finish_opaque_metalfx_pass(&mut self, fence: Option<&ProtocolObject<dyn MTLFence>>) {
-        if let Some(f) = fence {
+    /// Flush any deferred post-MetalFX fence wait into a minimal fallback compute encoder
+    /// when no subsequent encoder opened in this command buffer before `close()` or a raw
+    /// command-buffer scan.
+    fn flush_pending_mfx_wait_fence(&mut self) {
+        if let Some(f) = self.pending_mfx_wait_fence.take() {
             if let Some(e) = self.cb.computeCommandEncoder() {
-                e.waitForFence_beforeEncoderStages(f, MTLStages::Dispatch);
+                e.waitForFence_beforeEncoderStages(&f, MTLStages::Dispatch);
                 e.barrierAfterStages_beforeQueueStages_visibilityOptions(
                     MTLStages::Dispatch,
                     MTLStages::All,
@@ -19946,6 +20461,19 @@ impl CommandList {
                 e.endEncoding();
             }
         }
+    }
+
+    /// Record that an opaque `MTL4FX*Scaler` pass ran directly on `self.cb` outside
+    /// our normal encoder lifecycle.
+    ///
+    /// Defers the `waitForFence` + producer barrier into the very next encoder's
+    /// `begin_barrier` (falling back to a minimal compute encoder in `close()` only if
+    /// no subsequent encoder runs in this command buffer), invalidates all prior
+    /// `stage_sync` dominance entries, advances every `stage_gen`, clears compute UAV
+    /// passthrough caches, and arms a full `MTLStages::All -> MTLStages::All` (`Device`
+    /// visibility) queue barrier for the next encoder.
+    fn finish_opaque_metalfx_pass(&mut self, fence: Option<&ProtocolObject<dyn MTLFence>>) {
+        self.pending_mfx_wait_fence = fence.map(|f| f.retain());
         self.has_gpu_work = true;
         self.stage_sync = [StageSync::default(); 7];
         for g in &mut self.stage_gen {
@@ -20007,12 +20535,14 @@ impl CommandList {
             return self.util_dispatch_with("port_upscale_2d_f", Some(&sv), Some(&dv), clear::bytes_of(&p), [w, h, 1], &touch, tight_stages);
         }
         if super::gpunan::is_capturing() && self.open {
+            self.flush_pending_mfx_wait_fence();
             self.end_encoder();
             let _ = super::gpunan::encode_scan_resource(&self.cb, src, "upscale_res_in", "upscale", 0, 0, 0, 0);
             self.need_full(FullWhy::ClearUav);
         }
         if self.try_upscale_metalfx(&sv, &dv, x0, y0, w, h, s_fmt, d_fmt, &touch, tight_stages)? {
             if super::gpunan::is_capturing() && self.open {
+                self.flush_pending_mfx_wait_fence();
                 self.end_encoder();
                 let _ = super::gpunan::encode_scan_resource(&self.cb, dst, "upscale_res_out_smfx", "upscale", 0, 0, 0, 0);
                 self.need_full(FullWhy::ClearUav);
@@ -20541,21 +21071,26 @@ impl CommandList {
             e.setArgumentTable_atStages(&self.table, crate::mesh::STAGES);
             self.enc_render_cache.mesh_stages_bound = true;
         }
-        if self.gfx.dirty {
-            self.gfx.dirty = false;
-            self.enc_render_cache.apply_pso(&e, &p.pso, fast);
-            self.enc_render_cache.apply_raster(&e, &p.raster, fast);
-            self.enc_render_cache.apply_ds(&e, &p.depth_stencil, fast);
-            self.enc_render_cache.apply_shared(
-                &e,
-                size,
-                &self.gfx.viewports,
-                &self.gfx.scissors,
-                self.gfx.blend_factor,
-                self.gfx.stencil_ref,
-                self.gfx.stencil_back_ref,
-                fast,
-            );
+        let dirty = std::mem::replace(&mut self.gfx.dirty, 0);
+        if dirty != 0 {
+            if (dirty & GFX_DIRTY_PSO) != 0 {
+                self.enc_render_cache.apply_pso(&e, &p.pso, fast);
+                self.enc_render_cache.apply_raster(&e, &p.raster, fast);
+                self.enc_render_cache.apply_ds(&e, &p.depth_stencil, fast);
+            }
+            if (dirty & GFX_DIRTY_SHARED) != 0 {
+                self.enc_render_cache.apply_shared_dirty(
+                    &e,
+                    size,
+                    dirty,
+                    &self.gfx.viewports,
+                    &self.gfx.scissors,
+                    self.gfx.blend_factor,
+                    self.gfx.stencil_ref,
+                    self.gfx.stencil_back_ref,
+                    fast,
+                );
+            }
         }
         self.bind_table(root);
         let mut ran = MTLStages::Mesh;
@@ -21437,6 +21972,7 @@ mod tests {
             rs: pso_bounded.rs.clone(),
             threadgroup: pso_bounded.threadgroup,
             shader: pso_bounded.shader.clone(),
+            hk_profile: pso_bounded.hk_profile,
             access: ComputeAccess {
                 uav_slots: pso_bounded.access.uav_slots.clone(),
                 read_slots: None,
@@ -21549,6 +22085,8 @@ mod tests {
             sm66_narrowed: false,
             vs_access: pso_no_uav.vs_access.clone(),
             ps_access: pso_no_uav.ps_access.clone(),
+            vs_hk_profile: pso_no_uav.vs_hk_profile,
+            ps_hk_profile: pso_no_uav.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -22001,6 +22539,7 @@ mod tests {
             rs: pso_base.rs,
             threadgroup: pso_base.threadgroup,
             shader: pso_base.shader,
+            hk_profile: pso_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: pso_base.access.uav_slots,
                 read_slots: None,
@@ -22758,6 +23297,7 @@ mod tests {
             rs: cs_base.rs,
             threadgroup: cs_base.threadgroup,
             shader: cs_base.shader,
+            hk_profile: cs_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: cs_base.access.uav_slots,
                 read_slots: None,
@@ -23215,6 +23755,8 @@ mod tests {
             sm66_narrowed: false,
             vs_access: crate::metal::pipeline::ComputeAccess::opaque(),
             ps_access: None,
+            vs_hk_profile: pso_base.vs_hk_profile,
+            ps_hk_profile: pso_base.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -23828,6 +24370,7 @@ mod tests {
             rs: cs_base.rs,
             threadgroup: cs_base.threadgroup,
             shader: cs_base.shader,
+            hk_profile: cs_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: cs_base.access.uav_slots,
                 read_slots: None,
@@ -24370,6 +24913,7 @@ mod tests {
             rs: cs_base.rs.clone(),
             threadgroup: cs_base.threadgroup,
             shader: cs_base.shader.clone(),
+            hk_profile: cs_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: cs_base.access.uav_slots.clone(),
                 read_slots: None,
@@ -24386,6 +24930,7 @@ mod tests {
             rs: cs_base.rs,
             threadgroup: cs_base.threadgroup,
             shader: cs_base.shader,
+            hk_profile: cs_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: cs_base.access.uav_slots,
                 read_slots: None,
@@ -24982,6 +25527,7 @@ mod tests {
             rs: base.rs.clone(),
             threadgroup: base.threadgroup,
             shader: base.shader.clone(),
+            hk_profile: base.hk_profile,
             access: acc_on,
         });
 
@@ -24993,6 +25539,7 @@ mod tests {
             rs: base.rs.clone(),
             threadgroup: base.threadgroup,
             shader: base.shader.clone(),
+            hk_profile: base.hk_profile,
             access: ComputeAccess {
                 uav_slots: None,
                 read_slots: None,
@@ -25012,6 +25559,7 @@ mod tests {
             rs: base.rs.clone(),
             threadgroup: base.threadgroup,
             shader: base.shader.clone(),
+            hk_profile: base.hk_profile,
             access: ComputeAccess {
                 uav_slots: None,
                 read_slots: None,
@@ -25031,6 +25579,7 @@ mod tests {
             rs: base.rs,
             threadgroup: base.threadgroup,
             shader: base.shader,
+            hk_profile: base.hk_profile,
             access: ComputeAccess {
                 uav_slots: None,
                 read_slots: None,
@@ -26620,6 +27169,7 @@ mod tests {
             rs: cs_base.rs,
             threadgroup: cs_base.threadgroup,
             shader: cs_base.shader,
+            hk_profile: cs_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: cs_base.access.uav_slots,
                 read_slots: None,
@@ -28044,6 +28594,8 @@ mod tests {
             sm66_narrowed: false,
             vs_access: crate::metal::pipeline::ComputeAccess::opaque(),
             ps_access: pso_fs.ps_access.clone(),
+            vs_hk_profile: pso_fs.vs_hk_profile,
+            ps_hk_profile: pso_fs.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -28457,7 +29009,8 @@ mod tests {
         assert!(stats::c::ei_cs_exact.load(Relaxed) >= ei0 + 2, "ei_cs_exact must count both ei_expand and indirect dispatch");
         assert_eq!(stats::c::cs_mid_qb.load(Relaxed) - mqb0, 0, "ei_expand -> indirect dispatch must not emit false cs_mid_qb");
         assert!((l.split_pend.vtx_after | l.split_pend.frag_after | l.split_pend.disp_after).is_empty(), "expanded compute ExecuteIndirect must not leak false vtx/frag/disp obligations");
-        assert_eq!(l.ib_disp_uav.as_slice(), Some(&[uav_a_id][..]), "ib_disp_uav must stay exact after ExecuteIndirect");
+        let disp_uav = if l.opt_ib_substage_narrow { l.ib_sub[0].disp_uav.as_slice() } else { l.ib_disp_uav.as_slice() };
+        assert_eq!(disp_uav, Some(&[uav_a_id][..]), "ib_disp_uav must stay exact after ExecuteIndirect");
 
         // 2) `Barrier::Uav(unrelated_id)` + unexpanded `ExecuteIndirect` on `uav_a`:
         //    Because `ib_disp_uav` stayed exact (`[uav_a_id]`), `uav_unrelated` was never written so
@@ -28790,6 +29343,8 @@ mod tests {
             sm66_narrowed: true,
             vs_access: pso_base.vs_access.clone(),
             ps_access: pso_base.ps_access.clone(),
+            vs_hk_profile: pso_base.vs_hk_profile,
+            ps_hk_profile: pso_base.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -29441,6 +29996,7 @@ mod tests {
             rs: pso_base.rs.clone(),
             shader: pso_base.shader.clone(),
             threadgroup: pso_base.threadgroup,
+            hk_profile: pso_base.hk_profile,
             access: ComputeAccess {
                 uav_slots: pso_base.access.uav_slots.clone(),
                 read_slots: None,
@@ -29611,6 +30167,8 @@ mod tests {
             sm66_narrowed: false,
             vs_access: crate::metal::pipeline::ComputeAccess::opaque(),
             ps_access: None,
+            vs_hk_profile: pso_no_tex.vs_hk_profile,
+            ps_hk_profile: pso_no_tex.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -30257,6 +30815,8 @@ mod tests {
             sm66_narrowed: true,
             vs_access: pso_base.vs_access.clone(),
             ps_access: pso_base.ps_access.clone(),
+            vs_hk_profile: pso_base.vs_hk_profile,
+            ps_hk_profile: pso_base.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -31426,6 +31986,8 @@ mod tests {
                 msc_refined: true,
                 msc_exact_classes: READS_BUF | READS_TEX,
             }),
+            vs_hk_profile: pso_base.vs_hk_profile,
+            ps_hk_profile: pso_base.ps_hk_profile,
             icb_desc: None,
             icb_pso: std::sync::OnceLock::new(),
         });
@@ -34621,6 +35183,7 @@ mod tests {
             rs: pso_raw.rs.clone(),
             threadgroup: pso_raw.threadgroup,
             shader: pso_raw.shader.clone(),
+            hk_profile: pso_raw.hk_profile,
             access: ComputeAccess {
                 touches_textures: true,
                 heap_indexed_or_unknown: false,
@@ -35739,6 +36302,7 @@ mod tests {
             rs: pso_raw.rs.clone(),
             shader: pso_raw.shader.clone(),
             threadgroup: pso_raw.threadgroup,
+            hk_profile: pso_raw.hk_profile,
             access: ComputeAccess {
                 touches_textures: true,
                 heap_indexed_or_unknown: false,
@@ -35984,6 +36548,7 @@ mod tests {
             rs: cs_raw.rs.clone(),
             shader: cs_raw.shader.clone(),
             threadgroup: cs_raw.threadgroup,
+            hk_profile: cs_raw.hk_profile,
             access: ComputeAccess {
                 touches_textures: true,
                 heap_indexed_or_unknown: false,
@@ -36389,6 +36954,7 @@ mod tests {
             rs: pso.rs.clone(),
             shader: sh_unb,
             threadgroup: pso.threadgroup,
+            hk_profile: pso.hk_profile,
             access: ComputeAccess {
                 touches_textures: true,
                 heap_indexed_or_unknown: true,
@@ -36474,8 +37040,13 @@ mod tests {
             l.dispatch(1, 1, 1).unwrap();
             if enable_a2 {
                 // The modeled shader can write Tex3D through a UAV but cannot read it through an SRV.
-                assert_ne!(l.ib_disp_uav_hk & HK_TEX3D_FLT, 0);
-                assert_eq!(l.ib_disp_ro_hk & HK_TEX3D_FLT, 0);
+                let (disp_uav_hk, disp_ro_hk) = if l.opt_ib_substage_narrow {
+                    (l.ib_sub[0].disp_uav_hk, l.ib_sub[0].disp_ro_hk)
+                } else {
+                    (l.ib_disp_uav_hk, l.ib_disp_ro_hk)
+                };
+                assert_ne!(disp_uav_hk & HK_TEX3D_FLT, 0);
+                assert_eq!(disp_ro_hk & HK_TEX3D_FLT, 0);
             }
             let mqb0 = stats::c::cs_mid_qb.load(Relaxed);
             let eb0 = stats::c::enc_barrier.load(Relaxed);

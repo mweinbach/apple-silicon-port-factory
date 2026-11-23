@@ -45,17 +45,29 @@ pub struct SendTex(pub Tex);
 unsafe impl Send for SendTex {}
 unsafe impl Sync for SendTex {}
 
+struct StagingSlot {
+    tex: SendTex,
+    /// Pre-created linear UNORM view for `*_sRGB` staging textures so compute
+    /// present blits never allocate an ObjC texture view + `defer_release` per frame.
+    linear_view: Option<SendTex>,
+}
+
+struct Mailbox {
+    job: Option<Job>,
+    /// The thread is presenting a job it took from the mailbox.
+    busy: bool,
+}
+
 struct Shared {
     layer: LayerRef,
     pq: Arc<Queue>,
     main: Arc<Queue>,
     sq: Option<Arc<Queue>>,
-    staging: Mutex<Vec<SendTex>>,
+    staging: Mutex<Vec<StagingSlot>>,
     slot_pv: [AtomicU64; SLOTS],
-    mailbox: Mutex<Option<Job>>,
+    mailbox: Mutex<Mailbox>,
     cv: Condvar,
-    /// The thread is presenting a job it took from the mailbox.
-    busy: AtomicBool,
+    drain_cv: Condvar,
     quit: AtomicBool,
     opt_present_blit_narrow: AtomicBool,
 }
@@ -74,9 +86,9 @@ impl PresentThread {
             sq,
             staging: Mutex::new(Vec::new()),
             slot_pv: std::array::from_fn(|_| AtomicU64::new(0)),
-            mailbox: Mutex::new(None),
+            mailbox: Mutex::new(Mailbox { job: None, busy: false }),
             cv: Condvar::new(),
-            busy: AtomicBool::new(false),
+            drain_cv: Condvar::new(),
             quit: AtomicBool::new(false),
             opt_present_blit_narrow: AtomicBool::new(super::swapchain::present_blit_narrow()),
         });
@@ -94,9 +106,14 @@ impl PresentThread {
     /// thread must be drained.
     pub fn set_staging(&self, w: u32, h: u32, fmt: MTLPixelFormat) -> Result<(), String> {
         let d = super::device().ok_or("no device")?;
+        let linear_fmt = match fmt {
+            MTLPixelFormat::RGBA8Unorm_sRGB => Some(MTLPixelFormat::RGBA8Unorm),
+            MTLPixelFormat::BGRA8Unorm_sRGB => Some(MTLPixelFormat::BGRA8Unorm),
+            _ => None,
+        };
         let mut st = self.sh.staging.lock().unwrap();
-        for t in st.drain(..) {
-            d.remove_resident(ProtocolObject::from_ref(&*t.0));
+        for s in st.drain(..) {
+            d.remove_resident(ProtocolObject::from_ref(&*s.tex.0));
         }
         for _ in 0..SLOTS {
             let td = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(fmt, w as usize, h as usize, false) };
@@ -105,14 +122,15 @@ impl PresentThread {
             let t = d.dev.newTextureWithDescriptor(&td).ok_or("staging texture")?;
             t.setLabel(Some(&objc2_foundation::NSString::from_str("present staging")));
             d.add_resident(ProtocolObject::from_ref(&*t));
-            st.push(SendTex(t));
+            let linear_view = linear_fmt.and_then(|lf| t.newTextureViewWithPixelFormat(lf)).map(SendTex);
+            st.push(StagingSlot { tex: SendTex(t), linear_view });
         }
         d.commit_residency();
         Ok(())
     }
 
     pub fn staging(&self, slot: usize) -> Option<Tex> {
-        self.sh.staging.lock().unwrap().get(slot).map(|t| t.0.clone())
+        self.sh.staging.lock().unwrap().get(slot).map(|s| s.tex.0.clone())
     }
 
     /// A staging slot whose last blit has completed.
@@ -133,7 +151,7 @@ impl PresentThread {
     /// `src_value`. Replaces a frame the thread has not started.
     pub fn submit(&self, slot: usize, src_value: u64, from_sq: bool) {
         let mut m = self.sh.mailbox.lock().unwrap();
-        if let Some(old) = m.replace(Job { slot, src_value, from_sq }) {
+        if let Some(old) = m.job.replace(Job { slot, src_value, from_sq }) {
             // Never encoded: its slot's previous blit had completed.
             self.sh.slot_pv[old.slot].store(0, Ordering::Release);
             super::encstats::inc(&super::encstats::c::present_mbox);
@@ -144,12 +162,11 @@ impl PresentThread {
     /// Wait until no job is queued or presenting and both the staging queue
     /// (if any) and present queue are idle.
     pub fn drain(&self) {
-        loop {
-            let idle = self.sh.mailbox.lock().unwrap().is_none() && !self.sh.busy.load(Ordering::Acquire);
-            if idle {
-                break;
+        {
+            let mut m = self.sh.mailbox.lock().unwrap();
+            while m.job.is_some() || m.busy {
+                m = self.sh.drain_cv.wait(m).unwrap();
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
         }
         if let Some(sq) = &self.sh.sq {
             sq.wait_idle();
@@ -173,8 +190,8 @@ impl Drop for PresentThread {
         }
         self.sh.pq.wait_idle();
         if let Some(d) = super::device() {
-            for t in self.sh.staging.lock().unwrap().drain(..) {
-                d.remove_resident(ProtocolObject::from_ref(&*t.0));
+            for s in self.sh.staging.lock().unwrap().drain(..) {
+                d.remove_resident(ProtocolObject::from_ref(&*s.tex.0));
             }
         }
     }
@@ -193,49 +210,98 @@ fn run(sh: Arc<Shared>) {
         // Keep drawable acquisition and present blit on P-cores on Apple Silicon / iOS.
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
-    let Some(d) = super::device() else { return };
+    let notify_exit = || {
+        let mut m = sh.mailbox.lock().unwrap();
+        if let Some(j) = m.job.take() {
+            sh.slot_pv[j.slot].store(0, Ordering::Release);
+        }
+        m.busy = false;
+        sh.drain_cv.notify_all();
+    };
+    let Some(d) = super::device() else {
+        notify_exit();
+        return;
+    };
     let mut ring = Ring { allocs: Vec::new(), cbs: Vec::new(), values: [0; RING], next: 0 };
     for _ in 0..RING {
         let (Some(a), Some(cb)) = (CommandAllocator::new(ListType::Direct), d.dev.newCommandBuffer()) else {
             log::error!(target: "d3d", "present thread: no command allocator/buffer");
+            notify_exit();
             return;
         };
         ring.allocs.push(a);
         ring.cbs.push(cb);
     }
+    // Dedicated argument table for this thread so present blits never contend on a global mutex.
+    let arg_table = {
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxTextureBindCount(2);
+        d.dev.newArgumentTableWithDescriptor_error(&atd).ok()
+    };
     loop {
-        let job = {
+        let mut job = {
             let mut m = sh.mailbox.lock().unwrap();
+            if m.busy {
+                m.busy = false;
+                if m.job.is_none() {
+                    sh.drain_cv.notify_all();
+                }
+            }
             loop {
                 if sh.quit.load(Ordering::Acquire) {
+                    sh.drain_cv.notify_all();
                     return;
                 }
-                if let Some(j) = m.take() {
-                    sh.busy.store(true, Ordering::Release);
+                if let Some(j) = m.job.take() {
+                    m.busy = true;
                     break j;
                 }
                 m = sh.cv.wait(m).unwrap();
             }
         };
-        let slot = job.slot;
-        let r = objc2::rc::autoreleasepool(|_| present_one(&sh, &mut ring, job));
+        let r = objc2::rc::autoreleasepool(|_| present_one(&sh, &mut ring, &mut job, arg_table.as_deref()));
         if let Err(e) = r {
             log::warn!(target: "d3d", "present thread: {e}");
-            sh.slot_pv[slot].store(0, Ordering::Release);
+            sh.slot_pv[job.slot].store(0, Ordering::Release);
         }
-        sh.busy.store(false, Ordering::Release);
     }
 }
 
-fn present_one(sh: &Shared, ring: &mut Ring, job: Job) -> Result<(), String> {
-    let t = std::time::Instant::now();
-    let drawable = sh.layer.0.nextDrawable().ok_or("nextDrawable returned nil")?;
-    super::encstats::c::present_acq_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    let src = sh.staging.lock().unwrap().get(job.slot).map(|t| t.0.clone()).ok_or("no staging texture")?;
+fn present_one(
+    sh: &Shared,
+    ring: &mut Ring,
+    job: &mut Job,
+    arg_table: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
+) -> Result<(), String> {
+    // Wait for the ring slot's prior present to complete BEFORE acquiring a drawable
+    // so Core Animation drawables are never held idle across a CPU wait.
     let i = ring.next;
-    ring.next = (i + 1) % RING;
     sh.pq.timeline.wait_cpu(ring.values[i], u64::MAX);
     ring.allocs[i].reset();
+
+    let t = super::encstats::active().then(std::time::Instant::now);
+    let drawable = sh.layer.0.nextDrawable().ok_or("nextDrawable returned nil")?;
+    if let Some(t) = t {
+        super::encstats::add(&super::encstats::c::present_acq_us, t.elapsed().as_micros() as u64);
+    }
+    ring.next = (i + 1) % RING;
+
+    // If a fresher frame arrived while blocked in `nextDrawable()`, present the
+    // newest frame instead of a 1-frame-stale one.
+    {
+        let mut m = sh.mailbox.lock().unwrap();
+        if let Some(newer) = m.job.take() {
+            sh.slot_pv[job.slot].store(0, Ordering::Release);
+            super::encstats::inc(&super::encstats::c::present_mbox);
+            *job = newer;
+        }
+    }
+
+    let (src, src_linear) = {
+        let st = sh.staging.lock().unwrap();
+        let slot = st.get(job.slot).ok_or("no staging texture")?;
+        (slot.tex.0.clone(), slot.linear_view.as_ref().map(|v| v.0.clone()))
+    };
     let cb = ring.cbs[i].clone();
     cb.beginCommandBufferWithAllocator(&ring.allocs[i].a);
     let e = cb.computeCommandEncoder().ok_or("compute encoder")?;
@@ -252,7 +318,7 @@ fn present_one(sh: &Shared, ring: &mut Ring, job: Job) -> Result<(), String> {
         MTLStages::Blit
     };
     e.barrierAfterQueueStages_beforeStages_visibilityOptions(after_stages, before_stages, MTL4VisibilityOptions::Device);
-    let keep_views = blit(&e, &src, &dst_tex);
+    let keep_views = blit_with(&e, &src, &dst_tex, src_linear.as_deref(), arg_table);
     e.endEncoding();
     cb.endCommandBuffer();
     let md: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
@@ -339,6 +405,16 @@ pub fn blit(
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
 ) -> Vec<SendTex> {
+    blit_with(e, src, dst, None, None)
+}
+
+fn blit_with(
+    e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    cached_src_linear: Option<&ProtocolObject<dyn MTLTexture>>,
+    dedicated_table: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
+) -> Vec<SendTex> {
     let (sw, sh) = (src.width(), src.height());
     let (dw, dh) = (dst.width(), dst.height());
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
@@ -362,50 +438,69 @@ pub fn blit(
         return Vec::new();
     }
     if needs_compute_blit(src, dst) {
-        let mut keep = Vec::new();
         // Always read `*_sRGB` back buffers through their raw linear UNORM twin
         // and write `*_sRGB` drawables through their raw linear UNORM twin so
         // already-sRGB-encoded bytes transfer losslessly without double-gamma
         // darkening (and `ShaderWrite` remains legal on sRGB drawables).
-        let src_view = match src.pixelFormat() {
-            MTLPixelFormat::RGBA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::RGBA8Unorm),
-            MTLPixelFormat::BGRA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::BGRA8Unorm),
-            _ => None,
+        let src_view = if cached_src_linear.is_some() {
+            None
+        } else {
+            match src.pixelFormat() {
+                MTLPixelFormat::RGBA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::RGBA8Unorm),
+                MTLPixelFormat::BGRA8Unorm_sRGB => src.newTextureViewWithPixelFormat(MTLPixelFormat::BGRA8Unorm),
+                _ => None,
+            }
         };
         let dst_view = match dst.pixelFormat() {
             MTLPixelFormat::BGRA8Unorm_sRGB => dst.newTextureViewWithPixelFormat(MTLPixelFormat::BGRA8Unorm),
             MTLPixelFormat::RGBA8Unorm_sRGB => dst.newTextureViewWithPixelFormat(MTLPixelFormat::RGBA8Unorm),
             _ => None,
         };
-        let s_tex: &ProtocolObject<dyn MTLTexture> = src_view.as_deref().unwrap_or(src);
+        let s_tex: &ProtocolObject<dyn MTLTexture> = cached_src_linear.or(src_view.as_deref()).unwrap_or(src);
         let d_tex: &ProtocolObject<dyn MTLTexture> = dst_view.as_deref().unwrap_or(dst);
         let kernel_name = if same_size { "port_present_copy_2d" } else { "port_present_scale_2d" };
-        if let (Ok(pso), Some(tbl_mtx)) = (super::clear::kernel(kernel_name), blit_arg_table()) {
-            let tbl = tbl_mtx.lock().unwrap();
-            unsafe {
+        if let Ok(pso) = super::clear::kernel(kernel_name) {
+            let dispatch_with_table = |table: &ProtocolObject<dyn MTL4ArgumentTable>| unsafe {
                 e.setComputePipelineState(pso);
-                tbl.table.setTexture_atIndex(s_tex.gpuResourceID(), 0);
-                tbl.table.setTexture_atIndex(d_tex.gpuResourceID(), 1);
-                e.setArgumentTable(Some(&tbl.table));
+                table.setTexture_atIndex(s_tex.gpuResourceID(), 0);
+                table.setTexture_atIndex(d_tex.gpuResourceID(), 1);
+                e.setArgumentTable(Some(table));
                 e.dispatchThreads_threadsPerThreadgroup(
                     MTLSize { width: dw, height: dh, depth: 1 },
                     MTLSize { width: 8, height: 8, depth: 1 },
                 );
+            };
+            let dispatched = if let Some(table) = dedicated_table {
+                dispatch_with_table(table);
+                true
+            } else if let Some(tbl_mtx) = blit_arg_table() {
+                let tbl = tbl_mtx.lock().unwrap();
+                dispatch_with_table(&tbl.table);
+                true
+            } else {
+                false
+            };
+            if dispatched {
+                let mut keep = Vec::new();
+                if let Some(v) = src_view {
+                    keep.push(SendTex(v));
+                }
+                if let Some(v) = dst_view {
+                    keep.push(SendTex(v));
+                }
+                return keep;
             }
-            drop(tbl);
-            if let Some(v) = src_view {
-                keep.push(SendTex(v));
-            }
-            if let Some(v) = dst_view {
-                keep.push(SendTex(v));
-            }
-            return keep;
         }
         log::warn!(target: "d3d", "present: compute blit ({kernel_name}) unavailable for {:?} -> {:?}", src.pixelFormat(), dst.pixelFormat());
         return Vec::new();
     }
-    let view = src.newTextureViewWithPixelFormat(dst.pixelFormat());
-    let blit_src = view.as_deref().unwrap_or(src);
+    let cached_match = cached_src_linear.filter(|v| v.pixelFormat() == dst.pixelFormat());
+    let view = if cached_match.is_some() {
+        None
+    } else {
+        src.newTextureViewWithPixelFormat(dst.pixelFormat())
+    };
+    let blit_src = cached_match.or(view.as_deref()).unwrap_or(src);
     if blit_src.pixelFormat() != dst.pixelFormat() {
         log::warn!(target: "d3d", "present: back buffer {:?} vs drawable {:?}: format conversion not implemented", src.pixelFormat(), dst.pixelFormat());
         return Vec::new();

@@ -14,8 +14,9 @@ use dxil_metal::runtime::DescriptorTableEntry;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 // ---------------------------------------------------------------------------
 // Upload ring (per command allocator)
@@ -41,9 +42,74 @@ impl Drop for RingChunk {
     }
 }
 
+struct RingPool {
+    /// Resident `StorageModeShared` chunks sorted ascending by `cap`.
+    shared: Vec<RingChunk>,
+    /// Resident `StorageModePrivate` chunks sorted ascending by `cap`.
+    private: Vec<RingChunk>,
+}
+
+impl RingPool {
+    const fn new() -> Self {
+        Self { shared: Vec::new(), private: Vec::new() }
+    }
+
+    #[inline]
+    fn bucket_mut(&mut self, private: bool) -> &mut Vec<RingChunk> {
+        if private {
+            &mut self.private
+        } else {
+            &mut self.shared
+        }
+    }
+
+    #[inline]
+    fn insert_sorted(bucket: &mut Vec<RingChunk>, c: RingChunk) {
+        let pos = bucket.partition_point(|x| x.cap < c.cap);
+        bucket.insert(pos, c);
+    }
+
+    #[inline]
+    fn take_best_fit(&mut self, private: bool, min_cap: usize, max_cap: usize) -> Option<RingChunk> {
+        let b = self.bucket_mut(private);
+        let pos = b.partition_point(|c| c.cap < min_cap);
+        if pos < b.len() && b[pos].cap <= max_cap {
+            Some(b.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Keep the largest chunks up to `max_bytes` (preserving at least one when
+    /// `keep_at_least_one` is set) without temporary index vectors.
+    fn trim_bucket(
+        bucket: &mut Vec<RingChunk>,
+        max_bytes: u64,
+        keep_at_least_one: bool,
+        dropped: &mut Vec<RingChunk>,
+    ) {
+        let mut kept_bytes = 0u64;
+        let mut i = bucket.len();
+        while i > 0 {
+            i -= 1;
+            let b = bucket[i].cap as u64;
+            if (keep_at_least_one && kept_bytes == 0) || kept_bytes.saturating_add(b) <= max_bytes {
+                kept_bytes = kept_bytes.saturating_add(b);
+            } else {
+                dropped.push(bucket.remove(i));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.shared.is_empty() && self.private.is_empty()
+    }
+}
+
 /// Process-wide pool of resident `UploadRing` chunks (shared upload + private GPU scratch),
 /// eliminating per-frame `newBuffer` + `MTLResidencySet::commit()` churn across allocator resets.
-static RING_POOL: Mutex<Vec<RingChunk>> = Mutex::new(Vec::new());
+static RING_POOL: Mutex<RingPool> = Mutex::new(RingPool::new());
 
 /// Compute the per-storage-mode byte cap for [`RING_POOL`]: generous on macOS,
 /// right-sized on iOS so steady-state upload & ICB scratch chunks never thrash residency
@@ -70,29 +136,22 @@ fn return_ring_chunks_to_pool(chunks: &mut Vec<RingChunk>) {
     let cap_bytes = ring_pool_budget_bytes();
     let mut dropped = Vec::new();
     if let Ok(mut p) = RING_POOL.lock() {
-        p.append(chunks);
-        for is_priv in [false, true] {
-            let mut idxs: Vec<usize> = p
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| (c.private_storage == is_priv).then_some(i))
-                .collect();
-            // Keep larger chunks first (satisfy wider allocations) up to cap_bytes.
-            idxs.sort_by(|&a, &b| p[b].cap.cmp(&p[a].cap));
-            let mut kept_bytes = 0u64;
-            let mut evict = Vec::new();
-            for idx in idxs {
-                let b = p[idx].cap as u64;
-                if kept_bytes == 0 || kept_bytes.saturating_add(b) <= cap_bytes {
-                    kept_bytes = kept_bytes.saturating_add(b);
-                } else {
-                    evict.push(idx);
-                }
+        let mut touched_shared = false;
+        let mut touched_private = false;
+        for c in chunks.drain(..) {
+            if c.private_storage {
+                touched_private = true;
+                RingPool::insert_sorted(&mut p.private, c);
+            } else {
+                touched_shared = true;
+                RingPool::insert_sorted(&mut p.shared, c);
             }
-            evict.sort_unstable_by(|a, b| b.cmp(a));
-            for idx in evict {
-                dropped.push(p.swap_remove(idx));
-            }
+        }
+        if touched_shared {
+            RingPool::trim_bucket(&mut p.shared, cap_bytes, true, &mut dropped);
+        }
+        if touched_private {
+            RingPool::trim_bucket(&mut p.private, cap_bytes, true, &mut dropped);
         }
     }
     if !dropped.is_empty() {
@@ -102,11 +161,11 @@ fn return_ring_chunks_to_pool(chunks: &mut Vec<RingChunk>) {
 
 /// Release all idle pooled `UploadRing` buffers back to Metal/XNU once active queues drain.
 pub fn trim_pool() -> usize {
-    let dropped = if let Ok(mut p) = RING_POOL.lock() {
-        std::mem::take(&mut *p)
-    } else {
-        Vec::new()
-    };
+    let mut dropped = Vec::new();
+    if let Ok(mut p) = RING_POOL.lock() {
+        dropped.append(&mut p.shared);
+        dropped.append(&mut p.private);
+    }
     let n = dropped.len();
     if !dropped.is_empty() {
         super::queue::defer_release_all(dropped);
@@ -118,28 +177,8 @@ pub fn trim_pool() -> usize {
 pub fn trim_pool_keep(max_bytes_per_mode: u64) -> usize {
     let mut dropped = Vec::new();
     if let Ok(mut p) = RING_POOL.lock() {
-        for is_priv in [false, true] {
-            let mut idxs: Vec<usize> = p
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| (c.private_storage == is_priv).then_some(i))
-                .collect();
-            idxs.sort_by(|&a, &b| p[b].cap.cmp(&p[a].cap));
-            let mut kept_bytes = 0u64;
-            let mut evict = Vec::new();
-            for idx in idxs {
-                let b = p[idx].cap as u64;
-                if kept_bytes.saturating_add(b) <= max_bytes_per_mode {
-                    kept_bytes = kept_bytes.saturating_add(b);
-                } else {
-                    evict.push(idx);
-                }
-            }
-            evict.sort_unstable_by(|a, b| b.cmp(a));
-            for idx in evict {
-                dropped.push(p.swap_remove(idx));
-            }
-        }
+        RingPool::trim_bucket(&mut p.shared, max_bytes_per_mode, false, &mut dropped);
+        RingPool::trim_bucket(&mut p.private, max_bytes_per_mode, false, &mut dropped);
     }
     let n = dropped.len();
     if !dropped.is_empty() {
@@ -265,16 +304,7 @@ impl UploadRing {
             // and <= size*4 so 1 MiB requests never steal giant multi-MiB chunks).
             let pooled = {
                 let mut p = RING_POOL.lock().unwrap();
-                let max_cap = size.saturating_mul(4);
-                let mut best: Option<usize> = None;
-                for (i, c) in p.iter().enumerate() {
-                    if c.private_storage == self.private_storage && c.cap >= size && c.cap <= max_cap {
-                        if best.is_none_or(|bi| c.cap < p[bi].cap) {
-                            best = Some(i);
-                        }
-                    }
-                }
-                best.map(|i| p.swap_remove(i))
+                p.take_best_fit(self.private_storage, size, size.saturating_mul(4))
             };
             let chunk = if let Some(c) = pooled {
                 c
@@ -383,9 +413,15 @@ fn static_sampler_desc(s: &StaticSampler) -> super::views::SamplerDesc {
     }
 }
 
-struct SamplerTables(Mutex<HashMap<u128, Retained<MtlBuffer>>>);
+struct SamplerTables(RwLock<HashMap<u128, (Retained<MtlBuffer>, u64)>>);
 unsafe impl Send for SamplerTables {}
 unsafe impl Sync for SamplerTables {}
+
+thread_local! {
+    /// Lock-free thread-local cache of `(RootSignature::hash() -> static sampler table GPU VA)`.
+    /// Entries live for the process lifetime and are never mutated or evicted.
+    static SAMPLER_VA_TLS: RefCell<HashMap<u128, u64>> = RefCell::new(HashMap::new());
+}
 
 /// GPU address of the root signature's static sampler table (one
 /// `IRDescriptorTableEntry` per sampler, declaration order), created once
@@ -395,11 +431,17 @@ pub fn static_sampler_table(rs: &RootSignature) -> Result<Option<u64>, String> {
     if samplers.is_empty() {
         return Ok(None);
     }
+    let hash = rs.hash();
+    if let Some(va) = SAMPLER_VA_TLS.with(|c| c.borrow().get(&hash).copied()) {
+        return Ok(Some(va));
+    }
     static T: OnceLock<SamplerTables> = OnceLock::new();
-    let t = T.get_or_init(|| SamplerTables(Mutex::new(HashMap::new())));
-    let mut m = t.0.lock().unwrap();
-    if let Some(b) = m.get(&rs.hash()) {
-        return Ok(Some(b.gpuAddress()));
+    let t = T.get_or_init(|| SamplerTables(RwLock::new(HashMap::new())));
+    if let Some(&(_, va)) = t.0.read().unwrap().get(&hash) {
+        SAMPLER_VA_TLS.with(|c| {
+            c.borrow_mut().insert(hash, va);
+        });
+        return Ok(Some(va));
     }
     let mut bytes = Vec::with_capacity(samplers.len() * 24);
     for s in samplers {
@@ -408,13 +450,29 @@ pub fn static_sampler_table(rs: &RootSignature) -> Result<Option<u64>, String> {
         bytes.extend_from_slice(&DescriptorTableEntry::sampler(id, s.mip_lod_bias).to_bytes());
     }
     let d = super::device().ok_or("no device")?;
-    let b = d.dev.newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked).ok_or("newBuffer for static samplers")?;
+    let b = d
+        .dev
+        .newBufferWithLength_options(
+            bytes.len(),
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked,
+        )
+        .ok_or("newBuffer for static samplers")?;
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr() as *mut u8, bytes.len()) };
     b.setLabel(Some(&objc2_foundation::NSString::from_str("port static samplers")));
-    d.add_resident(ProtocolObject::from_ref(&*b));
-    let a = b.gpuAddress();
-    m.insert(rs.hash(), b);
-    Ok(Some(a))
+    let mut m = t.0.write().unwrap();
+    let va = if let Some(&(_, existing_va)) = m.get(&hash) {
+        existing_va
+    } else {
+        d.add_resident(ProtocolObject::from_ref(&*b));
+        let a = b.gpuAddress();
+        m.insert(hash, (b, a));
+        a
+    };
+    drop(m);
+    SAMPLER_VA_TLS.with(|c| {
+        c.borrow_mut().insert(hash, va);
+    });
+    Ok(Some(va))
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +670,7 @@ mod tests {
         assert_eq!(shared.chunks.len(), 2);
         shared.recycle_excess_chunks();
         assert_eq!(shared.chunks.len(), 1);
-        assert!(RING_POOL.lock().unwrap().iter().any(|c| !c.private_storage && c.cap >= (4 << 20) + 4096));
+        assert!(RING_POOL.lock().unwrap().shared.iter().any(|c| !c.private_storage && c.cap >= (4 << 20) + 4096));
 
         // Private GPU-only scratch ring: cpu_ptr is null, chunks pool separately from shared.
         let mut scratch = UploadRing::new_gpu_scratch();
@@ -624,12 +682,13 @@ mod tests {
         assert!(sptr1.is_null());
         scratch.recycle_excess_chunks();
         assert_eq!(scratch.chunks.len(), 1);
-        assert!(RING_POOL.lock().unwrap().iter().any(|c| c.private_storage && c.cap >= (4 << 20) + 4096));
+        assert!(RING_POOL.lock().unwrap().private.iter().any(|c| c.private_storage && c.cap >= (4 << 20) + 4096));
 
         // Re-allocating the same private size reuses the pooled chunk (zero new buffer allocation).
         let pooled_va = RING_POOL
             .lock()
             .unwrap()
+            .private
             .iter()
             .find(|c| c.private_storage && c.cap >= (4 << 20) + 4096)
             .map(|c| c.gpu_va)

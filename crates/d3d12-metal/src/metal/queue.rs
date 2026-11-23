@@ -88,7 +88,9 @@ pub struct Queue {
     pub q: Retained<MtlQueue>,
     pub kind: ListType,
     pub timeline: Fence,
-    next: AtomicU64,
+    /// Packed `(next << 1) | (unsignaled as u64)` so `last_submitted()` observes
+    /// `(next, unsignaled)` atomically with zero tearing and zero locks.
+    timeline_state: AtomicU64,
     deferred: Mutex<Vec<(u64, Deferred)>>,
     /// Serializes submissions so timeline values are monotonic.
     submit: Mutex<()>,
@@ -97,7 +99,6 @@ pub struct Queue {
     /// signal not yet made.
     pub pending_wait: AtomicU8,
     registered_active: AtomicBool,
-    unsignaled: AtomicBool,
     pending_log_count: AtomicUsize,
     pending_pass_logs: Mutex<Vec<super::passtiming::PassLog>>,
     pub(crate) opt_submit_coalesce: AtomicBool,
@@ -115,13 +116,27 @@ fn active_queues() -> &'static Mutex<Vec<usize>> {
     Q.get_or_init(Default::default)
 }
 
+/// Wrapper allowing `Arc<DropOnly<T>>` to be `Send` for any `T: Send` without a `Mutex`.
+///
+/// SOUNDNESS: `DropOnly<T>` never exposes `&T` (shared references are impossible), so `T`
+/// is only accessed when the final `Arc` drops `DropOnly<T>` with exclusive ownership
+/// synchronized by `Arc`'s Release/Acquire refcount decrement.
+struct DropOnly<T>(T);
+unsafe impl<T: Send> Sync for DropOnly<T> {}
+
 /// Park `obj` until all currently live queues have finished work submitted so far.
 pub fn defer_release_all<T: Send + 'static>(obj: T) {
     let qs = active_queues().lock().unwrap().clone();
     if qs.is_empty() {
         return;
     }
-    let arc = std::sync::Arc::new(Mutex::new(obj));
+    if qs.len() == 1 {
+        // SAFETY: `qs[0]` was in `active_queues` and caller keeps live queues valid across deferral.
+        let q = unsafe { &*(qs[0] as *const Queue) };
+        q.defer_release(Box::new(obj));
+        return;
+    }
+    let arc = std::sync::Arc::new(DropOnly(obj));
     for p in qs {
         // SAFETY: `p` is in `active_queues` until `Queue::drop`.
         let q = unsafe { &*(p as *const Queue) };
@@ -249,7 +264,53 @@ fn commit_with_feedback(q: &MtlQueue, ptrs: &mut [NonNull<MtlCommandBuffer>], ki
     }
 }
 
+/// Commit `cbs` to `q` using a stack-allocated pointer array for `<= 32` command
+/// buffers (falling back to heap allocation only for larger batches).
+#[inline]
+fn commit_cbs(q: &MtlQueue, cbs: &[&MtlCommandBuffer], kind: ListType) {
+    const STACK_CAP: usize = 32;
+    let hook = FEEDBACK_HOOK.load(Ordering::Relaxed);
+    if cbs.len() <= STACK_CAP {
+        let mut stack: [std::mem::MaybeUninit<NonNull<MtlCommandBuffer>>; STACK_CAP] =
+            [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
+        for (dst, &cb) in stack.iter_mut().zip(cbs.iter()) {
+            dst.write(NonNull::from(cb));
+        }
+        // SAFETY: the first `cbs.len()` slots were just initialized above.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(stack.as_mut_ptr() as *mut NonNull<MtlCommandBuffer>, cbs.len())
+        };
+        if hook != 0 {
+            commit_with_feedback(q, slice, kind, hook);
+        } else {
+            unsafe { q.commit_count(NonNull::new(slice.as_mut_ptr()).unwrap(), slice.len()) };
+        }
+    } else {
+        let mut ptrs: Vec<NonNull<MtlCommandBuffer>> = cbs.iter().map(|c| NonNull::from(*c)).collect();
+        if hook != 0 {
+            commit_with_feedback(q, &mut ptrs, kind, hook);
+        } else {
+            unsafe { q.commit_count(NonNull::new(ptrs.as_mut_ptr()).unwrap(), ptrs.len()) };
+        }
+    }
+}
+
 impl Queue {
+    #[inline]
+    fn pack_timeline_state(next: u64, unsignaled: bool) -> u64 {
+        (next << 1) | u64::from(unsignaled)
+    }
+
+    #[inline]
+    fn unpack_timeline_state(st: u64) -> (u64, bool) {
+        (st >> 1, (st & 1) != 0)
+    }
+
+    #[inline]
+    fn is_unsignaled(&self) -> bool {
+        (self.timeline_state.load(Ordering::Acquire) & 1) != 0
+    }
+
     pub fn new(kind: ListType, label: &str) -> Option<Queue> {
         let d = super::device()?;
         let desc = MTL4CommandQueueDescriptor::new();
@@ -263,12 +324,11 @@ impl Queue {
             q,
             kind,
             timeline: Fence::new(0)?,
-            next: AtomicU64::new(1),
+            timeline_state: AtomicU64::new(Self::pack_timeline_state(1, false)),
             deferred: Mutex::new(Vec::new()),
             submit: Mutex::new(()),
             pending_wait: AtomicU8::new(0),
             registered_active: AtomicBool::new(false),
-            unsignaled: AtomicBool::new(false),
             pending_log_count: AtomicUsize::new(0),
             pending_pass_logs: Mutex::new(Vec::new()),
             opt_submit_coalesce: AtomicBool::new(kind == ListType::Direct && submit_coalesce()),
@@ -283,8 +343,11 @@ impl Queue {
     #[cfg(test)]
     pub(crate) fn set_submit_coalesce(&self, on: bool) {
         if !on {
-            let _g = self.submit.lock().unwrap();
-            let _ = self.flush_timeline_locked();
+            {
+                let _g = self.submit.lock().unwrap();
+                let _ = self.flush_timeline_locked();
+            }
+            self.collect();
         }
         self.opt_submit_coalesce.store(on && self.kind == ListType::Direct, Ordering::Release);
     }
@@ -425,7 +488,8 @@ impl Queue {
     }
 
     /// Emit `signalEvent_value(&self.timeline.ev, v)` if any committed command buffers
-    /// or `PassLog`s are awaiting a timeline value. Caller must hold `self.submit`.
+    /// or `PassLog`s are awaiting a timeline value. Caller must hold `self.submit` and
+    /// run [`Self::collect`] AFTER releasing `self.submit`.
     fn flush_timeline_locked(&self) -> u64 {
         self.flush_fence_signals_locked();
         let logs = if self.pending_log_count.load(Ordering::Acquire) > 0 {
@@ -435,15 +499,16 @@ impl Queue {
         } else {
             Vec::new()
         };
-        if !self.unsignaled.swap(false, Ordering::AcqRel) && logs.is_empty() {
-            return self.next.load(Ordering::Acquire) - 1;
+        let (v, was_unsignaled) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+        if !was_unsignaled && logs.is_empty() {
+            return v - 1;
         }
-        let v = self.next.fetch_add(1, Ordering::AcqRel);
         self.q.signalEvent_value(ProtocolObject::from_ref(&*self.timeline.ev), v);
+        self.timeline_state
+            .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
         if !logs.is_empty() {
             self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
         }
-        self.collect();
         v
     }
 
@@ -459,36 +524,34 @@ impl Queue {
     /// folding in any previously deferred `unsignaled` command buffers or `PassLog`s.
     pub fn submit_with_logs(&self, cbs: &[&MtlCommandBuffer], mut logs: Vec<super::passtiming::PassLog>) -> u64 {
         self.ensure_registered_active();
-        let _g = self.submit.lock().unwrap();
-        if self.pending_log_count.load(Ordering::Acquire) > 0 {
-            let mut pl = self.pending_pass_logs.lock().unwrap();
-            self.pending_log_count.store(0, Ordering::Release);
-            if !pl.is_empty() {
-                pl.append(&mut logs);
-                logs = std::mem::take(&mut *pl);
+        let v = {
+            let _g = self.submit.lock().unwrap();
+            if self.pending_log_count.load(Ordering::Acquire) > 0 {
+                let mut pl = self.pending_pass_logs.lock().unwrap();
+                self.pending_log_count.store(0, Ordering::Release);
+                if !pl.is_empty() {
+                    pl.append(&mut logs);
+                    logs = std::mem::take(&mut *pl);
+                }
             }
-        }
-        self.unsignaled.store(false, Ordering::Release);
-        if let Some(d) = super::device() {
-            d.commit_residency();
-        }
-        if !cbs.is_empty() {
-            let mut ptrs: Vec<NonNull<MtlCommandBuffer>> = cbs.iter().map(|c| NonNull::from(*c)).collect();
-            let hook = FEEDBACK_HOOK.load(Ordering::Relaxed);
-            if hook != 0 {
-                commit_with_feedback(&self.q, &mut ptrs, self.kind, hook);
-            } else {
-                unsafe { self.q.commit_count(NonNull::new(ptrs.as_mut_ptr()).unwrap(), ptrs.len()) };
+            if let Some(d) = super::device() {
+                d.commit_residency();
             }
-            self.commit_epoch.fetch_add(1, Ordering::AcqRel);
-            SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
-        }
-        self.flush_fence_signals_locked();
-        let v = self.next.fetch_add(1, Ordering::AcqRel);
-        self.q.signalEvent_value(ProtocolObject::from_ref(&*self.timeline.ev), v);
-        if !logs.is_empty() {
-            self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
-        }
+            if !cbs.is_empty() {
+                commit_cbs(&self.q, cbs, self.kind);
+                self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+                SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+            }
+            self.flush_fence_signals_locked();
+            let (v, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+            self.q.signalEvent_value(ProtocolObject::from_ref(&*self.timeline.ev), v);
+            self.timeline_state
+                .store(Self::pack_timeline_state(v + 1, false), Ordering::Release);
+            if !logs.is_empty() {
+                self.timeline.on_completion(v, Box::new(move || super::passtiming::resolve(logs)));
+            }
+            v
+        };
         self.collect();
         v
     }
@@ -496,52 +559,54 @@ impl Queue {
     /// Submit D3D12 `ExecuteCommandLists` command buffers. When `AW2_SUBMIT_COALESCE=1`
     /// is enabled on a `ListType::Direct` queue (`q0`), skips per-call `signalEvent_value`
     /// timeline drains (`submit_nosig`) and batches `PassLog` callbacks until demand
-    /// (`last_submitted`, `defer_release`, `wait_idle`, `submit`, or 8 pending `PassLog`s).
+    /// (`flush_timeline`, `Present`, `wait_idle`, `submit`, or 8 pending `PassLog`s).
     pub fn submit_d3d_lists(&self, cbs: &[&MtlCommandBuffer], logs: Vec<super::passtiming::PassLog>) -> u64 {
         let coalesce = self.kind == ListType::Direct && self.opt_submit_coalesce.load(Ordering::Relaxed);
         if !coalesce {
             return self.submit_with_logs(cbs, logs);
         }
         self.ensure_registered_active();
-        let _g = self.submit.lock().unwrap();
-        if cbs.is_empty() && logs.is_empty() {
-            super::encstats::inc(&super::encstats::c::submit_nosig);
-            self.collect();
-            return self.next.load(Ordering::Acquire) - 1;
-        }
-        if !cbs.is_empty() {
-            if let Some(d) = super::device() {
-                d.commit_residency();
-            }
-            let mut ptrs: Vec<NonNull<MtlCommandBuffer>> = cbs.iter().map(|c| NonNull::from(*c)).collect();
-            let hook = FEEDBACK_HOOK.load(Ordering::Relaxed);
-            if hook != 0 {
-                commit_with_feedback(&self.q, &mut ptrs, self.kind, hook);
+        let out = {
+            let _g = self.submit.lock().unwrap();
+            if cbs.is_empty() && logs.is_empty() {
+                super::encstats::inc(&super::encstats::c::submit_nosig);
+                let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+                next - 1
             } else {
-                unsafe { self.q.commit_count(NonNull::new(ptrs.as_mut_ptr()).unwrap(), ptrs.len()) };
+                if !cbs.is_empty() {
+                    if let Some(d) = super::device() {
+                        d.commit_residency();
+                    }
+                    commit_cbs(&self.q, cbs, self.kind);
+                    self.commit_epoch.fetch_add(1, Ordering::AcqRel);
+                    SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
+                    let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+                    self.timeline_state
+                        .store(Self::pack_timeline_state(next, true), Ordering::Release);
+                }
+                let total_logs = if !logs.is_empty() {
+                    let mut pl = self.pending_pass_logs.lock().unwrap();
+                    if !pl.is_empty() {
+                        super::encstats::inc(&super::encstats::c::submit_coalesced);
+                    }
+                    pl.extend(logs);
+                    let len = pl.len();
+                    self.pending_log_count.store(len, Ordering::Release);
+                    len
+                } else {
+                    self.pending_log_count.load(Ordering::Relaxed)
+                };
+                if total_logs >= 8 {
+                    self.flush_timeline_locked()
+                } else {
+                    super::encstats::inc(&super::encstats::c::submit_nosig);
+                    let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+                    next - 1
+                }
             }
-            self.commit_epoch.fetch_add(1, Ordering::AcqRel);
-            SUBMIT_EPOCH.fetch_add(1, Ordering::AcqRel);
-            self.unsignaled.store(true, Ordering::Release);
-        }
-        let total_logs = if !logs.is_empty() {
-            let mut pl = self.pending_pass_logs.lock().unwrap();
-            if !pl.is_empty() {
-                super::encstats::inc(&super::encstats::c::submit_coalesced);
-            }
-            pl.extend(logs);
-            let len = pl.len();
-            self.pending_log_count.store(len, Ordering::Release);
-            len
-        } else {
-            self.pending_log_count.load(Ordering::Relaxed)
         };
-        if total_logs >= 8 {
-            return self.flush_timeline_locked();
-        }
-        super::encstats::inc(&super::encstats::c::submit_nosig);
         self.collect();
-        self.next.load(Ordering::Acquire) - 1
+        out
     }
 
     /// Submit closed D3D12 command lists, handling submit coalescing, pass-timing
@@ -557,11 +622,16 @@ impl Queue {
         lists: &mut [&mut super::cmdlist::CommandList],
         t_ecl: u64,
     ) -> ExecuteResult {
-        let mut cbs = Vec::with_capacity(lists.len());
+        const STACK_CAP: usize = 32;
         let coalesce = self.kind == ListType::Direct && self.opt_submit_coalesce.load(Ordering::Relaxed);
         let pt_on = super::passtiming::enabled();
         let mut pass_logs = Vec::new();
         let mut wait_sampled: Option<u8> = None;
+        let mut stack_cbs: [std::mem::MaybeUninit<&MtlCommandBuffer>; STACK_CAP] =
+            [const { std::mem::MaybeUninit::uninit() }; STACK_CAP];
+        let mut stack_len = 0usize;
+        let mut heap_cbs: Vec<&MtlCommandBuffer> = Vec::new();
+        let n_lists = lists.len();
         for (i, list) in lists.iter_mut().enumerate() {
             if list.is_open() {
                 log::error!(target: "d3d", "ExecuteCommandLists: list {i} is still open (not Closed); skipped");
@@ -585,25 +655,74 @@ impl Queue {
                 }
             }
             if list.has_commands() {
-                cbs.push(&*list.cb);
+                let cb: &MtlCommandBuffer = &*list.cb;
+                if heap_cbs.is_empty() && stack_len < STACK_CAP {
+                    stack_cbs[stack_len].write(cb);
+                    stack_len += 1;
+                } else {
+                    if heap_cbs.is_empty() {
+                        heap_cbs.reserve(n_lists);
+                        // SAFETY: `stack_cbs[..stack_len]` were initialized above.
+                        let init = unsafe {
+                            std::slice::from_raw_parts(
+                                stack_cbs.as_ptr() as *const &MtlCommandBuffer,
+                                stack_len,
+                            )
+                        };
+                        heap_cbs.extend_from_slice(init);
+                    }
+                    heap_cbs.push(cb);
+                }
             }
         }
+        let cbs: &[&MtlCommandBuffer] = if !heap_cbs.is_empty() {
+            &heap_cbs
+        } else {
+            // SAFETY: `stack_cbs[..stack_len]` were initialized above.
+            unsafe {
+                std::slice::from_raw_parts(stack_cbs.as_ptr() as *const &MtlCommandBuffer, stack_len)
+            }
+        };
         let submitted_cbs = cbs.len();
-        let timeline_value = self.submit_d3d_lists(&cbs, pass_logs);
+        let timeline_value = self.submit_d3d_lists(cbs, pass_logs);
         ExecuteResult { submitted_cbs, timeline_value }
     }
 
     /// Value the timeline will reach once everything submitted so far is done.
+    ///
+    /// Lock-free and non-flushing: when a coalesced batch is pending without a
+    /// timeline signal yet (`unsignaled == true`), returns the upcoming signal
+    /// value (`next`) so [`Self::defer_release`] keeps retired objects alive until
+    /// that coalesced batch completes on GPU without defeating `AW2_SUBMIT_COALESCE`.
+    /// Callers that wait on `self.timeline` (`wait_idle`, cross-queue `Swapchain`
+    /// sync) MUST call [`Self::flush_timeline`] so the GPU signal is emitted.
+    #[inline]
     pub fn last_submitted(&self) -> u64 {
-        if self.opt_submit_coalesce.load(Ordering::Acquire)
-            || self.unsignaled.load(Ordering::Acquire)
+        let (next, unsignaled) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+        if unsignaled {
+            next
+        } else {
+            next - 1
+        }
+    }
+
+    /// Flush any pending coalesced command buffers, pass logs, or deferred fence
+    /// signals onto `self.q` and return the timeline value guaranteed to be
+    /// signaled once all submitted work completes on GPU.
+    pub fn flush_timeline(&self) -> u64 {
+        if self.is_unsignaled()
             || self.pending_log_count.load(Ordering::Acquire) > 0
             || self.has_deferred_signals.load(Ordering::Acquire)
         {
-            let _g = self.submit.lock().unwrap();
-            return self.flush_timeline_locked();
+            let v = {
+                let _g = self.submit.lock().unwrap();
+                self.flush_timeline_locked()
+            };
+            self.collect();
+            return v;
         }
-        self.next.load(Ordering::Acquire) - 1
+        let (next, _) = Self::unpack_timeline_state(self.timeline_state.load(Ordering::Acquire));
+        next - 1
     }
 
     pub fn signal(&self, f: &Fence, v: u64) {
@@ -743,7 +862,7 @@ impl Queue {
 
     /// Block until the queue is idle.
     pub fn wait_idle(&self) {
-        let v = self.last_submitted();
+        let v = self.flush_timeline();
         self.timeline.wait_cpu(v, u64::MAX);
         self.collect();
     }
@@ -753,12 +872,26 @@ impl Drop for Queue {
     fn drop(&mut self) {
         let addr = self as *const Queue as usize;
         active_queues().lock().unwrap().retain(|&p| p != addr);
-        if self.unsignaled.load(Ordering::Acquire)
+        if self.is_unsignaled()
             || self.pending_log_count.load(Ordering::Acquire) > 0
             || self.has_deferred_signals.load(Ordering::Acquire)
         {
             let _g = self.submit.lock().unwrap();
             let _ = self.flush_timeline_locked();
+        }
+        // Ensure any GPU work using deferred resources has completed before
+        // `self.deferred` drops (even if no submit or `wait_idle` followed a
+        // coalesced `submit_d3d_lists` + `defer_release`).
+        let max_v = self
+            .deferred
+            .get_mut()
+            .unwrap()
+            .iter()
+            .map(|(v, _)| *v)
+            .max()
+            .unwrap_or(0);
+        if max_v > 0 && self.timeline.completed() < max_v {
+            self.timeline.wait_cpu(max_v, u64::MAX);
         }
     }
 }
@@ -883,19 +1016,22 @@ mod tests {
         assert_eq!(q.submit_d3d_lists(&[&l1.cb], logs1), 0);
         assert_eq!(q.submit_d3d_lists(&[&l2.cb], logs2), 0);
 
+        let (next_val, unsig) = Queue::unpack_timeline_state(q.timeline_state.load(Ordering::Acquire));
         assert_eq!(
-            q.next.load(Ordering::Acquire),
+            next_val,
             1,
             "lazy timeline coalescing must emit 0 timeline signals during burst submit"
         );
-        assert!(q.unsignaled.load(Ordering::Acquire));
+        assert!(unsig);
         assert!(super::super::encstats::c::submit_nosig.load(Ordering::Relaxed) >= nosig0 + 4);
         if had_logs {
             assert_eq!(q.pending_log_count.load(Ordering::Acquire), 3);
             assert!(super::super::encstats::c::submit_coalesced.load(Ordering::Relaxed) >= coal0 + 2);
         }
 
-        // `defer_release` / `last_submitted` flushes ALL 3 submissions onto a SINGLE timeline signal (`v == 1`).
+        // `defer_release` / `last_submitted` MUST NOT flush the coalesced batch:
+        // it parks the deferred object on the upcoming coalesced signal value (`1`)
+        // while keeping `unsignaled == true` and 0 timeline signals emitted.
         struct DropTracker(Arc<AtomicBool>);
         impl Drop for DropTracker {
             fn drop(&mut self) {
@@ -903,9 +1039,23 @@ mod tests {
             }
         }
         let dropped = Arc::new(AtomicBool::new(false));
+        assert_eq!(q.last_submitted(), 1, "last_submitted must return upcoming coalesced signal value without flushing");
         q.defer_release(Box::new(DropTracker(dropped.clone())));
-        assert_eq!(q.next.load(Ordering::Acquire), 2, "flush must advance timeline by exactly 1 tick");
-        assert!(!q.unsignaled.load(Ordering::Acquire));
+        let (next_after_defer, unsig_after_defer) =
+            Queue::unpack_timeline_state(q.timeline_state.load(Ordering::Acquire));
+        assert_eq!(next_after_defer, 1, "defer_release must not force an immediate timeline flush");
+        assert!(unsig_after_defer, "coalesced batch must stay unsignaled after defer_release");
+        assert!(!dropped.load(Ordering::Acquire), "deferred object must remain live until coalesced batch completes");
+        if had_logs {
+            assert_eq!(q.pending_log_count.load(Ordering::Acquire), 3);
+        }
+
+        // Demand (`flush_timeline` / `wait_idle`) flushes ALL 3 submissions onto a SINGLE timeline signal (`v == 1`).
+        assert_eq!(q.flush_timeline(), 1);
+        let (next_after_flush, unsig_after_flush) =
+            Queue::unpack_timeline_state(q.timeline_state.load(Ordering::Acquire));
+        assert_eq!(next_after_flush, 2, "flush must advance timeline by exactly 1 tick");
+        assert!(!unsig_after_flush);
         assert_eq!(q.pending_log_count.load(Ordering::Acquire), 0);
 
         q.wait_idle();
@@ -919,6 +1069,25 @@ mod tests {
         assert_eq!(q.submit(&[]), 2);
         q.timeline.wait_cpu(2, u64::MAX);
         assert_eq!(q.timeline.completed(), 2);
+
+        // Verify `Queue::drop` flushes an unsignaled coalesced batch and waits for GPU completion
+        // before dropping deferred resources even when no further submit or `wait_idle` happens.
+        let dropped_on_drop = Arc::new(AtomicBool::new(false));
+        {
+            let q_drop = Queue::new(ListType::Direct, "g35 drop flush test").unwrap();
+            q_drop.set_submit_coalesce(true);
+            let a_d = CommandAllocator::new(ListType::Direct).unwrap();
+            let mut l_d = CommandList::new(ListType::Direct).unwrap();
+            l_d.begin(&a_d).unwrap();
+            l_d.copy_buffer(&rb, 0, &up, 0, 16).unwrap();
+            l_d.close().unwrap();
+            assert_eq!(q_drop.submit_d3d_lists(&[&l_d.cb], Vec::new()), 0);
+            assert!(q_drop.is_unsignaled());
+            q_drop.defer_release(Box::new(DropTracker(dropped_on_drop.clone())));
+            assert!(q_drop.is_unsignaled());
+            assert!(!dropped_on_drop.load(Ordering::Acquire));
+        }
+        assert!(dropped_on_drop.load(Ordering::Acquire), "Queue::drop must flush & wait before releasing deferred items");
     }
 
     #[test]

@@ -574,7 +574,7 @@ impl Swapchain {
             }
             None => {
                 super::encstats::inc(&super::encstats::c::present_drop);
-                return Ok(self.queue.last_submitted());
+                return Ok(self.queue.flush_timeline());
             }
         };
         let dst = pt.staging(slot).ok_or("no staging texture")?;
@@ -607,7 +607,7 @@ impl Swapchain {
         if self.opt_present_off_main {
             if let Some(sq) = self.sq.as_deref() {
                 super::encstats::inc(&super::encstats::c::present_sq);
-                let vm = self.queue.last_submitted();
+                let vm = self.queue.flush_timeline();
                 sq.wait(&self.queue.timeline, vm);
                 let sv = sq.submit(&[&cb]);
                 if !keep_views.is_empty() {
@@ -652,7 +652,7 @@ impl Swapchain {
 
     /// Vsync'd on-screen present (blit on the present queue from this
     /// thread) or offscreen present.
-    fn present_sync(&mut self, sync_interval: u32, want_sync: bool) -> Result<u64, String> {
+    fn present_sync(&mut self, sync_interval: u32, _want_sync: bool) -> Result<u64, String> {
         if self.async_mode {
             if let Some(pt) = &self.pthread {
                 pt.drain();
@@ -667,15 +667,9 @@ impl Swapchain {
         let pq = self.pq.clone();
         let mut st = self.state.lock().unwrap();
         let pres_q: &Queue = pq.as_deref().unwrap_or(&self.queue);
-        let t_acq = std::time::Instant::now();
-        let drawable = match &self.layer {
-            Some(l) => Some(l.0.nextDrawable().ok_or("nextDrawable returned nil")?),
-            None => None,
-        };
-        super::encstats::c::present_acq_us.fetch_add(t_acq.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         let i = st.ring;
-        st.ring = (i + 1) % RING;
-        // The ring slot's previous submission must be done before reuse.
+        // Wait for the ring slot's previous submission BEFORE acquiring `nextDrawable()`
+        // so a CAMetalDrawable is never held across a CPU timeline wait.
         let ring_q: &Queue = match st.ring_owner[i] {
             RingOwner::Main => &self.queue,
             RingOwner::Stage => self.sq.as_deref().unwrap_or(&self.queue),
@@ -683,6 +677,15 @@ impl Swapchain {
         };
         ring_q.timeline.wait_cpu(st.ring_values[i], u64::MAX);
         st.allocs[i].reset();
+        let t_acq = super::encstats::active().then(std::time::Instant::now);
+        let drawable = match &self.layer {
+            Some(l) => Some(l.0.nextDrawable().ok_or("nextDrawable returned nil")?),
+            None => None,
+        };
+        if let Some(t) = t_acq {
+            super::encstats::add(&super::encstats::c::present_acq_us, t.elapsed().as_micros() as u64);
+        }
+        st.ring = (i + 1) % RING;
         let cb = st.cbs[i].clone();
         cb.beginCommandBufferWithAllocator(&st.allocs[i].a);
         let src = self.buffers[self.current].texture().ok_or("back buffer is not a texture")?;
@@ -730,7 +733,7 @@ impl Swapchain {
                 let md: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&**drawable);
                 let pq = pq.as_ref().ok_or("no present queue")?;
                 super::encstats::inc(&super::encstats::c::present_pq);
-                let vm = self.queue.last_submitted();
+                let vm = self.queue.flush_timeline();
                 pq.wait(&self.queue.timeline, vm);
                 pq.q.waitForDrawable(md);
                 let pv = pq.submit(&[&cb]);
@@ -739,13 +742,11 @@ impl Swapchain {
                 }
                 pq.q.signalDrawable(md);
                 md.present();
-                if want_sync {
-                    self.queue.wait(&pq.timeline, pv);
-                }
                 self.buf_pv[self.current] = pv;
                 self.last_pv = pv;
                 // The next frame renders into the next buffer: its
-                // previous present's blit must have read it.
+                // previous present's blit must have read it (which also
+                // covers `pv` directly when `buffers.len() == 1`).
                 let nb = (self.current + 1) % self.buffers.len();
                 if self.buf_pv[nb] > pq.timeline.completed() {
                     super::encstats::inc(&super::encstats::c::present_bbwait);

@@ -453,6 +453,980 @@ pub fn msc_resource_usages(sh: &CompiledShader) -> Option<u32> {
     rest[..digits_len].parse::<u32>().ok()
 }
 
+/// Typed render-pipeline fixed-function state key hashed directly into `KeyHasher`
+/// without heap `format!` allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RenderPsoStateKey {
+    pub blend: crate::state::BlendState,
+    pub rtv_len: u8,
+    pub rtv_formats: [u32; 8],
+    pub sample_count: u32,
+    pub extra: u32,
+}
+
+impl RenderPsoStateKey {
+    #[inline]
+    pub(crate) fn new(
+        blend: crate::state::BlendState,
+        rtv_formats: &[u32],
+        sample_count: u32,
+        extra: u32,
+    ) -> Self {
+        let mut fmts = [0u32; 8];
+        let n = rtv_formats.len().min(8);
+        fmts[..n].copy_from_slice(&rtv_formats[..n]);
+        Self { blend, rtv_len: n as u8, rtv_formats: fmts, sample_count, extra }
+    }
+
+    pub(crate) fn write_to(&self, key: &mut dxil_metal::hash::KeyHasher) {
+        let flags = (self.blend.alpha_to_coverage as u32)
+            | ((self.blend.dual_source as u32) << 1)
+            | ((self.blend.uses_blend_constant as u32) << 2)
+            | ((self.rtv_len as u32) << 8);
+        key.u32(flags);
+        for a in &self.blend.attachments {
+            key.u32(a.enabled as u32)
+                .u32(a.src_rgb.0 as u32)
+                .u32(a.dst_rgb.0 as u32)
+                .u32(a.op_rgb.0 as u32)
+                .u32(a.src_alpha.0 as u32)
+                .u32(a.dst_alpha.0 as u32)
+                .u32(a.op_alpha.0 as u32)
+                .u32(a.write_mask.0 as u32);
+        }
+        key.u32(self.blend.unsupported_logic_ops.len as u32);
+        for &(idx, op) in self.blend.unsupported_logic_ops.as_slice() {
+            key.u32(idx as u32).u32(op);
+        }
+        key.u32(self.blend.invalid.len as u32);
+        for &(idx, v) in self.blend.invalid.as_slice() {
+            key.u32(idx as u32).u32(v);
+        }
+        for &f in &self.rtv_formats[..self.rtv_len as usize] {
+            key.u32(f);
+        }
+        key.u32(self.sample_count).u32(self.extra);
+    }
+}
+
+/// Pre-parsed DXBC/DXIL, `.metallib`, and MSC reflection metadata for one shader stage.
+///
+/// Computed once per shader blob during PSO creation so stage resource/CBV/UAV/handle-kind
+/// queries never re-parse DXBC containers, re-run `dxilconv::convert_signed`, re-scan
+/// `.metallib` FlatBuffers, or re-parse MSC reflection JSON.
+pub(crate) struct ShaderStageSummary {
+    raw_parsed: bool,
+    raw_is_sm4: bool,
+    raw_feature_flags: u64,
+    raw_psv: Option<Vec<dxil_metal::dxbc::PsvResource>>,
+    converted_dxil: Option<Vec<u8>>,
+    converted_feature_flags: u64,
+    converted_psv: Option<Vec<dxil_metal::dxbc::PsvResource>>,
+    pub(crate) ru_opt: Option<u32>,
+    used_resources: Option<Vec<MscUsedResource>>,
+    pub(crate) res_desc_heap_unused: bool,
+    msc_cbv_opt: Option<bool>,
+}
+
+impl ShaderStageSummary {
+    pub(crate) fn new(bytecode: &[u8], sh: &CompiledShader, rs: &RootSignature) -> Self {
+        let mut raw_parsed = false;
+        let mut raw_is_sm4 = false;
+        let mut raw_feature_flags = 0u64;
+        let mut raw_psv = None;
+        let mut converted_dxil = None;
+        let mut converted_feature_flags = 0u64;
+        let mut converted_psv = None;
+
+        if let Ok(c) = dxil_metal::dxbc::Container::parse(bytecode) {
+            raw_parsed = true;
+            raw_is_sm4 = c.is_sm4_bytecode();
+            raw_feature_flags = c.feature_flags();
+            raw_psv = c.psv_resources();
+            if raw_is_sm4 {
+                if let Ok(cv) = dxil_metal::dxilconv::convert_signed(bytecode) {
+                    if let Ok(cp) = dxil_metal::dxbc::Container::parse(&cv) {
+                        converted_feature_flags = cp.feature_flags();
+                        converted_psv = cp.psv_resources();
+                        converted_dxil = Some(cv);
+                    }
+                }
+            }
+        }
+
+        let ru_opt = msc_resource_usages(sh);
+        let used_resources = msc_used_resources(sh.reflection.json.as_str());
+        let res_desc_heap_unused = metallib_res_desc_heap_unused(&sh.metallib);
+        let msc_cbv_opt = msc_stage_may_read_cbv_from_parts(
+            res_desc_heap_unused,
+            used_resources.as_deref(),
+            rs,
+        );
+
+        Self {
+            raw_parsed,
+            raw_is_sm4,
+            raw_feature_flags,
+            raw_psv,
+            converted_dxil,
+            converted_feature_flags,
+            converted_psv,
+            ru_opt,
+            used_resources,
+            res_desc_heap_unused,
+            msc_cbv_opt,
+        }
+    }
+
+    #[inline]
+    fn dxil_parsed(&self) -> bool {
+        if self.raw_is_sm4 { self.converted_dxil.is_some() } else { self.raw_parsed }
+    }
+
+    #[inline]
+    fn dxil_feature_flags(&self) -> u64 {
+        if self.raw_is_sm4 { self.converted_feature_flags } else { self.raw_feature_flags }
+    }
+
+    #[inline]
+    fn dxil_psv(&self) -> Option<&[dxil_metal::dxbc::PsvResource]> {
+        if self.raw_is_sm4 { self.converted_psv.as_deref() } else { self.raw_psv.as_deref() }
+    }
+
+    #[inline]
+    fn dxil_bytes<'a>(&'a self, orig: &'a [u8]) -> Option<&'a [u8]> {
+        if self.raw_is_sm4 {
+            self.converted_dxil.as_deref()
+        } else if self.raw_parsed {
+            Some(orig)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn msc_proven(&self) -> bool {
+        self.res_desc_heap_unused && self.ru_opt.is_some()
+    }
+
+    pub(crate) fn stage_reads_resources(&self, sh: &CompiledShader, opt_v2: bool) -> u8 {
+        use dxil_metal::root_signature::ResourceType as T;
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        const BOTH: u8 = READS_TEX | READS_BUF;
+        if opt_v2 {
+            if let Some(ru) = self.ru_opt {
+                let mut m = 0u8;
+                if (ru & (2 | 4 | 32)) != 0 {
+                    m |= READS_BUF;
+                }
+                if (ru & (8 | 16)) != 0 {
+                    m |= READS_TEX;
+                }
+                return m;
+            }
+        }
+        if !self.raw_parsed || (self.raw_feature_flags & RESOURCE_HEAP_INDEXING) != 0 {
+            return BOTH;
+        }
+        let reflected = |f: fn(&T) -> bool| sh.reflection.resources.iter().any(|r| f(&r.resource_type));
+        if !reflected(|t| matches!(t, T::Srv | T::Uav | T::Table | T::Invalid)) {
+            return 0;
+        }
+        let Some(res) = self.raw_psv.as_deref() else { return BOTH };
+        let m = res.iter().filter(|r| r.is_srv_uav()).fold(0, |m, r| {
+            m | if r.is_texture() {
+                READS_TEX
+            } else if r.is_buffer() {
+                READS_BUF
+            } else {
+                BOTH
+            }
+        });
+        if m == 0 && reflected(|t| matches!(t, T::Srv | T::Uav)) {
+            return BOTH;
+        }
+        m
+    }
+
+    pub(crate) fn stage_srv_uav_classes(
+        &self,
+        sh: &CompiledShader,
+        rs: &RootSignature,
+        opt_v2: bool,
+    ) -> u8 {
+        use dxil_metal::root_signature::{
+            DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
+        };
+        let base = self.stage_reads_resources(sh, opt_v2);
+        if base == 0 || !opt_v2 || !self.res_desc_heap_unused {
+            return base;
+        }
+        let Some(used) = self.used_resources.as_deref() else {
+            return base;
+        };
+        let layout = rs.layout();
+        let param_len = layout.parameters.len();
+        let has_static_samplers = layout.static_samplers.is_some();
+        let mut m = 0u8;
+        for u in used {
+            if !u.is_in_grs || u.binding_index > u16::MAX as u32 {
+                return base;
+            }
+            let idx = u.binding_index as usize;
+            if idx == param_len && has_static_samplers {
+                continue;
+            }
+            if idx >= param_len {
+                return base;
+            }
+            match &layout.parameters[idx].kind {
+                RootParameterLayoutKind::Constants { .. } => {}
+                RootParameterLayoutKind::Descriptor { kind, .. } => match kind {
+                    RootDescriptorKind::Cbv => {}
+                    RootDescriptorKind::Srv | RootDescriptorKind::Uav => m |= READS_BUF,
+                },
+                RootParameterLayoutKind::DescriptorTable { sampler: true, .. } => {}
+                RootParameterLayoutKind::DescriptorTable { sampler: false, ranges } => {
+                    if u.table_length == 0 {
+                        continue;
+                    }
+                    let (start, end) = if u.table_start_index == u32::MAX {
+                        (0u32, u32::MAX)
+                    } else {
+                        (
+                            u.table_start_index,
+                            u.table_start_index.saturating_add(u.table_length),
+                        )
+                    };
+                    let mut any_overlap = false;
+                    for rg in ranges {
+                        let rg_end = rg
+                            .num_descriptors
+                            .map_or(u32::MAX, |n| rg.descriptor_offset.saturating_add(n));
+                        if rg_end <= start || rg.descriptor_offset >= end {
+                            continue;
+                        }
+                        any_overlap = true;
+                        if matches!(rg.range_type, DescriptorRangeType::Srv | DescriptorRangeType::Uav)
+                        {
+                            m |= base;
+                        }
+                    }
+                    if !any_overlap {
+                        return base;
+                    }
+                }
+            }
+        }
+        base & m
+    }
+
+    pub(crate) fn stage_may_read_cbv(&self, rs: &RootSignature, opt_sm66: bool) -> bool {
+        use dxil_metal::root_signature::{
+            DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
+        };
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        let msc_cbv = if opt_sm66 { self.msc_cbv_opt } else { None };
+        if msc_cbv == Some(false) {
+            return false;
+        }
+        if !self.dxil_parsed() {
+            return true;
+        }
+        if (self.dxil_feature_flags() & RESOURCE_HEAP_INDEXING) != 0 {
+            return msc_cbv.unwrap_or(true);
+        }
+        let Some(psv) = self.dxil_psv() else {
+            return true;
+        };
+        let layout = rs.layout();
+        psv.iter().any(|r| {
+            if r.res_type != 2 {
+                return false;
+            }
+            if r.upper_bound != r.lower_bound || r.upper_bound == u32::MAX {
+                return true;
+            }
+            let reg = r.lower_bound;
+            let space = r.space;
+            let has_inline_const = layout.parameters.iter().any(|p| {
+                matches!(
+                    p.kind,
+                    RootParameterLayoutKind::Constants {
+                        shader_register,
+                        register_space,
+                        ..
+                    } if register_space == space && shader_register == reg
+                )
+            });
+            if !has_inline_const {
+                return true;
+            }
+            layout.parameters.iter().any(|p| match &p.kind {
+                RootParameterLayoutKind::Descriptor {
+                    kind: RootDescriptorKind::Cbv,
+                    shader_register,
+                    register_space,
+                } => *register_space == space && *shader_register == reg,
+                RootParameterLayoutKind::DescriptorTable { ranges, .. } => ranges.iter().any(|rg| {
+                    if rg.range_type != DescriptorRangeType::Cbv || rg.register_space != space {
+                        return false;
+                    }
+                    let end = rg
+                        .num_descriptors
+                        .map_or(u32::MAX, |n| rg.base_shader_register.saturating_add(n));
+                    reg >= rg.base_shader_register && reg < end
+                }),
+                _ => false,
+            })
+        })
+    }
+
+    #[inline]
+    fn raw_writes_uav(&self) -> bool {
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        if !self.raw_parsed || (self.raw_feature_flags & RESOURCE_HEAP_INDEXING) != 0 {
+            return true;
+        }
+        self.raw_psv
+            .as_deref()
+            .is_none_or(|res| res.iter().any(|r| (6..=9).contains(&r.res_type)))
+    }
+
+    #[inline]
+    pub(crate) fn shader_writes_uav(&self, opt_v2: bool) -> bool {
+        if opt_v2 {
+            if let Some(ru) = self.ru_opt {
+                return (ru & (4 | 16)) != 0;
+            }
+        }
+        self.raw_writes_uav()
+    }
+
+    #[inline]
+    pub(crate) fn shader_writes_buf_uav(&self) -> bool {
+        if let Some(ru) = self.ru_opt {
+            return (ru & 4) != 0;
+        }
+        self.raw_writes_uav()
+    }
+
+    pub(crate) fn shader_uses_uav(&self, rs: &RootSignature) -> bool {
+        use dxil_metal::root_signature::{
+            DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
+        };
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        if self.raw_parsed && (self.raw_feature_flags & RESOURCE_HEAP_INDEXING) == 0 {
+            if let Some(psv) = self.raw_psv.as_deref() {
+                return psv.iter().any(|r| (6..=9).contains(&r.res_type));
+            }
+        }
+        if !self.res_desc_heap_unused {
+            return true;
+        }
+        if let Some(ru) = self.ru_opt {
+            if (ru & (4 | 16)) != 0 {
+                return true;
+            }
+        }
+        let Some(used) = self.used_resources.as_deref() else {
+            return true;
+        };
+        let layout = rs.layout();
+        let param_len = layout.parameters.len();
+        let has_static_samplers = layout.static_samplers.is_some();
+        for u in used {
+            if !u.is_in_grs || u.binding_index > u16::MAX as u32 {
+                return true;
+            }
+            let idx = u.binding_index as usize;
+            if idx == param_len && has_static_samplers {
+                continue;
+            }
+            if idx >= param_len {
+                return true;
+            }
+            match &layout.parameters[idx].kind {
+                RootParameterLayoutKind::Constants { .. } => {}
+                RootParameterLayoutKind::Descriptor { kind, .. } => {
+                    if *kind == RootDescriptorKind::Uav {
+                        return true;
+                    }
+                }
+                RootParameterLayoutKind::DescriptorTable { sampler: true, .. } => {}
+                RootParameterLayoutKind::DescriptorTable { sampler: false, ranges } => {
+                    if u.table_length == 0 {
+                        continue;
+                    }
+                    let (start, end) = if u.table_start_index == u32::MAX {
+                        (0u32, u32::MAX)
+                    } else {
+                        (
+                            u.table_start_index,
+                            u.table_start_index.saturating_add(u.table_length),
+                        )
+                    };
+                    for rg in ranges {
+                        let rg_end = rg
+                            .num_descriptors
+                            .map_or(u32::MAX, |n| rg.descriptor_offset.saturating_add(n));
+                        if rg_end > start
+                            && rg.descriptor_offset < end
+                            && rg.range_type == DescriptorRangeType::Uav
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn exact_classes(&self, ru: u32, fallback_has_cbv: bool) -> u8 {
+        if (ru & !0x3e) != 0 {
+            return READS_TEX | READS_BUF;
+        }
+        let has_cbv = self.msc_cbv_opt.unwrap_or(fallback_has_cbv);
+        let mut ec = 0u8;
+        if (ru & (2 | 32)) != 0 || has_cbv {
+            ec |= READS_BUF;
+        }
+        if (ru & 8) != 0 {
+            ec |= READS_TEX;
+        }
+        ec
+    }
+
+    fn compute_access_from_dxil(&self, rs: &RootSignature) -> ComputeAccess {
+        use dxil_metal::root_signature::{
+            DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
+        };
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        const MAX_BOUNDED_ARRAY: u32 = 128;
+
+        if !self.dxil_parsed() || (self.dxil_feature_flags() & RESOURCE_HEAP_INDEXING) != 0 {
+            return ComputeAccess::opaque();
+        }
+        let Some(psv) = self.dxil_psv() else {
+            return ComputeAccess::opaque();
+        };
+
+        let layout = rs.layout();
+        let mut uav_ok = true;
+        let mut read_all_bounded = true;
+        let mut unbounded_srv_classes = 0u8;
+        let mut heap_indexed_or_unknown = false;
+        let mut psv_touches_textures = false;
+        let mut uav_slots: Vec<ComputeBind> = Vec::new();
+        let mut bounded_read_slots: Vec<ComputeBind> = Vec::new();
+
+        let push_unique = |v: &mut Vec<ComputeBind>, b: ComputeBind| {
+            if !v.contains(&b) {
+                v.push(b);
+            }
+        };
+
+        for r in psv {
+            if r.res_type == 1 {
+                continue;
+            }
+            let (is_uav, range_ty, root_kind, allow_constants) = match r.res_type {
+                2 => (false, DescriptorRangeType::Cbv, RootDescriptorKind::Cbv, true),
+                3..=5 => (false, DescriptorRangeType::Srv, RootDescriptorKind::Srv, false),
+                6..=9 => (true, DescriptorRangeType::Uav, RootDescriptorKind::Uav, false),
+                _ => return ComputeAccess::opaque(),
+            };
+
+            let srv_class = if r.is_texture() {
+                READS_TEX
+            } else if r.is_buffer() {
+                READS_BUF
+            } else {
+                READS_TEX | READS_BUF
+            };
+            if matches!(r.res_type, 3..=9) && (srv_class & READS_TEX) != 0 {
+                psv_touches_textures = true;
+            }
+
+            if r.upper_bound == u32::MAX || r.upper_bound < r.lower_bound {
+                if is_uav {
+                    uav_ok = false;
+                } else {
+                    read_all_bounded = false;
+                    if range_ty == DescriptorRangeType::Srv {
+                        unbounded_srv_classes |= srv_class;
+                    } else {
+                        heap_indexed_or_unknown = true;
+                    }
+                }
+                continue;
+            }
+            let count = r.upper_bound - r.lower_bound + 1;
+            if count > MAX_BOUNDED_ARRAY {
+                if is_uav {
+                    uav_ok = false;
+                } else {
+                    read_all_bounded = false;
+                    if range_ty == DescriptorRangeType::Srv {
+                        unbounded_srv_classes |= srv_class;
+                    } else {
+                        heap_indexed_or_unknown = true;
+                    }
+                }
+                continue;
+            }
+
+            for reg in r.lower_bound..=r.upper_bound {
+                let mut matched = false;
+                for (pi, p) in layout.parameters.iter().enumerate() {
+                    if pi > u16::MAX as usize {
+                        return ComputeAccess::opaque();
+                    }
+                    match &p.kind {
+                        RootParameterLayoutKind::Constants {
+                            shader_register,
+                            register_space,
+                            ..
+                        } if allow_constants
+                            && *register_space == r.space
+                            && *shader_register == reg =>
+                        {
+                            matched = true;
+                            break;
+                        }
+                        RootParameterLayoutKind::Descriptor {
+                            kind,
+                            shader_register,
+                            register_space,
+                        } if *kind == root_kind
+                            && *register_space == r.space
+                            && *shader_register == reg =>
+                        {
+                            let bind = ComputeBind::RootVa { param: pi as u16 };
+                            if is_uav {
+                                push_unique(&mut uav_slots, bind);
+                            } else {
+                                push_unique(&mut bounded_read_slots, bind);
+                            }
+                            matched = true;
+                            break;
+                        }
+                        RootParameterLayoutKind::DescriptorTable { ranges, .. } => {
+                            if let Some(rg) = ranges.iter().find(|rg| {
+                                rg.range_type == range_ty
+                                    && rg.register_space == r.space
+                                    && reg >= rg.base_shader_register
+                                    && rg
+                                        .num_descriptors
+                                        .is_none_or(|n| reg - rg.base_shader_register < n)
+                            }) {
+                                let byte_offset =
+                                    rg.byte_offset + (reg - rg.base_shader_register) as u64 * 24;
+                                let bind = ComputeBind::TableEntry { param: pi as u16, byte_offset };
+                                if is_uav {
+                                    push_unique(&mut uav_slots, bind);
+                                } else {
+                                    push_unique(&mut bounded_read_slots, bind);
+                                }
+                                matched = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !matched {
+                    return ComputeAccess::opaque();
+                }
+            }
+        }
+
+        let touches_textures = psv_touches_textures || (unbounded_srv_classes & READS_TEX) != 0;
+        ComputeAccess {
+            uav_slots: uav_ok.then_some(uav_slots),
+            read_slots: read_all_bounded.then(|| bounded_read_slots.clone()),
+            bounded_read_slots,
+            unbounded_srv_classes,
+            heap_indexed_or_unknown,
+            touches_textures,
+            uav_classes: READS_TEX | READS_BUF,
+            read_classes: READS_TEX | READS_BUF,
+            uav_srv_classes: READS_TEX | READS_BUF,
+            msc_refined: false,
+            msc_exact_classes: READS_TEX | READS_BUF,
+        }
+    }
+
+    fn refine_compute_access(
+        &self,
+        mut acc: ComputeAccess,
+        rs: &RootSignature,
+        enable_used_resources: bool,
+        ignore_heap_flag: bool,
+    ) -> ComputeAccess {
+        use dxil_metal::root_signature::{
+            DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
+        };
+        const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+        const MAX_BOUNDED_ARRAY: u32 = 128;
+
+        let was_uav_none = acc.uav_slots.is_none();
+        let was_read_none = acc.read_slots.is_none();
+        let prev_uav_slots = acc.uav_slots.clone();
+        let prev_read_slots = acc.read_slots.clone();
+        let prev_bounded_reads = acc.bounded_read_slots.clone();
+
+        let heap_indexed =
+            !self.dxil_parsed() || (self.dxil_feature_flags() & RESOURCE_HEAP_INDEXING) != 0;
+        let effective_heap_indexed = heap_indexed && !ignore_heap_flag;
+        let psv_opt = self.dxil_psv();
+        let layout = rs.layout();
+
+        let mut msc_applied = false;
+        let mut msc_has_cbv = false;
+
+        if enable_used_resources && !effective_heap_indexed {
+            if let Some(used) = self.used_resources.as_deref() {
+                let param_len = layout.parameters.len();
+                let has_static_samplers = layout.static_samplers.is_some();
+                if used.iter().all(|u| {
+                    u.is_in_grs
+                        && ((u.binding_index as usize) < param_len
+                            || (has_static_samplers && (u.binding_index as usize) == param_len))
+                        && u.binding_index <= u16::MAX as u32
+                }) {
+                    let mut msc_valid = true;
+                    let mut msc_uav_ok = true;
+                    let mut msc_read_all_bounded = true;
+                    let mut msc_unbounded_srv_classes = 0u8;
+                    let mut msc_heap_or_unknown = false;
+                    let mut msc_uav_slots: Vec<ComputeBind> = Vec::new();
+                    let mut msc_bounded_reads: Vec<ComputeBind> = Vec::new();
+
+                    let push_unique = |v: &mut Vec<ComputeBind>, b: ComputeBind| {
+                        if !v.contains(&b) {
+                            v.push(b);
+                        }
+                    };
+
+                    'used_loop: for u in used {
+                        if (u.binding_index as usize) == param_len {
+                            continue;
+                        }
+                        let param = u.binding_index as u16;
+                        match &layout.parameters[u.binding_index as usize].kind {
+                            RootParameterLayoutKind::Constants { .. } => {}
+                            RootParameterLayoutKind::Descriptor { kind, .. } => {
+                                let bind = ComputeBind::RootVa { param };
+                                match kind {
+                                    RootDescriptorKind::Uav => push_unique(&mut msc_uav_slots, bind),
+                                    RootDescriptorKind::Cbv => {
+                                        msc_has_cbv = true;
+                                        push_unique(&mut msc_bounded_reads, bind);
+                                    }
+                                    RootDescriptorKind::Srv => {
+                                        push_unique(&mut msc_bounded_reads, bind);
+                                    }
+                                }
+                            }
+                            RootParameterLayoutKind::DescriptorTable { sampler: true, .. } => {}
+                            RootParameterLayoutKind::DescriptorTable { sampler: false, ranges } => {
+                                if u.table_length == 0 {
+                                    continue;
+                                }
+                                let bounded_end = (u.table_start_index != u32::MAX
+                                    && u.table_length <= MAX_BOUNDED_ARRAY)
+                                    .then(|| u.table_start_index.checked_add(u.table_length))
+                                    .flatten();
+                                if let Some(end) = bounded_end {
+                                    for d in u.table_start_index..end {
+                                        let Some(rg) = ranges.iter().find(|rg| {
+                                            d >= rg.descriptor_offset
+                                                && rg
+                                                    .num_descriptors
+                                                    .is_none_or(|n| d - rg.descriptor_offset < n)
+                                        }) else {
+                                            msc_valid = false;
+                                            break 'used_loop;
+                                        };
+                                        let bind = ComputeBind::TableEntry {
+                                            param,
+                                            byte_offset: (d as u64) * 24,
+                                        };
+                                        match rg.range_type {
+                                            DescriptorRangeType::Sampler => {}
+                                            DescriptorRangeType::Uav => {
+                                                push_unique(&mut msc_uav_slots, bind);
+                                            }
+                                            DescriptorRangeType::Cbv => {
+                                                msc_has_cbv = true;
+                                                push_unique(&mut msc_bounded_reads, bind);
+                                            }
+                                            DescriptorRangeType::Srv => {
+                                                push_unique(&mut msc_bounded_reads, bind);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let (start, end) = if u.table_start_index == u32::MAX {
+                                        (0u32, u32::MAX)
+                                    } else {
+                                        (
+                                            u.table_start_index,
+                                            u.table_start_index.saturating_add(u.table_length),
+                                        )
+                                    };
+                                    let mut any_overlap = false;
+                                    for rg in ranges {
+                                        let rg_end = rg.num_descriptors.map_or(u32::MAX, |n| {
+                                            rg.descriptor_offset.saturating_add(n)
+                                        });
+                                        if rg_end <= start || rg.descriptor_offset >= end {
+                                            continue;
+                                        }
+                                        any_overlap = true;
+                                        match rg.range_type {
+                                            DescriptorRangeType::Sampler => {}
+                                            DescriptorRangeType::Uav => {
+                                                msc_uav_ok = false;
+                                            }
+                                            DescriptorRangeType::Cbv => {
+                                                msc_has_cbv = true;
+                                                msc_read_all_bounded = false;
+                                                msc_heap_or_unknown = true;
+                                            }
+                                            DescriptorRangeType::Srv => {
+                                                msc_read_all_bounded = false;
+                                                let rg_reg_end =
+                                                    rg.num_descriptors.map_or(u32::MAX, |n| {
+                                                        rg.base_shader_register.saturating_add(n)
+                                                    });
+                                                let cls = psv_opt
+                                                    .map(|psv| {
+                                                        let mut c = 0u8;
+                                                        for r in psv {
+                                                            if !(3..=5).contains(&r.res_type)
+                                                                || r.space != rg.register_space
+                                                            {
+                                                                continue;
+                                                            }
+                                                            let r_end = if r.upper_bound == u32::MAX
+                                                            {
+                                                                u32::MAX
+                                                            } else {
+                                                                r.upper_bound.saturating_add(1)
+                                                            };
+                                                            if r_end <= rg.base_shader_register
+                                                                || r.lower_bound >= rg_reg_end
+                                                            {
+                                                                continue;
+                                                            }
+                                                            c |= if r.is_texture() {
+                                                                READS_TEX
+                                                            } else if r.is_buffer() {
+                                                                READS_BUF
+                                                            } else {
+                                                                READS_TEX | READS_BUF
+                                                            };
+                                                        }
+                                                        if c == 0 {
+                                                            READS_TEX | READS_BUF
+                                                        } else {
+                                                            c
+                                                        }
+                                                    })
+                                                    .unwrap_or(READS_TEX | READS_BUF);
+                                                msc_unbounded_srv_classes |= cls;
+                                            }
+                                        }
+                                    }
+                                    if !any_overlap {
+                                        msc_valid = false;
+                                        break 'used_loop;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if msc_valid {
+                        msc_applied = true;
+                        acc.uav_slots = msc_uav_ok.then_some(msc_uav_slots);
+                        acc.read_slots =
+                            msc_read_all_bounded.then(|| msc_bounded_reads.clone());
+                        acc.bounded_read_slots = msc_bounded_reads;
+                        acc.unbounded_srv_classes = msc_unbounded_srv_classes;
+                        acc.heap_indexed_or_unknown = msc_heap_or_unknown;
+                    }
+                }
+            }
+        }
+
+        let may_read_cbv_resource = if msc_applied {
+            msc_has_cbv
+        } else if heap_indexed {
+            true
+        } else if let Some(psv) = psv_opt {
+            psv.iter().any(|r| {
+                r.res_type == 2
+                    && !layout.parameters.iter().any(|p| {
+                        matches!(
+                            p.kind,
+                            RootParameterLayoutKind::Constants {
+                                shader_register,
+                                register_space,
+                                ..
+                            } if register_space == r.space
+                                && r.lower_bound == shader_register
+                                && r.upper_bound == shader_register
+                        )
+                    })
+            })
+        } else {
+            true
+        };
+
+        if let Some(ru) = self.ru_opt {
+            if (ru & !0x3e) == 0 {
+                let mut uc = 0u8;
+                if (ru & 4) != 0 {
+                    uc |= READS_BUF;
+                }
+                if (ru & 16) != 0 {
+                    uc |= READS_TEX;
+                }
+                acc.uav_classes = uc;
+                if uc == 0 && acc.uav_slots.is_none() {
+                    acc.uav_slots = Some(Vec::new());
+                }
+
+                let mut usc = uc;
+                if (ru & (2 | 32)) != 0 {
+                    usc |= READS_BUF;
+                }
+                if (ru & 8) != 0 {
+                    usc |= READS_TEX;
+                }
+                acc.uav_srv_classes = usc;
+
+                let mut rc = usc;
+                if may_read_cbv_resource {
+                    rc |= READS_BUF;
+                }
+                acc.read_classes = rc;
+                let ro_c = (if (ru & (2 | 32)) != 0 || may_read_cbv_resource {
+                    READS_BUF
+                } else {
+                    0
+                }) | (if (ru & 8) != 0 { READS_TEX } else { 0 });
+                acc.msc_exact_classes &= ro_c;
+
+                let srv_ru_classes = (if (ru & (2 | 32)) != 0 { READS_BUF } else { 0 })
+                    | (if (ru & 8) != 0 { READS_TEX } else { 0 });
+                acc.unbounded_srv_classes &= srv_ru_classes;
+                if acc.unbounded_srv_classes == 0
+                    && !acc.heap_indexed_or_unknown
+                    && acc.read_slots.is_none()
+                {
+                    acc.read_slots = Some(acc.bounded_read_slots.clone());
+                }
+                if (ru & (8 | 16)) == 0 {
+                    acc.touches_textures = false;
+                }
+            }
+        }
+
+        acc.msc_refined = (was_uav_none && acc.uav_slots.is_some())
+            || (was_read_none && acc.read_slots.is_some())
+            || (msc_applied
+                && (acc.uav_slots != prev_uav_slots
+                    || acc.read_slots != prev_read_slots
+                    || acc.bounded_read_slots != prev_bounded_reads));
+        acc
+    }
+
+    pub(crate) fn for_stage(
+        &self,
+        bytecode: &[u8],
+        rs: &RootSignature,
+        shader: &CompiledShader,
+        allow_ia_buf_ru: bool,
+    ) -> (ComputeAccess, HandleKindProfile) {
+        let mut acc = self.compute_access_from_dxil(rs);
+        if let Some(ru) = self.ru_opt {
+            if (ru & !0x3e) == 0 {
+                if (ru & (8 | 16)) == 0 {
+                    acc.touches_textures = false;
+                    acc.unbounded_srv_classes &= !READS_TEX;
+                }
+                acc.msc_exact_classes = self.exact_classes(ru, self.stage_may_read_cbv(rs, false));
+            }
+        }
+        let air_unused = self.res_desc_heap_unused
+            && self.used_resources.as_deref().is_some_and(|u| {
+                !u.is_empty()
+                    || self.ru_opt == Some(0)
+                    || (allow_ia_buf_ru && self.ru_opt.is_some_and(|ru| (ru & !2) == 0))
+            });
+        let out = self.refine_compute_access(acc, rs, true, air_unused);
+        let raw_hk = resolve_shader_hk_profile_from_summary(self, bytecode, rs, shader);
+        let hk = raw_hk.intersect_access(&out);
+        (out, hk)
+    }
+
+    pub(crate) fn for_compute(
+        &self,
+        bytecode: &[u8],
+        rs: &RootSignature,
+        shader: &CompiledShader,
+    ) -> (ComputeAccess, HandleKindProfile) {
+        const BOTH: u8 = READS_TEX | READS_BUF;
+        let mid_v2 = cs_mid_qb_exact_v2();
+        let sm66_cs = sm66_cs_stage_exact();
+        let opt_msc_access = msc_compute_access() || sm66_cs;
+        let opt_stage_usage = msc_stage_usage() || mid_v2 || sm66_cs;
+        let opt_air_no_res_heap = air_no_res_heap() || mid_v2 || sm66_cs;
+
+        let mut acc = self.compute_access_from_dxil(rs);
+        if let Some(ru) = self.ru_opt {
+            if (ru & !0x3e) == 0 {
+                if (ru & (8 | 16)) == 0 {
+                    acc.touches_textures = false;
+                    acc.unbounded_srv_classes &= !READS_TEX;
+                }
+                acc.msc_exact_classes = self.exact_classes(ru, self.stage_may_read_cbv(rs, false));
+            }
+        }
+        let air_unused = opt_air_no_res_heap
+            && self.res_desc_heap_unused
+            && self
+                .used_resources
+                .as_deref()
+                .is_some_and(|u| !u.is_empty() || self.ru_opt == Some(0));
+        if air_unused {
+            super::encstats::inc(&super::encstats::c::air_no_res_heap_pso);
+        }
+        let out = if !opt_msc_access && !opt_stage_usage && !air_unused {
+            acc
+        } else {
+            let enable_used_resources = opt_msc_access || air_unused;
+            let refined = self.refine_compute_access(acc, rs, enable_used_resources, air_unused);
+            if opt_stage_usage
+                && (refined.uav_classes != BOTH
+                    || refined.read_classes != BOTH
+                    || refined.uav_srv_classes != BOTH)
+            {
+                super::encstats::inc(&super::encstats::c::msc_stage_usage_hit);
+            }
+            refined
+        };
+        let raw_hk = resolve_shader_hk_profile_from_summary(self, bytecode, rs, shader);
+        let hk = raw_hk.intersect_access(&out);
+        (out, hk)
+    }
+}
+
 /// Applies `AW2_SHADER_IMMUTABLE_OPT=1` compile-time options to any `MTL4PipelineDescriptor`.
 pub fn apply_immutable_pipeline_options(desc: &MTL4PipelineDescriptor) {
     let opts = MTL4PipelineOptions::new();
@@ -1315,6 +2289,7 @@ pub struct ComputePipeline {
     pub threadgroup: [u32; 3],
     pub shader: Arc<CompiledShader>,
     pub access: ComputeAccess,
+    pub hk_profile: HandleKindProfile,
 }
 unsafe impl Send for ComputePipeline {}
 unsafe impl Sync for ComputePipeline {}
@@ -1354,7 +2329,8 @@ impl ComputePipeline {
             StageInfo::Compute { threadgroup_size } => threadgroup_size,
             ref other => return Err(format!("compute shader without compute reflection: {other:?}")),
         };
-        let access = ComputeAccess::from_dxil_and_shader(dxil, &rs, &shader);
+        let summary = ShaderStageSummary::new(dxil, &shader, &rs);
+        let (access, hk_profile) = summary.for_compute(dxil, &rs, &shader);
         let lib = library(&shader)?;
         let desc = MTL4ComputePipelineDescriptor::new();
         desc.setComputeFunctionDescriptor(Some(&shader_function_descriptor(&lib, &shader)));
@@ -1386,7 +2362,7 @@ impl ComputePipeline {
             cache_key ^= IMMUTABLE_OPT_KEY_SALT;
         }
         let pso = cache.compute_pipeline(Some(cache_key), &desc).map_err(|e| format!("compute pipeline: {e}"))?;
-        Ok(ComputePipeline { pso, rs, threadgroup, shader, access })
+        Ok(ComputePipeline { pso, rs, threadgroup, shader, access, hk_profile })
     }
 }
 
@@ -1487,6 +2463,9 @@ pub struct GraphicsPipeline {
     /// Zero-salt per-stage binding profiles (`AW2_GFX_DESC_TABLE_EXACT=1`).
     pub vs_access: ComputeAccess,
     pub ps_access: Option<ComputeAccess>,
+    /// Embedded handle-kind profiles (eliminating `HK_PROFILE_REGISTRY.read()` on draw).
+    pub vs_hk_profile: HandleKindProfile,
+    pub ps_hk_profile: Option<HandleKindProfile>,
     /// Present when this pipeline emulates a D3D11/D3D12 geometry shader on a Metal 4
     /// mesh render pipeline (object = VS + linked stage-in, mesh = GS, fragment = PS).
     pub gs_emu: Option<GeometryEmulation>,
@@ -1494,28 +2473,23 @@ pub struct GraphicsPipeline {
     pub(crate) icb_pso: OnceLock<Result<Retained<MtlRenderPipeline>, String>>,
 }
 
-/// Inspects an embedded `.metallib` (`RBUF` `struct.res_desc_heap_ab` `unused == 1`) plus
-/// MSC's `"UsedResources"` reflection JSON against `rs` to determine whether a SM 6.6 shader
-/// stage may read any non-inline CBV buffer resource (root CBV descriptor or CBV table range).
-/// Returns `None` if `metallib_res_desc_heap_unused` is `false` or `"UsedResources"` is absent
-/// or outside GRS bounds (fail-closed: caller treats `None` as `true`).
-pub fn msc_stage_may_read_cbv_from_reflection(
-    metallib: &[u8],
-    msc_json: &str,
+fn msc_stage_may_read_cbv_from_parts(
+    res_desc_heap_unused: bool,
+    used: Option<&[MscUsedResource]>,
     rs: &RootSignature,
 ) -> Option<bool> {
     use dxil_metal::root_signature::{
         DescriptorRangeType, RootDescriptorKind, RootParameterLayoutKind,
     };
-    if !metallib_res_desc_heap_unused(metallib) {
+    if !res_desc_heap_unused {
         return None;
     }
-    let used = msc_used_resources(msc_json)?;
+    let used = used?;
     let layout = rs.layout();
     let param_len = layout.parameters.len();
     let has_static_samplers = layout.static_samplers.is_some();
     let mut has_cbv = false;
-    for u in &used {
+    for u in used {
         if !u.is_in_grs || u.binding_index > u16::MAX as u32 {
             return None;
         }
@@ -1566,6 +2540,23 @@ pub fn msc_stage_may_read_cbv_from_reflection(
         }
     }
     Some(has_cbv)
+}
+
+/// Inspects an embedded `.metallib` (`RBUF` `struct.res_desc_heap_ab` `unused == 1`) plus
+/// MSC's `"UsedResources"` reflection JSON against `rs` to determine whether a SM 6.6 shader
+/// stage may read any non-inline CBV buffer resource (root CBV descriptor or CBV table range).
+/// Returns `None` if `metallib_res_desc_heap_unused` is `false` or `"UsedResources"` is absent
+/// or outside GRS bounds (fail-closed: caller treats `None` as `true`).
+pub fn msc_stage_may_read_cbv_from_reflection(
+    metallib: &[u8],
+    msc_json: &str,
+    rs: &RootSignature,
+) -> Option<bool> {
+    if !metallib_res_desc_heap_unused(metallib) {
+        return None;
+    }
+    let used = msc_used_resources(msc_json)?;
+    msc_stage_may_read_cbv_from_parts(true, Some(&used), rs)
 }
 
 /// Whether a shader stage may read any GPU buffer via a root CBV descriptor,
@@ -1918,16 +2909,21 @@ unsafe impl Sync for DsCache {}
 pub fn depth_stencil_state(s: &DepthStencilState) -> Result<Retained<MtlDepthStencil>, String> {
     static C: OnceLock<DsCache> = OnceLock::new();
     let c = C.get_or_init(|| DsCache(Mutex::new(HashMap::new())));
-    let mut m = c.0.lock().unwrap();
-    if let Some(d) = m.get(s) {
-        return Ok(d.clone());
+    {
+        let m = c.0.lock().unwrap();
+        if let Some(d) = m.get(s) {
+            return Ok(d.clone());
+        }
     }
     let d = super::device().ok_or("no device")?;
     let desc = MTLDepthStencilDescriptor::new();
     s.apply_to(&desc);
-    let st = d.dev.newDepthStencilStateWithDescriptor(&desc).ok_or_else(|| format!("newDepthStencilState({s:?})"))?;
-    m.insert(*s, st.clone());
-    Ok(st)
+    let st = d
+        .dev
+        .newDepthStencilStateWithDescriptor(&desc)
+        .ok_or_else(|| format!("newDepthStencilState({s:?})"))?;
+    let mut m = c.0.lock().unwrap();
+    Ok(m.entry(*s).or_insert(st).clone())
 }
 
 fn semantic_matches(reflected: &str, name: &str, index: u32) -> bool {
@@ -2149,13 +3145,13 @@ impl GraphicsPipeline {
             MTL4AlphaToCoverageState::Disabled
         });
 
-        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal gs-emu pso v1");
+        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal gs-emu pso v2");
         key.u128(vs.key)
             .u128(gs.key)
             .u128(stage_in.as_ref().map_or(0, |s| s.key))
             .u128(ps.as_ref().map_or(0, |p| p.key))
             .u32(vertex_output_size);
-        key.bytes(format!("{blend:?}|{:?}|{}|{}", d.rtv_formats, d.sample_count, d.topology_type).as_bytes());
+        RenderPsoStateKey::new(blend, &d.rtv_formats, d.sample_count, d.topology_type).write_to(&mut key);
         let mut pso_key = key.finish();
         if immut_opt {
             pso_key ^= IMMUTABLE_OPT_KEY_SALT;
@@ -2165,16 +3161,19 @@ impl GraphicsPipeline {
         }
         let pso = cache.render_pipeline(Some(pso_key), &desc).map_err(|e| format!("geometry render pipeline: {e}"))?;
         let ds = if d.dsv_format == 0 { DepthStencilState::without_depth_stencil() } else { d.depth_stencil };
-        let pre_raster_reads = stage_reads_resources_with(&vs, d.vs, pso_opt_v2)
-            | stage_reads_resources_with(&gs, gs_dxil, pso_opt_v2);
-        let vs_writes_uav = shader_writes_uav(&vs, d.vs, true) || shader_writes_uav(&gs, gs_dxil, true);
-        let ps_writes_uav = ps.as_ref().zip(d.ps).is_some_and(|(p, b)| shader_writes_uav(p, b, true));
+        let vs_sum = ShaderStageSummary::new(d.vs, &vs, &rs);
+        let gs_sum = ShaderStageSummary::new(gs_dxil, &gs, &rs);
+        let ps_sum = ps.as_ref().zip(d.ps).map(|(p, b)| (p, b, ShaderStageSummary::new(b, p, &rs)));
+        let pre_raster_reads =
+            vs_sum.stage_reads_resources(&vs, pso_opt_v2) | gs_sum.stage_reads_resources(&gs, pso_opt_v2);
+        let vs_writes_uav = vs_sum.shader_writes_uav(true) || gs_sum.shader_writes_uav(true);
+        let ps_writes_uav = ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(true));
         let writes_uav = vs_writes_uav || ps_writes_uav;
-        let (ps_srv_uav_classes, ps_read_classes) = match ps.as_ref().zip(d.ps) {
-            Some((p, b)) => {
-                let srv_uav = stage_srv_uav_classes(p, b, &rs, true);
+        let (ps_srv_uav_classes, ps_read_classes) = match &ps_sum {
+            Some((p, _, s)) => {
+                let srv_uav = s.stage_srv_uav_classes(p, &rs, true);
                 let mut m = srv_uav;
-                if stage_may_read_cbv_buffer_with(p, b, &rs, true) {
+                if s.stage_may_read_cbv(&rs, true) {
                     m |= READS_BUF;
                 }
                 (srv_uav, m)
@@ -2182,11 +3181,17 @@ impl GraphicsPipeline {
             None => (0, 0),
         };
         let uses_uav = writes_uav
-            || shader_uses_uav(&vs, d.vs, &rs)
-            || shader_uses_uav(&gs, gs_dxil, &rs)
-            || ps.as_ref().zip(d.ps).is_some_and(|(p, b)| shader_uses_uav(p, b, &rs));
-        let vs_access = ComputeAccess::for_stage_shader(d.vs, &rs, &vs, true);
-        let ps_access = ps.as_ref().zip(d.ps).map(|(p, b)| ComputeAccess::for_stage_shader(b, &rs, p, false));
+            || vs_sum.shader_uses_uav(&rs)
+            || gs_sum.shader_uses_uav(&rs)
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_uses_uav(&rs));
+        let (vs_access, vs_hk_profile) = vs_sum.for_stage(d.vs, &rs, &vs, true);
+        let (ps_access, ps_hk_profile) = match &ps_sum {
+            Some((p, b, s)) => {
+                let (acc, hk) = s.for_stage(b, &rs, p, false);
+                (Some(acc), Some(hk))
+            }
+            None => (None, None),
+        };
         Ok(GraphicsPipeline {
             pso,
             rs,
@@ -2215,6 +3220,8 @@ impl GraphicsPipeline {
             uses_uav,
             vs_access,
             ps_access,
+            vs_hk_profile,
+            ps_hk_profile,
             vs,
             ps,
             gs_emu: Some(GeometryEmulation {
@@ -2318,7 +3325,7 @@ impl GraphicsPipeline {
         } else {
             MTL4IndirectCommandBufferSupportState::Enabled
         });
-        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal graphics pso v2");
+        let mut key = dxil_metal::hash::KeyHasher::new("d3d12-metal graphics pso v3");
         key.u128(vs.key).u128(ps.as_ref().map_or(0, |p| p.key));
         let mut vertex_slots = 0u32;
         if !inputs.is_empty() {
@@ -2379,7 +3386,7 @@ impl GraphicsPipeline {
         unsafe { desc.setRasterSampleCount(d.sample_count.max(1) as usize) };
         desc.setAlphaToCoverageState(if blend.alpha_to_coverage { MTL4AlphaToCoverageState::Enabled } else { MTL4AlphaToCoverageState::Disabled });
         desc.setInputPrimitiveTopology(crate::topology::topology_class(d.topology_type));
-        key.bytes(format!("{blend:?}|{:?}|{}|{}", d.rtv_formats, d.sample_count, d.topology_type).as_bytes());
+        RenderPsoStateKey::new(blend, &d.rtv_formats, d.sample_count, d.topology_type).write_to(&mut key);
 
         let mut base_key = key.finish();
         if immut_opt {
@@ -2395,55 +3402,42 @@ impl GraphicsPipeline {
         if ds.depth_bounds {
             log::warn!(target: "d3d", "graphics PSO enables the depth bounds test, which is reported unsupported; ignored");
         }
+        let vs_sum = ShaderStageSummary::new(d.vs, &vs, &rs);
+        let ps_sum = ps.as_ref().zip(d.ps).map(|(p, b)| (p, b, ShaderStageSummary::new(b, p, &rs)));
         let msc_usage = msc_stage_usage();
         let sm66_gfx = sm66_gfx_stage_exact();
         let base_use_msc = pso_opt_v2 || msc_usage;
-        let dxil_pre_raster = stage_reads_resources_with(&vs, d.vs, false);
+        let dxil_pre_raster = vs_sum.stage_reads_resources(&vs, false);
         let base_pre_raster = if base_use_msc {
-            stage_reads_resources_with(&vs, d.vs, true)
+            vs_sum.stage_reads_resources(&vs, true)
         } else {
             dxil_pre_raster
         };
-        let sm66_pre_raster_reads = stage_srv_uav_classes(&vs, d.vs, &rs, true);
-        let dxil_vs_cbv = vertex_slots != 0 || stage_may_read_cbv_buffer_with(&vs, d.vs, &rs, false);
+        let sm66_pre_raster_reads = vs_sum.stage_srv_uav_classes(&vs, &rs, true);
+        let dxil_vs_cbv = vertex_slots != 0 || vs_sum.stage_may_read_cbv(&rs, false);
         let base_vs_cbv = dxil_vs_cbv;
-        let sm66_vs_reads_cbv_or_ia =
-            vertex_slots != 0 || stage_may_read_cbv_buffer_with(&vs, d.vs, &rs, true);
-        let dxil_writes_uav = shader_writes_uav(&vs, d.vs, false)
-            || ps
-                .as_ref()
-                .zip(d.ps)
-                .is_some_and(|(p, b)| shader_writes_uav(p, b, false));
+        let sm66_vs_reads_cbv_or_ia = vertex_slots != 0 || vs_sum.stage_may_read_cbv(&rs, true);
+        let dxil_writes_uav = vs_sum.shader_writes_uav(false)
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(false));
+        let vs_writes_uav = vs_sum.shader_writes_uav(true);
+        let ps_writes_uav = ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_uav(true));
         let base_writes_uav = if base_use_msc {
-            shader_writes_uav(&vs, d.vs, true)
-                || ps
-                    .as_ref()
-                    .zip(d.ps)
-                    .is_some_and(|(p, b)| shader_writes_uav(p, b, true))
+            vs_writes_uav || ps_writes_uav
         } else {
             dxil_writes_uav
         };
-        let vs_writes_uav = shader_writes_uav(&vs, d.vs, true);
-        let ps_writes_uav = ps
-            .as_ref()
-            .zip(d.ps)
-            .is_some_and(|(p, b)| shader_writes_uav(p, b, true));
-        if ps
-            .as_ref()
-            .zip(d.ps)
-            .is_some_and(|(p, b)| shader_writes_buf_uav(p, b))
-        {
+        if ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_writes_buf_uav()) {
             note_frag_buf_write();
         }
         let sm66_writes_uav = vs_writes_uav || ps_writes_uav;
         let pre_raster_reads = if sm66_gfx { sm66_pre_raster_reads } else { base_pre_raster };
         let vs_reads_cbv_or_ia = if sm66_gfx { sm66_vs_reads_cbv_or_ia } else { base_vs_cbv };
         let writes_uav = if sm66_gfx { sm66_writes_uav } else { base_writes_uav };
-        let (ps_srv_uav_classes, ps_read_classes) = match ps.as_ref().zip(d.ps) {
-            Some((p, b)) => {
-                let srv_uav = stage_srv_uav_classes(p, b, &rs, true);
+        let (ps_srv_uav_classes, ps_read_classes) = match &ps_sum {
+            Some((p, _, s)) => {
+                let srv_uav = s.stage_srv_uav_classes(p, &rs, true);
                 let mut m = srv_uav;
-                if stage_may_read_cbv_buffer_with(p, b, &rs, true) {
+                if s.stage_may_read_cbv(&rs, true) {
                     m |= READS_BUF;
                 }
                 (srv_uav, m)
@@ -2451,17 +3445,10 @@ impl GraphicsPipeline {
             None => (0, 0),
         };
         let uses_uav = writes_uav
-            || shader_uses_uav(&vs, d.vs, &rs)
-            || ps
-                .as_ref()
-                .zip(d.ps)
-                .is_some_and(|(p, b)| shader_uses_uav(p, b, &rs));
+            || vs_sum.shader_uses_uav(&rs)
+            || ps_sum.as_ref().is_some_and(|(_, _, s)| s.shader_uses_uav(&rs));
         let both_classes = READS_TEX | READS_BUF;
-        let msc_proven = metallib_res_desc_heap_unused(&vs.metallib)
-            && msc_resource_usages(&vs).is_some()
-            && ps
-                .as_ref()
-                .is_none_or(|p| metallib_res_desc_heap_unused(&p.metallib) && msc_resource_usages(p).is_some());
+        let msc_proven = vs_sum.msc_proven() && ps_sum.as_ref().is_none_or(|(_, _, s)| s.msc_proven());
         let sm66_narrowed = sm66_pre_raster_reads != dxil_pre_raster
             || sm66_vs_reads_cbv_or_ia != dxil_vs_cbv
             || sm66_writes_uav != dxil_writes_uav
@@ -2476,11 +3463,14 @@ impl GraphicsPipeline {
         {
             super::encstats::inc(&super::encstats::c::msc_stage_usage_hit);
         }
-        let vs_access = ComputeAccess::for_stage_shader(d.vs, &rs, &vs, true);
-        let ps_access = ps
-            .as_ref()
-            .zip(d.ps)
-            .map(|(p, b)| ComputeAccess::for_stage_shader(b, &rs, p, false));
+        let (vs_access, vs_hk_profile) = vs_sum.for_stage(d.vs, &rs, &vs, true);
+        let (ps_access, ps_hk_profile) = match &ps_sum {
+            Some((p, b, s)) => {
+                let (acc, hk) = s.for_stage(b, &rs, p, false);
+                (Some(acc), Some(hk))
+            }
+            None => (None, None),
+        };
         Ok(GraphicsPipeline {
             pso,
             rs,
@@ -2509,6 +3499,8 @@ impl GraphicsPipeline {
             uses_uav,
             vs_access,
             ps_access,
+            vs_hk_profile,
+            ps_hk_profile,
             vs: vs.clone(),
             ps,
             gs_emu: None,
@@ -2644,9 +3636,57 @@ pub fn shader_handle_kind_profile(shader: &CompiledShader, acc: &ComputeAccess) 
     base.intersect_access(acc)
 }
 
+/// Returns the PSO's embedded [`HandleKindProfile`] with zero locking in production;
+/// under `#[cfg(test)]`, consults [`shader_handle_kind_profile`] so tests that mutate
+/// `access`, construct synthetic PSO literals, or register test profiles via
+/// [`register_shader_hk_profile_for_test`] after pipeline creation see exact results.
+#[inline]
+pub fn resolve_pso_hk_profile(
+    embedded: HandleKindProfile,
+    shader: &CompiledShader,
+    acc: &ComputeAccess,
+) -> HandleKindProfile {
+    #[cfg(test)]
+    {
+        let _ = embedded;
+        shader_handle_kind_profile(shader, acc)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (shader, acc);
+        embedded
+    }
+}
+
 #[cfg(test)]
 pub fn register_shader_hk_profile_for_test(key: u128, prof: HandleKindProfile) {
     hk_profile_registry().write().unwrap().insert(key, prof);
+}
+
+fn resolve_shader_hk_profile_from_summary(
+    summary: &ShaderStageSummary,
+    bytecode: &[u8],
+    rs: &RootSignature,
+    shader: &CompiledShader,
+) -> HandleKindProfile {
+    use super::cmdlist::{
+        opt_cs_bind_intra_safe_env, opt_ps_to_cs_hk_overlap_env, opt_sm66_handle_kind_exact_env,
+        opt_sm66_handle_kind_v2_env,
+    };
+    if shader.key == 0
+        || !(opt_sm66_handle_kind_exact_env()
+            || opt_sm66_handle_kind_v2_env()
+            || opt_ps_to_cs_hk_overlap_env()
+            || opt_cs_bind_intra_safe_env())
+    {
+        return HandleKindProfile::OPAQUE;
+    }
+    if let Some(&cached) = hk_profile_registry().read().unwrap().get(&shader.key) {
+        return cached;
+    }
+    let raw = build_handle_kind_profile_raw_from_summary(summary, bytecode, rs);
+    hk_profile_registry().write().unwrap().insert(shader.key, raw);
+    raw
 }
 
 fn register_shader_hk_profile(
@@ -2938,6 +3978,235 @@ fn build_handle_kind_profile_raw(
     }
 }
 
+fn compute_unbounded_srv_hk_from_summary(
+    summary: &ShaderStageSummary,
+    rs: &RootSignature,
+    detail_opt: Option<&DxilHkDetail>,
+    ro_srv_kinds: u32,
+) -> u32 {
+    use dxil_metal::root_signature::{DescriptorRangeType, RootParameterLayoutKind};
+    use super::resource::{HK_ALL, HK_CBV_BUF};
+    const RESOURCE_HEAP_INDEXING: u64 = 1 << 25;
+    const MAX_BOUNDED_ARRAY: u32 = 128;
+
+    let Some(detail) = detail_opt else {
+        return (HK_ALL & !HK_CBV_BUF) & ro_srv_kinds;
+    };
+
+    let psv_opt = summary.dxil_psv();
+    let heap_indexed =
+        !summary.dxil_parsed() || (summary.dxil_feature_flags() & RESOURCE_HEAP_INDEXING) != 0;
+    let air_unused = summary.res_desc_heap_unused
+        && summary
+            .used_resources
+            .as_deref()
+            .is_some_and(|u| !u.is_empty() || summary.ru_opt == Some(0));
+
+    if heap_indexed && !air_unused {
+        return ro_srv_kinds;
+    }
+
+    let range_srv_hk = |space: u32, reg_lo: u32, reg_end: u32| -> u32 {
+        let mut h = 0u32;
+        let mut matched_dxil = false;
+        for sr in &detail.srv_ranges {
+            if sr.space != space {
+                continue;
+            }
+            let sr_end = if sr.upper_bound == u32::MAX {
+                u32::MAX
+            } else {
+                sr.upper_bound.saturating_add(1)
+            };
+            if sr_end <= reg_lo || sr.lower_bound >= reg_end {
+                continue;
+            }
+            matched_dxil = true;
+            h |= sr.hk;
+        }
+        if matched_dxil {
+            return h;
+        }
+        if let Some(psv) = psv_opt {
+            let mut ph = 0u32;
+            for r in psv {
+                if !(3..=5).contains(&r.res_type) || r.space != space {
+                    continue;
+                }
+                let r_end = if r.upper_bound == u32::MAX {
+                    u32::MAX
+                } else {
+                    r.upper_bound.saturating_add(1)
+                };
+                if r_end <= reg_lo || r.lower_bound >= reg_end {
+                    continue;
+                }
+                ph |= psv_single_srv_hk(r) & (detail.srv_mask & !HK_CBV_BUF);
+            }
+            if ph != 0 {
+                return ph;
+            }
+        }
+        detail.srv_mask & !HK_CBV_BUF
+    };
+
+    if let Some(used) = summary.used_resources.as_deref() {
+        let layout = rs.layout();
+        let param_len = layout.parameters.len();
+        let has_static_samplers = layout.static_samplers.is_some();
+        if used.iter().all(|u| {
+            u.is_in_grs
+                && ((u.binding_index as usize) < param_len
+                    || (has_static_samplers && (u.binding_index as usize) == param_len))
+                && u.binding_index <= u16::MAX as u32
+        }) {
+            let mut msc_valid = !used.is_empty() || summary.ru_opt == Some(0);
+            let mut msc_unb_hk = 0u32;
+            'u_loop: for u in used {
+                if (u.binding_index as usize) == param_len {
+                    continue;
+                }
+                if let RootParameterLayoutKind::DescriptorTable { sampler: false, ranges } =
+                    &layout.parameters[u.binding_index as usize].kind
+                {
+                    if u.table_length == 0 {
+                        continue;
+                    }
+                    let bounded_end = (u.table_start_index != u32::MAX
+                        && u.table_length <= MAX_BOUNDED_ARRAY)
+                        .then(|| u.table_start_index.checked_add(u.table_length))
+                        .flatten();
+                    if let Some(end) = bounded_end {
+                        for d in u.table_start_index..end {
+                            if !ranges.iter().any(|rg| {
+                                d >= rg.descriptor_offset
+                                    && rg.num_descriptors.is_none_or(|n| d - rg.descriptor_offset < n)
+                            }) {
+                                msc_valid = false;
+                                break 'u_loop;
+                            }
+                        }
+                    } else {
+                        let (start, end) = if u.table_start_index == u32::MAX {
+                            (0u32, u32::MAX)
+                        } else {
+                            (
+                                u.table_start_index,
+                                u.table_start_index.saturating_add(u.table_length),
+                            )
+                        };
+                        let mut any_overlap = false;
+                        for rg in ranges {
+                            let rg_end = rg.num_descriptors.map_or(u32::MAX, |n| {
+                                rg.descriptor_offset.saturating_add(n)
+                            });
+                            if rg_end <= start || rg.descriptor_offset >= end {
+                                continue;
+                            }
+                            any_overlap = true;
+                            if rg.range_type == DescriptorRangeType::Srv {
+                                let rg_reg_end = rg.num_descriptors.map_or(u32::MAX, |n| {
+                                    rg.base_shader_register.saturating_add(n)
+                                });
+                                msc_unb_hk |= range_srv_hk(
+                                    rg.register_space,
+                                    rg.base_shader_register,
+                                    rg_reg_end,
+                                );
+                            }
+                        }
+                        if !any_overlap {
+                            msc_valid = false;
+                            break 'u_loop;
+                        }
+                    }
+                }
+            }
+            if msc_valid {
+                return msc_unb_hk & ro_srv_kinds;
+            }
+        }
+    }
+
+    let mut unb_hk = 0u32;
+    if !detail.srv_ranges.is_empty() {
+        for sr in &detail.srv_ranges {
+            let is_unb = sr.upper_bound == u32::MAX
+                || sr.upper_bound < sr.lower_bound
+                || (sr.upper_bound - sr.lower_bound + 1) > MAX_BOUNDED_ARRAY;
+            if is_unb {
+                unb_hk |= sr.hk;
+            }
+        }
+    } else if let Some(psv) = psv_opt {
+        for r in psv {
+            if !(3..=5).contains(&r.res_type) {
+                continue;
+            }
+            let is_unb = r.upper_bound == u32::MAX
+                || r.upper_bound < r.lower_bound
+                || (r.upper_bound - r.lower_bound + 1) > MAX_BOUNDED_ARRAY;
+            if is_unb {
+                unb_hk |= psv_single_srv_hk(r) & (detail.srv_mask & !HK_CBV_BUF);
+            }
+        }
+    } else {
+        unb_hk = detail.srv_mask & !HK_CBV_BUF;
+    }
+    unb_hk & ro_srv_kinds
+}
+
+fn build_handle_kind_profile_raw_from_summary(
+    summary: &ShaderStageSummary,
+    bytecode: &[u8],
+    rs: &RootSignature,
+) -> HandleKindProfile {
+    use super::resource::{
+        HK_ACCEL_STRUCT, HK_ALL, HK_ALL_TEX, HK_CBV_BUF, HK_RAW_BUF, HK_STRUCT_BUF, HK_TYPED_BUF,
+    };
+    const MSC_BUF_RW: u32 = HK_TYPED_BUF | HK_RAW_BUF | HK_STRUCT_BUF;
+    let detail_opt = summary
+        .dxil_bytes(bytecode)
+        .and_then(|bytes| dxil_handle_kinds_detail_from_dxil_container(bytes, summary.dxil_psv()));
+    let (dxil_srv, dxil_uav) = detail_opt
+        .as_ref()
+        .map_or((HK_ALL, HK_ALL & !HK_CBV_BUF), |d| (d.srv_mask, d.uav_mask));
+    let has_cbv = summary
+        .msc_cbv_opt
+        .unwrap_or_else(|| summary.stage_may_read_cbv(rs, false));
+
+    let (msc_w, msc_us, msc_ro) = match summary.ru_opt {
+        Some(ru) if (ru & !0x3e) == 0 => {
+            let w = (if (ru & 16) != 0 { HK_ALL_TEX } else { 0 })
+                | (if (ru & 4) != 0 { MSC_BUF_RW } else { 0 });
+            let ro = (if (ru & 8) != 0 { HK_ALL_TEX } else { 0 })
+                | (if (ru & 2) != 0 { MSC_BUF_RW } else { 0 })
+                | (if (ru & 32) != 0 { HK_ACCEL_STRUCT } else { 0 });
+            (w, w | ro, ro)
+        }
+        _ => (HK_ALL & !HK_CBV_BUF, HK_ALL & !HK_CBV_BUF, HK_ALL & !HK_CBV_BUF),
+    };
+
+    let uav_write_kinds = dxil_uav & msc_w;
+    let uav_srv_kinds = ((dxil_srv & !HK_CBV_BUF) | dxil_uav) & msc_us;
+    let ro_srv_kinds = (dxil_srv & !HK_CBV_BUF) & msc_ro;
+    let cbv_bit = if has_cbv && (dxil_srv & HK_CBV_BUF) != 0 {
+        HK_CBV_BUF
+    } else {
+        0
+    };
+    let read_kinds = uav_srv_kinds | cbv_bit;
+    let unbounded_srv_kinds =
+        compute_unbounded_srv_hk_from_summary(summary, rs, detail_opt.as_ref(), ro_srv_kinds);
+    HandleKindProfile {
+        uav_write_kinds,
+        uav_srv_kinds,
+        ro_srv_kinds,
+        read_kinds,
+        unbounded_srv_kinds,
+    }
+}
+
 pub fn build_handle_kind_profile(
     dxil: &[u8],
     rs: &RootSignature,
@@ -3033,7 +4302,44 @@ pub fn dxil_annotate_handle_kinds_opt(dxil: &[u8]) -> Option<(u32, u32)> {
     dxil_handle_kinds_detail_opt(dxil).map(|d| (d.srv_mask, d.uav_mask))
 }
 
+/// Like `dxil_handle_kinds_detail_opt`, reusing an already-converted DXIL container
+/// and pre-parsed PSV resources (avoids repeating `dxilconv::convert_signed`).
+fn dxil_handle_kinds_detail_from_dxil_container(
+    dxil_container: &[u8],
+    psv_opt: Option<&[dxil_metal::dxbc::PsvResource]>,
+) -> Option<DxilHkDetail> {
+    let c = dxil_metal::dxbc::Container::parse(dxil_container).ok()?;
+    let dxil_part = c.part(dxil_metal::dxbc::FOURCC_DXIL)?;
+    dxil_handle_kinds_detail_from_part(dxil_part, psv_opt)
+}
+
 pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
+    let parsed = dxil_metal::dxbc::Container::parse(dxil).ok()?;
+    let converted;
+    let c = if parsed.is_sm4_bytecode() {
+        converted = dxil_metal::dxilconv::convert_signed(dxil).ok()?;
+        dxil_metal::dxbc::Container::parse(&converted).ok()?
+    } else {
+        parsed
+    };
+    let dxil_part = c.part(dxil_metal::dxbc::FOURCC_DXIL)?;
+    let psv_owned = c.psv_resources();
+    dxil_handle_kinds_detail_from_part(dxil_part, psv_owned.as_deref())
+}
+
+fn dxil_handle_kinds_detail_from_part(
+    dxil_part: &[u8],
+    psv_opt: Option<&[dxil_metal::dxbc::PsvResource]>,
+) -> Option<DxilHkDetail> {
+    use dxil_metal::bitcode::dxil_part_bitcode;
+    // Constants & helper functions live inside this parser:
+    dxil_handle_kinds_detail_inner(dxil_part_bitcode(dxil_part)?, psv_opt)
+}
+
+fn dxil_handle_kinds_detail_inner(
+    bitcode: &[u8],
+    psv_opt: Option<&[dxil_metal::dxbc::PsvResource]>,
+) -> Option<DxilHkDetail> {
     const BLOCKINFO: u64 = 0;
     const MODULE_BLOCK: u64 = 8;
     const CONSTANTS_BLOCK: u64 = 11;
@@ -3172,6 +4478,15 @@ pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
     }
 
     fn read_abbrev_rec(b: &mut BcBits, a: &BcAbbrev) -> Option<(u64, Vec<u64>)> {
+        #[inline]
+        fn push_val(code: &mut Option<u64>, vals: &mut Vec<u64>, v: u64) {
+            if code.is_none() {
+                *code = Some(v);
+            } else {
+                vals.push(v);
+            }
+        }
+        let mut code: Option<u64> = None;
         let mut vals = Vec::new();
         let mut i = 0;
         while i < a.len() {
@@ -3184,7 +4499,7 @@ pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
                     }
                     vals.reserve((n as usize).min(4096));
                     for _ in 0..n {
-                        vals.push(read_scalar(b, elt)?);
+                        push_val(&mut code, &mut vals, read_scalar(b, elt)?);
                     }
                     i += 2;
                     continue;
@@ -3197,17 +4512,15 @@ pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
                     }
                     vals.reserve(n.min(4096));
                     for _ in 0..n {
-                        vals.push(b.read(8)?);
+                        push_val(&mut code, &mut vals, b.read(8)?);
                     }
                     b.align32();
                 }
-                op => vals.push(read_scalar(b, op)?),
+                op => push_val(&mut code, &mut vals, read_scalar(b, op)?),
             }
             i += 1;
         }
-        let code = *vals.first()?;
-        vals.remove(0);
-        Some((code, vals))
+        Some((code?, vals))
     }
 
     enum BcEntry {
@@ -3284,16 +4597,6 @@ pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
         Some(())
     }
 
-    let parsed = dxil_metal::dxbc::Container::parse(dxil).ok()?;
-    let converted;
-    let c = if parsed.is_sm4_bytecode() {
-        converted = dxil_metal::dxilconv::convert_signed(dxil).ok()?;
-        dxil_metal::dxbc::Container::parse(&converted).ok()?
-    } else {
-        parsed
-    };
-    let dxil_part = c.part(dxil_metal::dxbc::FOURCC_DXIL)?;
-    let bitcode = dxil_metal::bitcode::dxil_part_bitcode(dxil_part)?;
     if bitcode.get(0..4)? != b"BC\xC0\xDE" {
         return None;
     }
@@ -3754,8 +5057,8 @@ pub fn dxil_handle_kinds_detail_opt(dxil: &[u8]) -> Option<DxilHkDetail> {
             }
         }
     } else if has_legacy_create_handle || has_lib_create_handle {
-        let psv = c.psv_resources()?;
-        let (ps, pu) = psv_resource_handle_kinds(&psv);
+        let psv = psv_opt?;
+        let (ps, pu) = psv_resource_handle_kinds(psv);
         srv_mask |= ps;
         uav_mask |= pu;
     }
