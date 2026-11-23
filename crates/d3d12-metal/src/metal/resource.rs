@@ -667,7 +667,12 @@ pub fn texture_descriptor(desc: &ResourceDesc, extra_usage: MTLTextureUsage) -> 
     if flags & (resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_DEPTH_STENCIL) != 0 {
         usage |= MTLTextureUsage::RenderTarget;
     }
-    if flags & resource_flags::ALLOW_UNORDERED_ACCESS != 0 {
+    if flags & resource_flags::ALLOW_UNORDERED_ACCESS != 0
+        || (flags & resource_flags::ALLOW_RENDER_TARGET != 0
+            && desc.Dimension == dim::TEXTURE2D
+            && desc.SampleCount <= 1
+            && super::gpunan::needs_rt_shader_write(fmt))
+    {
         usage |= MTLTextureUsage::ShaderWrite;
     }
     let fi = format::info(desc.Format);

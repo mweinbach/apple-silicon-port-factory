@@ -43,3 +43,8 @@ pub fn handle_memory_warning() {
     }
     crate::dxgi::adapter::notify_video_memory_budget_change();
 }
+
+/// Arm the one-frame GPU `NaN`/`Inf`/HDR-spike pass scanner (`d3d12_metal::metal::gpunan`).
+pub fn arm_gpu_nan_scan() {
+    d3d12_metal::metal::gpunan::arm_next_frame();
+}

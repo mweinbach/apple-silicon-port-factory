@@ -264,6 +264,80 @@ kernel void port_present_scale_2d(texture2d<float, access::sample> src [[texture
     dst.write(src.sample(s, float2(px / rw, py / rh)), g);
 }
 
+kernel void port_diag_tex_scan_2d(
+    texture2d<float, access::read> tex [[texture(0)]],
+    device atomic_uint* out [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    uint w = tex.get_width(), h = tex.get_height();
+    if (g.x >= w || g.y >= h) return;
+    float4 v = tex.read(g);
+    if (g.x == (w >> 1) && g.y == (h >> 1)) {
+        atomic_store_explicit(&out[16], as_type<uint>(v.x), memory_order_relaxed);
+        atomic_store_explicit(&out[17], as_type<uint>(v.y), memory_order_relaxed);
+        atomic_store_explicit(&out[18], as_type<uint>(v.z), memory_order_relaxed);
+        atomic_store_explicit(&out[19], as_type<uint>(v.w), memory_order_relaxed);
+    }
+    if (g.x == ((w * 2u) / 3u) && g.y == ((h * 7u) / 8u)) {
+        atomic_store_explicit(&out[20], as_type<uint>(v.x), memory_order_relaxed);
+        atomic_store_explicit(&out[21], as_type<uint>(v.y), memory_order_relaxed);
+        atomic_store_explicit(&out[22], as_type<uint>(v.z), memory_order_relaxed);
+        atomic_store_explicit(&out[23], as_type<uint>(v.w), memory_order_relaxed);
+    }
+    bool nr = isnan(v.x), ng = isnan(v.y), nb = isnan(v.z), na = isnan(v.w);
+    bool ir = isinf(v.x), ig = isinf(v.y), ib = isinf(v.z), ia = isinf(v.w);
+    bool hr = !nr && !ir && abs(v.x) > 500.0;
+    bool hg = !ng && !ig && abs(v.y) > 500.0;
+    bool hb = !nb && !ib && abs(v.z) > 500.0;
+    if (nr) atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
+    if (ng) atomic_fetch_add_explicit(&out[1], 1u, memory_order_relaxed);
+    if (nb) atomic_fetch_add_explicit(&out[2], 1u, memory_order_relaxed);
+    if (na) atomic_fetch_add_explicit(&out[3], 1u, memory_order_relaxed);
+    if (ir) atomic_fetch_add_explicit(&out[4], 1u, memory_order_relaxed);
+    if (ig) atomic_fetch_add_explicit(&out[5], 1u, memory_order_relaxed);
+    if (ib) atomic_fetch_add_explicit(&out[6], 1u, memory_order_relaxed);
+    if (ia) atomic_fetch_add_explicit(&out[7], 1u, memory_order_relaxed);
+    if (hr) atomic_fetch_add_explicit(&out[8], 1u, memory_order_relaxed);
+    if (hg) atomic_fetch_add_explicit(&out[9], 1u, memory_order_relaxed);
+    if (hb) atomic_fetch_add_explicit(&out[10], 1u, memory_order_relaxed);
+    if (nr || ng || nb || ir || ig || ib || hr || hg || hb) {
+        if (atomic_load_explicit(&out[12], memory_order_relaxed) == 0xFFFFFFFFu) {
+            uint expected = 0xFFFFFFFFu;
+            if (atomic_compare_exchange_weak_explicit(&out[12], &expected, (g.y << 16) | g.x, memory_order_relaxed, memory_order_relaxed)) {
+                atomic_store_explicit(&out[13], as_type<uint>(v.x), memory_order_relaxed);
+                atomic_store_explicit(&out[14], as_type<uint>(v.y), memory_order_relaxed);
+                atomic_store_explicit(&out[15], as_type<uint>(v.z), memory_order_relaxed);
+            }
+        }
+    }
+}
+
+kernel void port_clamp_f16_inf_2d(
+    texture2d<float, access::read_write> tex [[texture(0)]],
+    constant float4& maxv [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    uint bx = g.x << 1u, by = g.y << 1u;
+    uint w = tex.get_width(), h = tex.get_height();
+    if (bx >= w || by >= h) return;
+    for (uint dy = 0u; dy < 2u; ++dy) {
+        uint y = by + dy;
+        if (y >= h) break;
+        for (uint dx = 0u; dx < 2u; ++dx) {
+            uint x = bx + dx;
+            if (x >= w) break;
+            float4 v = tex.read(uint2(x, y));
+            if (isinf(v.x) || isinf(v.y) || isinf(v.z) || isinf(v.w)) {
+                v.x = isinf(v.x) ? copysign(maxv.x, v.x) : v.x;
+                v.y = isinf(v.y) ? copysign(maxv.y, v.y) : v.y;
+                v.z = isinf(v.z) ? copysign(maxv.z, v.z) : v.z;
+                v.w = isinf(v.w) ? copysign(maxv.w, v.w) : v.w;
+                tex.write(v, uint2(x, y));
+            }
+        }
+    }
+}
+
 "#;
 
 /// The typed texture clear kernels (1-pixel/thread + 2x2-pixel/thread `*_t4` variants),
@@ -310,7 +384,7 @@ unsafe impl Sync for Kernels {}
 fn default_tg(name: &str) -> [u32; 3] {
     if name == "port_fill" || name == "port_fill_v4" {
         [64, 1, 1]
-    } else if name.ends_with("_t4") {
+    } else if name.ends_with("_t4") || name == "port_clamp_f16_inf_2d" {
         [16, 8, 1]
     } else {
         [8, 8, 1]
@@ -320,7 +394,7 @@ fn default_tg(name: &str) -> [u32; 3] {
 fn fast_tg(name: &str) -> [u32; 3] {
     if name == "port_fill" || name == "port_fill_v4" {
         [256, 1, 1]
-    } else if name.ends_with("_t4") {
+    } else if name.ends_with("_t4") || name == "port_clamp_f16_inf_2d" {
         [16, 8, 1]
     } else if name == "port_upscale_2d_f" || name.starts_with("port_clear_2d_") {
         [16, 16, 1]
@@ -341,6 +415,8 @@ fn kernels() -> &'static Kernels {
                 "port_upscale_2d_f".to_string(),
                 "port_present_copy_2d".to_string(),
                 "port_present_scale_2d".to_string(),
+                "port_diag_tex_scan_2d".to_string(),
+                "port_clamp_f16_inf_2d".to_string(),
             ];
             for t in ["1d", "1da", "2d", "2da", "3d"] {
                 for c in ["f", "u", "i"] {

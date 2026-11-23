@@ -307,6 +307,7 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
             }
             crate::hitch::on_present(n, present_ns);
             d3d12_metal::metal::gpucapture::on_present(n.into());
+            d3d12_metal::metal::gpunan::on_present(n.into(), &st.sc.queue);
             if n <= 10 || n % 60 == 0 {
                 log::info!(target: "d3d", "Present #{n} (sync {sync}, flags {flags:#x})");
             }

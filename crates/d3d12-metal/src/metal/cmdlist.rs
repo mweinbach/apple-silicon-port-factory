@@ -2382,6 +2382,10 @@ pub struct CommandList {
     /// Per-encoder GPU timestamps of this recording (`AW2_PASS_TIMING`), lazily acquired on first `pt_open`.
     pt: Option<pt::PassLog>,
     pt_armed: bool,
+    /// Last shader recorded on this list (for `PORT_DIAG_GPU_NAN` pass attribution; zero overhead when off).
+    diag_last_kind: &'static str,
+    diag_last_key: u64,
+    diag_last_vs_key: u64,
     /// Timeline optimization toggles (initialized from `AW2_*` env vars, overridable in tests).
     pub(crate) opt_ib_tight: bool,
     pub(crate) opt_ib_bindless_war: bool,
@@ -2724,6 +2728,9 @@ impl CommandList {
             cs_bind_tokens: Vec::new(),
             pt: None,
             pt_armed: false,
+            diag_last_kind: "none",
+            diag_last_key: 0,
+            diag_last_vs_key: 0,
             opt_ib_tight: opt_ib_tight_env(),
             opt_ib_bindless_war: opt_ib_bindless_war_env(),
             opt_rp_keep_write: opt_rp_keep_write_env(),
@@ -10862,9 +10869,182 @@ impl CommandList {
         self.barrier_list_with(items, barrier_r2r_elide(), barrier_uav0_keep());
     }
 
+    fn sanitize_f16_barriers(&mut self, items: &[Barrier]) {
+        let mut targets: Vec<(usize, Retained<super::resource::MtlTexture>, u32, u32, u64)> = Vec::new();
+        for item in items {
+            // Only sanitize when transitioning from a write state (RT/UAV) to a read/copy
+            // state (SRV/CopySource), or on explicit UAV barriers — skip RT<->UAV ping-pong
+            // transitions where a subsequent RT/UAV->SRV transition will sanitize once.
+            let r = match *item {
+                Barrier::Transition(r, s0, s1)
+                    if r != 0 && (s0 & (0x4 | 0x8)) != 0 && (s1 & (0x40 | 0x80 | 0x800)) != 0 =>
+                {
+                    r
+                }
+                Barrier::Uav(r) if r != 0 => r,
+                _ => 0,
+            };
+            if r == 0 || targets.iter().any(|t| t.0 == r) {
+                continue;
+            }
+            let res = unsafe { &*(r as *const Resource) };
+            if let Some((tex, w, h, maxv_va)) = super::gpunan::sanitize_f16_target(res) {
+                targets.push((r, tex, w, h, maxv_va));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let Ok((pso, tg)) = super::clear::kernel_for_dispatch("port_clamp_f16_inf_2d", self.opt_fast_bind_pso) else {
+            return;
+        };
+        if self.ensure_util_table().is_err() {
+            return;
+        }
+        let touch: Vec<usize> = targets.iter().map(|t| t.0).collect();
+        let masked = !legacy_barriers() && barrier_masks();
+        let ib_tight = self.ib_tight_active();
+        if masked {
+            const UTIL_AFTER: MTLStages = PRE_RASTER
+                .union(MTLStages::Fragment)
+                .union(MTLStages::Dispatch)
+                .union(MTLStages::Blit)
+                .union(MTLStages::AccelerationStructure);
+            self.add_pend(UTIL_AFTER, MTLStages::Dispatch);
+            if ib_tight {
+                for &r in &touch {
+                    self.ib_note_touch_before_tight(r, MTLStages::Dispatch);
+                }
+            } else {
+                for &r in &touch {
+                    self.ib_note(r);
+                }
+            }
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+        let e = if ib_tight && masked {
+            self.compute_op_tight(MTLStages::Dispatch, Some(&touch), Some(&touch), Some(&touch))
+        } else {
+            self.compute_touch(if masked { Some(&touch) } else { None })
+        };
+        let Some(e) = e else {
+            return;
+        };
+        let t = self.util_table.as_ref().unwrap();
+        e.setComputePipelineState(&pso);
+        for (_, tex, w, h, maxv_va) in &targets {
+            unsafe {
+                t.setAddress_atIndex(*maxv_va, 0);
+                t.setTexture_atIndex(tex.gpuResourceID(), 0);
+            }
+            e.setArgumentTable(Some(t));
+            let tx = (*w as usize).div_ceil(2);
+            let ty = (*h as usize).div_ceil(2);
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: tx.div_ceil(tg[0] as usize),
+                    height: ty.div_ceil(tg[1] as usize),
+                    depth: 1,
+                },
+                MTLSize { width: tg[0] as usize, height: tg[1] as usize, depth: 1 },
+            );
+        }
+        self.note_stage_ran(MTLStages::Dispatch);
+        e.setArgumentTable(Some(&self.table));
+        self.compute_pso_bound = false;
+        if masked {
+            const UTIL_BEFORE: MTLStages = PRE_RASTER
+                .union(MTLStages::Fragment)
+                .union(MTLStages::Dispatch)
+                .union(MTLStages::Blit)
+                .union(MTLStages::AccelerationStructure);
+            if ib_tight && self.opt_cs_mid_qb_res_defer_v5 {
+                if self.opt_cs_to_ps_overlap_v2 {
+                    self.add_pend_with_soft_res(MTLStages::Dispatch, MTLStages::Fragment, &touch);
+                } else {
+                    self.add_pend(MTLStages::Dispatch, PRE_RASTER | MTLStages::Fragment);
+                }
+                for &r in &touch {
+                    self.ib_add_obl_tight(r, MTLStages::Dispatch, COMPUTE_STAGES);
+                    self.cs_end_res.push((
+                        r,
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                    ));
+                }
+            } else {
+                self.add_pend(MTLStages::Dispatch, UTIL_BEFORE);
+                if ib_tight {
+                    for &r in &touch {
+                        self.ib_add_obl_tight(r, MTLStages::Dispatch, COMPUTE_STAGES);
+                    }
+                } else {
+                    for &r in &touch {
+                        self.ib_note(r);
+                    }
+                }
+            }
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+    }
+
     fn barrier_list_with(&mut self, items: &[Barrier], elide_r2r: bool, uav0_keep: bool) {
         use MTLStages as S;
         self.flush_icb_prepass_if_pending();
+        if super::gpunan::sanitize_f16_inf_active() && self.open && self.kind != ListType::Copy {
+            self.sanitize_f16_barriers(items);
+        }
+        if super::gpunan::is_capturing() && self.open && self.kind != ListType::Copy {
+            let mut scanned_any = false;
+            for item in items {
+                match *item {
+                    Barrier::Transition(r, s0, s1) if r != 0 && (s0 & (0x4 | 0x8)) != 0 => {
+                        let res = unsafe { &*(r as *const Resource) };
+                        if super::gpunan::can_scan_resource(res) {
+                            self.end_encoder();
+                            let tag = if s0 & 0x4 != 0 { "bar_rt" } else { "bar_uav" };
+                            if super::gpunan::encode_scan_resource(
+                                &self.cb,
+                                res,
+                                tag,
+                                self.diag_last_kind,
+                                self.diag_last_key,
+                                self.diag_last_vs_key,
+                                s0,
+                                s1,
+                            ) {
+                                scanned_any = true;
+                            }
+                        }
+                    }
+                    Barrier::Uav(r) if r != 0 => {
+                        let res = unsafe { &*(r as *const Resource) };
+                        if super::gpunan::can_scan_resource(res) {
+                            self.end_encoder();
+                            if super::gpunan::encode_scan_resource(
+                                &self.cb,
+                                res,
+                                "bar_uav",
+                                self.diag_last_kind,
+                                self.diag_last_key,
+                                self.diag_last_vs_key,
+                                0x8,
+                                0x8,
+                            ) {
+                                scanned_any = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if scanned_any {
+                self.need_full(FullWhy::ClearUav);
+            }
+        }
         stats::inc(&stats::c::app_barrier);
         let masked_mode = !legacy_barriers() && barrier_masks();
         let elide_r2r = elide_r2r && masked_mode;
@@ -15289,6 +15469,11 @@ impl CommandList {
         if self.hk_any_active() {
             self.cs_hk_profile = super::pipeline::shader_handle_kind_profile(&p.shader, &p.access);
         }
+        if super::gpunan::is_capturing() {
+            self.diag_last_kind = "cs";
+            self.diag_last_key = p.shader.key as u64;
+            self.diag_last_vs_key = 0;
+        }
         if self.compute_pso.as_ref().is_some_and(|c| Arc::ptr_eq(c, &p)) {
             return;
         }
@@ -16015,6 +16200,11 @@ impl CommandList {
 impl CommandList {
     /// `SetPipelineState` with a graphics PSO.
     pub fn set_graphics_pipeline(&mut self, p: Arc<GraphicsPipeline>) {
+        if super::gpunan::is_capturing() {
+            self.diag_last_kind = "gfx";
+            self.diag_last_key = p.ps.as_ref().map_or(p.vs.key as u64, |ps| ps.key as u64);
+            self.diag_last_vs_key = p.vs.key as u64;
+        }
         if self.gfx.pso.as_ref().is_some_and(|c| Arc::ptr_eq(c, &p)) {
             return;
         }
@@ -16025,6 +16215,11 @@ impl CommandList {
 
     /// `SetPipelineState` with a mesh-shader PSO.
     pub fn set_mesh_pipeline(&mut self, p: Arc<crate::mesh::MeshPipeline>) {
+        if super::gpunan::is_capturing() {
+            self.diag_last_kind = "mesh";
+            self.diag_last_key = 0;
+            self.diag_last_vs_key = 0;
+        }
         if self.gfx.mesh.as_ref().is_some_and(|c| Arc::ptr_eq(c, &p)) {
             return;
         }
@@ -19269,7 +19464,24 @@ impl CommandList {
             return Ok(UpscaleBackend::BilinearCompute);
         }
 
+        if super::gpunan::is_capturing() && self.open {
+            self.end_encoder();
+            let _ = super::gpunan::encode_scan_resource(&self.cb, params.color, "upscale_in_color", "upscale", 0, 0, 0, 0);
+            let _ = super::gpunan::encode_scan_resource(&self.cb, params.motion, "upscale_in_mv", "upscale", 0, 0, 0, 0);
+            if let Some(exp) = params.exposure {
+                let _ = super::gpunan::encode_scan_resource(&self.cb, exp, "upscale_in_exp", "upscale", 0, 0, 0, 0);
+            }
+            if let Some(rm) = params.reactive_mask {
+                let _ = super::gpunan::encode_scan_resource(&self.cb, rm, "upscale_in_react", "upscale", 0, 0, 0, 0);
+            }
+            self.need_full(FullWhy::ClearUav);
+        }
         if self.try_upscale_temporal_metalfx(params, &sv, &dv, x0, y0, w, h, s_fmt, d_fmt, &touch, tight_stages)? {
+            if super::gpunan::is_capturing() && self.open {
+                self.end_encoder();
+                let _ = super::gpunan::encode_scan_resource(&self.cb, params.output, "upscale_out_tmfx", "upscale", 0, 0, 0, 0);
+                self.need_full(FullWhy::ClearUav);
+            }
             return Ok(UpscaleBackend::TemporalMetalFx);
         }
 
@@ -19731,11 +19943,27 @@ impl CommandList {
             let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
             return self.util_dispatch_with("port_upscale_2d_f", Some(&sv), Some(&dv), clear::bytes_of(&p), [w, h, 1], &touch, tight_stages);
         }
+        if super::gpunan::is_capturing() && self.open {
+            self.end_encoder();
+            let _ = super::gpunan::encode_scan_resource(&self.cb, src, "upscale_res_in", "upscale", 0, 0, 0, 0);
+            self.need_full(FullWhy::ClearUav);
+        }
         if self.try_upscale_metalfx(&sv, &dv, x0, y0, w, h, s_fmt, d_fmt, &touch, tight_stages)? {
+            if super::gpunan::is_capturing() && self.open {
+                self.end_encoder();
+                let _ = super::gpunan::encode_scan_resource(&self.cb, dst, "upscale_res_out_smfx", "upscale", 0, 0, 0, 0);
+                self.need_full(FullWhy::ClearUav);
+            }
             return Ok(());
         }
         let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
-        self.util_dispatch_with("port_upscale_2d_f", Some(&sv), Some(&dv), clear::bytes_of(&p), [w, h, 1], &touch, tight_stages)
+        self.util_dispatch_with("port_upscale_2d_f", Some(&sv), Some(&dv), clear::bytes_of(&p), [w, h, 1], &touch, tight_stages)?;
+        if super::gpunan::is_capturing() && self.open {
+            self.end_encoder();
+            let _ = super::gpunan::encode_scan_resource(&self.cb, dst, "upscale_res_out_bilin", "upscale", 0, 0, 0, 0);
+            self.need_full(FullWhy::ClearUav);
+        }
+        Ok(())
     }
 
     fn copy_upscale_1to1(

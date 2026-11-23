@@ -334,6 +334,9 @@ fn apply_line(st: &mut LiveState, hwnd: usize, dir: &PathBuf, line: &str) {
             xinput1_4::backend_update(0, gp);
         }
         "release" => release_all(st, hwnd),
+        "gpunan" => {
+            w::d3d12::mtl::arm_gpu_nan_scan();
+        }
         "nantrace" if parts.len() >= 2 => {
             match parts[1].to_ascii_lowercase().as_str() {
                 "on" | "1" | "start" => {

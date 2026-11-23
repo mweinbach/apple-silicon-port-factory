@@ -114,8 +114,10 @@ pub fn device() -> Option<&'static Device> {
                     return None;
                 }
             };
+            let dev_name = dev.name().to_string();
+            super::gpunan::probe_f16_overflow_for_device(&dev, &dev_name);
             let m = Device {
-                name: dev.name().to_string(),
+                name: dev_name,
                 registry_id: dev.registryID(),
                 unified_memory: dev.hasUnifiedMemory(),
                 recommended_working_set: dev.recommendedMaxWorkingSetSize(),

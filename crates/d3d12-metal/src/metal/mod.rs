@@ -9,6 +9,7 @@ pub mod device;
 pub mod encstats;
 pub mod fence;
 pub mod gpucapture;
+pub mod gpunan;
 pub mod heap;
 pub mod indirect;
 pub mod indirect_icb;
