@@ -208,6 +208,8 @@ pub struct ChildProcessObj {
     pub exe_win: String,
     pub exit_code: handles::Guarded<Option<u32>>,
     #[cfg(not(target_os = "ios"))]
+    terminated_code: handles::Guarded<Option<u32>>,
+    #[cfg(not(target_os = "ios"))]
     os_pid: std::sync::atomic::AtomicI32,
 }
 
@@ -218,13 +220,16 @@ impl ChildProcessObj {
     }
 
     #[cfg(not(target_os = "ios"))]
-    fn mark_exited(&self, code: u32) {
+    fn finish_reaped(&self, guest_code: Option<u32>, fallback_code: u32) {
         self.os_pid.store(0, Ordering::Release);
         {
             let g = handles::wait_lock();
             let slot = self.exit_code.get(&g);
             if slot.is_none() {
-                *slot = Some(code);
+                let term_code = *self.terminated_code.get(&g);
+                // Prefer an explicit 32-bit guest exit code if the child completed ExitProcess/return;
+                // otherwise prefer the 32-bit code passed to TerminateProcess over POSIX signal fallback.
+                *slot = Some(guest_code.or(term_code).unwrap_or(fallback_code));
             }
         }
         handles::notify_object_key(handles::obj_key(self), usize::MAX);
@@ -330,11 +335,31 @@ pub unsafe extern "win64" fn TerminateProcess(h: HANDLE, code: u32) -> BOOL {
     if let Some(child) = handles::get_as::<ChildProcessObj>(h) {
         #[cfg(not(target_os = "ios"))]
         {
+            // Record the requested full 32-bit exit code before sending SIGKILL so the reaper
+            // cannot observe signal death before `terminated_code` is visible.
+            let already_exited = {
+                let g = handles::wait_lock();
+                if child.exit_code.get(&g).is_some() {
+                    true
+                } else {
+                    let tslot = child.terminated_code.get(&g);
+                    if tslot.is_none() {
+                        *tslot = Some(code);
+                    }
+                    false
+                }
+            };
+            if already_exited {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             let pid = child.os_pid.swap(0, Ordering::AcqRel);
             if pid > 0 {
-                let _ = libc::kill(pid, libc::SIGKILL);
+                if libc::kill(pid, libc::SIGKILL) != 0 && last_errno() == libc::ESRCH {
+                    set_err(err::ERROR_ACCESS_DENIED);
+                    return FALSE;
+                }
             }
-            child.mark_exited(code);
             return TRUE;
         }
         #[cfg(target_os = "ios")]
@@ -1037,6 +1062,7 @@ pub unsafe extern "win64" fn CreateProcessW(
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
+            let use_std = (si_flags & STARTF_USESTDHANDLES) != 0;
             for &h in list {
                 if h.is_null() || h == INVALID_HANDLE_VALUE || handles::get(h).is_none() {
                     set_err(err::ERROR_INVALID_HANDLE);
@@ -1044,6 +1070,16 @@ pub unsafe extern "win64" fn CreateProcessW(
                 }
                 if !is_inheritable_handle(h) {
                     set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                let is_redirected_std = use_std
+                    && (h == h_stdin || h == h_stdout || h == h_stderr)
+                    && crate::kernel32::file::file_fd_and_kind(h).is_some();
+                if !is_redirected_std {
+                    log::warn!(
+                        "CreateProcessW: PROC_THREAD_ATTRIBUTE_HANDLE_LIST entry {h:p} cannot be transferred (only redirected stdio handles are supported)"
+                    );
+                    set_err(err::ERROR_NOT_SUPPORTED);
                     return FALSE;
                 }
             }
@@ -1150,6 +1186,50 @@ pub unsafe extern "win64" fn CreateProcessW(
             }
         }
 
+        // Dedicated parent-child pipe to report the full 32-bit guest Windows exit code.
+        // Both ends start FD_CLOEXEC so unrelated concurrent spawns never inherit either end;
+        // `pre_exec` clears FD_CLOEXEC solely on the write end for this child, and the child
+        // immediately re-applies FD_CLOEXEC and removes `PORT_EXIT_CODE_FD` at startup.
+        struct OwnedFd(i32);
+        impl Drop for OwnedFd {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe {
+                        let _ = libc::close(self.0);
+                    }
+                    self.0 = -1;
+                }
+            }
+        }
+        let mut exit_pipe = [-1i32; 2];
+        if libc::pipe(exit_pipe.as_mut_ptr()) != 0 {
+            set_err(errno_to_win32(last_errno()));
+            return FALSE;
+        }
+        for &fd in &exit_pipe {
+            let fl = libc::fcntl(fd, libc::F_GETFD);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+            }
+        }
+        let exit_read_fd = OwnedFd(exit_pipe[0]);
+        let exit_write_fd = OwnedFd(exit_pipe[1]);
+        let child_exit_wfd = exit_write_fd.0;
+        command.env("PORT_EXIT_CODE_FD", child_exit_wfd.to_string());
+        {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(move || {
+                let fl = libc::fcntl(child_exit_wfd, libc::F_GETFD);
+                if fl < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(child_exit_wfd, libc::F_SETFD, fl & !libc::FD_CLOEXEC) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1157,11 +1237,15 @@ pub unsafe extern "win64" fn CreateProcessW(
                 return FALSE;
             }
         };
+        // Close parent's write end immediately so EOF arrives as soon as the child exits.
+        drop(exit_write_fd);
+
         let pid = child.id();
         let proc_obj = Arc::new(ChildProcessObj {
             pid,
             exe_win,
             exit_code: handles::Guarded::new(None),
+            terminated_code: handles::Guarded::new(None),
             os_pid: std::sync::atomic::AtomicI32::new(pid as i32),
         });
         child_processes()
@@ -1178,7 +1262,7 @@ pub unsafe extern "win64" fn CreateProcessW(
             .name(format!("win32-child-reap-{pid}"))
             .spawn(move || {
                 use std::os::unix::process::ExitStatusExt;
-                let code = match child.wait() {
+                let fallback_code = match child.wait() {
                     Ok(status) => {
                         if let Some(c) = status.code() {
                             c as u32
@@ -1190,7 +1274,29 @@ pub unsafe extern "win64" fn CreateProcessW(
                     }
                     Err(_) => 1,
                 };
-                proc_for_reaper.mark_exited(code);
+                // Read the full 32-bit Windows exit code written by `exit_process` (if any).
+                let mut code_buf = [0u8; 4];
+                let mut got = 0usize;
+                while got < 4 {
+                    let r = libc::read(
+                        exit_read_fd.0,
+                        code_buf.as_mut_ptr().add(got) as *mut c_void,
+                        4 - got,
+                    );
+                    if r < 0 {
+                        if last_errno() == libc::EINTR {
+                            continue;
+                        }
+                        break;
+                    }
+                    if r == 0 {
+                        break;
+                    }
+                    got += r as usize;
+                }
+                drop(exit_read_fd);
+                let guest_code = (got == 4).then(|| u32::from_le_bytes(code_buf));
+                proc_for_reaper.finish_reaped(guest_code, fallback_code);
             });
 
         let h_proc = handles::insert(proc_obj);
@@ -2173,7 +2279,7 @@ mod tests {
                 );
                 assert_eq!(GetLastError(), err::ERROR_INVALID_PARAMETER);
 
-                // Missing exe -> ERROR_FILE_NOT_FOUND.
+                // HANDLE_LIST with non-stdio handle (Event) or without STARTF_USESTDHANDLES -> ERROR_NOT_SUPPORTED before spawn.
                 assert_eq!(
                     CreateProcessW(
                         app.as_ptr(),
@@ -2185,6 +2291,47 @@ mod tests {
                         std::ptr::null_mut(),
                         std::ptr::null(),
                         si.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+                // Even with STARTF_USESTDHANDLES set, a non-stdio handle in HANDLE_LIST -> ERROR_NOT_SUPPORTED.
+                let mut si_std = si;
+                (si_std.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+                (si_std.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(ev);
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si_std.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+                // Missing exe with standard STARTUPINFOW -> ERROR_FILE_NOT_FOUND.
+                let mut si_basic = [0u8; 104];
+                (si_basic.as_mut_ptr() as *mut u32).write_unaligned(104);
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        FALSE,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si_basic.as_mut_ptr() as *mut c_void,
                         pi.as_mut_ptr() as *mut c_void,
                     ),
                     FALSE

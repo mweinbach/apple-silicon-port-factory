@@ -415,6 +415,65 @@ pub fn physical_memory() -> u64 {
     v
 }
 
+/// Optional POSIX pipe write-end fd inherited from a parent `CreateProcessW` call
+/// for reporting the full 32-bit Windows exit code back to the parent.
+static EXIT_CODE_PIPE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Capture `PORT_EXIT_CODE_FD` from the process environment (if launched by `CreateProcessW`),
+/// immediately mark the fd `FD_CLOEXEC`, and strip the env var so grandchildren never inherit it.
+pub fn init_exit_code_channel() {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let raw = std::env::var("PORT_EXIT_CODE_FD").ok();
+        std::env::remove_var("PORT_EXIT_CODE_FD");
+        if let Some(s) = raw {
+            if let Ok(fd) = s.trim().parse::<i32>() {
+                if fd >= 0 {
+                    unsafe {
+                        let fl = libc::fcntl(fd, libc::F_GETFD);
+                        if fl >= 0 {
+                            let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+                            EXIT_CODE_PIPE_FD.store(fd, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write the full 32-bit Windows exit code to the parent's exit-code pipe (at most once).
+fn report_exit_code_to_parent(code: u32) {
+    let fd = EXIT_CODE_PIPE_FD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    if fd < 0 {
+        return;
+    }
+    let bytes = code.to_le_bytes();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let r = unsafe {
+            libc::write(
+                fd,
+                bytes.as_ptr().add(off) as *const std::ffi::c_void,
+                bytes.len() - off,
+            )
+        };
+        if r < 0 {
+            if crate::types::last_errno() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+        if r == 0 {
+            break;
+        }
+        off += r as usize;
+    }
+    unsafe {
+        let _ = libc::close(fd);
+    }
+}
+
 /// Terminate the process with a Windows exit code.
 pub fn exit_process(code: u32) -> ! {
     if crate::shadow::in_child() {
@@ -426,6 +485,7 @@ pub fn exit_process(code: u32) -> ! {
     let _ = EXIT_CODE.compare_exchange(u64::MAX, code as u64, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
     run_exit_hooks();
     crate::ucrt::stdio::flush_all();
+    report_exit_code_to_parent(code);
     unsafe { libc::_exit(code as i32) }
 }
 
@@ -471,5 +531,43 @@ mod tests {
             r#""C:\Game\App.exe" -EPICUSERID=custom123 -flag "spaced arg""#
         );
         set_manifest_game_args(Vec::new());
+    }
+
+    #[test]
+    fn exit_code_channel_sets_cloexec_strips_env_and_writes_u32_once() {
+        let mut fds = [-1i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rfd, wfd) = (fds[0], fds[1]);
+        unsafe {
+            // Simulate inherited write fd (FD_CLOEXEC cleared) + env var present.
+            let fl = libc::fcntl(wfd, libc::F_GETFD);
+            assert!(fl >= 0);
+            assert_eq!(libc::fcntl(wfd, libc::F_SETFD, fl & !libc::FD_CLOEXEC), 0);
+            std::env::set_var("PORT_EXIT_CODE_FD", wfd.to_string());
+        }
+
+        init_exit_code_channel();
+        assert!(std::env::var("PORT_EXIT_CODE_FD").is_err(), "PORT_EXIT_CODE_FD must be removed from host env");
+        let after_fl = unsafe { libc::fcntl(wfd, libc::F_GETFD) };
+        assert_ne!(after_fl & libc::FD_CLOEXEC, 0, "exit-code fd must have FD_CLOEXEC set to avoid descendant leaks");
+
+        // First write sends full 32-bit exit code and closes wfd; second write is a no-op.
+        report_exit_code_to_parent(0xC000_013Au32);
+        report_exit_code_to_parent(0x1111_2222u32);
+
+        let mut buf = [0u8; 8];
+        let mut got = 0usize;
+        loop {
+            let n = unsafe { libc::read(rfd, buf.as_mut_ptr().add(got) as *mut libc::c_void, buf.len() - got) };
+            if n <= 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        unsafe {
+            let _ = libc::close(rfd);
+        }
+        assert_eq!(got, 4);
+        assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 0xC000_013Au32);
     }
 }

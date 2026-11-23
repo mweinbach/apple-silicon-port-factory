@@ -836,7 +836,7 @@ pub(crate) fn win32_to_ntstatus(win32_err: u32) -> usize {
 }
 
 #[inline]
-unsafe fn store_ov_internal(ov: *mut OVERLAPPED, val: usize) {
+pub(crate) unsafe fn store_ov_internal(ov: *mut OVERLAPPED, val: usize) {
     let p = std::ptr::addr_of_mut!((*ov).internal);
     if p.is_aligned() {
         std::sync::atomic::AtomicUsize::from_ptr(p).store(val, Ordering::Release);
@@ -847,7 +847,7 @@ unsafe fn store_ov_internal(ov: *mut OVERLAPPED, val: usize) {
 }
 
 #[inline]
-unsafe fn load_ov_internal(ov: *mut OVERLAPPED) -> usize {
+pub(crate) unsafe fn load_ov_internal(ov: *mut OVERLAPPED) -> usize {
     let p = std::ptr::addr_of_mut!((*ov).internal);
     if p.is_aligned() {
         std::sync::atomic::AtomicUsize::from_ptr(p).load(Ordering::Acquire)
@@ -859,7 +859,7 @@ unsafe fn load_ov_internal(ov: *mut OVERLAPPED) -> usize {
 }
 
 #[inline]
-unsafe fn store_ov_internal_high(ov: *mut OVERLAPPED, val: usize) {
+pub(crate) unsafe fn store_ov_internal_high(ov: *mut OVERLAPPED, val: usize) {
     let p = std::ptr::addr_of_mut!((*ov).internal_high);
     if p.is_aligned() {
         std::ptr::write_volatile(p, val);
@@ -869,7 +869,7 @@ unsafe fn store_ov_internal_high(ov: *mut OVERLAPPED, val: usize) {
 }
 
 #[inline]
-unsafe fn load_ov_internal_high(ov: *mut OVERLAPPED) -> usize {
+pub(crate) unsafe fn load_ov_internal_high(ov: *mut OVERLAPPED) -> usize {
     let p = std::ptr::addr_of!((*ov).internal_high);
     if p.is_aligned() {
         std::ptr::read_volatile(p)
@@ -890,9 +890,9 @@ pub(crate) unsafe fn prepare_overlapped_pending(ov: *mut OVERLAPPED) {
     if ov.is_null() {
         return;
     }
+    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
     store_ov_internal_high(ov, 0);
     store_ov_internal(ov, STATUS_PENDING);
-    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
     if !ev.is_null() {
         let ev_h = (ev as usize & !1) as HANDLE;
         if let Some(e) = handles::get_as::<Event>(ev_h) {
@@ -902,9 +902,11 @@ pub(crate) unsafe fn prepare_overlapped_pending(ov: *mut OVERLAPPED) {
 }
 
 unsafe fn complete_overlapped(ov: *mut OVERLAPPED, status: usize, n: usize) {
+    // Snapshot guest fields BEFORE publishing terminal `ov.internal` so a polling caller
+    // that frees or reuses `ov` immediately upon observing completion never races with us.
+    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
     store_ov_internal_high(ov, n);
     store_ov_internal(ov, status);
-    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
     if !ev.is_null() {
         // Low bit set = "don't signal a completion port"; still a valid event.
         let ev = (ev as usize & !1) as HANDLE;
@@ -1245,33 +1247,47 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
             return TRUE;
         }
         if !ov.is_null() {
-            match try_nonblocking_pipe_write(fd, buf as *const u8, n as usize) {
-                Ok(Some(k)) => {
-                    if !written.is_null() {
-                        std::ptr::write_unaligned(written, k as u32);
+            let total = n as usize;
+            let mut written_so_far = 0usize;
+            while written_so_far < total {
+                match try_nonblocking_pipe_write(
+                    fd,
+                    (buf as *const u8).add(written_so_far),
+                    total - written_so_far,
+                ) {
+                    Ok(Some(0)) => {
+                        set_err(err::ERROR_BROKEN_PIPE);
+                        return FALSE;
                     }
-                    complete_overlapped_io(h, ov, STATUS_SUCCESS, k, true);
-                    return TRUE;
-                }
-                Ok(None) => {
-                    f.io_event.reset();
-                    prepare_overlapped_pending(ov);
-                    pipe_reactor().submit(PendingPipeOp::new_write(
-                        h,
-                        Arc::clone(&f),
-                        fd,
-                        buf as usize,
-                        n as usize,
-                        PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
-                    ));
-                    set_err(err::ERROR_IO_PENDING);
-                    return FALSE;
-                }
-                Err(e) => {
-                    set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
-                    return FALSE;
+                    Ok(Some(k)) => {
+                        written_so_far += k;
+                    }
+                    Ok(None) => {
+                        f.io_event.reset();
+                        prepare_overlapped_pending(ov);
+                        pipe_reactor().submit(PendingPipeOp::new_write_at(
+                            h,
+                            Arc::clone(&f),
+                            fd,
+                            buf as usize,
+                            total,
+                            written_so_far,
+                            PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
+                        ));
+                        set_err(err::ERROR_IO_PENDING);
+                        return FALSE;
+                    }
+                    Err(e) => {
+                        set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+                        return FALSE;
+                    }
                 }
             }
+            if !written.is_null() {
+                std::ptr::write_unaligned(written, written_so_far as u32);
+            }
+            complete_overlapped_io(h, ov, STATUS_SUCCESS, written_so_far, true);
+            return TRUE;
         }
         // Synchronous blocking pipe write (write full buffer).
         let mut done = 0usize;
@@ -1499,35 +1515,49 @@ pub unsafe extern "win64" fn WriteFileEx(
             set_err(0);
             return TRUE;
         }
-        match try_nonblocking_pipe_write(fd, buf as *const u8, n as usize) {
-            Ok(Some(k)) => {
-                store_ov_internal_high(ov, k);
-                store_ov_internal(ov, STATUS_SUCCESS);
-                if let Some(cb) = completion_routine {
-                    crate::thread::queue_io_completion_apc(&caller, cb, 0, k as u32, ov as usize);
+        let total = n as usize;
+        let mut written_so_far = 0usize;
+        while written_so_far < total {
+            match try_nonblocking_pipe_write(
+                fd,
+                (buf as *const u8).add(written_so_far),
+                total - written_so_far,
+            ) {
+                Ok(Some(0)) => {
+                    set_err(err::ERROR_BROKEN_PIPE);
+                    return FALSE;
                 }
-                set_err(0);
-                return TRUE;
-            }
-            Ok(None) => {
-                store_ov_internal_high(ov, 0);
-                store_ov_internal(ov, STATUS_PENDING);
-                pipe_reactor().submit(PendingPipeOp::new_write(
-                    h,
-                    Arc::clone(&f),
-                    fd,
-                    buf as usize,
-                    n as usize,
-                    PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
-                ));
-                set_err(0);
-                return TRUE;
-            }
-            Err(e) => {
-                set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
-                return FALSE;
+                Ok(Some(k)) => {
+                    written_so_far += k;
+                }
+                Ok(None) => {
+                    store_ov_internal_high(ov, 0);
+                    store_ov_internal(ov, STATUS_PENDING);
+                    pipe_reactor().submit(PendingPipeOp::new_write_at(
+                        h,
+                        Arc::clone(&f),
+                        fd,
+                        buf as usize,
+                        total,
+                        written_so_far,
+                        PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
+                    ));
+                    set_err(0);
+                    return TRUE;
+                }
+                Err(e) => {
+                    set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+                    return FALSE;
+                }
             }
         }
+        store_ov_internal_high(ov, written_so_far);
+        store_ov_internal(ov, STATUS_SUCCESS);
+        if let Some(cb) = completion_routine {
+            crate::thread::queue_io_completion_apc(&caller, cb, 0, written_so_far as u32, ov as usize);
+        }
+        set_err(0);
+        return TRUE;
     }
 
     let slice = if n == 0 {
@@ -2722,10 +2752,14 @@ pub(crate) unsafe fn complete_overlapped_io(
     if ov.is_null() {
         return false;
     }
+    // Snapshot all guest OVERLAPPED fields BEFORE publishing terminal `ov.internal` so
+    // a polling caller can immediately free/reuse `ov` once `ov.internal != STATUS_PENDING`
+    // without racing with any subsequent guest-memory dereference.
+    let ov_addr = ov as usize;
+    let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
     store_ov_internal_high(ov, bytes);
     store_ov_internal(ov, nt_status);
 
-    let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
     let suppress_iocp = (raw_ev & 1) != 0;
     let ev_h = (raw_ev & !1) as HANDLE;
     if !ev_h.is_null() {
@@ -2766,13 +2800,13 @@ pub(crate) unsafe fn complete_overlapped_io(
         iocp.post(IocpPacket {
             bytes: bytes as u32,
             key,
-            overlapped: ov as usize,
+            overlapped: ov_addr,
             internal_status: nt_status,
         });
         return true;
     }
     if let Some(tp_io) = tp_io_binding {
-        return tp_io.dispatch_completion(ov as usize, ntstatus_to_win32_local(nt_status), bytes);
+        return tp_io.dispatch_completion(ov_addr, ntstatus_to_win32_local(nt_status), bytes);
     }
     false
 }
@@ -4808,6 +4842,11 @@ enum PipeDelivery {
     },
 }
 
+struct PipeOpState {
+    completed: bool,
+    written: usize,
+}
+
 struct PendingPipeOp {
     handle: usize,
     file: Arc<FileObj>,
@@ -4815,7 +4854,11 @@ struct PendingPipeOp {
     kind: PipeOpKind,
     buf: usize,
     len: usize,
-    completed: AtomicBool,
+    /// Serializes reactor guest-buffer I/O with cancellation (`CancelIo`/`CancelIoEx`/`CloseHandle`)
+    /// so completion is published only after no reactor step can touch guest memory again.
+    state: Mutex<PipeOpState>,
+    /// Lock-free mirror of `state.completed` for `reactor.ops.retain` without nesting locks.
+    done: AtomicBool,
     delivery: PipeDelivery,
 }
 
@@ -4828,12 +4871,21 @@ impl PendingPipeOp {
             kind: PipeOpKind::Read,
             buf,
             len,
-            completed: AtomicBool::new(false),
+            state: Mutex::new(PipeOpState { completed: false, written: 0 }),
+            done: AtomicBool::new(false),
             delivery,
         })
     }
 
-    fn new_write(handle: HANDLE, file: Arc<FileObj>, fd: i32, buf: usize, len: usize, delivery: PipeDelivery) -> Arc<Self> {
+    fn new_write_at(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        fd: i32,
+        buf: usize,
+        len: usize,
+        written: usize,
+        delivery: PipeDelivery,
+    ) -> Arc<Self> {
         Arc::new(PendingPipeOp {
             handle: handle as usize,
             file,
@@ -4841,7 +4893,8 @@ impl PendingPipeOp {
             kind: PipeOpKind::Write,
             buf,
             len,
-            completed: AtomicBool::new(false),
+            state: Mutex::new(PipeOpState { completed: false, written }),
+            done: AtomicBool::new(false),
             delivery,
         })
     }
@@ -4858,10 +4911,9 @@ impl PendingPipeOp {
         }
     }
 
-    fn finish_once(&self, nt_status: usize, bytes: usize) -> bool {
-        if self.completed.swap(true, Ordering::AcqRel) {
-            return false;
-        }
+    /// Publish terminal status and notification. Must only be called by the single thread
+    /// that transitioned `self.state.completed` from `false` to `true`, AFTER releasing `self.state`.
+    fn publish_completion(&self, nt_status: usize, bytes: usize) {
         match &self.delivery {
             PipeDelivery::Overlapped { ov, .. } => unsafe {
                 let _ = complete_overlapped_io(
@@ -4882,7 +4934,6 @@ impl PendingPipeOp {
                 }
             },
         }
-        true
     }
 }
 
@@ -4924,7 +4975,20 @@ impl PipeIoReactor {
         };
         let mut count = 0;
         for op in to_cancel {
-            if op.finish_once(STATUS_CANCELLED, 0) {
+            // Wait for any in-progress reactor non-blocking I/O step on `op.buf` to finish
+            // before marking cancelled and publishing completion.
+            let should_publish = {
+                let mut st = op.state.lock().unwrap();
+                if st.completed {
+                    false
+                } else {
+                    st.completed = true;
+                    op.done.store(true, Ordering::Release);
+                    true
+                }
+            };
+            if should_publish {
+                op.publish_completion(STATUS_CANCELLED, 0);
                 count += 1;
             }
         }
@@ -4965,7 +5029,7 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                     pfds.push(libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 });
                     {
                         let mut ops = reactor.ops.lock().unwrap();
-                        ops.retain(|o| !o.completed.load(Ordering::Acquire));
+                        ops.retain(|o| !o.done.load(Ordering::Acquire));
                         for o in ops.iter() {
                             let events = match o.kind {
                                 PipeOpKind::Read => libc::POLLIN,
@@ -4988,64 +5052,96 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                     }
                     for (idx, op) in snap.iter().enumerate() {
                         let revents = pfds[idx + 1].revents;
-                        if revents == 0 || op.completed.load(Ordering::Acquire) {
+                        if revents == 0 || op.done.load(Ordering::Acquire) {
                             continue;
                         }
-                        let ready_result: Option<(usize, usize)> = match op.kind {
-                            PipeOpKind::Read => {
-                                let dst = unsafe { std::slice::from_raw_parts_mut(op.buf as *mut u8, op.len) };
-                                let from_peek = drain_peek_buf(&op.file, dst);
-                                if from_peek > 0 {
-                                    Some((STATUS_SUCCESS, from_peek))
-                                } else {
-                                    match unsafe { try_nonblocking_pipe_read(op.fd, op.buf as *mut u8, op.len) } {
-                                        Ok(Some(0)) => Some((STATUS_PIPE_BROKEN, 0)),
-                                        Ok(Some(got)) => Some((STATUS_SUCCESS, got)),
-                                        Ok(None) => {
-                                            if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                                                Some((STATUS_PIPE_BROKEN, 0))
-                                            } else {
-                                                None
+                        // Hold `op.state` across the entire non-blocking guest buffer access so
+                        // `cancel_ops` cannot publish `STATUS_CANCELLED` while we touch `op.buf`.
+                        let finished: Option<(usize, usize)> = {
+                            let mut st = op.state.lock().unwrap();
+                            if st.completed {
+                                None
+                            } else {
+                                let step_res: Option<(usize, usize)> = match op.kind {
+                                    PipeOpKind::Read => {
+                                        let dst = unsafe { std::slice::from_raw_parts_mut(op.buf as *mut u8, op.len) };
+                                        let from_peek = drain_peek_buf(&op.file, dst);
+                                        if from_peek > 0 {
+                                            Some((STATUS_SUCCESS, from_peek))
+                                        } else {
+                                            match unsafe { try_nonblocking_pipe_read(op.fd, op.buf as *mut u8, op.len) } {
+                                                Ok(Some(0)) => Some((STATUS_PIPE_BROKEN, 0)),
+                                                Ok(Some(got)) => Some((STATUS_SUCCESS, got)),
+                                                Ok(None) => {
+                                                    if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                                                        Some((STATUS_PIPE_BROKEN, 0))
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let w = if e == libc::EPIPE || e == libc::ECONNRESET {
+                                                        err::ERROR_BROKEN_PIPE
+                                                    } else {
+                                                        errno_to_win32(e)
+                                                    };
+                                                    Some((win32_to_ntstatus(w), 0))
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            let w = if e == libc::EPIPE || e == libc::ECONNRESET {
-                                                err::ERROR_BROKEN_PIPE
-                                            } else {
-                                                errno_to_win32(e)
-                                            };
-                                            Some((win32_to_ntstatus(w), 0))
+                                    }
+                                    PipeOpKind::Write => {
+                                        let mut made_progress = false;
+                                        loop {
+                                            let rem = op.len.saturating_sub(st.written);
+                                            if rem == 0 {
+                                                break Some((STATUS_SUCCESS, st.written));
+                                            }
+                                            let ptr = unsafe { (op.buf as *const u8).add(st.written) };
+                                            match unsafe { try_nonblocking_pipe_write(op.fd, ptr, rem) } {
+                                                Ok(Some(0)) => break Some((STATUS_PIPE_BROKEN, st.written)),
+                                                Ok(Some(k)) => {
+                                                    st.written += k;
+                                                    made_progress = true;
+                                                    if st.written >= op.len {
+                                                        break Some((STATUS_SUCCESS, st.written));
+                                                    }
+                                                }
+                                                Ok(None) => {
+                                                    if !made_progress
+                                                        && (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+                                                    {
+                                                        break Some((STATUS_PIPE_BROKEN, st.written));
+                                                    }
+                                                    break None;
+                                                }
+                                                Err(e) => {
+                                                    let w = if e == libc::EPIPE || e == libc::ECONNRESET {
+                                                        err::ERROR_BROKEN_PIPE
+                                                    } else {
+                                                        errno_to_win32(e)
+                                                    };
+                                                    break Some((win32_to_ntstatus(w), st.written));
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
-                            PipeOpKind::Write => {
-                                match unsafe { try_nonblocking_pipe_write(op.fd, op.buf as *const u8, op.len) } {
-                                    Ok(Some(k)) => Some((STATUS_SUCCESS, k)),
-                                    Ok(None) => {
-                                        if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                                            Some((STATUS_PIPE_BROKEN, 0))
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let w = if e == libc::EPIPE || e == libc::ECONNRESET {
-                                            err::ERROR_BROKEN_PIPE
-                                        } else {
-                                            errno_to_win32(e)
-                                        };
-                                        Some((win32_to_ntstatus(w), 0))
-                                    }
+                                };
+                                if let Some(res) = step_res {
+                                    st.completed = true;
+                                    op.done.store(true, Ordering::Release);
+                                    Some(res)
+                                } else {
+                                    None
                                 }
                             }
                         };
-                        if let Some((status, bytes)) = ready_result {
+                        if let Some((status, bytes)) = finished {
                             {
                                 let mut ops = reactor.ops.lock().unwrap();
                                 ops.retain(|o| !Arc::ptr_eq(o, op));
                             }
-                            op.finish_once(status, bytes);
+                            op.publish_completion(status, bytes);
                         }
                     }
                     snap.clear();
@@ -6937,6 +7033,259 @@ mod tests {
             assert_eq!(crate::kernel32::threads::CloseHandle(h_conin), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(h_conout), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(h_null), TRUE);
+        }
+    }
+
+    #[test]
+    fn overlapped_pipe_write_backpressure_full_transfer_writefile_and_writefileex() {
+        use crate::kernel32::threads::CloseHandle;
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        // 512 KiB easily exceeds macOS's 64 KiB kernel pipe buffer, forcing partial non-blocking
+        // writes and multiple POLLOUT wakeups in the pipe reactor.
+        const PAYLOAD_LEN: usize = 512 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| ((i.wrapping_mul(31) ^ (i >> 7)) & 0xFF) as u8).collect();
+
+        unsafe {
+            // 1. Overlapped WriteFile + IOCP: must return ERROR_IO_PENDING on backpressure and
+            // complete only once ALL 512 KiB have been written intact.
+            let (mut rd, mut wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+            let iocp = CreateIoCompletionPort(wr, std::ptr::null_mut(), 0x5120, 1);
+            assert!(!iocp.is_null());
+
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let mut immediate = 0u32;
+            let rc = WriteFile(wr, payload.as_ptr() as *const c_void, PAYLOAD_LEN as u32, &mut immediate, &mut ov);
+            assert_eq!(rc, FALSE, "512 KiB pipe write should go pending under backpressure");
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let rd_addr = rd as usize;
+            let reader = std::thread::spawn(move || {
+                let mut acc = Vec::with_capacity(PAYLOAD_LEN);
+                let mut chunk = [0u8; 4096];
+                while acc.len() < PAYLOAD_LEN {
+                    let mut n = 0u32;
+                    let ok = ReadFile(rd_addr as HANDLE, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut n, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(n > 0);
+                    acc.extend_from_slice(&chunk[..n as usize]);
+                }
+                acc
+            });
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 5000), TRUE);
+            assert_eq!(key, 0x5120);
+            assert_eq!(ov_out, &mut ov as *mut OVERLAPPED);
+            assert_eq!(bytes as usize, PAYLOAD_LEN);
+            let mut res_bytes = 0u32;
+            assert_eq!(GetOverlappedResult(wr, &mut ov, &mut res_bytes, FALSE), TRUE);
+            assert_eq!(res_bytes as usize, PAYLOAD_LEN);
+
+            let received = reader.join().unwrap();
+            assert_eq!(received, payload, "overlapped WriteFile must transfer all 512 KiB intact");
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. WriteFileEx + APC completion routine under the same 512 KiB backpressure.
+            static WFEX_CALLS: AtomicU32 = AtomicU32::new(0);
+            static WFEX_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+            static WFEX_BYTES: AtomicU32 = AtomicU32::new(0);
+            static WFEX_OV: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "win64" fn wfex_cb(err_code: u32, transferred: u32, ov_addr: usize) {
+                WFEX_ERR.store(err_code, Ordering::Release);
+                WFEX_BYTES.store(transferred, Ordering::Release);
+                WFEX_OV.store(ov_addr, Ordering::Release);
+                WFEX_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+
+            WFEX_CALLS.store(0, Ordering::Release);
+            WFEX_ERR.store(u32::MAX, Ordering::Release);
+            WFEX_BYTES.store(0, Ordering::Release);
+            WFEX_OV.store(0, Ordering::Release);
+
+            let (mut rd2, mut wr2) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd2, &mut wr2, std::ptr::null_mut(), 0), TRUE);
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFileEx(wr2, payload.as_ptr() as *const c_void, PAYLOAD_LEN as u32, &mut ov2, Some(wfex_cb)),
+                TRUE
+            );
+            assert_eq!(load_ov_internal(&mut ov2), STATUS_PENDING);
+
+            let rd2_addr = rd2 as usize;
+            let reader2 = std::thread::spawn(move || {
+                let mut acc = Vec::with_capacity(PAYLOAD_LEN);
+                let mut chunk = [0u8; 4096];
+                while acc.len() < PAYLOAD_LEN {
+                    let mut n = 0u32;
+                    let ok = ReadFile(rd2_addr as HANDLE, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut n, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(n > 0);
+                    acc.extend_from_slice(&chunk[..n as usize]);
+                }
+                acc
+            });
+
+            assert_eq!(SleepEx(5000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(WFEX_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(WFEX_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(WFEX_BYTES.load(Ordering::Acquire) as usize, PAYLOAD_LEN);
+            assert_eq!(WFEX_OV.load(Ordering::Acquire), &mut ov2 as *mut OVERLAPPED as usize);
+
+            let received2 = reader2.join().unwrap();
+            assert_eq!(received2, payload, "WriteFileEx must transfer all 512 KiB intact");
+            assert_eq!(CloseHandle(rd2), TRUE);
+            assert_eq!(CloseHandle(wr2), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_cancel_serialized_with_reactor_and_reentry_exactly_once() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        static REENTRY_HANDLE: AtomicUsize = AtomicUsize::new(0);
+        static REENTRY_CALLS: AtomicU32 = AtomicU32::new(0);
+        static REENTRY_CANCEL_RET: AtomicU32 = AtomicU32::new(99);
+        static REENTRY_CANCEL_ERR: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "win64" fn reentry_apc_cb(err_code: u32, _bytes: u32, ov_addr: usize) {
+            assert_eq!(err_code, ERROR_OPERATION_ABORTED);
+            let h = REENTRY_HANDLE.load(Ordering::Acquire) as HANDLE;
+            let rc = CancelIoEx(h, ov_addr as *mut OVERLAPPED);
+            REENTRY_CANCEL_RET.store(rc as u32, Ordering::Release);
+            REENTRY_CANCEL_ERR.store(teb::last_error(), Ordering::Release);
+            REENTRY_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            // (a) Re-entrant CancelIoEx from inside completion callback must not deadlock and
+            // must return FALSE/ERROR_NOT_FOUND, with completion firing strictly once.
+            let (mut rd, mut wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+            REENTRY_HANDLE.store(rd as usize, Ordering::Release);
+            REENTRY_CALLS.store(0, Ordering::Release);
+
+            let mut buf = [0u8; 32];
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ReadFileEx(rd, buf.as_mut_ptr() as *mut c_void, 32, &mut ov, Some(reentry_apc_cb)), TRUE);
+            assert_eq!(CancelIoEx(rd, &mut ov), TRUE);
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(REENTRY_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(REENTRY_CANCEL_RET.load(Ordering::Acquire), FALSE as u32);
+            assert_eq!(REENTRY_CANCEL_ERR.load(Ordering::Acquire), err::ERROR_NOT_FOUND);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // (b) Repeated race between peer WriteFile and CancelIoEx on overlapped ReadFile:
+            // verifies strictly-once IOCP completion, no post-cancel buffer mutation, and safe
+            // immediate reuse/overwrite of OVERLAPPED.h_event once terminal ov.internal is observed.
+            let (mut rd2, mut wr2) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd2, &mut wr2, std::ptr::null_mut(), 0), TRUE);
+            let iocp = CreateIoCompletionPort(rd2, std::ptr::null_mut(), 0xCA01, 1);
+            assert!(!iocp.is_null());
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            let pattern = [0x5Au8; 64];
+            for iter in 0..40usize {
+                let mut rbuf = [0xCCu8; 64];
+                let mut ov_r: OVERLAPPED = std::mem::zeroed();
+                ov_r.h_event = ev;
+                let mut got = 0u32;
+                let r = ReadFile(rd2, rbuf.as_mut_ptr() as *mut c_void, 64, &mut got, &mut ov_r);
+                if r == FALSE {
+                    assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+                    let wr_addr = wr2 as usize;
+                    let writer = std::thread::spawn(move || {
+                        let mut wn = 0u32;
+                        let _ = WriteFile(
+                            wr_addr as HANDLE,
+                            pattern.as_ptr() as *const c_void,
+                            pattern.len() as u32,
+                            &mut wn,
+                            std::ptr::null_mut(),
+                        );
+                    });
+                    if iter % 2 == 0 {
+                        std::thread::yield_now();
+                    }
+                    let cancelled = CancelIoEx(rd2, &mut ov_r);
+
+                    // Wait for terminal ov.internal publication, then immediately clobber h_event
+                    // (simulating caller freeing/reusing OVERLAPPED as soon as internal != STATUS_PENDING).
+                    while load_ov_internal(&mut ov_r) == STATUS_PENDING {
+                        std::thread::yield_now();
+                    }
+                    let final_status = load_ov_internal(&mut ov_r);
+                    let final_bytes = load_ov_internal_high(&mut ov_r);
+                    std::ptr::write_unaligned(
+                        std::ptr::addr_of_mut!(ov_r.h_event),
+                        0xDEAD_BEEFusize as HANDLE,
+                    );
+
+                    // If cancelled, buffer must NEVER be mutated by the reactor afterward.
+                    if final_status == STATUS_CANCELLED {
+                        assert_eq!(cancelled, TRUE);
+                        assert_eq!(final_bytes, 0);
+                        assert!(rbuf.iter().all(|&b| b == 0xCC), "reactor wrote into buffer after STATUS_CANCELLED");
+                    } else {
+                        assert_eq!(final_status, STATUS_SUCCESS);
+                        assert!(final_bytes > 0 && final_bytes <= 64);
+                        assert!(rbuf[..final_bytes].iter().all(|&b| b == 0x5A));
+                    }
+
+                    // Exactly one IOCP completion packet must arrive.
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    let ok = GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000);
+                    assert_eq!(p_key, 0xCA01);
+                    assert_eq!(p_ov, &mut ov_r as *mut OVERLAPPED);
+                    if final_status == STATUS_CANCELLED {
+                        assert_eq!(ok, FALSE);
+                        assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                    } else {
+                        assert_eq!(ok, TRUE);
+                        assert_eq!(p_bytes as usize, final_bytes);
+                    }
+                    assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+                    writer.join().unwrap();
+
+                    // Drain any unread bytes left in pipe before the next iteration.
+                    let mut avail = 0u32;
+                    while PeekNamedPipe(rd2, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) == TRUE && avail > 0 {
+                        let mut drain = [0u8; 64];
+                        let mut dn = 0u32;
+                        let _ = ReadFile(rd2, drain.as_mut_ptr() as *mut c_void, drain.len() as u32, &mut dn, std::ptr::null_mut());
+                    }
+                } else {
+                    // Synchronous completion still posts 1 IOCP packet; dequeue it.
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+                }
+            }
+
+            // Confirm zero duplicate/stray IOCP packets remain.
+            let mut extra_entry: OVERLAPPED_ENTRY = std::mem::zeroed();
+            let mut extra_removed = 0u32;
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut extra_entry, 1, &mut extra_removed, 0, FALSE), FALSE);
+            assert_eq!(teb::last_error(), WAIT_TIMEOUT);
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(CloseHandle(rd2), TRUE);
+            assert_eq!(CloseHandle(wr2), TRUE);
         }
     }
 }

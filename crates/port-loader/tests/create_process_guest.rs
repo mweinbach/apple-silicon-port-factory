@@ -61,11 +61,18 @@ mod macos_guest_process_tests {
         code.extend_from_slice(&disp.to_le_bytes());
     }
 
-    /// Build a minimal valid PE32+ x86-64 console executable:
-    /// - If `sleep_loop` is false: reads stdin, writes `"OUT:" + stdin` to stdout,
-    ///   reads env `"CHILD_TAG"`, writes `"ERR:" + env` to stderr, calls `ExitProcess(exit_code)`.
-    /// - If `sleep_loop` is true: calls `Sleep(60000)` then `ExitProcess(0)` (for TerminateProcess test).
-    fn build_guest_pe(exit_code: u32, sleep_mode: bool) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum GuestMode {
+        /// Reads stdin -> stdout ("OUT:..."), reads CHILD_TAG -> stderr ("ERR:..."), calls ExitProcess(exit_code).
+        EchoExit,
+        /// Returns `exit_code` directly from the PE entrypoint (no ExitProcess call).
+        ReturnEntry,
+        /// Calls Sleep(60000) then ExitProcess(exit_code) (for TerminateProcess test).
+        Sleep,
+    }
+
+    /// Build a minimal valid PE32+ x86-64 console executable for the requested mode.
+    fn build_guest_pe(exit_code: u32, mode: GuestMode) -> Vec<u8> {
         let mut img = vec![0u8; 0xC00];
 
         // DOS header
@@ -173,17 +180,26 @@ mod macos_guest_process_tests {
         // sub rsp, 0x38
         code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
 
-        if sleep_mode {
-            // mov ecx, 60000
-            code.push(0xB9);
-            code.extend_from_slice(&60_000u32.to_le_bytes());
-            emit_call_rip(&mut code, 0x1000, IAT_SLEEP);
-            // mov ecx, exit_code
-            code.push(0xB9);
-            code.extend_from_slice(&exit_code.to_le_bytes());
-            emit_call_rip(&mut code, 0x1000, IAT_EXIT_PROCESS);
-            code.push(0xC3);
-        } else {
+        match mode {
+            GuestMode::Sleep => {
+                // mov ecx, 60000
+                code.push(0xB9);
+                code.extend_from_slice(&60_000u32.to_le_bytes());
+                emit_call_rip(&mut code, 0x1000, IAT_SLEEP);
+                // mov ecx, exit_code
+                code.push(0xB9);
+                code.extend_from_slice(&exit_code.to_le_bytes());
+                emit_call_rip(&mut code, 0x1000, IAT_EXIT_PROCESS);
+                code.push(0xC3);
+            }
+            GuestMode::ReturnEntry => {
+                // mov eax, exit_code; add rsp, 0x38; ret
+                code.push(0xB8);
+                code.extend_from_slice(&exit_code.to_le_bytes());
+                code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]);
+                code.push(0xC3);
+            }
+            GuestMode::EchoExit => {
             // hStdin = GetStdHandle(-10)
             code.extend_from_slice(&[0xB9, 0xF6, 0xFF, 0xFF, 0xFF]);
             emit_call_rip(&mut code, 0x1000, IAT_GET_STD_HANDLE);
@@ -253,6 +269,7 @@ mod macos_guest_process_tests {
             code.extend_from_slice(&exit_code.to_le_bytes());
             emit_call_rip(&mut code, 0x1000, IAT_EXIT_PROCESS);
             code.push(0xC3);
+            }
         }
 
         assert!(code.len() <= 0x400);
@@ -279,9 +296,15 @@ mod macos_guest_process_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let guest_exe = dir.join("guest_echo.exe");
-        std::fs::write(&guest_exe, build_guest_pe(42, false)).unwrap();
+        std::fs::write(&guest_exe, build_guest_pe(42, GuestMode::EchoExit)).unwrap();
+        let exit256_exe = dir.join("guest_exit_256.exe");
+        std::fs::write(&exit256_exe, build_guest_pe(0x0000_0100, GuestMode::EchoExit)).unwrap();
+        let exit_ntstatus_exe = dir.join("guest_exit_c0000005.exe");
+        std::fs::write(&exit_ntstatus_exe, build_guest_pe(0xC000_0005, GuestMode::EchoExit)).unwrap();
+        let return_entry_exe = dir.join("guest_return_entry.exe");
+        std::fs::write(&return_entry_exe, build_guest_pe(0x1234_5678, GuestMode::ReturnEntry)).unwrap();
         let sleep_exe = dir.join("guest_sleep.exe");
-        std::fs::write(&sleep_exe, build_guest_pe(0, true)).unwrap();
+        std::fs::write(&sleep_exe, build_guest_pe(0, GuestMode::Sleep)).unwrap();
         let bad_exe = dir.join("not_a_pe.exe");
         std::fs::write(&bad_exe, b"not a valid pe binary").unwrap();
 
@@ -334,6 +357,60 @@ mod macos_guest_process_tests {
             for h in [in_wr, out_rd, err_rd] {
                 assert_eq!(SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0), TRUE);
             }
+
+            // Reject PROC_THREAD_ATTRIBUTE_HANDLE_LIST containing an extra non-stdio pipe handle BEFORE spawning.
+            let (mut extra_rd, mut extra_wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut extra_rd, &mut extra_wr, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+            assert_eq!(SetHandleInformation(extra_rd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT), TRUE);
+            let mut bad_attr_sz = 0usize;
+            assert_eq!(InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bad_attr_sz), FALSE);
+            let mut bad_attr_buf = vec![0u8; bad_attr_sz];
+            assert_eq!(
+                InitializeProcThreadAttributeList(bad_attr_buf.as_mut_ptr() as *mut c_void, 1, 0, &mut bad_attr_sz),
+                TRUE
+            );
+            let mut bad_inherit_list: [HANDLE; 4] = [in_rd, out_wr, err_wr, extra_rd];
+            assert_eq!(
+                UpdateProcThreadAttribute(
+                    bad_attr_buf.as_mut_ptr() as *mut c_void,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    bad_inherit_list.as_mut_ptr() as *mut c_void,
+                    std::mem::size_of_val(&bad_inherit_list),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            let mut si_bad_list = [0u8; 112];
+            (si_bad_list.as_mut_ptr() as *mut u32).write_unaligned(112);
+            (si_bad_list.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+            (si_bad_list.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(in_rd);
+            (si_bad_list.as_mut_ptr().add(88) as *mut HANDLE).write_unaligned(out_wr);
+            (si_bad_list.as_mut_ptr().add(96) as *mut HANDLE).write_unaligned(err_wr);
+            (si_bad_list.as_mut_ptr().add(104) as *mut *mut c_void)
+                .write_unaligned(bad_attr_buf.as_mut_ptr() as *mut c_void);
+            let app_bad_list = to_wide_z("P:\\guest_echo.exe");
+            let mut pi_bad_list = [0u8; 24];
+            assert_eq!(
+                CreateProcessW(
+                    app_bad_list.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    TRUE,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    si_bad_list.as_mut_ptr() as *mut c_void,
+                    pi_bad_list.as_mut_ptr() as *mut c_void,
+                ),
+                FALSE
+            );
+            assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+            DeleteProcThreadAttributeList(bad_attr_buf.as_mut_ptr() as *mut c_void);
+            assert_eq!(CloseHandle(extra_rd), TRUE);
+            assert_eq!(CloseHandle(extra_wr), TRUE);
 
             // Build PROC_THREAD_ATTRIBUTE_HANDLE_LIST via Initialize/UpdateProcThreadAttributeList.
             let mut attr_sz = 0usize;
@@ -453,7 +530,61 @@ mod macos_guest_process_tests {
             assert_eq!(CloseHandle(h_thread), TRUE);
             assert_eq!(CloseHandle(h_proc), TRUE);
 
-            // Test TerminateProcess on a sleeping guest child process.
+            // Full 32-bit exit code preservation across ExitProcess(>255), normal entrypoint return,
+            // and TerminateProcess(>255).
+            for (win_exe, expected_code) in [
+                ("P:\\guest_exit_256.exe", 0x0000_0100u32),
+                ("P:\\guest_exit_c0000005.exe", 0xC000_0005u32),
+                ("P:\\guest_return_entry.exe", 0x1234_5678u32),
+            ] {
+                let (mut r_in, mut w_in) = (std::ptr::null_mut(), std::ptr::null_mut());
+                let (mut r_out, mut w_out) = (std::ptr::null_mut(), std::ptr::null_mut());
+                let (mut r_err, mut w_err) = (std::ptr::null_mut(), std::ptr::null_mut());
+                assert_eq!(CreatePipe(&mut r_in, &mut w_in, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+                assert_eq!(CreatePipe(&mut r_out, &mut w_out, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+                assert_eq!(CreatePipe(&mut r_err, &mut w_err, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+                let mut si_c = [0u8; 104];
+                (si_c.as_mut_ptr() as *mut u32).write_unaligned(104);
+                (si_c.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+                (si_c.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(r_in);
+                (si_c.as_mut_ptr().add(88) as *mut HANDLE).write_unaligned(w_out);
+                (si_c.as_mut_ptr().add(96) as *mut HANDLE).write_unaligned(w_err);
+                let exe_w = to_wide_z(win_exe);
+                let mut pi_c = [0u8; 24];
+                assert_eq!(
+                    CreateProcessW(
+                        exe_w.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        TRUE,
+                        CREATE_NO_WINDOW,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si_c.as_mut_ptr() as *mut c_void,
+                        pi_c.as_mut_ptr() as *mut c_void,
+                    ),
+                    TRUE,
+                    "CreateProcessW({win_exe}) failed with {}",
+                    GetLastError()
+                );
+                assert_eq!(CloseHandle(r_in), TRUE);
+                assert_eq!(CloseHandle(w_out), TRUE);
+                assert_eq!(CloseHandle(w_err), TRUE);
+                assert_eq!(CloseHandle(w_in), TRUE);
+                let hp = (pi_c.as_ptr() as *const HANDLE).read_unaligned();
+                let ht = (pi_c.as_ptr().add(8) as *const HANDLE).read_unaligned();
+                assert_eq!(WaitForSingleObject(hp, 15_000), WAIT_OBJECT_0);
+                let mut got_code = 0u32;
+                assert_eq!(GetExitCodeProcess(hp, &mut got_code), TRUE);
+                assert_eq!(got_code, expected_code, "32-bit exit code mismatch for {win_exe}");
+                assert_eq!(CloseHandle(r_out), TRUE);
+                assert_eq!(CloseHandle(r_err), TRUE);
+                assert_eq!(CloseHandle(ht), TRUE);
+                assert_eq!(CloseHandle(hp), TRUE);
+            }
+
+            // Test TerminateProcess with a full 32-bit exit code (>255) on a sleeping guest child process.
             let sleep_w = to_wide_z("P:\\guest_sleep.exe");
             let mut pi2 = [0u8; 24];
             assert_eq!(
@@ -476,10 +607,10 @@ mod macos_guest_process_tests {
             let mut code2 = 0u32;
             assert_eq!(GetExitCodeProcess(h_proc2, &mut code2), TRUE);
             assert_eq!(code2, STILL_ACTIVE);
-            assert_eq!(TerminateProcess(h_proc2, 99), TRUE);
+            assert_eq!(TerminateProcess(h_proc2, 0xDEAD_BEEF), TRUE);
             assert_eq!(WaitForSingleObject(h_proc2, 5_000), WAIT_OBJECT_0);
             assert_eq!(GetExitCodeProcess(h_proc2, &mut code2), TRUE);
-            assert_eq!(code2, 99);
+            assert_eq!(code2, 0xDEAD_BEEF);
             assert_eq!(CloseHandle(h_thread2), TRUE);
             assert_eq!(CloseHandle(h_proc2), TRUE);
         }

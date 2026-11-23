@@ -1069,6 +1069,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if let Ok(cur_exe) = std::env::current_exe() {
         w::process::set_runner_exe(cur_exe);
     }
+    w::process::init_exit_code_channel();
     raise_fd_limit();
 
     x86_runtime::exe::set_gs_reader(w::teb::gs_read);

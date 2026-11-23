@@ -1001,18 +1001,38 @@ pub unsafe extern "win64" fn UnregisterWait(wait_handle: HANDLE) -> BOOL {
 // Threadpool I/O (CreateThreadpoolIo / StartThreadpoolIo / CancelThreadpoolIo)
 // ---------------------------------------------------------------------------
 
+struct TpIoState {
+    /// Started I/O operations (`StartThreadpoolIo`) that have not yet transitioned
+    /// into a queued callback or been cancelled via `CancelThreadpoolIo`.
+    pending_io: usize,
+    /// Completion callbacks queued on the threadpool worker queue (not yet started).
+    queued_callbacks: usize,
+    /// Completion callbacks currently executing on a threadpool worker thread.
+    running_callbacks: usize,
+    /// Monotonic generation bumped by `WaitForThreadpoolIoCallbacks(pio, TRUE)` to
+    /// cancel queued (not-yet-started) callbacks.
+    generation: u64,
+    /// Number of threads currently inside `WaitForThreadpoolIoCallbacks(pio, TRUE)`.
+    cancel_waiters: usize,
+}
+
+impl TpIoState {
+    fn is_idle(&self) -> bool {
+        self.pending_io == 0 && self.queued_callbacks == 0 && self.running_callbacks == 0
+    }
+}
+
 pub struct TpIo {
     file: SendPtr,
     cb: usize,
     ctx: SendPtr,
-    pending: std::sync::atomic::AtomicUsize,
-    active_callbacks: Pending,
-    generation: AtomicU64,
+    state: Mutex<TpIoState>,
+    cv: Condvar,
 }
 
 impl TpIo {
     /// Dispatch a completed overlapped I/O operation onto the threadpool if
-    /// `StartThreadpoolIo` was called (`pending > 0`).
+    /// `StartThreadpoolIo` was called (`pending_io > 0`).
     ///
     /// Exact Windows `PTP_WIN32_IO_CALLBACK` signature:
     /// `void CALLBACK IoCompletionCallback(PTP_CALLBACK_INSTANCE Instance, PVOID Context,
@@ -1023,36 +1043,62 @@ impl TpIo {
         io_result_win32: u32,
         bytes: usize,
     ) -> bool {
-        let decremented = self
-            .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
-            .is_ok();
-        if !decremented {
-            return false;
-        }
-        let gen = self.generation.load(Ordering::Acquire);
+        let gen = {
+            let mut st = self.state.lock().unwrap();
+            if st.pending_io == 0 {
+                return false;
+            }
+            st.pending_io -= 1;
+            if st.cancel_waiters > 0 {
+                // Active `WaitForThreadpoolIoCallbacks(pio, TRUE)` cancels callbacks that
+                // have not yet started to execute without cancelling the underlying I/O.
+                if st.is_idle() {
+                    self.cv.notify_all();
+                }
+                return true;
+            }
+            // Atomically hand off `pending_io` -> `queued_callbacks` under the same lock
+            // so `WaitForThreadpoolIoCallbacks(pio, FALSE)` can never observe an idle gap.
+            st.queued_callbacks += 1;
+            st.generation
+        };
         let arc = Arc::clone(self);
         let raw = Arc::as_ptr(&arc) as u64;
-        arc.active_callbacks.inc();
         submit(Box::new(move || {
-            if arc.generation.load(Ordering::Acquire) == gen {
-                unsafe {
-                    with_callback_instance(|inst| {
-                        crate::call_guest8(
-                            arc.cb,
-                            inst as u64,
-                            arc.ctx.0 as u64,
-                            overlapped as u64,
-                            io_result_win32 as u64,
-                            bytes as u64,
-                            raw,
-                            0,
-                            0,
-                        );
-                    });
+            let should_run = {
+                let mut st = arc.state.lock().unwrap();
+                if st.generation != gen {
+                    // Already cancelled & removed from `queued_callbacks` by `WaitForThreadpoolIoCallbacks(pio, TRUE)`.
+                    false
+                } else {
+                    st.queued_callbacks -= 1;
+                    st.running_callbacks += 1;
+                    true
                 }
+            };
+            if !should_run {
+                return;
             }
-            arc.active_callbacks.dec();
+            unsafe {
+                with_callback_instance(|inst| {
+                    crate::call_guest8(
+                        arc.cb,
+                        inst as u64,
+                        arc.ctx.0 as u64,
+                        overlapped as u64,
+                        io_result_win32 as u64,
+                        bytes as u64,
+                        raw,
+                        0,
+                        0,
+                    );
+                });
+            }
+            let mut st = arc.state.lock().unwrap();
+            st.running_callbacks -= 1;
+            if st.is_idle() {
+                arc.cv.notify_all();
+            }
         }));
         true
     }
@@ -1072,9 +1118,14 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
         file: SendPtr(fl),
         cb: pfnio as usize,
         ctx: SendPtr(pv),
-        pending: std::sync::atomic::AtomicUsize::new(0),
-        active_callbacks: Pending::new(),
-        generation: AtomicU64::new(0),
+        state: Mutex::new(TpIoState {
+            pending_io: 0,
+            queued_callbacks: 0,
+            running_callbacks: 0,
+            generation: 0,
+            cancel_waiters: 0,
+        }),
+        cv: Condvar::new(),
     });
     if let Err(e) = crate::kernel32::file::bind_threadpool_io(fl, Arc::clone(&arc)) {
         crate::teb::set_last_error(e);
@@ -1085,15 +1136,17 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
 
 pub unsafe extern "win64" fn StartThreadpoolIo(pio: *mut TpIo) {
     if !pio.is_null() {
-        (*pio).pending.fetch_add(1, Ordering::AcqRel);
+        (*pio).state.lock().unwrap().pending_io += 1;
     }
 }
 
 pub unsafe extern "win64" fn CancelThreadpoolIo(pio: *mut TpIo) {
     if !pio.is_null() {
-        let _ = (*pio)
-            .pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
+        let mut st = (*pio).state.lock().unwrap();
+        st.pending_io = st.pending_io.saturating_sub(1);
+        if st.is_idle() {
+            (*pio).cv.notify_all();
+        }
     }
 }
 
@@ -1101,11 +1154,23 @@ pub unsafe extern "win64" fn WaitForThreadpoolIoCallbacks(pio: *mut TpIo, cancel
     if pio.is_null() {
         return;
     }
-    if cancel_pending != 0 {
-        (*pio).generation.fetch_add(1, Ordering::AcqRel);
-        (*pio).pending.store(0, Ordering::Release);
+    let cancel = cancel_pending != 0;
+    let mut st = (*pio).state.lock().unwrap();
+    if cancel {
+        // Per Win32 docs: `fCancelPendingCallbacks == TRUE` cancels queued callbacks that
+        // have not yet started to execute, and does NOT cancel underlying pending I/O.
+        st.cancel_waiters += 1;
+        if st.queued_callbacks > 0 {
+            st.generation = st.generation.wrapping_add(1);
+            st.queued_callbacks = 0;
+        }
     }
-    (*pio).active_callbacks.wait_zero();
+    while !st.is_idle() {
+        st = (*pio).cv.wait(st).unwrap();
+    }
+    if cancel {
+        st.cancel_waiters -= 1;
+    }
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolIo(pio: *mut TpIo) {
@@ -1145,12 +1210,13 @@ mod tests {
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
             StartThreadpoolIo(pio);
-            assert_eq!((*pio).pending.load(Ordering::Acquire), 1);
+            assert_eq!((*pio).state.lock().unwrap().pending_io, 1);
             CancelThreadpoolIo(pio);
-            assert_eq!((*pio).pending.load(Ordering::Acquire), 0);
+            assert_eq!((*pio).state.lock().unwrap().pending_io, 0);
             StartThreadpoolIo(pio);
+            CancelThreadpoolIo(pio);
             WaitForThreadpoolIoCallbacks(pio, TRUE);
-            assert_eq!((*pio).pending.load(Ordering::Acquire), 0);
+            assert_eq!((*pio).state.lock().unwrap().pending_io, 0);
             CloseThreadpoolIo(pio);
 
             // After CloseThreadpoolIo, handle is detached and can bind an IOCP cleanly.
@@ -1460,6 +1526,191 @@ mod tests {
             for ev in events {
                 assert_eq!(CloseHandle(ev), TRUE);
             }
+        }
+    }
+
+    #[test]
+    fn threadpool_io_wait_covers_pending_io_to_callback_and_cancel_distinction() {
+        use crate::kernel32::file::{
+            CancelIoEx, CreatePipe, GetOverlappedResult, ReadFile, WriteFile, OVERLAPPED,
+            STATUS_PENDING,
+        };
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, SetEvent, WaitForSingleObject};
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        struct GateCbState {
+            entered_ev: usize,
+            release_ev: usize,
+            use_gate: AtomicBool,
+            calls: AtomicU32,
+            last_err: AtomicU32,
+            finished_flag: AtomicBool,
+        }
+
+        unsafe extern "win64" fn gated_io_cb(
+            _inst: *mut c_void,
+            ctx: *mut c_void,
+            _ov: *mut c_void,
+            io_result: u32,
+            _bytes: usize,
+            _pio: *mut c_void,
+        ) {
+            let st = &*(ctx as *const GateCbState);
+            if st.use_gate.load(Ordering::Acquire) {
+                SetEvent(st.entered_ev as HANDLE);
+                assert_eq!(WaitForSingleObject(st.release_ev as HANDLE, 5_000), WAIT_OBJECT_0);
+            }
+            st.last_err.store(io_result, Ordering::Release);
+            st.calls.fetch_add(1, Ordering::AcqRel);
+            st.finished_flag.store(true, Ordering::Release);
+        }
+
+        unsafe {
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+
+            let entered_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let release_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let waiter_done_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let waiter_started_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let st = Box::new(GateCbState {
+                entered_ev: entered_ev as usize,
+                release_ev: release_ev as usize,
+                use_gate: AtomicBool::new(true),
+                calls: AtomicU32::new(0),
+                last_err: AtomicU32::new(u32::MAX),
+                finished_flag: AtomicBool::new(false),
+            });
+
+            let pio = CreateThreadpoolIo(
+                rd,
+                gated_io_cb as *const c_void,
+                &*st as *const GateCbState as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert!(!pio.is_null());
+
+            // (a) WaitForThreadpoolIoCallbacks(pio, FALSE) must block across the entire
+            // pending I/O -> queued callback -> running callback lifecycle with zero gap.
+            let mut ov1: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf1 = [0u8; 16];
+            let mut got1 = 0u32;
+            StartThreadpoolIo(pio);
+            assert_eq!(ReadFile(rd, rbuf1.as_mut_ptr() as *mut c_void, 16, &mut got1, &mut ov1), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_IO_PENDING);
+
+            let pio_addr = pio as usize;
+            let ws_addr = waiter_started_ev as usize;
+            let wd_addr = waiter_done_ev as usize;
+            let waiter1 = std::thread::spawn(move || {
+                SetEvent(ws_addr as HANDLE);
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, FALSE);
+                SetEvent(wd_addr as HANDLE);
+            });
+            assert_eq!(WaitForSingleObject(waiter_started_ev, 2_000), WAIT_OBJECT_0);
+            // Waiter must still be blocked while ReadFile is pending.
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 50), WAIT_TIMEOUT);
+
+            // Trigger I/O completion: callback enters and blocks on release_ev.
+            let mut w = 0u32;
+            assert_eq!(WriteFile(wr, b"gate1".as_ptr() as *const c_void, 5, &mut w, std::ptr::null_mut()), TRUE);
+            assert_eq!(WaitForSingleObject(entered_ev, 3_000), WAIT_OBJECT_0);
+            // Waiter must STILL be blocked while callback is running (no gap between pending_io and callback).
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 50), WAIT_TIMEOUT);
+            assert!(!st.finished_flag.load(Ordering::Acquire));
+
+            // Release callback gate; waiter unblocks only after callback finishes.
+            assert_eq!(SetEvent(release_ev), TRUE);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 3_000), WAIT_OBJECT_0);
+            waiter1.join().unwrap();
+            assert!(st.finished_flag.load(Ordering::Acquire));
+            assert_eq!(st.calls.load(Ordering::Acquire), 1);
+            assert_eq!(st.last_err.load(Ordering::Acquire), 0);
+
+            // (b) WaitForThreadpoolIoCallbacks(pio, TRUE) cancels queued callbacks but does NOT
+            // cancel underlying pending I/O; explicit CancelIoEx aborts the pipe read and suppresses the callback.
+            assert_eq!(ResetEvent(waiter_started_ev), TRUE);
+            assert_eq!(ResetEvent(waiter_done_ev), TRUE);
+            st.use_gate.store(false, Ordering::Release);
+
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf2 = [0u8; 16];
+            let mut got2 = 0u32;
+            StartThreadpoolIo(pio);
+            assert_eq!(ReadFile(rd, rbuf2.as_mut_ptr() as *mut c_void, 16, &mut got2, &mut ov2), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_IO_PENDING);
+
+            let waiter2 = std::thread::spawn(move || {
+                SetEvent(ws_addr as HANDLE);
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, TRUE);
+                SetEvent(wd_addr as HANDLE);
+            });
+            assert_eq!(WaitForSingleObject(waiter_started_ev, 2_000), WAIT_OBJECT_0);
+            // TRUE waiter stays blocked because underlying ReadFile is still pending (NOT cancelled by WaitForThreadpoolIoCallbacks).
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 50), WAIT_TIMEOUT);
+            assert_eq!(crate::kernel32::file::load_ov_internal(&mut ov2), STATUS_PENDING);
+
+            // Now explicitly cancel the underlying I/O with CancelIoEx.
+            assert_eq!(CancelIoEx(rd, &mut ov2), TRUE);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 3_000), WAIT_OBJECT_0);
+            waiter2.join().unwrap();
+            let mut n2 = 0u32;
+            assert_eq!(GetOverlappedResult(rd, &mut ov2, &mut n2, FALSE), FALSE);
+            assert_eq!(crate::teb::last_error(), 995); // ERROR_OPERATION_ABORTED
+            // Callback was suppressed by active fCancelPendingCallbacks == TRUE waiter.
+            assert_eq!(st.calls.load(Ordering::Acquire), 1);
+
+            // (c) Unmatched StartThreadpoolIo (e.g. submission failure / skip-completion) is balanced by CancelThreadpoolIo.
+            assert_eq!(ResetEvent(waiter_started_ev), TRUE);
+            assert_eq!(ResetEvent(waiter_done_ev), TRUE);
+            StartThreadpoolIo(pio);
+            let waiter3 = std::thread::spawn(move || {
+                SetEvent(ws_addr as HANDLE);
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, FALSE);
+                SetEvent(wd_addr as HANDLE);
+            });
+            assert_eq!(WaitForSingleObject(waiter_started_ev, 2_000), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 50), WAIT_TIMEOUT);
+            CancelThreadpoolIo(pio);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 3_000), WAIT_OBJECT_0);
+            waiter3.join().unwrap();
+
+            // (d) Direct queued-callback cancellation when a callback is queued while cancel_waiters == 0,
+            // then cancelled via WaitForThreadpoolIoCallbacks(pio, TRUE) before it runs.
+            // Hold a running callback on the gate, force a queued item via state check, and verify cancellation.
+            assert_eq!(ResetEvent(entered_ev), TRUE);
+            assert_eq!(ResetEvent(release_ev), TRUE);
+            assert_eq!(ResetEvent(waiter_started_ev), TRUE);
+            assert_eq!(ResetEvent(waiter_done_ev), TRUE);
+            st.use_gate.store(true, Ordering::Release);
+            let mut ov3: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf3 = [0u8; 16];
+            let mut got3 = 0u32;
+            StartThreadpoolIo(pio);
+            assert_eq!(WriteFile(wr, b"run!".as_ptr() as *const c_void, 4, &mut w, std::ptr::null_mut()), TRUE);
+            assert_eq!(ReadFile(rd, rbuf3.as_mut_ptr() as *mut c_void, 4, &mut got3, &mut ov3), TRUE);
+            assert_eq!(WaitForSingleObject(entered_ev, 3_000), WAIT_OBJECT_0);
+            // WaitForThreadpoolIoCallbacks(pio, TRUE) must still wait for the already-running callback to finish.
+            let waiter4 = std::thread::spawn(move || {
+                SetEvent(ws_addr as HANDLE);
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, TRUE);
+                SetEvent(wd_addr as HANDLE);
+            });
+            assert_eq!(WaitForSingleObject(waiter_started_ev, 2_000), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 50), WAIT_TIMEOUT);
+            assert_eq!(SetEvent(release_ev), TRUE);
+            assert_eq!(WaitForSingleObject(waiter_done_ev, 3_000), WAIT_OBJECT_0);
+            waiter4.join().unwrap();
+            assert_eq!(st.calls.load(Ordering::Acquire), 2);
+
+            CloseThreadpoolIo(pio);
+            assert_eq!(CloseHandle(entered_ev), TRUE);
+            assert_eq!(CloseHandle(release_ev), TRUE);
+            assert_eq!(CloseHandle(waiter_started_ev), TRUE);
+            assert_eq!(CloseHandle(waiter_done_ev), TRUE);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
         }
     }
 }

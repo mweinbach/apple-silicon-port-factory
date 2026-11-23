@@ -6,17 +6,17 @@
 //! `ioctlsocket`/`WSAIoctl`, `select`/`WSAPoll`, and errno -> WSAE* error codes.
 
 use crate::kernel32::file::{
-    complete_overlapped_io, external_io_event, get_file, prepare_overlapped_pending,
-    register_external_cancel_hook, register_external_io_handle, unregister_external_io_handle,
-    win32_to_ntstatus, INVALID_HANDLE_VALUE, OVERLAPPED, STATUS_CANCELLED, STATUS_PENDING,
-    STATUS_SUCCESS,
+    complete_overlapped_io, external_io_event, get_file, load_ov_internal, load_ov_internal_high,
+    prepare_overlapped_pending, register_external_cancel_hook, register_external_io_handle,
+    store_ov_internal, store_ov_internal_high, unregister_external_io_handle, win32_to_ntstatus,
+    INVALID_HANDLE_VALUE, OVERLAPPED, STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::types::*;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
@@ -1600,7 +1600,11 @@ pub unsafe extern "win64" fn WSASend(
             std::ptr::write_unaligned(sent, n as u32);
         }
         let tid = crate::kernel32::threads::GetCurrentThreadId();
-        let cur_thread = crate::thread::current_thread_object();
+        let cur_thread = if !completion.is_null() {
+            Some(crate::thread::ensure_current_thread_object())
+        } else {
+            crate::thread::current_thread_object()
+        };
         finish_overlapped_op(
             s,
             ov as usize,
@@ -1623,7 +1627,11 @@ pub unsafe extern "win64" fn WSASend(
             poll_events: libc::POLLOUT,
             overlapped: ov as usize,
             issuing_tid: crate::kernel32::threads::GetCurrentThreadId(),
-            issuing_thread: crate::thread::current_thread_object(),
+            issuing_thread: if !completion.is_null() {
+                Some(crate::thread::ensure_current_thread_object())
+            } else {
+                crate::thread::current_thread_object()
+            },
             completion_routine: completion as usize,
             kind: AsyncOpKind::Send {
                 bufs,
@@ -1684,7 +1692,11 @@ pub unsafe extern "win64" fn WSASendTo(
             std::ptr::write_unaligned(sent, n as u32);
         }
         let tid = crate::kernel32::threads::GetCurrentThreadId();
-        let cur_thread = crate::thread::current_thread_object();
+        let cur_thread = if !completion.is_null() {
+            Some(crate::thread::ensure_current_thread_object())
+        } else {
+            crate::thread::current_thread_object()
+        };
         finish_overlapped_op(
             s,
             ov as usize,
@@ -1707,7 +1719,11 @@ pub unsafe extern "win64" fn WSASendTo(
             poll_events: libc::POLLOUT,
             overlapped: ov as usize,
             issuing_tid: crate::kernel32::threads::GetCurrentThreadId(),
-            issuing_thread: crate::thread::current_thread_object(),
+            issuing_thread: if !completion.is_null() {
+                Some(crate::thread::ensure_current_thread_object())
+            } else {
+                crate::thread::current_thread_object()
+            },
             completion_routine: completion as usize,
             kind: AsyncOpKind::Send {
                 bufs,
@@ -1794,7 +1810,11 @@ pub unsafe extern "win64" fn WSARecv(
                 std::ptr::write_unaligned(recvd, got as u32);
             }
             let tid = crate::kernel32::threads::GetCurrentThreadId();
-            let cur_thread = crate::thread::current_thread_object();
+            let cur_thread = if !completion.is_null() {
+                Some(crate::thread::ensure_current_thread_object())
+            } else {
+                crate::thread::current_thread_object()
+            };
             finish_overlapped_op(
                 s,
                 ov as usize,
@@ -1816,7 +1836,11 @@ pub unsafe extern "win64" fn WSARecv(
                 poll_events: libc::POLLIN,
                 overlapped: ov as usize,
                 issuing_tid: crate::kernel32::threads::GetCurrentThreadId(),
-                issuing_thread: crate::thread::current_thread_object(),
+                issuing_thread: if !completion.is_null() {
+                    Some(crate::thread::ensure_current_thread_object())
+                } else {
+                    crate::thread::current_thread_object()
+                },
                 completion_routine: completion as usize,
                 kind: AsyncOpKind::Recv {
                     bufs,
@@ -1905,7 +1929,11 @@ pub unsafe extern "win64" fn WSARecvFrom(
             std::ptr::write_unaligned(recvd, n as u32);
         }
         let tid = crate::kernel32::threads::GetCurrentThreadId();
-        let cur_thread = crate::thread::current_thread_object();
+        let cur_thread = if !completion.is_null() {
+            Some(crate::thread::ensure_current_thread_object())
+        } else {
+            crate::thread::current_thread_object()
+        };
         finish_overlapped_op(
             s,
             ov as usize,
@@ -1928,7 +1956,11 @@ pub unsafe extern "win64" fn WSARecvFrom(
             poll_events: libc::POLLIN,
             overlapped: ov as usize,
             issuing_tid: crate::kernel32::threads::GetCurrentThreadId(),
-            issuing_thread: crate::thread::current_thread_object(),
+            issuing_thread: if !completion.is_null() {
+                Some(crate::thread::ensure_current_thread_object())
+            } else {
+                crate::thread::current_thread_object()
+            },
             completion_routine: completion as usize,
             kind: AsyncOpKind::Recv {
                 bufs,
@@ -1956,9 +1988,7 @@ pub unsafe extern "win64" fn WSAGetOverlappedResult(
     if ov.is_null() {
         return err(WSAEFAULT, FALSE);
     }
-    let load_internal = || {
-        AtomicUsize::from_ptr(std::ptr::addr_of_mut!((*ov).internal)).load(Ordering::Acquire)
-    };
+    let load_internal = || load_ov_internal(ov);
     let mut status = load_internal();
     if status == STATUS_PENDING {
         if f_wait == 0 {
@@ -1996,7 +2026,7 @@ pub unsafe extern "win64" fn WSAGetOverlappedResult(
         }
         status = load_internal();
     }
-    let bytes = std::ptr::read_volatile(std::ptr::addr_of!((*ov).internal_high)) as u32;
+    let bytes = load_ov_internal_high(ov) as u32;
     if !cb_transfer.is_null() {
         std::ptr::write_unaligned(cb_transfer, bytes);
     }
@@ -3082,9 +3112,9 @@ unsafe fn prepare_socket_pending(s: usize, ov: *mut OVERLAPPED, completion_routi
     }
     if completion_routine != 0 {
         // When a completion routine is provided, OVERLAPPED.hEvent is ignored by Windows.
-        std::ptr::write_volatile(std::ptr::addr_of_mut!((*ov).internal_high), 0);
-        AtomicUsize::from_ptr(std::ptr::addr_of_mut!((*ov).internal))
-            .store(STATUS_PENDING, Ordering::Release);
+        // Use the shared alignment-safe OVERLAPPED helpers without touching hEvent.
+        store_ov_internal_high(ov, 0);
+        store_ov_internal(ov, STATUS_PENDING);
     } else {
         prepare_overlapped_pending(ov);
         let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
@@ -3111,9 +3141,8 @@ unsafe fn finish_overlapped_op(
     }
     let ov_ptr = ov as *mut OVERLAPPED;
     if completion_routine != 0 {
-        std::ptr::write_volatile(std::ptr::addr_of_mut!((*ov_ptr).internal_high), bytes);
-        AtomicUsize::from_ptr(std::ptr::addr_of_mut!((*ov_ptr).internal))
-            .store(nt_status, Ordering::Release);
+        store_ov_internal_high(ov_ptr, bytes);
+        store_ov_internal(ov_ptr, nt_status);
         let wsa_err = ntstatus_to_wsa(nt_status);
         let target = issuing_thread
             .cloned()
@@ -5290,6 +5319,135 @@ mod tests {
             assert_eq!(shutdown(acc, 2), 0);
 
             assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(srv), 0);
+        }
+    }
+
+    #[test]
+    fn unaligned_overlapped_completion_routine_ignores_event() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        static APC_CALLS: AtomicU32 = AtomicU32::new(0);
+        static APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static APC_BYTES: AtomicU32 = AtomicU32::new(0);
+        static APC_OV: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "win64" fn wsa_completion_cb(err_code: u32, bytes: u32, ov: usize) {
+            APC_ERR.store(err_code, Ordering::Release);
+            APC_BYTES.store(bytes, Ordering::Release);
+            APC_OV.store(ov, Ordering::Release);
+            APC_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            let mut wsadata = [0u8; 408];
+            assert_eq!(WSAStartup(0x0202, wsadata.as_mut_ptr()), 0);
+
+            let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            assert_ne!(srv, INVALID_SOCKET);
+            let mut sa = loopback_sa(0);
+            assert_eq!(bind(srv, sa.as_ptr(), 16), 0);
+            assert_eq!(listen(srv, 4), 0);
+            let mut slen = 16i32;
+            assert_eq!(getsockname(srv, sa.as_mut_ptr(), &mut slen), 0);
+
+            let cli = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            assert_ne!(cli, INVALID_SOCKET);
+            assert_eq!(connect(cli, sa.as_ptr(), 16), 0);
+            let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+            assert_ne!(acc, INVALID_SOCKET);
+
+            // Odd-aligned OVERLAPPED buffer (1-byte offset inside 64-byte storage).
+            let mut raw_ov = [0u8; 64];
+            let unaligned_ov = raw_ov.as_mut_ptr().add(1) as *mut OVERLAPPED;
+            assert_ne!((unaligned_ov as usize) % std::mem::align_of::<OVERLAPPED>(), 0);
+
+            // Populate h_event with a real non-signaled manual-reset event: Windows ignores
+            // hEvent when a completion routine is provided, so it must never be signaled.
+            let ignored_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ignored_ev.is_null());
+            let mut init_ov: OVERLAPPED = std::mem::zeroed();
+            init_ov.h_event = ignored_ev;
+            std::ptr::write_unaligned(unaligned_ov, init_ov);
+
+            APC_CALLS.store(0, Ordering::Release);
+            APC_ERR.store(u32::MAX, Ordering::Release);
+            APC_BYTES.store(0, Ordering::Release);
+            APC_OV.store(0, Ordering::Release);
+
+            // 1. Pending WSARecv on odd-aligned OVERLAPPED with completion routine.
+            let mut rbuf_mem = [0u8; 32];
+            let rwb = WsaBuf { len: rbuf_mem.len() as u32, buf: rbuf_mem.as_mut_ptr() };
+            let mut rbytes = 0u32;
+            let mut rflags = 0u32;
+            assert_eq!(
+                WSARecv(
+                    acc,
+                    &rwb,
+                    1,
+                    &mut rbytes,
+                    &mut rflags,
+                    unaligned_ov as *mut c_void,
+                    wsa_completion_cb as *mut c_void,
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            // WSAGetOverlappedResult(f_wait=FALSE) on odd-aligned pending OVERLAPPED reports WSA_IO_INCOMPLETE.
+            let mut xfer = 0u32;
+            let mut out_flags = 0u32;
+            assert_eq!(WSAGetOverlappedResult(acc, unaligned_ov, &mut xfer, FALSE, &mut out_flags), FALSE);
+            assert_eq!(WSAGetLastError(), WSA_IO_INCOMPLETE as i32);
+
+            // Send payload from peer to complete the pending WSARecv.
+            let payload = b"unaligned-ov-ok!";
+            assert_eq!(send(cli, payload.as_ptr(), payload.len() as i32, 0), payload.len() as i32);
+
+            // Deliver completion routine via alertable wait.
+            assert_eq!(SleepEx(3000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire) as usize, payload.len());
+            assert_eq!(APC_OV.load(Ordering::Acquire), unaligned_ov as usize);
+            assert_eq!(&rbuf_mem[..payload.len()], payload);
+
+            // Ignored hEvent must remain unsignaled!
+            assert_eq!(WaitForSingleObject(ignored_ev, 0), crate::types::WAIT_TIMEOUT);
+
+            // WSAGetOverlappedResult must read the odd-aligned OVERLAPPED safely.
+            assert_eq!(WSAGetOverlappedResult(acc, unaligned_ov, &mut xfer, FALSE, &mut out_flags), TRUE);
+            assert_eq!(xfer as usize, payload.len());
+
+            // 2. Immediate WSASend on odd-aligned OVERLAPPED with completion routine also preserves ignored hEvent.
+            APC_CALLS.store(0, Ordering::Release);
+            let reply = b"reply-unaligned";
+            let swb = WsaBuf { len: reply.len() as u32, buf: reply.as_ptr() as *mut u8 };
+            let mut sbytes = 0u32;
+            assert_eq!(
+                WSASend(
+                    acc,
+                    &swb,
+                    1,
+                    &mut sbytes,
+                    0,
+                    unaligned_ov as *mut c_void,
+                    wsa_completion_cb as *mut c_void,
+                ),
+                0
+            );
+            assert_eq!(SleepEx(3000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire) as usize, reply.len());
+            assert_eq!(APC_OV.load(Ordering::Acquire), unaligned_ov as usize);
+            assert_eq!(WaitForSingleObject(ignored_ev, 0), crate::types::WAIT_TIMEOUT);
+
+            assert_eq!(CloseHandle(ignored_ev), TRUE);
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(cli), 0);
             assert_eq!(closesocket(srv), 0);
         }
     }
