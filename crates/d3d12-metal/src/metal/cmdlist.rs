@@ -31,13 +31,33 @@ use std::sync::{Arc, Mutex};
 
 pub type MtlAllocator = ProtocolObject<dyn MTL4CommandAllocator>;
 
-/// On iOS (6 GiB unified Jetsam limit), reuse `IcbRing` and GPU-written `icb_scratch`
-/// across closed render passes (rewound strictly after `endEncoding()`, synchronized by a
-/// cross-encoder `barrierAfterQueueStages(Vertex|Fragment, Vertex|Dispatch)`).
+/// Read a default-ON boolean feature knob with a universal `PORT_*` primary env var
+/// and optional legacy `AW2_*` alias (`=0` disables; unset or anything else enables).
+#[inline]
+fn env_flag_default_on(primary: &str, legacy: &str) -> bool {
+    std::env::var_os(primary)
+        .or_else(|| std::env::var_os(legacy))
+        .is_none_or(|v| v != "0")
+}
+
+/// Read a default-OFF boolean feature knob with a universal `PORT_*` primary env var
+/// and optional legacy `AW2_*` alias (`=1` enables; unset or anything else disables).
+#[inline]
+fn env_flag_default_off(primary: &str, legacy: &str) -> bool {
+    std::env::var_os(primary)
+        .or_else(|| std::env::var_os(legacy))
+        .is_some_and(|v| v == "1")
+}
+
+/// Reuse `IcbRing` and GPU-written `icb_scratch` across closed render passes (rewound
+/// strictly after `endEncoding()`, synchronized by a cross-encoder
+/// `barrierAfterQueueStages(All, Vertex|Dispatch)`). Default ON on iOS (`PORT_REUSE_ICB=0`
+/// / `PORT_IOS_REUSE_ICB=0` disables; `PORT_REUSE_ICB=1` enables on macOS).
 fn icb_reuse_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("PORT_IOS_REUSE_ICB")
+        std::env::var_os("PORT_REUSE_ICB")
+            .or_else(|| std::env::var_os("PORT_IOS_REUSE_ICB"))
             .map(|v| v != "0")
             .unwrap_or(cfg!(target_os = "ios"))
     })
@@ -90,7 +110,7 @@ impl CommandAllocator {
             a: d.dev.newCommandAllocator()?,
             kind,
             ring: Arc::default(),
-            icb_scratch: Arc::default(),
+            icb_scratch: Arc::new(Mutex::new(UploadRing::new_gpu_scratch())),
             rt_keep: Arc::default(),
             icbs: Arc::default(),
         })
@@ -506,12 +526,12 @@ pub(crate) fn opt_fast_bind_pso_env() -> bool {
     super::pipeline::fast_bind_pso()
 }
 
-/// Default OFF (`AW2_EMPTY_ENC_ELIDE=1` enables): elide closed command lists that
-/// recorded zero GPU encoders/timestamps/resolves (`L0`/`L1`/`L2`) while keeping
-/// `qw_elided` intact, and narrow `FullWhy::ListStart` on `Blit`-first lists (`L3#0`).
+/// Default ON (`PORT_EMPTY_ENC_ELIDE=0` / `AW2_EMPTY_ENC_ELIDE=0` disables): elide closed
+/// command lists that recorded zero GPU encoders/timestamps/resolves while keeping
+/// `qw_elided` intact, and narrow `FullWhy::ListStart` on `Blit`-first lists.
 pub(crate) fn opt_empty_enc_elide_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_EMPTY_ENC_ELIDE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_on("PORT_EMPTY_ENC_ELIDE", "AW2_EMPTY_ENC_ELIDE"))
 }
 
 /// Default ON (`AW2_UAV0_CLEAR_OVERLAP=0` disables): overlap standalone non-UAV
@@ -590,13 +610,13 @@ pub(crate) fn opt_mid_qb_stagesync_env() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_MID_QB_STAGESYNC").is_none_or(|v| v != "0"))
 }
 
-/// Default OFF (`AW2_RO_DSV_DONTCARE=1` enables): use `MTLStoreAction::DontCare` on loaded
-/// read-only depth (`DSV_READ_ONLY_DEPTH`) and stencil (`DSV_READ_ONLY_STENCIL`) planes in
-/// `draw_encoder()` and omit read-only DSVs from `pass_targets` -> `written` while keeping
-/// them in `sync_targets` for `begin_barrier`.
+/// Default ON (`PORT_RO_DSV_DONTCARE=0` / `AW2_RO_DSV_DONTCARE=0` disables): use
+/// `MTLStoreAction::DontCare` on loaded read-only depth (`DSV_READ_ONLY_DEPTH`) and stencil
+/// (`DSV_READ_ONLY_STENCIL`) planes in `draw_encoder()` and omit read-only DSVs from
+/// `pass_targets` -> `written` while keeping them in `sync_targets` for `begin_barrier`.
 pub(crate) fn opt_ro_dsv_dontcare_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_RO_DSV_DONTCARE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_on("PORT_RO_DSV_DONTCARE", "AW2_RO_DSV_DONTCARE"))
 }
 
 /// Default ON (`AW2_SPLIT_RES_SOFT_SYNC=0` disables): dimension-impossible state-bit
@@ -780,23 +800,30 @@ pub(crate) fn opt_cs_mid_qb_res_defer_v5_env() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_CS_MID_QB_RES_DEFER_V5").is_some_and(|v| v == "1"))
 }
 
-/// Default OFF (`AW2_ICB_ENC_BARRIER_EXACT=1` enables): zero-salt `flush_draw_batch` /
-/// `execute_indirect_icb` intra-render-encoder barrier narrowing (`Vertex -> Vertex` when
-/// depth-only `ps == None`, `Vertex -> Vertex | Fragment` otherwise, omitting unused
-/// `Object | Mesh` stages on classic `GraphicsPipeline` ICBs) plus keeping unattached
-/// non-SIMUL texture `-> STATE_COMMON` transitions inside open draw passes (`icb_enc_barrier_exact`).
+/// Default ON (`PORT_ICB_ENC_BARRIER_EXACT=0` / `AW2_ICB_ENC_BARRIER_EXACT=0` disables):
+/// zero-salt `flush_draw_batch` / `execute_indirect_icb` intra-render-encoder barrier
+/// narrowing (`Vertex -> Vertex` when depth-only `ps == None`, `Vertex -> Vertex | Fragment`
+/// otherwise, omitting unused `Object | Mesh` stages on classic `GraphicsPipeline` ICBs) plus
+/// keeping unattached non-SIMUL texture `-> STATE_COMMON` transitions inside open draw passes
+/// (`icb_enc_barrier_exact`).
 pub(crate) fn opt_icb_enc_barrier_exact_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_on("PORT_ICB_ENC_BARRIER_EXACT", "AW2_ICB_ENC_BARRIER_EXACT"))
 }
 
-/// Default OFF (`AW2_ICB_PREPASS_COMPUTE=1` enables): expand batched indirect ICB draws in a
-/// compute pre-pass (`aw2_ei_icb_prep_batch` + `aw2_ei_icb_v3_clamped` / `aw2_ei_icb_v3`) before
-/// opening the render pass when no draw pass is open yet, eliminating in-pass `Point` vertex draws
-/// and in-pass `Vertex -> Vertex|Fragment` intra-encoder barriers (`icb_prepass_cs`).
+/// Default ON on iOS (`PORT_ICB_PREPASS_COMPUTE=0/1` / `AW2_ICB_PREPASS_COMPUTE=0/1`
+/// overrides): expand batched indirect ICB draws in a compute pre-pass (`aw2_ei_icb_prep_batch`
+/// + `aw2_ei_icb_v3_clamped` / `aw2_ei_icb_v3`) before opening the render pass when no draw
+/// pass is open yet, clamping threadgroups to the live GPU count and eliminating in-pass
+/// `Point` vertex draws and intra-encoder barriers (`icb_prepass_cs`).
 pub(crate) fn opt_icb_prepass_compute_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_ICB_PREPASS_COMPUTE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_ICB_PREPASS_COMPUTE")
+            .or_else(|| std::env::var_os("AW2_ICB_PREPASS_COMPUTE"))
+            .map(|v| v != "0")
+            .unwrap_or(cfg!(target_os = "ios"))
+    })
 }
 
 /// Default OFF (`AW2_DESC_TABLE_CS_FAST=1` enables): per-list lock-free `CsBindCache` + single-lock
@@ -807,21 +834,22 @@ pub(crate) fn opt_desc_table_cs_fast_env() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_DESC_TABLE_CS_FAST").is_some_and(|v| v == "1"))
 }
 
-/// Default OFF (`AW2_RP_SPLIT_EXACT_KEEP=1` enables): lazy `OMSetRenderTargets` split deferral
-/// (`open_rtvs`/`open_dsv`/`had_target_rebind` coalescing 0-draw RT rebinds) + exact per-resource
-/// graphics UAV hazard disambiguation + unattached non-SIMUL buffer write->`COMMON` keep
-/// (`rp_split_exact_keep`).
+/// Default ON (`PORT_RP_SPLIT_EXACT_KEEP=0` / `AW2_RP_SPLIT_EXACT_KEEP=0` disables): lazy
+/// `OMSetRenderTargets` split deferral (`open_rtvs`/`open_dsv`/`had_target_rebind` coalescing
+/// 0-draw RT rebinds) + exact per-resource graphics UAV hazard disambiguation + unattached
+/// non-SIMUL buffer write->`COMMON` keep (`rp_split_exact_keep`).
 pub(crate) fn opt_rp_split_exact_keep_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_RP_SPLIT_EXACT_KEEP").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_on("PORT_RP_SPLIT_EXACT_KEEP", "AW2_RP_SPLIT_EXACT_KEEP"))
 }
 
-/// Default OFF (`AW2_CLEAR_CS_TILE4=1` enables): vectorized `uint4` buffer UAV clears
-/// (`aw2_fill_v4`), 2x2-pixel-per-thread texture clear kernels (`aw2_clear_*_t4`), and
-/// format-sorted `compute_clear_batch` PSO deduplication (`clear_cs_tile4`).
+/// Default ON (`PORT_CLEAR_CS_TILE4=0` / `AW2_CLEAR_CS_TILE4=0` disables): vectorized `uint4`
+/// buffer UAV clears (`aw2_fill_v4`), 2x2-pixel-per-thread texture clear kernels
+/// (`aw2_clear_*_t4`), and format-sorted `compute_clear_batch` PSO deduplication
+/// (`clear_cs_tile4`).
 pub(crate) fn opt_clear_cs_tile4_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_CLEAR_CS_TILE4").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_on("PORT_CLEAR_CS_TILE4", "AW2_CLEAR_CS_TILE4"))
 }
 
 /// Default OFF (`AW2_LIST_BOUNDARY_OVERLAP=1` enables): per-stage `StageSync::pre_list_stages`
@@ -989,12 +1017,20 @@ pub(crate) fn opt_gfx_overlap_frag_cap_env() -> bool {
     *ON.get_or_init(|| std::env::var_os("AW2_GFX_OVERLAP_FRAG_CAP").is_some_and(|v| v == "1"))
 }
 
-/// Default OFF (`AW2_CS_BIND_INTRA_SAFE=1` enables): 2-tier generation-invalidated `CsBindCache`
-/// + single-lock `with_resource_registry` + intra-encoder `HK_*` & class exactness strictly
-/// decoupled from `try_v3_defer` (`cs_bind_intra_safe`).
+/// Default ON (`PORT_CS_BIND_CACHE=0` disables): pure-CPU 2-tier generation-invalidated
+/// `CsBindCache` + single-lock `with_resource_registry` compute slot resolution (zero
+/// barrier-semantic changes; eliminates repeated `resolve_slots_with_reg` overhead).
+pub(crate) fn opt_cs_bind_cache_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_flag_default_on("PORT_CS_BIND_CACHE", "AW2_CS_BIND_CACHE"))
+}
+
+/// Default OFF (`PORT_CS_BIND_INTRA_SAFE=1` / `AW2_CS_BIND_INTRA_SAFE=1` enables): 2-tier
+/// generation-invalidated `CsBindCache` + single-lock `with_resource_registry` + intra-encoder
+/// `HK_*` & class exactness strictly decoupled from `try_v3_defer` (`cs_bind_intra_safe`).
 pub(crate) fn opt_cs_bind_intra_safe_env() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_CS_BIND_INTRA_SAFE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| env_flag_default_off("PORT_CS_BIND_INTRA_SAFE", "AW2_CS_BIND_INTRA_SAFE"))
 }
 
 /// Misaligned non-zero sentinel resource keys representing prior-list `Fragment` texture / buffer
@@ -1510,6 +1546,7 @@ enum DrawOp {
         ex: Option<Retained<super::indirect_icb::MtlRenderPso>>,
         params_va: u64,
         max_count: u32,
+        location: u32,
         icb: Retained<super::indirect_icb::MtlIcb>,
         range_out: u64,
         args_va: u64,
@@ -2459,6 +2496,7 @@ pub struct CommandList {
     pub(crate) opt_sm66_handle_kind_v2: bool,
     pub(crate) opt_ps_to_cs_hk_overlap: bool,
     pub(crate) opt_gfx_overlap_frag_cap: bool,
+    pub(crate) opt_cs_bind_cache: bool,
     pub(crate) opt_cs_bind_intra_safe: bool,
     #[cfg(test)]
     pub(crate) test_force_frag_buf_write: Option<bool>,
@@ -2803,6 +2841,7 @@ impl CommandList {
             opt_sm66_handle_kind_v2: opt_sm66_handle_kind_v2_env(),
             opt_ps_to_cs_hk_overlap: opt_ps_to_cs_hk_overlap_env(),
             opt_gfx_overlap_frag_cap: opt_gfx_overlap_frag_cap_env(),
+            opt_cs_bind_cache: opt_cs_bind_cache_env(),
             opt_cs_bind_intra_safe: opt_cs_bind_intra_safe_env(),
             #[cfg(test)]
             test_force_frag_buf_write: None,
@@ -15540,64 +15579,66 @@ impl CommandList {
         if slots.is_empty() {
             return true;
         }
-        for &slot in slots {
-            match slot {
-                super::pipeline::ComputeBind::RootVa { param } => {
-                    let Some(va) = root.param_u64(param as usize) else {
-                        return false;
-                    };
-                    if va != 0 {
-                        let ok = match spans.as_deref_mut() {
-                            Some(sp) => reg.push_buffer_span(va, 0, out, sp),
-                            None => reg.push_buffer_va(va, out),
+        super::resource::with_buf_va_cache(|cache| {
+            for &slot in slots {
+                match slot {
+                    super::pipeline::ComputeBind::RootVa { param } => {
+                        let Some(va) = root.param_u64(param as usize) else {
+                            return false;
                         };
-                        if !ok {
+                        if va != 0 {
+                            let ok = match spans.as_deref_mut() {
+                                Some(sp) => reg.push_buffer_span_cached(cache, va, 0, out, sp),
+                                None => reg.push_buffer_va_cached(cache, va, out),
+                            };
+                            if !ok {
+                                return false;
+                            }
+                        }
+                    }
+                    super::pipeline::ComputeBind::TableEntry { param, byte_offset } => {
+                        let Some(base_gpu) = root.param_u64(param as usize) else {
+                            return false;
+                        };
+                        if base_gpu == 0 {
+                            continue;
+                        }
+                        let Some((hbase, hlen, hcpu)) = heap0 else {
+                            return false;
+                        };
+                        let Some(entry_gpu) = base_gpu.checked_add(byte_offset) else {
+                            return false;
+                        };
+                        if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen) {
                             return false;
                         }
-                    }
-                }
-                super::pipeline::ComputeBind::TableEntry { param, byte_offset } => {
-                    let Some(base_gpu) = root.param_u64(param as usize) else {
-                        return false;
-                    };
-                    if base_gpu == 0 {
-                        continue;
-                    }
-                    let Some((hbase, hlen, hcpu)) = heap0 else {
-                        return false;
-                    };
-                    let Some(entry_gpu) = base_gpu.checked_add(byte_offset) else {
-                        return false;
-                    };
-                    if entry_gpu < hbase || entry_gpu.saturating_add(24) > hbase.saturating_add(hlen) {
-                        return false;
-                    }
-                    let entry_off = (entry_gpu - hbase) as usize;
-                    let (gpu_va, tex_id, meta) = unsafe {
-                        let p = (hcpu + entry_off) as *const u64;
-                        (p.read_unaligned(), p.add(1).read_unaligned(), p.add(2).read_unaligned())
-                    };
-                    if gpu_va != 0 {
-                        let found = match spans.as_deref_mut() {
-                            Some(sp) => reg.push_buffer_span(gpu_va, meta & 0xffff_ffff, out, sp),
-                            None => reg.push_buffer_va(gpu_va, out),
+                        let entry_off = (entry_gpu - hbase) as usize;
+                        let (gpu_va, tex_id, meta) = unsafe {
+                            let p = (hcpu + entry_off) as *const u64;
+                            (p.read_unaligned(), p.add(1).read_unaligned(), p.add(2).read_unaligned())
                         };
-                        if !found {
-                            return false;
-                        }
-                    } else if tex_id != 0 {
-                        let Some(rk) = reg.lookup_texture_id(tex_id) else { return false };
-                        if !out.contains(&rk) {
-                            out.push(rk);
-                        }
-                        if let Some(sp) = spans.as_deref_mut() {
-                            push_subrange(sp, SubRange::whole(rk));
+                        if gpu_va != 0 {
+                            let found = match spans.as_deref_mut() {
+                                Some(sp) => reg.push_buffer_span_cached(cache, gpu_va, meta & 0xffff_ffff, out, sp),
+                                None => reg.push_buffer_va_cached(cache, gpu_va, out),
+                            };
+                            if !found {
+                                return false;
+                            }
+                        } else if tex_id != 0 {
+                            let Some(rk) = reg.lookup_texture_id(tex_id) else { return false };
+                            if !out.contains(&rk) {
+                                out.push(rk);
+                            }
+                            if let Some(sp) = spans.as_deref_mut() {
+                                push_subrange(sp, SubRange::whole(rk));
+                            }
                         }
                     }
                 }
             }
-        }
-        true
+            true
+        })
     }
 
     fn extract_compute_slot_tokens(
@@ -15708,15 +15749,21 @@ impl CommandList {
             let has_any_slots = uav_slots.is_some_and(|s| !s.is_empty())
                 || read_slots.is_some_and(|s| !s.is_empty())
                 || (want_bounded && !pso.access.bounded_read_slots.is_empty());
-            let (uav_exact, full_read_exact, bounded_read_exact) = if (opt_cache_mode || has_any_slots)
+            let use_bind_cache = opt_cache_mode || self.opt_cs_bind_cache;
+            // Tier-1 generation check requires `bump_desc_heap_gen()` on every descriptor copy;
+            // keep it gated to `opt_cs_bind_intra_safe` so default `opt_cs_bind_cache` uses
+            // atomic-free Tier-2 token matching with zero global cache-line contention in
+            // `CopyDescriptorsSimple`.
+            let want_gen_cache = self.opt_cs_bind_intra_safe;
+            let (uav_exact, full_read_exact, bounded_read_exact) = if (use_bind_cache || has_any_slots)
                 && !pso.access.heap_indexed_or_unknown
             {
                 let pso_ptr = Arc::as_ptr(&pso) as usize;
                 let reg_gen = super::resource::res_registry_gen();
-                let desc_gen = if self.opt_cs_bind_intra_safe { super::descriptor::desc_heap_gen() } else { 0 };
+                let desc_gen = if want_gen_cache { super::descriptor::desc_heap_gen() } else { 0 };
                 let root_gen = self.compute_root.bind_gen;
                 let heap0_base = self.heaps[0];
-                if self.opt_cs_bind_intra_safe
+                if want_gen_cache
                     && self.cs_bind_cache.matches_gen(
                         pso_ptr,
                         want_spans,
@@ -15736,7 +15783,17 @@ impl CommandList {
                         scratch_read_spans.clear();
                         scratch_read_spans.extend_from_slice(&self.cs_bind_cache.read_spans);
                     }
-                    stats::inc(&stats::c::cs_bind_intra_safe);
+                    if self.opt_cs_bind_intra_safe {
+                        stats::inc(&stats::c::cs_bind_intra_safe);
+                    } else if self.opt_cs_fast_bind_exact {
+                        stats::inc(&stats::c::cs_fast_bind_exact);
+                    } else if self.opt_desc_table_cs_fast {
+                        stats::inc(&stats::c::desc_table_cs_fast);
+                    } else if self.opt_cs_intra_barrier_exact {
+                        stats::inc(&stats::c::cs_intra_barrier_exact);
+                    } else if self.opt_cs_intra_barrier_v2 {
+                        stats::inc(&stats::c::cs_intra_barrier_v2);
+                    }
                     (
                         self.cs_bind_cache.uav_exact,
                         self.cs_bind_cache.full_read_exact,
@@ -15776,10 +15833,12 @@ impl CommandList {
                             scratch_read_spans.clear();
                             scratch_read_spans.extend_from_slice(&self.cs_bind_cache.read_spans);
                         }
-                        if self.opt_cs_bind_intra_safe {
+                        if want_gen_cache {
                             self.cs_bind_cache.desc_gen = desc_gen;
                             self.cs_bind_cache.root_gen = root_gen;
                             self.cs_bind_cache.heap0_base = heap0_base;
+                        }
+                        if self.opt_cs_bind_intra_safe {
                             stats::inc(&stats::c::cs_bind_intra_safe);
                         } else if self.opt_cs_fast_bind_exact {
                             stats::inc(&stats::c::cs_fast_bind_exact);
@@ -17186,15 +17245,17 @@ impl CommandList {
                     self.compute()
                 };
                 if let (Some(ce), Some(ring_arc)) = (ce_opt, self.ring.clone()) {
+                    let scratch_arc = self.icb_scratch.clone().unwrap_or_else(|| ring_arc.clone());
                     let mut clamped_jobs: Vec<(u64, u64)> = Vec::new();
                     let mut prep_items: Vec<super::indirect_icb::PrepItem> = Vec::new();
                     let mut direct_jobs: Vec<(u64, u32)> = Vec::new();
                     {
-                        let mut ring = ring_arc.lock().unwrap();
+                        let mut scratch = scratch_arc.lock().unwrap();
                         for seg in &segs {
                             if let DrawOp::Icb {
                                 params_va,
                                 max_count,
+                                location,
                                 range_out,
                                 count_va,
                                 pred_va,
@@ -17203,14 +17264,14 @@ impl CommandList {
                             } = &seg.op
                             {
                                 if (*count_va != 0 || *pred_va != 0) && *max_count > 64 {
-                                    if let Ok((ind_out, _)) = ring.alloc(16, 16) {
+                                    if let Ok((ind_out, _)) = scratch.alloc(16, 16) {
                                         prep_items.push(super::indirect_icb::PrepItem {
                                             count: *count_va,
                                             pred: *pred_va,
                                             range_out: *range_out,
                                             ind_out,
                                             max_count: *max_count,
-                                            location: 0,
+                                            location: *location,
                                             pred_op: *pred_op,
                                             _pad: 0,
                                         });
@@ -19039,6 +19100,7 @@ impl CommandList {
                         ex: None,
                         params_va: params,
                         max_count,
+                        location: q.location,
                         icb,
                         range_out: q.range_out,
                         args_va: args,
@@ -19166,6 +19228,7 @@ impl CommandList {
                     ex: Some(ex),
                     params_va: params,
                     max_count,
+                    location: q.location,
                     icb,
                     range_out: q.range_out,
                     args_va: args,
@@ -21666,8 +21729,8 @@ mod tests {
         if std::env::var_os("AW2_BARRIER_TIGHT_V2").is_none() {
             assert!(!super::opt_barrier_tight_v2_env());
         }
-        if std::env::var_os("AW2_EMPTY_ENC_ELIDE").is_none() {
-            assert!(!super::opt_empty_enc_elide_env());
+        if std::env::var_os("PORT_EMPTY_ENC_ELIDE").is_none() && std::env::var_os("AW2_EMPTY_ENC_ELIDE").is_none() {
+            assert!(super::opt_empty_enc_elide_env());
         }
         // Promoted g35 winners (`AW2_SUBMIT_COALESCE`, `AW2_COPY_QUEUE_LIGHT`) MUST default ON.
         if std::env::var_os("AW2_SUBMIT_COALESCE").is_none() {
@@ -21683,25 +21746,25 @@ mod tests {
         if std::env::var_os("AW2_SHADER_PSO_OPT_V2").is_none() {
             assert!(!crate::metal::pipeline::shader_pso_opt_v2());
         }
-        // Promoted g36_B winner (`AW2_CLEAR_CS_EXACT_SYNC`) MUST default ON; non-promoted g36 knobs stay OFF.
+        // Promoted winners MUST default ON; non-promoted knobs stay OFF.
         if std::env::var_os("AW2_CLEAR_CS_EXACT_SYNC").is_none() {
             assert!(super::opt_clear_cs_exact_sync_env());
         }
         if std::env::var_os("AW2_MSC_COMPUTE_ACCESS").is_none() {
             assert!(!crate::metal::pipeline::msc_compute_access());
         }
-        if std::env::var_os("AW2_PRESENT_BLIT_NARROW").is_none() {
-            assert!(!crate::metal::swapchain::present_blit_narrow());
+        if std::env::var_os("PORT_PRESENT_BLIT_NARROW").is_none() && std::env::var_os("AW2_PRESENT_BLIT_NARROW").is_none() {
+            assert!(crate::metal::swapchain::present_blit_narrow());
         }
-        if std::env::var_os("AW2_ICB_FAST_V3").is_none() {
-            assert!(!crate::metal::indirect_icb::fast_v3());
+        if std::env::var_os("PORT_ICB_FAST_V3").is_none() && std::env::var_os("AW2_ICB_FAST_V3").is_none() {
+            assert!(crate::metal::indirect_icb::fast_v3());
         }
-        // g37 & g38 non-promoted knobs remain default OFF (`== "1"`).
+        // g37 non-promoted knob remains default OFF (`== "1"`).
         if std::env::var_os("AW2_FENCE_SIGNAL_COALESCE").is_none() {
             assert!(!crate::metal::queue::fence_signal_coalesce());
         }
-        if std::env::var_os("AW2_RO_DSV_DONTCARE").is_none() {
-            assert!(!super::opt_ro_dsv_dontcare_env());
+        if std::env::var_os("PORT_RO_DSV_DONTCARE").is_none() && std::env::var_os("AW2_RO_DSV_DONTCARE").is_none() {
+            assert!(super::opt_ro_dsv_dontcare_env());
         }
         // g39_D promoted knobs MUST default to ON (`!= "0"`).
         if std::env::var_os("AW2_RENDER_SPLIT_STAGE_SYNC").is_none() {
@@ -26287,7 +26350,7 @@ mod tests {
         //    whereas legacy `v.flags & 0x3 != 0x3` falsely treated it as written!
         l.barrier_list_with(&[Barrier::Transition(d32_id, STATE_DEPTH_WRITE, STATE_DEPTH_READ)], true, false);
         let dc2 = stats::c::ro_dsv_dontcare.load(Relaxed);
-        l.set_render_targets(Vec::new(), Some(d32_ro));
+        l.set_render_targets(vec![rtv_c], Some(d32_ro));
         l.set_graphics_pipeline(pso_ro_d32);
         l.set_viewports(vec![MTLViewport { originX: 0.0, originY: 0.0, width: 8.0, height: 8.0, znear: 0.25, zfar: 1.0 }]);
         l.draw(3, 1, 0, 0).unwrap();
@@ -26449,6 +26512,7 @@ mod tests {
         l.opt_ib_exact_obl = true;
 
         let _stats_guard = gpu_stats_lock();
+        l.opt_icb_enc_barrier_exact = false;
         l.begin(&alloc).unwrap();
         l.pt = pt::PassLog::acquire();
 
@@ -30926,6 +30990,7 @@ mod tests {
             let mut l = CommandList::new(ListType::Direct).unwrap();
             l.opt_ps_srv_class_exact = exact_on;
             l.opt_gfx_desc_table_exact = false;
+            l.opt_rp_split_exact_keep = false;
             let pse0 = stats::c::ps_srv_class_exact.load(Relaxed);
 
             l.begin(&alloc).unwrap();
@@ -31027,8 +31092,8 @@ mod tests {
         if std::env::var_os("AW2_CS_MID_QB_RES_DEFER_V5").is_none() {
             assert!(!super::opt_cs_mid_qb_res_defer_v5_env());
         }
-        if std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
-            assert!(!super::opt_icb_enc_barrier_exact_env());
+        if std::env::var_os("PORT_ICB_ENC_BARRIER_EXACT").is_none() && std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
+            assert!(super::opt_icb_enc_barrier_exact_env());
         }
         if let Some(l) = CommandList::new(ListType::Direct) {
             if std::env::var_os("AW2_PS_SRV_CLASS_EXACT").is_none() {
@@ -31043,8 +31108,8 @@ mod tests {
             if std::env::var_os("AW2_CS_MID_QB_RES_DEFER_V5").is_none() {
                 assert!(!l.opt_cs_mid_qb_res_defer_v5);
             }
-            if std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
-                assert!(!l.opt_icb_enc_barrier_exact);
+            if std::env::var_os("PORT_ICB_ENC_BARRIER_EXACT").is_none() && std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
+                assert!(l.opt_icb_enc_barrier_exact);
             }
         }
     }
@@ -31824,36 +31889,36 @@ mod tests {
         if std::env::var_os("AW2_CS_MID_QB_RES_DEFER_V5").is_none() {
             assert!(!super::opt_cs_mid_qb_res_defer_v5_env());
         }
-        if std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
-            assert!(!super::opt_icb_enc_barrier_exact_env());
+        if std::env::var_os("PORT_ICB_ENC_BARRIER_EXACT").is_none() && std::env::var_os("AW2_ICB_ENC_BARRIER_EXACT").is_none() {
+            assert!(super::opt_icb_enc_barrier_exact_env());
         }
-        if std::env::var_os("AW2_ICB_PREPASS_COMPUTE").is_none() {
+        if std::env::var_os("PORT_ICB_PREPASS_COMPUTE").is_none() && std::env::var_os("AW2_ICB_PREPASS_COMPUTE").is_none() {
             assert!(!super::opt_icb_prepass_compute_env());
         }
         if std::env::var_os("AW2_DESC_TABLE_CS_FAST").is_none() {
             assert!(!super::opt_desc_table_cs_fast_env());
         }
-        if std::env::var_os("AW2_RP_SPLIT_EXACT_KEEP").is_none() {
-            assert!(!super::opt_rp_split_exact_keep_env());
+        if std::env::var_os("PORT_RP_SPLIT_EXACT_KEEP").is_none() && std::env::var_os("AW2_RP_SPLIT_EXACT_KEEP").is_none() {
+            assert!(super::opt_rp_split_exact_keep_env());
         }
-        if std::env::var_os("AW2_CLEAR_CS_TILE4").is_none() {
-            assert!(!super::opt_clear_cs_tile4_env());
+        if std::env::var_os("PORT_CLEAR_CS_TILE4").is_none() && std::env::var_os("AW2_CLEAR_CS_TILE4").is_none() {
+            assert!(super::opt_clear_cs_tile4_env());
         }
         if let Some(l) = CommandList::new(ListType::Direct) {
             if std::env::var_os("AW2_GFX_DESC_TABLE_EXACT").is_none() {
                 assert!(l.opt_gfx_desc_table_exact);
             }
-            if std::env::var_os("AW2_ICB_PREPASS_COMPUTE").is_none() {
+            if std::env::var_os("PORT_ICB_PREPASS_COMPUTE").is_none() && std::env::var_os("AW2_ICB_PREPASS_COMPUTE").is_none() {
                 assert!(!l.opt_icb_prepass_compute);
             }
             if std::env::var_os("AW2_DESC_TABLE_CS_FAST").is_none() {
                 assert!(!l.opt_desc_table_cs_fast);
             }
-            if std::env::var_os("AW2_RP_SPLIT_EXACT_KEEP").is_none() {
-                assert!(!l.opt_rp_split_exact_keep);
+            if std::env::var_os("PORT_RP_SPLIT_EXACT_KEEP").is_none() && std::env::var_os("AW2_RP_SPLIT_EXACT_KEEP").is_none() {
+                assert!(l.opt_rp_split_exact_keep);
             }
-            if std::env::var_os("AW2_CLEAR_CS_TILE4").is_none() {
-                assert!(!l.opt_clear_cs_tile4);
+            if std::env::var_os("PORT_CLEAR_CS_TILE4").is_none() && std::env::var_os("AW2_CLEAR_CS_TILE4").is_none() {
+                assert!(l.opt_clear_cs_tile4);
             }
         }
     }
@@ -31933,10 +31998,11 @@ mod tests {
         let max_count = 512u32;
         let cb_up = test_buffer(256, heap_type::UPLOAD, 0);
         let args_buf = test_buffer((max_count as u64) * 16, heap_type::UPLOAD, 0);
+        let count_zero_buf = test_buffer(64, heap_type::UPLOAD, 0);
         let count_buf = test_buffer(64, heap_type::UPLOAD, 0);
         let rt = test_texture(4, 4, RGBA8_UNORM, resource_flags::ALLOW_RENDER_TARGET);
         let rb = test_buffer(256 * 4, heap_type::READBACK, 0);
-        for r in [&cb_up, &args_buf, &count_buf, &rt, &rb] {
+        for r in [&cb_up, &args_buf, &count_zero_buf, &count_buf, &rt, &rb] {
             r.register_ptr();
         }
         unsafe {
@@ -31954,6 +32020,8 @@ mod tests {
             *ap.add(1) = 1;
             *ap.add(4) = 3;
             *ap.add(5) = 1;
+            let cp0 = count_zero_buf.buffer().unwrap().contents().as_ptr() as *mut u32;
+            *cp0 = 0;
             let cp = count_buf.buffer().unwrap().contents().as_ptr() as *mut u32;
             *cp = 1;
         }
@@ -31980,6 +32048,11 @@ mod tests {
             l.gfx.topology = 4;
             l.set_graphics_pipeline(pso.clone());
             l.set_viewports(vec![MTLViewport { originX: 0.0, originY: 0.0, width: 4.0, height: 4.0, znear: 0.0, zfar: 1.0 }]);
+            // Two consecutive dynamic-count ExecuteIndirect draws sharing one ICB chunk:
+            // draw 1 takes location=0 with live count=0 (draws nothing);
+            // draw 2 takes location=512 with live count=1 (draws green triangle).
+            // Regression guard: PrepItem.location MUST propagate q.location (not 0).
+            l.execute_indirect(&layout, max_count, args_buf.gpu_va, None, Some(count_zero_buf.gpu_va)).unwrap();
             l.execute_indirect(&layout, max_count, args_buf.gpu_va, None, Some(count_buf.gpu_va)).unwrap();
             if prepass_on {
                 assert!(l.icb_prepass_pending, "large dynamic-count ICB before pass open must stage pre-pass compute");
@@ -32005,7 +32078,7 @@ mod tests {
         let (pre_off, px_off) = run_case(false);
         let (pre_on, px_on) = run_case(true);
         assert_eq!(pre_off, 0);
-        assert!(pre_on >= 1, "icb_prepass_cs must increment when pre-pass compute expands ICB");
+        assert!(pre_on >= 2, "icb_prepass_cs must increment for both batched ICB draws");
         assert_eq!(px_off, 0xff00_ff00);
         assert_eq!(px_on, 0xff00_ff00);
     }
@@ -32457,10 +32530,10 @@ mod tests {
         }
         let l = CommandList::new(ListType::Direct).unwrap();
         assert!(l.opt_gfx_desc_table_exact, "AW2_GFX_DESC_TABLE_EXACT must remain Default-ON");
-        assert!(!l.opt_icb_prepass_compute, "AW2_ICB_PREPASS_COMPUTE must remain Default-OFF");
+        assert!(!l.opt_icb_prepass_compute, "PORT_ICB_PREPASS_COMPUTE must remain Default-OFF");
         assert!(!l.opt_desc_table_cs_fast, "AW2_DESC_TABLE_CS_FAST must remain Default-OFF");
-        assert!(!l.opt_rp_split_exact_keep, "AW2_RP_SPLIT_EXACT_KEEP must remain Default-OFF");
-        assert!(!l.opt_clear_cs_tile4, "AW2_CLEAR_CS_TILE4 must remain Default-OFF");
+        assert!(l.opt_rp_split_exact_keep, "PORT_RP_SPLIT_EXACT_KEEP must default ON");
+        assert!(l.opt_clear_cs_tile4, "PORT_CLEAR_CS_TILE4 must default ON");
         assert!(!l.opt_list_boundary_overlap, "AW2_LIST_BOUNDARY_OVERLAP must default OFF");
         assert!(!l.opt_cs_intra_barrier_exact, "AW2_CS_INTRA_BARRIER_EXACT must default OFF");
         assert!(!l.opt_clear_pass_fold_v2, "AW2_CLEAR_PASS_FOLD_V2 must default OFF");
@@ -33316,8 +33389,8 @@ mod tests {
         assert!(l.opt_cs_to_ps_overlap_v2, "AW2_CS_TO_PS_OVERLAP_V2 promoted to Default-ON");
         assert!(!l.opt_icb_prepass_compute);
         assert!(!l.opt_desc_table_cs_fast);
-        assert!(!l.opt_rp_split_exact_keep);
-        assert!(!l.opt_clear_cs_tile4);
+        assert!(l.opt_rp_split_exact_keep);
+        assert!(l.opt_clear_cs_tile4);
         assert!(!l.opt_list_boundary_overlap);
         assert!(!l.opt_cs_intra_barrier_exact);
         assert!(!l.opt_clear_pass_fold_v2);
@@ -36139,7 +36212,10 @@ mod tests {
         if std::env::var_os("AW2_GFX_OVERLAP_FRAG_CAP").is_none() {
             assert!(!super::opt_gfx_overlap_frag_cap_env());
         }
-        if std::env::var_os("AW2_CS_BIND_INTRA_SAFE").is_none() {
+        if std::env::var_os("PORT_CS_BIND_CACHE").is_none() && std::env::var_os("AW2_CS_BIND_CACHE").is_none() {
+            assert!(super::opt_cs_bind_cache_env());
+        }
+        if std::env::var_os("PORT_CS_BIND_INTRA_SAFE").is_none() && std::env::var_os("AW2_CS_BIND_INTRA_SAFE").is_none() {
             assert!(!super::opt_cs_bind_intra_safe_env());
         }
         if let Some(l) = CommandList::new(ListType::Direct) {
@@ -36152,7 +36228,10 @@ mod tests {
             if std::env::var_os("AW2_GFX_OVERLAP_FRAG_CAP").is_none() {
                 assert!(!l.opt_gfx_overlap_frag_cap);
             }
-            if std::env::var_os("AW2_CS_BIND_INTRA_SAFE").is_none() {
+            if std::env::var_os("PORT_CS_BIND_CACHE").is_none() && std::env::var_os("AW2_CS_BIND_CACHE").is_none() {
+                assert!(l.opt_cs_bind_cache);
+            }
+            if std::env::var_os("PORT_CS_BIND_INTRA_SAFE").is_none() && std::env::var_os("AW2_CS_BIND_INTRA_SAFE").is_none() {
                 assert!(!l.opt_cs_bind_intra_safe);
             }
             if !l.opt_sm66_handle_kind_v2 && !l.opt_ps_to_cs_hk_overlap && !l.opt_cs_bind_intra_safe {

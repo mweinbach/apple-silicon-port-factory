@@ -163,6 +163,16 @@ unsafe fn wrap_buffers(sc: &MtlSwapchain) -> Vec<PR> {
     sc.buffers.iter().map(|b| Resource::wrap(b.clone(), 0, 0x4)).collect()
 }
 
+fn perf_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_PERF_LOG")
+            .or_else(|| std::env::var_os("PORT_IOS_PERF_LOG"))
+            .map(|v| v != "0")
+            .unwrap_or(cfg!(target_os = "ios"))
+    })
+}
+
 pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize, desc: SwapChainDesc1, fs: Option<FullscreenDesc>, out: *mut *mut c_void) -> HRESULT {
     *out = std::ptr::null_mut();
     let Some(q) = super::queue::from_ptr(queue) else {
@@ -219,9 +229,7 @@ pub unsafe fn create(factory: *mut Obj<Factory>, queue: *mut c_void, hwnd: usize
     } else {
         3
     };
-    if cfg!(target_os = "ios")
-        && std::env::var_os("PORT_IOS_PERF_LOG").is_none_or(|v| v != "0")
-    {
+    if perf_log_enabled() {
         d3d12_metal::metal::queue::enable_perf_meter();
     }
     let latency = Arc::new(Semaphore::new(max_latency as i32, 16, None));
@@ -319,48 +327,51 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                 if n % 30 == 0 {
                     d3d12_metal::metal::pipeline::flush_pso_cache_if_burst(8);
                 }
-                // Periodic zero-overhead CPU vs GPU perf summary every 120 frames on iOS.
-                if std::env::var_os("PORT_IOS_PERF_LOG").is_none_or(|v| v != "0") {
-                    static LAST_PERF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    static LAST_PERF_FRAME: AtomicU32 = AtomicU32::new(0);
-                    if n == 10 {
-                        LAST_PERF_NS.store(crate::hitch::now_ns(), Ordering::Relaxed);
-                        LAST_PERF_FRAME.store(n, Ordering::Relaxed);
-                        let _ = d3d12_metal::metal::queue::take_perf_meter_sample();
-                        let _ = d3d12_metal::metal::cmdlist::take_ios_icb_pass_splits();
-                        let _ = d3d12_metal::metal::indirect_icb::take_new_icb_count();
-                        let _ = super::cs::take_perf_stats();
-                        let _ = crate::audio::backend::take_underrun_frames();
-                    } else if n > 10 && n % 120 == 0 {
-                        let now = crate::hitch::now_ns();
-                        let prev_ns = LAST_PERF_NS.swap(now, Ordering::Relaxed);
-                        let prev_f = LAST_PERF_FRAME.swap(n, Ordering::Relaxed);
-                        let df = n.saturating_sub(prev_f);
-                        let (gpu_ns, submits, cbs) = d3d12_metal::metal::queue::take_perf_meter_sample();
-                        let icb_splits = d3d12_metal::metal::cmdlist::take_ios_icb_pass_splits();
-                        let icb_new = d3d12_metal::metal::indirect_icb::take_new_icb_count();
-                        let (cs_enc_ns, cs_flush_ns) = super::cs::take_perf_stats();
-                        let aud_under = crate::audio::backend::take_underrun_frames();
-                        if prev_ns != 0 && df > 0 && now > prev_ns {
-                            let dt_s = (now - prev_ns) as f64 / 1e9;
-                            let fps = df as f64 / dt_s;
-                            let wall_ms = (dt_s * 1000.0) / df as f64;
-                            let gpu_ms = (gpu_ns as f64 / 1e6) / df as f64;
-                            let cs_enc_ms = (cs_enc_ns as f64 / 1e6) / df as f64;
-                            let cs_flush_ms = (cs_flush_ns as f64 / 1e6) / df as f64;
-                            let fp_mb = super::mtl::process_phys_footprint() as f64 / 1048576.0;
-                            let avail_mb = super::mtl::available_headroom_bytes().unwrap_or(0) as f64 / 1048576.0;
-                            let thermal = d3d12_metal::metal::device::thermal_state();
-                            log::info!(
-                                target: "d3d",
-                                "perf[frame#{n}]: fps={fps:.1} wall={wall_ms:.1}ms gpu_busy={gpu_ms:.1}ms cs_enc={cs_enc_ms:.1}ms cs_flush={cs_flush_ms:.1}ms submits={:.1}/f cbs={:.1}/f icb_splits={:.1}/f icb_new={icb_new} aud_under={aud_under} phys={fp_mb:.0}MiB avail={avail_mb:.0}MiB thermal={thermal}",
-                                submits as f64 / df as f64,
-                                cbs as f64 / df as f64,
-                                icb_splits as f64 / df as f64,
-                            );
-                        }
+            }
+            // Periodic zero-overhead CPU vs GPU perf summary every 120 frames (default ON on
+            // iOS, opt-in on macOS via `PORT_PERF_LOG=1`).
+            if perf_log_enabled() {
+                static LAST_PERF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static LAST_PERF_FRAME: AtomicU32 = AtomicU32::new(0);
+                if n == 10 {
+                    LAST_PERF_NS.store(crate::hitch::now_ns(), Ordering::Relaxed);
+                    LAST_PERF_FRAME.store(n, Ordering::Relaxed);
+                    let _ = d3d12_metal::metal::queue::take_perf_meter_sample();
+                    let _ = d3d12_metal::metal::cmdlist::take_ios_icb_pass_splits();
+                    let _ = d3d12_metal::metal::indirect_icb::take_new_icb_count();
+                    let _ = super::cs::take_perf_stats();
+                    let _ = crate::audio::backend::take_underrun_frames();
+                } else if n > 10 && n % 120 == 0 {
+                    let now = crate::hitch::now_ns();
+                    let prev_ns = LAST_PERF_NS.swap(now, Ordering::Relaxed);
+                    let prev_f = LAST_PERF_FRAME.swap(n, Ordering::Relaxed);
+                    let df = n.saturating_sub(prev_f);
+                    let (gpu_ns, submits, cbs) = d3d12_metal::metal::queue::take_perf_meter_sample();
+                    let icb_splits = d3d12_metal::metal::cmdlist::take_ios_icb_pass_splits();
+                    let icb_new = d3d12_metal::metal::indirect_icb::take_new_icb_count();
+                    let (cs_enc_ns, cs_flush_ns) = super::cs::take_perf_stats();
+                    let aud_under = crate::audio::backend::take_underrun_frames();
+                    if prev_ns != 0 && df > 0 && now > prev_ns {
+                        let dt_s = (now - prev_ns) as f64 / 1e9;
+                        let fps = df as f64 / dt_s;
+                        let wall_ms = (dt_s * 1000.0) / df as f64;
+                        let gpu_ms = (gpu_ns as f64 / 1e6) / df as f64;
+                        let cs_enc_ms = (cs_enc_ns as f64 / 1e6) / df as f64;
+                        let cs_flush_ms = (cs_flush_ns as f64 / 1e6) / df as f64;
+                        let fp_mb = super::mtl::process_phys_footprint() as f64 / 1048576.0;
+                        let avail_mb = super::mtl::available_headroom_bytes().unwrap_or(0) as f64 / 1048576.0;
+                        let thermal = d3d12_metal::metal::device::thermal_state();
+                        log::info!(
+                            target: "d3d",
+                            "perf[frame#{n}]: fps={fps:.1} wall={wall_ms:.1}ms gpu_busy={gpu_ms:.1}ms cs_enc={cs_enc_ms:.1}ms cs_flush={cs_flush_ms:.1}ms submits={:.1}/f cbs={:.1}/f icb_splits={:.1}/f icb_new={icb_new} aud_under={aud_under} phys={fp_mb:.0}MiB avail={avail_mb:.0}MiB thermal={thermal}",
+                            submits as f64 / df as f64,
+                            cbs as f64 / df as f64,
+                            icb_splits as f64 / df as f64,
+                        );
                     }
                 }
+            }
+            if cfg!(target_os = "ios") {
                 if let Some(avail) = super::mtl::available_headroom_bytes() {
                     let fp = super::mtl::process_phys_footprint();
                     // Log each new 256 MiB high-water mark above 4.5 GiB so tight transitions

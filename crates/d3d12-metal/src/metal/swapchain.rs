@@ -61,15 +61,18 @@ pub fn present_off_main() -> bool {
     *V.get_or_init(|| std::env::var_os("AW2_PRESENT_OFF_MAIN").is_none_or(|v| v != "0"))
 }
 
-/// `AW2_PRESENT_BLIT_NARROW=1`: emit `MTLStages::Blit -> MTLStages::Blit`
-/// instead of `MTLStages::All -> MTLStages::Blit` on dedicated swapchain
-/// blit queues `sq` and `pq` (cross-queue `q0 -> sq` and `sq -> pq` producer
-/// visibility is already synchronized via `MTLSharedEvent` `wait`), while
-/// keeping `MTLStages::All -> MTLStages::Blit` whenever submitting on `q0`.
-/// Default **off** (`AW2_PRESENT_BLIT_NARROW=1` enables).
+/// `PORT_PRESENT_BLIT_NARROW` (alias `AW2_PRESENT_BLIT_NARROW`, default **on**; `=0` disables):
+/// emit `MTLStages::Blit -> MTLStages::Blit` instead of `MTLStages::All -> MTLStages::Blit` on
+/// dedicated swapchain blit queues `sq` and `pq` (cross-queue `q0 -> sq` and `sq -> pq` producer
+/// visibility is already synchronized via `MTLSharedEvent` `wait`), while keeping
+/// `MTLStages::All -> MTLStages::Blit` whenever submitting on `q0`.
 pub fn present_blit_narrow() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("AW2_PRESENT_BLIT_NARROW").is_some_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var_os("PORT_PRESENT_BLIT_NARROW")
+            .or_else(|| std::env::var_os("AW2_PRESENT_BLIT_NARROW"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1003,8 +1006,10 @@ mod tests {
 
     #[test]
     fn present_blit_narrow_narrows_sq_and_pq_while_preserving_main_queue_guard_on_gpu() {
-        if std::env::var_os("AW2_PRESENT_BLIT_NARROW").is_none() {
-            assert!(!super::present_blit_narrow(), "AW2_PRESENT_BLIT_NARROW must default OFF");
+        if std::env::var_os("PORT_PRESENT_BLIT_NARROW").is_none()
+            && std::env::var_os("AW2_PRESENT_BLIT_NARROW").is_none()
+        {
+            assert!(super::present_blit_narrow(), "PORT_PRESENT_BLIT_NARROW must default ON");
         }
         if super::super::device().is_none() {
             return;

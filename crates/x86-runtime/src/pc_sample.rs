@@ -30,11 +30,11 @@
 //! branched to a raw guest code pointer would show up there. (A tail `br` leaves the
 //! caller's caller in lr.)
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 use std::time::{Duration, Instant};
 
 /// Resolver for host PCs inside live AOT code: `(module, image base, guest block ip)`
@@ -49,7 +49,11 @@ static IMAGE_RESOLVER: OnceLock<ImageResolver> = OnceLock::new();
 static STARTED: OnceLock<()> = OnceLock::new();
 
 fn rate_hz() -> u64 {
-    if let Some(v) = std::env::var("AW2_PC_SAMPLE").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+    if let Some(v) = std::env::var("PORT_PC_SAMPLE")
+        .or_else(|_| std::env::var("AW2_PC_SAMPLE"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
         return v.min(10_000);
     }
     if std::env::var("AW2_JIT_STATS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0) != 0 {
@@ -66,12 +70,17 @@ pub fn start(resolver: Resolver, image: ImageResolver) {
     if hz == 0 || STARTED.set(()).is_err() {
         return;
     }
-    let report = std::env::var("AW2_PC_SAMPLE_REPORT_S").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30).max(1);
+    let report = std::env::var("PORT_PC_SAMPLE_REPORT_S")
+        .or_else(|_| std::env::var("AW2_PC_SAMPLE_REPORT_S"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(30)
+        .max(1);
     log::info!("pc sample: enabled at {hz} Hz, report every {report}s");
-    let _ = std::thread::Builder::new().name("aw2-pc-sample".into()).spawn(move || unsafe { run(hz, report) });
+    let _ = std::thread::Builder::new().name("port-pc-sample".into()).spawn(move || unsafe { run(hz, report) });
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod mach {
     pub type Port = u32;
     pub const THREAD_BASIC_INFO: u32 = 3;
@@ -134,7 +143,7 @@ mod mach {
 }
 
 /// The dyld shared cache `[start, end)` (system frameworks), or `(0, 0)`.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn shared_cache() -> (usize, usize) {
     static R: OnceLock<(usize, usize)> = OnceLock::new();
     *R.get_or_init(|| unsafe {
@@ -177,7 +186,7 @@ const JIT_STUBS_BYTES: u64 = 4096;
 /// `exec-nosym` (other executable memory without an image), `nonexec` (readable but not
 /// executable: should not happen), `unmapped`. The region carries its VM user tag
 /// (`VM_MEMORY_*`, names the allocator).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe fn classify_other(pc: usize) -> (&'static str, (u64, u64, i32, i32)) {
     use mach::*;
     // `mach_vm_region_recurse` descends into submaps: the dyld shared cache is one nested
@@ -209,10 +218,10 @@ unsafe fn classify_other(pc: usize) -> (&'static str, (u64, u64, i32, i32)) {
     (kind, (a, sz, prot, tag))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 unsafe fn run(_hz: u64, _report: u64) {}
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe fn run(hz: u64, report: u64) {
     use mach::*;
     let period = Duration::from_nanos(1_000_000_000 / hz.max(1));
@@ -347,7 +356,7 @@ fn demangle(s: &str) -> String {
 
 /// Report name of address `a`: live AOT block (`aot:<module>+0x<rva>`), mapped guest image
 /// (`<module>+0x<rva>`), host symbol (`<symbol>+0x<off>`), else `?`.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn name_addr(a: usize) -> String {
     if a == 0 {
         return "-".to_string();
@@ -378,7 +387,7 @@ fn name_addr(a: usize) -> String {
 }
 
 /// File name of the host image at `fbase` (0: the dyld shared cache, image unknown).
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn image_name(fbase: usize) -> String {
     if fbase == 0 {
         return "[dyld shared cache]".to_string();
@@ -393,7 +402,7 @@ fn image_name(fbase: usize) -> String {
     format!("0x{fbase:x}")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn write_report(st: &Stats, secs: f64, hz: u64) {
     use std::fmt::Write;
     let mut o = String::new();

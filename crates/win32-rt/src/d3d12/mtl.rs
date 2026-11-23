@@ -30,6 +30,21 @@ pub fn log_memory_snapshot_full(tag: &str) {
 /// purge Darwin libmalloc magazine caches back to XNU, and signal any registered DXGI video
 /// memory budget change events.
 pub fn handle_memory_warning() {
+    // Debounce back-to-back soft OS memory warnings when >= 1 GiB of Jetsam headroom
+    // remains (iOS can fire 4+ notifications within 100 ms, each stalling the UI thread
+    // on `malloc_zone_pressure_relief` and `MTL4Compiler` reset). Under real pressure
+    // (< 1 GiB headroom), always trim immediately.
+    if let Some(avail) = available_headroom_bytes() {
+        if avail >= (1024 << 20) {
+            static LAST_SOFT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = crate::hitch::now_ns();
+            let prev = LAST_SOFT_NS.load(std::sync::atomic::Ordering::Relaxed);
+            if prev != 0 && now.saturating_sub(prev) < 2_000_000_000 {
+                return;
+            }
+            LAST_SOFT_NS.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     log_memory_snapshot_full("memory-warning");
     d3d12_metal::metal::pipeline::trim_caches();
     #[cfg(target_vendor = "apple")]

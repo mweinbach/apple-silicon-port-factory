@@ -311,7 +311,16 @@ pub fn env_block_a() -> *mut u8 {
 // ---------------------------------------------------------------------------
 
 pub fn num_cpus() -> u32 {
-    std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4)
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let host = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4);
+        std::env::var("PORT_NUM_CPUS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .map(|n| n.min(64))
+            .unwrap_or(host)
+    })
 }
 
 pub fn physical_memory() -> u64 {

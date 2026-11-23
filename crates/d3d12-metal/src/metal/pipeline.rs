@@ -132,7 +132,23 @@ pub fn trim_caches() {
         })
         .unwrap_or(0);
     let dropped_shader_bytes = dxil_metal::ShaderPipeline::trim_memory_if_initialized();
-    let dropped_icbs = super::indirect_icb::trim_pool();
+    // On iOS, avoid nuking the active steady-state ICB / ring working set on soft memory
+    // warnings when >= 1 GiB of Jetsam headroom remains (wiping warm ICBs triggers an
+    // immediate 30+ `newIndirectCommandBuffer` stall on the very next frame). Under real
+    // Jetsam pressure (< 1 GiB headroom) or explicit macOS trims, evict 100% of idle pools.
+    let hard_pressure = super::device::available_headroom_bytes()
+        .map(|avail| avail < (1024 << 20))
+        .unwrap_or(true);
+    let dropped_icbs = if hard_pressure {
+        super::indirect_icb::trim_pool()
+    } else {
+        super::indirect_icb::trim_pool_soft()
+    };
+    let dropped_rings = if hard_pressure {
+        super::binding::trim_pool()
+    } else {
+        super::binding::trim_pool_keep(16 << 20)
+    };
     let reaped_deferred = super::queue::collect_all();
     if let Some(Ok(c)) = PSO_CACHE.get() {
         let res = if cfg!(target_os = "ios") {
@@ -147,7 +163,7 @@ pub fn trim_caches() {
     release_malloc_pressure();
     log::info!(
         target: "d3d",
-        "pipeline::trim_caches: evicted {dropped_libs} MTLLibrary handles, {dropped_icbs} idle ICBs, {reaped_deferred} deferred drops, and {:.1} MiB of cached metallibs",
+        "pipeline::trim_caches (hard={hard_pressure}): evicted {dropped_libs} MTLLibrary handles, {dropped_icbs} idle ICBs, {dropped_rings} ring buffers, {reaped_deferred} deferred drops, and {:.1} MiB of cached metallibs",
         dropped_shader_bytes as f64 / (1024.0 * 1024.0)
     );
 }

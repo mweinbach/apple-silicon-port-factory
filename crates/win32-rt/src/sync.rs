@@ -292,7 +292,7 @@ unsafe fn srw(p: *mut c_void) -> AtomicWord {
 }
 
 unsafe fn srw_park(lock: AtomicWord, blocked: impl Fn(usize) -> bool) {
-    let mut s = lock.load(Relaxed);
+    let s = lock.load(Relaxed);
     if !blocked(s) {
         return;
     }
@@ -300,9 +300,7 @@ unsafe fn srw_park(lock: AtomicWord, blocked: impl Fn(usize) -> bool) {
         if lock.compare_exchange(s, s | SRW_PARKED, Relaxed, Relaxed).is_err() {
             return;
         }
-        s |= SRW_PARKED;
     }
-    let _ = s;
     let key = lock.addr();
     let _scope = crate::hitch::Scope::enter(crate::hitch::ActKind::LockWait, key as u64);
     park(
@@ -318,9 +316,9 @@ unsafe fn srw_park(lock: AtomicWord, blocked: impl Fn(usize) -> bool) {
     );
 }
 
+#[cold]
 unsafe fn srw_wake(lock: AtomicWord) {
-    if lock.load(Relaxed) & SRW_PARKED != 0 {
-        lock.fetch_and(!SRW_PARKED, Relaxed);
+    if lock.fetch_and(!SRW_PARKED, Relaxed) & SRW_PARKED != 0 {
         unpark_all(lock.addr(), DEFAULT_UNPARK_TOKEN);
     }
 }
@@ -360,8 +358,10 @@ pub unsafe extern "win64" fn AcquireSRWLockExclusive(p: *mut c_void) {
 #[inline(never)]
 pub unsafe extern "win64" fn ReleaseSRWLockExclusive(p: *mut c_void) {
     let l = srw(p);
-    l.fetch_and(!SRW_WRITER, Release);
-    srw_wake(l);
+    let prev = l.fetch_and(!SRW_WRITER, Release);
+    if prev & SRW_PARKED != 0 {
+        srw_wake(l);
+    }
 }
 
 #[inline(never)]
@@ -402,7 +402,7 @@ pub unsafe extern "win64" fn AcquireSRWLockShared(p: *mut c_void) {
 pub unsafe extern "win64" fn ReleaseSRWLockShared(p: *mut c_void) {
     let l = srw(p);
     let prev = l.fetch_sub(SRW_READER, Release);
-    if (prev - SRW_READER) & SRW_READERS_MASK == 0 {
+    if (prev & SRW_PARKED != 0) && ((prev - SRW_READER) & SRW_READERS_MASK == 0) {
         srw_wake(l);
     }
 }
@@ -768,6 +768,50 @@ mod tests {
             WakeAllConditionVariable(cv as _);
         }
         t.join().unwrap();
+    }
+
+    #[test]
+    fn srw_mixed_exclusive_and_shared_contention() {
+        struct Shared(std::cell::UnsafeCell<(AtomicUsize, u64)>);
+        unsafe impl Sync for Shared {}
+        unsafe impl Send for Shared {}
+        let s = Arc::new(Shared(std::cell::UnsafeCell::new((AtomicUsize::new(0), 0))));
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || unsafe {
+                    let p = s.0.get();
+                    for _ in 0..2000 {
+                        AcquireSRWLockExclusive(&(*p).0 as *const AtomicUsize as *mut c_void);
+                        (*p).1 += 1;
+                        ReleaseSRWLockExclusive(&(*p).0 as *const AtomicUsize as *mut c_void);
+                    }
+                    crate::teb::uninstall();
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || unsafe {
+                    let p = s.0.get();
+                    let mut last = 0u64;
+                    for _ in 0..4000 {
+                        AcquireSRWLockShared(&(*p).0 as *const AtomicUsize as *mut c_void);
+                        let cur = (*p).1;
+                        assert!(cur >= last, "SRWLock reader observed non-monotonic value");
+                        last = cur;
+                        ReleaseSRWLockShared(&(*p).0 as *const AtomicUsize as *mut c_void);
+                    }
+                    crate::teb::uninstall();
+                })
+            })
+            .collect();
+        for h in writers.into_iter().chain(readers) {
+            h.join().unwrap();
+        }
+        assert_eq!(unsafe { (*s.0.get()).1 }, 8000);
+        assert_eq!(unsafe { (*s.0.get()).0.load(SeqCst) }, 0, "SRWLock state must return to 0 with SRW_PARKED cleared");
     }
 
     #[test]

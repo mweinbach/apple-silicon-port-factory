@@ -3,7 +3,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 static LIVE_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +84,7 @@ pub struct Device {
     /// residency). Commit is batched: see [`Device::commit_residency`].
     pub residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     residency_dirty: Mutex<bool>,
+    residency_dirty_fast: AtomicBool,
 }
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
@@ -124,6 +125,7 @@ pub fn device() -> Option<&'static Device> {
                 metal4,
                 residency,
                 residency_dirty: Mutex::new(false),
+                residency_dirty_fast: AtomicBool::new(false),
                 dev,
             };
             log::info!(
@@ -200,6 +202,7 @@ impl Device {
         self.residency.addAllocation(a);
         super::encstats::inc(&super::encstats::c::res_add);
         *d = true;
+        self.residency_dirty_fast.store(true, Ordering::Release);
     }
 
     pub fn remove_resident(&self, a: &ProtocolObject<dyn MTLAllocation>) {
@@ -207,15 +210,21 @@ impl Device {
         self.residency.removeAllocation(a);
         super::encstats::inc(&super::encstats::c::res_remove);
         *d = true;
+        self.residency_dirty_fast.store(true, Ordering::Release);
     }
 
     /// Commit pending residency changes (called before each queue submit).
+    #[inline]
     pub fn commit_residency(&self) {
+        if !self.residency_dirty_fast.load(Ordering::Acquire) {
+            return;
+        }
         let mut d = self.residency_dirty.lock().unwrap();
         if *d {
             self.residency.commit();
             super::encstats::inc(&super::encstats::c::res_commit);
             *d = false;
+            self.residency_dirty_fast.store(false, Ordering::Release);
         }
     }
 }

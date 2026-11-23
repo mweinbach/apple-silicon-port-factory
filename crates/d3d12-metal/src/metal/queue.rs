@@ -843,11 +843,11 @@ mod tests {
         }
 
         // 1) Zero-GPU-work command list (`L0`–`L2` barrier/state-only lists) MUST report
-        // `!has_gpu_work_recorded()` without altering `has_commands()` (`AW2_EMPTY_ENC_ELIDE` stays OFF).
+        // `!has_gpu_work_recorded()` and elide submission when `PORT_EMPTY_ENC_ELIDE` is ON.
         l_empty.begin(&a_empty).unwrap();
         l_empty.barrier_list(&[Barrier::Uav(0)]);
         l_empty.close().unwrap();
-        assert!(l_empty.has_commands());
+        assert_eq!(l_empty.has_commands(), !l_empty.opt_empty_enc_elide);
         assert!(!l_empty.has_gpu_work_recorded());
 
         // 2) Record 3 real-GPU dependent Blit submissions (`up -> mid0 -> mid1 -> rb`).

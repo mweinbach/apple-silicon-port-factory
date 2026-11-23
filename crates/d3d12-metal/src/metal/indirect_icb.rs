@@ -622,35 +622,56 @@ fn expander_ver(rtv_formats: &[u32], sample_count: u32, ver: u8) -> Result<Retai
     Ok(pso)
 }
 
-/// `AW2_ICB_FAST_V3=1` (default off): fragment-aware `aw2_ei_icb_vs_v3` ICB
-/// expansion (skipping dead `rc.set_fragment_buffer` calls on depth/shadow
-/// VS-only PSOs and vectorizing `da[0..3]` via `uint4`) plus tight
+/// `PORT_ICB_FAST_V3` (alias `AW2_ICB_FAST_V3`, default **on**; `=0` disables):
+/// fragment-aware `aw2_ei_icb_vs_v3` ICB expansion (skipping dead `rc.set_fragment_buffer`
+/// calls on depth/shadow VS-only PSOs and vectorizing `da[0..3]` via `uint4`) plus tight
 /// `Vertex` / `Vertex | Fragment` hoisted intra-pass encoder barrier.
 pub fn fast_v3() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_ICB_FAST_V3").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_ICB_FAST_V3")
+            .or_else(|| std::env::var_os("AW2_ICB_FAST_V3"))
+            .is_none_or(|v| v != "0")
+    })
+}
+
+/// `PORT_COMPACT_ICB` (default **on**; `=0` disables): select between 3 compact ICB tiers
+/// (`6`, `14`, or `30` vertex buffer slots) on both macOS and iOS so vertex-pulling and
+/// <=8-stream shaders allocate 2–5× smaller `MTLIndirectCommandBuffer`s with better GPU L2
+/// locality.
+pub fn compact_icb_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PORT_COMPACT_ICB").is_none_or(|v| v != "0"))
 }
 
 /// `AW2_EI_INPASS` (default on): encode in the render pass (vertex stage)
 /// instead of a compute dispatch that splits the pass.
 pub fn in_pass() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_EI_INPASS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_EI_INPASS")
+            .or_else(|| std::env::var_os("AW2_EI_INPASS"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
-/// `AW2_EI_ICB` (default on).
+/// `PORT_EI_ICB` (alias `AW2_EI_ICB`, default on).
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AW2_EI_ICB").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("PORT_EI_ICB")
+            .or_else(|| std::env::var_os("AW2_EI_ICB"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// Minimum vertex buffer bind count needed by an `ExecuteIndirect` draw (`6` IR runtime
-/// buffers plus the highest vertex buffer slot actually referenced). On iOS this selects
-/// between 3 compact ICB tiers (`6`, `14`, or `30` vertex buffer slots) so vertex-pulling
-/// and <=8-stream shaders allocate 2–4× smaller `MTLIndirectCommandBuffer`s.
+/// buffers plus the highest vertex buffer slot actually referenced). Selects between 3
+/// compact ICB tiers (`6`, `14`, or `30` vertex buffer slots) universally on macOS and iOS
+/// so vertex-pulling and <=8-stream shaders allocate 2–5× smaller `MTLIndirectCommandBuffer`s.
 #[inline]
 pub fn required_vb_bind_count(vb_mask: u32, vb_offsets: &[(u32, u32)]) -> usize {
-    if !cfg!(target_os = "ios") {
+    if !compact_icb_enabled() {
         return 6 + VB;
     }
     let mut max_slot_plus_1 = if vb_mask == 0 {
@@ -714,6 +735,29 @@ const IOS_MAX_POOLED_COMPACT: usize = 24;
 const IOS_MAX_POOLED_COMPACT_BYTES: u64 = 160 << 20;
 const IOS_MAX_POOLED_LARGE: usize = 4;
 
+/// Dynamic iOS compact-ICB pool budget `(max_count, max_bytes)` scaled from the process's
+/// total Jetsam ceiling (`phys_footprint + os_proc_available_memory`):
+/// - `<= 6.5 GiB` devices: `24` chunks / `160 MiB` (safe margin under 6 GiB Jetsam)
+/// - `> 6.5 GiB` devices (e.g. 8+ GiB Pro/Max/iPad): `32` chunks / `192 MiB` so steady-state
+///   `ExecuteIndirect` working sets stay resident (`icb_new = 0`) without pushing
+///   `phys_footprint` into aggressive XNU VM page compression.
+pub fn ios_compact_pool_limits(total_jetsam_bytes: u64) -> (usize, u64) {
+    if total_jetsam_bytes > (6656 << 20) {
+        (32, 192 << 20)
+    } else {
+        (IOS_MAX_POOLED_COMPACT, IOS_MAX_POOLED_COMPACT_BYTES)
+    }
+}
+
+fn active_ios_compact_pool_limits() -> (usize, u64) {
+    if let Some(avail) = super::device::available_headroom_bytes() {
+        let total = super::device::process_phys_footprint().saturating_add(avail);
+        ios_compact_pool_limits(total)
+    } else {
+        (IOS_MAX_POOLED_COMPACT, IOS_MAX_POOLED_COMPACT_BYTES)
+    }
+}
+
 /// Pure iOS chunk-matching rule: compact requests (`n <= 16384`) never steal giant
 /// (`cap > 24576`) pooled chunks, preventing duplicate 43–46 MiB allocations.
 #[inline]
@@ -728,9 +772,14 @@ fn ios_chunk_fits(n: u32, need_vb_binds: usize, chunk_cap: u32, chunk_vb_binds: 
 }
 
 /// Pure iOS 2-bucket pool trim selector: returns the indices to EVICT from `items`
-/// `(cap, vb_binds, alloc_bytes)` so up to `IOS_MAX_POOLED_COMPACT` (and `<= 80 MiB`)
-/// compact chunks AND up to `IOS_MAX_POOLED_LARGE` giant chunks stay warm.
-fn ios_trim_pool_evictions(items: &[(u32, usize, u64)]) -> Vec<usize> {
+/// `(cap, vb_binds, alloc_bytes)` so up to `max_compact` (and `<= max_compact_bytes`)
+/// compact chunks AND up to `max_large` giant chunks stay warm.
+fn ios_trim_pool_evictions_with(
+    items: &[(u32, usize, u64)],
+    max_compact: usize,
+    max_compact_bytes: u64,
+    max_large: usize,
+) -> Vec<usize> {
     let mut compact: Vec<usize> = Vec::new();
     let mut large: Vec<usize> = Vec::new();
     for (i, &(cap, _, _)) in items.iter().enumerate() {
@@ -750,8 +799,8 @@ fn ios_trim_pool_evictions(items: &[(u32, usize, u64)]) -> Vec<usize> {
     let mut kept_compact_bytes = 0u64;
     for idx in compact {
         let bytes = items[idx].2;
-        if kept_compact < IOS_MAX_POOLED_COMPACT
-            && (kept_compact == 0 || kept_compact_bytes.saturating_add(bytes) <= IOS_MAX_POOLED_COMPACT_BYTES)
+        if kept_compact < max_compact
+            && (kept_compact == 0 || kept_compact_bytes.saturating_add(bytes) <= max_compact_bytes)
         {
             kept_compact += 1;
             kept_compact_bytes = kept_compact_bytes.saturating_add(bytes);
@@ -759,12 +808,17 @@ fn ios_trim_pool_evictions(items: &[(u32, usize, u64)]) -> Vec<usize> {
             evict.push(idx);
         }
     }
-    for idx in large.into_iter().skip(IOS_MAX_POOLED_LARGE) {
+    for idx in large.into_iter().skip(max_large) {
         evict.push(idx);
     }
     // Sort descending so callers can safely `swap_remove` without invalidating earlier indices.
     evict.sort_unstable_by(|a, b| b.cmp(a));
     evict
+}
+
+#[cfg(test)]
+fn ios_trim_pool_evictions(items: &[(u32, usize, u64)]) -> Vec<usize> {
+    ios_trim_pool_evictions_with(items, IOS_MAX_POOLED_COMPACT, IOS_MAX_POOLED_COMPACT_BYTES, IOS_MAX_POOLED_LARGE)
 }
 
 fn return_chunks_to_pool(chunks: &mut Vec<Chunk>) {
@@ -778,8 +832,9 @@ fn return_chunks_to_pool(chunks: &mut Vec<Chunk>) {
     if let Ok(mut p) = POOL.lock() {
         p.append(chunks);
         if cfg!(target_os = "ios") && p.len() > IOS_MAX_POOLED_LARGE {
+            let (max_c, max_cb) = active_ios_compact_pool_limits();
             let meta: Vec<(u32, usize, u64)> = p.iter().map(|c| (c.cap, c.vb_binds, c.alloc_bytes)).collect();
-            for idx in ios_trim_pool_evictions(&meta) {
+            for idx in ios_trim_pool_evictions_with(&meta, max_c, max_cb, IOS_MAX_POOLED_LARGE) {
                 dropped.push(p.swap_remove(idx));
             }
         }
@@ -792,13 +847,32 @@ fn return_chunks_to_pool(chunks: &mut Vec<Chunk>) {
 }
 
 /// Release all idle pooled `MTLIndirectCommandBuffer`s back to Metal/XNU once active queues
-/// drain (called on iOS memory warnings).
+/// drain (called on real iOS Jetsam low-memory pressure `< 1 GiB` headroom).
 pub fn trim_pool() -> usize {
     let dropped = if let Ok(mut p) = POOL.lock() {
         std::mem::take(&mut *p)
     } else {
         Vec::new()
     };
+    let n = dropped.len();
+    if !dropped.is_empty() {
+        super::queue::defer_release_all(dropped);
+    }
+    n
+}
+
+/// Soft iOS memory-warning trim (when `>= 1 GiB` headroom remains): retain the active
+/// compact working set and up to 2 large chunks so the very next frame does not suffer a
+/// 30+ `newIndirectCommandBuffer` rebuild stall, while shedding any surplus idle chunks.
+pub fn trim_pool_soft() -> usize {
+    let (max_c, max_cb) = active_ios_compact_pool_limits();
+    let mut dropped = Vec::new();
+    if let Ok(mut p) = POOL.lock() {
+        let meta: Vec<(u32, usize, u64)> = p.iter().map(|c| (c.cap, c.vb_binds, c.alloc_bytes)).collect();
+        for idx in ios_trim_pool_evictions_with(&meta, max_c, max_cb, 2) {
+            dropped.push(p.swap_remove(idx));
+        }
+    }
     let n = dropped.len();
     if !dropped.is_empty() {
         super::queue::defer_release_all(dropped);
@@ -859,13 +933,21 @@ impl IcbRing {
     /// Reserve `n` consecutive commands with at least `need_vb_binds` vertex buffer slots:
     /// returns `(icb, first command index)`.
     pub fn alloc_for(&mut self, n: u32, need_vb_binds: usize) -> Result<(Retained<MtlIcb>, u32), String> {
-        // Prefer the narrowest existing chunk that satisfies both bind count and capacity.
+        // Prefer the narrowest existing chunk that satisfies both bind count and capacity,
+        // breaking ties by tightest remaining free space so small draws pack into leftover
+        // tails instead of consuming fresh large chunks.
         let mut best_idx: Option<usize> = None;
         for (i, c) in self.chunks.iter().enumerate() {
-            if c.vb_binds >= need_vb_binds && c.cap - c.off >= n {
+            let rem = c.cap - c.off;
+            if c.vb_binds >= need_vb_binds && rem >= n {
                 match best_idx {
                     None => best_idx = Some(i),
-                    Some(bi) if c.vb_binds < self.chunks[bi].vb_binds => best_idx = Some(i),
+                    Some(bi)
+                        if (c.vb_binds, rem)
+                            < (self.chunks[bi].vb_binds, self.chunks[bi].cap - self.chunks[bi].off) =>
+                    {
+                        best_idx = Some(i);
+                    }
                     _ => {}
                 }
             }
@@ -960,9 +1042,16 @@ fn new_icb(cap: u32, max_vb_binds: usize) -> Result<(Retained<MtlIcb>, u64), Str
 mod tests {
     #[test]
     fn kernel_compiles() {
-        if std::env::var_os("AW2_ICB_FAST_V3").is_none() {
-            assert!(!super::fast_v3());
+        if std::env::var_os("PORT_ICB_FAST_V3").is_none()
+            && std::env::var_os("AW2_ICB_FAST_V3").is_none()
+        {
+            assert!(super::fast_v3(), "PORT_ICB_FAST_V3 must default ON");
         }
+        assert_eq!(super::required_vb_bind_count(0, &[]), 6);
+        assert_eq!(super::required_vb_bind_count(0b101, &[]), 14);
+        assert_eq!(super::required_vb_bind_count(1 << 9, &[]), 6 + super::VB);
+        assert_eq!(super::ios_compact_pool_limits(6144 << 20), (24, 160 << 20));
+        assert_eq!(super::ios_compact_pool_limits(8192 << 20), (32, 192 << 20));
         if super::super::device().is_none() {
             return;
         }

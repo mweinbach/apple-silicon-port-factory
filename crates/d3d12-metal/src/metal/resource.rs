@@ -132,52 +132,55 @@ impl Hasher for U64MixHasher {
 
 /// Thread-local cache of strictly non-aliasing `[start, end) -> key` buffer ranges,
 /// invalidated whenever [`ResRegistry::buf_gen`] changes. Only populated for buffers
+/// Per-entry generation-tagged cache entry (32 bytes = power-of-2 stride so index
+/// arithmetic compiles to a single shift and generation bumps require zero memset).
+#[derive(Clone, Copy)]
+struct BufVaEntry {
+    start: u64,
+    end: u64,
+    key: usize,
+    gen: u64,
+}
+
+impl BufVaEntry {
+    const EMPTY: Self = Self { start: 0, end: 0, key: 0, gen: 0 };
+}
+
 /// mathematically proven disjoint from all neighbors in [`ResRegistry::buffers`].
-struct BufVaCache {
-    buf_gen: u64,
+pub(crate) struct BufVaCache {
     mru_cursor: usize,
-    mru: [(u64, u64, usize); 8],
-    page: [(u64, u64, usize); 128],
+    mru: [BufVaEntry; 4],
+    page: [BufVaEntry; 256],
 }
 
 impl BufVaCache {
     const fn new() -> Self {
         Self {
-            buf_gen: 0,
             mru_cursor: 0,
-            mru: [(0, 0, 0); 8],
-            page: [(0, 0, 0); 128],
+            mru: [BufVaEntry::EMPTY; 4],
+            page: [BufVaEntry::EMPTY; 256],
         }
     }
 
     #[inline(always)]
-    fn reset_if_stale(&mut self, buf_gen: u64) {
-        if self.buf_gen != buf_gen {
-            self.buf_gen = buf_gen;
-            self.mru_cursor = 0;
-            self.mru = [(0, 0, 0); 8];
-            self.page = [(0, 0, 0); 128];
-        }
+    fn page_slot(va: u64) -> usize {
+        (((va >> 16) ^ (va >> 24)) as usize) & 255
     }
 
     #[inline(always)]
-    fn lookup(&mut self, buf_gen: u64, va: u64) -> Option<(u64, u64, usize)> {
+    fn lookup(&self, buf_gen: u64, va: u64) -> Option<(u64, u64, usize)> {
         if buf_gen == 0 {
             return None;
         }
-        if self.buf_gen != buf_gen {
-            self.reset_if_stale(buf_gen);
-            return None;
+        // Check O(1) direct-mapped page table first before the 4-entry collision MRU.
+        let p = self.page[Self::page_slot(va)];
+        if p.gen == buf_gen && va >= p.start && va < p.end {
+            return Some((p.start, p.end, p.key));
         }
-        for &(s, e, k) in &self.mru {
-            if va >= s && va < e {
-                return Some((s, e, k));
+        for e in &self.mru {
+            if e.gen == buf_gen && va >= e.start && va < e.end {
+                return Some((e.start, e.end, e.key));
             }
-        }
-        let slot = ((va >> 16) as usize) & 127;
-        let (s, e, k) = self.page[slot];
-        if va >= s && va < e {
-            return Some((s, e, k));
         }
         None
     }
@@ -187,18 +190,29 @@ impl BufVaCache {
         if buf_gen == 0 {
             return;
         }
-        self.reset_if_stale(buf_gen);
-        let slot = ((va >> 16) as usize) & 127;
-        self.page[slot] = (start, end, key);
-        if !self.mru.iter().any(|&(s, e, _)| s == start && e == end) {
-            self.mru[self.mru_cursor & 7] = (start, end, key);
-            self.mru_cursor = self.mru_cursor.wrapping_add(1);
+        let entry = BufVaEntry { start, end, key, gen: buf_gen };
+        let slot = Self::page_slot(va);
+        let prev = self.page[slot];
+        self.page[slot] = entry;
+        // Spill displaced live entry into the 4-entry MRU so hash collisions stay hot.
+        if prev.gen == buf_gen && prev.key != key {
+            if !self.mru.iter().any(|e| e.gen == buf_gen && e.start == prev.start && e.end == prev.end) {
+                self.mru[self.mru_cursor & 3] = prev;
+                self.mru_cursor = self.mru_cursor.wrapping_add(1);
+            }
         }
     }
 }
 
 thread_local! {
     static BUF_VA_CACHE: std::cell::UnsafeCell<BufVaCache> = const { std::cell::UnsafeCell::new(BufVaCache::new()) };
+}
+
+/// Borrow the calling thread's [`BufVaCache`] once across a batch of slot lookups,
+/// avoiding repeated TLS accessor (`_tlv_get_addr`) calls per descriptor slot.
+#[inline]
+pub(crate) fn with_buf_va_cache<R>(f: impl FnOnce(&mut BufVaCache) -> R) -> R {
+    BUF_VA_CACHE.with(|c| f(unsafe { &mut *c.get() }))
 }
 
 /// Live resource registry mapping buffer GPU virtual address ranges and
@@ -289,15 +303,17 @@ impl ResRegistry {
     /// contains `va`. Returns `true` if at least one live buffer matched.
     #[inline]
     pub fn push_buffer_va(&self, va: u64, out: &mut Vec<usize>) -> bool {
+        with_buf_va_cache(|cache| self.push_buffer_va_cached(cache, va, out))
+    }
+
+    #[inline]
+    pub(crate) fn push_buffer_va_cached(&self, cache: &mut BufVaCache, va: u64, out: &mut Vec<usize>) -> bool {
         let bg = self.buf_gen;
-        if bg != 0 {
-            let hit = BUF_VA_CACHE.with(|c| unsafe { (*c.get()).lookup(bg, va) });
-            if let Some((_, _, key)) = hit {
-                if !out.contains(&key) {
-                    out.push(key);
-                }
-                return true;
+        if let Some((_, _, key)) = cache.lookup(bg, va) {
+            if !out.contains(&key) {
+                out.push(key);
             }
+            return true;
         }
         let idx = self.buffers.partition_point(|b| b.start <= va);
         let mut match_count = 0usize;
@@ -319,7 +335,7 @@ impl ResRegistry {
         }
         if match_count == 1 && bg != 0 && self.is_strictly_disjoint(last_idx) {
             let b = &self.buffers[last_idx];
-            BUF_VA_CACHE.with(|c| unsafe { (*c.get()).insert(bg, va, b.start, b.end, b.key) });
+            cache.insert(bg, va, b.start, b.end, b.key);
         }
         match_count != 0
     }
@@ -336,21 +352,30 @@ impl ResRegistry {
         out: &mut Vec<usize>,
         spans: &mut Vec<SubRange>,
     ) -> bool {
+        with_buf_va_cache(|cache| self.push_buffer_span_cached(cache, va, byte_len, out, spans))
+    }
+
+    #[inline]
+    pub(crate) fn push_buffer_span_cached(
+        &self,
+        cache: &mut BufVaCache,
+        va: u64,
+        byte_len: u64,
+        out: &mut Vec<usize>,
+        spans: &mut Vec<SubRange>,
+    ) -> bool {
         let bg = self.buf_gen;
-        if bg != 0 {
-            let hit = BUF_VA_CACHE.with(|c| unsafe { (*c.get()).lookup(bg, va) });
-            if let Some((start, end, key)) = hit {
-                let hi = if byte_len == 0 || (end - start) > u32::MAX as u64 {
-                    end
-                } else {
-                    va.saturating_add(byte_len).min(end)
-                };
-                if !out.contains(&key) {
-                    out.push(key);
-                }
-                push_subrange(spans, SubRange { r: key, lo: va, hi });
-                return true;
+        if let Some((start, end, key)) = cache.lookup(bg, va) {
+            let hi = if byte_len == 0 || (end - start) > u32::MAX as u64 {
+                end
+            } else {
+                va.saturating_add(byte_len).min(end)
+            };
+            if !out.contains(&key) {
+                out.push(key);
             }
+            push_subrange(spans, SubRange { r: key, lo: va, hi });
+            return true;
         }
         let idx = self.buffers.partition_point(|b| b.start <= va);
         let mut eff_hi = 0u64;
@@ -382,7 +407,7 @@ impl ResRegistry {
         if match_count == 1 && self.buffers.get(idx).is_none_or(|next| next.start >= eff_hi) {
             let (key, start, end) = single;
             if bg != 0 && self.is_strictly_disjoint(single_idx) {
-                BUF_VA_CACHE.with(|c| unsafe { (*c.get()).insert(bg, va, start, end, key) });
+                cache.insert(bg, va, start, end, key);
             }
             if !out.contains(&key) {
                 out.push(key);

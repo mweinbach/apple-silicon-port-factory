@@ -28,6 +28,7 @@ struct RingChunk {
     gpu_va: u64,
     cpu_ptr: *mut u8,
     cap: usize,
+    private_storage: bool,
 }
 unsafe impl Send for RingChunk {}
 
@@ -40,22 +41,137 @@ impl Drop for RingChunk {
     }
 }
 
-/// Linear allocator of shared, resident GPU memory. Reset with its command
-/// allocator (D3D12 guarantees the GPU is done with it then).
+/// Process-wide pool of resident `UploadRing` chunks (shared upload + private GPU scratch),
+/// eliminating per-frame `newBuffer` + `MTLResidencySet::commit()` churn across allocator resets.
+static RING_POOL: Mutex<Vec<RingChunk>> = Mutex::new(Vec::new());
+
+/// Compute the per-storage-mode byte cap for [`RING_POOL`]: generous on macOS,
+/// right-sized on iOS so steady-state upload & ICB scratch chunks never thrash residency
+/// (`res_commit == 0`) without inflating `phys_footprint` into the XNU VM compressor band.
+fn ring_pool_budget_bytes() -> u64 {
+    if !cfg!(target_os = "ios") {
+        return 128 << 20;
+    }
+    if let Some(avail) = super::device::available_headroom_bytes() {
+        let total = super::device::process_phys_footprint().saturating_add(avail);
+        if total > (6656 << 20) {
+            return 24 << 20;
+        }
+    }
+    16 << 20
+}
+
+/// Return chunks to [`RING_POOL`], keeping the most useful chunks within `budget_bytes` per
+/// storage mode (`shared` vs `private`) and deferring release of any surplus.
+fn return_ring_chunks_to_pool(chunks: &mut Vec<RingChunk>) {
+    if chunks.is_empty() {
+        return;
+    }
+    let cap_bytes = ring_pool_budget_bytes();
+    let mut dropped = Vec::new();
+    if let Ok(mut p) = RING_POOL.lock() {
+        p.append(chunks);
+        for is_priv in [false, true] {
+            let mut idxs: Vec<usize> = p
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| (c.private_storage == is_priv).then_some(i))
+                .collect();
+            // Keep larger chunks first (satisfy wider allocations) up to cap_bytes.
+            idxs.sort_by(|&a, &b| p[b].cap.cmp(&p[a].cap));
+            let mut kept_bytes = 0u64;
+            let mut evict = Vec::new();
+            for idx in idxs {
+                let b = p[idx].cap as u64;
+                if kept_bytes == 0 || kept_bytes.saturating_add(b) <= cap_bytes {
+                    kept_bytes = kept_bytes.saturating_add(b);
+                } else {
+                    evict.push(idx);
+                }
+            }
+            evict.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in evict {
+                dropped.push(p.swap_remove(idx));
+            }
+        }
+    }
+    if !dropped.is_empty() {
+        super::queue::defer_release_all(dropped);
+    }
+}
+
+/// Release all idle pooled `UploadRing` buffers back to Metal/XNU once active queues drain.
+pub fn trim_pool() -> usize {
+    let dropped = if let Ok(mut p) = RING_POOL.lock() {
+        std::mem::take(&mut *p)
+    } else {
+        Vec::new()
+    };
+    let n = dropped.len();
+    if !dropped.is_empty() {
+        super::queue::defer_release_all(dropped);
+    }
+    n
+}
+
+/// Trim idle pooled `UploadRing` buffers down to `max_bytes_per_mode` per storage mode.
+pub fn trim_pool_keep(max_bytes_per_mode: u64) -> usize {
+    let mut dropped = Vec::new();
+    if let Ok(mut p) = RING_POOL.lock() {
+        for is_priv in [false, true] {
+            let mut idxs: Vec<usize> = p
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| (c.private_storage == is_priv).then_some(i))
+                .collect();
+            idxs.sort_by(|&a, &b| p[b].cap.cmp(&p[a].cap));
+            let mut kept_bytes = 0u64;
+            let mut evict = Vec::new();
+            for idx in idxs {
+                let b = p[idx].cap as u64;
+                if kept_bytes.saturating_add(b) <= max_bytes_per_mode {
+                    kept_bytes = kept_bytes.saturating_add(b);
+                } else {
+                    evict.push(idx);
+                }
+            }
+            evict.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in evict {
+                dropped.push(p.swap_remove(idx));
+            }
+        }
+    }
+    let n = dropped.len();
+    if !dropped.is_empty() {
+        super::queue::defer_release_all(dropped);
+    }
+    n
+}
+
+/// Linear allocator of resident GPU memory (shared CPU-upload or private GPU-only scratch).
+/// Reset with its command allocator (D3D12 guarantees the GPU is done with it then).
 pub struct UploadRing {
     chunks: Vec<RingChunk>,
     cur: usize,
     off: usize,
+    private_storage: bool,
 }
 unsafe impl Send for UploadRing {}
 
 impl Default for UploadRing {
     fn default() -> Self {
-        UploadRing { chunks: Vec::new(), cur: 0, off: 0 }
+        UploadRing { chunks: Vec::new(), cur: 0, off: 0, private_storage: false }
     }
 }
 
 impl UploadRing {
+    /// Create a GPU-only (`StorageModePrivate`) scratch ring for GPU-written/GPU-read
+    /// transient buffers (e.g. `ExecuteIndirect` ICB expansion scratch). Never call
+    /// [`Self::upload`] or dereference the CPU pointer returned by [`Self::alloc`] on it.
+    pub fn new_gpu_scratch() -> Self {
+        UploadRing { chunks: Vec::new(), cur: 0, off: 0, private_storage: true }
+    }
+
     /// Rewind the cursor to offset 0 without dropping chunks (safe between closed render
     /// passes for GPU-written/GPU-read scratch buffers protected by a GPU queue WAR barrier).
     pub fn rewind(&mut self) {
@@ -63,51 +179,72 @@ impl UploadRing {
         self.off = 0;
     }
 
-    pub fn reset(&mut self) {
-        self.cur = 0;
-        self.off = 0;
-        // On iOS, release any oversized transient spike chunks (> 1 MiB) and any extra
-        // chunks beyond 2 standard 1 MiB chunks on allocator reset via deferred GPU release
-        // so loading/indirect-draw spikes don't pin dozens of MiB across allocators.
-        #[cfg(target_os = "ios")]
+    /// Keep up to 2 chunks `<= 2 MiB` local to this allocator and return extra or
+    /// oversized chunks to the shared global `RING_POOL` so other in-flight allocators
+    /// reuse them with zero `newBuffer` / `MTLResidencySet::commit()` churn.
+    #[cfg(any(target_os = "ios", test))]
+    fn recycle_excess_chunks(&mut self) {
+        const LOCAL_KEEP_MAX: usize = 2 << 20;
         if !self.chunks.is_empty() {
             let mut kept = Vec::with_capacity(2);
-            let mut retired = Vec::new();
+            let mut returned = Vec::new();
             for c in self.chunks.drain(..) {
-                if c.cap <= CHUNK && kept.len() < 2 {
+                if c.cap <= LOCAL_KEEP_MAX && kept.len() < 2 {
                     kept.push(c);
                 } else {
-                    retired.push(c);
+                    returned.push(c);
                 }
             }
             self.chunks = kept;
-            if !retired.is_empty() {
-                super::queue::defer_release_all(retired);
+            if !returned.is_empty() {
+                return_ring_chunks_to_pool(&mut returned);
             }
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.cur = 0;
+        self.off = 0;
+        // On macOS, command allocators cycle every frame so retaining chunks locally
+        // avoids both pool mutex traffic and residency-set churn (`res_commit == 0`).
+        // On iOS (tight Jetsam headroom), cap per-allocator retention and recycle surplus
+        // chunks through `RING_POOL` so steady-state frames still have zero residency churn.
+        #[cfg(target_os = "ios")]
+        self.recycle_excess_chunks();
     }
 
     /// Copy `bytes` in; returns their GPU address.
     #[inline]
     pub fn upload(&mut self, bytes: &[u8], align: usize) -> Result<u64, String> {
+        debug_assert!(!self.private_storage, "UploadRing::upload called on StorageModePrivate ring");
         let (va, p) = self.alloc(bytes.len(), align)?;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
         Ok(va)
     }
 
     /// Reserve `n` bytes (contents undefined, e.g. GPU-written scratch);
-    /// returns (GPU address, CPU pointer).
+    /// returns `(GPU address, CPU pointer)` (`cpu_ptr` is null for `new_gpu_scratch()`).
     #[inline]
     pub fn alloc(&mut self, n: usize, align: usize) -> Result<(u64, *mut u8), String> {
         if let Some(c) = self.chunks.get(self.cur) {
             let at = self.off.next_multiple_of(align);
             if at + n <= c.cap {
                 self.off = at + n;
-                return Ok((c.gpu_va + at as u64, unsafe { c.cpu_ptr.add(at) }));
+                let ptr = if c.cpu_ptr.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { c.cpu_ptr.add(at) }
+                };
+                return Ok((c.gpu_va + at as u64, ptr));
             }
         }
         let (b, at) = self.alloc_buffer(n, align)?;
-        Ok((b.gpuAddress() + at as u64, unsafe { (b.contents().as_ptr() as *mut u8).add(at) }))
+        let ptr = if self.private_storage {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (b.contents().as_ptr() as *mut u8).add(at) }
+        };
+        Ok((b.gpuAddress() + at as u64, ptr))
     }
 
     /// Reserve `n` bytes and return `(MTLBuffer, byte_offset)`.
@@ -123,17 +260,53 @@ impl UploadRing {
                 self.off = 0;
                 continue;
             }
-            let d = super::device().ok_or("no device")?;
             let size = CHUNK.max(n.next_multiple_of(4096));
-            let opts = MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined | MTLResourceOptions::HazardTrackingModeUntracked;
-            let b = d.dev.newBufferWithLength_options(size, opts).ok_or_else(|| format!("upload ring: newBuffer({size})"))?;
-            b.setLabel(Some(&objc2_foundation::NSString::from_str("port root argument ring")));
-            d.add_resident(ProtocolObject::from_ref(&*b));
-            let gpu_va = b.gpuAddress();
-            let cpu_ptr = b.contents().as_ptr() as *mut u8;
-            let cap = b.length();
-            super::device::note_ring_alloc(cap as u64);
-            self.chunks.push(RingChunk { buf: b, gpu_va, cpu_ptr, cap });
+            // Reuse a warm resident chunk from RING_POOL (best-fit smallest chunk >= size
+            // and <= size*4 so 1 MiB requests never steal giant multi-MiB chunks).
+            let pooled = {
+                let mut p = RING_POOL.lock().unwrap();
+                let max_cap = size.saturating_mul(4);
+                let mut best: Option<usize> = None;
+                for (i, c) in p.iter().enumerate() {
+                    if c.private_storage == self.private_storage && c.cap >= size && c.cap <= max_cap {
+                        if best.is_none_or(|bi| c.cap < p[bi].cap) {
+                            best = Some(i);
+                        }
+                    }
+                }
+                best.map(|i| p.swap_remove(i))
+            };
+            let chunk = if let Some(c) = pooled {
+                c
+            } else {
+                let d = super::device().ok_or("no device")?;
+                let (opts, label) = if self.private_storage {
+                    (
+                        MTLResourceOptions::StorageModePrivate | MTLResourceOptions::HazardTrackingModeUntracked,
+                        "port gpu scratch ring",
+                    )
+                } else {
+                    (
+                        MTLResourceOptions::StorageModeShared
+                            | MTLResourceOptions::CPUCacheModeWriteCombined
+                            | MTLResourceOptions::HazardTrackingModeUntracked,
+                        "port root argument ring",
+                    )
+                };
+                let b = d.dev.newBufferWithLength_options(size, opts).ok_or_else(|| format!("upload ring: newBuffer({size})"))?;
+                b.setLabel(Some(&objc2_foundation::NSString::from_str(label)));
+                d.add_resident(ProtocolObject::from_ref(&*b));
+                let gpu_va = b.gpuAddress();
+                let cpu_ptr = if self.private_storage {
+                    std::ptr::null_mut()
+                } else {
+                    b.contents().as_ptr() as *mut u8
+                };
+                let cap = b.length();
+                super::device::note_ring_alloc(cap as u64);
+                RingChunk { buf: b, gpu_va, cpu_ptr, cap, private_storage: self.private_storage }
+            };
+            self.chunks.push(chunk);
             self.cur = self.chunks.len() - 1;
             self.off = 0;
         }
@@ -143,8 +316,9 @@ impl UploadRing {
 impl Drop for UploadRing {
     fn drop(&mut self) {
         if !self.chunks.is_empty() {
-            let retired = std::mem::take(&mut self.chunks);
-            super::queue::defer_release_all(retired);
+            // CommandAllocator guarantees GPU completion before Drop; recycle into RING_POOL
+            // so future allocators reuse resident chunks without residency churn.
+            return_ring_chunks_to_pool(&mut self.chunks);
         }
     }
 }
@@ -414,4 +588,59 @@ pub fn new_argument_table(label: &str) -> Option<Retained<MtlArgumentTable>> {
     desc.setSupportAttributeStrides(true);
     desc.setLabel(Some(&objc2_foundation::NSString::from_str(label)));
     d.dev.newArgumentTableWithDescriptor_error(&desc).map_err(|e| log::error!(target: "d3d", "newArgumentTable: {e}")).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_ring_pools_shared_and_private_chunks_and_trims() {
+        if crate::metal::device().is_none() {
+            return;
+        }
+        trim_pool();
+
+        // Shared CPU-writable ring: keeps small chunks local, recycles >4 MiB chunks into pool.
+        let mut shared = UploadRing::default();
+        let va0 = shared.upload(&[0xABu8; 256], 256).expect("shared upload 0");
+        assert_ne!(va0, 0);
+        // Trigger an oversized chunk (> 4 MiB).
+        let big = vec![0xCDu8; (4 << 20) + 4096];
+        let va1 = shared.upload(&big, 256).expect("shared upload big");
+        assert_ne!(va1, 0);
+        assert_eq!(shared.chunks.len(), 2);
+        shared.recycle_excess_chunks();
+        assert_eq!(shared.chunks.len(), 1);
+        assert!(RING_POOL.lock().unwrap().iter().any(|c| !c.private_storage && c.cap >= (4 << 20) + 4096));
+
+        // Private GPU-only scratch ring: cpu_ptr is null, chunks pool separately from shared.
+        let mut scratch = UploadRing::new_gpu_scratch();
+        let (sva0, sptr0) = scratch.alloc(64, 16).expect("scratch alloc 0");
+        assert_ne!(sva0, 0);
+        assert!(sptr0.is_null(), "private GPU scratch must not expose a CPU pointer");
+        let (sva1, sptr1) = scratch.alloc((4 << 20) + 4096, 256).expect("scratch alloc big");
+        assert_ne!(sva1, 0);
+        assert!(sptr1.is_null());
+        scratch.recycle_excess_chunks();
+        assert_eq!(scratch.chunks.len(), 1);
+        assert!(RING_POOL.lock().unwrap().iter().any(|c| c.private_storage && c.cap >= (4 << 20) + 4096));
+
+        // Re-allocating the same private size reuses the pooled chunk (zero new buffer allocation).
+        let pooled_va = RING_POOL
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.private_storage && c.cap >= (4 << 20) + 4096)
+            .map(|c| c.gpu_va)
+            .unwrap();
+        let (sva2, _) = scratch.alloc((4 << 20) + 4096, 256).expect("scratch reuse big");
+        assert_eq!(sva2, pooled_va, "second scratch alloc should reuse pooled private chunk");
+
+        drop(shared);
+        drop(scratch);
+        assert!(!RING_POOL.lock().unwrap().is_empty());
+        trim_pool();
+        assert!(RING_POOL.lock().unwrap().is_empty());
+    }
 }
