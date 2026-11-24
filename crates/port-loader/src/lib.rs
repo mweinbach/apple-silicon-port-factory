@@ -641,6 +641,8 @@ fn init_boot_log() {
         )
     });
 
+    let child_stdio_mode = std::env::var_os("PORT_CHILD_STDIO").is_some_and(|v| v == "1");
+
     unsafe {
         let is_tty = libc::isatty(2) != 0;
         let cwd_root = std::env::current_dir().is_ok_and(|p| p == std::path::Path::new("/"));
@@ -648,7 +650,7 @@ fn init_boot_log() {
             let _ = std::env::set_current_dir(&log_dir);
         }
         if let Some(f) = file {
-            if !is_tty && !cli_stdout_mode {
+            if !is_tty && !cli_stdout_mode && !child_stdio_mode {
                 use std::os::fd::AsRawFd;
                 libc::dup2(f.as_raw_fd(), 1);
                 libc::dup2(f.as_raw_fd(), 2);
@@ -907,6 +909,25 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             bail!("--aot-to-o requires an aarch64 host");
         }
     }
+    let child_process_mode = std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1");
+    if child_process_mode {
+        x86_runtime::emu::set_disk_aot_disabled(true);
+        for k in [
+            "PORT_AOT_DIR",
+            "AW2_DLL_AOT_DIR",
+            "PORT_AOT_FALLBACK_DIR",
+            "PORT_AOT_DYLIB",
+            "AW2_AOT_DYLIB",
+            "PORT_AOT_BUILD",
+            "AW2_DLL_AOT_BUILD",
+            "PORT_JIT_PROFILE",
+            "AW2_JIT_PROFILE",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("PORT_AOT", "0");
+        std::env::set_var("AW2_DLL_AOT", "0");
+    }
     let mut temp_static_aot_stage: Option<std::path::PathBuf> = None;
     if let Some(ref out_dir) = args.emit_static_o {
         // Static signed __TEXT cannot self-patch runtime literal slots or LSE2 traps:
@@ -922,8 +943,10 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             temp_static_aot_stage = Some(stage);
         }
     }
-    if let Some(ref dir) = args.aot_dir {
-        std::env::set_var("PORT_AOT_DIR", dir);
+    if !child_process_mode {
+        if let Some(ref dir) = args.aot_dir {
+            std::env::set_var("PORT_AOT_DIR", dir);
+        }
     }
     let (manifest, manifest_dir) = match target::discover_with_path(args.manifest_path.as_deref()) {
         Some((m, path)) => (Some(m), path.parent().map(|d| d.to_path_buf())),
@@ -942,28 +965,30 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                 std::env::set_var("SteamGameId", app_id);
             }
         }
-        if let Some(aot_dir) = &m.aot_dir {
-            let trimmed = aot_dir.trim();
-            if !trimmed.is_empty()
-                && args.aot_dir.is_none()
-                && std::env::var_os("PORT_AOT_DIR").is_none()
-                && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
-            {
-                let p = std::path::PathBuf::from(trimmed);
-                let resolved = if p.is_relative() {
-                    manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
-                } else {
-                    p
-                };
-                std::env::set_var("PORT_AOT_DIR", resolved);
+        if !child_process_mode {
+            if let Some(aot_dir) = &m.aot_dir {
+                let trimmed = aot_dir.trim();
+                if !trimmed.is_empty()
+                    && args.aot_dir.is_none()
+                    && std::env::var_os("PORT_AOT_DIR").is_none()
+                    && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
+                {
+                    let p = std::path::PathBuf::from(trimmed);
+                    let resolved = if p.is_relative() {
+                        manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
+                    } else {
+                        p
+                    };
+                    std::env::set_var("PORT_AOT_DIR", resolved);
+                }
             }
-        }
-        if let Some(aot) = &m.aot_dylibs {
-            if !aot.is_empty()
-                && std::env::var_os("PORT_AOT_DYLIB").is_none()
-                && std::env::var_os("AW2_AOT_DYLIB").is_none()
-            {
-                std::env::set_var("PORT_AOT_DYLIB", aot);
+            if let Some(aot) = &m.aot_dylibs {
+                if !aot.is_empty()
+                    && std::env::var_os("PORT_AOT_DYLIB").is_none()
+                    && std::env::var_os("AW2_AOT_DYLIB").is_none()
+                {
+                    std::env::set_var("PORT_AOT_DYLIB", aot);
+                }
             }
         }
     }
@@ -1046,8 +1071,10 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     {
         use std::io::Write;
+        let child_stdio_mode = std::env::var_os("PORT_CHILD_STDIO").is_some_and(|v| v == "1");
+        let child_log_stderr = std::env::var_os("PORT_CHILD_LOG_STDERR").is_some_and(|v| v == "1");
         let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-        builder.format(|buf, record| {
+        builder.format(move |buf, record| {
             let ts = buf.timestamp_millis();
             let line = format!("[{ts} {:5} {}] {}\n", record.level(), record.target(), record.args());
             if let Some(m) = BOOT_LOG_TEE.get() {
@@ -1055,9 +1082,23 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                     let _ = f.write_all(line.as_bytes());
                 }
             }
+            if child_stdio_mode && !child_log_stderr {
+                return Ok(());
+            }
             buf.write_all(line.as_bytes())
         });
         let _ = builder.try_init();
+    }
+    if let Ok(cur_exe) = std::env::current_exe() {
+        w::process::set_runner_exe(cur_exe);
+    }
+    w::process::init_trusted_host_env();
+    w::process::lock_trusted_runner();
+    w::process::init_exit_code_channel();
+    if child_process_mode {
+        log::info!(
+            "port-runner: child-process mode — disk-sourced native AOT caches and dylibs disabled (using in-memory translator)"
+        );
     }
     raise_fd_limit();
 
@@ -1179,21 +1220,45 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     live_ctl::install();
     setup_filesystem(&game_dir, &game_win_dir, &args)?;
+    if let Some(child_cwd) = std::env::var("PORT_CHILD_CWD").ok().filter(|s| !s.is_empty()) {
+        w::path::set_cwd(&child_cwd);
+    }
+    std::env::remove_var("PORT_CHILD_CWD");
 
     // Process-wide Windows state.
-    let exe_win = format!("{game_win_dir}\\{}", args.exe);
-    let mut cmdline = format!("\"{exe_win}\"");
-    for a in &args.game_args {
-        if a.contains(' ') {
-            cmdline.push_str(&format!(" \"{a}\""));
-        } else {
-            cmdline.push(' ');
-            cmdline.push_str(a);
+    let exe_win = std::env::var("PORT_CHILD_EXE_WIN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{game_win_dir}\\{}", args.exe));
+    std::env::remove_var("PORT_CHILD_EXE_WIN");
+    let cmdline = if let Some(c) = std::env::var("PORT_CHILD_CMDLINE").ok().filter(|s| !s.is_empty()) {
+        c
+    } else {
+        let mut c = format!("\"{exe_win}\"");
+        for a in &args.game_args {
+            if a.contains(' ') {
+                c.push_str(&format!(" \"{a}\""));
+            } else {
+                c.push(' ');
+                c.push_str(a);
+            }
         }
-    }
+        c
+    };
+    std::env::remove_var("PORT_CHILD_CMDLINE");
     w::process::init(w::process::ProcessConfig { exe_path: exe_win.clone(), cmdline: cmdline.clone() });
-    w::process::init_env(&[]);
-    unsafe { w::teb::set_process_parameters(&exe_win, &cmdline, &format!("{game_win_dir}\\"), w::process::env_block_w()) };
+    if let Ok(encoded_env) = std::env::var("PORT_CHILD_ENV") {
+        std::env::remove_var("PORT_CHILD_ENV");
+        if let Some(vars) = w::process::decode_env_list(&encoded_env) {
+            w::process::replace_env(vars);
+        } else {
+            w::process::init_env(&[]);
+        }
+    } else {
+        w::process::init_env(&[]);
+    }
+    let cwd_for_peb = format!("{}\\", w::path::cwd().trim_end_matches('\\'));
+    unsafe { w::teb::set_process_parameters(&exe_win, &cmdline, &cwd_for_peb, w::process::env_block_w()) };
     w::teb::map_kuser_shared_data();
 
     let l = loader::init_with_routing(
@@ -1262,6 +1327,16 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             exe.base,
             h.image_base
         );
+    }
+    let prewarm_mode = args.prewarm_aot || args.emit_static_o.is_some();
+    if prewarm_mode {
+        let bundled = l.prewarm_map_bundled_plugins(&exe_host, manifest.as_ref());
+        if !bundled.is_empty() {
+            log::info!(
+                "prewarm: mapped {} bundled plugin(s) without running TLS/DllMain",
+                bundled.len()
+            );
+        }
     }
     if let Some(ref out_dir) = args.emit_static_o {
         #[cfg(target_arch = "aarch64")]

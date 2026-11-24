@@ -2471,3 +2471,445 @@ fn cached_preferred_base_reads_matching_header_only() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Build a synthetic mapped PE32+ plugin image at `buf` (relocated to `buf.as_ptr()`) covering:
+/// - Exported `run_register` (ord 1, @ 0x1000) calling:
+///   - `kernel32.dll!ReadFileEx` with 5th stack arg `[rsp + 0x20]` -> `0x1200` (APC)
+///   - `kernel32.dll!CreateThread` with 3rd arg `r8` -> `0x1220` (Worker)
+///   - `kernel32.dll!FlsAlloc` with 1st arg `rcx` -> `0x1240` (FLS)
+///   - `comctl32.dll!#410` (ordinal 410 = SetWindowSubclass) with 2nd arg `rdx` -> `0x1260` (WndProc)
+/// - `.CRT$XCA` ctor pointer -> `0x1280` (CrtCtorDtor)
+/// - `.pdata` `UNW_FLAG_EHANDLER` handler -> `0x12A0` (UnwindHandler) + `C_SCOPE_TABLE` JumpTarget -> `0x10B0` (EhContinuation)
+/// - Load Config `GuardEHContinuationTable` -> `0x10B0` (EhContinuation)
+/// - Static COM sink vtable in `.rdata` @ `0x2600` (3 methods: `0x12C0`, `0x12E0`, `0x1300`) stored into `[rcx]`
+/// - Unreferenced hidden callback @ `0x1340` (NOT in exports, `.pdata`, `.reloc`, or static reg sites;
+///   only discovered at runtime and replayed across base-address relocation via ImageFingerprint!)
+/// - Non-executable `.rdata` sentinel @ `0x2700` (must NEVER be recorded or replayed: code vs data!)
+fn fill_callback_plugin_pe(buf: &mut [u8], timestamp: u32, extra_text_byte: u8) {
+    buf.fill(0);
+    let base = buf.as_ptr() as u64;
+    let opt_base: u64 = 0x1_8000_0000;
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    w16(buf, 0, 0x5A4D);
+    w32(buf, 0x3C, 0x80);
+    w32(buf, 0x80, 0x0000_4550);
+    w16(buf, 0x84, 0x8664);
+    w16(buf, 0x86, 4); // .text, .rdata, .CRT$XCA, .reloc
+    w32(buf, 0x88, timestamp); // TimeDateStamp
+    w16(buf, 0x94, 240);
+    w16(buf, 0x96, 0x2022);
+    let opt = 0x98;
+    w16(buf, opt, 0x20B);
+    w32(buf, opt + 16, 0x1000);
+    w64(buf, opt + 24, opt_base);
+    w32(buf, opt + 32, 0x1000);
+    w32(buf, opt + 36, 0x1000);
+    w32(buf, opt + 56, buf.len() as u32);
+    w32(buf, opt + 60, 0x400);
+    w32(buf, opt + 108, 16);
+
+    // Data directories:
+    // [0] Export @ 0x2000 (0x100)
+    w32(buf, opt + 112, 0x2000);
+    w32(buf, opt + 116, 0x100);
+    // [1] Import @ 0x2100 (0x100)
+    w32(buf, opt + 112 + 8, 0x2100);
+    w32(buf, opt + 112 + 12, 0x100);
+    // [3] .pdata @ 0x2300 (12)
+    w32(buf, opt + 112 + 3 * 8, 0x2300);
+    w32(buf, opt + 112 + 3 * 8 + 4, 12);
+    // [5] .reloc @ 0x3000 (16)
+    w32(buf, opt + 112 + 5 * 8, 0x3000);
+    w32(buf, opt + 112 + 5 * 8 + 4, 16);
+    // [10] Load Config @ 0x2400 (0x140)
+    w32(buf, opt + 112 + 10 * 8, 0x2400);
+    w32(buf, opt + 112 + 10 * 8 + 4, 0x140);
+
+    let sec = opt + 240;
+    let put_sec = |b: &mut [u8], idx: usize, name: &[u8; 8], rva: u32, sz: u32, ch: u32| {
+        let o = sec + idx * 40;
+        b[o..o + 8].copy_from_slice(name);
+        w32(b, o + 8, sz);
+        w32(b, o + 12, rva);
+        w32(b, o + 16, sz);
+        w32(b, o + 20, rva);
+        w32(b, o + 36, ch);
+    };
+    put_sec(buf, 0, b".text\0\0\0", 0x1000, 0x1000, 0x6000_0020);
+    put_sec(buf, 1, b".rdata\0\0", 0x2000, 0x0800, 0x4000_0040);
+    put_sec(buf, 2, b".CRT$XCA", 0x2800, 0x0200, 0x4000_0040);
+    put_sec(buf, 3, b".reloc\0\0", 0x3000, 0x0200, 0x4200_0040);
+
+    // Exports @ 0x2000: ord 1 -> run_register @ 0x1000
+    w32(buf, 0x2000 + 16, 1);
+    w32(buf, 0x2000 + 20, 1);
+    w32(buf, 0x2000 + 24, 1);
+    w32(buf, 0x2000 + 28, 0x2040);
+    w32(buf, 0x2000 + 32, 0x2050);
+    w32(buf, 0x2000 + 36, 0x2060);
+    w32(buf, 0x2040, 0x1000);
+    w32(buf, 0x2050, 0x2070);
+    w16(buf, 0x2060, 0);
+    buf[0x2070..0x2070 + 13].copy_from_slice(b"run_register\0");
+
+    // Imports @ 0x2100:
+    // Desc 0: kernel32.dll -> ReadFileEx (0x2200), CreateThread (0x2208), FlsAlloc (0x2210)
+    // Desc 1: comctl32.dll -> #410 (0x2220)
+    w32(buf, 0x2100, 0x2160);
+    w32(buf, 0x2100 + 12, 0x21A0);
+    w32(buf, 0x2100 + 16, 0x2200);
+    w32(buf, 0x2114, 0x2180);
+    w32(buf, 0x2114 + 12, 0x21B0);
+    w32(buf, 0x2114 + 16, 0x2220);
+    w64(buf, 0x2160, 0x21C0);
+    w64(buf, 0x2168, 0x21D0);
+    w64(buf, 0x2170, 0x21E4);
+    w64(buf, 0x2180, (1u64 << 63) | 410); // ordinal 410 = SetWindowSubclass
+    buf[0x21A0..0x21A0 + 13].copy_from_slice(b"kernel32.dll\0");
+    buf[0x21B0..0x21B0 + 13].copy_from_slice(b"comctl32.dll\0");
+    buf[0x21C2..0x21C2 + 11].copy_from_slice(b"ReadFileEx\0");
+    buf[0x21D2..0x21D2 + 13].copy_from_slice(b"CreateThread\0");
+    buf[0x21E6..0x21E6 + 9].copy_from_slice(b"FlsAlloc\0");
+
+    // .pdata @ 0x2300: 0x1000..0x10D0 with UNW_FLAG_EHANDLER -> 0x12A0 + JumpTarget -> 0x10B0
+    w32(buf, 0x2300, 0x1000);
+    w32(buf, 0x2304, 0x10D0);
+    w32(buf, 0x2308, 0x2320);
+    buf[0x2320] = 0x01 | (1 << 3);
+    w32(buf, 0x2324, 0x12A0);
+    w32(buf, 0x2328, 1);
+    w32(buf, 0x232C, 0x1004);
+    w32(buf, 0x2330, 0x10A0);
+    w32(buf, 0x2334, 1);
+    w32(buf, 0x2338, 0x10B0);
+
+    // Load Config @ 0x2400 with GuardEHContinuationTable @ 0x2560 (relocated VA)
+    w32(buf, 0x2400, 0x140);
+    w32(buf, 0x2400 + 0x90, 0x0040_0000);
+    w64(buf, 0x2400 + 0x110, base + 0x2560);
+    w64(buf, 0x2400 + 0x118, 1);
+    w32(buf, 0x2560, 0x10B0);
+
+    // Static COM vtable @ 0x2600 (3 methods: QI=0x12C0, AddRef=0x12E0, Release=0x1300)
+    w64(buf, 0x2600, base + 0x12C0);
+    w64(buf, 0x2608, base + 0x12E0);
+    w64(buf, 0x2610, base + 0x1300);
+
+    // .CRT$XCA @ 0x2800: ctor -> 0x1280
+    w64(buf, 0x2800, base + 0x1280);
+
+    // .text @ 0x1000: static registration sites + COM vtable store + DIR64 relocated imm64 @ 0x1080
+    let mut c = Vec::new();
+    let emit_lea_rip = |v: &mut Vec<u8>, reg_code: u8, target_rva: u32| {
+        let next_rva = 0x1000u32 + v.len() as u32 + 7;
+        let rex = 0x48 | ((reg_code >> 3) << 2);
+        let modrm = 0x05 | ((reg_code & 7) << 3);
+        let disp = (target_rva as i32 - next_rva as i32).to_le_bytes();
+        v.extend_from_slice(&[rex, 0x8D, modrm, disp[0], disp[1], disp[2], disp[3]]);
+    };
+    let emit_call_iat = |v: &mut Vec<u8>, iat_rva: u32| {
+        let next_rva = 0x1000u32 + v.len() as u32 + 6;
+        let disp = (iat_rva as i32 - next_rva as i32).to_le_bytes();
+        v.extend_from_slice(&[0xFF, 0x15, disp[0], disp[1], disp[2], disp[3]]);
+    };
+    // sub rsp, 0x38
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
+    // 1) ReadFileEx with 5th arg [rsp + 0x20] = 0x1200
+    emit_lea_rip(&mut c, 0 /* rax */, 0x1200);
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax
+    emit_call_iat(&mut c, 0x2200);
+    // 2) CreateThread with r8 = 0x1220
+    emit_lea_rip(&mut c, 8 /* r8 */, 0x1220);
+    emit_call_iat(&mut c, 0x2208);
+    // 3) FlsAlloc with rcx = 0x1240
+    emit_lea_rip(&mut c, 1 /* rcx */, 0x1240);
+    emit_call_iat(&mut c, 0x2210);
+    // 4) comctl32!#410 (SetWindowSubclass) with rdx = 0x1260
+    emit_lea_rip(&mut c, 2 /* rdx */, 0x1260);
+    emit_call_iat(&mut c, 0x2220);
+    // 5) Store COM vtable 0x2600 into [rcx]
+    emit_lea_rip(&mut c, 0 /* rax */, 0x2600);
+    c.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+    // add rsp, 0x38; ret
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38, 0xC3]);
+    assert!(c.len() <= 0x80);
+    buf[0x1000..0x1000 + c.len()].copy_from_slice(&c);
+
+    // Relocated 64-bit immediate in .text @ 0x1080 (`mov rax, base + 0x2700; ret`) with a DIR64 reloc
+    // at 0x1082 so `image_fingerprint` exercises DIR64 un-relocation inside `.text`!
+    buf[0x1080] = 0x48;
+    buf[0x1081] = 0xB8;
+    w64(buf, 0x1082, base + 0x2700);
+    buf[0x108A] = 0xC3;
+    // .reloc block @ 0x3000: page 0x1000, size 12 (+2 pad -> 16), 1 DIR64 entry @ 0x082
+    w32(buf, 0x3000, 0x1000);
+    w32(buf, 0x3004, 12);
+    w16(buf, 0x3008, (10 << 12) | 0x082);
+
+    // EH continuation landing pad @ 0x10B0
+    buf[0x10B0..0x10B6].copy_from_slice(&[0xB8, 0xE4, 0x00, 0x00, 0x00, 0xC3]);
+
+    // Callback bodies:
+    let put_ret_imm = |b: &mut [u8], rva: usize, imm: u8| {
+        b[rva..rva + 6].copy_from_slice(&[0xB8, imm, 0x00, 0x00, 0x00, 0xC3]);
+    };
+    put_ret_imm(buf, 0x1200, 0x11); // APC
+    put_ret_imm(buf, 0x1220, 0x22); // Worker
+    put_ret_imm(buf, 0x1240, 0x33); // FLS
+    put_ret_imm(buf, 0x1260, 0x44); // WndProc (SetWindowSubclass #410)
+    put_ret_imm(buf, 0x1280, 0x55); // CRT ctor
+    put_ret_imm(buf, 0x12A0, 0x66); // Unwind handler
+    put_ret_imm(buf, 0x12C0, 0x71); // COM QI
+    put_ret_imm(buf, 0x12E0, 0x72); // COM AddRef
+    put_ret_imm(buf, 0x1300, 0x73); // COM Release
+    // Runtime-only hidden callback @ 0x1340: returns rcx + extra_text_byte
+    // mov rax, rcx; add rax, imm8; ret
+    buf[0x1340..0x1348].copy_from_slice(&[0x48, 0x89, 0xC8, 0x48, 0x83, 0xC0, extra_text_byte, 0xC3]);
+}
+
+#[test]
+fn callback_roots_fingerprint_relocation_replay_and_stale_invalidation() {
+    use super::callbacks::{
+        clear_runtime_callbacks_for_test, discover_all_callback_roots, flush_runtime_callbacks,
+        image_fingerprint, load_replayed_callback_roots, record_runtime_callback, CallbackKind,
+        CallbackRoot,
+    };
+
+    let dir = test_dir("cb-replay");
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+    clear_runtime_callbacks_for_test();
+
+    // Two distinct mapped addresses simulating relocation across runs.
+    let mut img1 = vec![0u8; 0x4000];
+    let mut img2 = vec![0u8; 0x4000];
+    let mut img_stale = vec![0u8; 0x4000];
+    fill_callback_plugin_pe(&mut img1, 0x6700_0001, 7);
+    fill_callback_plugin_pe(&mut img2, 0x6700_0001, 7);
+    fill_callback_plugin_pe(&mut img_stale, 0x6700_0001, 9); // 1-byte code change -> stale!
+
+    let b1 = img1.as_ptr() as usize;
+    let b2 = img2.as_ptr() as usize;
+    let bs = img_stale.as_ptr() as usize;
+    assert_ne!(b1, b2);
+
+    // 1. Fingerprint is relocation-invariant (even with a DIR64 reloc in `.text`) and
+    //    changes immediately on any code modification (stale image invalidation).
+    let fp1 = unsafe { image_fingerprint(b1, img1.len()) }.expect("fp1");
+    let fp2 = unsafe { image_fingerprint(b2, img2.len()) }.expect("fp2");
+    let fps = unsafe { image_fingerprint(bs, img_stale.len()) }.expect("fps");
+    assert_eq!(fp1, fp2, "identical PE relocated to another base must share fingerprint");
+    assert_ne!(fp1, fps, "modified PE must invalidate image fingerprint");
+
+    // 2. Static callback discovery covers APC (ReadFileEx arg5), Worker, FLS, WndProc (#410),
+    //    CRT ctor, UnwindHandler, EhContinuation (distinct context), and COM sink vtable.
+    let static_roots = unsafe { discover_all_callback_roots("cb_plugin.dll", b1, img1.len()) };
+    let has = |rva: u32, kind: CallbackKind| {
+        static_roots.contains(&CallbackRoot { rva, kind })
+    };
+    assert!(has(0x1200, CallbackKind::Apc), "ReadFileEx 5th-arg stack callback: {static_roots:?}");
+    assert!(has(0x1220, CallbackKind::Worker), "CreateThread callback");
+    assert!(has(0x1240, CallbackKind::Fls), "FlsAlloc callback");
+    assert!(has(0x1260, CallbackKind::WndProc), "SetWindowSubclass (#410) callback");
+    assert!(has(0x1280, CallbackKind::CrtCtorDtor), ".CRT$XCA ctor");
+    assert!(has(0x12A0, CallbackKind::UnwindHandler), ".pdata unwind handler");
+    assert!(has(0x10B0, CallbackKind::EhContinuation), "EH continuation (distinct context)");
+    assert!(CallbackKind::EhContinuation.is_eh_continuation());
+    assert!(!CallbackKind::WndProc.is_eh_continuation());
+    assert!(has(0x12C0, CallbackKind::ComSink) && has(0x12E0, CallbackKind::ComSink) && has(0x1300, CallbackKind::ComSink), "COM sink vtable");
+    // Hidden callback 0x1340 is NOT yet known statically; data sentinel 0x2700 must NEVER appear.
+    assert!(!static_roots.iter().any(|c| c.rva == 0x1340));
+    assert!(!static_roots.iter().any(|c| c.rva == 0x2700));
+
+    // 3. Runtime callback recording enforces guest-vs-host and code-vs-data discipline,
+    //    persists only module-relative RVAs + fingerprint, and replays after relocation!
+    module_mapped("cb_plugin.dll", b1, img1.len());
+    // Reject null, data-section pointer, and host-native VA.
+    assert!(!record_runtime_callback(0, CallbackKind::GenericCallback));
+    assert!(!record_runtime_callback(b1 as u64 + 0x2700, CallbackKind::GenericCallback));
+    let fake_host_va = b1 as u64 + 0x1340;
+    // Registering a native VA temporarily proves host-callable pointers are rejected.
+    crate::exe::register_native_va(fake_host_va, 0x1234_5678);
+    assert!(!record_runtime_callback(fake_host_va, CallbackKind::GenericCallback));
+    crate::exe::unregister_native_va(fake_host_va);
+
+    // Record the real runtime-discovered hidden guest callback @ base1 + 0x1340 and flush.
+    assert!(record_runtime_callback(b1 as u64 + 0x1340, CallbackKind::Timer));
+    flush_runtime_callbacks();
+
+    // Verify persisted file contains NO raw host pointers or raw base1 VA.
+    let cb_file = dir.join("callbacks").join(format!("cb_plugin.dll-{}.tsv", fp1.hex()));
+    let persisted = std::fs::read_to_string(&cb_file).expect("read persisted callbacks");
+    assert!(persisted.contains("0x00001340\ttimer"), "expected RVA entry in:\n{persisted}");
+    assert!(!persisted.contains(&format!("{b1:x}")), "must not persist raw base VA");
+
+    // 4. Relocated image at `b2` replays `0x1340` cleanly; stale image at `bs` rejects it!
+    let replayed_b2 = unsafe { load_replayed_callback_roots("cb_plugin.dll", b2, img2.len()) };
+    assert!(
+        replayed_b2.contains(&CallbackRoot { rva: 0x1340, kind: CallbackKind::Timer }),
+        "relocated image must replay runtime-discovered callback RVA: {replayed_b2:?}"
+    );
+    let replayed_stale =
+        unsafe { load_replayed_callback_roots("cb_plugin.dll", bs, img_stale.len()) };
+    assert!(
+        replayed_stale.is_empty(),
+        "stale modified image must NOT replay old callback RVAs: {replayed_stale:?}"
+    );
+
+    // 5. Cold prewarm of the relocated image at `b2` includes the replayed callback `0x1340`,
+    //    and activating AOT hits `b2 + 0x1340` on the VERY FIRST callback hit after relocation!
+    module_mapped("cb_plugin.dll", b2, img2.len());
+    let reports = aot_prewarm_all_mapped(0);
+    let rep_b2 = reports.iter().rev().find(|r| r.module == "cb_plugin.dll").expect("b2 prewarm");
+    assert!(rep_b2.cache_path.as_ref().is_some_and(|p| p.is_file()));
+
+    let key_b2 = unsafe { module_key(b2, img2.len()) };
+    TEST_AOT.with(|c| c.set(true));
+    let loaded_ips = unsafe { load_module("cb_plugin.dll", b2, img2.len(), &key_b2) }
+        .expect("load relocated prewarmed cache");
+    assert!(
+        loaded_ips.contains(&(b2 as u64 + 0x1340)),
+        "prewarmed relocated cache must contain replayed callback block 0x1340"
+    );
+    assert!(
+        find(b2 as u64 + 0x1340).is_some(),
+        "first callback hit after relocation must hit live AOT directory directly"
+    );
+    let res = unsafe { crate::emu::emu_run(b2 as u64 + 0x1340, [40, 0, 0, 0, 0, 0, 0, 0]) };
+    assert_eq!(res, 47, "callback(40) = 40 + 7");
+    TEST_AOT.with(|c| c.set(false));
+
+    // Clean up test env & MAPPED entries.
+    if let Ok(mut m) = MAPPED.lock() {
+        m.retain(|x| x.name != "cb_plugin.dll");
+    }
+    clear_runtime_callbacks_for_test();
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression for PR #2 review finding: `Loader::load_pe_with_opts` rewrites
+/// `OptionalHeader.ImageBase` to the actual mapped base after applying DIR64 relocations.
+/// `image_fingerprint` must normalize relocated executable-section immediates against the
+/// mapped base (module-relative offset) so distinct mappings of the same PE produce the
+/// exact same fingerprint and replay persisted callback roots, while still rejecting both
+/// modified non-relocated code bytes and modified DIR64 target RVAs.
+#[test]
+fn image_fingerprint_dir64_normalizes_with_rewritten_optional_header_image_base() {
+    use super::callbacks::{
+        clear_runtime_callbacks_for_test, flush_runtime_callbacks, image_fingerprint,
+        load_replayed_callback_roots, record_runtime_callback, CallbackKind, CallbackRoot,
+    };
+
+    let dir = test_dir("cb-fp-header-rewrite");
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+    clear_runtime_callbacks_for_test();
+
+    // Helper: fill synthetic PE with a DIR64 relocation in `.text` (0x1082 -> target_rva)
+    // and optionally rewrite OptionalHeader.ImageBase (opt + 24 = 0x98 + 24) to the mapped base,
+    // matching `Loader::load_pe_with_opts` lines 1048-1055.
+    let build_mapped = |buf: &mut [u8], extra_text_byte: u8, dir64_target_rva: u64, rewrite_opt_base: bool| {
+        fill_callback_plugin_pe(buf, 0x6700_0042, extra_text_byte);
+        let mapped_base = buf.as_ptr() as u64;
+        // Overwrite the DIR64 relocated slot @ 0x1082 with `mapped_base + dir64_target_rva`.
+        buf[0x1082..0x108A].copy_from_slice(&mapped_base.wrapping_add(dir64_target_rva).to_le_bytes());
+        if rewrite_opt_base {
+            let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
+            buf[e_lfanew + 24 + 24..e_lfanew + 24 + 32].copy_from_slice(&mapped_base.to_le_bytes());
+        }
+    };
+
+    let mut img_a = vec![0u8; 0x4000];
+    let mut img_b = vec![0u8; 0x4000];
+    let mut img_unrewritten = vec![0u8; 0x4000];
+    let mut img_stale_code = vec![0u8; 0x4000];
+    let mut img_stale_reloc_target = vec![0u8; 0x4000];
+
+    build_mapped(&mut img_a, 7, 0x2700, true);
+    build_mapped(&mut img_b, 7, 0x2700, true);
+    build_mapped(&mut img_unrewritten, 7, 0x2700, false);
+    build_mapped(&mut img_stale_code, 9, 0x2700, true);
+    build_mapped(&mut img_stale_reloc_target, 7, 0x2708, true);
+
+    let ba = img_a.as_ptr() as usize;
+    let bb = img_b.as_ptr() as usize;
+    let bu = img_unrewritten.as_ptr() as usize;
+    let bsc = img_stale_code.as_ptr() as usize;
+    let bsr = img_stale_reloc_target.as_ptr() as usize;
+    assert_ne!(ba, bb);
+
+    // Confirm OptionalHeader.ImageBase really was rewritten to each distinct mapped base.
+    let read_opt_base = |buf: &[u8]| -> u64 {
+        let e_lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().unwrap()) as usize;
+        u64::from_le_bytes(buf[e_lfanew + 24 + 24..e_lfanew + 24 + 32].try_into().unwrap())
+    };
+    assert_eq!(read_opt_base(&img_a), ba as u64);
+    assert_eq!(read_opt_base(&img_b), bb as u64);
+    assert_ne!(read_opt_base(&img_a), read_opt_base(&img_b));
+
+    let fp_a = unsafe { image_fingerprint(ba, img_a.len()) }.expect("fp_a");
+    let fp_b = unsafe { image_fingerprint(bb, img_b.len()) }.expect("fp_b");
+    let fp_u = unsafe { image_fingerprint(bu, img_unrewritten.len()) }.expect("fp_u");
+    let fp_sc = unsafe { image_fingerprint(bsc, img_stale_code.len()) }.expect("fp_sc");
+    let fp_sr = unsafe { image_fingerprint(bsr, img_stale_reloc_target.len()) }.expect("fp_sr");
+
+    assert_eq!(
+        fp_a, fp_b,
+        "distinct mappings with rewritten OptionalHeader.ImageBase and DIR64 code reloc must share fingerprint"
+    );
+    assert_eq!(
+        fp_a, fp_u,
+        "rewritten and unrewritten OptionalHeader.ImageBase must normalize to the same module-relative fingerprint"
+    );
+    assert_ne!(fp_a, fp_sc, "non-relocated code change must invalidate fingerprint");
+    assert_ne!(fp_a, fp_sr, "DIR64 relocated target RVA change must invalidate fingerprint");
+
+    // Record runtime callback at `ba` (with rewritten OptionalHeader.ImageBase) and replay at `bb`.
+    let mod_name = "cb_hdr_rewrite_test.dll";
+    module_mapped(mod_name, ba, img_a.len());
+    assert!(record_runtime_callback(ba as u64 + 0x1340, CallbackKind::Worker));
+    flush_runtime_callbacks();
+
+    let replayed_b = unsafe { load_replayed_callback_roots(mod_name, bb, img_b.len()) };
+    assert!(
+        replayed_b.contains(&CallbackRoot { rva: 0x1340, kind: CallbackKind::Worker }),
+        "recorded runtime root must replay at second mapping with rewritten ImageBase: {replayed_b:?}"
+    );
+    assert!(
+        unsafe { load_replayed_callback_roots(mod_name, bsc, img_stale_code.len()) }.is_empty(),
+        "stale code bytes must reject replayed roots"
+    );
+    assert!(
+        unsafe { load_replayed_callback_roots(mod_name, bsr, img_stale_reloc_target.len()) }.is_empty(),
+        "stale DIR64 relocated target RVA must reject replayed roots"
+    );
+
+    if let Ok(mut m) = MAPPED.lock() {
+        m.retain(|x| x.name != mod_name);
+    }
+    clear_runtime_callbacks_for_test();
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

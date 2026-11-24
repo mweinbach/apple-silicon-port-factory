@@ -447,7 +447,17 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
             continue;
         }
 
-        let roots = unsafe { discover_pe_roots(base, size, max_roots_per_module) };
+        let mut roots = unsafe { discover_pe_roots(base, size, 0) };
+        let replayed = unsafe { super::callbacks::load_replayed_callback_roots(&name, base, size) };
+        let replayed_count = replayed.len();
+        if !replayed.is_empty() {
+            roots.extend(replayed.into_iter().map(|c| c.rva));
+            roots.sort_unstable();
+            roots.dedup();
+        }
+        if max_roots_per_module > 0 && roots.len() > max_roots_per_module {
+            roots.truncate(max_roots_per_module);
+        }
         if roots.is_empty() {
             log::info!("emu aot: prewarm {name}: no executable code roots found; skipped");
             reports.push(AotPrewarmReport {
@@ -459,6 +469,11 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
                 skipped_reason: Some("no executable code roots found in PE".into()),
             });
             continue;
+        }
+        if replayed_count > 0 {
+            log::info!(
+                "emu aot: prewarm {name}: merged {replayed_count} runtime-replayed callback root(s) by image fingerprint"
+            );
         }
 
         let key = unsafe { module_key(base, size) };

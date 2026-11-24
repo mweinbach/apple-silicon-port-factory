@@ -127,8 +127,11 @@ pub fn canonical_dll(dll: &str) -> String {
     if n == "sensapi.dll" || n == "wininet.dll" {
         return "winhttp.dll".into();
     }
-    if n == "userenv.dll" {
+    if n == "userenv.dll" || n == "sechost.dll" {
         return "advapi32.dll".into();
+    }
+    if n == "bcryptprimitives.dll" {
+        return "bcrypt.dll".into();
     }
     if n == "sspicli.dll" || n == "security.dll" {
         return "secur32.dll".into();

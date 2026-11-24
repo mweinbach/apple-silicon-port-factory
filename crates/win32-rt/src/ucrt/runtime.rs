@@ -7,7 +7,7 @@ use crate::process as pr;
 use crate::strings::*;
 use crate::types::*;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 type Pvfv = unsafe extern "win64" fn();
@@ -219,6 +219,11 @@ static ARGV: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
 static WARGV: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
 static ENVIRON: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
 static WENVIRON: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
+static INITIAL_ENVIRON: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
+static INITIAL_WENVIRON: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
+static INITIAL_ENV_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+static MUTABLE_ENV_INIT_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+static ENV_TABLES_LOCK: Mutex<()> = Mutex::new(());
 static ACMDLN: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
 static WCMDLN: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
 static PGMPTR: Slot<usize> = Slot(std::cell::UnsafeCell::new(0));
@@ -237,15 +242,44 @@ unsafe fn ensure_args() {
     }
 }
 
-/// Rebuild the CRT `environ` arrays from the process environment.
-pub unsafe fn rebuild_environ() {
-    let vars = pr::env_vars();
+fn build_narrow_env_table(vars: &[(String, String)]) -> *mut *mut u8 {
     let mut a: Vec<*mut u8> = vars.iter().map(|(k, v)| leak_ansi_z(&format!("{k}={v}"))).collect();
     a.push(std::ptr::null_mut());
+    Box::leak(a.into_boxed_slice()).as_mut_ptr()
+}
+
+fn build_wide_env_table(vars: &[(String, String)]) -> *mut *mut u16 {
     let mut w: Vec<*mut u16> = vars.iter().map(|(k, v)| leak_wide_z(&format!("{k}={v}"))).collect();
     w.push(std::ptr::null_mut());
-    *ENVIRON.0.get() = Box::leak(a.into_boxed_slice()).as_mut_ptr() as usize;
-    *WENVIRON.0.get() = Box::leak(w.into_boxed_slice()).as_mut_ptr() as usize;
+    Box::leak(w.into_boxed_slice()).as_mut_ptr()
+}
+
+unsafe fn ensure_initial_environ_locked() {
+    let init_gen = pr::env_init_gen();
+    if INITIAL_ENV_GEN.load(Ordering::Acquire) == init_gen
+        && *INITIAL_ENVIRON.0.get() != 0
+        && *INITIAL_WENVIRON.0.get() != 0
+    {
+        return;
+    }
+    let vars = pr::initial_env_vars();
+    *INITIAL_ENVIRON.0.get() = build_narrow_env_table(&vars) as usize;
+    *INITIAL_WENVIRON.0.get() = build_wide_env_table(&vars) as usize;
+    INITIAL_ENV_GEN.store(init_gen, Ordering::Release);
+}
+
+unsafe fn rebuild_environ_locked() {
+    let vars = pr::env_vars();
+    *ENVIRON.0.get() = build_narrow_env_table(&vars) as usize;
+    *WENVIRON.0.get() = build_wide_env_table(&vars) as usize;
+    MUTABLE_ENV_INIT_GEN.store(pr::env_init_gen(), Ordering::Release);
+}
+
+/// Rebuild the mutable CRT `environ` arrays from the process environment.
+/// Preserves the immutable initial environment snapshots separately.
+pub unsafe fn rebuild_environ() {
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    rebuild_environ_locked();
 }
 
 pub unsafe extern "win64" fn _configure_narrow_argv(_mode: i32) -> i32 {
@@ -257,12 +291,26 @@ pub unsafe extern "win64" fn _configure_wide_argv(_mode: i32) -> i32 {
     0
 }
 pub unsafe extern "win64" fn _initialize_narrow_environment() -> i32 {
-    rebuild_environ();
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_initial_environ_locked();
+    rebuild_environ_locked();
     0
 }
 pub unsafe extern "win64" fn _initialize_wide_environment() -> i32 {
-    rebuild_environ();
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_initial_environ_locked();
+    rebuild_environ_locked();
     0
+}
+pub unsafe extern "win64" fn _get_initial_narrow_environment() -> *mut *mut u8 {
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_initial_environ_locked();
+    *INITIAL_ENVIRON.0.get() as *mut *mut u8
+}
+pub unsafe extern "win64" fn _get_initial_wide_environment() -> *mut *mut u16 {
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_initial_environ_locked();
+    *INITIAL_WENVIRON.0.get() as *mut *mut u16
 }
 pub unsafe extern "win64" fn __p___argc() -> *mut i32 {
     ensure_args();
@@ -277,14 +325,20 @@ pub unsafe extern "win64" fn __p___wargv() -> *mut usize {
     WARGV.0.get()
 }
 pub unsafe extern "win64" fn __p__environ() -> *mut usize {
-    if *ENVIRON.0.get() == 0 {
-        rebuild_environ();
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let init_gen = pr::env_init_gen();
+    if *ENVIRON.0.get() == 0 || MUTABLE_ENV_INIT_GEN.load(Ordering::Acquire) != init_gen {
+        ensure_initial_environ_locked();
+        rebuild_environ_locked();
     }
     ENVIRON.0.get()
 }
 pub unsafe extern "win64" fn __p__wenviron() -> *mut usize {
-    if *WENVIRON.0.get() == 0 {
-        rebuild_environ();
+    let _g = ENV_TABLES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let init_gen = pr::env_init_gen();
+    if *WENVIRON.0.get() == 0 || MUTABLE_ENV_INIT_GEN.load(Ordering::Acquire) != init_gen {
+        ensure_initial_environ_locked();
+        rebuild_environ_locked();
     }
     WENVIRON.0.get()
 }
@@ -754,6 +808,17 @@ pub unsafe extern "win64" fn fegetround() -> i32 {
     // MSVC FE_* values: TONEAREST 0, DOWNWARD 0x100, UPWARD 0x200, TOWARDZERO 0x300
     (((get_mxcsr() >> 13) & 3) << 8) as i32
 }
+pub unsafe extern "win64" fn __fpe_flt_rounds() -> i32 {
+    // C99/C11 FLT_ROUNDS mapping from MXCSR RC bits (14:13):
+    // 0 (TONEAREST) -> 1, 1 (DOWNWARD) -> 3, 2 (UPWARD) -> 2, 3 (TOWARDZERO) -> 0.
+    match (get_mxcsr() >> 13) & 3 {
+        0 => 1,
+        1 => 3,
+        2 => 2,
+        3 => 0,
+        _ => -1,
+    }
+}
 pub unsafe extern "win64" fn fesetround(r: i32) -> i32 {
     if r & !0x300 != 0 {
         return 1;
@@ -897,3 +962,159 @@ pub unsafe extern "win64" fn __threadhandle() -> HANDLE {
 }
 
 pub unsafe extern "win64" fn _crt_debugger_hook(_r: i32) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn collect_wide_env(mut p: *mut *mut u16) -> Vec<String> {
+        assert!(!p.is_null(), "wide env table pointer must not be null");
+        let mut out = Vec::new();
+        while !(*p).is_null() {
+            out.push(from_wide(*p));
+            p = p.add(1);
+        }
+        out
+    }
+
+    unsafe fn collect_narrow_env(mut p: *mut *mut u8) -> Vec<String> {
+        assert!(!p.is_null(), "narrow env table pointer must not be null");
+        let mut out = Vec::new();
+        while !(*p).is_null() {
+            out.push(from_ansi(*p));
+            p = p.add(1);
+        }
+        out
+    }
+
+    #[test]
+    fn initial_environment_exports_snapshot_isolation_unicode_and_empty() {
+        unsafe {
+            // 1. Verify actual DLL exports resolve via both ucrtbase.dll and api-ms-win-crt-runtime-l1-1-0.dll.
+            let wide_export = crate::lookup("ucrtbase.dll", "_get_initial_wide_environment")
+                .expect("ucrtbase.dll!_get_initial_wide_environment must be exported");
+            let narrow_export = crate::lookup("ucrtbase.dll", "_get_initial_narrow_environment")
+                .expect("ucrtbase.dll!_get_initial_narrow_environment must be exported");
+            assert_eq!(
+                crate::lookup("api-ms-win-crt-runtime-l1-1-0.dll", "_get_initial_wide_environment"),
+                Some(wide_export)
+            );
+            assert_eq!(
+                crate::lookup("api-ms-win-crt-runtime-l1-1-0.dll", "_get_initial_narrow_environment"),
+                Some(narrow_export)
+            );
+            let call_initial_wide: unsafe extern "win64" fn() -> *mut *mut u16 =
+                std::mem::transmute(wide_export);
+            let call_initial_narrow: unsafe extern "win64" fn() -> *mut *mut u8 =
+                std::mem::transmute(narrow_export);
+
+            // 2. Simulate guest child process environment override (including wide/non-ASCII & surrogate pair).
+            let child_vars = vec![
+                ("CHILD_KEY".to_string(), "orig".to_string()),
+                ("TO_DELETE".to_string(), "gone".to_string()),
+                ("UNICODE_VAL".to_string(), "café_日本語_🚀".to_string()),
+            ];
+            let encoded = pr::encode_env_list(&child_vars);
+            let decoded = pr::decode_env_list(&encoded).expect("decode_env_list");
+            pr::replace_env(decoded);
+
+            assert_eq!(_initialize_wide_environment(), 0);
+            assert_eq!(_initialize_narrow_environment(), 0);
+
+            let init_w = call_initial_wide();
+            let init_a = call_initial_narrow();
+            assert_eq!(call_initial_wide(), init_w, "initial wide pointer must be stable");
+            assert_eq!(call_initial_narrow(), init_a, "initial narrow pointer must be stable");
+
+            let expected = vec![
+                "CHILD_KEY=orig".to_string(),
+                "TO_DELETE=gone".to_string(),
+                "UNICODE_VAL=café_日本語_🚀".to_string(),
+            ];
+            assert_eq!(collect_wide_env(init_w), expected);
+            assert_eq!(collect_narrow_env(init_a), expected);
+
+            // Verify raw UTF-16 encoding of the surrogate pair in UNICODE_VAL entry.
+            let unicode_w_entry = wide_slice(*init_w.add(2));
+            let expected_utf16: Vec<u16> = "UNICODE_VAL=café_日本語_🚀".encode_utf16().collect();
+            assert_eq!(unicode_w_entry, expected_utf16.as_slice());
+
+            // Mutable environ tables must be distinct allocations from initial snapshots.
+            let mut_w_before = *__p__wenviron() as *mut *mut u16;
+            let mut_a_before = *__p__environ() as *mut *mut u8;
+            assert_ne!(mut_w_before, init_w);
+            assert_ne!(mut_a_before, init_a);
+            assert_eq!(collect_wide_env(mut_w_before), expected);
+            assert_eq!(collect_narrow_env(mut_a_before), expected);
+
+            // 3. Mutate via _wputenv, _putenv, SetEnvironmentVariableW, and direct mutable table write.
+            let add_w = to_wide_z("ADDED_W=new_value");
+            assert_eq!(super::super::env::_wputenv(add_w.as_ptr()), 0);
+            assert_eq!(super::super::env::_putenv(b"CHILD_KEY=mutated\0".as_ptr()), 0);
+            let del_w = to_wide_z("TO_DELETE=");
+            assert_eq!(super::super::env::_wputenv(del_w.as_ptr()), 0);
+            let k32_k = to_wide_z("K32_ONLY");
+            let k32_v = to_wide_z("from_kernel32");
+            assert_ne!(
+                crate::kernel32::process::SetEnvironmentVariableW(k32_k.as_ptr(), k32_v.as_ptr()),
+                0
+            );
+
+            // Mutable CRT environ reflects CRT mutations.
+            let mut_w_after = *__p__wenviron() as *mut *mut u16;
+            let mut_a_after = *__p__environ() as *mut *mut u8;
+            let mut_w_entries = collect_wide_env(mut_w_after);
+            let mut_a_entries = collect_narrow_env(mut_a_after);
+            assert!(mut_w_entries.contains(&"ADDED_W=new_value".to_string()));
+            assert!(mut_w_entries.contains(&"CHILD_KEY=mutated".to_string()));
+            assert!(!mut_w_entries.iter().any(|s| s.starts_with("TO_DELETE=")));
+            assert_eq!(mut_a_entries, mut_w_entries);
+
+            // Direct in-place clobber of mutable table must not affect initial snapshot.
+            *mut_w_after = std::ptr::null_mut();
+            *mut_a_after = std::ptr::null_mut();
+
+            // Initial snapshot pointers and contents remain completely unchanged.
+            assert_eq!(call_initial_wide(), init_w);
+            assert_eq!(call_initial_narrow(), init_a);
+            assert_eq!(collect_wide_env(call_initial_wide()), expected);
+            assert_eq!(collect_narrow_env(call_initial_narrow()), expected);
+
+            // 4. Empty environment returns non-null, immediately NULL-terminated tables.
+            pr::replace_env(Vec::new());
+            let empty_w = call_initial_wide();
+            let empty_a = call_initial_narrow();
+            assert!(!empty_w.is_null());
+            assert!(!empty_a.is_null());
+            assert!((*empty_w).is_null(), "empty wide initial env must be NULL-terminated at [0]");
+            assert!((*empty_a).is_null(), "empty narrow initial env must be NULL-terminated at [0]");
+            assert!(collect_wide_env(empty_w).is_empty());
+            assert!(collect_narrow_env(empty_a).is_empty());
+
+            // 5. Restore standard default environment for any subsequent serial tests.
+            pr::init_env(&[]);
+            let restored_w = call_initial_wide();
+            let restored_entries = collect_wide_env(restored_w);
+            assert!(
+                restored_entries.iter().any(|s| s == "OS=Windows_NT"),
+                "init_env snapshot should include default Windows environment"
+            );
+        }
+    }
+
+    #[test]
+    fn fpe_flt_rounds_tracks_mxcsr_rounding_mode() {
+        unsafe {
+            let saved = fegetround();
+            assert_eq!(fesetround(0x000), 0); // FE_TONEAREST
+            assert_eq!(__fpe_flt_rounds(), 1);
+            assert_eq!(fesetround(0x300), 0); // FE_TOWARDZERO
+            assert_eq!(__fpe_flt_rounds(), 0);
+            assert_eq!(fesetround(0x200), 0); // FE_UPWARD
+            assert_eq!(__fpe_flt_rounds(), 2);
+            assert_eq!(fesetround(0x100), 0); // FE_DOWNWARD
+            assert_eq!(__fpe_flt_rounds(), 3);
+            assert_eq!(fesetround(saved), 0);
+        }
+    }
+}

@@ -319,32 +319,242 @@ pub fn write_profiles_tsv(path: &Path, profiles: &[BinaryProfile]) -> Result<()>
     Ok(())
 }
 
+pub use port_manifest::{
+    collect_x64_pe_files, discover_bundled_plugins, has_pe_extension, has_plugin_extension,
+    is_valid_x64_pe_file, probe_x64_pe_file, PeDiscoveryOptions, PeHeaderProbe,
+    PE_BINARY_EXTENSIONS, PLUGIN_LIBRARY_EXTENSIONS,
+};
+
+/// Recursively collect valid x86-64 PE32+ binaries (`.exe`, `.dll`, `.pyd`, `.node`, `.ocx`)
+/// within `target`, scoped strictly to `target` with fast header-only probing.
 pub fn collect_pe_files(target: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut out = Vec::new();
-    if target.is_file() {
-        out.push(target.to_path_buf());
-        return Ok(out);
-    }
-    if target.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(target)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll")
-                        })
-            })
-            .collect();
-        entries.sort();
-        out.extend(entries);
-    }
-    Ok(out)
+    collect_x64_pe_files(target, &PeDiscoveryOptions::default())
+        .with_context(|| format!("collect PE files in {}", target.display()))
 }
 
 #[allow(dead_code)]
 pub fn find_op_record(id: &str) -> Option<&'static OpRecord> {
     OPS_CATALOG.iter().find(|r| r.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_temp_dir(tag: &str) -> TempDir {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "port_factory_scanner_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+
+    /// Minimal valid synthetic PE image builder (supports AMD64 PE32+, i386 PE32, ARM64 PE32+).
+    fn build_synthetic_pe(machine: u16, opt_magic: u16, is_dll: bool) -> Vec<u8> {
+        let mut img = vec![0u8; 0x400];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+        img[0..2].copy_from_slice(b"MZ");
+        let pe = 0x80usize;
+        w32(&mut img, 0x3C, pe as u32);
+        w32(&mut img, pe, 0x0000_4550);
+        w16(&mut img, pe + 4, machine);
+        w16(&mut img, pe + 6, 1); // NumberOfSections
+        let opt_size: u16 = if opt_magic == 0x20B { 240 } else { 224 };
+        w16(&mut img, pe + 20, opt_size);
+        let chars = if is_dll { 0x2022 } else { 0x0022 };
+        w16(&mut img, pe + 22, chars);
+
+        let opt = pe + 24;
+        w16(&mut img, opt, opt_magic);
+        w32(&mut img, opt + 16, 0x1000); // AddressOfEntryPoint
+        if opt_magic == 0x20B {
+            w64(&mut img, opt + 24, 0x1_8000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x2000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 108, 16);
+        } else {
+            w32(&mut img, opt + 28, 0x1000_0000);
+            w32(&mut img, opt + 32, 0x1000);
+            w32(&mut img, opt + 36, 0x200);
+            w32(&mut img, opt + 56, 0x2000);
+            w32(&mut img, opt + 60, 0x200);
+            w32(&mut img, opt + 92, 16);
+        }
+
+        let sec0 = opt + opt_size as usize;
+        img[sec0..sec0 + 5].copy_from_slice(b".text");
+        w32(&mut img, sec0 + 8, 0x200);
+        w32(&mut img, sec0 + 12, 0x1000);
+        w32(&mut img, sec0 + 16, 0x200);
+        w32(&mut img, sec0 + 20, 0x200);
+        w32(&mut img, sec0 + 36, 0x6000_0020);
+        img[0x200] = 0xC3; // ret
+        img
+    }
+
+    #[test]
+    fn recursive_plugin_discovery_and_header_filtering() {
+        let pkg = make_temp_dir("pkg");
+        let outside = make_temp_dir("outside");
+
+        let x64_exe = build_synthetic_pe(0x8664, 0x20B, false);
+        let x64_dll = build_synthetic_pe(0x8664, 0x20B, true);
+        let x86_dll = build_synthetic_pe(0x014C, 0x10B, true);
+        let arm64_dll = build_synthetic_pe(0xAA64, 0x20B, true);
+
+        // Valid x86-64 binaries at top-level and nested plugin subdirs (.exe, .dll, .pyd, .node, .ocx)
+        fs::write(pkg.0.join("App.exe"), &x64_exe).unwrap();
+        fs::create_dir_all(pkg.0.join("plugins/python")).unwrap();
+        fs::create_dir_all(pkg.0.join("resources/app.asar.unpacked/node_modules/native")).unwrap();
+        fs::create_dir_all(pkg.0.join("controls/sub")).unwrap();
+        fs::create_dir_all(pkg.0.join(".git")).unwrap();
+
+        fs::write(pkg.0.join("plugins/helper.dll"), &x64_dll).unwrap();
+        fs::write(pkg.0.join("plugins/python/mod_ext.pyd"), &x64_dll).unwrap();
+        fs::write(
+            pkg.0.join("resources/app.asar.unpacked/node_modules/native/addon.node"),
+            &x64_dll,
+        )
+        .unwrap();
+        fs::write(pkg.0.join("controls/sub/widget.ocx"), &x64_dll).unwrap();
+
+        // Rejected: wrong architecture, truncated/corrupt PE, non-PE asset, skipped VCS dir
+        fs::write(pkg.0.join("plugins/legacy_x86.dll"), &x86_dll).unwrap();
+        fs::write(pkg.0.join("plugins/native_arm64.dll"), &arm64_dll).unwrap();
+        fs::write(pkg.0.join("plugins/truncated.dll"), &x64_dll[..0x90]).unwrap();
+        fs::write(pkg.0.join("plugins/corrupt_mz.dll"), b"MZ\x00\x00not_a_real_pe").unwrap();
+        fs::write(pkg.0.join(".git/ignored.dll"), &x64_dll).unwrap();
+
+        // Large non-PE file with .dll extension (16 MiB sparse file) — fast header probe rejects in <= 200 bytes.
+        {
+            let big = fs::File::create(pkg.0.join("plugins/fake_asset.dll")).unwrap();
+            big.set_len(16 * 1024 * 1024).unwrap();
+        }
+        // Regular non-PE asset blob
+        fs::write(pkg.0.join("plugins/data.pak"), b"NOT_A_PE").unwrap();
+
+        // Outside-of-package PE + symlinks (loop and escape) must NEVER be collected.
+        fs::write(outside.0.join("escape.dll"), &x64_dll).unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(
+                outside.0.join("escape.dll"),
+                pkg.0.join("plugins/escape_link.dll"),
+            );
+            let _ = std::os::unix::fs::symlink(&outside.0, pkg.0.join("plugins/escape_dir"));
+            let _ = std::os::unix::fs::symlink(&pkg.0, pkg.0.join("plugins/self_loop"));
+        }
+
+        let found = collect_pe_files(&pkg.0).unwrap();
+        let rels: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&pkg.0)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(
+            rels,
+            vec![
+                "App.exe",
+                "controls/sub/widget.ocx",
+                "plugins/helper.dll",
+                "plugins/python/mod_ext.pyd",
+                "resources/app.asar.unpacked/node_modules/native/addon.node",
+            ]
+        );
+
+        // Single-file rejection of wrong-arch and malformed inputs.
+        assert!(collect_pe_files(&pkg.0.join("plugins/legacy_x86.dll"))
+            .unwrap()
+            .is_empty());
+        assert!(collect_pe_files(&pkg.0.join("plugins/native_arm64.dll"))
+            .unwrap()
+            .is_empty());
+        assert!(collect_pe_files(&pkg.0.join("plugins/truncated.dll"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            collect_pe_files(&pkg.0.join("plugins/python/mod_ext.pyd"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Routing-aware bundled plugin discovery excludes Disabled/Builtin overrides and primary EXE,
+        // and enforces root scoping on declared bundled_plugins / plugin_dirs.
+        let manifest = port_manifest::GameManifest::parse(
+            r#"
+[dlls]
+"helper.dll" = "disabled"
+"widget.ocx" = "builtin:kernel32.dll"
+"#,
+        );
+        let routing = manifest.routing_table(&[], None);
+        let plugins = discover_bundled_plugins(
+            &pkg.0,
+            Some(&routing),
+            |name| name == "kernel32.dll",
+            &["../outside".into(), "plugins".into()],
+            &["../outside/escape.dll".into()],
+            Some(&pkg.0.join("App.exe")),
+        );
+        let root_canon = fs::canonicalize(&pkg.0).unwrap();
+        let plugin_rels: Vec<String> = plugins
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root_canon)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            plugin_rels,
+            vec![
+                "plugins/python/mod_ext.pyd",
+                "resources/app.asar.unpacked/node_modules/native/addon.node",
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_respects_max_depth() {
+        let pkg = make_temp_dir("depth");
+        let x64_dll = build_synthetic_pe(0x8664, 0x20B, true);
+        let deep = pkg.0.join("a/b/c/d");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(pkg.0.join("a/shallow.dll"), &x64_dll).unwrap();
+        fs::write(deep.join("deep.dll"), &x64_dll).unwrap();
+
+        let opts = PeDiscoveryOptions {
+            max_depth: 2,
+            include_exe: true,
+            max_files: 64,
+        };
+        let found = collect_x64_pe_files(&pkg.0, &opts).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("shallow.dll"));
+    }
 }

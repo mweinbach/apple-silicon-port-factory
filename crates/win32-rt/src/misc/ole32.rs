@@ -14,7 +14,11 @@ pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
 
 const REGDB_E_CLASSNOTREG: HRESULT = 0x8004_0154u32 as i32;
+#[allow(dead_code)]
+const CLASS_E_NOAGGREGATION: HRESULT = 0x8004_0110u32 as i32;
+const CLASS_E_CLASSNOTAVAILABLE: HRESULT = 0x8004_0111u32 as i32;
 const CO_E_CLASSSTRING: HRESULT = 0x8004_01F3u32 as i32;
+const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const STG_E_INVALIDFUNCTION: HRESULT = 0x8003_0001u32 as i32;
 const STG_E_INVALIDPOINTER: HRESULT = 0x8003_0009u32 as i32;
 const STG_E_INVALIDPARAMETER: HRESULT = 0x8003_0057u32 as i32;
@@ -224,10 +228,138 @@ pub fn register_com_factory(factory: ComClassFactory) {
     EXTRA_COM_FACTORIES.write().unwrap().push(factory);
 }
 
+struct RegisteredClassObject {
+    cookie: u32,
+    clsid: [u8; 16],
+    punk: Arc<crate::com::ComPtr>,
+    cls_context: u32,
+    _flags: u32,
+}
+
+static NEXT_CLASS_REG_COOKIE: AtomicU32 = AtomicU32::new(1);
+static REGISTERED_CLASS_OBJECTS: LazyLock<Mutex<Vec<RegisteredClassObject>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static INPROC_SERVER_DLLS: LazyLock<Mutex<HashMap<[u8; 16], String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Associate a COM CLSID with an in-process server DLL exporting `DllGetClassObject`.
+#[allow(dead_code)]
+pub fn register_inproc_server_dll(clsid: crate::com::Guid, dll_name: impl Into<String>) {
+    INPROC_SERVER_DLLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(clsid.to_bytes(), dll_name.into());
+}
+
+#[allow(dead_code)]
+pub fn unregister_inproc_server_dll(clsid: crate::com::Guid) {
+    INPROC_SERVER_DLLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&clsid.to_bytes());
+}
+
+fn find_registered_class_object(clsid: &[u8; 16], ctx: u32) -> Option<Arc<crate::com::ComPtr>> {
+    let regs = REGISTERED_CLASS_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    regs.iter()
+        .rev()
+        .find(|e| e.clsid == *clsid && (ctx == 0 || e.cls_context == 0 || (e.cls_context & ctx) != 0))
+        .map(|e| Arc::clone(&e.punk))
+}
+
+unsafe fn try_inproc_dll_get_class_object(
+    clsid: &[u8; 16],
+    ctx: u32,
+    riid: *const u8,
+    out: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if ctx != 0 && (ctx & CLSCTX_INPROC_SERVER) == 0 {
+        return None;
+    }
+    let dll_name = INPROC_SERVER_DLLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(clsid)
+        .cloned()?;
+    let loader = crate::try_loader()?;
+    let hmod = loader
+        .get_module_handle(Some(&dll_name))
+        .or_else(|| loader.load_library(&dll_name, 0).ok())?;
+    let proc_addr = loader.get_proc_address(hmod, crate::ProcName::Name("DllGetClassObject"))?;
+    let hr = crate::call_guest8(
+        proc_addr,
+        clsid.as_ptr() as u64,
+        riid as u64,
+        out as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ) as HRESULT;
+    Some(hr)
+}
+
+pub unsafe extern "win64" fn CoRegisterClassObject(
+    rclsid: *const u8,
+    p_unk: *mut c_void,
+    dw_cls_context: u32,
+    flags: u32,
+    lpdw_register: *mut u32,
+) -> HRESULT {
+    if lpdw_register.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(lpdw_register, 0);
+    let Some(clsid) = read_guid_bytes(rclsid) else {
+        return E_INVALIDARG;
+    };
+    if p_unk.is_null() {
+        return E_INVALIDARG;
+    }
+    // Retain via AddRef strictly OUTSIDE any mutex.
+    let Some(retained) = crate::com::ComPtr::retain(p_unk) else {
+        return E_INVALIDARG;
+    };
+    let cookie = NEXT_CLASS_REG_COOKIE.fetch_add(1, Ordering::Relaxed);
+    REGISTERED_CLASS_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(RegisteredClassObject {
+            cookie,
+            clsid,
+            punk: Arc::new(retained),
+            cls_context: dw_cls_context,
+            _flags: flags,
+        });
+    std::ptr::write_unaligned(lpdw_register, cookie);
+    S_OK
+}
+
+pub unsafe extern "win64" fn CoRevokeClassObject(dw_register: u32) -> HRESULT {
+    if dw_register == 0 {
+        return E_INVALIDARG;
+    }
+    let removed = {
+        let mut regs = REGISTERED_CLASS_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+        regs.iter()
+            .position(|e| e.cookie == dw_register)
+            .map(|i| regs.remove(i))
+    };
+    // Drop Arc<ComPtr> (potentially calling guest Release) strictly OUTSIDE mutex.
+    match removed {
+        Some(entry) => {
+            drop(entry);
+            S_OK
+        }
+        None => E_INVALIDARG,
+    }
+}
+
 pub unsafe extern "win64" fn CoCreateInstance(
     clsid: *const u8,
     outer: *mut c_void,
-    _ctx: u32,
+    ctx: u32,
     iid: *const u8,
     out: *mut *mut c_void,
 ) -> HRESULT {
@@ -235,7 +367,25 @@ pub unsafe extern "win64" fn CoCreateInstance(
         return E_POINTER;
     }
     std::ptr::write_unaligned(out, std::ptr::null_mut());
-    // Dynamic class factories registered by game targets / plugins take precedence.
+    // 1. Registered in-proc class objects (CoRegisterClassObject) take precedence.
+    if let Some(clsid_bytes) = read_guid_bytes(clsid) {
+        if let Some(reg_punk) = find_registered_class_object(&clsid_bytes, ctx) {
+            let mut cf_ptr: *mut c_void = std::ptr::null_mut();
+            let qhr = com_call_qi(reg_punk.as_ptr(), IID_ICLASSFACTORY_BYTES.as_ptr(), &mut cf_ptr);
+            if qhr < 0 || cf_ptr.is_null() {
+                return if qhr < 0 { qhr } else { E_NOINTERFACE };
+            }
+            let hr = crate::com::com_invoke_hresult(
+                cf_ptr,
+                &crate::com::IID_IClassFactory,
+                3, // IClassFactory::CreateInstance
+                &[outer as u64, iid as u64, out as u64],
+            );
+            com_call_release(cf_ptr);
+            return hr;
+        }
+    }
+    // 2. Dynamic class factories registered by game targets / plugins.
     if let Ok(factories) = EXTRA_COM_FACTORIES.read() {
         for factory in factories.iter().rev() {
             if let Some(hr) = factory(clsid, iid, outer, out) {
@@ -243,7 +393,7 @@ pub unsafe extern "win64" fn CoCreateInstance(
             }
         }
     }
-    // Class registry: in-process servers implemented in Rust.
+    // 3. Built-in Rust in-process COM classes.
     if let Some(hr) = super::dinput8::create_instance(clsid, iid, outer, out) {
         return hr;
     }
@@ -279,6 +429,28 @@ pub unsafe extern "win64" fn CoCreateInstance(
             return crate::audio::com::CLASS_E_NOAGGREGATION;
         }
         if let Some(hr) = crate::audio::create_instance(&c, &i, out) {
+            return hr;
+        }
+    }
+    // 4. Registered in-proc server DLL exporting DllGetClassObject.
+    if let Some(clsid_bytes) = read_guid_bytes(clsid) {
+        let mut cf_ptr: *mut c_void = std::ptr::null_mut();
+        if let Some(ghr) = try_inproc_dll_get_class_object(
+            &clsid_bytes,
+            ctx,
+            IID_ICLASSFACTORY_BYTES.as_ptr(),
+            &mut cf_ptr,
+        ) {
+            if ghr < 0 || cf_ptr.is_null() {
+                return if ghr < 0 { ghr } else { CLASS_E_CLASSNOTAVAILABLE };
+            }
+            let hr = crate::com::com_invoke_hresult(
+                cf_ptr,
+                &crate::com::IID_IClassFactory,
+                3,
+                &[outer as u64, iid as u64, out as u64],
+            );
+            com_call_release(cf_ptr);
             return hr;
         }
     }
@@ -589,19 +761,17 @@ static FTM_MARSHAL_VTBL: IMarshalVtbl = IMarshalVtbl {
 };
 
 fn register_ftm_vtables() {
+    unsafe {
+        crate::com::register_host_vtable(
+            crate::com::IID_IMarshal,
+            (&FTM_MARSHAL_VTBL as *const IMarshalVtbl) as *const usize,
+            9,
+        );
+    }
     register_vtable_ptrs(&[
         ftm_unk_qi as *const () as usize,
         ftm_unk_add_ref as *const () as usize,
         ftm_unk_release as *const () as usize,
-        ftm_marshal_qi as *const () as usize,
-        ftm_marshal_add_ref as *const () as usize,
-        ftm_marshal_release as *const () as usize,
-        ftm_get_unmarshal_class as *const () as usize,
-        ftm_get_marshal_size_max as *const () as usize,
-        ftm_marshal_interface as *const () as usize,
-        ftm_unmarshal_interface as *const () as usize,
-        ftm_release_marshal_data as *const () as usize,
-        ftm_disconnect_object as *const () as usize,
     ]);
 }
 
@@ -730,13 +900,13 @@ static CLASS_FACTORY_VTBL: IClassFactoryVtbl = IClassFactoryVtbl {
 };
 
 fn register_class_factory_vtable() {
-    register_vtable_ptrs(&[
-        cf_qi as *const () as usize,
-        cf_add_ref as *const () as usize,
-        cf_release as *const () as usize,
-        cf_create_instance as *const () as usize,
-        cf_lock_server as *const () as usize,
-    ]);
+    unsafe {
+        crate::com::register_host_vtable(
+            crate::com::IID_IClassFactory,
+            (&CLASS_FACTORY_VTBL as *const IClassFactoryVtbl) as *const usize,
+            5,
+        );
+    }
 }
 
 unsafe fn is_registered_com_class(clsid: &[u8; 16]) -> bool {
@@ -790,25 +960,34 @@ pub unsafe extern "win64" fn CoGetClassObject(
     let (Some(clsid), Some(iid)) = (read_guid_bytes(rclsid), read_guid_bytes(riid)) else {
         return E_INVALIDARG;
     };
-    if !is_registered_com_class(&clsid) {
-        log::debug!(
-            "CoGetClassObject: unregistered COM class {} -> REGDB_E_CLASSNOTREG",
-            guid_string(rclsid)
-        );
-        return REGDB_E_CLASSNOTREG;
+    // 1. Registered in-proc class objects (CoRegisterClassObject): QI via call_guest8 outside lock.
+    if let Some(reg_punk) = find_registered_class_object(&clsid, ctx) {
+        return com_call_qi(reg_punk.as_ptr(), riid, out);
     }
-    if iid != IID_ICLASSFACTORY_BYTES && iid != IID_IUNKNOWN_BYTES {
-        return E_NOINTERFACE;
+    // 2. Built-in Rust in-process COM classes.
+    if is_registered_com_class(&clsid) {
+        if iid != IID_ICLASSFACTORY_BYTES && iid != IID_IUNKNOWN_BYTES {
+            return E_NOINTERFACE;
+        }
+        register_class_factory_vtable();
+        let factory = Box::into_raw(Box::new(ClassFactoryObj {
+            vtbl: &CLASS_FACTORY_VTBL,
+            refs: AtomicU32::new(1),
+            clsid,
+            ctx,
+        }));
+        std::ptr::write_unaligned(out, factory as *mut c_void);
+        return S_OK;
     }
-    register_class_factory_vtable();
-    let factory = Box::into_raw(Box::new(ClassFactoryObj {
-        vtbl: &CLASS_FACTORY_VTBL,
-        refs: AtomicU32::new(1),
-        clsid,
-        ctx,
-    }));
-    std::ptr::write_unaligned(out, factory as *mut c_void);
-    S_OK
+    // 3. Registered in-proc server DLL exporting DllGetClassObject.
+    if let Some(hr) = try_inproc_dll_get_class_object(&clsid, ctx, riid, out) {
+        return hr;
+    }
+    log::debug!(
+        "CoGetClassObject: unregistered COM class {} -> REGDB_E_CLASSNOTREG",
+        guid_string(rclsid)
+    );
+    REGDB_E_CLASSNOTREG
 }
 
 pub unsafe extern "win64" fn CoTaskMemAlloc(n: usize) -> *mut c_void {
@@ -947,22 +1126,13 @@ struct HGlobalStreamObj {
 static LIVE_HGLOBAL_STREAMS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn register_stream_vtable() {
-    register_vtable_ptrs(&[
-        stream_qi as *const () as usize,
-        stream_add_ref as *const () as usize,
-        stream_release as *const () as usize,
-        stream_read as *const () as usize,
-        stream_write as *const () as usize,
-        stream_seek as *const () as usize,
-        stream_set_size as *const () as usize,
-        stream_copy_to as *const () as usize,
-        stream_commit as *const () as usize,
-        stream_revert as *const () as usize,
-        stream_lock_region as *const () as usize,
-        stream_unlock_region as *const () as usize,
-        stream_stat as *const () as usize,
-        stream_clone as *const () as usize,
-    ]);
+    unsafe {
+        crate::com::register_host_vtable(
+            crate::com::IID_IStream,
+            (&ISTREAM_VTBL as *const IStreamVtbl) as *const usize,
+            14,
+        );
+    }
 }
 
 fn new_hglobal_stream_obj(backing: Arc<Mutex<HGlobalBacking>>, initial_pos: u64) -> *mut HGlobalStreamObj {
@@ -1596,8 +1766,1603 @@ pub unsafe extern "win64" fn ReleaseStgMedium(pmedium: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
-// WinRT basics (`Ro*`, `Windows*String*`)
+// WinRT runtime activation (`Ro*`, `Windows*String*`) & real Foundation classes
 // ---------------------------------------------------------------------------
+
+const TYPE_E_TYPEMISMATCH: HRESULT = 0x8002_8CA0u32 as i32;
+
+const TRUST_LEVEL_BASE: i32 = 0;
+
+static WINRT_FACTORIES: LazyLock<Mutex<HashMap<String, Arc<crate::com::ComPtr>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register an in-process WinRT activation factory for `class_name` (checked by
+/// [`RoGetActivationFactory`] and [`RoActivateInstance`]).
+#[allow(dead_code)]
+pub fn register_winrt_activation_factory(class_name: impl Into<String>, factory: crate::com::ComPtr) {
+    let old = WINRT_FACTORIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(class_name.into(), Arc::new(factory));
+    // Drop any previous factory strictly outside the lock.
+    drop(old);
+}
+
+#[allow(dead_code)]
+pub fn unregister_winrt_activation_factory(class_name: &str) {
+    let old = WINRT_FACTORIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(class_name);
+    drop(old);
+}
+
+unsafe fn hstring_to_rust(h: usize) -> String {
+    if h == 0 {
+        return String::new();
+    }
+    let mut len: u32 = 0;
+    let buf = WindowsGetStringRawBuffer(h, &mut len);
+    if buf.is_null() || len == 0 {
+        return String::new();
+    }
+    let mut units = Vec::with_capacity(len as usize);
+    for i in 0..len as usize {
+        units.push(std::ptr::read_unaligned(buf.add(i)));
+    }
+    String::from_utf16_lossy(&units)
+}
+
+unsafe fn rust_to_hstring(s: &str) -> Result<usize, HRESULT> {
+    if s.is_empty() {
+        return Ok(0);
+    }
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut out: usize = 0;
+    let hr = WindowsCreateString(units.as_ptr(), units.len() as u32, &mut out);
+    if hr < 0 { Err(hr) } else { Ok(out) }
+}
+
+unsafe fn write_iids(iid_count: *mut u32, iids: *mut *mut crate::com::Guid, list: &[crate::com::Guid]) -> HRESULT {
+    if iid_count.is_null() || iids.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(iid_count, 0);
+    std::ptr::write_unaligned(iids, std::ptr::null_mut());
+    if list.is_empty() {
+        return S_OK;
+    }
+    let byte_len = list.len() * std::mem::size_of::<crate::com::Guid>();
+    let mem = CoTaskMemAlloc(byte_len) as *mut crate::com::Guid;
+    if mem.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    for (i, g) in list.iter().enumerate() {
+        std::ptr::write_unaligned(mem.add(i), *g);
+    }
+    std::ptr::write_unaligned(iid_count, list.len() as u32);
+    std::ptr::write_unaligned(iids, mem);
+    S_OK
+}
+
+// --- Windows.Foundation.PropertyValue (`IPropertyValue` + `IPropertyValueStatics`) ---
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WinRtPropertyType {
+    Empty = 0,
+    UInt8 = 1,
+    Int16 = 2,
+    UInt16 = 3,
+    Int32 = 4,
+    UInt32 = 5,
+    Int64 = 6,
+    UInt64 = 7,
+    Single = 8,
+    Double = 9,
+    Char16 = 10,
+    Boolean = 11,
+    String = 12,
+    Inspectable = 13,
+    Guid = 16,
+}
+
+enum PropValData {
+    Empty,
+    UInt8(u8),
+    Int16(i16),
+    UInt16(u16),
+    Int32(i32),
+    UInt32(u32),
+    Int64(i64),
+    UInt64(u64),
+    Single(f32),
+    Double(f64),
+    Char16(u16),
+    Boolean(bool),
+    String(String),
+    #[allow(dead_code)]
+    Inspectable(Option<crate::com::ComPtr>),
+    Guid(crate::com::Guid),
+}
+
+impl PropValData {
+    fn prop_type(&self) -> WinRtPropertyType {
+        match self {
+            Self::Empty => WinRtPropertyType::Empty,
+            Self::UInt8(_) => WinRtPropertyType::UInt8,
+            Self::Int16(_) => WinRtPropertyType::Int16,
+            Self::UInt16(_) => WinRtPropertyType::UInt16,
+            Self::Int32(_) => WinRtPropertyType::Int32,
+            Self::UInt32(_) => WinRtPropertyType::UInt32,
+            Self::Int64(_) => WinRtPropertyType::Int64,
+            Self::UInt64(_) => WinRtPropertyType::UInt64,
+            Self::Single(_) => WinRtPropertyType::Single,
+            Self::Double(_) => WinRtPropertyType::Double,
+            Self::Char16(_) => WinRtPropertyType::Char16,
+            Self::Boolean(_) => WinRtPropertyType::Boolean,
+            Self::String(_) => WinRtPropertyType::String,
+            Self::Inspectable(_) => WinRtPropertyType::Inspectable,
+            Self::Guid(_) => WinRtPropertyType::Guid,
+        }
+    }
+
+    fn is_numeric_scalar(&self) -> bool {
+        matches!(
+            self,
+            Self::UInt8(_)
+                | Self::Int16(_)
+                | Self::UInt16(_)
+                | Self::Int32(_)
+                | Self::UInt32(_)
+                | Self::Int64(_)
+                | Self::UInt64(_)
+                | Self::Single(_)
+                | Self::Double(_)
+        )
+    }
+}
+
+type PropValObj = crate::com::ComObj<PropValData>;
+
+unsafe extern "win64" fn pv_qi(
+    this: *mut PropValObj,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    crate::com::qi_helper(
+        this,
+        riid,
+        ppv,
+        &[crate::com::IID_IInspectable, crate::com::IID_IPropertyValue],
+    )
+}
+
+unsafe extern "win64" fn pv_get_iids(
+    _this: *mut PropValObj,
+    iid_count: *mut u32,
+    iids: *mut *mut crate::com::Guid,
+) -> HRESULT {
+    write_iids(iid_count, iids, &[crate::com::IID_IPropertyValue])
+}
+
+unsafe extern "win64" fn pv_get_runtime_class_name(
+    _this: *mut PropValObj,
+    class_name: *mut usize,
+) -> HRESULT {
+    if class_name.is_null() {
+        return E_POINTER;
+    }
+    match rust_to_hstring("Windows.Foundation.PropertyValue") {
+        Ok(h) => {
+            std::ptr::write_unaligned(class_name, h);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+unsafe extern "win64" fn pv_get_trust_level(_this: *mut PropValObj, trust: *mut i32) -> HRESULT {
+    if trust.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(trust, TRUST_LEVEL_BASE);
+    S_OK
+}
+
+unsafe extern "win64" fn pv_get_type(this: *mut PropValObj, out: *mut i32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, crate::com::ComObj::inner(this).prop_type() as i32);
+    S_OK
+}
+
+unsafe extern "win64" fn pv_get_is_numeric(this: *mut PropValObj, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, crate::com::ComObj::inner(this).is_numeric_scalar() as u8);
+    S_OK
+}
+
+unsafe extern "win64" fn pv_get_u8(this: *mut PropValObj, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::UInt8(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_i16(this: *mut PropValObj, out: *mut i16) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Int16(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_u16(this: *mut PropValObj, out: *mut u16) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::UInt16(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_i32(this: *mut PropValObj, out: *mut i32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Int32(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_u32(this: *mut PropValObj, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::UInt32(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_i64(this: *mut PropValObj, out: *mut i64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Int64(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_u64(this: *mut PropValObj, out: *mut u64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::UInt64(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_single(this: *mut PropValObj, out: *mut f32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Single(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_double(this: *mut PropValObj, out: *mut f64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Double(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_char16(this: *mut PropValObj, out: *mut u16) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Char16(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_boolean(this: *mut PropValObj, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Boolean(v) => {
+            std::ptr::write_unaligned(out, *v as u8);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_string(this: *mut PropValObj, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    match crate::com::ComObj::inner(this) {
+        PropValData::String(s) => match rust_to_hstring(s) {
+            Ok(h) => {
+                std::ptr::write_unaligned(out, h);
+                S_OK
+            }
+            Err(hr) => hr,
+        },
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_guid(this: *mut PropValObj, out: *mut crate::com::Guid) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match crate::com::ComObj::inner(this) {
+        PropValData::Guid(g) => {
+            std::ptr::write_unaligned(out, *g);
+            S_OK
+        }
+        _ => TYPE_E_TYPEMISMATCH,
+    }
+}
+
+unsafe extern "win64" fn pv_get_date_time(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    crate::stub!("IPropertyValue::GetDateTime -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_time_span(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    crate::stub!("IPropertyValue::GetTimeSpan -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_point(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 2]);
+    crate::stub!("IPropertyValue::GetPoint -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_size(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 2]);
+    crate::stub!("IPropertyValue::GetSize -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_rect(_this: *mut PropValObj, out: *mut [f32; 4]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 4]);
+    crate::stub!("IPropertyValue::GetRect -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+macro_rules! define_pv_array_getter {
+    ($fn_name:ident, $method:literal) => {
+        unsafe extern "win64" fn $fn_name(
+            _this: *mut PropValObj,
+            out_len: *mut u32,
+            out_ptr: *mut *mut c_void,
+        ) -> HRESULT {
+            if !out_len.is_null() {
+                std::ptr::write_unaligned(out_len, 0);
+            }
+            if !out_ptr.is_null() {
+                std::ptr::write_unaligned(out_ptr, std::ptr::null_mut());
+            }
+            if out_len.is_null() || out_ptr.is_null() {
+                return E_POINTER;
+            }
+            crate::stub!(concat!("IPropertyValue::", $method, " -> E_NOTIMPL"));
+            E_NOTIMPL
+        }
+    };
+}
+
+define_pv_array_getter!(pv_get_u8_array, "GetUInt8Array");
+define_pv_array_getter!(pv_get_i16_array, "GetInt16Array");
+define_pv_array_getter!(pv_get_u16_array, "GetUInt16Array");
+define_pv_array_getter!(pv_get_i32_array, "GetInt32Array");
+define_pv_array_getter!(pv_get_u32_array, "GetUInt32Array");
+define_pv_array_getter!(pv_get_i64_array, "GetInt64Array");
+define_pv_array_getter!(pv_get_u64_array, "GetUInt64Array");
+define_pv_array_getter!(pv_get_single_array, "GetSingleArray");
+define_pv_array_getter!(pv_get_double_array, "GetDoubleArray");
+define_pv_array_getter!(pv_get_char16_array, "GetChar16Array");
+define_pv_array_getter!(pv_get_boolean_array, "GetBooleanArray");
+define_pv_array_getter!(pv_get_string_array, "GetStringArray");
+define_pv_array_getter!(pv_get_inspectable_array, "GetInspectableArray");
+define_pv_array_getter!(pv_get_guid_array, "GetGuidArray");
+define_pv_array_getter!(pv_get_date_time_array, "GetDateTimeArray");
+define_pv_array_getter!(pv_get_time_span_array, "GetTimeSpanArray");
+define_pv_array_getter!(pv_get_point_array, "GetPointArray");
+define_pv_array_getter!(pv_get_size_array, "GetSizeArray");
+define_pv_array_getter!(pv_get_rect_array, "GetRectArray");
+
+fn pv_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                pv_qi as *const () as usize,
+                crate::com::com_add_ref::<PropValData> as *const () as usize,
+                crate::com::com_release::<PropValData> as *const () as usize,
+                pv_get_iids as *const () as usize,
+                pv_get_runtime_class_name as *const () as usize,
+                pv_get_trust_level as *const () as usize,
+                pv_get_type as *const () as usize,
+                pv_get_is_numeric as *const () as usize,
+                pv_get_u8 as *const () as usize,
+                pv_get_i16 as *const () as usize,
+                pv_get_u16 as *const () as usize,
+                pv_get_i32 as *const () as usize,
+                pv_get_u32 as *const () as usize,
+                pv_get_i64 as *const () as usize,
+                pv_get_u64 as *const () as usize,
+                pv_get_single as *const () as usize,
+                pv_get_double as *const () as usize,
+                pv_get_char16 as *const () as usize,
+                pv_get_boolean as *const () as usize,
+                pv_get_string as *const () as usize,
+                pv_get_guid as *const () as usize,
+                pv_get_date_time as *const () as usize,
+                pv_get_time_span as *const () as usize,
+                pv_get_point as *const () as usize,
+                pv_get_size as *const () as usize,
+                pv_get_rect as *const () as usize,
+                pv_get_u8_array as *const () as usize,
+                pv_get_i16_array as *const () as usize,
+                pv_get_u16_array as *const () as usize,
+                pv_get_i32_array as *const () as usize,
+                pv_get_u32_array as *const () as usize,
+                pv_get_i64_array as *const () as usize,
+                pv_get_u64_array as *const () as usize,
+                pv_get_single_array as *const () as usize,
+                pv_get_double_array as *const () as usize,
+                pv_get_char16_array as *const () as usize,
+                pv_get_boolean_array as *const () as usize,
+                pv_get_string_array as *const () as usize,
+                pv_get_inspectable_array as *const () as usize,
+                pv_get_guid_array as *const () as usize,
+                pv_get_date_time_array as *const () as usize,
+                pv_get_time_span_array as *const () as usize,
+                pv_get_point_array as *const () as usize,
+                pv_get_size_array as *const () as usize,
+                pv_get_rect_array as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValue, ptr, 45) };
+    ptr
+}
+
+fn new_prop_val(data: PropValData) -> *mut c_void {
+    crate::com::ComObj::new(pv_vtbl(), data) as *mut c_void
+}
+
+/// Dual-interface static factory for `Windows.Foundation.PropertyValue`:
+/// offset 0 = `IActivationFactory`, offset 8 = `IPropertyValueStatics`.
+#[repr(C)]
+struct PropValFactoryObj {
+    act_vtbl: *const usize,
+    statics_vtbl: *const usize,
+    refs: AtomicU32,
+}
+
+unsafe fn pvf_from_statics(iface: *mut c_void) -> *mut PropValFactoryObj {
+    (iface as *mut u8).sub(std::mem::size_of::<*const usize>()) as *mut PropValFactoryObj
+}
+
+unsafe extern "win64" fn pvf_act_qi(
+    this: *mut PropValFactoryObj,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(ppv);
+    let Some(iid) = crate::com::read_guid(riid) else {
+        return E_POINTER;
+    };
+    if iid == crate::com::IID_IUnknown
+        || iid == crate::com::IID_IInspectable
+        || iid == crate::com::IID_IActivationFactory
+    {
+        (*this).refs.fetch_add(1, Ordering::AcqRel);
+        std::ptr::write_unaligned(ppv, this as *mut c_void);
+        S_OK
+    } else if iid == crate::com::IID_IPropertyValueStatics {
+        (*this).refs.fetch_add(1, Ordering::AcqRel);
+        let sec = std::ptr::addr_of!((*this).statics_vtbl) as *mut c_void;
+        std::ptr::write_unaligned(ppv, sec);
+        S_OK
+    } else {
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "win64" fn pvf_act_add_ref(this: *mut PropValFactoryObj) -> u32 {
+    (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+unsafe extern "win64" fn pvf_act_release(this: *mut PropValFactoryObj) -> u32 {
+    let rem = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if rem == 0 {
+        drop(Box::from_raw(this));
+    }
+    rem
+}
+
+unsafe extern "win64" fn pvf_get_iids(
+    _this: *mut c_void,
+    iid_count: *mut u32,
+    iids: *mut *mut crate::com::Guid,
+) -> HRESULT {
+    write_iids(
+        iid_count,
+        iids,
+        &[crate::com::IID_IActivationFactory, crate::com::IID_IPropertyValueStatics],
+    )
+}
+
+unsafe extern "win64" fn pvf_get_runtime_class_name(_this: *mut c_void, class_name: *mut usize) -> HRESULT {
+    if class_name.is_null() {
+        return E_POINTER;
+    }
+    match rust_to_hstring("Windows.Foundation.PropertyValue") {
+        Ok(h) => {
+            std::ptr::write_unaligned(class_name, h);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+unsafe extern "win64" fn pvf_get_trust_level(_this: *mut c_void, trust: *mut i32) -> HRESULT {
+    if trust.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(trust, TRUST_LEVEL_BASE);
+    S_OK
+}
+
+unsafe extern "win64" fn pvf_activate_instance(_this: *mut PropValFactoryObj, out: *mut *mut c_void) -> HRESULT {
+    crate::com::write_null_out(out);
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pvs_qi(
+    this: *mut c_void,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    pvf_act_qi(pvf_from_statics(this), riid, ppv)
+}
+
+unsafe extern "win64" fn pvs_add_ref(this: *mut c_void) -> u32 {
+    pvf_act_add_ref(pvf_from_statics(this))
+}
+
+unsafe extern "win64" fn pvs_release(this: *mut c_void) -> u32 {
+    pvf_act_release(pvf_from_statics(this))
+}
+
+unsafe extern "win64" fn pvs_create_empty(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Empty));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_u8(_this: *mut c_void, v: u8, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::UInt8(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_i16(_this: *mut c_void, v: i16, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Int16(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_u16(_this: *mut c_void, v: u16, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::UInt16(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_i32(_this: *mut c_void, v: i32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Int32(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_u32(_this: *mut c_void, v: u32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::UInt32(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_i64(_this: *mut c_void, v: i64, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Int64(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_u64(_this: *mut c_void, v: u64, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::UInt64(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_single(_this: *mut c_void, v: f32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Single(v)));
+    S_OK
+}
+crate::win64_bridge!(fn pvs_create_single(*mut c_void, f32, *mut *mut c_void) -> HRESULT);
+
+unsafe extern "win64" fn pvs_create_double(_this: *mut c_void, v: f64, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Double(v)));
+    S_OK
+}
+crate::win64_bridge!(fn pvs_create_double(*mut c_void, f64, *mut *mut c_void) -> HRESULT);
+
+unsafe extern "win64" fn pvs_create_char16(_this: *mut c_void, v: u16, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Char16(v)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_boolean(_this: *mut c_void, v: u8, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Boolean(v != 0)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_string(_this: *mut c_void, h: usize, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let s = hstring_to_rust(h);
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::String(s)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_inspectable(
+    _this: *mut c_void,
+    val: *mut c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let retained = crate::com::ComPtr::retain(val);
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Inspectable(retained)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_guid(
+    _this: *mut c_void,
+    g_ptr: *const crate::com::Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let Some(g) = crate::com::read_guid(g_ptr) else {
+        return E_POINTER;
+    };
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Guid(g)));
+    S_OK
+}
+
+fn pvf_act_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 7]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                pvf_act_qi as *const () as usize,
+                pvf_act_add_ref as *const () as usize,
+                pvf_act_release as *const () as usize,
+                pvf_get_iids as *const () as usize,
+                pvf_get_runtime_class_name as *const () as usize,
+                pvf_get_trust_level as *const () as usize,
+                pvf_activate_instance as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IActivationFactory, ptr, 7) };
+    ptr
+}
+
+unsafe extern "win64" fn pvs_create_date_time(
+    _this: *mut c_void,
+    _v: i64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateDateTime -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pvs_create_time_span(
+    _this: *mut c_void,
+    _v: i64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 8-byte `Windows.Foundation.Point { f32 x, f32 y }` struct by value in a GPR.
+unsafe extern "win64" fn pvs_create_point(
+    _this: *mut c_void,
+    _point_bits: u64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreatePoint -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 8-byte `Windows.Foundation.Size { f32 w, f32 h }` struct by value in a GPR.
+unsafe extern "win64" fn pvs_create_size(
+    _this: *mut c_void,
+    _size_bits: u64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateSize -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 16-byte `Windows.Foundation.Rect` struct indirectly by pointer.
+unsafe extern "win64" fn pvs_create_rect(
+    _this: *mut c_void,
+    rect_ptr: *const [f32; 4],
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    if rect_ptr.is_null() {
+        return E_POINTER;
+    }
+    crate::stub!("IPropertyValueStatics::CreateRect -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+macro_rules! define_pvs_array_creator {
+    ($fn_name:ident, $method:literal) => {
+        unsafe extern "win64" fn $fn_name(
+            _this: *mut c_void,
+            len: u32,
+            data: *const c_void,
+            out: *mut *mut c_void,
+        ) -> HRESULT {
+            if out.is_null() {
+                return E_POINTER;
+            }
+            crate::com::write_null_out(out);
+            if len > 0 && data.is_null() {
+                return E_POINTER;
+            }
+            crate::stub!(concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL"));
+            E_NOTIMPL
+        }
+    };
+}
+
+define_pvs_array_creator!(pvs_create_u8_array, "CreateUInt8Array");
+define_pvs_array_creator!(pvs_create_i16_array, "CreateInt16Array");
+define_pvs_array_creator!(pvs_create_u16_array, "CreateUInt16Array");
+define_pvs_array_creator!(pvs_create_i32_array, "CreateInt32Array");
+define_pvs_array_creator!(pvs_create_u32_array, "CreateUInt32Array");
+define_pvs_array_creator!(pvs_create_i64_array, "CreateInt64Array");
+define_pvs_array_creator!(pvs_create_u64_array, "CreateUInt64Array");
+define_pvs_array_creator!(pvs_create_single_array, "CreateSingleArray");
+define_pvs_array_creator!(pvs_create_double_array, "CreateDoubleArray");
+define_pvs_array_creator!(pvs_create_char16_array, "CreateChar16Array");
+define_pvs_array_creator!(pvs_create_boolean_array, "CreateBooleanArray");
+define_pvs_array_creator!(pvs_create_string_array, "CreateStringArray");
+define_pvs_array_creator!(pvs_create_inspectable_array, "CreateInspectableArray");
+define_pvs_array_creator!(pvs_create_guid_array, "CreateGuidArray");
+define_pvs_array_creator!(pvs_create_date_time_array, "CreateDateTimeArray");
+define_pvs_array_creator!(pvs_create_time_span_array, "CreateTimeSpanArray");
+define_pvs_array_creator!(pvs_create_point_array, "CreatePointArray");
+define_pvs_array_creator!(pvs_create_size_array, "CreateSizeArray");
+define_pvs_array_creator!(pvs_create_rect_array, "CreateRectArray");
+
+fn pvs_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                pvs_qi as *const () as usize,
+                pvs_add_ref as *const () as usize,
+                pvs_release as *const () as usize,
+                pvf_get_iids as *const () as usize,
+                pvf_get_runtime_class_name as *const () as usize,
+                pvf_get_trust_level as *const () as usize,
+                pvs_create_empty as *const () as usize,
+                pvs_create_u8 as *const () as usize,
+                pvs_create_i16 as *const () as usize,
+                pvs_create_u16 as *const () as usize,
+                pvs_create_i32 as *const () as usize,
+                pvs_create_u32 as *const () as usize,
+                pvs_create_i64 as *const () as usize,
+                pvs_create_u64 as *const () as usize,
+                crate::bridge_entry!(pvs_create_single) as *const () as usize,
+                crate::bridge_entry!(pvs_create_double) as *const () as usize,
+                pvs_create_char16 as *const () as usize,
+                pvs_create_boolean as *const () as usize,
+                pvs_create_string as *const () as usize,
+                pvs_create_inspectable as *const () as usize,
+                pvs_create_guid as *const () as usize,
+                pvs_create_date_time as *const () as usize,
+                pvs_create_time_span as *const () as usize,
+                pvs_create_point as *const () as usize,
+                pvs_create_size as *const () as usize,
+                pvs_create_rect as *const () as usize,
+                pvs_create_u8_array as *const () as usize,
+                pvs_create_i16_array as *const () as usize,
+                pvs_create_u16_array as *const () as usize,
+                pvs_create_i32_array as *const () as usize,
+                pvs_create_u32_array as *const () as usize,
+                pvs_create_i64_array as *const () as usize,
+                pvs_create_u64_array as *const () as usize,
+                pvs_create_single_array as *const () as usize,
+                pvs_create_double_array as *const () as usize,
+                pvs_create_char16_array as *const () as usize,
+                pvs_create_boolean_array as *const () as usize,
+                pvs_create_string_array as *const () as usize,
+                pvs_create_inspectable_array as *const () as usize,
+                pvs_create_guid_array as *const () as usize,
+                pvs_create_date_time_array as *const () as usize,
+                pvs_create_time_span_array as *const () as usize,
+                pvs_create_point_array as *const () as usize,
+                pvs_create_size_array as *const () as usize,
+                pvs_create_rect_array as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValueStatics, ptr, 45) };
+    ptr
+}
+
+unsafe fn create_property_value_factory(riid: *const crate::com::Guid, out: *mut *mut c_void) -> HRESULT {
+    let f = Box::into_raw(Box::new(PropValFactoryObj {
+        act_vtbl: pvf_act_vtbl(),
+        statics_vtbl: pvs_vtbl(),
+        refs: AtomicU32::new(1),
+    }));
+    let hr = pvf_act_qi(f, riid, out);
+    pvf_act_release(f);
+    hr
+}
+
+// --- Windows.Foundation.Uri (`IUriRuntimeClass` + `IUriRuntimeClassFactory`) ---
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedUri {
+    raw: String,
+    scheme: String,
+    user: String,
+    password: String,
+    host: String,
+    port: i32,
+    path: String,
+    query: String,
+    fragment: String,
+}
+
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            if let Some(slash) = out.rfind('/') {
+                out.truncate(slash);
+            } else {
+                out.clear();
+            }
+        } else if input == "/.." {
+            input = "/";
+            if let Some(slash) = out.rfind('/') {
+                out.truncate(slash);
+            } else {
+                out.clear();
+            }
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let seg_end = if let Some(after_leading) = input.strip_prefix('/') {
+                match after_leading.find('/') {
+                    Some(i) => i + 1,
+                    None => input.len(),
+                }
+            } else {
+                input.find('/').unwrap_or(input.len())
+            };
+            out.push_str(&input[..seg_end]);
+            input = &input[seg_end..];
+        }
+    }
+    out
+}
+
+impl ParsedUri {
+    fn parse(raw: &str) -> Result<Self, HRESULT> {
+        let trimmed = raw.trim();
+        let Some(colon) = trimmed.find(':') else {
+            return Err(E_INVALIDARG);
+        };
+        let scheme = trimmed[..colon].to_ascii_lowercase();
+        if scheme.is_empty()
+            || !scheme.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+            || !scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            return Err(E_INVALIDARG);
+        }
+        let mut rest = &trimmed[colon + 1..];
+        let (rest_no_frag, fragment) = match rest.find('#') {
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, String::new()),
+        };
+        let (rest_no_query, query) = match rest_no_frag.find('?') {
+            Some(i) => (&rest_no_frag[..i], rest_no_frag[i..].to_string()),
+            None => (rest_no_frag, String::new()),
+        };
+        rest = rest_no_query;
+
+        let default_port = match scheme.as_str() {
+            "http" | "ws" => 80,
+            "https" | "wss" => 443,
+            "ftp" => 21,
+            _ => 0,
+        };
+
+        let (mut user, mut password, mut host, mut port) = (String::new(), String::new(), String::new(), default_port);
+        let path: String;
+        if let Some(after_slashes) = rest.strip_prefix("//") {
+            let (authority, p) = match after_slashes.find('/') {
+                Some(i) => (&after_slashes[..i], &after_slashes[i..]),
+                None => (after_slashes, "/"),
+            };
+            path = p.to_string();
+            let hostport = match authority.rfind('@') {
+                Some(at) => {
+                    let userinfo = &authority[..at];
+                    match userinfo.find(':') {
+                        Some(c) => {
+                            user = userinfo[..c].to_string();
+                            password = userinfo[c + 1..].to_string();
+                        }
+                        None => user = userinfo.to_string(),
+                    }
+                    &authority[at + 1..]
+                }
+                None => authority,
+            };
+            if hostport.starts_with('[') {
+                // IPv6 literal
+                if let Some(end) = hostport.find(']') {
+                    host = hostport[..=end].to_ascii_lowercase();
+                    if let Some(pstr) = hostport[end + 1..].strip_prefix(':') {
+                        port = pstr.parse::<u16>().map(|v| v as i32).map_err(|_| E_INVALIDARG)?;
+                    }
+                } else {
+                    return Err(E_INVALIDARG);
+                }
+            } else if let Some(c) = hostport.rfind(':') {
+                host = hostport[..c].to_ascii_lowercase();
+                let pstr = &hostport[c + 1..];
+                if !pstr.is_empty() {
+                    port = pstr.parse::<u16>().map(|v| v as i32).map_err(|_| E_INVALIDARG)?;
+                }
+            } else {
+                host = hostport.to_ascii_lowercase();
+            }
+        } else {
+            path = rest.to_string();
+        }
+
+        Ok(Self {
+            raw: trimmed.to_string(),
+            scheme,
+            user,
+            password,
+            host,
+            port,
+            path,
+            query,
+            fragment,
+        })
+    }
+
+    fn absolute_uri(&self) -> String {
+        let mut s = format!("{}:", self.scheme);
+        if !self.host.is_empty() {
+            s.push_str("//");
+            if !self.user.is_empty() {
+                s.push_str(&self.user);
+                if !self.password.is_empty() {
+                    s.push(':');
+                    s.push_str(&self.password);
+                }
+                s.push('@');
+            }
+            s.push_str(&self.host);
+            let default_port = match self.scheme.as_str() {
+                "http" | "ws" => 80,
+                "https" | "wss" => 443,
+                "ftp" => 21,
+                _ => 0,
+            };
+            if self.port != 0 && self.port != default_port {
+                s.push(':');
+                s.push_str(&self.port.to_string());
+            }
+        }
+        s.push_str(&self.path);
+        s.push_str(&self.query);
+        s.push_str(&self.fragment);
+        s
+    }
+
+    fn extension(&self) -> String {
+        let seg = self.path.rsplit('/').next().unwrap_or("");
+        match seg.rfind('.') {
+            Some(dot) if dot > 0 => seg[dot..].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn combine(&self, rel: &str) -> Result<Self, HRESULT> {
+        let rel = rel.trim();
+        let (rel_path, rel_suffix) = match rel.find(['?', '#']) {
+            Some(i) => (&rel[..i], &rel[i..]),
+            None => (rel, ""),
+        };
+        if rel_path.is_empty() {
+            let base_prefix = if rel_suffix.starts_with('?') {
+                match self.raw.find(['?', '#']) {
+                    Some(i) => &self.raw[..i],
+                    None => self.raw.as_str(),
+                }
+            } else {
+                match self.raw.find('#') {
+                    Some(i) => &self.raw[..i],
+                    None => self.raw.as_str(),
+                }
+            };
+            let combined = format!("{base_prefix}{rel_suffix}");
+            return Self::parse(&combined);
+        }
+        if rel_path.starts_with("//") {
+            let combined = format!("{}:{rel}", self.scheme);
+            return Self::parse(&combined);
+        }
+        // RFC 3986 §3.1 / §4.2: a ':' in the first path segment (before any '/', '?', '#')
+        // denotes a scheme; delegate to Self::parse so valid schemes succeed and malformed
+        // scheme candidates fail honestly with E_INVALIDARG.
+        let first_seg = match rel_path.find('/') {
+            Some(i) => &rel_path[..i],
+            None => rel_path,
+        };
+        if first_seg.contains(':') {
+            return Self::parse(rel);
+        }
+        let (base_origin, has_authority) = match self.raw.find(':') {
+            Some(colon) => {
+                let after_colon = &self.raw[colon + 1..];
+                if let Some(after_slashes) = after_colon.strip_prefix("//") {
+                    let auth_len = after_slashes.find(['/', '?', '#']).unwrap_or(after_slashes.len());
+                    (&self.raw[..colon + 3 + auth_len], true)
+                } else {
+                    (&self.raw[..=colon], false)
+                }
+            }
+            None => (self.raw.as_str(), false),
+        };
+        let merged_path = if rel_path.starts_with('/') {
+            rel_path.to_string()
+        } else {
+            let base_dir = match self.path.rfind('/') {
+                Some(i) => &self.path[..=i],
+                None if has_authority => "/",
+                None => "",
+            };
+            format!("{base_dir}{rel_path}")
+        };
+        let clean_path = remove_dot_segments(&merged_path);
+        let combined = format!("{base_origin}{clean_path}{rel_suffix}");
+        Self::parse(&combined)
+    }
+}
+
+type UriObj = crate::com::ComObj<ParsedUri>;
+
+unsafe extern "win64" fn uri_qi(
+    this: *mut UriObj,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    crate::com::qi_helper(
+        this,
+        riid,
+        ppv,
+        &[crate::com::IID_IInspectable, crate::com::IID_IUriRuntimeClass],
+    )
+}
+
+unsafe extern "win64" fn uri_get_iids(
+    _this: *mut UriObj,
+    iid_count: *mut u32,
+    iids: *mut *mut crate::com::Guid,
+) -> HRESULT {
+    write_iids(iid_count, iids, &[crate::com::IID_IUriRuntimeClass])
+}
+
+unsafe extern "win64" fn uri_get_runtime_class_name(_this: *mut UriObj, class_name: *mut usize) -> HRESULT {
+    if class_name.is_null() {
+        return E_POINTER;
+    }
+    match rust_to_hstring("Windows.Foundation.Uri") {
+        Ok(h) => {
+            std::ptr::write_unaligned(class_name, h);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+unsafe extern "win64" fn uri_get_trust_level(_this: *mut UriObj, trust: *mut i32) -> HRESULT {
+    if trust.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(trust, TRUST_LEVEL_BASE);
+    S_OK
+}
+
+unsafe fn write_hstring_out(s: &str, out: *mut usize) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    match rust_to_hstring(s) {
+        Ok(h) => {
+            std::ptr::write_unaligned(out, h);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+unsafe extern "win64" fn uri_get_absolute(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).absolute_uri(), out)
+}
+unsafe extern "win64" fn uri_get_display(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).absolute_uri(), out)
+}
+unsafe extern "win64" fn uri_get_domain(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).host, out)
+}
+unsafe extern "win64" fn uri_get_extension(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).extension(), out)
+}
+unsafe extern "win64" fn uri_get_fragment(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).fragment, out)
+}
+unsafe extern "win64" fn uri_get_host(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).host, out)
+}
+unsafe extern "win64" fn uri_get_password(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).password, out)
+}
+unsafe extern "win64" fn uri_get_path(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).path, out)
+}
+unsafe extern "win64" fn uri_get_query(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).query, out)
+}
+unsafe extern "win64" fn uri_get_query_parsed(_this: *mut UriObj, out: *mut *mut c_void) -> HRESULT {
+    crate::com::write_null_out(out);
+    E_NOTIMPL
+}
+unsafe extern "win64" fn uri_get_raw(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).raw, out)
+}
+unsafe extern "win64" fn uri_get_scheme(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).scheme, out)
+}
+unsafe extern "win64" fn uri_get_user(this: *mut UriObj, out: *mut usize) -> HRESULT {
+    write_hstring_out(&crate::com::ComObj::inner(this).user, out)
+}
+unsafe extern "win64" fn uri_get_port(this: *mut UriObj, out: *mut i32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, crate::com::ComObj::inner(this).port);
+    S_OK
+}
+unsafe extern "win64" fn uri_get_suspicious(_this: *mut UriObj, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    S_OK
+}
+unsafe extern "win64" fn uri_equals(this: *mut UriObj, other: *mut c_void, out: *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let eq = match crate::com::com_from_iface::<ParsedUri>(other, uri_vtbl()) {
+        Some(o) => crate::com::ComObj::inner(this).absolute_uri() == o.inner.absolute_uri(),
+        None => false,
+    };
+    std::ptr::write_unaligned(out, eq as u8);
+    S_OK
+}
+unsafe extern "win64" fn uri_combine(
+    this: *mut UriObj,
+    rel: usize,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    let rel_s = hstring_to_rust(rel);
+    match crate::com::ComObj::inner(this).combine(&rel_s) {
+        Ok(u) => {
+            std::ptr::write_unaligned(out, crate::com::ComObj::new(uri_vtbl(), u) as *mut c_void);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+fn uri_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 23]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                uri_qi as *const () as usize,
+                crate::com::com_add_ref::<ParsedUri> as *const () as usize,
+                crate::com::com_release::<ParsedUri> as *const () as usize,
+                uri_get_iids as *const () as usize,
+                uri_get_runtime_class_name as *const () as usize,
+                uri_get_trust_level as *const () as usize,
+                uri_get_absolute as *const () as usize,
+                uri_get_display as *const () as usize,
+                uri_get_domain as *const () as usize,
+                uri_get_extension as *const () as usize,
+                uri_get_fragment as *const () as usize,
+                uri_get_host as *const () as usize,
+                uri_get_password as *const () as usize,
+                uri_get_path as *const () as usize,
+                uri_get_query as *const () as usize,
+                uri_get_query_parsed as *const () as usize,
+                uri_get_raw as *const () as usize,
+                uri_get_scheme as *const () as usize,
+                uri_get_user as *const () as usize,
+                uri_get_port as *const () as usize,
+                uri_get_suspicious as *const () as usize,
+                uri_equals as *const () as usize,
+                uri_combine as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IUriRuntimeClass, ptr, 23) };
+    ptr
+}
+
+#[repr(C)]
+struct UriFactoryObj {
+    act_vtbl: *const usize,
+    uri_factory_vtbl: *const usize,
+    refs: AtomicU32,
+}
+
+unsafe fn urif_from_sec(iface: *mut c_void) -> *mut UriFactoryObj {
+    (iface as *mut u8).sub(std::mem::size_of::<*const usize>()) as *mut UriFactoryObj
+}
+
+unsafe extern "win64" fn urif_act_qi(
+    this: *mut UriFactoryObj,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(ppv);
+    let Some(iid) = crate::com::read_guid(riid) else {
+        return E_POINTER;
+    };
+    if iid == crate::com::IID_IUnknown
+        || iid == crate::com::IID_IInspectable
+        || iid == crate::com::IID_IActivationFactory
+    {
+        (*this).refs.fetch_add(1, Ordering::AcqRel);
+        std::ptr::write_unaligned(ppv, this as *mut c_void);
+        S_OK
+    } else if iid == crate::com::IID_IUriRuntimeClassFactory {
+        (*this).refs.fetch_add(1, Ordering::AcqRel);
+        let sec = std::ptr::addr_of!((*this).uri_factory_vtbl) as *mut c_void;
+        std::ptr::write_unaligned(ppv, sec);
+        S_OK
+    } else {
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "win64" fn urif_act_add_ref(this: *mut UriFactoryObj) -> u32 {
+    (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+unsafe extern "win64" fn urif_act_release(this: *mut UriFactoryObj) -> u32 {
+    let rem = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if rem == 0 {
+        drop(Box::from_raw(this));
+    }
+    rem
+}
+
+unsafe extern "win64" fn urif_get_iids(
+    _this: *mut c_void,
+    iid_count: *mut u32,
+    iids: *mut *mut crate::com::Guid,
+) -> HRESULT {
+    write_iids(
+        iid_count,
+        iids,
+        &[crate::com::IID_IActivationFactory, crate::com::IID_IUriRuntimeClassFactory],
+    )
+}
+
+unsafe extern "win64" fn urif_get_runtime_class_name(_this: *mut c_void, class_name: *mut usize) -> HRESULT {
+    write_hstring_out("Windows.Foundation.Uri", class_name)
+}
+
+unsafe extern "win64" fn urif_get_trust_level(_this: *mut c_void, trust: *mut i32) -> HRESULT {
+    if trust.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(trust, TRUST_LEVEL_BASE);
+    S_OK
+}
+
+unsafe extern "win64" fn urif_activate_instance(_this: *mut UriFactoryObj, out: *mut *mut c_void) -> HRESULT {
+    crate::com::write_null_out(out);
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn urif_sec_qi(
+    this: *mut c_void,
+    riid: *const crate::com::Guid,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    urif_act_qi(urif_from_sec(this), riid, ppv)
+}
+
+unsafe extern "win64" fn urif_sec_add_ref(this: *mut c_void) -> u32 {
+    urif_act_add_ref(urif_from_sec(this))
+}
+
+unsafe extern "win64" fn urif_sec_release(this: *mut c_void) -> u32 {
+    urif_act_release(urif_from_sec(this))
+}
+
+unsafe extern "win64" fn urif_create_uri(
+    _this: *mut c_void,
+    uri_hstr: usize,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    let raw = hstring_to_rust(uri_hstr);
+    match ParsedUri::parse(&raw) {
+        Ok(u) => {
+            std::ptr::write_unaligned(out, crate::com::ComObj::new(uri_vtbl(), u) as *mut c_void);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+unsafe extern "win64" fn urif_create_with_relative_uri(
+    _this: *mut c_void,
+    base_hstr: usize,
+    rel_hstr: usize,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    let base_raw = hstring_to_rust(base_hstr);
+    let rel_raw = hstring_to_rust(rel_hstr);
+    let Ok(base) = ParsedUri::parse(&base_raw) else {
+        return E_INVALIDARG;
+    };
+    match base.combine(&rel_raw) {
+        Ok(u) => {
+            std::ptr::write_unaligned(out, crate::com::ComObj::new(uri_vtbl(), u) as *mut c_void);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
+}
+
+fn urif_act_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 7]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                urif_act_qi as *const () as usize,
+                urif_act_add_ref as *const () as usize,
+                urif_act_release as *const () as usize,
+                urif_get_iids as *const () as usize,
+                urif_get_runtime_class_name as *const () as usize,
+                urif_get_trust_level as *const () as usize,
+                urif_activate_instance as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IActivationFactory, ptr, 7) };
+    ptr
+}
+
+fn urif_sec_vtbl() -> *const usize {
+    static VT: std::sync::OnceLock<[usize; 8]> = std::sync::OnceLock::new();
+    let ptr = VT
+        .get_or_init(|| {
+            [
+                urif_sec_qi as *const () as usize,
+                urif_sec_add_ref as *const () as usize,
+                urif_sec_release as *const () as usize,
+                urif_get_iids as *const () as usize,
+                urif_get_runtime_class_name as *const () as usize,
+                urif_get_trust_level as *const () as usize,
+                urif_create_uri as *const () as usize,
+                urif_create_with_relative_uri as *const () as usize,
+            ]
+        })
+        .as_ptr();
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IUriRuntimeClassFactory, ptr, 8) };
+    ptr
+}
+
+unsafe fn create_uri_factory(riid: *const crate::com::Guid, out: *mut *mut c_void) -> HRESULT {
+    let f = Box::into_raw(Box::new(UriFactoryObj {
+        act_vtbl: urif_act_vtbl(),
+        uri_factory_vtbl: urif_sec_vtbl(),
+        refs: AtomicU32::new(1),
+    }));
+    let hr = urif_act_qi(f, riid, out);
+    urif_act_release(f);
+    hr
+}
 
 pub unsafe extern "win64" fn RoInitialize(_init_type: u32) -> HRESULT {
     com_init()
@@ -1608,15 +3373,93 @@ pub unsafe extern "win64" fn RoUninitialize() {
 }
 
 pub unsafe extern "win64" fn RoGetActivationFactory(
-    _activatable_class_id: usize,
-    _iid: *const u8,
+    activatable_class_id: usize,
+    iid: *const u8,
     factory: *mut *mut c_void,
 ) -> HRESULT {
-    if !factory.is_null() {
-        std::ptr::write_unaligned(factory, std::ptr::null_mut());
+    if factory.is_null() {
+        return E_POINTER;
     }
-    log::debug!("RoGetActivationFactory: class not registered -> REGDB_E_CLASSNOTREG");
-    REGDB_E_CLASSNOTREG
+    std::ptr::write_unaligned(factory, std::ptr::null_mut());
+    if iid.is_null() {
+        return E_INVALIDARG;
+    }
+    let class_name = hstring_to_rust(activatable_class_id);
+    if class_name.is_empty() {
+        return REGDB_E_CLASSNOTREG;
+    }
+
+    // 1. Dynamically registered WinRT activation factories (outside lock before QI).
+    let custom = WINRT_FACTORIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&class_name)
+        .cloned();
+    if let Some(f) = custom {
+        return com_call_qi(f.as_ptr(), iid, factory);
+    }
+
+    // 2. Real built-in Rust WinRT Foundation classes.
+    match class_name.as_str() {
+        "Windows.Foundation.PropertyValue" => {
+            create_property_value_factory(iid as *const crate::com::Guid, factory)
+        }
+        "Windows.Foundation.Uri" => {
+            create_uri_factory(iid as *const crate::com::Guid, factory)
+        }
+        _ => {
+            log::debug!("RoGetActivationFactory({class_name:?}): class not registered -> REGDB_E_CLASSNOTREG");
+            REGDB_E_CLASSNOTREG
+        }
+    }
+}
+
+pub unsafe extern "win64" fn RoActivateInstance(
+    activatable_class_id: usize,
+    instance: *mut *mut c_void,
+) -> HRESULT {
+    if instance.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(instance, std::ptr::null_mut());
+    let mut factory: *mut c_void = std::ptr::null_mut();
+    let act_iid = crate::com::IID_IActivationFactory.to_bytes();
+    let hr = RoGetActivationFactory(activatable_class_id, act_iid.as_ptr(), &mut factory);
+    if hr < 0 || factory.is_null() {
+        return if hr < 0 { hr } else { REGDB_E_CLASSNOTREG };
+    }
+    let ahr = crate::com::com_invoke_hresult(
+        factory,
+        &crate::com::IID_IActivationFactory,
+        6, // IActivationFactory::ActivateInstance
+        &[instance as u64],
+    );
+    com_call_release(factory);
+    ahr
+}
+
+pub unsafe extern "win64" fn WindowsDuplicateString(string: usize, new_string: *mut usize) -> HRESULT {
+    if new_string.is_null() {
+        return E_INVALIDARG;
+    }
+    if string == 0 {
+        std::ptr::write_unaligned(new_string, 0);
+        return S_OK;
+    }
+    let mut len: u32 = 0;
+    let buf = WindowsGetStringRawBuffer(string, &mut len);
+    WindowsCreateString(buf, len, new_string)
+}
+
+pub unsafe extern "win64" fn WindowsGetStringLen(string: usize) -> u32 {
+    if string == 0 {
+        return 0;
+    }
+    std::ptr::read_unaligned(string as *const u32)
+}
+
+pub unsafe extern "win64" fn WindowsIsStringEmpty(string: usize) -> BOOL {
+    (WindowsGetStringLen(string) == 0) as BOOL
 }
 
 pub unsafe extern "win64" fn WindowsCreateString(
@@ -1862,17 +3705,11 @@ pub unsafe extern "win64" fn CoGetMalloc(dw_mem_context: u32, pp_malloc: *mut *m
         std::ptr::write_unaligned(pp_malloc, std::ptr::null_mut());
         return E_INVALIDARG;
     }
-    register_vtable_ptrs(&[
-        malloc_qi as *const () as usize,
-        malloc_add_ref as *const () as usize,
-        malloc_release as *const () as usize,
-        malloc_alloc as *const () as usize,
-        malloc_realloc as *const () as usize,
-        malloc_free as *const () as usize,
-        malloc_get_size as *const () as usize,
-        malloc_did_alloc as *const () as usize,
-        malloc_heap_minimize as *const () as usize,
-    ]);
+    crate::com::register_host_vtable(
+        crate::com::IID_IMalloc,
+        (&IMALLOC_VTBL as *const IMallocVtbl) as *const usize,
+        9,
+    );
     std::ptr::write_unaligned(pp_malloc, (&IMALLOC_INSTANCE as *const IMallocObj) as *mut c_void);
     S_OK
 }
@@ -2210,6 +4047,1080 @@ mod tests {
             assert!(!mmdev.is_null());
             com_call_release(mmdev);
             assert_eq!((cfvt.release)(cf), 0);
+        }
+    }
+
+    #[test]
+    fn co_register_class_object_get_create_and_revoke_with_guest_factory() {
+        const CLSID_APP_WIDGET: crate::com::Guid =
+            crate::com::guid("55aa1122-3344-5566-7788-99aabbccdd01");
+        const IID_APP_WIDGET: crate::com::Guid =
+            crate::com::guid("55aa1122-3344-5566-7788-99aabbccdd02");
+        const IID_UNSUPPORTED: crate::com::Guid =
+            crate::com::guid("55aa1122-3344-5566-7788-99aabbccdd99");
+
+        #[repr(C)]
+        struct GuestWidget {
+            vtbl: *const usize,
+            refs: AtomicU32,
+            magic: u32,
+        }
+
+        unsafe extern "win64" fn widget_qi(
+            this: *mut GuestWidget,
+            riid: *const crate::com::Guid,
+            ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            if ppv.is_null() {
+                return E_POINTER;
+            }
+            crate::com::write_null_out(ppv);
+            let Some(g) = crate::com::read_guid(riid) else {
+                return E_INVALIDARG;
+            };
+            if g == crate::com::IID_IUnknown || g == IID_APP_WIDGET {
+                (*this).refs.fetch_add(1, Ordering::AcqRel);
+                std::ptr::write_unaligned(ppv, this as *mut c_void);
+                S_OK
+            } else {
+                E_NOINTERFACE
+            }
+        }
+        unsafe extern "win64" fn widget_add_ref(this: *mut GuestWidget) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "win64" fn widget_release(this: *mut GuestWidget) -> u32 {
+            let rem = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+            if rem == 0 {
+                drop(Box::from_raw(this));
+            }
+            rem
+        }
+        fn widget_vtbl() -> *const usize {
+            static VT: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
+            VT.get_or_init(|| {
+                [
+                    widget_qi as *const () as usize,
+                    widget_add_ref as *const () as usize,
+                    widget_release as *const () as usize,
+                ]
+            })
+            .as_ptr()
+        }
+
+        #[repr(C)]
+        struct GuestFactory {
+            vtbl: *const usize,
+            refs: AtomicU32,
+            created_count: AtomicU32,
+        }
+
+        unsafe extern "win64" fn gf_qi(
+            this: *mut GuestFactory,
+            riid: *const crate::com::Guid,
+            ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            if ppv.is_null() {
+                return E_POINTER;
+            }
+            crate::com::write_null_out(ppv);
+            let Some(g) = crate::com::read_guid(riid) else {
+                return E_INVALIDARG;
+            };
+            if g == crate::com::IID_IUnknown || g == crate::com::IID_IClassFactory {
+                (*this).refs.fetch_add(1, Ordering::AcqRel);
+                std::ptr::write_unaligned(ppv, this as *mut c_void);
+                S_OK
+            } else {
+                E_NOINTERFACE
+            }
+        }
+        unsafe extern "win64" fn gf_add_ref(this: *mut GuestFactory) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "win64" fn gf_release(this: *mut GuestFactory) -> u32 {
+            (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        unsafe extern "win64" fn gf_create_instance(
+            this: *mut GuestFactory,
+            outer: *mut c_void,
+            riid: *const crate::com::Guid,
+            ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            if !outer.is_null() {
+                return CLASS_E_NOAGGREGATION;
+            }
+            (*this).created_count.fetch_add(1, Ordering::AcqRel);
+            let w = Box::into_raw(Box::new(GuestWidget {
+                vtbl: widget_vtbl(),
+                refs: AtomicU32::new(1),
+                magic: 0x1337,
+            }));
+            let hr = widget_qi(w, riid, ppv);
+            widget_release(w);
+            hr
+        }
+        unsafe extern "win64" fn gf_lock_server(_this: *mut GuestFactory, _lock: BOOL) -> HRESULT {
+            S_OK
+        }
+
+        let gf_vtbl: [usize; 5] = [
+            gf_qi as *const () as usize,
+            gf_add_ref as *const () as usize,
+            gf_release as *const () as usize,
+            gf_create_instance as *const () as usize,
+            gf_lock_server as *const () as usize,
+        ];
+        let mut gf = GuestFactory {
+            vtbl: gf_vtbl.as_ptr(),
+            refs: AtomicU32::new(1),
+            created_count: AtomicU32::new(0),
+        };
+        let gf_ptr = (&mut gf as *mut GuestFactory) as *mut c_void;
+        let clsid_bytes = CLSID_APP_WIDGET.to_bytes();
+        let iid_widget_bytes = IID_APP_WIDGET.to_bytes();
+        let iid_bad_bytes = IID_UNSUPPORTED.to_bytes();
+
+        unsafe {
+            // Before registration -> REGDB_E_CLASSNOTREG.
+            let mut obj: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                CoCreateInstance(clsid_bytes.as_ptr(), std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid_widget_bytes.as_ptr(), &mut obj),
+                REGDB_E_CLASSNOTREG
+            );
+
+            // Register guest factory -> AddRef increments 1 -> 2.
+            let mut cookie = 0u32;
+            assert_eq!(
+                CoRegisterClassObject(clsid_bytes.as_ptr(), gf_ptr, CLSCTX_INPROC_SERVER, 1, &mut cookie),
+                S_OK
+            );
+            assert_ne!(cookie, 0);
+            assert_eq!(gf.refs.load(Ordering::Acquire), 2);
+
+            // CoGetClassObject returns guest IClassFactory and rejects unsupported IID with E_NOINTERFACE.
+            let mut got_cf: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                CoGetClassObject(clsid_bytes.as_ptr(), CLSCTX_INPROC_SERVER, std::ptr::null_mut(), IID_ICLASSFACTORY_BYTES.as_ptr(), &mut got_cf),
+                S_OK
+            );
+            assert_eq!(got_cf, gf_ptr);
+            assert_eq!(gf.refs.load(Ordering::Acquire), 3);
+            com_call_release(got_cf);
+            assert_eq!(gf.refs.load(Ordering::Acquire), 2);
+
+            assert_eq!(
+                CoGetClassObject(clsid_bytes.as_ptr(), CLSCTX_INPROC_SERVER, std::ptr::null_mut(), iid_bad_bytes.as_ptr(), &mut got_cf),
+                E_NOINTERFACE
+            );
+
+            // CoCreateInstance invokes guest IClassFactory::CreateInstance via call_guest8.
+            assert_eq!(
+                CoCreateInstance(clsid_bytes.as_ptr(), std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid_widget_bytes.as_ptr(), &mut obj),
+                S_OK
+            );
+            assert!(!obj.is_null());
+            assert_eq!((*(obj as *const GuestWidget)).magic, 0x1337);
+            assert_eq!(gf.created_count.load(Ordering::Acquire), 1);
+            assert_eq!(com_call_release(obj), 0);
+
+            // Unsupported IID on CoCreateInstance -> E_NOINTERFACE.
+            assert_eq!(
+                CoCreateInstance(clsid_bytes.as_ptr(), std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid_bad_bytes.as_ptr(), &mut obj),
+                E_NOINTERFACE
+            );
+
+            // Revoke releases factory ref (2 -> 1) and makes class unregistered again.
+            assert_eq!(CoRevokeClassObject(cookie), S_OK);
+            assert_eq!(gf.refs.load(Ordering::Acquire), 1);
+            assert_eq!(CoRevokeClassObject(cookie), E_INVALIDARG);
+            assert_eq!(
+                CoCreateInstance(clsid_bytes.as_ptr(), std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid_widget_bytes.as_ptr(), &mut obj),
+                REGDB_E_CLASSNOTREG
+            );
+        }
+    }
+
+    #[test]
+    fn winrt_activation_property_value_uri_custom_factory_and_unregistered_rejection() {
+        unsafe {
+            // 1. Unavailable WinRT class strictly returns REGDB_E_CLASSNOTREG.
+            let missing_id = rust_to_hstring("Windows.System.NonExistentRuntimeClass").unwrap();
+            let act_iid = crate::com::IID_IActivationFactory.to_bytes();
+            let mut out: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(missing_id, act_iid.as_ptr(), &mut out), REGDB_E_CLASSNOTREG);
+            assert!(out.is_null());
+            assert_eq!(RoActivateInstance(missing_id, &mut out), REGDB_E_CLASSNOTREG);
+            WindowsDeleteString(missing_id);
+
+            // 2. Real Windows.Foundation.PropertyValue activation + IInspectable + IPropertyValue.
+            let pv_class = rust_to_hstring("Windows.Foundation.PropertyValue").unwrap();
+            let pvs_iid = crate::com::IID_IPropertyValueStatics.to_bytes();
+            let mut pvs: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(pv_class, pvs_iid.as_ptr(), &mut pvs), S_OK);
+            assert!(!pvs.is_null());
+
+            // Unsupported IID on real WinRT class -> E_NOINTERFACE.
+            let bad_iid = crate::com::guid("deadbeef-1111-2222-3333-444444444444").to_bytes();
+            let mut bad_out: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(pv_class, bad_iid.as_ptr(), &mut bad_out), E_NOINTERFACE);
+
+            // Create Int32 PropertyValue via typed COM slot 10 (CreateInt32).
+            let mut pv_i32: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    10,
+                    &[(-42i32) as i64 as u64, &mut pv_i32 as *mut *mut c_void as u64]
+                ),
+                S_OK
+            );
+            assert!(!pv_i32.is_null());
+            let mut ptype = 0i32;
+            let mut is_num = 0u8;
+            let mut got_i32 = 0i32;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_i32, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]),
+                S_OK
+            );
+            assert_eq!(ptype, WinRtPropertyType::Int32 as i32);
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_i32, &crate::com::IID_IPropertyValue, 7, &[&mut is_num as *mut u8 as u64]),
+                S_OK
+            );
+            assert_eq!(is_num, 1);
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_i32, &crate::com::IID_IPropertyValue, 11, &[&mut got_i32 as *mut i32 as u64]),
+                S_OK
+            );
+            assert_eq!(got_i32, -42);
+
+            // Verify IInspectable::GetRuntimeClassName & GetTrustLevel & GetIids.
+            let mut rcn: usize = 0;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_i32, &crate::com::IID_IInspectable, 4, &[&mut rcn as *mut usize as u64]),
+                S_OK
+            );
+            assert_eq!(hstring_to_rust(rcn), "Windows.Foundation.PropertyValue");
+            WindowsDeleteString(rcn);
+
+            let mut trust = -1i32;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_i32, &crate::com::IID_IInspectable, 5, &[&mut trust as *mut i32 as u64]),
+                S_OK
+            );
+            assert_eq!(trust, TRUST_LEVEL_BASE);
+
+            let mut iid_cnt = 0u32;
+            let mut iid_arr: *mut crate::com::Guid = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv_i32,
+                    &crate::com::IID_IInspectable,
+                    3,
+                    &[&mut iid_cnt as *mut u32 as u64, &mut iid_arr as *mut *mut crate::com::Guid as u64]
+                ),
+                S_OK
+            );
+            assert_eq!(iid_cnt, 1);
+            assert_eq!(std::ptr::read_unaligned(iid_arr), crate::com::IID_IPropertyValue);
+            CoTaskMemFree(iid_arr as *mut c_void);
+
+            // Create String PropertyValue via slot 18.
+            let hello = rust_to_hstring("WinRT works").unwrap();
+            let mut pv_str: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    18,
+                    &[hello as u64, &mut pv_str as *mut *mut c_void as u64]
+                ),
+                S_OK
+            );
+            let mut got_hstr: usize = 0;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv_str, &crate::com::IID_IPropertyValue, 19, &[&mut got_hstr as *mut usize as u64]),
+                S_OK
+            );
+            assert_eq!(hstring_to_rust(got_hstr), "WinRT works");
+            assert_eq!(WindowsGetStringLen(got_hstr), 11);
+            assert_eq!(WindowsIsStringEmpty(got_hstr), FALSE);
+            WindowsDeleteString(got_hstr);
+            WindowsDeleteString(hello);
+            assert_eq!(com_call_release(pv_str), 0);
+            assert_eq!(com_call_release(pv_i32), 0);
+            assert_eq!(com_call_release(pvs), 0);
+            WindowsDeleteString(pv_class);
+
+            // 3. Real Windows.Foundation.Uri activation & RFC 3986 parsing.
+            let uri_class = rust_to_hstring("Windows.Foundation.Uri").unwrap();
+            let urif_iid = crate::com::IID_IUriRuntimeClassFactory.to_bytes();
+            let mut urif: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(uri_class, urif_iid.as_ptr(), &mut urif), S_OK);
+            let raw_uri = rust_to_hstring("https://example.com:8443/api/v1/doc.json?ok=1#top").unwrap();
+            let mut uri_obj: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    urif,
+                    &crate::com::IID_IUriRuntimeClassFactory,
+                    6, // CreateUri
+                    &[raw_uri as u64, &mut uri_obj as *mut *mut c_void as u64]
+                ),
+                S_OK
+            );
+            let mut scheme_h: usize = 0;
+            let mut host_h: usize = 0;
+            let mut path_h: usize = 0;
+            let mut ext_h: usize = 0;
+            let mut port = 0i32;
+            assert_eq!(crate::com::com_invoke_hresult(uri_obj, &crate::com::IID_IUriRuntimeClass, 17, &[&mut scheme_h as *mut usize as u64]), S_OK);
+            assert_eq!(crate::com::com_invoke_hresult(uri_obj, &crate::com::IID_IUriRuntimeClass, 11, &[&mut host_h as *mut usize as u64]), S_OK);
+            assert_eq!(crate::com::com_invoke_hresult(uri_obj, &crate::com::IID_IUriRuntimeClass, 13, &[&mut path_h as *mut usize as u64]), S_OK);
+            assert_eq!(crate::com::com_invoke_hresult(uri_obj, &crate::com::IID_IUriRuntimeClass, 9, &[&mut ext_h as *mut usize as u64]), S_OK);
+            assert_eq!(crate::com::com_invoke_hresult(uri_obj, &crate::com::IID_IUriRuntimeClass, 19, &[&mut port as *mut i32 as u64]), S_OK);
+            assert_eq!(hstring_to_rust(scheme_h), "https");
+            assert_eq!(hstring_to_rust(host_h), "example.com");
+            assert_eq!(hstring_to_rust(path_h), "/api/v1/doc.json");
+            assert_eq!(hstring_to_rust(ext_h), ".json");
+            assert_eq!(port, 8443);
+            for h in [scheme_h, host_h, path_h, ext_h, raw_uri, uri_class] {
+                WindowsDeleteString(h);
+            }
+            assert_eq!(com_call_release(uri_obj), 0);
+            assert_eq!(com_call_release(urif), 0);
+
+            // 4. Custom registered WinRT activation factory exercised through RoActivateInstance.
+            struct CustomActInner;
+            unsafe extern "win64" fn custom_act_qi(
+                this: *mut crate::com::ComObj<CustomActInner>,
+                riid: *const crate::com::Guid,
+                ppv: *mut *mut c_void,
+            ) -> HRESULT {
+                crate::com::qi_helper(
+                    this,
+                    riid,
+                    ppv,
+                    &[crate::com::IID_IInspectable, crate::com::IID_IActivationFactory],
+                )
+            }
+            unsafe extern "win64" fn custom_act_activate(
+                _this: *mut crate::com::ComObj<CustomActInner>,
+                out: *mut *mut c_void,
+            ) -> HRESULT {
+                std::ptr::write_unaligned(out, new_prop_val(PropValData::UInt32(9001)));
+                S_OK
+            }
+            let custom_vtbl: [usize; 7] = [
+                custom_act_qi as *const () as usize,
+                crate::com::com_add_ref::<CustomActInner> as *const () as usize,
+                crate::com::com_release::<CustomActInner> as *const () as usize,
+                pvf_get_iids as *const () as usize,
+                pvf_get_runtime_class_name as *const () as usize,
+                pvf_get_trust_level as *const () as usize,
+                custom_act_activate as *const () as usize,
+            ];
+            let cf_raw = crate::com::ComObj::new(custom_vtbl.as_ptr(), CustomActInner) as *mut c_void;
+            register_winrt_activation_factory(
+                "Test.Custom.Activatable",
+                crate::com::ComPtr::from_raw(cf_raw).unwrap(),
+            );
+            let cname = rust_to_hstring("Test.Custom.Activatable").unwrap();
+            let mut inst: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoActivateInstance(cname, &mut inst), S_OK);
+            assert!(!inst.is_null());
+            let mut got_u32 = 0u32;
+            assert_eq!(
+                crate::com::com_invoke_hresult(inst, &crate::com::IID_IPropertyValue, 12, &[&mut got_u32 as *mut u32 as u64]),
+                S_OK
+            );
+            assert_eq!(got_u32, 9001);
+            assert_eq!(com_call_release(inst), 0);
+            WindowsDeleteString(cname);
+            unregister_winrt_activation_factory("Test.Custom.Activatable");
+        }
+    }
+
+    #[test]
+    fn winrt_property_value_and_statics_complete_vtable_abi_order_and_final_slots() {
+        unsafe {
+            // Verify full WinMD ABI method order & count (6 IInspectable + 39 own = 45 slots each).
+            let pv_desc = crate::com::lookup_interface(&crate::com::IID_IPropertyValue)
+                .expect("IPropertyValue descriptor must be registered");
+            let pvs_desc = crate::com::lookup_interface(&crate::com::IID_IPropertyValueStatics)
+                .expect("IPropertyValueStatics descriptor must be registered");
+            let expected_pv = [
+                "get_Type",
+                "get_IsNumericScalar",
+                "GetUInt8",
+                "GetInt16",
+                "GetUInt16",
+                "GetInt32",
+                "GetUInt32",
+                "GetInt64",
+                "GetUInt64",
+                "GetSingle",
+                "GetDouble",
+                "GetChar16",
+                "GetBoolean",
+                "GetString",
+                "GetGuid",
+                "GetDateTime",
+                "GetTimeSpan",
+                "GetPoint",
+                "GetSize",
+                "GetRect",
+                "GetUInt8Array",
+                "GetInt16Array",
+                "GetUInt16Array",
+                "GetInt32Array",
+                "GetUInt32Array",
+                "GetInt64Array",
+                "GetUInt64Array",
+                "GetSingleArray",
+                "GetDoubleArray",
+                "GetChar16Array",
+                "GetBooleanArray",
+                "GetStringArray",
+                "GetInspectableArray",
+                "GetGuidArray",
+                "GetDateTimeArray",
+                "GetTimeSpanArray",
+                "GetPointArray",
+                "GetSizeArray",
+                "GetRectArray",
+            ];
+            let expected_pvs = [
+                "CreateEmpty",
+                "CreateUInt8",
+                "CreateInt16",
+                "CreateUInt16",
+                "CreateInt32",
+                "CreateUInt32",
+                "CreateInt64",
+                "CreateUInt64",
+                "CreateSingle",
+                "CreateDouble",
+                "CreateChar16",
+                "CreateBoolean",
+                "CreateString",
+                "CreateInspectable",
+                "CreateGuid",
+                "CreateDateTime",
+                "CreateTimeSpan",
+                "CreatePoint",
+                "CreateSize",
+                "CreateRect",
+                "CreateUInt8Array",
+                "CreateInt16Array",
+                "CreateUInt16Array",
+                "CreateInt32Array",
+                "CreateUInt32Array",
+                "CreateInt64Array",
+                "CreateUInt64Array",
+                "CreateSingleArray",
+                "CreateDoubleArray",
+                "CreateChar16Array",
+                "CreateBooleanArray",
+                "CreateStringArray",
+                "CreateInspectableArray",
+                "CreateGuidArray",
+                "CreateDateTimeArray",
+                "CreateTimeSpanArray",
+                "CreatePointArray",
+                "CreateSizeArray",
+                "CreateRectArray",
+            ];
+            assert_eq!(pv_desc.slots.len(), 39);
+            assert_eq!(pvs_desc.slots.len(), 39);
+            for (i, &name) in expected_pv.iter().enumerate() {
+                assert_eq!(pv_desc.slots[i].slot, 6 + i);
+                assert_eq!(pv_desc.slots[i].name, name);
+            }
+            for (i, &name) in expected_pvs.iter().enumerate() {
+                assert_eq!(pvs_desc.slots[i].slot, 6 + i);
+                assert_eq!(pvs_desc.slots[i].name, name);
+            }
+
+            // Activate Windows.Foundation.PropertyValue as IActivationFactory, then QI to IPropertyValueStatics.
+            let pv_class = rust_to_hstring("Windows.Foundation.PropertyValue").unwrap();
+            let act_iid = crate::com::IID_IActivationFactory.to_bytes();
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(pv_class, act_iid.as_ptr(), &mut factory), S_OK);
+            assert!(!factory.is_null());
+
+            let mut pvs: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    factory,
+                    &crate::com::IID_IUnknown,
+                    0, // QueryInterface
+                    &[
+                        &crate::com::IID_IPropertyValueStatics as *const crate::com::Guid as u64,
+                        &mut pvs as *mut *mut c_void as u64,
+                    ],
+                ),
+                S_OK
+            );
+            assert!(!pvs.is_null());
+
+            // Verify all 45 vtable slots on IPropertyValueStatics are populated and non-null.
+            let pvs_vtbl_ptr = *(pvs as *const *const usize);
+            for slot in 0..45usize {
+                assert_ne!(
+                    *pvs_vtbl_ptr.add(slot),
+                    0,
+                    "IPropertyValueStatics vtable slot {slot} must be populated"
+                );
+            }
+
+            // Create a boxed Int32 via slot 10 and QI it to IPropertyValue.
+            let mut pv_unk: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    10,
+                    &[1234u64, &mut pv_unk as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            let mut pv: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv_unk,
+                    &crate::com::IID_IUnknown,
+                    0,
+                    &[
+                        &crate::com::IID_IPropertyValue as *const crate::com::Guid as u64,
+                        &mut pv as *mut *mut c_void as u64,
+                    ],
+                ),
+                S_OK
+            );
+            assert!(!pv.is_null());
+
+            // Verify all 45 vtable slots on IPropertyValue are populated and non-null.
+            let pv_vtbl_ptr = *(pv as *const *const usize);
+            for slot in 0..45usize {
+                assert_ne!(
+                    *pv_vtbl_ptr.add(slot),
+                    0,
+                    "IPropertyValue vtable slot {slot} must be populated"
+                );
+            }
+
+            // Existing scalar getter (slot 11: GetInt32) remains intact.
+            let mut got_i32 = 0i32;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv,
+                    &crate::com::IID_IPropertyValue,
+                    11,
+                    &[&mut got_i32 as *mut i32 as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(got_i32, 1234);
+
+            // Exercise unsupported struct getters on IPropertyValue (slots 21..=25) via actual vtable.
+            let mut dt = 0x1122_3344_5566_7788i64;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv, &crate::com::IID_IPropertyValue, 21, &[&mut dt as *mut i64 as u64]),
+                E_NOTIMPL
+            );
+            assert_eq!(dt, 0);
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv, &crate::com::IID_IPropertyValue, 21, &[0]),
+                E_POINTER
+            );
+
+            let mut rect = [1.0f32, 2.0, 3.0, 4.0];
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv,
+                    &crate::com::IID_IPropertyValue,
+                    25, // GetRect
+                    &[&mut rect as *mut [f32; 4] as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert_eq!(rect, [0.0; 4]);
+
+            // Exercise array getters across the full range including near-final (43: GetSizeArray) and final (44: GetRectArray).
+            for slot in [26usize, 38, 39, 42, 43, 44] {
+                let mut len = 0xCAFE_BABEu32;
+                let mut ptr = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pv,
+                        &crate::com::IID_IPropertyValue,
+                        slot,
+                        &[&mut len as *mut u32 as u64, &mut ptr as *mut *mut c_void as u64],
+                    ),
+                    E_NOTIMPL,
+                    "IPropertyValue slot {slot} should return E_NOTIMPL"
+                );
+                assert_eq!(len, 0, "IPropertyValue slot {slot} must zero out_len");
+                assert!(ptr.is_null(), "IPropertyValue slot {slot} must null out_ptr");
+
+                // Null out_ptr must still zero out_len and return E_POINTER.
+                len = 99;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pv,
+                        &crate::com::IID_IPropertyValue,
+                        slot,
+                        &[&mut len as *mut u32 as u64, 0],
+                    ),
+                    E_POINTER
+                );
+                assert_eq!(len, 0);
+            }
+
+            // Exercise unsupported IPropertyValueStatics struct creators (21..=25).
+            let mut created = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    21, // CreateDateTime
+                    &[123456789u64, &mut created as *mut *mut c_void as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert!(created.is_null());
+
+            created = 0xDEAD_BEEFusize as *mut c_void;
+            let sample_rect = [0.0f32, 1.0, 100.0, 200.0];
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    25, // CreateRect
+                    &[&sample_rect as *const [f32; 4] as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert!(created.is_null());
+
+            // CreateRect with null rect pointer returns E_POINTER and nulls out-param.
+            created = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    25,
+                    &[0, &mut created as *mut *mut c_void as u64],
+                ),
+                E_POINTER
+            );
+            assert!(created.is_null());
+
+            // Exercise IPropertyValueStatics array creators including near-final (43: CreateSizeArray) and final (44: CreateRectArray).
+            let dummy_buf = [0u64; 4];
+            for slot in [26usize, 38, 39, 42, 43, 44] {
+                created = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[1, dummy_buf.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                    ),
+                    E_NOTIMPL,
+                    "IPropertyValueStatics slot {slot} should return E_NOTIMPL"
+                );
+                assert!(created.is_null(), "IPropertyValueStatics slot {slot} must null out-param");
+
+                // Non-zero length with null data pointer returns E_POINTER and nulls out-param.
+                created = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[2, 0, &mut created as *mut *mut c_void as u64],
+                    ),
+                    E_POINTER
+                );
+                assert!(created.is_null());
+
+                // Null out-param returns E_POINTER.
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[0, 0, 0],
+                    ),
+                    E_POINTER
+                );
+            }
+
+            // Also invoke the final slots directly via raw Win64 vtable function pointers.
+            type GetRectArrayFn = unsafe extern "win64" fn(*mut c_void, *mut u32, *mut *mut c_void) -> HRESULT;
+            type CreateRectArrayFn = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let raw_get_rect_array: GetRectArrayFn = std::mem::transmute(*pv_vtbl_ptr.add(44));
+            let raw_create_rect_array: CreateRectArrayFn = std::mem::transmute(*pvs_vtbl_ptr.add(44));
+            let mut raw_len = 77u32;
+            let mut raw_ptr = 0x1234usize as *mut c_void;
+            assert_eq!(raw_get_rect_array(pv, &mut raw_len, &mut raw_ptr), E_NOTIMPL);
+            assert_eq!(raw_len, 0);
+            assert!(raw_ptr.is_null());
+
+            created = 0x5678usize as *mut c_void;
+            assert_eq!(raw_create_rect_array(pvs, 0, std::ptr::null(), &mut created), E_NOTIMPL);
+            assert!(created.is_null());
+
+            assert_eq!(com_call_release(pv), 1);
+            assert_eq!(com_call_release(pv_unk), 0);
+            assert_eq!(com_call_release(pvs), 1);
+            assert_eq!(com_call_release(factory), 0);
+            WindowsDeleteString(pv_class);
+        }
+    }
+
+    #[test]
+    fn winrt_uri_combine_preserves_base_path_for_query_and_fragment_references() {
+        unsafe {
+            let uri_class = rust_to_hstring("Windows.Foundation.Uri").unwrap();
+            let urif_iid = crate::com::IID_IUriRuntimeClassFactory.to_bytes();
+            let mut urif: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(uri_class, urif_iid.as_ptr(), &mut urif), S_OK);
+
+            // (base, rel, expected_abs, expected_raw, expected_path, expected_query, expected_frag)
+            let cases: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+                // Reviewer doc.json examples: query-only and fragment-only keep doc.json.
+                (
+                    "https://example.com/a/doc.json",
+                    "?k=v",
+                    "https://example.com/a/doc.json?k=v",
+                    "https://example.com/a/doc.json?k=v",
+                    "/a/doc.json",
+                    "?k=v",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "#sec",
+                    "https://example.com/a/doc.json#sec",
+                    "https://example.com/a/doc.json#sec",
+                    "/a/doc.json",
+                    "",
+                    "#sec",
+                ),
+                // Replacing existing fragment preserves base query, userinfo, and port.
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "#new",
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#new",
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#new",
+                    "/a/doc.json",
+                    "?old=1",
+                    "#new",
+                ),
+                // Query + fragment replaces both existing query and fragment.
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?new=2#frag",
+                    "https://example.com/a/doc.json?new=2#frag",
+                    "https://example.com/a/doc.json?new=2#frag",
+                    "/a/doc.json",
+                    "?new=2",
+                    "#frag",
+                ),
+                // Explicitly empty '?' / '#' / '?#' vs empty reference "".
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?",
+                    "https://example.com/a/doc.json?",
+                    "https://example.com/a/doc.json?",
+                    "/a/doc.json",
+                    "?",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "#",
+                    "https://example.com/a/doc.json?old=1#",
+                    "https://example.com/a/doc.json?old=1#",
+                    "/a/doc.json",
+                    "?old=1",
+                    "#",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?#",
+                    "https://example.com/a/doc.json?#",
+                    "https://example.com/a/doc.json?#",
+                    "/a/doc.json",
+                    "?",
+                    "#",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "",
+                    "https://example.com/a/doc.json?old=1",
+                    "https://example.com/a/doc.json?old=1",
+                    "/a/doc.json",
+                    "?old=1",
+                    "",
+                ),
+                // Embedded '://' inside query or fragment must not be treated as an absolute URI.
+                (
+                    "https://example.com/a/doc.json",
+                    "?next=https://other.example/x",
+                    "https://example.com/a/doc.json?next=https://other.example/x",
+                    "https://example.com/a/doc.json?next=https://other.example/x",
+                    "/a/doc.json",
+                    "?next=https://other.example/x",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json?a=1",
+                    "#https://other.example/x",
+                    "https://example.com/a/doc.json?a=1#https://other.example/x",
+                    "https://example.com/a/doc.json?a=1#https://other.example/x",
+                    "/a/doc.json",
+                    "?a=1",
+                    "#https://other.example/x",
+                ),
+                // Scheme-relative (network-path) references inherit only the base scheme.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "//cdn.example.net/assets/app.js",
+                    "https://cdn.example.net/assets/app.js",
+                    "https://cdn.example.net/assets/app.js",
+                    "/assets/app.js",
+                    "",
+                    "",
+                ),
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "//cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "https://cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "https://cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "/p/http://origin/img.png",
+                    "?v=2",
+                    "#hero",
+                ),
+                (
+                    "http://example.com/a/doc.json",
+                    "//cdn.example.net?v=1#top",
+                    "http://cdn.example.net/?v=1#top",
+                    "http://cdn.example.net?v=1#top",
+                    "/",
+                    "?v=1",
+                    "#top",
+                ),
+                // Single-slash root-relative reference keeps base authority/port.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "/root/other.json?k=1#s",
+                    "https://example.com:8443/root/other.json?k=1#s",
+                    "https://example.com:8443/root/other.json?k=1#s",
+                    "/root/other.json",
+                    "?k=1",
+                    "#s",
+                ),
+                // Normal relative-file (including embedded '://' in query) and absolute controls.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "other.json?next=https://other.example/x",
+                    "https://example.com:8443/a/other.json?next=https://other.example/x",
+                    "https://example.com:8443/a/other.json?next=https://other.example/x",
+                    "/a/other.json",
+                    "?next=https://other.example/x",
+                    "",
+                ),
+                // Non-authority schemes (mailto, urn, custom with uppercase/punctuation).
+                (
+                    "https://example.com/a/doc.json",
+                    "mailto:user@example.com?subject=hi",
+                    "mailto:user@example.com?subject=hi",
+                    "mailto:user@example.com?subject=hi",
+                    "user@example.com",
+                    "?subject=hi",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "urn:isbn:0451450523",
+                    "urn:isbn:0451450523",
+                    "urn:isbn:0451450523",
+                    "isbn:0451450523",
+                    "",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "Foo+Bar.v1-test:opaque/part?q=1#f",
+                    "foo+bar.v1-test:opaque/part?q=1#f",
+                    "Foo+Bar.v1-test:opaque/part?q=1#f",
+                    "opaque/part",
+                    "?q=1",
+                    "#f",
+                ),
+                // Relative colons in non-initial segments, dot-segment resolution, and userinfo preservation.
+                (
+                    "https://example.com/a/doc.json",
+                    "dir/item:123?k=a:b#c:d",
+                    "https://example.com/a/dir/item:123?k=a:b#c:d",
+                    "https://example.com/a/dir/item:123?k=a:b#c:d",
+                    "/a/dir/item:123",
+                    "?k=a:b",
+                    "#c:d",
+                ),
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "./item:123",
+                    "https://user:pw@example.com:8443/a/item:123",
+                    "https://user:pw@example.com:8443/a/item:123",
+                    "/a/item:123",
+                    "",
+                    "",
+                ),
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "../b/c.json",
+                    "https://user:pw@example.com:8443/b/c.json",
+                    "https://user:pw@example.com:8443/b/c.json",
+                    "/b/c.json",
+                    "",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "https://other.example/x?q=1#f",
+                    "https://other.example/x?q=1#f",
+                    "https://other.example/x?q=1#f",
+                    "/x",
+                    "?q=1",
+                    "#f",
+                ),
+            ];
+
+            let check_uri = |obj: *mut c_void, label: &str, exp_abs: &str, exp_raw: &str, exp_path: &str, exp_q: &str, exp_f: &str| {
+                let mut abs_h = 0usize;
+                let mut raw_h = 0usize;
+                let mut path_h = 0usize;
+                let mut query_h = 0usize;
+                let mut frag_h = 0usize;
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 6, &[&mut abs_h as *mut usize as u64]), S_OK, "{label} AbsoluteUri");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 16, &[&mut raw_h as *mut usize as u64]), S_OK, "{label} RawUri");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 13, &[&mut path_h as *mut usize as u64]), S_OK, "{label} Path");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 14, &[&mut query_h as *mut usize as u64]), S_OK, "{label} Query");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 10, &[&mut frag_h as *mut usize as u64]), S_OK, "{label} Fragment");
+                assert_eq!(hstring_to_rust(abs_h), exp_abs, "{label} AbsoluteUri");
+                assert_eq!(hstring_to_rust(raw_h), exp_raw, "{label} RawUri");
+                assert_eq!(hstring_to_rust(path_h), exp_path, "{label} Path");
+                assert_eq!(hstring_to_rust(query_h), exp_q, "{label} Query");
+                assert_eq!(hstring_to_rust(frag_h), exp_f, "{label} Fragment");
+                for h in [abs_h, raw_h, path_h, query_h, frag_h] {
+                    WindowsDeleteString(h);
+                }
+            };
+
+            for &(base, rel, exp_abs, exp_raw, exp_path, exp_q, exp_f) in cases {
+                let base_h = rust_to_hstring(base).unwrap();
+                let rel_h = rust_to_hstring(rel).unwrap();
+
+                // Entry point 1: IUriRuntimeClass::CombineUri (slot 22).
+                let mut base_obj: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        6, // CreateUri
+                        &[base_h as u64, &mut base_obj as *mut *mut c_void as u64],
+                    ),
+                    S_OK
+                );
+                let mut combined_obj: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        base_obj,
+                        &crate::com::IID_IUriRuntimeClass,
+                        22, // CombineUri
+                        &[rel_h as u64, &mut combined_obj as *mut *mut c_void as u64],
+                    ),
+                    S_OK,
+                    "CombineUri({base:?}, {rel:?})"
+                );
+                check_uri(combined_obj, &format!("CombineUri({base:?}, {rel:?})"), exp_abs, exp_raw, exp_path, exp_q, exp_f);
+                assert_eq!(com_call_release(combined_obj), 0);
+                assert_eq!(com_call_release(base_obj), 0);
+
+                // Entry point 2: IUriRuntimeClassFactory::CreateWithRelativeUri (slot 7).
+                let mut factory_combined: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        7, // CreateWithRelativeUri
+                        &[base_h as u64, rel_h as u64, &mut factory_combined as *mut *mut c_void as u64],
+                    ),
+                    S_OK,
+                    "CreateWithRelativeUri({base:?}, {rel:?})"
+                );
+                check_uri(factory_combined, &format!("CreateWithRelativeUri({base:?}, {rel:?})"), exp_abs, exp_raw, exp_path, exp_q, exp_f);
+                assert_eq!(com_call_release(factory_combined), 0);
+
+                WindowsDeleteString(rel_h);
+                WindowsDeleteString(base_h);
+            }
+
+            // Malformed scheme candidates (':' in first path segment failing RFC 3986 §3.1)
+            // must fail honestly with E_INVALIDARG on both WinRT entry points.
+            let base_h = rust_to_hstring("https://example.com/a/doc.json").unwrap();
+            let mut base_obj: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    urif,
+                    &crate::com::IID_IUriRuntimeClassFactory,
+                    6, // CreateUri
+                    &[base_h as u64, &mut base_obj as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            for bad_rel in ["1bad:foo", ":missing-scheme", "bad_scheme:foo"] {
+                let rel_h = rust_to_hstring(bad_rel).unwrap();
+
+                let mut out_comb: *mut c_void = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        base_obj,
+                        &crate::com::IID_IUriRuntimeClass,
+                        22, // CombineUri
+                        &[rel_h as u64, &mut out_comb as *mut *mut c_void as u64],
+                    ),
+                    E_INVALIDARG,
+                    "CombineUri should reject malformed scheme {bad_rel:?}"
+                );
+                assert!(out_comb.is_null());
+
+                let mut out_fac: *mut c_void = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        7, // CreateWithRelativeUri
+                        &[base_h as u64, rel_h as u64, &mut out_fac as *mut *mut c_void as u64],
+                    ),
+                    E_INVALIDARG,
+                    "CreateWithRelativeUri should reject malformed scheme {bad_rel:?}"
+                );
+                assert!(out_fac.is_null());
+
+                WindowsDeleteString(rel_h);
+            }
+            assert_eq!(com_call_release(base_obj), 0);
+            WindowsDeleteString(base_h);
+
+            assert_eq!(com_call_release(urif), 0);
+            WindowsDeleteString(uri_class);
         }
     }
 }

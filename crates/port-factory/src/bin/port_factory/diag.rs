@@ -45,7 +45,7 @@ pub fn cmd_runtime_audit(args: &[String]) -> Result<()> {
         });
     }
     if files.is_empty() {
-        bail!("no PE32+ .exe/.dll files found in {:?}", paths);
+        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
     }
     let mut reports = Vec::new();
     for f in &files {

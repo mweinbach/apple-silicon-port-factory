@@ -582,3 +582,166 @@ fn vm_supports_value_type_structs_with_frame_reclamation_and_return_escape() {
         other => panic!("expected ValueType return, got {other:?}"),
     }
 }
+
+#[test]
+fn vm_environment_intrinsics_isolated_from_host_std_env() {
+    crate::process::init_env(&[]);
+
+    // Seed a harmless host-only marker in std::env that must stay invisible to managed guest code.
+    let host_only_key = "HOST_ONLY_CLR_ISOLATION_MARKER";
+    let guest_key = "CLR_GUEST_ENV_MARKER";
+    let prev_host = std::env::var_os(host_only_key);
+    let prev_guest = std::env::var_os(guest_key);
+    std::env::set_var(host_only_key, "host-only-marker-val");
+    std::env::remove_var(guest_key);
+
+    let mut b = TestAsmBuilder::new("VmEnvIsolationTest");
+    let corlib = b.add_assembly_ref("mscorlib");
+    let obj_ref = b.add_type_ref(corlib, "System", "Object");
+    let env_ref = b.add_type_ref(corlib, "System", "Environment");
+    let dict_ref = b.add_type_ref(corlib, "System.Collections.Generic", "Dictionary`2");
+
+    let get_env_mr = b.add_member_ref_on_typeref(
+        env_ref,
+        "GetEnvironmentVariable",
+        &[0x00, 0x01, elem_type::STRING, elem_type::STRING],
+    );
+    let set_env_mr = b.add_member_ref_on_typeref(
+        env_ref,
+        "SetEnvironmentVariable",
+        &[0x00, 0x02, elem_type::VOID, elem_type::STRING, elem_type::STRING],
+    );
+    let get_envs_mr = b.add_member_ref_on_typeref(
+        env_ref,
+        "GetEnvironmentVariables",
+        &[0x00, 0x00, elem_type::OBJECT],
+    );
+    let expand_mr = b.add_member_ref_on_typeref(
+        env_ref,
+        "ExpandEnvironmentVariables",
+        &[0x00, 0x01, elem_type::STRING, elem_type::STRING],
+    );
+    let dict_contains_mr = b.add_member_ref_on_typeref(
+        dict_ref,
+        "ContainsKey",
+        &[0x20, 0x01, elem_type::BOOLEAN, elem_type::STRING],
+    );
+
+    let _td = b.add_type_def("Tests", "EnvIso", Some(obj_ref));
+
+    // SetVar(string k, string v) -> Environment.SetEnvironmentVariable(k, v)
+    let mut set_code = vec![0x02, 0x03, 0x28];
+    set_code.extend_from_slice(&set_env_mr.to_le_bytes());
+    set_code.push(0x2A);
+    let _m_set = b.add_method(
+        0x0016,
+        0,
+        "SetVar",
+        &[0x00, 0x02, elem_type::VOID, elem_type::STRING, elem_type::STRING],
+        Some(TestMethodBody::tiny(set_code)),
+    );
+
+    // GetVar(string k) -> Environment.GetEnvironmentVariable(k)
+    let mut get_code = vec![0x02, 0x28];
+    get_code.extend_from_slice(&get_env_mr.to_le_bytes());
+    get_code.push(0x2A);
+    let _m_get = b.add_method(
+        0x0016,
+        0,
+        "GetVar",
+        &[0x00, 0x01, elem_type::STRING, elem_type::STRING],
+        Some(TestMethodBody::tiny(get_code)),
+    );
+
+    // Expand(string s) -> Environment.ExpandEnvironmentVariables(s)
+    let mut exp_code = vec![0x02, 0x28];
+    exp_code.extend_from_slice(&expand_mr.to_le_bytes());
+    exp_code.push(0x2A);
+    let _m_exp = b.add_method(
+        0x0016,
+        0,
+        "Expand",
+        &[0x00, 0x01, elem_type::STRING, elem_type::STRING],
+        Some(TestMethodBody::tiny(exp_code)),
+    );
+
+    // HasInAll(string k) -> Environment.GetEnvironmentVariables().ContainsKey(k)
+    let mut has_code = vec![0x28];
+    has_code.extend_from_slice(&get_envs_mr.to_le_bytes());
+    has_code.push(0x02); // ldarg.0
+    has_code.push(0x6F); // callvirt ContainsKey
+    has_code.extend_from_slice(&dict_contains_mr.to_le_bytes());
+    has_code.push(0x2A);
+    let _m_has = b.add_method(
+        0x0016,
+        0,
+        "HasInAll",
+        &[0x00, 0x01, elem_type::BOOLEAN, elem_type::STRING],
+        Some(TestMethodBody::tiny(has_code)),
+    );
+
+    let pe = b.build();
+    let (mid_set, mid_get, mid_exp, mid_has, s_host, s_guest, s_guest_lower, s_val, s_empty, s_tpl) = {
+        let mut vm = lock_vm();
+        let aid = vm.load_assembly_bytes(&pe, None).unwrap();
+        let cid = vm.find_class_in_assembly(aid, "Tests", "EnvIso").unwrap();
+        (
+            vm.find_method_in_class(cid, "SetVar", 2).unwrap(),
+            vm.find_method_in_class(cid, "GetVar", 1).unwrap(),
+            vm.find_method_in_class(cid, "Expand", 1).unwrap(),
+            vm.find_method_in_class(cid, "HasInAll", 1).unwrap(),
+            vm.alloc_string(host_only_key),
+            vm.alloc_string(guest_key),
+            vm.alloc_string("clr_guest_env_marker"),
+            vm.alloc_string("virtual-only-value"),
+            vm.alloc_string(""),
+            vm.alloc_string(&format!("%{guest_key}%:%{host_only_key}%")),
+        )
+    };
+
+    // 1. Host-only marker in std::env is invisible to managed GetEnvironmentVariable and GetEnvironmentVariables.
+    let got_host = execute_method(mid_get, vec![CilVal::Obj(s_host)]).unwrap().unwrap();
+    assert_eq!(got_host.as_obj(), 0, "host-only std::env marker must not leak to CLR GetEnvironmentVariable");
+    let has_host = execute_method(mid_has, vec![CilVal::Obj(s_host)]).unwrap().unwrap();
+    assert_eq!(has_host.as_i32(), 0, "host-only std::env marker must not appear in CLR GetEnvironmentVariables");
+
+    // 2. Managed SetEnvironmentVariable writes ONLY to virtual Windows env, never host std::env.
+    let _ = execute_method(mid_set, vec![CilVal::Obj(s_guest), CilVal::Obj(s_val)]).unwrap();
+    assert!(std::env::var_os(guest_key).is_none(), "CLR SetEnvironmentVariable must never mutate host std::env");
+    assert_eq!(crate::process::get_env(guest_key).as_deref(), Some("virtual-only-value"));
+
+    // 3. Managed GetEnvironmentVariable (case-insensitive), GetEnvironmentVariables, and ExpandEnvironmentVariables see it.
+    let got_guest = execute_method(mid_get, vec![CilVal::Obj(s_guest_lower)]).unwrap().unwrap();
+    let expanded = execute_method(mid_exp, vec![CilVal::Obj(s_tpl)]).unwrap().unwrap();
+    let has_guest = execute_method(mid_has, vec![CilVal::Obj(s_guest)]).unwrap().unwrap();
+    assert_eq!(has_guest.as_i32(), 1);
+    {
+        let vm = lock_vm();
+        assert_eq!(vm.heap.read_string(got_guest.as_obj()).as_deref(), Some("virtual-only-value"));
+        assert_eq!(
+            vm.heap.read_string(expanded.as_obj()).as_deref(),
+            Some(format!("virtual-only-value:%{host_only_key}%").as_str())
+        );
+    }
+
+    // 4. Delete via empty string and via null removes from virtual env without touching host std::env.
+    let _ = execute_method(mid_set, vec![CilVal::Obj(s_guest), CilVal::Obj(s_empty)]).unwrap();
+    assert!(crate::process::get_env(guest_key).is_none());
+    let _ = execute_method(mid_set, vec![CilVal::Obj(s_guest), CilVal::Obj(s_val)]).unwrap();
+    assert_eq!(crate::process::get_env(guest_key).as_deref(), Some("virtual-only-value"));
+    let _ = execute_method(mid_set, vec![CilVal::Obj(s_guest), CilVal::Obj(0)]).unwrap();
+    assert!(crate::process::get_env(guest_key).is_none());
+    let got_after_del = execute_method(mid_get, vec![CilVal::Obj(s_guest)]).unwrap().unwrap();
+    assert_eq!(got_after_del.as_obj(), 0);
+    assert!(std::env::var_os(guest_key).is_none());
+
+    // Restore host env markers cleanly.
+    match prev_host {
+        Some(v) => std::env::set_var(host_only_key, v),
+        None => std::env::remove_var(host_only_key),
+    }
+    match prev_guest {
+        Some(v) => std::env::set_var(guest_key, v),
+        None => std::env::remove_var(guest_key),
+    }
+}

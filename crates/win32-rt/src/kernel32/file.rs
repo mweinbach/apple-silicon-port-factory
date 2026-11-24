@@ -8,18 +8,23 @@
 //! TRUE, `OVERLAPPED.Internal*` are filled and `hEvent` is signalled).
 
 use crate::handles::{self, Event, KObject};
+use crate::kernel32::threadpool::TpIo;
 use crate::path;
 use crate::strings::*;
 use crate::teb;
+use crate::thread::ThreadObj;
 use crate::types::*;
 use std::any::Any;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 fn set_err(e: u32) {
     teb::set_last_error(e);
@@ -44,6 +49,11 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const FILE_READ_DATA: u32 = 0x1;
 const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_APPEND_DATA: u32 = 0x4;
+const FILE_WRITE_EA: u32 = 0x10;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+const DELETE_ACCESS: u32 = 0x0001_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
 
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
@@ -58,6 +68,73 @@ const FILE_TYPE_UNKNOWN: u32 = 0;
 const FILE_TYPE_DISK: u32 = 1;
 const FILE_TYPE_CHAR: u32 = 2;
 const FILE_TYPE_PIPE: u32 = 3;
+
+const STATUS_NOTIFY_ENUM_DIR: usize = 0x0000_010C;
+const STATUS_PIPE_BROKEN: usize = 0xC000_014B;
+
+const ERROR_SEM_TIMEOUT: u32 = 121;
+const ERROR_PIPE_BUSY: u32 = 231;
+const ERROR_PIPE_NOT_CONNECTED: u32 = 233;
+const ERROR_PIPE_CONNECTED: u32 = 535;
+const ERROR_PIPE_LISTENING: u32 = 536;
+const ERROR_OPERATION_ABORTED: u32 = 995;
+const ERROR_NOTIFY_ENUM_DIR: u32 = 1022;
+
+#[cfg(target_vendor = "apple")]
+const DARWIN_O_EVTONLY: libc::c_int = 0x8000;
+#[cfg(target_vendor = "apple")]
+const DARWIN_SO_NOSIGPIPE: libc::c_int = 0x1022;
+
+fn ntstatus_to_win32_local(s: usize) -> u32 {
+    match s {
+        STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED => 0,
+        STATUS_PENDING => err::ERROR_IO_PENDING,
+        STATUS_NOTIFY_ENUM_DIR => ERROR_NOTIFY_ENUM_DIR,
+        STATUS_END_OF_FILE => err::ERROR_HANDLE_EOF,
+        STATUS_CANCELLED => ERROR_OPERATION_ABORTED,
+        STATUS_PIPE_BROKEN => err::ERROR_BROKEN_PIPE,
+        other => crate::ntdll::ntstatus_to_win32(other as u32),
+    }
+}
+
+fn set_cloexec(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+fn set_nosigpipe_sock(fd: i32) {
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            DARWIN_SO_NOSIGPIPE,
+            &one as *const _ as *const c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = fd;
+}
+
+/// Extract `HANDLE_FLAG_INHERIT` from a Win64 `SECURITY_ATTRIBUTES` pointer
+/// (`bInheritHandle: BOOL` sits at offset 16 on x64).
+unsafe fn sec_attr_inherit_flags(sec: *mut c_void) -> u32 {
+    if sec.is_null() {
+        return 0;
+    }
+    let inherit = std::ptr::read_unaligned((sec as *const u8).add(16) as *const BOOL);
+    if inherit != 0 {
+        handles::HANDLE_FLAG_INHERIT
+    } else {
+        0
+    }
+}
 
 // ---------------------------------------------------------------------------
 // File objects
@@ -85,8 +162,13 @@ pub struct FileObj {
     pub flags: u32,
     pub append: bool,
     delete_on_close: Mutex<bool>,
-    iocp: Mutex<Option<(Arc<IoCompletionPort>, usize)>>,
-    completion_modes: std::sync::atomic::AtomicU8,
+    completion: Arc<IoCompletionBinding>,
+    /// Unread peek buffer for pipes (`PeekNamedPipe` fills; `ReadFile`/`ReadFileEx` drains first).
+    peek_buf: Mutex<VecDeque<u8>>,
+    /// Lazily started kqueue directory watcher for `ReadDirectoryChangesW`.
+    dir_watcher: Mutex<Option<Arc<DirWatcher>>>,
+    /// Present for server-side named pipe handles created via `CreateNamedPipeW`/`A`.
+    named_pipe_server: Option<Arc<NamedPipeServer>>,
 }
 
 impl FileObj {
@@ -101,41 +183,67 @@ impl FileObj {
             flags,
             append: false,
             delete_on_close: Mutex::new(flags & FILE_FLAG_DELETE_ON_CLOSE != 0),
-            iocp: Mutex::new(None),
-            completion_modes: std::sync::atomic::AtomicU8::new(0),
-        }
-    }
-    fn notify_iocp(&self, ov: *mut OVERLAPPED, bytes: usize) {
-        const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
-        if ov.is_null() {
-            return;
-        }
-        // Per Win32: low bit of OVERLAPPED.hEvent suppresses IOCP notification, and
-        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS skips posting on synchronous completion.
-        let ev = unsafe { (*ov).h_event as usize };
-        if (ev & 1) != 0 {
-            return;
-        }
-        if (self.completion_modes.load(std::sync::atomic::Ordering::Relaxed) & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
-            return;
-        }
-        if let Some((iocp, key)) = self.iocp.lock().unwrap().as_ref().cloned() {
-            iocp.post(IocpPacket { bytes: bytes as u32, key, overlapped: ov as usize });
+            completion: Arc::new(IoCompletionBinding::new()),
+            peek_buf: Mutex::new(VecDeque::new()),
+            dir_watcher: Mutex::new(None),
+            named_pipe_server: None,
         }
     }
     pub fn fd(&self) -> i32 {
+        if let Some(ref srv) = self.named_pipe_server {
+            return srv.connected_fd().unwrap_or(-1);
+        }
         self.file.as_raw_fd()
     }
     pub fn file(&self) -> &File {
         &self.file
     }
+    /// True if this file handle refers to a protected native host runner/bundle file or
+    /// ancestor directory (verified by both stored host path and live POSIX fd inode/`F_GETPATH`).
+    fn is_protected_native(&self) -> bool {
+        if self.kind != FileKind::Disk && self.kind != FileKind::Dir {
+            return false;
+        }
+        self.host_path
+            .as_deref()
+            .is_some_and(path::is_protected_host_remove_or_rename)
+            || path::is_protected_fd(self.fd())
+    }
+    /// Return the active raw POSIX fd and optional shared named-pipe connection owner
+    /// for pipe I/O, or a Win32 pipe state error if this is an unconnected named-pipe server.
+    fn io_pipe_target(&self) -> Result<PipeIoTarget, u32> {
+        if let Some(ref srv) = self.named_pipe_server {
+            srv.io_conn().map(PipeIoTarget::ServerConn)
+        } else {
+            Ok(PipeIoTarget::Direct(self.file.as_raw_fd()))
+        }
+    }
+    fn cancel_pending_io(&self, h: HANDLE, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
+        let mut count = 0usize;
+        if let Some(w) = self.dir_watcher.lock().unwrap().clone() {
+            count += w.cancel_requests(h as usize, ov, filter_tid);
+        }
+        count += pipe_reactor().cancel_ops(h as usize, ov, filter_tid);
+        if let Some(ref srv) = self.named_pipe_server {
+            count += srv.cancel_pending_connect(h as usize, ov, filter_tid);
+        }
+        count
+    }
 }
 
 impl Drop for FileObj {
     fn drop(&mut self) {
+        if let Some(w) = self.dir_watcher.lock().unwrap().take() {
+            w.shutdown();
+        }
+        if let Some(ref srv) = self.named_pipe_server {
+            srv.close_server();
+        }
         if *self.delete_on_close.lock().unwrap() {
             if let Some(p) = &self.host_path {
-                let _ = if self.kind == FileKind::Dir { std::fs::remove_dir(p) } else { std::fs::remove_file(p) };
+                if !path::is_protected_host_remove_or_rename(p) {
+                    let _ = if self.kind == FileKind::Dir { std::fs::remove_dir(p) } else { std::fs::remove_file(p) };
+                }
             }
         }
         if self.owned {
@@ -153,29 +261,67 @@ impl KObject for FileObj {
         self
     }
     fn waitable(&self) -> Option<&dyn handles::Waitable> {
-        Some(self)
+        Some(&*self.completion.io_event)
     }
 }
 
-/// A file handle is signalled whenever no I/O is pending (always, for us).
-impl handles::Waitable for FileObj {
-    fn is_signaled(&self, _g: &handles::WaitGuard, _tid: u32) -> bool {
-        true
+/// Called by `CloseHandle` before the generic table removes the handle.
+/// Cancels pending async I/O (directory watches, async pipe ops, pending
+/// named-pipe accepts) while `h` is still live in the handle table so
+/// `ERROR_OPERATION_ABORTED` completions still reach bound IOCP / `TpIo` sinks.
+pub fn close_handle_hook(h: HANDLE) -> bool {
+    if handles::is_protected_from_close(h) {
+        return false;
     }
-    fn acquire(&self, _g: &handles::WaitGuard, _tid: u32) -> bool {
-        false
+    if let Some(f) = get_file(h) {
+        let _ = f.cancel_pending_io(h, None, None);
     }
-}
-
-/// Called by `CloseHandle` before the generic table; nothing special needed
-/// since file handles live in the table and close their fd on drop.
-pub fn close_handle_hook(_h: HANDLE) -> bool {
     false
 }
 
 pub fn get_file(h: HANDLE) -> Option<Arc<FileObj>> {
     let h = resolve_std_pseudo(h);
     handles::get_as::<FileObj>(h)
+}
+
+/// Return `(raw_fd, FileKind)` for a `FileObj` handle (used by process launch & CRT `_open_osfhandle`).
+pub(crate) fn file_fd_and_kind(h: HANDLE) -> Option<(i32, FileKind)> {
+    get_file(h).map(|f| (f.fd(), f.kind))
+}
+
+/// Wrap an owned POSIX fd in an owning `FileObj` handle (used by CRT `_get_osfhandle`).
+pub(crate) fn wrap_owned_fd(
+    fd: std::os::fd::OwnedFd,
+    kind: FileKind,
+    win_path: String,
+    access: u32,
+) -> HANDLE {
+    let o = FileObj::new(File::from(fd), kind, win_path, None, access, 0);
+    handles::insert(Arc::new(o))
+}
+
+/// Wrap an existing POSIX fd in a non-owning `FileObj` handle (used by tests and non-owning wrappers).
+#[allow(dead_code)]
+pub(crate) fn wrap_non_owned_fd(fd: i32, kind: FileKind, win_path: String, access: u32) -> HANDLE {
+    let mut o = FileObj::new(
+        unsafe { File::from_raw_fd(fd) },
+        kind,
+        win_path,
+        None,
+        access,
+        0,
+    );
+    o.owned = false;
+    handles::insert(Arc::new(o))
+}
+
+/// Classify a POSIX fd into a `FileKind`.
+pub(crate) fn classify_host_fd(fd: i32) -> FileKind {
+    if unsafe { libc::isatty(fd) } == 1 {
+        FileKind::Console
+    } else {
+        host_fd_kind(fd)
+    }
 }
 
 /// Windows lets `GetStdHandle` values be passed directly; on our side they
@@ -226,7 +372,9 @@ fn host_fd_kind(fd: i32) -> FileKind {
     }
     match st.st_mode & libc::S_IFMT {
         libc::S_IFIFO | libc::S_IFSOCK => FileKind::Pipe,
-        libc::S_IFCHR => FileKind::Console,
+        // `host_fd_kind` is only called for non-TTY fds; non-TTY character
+        // devices like `/dev/null` are `FILE_TYPE_CHAR`, not Windows consoles.
+        libc::S_IFCHR => FileKind::Null,
         libc::S_IFDIR => FileKind::Dir,
         _ => FileKind::Disk,
     }
@@ -287,6 +435,29 @@ pub unsafe extern "win64" fn SetConsoleMode(h: HANDLE, _mode: u32) -> BOOL {
     TRUE
 }
 
+pub unsafe extern "win64" fn GetNumberOfConsoleInputEvents(h: HANDLE, count: *mut u32) -> BOOL {
+    if count.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if f.kind != FileKind::Console || (f.access & GENERIC_READ) == 0 {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    let mut avail: libc::c_int = 0;
+    let n = if libc::ioctl(f.fd(), libc::FIONREAD, &mut avail) == 0 && avail > 0 {
+        avail as u32
+    } else {
+        0
+    };
+    std::ptr::write_unaligned(count, n);
+    TRUE
+}
+
 pub unsafe extern "win64" fn GetConsoleCP() -> u32 {
     ACP
 }
@@ -342,8 +513,59 @@ pub unsafe extern "win64" fn SetConsoleScreenBufferSize(_h: HANDLE, _c: u32) -> 
 pub unsafe extern "win64" fn SetConsoleWindowInfo(_h: HANDLE, _abs: BOOL, _r: *const u16) -> BOOL {
     TRUE
 }
-pub unsafe extern "win64" fn SetConsoleCtrlHandler(_h: *const c_void, _add: BOOL) -> BOOL {
-    stub!("console control handlers are never invoked");
+struct ConsoleCtrlState {
+    handlers: Vec<usize>,
+    ignore_ctrl_c: bool,
+}
+
+fn console_ctrl_state() -> &'static Mutex<ConsoleCtrlState> {
+    static S: OnceLock<Mutex<ConsoleCtrlState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(ConsoleCtrlState { handlers: Vec::new(), ignore_ctrl_c: false }))
+}
+
+pub unsafe extern "win64" fn SetConsoleCtrlHandler(handler: *const c_void, add: BOOL) -> BOOL {
+    let mut st = console_ctrl_state().lock().unwrap();
+    if handler.is_null() {
+        st.ignore_ctrl_c = add != 0;
+        return TRUE;
+    }
+    let addr = handler as usize;
+    if add != 0 {
+        st.handlers.push(addr);
+        TRUE
+    } else if let Some(pos) = st.handlers.iter().rposition(|&h| h == addr) {
+        st.handlers.remove(pos);
+        TRUE
+    } else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        FALSE
+    }
+}
+
+pub unsafe extern "win64" fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> BOOL {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    if ctrl_event != CTRL_C_EVENT && ctrl_event != CTRL_BREAK_EVENT {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if process_group_id != 0 && process_group_id != std::process::id() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let snapshot: Vec<usize> = {
+        let st = console_ctrl_state().lock().unwrap();
+        if ctrl_event == CTRL_C_EVENT && st.ignore_ctrl_c {
+            return TRUE;
+        }
+        st.handlers.iter().rev().copied().collect()
+    };
+    for func in snapshot {
+        let handled = crate::call_guest8(func, ctrl_event as u64, 0, 0, 0, 0, 0, 0, 0) as BOOL;
+        if handled != 0 {
+            break;
+        }
+    }
     TRUE
 }
 
@@ -421,13 +643,21 @@ fn null_file() -> File {
 }
 
 pub fn create_file(name: &str, access: u32, disposition: u32, flags: u32) -> Result<HANDLE, u32> {
+    create_file_inner(name, access, disposition, flags, 0)
+}
+
+fn create_file_inner(name: &str, access: u32, disposition: u32, flags: u32, handle_flags: u32) -> Result<HANDLE, u32> {
     let wants_read = access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA) != 0;
     let wants_write = access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+
+    if let Some(norm) = normalize_pipe_name(name) {
+        return connect_named_pipe_client(&norm, name, access, flags, handle_flags);
+    }
 
     if is_raw_device(name) {
         log::debug!("CreateFile: device handle for {name}");
         let o = FileObj::new(null_file(), FileKind::Device, name.into(), None, access, flags);
-        return Ok(handles::insert(Arc::new(o)));
+        return Ok(handles::insert_with_flags(Arc::new(o), handle_flags));
     }
     if let Some(dev) = path::device_name(name) {
         let (file, kind) = match dev {
@@ -436,13 +666,25 @@ pub fn create_file(name: &str, access: u32, disposition: u32, flags: u32) -> Res
             _ => (unsafe { File::from_raw_fd(libc::dup(if wants_read && !wants_write { 0 } else { 1 })) }, FileKind::Console),
         };
         let o = FileObj::new(file, kind, dev.into(), None, access, flags);
-        return Ok(handles::insert(Arc::new(o)));
+        return Ok(handles::insert_with_flags(Arc::new(o), handle_flags));
     }
 
     let win = path::absolute(name);
     let host = host_path(&win)?;
     let exists = std::fs::symlink_metadata(&host).is_ok();
     let is_dir = host.is_dir();
+
+    let mutating_access = wants_write
+        || (access & (DELETE_ACCESS | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
+    let mutating_disp = matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING)
+        || (disposition == OPEN_ALWAYS && !exists);
+    let delete_on_close = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+    if (mutating_access || mutating_disp || delete_on_close) && path::is_protected_host_write(&host) {
+        return Err(err::ERROR_ACCESS_DENIED);
+    }
+    if (delete_on_close || (access & DELETE_ACCESS) != 0) && path::is_protected_host_remove_or_rename(&host) {
+        return Err(err::ERROR_ACCESS_DENIED);
+    }
 
     if is_dir {
         if flags & FILE_FLAG_BACKUP_SEMANTICS == 0 {
@@ -453,7 +695,7 @@ pub fn create_file(name: &str, access: u32, disposition: u32, flags: u32) -> Res
         }
         let f = File::open(&host).map_err(|e| io_err(&e))?;
         let o = FileObj::new(f, FileKind::Dir, win, Some(host), access, flags);
-        return Ok(handles::insert(Arc::new(o)));
+        return Ok(handles::insert_with_flags(Arc::new(o), handle_flags));
     }
 
     let mut oo = File::options();
@@ -500,7 +742,7 @@ pub fn create_file(name: &str, access: u32, disposition: u32, flags: u32) -> Res
     })?;
     let mut o = FileObj::new(f, FileKind::Disk, win, Some(host), access, flags);
     o.append = access & FILE_APPEND_DATA != 0 && access & (FILE_WRITE_DATA | GENERIC_WRITE) == 0;
-    let h = handles::insert(Arc::new(o));
+    let h = handles::insert_with_flags(Arc::new(o), handle_flags);
     // Windows reports ERROR_ALREADY_EXISTS on success for these dispositions.
     set_err(if exists && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS) {
         err::ERROR_ALREADY_EXISTS
@@ -514,7 +756,7 @@ pub unsafe extern "win64" fn CreateFileW(
     name: LPCWSTR,
     access: u32,
     _share: u32,
-    _sec: *mut c_void,
+    sec: *mut c_void,
     disposition: u32,
     flags: u32,
     _template: HANDLE,
@@ -523,7 +765,8 @@ pub unsafe extern "win64" fn CreateFileW(
     if let Some(h) = crate::misc::hid::create_file(&n, access, flags) {
         return h;
     }
-    match create_file(&n, access, disposition, flags) {
+    let hflags = sec_attr_inherit_flags(sec);
+    match create_file_inner(&n, access, disposition, flags, hflags) {
         Ok(h) => {
             log::debug!("CreateFileW({n:?}, {access:#x}, disp={disposition}) -> {h:p}");
             h
@@ -586,19 +829,221 @@ pub struct OVERLAPPED {
     pub h_event: HANDLE,
 }
 
-const STATUS_SUCCESS: usize = 0;
-const STATUS_END_OF_FILE: usize = 0xC000_0011;
+pub(crate) const STATUS_SUCCESS: usize = 0;
+/// Informational NTSTATUS (`ntstatus.h`) used by Winsock/AFD for successful OOB (`MSG_OOB`) receives.
+pub(crate) const STATUS_RECEIVE_EXPEDITED: usize = 0x4000_0010;
+pub(crate) const STATUS_PENDING: usize = 0x103;
+pub(crate) const STATUS_END_OF_FILE: usize = 0xC000_0011;
+pub(crate) const STATUS_CANCELLED: usize = 0xC000_0120;
+
+#[inline]
+pub(crate) fn is_io_success_status(s: usize) -> bool {
+    s == STATUS_SUCCESS || s == STATUS_RECEIVE_EXPEDITED
+}
+
+/// Convert a Win32 / Winsock error code into an NTSTATUS suitable for `OVERLAPPED.Internal`.
+pub(crate) fn win32_to_ntstatus(win32_err: u32) -> usize {
+    match win32_err {
+        0 => STATUS_SUCCESS,
+        995 => STATUS_CANCELLED, // ERROR_OPERATION_ABORTED
+        997 => STATUS_PENDING,   // ERROR_IO_PENDING
+        38 => STATUS_END_OF_FILE,
+        109 => 0xC000_014B,      // ERROR_BROKEN_PIPE -> STATUS_PIPE_BROKEN
+        2 => 0xC000_0034,        // ERROR_FILE_NOT_FOUND -> STATUS_OBJECT_NAME_NOT_FOUND
+        5 => 0xC000_0022,        // ERROR_ACCESS_DENIED -> STATUS_ACCESS_DENIED
+        6 => 0xC000_0008,        // ERROR_INVALID_HANDLE -> STATUS_INVALID_HANDLE
+        87 => 0xC000_000D,       // ERROR_INVALID_PARAMETER -> STATUS_INVALID_PARAMETER
+        10054 => 0xC000_020D,    // WSAECONNRESET -> STATUS_CONNECTION_RESET
+        10053 => 0xC000_0241,    // WSAECONNABORTED -> STATUS_CONNECTION_ABORTED
+        10061 => 0xC000_0236,    // WSAECONNREFUSED -> STATUS_CONNECTION_REFUSED
+        10060 => 0xC000_00B5,    // WSAETIMEDOUT -> STATUS_IO_TIMEOUT
+        10057 => 0xC000_0128,    // WSAENOTCONN -> STATUS_FILE_CLOSED / not connected
+        10058 => 0xC000_013C,    // WSAESHUTDOWN -> STATUS_REMOTE_DISCONNECT
+        10035 => 0xC000_00B5,    // WSAEWOULDBLOCK
+        10040 => 0x8000_0005,    // WSAEMSGSIZE -> STATUS_BUFFER_OVERFLOW
+        _ => 0xC000_0001,        // STATUS_UNSUCCESSFUL
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn store_ov_internal(ov: *mut OVERLAPPED, val: usize) {
+    let p = std::ptr::addr_of_mut!((*ov).internal);
+    if p.is_aligned() {
+        std::sync::atomic::AtomicUsize::from_ptr(p).store(val, Ordering::Release);
+    } else {
+        std::sync::atomic::fence(Ordering::Release);
+        std::ptr::write_unaligned(p, val);
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn load_ov_internal(ov: *mut OVERLAPPED) -> usize {
+    let p = std::ptr::addr_of_mut!((*ov).internal);
+    if p.is_aligned() {
+        std::sync::atomic::AtomicUsize::from_ptr(p).load(Ordering::Acquire)
+    } else {
+        let v = std::ptr::read_unaligned(p);
+        std::sync::atomic::fence(Ordering::Acquire);
+        v
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn store_ov_internal_high(ov: *mut OVERLAPPED, val: usize) {
+    let p = std::ptr::addr_of_mut!((*ov).internal_high);
+    if p.is_aligned() {
+        std::ptr::write_volatile(p, val);
+    } else {
+        std::ptr::write_unaligned(p, val);
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn load_ov_internal_high(ov: *mut OVERLAPPED) -> usize {
+    let p = std::ptr::addr_of!((*ov).internal_high);
+    if p.is_aligned() {
+        std::ptr::read_volatile(p)
+    } else {
+        std::ptr::read_unaligned(p)
+    }
+}
+
+#[inline]
+unsafe fn read_ov_offset(ov: *const OVERLAPPED) -> u64 {
+    let lo = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).offset)) as u64;
+    let hi = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).offset_high)) as u64;
+    lo | (hi << 32)
+}
+
+/// Mark `ov` pending before starting async I/O and reset `ov.h_event` if present.
+pub(crate) unsafe fn prepare_overlapped_pending(ov: *mut OVERLAPPED) {
+    if ov.is_null() {
+        return;
+    }
+    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
+    store_ov_internal_high(ov, 0);
+    store_ov_internal(ov, STATUS_PENDING);
+    if !ev.is_null() {
+        let ev_h = (ev as usize & !1) as HANDLE;
+        if let Some(e) = handles::get_as::<Event>(ev_h) {
+            e.reset();
+        }
+    }
+}
 
 unsafe fn complete_overlapped(ov: *mut OVERLAPPED, status: usize, n: usize) {
-    (*ov).internal = status;
-    (*ov).internal_high = n;
-    let ev = (*ov).h_event;
-    if !ev.is_null() {
-        // Low bit set = "don't signal a completion port"; still a valid event.
-        let ev = (ev as usize & !1) as HANDLE;
-        if let Some(e) = handles::get_as::<Event>(ev) {
-            e.set();
+    // Snapshot guest fields and resolve the explicit event handle BEFORE publishing
+    // terminal `ov.internal` so a polling caller can immediately close the event handle
+    // or free/reuse `ov` without racing with any lookup or guest-memory dereference.
+    let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
+    let ev_h = (raw_ev & !1) as HANDLE;
+    let explicit_event = if !ev_h.is_null() {
+        handles::get_as::<Event>(ev_h)
+    } else {
+        None
+    };
+    store_ov_internal_high(ov, n);
+    store_ov_internal(ov, status);
+    if let Some(e) = explicit_event {
+        e.set();
+    }
+}
+
+/// Drain up to `dst.len()` bytes from `f.peek_buf`.
+fn drain_peek_buf(f: &FileObj, dst: &mut [u8]) -> usize {
+    let mut pb = f.peek_buf.lock().unwrap();
+    let k = pb.len().min(dst.len());
+    for slot in dst.iter_mut().take(k) {
+        *slot = pb.pop_front().unwrap();
+    }
+    k
+}
+
+/// Try a genuinely nonblocking read on a pipe/socket fd.
+/// - For `AF_UNIX` `SOCK_STREAM` pipes (`CreatePipe`, `CreateNamedPipeW`/`A`), uses per-call
+///   `recv(..., MSG_DONTWAIT)` without ever modifying open-file-description status flags
+///   (`O_NONBLOCK`), so `DuplicateHandle` and inherited/redirected child stdio stay blocking.
+/// - For external POSIX `S_IFIFO` descriptors (`ENOTSOCK`), ensures `O_NONBLOCK` is enabled
+///   (without toggling it back off) so `read()` can never block the caller or shared pipe reactor.
+/// Returns `Ok(Some(n))` (`n == 0` means EOF/broken pipe), `Ok(None)` if would block,
+/// or `Err(errno)`.
+unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<Option<usize>, i32> {
+    if n == 0 {
+        return Ok(Some(0));
+    }
+    // Try MSG_DONTWAIT first for socketpair-backed anonymous and named pipes.
+    loop {
+        let r = libc::recv(fd, buf as *mut c_void, n, libc::MSG_DONTWAIT);
+        if r >= 0 {
+            return Ok(Some(r as usize));
         }
+        let e = last_errno();
+        if e == libc::EINTR {
+            continue;
+        }
+        if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+            return Ok(None);
+        }
+        if e == libc::ENOTSOCK {
+            break;
+        }
+        return Err(e);
+    }
+    // External POSIX FIFO fallback: ensure O_NONBLOCK is set once (never toggled off) so
+    // competing readers cannot cause a blocking read() between readiness check and read.
+    let fl = libc::fcntl(fd, libc::F_GETFL);
+    if fl < 0 {
+        return Err(last_errno());
+    }
+    if (fl & libc::O_NONBLOCK) == 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) != 0 {
+        return Err(last_errno());
+    }
+    loop {
+        let r = libc::read(fd, buf as *mut c_void, n);
+        if r >= 0 {
+            return Ok(Some(r as usize));
+        }
+        let e = last_errno();
+        if e == libc::EINTR {
+            continue;
+        }
+        if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+            return Ok(None);
+        }
+        return Err(e);
+    }
+}
+
+/// Try a genuinely nonblocking write on a pipe/socket fd.
+/// On Darwin XNU, `AF_UNIX` `SOCK_STREAM` ignores `MSG_DONTWAIT` on `send()` when `O_NONBLOCK`
+/// is clear and blocks in `sosend`; enabling `O_NONBLOCK` once (never toggling it back off) on
+/// the write fd guarantees nonblocking `write()` for both socketpair-backed pipes and raw
+/// `S_IFIFO` descriptors, while synchronous `WriteFile`/`ReadFile` handle `EAGAIN` via `poll`.
+/// Returns `Ok(Some(n))`, `Ok(None)` if would block, or `Err(errno)`.
+unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Result<Option<usize>, i32> {
+    if n == 0 {
+        return Ok(Some(0));
+    }
+    let fl = libc::fcntl(fd, libc::F_GETFL);
+    if fl < 0 {
+        return Err(last_errno());
+    }
+    if (fl & libc::O_NONBLOCK) == 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) != 0 {
+        return Err(last_errno());
+    }
+    loop {
+        let r = libc::write(fd, buf as *const c_void, n);
+        if r >= 0 {
+            return Ok(Some(r as usize));
+        }
+        let e = last_errno();
+        if e == libc::EINTR {
+            continue;
+        }
+        if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+            return Ok(None);
+        }
+        return Err(e);
     }
 }
 
@@ -607,16 +1052,116 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
         return r;
     }
     if !read.is_null() {
-        *read = 0;
+        std::ptr::write_unaligned(read, 0);
     }
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let slice = std::slice::from_raw_parts_mut(buf as *mut u8, n as usize);
+    if n > 0 && buf.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if f.kind == FileKind::Pipe {
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        let fd = target.fd();
+        let slice = if n == 0 {
+            &mut [][..]
+        } else {
+            std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+        };
+        let from_peek = drain_peek_buf(&f, slice);
+        if from_peek > 0 || n == 0 {
+            if !read.is_null() {
+                std::ptr::write_unaligned(read, from_peek as u32);
+            }
+            if !ov.is_null() {
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, from_peek, true);
+            }
+            return TRUE;
+        }
+        if !ov.is_null() {
+            match try_nonblocking_pipe_read(fd, buf as *mut u8, n as usize) {
+                Ok(Some(0)) => {
+                    set_err(err::ERROR_BROKEN_PIPE);
+                    return FALSE;
+                }
+                Ok(Some(got)) => {
+                    if !read.is_null() {
+                        std::ptr::write_unaligned(read, got as u32);
+                    }
+                    complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, got, true);
+                    return TRUE;
+                }
+                Ok(None) => {
+                    f.completion.io_event.reset();
+                    prepare_overlapped_pending(ov);
+                    pipe_reactor().submit(PendingPipeOp::new_read(
+                        h,
+                        Arc::clone(&f),
+                        target.conn(),
+                        fd,
+                        buf as usize,
+                        n as usize,
+                        PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
+                    ));
+                    set_err(err::ERROR_IO_PENDING);
+                    return FALSE;
+                }
+                Err(e) => {
+                    set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+                    return FALSE;
+                }
+            }
+        }
+        // Synchronous blocking pipe read (also waits via poll if fd has O_NONBLOCK).
+        let r = loop {
+            let k = libc::read(fd, buf, n as usize);
+            if k < 0 {
+                let e = last_errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                    let pr = libc::poll(&mut pfd, 1, -1);
+                    if pr < 0 && last_errno() != libc::EINTR {
+                        break -1;
+                    }
+                    continue;
+                }
+            }
+            break k;
+        };
+        if r < 0 {
+            let e = last_errno();
+            set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+            return FALSE;
+        }
+        if r == 0 {
+            set_err(err::ERROR_BROKEN_PIPE);
+            return FALSE;
+        }
+        if !read.is_null() {
+            std::ptr::write_unaligned(read, r as u32);
+        }
+        return TRUE;
+    }
+
+    let slice = if n == 0 {
+        &mut [][..]
+    } else {
+        std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+    };
     let io_scope = (f.kind == FileKind::Disk).then(|| crate::hitch::Scope::enter(crate::hitch::ActKind::FileIo, n as u64));
     let res = if !ov.is_null() && f.kind == FileKind::Disk {
-        let off = (*ov).offset as u64 | (((*ov).offset_high as u64) << 32);
+        let off = read_ov_offset(ov);
         read_full_at(f.file(), slice, off)
     } else {
         use std::io::Read;
@@ -637,7 +1182,7 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
     match res {
         Ok(got) => {
             if !read.is_null() {
-                *read = got as u32;
+                std::ptr::write_unaligned(read, got as u32);
             }
             if !ov.is_null() {
                 if got == 0 && n > 0 && f.kind == FileKind::Disk {
@@ -645,18 +1190,13 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                     set_err(err::ERROR_HANDLE_EOF);
                     return FALSE;
                 }
-                complete_overlapped(ov, STATUS_SUCCESS, got);
-                f.notify_iocp(ov, got);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, got, true);
             }
             TRUE
         }
         Err(e) => {
-            if f.kind == FileKind::Pipe && e.raw_os_error() == Some(libc::EPIPE) {
-                set_err(err::ERROR_BROKEN_PIPE);
-            } else {
-                log::warn!("ReadFile({:?}, n={n}) failed: {e}", f.win_path);
-                set_err(io_err(&e));
-            }
+            log::warn!("ReadFile({:?}, n={n}) failed: {e}", f.win_path);
+            set_err(io_err(&e));
             FALSE
         }
     }
@@ -683,16 +1223,119 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
         return r;
     }
     if !written.is_null() {
-        *written = 0;
+        std::ptr::write_unaligned(written, 0);
     }
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let slice = std::slice::from_raw_parts(buf as *const u8, n as usize);
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    if n > 0 && buf.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if f.kind == FileKind::Pipe {
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        let fd = target.fd();
+        if n == 0 {
+            if !ov.is_null() {
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, 0, true);
+            }
+            return TRUE;
+        }
+        if !ov.is_null() {
+            match pipe_reactor().admit_async_write(
+                h,
+                &f,
+                target.conn(),
+                fd,
+                buf as *const u8,
+                n as usize,
+                ov,
+                PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
+            ) {
+                AsyncPipeWriteOutcome::Completed(done) => {
+                    if !written.is_null() {
+                        std::ptr::write_unaligned(written, done as u32);
+                    }
+                    complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, done, true);
+                    return TRUE;
+                }
+                AsyncPipeWriteOutcome::Pending => {
+                    set_err(err::ERROR_IO_PENDING);
+                    return FALSE;
+                }
+                AsyncPipeWriteOutcome::Error(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            }
+        }
+        // Synchronous blocking pipe write: wait for any earlier pending writes on the same
+        // pipe/connection without holding reactor locks across blocking I/O, then write the
+        // full buffer (waiting via poll if fd has O_NONBLOCK).
+        let conn = target.conn();
+        let _sync_guard = match pipe_reactor().acquire_sync_write_turn(h, &f, conn.clone(), fd) {
+            Ok(g) => g,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        let mut done = 0usize;
+        while done < n as usize {
+            if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                set_err(err::ERROR_BROKEN_PIPE);
+                return FALSE;
+            }
+            let r = libc::write(fd, (buf as *const u8).add(done) as *const c_void, n as usize - done);
+            if r < 0 {
+                let e = last_errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                    let pr = libc::poll(&mut pfd, 1, -1);
+                    if pr < 0 && last_errno() != libc::EINTR {
+                        let pe = last_errno();
+                        set_err(if pe == libc::EPIPE || pe == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(pe) });
+                        return FALSE;
+                    }
+                    continue;
+                }
+                set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+                return FALSE;
+            }
+            if r == 0 {
+                set_err(err::ERROR_BROKEN_PIPE);
+                return FALSE;
+            }
+            done += r as usize;
+        }
+        if !written.is_null() {
+            std::ptr::write_unaligned(written, done as u32);
+        }
+        return TRUE;
+    }
+
+    let slice = if n == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(buf as *const u8, n as usize)
+    };
     let io_scope = (f.kind == FileKind::Disk).then(|| crate::hitch::Scope::enter(crate::hitch::ActKind::FileIo, n as u64));
     let res = if !ov.is_null() && f.kind == FileKind::Disk {
-        let off = (*ov).offset as u64 | (((*ov).offset_high as u64) << 32);
+        let off = read_ov_offset(ov);
         if off == u64::MAX {
             // 0xFFFFFFFF/0xFFFFFFFF = append
             use std::io::{Seek, Write};
@@ -718,11 +1361,10 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
     match res {
         Ok(k) => {
             if !written.is_null() {
-                *written = k as u32;
+                std::ptr::write_unaligned(written, k as u32);
             }
             if !ov.is_null() {
-                complete_overlapped(ov, STATUS_SUCCESS, k);
-                f.notify_iocp(ov, k);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, k, true);
             }
             TRUE
         }
@@ -734,31 +1376,283 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
     }
 }
 
-const STATUS_PENDING: usize = 0x103;
+pub unsafe extern "win64" fn ReadFileEx(
+    h: HANDLE,
+    buf: *mut c_void,
+    n: u32,
+    ov: *mut OVERLAPPED,
+    completion_routine: Option<crate::thread::IoCompletionRoutine>,
+) -> BOOL {
+    if ov.is_null() || (n > 0 && buf.is_null()) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let caller = crate::thread::ensure_current_thread_object();
+    let caller_tid = teb::thread_id();
+
+    if f.kind == FileKind::Pipe {
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        let fd = target.fd();
+        let slice = if n == 0 {
+            &mut [][..]
+        } else {
+            std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+        };
+        let from_peek = drain_peek_buf(&f, slice);
+        if from_peek > 0 || n == 0 {
+            store_ov_internal_high(ov, from_peek);
+            store_ov_internal(ov, STATUS_SUCCESS);
+            if let Some(cb) = completion_routine {
+                crate::thread::queue_io_completion_apc(&caller, cb, 0, from_peek as u32, ov as usize);
+            }
+            set_err(0);
+            return TRUE;
+        }
+        match try_nonblocking_pipe_read(fd, buf as *mut u8, n as usize) {
+            Ok(Some(0)) => {
+                store_ov_internal_high(ov, 0);
+                store_ov_internal(ov, STATUS_PIPE_BROKEN);
+                set_err(err::ERROR_BROKEN_PIPE);
+                return FALSE;
+            }
+            Ok(Some(got)) => {
+                store_ov_internal_high(ov, got);
+                store_ov_internal(ov, STATUS_SUCCESS);
+                if let Some(cb) = completion_routine {
+                    crate::thread::queue_io_completion_apc(&caller, cb, 0, got as u32, ov as usize);
+                }
+                set_err(0);
+                return TRUE;
+            }
+            Ok(None) => {
+                store_ov_internal_high(ov, 0);
+                store_ov_internal(ov, STATUS_PENDING);
+                pipe_reactor().submit(PendingPipeOp::new_read(
+                    h,
+                    Arc::clone(&f),
+                    target.conn(),
+                    fd,
+                    buf as usize,
+                    n as usize,
+                    PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
+                ));
+                set_err(0);
+                return TRUE;
+            }
+            Err(e) => {
+                set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
+                return FALSE;
+            }
+        }
+    }
+
+    let slice = if n == 0 {
+        &mut [][..]
+    } else {
+        std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+    };
+    let res = if f.kind == FileKind::Disk {
+        let off = read_ov_offset(ov);
+        read_full_at(f.file(), slice, off)
+    } else {
+        use std::io::Read;
+        let mut file = f.file();
+        loop {
+            match file.read(slice) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => break r,
+            }
+        }
+    };
+    match res {
+        Ok(got) => {
+            if got == 0 && n > 0 && f.kind == FileKind::Disk {
+                store_ov_internal_high(ov, 0);
+                store_ov_internal(ov, STATUS_END_OF_FILE);
+                set_err(err::ERROR_HANDLE_EOF);
+                return FALSE;
+            }
+            store_ov_internal_high(ov, got);
+            store_ov_internal(ov, STATUS_SUCCESS);
+            if let Some(cb) = completion_routine {
+                crate::thread::queue_io_completion_apc(&caller, cb, 0, got as u32, ov as usize);
+            }
+            set_err(0);
+            TRUE
+        }
+        Err(e) => {
+            set_err(io_err(&e));
+            FALSE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn WriteFileEx(
+    h: HANDLE,
+    buf: *const c_void,
+    n: u32,
+    ov: *mut OVERLAPPED,
+    completion_routine: Option<crate::thread::IoCompletionRoutine>,
+) -> BOOL {
+    if ov.is_null() || (n > 0 && buf.is_null()) {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    let caller = crate::thread::ensure_current_thread_object();
+    let caller_tid = teb::thread_id();
+
+    if f.kind == FileKind::Pipe {
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        let fd = target.fd();
+        if n == 0 {
+            store_ov_internal_high(ov, 0);
+            store_ov_internal(ov, STATUS_SUCCESS);
+            if let Some(cb) = completion_routine {
+                crate::thread::queue_io_completion_apc(&caller, cb, 0, 0, ov as usize);
+            }
+            set_err(0);
+            return TRUE;
+        }
+        let caller_for_done = Arc::clone(&caller);
+        match pipe_reactor().admit_async_write(
+            h,
+            &f,
+            target.conn(),
+            fd,
+            buf as *const u8,
+            n as usize,
+            ov,
+            PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
+        ) {
+            AsyncPipeWriteOutcome::Completed(done) => {
+                store_ov_internal_high(ov, done);
+                store_ov_internal(ov, STATUS_SUCCESS);
+                if let Some(cb) = completion_routine {
+                    crate::thread::queue_io_completion_apc(&caller_for_done, cb, 0, done as u32, ov as usize);
+                }
+                set_err(0);
+                return TRUE;
+            }
+            AsyncPipeWriteOutcome::Pending => {
+                set_err(0);
+                return TRUE;
+            }
+            AsyncPipeWriteOutcome::Error(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        }
+    }
+
+    let slice = if n == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(buf as *const u8, n as usize)
+    };
+    let res = if f.kind == FileKind::Disk {
+        let off = read_ov_offset(ov);
+        if off == u64::MAX {
+            use std::io::{Seek, Write};
+            let mut file = f.file();
+            file.seek(std::io::SeekFrom::End(0)).and_then(|_| file.write_all(slice)).map(|_| slice.len())
+        } else {
+            f.file().write_all_at(slice, off).map(|_| slice.len())
+        }
+    } else {
+        use std::io::{Seek, Write};
+        let mut file = f.file();
+        if f.append {
+            let _ = file.seek(std::io::SeekFrom::End(0));
+        }
+        file.write_all(slice).map(|_| slice.len())
+    };
+    match res {
+        Ok(k) => {
+            store_ov_internal_high(ov, k);
+            store_ov_internal(ov, STATUS_SUCCESS);
+            if let Some(cb) = completion_routine {
+                crate::thread::queue_io_completion_apc(&caller, cb, 0, k as u32, ov as usize);
+            }
+            set_err(0);
+            TRUE
+        }
+        Err(e) => {
+            set_err(io_err(&e));
+            FALSE
+        }
+    }
+}
 
 pub unsafe extern "win64" fn GetOverlappedResult(h: HANDLE, ov: *mut OVERLAPPED, n: *mut u32, wait: BOOL) -> BOOL {
     GetOverlappedResultEx(h, ov, n, if wait != 0 { INFINITE } else { 0 }, FALSE)
 }
 
-/// Disk/pipe I/O completes synchronously; device I/O (misc::hid) may still
+/// Disk I/O completes synchronously; pipe/device/socket/directory-watch I/O may
 /// be pending, completed from another thread (buffer, InternalHigh, then a
 /// release store of Internal, then the event).
 pub unsafe extern "win64" fn GetOverlappedResultEx(h: HANDLE, ov: *mut OVERLAPPED, n: *mut u32, ms: u32, alertable: BOOL) -> BOOL {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let internal = || AtomicUsize::from_ptr(std::ptr::addr_of_mut!((*ov).internal)).load(Ordering::Acquire);
-    if internal() == STATUS_PENDING {
+    if ov.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let deadline = (ms != INFINITE).then(|| Instant::now() + Duration::from_millis(ms as u64));
+    while load_ov_internal(ov) == STATUS_PENDING {
         if ms == 0 {
             set_err(err::ERROR_IO_INCOMPLETE);
             return FALSE;
         }
-        let ev = (*ov).h_event;
-        let target = if ev.is_null() { h } else { (ev as usize & !1) as HANDLE };
-        let Some(obj) = handles::get(target) else {
+        let remaining = match deadline {
+            None => None,
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    set_err(WAIT_TIMEOUT);
+                    return FALSE;
+                }
+                Some(dl - now)
+            }
+        };
+        let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
+        let obj: Option<Arc<dyn KObject>> = if !ev.is_null() {
+            handles::get((ev as usize & !1) as HANDLE)
+        } else if let Some(ext_ev) = external_io_event(h) {
+            Some(ext_ev as Arc<dyn KObject>)
+        } else {
+            handles::get(h)
+        };
+        let Some(obj) = obj else {
             set_err(err::ERROR_INVALID_HANDLE);
             return FALSE;
         };
-        match handles::wait_for(&[obj], false, ms, alertable != 0) {
+        match handles::wait_for_duration(std::slice::from_ref(&obj), false, remaining, alertable != 0) {
             handles::WaitResult::Timeout => {
+                if load_ov_internal(ov) != STATUS_PENDING {
+                    break;
+                }
                 set_err(WAIT_TIMEOUT);
                 return FALSE;
             }
@@ -770,15 +1664,21 @@ pub unsafe extern "win64" fn GetOverlappedResultEx(h: HANDLE, ov: *mut OVERLAPPE
                 set_err(e);
                 return FALSE;
             }
-            _ => {}
+            _ => {
+                // If waiting on a shared handle event while another op completed,
+                // yield briefly to avoid busy-spinning until our own `ov` completes.
+                if load_ov_internal(ov) == STATUS_PENDING && ev.is_null() {
+                    std::thread::yield_now();
+                }
+            }
         }
     }
-    let status = internal();
+    let status = load_ov_internal(ov);
     if !n.is_null() {
-        *n = std::ptr::read_volatile(std::ptr::addr_of!((*ov).internal_high)) as u32;
+        std::ptr::write_unaligned(n, load_ov_internal_high(ov) as u32);
     }
     match status {
-        STATUS_SUCCESS => TRUE,
+        STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED => TRUE,
         STATUS_END_OF_FILE => {
             set_err(err::ERROR_HANDLE_EOF);
             FALSE
@@ -788,7 +1688,7 @@ pub unsafe extern "win64" fn GetOverlappedResultEx(h: HANDLE, ov: *mut OVERLAPPE
             FALSE
         }
         s => {
-            set_err(crate::ntdll::ntstatus_to_win32(s as u32));
+            set_err(ntstatus_to_win32_local(s));
             FALSE
         }
     }
@@ -798,11 +1698,43 @@ pub unsafe extern "win64" fn CancelIo(h: HANDLE) -> BOOL {
     if let Some(r) = crate::misc::hid::cancel_io(h, std::ptr::null_mut(), false) {
         return r;
     }
-    TRUE // file I/O completes synchronously; nothing to cancel
+    if let Some(f) = get_file(h) {
+        let tid = teb::thread_id();
+        let _ = f.cancel_pending_io(h, None, Some(tid));
+        return TRUE;
+    }
+    let hooks = external_cancel_hooks().lock().unwrap().clone();
+    for hook in hooks {
+        if let Some(_cancelled) = hook(h, std::ptr::null_mut(), false) {
+            return TRUE;
+        }
+    }
+    set_err(err::ERROR_INVALID_HANDLE);
+    FALSE
 }
 pub unsafe extern "win64" fn CancelIoEx(h: HANDLE, ov: *mut OVERLAPPED) -> BOOL {
     if let Some(r) = crate::misc::hid::cancel_io(h, ov, true) {
         return r;
+    }
+    if let Some(f) = get_file(h) {
+        let ov_filter = (!ov.is_null()).then_some(ov as usize);
+        let n = f.cancel_pending_io(h, ov_filter, None);
+        if n > 0 {
+            return TRUE;
+        }
+        set_err(err::ERROR_NOT_FOUND);
+        return FALSE;
+    }
+    let hooks = external_cancel_hooks().lock().unwrap().clone();
+    for hook in hooks {
+        if let Some(cancelled) = hook(h, ov, true) {
+            if cancelled {
+                return TRUE;
+            } else {
+                set_err(err::ERROR_NOT_FOUND);
+                return FALSE;
+            }
+        }
     }
     set_err(err::ERROR_NOT_FOUND);
     FALSE
@@ -927,6 +1859,10 @@ pub unsafe extern "win64" fn SetEndOfFile(h: HANDLE) -> BOOL {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let pos = libc::lseek(f.fd(), 0, libc::SEEK_CUR);
     if pos < 0 || libc::ftruncate(f.fd(), pos) != 0 {
         set_err(errno_to_win32(last_errno()));
@@ -1187,6 +2123,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
     };
     match class {
         0 => {
+            if f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             // FILE_BASIC_INFO: times (0 = don't change).
             let a = (info.add(8) as *const i64).read_unaligned();
             let w = (info.add(16) as *const i64).read_unaligned();
@@ -1208,6 +2148,13 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
                     return FALSE;
                 }
             };
+            if f.is_protected_native()
+                || path::is_protected_host_remove_or_rename(src)
+                || path::is_protected_host_remove_or_rename(&dst)
+            {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             if !replace && dst.exists() {
                 set_err(err::ERROR_ALREADY_EXISTS);
                 return FALSE;
@@ -1223,6 +2170,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         4 | 21 => {
             // FILE_DISPOSITION_INFO(_EX)
             let del = if class == 4 { *info != 0 } else { (info as *const u32).read_unaligned() & 1 != 0 };
+            if del && f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             *f.delete_on_close.lock().unwrap() = del;
             TRUE
         }
@@ -1231,6 +2182,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             let len = (info as *const i64).read_unaligned();
             if class == 5 {
                 return TRUE; // allocation hint only
+            }
+            if f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
             }
             if libc::ftruncate(f.fd(), len) != 0 {
                 set_err(errno_to_win32(last_errno()));
@@ -1275,6 +2230,10 @@ pub unsafe extern "win64" fn SetFileTime(h: HANDLE, _c: *const FILETIME, a: *con
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let g = |p: *const FILETIME| if p.is_null() { 0 } else { (*p).to_u64() as i64 };
     set_times(&f, g(a), g(w))
 }
@@ -1392,6 +2351,10 @@ pub unsafe extern "win64" fn SetFileAttributesW(name: LPCWSTR, attrs: u32) -> BO
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&host) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let Ok(m) = std::fs::metadata(&host) else {
         set_err(not_found_err(&host));
         return FALSE;
@@ -1431,6 +2394,9 @@ fn path_op(name: &str, op: impl FnOnce(&Path) -> std::io::Result<()>) -> BOOL {
 
 pub unsafe extern "win64" fn CreateDirectoryW(name: LPCWSTR, _sec: *mut c_void) -> BOOL {
     path_op(&from_wide(name), |p| {
+        if path::is_protected_host_write(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EEXIST))
         } else {
@@ -1440,6 +2406,9 @@ pub unsafe extern "win64" fn CreateDirectoryW(name: LPCWSTR, _sec: *mut c_void) 
 }
 pub unsafe extern "win64" fn CreateDirectoryA(name: LPCSTR, _sec: *mut c_void) -> BOOL {
     path_op(&from_ansi(name), |p| {
+        if path::is_protected_host_write(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EEXIST))
         } else {
@@ -1462,21 +2431,34 @@ pub unsafe extern "win64" fn CreateDirectoryExA(
     CreateDirectoryA(new_dir, sec)
 }
 pub unsafe extern "win64" fn RemoveDirectoryW(name: LPCWSTR) -> BOOL {
-    path_op(&from_wide(name), |p| match std::fs::remove_dir(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-        Err(e) => Err(e),
+    path_op(&from_wide(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        match std::fs::remove_dir(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(e) => Err(e),
+        }
     })
 }
 pub unsafe extern "win64" fn RemoveDirectoryA(name: LPCSTR) -> BOOL {
-    path_op(&from_ansi(name), |p| match std::fs::remove_dir(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-        Err(e) => Err(e),
+    path_op(&from_ansi(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        match std::fs::remove_dir(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(e) => Err(e),
+        }
     })
 }
 pub unsafe extern "win64" fn DeleteFileW(name: LPCWSTR) -> BOOL {
     path_op(&from_wide(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EACCES))
         } else {
@@ -1500,6 +2482,10 @@ pub fn move_file(src: &str, dst: &str, flags: u32) -> BOOL {
             return FALSE;
         }
     };
+    if path::is_protected_host_remove_or_rename(&s) || path::is_protected_host_remove_or_rename(&d) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     if !s.exists() {
         set_err(not_found_err(&s));
         return FALSE;
@@ -1559,6 +2545,10 @@ pub unsafe extern "win64" fn CopyFileW(src: LPCWSTR, dst: LPCWSTR, fail_if_exist
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&d) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     if fail_if_exists != 0 && d.exists() {
         set_err(err::ERROR_FILE_EXISTS);
         return FALSE;
@@ -1606,15 +2596,25 @@ pub unsafe extern "win64" fn ReplaceFileW(
 }
 
 #[derive(Clone, Copy)]
-struct IocpPacket {
-    bytes: u32,
-    key: usize,
-    overlapped: usize,
+pub(crate) struct IocpPacket {
+    pub bytes: u32,
+    pub key: usize,
+    pub overlapped: usize,
+    pub internal_status: usize,
 }
 
-struct IoCompletionPort {
+enum IocpDequeue {
+    Packets(Vec<IocpPacket>),
+    Timeout,
+    IoCompletion,
+}
+
+pub(crate) struct IoCompletionPort {
     queue: std::sync::Mutex<std::collections::VecDeque<IocpPacket>>,
-    cv: std::sync::Condvar,
+    /// Auto-reset event signaled whenever packets are available; enables
+    /// alertable waits in `GetQueuedCompletionStatusEx` via `handles::wait_for_duration`
+    /// so queued APCs wake blocked IOCP waiters immediately without polling.
+    ready: Arc<Event>,
 }
 
 impl handles::KObject for IoCompletionPort {
@@ -1630,40 +2630,22 @@ impl IoCompletionPort {
     fn new() -> Self {
         Self {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            cv: std::sync::Condvar::new(),
+            ready: Arc::new(Event::new(false, false, None)),
         }
     }
 
-    fn post(&self, pkt: IocpPacket) {
-        let mut q = self.queue.lock().unwrap();
-        q.push_back(pkt);
-        self.cv.notify_one();
+    pub(crate) fn post(&self, pkt: IocpPacket) {
+        {
+            let mut q = self.queue.lock().unwrap();
+            q.push_back(pkt);
+        }
+        self.ready.set();
     }
 
-    fn dequeue_up_to(&self, max: usize, timeout_ms: u32) -> Vec<IocpPacket> {
+    fn try_pop_up_to(&self, max: usize) -> Vec<IocpPacket> {
         let mut q = self.queue.lock().unwrap();
-        let deadline = if timeout_ms == u32::MAX {
-            None
-        } else {
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
-        };
-        while q.is_empty() {
-            match deadline {
-                None => {
-                    q = self.cv.wait(q).unwrap();
-                }
-                Some(dl) => {
-                    let now = std::time::Instant::now();
-                    if now >= dl {
-                        return Vec::new();
-                    }
-                    let (g, res) = self.cv.wait_timeout(q, dl - now).unwrap();
-                    q = g;
-                    if res.timed_out() && q.is_empty() {
-                        return Vec::new();
-                    }
-                }
-            }
+        if q.is_empty() {
+            return Vec::new();
         }
         let n = q.len().min(max.max(1));
         let mut out = Vec::with_capacity(n);
@@ -1672,8 +2654,281 @@ impl IoCompletionPort {
                 out.push(pkt);
             }
         }
+        let more = !q.is_empty();
+        drop(q);
+        if more {
+            self.ready.set();
+        }
         out
     }
+
+    fn dequeue_up_to(&self, max: usize, timeout_ms: u32, alertable: bool) -> IocpDequeue {
+        if alertable && crate::thread::has_pending_apc() {
+            crate::thread::run_pending_apcs();
+            return IocpDequeue::IoCompletion;
+        }
+        let deadline = (timeout_ms != INFINITE).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let ready_obj: Arc<dyn KObject> = Arc::clone(&self.ready) as Arc<dyn KObject>;
+        loop {
+            let out = self.try_pop_up_to(max);
+            if !out.is_empty() {
+                return IocpDequeue::Packets(out);
+            }
+            if timeout_ms == 0 {
+                return IocpDequeue::Timeout;
+            }
+            let remaining = match deadline {
+                None => None,
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return IocpDequeue::Timeout;
+                    }
+                    Some(dl - now)
+                }
+            };
+            match handles::wait_for_duration(std::slice::from_ref(&ready_obj), false, remaining, alertable) {
+                handles::WaitResult::IoCompletion => return IocpDequeue::IoCompletion,
+                handles::WaitResult::Timeout => {
+                    let out = self.try_pop_up_to(max);
+                    if !out.is_empty() {
+                        return IocpDequeue::Packets(out);
+                    }
+                    return IocpDequeue::Timeout;
+                }
+                handles::WaitResult::Object(_) => continue,
+                _ => return IocpDequeue::Timeout,
+            }
+        }
+    }
+}
+
+/// Shared completion sink state for both `FileObj` and external I/O handles (such as Winsock2
+/// `SOCKET` handles). Held behind an `Arc` without any back-reference to `FileObj` so in-flight
+/// pending operations can retain completion sinks across concurrent `CloseHandle`/`closesocket`
+/// without creating reference cycles.
+pub(crate) struct IoCompletionBinding {
+    iocp: Mutex<Option<(Arc<IoCompletionPort>, usize)>>,
+    tp_io: Mutex<Option<Arc<TpIo>>>,
+    completion_modes: AtomicU8,
+    /// Manual-reset event representing handle completion state (used when
+    /// `GetOverlappedResultEx` waits on the handle itself with `ov.h_event == NULL`).
+    io_event: Arc<Event>,
+}
+
+struct CapturedCompletionBindings {
+    modes: u8,
+    iocp: Option<(Arc<IoCompletionPort>, usize)>,
+    tp_io: Option<Arc<TpIo>>,
+    handle_event: Arc<Event>,
+}
+
+impl IoCompletionBinding {
+    fn new() -> Self {
+        Self {
+            iocp: Mutex::new(None),
+            tp_io: Mutex::new(None),
+            completion_modes: AtomicU8::new(0),
+            io_event: Arc::new(Event::new(true, true, None)),
+        }
+    }
+
+    fn snapshot(&self) -> CapturedCompletionBindings {
+        CapturedCompletionBindings {
+            modes: self.completion_modes.load(Ordering::Relaxed),
+            iocp: self.iocp.lock().unwrap().clone(),
+            tp_io: self.tp_io.lock().unwrap().clone(),
+            handle_event: Arc::clone(&self.io_event),
+        }
+    }
+
+    fn has_sink(&self) -> bool {
+        self.iocp.lock().unwrap().is_some() || self.tp_io.lock().unwrap().is_some()
+    }
+
+    fn bind_iocp(&self, iocp: Arc<IoCompletionPort>, key: usize) -> Result<(), u32> {
+        let mut iocp_g = self.iocp.lock().unwrap();
+        let tp_g = self.tp_io.lock().unwrap();
+        if tp_g.is_some() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        *iocp_g = Some((iocp, key));
+        Ok(())
+    }
+
+    fn bind_tp_io(&self, tp_io: Arc<TpIo>) -> Result<(), u32> {
+        let iocp_g = self.iocp.lock().unwrap();
+        let mut tp_g = self.tp_io.lock().unwrap();
+        if iocp_g.is_some() || tp_g.is_some() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        *tp_g = Some(tp_io);
+        Ok(())
+    }
+
+    fn unbind_tp_io(&self, tp_io: &Arc<TpIo>) {
+        let mut tp_g = self.tp_io.lock().unwrap();
+        if tp_g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, tp_io)) {
+            *tp_g = None;
+        }
+    }
+}
+
+fn external_io_table() -> &'static Mutex<std::collections::HashMap<usize, Arc<IoCompletionBinding>>> {
+    static T: OnceLock<Mutex<std::collections::HashMap<usize, Arc<IoCompletionBinding>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) type ExternalCancelFn = unsafe fn(HANDLE, *mut OVERLAPPED, bool) -> Option<bool>;
+
+fn external_cancel_hooks() -> &'static Mutex<Vec<ExternalCancelFn>> {
+    static H: OnceLock<Mutex<Vec<ExternalCancelFn>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn register_external_cancel_hook(f: ExternalCancelFn) {
+    let mut hooks = external_cancel_hooks().lock().unwrap();
+    if !hooks.iter().any(|&h| h as usize == f as usize) {
+        hooks.push(f);
+    }
+}
+
+pub(crate) fn register_external_io_handle(h: HANDLE) {
+    let mut t = external_io_table().lock().unwrap();
+    t.entry(h as usize)
+        .or_insert_with(|| Arc::new(IoCompletionBinding::new()));
+}
+
+pub(crate) fn unregister_external_io_handle(h: HANDLE) {
+    external_io_table().lock().unwrap().remove(&(h as usize));
+}
+
+pub(crate) fn lookup_io_completion_binding(h: HANDLE) -> Option<Arc<IoCompletionBinding>> {
+    if let Some(f) = get_file(h) {
+        return Some(Arc::clone(&f.completion));
+    }
+    external_io_table().lock().unwrap().get(&(h as usize)).cloned()
+}
+
+pub(crate) fn external_io_event(h: HANDLE) -> Option<Arc<Event>> {
+    external_io_table()
+        .lock()
+        .unwrap()
+        .get(&(h as usize))
+        .map(|e| Arc::clone(&e.io_event))
+}
+
+#[allow(dead_code)]
+pub(crate) fn handle_has_completion_sink(h: HANDLE) -> bool {
+    lookup_io_completion_binding(h).is_some_and(|b| b.has_sink())
+}
+
+/// Bind a `TpIo` completion sink to a `FileObj` or registered external I/O handle (e.g. `SOCKET`).
+/// Fails with `ERROR_INVALID_HANDLE` if `h` is not a valid I/O handle, or `ERROR_INVALID_PARAMETER`
+/// if `h` is already bound to an IOCP or another `TpIo`.
+pub(crate) fn bind_threadpool_io(h: HANDLE, tp_io: Arc<TpIo>) -> Result<(), u32> {
+    let Some(binding) = lookup_io_completion_binding(h) else {
+        return Err(err::ERROR_INVALID_HANDLE);
+    };
+    binding.bind_tp_io(tp_io)
+}
+
+/// Detach a `TpIo` sink from `h` when `CloseThreadpoolIo` is called.
+pub(crate) fn unbind_threadpool_io(h: HANDLE, tp_io: &Arc<TpIo>) {
+    if let Some(binding) = lookup_io_completion_binding(h) {
+        binding.unbind_tp_io(tp_io);
+    }
+}
+
+#[inline(always)]
+unsafe fn complete_overlapped_binding_with_hook<F: FnOnce()>(
+    binding: Option<&IoCompletionBinding>,
+    ov: *mut OVERLAPPED,
+    nt_status: usize,
+    bytes: usize,
+    synchronous: bool,
+    after_signal: F,
+) -> bool {
+    const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
+    const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
+    if ov.is_null() {
+        return false;
+    }
+    // Capture guest OVERLAPPED fields, explicit event object, completion modes, handle event,
+    // and strong IOCP/TpIo references BEFORE publishing terminal `ov.internal` or signaling any
+    // event so a consumer waking on `ov.internal` or `ov.h_event` can immediately close handles
+    // or free/reuse `ov` without racing with any subsequent handle-table or guest dereference.
+    let ov_addr = ov as usize;
+    let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
+    let suppress_iocp = (raw_ev & 1) != 0;
+    let ev_h = (raw_ev & !1) as HANDLE;
+    let explicit_event = if !ev_h.is_null() {
+        handles::get_as::<Event>(ev_h)
+    } else {
+        None
+    };
+    let captured = binding.map(IoCompletionBinding::snapshot);
+
+    store_ov_internal_high(ov, bytes);
+    store_ov_internal(ov, nt_status);
+
+    // Post-publication: zero guest-memory dereferences and zero handle-table lookups.
+    if let Some(e) = explicit_event {
+        e.set();
+    }
+    after_signal();
+
+    let Some(c) = captured else {
+        return false;
+    };
+    if (c.modes & FILE_SKIP_SET_EVENT_ON_HANDLE) == 0 {
+        c.handle_event.set();
+    }
+
+    if suppress_iocp {
+        return false;
+    }
+    if synchronous && is_io_success_status(nt_status) && (c.modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
+        return false;
+    }
+    if let Some((iocp, key)) = c.iocp {
+        iocp.post(IocpPacket {
+            bytes: bytes as u32,
+            key,
+            overlapped: ov_addr,
+            internal_status: nt_status,
+        });
+        return true;
+    }
+    if let Some(tp_io) = c.tp_io {
+        return tp_io.dispatch_completion(ov_addr, ntstatus_to_win32_local(nt_status), bytes);
+    }
+    false
+}
+
+/// Complete an overlapped I/O operation using a retained `IoCompletionBinding`.
+pub(crate) unsafe fn complete_overlapped_binding(
+    binding: Option<&IoCompletionBinding>,
+    ov: *mut OVERLAPPED,
+    nt_status: usize,
+    bytes: usize,
+    synchronous: bool,
+) -> bool {
+    complete_overlapped_binding_with_hook(binding, ov, nt_status, bytes, synchronous, || {})
+}
+
+/// Complete an overlapped I/O operation on either a `FileObj` or a registered external I/O handle (e.g. SOCKET).
+/// Captures all completion bindings and events before atomically publishing `InternalHigh`/`Internal`,
+/// signaling `ov.h_event` (and the handle's event), and posting to any associated IOCP or `TpIo`.
+pub(crate) unsafe fn complete_overlapped_io(
+    h: HANDLE,
+    ov: *mut OVERLAPPED,
+    nt_status: usize,
+    bytes: usize,
+    synchronous: bool,
+) -> bool {
+    let binding = lookup_io_completion_binding(h);
+    complete_overlapped_binding(binding.as_deref(), ov, nt_status, bytes, synchronous)
 }
 
 #[repr(C)]
@@ -1704,8 +2959,19 @@ pub unsafe extern "win64" fn CreateIoCompletionPort(
         (h, p)
     };
     if !file_handle.is_null() && file_handle != INVALID_HANDLE_VALUE {
-        if let Some(f) = get_file(file_handle) {
-            *f.iocp.lock().unwrap() = Some((iocp, completion_key));
+        let Some(binding) = lookup_io_completion_binding(file_handle) else {
+            if existing_port.is_null() {
+                handles::close(port_handle);
+            }
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
+        };
+        if let Err(e) = binding.bind_iocp(iocp, completion_key) {
+            if existing_port.is_null() {
+                handles::close(port_handle);
+            }
+            set_err(e);
+            return std::ptr::null_mut();
         }
     }
     port_handle
@@ -1721,7 +2987,12 @@ pub unsafe extern "win64" fn PostQueuedCompletionStatus(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    iocp.post(IocpPacket { bytes, key, overlapped: overlapped as usize });
+    iocp.post(IocpPacket {
+        bytes,
+        key,
+        overlapped: overlapped as usize,
+        internal_status: STATUS_SUCCESS,
+    });
     TRUE
 }
 
@@ -1739,7 +3010,10 @@ pub unsafe extern "win64" fn GetQueuedCompletionStatus(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let mut got = iocp.dequeue_up_to(1, timeout_ms);
+    let mut got = match iocp.dequeue_up_to(1, timeout_ms, false) {
+        IocpDequeue::Packets(v) => v,
+        IocpDequeue::Timeout | IocpDequeue::IoCompletion => Vec::new(),
+    };
     if let Some(pkt) = got.pop() {
         if !bytes.is_null() {
             std::ptr::write_unaligned(bytes, pkt.bytes);
@@ -1749,6 +3023,10 @@ pub unsafe extern "win64" fn GetQueuedCompletionStatus(
         }
         if !overlapped.is_null() {
             std::ptr::write_unaligned(overlapped, pkt.overlapped as *mut OVERLAPPED);
+        }
+        if !is_io_success_status(pkt.internal_status) {
+            set_err(ntstatus_to_win32_local(pkt.internal_status));
+            return FALSE;
         }
         TRUE
     } else {
@@ -1782,31 +3060,33 @@ pub unsafe extern "win64" fn GetQueuedCompletionStatusEx(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    if alertable != 0 && crate::thread::has_pending_apc() {
-        crate::thread::run_pending_apcs();
-        std::ptr::write_unaligned(num_removed, 0);
-        set_err(WAIT_IO_COMPLETION);
-        return FALSE;
+    match iocp.dequeue_up_to(count as usize, timeout_ms, alertable != 0) {
+        IocpDequeue::IoCompletion => {
+            std::ptr::write_unaligned(num_removed, 0);
+            set_err(WAIT_IO_COMPLETION);
+            FALSE
+        }
+        IocpDequeue::Timeout => {
+            std::ptr::write_unaligned(num_removed, 0);
+            set_err(WAIT_TIMEOUT);
+            FALSE
+        }
+        IocpDequeue::Packets(got) => {
+            for (i, pkt) in got.iter().enumerate() {
+                std::ptr::write_unaligned(
+                    entries.add(i),
+                    OVERLAPPED_ENTRY {
+                        lpCompletionKey: pkt.key,
+                        lpOverlapped: pkt.overlapped as *mut OVERLAPPED,
+                        Internal: pkt.internal_status,
+                        dwNumberOfBytesTransferred: pkt.bytes,
+                    },
+                );
+            }
+            std::ptr::write_unaligned(num_removed, got.len() as u32);
+            TRUE
+        }
     }
-    let got = iocp.dequeue_up_to(count as usize, timeout_ms);
-    if got.is_empty() {
-        std::ptr::write_unaligned(num_removed, 0);
-        set_err(WAIT_TIMEOUT);
-        return FALSE;
-    }
-    for (i, pkt) in got.iter().enumerate() {
-        std::ptr::write_unaligned(
-            entries.add(i),
-            OVERLAPPED_ENTRY {
-                lpCompletionKey: pkt.key,
-                lpOverlapped: pkt.overlapped as *mut OVERLAPPED,
-                Internal: 0,
-                dwNumberOfBytesTransferred: pkt.bytes,
-            },
-        );
-    }
-    std::ptr::write_unaligned(num_removed, got.len() as u32);
-    TRUE
 }
 
 pub unsafe extern "win64" fn SetFileCompletionNotificationModes(
@@ -1822,10 +3102,12 @@ pub unsafe extern "win64" fn SetFileCompletionNotificationModes(
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if let Some(f) = get_file(file_handle) {
-        f.completion_modes.store(flags, std::sync::atomic::Ordering::Relaxed);
+    if let Some(binding) = lookup_io_completion_binding(file_handle) {
+        binding.completion_modes.store(flags, Ordering::Relaxed);
+        return TRUE;
     }
-    TRUE
+    set_err(err::ERROR_INVALID_HANDLE);
+    FALSE
 }
 
 pub unsafe extern "win64" fn CreateHardLinkW(new: LPCWSTR, existing: LPCWSTR, _sec: *mut c_void) -> BOOL {
@@ -1836,6 +3118,10 @@ pub unsafe extern "win64" fn CreateHardLinkW(new: LPCWSTR, existing: LPCWSTR, _s
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&n) || path::is_protected_host_alias_target(&e) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     match std::fs::hard_link(&e, &n) {
         Ok(()) => TRUE,
         Err(x) => {
@@ -1853,6 +3139,10 @@ pub unsafe extern "win64" fn CreateSymbolicLinkW(link: LPCWSTR, target: LPCWSTR,
             return 0;
         }
     };
+    if path::is_protected_host_write(&l) || path::is_protected_host_alias_target(&t) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return 0;
+    }
     match std::os::unix::fs::symlink(&t, &l) {
         Ok(()) => 1,
         Err(x) => {
@@ -2577,86 +3867,2459 @@ pub unsafe extern "win64" fn FindClose(h: HANDLE) -> BOOL {
     }
 }
 
-pub unsafe extern "win64" fn ReadDirectoryChangesW(
-    _h: HANDLE,
-    _buf: *mut c_void,
-    _len: u32,
-    _subtree: BOOL,
-    _filter: u32,
-    ret: *mut u32,
-    ov: *mut OVERLAPPED,
-    _cb: *const c_void,
-) -> BOOL {
-    if !ret.is_null() {
-        *ret = 0;
-    }
-    if !ov.is_null() {
-        // Leave overlapped request in pending state so async directory watchers wait on their event without spinning.
-        (*ov).internal = STATUS_PENDING;
-        (*ov).internal_high = 0;
-        set_err(err::ERROR_IO_PENDING);
-        return FALSE;
-    }
-    set_err(err::ERROR_NOT_SUPPORTED);
-    FALSE
+// ---------------------------------------------------------------------------
+// Native Darwin kqueue Directory Watching (ReadDirectoryChangesW &
+// FindFirstChangeNotificationW/Next/Close)
+// ---------------------------------------------------------------------------
+
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
+const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
+const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+const FILE_NOTIFY_CHANGE_LAST_ACCESS: u32 = 0x0000_0020;
+const FILE_NOTIFY_CHANGE_CREATION: u32 = 0x0000_0040;
+const FILE_NOTIFY_CHANGE_SECURITY: u32 = 0x0000_0100;
+
+const FILE_ACTION_ADDED: u32 = 1;
+const FILE_ACTION_REMOVED: u32 = 2;
+const FILE_ACTION_MODIFIED: u32 = 3;
+const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
+const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
+
+const MAX_WATCHED_VNODE_FDS: usize = 512;
+#[cfg(target_vendor = "apple")]
+const DIR_WATCH_FD_HEADROOM: usize = 64;
+#[cfg(target_vendor = "apple")]
+const DIR_WATCH_EMFILE_BACKOFF_FDS: usize = 16;
+#[cfg(target_vendor = "apple")]
+const DIR_WATCH_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_PENDING_DIR_CHANGES: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirSnapEntry {
+    is_dir: bool,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    atime: (i64, i64),
+    ctime: (i64, i64),
+    birthtime: (i64, i64),
+    mode: u32,
 }
 
-pub unsafe extern "win64" fn FindFirstChangeNotificationW(_p: LPCWSTR, _sub: BOOL, _f: u32) -> HANDLE {
-    // Return a non-signaled manual-reset event handle so file-watcher threads in IDEs/non-gaming apps can WaitForMultipleObjects cleanly.
-    crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null())
+#[derive(Clone, Debug)]
+struct DirChange {
+    action: u32,
+    rel_path: String,
+    filter_mask: u32,
+}
+
+fn dir_entry_from_meta(m: &std::fs::Metadata) -> DirSnapEntry {
+    DirSnapEntry {
+        is_dir: m.is_dir(),
+        dev: m.dev(),
+        ino: m.ino(),
+        size: if m.is_dir() { 0 } else { m.len() },
+        mtime: (m.mtime(), m.mtime_nsec()),
+        atime: (m.atime(), m.atime_nsec()),
+        ctime: (m.ctime(), m.ctime_nsec()),
+        birthtime: (m.st_birthtime(), m.st_birthtime_nsec()),
+        mode: m.permissions().mode(),
+    }
+}
+
+fn snapshot_dir_rec(
+    root: &Path,
+    rel_prefix: &str,
+    subtree: bool,
+    out: &mut BTreeMap<String, DirSnapEntry>,
+) -> Result<(), i32> {
+    let dir_path = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix.replace('\\', "/"))
+    };
+    let rd = match std::fs::read_dir(&dir_path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            let raw = e.raw_os_error().unwrap_or(libc::EIO);
+            if raw == libc::ENOENT || (!rel_prefix.is_empty() && (raw == libc::ENOTDIR || raw == libc::EACCES || raw == libc::EPERM)) {
+                return Ok(());
+            }
+            return Err(raw);
+        }
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if rel_prefix.is_empty() {
+            name
+        } else {
+            format!("{rel_prefix}\\{name}")
+        };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let snap = dir_entry_from_meta(&meta);
+        let is_dir = snap.is_dir;
+        out.insert(rel.clone(), snap);
+        if is_dir && subtree {
+            snapshot_dir_rec(root, &rel, true, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_dir(root: &Path, subtree: bool) -> Result<BTreeMap<String, DirSnapEntry>, i32> {
+    let mut map = BTreeMap::new();
+    snapshot_dir_rec(root, "", subtree, &mut map)?;
+    Ok(map)
+}
+
+fn parent_of_rel(rel: &str) -> &str {
+    match rel.rfind('\\') {
+        Some(i) => &rel[..i],
+        None => "",
+    }
+}
+
+fn diff_dir_snapshots(
+    old: &BTreeMap<String, DirSnapEntry>,
+    new: &BTreeMap<String, DirSnapEntry>,
+    vnode_written: &HashSet<String>,
+    vnode_attrib: &HashSet<String>,
+) -> Vec<DirChange> {
+    let mut removed: Vec<(&String, &DirSnapEntry)> = Vec::new();
+    let mut added: Vec<(&String, &DirSnapEntry)> = Vec::new();
+
+    for (k, v) in old {
+        if !new.contains_key(k) {
+            removed.push((k, v));
+        }
+    }
+    for (k, v) in new {
+        if !old.contains_key(k) {
+            added.push((k, v));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut used_removed = vec![false; removed.len()];
+    let mut used_added = vec![false; added.len()];
+
+    // Match renames within the same parent directory by (dev, ino, is_dir).
+    for (ri, (rpath, rent)) in removed.iter().enumerate() {
+        if rent.ino == 0 {
+            continue;
+        }
+        let rparent = parent_of_rel(rpath);
+        for (ai, (apath, aent)) in added.iter().enumerate() {
+            if used_added[ai] {
+                continue;
+            }
+            if rent.dev == aent.dev
+                && rent.ino == aent.ino
+                && rent.is_dir == aent.is_dir
+                && parent_of_rel(apath) == rparent
+            {
+                used_removed[ri] = true;
+                used_added[ai] = true;
+                let mask = if rent.is_dir {
+                    FILE_NOTIFY_CHANGE_DIR_NAME
+                } else {
+                    FILE_NOTIFY_CHANGE_FILE_NAME
+                };
+                out.push(DirChange {
+                    action: FILE_ACTION_RENAMED_OLD_NAME,
+                    rel_path: (*rpath).clone(),
+                    filter_mask: mask,
+                });
+                out.push(DirChange {
+                    action: FILE_ACTION_RENAMED_NEW_NAME,
+                    rel_path: (*apath).clone(),
+                    filter_mask: mask,
+                });
+                break;
+            }
+        }
+    }
+
+    for (ri, (rpath, rent)) in removed.iter().enumerate() {
+        if !used_removed[ri] {
+            let mask = if rent.is_dir {
+                FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+            };
+            out.push(DirChange {
+                action: FILE_ACTION_REMOVED,
+                rel_path: (*rpath).clone(),
+                filter_mask: mask,
+            });
+        }
+    }
+
+    for (ai, (apath, aent)) in added.iter().enumerate() {
+        if !used_added[ai] {
+            let mask = if aent.is_dir {
+                FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+            };
+            out.push(DirChange {
+                action: FILE_ACTION_ADDED,
+                rel_path: (*apath).clone(),
+                filter_mask: mask,
+            });
+        }
+    }
+
+    for (path, new_e) in new {
+        let Some(old_e) = old.get(path) else {
+            continue;
+        };
+        if old_e.is_dir != new_e.is_dir {
+            out.push(DirChange {
+                action: FILE_ACTION_REMOVED,
+                rel_path: path.clone(),
+                filter_mask: if old_e.is_dir { FILE_NOTIFY_CHANGE_DIR_NAME } else { FILE_NOTIFY_CHANGE_FILE_NAME },
+            });
+            out.push(DirChange {
+                action: FILE_ACTION_ADDED,
+                rel_path: path.clone(),
+                filter_mask: if new_e.is_dir { FILE_NOTIFY_CHANGE_DIR_NAME } else { FILE_NOTIFY_CHANGE_FILE_NAME },
+            });
+            continue;
+        }
+        let mut mask = 0u32;
+        if !new_e.is_dir {
+            let vnode_w = vnode_written.contains(path);
+            if old_e.size != new_e.size {
+                mask |= FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+            }
+            if old_e.mtime != new_e.mtime || vnode_w || old_e.ino != new_e.ino {
+                mask |= FILE_NOTIFY_CHANGE_LAST_WRITE;
+                if vnode_w {
+                    mask |= FILE_NOTIFY_CHANGE_SIZE;
+                }
+            }
+            if old_e.atime != new_e.atime {
+                mask |= FILE_NOTIFY_CHANGE_LAST_ACCESS;
+            }
+            if old_e.birthtime != new_e.birthtime {
+                mask |= FILE_NOTIFY_CHANGE_CREATION;
+            }
+            if old_e.mode != new_e.mode || vnode_attrib.contains(path) {
+                mask |= FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY;
+            }
+            if old_e.ctime != new_e.ctime && mask == 0 {
+                mask |= FILE_NOTIFY_CHANGE_ATTRIBUTES;
+            }
+        } else {
+            // For directories, only report attribute/security changes (child add/remove
+            // are already reported as child ADDED/REMOVED records).
+            if old_e.mode != new_e.mode || vnode_attrib.contains(path) {
+                mask |= FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY;
+            }
+        }
+        if mask != 0 {
+            out.push(DirChange {
+                action: FILE_ACTION_MODIFIED,
+                rel_path: path.clone(),
+                filter_mask: mask,
+            });
+        }
+    }
+
+    out
+}
+
+/// Serialize `changes` into a guest `FILE_NOTIFY_INFORMATION` buffer.
+/// Returns `Ok(bytes_written)` or `Err(())` on buffer overflow.
+unsafe fn write_notify_buffer(buf: *mut u8, buf_len: usize, changes: &[DirChange]) -> Result<usize, ()> {
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    let mut encoded: Vec<(u32, Vec<u16>)> = Vec::with_capacity(changes.len());
+    let mut total_needed = 0usize;
+    for (idx, c) in changes.iter().enumerate() {
+        let w: Vec<u16> = c.rel_path.encode_utf16().collect();
+        let name_bytes = w.len() * 2;
+        let rec_len = 12 + name_bytes;
+        if idx + 1 < changes.len() {
+            total_needed += (rec_len + 3) & !3;
+        } else {
+            total_needed += rec_len;
+        }
+        encoded.push((c.action, w));
+    }
+    if total_needed > buf_len {
+        return Err(());
+    }
+    let mut off = 0usize;
+    for (idx, (action, w)) in encoded.iter().enumerate() {
+        let name_bytes = w.len() * 2;
+        let rec_len = 12 + name_bytes;
+        let stride = (rec_len + 3) & !3;
+        let next_off = if idx + 1 < encoded.len() { stride as u32 } else { 0 };
+        let dst = buf.add(off);
+        std::ptr::write_unaligned(dst as *mut u32, next_off);
+        std::ptr::write_unaligned(dst.add(4) as *mut u32, *action);
+        std::ptr::write_unaligned(dst.add(8) as *mut u32, name_bytes as u32);
+        for (j, &ch) in w.iter().enumerate() {
+            std::ptr::write_unaligned(dst.add(12 + j * 2) as *mut u16, ch);
+        }
+        if idx + 1 < encoded.len() {
+            for pad in rec_len..stride {
+                std::ptr::write_unaligned(dst.add(pad), 0u8);
+            }
+            off += stride;
+        } else {
+            off += rec_len;
+        }
+    }
+    Ok(off)
+}
+
+enum DirWatchDelivery {
+    Sync {
+        done: Arc<(Mutex<Option<(usize, u32)>>, Condvar)>,
+        tid: u32,
+    },
+    Apc {
+        ov: usize,
+        cb: crate::thread::IoCompletionRoutine,
+        thread: Arc<ThreadObj>,
+        tid: u32,
+    },
+    Overlapped {
+        ov: usize,
+        tid: u32,
+        binding: Arc<IoCompletionBinding>,
+    },
+}
+
+struct DirWatchRequest {
+    handle: usize,
+    buf: usize,
+    len: usize,
+    filter: u32,
+    completed: AtomicBool,
+    delivery: DirWatchDelivery,
+}
+
+impl DirWatchRequest {
+    fn tid(&self) -> u32 {
+        match &self.delivery {
+            DirWatchDelivery::Sync { tid, .. }
+            | DirWatchDelivery::Apc { tid, .. }
+            | DirWatchDelivery::Overlapped { tid, .. } => *tid,
+        }
+    }
+
+    fn ov_addr(&self) -> Option<usize> {
+        match &self.delivery {
+            DirWatchDelivery::Sync { .. } => None,
+            DirWatchDelivery::Apc { ov, .. } | DirWatchDelivery::Overlapped { ov, .. } => Some(*ov),
+        }
+    }
+
+    /// Complete this request strictly once (idempotent via `completed` swap).
+    fn finish_once(&self, nt_status: usize, bytes: usize) -> bool {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        match &self.delivery {
+            DirWatchDelivery::Sync { done, .. } => {
+                let (m, cv) = &**done;
+                let mut g = m.lock().unwrap();
+                *g = Some((nt_status, bytes as u32));
+                cv.notify_all();
+            }
+            DirWatchDelivery::Apc { ov, cb, thread, .. } => unsafe {
+                let ov_ptr = *ov as *mut OVERLAPPED;
+                store_ov_internal_high(ov_ptr, bytes);
+                store_ov_internal(ov_ptr, nt_status);
+                let win_err = ntstatus_to_win32_local(nt_status);
+                crate::thread::queue_io_completion_apc(thread, *cb, win_err, bytes as u32, *ov);
+            },
+            DirWatchDelivery::Overlapped { ov, binding, .. } => unsafe {
+                let _ = complete_overlapped_binding(
+                    Some(binding),
+                    *ov as *mut OVERLAPPED,
+                    nt_status,
+                    bytes,
+                    false,
+                );
+            },
+        }
+        true
+    }
+}
+
+struct DirWatcherState {
+    subtree: bool,
+    requests: VecDeque<Arc<DirWatchRequest>>,
+    pending_changes: VecDeque<DirChange>,
+    overflow: bool,
+    /// Optional `FindFirstChangeNotification` event + filter.
+    notify_event: Option<(Arc<Event>, u32)>,
+}
+
+struct DirWatcher {
+    state: Mutex<DirWatcherState>,
+    closed: AtomicBool,
+    wake_w: Mutex<Option<i32>>,
+}
+
+impl DirWatcher {
+    fn poke(&self) {
+        if let Some(fd) = *self.wake_w.lock().unwrap() {
+            let b = 1u8;
+            unsafe {
+                let _ = libc::write(fd, &b as *const u8 as *const c_void, 1);
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let cancelled: Vec<Arc<DirWatchRequest>> = {
+            let mut st = self.state.lock().unwrap();
+            st.requests.drain(..).collect()
+        };
+        for req in cancelled {
+            req.finish_once(STATUS_CANCELLED, 0);
+        }
+        self.poke();
+    }
+
+    fn cancel_requests(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
+        let to_cancel: Vec<Arc<DirWatchRequest>> = {
+            let mut st = self.state.lock().unwrap();
+            let mut matched = Vec::new();
+            let mut i = 0;
+            while i < st.requests.len() {
+                let r = &st.requests[i];
+                let h_ok = r.handle == handle;
+                let ov_ok = ov.map_or(true, |target| r.ov_addr() == Some(target));
+                let tid_ok = filter_tid.map_or(true, |t| r.tid() == t);
+                if h_ok && ov_ok && tid_ok {
+                    if let Some(req) = st.requests.remove(i) {
+                        matched.push(req);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            matched
+        };
+        let mut count = 0;
+        for req in to_cancel {
+            if req.finish_once(STATUS_CANCELLED, 0) {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.poke();
+        }
+        count
+    }
+
+    fn start(root: PathBuf, subtree: bool, notify_event: Option<(Arc<Event>, u32)>) -> Result<Arc<Self>, u32> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return Err(errno_to_win32(last_errno()));
+            }
+            set_cloexec(kq);
+            let mut wake = [0i32; 2];
+            if unsafe { libc::pipe(wake.as_mut_ptr()) } != 0 {
+                let e = last_errno();
+                unsafe { libc::close(kq) };
+                return Err(errno_to_win32(e));
+            }
+            for &fd in &wake {
+                set_cloexec(fd);
+                unsafe {
+                    let fl = libc::fcntl(fd, libc::F_GETFL);
+                    if fl >= 0 {
+                        let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                    }
+                }
+            }
+            let wake_r = wake[0];
+            let wake_w = wake[1];
+
+            // Register wakeup pipe read end in kqueue.
+            let wake_ev = libc::kevent {
+                ident: wake_r as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { libc::kevent(kq, &wake_ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+                let e = last_errno();
+                unsafe {
+                    libc::close(kq);
+                    libc::close(wake_r);
+                    libc::close(wake_w);
+                }
+                return Err(errno_to_win32(e));
+            }
+
+            // Take initial snapshot and attach initial vnode watches SYNCHRONOUSLY before returning
+            // so any filesystem change immediately after ReadDirectoryChangesW/FindFirstChangeNotificationW
+            // is guaranteed to be observed.
+            let (initial_snap, snap_failed) = match snapshot_dir(&root, subtree) {
+                Ok(s) => (s, false),
+                Err(_) => (BTreeMap::new(), true),
+            };
+            let mut vnode_budget = effective_vnode_fd_budget(MAX_WATCHED_VNODE_FDS);
+            let mut watched_by_path: HashMap<String, (i32, u64, u64)> = HashMap::new();
+            let mut path_by_fd: HashMap<i32, String> = HashMap::new();
+            let initial_needs_rescan = sync_kqueue_vnodes(
+                kq,
+                &root,
+                &initial_snap,
+                &mut watched_by_path,
+                &mut path_by_fd,
+                &mut vnode_budget,
+            ) || snap_failed;
+
+            let watcher = Arc::new(DirWatcher {
+                state: Mutex::new(DirWatcherState {
+                    subtree,
+                    requests: VecDeque::new(),
+                    pending_changes: VecDeque::new(),
+                    overflow: false,
+                    notify_event,
+                }),
+                closed: AtomicBool::new(false),
+                wake_w: Mutex::new(Some(wake_w)),
+            });
+
+            let w_thread = Arc::clone(&watcher);
+            let initial_fds: Vec<i32> = watched_by_path.values().map(|&(fd, _, _)| fd).collect();
+            let spawn_res = std::thread::Builder::new()
+                .name("win32-dir-watch".into())
+                .spawn(move || {
+                    dir_watch_kqueue_loop(
+                        w_thread,
+                        kq,
+                        wake_r,
+                        root,
+                        initial_snap,
+                        watched_by_path,
+                        path_by_fd,
+                        vnode_budget,
+                        initial_needs_rescan,
+                    );
+                });
+            if let Err(e) = spawn_res {
+                for fd in initial_fds {
+                    unsafe { libc::close(fd) };
+                }
+                unsafe {
+                    libc::close(kq);
+                    libc::close(wake_r);
+                    libc::close(wake_w);
+                }
+                *watcher.wake_w.lock().unwrap() = None;
+                return Err(io_err(&e));
+            }
+            Ok(watcher)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (root, subtree, notify_event);
+            Err(err::ERROR_NOT_SUPPORTED)
+        }
+    }
+}
+
+impl Drop for DirWatcher {
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(fd) = self.wake_w.lock().unwrap().take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn effective_vnode_fd_budget(max_budget: usize) -> usize {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 || rl.rlim_cur == libc::RLIM_INFINITY {
+        return max_budget;
+    }
+    let soft = usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX);
+    // Keep at least half of RLIMIT_NOFILE (and DIR_WATCH_FD_HEADROOM when soft allows) free
+    // so snapshot_dir() and other process descriptors are never starved.
+    let safe_cap = (soft / 2).min(soft.saturating_sub(DIR_WATCH_FD_HEADROOM).max(1));
+    max_budget.min(safe_cap.max(1))
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_vnode_evtonly(path: &Path) -> Result<i32, i32> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe { libc::open(c.as_ptr(), DARWIN_O_EVTONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        Err(last_errno())
+    } else {
+        Ok(fd)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn register_vnode_kevent(kq: i32, fd: i32) -> bool {
+    let ev = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+        fflags: libc::NOTE_WRITE
+            | libc::NOTE_DELETE
+            | libc::NOTE_EXTEND
+            | libc::NOTE_ATTRIB
+            | libc::NOTE_LINK
+            | libc::NOTE_RENAME
+            | libc::NOTE_REVOKE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) >= 0 }
+}
+
+/// Synchronize kqueue `EVFILT_VNODE` descriptors against `root` and `snap`, prioritizing
+/// directories before files within `*vnode_budget` (bounded by `MAX_WATCHED_VNODE_FDS` and
+/// process `RLIMIT_NOFILE` headroom). On `EMFILE`/`ENFILE`, releases a small slice of
+/// non-root file descriptors and reduces `*vnode_budget` persistently to prevent FD starvation
+/// or open/close churn. Returns `true` when root or any snapshotted entry lacks an active
+/// registered vnode fd, signaling that periodic rescan is needed.
+#[cfg(target_vendor = "apple")]
+fn sync_kqueue_vnodes(
+    kq: i32,
+    root: &Path,
+    snap: &BTreeMap<String, DirSnapEntry>,
+    watched_by_path: &mut HashMap<String, (i32, u64, u64)>,
+    path_by_fd: &mut HashMap<i32, String>,
+    vnode_budget: &mut usize,
+) -> bool {
+    let limit = (*vnode_budget).min(effective_vnode_fd_budget(MAX_WATCHED_VNODE_FDS));
+    let mut desired: Vec<(String, u64, u64)> = Vec::new();
+    if let Ok(rm) = std::fs::symlink_metadata(root) {
+        desired.push((String::new(), rm.dev(), rm.ino()));
+    }
+    // Prioritize directories first so subtree watching covers subdirectories within the
+    // bounded fd budget, then add files up to `limit`.
+    for (rel, ent) in snap {
+        if ent.is_dir {
+            if desired.len() >= limit {
+                break;
+            }
+            desired.push((rel.clone(), ent.dev, ent.ino));
+        }
+    }
+    for (rel, ent) in snap {
+        if !ent.is_dir {
+            if desired.len() >= limit {
+                break;
+            }
+            desired.push((rel.clone(), ent.dev, ent.ino));
+        }
+    }
+    let desired_map: HashMap<String, (u64, u64)> = desired.iter().map(|(p, d, i)| (p.clone(), (*d, *i))).collect();
+
+    // Close removed or replaced (different inode) vnode fds.
+    let stale: Vec<String> = watched_by_path
+        .iter()
+        .filter_map(|(p, &(_fd, dev, ino))| match desired_map.get(p) {
+            Some(&(d, i)) if d == dev && i == ino => None,
+            _ => Some(p.clone()),
+        })
+        .collect();
+    for p in stale {
+        if let Some((fd, _, _)) = watched_by_path.remove(&p) {
+            path_by_fd.remove(&fd);
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // Open and register new vnode fds.
+    let mut hit_fd_limit = false;
+    for (rel, dev, ino) in desired {
+        if watched_by_path.contains_key(&rel) {
+            continue;
+        }
+        let full = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel.replace('\\', "/"))
+        };
+        match open_vnode_evtonly(&full) {
+            Ok(fd) => {
+                if register_vnode_kevent(kq, fd) {
+                    watched_by_path.insert(rel.clone(), (fd, dev, ino));
+                    path_by_fd.insert(fd, rel);
+                } else {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            Err(libc::EMFILE | libc::ENFILE) => {
+                hit_fd_limit = true;
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+
+    if hit_fd_limit {
+        // Release a small slice of non-root file descriptors first (preserving root & dirs)
+        // and clamp this watcher's budget so subsequent rescans do not thrash descriptors.
+        let mut to_release: Vec<String> = watched_by_path
+            .keys()
+            .filter(|k| !k.is_empty() && !snap.get(*k).is_some_and(|e| e.is_dir))
+            .cloned()
+            .collect();
+        to_release.sort();
+        for p in to_release.into_iter().rev().take(DIR_WATCH_EMFILE_BACKOFF_FDS) {
+            if let Some((fd, _, _)) = watched_by_path.remove(&p) {
+                path_by_fd.remove(&fd);
+                unsafe { libc::close(fd) };
+            }
+        }
+        *vnode_budget = watched_by_path.len().max(1);
+    }
+
+    // `watched_by_path` keys are a subset of `{""} U snap.keys()`; full coverage holds iff
+    // root (`""`) and every snapshotted entry have an active registered descriptor.
+    watched_by_path.len() < snap.len() + 1 || !watched_by_path.contains_key("")
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+fn dir_watch_kqueue_loop(
+    watcher: Arc<DirWatcher>,
+    kq: i32,
+    wake_r: i32,
+    root: PathBuf,
+    mut prev_snap: BTreeMap<String, DirSnapEntry>,
+    mut watched_by_path: HashMap<String, (i32, u64, u64)>,
+    mut path_by_fd: HashMap<i32, String>,
+    mut vnode_budget: usize,
+    mut needs_rescan: bool,
+) {
+    let mut cur_subtree = watcher.state.lock().unwrap().subtree;
+    let mut events = [unsafe { std::mem::zeroed::<libc::kevent>() }; 64];
+    let mut next_rescan: Option<Instant> =
+        needs_rescan.then(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
+
+    loop {
+        if watcher.closed.load(Ordering::Acquire) {
+            break;
+        }
+        let mut ts_storage = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let ts_ptr = if let Some(dl) = next_rescan {
+            let rem = dl.saturating_duration_since(Instant::now());
+            ts_storage.tv_sec = rem.as_secs() as libc::time_t;
+            ts_storage.tv_nsec = rem.subsec_nanos() as libc::c_long;
+            &ts_storage as *const libc::timespec
+        } else {
+            std::ptr::null()
+        };
+        let n = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                ts_ptr,
+            )
+        };
+        if n < 0 {
+            if last_errno() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+        if watcher.closed.load(Ordering::Acquire) {
+            break;
+        }
+
+        let mut woke_by_pipe = false;
+        let mut saw_vnode = false;
+        let mut vnode_written: HashSet<String> = HashSet::new();
+        let mut vnode_attrib: HashSet<String> = HashSet::new();
+
+        let mut record_events = |evs: &[libc::kevent]| {
+            for ev in evs {
+                if ev.filter == libc::EVFILT_READ && ev.ident == wake_r as usize {
+                    woke_by_pipe = true;
+                } else if ev.filter == libc::EVFILT_VNODE {
+                    saw_vnode = true;
+                    let fd = ev.ident as i32;
+                    if let Some(rel) = path_by_fd.get(&fd) {
+                        if !rel.is_empty() {
+                            if (ev.fflags & (libc::NOTE_WRITE | libc::NOTE_EXTEND)) != 0 {
+                                vnode_written.insert(rel.clone());
+                            }
+                            if (ev.fflags & (libc::NOTE_ATTRIB | libc::NOTE_LINK)) != 0 {
+                                vnode_attrib.insert(rel.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if n > 0 {
+            record_events(&events[..n as usize]);
+
+            // Drain any immediately queued events (e.g. rename firing both NOTE_RENAME on file and NOTE_WRITE on dir).
+            let zero_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            for _ in 0..8 {
+                let more = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, &zero_ts) };
+                if more <= 0 {
+                    break;
+                }
+                record_events(&events[..more as usize]);
+            }
+        }
+
+        if woke_by_pipe {
+            let mut drain = [0u8; 64];
+            while unsafe { libc::read(wake_r, drain.as_mut_ptr() as *mut c_void, drain.len()) } > 0 {}
+        }
+
+        if watcher.closed.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Handle subtree promotion if a subsequent ReadDirectoryChangesW enabled subtree watching.
+        let want_subtree = watcher.state.lock().unwrap().subtree;
+        if want_subtree && !cur_subtree {
+            cur_subtree = true;
+            if let Ok(snap) = snapshot_dir(&root, true) {
+                prev_snap = snap;
+                needs_rescan = sync_kqueue_vnodes(
+                    kq,
+                    &root,
+                    &prev_snap,
+                    &mut watched_by_path,
+                    &mut path_by_fd,
+                    &mut vnode_budget,
+                );
+            } else {
+                needs_rescan = true;
+            }
+            next_rescan = if needs_rescan {
+                Some(next_rescan.unwrap_or_else(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL))
+            } else {
+                None
+            };
+        }
+
+        let rescan_due = next_rescan.is_some_and(|dl| Instant::now() >= dl);
+        if saw_vnode || rescan_due {
+            let new_snap = match snapshot_dir(&root, cur_subtree) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    if e == libc::EMFILE || e == libc::ENFILE {
+                        vnode_budget = watched_by_path
+                            .len()
+                            .saturating_sub(DIR_WATCH_EMFILE_BACKOFF_FDS)
+                            .max(1);
+                        let _ = sync_kqueue_vnodes(
+                            kq,
+                            &root,
+                            &prev_snap,
+                            &mut watched_by_path,
+                            &mut path_by_fd,
+                            &mut vnode_budget,
+                        );
+                    }
+                    next_rescan = Some(Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
+                    continue;
+                }
+            };
+            let changes = diff_dir_snapshots(&prev_snap, &new_snap, &vnode_written, &vnode_attrib);
+            prev_snap = new_snap;
+            // Register new vnodes BEFORE completing any request so subsequent watches never miss mutations.
+            needs_rescan = sync_kqueue_vnodes(
+                kq,
+                &root,
+                &prev_snap,
+                &mut watched_by_path,
+                &mut path_by_fd,
+                &mut vnode_budget,
+            );
+            next_rescan = needs_rescan.then(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
+
+            if !changes.is_empty() {
+                let mut to_complete: Vec<(Arc<DirWatchRequest>, usize, usize)> = Vec::new();
+                let mut signal_event: Option<Arc<Event>> = None;
+                {
+                    let mut st = watcher.state.lock().unwrap();
+                    if let Some((ref ev, nfilter)) = st.notify_event {
+                        if changes.iter().any(|c| (c.filter_mask & nfilter) != 0) {
+                            signal_event = Some(Arc::clone(ev));
+                        }
+                    }
+                    // Queue changes and attempt to satisfy the front waiting request.
+                    for c in changes {
+                        if st.pending_changes.len() < MAX_PENDING_DIR_CHANGES {
+                            st.pending_changes.push_back(c);
+                        } else {
+                            st.overflow = true;
+                        }
+                    }
+                    while let Some(req) = st.requests.front().cloned() {
+                        if req.completed.load(Ordering::Acquire) {
+                            st.requests.pop_front();
+                            continue;
+                        }
+                        if st.overflow {
+                            st.overflow = false;
+                            st.pending_changes.clear();
+                            st.requests.pop_front();
+                            to_complete.push((req, STATUS_NOTIFY_ENUM_DIR, 0));
+                            continue;
+                        }
+                        let matching: Vec<DirChange> = st
+                            .pending_changes
+                            .iter()
+                            .filter(|c| (c.filter_mask & req.filter) != 0)
+                            .cloned()
+                            .collect();
+                        if matching.is_empty() {
+                            // Discard non-matching changes only if no other request needs them.
+                            if st.requests.len() == 1 {
+                                st.pending_changes.clear();
+                            }
+                            break;
+                        }
+                        st.pending_changes.clear();
+                        st.requests.pop_front();
+                        let res = unsafe { write_notify_buffer(req.buf as *mut u8, req.len, &matching) };
+                        match res {
+                            Ok(bytes) => to_complete.push((req, STATUS_SUCCESS, bytes)),
+                            Err(()) => to_complete.push((req, STATUS_NOTIFY_ENUM_DIR, 0)),
+                        }
+                    }
+                }
+                if let Some(ev) = signal_event {
+                    ev.set();
+                }
+                for (req, status, bytes) in to_complete {
+                    req.finish_once(status, bytes);
+                }
+            }
+        }
+    }
+
+    // Cleanup all fds on exit.
+    for (_, (fd, _, _)) in watched_by_path {
+        unsafe { libc::close(fd) };
+    }
+    unsafe {
+        libc::close(kq);
+        libc::close(wake_r);
+    }
+}
+
+pub unsafe extern "win64" fn ReadDirectoryChangesW(
+    h: HANDLE,
+    buf: *mut c_void,
+    len: u32,
+    subtree: BOOL,
+    filter: u32,
+    ret: *mut u32,
+    ov: *mut OVERLAPPED,
+    cb: *const c_void,
+) -> BOOL {
+    if !ret.is_null() {
+        std::ptr::write_unaligned(ret, 0);
+    }
+    if buf.is_null() || len < 12 || filter == 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if f.kind != FileKind::Dir {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(root) = f.host_path.clone() else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+
+    let watcher = {
+        let mut wg = f.dir_watcher.lock().unwrap();
+        if let Some(existing) = wg.as_ref() {
+            let w = Arc::clone(existing);
+            if subtree != 0 {
+                let mut st = w.state.lock().unwrap();
+                if !st.subtree {
+                    st.subtree = true;
+                    drop(st);
+                    w.poke();
+                }
+            }
+            w
+        } else {
+            match DirWatcher::start(root, subtree != 0, None) {
+                Ok(w) => {
+                    *wg = Some(Arc::clone(&w));
+                    w
+                }
+                Err(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            }
+        }
+    };
+
+    let tid = teb::thread_id();
+    // Atomically check buffered changes and, if none match, enqueue the request under a single
+    // `watcher.state` lock acquisition so kqueue events arriving concurrently cannot be stranded
+    // in `pending_changes`. Prepare pending OVERLAPPED state BEFORE enqueuing so the watcher
+    // thread can safely complete immediately after we drop the lock, and release the lock BEFORE
+    // delivering any completion notification.
+    let consume_buffered = |st: &mut DirWatcherState| -> Option<(usize, usize)> {
+        while st.requests.front().is_some_and(|r| r.completed.load(Ordering::Acquire)) {
+            st.requests.pop_front();
+        }
+        if !st.requests.is_empty() {
+            return None;
+        }
+        if st.overflow {
+            st.overflow = false;
+            st.pending_changes.clear();
+            Some((STATUS_NOTIFY_ENUM_DIR, 0))
+        } else if !st.pending_changes.is_empty() {
+            let matching: Vec<DirChange> = st
+                .pending_changes
+                .drain(..)
+                .filter(|c| (c.filter_mask & filter) != 0)
+                .collect();
+            if matching.is_empty() {
+                None
+            } else {
+                match write_notify_buffer(buf as *mut u8, len as usize, &matching) {
+                    Ok(bytes) => Some((STATUS_SUCCESS, bytes)),
+                    Err(()) => Some((STATUS_NOTIFY_ENUM_DIR, 0)),
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    if ov.is_null() {
+        let done = Arc::new((Mutex::new(None), Condvar::new()));
+        let req = Arc::new(DirWatchRequest {
+            handle: h as usize,
+            buf: buf as usize,
+            len: len as usize,
+            filter,
+            completed: AtomicBool::new(false),
+            delivery: DirWatchDelivery::Sync { done: Arc::clone(&done), tid },
+        });
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            if !ret.is_null() {
+                std::ptr::write_unaligned(ret, bytes as u32);
+            }
+            if status == STATUS_SUCCESS {
+                set_err(0);
+                return TRUE;
+            }
+            set_err(ntstatus_to_win32_local(status));
+            return FALSE;
+        }
+        // Drop `Arc<FileObj>` before blocking so `CloseHandle(h)` can drop & cancel cleanly.
+        drop(f);
+        let (m, cv) = &*done;
+        let mut g = m.lock().unwrap();
+        let (status, bytes) = loop {
+            if let Some(res) = *g {
+                break res;
+            }
+            g = cv.wait(g).unwrap();
+        };
+        if !ret.is_null() {
+            std::ptr::write_unaligned(ret, bytes);
+        }
+        if status == STATUS_SUCCESS {
+            set_err(0);
+            TRUE
+        } else {
+            set_err(ntstatus_to_win32_local(status));
+            FALSE
+        }
+    } else if !cb.is_null() {
+        let caller = crate::thread::ensure_current_thread_object();
+        let cb_fn: crate::thread::IoCompletionRoutine = std::mem::transmute(cb);
+        // APC delivery mode: do NOT touch `ov.h_event` or post to IOCP/TpIo.
+        // Publish STATUS_PENDING before `req` can be observed by the watcher thread.
+        store_ov_internal_high(ov, 0);
+        store_ov_internal(ov, STATUS_PENDING);
+        let req = Arc::new(DirWatchRequest {
+            handle: h as usize,
+            buf: buf as usize,
+            len: len as usize,
+            filter,
+            completed: AtomicBool::new(false),
+            delivery: DirWatchDelivery::Apc {
+                ov: ov as usize,
+                cb: cb_fn,
+                thread: Arc::clone(&caller),
+                tid,
+            },
+        });
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            store_ov_internal_high(ov, bytes);
+            store_ov_internal(ov, status);
+            crate::thread::queue_io_completion_apc(&caller, cb_fn, ntstatus_to_win32_local(status), bytes as u32, ov as usize);
+        }
+        set_err(0);
+        TRUE
+    } else {
+        // Publish pending state before `req` can be observed by the watcher thread.
+        f.completion.io_event.reset();
+        prepare_overlapped_pending(ov);
+        let req = Arc::new(DirWatchRequest {
+            handle: h as usize,
+            buf: buf as usize,
+            len: len as usize,
+            filter,
+            completed: AtomicBool::new(false),
+            delivery: DirWatchDelivery::Overlapped {
+                ov: ov as usize,
+                tid,
+                binding: Arc::clone(&f.completion),
+            },
+        });
+        let immediate = {
+            let mut st = watcher.state.lock().unwrap();
+            if let Some(res) = consume_buffered(&mut st) {
+                Some(res)
+            } else {
+                st.requests.push_back(req);
+                None
+            }
+        };
+        if let Some((status, bytes)) = immediate {
+            let _ = complete_overlapped_binding(Some(&f.completion), ov, status, bytes, false);
+        }
+        // Windows `ReadDirectoryChangesW` returns non-zero (TRUE) for async overlapped start!
+        set_err(0);
+        TRUE
+    }
+}
+
+struct ChangeNotifObj {
+    event: Arc<Event>,
+    watcher: Arc<DirWatcher>,
+}
+
+impl Drop for ChangeNotifObj {
+    fn drop(&mut self) {
+        self.watcher.shutdown();
+    }
+}
+
+impl KObject for ChangeNotifObj {
+    fn type_name(&self) -> &'static str {
+        "ChangeNotification"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn waitable(&self) -> Option<&dyn handles::Waitable> {
+        Some(&*self.event)
+    }
+}
+
+pub unsafe extern "win64" fn FindFirstChangeNotificationW(p: LPCWSTR, sub: BOOL, filter: u32) -> HANDLE {
+    if p.is_null() || filter == 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    let win = path::absolute(&from_wide(p));
+    let host = match host_path(&win) {
+        Ok(h) => h,
+        Err(e) => {
+            set_err(e);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+    if !host.is_dir() {
+        set_err(not_found_err(&host));
+        return INVALID_HANDLE_VALUE;
+    }
+    let ev = Arc::new(Event::new(true, false, None));
+    let watcher = match DirWatcher::start(host, sub != 0, Some((Arc::clone(&ev), filter))) {
+        Ok(w) => w,
+        Err(e) => {
+            set_err(e);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+    handles::insert(Arc::new(ChangeNotifObj { event: ev, watcher }))
 }
 
 pub unsafe extern "win64" fn FindFirstChangeNotificationA(p: LPCSTR, sub: BOOL, f: u32) -> HANDLE {
+    if p.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
     let w = to_wide_z(&from_ansi(p));
     FindFirstChangeNotificationW(w.as_ptr(), sub, f)
 }
 
 pub unsafe extern "win64" fn FindNextChangeNotification(h: HANDLE) -> BOOL {
-    crate::kernel32::threads::ResetEvent(h)
-}
-
-pub unsafe extern "win64" fn FindCloseChangeNotification(h: HANDLE) -> BOOL {
-    handles::close(h) as BOOL
-}
-
-// ---------------------------------------------------------------------------
-// Pipes (Anonymous & Named Pipes for CLI / Subprocess / IPC)
-// ---------------------------------------------------------------------------
-
-pub unsafe extern "win64" fn CreatePipe(rd: *mut HANDLE, wr: *mut HANDLE, _sec: *mut c_void, _size: u32) -> BOOL {
-    let mut fds = [0i32; 2];
-    if libc::pipe(fds.as_mut_ptr()) != 0 {
-        set_err(errno_to_win32(last_errno()));
+    let Some(obj) = handles::get_as::<ChangeNotifObj>(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
-    }
-    let r = FileObj::new(File::from_raw_fd(fds[0]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_READ, 0);
-    let w = FileObj::new(File::from_raw_fd(fds[1]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_WRITE, 0);
-    *rd = handles::insert(Arc::new(r));
-    *wr = handles::insert(Arc::new(w));
+    };
+    obj.watcher.state.lock().unwrap().pending_changes.clear();
+    obj.event.reset();
     TRUE
 }
 
-pub unsafe extern "win64" fn PeekNamedPipe(h: HANDLE, buf: *mut c_void, size: u32, read: *mut u32, avail: *mut u32, left: *mut u32) -> BOOL {
+pub unsafe extern "win64" fn FindCloseChangeNotification(h: HANDLE) -> BOOL {
+    if handles::get_as::<ChangeNotifObj>(h).is_some() && handles::close(h) {
+        TRUE
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipes (Anonymous & Named Pipes + Event-Driven Async Overlapped Pipe Reactor)
+// ---------------------------------------------------------------------------
+
+enum PipeOpKind {
+    Read,
+    Write,
+    /// Non-polled FIFO placeholder held by an active or waiting synchronous `WriteFile`
+    /// so neither earlier async writes are bypassed nor later async writes leapfrog it.
+    SyncWriteBarrier,
+}
+
+enum PipeDelivery {
+    Overlapped {
+        ov: usize,
+        tid: u32,
+    },
+    Apc {
+        ov: usize,
+        cb: Option<crate::thread::IoCompletionRoutine>,
+        thread: Arc<ThreadObj>,
+        tid: u32,
+    },
+    SyncBarrier,
+}
+
+enum AsyncPipeWriteOutcome {
+    Completed(usize),
+    Pending,
+    Error(u32),
+}
+
+struct SyncPipeWriteGuard {
+    reactor: &'static PipeIoReactor,
+    op: Arc<PendingPipeOp>,
+}
+
+impl Drop for SyncPipeWriteGuard {
+    fn drop(&mut self) {
+        self.op.done.store(true, Ordering::Release);
+        {
+            let mut st = self.reactor.state.lock().unwrap();
+            st.ops.retain(|o| !Arc::ptr_eq(o, &self.op));
+            self.reactor.gen_cv.notify_all();
+        }
+        self.reactor.poke();
+    }
+}
+
+/// True when `op` targets the same logical pipe write stream as `(file, conn)`:
+/// - Named-pipe server connections match by shared `Arc<PipeConn>` (so duplicated handles share
+///   one write queue while distinct reconnect generations remain isolated).
+/// - Direct pipes (anonymous pipes and named-pipe clients) match by shared `Arc<FileObj>`.
+fn same_pipe_write_stream(
+    op: &PendingPipeOp,
+    file: &Arc<FileObj>,
+    conn: Option<&Arc<PipeConn>>,
+) -> bool {
+    match (op.conn.as_ref(), conn) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => Arc::ptr_eq(&op.file, file),
+        _ => false,
+    }
+}
+
+fn has_prior_pipe_write(
+    ops: &[Arc<PendingPipeOp>],
+    file: &Arc<FileObj>,
+    conn: Option<&Arc<PipeConn>>,
+) -> bool {
+    ops.iter().any(|op| {
+        matches!(op.kind, PipeOpKind::Write | PipeOpKind::SyncWriteBarrier)
+            && !op.done.load(Ordering::Acquire)
+            && same_pipe_write_stream(op, file, conn)
+    })
+}
+
+struct PipeOpState {
+    completed: bool,
+    written: usize,
+}
+
+/// Stable shared connection identity and fd owner for a single named-pipe server session.
+struct PipeConn {
+    file: File,
+    disconnected: AtomicBool,
+}
+
+impl PipeConn {
+    fn new(file: File) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            disconnected: AtomicBool::new(false),
+        })
+    }
+
+    fn fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    fn mark_disconnected(&self) {
+        if !self.disconnected.swap(true, Ordering::AcqRel) {
+            unsafe {
+                let _ = libc::shutdown(self.file.as_raw_fd(), libc::SHUT_RDWR);
+            }
+        }
+    }
+}
+
+enum PipeIoTarget {
+    Direct(i32),
+    ServerConn(Arc<PipeConn>),
+}
+
+impl PipeIoTarget {
+    fn fd(&self) -> i32 {
+        match self {
+            PipeIoTarget::Direct(fd) => *fd,
+            PipeIoTarget::ServerConn(c) => c.fd(),
+        }
+    }
+
+    fn conn(&self) -> Option<Arc<PipeConn>> {
+        match self {
+            PipeIoTarget::Direct(_) => None,
+            PipeIoTarget::ServerConn(c) => Some(Arc::clone(c)),
+        }
+    }
+}
+
+struct PendingPipeOp {
+    handle: usize,
+    file: Arc<FileObj>,
+    /// Shared named-pipe server connection when operating on a server pipe handle.
+    /// Retains the connection's `File` lifetime across in-flight reactor steps and lets
+    /// `DisconnectNamedPipe` cancel every op on the connection across duplicated handles.
+    conn: Option<Arc<PipeConn>>,
+    fd: i32,
+    kind: PipeOpKind,
+    buf: usize,
+    len: usize,
+    /// Serializes reactor guest-buffer I/O with cancellation (`CancelIo`/`CancelIoEx`/`CloseHandle`/`DisconnectNamedPipe`)
+    /// so completion is published only after no reactor step can touch guest memory again.
+    state: Mutex<PipeOpState>,
+    /// Lock-free mirror of `state.completed` for `reactor.ops.retain` without nesting locks.
+    done: AtomicBool,
+    delivery: PipeDelivery,
+}
+
+impl PendingPipeOp {
+    fn new_read(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+        buf: usize,
+        len: usize,
+        delivery: PipeDelivery,
+    ) -> Arc<Self> {
+        Arc::new(PendingPipeOp {
+            handle: handle as usize,
+            file,
+            conn,
+            fd,
+            kind: PipeOpKind::Read,
+            buf,
+            len,
+            state: Mutex::new(PipeOpState { completed: false, written: 0 }),
+            done: AtomicBool::new(false),
+            delivery,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_write_at(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+        buf: usize,
+        len: usize,
+        written: usize,
+        delivery: PipeDelivery,
+    ) -> Arc<Self> {
+        Arc::new(PendingPipeOp {
+            handle: handle as usize,
+            file,
+            conn,
+            fd,
+            kind: PipeOpKind::Write,
+            buf,
+            len,
+            state: Mutex::new(PipeOpState { completed: false, written }),
+            done: AtomicBool::new(false),
+            delivery,
+        })
+    }
+
+    fn new_sync_write_barrier(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+    ) -> Arc<Self> {
+        Arc::new(PendingPipeOp {
+            handle: handle as usize,
+            file,
+            conn,
+            fd,
+            kind: PipeOpKind::SyncWriteBarrier,
+            buf: 0,
+            len: 0,
+            state: Mutex::new(PipeOpState { completed: false, written: 0 }),
+            done: AtomicBool::new(false),
+            delivery: PipeDelivery::SyncBarrier,
+        })
+    }
+
+    fn tid(&self) -> u32 {
+        match &self.delivery {
+            PipeDelivery::Overlapped { tid, .. } | PipeDelivery::Apc { tid, .. } => *tid,
+            PipeDelivery::SyncBarrier => 0,
+        }
+    }
+
+    fn ov_addr(&self) -> usize {
+        match &self.delivery {
+            PipeDelivery::Overlapped { ov, .. } | PipeDelivery::Apc { ov, .. } => *ov,
+            PipeDelivery::SyncBarrier => 0,
+        }
+    }
+
+    /// Publish terminal status and notification. Must only be called by the single thread
+    /// that transitioned `self.state.completed` from `false` to `true`, AFTER releasing `self.state`.
+    fn publish_completion(&self, nt_status: usize, bytes: usize) {
+        match &self.delivery {
+            PipeDelivery::Overlapped { ov, .. } => unsafe {
+                let _ = complete_overlapped_binding(
+                    Some(&self.file.completion),
+                    *ov as *mut OVERLAPPED,
+                    nt_status,
+                    bytes,
+                    false,
+                );
+            },
+            PipeDelivery::Apc { ov, cb, thread, .. } => unsafe {
+                let ov_ptr = *ov as *mut OVERLAPPED;
+                store_ov_internal_high(ov_ptr, bytes);
+                store_ov_internal(ov_ptr, nt_status);
+                if let Some(func) = *cb {
+                    let win_err = ntstatus_to_win32_local(nt_status);
+                    crate::thread::queue_io_completion_apc(thread, func, win_err, bytes as u32, *ov);
+                }
+            },
+            PipeDelivery::SyncBarrier => {}
+        }
+    }
+}
+
+struct PipeReactorState {
+    ops: Vec<Arc<PendingPipeOp>>,
+    poll_gen: u64,
+}
+
+struct PipeIoReactor {
+    state: Mutex<PipeReactorState>,
+    gen_cv: Condvar,
+    wake_w: i32,
+}
+
+impl PipeIoReactor {
+    fn poke(&self) {
+        let b = 1u8;
+        unsafe {
+            let _ = libc::write(self.wake_w, &b as *const u8 as *const c_void, 1);
+        }
+    }
+
+    /// Atomically admit an overlapped `WriteFile` or `WriteFileEx` on a pipe under `self.state`:
+    /// - If an earlier write on the same pipe/connection is still queued or active, enqueue
+    ///   strictly behind it without touching the fd.
+    /// - Otherwise attempt a nonblocking write loop while holding `self.state` so no concurrent
+    ///   writer can interleave bytes; if `EAGAIN` occurs, enqueue the remainder in FIFO order.
+    /// All completion notifications happen strictly outside `self.state` in the caller.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn admit_async_write(
+        &self,
+        handle: HANDLE,
+        file: &Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+        buf: *const u8,
+        total: usize,
+        ov: *mut OVERLAPPED,
+        delivery: PipeDelivery,
+    ) -> AsyncPipeWriteOutcome {
+        let mut st = self.state.lock().unwrap();
+        if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+            return AsyncPipeWriteOutcome::Error(err::ERROR_BROKEN_PIPE);
+        }
+        let mut written_so_far = 0usize;
+        if !has_prior_pipe_write(&st.ops, file, conn.as_ref()) {
+            while written_so_far < total {
+                match try_nonblocking_pipe_write(fd, buf.add(written_so_far), total - written_so_far) {
+                    Ok(Some(0)) => {
+                        return AsyncPipeWriteOutcome::Error(err::ERROR_BROKEN_PIPE);
+                    }
+                    Ok(Some(k)) => {
+                        written_so_far += k;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return AsyncPipeWriteOutcome::Error(if e == libc::EPIPE || e == libc::ECONNRESET {
+                            err::ERROR_BROKEN_PIPE
+                        } else {
+                            errno_to_win32(e)
+                        });
+                    }
+                }
+            }
+            if written_so_far >= total {
+                return AsyncPipeWriteOutcome::Completed(written_so_far);
+            }
+        }
+        match &delivery {
+            PipeDelivery::Overlapped { .. } => {
+                file.completion.io_event.reset();
+                prepare_overlapped_pending(ov);
+            }
+            PipeDelivery::Apc { .. } => {
+                store_ov_internal_high(ov, 0);
+                store_ov_internal(ov, STATUS_PENDING);
+            }
+            PipeDelivery::SyncBarrier => {}
+        }
+        st.ops.push(PendingPipeOp::new_write_at(
+            handle,
+            Arc::clone(file),
+            conn,
+            fd,
+            buf as usize,
+            total,
+            written_so_far,
+            delivery,
+        ));
+        drop(st);
+        self.poke();
+        AsyncPipeWriteOutcome::Pending
+    }
+
+    /// Enqueue a non-polled FIFO write barrier for a synchronous `WriteFile` and wait (releasing
+    /// `self.state` while waiting and before any blocking `write`/`poll`) until all earlier writes
+    /// on the same pipe/connection finish or are cancelled.
+    fn acquire_sync_write_turn(
+        &'static self,
+        handle: HANDLE,
+        file: &Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+    ) -> Result<SyncPipeWriteGuard, u32> {
+        let barrier = PendingPipeOp::new_sync_write_barrier(handle, Arc::clone(file), conn.clone(), fd);
+        let mut st = self.state.lock().unwrap();
+        if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+            return Err(err::ERROR_BROKEN_PIPE);
+        }
+        st.ops.push(Arc::clone(&barrier));
+        let guard = SyncPipeWriteGuard { reactor: self, op: Arc::clone(&barrier) };
+        loop {
+            if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                drop(st);
+                return Err(err::ERROR_BROKEN_PIPE);
+            }
+            let prior = match st.ops.iter().position(|o| Arc::ptr_eq(o, &barrier)) {
+                Some(idx) => has_prior_pipe_write(&st.ops[..idx], file, conn.as_ref()),
+                None => false,
+            };
+            if !prior {
+                break;
+            }
+            st = self.gen_cv.wait(st).unwrap();
+        }
+        drop(st);
+        Ok(guard)
+    }
+
+    fn submit(&self, op: Arc<PendingPipeOp>) {
+        let already_disconnected = {
+            let mut st = self.state.lock().unwrap();
+            if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                true
+            } else {
+                st.ops.push(Arc::clone(&op));
+                false
+            }
+        };
+        if already_disconnected {
+            let should_publish = {
+                let mut ost = op.state.lock().unwrap();
+                if ost.completed {
+                    false
+                } else {
+                    ost.completed = true;
+                    op.done.store(true, Ordering::Release);
+                    true
+                }
+            };
+            if should_publish {
+                op.publish_completion(STATUS_CANCELLED, 0);
+            }
+        } else {
+            self.poke();
+        }
+    }
+
+    /// Two-phase synchronized cancellation:
+    /// 1. Keep `to_cancel` in `self.state.ops` while acquiring each `op.state` so any in-flight
+    ///    reactor step on `op` finishes before a successor write can advance.
+    /// 2. Remove the now-completed ops from `self.state.ops` (preserving FIFO order) and notify
+    ///    `gen_cv` for any waiting synchronous writers.
+    /// 3. Publish `STATUS_CANCELLED` strictly outside both `self.state` and `op.state`.
+    fn finalize_cancelled_ops(&self, to_cancel: Vec<Arc<PendingPipeOp>>) -> usize {
+        if to_cancel.is_empty() {
+            return 0;
+        }
+        let mut publish = Vec::with_capacity(to_cancel.len());
+        for op in &to_cancel {
+            let should_publish = {
+                let mut ost = op.state.lock().unwrap();
+                if ost.completed {
+                    false
+                } else {
+                    ost.completed = true;
+                    op.done.store(true, Ordering::Release);
+                    true
+                }
+            };
+            if should_publish {
+                publish.push(Arc::clone(op));
+            }
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.ops.retain(|o| !to_cancel.iter().any(|c| Arc::ptr_eq(o, c)));
+            self.gen_cv.notify_all();
+        }
+        let count = publish.len();
+        for op in publish {
+            op.publish_completion(STATUS_CANCELLED, 0);
+        }
+        count
+    }
+
+    fn cancel_ops(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
+        let to_cancel: Vec<Arc<PendingPipeOp>> = {
+            let st = self.state.lock().unwrap();
+            st.ops
+                .iter()
+                .filter(|o| {
+                    !matches!(o.kind, PipeOpKind::SyncWriteBarrier)
+                        && o.handle == handle
+                        && ov.map_or(true, |target| o.ov_addr() == target)
+                        && filter_tid.map_or(true, |t| o.tid() == t)
+                })
+                .cloned()
+                .collect()
+        };
+        let count = self.finalize_cancelled_ops(to_cancel);
+        if count > 0 {
+            self.poke();
+        }
+        count
+    }
+
+    /// Cancel and synchronize every pending or in-flight operation bound to `conn`
+    /// across all duplicated numeric handles, wake any synchronous writers waiting on `conn`,
+    /// then wait one reactor cycle so any reactor snapshot drops its `Arc<PipeConn>` promptly.
+    fn cancel_ops_for_conn(&self, conn: &Arc<PipeConn>) -> usize {
+        let to_cancel: Vec<Arc<PendingPipeOp>> = {
+            let st = self.state.lock().unwrap();
+            self.gen_cv.notify_all();
+            st.ops
+                .iter()
+                .filter(|o| {
+                    !matches!(o.kind, PipeOpKind::SyncWriteBarrier)
+                        && o.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn))
+                })
+                .cloned()
+                .collect()
+        };
+        let count = self.finalize_cancelled_ops(to_cancel);
+        let gen_before = {
+            let st = self.state.lock().unwrap();
+            st.poll_gen
+        };
+        self.poke();
+        let mut st = self.state.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while st.poll_gen == gen_before {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let (next, res) = self.gen_cv.wait_timeout(st, rem).unwrap();
+            st = next;
+            if res.timed_out() {
+                break;
+            }
+        }
+        count
+    }
+}
+
+fn pipe_reactor() -> &'static PipeIoReactor {
+    static R: OnceLock<&'static PipeIoReactor> = OnceLock::new();
+    R.get_or_init(|| {
+        let mut wake = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(wake.as_mut_ptr()) }, 0, "pipe reactor wakeup pipe");
+        for &fd in &wake {
+            set_cloexec(fd);
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                if fl >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
+            }
+        }
+        let wake_r = wake[0];
+        let reactor: &'static PipeIoReactor = Box::leak(Box::new(PipeIoReactor {
+            state: Mutex::new(PipeReactorState { ops: Vec::new(), poll_gen: 0 }),
+            gen_cv: Condvar::new(),
+            wake_w: wake[1],
+        }));
+        std::thread::Builder::new()
+            .name("win32-pipe-io".into())
+            .spawn(move || {
+                let mut pfds: Vec<libc::pollfd> = Vec::new();
+                let mut snap: Vec<Arc<PendingPipeOp>> = Vec::new();
+                loop {
+                    pfds.clear();
+                    snap.clear();
+                    pfds.push(libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 });
+                    {
+                        let mut st = reactor.state.lock().unwrap();
+                        st.poll_gen = st.poll_gen.wrapping_add(1);
+                        reactor.gen_cv.notify_all();
+                        st.ops.retain(|o| !o.done.load(Ordering::Acquire));
+                        for (i, o) in st.ops.iter().enumerate() {
+                            let events = match o.kind {
+                                PipeOpKind::Read => libc::POLLIN,
+                                PipeOpKind::Write => {
+                                    if has_prior_pipe_write(&st.ops[..i], &o.file, o.conn.as_ref()) {
+                                        continue;
+                                    }
+                                    libc::POLLOUT
+                                }
+                                PipeOpKind::SyncWriteBarrier => continue,
+                            };
+                            pfds.push(libc::pollfd { fd: o.fd, events, revents: 0 });
+                            snap.push(Arc::clone(o));
+                        }
+                    }
+                    // Check buffered FIFO peek bytes or disconnected server connections outside
+                    // `reactor.state` so locks never nest and buffered reads never stall in poll().
+                    let mut immediate_ready = false;
+                    for op in &snap {
+                        if op.done.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                            immediate_ready = true;
+                            break;
+                        }
+                        if matches!(op.kind, PipeOpKind::Read)
+                            && op.len > 0
+                            && !op.file.peek_buf.lock().unwrap().is_empty()
+                        {
+                            immediate_ready = true;
+                            break;
+                        }
+                    }
+                    let timeout_ms = if immediate_ready { 0 } else { -1 };
+                    let pr = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+                    if pr < 0 {
+                        if last_errno() == libc::EINTR {
+                            continue;
+                        }
+                        break;
+                    }
+                    if (pfds[0].revents & libc::POLLIN) != 0 {
+                        let mut drain = [0u8; 64];
+                        while unsafe { libc::read(wake_r, drain.as_mut_ptr() as *mut c_void, drain.len()) } > 0 {}
+                    }
+                    for (idx, op) in snap.iter().enumerate() {
+                        if op.done.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let revents = pfds[idx + 1].revents;
+                        let is_disc = op.conn.as_ref().is_some_and(|c| c.is_disconnected());
+                        let has_peek = matches!(op.kind, PipeOpKind::Read)
+                            && op.len > 0
+                            && !op.file.peek_buf.lock().unwrap().is_empty();
+                        if revents == 0 && !is_disc && !has_peek {
+                            continue;
+                        }
+                        // Hold `op.state` across the entire non-blocking guest buffer access so
+                        // `cancel_ops` / `cancel_ops_for_conn` cannot publish `STATUS_CANCELLED`
+                        // while we touch `op.buf`.
+                        let finished: Option<(usize, usize)> = {
+                            let mut st = op.state.lock().unwrap();
+                            if st.completed {
+                                None
+                            } else if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                                st.completed = true;
+                                op.done.store(true, Ordering::Release);
+                                Some((STATUS_CANCELLED, 0))
+                            } else {
+                                let step_res: Option<(usize, usize)> = match op.kind {
+                                    PipeOpKind::Read => {
+                                        let dst = unsafe { std::slice::from_raw_parts_mut(op.buf as *mut u8, op.len) };
+                                        let from_peek = drain_peek_buf(&op.file, dst);
+                                        if from_peek > 0 {
+                                            Some((STATUS_SUCCESS, from_peek))
+                                        } else {
+                                            match unsafe { try_nonblocking_pipe_read(op.fd, op.buf as *mut u8, op.len) } {
+                                                Ok(Some(0)) => Some((STATUS_PIPE_BROKEN, 0)),
+                                                Ok(Some(got)) => Some((STATUS_SUCCESS, got)),
+                                                Ok(None) => {
+                                                    if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                                                        Some((STATUS_PIPE_BROKEN, 0))
+                                                    } else {
+                                                        None
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let w = if e == libc::EPIPE || e == libc::ECONNRESET {
+                                                        err::ERROR_BROKEN_PIPE
+                                                    } else {
+                                                        errno_to_win32(e)
+                                                    };
+                                                    Some((win32_to_ntstatus(w), 0))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    PipeOpKind::Write => {
+                                        let mut made_progress = false;
+                                        loop {
+                                            let rem = op.len.saturating_sub(st.written);
+                                            if rem == 0 {
+                                                break Some((STATUS_SUCCESS, st.written));
+                                            }
+                                            let ptr = unsafe { (op.buf as *const u8).add(st.written) };
+                                            match unsafe { try_nonblocking_pipe_write(op.fd, ptr, rem) } {
+                                                Ok(Some(0)) => break Some((STATUS_PIPE_BROKEN, st.written)),
+                                                Ok(Some(k)) => {
+                                                    st.written += k;
+                                                    made_progress = true;
+                                                    if st.written >= op.len {
+                                                        break Some((STATUS_SUCCESS, st.written));
+                                                    }
+                                                }
+                                                Ok(None) => {
+                                                    if !made_progress
+                                                        && (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+                                                    {
+                                                        break Some((STATUS_PIPE_BROKEN, st.written));
+                                                    }
+                                                    break None;
+                                                }
+                                                Err(e) => {
+                                                    let w = if e == libc::EPIPE || e == libc::ECONNRESET {
+                                                        err::ERROR_BROKEN_PIPE
+                                                    } else {
+                                                        errno_to_win32(e)
+                                                    };
+                                                    break Some((win32_to_ntstatus(w), st.written));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    PipeOpKind::SyncWriteBarrier => None,
+                                };
+                                if let Some(res) = step_res {
+                                    st.completed = true;
+                                    op.done.store(true, Ordering::Release);
+                                    Some(res)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some((status, bytes)) = finished {
+                            let was_write = matches!(op.kind, PipeOpKind::Write);
+                            {
+                                let mut st = reactor.state.lock().unwrap();
+                                st.ops.retain(|o| !Arc::ptr_eq(o, op));
+                                if was_write {
+                                    reactor.gen_cv.notify_all();
+                                }
+                            }
+                            op.publish_completion(status, bytes);
+                        }
+                    }
+                    snap.clear();
+                }
+            })
+            .expect("spawn win32-pipe-io thread");
+        reactor
+    })
+}
+
+// ---------------------------------------------------------------------------
+// In-process Named Pipe Registry (`\\.\pipe\<name>` via AF_UNIX socketpair)
+// ---------------------------------------------------------------------------
+
+fn normalize_pipe_name(name: &str) -> Option<String> {
+    let n = name.replace('/', "\\");
+    let lower = n.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("\\\\.\\pipe\\") {
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+    }
+    if let Some(rest) = lower.strip_prefix("\\\\?\\pipe\\") {
+        if !rest.is_empty() {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+enum ServerPipeConn {
+    Listening,
+    Connected(Arc<PipeConn>),
+    Disconnected,
+}
+
+enum PendingConnect {
+    Sync {
+        handle: usize,
+        tid: u32,
+        done: Arc<(Mutex<Option<usize>>, Condvar)>,
+    },
+    Overlapped {
+        handle: usize,
+        ov: usize,
+        tid: u32,
+        completed: Arc<AtomicBool>,
+        binding: Arc<IoCompletionBinding>,
+    },
+}
+
+struct ServerPipeInner {
+    conn: ServerPipeConn,
+    pending_connect: Option<PendingConnect>,
+}
+
+struct NamedPipeServer {
+    norm_name: String,
+    state: Mutex<ServerPipeInner>,
+}
+
+impl NamedPipeServer {
+    fn connected_fd(&self) -> Option<i32> {
+        let st = self.state.lock().unwrap();
+        match &st.conn {
+            ServerPipeConn::Connected(c) => Some(c.fd()),
+            _ => None,
+        }
+    }
+
+    fn io_conn(&self) -> Result<Arc<PipeConn>, u32> {
+        let st = self.state.lock().unwrap();
+        match &st.conn {
+            ServerPipeConn::Connected(c) => Ok(Arc::clone(c)),
+            ServerPipeConn::Listening => Err(ERROR_PIPE_LISTENING),
+            ServerPipeConn::Disconnected => Err(ERROR_PIPE_NOT_CONNECTED),
+        }
+    }
+
+    fn cancel_pending_connect(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
+        let taken = {
+            let mut st = self.state.lock().unwrap();
+            let matches = match &st.pending_connect {
+                Some(PendingConnect::Sync { handle: h, tid, .. }) => {
+                    *h == handle && ov.is_none() && filter_tid.map_or(true, |t| *tid == t)
+                }
+                Some(PendingConnect::Overlapped { handle: h, ov: o, tid, .. }) => {
+                    *h == handle
+                        && ov.map_or(true, |target| *o == target)
+                        && filter_tid.map_or(true, |t| *tid == t)
+                }
+                None => false,
+            };
+            if matches {
+                st.pending_connect.take()
+            } else {
+                None
+            }
+        };
+        let Some(pc) = taken else {
+            return 0;
+        };
+        match pc {
+            PendingConnect::Sync { done, .. } => {
+                let (m, cv) = &*done;
+                *m.lock().unwrap() = Some(STATUS_CANCELLED);
+                cv.notify_all();
+                1
+            }
+            PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
+                if !completed.swap(true, Ordering::AcqRel) {
+                    unsafe {
+                        let _ = complete_overlapped_binding(Some(&binding), o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
+                    }
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    fn close_server(self: &Arc<Self>) {
+        let (old_conn, pending) = {
+            let mut st = self.state.lock().unwrap();
+            let prev = std::mem::replace(&mut st.conn, ServerPipeConn::Disconnected);
+            let conn = match prev {
+                ServerPipeConn::Connected(c) => Some(c),
+                _ => None,
+            };
+            (conn, st.pending_connect.take())
+        };
+        if let Some(conn) = old_conn {
+            conn.mark_disconnected();
+            let _ = pipe_reactor().cancel_ops_for_conn(&conn);
+        }
+        if let Some(pc) = pending {
+            match pc {
+                PendingConnect::Sync { done, .. } => {
+                    let (m, cv) = &*done;
+                    *m.lock().unwrap() = Some(STATUS_CANCELLED);
+                    cv.notify_all();
+                }
+                PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
+                    if !completed.swap(true, Ordering::AcqRel) {
+                        unsafe {
+                            let _ = complete_overlapped_binding(Some(&binding), o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
+                        }
+                    }
+                }
+            }
+        }
+        let reg = named_pipe_registry();
+        let mut map = reg.lock().unwrap();
+        if let Some(entry) = map.get(&self.norm_name).cloned() {
+            let mut srvs = entry.servers.lock().unwrap();
+            srvs.retain(|s| !Arc::ptr_eq(s, self));
+            if srvs.is_empty() {
+                map.remove(&self.norm_name);
+            }
+            entry.cv.notify_all();
+        }
+    }
+}
+
+struct NamedPipeRegistryEntry {
+    servers: Mutex<Vec<Arc<NamedPipeServer>>>,
+    cv: Condvar,
+}
+
+fn named_pipe_registry() -> &'static Mutex<HashMap<String, Arc<NamedPipeRegistryEntry>>> {
+    static REG: OnceLock<Mutex<HashMap<String, Arc<NamedPipeRegistryEntry>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Wake `WaitNamedPipeW` waiters while holding `entry.servers` so notifications cannot
+/// land in the check-to-sleep window. Lock order is `registry -> entry.servers -> srv.state`;
+/// never call while holding `srv.state`.
+fn notify_pipe_waiters(norm_name: &str) {
+    let entry = named_pipe_registry().lock().unwrap().get(norm_name).cloned();
+    if let Some(entry) = entry {
+        let _srvs = entry.servers.lock().unwrap();
+        entry.cv.notify_all();
+    }
+}
+
+fn connect_named_pipe_client(
+    norm_name: &str,
+    orig_name: &str,
+    access: u32,
+    flags: u32,
+    handle_flags: u32,
+) -> Result<HANDLE, u32> {
+    let entry = {
+        let map = named_pipe_registry().lock().unwrap();
+        map.get(norm_name).cloned()
+    };
+    let Some(entry) = entry else {
+        return Err(err::ERROR_FILE_NOT_FOUND);
+    };
+    let servers = entry.servers.lock().unwrap().clone();
+    if servers.is_empty() {
+        return Err(err::ERROR_FILE_NOT_FOUND);
+    }
+
+    for srv in servers {
+        let mut st = srv.state.lock().unwrap();
+        if matches!(st.conn, ServerPipeConn::Listening) {
+            let mut fds = [0i32; 2];
+            if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+                return Err(errno_to_win32(last_errno()));
+            }
+            for &fd in &fds {
+                set_cloexec(fd);
+                set_nosigpipe_sock(fd);
+            }
+            st.conn = ServerPipeConn::Connected(PipeConn::new(unsafe { File::from_raw_fd(fds[0]) }));
+            let pending = st.pending_connect.take();
+            drop(st);
+
+            if let Some(pc) = pending {
+                match pc {
+                    PendingConnect::Sync { done, .. } => {
+                        let (m, cv) = &*done;
+                        *m.lock().unwrap() = Some(STATUS_SUCCESS);
+                        cv.notify_all();
+                    }
+                    PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
+                        if !completed.swap(true, Ordering::AcqRel) {
+                            unsafe {
+                                let _ = complete_overlapped_binding(
+                                    Some(&binding),
+                                    o as *mut OVERLAPPED,
+                                    STATUS_SUCCESS,
+                                    0,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let client = FileObj::new(
+                unsafe { File::from_raw_fd(fds[1]) },
+                FileKind::Pipe,
+                orig_name.to_string(),
+                None,
+                access,
+                flags,
+            );
+            return Ok(handles::insert_with_flags(Arc::new(client), handle_flags));
+        }
+    }
+    Err(ERROR_PIPE_BUSY)
+}
+
+pub unsafe extern "win64" fn CreatePipe(rd: *mut HANDLE, wr: *mut HANDLE, sec: *mut c_void, size: u32) -> BOOL {
+    if rd.is_null() || wr.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // Use an AF_UNIX SOCK_STREAM socketpair so overlapped/reactor/peek reads & writes can use
+    // per-syscall `MSG_DONTWAIT` without ever modifying shared `O_NONBLOCK` status flags on
+    // duplicated (`DuplicateHandle`) or child-inherited (`CreateProcessW`) descriptors.
+    let mut fds = [0i32; 2];
+    if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0 {
+        set_err(errno_to_win32(last_errno()));
+        return FALSE;
+    }
+    let buf_sz: libc::c_int = if size == 0 {
+        65_536
+    } else {
+        (size as i64).clamp(4096, 262_144) as libc::c_int
+    };
+    for &fd in &fds {
+        set_cloexec(fd);
+        set_nosigpipe_sock(fd);
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_sz as *const libc::c_int as *const c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_sz as *const libc::c_int as *const c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let hflags = sec_attr_inherit_flags(sec);
+    let r = FileObj::new(File::from_raw_fd(fds[0]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_READ, 0);
+    let w = FileObj::new(File::from_raw_fd(fds[1]), FileKind::Pipe, "\\\\.\\pipe\\anon".into(), None, GENERIC_WRITE, 0);
+    std::ptr::write_unaligned(rd, handles::insert_with_flags(Arc::new(r), hflags));
+    std::ptr::write_unaligned(wr, handles::insert_with_flags(Arc::new(w), hflags));
+    TRUE
+}
+
+pub unsafe extern "win64" fn PeekNamedPipe(
+    h: HANDLE,
+    buf: *mut c_void,
+    size: u32,
+    read: *mut u32,
+    avail: *mut u32,
+    left: *mut u32,
+) -> BOOL {
     let Some(f) = get_file(h) else {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let mut n: libc::c_int = 0;
-    if libc::ioctl(f.fd(), libc::FIONREAD, &mut n) != 0 {
-        set_err(err::ERROR_BROKEN_PIPE);
+    if f.kind != FileKind::Pipe {
+        set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    if !buf.is_null() && size > 0 && n > 0 {
-        stub!("PeekNamedPipe does not copy data");
+    let target = match f.io_pipe_target() {
+        Ok(t) => t,
+        Err(ERROR_PIPE_LISTENING) => {
+            if !read.is_null() {
+                std::ptr::write_unaligned(read, 0);
+            }
+            if !avail.is_null() {
+                std::ptr::write_unaligned(avail, 0);
+            }
+            if !left.is_null() {
+                std::ptr::write_unaligned(left, 0);
+            }
+            return TRUE;
+        }
+        Err(e) => {
+            set_err(e);
+            return FALSE;
+        }
+    };
+    let fd = target.fd();
+
+    let want = if !buf.is_null() && size > 0 { size as usize } else { 0 };
+    let mut buffered_new_fifo_bytes = false;
+    let res: Result<(usize, usize), u32> = (|| {
+        let mut pb = f.peek_buf.lock().unwrap();
+        let mut copied = 0usize;
+        let mut peeked_kernel = 0usize;
+
+        if want > 0 {
+            let from_pb = pb.len().min(want);
+            let dst = buf as *mut u8;
+            for i in 0..from_pb {
+                std::ptr::write_unaligned(dst.add(i), pb[i]);
+            }
+            copied = from_pb;
+
+            if want > from_pb {
+                let need = want - from_pb;
+                // Prefer non-consuming MSG_PEEK on socketpair-backed pipes so pending overlapped
+                // reads on the same pipe continue seeing kernel readiness and all bytes intact.
+                let mut is_raw_fifo = false;
+                loop {
+                    let r = libc::recv(
+                        fd,
+                        dst.add(from_pb) as *mut c_void,
+                        need,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    );
+                    if r > 0 {
+                        peeked_kernel = r as usize;
+                        copied = from_pb + peeked_kernel;
+                        break;
+                    }
+                    if r == 0 {
+                        if pb.is_empty() {
+                            return Err(err::ERROR_BROKEN_PIPE);
+                        }
+                        break;
+                    }
+                    let e = last_errno();
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                        break;
+                    }
+                    if e == libc::ENOTSOCK {
+                        is_raw_fifo = true;
+                        break;
+                    }
+                    if pb.is_empty() {
+                        return Err(if e == libc::EPIPE || e == libc::ECONNRESET {
+                            err::ERROR_BROKEN_PIPE
+                        } else {
+                            errno_to_win32(e)
+                        });
+                    }
+                    break;
+                }
+
+                if is_raw_fifo {
+                    // Raw POSIX FIFO fallback: MSG_PEEK is unavailable, so buffer peeked bytes
+                    // into `f.peek_buf` and wake `pipe_reactor()` after releasing `pb`.
+                    let mut tmp = vec![0u8; need];
+                    match try_nonblocking_pipe_read(fd, tmp.as_mut_ptr(), need) {
+                        Ok(Some(0)) => {
+                            if pb.is_empty() {
+                                return Err(err::ERROR_BROKEN_PIPE);
+                            }
+                        }
+                        Ok(Some(got)) => {
+                            pb.extend(&tmp[..got]);
+                            buffered_new_fifo_bytes = true;
+                            for i in from_pb..pb.len().min(want) {
+                                std::ptr::write_unaligned(dst.add(i), pb[i]);
+                            }
+                            copied = pb.len().min(want);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if pb.is_empty() {
+                                return Err(if e == libc::EPIPE || e == libc::ECONNRESET {
+                                    err::ERROR_BROKEN_PIPE
+                                } else {
+                                    errno_to_win32(e)
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut kernel_avail: libc::c_int = 0;
+        let fionread_ok = libc::ioctl(fd, libc::FIONREAD, &mut kernel_avail) == 0;
+        if !fionread_ok {
+            if pb.is_empty() && peeked_kernel == 0 {
+                return Err(err::ERROR_BROKEN_PIPE);
+            }
+            kernel_avail = 0;
+        }
+        let total_avail = pb
+            .len()
+            .saturating_add((kernel_avail.max(0) as usize).max(peeked_kernel));
+
+        // If nothing buffered in userspace or kernel, detect peer close (POLLHUP / EOF) as ERROR_BROKEN_PIPE.
+        if total_avail == 0 {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let pr = libc::poll(&mut pfd, 1, 0);
+            if pr > 0 {
+                if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                    return Err(err::ERROR_BROKEN_PIPE);
+                }
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    let mut probe = 0u8;
+                    let rr = libc::recv(
+                        fd,
+                        &mut probe as *mut u8 as *mut c_void,
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    );
+                    if rr == 0 {
+                        return Err(err::ERROR_BROKEN_PIPE);
+                    }
+                }
+            }
+        }
+
+        Ok((copied, total_avail))
+    })();
+
+    if buffered_new_fifo_bytes {
+        // Wake the pipe reactor outside `f.peek_buf` so any pending FIFO read immediately
+        // drains the newly buffered bytes without waiting for another write.
+        pipe_reactor().poke();
     }
+
+    let (copied, total_avail) = match res {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(e);
+            return FALSE;
+        }
+    };
+
     if !read.is_null() {
-        *read = 0;
+        std::ptr::write_unaligned(read, copied as u32);
     }
     if !avail.is_null() {
-        *avail = n as u32;
+        std::ptr::write_unaligned(avail, total_avail as u32);
     }
     if !left.is_null() {
-        *left = 0;
+        std::ptr::write_unaligned(left, total_avail.saturating_sub(copied) as u32);
     }
     TRUE
 }
@@ -2669,25 +6332,48 @@ pub unsafe extern "win64" fn CreateNamedPipeW(
     _out_buf: u32,
     _in_buf: u32,
     _timeout: u32,
-    _sec: *mut c_void,
+    sec: *mut c_void,
 ) -> HANDLE {
-    let pipe_name = from_wide(name);
-    let mut fds = [0i32; 2];
-    if libc::pipe(fds.as_mut_ptr()) != 0 {
-        set_err(errno_to_win32(last_errno()));
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_NAME);
         return INVALID_HANDLE_VALUE;
     }
-    // Keep read end and close extra write fd once wrapped
-    let _ = libc::close(fds[1]);
-    let obj = FileObj::new(
-        File::from_raw_fd(fds[0]),
+    let pipe_name = from_wide(name);
+    let Some(norm_name) = normalize_pipe_name(&pipe_name) else {
+        set_err(err::ERROR_INVALID_NAME);
+        return INVALID_HANDLE_VALUE;
+    };
+    let server = Arc::new(NamedPipeServer {
+        norm_name: norm_name.clone(),
+        state: Mutex::new(ServerPipeInner {
+            conn: ServerPipeConn::Listening,
+            pending_connect: None,
+        }),
+    });
+    {
+        let mut reg = named_pipe_registry().lock().unwrap();
+        let entry = Arc::clone(reg.entry(norm_name).or_insert_with(|| {
+            Arc::new(NamedPipeRegistryEntry {
+                servers: Mutex::new(Vec::new()),
+                cv: Condvar::new(),
+            })
+        }));
+        let mut srvs = entry.servers.lock().unwrap();
+        srvs.push(Arc::clone(&server));
+        entry.cv.notify_all();
+    }
+
+    let hflags = sec_attr_inherit_flags(sec);
+    let mut obj = FileObj::new(
+        null_file(),
         FileKind::Pipe,
         pipe_name,
         None,
         GENERIC_READ | GENERIC_WRITE,
         open_mode,
     );
-    handles::insert(Arc::new(obj))
+    obj.named_pipe_server = Some(server);
+    handles::insert_with_flags(Arc::new(obj), hflags)
 }
 
 pub unsafe extern "win64" fn CreateNamedPipeA(
@@ -2700,46 +6386,223 @@ pub unsafe extern "win64" fn CreateNamedPipeA(
     timeout: u32,
     sec: *mut c_void,
 ) -> HANDLE {
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_NAME);
+        return INVALID_HANDLE_VALUE;
+    }
     let w = to_wide_z(&from_ansi(name));
     CreateNamedPipeW(w.as_ptr(), open_mode, pipe_mode, max_instances, out_buf, in_buf, timeout, sec)
 }
 
-pub unsafe extern "win64" fn ConnectNamedPipe(_h: HANDLE, ov: *mut OVERLAPPED) -> BOOL {
-    if !ov.is_null() {
-        (*ov).internal = STATUS_PENDING;
+pub unsafe extern "win64" fn ConnectNamedPipe(h: HANDLE, ov: *mut OVERLAPPED) -> BOOL {
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let Some(srv) = f.named_pipe_server.clone() else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+
+    let (became_listening, wait_done) = {
+        let mut st = srv.state.lock().unwrap();
+        let mut became_listening = false;
+        match st.conn {
+            ServerPipeConn::Connected(_) => {
+                drop(st);
+                if !ov.is_null() {
+                    complete_overlapped(ov, STATUS_SUCCESS, 0);
+                }
+                set_err(ERROR_PIPE_CONNECTED);
+                return FALSE;
+            }
+            ServerPipeConn::Disconnected => {
+                st.conn = ServerPipeConn::Listening;
+                became_listening = true;
+            }
+            ServerPipeConn::Listening => {}
+        }
+
+        let tid = teb::thread_id();
+        if ov.is_null() {
+            let done = Arc::new((Mutex::new(None), Condvar::new()));
+            st.pending_connect = Some(PendingConnect::Sync {
+                handle: h as usize,
+                tid,
+                done: Arc::clone(&done),
+            });
+            (became_listening, Some(done))
+        } else {
+            f.completion.io_event.reset();
+            prepare_overlapped_pending(ov);
+            st.pending_connect = Some(PendingConnect::Overlapped {
+                handle: h as usize,
+                ov: ov as usize,
+                tid,
+                completed: Arc::new(AtomicBool::new(false)),
+                binding: Arc::clone(&f.completion),
+            });
+            (became_listening, None)
+        }
+    };
+    if became_listening {
+        notify_pipe_waiters(&srv.norm_name);
+    }
+    if let Some(done) = wait_done {
+        drop(f);
+        let (m, cv) = &*done;
+        let mut g = m.lock().unwrap();
+        let status = loop {
+            if let Some(s) = *g {
+                break s;
+            }
+            g = cv.wait(g).unwrap();
+        };
+        if status == STATUS_SUCCESS {
+            set_err(0);
+            TRUE
+        } else {
+            set_err(ntstatus_to_win32_local(status));
+            FALSE
+        }
+    } else {
         set_err(err::ERROR_IO_PENDING);
+        FALSE
+    }
+}
+
+pub unsafe extern "win64" fn DisconnectNamedPipe(h: HANDLE) -> BOOL {
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let Some(srv) = f.named_pipe_server.clone() else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    // Transition through `Disconnected` first so no new client can attach while we cancel
+    // and drain all operations belonging to the old shared connection across every duplicate handle.
+    let old_conn = {
+        let mut st = srv.state.lock().unwrap();
+        let prev = std::mem::replace(&mut st.conn, ServerPipeConn::Disconnected);
+        match prev {
+            ServerPipeConn::Connected(c) => Some(c),
+            _ => None,
+        }
+    };
+    if let Some(conn) = old_conn {
+        conn.mark_disconnected();
+        let _ = pipe_reactor().cancel_ops_for_conn(&conn);
+        drop(conn);
+    } else {
+        let _ = pipe_reactor().cancel_ops(h as usize, None, None);
+    }
+    f.peek_buf.lock().unwrap().clear();
+    let entry = named_pipe_registry().lock().unwrap().get(&srv.norm_name).cloned();
+    if let Some(entry) = entry {
+        let _srvs = entry.servers.lock().unwrap();
+        {
+            let mut st = srv.state.lock().unwrap();
+            if matches!(st.conn, ServerPipeConn::Disconnected) {
+                st.conn = ServerPipeConn::Listening;
+            }
+        }
+        entry.cv.notify_all();
+    } else {
+        let mut st = srv.state.lock().unwrap();
+        if matches!(st.conn, ServerPipeConn::Disconnected) {
+            st.conn = ServerPipeConn::Listening;
+        }
+    }
+    TRUE
+}
+
+pub unsafe extern "win64" fn SetNamedPipeHandleState(h: HANDLE, _mode: *const u32, _max_count: *const u32, _timeout: *const u32) -> BOOL {
+    if get_file(h).is_none() {
+        set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    set_err(535); // ERROR_PIPE_CONNECTED
-    FALSE
-}
-
-pub unsafe extern "win64" fn DisconnectNamedPipe(_h: HANDLE) -> BOOL {
     TRUE
 }
 
-pub unsafe extern "win64" fn SetNamedPipeHandleState(_h: HANDLE, _mode: *const u32, _max_count: *const u32, _timeout: *const u32) -> BOOL {
-    TRUE
-}
-
-pub unsafe extern "win64" fn GetNamedPipeInfo(_h: HANDLE, flags: *mut u32, out_sz: *mut u32, in_sz: *mut u32, max_inst: *mut u32) -> BOOL {
+pub unsafe extern "win64" fn GetNamedPipeInfo(h: HANDLE, flags: *mut u32, out_sz: *mut u32, in_sz: *mut u32, max_inst: *mut u32) -> BOOL {
+    let Some(f) = get_file(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
     if !flags.is_null() {
-        *flags = 0;
+        let fl = if f.named_pipe_server.is_some() { 0x1 /* PIPE_SERVER_END */ } else { 0x0 /* PIPE_CLIENT_END */ };
+        std::ptr::write_unaligned(flags, fl);
     }
     if !out_sz.is_null() {
-        *out_sz = 65536;
+        std::ptr::write_unaligned(out_sz, 65536);
     }
     if !in_sz.is_null() {
-        *in_sz = 65536;
+        std::ptr::write_unaligned(in_sz, 65536);
     }
     if !max_inst.is_null() {
-        *max_inst = 255;
+        std::ptr::write_unaligned(max_inst, 255);
     }
     TRUE
 }
 
-pub unsafe extern "win64" fn WaitNamedPipeW(_name: LPCWSTR, _timeout: u32) -> BOOL {
-    TRUE
+pub unsafe extern "win64" fn WaitNamedPipeW(name: LPCWSTR, timeout: u32) -> BOOL {
+    if name.is_null() {
+        set_err(err::ERROR_INVALID_NAME);
+        return FALSE;
+    }
+    let Some(norm) = normalize_pipe_name(&from_wide(name)) else {
+        set_err(err::ERROR_INVALID_NAME);
+        return FALSE;
+    };
+    let entry = {
+        let map = named_pipe_registry().lock().unwrap();
+        map.get(&norm).cloned()
+    };
+    let Some(entry) = entry else {
+        set_err(err::ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    };
+    let deadline = match timeout {
+        INFINITE => None,
+        0 => Some(Instant::now() + Duration::from_millis(5000)),
+        ms => Some(Instant::now() + Duration::from_millis(ms as u64)),
+    };
+    let mut srvs = entry.servers.lock().unwrap();
+    loop {
+        if srvs.is_empty() {
+            set_err(err::ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+        if srvs.iter().any(|s| matches!(s.state.lock().unwrap().conn, ServerPipeConn::Listening)) {
+            return TRUE;
+        }
+        match deadline {
+            None => {
+                srvs = entry.cv.wait(srvs).unwrap();
+            }
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    set_err(ERROR_SEM_TIMEOUT);
+                    return FALSE;
+                }
+                let (g, res) = entry.cv.wait_timeout(srvs, dl - now).unwrap();
+                srvs = g;
+                if res.timed_out() {
+                    if srvs.is_empty() {
+                        set_err(err::ERROR_FILE_NOT_FOUND);
+                        return FALSE;
+                    }
+                    if srvs.iter().any(|s| matches!(s.state.lock().unwrap().conn, ServerPipeConn::Listening)) {
+                        return TRUE;
+                    }
+                    set_err(ERROR_SEM_TIMEOUT);
+                    return FALSE;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2832,6 +6695,10 @@ pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<St
             set_err(err::ERROR_INVALID_HANDLE);
             return std::ptr::null_mut();
         };
+        if writable && f.is_protected_native() {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return std::ptr::null_mut();
+        }
         let cur = f.file().metadata().map(|m| m.len()).unwrap_or(0);
         if size > cur && writable {
             let _ = f.file().set_len(size);
@@ -3285,5 +7152,2816 @@ mod tests {
             let s = String::from_utf16_lossy(&drives[..dn as usize]);
             assert!(s.contains("C:\\\0"));
         }
+    }
+
+    fn parse_notify_records(buf: &[u8], bytes: usize) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        if bytes == 0 {
+            return out;
+        }
+        let mut off = 0usize;
+        loop {
+            assert!(off + 12 <= bytes);
+            let next = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            let action = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+            let name_len = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as usize;
+            assert!(off + 12 + name_len <= bytes);
+            let u16s: Vec<u16> = buf[off + 12..off + 12 + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push((action, String::from_utf16_lossy(&u16s)));
+            if next == 0 {
+                break;
+            }
+            off += next;
+        }
+        out
+    }
+
+    #[test]
+    fn read_write_file_ex_apc_issuing_thread_only_and_cancel() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        static APC_CALLS: AtomicU32 = AtomicU32::new(0);
+        static APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static APC_BYTES: AtomicU32 = AtomicU32::new(0);
+        static APC_OV: AtomicUsize = AtomicUsize::new(0);
+        static APC_TID: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "win64" fn completion_cb(err_code: u32, bytes: u32, ov: usize) {
+            APC_ERR.store(err_code, Ordering::Release);
+            APC_BYTES.store(bytes, Ordering::Release);
+            APC_OV.store(ov, Ordering::Release);
+            APC_TID.store(teb::thread_id(), Ordering::Release);
+            APC_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        APC_CALLS.store(0, Ordering::Release);
+        crate::path::add_mount("U:\\", std::path::Path::new("/"));
+
+        unsafe {
+            // Validation errors
+            assert_eq!(ReadFileEx(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, std::ptr::null_mut(), Some(completion_cb)), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            let mut dummy_ov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ReadFileEx(INVALID_HANDLE_VALUE, &mut dummy_ov as *mut _ as *mut c_void, 4, &mut dummy_ov, Some(completion_cb)), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            let tmp = std::env::temp_dir().join(format!("win32_rt_rwex_{}.bin", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            let win_p = to_wide_z(&format!("U:{}", tmp.to_string_lossy().replace('/', "\\")));
+            let h = CreateFileW(
+                win_p.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                7,
+                std::ptr::null_mut(),
+                CREATE_ALWAYS,
+                0x4000_0000, // FILE_FLAG_OVERLAPPED
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+
+            // Bind IOCP to prove ReadFileEx/WriteFileEx do NOT post to IOCP or signal ov.h_event!
+            let iocp = CreateIoCompletionPort(h, std::ptr::null_mut(), 0xCAFE, 1);
+            assert!(!iocp.is_null());
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+
+            let issuing_tid = teb::thread_id();
+            let payload = b"hello-ex-apc";
+            let mut wov: OVERLAPPED = std::mem::zeroed();
+            wov.h_event = ev;
+            assert_eq!(
+                WriteFileEx(h, payload.as_ptr() as *const c_void, payload.len() as u32, &mut wov, Some(completion_cb)),
+                TRUE
+            );
+            // Must NOT have run yet before alertable wait, must NOT signal h_event or IOCP.
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 0);
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT);
+            let mut entry: OVERLAPPED_ENTRY = std::mem::zeroed();
+            let mut removed = 0u32;
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut entry, 1, &mut removed, 0, FALSE), FALSE);
+
+            // A DIFFERENT thread entering an alertable wait must NOT run our APC!
+            std::thread::spawn(|| {
+                let _ = crate::thread::ensure_current_thread_object();
+                let r = SleepEx(10, TRUE);
+                assert_eq!(r, 0, "non-issuing thread must not steal issuing thread's APC");
+            })
+            .join()
+            .unwrap();
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 0);
+
+            // Issuing thread enters alertable SleepEx -> APC runs on issuing thread!
+            assert_eq!(SleepEx(500, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire), payload.len() as u32);
+            assert_eq!(APC_OV.load(Ordering::Acquire), &mut wov as *mut OVERLAPPED as usize);
+            assert_eq!(APC_TID.load(Ordering::Acquire), issuing_tid);
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT);
+
+            // ReadFileEx at offset 0 -> delivers APC via alertable GetQueuedCompletionStatusEx!
+            let mut rbuf = [0u8; 32];
+            let mut rov: OVERLAPPED = std::mem::zeroed();
+            rov.h_event = ev;
+            assert_eq!(
+                ReadFileEx(h, rbuf.as_mut_ptr() as *mut c_void, payload.len() as u32, &mut rov, Some(completion_cb)),
+                TRUE
+            );
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut entry, 1, &mut removed, 500, TRUE), FALSE);
+            assert_eq!(teb::last_error(), WAIT_IO_COMPLETION);
+            assert_eq!(removed, 0);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire), payload.len() as u32);
+            assert_eq!(&rbuf[..payload.len()], payload);
+
+            // ReadFileEx past EOF on disk returns FALSE + ERROR_HANDLE_EOF.
+            let mut eof_ov: OVERLAPPED = std::mem::zeroed();
+            eof_ov.offset = 1024;
+            assert_eq!(
+                ReadFileEx(h, rbuf.as_mut_ptr() as *mut c_void, 8, &mut eof_ov, Some(completion_cb)),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_HANDLE_EOF);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
+
+            // Pending ReadFileEx on an empty pipe cancelled by CancelIoEx delivers ERROR_OPERATION_ABORTED via APC!
+            let mut prd: HANDLE = std::ptr::null_mut();
+            let mut pwr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut prd, &mut pwr, std::ptr::null_mut(), 0), TRUE);
+            let mut pov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadFileEx(prd, rbuf.as_mut_ptr() as *mut c_void, 16, &mut pov, Some(completion_cb)),
+                TRUE
+            );
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
+            assert_eq!(CancelIoEx(prd, &mut pov), TRUE);
+            assert_eq!(SleepEx(500, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 3);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), ERROR_OPERATION_ABORTED);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire), 0);
+            assert_eq!(APC_OV.load(Ordering::Acquire), &mut pov as *mut OVERLAPPED as usize);
+
+            // Alertable GetQueuedCompletionStatusEx wakes up WHILE BLOCKED when an APC is queued from another thread!
+            let iocp_usize = iocp as usize;
+            let pwr_usize = pwr as usize;
+            let mut pov2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadFileEx(prd, rbuf.as_mut_ptr() as *mut c_void, 5, &mut pov2, Some(completion_cb)),
+                TRUE
+            );
+            let writer_th = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(35));
+                let mut w = 0u32;
+                assert_eq!(WriteFile(pwr_usize as HANDLE, b"wake!".as_ptr() as *const c_void, 5, &mut w, std::ptr::null_mut()), TRUE);
+            });
+            let t0 = Instant::now();
+            assert_eq!(GetQueuedCompletionStatusEx(iocp_usize as HANDLE, &mut entry, 1, &mut removed, 5000, TRUE), FALSE);
+            let elapsed = t0.elapsed();
+            writer_th.join().unwrap();
+            assert_eq!(teb::last_error(), WAIT_IO_COMPLETION);
+            assert!(elapsed < Duration::from_secs(2), "alertable GQCSEx should wake immediately on APC, took {elapsed:?}");
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 4);
+            assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_BYTES.load(Ordering::Acquire), 5);
+            assert_eq!(&rbuf[..5], b"wake!");
+
+            assert_eq!(CloseHandle(prd), TRUE);
+            assert_eq!(CloseHandle(pwr), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(CloseHandle(h), TRUE);
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    #[test]
+    fn read_directory_changes_all_modes_subtree_and_cancel() {
+        use crate::kernel32::threadpool::{
+            CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo, WaitForThreadpoolIoCallbacks,
+        };
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        crate::path::add_mount("U:\\", std::path::Path::new("/"));
+        let dir = std::env::temp_dir().join(format!("win32_rt_dirwatch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let win_dir = to_wide_z(&format!("U:{}", dir.to_string_lossy().replace('/', "\\")));
+        let all_filter = FILE_NOTIFY_CHANGE_FILE_NAME
+            | FILE_NOTIFY_CHANGE_DIR_NAME
+            | FILE_NOTIFY_CHANGE_SIZE
+            | FILE_NOTIFY_CHANGE_LAST_WRITE
+            | FILE_NOTIFY_CHANGE_ATTRIBUTES;
+
+        let open_dir = || unsafe {
+            let h = CreateFileW(
+                win_dir.as_ptr(),
+                FILE_READ_DATA,
+                7,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            h
+        };
+
+        unsafe {
+            // 1. Synchronous mode: create, modify, rename, delete.
+            let h_sync = open_dir();
+            let dir_c = dir.clone();
+            let mut sync_buf = [0u8; 4096];
+            let mut sync_ret = 0u32;
+            let mutater = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                std::fs::write(dir_c.join("alpha.txt"), b"v1").unwrap();
+            });
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_sync,
+                    sync_buf.as_mut_ptr() as *mut c_void,
+                    sync_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    &mut sync_ret,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            mutater.join().unwrap();
+            let recs = parse_notify_records(&sync_buf, sync_ret as usize);
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_ADDED && p == "alpha.txt"), "got {recs:?}");
+
+            // 2. Overlapped + hEvent: modify, rename, delete.
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            let mut ev_buf = [0u8; 4096];
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_sync,
+                    ev_buf.as_mut_ptr() as *mut c_void,
+                    ev_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::fs::write(dir.join("alpha.txt"), b"v2-longer").unwrap();
+            assert_eq!(WaitForSingleObject(ev, 3000), WAIT_OBJECT_0);
+            let mut n = 0u32;
+            assert_eq!(GetOverlappedResult(h_sync, &mut ov, &mut n, FALSE), TRUE);
+            let recs = parse_notify_records(&ev_buf, n as usize);
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "alpha.txt"), "got {recs:?}");
+
+            // Rename alpha.txt -> beta.txt
+            // Note: `std::fs::write` above does open(O_TRUNC) + write(), which can legitimately
+            // produce a trailing FILE_ACTION_MODIFIED on alpha.txt via EVFILT_VNODE before the
+            // rename event arrives; collect batches until the rename pair is delivered.
+            let mut rename_recs: Vec<(u32, String)> = Vec::new();
+            let mut renamed = false;
+            for attempt in 0..4 {
+                assert_eq!(
+                    ReadDirectoryChangesW(
+                        h_sync,
+                        ev_buf.as_mut_ptr() as *mut c_void,
+                        ev_buf.len() as u32,
+                        FALSE,
+                        all_filter,
+                        std::ptr::null_mut(),
+                        &mut ov,
+                        std::ptr::null(),
+                    ),
+                    TRUE
+                );
+                if attempt == 0 {
+                    std::fs::rename(dir.join("alpha.txt"), dir.join("beta.txt")).unwrap();
+                }
+                assert_eq!(WaitForSingleObject(ev, 3000), WAIT_OBJECT_0);
+                assert_eq!(GetOverlappedResult(h_sync, &mut ov, &mut n, FALSE), TRUE);
+                let batch = parse_notify_records(&ev_buf, n as usize);
+                rename_recs.extend(batch);
+                if rename_recs.iter().any(|(a, p)| *a == FILE_ACTION_RENAMED_OLD_NAME && p == "alpha.txt")
+                    && rename_recs.iter().any(|(a, p)| *a == FILE_ACTION_RENAMED_NEW_NAME && p == "beta.txt")
+                {
+                    renamed = true;
+                    break;
+                }
+                assert!(
+                    rename_recs.iter().all(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "alpha.txt"),
+                    "unexpected non-modify record before rename: {rename_recs:?}"
+                );
+            }
+            assert!(renamed, "expected rename pair, got {rename_recs:?}");
+
+            // Delete beta.txt
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_sync,
+                    ev_buf.as_mut_ptr() as *mut c_void,
+                    ev_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::fs::remove_file(dir.join("beta.txt")).unwrap();
+            assert_eq!(WaitForSingleObject(ev, 3000), WAIT_OBJECT_0);
+            assert_eq!(GetOverlappedResult(h_sync, &mut ov, &mut n, FALSE), TRUE);
+            let recs = parse_notify_records(&ev_buf, n as usize);
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_REMOVED && p == "beta.txt"), "got {recs:?}");
+
+            // Non-subtree must NOT trigger on sub/nested.txt!
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_sync,
+                    ev_buf.as_mut_ptr() as *mut c_void,
+                    ev_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::fs::write(dir.join("sub").join("nested.txt"), b"hi").unwrap();
+            assert_eq!(WaitForSingleObject(ev, 120), WAIT_TIMEOUT, "non-subtree watch must ignore sub/nested.txt");
+            // CancelIoEx cancels pending watch -> ERROR_OPERATION_ABORTED exactly once.
+            assert_eq!(CancelIoEx(h_sync, &mut ov), TRUE);
+            assert_eq!(WaitForSingleObject(ev, 1000), WAIT_OBJECT_0);
+            assert_eq!(GetOverlappedResult(h_sync, &mut ov, &mut n, FALSE), FALSE);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            assert_eq!(CloseHandle(h_sync), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
+
+            // 3. Overlapped + IOCP + subtree watching + CancelIoEx exactly-once check.
+            let h_iocp = open_dir();
+            let iocp = CreateIoCompletionPort(h_iocp, std::ptr::null_mut(), 0xD1A0, 1);
+            assert!(!iocp.is_null());
+            let mut iocp_buf = [0u8; 4096];
+            let mut ov_i: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_iocp,
+                    iocp_buf.as_mut_ptr() as *mut c_void,
+                    iocp_buf.len() as u32,
+                    TRUE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov_i,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::fs::write(dir.join("sub").join("deep.txt"), b"sub").unwrap();
+            let mut entry: OVERLAPPED_ENTRY = std::mem::zeroed();
+            let mut removed = 0u32;
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut entry, 1, &mut removed, 3000, FALSE), TRUE);
+            assert_eq!(removed, 1);
+            assert_eq!(entry.lpCompletionKey, 0xD1A0);
+            let recs = parse_notify_records(&iocp_buf, entry.dwNumberOfBytesTransferred as usize);
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_ADDED && p == "sub\\deep.txt"), "got {recs:?}");
+
+            // Queue another watch, then CancelIoEx + CloseHandle: must get EXACTLY ONE cancelled packet!
+            let mut ov_c: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_iocp,
+                    iocp_buf.as_mut_ptr() as *mut c_void,
+                    iocp_buf.len() as u32,
+                    TRUE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov_c,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            assert_eq!(CancelIoEx(h_iocp, &mut ov_c), TRUE);
+            assert_eq!(CloseHandle(h_iocp), TRUE);
+            let mut bytes_c = 0u32;
+            let mut key_c = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes_c, &mut key_c, &mut ov_out, 2000), FALSE);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            assert_eq!(ov_out, &mut ov_c as *mut OVERLAPPED);
+            // No duplicate second completion packet!
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut entry, 1, &mut removed, 50, FALSE), FALSE);
+            assert_eq!(teb::last_error(), WAIT_TIMEOUT);
+            assert_eq!(CloseHandle(iocp), TRUE);
+
+            // 4. Overlapped + APC completion routine.
+            static DIR_APC_CALLS: AtomicU32 = AtomicU32::new(0);
+            static DIR_APC_BYTES: AtomicU32 = AtomicU32::new(0);
+            unsafe extern "win64" fn dir_apc_cb(err_code: u32, bytes: u32, _ov: usize) {
+                if err_code == 0 {
+                    DIR_APC_BYTES.store(bytes, Ordering::Release);
+                }
+                DIR_APC_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+            DIR_APC_CALLS.store(0, Ordering::Release);
+            let h_apc = open_dir();
+            let mut apc_buf = [0u8; 4096];
+            let mut ov_a: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_apc,
+                    apc_buf.as_mut_ptr() as *mut c_void,
+                    apc_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov_a,
+                    dir_apc_cb as *const c_void,
+                ),
+                TRUE
+            );
+            std::fs::write(dir.join("apc_file.txt"), b"x").unwrap();
+            assert_eq!(SleepEx(3000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(DIR_APC_CALLS.load(Ordering::Acquire), 1);
+            let recs = parse_notify_records(&apc_buf, DIR_APC_BYTES.load(Ordering::Acquire) as usize);
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_ADDED && p == "apc_file.txt"), "got {recs:?}");
+            assert_eq!(CloseHandle(h_apc), TRUE);
+
+            // 5. Overlapped + CreateThreadpoolIo.
+            static DIR_TP_CALLS: AtomicU32 = AtomicU32::new(0);
+            static DIR_TP_BYTES: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "win64" fn dir_tp_cb(
+                _inst: *mut c_void,
+                _ctx: *mut c_void,
+                _ov: *mut c_void,
+                io_res: u32,
+                bytes: usize,
+                _pio: *mut c_void,
+            ) {
+                if io_res == 0 {
+                    DIR_TP_BYTES.store(bytes, Ordering::Release);
+                }
+                DIR_TP_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+            DIR_TP_CALLS.store(0, Ordering::Release);
+            let h_tp = open_dir();
+            let pio = CreateThreadpoolIo(h_tp, dir_tp_cb as *const c_void, std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(!pio.is_null());
+            let mut tp_buf = [0u8; 4096];
+            let mut ov_tp: OVERLAPPED = std::mem::zeroed();
+            StartThreadpoolIo(pio);
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_tp,
+                    tp_buf.as_mut_ptr() as *mut c_void,
+                    tp_buf.len() as u32,
+                    FALSE,
+                    all_filter,
+                    std::ptr::null_mut(),
+                    &mut ov_tp,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::fs::write(dir.join("tp_file.txt"), b"y").unwrap();
+            let dl = Instant::now() + Duration::from_secs(3);
+            while DIR_TP_CALLS.load(Ordering::Acquire) == 0 && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            WaitForThreadpoolIoCallbacks(pio, FALSE);
+            assert_eq!(DIR_TP_CALLS.load(Ordering::Acquire), 1);
+            let recs = parse_notify_records(&tp_buf, DIR_TP_BYTES.load(Ordering::Acquire));
+            assert!(recs.iter().any(|(a, p)| *a == FILE_ACTION_ADDED && p == "tp_file.txt"), "got {recs:?}");
+            CloseThreadpoolIo(pio);
+            assert_eq!(CloseHandle(h_tp), TRUE);
+
+            // 6. FindFirstChangeNotificationW / FindNextChangeNotification / FindCloseChangeNotification.
+            let ch = FindFirstChangeNotificationW(win_dir.as_ptr(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME);
+            assert_ne!(ch, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ch, 0), WAIT_TIMEOUT);
+            std::fs::write(dir.join("notif1.txt"), b"1").unwrap();
+            assert_eq!(WaitForSingleObject(ch, 3000), WAIT_OBJECT_0);
+            assert_eq!(FindNextChangeNotification(ch), TRUE);
+            assert_eq!(WaitForSingleObject(ch, 0), WAIT_TIMEOUT);
+            std::fs::write(dir.join("notif2.txt"), b"2").unwrap();
+            assert_eq!(WaitForSingleObject(ch, 3000), WAIT_OBJECT_0);
+            assert_eq!(FindCloseChangeNotification(ch), TRUE);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn pipes_inherit_peek_named_pipe_and_overlapped_connect() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+
+        #[repr(C)]
+        struct SecAttr {
+            len: u32,
+            _pad: u32,
+            sd: usize,
+            inherit: BOOL,
+        }
+
+        unsafe {
+            // 1. CreatePipe honors SECURITY_ATTRIBUTES.bInheritHandle and sets FD_CLOEXEC.
+            let mut sa = SecAttr { len: 24, _pad: 0, sd: 0, inherit: TRUE };
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+            assert_eq!(handles::get_flags(rd), Some(handles::HANDLE_FLAG_INHERIT));
+            assert_eq!(handles::get_flags(wr), Some(handles::HANDLE_FLAG_INHERIT));
+            let (rfd, _) = file_fd_and_kind(rd).unwrap();
+            let (wfd, _) = file_fd_and_kind(wr).unwrap();
+            assert_ne!(libc::fcntl(rfd, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            assert_ne!(libc::fcntl(wfd, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+
+            // 2. PeekNamedPipe copies data non-destructively and subsequent ReadFile gets full payload.
+            let payload = b"peek-test-payload";
+            let mut w = 0u32;
+            assert_eq!(WriteFile(wr, payload.as_ptr() as *const c_void, payload.len() as u32, &mut w, std::ptr::null_mut()), TRUE);
+            assert_eq!(w as usize, payload.len());
+            let mut pbuf = [0u8; 4];
+            let mut pread = 0u32;
+            let mut pavail = 0u32;
+            let mut pleft = 0u32;
+            assert_eq!(
+                PeekNamedPipe(rd, pbuf.as_mut_ptr() as *mut c_void, 4, &mut pread, &mut pavail, &mut pleft),
+                TRUE
+            );
+            assert_eq!(pread, 4);
+            assert_eq!(pavail as usize, payload.len());
+            assert_eq!(pleft as usize, payload.len() - 4);
+            assert_eq!(&pbuf, b"peek");
+
+            // ReadFile must still return the full payload starting with "peek"!
+            let mut rbuf = [0u8; 32];
+            let mut r1 = 0u32;
+            assert_eq!(ReadFile(rd, rbuf.as_mut_ptr() as *mut c_void, 32, &mut r1, std::ptr::null_mut()), TRUE);
+            let mut total = rbuf[..r1 as usize].to_vec();
+            while total.len() < payload.len() {
+                let mut r2 = 0u32;
+                assert_eq!(ReadFile(rd, rbuf.as_mut_ptr() as *mut c_void, 32, &mut r2, std::ptr::null_mut()), TRUE);
+                total.extend_from_slice(&rbuf[..r2 as usize]);
+            }
+            assert_eq!(&total, payload);
+
+            // Closing write end -> PeekNamedPipe & ReadFile report ERROR_BROKEN_PIPE.
+            assert_eq!(CloseHandle(wr), TRUE);
+            assert_eq!(PeekNamedPipe(rd, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut pavail, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_BROKEN_PIPE);
+            assert_eq!(ReadFile(rd, rbuf.as_mut_ptr() as *mut c_void, 8, &mut r1, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(rd), TRUE);
+
+            // 3. Named pipe server/client + overlapped ConnectNamedPipe + bidirectional I/O + DisconnectNamedPipe + sync ConnectNamedPipe.
+            let pname = to_wide_z(&format!("\\\\.\\pipe\\win32_rt_test_{}", std::process::id()));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x4000_0003, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                2,
+                4096,
+                4096,
+                1000,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitNamedPipeW(pname.as_ptr(), 100), TRUE);
+
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut cov: OVERLAPPED = std::mem::zeroed();
+            cov.h_event = ev;
+            assert_eq!(ConnectNamedPipe(srv, &mut cov), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT);
+
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+            let mut n = 0u32;
+            assert_eq!(GetOverlappedResult(srv, &mut cov, &mut n, FALSE), TRUE);
+
+            // Client -> Server & Server -> Client
+            assert_eq!(WriteFile(cli, b"ping".as_ptr() as *const c_void, 4, &mut w, std::ptr::null_mut()), TRUE);
+            let mut sbuf = [0u8; 8];
+            assert_eq!(ReadFile(srv, sbuf.as_mut_ptr() as *mut c_void, 8, &mut r1, std::ptr::null_mut()), TRUE);
+            assert_eq!(&sbuf[..r1 as usize], b"ping");
+            assert_eq!(WriteFile(srv, b"pong".as_ptr() as *const c_void, 4, &mut w, std::ptr::null_mut()), TRUE);
+            assert_eq!(ReadFile(cli, sbuf.as_mut_ptr() as *mut c_void, 8, &mut r1, std::ptr::null_mut()), TRUE);
+            assert_eq!(&sbuf[..r1 as usize], b"pong");
+
+            // DisconnectNamedPipe closes server side -> client gets ERROR_BROKEN_PIPE.
+            assert_eq!(DisconnectNamedPipe(srv), TRUE);
+            assert_eq!(ReadFile(cli, sbuf.as_mut_ptr() as *mut c_void, 8, &mut r1, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(cli), TRUE);
+
+            // Synchronous ConnectNamedPipe on a second client from another thread.
+            let pname2 = pname.clone();
+            let cli_th = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                let c = CreateFileW(
+                    pname2.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(c, INVALID_HANDLE_VALUE);
+                c as usize
+            });
+            assert_eq!(ConnectNamedPipe(srv, std::ptr::null_mut()), TRUE);
+            let cli2 = cli_th.join().unwrap() as HANDLE;
+            assert_eq!(CloseHandle(cli2), TRUE);
+            assert_eq!(DisconnectNamedPipe(srv), TRUE);
+
+            // Overlapped ConnectNamedPipe cancelled via CancelIoEx.
+            assert_eq!(ConnectNamedPipe(srv, &mut cov), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(CancelIoEx(srv, &mut cov), TRUE);
+            assert_eq!(WaitForSingleObject(ev, 1000), WAIT_OBJECT_0);
+            assert_eq!(GetOverlappedResult(srv, &mut cov, &mut n, FALSE), FALSE);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(srv), TRUE);
+        }
+    }
+
+    #[test]
+    fn console_ctrl_handler_lifo_ignore_and_removal() {
+        static LOG: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+        unsafe extern "win64" fn h_first(ev: u32) -> BOOL {
+            LOG.lock().unwrap().push((1, ev));
+            TRUE // stops propagation
+        }
+        unsafe extern "win64" fn h_second(ev: u32) -> BOOL {
+            LOG.lock().unwrap().push((2, ev));
+            FALSE // continue to next handler
+        }
+        unsafe extern "win64" fn h_unregistered(_ev: u32) -> BOOL {
+            TRUE
+        }
+
+        unsafe {
+            LOG.lock().unwrap().clear();
+            // Reset ignore flag and register two handlers.
+            assert_eq!(SetConsoleCtrlHandler(std::ptr::null(), FALSE), TRUE);
+            assert_eq!(SetConsoleCtrlHandler(h_first as *const c_void, TRUE), TRUE);
+            assert_eq!(SetConsoleCtrlHandler(h_second as *const c_void, TRUE), TRUE);
+
+            // LIFO: h_second runs first (returns FALSE), then h_first (returns TRUE).
+            assert_eq!(GenerateConsoleCtrlEvent(0, 0), TRUE);
+            assert_eq!(*LOG.lock().unwrap(), vec![(2, 0), (1, 0)]);
+
+            // SetConsoleCtrlHandler(NULL, TRUE) ignores CTRL_C_EVENT (0) but still delivers CTRL_BREAK_EVENT (1).
+            LOG.lock().unwrap().clear();
+            assert_eq!(SetConsoleCtrlHandler(std::ptr::null(), TRUE), TRUE);
+            assert_eq!(GenerateConsoleCtrlEvent(0, 0), TRUE);
+            assert!(LOG.lock().unwrap().is_empty());
+            assert_eq!(GenerateConsoleCtrlEvent(1, 0), TRUE);
+            assert_eq!(*LOG.lock().unwrap(), vec![(2, 1), (1, 1)]);
+
+            // Re-enable CTRL_C_EVENT and remove h_second.
+            assert_eq!(SetConsoleCtrlHandler(std::ptr::null(), FALSE), TRUE);
+            assert_eq!(SetConsoleCtrlHandler(h_second as *const c_void, FALSE), TRUE);
+            assert_eq!(SetConsoleCtrlHandler(h_unregistered as *const c_void, FALSE), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            LOG.lock().unwrap().clear();
+            assert_eq!(GenerateConsoleCtrlEvent(0, 0), TRUE);
+            assert_eq!(*LOG.lock().unwrap(), vec![(1, 0)]);
+
+            // Clean up.
+            assert_eq!(SetConsoleCtrlHandler(h_first as *const c_void, FALSE), TRUE);
+        }
+    }
+
+    #[test]
+    fn non_tty_dev_null_is_not_console_and_console_input_events_validates_handle() {
+        unsafe {
+            let null_f = std::fs::File::open("/dev/null").expect("open /dev/null");
+            assert_eq!(classify_host_fd(null_f.as_raw_fd()), FileKind::Null);
+            let h_null = wrap_non_owned_fd(null_f.as_raw_fd(), classify_host_fd(null_f.as_raw_fd()), "NUL".into(), GENERIC_READ);
+            assert_eq!(GetFileType(h_null), FILE_TYPE_CHAR);
+            let mut mode = 0u32;
+            assert_eq!(GetConsoleMode(h_null, &mut mode), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            let mut count = 99u32;
+            assert_eq!(GetNumberOfConsoleInputEvents(h_null, &mut count), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // Write-only console handle (CONOUT$) is rejected for input event count.
+            let h_conout = wrap_non_owned_fd(null_f.as_raw_fd(), FileKind::Console, "CONOUT$".into(), GENERIC_WRITE);
+            assert_eq!(GetConsoleMode(h_conout, &mut mode), TRUE);
+            assert_eq!(GetNumberOfConsoleInputEvents(h_conout, &mut count), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // Null output pointer returns ERROR_INVALID_PARAMETER.
+            let h_conin = wrap_non_owned_fd(null_f.as_raw_fd(), FileKind::Console, "CONIN$".into(), GENERIC_READ);
+            assert_eq!(GetNumberOfConsoleInputEvents(h_conin, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Readable console handle succeeds.
+            assert_eq!(GetNumberOfConsoleInputEvents(h_conin, &mut count), TRUE);
+            assert_eq!(count, 0);
+
+            assert_eq!(crate::kernel32::threads::CloseHandle(h_conin), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(h_conout), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(h_null), TRUE);
+        }
+    }
+
+    #[test]
+    fn overlapped_pipe_write_backpressure_full_transfer_writefile_and_writefileex() {
+        use crate::kernel32::threads::CloseHandle;
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        // 512 KiB easily exceeds macOS's 64 KiB kernel pipe buffer, forcing partial non-blocking
+        // writes and multiple POLLOUT wakeups in the pipe reactor.
+        const PAYLOAD_LEN: usize = 512 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| ((i.wrapping_mul(31) ^ (i >> 7)) & 0xFF) as u8).collect();
+
+        unsafe {
+            // 1. Overlapped WriteFile + IOCP: must return ERROR_IO_PENDING on backpressure and
+            // complete only once ALL 512 KiB have been written intact.
+            let (mut rd, mut wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+            let iocp = CreateIoCompletionPort(wr, std::ptr::null_mut(), 0x5120, 1);
+            assert!(!iocp.is_null());
+
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let mut immediate = 0u32;
+            let rc = WriteFile(wr, payload.as_ptr() as *const c_void, PAYLOAD_LEN as u32, &mut immediate, &mut ov);
+            assert_eq!(rc, FALSE, "512 KiB pipe write should go pending under backpressure");
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let rd_addr = rd as usize;
+            let reader = std::thread::spawn(move || {
+                let mut acc = Vec::with_capacity(PAYLOAD_LEN);
+                let mut chunk = [0u8; 4096];
+                while acc.len() < PAYLOAD_LEN {
+                    let mut n = 0u32;
+                    let ok = ReadFile(rd_addr as HANDLE, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut n, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(n > 0);
+                    acc.extend_from_slice(&chunk[..n as usize]);
+                }
+                acc
+            });
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 5000), TRUE);
+            assert_eq!(key, 0x5120);
+            assert_eq!(ov_out, &mut ov as *mut OVERLAPPED);
+            assert_eq!(bytes as usize, PAYLOAD_LEN);
+            let mut res_bytes = 0u32;
+            assert_eq!(GetOverlappedResult(wr, &mut ov, &mut res_bytes, FALSE), TRUE);
+            assert_eq!(res_bytes as usize, PAYLOAD_LEN);
+
+            let received = reader.join().unwrap();
+            assert_eq!(received, payload, "overlapped WriteFile must transfer all 512 KiB intact");
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. WriteFileEx + APC completion routine under the same 512 KiB backpressure.
+            static WFEX_CALLS: AtomicU32 = AtomicU32::new(0);
+            static WFEX_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+            static WFEX_BYTES: AtomicU32 = AtomicU32::new(0);
+            static WFEX_OV: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "win64" fn wfex_cb(err_code: u32, transferred: u32, ov_addr: usize) {
+                WFEX_ERR.store(err_code, Ordering::Release);
+                WFEX_BYTES.store(transferred, Ordering::Release);
+                WFEX_OV.store(ov_addr, Ordering::Release);
+                WFEX_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+
+            WFEX_CALLS.store(0, Ordering::Release);
+            WFEX_ERR.store(u32::MAX, Ordering::Release);
+            WFEX_BYTES.store(0, Ordering::Release);
+            WFEX_OV.store(0, Ordering::Release);
+
+            let (mut rd2, mut wr2) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd2, &mut wr2, std::ptr::null_mut(), 0), TRUE);
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFileEx(wr2, payload.as_ptr() as *const c_void, PAYLOAD_LEN as u32, &mut ov2, Some(wfex_cb)),
+                TRUE
+            );
+            assert_eq!(load_ov_internal(&mut ov2), STATUS_PENDING);
+
+            let rd2_addr = rd2 as usize;
+            let reader2 = std::thread::spawn(move || {
+                let mut acc = Vec::with_capacity(PAYLOAD_LEN);
+                let mut chunk = [0u8; 4096];
+                while acc.len() < PAYLOAD_LEN {
+                    let mut n = 0u32;
+                    let ok = ReadFile(rd2_addr as HANDLE, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut n, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(n > 0);
+                    acc.extend_from_slice(&chunk[..n as usize]);
+                }
+                acc
+            });
+
+            assert_eq!(SleepEx(5000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(WFEX_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(WFEX_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(WFEX_BYTES.load(Ordering::Acquire) as usize, PAYLOAD_LEN);
+            assert_eq!(WFEX_OV.load(Ordering::Acquire), &mut ov2 as *mut OVERLAPPED as usize);
+
+            let received2 = reader2.join().unwrap();
+            assert_eq!(received2, payload, "WriteFileEx must transfer all 512 KiB intact");
+            assert_eq!(CloseHandle(rd2), TRUE);
+            assert_eq!(CloseHandle(wr2), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_cancel_serialized_with_reactor_and_reentry_exactly_once() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        static REENTRY_HANDLE: AtomicUsize = AtomicUsize::new(0);
+        static REENTRY_CALLS: AtomicU32 = AtomicU32::new(0);
+        static REENTRY_CANCEL_RET: AtomicU32 = AtomicU32::new(99);
+        static REENTRY_CANCEL_ERR: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "win64" fn reentry_apc_cb(err_code: u32, _bytes: u32, ov_addr: usize) {
+            assert_eq!(err_code, ERROR_OPERATION_ABORTED);
+            let h = REENTRY_HANDLE.load(Ordering::Acquire) as HANDLE;
+            let rc = CancelIoEx(h, ov_addr as *mut OVERLAPPED);
+            REENTRY_CANCEL_RET.store(rc as u32, Ordering::Release);
+            REENTRY_CANCEL_ERR.store(teb::last_error(), Ordering::Release);
+            REENTRY_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            // (a) Re-entrant CancelIoEx from inside completion callback must not deadlock and
+            // must return FALSE/ERROR_NOT_FOUND, with completion firing strictly once.
+            let (mut rd, mut wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+            REENTRY_HANDLE.store(rd as usize, Ordering::Release);
+            REENTRY_CALLS.store(0, Ordering::Release);
+
+            let mut buf = [0u8; 32];
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ReadFileEx(rd, buf.as_mut_ptr() as *mut c_void, 32, &mut ov, Some(reentry_apc_cb)), TRUE);
+            assert_eq!(CancelIoEx(rd, &mut ov), TRUE);
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(REENTRY_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(REENTRY_CANCEL_RET.load(Ordering::Acquire), FALSE as u32);
+            assert_eq!(REENTRY_CANCEL_ERR.load(Ordering::Acquire), err::ERROR_NOT_FOUND);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // (b) Repeated race between peer WriteFile and CancelIoEx on overlapped ReadFile:
+            // verifies strictly-once IOCP completion, no post-cancel buffer mutation, and safe
+            // immediate reuse/overwrite of OVERLAPPED.h_event once terminal ov.internal is observed.
+            let (mut rd2, mut wr2) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd2, &mut wr2, std::ptr::null_mut(), 0), TRUE);
+            let iocp = CreateIoCompletionPort(rd2, std::ptr::null_mut(), 0xCA01, 1);
+            assert!(!iocp.is_null());
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            let pattern = [0x5Au8; 64];
+            for iter in 0..40usize {
+                let mut rbuf = [0xCCu8; 64];
+                let mut ov_r: OVERLAPPED = std::mem::zeroed();
+                ov_r.h_event = ev;
+                let mut got = 0u32;
+                let r = ReadFile(rd2, rbuf.as_mut_ptr() as *mut c_void, 64, &mut got, &mut ov_r);
+                if r == FALSE {
+                    assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+                    let wr_addr = wr2 as usize;
+                    let writer = std::thread::spawn(move || {
+                        let mut wn = 0u32;
+                        let _ = WriteFile(
+                            wr_addr as HANDLE,
+                            pattern.as_ptr() as *const c_void,
+                            pattern.len() as u32,
+                            &mut wn,
+                            std::ptr::null_mut(),
+                        );
+                    });
+                    if iter % 2 == 0 {
+                        std::thread::yield_now();
+                    }
+                    let cancelled = CancelIoEx(rd2, &mut ov_r);
+
+                    // Wait for terminal ov.internal publication, then immediately clobber h_event
+                    // (simulating caller freeing/reusing OVERLAPPED as soon as internal != STATUS_PENDING).
+                    while load_ov_internal(&mut ov_r) == STATUS_PENDING {
+                        std::thread::yield_now();
+                    }
+                    let final_status = load_ov_internal(&mut ov_r);
+                    let final_bytes = load_ov_internal_high(&mut ov_r);
+                    std::ptr::write_unaligned(
+                        std::ptr::addr_of_mut!(ov_r.h_event),
+                        0xDEAD_BEEFusize as HANDLE,
+                    );
+
+                    // If cancelled, buffer must NEVER be mutated by the reactor afterward.
+                    if final_status == STATUS_CANCELLED {
+                        assert_eq!(cancelled, TRUE);
+                        assert_eq!(final_bytes, 0);
+                        assert!(rbuf.iter().all(|&b| b == 0xCC), "reactor wrote into buffer after STATUS_CANCELLED");
+                    } else {
+                        assert_eq!(final_status, STATUS_SUCCESS);
+                        assert!(final_bytes > 0 && final_bytes <= 64);
+                        assert!(rbuf[..final_bytes].iter().all(|&b| b == 0x5A));
+                    }
+
+                    // Exactly one IOCP completion packet must arrive.
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    let ok = GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000);
+                    assert_eq!(p_key, 0xCA01);
+                    assert_eq!(p_ov, &mut ov_r as *mut OVERLAPPED);
+                    if final_status == STATUS_CANCELLED {
+                        assert_eq!(ok, FALSE);
+                        assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                    } else {
+                        assert_eq!(ok, TRUE);
+                        assert_eq!(p_bytes as usize, final_bytes);
+                    }
+                    assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+                    writer.join().unwrap();
+
+                    // Drain any unread bytes left in pipe before the next iteration.
+                    let mut avail = 0u32;
+                    while PeekNamedPipe(rd2, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut()) == TRUE && avail > 0 {
+                        let mut drain = [0u8; 64];
+                        let mut dn = 0u32;
+                        let _ = ReadFile(rd2, drain.as_mut_ptr() as *mut c_void, drain.len() as u32, &mut dn, std::ptr::null_mut());
+                    }
+                } else {
+                    // Synchronous completion still posts 1 IOCP packet; dequeue it.
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+                }
+            }
+
+            // Confirm zero duplicate/stray IOCP packets remain.
+            let mut extra_entry: OVERLAPPED_ENTRY = std::mem::zeroed();
+            let mut extra_removed = 0u32;
+            assert_eq!(GetQueuedCompletionStatusEx(iocp, &mut extra_entry, 1, &mut extra_removed, 0, FALSE), FALSE);
+            assert_eq!(teb::last_error(), WAIT_TIMEOUT);
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(CloseHandle(rd2), TRUE);
+            assert_eq!(CloseHandle(wr2), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_nonblocking_read_never_stalls_reactor_on_competing_reader_and_preserves_sync_eof() {
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+
+        unsafe {
+            // (a) CreatePipe + DuplicateHandle competing reader must never block the shared
+            // PipeIoReactor or stall unrelated pipes, and must never set O_NONBLOCK on the fd.
+            let (mut rd_a, mut wr_a) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let (mut rd_b, mut wr_b) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut rd_a, &mut wr_a, std::ptr::null_mut(), 0), TRUE);
+            assert_eq!(CreatePipe(&mut rd_b, &mut wr_b, std::ptr::null_mut(), 0), TRUE);
+
+            let cur_proc = handles::CURRENT_PROCESS;
+            let mut rd_a_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(cur_proc, rd_a, cur_proc, &mut rd_a_dup, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */),
+                TRUE
+            );
+            assert!(!rd_a_dup.is_null());
+
+            let (fd_a, _) = file_fd_and_kind(rd_a).unwrap();
+            let (fd_a_dup, _) = file_fd_and_kind(rd_a_dup).unwrap();
+            // Empty nonblocking read returns Ok(None) immediately and leaves O_NONBLOCK clear.
+            let mut probe = [0u8; 8];
+            assert_eq!(try_nonblocking_pipe_read(fd_a, probe.as_mut_ptr(), probe.len()), Ok(None));
+            assert_eq!(libc::fcntl(fd_a, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            assert_eq!(libc::fcntl(fd_a_dup, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+
+            let iocp = CreateIoCompletionPort(rd_a, std::ptr::null_mut(), 0xA001, 1);
+            assert!(!iocp.is_null());
+            assert_eq!(CreateIoCompletionPort(rd_b, iocp, 0xB002, 0), iocp);
+
+            // Race Pipe A's overlapped reactor read against a competing reader on rd_a_dup,
+            // while verifying Pipe B's overlapped read completes promptly without stalling.
+            for iter in 0..25usize {
+                let mut buf_a = [0u8; 16];
+                let mut ov_a: OVERLAPPED = std::mem::zeroed();
+                let mut got_a = 0u32;
+                assert_eq!(ReadFile(rd_a, buf_a.as_mut_ptr() as *mut c_void, 16, &mut got_a, &mut ov_a), FALSE);
+                assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+                let mut buf_b = [0u8; 16];
+                let mut ov_b: OVERLAPPED = std::mem::zeroed();
+                let mut got_b = 0u32;
+                assert_eq!(ReadFile(rd_b, buf_b.as_mut_ptr() as *mut c_void, 16, &mut got_b, &mut ov_b), FALSE);
+                assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+                // Write 1 byte to Pipe A, then immediately try to steal it via the duplicate handle.
+                let mut wn = 0u32;
+                let byte = [(iter & 0xFF) as u8];
+                assert_eq!(WriteFile(wr_a, byte.as_ptr() as *const c_void, 1, &mut wn, std::ptr::null_mut()), TRUE);
+                let mut stolen = [0u8; 4];
+                let stole = matches!(try_nonblocking_pipe_read(fd_a_dup, stolen.as_mut_ptr(), 4), Ok(Some(1)));
+
+                // Write to unrelated Pipe B: if the reactor blocked on Pipe A after losing the
+                // race, Pipe B's completion would hang!
+                let tag = b"pipe-b!";
+                assert_eq!(WriteFile(wr_b, tag.as_ptr() as *const c_void, tag.len() as u32, &mut wn, std::ptr::null_mut()), TRUE);
+
+                // If the duplicate handle stole the byte, cancel Pipe A's still-pending read;
+                // CancelIoEx must return immediately without blocking on a stuck reactor!
+                if stole {
+                    let _ = CancelIoEx(rd_a, &mut ov_a);
+                }
+
+                let mut saw_a = false;
+                let mut saw_b = false;
+                for _ in 0..2 {
+                    let mut p_bytes = 0u32;
+                    let mut p_key = 0usize;
+                    let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+                    let ok = GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000);
+                    if p_key == 0xB002 {
+                        assert_eq!(ok, TRUE);
+                        assert_eq!(p_ov, &mut ov_b as *mut OVERLAPPED);
+                        assert_eq!(p_bytes as usize, tag.len());
+                        assert_eq!(&buf_b[..tag.len()], tag);
+                        saw_b = true;
+                    } else if p_key == 0xA001 {
+                        assert_eq!(p_ov, &mut ov_a as *mut OVERLAPPED);
+                        if ok == TRUE {
+                            assert_eq!(p_bytes, 1);
+                            assert_eq!(buf_a[0], byte[0]);
+                        } else {
+                            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                        }
+                        saw_a = true;
+                    } else {
+                        panic!("unexpected IOCP key {p_key:#x}");
+                    }
+                }
+                assert!(saw_a && saw_b);
+            }
+
+            // (b) Synchronous ReadFile on duplicate pipe handle still blocks for data and
+            // reports ERROR_BROKEN_PIPE cleanly when the write end closes.
+            assert_eq!(libc::fcntl(fd_a_dup, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            let dup_addr = rd_a_dup as usize;
+            let sync_reader = std::thread::spawn(move || {
+                let mut out = [0u8; 32];
+                let mut n1 = 0u32;
+                let ok1 = ReadFile(dup_addr as HANDLE, out.as_mut_ptr() as *mut c_void, 32, &mut n1, std::ptr::null_mut());
+                assert_eq!(ok1, TRUE);
+                let first = out[..n1 as usize].to_vec();
+                let mut n2 = 0u32;
+                let ok2 = ReadFile(dup_addr as HANDLE, out.as_mut_ptr() as *mut c_void, 32, &mut n2, std::ptr::null_mut());
+                assert_eq!(ok2, FALSE);
+                (first, teb::last_error())
+            });
+            let msg = b"sync-wait-ok";
+            let mut wn = 0u32;
+            assert_eq!(WriteFile(wr_a, msg.as_ptr() as *const c_void, msg.len() as u32, &mut wn, std::ptr::null_mut()), TRUE);
+            assert_eq!(CloseHandle(wr_a), TRUE);
+            let (first, eof_err) = sync_reader.join().unwrap();
+            assert_eq!(&first, msg);
+            assert_eq!(eof_err, err::ERROR_BROKEN_PIPE);
+
+            assert_eq!(CloseHandle(rd_a_dup), TRUE);
+            assert_eq!(CloseHandle(rd_a), TRUE);
+            assert_eq!(CloseHandle(rd_b), TRUE);
+            assert_eq!(CloseHandle(wr_b), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+
+            // (c) External raw POSIX S_IFIFO fallback: nonblocking read never blocks on empty
+            // FIFO, and synchronous ReadFile still waits for data and returns ERROR_BROKEN_PIPE on EOF.
+            let mut raw_fds = [-1i32; 2];
+            assert_eq!(libc::pipe(raw_fds.as_mut_ptr()), 0);
+            set_cloexec(raw_fds[0]);
+            set_cloexec(raw_fds[1]);
+            let h_fifo_rd = handles::insert(Arc::new(FileObj::new(
+                File::from_raw_fd(raw_fds[0]),
+                FileKind::Pipe,
+                "\\\\.\\pipe\\raw-fifo-rd".into(),
+                None,
+                GENERIC_READ,
+                0,
+            )));
+            let h_fifo_wr = handles::insert(Arc::new(FileObj::new(
+                File::from_raw_fd(raw_fds[1]),
+                FileKind::Pipe,
+                "\\\\.\\pipe\\raw-fifo-wr".into(),
+                None,
+                GENERIC_WRITE,
+                0,
+            )));
+            assert_eq!(try_nonblocking_pipe_read(raw_fds[0], probe.as_mut_ptr(), 8), Ok(None));
+
+            let fifo_rd_addr = h_fifo_rd as usize;
+            let fifo_sync = std::thread::spawn(move || {
+                let mut b = [0u8; 16];
+                let mut n1 = 0u32;
+                assert_eq!(ReadFile(fifo_rd_addr as HANDLE, b.as_mut_ptr() as *mut c_void, 16, &mut n1, std::ptr::null_mut()), TRUE);
+                let got = b[..n1 as usize].to_vec();
+                let mut n2 = 0u32;
+                assert_eq!(ReadFile(fifo_rd_addr as HANDLE, b.as_mut_ptr() as *mut c_void, 16, &mut n2, std::ptr::null_mut()), FALSE);
+                (got, teb::last_error())
+            });
+            assert_eq!(WriteFile(h_fifo_wr, b"fifo-ok".as_ptr() as *const c_void, 7, &mut wn, std::ptr::null_mut()), TRUE);
+            assert_eq!(CloseHandle(h_fifo_wr), TRUE);
+            let (fifo_got, fifo_eof_err) = fifo_sync.join().unwrap();
+            assert_eq!(&fifo_got, b"fifo-ok");
+            assert_eq!(fifo_eof_err, err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(h_fifo_rd), TRUE);
+        }
+    }
+
+    #[test]
+    fn read_directory_changes_atomic_buffered_and_live_registration_all_modes() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        let dir = std::env::temp_dir().join(format!("win32_rt_dirwatch_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("W:\\", std::path::Path::new("/"));
+        let win_dir = to_wide_z(&format!("W:{}", dir.to_string_lossy().replace('/', "\\")));
+        let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+
+        unsafe {
+            let open_dir = || {
+                let h = CreateFileW(
+                    win_dir.as_ptr(),
+                    GENERIC_READ,
+                    7,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000, // FILE_FLAG_OVERLAPPED
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let wait_for_buffered = |h: HANDLE| {
+                let f = get_file(h).unwrap();
+                let w = f.dir_watcher.lock().unwrap().clone().expect("watcher started");
+                let dl = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < dl {
+                    if !w.state.lock().unwrap().pending_changes.is_empty() {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("timed out waiting for watcher to buffer filesystem change");
+            };
+
+            // (a) Event-before-register (buffered change consumed atomically) across Sync, APC, and Overlapped+IOCP.
+            let h = open_dir();
+            let iocp = CreateIoCompletionPort(h, std::ptr::null_mut(), 0xD777, 1);
+            assert!(!iocp.is_null());
+
+            // Prime the watcher with one live overlapped watch so DirWatcher is running.
+            let mut buf = [0u8; 4096];
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov, std::ptr::null()),
+                TRUE
+            );
+            std::fs::write(dir.join("prime.txt"), b"0").unwrap();
+            let mut p_bytes = 0u32;
+            let mut p_key = 0usize;
+            let mut p_ov: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+            assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+
+            // 1. Buffered -> Overlapped+IOCP: mutate while NO request is registered, wait until
+            // buffered, then register overlapped read; must complete immediately with NO extra mutation.
+            std::fs::write(dir.join("buffered_ov.txt"), b"1").unwrap();
+            wait_for_buffered(h);
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov, std::ptr::null()),
+                TRUE
+            );
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 2000), TRUE);
+            assert_eq!(p_key, 0xD777);
+            assert_eq!(p_ov, &mut ov as *mut OVERLAPPED);
+            assert_eq!(WaitForSingleObject(ev, 1000), WAIT_OBJECT_0);
+            let recs = parse_notify_records(&buf, p_bytes as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_ov.txt"), "got {recs:?}");
+
+            // 2. Buffered -> APC: mutate while NO request is registered, wait until buffered, then
+            // register APC read; must queue APC immediately without touching ov.h_event.
+            static ATOMIC_APC_CALLS: AtomicU32 = AtomicU32::new(0);
+            static ATOMIC_APC_BYTES: AtomicU32 = AtomicU32::new(0);
+            static ATOMIC_APC_OV: AtomicUsize = AtomicUsize::new(0);
+            unsafe extern "win64" fn atomic_apc_cb(err_code: u32, bytes: u32, ov_addr: usize) {
+                assert_eq!(err_code, 0);
+                ATOMIC_APC_BYTES.store(bytes, Ordering::Release);
+                ATOMIC_APC_OV.store(ov_addr, Ordering::Release);
+                ATOMIC_APC_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+            ATOMIC_APC_CALLS.store(0, Ordering::Release);
+            let apc_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_apc: OVERLAPPED = std::mem::zeroed();
+            ov_apc.h_event = apc_ev;
+            std::fs::write(dir.join("buffered_apc.txt"), b"2").unwrap();
+            wait_for_buffered(h);
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    filter,
+                    std::ptr::null_mut(),
+                    &mut ov_apc,
+                    atomic_apc_cb as *const c_void,
+                ),
+                TRUE
+            );
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(ATOMIC_APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(ATOMIC_APC_OV.load(Ordering::Acquire), &mut ov_apc as *mut OVERLAPPED as usize);
+            assert_eq!(WaitForSingleObject(apc_ev, 0), WAIT_TIMEOUT, "APC mode must not signal ov.h_event");
+            let recs = parse_notify_records(&buf, ATOMIC_APC_BYTES.load(Ordering::Acquire) as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_apc.txt"), "got {recs:?}");
+
+            // 3. Buffered -> Sync: mutate while NO request is registered, wait until buffered, then
+            // call synchronous ReadDirectoryChangesW; must return immediately with the buffered record.
+            std::fs::write(dir.join("buffered_sync.txt"), b"3").unwrap();
+            wait_for_buffered(h);
+            let mut sync_bytes = 0u32;
+            assert_eq!(
+                ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, &mut sync_bytes, std::ptr::null_mut(), std::ptr::null()),
+                TRUE
+            );
+            let recs = parse_notify_records(&buf, sync_bytes as usize);
+            assert!(recs.iter().any(|(_, p)| p == "buffered_sync.txt"), "got {recs:?}");
+
+            // (b) Concurrent mutation-vs-registration stress across Sync, APC, and Overlapped+IOCP:
+            // exercises both event-before-register and register-before-event with zero hangs.
+            for i in 0..10usize {
+                let name = format!("race_ov_{i}.txt");
+                let p = dir.join(&name);
+                let mut ov_r: OVERLAPPED = std::mem::zeroed();
+                let t = std::thread::spawn(move || {
+                    std::fs::write(p, b"r").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, std::ptr::null_mut(), &mut ov_r, std::ptr::null()),
+                    TRUE
+                );
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut p_bytes, &mut p_key, &mut p_ov, 3000), TRUE);
+                assert_eq!(p_ov, &mut ov_r as *mut OVERLAPPED);
+                t.join().unwrap();
+
+                let name_a = format!("race_apc_{i}.txt");
+                let pa = dir.join(&name_a);
+                ATOMIC_APC_CALLS.store(0, Ordering::Release);
+                let mut ov_ra: OVERLAPPED = std::mem::zeroed();
+                let ta = std::thread::spawn(move || {
+                    std::fs::write(pa, b"a").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(
+                        h,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len() as u32,
+                        FALSE,
+                        filter,
+                        std::ptr::null_mut(),
+                        &mut ov_ra,
+                        atomic_apc_cb as *const c_void,
+                    ),
+                    TRUE
+                );
+                assert_eq!(SleepEx(3000, TRUE), WAIT_IO_COMPLETION);
+                assert_eq!(ATOMIC_APC_CALLS.load(Ordering::Acquire), 1);
+                ta.join().unwrap();
+
+                let name_s = format!("race_sync_{i}.txt");
+                let ps = dir.join(&name_s);
+                let mut sb = 0u32;
+                let ts = std::thread::spawn(move || {
+                    std::fs::write(ps, b"s").unwrap();
+                });
+                assert_eq!(
+                    ReadDirectoryChangesW(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, FALSE, filter, &mut sb, std::ptr::null_mut(), std::ptr::null()),
+                    TRUE
+                );
+                assert!(sb > 0);
+                ts.join().unwrap();
+            }
+
+            assert_eq!(CloseHandle(apc_ev), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(h), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn complete_overlapped_captures_iocp_and_handle_event_before_publication() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        const WAIT_OBJECT_0: u32 = 0;
+        const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
+        const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
+
+        unsafe {
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            // 1. FileObj (pipe) path: consumer wakes on hEvent right after terminal Internal is
+            // published, immediately closes both the file handle and the event handle, and mutates
+            // `ov.h_event` (with low bit set) in valid stack storage. Completion must STILL set the
+            // retained handle event and post the original completion key/bytes to IOCP.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            let file_key = 0x1122_3344usize;
+            assert_eq!(CreateIoCompletionPort(rd, iocp, file_key, 0), iocp);
+            let file_binding = lookup_io_completion_binding(rd).unwrap();
+            file_binding.io_event.reset();
+
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            prepare_overlapped_pending(&mut ov);
+
+            let ov_ptr = &mut ov as *mut OVERLAPPED;
+            let posted = complete_overlapped_binding_with_hook(
+                Some(&file_binding),
+                ov_ptr,
+                STATUS_SUCCESS,
+                321,
+                false,
+                || {
+                    // Publication boundary: Internal/InternalHigh and explicit hEvent are already
+                    // visible, while handle_event and IOCP delivery have not run yet.
+                    assert_eq!(load_ov_internal(ov_ptr), STATUS_SUCCESS);
+                    assert_eq!(load_ov_internal_high(ov_ptr), 321);
+                    assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+                    assert_eq!(CloseHandle(rd), TRUE);
+                    assert_eq!(CloseHandle(ev), TRUE);
+                    // Mutate `ov.h_event` (including low-bit suppress flag) to prove no post-publish
+                    // guest OVERLAPPED dereference occurs.
+                    (*ov_ptr).h_event = (0xDEAD_BEEF_usize | 1) as HANDLE;
+                },
+            );
+            assert!(posted);
+            assert!(get_file(rd).is_none(), "file handle must already be closed");
+            assert!(
+                file_binding.io_event.try_take(),
+                "retained handle event must still be signaled after CloseHandle(rd)"
+            );
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, file_key);
+            assert_eq!(bytes, 321);
+            assert_eq!(ov_out, ov_ptr);
+
+            // Also verify PendingPipeOp's retained Arc<FileObj> completes cleanly even if CloseHandle
+            // already removed the handle BEFORE `complete_overlapped_binding` is entered.
+            let mut ov_late: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_late);
+            let ov_late_ptr = &mut ov_late as *mut OVERLAPPED;
+            assert!(complete_overlapped_binding(
+                Some(&file_binding),
+                ov_late_ptr,
+                STATUS_SUCCESS,
+                77,
+                false,
+            ));
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, file_key);
+            assert_eq!(bytes, 77);
+            assert_eq!(ov_out, ov_late_ptr);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. External/socket handle path: unregistering the handle immediately after hEvent
+            // signal must still deliver the original IOCP packet and handle event.
+            let fake_sock = 0x00EE_0001usize as HANDLE;
+            register_external_io_handle(fake_sock);
+            let sock_key = 0x5566_7788usize;
+            assert_eq!(CreateIoCompletionPort(fake_sock, iocp, sock_key, 0), iocp);
+            let sock_binding = lookup_io_completion_binding(fake_sock).unwrap();
+            sock_binding.io_event.reset();
+
+            let sock_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!sock_ev.is_null());
+            let mut ov_s: OVERLAPPED = std::mem::zeroed();
+            ov_s.h_event = sock_ev;
+            prepare_overlapped_pending(&mut ov_s);
+            let ov_s_ptr = &mut ov_s as *mut OVERLAPPED;
+
+            let posted_s = complete_overlapped_binding_with_hook(
+                Some(&sock_binding),
+                ov_s_ptr,
+                STATUS_SUCCESS,
+                654,
+                false,
+                || {
+                    assert_eq!(load_ov_internal(ov_s_ptr), STATUS_SUCCESS);
+                    assert_eq!(load_ov_internal_high(ov_s_ptr), 654);
+                    assert_eq!(WaitForSingleObject(sock_ev, 0), WAIT_OBJECT_0);
+                    unregister_external_io_handle(fake_sock);
+                    assert_eq!(CloseHandle(sock_ev), TRUE);
+                    (*ov_s_ptr).h_event = (0xCAFE_BABE_usize | 1) as HANDLE;
+                },
+            );
+            assert!(posted_s);
+            assert!(lookup_io_completion_binding(fake_sock).is_none());
+            assert!(sock_binding.io_event.try_take());
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, sock_key);
+            assert_eq!(bytes, 654);
+            assert_eq!(ov_out, ov_s_ptr);
+
+            // 3. Suppression rules (SetFileCompletionNotificationModes):
+            //    (a) low bit on hEvent suppresses IOCP while still signaling the explicit event;
+            //    (b) FILE_SKIP_SET_EVENT_ON_HANDLE suppresses the implicit handle event on both
+            //        pending and synchronous completions (never suppressing explicit hEvent);
+            //    (c) FILE_SKIP_COMPLETION_PORT_ON_SUCCESS suppresses IOCP only on sync completions.
+            let fake_sock2 = 0x00EE_0002usize as HANDLE;
+            register_external_io_handle(fake_sock2);
+            assert_eq!(CreateIoCompletionPort(fake_sock2, iocp, 0x9999, 0), iocp);
+            assert_eq!(
+                SetFileCompletionNotificationModes(
+                    fake_sock2,
+                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+                ),
+                TRUE
+            );
+            let b2 = lookup_io_completion_binding(fake_sock2).unwrap();
+            b2.io_event.reset();
+            let ev2 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_sup: OVERLAPPED = std::mem::zeroed();
+            ov_sup.h_event = (ev2 as usize | 1) as HANDLE;
+            prepare_overlapped_pending(&mut ov_sup);
+            assert!(!complete_overlapped_io(fake_sock2, &mut ov_sup, STATUS_SUCCESS, 12, false));
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0);
+            assert!(!b2.io_event.try_take());
+
+            // Pending completion with explicit event (no low bit): explicit event is set,
+            // implicit handle event remains clear, and exactly one IOCP packet is posted
+            // despite FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (0x1) also being set.
+            assert_eq!(crate::kernel32::threads::ResetEvent(ev2), TRUE);
+            b2.io_event.reset();
+            let mut ov_pend: OVERLAPPED = std::mem::zeroed();
+            ov_pend.h_event = ev2;
+            prepare_overlapped_pending(&mut ov_pend);
+            assert!(complete_overlapped_io(fake_sock2, &mut ov_pend, STATUS_SUCCESS, 56, false));
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0);
+            assert!(!b2.io_event.try_take());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, 0x9999);
+            assert_eq!(bytes, 56);
+            assert_eq!(ov_out, &mut ov_pend as *mut OVERLAPPED);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 20), FALSE);
+
+            b2.io_event.reset();
+            let mut ov_sync: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_sync);
+            assert!(!complete_overlapped_io(fake_sock2, &mut ov_sync, STATUS_SUCCESS, 34, true));
+            assert!(!b2.io_event.try_take());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 20), FALSE);
+
+            unregister_external_io_handle(fake_sock2);
+            assert_eq!(CloseHandle(ev2), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn complete_overlapped_captures_tp_io_before_publication_and_drains_wait() {
+        use crate::kernel32::threadpool::{
+            CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo, TpIo, WaitForThreadpoolIoCallbacks,
+        };
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use std::sync::atomic::AtomicUsize;
+
+        const WAIT_OBJECT_0: u32 = 0;
+
+        struct TpCapture {
+            calls: AtomicUsize,
+            last_ov: AtomicUsize,
+            last_res: AtomicUsize,
+            last_bytes: AtomicUsize,
+        }
+
+        unsafe extern "win64" fn tp_io_cb(
+            _inst: *mut c_void,
+            ctx: *mut c_void,
+            ov: *mut c_void,
+            io_result: usize,
+            bytes: usize,
+            _pio: *mut c_void,
+        ) {
+            let cap = &*(ctx as *const TpCapture);
+            cap.last_ov.store(ov as usize, Ordering::Release);
+            cap.last_res.store(io_result, Ordering::Release);
+            cap.last_bytes.store(bytes, Ordering::Release);
+            cap.calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            // 1. FileObj + TpIo: closing the file handle immediately upon hEvent signal must
+            // still dispatch the TpIo callback and drain WaitForThreadpoolIoCallbacks.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            let cap_file = Box::new(TpCapture {
+                calls: AtomicUsize::new(0),
+                last_ov: AtomicUsize::new(0),
+                last_res: AtomicUsize::new(usize::MAX),
+                last_bytes: AtomicUsize::new(0),
+            });
+            let pio_file = CreateThreadpoolIo(
+                rd,
+                tp_io_cb as *const c_void,
+                &*cap_file as *const TpCapture as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert!(!pio_file.is_null());
+            StartThreadpoolIo(pio_file);
+
+            let file_binding = lookup_io_completion_binding(rd).unwrap();
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            prepare_overlapped_pending(&mut ov);
+            let ov_ptr = &mut ov as *mut OVERLAPPED;
+
+            let dispatched = complete_overlapped_binding_with_hook(
+                Some(&file_binding),
+                ov_ptr,
+                STATUS_SUCCESS,
+                987,
+                false,
+                || {
+                    assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+                    assert_eq!(CloseHandle(rd), TRUE);
+                    assert_eq!(CloseHandle(ev), TRUE);
+                    (*ov_ptr).h_event = (0xBEEF_usize | 1) as HANDLE;
+                },
+            );
+            assert!(dispatched);
+
+            // Bounded WaitForThreadpoolIoCallbacks: must drain promptly (no stuck pending_io).
+            let pio_addr = pio_file as usize;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, FALSE);
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .expect("WaitForThreadpoolIoCallbacks must drain after CloseHandle at publication boundary");
+            waiter.join().unwrap();
+
+            assert_eq!(cap_file.calls.load(Ordering::Acquire), 1);
+            assert_eq!(cap_file.last_ov.load(Ordering::Acquire), ov_ptr as usize);
+            assert_eq!(cap_file.last_res.load(Ordering::Acquire), 0);
+            assert_eq!(cap_file.last_bytes.load(Ordering::Acquire), 987);
+            CloseThreadpoolIo(pio_file);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. External/socket handle + TpIo: unregistering at the publication boundary must
+            // likewise dispatch the TpIo callback and drain WaitForThreadpoolIoCallbacks.
+            let fake_sock = 0x00EE_0003usize as HANDLE;
+            register_external_io_handle(fake_sock);
+            let cap_ext = Box::new(TpCapture {
+                calls: AtomicUsize::new(0),
+                last_ov: AtomicUsize::new(0),
+                last_res: AtomicUsize::new(usize::MAX),
+                last_bytes: AtomicUsize::new(0),
+            });
+            let pio_ext = CreateThreadpoolIo(
+                fake_sock,
+                tp_io_cb as *const c_void,
+                &*cap_ext as *const TpCapture as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert!(!pio_ext.is_null());
+            StartThreadpoolIo(pio_ext);
+
+            let ext_binding = lookup_io_completion_binding(fake_sock).unwrap();
+            let ev_ext = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_ext: OVERLAPPED = std::mem::zeroed();
+            ov_ext.h_event = ev_ext;
+            prepare_overlapped_pending(&mut ov_ext);
+            let ov_ext_ptr = &mut ov_ext as *mut OVERLAPPED;
+
+            let dispatched_ext = complete_overlapped_binding_with_hook(
+                Some(&ext_binding),
+                ov_ext_ptr,
+                STATUS_SUCCESS,
+                432,
+                false,
+                || {
+                    assert_eq!(WaitForSingleObject(ev_ext, 0), WAIT_OBJECT_0);
+                    unregister_external_io_handle(fake_sock);
+                    assert_eq!(CloseHandle(ev_ext), TRUE);
+                    (*ov_ext_ptr).h_event = (0xFACE_usize | 1) as HANDLE;
+                },
+            );
+            assert!(dispatched_ext);
+
+            let pio_ext_addr = pio_ext as usize;
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            let waiter2 = std::thread::spawn(move || {
+                WaitForThreadpoolIoCallbacks(pio_ext_addr as *mut TpIo, FALSE);
+                let _ = tx2.send(());
+            });
+            rx2.recv_timeout(std::time::Duration::from_secs(3))
+                .expect("WaitForThreadpoolIoCallbacks must drain on external handle close at publication boundary");
+            waiter2.join().unwrap();
+
+            assert_eq!(cap_ext.calls.load(Ordering::Acquire), 1);
+            assert_eq!(cap_ext.last_ov.load(Ordering::Acquire), ov_ext_ptr as usize);
+            assert_eq!(cap_ext.last_res.load(Ordering::Acquire), 0);
+            assert_eq!(cap_ext.last_bytes.load(Ordering::Acquire), 432);
+            CloseThreadpoolIo(pio_ext);
+        }
+    }
+
+    #[test]
+    fn protected_native_runner_bundle_and_aot_cache_block_guest_writes_renames_deletes_and_aliases() {
+        use crate::kernel32::threads::CloseHandle;
+        let root = std::env::temp_dir().join(format!("port_factory_vfs_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = root.join("MockApp.app");
+        let contents = app.join("Contents");
+        let macos = contents.join("MacOS");
+        let frameworks = contents.join("Frameworks");
+        let codesig = contents.join("_CodeSignature");
+        let resources = contents.join("Resources");
+        let aot_bundle = resources.join("AotCache");
+        let game_dir = resources.join("Game");
+        let host_aot = root.join("HostAotCache");
+        let guest_work = root.join("GuestWork");
+
+        for d in [&macos, &frameworks, &codesig, &aot_bundle, &game_dir, &host_aot, &guest_work] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let runner = macos.join("port-runner");
+        let dylib = frameworks.join("libmetalirconverter.dylib");
+        let plist = contents.join("Info.plist");
+        let sig_res = codesig.join("CodeResources");
+        let manifest = resources.join("game.toml");
+        let bundled_aot = aot_bundle.join("mod.aot");
+        let host_aot_file = host_aot.join("cached.aot");
+        let game_save = game_dir.join("save.dat");
+        let guest_file = guest_work.join("ordinary.txt");
+
+        std::fs::write(&runner, b"INERT-RUNNER-FIXTURE").unwrap();
+        std::fs::write(&dylib, b"INERT-DYLIB-FIXTURE").unwrap();
+        std::fs::write(&plist, b"<plist/>").unwrap();
+        std::fs::write(&sig_res, b"sig").unwrap();
+        std::fs::write(&manifest, b"name = \"Mock\"\n").unwrap();
+        std::fs::write(&bundled_aot, b"AOT1").unwrap();
+        std::fs::write(&host_aot_file, b"AOT2").unwrap();
+        std::fs::write(&game_save, b"save-v1").unwrap();
+        std::fs::write(&guest_file, b"guest-v1").unwrap();
+
+        // Pre-existing host symlink & hardlink aliases outside the bundle pointing to the runner.
+        let ext_symlink = guest_work.join("symlink_to_runner");
+        let ext_hardlink = guest_work.join("hardlink_to_runner");
+        std::os::unix::fs::symlink(&runner, &ext_symlink).unwrap();
+        std::fs::hard_link(&runner, &ext_hardlink).unwrap();
+
+        let _guard = path::tests::protect_native_runner_scoped_for_test("V:\\", &root, &runner);
+        path::protect_native_subtree(&host_aot);
+
+        unsafe {
+            // 1. CreateFileW write / truncate / create-always / delete-on-close blocked across
+            //    direct paths, case variants, `..` traversal, bundle files, AOT cache, and aliases.
+            for win_target in [
+                r"V:\MockApp.app\Contents\MacOS\port-runner",
+                r"V:\MOCKAPP.APP\CONTENTS\MACOS\PORT-RUNNER",
+                r"V:\GuestWork\..\MockApp.app\Contents\MacOS\port-runner",
+                r"V:\MockApp.app\Contents\MacOS\new_helper",
+                r"V:\MockApp.app\Contents\Frameworks\libmetalirconverter.dylib",
+                r"V:\MockApp.app\Contents\Info.plist",
+                r"V:\MockApp.app\Contents\_CodeSignature\CodeResources",
+                r"V:\MockApp.app\Contents\Resources\game.toml",
+                r"V:\MockApp.app\Contents\Resources\AotCache\mod.aot",
+                r"V:\HostAotCache\cached.aot",
+                r"V:\HostAotCache\new_entry.aot",
+                r"V:\GuestWork\symlink_to_runner",
+                r"V:\GuestWork\hardlink_to_runner",
+            ] {
+                let w = to_wide_z(win_target);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_ALWAYS,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(h, INVALID_HANDLE_VALUE, "write open must be blocked for {win_target}");
+                assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED, "expected ACCESS_DENIED for {win_target}");
+
+                let h_del = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_DELETE_ON_CLOSE,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(h_del, INVALID_HANDLE_VALUE, "DELETE_ON_CLOSE must be blocked for {win_target}");
+                assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            }
+
+            // 2. Delete, rename/replace (target, source, and ancestor dir), copy-over, rmdir,
+            //    SetFileAttributes, hardlink, and symlink creation all fail with ACCESS_DENIED.
+            let w_runner = to_wide_z(r"V:\MockApp.app\Contents\MacOS\port-runner");
+            let w_guest = to_wide_z(r"V:\GuestWork\ordinary.txt");
+            let w_dst = to_wide_z(r"V:\GuestWork\moved_out");
+            let w_app = to_wide_z(r"V:\MockApp.app");
+            let w_contents = to_wide_z(r"V:\MockApp.app\Contents");
+            let w_macos = to_wide_z(r"V:\MockApp.app\Contents\MacOS");
+
+            assert_eq!(DeleteFileW(w_runner.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_runner.as_ptr(), w_dst.as_ptr(), MOVEFILE_REPLACE_EXISTING), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_guest.as_ptr(), w_runner.as_ptr(), MOVEFILE_REPLACE_EXISTING), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_app.as_ptr(), w_dst.as_ptr(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_contents.as_ptr(), w_dst.as_ptr(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(ReplaceFileW(w_runner.as_ptr(), w_guest.as_ptr(), std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CopyFileW(w_guest.as_ptr(), w_runner.as_ptr(), FALSE), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(RemoveDirectoryW(w_macos.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(RemoveDirectoryW(w_app.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(SetFileAttributesW(w_runner.as_ptr(), FILE_ATTRIBUTE_NORMAL), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+            let w_new_hl = to_wide_z(r"V:\GuestWork\new_hl");
+            let w_new_sl = to_wide_z(r"V:\GuestWork\new_sl");
+            assert_eq!(CreateHardLinkW(w_new_hl.as_ptr(), w_runner.as_ptr(), std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CreateSymbolicLinkW(w_new_sl.as_ptr(), w_runner.as_ptr(), 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CreateSymbolicLinkW(w_new_sl.as_ptr(), w_macos.as_ptr(), 1), 0);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+            // 3. Handle-based mutations on a read-only handle to the protected runner all fail closed.
+            let h_ro = CreateFileW(
+                w_runner.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_ro, INVALID_HANDLE_VALUE, "read-only open stays allowed");
+            let mut written = 0u32;
+            assert_eq!(WriteFile(h_ro, b"X".as_ptr() as *const c_void, 1, &mut written, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(SetEndOfFile(h_ro), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let del_flag: u8 = 1;
+            assert_eq!(SetFileInformationByHandle(h_ro, 4, &del_flag, 1), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let eof_zero: i64 = 0;
+            assert_eq!(SetFileInformationByHandle(h_ro, 6, &eof_zero as *const i64 as *const u8, 8), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let mut rename_buf = vec![0u8; 20 + 64];
+            rename_buf[0] = 1;
+            let dst_u16 = to_wide(r"V:\GuestWork\renamed_via_handle");
+            (rename_buf.as_mut_ptr().add(16) as *mut u32).write_unaligned((dst_u16.len() * 2) as u32);
+            std::ptr::copy_nonoverlapping(dst_u16.as_ptr() as *const u8, rename_buf.as_mut_ptr().add(20), dst_u16.len() * 2);
+            assert_eq!(SetFileInformationByHandle(h_ro, 3, rename_buf.as_ptr(), rename_buf.len() as u32), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert!(CreateFileMappingW(h_ro, std::ptr::null_mut(), 0x04, 0, 0, std::ptr::null()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(ReOpenFile(h_ro, GENERIC_WRITE, 0, 0), INVALID_HANDLE_VALUE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CloseHandle(h_ro), TRUE);
+
+            // 4. UCRT paths (_open write, _unlink, rename) and shell32 SHFileOperationW also refuse protected files.
+            assert_eq!(crate::ucrt::stdio::open_host(r"V:\MockApp.app\Contents\MacOS\port-runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::stdio::open_host(r"V:\GuestWork\symlink_to_runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::env::_wunlink(w_runner.as_ptr()), -1);
+            assert_eq!(crate::ucrt::env::_wrename(w_runner.as_ptr(), w_dst.as_ptr()), -1);
+            assert_eq!(crate::ucrt::env::_wrename(w_guest.as_ptr(), w_runner.as_ptr()), -1);
+
+            let mut sh_from = to_wide(r"V:\MockApp.app\Contents\MacOS\port-runner");
+            sh_from.extend_from_slice(&[0, 0]);
+            let mut sh_op = [0u8; 56];
+            (sh_op.as_mut_ptr().add(8) as *mut u32).write_unaligned(3); // FO_DELETE
+            (sh_op.as_mut_ptr().add(16) as *mut *const u16).write_unaligned(sh_from.as_ptr());
+            assert_eq!(
+                crate::misc::shell32::SHFileOperationW(sh_op.as_mut_ptr()),
+                err::ERROR_ACCESS_DENIED as i32
+            );
+
+            // 5. Ordinary guest data (both in GuestWork and in MockApp.app/Contents/Resources/Game)
+            //    remains fully writable, renamable, and removable.
+            for writable_win in [
+                r"V:\GuestWork\ordinary.txt",
+                r"V:\GuestWork\created_by_guest.txt",
+                r"V:\MockApp.app\Contents\Resources\Game\save.dat",
+                r"V:\MockApp.app\Contents\Resources\Game\new_save.dat",
+            ] {
+                let w = to_wide_z(writable_win);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    CREATE_ALWAYS,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE, "ordinary guest path must remain writable: {writable_win}");
+                let mut nw = 0u32;
+                assert_eq!(WriteFile(h, b"ok".as_ptr() as *const c_void, 2, &mut nw, std::ptr::null_mut()), TRUE);
+                assert_eq!(nw, 2);
+                assert_eq!(CloseHandle(h), TRUE);
+            }
+            let w_new_save = to_wide_z(r"V:\MockApp.app\Contents\Resources\Game\new_save.dat");
+            let w_moved_save = to_wide_z(r"V:\MockApp.app\Contents\Resources\Game\moved_save.dat");
+            assert_eq!(MoveFileExW(w_new_save.as_ptr(), w_moved_save.as_ptr(), MOVEFILE_REPLACE_EXISTING), TRUE);
+            assert_eq!(DeleteFileW(w_moved_save.as_ptr()), TRUE);
+        }
+
+        // Protected runner binary remained completely untouched.
+        assert_eq!(std::fs::read(&runner).unwrap(), b"INERT-RUNNER-FIXTURE");
+        assert_eq!(std::fs::read(&dylib).unwrap(), b"INERT-DYLIB-FIXTURE");
+        assert_eq!(std::fs::read(&host_aot_file).unwrap(), b"AOT2");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peek_named_pipe_preserves_bytes_for_pending_reads_socketpair_and_raw_fifo() {
+        use crate::kernel32::threads::CloseHandle;
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::AtomicUsize;
+
+        const WAIT_IO_COMPLETION: u32 = 0xC0;
+        static PEEK_APC_BYTES: AtomicUsize = AtomicUsize::new(0);
+        static PEEK_APC_ERR: AtomicUsize = AtomicUsize::new(usize::MAX);
+        unsafe extern "win64" fn peek_apc_cb(err_code: u32, bytes: u32, _ov: usize) {
+            PEEK_APC_ERR.store(err_code as usize, Ordering::Release);
+            PEEK_APC_BYTES.store(bytes as usize, Ordering::Release);
+        }
+
+        unsafe {
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            // 1. Socketpair-backed pipe (CreatePipe): PeekNamedPipe uses MSG_PEEK without
+            //    consuming kernel bytes or filling `peek_buf`, so repeated peeks see the same
+            //    data and a pending overlapped ReadFile completes with no second write.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            assert_eq!(CreateIoCompletionPort(rd, iocp, 0x9101, 0), iocp);
+
+            // Repeated peeks before any read must leave `peek_buf` empty and preserve exact counts.
+            let mut nw = 0u32;
+            let msg1 = b"PEEK-VISIBLE";
+            assert_eq!(WriteFile(wr, msg1.as_ptr() as *const c_void, msg1.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            for _ in 0..2 {
+                let mut pbuf = [0u8; 4];
+                let (mut pread, mut pavail, mut pleft) = (0u32, 0u32, 0u32);
+                assert_eq!(
+                    PeekNamedPipe(rd, pbuf.as_mut_ptr() as *mut c_void, 4, &mut pread, &mut pavail, &mut pleft),
+                    TRUE
+                );
+                assert_eq!(pread, 4);
+                assert_eq!(pavail, msg1.len() as u32);
+                assert_eq!(pleft, (msg1.len() - 4) as u32);
+                assert_eq!(&pbuf, b"PEEK");
+                assert!(
+                    get_file(rd).unwrap().peek_buf.lock().unwrap().is_empty(),
+                    "socketpair PeekNamedPipe must not consume kernel bytes into peek_buf"
+                );
+            }
+            let mut rbuf1 = [0u8; 32];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(rd, rbuf1.as_mut_ptr() as *mut c_void, rbuf1.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&rbuf1[..nr as usize], msg1);
+
+            // Pending overlapped ReadFile + write + immediate PeekNamedPipe (no second write!).
+            let mut ov_rd: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf2 = [0u8; 32];
+            assert_eq!(ReadFile(rd, rbuf2.as_mut_ptr() as *mut c_void, rbuf2.len() as u32, std::ptr::null_mut(), &mut ov_rd), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let msg2 = b"AFTER-PEEK";
+            assert_eq!(WriteFile(wr, msg2.as_ptr() as *const c_void, msg2.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut pbuf2 = [0u8; 16];
+            let (mut pread2, mut pavail2, mut pleft2) = (0u32, 0u32, 0u32);
+            let _ = PeekNamedPipe(rd, pbuf2.as_mut_ptr() as *mut c_void, 10, &mut pread2, &mut pavail2, &mut pleft2);
+
+            let (mut bytes, mut key, mut ov_out) = (0u32, 0usize, std::ptr::null_mut());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x9101);
+            assert_eq!(ov_out, &mut ov_rd as *mut OVERLAPPED);
+            assert_eq!(&rbuf2[..bytes as usize], msg2);
+
+            // Pending ReadFileEx (APC) also completes cleanly after PeekNamedPipe with no second write.
+            PEEK_APC_BYTES.store(0, Ordering::Release);
+            PEEK_APC_ERR.store(usize::MAX, Ordering::Release);
+            let mut ov_apc: OVERLAPPED = std::mem::zeroed();
+            let mut apc_buf = [0u8; 32];
+            assert_eq!(
+                ReadFileEx(rd, apc_buf.as_mut_ptr() as *mut c_void, apc_buf.len() as u32, &mut ov_apc, Some(peek_apc_cb)),
+                TRUE
+            );
+            let msg_apc = b"APC-PEEK";
+            assert_eq!(WriteFile(wr, msg_apc.as_ptr() as *const c_void, msg_apc.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let _ = PeekNamedPipe(rd, pbuf2.as_mut_ptr() as *mut c_void, 8, &mut pread2, &mut pavail2, &mut pleft2);
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(PEEK_APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(&apc_buf[..PEEK_APC_BYTES.load(Ordering::Acquire)], msg_apc);
+
+            assert_eq!(CloseHandle(wr), TRUE);
+            assert_eq!(PeekNamedPipe(rd, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut pavail2, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(rd), TRUE);
+
+            // 2. Raw POSIX FIFO (`libc::pipe`, ENOTSOCK fallback): PeekNamedPipe buffers into
+            //    `peek_buf` and wakes `pipe_reactor()`, so a pending overlapped ReadFile completes
+            //    deterministically without any further write.
+            let mut fds = [-1i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            set_cloexec(fds[0]);
+            set_cloexec(fds[1]);
+            let rd_fifo = wrap_non_owned_fd(fds[0], FileKind::Pipe, "\\\\.\\pipe\\raw_fifo".into(), GENERIC_READ);
+            assert_eq!(CreateIoCompletionPort(rd_fifo, iocp, 0x9102, 0), iocp);
+
+            // Repeated peeks on raw FIFO return identical data and counts before sync ReadFile drains.
+            let fifo_m1 = b"RAW-FIFO-1";
+            assert_eq!(libc::write(fds[1], fifo_m1.as_ptr() as *const c_void, fifo_m1.len()), fifo_m1.len() as isize);
+            for _ in 0..2 {
+                let mut fb = [0u8; 4];
+                let (mut r, mut a, mut l) = (0u32, 0u32, 0u32);
+                assert_eq!(PeekNamedPipe(rd_fifo, fb.as_mut_ptr() as *mut c_void, 4, &mut r, &mut a, &mut l), TRUE);
+                assert_eq!((r, a, l), (4, fifo_m1.len() as u32, (fifo_m1.len() - 4) as u32));
+                assert_eq!(&fb, b"RAW-");
+            }
+            let mut fdrain = [0u8; 32];
+            let mut got_sync = 0usize;
+            while got_sync < fifo_m1.len() {
+                let mut nread = 0u32;
+                assert_eq!(
+                    ReadFile(
+                        rd_fifo,
+                        fdrain[got_sync..].as_mut_ptr() as *mut c_void,
+                        (fdrain.len() - got_sync) as u32,
+                        &mut nread,
+                        std::ptr::null_mut(),
+                    ),
+                    TRUE
+                );
+                got_sync += nread as usize;
+            }
+            assert_eq!(&fdrain[..got_sync], fifo_m1);
+
+            // Now pend an overlapped ReadFile on the empty FIFO, write once, and PeekNamedPipe ALL
+            // bytes into `peek_buf`. Pending ReadFile must still wake and complete with no second write!
+            let mut ov_fifo: OVERLAPPED = std::mem::zeroed();
+            let mut fifo_out = [0u8; 32];
+            assert_eq!(
+                ReadFile(rd_fifo, fifo_out.as_mut_ptr() as *mut c_void, fifo_out.len() as u32, std::ptr::null_mut(), &mut ov_fifo),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let fifo_m2 = b"FIFO-DATA";
+            assert_eq!(libc::write(fds[1], fifo_m2.as_ptr() as *const c_void, fifo_m2.len()), fifo_m2.len() as isize);
+            let mut fpeek = [0u8; 16];
+            let (mut fr, mut fa, mut fl) = (0u32, 0u32, 0u32);
+            let _ = PeekNamedPipe(rd_fifo, fpeek.as_mut_ptr() as *mut c_void, fifo_m2.len() as u32, &mut fr, &mut fa, &mut fl);
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x9102);
+            assert_eq!(ov_out, &mut ov_fifo as *mut OVERLAPPED);
+            assert_eq!(&fifo_out[..bytes as usize], fifo_m2);
+
+            assert_eq!(CloseHandle(rd_fifo), TRUE);
+            assert_eq!(libc::close(fds[0]), 0);
+            assert_eq!(libc::close(fds[1]), 0);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn disconnect_named_pipe_cancels_duplicate_handle_io_and_isolates_reconnect() {
+        use crate::kernel32::process::GetCurrentProcess;
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+
+        unsafe {
+            let name = to_wide_z("\\\\.\\pipe\\aw2_disconnect_dup_conn_test");
+            let srv1 = CreateNamedPipeW(
+                name.as_ptr(),
+                0x0000_0003 | 0x4000_0000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv1, INVALID_HANDLE_VALUE);
+
+            let mut srv2: HANDLE = std::ptr::null_mut();
+            let cur_proc = GetCurrentProcess();
+            assert_eq!(
+                DuplicateHandle(cur_proc, srv1, cur_proc, &mut srv2, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */),
+                TRUE
+            );
+            assert!(!srv2.is_null());
+            assert_ne!(srv1, srv2);
+
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+            assert_eq!(CreateIoCompletionPort(srv1, iocp, 0x9201, 0), iocp);
+
+            // Connect client 1.
+            let cli1 = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli1, INVALID_HANDLE_VALUE);
+
+            // 1. Per-handle CancelIoEx remains scoped to the handle passed to it (srv2 only, not srv1).
+            let mut ov_srv1: OVERLAPPED = std::mem::zeroed();
+            let mut ov_srv2_cancel: OVERLAPPED = std::mem::zeroed();
+            let mut buf_srv1 = [0u8; 16];
+            let mut buf_srv2 = [0u8; 16];
+            assert_eq!(ReadFile(srv1, buf_srv1.as_mut_ptr() as *mut c_void, 16, std::ptr::null_mut(), &mut ov_srv1), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(ReadFile(srv2, buf_srv2.as_mut_ptr() as *mut c_void, 16, std::ptr::null_mut(), &mut ov_srv2_cancel), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            assert_eq!(CancelIoEx(srv2, std::ptr::null_mut()), TRUE);
+            let (mut bytes, mut key, mut ov_out) = (0u32, 0usize, std::ptr::null_mut());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(ov_out, &mut ov_srv2_cancel as *mut OVERLAPPED);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+
+            let msg_keep = b"FOR-SRV1";
+            let mut nw = 0u32;
+            assert_eq!(WriteFile(cli1, msg_keep.as_ptr() as *const c_void, msg_keep.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_srv1 as *mut OVERLAPPED);
+            assert_eq!(&buf_srv1[..bytes as usize], msg_keep);
+
+            // 2. Submit BOTH a pending overlapped read AND a pending backpressured overlapped write
+            //    through duplicate handle `srv2`, then call `DisconnectNamedPipe(srv1)`.
+            let mut old_rd_buf = [0x5Au8; 32];
+            let mut ov_dup_rd: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadFile(srv2, old_rd_buf.as_mut_ptr() as *mut c_void, old_rd_buf.len() as u32, std::ptr::null_mut(), &mut ov_dup_rd),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // Large overlapped write on `srv2` fills the socketpair send buffer and pends.
+            let big_wr = vec![0xA5u8; 512 * 1024];
+            let mut ov_dup_wr: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFile(srv2, big_wr.as_ptr() as *const c_void, big_wr.len() as u32, std::ptr::null_mut(), &mut ov_dup_wr),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // Capture a reference to the active connection to also verify post-disconnect submit safety.
+            let old_conn = get_file(srv1)
+                .unwrap()
+                .named_pipe_server
+                .as_ref()
+                .unwrap()
+                .io_conn()
+                .unwrap();
+
+            // Disconnect through `srv1` — MUST cancel all ops on the shared connection (including `srv2`!).
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert!(old_conn.is_disconnected());
+
+            let mut saw_rd_abort = false;
+            let mut saw_wr_abort = false;
+            for _ in 0..2 {
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+                assert_eq!(key, 0x9201);
+                assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                if ov_out == &mut ov_dup_rd as *mut OVERLAPPED {
+                    saw_rd_abort = true;
+                } else if ov_out == &mut ov_dup_wr as *mut OVERLAPPED {
+                    saw_wr_abort = true;
+                } else {
+                    panic!("unexpected overlapped {ov_out:p}");
+                }
+            }
+            assert!(saw_rd_abort && saw_wr_abort);
+
+            // Submitting an op bound to an already-disconnected `PipeConn` (racing with DisconnectNamedPipe)
+            // must immediately complete with ERROR_OPERATION_ABORTED and never target any new connection.
+            let mut late_buf = [0x33u8; 16];
+            let mut ov_late: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_late);
+            pipe_reactor().submit(PendingPipeOp::new_read(
+                srv2,
+                get_file(srv2).unwrap(),
+                Some(Arc::clone(&old_conn)),
+                old_conn.fd(),
+                late_buf.as_mut_ptr() as usize,
+                late_buf.len(),
+                PipeDelivery::Overlapped { ov: &mut ov_late as *mut OVERLAPPED as usize, tid: teb::thread_id() },
+            ));
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(ov_out, &mut ov_late as *mut OVERLAPPED);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            drop(old_conn);
+
+            // Drain/close client 1; once buffered bytes are drained, client 1 observes ERROR_BROKEN_PIPE.
+            assert_eq!(CloseHandle(cli1), TRUE);
+
+            // 3. Reconnect a brand new client through duplicate handle `srv2`: old buffers stay
+            //    untouched and the new connection exchanges data cleanly across both handles.
+            let mut ov_conn2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ConnectNamedPipe(srv2, &mut ov_conn2), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let cli2 = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli2, INVALID_HANDLE_VALUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_conn2 as *mut OVERLAPPED);
+
+            let new_msg = b"NEW-CONN-DATA";
+            assert_eq!(WriteFile(cli2, new_msg.as_ptr() as *const c_void, new_msg.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut new_rd = [0u8; 32];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(srv1, new_rd.as_mut_ptr() as *mut c_void, new_rd.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&new_rd[..nr as usize], new_msg);
+            assert_eq!(old_rd_buf, [0x5Au8; 32], "disconnected op buffer must never receive bytes from new connection");
+            assert_eq!(late_buf, [0x33u8; 16], "late disconnected op buffer must remain untouched");
+
+            let srv_reply = b"SRV-TO-CLI2";
+            assert_eq!(WriteFile(srv2, srv_reply.as_ptr() as *const c_void, srv_reply.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut cli2_rd = [0u8; 32];
+            assert_eq!(ReadFile(cli2, cli2_rd.as_mut_ptr() as *mut c_void, cli2_rd.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&cli2_rd[..nr as usize], srv_reply);
+
+            // DisconnectNamedPipe on non-pipe handle fails honestly with ERROR_INVALID_HANDLE.
+            assert_eq!(DisconnectNamedPipe(iocp), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            assert_eq!(CloseHandle(cli2), TRUE);
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert_eq!(CloseHandle(srv2), TRUE);
+            assert_eq!(CloseHandle(srv1), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_writes_serialize_fifo_across_mixed_apis_duplicates_cancel_and_distinct_pipes() {
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AOrd};
+        static APC_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static APC_BYTES: AtomicU32 = AtomicU32::new(0);
+        static APC_OV: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "win64" fn on_write_apc(err_code: u32, bytes: u32, ov: usize) {
+            APC_ERR.store(err_code, AOrd::SeqCst);
+            APC_BYTES.store(bytes, AOrd::SeqCst);
+            APC_OV.store(ov, AOrd::SeqCst);
+            APC_CALLS.fetch_add(1, AOrd::SeqCst);
+        }
+
+        unsafe {
+            APC_CALLS.store(0, AOrd::SeqCst);
+            APC_ERR.store(u32::MAX, AOrd::SeqCst);
+            APC_BYTES.store(0, AOrd::SeqCst);
+            APC_OV.store(0, AOrd::SeqCst);
+
+            let pname: Vec<u16> = format!(
+                "\\\\.\\pipe\\win32rt_write_fifo_test_{}\0",
+                std::process::id()
+            )
+            .encode_utf16()
+            .collect();
+            let srv1 = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x3 | 0x4000_0000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv1, INVALID_HANDLE_VALUE);
+
+            let mut srv2: HANDLE = std::ptr::null_mut();
+            let cur_proc = crate::kernel32::process::GetCurrentProcess();
+            assert_eq!(DuplicateHandle(cur_proc, srv1, cur_proc, &mut srv2, 0, FALSE, 2), TRUE);
+            assert!(!srv2.is_null());
+            assert_ne!(srv2, srv1);
+
+            let iocp = CreateIoCompletionPort(srv1, std::ptr::null_mut(), 0x5150, 0);
+            assert!(!iocp.is_null());
+
+            let mut ov_conn: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ConnectNamedPipe(srv1, &mut ov_conn), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_conn as *mut OVERLAPPED);
+
+            // 1. Backpressure on pipe 1: W1 (overlapped WriteFile on srv1), W2 (overlapped
+            //    WriteFile on duplicate srv2), W3 (WriteFileEx APC on srv1), W4 (synchronous
+            //    WriteFile on srv2 from another thread).
+            let w1 = vec![0xA1u8; 256 * 1024];
+            let w2 = vec![0xB2u8; 16 * 1024];
+            let w3 = vec![0xC3u8; 8 * 1024];
+            let w4 = vec![0xD4u8; 4 * 1024];
+
+            let mut ov1: OVERLAPPED = std::mem::zeroed();
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            let mut ov3: OVERLAPPED = std::mem::zeroed();
+            let mut nw = 0u32;
+
+            assert_eq!(
+                WriteFile(srv1, w1.as_ptr() as *const c_void, w1.len() as u32, &mut nw, &mut ov1),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // W2 on duplicate handle MUST queue behind W1 instead of bypassing it.
+            assert_eq!(
+                WriteFile(srv2, w2.as_ptr() as *const c_void, w2.len() as u32, &mut nw, &mut ov2),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // W3 via WriteFileEx MUST also queue behind W2 (still STATUS_PENDING).
+            assert_eq!(
+                WriteFileEx(srv1, w3.as_ptr() as *const c_void, w3.len() as u32, &mut ov3, Some(on_write_apc)),
+                TRUE
+            );
+            assert_eq!(load_ov_internal(&mut ov3), STATUS_PENDING);
+
+            // W4 via synchronous WriteFile on duplicate handle from another thread must wait
+            // behind W1..W3 without starving unrelated pipes.
+            let sync_done = Arc::new(AtomicBool::new(false));
+            let sync_done_bg = Arc::clone(&sync_done);
+            let w4_bg = w4.clone();
+            let srv2_raw = srv2 as usize;
+            let sync_thread = std::thread::spawn(move || {
+                let mut sw = 0u32;
+                let ok = WriteFile(
+                    srv2_raw as HANDLE,
+                    w4_bg.as_ptr() as *const c_void,
+                    w4_bg.len() as u32,
+                    &mut sw,
+                    std::ptr::null_mut(),
+                );
+                sync_done_bg.store(true, AOrd::Release);
+                (ok, sw)
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(
+                !sync_done.load(AOrd::Acquire),
+                "synchronous WriteFile must wait behind earlier pending async writes"
+            );
+
+            // Distinct pipe P2 must remain completely responsive while P1's writes are backed up.
+            let mut p2_r: HANDLE = std::ptr::null_mut();
+            let mut p2_w: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut p2_r, &mut p2_w, std::ptr::null_mut(), 0), TRUE);
+            let p2_msg = b"DISTINCT-PIPE-OK";
+            let mut p2_nw = 0u32;
+            assert_eq!(
+                WriteFile(p2_w, p2_msg.as_ptr() as *const c_void, p2_msg.len() as u32, &mut p2_nw, std::ptr::null_mut()),
+                TRUE
+            );
+            let mut p2_buf = [0u8; 32];
+            let mut p2_nr = 0u32;
+            assert_eq!(
+                ReadFile(p2_r, p2_buf.as_mut_ptr() as *mut c_void, p2_buf.len() as u32, &mut p2_nr, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(&p2_buf[..p2_nr as usize], p2_msg);
+            assert_eq!(CloseHandle(p2_r), TRUE);
+            assert_eq!(CloseHandle(p2_w), TRUE);
+
+            // Drain all bytes on the client end in a reader thread.
+            let total_expected = w1.len() + w2.len() + w3.len() + w4.len();
+            let cli_raw = cli as usize;
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(total_expected);
+                let mut chunk = [0u8; 8192];
+                while got.len() < total_expected {
+                    let want = (total_expected - got.len()).min(chunk.len()) as u32;
+                    let mut nr = 0u32;
+                    let ok = ReadFile(cli_raw as HANDLE, chunk.as_mut_ptr() as *mut c_void, want, &mut nr, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(nr > 0);
+                    got.extend_from_slice(&chunk[..nr as usize]);
+                }
+                got
+            });
+
+            let mut seen_ov = Vec::new();
+            for _ in 0..2 {
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 5000), TRUE);
+                seen_ov.push((ov_out as usize, bytes));
+            }
+            assert_eq!(
+                seen_ov,
+                vec![
+                    (&mut ov1 as *mut OVERLAPPED as usize, w1.len() as u32),
+                    (&mut ov2 as *mut OVERLAPPED as usize, w2.len() as u32),
+                ],
+                "overlapped WriteFile completions must fire in FIFO order"
+            );
+
+            // Deliver WriteFileEx APC completion for W3.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while APC_CALLS.load(AOrd::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                let _ = crate::kernel32::time::SleepEx(50, TRUE);
+            }
+            assert_eq!(APC_CALLS.load(AOrd::SeqCst), 1);
+            assert_eq!(APC_ERR.load(AOrd::SeqCst), 0);
+            assert_eq!(APC_BYTES.load(AOrd::SeqCst), w3.len() as u32);
+            assert_eq!(APC_OV.load(AOrd::SeqCst), &mut ov3 as *mut OVERLAPPED as usize);
+
+            let (sync_ok, sync_written) = sync_thread.join().unwrap();
+            assert_eq!(sync_ok, TRUE);
+            assert_eq!(sync_written, w4.len() as u32);
+
+            let received = reader.join().unwrap();
+            assert_eq!(received.len(), total_expected);
+            let off1 = w1.len();
+            let off2 = off1 + w2.len();
+            let off3 = off2 + w3.len();
+            assert!(received[..off1].iter().all(|&b| b == 0xA1), "W1 bytes must remain contiguous");
+            assert!(received[off1..off2].iter().all(|&b| b == 0xB2), "W2 bytes must follow W1");
+            assert!(received[off2..off3].iter().all(|&b| b == 0xC3), "W3 bytes must follow W2");
+            assert!(received[off3..].iter().all(|&b| b == 0xD4), "W4 sync bytes must follow W3");
+
+            // 2. Canceling the head pending write advances the queued successor cleanly.
+            let c1 = vec![0xE1u8; 256 * 1024];
+            let c2 = vec![0xF6u8; 8 * 1024];
+            let mut ov_c1: OVERLAPPED = std::mem::zeroed();
+            let mut ov_c2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFile(srv1, c1.as_ptr() as *const c_void, c1.len() as u32, &mut nw, &mut ov_c1),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(
+                WriteFile(srv2, c2.as_ptr() as *const c_void, c2.len() as u32, &mut nw, &mut ov_c2),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            assert_eq!(CancelIoEx(srv1, &mut ov_c1), TRUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            assert_eq!(ov_out, &mut ov_c1 as *mut OVERLAPPED);
+            assert_eq!(load_ov_internal(&mut ov_c1), STATUS_CANCELLED);
+
+            // Drain client while C2 completes; after C2 completes, write an 8-byte sentinel so
+            // the reader thread exits deterministically with zero TOCTOU.
+            const SENTINEL: &[u8; 8] = b"C2-DONE!";
+            let drain_thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let mut nr = 0u32;
+                    let ok = ReadFile(
+                        cli_raw as HANDLE,
+                        chunk.as_mut_ptr() as *mut c_void,
+                        chunk.len() as u32,
+                        &mut nr,
+                        std::ptr::null_mut(),
+                    );
+                    if ok == FALSE || nr == 0 {
+                        break;
+                    }
+                    all.extend_from_slice(&chunk[..nr as usize]);
+                    if all.ends_with(SENTINEL) {
+                        break;
+                    }
+                }
+                all
+            });
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 3000), TRUE);
+            assert_eq!(ov_out, &mut ov_c2 as *mut OVERLAPPED);
+            assert_eq!(bytes, c2.len() as u32);
+            assert_eq!(load_ov_internal(&mut ov_c2), STATUS_SUCCESS);
+            assert_eq!(
+                WriteFile(srv1, SENTINEL.as_ptr() as *const c_void, SENTINEL.len() as u32, &mut nw, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(nw, SENTINEL.len() as u32);
+
+            let drained = drain_thread.join().unwrap();
+            assert!(drained.ends_with(SENTINEL));
+            let without_sentinel = &drained[..drained.len() - SENTINEL.len()];
+            assert!(without_sentinel.len() >= c2.len());
+            let tail = &without_sentinel[without_sentinel.len() - c2.len()..];
+            assert!(tail.iter().all(|&b| b == 0xF6), "queued successor C2 must deliver intact after head cancel");
+
+            assert_eq!(CloseHandle(cli), TRUE);
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert_eq!(CloseHandle(srv2), TRUE);
+            assert_eq!(CloseHandle(srv1), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn wait_named_pipe_w_synchronizes_disconnect_infinite_timeout_and_close() {
+        use crate::kernel32::threads::CloseHandle;
+        use std::sync::{mpsc, Barrier};
+
+        unsafe {
+            let pname = to_wide_z(&format!("\\\\.\\pipe\\aw2_wait_sync_test_{}", std::process::id()));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x4000_0003, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+
+            // 1. Stress WaitNamedPipeW(INFINITE) on a connected server transitioning back to
+            //    Listening via DisconnectNamedPipe across tight barrier-synchronized rounds and
+            //    asleep-waiter rounds, guarded by a bounded watchdog so any lost wakeup fails fast.
+            for round in 0..40 {
+                let cli = CreateFileW(
+                    pname.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+                let barrier = Arc::new(Barrier::new(2));
+                let b_wait = Arc::clone(&barrier);
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    b_wait.wait();
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), INFINITE);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+
+                barrier.wait();
+                if round % 10 == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(CloseHandle(cli), TRUE);
+                assert_eq!(DisconnectNamedPipe(srv), TRUE);
+
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("round {round}: WaitNamedPipeW(INFINITE) hung (lost wakeup)"));
+                assert_eq!(ok, TRUE, "round {round}: WaitNamedPipeW failed with {e}");
+                waiter.join().unwrap();
+            }
+
+            // 2. Finite timeout returns ERROR_SEM_TIMEOUT while the only server stays connected.
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+            {
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), 40);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("finite WaitNamedPipeW hung");
+                assert_eq!(ok, FALSE);
+                assert_eq!(e, ERROR_SEM_TIMEOUT);
+                waiter.join().unwrap();
+            }
+
+            // 3. Closing the last connected server wakes WaitNamedPipeW(INFINITE) with ERROR_FILE_NOT_FOUND.
+            {
+                let barrier = Arc::new(Barrier::new(2));
+                let b_wait = Arc::clone(&barrier);
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    b_wait.wait();
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), INFINITE);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+                barrier.wait();
+                std::thread::sleep(Duration::from_millis(5));
+                assert_eq!(CloseHandle(srv), TRUE);
+
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("WaitNamedPipeW(INFINITE) hung after last server closed");
+                assert_eq!(ok, FALSE);
+                assert_eq!(e, err::ERROR_FILE_NOT_FOUND);
+                waiter.join().unwrap();
+            }
+
+            assert_eq!(WaitNamedPipeW(pname.as_ptr(), 40), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            assert_eq!(CloseHandle(cli), TRUE);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn dir_watch_periodic_rescan_covers_files_beyond_vnode_fd_cap() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, WaitForSingleObject};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = std::env::temp_dir().join(format!("aw2_dirwatch_cap_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Populate 520 files (> MAX_WATCHED_VNODE_FDS = 512). `BTreeMap` orders lexicographically,
+        // so root (1) + `f_0000.txt`..`f_0510.txt` (511) exhaust MAX_WATCHED_VNODE_FDS and
+        // `z_omitted_target.txt` is deterministically omitted from kqueue vnode descriptors.
+        for i in 0..519 {
+            std::fs::write(dir.join(format!("f_{i:04}.txt")), b"a").unwrap();
+        }
+        let target_path = dir.join("z_omitted_target.txt");
+        std::fs::write(&target_path, b"init").unwrap();
+
+        // Preopen the writable target file before attaching watches so in-place writes never
+        // depend on spare per-process fds while the watcher holds up to MAX_WATCHED_VNODE_FDS.
+        let mut target_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+
+        path::add_mount("U:\\", &dir);
+        let win_dir = to_wide_z("U:\\");
+
+        let parse_notify_records = |buf: &[u8], len: usize| -> Vec<(u32, String)> {
+            let mut out = Vec::new();
+            let mut off = 0usize;
+            while off + 12 <= len {
+                let next = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let action = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+                let name_bytes = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as usize;
+                let units: Vec<u16> = buf[off + 12..off + 12 + name_bytes]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                out.push((action, String::from_utf16_lossy(&units)));
+                if next == 0 {
+                    break;
+                }
+                off += next;
+            }
+            out
+        };
+
+        unsafe {
+            // 1. ReadDirectoryChangesW: in-place updates on the deterministically omitted file
+            //    (no rename, no sibling creation) must deliver FILE_ACTION_MODIFIED for both
+            //    FILE_NOTIFY_CHANGE_SIZE and FILE_NOTIFY_CHANGE_LAST_WRITE via periodic rescan.
+            let h_dir = CreateFileW(
+                win_dir.as_ptr(),
+                GENERIC_READ,
+                0x7, // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000, // FILE_FLAG_OVERLAPPED
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_dir, INVALID_HANDLE_VALUE);
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            // 1a. Size + LastWrite growth in-place.
+            let mut buf = [0u8; 4096];
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_dir,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    FILE_NOTIFY_CHANGE_SIZE,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"updated-size-payload").unwrap();
+            target_file.flush().unwrap();
+
+            assert_eq!(
+                WaitForSingleObject(ev, 3000),
+                WAIT_OBJECT_0,
+                "ReadDirectoryChangesW(SIZE) missed in-place update on file beyond vnode cap"
+            );
+            let mut got = 0u32;
+            assert_eq!(GetOverlappedResult(h_dir, &mut ov, &mut got, FALSE), TRUE);
+            let recs = parse_notify_records(&buf, got as usize);
+            assert!(
+                recs.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "z_omitted_target.txt"),
+                "expected FILE_ACTION_MODIFIED for z_omitted_target.txt (SIZE), got {recs:?}"
+            );
+            assert!(
+                !recs.iter().any(|(a, _)| *a == FILE_ACTION_REMOVED || *a == FILE_ACTION_ADDED),
+                "unexpected spurious add/remove under FD pressure: {recs:?}"
+            );
+
+            // 1b. Same-size in-place LastWrite update (no size change, no rename/create).
+            assert_eq!(ResetEvent(ev), TRUE);
+            buf.fill(0);
+            ov = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_dir,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"UPDATED-SIZE-PAYLOAD").unwrap();
+            target_file.flush().unwrap();
+
+            assert_eq!(
+                WaitForSingleObject(ev, 3000),
+                WAIT_OBJECT_0,
+                "ReadDirectoryChangesW(LAST_WRITE) missed same-size in-place update beyond vnode cap"
+            );
+            got = 0;
+            assert_eq!(GetOverlappedResult(h_dir, &mut ov, &mut got, FALSE), TRUE);
+            let recs2 = parse_notify_records(&buf, got as usize);
+            assert!(
+                recs2.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "z_omitted_target.txt"),
+                "expected FILE_ACTION_MODIFIED for z_omitted_target.txt (LAST_WRITE), got {recs2:?}"
+            );
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(h_dir), TRUE);
+            // Allow first watcher thread to exit and release its vnode fds before next watch.
+            std::thread::sleep(Duration::from_millis(50));
+
+            // 2. FindFirstChangeNotificationW sequentially for SIZE and LAST_WRITE on the same
+            //    omitted late-sort file.
+            let ch_size = FindFirstChangeNotificationW(win_dir.as_ptr(), FALSE, FILE_NOTIFY_CHANGE_SIZE);
+            assert_ne!(ch_size, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ch_size, 0), WAIT_TIMEOUT);
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"updated-size-payload-grown").unwrap();
+            target_file.flush().unwrap();
+            assert_eq!(
+                WaitForSingleObject(ch_size, 3000),
+                WAIT_OBJECT_0,
+                "FindFirstChangeNotificationW(SIZE) missed in-place growth beyond vnode cap"
+            );
+            assert_eq!(FindCloseChangeNotification(ch_size), TRUE);
+            std::thread::sleep(Duration::from_millis(50));
+
+            let ch_write = FindFirstChangeNotificationW(win_dir.as_ptr(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+            assert_ne!(ch_write, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ch_write, 0), WAIT_TIMEOUT);
+            std::thread::sleep(Duration::from_millis(5));
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"UPDATED-SIZE-PAYLOAD-GROWN").unwrap();
+            target_file.flush().unwrap();
+            assert_eq!(
+                WaitForSingleObject(ch_write, 3000),
+                WAIT_OBJECT_0,
+                "FindFirstChangeNotificationW(LAST_WRITE) missed in-place write beyond vnode cap"
+            );
+            assert_eq!(FindCloseChangeNotification(ch_write), TRUE);
+        }
+
+        drop(target_file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1749,7 +1749,7 @@ mod tests {
             let wc = super::class::WNDCLASSEX {
                 cb_size: std::mem::size_of::<super::class::WNDCLASSEX>() as u32,
                 style: 0,
-                wndproc: super::defproc::DefWindowProcW as *const () as usize,
+                wndproc: super::WNDPROC_HANDLE_DEF_WINDOW_W,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,

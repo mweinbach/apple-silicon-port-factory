@@ -209,6 +209,32 @@ pub fn is_guest_vm_addr(addr: usize) -> bool {
     VM.lock().unwrap().alloc_containing(page).is_some()
 }
 
+/// Returns `true` strictly if `addr` lies inside a committed, executable guest-owned
+/// private or mapped virtual memory allocation (`VirtualAlloc` / `MapViewOfFile`),
+/// excluding `MEM_IMAGE` (synthetic builtins are handled separately from real guest PEs),
+/// uncommitted `MEM_RESERVE`, non-executable pages, `PAGE_NOACCESS`, and `PAGE_GUARD`.
+pub fn is_guest_exec_vm_addr(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let page = addr & !(PAGE - 1);
+    let vm = VM.lock().unwrap();
+    let Some((_, alloc)) = vm.alloc_containing(page) else {
+        return false;
+    };
+    if alloc.kind != MEM_PRIVATE && alloc.kind != MEM_MAPPED {
+        return false;
+    }
+    let Some((&_s, seg)) = vm.segs.range(..=page).next_back() else {
+        return false;
+    };
+    page < seg.end
+        && seg.state == MEM_COMMIT
+        && is_exec(seg.prot)
+        && (seg.prot & 0xFF) != PAGE_NOACCESS
+        && (seg.prot & PAGE_GUARD) == 0
+}
+
 /// Returns `false` if any 16 KiB host page overlapping `[addr, addr + len)` contains
 /// a `PAGE_NOACCESS`, `PAGE_GUARD`, or uncommitted (`MEM_RESERVE`) guest page that would
 /// fault a speculative read (such as JIT successor flag-liveness lookahead).

@@ -180,9 +180,7 @@ pub fn call_window_proc(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM) -
     if p == 0 {
         return 0;
     }
-    unsafe {
-        crate::call_guest8(p, hwnd as u64, msg as u64, wparam as u64, lparam as u64, 0, 0, 0, 0) as LRESULT
-    }
+    unsafe { super::dispatch_wndproc(p, hwnd as HWND, msg, wparam, lparam) }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +691,8 @@ fn free_window(hwnd: usize) {
     }
     super::input::forget_window(hwnd);
     super::misc::forget_device_notifications(hwnd);
+    crate::misc::uxtheme::forget_window_subclasses(hwnd);
+    super::dialog::forget_dialog(hwnd);
 }
 
 pub unsafe fn create_window_w(
@@ -1627,7 +1627,7 @@ fn siblings_of(hwnd: usize) -> Vec<usize> {
     children_of(parent)
 }
 
-fn children_of(parent: usize) -> Vec<usize> {
+pub(crate) fn children_of(parent: usize) -> Vec<usize> {
     let t = table().read().unwrap();
     let mut v: Vec<usize> = t
         .map
@@ -2154,19 +2154,23 @@ mod tests {
     static LOG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static SIZES: AtomicU32 = AtomicU32::new(0);
 
-    unsafe extern "win64" fn test_proc(h: usize, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe extern "win64" fn test_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         LOG.lock().unwrap().push(m);
         if m == wm::SIZE {
             SIZES.store(l as u32, Ordering::SeqCst);
         }
-        super::super::defproc::DefWindowProcW(h as HWND, m, w, l)
+        super::super::defproc::DefWindowProcW(h, m, w, l)
+    }
+
+    fn test_proc_handle() -> usize {
+        super::super::register_typed_host_wndproc(test_proc)
     }
 
     fn register(name: &str) -> Vec<u16> {
         let n = crate::strings::to_wide_z(name);
         let wc = class::WNDCLASS {
             style: 0,
-            wndproc: test_proc as *const () as usize,
+            wndproc: test_proc_handle(),
             cls_extra: 0,
             wnd_extra: 16,
             instance: 0,
@@ -2249,11 +2253,11 @@ mod tests {
     static OLD_PROC: AtomicUsize = AtomicUsize::new(0);
     static SUB_HITS: AtomicU32 = AtomicU32::new(0);
 
-    unsafe extern "win64" fn sub_proc(h: usize, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe extern "win64" fn sub_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         if m == 0x0400 {
             SUB_HITS.fetch_add(1, Ordering::SeqCst);
         }
-        message::CallWindowProcW(OLD_PROC.load(Ordering::SeqCst), h as HWND, m, w, l)
+        message::CallWindowProcW(OLD_PROC.load(Ordering::SeqCst), h, m, w, l)
     }
 
     /// Close a window owned by a thread running a GetMessage loop and wait
@@ -2299,10 +2303,11 @@ mod tests {
         unsafe {
             assert_eq!(super::super::input::GetForegroundWindow() as usize, hu);
             let old = GetWindowLongPtrW(h, GWLP_WNDPROC);
-            assert_eq!(old as usize, test_proc as *const () as usize);
+            assert_eq!(old as usize, test_proc_handle());
             OLD_PROC.store(old as usize, Ordering::SeqCst);
-            assert_eq!(SetWindowLongPtrW(h, GWLP_WNDPROC, sub_proc as *const () as isize), old);
-            assert_eq!(GetWindowLongPtrW(h, GWLP_WNDPROC) as usize, sub_proc as *const () as usize);
+            let sub_handle = super::super::register_typed_host_wndproc(sub_proc);
+            assert_eq!(SetWindowLongPtrW(h, GWLP_WNDPROC, sub_handle as isize), old);
+            assert_eq!(GetWindowLongPtrW(h, GWLP_WNDPROC) as usize, sub_handle);
             LOG.lock().unwrap().clear();
             // Cross-thread SendMessage returns only after the owner processed it.
             message::SendMessageW(h, 0x0400, 0, 0);

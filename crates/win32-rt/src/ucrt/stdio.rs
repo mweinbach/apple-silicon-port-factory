@@ -11,7 +11,7 @@
 //! * One process-wide recursive lock serializes all stream operations and
 //!   backs `_lock_file`/`_unlock_file` (simple, deadlock-free).
 
-use super::errno::{self, EBADF, EINVAL, ENOENT};
+use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT, EPIPE};
 use crate::strings::{from_ansi, from_wide};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -102,6 +102,19 @@ struct FdInfo {
     /// Translation disabled for ttys/pipes.
     raw: bool,
     temporary: bool,
+    /// Associated Win32 `HANDLE` for this CRT descriptor.
+    ///
+    /// In both directions the CRT fd and the `FileObj` own distinct close-on-exec POSIX fds
+    /// (`F_DUPFD_CLOEXEC`) sharing the same kernel open file description (file offset, status
+    /// flags, pipe buffer):
+    /// - `_open_osfhandle(h, flags)` duplicates `h`'s fd for the CRT fd and stores `Some(h)`.
+    /// - `_get_osfhandle(fd)` lazily duplicates `fd` into an owning `FileObj` handle and caches
+    ///   `Some(h)`.
+    ///
+    /// Retiring `h` via `handles::close(h)` during `_close(fd)` or `_dup2(src, fd)` therefore
+    /// never closes the CRT fd, while any surviving `DuplicateHandle` sibling keeps its own
+    /// `Arc<FileObj>` and duplicated POSIX fd alive independently of the CRT fd.
+    osf_handle: Option<usize>,
 }
 
 static FDS: Mutex<Option<HashMap<i32, (FdInfo, Option<std::path::PathBuf>)>>> = Mutex::new(None);
@@ -119,7 +132,7 @@ fn fd_info(fd: i32) -> FdInfo {
         let mut st: libc::stat = std::mem::zeroed();
         libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) != libc::S_IFREG
     };
-    let i = FdInfo { text: true, raw, temporary: false };
+    let i = FdInfo { text: true, raw, temporary: false, osf_handle: None };
     if (0..=2).contains(&fd) {
         m.insert(fd, (i, None));
     }
@@ -151,7 +164,17 @@ pub fn open_host(win_path: &str, oflag: i32, pmode: i32) -> i32 {
 }
 
 fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
-    let mut f = match oflag & 3 {
+    let acc = oflag & 3;
+    let mutating = acc != O_RDONLY || (oflag & (O_APPEND | O_CREAT | O_TRUNC | O_TEMPORARY)) != 0;
+    if mutating && crate::path::is_protected_host_write(host) {
+        errno::set(EACCES);
+        return -1;
+    }
+    if (oflag & O_TEMPORARY) != 0 && crate::path::is_protected_host_remove_or_rename(host) {
+        errno::set(EACCES);
+        return -1;
+    }
+    let mut f = match acc {
         O_WRONLY => libc::O_WRONLY,
         O_RDWR => libc::O_RDWR,
         _ => libc::O_RDONLY,
@@ -186,7 +209,7 @@ fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
     if oflag & (O_WTEXT | O_U16TEXT | O_U8TEXT) != 0 {
         stub!("Unicode text modes (0x{oflag:x}) treated as plain text mode");
     }
-    set_fd_info(fd, FdInfo { text, raw: false, temporary: oflag & O_TEMPORARY != 0 }, Some(host.to_path_buf()));
+    set_fd_info(fd, FdInfo { text, raw: false, temporary: oflag & O_TEMPORARY != 0, osf_handle: None }, Some(host.to_path_buf()));
     fd
 }
 
@@ -249,9 +272,18 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
         return bad_fd();
     }
     let ent = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&fd);
+    if let Some((info, _)) = &ent {
+        if let Some(h) = info.osf_handle {
+            // Both `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and the `FileObj`
+            // on distinct duplicated POSIX fds sharing one open file description. Retiring `h`
+            // never closes `fd`, so `libc::close(fd)` below closes `fd` cleanly once while any
+            // `DuplicateHandle` sibling's `Arc<FileObj>` (and its own POSIX fd) stays alive.
+            let _ = crate::handles::close(h as crate::types::HANDLE);
+        }
+    }
     let r = libc::close(fd);
     if let Some((i, Some(p))) = ent {
-        if i.temporary {
+        if i.temporary && !crate::path::is_protected_host_remove_or_rename(&p) {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -263,14 +295,155 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
     }
 }
 
+/// Associate a CRT file descriptor with an existing Win32 file/pipe HANDLE,
+/// transferring ownership of `osfhandle` to the returned CRT fd.
+///
+/// Allocates an independent POSIX fd (`F_DUPFD_CLOEXEC`) sharing the same kernel open
+/// file description (offset, flags, pipe buffer) as `osfhandle`'s `FileObj`. Keeping the
+/// CRT fd distinct from `FileObj`'s internal fd guarantees that `_close(fd)` and
+/// `_dup2(src, fd)` retire `osfhandle` cleanly without ever double-closing or late-closing
+/// a reused descriptor, even when duplicate Win32 handles share the same `Arc<FileObj>`.
+pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32 {
+    use crate::kernel32::file::{file_fd_and_kind, FileKind};
+    use crate::types::{HANDLE, INVALID_HANDLE_VALUE};
+    let h = osfhandle as HANDLE;
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        errno::set(EBADF);
+        return -1;
+    }
+    let Some((raw_fd, kind)) = file_fd_and_kind(h) else {
+        errno::set(EBADF);
+        return -1;
+    };
+    if !fd_valid(raw_fd) {
+        errno::set(EBADF);
+        return -1;
+    }
+    let crt_fd = libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0);
+    if crt_fd < 0 {
+        errno::set_from_host();
+        return -1;
+    }
+    if (flags & O_APPEND) != 0 {
+        let cur = libc::fcntl(crt_fd, libc::F_GETFL);
+        if cur >= 0 {
+            let _ = libc::fcntl(crt_fd, libc::F_SETFL, cur | libc::O_APPEND);
+        }
+    }
+    let text = if (flags & O_BINARY) != 0 {
+        false
+    } else if (flags & (O_TEXT | O_WTEXT | O_U16TEXT | O_U8TEXT)) != 0 {
+        true
+    } else {
+        false
+    };
+    let raw = kind != FileKind::Disk;
+    set_fd_info(
+        crt_fd,
+        FdInfo {
+            text,
+            raw,
+            temporary: false,
+            osf_handle: Some(osfhandle as usize),
+        },
+        None,
+    );
+    crt_fd
+}
+
+/// Return the Win32 HANDLE backing a CRT file descriptor without transferring ownership.
+///
+/// Lazily exported handles own an independent close-on-exec POSIX duplicate (`F_DUPFD_CLOEXEC`)
+/// of `fd` sharing the same kernel open file description so `DuplicateHandle` siblings stay
+/// valid after `_close(fd)` or `_dup2(other, fd)`.
+pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use crate::kernel32::file::{classify_host_fd, wrap_owned_fd, FileKind};
+    if !fd_valid(fd) {
+        errno::set(EBADF);
+        return -1;
+    }
+    let mut g = FDS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some((info, _)) = m.get(&fd) {
+        if let Some(h) = info.osf_handle {
+            if crate::handles::get(h as crate::types::HANDLE).is_some() {
+                return h as isize;
+            }
+        }
+    }
+    let dup_fd = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+    if dup_fd < 0 {
+        errno::set_from_host();
+        return -1;
+    }
+    let owned_fd = OwnedFd::from_raw_fd(dup_fd);
+    let kind = classify_host_fd(dup_fd);
+    let h = wrap_owned_fd(owned_fd, kind, format!("crt://fd/{fd}"), 0xC000_0000);
+    if let Some((info, _)) = m.get_mut(&fd) {
+        info.osf_handle = Some(h as usize);
+    } else {
+        let raw = kind != FileKind::Disk;
+        m.insert(
+            fd,
+            (
+                FdInfo {
+                    text: true,
+                    raw,
+                    temporary: false,
+                    osf_handle: Some(h as usize),
+                },
+                None,
+            ),
+        );
+    }
+    h as isize
+}
+
+/// Wait for a pipe fd to become ready for `events` (`POLLIN` or `POLLOUT`) when its shared
+/// kernel open file description has `O_NONBLOCK` set (e.g. after an overlapped Win32 pipe
+/// write on a handle sharing the same open file description). Scoped strictly to `FileKind::Pipe`
+/// without toggling `O_NONBLOCK`. Restores `orig_errno` if `fd` is not a pipe.
+unsafe fn wait_pipe_fd_ready(fd: i32, events: libc::c_short, orig_errno: i32) -> bool {
+    use crate::kernel32::file::{classify_host_fd, FileKind};
+    if classify_host_fd(fd) != FileKind::Pipe {
+        *libc::__error() = orig_errno;
+        return false;
+    }
+    loop {
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let pr = libc::poll(&mut pfd, 1, -1);
+        if pr >= 0 {
+            return true;
+        }
+        if *libc::__error() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
 /// Raw read with CRLF->LF translation in text mode.
 pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
     let info = fd_info(fd);
-    let r = libc::read(fd, buf as *mut c_void, n);
-    if r <= 0 || !info.text || info.raw {
-        if r < 0 {
-            errno::set_from_host();
+    let r = loop {
+        let k = libc::read(fd, buf as *mut c_void, n);
+        if k >= 0 {
+            break k;
         }
+        let e = *libc::__error();
+        if e == libc::EINTR {
+            continue;
+        }
+        if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
+            && wait_pipe_fd_ready(fd, libc::POLLIN, e)
+        {
+            continue;
+        }
+        errno::set_from_host();
+        return -1;
+    };
+    if r == 0 || !info.text || info.raw {
         return r;
     }
     let s = std::slice::from_raw_parts_mut(buf, r as usize);
@@ -326,10 +499,20 @@ pub unsafe fn write_fd(fd: i32, data: &[u8]) -> isize {
     while off < out.len() {
         let r = libc::write(fd, out[off..].as_ptr() as *const c_void, out.len() - off);
         if r < 0 {
-            if *libc::__error() == libc::EINTR {
+            let e = *libc::__error();
+            if e == libc::EINTR {
+                continue;
+            }
+            if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
+                && wait_pipe_fd_ready(fd, libc::POLLOUT, e)
+            {
                 continue;
             }
             errno::set_from_host();
+            return -1;
+        }
+        if r == 0 {
+            errno::set(EPIPE);
             return -1;
         }
         off += r as usize;
@@ -408,20 +591,45 @@ pub unsafe extern "win64" fn _dup(fd: i32) -> i32 {
         return -1;
     }
     let i = fd_info(fd);
-    set_fd_info(n, FdInfo { temporary: false, ..i }, None);
+    set_fd_info(n, FdInfo { temporary: false, osf_handle: None, ..i }, None);
     n
 }
 
 pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
-    if !fd_valid(fd) {
+    if !fd_valid(fd) || fd2 < 0 {
         return bad_fd();
     }
+    // Self-dup is a validated no-op that preserves `FDS[fd]` and its `osf_handle` association.
+    if fd == fd2 {
+        return 0;
+    }
+    let src_info = fd_info(fd);
     if libc::dup2(fd, fd2) < 0 {
         errno::set_from_host();
         return -1;
     }
-    let i = fd_info(fd);
-    set_fd_info(fd2, FdInfo { temporary: false, ..i }, None);
+    // Atomically swap `FDS[fd2]` after `libc::dup2` succeeds so failed dups never disturb
+    // `fd2`, and retire any previous `osf_handle` outside the lock. Because both
+    // `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and `FileObj` on distinct
+    // duplicated POSIX fds, closing `old_h` never closes the newly duplicated `fd2`, and any
+    // retained `DuplicateHandle` sibling keeps its own `FileObj` fd alive on the original file.
+    let prev = FDS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(fd2, (FdInfo { temporary: false, osf_handle: None, ..src_info }, None));
+    if let Some((old_info, old_path)) = prev {
+        if let Some(old_h) = old_info.osf_handle {
+            let _ = crate::handles::close(old_h as crate::types::HANDLE);
+        }
+        if old_info.temporary {
+            if let Some(p) = old_path {
+                if !crate::path::is_protected_host_remove_or_rename(&p) {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
     0
 }
 
@@ -1434,7 +1642,7 @@ pub unsafe extern "win64" fn tmpfile() -> *mut FILE {
         return std::ptr::null_mut();
     }
     libc::unlink(c.as_ptr());
-    set_fd_info(fd, FdInfo { text: false, raw: false, temporary: false }, None);
+    set_fd_info(fd, FdInfo { text: false, raw: false, temporary: false, osf_handle: None }, None);
     let _l = Locked::new();
     new_stream(fd, &ModeFlags { oflag: O_RDWR | O_BINARY, readable: true, writable: true })
 }
@@ -1480,5 +1688,731 @@ mod tests {
             assert!(fopen(b"T:\\missing\\x\0".as_ptr(), b"r\0".as_ptr()).is_null());
             assert_eq!(errno::get(), ENOENT);
         }
+    }
+
+    #[test]
+    fn osfhandle_open_get_and_ownership() {
+        use crate::kernel32::file::{CreateFileW, ReadFile, WriteFile};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        let dir = std::env::temp_dir().join(format!("aw2_osf_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("O:\\", &dir);
+        unsafe {
+            // Invalid handles / fds fail with EBADF and -1.
+            assert_eq!(_open_osfhandle(-1, O_BINARY), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(-1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(9999), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            // Create a Win32 file handle, transfer ownership to CRT via _open_osfhandle.
+            let p = crate::strings::to_wide_z("O:\\osf.bin");
+            let h = CreateFileW(
+                p.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                3,
+                std::ptr::null_mut(),
+                2, // CREATE_ALWAYS
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            let fd = _open_osfhandle(h as isize, O_BINARY);
+            assert!(fd >= 0);
+            // _get_osfhandle returns the exact underlying Win32 handle.
+            assert_eq!(_get_osfhandle(fd), h as isize);
+
+            // Write via CRT _write, read back via Win32 ReadFile after lseek!
+            assert_eq!(_write(fd, b"hello-osf".as_ptr() as *const c_void, 9), 9);
+            assert_eq!(_lseeki64(fd, 0, 0), 0);
+            let mut rbuf = [0u8; 16];
+            let mut got = 0u32;
+            assert_eq!(ReadFile(h, rbuf.as_mut_ptr() as *mut c_void, 9, &mut got, std::ptr::null_mut()), TRUE);
+            assert_eq!(got, 9);
+            assert_eq!(&rbuf[..9], b"hello-osf");
+
+            // Closing the CRT fd closes the owned Win32 HANDLE cleanly once.
+            assert_eq!(_close(fd), 0);
+            assert!(crate::handles::get(h).is_none());
+            assert_eq!(_get_osfhandle(fd), -1);
+
+            // Reverse direction: open via CRT _open, wrap lazily via _get_osfhandle, write via WriteFile, close via _close.
+            let fd2 = _open(b"O:\\crt.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            assert!(fd2 >= 0);
+            let h2 = _get_osfhandle(fd2) as HANDLE;
+            assert_ne!(h2, INVALID_HANDLE_VALUE);
+            assert_eq!(_get_osfhandle(fd2), h2 as isize); // cached
+            let mut written = 0u32;
+            assert_eq!(WriteFile(h2, b"from-win32".as_ptr() as *const c_void, 10, &mut written, std::ptr::null_mut()), TRUE);
+            assert_eq!(written, 10);
+            assert_eq!(_close(fd2), 0);
+            assert!(crate::handles::get(h2).is_none());
+            assert_eq!(std::fs::read(dir.join("crt.bin")).unwrap(), b"from-win32");
+
+            // Standard descriptors return valid std handles.
+            assert_ne!(_get_osfhandle(1), -1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn dup2_and_close_preserve_osfhandle_ownership_and_duplicate_handles() {
+        use crate::kernel32::file::{CreateFileW, ReadFile, SetFilePointerEx, WriteFile};
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        let dir = std::env::temp_dir().join(format!("aw2_dup2_osf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("D:\\", &dir);
+        std::fs::write(dir.join("old1.bin"), b"OLD-ONE").unwrap();
+        std::fs::write(dir.join("old2.bin"), b"OLD-TWO").unwrap();
+        std::fs::write(dir.join("old3.bin"), b"OLD-THREE").unwrap();
+        std::fs::write(dir.join("new.bin"), b"NEW-DATA").unwrap();
+        std::fs::write(dir.join("crt_close.bin"), b"CRT-ORIG").unwrap();
+        std::fs::write(dir.join("crt_dup2.bin"), b"CRT-DUP2").unwrap();
+        std::fs::write(dir.join("crt_other.bin"), b"OTHER-FD").unwrap();
+
+        unsafe {
+            let open_win = |win_path: &str| -> HANDLE {
+                let p = crate::strings::to_wide_z(win_path);
+                let h = CreateFileW(
+                    p.as_ptr(),
+                    0xC000_0000,
+                    3,
+                    std::ptr::null_mut(),
+                    3, // OPEN_EXISTING
+                    0x80,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let read_all_crt = |fd: i32| -> Vec<u8> {
+                assert_eq!(_lseeki64(fd, 0, 0), 0);
+                let mut buf = [0u8; 32];
+                let n = _read(fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                assert!(n >= 0, "_read({fd}) failed with errno {}", errno::get());
+                buf[..n as usize].to_vec()
+            };
+
+            let read_win_from_start = |h: HANDLE| -> Vec<u8> {
+                assert_eq!(SetFilePointerEx(h, 0, std::ptr::null_mut(), 0), TRUE);
+                let mut buf = [0u8; 32];
+                let mut got = 0u32;
+                assert_eq!(
+                    ReadFile(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got, std::ptr::null_mut()),
+                    TRUE
+                );
+                buf[..got as usize].to_vec()
+            };
+
+            let dup_win = |src: HANDLE| -> HANDLE {
+                let mut dst: HANDLE = std::ptr::null_mut();
+                assert_eq!(
+                    DuplicateHandle(
+                        crate::handles::CURRENT_PROCESS,
+                        src,
+                        crate::handles::CURRENT_PROCESS,
+                        &mut dst,
+                        0,
+                        0,
+                        2, // DUPLICATE_SAME_ACCESS
+                    ),
+                    TRUE
+                );
+                assert!(!dst.is_null() && dst != src);
+                dst
+            };
+
+            // 1. Self-dup on invalid fd fails with EBADF; self-dup on _open_osfhandle fd is a
+            //    validated no-op preserving both the descriptor and its Win32 handle association.
+            assert_eq!(_dup2(-1, -1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            let h1 = open_win("D:\\old1.bin");
+            let fd1 = _open_osfhandle(h1 as isize, O_BINARY);
+            assert!(fd1 >= 0);
+            assert_eq!(_dup2(fd1, fd1), 0);
+            assert_eq!(_get_osfhandle(fd1), h1 as isize);
+            assert!(crate::handles::get(h1).is_some());
+            assert_eq!(read_all_crt(fd1), b"OLD-ONE");
+
+            // 2. Failed _dup2 (invalid source or invalid dest) preserves valid target & handle.
+            assert_eq!(_dup2(-1, fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_dup2(9999, fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_dup2(fd1, -1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(fd1), h1 as isize);
+            assert!(crate::handles::get(h1).is_some());
+            assert_eq!(read_all_crt(fd1), b"OLD-ONE");
+
+            // 3. Replacing an _open_osfhandle target retires old Win32 handle without closing
+            //    the newly duplicated descriptor, and closing later does not double-close.
+            let fd_src = _open(b"D:\\new.bin\0".as_ptr(), O_RDWR | O_BINARY, 0x180);
+            assert!(fd_src >= 0);
+            assert_eq!(_dup2(fd_src, fd1), 0);
+            assert!(crate::handles::get(h1).is_none(), "old owning handle must be retired");
+            assert_eq!(read_all_crt(fd1), b"NEW-DATA");
+            let h1_new = _get_osfhandle(fd1);
+            assert_ne!(h1_new, -1);
+            assert_ne!(h1_new, h1 as isize);
+            assert_eq!(_close(fd1), 0);
+            assert_eq!(_close(fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            // 4. Replacing an _open_osfhandle target when DuplicateHandle retains another handle
+            //    to the same FileObj: old CRT handle retires, retained duplicate handle stays live
+            //    on the original file, and closing the retained duplicate handle later does NOT
+            //    close the newly duplicated CRT descriptor!
+            let h2 = open_win("D:\\old2.bin");
+            let h2_dup = dup_win(h2);
+            let fd2 = _open_osfhandle(h2 as isize, O_BINARY);
+            assert!(fd2 >= 0);
+            assert_eq!(_dup2(fd_src, fd2), 0);
+            assert!(crate::handles::get(h2).is_none());
+            assert!(crate::handles::get(h2_dup).is_some());
+            assert_eq!(read_win_from_start(h2_dup), b"OLD-TWO");
+            assert_eq!(read_all_crt(fd2), b"NEW-DATA");
+
+            // Dropping the last Arc<FileObj> via CloseHandle(h2_dup) must NOT affect fd2!
+            assert_eq!(CloseHandle(h2_dup), TRUE);
+            assert!(crate::handles::get(h2_dup).is_none());
+            assert_eq!(read_all_crt(fd2), b"NEW-DATA");
+            assert_eq!(_close(fd2), 0);
+            assert_eq!(_close(fd_src), 0);
+
+            // 5. _close on an _open_osfhandle fd with a retained DuplicateHandle closes the CRT
+            //    fd immediately while leaving the retained Win32 duplicate handle usable.
+            let h3 = open_win("D:\\old3.bin");
+            let h3_dup = dup_win(h3);
+            let fd3 = _open_osfhandle(h3 as isize, O_BINARY);
+            assert!(fd3 >= 0);
+            assert_eq!(_close(fd3), 0);
+            assert!(crate::handles::get(h3).is_none());
+            assert_eq!(_get_osfhandle(fd3), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_close(fd3), -1);
+            assert_eq!(errno::get(), EBADF);
+            // Retained duplicate handle still reads the original file cleanly!
+            assert_eq!(read_win_from_start(h3_dup), b"OLD-THREE");
+            assert_eq!(CloseHandle(h3_dup), TRUE);
+
+            // 6. Genuinely CRT-opened ordinary file (`_open`) -> `_get_osfhandle` ->
+            //    `DuplicateHandle` -> `_close(fd)`:
+            //    - Exported handle owns a distinct CLOEXEC POSIX duplicate sharing the open file
+            //      description (shared file position before `_close`).
+            //    - After `_close(fd)`, the cached handle retires and the CRT fd is closed, while
+            //      the surviving sibling handle still reads and writes the original file.
+            let fd4 = _open(b"D:\\crt_close.bin\0".as_ptr(), O_RDWR | O_BINARY, 0x180);
+            assert!(fd4 >= 0);
+            let h4 = _get_osfhandle(fd4) as HANDLE;
+            assert_ne!(h4, INVALID_HANDLE_VALUE);
+            assert_eq!(_get_osfhandle(fd4), h4 as isize); // cached
+            let h4_obj = crate::kernel32::file::get_file(h4).expect("cached FileObj");
+            assert_ne!(h4_obj.fd(), fd4, "_get_osfhandle must own a distinct duplicated POSIX fd");
+            assert_ne!(libc::fcntl(h4_obj.fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            drop(h4_obj);
+
+            let h4_dup = dup_win(h4);
+            // Shared open file description: seeking/reading via CRT fd moves h4_dup's position
+            // and vice versa.
+            let mut prefix = [0u8; 4];
+            assert_eq!(_read(fd4, prefix.as_mut_ptr() as *mut c_void, 4), 4);
+            assert_eq!(&prefix, b"CRT-");
+            let mut pos = -1i64;
+            assert_eq!(SetFilePointerEx(h4_dup, 0, &mut pos, 1), TRUE); // FILE_CURRENT
+            assert_eq!(pos, 4);
+            let mut rest = [0u8; 4];
+            let mut got = 0u32;
+            assert_eq!(
+                ReadFile(h4_dup, rest.as_mut_ptr() as *mut c_void, 4, &mut got, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(got, 4);
+            assert_eq!(&rest, b"ORIG");
+            assert_eq!(_telli64(fd4), 8);
+
+            // Closing the CRT fd retires h4 and closes fd4, while h4_dup still reads and writes!
+            assert_eq!(_close(fd4), 0);
+            assert!(crate::handles::get(h4).is_none());
+            assert_eq!(_get_osfhandle(fd4), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(read_win_from_start(h4_dup), b"CRT-ORIG");
+            let mut written = 0u32;
+            assert_eq!(
+                WriteFile(h4_dup, b"+ALIVE".as_ptr() as *const c_void, 6, &mut written, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(written, 6);
+            assert_eq!(read_win_from_start(h4_dup), b"CRT-ORIG+ALIVE");
+            assert_eq!(CloseHandle(h4_dup), TRUE);
+            assert!(crate::handles::get(h4_dup).is_none());
+            assert_eq!(std::fs::read(dir.join("crt_close.bin")).unwrap(), b"CRT-ORIG+ALIVE");
+
+            // 7. Genuinely CRT-opened ordinary file (`_open`) -> `_get_osfhandle` ->
+            //    `DuplicateHandle` -> `_dup2(other_fd, fd)`:
+            //    - Shared file position before `_dup2`.
+            //    - After `_dup2`, the surviving sibling handle still reads and writes the original
+            //      file while `fd` points to `other_fd`.
+            //    - After `CloseHandle(sibling)` drops the last `Arc<FileObj>`, destination `fd`
+            //      and its new `_get_osfhandle(fd)` still read and write cleanly!
+            let fd5 = _open(b"D:\\crt_dup2.bin\0".as_ptr(), O_RDWR | O_BINARY, 0x180);
+            let fd_other = _open(b"D:\\crt_other.bin\0".as_ptr(), O_RDWR | O_BINARY, 0x180);
+            assert!(fd5 >= 0 && fd_other >= 0);
+            let h5 = _get_osfhandle(fd5) as HANDLE;
+            assert_ne!(h5, INVALID_HANDLE_VALUE);
+            let h5_dup = dup_win(h5);
+
+            // Verify shared file position before `_dup2`.
+            assert_eq!(_lseeki64(fd5, 4, 0), 4);
+            let mut pos5 = -1i64;
+            assert_eq!(SetFilePointerEx(h5_dup, 0, &mut pos5, 1), TRUE);
+            assert_eq!(pos5, 4);
+
+            assert_eq!(_dup2(fd_other, fd5), 0);
+            assert!(crate::handles::get(h5).is_none(), "cached _get_osfhandle must retire on _dup2");
+            assert!(crate::handles::get(h5_dup).is_some());
+
+            // Sibling still reads and writes the original file after `_dup2`.
+            assert_eq!(read_win_from_start(h5_dup), b"CRT-DUP2");
+            let mut w5 = 0u32;
+            assert_eq!(
+                WriteFile(h5_dup, b"!OK".as_ptr() as *const c_void, 3, &mut w5, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(w5, 3);
+            assert_eq!(read_win_from_start(h5_dup), b"CRT-DUP2!OK");
+
+            // Destination fd now refers to `crt_other.bin`.
+            assert_eq!(read_all_crt(fd5), b"OTHER-FD");
+
+            // Closing the surviving sibling must NOT disturb destination `fd5` or its new handle!
+            assert_eq!(CloseHandle(h5_dup), TRUE);
+            assert!(crate::handles::get(h5_dup).is_none());
+            assert_eq!(read_all_crt(fd5), b"OTHER-FD");
+
+            let h5_new = _get_osfhandle(fd5) as HANDLE;
+            assert_ne!(h5_new, INVALID_HANDLE_VALUE);
+            assert_ne!(h5_new, h5);
+            assert_eq!(_get_osfhandle(fd5), h5_new as isize);
+            assert_eq!(read_win_from_start(h5_new), b"OTHER-FD");
+            let mut w_other = 0u32;
+            assert_eq!(
+                WriteFile(h5_new, b"+NEW".as_ptr() as *const c_void, 4, &mut w_other, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(w_other, 4);
+            assert_eq!(read_all_crt(fd5), b"OTHER-FD+NEW");
+
+            assert_eq!(_close(fd5), 0);
+            assert_eq!(_close(fd_other), 0);
+            assert_eq!(std::fs::read(dir.join("crt_dup2.bin")).unwrap(), b"CRT-DUP2!OK");
+            assert_eq!(std::fs::read(dir.join("crt_other.bin")).unwrap(), b"OTHER-FD+NEW");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crt_read_write_block_on_nonblocking_duplex_named_pipe_after_overlapped_write() {
+        use crate::kernel32::file::{
+            CreateFileW, CreateNamedPipeW, DisconnectNamedPipe, GetOverlappedResult, ReadFile,
+            WriteFile, OVERLAPPED,
+        };
+        use crate::kernel32::threads::CloseHandle;
+        use crate::types::{err, INVALID_HANDLE_VALUE, TRUE};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        unsafe {
+            let pname = crate::strings::to_wide_z(&format!(
+                "\\\\.\\pipe\\aw2_crt_nb_pipe_test_{}",
+                std::process::id()
+            ));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x4000_0003, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                0,
+                std::ptr::null_mut(),
+                3,           // OPEN_EXISTING
+                0x4000_0000, // FILE_FLAG_OVERLAPPED
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+            let cli_fd = _open_osfhandle(cli as isize, O_BINARY);
+            assert!(cli_fd >= 0);
+
+            // A 1-byte overlapped WriteFile permanently enables O_NONBLOCK on the shared
+            // open file description (visible through cli_fd via F_DUPFD_CLOEXEC).
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let mut nw = 0u32;
+            let ok = WriteFile(cli, b"X".as_ptr() as *const c_void, 1, &mut nw, &mut ov);
+            if ok == 0 {
+                assert_eq!(crate::teb::last_error(), err::ERROR_IO_PENDING);
+                assert_eq!(GetOverlappedResult(cli, &mut ov, &mut nw, TRUE), TRUE);
+            }
+            assert_eq!(nw, 1);
+
+            let mut one = [0u8; 1];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(srv, one.as_mut_ptr() as *mut c_void, 1, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(nr, 1);
+            assert_eq!(&one, b"X");
+            assert_ne!(
+                libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "expected shared O_NONBLOCK after overlapped pipe write"
+            );
+
+            // 1. CRT _read on an empty nonblocking pipe must wait for data (not fail with EAGAIN)
+            //    and preserve ordinary short read counts.
+            let (r_tx, r_rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 32];
+                let n = _read(cli_fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                let e = errno::get();
+                let _ = r_tx.send((n, e, buf));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(
+                matches!(r_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "_read on empty pipe returned prematurely instead of waiting"
+            );
+            let msg = b"hello-pipe";
+            assert_eq!(
+                WriteFile(srv, msg.as_ptr() as *const c_void, msg.len() as u32, &mut nw, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(nw as usize, msg.len());
+            let (n, e, buf) = r_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("_read on pipe hung after data arrived");
+            reader.join().unwrap();
+            assert_eq!(n as usize, msg.len(), "_read failed with errno={e}");
+            assert_eq!(&buf[..n as usize], msg);
+
+            // 2. Backpressured CRT _write must wait and resume after partial writes, delivering
+            //    all 256 KiB intact and in exact order while keeping shared O_NONBLOCK intact.
+            //    Shrink SO_SNDBUF on the socketpair client fd to guarantee backpressure
+            //    independent of host socket defaults.
+            let small_sndbuf: libc::c_int = 4096;
+            assert_eq!(
+                libc::setsockopt(
+                    cli_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &small_sndbuf as *const libc::c_int as *const c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ),
+                0
+            );
+            let (srv_fd, _) = crate::kernel32::file::file_fd_and_kind(srv)
+                .expect("connected named pipe server must have a live POSIX fd");
+
+            let payload: Vec<u8> = (0..256 * 1024usize)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8)
+                .collect();
+            let payload_send = payload.clone();
+            let (w_tx, w_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let n = _write(
+                    cli_fd,
+                    payload_send.as_ptr() as *const c_void,
+                    payload_send.len() as u32,
+                );
+                let e = errno::get();
+                let _ = w_tx.send((n, e));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(
+                matches!(w_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "backpressured _write returned prematurely instead of waiting"
+            );
+
+            let mut received = Vec::with_capacity(payload.len());
+            let mut chunk = [0u8; 8192];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while received.len() < payload.len() {
+                let mut pfd = libc::pollfd {
+                    fd: srv_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = loop {
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !rem.is_zero(),
+                        "timed out draining backpressured _write ({}/{} bytes received; writer={:?})",
+                        received.len(),
+                        payload.len(),
+                        w_rx.try_recv()
+                    );
+                    let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+                    let rc = libc::poll(&mut pfd, 1, timeout_ms);
+                    if rc < 0 && *libc::__error() == libc::EINTR {
+                        continue;
+                    }
+                    break rc;
+                };
+                assert!(
+                    pr > 0,
+                    "poll(srv_fd) failed or timed out (rc={pr}, errno={}, {}/{} bytes, writer={:?})",
+                    *libc::__error(),
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
+                assert!(
+                    (pfd.revents & libc::POLLIN) != 0,
+                    "pipe peer closed/errored before full payload (revents={:#x}, {}/{} bytes, writer={:?})",
+                    pfd.revents,
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
+                let want = (payload.len() - received.len()).min(chunk.len()) as u32;
+                let mut got = 0u32;
+                let rok = ReadFile(
+                    srv,
+                    chunk.as_mut_ptr() as *mut c_void,
+                    want,
+                    &mut got,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(
+                    rok,
+                    TRUE,
+                    "ReadFile(srv) failed with {} ({}/{} bytes, writer={:?})",
+                    crate::teb::last_error(),
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
+                assert!(got > 0, "unexpected 0-byte ReadFile before full payload");
+                received.extend_from_slice(&chunk[..got as usize]);
+            }
+            let (wn, we) = w_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("backpressured _write hung while peer drained");
+            writer.join().unwrap();
+            assert_eq!(wn as usize, payload.len(), "_write failed with errno={we}");
+            assert_eq!(received, payload);
+            assert_ne!(
+                libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "CRT retry path must not toggle shared O_NONBLOCK off"
+            );
+
+            // 3. Peer disconnect/close terminates waiting CRT _read with 0 (EOF) and causes
+            //    subsequent CRT _write to fail cleanly with EPIPE.
+            let (eof_tx, eof_rx) = mpsc::channel();
+            let eof_reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 16];
+                let n = _read(cli_fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                let e = errno::get();
+                let _ = eof_tx.send((n, e));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(matches!(eof_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(DisconnectNamedPipe(srv), TRUE);
+            assert_eq!(CloseHandle(srv), TRUE);
+
+            let (eof_n, eof_e) = eof_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("_read on pipe hung after peer closed");
+            eof_reader.join().unwrap();
+            assert_eq!(eof_n, 0, "expected EOF (0), got {eof_n} errno={eof_e}");
+
+            assert_eq!(_write(cli_fd, b"after-eof".as_ptr() as *const c_void, 9), -1);
+            assert_eq!(errno::get(), EPIPE);
+
+            assert_eq!(_close(cli_fd), 0);
+            assert!(crate::handles::get(cli).is_none());
+        }
+    }
+
+    #[test]
+    fn std_fd_get_osfhandle_tracks_fd_independently_of_set_std_handle_and_dup2() {
+        use crate::kernel32::file::{CreateFileW, GetStdHandle, SetStdHandle, WriteFile};
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+
+        struct StdFd1Guard {
+            saved_posix_1: i32,
+            saved_std_out: HANDLE,
+        }
+        impl Drop for StdFd1Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    SetStdHandle(STD_OUTPUT_HANDLE, self.saved_std_out);
+                    let _ = libc::dup2(self.saved_posix_1, 1);
+                    let prev = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&1);
+                    if let Some((old_info, _)) = prev {
+                        if let Some(old_h) = old_info.osf_handle {
+                            let _ = crate::handles::close(old_h as HANDLE);
+                        }
+                    }
+                    let _ = libc::close(self.saved_posix_1);
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("aw2_std_osf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("M:\\", &dir);
+
+        unsafe {
+            let create_win = |win_path: &str| -> HANDLE {
+                let p = crate::strings::to_wide_z(win_path);
+                let h = CreateFileW(
+                    p.as_ptr(),
+                    0xC000_0000,
+                    3,
+                    std::ptr::null_mut(),
+                    2, // CREATE_ALWAYS
+                    0x80,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let write_win = |h: HANDLE, data: &[u8]| {
+                let mut written = 0u32;
+                assert_eq!(
+                    WriteFile(h, data.as_ptr() as *const c_void, data.len() as u32, &mut written, std::ptr::null_mut()),
+                    TRUE
+                );
+                assert_eq!(written as usize, data.len());
+            };
+
+            let saved_posix_1 = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3);
+            assert!(saved_posix_1 >= 3);
+            let saved_std_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            let _guard = StdFd1Guard { saved_posix_1, saved_std_out };
+
+            // Open helper files before closing slot 1 so `CreateFileW` / `_open` cannot claim slot 1.
+            let fd_extra = _open(b"M:\\extra.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let h_alias = create_win("M:\\alias.bin");
+            let fd_a = _open(b"M:\\fd1_a.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let fd_b = _open(b"M:\\fd1_b.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let h_win = create_win("M:\\std_win.bin");
+            assert!(fd_extra >= 3 && fd_a >= 3 && fd_b >= 3);
+
+            // 1. With standard slot 1 closed, exporting another fd via _get_osfhandle must use
+            //    min fd 3 and leave closed slot 1 unpopulated; _open_osfhandle aliasing into a
+            //    standard slot preserves the exact transferred Win32 handle.
+            assert_eq!(_close(1), 0);
+            assert!(!fd_valid(1));
+            assert_eq!(_get_osfhandle(1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            let h_extra = _get_osfhandle(fd_extra) as HANDLE;
+            assert_ne!(h_extra, INVALID_HANDLE_VALUE);
+            let extra_obj = crate::kernel32::file::get_file(h_extra).expect("exported FileObj");
+            assert!(extra_obj.fd() >= 3, "internal duplicate must not occupy closed std slot");
+            assert_ne!(libc::fcntl(extra_obj.fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            drop(extra_obj);
+            assert!(!fd_valid(1), "exporting another fd must not populate closed slot 1");
+            assert_eq!(_close(fd_extra), 0);
+
+            let fd_alias = _open_osfhandle(h_alias as isize, O_BINARY);
+            assert!((0..=2).contains(&fd_alias), "expected _open_osfhandle to reuse closed std slot, got {fd_alias}");
+            assert_eq!(_get_osfhandle(fd_alias), h_alias as isize);
+            write_win(h_alias, b"ALIAS");
+            assert_eq!(_close(fd_alias), 0);
+            assert!(crate::handles::get(h_alias).is_none());
+
+            // 2. Bind POSIX fd 1 to file A and redirect Win32 STD_OUTPUT_HANDLE to a distinct file.
+            //    _get_osfhandle(1) must track fd 1 (not STD_OUTPUT_HANDLE), stay cached/stable
+            //    before and after SetStdHandle, support DuplicateHandle lifetime across _dup2,
+            //    and track file B after _dup2(fd_b, 1).
+            assert_eq!(_dup2(fd_a, 1), 0);
+
+            assert_eq!(SetStdHandle(STD_OUTPUT_HANDLE, h_win), TRUE);
+            assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), h_win);
+
+            let h1_a = _get_osfhandle(1) as HANDLE;
+            assert_ne!(h1_a, INVALID_HANDLE_VALUE);
+            assert_ne!(h1_a, h_win);
+            assert_ne!(h1_a, saved_std_out);
+            assert_eq!(_get_osfhandle(1), h1_a as isize); // cached identity stable
+            let h1_a_obj = crate::kernel32::file::get_file(h1_a).expect("fd 1 FileObj");
+            assert!(h1_a_obj.fd() >= 3);
+            assert_ne!(libc::fcntl(h1_a_obj.fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            drop(h1_a_obj);
+
+            let mut h1_a_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(
+                    crate::handles::CURRENT_PROCESS,
+                    h1_a,
+                    crate::handles::CURRENT_PROCESS,
+                    &mut h1_a_dup,
+                    0,
+                    0,
+                    2, // DUPLICATE_SAME_ACCESS
+                ),
+                TRUE
+            );
+            assert!(!h1_a_dup.is_null() && h1_a_dup != h1_a);
+
+            write_win(GetStdHandle(STD_OUTPUT_HANDLE), b"WIN-A");
+            write_win(h1_a, b"FD1-A");
+
+            // Redirect POSIX fd 1 to file B; old cached handle retires, DuplicateHandle sibling survives.
+            assert_eq!(_dup2(fd_b, 1), 0);
+            assert!(crate::handles::get(h1_a).is_none());
+            assert!(crate::handles::get(h1_a_dup).is_some());
+            write_win(h1_a_dup, b"+DUP");
+            assert_eq!(CloseHandle(h1_a_dup), TRUE);
+
+            assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), h_win);
+            let h1_b = _get_osfhandle(1) as HANDLE;
+            assert_ne!(h1_b, INVALID_HANDLE_VALUE);
+            assert_ne!(h1_b, h1_a);
+            assert_ne!(h1_b, h_win);
+            assert_eq!(_get_osfhandle(1), h1_b as isize); // cached identity stable after _dup2
+            let h1_b_obj = crate::kernel32::file::get_file(h1_b).expect("redirected fd 1 FileObj");
+            assert!(h1_b_obj.fd() >= 3);
+            drop(h1_b_obj);
+
+            write_win(h1_b, b"FD1-B");
+            write_win(GetStdHandle(STD_OUTPUT_HANDLE), b"+WIN-B");
+
+            assert_eq!(_close(fd_a), 0);
+            assert_eq!(_close(fd_b), 0);
+            drop(_guard);
+            assert_eq!(CloseHandle(h_win), TRUE);
+
+            assert_eq!(std::fs::read(dir.join("alias.bin")).unwrap(), b"ALIAS");
+            assert_eq!(std::fs::read(dir.join("std_win.bin")).unwrap(), b"WIN-A+WIN-B");
+            assert_eq!(std::fs::read(dir.join("fd1_a.bin")).unwrap(), b"FD1-A+DUP");
+            assert_eq!(std::fs::read(dir.join("fd1_b.bin")).unwrap(), b"FD1-B");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

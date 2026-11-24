@@ -18,7 +18,7 @@ const PARALLEL_DISCOVER_MIN_BLOCKS: usize = 512;
 
 /// PE32+ data directory `idx` of the image at `[base, base + size)`: `(rva, size)`, None if
 /// absent or out of the image.
-unsafe fn data_dir(base: usize, size: usize, idx: usize) -> Option<(u32, u32)> {
+pub(super) unsafe fn data_dir(base: usize, size: usize, idx: usize) -> Option<(u32, u32)> {
     if base == 0 || size < 0x400 {
         return None;
     }
@@ -492,7 +492,7 @@ unsafe fn export_function_rvas(base: usize, size: usize) -> Vec<u32> {
 }
 
 /// OptionalHeader `ImageBase` of a PE32+ image mapped at `[base, base + size)`.
-unsafe fn opt_image_base(base: usize, size: usize) -> Option<u64> {
+pub(super) unsafe fn opt_image_base(base: usize, size: usize) -> Option<u64> {
     if base == 0 || size < 0x400 {
         return None;
     }
@@ -512,7 +512,7 @@ unsafe fn opt_image_base(base: usize, size: usize) -> Option<u64> {
 /// Convert a VA inside a mapped PE32+ image (`[base, base + size)`, or fallback to
 /// `OptionalHeader.ImageBase` if unrelocated) into an in-bounds RVA.
 #[inline]
-fn pe_va_to_rva(base: usize, size: usize, opt_base: Option<u64>, va: u64) -> Option<u32> {
+pub(super) fn pe_va_to_rva(base: usize, size: usize, opt_base: Option<u64>, va: u64) -> Option<u32> {
     let b = base as u64;
     let sz = size as u64;
     if va >= b && va - b < sz {
@@ -777,6 +777,11 @@ pub(super) unsafe fn discover_pe_roots(base: usize, size: usize, max_roots: usiz
     }
     if reloc_roots_enabled() {
         roots.extend(base_reloc_code_rvas(base, size, &text));
+    }
+    for cb in super::callbacks::discover_static_callback_roots(base, size, &text) {
+        if in_text(cb.rva) {
+            roots.push(cb.rva);
+        }
     }
     roots.sort_unstable();
     roots.dedup();

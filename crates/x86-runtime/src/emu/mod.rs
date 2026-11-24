@@ -2,11 +2,12 @@
 //! for calling unlifted PE functions (`DllMain`, CRT init, third-party DLLs, or fallback
 //! executable VAs) on non-`x86_64` hosts (`aarch64-apple-darwin` / `aarch64-apple-ios`).
 //!
-//! Whenever a `call` or `jmp` targets an address registered in [`crate::exe::lookup_native_va`]
-//! (or any address inside the host Mach-O `__TEXT` segment), execution dispatches directly
-//! to the compiled native `aarch64` Rust function (`win32-rt` builtin export or registered
-//! game replacement). Otherwise, it decodes and executes the guest `x86-64` instructions in
-//! place against guest memory and the thread's TEB (`gs:[offset]`).
+//! Whenever a `call` or `jmp` targets an address explicitly registered in
+//! [`crate::exe::lookup_native_va`], execution dispatches directly to the compiled native
+//! `aarch64` Rust function (`win32-rt` builtin export thunk, COM vtable method, or registered
+//! game replacement). Unregistered host `__TEXT` addresses are never implicitly authorized.
+//! Otherwise, it decodes and executes the guest `x86-64` instructions in place against guest
+//! memory and the thread's TEB (`gs:[offset]`).
 //!
 //! Submodule layout:
 //! - [`cpu`]: `Cpu` state, flags, memory/atomic accessors, `MXCSR`↔`FPCR` guards, precise faults, scalar SSE helpers
@@ -229,7 +230,33 @@ pub fn aot_profile_dump() {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub use aot::{aot_cached_preferred_base, aot_prewarm_all_mapped, AotPrewarmReport};
+pub use aot::{
+    aot_cached_preferred_base, aot_prewarm_all_mapped, discover_all_callback_roots,
+    disk_aot_disabled, flush_runtime_callbacks, image_fingerprint, record_runtime_callback,
+    set_disk_aot_disabled, AotPrewarmReport, CallbackKind, CallbackRoot, ImageFingerprint,
+};
+
+/// Permanently disable disk-sourced native AOT caches (no-op on non-aarch64 hosts).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn set_disk_aot_disabled(_disabled: bool) {}
+
+/// True when disk-sourced native AOT caches are disabled (always true on non-aarch64 hosts).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn disk_aot_disabled() -> bool {
+    true
+}
+
+/// True if guest block `ip` is currently backed by a live AOT translation (dynamic or static).
+#[cfg(target_arch = "aarch64")]
+pub fn aot_has_block(ip: u64) -> bool {
+    aot::find(ip).is_some()
+}
+
+/// True if guest block `ip` is currently backed by a live AOT translation (always false on non-aarch64).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn aot_has_block(_ip: u64) -> bool {
+    false
+}
 
 /// Look up the compiled `image_base` of a matching dynamic `.aot` cache (no-op on non-aarch64 hosts).
 #[cfg(not(target_arch = "aarch64"))]

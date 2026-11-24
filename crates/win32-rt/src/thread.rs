@@ -11,6 +11,22 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 pub type ThreadProc = unsafe extern "win64" fn(*mut c_void) -> u32;
 pub type ApcProc = unsafe extern "win64" fn(usize);
+pub type IoCompletionRoutine = unsafe extern "win64" fn(u32, u32, usize);
+
+#[derive(Clone, Copy)]
+pub enum ApcItem {
+    User {
+        func: ApcProc,
+        param: usize,
+    },
+    IoCompletion {
+        func: usize,
+        err_code: u32,
+        bytes: u32,
+        overlapped: usize,
+        flags: u32,
+    },
+}
 
 /// Windows maximum thread suspend count (`MAXIMUM_SUSPEND_COUNT`).
 pub const MAXIMUM_SUSPEND_COUNT: u32 = 127;
@@ -40,7 +56,7 @@ pub struct ThreadObj {
     pub tid: AtomicUsize,
     pub teb: AtomicUsize,
     pub exit_code: Guarded<Option<u32>>,
-    pub apcs: Mutex<Vec<(ApcProc, usize)>>,
+    pub apcs: Mutex<Vec<ApcItem>>,
     /// Lock-free mirror of `!apcs.is_empty()` for zero-overhead `has_pending_apc()`.
     pub has_apc: AtomicBool,
     pub name: Mutex<String>,
@@ -349,6 +365,32 @@ pub fn current_thread_object() -> Option<Arc<ThreadObj>> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
+/// Return the current thread's `ThreadObj`, lazily attaching a lightweight
+/// `ThreadObj` for host/test threads that did not enter via [`spawn`].
+/// This guarantees issuing-thread APC queues (`ReadFileEx`, `WriteFileEx`,
+/// `ReadDirectoryChangesW`) work on every thread, including the initial thread.
+pub fn ensure_current_thread_object() -> Arc<ThreadObj> {
+    if let Some(obj) = current_thread_object() {
+        return obj;
+    }
+    let obj = ThreadObj::new(false);
+    let teb_ptr = teb::current();
+    let tid = teb::thread_id();
+    obj.tid.store(tid as usize, Ordering::Relaxed);
+    obj.teb.store(teb_ptr as usize, Ordering::Relaxed);
+    obj.pthread.store(unsafe { libc::pthread_self() as usize }, Ordering::Relaxed);
+    {
+        let mut s = obj.suspend.lock().unwrap();
+        s.phase = ThreadPhase::Live;
+        #[cfg(target_vendor = "apple")]
+        {
+            s.mach_port = sched::current_port();
+        }
+    }
+    install_current_thread_context(Some(obj.clone()));
+    obj
+}
+
 pub fn find_by_tid(tid: u32) -> Option<Arc<ThreadObj>> {
     THREADS.lock().unwrap().iter().find(|t| t.tid.load(Ordering::Relaxed) as u32 == tid).cloned()
 }
@@ -551,8 +593,21 @@ pub fn run_pending_apcs() {
                 }
             };
             match next {
-                Some((f, p)) => unsafe {
-                    crate::call_guest8(f as usize, p as u64, 0, 0, 0, 0, 0, 0, 0);
+                Some(ApcItem::User { func, param }) => unsafe {
+                    crate::call_guest8(func as usize, param as u64, 0, 0, 0, 0, 0, 0, 0);
+                },
+                Some(ApcItem::IoCompletion { func, err_code, bytes, overlapped, flags }) => unsafe {
+                    crate::call_guest8(
+                        func,
+                        err_code as u64,
+                        bytes as u64,
+                        overlapped as u64,
+                        flags as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
                 },
                 None => break,
             }
@@ -563,11 +618,33 @@ pub fn run_pending_apcs() {
 pub fn queue_apc(t: &ThreadObj, f: ApcProc, param: usize) {
     {
         let mut q = t.apcs.lock().unwrap();
-        q.push((f, param));
+        q.push(ApcItem::User { func: f, param });
         t.has_apc.store(true, Ordering::Release);
     }
     // `notify_thread_apc` issues a SeqCst fence before checking ALERTABLE_WAITERS,
     // waking ONLY this specific thread if it is in an alertable wait.
+    handles::notify_thread_apc(t.tid.load(Ordering::Relaxed) as u32);
+}
+
+pub fn queue_io_completion_apc(t: &ThreadObj, func: IoCompletionRoutine, err_code: u32, bytes: u32, overlapped: usize) {
+    queue_io_completion_apc_with_flags(t, func as usize, err_code, bytes, overlapped, 0);
+}
+
+/// Queue an I/O completion APC carrying an explicit 4th `dwFlags` argument
+/// (`LPWSAOVERLAPPED_COMPLETION_ROUTINE(dwError, cbTransferred, lpOverlapped, dwFlags)`).
+pub fn queue_io_completion_apc_with_flags(
+    t: &ThreadObj,
+    func: usize,
+    err_code: u32,
+    bytes: u32,
+    overlapped: usize,
+    flags: u32,
+) {
+    {
+        let mut q = t.apcs.lock().unwrap();
+        q.push(ApcItem::IoCompletion { func, err_code, bytes, overlapped, flags });
+        t.has_apc.store(true, Ordering::Release);
+    }
     handles::notify_thread_apc(t.tid.load(Ordering::Relaxed) as u32);
 }
 

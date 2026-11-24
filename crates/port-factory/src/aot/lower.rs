@@ -1,6 +1,7 @@
 //! Instruction-level lowering (`x86-64 -> Native Rust/ARM64`) for the
 //! Static AOT Compiler.
 
+use super::abi::IatCallAbi;
 use super::operands::*;
 use super::AotImportBinding;
 use anyhow::Result;
@@ -38,6 +39,67 @@ pub(super) fn is_block_terminator(ins: &Instruction) -> bool {
             ins.op0_kind(),
             OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16
         )
+}
+
+/// Emit a direct Win32 IAT `call` or tail `jmp` using the import's classified Win64 ABI.
+///
+/// - For known pure-integer/pointer Win64 imports (`IatCallAbi::IntArgs(n)`):
+///   - On `call`: forwards `rcx..r9` plus stack arguments `5..=n` from `[rsp + 0x20..]`
+///     (e.g. `ReadFileEx`'s 5th `lpCompletionRoutine` pointer at `[rsp + 0x20]`) -> `Ok(true)`.
+///   - On tail `jmp`: exact only when `n <= 4` (the standalone 4-GPR function signature did
+///     not receive caller stack arguments 5+); for `n > 4` emits a best-effort call and
+///     honestly returns `Ok(false)` (`fully_lowered = false`).
+/// - For `IatCallAbi::Fallback` (variadic, float/SIMD, hidden `sret`, or unknown signature):
+///   emits a best-effort bridge and honestly returns `Ok(false)` so `port-loader` defers
+///   the function to the full ARM64 JIT instead of silently dropping arguments.
+fn emit_iat_call(
+    out: &mut String,
+    iat_rva: u32,
+    imp: &AotImportBinding,
+    is_tail_jmp: bool,
+) -> Result<bool> {
+    let stack_base = if is_tail_jmp { "0x28" } else { "0x20" };
+    let assign_or_ret = if is_tail_jmp { "return " } else { "rax = " };
+    match imp.call_abi {
+        IatCallAbi::IntArgs(arity) => {
+            let exact = !is_tail_jmp || arity <= 4;
+            if exact {
+                writeln!(
+                    out,
+                    "                    // Direct Win32 IAT {} (int_args={arity}): {}!{} (win32={:?})",
+                    if is_tail_jmp { "tail-jmp" } else { "call" },
+                    imp.canonical_dll,
+                    imp.symbol,
+                    imp.rust_path
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "                    // [AOT_FALLBACK] tail-jmp to {arity}-arg IAT {}!{} exceeds 4-GPR standalone entry ABI",
+                    imp.canonical_dll, imp.symbol
+                )?;
+            }
+            writeln!(
+                out,
+                "                    {assign_or_ret}call_iat_args(0x{iat_rva:08X}, rcx, rdx, r8, r9, rsp, {stack_base}, {arity});"
+            )?;
+            Ok(exact)
+        }
+        IatCallAbi::Fallback => {
+            writeln!(
+                out,
+                "                    // [AOT_FALLBACK] IAT {} {}!{} has non-4GPR/float/variadic/unknown ABI",
+                if is_tail_jmp { "tail-jmp" } else { "call" },
+                imp.canonical_dll,
+                imp.symbol
+            )?;
+            writeln!(
+                out,
+                "                    {assign_or_ret}call_iat_args(0x{iat_rva:08X}, rcx, rdx, r8, r9, rsp, {stack_base}, 8);"
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 /// Lower one `iced_x86::Instruction` into Rust statements inside the basic block.
@@ -169,16 +231,7 @@ fn lower_instruction_inner(
                     let target_rva = rel as u32;
                     if let Some(&iat_rva) = iat_thunks.get(&target_rva) {
                         let imp = &imports_by_rva[&iat_rva];
-                        writeln!(
-                            out,
-                            "                    // Direct Win32 IAT thunk call: {}!{} (win32={:?})",
-                            imp.canonical_dll, imp.symbol, imp.rust_path
-                        )?;
-                        writeln!(
-                            out,
-                            "                    rax = call_iat(0x{iat_rva:08X}, {arg_rcx}, {arg_rdx}, {arg_r8}, {arg_r9});"
-                        )?;
-                        return Ok(true);
+                        return emit_iat_call(out, iat_rva, imp, false);
                     }
                     if known_fn_rvas.contains(&target_rva) {
                         writeln!(
@@ -199,16 +252,7 @@ fn lower_instruction_inner(
                 if let Some(rel) = target_va.checked_sub(image_base) {
                     let iat_rva = rel as u32;
                     if let Some(imp) = imports_by_rva.get(&iat_rva) {
-                        writeln!(
-                            out,
-                            "                    // Direct Win32 IAT call: {}!{} (win32={:?})",
-                            imp.canonical_dll, imp.symbol, imp.rust_path
-                        )?;
-                        writeln!(
-                            out,
-                            "                    rax = call_iat(0x{iat_rva:08X}, {arg_rcx}, {arg_rdx}, {arg_r8}, {arg_r9});"
-                        )?;
-                        return Ok(true);
+                        return emit_iat_call(out, iat_rva, imp, false);
                     }
                 }
             }
@@ -233,12 +277,9 @@ fn lower_instruction_inner(
                         return Ok(true);
                     }
                     if let Some(&iat_rva) = iat_thunks.get(&target_rva) {
-                        writeln!(
-                            out,
-                            "                    return call_iat(0x{iat_rva:08X}, rcx, rdx, r8, r9);"
-                        )?;
+                        let imp = &imports_by_rva[&iat_rva];
                         *terminated = true;
-                        return Ok(true);
+                        return emit_iat_call(out, iat_rva, imp, true);
                     }
                     if known_fn_rvas.contains(&target_rva) {
                         writeln!(
@@ -260,13 +301,9 @@ fn lower_instruction_inner(
                 let target_va = ins.ip_rel_memory_address();
                 if let Some(rel) = target_va.checked_sub(image_base) {
                     let iat_rva = rel as u32;
-                    if imports_by_rva.contains_key(&iat_rva) {
-                        writeln!(
-                            out,
-                            "                    return call_iat(0x{iat_rva:08X}, rcx, rdx, r8, r9);"
-                        )?;
+                    if let Some(imp) = imports_by_rva.get(&iat_rva) {
                         *terminated = true;
-                        return Ok(true);
+                        return emit_iat_call(out, iat_rva, imp, true);
                     }
                 }
             }
@@ -1641,7 +1678,7 @@ fn main() {
         src.push_str("#![allow(unused_variables, unused_mut, unused_assignments, unused_parens, dead_code, non_snake_case, unreachable_code, unused_unsafe, clippy::all)]\n");
         emit_aot_runtime_prelude(&mut src, BASE, 0x10000).unwrap();
         emit_import_table(&mut src, &BTreeMap::new()).unwrap();
-        emit_function_directory(&mut src, &[], &[]).unwrap();
+        emit_function_directory(&mut src, &[], &[], &[], &[]).unwrap();
         src.push_str(
             "#[derive(Clone, Copy, Default)]\nstruct St { r: [u64; 16], xmm: [u128; 16], cf: bool, zf: bool, sf: bool, of: bool }\n\
              #[repr(C, align(16))]\nstruct A16([u64; 2]);\n\

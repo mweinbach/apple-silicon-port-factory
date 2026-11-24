@@ -183,6 +183,8 @@ pub unsafe extern "win64" fn GetCurrentProcessId() -> u32 {
 pub unsafe extern "win64" fn GetProcessId(h: HANDLE) -> u32 {
     if h == handles::CURRENT_PROCESS || handles::get_as::<ProcessObj>(h).is_some() {
         std::process::id()
+    } else if let Some(c) = handles::get_as::<ChildProcessObj>(h) {
+        c.pid
     } else {
         set_err(err::ERROR_INVALID_HANDLE);
         0
@@ -200,14 +202,120 @@ impl KObject for ProcessObj {
     }
 }
 
-pub unsafe extern "win64" fn OpenProcess(_access: u32, _inherit: BOOL, pid: u32) -> HANDLE {
-    if pid == std::process::id() {
-        handles::insert(Arc::new(ProcessObj))
-    } else {
-        log::debug!("OpenProcess({pid}): not our process");
-        set_err(if pid == 0 { err::ERROR_INVALID_PARAMETER } else { err::ERROR_ACCESS_DENIED });
-        std::ptr::null_mut()
+/// Handle to a real child guest process launched by `CreateProcessW` on macOS.
+pub struct ChildProcessObj {
+    pub pid: u32,
+    pub exe_win: String,
+    pub exit_code: handles::Guarded<Option<u32>>,
+    #[cfg(not(target_os = "ios"))]
+    terminated_code: handles::Guarded<Option<u32>>,
+    #[cfg(not(target_os = "ios"))]
+    os_pid: std::sync::atomic::AtomicI32,
+}
+
+impl ChildProcessObj {
+    pub fn current_exit_code(&self) -> Option<u32> {
+        let g = handles::wait_lock();
+        *self.exit_code.get(&g)
     }
+
+    #[cfg(not(target_os = "ios"))]
+    fn finish_reaped(&self, guest_code: Option<u32>, fallback_code: u32) {
+        self.os_pid.store(0, Ordering::Release);
+        {
+            let g = handles::wait_lock();
+            let slot = self.exit_code.get(&g);
+            if slot.is_none() {
+                let term_code = *self.terminated_code.get(&g);
+                // Prefer an explicit 32-bit guest exit code if the child completed ExitProcess/return;
+                // otherwise prefer the 32-bit code passed to TerminateProcess over POSIX signal fallback.
+                *slot = Some(guest_code.or(term_code).unwrap_or(fallback_code));
+            }
+        }
+        handles::notify_object_key(handles::obj_key(self), usize::MAX);
+    }
+}
+
+impl KObject for ChildProcessObj {
+    fn type_name(&self) -> &'static str {
+        "ChildProcess"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn waitable(&self) -> Option<&dyn handles::Waitable> {
+        Some(self)
+    }
+}
+
+impl handles::Waitable for ChildProcessObj {
+    fn is_signaled(&self, g: &handles::WaitGuard, _tid: u32) -> bool {
+        self.exit_code.get(g).is_some()
+    }
+    fn acquire(&self, _g: &handles::WaitGuard, _tid: u32) -> bool {
+        false
+    }
+}
+
+/// Companion waitable thread handle returned in `PROCESS_INFORMATION.hThread` for a child process.
+pub struct ChildThreadObj {
+    pub tid: u32,
+    pub process: Arc<ChildProcessObj>,
+}
+
+impl KObject for ChildThreadObj {
+    fn type_name(&self) -> &'static str {
+        "ChildThread"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn waitable(&self) -> Option<&dyn handles::Waitable> {
+        Some(self)
+    }
+}
+
+impl handles::Waitable for ChildThreadObj {
+    fn is_signaled(&self, g: &handles::WaitGuard, _tid: u32) -> bool {
+        self.process.exit_code.get(g).is_some()
+    }
+    fn acquire(&self, _g: &handles::WaitGuard, _tid: u32) -> bool {
+        false
+    }
+    fn wait_key(&self) -> usize {
+        handles::obj_key(&*self.process)
+    }
+}
+
+fn child_processes() -> &'static std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<ChildProcessObj>>> {
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<ChildProcessObj>>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub unsafe extern "win64" fn OpenProcess(_access: u32, inherit: BOOL, pid: u32) -> HANDLE {
+    let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
+    if pid == std::process::id() {
+        return handles::insert_with_flags(Arc::new(ProcessObj), flags);
+    }
+    if pid == 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let found = {
+        let mut m = child_processes().lock().unwrap();
+        let obj = m.get(&pid).and_then(|w| w.upgrade());
+        if obj.is_none() {
+            m.remove(&pid);
+        }
+        obj
+    };
+    if let Some(child) = found {
+        return handles::insert_with_flags(child, flags);
+    }
+    log::debug!("OpenProcess({pid}): not our process or known child");
+    set_err(err::ERROR_ACCESS_DENIED);
+    std::ptr::null_mut()
 }
 
 pub fn is_self(h: HANDLE) -> bool {
@@ -224,13 +332,61 @@ pub unsafe extern "win64" fn TerminateProcess(h: HANDLE, code: u32) -> BOOL {
         log::info!("TerminateProcess(self, {code}) called from {}", crate::symbolize(return_address()));
         pr::exit_process(code)
     }
+    if let Some(child) = handles::get_as::<ChildProcessObj>(h) {
+        #[cfg(not(target_os = "ios"))]
+        {
+            // Record the requested full 32-bit exit code before sending SIGKILL so the reaper
+            // cannot observe signal death before `terminated_code` is visible.
+            let already_exited = {
+                let g = handles::wait_lock();
+                if child.exit_code.get(&g).is_some() {
+                    true
+                } else {
+                    let tslot = child.terminated_code.get(&g);
+                    if tslot.is_none() {
+                        *tslot = Some(code);
+                    }
+                    false
+                }
+            };
+            if already_exited {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            let pid = child.os_pid.swap(0, Ordering::AcqRel);
+            if pid > 0 {
+                if libc::kill(pid, libc::SIGKILL) != 0 && last_errno() == libc::ESRCH {
+                    set_err(err::ERROR_ACCESS_DENIED);
+                    return FALSE;
+                }
+            }
+            return TRUE;
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let _ = (child, code);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+    }
     set_err(err::ERROR_ACCESS_DENIED);
     FALSE
 }
 
 pub unsafe extern "win64" fn GetExitCodeProcess(h: HANDLE, code: *mut u32) -> BOOL {
+    if code.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     if is_self(h) {
-        *code = crate::kernel32::threads::STILL_ACTIVE;
+        std::ptr::write_unaligned(code, crate::kernel32::threads::STILL_ACTIVE);
+        return TRUE;
+    }
+    if let Some(child) = handles::get_as::<ChildProcessObj>(h) {
+        let c = child
+            .current_exit_code()
+            .unwrap_or(crate::kernel32::threads::STILL_ACTIVE);
+        std::ptr::write_unaligned(code, c);
         return TRUE;
     }
     set_err(err::ERROR_INVALID_HANDLE);
@@ -260,33 +416,53 @@ pub unsafe extern "win64" fn GetStartupInfoA(si: *mut u8) {
 }
 
 pub unsafe extern "win64" fn QueryFullProcessImageNameW(h: HANDLE, _flags: u32, buf: LPWSTR, size: *mut u32) -> BOOL {
-    if !is_self(h) {
-        set_err(err::ERROR_INVALID_HANDLE);
+    if buf.is_null() || size.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let p = &pr::config().exe_path;
+    let p_owned: String;
+    let p: &str = if is_self(h) {
+        &pr::config().exe_path
+    } else if let Some(child) = handles::get_as::<ChildProcessObj>(h) {
+        p_owned = child.exe_win.clone();
+        &p_owned
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
     let n = p.encode_utf16().count() as u32;
-    if n + 1 > *size {
+    let cap = std::ptr::read_unaligned(size);
+    if n + 1 > cap {
         set_err(err::ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
-    write_wide_buf(p, buf, *size as usize);
-    *size = n;
+    write_wide_buf(p, buf, cap as usize);
+    std::ptr::write_unaligned(size, n);
     TRUE
 }
 
 pub unsafe extern "win64" fn QueryFullProcessImageNameA(h: HANDLE, _flags: u32, buf: LPSTR, size: *mut u32) -> BOOL {
-    if !is_self(h) {
-        set_err(err::ERROR_INVALID_HANDLE);
+    if buf.is_null() || size.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let p = &pr::config().exe_path;
-    if p.len() as u32 + 1 > *size {
+    let p_owned: String;
+    let p: &str = if is_self(h) {
+        &pr::config().exe_path
+    } else if let Some(child) = handles::get_as::<ChildProcessObj>(h) {
+        p_owned = child.exe_win.clone();
+        &p_owned
+    } else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let cap = std::ptr::read_unaligned(size);
+    if p.len() as u32 + 1 > cap {
         set_err(err::ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
-    write_ansi_buf(p, buf, *size as usize);
-    *size = p.len() as u32;
+    write_ansi_buf(p, buf, cap as usize);
+    std::ptr::write_unaligned(size, p.len() as u32);
     TRUE
 }
 
@@ -469,41 +645,990 @@ pub unsafe extern "win64" fn GetProcessIoCounters(_h: HANDLE, out: *mut u64) -> 
 }
 
 // ---------------------------------------------------------------------------
-// CreateProcess (not supported)
+// ProcThreadAttributeList & CreateProcessW/A
 // ---------------------------------------------------------------------------
+
+const PROC_THREAD_ATTR_MAGIC: u32 = 0x5054_414C; // "PTAL"
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
+
+#[cfg(any(not(target_os = "ios"), test))]
+const DEBUG_PROCESS: u32 = 0x0000_0001;
+#[cfg(any(not(target_os = "ios"), test))]
+const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_SEPARATE_WOW_VDM: u32 = 0x0000_0800;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_SHARED_WOW_VDM: u32 = 0x0000_1000;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_PROTECTED_PROCESS: u32 = 0x0004_0000;
+#[cfg(any(not(target_os = "ios"), test))]
+const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_SECURE_PROCESS: u32 = 0x0040_0000;
+#[cfg(any(not(target_os = "ios"), test))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(any(not(target_os = "ios"), test))]
+const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+#[cfg(any(not(target_os = "ios"), test))]
+const ERROR_BAD_EXE_FORMAT: u32 = 193;
+#[cfg(any(not(target_os = "ios"), test))]
+const ERROR_DIRECTORY: u32 = 267;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcThreadAttrHeader {
+    magic: u32,
+    capacity: u32,
+    count: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcThreadAttrEntry {
+    attribute: usize,
+    value_ptr: usize,
+    value_size: usize,
+}
+
+fn attr_list_bytes(count: u32) -> Option<usize> {
+    std::mem::size_of::<ProcThreadAttrHeader>()
+        .checked_add((count as usize).checked_mul(std::mem::size_of::<ProcThreadAttrEntry>())?)
+}
+
+pub unsafe extern "win64" fn InitializeProcThreadAttributeList(
+    attr_list: *mut c_void,
+    attr_count: u32,
+    flags: u32,
+    size: *mut usize,
+) -> BOOL {
+    if flags != 0 || size.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(needed) = attr_list_bytes(attr_count) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let avail = std::ptr::read_unaligned(size);
+    std::ptr::write_unaligned(size, needed);
+    if attr_list.is_null() || avail < needed {
+        set_err(err::ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    std::ptr::write_bytes(attr_list as *mut u8, 0, needed);
+    std::ptr::write_unaligned(
+        attr_list as *mut ProcThreadAttrHeader,
+        ProcThreadAttrHeader {
+            magic: PROC_THREAD_ATTR_MAGIC,
+            capacity: attr_count,
+            count: 0,
+            _pad: 0,
+        },
+    );
+    TRUE
+}
+
+pub unsafe extern "win64" fn UpdateProcThreadAttribute(
+    attr_list: *mut c_void,
+    flags: u32,
+    attribute: usize,
+    value: *mut c_void,
+    cb_size: usize,
+    previous_value: *mut c_void,
+    return_size: *mut usize,
+) -> BOOL {
+    if flags != 0 || attr_list.is_null() || !previous_value.is_null() || !return_size.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mut hdr = std::ptr::read_unaligned(attr_list as *const ProcThreadAttrHeader);
+    if hdr.magic != PROC_THREAD_ATTR_MAGIC {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    match attribute {
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST => {
+            if value.is_null() || cb_size == 0 || (cb_size % std::mem::size_of::<HANDLE>()) != 0 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY => {
+            if value.is_null() || (cb_size != 8 && cb_size != 16) {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+        _ => {
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+    }
+    let entries_base = (attr_list as *mut u8).add(std::mem::size_of::<ProcThreadAttrHeader>())
+        as *mut ProcThreadAttrEntry;
+    for i in 0..hdr.count as usize {
+        let mut ent = std::ptr::read_unaligned(entries_base.add(i));
+        if ent.attribute == attribute {
+            ent.value_ptr = value as usize;
+            ent.value_size = cb_size;
+            std::ptr::write_unaligned(entries_base.add(i), ent);
+            return TRUE;
+        }
+    }
+    if hdr.count >= hdr.capacity {
+        set_err(err::ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    std::ptr::write_unaligned(
+        entries_base.add(hdr.count as usize),
+        ProcThreadAttrEntry {
+            attribute,
+            value_ptr: value as usize,
+            value_size: cb_size,
+        },
+    );
+    hdr.count += 1;
+    std::ptr::write_unaligned(attr_list as *mut ProcThreadAttrHeader, hdr);
+    TRUE
+}
+
+pub unsafe extern "win64" fn DeleteProcThreadAttributeList(attr_list: *mut c_void) {
+    if attr_list.is_null() {
+        return;
+    }
+    let mut hdr = std::ptr::read_unaligned(attr_list as *const ProcThreadAttrHeader);
+    if hdr.magic == PROC_THREAD_ATTR_MAGIC {
+        hdr.magic = 0;
+        hdr.count = 0;
+        std::ptr::write_unaligned(attr_list as *mut ProcThreadAttrHeader, hdr);
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+unsafe fn extract_handle_list(attr_list: *const c_void) -> Result<Option<Vec<HANDLE>>, u32> {
+    if attr_list.is_null() {
+        return Ok(None);
+    }
+    let hdr = std::ptr::read_unaligned(attr_list as *const ProcThreadAttrHeader);
+    if hdr.magic != PROC_THREAD_ATTR_MAGIC || hdr.count > hdr.capacity {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+    let entries_base = (attr_list as *const u8).add(std::mem::size_of::<ProcThreadAttrHeader>())
+        as *const ProcThreadAttrEntry;
+    let mut out = None;
+    for i in 0..hdr.count as usize {
+        let ent = std::ptr::read_unaligned(entries_base.add(i));
+        match ent.attribute {
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST => {
+                if ent.value_ptr == 0 || ent.value_size == 0 || (ent.value_size % std::mem::size_of::<HANDLE>()) != 0 {
+                    return Err(err::ERROR_INVALID_PARAMETER);
+                }
+                let n = ent.value_size / std::mem::size_of::<HANDLE>();
+                let ptr = ent.value_ptr as *const HANDLE;
+                let mut hs = Vec::with_capacity(n);
+                for j in 0..n {
+                    hs.push(std::ptr::read_unaligned(ptr.add(j)));
+                }
+                out = Some(hs);
+            }
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY => {}
+            _ => return Err(err::ERROR_NOT_SUPPORTED),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn win_parent_dir(win_path: &str) -> Option<String> {
+    let norm = crate::path::normalize(win_path.trim());
+    let trimmed = norm.trim_end_matches('\\');
+    let sep = trimmed.rfind('\\')?;
+    let dir = &trimmed[..sep];
+    if dir.is_empty() {
+        Some("\\".to_string())
+    } else if dir.len() == 2 && dir.as_bytes()[1] == b':' {
+        Some(format!("{dir}\\"))
+    } else {
+        Some(dir.to_string())
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn join_win_dir(dir: &str, name: &str) -> String {
+    let cleaned = dir.trim().trim_matches('"').trim();
+    if cleaned.is_empty() {
+        return name.to_string();
+    }
+    let base = cleaned.trim_end_matches(['\\', '/']);
+    if base.is_empty() {
+        format!("\\{name}")
+    } else {
+        format!("{base}\\{name}")
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn resolve_guest_exe_with_dirs(
+    raw_exe: &str,
+    from_app_name: bool,
+    parent_exe: Option<&str>,
+    win_dirs: [&str; 3],
+) -> Result<(String, std::path::PathBuf), u32> {
+    let has_dir = raw_exe.contains('\\') || raw_exe.contains('/') || raw_exe.contains(':');
+    if from_app_name || has_dir {
+        let win = crate::path::absolute(raw_exe);
+        if let Some(host) = crate::path::to_host(&win) {
+            if host.is_file() {
+                return Ok((crate::path::normalize(&win), host));
+            }
+        }
+        return Err(err::ERROR_FILE_NOT_FOUND);
+    }
+
+    let file_name = if raw_exe.contains('.') {
+        raw_exe.to_string()
+    } else {
+        format!("{raw_exe}.exe")
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(app_dir) = parent_exe.and_then(win_parent_dir) {
+        dirs.push(app_dir);
+    }
+    dirs.push(crate::path::cwd());
+    for d in win_dirs {
+        dirs.push(d.to_string());
+    }
+    if let Some(path_env) = pr::get_env("Path") {
+        for raw_dir in path_env.split(';') {
+            let dir = raw_dir.trim().trim_matches('"').trim();
+            if !dir.is_empty() {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    for dir in dirs {
+        let win = crate::path::absolute(&join_win_dir(&dir, &file_name));
+        if let Some(host) = crate::path::to_host(&win) {
+            if host.is_file() {
+                return Ok((crate::path::normalize(&win), host));
+            }
+        }
+    }
+    Err(err::ERROR_FILE_NOT_FOUND)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn resolve_guest_exe(
+    raw_exe: &str,
+    from_app_name: bool,
+    parent_exe: Option<&str>,
+) -> Result<(String, std::path::PathBuf), u32> {
+    resolve_guest_exe_with_dirs(
+        raw_exe,
+        from_app_name,
+        parent_exe,
+        [
+            crate::kernel32::sysinfo::SYSTEM_DIR,
+            crate::kernel32::sysinfo::SYSTEM16_DIR,
+            crate::kernel32::sysinfo::WINDOWS_DIR,
+        ],
+    )
+}
+
+#[cfg(not(target_os = "ios"))]
+fn is_pe_file(host: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(host) else {
+        return false;
+    };
+    let mut hdr = [0u8; 64];
+    if f.read_exact(&mut hdr).is_err() || &hdr[0..2] != b"MZ" {
+        return false;
+    }
+    let off = u32::from_le_bytes([hdr[0x3C], hdr[0x3D], hdr[0x3E], hdr[0x3F]]) as u64;
+    use std::io::Seek;
+    if f.seek(std::io::SeekFrom::Start(off)).is_err() {
+        return false;
+    }
+    let mut sig = [0u8; 4];
+    f.read_exact(&mut sig).is_ok() && &sig == b"PE\0\0"
+}
+
+#[cfg(not(target_os = "ios"))]
+unsafe fn parse_env_block(env: *const c_void, unicode: bool) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if unicode {
+        let mut p = env as *const u16;
+        loop {
+            if std::ptr::read_unaligned(p) == 0 {
+                break;
+            }
+            let mut u16s = Vec::new();
+            while std::ptr::read_unaligned(p) != 0 {
+                u16s.push(std::ptr::read_unaligned(p));
+                p = p.add(1);
+            }
+            p = p.add(1);
+            let s = String::from_utf16_lossy(&u16s);
+            if let Some((k, v)) = s.split_once('=') {
+                if !k.is_empty() {
+                    vars.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    } else {
+        let mut p = env as *const u8;
+        loop {
+            if *p == 0 {
+                break;
+            }
+            let mut bytes = Vec::new();
+            while *p != 0 {
+                bytes.push(*p);
+                p = p.add(1);
+            }
+            p = p.add(1);
+            let s = String::from_utf8_lossy(&bytes);
+            if let Some((k, v)) = s.split_once('=') {
+                if !k.is_empty() {
+                    vars.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    vars
+}
+
+#[cfg(not(target_os = "ios"))]
+fn is_inheritable_handle(h: HANDLE) -> bool {
+    let Some(flags) = handles::get_flags(h) else {
+        return false;
+    };
+    if (flags & handles::HANDLE_FLAG_INHERIT) != 0 {
+        return true;
+    }
+    // Standard handles default to inheritable unless a different handle is passed.
+    (0..3).any(|i| crate::kernel32::file::std_handle(i) == h)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn build_child_runner_command(
+    runner: &std::path::Path,
+    exe_host: &std::path::Path,
+    exe_win: &str,
+    effective_cmdline: &str,
+    child_cwd_win: &str,
+    child_env_vars: &[(String, String)],
+    headless: bool,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(runner);
+    // Start from an empty host environment and populate ONLY immutable minimal platform
+    // necessities captured at startup, followed by explicit runtime-owned protocol values.
+    // Guest variables travel strictly inside `PORT_CHILD_ENV` and can never inject host
+    // loader/AOT/dyld variables into the native child runner.
+    command.env_clear();
+    for (k, v) in pr::trusted_child_host_env() {
+        command.env(k, v);
+    }
+    command.arg("--pe").arg(exe_host);
+    for (win_prefix, host_dir) in crate::path::list_mounts() {
+        command.arg("--mount").arg(format!("{win_prefix}={}", host_dir.display()));
+    }
+    command.env("PORT_CHILD_PROCESS", "1");
+    command.env("PORT_AOT", "0");
+    command.env("AW2_DLL_AOT", "0");
+    command.env("PORT_CHILD_STDIO", "1");
+    command.env("PORT_CHILD_EXE_WIN", exe_win);
+    command.env("PORT_CHILD_CMDLINE", effective_cmdline);
+    command.env("PORT_CHILD_CWD", child_cwd_win);
+    command.env("PORT_CHILD_ENV", pr::encode_env_list(child_env_vars));
+    command.env("PORT_NO_BASE_RETRY", "1");
+    if headless {
+        command.env("PORT_HEADLESS", "1");
+        command.env("AW2_HEADLESS", "1");
+    }
+    command
+}
+
+#[cfg(not(target_os = "ios"))]
+const POSIX_SPAWN_START_SUSPENDED: libc::c_short = 0x0080;
+#[cfg(not(target_os = "ios"))]
+const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+
+#[cfg(not(target_os = "ios"))]
+extern "C" {
+    fn posix_spawn_file_actions_addinherit_np(
+        file_actions: *mut libc::posix_spawn_file_actions_t,
+        filedes: libc::c_int,
+    ) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "ios"))]
+struct OwnedFd(i32);
+#[cfg(not(target_os = "ios"))]
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                let _ = libc::close(self.0);
+            }
+            self.0 = -1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+enum ChildStdioTarget {
+    Inherit,
+    DevNull,
+    DupFd(OwnedFd),
+}
+
+#[cfg(not(target_os = "ios"))]
+struct ChildStdioPlan {
+    stdin: ChildStdioTarget,
+    stdout: ChildStdioTarget,
+    stderr: ChildStdioTarget,
+}
+
+#[cfg(not(target_os = "ios"))]
+fn dup_handle_to_child_stdio(h: HANDLE, allowed_list: Option<&[HANDLE]>) -> Result<ChildStdioTarget, u32> {
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        return Ok(ChildStdioTarget::DevNull);
+    }
+    if let Some(list) = allowed_list {
+        if !list.contains(&h) {
+            return Ok(ChildStdioTarget::DevNull);
+        }
+    } else if !is_inheritable_handle(h) {
+        return Ok(ChildStdioTarget::DevNull);
+    }
+    let Some((raw_fd, _kind)) = crate::kernel32::file::file_fd_and_kind(h) else {
+        return Err(err::ERROR_INVALID_HANDLE);
+    };
+    let dup_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup_fd < 0 {
+        return Err(errno_to_win32(last_errno()));
+    }
+    Ok(ChildStdioTarget::DupFd(OwnedFd(dup_fd)))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn spawn_and_verify_suspended_child(
+    exe_path: &std::path::Path,
+    expected_identity: &pr::RunnerCodeIdentity,
+    args: &[std::ffi::OsString],
+    envs: &[(std::ffi::OsString, std::ffi::OsString)],
+    stdio: &ChildStdioPlan,
+    inherit_fd: Option<i32>,
+) -> Result<libc::pid_t, u32> {
+    use std::ffi::CString;
+
+    let c_exe = CString::new(exe_path.as_os_str().as_encoded_bytes())
+        .map_err(|_| err::ERROR_INVALID_PARAMETER)?;
+    let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
+    c_args.push(c_exe.clone());
+    for a in args {
+        c_args.push(
+            CString::new(a.as_encoded_bytes()).map_err(|_| err::ERROR_INVALID_PARAMETER)?,
+        );
+    }
+    let mut argv_ptrs: Vec<*mut libc::c_char> =
+        c_args.iter().map(|s| s.as_ptr() as *mut libc::c_char).collect();
+    argv_ptrs.push(std::ptr::null_mut());
+
+    let mut c_envs: Vec<CString> = Vec::with_capacity(envs.len());
+    for (k, v) in envs {
+        let mut kv = Vec::with_capacity(k.len() + 1 + v.len());
+        kv.extend_from_slice(k.as_encoded_bytes());
+        kv.push(b'=');
+        kv.extend_from_slice(v.as_encoded_bytes());
+        c_envs.push(CString::new(kv).map_err(|_| err::ERROR_INVALID_PARAMETER)?);
+    }
+    let mut envp_ptrs: Vec<*mut libc::c_char> =
+        c_envs.iter().map(|s| s.as_ptr() as *mut libc::c_char).collect();
+    envp_ptrs.push(std::ptr::null_mut());
+
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
+        let rc = libc::posix_spawnattr_init(&mut attr);
+        if rc != 0 {
+            return Err(errno_to_win32(rc));
+        }
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        let rc = libc::posix_spawn_file_actions_init(&mut actions);
+        if rc != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(errno_to_win32(rc));
+        }
+
+        let wire_res = (|| -> Result<(), u32> {
+            // Start suspended in the kernel BEFORE dyld/initializers execute, and close every
+            // parent fd by default except explicitly wired stdio + exit-code channel fds.
+            let rc = libc::posix_spawnattr_setflags(
+                &mut attr,
+                POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT,
+            );
+            if rc != 0 {
+                return Err(errno_to_win32(rc));
+            }
+            for (target_fd, target) in [
+                (0, &stdio.stdin),
+                (1, &stdio.stdout),
+                (2, &stdio.stderr),
+            ] {
+                let open_mode = if target_fd == 0 { libc::O_RDONLY } else { libc::O_WRONLY };
+                let rc = match target {
+                    ChildStdioTarget::Inherit => {
+                        if libc::fcntl(target_fd, libc::F_GETFD) >= 0 {
+                            posix_spawn_file_actions_addinherit_np(&mut actions, target_fd)
+                        } else {
+                            libc::posix_spawn_file_actions_addopen(
+                                &mut actions,
+                                target_fd,
+                                c"/dev/null".as_ptr(),
+                                open_mode,
+                                0,
+                            )
+                        }
+                    }
+                    ChildStdioTarget::DevNull => libc::posix_spawn_file_actions_addopen(
+                        &mut actions,
+                        target_fd,
+                        c"/dev/null".as_ptr(),
+                        open_mode,
+                        0,
+                    ),
+                    ChildStdioTarget::DupFd(fd) => {
+                        libc::posix_spawn_file_actions_adddup2(&mut actions, fd.0, target_fd)
+                    }
+                };
+                if rc != 0 {
+                    return Err(errno_to_win32(rc));
+                }
+            }
+            if let Some(fd) = inherit_fd {
+                let rc = posix_spawn_file_actions_addinherit_np(&mut actions, fd);
+                if rc != 0 {
+                    return Err(errno_to_win32(rc));
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = wire_res {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(e);
+        }
+
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_exe.as_ptr(),
+            &actions,
+            &attr,
+            argv_ptrs.as_ptr(),
+            envp_ptrs.as_ptr(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+        if rc != 0 {
+            return Err(errno_to_win32(rc));
+        }
+
+        // Validate the kernel-backed signing status and CDHash of the exact mapped image
+        // while the child is still suspended before dyld/userspace entry.
+        if let Err(reason) = pr::verify_suspended_child_identity(pid, expected_identity) {
+            log::error!(
+                "CreateProcessW: rejecting spawned child pid={pid} before execution: {reason}"
+            );
+            pr::kill_and_reap_pid(pid);
+            return Err(err::ERROR_ACCESS_DENIED);
+        }
+
+        if libc::kill(pid, libc::SIGCONT) != 0 {
+            let e = last_errno();
+            pr::kill_and_reap_pid(pid);
+            return Err(errno_to_win32(e));
+        }
+
+        Ok(pid)
+    }
+}
 
 pub unsafe extern "win64" fn CreateProcessW(
     app: LPCWSTR,
     cmd: LPWSTR,
     _pa: *mut c_void,
     _ta: *mut c_void,
-    _inherit: BOOL,
-    _flags: u32,
-    _env: *mut c_void,
-    _cwd: LPCWSTR,
-    _si: *mut c_void,
-    _pi: *mut c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *mut c_void,
+    cwd: LPCWSTR,
+    si: *mut c_void,
+    pi: *mut c_void,
 ) -> BOOL {
-    stub!("CreateProcessW refused: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd));
-    set_err(err::ERROR_NOT_SUPPORTED);
-    FALSE
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (inherit, flags, env, cwd, si, pi);
+        stub!(
+            "CreateProcessW unavailable on iOS: app={:?} cmd={:?}",
+            from_wide_opt(app),
+            from_wide_opt(cmd)
+        );
+        set_err(err::ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        if si.is_null() || pi.is_null() {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let app_s = from_wide_opt(app).filter(|s| !s.is_empty());
+        let cmd_s = from_wide_opt(cmd).filter(|s| !s.is_empty());
+        if app_s.is_none() && cmd_s.is_none() {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+
+        let unsupported_flags = DEBUG_PROCESS
+            | DEBUG_ONLY_THIS_PROCESS
+            | CREATE_SUSPENDED
+            | CREATE_SEPARATE_WOW_VDM
+            | CREATE_SHARED_WOW_VDM
+            | CREATE_PROTECTED_PROCESS
+            | CREATE_SECURE_PROCESS;
+        if (flags & unsupported_flags) != 0 {
+            log::warn!("CreateProcessW: unsupported creation flags {flags:#x}");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
+
+        let si_bytes = si as *const u8;
+        let cb = (si_bytes as *const u32).read_unaligned();
+        let extended = (flags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+        let min_cb = if extended { 112 } else { 104 };
+        if cb < min_cb {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let si_flags = (si_bytes.add(60) as *const u32).read_unaligned();
+        let h_stdin = (si_bytes.add(80) as *const HANDLE).read_unaligned();
+        let h_stdout = (si_bytes.add(88) as *const HANDLE).read_unaligned();
+        let h_stderr = (si_bytes.add(96) as *const HANDLE).read_unaligned();
+
+        let handle_list = if extended {
+            let attr_ptr = (si_bytes.add(104) as *const *const c_void).read_unaligned();
+            match extract_handle_list(attr_ptr) {
+                Ok(list) => list,
+                Err(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref list) = handle_list {
+            if inherit == FALSE {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let use_std = (si_flags & STARTF_USESTDHANDLES) != 0;
+            for &h in list {
+                if h.is_null() || h == INVALID_HANDLE_VALUE || handles::get(h).is_none() {
+                    set_err(err::ERROR_INVALID_HANDLE);
+                    return FALSE;
+                }
+                if !is_inheritable_handle(h) {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                let is_redirected_std = use_std
+                    && (h == h_stdin || h == h_stdout || h == h_stderr)
+                    && crate::kernel32::file::file_fd_and_kind(h).is_some();
+                if !is_redirected_std {
+                    log::warn!(
+                        "CreateProcessW: PROC_THREAD_ATTRIBUTE_HANDLE_LIST entry {h:p} cannot be transferred (only redirected stdio handles are supported)"
+                    );
+                    set_err(err::ERROR_NOT_SUPPORTED);
+                    return FALSE;
+                }
+            }
+        }
+
+        let (raw_exe, from_app_name) = if let Some(ref a) = app_s {
+            (a.clone(), true)
+        } else {
+            let parts = pr::split_cmdline(cmd_s.as_deref().unwrap_or(""));
+            let Some(first) = parts.into_iter().next().filter(|s| !s.is_empty()) else {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            };
+            (first, false)
+        };
+
+        let (exe_win, exe_host) = match resolve_guest_exe(
+            &raw_exe,
+            from_app_name,
+            pr::try_config().map(|c| c.exe_path.as_str()),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        if !is_pe_file(&exe_host) {
+            set_err(ERROR_BAD_EXE_FORMAT);
+            return FALSE;
+        }
+
+        let child_cwd_win = if let Some(c) = from_wide_opt(cwd).filter(|s| !s.is_empty()) {
+            let abs = crate::path::absolute(&c);
+            let Some(host_cwd) = crate::path::to_host(&abs) else {
+                set_err(ERROR_DIRECTORY);
+                return FALSE;
+            };
+            if !host_cwd.is_dir() {
+                set_err(ERROR_DIRECTORY);
+                return FALSE;
+            }
+            abs
+        } else {
+            crate::path::cwd()
+        };
+
+        let Some(trusted_runner) = pr::trusted_runner() else {
+            log::warn!("CreateProcessW: failing closed — no verified trusted host runner pinned");
+            set_err(err::ERROR_ACCESS_DENIED);
+            return FALSE;
+        };
+
+        let effective_cmdline = cmd_s.unwrap_or_else(|| format!("\"{exe_win}\""));
+        let child_env_vars = if env.is_null() {
+            pr::env_vars()
+        } else {
+            parse_env_block(env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0)
+        };
+
+        let headless = (flags & CREATE_NO_WINDOW) != 0
+            || (si_flags & STARTF_USESTDHANDLES) != 0
+            || pr::trusted_host_headless();
+        let command = build_child_runner_command(
+            &trusted_runner.exe_path,
+            &exe_host,
+            &exe_win,
+            &effective_cmdline,
+            &child_cwd_win,
+            &child_env_vars,
+            headless,
+        );
+
+        let stdio_plan = if (si_flags & STARTF_USESTDHANDLES) != 0 && inherit != FALSE {
+            let allowed = handle_list.as_deref();
+            let stdin = match dup_handle_to_child_stdio(h_stdin, allowed) {
+                Ok(s) => s,
+                Err(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            };
+            let stdout = match dup_handle_to_child_stdio(h_stdout, allowed) {
+                Ok(s) => s,
+                Err(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            };
+            let stderr = match dup_handle_to_child_stdio(h_stderr, allowed) {
+                Ok(s) => s,
+                Err(e) => {
+                    set_err(e);
+                    return FALSE;
+                }
+            };
+            ChildStdioPlan { stdin, stdout, stderr }
+        } else {
+            ChildStdioPlan {
+                stdin: ChildStdioTarget::Inherit,
+                stdout: ChildStdioTarget::Inherit,
+                stderr: ChildStdioTarget::Inherit,
+            }
+        };
+
+        // Dedicated parent-child pipe to report the full 32-bit guest Windows exit code.
+        // Both ends start FD_CLOEXEC and the write end is kept >= 3 so it never collides
+        // with child stdio (0/1/2); `POSIX_SPAWN_CLOEXEC_DEFAULT` + `addinherit_np` passes
+        // only this write end to the child.
+        let mut exit_pipe = [-1i32; 2];
+        if libc::pipe(exit_pipe.as_mut_ptr()) != 0 {
+            set_err(errno_to_win32(last_errno()));
+            return FALSE;
+        }
+        for &fd in &exit_pipe {
+            let fl = libc::fcntl(fd, libc::F_GETFD);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+            }
+        }
+        let exit_read_fd = OwnedFd(exit_pipe[0]);
+        let mut exit_write_fd = OwnedFd(exit_pipe[1]);
+        if exit_write_fd.0 < 3 {
+            let moved = libc::fcntl(exit_write_fd.0, libc::F_DUPFD_CLOEXEC, 3);
+            if moved < 0 {
+                set_err(errno_to_win32(last_errno()));
+                return FALSE;
+            }
+            exit_write_fd = OwnedFd(moved);
+        }
+        let child_exit_wfd = exit_write_fd.0;
+
+        let args: Vec<std::ffi::OsString> =
+            command.get_args().map(|a| a.to_os_string()).collect();
+        let mut envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = command
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|val| (k.to_os_string(), val.to_os_string())))
+            .collect();
+        envs.push((
+            std::ffi::OsString::from("PORT_EXIT_CODE_FD"),
+            std::ffi::OsString::from(child_exit_wfd.to_string()),
+        ));
+
+        let raw_pid = match spawn_and_verify_suspended_child(
+            &trusted_runner.exe_path,
+            &trusted_runner.identity,
+            &args,
+            &envs,
+            &stdio_plan,
+            Some(child_exit_wfd),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+        // Close parent's write end and temporary duped stdio fds immediately so EOF arrives
+        // as soon as the child exits.
+        drop(exit_write_fd);
+        drop(stdio_plan);
+
+        let pid = raw_pid as u32;
+        let proc_obj = Arc::new(ChildProcessObj {
+            pid,
+            exe_win,
+            exit_code: handles::Guarded::new(None),
+            terminated_code: handles::Guarded::new(None),
+            os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
+        });
+        child_processes()
+            .lock()
+            .unwrap()
+            .insert(pid, Arc::downgrade(&proc_obj));
+        let thread_obj = Arc::new(ChildThreadObj {
+            tid: pid,
+            process: Arc::clone(&proc_obj),
+        });
+
+        let proc_for_reaper = Arc::clone(&proc_obj);
+        let _ = std::thread::Builder::new()
+            .name(format!("win32-child-reap-{pid}"))
+            .spawn(move || {
+                let mut status: libc::c_int = 0;
+                let waited = loop {
+                    let r = libc::waitpid(raw_pid, &mut status, 0);
+                    if r < 0 && last_errno() == libc::EINTR {
+                        continue;
+                    }
+                    break r;
+                };
+                let fallback_code = if waited == raw_pid {
+                    if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status) as u32
+                    } else if libc::WIFSIGNALED(status) {
+                        0xC000_0000u32 | (libc::WTERMSIG(status) as u32)
+                    } else {
+                        0
+                    }
+                } else {
+                    1
+                };
+                // Read the full 32-bit Windows exit code written by `exit_process` (if any).
+                let mut code_buf = [0u8; 4];
+                let mut got = 0usize;
+                while got < 4 {
+                    let r = libc::read(
+                        exit_read_fd.0,
+                        code_buf.as_mut_ptr().add(got) as *mut c_void,
+                        4 - got,
+                    );
+                    if r < 0 {
+                        if last_errno() == libc::EINTR {
+                            continue;
+                        }
+                        break;
+                    }
+                    if r == 0 {
+                        break;
+                    }
+                    got += r as usize;
+                }
+                drop(exit_read_fd);
+                let guest_code = (got == 4).then(|| u32::from_le_bytes(code_buf));
+                proc_for_reaper.finish_reaped(guest_code, fallback_code);
+            });
+
+        let h_proc = handles::insert(proc_obj);
+        let h_thread = handles::insert(thread_obj);
+        let pi_bytes = pi as *mut u8;
+        std::ptr::write_unaligned(pi_bytes as *mut HANDLE, h_proc);
+        std::ptr::write_unaligned(pi_bytes.add(8) as *mut HANDLE, h_thread);
+        std::ptr::write_unaligned(pi_bytes.add(16) as *mut u32, pid);
+        std::ptr::write_unaligned(pi_bytes.add(20) as *mut u32, pid);
+        TRUE
+    }
 }
 
 pub unsafe extern "win64" fn CreateProcessA(
     app: LPCSTR,
     cmd: LPSTR,
-    _pa: *mut c_void,
-    _ta: *mut c_void,
-    _inherit: BOOL,
-    _flags: u32,
-    _env: *mut c_void,
-    _cwd: LPCSTR,
-    _si: *mut c_void,
-    _pi: *mut c_void,
+    pa: *mut c_void,
+    ta: *mut c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *mut c_void,
+    cwd: LPCSTR,
+    si: *mut c_void,
+    pi: *mut c_void,
 ) -> BOOL {
-    stub!("CreateProcessA refused: app={:?} cmd={:?}", from_ansi_opt(app), from_ansi_opt(cmd));
-    set_err(err::ERROR_NOT_SUPPORTED);
-    FALSE
+    let w_app = from_ansi_opt(app).map(|s| to_wide_z(&s));
+    let mut w_cmd = from_ansi_opt(cmd).map(|s| to_wide_z(&s));
+    let w_cwd = from_ansi_opt(cwd).map(|s| to_wide_z(&s));
+    CreateProcessW(
+        w_app.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        w_cmd.as_mut().map_or(std::ptr::null_mut(), |v| v.as_mut_ptr()),
+        pa,
+        ta,
+        inherit,
+        flags,
+        env,
+        w_cwd.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        si,
+        pi,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,5 +2475,520 @@ mod tests {
             assert!(k >= i, "kernel time ({k}) must include idle time ({i})");
             assert!(k + u > 0, "total CPU ticks must be nonzero");
         }
+    }
+
+    #[test]
+    fn proc_thread_attribute_list_and_create_process_validation() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, GetHandleInformation, SetHandleInformation};
+        unsafe {
+            // Query required size for 2 attributes.
+            let mut sz = 0usize;
+            assert_eq!(InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut sz), FALSE);
+            assert_eq!(GetLastError(), err::ERROR_INSUFFICIENT_BUFFER);
+            assert!(sz >= std::mem::size_of::<ProcThreadAttrHeader>() + 2 * std::mem::size_of::<ProcThreadAttrEntry>());
+
+            let mut buf = vec![0u8; sz];
+            assert_eq!(InitializeProcThreadAttributeList(buf.as_mut_ptr() as *mut c_void, 2, 0, &mut sz), TRUE);
+
+            // Update with HANDLE_LIST succeeds.
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert_eq!(SetHandleInformation(ev, handles::HANDLE_FLAG_INHERIT, handles::HANDLE_FLAG_INHERIT), TRUE);
+            let mut flags_out = 0u32;
+            assert_eq!(GetHandleInformation(ev, &mut flags_out), TRUE);
+            assert_eq!(flags_out, handles::HANDLE_FLAG_INHERIT);
+
+            let mut hlist = [ev];
+            assert_eq!(
+                UpdateProcThreadAttribute(
+                    buf.as_mut_ptr() as *mut c_void,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    hlist.as_mut_ptr() as *mut c_void,
+                    std::mem::size_of_val(&hlist),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+
+            // Unsupported attribute returns ERROR_NOT_SUPPORTED.
+            let mut dummy = 0u64;
+            assert_eq!(
+                UpdateProcThreadAttribute(
+                    buf.as_mut_ptr() as *mut c_void,
+                    0,
+                    0x0002_0016, // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+                    &mut dummy as *mut u64 as *mut c_void,
+                    8,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+            // CreateProcessW rejects CREATE_SUSPENDED and invalid SI / handle-list without inherit.
+            let app = to_wide_z("C:\\nonexistent.exe");
+            let mut si = [0u8; 112];
+            (si.as_mut_ptr() as *mut u32).write_unaligned(112);
+            (si.as_mut_ptr().add(104) as *mut *mut c_void).write_unaligned(buf.as_mut_ptr() as *mut c_void);
+            let mut pi = [0u8; 24];
+
+            assert_eq!(
+                CreateProcessW(
+                    app.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    TRUE,
+                    CREATE_SUSPENDED,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    si.as_mut_ptr() as *mut c_void,
+                    pi.as_mut_ptr() as *mut c_void,
+                ),
+                FALSE
+            );
+            assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+            #[cfg(not(target_os = "ios"))]
+            {
+                // HANDLE_LIST with inherit=FALSE -> ERROR_INVALID_PARAMETER.
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        FALSE,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_INVALID_PARAMETER);
+
+                // HANDLE_LIST with non-stdio handle (Event) or without STARTF_USESTDHANDLES -> ERROR_NOT_SUPPORTED before spawn.
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+                // Even with STARTF_USESTDHANDLES set, a non-stdio handle in HANDLE_LIST -> ERROR_NOT_SUPPORTED.
+                let mut si_std = si;
+                (si_std.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+                (si_std.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(ev);
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si_std.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_NOT_SUPPORTED);
+
+                // Missing exe with standard STARTUPINFOW -> ERROR_FILE_NOT_FOUND.
+                let mut si_basic = [0u8; 104];
+                (si_basic.as_mut_ptr() as *mut u32).write_unaligned(104);
+                assert_eq!(
+                    CreateProcessW(
+                        app.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        FALSE,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        si_basic.as_mut_ptr() as *mut c_void,
+                        pi.as_mut_ptr() as *mut c_void,
+                    ),
+                    FALSE
+                );
+                assert_eq!(GetLastError(), err::ERROR_FILE_NOT_FOUND);
+            }
+
+            DeleteProcThreadAttributeList(buf.as_mut_ptr() as *mut c_void);
+            // Update after delete fails with ERROR_INVALID_PARAMETER.
+            assert_eq!(
+                UpdateProcThreadAttribute(
+                    buf.as_mut_ptr() as *mut c_void,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    hlist.as_mut_ptr() as *mut c_void,
+                    std::mem::size_of_val(&hlist),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                FALSE
+            );
+            assert_eq!(GetLastError(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(CloseHandle(ev), TRUE);
+
+            // Env codec roundtrip
+            let orig = vec![
+                ("FOO".to_string(), "bar=baz:1".to_string()),
+                ("EMPTY".to_string(), "".to_string()),
+            ];
+            let enc = pr::encode_env_list(&orig);
+            assert_eq!(pr::decode_env_list(&enc).as_deref(), Some(orig.as_slice()));
+        }
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn child_runner_command_clears_host_env_and_isolates_protocol_vars() {
+        pr::init_trusted_host_env();
+        let marker_key = "HOST_ONLY_CHILD_ISOLATION_MARKER";
+        let aot_key = "PORT_AOT_DYLIB";
+        let prev_marker = std::env::var_os(marker_key);
+        let prev_aot = std::env::var_os(aot_key);
+        std::env::set_var(marker_key, "host-only-value");
+        std::env::set_var(aot_key, "marker-value-must-not-propagate");
+
+        let guest_vars = vec![
+            ("GUEST_OVERRIDE".to_string(), "guest-value".to_string()),
+            ("PORT_AOT_DYLIB".to_string(), "guest-var-stays-serialized".to_string()),
+        ];
+        let cmd = build_child_runner_command(
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/tmp/guest.exe"),
+            "C:\\guest.exe",
+            "\"C:\\guest.exe\"",
+            "C:\\",
+            &guest_vars,
+            true,
+        );
+
+        match prev_marker {
+            Some(v) => std::env::set_var(marker_key, v),
+            None => std::env::remove_var(marker_key),
+        }
+        match prev_aot {
+            Some(v) => std::env::set_var(aot_key, v),
+            None => std::env::remove_var(aot_key),
+        }
+
+        let env_map: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        // Host-only / loader override vars must NOT leak into child host environment.
+        assert!(!env_map.contains_key(marker_key));
+        assert!(!env_map.contains_key(aot_key));
+        assert!(!env_map.contains_key("DYLD_INSERT_LIBRARIES"));
+
+        // Runtime-owned protocol controls and serialized guest environment are explicitly present.
+        assert_eq!(env_map.get("PORT_CHILD_PROCESS").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_AOT").and_then(|v| v.as_deref()), Some("0"));
+        assert_eq!(env_map.get("AW2_DLL_AOT").and_then(|v| v.as_deref()), Some("0"));
+        assert_eq!(env_map.get("PORT_CHILD_STDIO").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_CHILD_EXE_WIN").and_then(|v| v.as_deref()), Some("C:\\guest.exe"));
+        assert_eq!(env_map.get("PORT_CHILD_CWD").and_then(|v| v.as_deref()), Some("C:\\"));
+        assert_eq!(env_map.get("PORT_NO_BASE_RETRY").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_HEADLESS").and_then(|v| v.as_deref()), Some("1"));
+        let decoded = pr::decode_env_list(
+            env_map.get("PORT_CHILD_ENV").and_then(|v| v.as_deref()).expect("PORT_CHILD_ENV"),
+        )
+        .expect("decode PORT_CHILD_ENV");
+        assert_eq!(decoded, guest_vars);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn suspended_spawn_rejects_mismatched_cdhash_before_execution_and_accepts_verified_binary() {
+        let self_id = pr::query_pid_code_identity(unsafe { libc::getpid() })
+            .expect("current macOS binary must have kernel-backed CDHash");
+        let echo_path = std::path::Path::new("/bin/echo");
+        let echo_trusted = pr::capture_runner_identity(echo_path)
+            .expect("/bin/echo must have kernel-backed CDHash");
+        assert_ne!(
+            self_id.cdhash, echo_trusted.identity.cdhash,
+            "test runner and /bin/echo must have distinct kernel CDHashes"
+        );
+
+        let make_pipe = || -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for &fd in &fds {
+                let fl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if fl >= 0 {
+                    unsafe {
+                        let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            (OwnedFd(fds[0]), OwnedFd(fds[1]))
+        };
+
+        let read_all = |rfd: &OwnedFd| -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 128];
+            loop {
+                let n = unsafe { libc::read(rfd.0, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            out
+        };
+
+        // 1. Mismatched expected identity: /bin/echo is spawned suspended, fails CDHash check,
+        //    is SIGKILLed and reaped before userspace executes, and produces 0 bytes on stdout.
+        let (r1, w1) = make_pipe();
+        let stdio1 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w1),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let res_mismatch = spawn_and_verify_suspended_child(
+            echo_path,
+            &self_id,
+            &[std::ffi::OsString::from("MUST_NOT_EXECUTE")],
+            &[],
+            &stdio1,
+            None,
+        );
+        drop(stdio1);
+        assert_eq!(
+            res_mismatch,
+            Err(err::ERROR_ACCESS_DENIED),
+            "mismatched CDHash must fail closed with ERROR_ACCESS_DENIED"
+        );
+        assert!(
+            read_all(&r1).is_empty(),
+            "rejected child must never execute userspace code or emit output"
+        );
+
+        // 2. Matching trusted identity: /bin/echo passes CDHash check, resumes via SIGCONT,
+        //    writes expected stdout, and exits cleanly with status 0.
+        let (r2, w2) = make_pipe();
+        let stdio2 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w2),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let pid = spawn_and_verify_suspended_child(
+            echo_path,
+            &echo_trusted.identity,
+            &[std::ffi::OsString::from("verified-ok")],
+            &[],
+            &stdio2,
+            None,
+        )
+        .expect("matching kernel CDHash must resume and succeed");
+        drop(stdio2);
+        let out = read_all(&r2);
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(out, b"verified-ok\n");
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn capture_runner_identity_fails_closed_on_missing_or_inert_non_executable_file() {
+        let dir = std::env::temp_dir().join(format!("port_factory_id_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inert = dir.join("not_a_binary.txt");
+        std::fs::write(&inert, b"inert non-executable fixture").unwrap();
+
+        assert!(pr::capture_runner_identity(&inert).is_err());
+        assert!(pr::capture_runner_identity(&dir.join("missing_runner")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn resolve_guest_exe_follows_create_process_search_order_and_app_name_rules() {
+        assert_eq!(win_parent_dir("R:\\app\\parent.exe").as_deref(), Some("R:\\app"));
+        assert_eq!(win_parent_dir("R:/app/sub/parent.exe").as_deref(), Some("R:\\app\\sub"));
+        assert_eq!(win_parent_dir("R:\\parent.exe").as_deref(), Some("R:\\"));
+        assert_eq!(win_parent_dir("R:/parent.exe").as_deref(), Some("R:\\"));
+        assert_eq!(win_parent_dir("R:\\"), None);
+        assert_eq!(win_parent_dir("bare.exe"), None);
+
+        let dir = std::env::temp_dir().join(format!("port_factory_resolve_exe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        let cwd_dir = dir.join("cwd");
+        let cwd_sub = cwd_dir.join("sub");
+        let app_sub = app_dir.join("sub");
+        let sys32_dir = dir.join("win").join("system32");
+        let sys16_dir = dir.join("win").join("System");
+        let win_dir = dir.join("win");
+        let path_dir = dir.join("pathdir");
+        for d in [&app_dir, &cwd_dir, &cwd_sub, &app_sub, &sys32_dir, &sys16_dir, &win_dir, &path_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // Seed files across all 6 documented search locations to assert exact precedence.
+        for f in [
+            app_dir.join("tool.exe"),
+            app_dir.join("app_only.exe"),
+            app_sub.join("rel.exe"),
+            dir.join("root_tool.exe"),
+            cwd_dir.join("tool.exe"),
+            cwd_dir.join("cwd_tool.exe"),
+            cwd_dir.join("root_tool.exe"),
+            cwd_dir.join("raw_bin"),
+            cwd_sub.join("rel.exe"),
+            cwd_sub.join("raw_sub"),
+            sys32_dir.join("tool.exe"),
+            sys32_dir.join("sys32_tool.exe"),
+            sys16_dir.join("sys32_tool.exe"),
+            sys16_dir.join("sys16_tool.exe"),
+            win_dir.join("sys16_tool.exe"),
+            win_dir.join("win_tool.exe"),
+            path_dir.join("tool.exe"),
+            path_dir.join("win_tool.exe"),
+            path_dir.join("path_tool.exe"),
+            path_dir.join("script.com"),
+        ] {
+            std::fs::write(&f, b"MZ").unwrap();
+        }
+
+        let prev_cwd = crate::path::cwd();
+        let prev_path = pr::get_env("Path");
+        crate::path::add_mount("R:\\", &dir);
+        crate::path::set_cwd("R:\\cwd");
+        pr::set_env("Path", Some("\"R:\\pathdir\""));
+
+        let win_dirs = ["R:\\win\\system32", "R:\\win\\System", "R:\\win"];
+        let parent_bs = Some("R:\\app\\parent.exe");
+        let parent_fs = Some("R:/app/parent.exe");
+
+        // 1. Bare command-line name precedence: app dir > cwd > system32 > System > Windows > PATH.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\app\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", false, parent_fs, win_dirs).unwrap().0,
+            "R:\\app\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("root_tool", false, Some("R:/parent.exe"), win_dirs).unwrap().0,
+            "R:\\root_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("cwd_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\cwd_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sys32_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\system32\\sys32_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sys16_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\System\\sys16_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("win_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\win_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("path_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\pathdir\\path_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("script.com", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\pathdir\\script.com"
+        );
+
+        // 2. App-only helper resolves beside parent guest image even when cwd differs.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("app_only", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\app\\app_only.exe"
+        );
+        // Trailing dot suppresses .exe inference on bare command-line names.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool.", false, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+
+        // 3. Explicit lpApplicationName resolves directly against cwd without probing search path or inferring .exe.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("app_only.exe", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("path_tool.exe", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("raw_bin", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\raw_bin"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub/rel.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+
+        // 4. Command-line name containing a directory resolves directly relative to cwd/drive without search or .exe inference.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel.exe", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel", false, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\raw_sub", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\raw_sub"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("R:tool.exe", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\tool.exe"
+        );
+
+        crate::path::set_cwd(&prev_cwd);
+        pr::set_env("Path", prev_path.as_deref());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

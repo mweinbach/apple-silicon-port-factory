@@ -1360,6 +1360,322 @@ pub unsafe extern "win64" fn GetCalendarInfoW(_lcid: u32, cal: u32, ty: u32, out
     GetCalendarInfoEx(std::ptr::null(), cal, std::ptr::null(), ty, out, cap, val)
 }
 
+// ---------------------------------------------------------------------------
+// PathCch* (`api-ms-win-core-path-l1-1-0.dll` / `kernelbase.dll`)
+// ---------------------------------------------------------------------------
+
+const PATHCCH_ALLOW_LONG_PATHS: u32 = 0x0000_0001;
+const PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS: u32 = 0x0000_0002;
+const PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS: u32 = 0x0000_0004;
+const PATHCCH_DO_NOT_NORMALIZE_SEGMENTS: u32 = 0x0000_0008;
+const PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH: u32 = 0x0000_0010;
+const PATHCCH_ENSURE_TRAILING_SLASH: u32 = 0x0000_0020;
+const PATHCCH_MAX_CCH: usize = 0x8000;
+const MAX_PATH_CCH: usize = 260;
+const STRSAFE_E_INSUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
+const HRESULT_FILENAME_EXCED_RANGE: HRESULT = 0x8007_00CEu32 as i32;
+
+fn is_ascii_alpha_u16(c: u16) -> bool {
+    (b'A' as u16..=b'Z' as u16).contains(&c) || (b'a' as u16..=b'z' as u16).contains(&c)
+}
+
+fn is_sep_u16(c: u16) -> bool {
+    c == b'\\' as u16 || c == b'/' as u16
+}
+
+fn eq_ascii_ci(slice: &[u16], ascii: &[u8]) -> bool {
+    slice.len() == ascii.len()
+        && slice.iter().zip(ascii.iter()).all(|(&w, &b)| {
+            w < 128 && (w as u8).eq_ignore_ascii_case(&b)
+        })
+}
+
+/// Compute the root length (in UTF-16 code units) for `PathCchSkipRoot`.
+/// Returns `None` if `s` has no recognized Windows root prefix.
+fn pathcch_root_len(s: &[u16]) -> Option<usize> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    // Extended-length `\\?\` or `\\.\`
+    if n >= 4
+        && s[0] == b'\\' as u16
+        && s[1] == b'\\' as u16
+        && (s[2] == b'?' as u16 || s[2] == b'.' as u16)
+        && s[3] == b'\\' as u16
+    {
+        let rest = &s[4..];
+        // `\\?\UNC\server\share[\]`
+        if rest.len() >= 4 && eq_ascii_ci(&rest[..4], b"UNC\\") {
+            let mut i = 8;
+            // server
+            let srv_start = i;
+            while i < n && s[i] != b'\\' as u16 {
+                i += 1;
+            }
+            if i == srv_start {
+                return Some(8);
+            }
+            if i < n {
+                i += 1; // skip '\'
+                let share_start = i;
+                while i < n && s[i] != b'\\' as u16 {
+                    i += 1;
+                }
+                if i > share_start && i < n && s[i] == b'\\' as u16 {
+                    i += 1;
+                }
+            }
+            return Some(i);
+        }
+        // `\\?\X:[\]`
+        if rest.len() >= 2 && is_ascii_alpha_u16(rest[0]) && rest[1] == b':' as u16 {
+            return Some(if rest.len() >= 3 && rest[2] == b'\\' as u16 { 7 } else { 6 });
+        }
+        // `\\?\Volume{...}[\]` or device name `\\.\Device[\]`
+        let mut i = 4;
+        while i < n && s[i] != b'\\' as u16 {
+            i += 1;
+        }
+        if i < n && s[i] == b'\\' as u16 {
+            i += 1;
+        }
+        return Some(i);
+    }
+    // UNC `\\server\share[\]`
+    if n >= 2 && s[0] == b'\\' as u16 && s[1] == b'\\' as u16 {
+        let mut i = 2;
+        let srv_start = i;
+        while i < n && s[i] != b'\\' as u16 {
+            i += 1;
+        }
+        if i == srv_start {
+            return Some(2);
+        }
+        if i < n {
+            i += 1; // skip '\'
+            while i < n && s[i] != b'\\' as u16 {
+                i += 1;
+            }
+            if i < n && s[i] == b'\\' as u16 {
+                i += 1;
+            }
+        }
+        return Some(i);
+    }
+    // Drive root `X:\` or `X:`
+    if n >= 2 && is_ascii_alpha_u16(s[0]) && s[1] == b':' as u16 {
+        return Some(if n >= 3 && is_sep_u16(s[2]) { 3 } else { 2 });
+    }
+    // Single leading backslash `\`
+    if s[0] == b'\\' as u16 {
+        return Some(1);
+    }
+    None
+}
+
+pub unsafe extern "win64" fn PathCchSkipRoot(psz_path: LPCWSTR, ppsz_root_end: *mut LPCWSTR) -> HRESULT {
+    if ppsz_root_end.is_null() {
+        return E_INVALIDARG;
+    }
+    std::ptr::write_unaligned(ppsz_root_end, std::ptr::null());
+    if psz_path.is_null() {
+        return E_INVALIDARG;
+    }
+    // Read into an aligned Vec<u16> without assuming 2-byte alignment of `psz_path`
+    // and without lossy UTF-8 conversion so every UTF-16 code unit offset is exact.
+    let units = crate::strings::read_wide_units_z(psz_path, PATHCCH_MAX_CCH);
+    match pathcch_root_len(&units) {
+        Some(off) => {
+            // Advance by byte offset so odd-aligned guest buffers keep exact provenance.
+            let end_ptr = (psz_path as *const u8).add(off * 2) as LPCWSTR;
+            std::ptr::write_unaligned(ppsz_root_end, end_ptr);
+            S_OK
+        }
+        None => E_INVALIDARG,
+    }
+}
+
+/// Default Win32 `PathCch` segment-name normalization: strip trailing spaces and
+/// periods from an ordinary segment, retaining a single trailing period only when
+/// immediately preceded by the `*` wildcard character.
+fn normalize_pathcch_segment(part: &str) -> &str {
+    let trimmed = part.trim_end_matches([' ', '.']);
+    let had_trailing_dot = part.as_bytes().get(trimmed.len()) == Some(&b'.');
+    if had_trailing_dot && trimmed.as_bytes().last() == Some(&b'*') {
+        &part[..trimmed.len() + 1]
+    } else {
+        trimmed
+    }
+}
+
+fn canonicalize_pathcch(raw: &str, flags: u32) -> String {
+    // PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH implies PATHCCH_DO_NOT_NORMALIZE_SEGMENTS.
+    let preserve_segments =
+        (flags & (PATHCCH_DO_NOT_NORMALIZE_SEGMENTS | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH)) != 0;
+    let normalized = raw.replace('/', "\\");
+    let wide: Vec<u16> = normalized.encode_utf16().collect();
+    let root_len = pathcch_root_len(&wide).unwrap_or(0);
+    let root_str = String::from_utf16_lossy(&wide[..root_len]);
+    let rest_str = String::from_utf16_lossy(&wide[root_len..]);
+
+    let has_drive_only_root = root_str.len() == 2 && root_str.as_bytes()[1] == b':';
+    let rooted = !root_str.is_empty() && !has_drive_only_root;
+
+    let mut segs: Vec<&str> = Vec::new();
+    for part in rest_str.split('\\') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        // Exact "." and ".." components are always resolved prior to segment-name
+        // normalization, preserving drive and UNC root boundaries.
+        if part == ".." {
+            if let Some(&last) = segs.last() {
+                if last != ".." {
+                    segs.pop();
+                    continue;
+                }
+            }
+            if rooted {
+                continue;
+            }
+            segs.push("..");
+            continue;
+        }
+        let seg = if preserve_segments {
+            part
+        } else {
+            normalize_pathcch_segment(part)
+        };
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
+    }
+
+    let mut out = root_str;
+    if !segs.is_empty() {
+        if !out.is_empty() && !out.ends_with('\\') && !has_drive_only_root {
+            out.push('\\');
+        }
+        out.push_str(&segs.join("\\"));
+    }
+
+    let want_ext = (flags & PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH) != 0
+        || ((flags & PATHCCH_ALLOW_LONG_PATHS) != 0 && out.encode_utf16().count() >= MAX_PATH_CCH);
+    if want_ext && !out.starts_with("\\\\?\\") && !out.starts_with("\\\\.\\") {
+        let b = out.as_bytes();
+        if out.starts_with("\\\\") {
+            out = format!("\\\\?\\UNC\\{}", &out[2..]);
+        } else if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            out = format!("\\\\?\\{out}");
+        }
+    }
+
+    if (flags & PATHCCH_ENSURE_TRAILING_SLASH) != 0 && !out.is_empty() && !out.ends_with('\\') {
+        out.push('\\');
+    }
+    out
+}
+
+pub unsafe extern "win64" fn PathCchCombineEx(
+    psz_path_out: LPWSTR,
+    cch_path_out: usize,
+    psz_path_in: LPCWSTR,
+    psz_more: LPCWSTR,
+    dw_flags: u32,
+) -> HRESULT {
+    let valid_flags = PATHCCH_ALLOW_LONG_PATHS
+        | PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS
+        | PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS
+        | PATHCCH_DO_NOT_NORMALIZE_SEGMENTS
+        | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH
+        | PATHCCH_ENSURE_TRAILING_SLASH;
+    if psz_path_out.is_null() || cch_path_out == 0 || cch_path_out > PATHCCH_MAX_CCH {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & !valid_flags) != 0 {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS) != 0
+        && (dw_flags & PATHCCH_FORCE_DISABLE_LONG_NAME_PROCESS) != 0
+    {
+        return E_INVALIDARG;
+    }
+    if (dw_flags & PATHCCH_ALLOW_LONG_PATHS) != 0
+        && (dw_flags & PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH) != 0
+    {
+        return E_INVALIDARG;
+    }
+
+    let p_in = crate::strings::read_wide_z_opt(psz_path_in, PATHCCH_MAX_CCH).unwrap_or_default();
+    let p_more = crate::strings::read_wide_z_opt(psz_more, PATHCCH_MAX_CCH).unwrap_or_default();
+
+    let combined = if p_in.is_empty() && p_more.is_empty() {
+        String::new()
+    } else if p_in.is_empty() {
+        p_more
+    } else if p_more.is_empty() {
+        p_in
+    } else {
+        let more_norm = p_more.replace('/', "\\");
+        let more_w: Vec<u16> = more_norm.encode_utf16().collect();
+        let in_norm = p_in.replace('/', "\\");
+        let in_w: Vec<u16> = in_norm.encode_utf16().collect();
+        if let Some(mroot) = pathcch_root_len(&more_w) {
+            if mroot == 1 && more_norm.starts_with('\\') && !more_norm.starts_with("\\\\") {
+                // Single leading backslash: combine with root of `psz_path_in`.
+                if let Some(iroot) = pathcch_root_len(&in_w) {
+                    let root_part = String::from_utf16_lossy(&in_w[..iroot]);
+                    let trimmed_more = more_norm.trim_start_matches('\\');
+                    if root_part.ends_with('\\') {
+                        format!("{root_part}{trimmed_more}")
+                    } else {
+                        format!("{root_part}\\{trimmed_more}")
+                    }
+                } else {
+                    more_norm
+                }
+            } else {
+                // Fully rooted `psz_more` replaces `psz_path_in`.
+                more_norm
+            }
+        } else if in_norm.ends_with('\\') {
+            format!("{in_norm}{more_norm}")
+        } else {
+            format!("{in_norm}\\{more_norm}")
+        }
+    };
+
+    let result = if combined.is_empty() {
+        String::new()
+    } else {
+        canonicalize_pathcch(&combined, dw_flags)
+    };
+    let wide: Vec<u16> = result.encode_utf16().collect();
+    let long_allowed = (dw_flags
+        & (PATHCCH_ALLOW_LONG_PATHS
+            | PATHCCH_FORCE_ENABLE_LONG_NAME_PROCESS
+            | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH))
+        != 0;
+    if !long_allowed && wide.len() + 1 > MAX_PATH_CCH {
+        std::ptr::write_unaligned(psz_path_out, 0);
+        return HRESULT_FILENAME_EXCED_RANGE;
+    }
+    if wide.len() + 1 > cch_path_out {
+        std::ptr::write_unaligned(psz_path_out, 0);
+        return STRSAFE_E_INSUFFICIENT_BUFFER;
+    }
+    if !wide.is_empty() {
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr() as *const u8,
+            psz_path_out as *mut u8,
+            wide.len() * 2,
+        );
+    }
+    std::ptr::write_unaligned((psz_path_out as *mut u8).add(wide.len() * 2) as *mut u16, 0);
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,5 +1711,211 @@ mod tests {
         assert_eq!(format_picture("dddd, MMMM d, yyyy", &st), "Friday, October 27, 2023");
         assert_eq!(format_picture("h:mm:ss tt", &st), "1:05:09 PM");
         assert_eq!(format_picture("'at' HH", &st), "at 13");
+    }
+    #[test]
+    fn path_cch_skip_root_and_combine() {
+        unsafe {
+            let p1 = to_wide_z("C:\\Users\\alice\\file.txt");
+            let mut end: LPCWSTR = std::ptr::null();
+            assert_eq!(PathCchSkipRoot(p1.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "Users\\alice\\file.txt");
+
+            let unc = to_wide_z("\\\\server\\share\\dir\\a.bin");
+            assert_eq!(PathCchSkipRoot(unc.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "dir\\a.bin");
+
+            let ext_unc = to_wide_z("\\\\?\\UNC\\srv\\shr\\sub");
+            assert_eq!(PathCchSkipRoot(ext_unc.as_ptr(), &mut end), S_OK);
+            assert_eq!(from_wide(end), "sub");
+
+            let rel = to_wide_z("relative\\path");
+            assert_eq!(PathCchSkipRoot(rel.as_ptr(), &mut end), E_INVALIDARG);
+            assert!(end.is_null());
+
+            let mut out = [0u16; 512];
+            let base = to_wide_z("C:\\Games\\App\\bin");
+            let more = to_wide_z("..\\data\\./cfg.ini");
+            assert_eq!(PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), more.as_ptr(), 0), S_OK);
+            assert_eq!(from_wide(out.as_ptr()), "C:\\Games\\App\\data\\cfg.ini");
+
+            // Leading single backslash keeps root of pszPathIn
+            let root_rel = to_wide_z("\\Windows\\System32");
+            assert_eq!(
+                PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), root_rel.as_ptr(), PATHCCH_ENSURE_TRAILING_SLASH),
+                S_OK
+            );
+            assert_eq!(from_wide(out.as_ptr()), "C:\\Windows\\System32\\");
+
+            // Extended length prefix
+            assert_eq!(
+                PathCchCombineEx(out.as_mut_ptr(), out.len(), base.as_ptr(), more.as_ptr(), PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH),
+                S_OK
+            );
+            assert_eq!(from_wide(out.as_ptr()), "\\\\?\\C:\\Games\\App\\data\\cfg.ini");
+
+            // Insufficient buffer
+            let mut tiny = [0u16; 8];
+            assert_eq!(
+                PathCchCombineEx(tiny.as_mut_ptr(), tiny.len(), base.as_ptr(), more.as_ptr(), 0),
+                STRSAFE_E_INSUFFICIENT_BUFFER
+            );
+            assert_eq!(tiny[0], 0);
+
+            // Empty string & null input rejected cleanly.
+            let empty = to_wide_z("");
+            let mut empty_end: LPCWSTR = p1.as_ptr();
+            assert_eq!(PathCchSkipRoot(empty.as_ptr(), &mut empty_end), E_INVALIDARG);
+            assert!(empty_end.is_null());
+            assert_eq!(PathCchSkipRoot(std::ptr::null(), &mut empty_end), E_INVALIDARG);
+            assert!(empty_end.is_null());
+
+            // Unaligned (odd-byte) guest UTF-16 buffers AND odd-aligned ppsz_root_end out-pointer
+            // across drive, UNC, extended UNC, lone backslash, empty, and unpaired surrogate units.
+            let mut raw_buf = [0xAAu8; 256];
+            let mut raw_out_ptr = [0x55u8; 16];
+            let odd_out_ptr = raw_out_ptr.as_mut_ptr().add(1) as *mut LPCWSTR;
+
+            let write_odd_units = |buf: &mut [u8], units: &[u16]| -> LPCWSTR {
+                let dst = buf.as_mut_ptr().add(1);
+                for (i, &u) in units.iter().enumerate() {
+                    std::ptr::write_unaligned(dst.add(i * 2) as *mut u16, u);
+                }
+                std::ptr::write_unaligned(dst.add(units.len() * 2) as *mut u16, 0u16);
+                dst as LPCWSTR
+            };
+
+            // Odd-aligned drive path + unpaired surrogate (0xD800) preserved without loss.
+            let mut drive_units = to_wide("C:\\dir\\");
+            drive_units.push(0xD800);
+            drive_units.extend(to_wide("tail.txt"));
+            let odd_in = write_odd_units(&mut raw_buf, &drive_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 3 * 2);
+            let got_units = crate::strings::read_wide_units_z(got_ptr, 64);
+            assert_eq!(got_units, drive_units[3..]);
+
+            // Odd-aligned drive-relative `D:foo` skips 2 code units (`D:`).
+            let drive_rel = to_wide("D:foo");
+            let odd_in = write_odd_units(&mut raw_buf, &drive_rel);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 2 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "foo");
+
+            // Odd-aligned UNC `\\srv\shr\rest` skips `\\srv\shr\`.
+            let unc_units = to_wide("\\\\srv\\shr\\rest");
+            let odd_in = write_odd_units(&mut raw_buf, &unc_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 10 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "rest");
+
+            // Odd-aligned extended UNC `\\?\UNC\host\share\leaf`.
+            let ext_unc_units = to_wide("\\\\?\\UNC\\host\\share\\leaf");
+            let odd_in = write_odd_units(&mut raw_buf, &ext_unc_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 19 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "leaf");
+
+            // Odd-aligned empty string fails and writes NULL to odd_out_ptr.
+            let odd_empty = write_odd_units(&mut raw_buf, &[]);
+            assert_eq!(PathCchSkipRoot(odd_empty, odd_out_ptr), E_INVALIDARG);
+            assert!(std::ptr::read_unaligned(odd_out_ptr).is_null());
+
+            // PathCchCombineEx with odd-aligned inputs AND odd-aligned output buffer.
+            let mut raw_in1 = [0u8; 64];
+            let mut raw_in2 = [0u8; 64];
+            let mut raw_comb = [0xCCu8; 128];
+            let odd_base = write_odd_units(&mut raw_in1, &to_wide("C:\\Alpha\\Beta"));
+            let odd_more = write_odd_units(&mut raw_in2, &to_wide("..\\Gamma\\file.bin"));
+            let odd_comb = raw_comb.as_mut_ptr().add(1) as LPWSTR;
+            assert_eq!(PathCchCombineEx(odd_comb, 60, odd_base, odd_more, 0), S_OK);
+            assert_eq!(crate::strings::read_wide_z(odd_comb, 60), "C:\\Alpha\\Gamma\\file.bin");
+        }
+    }
+
+    #[test]
+    fn path_cch_combine_ex_dot_resolution_and_segment_normalization() {
+        let cases: &[(&str, &str, u32, &str)] = &[
+            // Exact "." and ".." always resolve, including with 0x8 and 0x10.
+            ("C:\\Games\\App\\bin", "..\\data\\./cfg.ini", 0, "C:\\Games\\App\\data\\cfg.ini"),
+            (
+                "C:\\Games\\App\\bin",
+                "..\\data\\./cfg.ini",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\Games\\App\\data\\cfg.ini",
+            ),
+            (
+                "C:\\Games\\App\\bin",
+                "..\\data\\./cfg.ini",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\C:\\Games\\App\\data\\cfg.ini",
+            ),
+            // Trailing spaces and periods normalized by default, preserved by 0x8 and implied by 0x10.
+            ("C:\\dir \\sub", "..\\file. . ", 0, "C:\\dir\\file"),
+            (
+                "C:\\dir \\sub",
+                "..\\file. . ",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\dir \\file. . ",
+            ),
+            (
+                "C:\\dir \\sub",
+                "..\\file. . ",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\C:\\dir \\file. . ",
+            ),
+            ("C:\\a\\b..", ".\\c...\\d ", 0, "C:\\a\\b\\c\\d"),
+            (
+                "C:\\a\\b..",
+                ".\\c...\\d ",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\a\\b..\\c...\\d ",
+            ),
+            // Windows wildcard rule: retain a single trailing period immediately after '*' only.
+            ("C:\\a", "*...", 0, "C:\\a\\*."),
+            ("C:\\a", "*.", 0, "C:\\a\\*."),
+            ("C:\\a", "foo?. .", 0, "C:\\a\\foo?"),
+            ("C:\\a", "foo?. .", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\a\\foo?. ."),
+            ("C:\\a", "*...", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\a\\*..."),
+            // Drive and UNC root boundaries preserved under default, 0x8, and 0x10.
+            ("C:\\dir", "..\\..\\leaf", 0, "C:\\leaf"),
+            ("C:\\dir", "..\\..\\leaf", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\leaf"),
+            ("C:\\dir", "..\\..", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\"),
+            ("\\\\srv\\shr\\dir", "..\\..\\leaf", 0, "\\\\srv\\shr\\leaf"),
+            (
+                "\\\\srv\\shr\\dir",
+                "..\\..\\leaf",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "\\\\srv\\shr\\leaf",
+            ),
+            (
+                "\\\\srv\\shr\\dir",
+                "..\\..\\leaf. ",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\UNC\\srv\\shr\\leaf. ",
+            ),
+            ("\\\\srv\\shr\\dir", "..\\..", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "\\\\srv\\shr\\"),
+        ];
+
+        unsafe {
+            let mut out = [0u16; 512];
+            for &(base, more, flags, expected) in cases {
+                let base_w = to_wide_z(base);
+                let more_w = to_wide_z(more);
+                assert_eq!(
+                    PathCchCombineEx(out.as_mut_ptr(), out.len(), base_w.as_ptr(), more_w.as_ptr(), flags),
+                    S_OK,
+                    "PathCchCombineEx({base:?}, {more:?}, {flags:#x})"
+                );
+                assert_eq!(
+                    from_wide(out.as_ptr()),
+                    expected,
+                    "PathCchCombineEx({base:?}, {more:?}, {flags:#x})"
+                );
+            }
+        }
     }
 }

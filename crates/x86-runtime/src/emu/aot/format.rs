@@ -984,7 +984,7 @@ pub(super) fn read_cached_preferred_base_in(
 ///
 /// Side-effect free: never initializes `aot_mode()` or creates crash-guard session locks.
 pub fn aot_cached_preferred_base(name: &str, image_size: usize) -> Option<usize> {
-    if building() || image_size == 0 {
+    if super::disk_aot_disabled() || building() || image_size == 0 {
         return None;
     }
     if env_var_any(&["PORT_AOT", "AW2_DLL_AOT"]).is_some_and(|v| v.trim() == "0") {
@@ -1023,6 +1023,9 @@ pub(super) fn read_cache_file_in(
 /// read-only to [`super::fallback_cache_dirs`] (`PORT_AOT_FALLBACK_DIR`, bundled
 /// `Contents/Resources/AotCache`, and legacy `~/Library/Caches/aw2-port/aot`).
 pub(super) fn read_cache_file(name: &str, key: &AotKey) -> (PathBuf, Option<(Vec<u8>, bool)>) {
+    if super::disk_aot_disabled() {
+        return (PathBuf::new(), None);
+    }
     let primary_dir = cache_dir();
     let fallbacks = fallback_cache_dirs_for(&primary_dir);
     read_cache_file_in(&primary_dir, &fallbacks, name, key)

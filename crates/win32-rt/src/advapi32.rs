@@ -161,17 +161,85 @@ fn read_sysctl_string(name: &std::ffi::CStr) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+const REG_NOTIFY_CHANGE_NAME: u32 = 0x0000_0001;
+const REG_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0002;
+const REG_NOTIFY_CHANGE_LAST_SET: u32 = 0x0000_0004;
+const REG_NOTIFY_CHANGE_SECURITY: u32 = 0x0000_0008;
+const REG_NOTIFY_THREAD_AGNOSTIC: u32 = 0x1000_0000;
+
+struct RegWatcher {
+    key_handle: usize,
+    path: String,
+    watch_subtree: bool,
+    filter: u32,
+    event: Arc<handles::Event>,
+}
+
 struct Registry {
     keys: std::collections::BTreeMap<String, std::collections::BTreeMap<String, RegValue>>,
+    watchers: Vec<RegWatcher>,
+}
+
+fn path_matches_watch(watch_path: &str, watch_subtree: bool, changed_path: &str) -> bool {
+    if changed_path == watch_path {
+        return true;
+    }
+    if watch_subtree {
+        if let Some(rest) = changed_path.strip_prefix(watch_path) {
+            return rest.starts_with('\\');
+        }
+    }
+    false
+}
+
+fn parent_reg_path(path: &str) -> Option<&str> {
+    path.rsplit_once('\\').map(|(p, _)| p)
+}
+
+fn signal_reg_events(events: Vec<Arc<handles::Event>>) {
+    for ev in events {
+        ev.set();
+    }
 }
 
 impl Registry {
+    fn take_triggered(&mut self, changed_paths: &[&str], mask: u32) -> Vec<Arc<handles::Event>> {
+        let mut fired = Vec::new();
+        let mut i = 0;
+        while i < self.watchers.len() {
+            let w = &self.watchers[i];
+            let matched = (w.filter & mask) != 0
+                && changed_paths
+                    .iter()
+                    .any(|p| path_matches_watch(&w.path, w.watch_subtree, p));
+            if matched {
+                fired.push(self.watchers.swap_remove(i).event);
+            } else {
+                i += 1;
+            }
+        }
+        fired
+    }
+
+    fn take_key_closed(&mut self, key_handle: usize) -> Vec<Arc<handles::Event>> {
+        let mut fired = Vec::new();
+        let mut i = 0;
+        while i < self.watchers.len() {
+            if self.watchers[i].key_handle == key_handle {
+                fired.push(self.watchers.swap_remove(i).event);
+            } else {
+                i += 1;
+            }
+        }
+        fired
+    }
+
     fn new() -> Self {
         let mut keys = std::collections::BTreeMap::new();
         for root in ["hkcr", "hkcu", "hklm", "hku", "hkpd", "hkcc"] {
             keys.insert(root.to_string(), std::collections::BTreeMap::new());
         }
-        let mut reg = Self { keys };
+        let mut reg = Self { keys, watchers: Vec::new() };
         // Pre-populate standard .NET Framework 4.8 & .NET 8.0 keys so games, launchers,
         // and installers checking for .NET prerequisites succeed automatically.
         for sub in [
@@ -527,30 +595,45 @@ pub unsafe extern "win64" fn RegOpenKeyExA(key: HANDLE, sub: LPCSTR, opts: u32, 
 
 pub unsafe extern "win64" fn RegCreateKeyExW(key: HANDLE, sub: LPCWSTR, _r: u32, _class: LPWSTR, _opts: u32, _sam: u32, _sa: *mut c_void, out: *mut HANDLE, disp: *mut u32) -> u32 {
     if !out.is_null() {
-        *out = std::ptr::null_mut();
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
     }
     if !disp.is_null() {
-        *disp = 0;
+        std::ptr::write_unaligned(disp, 0);
     }
     let Some(base) = resolve_key_path(key) else {
         return ERROR_INVALID_HANDLE;
     };
     let sub_str = crate::strings::from_wide_opt(sub).unwrap_or_default();
     let mut cur = base;
+    let mut created_parents: Vec<String> = Vec::new();
     let mut reg = registry().lock().unwrap();
     let mut existed = reg.keys.contains_key(&cur);
     for seg in sub_str.split(['\\', '/']).filter(|s| !s.is_empty()) {
+        let parent = cur.clone();
         cur.push('\\');
         cur.push_str(&seg.to_ascii_lowercase());
         existed = reg.keys.contains_key(&cur);
-        reg.keys.entry(cur.clone()).or_default();
+        if !existed {
+            created_parents.push(parent);
+            reg.keys.insert(cur.clone(), std::collections::BTreeMap::new());
+        }
     }
+    // Match the observed parent path of every newly created key (including intermediates)
+    // in a single pass under the registry lock so each one-shot watcher fires at most once,
+    // no-op reopens fire nothing, and direct vs subtree filters remain exact.
+    let fired = if !created_parents.is_empty() {
+        let refs: Vec<&str> = created_parents.iter().map(String::as_str).collect();
+        reg.take_triggered(&refs, REG_NOTIFY_CHANGE_NAME)
+    } else {
+        Vec::new()
+    };
     drop(reg);
+    signal_reg_events(fired);
     if !disp.is_null() {
-        *disp = if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY };
+        std::ptr::write_unaligned(disp, if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY });
     }
     if !out.is_null() {
-        *out = handles::insert(Arc::new(RegKey { path: cur.clone() }));
+        std::ptr::write_unaligned(out, handles::insert(Arc::new(RegKey { path: cur.clone() })));
     }
     log::debug!("RegCreateKeyExW({}\\{sub_str}) -> {cur} (existed={existed})", key_desc(key));
     ERROR_SUCCESS
@@ -560,6 +643,8 @@ pub unsafe extern "win64" fn RegCloseKey(key: HANDLE) -> u32 {
     if predefined_name(key).is_some() {
         ERROR_SUCCESS
     } else if handles::get_as::<RegKey>(key).is_some() && handles::close(key) {
+        let fired = registry().lock().unwrap().take_key_closed(key as usize);
+        signal_reg_events(fired);
         ERROR_SUCCESS
     } else {
         ERROR_INVALID_HANDLE
@@ -805,6 +890,9 @@ pub unsafe extern "win64" fn RegSetValueExW(key: HANDLE, name: LPCWSTR, _r: u32,
     let mut reg = registry().lock().unwrap();
     let vals = reg.keys.entry(path.clone()).or_default();
     vals.insert(name_str.to_ascii_lowercase(), RegValue { name: name_str.clone(), ty, data: bytes });
+    let fired = reg.take_triggered(&[&path], REG_NOTIFY_CHANGE_LAST_SET);
+    drop(reg);
+    signal_reg_events(fired);
     log::debug!("RegSetValueExW({path}, {name_str:?}, ty={ty}, len={len}) -> ERROR_SUCCESS");
     ERROR_SUCCESS
 }
@@ -817,12 +905,54 @@ pub unsafe extern "win64" fn RegFlushKey(key: HANDLE) -> u32 {
     }
 }
 
-pub unsafe extern "win64" fn RegNotifyChangeKeyValue(key: HANDLE, _watch_subtree: BOOL, _filter: u32, _event: HANDLE, _async_flag: BOOL) -> u32 {
-    if resolve_key_path(key).is_none() {
+pub unsafe extern "win64" fn RegNotifyChangeKeyValue(
+    key: HANDLE,
+    watch_subtree: BOOL,
+    filter: u32,
+    event: HANDLE,
+    async_flag: BOOL,
+) -> u32 {
+    let Some(path) = resolve_key_path(key) else {
         return ERROR_INVALID_HANDLE;
+    };
+    let valid_mask = REG_NOTIFY_CHANGE_NAME
+        | REG_NOTIFY_CHANGE_ATTRIBUTES
+        | REG_NOTIFY_CHANGE_LAST_SET
+        | REG_NOTIFY_CHANGE_SECURITY
+        | REG_NOTIFY_THREAD_AGNOSTIC;
+    let notify_bits = filter & !REG_NOTIFY_THREAD_AGNOSTIC;
+    if notify_bits == 0 || (filter & !valid_mask) != 0 {
+        return ERROR_INVALID_PARAMETER;
     }
-    stub!("RegNotifyChangeKeyValue({}) -> ERROR_CALL_NOT_IMPLEMENTED", key_desc(key));
-    ERROR_CALL_NOT_IMPLEMENTED
+    if async_flag != 0 {
+        let Some(ev) = handles::get_as::<handles::Event>(event) else {
+            return ERROR_INVALID_PARAMETER;
+        };
+        let mut reg = registry().lock().unwrap();
+        reg.watchers.push(RegWatcher {
+            key_handle: key as usize,
+            path,
+            watch_subtree: watch_subtree != 0,
+            filter: notify_bits,
+            event: ev,
+        });
+        return ERROR_SUCCESS;
+    }
+    // Synchronous mode: register a one-shot internal event and wait until signaled by a matching mutation or RegCloseKey.
+    let ev = Arc::new(handles::Event::new(true, false, None));
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.watchers.push(RegWatcher {
+            key_handle: key as usize,
+            path,
+            watch_subtree: watch_subtree != 0,
+            filter: notify_bits,
+            event: Arc::clone(&ev),
+        });
+    }
+    let obj: Arc<dyn handles::KObject> = ev;
+    let _ = handles::wait_for(&[obj], false, INFINITE, false);
+    ERROR_SUCCESS
 }
 
 pub unsafe extern "win64" fn RegDeleteKeyExW(key: HANDLE, sub: LPCWSTR, _sam: u32, _r: u32) -> u32 {
@@ -836,6 +966,13 @@ pub unsafe extern "win64" fn RegDeleteKeyExW(key: HANDLE, sub: LPCWSTR, _sam: u3
     let full = join_reg_path(&base, &sub_str);
     let mut reg = registry().lock().unwrap();
     if reg.keys.remove(&full).is_some() {
+        let fired = if let Some(parent) = parent_reg_path(&full) {
+            reg.take_triggered(&[&full, parent], REG_NOTIFY_CHANGE_NAME)
+        } else {
+            reg.take_triggered(&[&full], REG_NOTIFY_CHANGE_NAME)
+        };
+        drop(reg);
+        signal_reg_events(fired);
         ERROR_SUCCESS
     } else {
         ERROR_FILE_NOT_FOUND
@@ -859,6 +996,13 @@ pub unsafe extern "win64" fn RegDeleteTreeW(key: HANDLE, sub: LPCWSTR) -> u32 {
     } else if let Some(vals) = reg.keys.get_mut(&full) {
         vals.clear();
     }
+    let fired = if let Some(parent) = parent_reg_path(&full) {
+        reg.take_triggered(&[&full, parent], REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET)
+    } else {
+        reg.take_triggered(&[&full], REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET)
+    };
+    drop(reg);
+    signal_reg_events(fired);
     ERROR_SUCCESS
 }
 
@@ -1246,19 +1390,6 @@ pub unsafe extern "win64" fn ImpersonateLoggedOnUser(_token: HANDLE) -> BOOL {
 
 pub unsafe extern "win64" fn RevertToSelf() -> BOOL {
     TRUE
-}
-
-pub unsafe extern "win64" fn QueryServiceStatusEx(
-    _svc: HANDLE,
-    _level: u32,
-    _buf: *mut u8,
-    _len: u32,
-    needed: *mut u32,
-) -> BOOL {
-    if !needed.is_null() {
-        std::ptr::write_unaligned(needed, 0);
-    }
-    err(ERROR_INVALID_HANDLE, FALSE)
 }
 
 /// Well-known privilege LUIDs (winnt.h SE_*_PRIVILEGE values).
@@ -1704,6 +1835,9 @@ pub unsafe extern "win64" fn RegDeleteValueW(key: HANDLE, name: LPCWSTR) -> u32 
     let mut reg = registry().lock().unwrap();
     if let Some(vals) = reg.keys.get_mut(&path) {
         if vals.remove(&name_str).is_some() {
+            let fired = reg.take_triggered(&[&path], REG_NOTIFY_CHANGE_LAST_SET);
+            drop(reg);
+            signal_reg_events(fired);
             return ERROR_SUCCESS;
         }
     }
@@ -1775,20 +1909,738 @@ pub unsafe extern "win64" fn RegQueryInfoKeyA(
     )
 }
 
-// ------------------------------------------------------- CAPI / Cred* / SCM
+// ------------------------------------------------------- userenv.dll
+// (`userenv.dll` routes to `advapi32.dll` in `port-manifest::dll_map`).
 
-// @exports CryptAcquireContextW CryptAcquireContextA CryptReleaseContext CryptCreateHash CryptHashData CryptGetHashParam CryptSetHashParam CryptDestroyHash CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptGetProvParam CryptSignHashW CredWriteW ChangeServiceConfig2W QueryServiceConfig2W QueryServiceConfigW QueryServiceStatus CloseServiceHandle
+fn user_profile_dir() -> String {
+    if let Some(p) = crate::process::get_env("USERPROFILE").filter(|s| !s.is_empty()) {
+        return p;
+    }
+    format!("C:\\users\\{}", host_user())
+}
+
+pub unsafe extern "win64" fn GetUserProfileDirectoryW(
+    h_token: HANDLE,
+    lp_profile_dir: LPWSTR,
+    lpcch_size: *mut u32,
+) -> BOOL {
+    if lpcch_size.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if h_token.is_null() || handles::get(h_token).is_none() {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    let dir = user_profile_dir();
+    if let Some(host) = crate::path::to_host(&dir) {
+        let _ = std::fs::create_dir_all(host);
+    }
+    let units = dir.encode_utf16().count() + 1;
+    let needed = units as u32;
+    let cap = std::ptr::read_unaligned(lpcch_size);
+    if lp_profile_dir.is_null() || cap < needed {
+        std::ptr::write_unaligned(lpcch_size, needed);
+        return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    crate::strings::write_wide_z(lp_profile_dir, units, &dir);
+    std::ptr::write_unaligned(lpcch_size, needed);
+    TRUE
+}
+
+pub unsafe extern "win64" fn GetUserProfileDirectoryA(
+    h_token: HANDLE,
+    lp_profile_dir: LPSTR,
+    lpcch_size: *mut u32,
+) -> BOOL {
+    if lpcch_size.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if h_token.is_null() || handles::get(h_token).is_none() {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    let dir = user_profile_dir();
+    if let Some(host) = crate::path::to_host(&dir) {
+        let _ = std::fs::create_dir_all(host);
+    }
+    let needed = dir.len() as u32 + 1;
+    let cap = std::ptr::read_unaligned(lpcch_size);
+    if lp_profile_dir.is_null() || cap < needed {
+        std::ptr::write_unaligned(lpcch_size, needed);
+        return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(dir.as_ptr(), lp_profile_dir, dir.len());
+    *lp_profile_dir.add(dir.len()) = 0;
+    std::ptr::write_unaligned(lpcch_size, needed);
+    TRUE
+}
+
+// ------------------------------------------------------- User-mode Service Control Manager & Dispatcher
+
+const ERROR_INVALID_SERVICE_CONTROL: u32 = 1052;
+const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
+const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+const ERROR_SERVICE_EXISTS: u32 = 1073;
+const ERROR_INVALID_DATA: u32 = 13;
+
+const SERVICE_WIN32_OWN_PROCESS: u32 = 0x10;
+const SERVICE_STOPPED: u32 = 1;
+const SERVICE_CONTROL_STOP: u32 = 1;
+const SERVICE_CONTROL_PAUSE: u32 = 2;
+const SERVICE_CONTROL_CONTINUE: u32 = 3;
+const SERVICE_CONTROL_INTERROGATE: u32 = 4;
+const SERVICE_CONTROL_SHUTDOWN: u32 = 5;
+const SERVICE_ACCEPT_STOP: u32 = 0x1;
+const SERVICE_ACCEPT_PAUSE_CONTINUE: u32 = 0x2;
+const SERVICE_ACCEPT_SHUTDOWN: u32 = 0x4;
+const SERVICE_CONFIG_DESCRIPTION: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SERVICE_STATUS {
+    pub dwServiceType: u32,
+    pub dwCurrentState: u32,
+    pub dwControlsAccepted: u32,
+    pub dwWin32ExitCode: u32,
+    pub dwServiceSpecificExitCode: u32,
+    pub dwCheckPoint: u32,
+    pub dwWaitHint: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SERVICE_STATUS_PROCESS {
+    pub dwServiceType: u32,
+    pub dwCurrentState: u32,
+    pub dwControlsAccepted: u32,
+    pub dwWin32ExitCode: u32,
+    pub dwServiceSpecificExitCode: u32,
+    pub dwCheckPoint: u32,
+    pub dwWaitHint: u32,
+    pub dwProcessId: u32,
+    pub dwServiceFlags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SERVICE_TABLE_ENTRYW {
+    pub lpServiceName: LPWSTR,
+    pub lpServiceProc: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SERVICE_TABLE_ENTRYA {
+    pub lpServiceName: LPSTR,
+    pub lpServiceProc: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ServiceHandler {
+    Legacy(usize),
+    Ex(usize, usize),
+}
+
+struct ServiceEntry {
+    name: String,
+    display_name: std::sync::Mutex<String>,
+    binary_path: std::sync::Mutex<String>,
+    description: std::sync::Mutex<String>,
+    start_type: std::sync::atomic::AtomicU32,
+    error_control: std::sync::atomic::AtomicU32,
+    status: std::sync::Mutex<SERVICE_STATUS>,
+    handler: std::sync::Mutex<Option<ServiceHandler>>,
+}
+
+impl ServiceEntry {
+    fn new(name: String, display_name: String, binary_path: String, service_type: u32, start_type: u32, error_control: u32) -> Self {
+        Self {
+            name,
+            display_name: std::sync::Mutex::new(display_name),
+            binary_path: std::sync::Mutex::new(binary_path),
+            description: std::sync::Mutex::new(String::new()),
+            start_type: std::sync::atomic::AtomicU32::new(start_type),
+            error_control: std::sync::atomic::AtomicU32::new(error_control),
+            status: std::sync::Mutex::new(SERVICE_STATUS {
+                dwServiceType: if service_type == 0 { SERVICE_WIN32_OWN_PROCESS } else { service_type },
+                dwCurrentState: SERVICE_STOPPED,
+                ..Default::default()
+            }),
+            handler: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+struct ScmObj;
+impl handles::KObject for ScmObj {
+    fn type_name(&self) -> &'static str {
+        "SCManager"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct ServiceHandleObj {
+    entry: Arc<ServiceEntry>,
+}
+impl handles::KObject for ServiceHandleObj {
+    fn type_name(&self) -> &'static str {
+        "Service"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct ServiceStatusHandleObj {
+    entry: Arc<ServiceEntry>,
+}
+impl handles::KObject for ServiceStatusHandleObj {
+    fn type_name(&self) -> &'static str {
+        "ServiceStatusHandle"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn services() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<ServiceEntry>>> {
+    static SVCS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<ServiceEntry>>>> =
+        std::sync::OnceLock::new();
+    SVCS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+static DISPATCHER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn get_or_create_service(name: &str) -> Arc<ServiceEntry> {
+    let key = name.to_ascii_lowercase();
+    let mut map = services().lock().unwrap();
+    map.entry(key)
+        .or_insert_with(|| {
+            Arc::new(ServiceEntry::new(
+                name.to_string(),
+                name.to_string(),
+                String::new(),
+                SERVICE_WIN32_OWN_PROCESS,
+                3, // SERVICE_DEMAND_START
+                1, // SERVICE_ERROR_NORMAL
+            ))
+        })
+        .clone()
+}
+
+fn is_local_machine(machine: Option<&str>) -> bool {
+    match machine {
+        None => true,
+        Some(m) => {
+            let t = m.trim().trim_start_matches('\\');
+            t.is_empty()
+                || t == "."
+                || t.eq_ignore_ascii_case("localhost")
+                || t.eq_ignore_ascii_case(&crate::config::app_config().computer_name)
+        }
+    }
+}
+
+pub unsafe extern "win64" fn OpenSCManagerW(
+    machine_name: LPCWSTR,
+    _database_name: LPCWSTR,
+    _desired_access: u32,
+) -> HANDLE {
+    let m = crate::strings::from_wide_opt(machine_name);
+    if !is_local_machine(m.as_deref()) {
+        return err(ERROR_ACCESS_DENIED, std::ptr::null_mut());
+    }
+    handles::insert(Arc::new(ScmObj))
+}
+
+pub unsafe extern "win64" fn OpenSCManagerA(
+    machine_name: LPCSTR,
+    _database_name: LPCSTR,
+    desired_access: u32,
+) -> HANDLE {
+    let w = crate::strings::from_ansi_opt(machine_name).map(|s| crate::strings::to_wide_z(&s));
+    OpenSCManagerW(w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), std::ptr::null(), desired_access)
+}
+
+pub unsafe extern "win64" fn CreateServiceW(
+    h_sc_manager: HANDLE,
+    service_name: LPCWSTR,
+    display_name: LPCWSTR,
+    _desired_access: u32,
+    service_type: u32,
+    start_type: u32,
+    error_control: u32,
+    binary_path: LPCWSTR,
+    _load_order_group: LPCWSTR,
+    _tag_id: *mut u32,
+    _dependencies: LPCWSTR,
+    _service_start_name: LPCWSTR,
+    _password: LPCWSTR,
+) -> HANDLE {
+    if handles::get_as::<ScmObj>(h_sc_manager).is_none() {
+        return err(ERROR_INVALID_HANDLE, std::ptr::null_mut());
+    }
+    let Some(name) = crate::strings::from_wide_opt(service_name).filter(|s| !s.is_empty()) else {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    };
+    let disp = crate::strings::from_wide_opt(display_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.clone());
+    let bin = crate::strings::from_wide_opt(binary_path).unwrap_or_default();
+    let key = name.to_ascii_lowercase();
+    let mut map = services().lock().unwrap();
+    if map.contains_key(&key) {
+        return err(ERROR_SERVICE_EXISTS, std::ptr::null_mut());
+    }
+    let entry = Arc::new(ServiceEntry::new(name, disp, bin, service_type, start_type, error_control));
+    map.insert(key, Arc::clone(&entry));
+    drop(map);
+    handles::insert(Arc::new(ServiceHandleObj { entry }))
+}
+
+pub unsafe extern "win64" fn CreateServiceA(
+    h_sc_manager: HANDLE,
+    service_name: LPCSTR,
+    display_name: LPCSTR,
+    desired_access: u32,
+    service_type: u32,
+    start_type: u32,
+    error_control: u32,
+    binary_path: LPCSTR,
+    _load_order_group: LPCSTR,
+    tag_id: *mut u32,
+    _dependencies: LPCSTR,
+    _service_start_name: LPCSTR,
+    _password: LPCSTR,
+) -> HANDLE {
+    let wn = crate::strings::from_ansi_opt(service_name).map(|s| crate::strings::to_wide_z(&s));
+    let wd = crate::strings::from_ansi_opt(display_name).map(|s| crate::strings::to_wide_z(&s));
+    let wb = crate::strings::from_ansi_opt(binary_path).map(|s| crate::strings::to_wide_z(&s));
+    CreateServiceW(
+        h_sc_manager,
+        wn.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        wd.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        desired_access,
+        service_type,
+        start_type,
+        error_control,
+        wb.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        std::ptr::null(),
+        tag_id,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+    )
+}
+
+pub unsafe extern "win64" fn OpenServiceW(
+    h_sc_manager: HANDLE,
+    service_name: LPCWSTR,
+    _desired_access: u32,
+) -> HANDLE {
+    if handles::get_as::<ScmObj>(h_sc_manager).is_none() {
+        return err(ERROR_INVALID_HANDLE, std::ptr::null_mut());
+    }
+    let Some(name) = crate::strings::from_wide_opt(service_name).filter(|s| !s.is_empty()) else {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    };
+    let key = name.to_ascii_lowercase();
+    let entry = services().lock().unwrap().get(&key).cloned();
+    match entry {
+        Some(entry) => handles::insert(Arc::new(ServiceHandleObj { entry })),
+        None => err(ERROR_SERVICE_DOES_NOT_EXIST, std::ptr::null_mut()),
+    }
+}
+
+pub unsafe extern "win64" fn OpenServiceA(
+    h_sc_manager: HANDLE,
+    service_name: LPCSTR,
+    desired_access: u32,
+) -> HANDLE {
+    let w = crate::strings::from_ansi_opt(service_name).map(|s| crate::strings::to_wide_z(&s));
+    OpenServiceW(h_sc_manager, w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), desired_access)
+}
+
+pub unsafe extern "win64" fn CloseServiceHandle(h_sc_object: HANDLE) -> BOOL {
+    if handles::get_as::<ScmObj>(h_sc_object).is_some()
+        || handles::get_as::<ServiceHandleObj>(h_sc_object).is_some()
+    {
+        handles::close(h_sc_object);
+        TRUE
+    } else {
+        err(ERROR_INVALID_HANDLE, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn DeleteService(h_service: HANDLE) -> BOOL {
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    services().lock().unwrap().remove(&svc.entry.name.to_ascii_lowercase());
+    TRUE
+}
+
+pub unsafe extern "win64" fn RegisterServiceCtrlHandlerW(
+    service_name: LPCWSTR,
+    handler_proc: *const c_void,
+) -> HANDLE {
+    let Some(name) = crate::strings::from_wide_opt(service_name).filter(|s| !s.is_empty()) else {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    };
+    if handler_proc.is_null() {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    }
+    let entry = get_or_create_service(&name);
+    *entry.handler.lock().unwrap() = Some(ServiceHandler::Legacy(handler_proc as usize));
+    handles::insert(Arc::new(ServiceStatusHandleObj { entry }))
+}
+
+pub unsafe extern "win64" fn RegisterServiceCtrlHandlerA(
+    service_name: LPCSTR,
+    handler_proc: *const c_void,
+) -> HANDLE {
+    let w = crate::strings::from_ansi_opt(service_name).map(|s| crate::strings::to_wide_z(&s));
+    RegisterServiceCtrlHandlerW(w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), handler_proc)
+}
+
+pub unsafe extern "win64" fn RegisterServiceCtrlHandlerExW(
+    service_name: LPCWSTR,
+    handler_proc: *const c_void,
+    context: *mut c_void,
+) -> HANDLE {
+    let Some(name) = crate::strings::from_wide_opt(service_name).filter(|s| !s.is_empty()) else {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    };
+    if handler_proc.is_null() {
+        return err(ERROR_INVALID_PARAMETER, std::ptr::null_mut());
+    }
+    let entry = get_or_create_service(&name);
+    *entry.handler.lock().unwrap() = Some(ServiceHandler::Ex(handler_proc as usize, context as usize));
+    handles::insert(Arc::new(ServiceStatusHandleObj { entry }))
+}
+
+pub unsafe extern "win64" fn RegisterServiceCtrlHandlerExA(
+    service_name: LPCSTR,
+    handler_proc: *const c_void,
+    context: *mut c_void,
+) -> HANDLE {
+    let w = crate::strings::from_ansi_opt(service_name).map(|s| crate::strings::to_wide_z(&s));
+    RegisterServiceCtrlHandlerExW(w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), handler_proc, context)
+}
+
+pub unsafe extern "win64" fn SetServiceStatus(
+    h_service_status: HANDLE,
+    lp_service_status: *const SERVICE_STATUS,
+) -> BOOL {
+    if lp_service_status.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(sh) = handles::get_as::<ServiceStatusHandleObj>(h_service_status) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    let st = std::ptr::read_unaligned(lp_service_status);
+    *sh.entry.status.lock().unwrap() = st;
+    TRUE
+}
+
+pub unsafe extern "win64" fn QueryServiceStatus(
+    h_service: HANDLE,
+    lp_service_status: *mut SERVICE_STATUS,
+) -> BOOL {
+    if lp_service_status.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    let st = *svc.entry.status.lock().unwrap();
+    std::ptr::write_unaligned(lp_service_status, st);
+    TRUE
+}
+
+pub unsafe extern "win64" fn QueryServiceStatusEx(
+    h_service: HANDLE,
+    info_level: u32,
+    lp_buffer: *mut u8,
+    cb_buf_size: u32,
+    pcb_bytes_needed: *mut u32,
+) -> BOOL {
+    if pcb_bytes_needed.is_null() || info_level != 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    let need = std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32;
+    std::ptr::write_unaligned(pcb_bytes_needed, need);
+    if lp_buffer.is_null() || cb_buf_size < need {
+        return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    let st = *svc.entry.status.lock().unwrap();
+    let ssp = SERVICE_STATUS_PROCESS {
+        dwServiceType: st.dwServiceType,
+        dwCurrentState: st.dwCurrentState,
+        dwControlsAccepted: st.dwControlsAccepted,
+        dwWin32ExitCode: st.dwWin32ExitCode,
+        dwServiceSpecificExitCode: st.dwServiceSpecificExitCode,
+        dwCheckPoint: st.dwCheckPoint,
+        dwWaitHint: st.dwWaitHint,
+        dwProcessId: if st.dwCurrentState == SERVICE_STOPPED { 0 } else { std::process::id() },
+        dwServiceFlags: 0,
+    };
+    std::ptr::write_unaligned(lp_buffer as *mut SERVICE_STATUS_PROCESS, ssp);
+    TRUE
+}
+
+pub unsafe extern "win64" fn ControlService(
+    h_service: HANDLE,
+    dw_control: u32,
+    lp_service_status: *mut SERVICE_STATUS,
+) -> BOOL {
+    if lp_service_status.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    let handler = *svc.entry.handler.lock().unwrap();
+    let Some(handler) = handler else {
+        return err(ERROR_SERVICE_NOT_ACTIVE, FALSE);
+    };
+    let cur = *svc.entry.status.lock().unwrap();
+    let accepted = match dw_control {
+        SERVICE_CONTROL_INTERROGATE | 128..=255 => true,
+        SERVICE_CONTROL_STOP => (cur.dwControlsAccepted & SERVICE_ACCEPT_STOP) != 0,
+        SERVICE_CONTROL_PAUSE | SERVICE_CONTROL_CONTINUE => (cur.dwControlsAccepted & SERVICE_ACCEPT_PAUSE_CONTINUE) != 0,
+        SERVICE_CONTROL_SHUTDOWN => (cur.dwControlsAccepted & SERVICE_ACCEPT_SHUTDOWN) != 0,
+        _ => true,
+    };
+    if !accepted {
+        return err(ERROR_INVALID_SERVICE_CONTROL, FALSE);
+    }
+    // Invoke handler with NO locks held so handler can call SetServiceStatus re-entrantly.
+    match handler {
+        ServiceHandler::Legacy(proc_addr) => {
+            crate::call_guest8(proc_addr, dw_control as u64, 0, 0, 0, 0, 0, 0, 0);
+        }
+        ServiceHandler::Ex(proc_addr, ctx) => {
+            let rc = crate::call_guest8(proc_addr, dw_control as u64, 0, 0, ctx as u64, 0, 0, 0, 0) as u32;
+            if rc != ERROR_SUCCESS {
+                let updated = *svc.entry.status.lock().unwrap();
+                std::ptr::write_unaligned(lp_service_status, updated);
+                return err(rc, FALSE);
+            }
+        }
+    }
+    let updated = *svc.entry.status.lock().unwrap();
+    std::ptr::write_unaligned(lp_service_status, updated);
+    TRUE
+}
+
+pub unsafe extern "win64" fn ChangeServiceConfig2W(
+    h_service: HANDLE,
+    info_level: u32,
+    lp_info: *const c_void,
+) -> BOOL {
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    if lp_info.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if info_level == SERVICE_CONFIG_DESCRIPTION {
+        let ptr = std::ptr::read_unaligned(lp_info as *const LPCWSTR);
+        let desc = crate::strings::from_wide_opt(ptr).unwrap_or_default();
+        *svc.entry.description.lock().unwrap() = desc;
+        return TRUE;
+    }
+    err(ERROR_CALL_NOT_IMPLEMENTED, FALSE)
+}
+
+pub unsafe extern "win64" fn QueryServiceConfig2W(
+    h_service: HANDLE,
+    info_level: u32,
+    lp_buffer: *mut u8,
+    cb_buf_size: u32,
+    pcb_bytes_needed: *mut u32,
+) -> BOOL {
+    if pcb_bytes_needed.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    if info_level == SERVICE_CONFIG_DESCRIPTION {
+        let desc = svc.entry.description.lock().unwrap().clone();
+        let desc_units = desc.encode_utf16().count() + 1;
+        let need = (8 + desc_units * 2) as u32;
+        std::ptr::write_unaligned(pcb_bytes_needed, need);
+        if lp_buffer.is_null() || cb_buf_size < need {
+            return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
+        }
+        let str_dst = lp_buffer.add(8) as *mut u16;
+        crate::strings::write_wide_z(str_dst, desc_units, &desc);
+        std::ptr::write_unaligned(lp_buffer as *mut LPWSTR, str_dst);
+        return TRUE;
+    }
+    err(ERROR_CALL_NOT_IMPLEMENTED, FALSE)
+}
+
+pub unsafe extern "win64" fn QueryServiceConfigW(
+    h_service: HANDLE,
+    lp_config: *mut u8,
+    cb_buf_size: u32,
+    pcb_bytes_needed: *mut u32,
+) -> BOOL {
+    if pcb_bytes_needed.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(svc) = handles::get_as::<ServiceHandleObj>(h_service) else {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
+    let bin = svc.entry.binary_path.lock().unwrap().clone();
+    let disp = svc.entry.display_name.lock().unwrap().clone();
+    let bin_units = bin.encode_utf16().count() + 1;
+    let disp_units = disp.encode_utf16().count() + 1;
+    // QUERY_SERVICE_CONFIGW on x64 is 64 bytes:
+    // 0: dwServiceType, 4: dwStartType, 8: dwErrorControl, 12: pad,
+    // 16: lpBinaryPathName, 24: lpLoadOrderGroup, 32: dwTagId, 36: pad,
+    // 40: lpDependencies, 48: lpServiceStartName, 56: lpDisplayName
+    let header_sz = 64usize;
+    let need = (header_sz + (bin_units + disp_units) * 2) as u32;
+    std::ptr::write_unaligned(pcb_bytes_needed, need);
+    if lp_config.is_null() || cb_buf_size < need {
+        return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::write_bytes(lp_config, 0, header_sz);
+    let st = *svc.entry.status.lock().unwrap();
+    (lp_config as *mut u32).write_unaligned(st.dwServiceType);
+    (lp_config.add(4) as *mut u32).write_unaligned(svc.entry.start_type.load(Ordering::Relaxed));
+    (lp_config.add(8) as *mut u32).write_unaligned(svc.entry.error_control.load(Ordering::Relaxed));
+    let bin_dst = lp_config.add(header_sz) as *mut u16;
+    crate::strings::write_wide_z(bin_dst, bin_units, &bin);
+    let disp_dst = bin_dst.add(bin_units);
+    crate::strings::write_wide_z(disp_dst, disp_units, &disp);
+    (lp_config.add(16) as *mut LPWSTR).write_unaligned(bin_dst);
+    (lp_config.add(56) as *mut LPWSTR).write_unaligned(disp_dst);
+    TRUE
+}
+
+fn dispatch_service_entries(entries: Vec<(String, usize, bool)>) -> BOOL {
+    if entries.is_empty() {
+        return err(ERROR_INVALID_DATA, FALSE);
+    }
+    if DISPATCHER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return err(ERROR_SERVICE_ALREADY_RUNNING, FALSE);
+    }
+    struct DispatchGuard;
+    impl Drop for DispatchGuard {
+        fn drop(&mut self) {
+            DISPATCHER_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _guard = DispatchGuard;
+
+    let mut threads: Vec<Arc<dyn handles::KObject>> = Vec::with_capacity(entries.len());
+    for (name, proc_addr, wide) in entries {
+        let _ = get_or_create_service(&name);
+        let spawned = crate::thread::spawn(
+            Box::new(move || unsafe {
+                if wide {
+                    let mut wname = crate::strings::to_wide_z(&name);
+                    let mut argv: [*mut u16; 2] = [wname.as_mut_ptr(), std::ptr::null_mut()];
+                    crate::call_guest8(proc_addr, 1, argv.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0);
+                } else {
+                    let mut aname = name.into_bytes();
+                    aname.push(0);
+                    let mut argv: [*mut u8; 2] = [aname.as_mut_ptr(), std::ptr::null_mut()];
+                    crate::call_guest8(proc_addr, 1, argv.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0);
+                }
+                0
+            }),
+            0,
+            false,
+            false,
+        );
+        match spawned {
+            Ok(t) => threads.push(t),
+            Err(e) => {
+                let code = e.raw_os_error().map(errno_to_win32).unwrap_or(ERROR_ACCESS_DENIED);
+                if !threads.is_empty() {
+                    let _ = handles::wait_for(&threads, true, INFINITE, false);
+                }
+                return err(code, FALSE);
+            }
+        }
+    }
+    let _ = handles::wait_for(&threads, true, INFINITE, false);
+    TRUE
+}
+
+pub unsafe extern "win64" fn StartServiceCtrlDispatcherW(
+    service_start_table: *const SERVICE_TABLE_ENTRYW,
+) -> BOOL {
+    if service_start_table.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let ent = std::ptr::read_unaligned(service_start_table.add(i));
+        if ent.lpServiceName.is_null() && ent.lpServiceProc == 0 {
+            break;
+        }
+        if ent.lpServiceProc == 0 {
+            return err(ERROR_INVALID_DATA, FALSE);
+        }
+        let name = crate::strings::from_wide_opt(ent.lpServiceName).unwrap_or_default();
+        entries.push((name, ent.lpServiceProc, true));
+        i += 1;
+        if i >= 256 {
+            break;
+        }
+    }
+    dispatch_service_entries(entries)
+}
+
+pub unsafe extern "win64" fn StartServiceCtrlDispatcherA(
+    service_start_table: *const SERVICE_TABLE_ENTRYA,
+) -> BOOL {
+    if service_start_table.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let ent = std::ptr::read_unaligned(service_start_table.add(i));
+        if ent.lpServiceName.is_null() && ent.lpServiceProc == 0 {
+            break;
+        }
+        if ent.lpServiceProc == 0 {
+            return err(ERROR_INVALID_DATA, FALSE);
+        }
+        let name = crate::strings::from_ansi_opt(ent.lpServiceName).unwrap_or_default();
+        entries.push((name, ent.lpServiceProc, false));
+        i += 1;
+        if i >= 256 {
+            break;
+        }
+    }
+    dispatch_service_entries(entries)
+}
+
+// ------------------------------------------------------- CAPI / Cred*
+
+// @exports CryptAcquireContextW CryptAcquireContextA CryptReleaseContext CryptCreateHash CryptHashData CryptGetHashParam CryptSetHashParam CryptDestroyHash CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptGetProvParam CryptSignHashW CredWriteW
 failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
     CryptAcquireContextW, CryptAcquireContextA, CryptReleaseContext, CryptCreateHash, CryptHashData,
     CryptGetHashParam, CryptSetHashParam, CryptDestroyHash, CryptDecrypt,
     CryptEncrypt, CryptDestroyKey, CryptExportKey, CryptImportKey,
-    CryptGetUserKey, CryptGetProvParam, CryptSignHashW, CredWriteW,
-    ChangeServiceConfig2W, QueryServiceConfig2W, QueryServiceConfigW, QueryServiceStatus,
-    CloseServiceHandle);
-
-// @exports OpenSCManagerW OpenSCManagerA OpenServiceW OpenServiceA
-failing!(HANDLE = std::ptr::null_mut(), err ERROR_ACCESS_DENIED;
-    OpenSCManagerW, OpenSCManagerA, OpenServiceW, OpenServiceA);
+    CryptGetUserKey, CryptGetProvParam, CryptSignHashW, CredWriteW);
 
 /// `RtlGenRandom` alias exported by advapi32.dll as `SystemFunction036`.
 pub unsafe extern "win64" fn SystemFunction036(buf: *mut c_void, len: u32) -> u8 {
@@ -2023,6 +2875,570 @@ mod tests {
 
             assert_eq!(RegCloseKey(hdev), ERROR_SUCCESS);
             assert_eq!(RegCloseKey(hclass), ERROR_SUCCESS);
+        }
+    }
+
+    unsafe fn read_unaligned_utf16_z(ptr: *const u16, max_units: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for i in 0..max_units {
+            let u = std::ptr::read_unaligned(ptr.add(i));
+            if u == 0 {
+                return out;
+            }
+            out.push(u);
+        }
+        panic!("missing NUL terminator within {max_units} UTF-16 code units");
+    }
+
+    fn odd_sentinel_buf(payload_bytes: usize) -> (Vec<u8>, usize) {
+        let backing = vec![0xA5u8; payload_bytes + 8];
+        let odd_off = if (backing.as_ptr() as usize) & 1 == 0 { 1 } else { 2 };
+        assert_eq!((backing.as_ptr() as usize + odd_off) & 1, 1);
+        (backing, odd_off)
+    }
+
+    #[test]
+    fn user_profile_directory_uses_vfs() {
+        unsafe {
+            let mut tok = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken(handles::CURRENT_PROCESS, 0x8, &mut tok), TRUE);
+            let mut sz = 0u32;
+            assert_eq!(GetUserProfileDirectoryW(tok, std::ptr::null_mut(), &mut sz), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert!(sz > 4);
+            let expected_units = sz as usize;
+            let mut buf = vec![0u16; expected_units];
+            assert_eq!(GetUserProfileDirectoryW(tok, buf.as_mut_ptr(), &mut sz), TRUE);
+            assert_eq!(sz as usize, expected_units);
+            let dir = crate::strings::from_wide(buf.as_ptr());
+            assert!(dir.to_ascii_lowercase().starts_with("c:\\users\\"));
+
+            // Odd-address buffer: undersize probe preserves sentinels; exact size writes UTF-16 + NUL safely.
+            let byte_len = expected_units * 2;
+            let (mut odd_backing, odd_off) = odd_sentinel_buf(byte_len);
+            let odd_ptr = odd_backing.as_mut_ptr().add(odd_off) as *mut u16;
+            assert_eq!((odd_ptr as usize) & 1, 1);
+
+            let mut small = (expected_units - 1) as u32;
+            assert_eq!(GetUserProfileDirectoryW(tok, odd_ptr, &mut small), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(small as usize, expected_units);
+            assert!(odd_backing.iter().all(|&b| b == 0xA5));
+
+            let mut exact = expected_units as u32;
+            assert_eq!(GetUserProfileDirectoryW(tok, odd_ptr, &mut exact), TRUE);
+            assert_eq!(exact as usize, expected_units);
+            let got_units = read_unaligned_utf16_z(odd_ptr, expected_units);
+            let expected_utf16: Vec<u16> = dir.encode_utf16().collect();
+            assert_eq!(got_units, expected_utf16);
+            assert_eq!(std::ptr::read_unaligned(odd_ptr.add(expected_utf16.len())), 0u16);
+            assert!(odd_backing[..odd_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_backing[odd_off + byte_len..].iter().all(|&b| b == 0xA5));
+
+            // Invalid token fails cleanly.
+            assert_eq!(GetUserProfileDirectoryW(std::ptr::null_mut(), buf.as_mut_ptr(), &mut sz), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_HANDLE);
+            assert!(handles::close(tok));
+        }
+    }
+
+    #[test]
+    fn registry_notify_change_async_subtree_and_close() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, WaitForSingleObject};
+        unsafe {
+            let hkcu = 0xFFFF_FFFF_8000_0001usize as HANDLE;
+            let root_sub = crate::strings::to_wide_z("Software\\PortFactoryNotifyTest");
+            let mut hroot = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(hkcu, root_sub.as_ptr(), 0, std::ptr::null_mut(), 0, 0x2001F, std::ptr::null_mut(), &mut hroot, std::ptr::null_mut()),
+                ERROR_SUCCESS
+            );
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            // Watch subtree for value changes (LAST_SET).
+            assert_eq!(RegNotifyChangeKeyValue(hroot, TRUE, REG_NOTIFY_CHANGE_LAST_SET, ev, TRUE), ERROR_SUCCESS);
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT);
+
+            // Creating a subkey fires NAME, not LAST_SET -> event stays unsignaled.
+            let child_sub = crate::strings::to_wide_z("Child");
+            let mut hchild = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(hroot, child_sub.as_ptr(), 0, std::ptr::null_mut(), 0, 0x2001F, std::ptr::null_mut(), &mut hchild, std::ptr::null_mut()),
+                ERROR_SUCCESS
+            );
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT);
+
+            // Setting a value on the child triggers subtree LAST_SET watcher!
+            let val_name = crate::strings::to_wide_z("Tick");
+            let v = 7u32;
+            assert_eq!(RegSetValueExW(hchild, val_name.as_ptr(), 0, REG_DWORD, &v as *const u32 as *const u8, 4), ERROR_SUCCESS);
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+
+            // Synchronous mode unblocks when key is closed from another thread.
+            assert_eq!(ResetEvent(ev), TRUE);
+            let hroot_val = hroot as usize;
+            let sync_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sync_done2 = Arc::clone(&sync_done);
+            let th = std::thread::spawn(move || {
+                let rc = RegNotifyChangeKeyValue(hroot_val as HANDLE, FALSE, REG_NOTIFY_CHANGE_NAME, std::ptr::null_mut(), FALSE);
+                assert_eq!(rc, ERROR_SUCCESS);
+                sync_done2.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            assert!(!sync_done.load(Ordering::Acquire));
+            assert_eq!(RegCloseKey(hroot), ERROR_SUCCESS);
+            th.join().unwrap();
+            assert!(sync_done.load(Ordering::Acquire));
+
+            assert_eq!(RegCloseKey(hchild), ERROR_SUCCESS);
+            let _ = RegDeleteTreeW(hkcu, root_sub.as_ptr());
+            assert_eq!(CloseHandle(ev), TRUE);
+        }
+    }
+
+    #[test]
+    fn registry_create_key_intermediate_notify_direct_subtree_and_reopen() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, WaitForSingleObject};
+        unsafe {
+            let hkcu = 0xFFFF_FFFF_8000_0001usize as HANDLE;
+            let parent_sub = crate::strings::to_wide_z("Software\\PortFactoryMultiLevelParent");
+            let _ = RegDeleteTreeW(hkcu, parent_sub.as_ptr());
+            let mut hparent = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hkcu,
+                    parent_sub.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hparent,
+                    std::ptr::null_mut(),
+                ),
+                ERROR_SUCCESS
+            );
+            let root_name = crate::strings::to_wide_z("Root");
+            let mut hroot = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hparent,
+                    root_name.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hroot,
+                    std::ptr::null_mut(),
+                ),
+                ERROR_SUCCESS
+            );
+
+            // Auto-reset events so a single signal is consumed once (proving one-shot deduplication).
+            let ev_root_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            let ev_root_subtree = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            let ev_parent_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            assert!(!ev_root_direct.is_null() && !ev_root_subtree.is_null() && !ev_parent_direct.is_null());
+
+            // 1. Creating two missing levels together (`Mid\Leaf`) under `Root`:
+            //    - `Root` direct watcher MUST fire (direct child `Mid` was created), once.
+            //    - `Root` subtree watcher MUST fire, once (deduplicated across Mid + Leaf).
+            //    - `Parent` direct watcher MUST NOT fire (no direct child of `Parent` was created).
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, FALSE, REG_NOTIFY_CHANGE_NAME, ev_root_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, TRUE, REG_NOTIFY_CHANGE_NAME, ev_root_subtree, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hparent, FALSE, REG_NOTIFY_CHANGE_NAME, ev_parent_direct, TRUE),
+                ERROR_SUCCESS
+            );
+
+            let two_levels = crate::strings::to_wide_z("Mid\\Leaf");
+            let mut hleaf = std::ptr::null_mut();
+            let mut disp = 0u32;
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    two_levels.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_parent_direct, 0), WAIT_TIMEOUT);
+
+            // 2. Reopening existing `Mid\Leaf` (both W and A) is a no-op: fires NO watchers.
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, FALSE, REG_NOTIFY_CHANGE_NAME, ev_root_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, TRUE, REG_NOTIFY_CHANGE_NAME, ev_root_subtree, TRUE),
+                ERROR_SUCCESS
+            );
+            let mut hreopen_w = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    two_levels.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hreopen_w,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_OPENED_EXISTING_KEY);
+            let mut hreopen_a = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExA(
+                    hroot,
+                    b"Mid\\Leaf\0".as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hreopen_a,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_OPENED_EXISTING_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_TIMEOUT);
+
+            // 3. Creating a grandchild (`Mid\Leaf2`) when `Mid` already exists:
+            //    - `Root` direct watcher MUST NOT fire!
+            //    - `Root` subtree watcher MUST fire!
+            //    - `Mid` direct watcher MUST fire!
+            let mid_w = crate::strings::to_wide_z("Mid");
+            let mut hmid = std::ptr::null_mut();
+            assert_eq!(RegOpenKeyExW(hroot, mid_w.as_ptr(), 0, 0x2001F, &mut hmid), ERROR_SUCCESS);
+            let ev_mid_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            assert!(!ev_mid_direct.is_null());
+            assert_eq!(
+                RegNotifyChangeKeyValue(hmid, FALSE, REG_NOTIFY_CHANGE_NAME, ev_mid_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            let leaf2_w = crate::strings::to_wide_z("Mid\\Leaf2");
+            let mut hleaf2 = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    leaf2_w.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf2,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_mid_direct, 0), WAIT_OBJECT_0);
+
+            // 4. RegCreateKeyExA creating two missing levels together (`MidA\LeafA`) shares
+            //    the exact same intermediate notification path and wakes `ev_root_direct` once!
+            let mut hleaf_a = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExA(
+                    hroot,
+                    b"MidA\\LeafA\0".as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf_a,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_parent_direct, 0), WAIT_TIMEOUT);
+
+            // Cleanup.
+            let _ = ResetEvent(ev_parent_direct);
+            assert_eq!(RegCloseKey(hleaf_a), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hleaf2), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hmid), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hreopen_a), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hreopen_w), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hleaf), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hroot), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hparent), ERROR_SUCCESS);
+            let _ = RegDeleteTreeW(hkcu, parent_sub.as_ptr());
+            assert_eq!(CloseHandle(ev_mid_direct), TRUE);
+            assert_eq!(CloseHandle(ev_parent_direct), TRUE);
+            assert_eq!(CloseHandle(ev_root_subtree), TRUE);
+            assert_eq!(CloseHandle(ev_root_direct), TRUE);
+        }
+    }
+
+    #[test]
+    fn user_mode_service_dispatch_control_and_status() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+
+        static STOP_EV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        static LAST_CTRL: AtomicU32 = AtomicU32::new(0);
+        static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
+        static STATUS_HANDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        unsafe extern "win64" fn test_ctrl_ex(ctrl: u32, _ev_ty: u32, _ev_data: *mut c_void, ctx: *mut c_void) -> u32 {
+            assert_eq!(ctx as usize, 0xCAFE);
+            LAST_CTRL.store(ctrl, Ordering::Release);
+            HANDLER_RAN.store(true, Ordering::Release);
+            if ctrl == SERVICE_CONTROL_STOP {
+                let sh = STATUS_HANDLE.load(Ordering::Acquire) as HANDLE;
+                let st = SERVICE_STATUS {
+                    dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                    dwCurrentState: SERVICE_STOPPED,
+                    dwControlsAccepted: 0,
+                    ..Default::default()
+                };
+                SetServiceStatus(sh, &st);
+                if let Some(&ev) = STOP_EV.get() {
+                    crate::kernel32::threads::SetEvent(ev as HANDLE);
+                }
+            }
+            ERROR_SUCCESS
+        }
+
+        unsafe extern "win64" fn test_service_main(argc: u32, argv: *mut LPWSTR) {
+            assert_eq!(argc, 1);
+            let svc_name = std::ptr::read_unaligned(argv);
+            let sh = RegisterServiceCtrlHandlerExW(svc_name, test_ctrl_ex as *const c_void, 0xCAFE as *mut c_void);
+            assert!(!sh.is_null());
+            STATUS_HANDLE.store(sh as usize, Ordering::Release);
+            let running = SERVICE_STATUS {
+                dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                dwCurrentState: 4, // SERVICE_RUNNING
+                dwControlsAccepted: SERVICE_ACCEPT_STOP,
+                ..Default::default()
+            };
+            assert_eq!(SetServiceStatus(sh, &running), TRUE);
+            if let Some(&ev) = STOP_EV.get() {
+                crate::kernel32::threads::WaitForSingleObject(ev as HANDLE, 5000);
+            }
+        }
+
+        unsafe {
+            let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let _ = STOP_EV.set(ev as usize);
+            LAST_CTRL.store(0, Ordering::Release);
+            HANDLER_RAN.store(false, Ordering::Release);
+
+            let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), 0xF003F);
+            assert!(!scm.is_null());
+            // Remote machine rejected honestly.
+            let remote = crate::strings::to_wide_z("\\\\REMOTE-HOST");
+            assert!(OpenSCManagerW(remote.as_ptr(), std::ptr::null(), 0xF003F).is_null());
+
+            let svc_name = crate::strings::to_wide_z("PortFactoryTestSvc");
+            let bin_path = crate::strings::to_wide_z("C:\\Test\\svc.exe");
+            let hsvc = CreateServiceW(
+                scm,
+                svc_name.as_ptr(),
+                svc_name.as_ptr(),
+                0xF01FF,
+                SERVICE_WIN32_OWN_PROCESS,
+                3,
+                1,
+                bin_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!hsvc.is_null());
+
+            // ChangeServiceConfig2W + QueryServiceConfig2W description roundtrip (aligned).
+            let desc = crate::strings::to_wide_z("Test Service Description");
+            let desc_ptr = desc.as_ptr();
+            assert_eq!(ChangeServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, &desc_ptr as *const _ as *const c_void), TRUE);
+            let mut need = 0u32;
+            assert_eq!(QueryServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            let mut dbuf = vec![0u8; need as usize];
+            assert_eq!(QueryServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, dbuf.as_mut_ptr(), need, &mut need), TRUE);
+            let out_ptr = std::ptr::read_unaligned(dbuf.as_ptr() as *const LPCWSTR);
+            assert_eq!(crate::strings::from_wide(out_ptr), "Test Service Description");
+
+            // Odd-address + Unicode (including surrogate pair) tests for QueryServiceConfig2W & QueryServiceConfigW.
+            let u_svc_name = crate::strings::to_wide_z("PortFactoryUnicodeSvc");
+            let u_bin_str = "C:\\Test\\svc_\u{03A9}_\u{1F680}.exe";
+            let u_disp_str = "Display \u{03A9} \u{1F680}";
+            let u_desc_str = "Desc \u{03A9} \u{1F680}";
+            let u_bin_w = crate::strings::to_wide_z(u_bin_str);
+            let u_disp_w = crate::strings::to_wide_z(u_disp_str);
+            let u_desc_w = crate::strings::to_wide_z(u_desc_str);
+            let husvc = CreateServiceW(
+                scm,
+                u_svc_name.as_ptr(),
+                u_disp_w.as_ptr(),
+                0xF01FF,
+                SERVICE_WIN32_OWN_PROCESS,
+                2, // SERVICE_AUTO_START
+                1, // SERVICE_ERROR_NORMAL
+                u_bin_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!husvc.is_null());
+            let u_desc_ptr = u_desc_w.as_ptr();
+            assert_eq!(ChangeServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, &u_desc_ptr as *const _ as *const c_void), TRUE);
+
+            // QueryServiceConfig2W: size probe, undersize, exact odd-address buffer with sentinels, and aligned control.
+            let desc_units = u_desc_str.encode_utf16().count() + 1;
+            let expected_desc_need = (8 + desc_units * 2) as u32;
+            let mut desc_need = 0u32;
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, std::ptr::null_mut(), 0, &mut desc_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(desc_need, expected_desc_need);
+
+            let (mut odd_d2_backing, odd_d2_off) = odd_sentinel_buf(desc_need as usize);
+            let odd_d2_ptr = odd_d2_backing.as_mut_ptr().add(odd_d2_off);
+            assert_eq!((odd_d2_ptr as usize) & 1, 1);
+            let mut got_need = 0u32;
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, odd_d2_ptr, desc_need - 1, &mut got_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(got_need, expected_desc_need);
+            assert!(odd_d2_backing.iter().all(|&b| b == 0xA5));
+
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, odd_d2_ptr, desc_need, &mut got_need), TRUE);
+            assert_eq!(got_need, expected_desc_need);
+            let odd_desc_out = std::ptr::read_unaligned(odd_d2_ptr as *const *const u16);
+            assert_eq!(odd_desc_out as usize, odd_d2_ptr as usize + 8);
+            let got_desc_units = read_unaligned_utf16_z(odd_desc_out, desc_units);
+            assert_eq!(got_desc_units, u_desc_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(std::ptr::read_unaligned(odd_desc_out.add(desc_units - 1)), 0u16);
+            assert_eq!(String::from_utf16(&got_desc_units).unwrap(), u_desc_str);
+            assert!(odd_d2_backing[..odd_d2_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_d2_backing[odd_d2_off + desc_need as usize..].iter().all(|&b| b == 0xA5));
+
+            // QueryServiceConfigW: size probe, undersize, exact odd-address buffer with sentinels, and aligned control.
+            let bin_units = u_bin_str.encode_utf16().count() + 1;
+            let disp_units = u_disp_str.encode_utf16().count() + 1;
+            let expected_cfg_need = (64 + (bin_units + disp_units) * 2) as u32;
+            let mut cfg_need = 0u32;
+            assert_eq!(QueryServiceConfigW(husvc, std::ptr::null_mut(), 0, &mut cfg_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(cfg_need, expected_cfg_need);
+
+            let (mut odd_cfg_backing, odd_cfg_off) = odd_sentinel_buf(cfg_need as usize);
+            let odd_cfg_ptr = odd_cfg_backing.as_mut_ptr().add(odd_cfg_off);
+            assert_eq!((odd_cfg_ptr as usize) & 1, 1);
+            let mut cfg_got_need = 0u32;
+            assert_eq!(QueryServiceConfigW(husvc, odd_cfg_ptr, cfg_need - 1, &mut cfg_got_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(cfg_got_need, expected_cfg_need);
+            assert!(odd_cfg_backing.iter().all(|&b| b == 0xA5));
+
+            assert_eq!(QueryServiceConfigW(husvc, odd_cfg_ptr, cfg_need, &mut cfg_got_need), TRUE);
+            assert_eq!(cfg_got_need, expected_cfg_need);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr as *const u32), SERVICE_WIN32_OWN_PROCESS);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr.add(4) as *const u32), 2);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr.add(8) as *const u32), 1);
+            let odd_bin_out = std::ptr::read_unaligned(odd_cfg_ptr.add(16) as *const *const u16);
+            let odd_disp_out = std::ptr::read_unaligned(odd_cfg_ptr.add(56) as *const *const u16);
+            assert_eq!(odd_bin_out as usize, odd_cfg_ptr as usize + 64);
+            assert_eq!(odd_disp_out as usize, odd_cfg_ptr as usize + 64 + bin_units * 2);
+            let got_bin_units = read_unaligned_utf16_z(odd_bin_out, bin_units);
+            let got_disp_units = read_unaligned_utf16_z(odd_disp_out, disp_units);
+            assert_eq!(got_bin_units, u_bin_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(got_disp_units, u_disp_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(std::ptr::read_unaligned(odd_bin_out.add(bin_units - 1)), 0u16);
+            assert_eq!(std::ptr::read_unaligned(odd_disp_out.add(disp_units - 1)), 0u16);
+            assert_eq!(String::from_utf16(&got_bin_units).unwrap(), u_bin_str);
+            assert_eq!(String::from_utf16(&got_disp_units).unwrap(), u_disp_str);
+            assert!(odd_cfg_backing[..odd_cfg_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_cfg_backing[odd_cfg_off + cfg_need as usize..].iter().all(|&b| b == 0xA5));
+
+            // Aligned QueryServiceConfigW control.
+            let mut aligned_cfg = vec![0u64; (cfg_need as usize).div_ceil(8)];
+            let aligned_ptr = aligned_cfg.as_mut_ptr() as *mut u8;
+            assert_eq!(QueryServiceConfigW(husvc, aligned_ptr, cfg_need, &mut cfg_got_need), TRUE);
+            let al_bin_out = std::ptr::read_unaligned(aligned_ptr.add(16) as *const *const u16);
+            let al_disp_out = std::ptr::read_unaligned(aligned_ptr.add(56) as *const *const u16);
+            assert_eq!(String::from_utf16(&read_unaligned_utf16_z(al_bin_out, bin_units)).unwrap(), u_bin_str);
+            assert_eq!(String::from_utf16(&read_unaligned_utf16_z(al_disp_out, disp_units)).unwrap(), u_disp_str);
+
+            assert_eq!(DeleteService(husvc), TRUE);
+            assert_eq!(CloseServiceHandle(husvc), TRUE);
+
+            // Start dispatcher on background thread, verify running status, send STOP via ControlService.
+            let dispatcher = std::thread::spawn(move || {
+                let mut name_w = crate::strings::to_wide_z("PortFactoryTestSvc");
+                let table = [
+                    SERVICE_TABLE_ENTRYW {
+                        lpServiceName: name_w.as_mut_ptr(),
+                        lpServiceProc: test_service_main as *const () as usize,
+                    },
+                    SERVICE_TABLE_ENTRYW {
+                        lpServiceName: std::ptr::null_mut(),
+                        lpServiceProc: 0,
+                    },
+                ];
+                assert_eq!(StartServiceCtrlDispatcherW(table.as_ptr()), TRUE);
+            });
+
+            // Wait until service reports SERVICE_RUNNING (4).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut st = SERVICE_STATUS::default();
+            while std::time::Instant::now() < deadline {
+                assert_eq!(QueryServiceStatus(hsvc, &mut st), TRUE);
+                if st.dwCurrentState == 4 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(st.dwCurrentState, 4);
+
+            // Unsupported PAUSE control is rejected because only ACCEPT_STOP is set.
+            assert_eq!(ControlService(hsvc, SERVICE_CONTROL_PAUSE, &mut st), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_SERVICE_CONTROL);
+
+            // Send STOP control -> handler runs -> status becomes SERVICE_STOPPED -> dispatcher returns!
+            assert_eq!(ControlService(hsvc, SERVICE_CONTROL_STOP, &mut st), TRUE);
+            assert!(HANDLER_RAN.load(Ordering::Acquire));
+            assert_eq!(LAST_CTRL.load(Ordering::Acquire), SERVICE_CONTROL_STOP);
+            assert_eq!(st.dwCurrentState, SERVICE_STOPPED);
+            dispatcher.join().unwrap();
+
+            assert_eq!(DeleteService(hsvc), TRUE);
+            assert_eq!(CloseServiceHandle(hsvc), TRUE);
+            assert_eq!(CloseServiceHandle(scm), TRUE);
+            let _ = crate::kernel32::threads::CloseHandle(ev);
         }
     }
 }

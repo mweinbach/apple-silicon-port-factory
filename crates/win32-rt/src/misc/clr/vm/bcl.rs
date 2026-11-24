@@ -349,7 +349,7 @@ pub(crate) fn dispatch_intrinsic(
         }
         BclIntrinsic::EnvGetMachineName => Ok(Some(CilVal::Obj(vm.alloc_string("APPLE-SILICON")))),
         BclIntrinsic::EnvGetUserName => {
-            let u = std::env::var("USER").unwrap_or_else(|_| "player".into());
+            let u = crate::process::get_env("USERNAME").unwrap_or_else(|| "player".into());
             Ok(Some(CilVal::Obj(vm.alloc_string(&u))))
         }
         BclIntrinsic::EnvGetEnvVar => {
@@ -357,9 +357,12 @@ pub(crate) fn dispatch_intrinsic(
                 .heap
                 .read_string(args.first().map_or(0, |v| v.as_obj()))
                 .unwrap_or_default();
-            match std::env::var(&key) {
-                Ok(val) => Ok(Some(CilVal::Obj(vm.alloc_string(&val)))),
-                Err(_) => Ok(Some(CilVal::Obj(0))),
+            if key.is_empty() {
+                return Ok(Some(CilVal::Obj(0)));
+            }
+            match crate::process::get_env(&key) {
+                Some(val) => Ok(Some(CilVal::Obj(vm.alloc_string(&val)))),
+                None => Ok(Some(CilVal::Obj(0))),
             }
         }
         BclIntrinsic::EnvSetEnvVar => {
@@ -368,14 +371,48 @@ pub(crate) fn dispatch_intrinsic(
                 .read_string(args.first().map_or(0, |v| v.as_obj()))
                 .unwrap_or_default();
             let val = vm.heap.read_string(args.get(1).map_or(0, |v| v.as_obj()));
-            if !key.is_empty() {
-                if let Some(v) = val {
-                    unsafe { std::env::set_var(&key, &v) };
-                } else {
-                    unsafe { std::env::remove_var(&key) };
-                }
+            if !key.is_empty() && !key.contains('=') {
+                // Route strictly through the virtual Windows process environment (never host std::env).
+                // On Windows/.NET, null or empty value deletes the variable.
+                let effective = val.as_deref().filter(|s| !s.is_empty());
+                crate::process::set_env(&key, effective);
             }
             Ok(None)
+        }
+        BclIntrinsic::EnvGetEnvVars => {
+            let vars = crate::process::env_vars();
+            let dict_vt = vm.classes[vm.core.dict_cls].mono_vtable;
+            let dict_obj = vm.heap.alloc_dictionary(dict_vt, vars.len());
+            let mut allocated = Vec::with_capacity(vars.len());
+            for (k, v) in vars {
+                let k_obj = vm.alloc_string(&k);
+                let v_obj = vm.alloc_string(&v);
+                let hash = vm
+                    .heap
+                    .string_hash_u64(k_obj)
+                    .map_or(k_obj as u64, |h| h ^ 0x517C_C1B7_2722_0A95);
+                allocated.push((hash, CilVal::Obj(k_obj), CilVal::Obj(v_obj)));
+            }
+            if let Some(HeapObjKind::Dictionary { entries, index }) =
+                vm.heap.get_managed_mut(dict_obj)
+            {
+                for (hash, k_val, v_val) in allocated {
+                    let ei = entries.len();
+                    entries.push((k_val, v_val));
+                    index.entry(hash).or_default().push(ei);
+                }
+            }
+            Ok(Some(CilVal::Obj(dict_obj)))
+        }
+        BclIntrinsic::EnvExpandEnvVars => {
+            let raw = vm.heap.read_string(args.first().map_or(0, |v| v.as_obj()));
+            match raw {
+                Some(s) => {
+                    let expanded = crate::kernel32::process::expand_env(&s);
+                    Ok(Some(CilVal::Obj(vm.alloc_string(&expanded))))
+                }
+                None => Ok(Some(CilVal::Obj(0))),
+            }
         }
         BclIntrinsic::EnvGetCommandLineArgs => {
             let items = vm.command_line_args.clone();

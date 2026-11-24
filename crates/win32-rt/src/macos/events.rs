@@ -184,7 +184,7 @@ pub(super) fn wheel_notches(ev: &NSEvent) -> (f64, f64) {
 mod tests {
     use super::*;
     use crate::types::HWND;
-    use crate::user32::{class, defproc, input as inp, message, window, wm, MSG};
+    use crate::user32::{class, input as inp, message, window, wm, MSG};
     use objc2::encode::{Encoding, RefEncode};
     use objc2::rc::Retained;
     use objc2::{msg_send, ClassType};
@@ -300,7 +300,7 @@ mod tests {
             let name = crate::strings::to_wide_z("Aw2TestNsEvents");
             let wc = class::WNDCLASS {
                 style: 0,
-                wndproc: defproc::DefWindowProcW as *const () as usize,
+                wndproc: crate::user32::WNDPROC_HANDLE_DEF_WINDOW_W,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,

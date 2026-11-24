@@ -502,13 +502,107 @@ struct DynTable {
 unsafe impl Send for DynTable {}
 static DYN_TABLES: Mutex<Vec<DynTable>> = Mutex::new(Vec::new());
 
+pub type GetRuntimeFunctionCallback =
+    unsafe extern "win64" fn(u64, *const c_void) -> *const RuntimeFunction;
+
+/// Typed callback target for dynamic unwind function-table callbacks.
+///
+/// Guest registrations (`RtlInstallFunctionTableCallback`) can ONLY construct
+/// [`CallbackTarget::Guest`], validated against executable guest provenance at both
+/// registration and use. Typed native host callbacks can ONLY be registered internally via
+/// [`install_host_function_table_callback`] and are unreachable from guest pointers.
+#[derive(Clone, Copy)]
+enum CallbackTarget {
+    Guest(usize),
+    Host(GetRuntimeFunctionCallback),
+}
+
+#[derive(Clone, Copy)]
+struct DynCallbackTable {
+    table_id: u64,
+    base: u64,
+    len: u32,
+    target: CallbackTarget,
+    context: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    guest_image_backed: bool,
+}
+static DYN_CALLBACKS: Mutex<Vec<DynCallbackTable>> = Mutex::new(Vec::new());
+
+#[inline]
+fn is_in_test_image(addr: u64) -> bool {
+    let t = TEST_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    !t.is_empty() && t.iter().any(|&(b, s)| addr >= b && addr < b.saturating_add(s))
+}
+
+#[inline]
+fn is_validated_guest_pe_code(addr: usize) -> bool {
+    crate::try_loader().is_some_and(|l| l.is_guest_pe_code(addr))
+        || is_in_test_image(addr as u64)
+}
+
+/// Returns `true` strictly if `addr` is a validated executable guest target:
+/// either inside an executable section of a real mapped guest PE image (excluding
+/// synthetic builtin DLLs, PE headers, and data sections) or inside committed,
+/// executable guest private/mapped virtual memory (`VirtualAlloc` / `MapViewOfFile`).
+/// Never accepts arbitrary host text, dylibs, heap/stack addresses, or non-executable pages.
+#[inline]
+fn is_validated_guest_callback_target(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    if is_validated_guest_pe_code(addr) {
+        return true;
+    }
+    crate::kernel32::memory::is_guest_exec_vm_addr(addr)
+}
+
+/// Internal host-only registration for a strongly-typed Rust `GetRuntimeFunctionCallback`.
+/// Not exported to Windows guest code and completely separate from guest raw-pointer
+/// validation in [`RtlInstallFunctionTableCallback`]. Remove via [`RtlDeleteFunctionTable`].
+pub fn install_host_function_table_callback(
+    table_id: u64,
+    base: u64,
+    len: u32,
+    cb: GetRuntimeFunctionCallback,
+    ctx: usize,
+) -> bool {
+    if (table_id & 3) != 3 || len == 0 || base.checked_add(len as u64).is_none() {
+        return false;
+    }
+    let mut cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    if cbs.iter().any(|d| d.table_id == table_id) {
+        return false;
+    }
+    cbs.push(DynCallbackTable {
+        table_id,
+        base,
+        len,
+        target: CallbackTarget::Host(cb),
+        context: ctx,
+        guest_image_backed: false,
+    });
+    true
+}
+
 pub unsafe extern "win64" fn RtlAddFunctionTable(table: *const RuntimeFunction, count: u32, base: u64) -> u8 {
-    DYN_TABLES.lock().unwrap().push(DynTable { table, count, base });
+    if table.is_null() || count == 0 {
+        return 0;
+    }
+    DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner()).push(DynTable { table, count, base });
     1
 }
 
 pub unsafe extern "win64" fn RtlDeleteFunctionTable(table: *const RuntimeFunction) -> u8 {
-    let mut t = DYN_TABLES.lock().unwrap();
+    let raw = table as u64;
+    // Windows marks callback table identifiers with both low bits set (TableIdentifier & 3 == 3).
+    if (raw & 3) == 3 {
+        let mut cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = cbs.len();
+        cbs.retain(|d| d.table_id != raw);
+        return (cbs.len() != n) as u8;
+    }
+    let mut t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     let n = t.len();
     t.retain(|d| d.table != table);
     (t.len() != n) as u8
@@ -525,18 +619,18 @@ pub unsafe extern "win64" fn RtlAddGrowableFunctionTable(
     if dynamic_table.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
-    DYN_TABLES.lock().unwrap().push(DynTable {
+    DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner()).push(DynTable {
         table,
         count: entry_count,
         base: range_base as u64,
     });
-    *dynamic_table = table as *mut c_void;
+    std::ptr::write_unaligned(dynamic_table, table as *mut c_void);
     0 // STATUS_SUCCESS
 }
 
 pub unsafe extern "win64" fn RtlGrowFunctionTable(dynamic_table: *mut c_void, new_entry_count: u32) {
     let table = dynamic_table as *const RuntimeFunction;
-    let mut t = DYN_TABLES.lock().unwrap();
+    let mut t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(d) = t.iter_mut().find(|d| d.table == table) {
         d.count = new_entry_count;
     }
@@ -547,29 +641,138 @@ pub unsafe extern "win64" fn RtlDeleteGrowableFunctionTable(dynamic_table: *mut 
 }
 
 pub unsafe extern "win64" fn RtlInstallFunctionTableCallback(
-    _table_id: u64,
-    _base: u64,
-    _len: u32,
-    _cb: *const c_void,
-    _ctx: *const c_void,
+    table_id: u64,
+    base: u64,
+    len: u32,
+    cb: *const c_void,
+    ctx: *const c_void,
     _dll: *const u16,
 ) -> u8 {
-    stub!("function table callbacks not supported (JIT code will not unwind)");
+    // Windows requires the two low-order bits of TableIdentifier to be set, non-zero range
+    // without overflow, and a non-null callback pointer.
+    if (table_id & 3) != 3 || len == 0 || cb.is_null() || base.checked_add(len as u64).is_none() {
+        return 0;
+    }
+    let cb_addr = cb as usize;
+    // Security boundary: guest registrations must point to validated executable guest code
+    // (real guest PE executable section or committed executable guest VM). Never treat an
+    // unrecognized or non-guest pointer as authority to invoke a native host address.
+    if !is_validated_guest_callback_target(cb_addr) {
+        log::warn!(
+            "RtlInstallFunctionTableCallback: rejecting unvalidated or non-executable callback {cb_addr:#x} for table {table_id:#x}"
+        );
+        return 0;
+    }
+    let guest_image_backed = is_validated_guest_pe_code(cb_addr);
+    let mut cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    if cbs.iter().any(|d| d.table_id == table_id) {
+        return 0;
+    }
+    cbs.push(DynCallbackTable {
+        table_id,
+        base,
+        len,
+        target: CallbackTarget::Guest(cb_addr),
+        context: ctx as usize,
+        guest_image_backed,
+    });
     1
+}
+
+thread_local! {
+    static ACTIVE_CALLBACK_LOOKUPS: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ActiveCallbackGuard;
+impl Drop for ActiveCallbackGuard {
+    fn drop(&mut self) {
+        ACTIVE_CALLBACK_LOOKUPS.with(|s| {
+            let _ = s.borrow_mut().pop();
+        });
+    }
+}
+
+unsafe fn invoke_function_table_callback(entry: DynCallbackTable, pc: u64) -> *const RuntimeFunction {
+    match entry.target {
+        CallbackTarget::Guest(cb_addr) => {
+            // Re-validate executable guest provenance at use time in case memory was freed,
+            // made non-executable, or a guest DLL was unloaded after registration.
+            if !is_validated_guest_callback_target(cb_addr) {
+                log::warn!(
+                    "RtlLookupFunctionEntry: refusing stale or non-executable guest callback {cb_addr:#x} for table {:#x}",
+                    entry.table_id
+                );
+                return std::ptr::null();
+            }
+            // On non-x86_64 hosts (e.g. ARM64), require an active x86-64 guest translator
+            // dispatcher rather than falling through to direct native call transmute.
+            #[cfg(not(target_arch = "x86_64"))]
+            if !crate::has_guest_dispatcher() {
+                log::warn!(
+                    "RtlLookupFunctionEntry: refusing guest callback {cb_addr:#x} without guest translator dispatcher"
+                );
+                return std::ptr::null();
+            }
+            crate::call_guest8_seh(
+                cb_addr,
+                pc,
+                entry.context as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ) as *const RuntimeFunction
+        }
+        CallbackTarget::Host(f) => f(pc, entry.context as *const c_void),
+    }
 }
 
 pub fn lookup_function_entry(pc: u64) -> Option<(u64, *const RuntimeFunction)> {
     {
-        let t = DYN_TABLES.lock().unwrap();
+        let t = DYN_TABLES.lock().unwrap_or_else(|e| e.into_inner());
         for d in t.iter() {
-            if pc < d.base || pc - d.base > u32::MAX as u64 {
+            if d.table.is_null() || d.count == 0 || pc < d.base || pc - d.base > u32::MAX as u64 {
                 continue;
             }
             let rva = (pc - d.base) as u32;
-            let s = unsafe { std::slice::from_raw_parts(d.table, d.count as usize) };
-            if let Some(f) = s.iter().find(|f| rva >= f.begin_rva && rva < f.end_rva) {
-                return Some((d.base, f as *const _));
+            for i in 0..d.count as usize {
+                let p = unsafe { d.table.add(i) };
+                let f = unsafe { std::ptr::read_unaligned(p) };
+                if rva >= f.begin_rva && rva < f.end_rva {
+                    return Some((d.base, p));
+                }
             }
+        }
+    }
+    let matching_callbacks: Vec<DynCallbackTable> = {
+        let cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        cbs.iter()
+            .copied()
+            .filter(|d| pc >= d.base && pc < d.base.saturating_add(d.len as u64))
+            .collect()
+    };
+    const MAX_CALLBACK_REENTRY_DEPTH: usize = 16;
+    for entry in matching_callbacks {
+        let can_enter = ACTIVE_CALLBACK_LOOKUPS.with(|s| {
+            let mut active = s.borrow_mut();
+            if active.len() >= MAX_CALLBACK_REENTRY_DEPTH
+                || active.contains(&(entry.table_id, pc))
+            {
+                return false;
+            }
+            active.push((entry.table_id, pc));
+            true
+        });
+        if !can_enter {
+            continue;
+        }
+        let _guard = ActiveCallbackGuard;
+        let rf = unsafe { invoke_function_table_callback(entry, pc) };
+        if !rf.is_null() {
+            return Some((entry.base, rf));
         }
     }
     crate::try_loader()?.lookup_function_entry(pc)
@@ -579,7 +782,7 @@ pub unsafe extern "win64" fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, _hi
     match lookup_function_entry(pc) {
         Some((b, f)) => {
             if !base.is_null() {
-                *base = b;
+                std::ptr::write_unaligned(base, b);
             }
             f
         }
@@ -2753,4 +2956,678 @@ pub unsafe extern "win64" fn dispatch_hardware_exception(rec: *mut ExceptionReco
     let mut c = *ctx;
     dispatch_exception(&mut *rec, &mut c);
     restore_context(&c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn rtl_install_function_table_callback_lookup_delete_out_of_range_and_reentry() {
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static LAST_PC: AtomicUsize = AtomicUsize::new(0);
+        static LAST_CTX: AtomicUsize = AtomicUsize::new(0);
+        static NESTED_BASE_SEEN: AtomicUsize = AtomicUsize::new(0);
+        static NESTED_RF_SEEN: AtomicUsize = AtomicUsize::new(0);
+        static SELF_REENTRY_RF: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static DYNAMIC_NESTED_OK: AtomicUsize = AtomicUsize::new(0);
+
+        static RF_PRIMARY: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x100,
+            end_rva: 0x200,
+            unwind_rva: 0x1000,
+        };
+        static RF_SECONDARY: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x040,
+            end_rva: 0x080,
+            unwind_rva: 0x2000,
+        };
+        static RF_TEMP: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x010,
+            end_rva: 0x050,
+            unwind_rva: 0x3000,
+        };
+
+        const BASE_PRIMARY: u64 = 0x7000_0000;
+        const LEN_PRIMARY: u32 = 0x4000;
+        const TID_PRIMARY: u64 = 0x7000_0000 | 3;
+
+        const BASE_SECONDARY: u64 = 0x7001_0000;
+        const LEN_SECONDARY: u32 = 0x2000;
+        const TID_SECONDARY: u64 = 0x7001_0000 | 3;
+
+        const BASE_TEMP: u64 = 0x7002_0000;
+        const LEN_TEMP: u32 = 0x1000;
+        const TID_TEMP: u64 = 0x7002_0000 | 3;
+
+        unsafe extern "win64" fn temp_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            if pc == BASE_TEMP + 0x20 && ctx as usize == 0x55AA {
+                &RF_TEMP
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe extern "win64" fn secondary_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            if pc >= BASE_SECONDARY + 0x40 && pc < BASE_SECONDARY + 0x80 && ctx as usize == 0x2222 {
+                &RF_SECONDARY
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe extern "win64" fn primary_cb(pc: u64, ctx: *const c_void) -> *const RuntimeFunction {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            LAST_PC.store(pc as usize, Ordering::SeqCst);
+            LAST_CTX.store(ctx as usize, Ordering::SeqCst);
+
+            // Reentry test: while inside callback (locks MUST be dropped!), perform:
+            // 1) lookup into another callback table,
+            // 2) install + lookup + delete of a temporary callback table,
+            // 3) self-reentry lookup on our own exact (table_id, pc) without deadlock or recursion blowup.
+            if ctx as usize == 0xCAFE_BABE {
+                let mut nested_base = 0u64;
+                let nested_rf = RtlLookupFunctionEntry(
+                    BASE_SECONDARY + 0x50,
+                    &mut nested_base,
+                    std::ptr::null_mut(),
+                );
+                NESTED_BASE_SEEN.store(nested_base as usize, Ordering::SeqCst);
+                NESTED_RF_SEEN.store(nested_rf as usize, Ordering::SeqCst);
+
+                let installed = install_host_function_table_callback(
+                    TID_TEMP,
+                    BASE_TEMP,
+                    LEN_TEMP,
+                    temp_cb,
+                    0x55AA,
+                );
+                let mut tb = 0u64;
+                let trf = RtlLookupFunctionEntry(BASE_TEMP + 0x20, &mut tb, std::ptr::null_mut());
+                let deleted = RtlDeleteFunctionTable(TID_TEMP as *const RuntimeFunction);
+                if installed
+                    && tb == BASE_TEMP
+                    && trf == (&RF_TEMP as *const RuntimeFunction)
+                    && deleted == 1
+                {
+                    DYNAMIC_NESTED_OK.store(1, Ordering::SeqCst);
+                }
+
+                let self_rf = RtlLookupFunctionEntry(pc, std::ptr::null_mut(), std::ptr::null_mut());
+                SELF_REENTRY_RF.store(self_rf as usize, Ordering::SeqCst);
+            }
+
+            if pc >= BASE_PRIMARY + 0x100 && pc < BASE_PRIMARY + 0x200 {
+                &RF_PRIMARY
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        unsafe {
+            CALL_COUNT.store(0, Ordering::SeqCst);
+            LAST_PC.store(0, Ordering::SeqCst);
+            LAST_CTX.store(0, Ordering::SeqCst);
+            NESTED_BASE_SEEN.store(0, Ordering::SeqCst);
+            NESTED_RF_SEEN.store(0, Ordering::SeqCst);
+            SELF_REENTRY_RF.store(usize::MAX, Ordering::SeqCst);
+            DYNAMIC_NESTED_OK.store(0, Ordering::SeqCst);
+
+            // 1. Validation on the internal typed host route: low 2 bits == 3, len > 0, no overflow.
+            assert!(!install_host_function_table_callback(
+                BASE_PRIMARY, // low 2 bits == 0 -> rejected
+                BASE_PRIMARY,
+                LEN_PRIMARY,
+                primary_cb,
+                0,
+            ));
+            assert!(!install_host_function_table_callback(
+                TID_PRIMARY,
+                BASE_PRIMARY,
+                0, // zero length -> rejected
+                primary_cb,
+                0,
+            ));
+            assert!(!install_host_function_table_callback(
+                TID_PRIMARY,
+                u64::MAX - 4,
+                0x100, // base + len overflows -> rejected
+                primary_cb,
+                0,
+            ));
+
+            // 2. Install primary & secondary host callback ranges; duplicate TableIdentifier is rejected.
+            assert!(install_host_function_table_callback(
+                TID_PRIMARY,
+                BASE_PRIMARY,
+                LEN_PRIMARY,
+                primary_cb,
+                0x1111,
+            ));
+            assert!(!install_host_function_table_callback(
+                TID_PRIMARY,
+                BASE_PRIMARY,
+                LEN_PRIMARY,
+                primary_cb,
+                0x1111,
+            ));
+            assert!(install_host_function_table_callback(
+                TID_SECONDARY,
+                BASE_SECONDARY,
+                LEN_SECONDARY,
+                secondary_cb,
+                0x2222,
+            ));
+
+            // 3. Out-of-range lookups return NULL and must NOT invoke the callback.
+            let mut out_base = 0xDEAD_BEEFu64;
+            assert!(
+                RtlLookupFunctionEntry(BASE_PRIMARY - 1, &mut out_base, std::ptr::null_mut())
+                    .is_null()
+            );
+            assert!(
+                RtlLookupFunctionEntry(
+                    BASE_PRIMARY + LEN_PRIMARY as u64,
+                    &mut out_base,
+                    std::ptr::null_mut()
+                )
+                .is_null()
+            );
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 0);
+
+            // 4. In-range lookup invokes callback with exact (ControlPc, Context) and returns (entry, base).
+            let rf = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x120,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rf, &RF_PRIMARY as *const RuntimeFunction);
+            assert_eq!(out_base, BASE_PRIMARY);
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(LAST_PC.load(Ordering::SeqCst), (BASE_PRIMARY + 0x120) as usize);
+            assert_eq!(LAST_CTX.load(Ordering::SeqCst), 0x1111);
+
+            // In-range PC where callback returns NULL yields NULL.
+            let rf_none = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x010,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert!(rf_none.is_null());
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+
+            // 5. Delete primary and re-install with reentry context to verify lock-free reentry.
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 0);
+            assert!(
+                RtlLookupFunctionEntry(BASE_PRIMARY + 0x120, &mut out_base, std::ptr::null_mut())
+                    .is_null()
+            );
+            assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+
+            assert!(install_host_function_table_callback(
+                TID_PRIMARY,
+                BASE_PRIMARY,
+                LEN_PRIMARY,
+                primary_cb,
+                0xCAFE_BABE,
+            ));
+            let rf_re = RtlLookupFunctionEntry(
+                BASE_PRIMARY + 0x140,
+                &mut out_base,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rf_re, &RF_PRIMARY as *const RuntimeFunction);
+            assert_eq!(out_base, BASE_PRIMARY);
+            assert_eq!(NESTED_BASE_SEEN.load(Ordering::SeqCst), BASE_SECONDARY as usize);
+            assert_eq!(
+                NESTED_RF_SEEN.load(Ordering::SeqCst),
+                &RF_SECONDARY as *const RuntimeFunction as usize
+            );
+            assert_eq!(DYNAMIC_NESTED_OK.load(Ordering::SeqCst), 1);
+            assert_eq!(SELF_REENTRY_RF.load(Ordering::SeqCst), 0);
+
+            // Clean up all installed test tables.
+            assert_eq!(RtlDeleteFunctionTable(TID_PRIMARY as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_SECONDARY as *const RuntimeFunction), 1);
+        }
+    }
+
+    #[test]
+    fn rtl_install_function_table_callback_enforces_guest_provenance_and_dispatches_validated_guest() {
+        use crate::kernel32::memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+
+        static SENTINEL_HOST_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DISPATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static LAST_DISPATCH_VA: AtomicUsize = AtomicUsize::new(0);
+        static LAST_DISPATCH_PC: AtomicUsize = AtomicUsize::new(0);
+        static LAST_DISPATCH_CTX: AtomicUsize = AtomicUsize::new(0);
+        static GUEST_SELF_REENTRY_RF: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static GUEST_NESTED_RF: AtomicUsize = AtomicUsize::new(0);
+
+        static RF_VM: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x100,
+            end_rva: 0x200,
+            unwind_rva: 0x4000,
+        };
+        static RF_IMG: RuntimeFunction = RuntimeFunction {
+            begin_rva: 0x120,
+            end_rva: 0x180,
+            unwind_rva: 0x5000,
+        };
+
+        const BASE_REJECT: u64 = 0x7100_0000;
+        const LEN_REJECT: u32 = 0x1000;
+        const TID_REJECT: u64 = 0x7100_0000 | 3;
+
+        const BASE_GUEST_VM: u64 = 0x7101_0000;
+        const LEN_GUEST_VM: u32 = 0x2000;
+        const TID_GUEST_VM: u64 = 0x7101_0000 | 3;
+
+        const BASE_GUEST_IMG: u64 = 0x7102_0000;
+        const LEN_GUEST_IMG: u32 = 0x1000;
+        const TID_GUEST_IMG: u64 = 0x7102_0000 | 3;
+        const SYNTH_PE_CODE_VA: u64 = 0x0000_0001_4000_1000;
+
+        unsafe extern "win64" fn sentinel_host_cb(
+            _pc: u64,
+            _ctx: *const c_void,
+        ) -> *const RuntimeFunction {
+            SENTINEL_HOST_CALLS.fetch_add(1, Ordering::SeqCst);
+            &RF_VM
+        }
+
+        unsafe fn mock_guest_dispatch(
+            va: u64,
+            a0: u64,
+            a1: u64,
+            _a2: u64,
+            _a3: u64,
+            _a4: u64,
+            _a5: u64,
+            _a6: u64,
+            _a7: u64,
+        ) -> u64 {
+            DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
+            LAST_DISPATCH_VA.store(va as usize, Ordering::SeqCst);
+            LAST_DISPATCH_PC.store(a0 as usize, Ordering::SeqCst);
+            LAST_DISPATCH_CTX.store(a1 as usize, Ordering::SeqCst);
+
+            if a1 == 0xB00B_1E55 {
+                // Verify lock-free reentry on the guest dispatch path too.
+                let mut nested_base = 0u64;
+                let nested = RtlLookupFunctionEntry(
+                    BASE_GUEST_IMG + 0x150,
+                    &mut nested_base,
+                    std::ptr::null_mut(),
+                );
+                GUEST_NESTED_RF.store(nested as usize, Ordering::SeqCst);
+                let self_rf =
+                    RtlLookupFunctionEntry(a0, std::ptr::null_mut(), std::ptr::null_mut());
+                GUEST_SELF_REENTRY_RF.store(self_rf as usize, Ordering::SeqCst);
+            }
+
+            if a0 >= BASE_GUEST_VM + 0x100 && a0 < BASE_GUEST_VM + 0x200 {
+                &RF_VM as *const RuntimeFunction as u64
+            } else if va == SYNTH_PE_CODE_VA
+                && a0 == BASE_GUEST_IMG + 0x150
+                && a1 == 0x7777
+            {
+                &RF_IMG as *const RuntimeFunction as u64
+            } else {
+                0
+            }
+        }
+
+        unsafe {
+            SENTINEL_HOST_CALLS.store(0, Ordering::SeqCst);
+            DISPATCH_CALLS.store(0, Ordering::SeqCst);
+            LAST_DISPATCH_VA.store(0, Ordering::SeqCst);
+            LAST_DISPATCH_PC.store(0, Ordering::SeqCst);
+            LAST_DISPATCH_CTX.store(0, Ordering::SeqCst);
+            GUEST_SELF_REENTRY_RF.store(usize::MAX, Ordering::SeqCst);
+            GUEST_NESTED_RF.store(0, Ordering::SeqCst);
+
+            // 1. Parameter checks on guest API: invalid low bits, zero length, null cb, overflow.
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    BASE_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    0x1234_5678usize as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    0,
+                    0x1234_5678usize as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    u64::MAX - 4,
+                    0x100,
+                    0x1234_5678usize as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+
+            // 2. Reject unmapped sentinel and arbitrary native host function pointers BEFORE invocation.
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    0x0000_0000_1234_5678usize as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    sentinel_host_cb as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            let mut out_base = 0xDEAD_BEEFu64;
+            assert!(
+                RtlLookupFunctionEntry(BASE_REJECT + 0x10, &mut out_base, std::ptr::null_mut())
+                    .is_null()
+            );
+            assert_eq!(SENTINEL_HOST_CALLS.load(Ordering::SeqCst), 0);
+
+            // 3. Reject non-executable committed guest VM, uncommitted MEM_RESERVE, and synthetic MEM_IMAGE.
+            let rw_page = VirtualAlloc(
+                std::ptr::null_mut(),
+                0x4000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            );
+            assert!(!rw_page.is_null());
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    rw_page as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(VirtualFree(rw_page, 0, MEM_RELEASE), 1);
+
+            let reserved_page = VirtualAlloc(
+                std::ptr::null_mut(),
+                0x4000,
+                MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            );
+            assert!(!reserved_page.is_null());
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    reserved_page as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(VirtualFree(reserved_page, 0, MEM_RELEASE), 1);
+
+            // Synthetic MEM_IMAGE without real guest PE executable provenance (mirrors Kind::Builtin).
+            const SYNTH_BUILTIN_BASE: usize = 0x0000_7FF0_DEAD_0000;
+            crate::kernel32::memory::register_image(
+                SYNTH_BUILTIN_BASE,
+                0x4000,
+                &[(SYNTH_BUILTIN_BASE, SYNTH_BUILTIN_BASE + 0x4000, PAGE_EXECUTE_READ)],
+            );
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_REJECT,
+                    BASE_REJECT,
+                    LEN_REJECT,
+                    (SYNTH_BUILTIN_BASE + 0x100) as *const c_void,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+
+            // 4. Valid committed executable guest VM registration & dispatch.
+            let exec_page = VirtualAlloc(
+                std::ptr::null_mut(),
+                0x4000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            );
+            assert!(!exec_page.is_null());
+            let exec_cb_va = exec_page as usize + 0x40;
+
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_GUEST_VM,
+                    BASE_GUEST_VM,
+                    LEN_GUEST_VM,
+                    exec_cb_va as *const c_void,
+                    0x3333usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                1
+            );
+            // Duplicate TableIdentifier must still be rejected.
+            assert_eq!(
+                RtlInstallFunctionTableCallback(
+                    TID_GUEST_VM,
+                    BASE_GUEST_VM,
+                    LEN_GUEST_VM,
+                    exec_cb_va as *const c_void,
+                    0x3333usize as *const c_void,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            {
+                let cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = cbs.iter().find(|d| d.table_id == TID_GUEST_VM).unwrap();
+                assert!(!entry.guest_image_backed);
+            }
+
+            // On non-x86_64 hosts, missing guest translator dispatcher must fail closed (NULL),
+            // never falling through to direct native call transmute.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _no_disp = crate::tests::install_test_guest_dispatcher(None);
+                assert!(
+                    RtlLookupFunctionEntry(
+                        BASE_GUEST_VM + 0x120,
+                        &mut out_base,
+                        std::ptr::null_mut(),
+                    )
+                    .is_null()
+                );
+            }
+
+            // Install scoped test guest dispatcher and verify dispatch, miss, out-of-range,
+            // guest PE image-backed callback, reentry, and at-use revocation.
+            {
+                let _disp = crate::tests::install_test_guest_dispatcher(Some(mock_guest_dispatch));
+
+                // Out-of-range PC must not invoke dispatcher.
+                assert!(
+                    RtlLookupFunctionEntry(BASE_GUEST_VM - 1, &mut out_base, std::ptr::null_mut())
+                        .is_null()
+                );
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 0);
+
+                // In-range hit dispatches through guest translator with exact (va, pc, ctx).
+                let rf = RtlLookupFunctionEntry(
+                    BASE_GUEST_VM + 0x120,
+                    &mut out_base,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(rf, &RF_VM as *const RuntimeFunction);
+                assert_eq!(out_base, BASE_GUEST_VM);
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
+                assert_eq!(LAST_DISPATCH_VA.load(Ordering::SeqCst), exec_cb_va);
+                assert_eq!(LAST_DISPATCH_PC.load(Ordering::SeqCst), (BASE_GUEST_VM + 0x120) as usize);
+                assert_eq!(LAST_DISPATCH_CTX.load(Ordering::SeqCst), 0x3333);
+
+                // In-range miss returns NULL.
+                assert!(
+                    RtlLookupFunctionEntry(
+                        BASE_GUEST_VM + 0x010,
+                        &mut out_base,
+                        std::ptr::null_mut(),
+                    )
+                    .is_null()
+                );
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 2);
+
+                // 5. Guest PE image-backed callback tracking + dispatch + reentry.
+                register_test_image(SYNTH_PE_CODE_VA, 0x100);
+                assert_eq!(
+                    RtlInstallFunctionTableCallback(
+                        TID_GUEST_IMG,
+                        BASE_GUEST_IMG,
+                        LEN_GUEST_IMG,
+                        SYNTH_PE_CODE_VA as *const c_void,
+                        0x7777usize as *const c_void,
+                        std::ptr::null(),
+                    ),
+                    1
+                );
+                {
+                    let cbs = DYN_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+                    let entry = cbs.iter().find(|d| d.table_id == TID_GUEST_IMG).unwrap();
+                    assert!(entry.guest_image_backed);
+                }
+
+                let mut img_base = 0u64;
+                let img_rf = RtlLookupFunctionEntry(
+                    BASE_GUEST_IMG + 0x150,
+                    &mut img_base,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(img_rf, &RF_IMG as *const RuntimeFunction);
+                assert_eq!(img_base, BASE_GUEST_IMG);
+
+                // Re-install VM table with reentry context to test lock-free guest reentry.
+                assert_eq!(RtlDeleteFunctionTable(TID_GUEST_VM as *const RuntimeFunction), 1);
+                assert_eq!(
+                    RtlInstallFunctionTableCallback(
+                        TID_GUEST_VM,
+                        BASE_GUEST_VM,
+                        LEN_GUEST_VM,
+                        exec_cb_va as *const c_void,
+                        0xB00B_1E55usize as *const c_void,
+                        std::ptr::null(),
+                    ),
+                    1
+                );
+                let rf_re = RtlLookupFunctionEntry(
+                    BASE_GUEST_VM + 0x140,
+                    &mut out_base,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(rf_re, &RF_VM as *const RuntimeFunction);
+                assert_eq!(
+                    GUEST_NESTED_RF.load(Ordering::SeqCst),
+                    &RF_IMG as *const RuntimeFunction as usize
+                );
+                assert_eq!(GUEST_SELF_REENTRY_RF.load(Ordering::SeqCst), 0);
+
+                // 6. At-use revocation: making the page non-executable refuses dispatch BEFORE calling.
+                let mut old_prot = 0u32;
+                assert_eq!(VirtualProtect(exec_page, 0x4000, PAGE_READWRITE, &mut old_prot), 1);
+                let calls_before = DISPATCH_CALLS.load(Ordering::SeqCst);
+                assert!(
+                    RtlLookupFunctionEntry(
+                        BASE_GUEST_VM + 0x140,
+                        &mut out_base,
+                        std::ptr::null_mut(),
+                    )
+                    .is_null()
+                );
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), calls_before);
+
+                // Restoring execute permission re-enables dispatch.
+                assert_eq!(VirtualProtect(exec_page, 0x4000, PAGE_EXECUTE_READ, &mut old_prot), 1);
+                let rf_restored = RtlLookupFunctionEntry(
+                    BASE_GUEST_VM + 0x140,
+                    &mut out_base,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(rf_restored, &RF_VM as *const RuntimeFunction);
+                assert!(DISPATCH_CALLS.load(Ordering::SeqCst) > calls_before);
+
+                // 7. At-use revocation: VirtualFree refuses dispatch BEFORE calling.
+                assert_eq!(VirtualFree(exec_page, 0, MEM_RELEASE), 1);
+                let calls_after_free = DISPATCH_CALLS.load(Ordering::SeqCst);
+                assert!(
+                    RtlLookupFunctionEntry(
+                        BASE_GUEST_VM + 0x140,
+                        &mut out_base,
+                        std::ptr::null_mut(),
+                    )
+                    .is_null()
+                );
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), calls_after_free);
+
+                // 8. At-use revocation: removing guest image range (DLL unload) refuses dispatch.
+                {
+                    let mut t = TEST_IMAGES.lock().unwrap();
+                    t.retain(|&(b, s)| !(b == SYNTH_PE_CODE_VA && s == 0x100));
+                }
+                let calls_after_unload = DISPATCH_CALLS.load(Ordering::SeqCst);
+                assert!(
+                    RtlLookupFunctionEntry(
+                        BASE_GUEST_IMG + 0x150,
+                        &mut img_base,
+                        std::ptr::null_mut(),
+                    )
+                    .is_null()
+                );
+                assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), calls_after_unload);
+            }
+
+            // Clean up all installed test tables.
+            assert_eq!(RtlDeleteFunctionTable(TID_GUEST_VM as *const RuntimeFunction), 1);
+            assert_eq!(RtlDeleteFunctionTable(TID_GUEST_IMG as *const RuntimeFunction), 1);
+        }
+    }
 }

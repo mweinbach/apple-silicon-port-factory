@@ -216,12 +216,21 @@ static HOST_TEXT_START: AtomicUsize = AtomicUsize::new(0);
 static HOST_TEXT_END: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the `[start, end)` address range of the host Mach-O `__TEXT,__text` section
-/// so any host function pointer (e.g. test callbacks in fake vtables) is recognized
-/// as native host code.
+/// strictly for **negative** exclusion checks ([`in_host_text`]) — e.g. refusing to persist
+/// host pointers as runtime guest callbacks or execute unregistered host text.
+/// Host `__TEXT` is NEVER implicitly authorized for native dispatch.
 pub fn set_host_text_range(start: usize, end: usize) {
     HOST_TEXT_START.store(start, Ordering::Release);
     HOST_TEXT_END.store(end, Ordering::Release);
-    bump_va_gen();
+}
+
+/// True if `addr` lies inside the recorded host Mach-O `__TEXT,__text` range.
+/// Used strictly for negative exclusion guards, never as a dispatch allowlist.
+#[inline]
+pub fn in_host_text(addr: usize) -> bool {
+    let s = HOST_TEXT_START.load(Ordering::Acquire);
+    let e = HOST_TEXT_END.load(Ordering::Acquire);
+    s < e && addr >= s && addr < e
 }
 
 /// Register a native host function pointer `ptr` for preferred-base `va`.
@@ -292,19 +301,13 @@ pub fn exe_va_window() -> (u64, u64) {
     }
 }
 
-/// Look up the native host function pointer registered for `va` (preferred-base VA,
-/// actual mapped address, or host `__TEXT` function pointer).
+/// Look up the native host function pointer explicitly registered in `VA_DISPATCH` for `va`
+/// (preferred-base VA or actual mapped address).
+///
+/// Unregistered addresses inside host `__TEXT` are NEVER implicitly authorized.
 #[inline]
 pub fn lookup_native_va(va_or_addr: u64) -> Option<usize> {
-    if let Some(p) = lookup_va_only(va_or_addr) {
-        return Some(p);
-    }
-    let ts = HOST_TEXT_START.load(Ordering::Relaxed) as u64;
-    let te = HOST_TEXT_END.load(Ordering::Relaxed) as u64;
-    if ts != 0 && va_or_addr >= ts && va_or_addr < te {
-        return Some(va_or_addr as usize);
-    }
-    None
+    lookup_va_only(va_or_addr)
 }
 
 /// Conversion into a 64-bit Win64 register argument for [`call_va!`] / [`call_iat!`].

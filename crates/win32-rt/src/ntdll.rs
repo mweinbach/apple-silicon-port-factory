@@ -59,7 +59,7 @@ pub unsafe extern "win64" fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut
 
 pub fn ntstatus_to_win32(s: u32) -> u32 {
     match s {
-        0 => 0,
+        0 | 0x4000_0010 => 0, // STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED
         0x0000_0102 => err::ERROR_TIMEOUT,
         0x0000_0103 => err::ERROR_IO_PENDING,
         0xC000_0005 => err::ERROR_NOACCESS,
@@ -1130,8 +1130,24 @@ pub unsafe extern "win64" fn LdrGetDllHandle(
     if module_file_name.is_null() || p_hmodule.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let h = crate::kernel32::module::GetModuleHandleW((*module_file_name).buf);
-    *p_hmodule = h;
+    let us = std::ptr::read_unaligned(module_file_name);
+    if us.buf.is_null() || us.len == 0 {
+        std::ptr::write_unaligned(p_hmodule, std::ptr::null_mut());
+        return STATUS_INVALID_PARAMETER;
+    }
+    let words = (us.len as usize) / 2;
+    let units = read_wide_slice(us.buf, words);
+    let name = String::from_utf16_lossy(&units);
+    let trimmed = name.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        std::ptr::write_unaligned(p_hmodule, std::ptr::null_mut());
+        return STATUS_INVALID_PARAMETER;
+    }
+    let h = crate::loader()
+        .get_module_handle(Some(trimmed))
+        .map(|base| base as HMODULE)
+        .unwrap_or(std::ptr::null_mut());
+    std::ptr::write_unaligned(p_hmodule, h);
     if h.is_null() {
         0xC000_0135u32 as i32 // STATUS_DLL_NOT_FOUND
     } else {
@@ -1167,25 +1183,68 @@ pub unsafe extern "win64" fn ZwContinue(
 pub unsafe extern "win64" fn LdrGetProcedureAddress(
     hmodule: HMODULE,
     func_name: *const u8,
-    ordinal: u16,
+    ordinal: u32,
     func_addr: *mut *const c_void,
 ) -> NTSTATUS {
     if func_addr.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    let p = if !func_name.is_null() {
-        // ANSI_STRING: { Length: u16, MaximumLength: u16, pad: u32, Buffer: *const u8 }
-        let buf = std::ptr::read_unaligned(func_name.add(8) as *const *const u8);
-        crate::kernel32::module::GetProcAddress(hmodule, buf)
-    } else {
-        crate::kernel32::module::GetProcAddress(hmodule, ordinal as usize as *const u8)
-    };
-    std::ptr::write_unaligned(func_addr, p);
-    if p.is_null() {
-        0xC000_0139u32 as i32 // STATUS_ENTRYPOINT_NOT_FOUND
-    } else {
-        STATUS_SUCCESS
+    if hmodule.is_null() {
+        std::ptr::write_unaligned(func_addr, std::ptr::null());
+        return STATUS_INVALID_PARAMETER;
     }
+    let resolved: Option<usize> = if !func_name.is_null() {
+        // ANSI_STRING: { Length: u16, MaximumLength: u16, pad: u32, Buffer: *const u8 }
+        let byte_len = std::ptr::read_unaligned(func_name as *const u16) as usize;
+        let buf = std::ptr::read_unaligned(func_name.add(8) as *const *const u8);
+        if byte_len > 0 && !buf.is_null() {
+            let name = read_ansi_len(buf, byte_len);
+            if name.is_empty() {
+                std::ptr::write_unaligned(func_addr, std::ptr::null());
+                return STATUS_INVALID_PARAMETER;
+            }
+            crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Name(&name))
+        } else if ordinal != 0 {
+            if ordinal > u16::MAX as u32 {
+                std::ptr::write_unaligned(func_addr, std::ptr::null());
+                return 0xC000_0139u32 as i32; // STATUS_ENTRYPOINT_NOT_FOUND
+            }
+            crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16))
+        } else {
+            std::ptr::write_unaligned(func_addr, std::ptr::null());
+            return STATUS_INVALID_PARAMETER;
+        }
+    } else {
+        if ordinal == 0 {
+            std::ptr::write_unaligned(func_addr, std::ptr::null());
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ordinal > u16::MAX as u32 {
+            std::ptr::write_unaligned(func_addr, std::ptr::null());
+            return 0xC000_0139u32 as i32; // STATUS_ENTRYPOINT_NOT_FOUND
+        }
+        crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16))
+    };
+    match resolved {
+        Some(p) => {
+            std::ptr::write_unaligned(func_addr, p as *const c_void);
+            STATUS_SUCCESS
+        }
+        None => {
+            std::ptr::write_unaligned(func_addr, std::ptr::null());
+            0xC000_0139u32 as i32 // STATUS_ENTRYPOINT_NOT_FOUND
+        }
+    }
+}
+
+pub unsafe extern "win64" fn LdrGetProcedureAddressEx(
+    hmodule: HMODULE,
+    func_name: *const u8,
+    ordinal: u32,
+    func_addr: *mut *const c_void,
+    _flags: u32,
+) -> NTSTATUS {
+    LdrGetProcedureAddress(hmodule, func_name, ordinal, func_addr)
 }
 
 /// Extract an optional section/object name from a Windows x64 `OBJECT_ATTRIBUTES*`.
@@ -1960,7 +2019,7 @@ pub unsafe extern "win64" fn ZwWriteFile(
 }
 
 pub unsafe extern "win64" fn LdrLoadDll(
-    _path_to_file: LPCWSTR,
+    path_to_file: LPCWSTR,
     flags: *const u32,
     module_file_name: *const UNICODE_STRING,
     module_handle: *mut HMODULE,
@@ -1970,19 +2029,43 @@ pub unsafe extern "win64" fn LdrLoadDll(
     }
     let us = std::ptr::read_unaligned(module_file_name);
     if us.buf.is_null() || us.len == 0 {
+        std::ptr::write_unaligned(module_handle, std::ptr::null_mut());
         return STATUS_INVALID_PARAMETER;
     }
     let words = (us.len as usize) / 2;
-    let mut tmp = Vec::with_capacity(words + 1);
-    for i in 0..words {
-        tmp.push(std::ptr::read_unaligned(us.buf.add(i)));
+    let units = read_wide_slice(us.buf, words);
+    let name = String::from_utf16_lossy(&units);
+    let name = name.trim_end_matches('\0');
+    if name.is_empty() {
+        std::ptr::write_unaligned(module_handle, std::ptr::null_mut());
+        return STATUS_INVALID_PARAMETER;
     }
-    tmp.push(0);
-    let fl = if flags.is_null() { 0 } else { std::ptr::read_unaligned(flags) };
-    let h = crate::kernel32::module::LoadLibraryExW(tmp.as_ptr(), std::ptr::null_mut(), fl);
+    let mut fl = if flags.is_null() { 0 } else { std::ptr::read_unaligned(flags) };
+    let search_path = if path_to_file.is_null() {
+        None
+    } else if (path_to_file as usize) & 1 != 0 {
+        // Windows 8+ LdrLoadDll convention: bit 0 set on PathToFile means pointer to PULONG search flags.
+        let fl_ptr = ((path_to_file as usize) & !1) as *const u32;
+        if !fl_ptr.is_null() {
+            fl |= std::ptr::read_unaligned(fl_ptr);
+        }
+        None
+    } else {
+        let s = read_wide_z(path_to_file, DEFAULT_MAX_STR_LEN);
+        (!s.is_empty()).then_some(s)
+    };
+    let h = crate::kernel32::module::load_library_with_search_path(
+        name,
+        fl,
+        search_path.as_deref(),
+    );
     std::ptr::write_unaligned(module_handle, h);
     if h.is_null() {
-        0xC000_0135u32 as i32 // STATUS_DLL_NOT_FOUND
+        match teb::last_error() {
+            err::ERROR_INVALID_PARAMETER => STATUS_INVALID_PARAMETER,
+            err::ERROR_DLL_INIT_FAILED => 0xC000_0142u32 as i32, // STATUS_DLL_INIT_FAILED
+            _ => 0xC000_0135u32 as i32,                          // STATUS_DLL_NOT_FOUND
+        }
     } else {
         STATUS_SUCCESS
     }
