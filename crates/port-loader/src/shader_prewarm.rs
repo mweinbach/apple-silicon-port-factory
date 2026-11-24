@@ -16,6 +16,7 @@ pub(crate) fn run_cold_device_prewarm() {
     let Some(device_id) = d3d12_metal::metal::pso_manifest::prewarm_needed(only_if_cold) else {
         return;
     };
+    w::hitch::heartbeat_stage(w::hitch::HeartbeatKind::LoaderMap, "shader_prewarm");
     let res = if w::macos::active() {
         let app_name = w::config::app_config().app_name;
         w::macos::progress_window_open(
@@ -31,6 +32,7 @@ pub(crate) fn run_cold_device_prewarm() {
                 None,
                 only_if_cold,
                 |p| {
+                    w::hitch::heartbeat(w::hitch::HeartbeatKind::LoaderMap);
                     let prev = last_tick.load(std::sync::atomic::Ordering::Relaxed);
                     if p.done == 0
                         || p.done >= p.total
@@ -58,8 +60,15 @@ pub(crate) fn run_cold_device_prewarm() {
         w::macos::progress_window_close();
         bg.join().unwrap_or_else(|_| Err("shader prewarm thread panicked".into()))
     } else {
-        d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, only_if_cold)
+        d3d12_metal::metal::pso_manifest::prewarm_for_current_device_with_progress(
+            None,
+            only_if_cold,
+            |_| {
+                w::hitch::heartbeat(w::hitch::HeartbeatKind::LoaderMap);
+            },
+        )
     };
+    w::hitch::heartbeat_stage(w::hitch::HeartbeatKind::LoaderMap, "shader_prewarm_done");
     match res {
         Ok(rep) if !rep.skipped_warm && (rep.tier1_total > 0 || rep.pso_total > 0) => {
             log::info!(

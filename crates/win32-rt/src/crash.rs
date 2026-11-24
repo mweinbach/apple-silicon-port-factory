@@ -32,7 +32,7 @@
 use crate::unwind::{self, Context, ExceptionRecord, RBP, RSP};
 use std::cell::UnsafeCell;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -298,6 +298,8 @@ fn guest_frames(guest: Option<([u64; 16], u64)>) -> Vec<u64> {
 
 /// pthread of the process main thread (AppKit), recorded by [`install`].
 static MAIN_PTHREAD: AtomicUsize = AtomicUsize::new(0);
+/// True once [`install`] has registered the `SIGUSR2` snapshot handler.
+static SNAP_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn snapshot_handler(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
     unsafe {
@@ -333,6 +335,7 @@ pub fn install() {
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+        SNAP_HANDLER_INSTALLED.store(true, Ordering::Release);
     }
 }
 
@@ -340,6 +343,9 @@ static SNAP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Interrupt `pthread`, walk its stack while it is parked, release it.
 unsafe fn snapshot_walk(pthread: usize, max: usize) -> Result<Vec<u64>, &'static str> {
+    if !SNAP_HANDLER_INSTALLED.load(Ordering::Acquire) {
+        return Err("SIGUSR2 snapshot handler not installed");
+    }
     let _guard = SNAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if SNAP.state.load(Ordering::Acquire) != SNAP_IDLE {
         // A previous target timed out and has not left the handler yet.

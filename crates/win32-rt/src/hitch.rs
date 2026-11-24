@@ -30,7 +30,7 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -178,17 +178,25 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(default)
 }
 
+fn env_u64_pair(primary: &str, fallback: &str, default: u64) -> u64 {
+    std::env::var(primary)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .or_else(|| std::env::var(fallback).ok().and_then(|s| s.trim().parse::<u64>().ok()))
+        .unwrap_or(default)
+}
+
 #[inline(always)]
 fn cfg() -> &'static Config {
     static CFG: OnceLock<Config> = OnceLock::new();
     CFG.get_or_init(|| {
-        let frame_ms = env_u64("AW2_HITCH_MS", 50);
-        let op_ms = env_u64("AW2_HITCH_OP_MS", 20);
-        let stall_ms = env_u64("AW2_STALL_MS", 2000);
+        let frame_ms = env_u64_pair("PORT_HITCH_MS", "AW2_HITCH_MS", 50);
+        let op_ms = env_u64_pair("PORT_HITCH_OP_MS", "AW2_HITCH_OP_MS", 20);
+        let stall_ms = env_u64_pair("PORT_STALL_MS", "AW2_STALL_MS", 2000);
         let enabled = frame_ms > 0;
         let log_path = if !enabled {
             None
-        } else if let Some(p) = std::env::var_os("AW2_HITCH_LOG") {
+        } else if let Some(p) = std::env::var_os("PORT_HITCH_LOG").or_else(|| std::env::var_os("AW2_HITCH_LOG")) {
             (!p.is_empty() && p != "0").then(|| PathBuf::from(p))
         } else if cfg!(test) {
             None
@@ -297,12 +305,131 @@ fn take_frame_snapshot() -> FrameSnapshot {
     }
 }
 
-// Frame timing & PSO cache baselines
+/// Pre-first-frame / lifecycle heartbeat source for the stall watchdog.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatKind {
+    None = 0,
+    Launch = 1,
+    LoaderMap = 2,
+    LoaderDllInit = 3,
+    LoaderEntry = 4,
+    MessagePump = 5,
+    Present = 6,
+}
+
+impl HeartbeatKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Launch,
+            2 => Self::LoaderMap,
+            3 => Self::LoaderDllInit,
+            4 => Self::LoaderEntry,
+            5 => Self::MessagePump,
+            6 => Self::Present,
+            _ => Self::None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Launch => "launch",
+            Self::LoaderMap => "loader:map",
+            Self::LoaderDllInit => "loader:dll_init",
+            Self::LoaderEntry => "loader:entry",
+            Self::MessagePump => "message_pump",
+            Self::Present => "present",
+        }
+    }
+}
+
+// Frame timing, pre-first-frame heartbeat, & PSO cache baselines
+static LAUNCH_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_HEARTBEAT_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_HEARTBEAT_SEQ: AtomicU64 = AtomicU64::new(0);
+static LAST_HEARTBEAT_KIND: AtomicU8 = AtomicU8::new(0);
+static LAST_HEARTBEAT_TID: AtomicU32 = AtomicU32::new(0);
+static LAST_HEARTBEAT_PTHREAD: AtomicUsize = AtomicUsize::new(0);
+static LAST_STAGE_DETAIL: Mutex<String> = Mutex::new(String::new());
+
 static LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static EMA_FRAME_NS: AtomicU64 = AtomicU64::new(16_666_667); // 60 FPS initial baseline
 static CURRENT_FRAME: AtomicU32 = AtomicU32::new(0);
 static LAST_PRESENT_TID: AtomicU32 = AtomicU32::new(0);
 static LAST_PRESENT_PTHREAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Record a lock-free progress heartbeat (loader milestones, Win32 message pump, present).
+///
+/// While no frame has presented yet (`LAST_PRESENT_NS == 0`), the stall watchdog resets its
+/// deadline whenever the heartbeat sequence advances; once a frame stops making progress for
+/// `PORT_STALL_MS` / `AW2_STALL_MS`, it emits a pre-first-frame `[HITCH:STALL]` report.
+#[inline(always)]
+pub fn heartbeat(kind: HeartbeatKind) {
+    let now = now_ns();
+    LAST_HEARTBEAT_NS.store(now, Ordering::Relaxed);
+    LAST_HEARTBEAT_KIND.store(kind as u8, Ordering::Relaxed);
+    let tid = if crate::teb::current_raw().is_null() { 0 } else { crate::teb::thread_id() };
+    LAST_HEARTBEAT_TID.store(tid, Ordering::Relaxed);
+    LAST_HEARTBEAT_PTHREAD.store(unsafe { libc::pthread_self() as usize }, Ordering::Relaxed);
+    LAST_HEARTBEAT_SEQ.fetch_add(1, Ordering::Release);
+}
+
+/// Record a loader/startup stage detail (e.g. PE map, `DllMain`, exe entry) and emit a heartbeat.
+pub fn heartbeat_stage(kind: HeartbeatKind, detail: &str) {
+    if let Ok(mut s) = LAST_STAGE_DETAIL.lock() {
+        s.clear();
+        s.push_str(detail);
+    }
+    heartbeat(kind);
+}
+
+fn last_stage_detail() -> String {
+    LAST_STAGE_DETAIL
+        .try_lock()
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
+
+/// Snapshot of the watchdog's launch, heartbeat, and presentation state.
+#[derive(Debug, Clone)]
+pub struct WatchdogState {
+    pub launch_ns: u64,
+    pub last_present_ns: u64,
+    pub current_frame: u32,
+    pub last_heartbeat_ns: u64,
+    pub last_heartbeat_kind: HeartbeatKind,
+    pub last_heartbeat_seq: u64,
+    pub last_heartbeat_tid: u32,
+    pub last_stage_detail: String,
+}
+
+/// Read the current watchdog/heartbeat state (for diagnostics, boot reports, and tests).
+pub fn watchdog_state() -> WatchdogState {
+    WatchdogState {
+        launch_ns: LAUNCH_NS.load(Ordering::Acquire),
+        last_present_ns: LAST_PRESENT_NS.load(Ordering::Acquire),
+        current_frame: CURRENT_FRAME.load(Ordering::Acquire),
+        last_heartbeat_ns: LAST_HEARTBEAT_NS.load(Ordering::Acquire),
+        last_heartbeat_kind: HeartbeatKind::from_u8(LAST_HEARTBEAT_KIND.load(Ordering::Acquire)),
+        last_heartbeat_seq: LAST_HEARTBEAT_SEQ.load(Ordering::Acquire),
+        last_heartbeat_tid: LAST_HEARTBEAT_TID.load(Ordering::Acquire),
+        last_stage_detail: last_stage_detail(),
+    }
+}
+
+/// Start the stall watchdog at process launch (before the first frame presents).
+///
+/// Safe to call multiple times; call after `crash::install()` so `SIGUSR2` stack
+/// snapshots are ready if a pre-first-frame deadlock occurs.
+pub fn start_watchdog() {
+    let now = now_ns();
+    let _ = LAUNCH_NS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+    if LAST_HEARTBEAT_NS.load(Ordering::Acquire) == 0 {
+        heartbeat(HeartbeatKind::Launch);
+    }
+    ensure_watchdog_started();
+}
 
 static PREV_PSO_ARCHIVE_HITS: AtomicU64 = AtomicU64::new(0);
 static PREV_PSO_MEMORY_HITS: AtomicU64 = AtomicU64::new(0);
@@ -552,8 +679,14 @@ fn on_present_inner(frame: u32, present_drawable_ns: u64) {
     CURRENT_FRAME.store(frame, Ordering::Relaxed);
 
     let tid = if crate::teb::current_raw().is_null() { 0 } else { crate::teb::thread_id() };
+    let pt = unsafe { libc::pthread_self() as usize };
     LAST_PRESENT_TID.store(tid, Ordering::Relaxed);
-    LAST_PRESENT_PTHREAD.store(unsafe { libc::pthread_self() as usize }, Ordering::Relaxed);
+    LAST_PRESENT_PTHREAD.store(pt, Ordering::Relaxed);
+    LAST_HEARTBEAT_NS.store(now, Ordering::Relaxed);
+    LAST_HEARTBEAT_KIND.store(HeartbeatKind::Present as u8, Ordering::Relaxed);
+    LAST_HEARTBEAT_TID.store(tid, Ordering::Relaxed);
+    LAST_HEARTBEAT_PTHREAD.store(pt, Ordering::Relaxed);
+    LAST_HEARTBEAT_SEQ.fetch_add(1, Ordering::Release);
 
     let snap = take_frame_snapshot();
     let (d_arch, d_mem, d_comp, d_comp_ns) = poll_pso_stats_delta();
@@ -852,29 +985,53 @@ fn ensure_watchdog_started() {
         return;
     }
     if WATCHDOG_STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-        let _ = std::thread::Builder::new().name("aw2-hitch-watchdog".into()).spawn(watchdog_loop);
+        let _ = std::thread::Builder::new().name("port-hitch-watchdog".into()).spawn(watchdog_loop);
     }
 }
 
 fn watchdog_loop() {
     let base_stall_ns = cfg().stall_threshold_ns;
     let mut watched_frame = u32::MAX;
+    let mut watched_hb_seq = u64::MAX;
     let mut next_threshold_ns = base_stall_ns;
-    let idle_sleep = Duration::from_nanos((base_stall_ns / 2).clamp(100_000_000, 500_000_000));
+    let idle_sleep = Duration::from_nanos((base_stall_ns / 2).clamp(50_000_000, 500_000_000));
 
     loop {
-        let last_ns = LAST_PRESENT_NS.load(Ordering::Relaxed);
-        if last_ns == 0 {
-            std::thread::sleep(idle_sleep);
+        let last_present = LAST_PRESENT_NS.load(Ordering::Relaxed);
+        if last_present == 0 {
+            let last_hb = LAST_HEARTBEAT_NS.load(Ordering::Relaxed);
+            if last_hb == 0 {
+                std::thread::sleep(idle_sleep);
+                continue;
+            }
+            let seq = LAST_HEARTBEAT_SEQ.load(Ordering::Acquire);
+            if seq != watched_hb_seq {
+                watched_hb_seq = seq;
+                next_threshold_ns = base_stall_ns;
+            }
+            let now = now_ns();
+            let elapsed_ns = now.saturating_sub(last_hb);
+            if elapsed_ns < next_threshold_ns {
+                let remaining = next_threshold_ns - elapsed_ns;
+                let sleep_ns = remaining.min(base_stall_ns).max(25_000_000);
+                std::thread::sleep(Duration::from_nanos(sleep_ns));
+                continue;
+            }
+            report_live_stall(0, elapsed_ns, now);
+            next_threshold_ns = next_threshold_ns
+                .saturating_mul(4)
+                .min(elapsed_ns.saturating_add(30_000_000_000))
+                .max(elapsed_ns.saturating_add(base_stall_ns));
             continue;
         }
+
         let frame = CURRENT_FRAME.load(Ordering::Relaxed);
         if frame != watched_frame {
             watched_frame = frame;
             next_threshold_ns = base_stall_ns;
         }
         let now = now_ns();
-        let elapsed_ns = now.saturating_sub(last_ns);
+        let elapsed_ns = now.saturating_sub(last_present);
         if elapsed_ns < next_threshold_ns {
             let remaining = next_threshold_ns - elapsed_ns;
             // Sleep until the current threshold could fire, capped at `base_stall_ns`
@@ -900,12 +1057,31 @@ fn report_live_stall(frame: u32, stall_ns: u64, now: u64) {
     let stall_ms = stall_ns as f64 / 1_000_000.0;
     let render_tid = LAST_PRESENT_TID.load(Ordering::Relaxed);
     let render_pt = LAST_PRESENT_PTHREAD.load(Ordering::Relaxed);
+    let hb_kind = HeartbeatKind::from_u8(LAST_HEARTBEAT_KIND.load(Ordering::Relaxed));
+    let hb_tid = LAST_HEARTBEAT_TID.load(Ordering::Relaxed);
+    let hb_pt = LAST_HEARTBEAT_PTHREAD.load(Ordering::Relaxed);
+    let self_pt = unsafe { libc::pthread_self() as usize };
 
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "==================== [HITCH:STALL] No Present for {stall_ms:.1} ms (after Frame #{frame}, render tid 0x{render_tid:x}) ===================="
-    );
+    if frame == 0 {
+        let stage = last_stage_detail();
+        let stage_suffix = if stage.is_empty() {
+            String::new()
+        } else {
+            format!(", stage={stage:?}")
+        };
+        let _ = writeln!(
+            out,
+            "==================== [HITCH:STALL] Pre-first-frame stall: no heartbeat or Present for {stall_ms:.1} ms (last={}, tid=0x{hb_tid:x}{stage_suffix}) ====================",
+            hb_kind.label()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "==================== [HITCH:STALL] No Present for {stall_ms:.1} ms (after Frame #{frame}, render tid 0x{render_tid:x}, api={}) ====================",
+            crate::present::last_present_api().label()
+        );
+    }
 
     let threads = crate::thread::all_threads();
     let mut to_snapshot: Vec<(String, usize)> = Vec::new();
@@ -927,32 +1103,41 @@ fn report_live_stall(frame: u32, stall_ns: u64, now: u64) {
                 "  thread 0x{tid:x} {name:?}: active in {} ({detail}) for {dur_ms:.1} ms",
                 kind.label()
             );
-            if kind == ActKind::LockWait && tid == render_tid {
+            if kind == ActKind::LockWait
+                && ((render_tid != 0 && tid == render_tid)
+                    || (frame == 0 && (tid == hb_tid || lock_owner_tid == 0)))
+            {
                 if let Some(owner) = crate::crash::read_u64(arg.wrapping_add(0x10)) {
                     lock_owner_tid = owner as u32;
                 }
             }
         }
 
-        // Snapshot stack if this is the render thread, a lock owner blocking the render thread,
-        // or a thread actively executing a tracked non-wait operation (PSO, FileIo, CmdSubmit, ResourceAlloc).
-        let interesting = tid == render_tid
+        // Snapshot stack if this is the render thread, the last-heartbeat thread (pre-present),
+        // a lock owner, a pre-present waiting thread, or a thread executing a tracked operation.
+        let interesting = (render_tid != 0 && tid == render_tid)
+            || (frame == 0 && hb_tid != 0 && tid == hb_tid)
             || (lock_owner_tid != 0 && tid == lock_owner_tid)
+            || (frame == 0 && matches!(kind, ActKind::LockWait | ActKind::HandleWait))
             || matches!(
                 kind,
                 ActKind::Present | ActKind::CmdSubmit | ActKind::PsoCompile | ActKind::ResourceAlloc | ActKind::FileIo
             );
-        if interesting && pt != 0 && to_snapshot.len() < 6 {
+        if interesting && pt != 0 && pt != self_pt && to_snapshot.len() < 6 {
             to_snapshot.push((format!("thread 0x{tid:x} {name:?} ({})", kind.label()), pt));
         }
     }
 
-    // If the render thread wasn't in `threads` (or if nothing was queued), ensure we snapshot `render_pt` and `main_pthread`.
-    if render_pt != 0 && !to_snapshot.iter().any(|(_, pt)| *pt == render_pt) {
+    // Ensure the render thread (post-present) or last-heartbeat thread (pre-present),
+    // AppKit main thread, and guest main thread are always included.
+    if frame > 0 && render_pt != 0 && render_pt != self_pt && !to_snapshot.iter().any(|(_, pt)| *pt == render_pt) {
         to_snapshot.insert(0, (format!("render thread 0x{render_tid:x}"), render_pt));
     }
+    if frame == 0 && hb_pt != 0 && hb_pt != self_pt && !to_snapshot.iter().any(|(_, pt)| *pt == hb_pt) {
+        to_snapshot.insert(0, (format!("last-heartbeat thread 0x{hb_tid:x} ({})", hb_kind.label()), hb_pt));
+    }
     let main_pt = crate::crash::main_pthread();
-    if main_pt != 0 && !to_snapshot.iter().any(|(_, pt)| *pt == main_pt) && to_snapshot.len() < 6 {
+    if main_pt != 0 && main_pt != self_pt && !to_snapshot.iter().any(|(_, pt)| *pt == main_pt) && to_snapshot.len() < 6 {
         to_snapshot.push(("main thread (AppKit)".into(), main_pt));
     }
     // The guest main thread (lowest Windows tid; runs the exe entry point / game loop).
@@ -962,7 +1147,7 @@ fn report_live_stall(frame: u32, stall_ns: u64, now: u64) {
         .min_by_key(|t| t.tid.load(Ordering::Relaxed))
     {
         let pt = t.pthread.load(Ordering::Relaxed);
-        if !to_snapshot.iter().any(|(_, p)| *p == pt) {
+        if pt != self_pt && !to_snapshot.iter().any(|(_, p)| *p == pt) {
             let tid = t.tid.load(Ordering::Relaxed);
             to_snapshot.push((format!("guest main thread 0x{tid:x}"), pt));
         }
@@ -1076,5 +1261,24 @@ mod tests {
         let after = stats();
         assert!(after.op_hitches > before.op_hitches);
         assert!(after.frame_hitches > before.frame_hitches);
+    }
+
+    #[test]
+    fn watchdog_heartbeats_and_stage_details_update_state() {
+        start_watchdog();
+        let s0 = watchdog_state();
+        assert!(s0.launch_ns > 0);
+        assert!(s0.last_heartbeat_ns > 0);
+
+        heartbeat_stage(HeartbeatKind::LoaderDllInit, "DllMain(test.dll)");
+        let s1 = watchdog_state();
+        assert_eq!(s1.last_heartbeat_kind, HeartbeatKind::LoaderDllInit);
+        assert_eq!(s1.last_stage_detail, "DllMain(test.dll)");
+        assert!(s1.last_heartbeat_seq > s0.last_heartbeat_seq);
+
+        heartbeat(HeartbeatKind::MessagePump);
+        let s2 = watchdog_state();
+        assert_eq!(s2.last_heartbeat_kind, HeartbeatKind::MessagePump);
+        assert!(s2.last_heartbeat_seq > s1.last_heartbeat_seq);
     }
 }
