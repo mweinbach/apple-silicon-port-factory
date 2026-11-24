@@ -405,18 +405,20 @@ pub fn register_static_ptr_slice(ptrs: &[crate::Ptr]) {
 /// Register every native method pointer in a `#[repr(C)]` static COM vtable struct with
 /// `VA_DISPATCH` once per vtable address so ARM64 guest indirect calls dispatch to native
 /// Rust instead of executing host `__TEXT` as x86-64 bytes.
+///
+/// Holds `SEEN` across registration and only marks `base` initialized after every slot has
+/// been published, so concurrent callers wait until all method pointers are registered.
 #[allow(dead_code)]
 pub fn register_vtbl_struct<V: 'static>(vtbl: &'static V) {
     let base = vtbl as *const V as usize;
     static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-    let is_new = {
-        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        g.get_or_insert_with(std::collections::HashSet::new).insert(base)
-    };
-    if is_new {
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = g.get_or_insert_with(std::collections::HashSet::new);
+    if !seen.contains(&base) {
         let count = std::mem::size_of::<V>() / std::mem::size_of::<usize>();
         let ptrs = unsafe { std::slice::from_raw_parts(vtbl as *const V as *const usize, count) };
         register_vtable_ptrs(ptrs);
+        seen.insert(base);
     }
 }
 
@@ -2676,5 +2678,64 @@ mod tests {
             assert_eq!(com_call_release(cp_iface), 0);
             assert_eq!(com_call_release(cpc), 0);
         }
+    }
+
+    #[test]
+    fn register_vtbl_struct_serializes_concurrent_callers_until_complete() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[repr(C)]
+        struct FakeVtbl {
+            m0: usize,
+            m1: usize,
+            m2: usize,
+        }
+        static FAKE_VTBL: FakeVtbl = FakeVtbl {
+            m0: 0x1001_0000,
+            m1: 0x1002_0000,
+            m2: 0x1003_0000,
+        };
+        static REG_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PREV_REGISTRAR: AtomicUsize = AtomicUsize::new(0);
+
+        fn slow_registrar(va: u64, ptr: usize) {
+            if matches!(va, 0x1001_0000 | 0x1002_0000 | 0x1003_0000) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                REG_COUNT.fetch_add(1, Ordering::Release);
+            }
+            let prev = PREV_REGISTRAR.load(Ordering::Acquire);
+            if prev != 0 {
+                let f: crate::NativeVaRegistrarFn = unsafe { std::mem::transmute(prev) };
+                f(va, ptr);
+            }
+        }
+
+        let prev = crate::NATIVE_VA_REGISTRAR
+            .swap(slow_registrar as *const () as usize, Ordering::AcqRel);
+        PREV_REGISTRAR.store(prev, Ordering::Release);
+        struct RestoreGuard(usize);
+        impl Drop for RestoreGuard {
+            fn drop(&mut self) {
+                crate::NATIVE_VA_REGISTRAR.store(self.0, Ordering::Release);
+            }
+        }
+        let _restore = RestoreGuard(prev);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                register_vtbl_struct(&FAKE_VTBL);
+                // Every returning thread must observe all 3 slots fully registered.
+                assert_eq!(REG_COUNT.load(Ordering::Acquire), 3);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(_restore);
+        assert_eq!(REG_COUNT.load(Ordering::Acquire), 3);
     }
 }
