@@ -1,4 +1,6 @@
-//! Unit tests for `JitCache` static-AOT negative caching, late binding, and LSE2 slot recycling.
+//! Tests for the A64 emitter and JIT cache.
+
+mod opcode_encodings;
 
 use super::cache::{jslot, MAX_LSE2_REGIONS, NOJIT};
 use super::*;

@@ -46,6 +46,30 @@ cargo opsdb -- verify-x86 /path/to/PhysX3_x64.dll --trials 4 --oracle --oracle-s
 cargo x86-verify /path/to/Game.exe --fp-only --rva 0x1000..0x200000
 ```
 
+#### Check the A64 words emitted by the JIT
+
+On an Apple Silicon Mac with Xcode command-line tools, set `PORT_A64_ENCODINGS` to
+an external TSV of Arm instruction patterns. Each case calls the real `Asm`
+method, checks its output against the expected instruction page, and compares
+every word with assembly for the same operands. This also checks register order,
+immediate values, addressing modes, and patched PC-relative displacements.
+The reference check skips when the variable is unset.
+
+To build the TSV, extract an Arm A64 ISA XML release outside the checkout and
+pass the directory containing its instruction XML files to the converter.
+Its TSV has a `page` column for the instruction's XML filename stem and a `pattern`
+column with 32 bits in most-significant-first order. A variable bit is written as
+`x`. [Arm A64 ISA XML, September 2026](https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz)
+
+```sh
+ref_dir="$HOME/Library/Caches/port-factory/arm-a64/2026-09"
+mkdir -p "$ref_dir"
+python3 tools/debug/arm_encoding_table.py /path/to/ISA_A64_xml_A_profile-2026-09 > "$ref_dir/encodings.tsv.tmp" &&
+  mv "$ref_dir/encodings.tsv.tmp" "$ref_dir/encodings.tsv"
+PORT_A64_ENCODINGS="$ref_dir/encodings.tsv" \
+  cargo test -p x86-runtime --lib --target aarch64-apple-darwin -- a64_opcode_encodings --nocapture
+```
+
 ### Stage 3 — Automated Reproducer & Frame Capture (`live-probe`)
 Turn any manual bug into a repeatable, frame-paced reproducer using `PORT_CONTROL_DIR`.
 `live-probe` launches `port-runner`, waits for a log readiness marker, pulses optional boot/menu
