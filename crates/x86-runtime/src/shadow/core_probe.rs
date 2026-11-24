@@ -114,6 +114,18 @@ unsafe fn exclusions(hook_sp: usize, cfg: &ProbeCfg, bufs: &Bufs) -> Excl {
         scratch.push((eb, esp));
         poison.extend(below(eb, esp));
     }
+    // If an alternate signal stack is active on this thread, keep it writable (`on_fault`
+    // uses `SA_ONSTACK`; write-protecting an active altstack kills the child in the kernel
+    // before `on_fault` can run).
+    let mut alt: libc::stack_t = core::mem::zeroed();
+    if libc::sigaltstack(core::ptr::null(), &mut alt) == 0
+        && (alt.ss_flags & libc::SS_DISABLE) == 0
+        && !alt.ss_sp.is_null()
+        && alt.ss_size > 0
+    {
+        let lo = alt.ss_sp as usize;
+        hard.push((lo, lo.saturating_add(alt.ss_size)));
+    }
     stage(33);
     hard.extend_from_slice(&bufs.own_ranges());
     hard.push((diag_page(), diag_page() + 16384));
@@ -351,14 +363,18 @@ unsafe fn wait_orch(pid: i32, fd: i32, limit_ms: u64) -> (Option<Report>, i32) {
     let deadline = run::now_us() + limit_ms * 1000;
     let mut status = 0i32;
     loop {
-        let w = libc::waitpid(pid, &mut status, libc::WNOHANG);
-        if w == pid || w < 0 {
+        let (w, err) = run::waitpid_retry(pid, &mut status, libc::WNOHANG);
+        if w == pid {
+            break;
+        }
+        if w < 0 {
+            status = if err > 0 { -err } else { -1 };
             break;
         }
         if run::now_us() > deadline {
             libc::kill(-pid, libc::SIGKILL);
             libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
+            let _ = run::waitpid_retry(pid, &mut status, 0);
             status = -2;
             break;
         }
