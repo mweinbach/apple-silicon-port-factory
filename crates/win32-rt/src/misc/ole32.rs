@@ -2159,8 +2159,95 @@ unsafe extern "win64" fn pv_get_guid(this: *mut PropValObj, out: *mut crate::com
     }
 }
 
+unsafe extern "win64" fn pv_get_date_time(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    crate::stub!("IPropertyValue::GetDateTime -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_time_span(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, 0);
+    crate::stub!("IPropertyValue::GetTimeSpan -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_point(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 2]);
+    crate::stub!("IPropertyValue::GetPoint -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_size(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 2]);
+    crate::stub!("IPropertyValue::GetSize -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pv_get_rect(_this: *mut PropValObj, out: *mut [f32; 4]) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    std::ptr::write_unaligned(out, [0.0; 4]);
+    crate::stub!("IPropertyValue::GetRect -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+macro_rules! define_pv_array_getter {
+    ($fn_name:ident, $method:literal) => {
+        unsafe extern "win64" fn $fn_name(
+            _this: *mut PropValObj,
+            out_len: *mut u32,
+            out_ptr: *mut *mut c_void,
+        ) -> HRESULT {
+            if !out_len.is_null() {
+                std::ptr::write_unaligned(out_len, 0);
+            }
+            if !out_ptr.is_null() {
+                std::ptr::write_unaligned(out_ptr, std::ptr::null_mut());
+            }
+            if out_len.is_null() || out_ptr.is_null() {
+                return E_POINTER;
+            }
+            crate::stub!(concat!("IPropertyValue::", $method, " -> E_NOTIMPL"));
+            E_NOTIMPL
+        }
+    };
+}
+
+define_pv_array_getter!(pv_get_u8_array, "GetUInt8Array");
+define_pv_array_getter!(pv_get_i16_array, "GetInt16Array");
+define_pv_array_getter!(pv_get_u16_array, "GetUInt16Array");
+define_pv_array_getter!(pv_get_i32_array, "GetInt32Array");
+define_pv_array_getter!(pv_get_u32_array, "GetUInt32Array");
+define_pv_array_getter!(pv_get_i64_array, "GetInt64Array");
+define_pv_array_getter!(pv_get_u64_array, "GetUInt64Array");
+define_pv_array_getter!(pv_get_single_array, "GetSingleArray");
+define_pv_array_getter!(pv_get_double_array, "GetDoubleArray");
+define_pv_array_getter!(pv_get_char16_array, "GetChar16Array");
+define_pv_array_getter!(pv_get_boolean_array, "GetBooleanArray");
+define_pv_array_getter!(pv_get_string_array, "GetStringArray");
+define_pv_array_getter!(pv_get_inspectable_array, "GetInspectableArray");
+define_pv_array_getter!(pv_get_guid_array, "GetGuidArray");
+define_pv_array_getter!(pv_get_date_time_array, "GetDateTimeArray");
+define_pv_array_getter!(pv_get_time_span_array, "GetTimeSpanArray");
+define_pv_array_getter!(pv_get_point_array, "GetPointArray");
+define_pv_array_getter!(pv_get_size_array, "GetSizeArray");
+define_pv_array_getter!(pv_get_rect_array, "GetRectArray");
+
 fn pv_vtbl() -> *const usize {
-    static VT: std::sync::OnceLock<[usize; 21]> = std::sync::OnceLock::new();
+    static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
     let ptr = VT
         .get_or_init(|| {
             [
@@ -2185,10 +2272,34 @@ fn pv_vtbl() -> *const usize {
                 pv_get_boolean as *const () as usize,
                 pv_get_string as *const () as usize,
                 pv_get_guid as *const () as usize,
+                pv_get_date_time as *const () as usize,
+                pv_get_time_span as *const () as usize,
+                pv_get_point as *const () as usize,
+                pv_get_size as *const () as usize,
+                pv_get_rect as *const () as usize,
+                pv_get_u8_array as *const () as usize,
+                pv_get_i16_array as *const () as usize,
+                pv_get_u16_array as *const () as usize,
+                pv_get_i32_array as *const () as usize,
+                pv_get_u32_array as *const () as usize,
+                pv_get_i64_array as *const () as usize,
+                pv_get_u64_array as *const () as usize,
+                pv_get_single_array as *const () as usize,
+                pv_get_double_array as *const () as usize,
+                pv_get_char16_array as *const () as usize,
+                pv_get_boolean_array as *const () as usize,
+                pv_get_string_array as *const () as usize,
+                pv_get_inspectable_array as *const () as usize,
+                pv_get_guid_array as *const () as usize,
+                pv_get_date_time_array as *const () as usize,
+                pv_get_time_span_array as *const () as usize,
+                pv_get_point_array as *const () as usize,
+                pv_get_size_array as *const () as usize,
+                pv_get_rect_array as *const () as usize,
             ]
         })
         .as_ptr();
-    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValue, ptr, 21) };
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValue, ptr, 45) };
     ptr
 }
 
@@ -2458,8 +2569,120 @@ fn pvf_act_vtbl() -> *const usize {
     ptr
 }
 
+unsafe extern "win64" fn pvs_create_date_time(
+    _this: *mut c_void,
+    _v: i64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateDateTime -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+unsafe extern "win64" fn pvs_create_time_span(
+    _this: *mut c_void,
+    _v: i64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 8-byte `Windows.Foundation.Point { f32 x, f32 y }` struct by value in a GPR.
+unsafe extern "win64" fn pvs_create_point(
+    _this: *mut c_void,
+    _point_bits: u64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreatePoint -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 8-byte `Windows.Foundation.Size { f32 w, f32 h }` struct by value in a GPR.
+unsafe extern "win64" fn pvs_create_size(
+    _this: *mut c_void,
+    _size_bits: u64,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    crate::stub!("IPropertyValueStatics::CreateSize -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+/// Win64 passes the 16-byte `Windows.Foundation.Rect` struct indirectly by pointer.
+unsafe extern "win64" fn pvs_create_rect(
+    _this: *mut c_void,
+    rect_ptr: *const [f32; 4],
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    if rect_ptr.is_null() {
+        return E_POINTER;
+    }
+    crate::stub!("IPropertyValueStatics::CreateRect -> E_NOTIMPL");
+    E_NOTIMPL
+}
+
+macro_rules! define_pvs_array_creator {
+    ($fn_name:ident, $method:literal) => {
+        unsafe extern "win64" fn $fn_name(
+            _this: *mut c_void,
+            len: u32,
+            data: *const c_void,
+            out: *mut *mut c_void,
+        ) -> HRESULT {
+            if out.is_null() {
+                return E_POINTER;
+            }
+            crate::com::write_null_out(out);
+            if len > 0 && data.is_null() {
+                return E_POINTER;
+            }
+            crate::stub!(concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL"));
+            E_NOTIMPL
+        }
+    };
+}
+
+define_pvs_array_creator!(pvs_create_u8_array, "CreateUInt8Array");
+define_pvs_array_creator!(pvs_create_i16_array, "CreateInt16Array");
+define_pvs_array_creator!(pvs_create_u16_array, "CreateUInt16Array");
+define_pvs_array_creator!(pvs_create_i32_array, "CreateInt32Array");
+define_pvs_array_creator!(pvs_create_u32_array, "CreateUInt32Array");
+define_pvs_array_creator!(pvs_create_i64_array, "CreateInt64Array");
+define_pvs_array_creator!(pvs_create_u64_array, "CreateUInt64Array");
+define_pvs_array_creator!(pvs_create_single_array, "CreateSingleArray");
+define_pvs_array_creator!(pvs_create_double_array, "CreateDoubleArray");
+define_pvs_array_creator!(pvs_create_char16_array, "CreateChar16Array");
+define_pvs_array_creator!(pvs_create_boolean_array, "CreateBooleanArray");
+define_pvs_array_creator!(pvs_create_string_array, "CreateStringArray");
+define_pvs_array_creator!(pvs_create_inspectable_array, "CreateInspectableArray");
+define_pvs_array_creator!(pvs_create_guid_array, "CreateGuidArray");
+define_pvs_array_creator!(pvs_create_date_time_array, "CreateDateTimeArray");
+define_pvs_array_creator!(pvs_create_time_span_array, "CreateTimeSpanArray");
+define_pvs_array_creator!(pvs_create_point_array, "CreatePointArray");
+define_pvs_array_creator!(pvs_create_size_array, "CreateSizeArray");
+define_pvs_array_creator!(pvs_create_rect_array, "CreateRectArray");
+
 fn pvs_vtbl() -> *const usize {
-    static VT: std::sync::OnceLock<[usize; 21]> = std::sync::OnceLock::new();
+    static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
     let ptr = VT
         .get_or_init(|| {
             [
@@ -2484,10 +2707,34 @@ fn pvs_vtbl() -> *const usize {
                 pvs_create_string as *const () as usize,
                 pvs_create_inspectable as *const () as usize,
                 pvs_create_guid as *const () as usize,
+                pvs_create_date_time as *const () as usize,
+                pvs_create_time_span as *const () as usize,
+                pvs_create_point as *const () as usize,
+                pvs_create_size as *const () as usize,
+                pvs_create_rect as *const () as usize,
+                pvs_create_u8_array as *const () as usize,
+                pvs_create_i16_array as *const () as usize,
+                pvs_create_u16_array as *const () as usize,
+                pvs_create_i32_array as *const () as usize,
+                pvs_create_u32_array as *const () as usize,
+                pvs_create_i64_array as *const () as usize,
+                pvs_create_u64_array as *const () as usize,
+                pvs_create_single_array as *const () as usize,
+                pvs_create_double_array as *const () as usize,
+                pvs_create_char16_array as *const () as usize,
+                pvs_create_boolean_array as *const () as usize,
+                pvs_create_string_array as *const () as usize,
+                pvs_create_inspectable_array as *const () as usize,
+                pvs_create_guid_array as *const () as usize,
+                pvs_create_date_time_array as *const () as usize,
+                pvs_create_time_span_array as *const () as usize,
+                pvs_create_point_array as *const () as usize,
+                pvs_create_size_array as *const () as usize,
+                pvs_create_rect_array as *const () as usize,
             ]
         })
         .as_ptr();
-    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValueStatics, ptr, 21) };
+    unsafe { crate::com::register_host_vtable(crate::com::IID_IPropertyValueStatics, ptr, 45) };
     ptr
 }
 
@@ -4104,6 +4351,346 @@ mod tests {
             assert_eq!(com_call_release(inst), 0);
             WindowsDeleteString(cname);
             unregister_winrt_activation_factory("Test.Custom.Activatable");
+        }
+    }
+
+    #[test]
+    fn winrt_property_value_and_statics_complete_vtable_abi_order_and_final_slots() {
+        unsafe {
+            // Verify full WinMD ABI method order & count (6 IInspectable + 39 own = 45 slots each).
+            let pv_desc = crate::com::lookup_interface(&crate::com::IID_IPropertyValue)
+                .expect("IPropertyValue descriptor must be registered");
+            let pvs_desc = crate::com::lookup_interface(&crate::com::IID_IPropertyValueStatics)
+                .expect("IPropertyValueStatics descriptor must be registered");
+            let expected_pv = [
+                "get_Type",
+                "get_IsNumericScalar",
+                "GetUInt8",
+                "GetInt16",
+                "GetUInt16",
+                "GetInt32",
+                "GetUInt32",
+                "GetInt64",
+                "GetUInt64",
+                "GetSingle",
+                "GetDouble",
+                "GetChar16",
+                "GetBoolean",
+                "GetString",
+                "GetGuid",
+                "GetDateTime",
+                "GetTimeSpan",
+                "GetPoint",
+                "GetSize",
+                "GetRect",
+                "GetUInt8Array",
+                "GetInt16Array",
+                "GetUInt16Array",
+                "GetInt32Array",
+                "GetUInt32Array",
+                "GetInt64Array",
+                "GetUInt64Array",
+                "GetSingleArray",
+                "GetDoubleArray",
+                "GetChar16Array",
+                "GetBooleanArray",
+                "GetStringArray",
+                "GetInspectableArray",
+                "GetGuidArray",
+                "GetDateTimeArray",
+                "GetTimeSpanArray",
+                "GetPointArray",
+                "GetSizeArray",
+                "GetRectArray",
+            ];
+            let expected_pvs = [
+                "CreateEmpty",
+                "CreateUInt8",
+                "CreateInt16",
+                "CreateUInt16",
+                "CreateInt32",
+                "CreateUInt32",
+                "CreateInt64",
+                "CreateUInt64",
+                "CreateSingle",
+                "CreateDouble",
+                "CreateChar16",
+                "CreateBoolean",
+                "CreateString",
+                "CreateInspectable",
+                "CreateGuid",
+                "CreateDateTime",
+                "CreateTimeSpan",
+                "CreatePoint",
+                "CreateSize",
+                "CreateRect",
+                "CreateUInt8Array",
+                "CreateInt16Array",
+                "CreateUInt16Array",
+                "CreateInt32Array",
+                "CreateUInt32Array",
+                "CreateInt64Array",
+                "CreateUInt64Array",
+                "CreateSingleArray",
+                "CreateDoubleArray",
+                "CreateChar16Array",
+                "CreateBooleanArray",
+                "CreateStringArray",
+                "CreateInspectableArray",
+                "CreateGuidArray",
+                "CreateDateTimeArray",
+                "CreateTimeSpanArray",
+                "CreatePointArray",
+                "CreateSizeArray",
+                "CreateRectArray",
+            ];
+            assert_eq!(pv_desc.slots.len(), 39);
+            assert_eq!(pvs_desc.slots.len(), 39);
+            for (i, &name) in expected_pv.iter().enumerate() {
+                assert_eq!(pv_desc.slots[i].slot, 6 + i);
+                assert_eq!(pv_desc.slots[i].name, name);
+            }
+            for (i, &name) in expected_pvs.iter().enumerate() {
+                assert_eq!(pvs_desc.slots[i].slot, 6 + i);
+                assert_eq!(pvs_desc.slots[i].name, name);
+            }
+
+            // Activate Windows.Foundation.PropertyValue as IActivationFactory, then QI to IPropertyValueStatics.
+            let pv_class = rust_to_hstring("Windows.Foundation.PropertyValue").unwrap();
+            let act_iid = crate::com::IID_IActivationFactory.to_bytes();
+            let mut factory: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(pv_class, act_iid.as_ptr(), &mut factory), S_OK);
+            assert!(!factory.is_null());
+
+            let mut pvs: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    factory,
+                    &crate::com::IID_IUnknown,
+                    0, // QueryInterface
+                    &[
+                        &crate::com::IID_IPropertyValueStatics as *const crate::com::Guid as u64,
+                        &mut pvs as *mut *mut c_void as u64,
+                    ],
+                ),
+                S_OK
+            );
+            assert!(!pvs.is_null());
+
+            // Verify all 45 vtable slots on IPropertyValueStatics are populated and non-null.
+            let pvs_vtbl_ptr = *(pvs as *const *const usize);
+            for slot in 0..45usize {
+                assert_ne!(
+                    *pvs_vtbl_ptr.add(slot),
+                    0,
+                    "IPropertyValueStatics vtable slot {slot} must be populated"
+                );
+            }
+
+            // Create a boxed Int32 via slot 10 and QI it to IPropertyValue.
+            let mut pv_unk: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    10,
+                    &[1234u64, &mut pv_unk as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            let mut pv: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv_unk,
+                    &crate::com::IID_IUnknown,
+                    0,
+                    &[
+                        &crate::com::IID_IPropertyValue as *const crate::com::Guid as u64,
+                        &mut pv as *mut *mut c_void as u64,
+                    ],
+                ),
+                S_OK
+            );
+            assert!(!pv.is_null());
+
+            // Verify all 45 vtable slots on IPropertyValue are populated and non-null.
+            let pv_vtbl_ptr = *(pv as *const *const usize);
+            for slot in 0..45usize {
+                assert_ne!(
+                    *pv_vtbl_ptr.add(slot),
+                    0,
+                    "IPropertyValue vtable slot {slot} must be populated"
+                );
+            }
+
+            // Existing scalar getter (slot 11: GetInt32) remains intact.
+            let mut got_i32 = 0i32;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv,
+                    &crate::com::IID_IPropertyValue,
+                    11,
+                    &[&mut got_i32 as *mut i32 as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(got_i32, 1234);
+
+            // Exercise unsupported struct getters on IPropertyValue (slots 21..=25) via actual vtable.
+            let mut dt = 0x1122_3344_5566_7788i64;
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv, &crate::com::IID_IPropertyValue, 21, &[&mut dt as *mut i64 as u64]),
+                E_NOTIMPL
+            );
+            assert_eq!(dt, 0);
+            assert_eq!(
+                crate::com::com_invoke_hresult(pv, &crate::com::IID_IPropertyValue, 21, &[0]),
+                E_POINTER
+            );
+
+            let mut rect = [1.0f32, 2.0, 3.0, 4.0];
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pv,
+                    &crate::com::IID_IPropertyValue,
+                    25, // GetRect
+                    &[&mut rect as *mut [f32; 4] as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert_eq!(rect, [0.0; 4]);
+
+            // Exercise array getters across the full range including near-final (43: GetSizeArray) and final (44: GetRectArray).
+            for slot in [26usize, 38, 39, 42, 43, 44] {
+                let mut len = 0xCAFE_BABEu32;
+                let mut ptr = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pv,
+                        &crate::com::IID_IPropertyValue,
+                        slot,
+                        &[&mut len as *mut u32 as u64, &mut ptr as *mut *mut c_void as u64],
+                    ),
+                    E_NOTIMPL,
+                    "IPropertyValue slot {slot} should return E_NOTIMPL"
+                );
+                assert_eq!(len, 0, "IPropertyValue slot {slot} must zero out_len");
+                assert!(ptr.is_null(), "IPropertyValue slot {slot} must null out_ptr");
+
+                // Null out_ptr must still zero out_len and return E_POINTER.
+                len = 99;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pv,
+                        &crate::com::IID_IPropertyValue,
+                        slot,
+                        &[&mut len as *mut u32 as u64, 0],
+                    ),
+                    E_POINTER
+                );
+                assert_eq!(len, 0);
+            }
+
+            // Exercise unsupported IPropertyValueStatics struct creators (21..=25).
+            let mut created = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    21, // CreateDateTime
+                    &[123456789u64, &mut created as *mut *mut c_void as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert!(created.is_null());
+
+            created = 0xDEAD_BEEFusize as *mut c_void;
+            let sample_rect = [0.0f32, 1.0, 100.0, 200.0];
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    25, // CreateRect
+                    &[&sample_rect as *const [f32; 4] as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                E_NOTIMPL
+            );
+            assert!(created.is_null());
+
+            // CreateRect with null rect pointer returns E_POINTER and nulls out-param.
+            created = 0xDEAD_BEEFusize as *mut c_void;
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    25,
+                    &[0, &mut created as *mut *mut c_void as u64],
+                ),
+                E_POINTER
+            );
+            assert!(created.is_null());
+
+            // Exercise IPropertyValueStatics array creators including near-final (43: CreateSizeArray) and final (44: CreateRectArray).
+            let dummy_buf = [0u64; 4];
+            for slot in [26usize, 38, 39, 42, 43, 44] {
+                created = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[1, dummy_buf.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                    ),
+                    E_NOTIMPL,
+                    "IPropertyValueStatics slot {slot} should return E_NOTIMPL"
+                );
+                assert!(created.is_null(), "IPropertyValueStatics slot {slot} must null out-param");
+
+                // Non-zero length with null data pointer returns E_POINTER and nulls out-param.
+                created = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[2, 0, &mut created as *mut *mut c_void as u64],
+                    ),
+                    E_POINTER
+                );
+                assert!(created.is_null());
+
+                // Null out-param returns E_POINTER.
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        pvs,
+                        &crate::com::IID_IPropertyValueStatics,
+                        slot,
+                        &[0, 0, 0],
+                    ),
+                    E_POINTER
+                );
+            }
+
+            // Also invoke the final slots directly via raw Win64 vtable function pointers.
+            type GetRectArrayFn = unsafe extern "win64" fn(*mut c_void, *mut u32, *mut *mut c_void) -> HRESULT;
+            type CreateRectArrayFn = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+            let raw_get_rect_array: GetRectArrayFn = std::mem::transmute(*pv_vtbl_ptr.add(44));
+            let raw_create_rect_array: CreateRectArrayFn = std::mem::transmute(*pvs_vtbl_ptr.add(44));
+            let mut raw_len = 77u32;
+            let mut raw_ptr = 0x1234usize as *mut c_void;
+            assert_eq!(raw_get_rect_array(pv, &mut raw_len, &mut raw_ptr), E_NOTIMPL);
+            assert_eq!(raw_len, 0);
+            assert!(raw_ptr.is_null());
+
+            created = 0x5678usize as *mut c_void;
+            assert_eq!(raw_create_rect_array(pvs, 0, std::ptr::null(), &mut created), E_NOTIMPL);
+            assert!(created.is_null());
+
+            assert_eq!(com_call_release(pv), 1);
+            assert_eq!(com_call_release(pv_unk), 0);
+            assert_eq!(com_call_release(pvs), 1);
+            assert_eq!(com_call_release(factory), 0);
+            WindowsDeleteString(pv_class);
         }
     }
 }

@@ -38,6 +38,9 @@ const DM_SETDEFID: u32 = wm::USER + 1;
 const DC_HASDEFID: usize = 0x534B;
 
 const DLGC_WANTARROWS: isize = 0x0001;
+const DLGC_WANTTAB: isize = 0x0002;
+const DLGC_WANTALLKEYS: isize = 0x0004;
+const DLGC_WANTMESSAGE: isize = 0x0004;
 const DLGC_WANTCHARS: isize = 0x0080;
 const DLGC_BUTTON: isize = 0x2000;
 const DLGC_DEFPUSHBUTTON: isize = 0x0010;
@@ -1220,43 +1223,64 @@ unsafe fn is_dialog_message_impl(hdlg: HWND, lp_msg: *mut MSG, unicode: bool) ->
         return FALSE;
     }
 
-    if msg.message == wm::KEYDOWN {
-        match msg.wparam {
-            VK_TAB => {
-                let prev = input::shift_down() as BOOL;
-                let next = GetNextDlgTabItem(hdlg, input::GetFocus(), prev);
-                if !next.is_null() {
-                    send_message(h, wm::NEXTDLGCTL, next as usize, 1);
+    if msg.message == wm::KEYDOWN && matches!(msg.wparam, VK_TAB | VK_RETURN | VK_ESCAPE) {
+        // Query the target control via WM_GETDLGCODE outside any locks before
+        // consuming dialog navigation, default, or cancel keys.
+        let target = if msg.hwnd != 0 && msg.hwnd != h && window::exists(msg.hwnd) {
+            msg.hwnd
+        } else {
+            let focus = input::GetFocus() as usize;
+            if focus != 0 && (focus == h || window::is_child_of(focus, h)) {
+                focus
+            } else {
+                msg.hwnd
+            }
+        };
+        let dlg_code = if target != 0 {
+            send_message(target, wm::GETDLGCODE, msg.wparam, lp_msg as LPARAM)
+        } else {
+            0
+        };
+        let wants_all = (dlg_code & (DLGC_WANTMESSAGE | DLGC_WANTALLKEYS)) != 0;
+
+        if !wants_all {
+            match msg.wparam {
+                VK_TAB if (dlg_code & DLGC_WANTTAB) == 0 => {
+                    let prev = input::shift_down() as BOOL;
+                    let next = GetNextDlgTabItem(hdlg, input::GetFocus(), prev);
+                    if !next.is_null() {
+                        send_message(h, wm::NEXTDLGCTL, next as usize, 1);
+                    }
+                    return TRUE;
                 }
-                return TRUE;
+                VK_RETURN => {
+                    let def = send_message(h, DM_GETDEFID, 0, 0) as usize;
+                    let def_id = if (def >> 16) == DC_HASDEFID {
+                        (def & 0xFFFF) as i32
+                    } else {
+                        IDOK
+                    };
+                    let ctrl = GetDlgItem(hdlg, def_id);
+                    send_message(
+                        h,
+                        wm::COMMAND,
+                        ((BN_CLICKED & 0xFFFF) << 16) | (def_id as u16 as usize),
+                        ctrl as LPARAM,
+                    );
+                    return TRUE;
+                }
+                VK_ESCAPE => {
+                    let ctrl = GetDlgItem(hdlg, IDCANCEL);
+                    send_message(
+                        h,
+                        wm::COMMAND,
+                        ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as u16 as usize),
+                        ctrl as LPARAM,
+                    );
+                    return TRUE;
+                }
+                _ => {}
             }
-            VK_RETURN => {
-                let def = send_message(h, DM_GETDEFID, 0, 0) as usize;
-                let def_id = if (def >> 16) == DC_HASDEFID {
-                    (def & 0xFFFF) as i32
-                } else {
-                    IDOK
-                };
-                let ctrl = GetDlgItem(hdlg, def_id);
-                send_message(
-                    h,
-                    wm::COMMAND,
-                    ((BN_CLICKED & 0xFFFF) << 16) | (def_id as u16 as usize),
-                    ctrl as LPARAM,
-                );
-                return TRUE;
-            }
-            VK_ESCAPE => {
-                let ctrl = GetDlgItem(hdlg, IDCANCEL);
-                send_message(
-                    h,
-                    wm::COMMAND,
-                    ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as u16 as usize),
-                    ctrl as LPARAM,
-                );
-                return TRUE;
-            }
-            _ => {}
         }
     }
 
@@ -1688,6 +1712,183 @@ mod tests {
             // EndDialog on invalid HWND -> FALSE + ERROR_INVALID_WINDOW_HANDLE.
             assert_eq!(EndDialog(0xDEAD_BEEFusize as HWND, 1), FALSE);
             assert_eq!(crate::teb::last_error(), e::INVALID_WINDOW_HANDLE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    static DLGCODE_REPLY: AtomicIsize = AtomicIsize::new(0);
+    static DLGCODE_LAST_WPARAM: AtomicUsize = AtomicUsize::new(0);
+    static DLGCODE_LAST_LPARAM: AtomicIsize = AtomicIsize::new(0);
+    static CTRL_LAST_KEYDOWN: AtomicUsize = AtomicUsize::new(0);
+    static CTRL_KEYDOWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static DLG_LAST_CMD_ID: AtomicUsize = AtomicUsize::new(0);
+    static DLG_CMD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "win64" fn dlgcode_test_ctrl_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            wm::GETDLGCODE => {
+                DLGCODE_LAST_WPARAM.store(wparam, Ordering::SeqCst);
+                DLGCODE_LAST_LPARAM.store(lparam, Ordering::SeqCst);
+                DLGCODE_REPLY.load(Ordering::SeqCst)
+            }
+            wm::KEYDOWN => {
+                CTRL_LAST_KEYDOWN.store(wparam, Ordering::SeqCst);
+                CTRL_KEYDOWN_COUNT.fetch_add(1, Ordering::SeqCst);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe extern "win64" fn dlgcode_test_dlg_proc(
+        _hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> isize {
+        match msg {
+            wm::INITDIALOG => 1,
+            wm::COMMAND => {
+                DLG_LAST_CMD_ID.store(wparam & 0xFFFF, Ordering::SeqCst);
+                DLG_CMD_COUNT.fetch_add(1, Ordering::SeqCst);
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn is_dialog_message_honors_wm_getdlgcode_and_preserves_default_navigation() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!crate::macos::active(), "unit tests must stay headless");
+        std::thread::spawn(|| unsafe {
+            let ctrl_proc_va = dlgcode_test_ctrl_proc as *const () as usize;
+            let dlg_proc_va = dlgcode_test_dlg_proc as *const () as usize;
+            crate::register_native_va(ctrl_proc_va as u64, ctrl_proc_va);
+            crate::register_native_va(dlg_proc_va as u64, dlg_proc_va);
+
+            let tmpl = build_std_template();
+            let hdlg = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg.is_null());
+            let h_edit = GetDlgItem(hdlg, 101);
+            let h_ok = GetDlgItem(hdlg, IDOK);
+            assert!(!h_edit.is_null());
+            assert!(!h_ok.is_null());
+
+            // Subclass the Edit control with our headless WM_GETDLGCODE test wndproc (GWLP_WNDPROC = -4).
+            SetWindowLongPtrW(h_edit, -4, ctrl_proc_va as isize);
+
+            let make_key_msg = |hwnd: HWND, vk: usize| MSG {
+                hwnd: hwnd as usize,
+                message: wm::KEYDOWN,
+                wparam: vk,
+                lparam: 0,
+                time: 0,
+                pt: POINT { x: 0, y: 0 },
+                l_private: 0,
+            };
+
+            let reset_counters = || {
+                DLGCODE_LAST_WPARAM.store(0, Ordering::SeqCst);
+                DLGCODE_LAST_LPARAM.store(0, Ordering::SeqCst);
+                CTRL_LAST_KEYDOWN.store(0, Ordering::SeqCst);
+                CTRL_KEYDOWN_COUNT.store(0, Ordering::SeqCst);
+                DLG_LAST_CMD_ID.store(0, Ordering::SeqCst);
+                DLG_CMD_COUNT.store(0, Ordering::SeqCst);
+            };
+
+            // 1. DLGC_WANTTAB: Tab goes directly to the control without moving focus,
+            //    while Return and Escape still trigger dialog IDOK / IDCANCEL commands.
+            input::SetFocus(h_edit);
+            DLGCODE_REPLY.store(DLGC_WANTTAB, Ordering::SeqCst);
+            reset_counters();
+
+            let mut msg_tab = make_key_msg(h_edit, VK_TAB);
+            let msg_tab_ptr = &mut msg_tab as *mut MSG;
+            assert_eq!(IsDialogMessageW(hdlg, msg_tab_ptr), TRUE);
+            assert_eq!(DLGCODE_LAST_WPARAM.load(Ordering::SeqCst), VK_TAB);
+            assert_eq!(DLGCODE_LAST_LPARAM.load(Ordering::SeqCst), msg_tab_ptr as LPARAM);
+            assert_eq!(input::GetFocus(), h_edit, "DLGC_WANTTAB must not move focus");
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(CTRL_LAST_KEYDOWN.load(Ordering::SeqCst), VK_TAB);
+            assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 0);
+
+            reset_counters();
+            let mut msg_ret = make_key_msg(h_edit, VK_RETURN);
+            let msg_ret_ptr = &mut msg_ret as *mut MSG;
+            assert_eq!(IsDialogMessageW(hdlg, msg_ret_ptr), TRUE);
+            assert_eq!(DLGCODE_LAST_WPARAM.load(Ordering::SeqCst), VK_RETURN);
+            assert_eq!(DLGCODE_LAST_LPARAM.load(Ordering::SeqCst), msg_ret_ptr as LPARAM);
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(DLG_LAST_CMD_ID.load(Ordering::SeqCst), IDOK as usize);
+
+            reset_counters();
+            let mut msg_esc = make_key_msg(h_edit, VK_ESCAPE);
+            let msg_esc_ptr = &mut msg_esc as *mut MSG;
+            assert_eq!(IsDialogMessageW(hdlg, msg_esc_ptr), TRUE);
+            assert_eq!(DLGCODE_LAST_WPARAM.load(Ordering::SeqCst), VK_ESCAPE);
+            assert_eq!(DLGCODE_LAST_LPARAM.load(Ordering::SeqCst), msg_esc_ptr as LPARAM);
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(DLG_LAST_CMD_ID.load(Ordering::SeqCst), IDCANCEL as usize);
+
+            // 2. DLGC_WANTMESSAGE / DLGC_WANTALLKEYS: Tab, Return, and Escape all go
+            //    straight to the control without changing focus or firing WM_COMMAND.
+            input::SetFocus(h_edit);
+            DLGCODE_REPLY.store(DLGC_WANTMESSAGE, Ordering::SeqCst);
+            for vk in [VK_TAB, VK_RETURN, VK_ESCAPE] {
+                reset_counters();
+                let mut msg = make_key_msg(h_edit, vk);
+                let msg_ptr = &mut msg as *mut MSG;
+                assert_eq!(IsDialogMessageW(hdlg, msg_ptr), TRUE);
+                assert_eq!(DLGCODE_LAST_WPARAM.load(Ordering::SeqCst), vk);
+                assert_eq!(DLGCODE_LAST_LPARAM.load(Ordering::SeqCst), msg_ptr as LPARAM);
+                assert_eq!(input::GetFocus(), h_edit, "DLGC_WANTMESSAGE must preserve focus for vk={vk:#x}");
+                assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 1);
+                assert_eq!(CTRL_LAST_KEYDOWN.load(Ordering::SeqCst), vk);
+                assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 0);
+            }
+
+            // 3. Ordinary control (DLGC_WANTARROWS | DLGC_WANTCHARS): default dialog
+            //    navigation (Tab focus change, Return -> IDOK, Escape -> IDCANCEL) works.
+            input::SetFocus(h_edit);
+            DLGCODE_REPLY.store(DLGC_WANTARROWS | DLGC_WANTCHARS, Ordering::SeqCst);
+
+            reset_counters();
+            let mut msg_tab_def = make_key_msg(h_edit, VK_TAB);
+            assert_eq!(IsDialogMessageW(hdlg, &mut msg_tab_def), TRUE);
+            assert_eq!(input::GetFocus(), h_ok, "ordinary control Tab must advance focus to OK button");
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 0);
+
+            input::SetFocus(h_edit);
+            reset_counters();
+            let mut msg_ret_def = make_key_msg(h_edit, VK_RETURN);
+            assert_eq!(IsDialogMessageW(hdlg, &mut msg_ret_def), TRUE);
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(DLG_LAST_CMD_ID.load(Ordering::SeqCst), IDOK as usize);
+
+            reset_counters();
+            let mut msg_esc_def = make_key_msg(h_edit, VK_ESCAPE);
+            assert_eq!(IsDialogMessageW(hdlg, &mut msg_esc_def), TRUE);
+            assert_eq!(CTRL_KEYDOWN_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(DLG_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(DLG_LAST_CMD_ID.load(Ordering::SeqCst), IDCANCEL as usize);
+
+            assert_eq!(DestroyWindow(hdlg), TRUE);
         })
         .join()
         .unwrap();
