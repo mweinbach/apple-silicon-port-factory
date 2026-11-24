@@ -59,7 +59,7 @@ pub unsafe extern "win64" fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut
 
 pub fn ntstatus_to_win32(s: u32) -> u32 {
     match s {
-        0 => 0,
+        0 | 0x4000_0010 => 0, // STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED
         0x0000_0102 => err::ERROR_TIMEOUT,
         0x0000_0103 => err::ERROR_IO_PENDING,
         0xC000_0005 => err::ERROR_NOACCESS,

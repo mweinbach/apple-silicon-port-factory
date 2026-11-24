@@ -87,7 +87,7 @@ const DARWIN_SO_NOSIGPIPE: libc::c_int = 0x1022;
 
 fn ntstatus_to_win32_local(s: usize) -> u32 {
     match s {
-        STATUS_SUCCESS => 0,
+        STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED => 0,
         STATUS_PENDING => err::ERROR_IO_PENDING,
         STATUS_NOTIFY_ENUM_DIR => ERROR_NOTIFY_ENUM_DIR,
         STATUS_END_OF_FILE => err::ERROR_HANDLE_EOF,
@@ -830,9 +830,16 @@ pub struct OVERLAPPED {
 }
 
 pub(crate) const STATUS_SUCCESS: usize = 0;
+/// Informational NTSTATUS (`ntstatus.h`) used by Winsock/AFD for successful OOB (`MSG_OOB`) receives.
+pub(crate) const STATUS_RECEIVE_EXPEDITED: usize = 0x4000_0010;
 pub(crate) const STATUS_PENDING: usize = 0x103;
 pub(crate) const STATUS_END_OF_FILE: usize = 0xC000_0011;
 pub(crate) const STATUS_CANCELLED: usize = 0xC000_0120;
+
+#[inline]
+pub(crate) fn is_io_success_status(s: usize) -> bool {
+    s == STATUS_SUCCESS || s == STATUS_RECEIVE_EXPEDITED
+}
 
 /// Convert a Win32 / Winsock error code into an NTSTATUS suitable for `OVERLAPPED.Internal`.
 pub(crate) fn win32_to_ntstatus(win32_err: u32) -> usize {
@@ -1671,7 +1678,7 @@ pub unsafe extern "win64" fn GetOverlappedResultEx(h: HANDLE, ov: *mut OVERLAPPE
         std::ptr::write_unaligned(n, load_ov_internal_high(ov) as u32);
     }
     match status {
-        STATUS_SUCCESS => TRUE,
+        STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED => TRUE,
         STATUS_END_OF_FILE => {
             set_err(err::ERROR_HANDLE_EOF);
             FALSE
@@ -2881,7 +2888,7 @@ unsafe fn complete_overlapped_binding_with_hook<F: FnOnce()>(
     if suppress_iocp {
         return false;
     }
-    if synchronous && nt_status == STATUS_SUCCESS && (c.modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
+    if synchronous && is_io_success_status(nt_status) && (c.modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
         return false;
     }
     if let Some((iocp, key)) = c.iocp {
@@ -3017,7 +3024,7 @@ pub unsafe extern "win64" fn GetQueuedCompletionStatus(
         if !overlapped.is_null() {
             std::ptr::write_unaligned(overlapped, pkt.overlapped as *mut OVERLAPPED);
         }
-        if pkt.internal_status != STATUS_SUCCESS {
+        if !is_io_success_status(pkt.internal_status) {
             set_err(ntstatus_to_win32_local(pkt.internal_status));
             return FALSE;
         }

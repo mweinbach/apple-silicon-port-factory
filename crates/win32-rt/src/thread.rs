@@ -20,10 +20,11 @@ pub enum ApcItem {
         param: usize,
     },
     IoCompletion {
-        func: IoCompletionRoutine,
+        func: usize,
         err_code: u32,
         bytes: u32,
         overlapped: usize,
+        flags: u32,
     },
 }
 
@@ -595,8 +596,18 @@ pub fn run_pending_apcs() {
                 Some(ApcItem::User { func, param }) => unsafe {
                     crate::call_guest8(func as usize, param as u64, 0, 0, 0, 0, 0, 0, 0);
                 },
-                Some(ApcItem::IoCompletion { func, err_code, bytes, overlapped }) => unsafe {
-                    crate::call_guest8(func as usize, err_code as u64, bytes as u64, overlapped as u64, 0, 0, 0, 0, 0);
+                Some(ApcItem::IoCompletion { func, err_code, bytes, overlapped, flags }) => unsafe {
+                    crate::call_guest8(
+                        func,
+                        err_code as u64,
+                        bytes as u64,
+                        overlapped as u64,
+                        flags as u64,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
                 },
                 None => break,
             }
@@ -616,9 +627,22 @@ pub fn queue_apc(t: &ThreadObj, f: ApcProc, param: usize) {
 }
 
 pub fn queue_io_completion_apc(t: &ThreadObj, func: IoCompletionRoutine, err_code: u32, bytes: u32, overlapped: usize) {
+    queue_io_completion_apc_with_flags(t, func as usize, err_code, bytes, overlapped, 0);
+}
+
+/// Queue an I/O completion APC carrying an explicit 4th `dwFlags` argument
+/// (`LPWSAOVERLAPPED_COMPLETION_ROUTINE(dwError, cbTransferred, lpOverlapped, dwFlags)`).
+pub fn queue_io_completion_apc_with_flags(
+    t: &ThreadObj,
+    func: usize,
+    err_code: u32,
+    bytes: u32,
+    overlapped: usize,
+    flags: u32,
+) {
     {
         let mut q = t.apcs.lock().unwrap();
-        q.push(ApcItem::IoCompletion { func, err_code, bytes, overlapped });
+        q.push(ApcItem::IoCompletion { func, err_code, bytes, overlapped, flags });
         t.has_apc.store(true, Ordering::Release);
     }
     handles::notify_thread_apc(t.tid.load(Ordering::Relaxed) as u32);

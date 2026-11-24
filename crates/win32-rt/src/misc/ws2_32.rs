@@ -7,11 +7,11 @@
 
 use crate::kernel32::file::{
     complete_overlapped_binding, complete_overlapped_io, external_io_event, get_file,
-    load_ov_internal, load_ov_internal_high, lookup_io_completion_binding,
+    is_io_success_status, load_ov_internal, load_ov_internal_high, lookup_io_completion_binding,
     prepare_overlapped_pending, register_external_cancel_hook, register_external_io_handle,
     store_ov_internal, store_ov_internal_high, unregister_external_io_handle, win32_to_ntstatus,
     IoCompletionBinding, INVALID_HANDLE_VALUE, OVERLAPPED, STATUS_CANCELLED, STATUS_PENDING,
-    STATUS_SUCCESS,
+    STATUS_RECEIVE_EXPEDITED, STATUS_SUCCESS,
 };
 use crate::types::*;
 use std::collections::HashMap;
@@ -205,7 +205,7 @@ fn lookup_fd(s: usize) -> Option<i32> {
 
 fn ntstatus_to_wsa(status: usize) -> u32 {
     match status as u32 {
-        0 => 0,
+        0 | 0x4000_0010 => 0, // STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED
         0x0000_0103 => WSA_IO_INCOMPLETE,
         0xC000_0120 => WSA_OPERATION_ABORTED,
         0xC000_020D => WSAECONNRESET,
@@ -219,6 +219,15 @@ fn ntstatus_to_wsa(status: usize) -> u32 {
         0xC000_000D => WSAEINVAL,
         0xC000_0022 => WSAEACCES,
         s => crate::ntdll::ntstatus_to_win32(s),
+    }
+}
+
+#[inline]
+fn ntstatus_to_wsa_recv_flags(status: usize) -> u32 {
+    if status == STATUS_RECEIVE_EXPEDITED {
+        WIN_MSG_OOB
+    } else {
+        0
     }
 }
 
@@ -1321,6 +1330,7 @@ fn map_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
         (WIN_SOL_SOCKET, 0x0010) => Some((libc::SOL_SOCKET, libc::SO_DONTROUTE)),
         (WIN_SOL_SOCKET, 0x0020) => Some((libc::SOL_SOCKET, libc::SO_BROADCAST)),
         (WIN_SOL_SOCKET, 0x0080) => Some((libc::SOL_SOCKET, libc::SO_LINGER)),
+        (WIN_SOL_SOCKET, 0x0100) => Some((libc::SOL_SOCKET, libc::SO_OOBINLINE)),
         (WIN_SOL_SOCKET, 0x1001) => Some((libc::SOL_SOCKET, libc::SO_SNDBUF)),
         (WIN_SOL_SOCKET, 0x1002) => Some((libc::SOL_SOCKET, libc::SO_RCVBUF)),
         (WIN_SOL_SOCKET, 0x1005) => Some((libc::SOL_SOCKET, libc::SO_SNDTIMEO)),
@@ -2277,6 +2287,7 @@ unsafe fn step_overlapped_recv(
         && (pflags & libc::MSG_WAITALL) != 0
         && (pflags & (libc::MSG_PEEK | libc::MSG_OOB)) == 0
         && total_len > 0;
+    let want_oob = is_stream && (pflags & libc::MSG_OOB) != 0;
     let nb_flags = (pflags & !libc::MSG_WAITALL) | libc::MSG_DONTWAIT;
     loop {
         let mut chunk_flags = 0i32;
@@ -2304,8 +2315,16 @@ unsafe fn step_overlapped_recv(
             *recvd_so_far += k;
             if !wait_all || k == 0 || *recvd_so_far >= total_len {
                 let truncated_dgram = !is_stream && (*acc_msg_flags & libc::MSG_TRUNC) != 0;
+                let expedited_oob = is_stream
+                    && *recvd_so_far > 0
+                    && ((*acc_msg_flags & libc::MSG_OOB) != 0 || want_oob);
+                if expedited_oob {
+                    *acc_msg_flags |= libc::MSG_OOB;
+                }
                 let nt_status = if truncated_dgram {
                     win32_to_ntstatus(WSAEMSGSIZE)
+                } else if expedited_oob {
+                    STATUS_RECEIVE_EXPEDITED
                 } else {
                     STATUS_SUCCESS
                 };
@@ -2323,6 +2342,57 @@ unsafe fn step_overlapped_recv(
             continue;
         }
         if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+            return RecvStep::Pending;
+        }
+        if want_oob && e == libc::EINVAL {
+            // Darwin/BSD `recvmsg(..., MSG_OOB | MSG_DONTWAIT)` returns `EINVAL` when no urgent
+            // byte has arrived yet on a connected stream socket with `SO_OOBINLINE == 0`.
+            // Distinguish genuine `EINVAL` (`SO_OOBINLINE`), unconnected sockets, peer EOF, and
+            // socket errors from "urgent byte pending".
+            let mut oobinline: libc::c_int = 0;
+            let mut optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_OOBINLINE,
+                &mut oobinline as *mut _ as *mut c_void,
+                &mut optlen,
+            ) == 0
+                && oobinline != 0
+            {
+                return RecvStep::Error(libc::EINVAL);
+            }
+            let so_err = query_so_error(fd);
+            if so_err != 0 {
+                return RecvStep::Error(so_err);
+            }
+            let mut peer: libc::sockaddr_storage = std::mem::zeroed();
+            let mut plen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            if libc::getpeername(fd, &mut peer as *mut _ as *mut libc::sockaddr, &mut plen) != 0 {
+                let pe = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOTCONN);
+                return RecvStep::Error(pe);
+            }
+            let mut peek_b = 0u8;
+            let pr = libc::recv(
+                fd,
+                &mut peek_b as *mut u8 as *mut c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            );
+            if pr == 0 {
+                return RecvStep::Complete {
+                    nt_status: STATUS_SUCCESS,
+                    bytes: 0,
+                    msg_flags: 0,
+                    from: from_captured.take(),
+                };
+            }
+            if pr < 0 {
+                let pe = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+                if pe != libc::EAGAIN && pe != libc::EWOULDBLOCK && pe != libc::EINTR {
+                    return RecvStep::Error(pe);
+                }
+            }
             return RecvStep::Pending;
         }
         return RecvStep::Error(e);
@@ -2468,11 +2538,16 @@ unsafe fn submit_overlapped_recv(
         if matches!(step, RecvStep::Pending) {
             prepare_socket_pending(s, ov, completion as usize);
             ensure_async_io_started(&mut st);
+            let poll_events = if is_stream && (pflags & libc::MSG_OOB) != 0 {
+                libc::POLLPRI
+            } else {
+                libc::POLLIN
+            };
             st.ops.push(PendingSocketOp {
                 socket_handle: s,
                 secondary_socket: None,
                 poll_fd: fd,
-                poll_events: libc::POLLIN,
+                poll_events,
                 overlapped: ov as usize,
                 issuing_tid,
                 issuing_thread: issuing_thread.clone(),
@@ -2515,13 +2590,13 @@ unsafe fn submit_overlapped_recv(
                 }
             }
             if !flags.is_null() {
-                let out_fl = if (msg_flags & libc::MSG_OOB) != 0 { 0x1 } else { 0 };
+                let out_fl = if (msg_flags & libc::MSG_OOB) != 0 { WIN_MSG_OOB } else { 0 };
                 std::ptr::write_unaligned(flags, out_fl);
             }
             if !recvd.is_null() {
                 std::ptr::write_unaligned(recvd, bytes as u32);
             }
-            if nt_status != STATUS_SUCCESS {
+            if !is_io_success_status(nt_status) {
                 // Immediate failure (e.g. oversized UDP datagram -> WSAEMSGSIZE): per Win32
                 // WSARecv/WSARecvFrom contract, return SOCKET_ERROR with the WSA error code
                 // and emit no completion indication.
@@ -2534,7 +2609,7 @@ unsafe fn submit_overlapped_recv(
                 completion_binding.as_deref(),
                 issuing_thread.as_ref(),
                 issuing_tid,
-                STATUS_SUCCESS,
+                nt_status,
                 bytes,
                 true,
             );
@@ -2698,9 +2773,9 @@ pub unsafe extern "win64" fn WSAGetOverlappedResult(
         std::ptr::write_unaligned(cb_transfer, bytes);
     }
     if !flags.is_null() {
-        std::ptr::write_unaligned(flags, 0);
+        std::ptr::write_unaligned(flags, ntstatus_to_wsa_recv_flags(status));
     }
-    if status == STATUS_SUCCESS {
+    if is_io_success_status(status) {
         TRUE
     } else {
         err(ntstatus_to_wsa(status), FALSE)
@@ -3878,12 +3953,19 @@ unsafe fn finish_overlapped_op(
         store_ov_internal_high(ov_ptr, bytes);
         store_ov_internal(ov_ptr, nt_status);
         let wsa_err = ntstatus_to_wsa(nt_status);
+        let wsa_flags = ntstatus_to_wsa_recv_flags(nt_status);
         let target = issuing_thread
             .cloned()
             .or_else(|| crate::thread::find_by_tid(issuing_tid));
         if let Some(t) = target {
-            let func: crate::thread::IoCompletionRoutine = std::mem::transmute(completion_routine);
-            crate::thread::queue_io_completion_apc(&t, func, wsa_err, bytes as u32, ov);
+            crate::thread::queue_io_completion_apc_with_flags(
+                &t,
+                completion_routine,
+                wsa_err,
+                bytes as u32,
+                ov,
+                wsa_flags,
+            );
         }
     } else if completion_binding.is_some() {
         complete_overlapped_binding(completion_binding, ov_ptr, nt_status, bytes, synchronous);
@@ -4429,11 +4511,36 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
 }
 
 fn async_io_reactor_loop() {
+    #[cfg(target_vendor = "apple")]
+    const DARWIN_EVFILT_EXCEPT: i16 = -15;
+    #[cfg(target_vendor = "apple")]
+    const DARWIN_NOTE_OOB: u32 = 0x2;
+
     let mut pfds: Vec<libc::pollfd> = Vec::new();
     let mut completed: Vec<CompletedOp> = Vec::new();
+    // On Darwin, `poll(2)` does not report TCP OOB via `POLLPRI`; a pollable `kqueue`
+    // watching `EVFILT_EXCEPT` + `NOTE_OOB` wakes `poll(2)` cleanly whenever urgent data
+    // arrives without letting ordinary `POLLIN` traffic mask or spin pending OOB receives.
+    #[cfg(target_vendor = "apple")]
+    let oob_kq: i32 = unsafe {
+        let kq = libc::kqueue();
+        if kq >= 0 {
+            let fl = libc::fcntl(kq, libc::F_GETFD);
+            if fl >= 0 {
+                libc::fcntl(kq, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+            }
+        }
+        kq
+    };
+    #[cfg(target_vendor = "apple")]
+    let mut oob_fds: Vec<i32> = Vec::new();
+    #[cfg(target_vendor = "apple")]
+    let mut prev_oob_fds: Vec<i32> = Vec::new();
 
     loop {
         pfds.clear();
+        #[cfg(target_vendor = "apple")]
+        oob_fds.clear();
         let wake_r = {
             let mut st = ASYNC_IO.inner.lock().unwrap();
             st.poll_gen = st.poll_gen.wrapping_add(1);
@@ -4452,6 +4559,10 @@ fn async_io_reactor_loop() {
                     continue;
                 }
                 if op.poll_fd >= 0 && op.poll_events != 0 {
+                    #[cfg(target_vendor = "apple")]
+                    if (op.poll_events & libc::POLLPRI) != 0 && !oob_fds.contains(&op.poll_fd) {
+                        oob_fds.push(op.poll_fd);
+                    }
                     if let Some(existing) = pfds[1..].iter_mut().find(|p| p.fd == op.poll_fd) {
                         existing.events |= op.poll_events;
                     } else {
@@ -4464,6 +4575,55 @@ fn async_io_reactor_loop() {
                 }
             }
             wr
+        };
+
+        #[cfg(target_vendor = "apple")]
+        let oob_kq_idx = if oob_kq >= 0 {
+            for &old_fd in &prev_oob_fds {
+                if !oob_fds.contains(&old_fd) {
+                    let del = libc::kevent {
+                        ident: old_fd as usize,
+                        filter: DARWIN_EVFILT_EXCEPT,
+                        flags: libc::EV_DELETE,
+                        fflags: 0,
+                        data: 0,
+                        udata: std::ptr::null_mut(),
+                    };
+                    unsafe {
+                        let _ = libc::kevent(oob_kq, &del, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                    }
+                }
+            }
+            for &fd in &oob_fds {
+                if !prev_oob_fds.contains(&fd) {
+                    let add = libc::kevent {
+                        ident: fd as usize,
+                        filter: DARWIN_EVFILT_EXCEPT,
+                        flags: libc::EV_ADD | libc::EV_CLEAR,
+                        fflags: DARWIN_NOTE_OOB,
+                        data: 0,
+                        udata: std::ptr::null_mut(),
+                    };
+                    unsafe {
+                        let _ = libc::kevent(oob_kq, &add, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                    }
+                }
+            }
+            prev_oob_fds.clear();
+            prev_oob_fds.extend_from_slice(&oob_fds);
+            if !oob_fds.is_empty() {
+                let idx = pfds.len();
+                pfds.push(libc::pollfd {
+                    fd: oob_kq,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                Some(idx)
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
@@ -4482,6 +4642,38 @@ fn async_io_reactor_loop() {
                 let n = unsafe { libc::read(wake_r, drain.as_mut_ptr() as *mut c_void, drain.len()) };
                 if n <= 0 {
                     break;
+                }
+            }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        if let Some(kq_idx) = oob_kq_idx {
+            if (pfds[kq_idx].revents & libc::POLLIN) != 0 {
+                let zero_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                let mut evs: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+                loop {
+                    let n = unsafe {
+                        libc::kevent(
+                            oob_kq,
+                            std::ptr::null(),
+                            0,
+                            evs.as_mut_ptr(),
+                            evs.len() as libc::c_int,
+                            &zero_ts,
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    for ev in &evs[..n as usize] {
+                        let ready_fd = ev.ident as i32;
+                        if let Some(p) = pfds[1..kq_idx].iter_mut().find(|p| p.fd == ready_fd) {
+                            p.revents |= libc::POLLPRI;
+                        }
+                    }
+                    if (n as usize) < evs.len() {
+                        break;
+                    }
                 }
             }
         }
@@ -6230,11 +6422,13 @@ mod tests {
         static APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
         static APC_BYTES: AtomicU32 = AtomicU32::new(0);
         static APC_OV: AtomicUsize = AtomicUsize::new(0);
+        static APC_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
 
-        unsafe extern "win64" fn wsa_completion_cb(err_code: u32, bytes: u32, ov: usize) {
+        unsafe extern "win64" fn wsa_completion_cb(err_code: u32, bytes: u32, ov: usize, flags: u32) {
             APC_ERR.store(err_code, Ordering::Release);
             APC_BYTES.store(bytes, Ordering::Release);
             APC_OV.store(ov, Ordering::Release);
+            APC_FLAGS.store(flags, Ordering::Release);
             APC_CALLS.fetch_add(1, Ordering::AcqRel);
         }
 
@@ -6309,17 +6503,21 @@ mod tests {
             assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
             assert_eq!(APC_BYTES.load(Ordering::Acquire) as usize, payload.len());
             assert_eq!(APC_OV.load(Ordering::Acquire), unaligned_ov as usize);
+            assert_eq!(APC_FLAGS.load(Ordering::Acquire), 0);
             assert_eq!(&rbuf_mem[..payload.len()], payload);
 
             // Ignored hEvent must remain unsignaled!
             assert_eq!(WaitForSingleObject(ignored_ev, 0), crate::types::WAIT_TIMEOUT);
 
             // WSAGetOverlappedResult must read the odd-aligned OVERLAPPED safely.
+            out_flags = 0xDEAD;
             assert_eq!(WSAGetOverlappedResult(acc, unaligned_ov, &mut xfer, FALSE, &mut out_flags), TRUE);
             assert_eq!(xfer as usize, payload.len());
+            assert_eq!(out_flags, 0);
 
             // 2. Immediate WSASend on odd-aligned OVERLAPPED with completion routine also preserves ignored hEvent.
             APC_CALLS.store(0, Ordering::Release);
+            APC_FLAGS.store(u32::MAX, Ordering::Release);
             let reply = b"reply-unaligned";
             let swb = WsaBuf { len: reply.len() as u32, buf: reply.as_ptr() as *mut u8 };
             let mut sbytes = 0u32;
@@ -6340,6 +6538,7 @@ mod tests {
             assert_eq!(APC_ERR.load(Ordering::Acquire), 0);
             assert_eq!(APC_BYTES.load(Ordering::Acquire) as usize, reply.len());
             assert_eq!(APC_OV.load(Ordering::Acquire), unaligned_ov as usize);
+            assert_eq!(APC_FLAGS.load(Ordering::Acquire), 0);
             assert_eq!(WaitForSingleObject(ignored_ev, 0), crate::types::WAIT_TIMEOUT);
 
             assert_eq!(CloseHandle(ignored_ev), TRUE);
@@ -8372,6 +8571,331 @@ mod tests {
             assert_eq!(closesocket(cli), 0);
             assert_eq!(closesocket(srv), 0);
             assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn overlapped_wsa_recv_and_recvfrom_preserve_oob_flags_and_apc_arg4() {
+        use crate::kernel32::file::{
+            CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus,
+            SetFileCompletionNotificationModes, INVALID_HANDLE_VALUE, OVERLAPPED,
+        };
+        use crate::kernel32::threads::CloseHandle;
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        static OOB_APC_CALLS: AtomicU32 = AtomicU32::new(0);
+        static OOB_APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static OOB_APC_BYTES: AtomicU32 = AtomicU32::new(0);
+        static OOB_APC_OV: AtomicUsize = AtomicUsize::new(0);
+        static OOB_APC_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+        unsafe extern "win64" fn oob_completion_cb(
+            err_code: u32,
+            bytes: u32,
+            ov: usize,
+            flags: u32,
+        ) {
+            OOB_APC_ERR.store(err_code, Ordering::Release);
+            OOB_APC_BYTES.store(bytes, Ordering::Release);
+            OOB_APC_OV.store(ov, Ordering::Release);
+            OOB_APC_FLAGS.store(flags, Ordering::Release);
+            OOB_APC_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let reset_apc = || {
+            OOB_APC_CALLS.store(0, Ordering::Release);
+            OOB_APC_ERR.store(u32::MAX, Ordering::Release);
+            OOB_APC_BYTES.store(0, Ordering::Release);
+            OOB_APC_OV.store(0, Ordering::Release);
+            OOB_APC_FLAGS.store(u32::MAX, Ordering::Release);
+        };
+
+        unsafe {
+            let mut wd = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, wd.as_mut_ptr()), 0);
+
+            let make_tcp_pair = || -> (usize, usize, usize) {
+                let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+                assert_ne!(srv, INVALID_SOCKET);
+                let mut sa = loopback_sa(0);
+                assert_eq!(bind(srv, sa.as_ptr(), 16), 0);
+                assert_eq!(listen(srv, 4), 0);
+                let mut slen = 16i32;
+                assert_eq!(getsockname(srv, sa.as_mut_ptr(), &mut slen), 0);
+
+                let cli = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+                assert_ne!(cli, INVALID_SOCKET);
+                assert_eq!(connect(cli, sa.as_ptr(), 16), 0);
+                let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+                assert_ne!(acc, INVALID_SOCKET);
+                (srv, cli, acc)
+            };
+
+            let (srv, cli, acc) = make_tcp_pair();
+
+            // Odd-aligned OVERLAPPED to keep unaligned-access safety covered too.
+            let mut raw_ov = [0u8; 64];
+            let ov = raw_ov.as_mut_ptr().add(1) as *mut OVERLAPPED;
+            std::ptr::write_unaligned(ov, std::mem::zeroed());
+
+            // 1. Delayed reactor OOB completion even when ordinary data is ALREADY buffered:
+            //    ordinary data must NOT mask or prematurely complete the MSG_OOB receive.
+            assert_eq!(send(cli, b"norm".as_ptr(), 4, 0), 4);
+            let mut pfd = libc::pollfd {
+                fd: lookup_fd(acc).unwrap(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(libc::poll(&mut pfd, 1, 2000) > 0);
+
+            reset_apc();
+            let mut oob_buf = [0u8; 8];
+            let wb = WsaBuf { len: oob_buf.len() as u32, buf: oob_buf.as_mut_ptr() };
+            let mut recvd = 0u32;
+            let mut fl = WIN_MSG_OOB;
+            assert_eq!(
+                WSARecv(
+                    acc,
+                    &wb,
+                    1,
+                    &mut recvd,
+                    &mut fl,
+                    ov as *mut c_void,
+                    oob_completion_cb as *mut c_void,
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            // Still pending before urgent byte arrives (ordinary "norm" did not complete it).
+            assert_eq!(SleepEx(40, TRUE), 0);
+            assert_eq!(OOB_APC_CALLS.load(Ordering::Acquire), 0);
+
+            // Now send an actual local urgent TCP byte.
+            assert_eq!(send(cli, b"!".as_ptr(), 1, WIN_MSG_OOB as i32), 1);
+            assert_eq!(SleepEx(2000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(OOB_APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(OOB_APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(OOB_APC_BYTES.load(Ordering::Acquire), 1);
+            assert_eq!(OOB_APC_OV.load(Ordering::Acquire), ov as usize);
+            assert_eq!(OOB_APC_FLAGS.load(Ordering::Acquire), WIN_MSG_OOB);
+            assert_eq!(&oob_buf[..1], b"!");
+
+            // Repeated WSAGetOverlappedResult queries must consistently report TRUE + WIN_MSG_OOB.
+            for _ in 0..2 {
+                let mut xfer = 0u32;
+                let mut out_fl = 0u32;
+                assert_eq!(WSAGetOverlappedResult(acc, ov, &mut xfer, FALSE, &mut out_fl), TRUE);
+                assert_eq!(xfer, 1);
+                assert_eq!(out_fl, WIN_MSG_OOB);
+            }
+            let mut gor_n = 0u32;
+            assert_eq!(GetOverlappedResult(acc as HANDLE, ov, &mut gor_n, FALSE), TRUE);
+            assert_eq!(gor_n, 1);
+
+            // 2. Reuse the EXACT SAME OVERLAPPED for an ordinary WSARecv (draining untouched "norm"):
+            //    must return flags == 0 in BOTH callback arg4 and WSAGetOverlappedResult (no stale OOB).
+            reset_apc();
+            let mut norm_buf = [0u8; 8];
+            let nwb = WsaBuf { len: norm_buf.len() as u32, buf: norm_buf.as_mut_ptr() };
+            fl = 0;
+            assert_eq!(
+                WSARecv(
+                    acc,
+                    &nwb,
+                    1,
+                    &mut recvd,
+                    &mut fl,
+                    ov as *mut c_void,
+                    oob_completion_cb as *mut c_void,
+                ),
+                0
+            );
+            assert_eq!(recvd, 4);
+            assert_eq!(fl, 0);
+            assert_eq!(&norm_buf[..4], b"norm");
+            assert_eq!(SleepEx(2000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(OOB_APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(OOB_APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(OOB_APC_BYTES.load(Ordering::Acquire), 4);
+            assert_eq!(OOB_APC_FLAGS.load(Ordering::Acquire), 0);
+            let mut xfer = 0u32;
+            let mut out_fl = 0xDEAD;
+            assert_eq!(WSAGetOverlappedResult(acc, ov, &mut xfer, FALSE, &mut out_fl), TRUE);
+            assert_eq!(xfer, 4);
+            assert_eq!(out_fl, 0);
+
+            let send_oob_and_wait = |tx: usize, rx: usize, byte: u8| {
+                let rx_fd = lookup_fd(rx).unwrap();
+                let kq = libc::kqueue();
+                assert!(kq >= 0);
+                let ev_add = libc::kevent {
+                    ident: rx_fd as usize,
+                    filter: -15, // EVFILT_EXCEPT
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: 0x2, // NOTE_OOB
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                assert_eq!(
+                    libc::kevent(kq, &ev_add, 1, std::ptr::null_mut(), 0, std::ptr::null()),
+                    0
+                );
+                let zero_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                let mut out: libc::kevent = std::mem::zeroed();
+                let _ = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &zero_ts);
+                assert_eq!(send(tx, &byte as *const u8, 1, WIN_MSG_OOB as i32), 1);
+                let wait_ts = libc::timespec { tv_sec: 2, tv_nsec: 0 };
+                let rc = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, &wait_ts);
+                let _ = libc::close(kq);
+                assert_eq!(rc, 1, "expected fresh OOB arrival on fd={rx_fd}");
+            };
+
+            // 3. Immediate OOB completion (urgent byte already buffered before submission):
+            //    verify lpFlags, callback arg4, and WSAGetOverlappedResult all carry WIN_MSG_OOB.
+            send_oob_and_wait(cli, acc, b'Q');
+
+            reset_apc();
+            oob_buf = [0u8; 8];
+            fl = WIN_MSG_OOB;
+            recvd = 0;
+            assert_eq!(
+                WSARecv(
+                    acc,
+                    &wb,
+                    1,
+                    &mut recvd,
+                    &mut fl,
+                    ov as *mut c_void,
+                    oob_completion_cb as *mut c_void,
+                ),
+                0
+            );
+            assert_eq!(recvd, 1);
+            assert_eq!(fl, WIN_MSG_OOB);
+            assert_eq!(&oob_buf[..1], b"Q");
+            assert_eq!(SleepEx(2000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(OOB_APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(OOB_APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(OOB_APC_BYTES.load(Ordering::Acquire), 1);
+            assert_eq!(OOB_APC_FLAGS.load(Ordering::Acquire), WIN_MSG_OOB);
+            out_fl = 0;
+            assert_eq!(WSAGetOverlappedResult(acc, ov, &mut xfer, FALSE, &mut out_fl), TRUE);
+            assert_eq!(xfer, 1);
+            assert_eq!(out_fl, WIN_MSG_OOB);
+
+            // Reuse OVERLAPPED for WSASend -> clears stale OOB flag to 0.
+            reset_apc();
+            let swb = WsaBuf { len: 2, buf: b"hi".as_ptr() as *mut u8 };
+            let mut sent = 0u32;
+            assert_eq!(
+                WSASend(acc, &swb, 1, &mut sent, 0, ov as *mut c_void, oob_completion_cb as *mut c_void),
+                0
+            );
+            assert_eq!(SleepEx(2000, TRUE), crate::types::WAIT_IO_COMPLETION);
+            assert_eq!(OOB_APC_FLAGS.load(Ordering::Acquire), 0);
+            out_fl = 0xDEAD;
+            assert_eq!(WSAGetOverlappedResult(acc, ov, &mut xfer, FALSE, &mut out_fl), TRUE);
+            assert_eq!(out_fl, 0);
+
+            // 4. IOCP / GetQueuedCompletionStatus + WSARecvFrom (delayed & immediate with
+            //    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) treat STATUS_RECEIVE_EXPEDITED as success.
+            let (srv2, cli2, acc2) = make_tcp_pair();
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+            assert_eq!(CreateIoCompletionPort(acc2 as HANDLE, iocp, 0x9301, 0), iocp);
+
+            let mut rf_buf = [0u8; 8];
+            let rf_wb = WsaBuf { len: rf_buf.len() as u32, buf: rf_buf.as_mut_ptr() };
+            let mut from_sa = [0u8; 32];
+            let mut from_len = 32i32;
+            let mut ov_rf: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_OOB;
+            assert_eq!(
+                WSARecvFrom(
+                    acc2,
+                    &rf_wb,
+                    1,
+                    &mut recvd,
+                    &mut fl,
+                    from_sa.as_mut_ptr(),
+                    &mut from_len,
+                    &mut ov_rf as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            assert_eq!(send(cli2, b"R".as_ptr(), 1, WIN_MSG_OOB as i32), 1);
+            let mut gq_bytes = 0u32;
+            let mut gq_key = 0usize;
+            let mut gq_ov: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut gq_bytes, &mut gq_key, &mut gq_ov, 2000), TRUE);
+            assert_eq!(gq_key, 0x9301);
+            assert_eq!(gq_ov, &mut ov_rf as *mut OVERLAPPED);
+            assert_eq!(gq_bytes, 1);
+            assert_eq!(&rf_buf[..1], b"R");
+            out_fl = 0;
+            assert_eq!(WSAGetOverlappedResult(acc2, &mut ov_rf, &mut xfer, FALSE, &mut out_fl), TRUE);
+            assert_eq!(xfer, 1);
+            assert_eq!(out_fl, WIN_MSG_OOB);
+
+            // Enable FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: immediate OOB completion succeeds
+            // without queueing an IOCP packet, while WSAGetOverlappedResult still reports WIN_MSG_OOB.
+            assert_eq!(SetFileCompletionNotificationModes(acc2 as HANDLE, 0x1), TRUE);
+            send_oob_and_wait(cli2, acc2, b'S');
+            let mut ov_skip: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_OOB;
+            recvd = 0;
+            assert_eq!(
+                WSARecv(acc2, &rf_wb, 1, &mut recvd, &mut fl, &mut ov_skip as *mut _ as *mut c_void, std::ptr::null_mut()),
+                0
+            );
+            assert_eq!(recvd, 1);
+            assert_eq!(fl, WIN_MSG_OOB);
+            assert_eq!(&rf_buf[..1], b"S");
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut gq_bytes, &mut gq_key, &mut gq_ov, 50), FALSE);
+            assert_eq!(crate::kernel32::process::GetLastError(), WAIT_TIMEOUT);
+            out_fl = 0;
+            assert_eq!(WSAGetOverlappedResult(acc2, &mut ov_skip, &mut xfer, FALSE, &mut out_fl), TRUE);
+            assert_eq!(xfer, 1);
+            assert_eq!(out_fl, WIN_MSG_OOB);
+
+            // 5. Genuine unsupported/invalid MSG_OOB failures remain failures:
+            //    SO_OOBINLINE=1 + MSG_OOB -> WSAEINVAL; UDP + MSG_OOB -> WSAEOPNOTSUPP.
+            let one: i32 = 1;
+            assert_eq!(
+                setsockopt(acc2, 0xFFFF, 0x0100 /* SO_OOBINLINE */, &one as *const i32 as *const u8, 4),
+                0
+            );
+            let mut ov_inv: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_OOB;
+            assert_eq!(
+                WSARecv(acc2, &rf_wb, 1, &mut recvd, &mut fl, &mut ov_inv as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEINVAL as i32);
+
+            let udp = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            assert_ne!(udp, INVALID_SOCKET);
+            let usa = loopback_sa(0);
+            assert_eq!(bind(udp, usa.as_ptr(), 16), 0);
+            fl = WIN_MSG_OOB;
+            assert_eq!(
+                WSARecv(udp, &rf_wb, 1, &mut recvd, &mut fl, &mut ov_inv as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEOPNOTSUPP as i32);
+
+            assert_eq!(closesocket(udp), 0);
+            assert_eq!(closesocket(acc2), 0);
+            assert_eq!(closesocket(cli2), 0);
+            assert_eq!(closesocket(srv2), 0);
+            assert_eq!(CloseHandle(iocp), TRUE);
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(cli), 0);
+            assert_eq!(closesocket(srv), 0);
         }
     }
 }
