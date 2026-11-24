@@ -46,6 +46,33 @@ pub fn set_guest_state_hook(f: GuestStateFn) {
     let _ = GUEST_STATE.set(f);
 }
 
+/// Snapshot the calling thread's innermost guest x86-64 interpreter state as a
+/// [`Context`] suitable for [`report`], if the thread is currently running guest code.
+pub fn capture_guest_context() -> Option<Context> {
+    let (gpr, rip) = GUEST_STATE.get()?()?;
+    let mut ctx = Context::zeroed();
+    ctx.context_flags = unwind::CONTEXT_FULL | unwind::CONTEXT_SEGMENTS;
+    ctx.gpr = gpr;
+    ctx.rip = rip;
+    ctx.mx_csr = 0x1F80;
+    Some(ctx)
+}
+
+/// Best-effort guest caller PC for native traps called from guest code on ARM64
+/// (prefers `[rsp]` when guest RIP is outside a mapped PE module, else guest RIP).
+pub fn guest_caller_hint() -> Option<u64> {
+    let (gpr, rip) = GUEST_STATE.get()?()?;
+    if loader_module(rip) {
+        return Some(rip);
+    }
+    if let Some(caller) = read_u64(gpr[RSP]) {
+        if loader_module(caller) {
+            return Some(caller);
+        }
+    }
+    (rip != 0).then_some(rip)
+}
+
 // ---------------------------------------------------------------------------
 // Memory and register helpers
 // ---------------------------------------------------------------------------
@@ -423,7 +450,7 @@ fn line(s: impl AsRef<str>) {
 }
 
 fn crash_dir() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("AW2_CRASH_DIR") {
+    if let Some(p) = std::env::var_os("PORT_CRASH_DIR").or_else(|| std::env::var_os("AW2_CRASH_DIR")) {
         return p.into();
     }
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

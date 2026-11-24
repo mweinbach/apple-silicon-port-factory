@@ -1037,6 +1037,7 @@ static DEV_VTBL: DeviceVTable = DeviceVTable {
 };
 
 fn new_device(slot: usize, wide: bool) -> *mut c_void {
+    crate::com::register_vtbl_struct(&DEV_VTBL);
     Box::into_raw(Box::new(DeviceObj {
         vtbl: &DEV_VTBL,
         refs: AtomicU32::new(1),
@@ -1693,6 +1694,7 @@ static VTBL: VTable = VTable {
 };
 
 fn new_obj(wide: bool) -> *mut c_void {
+    crate::com::register_vtbl_struct(&VTBL);
     Box::into_raw(Box::new(Obj { vtbl: &VTBL, refs: AtomicU32::new(1), wide })) as *mut c_void
 }
 

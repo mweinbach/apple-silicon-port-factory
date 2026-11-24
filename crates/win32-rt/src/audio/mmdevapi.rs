@@ -530,6 +530,7 @@ pub type DeviceObj = ComObj<IMMDeviceVtbl, DeviceInner>;
 const ENDPOINT_IFACE_OFFSET: usize = std::mem::offset_of!(DeviceObj, inner) + std::mem::offset_of!(DeviceInner, endpoint_vtbl);
 
 pub fn new_device(ep: Arc<Endpoint>) -> *mut DeviceObj {
+    register_vtbl_struct(&ENDPOINT_VTBL);
     DeviceObj::create(&DEVICE_VTBL, DeviceInner { endpoint_vtbl: &ENDPOINT_VTBL, ep })
 }
 
@@ -551,7 +552,7 @@ mod device {
             std::ptr::write_unaligned(out, (this as *mut u8).add(ENDPOINT_IFACE_OFFSET) as *mut c_void);
             S_OK
         } else {
-            log::debug!(target: "audio", "IMMDevice::QueryInterface({iid:?}) -> E_NOINTERFACE");
+            crate::com::warn_qi_failed_once("IMMDevice", &crate::com::Guid::from_win_guid(iid));
             E_NOINTERFACE
         }
     }
