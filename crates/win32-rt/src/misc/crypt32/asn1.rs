@@ -1661,11 +1661,10 @@ pub(super) unsafe fn cert_find_extension_impl(
 // DPAPI: CryptProtectData / CryptUnprotectData (AES-256-CTR + HMAC-SHA256)
 // ---------------------------------------------------------------------------
 
-const DPAPI_MAGIC: &[u8; 8] = b"PFDPAPI1";
+const DPAPI_MAGIC: &[u8; 8] = b"PFDPAPI2";
 const CRYPTPROTECT_LOCAL_MACHINE: u32 = 0x4;
 
 extern "C" {
-    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
     fn CCHmac(
         alg: u32,
         key: *const c_void,
@@ -1699,31 +1698,174 @@ extern "C" {
     fn CCCryptorRelease(cryptor_ref: *mut c_void) -> i32;
 }
 
-unsafe fn dpapi_derive_keys(local_machine: bool, entropy: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let mut seed = Vec::new();
-    seed.extend_from_slice(b"port-factory-dpapi-v1:");
-    if local_machine {
-        seed.extend_from_slice(b"machine:");
+fn sanitize_profile_user(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "player".to_string()
     } else {
-        seed.extend_from_slice(b"user:");
-        if let Some(u) = crate::process::get_env("USERNAME") {
-            seed.extend_from_slice(u.as_bytes());
+        clean
+    }
+}
+
+fn current_dpapi_user() -> String {
+    let raw = crate::process::get_env("USERNAME")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "player".to_string());
+    sanitize_profile_user(&raw)
+}
+
+pub(super) fn dpapi_secret_path(local_machine: bool) -> std::path::PathBuf {
+    let root = crate::path::default_translator_root();
+    if local_machine {
+        root.join("ProgramData")
+            .join("Microsoft")
+            .join("Protect")
+            .join("dpapi_machine.key")
+    } else {
+        let user = current_dpapi_user();
+        root.join("AppData")
+            .join("Roaming")
+            .join("Microsoft")
+            .join("Protect")
+            .join(format!("dpapi_user_{user}.key"))
+    }
+}
+
+/// Load or atomically generate a 32-byte random host secret stored with `0600`
+/// permissions under the virtual profile. Never falls back to a constant key.
+fn load_or_create_dpapi_secret(local_machine: bool) -> std::io::Result<[u8; 32]> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = dpapi_secret_path(local_machine);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DPAPI host secret file has invalid length",
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "DPAPI secret path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let mut secret = [0u8; 32];
+    unsafe {
+        libc::arc4random_buf(secret.as_mut_ptr() as *mut c_void, secret.len());
+    }
+    let mut rnd = [0u8; 8];
+    unsafe {
+        libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    }
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{suffix:016x}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("dpapi.key"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&secret)?;
+        f.sync_all()?;
+    }
+
+    // Use hard_link so racing processes never overwrite an already-created secret.
+    match std::fs::hard_link(&tmp_path, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            Ok(secret)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_path);
+            let bytes = std::fs::read(&path)?;
+            if bytes.len() != 32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "DPAPI host secret file has invalid length",
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            Ok(key)
+        }
+        Err(_) => {
+            // Fallback for filesystems without hard_link: create_new directly.
+            let _ = std::fs::remove_file(&tmp_path);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(&secret)?;
+                    f.sync_all()?;
+                    Ok(secret)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let bytes = std::fs::read(&path)?;
+                    if bytes.len() != 32 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "DPAPI host secret file has invalid length",
+                        ));
+                    }
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    Ok(key)
+                }
+                Err(e) => Err(e),
+            }
         }
     }
-    seed.extend_from_slice(b":entropy:");
-    seed.extend_from_slice(&(entropy.len() as u32).to_le_bytes());
-    seed.extend_from_slice(entropy);
+}
 
-    let mut enc_input = seed.clone();
-    enc_input.extend_from_slice(b":enc");
-    let mut enc_key = [0u8; 32];
-    CC_SHA256(enc_input.as_ptr() as *const c_void, enc_input.len() as u32, enc_key.as_mut_ptr());
+unsafe fn dpapi_derive_keys(local_machine: bool, entropy: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    let master_secret = load_or_create_dpapi_secret(local_machine).ok()?;
+    let mut info = Vec::with_capacity(64 + entropy.len());
+    info.extend_from_slice(b"port-factory-dpapi-v2:");
+    if local_machine {
+        info.extend_from_slice(b"machine");
+    } else {
+        info.extend_from_slice(b"user:");
+        info.extend_from_slice(current_dpapi_user().as_bytes());
+    }
+    info.extend_from_slice(b":entropy:");
+    info.extend_from_slice(&(entropy.len() as u32).to_le_bytes());
+    info.extend_from_slice(entropy);
 
-    let mut mac_input = seed;
-    mac_input.extend_from_slice(b":mac");
-    let mut mac_key = [0u8; 32];
-    CC_SHA256(mac_input.as_ptr() as *const c_void, mac_input.len() as u32, mac_key.as_mut_ptr());
-    (enc_key, mac_key)
+    let mut enc_info = info.clone();
+    enc_info.extend_from_slice(b":enc");
+    let enc_key = dpapi_hmac_sha256(&master_secret, &enc_info);
+
+    let mut mac_info = info;
+    mac_info.extend_from_slice(b":mac");
+    let mac_key = dpapi_hmac_sha256(&master_secret, &mac_info);
+    Some((enc_key, mac_key))
 }
 
 unsafe fn dpapi_aes256_ctr(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
@@ -1778,6 +1920,69 @@ unsafe fn dpapi_hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     tag
 }
 
+pub(crate) unsafe fn dpapi_protect_bytes(
+    local_machine: bool,
+    descr: &str,
+    entropy: &[u8],
+    plain: &[u8],
+) -> Option<Vec<u8>> {
+    let descr_bytes = descr.as_bytes();
+    let scope_flags = if local_machine { CRYPTPROTECT_LOCAL_MACHINE } else { 0 };
+    let (enc_key, mac_key) = dpapi_derive_keys(local_machine, entropy)?;
+
+    let mut nonce = [0u8; 16];
+    libc::arc4random_buf(nonce.as_mut_ptr() as *mut c_void, nonce.len());
+
+    let mut combined_plain = Vec::with_capacity(descr_bytes.len() + plain.len());
+    combined_plain.extend_from_slice(descr_bytes);
+    combined_plain.extend_from_slice(plain);
+    let ct = dpapi_aes256_ctr(&enc_key, &nonce, &combined_plain)?;
+
+    let mut env = Vec::with_capacity(8 + 4 + 16 + 4 + 4 + ct.len() + 32);
+    env.extend_from_slice(DPAPI_MAGIC);
+    env.extend_from_slice(&scope_flags.to_le_bytes());
+    env.extend_from_slice(&nonce);
+    env.extend_from_slice(&(descr_bytes.len() as u32).to_le_bytes());
+    env.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    env.extend_from_slice(&ct);
+    let tag = dpapi_hmac_sha256(&mac_key, &env);
+    env.extend_from_slice(&tag);
+    Some(env)
+}
+
+pub(crate) unsafe fn dpapi_unprotect_bytes(
+    entropy: &[u8],
+    env: &[u8],
+) -> Option<(String, Vec<u8>)> {
+    const MIN_LEN: usize = 8 + 4 + 16 + 4 + 4 + 32;
+    if env.len() < MIN_LEN || &env[..8] != DPAPI_MAGIC {
+        return None;
+    }
+    let scope_flags = u32::from_le_bytes(env[8..12].try_into().ok()?);
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&env[12..28]);
+    let descr_len = u32::from_le_bytes(env[28..32].try_into().ok()?) as usize;
+    let plain_len = u32::from_le_bytes(env[32..36].try_into().ok()?) as usize;
+    let body_end = env.len() - 32;
+    if 36usize.saturating_add(descr_len).saturating_add(plain_len) != body_end {
+        return None;
+    }
+    let (enc_key, mac_key) =
+        dpapi_derive_keys((scope_flags & CRYPTPROTECT_LOCAL_MACHINE) != 0, entropy)?;
+    let expected_tag = dpapi_hmac_sha256(&mac_key, &env[..body_end]);
+    let mut diff = 0u8;
+    for (a, b) in expected_tag.iter().zip(env[body_end..].iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return None;
+    }
+    let combined = dpapi_aes256_ctr(&enc_key, &nonce, &env[36..body_end])?;
+    let descr = String::from_utf8_lossy(&combined[..descr_len]).into_owned();
+    let plain = combined[descr_len..].to_vec();
+    Some((descr, plain))
+}
+
 pub(super) unsafe fn crypt_protect_data_impl(
     p_data_in: *const c_void,
     sz_data_descr: LPCWSTR,
@@ -1797,30 +2002,11 @@ pub(super) unsafe fn crypt_protect_data_impl(
     }
     let entropy = read_blob_slice(p_optional_entropy).unwrap_or(&[]);
     let descr = crate::strings::from_wide_opt(sz_data_descr).unwrap_or_default();
-    let descr_bytes = descr.as_bytes();
-    let scope_flags = dw_flags & CRYPTPROTECT_LOCAL_MACHINE;
-    let (enc_key, mac_key) = dpapi_derive_keys(scope_flags != 0, entropy);
-
-    let mut nonce = [0u8; 16];
-    libc::arc4random_buf(nonce.as_mut_ptr() as *mut c_void, nonce.len());
-
-    let mut combined_plain = Vec::with_capacity(descr_bytes.len() + plain.len());
-    combined_plain.extend_from_slice(descr_bytes);
-    combined_plain.extend_from_slice(plain);
-    let Some(ct) = dpapi_aes256_ctr(&enc_key, &nonce, &combined_plain) else {
+    let local_machine = (dw_flags & CRYPTPROTECT_LOCAL_MACHINE) != 0;
+    let Some(env) = dpapi_protect_bytes(local_machine, &descr, entropy, plain) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return FALSE;
     };
-
-    let mut env = Vec::with_capacity(8 + 4 + 16 + 4 + 4 + ct.len() + 32);
-    env.extend_from_slice(DPAPI_MAGIC);
-    env.extend_from_slice(&scope_flags.to_le_bytes());
-    env.extend_from_slice(&nonce);
-    env.extend_from_slice(&(descr_bytes.len() as u32).to_le_bytes());
-    env.extend_from_slice(&(plain.len() as u32).to_le_bytes());
-    env.extend_from_slice(&ct);
-    let tag = dpapi_hmac_sha256(&mac_key, &env);
-    env.extend_from_slice(&tag);
 
     let buf = crate::heap::alloc(env.len(), false) as *mut u8;
     if buf.is_null() {
@@ -1855,38 +2041,11 @@ pub(super) unsafe fn crypt_unprotect_data_impl(
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    const MIN_LEN: usize = 8 + 4 + 16 + 4 + 4 + 32;
-    if env.len() < MIN_LEN || &env[..8] != DPAPI_MAGIC {
-        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
-        return FALSE;
-    }
-    let scope_flags = u32::from_le_bytes(env[8..12].try_into().unwrap());
-    let mut nonce = [0u8; 16];
-    nonce.copy_from_slice(&env[12..28]);
-    let descr_len = u32::from_le_bytes(env[28..32].try_into().unwrap()) as usize;
-    let plain_len = u32::from_le_bytes(env[32..36].try_into().unwrap()) as usize;
-    let body_end = env.len() - 32;
-    if 36usize.saturating_add(descr_len).saturating_add(plain_len) != body_end {
-        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
-        return FALSE;
-    }
     let entropy = read_blob_slice(p_optional_entropy).unwrap_or(&[]);
-    let (enc_key, mac_key) = dpapi_derive_keys((scope_flags & CRYPTPROTECT_LOCAL_MACHINE) != 0, entropy);
-    let expected_tag = dpapi_hmac_sha256(&mac_key, &env[..body_end]);
-    let mut diff = 0u8;
-    for (a, b) in expected_tag.iter().zip(env[body_end..].iter()) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
-        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
-        return FALSE;
-    }
-    let Some(combined) = dpapi_aes256_ctr(&enc_key, &nonce, &env[36..body_end]) else {
+    let Some((descr, plain_slice)) = dpapi_unprotect_bytes(entropy, env) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return FALSE;
     };
-    let descr_slice = &combined[..descr_len];
-    let plain_slice = &combined[descr_len..];
 
     let out_buf = if plain_slice.is_empty() {
         crate::heap::alloc(1, true) as *mut u8
@@ -1900,8 +2059,7 @@ pub(super) unsafe fn crypt_unprotect_data_impl(
         p
     };
     if !ppsz_data_descr.is_null() {
-        let s = String::from_utf8_lossy(descr_slice);
-        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = descr.encode_utf16().chain(std::iter::once(0)).collect();
         let dbuf = crate::heap::alloc(wide.len() * 2, false) as *mut u16;
         if !dbuf.is_null() {
             for (i, &u) in wide.iter().enumerate() {

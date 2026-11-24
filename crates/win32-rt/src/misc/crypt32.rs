@@ -16,6 +16,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use store::{CRYPT_E_NOT_FOUND, ERROR_CALL_NOT_IMPLEMENTED};
 
+pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
 pub(crate) use chain::verify_peer_chain_error;
 #[allow(unused_imports)]
 pub(crate) use chain::{

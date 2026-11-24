@@ -147,6 +147,7 @@ const CLEAN_WIN32_GUEST_C: &str = r#"
 #include <oleauto.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 
 static void die(const char *msg) {
     fprintf(stderr, "GUEST_FAIL: %s (err=%lu)\n", msg, (unsigned long)GetLastError());
@@ -250,11 +251,28 @@ int main(void) {
     ULONG64 cyc = 0;
     if (!QueryThreadCycleTime(GetCurrentThread(), &cyc)) die("QueryThreadCycleTime");
 
-    // 6. user32: SPI_GETNONCLIENTMETRICS
+    // 6. user32: SPI_GETNONCLIENTMETRICS (verify real MinGW struct field offsets for A and W)
     NONCLIENTMETRICSA ncm;
     memset(&ncm, 0, sizeof(ncm));
     ncm.cbSize = sizeof(ncm);
-    if (!SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) die("SPI_GETNONCLIENTMETRICS");
+    if (!SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) die("SPI_GETNONCLIENTMETRICS A");
+    if (ncm.iBorderWidth != 1 || ncm.iScrollWidth != 17 || ncm.iCaptionWidth != 36) die("NCM A ints");
+    if (ncm.iSmCaptionWidth != 22 || ncm.iSmCaptionHeight != 22) die("NCM A smCaption");
+    if (ncm.iMenuWidth != 19 || ncm.iMenuHeight != 19) die("NCM A menu");
+    if (ncm.lfCaptionFont.lfHeight != -12 || strcmp(ncm.lfCaptionFont.lfFaceName, "Segoe UI") != 0) die("NCM A lfCaptionFont");
+    if (strcmp(ncm.lfSmCaptionFont.lfFaceName, "Segoe UI") != 0) die("NCM A lfSmCaptionFont");
+    if (strcmp(ncm.lfMenuFont.lfFaceName, "Segoe UI") != 0) die("NCM A lfMenuFont");
+    if (strcmp(ncm.lfStatusFont.lfFaceName, "Segoe UI") != 0) die("NCM A lfStatusFont");
+    if (strcmp(ncm.lfMessageFont.lfFaceName, "Segoe UI") != 0) die("NCM A lfMessageFont");
+    if (ncm.iPaddedBorderWidth != 4) die("NCM A iPaddedBorderWidth");
+
+    NONCLIENTMETRICSW ncmw;
+    memset(&ncmw, 0, sizeof(ncmw));
+    ncmw.cbSize = sizeof(ncmw);
+    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncmw), &ncmw, 0)) die("SPI_GETNONCLIENTMETRICS W");
+    if (ncmw.iSmCaptionWidth != 22 || ncmw.iMenuWidth != 19 || ncmw.iPaddedBorderWidth != 4) die("NCM W ints");
+    if (ncmw.lfCaptionFont.lfHeight != -12 || wcscmp(ncmw.lfCaptionFont.lfFaceName, L"Segoe UI") != 0) die("NCM W lfCaptionFont");
+    if (wcscmp(ncmw.lfMessageFont.lfFaceName, L"Segoe UI") != 0) die("NCM W lfMessageFont");
 
     // 7. oleaut32: VariantChangeType I4 -> BSTR -> R8
     VARIANT v1, v2;
@@ -374,4 +392,199 @@ fn win32_unstubbed_apis_and_boot_report_diff_e2e() {
     assert!(diff.contains("RESOLVED stubs (-2)"), "expected 2 resolved stubs:\n{diff}");
     assert!(diff.contains("ws2_32.dll!WSAJoinLeaf"), "missing WSAJoinLeaf in diff:\n{diff}");
     assert!(diff.contains("user32.dll!GetSystemMetrics"), "missing GetSystemMetrics in diff:\n{diff}");
+}
+
+const CRED_WRITER_GUEST_C: &str = r#"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <wincrypt.h>
+#include <wincred.h>
+#include <stdio.h>
+#include <string.h>
+
+static void die(const char *msg) {
+    fprintf(stderr, "WRITER_FAIL: %s (err=%lu)\n", msg, (unsigned long)GetLastError());
+    ExitProcess(1);
+}
+
+int main(void) {
+    CREDENTIALW c;
+    memset(&c, 0, sizeof(c));
+    c.Type = CRED_TYPE_GENERIC;
+    c.UserName = (LPWSTR)L"persist-user";
+
+    c.TargetName = (LPWSTR)L"CrossProc/LocalMachine";
+    c.CredentialBlob = (LPBYTE)"local-secret-42";
+    c.CredentialBlobSize = 15;
+    c.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    if (!CredWriteW(&c, 0)) die("CredWriteW local");
+
+    c.TargetName = (LPWSTR)L"CrossProc/Enterprise";
+    c.CredentialBlob = (LPBYTE)"ent-secret-99";
+    c.CredentialBlobSize = 13;
+    c.Persist = CRED_PERSIST_ENTERPRISE;
+    if (!CredWriteW(&c, 0)) die("CredWriteW enterprise");
+
+    c.TargetName = (LPWSTR)L"CrossProc/SessionOnly";
+    c.CredentialBlob = (LPBYTE)"ephemeral";
+    c.CredentialBlobSize = 9;
+    c.Persist = CRED_PERSIST_SESSION;
+    if (!CredWriteW(&c, 0)) die("CredWriteW session");
+
+    const BYTE secret[] = "cross-process-dpapi-secret";
+    DATA_BLOB inb = { (DWORD)(sizeof(secret) - 1), (BYTE*)secret };
+    DATA_BLOB outb = { 0, NULL };
+    if (!CryptProtectData(&inb, L"cross-proc", NULL, NULL, NULL, 0, &outb)) die("CryptProtectData");
+
+    HANDLE fh = CreateFileA("C:\\Windows\\Temp\\dpapi_blob.bin", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) die("CreateFileA");
+    DWORD written = 0;
+    if (!WriteFile(fh, outb.pbData, outb.cbData, &written, NULL) || written != outb.cbData) die("WriteFile");
+    CloseHandle(fh);
+    LocalFree(outb.pbData);
+
+    printf("CRED_WRITER_PASS\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+
+const CRED_READER_GUEST_C: &str = r#"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <wincrypt.h>
+#include <wincred.h>
+#include <stdio.h>
+#include <string.h>
+
+static void die(const char *msg) {
+    fprintf(stderr, "READER_FAIL: %s (err=%lu)\n", msg, (unsigned long)GetLastError());
+    ExitProcess(1);
+}
+
+int main(void) {
+    PCREDENTIALW out = NULL;
+    if (!CredReadW(L"CrossProc/LocalMachine", CRED_TYPE_GENERIC, 0, &out) || !out) die("CredReadW local");
+    if (out->CredentialBlobSize != 15 || memcmp(out->CredentialBlob, "local-secret-42", 15) != 0) die("local blob mismatch");
+    if (out->Persist != CRED_PERSIST_LOCAL_MACHINE) die("local persist mismatch");
+    CredFree(out);
+
+    out = NULL;
+    if (!CredReadW(L"CrossProc/Enterprise", CRED_TYPE_GENERIC, 0, &out) || !out) die("CredReadW enterprise");
+    if (out->CredentialBlobSize != 13 || memcmp(out->CredentialBlob, "ent-secret-99", 13) != 0) die("enterprise blob mismatch");
+    if (out->Persist != CRED_PERSIST_ENTERPRISE) die("enterprise persist mismatch");
+    CredFree(out);
+
+    out = NULL;
+    if (CredReadW(L"CrossProc/SessionOnly", CRED_TYPE_GENERIC, 0, &out)) die("session cred must not persist");
+    if (GetLastError() != ERROR_NOT_FOUND) die("session cred wrong error");
+
+    if (!CredDeleteW(L"CrossProc/LocalMachine", CRED_TYPE_GENERIC, 0)) die("CredDeleteW local");
+    if (!CredDeleteW(L"CrossProc/Enterprise", CRED_TYPE_GENERIC, 0)) die("CredDeleteW enterprise");
+
+    HANDLE fh = CreateFileA("C:\\Windows\\Temp\\dpapi_blob.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) die("Open dpapi_blob.bin");
+    BYTE buf[512];
+    DWORD got = 0;
+    if (!ReadFile(fh, buf, sizeof(buf), &got, NULL) || got == 0) die("ReadFile dpapi_blob.bin");
+    CloseHandle(fh);
+
+    DATA_BLOB enc = { got, buf };
+    DATA_BLOB dec = { 0, NULL };
+    if (!CryptUnprotectData(&enc, NULL, NULL, NULL, NULL, 0, &dec)) die("CryptUnprotectData same profile");
+    const char *want = "cross-process-dpapi-secret";
+    if (dec.cbData != strlen(want) || memcmp(dec.pbData, want, dec.cbData) != 0) die("DPAPI payload mismatch");
+    LocalFree(dec.pbData);
+
+    printf("CRED_READER_PASS\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+
+const DPAPI_OTHER_SECRET_GUEST_C: &str = r#"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <wincrypt.h>
+#include <stdio.h>
+
+static void die(const char *msg) {
+    fprintf(stderr, "OTHER_FAIL: %s (err=%lu)\n", msg, (unsigned long)GetLastError());
+    ExitProcess(1);
+}
+
+int main(void) {
+    HANDLE fh = CreateFileA("C:\\Windows\\Temp\\dpapi_blob.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) die("Open dpapi_blob.bin");
+    BYTE buf[512];
+    DWORD got = 0;
+    if (!ReadFile(fh, buf, sizeof(buf), &got, NULL) || got == 0) die("ReadFile");
+    CloseHandle(fh);
+
+    DATA_BLOB enc = { got, buf };
+    DATA_BLOB dec = { 0, NULL };
+    if (CryptUnprotectData(&enc, NULL, NULL, NULL, NULL, 0, &dec)) die("other profile must NOT decrypt");
+    if (GetLastError() != ERROR_INVALID_DATA) die("expected ERROR_INVALID_DATA");
+
+    printf("DPAPI_ISOLATION_PASS\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+
+#[test]
+fn cred_persist_and_dpapi_across_processes_e2e() {
+    let Some(zig) = find_zig() else {
+        eprintln!("skipping cred_persist_and_dpapi_across_processes_e2e: zig not found");
+        return;
+    };
+    let tmp_a = TempDir::new("cred_a");
+    let tmp_b = TempDir::new("cred_b");
+
+    let writer_exe = compile_guest(
+        &zig,
+        tmp_a.path(),
+        "cred_writer",
+        CRED_WRITER_GUEST_C,
+        &["-ladvapi32", "-lcrypt32", "-lkernel32"],
+    );
+    let reader_exe = compile_guest(
+        &zig,
+        tmp_a.path(),
+        "cred_reader",
+        CRED_READER_GUEST_C,
+        &["-ladvapi32", "-lcrypt32", "-lkernel32"],
+    );
+    let other_exe = compile_guest(
+        &zig,
+        tmp_b.path(),
+        "dpapi_other_secret",
+        DPAPI_OTHER_SECRET_GUEST_C,
+        &["-lcrypt32", "-lkernel32"],
+    );
+
+    // Run 1: write LOCAL_MACHINE, ENTERPRISE, SESSION creds + DPAPI blob in profile A.
+    let rep1 = tmp_a.path().join("rep1.json");
+    let (code1, log1) = run_port_runner(tmp_a.path(), &writer_exe, &rep1);
+    assert_eq!(code1, Some(0), "cred_writer failed:\n{log1}");
+    assert!(log1.contains("CRED_WRITER_PASS"), "missing CRED_WRITER_PASS:\n{log1}");
+
+    // Run 2: fresh port-runner process sharing profile A reads persisted creds & DPAPI blob;
+    // SESSION cred must be gone.
+    let rep2 = tmp_a.path().join("rep2.json");
+    let (code2, log2) = run_port_runner(tmp_a.path(), &reader_exe, &rep2);
+    assert_eq!(code2, Some(0), "cred_reader failed:\n{log2}");
+    assert!(log2.contains("CRED_READER_PASS"), "missing CRED_READER_PASS:\n{log2}");
+
+    // Copy profile A's DPAPI ciphertext into profile B (which has its own random host secret).
+    let blob_src = tmp_a.path().join("drive_c").join("Temp").join("dpapi_blob.bin");
+    let blob_dst_dir = tmp_b.path().join("drive_c").join("Temp");
+    std::fs::create_dir_all(&blob_dst_dir).unwrap();
+    std::fs::copy(&blob_src, blob_dst_dir.join("dpapi_blob.bin")).unwrap();
+
+    // Run 3: fresh port-runner process in profile B must NOT decrypt profile A's DPAPI blob.
+    let rep3 = tmp_b.path().join("rep3.json");
+    let (code3, log3) = run_port_runner(tmp_b.path(), &other_exe, &rep3);
+    assert_eq!(code3, Some(0), "dpapi_other_secret failed:\n{log3}");
+    assert!(log3.contains("DPAPI_ISOLATION_PASS"), "missing DPAPI_ISOLATION_PASS:\n{log3}");
 }

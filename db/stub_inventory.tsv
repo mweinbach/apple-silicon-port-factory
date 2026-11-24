@@ -36,20 +36,20 @@ bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryp
 bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
 bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
 bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
-crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	354	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
-crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	361	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
-crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	355	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
+crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	362	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
+crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
 crypt32.dll	cert_free_certificate_chain_engine_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	593	"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"
 crypt32.dll	cert_free_certificate_chain_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	787	"CertFreeCertificateChain({chain:p}): foreign chain ignored"
 crypt32.dll	cert_verify_certificate_chain_policy_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	807	"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"
@@ -221,15 +221,15 @@ user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	987	"CreateCur
 user32.dll	DisplayConfigGetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	684	"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
 user32.dll	DisplayConfigSetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	692	"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
 user32.dll	GetSystemMetrics	stub	crates/win32-rt/src/user32/misc.rs	234	"GetSystemMetrics({index}) -> 0"
-user32.dll	RegisterHotKey	stub	crates/win32-rt/src/user32/misc.rs	601	"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize
+user32.dll	RegisterHotKey	stub	crates/win32-rt/src/user32/misc.rs	759	"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize
 user32.dll	RegisterRawInputDevices	stub	crates/win32-rt/src/user32/input.rs	1363	"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"
 user32.dll	ReplyMessage	stub	crates/win32-rt/src/user32/message.rs	883	"ReplyMessage: early reply not supported"
 user32.dll	def_window_proc	stub	crates/win32-rt/src/user32/defproc.rs	154	"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"
 user32.dll	load_cursor	stub	crates/win32-rt/src/user32/cursor.rs	87	"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"
-user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1718	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
-user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	407	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
-user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	442	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
-user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	464	"GetUserObjectInformation index {index} not supported"
+user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1876	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
+user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	565	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	600	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	622	"GetUserObjectInformation index {index} not supported"
 uxtheme.dll	DrawThemeBackground	stub	crates/win32-rt/src/misc/uxtheme.rs	111	"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"
 uxtheme.dll	TaskDialogIndirect	stub	crates/win32-rt/src/misc/uxtheme.rs	203	"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"
 vulkan_1.dll	NvLL_VK_DestroyLowLatencyDevice	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0

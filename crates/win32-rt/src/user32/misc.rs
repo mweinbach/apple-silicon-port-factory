@@ -278,6 +278,183 @@ const SPI_GETSCREENREADER: u32 = 0x0046;
 const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 const SPI_GETANIMATION: u32 = 0x0048;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct LogFontA {
+    pub lf_height: i32,
+    pub lf_width: i32,
+    pub lf_escapement: i32,
+    pub lf_orientation: i32,
+    pub lf_weight: i32,
+    pub lf_italic: u8,
+    pub lf_underline: u8,
+    pub lf_strike_out: u8,
+    pub lf_char_set: u8,
+    pub lf_out_precision: u8,
+    pub lf_clip_precision: u8,
+    pub lf_quality: u8,
+    pub lf_pitch_and_family: u8,
+    pub lf_face_name: [u8; 32],
+}
+
+impl LogFontA {
+    fn segoe_ui_9pt() -> Self {
+        let mut lf_face_name = [0u8; 32];
+        let name = b"Segoe UI\0";
+        lf_face_name[..name.len()].copy_from_slice(name);
+        Self {
+            lf_height: -12,
+            lf_width: 0,
+            lf_escapement: 0,
+            lf_orientation: 0,
+            lf_weight: 400,
+            lf_italic: 0,
+            lf_underline: 0,
+            lf_strike_out: 0,
+            lf_char_set: 1, // DEFAULT_CHARSET
+            lf_out_precision: 0,
+            lf_clip_precision: 0,
+            lf_quality: 0,
+            lf_pitch_and_family: 0,
+            lf_face_name,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct LogFontW {
+    pub lf_height: i32,
+    pub lf_width: i32,
+    pub lf_escapement: i32,
+    pub lf_orientation: i32,
+    pub lf_weight: i32,
+    pub lf_italic: u8,
+    pub lf_underline: u8,
+    pub lf_strike_out: u8,
+    pub lf_char_set: u8,
+    pub lf_out_precision: u8,
+    pub lf_clip_precision: u8,
+    pub lf_quality: u8,
+    pub lf_pitch_and_family: u8,
+    pub lf_face_name: [u16; 32],
+}
+
+impl LogFontW {
+    fn segoe_ui_9pt() -> Self {
+        let mut lf_face_name = [0u16; 32];
+        for (i, u) in "Segoe UI".encode_utf16().enumerate() {
+            lf_face_name[i] = u;
+        }
+        Self {
+            lf_height: -12,
+            lf_width: 0,
+            lf_escapement: 0,
+            lf_orientation: 0,
+            lf_weight: 400,
+            lf_italic: 0,
+            lf_underline: 0,
+            lf_strike_out: 0,
+            lf_char_set: 1, // DEFAULT_CHARSET
+            lf_out_precision: 0,
+            lf_clip_precision: 0,
+            lf_quality: 0,
+            lf_pitch_and_family: 0,
+            lf_face_name,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct NonClientMetricsA {
+    pub cb_size: u32,
+    pub i_border_width: i32,
+    pub i_scroll_width: i32,
+    pub i_scroll_height: i32,
+    pub i_caption_width: i32,
+    pub i_caption_height: i32,
+    pub lf_caption_font: LogFontA,
+    pub i_sm_caption_width: i32,
+    pub i_sm_caption_height: i32,
+    pub lf_sm_caption_font: LogFontA,
+    pub i_menu_width: i32,
+    pub i_menu_height: i32,
+    pub lf_menu_font: LogFontA,
+    pub lf_status_font: LogFontA,
+    pub lf_message_font: LogFontA,
+    pub i_padded_border_width: i32,
+}
+
+impl NonClientMetricsA {
+    fn windows_default(cb_size: u32, caption_height: i32) -> Self {
+        let font = LogFontA::segoe_ui_9pt();
+        Self {
+            cb_size,
+            i_border_width: 1,
+            i_scroll_width: 17,
+            i_scroll_height: 17,
+            i_caption_width: 36,
+            i_caption_height: caption_height,
+            lf_caption_font: font,
+            i_sm_caption_width: 22,
+            i_sm_caption_height: 22,
+            lf_sm_caption_font: font,
+            i_menu_width: 19,
+            i_menu_height: 19,
+            lf_menu_font: font,
+            lf_status_font: font,
+            lf_message_font: font,
+            i_padded_border_width: 4,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct NonClientMetricsW {
+    pub cb_size: u32,
+    pub i_border_width: i32,
+    pub i_scroll_width: i32,
+    pub i_scroll_height: i32,
+    pub i_caption_width: i32,
+    pub i_caption_height: i32,
+    pub lf_caption_font: LogFontW,
+    pub i_sm_caption_width: i32,
+    pub i_sm_caption_height: i32,
+    pub lf_sm_caption_font: LogFontW,
+    pub i_menu_width: i32,
+    pub i_menu_height: i32,
+    pub lf_menu_font: LogFontW,
+    pub lf_status_font: LogFontW,
+    pub lf_message_font: LogFontW,
+    pub i_padded_border_width: i32,
+}
+
+impl NonClientMetricsW {
+    fn windows_default(cb_size: u32, caption_height: i32) -> Self {
+        let font = LogFontW::segoe_ui_9pt();
+        Self {
+            cb_size,
+            i_border_width: 1,
+            i_scroll_width: 17,
+            i_scroll_height: 17,
+            i_caption_width: 36,
+            i_caption_height: caption_height,
+            lf_caption_font: font,
+            i_sm_caption_width: 22,
+            i_sm_caption_height: 22,
+            lf_sm_caption_font: font,
+            i_menu_width: 19,
+            i_menu_height: 19,
+            lf_menu_font: font,
+            lf_status_font: font,
+            lf_message_font: font,
+            i_padded_border_width: 4,
+        }
+    }
+}
+
 unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
     let put_u32 = |v: u32| {
         if pv.is_null() {
@@ -355,8 +532,9 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
                 set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            // NONCLIENTMETRICSA: 340 bytes (344 with iPaddedBorderWidth)
-            // NONCLIENTMETRICSW: 500 bytes (504 with iPaddedBorderWidth)
+            // Documented Win32 layouts:
+            //   NONCLIENTMETRICSA: 340 bytes (344 with iPaddedBorderWidth)
+            //   NONCLIENTMETRICSW: 500 bytes (504 with iPaddedBorderWidth)
             let base_sz: usize = if wide { 500 } else { 340 };
             let padded_sz = base_sz + 4;
             let cb = std::ptr::read_unaligned(pv as *const u32) as usize;
@@ -365,41 +543,21 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
                 return FALSE;
             }
             let write_len = cb.min(padded_sz);
-            std::ptr::write_bytes(pv.add(4), 0, write_len - 4);
             let cap = super::window::nc_insets(ws::CAPTION, 0).1;
-            let ints: [i32; 9] = [
-                1,   // iBorderWidth
-                17,  // iScrollWidth
-                17,  // iScrollHeight
-                36,  // iCaptionWidth
-                cap, // iCaptionHeight
-                22,  // iSmCaptionWidth
-                22,  // iSmCaptionHeight
-                19,  // iMenuWidth
-                19,  // iMenuHeight
-            ];
-            for (i, &val) in ints.iter().enumerate() {
-                std::ptr::write_unaligned(pv.add(4 + i * 4) as *mut i32, val);
-            }
-            // Write 5 LOGFONT{A,W} entries (lfCaptionFont, lfSmCaptionFont, lfMenuFont,
-            // lfStatusFont, lfMessageFont) with standard Windows 10 9pt Segoe UI defaults.
-            let lf_size: usize = if wide { 92 } else { 60 };
-            let mut off = 40usize;
-            for _ in 0..5 {
-                let lf = pv.add(off);
-                std::ptr::write_unaligned(lf as *mut i32, -12); // lfHeight (9pt @ 96 DPI)
-                std::ptr::write_unaligned(lf.add(16) as *mut i32, 400); // lfWeight = FW_NORMAL
-                std::ptr::write_unaligned(lf.add(23), 1u8); // lfCharSet = DEFAULT_CHARSET
-                if wide {
-                    crate::strings::write_wide_trunc("Segoe UI", lf.add(28) as *mut u16, 32);
-                } else {
-                    let face = b"Segoe UI\0";
-                    std::ptr::copy_nonoverlapping(face.as_ptr(), lf.add(28), face.len());
-                }
-                off += lf_size;
-            }
-            if cb >= padded_sz {
-                std::ptr::write_unaligned(pv.add(base_sz) as *mut i32, 4); // iPaddedBorderWidth
+            if wide {
+                let ncm = NonClientMetricsW::windows_default(cb as u32, cap);
+                std::ptr::copy_nonoverlapping(
+                    &ncm as *const NonClientMetricsW as *const u8,
+                    pv,
+                    write_len,
+                );
+            } else {
+                let ncm = NonClientMetricsA::windows_default(cb as u32, cap);
+                std::ptr::copy_nonoverlapping(
+                    &ncm as *const NonClientMetricsA as *const u8,
+                    pv,
+                    write_len,
+                );
             }
             TRUE
         }
