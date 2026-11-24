@@ -681,7 +681,11 @@ pub unsafe extern "win64" fn VariantChangeType(
     if let Err(hr) = conv {
         return hr;
     }
-    VariantClear(dst);
+    let clr_hr = VariantClear(dst);
+    if clr_hr != crate::types::S_OK {
+        let _ = VariantClear(out.as_mut_ptr());
+        return clr_hr;
+    }
     std::ptr::copy_nonoverlapping(out.as_ptr(), dst, 24);
     crate::types::S_OK
 }
@@ -928,9 +932,33 @@ pub unsafe extern "win64" fn SafeArrayGetElement(
     if hr != crate::types::S_OK {
         return hr;
     }
+    let features = std::ptr::read_unaligned(psa.add(2) as *const u16);
     let sz = SafeArrayGetElemsize(psa) as usize;
-    std::ptr::copy_nonoverlapping(ptr as *const u8, out as *mut u8, sz);
-    crate::types::S_OK
+    if (features & FADF_BSTR) != 0 && sz == std::mem::size_of::<*mut u16>() {
+        let s = std::ptr::read_unaligned(ptr as *const *const u16);
+        match copy_bstr(s) {
+            Ok(dup) => {
+                std::ptr::write_unaligned(out as *mut *mut u16, dup);
+                crate::types::S_OK
+            }
+            Err(err_hr) => err_hr,
+        }
+    } else if (features & (FADF_UNKNOWN | FADF_DISPATCH)) != 0
+        && sz == std::mem::size_of::<*mut c_void>()
+    {
+        let obj = std::ptr::read_unaligned(ptr as *const *mut c_void);
+        if !obj.is_null() {
+            crate::com::com_call_add_ref(obj);
+        }
+        std::ptr::write_unaligned(out as *mut *mut c_void, obj);
+        crate::types::S_OK
+    } else if (features & FADF_VARIANT) != 0 && sz == 24 {
+        VariantInit(out as *mut u8);
+        VariantCopy(out as *mut u8, ptr as *const u8)
+    } else {
+        std::ptr::copy_nonoverlapping(ptr as *const u8, out as *mut u8, sz);
+        crate::types::S_OK
+    }
 }
 
 pub unsafe extern "win64" fn SafeArrayPutElement(
@@ -938,17 +966,51 @@ pub unsafe extern "win64" fn SafeArrayPutElement(
     indices: *const i32,
     val: *const c_void,
 ) -> i32 {
-    if val.is_null() {
-        return crate::types::E_INVALIDARG;
-    }
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let hr = SafeArrayPtrOfIndex(psa, indices, &mut ptr);
     if hr != crate::types::S_OK {
         return hr;
     }
+    let features = std::ptr::read_unaligned(psa.add(2) as *const u16);
     let sz = SafeArrayGetElemsize(psa) as usize;
-    std::ptr::copy_nonoverlapping(val as *const u8, ptr as *mut u8, sz);
-    crate::types::S_OK
+    if (features & FADF_BSTR) != 0 && sz == std::mem::size_of::<*mut u16>() {
+        // Per Win32 SafeArrayPutElement, for FADF_BSTR `val` is the BSTR itself (may be null).
+        let dup = match copy_bstr(val as *const u16) {
+            Ok(d) => d,
+            Err(err_hr) => return err_hr,
+        };
+        let old = std::ptr::read_unaligned(ptr as *const *mut u16);
+        if !old.is_null() {
+            SysFreeString(old);
+        }
+        std::ptr::write_unaligned(ptr as *mut *mut u16, dup);
+        crate::types::S_OK
+    } else if (features & (FADF_UNKNOWN | FADF_DISPATCH)) != 0
+        && sz == std::mem::size_of::<*mut c_void>()
+    {
+        // Per Win32 SafeArrayPutElement, for COM arrays `val` is the IUnknown*/IDispatch* itself (may be null).
+        let new_obj = val as *mut c_void;
+        if !new_obj.is_null() {
+            crate::com::com_call_add_ref(new_obj);
+        }
+        let old = std::ptr::read_unaligned(ptr as *const *mut c_void);
+        if !old.is_null() {
+            crate::com::com_call_release(old);
+        }
+        std::ptr::write_unaligned(ptr as *mut *mut c_void, new_obj);
+        crate::types::S_OK
+    } else if (features & FADF_VARIANT) != 0 && sz == 24 {
+        if val.is_null() {
+            return crate::types::E_INVALIDARG;
+        }
+        VariantCopy(ptr as *mut u8, val as *const u8)
+    } else {
+        if val.is_null() {
+            return crate::types::E_INVALIDARG;
+        }
+        std::ptr::copy_nonoverlapping(val as *const u8, ptr as *mut u8, sz);
+        crate::types::S_OK
+    }
 }
 
 pub unsafe extern "win64" fn SafeArrayCopy(psa: *const u8, out: *mut *mut u8) -> i32 {
@@ -1454,6 +1516,81 @@ mod tests {
                 (bad_rec.as_mut_ptr() as *mut u16).write_unaligned(VT_RECORD);
                 (bad_rec.as_mut_ptr().add(8) as *mut usize).write_unaligned(0x1234);
                 assert_eq!(VariantCopy(dst.as_mut_ptr(), bad_rec.as_ptr()), DISP_E_BADVARTYPE);
+
+                // 7. SafeArrayPutElement / SafeArrayGetElement element-copy ownership (BSTR, IUnknown, VARIANT).
+                let sa_bstr = SafeArrayCreateVector(VT_BSTR, 0, 1);
+                let orig_bstr = SysAllocString(crate::strings::to_wide_z("owned-elem").as_ptr());
+                assert_eq!(SafeArrayPutElement(sa_bstr, &idx0, orig_bstr as *const c_void), crate::types::S_OK);
+                // Freeing caller's original BSTR must not invalidate the element stored in the array.
+                SysFreeString(orig_bstr);
+                let mut got_bstr: *mut u16 = std::ptr::null_mut();
+                assert_eq!(
+                    SafeArrayGetElement(sa_bstr, &idx0, &mut got_bstr as *mut *mut u16 as *mut c_void),
+                    crate::types::S_OK
+                );
+                assert_eq!(crate::strings::from_wide(got_bstr), "owned-elem");
+                if clear_src_first {
+                    assert_eq!(SafeArrayDestroy(sa_bstr), crate::types::S_OK);
+                    assert_eq!(crate::strings::from_wide(got_bstr), "owned-elem");
+                    SysFreeString(got_bstr);
+                } else {
+                    SysFreeString(got_bstr);
+                    assert_eq!(SafeArrayDestroy(sa_bstr), crate::types::S_OK);
+                }
+
+                let mut elem_com = MockComObj { vtbl: com_vtbl.as_ptr(), refs: AtomicU32::new(1) };
+                let elem_com_ptr = &mut elem_com as *mut MockComObj as *mut c_void;
+                let sa_com = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+                assert_eq!(SafeArrayPutElement(sa_com, &idx0, elem_com_ptr), crate::types::S_OK);
+                assert_eq!(elem_com.refs.load(Ordering::Acquire), 2);
+                let mut got_com: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    SafeArrayGetElement(sa_com, &idx0, &mut got_com as *mut *mut c_void as *mut c_void),
+                    crate::types::S_OK
+                );
+                assert_eq!(got_com, elem_com_ptr);
+                assert_eq!(elem_com.refs.load(Ordering::Acquire), 3);
+                assert_eq!(SafeArrayDestroy(sa_com), crate::types::S_OK);
+                assert_eq!(elem_com.refs.load(Ordering::Acquire), 2);
+                crate::com::com_call_release(got_com);
+                assert_eq!(elem_com.refs.load(Ordering::Acquire), 1);
+
+                let sa_var = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+                let mut elem_v = [0u8; 24];
+                VariantInit(elem_v.as_mut_ptr());
+                (elem_v.as_mut_ptr() as *mut u16).write_unaligned(VT_BSTR);
+                (elem_v.as_mut_ptr().add(8) as *mut *mut u16)
+                    .write_unaligned(SysAllocString(crate::strings::to_wide_z("var-elem").as_ptr()));
+                assert_eq!(SafeArrayPutElement(sa_var, &idx0, elem_v.as_ptr() as *const c_void), crate::types::S_OK);
+                assert_eq!(VariantClear(elem_v.as_mut_ptr()), crate::types::S_OK);
+                let mut got_v = [0xCCu8; 24]; // intentionally uninitialized garbage
+                assert_eq!(SafeArrayGetElement(sa_var, &idx0, got_v.as_mut_ptr() as *mut c_void), crate::types::S_OK);
+                assert_eq!(SafeArrayDestroy(sa_var), crate::types::S_OK);
+                assert_eq!((got_v.as_ptr() as *const u16).read_unaligned(), VT_BSTR);
+                let got_vb = (got_v.as_ptr().add(8) as *const *const u16).read_unaligned();
+                assert_eq!(crate::strings::from_wide(got_vb), "var-elem");
+                assert_eq!(VariantClear(got_v.as_mut_ptr()), crate::types::S_OK);
+
+                // 8. VariantChangeType propagates VariantClear(dst) failure (locked SAFEARRAY) without clobbering dst.
+                let locked_sa = SafeArrayCreateVector(VT_I4, 0, 1);
+                let mut locked_data: *mut c_void = std::ptr::null_mut();
+                assert_eq!(SafeArrayAccessData(locked_sa, &mut locked_data), crate::types::S_OK);
+                let mut locked_dst = [0u8; 24];
+                VariantInit(locked_dst.as_mut_ptr());
+                (locked_dst.as_mut_ptr() as *mut u16).write_unaligned(VT_ARRAY | VT_I4);
+                (locked_dst.as_mut_ptr().add(8) as *mut *mut u8).write_unaligned(locked_sa);
+                let mut src_num = [0u8; 24];
+                VariantInit(src_num.as_mut_ptr());
+                (src_num.as_mut_ptr() as *mut u16).write_unaligned(VT_I4);
+                (src_num.as_mut_ptr().add(8) as *mut i32).write_unaligned(42);
+                assert_eq!(
+                    VariantChangeType(locked_dst.as_mut_ptr(), src_num.as_ptr(), 0, VT_BSTR),
+                    DISP_E_ARRAYISLOCKED
+                );
+                assert_eq!((locked_dst.as_ptr() as *const u16).read_unaligned(), VT_ARRAY | VT_I4);
+                assert_eq!((locked_dst.as_ptr().add(8) as *const *mut u8).read_unaligned(), locked_sa);
+                assert_eq!(SafeArrayUnaccessData(locked_sa), crate::types::S_OK);
+                assert_eq!(VariantClear(locked_dst.as_mut_ptr()), crate::types::S_OK);
             }
         }
     }

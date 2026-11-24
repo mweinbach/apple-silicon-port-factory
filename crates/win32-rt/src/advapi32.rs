@@ -3319,10 +3319,31 @@ unsafe fn save_persisted_vault(
     Ok(())
 }
 
-pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, _flags: u32) -> BOOL {
+const CRED_PRESERVE_CREDENTIAL_BLOB: u32 = 1;
+const ERROR_INVALID_FLAGS_CRED: u32 = 1004;
+
+unsafe fn find_existing_cred_blob_locked(key: &(String, u32)) -> Option<Vec<u8>> {
+    if let Some(e) = session_cred_store().lock().unwrap().get(key) {
+        return Some(e.blob.clone());
+    }
+    for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
+        if let Ok(map) = load_persisted_vault(kind) {
+            if let Some(e) = map.get(key) {
+                return Some(e.blob.clone());
+            }
+        }
+    }
+    None
+}
+
+pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, flags: u32) -> BOOL {
     if cred_ptr.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
+    if (flags & !CRED_PRESERVE_CREDENTIAL_BLOB) != 0 {
+        return err(ERROR_INVALID_FLAGS_CRED, FALSE);
+    }
+    let preserve_blob = (flags & CRED_PRESERVE_CREDENTIAL_BLOB) != 0;
     let c = std::ptr::read_unaligned(cred_ptr as *const CredentialW);
     if !matches!(
         c.persist,
@@ -3330,30 +3351,44 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, _flags: u32) ->
     ) {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
+    if preserve_blob && c.credential_blob_size != 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
     let Some(target) = crate::strings::from_wide_opt(c.target_name) else {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     };
-    let blob = if c.credential_blob_size > 0 && !c.credential_blob.is_null() {
+    let input_blob = if c.credential_blob_size > 0 && !c.credential_blob.is_null() {
         std::slice::from_raw_parts(c.credential_blob, c.credential_blob_size as usize).to_vec()
     } else {
         Vec::new()
     };
     let key = (target.to_ascii_lowercase(), c.cred_type);
-    let entry = StoredCredential {
-        flags: c.flags,
-        cred_type: c.cred_type,
-        target_name: target,
-        comment: crate::strings::from_wide_opt(c.comment),
-        last_written: FILETIME::from_u64(crate::types::now_filetime()),
-        blob,
-        persist: c.persist,
-        target_alias: crate::strings::from_wide_opt(c.target_alias),
-        user_name: crate::strings::from_wide_opt(c.user_name),
-    };
+    let comment = crate::strings::from_wide_opt(c.comment);
+    let target_alias = crate::strings::from_wide_opt(c.target_alias);
+    let user_name = crate::strings::from_wide_opt(c.user_name);
 
     match c.persist {
         CRED_PERSIST_SESSION => {
             let _guard = acquire_cred_store_lock_best_effort();
+            let blob = if preserve_blob {
+                let Some(existing) = find_existing_cred_blob_locked(&key) else {
+                    return err(ERROR_NOT_FOUND, FALSE);
+                };
+                existing
+            } else {
+                input_blob
+            };
+            let entry = StoredCredential {
+                flags: c.flags,
+                cred_type: c.cred_type,
+                target_name: target,
+                comment,
+                last_written: FILETIME::from_u64(crate::types::now_filetime()),
+                blob,
+                persist: c.persist,
+                target_alias,
+                user_name,
+            };
             session_cred_store().lock().unwrap().insert(key.clone(), entry);
             // Replace any stale persisted entry for the same (target, type).
             for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
@@ -3369,6 +3404,25 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, _flags: u32) ->
             let _guard = match acquire_cred_store_lock() {
                 Ok(g) => g,
                 Err(_) => return err(ERROR_WRITE_FAULT_CRED, FALSE),
+            };
+            let blob = if preserve_blob {
+                let Some(existing) = find_existing_cred_blob_locked(&key) else {
+                    return err(ERROR_NOT_FOUND, FALSE);
+                };
+                existing
+            } else {
+                input_blob
+            };
+            let entry = StoredCredential {
+                flags: c.flags,
+                cred_type: c.cred_type,
+                target_name: target,
+                comment,
+                last_written: FILETIME::from_u64(crate::types::now_filetime()),
+                blob,
+                persist: c.persist,
+                target_alias,
+                user_name,
             };
             let (target_kind, other_kind) = if c.persist == CRED_PERSIST_LOCAL_MACHINE {
                 (CredVaultKind::LocalMachine, CredVaultKind::Enterprise)
@@ -4354,6 +4408,34 @@ mod tests {
             assert_eq!(CredWriteW(&c_local as *const _ as *const c_void, 0), TRUE);
             assert_eq!(CredWriteW(&c_ent as *const _ as *const c_void, 0), TRUE);
 
+            // CRED_PRESERVE_CREDENTIAL_BLOB: updates metadata while preserving persisted blob,
+            // rejects non-zero input blob, unknown flags, and nonexistent targets.
+            let user_updated = crate::strings::to_wide_z("alice-renamed");
+            let bad_flags = make_cred(&target_local, &user_updated, b"", CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(CredWriteW(&bad_flags as *const _ as *const c_void, 0x2), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_FLAGS_CRED);
+
+            let bad_preserve = make_cred(&target_local, &user_updated, b"nonempty", CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(
+                CredWriteW(&bad_preserve as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            let missing_target = crate::strings::to_wide_z("PortFactory/DoesNotExist");
+            let missing_preserve = make_cred(&missing_target, &user_updated, b"", CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(
+                CredWriteW(&missing_preserve as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
+
+            let ok_preserve = make_cred(&target_local, &user_updated, b"", CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(
+                CredWriteW(&ok_preserve as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                TRUE
+            );
+
             // Vault files exist with 0600 permissions and do not store plaintext secret bytes.
             for (kind, needle) in [
                 (CredVaultKind::LocalMachine, &b"local-blob"[..]),
@@ -4374,13 +4456,16 @@ mod tests {
             assert_eq!(CredReadW(target_sess.as_ptr(), 1, 0, &mut out), FALSE);
             assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
 
-            for (t, expected) in [(&target_local, &b"local-blob"[..]), (&target_ent, &b"ent-blob"[..])] {
+            for (t, expected, expected_user) in [
+                (&target_local, &b"local-blob"[..], "alice-renamed"),
+                (&target_ent, &b"ent-blob"[..], "alice"),
+            ] {
                 assert_eq!(CredReadW(t.as_ptr(), 1, 0, &mut out), TRUE);
                 assert!(!out.is_null());
                 let got = std::ptr::read_unaligned(out as *const CredentialW);
                 assert_eq!(got.credential_blob_size as usize, expected.len());
                 assert_eq!(std::slice::from_raw_parts(got.credential_blob, expected.len()), expected);
-                assert_eq!(crate::strings::from_wide(got.user_name), "alice");
+                assert_eq!(crate::strings::from_wide(got.user_name), expected_user);
                 CredFree(out);
 
                 assert_eq!(CredDeleteW(t.as_ptr(), 1, 0), TRUE);
