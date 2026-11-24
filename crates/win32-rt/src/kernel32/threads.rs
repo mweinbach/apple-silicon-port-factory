@@ -100,13 +100,14 @@ pub unsafe extern "win64" fn GetThreadId(h: HANDLE) -> u32 {
     if h == handles::CURRENT_THREAD {
         return teb::thread_id();
     }
-    match thread_obj(h) {
-        Some(t) => t.tid.load(Ordering::Relaxed) as u32,
-        None => {
-            set_err(err::ERROR_INVALID_HANDLE);
-            0
-        }
+    if let Some(t) = thread_obj(h) {
+        return t.tid.load(Ordering::Relaxed) as u32;
     }
+    if let Some(child) = handles::get_as::<crate::kernel32::process::ChildThreadObj>(h) {
+        return child.tid;
+    }
+    set_err(err::ERROR_INVALID_HANDLE);
+    0
 }
 
 pub unsafe extern "win64" fn OpenThread(_access: u32, _inherit: BOOL, tid: u32) -> HANDLE {
@@ -120,16 +121,20 @@ pub unsafe extern "win64" fn OpenThread(_access: u32, _inherit: BOOL, tid: u32) 
 }
 
 pub unsafe extern "win64" fn GetExitCodeThread(h: HANDLE, code: *mut u32) -> BOOL {
-    match thread_obj(h) {
-        Some(t) => {
-            *code = t.exit_code().unwrap_or(STILL_ACTIVE);
-            TRUE
-        }
-        None => {
-            set_err(err::ERROR_INVALID_HANDLE);
-            FALSE
-        }
+    if code.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
+    if let Some(t) = thread_obj(h) {
+        std::ptr::write_unaligned(code, t.exit_code().unwrap_or(STILL_ACTIVE));
+        return TRUE;
+    }
+    if let Some(child) = handles::get_as::<crate::kernel32::process::ChildThreadObj>(h) {
+        std::ptr::write_unaligned(code, child.process.current_exit_code().unwrap_or(STILL_ACTIVE));
+        return TRUE;
+    }
+    set_err(err::ERROR_INVALID_HANDLE);
+    FALSE
 }
 
 pub unsafe extern "win64" fn ResumeThread(h: HANDLE) -> u32 {
@@ -1630,6 +1635,46 @@ mod tests {
             assert_eq!(called.load(Ordering::Acquire), 1);
             assert!(FlsGetValue(idx).is_null());
             assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn get_thread_id_and_exit_code_validate_null_unaligned_and_unrelated_handles() {
+        #[repr(align(8))]
+        struct Aligned([u8; 8]);
+        const GUARD: u8 = 0xA5;
+
+        let obj = thread::spawn(Box::new(|| 0xCAFE_BABEu32), 64 * 1024, false, false)
+            .expect("spawn thread");
+        let expected_tid = obj.tid.load(Ordering::Relaxed) as u32;
+        let h = handles::insert(obj);
+
+        unsafe {
+            assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+            assert_eq!(GetThreadId(h), expected_tid);
+
+            assert_eq!(GetExitCodeThread(h, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            let mut cell = Aligned([GUARD; 8]);
+            let ptr = cell.0.as_mut_ptr().add(1) as *mut u32;
+            assert_eq!((ptr as usize) % 4, 1);
+            assert_eq!(GetExitCodeThread(h, ptr), TRUE);
+            assert_eq!(ptr.read_unaligned(), 0xCAFE_BABEu32);
+            assert_eq!(cell.0[0], GUARD);
+            assert_eq!(&cell.0[5..], &[GUARD; 3]);
+
+            // Unrelated handle (event) preserves ERROR_INVALID_HANDLE semantics.
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+            assert_eq!(GetThreadId(ev), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            assert_eq!(GetExitCodeThread(ev, ptr), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+            assert_eq!(ptr.read_unaligned(), 0xCAFE_BABEu32);
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(h), TRUE);
         }
     }
 }

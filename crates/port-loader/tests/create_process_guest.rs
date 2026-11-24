@@ -18,7 +18,8 @@ mod macos_guest_process_tests {
         QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
     };
     use win32_rt::kernel32::threads::{
-        CloseHandle, SetHandleInformation, WaitForSingleObject, STILL_ACTIVE,
+        CloseHandle, DuplicateHandle, GetExitCodeThread, GetThreadId, SetHandleInformation,
+        WaitForSingleObject, STILL_ACTIVE,
     };
     use win32_rt::strings::{from_wide, to_wide_z};
     use win32_rt::types::{err, BOOL, FALSE, HANDLE, TRUE, WAIT_OBJECT_0};
@@ -487,10 +488,13 @@ mod macos_guest_process_tests {
             let h_proc = (pi.as_ptr() as *const HANDLE).read_unaligned();
             let h_thread = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
             let pid = (pi.as_ptr().add(16) as *const u32).read_unaligned();
+            let tid = (pi.as_ptr().add(20) as *const u32).read_unaligned();
             assert!(!h_proc.is_null());
             assert!(!h_thread.is_null());
             assert!(pid > 0);
+            assert!(tid > 0);
             assert_eq!(GetProcessId(h_proc), pid);
+            assert_eq!(GetThreadId(h_thread), tid);
 
             // Verify OpenProcess & QueryFullProcessImageNameW on child handle.
             let h_opened = OpenProcess(0x1000, FALSE, pid);
@@ -647,7 +651,13 @@ mod macos_guest_process_tests {
                 assert_eq!(CloseHandle(w_in), TRUE);
                 let hp = (pi_c.as_ptr() as *const HANDLE).read_unaligned();
                 let ht = (pi_c.as_ptr().add(8) as *const HANDLE).read_unaligned();
-                assert_eq!(WaitForSingleObject(hp, 15_000), WAIT_OBJECT_0);
+                let tid_c = (pi_c.as_ptr().add(20) as *const u32).read_unaligned();
+                assert!(tid_c > 0);
+                assert_eq!(GetThreadId(ht), tid_c);
+                assert_eq!(WaitForSingleObject(ht, 15_000), WAIT_OBJECT_0);
+                let mut got_tcode = 0u32;
+                assert_eq!(GetExitCodeThread(ht, &mut got_tcode), TRUE);
+                assert_eq!(got_tcode, expected_code, "32-bit thread exit code mismatch for {win_exe}");
                 let mut got_code = 0u32;
                 assert_eq!(GetExitCodeProcess(hp, &mut got_code), TRUE);
                 assert_eq!(got_code, expected_code, "32-bit exit code mismatch for {win_exe}");
@@ -657,7 +667,9 @@ mod macos_guest_process_tests {
                 assert_eq!(CloseHandle(hp), TRUE);
             }
 
-            // Test TerminateProcess with a full 32-bit exit code (>255) on a sleeping guest child process.
+            // Test TerminateProcess with a full 32-bit exit code (>255) on a sleeping guest child process,
+            // plus ChildThreadObj GetThreadId / GetExitCodeThread (STILL_ACTIVE -> full DWORD) and a
+            // DuplicateHandle copy surviving after hProcess and the original hThread are closed.
             let sleep_w = to_wide_z("P:\\guest_sleep.exe");
             let mut pi2 = [0u8; 24];
             assert_eq!(
@@ -677,15 +689,58 @@ mod macos_guest_process_tests {
             );
             let h_proc2 = (pi2.as_ptr() as *const HANDLE).read_unaligned();
             let h_thread2 = (pi2.as_ptr().add(8) as *const HANDLE).read_unaligned();
+            let tid2 = (pi2.as_ptr().add(20) as *const u32).read_unaligned();
+            assert!(tid2 > 0);
+            assert_eq!(GetThreadId(h_thread2), tid2);
+
+            let mut h_thread2_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(
+                    win32_rt::handles::CURRENT_PROCESS,
+                    h_thread2,
+                    win32_rt::handles::CURRENT_PROCESS,
+                    &mut h_thread2_dup,
+                    0,
+                    FALSE,
+                    2, // DUPLICATE_SAME_ACCESS
+                ),
+                TRUE
+            );
+            assert!(!h_thread2_dup.is_null() && h_thread2_dup != h_thread2);
+
             let mut code2 = 0u32;
             assert_eq!(GetExitCodeProcess(h_proc2, &mut code2), TRUE);
             assert_eq!(code2, STILL_ACTIVE);
+            let mut tcode2 = 0u32;
+            assert_eq!(GetExitCodeThread(h_thread2, &mut tcode2), TRUE);
+            assert_eq!(tcode2, STILL_ACTIVE);
+            assert_eq!(GetExitCodeThread(h_thread2, std::ptr::null_mut()), FALSE);
+            assert_eq!(GetLastError(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(GetThreadId(h_proc2), 0);
+            assert_eq!(GetLastError(), err::ERROR_INVALID_HANDLE);
+            assert_eq!(GetExitCodeThread(h_proc2, &mut tcode2), FALSE);
+            assert_eq!(GetLastError(), err::ERROR_INVALID_HANDLE);
+
             assert_eq!(TerminateProcess(h_proc2, 0xDEAD_BEEF), TRUE);
             assert_eq!(WaitForSingleObject(h_proc2, 5_000), WAIT_OBJECT_0);
             assert_eq!(GetExitCodeProcess(h_proc2, &mut code2), TRUE);
             assert_eq!(code2, 0xDEAD_BEEF);
-            assert_eq!(CloseHandle(h_thread2), TRUE);
             assert_eq!(CloseHandle(h_proc2), TRUE);
+            assert_eq!(CloseHandle(h_thread2), TRUE);
+
+            // Duplicated hThread remains waitable and queryable after hProcess and original hThread close.
+            assert_eq!(WaitForSingleObject(h_thread2_dup, 5_000), WAIT_OBJECT_0);
+            assert_eq!(GetThreadId(h_thread2_dup), tid2);
+            #[repr(align(8))]
+            struct Aligned([u8; 8]);
+            let mut unaligned_cell = Aligned([0xA5; 8]);
+            let unaligned_ptr = unaligned_cell.0.as_mut_ptr().add(1) as *mut u32;
+            assert_eq!((unaligned_ptr as usize) % 4, 1);
+            assert_eq!(GetExitCodeThread(h_thread2_dup, unaligned_ptr), TRUE);
+            assert_eq!(unaligned_ptr.read_unaligned(), 0xDEAD_BEEF);
+            assert_eq!(unaligned_cell.0[0], 0xA5);
+            assert_eq!(&unaligned_cell.0[5..], &[0xA5; 3]);
+            assert_eq!(CloseHandle(h_thread2_dup), TRUE);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
