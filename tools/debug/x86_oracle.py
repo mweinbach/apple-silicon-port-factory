@@ -202,10 +202,24 @@ def main() -> int:
     ap.add_argument("--max", type=int, default=64, help="Maximum unique snapshots to test")
     ap.add_argument("--mxcsr", type=lambda s: int(s, 0), default=None, help="Override MXCSR value for all snapshots (e.g. 0x9fc0 for FTZ|DAZ, 0x1f80 default)")
     ap.add_argument("--quiet-matches", action="store_true", help="Only print divergences and summary")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
     args = ap.parse_args()
+
+    def emit_json_result(exit_code: int, data, error: str | None) -> int:
+        print(json.dumps({
+            "schema_version": 1,
+            "command": "oracle",
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "data": data,
+            "error": error,
+        }, indent=2))
+        return exit_code
 
     snaps = load_snapshots(args.inputs)
     if not snaps:
+        if args.json:
+            return emit_json_result(2, None, "No snap_*.json files found.")
         print("No snap_*.json files found.", file=sys.stderr)
         return 2
 
@@ -270,8 +284,17 @@ def main() -> int:
         cases_code.append("\n".join(lines))
         tested.append((path, s))
 
-    print(f"Loaded {len(uniq)} unique snapshots ({len(tested)} reg-only testable on Rosetta x86-64, {skipped_mem} mem-operand).")
+    if not args.json:
+        print(f"Loaded {len(uniq)} unique snapshots ({len(tested)} reg-only testable on Rosetta x86-64, {skipped_mem} mem-operand).")
     if not tested:
+        if args.json:
+            return emit_json_result(0, {
+                "unique_snapshots": len(uniq),
+                "tested": 0,
+                "skipped_mem": skipped_mem,
+                "divergences": 0,
+                "cases": [],
+            }, None)
         return 0
 
     src = C_HARNESS + "\nint main(void) {\n" + "\n".join(cases_code) + "\n  return 0;\n}\n"
@@ -285,8 +308,10 @@ def main() -> int:
             capture_output=True, text=True
         )
         if cc.returncode != 0:
+            if args.json:
+                return emit_json_result(1, None, f"clang -arch x86_64 failed: {cc.stderr.strip()}")
             print("clang -arch x86_64 failed:", cc.stderr, file=sys.stderr)
-            return 2
+            return 1
         env = os.environ.copy()
         env["ROSETTA_ADVERTISE_AVX"] = "1"
         env["ROSETTA_DISABLE_AOT"] = "1"
@@ -294,10 +319,13 @@ def main() -> int:
         run_cmd = [rosetta_sh, bin_path] if os.path.isfile(rosetta_sh) else ["arch", "-x86_64", bin_path]
         run = subprocess.run(run_cmd, capture_output=True, text=True, env=env)
         if run.returncode != 0:
+            if args.json:
+                return emit_json_result(1, None, f"Rosetta x86_64 run failed: {run.stderr.strip()}")
             print("Rosetta x86_64 run failed:", run.stderr, file=sys.stderr)
-            return 2
+            return 1
 
     divergences = 0
+    divergence_records = []
     for line in run.stdout.splitlines():
         if not line.startswith("CASE "):
             continue
@@ -330,17 +358,44 @@ def main() -> int:
                 severity = "NAN_PAYLOAD_DIFF"
             else:
                 severity = "VALUE_DIVERGENCE"
-            print(
-                f"[{severity}] {s['where']} `{s['disasm']}` (lane {lane}):\n"
-                f"  real x86-64: xmm{dst}=0x{x86_lo:032x} ymm_hi=0x{x86_hi:032x}\n"
-                f"  x86-runtime: xmm{dst}=0x{emu_lo:032x} ymm_hi=0x{emu_hi:032x}\n"
-                f"  snapshot:    {path}"
-            )
-        elif not args.quiet_matches:
+            divergence_records.append({
+                "severity": severity,
+                "where": s.get("where"),
+                "disasm": s.get("disasm"),
+                "lane": lane,
+                "dst_reg": dst,
+                "x86_xmm": f"0x{x86_lo:032x}",
+                "x86_ymm_hi": f"0x{x86_hi:032x}",
+                "emu_xmm": f"0x{emu_lo:032x}",
+                "emu_ymm_hi": f"0x{emu_hi:032x}",
+                "snapshot": path,
+            })
+            if not args.json:
+                print(
+                    f"[{severity}] {s['where']} `{s['disasm']}` (lane {lane}):\n"
+                    f"  real x86-64: xmm{dst}=0x{x86_lo:032x} ymm_hi=0x{x86_hi:032x}\n"
+                    f"  x86-runtime: xmm{dst}=0x{emu_lo:032x} ymm_hi=0x{emu_hi:032x}\n"
+                    f"  snapshot:    {path}"
+                )
+        elif not args.quiet_matches and not args.json:
             print(f"[MATCH] {s['where']} `{s['disasm']}` lane={lane}")
 
+    exit_code = 4 if divergences > 0 else 0
+    if args.json:
+        return emit_json_result(
+            exit_code,
+            {
+                "unique_snapshots": len(uniq),
+                "tested": len(tested),
+                "skipped_mem": skipped_mem,
+                "divergences": divergences,
+                "cases": divergence_records,
+            },
+            f"{divergences} oracle divergence(s) detected" if divergences > 0 else None,
+        )
+
     print(f"\nOracle summary: {len(tested)} tested, {divergences} divergences.")
-    return 1 if divergences > 0 else 0
+    return exit_code
 
 
 if __name__ == "__main__":

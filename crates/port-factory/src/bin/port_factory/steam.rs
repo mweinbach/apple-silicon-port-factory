@@ -1,7 +1,8 @@
 //! Steam library, DepotDownloader, local launcher UI, and one-click Steam conversion handlers.
 
-use super::{workspace_root, ArgCursor, DEFAULT_STEAM_BROWSER_HTML};
-use anyhow::{bail, Context, Result};
+use super::{emit_json, usage_err, workspace_root, ArgCursor, DEFAULT_STEAM_BROWSER_HTML};
+use anyhow::Result;
+use port_factory::json_output::{exit_codes, steam_scan_data_json, JsonEnvelope};
 use port_factory::launcher::{build_launcher_app_bundle, run_launcher, LauncherOptions};
 use port_factory::steam_library::{
     apply_post_install, convert_steam_game, default_apps_dir, default_steam_downloads_dir,
@@ -12,40 +13,45 @@ use port_factory::steam_library::{
 };
 use std::path::PathBuf;
 
-pub fn cmd_steam_scan(args: &[String]) -> Result<()> {
+pub fn cmd_steam_scan(args: &[String]) -> Result<i32> {
     let mut html_out: Option<PathBuf> = None;
     let mut open_browser = false;
+    let mut json = false;
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
             "--html" | "-o" => {
-                if let Some(p) = cur.next() {
-                    html_out = Some(PathBuf::from(p));
-                }
+                html_out = Some(cur.next_path_or_err("--html requires PATH")?);
             }
             "--open" => open_browser = true,
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown steam-scan flag {s:?}"))),
             _ => {}
         }
     }
 
     let root = workspace_root();
     let report = scan_all_steam_libraries(&root)?;
-    print!("{}", format_steam_scan_report(&report));
-
     let html_path = html_out.unwrap_or_else(|| root.join(DEFAULT_STEAM_BROWSER_HTML));
     write_steam_browser_html(&report, &html_path)?;
-    println!(
-        "\nInteractive Steam Library Browser generated at:\n  {}",
-        html_path.display()
-    );
 
     if open_browser {
         let _ = std::process::Command::new("open").arg(&html_path).status();
     }
-    Ok(())
+    if json {
+        let data = steam_scan_data_json(&report, Some(&html_path.display().to_string()));
+        return Ok(emit_json(&JsonEnvelope::ok("steam-scan", data)));
+    }
+
+    print!("{}", format_steam_scan_report(&report));
+    println!(
+        "\nInteractive Steam Library Browser generated at:\n  {}",
+        html_path.display()
+    );
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_launcher(args: &[String]) -> Result<()> {
+pub fn cmd_launcher(args: &[String]) -> Result<i32> {
     let mut port: u16 = 7420;
     let mut open_browser = true;
     let mut ws = workspace_root();
@@ -57,13 +63,13 @@ pub fn cmd_launcher(args: &[String]) -> Result<()> {
                 let raw = cur.next_or_err("--port requires PORT")?;
                 port = raw
                     .parse()
-                    .with_context(|| format!("invalid --port {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --port {raw:?}")))?;
             }
             "--workspace" | "-w" => {
-                ws = PathBuf::from(cur.next_or_err("--workspace requires DIR")?);
+                ws = cur.next_path_or_err("--workspace requires DIR")?;
             }
             "--no-open" => open_browser = false,
-            other => bail!("unknown launcher flag {other:?}"),
+            other => return Err(usage_err(format!("unknown launcher flag {other:?}"))),
         }
     }
 
@@ -71,19 +77,20 @@ pub fn cmd_launcher(args: &[String]) -> Result<()> {
         workspace_root: ws,
         port,
         open_browser,
-    })
+    })?;
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_launcher_app(args: &[String]) -> Result<()> {
+pub fn cmd_launcher_app(args: &[String]) -> Result<i32> {
     let root = workspace_root();
     let mut out_app = default_apps_dir(&root).join("Port Factory.app");
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
             "--out" | "-o" => {
-                out_app = PathBuf::from(cur.next_or_err("--out requires PATH.app")?);
+                out_app = cur.next_path_or_err("--out requires PATH.app")?;
             }
-            other => bail!("unknown launcher-app flag {other:?}"),
+            other => return Err(usage_err(format!("unknown launcher-app flag {other:?}"))),
         }
     }
     let built = build_launcher_app_bundle(&root, &out_app)?;
@@ -92,27 +99,27 @@ pub fn cmd_launcher_app(args: &[String]) -> Result<()> {
         "Double-click it in Finder or run: open \"{}\"",
         built.display()
     );
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_steam_setup(args: &[String]) -> Result<()> {
+pub fn cmd_steam_setup(args: &[String]) -> Result<i32> {
     let mut dir: Option<PathBuf> = None;
     let mut force = false;
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
             "--dir" | "-o" => {
-                dir = Some(PathBuf::from(cur.next_or_err("--dir requires DIR")?));
+                dir = Some(cur.next_path_or_err("--dir requires DIR")?);
             }
             "--force" => force = true,
-            other => bail!("unknown steam-setup flag {other:?}"),
+            other => return Err(usage_err(format!("unknown steam-setup flag {other:?}"))),
         }
     }
     if !force {
         if let Some(existing) = find_depot_downloader() {
             println!("DepotDownloader is already installed: {}", existing.display());
             println!("(Pass --force to reinstall the latest native macOS release.)");
-            return Ok(());
+            return Ok(exit_codes::OK);
         }
     }
     let bin = install_depot_downloader(dir.as_deref())?;
@@ -120,14 +127,14 @@ pub fn cmd_steam_setup(args: &[String]) -> Result<()> {
         "Ready to download Windows x64 Steam games with: {}",
         bin.display()
     );
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_steam_download(args: &[String]) -> Result<()> {
+pub fn cmd_steam_download(args: &[String]) -> Result<i32> {
     if args.is_empty() {
-        bail!(
-            "steam-download requires <APPID_OR_NAME> [--dir DIR] [--qr | --user ACCOUNT] [--validate] [--branch BRANCH] [--dry-run]"
-        );
+        return Err(usage_err(
+            "steam-download requires <APPID_OR_NAME> [--dir DIR] [--qr | --user ACCOUNT] [--validate] [--branch BRANCH] [--dry-run]",
+        ));
     }
     let mut target: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
@@ -141,7 +148,7 @@ pub fn cmd_steam_download(args: &[String]) -> Result<()> {
     while let Some(a) = cur.next() {
         match a {
             "--dir" | "-o" => {
-                output_dir = Some(PathBuf::from(cur.next_or_err("--dir requires DIR")?));
+                output_dir = Some(cur.next_path_or_err("--dir requires DIR")?);
             }
             "--user" | "-u" => {
                 username = Some(cur.next_or_err("--user requires ACCOUNT")?.to_string());
@@ -156,11 +163,13 @@ pub fn cmd_steam_download(args: &[String]) -> Result<()> {
             other if !other.starts_with('-') && target.is_none() => {
                 target = Some(other.to_string());
             }
-            other => bail!("unknown steam-download flag '{}'", other),
+            other => return Err(usage_err(format!("unknown steam-download flag '{other}'"))),
         }
     }
 
-    let target = target.context("missing Steam <APPID_OR_NAME>")?;
+    let Some(target) = target else {
+        return Err(usage_err("missing Steam <APPID_OR_NAME>"));
+    };
     let root = workspace_root();
     let scan = scan_all_steam_libraries(&root)?;
     let (app_id, title, existing_win_dir) = resolve_steam_target_app_id(&scan, &target)?;
@@ -182,14 +191,14 @@ pub fn cmd_steam_download(args: &[String]) -> Result<()> {
 
     let installed_dir = download_steam_game(&root, &opts)?;
     println!("  Download Dir  : {}", installed_dir.display());
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_steam_port(args: &[String]) -> Result<()> {
+pub fn cmd_steam_port(args: &[String]) -> Result<i32> {
     if args.is_empty() {
-        bail!(
-            "steam-port requires <APPID_OR_NAME> [--qr | --user ACCOUNT] [--validate] [--skip-download] [--dir DIR] [--out PATH.app] [--copy-to /Volumes/SSD] [--dry-run]"
-        );
+        return Err(usage_err(
+            "steam-port requires <APPID_OR_NAME> [--qr | --user ACCOUNT] [--validate] [--skip-download] [--dir DIR] [--out PATH.app] [--copy-to /Volumes/SSD] [--dry-run]",
+        ));
     }
     let mut target: Option<String> = None;
     let mut download_dir: Option<PathBuf> = None;
@@ -207,13 +216,13 @@ pub fn cmd_steam_port(args: &[String]) -> Result<()> {
     while let Some(a) = cur.next() {
         match a {
             "--dir" => {
-                download_dir = Some(PathBuf::from(cur.next_or_err("--dir requires DIR")?));
+                download_dir = Some(cur.next_path_or_err("--dir requires DIR")?);
             }
             "--out" | "-o" => {
-                output_app = Some(PathBuf::from(cur.next_or_err("--out requires PATH.app")?));
+                output_app = Some(cur.next_path_or_err("--out requires PATH.app")?);
             }
             "--copy-to" => {
-                copy_to = Some(PathBuf::from(cur.next_or_err("--copy-to requires DEST")?));
+                copy_to = Some(cur.next_path_or_err("--copy-to requires DEST")?);
             }
             "--user" | "-u" => {
                 username = Some(cur.next_or_err("--user requires ACCOUNT")?.to_string());
@@ -230,11 +239,13 @@ pub fn cmd_steam_port(args: &[String]) -> Result<()> {
             other if !other.starts_with('-') && target.is_none() => {
                 target = Some(other.to_string());
             }
-            other => bail!("unknown steam-port flag {other:?}"),
+            other => return Err(usage_err(format!("unknown steam-port flag {other:?}"))),
         }
     }
 
-    let target = target.context("missing <APPID_OR_NAME>")?;
+    let Some(target) = target else {
+        return Err(usage_err("missing <APPID_OR_NAME>"));
+    };
     let root = workspace_root();
     let res = port_steam_game(
         &root,
@@ -260,12 +271,14 @@ pub fn cmd_steam_port(args: &[String]) -> Result<()> {
             println!("  Exported   : {}", exp.display());
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_steam_postinstall(args: &[String]) -> Result<()> {
+pub fn cmd_steam_postinstall(args: &[String]) -> Result<i32> {
     if args.is_empty() {
-        bail!("steam-postinstall requires <GAME_DIR> [--appid ID] [--out DIR]");
+        return Err(usage_err(
+            "steam-postinstall requires <GAME_DIR> [--appid ID] [--out DIR]",
+        ));
     }
     let mut game_dir: Option<PathBuf> = None;
     let mut app_id = "0".to_string();
@@ -276,16 +289,22 @@ pub fn cmd_steam_postinstall(args: &[String]) -> Result<()> {
         match a {
             "--appid" => app_id = cur.next_or_err("--appid requires ID")?.to_string(),
             "--out" | "-o" => {
-                out_dir = Some(PathBuf::from(cur.next_or_err("--out requires DIR")?));
+                out_dir = Some(cur.next_path_or_err("--out requires DIR")?);
             }
             other if !other.starts_with('-') && game_dir.is_none() => {
                 game_dir = Some(PathBuf::from(other));
             }
-            other => bail!("unknown steam-postinstall argument '{}'", other),
+            other => {
+                return Err(usage_err(format!(
+                    "unknown steam-postinstall argument '{other}'"
+                )))
+            }
         }
     }
 
-    let game_dir = game_dir.context("missing <GAME_DIR>")?;
+    let Some(game_dir) = game_dir else {
+        return Err(usage_err("missing <GAME_DIR>"));
+    };
     let out_dir = out_dir.unwrap_or_else(|| game_dir.clone());
     let summary = apply_post_install(&game_dir, &app_id, &out_dir)?;
 
@@ -326,14 +345,14 @@ pub fn cmd_steam_postinstall(args: &[String]) -> Result<()> {
     for r in &summary.bypassable_redistributables {
         println!("    - {}", r);
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_steam_convert(args: &[String]) -> Result<()> {
+pub fn cmd_steam_convert(args: &[String]) -> Result<i32> {
     if args.is_empty() {
-        bail!(
-            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH]"
-        );
+        return Err(usage_err(
+            "steam-convert requires <APPID_OR_NAME_OR_DIR> [--format app|aot-crate|shaders] [--out PATH]",
+        ));
     }
     let mut target: Option<String> = None;
     let mut format = ConversionFormat::MacOsApp;
@@ -346,16 +365,17 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<()> {
     while let Some(a) = cur.next() {
         match a {
             "--format" | "-f" => {
-                format = ConversionFormat::parse(cur.next_or_err("--format requires FORMAT")?)?;
+                format = ConversionFormat::parse(cur.next_or_err("--format requires FORMAT")?)
+                    .map_err(|e| usage_err(format!("{e:#}")))?;
             }
             "--out" | "-o" => {
-                output_path = Some(PathBuf::from(cur.next_or_err("--out requires PATH")?));
+                output_path = Some(cur.next_path_or_err("--out requires PATH")?);
             }
             "--max-fns" => {
                 let raw = cur.next_or_err("--max-fns requires N")?;
                 max_aot_functions = raw
                     .parse()
-                    .with_context(|| format!("invalid --max-fns value {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --max-fns value {raw:?}")))?;
             }
             "--copy-game" => {
                 // Self-contained copy into `Contents/Resources/Game` is always enabled.
@@ -372,18 +392,24 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<()> {
                             std::env::var_os("HOME")
                                 .map(|h| PathBuf::from(h).join("Translator/ShaderCache"))
                         })
-                        .context("cannot resolve default shader cache directory; pass a path after --bundle-shader-cache")?;
+                        .ok_or_else(|| {
+                            usage_err(
+                                "cannot resolve default shader cache directory; pass a path after --bundle-shader-cache",
+                            )
+                        })?;
                     bundle_shader_cache_from = Some(default_src);
                 }
             }
             other if !other.starts_with('-') && target.is_none() => {
                 target = Some(other.to_string());
             }
-            other => bail!("unknown steam-convert flag '{}'", other),
+            other => return Err(usage_err(format!("unknown steam-convert flag '{other}'"))),
         }
     }
 
-    let target = target.context("missing <APPID_OR_NAME_OR_DIR>")?;
+    let Some(target) = target else {
+        return Err(usage_err("missing <APPID_OR_NAME_OR_DIR>"));
+    };
     let opts = SteamConvertOptions {
         target,
         format,
@@ -435,5 +461,5 @@ pub fn cmd_steam_convert(args: &[String]) -> Result<()> {
         "  Shader Pipeline    : {} Metal shader(s) pre-compiled",
         res.shaders_converted
     );
-    Ok(())
+    Ok(exit_codes::OK)
 }

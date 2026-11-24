@@ -31,6 +31,7 @@ pub mod dotnet;
 pub mod game_profiles;
 pub mod gpu_shaders;
 pub mod ios_bundle;
+pub mod json_output;
 pub mod launcher;
 pub mod ops_db;
 pub mod scaffold;

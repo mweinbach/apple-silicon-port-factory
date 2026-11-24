@@ -10,10 +10,36 @@
 
 mod port_factory;
 
-use anyhow::{bail, Result};
-use port_factory::{bundle, db, diag, scan, steam, usage};
+use ::port_factory::json_output::{exit_codes, JsonEnvelope};
+use port_factory::{bundle, db, diag, scan, steam, usage, usage_err, UsageError};
 
-fn main() -> Result<()> {
+fn canonical_command_name(cmd: &str) -> &str {
+    match cmd {
+        "aot-prewarm" | "prewarm-aot" => "aot-prewarm",
+        "aot-static-obj" | "static-aot-obj" => "aot-static-obj",
+        "ios-bundle" | "ios-package" | "ios-ipa" => "ios-bundle",
+        "optimize-assets" | "storage-opt" | "opt-assets" => "optimize-assets",
+        "launcher" | "ui" | "gui" => "launcher",
+        "steam-scan" | "steam-library" | "steam-browser" => "steam-scan",
+        "steam-download" | "steam-update" => "steam-download",
+        "steam-port" | "port" => "steam-port",
+        "bundles" | "bundle-list" => "bundles",
+        "bundle-verify" | "verify-bundle" => "bundle-verify",
+        "bundle-export" | "export-bundle" => "bundle-export",
+        "game-profiles" | "games-audit" => "game-profiles",
+        "app-audit" | "gpu-audit" => "app-audit",
+        "dotnet-audit" | "clr-audit" => "dotnet-audit",
+        "precompile-shaders" | "shader-precompile" => "precompile-shaders",
+        "runtime-audit" | "mxcsr-audit" | "hazard-audit" => "runtime-audit",
+        "verify-x86" | "x86-verify" => "verify-x86",
+        "oracle" | "x86-oracle" => "oracle",
+        "bisect-runtime" | "bisect" => "bisect-runtime",
+        "live-probe" | "probe" => "live-probe",
+        other => other,
+    }
+}
+
+fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "--") {
         args.remove(0);
@@ -22,9 +48,12 @@ fn main() -> Result<()> {
         usage();
     };
     let rest = &args[1..];
-    match cmd {
+    let want_json = rest.iter().any(|a| a == "--json");
+    let canonical = canonical_command_name(cmd);
+
+    let res = match cmd {
         "sync" => db::cmd_sync(rest),
-        "stats" => db::cmd_stats(),
+        "stats" => db::cmd_stats(rest),
         "list" => db::cmd_list(rest),
         "explain" => db::cmd_explain(rest),
         "scan" => scan::cmd_scan(rest),
@@ -46,7 +75,7 @@ fn main() -> Result<()> {
         "steam-postinstall" => steam::cmd_steam_postinstall(rest),
         "steam-convert" => steam::cmd_steam_convert(rest),
         "steam-port" | "port" => steam::cmd_steam_port(rest),
-        "bundles" | "bundle-list" => bundle::cmd_bundles(),
+        "bundles" | "bundle-list" => bundle::cmd_bundles(rest),
         "bundle-verify" | "verify-bundle" => bundle::cmd_bundle_verify(rest),
         "bundle-export" | "export-bundle" => bundle::cmd_bundle_export(rest),
         "game-profiles" | "games-audit" => db::cmd_game_profiles(rest),
@@ -68,6 +97,24 @@ fn main() -> Result<()> {
         "live-probe" | "probe" => diag::cmd_live_probe(rest),
         "nan-trace" => diag::cmd_nan_trace(rest),
         "-h" | "--help" | "help" => usage(),
-        other => bail!("unknown subcommand {other:?}"),
+        other => Err(usage_err(format!("unknown subcommand {other:?}"))),
+    };
+
+    match res {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            let code = if err.downcast_ref::<UsageError>().is_some() {
+                exit_codes::USAGE_ERROR
+            } else {
+                exit_codes::RUNTIME_ERROR
+            };
+            if want_json {
+                let env = JsonEnvelope::error(canonical, code, format!("{err:#}"));
+                println!("{}", env.to_json_pretty());
+            } else {
+                eprintln!("Error: {err:#}");
+            }
+            std::process::exit(code);
+        }
     }
 }

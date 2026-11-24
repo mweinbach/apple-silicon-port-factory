@@ -116,8 +116,13 @@ def main() -> int:
     ap.add_argument("--confirm-clean", type=int, default=1, help="Require N consecutive CLEAN runs before accepting a CLEAN verdict (guards against probabilistic repros)")
     ap.add_argument("--extra-env", action="append", default=[], help="Extra KEY=VAL env var(s) passed to every probe")
     ap.add_argument("--fast-only", action="store_true", help="Skip slow full-boot AW2_JIT=0 / AW2_EMU_FAST=0 probes")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
     ap.add_argument("--out", help="Write structured JSON report to this path")
     args = ap.parse_args()
+
+    orig_stdout = sys.stdout
+    if args.json:
+        sys.stdout = sys.stderr
 
     base_env: dict[str, str] = {}
     for item in args.extra_env:
@@ -221,6 +226,16 @@ def main() -> int:
         with open(args.out, "w") as fh:
             json.dump(report, fh, indent=2)
         print(f"Wrote report to {args.out}", flush=True)
+    if args.json:
+        sys.stdout = orig_stdout
+        print(json.dumps({
+            "schema_version": 1,
+            "command": "bisect-runtime",
+            "ok": True,
+            "exit_code": 0,
+            "data": report,
+            "error": None,
+        }, indent=2))
     return 0
 
 

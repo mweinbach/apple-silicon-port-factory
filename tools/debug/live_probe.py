@@ -385,6 +385,7 @@ def main() -> int:
     ap.add_argument("--timeout-step", type=float, default=60.0, help="Max seconds per step wait")
     ap.add_argument("--extra-env", action="append", default=[], help="Extra KEY=VAL env var(s) passed to port-runner")
     ap.add_argument("--keep-ctl", action="store_true", help="Keep temporary PORT_CONTROL_DIR for debugging")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
     ap.add_argument("--json-out", help="Write structured JSON trial report to this path")
     ap.add_argument("game_args", nargs=argparse.REMAINDER, help="Extra arguments passed after `--` to the Windows game")
     args = ap.parse_args()
@@ -393,6 +394,10 @@ def main() -> int:
         args.game_args = args.game_args[1:]
     if not args.manifest and not args.pe:
         ap.error("Provide --manifest <game.toml> or --pe <Game.exe>")
+
+    orig_stdout = sys.stdout
+    if args.json:
+        sys.stdout = sys.stderr
 
     runner = find_port_runner(args.runner)
     steps = load_steps(args.step, args.script)
@@ -405,10 +410,22 @@ def main() -> int:
             worst_rc = rec["rc"]
             break
 
+    payload = {"trials": trials, "rc": worst_rc}
     if args.json_out:
         out_p = Path(args.json_out)
         out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(json.dumps({"trials": trials, "rc": worst_rc}, indent=2) + "\n", encoding="utf-8")
+        out_p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    if args.json:
+        sys.stdout = orig_stdout
+        print(json.dumps({
+            "schema_version": 1,
+            "command": "live-probe",
+            "ok": worst_rc == 0,
+            "exit_code": worst_rc,
+            "data": payload,
+            "error": None if worst_rc == 0 else f"live-probe exited with rc={worst_rc}",
+        }, indent=2))
 
     return worst_rc
 
