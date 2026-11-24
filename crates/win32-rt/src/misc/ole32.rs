@@ -2764,6 +2764,50 @@ struct ParsedUri {
     fragment: String,
 }
 
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            if let Some(slash) = out.rfind('/') {
+                out.truncate(slash);
+            } else {
+                out.clear();
+            }
+        } else if input == "/.." {
+            input = "/";
+            if let Some(slash) = out.rfind('/') {
+                out.truncate(slash);
+            } else {
+                out.clear();
+            }
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let seg_end = if let Some(after_leading) = input.strip_prefix('/') {
+                match after_leading.find('/') {
+                    Some(i) => i + 1,
+                    None => input.len(),
+                }
+            } else {
+                input.find('/').unwrap_or(input.len())
+            };
+            out.push_str(&input[..seg_end]);
+            input = &input[seg_end..];
+        }
+    }
+    out
+}
+
 impl ParsedUri {
     fn parse(raw: &str) -> Result<Self, HRESULT> {
         let trimmed = raw.trim();
@@ -2916,19 +2960,40 @@ impl ParsedUri {
             let combined = format!("{}:{rel}", self.scheme);
             return Self::parse(&combined);
         }
-        if rel_path.contains("://") {
+        // RFC 3986 §3.1 / §4.2: a ':' in the first path segment (before any '/', '?', '#')
+        // denotes a scheme; delegate to Self::parse so valid schemes succeed and malformed
+        // scheme candidates fail honestly with E_INVALIDARG.
+        let first_seg = match rel_path.find('/') {
+            Some(i) => &rel_path[..i],
+            None => rel_path,
+        };
+        if first_seg.contains(':') {
             return Self::parse(rel);
         }
-        let new_path = if rel_path.starts_with('/') {
-            rel.to_string()
+        let (base_origin, has_authority) = match self.raw.find(':') {
+            Some(colon) => {
+                let after_colon = &self.raw[colon + 1..];
+                if let Some(after_slashes) = after_colon.strip_prefix("//") {
+                    let auth_len = after_slashes.find(['/', '?', '#']).unwrap_or(after_slashes.len());
+                    (&self.raw[..colon + 3 + auth_len], true)
+                } else {
+                    (&self.raw[..=colon], false)
+                }
+            }
+            None => (self.raw.as_str(), false),
+        };
+        let merged_path = if rel_path.starts_with('/') {
+            rel_path.to_string()
         } else {
             let base_dir = match self.path.rfind('/') {
                 Some(i) => &self.path[..=i],
-                None => "/",
+                None if has_authority => "/",
+                None => "",
             };
-            format!("{base_dir}{rel}")
+            format!("{base_dir}{rel_path}")
         };
-        let combined = format!("{}://{}{}{}", self.scheme, self.host, if self.port != 0 { format!(":{}", self.port) } else { String::new() }, new_path);
+        let clean_path = remove_dot_segments(&merged_path);
+        let combined = format!("{base_origin}{clean_path}{rel_suffix}");
         Self::parse(&combined)
     }
 }
@@ -4870,6 +4935,62 @@ mod tests {
                     "?next=https://other.example/x",
                     "",
                 ),
+                // Non-authority schemes (mailto, urn, custom with uppercase/punctuation).
+                (
+                    "https://example.com/a/doc.json",
+                    "mailto:user@example.com?subject=hi",
+                    "mailto:user@example.com?subject=hi",
+                    "mailto:user@example.com?subject=hi",
+                    "user@example.com",
+                    "?subject=hi",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "urn:isbn:0451450523",
+                    "urn:isbn:0451450523",
+                    "urn:isbn:0451450523",
+                    "isbn:0451450523",
+                    "",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "Foo+Bar.v1-test:opaque/part?q=1#f",
+                    "foo+bar.v1-test:opaque/part?q=1#f",
+                    "Foo+Bar.v1-test:opaque/part?q=1#f",
+                    "opaque/part",
+                    "?q=1",
+                    "#f",
+                ),
+                // Relative colons in non-initial segments, dot-segment resolution, and userinfo preservation.
+                (
+                    "https://example.com/a/doc.json",
+                    "dir/item:123?k=a:b#c:d",
+                    "https://example.com/a/dir/item:123?k=a:b#c:d",
+                    "https://example.com/a/dir/item:123?k=a:b#c:d",
+                    "/a/dir/item:123",
+                    "?k=a:b",
+                    "#c:d",
+                ),
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "./item:123",
+                    "https://user:pw@example.com:8443/a/item:123",
+                    "https://user:pw@example.com:8443/a/item:123",
+                    "/a/item:123",
+                    "",
+                    "",
+                ),
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "../b/c.json",
+                    "https://user:pw@example.com:8443/b/c.json",
+                    "https://user:pw@example.com:8443/b/c.json",
+                    "/b/c.json",
+                    "",
+                    "",
+                ),
                 (
                     "https://example.com/a/doc.json",
                     "https://other.example/x?q=1#f",
@@ -4950,6 +5071,53 @@ mod tests {
                 WindowsDeleteString(rel_h);
                 WindowsDeleteString(base_h);
             }
+
+            // Malformed scheme candidates (':' in first path segment failing RFC 3986 §3.1)
+            // must fail honestly with E_INVALIDARG on both WinRT entry points.
+            let base_h = rust_to_hstring("https://example.com/a/doc.json").unwrap();
+            let mut base_obj: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    urif,
+                    &crate::com::IID_IUriRuntimeClassFactory,
+                    6, // CreateUri
+                    &[base_h as u64, &mut base_obj as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            for bad_rel in ["1bad:foo", ":missing-scheme", "bad_scheme:foo"] {
+                let rel_h = rust_to_hstring(bad_rel).unwrap();
+
+                let mut out_comb: *mut c_void = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        base_obj,
+                        &crate::com::IID_IUriRuntimeClass,
+                        22, // CombineUri
+                        &[rel_h as u64, &mut out_comb as *mut *mut c_void as u64],
+                    ),
+                    E_INVALIDARG,
+                    "CombineUri should reject malformed scheme {bad_rel:?}"
+                );
+                assert!(out_comb.is_null());
+
+                let mut out_fac: *mut c_void = 0xDEAD_BEEFusize as *mut c_void;
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        7, // CreateWithRelativeUri
+                        &[base_h as u64, rel_h as u64, &mut out_fac as *mut *mut c_void as u64],
+                    ),
+                    E_INVALIDARG,
+                    "CreateWithRelativeUri should reject malformed scheme {bad_rel:?}"
+                );
+                assert!(out_fac.is_null());
+
+                WindowsDeleteString(rel_h);
+            }
+            assert_eq!(com_call_release(base_obj), 0);
+            WindowsDeleteString(base_h);
 
             assert_eq!(com_call_release(urif), 0);
             WindowsDeleteString(uri_class);
