@@ -959,6 +959,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
@@ -1057,6 +1058,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.

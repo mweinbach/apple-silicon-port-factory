@@ -6442,3 +6442,676 @@ fn jit_timestamp_blocks_switch_clock_mode_at_execution() {
     assert_eq!(with_frozen_tsc(sample), (GUEST_TSC, GUEST_TSC));
     assert!(jit::test_dump_take().is_empty(), "changing clock mode recompiled the block");
 }
+
+/// Multi-threaded contention test for unaligned LOCK operations:
+/// verifies zero lost updates when N threads concurrently hammer LOCK ops on:
+///   (a) a misaligned word inside a 16-byte granule (handled by FEAT_LSE2 single-insn atomics)
+///   (b) a word crossing a 16-byte boundary (serialized via the sharded spinlock)
+/// across all LOCK sub-ops (add, sub, and, or, xor, inc, dec, not, neg, xchg, cmpxchg, xadd,
+/// bts/btr/btc, cmpxchg8b, cmpxchg16b) and mixed JIT + interpreter threads.
+#[test]
+fn unaligned_lock_ops_contention() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 4;
+    const ITERS: u64 = 20_000;
+
+    fn assemble_fn(build: impl FnOnce(&mut CodeAssembler)) -> *mut u8 {
+        let mut a = CodeAssembler::new(64).unwrap();
+        build(&mut a);
+        let code = arena_alloc(256, 16);
+        let bytes = a.assemble(code as u64).unwrap();
+        assert!(bytes.len() <= 256);
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
+            core::ptr::write_bytes(code.add(bytes.len()), 0xCC, 256 - bytes.len());
+        }
+        code
+    }
+
+    // Run `code(rcx = ptr, rdx = iters, r8 = tid)` concurrently on `THREADS` threads.
+    // `modes` chooses `jit::force(mode)` per thread (1 = JIT, 2 = interpreter).
+    fn run_contended(code: *mut u8, ptr: usize, iters: u64, modes: [u8; THREADS]) -> [u64; THREADS] {
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut results = [0u64; THREADS];
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(THREADS);
+            for tid in 0..THREADS {
+                let b = Arc::clone(&barrier);
+                let mode = modes[tid];
+                let code_addr = code as u64;
+                handles.push(s.spawn(move || {
+                    b.wait();
+                    unsafe {
+                        jit::force(mode);
+                        let (ret, _) = emu_run_full(
+                            code_addr,
+                            [ptr as u64, iters, tid as u64, 0, 0, 0, 0, 0],
+                            [0; 4],
+                            [0; 8],
+                        );
+                        jit::force(0);
+                        ret
+                    }
+                }));
+            }
+            for (tid, h) in handles.into_iter().enumerate() {
+                results[tid] = h.join().expect("worker thread panicked");
+            }
+        });
+        results
+    }
+
+    let buf = arena_alloc(128, 64);
+    // Test offsets: misaligned inside 16B window AND crossing 16B boundary.
+    let offsets_32: [(&str, usize); 2] = [("misaligned_in_16b", 1), ("crossing_16b", 14)];
+    let offsets_64: [(&str, usize); 2] = [("misaligned_in_16b", 1), ("crossing_16b", 12)];
+    let offsets_16: [(&str, usize); 2] = [("misaligned_in_16b", 1), ("crossing_16b", 15)];
+
+    // 1. LOCK ADD + LOCK SUB (net +1 per iter: +3 then -2) on 32-bit and 64-bit.
+    let lock_add_sub_32 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().add(dword_ptr(rcx), 3).unwrap();
+        a.lock().sub(dword_ptr(rcx), 2).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    let lock_add_sub_64 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().add(qword_ptr(rcx), 3).unwrap();
+        a.lock().sub(qword_ptr(rcx), 2).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_32 {
+        for modes in [[1, 1, 1, 1], [1, 2, 1, 2]] {
+            unsafe {
+                core::ptr::write_bytes(buf, 0, 128);
+                let p = buf.add(off);
+                run_contended(lock_add_sub_32, p as usize, ITERS, modes);
+                let got = core::ptr::read_unaligned(p as *const u32);
+                assert_eq!(
+                    got as u64,
+                    THREADS as u64 * ITERS,
+                    "lock add/sub u32 {label} modes={modes:?}"
+                );
+            }
+        }
+    }
+    for &(label, off) in &offsets_64 {
+        for modes in [[1, 1, 1, 1], [1, 2, 1, 2]] {
+            unsafe {
+                core::ptr::write_bytes(buf, 0, 128);
+                let p = buf.add(off);
+                run_contended(lock_add_sub_64, p as usize, ITERS, modes);
+                let got = core::ptr::read_unaligned(p as *const u64);
+                assert_eq!(
+                    got,
+                    THREADS as u64 * ITERS,
+                    "lock add/sub u64 {label} modes={modes:?}"
+                );
+            }
+        }
+    }
+
+    // 2. LOCK INC + LOCK DEC (2x inc, 1x dec -> net +1 per iter) on 16-bit and 32-bit.
+    let lock_inc_dec_16 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().inc(word_ptr(rcx)).unwrap();
+        a.lock().inc(word_ptr(rcx)).unwrap();
+        a.lock().dec(word_ptr(rcx)).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    let lock_inc_dec_32 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().inc(dword_ptr(rcx)).unwrap();
+        a.lock().inc(dword_ptr(rcx)).unwrap();
+        a.lock().dec(dword_ptr(rcx)).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_16 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_inc_dec_16, p as usize, ITERS, [1, 1, 1, 1]);
+            let got = core::ptr::read_unaligned(p as *const u16);
+            assert_eq!(
+                got,
+                (THREADS as u64 * ITERS) as u16,
+                "lock inc/dec u16 {label}"
+            );
+        }
+    }
+    for &(label, off) in &offsets_32 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_inc_dec_32, p as usize, ITERS, [1, 1, 1, 1]);
+            let got = core::ptr::read_unaligned(p as *const u32);
+            assert_eq!(got as u64, THREADS as u64 * ITERS, "lock inc/dec u32 {label}");
+        }
+    }
+
+    // 3. LOCK XADD: sum all returned old values across all threads == N*(N-1)/2.
+    let lock_xadd_64 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.xor(rax, rax).unwrap();
+        a.set_label(&mut lp).unwrap();
+        a.mov(r9, 1u64).unwrap();
+        a.lock().xadd(qword_ptr(rcx), r9).unwrap();
+        a.add(rax, r9).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_64 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            let sums = run_contended(lock_xadd_64, p as usize, ITERS, [1, 2, 1, 2]);
+            let got = core::ptr::read_unaligned(p as *const u64);
+            let total = THREADS as u64 * ITERS;
+            assert_eq!(got, total, "lock xadd u64 final {label}");
+            let sum_old: u64 = sums.iter().sum();
+            assert_eq!(sum_old, total * (total - 1) / 2, "lock xadd u64 sum {label}");
+        }
+    }
+
+    // 4. LOCK CMPXCHG (CAS increment loop) on 32-bit and 64-bit.
+    let lock_cmpxchg_32 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        let mut retry = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.mov(eax, dword_ptr(rcx)).unwrap();
+        a.set_label(&mut retry).unwrap();
+        a.lea(r9d, dword_ptr(rax + 1)).unwrap();
+        a.lock().cmpxchg(dword_ptr(rcx), r9d).unwrap();
+        a.jne(retry).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_32 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_cmpxchg_32, p as usize, ITERS, [1, 2, 1, 2]);
+            let got = core::ptr::read_unaligned(p as *const u32);
+            assert_eq!(got as u64, THREADS as u64 * ITERS, "lock cmpxchg u32 {label}");
+        }
+    }
+
+    // 5. LOCK AND / OR / XOR / BTS / BTR / BTC on disjoint per-thread bit slices of the same word.
+    let lock_bitwise_32 = assemble_fn(|a| {
+        // Each thread tid in 0..4 owns bits: (tid*4 + 0..=3):
+        //   bit tid*4 + 0: set via LOCK OR, cleared via LOCK AND, then left set via LOCK OR
+        //   bit tid*4 + 1: toggled (2*iters + 1) times via LOCK XOR -> ends 1
+        //   bit tid*4 + 2: set via LOCK BTS, cleared via LOCK BTR, set via LOCK BTS -> ends 1
+        //   bit tid*4 + 3: toggled (2*iters + 1) times via LOCK BTC -> ends 1
+        let mut lp = a.create_label();
+        a.mov(r9, r8).unwrap();
+        a.shl(r9, 2).unwrap(); // base_bit = tid * 4
+        a.mov(r10d, 1u32).unwrap();
+        a.mov(r11, rcx).unwrap();
+        a.mov(rcx, r9).unwrap();
+        a.shl(r10d, cl).unwrap(); // mask0 = 1 << base_bit
+        a.mov(eax, r10d).unwrap();
+        a.not(eax).unwrap(); // ~mask0
+        a.lea(esi, dword_ptr(r10 + r10)).unwrap(); // mask1 = 1 << (base_bit + 1)
+        a.mov(rcx, r11).unwrap();
+        // Pre-toggle once so total toggles = 2*iters + 1 (odd -> ends 1).
+        a.lock().xor(dword_ptr(rcx), esi).unwrap();
+        a.lea(edi, dword_ptr(r9 + 3)).unwrap();
+        a.lock().btc(dword_ptr(rcx), edi).unwrap();
+        a.set_label(&mut lp).unwrap();
+        a.lock().or(dword_ptr(rcx), r10d).unwrap();
+        a.lock().and(dword_ptr(rcx), eax).unwrap();
+        a.lock().or(dword_ptr(rcx), r10d).unwrap();
+        a.lock().xor(dword_ptr(rcx), esi).unwrap();
+        a.lock().xor(dword_ptr(rcx), esi).unwrap();
+        a.lea(r11d, dword_ptr(r9 + 2)).unwrap();
+        a.lock().bts(dword_ptr(rcx), r11d).unwrap();
+        a.lock().btr(dword_ptr(rcx), r11d).unwrap();
+        a.lock().bts(dword_ptr(rcx), r11d).unwrap();
+        a.lock().btc(dword_ptr(rcx), edi).unwrap();
+        a.lock().btc(dword_ptr(rcx), edi).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_32 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_bitwise_32, p as usize, ITERS / 4, [1, 1, 1, 1]);
+            let got = core::ptr::read_unaligned(p as *const u32);
+            assert_eq!(got, 0x0000_FFFF, "lock and/or/xor/bts/btr/btc u32 {label}");
+        }
+    }
+
+    // 6. LOCK NOT and LOCK NEG: odd number of total ops flips/negates exact initial value.
+    let lock_not_32 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().not(dword_ptr(rcx)).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    let lock_neg_32 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.set_label(&mut lp).unwrap();
+        a.lock().neg(dword_ptr(rcx)).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_32 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            core::ptr::write_unaligned(p as *mut u32, 0xA55A_1234);
+            // 4 threads * 5000 = 20000 (even) -> must end at 0xA55A_1234.
+            run_contended(lock_not_32, p as usize, ITERS / 4, [1, 1, 1, 1]);
+            assert_eq!(core::ptr::read_unaligned(p as *const u32), 0xA55A_1234, "lock not u32 {label}");
+            // 4 threads * 5000 = 20000 (even) -> must end at 0xA55A_1234.
+            run_contended(lock_neg_32, p as usize, ITERS / 4, [1, 1, 1, 1]);
+            assert_eq!(core::ptr::read_unaligned(p as *const u32), 0xA55A_1234, "lock neg u32 {label}");
+        }
+    }
+
+    // 7. XCHG (implicit LOCK): token conservation across all threads.
+    let xchg_conserve_64 = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        a.xor(rax, rax).unwrap(); // sum_out
+        a.lea(r10, qword_ptr(r8 + 1)).unwrap(); // fixed token = tid + 1
+        a.set_label(&mut lp).unwrap();
+        a.mov(r9, r10).unwrap();
+        a.xchg(qword_ptr(rcx), r9).unwrap();
+        a.add(rax, r9).unwrap();
+        a.dec(rdx).unwrap();
+        a.jnz(lp).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_64 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            let init_tok = 999u64;
+            core::ptr::write_unaligned(p as *mut u64, init_tok);
+            let outs = run_contended(xchg_conserve_64, p as usize, ITERS, [1, 1, 1, 1]);
+            let final_tok = core::ptr::read_unaligned(p as *const u64);
+            let sum_in: u64 = init_tok + (1..=THREADS as u64).map(|t| t * ITERS).sum::<u64>();
+            let sum_out: u64 = final_tok + outs.iter().sum::<u64>();
+            assert_eq!(sum_out, sum_in, "xchg u64 token conservation {label}");
+        }
+    }
+
+    // 8. LOCK CMPXCHG8B (64-bit CAS increment loop) on misaligned-in-16B and 16B-crossing.
+    let lock_cmpxchg8b = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        let mut retry = a.create_label();
+        a.push(rbx).unwrap();
+        a.mov(r9, rcx).unwrap();
+        a.mov(r10, rdx).unwrap();
+        a.set_label(&mut lp).unwrap();
+        a.mov(eax, dword_ptr(r9)).unwrap();
+        a.mov(edx, dword_ptr(r9 + 4)).unwrap();
+        a.set_label(&mut retry).unwrap();
+        a.mov(ebx, eax).unwrap();
+        a.mov(ecx, edx).unwrap();
+        a.add(ebx, 1).unwrap();
+        a.adc(ecx, 0).unwrap();
+        a.lock().cmpxchg8b(qword_ptr(r9)).unwrap();
+        a.jne(retry).unwrap();
+        a.dec(r10).unwrap();
+        a.jnz(lp).unwrap();
+        a.pop(rbx).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &offsets_64 {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_cmpxchg8b, p as usize, ITERS, [1, 2, 1, 2]);
+            let got = core::ptr::read_unaligned(p as *const u64);
+            assert_eq!(got, THREADS as u64 * ITERS, "lock cmpxchg8b {label}");
+        }
+    }
+
+    // 9. LOCK CMPXCHG16B (128-bit CAS increment loop) on aligned AND misaligned (crossing 16B).
+    let lock_cmpxchg16b = assemble_fn(|a| {
+        let mut lp = a.create_label();
+        let mut retry = a.create_label();
+        a.push(rbx).unwrap();
+        a.mov(r9, rcx).unwrap();
+        a.mov(r10, rdx).unwrap();
+        a.set_label(&mut lp).unwrap();
+        a.mov(rax, qword_ptr(r9)).unwrap();
+        a.mov(rdx, qword_ptr(r9 + 8)).unwrap();
+        a.set_label(&mut retry).unwrap();
+        a.mov(rbx, rax).unwrap();
+        a.mov(rcx, rdx).unwrap();
+        a.add(rbx, 1).unwrap();
+        a.adc(rcx, 0).unwrap();
+        a.lock().cmpxchg16b(xmmword_ptr(r9)).unwrap();
+        a.jne(retry).unwrap();
+        a.dec(r10).unwrap();
+        a.jnz(lp).unwrap();
+        a.pop(rbx).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+    });
+    for &(label, off) in &[("aligned_16b", 0usize), ("crossing_16b", 4usize)] {
+        unsafe {
+            core::ptr::write_bytes(buf, 0, 128);
+            let p = buf.add(off);
+            run_contended(lock_cmpxchg16b, p as usize, ITERS / 2, [1, 2, 1, 2]);
+            let lo = core::ptr::read_unaligned(p as *const u64);
+            let hi = core::ptr::read_unaligned(p.add(8) as *const u64);
+            assert_eq!((lo, hi), (THREADS as u64 * (ITERS / 2), 0), "lock cmpxchg16b {label}");
+        }
+    }
+}
+
+/// Differential parity test across Interpreter (FastOp), Live JIT, Disk AOT, and Static Mach-O AOT
+/// covering every LOCK sub-op (add, sub, and, or, xor, inc, dec, not, neg, bt/bts/btr/btc, xchg,
+/// xadd, cmpxchg, cmpxchg8b, cmpxchg16b) across widths (8/16/32/64/128) and alignments (aligned,
+/// misaligned within 16B, and crossing 16B), including preserved and updated RFLAGS.
+#[test]
+fn unaligned_lock_ops_all_subops_tier_and_flag_parity() {
+    use crate::emu::static_macho::{emit_macho_object_from_aot_bytes, MachoPlatform};
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Input: rcx = 64B-aligned data buffer (512 bytes).
+    // Output: writes results + flag snapshots (pushfq; pop) into [rcx + 0x100..].
+    a.push(rbx).unwrap();
+    a.mov(r10, rcx).unwrap();
+
+    // Helper macro: run `body`, then snapshot RFLAGS (masked to CF|PF|ZF|SF|OF = 0x8C5) to [r10 + out_off].
+    let mut snap_off = 0x100i32;
+    let mut emit_snap = |a: &mut CodeAssembler| {
+        a.pushfq().unwrap();
+        a.pop(r11).unwrap();
+        a.and(r11, 0x8C5).unwrap();
+        a.mov(qword_ptr(r10 + snap_off), r11).unwrap();
+        snap_off += 8;
+    };
+
+    // Exercise 3 offsets per width: aligned, misaligned inside 16B, crossing 16B.
+    // Buffer layout [0x00..0x80]:
+    //   8-bit:  0x00, 0x07, 0x0F
+    //   16-bit: 0x10, 0x11, 0x1F (crosses 0x20)
+    //   32-bit: 0x30, 0x31, 0x3E (crosses 0x40)
+    //   64-bit: 0x50, 0x51, 0x5C (crosses 0x60)
+    //   128-bit: 0x70 (aligned), 0x74 (crosses 0x80)
+    for &off in &[0x00i32, 0x07, 0x0F] {
+        a.mov(rax, 0xDEAD_BEEF_1234_56A5u64).unwrap();
+        a.mov(rdx, 0xCAFE_BABE_9876_543Bu64).unwrap();
+        a.lock().add(byte_ptr(r10 + off), dl).unwrap();
+        emit_snap(&mut a);
+        a.lock().sub(byte_ptr(r10 + off), 0x19).unwrap();
+        emit_snap(&mut a);
+        a.lock().and(byte_ptr(r10 + off), 0xF3).unwrap();
+        emit_snap(&mut a);
+        a.lock().or(byte_ptr(r10 + off), 0x24).unwrap();
+        emit_snap(&mut a);
+        a.lock().xor(byte_ptr(r10 + off), 0x5A).unwrap();
+        emit_snap(&mut a);
+        a.stc().unwrap();
+        a.lock().inc(byte_ptr(r10 + off)).unwrap(); // must preserve CF=1
+        emit_snap(&mut a);
+        a.clc().unwrap();
+        a.lock().dec(byte_ptr(r10 + off)).unwrap(); // must preserve CF=0
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.lock().not(byte_ptr(r10 + off)).unwrap(); // must preserve all flags
+        emit_snap(&mut a);
+        a.lock().neg(byte_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.xchg(byte_ptr(r10 + off), dl).unwrap(); // must preserve all flags
+        emit_snap(&mut a);
+        a.lock().xadd(byte_ptr(r10 + off), dl).unwrap();
+        emit_snap(&mut a);
+        // cmpxchg fail (al != mem) then succeed (al == mem)
+        a.mov(al, 0xEE).unwrap();
+        a.lock().cmpxchg(byte_ptr(r10 + off), dl).unwrap();
+        emit_snap(&mut a);
+        a.lock().cmpxchg(byte_ptr(r10 + off), dl).unwrap();
+        emit_snap(&mut a);
+    }
+
+    for &off in &[0x10i32, 0x11, 0x1F] {
+        a.mov(rax, 0x1122_3344_5566_7788u64).unwrap();
+        a.mov(rdx, 0x99AA_BBCC_DDEE_1234u64).unwrap();
+        a.lock().add(word_ptr(r10 + off), dx).unwrap();
+        emit_snap(&mut a);
+        a.lock().sub(word_ptr(r10 + off), 0x0555).unwrap();
+        emit_snap(&mut a);
+        a.lock().and(word_ptr(r10 + off), 0x7FFEu32).unwrap();
+        emit_snap(&mut a);
+        a.lock().or(word_ptr(r10 + off), 0x0041).unwrap();
+        emit_snap(&mut a);
+        a.lock().xor(word_ptr(r10 + off), 0x5A5A).unwrap();
+        emit_snap(&mut a);
+        a.stc().unwrap();
+        a.lock().inc(word_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.clc().unwrap();
+        a.lock().dec(word_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.lock().not(word_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.lock().neg(word_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.lock().bts(word_ptr(r10 + off), 5).unwrap();
+        emit_snap(&mut a);
+        a.lock().btr(word_ptr(r10 + off), 5).unwrap();
+        emit_snap(&mut a);
+        a.lock().btc(word_ptr(r10 + off), 3).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.xchg(word_ptr(r10 + off), dx).unwrap();
+        emit_snap(&mut a);
+        a.lock().xadd(word_ptr(r10 + off), dx).unwrap();
+        emit_snap(&mut a);
+        a.mov(ax, 0xBEEF).unwrap();
+        a.lock().cmpxchg(word_ptr(r10 + off), dx).unwrap();
+        emit_snap(&mut a);
+        a.lock().cmpxchg(word_ptr(r10 + off), dx).unwrap();
+        emit_snap(&mut a);
+    }
+
+    for &off in &[0x30i32, 0x31, 0x3E] {
+        a.mov(rax, 0x8000_0001u64).unwrap();
+        a.mov(rdx, 0x7FFF_1234u64).unwrap();
+        a.lock().add(dword_ptr(r10 + off), edx).unwrap();
+        emit_snap(&mut a);
+        a.lock().sub(dword_ptr(r10 + off), 0x12345).unwrap();
+        emit_snap(&mut a);
+        a.lock().and(dword_ptr(r10 + off), 0x0FFF_FFF0u32).unwrap();
+        emit_snap(&mut a);
+        a.lock().or(dword_ptr(r10 + off), 0x0000_00A5u32).unwrap();
+        emit_snap(&mut a);
+        a.lock().xor(dword_ptr(r10 + off), 0x5A5A_A5A5u32).unwrap();
+        emit_snap(&mut a);
+        a.stc().unwrap();
+        a.lock().inc(dword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.clc().unwrap();
+        a.lock().dec(dword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(eax, edx).unwrap();
+        a.lock().not(dword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.lock().neg(dword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(eax, edx).unwrap();
+        a.lock().bts(dword_ptr(r10 + off), 17).unwrap();
+        emit_snap(&mut a);
+        a.lock().btr(dword_ptr(r10 + off), 17).unwrap();
+        emit_snap(&mut a);
+        a.lock().btc(dword_ptr(r10 + off), 9).unwrap();
+        emit_snap(&mut a);
+        a.cmp(eax, edx).unwrap();
+        a.xchg(dword_ptr(r10 + off), edx).unwrap();
+        emit_snap(&mut a);
+        a.lock().xadd(dword_ptr(r10 + off), edx).unwrap();
+        emit_snap(&mut a);
+        a.mov(eax, 0x1111_2222u32).unwrap();
+        a.lock().cmpxchg(dword_ptr(r10 + off), edx).unwrap();
+        emit_snap(&mut a);
+        a.lock().cmpxchg(dword_ptr(r10 + off), edx).unwrap();
+        emit_snap(&mut a);
+    }
+
+    for &off in &[0x50i32, 0x51, 0x5C] {
+        a.mov(rax, 0x0123_4567_89AB_CDEFu64).unwrap();
+        a.mov(rdx, 0xFEDC_BA98_7654_3210u64).unwrap();
+        a.lock().add(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.lock().sub(qword_ptr(r10 + off), 0x13579).unwrap();
+        emit_snap(&mut a);
+        a.lock().and(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.lock().or(qword_ptr(r10 + off), rax).unwrap();
+        emit_snap(&mut a);
+        a.lock().xor(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.stc().unwrap();
+        a.lock().inc(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.clc().unwrap();
+        a.lock().dec(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.lock().not(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.lock().neg(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.lock().bts(qword_ptr(r10 + off), 41).unwrap();
+        emit_snap(&mut a);
+        a.lock().btr(qword_ptr(r10 + off), 41).unwrap();
+        emit_snap(&mut a);
+        a.lock().btc(qword_ptr(r10 + off), 33).unwrap();
+        emit_snap(&mut a);
+        a.cmp(rax, rdx).unwrap();
+        a.xchg(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.lock().xadd(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.mov(rax, 0x5555_6666_7777_8888u64).unwrap();
+        a.lock().cmpxchg(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        a.lock().cmpxchg(qword_ptr(r10 + off), rdx).unwrap();
+        emit_snap(&mut a);
+        // cmpxchg8b mismatch (loads edx:eax) then match (stores ecx:ebx); preserves CF/SF/OF!
+        a.mov(eax, 0x1234_5678u32).unwrap();
+        a.mov(edx, 0x9ABC_DEF0u32).unwrap();
+        a.mov(ebx, 0xAAAA_BBBBu32).unwrap();
+        a.mov(ecx, 0xCCCC_DDDDu32).unwrap();
+        a.stc().unwrap();
+        a.lock().cmpxchg8b(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+        a.lock().cmpxchg8b(qword_ptr(r10 + off)).unwrap();
+        emit_snap(&mut a);
+    }
+
+    for &off in &[0x70i32, 0x74] {
+        a.mov(rax, 0x1111_2222_3333_4444u64).unwrap();
+        a.mov(rdx, 0x5555_6666_7777_8888u64).unwrap();
+        a.mov(rbx, 0xAAAA_BBBB_CCCC_DDDDu64).unwrap();
+        a.mov(rcx, 0xEEEE_FFFF_0102_0304u64).unwrap();
+        a.stc().unwrap();
+        a.lock().cmpxchg16b(xmmword_ptr(r10 + off)).unwrap(); // mismatch -> loads rdx:rax
+        emit_snap(&mut a);
+        a.lock().cmpxchg16b(xmmword_ptr(r10 + off)).unwrap(); // match -> stores rcx:rbx
+        emit_snap(&mut a);
+    }
+
+    a.mov(rax, rdx).unwrap();
+    a.pop(rbx).unwrap();
+    a.ret().unwrap();
+
+    let data_len = (snap_off as usize + 64).max(0x1000);
+    let code_cap = 0x4000usize;
+    let code = arena_alloc(code_cap, 16);
+    let bytes = a.assemble(code as u64).unwrap();
+    assert!(bytes.len() + 16 <= code_cap);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
+        core::ptr::write_bytes(code.add(bytes.len()), 0xCC, 16);
+    }
+
+    let mut init = vec![0u8; data_len];
+    for (i, b) in init.iter_mut().take(0x90).enumerate() {
+        *b = ((i as u8).wrapping_mul(37)).wrapping_add(11);
+    }
+    let d_interp = arena_alloc(data_len, 64);
+    let d_jit = arena_alloc(data_len, 64);
+
+    let interp = unsafe { run_mode(code, d_interp, &init, 2) };
+    let jit_before = jit::test_executed();
+    let jit1 = unsafe { run_mode(code, d_jit, &init, 1) };
+    assert!(jit::test_executed() > jit_before, "LOCK test block must execute in JIT");
+    assert_eq!(jit1, interp, "Live JIT differs from FastOp interpreter on LOCK ops");
+
+    // Also build a Disk AOT image AND Static Mach-O `.aot.o` for this exact x86-64 code and verify:
+    //   1. Zero runtime relocations (`skipped_reloc_blocks == 0`, 100% emitted into static __TEXT).
+    //   2. Executing the AOT image directly produces bit-for-bit identical output to interpreter/JIT.
+    let mut ips = vec![code as u64];
+    let mut dec = iced_x86::Decoder::with_ip(64, &bytes, code as u64, iced_x86::DecoderOptions::NONE);
+    let mut ins_cnt = 0usize;
+    while dec.can_decode() {
+        let ins = dec.decode();
+        ins_cnt += 1;
+        if ins_cnt >= BLK_MAX_INSNS {
+            ips.push(ins.next_ip());
+            ins_cnt = 0;
+        }
+    }
+    ips.retain(|&ip| ip >= code as u64 && ip < code as u64 + bytes.len() as u64);
+    ips.sort_unstable();
+    ips.dedup();
+
+    let mut bc = Box::new(BlockCache::new());
+    let img = unsafe { aot::build_image_for_test(&mut *bc, &ips) }.expect("build aot image for LOCK ops");
+    assert!(!img.blocks.is_empty());
+    let key = aot::AotKey {
+        image_hash: [0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00],
+        image_base: code as u64,
+        image_size: code_cap as u64,
+        codegen_hash: aot::codegen_hash(),
+        knobs: jit::aot_knob_bits(),
+    };
+    let aot_bytes = aot::encode_for_test("lock_ops_test.dll", &key, &img);
+    for plat in [MachoPlatform::MacOs, MachoPlatform::Ios] {
+        let (_obj, rep) = emit_macho_object_from_aot_bytes(&aot_bytes, plat)
+            .unwrap_or_else(|e| panic!("static Mach-O emit ({plat}) failed: {e}"));
+        assert_eq!(rep.skipped_reloc_blocks, 0, "LOCK blocks must have zero runtime relocations for static AOT");
+        assert_eq!(rep.emitted_blocks, img.blocks.len());
+    }
+}

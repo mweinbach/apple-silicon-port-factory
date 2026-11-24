@@ -894,158 +894,208 @@ case_id	case_word	word	assembly	page	encodings
 419	v_fcvtl_h[0]	4e217ac6	fcvtl2 v6.4s, v22.8h	fcvtl_advsimd	FCVTL_asimdmisc_L
 420	v_fcvtn_h[0]	0e216ae7	fcvtn v7.4h, v23.4s	fcvtn_advsimd	FCVTN_asimdmisc_N
 421	v_fcvtn_h[0]	4e216b08	fcvtn2 v8.8h, v24.4s	fcvtn_advsimd	FCVTN_asimdmisc_N
-422	ldaxr[0]	085ffe65	ldaxrb w5, [x19]	ldaxrb	LDAXRB_LR32_ldstexclr
-423	ldaxr[0]	485ffe86	ldaxrh w6, [x20]	ldaxrh	LDAXRH_LR32_ldstexclr
-424	ldaxr[0]	885ffea7	ldaxr w7, [x21]	ldaxr	LDAXR_LR32_ldstexclr
-425	ldaxr[0]	c85ffec8	ldaxr x8, [x22]	ldaxr	LDAXR_LR64_ldstexclr
-426	stlxr[0]	0803fe6b	stlxrb w3, w11, [x19]	stlxrb	STLXRB_SR32_ldstexclr
-427	stlxr[0]	4804fe8c	stlxrh w4, w12, [x20]	stlxrh	STLXRH_SR32_ldstexclr
-428	stlxr[0]	8805fead	stlxr w5, w13, [x21]	stlxr	STLXR_SR32_ldstexclr
-429	stlxr[0]	c806fece	stlxr w6, x14, [x22]	stlxr	STLXR_SR64_ldstexclr
-430	ldaxp_x[0]	c87fcf25	ldaxp x5, x19, [x25]	ldaxp	LDAXP_LP64_ldstexclp
-431	stlxp_x[0]	c824d346	stlxp w4, x6, x20, [x26]	stlxp	STLXP_SP64_ldstexclp
-432	clrex[0]	d5033f5f	clrex	clrex	CLREX_BN_barriers
-433	ldr_reg[0]	38716965	ldrb w5, [x11, x17]	ldrb_reg	LDRB_32BL_ldst_regoff
-434	ldr_reg[0]	38717965	ldrb w5, [x11, x17, lsl #0]	ldrb_reg	LDRB_32BL_ldst_regoff
-435	ldr_reg[0]	38b16965	ldrsb x5, [x11, x17]	ldrsb_reg	LDRSB_64BL_ldst_regoff
-436	ldr_reg[0]	38b17965	ldrsb x5, [x11, x17, lsl #0]	ldrsb_reg	LDRSB_64BL_ldst_regoff
-437	ldr_reg[0]	78726986	ldrh w6, [x12, x18]	ldrh_reg	LDRH_32_ldst_regoff
-438	ldr_reg[0]	78727986	ldrh w6, [x12, x18, lsl #1]	ldrh_reg	LDRH_32_ldst_regoff
-439	ldr_reg[0]	78b26986	ldrsh x6, [x12, x18]	ldrsh_reg	LDRSH_64_ldst_regoff
-440	ldr_reg[0]	78b27986	ldrsh x6, [x12, x18, lsl #1]	ldrsh_reg	LDRSH_64_ldst_regoff
-441	ldr_reg[0]	b87369a7	ldr w7, [x13, x19]	ldr_reg_gen	LDR_32_ldst_regoff
-442	ldr_reg[0]	b87379a7	ldr w7, [x13, x19, lsl #2]	ldr_reg_gen	LDR_32_ldst_regoff
-443	ldr_reg[0]	b8b369a7	ldrsw x7, [x13, x19]	ldrsw_reg	LDRSW_64_ldst_regoff
-444	ldr_reg[0]	b8b379a7	ldrsw x7, [x13, x19, lsl #2]	ldrsw_reg	LDRSW_64_ldst_regoff
-445	ldr_reg[0]	f87469c8	ldr x8, [x14, x20]	ldr_reg_gen	LDR_64_ldst_regoff
-446	ldr_reg[0]	f87479c8	ldr x8, [x14, x20, lsl #3]	ldr_reg_gen	LDR_64_ldst_regoff
-447	v_xtl[0]	0f08a664	sxtl v4.8h, v19.8b	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-448	v_xtl[0]	4f08a664	sxtl2 v4.8h, v19.16b	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-449	v_xtl[0]	0f10a685	sxtl v5.4s, v20.4h	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-450	v_xtl[0]	4f10a685	sxtl2 v5.4s, v20.8h	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-451	v_xtl[0]	0f20a6a6	sxtl v6.2d, v21.2s	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-452	v_xtl[0]	4f20a6a6	sxtl2 v6.2d, v21.4s	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
-453	v_xtl[0]	2f08a6c7	uxtl v7.8h, v22.8b	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-454	v_xtl[0]	6f08a6c7	uxtl2 v7.8h, v22.16b	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-455	v_xtl[0]	2f10a6e8	uxtl v8.4s, v23.4h	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-456	v_xtl[0]	6f10a6e8	uxtl2 v8.4s, v23.8h	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-457	v_xtl[0]	2f20a709	uxtl v9.2d, v24.2s	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-458	v_xtl[0]	6f20a709	uxtl2 v9.2d, v24.4s	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
-459	v_fcvtl[0]	0e617aa5	fcvtl v5.2d, v21.2s	fcvtl_advsimd	FCVTL_asimdmisc_L
-460	v_fcvtl[0]	4e617ac6	fcvtl2 v6.2d, v22.4s	fcvtl_advsimd	FCVTL_asimdmisc_L
-461	v_fcvtn[0]	0e616ae7	fcvtn v7.2s, v23.2d	fcvtn_advsimd	FCVTN_asimdmisc_N
-462	v_fcvtn[0]	4e616b08	fcvtn2 v8.4s, v24.2d	fcvtn_advsimd	FCVTN_asimdmisc_N
-463	v_scvtf_2d[0]	4e61db09	scvtf v9.2d, v24.2d	scvtf_advsimd_int	SCVTF_asimdmisc_R
-464	v_fcvtzs_2d[0]	4ee1bb2a	fcvtzs v10.2d, v25.2d	fcvtzs_advsimd_int	FCVTZS_asimdmisc_R
-465	v_xtn_2s[0]	0ea12b4b	xtn v11.2s, v26.2d	xtn_advsimd	XTN_asimdmisc_N
-466	v_xtn_2s[0]	4ea12b6c	xtn2 v12.4s, v27.2d	xtn_advsimd	XTN_asimdmisc_N
-467	s_fneg[0]	1e214264	fneg s4, s19	fneg_float	FNEG_S_floatdp1
-468	s_fneg[0]	1e614285	fneg d5, d20	fneg_float	FNEG_D_floatdp1
-469	s_fmadd[0]	1f136d63	fmadd s3, s11, s19, s27	fmadd_float	FMADD_S_floatdp3
-470	s_fmadd[0]	1f547184	fmadd d4, d12, d20, d28	fmadd_float	FMADD_D_floatdp3
-471	v_fneg[0]	6ea0faa6	fneg v6.4s, v21.4s	fneg_advsimd	FNEG_asimdmisc_R
-472	v_fneg[0]	6ee0fac7	fneg v7.2d, v22.2d	fneg_advsimd	FNEG_asimdmisc_R
-473	v_fmla[0]	4e37cda5	fmla v5.4s, v13.4s, v23.4s	fmla_advsimd_vec	FMLA_asimdsame_only
-474	v_fmla[0]	4e78cdc6	fmla v6.2d, v14.2d, v24.2d	fmla_advsimd_vec	FMLA_asimdsame_only
-475	bics_rr[0]	0a320164	bic w4, w11, w18	bic_log_shift	BIC_32_log_shift
-476	bics_rr[0]	8a330185	bic x5, x12, x19	bic_log_shift	BIC_64_log_shift
-477	bics_rr[0]	6a3401a6	bics w6, w13, w20	bics	BICS_32_log_shift
-478	bics_rr[0]	ea3501c7	bics x7, x14, x21	bics	BICS_64_log_shift
-479	crc32c[0]	1ad25164	crc32cb w4, w11, w18	crc32c	CRC32CB_32C_dp_2src
-480	crc32c[0]	1ad35585	crc32ch w5, w12, w19	crc32c	CRC32CH_32C_dp_2src
-481	crc32c[0]	1ad459a6	crc32cw w6, w13, w20	crc32c	CRC32CW_32C_dp_2src
-482	crc32c[0]	9ad55dc7	crc32cx w7, w14, x21	crc32c	CRC32CX_64C_dp_2src
-483	not_bl[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
-483	not_bl[1]	b3401c16	bfxil x22, x0, #0, #8	bfxil_bfm	BFM_64M_bitfield/BFXIL
-484	not_bx[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
-484	not_bx[1]	b3403c16	bfxil x22, x0, #0, #16	bfxil_bfm	BFM_64M_bitfield/BFXIL
-485	not_ebx[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
-485	not_ebx[1]	2a0003f6	mov w22, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
-486	not_rbx[0]	aa3603e0	mvn x0, x22	mvn_orn_log_shift	ORN_64_log_shift/MVN
-486	not_rbx[1]	aa0003f6	mov x22, x0	mov_orr_log_shift	ORR_64_log_shift/MOV
-487	not_bh[0]	d3483ec0	ubfx x0, x22, #8, #8	ubfx_ubfm	UBFM_64M_bitfield/UBFX
-487	not_bh[1]	2a2003e0	mvn w0, w0	mvn_orn_log_shift	ORN_32_log_shift/MVN
-487	not_bh[2]	b3781c16	bfi x22, x0, #8, #8	bfi_bfm	BFM_64M_bitfield/BFI
-488	lock_not_byte_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
-488	lock_not_byte_rsp[1]	085ffe00	ldaxrb w0, [x16]	ldaxrb	LDAXRB_LR32_ldstexclr
-488	lock_not_byte_rsp[2]	2a2003e2	mvn w2, w0	mvn_orn_log_shift	ORN_32_log_shift/MVN
-488	lock_not_byte_rsp[3]	0803fe02	stlxrb w3, w2, [x16]	stlxrb	STLXRB_SR32_ldstexclr
-488	lock_not_byte_rsp[4]	35ffffa3	cbnz w3, #-12	cbnz	CBNZ_32_compbranch
-489	lock_not_qword_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
-489	lock_not_qword_rsp[1]	92400a11	and x17, x16, #7	and_log_imm	AND_64_log_imm
-489	lock_not_qword_rsp[2]	b50000d1	cbnz x17, #24	cbnz	CBNZ_64_compbranch
-489	lock_not_qword_rsp[3]	c85ffe00	ldaxr x0, [x16]	ldaxr	LDAXR_LR64_ldstexclr
-489	lock_not_qword_rsp[4]	aa2003e2	mvn x2, x0	mvn_orn_log_shift	ORN_64_log_shift/MVN
-489	lock_not_qword_rsp[5]	c803fe02	stlxr w3, x2, [x16]	stlxr	STLXR_SR64_ldstexclr
-489	lock_not_qword_rsp[6]	35ffffa3	cbnz w3, #-12	cbnz	CBNZ_32_compbranch
-489	lock_not_qword_rsp[7]	14000006	b #24	b_uncond	B_only_branch_imm
-489	lock_not_qword_rsp[8]	f9400200	ldr x0, [x16]	ldr_imm_gen	LDR_64_ldst_pos
-489	lock_not_qword_rsp[9]	d50339bf	dmb ishld	dmb	DMB_BO_barriers
-489	lock_not_qword_rsp[10]	aa2003e2	mvn x2, x0	mvn_orn_log_shift	ORN_64_log_shift/MVN
-489	lock_not_qword_rsp[11]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
-489	lock_not_qword_rsp[12]	f9000202	str x2, [x16]	str_imm_gen	STR_64_ldst_pos
-490	rdtsc[0]	394c61e1	ldrb w1, [x15, #792]	ldrb_imm	LDRB_32_ldst_pos
-490	rdtsc[1]	36080041	tbz w1, #1, #8	tbz	TBZ_only_testbranch
-490	rdtsc[2]	14000004	b #16	b_uncond	B_only_branch_imm
-490	rdtsc[3]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
-490	rdtsc[4]	2a0003f3	mov w19, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
-490	rdtsc[5]	d360fc15	lsr x21, x0, #32	lsr_ubfm	UBFM_64M_bitfield/LSR
-490	rdtsc[6]	36100121	tbz w1, #2, #36	tbz	TBZ_only_testbranch
-490	rdtsc[7]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
-490	rdtsc[8]	b201f3e2	mov x2, #0xaaaaaaaaaaaaaaaa	mov_orr_log_imm	ORR_64_log_imm/MOV
-490	rdtsc[9]	91000442	add x2, x2, #1	add_addsub_imm	ADD_64_addsub_imm
-490	rdtsc[10]	9bc27c01	umulh x1, x0, x2	umulh	UMULH_64_dp_3src
-490	rdtsc[11]	8b000802	add x2, x0, x0, lsl #2	add_addsub_shift	ADD_64_addsub_shift
-490	rdtsc[12]	8b020c00	add x0, x0, x2, lsl #3	add_addsub_shift	ADD_64_addsub_shift
-490	rdtsc[13]	8b010000	add x0, x0, x1	add_addsub_shift	ADD_64_addsub_shift
-490	rdtsc[14]	17fffff6	b #-40	b_uncond	B_only_branch_imm
-490	rdtsc[15]	97fffef1	bl #-1084	bl	BL_only_branch_imm
-490	rdtsc[16]	17fffff4	b #-48	b_uncond	B_only_branch_imm
-491	rdtscp[0]	394c61e1	ldrb w1, [x15, #792]	ldrb_imm	LDRB_32_ldst_pos
-491	rdtscp[1]	d503399f	dsb ishld	dsb	DSB_BO_barriers
-491	rdtscp[2]	350000a1	cbnz w1, #20	cbnz	CBNZ_32_compbranch
-491	rdtscp[3]	d53be0c0	mrs x0, S3_3_C14_C0_6	mrs	MRS_RS_systemmove
-491	rdtscp[4]	2a0003f3	mov w19, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
-491	rdtscp[5]	d360fc15	lsr x21, x0, #32	lsr_ubfm	UBFM_64M_bitfield/LSR
-491	rdtscp[6]	d2800014	movz x20, #0	movz	MOVZ_64_movewide
-491	rdtscp[7]	97fffeb9	bl #-1308	bl	BL_only_branch_imm
-491	rdtscp[8]	17fffffc	b #-16	b_uncond	B_only_branch_imm
-492	stub_enter_frame[0]	a9ba7bfd	stp x29, x30, [sp, #-96]!	stp_gen	STP_64_ldstpair_pre
-492	stub_enter_frame[1]	910003fd	mov x29, sp	mov_add_addsub_imm	ADD_64_addsub_imm/MOV
-493	stub_exit_frame[0]	a8c67bfd	ldp x29, x30, [sp], #96	ldp_gen	LDP_64_ldstpair_post
-493	stub_exit_frame[1]	d65f03c0	ret	ret	RET_64R_branch_reg
-494	timestamp_stubs[0]	36180061	tbz w1, #3, #12	tbz	TBZ_only_testbranch
-494	timestamp_stubs[1]	d53be0c0	mrs x0, S3_3_C14_C0_6	mrs	MRS_RS_systemmove
-494	timestamp_stubs[2]	14000005	b #20	b_uncond	B_only_branch_imm
-494	timestamp_stubs[3]	d5033fdf	isb	isb	ISB_BI_barriers
-494	timestamp_stubs[4]	360802e1	tbz w1, #1, #92	tbz	TBZ_only_testbranch
-494	timestamp_stubs[5]	37000281	tbnz w1, #0, #80	tbnz	TBNZ_only_testbranch
-494	timestamp_stubs[6]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
-494	timestamp_stubs[7]	36100101	tbz w1, #2, #32	tbz	TBZ_only_testbranch
-494	timestamp_stubs[8]	b201f3e2	mov x2, #0xaaaaaaaaaaaaaaaa	mov_orr_log_imm	ORR_64_log_imm/MOV
-494	timestamp_stubs[9]	91000442	add x2, x2, #1	add_addsub_imm	ADD_64_addsub_imm
-494	timestamp_stubs[10]	9bc27c01	umulh x1, x0, x2	umulh	UMULH_64_dp_3src
-494	timestamp_stubs[11]	8b000802	add x2, x0, x0, lsl #2	add_addsub_shift	ADD_64_addsub_shift
-494	timestamp_stubs[12]	8b020c00	add x0, x0, x2, lsl #3	add_addsub_shift	ADD_64_addsub_shift
-494	timestamp_stubs[13]	8b010000	add x0, x0, x1	add_addsub_shift	ADD_64_addsub_shift
-494	timestamp_stubs[14]	d65f03c0	ret	ret	RET_64R_branch_reg
-494	timestamp_stubs[15]	d53be001	mrs x1, cntfrq_el0	mrs	MRS_RS_systemmove
-494	timestamp_stubs[16]	d2994002	movz x2, #0xca00	movz	MOVZ_64_movewide
-494	timestamp_stubs[17]	f2a77342	movk x2, #0x3b9a, lsl #16	movk	MOVK_64_movewide
-494	timestamp_stubs[18]	9ac10803	udiv x3, x0, x1	udiv	UDIV_64_dp_2src
-494	timestamp_stubs[19]	9b018060	msub x0, x3, x1, x0	msub	MSUB_64A_dp_3src
-494	timestamp_stubs[20]	9b027c00	mul x0, x0, x2	mul_madd	MADD_64A_dp_3src/MUL
-494	timestamp_stubs[21]	9b027c63	mul x3, x3, x2	mul_madd	MADD_64A_dp_3src/MUL
-494	timestamp_stubs[22]	9ac10800	udiv x0, x0, x1	udiv	UDIV_64_dp_2src
-494	timestamp_stubs[23]	8b000060	add x0, x3, x0	add_addsub_shift	ADD_64_addsub_shift
-494	timestamp_stubs[24]	d65f03c0	ret	ret	RET_64R_branch_reg
-494	timestamp_stubs[25]	d2820000	movz x0, #0x1000	movz	MOVZ_64_movewide
-494	timestamp_stubs[26]	d65f03c0	ret	ret	RET_64R_branch_reg
-494	timestamp_stubs[27]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
-494	timestamp_stubs[28]	d65f03c0	ret	ret	RET_64R_branch_reg
-495	static_host_call_relocation[0]	94000000	bl #0	bl	BL_only_branch_imm
-496	static_host_call_to_veneer[0]	94000015	bl #84	bl	BL_only_branch_imm
-497	static_host_call_veneer[0]	90000010	adrp x16, #0	adrp	ADRP_only_pcreladdr
-497	static_host_call_veneer[1]	f9400210	ldr x16, [x16]	ldr_imm_gen	LDR_64_ldst_pos
-497	static_host_call_veneer[2]	d61f0200	br x16	br	BR_64_branch_reg
-497	static_host_call_veneer[3]	d503201f	nop	nop	NOP_HI_hints
+422	ldaddal[0]	38e30265	ldaddalb w3, w5, [x19]	ldaddb	LDADDALB_32_memop
+423	ldaddal[0]	78e40286	ldaddalh w4, w6, [x20]	ldaddh	LDADDALH_32_memop
+424	ldaddal[0]	b8e502a7	ldaddal w5, w7, [x21]	ldadd	LDADDAL_32_memop
+425	ldaddal[0]	f8e602c8	ldaddal x6, x8, [x22]	ldadd	LDADDAL_64_memop
+426	ldclral[0]	38e31265	ldclralb w3, w5, [x19]	ldclrb	LDCLRALB_32_memop
+427	ldclral[0]	78e41286	ldclralh w4, w6, [x20]	ldclrh	LDCLRALH_32_memop
+428	ldclral[0]	b8e512a7	ldclral w5, w7, [x21]	ldclr	LDCLRAL_32_memop
+429	ldclral[0]	f8e612c8	ldclral x6, x8, [x22]	ldclr	LDCLRAL_64_memop
+430	ldeoral[0]	38e32265	ldeoralb w3, w5, [x19]	ldeorb	LDEORALB_32_memop
+431	ldeoral[0]	78e42286	ldeoralh w4, w6, [x20]	ldeorh	LDEORALH_32_memop
+432	ldeoral[0]	b8e522a7	ldeoral w5, w7, [x21]	ldeor	LDEORAL_32_memop
+433	ldeoral[0]	f8e622c8	ldeoral x6, x8, [x22]	ldeor	LDEORAL_64_memop
+434	ldsetal[0]	38e33265	ldsetalb w3, w5, [x19]	ldsetb	LDSETALB_32_memop
+435	ldsetal[0]	78e43286	ldsetalh w4, w6, [x20]	ldseth	LDSETALH_32_memop
+436	ldsetal[0]	b8e532a7	ldsetal w5, w7, [x21]	ldset	LDSETAL_32_memop
+437	ldsetal[0]	f8e632c8	ldsetal x6, x8, [x22]	ldset	LDSETAL_64_memop
+438	swpal[0]	38e38265	swpalb w3, w5, [x19]	swpb	SWPALB_32_memop
+439	swpal[0]	78e48286	swpalh w4, w6, [x20]	swph	SWPALH_32_memop
+440	swpal[0]	b8e582a7	swpal w5, w7, [x21]	swp	SWPAL_32_memop
+441	swpal[0]	f8e682c8	swpal x6, x8, [x22]	swp	SWPAL_64_memop
+442	casal[0]	08e3fe65	casalb w3, w5, [x19]	casb	CASALB_C32_comswap
+443	casal[0]	48e4fe86	casalh w4, w6, [x20]	cash	CASALH_C32_comswap
+444	casal[0]	88e5fea7	casal w5, w7, [x21]	cas	CASAL_C32_comswap
+445	casal[0]	c8e6fec8	casal x6, x8, [x22]	cas	CASAL_C64_comswap
+446	caspal_x[0]	4860fe02	caspal x0, x1, x2, x3, [x16]	casp	CASPAL_CP64_comswappr
+447	yield_hint[0]	d503203f	yield	yield	YIELD_HI_hints
+448	clrex[0]	d5033f5f	clrex	clrex	CLREX_BN_barriers
+449	ldr_reg[0]	38716965	ldrb w5, [x11, x17]	ldrb_reg	LDRB_32BL_ldst_regoff
+450	ldr_reg[0]	38717965	ldrb w5, [x11, x17, lsl #0]	ldrb_reg	LDRB_32BL_ldst_regoff
+451	ldr_reg[0]	38b16965	ldrsb x5, [x11, x17]	ldrsb_reg	LDRSB_64BL_ldst_regoff
+452	ldr_reg[0]	38b17965	ldrsb x5, [x11, x17, lsl #0]	ldrsb_reg	LDRSB_64BL_ldst_regoff
+453	ldr_reg[0]	78726986	ldrh w6, [x12, x18]	ldrh_reg	LDRH_32_ldst_regoff
+454	ldr_reg[0]	78727986	ldrh w6, [x12, x18, lsl #1]	ldrh_reg	LDRH_32_ldst_regoff
+455	ldr_reg[0]	78b26986	ldrsh x6, [x12, x18]	ldrsh_reg	LDRSH_64_ldst_regoff
+456	ldr_reg[0]	78b27986	ldrsh x6, [x12, x18, lsl #1]	ldrsh_reg	LDRSH_64_ldst_regoff
+457	ldr_reg[0]	b87369a7	ldr w7, [x13, x19]	ldr_reg_gen	LDR_32_ldst_regoff
+458	ldr_reg[0]	b87379a7	ldr w7, [x13, x19, lsl #2]	ldr_reg_gen	LDR_32_ldst_regoff
+459	ldr_reg[0]	b8b369a7	ldrsw x7, [x13, x19]	ldrsw_reg	LDRSW_64_ldst_regoff
+460	ldr_reg[0]	b8b379a7	ldrsw x7, [x13, x19, lsl #2]	ldrsw_reg	LDRSW_64_ldst_regoff
+461	ldr_reg[0]	f87469c8	ldr x8, [x14, x20]	ldr_reg_gen	LDR_64_ldst_regoff
+462	ldr_reg[0]	f87479c8	ldr x8, [x14, x20, lsl #3]	ldr_reg_gen	LDR_64_ldst_regoff
+463	v_xtl[0]	0f08a664	sxtl v4.8h, v19.8b	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+464	v_xtl[0]	4f08a664	sxtl2 v4.8h, v19.16b	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+465	v_xtl[0]	0f10a685	sxtl v5.4s, v20.4h	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+466	v_xtl[0]	4f10a685	sxtl2 v5.4s, v20.8h	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+467	v_xtl[0]	0f20a6a6	sxtl v6.2d, v21.2s	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+468	v_xtl[0]	4f20a6a6	sxtl2 v6.2d, v21.4s	sxtl_sshll_advsimd	SSHLL_asimdshf_L/SXTL
+469	v_xtl[0]	2f08a6c7	uxtl v7.8h, v22.8b	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+470	v_xtl[0]	6f08a6c7	uxtl2 v7.8h, v22.16b	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+471	v_xtl[0]	2f10a6e8	uxtl v8.4s, v23.4h	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+472	v_xtl[0]	6f10a6e8	uxtl2 v8.4s, v23.8h	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+473	v_xtl[0]	2f20a709	uxtl v9.2d, v24.2s	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+474	v_xtl[0]	6f20a709	uxtl2 v9.2d, v24.4s	uxtl_ushll_advsimd	USHLL_asimdshf_L/UXTL
+475	v_fcvtl[0]	0e617aa5	fcvtl v5.2d, v21.2s	fcvtl_advsimd	FCVTL_asimdmisc_L
+476	v_fcvtl[0]	4e617ac6	fcvtl2 v6.2d, v22.4s	fcvtl_advsimd	FCVTL_asimdmisc_L
+477	v_fcvtn[0]	0e616ae7	fcvtn v7.2s, v23.2d	fcvtn_advsimd	FCVTN_asimdmisc_N
+478	v_fcvtn[0]	4e616b08	fcvtn2 v8.4s, v24.2d	fcvtn_advsimd	FCVTN_asimdmisc_N
+479	v_scvtf_2d[0]	4e61db09	scvtf v9.2d, v24.2d	scvtf_advsimd_int	SCVTF_asimdmisc_R
+480	v_fcvtzs_2d[0]	4ee1bb2a	fcvtzs v10.2d, v25.2d	fcvtzs_advsimd_int	FCVTZS_asimdmisc_R
+481	v_xtn_2s[0]	0ea12b4b	xtn v11.2s, v26.2d	xtn_advsimd	XTN_asimdmisc_N
+482	v_xtn_2s[0]	4ea12b6c	xtn2 v12.4s, v27.2d	xtn_advsimd	XTN_asimdmisc_N
+483	s_fneg[0]	1e214264	fneg s4, s19	fneg_float	FNEG_S_floatdp1
+484	s_fneg[0]	1e614285	fneg d5, d20	fneg_float	FNEG_D_floatdp1
+485	s_fmadd[0]	1f136d63	fmadd s3, s11, s19, s27	fmadd_float	FMADD_S_floatdp3
+486	s_fmadd[0]	1f547184	fmadd d4, d12, d20, d28	fmadd_float	FMADD_D_floatdp3
+487	v_fneg[0]	6ea0faa6	fneg v6.4s, v21.4s	fneg_advsimd	FNEG_asimdmisc_R
+488	v_fneg[0]	6ee0fac7	fneg v7.2d, v22.2d	fneg_advsimd	FNEG_asimdmisc_R
+489	v_fmla[0]	4e37cda5	fmla v5.4s, v13.4s, v23.4s	fmla_advsimd_vec	FMLA_asimdsame_only
+490	v_fmla[0]	4e78cdc6	fmla v6.2d, v14.2d, v24.2d	fmla_advsimd_vec	FMLA_asimdsame_only
+491	bics_rr[0]	0a320164	bic w4, w11, w18	bic_log_shift	BIC_32_log_shift
+492	bics_rr[0]	8a330185	bic x5, x12, x19	bic_log_shift	BIC_64_log_shift
+493	bics_rr[0]	6a3401a6	bics w6, w13, w20	bics	BICS_32_log_shift
+494	bics_rr[0]	ea3501c7	bics x7, x14, x21	bics	BICS_64_log_shift
+495	crc32c[0]	1ad25164	crc32cb w4, w11, w18	crc32c	CRC32CB_32C_dp_2src
+496	crc32c[0]	1ad35585	crc32ch w5, w12, w19	crc32c	CRC32CH_32C_dp_2src
+497	crc32c[0]	1ad459a6	crc32cw w6, w13, w20	crc32c	CRC32CW_32C_dp_2src
+498	crc32c[0]	9ad55dc7	crc32cx w7, w14, x21	crc32c	CRC32CX_64C_dp_2src
+499	not_bl[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
+499	not_bl[1]	b3401c16	bfxil x22, x0, #0, #8	bfxil_bfm	BFM_64M_bitfield/BFXIL
+500	not_bx[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
+500	not_bx[1]	b3403c16	bfxil x22, x0, #0, #16	bfxil_bfm	BFM_64M_bitfield/BFXIL
+501	not_ebx[0]	2a3603e0	mvn w0, w22	mvn_orn_log_shift	ORN_32_log_shift/MVN
+501	not_ebx[1]	2a0003f6	mov w22, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
+502	not_rbx[0]	aa3603e0	mvn x0, x22	mvn_orn_log_shift	ORN_64_log_shift/MVN
+502	not_rbx[1]	aa0003f6	mov x22, x0	mov_orr_log_shift	ORR_64_log_shift/MOV
+503	not_bh[0]	d3483ec0	ubfx x0, x22, #8, #8	ubfx_ubfm	UBFM_64M_bitfield/UBFX
+503	not_bh[1]	2a2003e0	mvn w0, w0	mvn_orn_log_shift	ORN_32_log_shift/MVN
+503	not_bh[2]	b3781c16	bfi x22, x0, #8, #8	bfi_bfm	BFM_64M_bitfield/BFI
+504	lock_not_byte_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
+504	lock_not_byte_rsp[1]	12800002	movn w2, #0	movn	MOVN_32_movewide
+504	lock_not_byte_rsp[2]	38e22200	ldeoralb w2, w0, [x16]	ldeorb	LDEORALB_32_memop
+504	lock_not_byte_rsp[3]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
+505	lock_not_qword_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
+505	lock_not_qword_rsp[1]	12000e11	and w17, w16, #15	and_log_imm	AND_32_log_imm
+505	lock_not_qword_rsp[2]	11001e31	add w17, w17, #7	add_addsub_imm	ADD_32_addsub_imm
+505	lock_not_qword_rsp[3]	53047e31	lsr w17, w17, #4	lsr_ubfm	UBFM_32M_bitfield/LSR
+505	lock_not_qword_rsp[4]	35000091	cbnz w17, #16	cbnz	CBNZ_32_compbranch
+505	lock_not_qword_rsp[5]	92800002	movn x2, #0	movn	MOVN_64_movewide
+505	lock_not_qword_rsp[6]	f8e22200	ldeoral x2, x0, [x16]	ldeor	LDEORAL_64_memop
+505	lock_not_qword_rsp[7]	1400000f	b #60	b_uncond	B_only_branch_imm
+505	lock_not_qword_rsp[8]	d3442605	ubfx x5, x16, #4, #6	ubfx_ubfm	UBFM_64M_bitfield/UBFX
+505	lock_not_qword_rsp[9]	f94165f1	ldr x17, [x15, #712]	ldr_imm_gen	LDR_64_ldst_pos
+505	lock_not_qword_rsp[10]	8b051e31	add x17, x17, x5, lsl #7	add_addsub_shift	ADD_64_addsub_shift
+505	lock_not_qword_rsp[11]	52800026	movz w6, #1	movz	MOVZ_32_movewide
+505	lock_not_qword_rsp[12]	b8e68225	swpal w6, w5, [x17]	swp	SWPAL_32_memop
+505	lock_not_qword_rsp[13]	340000a5	cbz w5, #20	cbz	CBZ_32_compbranch
+505	lock_not_qword_rsp[14]	d503203f	yield	yield	YIELD_HI_hints
+505	lock_not_qword_rsp[15]	b9400225	ldr w5, [x17]	ldr_imm_gen	LDR_32_ldst_pos
+505	lock_not_qword_rsp[16]	35ffffc5	cbnz w5, #-8	cbnz	CBNZ_32_compbranch
+505	lock_not_qword_rsp[17]	17fffffb	b #-20	b_uncond	B_only_branch_imm
+505	lock_not_qword_rsp[18]	f9400200	ldr x0, [x16]	ldr_imm_gen	LDR_64_ldst_pos
+505	lock_not_qword_rsp[19]	aa2003e2	mvn x2, x0	mvn_orn_log_shift	ORN_64_log_shift/MVN
+505	lock_not_qword_rsp[20]	f9000202	str x2, [x16]	str_imm_gen	STR_64_ldst_pos
+505	lock_not_qword_rsp[21]	889ffe3f	stlr wzr, [x17]	stlr	STLR_SL32_ldstord
+505	lock_not_qword_rsp[22]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
+506	lock_and_dword_rsp[0]	aa1703f0	mov x16, x23	mov_orr_log_shift	ORR_64_log_shift/MOV
+506	lock_and_dword_rsp[1]	aa1303e1	mov x1, x19	mov_orr_log_shift	ORR_64_log_shift/MOV
+506	lock_and_dword_rsp[2]	12000e11	and w17, w16, #15	and_log_imm	AND_32_log_imm
+506	lock_and_dword_rsp[3]	11000e31	add w17, w17, #3	add_addsub_imm	ADD_32_addsub_imm
+506	lock_and_dword_rsp[4]	53047e31	lsr w17, w17, #4	lsr_ubfm	UBFM_32M_bitfield/LSR
+506	lock_and_dword_rsp[5]	35000091	cbnz w17, #16	cbnz	CBNZ_32_compbranch
+506	lock_and_dword_rsp[6]	2a2103e2	mvn w2, w1	mvn_orn_log_shift	ORN_32_log_shift/MVN
+506	lock_and_dword_rsp[7]	b8e21200	ldclral w2, w0, [x16]	ldclr	LDCLRAL_32_memop
+506	lock_and_dword_rsp[8]	1400000f	b #60	b_uncond	B_only_branch_imm
+506	lock_and_dword_rsp[9]	d3442605	ubfx x5, x16, #4, #6	ubfx_ubfm	UBFM_64M_bitfield/UBFX
+506	lock_and_dword_rsp[10]	f94165f1	ldr x17, [x15, #712]	ldr_imm_gen	LDR_64_ldst_pos
+506	lock_and_dword_rsp[11]	8b051e31	add x17, x17, x5, lsl #7	add_addsub_shift	ADD_64_addsub_shift
+506	lock_and_dword_rsp[12]	52800026	movz w6, #1	movz	MOVZ_32_movewide
+506	lock_and_dword_rsp[13]	b8e68225	swpal w6, w5, [x17]	swp	SWPAL_32_memop
+506	lock_and_dword_rsp[14]	340000a5	cbz w5, #20	cbz	CBZ_32_compbranch
+506	lock_and_dword_rsp[15]	d503203f	yield	yield	YIELD_HI_hints
+506	lock_and_dword_rsp[16]	b9400225	ldr w5, [x17]	ldr_imm_gen	LDR_32_ldst_pos
+506	lock_and_dword_rsp[17]	35ffffc5	cbnz w5, #-8	cbnz	CBNZ_32_compbranch
+506	lock_and_dword_rsp[18]	17fffffb	b #-20	b_uncond	B_only_branch_imm
+506	lock_and_dword_rsp[19]	b9400200	ldr w0, [x16]	ldr_imm_gen	LDR_32_ldst_pos
+506	lock_and_dword_rsp[20]	0a010002	and w2, w0, w1	and_log_shift	AND_32_log_shift
+506	lock_and_dword_rsp[21]	b9000202	str w2, [x16]	str_imm_gen	STR_32_ldst_pos
+506	lock_and_dword_rsp[22]	889ffe3f	stlr wzr, [x17]	stlr	STLR_SL32_ldstord
+506	lock_and_dword_rsp[23]	d5033bbf	dmb ish	dmb	DMB_BO_barriers
+506	lock_and_dword_rsp[24]	6a010005	ands w5, w0, w1	ands_log_shift	ANDS_32_log_shift
+507	rdtsc[0]	394c81e1	ldrb w1, [x15, #800]	ldrb_imm	LDRB_32_ldst_pos
+507	rdtsc[1]	36080041	tbz w1, #1, #8	tbz	TBZ_only_testbranch
+507	rdtsc[2]	14000004	b #16	b_uncond	B_only_branch_imm
+507	rdtsc[3]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
+507	rdtsc[4]	2a0003f3	mov w19, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
+507	rdtsc[5]	d360fc15	lsr x21, x0, #32	lsr_ubfm	UBFM_64M_bitfield/LSR
+507	rdtsc[6]	36100121	tbz w1, #2, #36	tbz	TBZ_only_testbranch
+507	rdtsc[7]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
+507	rdtsc[8]	b201f3e2	mov x2, #0xaaaaaaaaaaaaaaaa	mov_orr_log_imm	ORR_64_log_imm/MOV
+507	rdtsc[9]	91000442	add x2, x2, #1	add_addsub_imm	ADD_64_addsub_imm
+507	rdtsc[10]	9bc27c01	umulh x1, x0, x2	umulh	UMULH_64_dp_3src
+507	rdtsc[11]	8b000802	add x2, x0, x0, lsl #2	add_addsub_shift	ADD_64_addsub_shift
+507	rdtsc[12]	8b020c00	add x0, x0, x2, lsl #3	add_addsub_shift	ADD_64_addsub_shift
+507	rdtsc[13]	8b010000	add x0, x0, x1	add_addsub_shift	ADD_64_addsub_shift
+507	rdtsc[14]	17fffff6	b #-40	b_uncond	B_only_branch_imm
+507	rdtsc[15]	97fffef1	bl #-1084	bl	BL_only_branch_imm
+507	rdtsc[16]	17fffff4	b #-48	b_uncond	B_only_branch_imm
+508	rdtscp[0]	394c81e1	ldrb w1, [x15, #800]	ldrb_imm	LDRB_32_ldst_pos
+508	rdtscp[1]	d503399f	dsb ishld	dsb	DSB_BO_barriers
+508	rdtscp[2]	350000a1	cbnz w1, #20	cbnz	CBNZ_32_compbranch
+508	rdtscp[3]	d53be0c0	mrs x0, S3_3_C14_C0_6	mrs	MRS_RS_systemmove
+508	rdtscp[4]	2a0003f3	mov w19, w0	mov_orr_log_shift	ORR_32_log_shift/MOV
+508	rdtscp[5]	d360fc15	lsr x21, x0, #32	lsr_ubfm	UBFM_64M_bitfield/LSR
+508	rdtscp[6]	d2800014	movz x20, #0	movz	MOVZ_64_movewide
+508	rdtscp[7]	97fffeb9	bl #-1308	bl	BL_only_branch_imm
+508	rdtscp[8]	17fffffc	b #-16	b_uncond	B_only_branch_imm
+509	stub_enter_frame[0]	a9ba7bfd	stp x29, x30, [sp, #-96]!	stp_gen	STP_64_ldstpair_pre
+509	stub_enter_frame[1]	910003fd	mov x29, sp	mov_add_addsub_imm	ADD_64_addsub_imm/MOV
+510	stub_exit_frame[0]	a8c67bfd	ldp x29, x30, [sp], #96	ldp_gen	LDP_64_ldstpair_post
+510	stub_exit_frame[1]	d65f03c0	ret	ret	RET_64R_branch_reg
+511	timestamp_stubs[0]	36180061	tbz w1, #3, #12	tbz	TBZ_only_testbranch
+511	timestamp_stubs[1]	d53be0c0	mrs x0, S3_3_C14_C0_6	mrs	MRS_RS_systemmove
+511	timestamp_stubs[2]	14000005	b #20	b_uncond	B_only_branch_imm
+511	timestamp_stubs[3]	d5033fdf	isb	isb	ISB_BI_barriers
+511	timestamp_stubs[4]	360802e1	tbz w1, #1, #92	tbz	TBZ_only_testbranch
+511	timestamp_stubs[5]	37000281	tbnz w1, #0, #80	tbnz	TBNZ_only_testbranch
+511	timestamp_stubs[6]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
+511	timestamp_stubs[7]	36100101	tbz w1, #2, #32	tbz	TBZ_only_testbranch
+511	timestamp_stubs[8]	b201f3e2	mov x2, #0xaaaaaaaaaaaaaaaa	mov_orr_log_imm	ORR_64_log_imm/MOV
+511	timestamp_stubs[9]	91000442	add x2, x2, #1	add_addsub_imm	ADD_64_addsub_imm
+511	timestamp_stubs[10]	9bc27c01	umulh x1, x0, x2	umulh	UMULH_64_dp_3src
+511	timestamp_stubs[11]	8b000802	add x2, x0, x0, lsl #2	add_addsub_shift	ADD_64_addsub_shift
+511	timestamp_stubs[12]	8b020c00	add x0, x0, x2, lsl #3	add_addsub_shift	ADD_64_addsub_shift
+511	timestamp_stubs[13]	8b010000	add x0, x0, x1	add_addsub_shift	ADD_64_addsub_shift
+511	timestamp_stubs[14]	d65f03c0	ret	ret	RET_64R_branch_reg
+511	timestamp_stubs[15]	d53be001	mrs x1, cntfrq_el0	mrs	MRS_RS_systemmove
+511	timestamp_stubs[16]	d2994002	movz x2, #0xca00	movz	MOVZ_64_movewide
+511	timestamp_stubs[17]	f2a77342	movk x2, #0x3b9a, lsl #16	movk	MOVK_64_movewide
+511	timestamp_stubs[18]	9ac10803	udiv x3, x0, x1	udiv	UDIV_64_dp_2src
+511	timestamp_stubs[19]	9b018060	msub x0, x3, x1, x0	msub	MSUB_64A_dp_3src
+511	timestamp_stubs[20]	9b027c00	mul x0, x0, x2	mul_madd	MADD_64A_dp_3src/MUL
+511	timestamp_stubs[21]	9b027c63	mul x3, x3, x2	mul_madd	MADD_64A_dp_3src/MUL
+511	timestamp_stubs[22]	9ac10800	udiv x0, x0, x1	udiv	UDIV_64_dp_2src
+511	timestamp_stubs[23]	8b000060	add x0, x3, x0	add_addsub_shift	ADD_64_addsub_shift
+511	timestamp_stubs[24]	d65f03c0	ret	ret	RET_64R_branch_reg
+511	timestamp_stubs[25]	d2820000	movz x0, #0x1000	movz	MOVZ_64_movewide
+511	timestamp_stubs[26]	d65f03c0	ret	ret	RET_64R_branch_reg
+511	timestamp_stubs[27]	d53be040	mrs x0, cntvct_el0	mrs	MRS_RS_systemmove
+511	timestamp_stubs[28]	d65f03c0	ret	ret	RET_64R_branch_reg
+512	static_host_call_relocation[0]	94000000	bl #0	bl	BL_only_branch_imm
+513	static_host_call_to_veneer[0]	94000015	bl #84	bl	BL_only_branch_imm
+514	static_host_call_veneer[0]	90000010	adrp x16, #0	adrp	ADRP_only_pcreladdr
+514	static_host_call_veneer[1]	f9400210	ldr x16, [x16]	ldr_imm_gen	LDR_64_ldst_pos
+514	static_host_call_veneer[2]	d61f0200	br x16	br	BR_64_branch_reg
+514	static_host_call_veneer[3]	d503201f	nop	nop	NOP_HI_hints

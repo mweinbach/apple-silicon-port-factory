@@ -855,121 +855,147 @@ impl Cpu {
 
     #[inline]
     unsafe fn atomic_rmw_raw(&self, addr: u64, bits: u32, mut f: impl FnMut(u64) -> u64) -> (u64, u64) {
-        use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-        let align = (bits as usize / 8).clamp(1, 8);
-        if !regfile_ext::is_valid_guest_range(addr, align) {
+        let bytes = (bits as usize / 8).clamp(1, 8);
+        if !regfile_ext::is_valid_guest_range(addr, bytes) {
             cold_bad_addr(self, "atomic_rmw", addr, bits, true);
             return (0, 0);
         }
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
         let p = addr as usize;
-        if (p & (align - 1)) == 0 {
-            match bits {
-                8 => {
-                    let a = &*(p as *const AtomicU8);
-                    let mut cur = a.load(Ordering::Relaxed);
-                    loop {
-                        let next = f(cur as u64) as u8;
-                        match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
-                            Ok(_) => return (cur as u64, next as u64),
-                            Err(actual) => cur = actual,
+        #[cfg(target_arch = "aarch64")]
+        {
+            if (p & 15) + bytes <= 16 {
+                let mut cur = read_unaligned_bits(p, bits);
+                loop {
+                    let next = f(cur) & mask;
+                    let actual = lse_casal(p, bits, cur, next);
+                    if actual == cur {
+                        return (cur, next);
+                    }
+                    cur = actual;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+            if (p & (bytes - 1)) == 0 {
+                match bits {
+                    8 => {
+                        let a = &*(p as *const AtomicU8);
+                        let mut cur = a.load(Ordering::Relaxed);
+                        loop {
+                            let next = f(cur as u64) as u8;
+                            match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
+                                Ok(_) => return (cur as u64, next as u64),
+                                Err(actual) => cur = actual,
+                            }
                         }
                     }
-                }
-                16 => {
-                    let a = &*(p as *const AtomicU16);
-                    let mut cur = a.load(Ordering::Relaxed);
-                    loop {
-                        let next = f(cur as u64) as u16;
-                        match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
-                            Ok(_) => return (cur as u64, next as u64),
-                            Err(actual) => cur = actual,
+                    16 => {
+                        let a = &*(p as *const AtomicU16);
+                        let mut cur = a.load(Ordering::Relaxed);
+                        loop {
+                            let next = f(cur as u64) as u16;
+                            match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
+                                Ok(_) => return (cur as u64, next as u64),
+                                Err(actual) => cur = actual,
+                            }
                         }
                     }
-                }
-                32 => {
-                    let a = &*(p as *const AtomicU32);
-                    let mut cur = a.load(Ordering::Relaxed);
-                    loop {
-                        let next = f(cur as u64) as u32;
-                        match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
-                            Ok(_) => return (cur as u64, next as u64),
-                            Err(actual) => cur = actual,
+                    32 => {
+                        let a = &*(p as *const AtomicU32);
+                        let mut cur = a.load(Ordering::Relaxed);
+                        loop {
+                            let next = f(cur as u64) as u32;
+                            match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
+                                Ok(_) => return (cur as u64, next as u64),
+                                Err(actual) => cur = actual,
+                            }
                         }
                     }
-                }
-                _ => {
-                    let a = &*(p as *const AtomicU64);
-                    let mut cur = a.load(Ordering::Relaxed);
-                    loop {
-                        let next = f(cur);
-                        match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
-                            Ok(_) => return (cur, next),
-                            Err(actual) => cur = actual,
+                    _ => {
+                        let a = &*(p as *const AtomicU64);
+                        let mut cur = a.load(Ordering::Relaxed);
+                        loop {
+                            let next = f(cur);
+                            match a.compare_exchange_weak(cur, next, Ordering::SeqCst, Ordering::Relaxed) {
+                                Ok(_) => return (cur, next),
+                                Err(actual) => cur = actual,
+                            }
                         }
                     }
                 }
             }
-        } else {
-            static UNALIGNED_ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _g = UNALIGNED_ATOMIC_LOCK.lock().unwrap();
-            let old = self.read_mem(addr, bits);
-            let new = f(old);
-            self.write_mem(addr, bits, new);
-            (old, new)
         }
+        let _g = lock_atomic_shard(addr);
+        let old = self.read_mem(addr, bits) & mask;
+        let new = f(old) & mask;
+        self.write_mem(addr, bits, new);
+        (old, new)
     }
 
     #[inline]
     unsafe fn atomic_cmpxchg_raw(&self, addr: u64, bits: u32, expected: u64, desired: u64) -> (bool, u64) {
-        use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-        let align = (bits as usize / 8).clamp(1, 8);
-        if !regfile_ext::is_valid_guest_range(addr, align) {
+        let bytes = (bits as usize / 8).clamp(1, 8);
+        if !regfile_ext::is_valid_guest_range(addr, bytes) {
             cold_bad_addr(self, "atomic_cmpxchg", addr, bits, true);
             return (false, 0);
         }
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let exp = expected & mask;
+        let des = desired & mask;
         let p = addr as usize;
-        if (p & (align - 1)) == 0 {
-            match bits {
-                8 => {
-                    let a = &*(p as *const AtomicU8);
-                    match a.compare_exchange(expected as u8, desired as u8, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(v) => (true, v as u64),
-                        Err(v) => (false, v as u64),
-                    }
-                }
-                16 => {
-                    let a = &*(p as *const AtomicU16);
-                    match a.compare_exchange(expected as u16, desired as u16, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(v) => (true, v as u64),
-                        Err(v) => (false, v as u64),
-                    }
-                }
-                32 => {
-                    let a = &*(p as *const AtomicU32);
-                    match a.compare_exchange(expected as u32, desired as u32, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(v) => (true, v as u64),
-                        Err(v) => (false, v as u64),
-                    }
-                }
-                _ => {
-                    let a = &*(p as *const AtomicU64);
-                    match a.compare_exchange(expected, desired, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(v) => (true, v),
-                        Err(v) => (false, v),
-                    }
-                }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if (p & 15) + bytes <= 16 {
+                let actual = lse_casal(p, bits, exp, des);
+                return (actual == exp, actual);
             }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+            if (p & (bytes - 1)) == 0 {
+                return match bits {
+                    8 => {
+                        let a = &*(p as *const AtomicU8);
+                        match a.compare_exchange(exp as u8, des as u8, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(v) => (true, v as u64),
+                            Err(v) => (false, v as u64),
+                        }
+                    }
+                    16 => {
+                        let a = &*(p as *const AtomicU16);
+                        match a.compare_exchange(exp as u16, des as u16, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(v) => (true, v as u64),
+                            Err(v) => (false, v as u64),
+                        }
+                    }
+                    32 => {
+                        let a = &*(p as *const AtomicU32);
+                        match a.compare_exchange(exp as u32, des as u32, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(v) => (true, v as u64),
+                            Err(v) => (false, v as u64),
+                        }
+                    }
+                    _ => {
+                        let a = &*(p as *const AtomicU64);
+                        match a.compare_exchange(exp, des, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(v) => (true, v),
+                            Err(v) => (false, v),
+                        }
+                    }
+                };
+            }
+        }
+        let _g = lock_atomic_shard(addr);
+        let cur = self.read_mem(addr, bits) & mask;
+        if cur == exp {
+            self.write_mem(addr, bits, des);
+            (true, cur)
         } else {
-            static UNALIGNED_CAS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _g = UNALIGNED_CAS_LOCK.lock().unwrap();
-            let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            let cur = self.read_mem(addr, bits) & mask;
-            if cur == (expected & mask) {
-                self.write_mem(addr, bits, desired);
-                (true, cur)
-            } else {
-                (false, cur)
-            }
+            (false, cur)
         }
     }
 
@@ -1265,4 +1291,132 @@ pub(super) unsafe fn cas128_full(addr: u64, expected: u128, desired: u128) -> Op
 #[inline]
 pub(super) unsafe fn cas128_full(_addr: u64, _expected: u128, _desired: u128) -> Option<u128> {
     None
+}
+
+/// Number of cache-line-isolated spinlock shards for 16-byte-boundary-crossing LOCK operations.
+/// Every 2/4/8/16-byte access crossing a 16-byte boundary starts in granule `addr >> 4`, so
+/// hashing by `(addr >> 4) & (ATOMIC_LOCK_SHARDS - 1)` serializes all overlapping boundary-crossing
+/// accesses across every execution tier (Generic, FastOp, Live JIT, Disk AOT, Static Mach-O AOT).
+pub(super) const ATOMIC_LOCK_SHARDS: usize = 64;
+#[cfg(target_arch = "aarch64")]
+pub(super) const ATOMIC_LOCK_SHARD_BITS: u32 = 6;
+#[cfg(target_arch = "aarch64")]
+pub(super) const ATOMIC_LOCK_STRIDE_SHIFT: u32 = 7; // 128 bytes (Apple Silicon cache line)
+
+#[repr(C, align(128))]
+struct AtomicLockShard {
+    lock: core::sync::atomic::AtomicU32,
+}
+
+impl AtomicLockShard {
+    const fn new() -> Self {
+        Self { lock: core::sync::atomic::AtomicU32::new(0) }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(ATOMIC_LOCK_SHARDS == (1usize << ATOMIC_LOCK_SHARD_BITS));
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::size_of::<AtomicLockShard>() == (1usize << ATOMIC_LOCK_STRIDE_SHIFT));
+const _: () = assert!(core::mem::offset_of!(AtomicLockShard, lock) == 0);
+
+static ATOMIC_LOCKS: [AtomicLockShard; ATOMIC_LOCK_SHARDS] =
+    [const { AtomicLockShard::new() }; ATOMIC_LOCK_SHARDS];
+
+/// Base address of [`ATOMIC_LOCKS`] exposed to translated code via `Cpu::jx.atomic_locks`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) fn atomic_locks_ptr() -> usize {
+    ATOMIC_LOCKS.as_ptr() as usize
+}
+
+/// RAII guard for one shard in [`ATOMIC_LOCKS`].
+pub(super) struct AtomicShardGuard {
+    lock: &'static core::sync::atomic::AtomicU32,
+}
+
+impl Drop for AtomicShardGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.lock.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Acquire the spinlock shard governing 16-byte-crossing LOCK ops starting in granule `addr >> 4`.
+/// Uses the exact same `0 = unlocked, 1 = locked` protocol as translated ARM64 code.
+#[inline]
+pub(super) fn lock_atomic_shard(addr: u64) -> AtomicShardGuard {
+    use core::sync::atomic::Ordering;
+    let idx = ((addr >> 4) as usize) & (ATOMIC_LOCK_SHARDS - 1);
+    let lock = &ATOMIC_LOCKS[idx].lock;
+    while lock.swap(1, Ordering::Acquire) != 0 {
+        while lock.load(Ordering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+    AtomicShardGuard { lock }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn read_unaligned_bits(addr: usize, bits: u32) -> u64 {
+    match bits {
+        8 => core::ptr::read_unaligned(addr as *const u8) as u64,
+        16 => core::ptr::read_unaligned(addr as *const u16) as u64,
+        32 => core::ptr::read_unaligned(addr as *const u32) as u64,
+        _ => core::ptr::read_unaligned(addr as *const u64),
+    }
+}
+
+/// Single-instruction LSE compare-and-swap (`CASAL{B,H,,}`), which `FEAT_LSE2` permits on any
+/// misaligned address that does not cross a 16-byte boundary. Returns the zero-extended old value.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lse_casal(addr: usize, bits: u32, expected: u64, desired: u64) -> u64 {
+    match bits {
+        8 => {
+            let mut cur = expected as u32;
+            core::arch::asm!(
+                "casalb {c:w}, {d:w}, [{p}]",
+                p = in(reg) addr,
+                c = inout(reg) cur,
+                d = in(reg) desired as u32,
+                options(nostack),
+            );
+            (cur & 0xFF) as u64
+        }
+        16 => {
+            let mut cur = expected as u32;
+            core::arch::asm!(
+                "casalh {c:w}, {d:w}, [{p}]",
+                p = in(reg) addr,
+                c = inout(reg) cur,
+                d = in(reg) desired as u32,
+                options(nostack),
+            );
+            (cur & 0xFFFF) as u64
+        }
+        32 => {
+            let mut cur = expected as u32;
+            core::arch::asm!(
+                "casal {c:w}, {d:w}, [{p}]",
+                p = in(reg) addr,
+                c = inout(reg) cur,
+                d = in(reg) desired as u32,
+                options(nostack),
+            );
+            cur as u64
+        }
+        _ => {
+            let mut cur = expected;
+            core::arch::asm!(
+                "casal {c:x}, {d:x}, [{p}]",
+                p = in(reg) addr,
+                c = inout(reg) cur,
+                d = in(reg) desired,
+                options(nostack),
+            );
+            cur
+        }
+    }
 }

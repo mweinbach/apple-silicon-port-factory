@@ -215,18 +215,38 @@ fn register_more(cases: &mut Cases) {
     check_words!(cases, v_fcvtn_h(false, 7, 23) => "fcvtn_advsimd", "fcvtn v7.4h, v23.4s");
     check_words!(cases, v_fcvtn_h(true, 8, 24) => "fcvtn_advsimd", "fcvtn2 v8.8h, v24.4s");
 
-    check_words!(cases, ldaxr(8, 5, 19) => "ldaxrb", "ldaxrb w5, [x19]");
-    check_words!(cases, ldaxr(16, 6, 20) => "ldaxrh", "ldaxrh w6, [x20]");
-    check_words!(cases, ldaxr(32, 7, 21) => "ldaxr", "ldaxr w7, [x21]");
-    check_words!(cases, ldaxr(64, 8, 22) => "ldaxr", "ldaxr x8, [x22]");
+    check_words!(cases, ldaddal(8, 3, 5, 19) => "ldaddb", "ldaddalb w3, w5, [x19]");
+    check_words!(cases, ldaddal(16, 4, 6, 20) => "ldaddh", "ldaddalh w4, w6, [x20]");
+    check_words!(cases, ldaddal(32, 5, 7, 21) => "ldadd", "ldaddal w5, w7, [x21]");
+    check_words!(cases, ldaddal(64, 6, 8, 22) => "ldadd", "ldaddal x6, x8, [x22]");
 
-    check_words!(cases, stlxr(8, 3, 11, 19) => "stlxrb", "stlxrb w3, w11, [x19]");
-    check_words!(cases, stlxr(16, 4, 12, 20) => "stlxrh", "stlxrh w4, w12, [x20]");
-    check_words!(cases, stlxr(32, 5, 13, 21) => "stlxr", "stlxr w5, w13, [x21]");
-    check_words!(cases, stlxr(64, 6, 14, 22) => "stlxr", "stlxr w6, x14, [x22]");
+    check_words!(cases, ldclral(8, 3, 5, 19) => "ldclrb", "ldclralb w3, w5, [x19]");
+    check_words!(cases, ldclral(16, 4, 6, 20) => "ldclrh", "ldclralh w4, w6, [x20]");
+    check_words!(cases, ldclral(32, 5, 7, 21) => "ldclr", "ldclral w5, w7, [x21]");
+    check_words!(cases, ldclral(64, 6, 8, 22) => "ldclr", "ldclral x6, x8, [x22]");
 
-    check_words!(cases, ldaxp_x(5, 19, 25) => "ldaxp", "ldaxp x5, x19, [x25]");
-    check_words!(cases, stlxp_x(4, 6, 20, 26) => "stlxp", "stlxp w4, x6, x20, [x26]");
+    check_words!(cases, ldeoral(8, 3, 5, 19) => "ldeorb", "ldeoralb w3, w5, [x19]");
+    check_words!(cases, ldeoral(16, 4, 6, 20) => "ldeorh", "ldeoralh w4, w6, [x20]");
+    check_words!(cases, ldeoral(32, 5, 7, 21) => "ldeor", "ldeoral w5, w7, [x21]");
+    check_words!(cases, ldeoral(64, 6, 8, 22) => "ldeor", "ldeoral x6, x8, [x22]");
+
+    check_words!(cases, ldsetal(8, 3, 5, 19) => "ldsetb", "ldsetalb w3, w5, [x19]");
+    check_words!(cases, ldsetal(16, 4, 6, 20) => "ldseth", "ldsetalh w4, w6, [x20]");
+    check_words!(cases, ldsetal(32, 5, 7, 21) => "ldset", "ldsetal w5, w7, [x21]");
+    check_words!(cases, ldsetal(64, 6, 8, 22) => "ldset", "ldsetal x6, x8, [x22]");
+
+    check_words!(cases, swpal(8, 3, 5, 19) => "swpb", "swpalb w3, w5, [x19]");
+    check_words!(cases, swpal(16, 4, 6, 20) => "swph", "swpalh w4, w6, [x20]");
+    check_words!(cases, swpal(32, 5, 7, 21) => "swp", "swpal w5, w7, [x21]");
+    check_words!(cases, swpal(64, 6, 8, 22) => "swp", "swpal x6, x8, [x22]");
+
+    check_words!(cases, casal(8, 3, 5, 19) => "casb", "casalb w3, w5, [x19]");
+    check_words!(cases, casal(16, 4, 6, 20) => "cash", "casalh w4, w6, [x20]");
+    check_words!(cases, casal(32, 5, 7, 21) => "cas", "casal w5, w7, [x21]");
+    check_words!(cases, casal(64, 6, 8, 22) => "cas", "casal x6, x8, [x22]");
+
+    check_words!(cases, caspal_x(0, 2, 16) => "casp", "caspal x0, x1, x2, x3, [x16]");
+    check_words!(cases, yield_hint() => "yield", "yield");
     check_words!(cases, clrex() => "clrex", "clrex");
 
     check_words!(cases, ldr_reg(8, false, 5, 11, 17, false) => "ldrb_reg", "ldrb w5, [x11, x17]");
