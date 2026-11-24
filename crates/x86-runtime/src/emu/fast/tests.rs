@@ -93,7 +93,7 @@ fn diff_seq(
     }
     fuse(&mut ops);
 
-    unsafe {
+    crate::emu::with_frozen_tsc(|| unsafe {
         for (ins, op) in insns.iter().zip(ops.iter()) {
             cpu_f.rip = op.ip.wrapping_add(op.len as u64);
             let _ = exec(&mut cpu_f, op);
@@ -101,7 +101,7 @@ fn diff_seq(
             let handled = cpu_g.exec_generic_ins(ins);
             assert!(handled, "{label}: generic handler did not handle {:?}", ins.mnemonic());
         }
-    }
+    });
 
     // Normalize buffer base pointers in GPRs before comparing (since fast & generic use separate buffers).
     // Check exact [base, base + sz) first so adjacent heap allocations never alias into the +-64 slack window.
@@ -803,4 +803,41 @@ fn fast_cmpj_fusion_and_run_chain_end_to_end() {
     // Expected: for k in 1..=200: (+2 if k >= 50 => 151*2 = 302) + (sum of odd k in 1..=200 => 100^2 = 10000) = 10302.
     assert_eq!(fast_res, 10302);
     assert_eq!(fast_res, gen_res);
+}
+
+#[test]
+fn timestamp_registers_and_flags_in_the_generic_and_fast_paths() {
+    use crate::emu::{guest_rdtscp, with_frozen_tsc, GUEST_TSC};
+    for (bytes, ordered) in [(&[0x0f, 0x31][..], false), (&[0x0f, 0x01, 0xf9][..], true)] {
+        let ins = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE).decode();
+        let op = lower(&ins);
+        assert_eq!(op.kind, K_SYS_MISC);
+        for fast in [false, true] {
+            let sample = || {
+                let mut cpu = base_cpu();
+                cpu.gpr = [u64::MAX; 16];
+                cpu.last_bits = [16; 16];
+                cpu.cf = true;
+                cpu.df = true;
+                let flags = cpu.rflags();
+                unsafe {
+                    if fast { let _ = exec(&mut cpu, &op); } else { assert!(cpu.exec_generic_ins(&ins)); }
+                }
+                let stamp = (cpu.gpr[2] << 32) | cpu.gpr[0];
+                let mut regs = [u64::MAX; 16];
+                regs[0] = stamp & 0xffff_ffff;
+                regs[2] = stamp >> 32;
+                if ordered { regs[1] = 0; }
+                assert_eq!(cpu.gpr, regs);
+                assert_eq!(cpu.rflags(), flags);
+                assert_eq!((cpu.last_bits[0], cpu.last_bits[1], cpu.last_bits[2]),
+                           (64, if ordered { 64 } else { 16 }, 64));
+                stamp
+            };
+            let before = guest_rdtscp();
+            let t = sample();
+            assert!((before..=guest_rdtscp()).contains(&t));
+            assert_eq!(with_frozen_tsc(sample), GUEST_TSC);
+        }
+    }
 }

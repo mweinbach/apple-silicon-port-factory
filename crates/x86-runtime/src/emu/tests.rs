@@ -981,7 +981,7 @@ fn bitops_misc_new_mnemonics() {
     for i in 0..16 {
         b.0[0x30 + i] = 0xA0 + i as u8;
     }
-    run(BITOPS_MISC, &mut b, [0; 4]);
+    with_frozen_tsc(|| run(BITOPS_MISC, &mut b, [0; 4]));
     assert_eq!(b.u32(0x100), 0x4433_2211, "movbe load");
     assert_eq!(b.u64(0x108), 0x0807_0605_0403_0201, "movbe store");
     assert_eq!(b.u32(0x1a0), 0x4700, "lahf: SF=0 ZF=1 PF=1 CF=1 + reserved bit 1");
@@ -1500,8 +1500,7 @@ fn native_to_guest_call_passes_rax() {
     jit::force(0);
 }
 
-/// `rdtsc` / `rdtscp` read [`GUEST_TSC`] on every emulator path (interpreter, translator, and
-/// the default fast path), equal to the lifted code's [`guest_rdtsc`] (frontier_plan.md §3).
+/// Store both halves of each timestamp and the AUX value for tier comparison.
 #[rustfmt::skip]
 const RDTSC_FORMS: &[u8] = &[
     0x49, 0x89, 0xc8,  // mov r8, rcx
@@ -1517,32 +1516,17 @@ const RDTSC_FORMS: &[u8] = &[
 ];
 
 #[test]
-fn rdtsc_reads_guest_tsc_on_every_path() {
-    let t = guest_rdtsc();
-    assert_eq!(t, GUEST_TSC);
-    let check = |b: &Buf, what: &str| {
-        assert_eq!(b.u64(0x100), t & 0xffff_ffff, "{what}: rdtsc rax");
-        assert_eq!(b.u64(0x108), t >> 32, "{what}: rdtsc rdx");
-        assert_eq!(b.u64(0x110), t & 0xffff_ffff, "{what}: rdtscp rax");
-        assert_eq!(b.u64(0x118), t >> 32, "{what}: rdtscp rdx");
-        assert_eq!(b.u64(0x120), 0, "{what}: rdtscp rcx = TSC_AUX");
-    };
-    let mut b = new_buf();
-    b.0[0x100..0x128].fill(0xff);
-    run(RDTSC_FORMS, &mut b, [0; 4]); // interpreter == translator
-    check(&b, "interpreter");
-    // Default mode (fast path / JIT as chosen at runtime), fresh code address.
-    let c = arena_alloc(RDTSC_FORMS.len() + 16, 16);
-    let d = arena_alloc(core::mem::size_of::<Buf>(), 32) as *mut Buf;
-    unsafe {
-        core::ptr::copy_nonoverlapping(RDTSC_FORMS.as_ptr(), c, RDTSC_FORMS.len());
-        core::ptr::write_bytes(c.add(RDTSC_FORMS.len()), 0xCC, 16);
-        (*d).0 = [0xff; 512];
-        for _ in 0..3 {
-            emu_run_full(c as u64, [d as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
-            check(&*d, "default");
+fn rdtsc_reads_the_verifier_clock_on_every_path() {
+    with_frozen_tsc(|| {
+        let mut b = new_buf();
+        b.0[0x100..0x128].fill(0xff);
+        run(RDTSC_FORMS, &mut b, [0; 4]);
+        for off in [0x100, 0x110] {
+            assert_eq!(b.u64(off), GUEST_TSC);
+            assert_eq!(b.u64(off + 8), 0);
         }
-    }
+        assert_eq!(b.u64(0x120), 0);
+    });
 }
 
 /// `paddb` / `pmaxuw`: the emulator matches `simd_ops::vpaddb` / `vpmaxuw` (the lifted

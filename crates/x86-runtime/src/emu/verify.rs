@@ -638,8 +638,6 @@ fn is_forbidden_ins(ins: &Instruction) -> bool {
             | Ud1
             | Ud2
             | Hlt
-            | Rdtsc
-            | Rdtscp
             | Cpuid
             | Xgetbv
             | Xsetbv
@@ -1361,6 +1359,10 @@ pub fn verify_pe_file(path: &Path, cfg: &VerifyConfig) -> Result<BinaryVerifyRep
 /// AOT (unlinked split+rebased), and AOT Linked (multi-block CFG traces with `fallthrough nop`
 /// & `cond_patch`).
 pub fn verify_mapped_pe(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryVerifyReport, String> {
+    super::with_frozen_tsc(|| verify_with_frozen_clock(pe, cfg))
+}
+
+fn verify_with_frozen_clock(pe: &MappedPe, cfg: &VerifyConfig) -> Result<BinaryVerifyReport, String> {
     let t0 = Instant::now();
     let mut rep = BinaryVerifyReport {
         module: pe.name.clone(),
@@ -1925,6 +1927,29 @@ mod tests {
         pe[0x2000..0x2004].copy_from_slice(&0x1000u32.to_le_bytes());
         pe[0x2004..0x2008].copy_from_slice(&(0x1000u32 + code.len() as u32).to_le_bytes());
         pe
+    }
+
+    #[test]
+    fn verify_timestamp_blocks_and_linked_aot() {
+        let code = [
+            0x0f, 0x31,             // rdtsc
+            0x41, 0x89, 0xc0,       // mov r8d, eax
+            0x74, 0x04,             // jz plain
+            0x0f, 0x01, 0xf9, 0xc3, // rdtscp; ret
+            0x0f, 0x31, 0xc3,       // plain: rdtsc; ret
+        ];
+        let mapped = MappedPe::from_bytes("clock.dll", &synth_pe(&code)).expect("map clock PE");
+        let cfg = VerifyConfig {
+            trials: 4,
+            threads: 2,
+            rva_filter: Some((0x1000, 0x1000 + code.len() as u32)),
+            ..VerifyConfig::default()
+        };
+        let rep = verify_mapped_pe(&mapped, &cfg).expect("verify clock PE");
+        assert_eq!(rep.blocks_tested, 3, "{rep:?}");
+        assert_eq!(rep.trials_executed, 12, "{rep:?}");
+        assert!(rep.linked_traces_tested > 0, "{rep:?}");
+        assert_eq!(rep.total_critical_mismatches(), 0, "{:?}", rep.mismatches);
     }
 
     #[test]

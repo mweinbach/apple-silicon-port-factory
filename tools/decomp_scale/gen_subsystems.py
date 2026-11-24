@@ -2736,10 +2736,10 @@ def translate_linear_insns(
             lines.append("rax = 7; rdx = 0;")
             last_flag = None
         elif mn in ("rdtsc", "rdtscp"):
-            # The emulator's time-stamp counter, the same value on every path (frontier_plan.md
-            # §3: `emu::guest_rdtsc`, GUEST_TSC); flags unchanged; rdtscp: ecx = TSC_AUX = 0.
+            # Both helpers share the guest clock. RDTSCP also orders prior loads and returns TSC_AUX.
+            clock = "guest_rdtscp" if mn == "rdtscp" else "guest_rdtsc"
             lines.append(
-                "{ let t = crate::emu::guest_rdtsc(); rax = t & 0xffff_ffff; rdx = t >> 32; }"
+                f"{{ let t = crate::emu::{clock}(); rax = t & 0xffff_ffff; rdx = t >> 32; }}"
                 + (" rcx = 0;" if mn == "rdtscp" else "")
             )
         elif mn == "int":

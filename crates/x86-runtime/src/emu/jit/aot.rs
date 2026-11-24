@@ -347,7 +347,7 @@ unsafe fn aot_translate_rec(
 /// Codegen knob vector for the AOT key: every input of the translation / `emit_stubs`
 /// that is not guest memory or host-callable state (those are hashed / assumed).
 pub(in crate::emu) fn aot_knob_bits() -> u64 {
-    let bits: [(u32, u64); 25] = [
+    let bits: [(u32, u64); 26] = [
         (0, ras_enabled() as u64),
         (1, flags_dead_mask() as u64), // 2 bits
         (3, ro_plain_enabled() as u64),
@@ -373,6 +373,7 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
         (34, budget_light_enabled() as u64),
         (35, hw_range_enabled() as u64),
         (36, 1u64), // codegen rev 4: XBUD bit-0 ymm_dirty, batched push/pop/ret, JccPair, x_shuf_rr, xmm_hi_live, XA cache, hot/cold split
+        (37, 1u64), // codegen rev 5: live 1 GHz CNTVCT/CNTFRQ RDTSC/RDTSCP with runtime JitScratch::tsc_frozen
     ];
     bits.iter().fold(0u64, |k, &(b, v)| k | v << b)
 }

@@ -951,6 +951,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.tsc_frozen = u8::from(crate::emu::tsc_is_frozen());
         cpu.jx.aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
         } else if crate::emu::aot::active() {
@@ -1048,6 +1049,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.tsc_frozen = u8::from(crate::emu::tsc_is_frozen());
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
         let mut yd = 0u16;

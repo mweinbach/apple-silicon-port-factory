@@ -884,9 +884,22 @@ fn register_loads_stores_barriers_sysregs(cases: &mut Cases) {
         a.dmb_ishst();
     });
 
+    cases.check("dsb_ishld", &[("dsb", "dsb ishld")], |a| {
+        a.dsb_ishld();
+    });
+
+    cases.check("isb", &[("isb", "isb")], |a| {
+        a.isb();
+    });
+
     check_words!(cases, "mrs_cntvct";
         mrs_cntvct(3) => "mrs", "mrs x3, cntvct_el0";
         mrs_cntvct(22) => "mrs", "mrs x22, cntvct_el0";
+    );
+
+    check_words!(cases, "mrs_cntfrq";
+        mrs_cntfrq(3) => "mrs", "mrs x3, cntfrq_el0";
+        mrs_cntfrq(22) => "mrs", "mrs x22, cntfrq_el0";
     );
 
     check_words!(cases, "mrs_fpcr";

@@ -6389,3 +6389,56 @@ fn block_v128_mask_preserves_ymm_hi_on_narrowing_ops() {
 
 
 
+
+
+/// Compile while frozen, then reuse the same machine code for live and frozen reads.
+#[test]
+fn jit_timestamp_blocks_switch_clock_mode_at_execution() {
+    use std::time::{Duration, Instant};
+    let mut asm = CodeAssembler::new(64).unwrap();
+    asm.mov(r8, rcx).unwrap();
+    asm.mov(rcx, u64::MAX).unwrap();
+    asm.stc().unwrap();
+    asm.rdtsc().unwrap();
+    asm.mov(qword_ptr(r8), rax).unwrap();
+    asm.mov(qword_ptr(r8 + 8), rdx).unwrap();
+    asm.mov(qword_ptr(r8 + 16), rcx).unwrap();
+    asm.rdtscp().unwrap();
+    asm.mov(qword_ptr(r8 + 24), rax).unwrap();
+    asm.mov(qword_ptr(r8 + 32), rdx).unwrap();
+    asm.mov(qword_ptr(r8 + 40), rcx).unwrap();
+    asm.setc(byte_ptr(r8 + 48)).unwrap();
+    asm.ret().unwrap();
+    let code = arena_alloc(128, 16);
+    let data = arena_alloc(64, 16);
+    let bytes = asm.assemble(code as u64).unwrap();
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len()); }
+    let sample = || {
+        let before = jit::test_executed();
+        let (_, out) = unsafe { run_mode(code, data, &[0xff; 64], 1) };
+        assert_eq!(jit::test_executed() - before, 13, "timestamp block fell back to the interpreter");
+        let word = |n: usize| u64::from_le_bytes(out[n..n + 8].try_into().unwrap());
+        assert_eq!((word(16), word(40), out[48]), (u64::MAX, 0, 1));
+        assert!([0, 8, 24, 32].iter().all(|&n| word(n) <= u32::MAX as u64));
+        (word(8) << 32 | word(0), word(32) << 32 | word(24))
+    };
+    jit::test_dump_start();
+    assert_eq!(with_frozen_tsc(sample), (GUEST_TSC, GUEST_TSC));
+    assert!(!jit::test_dump_take().is_empty());
+    jit::test_dump_start();
+    let before = guest_rdtscp();
+    let wall = Instant::now();
+    let (first, first_p) = sample();
+    let inner = Instant::now();
+    std::thread::sleep(Duration::from_millis(5));
+    let lower_ns = inner.elapsed().as_nanos() as u64;
+    let (last, last_p) = sample();
+    let upper_ns = wall.elapsed().as_nanos() as u64;
+    assert!(before <= first && first <= first_p && first_p <= last && last <= last_p && last_p <= guest_rdtscp());
+    if !tsc_is_frozen() {
+        let elapsed = last - first;
+        assert!(elapsed >= lower_ns.saturating_sub(10_000) && elapsed <= upper_ns + 10_000);
+    }
+    assert_eq!(with_frozen_tsc(sample), (GUEST_TSC, GUEST_TSC));
+    assert!(jit::test_dump_take().is_empty(), "changing clock mode recompiled the block");
+}

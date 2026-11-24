@@ -111,8 +111,9 @@ pub(super) struct JitScratch {
     pub aot_dir: usize,
     /// `lookup_*` misses served from [`Self::aot_dir`] (drained by [`JitCache::run`]).
     pub aot_probe_hits: u64,
-    /// Reserved padding (keeps `ymm_dirty` 2-byte aligned).
-    pub _pad_xmm: u8,
+    /// Non-zero when translated `rdtsc`/`rdtscp` must return deterministic [`crate::emu::GUEST_TSC`]
+    /// (populated from [`crate::emu::tsc_is_frozen`] at translated-code entry).
+    pub tsc_frozen: u8,
     /// Non-zero when `fast::Cpu::rset` should maintain `Cpu::last_bits` (mirrors `PORT_JIT_LAST_BITS` / verify).
     pub lb_on: u8,
     /// Bitmask of `Cpu::ymm_hi[0..16]` registers that may be non-zero (0 = all upper halves
@@ -144,7 +145,7 @@ impl Default for JitScratch {
             ctx_ras_cell: 0,
             aot_dir: 0,
             aot_probe_hits: 0,
-            _pad_xmm: 0,
+            tsc_frozen: 0,
             lb_on: 1,
             ymm_dirty: 0,
             mxcsr: 0x1F80,
@@ -771,6 +772,7 @@ const OFF_TEB: u32 = OFF_JX + offset_of!(JitScratch, teb) as u32;
 const OFF_RAS: u32 = OFF_JX + offset_of!(JitScratch, ras) as u32;
 const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
 const OFF_PROBEHITS: u32 = OFF_JX + offset_of!(JitScratch, aot_probe_hits) as u32;
+const OFF_TSC_FROZEN: u32 = OFF_JX + offset_of!(JitScratch, tsc_frozen) as u32;
 const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 #[cfg(test)]
@@ -779,6 +781,7 @@ const _: () = assert!(
     OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096
+        && OFF_TSC_FROZEN < 4096
         && OFF_YMM_DIRTY % 2 == 0
         && OFF_YMM_DIRTY < 2 * 4096
         && OFF_MXCSR % 4 == 0

@@ -54,17 +54,21 @@ regression benchmark for the universal crates.
 
 ## 3. Baseline Test Health
 
+`RDTSC` and `RDTSCP` expose a shared 1 GHz guest clock on Apple Silicon. Differential
+verification can replay a fixed timestamp, including in linked AOT blocks.
+[Guest timestamp semantics](DIAGNOSTICS.md#guest-timestamp-counter)
+
 The checked-in A64 catalog contains all 4,743 encoding forms in Arm's open-source
-September 2026 A-profile release. The offline emitter test matches 989 emitted words in
-491 cases to 390 encoding forms across 263 operation pages. Cases exercise all 190
-`Asm` methods as well as direct register and locked-memory NOT translation, stub frames
-and the static AOT host-call veneer. Clang independently assembled every expected word.
+September 2026 A-profile release. The offline emitter test matches 1,030 emitted words in
+496 cases to 392 encoding forms across 265 operation pages. Cases exercise all 193
+`Asm` methods, the full `RDTSC` and `RDTSCP` sequences, register and locked-memory NOT,
+stub frames, and the static AOT host-call veneer. Clang independently assembled every expected word.
 [Catalog, emitter matches and reproduction commands](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit)
 
 All universal suites run green on `aarch64-apple-darwin`:
 
-- `cargo factory-test -- --test-threads=1` — **476 passed, 3 ignored** with `PORT_A64_ENCODINGS`
-  set (`pe-image` 5, `dxil-metal` 20, `wwise-audio` 88, `x86-runtime` 277, `port-manifest` 10,
+- `cargo factory-test -- --test-threads=1` — **481 passed, 3 ignored** with `PORT_A64_ENCODINGS`
+  set (`pe-image` 5, `dxil-metal` 20, `wwise-audio` 88, `x86-runtime` 282, `port-manifest` 10,
   `port-factory` 45, `port-loader` 31).
 - `cargo test -p wwise-audio --features northlight --test real_data --target aarch64-apple-darwin` — **8 / 8** (+1 ignored full-5,009-bank scan; verifies real `Init.bnk` + `Global.bnk` BFloat16 `00 04 02 00` IR convolution and bus `1134869537` pass-through folding)
 - `cargo test -p dxil-metal --target aarch64-apple-darwin -- --test-threads=1` — **56 / 56** (incl. Mach-O `LC_UUID` converter fingerprinting, cross-suffix fallback cache hits, `is_cold_device()`/`PORT_PSO_CACHE` checks, 6/6 `worker_lifecycle` parent-`SIGKILL` watchdog tests + 2 doc-tests)

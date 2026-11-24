@@ -2,7 +2,7 @@
 //! shifts/rotates, bit tests, multiply/divide, atomics (`lock`, `cmpxchg8b`/`16b`), `cpuid`,
 //! `rdtsc`, descriptor-table stores, string ops, and fallback dispatch into `simd_mov` / `simd_fp`.
 
-use super::cpu::{cas128_full, Cpu, GUEST_TSC};
+use super::cpu::{cas128_full, Cpu};
 use super::{fast, mem};
 use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
@@ -784,16 +784,7 @@ impl Cpu {
                 cpu.last_bits[0] = 64;
                 cpu.last_bits[2] = 64;
             }
-            Mnemonic::Rdtsc | Mnemonic::Rdtscp => {
-                cpu.gpr[0] = GUEST_TSC & 0xffff_ffff;
-                cpu.gpr[2] = GUEST_TSC >> 32;
-                cpu.last_bits[0] = 64;
-                cpu.last_bits[2] = 64;
-                if mn == Mnemonic::Rdtscp {
-                    cpu.gpr[1] = 0; // IA32_TSC_AUX
-                    cpu.last_bits[1] = 64;
-                }
-            }
+            Mnemonic::Rdtsc | Mnemonic::Rdtscp => cpu.read_timestamp(mn == Mnemonic::Rdtscp),
             // Unprivileged x86-64 system-table / machine-status store instructions
             // (used by OS runtimes and integrity probes; legal in ring 3 when UMIP=0).
             Mnemonic::Sidt => {

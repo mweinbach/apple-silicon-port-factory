@@ -16,6 +16,7 @@
 //! - [`block_cache`]: per-thread `BlockCache`, `ThreadEmuState`, guest stack & `TLS_EMU`/`CUR_CPU`
 //! - [`interp`]: `emu_run*` entry points, `interp_burst`, and main `emu_run_region` loop
 //! - [`generic_ops`]: generic `iced-x86` instruction interpreter (`Cpu::exec_generic_ins`)
+//! - [`tsc`]: guest timestamp counter shared with standalone Rust AOT output
 //! - [`fast`], [`jit`], [`aot`], [`static_macho`], [`verify`], [`eh`], [`regfile`], [`simd_kernels`], [`simd_mov`], [`simd_fp`]
 
 mod block_cache;
@@ -33,6 +34,7 @@ mod routes;
 mod simd_fp;
 mod simd_kernels;
 mod simd_mov;
+mod tsc;
 #[cfg(target_arch = "aarch64")]
 mod jit;
 #[cfg(not(target_arch = "aarch64"))]
@@ -62,16 +64,19 @@ mod jit_bench;
 // Public & crate-internal API re-exports (preserving 100% of `crate::emu::*` paths)
 // ---------------------------------------------------------------------------------------------
 
-pub use block_cache::{current_guest_state, jit_warm, zero_guest_stack_unused};
+pub use block_cache::{current_guest_state, jit_warm, with_frozen_tsc, zero_guest_stack_unused};
 pub(crate) use block_cache::{
-    eh_emu_state, eh_set_emu_state, out_split, shadow_prepare, GUEST_ROOM_MIN,
+    eh_emu_state, eh_set_emu_state, out_split, shadow_prepare, tsc_is_frozen, GUEST_ROOM_MIN,
 };
 
 pub use cpu::{
-    guest_rdtsc, precise_faults, set_precise_faults, Cpu, GUEST_TSC, PRECISE_FAULT_DISPATCHES,
+    guest_rdtsc, guest_rdtscp, guest_tsc, precise_faults, set_precise_faults, Cpu,
+    PRECISE_FAULT_DISPATCHES,
 };
 #[cfg(test)]
 pub(crate) use cpu::set_precise_faults_local;
+
+pub use tsc::GUEST_TSC;
 
 pub use dispatch::{
     call_host_dispatched, call_host_for_va, call_host_with_xmm, call_va8, peek_incoming_rsp,

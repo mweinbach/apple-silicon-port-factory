@@ -63,10 +63,10 @@ impl H128 {
 
 /// Hash of the translator / decoder sources (embedded), the format and the `Cpu` layout:
 /// any change to them invalidates every cache, unrelated rebuilds keep them.
-pub(super) fn codegen_hash() -> u64 {
+pub(in crate::emu) fn codegen_hash() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        const SRC: [&[u8]; 29] = [
+        const SRC: [&[u8]; 30] = [
             include_bytes!("../jit.rs"),
             include_bytes!("../jit/emit.rs"),
             include_bytes!("../jit/cache.rs"),
@@ -88,6 +88,7 @@ pub(super) fn codegen_hash() -> u64 {
             include_bytes!("../routes.rs"),
             include_bytes!("../dispatch.rs"),
             include_bytes!("../cpu.rs"),
+            include_bytes!("../tsc.rs"),
             include_bytes!("../block_cache.rs"),
             include_bytes!("../interp.rs"),
             include_bytes!("../generic_ops.rs"),

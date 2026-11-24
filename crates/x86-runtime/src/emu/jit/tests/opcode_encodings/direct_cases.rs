@@ -11,11 +11,11 @@ use crate::emu::BLK_MAX_INSNS;
 use iced_x86::{Decoder, DecoderOptions};
 
 pub(super) fn register(cases: &mut Cases) {
-    register_not(cases);
+    register_translated_instructions(cases);
     register_stubs(cases);
 }
 
-fn register_not(cases: &mut Cases) {
+fn register_translated_instructions(cases: &mut Cases) {
     // Translate each guest instruction in isolation. These forms never branch to a shared stub.
     let stubs = StubAddrs {
         exit: 0,
@@ -127,6 +127,31 @@ fn register_not(cases: &mut Cases) {
             ("str_imm_gen", "str x2, [x16]"),
         ],
     );
+    let load_mode = format!("ldrb w0, [x15, #{}]", crate::emu::jit::OFF_TSC_FROZEN);
+    let clock = [
+        ("ldrb_imm", load_mode.as_str()),
+        ("cbnz", "cbnz w0, #52"),
+        ("mrs", "mrs x0, cntvct_el0"),
+        ("mrs", "mrs x1, cntfrq_el0"),
+        ("cbz", "cbz x1, #44"),
+        ("movz", "movz x2, #0xca00"),
+        ("movk", "movk x2, #0x3b9a, lsl #16"),
+        ("udiv", "udiv x3, x0, x1"),
+        ("msub", "msub x0, x3, x1, x0"),
+        ("mul_madd", "mul x0, x0, x2"),
+        ("mul_madd", "mul x3, x3, x2"),
+        ("udiv", "udiv x0, x0, x1"),
+        ("add_addsub_shift", "add x0, x3, x0"),
+        ("b_uncond", "b #8"),
+        ("movz", "movz x0, #0x1000"),
+        ("mov_orr_log_shift", "mov w19, w0"),
+        ("lsr_ubfm", "lsr x21, x0, #32"),
+    ];
+    check("rdtsc", &[0x0f, 0x31], &clock);
+    let mut ordered = vec![("dsb", "dsb ishld"), ("isb", "isb")];
+    ordered.extend_from_slice(&clock);
+    ordered.push(("movz", "movz x20, #0"));
+    check("rdtscp", &[0x0f, 0x01, 0xf9], &ordered);
 }
 
 fn register_stubs(cases: &mut Cases) {

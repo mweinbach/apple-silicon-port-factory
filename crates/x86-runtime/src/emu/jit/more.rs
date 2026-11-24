@@ -442,9 +442,37 @@ impl Tr<'_> {
                         self.set_lb(2, 64);
                     }
                     8 => {
-                        // Rdtsc / Rdtscp
-                        self.a.movz(true, g(0), 0x1000, 0);
-                        self.a.movz(true, g(2), 0, 0);
+                        // Rdtsc (w == 0) / Rdtscp (w != 0):
+                        // Runtime clock mode via `Cpu::jx.tsc_frozen` so cached JIT/AOT/static-PIC
+                        // blocks run in either live 1 GHz or deterministic `GUEST_TSC` (0x1000)
+                        // mode without clobbering host NZCV flags or caching host pointers/freq.
+                        if w != 0 {
+                            // RDTSCP orders prior loads even when the verifier freezes the value.
+                            self.a.dsb_ishld();
+                            self.a.isb();
+                        }
+                        self.a.ldr(8, T0, XCPU, OFF_TSC_FROZEN);
+                        let frozen = self.a.cbnz(false, T0);
+                        // Exact 1 GHz conversion: floor(CNTVCT_EL0 * 1_000_000_000 / CNTFRQ_EL0)
+                        // mod 2^64 via Euclidean split `v = q*f + r` (`0 <= r < f < 2^32`, so
+                        // `r * 1e9 < 4.3e18 < 2^64` never overflows for any 64-bit `CNTVCT_EL0`).
+                        self.a.mrs_cntvct(T0);
+                        self.a.mrs_cntfrq(T1);
+                        let freq_zero = self.a.cbz(true, T1);
+                        self.a.mov_imm(true, T2, crate::emu::tsc::TSC_NOMINAL_HZ);
+                        self.a.udiv(true, T3, T0, T1);
+                        self.a.msub(true, T0, T3, T1, T0);
+                        self.a.mul(true, T0, T0, T2);
+                        self.a.mul(true, T3, T3, T2);
+                        self.a.udiv(true, T0, T0, T1);
+                        self.a.addsub_rr(true, false, false, T0, T3, T0, 0);
+                        let done = self.a.b();
+                        self.a.bind(frozen);
+                        self.a.mov_imm(true, T0, crate::emu::GUEST_TSC);
+                        self.a.bind(freq_zero);
+                        self.a.bind(done);
+                        self.a.mov_rr(false, g(0), T0);
+                        self.a.lsr_i(true, g(2), T0, 32);
                         self.set_lb(0, 64);
                         self.set_lb(2, 64);
                         if w != 0 {

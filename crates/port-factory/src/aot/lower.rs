@@ -1245,14 +1245,14 @@ fn lower_instruction_inner(
         Mnemonic::Rdtsc => {
             writeln!(
                 out,
-                "                    {{ let _t = aot_read_tsc(); rax = _t & 0xFFFF_FFFF; rdx = _t >> 32; }}"
+                "                    {{ let _t = aot_read_tsc(false); rax = _t & 0xFFFF_FFFF; rdx = _t >> 32; }}"
             )?;
             return Ok(true);
         }
         Mnemonic::Rdtscp => {
             writeln!(
                 out,
-                "                    {{ let _t = aot_read_tsc(); rax = _t & 0xFFFF_FFFF; rdx = _t >> 32; rcx = 0; }}"
+                "                    {{ let _t = aot_read_tsc(true); rax = _t & 0xFFFF_FFFF; rdx = _t >> 32; rcx = 0; }}"
             )?;
             return Ok(true);
         }
@@ -1498,6 +1498,8 @@ mod tests {
         Snip { name: "rep_stosd", code: &[0xF3, 0xAB], asm: &["rep stosd"], exact: true },
         Snip { name: "movsd_str", code: &[0xA5], asm: &["movsd"], exact: true },
         Snip { name: "mfence", code: &[0x0F, 0xAE, 0xF0], asm: &["mfence"], exact: true },
+        Snip { name: "rdtsc_op", code: &[0x0F, 0x31], asm: &["rdtsc"], exact: true },
+        Snip { name: "rdtscp_op", code: &[0x0F, 0x01, 0xF9], asm: &["rdtscp"], exact: true },
         // Approximations must report Ok(false).
         Snip { name: "addss_unimpl", code: &[0xF3, 0x0F, 0x58, 0xC1], asm: &["addss xmm0,xmm1"], exact: false },
         Snip { name: "setp_al", code: &[0x0F, 0x9A, 0xC0], asm: &["setp al"], exact: false },
@@ -1588,6 +1590,33 @@ fn main() {
         cas8b(&mut st); assert!(st.zf); assert_eq!(m[0], 0x0000_0004_0000_0003);
         st.r[RDX] = 2; st.r[RAX] = 1; cas8b(&mut st); assert!(!st.zf); assert_eq!((st.r[RAX], st.r[RDX]), (3, 4));
         mfence(&mut st);
+
+        // Read the generated clock before installing a host reader, as a standalone crate would.
+        st.r[RCX] = u64::MAX;
+        st.cf = true;
+        rdtsc_op(&mut st);
+        let start = (st.r[RDX] << 32) | st.r[RAX];
+        assert_eq!(st.r[RCX], u64::MAX);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        rdtscp_op(&mut st);
+        let end = (st.r[RDX] << 32) | st.r[RAX];
+        assert!(end - start >= 1_000_000);
+        assert_eq!(st.r[RCX], 0);
+        assert!(st.cf);
+
+        // A loaded dylib samples the host exactly once with the instruction's ordering.
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        extern "C" fn host_clock(ordered: bool) -> u64 {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if ordered { 0xfedc_ba98_7654_3210 } else { 0x0123_4567_89ab_cdef }
+        }
+        aw2_aot_set_tsc_reader(host_clock);
+        st.r[RCX] = u64::MAX;
+        rdtsc_op(&mut st);
+        assert_eq!((st.r[RDX], st.r[RAX], st.r[RCX]), (0x0123_4567, 0x89ab_cdef, u64::MAX));
+        rdtscp_op(&mut st);
+        assert_eq!((st.r[RDX], st.r[RAX], st.r[RCX]), (0xfedc_ba98, 0x7654_3210, 0));
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 2);
 
         // ---- multi-threaded contention ----
         const THREADS: usize = 8;
@@ -1703,7 +1732,10 @@ fn main() {
             .status()
             .expect("invoke rustc");
         assert!(status.success(), "rustc failed for {extra:?}");
-        let out = Command::new(bin).output().expect("run AOT semantics binary");
+        let out = Command::new(bin)
+            .env_remove("AW2_EMU_VERIFY")
+            .output()
+            .expect("run AOT semantics binary");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(

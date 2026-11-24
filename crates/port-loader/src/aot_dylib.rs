@@ -77,6 +77,13 @@ pub(crate) fn load_aot_dylibs(mods: &[Arc<Module>]) {
                                 Some(std::mem::transmute(fully_lowered_sym))
                             };
                         set_base(mod_base);
+                        // New generated dylibs inherit scoped verification and shadow-child time.
+                        let set_clock = libc::dlsym(handle, c"aw2_aot_set_tsc_reader".as_ptr());
+                        if !set_clock.is_null() {
+                            let install: extern "C" fn(extern "C" fn(bool) -> u64) =
+                                std::mem::transmute(set_clock);
+                            install(x86_runtime::emu::guest_tsc);
+                        }
                         let count = get_count();
                         let mut registered = 0usize;
                         let mut skipped_partial = 0usize;

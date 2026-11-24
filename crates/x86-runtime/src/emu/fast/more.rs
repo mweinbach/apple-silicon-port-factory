@@ -1273,17 +1273,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     cpu.last_bits[0] = 64;
                     cpu.last_bits[2] = 64;
                 }
-                8 => {
-                    // Rdtsc / Rdtscp (must match `GUEST_TSC` across interpreter, JIT, and lifted code)
-                    cpu.gpr[0] = crate::emu::GUEST_TSC & 0xFFFF_FFFF;
-                    cpu.gpr[2] = crate::emu::GUEST_TSC >> 32;
-                    cpu.last_bits[0] = 64;
-                    cpu.last_bits[2] = 64;
-                    if op.w != 0 {
-                        cpu.gpr[1] = 0;
-                        cpu.last_bits[1] = 64;
-                    }
-                }
+                8 => cpu.read_timestamp(op.w != 0), // RDTSC / RDTSCP
                 9 => {
                     // Cpuid
                     let leaf = cpu.gpr[0] as u32;

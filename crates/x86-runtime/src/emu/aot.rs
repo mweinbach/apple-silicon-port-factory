@@ -36,7 +36,7 @@ pub use callbacks::{
 pub(super) use cfg_discover::discover_blocks_for_verify;
 pub use format::aot_cached_preferred_base;
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(super) use format::{decode, AotKey};
+pub(super) use format::{codegen_hash, decode, AotKey};
 #[cfg(test)]
 pub(super) use format::encode_for_test;
 pub use runtime::{activate, module_mapped};

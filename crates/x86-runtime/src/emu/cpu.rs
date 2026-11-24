@@ -35,6 +35,18 @@ pub struct Cpu {
 }
 
 impl Cpu {
+    pub(super) fn read_timestamp(&mut self, ordered: bool) {
+        let t = guest_tsc(ordered);
+        self.gpr[0] = u64::from(t as u32);
+        self.gpr[2] = t >> 32;
+        self.last_bits[0] = 64;
+        self.last_bits[2] = 64;
+        if ordered {
+            self.gpr[1] = 0; // IA32_TSC_AUX
+            self.last_bits[1] = 64;
+        }
+    }
+
     /// Current guest x86-64 `MXCSR` register value.
     #[inline(always)]
     pub(crate) fn mxcsr(&self) -> u32 {
@@ -364,17 +376,22 @@ std::thread_local! {
 /// `_tlv_get_addr` call on every guest memory store.
 static PRECISE_FAULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The guest time-stamp counter: `rdtsc` / `rdtscp` return this constant (edx:eax; rdtscp
-/// ecx = TSC_AUX = 0) on every emulator path (interpreter, the fast path's generic fallback,
-/// and the JIT's inline `movz`, `jit_more.rs` kind 8, which must stay equal to it), and the
-/// lifted code's `rdtsc` ([`guest_rdtsc`], dll_lift). A real monotonic counter is a deferred,
-/// gameplay-visible option (g19 frontier_plan.md).
-pub const GUEST_TSC: u64 = 0x1000;
+/// Shared timestamp reader passed to generated Rust AOT dylibs at registration.
+#[inline]
+pub extern "C" fn guest_tsc(ordered: bool) -> u64 {
+    super::tsc::read_tsc(ordered, super::tsc_is_frozen())
+}
 
-/// [`GUEST_TSC`] for lifted code (`rdtsc` -> rdx:rax).
-#[inline(always)]
+/// Read the guest timestamp for lifted RDTSC code.
+#[inline]
 pub fn guest_rdtsc() -> u64 {
-    GUEST_TSC
+    guest_tsc(false)
+}
+
+/// Read the guest timestamp after prior loads for lifted RDTSCP code.
+#[inline]
+pub fn guest_rdtscp() -> u64 {
+    guest_tsc(true)
 }
 
 /// Turn precise guest faults on / off for runs that start afterwards (difftest child only).

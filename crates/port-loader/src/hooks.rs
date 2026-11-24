@@ -428,6 +428,10 @@ pub fn start_reporter() {
 /// Run every registry differential test (original via trampoline vs Rust).
 /// Returns (passed, failed). Entries without a `diff` function are skipped.
 pub fn run_difftests(set: Option<&x86_runtime::game_plugin::ReplacementSet>) -> (usize, usize) {
+    x86_runtime::emu::with_frozen_tsc(|| run_difftests_with_frozen_clock(set))
+}
+
+fn run_difftests_with_frozen_clock(set: Option<&x86_runtime::game_plugin::ReplacementSet>) -> (usize, usize) {
     // AOT translation caches for the mapped images (AW2_DLL_AOT / AW2_DLL_AOT_BUILD).
     x86_runtime::emu::aot_activate();
     let _ = win32_rt::teb::map_kuser_shared_data();

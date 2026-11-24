@@ -242,6 +242,11 @@ pub fn emit_macho_object_from_aot_bytes(
     let Some((module_name, key, img, _flags)) = aot::decode(aot_bytes) else {
         return Err("invalid or corrupted .aot input (checksum/header verification failed)".into());
     };
+    if key.codegen_hash != aot::codegen_hash() {
+        return Err(format!(
+            "Prewarm {module_name} with this runtime before emitting a static object. The .aot cache uses an older code generator."
+        ));
+    }
     if img.blocks.is_empty() {
         return Err(format!("{module_name}: .aot image contains zero translated blocks"));
     }
@@ -949,9 +954,13 @@ mod tests {
             image_hash: [0xA1B2_C3D4_E5F6_0718, 0x9988_7766_5544_3322],
             image_base: base as u64,
             image_size: code_buf.len() as u64,
-            codegen_hash: 0xDEAD_BEEF,
+            codegen_hash: aot::codegen_hash(),
             knobs: jit::aot_knob_bits(),
         };
+        let stale_key = aot::AotKey { codegen_hash: key.codegen_hash ^ 1, ..key };
+        let stale = aot::encode_for_test("unit_sum.dll", &stale_key, &img);
+        assert!(emit_macho_object_from_aot_bytes(&stale, MachoPlatform::Ios)
+            .unwrap_err().contains("Prewarm"));
         let aot_bytes = aot::encode_for_test("unit_sum.dll", &key, &img);
 
         for plat in [MachoPlatform::Ios, MachoPlatform::IosSimulator, MachoPlatform::MacOs] {
@@ -1052,7 +1061,7 @@ mod tests {
             image_hash: [0x5566_7788_99AA_BBCC, 0x1020_3040_5060_7080],
             image_base: base64,
             image_size: code_buf.len() as u64,
-            codegen_hash: 0xCAFE_BABE,
+            codegen_hash: aot::codegen_hash(),
             knobs: jit::aot_knob_bits(),
         };
         let aot_bytes = aot::encode_for_test("big_game.exe", &key, &img);
@@ -1210,7 +1219,7 @@ struct StaticAotModuleDesc {
 };
 static int g_ok = 0;
 void port_static_aot_register_desc(const struct StaticAotModuleDesc *d) {
-    if (d && d->magic == 0x53414F54u && d->version == 1 && d->code_base != 0 &&
+    if (d && d->magic == 0x53414F54u && d->version == 2 && d->code_base != 0 &&
         d->entries != 0 && d->entry_count > 0 && d->module_name &&
         strcmp(d->module_name, "big_game.exe") == 0) {
         g_ok = 1;

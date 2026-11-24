@@ -377,9 +377,19 @@ impl Asm {
     pub(super) fn dmb_ishst(&mut self) {
         self.emit(0xD503_3ABF);
     }
+    pub(super) fn dsb_ishld(&mut self) {
+        self.emit(0xD503_399F);
+    }
+    pub(super) fn isb(&mut self) {
+        self.emit(0xD503_3FDF);
+    }
     /// `mrs xt, cntvct_el0` (reads the virtual timer count directly without ISB).
     pub(super) fn mrs_cntvct(&mut self, t: u32) {
         self.emit(0xD53B_E040 | t);
+    }
+    /// `mrs xt, cntfrq_el0` (reads the execution host's counter frequency in Hz).
+    pub(super) fn mrs_cntfrq(&mut self, t: u32) {
+        self.emit(0xD53B_E000 | t);
     }
     /// `mrs xt, fpcr` (reads ARM64 floating-point control register).
     pub(super) fn mrs_fpcr(&mut self, t: u32) {

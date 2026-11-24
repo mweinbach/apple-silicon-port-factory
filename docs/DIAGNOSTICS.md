@@ -46,6 +46,23 @@ cargo opsdb -- verify-x86 /path/to/PhysX3_x64.dll --trials 4 --oracle --oracle-s
 cargo x86-verify /path/to/Game.exe --fp-only --rva 0x1000..0x200000
 ```
 
+#### Guest timestamp counter
+
+On Apple Silicon, `RDTSC` reads the Arm virtual counter and scales it to **1 GHz**, so
+one guest tick represents one nanosecond. Consecutive reads can return the same value when
+the host counter has coarser resolution. `RDTSCP` waits for earlier instructions and loads
+before reading the same clock. Both write the low and high 32 bits to EAX and EDX and
+preserve RFLAGS. `RDTSC` preserves RCX. `RDTSCP` writes zero to ECX because the runtime
+exposes one `TSC_AUX` value across guest threads.
+
+`verify-x86`, `--diff-test`, shadow comparisons, and `AW2_EMU_VERIFY=1` use a repeatable
+timestamp of `0x1000` so the same instruction can run twice and produce comparable register
+snapshots. `PORT_AOT_VERIFY=1` checks cached machine code and leaves the guest clock live.
+The runtime invalidates disk caches built with the old clock. Rebuild previously linked
+static `.aot.o` objects from the original PE with `port-runner --pe FILE --emit-static-o DIR`.
+Regenerate Rust AOT crates and dylibs with `cargo opsdb -- aot-crate FILE --out DIR` to
+pick up the live clock and the loader's differential-verification mode.
+
 #### Check the A64 words emitted by the JIT
 
 [The A64 catalog](../db/a64_encodings.tsv) contains all 4,429 instruction encodings and

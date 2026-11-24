@@ -320,6 +320,38 @@ pub(super) fn verify_enabled() -> bool {
     *V.get_or_init(|| std::env::var("AW2_EMU_VERIFY").is_ok_and(|s| s.trim() == "1"))
 }
 
+std::thread_local! {
+    static FROZEN_TSC: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Compare guest executions with a repeatable timestamp on this thread, including lifted calls.
+/// Nested comparisons restore their caller's clock mode, also on unwind.
+pub fn with_frozen_tsc<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FROZEN_TSC.set(self.0);
+        }
+    }
+    let _restore = Restore(FROZEN_TSC.replace(true));
+    run()
+}
+
+pub(crate) fn tsc_is_frozen() -> bool {
+    FROZEN_TSC.get() || win32_rt::shadow::in_child() || verify_enabled()
+}
+
+#[test]
+fn frozen_tsc_scope_is_thread_local_and_restored_on_unwind() {
+    assert!(!FROZEN_TSC.get());
+    with_frozen_tsc(|| {
+        assert!(std::panic::catch_unwind(|| with_frozen_tsc(|| panic!("end comparison"))).is_err());
+        assert!(FROZEN_TSC.get());
+        assert!(!std::thread::spawn(|| FROZEN_TSC.get()).join().unwrap());
+    });
+    assert!(!FROZEN_TSC.get());
+}
+
 pub(super) struct ThreadEmuState {
     pub(super) _stack: Box<[u64]>,
     pub(super) stack_min: u64,

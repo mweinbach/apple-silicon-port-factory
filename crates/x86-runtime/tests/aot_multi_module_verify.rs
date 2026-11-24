@@ -373,7 +373,17 @@ fn build_helper_dll(pe: &mut MappedBuf, host_va: u64, work_buf: u64) {
     for j in 0..EXTRA_HELPERS {
         let rva = 0x1400u32 + (j as u32) * 16;
         let mut a = CodeAssembler::new(64).unwrap();
-        a.lea(eax, ptr(rcx + (j as i32 + 1))).unwrap();
+        if j < 2 {
+            if j == 0 {
+                a.rdtsc().unwrap();
+            } else {
+                a.rdtscp().unwrap();
+            }
+            a.shl(rdx, 32).unwrap();
+            a.or(rax, rdx).unwrap();
+        } else {
+            a.lea(eax, ptr(rcx + (j as i32 + 1))).unwrap();
+        }
         a.ret().unwrap();
         let b = a.assemble(base + rva as u64).unwrap();
         buf[rva as usize..rva as usize + b.len()].copy_from_slice(&b);
@@ -709,6 +719,17 @@ fn multi_module_aot_prewarm_and_shifted_reload_under_port_aot_verify() {
 
             assert_eq!(run_matrix(exe2.base() as u64 + 0x1000), expected);
             assert_eq!(run_matrix(exe2.base() as u64 + 0x1000), expected);
+
+            // The same reloaded blocks must switch clock mode at execution time.
+            let entries = [0x1400, 0x1410].map(|rva| dll2.base() as u64 + rva);
+            assert!(entries.iter().all(|&ip| x86_runtime::emu::aot_has_block(ip)));
+            let clocks = || entries.map(|ip| unsafe { x86_runtime::emu::emu_run(ip, [0; 8]) });
+            let reference = x86_runtime::emu::GUEST_TSC;
+            assert_eq!(x86_runtime::emu::with_frozen_tsc(clocks), [reference; 2]);
+            let before = x86_runtime::emu::guest_rdtscp();
+            let [plain, ordered] = clocks();
+            let after = x86_runtime::emu::guest_rdtscp();
+            assert!(before <= plain && plain <= ordered && ordered <= after);
 
             x86_runtime::exe::unregister_native_va(h_memset_1);
             x86_runtime::exe::unregister_native_va(h_memset_2);

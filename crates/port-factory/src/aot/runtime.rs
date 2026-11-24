@@ -151,7 +151,8 @@ unsafe fn call_indirect_args(
 }}
 
 static SYSCALL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static TSC_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x0000_0100_0000_0000);
+
+static HOST_TSC_READER: std::sync::OnceLock<extern "C" fn(bool) -> u64> = std::sync::OnceLock::new();
 
 /// Register a host Windows NT syscall dispatcher (`fn(ssn, r10, rdx, r8, r9, rsp) -> i32`).
 pub fn set_syscall_hook(hook: unsafe extern "C" fn(u32, u64, u64, u64, u64, u64) -> i32) {{
@@ -159,8 +160,13 @@ pub fn set_syscall_hook(hook: unsafe extern "C" fn(u32, u64, u64, u64, u64, u64)
 }}
 
 #[inline(always)]
-fn aot_read_tsc() -> u64 {{
-    TSC_COUNTER.fetch_add(64, core::sync::atomic::Ordering::Relaxed)
+fn aot_read_tsc(ordered: bool) -> u64 {{
+    if let Some(read) = HOST_TSC_READER.get() {{
+        return read(ordered);
+    }}
+    static FROZEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let frozen = *FROZEN.get_or_init(|| std::env::var("AW2_EMU_VERIFY").is_ok_and(|s| s.trim() == "1"));
+    aot_tsc::read_tsc(ordered, frozen)
 }}
 
 #[inline(always)]
@@ -221,6 +227,9 @@ unsafe fn aot_nt_syscall(ssn: u32, r10: u64, rdx: u64, r8: u64, r9: u64, rsp: u6
 "#
     )?;
     out.push_str(AOT_TSO_ATOMICS_PRELUDE);
+    out.push_str("\nmod aot_tsc {\n");
+    out.push_str(include_str!("../../../x86-runtime/src/emu/tsc.rs"));
+    out.push_str("\n}\n");
     Ok(())
 }
 
@@ -380,6 +389,12 @@ pub extern "C" fn aw2_aot_lookup_rva(rva: u32) -> usize {{
 #[no_mangle]
 pub extern "C" fn aw2_aot_entry_fully_lowered(idx: usize) -> bool {{
     AOT_FUNCTIONS.get(idx).is_some_and(|e| e.fully_lowered)
+}}
+
+/// Use the loader's live or verifier clock on each call, including from guest threads.
+#[no_mangle]
+pub extern "C" fn aw2_aot_set_tsc_reader(reader: extern "C" fn(bool) -> u64) {{
+    let _ = HOST_TSC_READER.set(reader);
 }}
 "#
     )?;
