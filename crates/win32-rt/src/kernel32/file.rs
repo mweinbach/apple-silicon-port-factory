@@ -209,13 +209,13 @@ impl FileObj {
             .is_some_and(path::is_protected_host_remove_or_rename)
             || path::is_protected_fd(self.fd())
     }
-    /// Return the active raw POSIX fd for I/O, or a Win32 pipe state error if
-    /// this is an unconnected named-pipe server.
-    fn io_fd(&self) -> Result<i32, u32> {
+    /// Return the active raw POSIX fd and optional shared named-pipe connection owner
+    /// for pipe I/O, or a Win32 pipe state error if this is an unconnected named-pipe server.
+    fn io_pipe_target(&self) -> Result<PipeIoTarget, u32> {
         if let Some(ref srv) = self.named_pipe_server {
-            srv.io_fd()
+            srv.io_conn().map(PipeIoTarget::ServerConn)
         } else {
-            Ok(self.file.as_raw_fd())
+            Ok(PipeIoTarget::Direct(self.file.as_raw_fd()))
         }
     }
     fn cancel_pending_io(&self, h: HANDLE, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
@@ -1044,13 +1044,14 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
         return FALSE;
     }
     if f.kind == FileKind::Pipe {
-        let fd = match f.io_fd() {
-            Ok(fd) => fd,
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
             Err(e) => {
                 set_err(e);
                 return FALSE;
             }
         };
+        let fd = target.fd();
         let slice = if n == 0 {
             &mut [][..]
         } else {
@@ -1085,6 +1086,7 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                     pipe_reactor().submit(PendingPipeOp::new_read(
                         h,
                         Arc::clone(&f),
+                        target.conn(),
                         fd,
                         buf as usize,
                         n as usize,
@@ -1217,13 +1219,14 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
         return FALSE;
     }
     if f.kind == FileKind::Pipe {
-        let fd = match f.io_fd() {
-            Ok(fd) => fd,
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
             Err(e) => {
                 set_err(e);
                 return FALSE;
             }
         };
+        let fd = target.fd();
         if n == 0 {
             if !ov.is_null() {
                 complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, 0, true);
@@ -1252,6 +1255,7 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
                         pipe_reactor().submit(PendingPipeOp::new_write_at(
                             h,
                             Arc::clone(&f),
+                            target.conn(),
                             fd,
                             buf as usize,
                             total,
@@ -1374,13 +1378,14 @@ pub unsafe extern "win64" fn ReadFileEx(
     let caller_tid = teb::thread_id();
 
     if f.kind == FileKind::Pipe {
-        let fd = match f.io_fd() {
-            Ok(fd) => fd,
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
             Err(e) => {
                 set_err(e);
                 return FALSE;
             }
         };
+        let fd = target.fd();
         let slice = if n == 0 {
             &mut [][..]
         } else {
@@ -1418,6 +1423,7 @@ pub unsafe extern "win64" fn ReadFileEx(
                 pipe_reactor().submit(PendingPipeOp::new_read(
                     h,
                     Arc::clone(&f),
+                    target.conn(),
                     fd,
                     buf as usize,
                     n as usize,
@@ -1497,13 +1503,14 @@ pub unsafe extern "win64" fn WriteFileEx(
     let caller_tid = teb::thread_id();
 
     if f.kind == FileKind::Pipe {
-        let fd = match f.io_fd() {
-            Ok(fd) => fd,
+        let target = match f.io_pipe_target() {
+            Ok(t) => t,
             Err(e) => {
                 set_err(e);
                 return FALSE;
             }
         };
+        let fd = target.fd();
         if n == 0 {
             store_ov_internal_high(ov, 0);
             store_ov_internal(ov, STATUS_SUCCESS);
@@ -1534,6 +1541,7 @@ pub unsafe extern "win64" fn WriteFileEx(
                     pipe_reactor().submit(PendingPipeOp::new_write_at(
                         h,
                         Arc::clone(&f),
+                        target.conn(),
                         fd,
                         buf as usize,
                         total,
@@ -4979,14 +4987,70 @@ struct PipeOpState {
     written: usize,
 }
 
+/// Stable shared connection identity and fd owner for a single named-pipe server session.
+struct PipeConn {
+    file: File,
+    disconnected: AtomicBool,
+}
+
+impl PipeConn {
+    fn new(file: File) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            disconnected: AtomicBool::new(false),
+        })
+    }
+
+    fn fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    fn mark_disconnected(&self) {
+        if !self.disconnected.swap(true, Ordering::AcqRel) {
+            unsafe {
+                let _ = libc::shutdown(self.file.as_raw_fd(), libc::SHUT_RDWR);
+            }
+        }
+    }
+}
+
+enum PipeIoTarget {
+    Direct(i32),
+    ServerConn(Arc<PipeConn>),
+}
+
+impl PipeIoTarget {
+    fn fd(&self) -> i32 {
+        match self {
+            PipeIoTarget::Direct(fd) => *fd,
+            PipeIoTarget::ServerConn(c) => c.fd(),
+        }
+    }
+
+    fn conn(&self) -> Option<Arc<PipeConn>> {
+        match self {
+            PipeIoTarget::Direct(_) => None,
+            PipeIoTarget::ServerConn(c) => Some(Arc::clone(c)),
+        }
+    }
+}
+
 struct PendingPipeOp {
     handle: usize,
     file: Arc<FileObj>,
+    /// Shared named-pipe server connection when operating on a server pipe handle.
+    /// Retains the connection's `File` lifetime across in-flight reactor steps and lets
+    /// `DisconnectNamedPipe` cancel every op on the connection across duplicated handles.
+    conn: Option<Arc<PipeConn>>,
     fd: i32,
     kind: PipeOpKind,
     buf: usize,
     len: usize,
-    /// Serializes reactor guest-buffer I/O with cancellation (`CancelIo`/`CancelIoEx`/`CloseHandle`)
+    /// Serializes reactor guest-buffer I/O with cancellation (`CancelIo`/`CancelIoEx`/`CloseHandle`/`DisconnectNamedPipe`)
     /// so completion is published only after no reactor step can touch guest memory again.
     state: Mutex<PipeOpState>,
     /// Lock-free mirror of `state.completed` for `reactor.ops.retain` without nesting locks.
@@ -4995,10 +5059,19 @@ struct PendingPipeOp {
 }
 
 impl PendingPipeOp {
-    fn new_read(handle: HANDLE, file: Arc<FileObj>, fd: i32, buf: usize, len: usize, delivery: PipeDelivery) -> Arc<Self> {
+    fn new_read(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+        buf: usize,
+        len: usize,
+        delivery: PipeDelivery,
+    ) -> Arc<Self> {
         Arc::new(PendingPipeOp {
             handle: handle as usize,
             file,
+            conn,
             fd,
             kind: PipeOpKind::Read,
             buf,
@@ -5009,9 +5082,11 @@ impl PendingPipeOp {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_write_at(
         handle: HANDLE,
         file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
         fd: i32,
         buf: usize,
         len: usize,
@@ -5021,6 +5096,7 @@ impl PendingPipeOp {
         Arc::new(PendingPipeOp {
             handle: handle as usize,
             file,
+            conn,
             fd,
             kind: PipeOpKind::Write,
             buf,
@@ -5069,8 +5145,14 @@ impl PendingPipeOp {
     }
 }
 
+struct PipeReactorState {
+    ops: Vec<Arc<PendingPipeOp>>,
+    poll_gen: u64,
+}
+
 struct PipeIoReactor {
-    ops: Mutex<Vec<Arc<PendingPipeOp>>>,
+    state: Mutex<PipeReactorState>,
+    gen_cv: Condvar,
     wake_w: i32,
 }
 
@@ -5083,28 +5165,35 @@ impl PipeIoReactor {
     }
 
     fn submit(&self, op: Arc<PendingPipeOp>) {
-        self.ops.lock().unwrap().push(op);
-        self.poke();
+        let already_disconnected = {
+            let mut st = self.state.lock().unwrap();
+            if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                true
+            } else {
+                st.ops.push(Arc::clone(&op));
+                false
+            }
+        };
+        if already_disconnected {
+            let should_publish = {
+                let mut ost = op.state.lock().unwrap();
+                if ost.completed {
+                    false
+                } else {
+                    ost.completed = true;
+                    op.done.store(true, Ordering::Release);
+                    true
+                }
+            };
+            if should_publish {
+                op.publish_completion(STATUS_CANCELLED, 0);
+            }
+        } else {
+            self.poke();
+        }
     }
 
-    fn cancel_ops(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
-        let to_cancel: Vec<Arc<PendingPipeOp>> = {
-            let mut ops = self.ops.lock().unwrap();
-            let mut matched = Vec::new();
-            let mut i = 0;
-            while i < ops.len() {
-                let o = &ops[i];
-                let h_ok = o.handle == handle;
-                let ov_ok = ov.map_or(true, |target| o.ov_addr() == target);
-                let tid_ok = filter_tid.map_or(true, |t| o.tid() == t);
-                if h_ok && ov_ok && tid_ok {
-                    matched.push(ops.swap_remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            matched
-        };
+    fn finish_cancelled_ops(&self, to_cancel: Vec<Arc<PendingPipeOp>>) -> usize {
         let mut count = 0;
         for op in to_cancel {
             // Wait for any in-progress reactor non-blocking I/O step on `op.buf` to finish
@@ -5124,8 +5213,69 @@ impl PipeIoReactor {
                 count += 1;
             }
         }
+        count
+    }
+
+    fn cancel_ops(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
+        let to_cancel: Vec<Arc<PendingPipeOp>> = {
+            let mut st = self.state.lock().unwrap();
+            let mut matched = Vec::new();
+            let mut i = 0;
+            while i < st.ops.len() {
+                let o = &st.ops[i];
+                let h_ok = o.handle == handle;
+                let ov_ok = ov.map_or(true, |target| o.ov_addr() == target);
+                let tid_ok = filter_tid.map_or(true, |t| o.tid() == t);
+                if h_ok && ov_ok && tid_ok {
+                    matched.push(st.ops.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            matched
+        };
+        let count = self.finish_cancelled_ops(to_cancel);
         if count > 0 {
             self.poke();
+        }
+        count
+    }
+
+    /// Cancel and synchronize every pending or in-flight operation bound to `conn`
+    /// across all duplicated numeric handles, then wait one reactor cycle so any
+    /// reactor snapshot drops its `Arc<PipeConn>` reference promptly.
+    fn cancel_ops_for_conn(&self, conn: &Arc<PipeConn>) -> usize {
+        let (to_cancel, gen_before) = {
+            let mut st = self.state.lock().unwrap();
+            let mut matched = Vec::new();
+            let mut i = 0;
+            while i < st.ops.len() {
+                if st.ops[i]
+                    .conn
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, conn))
+                {
+                    matched.push(st.ops.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            (matched, st.poll_gen)
+        };
+        let count = self.finish_cancelled_ops(to_cancel);
+        self.poke();
+        let mut st = self.state.lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while st.poll_gen == gen_before {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let (next, res) = self.gen_cv.wait_timeout(st, rem).unwrap();
+            st = next;
+            if res.timed_out() {
+                break;
+            }
         }
         count
     }
@@ -5147,7 +5297,8 @@ fn pipe_reactor() -> &'static PipeIoReactor {
         }
         let wake_r = wake[0];
         let reactor: &'static PipeIoReactor = Box::leak(Box::new(PipeIoReactor {
-            ops: Mutex::new(Vec::new()),
+            state: Mutex::new(PipeReactorState { ops: Vec::new(), poll_gen: 0 }),
+            gen_cv: Condvar::new(),
             wake_w: wake[1],
         }));
         std::thread::Builder::new()
@@ -5160,9 +5311,11 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                     snap.clear();
                     pfds.push(libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 });
                     {
-                        let mut ops = reactor.ops.lock().unwrap();
-                        ops.retain(|o| !o.done.load(Ordering::Acquire));
-                        for o in ops.iter() {
+                        let mut st = reactor.state.lock().unwrap();
+                        st.poll_gen = st.poll_gen.wrapping_add(1);
+                        reactor.gen_cv.notify_all();
+                        st.ops.retain(|o| !o.done.load(Ordering::Acquire));
+                        for o in st.ops.iter() {
                             let events = match o.kind {
                                 PipeOpKind::Read => libc::POLLIN,
                                 PipeOpKind::Write => libc::POLLOUT,
@@ -5171,7 +5324,27 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                             snap.push(Arc::clone(o));
                         }
                     }
-                    let pr = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+                    // Check buffered FIFO peek bytes or disconnected server connections outside
+                    // `reactor.state` so locks never nest and buffered reads never stall in poll().
+                    let mut immediate_ready = false;
+                    for op in &snap {
+                        if op.done.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                            immediate_ready = true;
+                            break;
+                        }
+                        if matches!(op.kind, PipeOpKind::Read)
+                            && op.len > 0
+                            && !op.file.peek_buf.lock().unwrap().is_empty()
+                        {
+                            immediate_ready = true;
+                            break;
+                        }
+                    }
+                    let timeout_ms = if immediate_ready { 0 } else { -1 };
+                    let pr = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
                     if pr < 0 {
                         if last_errno() == libc::EINTR {
                             continue;
@@ -5183,16 +5356,28 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                         while unsafe { libc::read(wake_r, drain.as_mut_ptr() as *mut c_void, drain.len()) } > 0 {}
                     }
                     for (idx, op) in snap.iter().enumerate() {
+                        if op.done.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let revents = pfds[idx + 1].revents;
-                        if revents == 0 || op.done.load(Ordering::Acquire) {
+                        let is_disc = op.conn.as_ref().is_some_and(|c| c.is_disconnected());
+                        let has_peek = matches!(op.kind, PipeOpKind::Read)
+                            && op.len > 0
+                            && !op.file.peek_buf.lock().unwrap().is_empty();
+                        if revents == 0 && !is_disc && !has_peek {
                             continue;
                         }
                         // Hold `op.state` across the entire non-blocking guest buffer access so
-                        // `cancel_ops` cannot publish `STATUS_CANCELLED` while we touch `op.buf`.
+                        // `cancel_ops` / `cancel_ops_for_conn` cannot publish `STATUS_CANCELLED`
+                        // while we touch `op.buf`.
                         let finished: Option<(usize, usize)> = {
                             let mut st = op.state.lock().unwrap();
                             if st.completed {
                                 None
+                            } else if op.conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                                st.completed = true;
+                                op.done.store(true, Ordering::Release);
+                                Some((STATUS_CANCELLED, 0))
                             } else {
                                 let step_res: Option<(usize, usize)> = match op.kind {
                                     PipeOpKind::Read => {
@@ -5270,8 +5455,8 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                         };
                         if let Some((status, bytes)) = finished {
                             {
-                                let mut ops = reactor.ops.lock().unwrap();
-                                ops.retain(|o| !Arc::ptr_eq(o, op));
+                                let mut st = reactor.state.lock().unwrap();
+                                st.ops.retain(|o| !Arc::ptr_eq(o, op));
                             }
                             op.publish_completion(status, bytes);
                         }
@@ -5306,7 +5491,7 @@ fn normalize_pipe_name(name: &str) -> Option<String> {
 
 enum ServerPipeConn {
     Listening,
-    Connected(File),
+    Connected(Arc<PipeConn>),
     Disconnected,
 }
 
@@ -5339,15 +5524,15 @@ impl NamedPipeServer {
     fn connected_fd(&self) -> Option<i32> {
         let st = self.state.lock().unwrap();
         match &st.conn {
-            ServerPipeConn::Connected(f) => Some(f.as_raw_fd()),
+            ServerPipeConn::Connected(c) => Some(c.fd()),
             _ => None,
         }
     }
 
-    fn io_fd(&self) -> Result<i32, u32> {
+    fn io_conn(&self) -> Result<Arc<PipeConn>, u32> {
         let st = self.state.lock().unwrap();
         match &st.conn {
-            ServerPipeConn::Connected(f) => Ok(f.as_raw_fd()),
+            ServerPipeConn::Connected(c) => Ok(Arc::clone(c)),
             ServerPipeConn::Listening => Err(ERROR_PIPE_LISTENING),
             ServerPipeConn::Disconnected => Err(ERROR_PIPE_NOT_CONNECTED),
         }
@@ -5397,11 +5582,19 @@ impl NamedPipeServer {
     }
 
     fn close_server(self: &Arc<Self>) {
-        let pending = {
+        let (old_conn, pending) = {
             let mut st = self.state.lock().unwrap();
-            st.conn = ServerPipeConn::Disconnected;
-            st.pending_connect.take()
+            let prev = std::mem::replace(&mut st.conn, ServerPipeConn::Disconnected);
+            let conn = match prev {
+                ServerPipeConn::Connected(c) => Some(c),
+                _ => None,
+            };
+            (conn, st.pending_connect.take())
         };
+        if let Some(conn) = old_conn {
+            conn.mark_disconnected();
+            let _ = pipe_reactor().cancel_ops_for_conn(&conn);
+        }
         if let Some(pc) = pending {
             match pc {
                 PendingConnect::Sync { done, .. } => {
@@ -5473,7 +5666,7 @@ fn connect_named_pipe_client(
                 set_cloexec(fd);
                 set_nosigpipe_sock(fd);
             }
-            st.conn = ServerPipeConn::Connected(unsafe { File::from_raw_fd(fds[0]) });
+            st.conn = ServerPipeConn::Connected(PipeConn::new(unsafe { File::from_raw_fd(fds[0]) }));
             let pending = st.pending_connect.take();
             drop(st);
 
@@ -5573,8 +5766,8 @@ pub unsafe extern "win64" fn PeekNamedPipe(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    let fd = match f.io_fd() {
-        Ok(fd) => fd,
+    let target = match f.io_pipe_target() {
+        Ok(t) => t,
         Err(ERROR_PIPE_LISTENING) => {
             if !read.is_null() {
                 std::ptr::write_unaligned(read, 0);
@@ -5592,77 +5785,150 @@ pub unsafe extern "win64" fn PeekNamedPipe(
             return FALSE;
         }
     };
+    let fd = target.fd();
 
-    let mut pb = f.peek_buf.lock().unwrap();
     let want = if !buf.is_null() && size > 0 { size as usize } else { 0 };
-    if pb.len() < want {
-        let need = want - pb.len();
-        let mut tmp = vec![0u8; need];
-        match try_nonblocking_pipe_read(fd, tmp.as_mut_ptr(), need) {
-            Ok(Some(0)) => {
-                if pb.is_empty() {
-                    set_err(err::ERROR_BROKEN_PIPE);
-                    return FALSE;
+    let mut buffered_new_fifo_bytes = false;
+    let res: Result<(usize, usize), u32> = (|| {
+        let mut pb = f.peek_buf.lock().unwrap();
+        let mut copied = 0usize;
+        let mut peeked_kernel = 0usize;
+
+        if want > 0 {
+            let from_pb = pb.len().min(want);
+            let dst = buf as *mut u8;
+            for i in 0..from_pb {
+                std::ptr::write_unaligned(dst.add(i), pb[i]);
+            }
+            copied = from_pb;
+
+            if want > from_pb {
+                let need = want - from_pb;
+                // Prefer non-consuming MSG_PEEK on socketpair-backed pipes so pending overlapped
+                // reads on the same pipe continue seeing kernel readiness and all bytes intact.
+                let mut is_raw_fifo = false;
+                loop {
+                    let r = libc::recv(
+                        fd,
+                        dst.add(from_pb) as *mut c_void,
+                        need,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    );
+                    if r > 0 {
+                        peeked_kernel = r as usize;
+                        copied = from_pb + peeked_kernel;
+                        break;
+                    }
+                    if r == 0 {
+                        if pb.is_empty() {
+                            return Err(err::ERROR_BROKEN_PIPE);
+                        }
+                        break;
+                    }
+                    let e = last_errno();
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                        break;
+                    }
+                    if e == libc::ENOTSOCK {
+                        is_raw_fifo = true;
+                        break;
+                    }
+                    if pb.is_empty() {
+                        return Err(if e == libc::EPIPE || e == libc::ECONNRESET {
+                            err::ERROR_BROKEN_PIPE
+                        } else {
+                            errno_to_win32(e)
+                        });
+                    }
+                    break;
                 }
-            }
-            Ok(Some(got)) => {
-                pb.extend(&tmp[..got]);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                if pb.is_empty() {
-                    set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
-                    return FALSE;
+
+                if is_raw_fifo {
+                    // Raw POSIX FIFO fallback: MSG_PEEK is unavailable, so buffer peeked bytes
+                    // into `f.peek_buf` and wake `pipe_reactor()` after releasing `pb`.
+                    let mut tmp = vec![0u8; need];
+                    match try_nonblocking_pipe_read(fd, tmp.as_mut_ptr(), need) {
+                        Ok(Some(0)) => {
+                            if pb.is_empty() {
+                                return Err(err::ERROR_BROKEN_PIPE);
+                            }
+                        }
+                        Ok(Some(got)) => {
+                            pb.extend(&tmp[..got]);
+                            buffered_new_fifo_bytes = true;
+                            for i in from_pb..pb.len().min(want) {
+                                std::ptr::write_unaligned(dst.add(i), pb[i]);
+                            }
+                            copied = pb.len().min(want);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if pb.is_empty() {
+                                return Err(if e == libc::EPIPE || e == libc::ECONNRESET {
+                                    err::ERROR_BROKEN_PIPE
+                                } else {
+                                    errno_to_win32(e)
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        let mut kernel_avail: libc::c_int = 0;
+        let fionread_ok = libc::ioctl(fd, libc::FIONREAD, &mut kernel_avail) == 0;
+        if !fionread_ok {
+            if pb.is_empty() && peeked_kernel == 0 {
+                return Err(err::ERROR_BROKEN_PIPE);
+            }
+            kernel_avail = 0;
+        }
+        let total_avail = pb
+            .len()
+            .saturating_add((kernel_avail.max(0) as usize).max(peeked_kernel));
+
+        // If nothing buffered in userspace or kernel, detect peer close (POLLHUP / EOF) as ERROR_BROKEN_PIPE.
+        if total_avail == 0 {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let pr = libc::poll(&mut pfd, 1, 0);
+            if pr > 0 {
+                if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                    return Err(err::ERROR_BROKEN_PIPE);
+                }
+                if (pfd.revents & libc::POLLIN) != 0 {
+                    let mut probe = 0u8;
+                    let rr = libc::recv(
+                        fd,
+                        &mut probe as *mut u8 as *mut c_void,
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    );
+                    if rr == 0 {
+                        return Err(err::ERROR_BROKEN_PIPE);
+                    }
+                }
+            }
+        }
+
+        Ok((copied, total_avail))
+    })();
+
+    if buffered_new_fifo_bytes {
+        // Wake the pipe reactor outside `f.peek_buf` so any pending FIFO read immediately
+        // drains the newly buffered bytes without waiting for another write.
+        pipe_reactor().poke();
     }
 
-    let mut kernel_avail: libc::c_int = 0;
-    let fionread_ok = libc::ioctl(fd, libc::FIONREAD, &mut kernel_avail) == 0;
-    if !fionread_ok {
-        if pb.is_empty() {
-            set_err(err::ERROR_BROKEN_PIPE);
+    let (copied, total_avail) = match res {
+        Ok(v) => v,
+        Err(e) => {
+            set_err(e);
             return FALSE;
         }
-        kernel_avail = 0;
-    }
-    let total_avail = pb.len().saturating_add(kernel_avail.max(0) as usize);
-
-    // If nothing buffered in userspace or kernel, detect peer close (POLLHUP / EOF) as ERROR_BROKEN_PIPE.
-    if total_avail == 0 {
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let pr = libc::poll(&mut pfd, 1, 0);
-        if pr > 0 {
-            if (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-                set_err(err::ERROR_BROKEN_PIPE);
-                return FALSE;
-            }
-            if (pfd.revents & libc::POLLIN) != 0 {
-                let mut probe = 0u8;
-                let rr = libc::recv(
-                    fd,
-                    &mut probe as *mut u8 as *mut c_void,
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                );
-                if rr == 0 {
-                    set_err(err::ERROR_BROKEN_PIPE);
-                    return FALSE;
-                }
-            }
-        }
-    }
-
-    let copied = if want > 0 {
-        let k = pb.len().min(want);
-        let dst = buf as *mut u8;
-        for i in 0..k {
-            std::ptr::write_unaligned(dst.add(i), pb[i]);
-        }
-        k
-    } else {
-        0
     };
 
     if !read.is_null() {
@@ -5825,11 +6091,29 @@ pub unsafe extern "win64" fn DisconnectNamedPipe(h: HANDLE) -> BOOL {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
-    let _ = pipe_reactor().cancel_ops(h as usize, None, None);
+    // Transition through `Disconnected` first so no new client can attach while we cancel
+    // and drain all operations belonging to the old shared connection across every duplicate handle.
+    let old_conn = {
+        let mut st = srv.state.lock().unwrap();
+        let prev = std::mem::replace(&mut st.conn, ServerPipeConn::Disconnected);
+        match prev {
+            ServerPipeConn::Connected(c) => Some(c),
+            _ => None,
+        }
+    };
+    if let Some(conn) = old_conn {
+        conn.mark_disconnected();
+        let _ = pipe_reactor().cancel_ops_for_conn(&conn);
+        drop(conn);
+    } else {
+        let _ = pipe_reactor().cancel_ops(h as usize, None, None);
+    }
     f.peek_buf.lock().unwrap().clear();
     {
         let mut st = srv.state.lock().unwrap();
-        st.conn = ServerPipeConn::Listening;
+        if matches!(st.conn, ServerPipeConn::Disconnected) {
+            st.conn = ServerPipeConn::Listening;
+        }
     }
     if let Some(entry) = named_pipe_registry().lock().unwrap().get(&srv.norm_name).cloned() {
         entry.cv.notify_all();
@@ -8348,5 +8632,344 @@ mod tests {
         assert_eq!(std::fs::read(&host_aot_file).unwrap(), b"AOT2");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peek_named_pipe_preserves_bytes_for_pending_reads_socketpair_and_raw_fifo() {
+        use crate::kernel32::threads::CloseHandle;
+        use crate::kernel32::time::SleepEx;
+        use std::sync::atomic::AtomicUsize;
+
+        const WAIT_IO_COMPLETION: u32 = 0xC0;
+        static PEEK_APC_BYTES: AtomicUsize = AtomicUsize::new(0);
+        static PEEK_APC_ERR: AtomicUsize = AtomicUsize::new(usize::MAX);
+        unsafe extern "win64" fn peek_apc_cb(err_code: u32, bytes: u32, _ov: usize) {
+            PEEK_APC_ERR.store(err_code as usize, Ordering::Release);
+            PEEK_APC_BYTES.store(bytes as usize, Ordering::Release);
+        }
+
+        unsafe {
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            // 1. Socketpair-backed pipe (CreatePipe): PeekNamedPipe uses MSG_PEEK without
+            //    consuming kernel bytes or filling `peek_buf`, so repeated peeks see the same
+            //    data and a pending overlapped ReadFile completes with no second write.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            assert_eq!(CreateIoCompletionPort(rd, iocp, 0x9101, 0), iocp);
+
+            // Repeated peeks before any read must leave `peek_buf` empty and preserve exact counts.
+            let mut nw = 0u32;
+            let msg1 = b"PEEK-VISIBLE";
+            assert_eq!(WriteFile(wr, msg1.as_ptr() as *const c_void, msg1.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            for _ in 0..2 {
+                let mut pbuf = [0u8; 4];
+                let (mut pread, mut pavail, mut pleft) = (0u32, 0u32, 0u32);
+                assert_eq!(
+                    PeekNamedPipe(rd, pbuf.as_mut_ptr() as *mut c_void, 4, &mut pread, &mut pavail, &mut pleft),
+                    TRUE
+                );
+                assert_eq!(pread, 4);
+                assert_eq!(pavail, msg1.len() as u32);
+                assert_eq!(pleft, (msg1.len() - 4) as u32);
+                assert_eq!(&pbuf, b"PEEK");
+                assert!(
+                    get_file(rd).unwrap().peek_buf.lock().unwrap().is_empty(),
+                    "socketpair PeekNamedPipe must not consume kernel bytes into peek_buf"
+                );
+            }
+            let mut rbuf1 = [0u8; 32];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(rd, rbuf1.as_mut_ptr() as *mut c_void, rbuf1.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&rbuf1[..nr as usize], msg1);
+
+            // Pending overlapped ReadFile + write + immediate PeekNamedPipe (no second write!).
+            let mut ov_rd: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf2 = [0u8; 32];
+            assert_eq!(ReadFile(rd, rbuf2.as_mut_ptr() as *mut c_void, rbuf2.len() as u32, std::ptr::null_mut(), &mut ov_rd), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let msg2 = b"AFTER-PEEK";
+            assert_eq!(WriteFile(wr, msg2.as_ptr() as *const c_void, msg2.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut pbuf2 = [0u8; 16];
+            let (mut pread2, mut pavail2, mut pleft2) = (0u32, 0u32, 0u32);
+            let _ = PeekNamedPipe(rd, pbuf2.as_mut_ptr() as *mut c_void, 10, &mut pread2, &mut pavail2, &mut pleft2);
+
+            let (mut bytes, mut key, mut ov_out) = (0u32, 0usize, std::ptr::null_mut());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x9101);
+            assert_eq!(ov_out, &mut ov_rd as *mut OVERLAPPED);
+            assert_eq!(&rbuf2[..bytes as usize], msg2);
+
+            // Pending ReadFileEx (APC) also completes cleanly after PeekNamedPipe with no second write.
+            PEEK_APC_BYTES.store(0, Ordering::Release);
+            PEEK_APC_ERR.store(usize::MAX, Ordering::Release);
+            let mut ov_apc: OVERLAPPED = std::mem::zeroed();
+            let mut apc_buf = [0u8; 32];
+            assert_eq!(
+                ReadFileEx(rd, apc_buf.as_mut_ptr() as *mut c_void, apc_buf.len() as u32, &mut ov_apc, Some(peek_apc_cb)),
+                TRUE
+            );
+            let msg_apc = b"APC-PEEK";
+            assert_eq!(WriteFile(wr, msg_apc.as_ptr() as *const c_void, msg_apc.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let _ = PeekNamedPipe(rd, pbuf2.as_mut_ptr() as *mut c_void, 8, &mut pread2, &mut pavail2, &mut pleft2);
+            assert_eq!(SleepEx(2000, TRUE), WAIT_IO_COMPLETION);
+            assert_eq!(PEEK_APC_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(&apc_buf[..PEEK_APC_BYTES.load(Ordering::Acquire)], msg_apc);
+
+            assert_eq!(CloseHandle(wr), TRUE);
+            assert_eq!(PeekNamedPipe(rd, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut pavail2, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_BROKEN_PIPE);
+            assert_eq!(CloseHandle(rd), TRUE);
+
+            // 2. Raw POSIX FIFO (`libc::pipe`, ENOTSOCK fallback): PeekNamedPipe buffers into
+            //    `peek_buf` and wakes `pipe_reactor()`, so a pending overlapped ReadFile completes
+            //    deterministically without any further write.
+            let mut fds = [-1i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            set_cloexec(fds[0]);
+            set_cloexec(fds[1]);
+            let rd_fifo = wrap_non_owned_fd(fds[0], FileKind::Pipe, "\\\\.\\pipe\\raw_fifo".into(), GENERIC_READ);
+            assert_eq!(CreateIoCompletionPort(rd_fifo, iocp, 0x9102, 0), iocp);
+
+            // Repeated peeks on raw FIFO return identical data and counts before sync ReadFile drains.
+            let fifo_m1 = b"RAW-FIFO-1";
+            assert_eq!(libc::write(fds[1], fifo_m1.as_ptr() as *const c_void, fifo_m1.len()), fifo_m1.len() as isize);
+            for _ in 0..2 {
+                let mut fb = [0u8; 4];
+                let (mut r, mut a, mut l) = (0u32, 0u32, 0u32);
+                assert_eq!(PeekNamedPipe(rd_fifo, fb.as_mut_ptr() as *mut c_void, 4, &mut r, &mut a, &mut l), TRUE);
+                assert_eq!((r, a, l), (4, fifo_m1.len() as u32, (fifo_m1.len() - 4) as u32));
+                assert_eq!(&fb, b"RAW-");
+            }
+            let mut fdrain = [0u8; 32];
+            let mut got_sync = 0usize;
+            while got_sync < fifo_m1.len() {
+                let mut nread = 0u32;
+                assert_eq!(
+                    ReadFile(
+                        rd_fifo,
+                        fdrain[got_sync..].as_mut_ptr() as *mut c_void,
+                        (fdrain.len() - got_sync) as u32,
+                        &mut nread,
+                        std::ptr::null_mut(),
+                    ),
+                    TRUE
+                );
+                got_sync += nread as usize;
+            }
+            assert_eq!(&fdrain[..got_sync], fifo_m1);
+
+            // Now pend an overlapped ReadFile on the empty FIFO, write once, and PeekNamedPipe ALL
+            // bytes into `peek_buf`. Pending ReadFile must still wake and complete with no second write!
+            let mut ov_fifo: OVERLAPPED = std::mem::zeroed();
+            let mut fifo_out = [0u8; 32];
+            assert_eq!(
+                ReadFile(rd_fifo, fifo_out.as_mut_ptr() as *mut c_void, fifo_out.len() as u32, std::ptr::null_mut(), &mut ov_fifo),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let fifo_m2 = b"FIFO-DATA";
+            assert_eq!(libc::write(fds[1], fifo_m2.as_ptr() as *const c_void, fifo_m2.len()), fifo_m2.len() as isize);
+            let mut fpeek = [0u8; 16];
+            let (mut fr, mut fa, mut fl) = (0u32, 0u32, 0u32);
+            let _ = PeekNamedPipe(rd_fifo, fpeek.as_mut_ptr() as *mut c_void, fifo_m2.len() as u32, &mut fr, &mut fa, &mut fl);
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x9102);
+            assert_eq!(ov_out, &mut ov_fifo as *mut OVERLAPPED);
+            assert_eq!(&fifo_out[..bytes as usize], fifo_m2);
+
+            assert_eq!(CloseHandle(rd_fifo), TRUE);
+            assert_eq!(libc::close(fds[0]), 0);
+            assert_eq!(libc::close(fds[1]), 0);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn disconnect_named_pipe_cancels_duplicate_handle_io_and_isolates_reconnect() {
+        use crate::kernel32::process::GetCurrentProcess;
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+
+        unsafe {
+            let name = to_wide_z("\\\\.\\pipe\\aw2_disconnect_dup_conn_test");
+            let srv1 = CreateNamedPipeW(
+                name.as_ptr(),
+                0x0000_0003 | 0x4000_0000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv1, INVALID_HANDLE_VALUE);
+
+            let mut srv2: HANDLE = std::ptr::null_mut();
+            let cur_proc = GetCurrentProcess();
+            assert_eq!(
+                DuplicateHandle(cur_proc, srv1, cur_proc, &mut srv2, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */),
+                TRUE
+            );
+            assert!(!srv2.is_null());
+            assert_ne!(srv1, srv2);
+
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+            assert_eq!(CreateIoCompletionPort(srv1, iocp, 0x9201, 0), iocp);
+
+            // Connect client 1.
+            let cli1 = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli1, INVALID_HANDLE_VALUE);
+
+            // 1. Per-handle CancelIoEx remains scoped to the handle passed to it (srv2 only, not srv1).
+            let mut ov_srv1: OVERLAPPED = std::mem::zeroed();
+            let mut ov_srv2_cancel: OVERLAPPED = std::mem::zeroed();
+            let mut buf_srv1 = [0u8; 16];
+            let mut buf_srv2 = [0u8; 16];
+            assert_eq!(ReadFile(srv1, buf_srv1.as_mut_ptr() as *mut c_void, 16, std::ptr::null_mut(), &mut ov_srv1), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(ReadFile(srv2, buf_srv2.as_mut_ptr() as *mut c_void, 16, std::ptr::null_mut(), &mut ov_srv2_cancel), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            assert_eq!(CancelIoEx(srv2, std::ptr::null_mut()), TRUE);
+            let (mut bytes, mut key, mut ov_out) = (0u32, 0usize, std::ptr::null_mut());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(ov_out, &mut ov_srv2_cancel as *mut OVERLAPPED);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+
+            let msg_keep = b"FOR-SRV1";
+            let mut nw = 0u32;
+            assert_eq!(WriteFile(cli1, msg_keep.as_ptr() as *const c_void, msg_keep.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_srv1 as *mut OVERLAPPED);
+            assert_eq!(&buf_srv1[..bytes as usize], msg_keep);
+
+            // 2. Submit BOTH a pending overlapped read AND a pending backpressured overlapped write
+            //    through duplicate handle `srv2`, then call `DisconnectNamedPipe(srv1)`.
+            let mut old_rd_buf = [0x5Au8; 32];
+            let mut ov_dup_rd: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                ReadFile(srv2, old_rd_buf.as_mut_ptr() as *mut c_void, old_rd_buf.len() as u32, std::ptr::null_mut(), &mut ov_dup_rd),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // Large overlapped write on `srv2` fills the socketpair send buffer and pends.
+            let big_wr = vec![0xA5u8; 512 * 1024];
+            let mut ov_dup_wr: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFile(srv2, big_wr.as_ptr() as *const c_void, big_wr.len() as u32, std::ptr::null_mut(), &mut ov_dup_wr),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // Capture a reference to the active connection to also verify post-disconnect submit safety.
+            let old_conn = get_file(srv1)
+                .unwrap()
+                .named_pipe_server
+                .as_ref()
+                .unwrap()
+                .io_conn()
+                .unwrap();
+
+            // Disconnect through `srv1` — MUST cancel all ops on the shared connection (including `srv2`!).
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert!(old_conn.is_disconnected());
+
+            let mut saw_rd_abort = false;
+            let mut saw_wr_abort = false;
+            for _ in 0..2 {
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+                assert_eq!(key, 0x9201);
+                assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+                if ov_out == &mut ov_dup_rd as *mut OVERLAPPED {
+                    saw_rd_abort = true;
+                } else if ov_out == &mut ov_dup_wr as *mut OVERLAPPED {
+                    saw_wr_abort = true;
+                } else {
+                    panic!("unexpected overlapped {ov_out:p}");
+                }
+            }
+            assert!(saw_rd_abort && saw_wr_abort);
+
+            // Submitting an op bound to an already-disconnected `PipeConn` (racing with DisconnectNamedPipe)
+            // must immediately complete with ERROR_OPERATION_ABORTED and never target any new connection.
+            let mut late_buf = [0x33u8; 16];
+            let mut ov_late: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_late);
+            pipe_reactor().submit(PendingPipeOp::new_read(
+                srv2,
+                get_file(srv2).unwrap(),
+                Some(Arc::clone(&old_conn)),
+                old_conn.fd(),
+                late_buf.as_mut_ptr() as usize,
+                late_buf.len(),
+                PipeDelivery::Overlapped { ov: &mut ov_late as *mut OVERLAPPED as usize, tid: teb::thread_id() },
+            ));
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(ov_out, &mut ov_late as *mut OVERLAPPED);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            drop(old_conn);
+
+            // Drain/close client 1; once buffered bytes are drained, client 1 observes ERROR_BROKEN_PIPE.
+            assert_eq!(CloseHandle(cli1), TRUE);
+
+            // 3. Reconnect a brand new client through duplicate handle `srv2`: old buffers stay
+            //    untouched and the new connection exchanges data cleanly across both handles.
+            let mut ov_conn2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ConnectNamedPipe(srv2, &mut ov_conn2), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let cli2 = CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli2, INVALID_HANDLE_VALUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_conn2 as *mut OVERLAPPED);
+
+            let new_msg = b"NEW-CONN-DATA";
+            assert_eq!(WriteFile(cli2, new_msg.as_ptr() as *const c_void, new_msg.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut new_rd = [0u8; 32];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(srv1, new_rd.as_mut_ptr() as *mut c_void, new_rd.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&new_rd[..nr as usize], new_msg);
+            assert_eq!(old_rd_buf, [0x5Au8; 32], "disconnected op buffer must never receive bytes from new connection");
+            assert_eq!(late_buf, [0x33u8; 16], "late disconnected op buffer must remain untouched");
+
+            let srv_reply = b"SRV-TO-CLI2";
+            assert_eq!(WriteFile(srv2, srv_reply.as_ptr() as *const c_void, srv_reply.len() as u32, &mut nw, std::ptr::null_mut()), TRUE);
+            let mut cli2_rd = [0u8; 32];
+            assert_eq!(ReadFile(cli2, cli2_rd.as_mut_ptr() as *mut c_void, cli2_rd.len() as u32, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(&cli2_rd[..nr as usize], srv_reply);
+
+            // DisconnectNamedPipe on non-pipe handle fails honestly with ERROR_INVALID_HANDLE.
+            assert_eq!(DisconnectNamedPipe(iocp), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            assert_eq!(CloseHandle(cli2), TRUE);
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert_eq!(CloseHandle(srv2), TRUE);
+            assert_eq!(CloseHandle(srv1), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
     }
 }
