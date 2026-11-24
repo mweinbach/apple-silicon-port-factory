@@ -1498,16 +1498,11 @@ pub unsafe extern "win64" fn PathCchSkipRoot(psz_path: LPCWSTR, ppsz_root_end: *
 
 /// Default Win32 `PathCch` segment-name normalization: strip trailing spaces and
 /// periods from an ordinary segment, retaining a single trailing period only when
-/// immediately preceded by a wildcard character (`*` or `?`).
+/// immediately preceded by the `*` wildcard character.
 fn normalize_pathcch_segment(part: &str) -> &str {
     let trimmed = part.trim_end_matches([' ', '.']);
     let had_trailing_dot = part.as_bytes().get(trimmed.len()) == Some(&b'.');
-    if had_trailing_dot
-        && trimmed
-            .as_bytes()
-            .last()
-            .is_some_and(|&b| b == b'*' || b == b'?')
-    {
+    if had_trailing_dot && trimmed.as_bytes().last() == Some(&b'*') {
         &part[..trimmed.len() + 1]
     } else {
         trimmed
@@ -1879,9 +1874,11 @@ mod tests {
                 PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
                 "C:\\a\\b..\\c...\\d ",
             ),
-            // Windows wildcard rule: retain single trailing period immediately after '*' or '?'.
+            // Windows wildcard rule: retain a single trailing period immediately after '*' only.
             ("C:\\a", "*...", 0, "C:\\a\\*."),
-            ("C:\\a", "foo?. .", 0, "C:\\a\\foo?."),
+            ("C:\\a", "*.", 0, "C:\\a\\*."),
+            ("C:\\a", "foo?. .", 0, "C:\\a\\foo?"),
+            ("C:\\a", "foo?. .", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\a\\foo?. ."),
             ("C:\\a", "*...", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\a\\*..."),
             // Drive and UNC root boundaries preserved under default, 0x8, and 0x10.
             ("C:\\dir", "..\\..\\leaf", 0, "C:\\leaf"),
