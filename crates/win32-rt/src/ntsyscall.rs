@@ -88,9 +88,14 @@ pub struct SyscallDesc {
 
 pub static SYSCALL_TABLE: &[SyscallDesc] = &[
     SyscallDesc { ssn: ssn::NT_WAIT_FOR_SINGLE_OBJECT, name: "NtWaitForSingleObject", arg_count: 3 },
+    SyscallDesc { ssn: ssn::NT_READ_FILE, name: "NtReadFile", arg_count: 9 },
+    SyscallDesc { ssn: ssn::NT_WRITE_FILE, name: "NtWriteFile", arg_count: 9 },
+    SyscallDesc { ssn: ssn::NT_REMOVE_IO_COMPLETION, name: "NtRemoveIoCompletion", arg_count: 5 },
+    SyscallDesc { ssn: ssn::NT_RELEASE_SEMAPHORE, name: "NtReleaseSemaphore", arg_count: 3 },
     SyscallDesc { ssn: ssn::NT_SET_INFORMATION_THREAD, name: "NtSetInformationThread", arg_count: 4 },
     SyscallDesc { ssn: ssn::NT_SET_EVENT, name: "NtSetEvent", arg_count: 2 },
     SyscallDesc { ssn: ssn::NT_CLOSE, name: "NtClose", arg_count: 1 },
+    SyscallDesc { ssn: ssn::NT_QUERY_ATTRIBUTES_FILE, name: "NtQueryAttributesFile", arg_count: 2 },
     SyscallDesc { ssn: ssn::NT_ALLOCATE_VIRTUAL_MEMORY, name: "NtAllocateVirtualMemory", arg_count: 6 },
     SyscallDesc { ssn: ssn::NT_QUERY_INFORMATION_PROCESS, name: "NtQueryInformationProcess", arg_count: 5 },
     SyscallDesc { ssn: ssn::NT_SET_INFORMATION_PROCESS, name: "NtSetInformationProcess", arg_count: 4 },
@@ -101,6 +106,7 @@ pub static SYSCALL_TABLE: &[SyscallDesc] = &[
     SyscallDesc { ssn: ssn::NT_MAP_VIEW_OF_SECTION, name: "NtMapViewOfSection", arg_count: 10 },
     SyscallDesc { ssn: ssn::NT_UNMAP_VIEW_OF_SECTION, name: "NtUnmapViewOfSection", arg_count: 2 },
     SyscallDesc { ssn: ssn::NT_TERMINATE_PROCESS, name: "NtTerminateProcess", arg_count: 2 },
+    SyscallDesc { ssn: ssn::NT_CLEAR_EVENT, name: "NtClearEvent", arg_count: 1 },
     SyscallDesc { ssn: ssn::NT_QUERY_PERFORMANCE_COUNTER, name: "NtQueryPerformanceCounter", arg_count: 2 },
     SyscallDesc { ssn: ssn::NT_OPEN_FILE, name: "NtOpenFile", arg_count: 6 },
     SyscallDesc { ssn: ssn::NT_DELAY_EXECUTION, name: "NtDelayExecution", arg_count: 2 },
@@ -110,9 +116,11 @@ pub static SYSCALL_TABLE: &[SyscallDesc] = &[
     SyscallDesc { ssn: ssn::NT_READ_VIRTUAL_MEMORY, name: "NtReadVirtualMemory", arg_count: 5 },
     SyscallDesc { ssn: ssn::NT_CONTINUE, name: "NtContinue", arg_count: 2 },
     SyscallDesc { ssn: ssn::NT_YIELD_EXECUTION, name: "NtYieldExecution", arg_count: 0 },
+    SyscallDesc { ssn: ssn::NT_CREATE_EVENT, name: "NtCreateEvent", arg_count: 5 },
     SyscallDesc { ssn: ssn::NT_CREATE_SECTION, name: "NtCreateSection", arg_count: 7 },
     SyscallDesc { ssn: ssn::NT_PROTECT_VIRTUAL_MEMORY, name: "NtProtectVirtualMemory", arg_count: 5 },
     SyscallDesc { ssn: ssn::NT_CREATE_FILE, name: "NtCreateFile", arg_count: 11 },
+    SyscallDesc { ssn: ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS, name: "NtWaitForMultipleObjects", arg_count: 5 },
     SyscallDesc { ssn: ssn::NT_FLUSH_INSTRUCTION_CACHE, name: "NtFlushInstructionCache", arg_count: 3 },
     SyscallDesc { ssn: ssn::NT_CREATE_THREAD_EX, name: "NtCreateThreadEx", arg_count: 11 },
     SyscallDesc { ssn: ssn::NT_GET_CONTEXT_THREAD, name: "NtGetContextThread", arg_count: 2 },
@@ -373,20 +381,85 @@ pub unsafe extern "win64" fn dispatch_nt_syscall(
         ssn::NT_WAIT_FOR_SINGLE_OBJECT => {
             ntdll::NtWaitForSingleObject(r10 as HANDLE, rdx as u8, r8 as *const i64)
         }
-        ssn::NT_SET_EVENT => {
-            if crate::kernel32::threads::SetEvent(r10 as HANDLE) != 0 {
-                ntdll::STATUS_SUCCESS
-            } else {
-                ntdll::STATUS_INVALID_HANDLE
-            }
+        ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS => ntdll::NtWaitForMultipleObjects(
+            r10 as u32,
+            rdx as *const HANDLE,
+            r8 as u32,
+            r9 as u8,
+            a5 as *const i64,
+        ),
+        ssn::NT_RELEASE_SEMAPHORE => {
+            ntdll::NtReleaseSemaphore(r10 as HANDLE, rdx as i32, r8 as *mut i32)
         }
-        ssn::NT_CLEAR_EVENT => {
-            if crate::kernel32::threads::ResetEvent(r10 as HANDLE) != 0 {
-                ntdll::STATUS_SUCCESS
-            } else {
-                ntdll::STATUS_INVALID_HANDLE
-            }
+        ssn::NT_REMOVE_IO_COMPLETION => ntdll::NtRemoveIoCompletion(
+            r10 as HANDLE,
+            rdx as *mut usize,
+            r8 as *mut *mut c_void,
+            r9 as *mut u8,
+            a5 as *const i64,
+        ),
+        ssn::NT_READ_FILE => ntdll::NtReadFile(
+            r10 as HANDLE,
+            rdx as HANDLE,
+            r8 as *const c_void,
+            r9 as *mut c_void,
+            a5 as *mut u8,
+            a6 as *mut c_void,
+            stack_arg(rsp, 2) as u32,
+            stack_arg(rsp, 3) as *const i64,
+            stack_arg(rsp, 4) as *const u32,
+        ),
+        ssn::NT_WRITE_FILE => ntdll::NtWriteFile(
+            r10 as HANDLE,
+            rdx as HANDLE,
+            r8 as *const c_void,
+            r9 as *mut c_void,
+            a5 as *mut u8,
+            a6 as *const c_void,
+            stack_arg(rsp, 2) as u32,
+            stack_arg(rsp, 3) as *const i64,
+            stack_arg(rsp, 4) as *const u32,
+        ),
+        ssn::NT_QUERY_ATTRIBUTES_FILE => {
+            ntdll::NtQueryAttributesFile(r10 as *const c_void, rdx as *mut u8)
         }
+        ssn::NT_DUPLICATE_OBJECT => ntdll::NtDuplicateObject(
+            r10 as HANDLE,
+            rdx as HANDLE,
+            r8 as HANDLE,
+            r9 as *mut HANDLE,
+            a5 as u32,
+            a6 as u32,
+            stack_arg(rsp, 2) as u32,
+        ),
+        ssn::NT_CONTINUE => ntdll::nt_continue_with_callers(
+            r10 as *const crate::unwind::Context,
+            rdx as u8,
+            &[
+                dispatch_nt_syscall as *const () as usize,
+                ntdll::NtContinue as *const () as usize,
+                ntdll::ZwContinue as *const () as usize,
+            ],
+        ),
+        ssn::NT_RAISE_EXCEPTION => ntdll::nt_raise_exception_with_callers(
+            r10 as *mut crate::unwind::ExceptionRecord,
+            rdx as *mut crate::unwind::Context,
+            r8 as u8,
+            &[
+                dispatch_nt_syscall as *const () as usize,
+                ntdll::NtRaiseException as *const () as usize,
+                ntdll::ZwRaiseException as *const () as usize,
+            ],
+        ),
+        ssn::NT_CREATE_EVENT => ntdll::NtCreateEvent(
+            r10 as *mut HANDLE,
+            rdx as u32,
+            r8 as *const c_void,
+            r9 as u32,
+            a5 as u8,
+        ),
+        ssn::NT_SET_EVENT => ntdll::NtSetEvent(r10 as HANDLE, rdx as *mut i32),
+        ssn::NT_CLEAR_EVENT => ntdll::NtClearEvent(r10 as HANDLE),
         ssn::NT_TERMINATE_PROCESS => {
             if r10 == 0 || r10 == usize::MAX as u64 {
                 crate::process::exit_process(rdx as u32);
@@ -394,8 +467,26 @@ pub unsafe extern "win64" fn dispatch_nt_syscall(
             ntdll::STATUS_SUCCESS
         }
         _ => {
-            log::debug!("ntsyscall: unhandled direct syscall SSN=0x{ssn:04x} (r10=0x{r10:x}, rdx=0x{rdx:x})");
-            ntdll::STATUS_SUCCESS
+            warn_unhandled_ssn_once(ssn, sym_name, r10, rdx, r8, r9);
+            ntdll::STATUS_NOT_IMPLEMENTED
         }
+    }
+}
+
+fn warn_unhandled_ssn_once(ssn: u32, sym_name: &str, r10: u64, rdx: u64, r8: u64, r9: u64) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+        std::sync::Mutex::new(None);
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new).insert(ssn)
+    };
+    if first {
+        log::warn!(
+            "ntsyscall: unhandled direct syscall {sym_name} (SSN=0x{ssn:04x}, r10=0x{r10:x}, rdx=0x{rdx:x}, r8=0x{r8:x}, r9=0x{r9:x}) -> STATUS_NOT_IMPLEMENTED"
+        );
+    } else {
+        log::debug!(
+            "ntsyscall: unhandled direct syscall {sym_name} (SSN=0x{ssn:04x}, r10=0x{r10:x}, rdx=0x{rdx:x}) -> STATUS_NOT_IMPLEMENTED"
+        );
     }
 }

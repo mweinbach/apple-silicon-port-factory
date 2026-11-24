@@ -88,7 +88,10 @@ pub use dispatch::port_static_aot_host_xfer;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use dispatch::{call_host_dispatched_in, call_lean_in, shadow_lean_xmm, shadow_run_guest, shadow_run_lean};
 
-pub use interp::{emu_run, emu_run_full, emu_run_full_rax, emu_run_with_xmm};
+pub use interp::{
+    clear_fail_on_unimpl_op_override, emu_run, emu_run_full, emu_run_full_rax, emu_run_with_xmm,
+    fail_on_unimpl_op_enabled, parse_env_bool, set_fail_on_unimpl_op, EXIT_UNIMPL_OP,
+};
 #[cfg(test)]
 pub(crate) use interp::{test_last_steps, test_total_steps};
 

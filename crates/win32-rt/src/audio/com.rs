@@ -109,14 +109,12 @@ pub struct ComObj<V: 'static, T> {
     pub inner: T,
 }
 
+pub(crate) use crate::com::register_vtbl_struct;
+
 impl<V: 'static, T> ComObj<V, T> {
     /// Heap-allocate with refcount 1 and return the interface pointer.
     pub fn create(vtbl: &'static V, inner: T) -> *mut Self {
-        let count = std::mem::size_of::<V>() / std::mem::size_of::<usize>();
-        if count > 0 {
-            let slots = unsafe { std::slice::from_raw_parts(vtbl as *const V as *const usize, count) };
-            crate::com::register_vtable_ptrs(slots);
-        }
+        register_vtbl_struct(vtbl);
         Box::into_raw(Box::new(ComObj { vtbl, refs: AtomicU32::new(1), inner }))
     }
     pub unsafe fn add_ref(this: *mut Self) -> u32 {
@@ -148,7 +146,7 @@ macro_rules! com_iunknown {
                 ::std::ptr::write_unaligned(out, this as *mut ::std::ffi::c_void);
                 return $crate::types::S_OK;
             }
-            ::log::debug!(target: "audio", "{}: QueryInterface({:?}) -> E_NOINTERFACE", stringify!($ty), iid);
+            $crate::com::warn_qi_failed_once(stringify!($ty), &$crate::com::Guid::from_win_guid(iid));
             $crate::types::E_NOINTERFACE
         }
         pub(crate) unsafe extern "win64" fn add_ref(this: *mut $ty) -> u32 {

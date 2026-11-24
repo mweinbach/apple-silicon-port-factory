@@ -454,11 +454,9 @@ pub unsafe extern "win64" fn CoCreateInstance(
             return hr;
         }
     }
-    log::debug!(
-        "CoCreateInstance: unregistered COM class {} (iid {}) -> REGDB_E_CLASSNOTREG",
-        if clsid.is_null() { "NULL".into() } else { guid_string(clsid) },
-        if iid.is_null() { "NULL".into() } else { guid_string(iid) }
-    );
+    let clsid_g = read_guid_bytes(clsid).map(crate::com::Guid::from_bytes);
+    let iid_g = read_guid_bytes(iid).map(crate::com::Guid::from_bytes);
+    crate::com::warn_unknown_clsid_once("CoCreateInstance", clsid_g.as_ref(), iid_g.as_ref());
     REGDB_E_CLASSNOTREG
 }
 
@@ -574,6 +572,7 @@ unsafe extern "win64" fn ftm_unk_qi(this: *mut c_void, riid: *const u8, ppv: *mu
         }
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("FreeThreadedMarshaler", &crate::com::Guid::from_bytes(iid));
         E_NOINTERFACE
     }
 }
@@ -854,6 +853,7 @@ unsafe extern "win64" fn cf_qi(
         std::ptr::write_unaligned(ppv, this as *mut c_void);
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("IClassFactory", &crate::com::Guid::from_bytes(iid));
         E_NOINTERFACE
     }
 }
@@ -983,10 +983,9 @@ pub unsafe extern "win64" fn CoGetClassObject(
     if let Some(hr) = try_inproc_dll_get_class_object(&clsid, ctx, riid, out) {
         return hr;
     }
-    log::debug!(
-        "CoGetClassObject: unregistered COM class {} -> REGDB_E_CLASSNOTREG",
-        guid_string(rclsid)
-    );
+    let clsid_g = crate::com::Guid::from_bytes(clsid);
+    let iid_g = crate::com::Guid::from_bytes(iid);
+    crate::com::warn_unknown_clsid_once("CoGetClassObject", Some(&clsid_g), Some(&iid_g));
     REGDB_E_CLASSNOTREG
 }
 
@@ -1164,6 +1163,7 @@ unsafe extern "win64" fn stream_qi(
         std::ptr::write_unaligned(ppv, this as *mut c_void);
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("IStream", &crate::com::Guid::from_bytes(iid));
         E_NOINTERFACE
     }
 }
@@ -2345,6 +2345,7 @@ unsafe extern "win64" fn pvf_act_qi(
         std::ptr::write_unaligned(ppv, sec);
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("WinRTActivationFactory", &iid);
         E_NOINTERFACE
     }
 }
@@ -3210,6 +3211,7 @@ unsafe extern "win64" fn urif_act_qi(
         std::ptr::write_unaligned(ppv, sec);
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("WinRTActivationFactory", &iid);
         E_NOINTERFACE
     }
 }
@@ -3408,7 +3410,7 @@ pub unsafe extern "win64" fn RoGetActivationFactory(
             create_uri_factory(iid as *const crate::com::Guid, factory)
         }
         _ => {
-            log::debug!("RoGetActivationFactory({class_name:?}): class not registered -> REGDB_E_CLASSNOTREG");
+            crate::com::warn_unknown_winrt_class_once("RoGetActivationFactory", &class_name);
             REGDB_E_CLASSNOTREG
         }
     }
@@ -3635,6 +3637,7 @@ unsafe extern "win64" fn malloc_qi(
         std::ptr::write_unaligned(ppv, this as *mut c_void);
         S_OK
     } else {
+        crate::com::warn_qi_failed_once("IMalloc", &crate::com::Guid::from_bytes(iid));
         E_NOINTERFACE
     }
 }

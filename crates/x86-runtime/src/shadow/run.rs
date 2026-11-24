@@ -286,9 +286,25 @@ pub unsafe fn arm_watchdog(ms: u64) {
 }
 
 /// Run watchdog: well past the orchestrator's own `timeout_ms` kill (it only fires when the
-/// orchestrator is gone or stuck).
+/// orchestrator is gone or stuck). Extra 5 s slack keeps VM scheduling pauses on hosted CI
+/// runners from firing `SIGALRM` ahead of the orchestrator's `timeout_ms` check.
 pub fn run_watchdog_ms(timeout_ms: u64) -> u64 {
-    timeout_ms.saturating_mul(2).saturating_add(1000)
+    timeout_ms.saturating_mul(2).saturating_add(5_000)
+}
+
+/// Call `waitpid`, retrying on `EINTR`. Returns `(w, errno_if_neg)`.
+pub(crate) unsafe fn waitpid_retry(pid: i32, status: &mut i32, options: i32) -> (i32, i32) {
+    loop {
+        let w = libc::waitpid(pid, status, options);
+        if w < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EINTR {
+                continue;
+            }
+            return (w, err);
+        }
+        return (w, 0);
+    }
 }
 
 /// Result of one run.
@@ -300,6 +316,10 @@ pub struct RunRes {
     pub t_us: u64,
     pub fault_addr: u64,
     pub fault_pc: u64,
+    /// Raw `waitpid` status (or `-errno` when `waitpid` failed).
+    pub wait_status: i32,
+    /// Signal recorded by `on_fault` (`RunHdr::fault_sig`, 0 if `on_fault` did not exit).
+    pub fault_sig: u32,
     /// [`ST_HOST`]: the host API (NUL-terminated).
     pub host_api: [u8; HOST_API_LEN],
 }
@@ -357,52 +377,69 @@ pub unsafe fn run_one(bufs: &Bufs, r: usize, timeout_ms: u64, body: &dyn Fn() ->
         libc::_exit(handler::EXIT_OK);
     }
     let deadline = now_us() + timeout_ms * 1000;
-    let mut status = 0i32;
+    let mut raw_status = 0i32;
     loop {
-        let w = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        let (w, err) = waitpid_retry(pid, &mut raw_status, libc::WNOHANG);
         if w == pid {
             break;
         }
         if w < 0 {
-            status = -1;
+            raw_status = if err > 0 { -err } else { -1 };
             break;
         }
         if now_us() > deadline {
             libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
-            return RunRes { status: ST_TIMEOUT, ..Default::default() };
+            let _ = waitpid_retry(pid, &mut raw_status, 0);
+            return RunRes { status: ST_TIMEOUT, wait_status: raw_status, ..Default::default() };
         }
         if parent_gone() {
             libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
+            let _ = waitpid_retry(pid, &mut raw_status, 0);
             libc::_exit(EXIT_PARENT_GONE);
         }
         libc::usleep(100);
     }
-    let exited = status >= 0 && libc::WIFEXITED(status);
-    let code = if exited { libc::WEXITSTATUS(status) } else { -1 };
-    let status = if code == handler::EXIT_SHARED {
-        ST_SHARED
-    } else if code == win32_rt::shadow::EXIT_HOST_UNSAFE {
-        ST_HOST
-    } else if code != handler::EXIT_OK || (*h).done != 1 {
-        ST_FAULT
-    } else if (*h).overflow != 0 {
-        ST_OVERFLOW
-    } else {
-        ST_OK
-    };
+    let done = core::ptr::read_volatile(core::ptr::addr_of!((*h).done));
+    let overflow = core::ptr::read_volatile(core::ptr::addr_of!((*h).overflow));
+    let status = classify_run_exit(raw_status, done, overflow);
     if status == ST_OK {
         rebase(buf, bufs.maxpages);
     }
     RunRes {
         status,
-        rax: (*h).rax,
-        xmm0: (*h).xmm0,
-        t_us: (*h).t_us,
-        fault_addr: (*h).fault_addr,
-        fault_pc: (*h).fault_pc,
-        host_api: (*h).host_api,
+        rax: core::ptr::read_volatile(core::ptr::addr_of!((*h).rax)),
+        xmm0: core::ptr::read_volatile(core::ptr::addr_of!((*h).xmm0)),
+        t_us: core::ptr::read_volatile(core::ptr::addr_of!((*h).t_us)),
+        fault_addr: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_addr)),
+        fault_pc: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_pc)),
+        wait_status: raw_status,
+        fault_sig: core::ptr::read_volatile(core::ptr::addr_of!((*h).fault_sig)) as u32,
+        host_api: core::ptr::read_volatile(core::ptr::addr_of!((*h).host_api)),
+    }
+}
+
+/// Classify a finished run child from its raw `waitpid` status and shared header flags.
+///
+/// A child terminated by its own `arm_watchdog` `SIGALRM` (for example if the orchestrator was
+/// preempted past `run_watchdog_ms` on a virtualized runner) is a timeout (`ST_TIMEOUT`), not
+/// a guest fault (`ST_FAULT`).
+pub(crate) fn classify_run_exit(raw_status: i32, done: u64, overflow: u64) -> u8 {
+    let signaled = raw_status >= 0 && libc::WIFSIGNALED(raw_status);
+    if signaled && libc::WTERMSIG(raw_status) == libc::SIGALRM {
+        return ST_TIMEOUT;
+    }
+    let exited = raw_status >= 0 && libc::WIFEXITED(raw_status);
+    let code = if exited { libc::WEXITSTATUS(raw_status) } else { -1 };
+    if code == handler::EXIT_SHARED {
+        ST_SHARED
+    } else if code == win32_rt::shadow::EXIT_HOST_UNSAFE {
+        ST_HOST
+    } else if code != handler::EXIT_OK || done != 1 {
+        ST_FAULT
+    } else if overflow != 0 {
+        ST_OVERFLOW
+    } else {
+        ST_OK
     }
 }
 

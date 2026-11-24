@@ -72,6 +72,7 @@ struct Args {
     audio_harness: bool,
     diff_test: bool,
     report_json: Option<std::path::PathBuf>,
+    fail_on_unimpl_op: Option<bool>,
     game_args: Vec<String>,
     explicit_game_dir: bool,
     explicit_exe: bool,
@@ -79,7 +80,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-game-hooks] [--no-avx] [--audio-harness] [--diff-test] [-- ARGS...]\n\
+        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-game-hooks] [--no-avx] [--fail-on-unimpl-op | --no-fail-on-unimpl-op] [--audio-harness] [--diff-test] [-- ARGS...]\n\
          \n\
            --manifest FILE         declarative game.toml manifest (default: auto-discover ../Resources/game.toml or $PORT_MANIFEST)\n\
            --game-dir DIR          game/library directory (default: bundled ../Resources/Game, $PORT_GAME_DIR / $AW2_GAME_DIR, or current dir)\n\
@@ -104,11 +105,14 @@ fn usage() -> ! {
            --no-run                map + resolve only; report unresolved imports and exit\n\
            --report-json PATH      write one structured JSON boot report on exit (or $PORT_REPORT_JSON)\n\
            --no-avx                do not re-exec with ROSETTA_ADVERTISE_AVX=1\n\
+           --fail-on-unimpl-op     abort with exit code {} on unimplemented x86-64 instructions (default on for CLI bring-up runs; $PORT_FAIL_ON_UNIMPL_OP=1)\n\
+           --no-fail-on-unimpl-op  log unimplemented x86-64 instructions and continue as no-op ($PORT_FAIL_ON_UNIMPL_OP=0)\n\
            --audio-harness         enable plugin audio test harness when supported by the active game plugin\n\
            --diff-test             run differential tests (original vs Rust) and exit\n\
          \n\
-         Env vars: PORT_AOT_DIR, PORT_BUILTIN_OVERRIDES, PORT_HEADLESS, PORT_SYMBOLS, PORT_AOT_DYLIB (legacy AW2_* aliases supported)\n\
-         Logging:  RUST_LOG (default `info`), e.g. RUST_LOG=info,stub=warn,trace=info"
+         Env vars: PORT_AOT_DIR, PORT_BUILTIN_OVERRIDES, PORT_FAIL_ON_UNIMPL_OP, PORT_HEADLESS, PORT_SYMBOLS, PORT_AOT_DYLIB (legacy AW2_* aliases supported)\n\
+         Logging:  RUST_LOG (default `info`), e.g. RUST_LOG=info,stub=warn,trace=info",
+        x86_runtime::emu::EXIT_UNIMPL_OP
     );
     std::process::exit(2);
 }
@@ -161,6 +165,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         report_json: std::env::var_os("PORT_REPORT_JSON")
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from),
+        fail_on_unimpl_op: None,
         game_args: Vec::new(),
         explicit_game_dir: false,
         explicit_exe: false,
@@ -241,6 +246,8 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
             "--call-export" => a.call_export = Some(it.next().unwrap_or_else(|| usage())),
             "--audio-harness" => a.audio_harness = true,
             "--diff-test" => a.diff_test = true,
+            "--fail-on-unimpl-op" => a.fail_on_unimpl_op = Some(true),
+            "--no-fail-on-unimpl-op" => a.fail_on_unimpl_op = Some(false),
             "--" => {
                 a.game_args.extend(it.by_ref());
             }
@@ -916,6 +923,20 @@ pub(crate) fn run_embedded(args: Args) -> anyhow::Result<()> {
     run_with_args(args, true)
 }
 
+fn resolve_fail_on_unimpl_op(
+    cli_flag: Option<bool>,
+    env_val: Option<&str>,
+    is_bringup_run: bool,
+) -> bool {
+    if let Some(v) = cli_flag {
+        return v;
+    }
+    if let Some(raw) = env_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return x86_runtime::emu::parse_env_bool(raw);
+    }
+    is_bringup_run
+}
+
 fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use win32_rt as w;
@@ -1043,6 +1064,13 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         std::env::set_var("AW2_DRIVE_C", drive_c);
     }
     bridge_port_env_vars();
+    let is_bringup_run = !embedded_host && target::bundled_game_dir().is_none();
+    let fail_on_unimpl = resolve_fail_on_unimpl_op(
+        args.fail_on_unimpl_op,
+        std::env::var("PORT_FAIL_ON_UNIMPL_OP").ok().as_deref(),
+        is_bringup_run,
+    );
+    x86_runtime::emu::set_fail_on_unimpl_op(fail_on_unimpl);
 
     if args.prewarm_shaders {
         let rep = d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, false)
@@ -1758,5 +1786,23 @@ mod tests {
             Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
             None => std::env::remove_var("AW2_DLL_AOT_DIR"),
         }
+    }
+
+    #[test]
+    fn parse_fail_on_unimpl_op_flags_and_resolution() {
+        let def = parse_args_from(std::iter::empty::<String>());
+        assert_eq!(def.fail_on_unimpl_op, None);
+        let on = parse_args_from(["--fail-on-unimpl-op"].into_iter().map(String::from));
+        assert_eq!(on.fail_on_unimpl_op, Some(true));
+        let off = parse_args_from(["--no-fail-on-unimpl-op"].into_iter().map(String::from));
+        assert_eq!(off.fail_on_unimpl_op, Some(false));
+
+        // Precedence: CLI flag > PORT_FAIL_ON_UNIMPL_OP env > bring-up default
+        assert!(resolve_fail_on_unimpl_op(None, None, true));
+        assert!(!resolve_fail_on_unimpl_op(None, None, false));
+        assert!(!resolve_fail_on_unimpl_op(None, Some("0"), true));
+        assert!(resolve_fail_on_unimpl_op(None, Some("1"), false));
+        assert!(resolve_fail_on_unimpl_op(Some(true), Some("0"), false));
+        assert!(!resolve_fail_on_unimpl_op(Some(false), Some("1"), true));
     }
 }

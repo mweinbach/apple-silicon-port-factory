@@ -2603,7 +2603,7 @@ pub(crate) struct IocpPacket {
     pub internal_status: usize,
 }
 
-enum IocpDequeue {
+pub(crate) enum IocpDequeue {
     Packets(Vec<IocpPacket>),
     Timeout,
     IoCompletion,
@@ -2663,18 +2663,29 @@ impl IoCompletionPort {
     }
 
     fn dequeue_up_to(&self, max: usize, timeout_ms: u32, alertable: bool) -> IocpDequeue {
+        let timeout = (timeout_ms != INFINITE).then(|| Duration::from_millis(timeout_ms as u64));
+        self.dequeue_up_to_duration(max, timeout, alertable)
+    }
+
+    pub(crate) fn dequeue_up_to_duration(
+        &self,
+        max: usize,
+        timeout: Option<Duration>,
+        alertable: bool,
+    ) -> IocpDequeue {
         if alertable && crate::thread::has_pending_apc() {
             crate::thread::run_pending_apcs();
             return IocpDequeue::IoCompletion;
         }
-        let deadline = (timeout_ms != INFINITE).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let is_zero = matches!(timeout, Some(d) if d.is_zero());
+        let deadline = timeout.and_then(|d| if d.is_zero() { None } else { Some(Instant::now() + d) });
         let ready_obj: Arc<dyn KObject> = Arc::clone(&self.ready) as Arc<dyn KObject>;
         loop {
             let out = self.try_pop_up_to(max);
             if !out.is_empty() {
                 return IocpDequeue::Packets(out);
             }
-            if timeout_ms == 0 {
+            if is_zero {
                 return IocpDequeue::Timeout;
             }
             let remaining = match deadline {

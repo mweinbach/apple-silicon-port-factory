@@ -76,6 +76,8 @@ legacy_remedy_migration = false
 | `--no-aw2-hooks` | Disable Alan Wake 2 VA hooks (already off automatically for non-AW2 binaries). |
 | `--trace` | Log every resolved import call (`RUST_LOG=trace=info`). |
 | `--no-run` | Map the PE, resolve imports, print any unresolved imports per DLL, and exit. |
+| `--fail-on-unimpl-op` | Abort with documented exit code `86` (`EXIT_UNIMPL_OP`) and a crash report if the generic interpreter hits an unimplemented x86-64 instruction (`PORT_FAIL_ON_UNIMPL_OP=1`). Default **on** for CLI bring-up runs (outside a packaged `.app` bundle) and `live-probe`. |
+| `--no-fail-on-unimpl-op` | Log unimplemented x86-64 instructions once per IP and continue as a no-op (`PORT_FAIL_ON_UNIMPL_OP=0`). |
 | `--diff-test` | (`aw2` feature) Run differential tests comparing original x86-64 code against Rust replacements. |
 | `--audio-harness` | (`aw2` feature) Replace `WinMain` with the Wwise audio oracle harness. |
 
@@ -94,6 +96,7 @@ use them.
 | `PORT_METALFX` | `AW2_METALFX` | `0` disables `MTL4FXSpatialScaler` and forces bilinear compute fallback |
 | `PORT_D3D11` | — | `0` disables `d3d11.dll` (`DXGI_ERROR_UNSUPPORTED`) |
 | `PORT_BUILTIN_OVERRIDES` | `AW2_BUILTIN_OVERRIDES` | `0` disables builtin overrides for game-shipped DLLs |
+| `PORT_FAIL_ON_UNIMPL_OP` | — | `1` aborts with exit code `86` on unimplemented x86-64 instructions (`0` continues as no-op; defaults on for CLI bring-up runs and `live-probe`) |
 | `PORT_SHADER_CACHE` | `AW2_SHADER_CACHE` | Writable on-disk `.metallib` shader cache directory (default `~/Translator/ShaderCache`) |
 | `PORT_SHADER_CACHE_FALLBACK` | — | Read-only seed `.metallib` cache directory (e.g. bundled `Contents/Resources/ShaderCache`) |
 | `PORT_PSO_CACHE` | `AW2_PSO_CACHE` | Writable Metal 4 `MTL4Archive` PSO cache root (default `<shader cache>/pso`) |

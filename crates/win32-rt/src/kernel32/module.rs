@@ -257,6 +257,23 @@ pub unsafe extern "win64" fn GetModuleHandleExW(flags: u32, name: LPCWSTR, out: 
     get_module_handle_ex(flags, n, name as usize, out)
 }
 
+/// Log a missing procedure lookup (`GetProcAddress` / `LdrGetProcedureAddress`) once per
+/// distinct `(module, proc)` pair at warning level, demoting repeat probes to debug level.
+pub(crate) fn warn_proc_not_found_once(api: &str, mod_name: &str, proc_name: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> =
+        std::sync::Mutex::new(None);
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new)
+            .insert((mod_name.to_ascii_lowercase(), proc_name.to_string()))
+    };
+    if first {
+        log::warn!("{api}({mod_name}, {proc_name}) -> NULL (ERROR_PROC_NOT_FOUND)");
+    } else {
+        log::debug!("{api}({mod_name}, {proc_name}) -> NULL");
+    }
+}
+
 pub unsafe extern "win64" fn GetProcAddress(h: HMODULE, name: LPCSTR) -> *const c_void {
     if name.is_null() {
         set_err(err::ERROR_PROC_NOT_FOUND);
@@ -282,7 +299,7 @@ pub unsafe extern "win64" fn GetProcAddress(h: HMODULE, name: LPCSTR) -> *const 
         }
         None => {
             let mod_name = crate::loader().module_path(Some(h)).unwrap_or_else(|| format!("0x{h:x}"));
-            log::debug!("GetProcAddress({mod_name}, {pn}) -> NULL");
+            warn_proc_not_found_once("GetProcAddress", &mod_name, &pn.to_string());
             set_err(err::ERROR_PROC_NOT_FOUND);
             std::ptr::null()
         }

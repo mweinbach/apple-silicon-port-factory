@@ -202,6 +202,69 @@ pub fn iid_name(g: &Guid) -> Option<&'static str> {
         .map(|(_, n)| *n)
 }
 
+/// Log a failed `QueryInterface` (`E_NOINTERFACE`) once per distinct `(class_name, iid)` at
+/// warning level, demoting repeat probes to debug level.
+pub fn warn_qi_failed_once(class_name: &str, iid: &Guid) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(String, Guid)>>> = Mutex::new(None);
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new)
+            .insert((class_name.to_string(), *iid))
+    };
+    if first {
+        log::warn!(target: "com", "{class_name}::QueryInterface({iid:?}) -> E_NOINTERFACE");
+    } else {
+        log::debug!(target: "com", "{class_name}::QueryInterface({iid:?}) -> E_NOINTERFACE");
+    }
+}
+
+/// Log an unregistered COM CLSID (`REGDB_E_CLASSNOTREG`) once per distinct `(api, clsid, iid)`
+/// at warning level, demoting repeat probes to debug level.
+pub fn warn_unknown_clsid_once(api: &str, clsid: Option<&Guid>, iid: Option<&Guid>) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(String, Option<Guid>, Option<Guid>)>>> =
+        Mutex::new(None);
+    let key = (api.to_string(), clsid.copied(), iid.copied());
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new).insert(key)
+    };
+    let clsid_s = clsid.map_or_else(|| "NULL".to_string(), |g| format!("{g:?}"));
+    let iid_s = iid.map_or_else(|| "NULL".to_string(), |g| format!("{g:?}"));
+    if first {
+        log::warn!(
+            target: "com",
+            "{api}: unregistered COM class {clsid_s} (iid {iid_s}) -> REGDB_E_CLASSNOTREG"
+        );
+    } else {
+        log::debug!(
+            target: "com",
+            "{api}: unregistered COM class {clsid_s} (iid {iid_s}) -> REGDB_E_CLASSNOTREG"
+        );
+    }
+}
+
+/// Log an unregistered WinRT activatable class name once per distinct `(api, class_name)` at
+/// warning level, demoting repeat probes to debug level.
+pub fn warn_unknown_winrt_class_once(api: &str, class_name: &str) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(String, String)>>> = Mutex::new(None);
+    let first = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new)
+            .insert((api.to_string(), class_name.to_string()))
+    };
+    if first {
+        log::warn!(
+            target: "com",
+            "{api}({class_name:?}): class not registered -> REGDB_E_CLASSNOTREG"
+        );
+    } else {
+        log::debug!(
+            target: "com",
+            "{api}({class_name:?}): class not registered -> REGDB_E_CLASSNOTREG"
+        );
+    }
+}
+
 pub const IID_IUnknown: Guid = guid("00000000-0000-0000-c000-000000000046");
 pub const IID_IClassFactory: Guid = guid("00000001-0000-0000-c000-000000000046");
 pub const IID_IMalloc: Guid = guid("00000002-0000-0000-c000-000000000046");
@@ -339,6 +402,24 @@ pub fn register_static_ptr_slice(ptrs: &[crate::Ptr]) {
     }
 }
 
+/// Register every native method pointer in a `#[repr(C)]` static COM vtable struct with
+/// `VA_DISPATCH` once per vtable address so ARM64 guest indirect calls dispatch to native
+/// Rust instead of executing host `__TEXT` as x86-64 bytes.
+#[allow(dead_code)]
+pub fn register_vtbl_struct<V: 'static>(vtbl: &'static V) {
+    let base = vtbl as *const V as usize;
+    static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    let is_new = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashSet::new).insert(base)
+    };
+    if is_new {
+        let count = std::mem::size_of::<V>() / std::mem::size_of::<usize>();
+        let ptrs = unsafe { std::slice::from_raw_parts(vtbl as *const V as *const usize, count) };
+        register_vtable_ptrs(ptrs);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generic refcounted COM object (`ComObj<T>`) & IUnknown helpers
 // ---------------------------------------------------------------------------
@@ -464,6 +545,7 @@ pub unsafe fn qi_helper<T>(
         std::ptr::write_unaligned(ppv, this as *mut c_void);
         S_OK
     } else {
+        warn_qi_failed_once(std::any::type_name::<T>(), &iid);
         E_NOINTERFACE
     }
 }
@@ -513,6 +595,7 @@ pub unsafe fn qi_from_table<T>(
             return S_OK;
         }
     }
+    warn_qi_failed_once(std::any::type_name::<T>(), &iid);
     E_NOINTERFACE
 }
 
