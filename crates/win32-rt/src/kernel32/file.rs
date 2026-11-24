@@ -5817,12 +5817,10 @@ impl NamedPipeServer {
         if let Some(entry) = map.get(&self.norm_name).cloned() {
             let mut srvs = entry.servers.lock().unwrap();
             srvs.retain(|s| !Arc::ptr_eq(s, self));
-            let empty = srvs.is_empty();
-            drop(srvs);
-            entry.cv.notify_all();
-            if empty {
+            if srvs.is_empty() {
                 map.remove(&self.norm_name);
             }
+            entry.cv.notify_all();
         }
     }
 }
@@ -5835,6 +5833,17 @@ struct NamedPipeRegistryEntry {
 fn named_pipe_registry() -> &'static Mutex<HashMap<String, Arc<NamedPipeRegistryEntry>>> {
     static REG: OnceLock<Mutex<HashMap<String, Arc<NamedPipeRegistryEntry>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Wake `WaitNamedPipeW` waiters while holding `entry.servers` so notifications cannot
+/// land in the check-to-sleep window. Lock order is `registry -> entry.servers -> srv.state`;
+/// never call while holding `srv.state`.
+fn notify_pipe_waiters(norm_name: &str) {
+    let entry = named_pipe_registry().lock().unwrap().get(norm_name).cloned();
+    if let Some(entry) = entry {
+        let _srvs = entry.servers.lock().unwrap();
+        entry.cv.notify_all();
+    }
 }
 
 fn connect_named_pipe_client(
@@ -6170,17 +6179,18 @@ pub unsafe extern "win64" fn CreateNamedPipeW(
             pending_connect: None,
         }),
     });
-    let entry = {
+    {
         let mut reg = named_pipe_registry().lock().unwrap();
-        Arc::clone(reg.entry(norm_name).or_insert_with(|| {
+        let entry = Arc::clone(reg.entry(norm_name).or_insert_with(|| {
             Arc::new(NamedPipeRegistryEntry {
                 servers: Mutex::new(Vec::new()),
                 cv: Condvar::new(),
             })
-        }))
-    };
-    entry.servers.lock().unwrap().push(Arc::clone(&server));
-    entry.cv.notify_all();
+        }));
+        let mut srvs = entry.servers.lock().unwrap();
+        srvs.push(Arc::clone(&server));
+        entry.cv.notify_all();
+    }
 
     let hflags = sec_attr_inherit_flags(sec);
     let mut obj = FileObj::new(
@@ -6223,34 +6233,51 @@ pub unsafe extern "win64" fn ConnectNamedPipe(h: HANDLE, ov: *mut OVERLAPPED) ->
         return FALSE;
     };
 
-    let mut st = srv.state.lock().unwrap();
-    match st.conn {
-        ServerPipeConn::Connected(_) => {
-            drop(st);
-            if !ov.is_null() {
-                complete_overlapped(ov, STATUS_SUCCESS, 0);
+    let (became_listening, wait_done) = {
+        let mut st = srv.state.lock().unwrap();
+        let mut became_listening = false;
+        match st.conn {
+            ServerPipeConn::Connected(_) => {
+                drop(st);
+                if !ov.is_null() {
+                    complete_overlapped(ov, STATUS_SUCCESS, 0);
+                }
+                set_err(ERROR_PIPE_CONNECTED);
+                return FALSE;
             }
-            set_err(ERROR_PIPE_CONNECTED);
-            return FALSE;
-        }
-        ServerPipeConn::Disconnected => {
-            st.conn = ServerPipeConn::Listening;
-            if let Some(entry) = named_pipe_registry().lock().unwrap().get(&srv.norm_name).cloned() {
-                entry.cv.notify_all();
+            ServerPipeConn::Disconnected => {
+                st.conn = ServerPipeConn::Listening;
+                became_listening = true;
             }
+            ServerPipeConn::Listening => {}
         }
-        ServerPipeConn::Listening => {}
-    }
 
-    let tid = teb::thread_id();
-    if ov.is_null() {
-        let done = Arc::new((Mutex::new(None), Condvar::new()));
-        st.pending_connect = Some(PendingConnect::Sync {
-            handle: h as usize,
-            tid,
-            done: Arc::clone(&done),
-        });
-        drop(st);
+        let tid = teb::thread_id();
+        if ov.is_null() {
+            let done = Arc::new((Mutex::new(None), Condvar::new()));
+            st.pending_connect = Some(PendingConnect::Sync {
+                handle: h as usize,
+                tid,
+                done: Arc::clone(&done),
+            });
+            (became_listening, Some(done))
+        } else {
+            f.completion.io_event.reset();
+            prepare_overlapped_pending(ov);
+            st.pending_connect = Some(PendingConnect::Overlapped {
+                handle: h as usize,
+                ov: ov as usize,
+                tid,
+                completed: Arc::new(AtomicBool::new(false)),
+                binding: Arc::clone(&f.completion),
+            });
+            (became_listening, None)
+        }
+    };
+    if became_listening {
+        notify_pipe_waiters(&srv.norm_name);
+    }
+    if let Some(done) = wait_done {
         drop(f);
         let (m, cv) = &*done;
         let mut g = m.lock().unwrap();
@@ -6268,16 +6295,6 @@ pub unsafe extern "win64" fn ConnectNamedPipe(h: HANDLE, ov: *mut OVERLAPPED) ->
             FALSE
         }
     } else {
-        f.completion.io_event.reset();
-        prepare_overlapped_pending(ov);
-        st.pending_connect = Some(PendingConnect::Overlapped {
-            handle: h as usize,
-            ov: ov as usize,
-            tid,
-            completed: Arc::new(AtomicBool::new(false)),
-            binding: Arc::clone(&f.completion),
-        });
-        drop(st);
         set_err(err::ERROR_IO_PENDING);
         FALSE
     }
@@ -6310,14 +6327,21 @@ pub unsafe extern "win64" fn DisconnectNamedPipe(h: HANDLE) -> BOOL {
         let _ = pipe_reactor().cancel_ops(h as usize, None, None);
     }
     f.peek_buf.lock().unwrap().clear();
-    {
+    let entry = named_pipe_registry().lock().unwrap().get(&srv.norm_name).cloned();
+    if let Some(entry) = entry {
+        let _srvs = entry.servers.lock().unwrap();
+        {
+            let mut st = srv.state.lock().unwrap();
+            if matches!(st.conn, ServerPipeConn::Disconnected) {
+                st.conn = ServerPipeConn::Listening;
+            }
+        }
+        entry.cv.notify_all();
+    } else {
         let mut st = srv.state.lock().unwrap();
         if matches!(st.conn, ServerPipeConn::Disconnected) {
             st.conn = ServerPipeConn::Listening;
         }
-    }
-    if let Some(entry) = named_pipe_registry().lock().unwrap().get(&srv.norm_name).cloned() {
-        entry.cv.notify_all();
     }
     TRUE
 }
@@ -6395,6 +6419,10 @@ pub unsafe extern "win64" fn WaitNamedPipeW(name: LPCWSTR, timeout: u32) -> BOOL
                 let (g, res) = entry.cv.wait_timeout(srvs, dl - now).unwrap();
                 srvs = g;
                 if res.timed_out() {
+                    if srvs.is_empty() {
+                        set_err(err::ERROR_FILE_NOT_FOUND);
+                        return FALSE;
+                    }
                     if srvs.iter().any(|s| matches!(s.state.lock().unwrap().conn, ServerPipeConn::Listening)) {
                         return TRUE;
                     }
@@ -9447,6 +9475,122 @@ mod tests {
             assert_eq!(CloseHandle(srv2), TRUE);
             assert_eq!(CloseHandle(srv1), TRUE);
             assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn wait_named_pipe_w_synchronizes_disconnect_infinite_timeout_and_close() {
+        use crate::kernel32::threads::CloseHandle;
+        use std::sync::{mpsc, Barrier};
+
+        unsafe {
+            let pname = to_wide_z(&format!("\\\\.\\pipe\\aw2_wait_sync_test_{}", std::process::id()));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x4000_0003, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+
+            // 1. Stress WaitNamedPipeW(INFINITE) on a connected server transitioning back to
+            //    Listening via DisconnectNamedPipe across tight barrier-synchronized rounds and
+            //    asleep-waiter rounds, guarded by a bounded watchdog so any lost wakeup fails fast.
+            for round in 0..40 {
+                let cli = CreateFileW(
+                    pname.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+                let barrier = Arc::new(Barrier::new(2));
+                let b_wait = Arc::clone(&barrier);
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    b_wait.wait();
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), INFINITE);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+
+                barrier.wait();
+                if round % 10 == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(CloseHandle(cli), TRUE);
+                assert_eq!(DisconnectNamedPipe(srv), TRUE);
+
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("round {round}: WaitNamedPipeW(INFINITE) hung (lost wakeup)"));
+                assert_eq!(ok, TRUE, "round {round}: WaitNamedPipeW failed with {e}");
+                waiter.join().unwrap();
+            }
+
+            // 2. Finite timeout returns ERROR_SEM_TIMEOUT while the only server stays connected.
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+            {
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), 40);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("finite WaitNamedPipeW hung");
+                assert_eq!(ok, FALSE);
+                assert_eq!(e, ERROR_SEM_TIMEOUT);
+                waiter.join().unwrap();
+            }
+
+            // 3. Closing the last connected server wakes WaitNamedPipeW(INFINITE) with ERROR_FILE_NOT_FOUND.
+            {
+                let barrier = Arc::new(Barrier::new(2));
+                let b_wait = Arc::clone(&barrier);
+                let pname_w = pname.clone();
+                let (tx, rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    b_wait.wait();
+                    let ok = WaitNamedPipeW(pname_w.as_ptr(), INFINITE);
+                    let e = teb::last_error();
+                    let _ = tx.send((ok, e));
+                });
+                barrier.wait();
+                std::thread::sleep(Duration::from_millis(5));
+                assert_eq!(CloseHandle(srv), TRUE);
+
+                let (ok, e) = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("WaitNamedPipeW(INFINITE) hung after last server closed");
+                assert_eq!(ok, FALSE);
+                assert_eq!(e, err::ERROR_FILE_NOT_FOUND);
+                waiter.join().unwrap();
+            }
+
+            assert_eq!(WaitNamedPipeW(pname.as_ptr(), 40), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            assert_eq!(CloseHandle(cli), TRUE);
         }
     }
 }
