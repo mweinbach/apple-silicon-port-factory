@@ -274,7 +274,7 @@ int main(void) {
     if (ncmw.lfCaptionFont.lfHeight != -12 || wcscmp(ncmw.lfCaptionFont.lfFaceName, L"Segoe UI") != 0) die("NCM W lfCaptionFont");
     if (wcscmp(ncmw.lfMessageFont.lfFaceName, L"Segoe UI") != 0) die("NCM W lfMessageFont");
 
-    // 7. oleaut32: VariantChangeType I4 -> BSTR -> R8
+    // 7. oleaut32: VariantChangeType + VariantCopy / VariantCopyInd / VariantClear (no double free)
     VARIANT v1, v2;
     VariantInit(&v1);
     VariantInit(&v2);
@@ -284,6 +284,33 @@ int main(void) {
     if (VariantChangeType(&v2, &v2, 0, VT_R8) != S_OK) die("VariantChangeType R8");
     if (V_R8(&v2) != 123.0) die("VariantChangeType value");
     VariantClear(&v2);
+
+    SAFEARRAY *psa = SafeArrayCreateVector(VT_I4, 0, 2);
+    if (!psa) die("SafeArrayCreateVector");
+    LONG sa_i0 = 0, sa_i1 = 1, a0 = 11, a1 = 22;
+    SafeArrayPutElement(psa, &sa_i0, &a0);
+    SafeArrayPutElement(psa, &sa_i1, &a1);
+    VARIANT va1, va2;
+    VariantInit(&va1);
+    VariantInit(&va2);
+    V_VT(&va1) = VT_ARRAY | VT_I4;
+    V_ARRAY(&va1) = psa;
+    if (VariantCopy(&va2, &va1) != S_OK) die("VariantCopy SAFEARRAY");
+    if (V_ARRAY(&va2) == V_ARRAY(&va1)) die("VariantCopy aliased SAFEARRAY");
+    VariantClear(&va1);
+    LONG got1 = 0;
+    if (SafeArrayGetElement(V_ARRAY(&va2), &sa_i1, &got1) != S_OK || got1 != 22) die("SafeArrayGetElement after clear");
+    VariantClear(&va2);
+
+    LONG byref_val = 555;
+    VARIANT vr, vind;
+    VariantInit(&vr);
+    VariantInit(&vind);
+    V_VT(&vr) = VT_BYREF | VT_I4;
+    V_I4REF(&vr) = &byref_val;
+    if (VariantCopyInd(&vind, &vr) != S_OK || V_VT(&vind) != VT_I4 || V_I4(&vind) != 555) die("VariantCopyInd");
+    VariantClear(&vr);
+    VariantClear(&vind);
 
     printf("GUEST_WIN32_PASS\n");
     fflush(stdout);

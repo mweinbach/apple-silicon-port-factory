@@ -84,42 +84,101 @@ pub unsafe extern "win64" fn SysStringByteLen(b: *const u16) -> u32 {
         *((b as *const u8).sub(4) as *const u32)
     }
 }
+const DISP_E_TYPEMISMATCH: i32 = 0x8002_0005u32 as i32;
+const DISP_E_BADVARTYPE: i32 = 0x8002_0008u32 as i32;
+const DISP_E_OVERFLOW: i32 = 0x8002_000Au32 as i32;
+const DISP_E_ARRAYISLOCKED: i32 = 0x8002_000Du32 as i32;
+const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+
+const VT_EMPTY: u16 = 0;
+const VT_NULL: u16 = 1;
+const VT_I2: u16 = 2;
+const VT_I4: u16 = 3;
+const VT_R4: u16 = 4;
+const VT_R8: u16 = 5;
+const VT_CY: u16 = 6;
+const VT_DATE: u16 = 7;
+const VT_BSTR: u16 = 8;
+const VT_DISPATCH: u16 = 9;
+const VT_ERROR: u16 = 10;
+const VT_BOOL: u16 = 11;
+const VT_VARIANT: u16 = 12;
+const VT_UNKNOWN: u16 = 13;
+const VT_DECIMAL: u16 = 14;
+const VT_I1: u16 = 16;
+const VT_UI1: u16 = 17;
+const VT_UI2: u16 = 18;
+const VT_UI4: u16 = 19;
+const VT_I8: u16 = 20;
+const VT_UI8: u16 = 21;
+const VT_INT: u16 = 22;
+const VT_UINT: u16 = 23;
+const VT_RECORD: u16 = 36;
+const VT_ARRAY: u16 = 0x2000;
+const VT_BYREF: u16 = 0x4000;
+
+const FADF_BSTR: u16 = 0x0100;
+const FADF_UNKNOWN: u16 = 0x0200;
+const FADF_DISPATCH: u16 = 0x0400;
+const FADF_VARIANT: u16 = 0x0800;
+
+const IRECORDINFO_RECORD_COPY: usize = 5;
+const IRECORDINFO_RECORD_CREATE: usize = 16;
+const IRECORDINFO_RECORD_DESTROY: usize = 18;
+
 pub unsafe extern "win64" fn VariantInit(v: *mut u8) {
-    std::ptr::write_bytes(v, 0, 24);
+    if !v.is_null() {
+        std::ptr::write_bytes(v, 0, 24);
+    }
 }
-/// VARIANT: frees BSTRs and owned SAFEARRAYs; releases IUnknown/IDispatch via vtable slot 2.
+
+/// VARIANT: frees BSTRs and owned SAFEARRAYs, destroys VT_RECORD via IRecordInfo,
+/// and releases IUnknown/IDispatch via vtable slot 2. Never frees VT_BYREF payloads.
 pub unsafe extern "win64" fn VariantClear(v: *mut u8) -> i32 {
     if v.is_null() {
-        return 0;
+        return crate::types::S_OK;
     }
     let vt = std::ptr::read_unaligned(v as *const u16);
-    const VT_BSTR: u16 = 8;
-    const VT_DISPATCH: u16 = 9;
-    const VT_UNKNOWN: u16 = 13;
-    const VT_ARRAY: u16 = 0x2000;
-    const VT_BYREF: u16 = 0x4000;
     if (vt & VT_BYREF) == 0 {
-        match vt {
-            VT_BSTR => SysFreeString(std::ptr::read_unaligned(v.add(8) as *const *mut u16)),
-            VT_DISPATCH | VT_UNKNOWN => {
-                let obj = std::ptr::read_unaligned(v.add(8) as *const *mut *const usize);
-                if !obj.is_null() {
-                    let release: unsafe extern "win64" fn(*mut c_void) -> u32 =
-                        std::mem::transmute(*(*obj).add(2));
-                    release(obj as *mut c_void);
+        if (vt & VT_ARRAY) != 0 {
+            let psa = std::ptr::read_unaligned(v.add(8) as *const *mut u8);
+            if !psa.is_null() {
+                let hr = SafeArrayDestroy(psa);
+                if hr != crate::types::S_OK {
+                    return hr;
                 }
             }
-            x if (x & VT_ARRAY) != 0 => {
-                let psa = std::ptr::read_unaligned(v.add(8) as *const *mut u8);
-                if !psa.is_null() {
-                    let _ = SafeArrayDestroy(psa);
+        } else {
+            match vt {
+                VT_BSTR => SysFreeString(std::ptr::read_unaligned(v.add(8) as *const *mut u16)),
+                VT_DISPATCH | VT_UNKNOWN => {
+                    let obj = std::ptr::read_unaligned(v.add(8) as *const *mut c_void);
+                    if !obj.is_null() {
+                        crate::com::com_call_release(obj);
+                    }
                 }
+                VT_RECORD => {
+                    let pv_rec = std::ptr::read_unaligned(v.add(8) as *const *mut c_void);
+                    let rec_info = std::ptr::read_unaligned(v.add(16) as *const *mut c_void);
+                    if !rec_info.is_null() {
+                        if !pv_rec.is_null() {
+                            let _ = crate::com::com_call_slot(
+                                rec_info,
+                                IRECORDINFO_RECORD_DESTROY,
+                                pv_rec as u64,
+                                0,
+                                0,
+                            );
+                        }
+                        crate::com::com_call_release(rec_info);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     std::ptr::write_bytes(v, 0, 24);
-    0
+    crate::types::S_OK
 }
 
 pub unsafe extern "win64" fn SafeArrayGetDim(psa: *const u16) -> u32 {
@@ -156,6 +215,123 @@ pub unsafe extern "win64" fn SysReAllocStringLen(pbstr: *mut *mut u16, s: *const
     1
 }
 
+unsafe fn copy_bstr(s: *const u16) -> Result<*mut u16, i32> {
+    if s.is_null() {
+        return Ok(std::ptr::null_mut());
+    }
+    let bytes = SysStringByteLen(s as *mut u16);
+    let dup = SysAllocStringByteLen(s as *const u8, bytes);
+    if dup.is_null() {
+        Err(E_OUTOFMEMORY)
+    } else {
+        Ok(dup)
+    }
+}
+
+unsafe fn copy_record_into(out: &mut [u8; 24], pv_rec: *mut c_void, rec_info: *mut c_void) -> i32 {
+    if rec_info.is_null() {
+        if !pv_rec.is_null() {
+            return DISP_E_BADVARTYPE;
+        }
+        std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, VT_RECORD);
+        return crate::types::S_OK;
+    }
+    let new_rec = if pv_rec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        let Some(raw) = crate::com::com_call_slot_raw(rec_info, IRECORDINFO_RECORD_CREATE, &[]) else {
+            return DISP_E_BADVARTYPE;
+        };
+        let created = raw as *mut c_void;
+        if created.is_null() {
+            return E_OUTOFMEMORY;
+        }
+        let hr = crate::com::com_call_slot(
+            rec_info,
+            IRECORDINFO_RECORD_COPY,
+            pv_rec as u64,
+            created as u64,
+            0,
+        );
+        if hr < 0 {
+            let _ = crate::com::com_call_slot(
+                rec_info,
+                IRECORDINFO_RECORD_DESTROY,
+                created as u64,
+                0,
+                0,
+            );
+            return hr;
+        }
+        created
+    };
+    crate::com::com_call_add_ref(rec_info);
+    std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, VT_RECORD);
+    std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut c_void, new_rec);
+    std::ptr::write_unaligned(out.as_mut_ptr().add(16) as *mut *mut c_void, rec_info);
+    crate::types::S_OK
+}
+
+unsafe fn variant_copy_into_buf(out: &mut [u8; 24], src: *const u8) -> i32 {
+    *out = [0u8; 24];
+    let vt = std::ptr::read_unaligned(src as *const u16);
+
+    if (vt & VT_BYREF) != 0 {
+        // VT_BYREF: copy pointer without taking ownership.
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 24);
+        return crate::types::S_OK;
+    }
+
+    if (vt & VT_ARRAY) != 0 {
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 24);
+        let psa = std::ptr::read_unaligned(src.add(8) as *const *const u8);
+        let mut dup: *mut u8 = std::ptr::null_mut();
+        if !psa.is_null() {
+            let hr = SafeArrayCopy(psa, &mut dup);
+            if hr != crate::types::S_OK {
+                *out = [0u8; 24];
+                return hr;
+            }
+        }
+        std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut u8, dup);
+        return crate::types::S_OK;
+    }
+
+    match vt {
+        VT_BSTR => {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 24);
+            let s = std::ptr::read_unaligned(src.add(8) as *const *const u16);
+            match copy_bstr(s) {
+                Ok(dup) => {
+                    std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut u16, dup);
+                    crate::types::S_OK
+                }
+                Err(hr) => {
+                    *out = [0u8; 24];
+                    hr
+                }
+            }
+        }
+        VT_UNKNOWN | VT_DISPATCH => {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 24);
+            let obj = std::ptr::read_unaligned(src.add(8) as *const *mut c_void);
+            if !obj.is_null() {
+                crate::com::com_call_add_ref(obj);
+            }
+            crate::types::S_OK
+        }
+        VT_RECORD => {
+            let pv_rec = std::ptr::read_unaligned(src.add(8) as *const *mut c_void);
+            let rec_info = std::ptr::read_unaligned(src.add(16) as *const *mut c_void);
+            copy_record_into(out, pv_rec, rec_info)
+        }
+        _ => {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 24);
+            crate::types::S_OK
+        }
+    }
+}
+
 pub unsafe extern "win64" fn VariantCopy(dst: *mut u8, src: *const u8) -> i32 {
     if dst.is_null() || src.is_null() {
         return crate::types::E_INVALIDARG;
@@ -163,40 +339,160 @@ pub unsafe extern "win64" fn VariantCopy(dst: *mut u8, src: *const u8) -> i32 {
     if dst as *const u8 == src {
         return crate::types::S_OK;
     }
-    VariantClear(dst);
-    std::ptr::copy_nonoverlapping(src, dst, 24);
-    let vt = std::ptr::read_unaligned(src as *const u16);
-    if vt == 8 {
-        let s = std::ptr::read_unaligned(src.add(8) as *const *const u16);
-        let dup = if s.is_null() { std::ptr::null_mut() } else { SysAllocStringLen(s, SysStringLen(s as *mut u16)) };
-        std::ptr::write_unaligned(dst.add(8) as *mut *mut u16, dup);
+    let mut tmp = [0u8; 24];
+    let hr = variant_copy_into_buf(&mut tmp, src);
+    if hr != crate::types::S_OK {
+        return hr;
     }
+    let clr_hr = VariantClear(dst);
+    if clr_hr != crate::types::S_OK {
+        let _ = VariantClear(tmp.as_mut_ptr());
+        return clr_hr;
+    }
+    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, 24);
     crate::types::S_OK
 }
 
-pub unsafe extern "win64" fn VariantCopyInd(dst: *mut u8, src: *const u8) -> i32 {
-    VariantCopy(dst, src)
+unsafe fn variant_copy_ind_into_buf(out: &mut [u8; 24], src: *const u8, depth: u8) -> i32 {
+    if depth > 8 {
+        return crate::types::E_INVALIDARG;
+    }
+    *out = [0u8; 24];
+    let vt = std::ptr::read_unaligned(src as *const u16);
+    if (vt & VT_BYREF) == 0 {
+        return variant_copy_into_buf(out, src);
+    }
+
+    let inner_vt = vt & !VT_BYREF;
+    let ref_ptr = std::ptr::read_unaligned(src.add(8) as *const *const u8);
+
+    if inner_vt == VT_VARIANT {
+        if ref_ptr.is_null() {
+            return crate::types::E_INVALIDARG;
+        }
+        // Per Windows semantics, a VT_BYREF|VT_VARIANT cannot point to another VT_BYREF|VT_VARIANT.
+        let nested_vt = std::ptr::read_unaligned(ref_ptr as *const u16);
+        if nested_vt == (VT_BYREF | VT_VARIANT) {
+            return crate::types::E_INVALIDARG;
+        }
+        return variant_copy_ind_into_buf(out, ref_ptr, depth + 1);
+    }
+
+    if (inner_vt & VT_ARRAY) != 0 {
+        if ref_ptr.is_null() {
+            return crate::types::E_INVALIDARG;
+        }
+        let psa = std::ptr::read_unaligned(ref_ptr as *const *const u8);
+        let mut dup: *mut u8 = std::ptr::null_mut();
+        if !psa.is_null() {
+            let hr = SafeArrayCopy(psa, &mut dup);
+            if hr != crate::types::S_OK {
+                return hr;
+            }
+        }
+        std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+        std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut u8, dup);
+        return crate::types::S_OK;
+    }
+
+    match inner_vt {
+        VT_BSTR => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            let s = std::ptr::read_unaligned(ref_ptr as *const *const u16);
+            match copy_bstr(s) {
+                Ok(dup) => {
+                    std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, VT_BSTR);
+                    std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut u16, dup);
+                    crate::types::S_OK
+                }
+                Err(hr) => hr,
+            }
+        }
+        VT_UNKNOWN | VT_DISPATCH => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            let obj = std::ptr::read_unaligned(ref_ptr as *const *mut c_void);
+            if !obj.is_null() {
+                crate::com::com_call_add_ref(obj);
+            }
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+            std::ptr::write_unaligned(out.as_mut_ptr().add(8) as *mut *mut c_void, obj);
+            crate::types::S_OK
+        }
+        VT_RECORD => {
+            let rec_info = std::ptr::read_unaligned(src.add(16) as *const *mut c_void);
+            copy_record_into(out, ref_ptr as *mut c_void, rec_info)
+        }
+        VT_DECIMAL => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::copy_nonoverlapping(ref_ptr, out.as_mut_ptr(), 16);
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, VT_DECIMAL);
+            crate::types::S_OK
+        }
+        VT_I1 | VT_UI1 => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+            out[8] = std::ptr::read_unaligned(ref_ptr);
+            crate::types::S_OK
+        }
+        VT_I2 | VT_UI2 | VT_BOOL => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+            std::ptr::copy_nonoverlapping(ref_ptr, out.as_mut_ptr().add(8), 2);
+            crate::types::S_OK
+        }
+        VT_I4 | VT_UI4 | VT_R4 | VT_ERROR | VT_INT | VT_UINT => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+            std::ptr::copy_nonoverlapping(ref_ptr, out.as_mut_ptr().add(8), 4);
+            crate::types::S_OK
+        }
+        VT_I8 | VT_UI8 | VT_R8 | VT_CY | VT_DATE => {
+            if ref_ptr.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, inner_vt);
+            std::ptr::copy_nonoverlapping(ref_ptr, out.as_mut_ptr().add(8), 8);
+            crate::types::S_OK
+        }
+        _ => DISP_E_BADVARTYPE,
+    }
 }
 
-const DISP_E_TYPEMISMATCH: i32 = 0x8002_0005u32 as i32;
-const DISP_E_OVERFLOW: i32 = 0x8002_000Au32 as i32;
-
-const VT_EMPTY: u16 = 0;
-const VT_NULL: u16 = 1;
-const VT_I2: u16 = 2;
-const VT_I4: u16 = 3;
-const VT_R4: u16 = 4;
-const VT_R8: u16 = 5;
-const VT_BSTR: u16 = 8;
-const VT_BOOL: u16 = 11;
-const VT_I1: u16 = 16;
-const VT_UI1: u16 = 17;
-const VT_UI2: u16 = 18;
-const VT_UI4: u16 = 19;
-const VT_I8: u16 = 20;
-const VT_UI8: u16 = 21;
-const VT_INT: u16 = 22;
-const VT_UINT: u16 = 23;
+pub unsafe extern "win64" fn VariantCopyInd(dst: *mut u8, src: *const u8) -> i32 {
+    if dst.is_null() || src.is_null() {
+        return crate::types::E_INVALIDARG;
+    }
+    let vt = std::ptr::read_unaligned(src as *const u16);
+    if (vt & VT_BYREF) == 0 {
+        return VariantCopy(dst, src);
+    }
+    let mut tmp = [0u8; 24];
+    let hr = variant_copy_ind_into_buf(&mut tmp, src, 0);
+    if hr != crate::types::S_OK {
+        return hr;
+    }
+    // Note: if dst == src, src was VT_BYREF so clearing dst does not free the pointed-to data
+    // (which we already deep-copied/AddRef'd into `tmp`).
+    let clr_hr = VariantClear(dst);
+    if clr_hr != crate::types::S_OK {
+        let _ = VariantClear(tmp.as_mut_ptr());
+        return clr_hr;
+    }
+    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, 24);
+    crate::types::S_OK
+}
 
 enum CoercedVal {
     I64(i64),
@@ -411,6 +707,29 @@ fn vt_elem_size(vt: u16) -> u32 {
     }
 }
 
+fn vt_safearray_features(vt: u16) -> u16 {
+    match vt {
+        VT_BSTR => FADF_BSTR,
+        VT_UNKNOWN => FADF_UNKNOWN,
+        VT_DISPATCH => FADF_DISPATCH,
+        VT_VARIANT => FADF_VARIANT,
+        _ => 0,
+    }
+}
+
+unsafe fn safearray_total_elems(psa: *const u8) -> usize {
+    let dims = std::ptr::read_unaligned(psa as *const u16) as usize;
+    if dims == 0 {
+        return 0;
+    }
+    let mut total: usize = 1;
+    for i in 0..dims {
+        let cnt = std::ptr::read_unaligned(psa.add(24 + i * 8) as *const u32) as usize;
+        total = total.saturating_mul(cnt);
+    }
+    total
+}
+
 pub unsafe extern "win64" fn SafeArrayCreate(vt: u16, dims: u32, bounds: *const u8) -> *mut u8 {
     if dims == 0 || dims > 64 || bounds.is_null() {
         return std::ptr::null_mut();
@@ -427,11 +746,17 @@ pub unsafe extern "win64" fn SafeArrayCreate(vt: u16, dims: u32, bounds: *const 
         return std::ptr::null_mut();
     }
     let data = if total > 0 {
-        crate::heap::alloc(total.saturating_mul(elem_sz as usize), true)
+        let p = crate::heap::alloc(total.saturating_mul(elem_sz as usize), true);
+        if p.is_null() {
+            crate::heap::free(sa as *mut c_void);
+            return std::ptr::null_mut();
+        }
+        p
     } else {
         std::ptr::null_mut()
     };
     std::ptr::write_unaligned(sa.add(0) as *mut u16, dims as u16);
+    std::ptr::write_unaligned(sa.add(2) as *mut u16, vt_safearray_features(vt));
     std::ptr::write_unaligned(sa.add(4) as *mut u32, elem_sz);
     std::ptr::write_unaligned(sa.add(16) as *mut *mut c_void, data);
     // Windows stores rgsabound in reverse order (dim 1 last).
@@ -454,9 +779,37 @@ pub unsafe extern "win64" fn SafeArrayDestroy(psa: *mut u8) -> i32 {
     if psa.is_null() {
         return crate::types::S_OK;
     }
-    let data = std::ptr::read_unaligned(psa.add(16) as *const *mut c_void);
-    if !data.is_null() {
-        crate::heap::free(data);
+    let locks = std::ptr::read_unaligned(psa.add(8) as *const u32);
+    if locks > 0 {
+        return DISP_E_ARRAYISLOCKED;
+    }
+    let features = std::ptr::read_unaligned(psa.add(2) as *const u16);
+    let elem_sz = std::ptr::read_unaligned(psa.add(4) as *const u32) as usize;
+    let total = safearray_total_elems(psa);
+    let data = std::ptr::read_unaligned(psa.add(16) as *const *mut u8);
+    if !data.is_null() && total > 0 {
+        if (features & FADF_BSTR) != 0 && elem_sz == std::mem::size_of::<*mut u16>() {
+            for i in 0..total {
+                let b = std::ptr::read_unaligned(data.add(i * elem_sz) as *const *mut u16);
+                if !b.is_null() {
+                    SysFreeString(b);
+                }
+            }
+        } else if (features & (FADF_UNKNOWN | FADF_DISPATCH)) != 0
+            && elem_sz == std::mem::size_of::<*mut c_void>()
+        {
+            for i in 0..total {
+                let obj = std::ptr::read_unaligned(data.add(i * elem_sz) as *const *mut c_void);
+                if !obj.is_null() {
+                    crate::com::com_call_release(obj);
+                }
+            }
+        } else if (features & FADF_VARIANT) != 0 && elem_sz == 24 {
+            for i in 0..total {
+                let _ = VariantClear(data.add(i * 24));
+            }
+        }
+        crate::heap::free(data as *mut c_void);
     }
     crate::heap::free(psa as *mut c_void);
     crate::types::S_OK
@@ -602,29 +955,75 @@ pub unsafe extern "win64" fn SafeArrayCopy(psa: *const u8, out: *mut *mut u8) ->
     if out.is_null() {
         return crate::types::E_INVALIDARG;
     }
+    std::ptr::write_unaligned(out, std::ptr::null_mut());
     if psa.is_null() {
-        std::ptr::write_unaligned(out, std::ptr::null_mut());
         return crate::types::S_OK;
     }
     let dims = std::ptr::read_unaligned(psa as *const u16) as usize;
+    let features = std::ptr::read_unaligned(psa.add(2) as *const u16);
     let elem_sz = std::ptr::read_unaligned(psa.add(4) as *const u32) as usize;
     let hdr_sz = 24 + dims * 8;
-    let mut total: usize = 1;
-    for i in 0..dims {
-        let cnt = std::ptr::read_unaligned(psa.add(24 + i * 8) as *const u32) as usize;
-        total = total.saturating_mul(cnt);
-    }
+    let total = safearray_total_elems(psa);
     let dup = crate::heap::alloc(hdr_sz, true) as *mut u8;
     if dup.is_null() {
-        return 0x8007_000Eu32 as i32;
+        return E_OUTOFMEMORY;
     }
     std::ptr::copy_nonoverlapping(psa, dup, hdr_sz);
     std::ptr::write_unaligned(dup.add(8) as *mut u32, 0);
     let src_data = std::ptr::read_unaligned(psa.add(16) as *const *const u8);
     let data_bytes = total.saturating_mul(elem_sz);
     let dst_data = if data_bytes > 0 && !src_data.is_null() {
-        let p = crate::heap::alloc(data_bytes, false) as *mut u8;
-        if !p.is_null() {
+        let p = crate::heap::alloc(data_bytes, true) as *mut u8;
+        if p.is_null() {
+            crate::heap::free(dup as *mut c_void);
+            return E_OUTOFMEMORY;
+        }
+        if (features & FADF_BSTR) != 0 && elem_sz == std::mem::size_of::<*mut u16>() {
+            for i in 0..total {
+                let s = std::ptr::read_unaligned(src_data.add(i * elem_sz) as *const *const u16);
+                match copy_bstr(s) {
+                    Ok(cloned) => {
+                        std::ptr::write_unaligned(p.add(i * elem_sz) as *mut *mut u16, cloned);
+                    }
+                    Err(hr) => {
+                        for j in 0..i {
+                            let prev =
+                                std::ptr::read_unaligned(p.add(j * elem_sz) as *const *mut u16);
+                            if !prev.is_null() {
+                                SysFreeString(prev);
+                            }
+                        }
+                        crate::heap::free(p as *mut c_void);
+                        crate::heap::free(dup as *mut c_void);
+                        return hr;
+                    }
+                }
+            }
+        } else if (features & (FADF_UNKNOWN | FADF_DISPATCH)) != 0
+            && elem_sz == std::mem::size_of::<*mut c_void>()
+        {
+            for i in 0..total {
+                let obj = std::ptr::read_unaligned(src_data.add(i * elem_sz) as *const *mut c_void);
+                if !obj.is_null() {
+                    crate::com::com_call_add_ref(obj);
+                }
+                std::ptr::write_unaligned(p.add(i * elem_sz) as *mut *mut c_void, obj);
+            }
+        } else if (features & FADF_VARIANT) != 0 && elem_sz == 24 {
+            for i in 0..total {
+                let dst_v = p.add(i * 24);
+                let src_v = src_data.add(i * 24);
+                let hr = VariantCopy(dst_v, src_v);
+                if hr != crate::types::S_OK {
+                    for j in 0..i {
+                        let _ = VariantClear(p.add(j * 24));
+                    }
+                    crate::heap::free(p as *mut c_void);
+                    crate::heap::free(dup as *mut c_void);
+                    return hr;
+                }
+            }
+        } else {
             std::ptr::copy_nonoverlapping(src_data, p, data_bytes);
         }
         p as *mut c_void
@@ -698,6 +1097,364 @@ mod tests {
             let mut v_u4 = [0u8; 24];
             VariantInit(v_u4.as_mut_ptr());
             assert_eq!(VariantChangeType(v_u4.as_mut_ptr(), v_i4.as_ptr(), 0, VT_UI4), DISP_E_OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn variant_copy_copyind_and_clear_all_kinds_both_orders_no_double_free() {
+        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+        #[repr(C)]
+        struct MockComObj {
+            vtbl: *const usize,
+            refs: AtomicU32,
+        }
+        unsafe extern "win64" fn mock_qi(
+            _this: *mut MockComObj,
+            _riid: *const c_void,
+            _ppv: *mut *mut c_void,
+        ) -> i32 {
+            crate::types::E_NOINTERFACE
+        }
+        unsafe extern "win64" fn mock_add_ref(this: *mut MockComObj) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "win64" fn mock_release(this: *mut MockComObj) -> u32 {
+            let prev = (*this).refs.fetch_sub(1, Ordering::AcqRel);
+            assert!(prev > 0, "double Release detected on MockComObj");
+            prev - 1
+        }
+        let com_vtbl: [usize; 3] = [
+            mock_qi as *const () as usize,
+            mock_add_ref as *const () as usize,
+            mock_release as *const () as usize,
+        ];
+
+        // Mock IRecordInfo (19 vtable slots: 0..2 IUnknown, 5 RecordCopy, 16 RecordCreate, 18 RecordDestroy).
+        #[repr(C)]
+        struct MockRecInfo {
+            vtbl: *const usize,
+            refs: AtomicU32,
+            live_records: AtomicI32,
+        }
+        unsafe extern "win64" fn ri_add_ref(this: *mut MockRecInfo) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+        }
+        unsafe extern "win64" fn ri_release(this: *mut MockRecInfo) -> u32 {
+            let prev = (*this).refs.fetch_sub(1, Ordering::AcqRel);
+            assert!(prev > 0, "double Release on MockRecInfo");
+            prev - 1
+        }
+        unsafe extern "win64" fn ri_record_copy(
+            _this: *mut MockRecInfo,
+            src: *const u64,
+            dst: *mut u64,
+        ) -> i32 {
+            if src.is_null() || dst.is_null() {
+                return crate::types::E_INVALIDARG;
+            }
+            std::ptr::write_unaligned(dst, std::ptr::read_unaligned(src));
+            crate::types::S_OK
+        }
+        unsafe extern "win64" fn ri_record_create(this: *mut MockRecInfo) -> *mut c_void {
+            (*this).live_records.fetch_add(1, Ordering::AcqRel);
+            crate::heap::alloc(8, true)
+        }
+        unsafe extern "win64" fn ri_record_destroy(
+            this: *mut MockRecInfo,
+            rec: *mut c_void,
+        ) -> i32 {
+            let prev = (*this).live_records.fetch_sub(1, Ordering::AcqRel);
+            assert!(prev > 0, "double RecordDestroy detected");
+            crate::heap::free(rec);
+            crate::types::S_OK
+        }
+        let mut ri_vtbl = [0usize; 19];
+        ri_vtbl[0] = mock_qi as *const () as usize;
+        ri_vtbl[1] = ri_add_ref as *const () as usize;
+        ri_vtbl[2] = ri_release as *const () as usize;
+        ri_vtbl[IRECORDINFO_RECORD_COPY] = ri_record_copy as *const () as usize;
+        ri_vtbl[IRECORDINFO_RECORD_CREATE] = ri_record_create as *const () as usize;
+        ri_vtbl[IRECORDINFO_RECORD_DESTROY] = ri_record_destroy as *const () as usize;
+
+        for clear_src_first in [true, false] {
+            unsafe {
+                // 1. VT_BSTR: deep copy & clear in both orders
+                let w_hello = crate::strings::to_wide_z("HelloVariant");
+                let mut src = [0u8; 24];
+                let mut dst = [0u8; 24];
+                VariantInit(src.as_mut_ptr());
+                VariantInit(dst.as_mut_ptr());
+                (src.as_mut_ptr() as *mut u16).write_unaligned(VT_BSTR);
+                (src.as_mut_ptr().add(8) as *mut *mut u16)
+                    .write_unaligned(SysAllocString(w_hello.as_ptr()));
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), src.as_ptr()), crate::types::S_OK);
+                let src_p = (src.as_ptr().add(8) as *const *mut u16).read_unaligned();
+                let dst_p = (dst.as_ptr().add(8) as *const *mut u16).read_unaligned();
+                assert_ne!(src_p, dst_p);
+                // Self-copy is a safe no-op.
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), dst.as_ptr()), crate::types::S_OK);
+                assert_eq!((dst.as_ptr().add(8) as *const *mut u16).read_unaligned(), dst_p);
+
+                if clear_src_first {
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                    assert_eq!(crate::strings::from_wide(dst_p), "HelloVariant");
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                } else {
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                    assert_eq!(crate::strings::from_wide(src_p), "HelloVariant");
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                }
+
+                // 2. VT_ARRAY | VT_I4: deep copy via SafeArrayCopy & clear in both orders
+                let psa = SafeArrayCreateVector(VT_I4, 0, 3);
+                assert!(!psa.is_null());
+                for (i, val) in [10i32, 20, 30].iter().enumerate() {
+                    let idx = i as i32;
+                    assert_eq!(
+                        SafeArrayPutElement(psa, &idx, val as *const i32 as *const c_void),
+                        crate::types::S_OK
+                    );
+                }
+                VariantInit(src.as_mut_ptr());
+                VariantInit(dst.as_mut_ptr());
+                (src.as_mut_ptr() as *mut u16).write_unaligned(VT_ARRAY | VT_I4);
+                (src.as_mut_ptr().add(8) as *mut *mut u8).write_unaligned(psa);
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), src.as_ptr()), crate::types::S_OK);
+                let psa_dst = (dst.as_ptr().add(8) as *const *mut u8).read_unaligned();
+                assert_ne!(psa, psa_dst);
+
+                let check_i4_sa = |arr: *mut u8| {
+                    for (i, expected) in [10i32, 20, 30].iter().enumerate() {
+                        let idx = i as i32;
+                        let mut got = 0i32;
+                        assert_eq!(
+                            SafeArrayGetElement(arr, &idx, &mut got as *mut i32 as *mut c_void),
+                            crate::types::S_OK
+                        );
+                        assert_eq!(got, *expected);
+                    }
+                };
+                if clear_src_first {
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                    check_i4_sa(psa_dst);
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                } else {
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                    check_i4_sa(psa);
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                }
+
+                // 3. VT_ARRAY | VT_BSTR: deep-copies both SAFEARRAY and each BSTR element
+                let psa_bstr = SafeArrayCreateVector(VT_BSTR, 0, 2);
+                let mut raw_data: *mut c_void = std::ptr::null_mut();
+                assert_eq!(SafeArrayAccessData(psa_bstr, &mut raw_data), crate::types::S_OK);
+                let b0 = SysAllocString(crate::strings::to_wide_z("alpha").as_ptr());
+                let b1 = SysAllocString(crate::strings::to_wide_z("beta").as_ptr());
+                (raw_data as *mut *mut u16).write_unaligned(b0);
+                (raw_data as *mut *mut u16).add(1).write_unaligned(b1);
+                assert_eq!(SafeArrayUnaccessData(psa_bstr), crate::types::S_OK);
+
+                VariantInit(src.as_mut_ptr());
+                VariantInit(dst.as_mut_ptr());
+                (src.as_mut_ptr() as *mut u16).write_unaligned(VT_ARRAY | VT_BSTR);
+                (src.as_mut_ptr().add(8) as *mut *mut u8).write_unaligned(psa_bstr);
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), src.as_ptr()), crate::types::S_OK);
+                let psa_bstr_dst = (dst.as_ptr().add(8) as *const *mut u8).read_unaligned();
+                assert_ne!(psa_bstr, psa_bstr_dst);
+
+                let check_bstr_sa = |arr: *mut u8| {
+                    let mut p: *mut c_void = std::ptr::null_mut();
+                    assert_eq!(SafeArrayAccessData(arr, &mut p), crate::types::S_OK);
+                    let s0 = (p as *const *const u16).read_unaligned();
+                    let s1 = (p as *const *const u16).add(1).read_unaligned();
+                    assert_eq!(crate::strings::from_wide(s0), "alpha");
+                    assert_eq!(crate::strings::from_wide(s1), "beta");
+                    assert_eq!(SafeArrayUnaccessData(arr), crate::types::S_OK);
+                };
+                if clear_src_first {
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                    check_bstr_sa(psa_bstr_dst);
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                } else {
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                    check_bstr_sa(psa_bstr);
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                }
+
+                // 4. VT_UNKNOWN and VT_DISPATCH: AddRef on copy, Release on clear in both orders
+                for vt_com in [VT_UNKNOWN, VT_DISPATCH] {
+                    let mut obj = MockComObj {
+                        vtbl: com_vtbl.as_ptr(),
+                        refs: AtomicU32::new(1),
+                    };
+                    let obj_ptr = &mut obj as *mut MockComObj as *mut c_void;
+                    VariantInit(src.as_mut_ptr());
+                    VariantInit(dst.as_mut_ptr());
+                    (src.as_mut_ptr() as *mut u16).write_unaligned(vt_com);
+                    (src.as_mut_ptr().add(8) as *mut *mut c_void).write_unaligned(obj_ptr);
+
+                    assert_eq!(VariantCopy(dst.as_mut_ptr(), src.as_ptr()), crate::types::S_OK);
+                    assert_eq!(obj.refs.load(Ordering::Acquire), 2);
+                    if clear_src_first {
+                        assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                        assert_eq!(obj.refs.load(Ordering::Acquire), 1);
+                        assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                    } else {
+                        assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                        assert_eq!(obj.refs.load(Ordering::Acquire), 1);
+                        assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                    }
+                    assert_eq!(obj.refs.load(Ordering::Acquire), 0);
+                }
+
+                // 5. VT_BYREF (scalar, BSTR, SAFEARRAY, IUnknown, VT_VARIANT):
+                //    VariantCopy copies pointer without taking ownership;
+                //    VariantCopyInd dereferences into an owned copy.
+                let mut i4_target = 777i32;
+                let mut byref_i4 = [0u8; 24];
+                VariantInit(byref_i4.as_mut_ptr());
+                (byref_i4.as_mut_ptr() as *mut u16).write_unaligned(VT_BYREF | VT_I4);
+                (byref_i4.as_mut_ptr().add(8) as *mut *mut i32).write_unaligned(&mut i4_target);
+
+                let mut byref_copy = [0u8; 24];
+                VariantInit(byref_copy.as_mut_ptr());
+                assert_eq!(VariantCopy(byref_copy.as_mut_ptr(), byref_i4.as_ptr()), crate::types::S_OK);
+                assert_eq!((byref_copy.as_ptr() as *const u16).read_unaligned(), VT_BYREF | VT_I4);
+                assert_eq!(
+                    (byref_copy.as_ptr().add(8) as *const *mut i32).read_unaligned(),
+                    &mut i4_target as *mut i32
+                );
+
+                // VariantCopyInd resolves VT_BYREF|VT_I4 -> owned VT_I4 (also in-place!).
+                let mut ind_out = [0u8; 24];
+                VariantInit(ind_out.as_mut_ptr());
+                assert_eq!(VariantCopyInd(ind_out.as_mut_ptr(), byref_i4.as_ptr()), crate::types::S_OK);
+                assert_eq!((ind_out.as_ptr() as *const u16).read_unaligned(), VT_I4);
+                assert_eq!((ind_out.as_ptr().add(8) as *const i32).read_unaligned(), 777);
+                assert_eq!(VariantCopyInd(byref_copy.as_mut_ptr(), byref_copy.as_ptr()), crate::types::S_OK);
+                assert_eq!((byref_copy.as_ptr() as *const u16).read_unaligned(), VT_I4);
+                assert_eq!((byref_copy.as_ptr().add(8) as *const i32).read_unaligned(), 777);
+                assert_eq!(VariantClear(byref_i4.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(VariantClear(byref_copy.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(VariantClear(ind_out.as_mut_ptr()), crate::types::S_OK);
+
+                // VT_BYREF | VT_ARRAY | VT_I4: VariantCopy does not free; VariantCopyInd deep-copies.
+                let mut sa_owner = SafeArrayCreateVector(VT_I4, 0, 1);
+                let idx0 = 0i32;
+                let v99 = 99i32;
+                assert_eq!(SafeArrayPutElement(sa_owner, &idx0, &v99 as *const i32 as *const c_void), crate::types::S_OK);
+                let mut byref_sa = [0u8; 24];
+                VariantInit(byref_sa.as_mut_ptr());
+                (byref_sa.as_mut_ptr() as *mut u16).write_unaligned(VT_BYREF | VT_ARRAY | VT_I4);
+                (byref_sa.as_mut_ptr().add(8) as *mut *mut *mut u8).write_unaligned(&mut sa_owner);
+
+                let mut byref_sa_copy = [0u8; 24];
+                VariantInit(byref_sa_copy.as_mut_ptr());
+                assert_eq!(VariantCopy(byref_sa_copy.as_mut_ptr(), byref_sa.as_ptr()), crate::types::S_OK);
+                assert_eq!(VariantCopyInd(ind_out.as_mut_ptr(), byref_sa.as_ptr()), crate::types::S_OK);
+                assert_eq!((ind_out.as_ptr() as *const u16).read_unaligned(), VT_ARRAY | VT_I4);
+                let ind_psa = (ind_out.as_ptr().add(8) as *const *mut u8).read_unaligned();
+                assert_ne!(ind_psa, sa_owner);
+
+                // Clearing both VT_BYREF variants must NOT destroy `sa_owner`.
+                assert_eq!(VariantClear(byref_sa.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(VariantClear(byref_sa_copy.as_mut_ptr()), crate::types::S_OK);
+                let mut check = 0i32;
+                assert_eq!(SafeArrayGetElement(sa_owner, &idx0, &mut check as *mut i32 as *mut c_void), crate::types::S_OK);
+                assert_eq!(check, 99);
+                if clear_src_first {
+                    assert_eq!(SafeArrayDestroy(sa_owner), crate::types::S_OK);
+                    assert_eq!(SafeArrayGetElement(ind_psa, &idx0, &mut check as *mut i32 as *mut c_void), crate::types::S_OK);
+                    assert_eq!(check, 99);
+                    assert_eq!(VariantClear(ind_out.as_mut_ptr()), crate::types::S_OK);
+                } else {
+                    assert_eq!(VariantClear(ind_out.as_mut_ptr()), crate::types::S_OK);
+                    assert_eq!(SafeArrayGetElement(sa_owner, &idx0, &mut check as *mut i32 as *mut c_void), crate::types::S_OK);
+                    assert_eq!(check, 99);
+                    assert_eq!(SafeArrayDestroy(sa_owner), crate::types::S_OK);
+                }
+
+                // VT_BYREF | VT_UNKNOWN: VariantCopy leaves refs=1; VariantCopyInd AddRefs to 2.
+                let mut ref_obj = MockComObj { vtbl: com_vtbl.as_ptr(), refs: AtomicU32::new(1) };
+                let mut ref_obj_ptr = &mut ref_obj as *mut MockComObj as *mut c_void;
+                let mut byref_unk = [0u8; 24];
+                VariantInit(byref_unk.as_mut_ptr());
+                (byref_unk.as_mut_ptr() as *mut u16).write_unaligned(VT_BYREF | VT_UNKNOWN);
+                (byref_unk.as_mut_ptr().add(8) as *mut *mut *mut c_void).write_unaligned(&mut ref_obj_ptr);
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), byref_unk.as_ptr()), crate::types::S_OK);
+                assert_eq!(ref_obj.refs.load(Ordering::Acquire), 1);
+                assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(ref_obj.refs.load(Ordering::Acquire), 1);
+                assert_eq!(VariantCopyInd(dst.as_mut_ptr(), byref_unk.as_ptr()), crate::types::S_OK);
+                assert_eq!((dst.as_ptr() as *const u16).read_unaligned(), VT_UNKNOWN);
+                assert_eq!(ref_obj.refs.load(Ordering::Acquire), 2);
+                assert_eq!(VariantClear(byref_unk.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(ref_obj.refs.load(Ordering::Acquire), 2);
+                assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(ref_obj.refs.load(Ordering::Acquire), 1);
+
+                // VT_BYREF | VT_VARIANT pointing to an owned VT_BSTR resolves cleanly.
+                let mut inner_bstr_v = [0u8; 24];
+                VariantInit(inner_bstr_v.as_mut_ptr());
+                (inner_bstr_v.as_mut_ptr() as *mut u16).write_unaligned(VT_BSTR);
+                (inner_bstr_v.as_mut_ptr().add(8) as *mut *mut u16)
+                    .write_unaligned(SysAllocString(crate::strings::to_wide_z("Nested").as_ptr()));
+                let mut byref_var = [0u8; 24];
+                VariantInit(byref_var.as_mut_ptr());
+                (byref_var.as_mut_ptr() as *mut u16).write_unaligned(VT_BYREF | VT_VARIANT);
+                (byref_var.as_mut_ptr().add(8) as *mut *mut u8).write_unaligned(inner_bstr_v.as_mut_ptr());
+                assert_eq!(VariantCopyInd(dst.as_mut_ptr(), byref_var.as_ptr()), crate::types::S_OK);
+                assert_eq!((dst.as_ptr() as *const u16).read_unaligned(), VT_BSTR);
+                let resolved_b = (dst.as_ptr().add(8) as *const *const u16).read_unaligned();
+                assert_ne!(resolved_b, (inner_bstr_v.as_ptr().add(8) as *const *const u16).read_unaligned());
+                assert_eq!(VariantClear(byref_var.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(VariantClear(inner_bstr_v.as_mut_ptr()), crate::types::S_OK);
+                assert_eq!(crate::strings::from_wide(resolved_b), "Nested");
+                assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+
+                // 6. VT_RECORD: copies via IRecordInfo::RecordCreate + RecordCopy, clears via RecordDestroy + Release.
+                let mut rec_info = MockRecInfo {
+                    vtbl: ri_vtbl.as_ptr(),
+                    refs: AtomicU32::new(1),
+                    live_records: AtomicI32::new(0),
+                };
+                let rec_info_ptr = &mut rec_info as *mut MockRecInfo as *mut c_void;
+                let rec0 = ri_record_create(&mut rec_info);
+                (rec0 as *mut u64).write_unaligned(0xDEAD_BEEF_CAFE_BABE);
+                VariantInit(src.as_mut_ptr());
+                VariantInit(dst.as_mut_ptr());
+                (src.as_mut_ptr() as *mut u16).write_unaligned(VT_RECORD);
+                (src.as_mut_ptr().add(8) as *mut *mut c_void).write_unaligned(rec0);
+                (src.as_mut_ptr().add(16) as *mut *mut c_void).write_unaligned(rec_info_ptr);
+
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), src.as_ptr()), crate::types::S_OK);
+                let rec1 = (dst.as_ptr().add(8) as *const *mut c_void).read_unaligned();
+                assert_ne!(rec0, rec1);
+                assert_eq!(rec_info.refs.load(Ordering::Acquire), 2);
+                assert_eq!(rec_info.live_records.load(Ordering::Acquire), 2);
+
+                if clear_src_first {
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                    assert_eq!(rec_info.live_records.load(Ordering::Acquire), 1);
+                    assert_eq!((rec1 as *const u64).read_unaligned(), 0xDEAD_BEEF_CAFE_BABE);
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                } else {
+                    assert_eq!(VariantClear(dst.as_mut_ptr()), crate::types::S_OK);
+                    assert_eq!(rec_info.live_records.load(Ordering::Acquire), 1);
+                    assert_eq!((rec0 as *const u64).read_unaligned(), 0xDEAD_BEEF_CAFE_BABE);
+                    assert_eq!(VariantClear(src.as_mut_ptr()), crate::types::S_OK);
+                }
+                assert_eq!(rec_info.refs.load(Ordering::Acquire), 0);
+                assert_eq!(rec_info.live_records.load(Ordering::Acquire), 0);
+
+                // Invalid VT_RECORD (non-null pvRecord with null pRecInfo) fails loudly with DISP_E_BADVARTYPE.
+                let mut bad_rec = [0u8; 24];
+                VariantInit(bad_rec.as_mut_ptr());
+                (bad_rec.as_mut_ptr() as *mut u16).write_unaligned(VT_RECORD);
+                (bad_rec.as_mut_ptr().add(8) as *mut usize).write_unaligned(0x1234);
+                assert_eq!(VariantCopy(dst.as_mut_ptr(), bad_rec.as_ptr()), DISP_E_BADVARTYPE);
+            }
         }
     }
 }
