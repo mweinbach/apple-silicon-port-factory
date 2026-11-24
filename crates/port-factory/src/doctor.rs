@@ -13,7 +13,7 @@ use crate::game_profiles::{
     audit_all_game_profiles, format_game_profiles_tsv, TOP_GAME_PROFILES,
 };
 use crate::ops_db::{catalog_stats, format_tsv as format_ops_tsv};
-use crate::win32_db::Win32Database;
+use crate::win32_db::{ImplKind, Win32Database};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -354,7 +354,15 @@ pub fn check_or_fix_db_tsvs(
         "win32_apis.tsv",
         db_dir.join("win32_apis.tsv"),
         "Win32 Database",
-        format!("{} APIs across {} DLLs", win_db.entries.len(), dll_count.len()),
+        format!(
+            "{} APIs across {} DLLs ({} real, {} partial, {} stub, {} failing)",
+            win_db.entries.len(),
+            dll_count.len(),
+            win_db.count_by_impl_kind(ImplKind::Real),
+            win_db.count_by_impl_kind(ImplKind::Partial),
+            win_db.count_by_impl_kind(ImplKind::Stub),
+            win_db.count_by_impl_kind(ImplKind::Failing),
+        ),
         "cargo opsdb -- win32-sync",
         &win_expected,
         fix,
