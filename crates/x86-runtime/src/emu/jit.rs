@@ -77,7 +77,7 @@ use crate::emu::Cpu;
 use core::mem::offset_of;
 
 /// Encoding consumed by `Tr::emit_timestamp`: bit 1 clear selects a raw read. Otherwise
-/// bit 0 selects the verifier clock and bit 2 selects the 24 MHz conversion.
+/// bit 0 selects the verifier clock, bit 2 the 24 MHz scale, and bit 3 ECV on a scaled clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(super) enum TscMode {
@@ -86,39 +86,20 @@ pub(super) enum TscMode {
     Scaled = 2,
     Frozen = 3,
     From24Mhz = 6,
+    ScaledEcv = 10,
+    From24MhzEcv = 14,
 }
 
 impl TscMode {
     fn host() -> Self {
-        static LIVE: std::sync::OnceLock<TscMode> = std::sync::OnceLock::new();
-        *LIVE.get_or_init(|| match super::tsc::counter_frequency() {
-            0 | super::tsc::TSC_NOMINAL_HZ if Self::has_ecv() => Self::NativeEcv,
-            0 | super::tsc::TSC_NOMINAL_HZ => Self::Native,
-            hz if super::tsc::is_24mhz_to_ns(hz) => Self::From24Mhz,
-            _ => Self::Scaled,
-        })
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn has_ecv() -> bool {
-        let mut flag = 0u32;
-        let mut size = size_of::<u32>();
-        // Darwin exposes the EL0 counter feature through this sysctl. Older kernels may omit it.
-        let rc = unsafe {
-            win32_rt::libc::sysctlbyname(
-                c"hw.optional.arm.FEAT_ECV".as_ptr(),
-                (&raw mut flag).cast(),
-                &mut size,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        rc == 0 && size == size_of::<u32>() && flag == 1
-    }
-
-    #[cfg(not(target_vendor = "apple"))]
-    fn has_ecv() -> bool {
-        false
+        match (super::tsc::counter_frequency(), super::tsc::has_ecv()) {
+            (0 | super::tsc::TSC_NOMINAL_HZ, true) => Self::NativeEcv,
+            (0 | super::tsc::TSC_NOMINAL_HZ, false) => Self::Native,
+            (hz, true) if super::tsc::is_24mhz_to_ns(hz) => Self::From24MhzEcv,
+            (hz, false) if super::tsc::is_24mhz_to_ns(hz) => Self::From24Mhz,
+            (_, true) => Self::ScaledEcv,
+            (_, false) => Self::Scaled,
+        }
     }
 
     fn for_run(self) -> Self {

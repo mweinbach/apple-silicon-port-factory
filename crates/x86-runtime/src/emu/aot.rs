@@ -2,7 +2,7 @@
 //! Translator side: `jit/aot.rs`.
 //!
 //! Submodules:
-//! - `format`: `.aot` v5/v6 binary encoding/decoding, image/codegen hashing, cache-file lookup, multi-bank `Image`
+//! - `format`: `.aot` v5–v7 binary encoding/decoding, image/codegen hashing, cache-file lookup, multi-bank `Image`
 //! - `cfg_discover`: PE32+ root discovery (`.pdata`, EntryPoint, Exports, TLS, CFG, DIR64 relocs) & parallel static CFG closure
 //! - `jumptable`: RIP-relative switch / jump-table abstract interpretation
 //! - `builder`: parallel block assembly, multi-bank chunk packing, `aot_prewarm_all_mapped`, `VerifyAotBatch`

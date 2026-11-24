@@ -86,58 +86,22 @@ impl Tr<'_> {
     /// Read the guest clock into EDX:EAX with runtime-selected timing and verifier modes.
     fn emit_timestamp(&mut self, ordered: bool) {
         self.a.ldr(8, T1, XCPU, OFF_TSC_MODE);
-        let native_ecv = if ordered {
-            // Complete prior loads in all modes. CNTVCTSS_EL0 samples in order
-            // on ECV hosts. Ordinary CNTVCT_EL0 needs an explicit ISB.
+        // Keep the direct hardware sample inline. The bank supplies shared leaf routines
+        // for other timer rates and verifier reads, including in signed static images.
+        let slow = if ordered {
             self.a.dsb_ishld();
-            let ecv = self.a.cbz(false, T1);
-            self.a.isb();
-            Some(ecv)
-        } else {
-            None
-        };
-        let native_rate = self.a.tbz(T1, 1); // NativeEcv or Native
-        let frozen = self.a.tbnz(T1, 0);
-        self.a.mrs_cntvct(T0);
-        let from_24mhz = self.a.tbnz(T1, 2);
-        // Exact 1 GHz conversion: floor(CNTVCT_EL0 * 1_000_000_000 / CNTFRQ_EL0)
-        // mod 2^64 via Euclidean split `v = q*f + r` (`0 <= r < f < 2^32`, so
-        // `r * 1e9 < 4.3e18 < 2^64` never overflows for any 64-bit `CNTVCT_EL0`).
-        self.a.mrs_cntfrq(T1);
-        self.a.mov_imm(true, T2, crate::emu::tsc::TSC_NOMINAL_HZ);
-        self.a.udiv(true, T3, T0, T1);
-        self.a.msub(true, T0, T3, T1, T0);
-        self.a.mul(true, T0, T0, T2);
-        self.a.mul(true, T3, T3, T2);
-        self.a.udiv(true, T0, T0, T1);
-        self.a.addsub_rr(true, false, false, T0, T3, T0, 0);
-        let scaled_done = self.a.b();
-
-        self.a.bind(from_24mhz);
-        // Match scale_counter_to_tsc: 41*x + floor(2*x/3), wrapping at 64 bits.
-        // The repeating-bit part of the Q64 multiplier fits one ORR-immediate.
-        self.a.mov_imm(true, T2, crate::emu::tsc::TWO_THIRDS_Q64 - 1);
-        self.a.addsub_ri(true, false, false, T2, T2, 1, false);
-        self.a.umulh(T1, T0, T2);
-        self.a.addsub_rr(true, false, false, T2, T0, T0, 2); // 5*x
-        self.a.addsub_rr(true, false, false, T0, T0, T2, 3); // 41*x
-        self.a.addsub_rr(true, false, false, T0, T0, T1, 0);
-        let from_24mhz_done = self.a.b();
-
-        self.a.bind(frozen);
-        self.a.mov_imm(true, T0, crate::emu::GUEST_TSC);
-        let frozen_done = self.a.b();
-        self.a.bind(native_rate);
-        self.a.mrs_cntvct(T0);
-        if let Some(ecv) = native_ecv {
-            let native_done = self.a.b();
-            self.a.bind(ecv);
+            let slow = self.a.cbnz(false, T1);
             self.a.mrs_cntvctss(T0);
-            self.a.bind(native_done);
-        }
-        self.a.bind(frozen_done);
-        self.a.bind(from_24mhz_done);
-        self.a.bind(scaled_done);
+            slow
+        } else {
+            // A full block can exceed the 32 KiB range of TBZ. B reaches its cold fragment.
+            let native = self.a.tbz(T1, 1);
+            let slow = self.a.b();
+            self.a.bind(native);
+            self.a.mrs_cntvct(T0);
+            slow
+        };
+        self.tsc_colds.push((slow, self.a.pos, ordered));
         self.a.mov_rr(false, g(0), T0);
         self.a.lsr_i(true, g(2), T0, 32);
         self.set_lb(0, 64);
@@ -145,6 +109,22 @@ impl Tr<'_> {
         if ordered {
             self.a.movz(true, g(1), 0, 0);
             self.set_lb(1, 64);
+        }
+    }
+
+    pub(super) fn emit_timestamp_fallbacks(&mut self) {
+        for &(site, resume, ordered) in &self.tsc_colds {
+            self.a.bind(site);
+            let back = self.a.addr_of(resume);
+            if !ordered {
+                let uncommon = self.a.tbz(T1, 2);
+                self.a.mrs_cntvct(T0);
+                super::stubs::emit_tsc_scale_24mhz(&mut self.a);
+                self.a.b_to(back);
+                self.a.bind(uncommon);
+            }
+            self.a.bl_to(if ordered { self.rdtscp_slow } else { self.rdtsc_slow });
+            self.a.b_to(back);
         }
     }
 

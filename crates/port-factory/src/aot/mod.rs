@@ -382,6 +382,7 @@ pub fn compile_pe_bytes_to_rust(
     // 5. Lift each function to native Rust.
     let mut functions_meta = Vec::new();
     let mut total_insns = 0usize;
+    let mut uses_rdtscp = false;
     let mut total_lowered = 0usize;
     let mut total_fallback = 0usize;
 
@@ -407,6 +408,7 @@ pub fn compile_pe_bytes_to_rust(
             &iat_thunks,
             &imports_by_rva,
             &eh_continuation_set,
+            &mut uses_rdtscp,
             opts,
         )?;
         total_insns += fn_meta.instruction_count;
@@ -423,6 +425,7 @@ pub fn compile_pe_bytes_to_rust(
         &pe.sections,
         &callback_roots,
         &eh_continuations,
+        uses_rdtscp,
     )?;
 
     Ok(AotModuleOutput {
@@ -495,6 +498,7 @@ fn lift_function(
     iat_thunks: &HashMap<u32, u32>,
     imports_by_rva: &BTreeMap<u32, AotImportBinding>,
     eh_continuations: &BTreeSet<u32>,
+    uses_rdtscp: &mut bool,
     opts: &AotOptions,
 ) -> Result<(AotFunctionMeta, String)> {
     let rust_ident = format!("fn_rva_{begin_rva:08x}");
@@ -662,6 +666,9 @@ fn lift_function(
 
         for &(insn_rva, ref ins) in blk_insns {
             total_fn_insns += 1;
+            if ins.mnemonic() == Mnemonic::Rdtscp {
+                *uses_rdtscp = true;
+            }
             let mut disasm = String::new();
             fmt.format(ins, &mut disasm);
             writeln!(out, "                    // 0x{insn_rva:08X}: {disasm}")?;
@@ -1017,6 +1024,20 @@ fn main() {{
         raw[0x1180..0x1186].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
 
         raw
+    }
+
+    #[test]
+    fn ordered_clock_setup_follows_the_functions_selected_for_recompilation() {
+        let mut pe = build_callback_and_5arg_pe_fixture();
+        pe[0x1000..0x1003].copy_from_slice(&[0x0f, 0x31, 0xc3]); // rdtsc; ret
+        pe[0x1080..0x1084].copy_from_slice(&[0x0f, 0x01, 0xf9, 0xc3]); // rdtscp; ret
+        let db = Win32Database::default();
+        for (rva, ordered) in [(0x1000, false), (0x1080, true)] {
+            let opts = AotOptions { filter_rvas: [rva].into(), ..AotOptions::default() };
+            let module = compile_pe_bytes_to_rust("clock.dll", &pe, &db, &opts).unwrap();
+            assert_eq!(module.functions.len(), 1);
+            assert_eq!(module.rust_source.contains("let _ = aot_tsc::has_ecv()"), ordered);
+        }
     }
 
     #[test]

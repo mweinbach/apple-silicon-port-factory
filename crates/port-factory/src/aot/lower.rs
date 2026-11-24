@@ -1707,7 +1707,7 @@ fn main() {
         src.push_str("#![allow(unused_variables, unused_mut, unused_assignments, unused_parens, dead_code, non_snake_case, unreachable_code, unused_unsafe, clippy::all)]\n");
         emit_aot_runtime_prelude(&mut src, BASE, 0x10000).unwrap();
         emit_import_table(&mut src, &BTreeMap::new()).unwrap();
-        emit_function_directory(&mut src, &[], &[], &[], &[]).unwrap();
+        emit_function_directory(&mut src, &[], &[], &[], &[], true).unwrap();
         src.push_str(
             "#[derive(Clone, Copy, Default)]\nstruct St { r: [u64; 16], xmm: [u128; 16], cf: bool, zf: bool, sf: bool, of: bool }\n\
              #[repr(C, align(16))]\nstruct A16([u64; 2]);\n\

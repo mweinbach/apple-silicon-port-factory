@@ -26,11 +26,6 @@ pub fn image_base() -> u64 {{
     IMAGE_BASE.load(core::sync::atomic::Ordering::Relaxed)
 }}
 
-#[inline(always)]
-pub fn set_image_base(base: u64) {{
-    IMAGE_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
-}}
-
 #[derive(Clone, Copy)]
 pub struct AotFunctionEntry {{
     pub begin_rva: u32,
@@ -281,7 +276,16 @@ pub(super) fn emit_function_directory(
     sections: &[pe_image::Section],
     callback_roots: &[AotCallbackRoot],
     eh_continuations: &[u32],
+    uses_rdtscp: bool,
 ) -> Result<()> {
+    writeln!(out, "pub fn set_image_base(base: u64) {{")?;
+    writeln!(out, "    IMAGE_BASE.store(base, core::sync::atomic::Ordering::Relaxed);")?;
+    if uses_rdtscp {
+        // Probe during module setup so the first timed guest region also uses the fast path.
+        writeln!(out, r#"    #[cfg(target_arch = "aarch64")]
+    if HOST_TSC_READER.get().is_none() {{ let _ = aot_tsc::has_ecv(); }}"#)?;
+    }
+    writeln!(out, "}}\n")?;
     writeln!(out, "pub static AOT_FUNCTIONS: &[AotFunctionEntry] = &[")?;
     for f in functions {
         writeln!(

@@ -1,4 +1,4 @@
-//! AOT `.aot` file format (v5/v6), image/codegen hashing, cache-file lookup, and
+//! AOT `.aot` file format (v5–v7), image/codegen hashing, cache-file lookup, and
 //! multi-bank hot/cold `Image` layout.
 
 use crate::emu::jit::{
@@ -14,7 +14,10 @@ pub(super) const MAGIC: [u8; 8] = *b"AW2AOT\0\x01";
 /// Legacy single-bank format version (still cleanly decoded and upgraded to 1-bank `Image`).
 pub(super) const FORMAT_VERSION_V5: u32 = 5;
 /// Multi-bank format version (stores `stub_banks` table for >112 MiB executables).
-pub(super) const FORMAT_VERSION: u32 = 6;
+pub(super) const FORMAT_VERSION_V6: u32 = 6;
+/// Includes both shared timestamp entry points in each bank's stub table.
+pub(super) const FORMAT_VERSION: u32 = 7;
+const LEGACY_STUB_COUNT: usize = 10;
 /// Bump on any codegen-relevant change the source hash can't see.
 const AOT_CODEGEN_VERSION: u64 = 3;
 
@@ -645,7 +648,7 @@ impl<'a> Rd<'a> {
 /// ([`super::runtime::load_module`]), then cleared in the file.
 pub(super) const FLAG_VERIFY_PENDING: u32 = 1;
 
-/// Serialise (little-endian, v6): header, stub banks, blocks, links, relocs, assumptions,
+/// Serialise (little-endian, v7): header, stub banks, blocks, links, relocs, assumptions,
 /// code, checksum.
 pub(super) fn encode(name: &str, key: &AotKey, img: &Image, flags: u32) -> Vec<u8> {
     encode_with_version(name, key, img, flags, FORMAT_VERSION)
@@ -677,11 +680,12 @@ pub(super) fn encode_with_version(
     }
     put32(&mut w, name.len() as u32);
     w.extend_from_slice(name.as_bytes());
-    for s in img.stubs {
+    let stub_count = if version <= FORMAT_VERSION_V6 { LEGACY_STUB_COUNT } else { img.stubs.len() };
+    for &s in &img.stubs[..stub_count] {
         put32(&mut w, s);
     }
     put32(&mut w, AOT_STUBS_BYTES as u32);
-    if version >= FORMAT_VERSION {
+    if version >= FORMAT_VERSION_V6 {
         put32(&mut w, banks.len() as u32);
         for &bo in banks {
             put32(&mut w, bo);
@@ -753,7 +757,7 @@ pub(super) fn set_flags(bytes: &mut [u8], flags: u32) -> bool {
     true
 }
 
-/// Parse an encoded v5 (single-bank, upgraded cleanly) or v6 (multi-bank) `.aot` file:
+/// Parse a v5 single-bank or v6/v7 multi-bank `.aot` file:
 /// `(module name, key, image, header flags)`.
 pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32)> {
     if bytes.len() < 16 {
@@ -770,7 +774,7 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
         return None;
     }
     let version = r.u32()?;
-    if version != FORMAT_VERSION_V5 && version != FORMAT_VERSION {
+    if !(FORMAT_VERSION_V5..=FORMAT_VERSION).contains(&version) {
         return None;
     }
     let flags = r.u32()?;
@@ -788,13 +792,15 @@ pub(in crate::emu) fn decode(bytes: &[u8]) -> Option<(String, AotKey, Image, u32
     let nlen = r.u32()? as usize;
     let name = String::from_utf8(r.take(nlen)?.to_vec()).ok()?;
     let mut img = Image::default();
-    for s in img.stubs.iter_mut() {
+    let stub_count = if version <= FORMAT_VERSION_V6 { LEGACY_STUB_COUNT } else { img.stubs.len() };
+    img.stubs[stub_count..].fill(u32::MAX);
+    for s in &mut img.stubs[..stub_count] {
         *s = r.u32()?;
     }
     if r.u32()? as usize != AOT_STUBS_BYTES {
         return None;
     }
-    if version >= FORMAT_VERSION {
+    if version >= FORMAT_VERSION_V6 {
         let nbanks = r.u32()? as usize;
         if nbanks == 0 || nbanks.checked_mul(4).is_none_or(|b| b > body.len() - r.p) {
             return None;
@@ -909,7 +915,7 @@ fn peek_cache_header(path: &Path) -> Option<(String, AotKey)> {
         return None;
     }
     let version = r.u32()?;
-    if version != FORMAT_VERSION_V5 && version != FORMAT_VERSION {
+    if !(FORMAT_VERSION_V5..=FORMAT_VERSION).contains(&version) {
         return None;
     }
     let _flags = r.u32()?;

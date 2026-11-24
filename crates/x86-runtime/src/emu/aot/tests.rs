@@ -11,7 +11,7 @@ use super::cfg_discover::{discover, discover_pe_roots, discover_with_threads, Fu
 use super::format::{
     codegen_hash, decode, encode, encode_with_version, module_key, read_cache_file,
     read_cache_file_in, read_cached_preferred_base_in, set_flags, AotKey, Image, BUILD_VBASE,
-    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, MAX_CODE,
+    FLAG_VERIFY_PENDING, FORMAT_VERSION_V5, FORMAT_VERSION_V6, MAX_CODE,
 };
 use super::runtime::{
     install_image, load_module, load_verify, Verify, DIR, FIRST_LOAD_FULL_MAX,
@@ -1858,7 +1858,7 @@ fn bg_job_and_load_skip_runtime_modified_code_regions() {
 /// Multi-bank AOT image test (using a small test `bank_span` = 16 KiB):
 /// - Verifies multiple stub banks emit cleanly with 16-byte alignment and no block overlaps;
 /// - Verifies every stub branch in every bank targets its OWN bank's stub offsets within range;
-/// - Verifies v6 `.aot` round-trips cleanly and legacy v5 `.aot` decodes & upgrades cleanly;
+/// - Verifies current and legacy stub tables and bank directories round-trip;
 /// - Verifies single- vs multi-threaded multi-bank builds are bit-for-bit deterministic;
 /// - Installs the multi-bank image with `Verify::All` (0 mismatches) and executes functions
 ///   in every bank against the interpreter oracle.
@@ -1910,7 +1910,11 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                 a.imul_3(eax, eax, ((i as i32) * 2) | 1).unwrap();
                 a.ret().unwrap();
                 a.set_label(&mut l_alt).unwrap();
-                a.mov(eax, edx).unwrap();
+                a.mov(r10d, edx).unwrap();
+                a.rdtsc().unwrap();
+                a.add(r10d, eax).unwrap();
+                a.rdtscp().unwrap();
+                a.add(eax, r10d).unwrap();
                 a.add(eax, (i as i32) + 100).unwrap();
                 a.ret().unwrap();
                 let code = a.assemble(va).unwrap();
@@ -1947,13 +1951,14 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
             let stubs_words = (AOT_STUBS_BYTES / 4) as i64;
             let mut blocks_per_bank = vec![0usize; img_1.stub_banks.len()];
             let mut stub_branches_checked = 0usize;
+            let mut timestamp_calls = vec![[false; 2]; img_1.stub_banks.len()];
             for b in &img_1.blocks {
                 let bi = img_1.bank_index_of(b.code_off);
                 blocks_per_bank[bi] += 1;
                 let bank_off = img_1.stub_banks[bi] as i64;
                 let bank_w = bank_off / 4;
                 // Check hot words and cold words (up to any literal slots; scan all B/BL targeting a stub range).
-                let check_slice = |words: &[u32], base_off: u32, count: &mut usize| {
+                let mut check_slice = |words: &[u32], base_off: u32, count: &mut usize| {
                     let base_w = (base_off as i64) / 4;
                     for (i, &w) in words.iter().enumerate() {
                         if (w & 0x7C00_0000) == 0x1400_0000 {
@@ -1970,6 +1975,9 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                                     "stub branch exceeded bank span: {}",
                                     imm26 * 4
                                 );
+                                if let Some(op) = img_1.stubs[10..].iter().position(|&s| s == stub_w) {
+                                    timestamp_calls[bi][op] = true;
+                                }
                                 *count += 1;
                             } else {
                                 // Must NEVER target a different bank's stub area!
@@ -1995,7 +2003,9 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
             );
             assert!(stub_branches_checked > 0, "expected stub branches verified across banks");
 
-            // Determinism: 1, 2, 4 threads must produce bit-for-bit identical v6 `.aot` bytes!
+            assert!(timestamp_calls.iter().filter(|&&calls| calls == [true; 2]).count() >= 2);
+
+            // Thread count must not affect the emitted image.
             let key = unsafe { module_key(base, pe.len) };
             let bytes_1 = encode("multibank.dll", &key, &img_1, 0);
             for threads in [2usize, 4] {
@@ -2012,14 +2022,21 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                 );
             }
 
-            // Round-trip v6 decode AND legacy v5 single-bank decode upgrade.
-            let (name_dec, key_dec, img_dec, flags_dec) = decode(&bytes_1).expect("decode v6 multi-bank");
+            // Preserve both timestamp entries in the current format.
+            let (name_dec, key_dec, img_dec, flags_dec) = decode(&bytes_1).expect("decode multi-bank cache");
             assert_eq!(name_dec, "multibank.dll");
             assert_eq!(key_dec, key);
             assert_eq!(flags_dec, 0);
             assert_eq!(img_dec.stub_banks, img_1.stub_banks);
             assert_eq!(img_dec.blocks, img_1.blocks);
+            assert_eq!(img_dec.stubs, img_1.stubs);
             assert_eq!(img_dec.code, img_1.code);
+
+            let v6_bytes = encode_with_version("legacy_v6.dll", &key, &img_1, 0, FORMAT_VERSION_V6);
+            let (_, _, v6_img, _) = decode(&v6_bytes).expect("decode legacy multi-bank header");
+            assert_eq!(v6_img.stub_banks, img_1.stub_banks);
+            assert_eq!(&v6_img.stubs[..10], &img_1.stubs[..10]);
+            assert_eq!(&v6_img.stubs[10..], &[u32::MAX; 2]);
 
             let single_img = unsafe { build_image(pool1.get_one(), &ips[..4], BUILD_VBASE) }.expect("single-bank");
             let v5_bytes = encode_with_version("legacy_v5.dll", &key, &single_img, FLAG_VERIFY_PENDING, FORMAT_VERSION_V5);
@@ -2047,9 +2064,12 @@ fn aot_multibank_chunk_assembler_roundtrip_determinism_and_exec() {
                 assert!(find(entry).is_some(), "func {fi} missing from AOT dir");
                 for (a0, a1) in [(2u64, 15u64), (20u64, 33u64)] {
                     jit::force(2);
-                    let (exp, _) = unsafe { crate::emu::emu_run_full(entry, [a0, a1, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]) };
+                    let run = || crate::emu::with_frozen_tsc(|| unsafe {
+                        crate::emu::emu_run_full(entry, [a0, a1, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8])
+                    });
+                    let (exp, _) = run();
                     jit::force(1);
-                    let (got, _) = unsafe { crate::emu::emu_run_full(entry, [a0, a1, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]) };
+                    let (got, _) = run();
                     jit::force(0);
                     assert_eq!(got, exp, "multi-bank func {fi} mismatch for args ({a0}, {a1})");
                 }

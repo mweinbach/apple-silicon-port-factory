@@ -16,7 +16,7 @@ pub(super) fn register(cases: &mut Cases) {
 }
 
 fn register_translated_instructions(cases: &mut Cases) {
-    // Translate each guest instruction in isolation. These forms never branch to a shared stub.
+    // Translate each guest instruction in isolation. Use fixed virtual addresses for its shared timestamp stubs.
     let stubs = StubAddrs {
         exit: 0,
         lookup_rip: 0,
@@ -27,6 +27,8 @@ fn register_translated_instructions(cases: &mut Cases) {
         spill_xmm: 0,
         reload_xmm: 0,
         clear_ymm_hi: 0,
+        rdtsc_slow: 0xc00,
+        rdtscp_slow: 0xb00,
     };
     let mut prep = Prep {
         ops: [FastOp::default(); BLK_MAX_INSNS],
@@ -52,6 +54,7 @@ fn register_translated_instructions(cases: &mut Cases) {
         let a = Asm::new(buf.as_mut_ptr(), 0x1000, buf.len());
         let mut tr = new_tr(a, &prep.ops[..1], &prep, &stubs, false, &mut scratch);
         tr.op(0);
+        tr.emit_timestamp_fallbacks();
         assert!(!tr.a.overflow);
         cases.record(name, expected, &buf[..tr.a.pos]);
         tr.return_scratch(&mut scratch);
@@ -128,65 +131,44 @@ fn register_translated_instructions(cases: &mut Cases) {
         ],
     );
     let load_mode = format!("ldrb w1, [x15, #{}]", crate::emu::jit::OFF_TSC_MODE);
-    let dispatch_and_scale = [
-        ("tbz", "tbz w1, #1, #92"),
-        ("tbnz", "tbnz w1, #0, #80"),
-        ("mrs", "mrs x0, cntvct_el0"),
-        ("tbnz", "tbnz w1, #2, #44"),
-        ("mrs", "mrs x1, cntfrq_el0"),
-        ("movz", "movz x2, #0xca00"),
-        ("movk", "movk x2, #0x3b9a, lsl #16"),
-        ("udiv", "udiv x3, x0, x1"),
-        ("msub", "msub x0, x3, x1, x0"),
-        ("mul_madd", "mul x0, x0, x2"),
-        ("mul_madd", "mul x3, x3, x2"),
-        ("udiv", "udiv x0, x0, x1"),
-        ("add_addsub_shift", "add x0, x3, x0"),
-    ];
-    let from_24mhz = [
-        ("mov_orr_log_imm", "mov x2, #0xaaaaaaaaaaaaaaaa"),
-        ("add_addsub_imm", "add x2, x2, #1"),
-        ("umulh", "umulh x1, x0, x2"),
-        ("add_addsub_shift", "add x2, x0, x0, lsl #2"),
-        ("add_addsub_shift", "add x0, x0, x2, lsl #3"),
-        ("add_addsub_shift", "add x0, x0, x1"),
-    ];
-    let split = [
-        ("mov_orr_log_shift", "mov w19, w0"),
-        ("lsr_ubfm", "lsr x21, x0, #32"),
-    ];
-    let mut clock = vec![("ldrb_imm", load_mode.as_str())];
-    clock.extend(dispatch_and_scale);
-    clock.push(("b_uncond", "b #44"));
-    clock.extend(from_24mhz);
-    clock.extend([
-        ("b_uncond", "b #16"),
-        ("movz", "movz x0, #0x1000"),
-        ("b_uncond", "b #8"),
-        ("mrs", "mrs x0, cntvct_el0"),
-    ]);
-    clock.extend(split);
-    check("rdtsc", &[0x0f, 0x31], &clock);
-    let mut ordered = vec![
-        ("ldrb_imm", load_mode.as_str()),
-        ("dsb", "dsb ishld"),
-        ("cbz", "cbz w1, #108"),
-        ("isb", "isb"),
-    ];
-    ordered.extend(dispatch_and_scale);
-    ordered.push(("b_uncond", "b #52"));
-    ordered.extend(from_24mhz);
-    ordered.extend([
-        ("b_uncond", "b #24"),
-        ("movz", "movz x0, #0x1000"),
-        ("b_uncond", "b #16"),
-        ("mrs", "mrs x0, cntvct_el0"),
-        ("b_uncond", "b #8"),
-        ("mrs", "mrs x0, S3_3_C14_C0_6"),
-    ]);
-    ordered.extend(split);
-    ordered.push(("movz", "movz x20, #0"));
-    check("rdtscp", &[0x0f, 0x01, 0xf9], &ordered);
+    check(
+        "rdtsc",
+        &[0x0f, 0x31],
+        &[
+            ("ldrb_imm", &load_mode),
+            ("tbz", "tbz w1, #1, #8"),
+            ("b_uncond", "b #16"),
+            ("mrs", "mrs x0, cntvct_el0"),
+            ("mov_orr_log_shift", "mov w19, w0"),
+            ("lsr_ubfm", "lsr x21, x0, #32"),
+            ("tbz", "tbz w1, #2, #36"),
+            ("mrs", "mrs x0, cntvct_el0"),
+            ("mov_orr_log_imm", "mov x2, #0xaaaaaaaaaaaaaaaa"),
+            ("add_addsub_imm", "add x2, x2, #1"),
+            ("umulh", "umulh x1, x0, x2"),
+            ("add_addsub_shift", "add x2, x0, x0, lsl #2"),
+            ("add_addsub_shift", "add x0, x0, x2, lsl #3"),
+            ("add_addsub_shift", "add x0, x0, x1"),
+            ("b_uncond", "b #-40"),
+            ("bl", "bl #-1084"),
+            ("b_uncond", "b #-48"),
+        ],
+    );
+    check(
+        "rdtscp",
+        &[0x0f, 0x01, 0xf9],
+        &[
+            ("ldrb_imm", &load_mode),
+            ("dsb", "dsb ishld"),
+            ("cbnz", "cbnz w1, #20"),
+            ("mrs", "mrs x0, S3_3_C14_C0_6"),
+            ("mov_orr_log_shift", "mov w19, w0"),
+            ("lsr_ubfm", "lsr x21, x0, #32"),
+            ("movz", "movz x20, #0"),
+            ("bl", "bl #-1308"),
+            ("b_uncond", "b #-16"),
+        ],
+    );
 }
 
 fn register_stubs(cases: &mut Cases) {
@@ -211,6 +193,41 @@ fn register_stubs(cases: &mut Cases) {
         &[("ldp_gen", "ldp x29, x30, [sp], #96"), ("ret", "ret")],
         &bank[st.clear_ymm_hi - 2..st.clear_ymm_hi],
     );
+    cases.record(
+        "timestamp_stubs",
+        &[
+            ("tbz", "tbz w1, #3, #12"),
+            ("mrs", "mrs x0, S3_3_C14_C0_6"),
+            ("b_uncond", "b #20"),
+            ("isb", "isb"),
+            ("tbz", "tbz w1, #1, #92"),
+            ("tbnz", "tbnz w1, #0, #80"),
+            ("mrs", "mrs x0, cntvct_el0"),
+            ("tbz", "tbz w1, #2, #32"),
+            ("mov_orr_log_imm", "mov x2, #0xaaaaaaaaaaaaaaaa"),
+            ("add_addsub_imm", "add x2, x2, #1"),
+            ("umulh", "umulh x1, x0, x2"),
+            ("add_addsub_shift", "add x2, x0, x0, lsl #2"),
+            ("add_addsub_shift", "add x0, x0, x2, lsl #3"),
+            ("add_addsub_shift", "add x0, x0, x1"),
+            ("ret", "ret"),
+            ("mrs", "mrs x1, cntfrq_el0"),
+            ("movz", "movz x2, #0xca00"),
+            ("movk", "movk x2, #0x3b9a, lsl #16"),
+            ("udiv", "udiv x3, x0, x1"),
+            ("msub", "msub x0, x3, x1, x0"),
+            ("mul_madd", "mul x0, x0, x2"),
+            ("mul_madd", "mul x3, x3, x2"),
+            ("udiv", "udiv x0, x0, x1"),
+            ("add_addsub_shift", "add x0, x3, x0"),
+            ("ret", "ret"),
+            ("movz", "movz x0, #0x1000"),
+            ("ret", "ret"),
+            ("mrs", "mrs x0, cntvct_el0"),
+            ("ret", "ret"),
+        ],
+        &bank[st.rdtscp_slow..st.lookup_rip],
+    );
     let call = call.expect("host transfer BL") / 4;
     cases.record(
         "static_host_call_relocation",
@@ -218,20 +235,7 @@ fn register_stubs(cases: &mut Cases) {
         &bank[call..call + 1],
     );
 
-    let offsets = [
-        Some(st.enter),
-        Some(st.exit),
-        Some(st.lookup_rip),
-        Some(st.lookup_jmp),
-        Some(st.lookup_call),
-        st.host_xfer,
-        st.ras_miss,
-        st.spill_xmm,
-        st.reload_xmm,
-        Some(st.clear_ymm_hi),
-    ]
-    .map(|off| off.map_or(u32::MAX, |i| i as u32));
-    // The production writer takes an aligned, writable stub bank of AOT_STUBS_BYTES.
+    let offsets = st.offsets();
     let (_, veneer) =
         unsafe { emit_static_stubs_with_veneer(bank.as_mut_ptr(), VBASE, HOST_CALLS, &offsets) }
             .unwrap();

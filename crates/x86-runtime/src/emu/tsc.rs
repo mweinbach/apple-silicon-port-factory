@@ -32,19 +32,81 @@ pub fn scale_counter_to_tsc(counter: u64, frequency: u64) -> u64 {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn counter_frequency() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // CNTFRQ_EL0 is a process-invariant 32-bit value, including a possible zero.
+    // Concurrent first readers can publish the same register value independently.
+    static HZ: AtomicU64 = AtomicU64::new(u64::MAX);
+    let cached = HZ.load(Ordering::Relaxed);
+    if cached != u64::MAX {
+        return cached;
+    }
     let frequency: u64;
     unsafe {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(pure, nomem, nostack, preserves_flags));
     }
+    HZ.store(frequency, Ordering::Relaxed);
     frequency
+}
+
+/// Defer the Darwin capability query until an ordered read or JIT setup needs it.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn has_ecv() -> bool {
+    static ECV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ECV.get_or_init(detect_ecv)
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn detect_ecv() -> bool {
+    // This source is also compiled in generated crates without a libc dependency.
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const core::ffi::c_char,
+            old: *mut core::ffi::c_void,
+            oldlen: *mut usize,
+            new: *mut core::ffi::c_void,
+            newlen: usize,
+        ) -> core::ffi::c_int;
+    }
+    let mut flag = 0u32;
+    let mut size = core::mem::size_of::<u32>();
+    let rc = unsafe {
+        sysctlbyname(
+            c"hw.optional.arm.FEAT_ECV".as_ptr(),
+            (&raw mut flag).cast(),
+            &mut size,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0 && size == core::mem::size_of::<u32>() && flag == 1
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+fn detect_ecv() -> bool {
+    false
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn counter_ns() -> u64 {
+pub fn read_tsc(ordered: bool, frozen: bool) -> u64 {
+    if frozen {
+        if ordered {
+            unsafe { core::arch::asm!("dsb ishld", "isb", options(nostack, preserves_flags)) }
+        }
+        return GUEST_TSC;
+    }
     let count: u64;
     unsafe {
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) count, options(nostack, preserves_flags));
+        if !ordered {
+            core::arch::asm!("mrs {}, cntvct_el0", out(reg) count, options(nostack, preserves_flags));
+        } else if has_ecv() {
+            // CNTVCTSS_EL0 orders the sample after DSB. Use its encoding so generated
+            // crates can target CPUs that predate ECV and select this path at runtime.
+            core::arch::asm!("dsb ishld", "mrs {}, S3_3_C14_C0_6", out(reg) count, options(nostack, preserves_flags));
+        } else {
+            core::arch::asm!("dsb ishld", "isb", "mrs {}, cntvct_el0", out(reg) count, options(nostack, preserves_flags));
+        }
     }
     scale_counter_to_tsc(count, counter_frequency())
 }
@@ -69,16 +131,10 @@ fn counter_ns() -> u64 {
         .as_nanos() as u64
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn read_tsc(ordered: bool, frozen: bool) -> u64 {
     if ordered {
-        // RDTSCP waits for older loads to complete before the counter read. The asm
-        // also orders compiler memory accesses. This applies in verifier mode too.
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("dsb ishld", "isb", options(nostack, preserves_flags));
-        }
-        #[cfg(not(target_arch = "aarch64"))]
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
     if frozen {

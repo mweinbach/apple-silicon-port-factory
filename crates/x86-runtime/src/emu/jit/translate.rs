@@ -215,6 +215,8 @@ pub(super) struct Tr<'a> {
     pub(super) spill_xmm: usize,
     pub(super) reload_xmm: usize,
     pub(super) clear_ymm_hi: usize,
+    pub(super) rdtsc_slow: usize,
+    pub(super) rdtscp_slow: usize,
     /// Static terminator target needs host dispatch (or is 0 / `__chkstk`).
     pub(super) target_host: bool,
     /// `JitCache::ras_miss`: non-zero = shadow return-address stack on (`AW2_JIT_RAS`).
@@ -242,6 +244,8 @@ pub(super) struct Tr<'a> {
     pub(super) ymm_clean: u16,
     /// Deferred cold calls to `clear_ymm_hi`: `(tbnz_site, resume_pos, mask)`.
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
+    /// (branch to fallback, resume after counter sample, ordered read).
+    pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     /// Bitmasks of guest `xmm0..15` whose upper bits `[127:32]` / `[127:64]` are known 0.
     pub(super) xmm_hi32_zero: u16,
     pub(super) xmm_hi64_zero: u16,
@@ -528,6 +532,7 @@ impl Tr<'_> {
         }
         ymm_colds.clear();
         self.ymm_colds = ymm_colds;
+        self.emit_timestamp_fallbacks();
         self.emit_cold_nan();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
@@ -580,6 +585,7 @@ impl Tr<'_> {
         self.cond_links.clear();
         self.link_conds.clear();
         self.ymm_colds.clear();
+        self.tsc_colds.clear();
         self.cold.clear();
         self.lits.clear();
         self.lits128.clear();
@@ -593,6 +599,7 @@ impl Tr<'_> {
         sc.cond_links = self.cond_links;
         sc.link_conds = self.link_conds;
         sc.ymm_colds = self.ymm_colds;
+        sc.tsc_colds = self.tsc_colds;
         sc.cold = self.cold;
         sc.lits = self.lits;
         sc.lits128 = self.lits128;

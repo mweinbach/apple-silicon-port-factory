@@ -55,18 +55,46 @@ before reading the same clock. Both write the low and high 32 bits to EAX and ED
 preserve RFLAGS. `RDTSC` preserves RCX. `RDTSCP` writes zero to ECX because the runtime
 exposes one `TSC_AUX` value across guest threads.
 
-JIT and AOT blocks use the executing host's timer mode. A 1 GHz host supplies guest ticks
-directly. A 24 MHz host uses an exact multiply by 125/3 with no division. Other timer rates
-use integer division. For `RDTSCP`, all modes complete prior loads with `DSB ISHLD`.
-At the native rate on a Darwin host advertising FEAT_ECV, the JIT reads the
-self-synchronizing `CNTVCTSS_EL0`. The fallback issues `ISB` before
-sampling `CNTVCT_EL0`.
+JIT blocks, disk AOT, signed static AOT and generated Rust use the executing host's timer
+capabilities. A 1 GHz counter supplies guest ticks directly. A 24 MHz counter uses an
+exact multiply by 125/3. Other rates use integer division. Translated blocks keep the native
+sample on the main path and place the compatibility paths outside it. Each code bank
+shares the uncommon conversion and verifier routines.
+
+`RDTSCP` completes prior loads with `DSB ISHLD`. On Darwin hosts advertising FEAT_ECV,
+live reads then use the self-synchronizing `CNTVCTSS_EL0` at every counter rate. Older
+hosts issue `ISB` before sampling `CNTVCT_EL0`. Standalone Rust AOT caches the
+frequency on its first live sample. Generated modules containing `RDTSCP` check ECV during
+image setup when they use their own clock.
 
 `verify-x86`, `--diff-test`, shadow comparisons, and `AW2_EMU_VERIFY=1` use a repeatable
 timestamp of `0x1000` so the same instruction can run twice and produce comparable register
 snapshots. `PORT_AOT_VERIFY=1` checks cached machine code and leaves the guest clock live.
 The runtime invalidates disk caches built with the old clock. Rebuild previously linked
 static `.aot.o` objects from the original PE with `port-runner --pe FILE --emit-static-o DIR`.
+
+To measure a timestamp followed by a dependent load, build the Windows x64 probe and run
+its `load_tscp` export from a verified cache. The returned tick count divided by four times
+the iteration count gives nanoseconds per read-and-load pair.
+
+```sh
+cargo runner-build
+bench_dir=$(mktemp -d)
+xcrun clang -target x86_64-pc-windows-msvc -c tools/perf/guest_tsc.s -o "$bench_dir/probe.obj"
+lld-link /dll /noentry /nodefaultlib "/out:$bench_dir/probe.dll" "$bench_dir/probe.obj"
+(
+    export PORT_AOT=1 PORT_AOT_VERIFY=1 PORT_HEADLESS=1 PORT_AOT_DIR="$bench_dir/cache"
+    export TRANSLATOR_HOME="$bench_dir/vfs" AW2_EMU_VERIFY=0
+    runner=target/aarch64-apple-darwin/debug/port-runner
+    "$runner" --pe "$bench_dir/probe.dll" --prewarm-aot
+    "$runner" --pe "$bench_dir/probe.dll" --call-export load_tscp -- 250000
+)
+```
+
+`use_tsc` and `use_tscp` consume four full timestamps per iteration. `load_tsc` closes
+each indexed load with an additional ordered read. `bench_rdtsc`, `bench_rdtscp` and
+`bench_empty` measure eight back-to-back instructions per iteration. The same PE can
+be compiled with `cargo opsdb -- aot-crate` for standalone Rust measurements.
 Regenerate Rust AOT crates and dylibs with `cargo opsdb -- aot-crate FILE --out DIR` to
 pick up the live clock and the loader's differential-verification mode.
 

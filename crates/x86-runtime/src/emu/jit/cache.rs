@@ -416,6 +416,8 @@ pub(in crate::emu) struct JitCache {
     spill_xmm: usize,
     reload_xmm: usize,
     clear_ymm_hi: usize,
+    rdtsc_slow: usize,
+    rdtscp_slow: usize,
     pub(super) index: Box<[JEnt]>,
     pub(super) meta: Box<[JMeta]>,
     /// All blocks compiled since the last flush, so direct-mapped `index` collisions can
@@ -493,6 +495,8 @@ impl JitCache {
             spill_xmm: 0,
             reload_xmm: 0,
             clear_ymm_hi: 0,
+            rdtsc_slow: 0,
+            rdtscp_slow: 0,
             index: Box::new([]),
             meta: Box::new([]),
             compiled: std::collections::HashMap::new(),
@@ -772,6 +776,8 @@ impl JitCache {
         self.spill_xmm = st.spill_xmm.map_or(0, |p| b + p * 4);
         self.reload_xmm = st.reload_xmm.map_or(0, |p| b + p * 4);
         self.clear_ymm_hi = b + st.clear_ymm_hi * 4;
+        self.rdtsc_slow = b + st.rdtsc_slow * 4;
+        self.rdtscp_slow = b + st.rdtscp_slow * 4;
         self.cursor = STUBS_BYTES;
         if let Some(m) = st.ras_miss {
             self.ras_ring = ring;
@@ -1223,6 +1229,8 @@ impl JitCache {
             spill_xmm: self.spill_xmm,
             reload_xmm: self.reload_xmm,
             clear_ymm_hi: self.clear_ymm_hi,
+            rdtsc_slow: self.rdtsc_slow,
+            rdtscp_slow: self.rdtscp_slow,
         }
     }
 
@@ -1387,6 +1395,8 @@ pub(super) struct StubAddrs {
     pub(super) spill_xmm: usize,
     pub(super) reload_xmm: usize,
     pub(super) clear_ymm_hi: usize,
+    pub(super) rdtsc_slow: usize,
+    pub(super) rdtscp_slow: usize,
 }
 
 /// Decoded, analysed block (everything [`Tr`] needs besides the stubs and the emission
@@ -1561,6 +1571,7 @@ pub(in crate::emu) struct TrScratch {
     pub(super) cond_links: Vec<(usize, u64)>,
     pub(super) link_conds: Vec<(usize, usize)>,
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
+    pub(super) tsc_colds: Vec<(usize, usize, bool)>,
     pub(super) cold: Vec<ColdNan>,
     pub(super) lits: Vec<(usize, u64)>,
     pub(super) lits128: Vec<(usize, u64, u64)>,
@@ -1581,6 +1592,7 @@ impl TrScratch {
             cond_links: Vec::new(),
             link_conds: Vec::new(),
             ymm_colds: Vec::new(),
+            tsc_colds: Vec::new(),
             cold: Vec::new(),
             lits: Vec::new(),
             lits128: Vec::new(),
@@ -1610,6 +1622,7 @@ pub(super) fn new_tr<'a>(
     let mut cond_links = core::mem::take(&mut sc.cond_links);
     let mut link_conds = core::mem::take(&mut sc.link_conds);
     let mut ymm_colds = core::mem::take(&mut sc.ymm_colds);
+    let tsc_colds = core::mem::take(&mut sc.tsc_colds);
     let mut cold = core::mem::take(&mut sc.cold);
     let mut lits = core::mem::take(&mut sc.lits);
     let mut lits128 = core::mem::take(&mut sc.lits128);
@@ -1650,6 +1663,8 @@ pub(super) fn new_tr<'a>(
         spill_xmm: st.spill_xmm,
         reload_xmm: st.reload_xmm,
         clear_ymm_hi: st.clear_ymm_hi,
+        rdtsc_slow: st.rdtsc_slow,
+        rdtscp_slow: st.rdtscp_slow,
         target_host: p.target_host,
         ras_miss: st.ras_miss,
         wr: p.wr,
@@ -1663,6 +1678,7 @@ pub(super) fn new_tr<'a>(
         xpin: xmm_pin_enabled(),
         ymm_clean: 0,
         ymm_colds,
+        tsc_colds,
         xmm_hi32_zero: 0,
         xmm_hi64_zero: 0,
         xmm_hi32_live: [0xFFFF; BLK_MAX_INSNS + 1],

@@ -34,8 +34,11 @@ fn timestamp_block_runs_native_scaled_and_frozen_paths() {
         let ip = arena_alloc(32, 16);
         unsafe { core::ptr::copy_nonoverlapping(probe.as_ptr(), ip, probe.len()) };
         let code = unsafe { cache.compile_single_for_verify(ip as u64, &mut *blocks) }.unwrap();
-        for mode in [TscMode::Native, TscMode::Scaled, TscMode::From24Mhz, TscMode::Frozen, TscMode::NativeEcv] {
-            if mode == TscMode::NativeEcv && TscMode::host() != mode {
+        for mode in [
+            TscMode::Native, TscMode::Scaled, TscMode::From24Mhz, TscMode::Frozen,
+            TscMode::NativeEcv, TscMode::ScaledEcv, TscMode::From24MhzEcv,
+        ] {
+            if matches!(mode, TscMode::NativeEcv | TscMode::ScaledEcv | TscMode::From24MhzEcv) && !tsc::has_ecv() {
                 continue;
             }
             cache.live_tsc_mode = mode;
@@ -47,8 +50,8 @@ fn timestamp_block_runs_native_scaled_and_frozen_paths() {
             let stamp = cpu.gpr[2] << 32 | cpu.gpr[0];
             let expected = |count| match mode.for_run() {
                 TscMode::Frozen => tsc::GUEST_TSC,
-                TscMode::Scaled => tsc::scale_counter_to_tsc(count, frequency),
-                TscMode::From24Mhz => tsc::scale_counter_to_tsc(count, 24_000_000),
+                TscMode::Scaled | TscMode::ScaledEcv => tsc::scale_counter_to_tsc(count, frequency),
+                TscMode::From24Mhz | TscMode::From24MhzEcv => tsc::scale_counter_to_tsc(count, 24_000_000),
                 _ => count,
             };
             assert!((expected(before)..=expected(after)).contains(&stamp), "{mode:?} timestamp {stamp}");

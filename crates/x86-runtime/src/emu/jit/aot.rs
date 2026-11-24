@@ -24,8 +24,8 @@ use crate::emu::{mem, to_mapped_addr, BlockCache, BLK_MAX_INSNS};
 
 /// Word offsets of the shared stubs at the start of an AOT region: enter, exit,
 /// lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm,
-/// clear_ymm_hi (`u32::MAX` = not emitted).
-pub(in crate::emu) type AotStubOffs = [u32; 10];
+/// clear_ymm_hi, rdtsc_slow, rdtscp_slow (`u32::MAX` = not emitted).
+pub(in crate::emu) type AotStubOffs = [u32; 12];
 
 /// Bytes reserved for the stubs at the start of an AOT region.
 pub(in crate::emu) const AOT_STUBS_BYTES: usize = STUBS_BYTES;
@@ -86,7 +86,7 @@ unsafe fn emit_static_stubs_inner(
     // Try standard production stub flags first, then test/stats counter variants if the
     // `.aot` file was produced by a test or `AW2_JIT_STATS=1` build.
     let candidates: [(bool, bool); 3] = [(false, false), (true, false), (true, true)];
-    let mut last_got = [0u32; 10];
+    let mut last_got = AotStubOffs::default();
     for &(count_probe, count_plain) in &candidates {
         if count_plain && !cfg!(test) {
             continue;
@@ -98,19 +98,7 @@ unsafe fn emit_static_stubs_inner(
         if a.overflow {
             continue;
         }
-        let o = |p: usize| p as u32;
-        let got: AotStubOffs = [
-            o(st.enter),
-            o(st.exit),
-            o(st.lookup_rip),
-            o(st.lookup_jmp),
-            o(st.lookup_call),
-            st.host_xfer.map_or(u32::MAX, o),
-            st.ras_miss.map_or(u32::MAX, o),
-            st.spill_xmm.map_or(u32::MAX, o),
-            st.reload_xmm.map_or(u32::MAX, o),
-            o(st.clear_ymm_hi),
-        ];
+        let got = st.offsets();
         if got == *want_stubs {
             return Ok((got, bl_off, a.pos));
         }
@@ -203,19 +191,7 @@ pub(in crate::emu) unsafe fn test_emit_stubs_and_veneer_for_knobs(
         return Err(format!("live stubs overflowed {STUBS_BYTES} bytes for knobs={knobs:#x}"));
     }
     let live_words = a.pos;
-    let o = |p: usize| p as u32;
-    let want: AotStubOffs = [
-        o(st.enter),
-        o(st.exit),
-        o(st.lookup_rip),
-        o(st.lookup_jmp),
-        o(st.lookup_call),
-        st.host_xfer.map_or(u32::MAX, o),
-        st.ras_miss.map_or(u32::MAX, o),
-        st.spill_xmm.map_or(u32::MAX, o),
-        st.reload_xmm.map_or(u32::MAX, o),
-        o(st.clear_ymm_hi),
-    ];
+    let want = st.offsets();
     let mut veneer_buf = vec![0u32; STUBS_BYTES / 4];
     let (got, veneer_off) = emit_static_stubs_with_veneer(veneer_buf.as_mut_ptr(), VBASE, knobs, &want)?;
     if got != want {
@@ -235,19 +211,7 @@ pub(in crate::emu) unsafe fn aot_emit_stubs(buf: *mut u32, vbase: usize) -> Opti
     if a.overflow {
         return None;
     }
-    let o = |p: usize| p as u32;
-    Some([
-        o(st.enter),
-        o(st.exit),
-        o(st.lookup_rip),
-        o(st.lookup_jmp),
-        o(st.lookup_call),
-        st.host_xfer.map_or(u32::MAX, o),
-        st.ras_miss.map_or(u32::MAX, o),
-        st.spill_xmm.map_or(u32::MAX, o),
-        st.reload_xmm.map_or(u32::MAX, o),
-        o(st.clear_ymm_hi),
-    ])
+    Some(st.offsets())
 }
 
 /// Stub addresses of an AOT region at `vbase` (same convention as [`JitCache`]: 0 = none).
@@ -263,6 +227,8 @@ fn aot_stub_addrs(vbase: usize, o: &AotStubOffs) -> StubAddrs {
         spill_xmm: at(o[7]),
         reload_xmm: at(o[8]),
         clear_ymm_hi: at(o[9]),
+        rdtsc_slow: at(o[10]),
+        rdtscp_slow: at(o[11]),
     }
 }
 
@@ -373,7 +339,7 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
         (34, budget_light_enabled() as u64),
         (35, hw_range_enabled() as u64),
         (36, 1u64), // codegen rev 4: XBUD bit-0 ymm_dirty, batched push/pop/ret, JccPair, x_shuf_rr, xmm_hi_live, XA cache, hot/cold split
-        (37, 2u64), // codegen rev 6 (bits 37..38): runtime native/ECV, scaled, and frozen timestamp paths
+        (37, 3u64), // codegen rev 7 (bits 37..38): shared timestamp conversion stubs
     ];
     bits.iter().fold(0u64, |k, &(b, v)| k | v << b)
 }

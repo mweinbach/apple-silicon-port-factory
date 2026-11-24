@@ -1,6 +1,6 @@
-//! Offline v5/v6 `.aot` -> Apple-signed static ARM64 Mach-O relocatable object (`.o`) compiler.
+//! Offline v5–v7 `.aot` -> Apple-signed static ARM64 Mach-O relocatable object (`.o`) compiler.
 //!
-//! Converts any v5 (single-bank) or v6 (multi-bank) `.aot` translation cache produced by
+//! Converts a single- or multi-bank `.aot` translation cache produced by
 //! [`super::aot`] into a standard `arm64` `MH_OBJECT` Mach-O `.o` file that links directly
 //! into an iOS `.ipa`, iOS Simulator binary, or macOS binary's Apple-signed read-only
 //! `__TEXT,__text` segment and executes natively on Apple Silicon with **zero `MAP_JIT` pages**.
@@ -234,7 +234,7 @@ struct Sym {
     n_value: u64,
 }
 
-/// Convert raw v5/v6 `.aot` bytes into an Apple Silicon ARM64 `MH_OBJECT` Mach-O `.o` byte vector.
+/// Convert raw v5–v7 `.aot` bytes into an Apple Silicon ARM64 `MH_OBJECT` Mach-O `.o` byte vector.
 pub fn emit_macho_object_from_aot_bytes(
     aot_bytes: &[u8],
     platform: MachoPlatform,

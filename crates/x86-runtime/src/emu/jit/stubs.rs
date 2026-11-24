@@ -74,6 +74,57 @@ impl StubCfg {
     }
 }
 
+/// Convert the 24 MHz count in x0 to guest ticks without division or flag changes.
+pub(super) fn emit_tsc_scale_24mhz(a: &mut Asm) {
+    // floor(125*x/3) = 41*x + floor(2*x/3), modulo 2^64.
+    a.mov_imm(true, T2, crate::emu::tsc::TWO_THIRDS_Q64 - 1);
+    a.addsub_ri(true, false, false, T2, T2, 1, false);
+    a.umulh(T1, T0, T2);
+    a.addsub_rr(true, false, false, T2, T0, T0, 2);
+    a.addsub_rr(true, false, false, T0, T0, T2, 3);
+    a.addsub_rr(true, false, false, T0, T0, T1, 0);
+}
+
+/// Timestamp fallback entries. Both return the value in x0 and preserve NZCV and all
+/// guest registers. The ordered caller has already issued DSB ISHLD.
+fn emit_timestamp_stubs(a: &mut Asm) -> (usize, usize) {
+    let ordered = a.pos;
+    let legacy = a.tbz(T1, 3);
+    a.mrs_cntvctss(T0);
+    let scale_ecv = a.b();
+    a.bind(legacy);
+    a.isb();
+    let native = a.tbz(T1, 1);
+
+    let unordered = a.pos;
+    let frozen = a.tbnz(T1, 0);
+    a.mrs_cntvct(T0);
+    a.bind(scale_ecv);
+    let generic = a.tbz(T1, 2);
+    emit_tsc_scale_24mhz(a);
+    a.ret();
+
+    a.bind(generic);
+    // CNTFRQ_EL0 fits 32 bits, so (counter % frequency) * 1e9 fits u64.
+    a.mrs_cntfrq(T1);
+    a.mov_imm(true, T2, crate::emu::tsc::TSC_NOMINAL_HZ);
+    a.udiv(true, T3, T0, T1);
+    a.msub(true, T0, T3, T1, T0);
+    a.mul(true, T0, T0, T2);
+    a.mul(true, T3, T3, T2);
+    a.udiv(true, T0, T0, T1);
+    a.addsub_rr(true, false, false, T0, T3, T0, 0);
+    a.ret();
+
+    a.bind(frozen);
+    a.mov_imm(true, T0, crate::emu::GUEST_TSC);
+    a.ret();
+    a.bind(native);
+    a.mrs_cntvct(T0);
+    a.ret();
+    (unordered, ordered)
+}
+
 /// Shared stubs (never overwritten by translation-cache flushes). `ras`: emit the shadow
 /// return-address stack push in `lookup_call` and the `ras_miss` stub.
 pub(super) fn emit_stubs(a: &mut Asm, ras: bool) -> Stubs {
@@ -188,6 +239,8 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     a.logic_ri(true, 0, XBUD, XBUD, enc_logic_imm(!1u64, true).unwrap());
     a.bind(ym_ret);
     a.ret();
+
+    let (rdtsc_slow, rdtscp_slow) = emit_timestamp_stubs(a);
 
     // Hash probe of x0 -> on hit branches to the code (x1); on miss falls through.
     // Clobbers x1, x2, x16, x17 and NZCV.
@@ -777,7 +830,7 @@ pub(super) fn emit_stubs_cfg(a: &mut Asm, cfg: StubCfg) -> (Stubs, Option<usize>
     };
 
     (
-        Stubs { enter, exit, lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm, clear_ymm_hi },
+        Stubs { enter, exit, lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm, clear_ymm_hi, rdtsc_slow, rdtscp_slow },
         host_xfer_bl,
     )
 }
@@ -802,6 +855,21 @@ pub(super) struct Stubs {
     pub(super) spill_xmm: Option<usize>,
     pub(super) reload_xmm: Option<usize>,
     pub(super) clear_ymm_hi: usize,
+    pub(super) rdtsc_slow: usize,
+    pub(super) rdtscp_slow: usize,
+}
+
+impl Stubs {
+    pub(super) fn offsets(&self) -> AotStubOffs {
+        let word = |p: usize| p as u32;
+        [
+            word(self.enter), word(self.exit), word(self.lookup_rip), word(self.lookup_jmp),
+            word(self.lookup_call), self.host_xfer.map_or(u32::MAX, word),
+            self.ras_miss.map_or(u32::MAX, word), self.spill_xmm.map_or(u32::MAX, word),
+            self.reload_xmm.map_or(u32::MAX, word), word(self.clear_ymm_hi),
+            word(self.rdtsc_slow), word(self.rdtscp_slow),
+        ]
+    }
 }
 
 /// `AW2_JIT_HOSTCALL=0` makes host calls/jmps from translated code leave translated code
