@@ -2116,6 +2116,22 @@ mod tests {
 
             // 2. Backpressured CRT _write must wait and resume after partial writes, delivering
             //    all 256 KiB intact and in exact order while keeping shared O_NONBLOCK intact.
+            //    Shrink SO_SNDBUF on the socketpair client fd to guarantee backpressure
+            //    independent of host socket defaults.
+            let small_sndbuf: libc::c_int = 4096;
+            assert_eq!(
+                libc::setsockopt(
+                    cli_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &small_sndbuf as *const libc::c_int as *const c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ),
+                0
+            );
+            let (srv_fd, _) = crate::kernel32::file::file_fd_and_kind(srv)
+                .expect("connected named pipe server must have a live POSIX fd");
+
             let payload: Vec<u8> = (0..256 * 1024usize)
                 .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8)
                 .collect();
@@ -2139,14 +2155,63 @@ mod tests {
             let mut received = Vec::with_capacity(payload.len());
             let mut chunk = [0u8; 8192];
             let deadline = Instant::now() + Duration::from_secs(5);
-            while received.len() < payload.len() && Instant::now() < deadline {
+            while received.len() < payload.len() {
+                let mut pfd = libc::pollfd {
+                    fd: srv_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = loop {
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !rem.is_zero(),
+                        "timed out draining backpressured _write ({}/{} bytes received; writer={:?})",
+                        received.len(),
+                        payload.len(),
+                        w_rx.try_recv()
+                    );
+                    let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+                    let rc = libc::poll(&mut pfd, 1, timeout_ms);
+                    if rc < 0 && *libc::__error() == libc::EINTR {
+                        continue;
+                    }
+                    break rc;
+                };
+                assert!(
+                    pr > 0,
+                    "poll(srv_fd) failed or timed out (rc={pr}, errno={}, {}/{} bytes, writer={:?})",
+                    *libc::__error(),
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
+                assert!(
+                    (pfd.revents & libc::POLLIN) != 0,
+                    "pipe peer closed/errored before full payload (revents={:#x}, {}/{} bytes, writer={:?})",
+                    pfd.revents,
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
                 let want = (payload.len() - received.len()).min(chunk.len()) as u32;
                 let mut got = 0u32;
-                assert_eq!(
-                    ReadFile(srv, chunk.as_mut_ptr() as *mut c_void, want, &mut got, std::ptr::null_mut()),
-                    TRUE
+                let rok = ReadFile(
+                    srv,
+                    chunk.as_mut_ptr() as *mut c_void,
+                    want,
+                    &mut got,
+                    std::ptr::null_mut(),
                 );
-                assert!(got > 0);
+                assert_eq!(
+                    rok,
+                    TRUE,
+                    "ReadFile(srv) failed with {} ({}/{} bytes, writer={:?})",
+                    crate::teb::last_error(),
+                    received.len(),
+                    payload.len(),
+                    w_rx.try_recv()
+                );
+                assert!(got > 0, "unexpected 0-byte ReadFile before full payload");
                 received.extend_from_slice(&chunk[..got as usize]);
             }
             let (wn, we) = w_rx
