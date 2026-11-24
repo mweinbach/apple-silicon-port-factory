@@ -187,6 +187,12 @@ fn default_game_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".")
 }
 
+fn env_audio_harness() -> bool {
+    std::env::var_os("PORT_AUDIO_HARNESS")
+        .or_else(|| std::env::var_os("AW2_AUDIO_HARNESS"))
+        .is_some_and(|v| v == "1")
+}
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1))
 }
@@ -217,7 +223,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         static_platform: "ios".into(),
         aot_max_funcs: 0,
         aot_dir: None,
-        audio_harness: std::env::var_os("AW2_AUDIO_HARNESS").is_some_and(|v| v == "1"),
+        audio_harness: env_audio_harness(),
         diff_test: false,
         knobs: false,
         json: false,
@@ -931,6 +937,138 @@ pub(crate) fn run_embedded(args: Args) -> anyhow::Result<()> {
     run_with_args(args, true)
 }
 
+fn strip_child_process_aot_env() {
+    for k in [
+        "PORT_AOT_DIR",
+        "AW2_DLL_AOT_DIR",
+        "PORT_AOT_FALLBACK_DIR",
+        "PORT_AOT_DYLIB",
+        "AW2_AOT_DYLIB",
+        "PORT_AOT_BUILD",
+        "AW2_DLL_AOT_BUILD",
+        "PORT_JIT_PROFILE",
+        "AW2_JIT_PROFILE",
+    ] {
+        std::env::remove_var(k);
+    }
+    std::env::set_var("PORT_AOT", "0");
+    std::env::set_var("AW2_DLL_AOT", "0");
+}
+
+fn force_emit_static_o_env() {
+    // Static signed __TEXT cannot self-patch runtime literal slots or LSE2 traps:
+    // emit position-independent blocks with zero literal relocations and inline unaligned TSO.
+    std::env::set_var("PORT_JIT_PLAINCALL", "0");
+    std::env::set_var("AW2_JIT_PLAINCALL", "0");
+    std::env::set_var("PORT_JIT_LSE2_TRAP", "0");
+    std::env::set_var("PORT_HEADLESS", "1");
+    std::env::set_var("AW2_HEADLESS", "1");
+}
+
+/// Apply CLI overrides, `game.toml [knobs]`, and canonical/legacy env aliases before any
+/// runtime subsystem or knob-backed CLI default (`PORT_GAME_DIR`, `PORT_AUDIO_HARNESS`) is
+/// consumed. Returns the temporary AOT stage directory created for `--emit-static-o`, if any.
+fn apply_startup_manifest_knobs(
+    args: &mut Args,
+    manifest: Option<&port_manifest::GameManifest>,
+    manifest_dir: Option<&std::path::Path>,
+    child_process_mode: bool,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if child_process_mode {
+        x86_runtime::emu::set_disk_aot_disabled(true);
+        strip_child_process_aot_env();
+    }
+    let mut temp_static_aot_stage: Option<std::path::PathBuf> = None;
+    if let Some(ref out_dir) = args.emit_static_o {
+        force_emit_static_o_env();
+        if args.aot_dir.is_none() {
+            let stage = out_dir.join(format!(".aot-stage-{}", std::process::id()));
+            std::fs::create_dir_all(&stage)?;
+            std::env::set_var("PORT_AOT_DIR", &stage);
+            temp_static_aot_stage = Some(stage);
+        }
+    }
+    if !child_process_mode {
+        if let Some(ref dir) = args.aot_dir {
+            std::env::set_var("PORT_AOT_DIR", dir);
+        }
+    }
+    if let Some(m) = manifest {
+        if !args.explicit_exe {
+            if let Some(exe) = &m.exe {
+                args.exe = exe.clone();
+            }
+        }
+        if let Some(app_id) = &m.steam_app_id {
+            if std::env::var_os("STEAM_APPID").is_none() {
+                std::env::set_var("STEAM_APPID", app_id);
+                std::env::set_var("SteamAppId", app_id);
+                std::env::set_var("SteamGameId", app_id);
+            }
+        }
+        if !child_process_mode {
+            if let Some(aot_dir) = &m.aot_dir {
+                let trimmed = aot_dir.trim();
+                if !trimmed.is_empty()
+                    && args.aot_dir.is_none()
+                    && std::env::var_os("PORT_AOT_DIR").is_none()
+                    && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
+                {
+                    let p = std::path::PathBuf::from(trimmed);
+                    let resolved = if p.is_relative() {
+                        manifest_dir.map_or(p.clone(), |d| d.join(&p))
+                    } else {
+                        p
+                    };
+                    std::env::set_var("PORT_AOT_DIR", resolved);
+                }
+            }
+            if let Some(aot) = &m.aot_dylibs {
+                if !aot.is_empty()
+                    && std::env::var_os("PORT_AOT_DYLIB").is_none()
+                    && std::env::var_os("AW2_AOT_DYLIB").is_none()
+                {
+                    std::env::set_var("PORT_AOT_DYLIB", aot);
+                }
+            }
+        }
+    }
+    if args.prewarm_aot || args.prewarm_shaders || args.emit_static_o.is_some() {
+        std::env::set_var("PORT_HEADLESS", "1");
+        std::env::set_var("AW2_HEADLESS", "1");
+    } else if args.list_exports || args.call_export.is_some() || args.no_run {
+        if std::env::var_os("PORT_HEADLESS").is_none() && std::env::var_os("AW2_HEADLESS").is_none() {
+            std::env::set_var("PORT_HEADLESS", "1");
+        }
+    }
+    if let Some(ref drive_c) = args.drive_c_dir {
+        std::env::set_var("TRANSLATOR_HOME", drive_c);
+        std::env::set_var("AW2_DRIVE_C", drive_c);
+    }
+    port_manifest::knobs::apply_manifest_and_aliases(manifest)
+        .map_err(anyhow::Error::msg)?;
+
+    // Re-enforce mandatory process invariants so neither inherited env vars nor
+    // `game.toml [knobs]` can disable child-process AOT isolation or static-PIC codegen.
+    if child_process_mode {
+        strip_child_process_aot_env();
+    }
+    if args.emit_static_o.is_some() {
+        force_emit_static_o_env();
+    }
+
+    // Consume `PORT_GAME_DIR` and `PORT_AUDIO_HARNESS` after manifest `[knobs]` and aliases
+    // have been applied (explicit `--game-dir` / `--pe` / `--audio-harness` CLI flags still win).
+    if !args.explicit_game_dir && args.pe_path.is_none() {
+        args.game_dir = default_game_dir();
+    }
+    if !args.audio_harness {
+        args.audio_harness = env_audio_harness();
+    }
+
+    Ok(temp_static_aot_stage)
+}
+
 fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use win32_rt as w;
@@ -966,102 +1104,16 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         }
     }
     let child_process_mode = std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1");
-    if child_process_mode {
-        x86_runtime::emu::set_disk_aot_disabled(true);
-        for k in [
-            "PORT_AOT_DIR",
-            "AW2_DLL_AOT_DIR",
-            "PORT_AOT_FALLBACK_DIR",
-            "PORT_AOT_DYLIB",
-            "AW2_AOT_DYLIB",
-            "PORT_AOT_BUILD",
-            "AW2_DLL_AOT_BUILD",
-            "PORT_JIT_PROFILE",
-            "AW2_JIT_PROFILE",
-        ] {
-            std::env::remove_var(k);
-        }
-        std::env::set_var("PORT_AOT", "0");
-        std::env::set_var("AW2_DLL_AOT", "0");
-    }
-    let mut temp_static_aot_stage: Option<std::path::PathBuf> = None;
-    if let Some(ref out_dir) = args.emit_static_o {
-        // Static signed __TEXT cannot self-patch runtime literal slots or LSE2 traps:
-        // emit position-independent blocks with zero literal relocations and inline unaligned TSO.
-        std::env::set_var("AW2_JIT_PLAINCALL", "0");
-        std::env::set_var("PORT_JIT_LSE2_TRAP", "0");
-        std::env::set_var("PORT_HEADLESS", "1");
-        std::env::set_var("AW2_HEADLESS", "1");
-        if args.aot_dir.is_none() {
-            let stage = out_dir.join(format!(".aot-stage-{}", std::process::id()));
-            std::fs::create_dir_all(&stage)?;
-            std::env::set_var("PORT_AOT_DIR", &stage);
-            temp_static_aot_stage = Some(stage);
-        }
-    }
-    if !child_process_mode {
-        if let Some(ref dir) = args.aot_dir {
-            std::env::set_var("PORT_AOT_DIR", dir);
-        }
-    }
     let (manifest, manifest_dir) = match target::discover_with_path(args.manifest_path.as_deref()) {
         Some((m, path)) => (Some(m), path.parent().map(|d| d.to_path_buf())),
         None => (None, None),
     };
-    if let Some(m) = &manifest {
-        if !args.explicit_exe {
-            if let Some(exe) = &m.exe {
-                args.exe = exe.clone();
-            }
-        }
-        if let Some(app_id) = &m.steam_app_id {
-            if std::env::var_os("STEAM_APPID").is_none() {
-                std::env::set_var("STEAM_APPID", app_id);
-                std::env::set_var("SteamAppId", app_id);
-                std::env::set_var("SteamGameId", app_id);
-            }
-        }
-        if !child_process_mode {
-            if let Some(aot_dir) = &m.aot_dir {
-                let trimmed = aot_dir.trim();
-                if !trimmed.is_empty()
-                    && args.aot_dir.is_none()
-                    && std::env::var_os("PORT_AOT_DIR").is_none()
-                    && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
-                {
-                    let p = std::path::PathBuf::from(trimmed);
-                    let resolved = if p.is_relative() {
-                        manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
-                    } else {
-                        p
-                    };
-                    std::env::set_var("PORT_AOT_DIR", resolved);
-                }
-            }
-            if let Some(aot) = &m.aot_dylibs {
-                if !aot.is_empty()
-                    && std::env::var_os("PORT_AOT_DYLIB").is_none()
-                    && std::env::var_os("AW2_AOT_DYLIB").is_none()
-                {
-                    std::env::set_var("PORT_AOT_DYLIB", aot);
-                }
-            }
-        }
-    }
-    if args.prewarm_aot || args.prewarm_shaders || args.emit_static_o.is_some() {
-        std::env::set_var("PORT_HEADLESS", "1");
-        std::env::set_var("AW2_HEADLESS", "1");
-    } else if args.list_exports || args.call_export.is_some() || args.no_run {
-        if std::env::var_os("PORT_HEADLESS").is_none() && std::env::var_os("AW2_HEADLESS").is_none() {
-            std::env::set_var("PORT_HEADLESS", "1");
-        }
-    }
-    if let Some(ref drive_c) = args.drive_c_dir {
-        std::env::set_var("TRANSLATOR_HOME", drive_c);
-        std::env::set_var("AW2_DRIVE_C", drive_c);
-    }
-    port_manifest::knobs::apply_manifest_and_aliases(manifest.as_ref())
-        .map_err(anyhow::Error::msg)?;
+    let temp_static_aot_stage = apply_startup_manifest_knobs(
+        &mut args,
+        manifest.as_ref(),
+        manifest_dir.as_deref(),
+        child_process_mode,
+    )?;
 
     if args.prewarm_shaders {
         let rep = d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, false)
@@ -1763,5 +1815,132 @@ mod tests {
             Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
             None => std::env::remove_var("AW2_DLL_AOT_DIR"),
         }
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|&k| (k, std::env::var_os(k))).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+            let _ = port_manifest::knobs::apply_manifest_and_aliases(None);
+        }
+    }
+
+    #[test]
+    fn manifest_knobs_apply_before_game_dir_and_audio_harness() {
+        let _guard = EnvRestore::capture(&[
+            "PORT_GAME_DIR",
+            "AW2_GAME_DIR",
+            "PORT_AUDIO_HARNESS",
+            "AW2_AUDIO_HARNESS",
+        ]);
+        for k in [
+            "PORT_GAME_DIR",
+            "AW2_GAME_DIR",
+            "PORT_AUDIO_HARNESS",
+            "AW2_AUDIO_HARNESS",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        let mut manifest = port_manifest::GameManifest::default();
+        manifest
+            .knobs
+            .insert("PORT_GAME_DIR".to_string(), "/tmp/manifest-game-dir".to_string());
+        manifest
+            .knobs
+            .insert("PORT_AUDIO_HARNESS".to_string(), "1".to_string());
+
+        let mut args = parse_args_from(std::iter::empty::<String>());
+        assert!(!args.audio_harness);
+        assert_ne!(args.game_dir, std::path::PathBuf::from("/tmp/manifest-game-dir"));
+
+        let stage = apply_startup_manifest_knobs(&mut args, Some(&manifest), None, false)
+            .expect("apply_startup_manifest_knobs");
+        assert!(stage.is_none());
+        assert_eq!(args.game_dir, std::path::PathBuf::from("/tmp/manifest-game-dir"));
+        assert!(args.audio_harness);
+
+        // Explicit --game-dir CLI flag must still beat game.toml [knobs] PORT_GAME_DIR.
+        std::env::remove_var("PORT_GAME_DIR");
+        std::env::remove_var("AW2_GAME_DIR");
+        let mut explicit = parse_args_from(
+            ["--game-dir", "/tmp/cli-game-dir"]
+                .into_iter()
+                .map(String::from),
+        );
+        apply_startup_manifest_knobs(&mut explicit, Some(&manifest), None, false)
+            .expect("apply_startup_manifest_knobs explicit");
+        assert_eq!(explicit.game_dir, std::path::PathBuf::from("/tmp/cli-game-dir"));
+    }
+
+    #[test]
+    fn emit_static_o_forces_plaincall_off_over_manifest_knobs() {
+        let _guard = EnvRestore::capture(&[
+            "PORT_JIT_PLAINCALL",
+            "AW2_JIT_PLAINCALL",
+            "PORT_JIT_LSE2_TRAP",
+            "PORT_HEADLESS",
+            "AW2_HEADLESS",
+            "PORT_AOT_DIR",
+            "AW2_DLL_AOT_DIR",
+        ]);
+        for k in [
+            "PORT_JIT_PLAINCALL",
+            "AW2_JIT_PLAINCALL",
+            "PORT_JIT_LSE2_TRAP",
+            "PORT_HEADLESS",
+            "AW2_HEADLESS",
+            "PORT_AOT_DIR",
+            "AW2_DLL_AOT_DIR",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "port-loader-static-o-knobs-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).expect("create temp out_dir");
+
+        let mut manifest = port_manifest::GameManifest::default();
+        manifest
+            .knobs
+            .insert("PORT_JIT_PLAINCALL".to_string(), "1".to_string());
+        manifest
+            .knobs
+            .insert("AW2_JIT_PLAINCALL".to_string(), "1".to_string());
+        manifest
+            .knobs
+            .insert("PORT_JIT_LSE2_TRAP".to_string(), "1".to_string());
+
+        // Also verify inherited PORT_JIT_PLAINCALL=1 in env cannot defeat --emit-static-o.
+        std::env::set_var("PORT_JIT_PLAINCALL", "1");
+
+        let mut args = parse_args_from(
+            ["--emit-static-o", out_dir.to_str().unwrap()]
+                .into_iter()
+                .map(String::from),
+        );
+        let stage = apply_startup_manifest_knobs(&mut args, Some(&manifest), None, false)
+            .expect("apply_startup_manifest_knobs --emit-static-o");
+        assert!(stage.is_some());
+        assert_eq!(std::env::var("PORT_JIT_PLAINCALL").as_deref(), Ok("0"));
+        assert_eq!(std::env::var("AW2_JIT_PLAINCALL").as_deref(), Ok("0"));
+        assert_eq!(std::env::var("PORT_JIT_LSE2_TRAP").as_deref(), Ok("0"));
+        assert_eq!(std::env::var("PORT_HEADLESS").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("AW2_HEADLESS").as_deref(), Ok("1"));
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
