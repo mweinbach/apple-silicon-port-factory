@@ -1234,52 +1234,50 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
             return TRUE;
         }
         if !ov.is_null() {
-            let total = n as usize;
-            let mut written_so_far = 0usize;
-            while written_so_far < total {
-                match try_nonblocking_pipe_write(
-                    fd,
-                    (buf as *const u8).add(written_so_far),
-                    total - written_so_far,
-                ) {
-                    Ok(Some(0)) => {
-                        set_err(err::ERROR_BROKEN_PIPE);
-                        return FALSE;
+            match pipe_reactor().admit_async_write(
+                h,
+                &f,
+                target.conn(),
+                fd,
+                buf as *const u8,
+                n as usize,
+                ov,
+                PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
+            ) {
+                AsyncPipeWriteOutcome::Completed(done) => {
+                    if !written.is_null() {
+                        std::ptr::write_unaligned(written, done as u32);
                     }
-                    Ok(Some(k)) => {
-                        written_so_far += k;
-                    }
-                    Ok(None) => {
-                        f.completion.io_event.reset();
-                        prepare_overlapped_pending(ov);
-                        pipe_reactor().submit(PendingPipeOp::new_write_at(
-                            h,
-                            Arc::clone(&f),
-                            target.conn(),
-                            fd,
-                            buf as usize,
-                            total,
-                            written_so_far,
-                            PipeDelivery::Overlapped { ov: ov as usize, tid: teb::thread_id() },
-                        ));
-                        set_err(err::ERROR_IO_PENDING);
-                        return FALSE;
-                    }
-                    Err(e) => {
-                        set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
-                        return FALSE;
-                    }
+                    complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, done, true);
+                    return TRUE;
+                }
+                AsyncPipeWriteOutcome::Pending => {
+                    set_err(err::ERROR_IO_PENDING);
+                    return FALSE;
+                }
+                AsyncPipeWriteOutcome::Error(e) => {
+                    set_err(e);
+                    return FALSE;
                 }
             }
-            if !written.is_null() {
-                std::ptr::write_unaligned(written, written_so_far as u32);
-            }
-            complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, written_so_far, true);
-            return TRUE;
         }
-        // Synchronous blocking pipe write (write full buffer; waits via poll if fd has O_NONBLOCK).
+        // Synchronous blocking pipe write: wait for any earlier pending writes on the same
+        // pipe/connection without holding reactor locks across blocking I/O, then write the
+        // full buffer (waiting via poll if fd has O_NONBLOCK).
+        let conn = target.conn();
+        let _sync_guard = match pipe_reactor().acquire_sync_write_turn(h, &f, conn.clone(), fd) {
+            Ok(g) => g,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
         let mut done = 0usize;
         while done < n as usize {
+            if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                set_err(err::ERROR_BROKEN_PIPE);
+                return FALSE;
+            }
             let r = libc::write(fd, (buf as *const u8).add(done) as *const c_void, n as usize - done);
             if r < 0 {
                 let e = last_errno();
@@ -1520,50 +1518,35 @@ pub unsafe extern "win64" fn WriteFileEx(
             set_err(0);
             return TRUE;
         }
-        let total = n as usize;
-        let mut written_so_far = 0usize;
-        while written_so_far < total {
-            match try_nonblocking_pipe_write(
-                fd,
-                (buf as *const u8).add(written_so_far),
-                total - written_so_far,
-            ) {
-                Ok(Some(0)) => {
-                    set_err(err::ERROR_BROKEN_PIPE);
-                    return FALSE;
+        let caller_for_done = Arc::clone(&caller);
+        match pipe_reactor().admit_async_write(
+            h,
+            &f,
+            target.conn(),
+            fd,
+            buf as *const u8,
+            n as usize,
+            ov,
+            PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
+        ) {
+            AsyncPipeWriteOutcome::Completed(done) => {
+                store_ov_internal_high(ov, done);
+                store_ov_internal(ov, STATUS_SUCCESS);
+                if let Some(cb) = completion_routine {
+                    crate::thread::queue_io_completion_apc(&caller_for_done, cb, 0, done as u32, ov as usize);
                 }
-                Ok(Some(k)) => {
-                    written_so_far += k;
-                }
-                Ok(None) => {
-                    store_ov_internal_high(ov, 0);
-                    store_ov_internal(ov, STATUS_PENDING);
-                    pipe_reactor().submit(PendingPipeOp::new_write_at(
-                        h,
-                        Arc::clone(&f),
-                        target.conn(),
-                        fd,
-                        buf as usize,
-                        total,
-                        written_so_far,
-                        PipeDelivery::Apc { ov: ov as usize, cb: completion_routine, thread: caller, tid: caller_tid },
-                    ));
-                    set_err(0);
-                    return TRUE;
-                }
-                Err(e) => {
-                    set_err(if e == libc::EPIPE || e == libc::ECONNRESET { err::ERROR_BROKEN_PIPE } else { errno_to_win32(e) });
-                    return FALSE;
-                }
+                set_err(0);
+                return TRUE;
+            }
+            AsyncPipeWriteOutcome::Pending => {
+                set_err(0);
+                return TRUE;
+            }
+            AsyncPipeWriteOutcome::Error(e) => {
+                set_err(e);
+                return FALSE;
             }
         }
-        store_ov_internal_high(ov, written_so_far);
-        store_ov_internal(ov, STATUS_SUCCESS);
-        if let Some(cb) = completion_routine {
-            crate::thread::queue_io_completion_apc(&caller, cb, 0, written_so_far as u32, ov as usize);
-        }
-        set_err(0);
-        return TRUE;
     }
 
     let slice = if n == 0 {
@@ -4967,6 +4950,9 @@ pub unsafe extern "win64" fn FindCloseChangeNotification(h: HANDLE) -> BOOL {
 enum PipeOpKind {
     Read,
     Write,
+    /// Non-polled FIFO placeholder held by an active or waiting synchronous `WriteFile`
+    /// so neither earlier async writes are bypassed nor later async writes leapfrog it.
+    SyncWriteBarrier,
 }
 
 enum PipeDelivery {
@@ -4980,6 +4966,58 @@ enum PipeDelivery {
         thread: Arc<ThreadObj>,
         tid: u32,
     },
+    SyncBarrier,
+}
+
+enum AsyncPipeWriteOutcome {
+    Completed(usize),
+    Pending,
+    Error(u32),
+}
+
+struct SyncPipeWriteGuard {
+    reactor: &'static PipeIoReactor,
+    op: Arc<PendingPipeOp>,
+}
+
+impl Drop for SyncPipeWriteGuard {
+    fn drop(&mut self) {
+        self.op.done.store(true, Ordering::Release);
+        {
+            let mut st = self.reactor.state.lock().unwrap();
+            st.ops.retain(|o| !Arc::ptr_eq(o, &self.op));
+            self.reactor.gen_cv.notify_all();
+        }
+        self.reactor.poke();
+    }
+}
+
+/// True when `op` targets the same logical pipe write stream as `(file, conn)`:
+/// - Named-pipe server connections match by shared `Arc<PipeConn>` (so duplicated handles share
+///   one write queue while distinct reconnect generations remain isolated).
+/// - Direct pipes (anonymous pipes and named-pipe clients) match by shared `Arc<FileObj>`.
+fn same_pipe_write_stream(
+    op: &PendingPipeOp,
+    file: &Arc<FileObj>,
+    conn: Option<&Arc<PipeConn>>,
+) -> bool {
+    match (op.conn.as_ref(), conn) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => Arc::ptr_eq(&op.file, file),
+        _ => false,
+    }
+}
+
+fn has_prior_pipe_write(
+    ops: &[Arc<PendingPipeOp>],
+    file: &Arc<FileObj>,
+    conn: Option<&Arc<PipeConn>>,
+) -> bool {
+    ops.iter().any(|op| {
+        matches!(op.kind, PipeOpKind::Write | PipeOpKind::SyncWriteBarrier)
+            && !op.done.load(Ordering::Acquire)
+            && same_pipe_write_stream(op, file, conn)
+    })
 }
 
 struct PipeOpState {
@@ -5107,15 +5145,37 @@ impl PendingPipeOp {
         })
     }
 
+    fn new_sync_write_barrier(
+        handle: HANDLE,
+        file: Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+    ) -> Arc<Self> {
+        Arc::new(PendingPipeOp {
+            handle: handle as usize,
+            file,
+            conn,
+            fd,
+            kind: PipeOpKind::SyncWriteBarrier,
+            buf: 0,
+            len: 0,
+            state: Mutex::new(PipeOpState { completed: false, written: 0 }),
+            done: AtomicBool::new(false),
+            delivery: PipeDelivery::SyncBarrier,
+        })
+    }
+
     fn tid(&self) -> u32 {
         match &self.delivery {
             PipeDelivery::Overlapped { tid, .. } | PipeDelivery::Apc { tid, .. } => *tid,
+            PipeDelivery::SyncBarrier => 0,
         }
     }
 
     fn ov_addr(&self) -> usize {
         match &self.delivery {
             PipeDelivery::Overlapped { ov, .. } | PipeDelivery::Apc { ov, .. } => *ov,
+            PipeDelivery::SyncBarrier => 0,
         }
     }
 
@@ -5141,6 +5201,7 @@ impl PendingPipeOp {
                     crate::thread::queue_io_completion_apc(thread, func, win_err, bytes as u32, *ov);
                 }
             },
+            PipeDelivery::SyncBarrier => {}
         }
     }
 }
@@ -5162,6 +5223,113 @@ impl PipeIoReactor {
         unsafe {
             let _ = libc::write(self.wake_w, &b as *const u8 as *const c_void, 1);
         }
+    }
+
+    /// Atomically admit an overlapped `WriteFile` or `WriteFileEx` on a pipe under `self.state`:
+    /// - If an earlier write on the same pipe/connection is still queued or active, enqueue
+    ///   strictly behind it without touching the fd.
+    /// - Otherwise attempt a nonblocking write loop while holding `self.state` so no concurrent
+    ///   writer can interleave bytes; if `EAGAIN` occurs, enqueue the remainder in FIFO order.
+    /// All completion notifications happen strictly outside `self.state` in the caller.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn admit_async_write(
+        &self,
+        handle: HANDLE,
+        file: &Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+        buf: *const u8,
+        total: usize,
+        ov: *mut OVERLAPPED,
+        delivery: PipeDelivery,
+    ) -> AsyncPipeWriteOutcome {
+        let mut st = self.state.lock().unwrap();
+        if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+            return AsyncPipeWriteOutcome::Error(err::ERROR_BROKEN_PIPE);
+        }
+        let mut written_so_far = 0usize;
+        if !has_prior_pipe_write(&st.ops, file, conn.as_ref()) {
+            while written_so_far < total {
+                match try_nonblocking_pipe_write(fd, buf.add(written_so_far), total - written_so_far) {
+                    Ok(Some(0)) => {
+                        return AsyncPipeWriteOutcome::Error(err::ERROR_BROKEN_PIPE);
+                    }
+                    Ok(Some(k)) => {
+                        written_so_far += k;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return AsyncPipeWriteOutcome::Error(if e == libc::EPIPE || e == libc::ECONNRESET {
+                            err::ERROR_BROKEN_PIPE
+                        } else {
+                            errno_to_win32(e)
+                        });
+                    }
+                }
+            }
+            if written_so_far >= total {
+                return AsyncPipeWriteOutcome::Completed(written_so_far);
+            }
+        }
+        match &delivery {
+            PipeDelivery::Overlapped { .. } => {
+                file.completion.io_event.reset();
+                prepare_overlapped_pending(ov);
+            }
+            PipeDelivery::Apc { .. } => {
+                store_ov_internal_high(ov, 0);
+                store_ov_internal(ov, STATUS_PENDING);
+            }
+            PipeDelivery::SyncBarrier => {}
+        }
+        st.ops.push(PendingPipeOp::new_write_at(
+            handle,
+            Arc::clone(file),
+            conn,
+            fd,
+            buf as usize,
+            total,
+            written_so_far,
+            delivery,
+        ));
+        drop(st);
+        self.poke();
+        AsyncPipeWriteOutcome::Pending
+    }
+
+    /// Enqueue a non-polled FIFO write barrier for a synchronous `WriteFile` and wait (releasing
+    /// `self.state` while waiting and before any blocking `write`/`poll`) until all earlier writes
+    /// on the same pipe/connection finish or are cancelled.
+    fn acquire_sync_write_turn(
+        &'static self,
+        handle: HANDLE,
+        file: &Arc<FileObj>,
+        conn: Option<Arc<PipeConn>>,
+        fd: i32,
+    ) -> Result<SyncPipeWriteGuard, u32> {
+        let barrier = PendingPipeOp::new_sync_write_barrier(handle, Arc::clone(file), conn.clone(), fd);
+        let mut st = self.state.lock().unwrap();
+        if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+            return Err(err::ERROR_BROKEN_PIPE);
+        }
+        st.ops.push(Arc::clone(&barrier));
+        let guard = SyncPipeWriteGuard { reactor: self, op: Arc::clone(&barrier) };
+        loop {
+            if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
+                drop(st);
+                return Err(err::ERROR_BROKEN_PIPE);
+            }
+            let prior = match st.ops.iter().position(|o| Arc::ptr_eq(o, &barrier)) {
+                Some(idx) => has_prior_pipe_write(&st.ops[..idx], file, conn.as_ref()),
+                None => false,
+            };
+            if !prior {
+                break;
+            }
+            st = self.gen_cv.wait(st).unwrap();
+        }
+        drop(st);
+        Ok(guard)
     }
 
     fn submit(&self, op: Arc<PendingPipeOp>) {
@@ -5193,48 +5361,59 @@ impl PipeIoReactor {
         }
     }
 
-    fn finish_cancelled_ops(&self, to_cancel: Vec<Arc<PendingPipeOp>>) -> usize {
-        let mut count = 0;
-        for op in to_cancel {
-            // Wait for any in-progress reactor non-blocking I/O step on `op.buf` to finish
-            // before marking cancelled and publishing completion.
+    /// Two-phase synchronized cancellation:
+    /// 1. Keep `to_cancel` in `self.state.ops` while acquiring each `op.state` so any in-flight
+    ///    reactor step on `op` finishes before a successor write can advance.
+    /// 2. Remove the now-completed ops from `self.state.ops` (preserving FIFO order) and notify
+    ///    `gen_cv` for any waiting synchronous writers.
+    /// 3. Publish `STATUS_CANCELLED` strictly outside both `self.state` and `op.state`.
+    fn finalize_cancelled_ops(&self, to_cancel: Vec<Arc<PendingPipeOp>>) -> usize {
+        if to_cancel.is_empty() {
+            return 0;
+        }
+        let mut publish = Vec::with_capacity(to_cancel.len());
+        for op in &to_cancel {
             let should_publish = {
-                let mut st = op.state.lock().unwrap();
-                if st.completed {
+                let mut ost = op.state.lock().unwrap();
+                if ost.completed {
                     false
                 } else {
-                    st.completed = true;
+                    ost.completed = true;
                     op.done.store(true, Ordering::Release);
                     true
                 }
             };
             if should_publish {
-                op.publish_completion(STATUS_CANCELLED, 0);
-                count += 1;
+                publish.push(Arc::clone(op));
             }
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.ops.retain(|o| !to_cancel.iter().any(|c| Arc::ptr_eq(o, c)));
+            self.gen_cv.notify_all();
+        }
+        let count = publish.len();
+        for op in publish {
+            op.publish_completion(STATUS_CANCELLED, 0);
         }
         count
     }
 
     fn cancel_ops(&self, handle: usize, ov: Option<usize>, filter_tid: Option<u32>) -> usize {
         let to_cancel: Vec<Arc<PendingPipeOp>> = {
-            let mut st = self.state.lock().unwrap();
-            let mut matched = Vec::new();
-            let mut i = 0;
-            while i < st.ops.len() {
-                let o = &st.ops[i];
-                let h_ok = o.handle == handle;
-                let ov_ok = ov.map_or(true, |target| o.ov_addr() == target);
-                let tid_ok = filter_tid.map_or(true, |t| o.tid() == t);
-                if h_ok && ov_ok && tid_ok {
-                    matched.push(st.ops.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            matched
+            let st = self.state.lock().unwrap();
+            st.ops
+                .iter()
+                .filter(|o| {
+                    !matches!(o.kind, PipeOpKind::SyncWriteBarrier)
+                        && o.handle == handle
+                        && ov.map_or(true, |target| o.ov_addr() == target)
+                        && filter_tid.map_or(true, |t| o.tid() == t)
+                })
+                .cloned()
+                .collect()
         };
-        let count = self.finish_cancelled_ops(to_cancel);
+        let count = self.finalize_cancelled_ops(to_cancel);
         if count > 0 {
             self.poke();
         }
@@ -5242,27 +5421,26 @@ impl PipeIoReactor {
     }
 
     /// Cancel and synchronize every pending or in-flight operation bound to `conn`
-    /// across all duplicated numeric handles, then wait one reactor cycle so any
-    /// reactor snapshot drops its `Arc<PipeConn>` reference promptly.
+    /// across all duplicated numeric handles, wake any synchronous writers waiting on `conn`,
+    /// then wait one reactor cycle so any reactor snapshot drops its `Arc<PipeConn>` promptly.
     fn cancel_ops_for_conn(&self, conn: &Arc<PipeConn>) -> usize {
-        let (to_cancel, gen_before) = {
-            let mut st = self.state.lock().unwrap();
-            let mut matched = Vec::new();
-            let mut i = 0;
-            while i < st.ops.len() {
-                if st.ops[i]
-                    .conn
-                    .as_ref()
-                    .is_some_and(|c| Arc::ptr_eq(c, conn))
-                {
-                    matched.push(st.ops.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            (matched, st.poll_gen)
+        let to_cancel: Vec<Arc<PendingPipeOp>> = {
+            let st = self.state.lock().unwrap();
+            self.gen_cv.notify_all();
+            st.ops
+                .iter()
+                .filter(|o| {
+                    !matches!(o.kind, PipeOpKind::SyncWriteBarrier)
+                        && o.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn))
+                })
+                .cloned()
+                .collect()
         };
-        let count = self.finish_cancelled_ops(to_cancel);
+        let count = self.finalize_cancelled_ops(to_cancel);
+        let gen_before = {
+            let st = self.state.lock().unwrap();
+            st.poll_gen
+        };
         self.poke();
         let mut st = self.state.lock().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
@@ -5315,10 +5493,16 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                         st.poll_gen = st.poll_gen.wrapping_add(1);
                         reactor.gen_cv.notify_all();
                         st.ops.retain(|o| !o.done.load(Ordering::Acquire));
-                        for o in st.ops.iter() {
+                        for (i, o) in st.ops.iter().enumerate() {
                             let events = match o.kind {
                                 PipeOpKind::Read => libc::POLLIN,
-                                PipeOpKind::Write => libc::POLLOUT,
+                                PipeOpKind::Write => {
+                                    if has_prior_pipe_write(&st.ops[..i], &o.file, o.conn.as_ref()) {
+                                        continue;
+                                    }
+                                    libc::POLLOUT
+                                }
+                                PipeOpKind::SyncWriteBarrier => continue,
                             };
                             pfds.push(libc::pollfd { fd: o.fd, events, revents: 0 });
                             snap.push(Arc::clone(o));
@@ -5443,6 +5627,7 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                                             }
                                         }
                                     }
+                                    PipeOpKind::SyncWriteBarrier => None,
                                 };
                                 if let Some(res) = step_res {
                                     st.completed = true;
@@ -5454,9 +5639,13 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                             }
                         };
                         if let Some((status, bytes)) = finished {
+                            let was_write = matches!(op.kind, PipeOpKind::Write);
                             {
                                 let mut st = reactor.state.lock().unwrap();
                                 st.ops.retain(|o| !Arc::ptr_eq(o, op));
+                                if was_write {
+                                    reactor.gen_cv.notify_all();
+                                }
                             }
                             op.publish_completion(status, bytes);
                         }
@@ -8966,6 +9155,282 @@ mod tests {
             assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
 
             assert_eq!(CloseHandle(cli2), TRUE);
+            assert_eq!(DisconnectNamedPipe(srv1), TRUE);
+            assert_eq!(CloseHandle(srv2), TRUE);
+            assert_eq!(CloseHandle(srv1), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn pipe_writes_serialize_fifo_across_mixed_apis_duplicates_cancel_and_distinct_pipes() {
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AOrd};
+        static APC_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static APC_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static APC_BYTES: AtomicU32 = AtomicU32::new(0);
+        static APC_OV: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "win64" fn on_write_apc(err_code: u32, bytes: u32, ov: usize) {
+            APC_ERR.store(err_code, AOrd::SeqCst);
+            APC_BYTES.store(bytes, AOrd::SeqCst);
+            APC_OV.store(ov, AOrd::SeqCst);
+            APC_CALLS.fetch_add(1, AOrd::SeqCst);
+        }
+
+        unsafe {
+            APC_CALLS.store(0, AOrd::SeqCst);
+            APC_ERR.store(u32::MAX, AOrd::SeqCst);
+            APC_BYTES.store(0, AOrd::SeqCst);
+            APC_OV.store(0, AOrd::SeqCst);
+
+            let pname: Vec<u16> = format!(
+                "\\\\.\\pipe\\win32rt_write_fifo_test_{}\0",
+                std::process::id()
+            )
+            .encode_utf16()
+            .collect();
+            let srv1 = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x3 | 0x4000_0000, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv1, INVALID_HANDLE_VALUE);
+
+            let mut srv2: HANDLE = std::ptr::null_mut();
+            let cur_proc = crate::kernel32::process::GetCurrentProcess();
+            assert_eq!(DuplicateHandle(cur_proc, srv1, cur_proc, &mut srv2, 0, FALSE, 2), TRUE);
+            assert!(!srv2.is_null());
+            assert_ne!(srv2, srv1);
+
+            let iocp = CreateIoCompletionPort(srv1, std::ptr::null_mut(), 0x5150, 0);
+            assert!(!iocp.is_null());
+
+            let mut ov_conn: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ConnectNamedPipe(srv1, &mut ov_conn), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_conn as *mut OVERLAPPED);
+
+            // 1. Backpressure on pipe 1: W1 (overlapped WriteFile on srv1), W2 (overlapped
+            //    WriteFile on duplicate srv2), W3 (WriteFileEx APC on srv1), W4 (synchronous
+            //    WriteFile on srv2 from another thread).
+            let w1 = vec![0xA1u8; 256 * 1024];
+            let w2 = vec![0xB2u8; 16 * 1024];
+            let w3 = vec![0xC3u8; 8 * 1024];
+            let w4 = vec![0xD4u8; 4 * 1024];
+
+            let mut ov1: OVERLAPPED = std::mem::zeroed();
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            let mut ov3: OVERLAPPED = std::mem::zeroed();
+            let mut nw = 0u32;
+
+            assert_eq!(
+                WriteFile(srv1, w1.as_ptr() as *const c_void, w1.len() as u32, &mut nw, &mut ov1),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // W2 on duplicate handle MUST queue behind W1 instead of bypassing it.
+            assert_eq!(
+                WriteFile(srv2, w2.as_ptr() as *const c_void, w2.len() as u32, &mut nw, &mut ov2),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            // W3 via WriteFileEx MUST also queue behind W2 (still STATUS_PENDING).
+            assert_eq!(
+                WriteFileEx(srv1, w3.as_ptr() as *const c_void, w3.len() as u32, &mut ov3, Some(on_write_apc)),
+                TRUE
+            );
+            assert_eq!(load_ov_internal(&mut ov3), STATUS_PENDING);
+
+            // W4 via synchronous WriteFile on duplicate handle from another thread must wait
+            // behind W1..W3 without starving unrelated pipes.
+            let sync_done = Arc::new(AtomicBool::new(false));
+            let sync_done_bg = Arc::clone(&sync_done);
+            let w4_bg = w4.clone();
+            let srv2_raw = srv2 as usize;
+            let sync_thread = std::thread::spawn(move || {
+                let mut sw = 0u32;
+                let ok = WriteFile(
+                    srv2_raw as HANDLE,
+                    w4_bg.as_ptr() as *const c_void,
+                    w4_bg.len() as u32,
+                    &mut sw,
+                    std::ptr::null_mut(),
+                );
+                sync_done_bg.store(true, AOrd::Release);
+                (ok, sw)
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(
+                !sync_done.load(AOrd::Acquire),
+                "synchronous WriteFile must wait behind earlier pending async writes"
+            );
+
+            // Distinct pipe P2 must remain completely responsive while P1's writes are backed up.
+            let mut p2_r: HANDLE = std::ptr::null_mut();
+            let mut p2_w: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut p2_r, &mut p2_w, std::ptr::null_mut(), 0), TRUE);
+            let p2_msg = b"DISTINCT-PIPE-OK";
+            let mut p2_nw = 0u32;
+            assert_eq!(
+                WriteFile(p2_w, p2_msg.as_ptr() as *const c_void, p2_msg.len() as u32, &mut p2_nw, std::ptr::null_mut()),
+                TRUE
+            );
+            let mut p2_buf = [0u8; 32];
+            let mut p2_nr = 0u32;
+            assert_eq!(
+                ReadFile(p2_r, p2_buf.as_mut_ptr() as *mut c_void, p2_buf.len() as u32, &mut p2_nr, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(&p2_buf[..p2_nr as usize], p2_msg);
+            assert_eq!(CloseHandle(p2_r), TRUE);
+            assert_eq!(CloseHandle(p2_w), TRUE);
+
+            // Drain all bytes on the client end in a reader thread.
+            let total_expected = w1.len() + w2.len() + w3.len() + w4.len();
+            let cli_raw = cli as usize;
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(total_expected);
+                let mut chunk = [0u8; 8192];
+                while got.len() < total_expected {
+                    let want = (total_expected - got.len()).min(chunk.len()) as u32;
+                    let mut nr = 0u32;
+                    let ok = ReadFile(cli_raw as HANDLE, chunk.as_mut_ptr() as *mut c_void, want, &mut nr, std::ptr::null_mut());
+                    assert_eq!(ok, TRUE);
+                    assert!(nr > 0);
+                    got.extend_from_slice(&chunk[..nr as usize]);
+                }
+                got
+            });
+
+            let mut seen_ov = Vec::new();
+            for _ in 0..2 {
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 5000), TRUE);
+                seen_ov.push((ov_out as usize, bytes));
+            }
+            assert_eq!(
+                seen_ov,
+                vec![
+                    (&mut ov1 as *mut OVERLAPPED as usize, w1.len() as u32),
+                    (&mut ov2 as *mut OVERLAPPED as usize, w2.len() as u32),
+                ],
+                "overlapped WriteFile completions must fire in FIFO order"
+            );
+
+            // Deliver WriteFileEx APC completion for W3.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while APC_CALLS.load(AOrd::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                let _ = crate::kernel32::time::SleepEx(50, TRUE);
+            }
+            assert_eq!(APC_CALLS.load(AOrd::SeqCst), 1);
+            assert_eq!(APC_ERR.load(AOrd::SeqCst), 0);
+            assert_eq!(APC_BYTES.load(AOrd::SeqCst), w3.len() as u32);
+            assert_eq!(APC_OV.load(AOrd::SeqCst), &mut ov3 as *mut OVERLAPPED as usize);
+
+            let (sync_ok, sync_written) = sync_thread.join().unwrap();
+            assert_eq!(sync_ok, TRUE);
+            assert_eq!(sync_written, w4.len() as u32);
+
+            let received = reader.join().unwrap();
+            assert_eq!(received.len(), total_expected);
+            let off1 = w1.len();
+            let off2 = off1 + w2.len();
+            let off3 = off2 + w3.len();
+            assert!(received[..off1].iter().all(|&b| b == 0xA1), "W1 bytes must remain contiguous");
+            assert!(received[off1..off2].iter().all(|&b| b == 0xB2), "W2 bytes must follow W1");
+            assert!(received[off2..off3].iter().all(|&b| b == 0xC3), "W3 bytes must follow W2");
+            assert!(received[off3..].iter().all(|&b| b == 0xD4), "W4 sync bytes must follow W3");
+
+            // 2. Canceling the head pending write advances the queued successor cleanly.
+            let c1 = vec![0xE1u8; 256 * 1024];
+            let c2 = vec![0xF6u8; 8 * 1024];
+            let mut ov_c1: OVERLAPPED = std::mem::zeroed();
+            let mut ov_c2: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WriteFile(srv1, c1.as_ptr() as *const c_void, c1.len() as u32, &mut nw, &mut ov_c1),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+            assert_eq!(
+                WriteFile(srv2, c2.as_ptr() as *const c_void, c2.len() as u32, &mut nw, &mut ov_c2),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_IO_PENDING);
+
+            assert_eq!(CancelIoEx(srv1, &mut ov_c1), TRUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(teb::last_error(), ERROR_OPERATION_ABORTED);
+            assert_eq!(ov_out, &mut ov_c1 as *mut OVERLAPPED);
+            assert_eq!(load_ov_internal(&mut ov_c1), STATUS_CANCELLED);
+
+            // Drain client while C2 completes; after C2 completes, write an 8-byte sentinel so
+            // the reader thread exits deterministically with zero TOCTOU.
+            const SENTINEL: &[u8; 8] = b"C2-DONE!";
+            let drain_thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let mut nr = 0u32;
+                    let ok = ReadFile(
+                        cli_raw as HANDLE,
+                        chunk.as_mut_ptr() as *mut c_void,
+                        chunk.len() as u32,
+                        &mut nr,
+                        std::ptr::null_mut(),
+                    );
+                    if ok == FALSE || nr == 0 {
+                        break;
+                    }
+                    all.extend_from_slice(&chunk[..nr as usize]);
+                    if all.ends_with(SENTINEL) {
+                        break;
+                    }
+                }
+                all
+            });
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 3000), TRUE);
+            assert_eq!(ov_out, &mut ov_c2 as *mut OVERLAPPED);
+            assert_eq!(bytes, c2.len() as u32);
+            assert_eq!(load_ov_internal(&mut ov_c2), STATUS_SUCCESS);
+            assert_eq!(
+                WriteFile(srv1, SENTINEL.as_ptr() as *const c_void, SENTINEL.len() as u32, &mut nw, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(nw, SENTINEL.len() as u32);
+
+            let drained = drain_thread.join().unwrap();
+            assert!(drained.ends_with(SENTINEL));
+            let without_sentinel = &drained[..drained.len() - SENTINEL.len()];
+            assert!(without_sentinel.len() >= c2.len());
+            let tail = &without_sentinel[without_sentinel.len() - c2.len()..];
+            assert!(tail.iter().all(|&b| b == 0xF6), "queued successor C2 must deliver intact after head cancel");
+
+            assert_eq!(CloseHandle(cli), TRUE);
             assert_eq!(DisconnectNamedPipe(srv1), TRUE);
             assert_eq!(CloseHandle(srv2), TRUE);
             assert_eq!(CloseHandle(srv1), TRUE);
