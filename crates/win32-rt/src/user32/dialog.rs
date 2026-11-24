@@ -485,17 +485,37 @@ fn returns_direct_result(msg: u32) -> bool {
     )
 }
 
+/// Returns `(visible, enabled, tabstop)` for a child control's own live state.
+/// Uses the control's own `WindowData.visible` (maintained by `ShowWindow` /
+/// `SetWindowLong`), not ancestor-inclusive `IsWindowVisible`, because controls
+/// are queried during `WM_INITDIALOG` before the dialog itself is shown.
+fn control_focus_flags(hwnd: usize) -> Option<(bool, bool, bool)> {
+    let w = window::get(hwnd)?;
+    let d = w.data();
+    Some((d.visible, d.enabled, (d.style & ws::TABSTOP) != 0))
+}
+
+#[inline]
+fn is_control_visible_enabled(hwnd: usize) -> bool {
+    control_focus_flags(hwnd).is_some_and(|(visible, enabled, _)| visible && enabled)
+}
+
+#[inline]
+fn is_control_tab_stop(hwnd: usize) -> bool {
+    control_focus_flags(hwnd).is_some_and(|(visible, enabled, tabstop)| visible && enabled && tabstop)
+}
+
 unsafe fn first_focusable_control(hdlg: usize) -> usize {
     let children = window::children_of(hdlg);
     for &c in &children {
-        if let Some(w) = window::get(c) {
-            let d = w.data();
-            if d.enabled && (d.style & ws::TABSTOP) != 0 {
-                return c;
-            }
+        if is_control_tab_stop(c) {
+            return c;
         }
     }
-    children.first().copied().unwrap_or(0)
+    children
+        .into_iter()
+        .find(|&c| is_control_visible_enabled(c))
+        .unwrap_or(0)
 }
 
 unsafe fn def_dlg_proc_impl(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -753,8 +773,17 @@ unsafe fn create_dialog_indirect_internal(
         .is_some_and(|s| s.ended);
 
     if !ended {
-        if init_ret != 0 && first_ctrl != 0 && window::exists(first_ctrl) {
-            input::set_focus(first_ctrl);
+        if init_ret != 0 {
+            // Re-validate after WM_INITDIALOG in case the handler hid, disabled,
+            // destroyed, or revealed controls before returning TRUE.
+            let target = if first_ctrl != 0 && is_control_tab_stop(first_ctrl) {
+                first_ctrl
+            } else {
+                first_focusable_control(h)
+            };
+            if target != 0 && window::exists(target) {
+                input::set_focus(target);
+            }
         }
         if want_visible || modal {
             ShowWindow(hdlg, SW_SHOWNORMAL);
@@ -1181,14 +1210,11 @@ pub unsafe extern "win64" fn GetNextDlgTabItem(hdlg: HWND, hctl: HWND, b_previou
         set_error(e::INVALID_WINDOW_HANDLE);
         return std::ptr::null_mut();
     }
-    let tab_stops: Vec<usize> = window::children_of(h)
-        .into_iter()
-        .filter(|&c| {
-            window::get(c).is_some_and(|w| {
-                let d = w.data();
-                d.enabled && (d.style & ws::TABSTOP) != 0
-            })
-        })
+    let children = window::children_of(h);
+    let tab_stops: Vec<usize> = children
+        .iter()
+        .copied()
+        .filter(|&c| is_control_tab_stop(c))
         .collect();
     if tab_stops.is_empty() {
         return std::ptr::null_mut();
@@ -1211,6 +1237,23 @@ pub unsafe extern "win64" fn GetNextDlgTabItem(hdlg: HWND, hctl: HWND, b_previou
             tab_stops[next_idx] as HWND
         }
         None => {
+            if let Some(pos) = children.iter().position(|&c| c == cur) {
+                if b_previous != 0 {
+                    for &c in children[..pos].iter().rev() {
+                        if is_control_tab_stop(c) {
+                            return c as HWND;
+                        }
+                    }
+                    return *tab_stops.last().unwrap() as HWND;
+                } else {
+                    for &c in &children[pos + 1..] {
+                        if is_control_tab_stop(c) {
+                            return c as HWND;
+                        }
+                    }
+                    return tab_stops[0] as HWND;
+                }
+            }
             if b_previous != 0 {
                 *tab_stops.last().unwrap() as HWND
             } else {
@@ -2228,6 +2271,249 @@ mod tests {
                 parse_dialog_template(ex_trunc.as_ptr(), Some(ex_trunc.len())).is_err(),
                 "truncated extended creation-data payload must fail"
             );
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn push_std_ctrl(buf: &mut Vec<u8>, id: u16, cls_ord: u16, style: u32, title: &str) {
+        align4(buf);
+        push_u32(buf, style);
+        push_u32(buf, 0);
+        push_u16(buf, 4);
+        push_u16(buf, 4);
+        push_u16(buf, 40);
+        push_u16(buf, 12);
+        push_u16(buf, id);
+        push_u16(buf, 0xFFFF);
+        push_u16(buf, cls_ord);
+        push_wide_z(buf, title);
+        push_u16(buf, 0);
+    }
+
+    static VIS_INIT_WPARAM: AtomicUsize = AtomicUsize::new(0);
+    static VIS_INIT_MODE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "win64" fn vis_focus_dlg_proc(
+        hdlg: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> isize {
+        if msg == wm::INITDIALOG {
+            VIS_INIT_WPARAM.store(wparam, Ordering::SeqCst);
+            match VIS_INIT_MODE.load(Ordering::SeqCst) {
+                // Mode 1: hide the proposed control and return TRUE -> dialog must recompute focus.
+                1 => {
+                    ShowWindow(wparam as HWND, SW_HIDE);
+                    1
+                }
+                // Mode 2: set explicit custom focus on id 203 and return FALSE -> preserve it.
+                2 => {
+                    let h203 = GetDlgItem(hdlg, 203);
+                    input::SetFocus(h203);
+                    0
+                }
+                // Default: return TRUE and let dialog focus proposed control.
+                _ => 1,
+            }
+        } else {
+            0
+        }
+    }
+
+    struct ShiftKeyGuard;
+    impl ShiftKeyGuard {
+        fn press() -> Self {
+            input::native_key(input::NativeKey {
+                mac: 0x38, // Left Shift
+                down: true,
+                repeat: false,
+                chars: Vec::new(),
+            });
+            Self
+        }
+    }
+    impl Drop for ShiftKeyGuard {
+        fn drop(&mut self) {
+            input::native_key(input::NativeKey {
+                mac: 0x38,
+                down: false,
+                repeat: false,
+                chars: Vec::new(),
+            });
+        }
+    }
+
+    #[test]
+    fn dialog_focus_and_tab_navigation_skip_hidden_controls() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!crate::macos::active(), "unit tests must stay headless");
+        std::thread::spawn(|| unsafe {
+            let dlg_proc_va = vis_focus_dlg_proc as *const () as usize;
+            crate::register_native_va(dlg_proc_va as u64, dlg_proc_va);
+
+            let make_tab_msg = |hwnd: HWND| MSG {
+                hwnd: hwnd as usize,
+                message: wm::KEYDOWN,
+                wparam: VK_TAB,
+                lparam: 0,
+                time: 0,
+                pt: POINT { x: 0, y: 0 },
+                l_private: 0,
+            };
+
+            // 1. Initially hidden first tab-stop + ShowWindow(SW_HIDE / SW_SHOWNORMAL),
+            //    forward/reverse/wrap traversal via GetNextDlgTabItem and IsDialogMessageW (Tab / Shift+Tab).
+            let mut tmpl1 = build_std_header(ws::POPUP | ws::CAPTION, 4, "HiddenTabTest");
+            push_std_ctrl(&mut tmpl1, 101, 0x0081, ws::CHILD | ws::TABSTOP, "HiddenFirst"); // no WS_VISIBLE
+            push_std_ctrl(&mut tmpl1, 102, 0x0081, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "VisSecond");
+            push_std_ctrl(&mut tmpl1, 103, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "VisThird");
+            push_std_ctrl(&mut tmpl1, 104, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "VisFourth");
+
+            VIS_INIT_WPARAM.store(0, Ordering::SeqCst);
+            VIS_INIT_MODE.store(0, Ordering::SeqCst);
+            let hdlg1 = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl1.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg1.is_null());
+            let h101 = GetDlgItem(hdlg1, 101);
+            let h102 = GetDlgItem(hdlg1, 102);
+            let h103 = GetDlgItem(hdlg1, 103);
+            let h104 = GetDlgItem(hdlg1, 104);
+
+            // Dialog itself is not WS_VISIBLE yet, yet visible child h102 is selected while hidden h101 is skipped.
+            assert_eq!(VIS_INIT_WPARAM.load(Ordering::SeqCst), h102 as usize);
+            assert_eq!(input::GetFocus(), h102);
+
+            // GetNextDlgTabItem skips initially hidden h101 in both directions and wraps cleanly.
+            assert_eq!(GetNextDlgTabItem(hdlg1, std::ptr::null_mut(), FALSE), h102);
+            assert_eq!(GetNextDlgTabItem(hdlg1, std::ptr::null_mut(), TRUE), h104);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h102, FALSE), h103);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h103, FALSE), h104);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h104, FALSE), h102);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h102, TRUE), h104);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h104, TRUE), h103);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h103, TRUE), h102);
+
+            // Hide h103 dynamically via ShowWindow(SW_HIDE): Tab and Shift+Tab skip both h101 and h103.
+            ShowWindow(h103, SW_HIDE);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h102, FALSE), h104);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h104, TRUE), h102);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h103, FALSE), h104);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h103, TRUE), h102);
+
+            let mut msg_tab = make_tab_msg(h102);
+            assert_eq!(IsDialogMessageW(hdlg1, &mut msg_tab), TRUE);
+            assert_eq!(input::GetFocus(), h104, "Tab must skip hidden h103");
+            let mut msg_tab2 = make_tab_msg(h104);
+            assert_eq!(IsDialogMessageW(hdlg1, &mut msg_tab2), TRUE);
+            assert_eq!(input::GetFocus(), h102, "Tab must wrap past hidden h101");
+
+            {
+                let _shift = ShiftKeyGuard::press();
+                assert!(input::shift_down());
+                let mut msg_stab = make_tab_msg(h102);
+                assert_eq!(IsDialogMessageW(hdlg1, &mut msg_stab), TRUE);
+                assert_eq!(input::GetFocus(), h104, "Shift+Tab must wrap past hidden h101");
+                let mut msg_stab2 = make_tab_msg(h104);
+                assert_eq!(IsDialogMessageW(hdlg1, &mut msg_stab2), TRUE);
+                assert_eq!(input::GetFocus(), h102, "Shift+Tab must skip hidden h103");
+            }
+            assert!(!input::shift_down());
+
+            // Showing h101 and h103 restores eligibility in tab order.
+            ShowWindow(h101, SW_SHOWNORMAL);
+            ShowWindow(h103, SW_SHOWNORMAL);
+            assert_eq!(GetNextDlgTabItem(hdlg1, std::ptr::null_mut(), FALSE), h101);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h102, FALSE), h103);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h104, FALSE), h101);
+            assert_eq!(GetNextDlgTabItem(hdlg1, h102, TRUE), h101);
+
+            // Hiding every control leaves zero eligible tab-stops or focusable controls.
+            for h in [h101, h102, h103, h104] {
+                ShowWindow(h, SW_HIDE);
+            }
+            assert!(GetNextDlgTabItem(hdlg1, h102, FALSE).is_null());
+            assert!(GetNextDlgTabItem(hdlg1, std::ptr::null_mut(), TRUE).is_null());
+            assert_eq!(first_focusable_control(hdlg1 as usize), 0);
+            assert_eq!(DestroyWindow(hdlg1), TRUE);
+
+            // 2. WM_INITDIALOG hiding proposed wparam while returning TRUE recomputes focus;
+            //    returning FALSE preserves custom focus.
+            let mut tmpl2 = build_std_header(ws::POPUP | ws::CAPTION, 3, "InitDlgFocusTest");
+            push_std_ctrl(&mut tmpl2, 201, 0x0081, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "First");
+            push_std_ctrl(&mut tmpl2, 202, 0x0081, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "Second");
+            push_std_ctrl(&mut tmpl2, 203, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "Third");
+
+            VIS_INIT_WPARAM.store(0, Ordering::SeqCst);
+            VIS_INIT_MODE.store(1, Ordering::SeqCst);
+            let hdlg2 = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl2.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg2.is_null());
+            let h201 = GetDlgItem(hdlg2, 201);
+            let h202 = GetDlgItem(hdlg2, 202);
+            assert_eq!(VIS_INIT_WPARAM.load(Ordering::SeqCst), h201 as usize);
+            assert_eq!(
+                input::GetFocus(),
+                h202,
+                "WM_INITDIALOG returning TRUE after hiding wparam must focus next eligible control"
+            );
+            assert_eq!(DestroyWindow(hdlg2), TRUE);
+
+            VIS_INIT_WPARAM.store(0, Ordering::SeqCst);
+            VIS_INIT_MODE.store(2, Ordering::SeqCst);
+            let hdlg3 = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl2.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg3.is_null());
+            let h203 = GetDlgItem(hdlg3, 203);
+            assert_eq!(
+                input::GetFocus(),
+                h203,
+                "WM_INITDIALOG returning FALSE must preserve custom focus"
+            );
+            assert_eq!(DestroyWindow(hdlg3), TRUE);
+
+            // 3. No WS_TABSTOP controls: fallback only among visible+enabled children, else 0.
+            let mut tmpl3 = build_std_header(ws::POPUP | ws::CAPTION, 2, "FallbackVisTest");
+            push_std_ctrl(&mut tmpl3, 301, 0x0082, ws::CHILD, "HiddenStatic"); // no WS_VISIBLE
+            push_std_ctrl(&mut tmpl3, 302, 0x0082, ws::CHILD | ws::VISIBLE, "VisStatic");
+
+            VIS_INIT_WPARAM.store(0, Ordering::SeqCst);
+            VIS_INIT_MODE.store(0, Ordering::SeqCst);
+            let hdlg4 = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl3.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg4.is_null());
+            let h302 = GetDlgItem(hdlg4, 302);
+            assert_eq!(VIS_INIT_WPARAM.load(Ordering::SeqCst), h302 as usize);
+            assert_eq!(first_focusable_control(hdlg4 as usize), h302 as usize);
+            assert!(GetNextDlgTabItem(hdlg4, std::ptr::null_mut(), FALSE).is_null());
+
+            ShowWindow(h302, SW_HIDE);
+            assert_eq!(first_focusable_control(hdlg4 as usize), 0);
+            ShowWindow(h302, SW_SHOWNORMAL);
+            EnableWindow(h302, FALSE);
+            assert_eq!(first_focusable_control(hdlg4 as usize), 0);
+            assert_eq!(DestroyWindow(hdlg4), TRUE);
         })
         .join()
         .unwrap();
