@@ -1410,7 +1410,7 @@ fn render_manifest_with_header(
 mod tests {
     use super::*;
     use crate::bundle_common::TempDirGuard;
-    use crate::win32_db::test_pe_fixture::build_synthetic_pe;
+    use crate::win32_db::test_pe_fixture::{build_synthetic_pe, build_synthetic_win32_workspace};
     use pe_image::consts::{
         IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_FILE_MACHINE_AMD64,
         IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
@@ -1499,14 +1499,11 @@ mod tests {
 
     #[test]
     fn single_pass_audit_game_on_synthetic_pe_fixture() {
-        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .to_path_buf();
-        let db = Win32Database::from_workspace_src(&ws).unwrap();
-
         let tmp = make_temp_dir("synthetic_fixture");
+        let fake_ws = tmp.path().join("fake_ws");
+        build_synthetic_win32_workspace(&fake_ws);
+        let db = Win32Database::from_workspace_src(&fake_ws).unwrap();
+
         let game_dir = tmp.path().join("SpaceOdyssey");
         fs::create_dir_all(&game_dir).unwrap();
 
@@ -1525,8 +1522,8 @@ mod tests {
                 ("KERNEL32.dll", &["CreateFileW"]),
                 ("d3d12.dll", &["D3D12CreateDevice"]),
                 ("ntdll.dll", &["NtQueryInformationProcess"]),
-                ("zstd.dll", &["ZSTD_decompress"]),
-                ("ADVAPI32.dll", &["CryptAcquireContextW"]),
+                ("zstd.dll", &["SynthZstdStub"]),
+                ("ADVAPI32.dll", &["SynthFailApi"]),
                 ("custom_game.dll", &["InitWorld"]),
                 ("missing_sdk.dll", &["MissingCall"]),
             ],
@@ -1556,11 +1553,11 @@ mod tests {
         assert_eq!(report.steam_app_id.as_deref(), Some("480"));
         assert_eq!(report.readiness, ReadinessLevel::NeedsWork);
 
-        // Honest impl_kind breakdown:
+        // Honest impl_kind breakdown against synthetic Win32Database:
         //   main_exe: 2 real (CreateFileW, D3D12CreateDevice), 1 partial (NtQueryInformationProcess),
-        //             1 stub (ZSTD_decompress), 1 failing (CryptAcquireContextW),
+        //             1 stub (SynthZstdStub), 1 failing (SynthFailApi),
         //             1 sibling (custom_game.dll!InitWorld), 1 unresolved (missing_sdk.dll!MissingCall)
-        //   sibling_dll: 1 real (physx3_x64.dll!PxCreatePhysics)
+        //   sibling_dll: 1 real (physx3_x64.dll!PxCreateBasePhysics)
         assert_eq!(report.imports.total_imports, 8);
         assert_eq!(report.imports.resolved_real, 3);
         assert_eq!(report.imports.resolved_sibling, 1);
@@ -1573,13 +1570,13 @@ mod tests {
             .imports
             .stubbed_imports
             .iter()
-            .any(|s| s.dll == "zstd.dll" && s.symbol == "ZSTD_decompress" && s.impl_kind == ImplKind::Stub));
+            .any(|s| s.dll == "zstd.dll" && s.symbol == "SynthZstdStub" && s.impl_kind == ImplKind::Stub));
         assert!(report
             .imports
             .stubbed_imports
             .iter()
             .any(|s| s.dll == "advapi32.dll"
-                && s.symbol == "CryptAcquireContextW"
+                && s.symbol == "SynthFailApi"
                 && s.impl_kind == ImplKind::Failing));
         assert!(report
             .imports
@@ -1628,19 +1625,16 @@ mod tests {
 
         let text = report.format_human_report(Some(&out_toml));
         assert!(text.contains("Single-Pass Game Readiness Audit [NEEDS_WORK]"));
-        assert!(text.contains("zstd.dll!ZSTD_decompress [stub]"));
-        assert!(text.contains("advapi32.dll!CryptAcquireContextW [failing]"));
+        assert!(text.contains("zstd.dll!SynthZstdStub [stub]"));
+        assert!(text.contains("advapi32.dll!SynthFailApi [failing]"));
         assert!(text.contains("D3D12"));
     }
 
     #[test]
     fn audit_game_readiness_levels_ready_and_blocked() {
-        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .to_path_buf();
-        let db = Win32Database::from_workspace_src(&ws).unwrap();
+        let ws_tmp = make_temp_dir("ready_blocked_ws");
+        build_synthetic_win32_workspace(ws_tmp.path());
+        let db = Win32Database::from_workspace_src(ws_tmp.path()).unwrap();
 
         // 1. Clean game with only real imports -> READY
         let ready_tmp = make_temp_dir("ready_game");

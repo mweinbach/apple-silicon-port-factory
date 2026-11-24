@@ -1557,6 +1557,140 @@ pub(crate) mod test_pe_fixture {
         img[rdata_raw_off..rdata_raw_off + rdata.len()].copy_from_slice(&rdata);
         img
     }
+
+    /// Populate a minimal synthetic `crates/win32-rt/src/` tree under `ws_root` with
+    /// deterministic `real`, `partial`, `stub`, and `failing` exports so tests never depend
+    /// on which live repo exports happen to be stubs on a given commit.
+    pub(crate) fn build_synthetic_win32_workspace(ws_root: &std::path::Path) {
+        let src = ws_root.join("crates/win32-rt/src");
+        for sub in ["kernel32", "d3d12", "d3d11", "misc"] {
+            std::fs::create_dir_all(src.join(sub)).unwrap();
+        }
+        std::fs::write(
+            src.join("kernel32/file.rs"),
+            r#"
+pub unsafe extern "win64" fn CreateFileW() -> usize { 1 }
+pub unsafe extern "win64" fn CloseHandle() -> i32 { 1 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("ntdll.rs"),
+            r#"
+pub unsafe extern "win64" fn NtQueryInformationProcess(class: u32) -> i32 {
+    match class {
+        0 => 0,
+        _ => {
+            stub!("NtQueryInformationProcess({class})");
+            -1
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("advapi32.rs"),
+            r#"
+pub unsafe extern "win64" fn CreateServiceW() -> usize { 1 }
+
+// @exports SynthFailApi
+failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
+    SynthFailApi);
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("d3d12/mod.rs"),
+            r#"
+pub static EXPORTS: &[crate::Export] = exports![
+    D3D12CreateDevice,
+    SynthD3D12Stub,
+];
+pub unsafe extern "win64" fn D3D12CreateDevice() -> i32 { 0 }
+pub unsafe extern "win64" fn SynthD3D12Stub() -> i32 {
+    stub!("SynthD3D12Stub -> E_NOTIMPL");
+    E_NOTIMPL
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("d3d11/mod.rs"),
+            r#"
+pub static EXPORTS: &[crate::Export] = exports![D3D11CreateDevice];
+pub unsafe extern "win64" fn D3D11CreateDevice() -> i32 { 0 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("slstub.rs"),
+            r#"
+pub static EXPORTS: &[crate::Export] = exports![
+    slInit;
+    "SynthD3D12Stub" => crate::d3d12::SynthD3D12Stub,
+];
+pub unsafe extern "win64" fn slInit() -> i32 { 0 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("misc/zstd.rs"),
+            r#"
+pub static EXTRA_EXPORTS: &[crate::Export] = &[];
+pub static ORDINALS: &[(u16, &str)] = &[];
+pub extern "win64" fn SynthZstdStub() -> usize {
+    crate::stub!("zstd!SynthZstdStub");
+    usize::MAX
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("misc/physx3_x64.rs"),
+            r#"
+pub static EXTRA_EXPORTS: &[crate::Export] = &[];
+pub static ORDINALS: &[(u16, &str)] = &[];
+pub extern "win64" fn PxCreateBasePhysics() -> usize { 1 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("misc/bcrypt.rs"),
+            r#"
+pub static EXTRA_EXPORTS: &[crate::Export] = &[];
+pub static ORDINALS: &[(u16, &str)] = &[];
+pub unsafe extern "win64" fn SynthEarlyReturnPartial(tag: u32) -> i32 {
+    if tag == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if tag == 1 {
+        return STATUS_SUCCESS;
+    }
+    stub!("SynthEarlyReturnPartial fallback");
+    STATUS_NOT_SUPPORTED
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("misc/libxess_dx11.rs"),
+            r#"
+pub static EXTRA_EXPORTS: &[crate::Export] = &[
+    crate::Export {
+        name: "SynthBridgeStub",
+        ptr: crate::Ptr(crate::bridge_entry!(synth_bridge_stub_impl)),
+    },
+];
+pub static ORDINALS: &[(u16, &str)] = &[];
+extern "win64" fn synth_bridge_stub_impl() -> i32 {
+    crate::stub!("synth_bridge_stub_impl -> NOT_IMPLEMENTED");
+    -1
+}
+"#,
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1698,13 +1832,16 @@ win64_stubs!(Win64StubMacroFn);
     }
 
     #[test]
-    fn workspace_win32_db_classifies_real_partial_stub_and_failing_exports() {
-        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .to_path_buf();
-        let db = Win32Database::from_workspace_src(&ws).unwrap();
+    fn synthetic_workspace_win32_db_classifies_real_partial_stub_and_failing_exports() {
+        let fake_ws = std::env::temp_dir().join(format!(
+            "port_factory_win32_db_synth_ws_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&fake_ws);
+        test_pe_fixture::build_synthetic_win32_workspace(&fake_ws);
+
+        let db = Win32Database::from_workspace_src(&fake_ws).unwrap();
+        let _ = fs::remove_dir_all(&fake_ws);
 
         let lookup = |dll: &str, sym: &str| {
             db.resolve(
@@ -1714,42 +1851,39 @@ win64_stubs!(Win64StubMacroFn);
                     name: sym.to_string(),
                 },
             )
-            .unwrap_or_else(|| panic!("expected {dll}!{sym} in Win32Database"))
+            .unwrap_or_else(|| panic!("expected {dll}!{sym} in synthetic Win32Database"))
             .impl_kind
         };
 
         assert_eq!(lookup("kernel32.dll", "CreateFileW"), ImplKind::Real);
+        assert_eq!(lookup("d3d12.dll", "D3D12CreateDevice"), ImplKind::Real);
         assert_eq!(
             lookup("ntdll.dll", "NtQueryInformationProcess"),
             ImplKind::Partial
         );
-        assert_eq!(lookup("bcrypt.dll", "BCryptSetProperty"), ImplKind::Partial);
-        assert_eq!(lookup("zstd.dll", "ZSTD_decompress"), ImplKind::Stub);
         assert_eq!(
-            lookup("d3d12.dll", "D3D12CreateRootSignatureDeserializer"),
-            ImplKind::Stub
+            lookup("bcrypt.dll", "SynthEarlyReturnPartial"),
+            ImplKind::Partial
         );
-        // Cross-module forwarder in sl.interposer.dll inherits Stub from d3d12.rs.
+        assert_eq!(lookup("zstd.dll", "SynthZstdStub"), ImplKind::Stub);
+        assert_eq!(lookup("d3d12.dll", "SynthD3D12Stub"), ImplKind::Stub);
+        // Cross-module forwarder in sl.interposer.dll inherits Stub from d3d12/mod.rs.
         assert_eq!(
-            lookup("sl.interposer.dll", "D3D12CreateRootSignatureDeserializer"),
+            lookup("sl.interposer.dll", "SynthD3D12Stub"),
             ImplKind::Stub
         );
         // EXTRA_EXPORTS + bridge_entry! inherits Stub from target impl fn.
         assert_eq!(
-            lookup("libxess_dx11.dll", "xessSetContextParameterF"),
+            lookup("libxess_dx11.dll", "SynthBridgeStub"),
             ImplKind::Stub
         );
         // `// @exports` + `failing!(...)` is classified as Failing.
-        assert_eq!(
-            lookup("advapi32.dll", "CryptAcquireContextW"),
-            ImplKind::Failing
-        );
-        assert_eq!(lookup("dbghelp.dll", "SymInitialize"), ImplKind::Failing);
+        assert_eq!(lookup("advapi32.dll", "SynthFailApi"), ImplKind::Failing);
 
-        assert!(db.count_by_impl_kind(ImplKind::Real) > 3000);
-        assert!(db.count_by_impl_kind(ImplKind::Partial) > 20);
-        assert!(db.count_by_impl_kind(ImplKind::Stub) > 20);
-        assert!(db.count_by_impl_kind(ImplKind::Failing) >= 70);
+        assert_eq!(db.count_by_impl_kind(ImplKind::Real), 7);
+        assert_eq!(db.count_by_impl_kind(ImplKind::Partial), 2);
+        assert_eq!(db.count_by_impl_kind(ImplKind::Stub), 4);
+        assert_eq!(db.count_by_impl_kind(ImplKind::Failing), 1);
 
         // Verify TSV header & row column count include `impl_kind`.
         let tsv = db.format_tsv();
@@ -1758,7 +1892,7 @@ win64_stubs!(Win64StubMacroFn);
             lines.next().unwrap(),
             "dll\tsymbol\tordinal\tcategory\timpl_kind\trust_path\tsource_file"
         );
-        for row in lines.take(20) {
+        for row in lines {
             let cols: Vec<&str> = row.split('\t').collect();
             assert_eq!(cols.len(), 7, "expected 7 columns in row: {row}");
             assert!(
@@ -1770,7 +1904,7 @@ win64_stubs!(Win64StubMacroFn);
     }
 
     #[test]
-    fn synthetic_pe_win32_audit_reports_impl_kinds_and_lists_stubs() {
+    fn live_workspace_win32_db_invariants_hold_independent_of_stub_counts() {
         let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -1778,11 +1912,54 @@ win64_stubs!(Win64StubMacroFn);
             .to_path_buf();
         let db = Win32Database::from_workspace_src(&ws).unwrap();
 
-        // Synthetic PE importing:
+        assert!(db.entries.len() > 3000);
+        let sum = db.count_by_impl_kind(ImplKind::Real)
+            + db.count_by_impl_kind(ImplKind::Partial)
+            + db.count_by_impl_kind(ImplKind::Stub)
+            + db.count_by_impl_kind(ImplKind::Failing);
+        assert_eq!(sum, db.entries.len());
+        assert_eq!(
+            db.resolve(
+                "kernel32.dll",
+                &ImportName::Name {
+                    hint: 0,
+                    name: "CreateFileW".to_string(),
+                }
+            )
+            .unwrap()
+            .impl_kind,
+            ImplKind::Real
+        );
+
+        let tsv = db.format_tsv();
+        let mut lines = tsv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "dll\tsymbol\tordinal\tcategory\timpl_kind\trust_path\tsource_file"
+        );
+        for row in lines {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols.len(), 7, "expected 7 columns in row: {row}");
+            assert!(ImplKind::parse(cols[4]).is_some());
+        }
+    }
+
+    #[test]
+    fn synthetic_pe_win32_audit_reports_impl_kinds_and_lists_stubs() {
+        let fake_ws = std::env::temp_dir().join(format!(
+            "port_factory_win32_audit_synth_ws_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&fake_ws);
+        test_pe_fixture::build_synthetic_win32_workspace(&fake_ws);
+        let db = Win32Database::from_workspace_src(&fake_ws).unwrap();
+        let _ = fs::remove_dir_all(&fake_ws);
+
+        // Synthetic PE importing against our controlled synthetic Win32Database:
         // - 2 real (`kernel32.dll!CreateFileW`, `d3d12.dll!D3D12CreateDevice`)
         // - 1 partial (`ntdll.dll!NtQueryInformationProcess`)
-        // - 1 stub (`zstd.dll!ZSTD_decompress`)
-        // - 1 failing (`advapi32.dll!CryptAcquireContextW`)
+        // - 1 stub (`zstd.dll!SynthZstdStub`)
+        // - 1 failing (`advapi32.dll!SynthFailApi`)
         // - 1 unresolved (`custom_engine.dll!MysteryInit`)
         let pe_bytes = test_pe_fixture::build_synthetic_pe(
             false,
@@ -1791,8 +1968,8 @@ win64_stubs!(Win64StubMacroFn);
                 ("KERNEL32.dll", &["CreateFileW"]),
                 ("d3d12.dll", &["D3D12CreateDevice"]),
                 ("ntdll.dll", &["NtQueryInformationProcess"]),
-                ("zstd.dll", &["ZSTD_decompress"]),
-                ("ADVAPI32.dll", &["CryptAcquireContextW"]),
+                ("zstd.dll", &["SynthZstdStub"]),
+                ("ADVAPI32.dll", &["SynthFailApi"]),
                 ("custom_engine.dll", &["MysteryInit"]),
             ],
             false,
@@ -1812,8 +1989,8 @@ win64_stubs!(Win64StubMacroFn);
         let report = audit.format_report();
         assert!(report.contains("5/6 resolved = 83.33%, 2/6 real = 33.33%"));
         assert!(report.contains("Stubbed / Failing Imports (2):"));
-        assert!(report.contains("zstd.dll!ZSTD_decompress [stub]"));
-        assert!(report.contains("advapi32.dll!CryptAcquireContextW [failing]"));
+        assert!(report.contains("zstd.dll!SynthZstdStub [stub]"));
+        assert!(report.contains("advapi32.dll!SynthFailApi [failing]"));
         assert!(report.contains("Partial Imports (1):"));
         assert!(report.contains("ntdll.dll!NtQueryInformationProcess [partial]"));
         assert!(report.contains("custom_engine.dll!MysteryInit"));

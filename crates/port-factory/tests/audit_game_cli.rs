@@ -148,8 +148,70 @@ fn build_synthetic_pe(
     img
 }
 
-fn run_pf_json(args: &[&str]) -> (i32, JsonValue) {
+fn build_synthetic_win32_workspace(ws_root: &std::path::Path) {
+    let src = ws_root.join("crates/win32-rt/src");
+    for sub in ["kernel32", "d3d12", "misc"] {
+        std::fs::create_dir_all(src.join(sub)).unwrap();
+    }
+    std::fs::write(
+        src.join("kernel32/file.rs"),
+        r#"
+pub unsafe extern "win64" fn CreateFileW() -> usize { 1 }
+pub unsafe extern "win64" fn CloseHandle() -> i32 { 1 }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("ntdll.rs"),
+        r#"
+pub unsafe extern "win64" fn NtQueryInformationProcess(class: u32) -> i32 {
+    match class {
+        0 => 0,
+        _ => {
+            stub!("NtQueryInformationProcess({class})");
+            -1
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("advapi32.rs"),
+        r#"
+pub unsafe extern "win64" fn CreateServiceW() -> usize { 1 }
+
+// @exports SynthFailApi
+failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
+    SynthFailApi);
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("d3d12/mod.rs"),
+        r#"
+pub static EXPORTS: &[crate::Export] = exports![D3D12CreateDevice];
+pub unsafe extern "win64" fn D3D12CreateDevice() -> i32 { 0 }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("misc/zstd.rs"),
+        r#"
+pub static EXTRA_EXPORTS: &[crate::Export] = &[];
+pub static ORDINALS: &[(u16, &str)] = &[];
+pub extern "win64" fn SynthZstdStub() -> usize {
+    crate::stub!("zstd!SynthZstdStub");
+    usize::MAX
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn run_pf_json(ws: &std::path::Path, args: &[&str]) -> (i32, JsonValue) {
     let out = Command::new(env!("CARGO_BIN_EXE_port-factory"))
+        .env("PORT_FACTORY_WORKSPACE", ws)
         .args(args)
         .output()
         .expect("spawn port-factory");
@@ -177,10 +239,12 @@ fn run_pf_json(args: &[&str]) -> (i32, JsonValue) {
 #[test]
 fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
     let root = unique_temp_dir("e2e");
+    let fake_ws = root.join("fake_ws");
+    build_synthetic_win32_workspace(&fake_ws);
     let game_dir = root.join("NebulaDrifter");
     std::fs::create_dir_all(&game_dir).unwrap();
 
-    // Game EXE importing real, partial, stub, and failing Win32 symbols + D3D12 (0 unresolved).
+    // Game EXE importing controlled synthetic real, partial, stub, and failing Win32 symbols + D3D12 (0 unresolved).
     let code: &[u8] = &[
         0x48, 0x31, 0xC0, // xor rax, rax
         0x48, 0x01, 0xC8, // add rax, rcx
@@ -195,8 +259,8 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
             ("KERNEL32.dll", &["CreateFileW", "CloseHandle"]),
             ("d3d12.dll", &["D3D12CreateDevice"]),
             ("ntdll.dll", &["NtQueryInformationProcess"]),
-            ("zstd.dll", &["ZSTD_decompress"]),
-            ("ADVAPI32.dll", &["CryptAcquireContextW"]),
+            ("zstd.dll", &["SynthZstdStub"]),
+            ("ADVAPI32.dll", &["SynthFailApi"]),
         ],
         false,
     );
@@ -205,6 +269,7 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
 
     // 1. `win32-audit` human output reports impl_kind breakdown and lists stub/failing imports.
     let human_out = Command::new(env!("CARGO_BIN_EXE_port-factory"))
+        .env("PORT_FACTORY_WORKSPACE", &fake_ws)
         .args(["win32-audit", game_dir.to_str().unwrap()])
         .output()
         .expect("run win32-audit");
@@ -215,11 +280,11 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
         "expected honest real vs resolved header, got:\n{human_stdout}"
     );
     assert!(human_stdout.contains("Stubbed / Failing Imports (2):"));
-    assert!(human_stdout.contains("zstd.dll!ZSTD_decompress [stub]"));
-    assert!(human_stdout.contains("advapi32.dll!CryptAcquireContextW [failing]"));
+    assert!(human_stdout.contains("zstd.dll!SynthZstdStub [stub]"));
+    assert!(human_stdout.contains("advapi32.dll!SynthFailApi [failing]"));
 
     // 2. `win32-audit --json` emits impl_kind counts & stubbed_imports list.
-    let (code, val) = run_pf_json(&["win32-audit", game_dir.to_str().unwrap(), "--json"]);
+    let (code, val) = run_pf_json(&fake_ws, &["win32-audit", game_dir.to_str().unwrap(), "--json"]);
     assert_eq!(code, exit_codes::OK);
     assert_eq!(
         val.get("command").and_then(JsonValue::as_str),
@@ -243,13 +308,16 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
 
     // 3. `audit-game <dir> --json --init-manifest <out_toml>` does one pass & writes game.toml.
     let manifest_out = root.join("generated/nebula-drifter/game.toml");
-    let (code, val) = run_pf_json(&[
-        "audit-game",
-        game_dir.to_str().unwrap(),
-        "--json",
-        "--init-manifest",
-        manifest_out.to_str().unwrap(),
-    ]);
+    let (code, val) = run_pf_json(
+        &fake_ws,
+        &[
+            "audit-game",
+            game_dir.to_str().unwrap(),
+            "--json",
+            "--init-manifest",
+            manifest_out.to_str().unwrap(),
+        ],
+    );
     assert_eq!(code, exit_codes::OK);
     assert_eq!(
         val.get("command").and_then(JsonValue::as_str),
@@ -328,7 +396,10 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
         false,
     );
     std::fs::write(unresolved_dir.join("Game.exe"), &unresolved_exe).unwrap();
-    let (code, val) = run_pf_json(&["audit-game", unresolved_dir.to_str().unwrap(), "--json"]);
+    let (code, val) = run_pf_json(
+        &fake_ws,
+        &["audit-game", unresolved_dir.to_str().unwrap(), "--json"],
+    );
     assert_eq!(code, exit_codes::UNRESOLVED_IMPORTS);
     assert_eq!(
         val.get("data")
@@ -350,7 +421,10 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
         false,
     );
     std::fs::write(kernel_dir.join("AcGame.exe"), &kernel_exe).unwrap();
-    let (code, val) = run_pf_json(&["audit-game", kernel_dir.to_str().unwrap(), "--json"]);
+    let (code, val) = run_pf_json(
+        &fake_ws,
+        &["audit-game", kernel_dir.to_str().unwrap(), "--json"],
+    );
     assert_eq!(code, exit_codes::INCOMPATIBLE);
     assert_eq!(
         val.get("data")
@@ -361,11 +435,14 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
     );
 
     // 6. Missing directory -> exit 2 (USAGE_ERROR) with JSON error envelope.
-    let (code, val) = run_pf_json(&[
-        "audit-game",
-        root.join("does_not_exist").to_str().unwrap(),
-        "--json",
-    ]);
+    let (code, val) = run_pf_json(
+        &fake_ws,
+        &[
+            "audit-game",
+            root.join("does_not_exist").to_str().unwrap(),
+            "--json",
+        ],
+    );
     assert_eq!(code, exit_codes::USAGE_ERROR);
     assert!(val.get("error").and_then(JsonValue::as_str).is_some());
 
