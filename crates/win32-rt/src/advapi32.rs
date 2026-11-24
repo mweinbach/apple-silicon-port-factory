@@ -2662,9 +2662,12 @@ struct CapiProvider {
     container: String,
 }
 
+/// Incremental CommonCrypto digest context (512-byte 8-byte-aligned storage holds
+/// any `CC_MD5_CTX` / `CC_SHA1_CTX` / `CC_SHA256_CTX` / `CC_SHA512_CTX` without
+/// buffering the full message or truncating lengths above 4 GiB).
 struct CapiHash {
     alg_id: u32,
-    data: Vec<u8>,
+    ctx: [u64; 64],
     override_val: Option<Vec<u8>>,
 }
 
@@ -2683,11 +2686,25 @@ fn capi_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, C
 }
 
 extern "C" {
-    fn CC_MD5(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA1(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA384(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA512(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
+    fn CC_MD5_Init(c: *mut c_void) -> i32;
+    fn CC_MD5_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_MD5_Final(md: *mut u8, c: *mut c_void) -> i32;
+
+    fn CC_SHA1_Init(c: *mut c_void) -> i32;
+    fn CC_SHA1_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA1_Final(md: *mut u8, c: *mut c_void) -> i32;
+
+    fn CC_SHA256_Init(c: *mut c_void) -> i32;
+    fn CC_SHA256_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA256_Final(md: *mut u8, c: *mut c_void) -> i32;
+
+    fn CC_SHA384_Init(c: *mut c_void) -> i32;
+    fn CC_SHA384_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA384_Final(md: *mut u8, c: *mut c_void) -> i32;
+
+    fn CC_SHA512_Init(c: *mut c_void) -> i32;
+    fn CC_SHA512_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA512_Final(md: *mut u8, c: *mut c_void) -> i32;
 }
 
 fn capi_hash_len(alg_id: u32) -> Option<usize> {
@@ -2701,17 +2718,49 @@ fn capi_hash_len(alg_id: u32) -> Option<usize> {
     }
 }
 
-unsafe fn capi_compute_digest(alg_id: u32, data: &[u8]) -> Option<Vec<u8>> {
-    let len = capi_hash_len(alg_id)?;
-    let mut out = vec![0u8; len];
-    let ptr = data.as_ptr() as *const c_void;
-    let dlen = data.len() as u32;
+unsafe fn capi_hash_init(alg_id: u32) -> Option<CapiHash> {
+    let mut ctx = [0u64; 64];
+    let p = ctx.as_mut_ptr() as *mut c_void;
     match alg_id {
-        CALG_MD5 => { CC_MD5(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA1 => { CC_SHA1(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_256 => { CC_SHA256(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_384 => { CC_SHA384(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_512 => { CC_SHA512(ptr, dlen, out.as_mut_ptr()); }
+        CALG_MD5 => { CC_MD5_Init(p); }
+        CALG_SHA1 => { CC_SHA1_Init(p); }
+        CALG_SHA_256 => { CC_SHA256_Init(p); }
+        CALG_SHA_384 => { CC_SHA384_Init(p); }
+        CALG_SHA_512 => { CC_SHA512_Init(p); }
+        _ => return None,
+    }
+    Some(CapiHash {
+        alg_id,
+        ctx,
+        override_val: None,
+    })
+}
+
+unsafe fn capi_hash_update(h: &mut CapiHash, data: *const u8, len: u32) {
+    let p = h.ctx.as_mut_ptr() as *mut c_void;
+    let d = data as *const c_void;
+    match h.alg_id {
+        CALG_MD5 => { CC_MD5_Update(p, d, len); }
+        CALG_SHA1 => { CC_SHA1_Update(p, d, len); }
+        CALG_SHA_256 => { CC_SHA256_Update(p, d, len); }
+        CALG_SHA_384 => { CC_SHA384_Update(p, d, len); }
+        CALG_SHA_512 => { CC_SHA512_Update(p, d, len); }
+        _ => {}
+    }
+}
+
+unsafe fn capi_hash_finalize(h: &CapiHash) -> Option<Vec<u8>> {
+    let len = capi_hash_len(h.alg_id)?;
+    let mut out = vec![0u8; len];
+    // Finalize a copy of the context so size queries / repeated reads stay valid.
+    let mut snapshot = h.ctx;
+    let p = snapshot.as_mut_ptr() as *mut c_void;
+    match h.alg_id {
+        CALG_MD5 => { CC_MD5_Final(out.as_mut_ptr(), p); }
+        CALG_SHA1 => { CC_SHA1_Final(out.as_mut_ptr(), p); }
+        CALG_SHA_256 => { CC_SHA256_Final(out.as_mut_ptr(), p); }
+        CALG_SHA_384 => { CC_SHA384_Final(out.as_mut_ptr(), p); }
+        CALG_SHA_512 => { CC_SHA512_Final(out.as_mut_ptr(), p); }
         _ => return None,
     }
     Some(out)
@@ -2835,18 +2884,11 @@ pub unsafe extern "win64" fn CryptCreateHash(
     if !capi_providers().lock().unwrap().contains_key(&h_prov) {
         return err(NTE_BAD_UID, FALSE);
     }
-    if capi_hash_len(alg_id).is_none() {
+    let Some(state) = capi_hash_init(alg_id) else {
         return err(NTE_BAD_ALGID, FALSE);
-    }
+    };
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
-    capi_hashes().lock().unwrap().insert(
-        h,
-        CapiHash {
-            alg_id,
-            data: Vec::new(),
-            override_val: None,
-        },
-    );
+    capi_hashes().lock().unwrap().insert(h, state);
     std::ptr::write_unaligned(ph_hash, h);
     TRUE
 }
@@ -2865,8 +2907,7 @@ pub unsafe extern "win64" fn CryptHashData(
         return err(NTE_BAD_HASH, FALSE);
     };
     if dw_data_len > 0 {
-        let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
-        h.data.extend_from_slice(slice);
+        capi_hash_update(h, pb_data, dw_data_len);
         h.override_val = None;
     }
     TRUE
@@ -2893,7 +2934,7 @@ pub unsafe extern "win64" fn CryptGetHashParam(
             if let Some(ref ov) = h.override_val {
                 ov.clone()
             } else {
-                let Some(d) = capi_compute_digest(h.alg_id, &h.data) else {
+                let Some(d) = capi_hash_finalize(h) else {
                     return err(NTE_BAD_ALGID, FALSE);
                 };
                 d
@@ -4346,7 +4387,13 @@ mod tests {
 
             let mut hhash: usize = 0;
             assert_eq!(CryptCreateHash(hprov, CALG_SHA_256, 0, 0, &mut hhash), TRUE);
-            assert_eq!(CryptHashData(hhash, b"abc".as_ptr(), 3, 0), TRUE);
+            // Incremental multi-chunk updates (verifying streaming context + size-query stability).
+            assert_eq!(CryptHashData(hhash, b"a".as_ptr(), 1, 0), TRUE);
+            assert_eq!(CryptHashData(hhash, b"bc".as_ptr(), 2, 0), TRUE);
+
+            let mut qlen = 0u32;
+            assert_eq!(CryptGetHashParam(hhash, HP_HASHVAL, std::ptr::null_mut(), &mut qlen, 0), TRUE);
+            assert_eq!(qlen, 32);
 
             let mut digest = [0u8; 32];
             let mut dlen = 32u32;
