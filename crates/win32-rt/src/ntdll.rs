@@ -11,6 +11,10 @@ use std::ffi::c_void;
 pub static EXPORTS: &[crate::Export] = include!(concat!(env!("OUT_DIR"), "/ntdll_exports.rs"));
 
 pub const STATUS_SUCCESS: NTSTATUS = 0;
+pub const STATUS_WAIT_0: NTSTATUS = 0;
+pub const STATUS_ABANDONED_WAIT_0: NTSTATUS = 0x0000_0080;
+pub const STATUS_USER_APC: NTSTATUS = 0x0000_00C0;
+pub const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
 pub const STATUS_BUFFER_OVERFLOW: NTSTATUS = 0x8000_0005u32 as i32;
 pub const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC000_0002u32 as i32;
 pub const STATUS_INVALID_INFO_CLASS: NTSTATUS = 0xC000_0003u32 as i32;
@@ -22,6 +26,8 @@ pub const STATUS_CONFLICTING_ADDRESSES: NTSTATUS = 0xC000_0018u32 as i32;
 pub const STATUS_NOT_MAPPED_VIEW: NTSTATUS = 0xC000_0019u32 as i32;
 pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022u32 as i32;
 pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023u32 as i32;
+pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024u32 as i32;
+pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: NTSTATUS = 0xC000_0047u32 as i32;
 pub const STATUS_FILE_INVALID: NTSTATUS = 0xC000_0098u32 as i32;
 pub const STATUS_INVALID_ADDRESS: NTSTATUS = 0xC000_0141u32 as i32;
 pub const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000_001Au32 as i32;
@@ -60,6 +66,7 @@ pub unsafe extern "win64" fn RtlGetNtVersionNumbers(major: *mut u32, minor: *mut
 pub fn ntstatus_to_win32(s: u32) -> u32 {
     match s {
         0 | 0x4000_0010 => 0, // STATUS_SUCCESS | STATUS_RECEIVE_EXPEDITED
+        0x0000_00C0 => WAIT_IO_COMPLETION,
         0x0000_0102 => err::ERROR_TIMEOUT,
         0x0000_0103 => err::ERROR_IO_PENDING,
         0xC000_0005 => err::ERROR_NOACCESS,
@@ -72,9 +79,11 @@ pub fn ntstatus_to_win32(s: u32) -> u32 {
         0xC000_0017 => err::ERROR_NOT_ENOUGH_MEMORY,
         0xC000_0022 => err::ERROR_ACCESS_DENIED,
         0xC000_0023 => err::ERROR_INSUFFICIENT_BUFFER,
+        0xC000_0024 => err::ERROR_INVALID_HANDLE,
         0xC000_0034 => err::ERROR_FILE_NOT_FOUND,
         0xC000_0035 => err::ERROR_ALREADY_EXISTS,
         0xC000_003A => err::ERROR_PATH_NOT_FOUND,
+        0xC000_0047 => err::ERROR_TOO_MANY_POSTS,
         0xC000_0002 => err::ERROR_CALL_NOT_IMPLEMENTED,
         0xC000_00BB => err::ERROR_NOT_SUPPORTED,
         0xC000_0135 => err::ERROR_MOD_NOT_FOUND,
@@ -1085,18 +1094,50 @@ pub unsafe extern "win64" fn NtOpenThread(
 }
 
 pub unsafe extern "win64" fn NtDuplicateObject(
-    _src_proc: HANDLE,
+    src_proc: HANDLE,
     src_handle: HANDLE,
-    _dst_proc: HANDLE,
+    dst_proc: HANDLE,
     target_handle: *mut HANDLE,
-    _desired_access: u32,
-    _handle_attributes: u32,
-    _options: u32,
+    desired_access: u32,
+    handle_attributes: u32,
+    options: u32,
 ) -> NTSTATUS {
-    if !target_handle.is_null() {
-        *target_handle = src_handle;
+    const OBJ_INHERIT: u32 = 0x0000_0002;
+    let inherit = if (handle_attributes & OBJ_INHERIT) != 0 { TRUE } else { FALSE };
+    if crate::kernel32::threads::DuplicateHandle(
+        src_proc,
+        src_handle,
+        dst_proc,
+        target_handle,
+        desired_access,
+        inherit,
+        options,
+    ) != 0
+    {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_HANDLE
     }
-    STATUS_SUCCESS
+}
+
+pub unsafe extern "win64" fn ZwDuplicateObject(
+    src_proc: HANDLE,
+    src_handle: HANDLE,
+    dst_proc: HANDLE,
+    target_handle: *mut HANDLE,
+    desired_access: u32,
+    handle_attributes: u32,
+    options: u32,
+) -> NTSTATUS {
+    NtDuplicateObject(
+        src_proc,
+        src_handle,
+        dst_proc,
+        target_handle,
+        desired_access,
+        handle_attributes,
+        options,
+    )
 }
 
 pub unsafe extern "win64" fn RtlAddVectoredExceptionHandler(
@@ -1193,7 +1234,7 @@ pub unsafe extern "win64" fn LdrGetProcedureAddress(
         std::ptr::write_unaligned(func_addr, std::ptr::null());
         return STATUS_INVALID_PARAMETER;
     }
-    let resolved: Option<usize> = if !func_name.is_null() {
+    let (proc_label, resolved): (String, Option<usize>) = if !func_name.is_null() {
         // ANSI_STRING: { Length: u16, MaximumLength: u16, pad: u32, Buffer: *const u8 }
         let byte_len = std::ptr::read_unaligned(func_name as *const u16) as usize;
         let buf = std::ptr::read_unaligned(func_name.add(8) as *const *const u8);
@@ -1203,13 +1244,15 @@ pub unsafe extern "win64" fn LdrGetProcedureAddress(
                 std::ptr::write_unaligned(func_addr, std::ptr::null());
                 return STATUS_INVALID_PARAMETER;
             }
-            crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Name(&name))
+            let r = crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Name(&name));
+            (name, r)
         } else if ordinal != 0 {
             if ordinal > u16::MAX as u32 {
                 std::ptr::write_unaligned(func_addr, std::ptr::null());
                 return 0xC000_0139u32 as i32; // STATUS_ENTRYPOINT_NOT_FOUND
             }
-            crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16))
+            let r = crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16));
+            (format!("#{ordinal}"), r)
         } else {
             std::ptr::write_unaligned(func_addr, std::ptr::null());
             return STATUS_INVALID_PARAMETER;
@@ -1223,7 +1266,8 @@ pub unsafe extern "win64" fn LdrGetProcedureAddress(
             std::ptr::write_unaligned(func_addr, std::ptr::null());
             return 0xC000_0139u32 as i32; // STATUS_ENTRYPOINT_NOT_FOUND
         }
-        crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16))
+        let r = crate::loader().get_proc_address(hmodule as usize, crate::ProcName::Ordinal(ordinal as u16));
+        (format!("#{ordinal}"), r)
     };
     match resolved {
         Some(p) => {
@@ -1231,6 +1275,9 @@ pub unsafe extern "win64" fn LdrGetProcedureAddress(
             STATUS_SUCCESS
         }
         None => {
+            let h = hmodule as usize;
+            let mod_name = crate::loader().module_path(Some(h)).unwrap_or_else(|| format!("0x{h:x}"));
+            crate::kernel32::module::warn_proc_not_found_once("LdrGetProcedureAddress", &mod_name, &proc_label);
             std::ptr::write_unaligned(func_addr, std::ptr::null());
             0xC000_0139u32 as i32 // STATUS_ENTRYPOINT_NOT_FOUND
         }
@@ -1916,6 +1963,219 @@ pub unsafe extern "win64" fn ZwWaitForSingleObject(
     NtWaitForSingleObject(handle, alertable, timeout)
 }
 
+pub unsafe extern "win64" fn NtWaitForMultipleObjects(
+    count: u32,
+    handles: *const HANDLE,
+    wait_type: u32,
+    alertable: u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    // NT WAIT_TYPE: WaitAll = 0, WaitAny = 1.
+    if count == 0 || count > 64 || handles.is_null() || wait_type > 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let wait_all = wait_type == 0;
+    let mut objs = crate::handles::WaitableList::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let h = std::ptr::read_unaligned(handles.add(i));
+        let Some(obj) = crate::handles::get(h) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if obj.waitable().is_none() {
+            return STATUS_INVALID_HANDLE;
+        }
+        objs.push(obj);
+    }
+    if wait_all {
+        let slice = objs.as_slice();
+        for i in 0..slice.len() {
+            for j in (i + 1)..slice.len() {
+                if std::sync::Arc::ptr_eq(&slice[i], &slice[j]) {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+        }
+    }
+    let dur = nt_timeout_to_duration(timeout);
+    let r = crate::handles::wait_for_duration(objs.as_slice(), wait_all, dur, alertable != 0);
+    match r {
+        crate::handles::WaitResult::Object(i) => STATUS_WAIT_0 + i as NTSTATUS,
+        crate::handles::WaitResult::Abandoned(i) => STATUS_ABANDONED_WAIT_0 + i as NTSTATUS,
+        crate::handles::WaitResult::Timeout => STATUS_TIMEOUT,
+        crate::handles::WaitResult::IoCompletion => STATUS_USER_APC,
+        crate::handles::WaitResult::Failed(_) => STATUS_INVALID_HANDLE,
+    }
+}
+
+pub unsafe extern "win64" fn ZwWaitForMultipleObjects(
+    count: u32,
+    handles: *const HANDLE,
+    wait_type: u32,
+    alertable: u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    NtWaitForMultipleObjects(count, handles, wait_type, alertable, timeout)
+}
+
+pub unsafe extern "win64" fn NtReleaseSemaphore(
+    handle: HANDLE,
+    release_count: i32,
+    previous_count: *mut i32,
+) -> NTSTATUS {
+    if release_count <= 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(obj) = crate::handles::get(handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(sem) = obj.as_any().downcast_ref::<crate::handles::Semaphore>() else {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    };
+    match sem.release(release_count) {
+        Some(prev) => {
+            if !previous_count.is_null() {
+                std::ptr::write_unaligned(previous_count, prev);
+            }
+            STATUS_SUCCESS
+        }
+        None => STATUS_SEMAPHORE_LIMIT_EXCEEDED,
+    }
+}
+
+pub unsafe extern "win64" fn ZwReleaseSemaphore(
+    handle: HANDLE,
+    release_count: i32,
+    previous_count: *mut i32,
+) -> NTSTATUS {
+    NtReleaseSemaphore(handle, release_count, previous_count)
+}
+
+pub unsafe extern "win64" fn NtRemoveIoCompletion(
+    io_completion_handle: HANDLE,
+    key_context: *mut usize,
+    apc_context: *mut *mut c_void,
+    io_status_block: *mut u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    if io_status_block.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(obj) = crate::handles::get(io_completion_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(iocp) = obj.as_any().downcast_ref::<crate::kernel32::file::IoCompletionPort>() else {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    };
+    let dur = nt_timeout_to_duration(timeout);
+    match iocp.dequeue_up_to_duration(1, dur, false) {
+        crate::kernel32::file::IocpDequeue::Packets(mut v) => {
+            if let Some(pkt) = v.pop() {
+                if !key_context.is_null() {
+                    std::ptr::write_unaligned(key_context, pkt.key);
+                }
+                if !apc_context.is_null() {
+                    std::ptr::write_unaligned(apc_context, pkt.overlapped as *mut c_void);
+                }
+                // IO_STATUS_BLOCK on x64: { Status: i32 (union PVOID, 8 bytes), Information: usize }
+                std::ptr::write_unaligned(io_status_block as *mut usize, pkt.internal_status);
+                std::ptr::write_unaligned(io_status_block.add(8) as *mut usize, pkt.bytes as usize);
+                STATUS_SUCCESS
+            } else {
+                STATUS_TIMEOUT
+            }
+        }
+        crate::kernel32::file::IocpDequeue::Timeout => STATUS_TIMEOUT,
+        crate::kernel32::file::IocpDequeue::IoCompletion => STATUS_USER_APC,
+    }
+}
+
+pub unsafe extern "win64" fn ZwRemoveIoCompletion(
+    io_completion_handle: HANDLE,
+    key_context: *mut usize,
+    apc_context: *mut *mut c_void,
+    io_status_block: *mut u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    NtRemoveIoCompletion(io_completion_handle, key_context, apc_context, io_status_block, timeout)
+}
+
+pub unsafe extern "win64" fn NtSetEvent(
+    event_handle: HANDLE,
+    previous_state: *mut i32,
+) -> NTSTATUS {
+    let Some(obj) = crate::handles::get(event_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(ev) = obj.as_any().downcast_ref::<crate::handles::Event>() else {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    };
+    let prev = ev.set_returning_prev();
+    if !previous_state.is_null() {
+        std::ptr::write_unaligned(previous_state, i32::from(prev));
+    }
+    STATUS_SUCCESS
+}
+
+pub unsafe extern "win64" fn ZwSetEvent(
+    event_handle: HANDLE,
+    previous_state: *mut i32,
+) -> NTSTATUS {
+    NtSetEvent(event_handle, previous_state)
+}
+
+pub unsafe extern "win64" fn NtClearEvent(event_handle: HANDLE) -> NTSTATUS {
+    let Some(obj) = crate::handles::get(event_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(ev) = obj.as_any().downcast_ref::<crate::handles::Event>() else {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    };
+    ev.reset();
+    STATUS_SUCCESS
+}
+
+pub unsafe extern "win64" fn ZwClearEvent(event_handle: HANDLE) -> NTSTATUS {
+    NtClearEvent(event_handle)
+}
+
+pub unsafe extern "win64" fn NtCreateEvent(
+    event_handle: *mut HANDLE,
+    _desired_access: u32,
+    object_attributes: *const c_void,
+    event_type: u32,
+    initial_state: u8,
+) -> NTSTATUS {
+    // EVENT_TYPE: NotificationEvent = 0 (manual reset), SynchronizationEvent = 1 (auto reset).
+    if event_handle.is_null() || event_type > 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let name_w = object_attributes_name(object_attributes).map(|s| to_wide_z(&s));
+    let manual_reset = if event_type == 0 { TRUE } else { FALSE };
+    let initial = if initial_state != 0 { TRUE } else { FALSE };
+    let h = crate::kernel32::threads::CreateEventW(
+        std::ptr::null_mut(),
+        manual_reset,
+        initial,
+        name_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+    );
+    if h.is_null() {
+        std::ptr::write_unaligned(event_handle, std::ptr::null_mut());
+        return STATUS_INVALID_PARAMETER;
+    }
+    std::ptr::write_unaligned(event_handle, h);
+    STATUS_SUCCESS
+}
+
+pub unsafe extern "win64" fn ZwCreateEvent(
+    event_handle: *mut HANDLE,
+    desired_access: u32,
+    object_attributes: *const c_void,
+    event_type: u32,
+    initial_state: u8,
+) -> NTSTATUS {
+    NtCreateEvent(event_handle, desired_access, object_attributes, event_type, initial_state)
+}
+
 pub unsafe extern "win64" fn NtReadFile(
     file: HANDLE,
     _event: HANDLE,
@@ -2374,6 +2634,370 @@ mod tests {
             assert_eq!(exit_st, 0x0000_00C0); // STATUS_USER_APC
             assert!(apc_ran.load(Ordering::Acquire));
             assert_eq!(crate::kernel32::threads::CloseHandle(th), TRUE);
+        }
+    }
+
+    #[test]
+    fn ntsyscall_unknown_ssn_returns_status_not_implemented() {
+        unsafe {
+            let st1 = crate::ntsyscall::dispatch_nt_syscall(0x0FFE, 1, 2, 3, 4, 0);
+            let st2 = crate::ntsyscall::dispatch_nt_syscall(0x0FFE, 5, 6, 7, 8, 0);
+            assert_eq!(st1, STATUS_NOT_IMPLEMENTED);
+            assert_eq!(st2, STATUS_NOT_IMPLEMENTED);
+        }
+    }
+
+    #[test]
+    fn ntsyscall_wait_for_multiple_objects_semantics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        unsafe {
+            let ev0 = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let ev1 = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev0.is_null() && !ev1.is_null());
+            let hs = [ev0, ev1];
+            let zero: i64 = 0;
+
+            // Stack layout for 5th arg at [rsp + 0x28]
+            let mut fake_stack = [0u64; 8];
+            fake_stack[5] = &zero as *const i64 as u64;
+            let rsp = fake_stack.as_ptr() as u64;
+
+            // WaitAny (wait_type = 1) with neither signaled -> STATUS_TIMEOUT
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    1, // WaitAny
+                    0, // alertable = false
+                    rsp,
+                ),
+                STATUS_TIMEOUT
+            );
+
+            // Signal ev1 -> WaitAny returns STATUS_WAIT_0 + 1
+            assert_eq!(crate::kernel32::threads::SetEvent(ev1), TRUE);
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    1, // WaitAny
+                    0,
+                    rsp,
+                ),
+                STATUS_WAIT_0 + 1
+            );
+
+            // WaitAll (wait_type = 0) with only ev1 signaled -> STATUS_TIMEOUT
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    0, // WaitAll
+                    0,
+                    rsp,
+                ),
+                STATUS_TIMEOUT
+            );
+
+            // Signal ev0 -> WaitAll returns STATUS_WAIT_0 (STATUS_SUCCESS)
+            assert_eq!(crate::kernel32::threads::SetEvent(ev0), TRUE);
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    0, // WaitAll
+                    0,
+                    rsp,
+                ),
+                STATUS_WAIT_0
+            );
+
+            // WaitAll with duplicate handles -> STATUS_INVALID_PARAMETER
+            let dup = [ev0, ev0];
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    dup.as_ptr() as u64,
+                    0,
+                    0,
+                    rsp,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            // Invalid wait_type / count / handle
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    2,
+                    0,
+                    rsp,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    0,
+                    hs.as_ptr() as u64,
+                    1,
+                    0,
+                    rsp,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+            let bad_hs = [ev0, 0xDEAD_BEEF as HANDLE];
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    bad_hs.as_ptr() as u64,
+                    1,
+                    0,
+                    rsp,
+                ),
+                STATUS_INVALID_HANDLE
+            );
+
+            // Relative timeout sleeps instead of returning immediately
+            assert_eq!(crate::kernel32::threads::ResetEvent(ev0), TRUE);
+            assert_eq!(crate::kernel32::threads::ResetEvent(ev1), TRUE);
+            let rel_5ms: i64 = -50_000;
+            fake_stack[5] = &rel_5ms as *const i64 as u64;
+            let rsp_rel = fake_stack.as_ptr() as u64;
+            let t0 = Instant::now();
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                    2,
+                    hs.as_ptr() as u64,
+                    1,
+                    0,
+                    rsp_rel,
+                ),
+                STATUS_TIMEOUT
+            );
+            assert!(t0.elapsed() >= Duration::from_millis(2));
+
+            // Alertable WaitAny returns STATUS_USER_APC and runs queued APC
+            unsafe extern "win64" fn multi_apc(param: usize) {
+                (*(param as *const AtomicBool)).store(true, Ordering::Release);
+            }
+            let apc_ran = std::sync::Arc::new(AtomicBool::new(false));
+            let apc_flag = apc_ran.clone();
+            let thr = crate::thread::spawn(
+                Box::new(move || {
+                    let e_a = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+                    let e_b = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+                    let arr = [e_a, e_b];
+                    let cur = crate::thread::current_thread_object().unwrap();
+                    crate::thread::queue_apc(&cur, multi_apc, std::sync::Arc::as_ptr(&apc_flag) as usize);
+                    let wait_50ms: i64 = -500_000;
+                    let mut stk = [0u64; 8];
+                    stk[5] = &wait_50ms as *const i64 as u64;
+                    let st = crate::ntsyscall::dispatch_nt_syscall(
+                        crate::ntsyscall::ssn::NT_WAIT_FOR_MULTIPLE_OBJECTS,
+                        2,
+                        arr.as_ptr() as u64,
+                        1,
+                        1, // alertable
+                        stk.as_ptr() as u64,
+                    );
+                    assert_eq!(crate::kernel32::threads::CloseHandle(e_a), TRUE);
+                    assert_eq!(crate::kernel32::threads::CloseHandle(e_b), TRUE);
+                    st as u32
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn alertable multi-wait thread");
+            let th = crate::handles::insert(thr);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(th, 5_000), WAIT_OBJECT_0);
+            let mut exit_st = 0u32;
+            assert_eq!(crate::kernel32::threads::GetExitCodeThread(th, &mut exit_st), TRUE);
+            assert_eq!(exit_st, STATUS_USER_APC as u32);
+            assert!(apc_ran.load(Ordering::Acquire));
+
+            assert_eq!(crate::kernel32::threads::CloseHandle(th), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev0), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev1), TRUE);
+        }
+    }
+
+    #[test]
+    fn ntsyscall_release_semaphore_and_remove_io_completion() {
+        unsafe {
+            // --- NtReleaseSemaphore ---
+            let sem = crate::kernel32::threads::CreateSemaphoreW(std::ptr::null_mut(), 0, 3, std::ptr::null());
+            assert!(!sem.is_null());
+            let mut prev: i32 = -1;
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_RELEASE_SEMAPHORE,
+                    sem as u64,
+                    2,
+                    &mut prev as *mut i32 as u64,
+                    0,
+                    0,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(prev, 0);
+
+            // Releasing 2 more exceeds max=3 -> STATUS_SEMAPHORE_LIMIT_EXCEEDED
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_RELEASE_SEMAPHORE,
+                    sem as u64,
+                    2,
+                    &mut prev as *mut i32 as u64,
+                    0,
+                    0,
+                ),
+                STATUS_SEMAPHORE_LIMIT_EXCEEDED
+            );
+
+            // Invalid count <= 0 -> STATUS_INVALID_PARAMETER
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_RELEASE_SEMAPHORE,
+                    sem as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            // Wrong handle type (Event) -> STATUS_OBJECT_TYPE_MISMATCH
+            let ev = crate::kernel32::threads::CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_RELEASE_SEMAPHORE,
+                    ev as u64,
+                    1,
+                    0,
+                    0,
+                    0,
+                ),
+                STATUS_OBJECT_TYPE_MISMATCH
+            );
+
+            // Invalid handle -> STATUS_INVALID_HANDLE
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_RELEASE_SEMAPHORE,
+                    0xDEAD_BEEFu64,
+                    1,
+                    0,
+                    0,
+                    0,
+                ),
+                STATUS_INVALID_HANDLE
+            );
+
+            // --- NtRemoveIoCompletion ---
+            let iocp = crate::kernel32::file::CreateIoCompletionPort(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                0,
+                0,
+            );
+            assert!(!iocp.is_null());
+
+            let zero: i64 = 0;
+            let mut fake_stack = [0u64; 8];
+            fake_stack[5] = &zero as *const i64 as u64;
+            let rsp = fake_stack.as_ptr() as u64;
+
+            let mut key: usize = 0;
+            let mut apc: *mut c_void = std::ptr::null_mut();
+            let mut iosb = [0u8; 16];
+
+            // Empty IOCP poll -> STATUS_TIMEOUT
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_REMOVE_IO_COMPLETION,
+                    iocp as u64,
+                    &mut key as *mut usize as u64,
+                    &mut apc as *mut *mut c_void as u64,
+                    iosb.as_mut_ptr() as u64,
+                    rsp,
+                ),
+                STATUS_TIMEOUT
+            );
+
+            // Post packet and remove via direct syscall
+            let ov_tag = 0x1234_5678usize as *mut crate::kernel32::file::OVERLAPPED;
+            assert_eq!(
+                crate::kernel32::file::PostQueuedCompletionStatus(iocp, 0x420, 0xCAFE_BABE, ov_tag),
+                TRUE
+            );
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_REMOVE_IO_COMPLETION,
+                    iocp as u64,
+                    &mut key as *mut usize as u64,
+                    &mut apc as *mut *mut c_void as u64,
+                    iosb.as_mut_ptr() as u64,
+                    rsp,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(key, 0xCAFE_BABE);
+            assert_eq!(apc as usize, 0x1234_5678);
+            assert_eq!(std::ptr::read_unaligned(iosb.as_ptr() as *const i32), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(iosb.as_ptr().add(8) as *const usize), 0x420);
+
+            // Wrong handle type -> STATUS_OBJECT_TYPE_MISMATCH; invalid -> STATUS_INVALID_HANDLE; null iosb -> STATUS_INVALID_PARAMETER
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_REMOVE_IO_COMPLETION,
+                    ev as u64,
+                    &mut key as *mut usize as u64,
+                    &mut apc as *mut *mut c_void as u64,
+                    iosb.as_mut_ptr() as u64,
+                    rsp,
+                ),
+                STATUS_OBJECT_TYPE_MISMATCH
+            );
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_REMOVE_IO_COMPLETION,
+                    0xDEAD_BEEFu64,
+                    &mut key as *mut usize as u64,
+                    &mut apc as *mut *mut c_void as u64,
+                    iosb.as_mut_ptr() as u64,
+                    rsp,
+                ),
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                crate::ntsyscall::dispatch_nt_syscall(
+                    crate::ntsyscall::ssn::NT_REMOVE_IO_COMPLETION,
+                    iocp as u64,
+                    &mut key as *mut usize as u64,
+                    &mut apc as *mut *mut c_void as u64,
+                    0,
+                    rsp,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            assert_eq!(crate::kernel32::threads::CloseHandle(iocp), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(sem), TRUE);
         }
     }
 }

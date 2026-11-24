@@ -986,8 +986,18 @@ impl Event {
         // An auto-reset event satisfies exactly one wait.
         notify_object_key(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
     }
+    /// Set the event and return whether it was previously signaled (`NtSetEvent`).
+    pub fn set_returning_prev(&self) -> bool {
+        let prev = self.signaled.swap(true, Ordering::AcqRel);
+        notify_object_key(obj_key(self), if self.manual_reset { usize::MAX } else { 1 });
+        prev
+    }
     pub fn reset(&self) {
         self.signaled.store(false, Ordering::Release);
+    }
+    /// Reset the event and return whether it was previously signaled (`NtResetEvent`).
+    pub fn reset_returning_prev(&self) -> bool {
+        self.signaled.swap(false, Ordering::AcqRel)
     }
     /// PulseEvent: release current waiters then reset. Approximated by
     /// set + (yield) + reset.

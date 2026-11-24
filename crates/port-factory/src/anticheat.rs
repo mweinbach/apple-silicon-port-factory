@@ -30,6 +30,8 @@ pub static KNOWN_WIN10_SSNS: &[(u32, &str)] = &[
     (0x0006, "NtReadFile"),
     (0x0007, "NtDeviceIoControlFile"),
     (0x0008, "NtWriteFile"),
+    (0x0009, "NtRemoveIoCompletion"),
+    (0x000A, "NtReleaseSemaphore"),
     (0x000D, "NtSetInformationThread"),
     (0x000E, "NtSetEvent"),
     (0x000F, "NtClose"),
