@@ -13,6 +13,9 @@ use crate::game_profiles::{
     audit_all_game_profiles, format_game_profiles_tsv, TOP_GAME_PROFILES,
 };
 use crate::ops_db::{catalog_stats, format_tsv as format_ops_tsv};
+use crate::stub_inventory::{
+    check_no_new_stubs_against_file, format_inventory_tsv, scan_workspace_stubs,
+};
 use crate::win32_db::Win32Database;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -393,8 +396,26 @@ pub fn check_or_fix_db_tsvs(
         fix,
     )?;
 
+    // 5. Static Stub Inventory + zero-new-stub regression guard
+    let stubs = scan_workspace_stubs(workspace_root)?;
+    let stub_tsv_path = db_dir.join("stub_inventory.tsv");
+    // Always enforce the zero-new-stub policy (even in --fix mode!) so `doctor --fix`
+    // can never silently bless newly added `stub!`/`failing!` sites.
+    check_no_new_stubs_against_file(&stub_tsv_path, &stubs)?;
+    let stub_expected = format_inventory_tsv(&stubs);
+    let stub_dlls: BTreeSet<&str> = stubs.iter().map(|s| s.dll.as_str()).collect();
+    let stub_item = check_or_fix_single(
+        "stub_inventory.tsv",
+        stub_tsv_path,
+        "Stub Inventory",
+        format!("{} sites across {} DLLs", stubs.len(), stub_dlls.len()),
+        "cargo opsdb -- stub-sync",
+        &stub_expected,
+        fix,
+    )?;
+
     Ok(DoctorDbReport {
-        items: vec![ops_item, win_item, shader_item, gp_item],
+        items: vec![ops_item, win_item, shader_item, gp_item, stub_item],
     })
 }
 
@@ -427,11 +448,11 @@ mod tests {
         let root = workspace_root();
         let tmp = make_temp_db_dir("missing_and_sync");
 
-        // 1. Empty db_dir -> all 4 TSVs reported missing, check mode fails without creating files.
+        // 1. Empty db_dir -> all 5 TSVs reported missing, check mode fails without creating files.
         let missing_rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
-        assert_eq!(missing_rep.items.len(), 4);
+        assert_eq!(missing_rep.items.len(), 5);
         assert!(missing_rep.has_drift());
-        assert_eq!(missing_rep.drifted_items().len(), 4);
+        assert_eq!(missing_rep.drifted_items().len(), 5);
         for item in &missing_rep.items {
             assert!(matches!(item.status, TsvSyncStatus::Missing { .. }));
             assert!(
@@ -446,6 +467,7 @@ mod tests {
         assert!(err_msg.contains("win32_apis.tsv"));
         assert!(err_msg.contains("shader_formats.tsv"));
         assert!(err_msg.contains("game_profiles.tsv"));
+        assert!(err_msg.contains("stub_inventory.tsv"));
 
         // 2. Fix mode writes all 4 canonical TSVs cleanly.
         let fixed_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
@@ -479,6 +501,7 @@ mod tests {
             "win32_apis.tsv",
             "shader_formats.tsv",
             "game_profiles.tsv",
+            "stub_inventory.tsv",
         ] {
             let p = tmp.path().join(target_file);
             let orig = fs::read_to_string(&p).unwrap();
@@ -519,5 +542,36 @@ mod tests {
             let check_after = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
             assert!(check_after.ensure_clean().is_ok());
         }
+    }
+
+    #[test]
+    fn doctor_rejects_new_stub_sites_even_in_fix_mode() {
+        let root = workspace_root();
+        let tmp = make_temp_db_dir("reject_new_stubs");
+
+        let seeded = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
+        assert!(seeded.ensure_clean().is_ok());
+
+        // Remove one existing row from stub_inventory.tsv to simulate a newly added stub in source.
+        let stub_tsv = tmp.path().join("stub_inventory.tsv");
+        let lines: Vec<String> = fs::read_to_string(&stub_tsv)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert!(lines.len() > 2);
+        let truncated = format!("{}\n", lines[..lines.len() - 1].join("\n"));
+        fs::write(&stub_tsv, truncated).unwrap();
+
+        let err_check = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap_err();
+        assert!(
+            err_check.to_string().contains("zero-stub policy violation"),
+            "unexpected error: {err_check}"
+        );
+        let err_fix = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap_err();
+        assert!(
+            err_fix.to_string().contains("zero-stub policy violation"),
+            "fix mode must also reject new stubs: {err_fix}"
+        );
     }
 }

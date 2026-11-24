@@ -37,5 +37,6 @@ pub mod scaffold;
 pub mod scanner;
 pub mod steam_library;
 pub mod storage_opt;
+pub mod stub_inventory;
 pub mod vfs;
 pub mod win32_db;

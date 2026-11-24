@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_OPS_TSV: &str = "db/ops_x86_to_arm64.tsv";
 pub const DEFAULT_PROFILES_TSV: &str = "db/ops_profiles.tsv";
 pub const DEFAULT_WIN32_TSV: &str = "db/win32_apis.tsv";
+pub const DEFAULT_STUB_INVENTORY_TSV: &str = "db/stub_inventory.tsv";
+pub const DEFAULT_STUB_BACKLOG_MD: &str = "docs/stub-backlog.md";
 pub const DEFAULT_SHADER_FORMATS_TSV: &str = "db/shader_formats.tsv";
 pub const DEFAULT_GAME_PROFILES_TSV: &str = "db/game_profiles.tsv";
 pub const DEFAULT_STEAM_BROWSER_HTML: &str = "out/steam_library_browser.html";
@@ -33,6 +35,9 @@ pub fn usage() -> ! {
            win32-sync [--tsv PATH]              Export canonical Win32 DLL & API mapping catalog to TSV\n\
            win32-stats [--search STR]           Print summary statistics of mapped Windows DLLs & APIs\n\
            win32-audit <PE_FILE_OR_DIR...>      Audit PE imports against the Win32 API database\n\
+           stub-sync [--tsv PATH] [--backlog]   Export checked-in stub inventory (`db/stub_inventory.tsv`) & optional backlog\n\
+           stub-backlog [--write] [--out PATH]  Generate `docs/stub-backlog.md` collecting `docs/stub-backlog.d/*.md`\n\
+           stub-diff <BEFORE.json> <AFTER.json> Diff two runtime stub snapshots (or boot report JSONs)\n\
          \n\
          Generalized Static AOT & Embedding Commands:\n\
            aot <PE_FILE> [--out PATH.rs] [--max-fns N]\n\
