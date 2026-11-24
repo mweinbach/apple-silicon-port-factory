@@ -671,7 +671,7 @@ mod tests {
             let wc = crate::user32::class::WNDCLASSEX {
                 cb_size: std::mem::size_of::<crate::user32::class::WNDCLASSEX>() as u32,
                 style: 0,
-                wndproc: crate::user32::defproc::DefWindowProcW as *const () as usize,
+                wndproc: crate::user32::WNDPROC_HANDLE_DEF_WINDOW_W,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,

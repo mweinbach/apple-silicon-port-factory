@@ -761,4 +761,39 @@ mod lean_tests {
         assert_eq!(u16::from_le_bytes([out[24], out[25]]), 0x0033);
         assert_eq!(rax, 0x8005_0033);
     }
+
+    #[test]
+    fn unregistered_host_text_is_never_authorized_in_lookup_or_cached_dispatch() {
+        unsafe extern "win64" fn reg_thunk_target(a: u64) -> u64 {
+            a.wrapping_add(0x42)
+        }
+
+        // Record a neutral synthetic host-text range for negative-exclusion checks only.
+        let sentinel_base: usize = 0x0000_0007_8000_0000;
+        let sentinel_addr: usize = sentinel_base + 0x140;
+        crate::exe::set_host_text_range(sentinel_base, sentinel_base + 0x2000);
+        assert!(crate::exe::in_host_text(sentinel_addr));
+
+        // 1. Direct lookup, host-callable predicate, and memoized dispatch (cold + warm dcache)
+        //    must all reject the unregistered host-text address without authorizing DF_HOST.
+        assert_eq!(crate::exe::lookup_native_va(sentinel_addr as u64), None);
+        assert_eq!(resolve_host_callable(sentinel_addr as u64), None);
+        for _ in 0..3 {
+            let (h, flags) = resolve_dispatch(sentinel_addr as u64);
+            assert_eq!(h, 0, "unregistered host text must never populate host_fn");
+            assert_eq!(flags & DF_HOST, 0, "unregistered host text must never set DF_HOST");
+        }
+
+        // 2. An explicitly registered synthetic thunk VA (bit 46 clear) dispatches cleanly
+        //    to its approved target, and stops resolving once unregistered.
+        let thunk_va: u64 = 0x0000_0007_7700_0200;
+        let target_ptr = reg_thunk_target as *const () as usize;
+        crate::exe::register_native_va(thunk_va, target_ptr);
+        assert_eq!(crate::exe::lookup_native_va(thunk_va), Some(target_ptr));
+        assert_eq!(resolve_host_callable(thunk_va), Some(target_ptr));
+        assert_eq!(unsafe { call_va8(thunk_va, 10, 0, 0, 0, 0, 0, 0, 0) }, 10 + 0x42);
+        crate::exe::unregister_native_va(thunk_va);
+        assert_eq!(resolve_host_callable(thunk_va), None);
+        crate::exe::set_host_text_range(0, 0);
+    }
 }

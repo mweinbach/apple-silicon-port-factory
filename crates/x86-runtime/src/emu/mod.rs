@@ -2,11 +2,12 @@
 //! for calling unlifted PE functions (`DllMain`, CRT init, third-party DLLs, or fallback
 //! executable VAs) on non-`x86_64` hosts (`aarch64-apple-darwin` / `aarch64-apple-ios`).
 //!
-//! Whenever a `call` or `jmp` targets an address registered in [`crate::exe::lookup_native_va`]
-//! (or any address inside the host Mach-O `__TEXT` segment), execution dispatches directly
-//! to the compiled native `aarch64` Rust function (`win32-rt` builtin export or registered
-//! game replacement). Otherwise, it decodes and executes the guest `x86-64` instructions in
-//! place against guest memory and the thread's TEB (`gs:[offset]`).
+//! Whenever a `call` or `jmp` targets an address explicitly registered in
+//! [`crate::exe::lookup_native_va`], execution dispatches directly to the compiled native
+//! `aarch64` Rust function (`win32-rt` builtin export thunk, COM vtable method, or registered
+//! game replacement). Unregistered host `__TEXT` addresses are never implicitly authorized.
+//! Otherwise, it decodes and executes the guest `x86-64` instructions in place against guest
+//! memory and the thread's TEB (`gs:[offset]`).
 //!
 //! Submodule layout:
 //! - [`cpu`]: `Cpu` state, flags, memory/atomic accessors, `MXCSR`↔`FPCR` guards, precise faults, scalar SSE helpers

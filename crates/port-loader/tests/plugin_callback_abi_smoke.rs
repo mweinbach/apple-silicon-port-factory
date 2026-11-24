@@ -658,4 +658,510 @@ mod macos_plugin_callback_smoke {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// Build a standalone x86-64 PE32+ guest executable that exercises:
+    /// 1. `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` for `AcceptEx`, `ConnectEx`, and
+    ///    `GetAcceptExSockaddrs`, verifying stability across repeated queries.
+    /// 2. Direct guest x86-64 `call [mem]` invocation of those returned extension thunks
+    ///    through real `port-runner` + `x86-runtime` guest dispatch over a loopback TCP
+    ///    connection with initial payload `"LOOPBACK"` and IOCP completion.
+    /// 3. `CallWindowProcW` from guest x86-64 code:
+    ///    - validated guest `.text` `WNDPROC` succeeds (`0x0400 + 11 + 22 == 0x421`),
+    ///    - `user32.dll!DefWindowProcW` export thunk succeeds,
+    ///    - registered non-`WNDPROC` thunk (`AcceptEx` thunk) is rejected before invocation
+    ///      (`0`, `GetLastError() == ERROR_INVALID_PARAMETER = 87`).
+    /// Exits 88 on full pass, or a distinct non-88 error code pinpointing the failing step.
+    fn build_wsa_ext_and_wndproc_guest_exe() -> Vec<u8> {
+        let mut img = vec![0u8; 0x3800];
+        let opt_base: u64 = 0x1_4000_0000;
+
+        img[0..2].copy_from_slice(b"MZ");
+        w32(&mut img, 0x3C, 0x80);
+        img[0x80..0x84].copy_from_slice(b"PE\0\0");
+        w16(&mut img, 0x84, 0x8664);
+        w16(&mut img, 0x86, 3); // .text, .rdata, .data
+        w32(&mut img, 0x88, 0x6700_3001);
+        w16(&mut img, 0x94, 0xF0);
+        w16(&mut img, 0x96, 0x0022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+        let opt = 0x98;
+        w16(&mut img, opt, 0x020B);
+        w32(&mut img, opt + 16, 0x1000); // AddressOfEntryPoint
+        w32(&mut img, opt + 20, 0x1000);
+        w64(&mut img, opt + 24, opt_base);
+        w32(&mut img, opt + 32, 0x1000);
+        w32(&mut img, opt + 36, 0x1000);
+        w16(&mut img, opt + 40, 6);
+        w16(&mut img, opt + 48, 6);
+        w32(&mut img, opt + 56, 0x4000);
+        w32(&mut img, opt + 60, 0x400);
+        w16(&mut img, opt + 68, 3); // CUI
+        w16(&mut img, opt + 70, 0x0160);
+        w32(&mut img, opt + 108, 16);
+
+        // [1] Import directory @ 0x2000 (3 descriptors + null = 80 bytes)
+        w32(&mut img, opt + 112 + 8, 0x2000);
+        w32(&mut img, opt + 112 + 12, 80);
+
+        let sec = opt + 0xF0;
+        let put_sec = |b: &mut [u8], idx: usize, name: &[u8; 8], rva: u32, sz: u32, ch: u32| {
+            let o = sec + idx * 40;
+            b[o..o + 8].copy_from_slice(name);
+            w32(b, o + 8, sz);
+            w32(b, o + 12, rva);
+            w32(b, o + 16, sz);
+            w32(b, o + 20, rva);
+            w32(b, o + 36, ch);
+        };
+        put_sec(&mut img, 0, b".text\0\0\0", 0x1000, 0x1000, 0x6000_0020);
+        put_sec(&mut img, 1, b".rdata\0\0", 0x2000, 0x1000, 0x4000_0040);
+        put_sec(&mut img, 2, b".data\0\0\0", 0x3000, 0x0800, 0xC000_0040);
+
+        // --- Import Descriptor 0: KERNEL32.dll ---
+        w32(&mut img, 0x2000, 0x2080); // OFT
+        w32(&mut img, 0x2000 + 12, 0x2300); // Name
+        w32(&mut img, 0x2000 + 16, 0x2180); // IAT
+        img[0x2300..0x2300 + 13].copy_from_slice(b"KERNEL32.dll\0");
+
+        // --- Import Descriptor 1: WS2_32.dll ---
+        w32(&mut img, 0x2014, 0x20D0); // OFT
+        w32(&mut img, 0x2014 + 12, 0x2320); // Name
+        w32(&mut img, 0x2014 + 16, 0x21D0); // IAT
+        img[0x2320..0x2320 + 11].copy_from_slice(b"WS2_32.dll\0");
+
+        // --- Import Descriptor 2: USER32.dll ---
+        w32(&mut img, 0x2028, 0x2130); // OFT
+        w32(&mut img, 0x2028 + 12, 0x2340); // Name
+        w32(&mut img, 0x2028 + 16, 0x2230); // IAT
+        img[0x2340..0x2340 + 11].copy_from_slice(b"USER32.dll\0");
+
+        let mut hn = 0x2360u32;
+        let mut add_imports = |img: &mut [u8], oft: usize, iat: usize, syms: &[&[u8]]| {
+            for (i, sym) in syms.iter().enumerate() {
+                w64(img, oft + i * 8, hn as u64);
+                w64(img, iat + i * 8, hn as u64);
+                w16(img, hn as usize, 0);
+                img[hn as usize + 2..hn as usize + 2 + sym.len()].copy_from_slice(sym);
+                hn = (hn + 2 + sym.len() as u32 + 1) & !1;
+            }
+        };
+
+        add_imports(
+            &mut img,
+            0x2080,
+            0x2180,
+            &[
+                b"ExitProcess\0",               // 0x2180
+                b"CreateIoCompletionPort\0",    // 0x2188
+                b"GetQueuedCompletionStatus\0", // 0x2190
+                b"GetLastError\0",              // 0x2198
+                b"SetLastError\0",              // 0x21A0
+                b"GetModuleHandleA\0",          // 0x21A8
+                b"GetProcAddress\0",            // 0x21B0
+                b"CloseHandle\0",               // 0x21B8
+            ],
+        );
+        add_imports(
+            &mut img,
+            0x20D0,
+            0x21D0,
+            &[
+                b"WSAStartup\0",  // 0x21D0
+                b"socket\0",      // 0x21D8
+                b"bind\0",        // 0x21E0
+                b"getsockname\0", // 0x21E8
+                b"listen\0",      // 0x21F0
+                b"WSAIoctl\0",    // 0x21F8
+                b"closesocket\0", // 0x2200
+            ],
+        );
+        add_imports(
+            &mut img,
+            0x2130,
+            0x2230,
+            &[
+                b"CallWindowProcW\0", // 0x2230
+            ],
+        );
+
+        const IAT_EXIT: u32 = 0x2180;
+        const IAT_CREATE_IOCP: u32 = 0x2188;
+        const IAT_GQCS: u32 = 0x2190;
+        const IAT_GET_ERR: u32 = 0x2198;
+        const IAT_SET_ERR: u32 = 0x21A0;
+        const IAT_GET_MOD_A: u32 = 0x21A8;
+        const IAT_GET_PROC: u32 = 0x21B0;
+        const IAT_CLOSE: u32 = 0x21B8;
+        const IAT_WSA_STARTUP: u32 = 0x21D0;
+        const IAT_SOCKET: u32 = 0x21D8;
+        const IAT_BIND: u32 = 0x21E0;
+        const IAT_GETSOCKNAME: u32 = 0x21E8;
+        const IAT_LISTEN: u32 = 0x21F0;
+        const IAT_WSA_IOCTL: u32 = 0x21F8;
+        const IAT_CLOSESOCKET: u32 = 0x2200;
+        const IAT_CALL_WNDPROC_W: u32 = 0x2230;
+
+        // Static constants in .rdata @ 0x2600..
+        const RDATA_GUID_ACCEPTEX: u32 = 0x2600;
+        const RDATA_GUID_CONNECTEX: u32 = 0x2610;
+        const RDATA_GUID_SOCKADDRS: u32 = 0x2620;
+        const RDATA_PAYLOAD: u32 = 0x2630;
+        const RDATA_USER32: u32 = 0x2640;
+        const RDATA_DEFWNDPROCW: u32 = 0x2650;
+        const RDATA_BIND_SA: u32 = 0x2670;
+
+        // WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_GETACCEPTEXSOCKADDRS
+        img[0x2600..0x2610].copy_from_slice(&[
+            0xf1, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92,
+        ]);
+        img[0x2610..0x2620].copy_from_slice(&[
+            0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46, 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e,
+        ]);
+        img[0x2620..0x2630].copy_from_slice(&[
+            0xf2, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92,
+        ]);
+        img[0x2630..0x2638].copy_from_slice(b"LOOPBACK");
+        img[0x2640..0x264B].copy_from_slice(b"user32.dll\0");
+        img[0x2650..0x265F].copy_from_slice(b"DefWindowProcW\0");
+        // sockaddr_in 127.0.0.1:0
+        w16(&mut img, 0x2670, 2); // AF_INET
+        img[0x2674..0x2678].copy_from_slice(&[127, 0, 0, 1]);
+
+        // .data layout @ 0x3000..0x37FF:
+        const DATA_IOCP: u32 = 0x3000;
+        const DATA_SRV: u32 = 0x3008;
+        const DATA_ACC: u32 = 0x3010;
+        const DATA_CLI: u32 = 0x3018;
+        const DATA_P_ACCEPTEX: u32 = 0x3020;
+        const DATA_P_ACCEPTEX2: u32 = 0x3028;
+        const DATA_P_CONNECTEX: u32 = 0x3030;
+        const DATA_P_SOCKADDRS: u32 = 0x3038;
+        const DATA_BYTES_RET: u32 = 0x3040;
+        const DATA_SRV_SA_LEN: u32 = 0x3044;
+        const DATA_SRV_SA: u32 = 0x3050; // 16 bytes
+        const DATA_OV_ACC: u32 = 0x3080; // 32 bytes
+        const DATA_OV_CLI: u32 = 0x30A0; // 32 bytes
+        const DATA_ACC_BUF: u32 = 0x3100; // 128 bytes
+        const DATA_LOC_PTR: u32 = 0x3180;
+        const DATA_REM_PTR: u32 = 0x3188;
+        const DATA_LOC_LEN: u32 = 0x3190;
+        const DATA_REM_LEN: u32 = 0x3194;
+        const DATA_GQCS_BYTES: u32 = 0x3198;
+        const DATA_GQCS_KEY: u32 = 0x31A0;
+        const DATA_GQCS_OV: u32 = 0x31A8;
+        const DATA_WSADATA: u32 = 0x3200; // 512 bytes
+
+        w32(&mut img, DATA_SRV_SA_LEN as usize, 16);
+
+        // Helper: emit `mov reg, [rip + rva]` / `mov [rip + rva], reg`
+        let emit_load_rip64 = |c: &mut Vec<u8>, rex: u8, modrm: u8, base_rva: u32, target_rva: u32| {
+            c.extend_from_slice(&[rex, 0x8B, modrm]);
+            let next = base_rva + c.len() as u32 + 4;
+            c.extend_from_slice(&((target_rva as i64 - next as i64) as i32).to_le_bytes());
+        };
+        let emit_store_rip64 = |c: &mut Vec<u8>, rex: u8, modrm: u8, base_rva: u32, target_rva: u32| {
+            c.extend_from_slice(&[rex, 0x89, modrm]);
+            let next = base_rva + c.len() as u32 + 4;
+            c.extend_from_slice(&((target_rva as i64 - next as i64) as i32).to_le_bytes());
+        };
+        let emit_fail_if_nz = |c: &mut Vec<u8>, code: u32| {
+            // test eax, eax; jz +11; mov ecx, code; call ExitProcess
+            c.extend_from_slice(&[0x85, 0xC0, 0x74, 11, 0xB9]);
+            c.extend_from_slice(&code.to_le_bytes());
+            emit_call_rip(c, 0x1000, IAT_EXIT);
+        };
+        let emit_fail_if_z = |c: &mut Vec<u8>, code: u32| {
+            // test rax, rax; jnz +11; mov ecx, code; call ExitProcess
+            c.extend_from_slice(&[0x48, 0x85, 0xC0, 0x75, 11, 0xB9]);
+            c.extend_from_slice(&code.to_le_bytes());
+            emit_call_rip(c, 0x1000, IAT_EXIT);
+        };
+
+        // --- guest_wndproc @ 0x1800 ---
+        // Returns rdx (msg) + r8 (wparam) + r9 (lparam)
+        // lea rax, [rdx + r8]; add rax, r9; ret
+        let wp_code: [u8; 8] = [0x4A, 0x8D, 0x04, 0x02, 0x4C, 0x01, 0xC8, 0xC3];
+        img[0x1800..0x1808].copy_from_slice(&wp_code);
+
+        // --- Entry point @ 0x1000 ---
+        let mut c = Vec::new();
+        c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68 (aligned + 9 args)
+
+        // 1. WSAStartup(0x0202, &DATA_WSADATA)
+        c.extend_from_slice(&[0xB9, 0x02, 0x02, 0x00, 0x00]); // mov ecx, 0x0202
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, DATA_WSADATA); // rdx
+        emit_call_rip(&mut c, 0x1000, IAT_WSA_STARTUP);
+        emit_fail_if_nz(&mut c, 10);
+
+        // 2. CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 1)
+        c.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1
+        c.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        c.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        c.extend_from_slice(&[0x41, 0xB9, 1, 0, 0, 0]); // mov r9d, 1
+        emit_call_rip(&mut c, 0x1000, IAT_CREATE_IOCP);
+        emit_fail_if_z(&mut c, 11);
+        emit_store_rip64(&mut c, 0x48, 0x05, 0x1000, DATA_IOCP);
+
+        // 3. Create srv, acc, cli TCP sockets (AF_INET=2, SOCK_STREAM=1, IPPROTO_TCP=6)
+        for &slot in &[DATA_SRV, DATA_ACC, DATA_CLI] {
+            c.extend_from_slice(&[0xB9, 2, 0, 0, 0]);
+            c.extend_from_slice(&[0xBA, 1, 0, 0, 0]);
+            c.extend_from_slice(&[0x41, 0xB8, 6, 0, 0, 0]);
+            emit_call_rip(&mut c, 0x1000, IAT_SOCKET);
+            emit_store_rip64(&mut c, 0x48, 0x05, 0x1000, slot);
+        }
+
+        // Associate srv (key 1) and cli (key 2) with IOCP
+        for &(slot, key) in &[(DATA_SRV, 1u32), (DATA_CLI, 2u32)] {
+            emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, slot); // rcx
+            emit_load_rip64(&mut c, 0x48, 0x15, 0x1000, DATA_IOCP); // rdx
+            c.extend_from_slice(&[0x41, 0xB8]);
+            c.extend_from_slice(&key.to_le_bytes()); // r8d
+            c.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+            emit_call_rip(&mut c, 0x1000, IAT_CREATE_IOCP);
+            emit_fail_if_z(&mut c, 12);
+        }
+
+        // bind(srv, &RDATA_BIND_SA, 16) + getsockname(srv, &DATA_SRV_SA, &DATA_SRV_SA_LEN) + listen(srv, 4)
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_SRV);
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, RDATA_BIND_SA);
+        c.extend_from_slice(&[0x41, 0xB8, 16, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_BIND);
+        emit_fail_if_nz(&mut c, 13);
+
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_SRV);
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, DATA_SRV_SA);
+        emit_lea_rip(&mut c, 0x4C, 0x05, 0x1000, DATA_SRV_SA_LEN);
+        emit_call_rip(&mut c, 0x1000, IAT_GETSOCKNAME);
+        emit_fail_if_nz(&mut c, 14);
+
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_SRV);
+        c.extend_from_slice(&[0xBA, 4, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_LISTEN);
+        emit_fail_if_nz(&mut c, 15);
+
+        // bind(cli, &RDATA_BIND_SA, 16)
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_CLI);
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, RDATA_BIND_SA);
+        c.extend_from_slice(&[0x41, 0xB8, 16, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_BIND);
+        emit_fail_if_nz(&mut c, 16);
+
+        // 4. WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER = 0xC8000006) for AcceptEx (x2), ConnectEx, GetAcceptExSockaddrs
+        for &(sock_slot, guid_rva, out_slot, fail_code) in &[
+            (DATA_SRV, RDATA_GUID_ACCEPTEX, DATA_P_ACCEPTEX, 20u32),
+            (DATA_CLI, RDATA_GUID_ACCEPTEX, DATA_P_ACCEPTEX2, 21u32),
+            (DATA_CLI, RDATA_GUID_CONNECTEX, DATA_P_CONNECTEX, 22u32),
+            (DATA_SRV, RDATA_GUID_SOCKADDRS, DATA_P_SOCKADDRS, 23u32),
+        ] {
+            emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, sock_slot); // rcx = s
+            c.extend_from_slice(&[0xBA]);
+            c.extend_from_slice(&0xC800_0006u32.to_le_bytes()); // edx = SIO_GET_EXTENSION_FUNCTION_POINTER
+            emit_lea_rip(&mut c, 0x4C, 0x05, 0x1000, guid_rva); // r8 = &guid
+            c.extend_from_slice(&[0x41, 0xB9, 16, 0, 0, 0]); // r9d = 16
+            emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, out_slot); // rax = &out_slot
+            c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // [rsp+0x20] = out_buf
+            c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 8, 0, 0, 0]); // [rsp+0x28] = 8
+            emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_BYTES_RET);
+            c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = &bytes_ret
+            c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 0, 0, 0, 0]); // [rsp+0x38] = 0
+            c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0, 0, 0, 0]); // [rsp+0x40] = 0
+            emit_call_rip(&mut c, 0x1000, IAT_WSA_IOCTL);
+            emit_fail_if_nz(&mut c, fail_code);
+        }
+
+        // Verify AcceptEx thunk is stable across srv & cli sockets (p_acceptex == p_acceptex2 != 0)
+        emit_load_rip64(&mut c, 0x48, 0x05, 0x1000, DATA_P_ACCEPTEX); // rax
+        emit_fail_if_z(&mut c, 24);
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_P_ACCEPTEX2); // rcx
+        c.extend_from_slice(&[0x48, 0x39, 0xC8, 0x74, 11, 0xB9]); // cmp rax, rcx; je +11
+        c.extend_from_slice(&25u32.to_le_bytes());
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        // 5. Guest x64 indirect call to AcceptEx thunk:
+        //    AcceptEx(srv, acc, &DATA_ACC_BUF, 8, 32, 32, &DATA_BYTES_RET, &DATA_OV_ACC)
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_SRV); // rcx
+        emit_load_rip64(&mut c, 0x48, 0x15, 0x1000, DATA_ACC); // rdx
+        emit_lea_rip(&mut c, 0x4C, 0x05, 0x1000, DATA_ACC_BUF); // r8
+        c.extend_from_slice(&[0x41, 0xB9, 8, 0, 0, 0]); // r9d = 8
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 32, 0, 0, 0]); // [rsp+0x20] = 32
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 32, 0, 0, 0]); // [rsp+0x28] = 32
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_BYTES_RET);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = &bytes_ret
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_OV_ACC);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]); // [rsp+0x38] = &ov_acc
+        emit_call_rip(&mut c, 0x1000, DATA_P_ACCEPTEX); // call qword ptr [rip + p_acceptex]
+
+        // 6. Guest x64 indirect call to ConnectEx thunk:
+        //    ConnectEx(cli, &DATA_SRV_SA, 16, "LOOPBACK", 8, &DATA_BYTES_RET, &DATA_OV_CLI)
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_CLI); // rcx
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, DATA_SRV_SA); // rdx
+        c.extend_from_slice(&[0x41, 0xB8, 16, 0, 0, 0]); // r8d = 16
+        emit_lea_rip(&mut c, 0x4C, 0x0D, 0x1000, RDATA_PAYLOAD); // r9 = "LOOPBACK"
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 8, 0, 0, 0]); // [rsp+0x20] = 8
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_BYTES_RET);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // [rsp+0x28] = &bytes_ret
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_OV_CLI);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = &ov_cli
+        emit_call_rip(&mut c, 0x1000, DATA_P_CONNECTEX); // call qword ptr [rip + p_connectex]
+
+        // 7. Drain 2 IOCP completions (AcceptEx + ConnectEx)
+        for fail_code in [30u32, 31u32] {
+            emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_IOCP); // rcx
+            emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, DATA_GQCS_BYTES); // rdx
+            emit_lea_rip(&mut c, 0x4C, 0x05, 0x1000, DATA_GQCS_KEY); // r8
+            emit_lea_rip(&mut c, 0x4C, 0x0D, 0x1000, DATA_GQCS_OV); // r9
+            c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20]);
+            c.extend_from_slice(&2000u32.to_le_bytes()); // [rsp+0x20] = 2000ms
+            emit_call_rip(&mut c, 0x1000, IAT_GQCS);
+            emit_fail_if_z(&mut c, fail_code);
+        }
+
+        // Verify DATA_ACC_BUF[0..8] == "LOOPBACK"
+        emit_load_rip64(&mut c, 0x48, 0x05, 0x1000, DATA_ACC_BUF); // rax = *(u64*)acc_buf
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, RDATA_PAYLOAD); // rcx = *(u64*)"LOOPBACK"
+        c.extend_from_slice(&[0x48, 0x39, 0xC8, 0x74, 11, 0xB9]); // cmp rax, rcx; je +11
+        c.extend_from_slice(&32u32.to_le_bytes());
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        // 8. Guest x64 indirect call to GetAcceptExSockaddrs thunk:
+        //    GetAcceptExSockaddrs(&DATA_ACC_BUF, 8, 32, 32, &loc_ptr, &loc_len, &rem_ptr, &rem_len)
+        emit_lea_rip(&mut c, 0x48, 0x0D, 0x1000, DATA_ACC_BUF); // rcx
+        c.extend_from_slice(&[0xBA, 8, 0, 0, 0]); // edx = 8
+        c.extend_from_slice(&[0x41, 0xB8, 32, 0, 0, 0]); // r8d = 32
+        c.extend_from_slice(&[0x41, 0xB9, 32, 0, 0, 0]); // r9d = 32
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_LOC_PTR);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_LOC_LEN);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_REM_PTR);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]);
+        emit_lea_rip(&mut c, 0x48, 0x05, 0x1000, DATA_REM_LEN);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]);
+        emit_call_rip(&mut c, 0x1000, DATA_P_SOCKADDRS); // call qword ptr [rip + p_sockaddrs]
+
+        // Verify *(u16*)(*DATA_LOC_PTR) == 2 (AF_INET)
+        emit_load_rip64(&mut c, 0x48, 0x05, 0x1000, DATA_LOC_PTR);
+        emit_fail_if_z(&mut c, 33);
+        c.extend_from_slice(&[0x0F, 0xB7, 0x00]); // movzx eax, word ptr [rax]
+        c.extend_from_slice(&[0x83, 0xF8, 2, 0x74, 11, 0xB9]); // cmp eax, 2; je +11
+        c.extend_from_slice(&34u32.to_le_bytes());
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        // 9. CallWindowProcW on validated guest .text WNDPROC @ 0x1800 -> expect 0x421
+        emit_lea_rip(&mut c, 0x48, 0x0D, 0x1000, 0x1800); // rcx = &guest_wndproc
+        c.extend_from_slice(&[0x31, 0xD2]); // edx = 0 (hwnd)
+        c.extend_from_slice(&[0x41, 0xB8, 0x00, 0x04, 0x00, 0x00]); // r8d = 0x0400
+        c.extend_from_slice(&[0x41, 0xB9, 11, 0, 0, 0]); // r9d = 11
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 22, 0, 0, 0]); // [rsp+0x20] = 22
+        emit_call_rip(&mut c, 0x1000, IAT_CALL_WNDPROC_W);
+        c.extend_from_slice(&[0x3D]); // cmp eax, 0x421
+        c.extend_from_slice(&0x421u32.to_le_bytes());
+        c.extend_from_slice(&[0x74, 11, 0xB9]); // je +11
+        c.extend_from_slice(&40u32.to_le_bytes());
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        // 10. CallWindowProcW on user32.dll!DefWindowProcW export thunk -> succeeds (last_error == 0)
+        emit_lea_rip(&mut c, 0x48, 0x0D, 0x1000, RDATA_USER32);
+        emit_call_rip(&mut c, 0x1000, IAT_GET_MOD_A);
+        emit_fail_if_z(&mut c, 41);
+        c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+        emit_lea_rip(&mut c, 0x48, 0x15, 0x1000, RDATA_DEFWNDPROCW);
+        emit_call_rip(&mut c, 0x1000, IAT_GET_PROC);
+        emit_fail_if_z(&mut c, 42);
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x50]); // save DefWindowProcW thunk at [rsp+0x50]
+        c.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        emit_call_rip(&mut c, 0x1000, IAT_SET_ERR);
+        c.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x50]); // rcx = DefWindowProcW thunk
+        c.extend_from_slice(&[0x31, 0xD2]); // edx = 0
+        c.extend_from_slice(&[0x45, 0x31, 0xC0]); // r8d = 0
+        c.extend_from_slice(&[0x45, 0x31, 0xC9]); // r9d = 0
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_CALL_WNDPROC_W);
+        emit_call_rip(&mut c, 0x1000, IAT_GET_ERR);
+        emit_fail_if_nz(&mut c, 43);
+
+        // 11. CallWindowProcW on registered non-WNDPROC thunk (AcceptEx thunk!) -> MUST be
+        //     rejected before invocation with ERROR_INVALID_PARAMETER (87).
+        c.extend_from_slice(&[0x31, 0xC9]); // SetLastError(0)
+        emit_call_rip(&mut c, 0x1000, IAT_SET_ERR);
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_P_ACCEPTEX); // rcx = AcceptEx thunk
+        c.extend_from_slice(&[0x31, 0xD2]);
+        c.extend_from_slice(&[0x41, 0xB8, 0x00, 0x04, 0x00, 0x00]);
+        c.extend_from_slice(&[0x41, 0xB9, 1, 0, 0, 0]);
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 2, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_CALL_WNDPROC_W);
+        emit_fail_if_nz(&mut c, 44);
+        emit_call_rip(&mut c, 0x1000, IAT_GET_ERR);
+        c.extend_from_slice(&[0x83, 0xF8, 87, 0x74, 11, 0xB9]); // cmp eax, 87; je +11
+        c.extend_from_slice(&45u32.to_le_bytes());
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        // Cleanup sockets & IOCP
+        for &slot in &[DATA_ACC, DATA_CLI, DATA_SRV] {
+            emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, slot);
+            emit_call_rip(&mut c, 0x1000, IAT_CLOSESOCKET);
+        }
+        emit_load_rip64(&mut c, 0x48, 0x0D, 0x1000, DATA_IOCP);
+        emit_call_rip(&mut c, 0x1000, IAT_CLOSE);
+
+        // ExitProcess(88)
+        c.extend_from_slice(&[0xB9, 88, 0, 0, 0]);
+        emit_call_rip(&mut c, 0x1000, IAT_EXIT);
+
+        assert!(c.len() <= 0x7F0, "entry code len {} exceeded budget", c.len());
+        img[0x1000..0x1000 + c.len()].copy_from_slice(&c);
+        img
+    }
+
+    #[test]
+    fn wsa_extension_thunks_and_callwindowproc_guest_x64_smoke() {
+        let runner = PathBuf::from(env!("CARGO_BIN_EXE_port-runner"));
+        let tmp = std::env::temp_dir().join(format!(
+            "port_runner_wsa_ext_wndproc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pkg = tmp.join("pkg");
+        let drive_c = tmp.join("drive_c");
+        let aot_dir = tmp.join("aot_cache");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(&drive_c).unwrap();
+        std::fs::create_dir_all(&aot_dir).unwrap();
+
+        let exe_path = pkg.join("wsa_ext_wndproc_guest.exe");
+        std::fs::write(&exe_path, build_wsa_ext_and_wndproc_guest_exe()).unwrap();
+
+        let run = Command::new(&runner)
+            .args([
+                "--pe",
+                exe_path.to_str().unwrap(),
+                "--game-dir",
+                pkg.to_str().unwrap(),
+                "--drive-c",
+                drive_c.to_str().unwrap(),
+            ])
+            .env("PORT_AOT", "0")
+            .env("PORT_AOT_DIR", &aot_dir)
+            .env("PORT_HEADLESS", "1")
+            .env("PORT_AOT_GUARD", "0")
+            .env("PORT_CHILD_STDIO", "1")
+            .env("PORT_CHILD_LOG_STDERR", "1")
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("spawn port-runner for wsa ext + CallWindowProcW guest smoke");
+
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(
+            run.status.code(),
+            Some(88),
+            "expected guest exit code 88 (got {:?})\nstdout:\n{}\nstderr:\n{stderr}",
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

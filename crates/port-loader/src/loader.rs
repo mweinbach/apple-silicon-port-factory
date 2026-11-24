@@ -158,6 +158,8 @@ pub struct Loader {
     exe: OnceLock<Arc<Module>>,
     /// Cache of trace thunks per (dll, name) so GetProcAddress is stable.
     trace_cache: Mutex<HashMap<(String, String), usize>>,
+    /// Immutable guest-visible thunk page for the fixed verified Winsock2 extensions.
+    wsa_ext_thunks: OnceLock<crate::builtin_image::FixedThunkPage>,
     /// Count of unresolved static imports (trap thunks installed).
     pub traps: AtomicU32,
     /// `dll!name` of every unresolved static import.
@@ -193,6 +195,7 @@ impl Loader {
             lock: ReentrantLock::new(),
             exe: OnceLock::new(),
             trace_cache: Mutex::new(HashMap::new()),
+            wsa_ext_thunks: OnceLock::new(),
             traps: AtomicU32::new(0),
             unresolved: Mutex::new(Default::default()),
         }
@@ -1505,6 +1508,11 @@ impl Loader {
         if let Some((dll, name)) = w::builtin_name_for(addr) {
             return format!("{dll}!{name} [builtin]");
         }
+        if let Some(page) = self.wsa_ext_thunks.get() {
+            if let Some(name) = page.symbol_for(addr) {
+                return format!("{name} [wsa ext thunk]");
+            }
+        }
         if let Some(m) = self.module_at(addr) {
             if let Kind::Builtin { thunk_names, .. } = &m.kind {
                 if let Some(n) = thunk_names.get(&(addr & !(crate::builtin_image::THUNK_SIZE - 1))) {
@@ -1779,6 +1787,17 @@ impl w::LoaderOps for Loader {
         } else {
             Some(a)
         }
+    }
+
+    fn wsa_extension_thunk(&self, ext: w::WsaExtension) -> Option<usize> {
+        let page = self.wsa_ext_thunks.get_or_init(|| {
+            let entries: Vec<(&'static str, usize)> = w::WsaExtension::ALL
+                .iter()
+                .map(|&e| (e.symbol_name(), w::misc::ws2_32::wsa_extension_target(e)))
+                .collect();
+            crate::builtin_image::build_fixed_thunk_page(&entries)
+        });
+        page.thunks.get(ext as usize).map(|&(va, _)| va)
     }
 
     fn module_path(&self, hmod: Option<usize>) -> Option<String> {

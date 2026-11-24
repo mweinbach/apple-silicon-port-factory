@@ -244,9 +244,7 @@ thread_local! {
 }
 
 fn master_wndproc_va() -> usize {
-    let va = master_subclass_wndproc as *const () as usize;
-    crate::register_native_va(va as u64, va);
-    va
+    crate::user32::register_typed_host_wndproc(master_subclass_wndproc)
 }
 
 /// Remove any remaining subclass state for a destroyed window (called from
@@ -553,17 +551,7 @@ pub unsafe extern "win64" fn DefSubclassProc(
     } else {
         let master = master_wndproc_va();
         if frame_orig != 0 && frame_orig != master {
-            crate::call_guest8(
-                frame_orig,
-                h as u64,
-                u_msg as u64,
-                w_param as u64,
-                l_param as u64,
-                0,
-                0,
-                0,
-                0,
-            ) as isize
+            crate::user32::message::CallWindowProcW(frame_orig, hwnd, u_msg, w_param, l_param)
         } else {
             crate::user32::defproc::DefWindowProcW(hwnd, u_msg, w_param, l_param)
         }
@@ -759,7 +747,7 @@ mod tests {
             let cls = crate::strings::to_wide_z("ComctlSubclassTestWnd");
             let wc = crate::user32::class::WNDCLASS {
                 style: 0,
-                wndproc: base_wndproc as *const () as usize,
+                wndproc: crate::user32::register_typed_host_wndproc(base_wndproc),
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,

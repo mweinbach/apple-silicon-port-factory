@@ -404,6 +404,77 @@ pub fn host_text_range() -> Option<(usize, usize)> {
     text_range_of(host_binary_base())
 }
 
+/// Immutable, W^X-separated guest-visible thunk page for a fixed, closed table of internal
+/// host entry points (e.g. verified Winsock2 extension functions).
+pub struct FixedThunkPage {
+    pub base: usize,
+    pub thunks: Vec<(usize, &'static str)>,
+}
+
+impl FixedThunkPage {
+    pub fn symbol_for(&self, addr: usize) -> Option<&'static str> {
+        if addr < self.base || addr >= self.base + PAGE {
+            return None;
+        }
+        let aligned = addr & !(THUNK_SIZE - 1);
+        self.thunks.iter().find_map(|&(va, name)| (va == aligned).then_some(name))
+    }
+}
+
+/// Provision an immutable single-page W^X thunk table for a fixed, closed list of
+/// `(symbol_name, host_target)` entries.
+///
+/// - On ARM64 (macOS & iOS), writes harmless x86-64 stub bytes containing **no** host pointers,
+///   switches the page to `PROT_READ`, registers guest `PAGE_EXECUTE_READ` metadata, and binds
+///   each thunk VA to its fixed `host_target` via `x86_runtime::exe::register_native_va`.
+/// - On `x86_64`, emits standard 16-byte `jmp [rip+0]` thunks and switches the page to
+///   `PROT_READ | PROT_EXEC` (strict W^X).
+pub fn build_fixed_thunk_page(entries: &[(&'static str, usize)]) -> FixedThunkPage {
+    assert!(
+        entries.len() * THUNK_SIZE <= PAGE,
+        "fixed thunk table exceeds one page"
+    );
+    let base = unsafe { map_near_host(PAGE) };
+    let mut thunks = Vec::with_capacity(entries.len());
+    unsafe {
+        std::ptr::write_bytes(base as *mut u8, 0xCC, PAGE);
+        for (i, &(name, target)) in entries.iter().enumerate() {
+            let off = i * THUNK_SIZE;
+            let thunk_va = base + off;
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut stub = [0xCCu8; THUNK_SIZE];
+                stub[0..6].copy_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+                stub[6..14].copy_from_slice(&(target as u64).to_le_bytes());
+                std::ptr::copy_nonoverlapping(stub.as_ptr(), thunk_va as *mut u8, THUNK_SIZE);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let stub: [u8; THUNK_SIZE] = [
+                    0x48, 0x83, 0xEC, 0x28, // sub rsp, 0x28
+                    0x48, 0x83, 0xC4, 0x28, // add rsp, 0x28
+                    0xC3, // ret
+                    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                ];
+                std::ptr::copy_nonoverlapping(stub.as_ptr(), thunk_va as *mut u8, THUNK_SIZE);
+                x86_runtime::exe::register_native_va(thunk_va as u64, target);
+            }
+            thunks.push((thunk_va, name));
+        }
+        #[cfg(target_arch = "x86_64")]
+        let prot = libc::PROT_READ | libc::PROT_EXEC;
+        #[cfg(not(target_arch = "x86_64"))]
+        let prot = libc::PROT_READ;
+        let _ = libc::mprotect(base as *mut libc::c_void, PAGE, prot);
+    }
+    win32_rt::kernel32::memory::register_image(
+        base,
+        PAGE,
+        &[(base, base + PAGE, win32_rt::kernel32::memory::PAGE_EXECUTE_READ)],
+    );
+    FixedThunkPage { base, thunks }
+}
+
 /// Map `size` bytes (RW) for a builtin image, preferring a spot just below
 /// the host binary so its statics are within 4 GB above the image base
 /// (data exports need 32-bit RVAs).

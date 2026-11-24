@@ -60,6 +60,147 @@ pub type LPARAM = isize;
 pub type LRESULT = isize;
 pub type ATOM = u16;
 pub type WNDPROC = unsafe extern "win64" fn(usize, u32, WPARAM, LPARAM) -> LRESULT;
+/// Strongly-typed internal host window procedure signature.
+pub type TypedWndProc = unsafe extern "win64" fn(crate::types::HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+/// Opaque Windows-style high-word (`0xFFFFxxxx`) proc handles for built-in internal host
+/// window procedures. Never expose raw host code addresses via `Get/SetWindowLongPtr(GWLP_WNDPROC)`
+/// or `GetClassInfoEx`.
+pub const WNDPROC_HANDLE_DEF_WINDOW_W: usize = 0xFFFF_0001;
+pub const WNDPROC_HANDLE_DEF_WINDOW_A: usize = 0xFFFF_0002;
+pub const WNDPROC_HANDLE_DEF_DLG_W: usize = 0xFFFF_0003;
+pub const WNDPROC_HANDLE_DEF_DLG_A: usize = 0xFFFF_0004;
+pub const WNDPROC_HANDLE_BUTTON: usize = 0xFFFF_0005;
+pub const WNDPROC_HANDLE_EDIT: usize = 0xFFFF_0006;
+pub const WNDPROC_HANDLE_DEFAULT_CTRL: usize = 0xFFFF_0007;
+const WNDPROC_HANDLE_DYNAMIC_BASE: usize = 0xFFFF_0100;
+
+static TYPED_HOST_WNDPROCS: std::sync::Mutex<Vec<TypedWndProc>> = std::sync::Mutex::new(Vec::new());
+
+/// Explicitly register an internal Rust `TypedWndProc` under an opaque `0xFFFFxxxx` proc handle
+/// so it can be invoked via `CallWindowProcW/A` and `window::call_window_proc` without exposing
+/// raw host pointers or widening general native dispatch.
+pub fn register_typed_host_wndproc(proc_: TypedWndProc) -> usize {
+    let mut reg = TYPED_HOST_WNDPROCS.lock().unwrap_or_else(|e| e.into_inner());
+    let target = proc_ as *const () as usize;
+    if let Some(idx) = reg.iter().position(|&f| (f as *const () as usize) == target) {
+        return WNDPROC_HANDLE_DYNAMIC_BASE + idx;
+    }
+    let idx = reg.len();
+    reg.push(proc_);
+    WNDPROC_HANDLE_DYNAMIC_BASE + idx
+}
+
+/// Resolve the synthetic `user32.dll` export thunk VAs for the 4 built-in Windows default
+/// window procedures (`DefWindowProcW/A`, `DefDlgProcW/A`), cached once `user32.dll` is loaded.
+fn user32_defproc_thunks() -> Option<[(usize, TypedWndProc); 4]> {
+    static CACHE: std::sync::OnceLock<[(usize, TypedWndProc); 4]> = std::sync::OnceLock::new();
+    if let Some(cached) = CACHE.get() {
+        return Some(*cached);
+    }
+    let l = crate::try_loader()?;
+    let hmod = l.get_module_handle(Some("user32.dll"))?;
+    let def_w = l.get_proc_address(hmod, crate::ProcName::Name("DefWindowProcW")).unwrap_or(0);
+    let def_a = l.get_proc_address(hmod, crate::ProcName::Name("DefWindowProcA")).unwrap_or(0);
+    let dlg_w = l.get_proc_address(hmod, crate::ProcName::Name("DefDlgProcW")).unwrap_or(0);
+    let dlg_a = l.get_proc_address(hmod, crate::ProcName::Name("DefDlgProcA")).unwrap_or(0);
+    let table: [(usize, TypedWndProc); 4] = [
+        (def_w, defproc::DefWindowProcW),
+        (def_a, defproc::DefWindowProcA),
+        (dlg_w, dialog::DefDlgProcW),
+        (dlg_a, dialog::DefDlgProcA),
+    ];
+    let _ = CACHE.set(table);
+    Some(table)
+}
+
+/// Resolve `p` strictly as an explicitly authorized typed internal `WNDPROC`:
+/// - opaque built-in `0xFFFF_0001..=0xFFFF_0007` handles,
+/// - Rust-registered typed handles (`0xFFFF_0100..`), or
+/// - `user32.dll`'s 4 built-in `DefWindowProcW/A` / `DefDlgProcW/A` export thunk VAs.
+///
+/// Arbitrary raw host addresses and unrelated `VA_DISPATCH` entries NEVER match.
+pub(crate) fn resolve_typed_wndproc(p: usize) -> Option<TypedWndProc> {
+    match p {
+        WNDPROC_HANDLE_DEF_WINDOW_W => return Some(defproc::DefWindowProcW),
+        WNDPROC_HANDLE_DEF_WINDOW_A => return Some(defproc::DefWindowProcA),
+        WNDPROC_HANDLE_DEF_DLG_W => return Some(dialog::DefDlgProcW),
+        WNDPROC_HANDLE_DEF_DLG_A => return Some(dialog::DefDlgProcA),
+        WNDPROC_HANDLE_BUTTON => return Some(dialog::button_wndproc),
+        WNDPROC_HANDLE_EDIT => return Some(dialog::edit_wndproc),
+        WNDPROC_HANDLE_DEFAULT_CTRL => return Some(dialog::default_control_wndproc),
+        _ => {}
+    }
+    if p >= WNDPROC_HANDLE_DYNAMIC_BASE && (p >> 16) == 0xFFFF {
+        let idx = p - WNDPROC_HANDLE_DYNAMIC_BASE;
+        let reg = TYPED_HOST_WNDPROCS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&f) = reg.get(idx) {
+            return Some(f);
+        }
+        return None;
+    }
+    if let Some(thunks) = user32_defproc_thunks() {
+        for (va, f) in thunks {
+            if va != 0 && va == p {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// True strictly if `p` points to validated executable guest code (an executable section of
+/// a real mapped guest PE image, or committed executable guest `VirtualAlloc`/`MapViewOfFile`
+/// memory — excluding synthetic builtins, host `__TEXT`, and non-executable pages).
+#[inline]
+pub(crate) fn is_validated_guest_wndproc_target(p: usize) -> bool {
+    if p == 0 {
+        return false;
+    }
+    crate::try_loader().is_some_and(|l| l.is_guest_pe_code(p))
+        || crate::kernel32::memory::is_guest_exec_vm_addr(p)
+}
+
+/// Dispatch a `WNDPROC` target for `CallWindowProcW/A` and `window::call_window_proc`.
+///
+/// Enforces strict separation between typed internal host `WNDPROC`s and validated guest code:
+/// 1. Explicitly authorized typed internal `WNDPROC` (opaque `0xFFFFxxxx` handle or `user32.dll`
+///    `DefWindowProcW/A` / `DefDlgProcW/A` thunk) -> invoked directly with typed `WNDPROC` ABI.
+/// 2. Validated executable guest code target when a guest translator dispatcher is active ->
+///    invoked via `crate::call_guest8`.
+/// 3. Anything else (arbitrary host `__TEXT`, raw host fn pointers, non-`WNDPROC` Win32/COM
+///    thunks, non-executable guest memory, or guest code without a guest dispatcher) -> rejected
+///    BEFORE invocation with `ERROR_INVALID_PARAMETER`.
+pub(crate) unsafe fn dispatch_wndproc(
+    p: usize,
+    hwnd: crate::types::HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if p == 0 {
+        return 0;
+    }
+    if let Some(f) = resolve_typed_wndproc(p) {
+        return f(hwnd, msg, wparam, lparam);
+    }
+    if crate::has_guest_dispatcher() && is_validated_guest_wndproc_target(p) {
+        return crate::call_guest8(
+            p,
+            hwnd as u64,
+            msg as u64,
+            wparam as u64,
+            lparam as u64,
+            0,
+            0,
+            0,
+            0,
+        ) as LRESULT;
+    }
+    log::warn!("user32: CallWindowProc rejected unauthorized target {p:#x}");
+    set_error(e::INVALID_PARAMETER);
+    0
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

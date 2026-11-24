@@ -882,14 +882,11 @@ pub unsafe extern "win64" fn ReplyMessage(_r: LRESULT) -> BOOL {
 }
 
 pub unsafe extern "win64" fn CallWindowProcW(p: usize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if p == 0 {
-        return 0;
-    }
-    crate::call_guest8(p, hwnd as u64, msg as u64, wparam as u64, lparam as u64, 0, 0, 0, 0) as LRESULT
+    super::dispatch_wndproc(p, hwnd, msg, wparam, lparam)
 }
 
 pub unsafe extern "win64" fn CallWindowProcA(p: usize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    CallWindowProcW(p, hwnd, msg, wparam, lparam)
+    super::dispatch_wndproc(p, hwnd, msg, wparam, lparam)
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1074,134 @@ mod tests {
             assert_eq!(r3, WAIT_OBJECT_0);
 
             assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
+            crate::teb::uninstall();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn call_window_proc_requires_typed_wndproc_or_validated_guest_target() {
+        use crate::kernel32::memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static UNREG_HITS: AtomicUsize = AtomicUsize::new(0);
+        static TYPED_HITS: AtomicUsize = AtomicUsize::new(0);
+        static GUEST_DISPATCH_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "win64" fn unregistered_host_fn(
+            _hwnd: HWND,
+            _msg: u32,
+            _wp: WPARAM,
+            _lp: LPARAM,
+        ) -> LRESULT {
+            UNREG_HITS.fetch_add(1, Ordering::SeqCst);
+            0x7777
+        }
+
+        unsafe extern "win64" fn registered_typed_proc(
+            _hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            TYPED_HITS.fetch_add(1, Ordering::SeqCst);
+            (msg as isize) + (wp as isize) + lp
+        }
+
+        unsafe fn mock_guest_dispatcher(
+            va: u64,
+            _rcx: u64,
+            rdx: u64,
+            r8: u64,
+            r9: u64,
+            _a5: u64,
+            _a6: u64,
+            _a7: u64,
+            _a8: u64,
+        ) -> u64 {
+            GUEST_DISPATCH_TARGET.store(va as usize, Ordering::SeqCst);
+            0x1000 + rdx + r8 + r9
+        }
+
+        std::thread::spawn(|| unsafe {
+            UNREG_HITS.store(0, Ordering::SeqCst);
+            TYPED_HITS.store(0, Ordering::SeqCst);
+            GUEST_DISPATCH_TARGET.store(0, Ordering::SeqCst);
+
+            // 1. Unregistered raw host function pointer is rejected BEFORE invocation (both W & A).
+            let raw_host = unregistered_host_fn as *const () as usize;
+            crate::teb::set_last_error(0);
+            assert_eq!(CallWindowProcW(raw_host, std::ptr::null_mut(), wm::USER, 1, 2), 0);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+            assert_eq!(UNREG_HITS.load(Ordering::SeqCst), 0);
+
+            crate::teb::set_last_error(0);
+            assert_eq!(CallWindowProcA(raw_host, std::ptr::null_mut(), wm::USER, 1, 2), 0);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+            assert_eq!(UNREG_HITS.load(Ordering::SeqCst), 0);
+
+            // 2. Explicitly registered typed host WNDPROC works via its opaque 0xFFFFxxxx handle,
+            //    and the raw host pointer itself remains rejected.
+            let handle = super::super::register_typed_host_wndproc(registered_typed_proc);
+            assert_eq!(handle >> 16, 0xFFFF);
+            assert_ne!(handle, registered_typed_proc as *const () as usize);
+            assert_eq!(
+                CallWindowProcW(handle, std::ptr::null_mut(), wm::USER, 10, 20),
+                (wm::USER as isize) + 30
+            );
+            assert_eq!(TYPED_HITS.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                CallWindowProcW(registered_typed_proc as *const () as usize, std::ptr::null_mut(), wm::USER, 10, 20),
+                0
+            );
+            assert_eq!(TYPED_HITS.load(Ordering::SeqCst), 1);
+
+            // 3. Built-in opaque WNDPROC handles (e.g. DefWindowProcW, Edit) work directly.
+            assert_eq!(
+                CallWindowProcW(super::super::WNDPROC_HANDLE_EDIT, std::ptr::null_mut(), wm::GETDLGCODE, 0, 0),
+                0x0001 | 0x0080 // DLGC_WANTARROWS | DLGC_WANTCHARS
+            );
+
+            // 4. Guest VirtualAlloc executable page is rejected when no guest dispatcher is active,
+            //    non-executable RW guest page is always rejected, and executable guest page is
+            //    dispatched when a guest dispatcher is active.
+            let rw_page = VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            let rwx_page = VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            assert!(!rw_page.is_null() && !rwx_page.is_null());
+
+            // No guest dispatcher installed -> even executable guest memory is rejected safely.
+            assert_eq!(CallWindowProcW(rwx_page as usize, std::ptr::null_mut(), wm::USER, 3, 4), 0);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            {
+                let _disp = crate::tests::install_test_guest_dispatcher(Some(mock_guest_dispatcher));
+                // Non-executable guest memory still rejected even with guest dispatcher active.
+                crate::teb::set_last_error(0);
+                assert_eq!(CallWindowProcW(rw_page as usize, std::ptr::null_mut(), wm::USER, 3, 4), 0);
+                assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+                assert_eq!(GUEST_DISPATCH_TARGET.load(Ordering::SeqCst), 0);
+
+                // Unregistered raw host function still rejected even with guest dispatcher active.
+                crate::teb::set_last_error(0);
+                assert_eq!(CallWindowProcW(raw_host, std::ptr::null_mut(), wm::USER, 3, 4), 0);
+                assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+                assert_eq!(UNREG_HITS.load(Ordering::SeqCst), 0);
+                assert_eq!(GUEST_DISPATCH_TARGET.load(Ordering::SeqCst), 0);
+
+                // Validated executable guest VM target dispatches cleanly through guest dispatcher.
+                assert_eq!(
+                    CallWindowProcW(rwx_page as usize, std::ptr::null_mut(), wm::USER, 3, 4),
+                    (0x1000 + wm::USER as isize + 7)
+                );
+                assert_eq!(GUEST_DISPATCH_TARGET.load(Ordering::SeqCst), rwx_page as usize);
+            }
+
+            assert_eq!(VirtualFree(rw_page, 0, MEM_RELEASE), TRUE);
+            assert_eq!(VirtualFree(rwx_page, 0, MEM_RELEASE), TRUE);
             crate::teb::uninstall();
         })
         .join()

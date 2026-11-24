@@ -85,7 +85,7 @@ pub(crate) fn forget_dialog(hwnd: usize) {
 // Built-in system dialog & control window classes
 // ---------------------------------------------------------------------------
 
-unsafe extern "win64" fn button_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+pub(crate) unsafe extern "win64" fn button_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let h = hwnd as usize;
     match msg {
         wm::BM_GETCHECK => button_checks().lock().unwrap_or_else(|e| e.into_inner()).get(&h).copied().unwrap_or(0) as LRESULT,
@@ -121,29 +121,20 @@ unsafe extern "win64" fn button_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
-unsafe extern "win64" fn edit_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+pub(crate) unsafe extern "win64" fn edit_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         wm::GETDLGCODE => DLGC_WANTARROWS | DLGC_WANTCHARS,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-unsafe extern "win64" fn default_control_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+pub(crate) unsafe extern "win64" fn default_control_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 fn ensure_dialog_classes() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let def_dlg = DefDlgProcW as *const () as usize;
-        let btn_proc = button_wndproc as *const () as usize;
-        let edit_proc = edit_wndproc as *const () as usize;
-        let ctrl_proc = default_control_wndproc as *const () as usize;
-
-        for va in [def_dlg, btn_proc, edit_proc, ctrl_proc] {
-            crate::register_native_va(va as u64, va);
-        }
-
         let reg = |name: &str, wndproc: usize, wnd_extra: i32| {
             if class::find(&ClassName::Name(name.to_string())).is_none() {
                 let _ = class::register(ClassDesc {
@@ -161,13 +152,13 @@ fn ensure_dialog_classes() {
             }
         };
 
-        reg("#32770", def_dlg, DLGWINDOWEXTRA);
-        reg("Button", btn_proc, 0);
-        reg("Edit", edit_proc, 0);
-        reg("Static", ctrl_proc, 0);
-        reg("ListBox", ctrl_proc, 0);
-        reg("ScrollBar", ctrl_proc, 0);
-        reg("ComboBox", ctrl_proc, 0);
+        reg("#32770", super::WNDPROC_HANDLE_DEF_DLG_W, DLGWINDOWEXTRA);
+        reg("Button", super::WNDPROC_HANDLE_BUTTON, 0);
+        reg("Edit", super::WNDPROC_HANDLE_EDIT, 0);
+        reg("Static", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
+        reg("ListBox", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
+        reg("ScrollBar", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
+        reg("ComboBox", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
     });
 }
 
@@ -1632,7 +1623,7 @@ mod tests {
             let owner_cls = crate::strings::to_wide_z("Aw2ModalOwnerCls");
             let wc = class::WNDCLASS {
                 style: 0,
-                wndproc: DefWindowProcW as *const () as usize,
+                wndproc: super::super::WNDPROC_HANDLE_DEF_WINDOW_W,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,
@@ -1784,9 +1775,8 @@ mod tests {
         let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!crate::macos::active(), "unit tests must stay headless");
         std::thread::spawn(|| unsafe {
-            let ctrl_proc_va = dlgcode_test_ctrl_proc as *const () as usize;
+            let ctrl_proc_handle = super::super::register_typed_host_wndproc(dlgcode_test_ctrl_proc);
             let dlg_proc_va = dlgcode_test_dlg_proc as *const () as usize;
-            crate::register_native_va(ctrl_proc_va as u64, ctrl_proc_va);
             crate::register_native_va(dlg_proc_va as u64, dlg_proc_va);
 
             let tmpl = build_std_template();
@@ -1804,7 +1794,8 @@ mod tests {
             assert!(!h_ok.is_null());
 
             // Subclass the Edit control with our headless WM_GETDLGCODE test wndproc (GWLP_WNDPROC = -4).
-            SetWindowLongPtrW(h_edit, -4, ctrl_proc_va as isize);
+            let orig_edit_proc = SetWindowLongPtrW(h_edit, -4, ctrl_proc_handle as isize) as usize;
+            assert_eq!(orig_edit_proc, super::super::WNDPROC_HANDLE_EDIT);
 
             let make_key_msg = |hwnd: HWND, vk: usize| MSG {
                 hwnd: hwnd as usize,
@@ -2075,13 +2066,12 @@ mod tests {
         let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!crate::macos::active(), "unit tests must stay headless");
         std::thread::spawn(|| unsafe {
-            let proc_va = create_param_capture_proc as *const () as usize;
-            crate::register_native_va(proc_va as u64, proc_va);
+            let proc_handle = super::super::register_typed_host_wndproc(create_param_capture_proc);
             let cls_name = "Aw2DlgCreateParamCtrl";
             let cls_w = crate::strings::to_wide_z(cls_name);
             let wc = class::WNDCLASS {
                 style: 0,
-                wndproc: proc_va,
+                wndproc: proc_handle,
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: 0,

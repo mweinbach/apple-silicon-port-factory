@@ -1494,11 +1494,15 @@ pub unsafe extern "win64" fn WSAIoctl(
                 return err(WSAEFAULT, SOCKET_ERROR);
             }
             let guid = std::ptr::read_unaligned(in_buf as *const [u8; 16]);
-            let Some(ptr) = lookup_extension_fn(&guid) else {
+            let Some(ext) = lookup_extension_kind(&guid) else {
                 return err(WSAEOPNOTSUPP, SOCKET_ERROR);
             };
-            crate::register_native_va(ptr as u64, ptr);
-            std::ptr::write_unaligned(out_buf as *mut usize, ptr);
+            let Some(thunk_va) = resolve_wsa_extension_thunk(ext) else {
+                // Never disclose or fall back to a raw internal host code pointer if
+                // guest thunk provisioning is unavailable.
+                return err(WSAEOPNOTSUPP, SOCKET_ERROR);
+            };
+            std::ptr::write_unaligned(out_buf as *mut usize, thunk_va);
             if !bytes_returned.is_null() {
                 std::ptr::write_unaligned(bytes_returned, std::mem::size_of::<usize>() as u32);
             }
@@ -3572,20 +3576,39 @@ const WSAID_GETACCEPTEXSOCKADDRS: [u8; 16] = [
     0xf2, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92,
 ];
 
-fn lookup_extension_fn(guid: &[u8; 16]) -> Option<usize> {
+fn lookup_extension_kind(guid: &[u8; 16]) -> Option<crate::WsaExtension> {
     if guid == &WSAID_ACCEPTEX {
-        Some(ext_accept_ex as *const () as usize)
+        Some(crate::WsaExtension::AcceptEx)
     } else if guid == &WSAID_CONNECTEX {
-        Some(ext_connect_ex as *const () as usize)
+        Some(crate::WsaExtension::ConnectEx)
     } else if guid == &WSAID_DISCONNECTEX {
-        Some(ext_disconnect_ex as *const () as usize)
+        Some(crate::WsaExtension::DisconnectEx)
     } else if guid == &WSAID_TRANSMITFILE {
-        Some(ext_transmit_file as *const () as usize)
+        Some(crate::WsaExtension::TransmitFile)
     } else if guid == &WSAID_GETACCEPTEXSOCKADDRS {
-        Some(ext_get_accept_ex_sockaddrs as *const () as usize)
+        Some(crate::WsaExtension::GetAcceptExSockaddrs)
     } else {
         None
     }
+}
+
+/// Fixed internal ABI-correct implementation address for a verified Winsock2 extension.
+/// Used exclusively by the loader when provisioning immutable guest-visible thunks; never
+/// returned directly to guest memory.
+pub fn wsa_extension_target(ext: crate::WsaExtension) -> usize {
+    match ext {
+        crate::WsaExtension::AcceptEx => ext_accept_ex as *const () as usize,
+        crate::WsaExtension::ConnectEx => ext_connect_ex as *const () as usize,
+        crate::WsaExtension::DisconnectEx => ext_disconnect_ex as *const () as usize,
+        crate::WsaExtension::TransmitFile => ext_transmit_file as *const () as usize,
+        crate::WsaExtension::GetAcceptExSockaddrs => ext_get_accept_ex_sockaddrs as *const () as usize,
+    }
+}
+
+/// Resolve a stable guest-visible thunk VA for `ext` via the loader (never returning 0 or a
+/// raw host code pointer).
+fn resolve_wsa_extension_thunk(ext: crate::WsaExtension) -> Option<usize> {
+    crate::resolve_wsa_extension_thunk(ext, wsa_extension_target(ext))
 }
 
 #[repr(C)]
@@ -5188,45 +5211,160 @@ mod tests {
         }
     }
 
-    type AcceptExFn = unsafe extern "win64" fn(
-        usize,
-        usize,
-        *mut u8,
-        u32,
-        u32,
-        u32,
-        *mut u32,
-        *mut OVERLAPPED,
-    ) -> BOOL;
-    type GetAcceptExSockaddrsFn = unsafe extern "win64" fn(
-        *const u8,
-        u32,
-        u32,
-        u32,
-        *mut *mut u8,
-        *mut i32,
-        *mut *mut u8,
-        *mut i32,
-    );
-    type ConnectExFn = unsafe extern "win64" fn(
-        usize,
-        *const u8,
-        i32,
-        *const u8,
-        u32,
-        *mut u32,
-        *mut OVERLAPPED,
-    ) -> BOOL;
-    type DisconnectExFn = unsafe extern "win64" fn(usize, *mut OVERLAPPED, u32, u32) -> BOOL;
-    type TransmitFileFn = unsafe extern "win64" fn(
-        usize,
-        HANDLE,
-        u32,
-        u32,
-        *mut OVERLAPPED,
-        *const c_void,
-        u32,
-    ) -> BOOL;
+    unsafe fn test_wsa_ext_guest_dispatcher(
+        va: u64,
+        rcx: u64,
+        rdx: u64,
+        r8: u64,
+        r9: u64,
+        arg5: u64,
+        arg6: u64,
+        arg7: u64,
+        arg8: u64,
+    ) -> u64 {
+        let va_usize = va as usize;
+        for ext in crate::WsaExtension::ALL {
+            if va_usize
+                == crate::tests::TEST_WSA_EXT_THUNK_BASE
+                    + (ext as usize) * crate::tests::TEST_WSA_EXT_THUNK_STRIDE
+            {
+                let target = wsa_extension_target(ext);
+                let f: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(target);
+                return f(rcx, rdx, r8, r9, arg5, arg6, arg7, arg8);
+            }
+        }
+        panic!("unexpected test guest dispatch target {va:#x}");
+    }
+
+    struct TestWsaExtThunksGuard {
+        _ext: crate::tests::ScopedTestWsaExtGuard,
+        _disp: crate::tests::ScopedGuestDispatcherGuard,
+    }
+
+    impl TestWsaExtThunksGuard {
+        fn install() -> Self {
+            let ext = crate::tests::enable_test_wsa_ext_thunks();
+            let disp = crate::tests::install_test_guest_dispatcher(Some(
+                test_wsa_ext_guest_dispatcher,
+            ));
+            Self { _ext: ext, _disp: disp }
+        }
+    }
+
+    unsafe fn call_ext_accept_ex(
+        thunk: usize,
+        s_listen: usize,
+        s_accept: usize,
+        out_buf: *mut u8,
+        recv_data_len: u32,
+        local_addr_len: u32,
+        remote_addr_len: u32,
+        bytes_received: *mut u32,
+        ov: *mut OVERLAPPED,
+    ) -> BOOL {
+        crate::call_guest8(
+            thunk,
+            s_listen as u64,
+            s_accept as u64,
+            out_buf as u64,
+            recv_data_len as u64,
+            local_addr_len as u64,
+            remote_addr_len as u64,
+            bytes_received as u64,
+            ov as u64,
+        ) as BOOL
+    }
+
+    unsafe fn call_ext_get_accept_ex_sockaddrs(
+        thunk: usize,
+        out_buf: *const u8,
+        recv_data_len: u32,
+        local_addr_len: u32,
+        remote_addr_len: u32,
+        local_sa: *mut *mut u8,
+        local_sa_len: *mut i32,
+        remote_sa: *mut *mut u8,
+        remote_sa_len: *mut i32,
+    ) {
+        let _ = crate::call_guest8(
+            thunk,
+            out_buf as u64,
+            recv_data_len as u64,
+            local_addr_len as u64,
+            remote_addr_len as u64,
+            local_sa as u64,
+            local_sa_len as u64,
+            remote_sa as u64,
+            remote_sa_len as u64,
+        );
+    }
+
+    unsafe fn call_ext_connect_ex(
+        thunk: usize,
+        s: usize,
+        name: *const u8,
+        namelen: i32,
+        send_buf: *const u8,
+        send_len: u32,
+        bytes_sent: *mut u32,
+        ov: *mut OVERLAPPED,
+    ) -> BOOL {
+        crate::call_guest8(
+            thunk,
+            s as u64,
+            name as u64,
+            namelen as u64,
+            send_buf as u64,
+            send_len as u64,
+            bytes_sent as u64,
+            ov as u64,
+            0,
+        ) as BOOL
+    }
+
+    unsafe fn call_ext_disconnect_ex(
+        thunk: usize,
+        s: usize,
+        ov: *mut OVERLAPPED,
+        flags: u32,
+        reserved: u32,
+    ) -> BOOL {
+        crate::call_guest8(
+            thunk,
+            s as u64,
+            ov as u64,
+            flags as u64,
+            reserved as u64,
+            0,
+            0,
+            0,
+            0,
+        ) as BOOL
+    }
+
+    unsafe fn call_ext_transmit_file(
+        thunk: usize,
+        s: usize,
+        h_file: HANDLE,
+        n_bytes: u32,
+        n_bytes_per_send: u32,
+        ov: *mut OVERLAPPED,
+        buffers: *const c_void,
+        flags: u32,
+    ) -> BOOL {
+        crate::call_guest8(
+            thunk,
+            s as u64,
+            h_file as u64,
+            n_bytes as u64,
+            n_bytes_per_send as u64,
+            ov as u64,
+            buffers as u64,
+            flags as u64,
+            0,
+        ) as BOOL
+    }
 
     unsafe fn query_ext_ptr(s: usize, guid: &[u8; 16]) -> Result<usize, i32> {
         const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
@@ -5285,23 +5423,58 @@ mod tests {
             assert_eq!(WSAGetLastError(), WSAENOTSOCK as i32);
 
             let s = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            let s2 = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
             assert_ne!(s, INVALID_SOCKET);
+            assert_ne!(s2, INVALID_SOCKET);
 
-            // All 5 Windows extension GUIDs resolve to non-null pointers.
-            let p_accept = query_ext_ptr(s, &WSAID_ACCEPTEX).unwrap();
-            let p_connect = query_ext_ptr(s, &WSAID_CONNECTEX).unwrap();
-            let p_disconnect = query_ext_ptr(s, &WSAID_DISCONNECTEX).unwrap();
-            let p_transmit = query_ext_ptr(s, &WSAID_TRANSMITFILE).unwrap();
-            let p_sockaddrs = query_ext_ptr(s, &WSAID_GETACCEPTEXSOCKADDRS).unwrap();
-            assert_eq!(p_accept, ext_accept_ex as *const () as usize);
-            assert_eq!(p_connect, ext_connect_ex as *const () as usize);
-            assert_eq!(p_disconnect, ext_disconnect_ex as *const () as usize);
-            assert_eq!(p_transmit, ext_transmit_file as *const () as usize);
-            assert_eq!(p_sockaddrs, ext_get_accept_ex_sockaddrs as *const () as usize);
+            // Without a thunk provider, WSAIoctl must fail with WSAEOPNOTSUPP rather than
+            // falling back to disclosing raw internal host code pointers.
+            for guid in [
+                &WSAID_ACCEPTEX,
+                &WSAID_CONNECTEX,
+                &WSAID_DISCONNECTEX,
+                &WSAID_TRANSMITFILE,
+                &WSAID_GETACCEPTEXSOCKADDRS,
+            ] {
+                assert_eq!(query_ext_ptr(s, guid), Err(WSAEOPNOTSUPP as i32));
+            }
 
-            // Unknown GUID -> WSAEOPNOTSUPP
-            let bad_guid = [0xAAu8; 16];
-            assert_eq!(query_ext_ptr(s, &bad_guid), Err(WSAEOPNOTSUPP as i32));
+            // With thunk provisioning active, all 5 Windows extension GUIDs resolve to stable,
+            // distinct guest-visible thunk tokens that never equal raw internal host pointers.
+            {
+                let _ext = TestWsaExtThunksGuard::install();
+                let p_accept = query_ext_ptr(s, &WSAID_ACCEPTEX).unwrap();
+                let p_connect = query_ext_ptr(s, &WSAID_CONNECTEX).unwrap();
+                let p_disconnect = query_ext_ptr(s, &WSAID_DISCONNECTEX).unwrap();
+                let p_transmit = query_ext_ptr(s, &WSAID_TRANSMITFILE).unwrap();
+                let p_sockaddrs = query_ext_ptr(s, &WSAID_GETACCEPTEXSOCKADDRS).unwrap();
+
+                let raw_targets = [
+                    ext_accept_ex as *const () as usize,
+                    ext_connect_ex as *const () as usize,
+                    ext_disconnect_ex as *const () as usize,
+                    ext_transmit_file as *const () as usize,
+                    ext_get_accept_ex_sockaddrs as *const () as usize,
+                ];
+                let thunks = [p_accept, p_connect, p_disconnect, p_transmit, p_sockaddrs];
+                for (&th, &raw) in thunks.iter().zip(raw_targets.iter()) {
+                    assert_ne!(th, 0);
+                    assert_ne!(th, raw, "WSAIoctl must never disclose raw host function pointer");
+                }
+                // All 5 thunks are pairwise distinct and stable across repeated queries/sockets.
+                let unique: std::collections::HashSet<usize> = thunks.iter().copied().collect();
+                assert_eq!(unique.len(), 5);
+                assert_eq!(query_ext_ptr(s, &WSAID_ACCEPTEX).unwrap(), p_accept);
+                assert_eq!(query_ext_ptr(s2, &WSAID_ACCEPTEX).unwrap(), p_accept);
+                assert_eq!(query_ext_ptr(s2, &WSAID_CONNECTEX).unwrap(), p_connect);
+                assert_eq!(query_ext_ptr(s2, &WSAID_DISCONNECTEX).unwrap(), p_disconnect);
+                assert_eq!(query_ext_ptr(s2, &WSAID_TRANSMITFILE).unwrap(), p_transmit);
+                assert_eq!(query_ext_ptr(s2, &WSAID_GETACCEPTEXSOCKADDRS).unwrap(), p_sockaddrs);
+
+                // Unknown GUID -> WSAEOPNOTSUPP
+                let bad_guid = [0xAAu8; 16];
+                assert_eq!(query_ext_ptr(s, &bad_guid), Err(WSAEOPNOTSUPP as i32));
+            }
 
             // Null / undersized input or output buffer -> WSAEFAULT
             assert_eq!(
@@ -5352,6 +5525,7 @@ mod tests {
             );
             assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
 
+            assert_eq!(closesocket(s2), 0);
             assert_eq!(closesocket(s), 0);
         }
     }
@@ -5361,6 +5535,7 @@ mod tests {
         use crate::kernel32::file::{CreateIoCompletionPort, GetQueuedCompletionStatus};
         use crate::kernel32::threads::CloseHandle;
 
+        let _ext = TestWsaExtThunksGuard::install();
         unsafe {
             let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
             assert!(!iocp.is_null());
@@ -5375,10 +5550,12 @@ mod tests {
             assert_eq!(getsockname(srv, srv_sa.as_mut_ptr(), &mut srv_slen), 0);
             assert_eq!(listen(srv, 8), 0);
 
-            let accept_ex: AcceptExFn = std::mem::transmute(query_ext_ptr(srv, &WSAID_ACCEPTEX).unwrap());
-            let get_sockaddrs: GetAcceptExSockaddrsFn =
-                std::mem::transmute(query_ext_ptr(srv, &WSAID_GETACCEPTEXSOCKADDRS).unwrap());
-            let connect_ex: ConnectExFn = std::mem::transmute(query_ext_ptr(srv, &WSAID_CONNECTEX).unwrap());
+            let accept_ex = query_ext_ptr(srv, &WSAID_ACCEPTEX).unwrap();
+            let get_sockaddrs = query_ext_ptr(srv, &WSAID_GETACCEPTEXSOCKADDRS).unwrap();
+            let connect_ex = query_ext_ptr(srv, &WSAID_CONNECTEX).unwrap();
+            assert_ne!(accept_ex, ext_accept_ex as *const () as usize);
+            assert_ne!(get_sockaddrs, ext_get_accept_ex_sockaddrs as *const () as usize);
+            assert_ne!(connect_ex, ext_connect_ex as *const () as usize);
 
             // Case 1: 0 initial payload
             let acc1 = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
@@ -5386,7 +5563,7 @@ mod tests {
             let mut acc_buf1 = [0u8; 64];
             let mut ov_acc1: OVERLAPPED = std::mem::zeroed();
             let mut got1 = 0u32;
-            let r_acc1 = accept_ex(srv, acc1, acc_buf1.as_mut_ptr(), 0, 32, 32, &mut got1, &mut ov_acc1);
+            let r_acc1 = call_ext_accept_ex(accept_ex, srv, acc1, acc_buf1.as_mut_ptr(), 0, 32, 32, &mut got1, &mut ov_acc1);
             assert_eq!(r_acc1, FALSE);
             assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
 
@@ -5398,7 +5575,7 @@ mod tests {
             let mut ov_cli1: OVERLAPPED = std::mem::zeroed();
             let mut sent1 = 0u32;
             assert_eq!(
-                connect_ex(cli1, srv_sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent1, &mut ov_cli1),
+                call_ext_connect_ex(connect_ex, cli1, srv_sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent1, &mut ov_cli1),
                 FALSE
             );
             assert_eq!(WSAGetLastError(), WSAEINVAL as i32);
@@ -5409,7 +5586,7 @@ mod tests {
             let mut cli1_llen = 16i32;
             assert_eq!(getsockname(cli1, cli1_local.as_mut_ptr(), &mut cli1_llen), 0);
 
-            let r_cli1 = connect_ex(cli1, srv_sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent1, &mut ov_cli1);
+            let r_cli1 = call_ext_connect_ex(connect_ex, cli1, srv_sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent1, &mut ov_cli1);
             assert!(r_cli1 == TRUE || WSAGetLastError() == WSA_IO_PENDING as i32);
 
             // Drain both completions (AcceptEx on key 0x1111 and ConnectEx on key 0x2222).
@@ -5446,7 +5623,17 @@ mod tests {
             let mut lsa_len = 0i32;
             let mut rsa: *mut u8 = std::ptr::null_mut();
             let mut rsa_len = 0i32;
-            get_sockaddrs(acc_buf1.as_ptr(), 0, 32, 32, &mut lsa, &mut lsa_len, &mut rsa, &mut rsa_len);
+            call_ext_get_accept_ex_sockaddrs(
+                get_sockaddrs,
+                acc_buf1.as_ptr(),
+                0,
+                32,
+                32,
+                &mut lsa,
+                &mut lsa_len,
+                &mut rsa,
+                &mut rsa_len,
+            );
             assert_eq!(lsa_len, 16);
             assert_eq!(rsa_len, 16);
             assert_eq!(std::slice::from_raw_parts(lsa, 16), &srv_sa);
@@ -5459,7 +5646,7 @@ mod tests {
             let mut ov_acc2: OVERLAPPED = std::mem::zeroed();
             let mut got2 = 0u32;
             assert_eq!(
-                accept_ex(srv, acc2, acc_buf2.as_mut_ptr(), 64, 32, 32, &mut got2, &mut ov_acc2),
+                call_ext_accept_ex(accept_ex, srv, acc2, acc_buf2.as_mut_ptr(), 64, 32, 32, &mut got2, &mut ov_acc2),
                 FALSE
             );
             assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
@@ -5472,7 +5659,8 @@ mod tests {
             let initial_msg = b"hello-connectex-payload";
             let mut ov_cli2: OVERLAPPED = std::mem::zeroed();
             let mut sent2 = 0u32;
-            let r_cli2 = connect_ex(
+            let r_cli2 = call_ext_connect_ex(
+                connect_ex,
                 cli2,
                 srv_sa.as_ptr(),
                 16,
@@ -5505,7 +5693,17 @@ mod tests {
             }
             assert!(saw_acc2 && saw_cli2);
 
-            get_sockaddrs(acc_buf2.as_ptr(), 64, 32, 32, &mut lsa, &mut lsa_len, &mut rsa, &mut rsa_len);
+            call_ext_get_accept_ex_sockaddrs(
+                get_sockaddrs,
+                acc_buf2.as_ptr(),
+                64,
+                32,
+                32,
+                &mut lsa,
+                &mut lsa_len,
+                &mut rsa,
+                &mut rsa_len,
+            );
             assert_eq!(lsa_len, 16);
             assert_eq!(rsa_len, 16);
             assert_eq!(std::slice::from_raw_parts(lsa, 16), &srv_sa);
@@ -5696,8 +5894,9 @@ mod tests {
             let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
             assert_eq!(CreateIoCompletionPort(cli as HANDLE, iocp, 0x7F7F, 0), iocp);
 
-            let transmit_file: TransmitFileFn =
-                std::mem::transmute(query_ext_ptr(cli, &WSAID_TRANSMITFILE).unwrap());
+            let _ext = TestWsaExtThunksGuard::install();
+            let transmit_file = query_ext_ptr(cli, &WSAID_TRANSMITFILE).unwrap();
+            assert_ne!(transmit_file, ext_transmit_file as *const () as usize);
 
             let head = b"[HEAD]";
             let tail = b"[TAIL]";
@@ -5711,7 +5910,8 @@ mod tests {
             };
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.offset = 10; // skip "0123456789" -> read "BODY-CONTENT-END" (16 bytes)
-            let ok = transmit_file(
+            let ok = call_ext_transmit_file(
+                transmit_file,
                 cli,
                 h_file,
                 0, // entire remaining file from offset 10
@@ -5766,16 +5966,18 @@ mod tests {
             let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
             assert_eq!(CreateIoCompletionPort(cli as HANDLE, iocp, 0x5555, 0), iocp);
 
-            let connect_ex: ConnectExFn = std::mem::transmute(query_ext_ptr(cli, &WSAID_CONNECTEX).unwrap());
-            let disconnect_ex: DisconnectExFn =
-                std::mem::transmute(query_ext_ptr(cli, &WSAID_DISCONNECTEX).unwrap());
+            let _ext = TestWsaExtThunksGuard::install();
+            let connect_ex = query_ext_ptr(cli, &WSAID_CONNECTEX).unwrap();
+            let disconnect_ex = query_ext_ptr(cli, &WSAID_DISCONNECTEX).unwrap();
+            assert_ne!(connect_ex, ext_connect_ex as *const () as usize);
+            assert_ne!(disconnect_ex, ext_disconnect_ex as *const () as usize);
 
             // First connection
             let bind_sa = loopback_sa(0);
             assert_eq!(bind(cli, bind_sa.as_ptr(), 16), 0);
             let mut ov1: OVERLAPPED = std::mem::zeroed();
             let mut sent = 0u32;
-            let rc1 = connect_ex(cli, sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent, &mut ov1);
+            let rc1 = call_ext_connect_ex(connect_ex, cli, sa.as_ptr(), 16, std::ptr::null(), 0, &mut sent, &mut ov1);
             assert!(rc1 == TRUE || WSAGetLastError() == WSA_IO_PENDING as i32);
             let acc1 = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
             assert_ne!(acc1, INVALID_SOCKET);
@@ -5788,7 +5990,7 @@ mod tests {
 
             // DisconnectEx with TF_REUSE_SOCKET -> resets socket fd and keeps IOCP association.
             let mut ov_disc: OVERLAPPED = std::mem::zeroed();
-            assert_eq!(disconnect_ex(cli, &mut ov_disc, TF_REUSE_SOCKET, 0), TRUE);
+            assert_eq!(call_ext_disconnect_ex(disconnect_ex, cli, &mut ov_disc, TF_REUSE_SOCKET, 0), TRUE);
             assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
             assert_eq!(ov_out, &mut ov_disc as *mut OVERLAPPED);
             assert_eq!(closesocket(acc1), 0);
@@ -5797,7 +5999,7 @@ mod tests {
             assert_eq!(bind(cli, bind_sa.as_ptr(), 16), 0);
             let mut ov2: OVERLAPPED = std::mem::zeroed();
             let payload = b"reused!";
-            let rc2 = connect_ex(cli, sa.as_ptr(), 16, payload.as_ptr(), payload.len() as u32, &mut sent, &mut ov2);
+            let rc2 = call_ext_connect_ex(connect_ex, cli, sa.as_ptr(), 16, payload.as_ptr(), payload.len() as u32, &mut sent, &mut ov2);
             assert!(rc2 == TRUE || WSAGetLastError() == WSA_IO_PENDING as i32);
             let acc2 = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
             assert_ne!(acc2, INVALID_SOCKET);
@@ -5835,7 +6037,8 @@ mod tests {
             assert_eq!(getsockname(srv, sa.as_mut_ptr(), &mut slen), 0);
             assert_eq!(listen(srv, 4), 0);
 
-            let accept_ex: AcceptExFn = std::mem::transmute(query_ext_ptr(srv, &WSAID_ACCEPTEX).unwrap());
+            let _ext = TestWsaExtThunksGuard::install();
+            let accept_ex = query_ext_ptr(srv, &WSAID_ACCEPTEX).unwrap();
 
             // 1. Cancel pending AcceptEx with CancelIoEx(srv, &ov_acc).
             let acc_slot = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
@@ -5843,7 +6046,7 @@ mod tests {
             let mut ov_acc: OVERLAPPED = std::mem::zeroed();
             let mut got = 0u32;
             assert_eq!(
-                accept_ex(srv, acc_slot, acc_buf.as_mut_ptr(), 0, 32, 32, &mut got, &mut ov_acc),
+                call_ext_accept_ex(accept_ex, srv, acc_slot, acc_buf.as_mut_ptr(), 0, 32, 32, &mut got, &mut ov_acc),
                 FALSE
             );
             assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);

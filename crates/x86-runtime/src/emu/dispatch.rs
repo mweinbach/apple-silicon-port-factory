@@ -152,7 +152,18 @@ pub unsafe fn call_va8(
 ) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        let addr = resolve_host_callable(va_or_addr).unwrap_or_else(|| to_mapped_addr(va_or_addr));
+        let addr = match resolve_host_callable(va_or_addr) {
+            Some(h) => h,
+            None => {
+                if crate::exe::in_host_text(va_or_addr as usize) {
+                    log::error!(
+                        "emu::call_va8: refused unregistered host __TEXT target {va_or_addr:#x}"
+                    );
+                    return 0;
+                }
+                to_mapped_addr(va_or_addr)
+            }
+        };
         let f: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
             core::mem::transmute(addr);
         f(rcx, rdx, r8, r9, arg5, arg6, arg7, arg8)
@@ -262,6 +273,11 @@ unsafe fn call_va8_bridge(
             }
             return r_gpr;
         }
+    }
+    if crate::exe::in_host_text(clean_va as usize) {
+        log::error!("emu::call_va8: refused unregistered host __TEXT target {clean_va:#x}");
+        c.rax_in.set(prev_rax);
+        return 0;
     }
     #[cfg(target_arch = "aarch64")]
     super::aot::record_runtime_callback(clean_va, super::aot::CallbackKind::GenericCallback);

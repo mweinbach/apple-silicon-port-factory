@@ -348,6 +348,40 @@ impl std::fmt::Display for ProcName<'_> {
     }
 }
 
+/// Closed set of verified Winsock2 `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` extensions.
+///
+/// Only these fixed extensions can be provisioned as guest-visible, guest-callable thunks;
+/// this intentionally never forms a generic arbitrary-target host trampoline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum WsaExtension {
+    AcceptEx = 0,
+    ConnectEx = 1,
+    DisconnectEx = 2,
+    TransmitFile = 3,
+    GetAcceptExSockaddrs = 4,
+}
+
+impl WsaExtension {
+    pub const ALL: [WsaExtension; 5] = [
+        WsaExtension::AcceptEx,
+        WsaExtension::ConnectEx,
+        WsaExtension::DisconnectEx,
+        WsaExtension::TransmitFile,
+        WsaExtension::GetAcceptExSockaddrs,
+    ];
+
+    pub const fn symbol_name(self) -> &'static str {
+        match self {
+            WsaExtension::AcceptEx => "ws2_32!AcceptEx",
+            WsaExtension::ConnectEx => "ws2_32!ConnectEx",
+            WsaExtension::DisconnectEx => "ws2_32!DisconnectEx",
+            WsaExtension::TransmitFile => "ws2_32!TransmitFile",
+            WsaExtension::GetAcceptExSockaddrs => "ws2_32!GetAcceptExSockaddrs",
+        }
+    }
+}
+
 /// Services the PE loader provides to the Win32 layer.
 pub trait LoaderOps: Send + Sync {
     /// `LoadLibraryExW` semantics. Returns the HMODULE or a Win32 error code.
@@ -366,6 +400,12 @@ pub trait LoaderOps: Send + Sync {
     /// `None` = the main executable.
     fn get_module_handle(&self, name: Option<&str>) -> Option<usize>;
     fn get_proc_address(&self, hmod: usize, name: ProcName<'_>) -> Option<usize>;
+    /// Provision and return a stable, guest-visible, guest-callable thunk VA for one of the
+    /// fixed verified Winsock2 extensions (never a raw host code pointer). Returns `None` if
+    /// thunk provisioning is unavailable.
+    fn wsa_extension_thunk(&self, _ext: WsaExtension) -> Option<usize> {
+        None
+    }
     /// Windows-style full path of a module (`None` = main exe).
     fn module_path(&self, hmod: Option<usize>) -> Option<String>;
     /// HMODULE of the image containing `addr`.
@@ -413,6 +453,17 @@ pub fn loader() -> &'static dyn LoaderOps {
 
 pub fn try_loader() -> Option<&'static dyn LoaderOps> {
     LOADER.get().copied()
+}
+
+/// Resolve a stable guest-visible thunk VA for `ext` via the registered loader (or a
+/// `#[cfg(test)]`-only scoped test provider). Never returns 0 or a raw host code pointer.
+pub(crate) fn resolve_wsa_extension_thunk(ext: WsaExtension, raw_host: usize) -> Option<usize> {
+    #[cfg(test)]
+    let thunk = tests::test_wsa_extension_thunk(ext)
+        .or_else(|| try_loader().and_then(|l| l.wsa_extension_thunk(ext)));
+    #[cfg(not(test))]
+    let thunk = try_loader().and_then(|l| l.wsa_extension_thunk(ext));
+    thunk.filter(|&va| va != 0 && va != raw_host)
 }
 
 /// Symbolize an address via the loader if available.
@@ -1064,5 +1115,32 @@ mod tests {
         let next = f.map_or(0, |func| func as usize);
         let prev = GUEST_DISPATCHER.swap(next, Ordering::AcqRel);
         ScopedGuestDispatcherGuard { prev }
+    }
+
+    pub(crate) const TEST_WSA_EXT_THUNK_BASE: usize = 0x7FFF_E000;
+    pub(crate) const TEST_WSA_EXT_THUNK_STRIDE: usize = 16;
+    static TEST_WSA_EXT_ENABLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn test_wsa_extension_thunk(ext: WsaExtension) -> Option<usize> {
+        if !TEST_WSA_EXT_ENABLED.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(TEST_WSA_EXT_THUNK_BASE + (ext as usize) * TEST_WSA_EXT_THUNK_STRIDE)
+    }
+
+    pub(crate) struct ScopedTestWsaExtGuard {
+        prev: bool,
+    }
+
+    impl Drop for ScopedTestWsaExtGuard {
+        fn drop(&mut self) {
+            TEST_WSA_EXT_ENABLED.store(self.prev, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn enable_test_wsa_ext_thunks() -> ScopedTestWsaExtGuard {
+        let prev = TEST_WSA_EXT_ENABLED.swap(true, Ordering::AcqRel);
+        ScopedTestWsaExtGuard { prev }
     }
 }
