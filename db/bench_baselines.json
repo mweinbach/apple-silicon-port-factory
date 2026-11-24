@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "chips": {
+    "Apple M3 Ultra": {
+      "aot": {
+        "compression_loop": 11.748,
+        "d3d12_draw_heavy_frame": 18.377,
+        "lock_heavy_job_queue": 44.825,
+        "simd_kernel": 42.007
+      },
+      "jit": {
+        "compression_loop": 16.531,
+        "d3d12_draw_heavy_frame": 18.169,
+        "lock_heavy_job_queue": 39.912,
+        "simd_kernel": 41.629
+      }
+    }
+  }
+}

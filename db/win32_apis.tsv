@@ -3590,6 +3590,7 @@ ucrtbase.dll	wcsnlen	-	CRT_STL	win32_rt::ucrt::string::wcsnlen	crates/win32-rt/s
 ucrtbase.dll	wcspbrk	-	CRT_STL	win32_rt::ucrt::string::wcspbrk	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	wcsrtombs	-	CRT_STL	win32_rt::ucrt::convert::wcsrtombs	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	wcsspn	-	CRT_STL	win32_rt::ucrt::string::wcsspn	crates/win32-rt/src/ucrt/string.rs
+ucrtbase.dll	wcsstr	-	CRT_STL	win32_rt::ucrt::string::wcsstr	crates/win32-rt/src/ucrt/string.rs
 ucrtbase.dll	wcstod	-	CRT_STL	win32_rt::ucrt::convert::wcstod	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	wcstof	-	CRT_STL	win32_rt::ucrt::convert::wcstof	crates/win32-rt/src/ucrt/convert.rs
 ucrtbase.dll	wcstoimax	-	CRT_STL	win32_rt::ucrt::convert::wcstoimax	crates/win32-rt/src/ucrt/convert.rs

@@ -177,6 +177,8 @@ struct RegWatcher {
 
 struct Registry {
     keys: std::collections::BTreeMap<String, std::collections::BTreeMap<String, RegValue>>,
+    /// Original-case leaf key name keyed by lowercased full registry path.
+    key_names: std::collections::BTreeMap<String, String>,
     watchers: Vec<RegWatcher>,
 }
 
@@ -239,7 +241,7 @@ impl Registry {
         for root in ["hkcr", "hkcu", "hklm", "hku", "hkpd", "hkcc"] {
             keys.insert(root.to_string(), std::collections::BTreeMap::new());
         }
-        let mut reg = Self { keys, watchers: Vec::new() };
+        let mut reg = Self { keys, key_names: std::collections::BTreeMap::new(), watchers: Vec::new() };
         // Pre-populate standard .NET Framework 4.8 & .NET 8.0 keys so games, launchers,
         // and installers checking for .NET prerequisites succeed automatically.
         for sub in [
@@ -459,6 +461,7 @@ impl Registry {
             }
             cur.push_str(&seg.to_ascii_lowercase());
             self.keys.entry(cur.clone()).or_default();
+            self.key_names.entry(cur.clone()).or_insert_with(|| seg.to_string());
         }
     }
 
@@ -616,6 +619,7 @@ pub unsafe extern "win64" fn RegCreateKeyExW(key: HANDLE, sub: LPCWSTR, _r: u32,
         if !existed {
             created_parents.push(parent);
             reg.keys.insert(cur.clone(), std::collections::BTreeMap::new());
+            reg.key_names.insert(cur.clone(), seg.to_string());
         }
     }
     // Match the observed parent path of every newly created key (including intermediates)
@@ -966,6 +970,7 @@ pub unsafe extern "win64" fn RegDeleteKeyExW(key: HANDLE, sub: LPCWSTR, _sam: u3
     let full = join_reg_path(&base, &sub_str);
     let mut reg = registry().lock().unwrap();
     if reg.keys.remove(&full).is_some() {
+        reg.key_names.remove(&full);
         let fired = if let Some(parent) = parent_reg_path(&full) {
             reg.take_triggered(&[&full, parent], REG_NOTIFY_CHANGE_NAME)
         } else {
@@ -991,8 +996,10 @@ pub unsafe extern "win64" fn RegDeleteTreeW(key: HANDLE, sub: LPCWSTR) -> u32 {
         return ERROR_FILE_NOT_FOUND;
     }
     reg.keys.retain(|k, _| !k.starts_with(&prefix));
+    reg.key_names.retain(|k, _| !k.starts_with(&prefix));
     if !sub_str.is_empty() {
         reg.keys.remove(&full);
+        reg.key_names.remove(&full);
     } else if let Some(vals) = reg.keys.get_mut(&full) {
         vals.clear();
     }
@@ -1028,7 +1035,8 @@ fn direct_subkeys(reg: &Registry, path: &str) -> Vec<String> {
     for k in reg.keys.keys() {
         if let Some(rest) = k.strip_prefix(&prefix) {
             if !rest.is_empty() && !rest.contains('\\') {
-                subkeys.push(rest.to_string());
+                let display = reg.key_names.get(k).cloned().unwrap_or_else(|| rest.to_string());
+                subkeys.push(display);
             }
         }
     }
