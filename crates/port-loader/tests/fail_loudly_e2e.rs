@@ -459,6 +459,7 @@ fn guest_missing_com_method_and_lookup_warnings() {
 const GUEST_NTSYSCALL_C: &str = r##"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -570,6 +571,53 @@ int main(void) {
     CloseHandle(ev0);
     CloseHandle(ev1);
     CloseHandle(sem);
+
+    /* 5. Direct NtContinue (0x0043) syscall outside any exception handler (NTCONTINUE_STACK empty):
+     *    captures a live CONTEXT, rewrites Rip/Rbx/R12/Rax, invokes raw `syscall`, and verifies
+     *    execution resumes at the target label with the restored registers instead of crashing. */
+    NTSTATUS nc_null = raw_syscall5(0x0043, 0, 0, 0, 0, 0);
+    CHECK((uint32_t)nc_null == 0xC000000Du, "NtContinue(NULL) != STATUS_INVALID_PARAMETER");
+
+    __attribute__((aligned(16))) CONTEXT cont_ctx;
+    RtlCaptureContext(&cont_ctx);
+    CONTEXT *volatile ctx_ptr = &cont_ctx;
+    uint64_t restored_rbx = 0, restored_r12 = 0, restored_rax = 0;
+    __asm__ __volatile__(
+        "movq %[ctxp], %%r10\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "movq %%rax, %c[rip_off](%%r10)\n\t"
+        "movq %%rsp, %c[rsp_off](%%r10)\n\t"
+        "movq %%rbp, %c[rbp_off](%%r10)\n\t"
+        "movabsq $0x1122334455667788, %%rax\n\t"
+        "movq %%rax, %c[rax_off](%%r10)\n\t"
+        "movabsq $0xA1B2C3D4E5F60718, %%rax\n\t"
+        "movq %%rax, %c[rbx_off](%%r10)\n\t"
+        "movabsq $0x0F1E2D3C4B5A6978, %%rax\n\t"
+        "movq %%rax, %c[r12_off](%%r10)\n\t"
+        "xorl %%edx, %%edx\n\t"
+        "movl $0x0043, %%eax\n\t"
+        "syscall\n\t"
+        "ud2\n\t"
+        "1:\n\t"
+        "movq %%rax, %[out_rax]\n\t"
+        "movq %%rbx, %[out_rbx]\n\t"
+        "movq %%r12, %[out_r12]\n\t"
+        : [out_rax] "=m"(restored_rax),
+          [out_rbx] "=m"(restored_rbx),
+          [out_r12] "=m"(restored_r12)
+        : [ctxp] "m"(ctx_ptr),
+          [rip_off] "i"(offsetof(CONTEXT, Rip)),
+          [rsp_off] "i"(offsetof(CONTEXT, Rsp)),
+          [rbp_off] "i"(offsetof(CONTEXT, Rbp)),
+          [rax_off] "i"(offsetof(CONTEXT, Rax)),
+          [rbx_off] "i"(offsetof(CONTEXT, Rbx)),
+          [r12_off] "i"(offsetof(CONTEXT, R12))
+        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "memory", "cc"
+    );
+    CHECK(restored_rax == 0x1122334455667788ULL, "NtContinue direct syscall rax mismatch");
+    CHECK(restored_rbx == 0xA1B2C3D4E5F60718ULL, "NtContinue direct syscall rbx mismatch");
+    CHECK(restored_r12 == 0x0F1E2D3C4B5A6978ULL, "NtContinue direct syscall r12 mismatch");
+
     printf("NTSYSCALL_E2E: PASS ALL\n");
     fflush(stdout);
     return 0;

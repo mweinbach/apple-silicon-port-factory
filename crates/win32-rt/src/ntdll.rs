@@ -1196,9 +1196,10 @@ pub unsafe extern "win64" fn LdrGetDllHandle(
     }
 }
 
-pub unsafe extern "win64" fn NtContinue(
+pub(crate) unsafe fn nt_continue_with_callers(
     ctx: *const crate::unwind::Context,
     test_alert: u8,
+    caller_fns: &[usize],
 ) -> NTSTATUS {
     if ctx.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -1206,18 +1207,50 @@ pub unsafe extern "win64" fn NtContinue(
     if test_alert != 0 && crate::thread::has_pending_apc() {
         crate::thread::run_pending_apcs();
     }
-    if crate::unwind::capture_ntcontinue(&*ctx) {
+    let target = std::ptr::read_unaligned(ctx);
+    if crate::unwind::capture_ntcontinue(&target) {
         return STATUS_SUCCESS;
     }
-    crate::unwind::RtlRestoreContext(ctx as *mut _, std::ptr::null_mut());
-    STATUS_SUCCESS
+    // On non-x86_64 hosts (e.g. ARM64), restoring a guest CONTEXT outside `NTCONTINUE_STACK`
+    // requires an active emulator EH callout (`eh::callout` -> `eh::land`). Falling back to
+    // native `restore_context_asm` would branch directly to x86-64 guest RIP as host code.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if !crate::unwind::has_guest_callout_for(caller_fns) {
+            log::warn!(
+                "NtContinue: called outside exception capture scope without an active guest EH callout (rip=0x{:x})",
+                target.rip
+            );
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    crate::unwind::restore_context_for_caller(
+        &target as *const crate::unwind::Context as *mut crate::unwind::Context,
+        std::ptr::null_mut(),
+        caller_fns,
+    )
+}
+
+pub unsafe extern "win64" fn NtContinue(
+    ctx: *const crate::unwind::Context,
+    test_alert: u8,
+) -> NTSTATUS {
+    nt_continue_with_callers(
+        ctx,
+        test_alert,
+        &[NtContinue as *const () as usize, ZwContinue as *const () as usize],
+    )
 }
 
 pub unsafe extern "win64" fn ZwContinue(
     ctx: *const crate::unwind::Context,
     test_alert: u8,
 ) -> NTSTATUS {
-    NtContinue(ctx, test_alert)
+    nt_continue_with_callers(
+        ctx,
+        test_alert,
+        &[ZwContinue as *const () as usize, NtContinue as *const () as usize],
+    )
 }
 
 
@@ -1647,20 +1680,43 @@ pub unsafe extern "win64" fn RtlDispatchException(
     }
 }
 
-pub unsafe extern "win64" fn NtRaiseException(
+pub(crate) unsafe fn nt_raise_exception_with_callers(
     rec: *mut crate::unwind::ExceptionRecord,
     ctx: *mut crate::unwind::Context,
     first_chance: u8,
+    caller_fns: &[usize],
 ) -> NTSTATUS {
     if rec.is_null() || ctx.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     if first_chance != 0 && crate::unwind::dispatch_veh_guest(&mut *rec, &mut *ctx) {
-        crate::unwind::RtlRestoreContext(ctx, std::ptr::null_mut());
-        return STATUS_SUCCESS;
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            if !crate::unwind::has_guest_callout_for(caller_fns) {
+                log::warn!(
+                    "NtRaiseException: VEH continued without an active guest EH callout (rip=0x{:x})",
+                    (*ctx).rip
+                );
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+        crate::unwind::restore_context_for_caller(ctx, std::ptr::null_mut(), caller_fns);
     }
     crate::unwind::dispatch_exception(&mut *rec, &mut *ctx);
     STATUS_SUCCESS
+}
+
+pub unsafe extern "win64" fn NtRaiseException(
+    rec: *mut crate::unwind::ExceptionRecord,
+    ctx: *mut crate::unwind::Context,
+    first_chance: u8,
+) -> NTSTATUS {
+    nt_raise_exception_with_callers(
+        rec,
+        ctx,
+        first_chance,
+        &[NtRaiseException as *const () as usize, ZwRaiseException as *const () as usize],
+    )
 }
 
 pub unsafe extern "win64" fn ZwRaiseException(
@@ -1668,7 +1724,12 @@ pub unsafe extern "win64" fn ZwRaiseException(
     ctx: *mut crate::unwind::Context,
     first_chance: u8,
 ) -> NTSTATUS {
-    NtRaiseException(rec, ctx, first_chance)
+    nt_raise_exception_with_callers(
+        rec,
+        ctx,
+        first_chance,
+        &[ZwRaiseException as *const () as usize, NtRaiseException as *const () as usize],
+    )
 }
 
 unsafe fn object_attributes_raw_name(obj_attr: *const c_void) -> Option<String> {

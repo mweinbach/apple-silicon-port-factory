@@ -432,13 +432,24 @@ pub unsafe extern "win64" fn dispatch_nt_syscall(
             a6 as u32,
             stack_arg(rsp, 2) as u32,
         ),
-        ssn::NT_CONTINUE => {
-            ntdll::NtContinue(r10 as *const crate::unwind::Context, rdx as u8)
-        }
-        ssn::NT_RAISE_EXCEPTION => ntdll::NtRaiseException(
+        ssn::NT_CONTINUE => ntdll::nt_continue_with_callers(
+            r10 as *const crate::unwind::Context,
+            rdx as u8,
+            &[
+                dispatch_nt_syscall as *const () as usize,
+                ntdll::NtContinue as *const () as usize,
+                ntdll::ZwContinue as *const () as usize,
+            ],
+        ),
+        ssn::NT_RAISE_EXCEPTION => ntdll::nt_raise_exception_with_callers(
             r10 as *mut crate::unwind::ExceptionRecord,
             rdx as *mut crate::unwind::Context,
             r8 as u8,
+            &[
+                dispatch_nt_syscall as *const () as usize,
+                ntdll::NtRaiseException as *const () as usize,
+                ntdll::ZwRaiseException as *const () as usize,
+            ],
         ),
         ssn::NT_CREATE_EVENT => ntdll::NtCreateEvent(
             r10 as *mut HANDLE,

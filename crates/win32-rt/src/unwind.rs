@@ -375,13 +375,42 @@ pub unsafe fn restore_context(ctx: &Context) -> ! {
 }
 
 pub unsafe extern "win64" fn RtlRestoreContext(ctx: *mut Context, rec: *mut ExceptionRecord) {
+    restore_context_for_caller(ctx, rec, &[RtlRestoreContext as *const () as usize])
+}
+
+/// Returns whether the innermost EH record is an emulated region whose in-flight host callout
+/// matches one of `caller_fns`.
+pub(crate) unsafe fn has_guest_callout_for(caller_fns: &[usize]) -> bool {
+    let Some(h) = eh_hooks() else {
+        return false;
+    };
+    let head = (h.head)();
+    if head.is_null() || (*head).kind != EH_EMU_ENTRY {
+        return false;
+    }
+    let active = (h.callout_fn)(head);
+    active != 0 && caller_fns.contains(&active)
+}
+
+/// Like [`RtlRestoreContext`], but matches the innermost emulated region's active callout against
+/// any entry in `caller_fns` (e.g. `RtlRestoreContext`, `NtContinue`, `ZwContinue`,
+/// `NtRaiseException`, `ZwRaiseException`, or `ntsyscall::dispatch_nt_syscall`).
+pub(crate) unsafe fn restore_context_for_caller(
+    ctx: *mut Context,
+    rec: *mut ExceptionRecord,
+    caller_fns: &[usize],
+) -> ! {
     // Called by guest code: `ctx` is a guest context in the caller's emulated region.
     let mut caller = Context::zeroed();
-    let cur = guest_caller_context(RtlRestoreContext as *const () as usize, &mut caller).unwrap_or(Cur::Host);
+    let cur = caller_fns
+        .iter()
+        .find_map(|&f| guest_caller_context(f, &mut caller))
+        .unwrap_or(Cur::Host);
+    let mut target = std::ptr::read_unaligned(ctx);
     if !rec.is_null() {
-        consolidate(&mut *ctx, cur, &mut *rec);
+        consolidate(&mut target, cur, &mut *rec);
     }
-    resume_at(&*ctx, cur)
+    resume_at(&target, cur)
 }
 
 /// Defines a naked export that captures the caller's CONTEXT on its own

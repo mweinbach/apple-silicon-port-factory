@@ -1153,7 +1153,7 @@ unsafe fn emu_run_region(
             }
             Mnemonic::Syscall | Mnemonic::Sysenter => {
                 let ssn = cpu.gpr[0] as u32;
-                let r10 = if cpu.gpr[10] != 0 { cpu.gpr[10] } else { cpu.gpr[1] };
+                let r10 = cpu.gpr[10];
                 let rdx = cpu.gpr[2];
                 let r8 = cpu.gpr[8];
                 let r9 = cpu.gpr[9];
@@ -1161,11 +1161,37 @@ unsafe fn emu_run_region(
                 // Architectural x86-64 SYSCALL saves next RIP in RCX and RFLAGS in R11
                 cpu.gpr[1] = cpu.rip;
                 cpu.gpr[11] = cpu.rflags() as u64;
-                let status = win32_rt::ntsyscall::dispatch_nt_syscall(ssn, r10, rdx, r8, r9, rsp);
-                cpu.gpr[0] = status as i64 as u64;
-                cpu.last_bits[0] = 64;
-                cpu.last_bits[1] = 64;
-                cpu.last_bits[11] = 64;
+                let status_opt = if matches!(
+                    ssn,
+                    win32_rt::ntsyscall::ssn::NT_CONTINUE
+                        | win32_rt::ntsyscall::ssn::NT_RAISE_EXCEPTION
+                ) {
+                    // Wrap control-transferring syscalls in an EH callout so `NtContinue` /
+                    // `NtRaiseException` can land back into this emulated region via `eh::land`
+                    // instead of attempting a native host `restore_context_asm` jump.
+                    let host_fn = win32_rt::ntsyscall::dispatch_nt_syscall as *const () as usize;
+                    eh::callout(&mut cpu, host_fn, *sp_ptr, move || {
+                        let status = win32_rt::ntsyscall::dispatch_nt_syscall(
+                            ssn, r10, rdx, r8, r9, rsp,
+                        );
+                        (status as i64 as u64, 0)
+                    })
+                    .map(|(st, _)| st)
+                } else {
+                    let status =
+                        win32_rt::ntsyscall::dispatch_nt_syscall(ssn, r10, rdx, r8, r9, rsp);
+                    Some(status as i64 as u64)
+                };
+                if let Some(status_u64) = status_opt {
+                    cpu.gpr[0] = status_u64;
+                    cpu.last_bits[0] = 64;
+                    cpu.last_bits[1] = 64;
+                    cpu.last_bits[11] = 64;
+                } else {
+                    // `eh::callout` landed with the restored guest `Context` already in `cpu`.
+                    blk_left = 0;
+                    continue;
+                }
             }
             Mnemonic::Ret => {
                 let rsp = cpu.gpr[4];
