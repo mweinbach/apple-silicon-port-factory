@@ -2027,6 +2027,28 @@ mod tests {
             assert_eq!(read_and_free_name(item_ptr, SIGDN_PARENTRELATIVEPARSING), "report.txt");
             assert_eq!(read_and_free_name(item_ptr, SIGDN_URL), "file:///S:/ItemTest/sub/report.txt");
 
+            // Unaligned (odd-address) Unicode parsing-name buffer through SHCreateItemFromParsingName.
+            std::fs::write(root.join("sub/odd-\u{1F680}.txt"), b"odd unicode").unwrap();
+            let odd_path = "S:\\ItemTest\\sub\\odd-\u{1F680}.txt";
+            let odd_units = odd_path.encode_utf16().count() + 1;
+            let mut odd_backing = vec![0u16; odd_units + 2];
+            let odd_ptr = (odd_backing.as_mut_ptr() as *mut u8).add(1) as *mut u16;
+            assert!(!odd_ptr.is_aligned());
+            assert_eq!(crate::strings::write_wide_z(odd_ptr, odd_units, odd_path), odd_units - 1);
+            let mut odd_item: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    odd_ptr,
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut odd_item,
+                ),
+                S_OK
+            );
+            assert!(!odd_item.is_null());
+            assert_eq!(read_and_free_name(odd_item, SIGDN_FILESYSPATH), odd_path);
+            assert_eq!(crate::com::com_call_release(odd_item), 0);
+
             let mut bad_name: LPWSTR = 0x1usize as LPWSTR;
             assert_eq!(
                 crate::com::com_call_slot(

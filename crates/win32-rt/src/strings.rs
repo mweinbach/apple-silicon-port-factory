@@ -36,9 +36,13 @@ pub unsafe fn cstr_slice<'a>(p: *const u8) -> &'a [u8] {
     std::slice::from_raw_parts(p, strlen(p))
 }
 
-/// Read a NUL-terminated UTF-16 string (lossy).
+/// Read a NUL-terminated UTF-16 string (lossy, unaligned-safe).
 pub unsafe fn from_wide(p: *const u16) -> String {
-    String::from_utf16_lossy(wide_slice(p))
+    if p.is_aligned() {
+        String::from_utf16_lossy(wide_slice(p))
+    } else {
+        read_wide_z(p, usize::MAX)
+    }
 }
 
 /// Read a NUL-terminated UTF-16 string, `None` if the pointer is NULL.
@@ -532,6 +536,17 @@ mod tests {
             assert_eq!(write_wide_bytes_out(std::ptr::null_mut(), 16, "Hi!"), (8, false));
             assert_eq!(write_wide_bytes_out(bptr, 8, "Hi!"), (6, true));
             assert_eq!(read_wide_z(bptr as *const u16, 16), "Hi!");
+
+            // Direct from_wide / from_wide_opt at a guaranteed odd address (aligned u16 base + 1 byte).
+            let mut aligned_backing = [0xCCu16; 32];
+            let odd = (aligned_backing.as_mut_ptr() as *mut u8).add(1) as *mut u16;
+            assert!(!odd.is_aligned());
+            let sample = "Odd-\u{03A9}-\u{1F680}";
+            assert_eq!(write_wide_z(odd, 30, sample), sample.encode_utf16().count());
+            assert_eq!(from_wide(odd), sample);
+            assert_eq!(from_wide_opt(odd).as_deref(), Some(sample));
+            assert_eq!(from_wide(std::ptr::null()), "");
+            assert_eq!(from_wide_opt(std::ptr::null()), None);
         }
     }
 
