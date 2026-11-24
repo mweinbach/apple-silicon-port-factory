@@ -3024,6 +3024,73 @@ fn cred_store_lock() -> &'static std::sync::Mutex<()> {
     L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Cross-process + in-process lock guard for the credential vault.
+/// Holds the in-process mutex and an exclusive POSIX `flock(LOCK_EX)` on `.vault.lock`
+/// so concurrent processes serialise load-modify-rename writes cleanly.
+struct CredStoreGuard {
+    _mem: std::sync::MutexGuard<'static, ()>,
+    flock_file: Option<std::fs::File>,
+}
+
+impl Drop for CredStoreGuard {
+    fn drop(&mut self) {
+        if let Some(ref f) = self.flock_file {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+fn acquire_cred_store_lock() -> std::io::Result<CredStoreGuard> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let mem = cred_store_lock().lock().unwrap();
+    let lock_path = crate::path::default_translator_root()
+        .join("AppData")
+        .join("Local")
+        .join("Microsoft")
+        .join("Credentials")
+        .join(".vault.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    Ok(CredStoreGuard {
+        _mem: mem,
+        flock_file: Some(file),
+    })
+}
+
+fn acquire_cred_store_lock_best_effort() -> CredStoreGuard {
+    match acquire_cred_store_lock() {
+        Ok(g) => g,
+        Err(_) => CredStoreGuard {
+            _mem: cred_store_lock().lock().unwrap(),
+            flock_file: None,
+        },
+    }
+}
+
 /// Session-scoped (`CRED_PERSIST_SESSION`) credentials stay in memory only.
 fn session_cred_store() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u32), StoredCredential>> {
     static M: std::sync::OnceLock<
@@ -3292,9 +3359,9 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, _flags: u32) ->
         user_name: crate::strings::from_wide_opt(c.user_name),
     };
 
-    let _guard = cred_store_lock().lock().unwrap();
     match c.persist {
         CRED_PERSIST_SESSION => {
+            let _guard = acquire_cred_store_lock_best_effort();
             session_cred_store().lock().unwrap().insert(key.clone(), entry);
             // Replace any stale persisted entry for the same (target, type).
             for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
@@ -3307,6 +3374,10 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, _flags: u32) ->
             TRUE
         }
         CRED_PERSIST_LOCAL_MACHINE | CRED_PERSIST_ENTERPRISE => {
+            let _guard = match acquire_cred_store_lock() {
+                Ok(g) => g,
+                Err(_) => return err(ERROR_WRITE_FAULT_CRED, FALSE),
+            };
             let (target_kind, other_kind) = if c.persist == CRED_PERSIST_LOCAL_MACHINE {
                 (CredVaultKind::LocalMachine, CredVaultKind::Enterprise)
             } else {
@@ -3342,7 +3413,7 @@ pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, ty: u32, _flags: u32, ou
     };
     let key = (name.to_ascii_lowercase(), ty);
     let entry = {
-        let _guard = cred_store_lock().lock().unwrap();
+        let _guard = acquire_cred_store_lock_best_effort();
         if let Some(e) = session_cred_store().lock().unwrap().get(&key).cloned() {
             Some(e)
         } else {
@@ -3433,7 +3504,7 @@ pub unsafe extern "win64" fn CredDeleteW(target: LPCWSTR, ty: u32, _flags: u32) 
         return err(ERROR_INVALID_PARAMETER, FALSE);
     };
     let key = (name.to_ascii_lowercase(), ty);
-    let _guard = cred_store_lock().lock().unwrap();
+    let _guard = acquire_cred_store_lock_best_effort();
     if session_cred_store().lock().unwrap().remove(&key).is_some() {
         return TRUE;
     }
