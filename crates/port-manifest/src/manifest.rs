@@ -62,6 +62,11 @@ pub struct GameManifest {
 
     // [ios]
     pub ios_seed_files: Vec<(String, String)>,
+
+    // [knobs]
+    /// Per-game runtime knob defaults (`PORT_*` or legacy `AW2_*` aliases).
+    /// Applied before the runtime starts with precedence `env > game.toml > default`.
+    pub knobs: BTreeMap<String, String>,
 }
 
 impl GameManifest {
@@ -235,6 +240,25 @@ impl GameManifest {
     }
 
     fn apply_entry(&mut self, section: &str, raw_key: &str, raw_val: &str) {
+        if section == "knobs" {
+            let key = raw_key.trim();
+            if !key.is_empty() {
+                let is_quoted = (raw_val.starts_with('"') && raw_val.ends_with('"'))
+                    || (raw_val.starts_with('\'') && raw_val.ends_with('\''));
+                let val = if !is_quoted {
+                    match raw_val.trim() {
+                        "true" => "1".to_string(),
+                        "false" => "0".to_string(),
+                        other => other.to_string(),
+                    }
+                } else {
+                    unquote(raw_val)
+                };
+                self.knobs.insert(key.to_string(), val);
+            }
+            return;
+        }
+
         if section == "dlls" {
             let dll = pe_image::normalize_dll_name(raw_key);
             let val = unquote(raw_val);
@@ -467,6 +491,24 @@ impl GameManifest {
             for (src, dst) in &self.ios_seed_files {
                 let combined = format!("{src} -> {dst}");
                 push_opt_str(&mut out, "seed_file", Some(&combined));
+            }
+        }
+
+        if !self.knobs.is_empty() {
+            start_section(&mut out, "knobs");
+            for (k, v) in &self.knobs {
+                let bare_ok = !k.is_empty()
+                    && k.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                if bare_ok {
+                    out.push_str(&format!("{k} = \"{}\"\n", escape_toml_str(v)));
+                } else {
+                    out.push_str(&format!(
+                        "\"{}\" = \"{}\"\n",
+                        escape_toml_str(k),
+                        escape_toml_str(v)
+                    ));
+                }
             }
         }
 
@@ -888,7 +930,14 @@ keep_dlls = [
                 "ios.ini".into(),
                 "AppData/Local/Test/ios.ini".into(),
             )],
+            knobs: BTreeMap::new(),
         };
+        original
+            .knobs
+            .insert("PORT_METALFX".into(), "0".into());
+        original
+            .knobs
+            .insert("PORT_VRAM_MB".into(), "8192".into());
         original.dlls.insert("nrd.dll".into(), DllRoute::Guest);
         original.dlls.insert(
             "old_xinput.dll".into(),
@@ -922,5 +971,30 @@ keep_dlls = [
         let reparsed = GameManifest::parse(&serialized);
         assert_eq!(reparsed, original);
         assert_eq!(reparsed.split_args(), vec!["-lang", "en US", "-flag=1"]);
+    }
+
+    #[test]
+    fn parses_knobs_section_types() {
+        let src = r#"
+[app]
+id = "knobs-test"
+
+[knobs]
+PORT_METALFX = false
+PORT_JIT_RAS = true
+PORT_VRAM_MB = 8192
+PORT_AUDIO_RATE = "48000"
+AW2_DLL_AOT = "1"
+"#;
+        let m = GameManifest::parse(src);
+        assert_eq!(m.knobs.get("PORT_METALFX").map(String::as_str), Some("0"));
+        assert_eq!(m.knobs.get("PORT_JIT_RAS").map(String::as_str), Some("1"));
+        assert_eq!(m.knobs.get("PORT_VRAM_MB").map(String::as_str), Some("8192"));
+        assert_eq!(
+            m.knobs.get("PORT_AUDIO_RATE").map(String::as_str),
+            Some("48000")
+        );
+        assert_eq!(m.knobs.get("AW2_DLL_AOT").map(String::as_str), Some("1"));
+        assert!(crate::knobs::validate_manifest_knobs(&m.knobs).is_empty());
     }
 }

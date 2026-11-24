@@ -7,11 +7,17 @@
 //! `aarch64-apple-ios`, `aarch64-apple-ios-sim`, and `x86_64-apple-darwin`.
 
 pub mod dll_map;
+pub mod knobs;
 pub mod manifest;
 pub mod middleware;
 pub mod plugins;
 
 pub use dll_map::{canonical_dll, DllRoute, DllRoutingTable, DEFAULT_BUILTIN_OVERRIDES};
+pub use knobs::{
+    aot_key_hash, aot_key_hash_with, apply_manifest_and_aliases, format_json, format_table,
+    lookup as lookup_knob, resolve_all as resolve_all_knobs, validate_manifest_knobs, KnobSource,
+    KnobSpec, KnobType, ResolvedKnob, KNOBS,
+};
 pub use manifest::{GameManifest, MiddlewareSelection, StorageManifestConfig};
 pub use middleware::{
     detect_middleware_from_dlls, family_all_dlls, find_by_dll, find_family, find_version,
