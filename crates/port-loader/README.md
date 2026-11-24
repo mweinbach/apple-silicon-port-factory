@@ -75,10 +75,14 @@ legacy_remedy_migration = false
 | `--no-builtin-overrides` | Load shipping PE DLLs from `--game-dir` instead of builtin overrides (`PORT_BUILTIN_OVERRIDES=0`). |
 | `--no-aw2-hooks` | Disable Alan Wake 2 VA hooks (already off automatically for non-AW2 binaries). |
 | `--trace` | Log every resolved import call (`RUST_LOG=trace=info`). |
-| `--no-run` | Map the PE, resolve imports, print any unresolved imports per DLL, and exit. |
+| `--no-run` | Map the PE, resolve imports, report unresolved imports per DLL, and exit (`0` if all resolved, `3` if unresolved > 0). |
+| `--json` | Emit a stable schema v1 JSON envelope on stdout (see `docs/DIAGNOSTICS.md`). |
+| `--report-json PATH` | Write one structured JSON boot report on exit (or `$PORT_REPORT_JSON`). |
+| `--timeout-secs SECS` | Terminate a live run with exit code `124` after `SECS` wall-clock seconds. |
+| `--max-frames N` | Stop a live run cleanly (exit `0`) after `N` presented frames (counted via `run_limits::on_frame_presented`). |
 | `--fail-on-unimpl-op` | Abort with documented exit code `86` (`EXIT_UNIMPL_OP`) and a crash report if the generic interpreter hits an unimplemented x86-64 instruction (`PORT_FAIL_ON_UNIMPL_OP=1`). Default **on** for CLI bring-up runs (outside a packaged `.app` bundle) and `live-probe`. |
 | `--no-fail-on-unimpl-op` | Log unimplemented x86-64 instructions once per IP and continue as a no-op (`PORT_FAIL_ON_UNIMPL_OP=0`). |
-| `--diff-test` | (`aw2` feature) Run differential tests comparing original x86-64 code against Rust replacements. |
+| `--diff-test` | (`aw2` feature) Run differential tests comparing original x86-64 code against Rust replacements (exit `4` on failures). |
 | `--audio-harness` | (`aw2` feature) Replace `WinMain` with the Wwise audio oracle harness. |
 
 ## Environment variables

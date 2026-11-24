@@ -1,14 +1,15 @@
 //! CLI handler for `port-factory bench` (`cargo opsdb -- bench`).
 
-use super::{workspace_root, ArgCursor};
+use super::{usage_err, workspace_root, ArgCursor};
 use anyhow::{bail, Context, Result};
 use port_factory::bench::{
     format_report_json, format_summary_table, run_benchmarks, BenchMode, BenchOptions,
     DEFAULT_BASELINE_PATH, DEFAULT_OUT_PATH, DEFAULT_TOLERANCE, WORKLOADS,
 };
+use port_factory::json_output::exit_codes;
 use std::path::PathBuf;
 
-pub fn cmd_bench(args: &[String]) -> Result<()> {
+pub fn cmd_bench(args: &[String]) -> Result<i32> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         let names = WORKLOADS
             .iter()
@@ -35,7 +36,7 @@ pub fn cmd_bench(args: &[String]) -> Result<()> {
                --no-compare            Do not fail if current chip has no baseline yet\n\
                --json                  Print full JSON report to stdout\n"
         );
-        return Ok(());
+        return Ok(exit_codes::OK);
     }
 
     let root = workspace_root();
@@ -84,7 +85,7 @@ pub fn cmd_bench(args: &[String]) -> Result<()> {
             "--update-baseline" => update_baseline = true,
             "--no-compare" => no_compare = true,
             "--json" => print_json = true,
-            other => bail!("unknown bench argument {other:?}"),
+            other => return Err(usage_err(format!("unknown bench argument {other:?}"))),
         }
     }
 
@@ -122,5 +123,5 @@ pub fn cmd_bench(args: &[String]) -> Result<()> {
             report.tolerance * 100.0
         );
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }

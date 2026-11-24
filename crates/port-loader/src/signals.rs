@@ -93,6 +93,7 @@ unsafe fn fatal(msg: &str, mc: *mut u8) -> ! {
     log::error!("FATAL: {msg} at {}", l.symbolize_addr(ctx.rip as usize));
     win32_rt::crash::report(msg, None, &ctx);
     crate::thunks::exit_hold();
+    win32_rt::process::record_exit_code(3);
     win32_rt::process::run_exit_hooks();
     libc::_exit(3)
 }

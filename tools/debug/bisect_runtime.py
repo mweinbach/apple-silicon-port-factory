@@ -104,21 +104,33 @@ def fmt_range(mod: str | None, lo: int, hi: int) -> str:
     return f"{mod}:{s}" if mod else s
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Automated x86-runtime knob matrix and PORT_JIT_SKIP bisector")
-    ap.add_argument("--cmd", required=True, help="Reproducer command (exit 0=CLEAN, 1=BUG)")
-    ap.add_argument("--bisect-range", help="Optional VA/RVA span for PORT_JIT_SKIP binary search (e.g. game.exe:0x1000..0x2000000)")
-    ap.add_argument("--min-span", type=lambda s: int(s, 0), default=64, help="Stop binary search when span <= bytes (default 64)")
-    ap.add_argument("--timeout", type=int, default=180, help="Per-run timeout in seconds")
-    ap.add_argument("--matrix-only", action="store_true", help="Only run the knob matrix, skip binary search")
-    ap.add_argument("--bisect-only", action="store_true", help="Skip the knob matrix and run binary search directly")
-    ap.add_argument("--skip-var", choices=["PORT_AOT_SKIP", "PORT_JIT_SKIP"], default="PORT_AOT_SKIP", help="Skip filter env var for --bisect-only (default PORT_AOT_SKIP)")
-    ap.add_argument("--confirm-clean", type=int, default=1, help="Require N consecutive CLEAN runs before accepting a CLEAN verdict (guards against probabilistic repros)")
-    ap.add_argument("--extra-env", action="append", default=[], help="Extra KEY=VAL env var(s) passed to every probe")
-    ap.add_argument("--fast-only", action="store_true", help="Skip slow full-boot AW2_JIT=0 / AW2_EMU_FAST=0 probes")
-    ap.add_argument("--out", help="Write structured JSON report to this path")
-    args = ap.parse_args()
+def _emit_json_envelope(out_stream, exit_code: int, data, error: str | None) -> int:
+    out_stream.write(json.dumps({
+        "schema_version": 1,
+        "command": "bisect-runtime",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "data": data,
+        "error": error,
+    }, indent=2) + "\n")
+    out_stream.flush()
+    return exit_code
 
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, json_mode: bool = False, orig_stdout=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._json_mode = json_mode
+        self._orig_stdout = orig_stdout or sys.stdout
+
+    def error(self, message: str):
+        if self._json_mode:
+            _emit_json_envelope(self._orig_stdout, 2, None, message)
+            self.exit(2)
+        super().error(message)
+
+
+def _run_main(args, orig_stdout) -> int:
     base_env: dict[str, str] = {}
     for item in args.extra_env:
         if "=" not in item:
@@ -127,6 +139,8 @@ def main() -> int:
         base_env[k] = v
 
     cmd = shlex.split(args.cmd)
+    if not cmd:
+        raise ValueError("--cmd must not be empty")
     report: dict = {"cmd": cmd, "base_env": base_env, "matrix": [], "bisect": []}
 
     results = {}
@@ -221,7 +235,49 @@ def main() -> int:
         with open(args.out, "w") as fh:
             json.dump(report, fh, indent=2)
         print(f"Wrote report to {args.out}", flush=True)
+    if args.json:
+        return _emit_json_envelope(orig_stdout, 0, report, None)
     return 0
+
+
+def main() -> int:
+    want_json = "--json" in sys.argv[1:]
+    orig_stdout = sys.stdout
+    ap = _JsonArgumentParser(
+        description="Automated x86-runtime knob matrix and PORT_JIT_SKIP bisector",
+        json_mode=want_json,
+        orig_stdout=orig_stdout,
+    )
+    ap.add_argument("--cmd", required=True, help="Reproducer command (exit 0=CLEAN, 1=BUG)")
+    ap.add_argument("--bisect-range", help="Optional VA/RVA span for PORT_JIT_SKIP binary search (e.g. game.exe:0x1000..0x2000000)")
+    ap.add_argument("--min-span", type=lambda s: int(s, 0), default=64, help="Stop binary search when span <= bytes (default 64)")
+    ap.add_argument("--timeout", type=int, default=180, help="Per-run timeout in seconds")
+    ap.add_argument("--matrix-only", action="store_true", help="Only run the knob matrix, skip binary search")
+    ap.add_argument("--bisect-only", action="store_true", help="Skip the knob matrix and run binary search directly")
+    ap.add_argument("--skip-var", choices=["PORT_AOT_SKIP", "PORT_JIT_SKIP"], default="PORT_AOT_SKIP", help="Skip filter env var for --bisect-only (default PORT_AOT_SKIP)")
+    ap.add_argument("--confirm-clean", type=int, default=1, help="Require N consecutive CLEAN runs before accepting a CLEAN verdict (guards against probabilistic repros)")
+    ap.add_argument("--extra-env", action="append", default=[], help="Extra KEY=VAL env var(s) passed to every probe")
+    ap.add_argument("--fast-only", action="store_true", help="Skip slow full-boot AW2_JIT=0 / AW2_EMU_FAST=0 probes")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
+    ap.add_argument("--out", help="Write structured JSON report to this path")
+    args = ap.parse_args()
+
+    if args.json:
+        sys.stdout = sys.stderr
+    try:
+        return _run_main(args, orig_stdout)
+    except SystemExit:
+        raise
+    except ValueError as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 2, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 1, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

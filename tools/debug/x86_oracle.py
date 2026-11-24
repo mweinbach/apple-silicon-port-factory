@@ -196,16 +196,40 @@ static void run_snippet(State *st, const uint8_t *ins, size_t ins_len, int has_a
 """
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Verify PORT_NAN_TRACE / x86-verify snapshots on real Rosetta x86-64")
-    ap.add_argument("inputs", nargs="+", help="Snapshot JSON file(s) or dump directory")
-    ap.add_argument("--max", type=int, default=64, help="Maximum unique snapshots to test")
-    ap.add_argument("--mxcsr", type=lambda s: int(s, 0), default=None, help="Override MXCSR value for all snapshots (e.g. 0x9fc0 for FTZ|DAZ, 0x1f80 default)")
-    ap.add_argument("--quiet-matches", action="store_true", help="Only print divergences and summary")
-    args = ap.parse_args()
+def _emit_json_envelope(out_stream, exit_code: int, data, error: str | None) -> int:
+    out_stream.write(json.dumps({
+        "schema_version": 1,
+        "command": "oracle",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "data": data,
+        "error": error,
+    }, indent=2) + "\n")
+    out_stream.flush()
+    return exit_code
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, json_mode: bool = False, orig_stdout=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._json_mode = json_mode
+        self._orig_stdout = orig_stdout or sys.stdout
+
+    def error(self, message: str):
+        if self._json_mode:
+            _emit_json_envelope(self._orig_stdout, 2, None, message)
+            self.exit(2)
+        super().error(message)
+
+
+def _run_main(args, orig_stdout) -> int:
+    def emit_json_result(exit_code: int, data, error: str | None) -> int:
+        return _emit_json_envelope(orig_stdout, exit_code, data, error)
 
     snaps = load_snapshots(args.inputs)
     if not snaps:
+        if args.json:
+            return emit_json_result(2, None, "No snap_*.json files found.")
         print("No snap_*.json files found.", file=sys.stderr)
         return 2
 
@@ -270,8 +294,17 @@ def main() -> int:
         cases_code.append("\n".join(lines))
         tested.append((path, s))
 
-    print(f"Loaded {len(uniq)} unique snapshots ({len(tested)} reg-only testable on Rosetta x86-64, {skipped_mem} mem-operand).")
+    if not args.json:
+        print(f"Loaded {len(uniq)} unique snapshots ({len(tested)} reg-only testable on Rosetta x86-64, {skipped_mem} mem-operand).")
     if not tested:
+        if args.json:
+            return emit_json_result(0, {
+                "unique_snapshots": len(uniq),
+                "tested": 0,
+                "skipped_mem": skipped_mem,
+                "divergences": 0,
+                "cases": [],
+            }, None)
         return 0
 
     src = C_HARNESS + "\nint main(void) {\n" + "\n".join(cases_code) + "\n  return 0;\n}\n"
@@ -285,8 +318,10 @@ def main() -> int:
             capture_output=True, text=True
         )
         if cc.returncode != 0:
+            if args.json:
+                return emit_json_result(1, None, f"clang -arch x86_64 failed: {cc.stderr.strip()}")
             print("clang -arch x86_64 failed:", cc.stderr, file=sys.stderr)
-            return 2
+            return 1
         env = os.environ.copy()
         env["ROSETTA_ADVERTISE_AVX"] = "1"
         env["ROSETTA_DISABLE_AOT"] = "1"
@@ -294,10 +329,13 @@ def main() -> int:
         run_cmd = [rosetta_sh, bin_path] if os.path.isfile(rosetta_sh) else ["arch", "-x86_64", bin_path]
         run = subprocess.run(run_cmd, capture_output=True, text=True, env=env)
         if run.returncode != 0:
+            if args.json:
+                return emit_json_result(1, None, f"Rosetta x86_64 run failed: {run.stderr.strip()}")
             print("Rosetta x86_64 run failed:", run.stderr, file=sys.stderr)
-            return 2
+            return 1
 
     divergences = 0
+    divergence_records = []
     for line in run.stdout.splitlines():
         if not line.startswith("CASE "):
             continue
@@ -330,17 +368,77 @@ def main() -> int:
                 severity = "NAN_PAYLOAD_DIFF"
             else:
                 severity = "VALUE_DIVERGENCE"
-            print(
-                f"[{severity}] {s['where']} `{s['disasm']}` (lane {lane}):\n"
-                f"  real x86-64: xmm{dst}=0x{x86_lo:032x} ymm_hi=0x{x86_hi:032x}\n"
-                f"  x86-runtime: xmm{dst}=0x{emu_lo:032x} ymm_hi=0x{emu_hi:032x}\n"
-                f"  snapshot:    {path}"
-            )
-        elif not args.quiet_matches:
+            divergence_records.append({
+                "severity": severity,
+                "where": s.get("where"),
+                "disasm": s.get("disasm"),
+                "lane": lane,
+                "dst_reg": dst,
+                "x86_xmm": f"0x{x86_lo:032x}",
+                "x86_ymm_hi": f"0x{x86_hi:032x}",
+                "emu_xmm": f"0x{emu_lo:032x}",
+                "emu_ymm_hi": f"0x{emu_hi:032x}",
+                "snapshot": path,
+            })
+            if not args.json:
+                print(
+                    f"[{severity}] {s['where']} `{s['disasm']}` (lane {lane}):\n"
+                    f"  real x86-64: xmm{dst}=0x{x86_lo:032x} ymm_hi=0x{x86_hi:032x}\n"
+                    f"  x86-runtime: xmm{dst}=0x{emu_lo:032x} ymm_hi=0x{emu_hi:032x}\n"
+                    f"  snapshot:    {path}"
+                )
+        elif not args.quiet_matches and not args.json:
             print(f"[MATCH] {s['where']} `{s['disasm']}` lane={lane}")
 
+    exit_code = 4 if divergences > 0 else 0
+    if args.json:
+        return emit_json_result(
+            exit_code,
+            {
+                "unique_snapshots": len(uniq),
+                "tested": len(tested),
+                "skipped_mem": skipped_mem,
+                "divergences": divergences,
+                "cases": divergence_records,
+            },
+            f"{divergences} oracle divergence(s) detected" if divergences > 0 else None,
+        )
+
     print(f"\nOracle summary: {len(tested)} tested, {divergences} divergences.")
-    return 1 if divergences > 0 else 0
+    return exit_code
+
+
+def main() -> int:
+    want_json = "--json" in sys.argv[1:]
+    orig_stdout = sys.stdout
+    ap = _JsonArgumentParser(
+        description="Verify PORT_NAN_TRACE / x86-verify snapshots on real Rosetta x86-64",
+        json_mode=want_json,
+        orig_stdout=orig_stdout,
+    )
+    ap.add_argument("inputs", nargs="+", help="Snapshot JSON file(s) or dump directory")
+    ap.add_argument("--max", type=int, default=64, help="Maximum unique snapshots to test")
+    ap.add_argument("--mxcsr", type=lambda s: int(s, 0), default=None, help="Override MXCSR value for all snapshots (e.g. 0x9fc0 for FTZ|DAZ, 0x1f80 default)")
+    ap.add_argument("--quiet-matches", action="store_true", help="Only print divergences and summary")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
+    args = ap.parse_args()
+
+    if args.json:
+        sys.stdout = sys.stderr
+    try:
+        return _run_main(args, orig_stdout)
+    except SystemExit:
+        raise
+    except ValueError as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 2, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 1, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -22,7 +22,38 @@ win64_abi::win64_mods! {
 mod aot_dylib;
 mod boot_report;
 pub mod ios_host;
+pub mod run_limits;
 mod shader_prewarm;
+
+#[derive(Debug)]
+struct CliUsageError(String);
+
+impl std::fmt::Display for CliUsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CliUsageError {}
+
+fn usage_err(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CliUsageError(msg.into()))
+}
+
+fn emit_cli_json_error(code: i32, msg: &str) {
+    #[cfg(feature = "cli")]
+    {
+        let env = port_factory::json_output::JsonEnvelope::error("port-runner", code, msg);
+        run_limits::write_json_stdout(&env.to_json_pretty());
+    }
+    #[cfg(not(feature = "cli"))]
+    {
+        let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+        run_limits::write_json_stdout(&format!(
+            "{{\"schema_version\":1,\"command\":\"port-runner\",\"ok\":false,\"exit_code\":{code},\"data\":null,\"error\":\"{escaped}\"}}"
+        ));
+    }
+}
 
 /// Register any compiled-in optional [`x86_runtime::game_plugin::GamePlugin`] implementations.
 /// Idempotent (deduplicated by plugin ID).
@@ -33,16 +64,32 @@ fn register_builtin_plugins() {
 
 pub fn run_cli() {
     boot_report::mark_boot_start();
+    let want_json = std::env::args().any(|a| a == "--json");
+    if want_json {
+        // Reserve original fd 1 exclusively for the `--json` envelope and send
+        // guest/host stdout writes to stderr so they can never corrupt JSON stdout.
+        run_limits::reserve_json_stdout();
+    }
     register_builtin_plugins();
     init_boot_log();
     if let Err(e) = real_main() {
-        let msg = format!("port-runner fatal startup error: {e:#}");
-        boot_report::write_report_with_override(Some(("startup_error", &msg)), Some(1));
-        boot_log_line(&msg);
-        eprintln!("{msg}");
-        write_last_crash(&msg);
-        show_startup_error_alert(&msg);
-        std::process::exit(1);
+        let code = if e.downcast_ref::<CliUsageError>().is_some() {
+            run_limits::exit_codes::USAGE_ERROR
+        } else {
+            run_limits::exit_codes::RUNTIME_ERROR
+        };
+        let msg = format!("{e:#}");
+        boot_report::write_report_with_override(Some(("startup_error", &msg)), Some(code as u32));
+        boot_log_line(&format!("port-runner fatal startup error (exit {code}): {msg}"));
+        if want_json {
+            emit_cli_json_error(code, &msg);
+        } else {
+            let full = format!("port-runner fatal startup error: {msg}");
+            eprintln!("{full}");
+            write_last_crash(&full);
+            show_startup_error_alert(&full);
+        }
+        std::process::exit(code);
     }
 }
 
@@ -55,6 +102,9 @@ struct Args {
     extra_mounts: Vec<String>,
     trace: bool,
     no_run: bool,
+    json: bool,
+    timeout_secs: Option<f64>,
+    max_frames: Option<u64>,
     no_avx: bool,
     no_builtin_overrides: bool,
     no_game_hooks: bool,
@@ -80,7 +130,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-game-hooks] [--no-avx] [--fail-on-unimpl-op | --no-fail-on-unimpl-op] [--audio-harness] [--diff-test] [-- ARGS...]\n\
+        "usage: port-runner [--manifest FILE] [--game-dir DIR] [--exe NAME] [--pe PATH] [--drive-c DIR] [--mount WIN=HOST] [--prewarm-aot] [--prewarm-shaders] [--aot-max-funcs N] [--aot-dir DIR] [--trace] [--no-run] [--json] [--report-json PATH] [--timeout-secs SECS] [--max-frames N] [--ops-report] [--list-exports] [--call-export SYM] [--no-builtin-overrides] [--no-game-hooks] [--no-avx] [--fail-on-unimpl-op | --no-fail-on-unimpl-op] [--audio-harness] [--diff-test] [-- ARGS...]\n\
          \n\
            --manifest FILE         declarative game.toml manifest (default: auto-discover ../Resources/game.toml or $PORT_MANIFEST)\n\
            --game-dir DIR          game/library directory (default: bundled ../Resources/Game, $PORT_GAME_DIR / $AW2_GAME_DIR, or current dir)\n\
@@ -102,19 +152,22 @@ fn usage() -> ! {
            --no-builtin-overrides  load real PE DLLs from directory instead of builtin overrides ($PORT_BUILTIN_OVERRIDES=0)\n\
            --no-game-hooks         disable optional compiled-in game plugin hooks/replacements (alias: --no-aw2-hooks)\n\
            --trace                 log every call through an import (target `trace`)\n\
-           --no-run                map + resolve only; report unresolved imports and exit\n\
+           --no-run                map + resolve only; report unresolved imports and exit (exit 3 if unresolved > 0)\n\
+           --json                  emit stable schema v1 JSON envelope on stdout\n\
            --report-json PATH      write one structured JSON boot report on exit (or $PORT_REPORT_JSON)\n\
+           --timeout-secs SECS     terminate live run after SECS seconds with exit code 124 (positive float/int)\n\
+           --max-frames N          stop live run cleanly (exit 0) after N presented frames (>= 1)\n\
            --no-avx                do not re-exec with ROSETTA_ADVERTISE_AVX=1\n\
            --fail-on-unimpl-op     abort with exit code {} on unimplemented x86-64 instructions (default on for CLI bring-up runs; $PORT_FAIL_ON_UNIMPL_OP=1)\n\
            --no-fail-on-unimpl-op  log unimplemented x86-64 instructions and continue as no-op ($PORT_FAIL_ON_UNIMPL_OP=0)\n\
            --audio-harness         enable plugin audio test harness when supported by the active game plugin\n\
-           --diff-test             run differential tests (original vs Rust) and exit\n\
+           --diff-test             run differential tests (original vs Rust) and exit (exit 4 on failure)\n\
          \n\
          Env vars: PORT_AOT_DIR, PORT_BUILTIN_OVERRIDES, PORT_FAIL_ON_UNIMPL_OP, PORT_HEADLESS, PORT_SYMBOLS, PORT_AOT_DYLIB (legacy AW2_* aliases supported)\n\
          Logging:  RUST_LOG (default `info`), e.g. RUST_LOG=info,stub=warn,trace=info",
         x86_runtime::emu::EXIT_UNIMPL_OP
     );
-    std::process::exit(2);
+    std::process::exit(run_limits::exit_codes::USAGE_ERROR);
 }
 
 fn default_game_dir() -> std::path::PathBuf {
@@ -130,11 +183,19 @@ fn default_game_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".")
 }
 
-fn parse_args() -> Args {
-    parse_args_from(std::env::args().skip(1))
+fn parse_args() -> anyhow::Result<Args> {
+    try_parse_args_from(std::env::args().skip(1))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
+    try_parse_args_from(iter).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        usage()
+    })
+}
+
+fn try_parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> anyhow::Result<Args> {
     let mut a = Args {
         manifest_path: None,
         game_dir: default_game_dir(),
@@ -146,6 +207,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         extra_mounts: Vec::new(),
         trace: false,
         no_run: false,
+        json: false,
+        timeout_secs: None,
+        max_frames: None,
         no_avx: false,
         no_builtin_overrides: false,
         no_game_hooks: false,
@@ -175,21 +239,25 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
     if it.peek().is_some_and(|s| s == "--") {
         it.next();
     }
+    let next_val = |it: &mut std::iter::Peekable<_>, flag: &str| -> anyhow::Result<String> {
+        it.next()
+            .ok_or_else(|| usage_err(format!("{flag} requires a value")))
+    };
     while let Some(s) = it.next() {
         match s.as_str() {
             "--manifest" => {
-                a.manifest_path = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.manifest_path = Some(std::path::PathBuf::from(next_val(&mut it, "--manifest")?));
             }
             "--game-dir" => {
-                a.game_dir = it.next().unwrap_or_else(|| usage()).into();
+                a.game_dir = next_val(&mut it, "--game-dir")?.into();
                 a.explicit_game_dir = true;
             }
             "--exe" => {
-                a.exe = it.next().unwrap_or_else(|| usage());
+                a.exe = next_val(&mut it, "--exe")?;
                 a.explicit_exe = true;
             }
             "--pe" => {
-                let p = std::path::PathBuf::from(it.next().unwrap_or_else(|| usage()));
+                let p = std::path::PathBuf::from(next_val(&mut it, "--pe")?);
                 if !a.explicit_game_dir {
                     if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
                         a.game_dir = parent.to_path_buf();
@@ -204,46 +272,68 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
                 a.pe_path = Some(p);
             }
             "--drive-c" => {
-                a.drive_c_dir = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.drive_c_dir = Some(std::path::PathBuf::from(next_val(&mut it, "--drive-c")?));
             }
             "--mount" => {
-                a.extra_mounts.push(it.next().unwrap_or_else(|| usage()));
+                a.extra_mounts.push(next_val(&mut it, "--mount")?);
             }
             "--prewarm-aot" => a.prewarm_aot = true,
             "--prewarm-shaders" => a.prewarm_shaders = true,
             "--emit-static-o" => {
-                a.emit_static_o = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.emit_static_o = Some(std::path::PathBuf::from(next_val(&mut it, "--emit-static-o")?));
             }
             "--aot-to-o" => {
-                a.aot_to_o = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.aot_to_o = Some(std::path::PathBuf::from(next_val(&mut it, "--aot-to-o")?));
             }
             "--out" => {
-                a.out_path = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.out_path = Some(std::path::PathBuf::from(next_val(&mut it, "--out")?));
             }
             "--static-platform" => {
-                a.static_platform = it.next().unwrap_or_else(|| usage());
+                a.static_platform = next_val(&mut it, "--static-platform")?;
             }
             "--aot-max-funcs" => {
-                let raw = it.next().unwrap_or_else(|| usage());
-                a.aot_max_funcs = raw.parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --aot-max-funcs value {raw:?}");
-                    usage()
-                });
+                let raw = next_val(&mut it, "--aot-max-funcs")?;
+                a.aot_max_funcs = raw
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid --aot-max-funcs value {raw:?}")))?;
             }
             "--aot-dir" => {
-                a.aot_dir = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.aot_dir = Some(std::path::PathBuf::from(next_val(&mut it, "--aot-dir")?));
             }
             "--trace" => a.trace = true,
             "--no-run" => a.no_run = true,
             "--report-json" => {
-                a.report_json = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+                a.report_json = Some(std::path::PathBuf::from(next_val(&mut it, "--report-json")?));
+            }
+            "--json" => a.json = true,
+            "--timeout-secs" => {
+                let raw = next_val(&mut it, "--timeout-secs")?;
+                let secs: f64 = raw
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid --timeout-secs value {raw:?}")))?;
+                if !secs.is_finite() || secs <= 0.0 {
+                    return Err(usage_err(format!(
+                        "--timeout-secs must be a positive finite number, got {raw:?}"
+                    )));
+                }
+                a.timeout_secs = Some(secs);
+            }
+            "--max-frames" => {
+                let raw = next_val(&mut it, "--max-frames")?;
+                let n: u64 = raw
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid --max-frames value {raw:?}")))?;
+                if n == 0 {
+                    return Err(usage_err("--max-frames must be >= 1"));
+                }
+                a.max_frames = Some(n);
             }
             "--no-avx" => a.no_avx = true,
             "--no-builtin-overrides" => a.no_builtin_overrides = true,
             "--no-game-hooks" | "--no-aw2-hooks" => a.no_game_hooks = true,
             "--ops-report" => a.ops_report = true,
             "--list-exports" => a.list_exports = true,
-            "--call-export" => a.call_export = Some(it.next().unwrap_or_else(|| usage())),
+            "--call-export" => a.call_export = Some(next_val(&mut it, "--call-export")?),
             "--audio-harness" => a.audio_harness = true,
             "--diff-test" => a.diff_test = true,
             "--fail-on-unimpl-op" => a.fail_on_unimpl_op = Some(true),
@@ -257,12 +347,11 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
                 let _ = it.next();
             }
             other => {
-                eprintln!("unknown argument {other:?}");
-                usage()
+                return Err(usage_err(format!("unknown argument {other:?}")));
             }
         }
     }
-    a
+    Ok(a)
 }
 
 /// Fast header-only peek of a PE32+ file's `(image_base, page_aligned_size_of_image, is_dll)`.
@@ -530,6 +619,9 @@ fn show_startup_error_alert(msg: &str) {
             matches!(
                 a.as_str(),
                 "--no-run"
+                    | "--json"
+                    | "--timeout-secs"
+                    | "--max-frames"
                     | "--diff-test"
                     | "--prewarm-aot"
                     | "--prewarm-shaders"
@@ -652,6 +744,7 @@ fn init_boot_log() {
                 | "--list-exports"
                 | "--ops-report"
                 | "--no-run"
+                | "--json"
                 | "--diff-test"
                 | "--call-export"
                 | "-h"
@@ -899,7 +992,7 @@ fn anchor_static_aot_symbols() {
 }
 
 fn real_main() -> anyhow::Result<()> {
-    run_with_args(parse_args(), false)
+    run_with_args(parse_args()?, false)
 }
 
 fn init_embedded_log() {
@@ -1075,6 +1168,29 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if args.prewarm_shaders {
         let rep = d3d12_metal::metal::pso_manifest::prewarm_for_current_device(None, false)
             .map_err(anyhow::Error::msg)?;
+        if args.json {
+            #[cfg(feature = "cli")]
+            {
+                use port_factory::json_output::{JsonEnvelope, JsonObj};
+                let data = JsonObj::new()
+                    .str("device_identity", rep.device_identity.clone())
+                    .bool("was_cold_device", rep.was_cold_device)
+                    .usize("tier1_compiled", rep.tier1_compiled)
+                    .usize("tier1_total", rep.tier1_total)
+                    .usize("tier1_failed", rep.tier1_failed)
+                    .usize("pso_compiled", rep.pso_compiled)
+                    .usize("pso_total", rep.pso_total)
+                    .usize("pso_failed", rep.pso_failed)
+                    .opt_str(
+                        "archive_written",
+                        rep.archive_written.as_ref().map(|p| p.display().to_string()),
+                    )
+                    .u64("elapsed_ms", rep.elapsed_ms)
+                    .build();
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
+            }
+            return Ok(());
+        }
         println!("=== Metal 4 Shader & PSO Prewarm Summary ===");
         println!("  Device / OS      : {}", if rep.device_identity.is_empty() { "(no manifests found)" } else { &rep.device_identity });
         println!("  Cold Device      : {}", rep.was_cold_device);
@@ -1088,7 +1204,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
 
     if args.pe_path.is_none() && args.exe.is_empty() {
-        bail!("no target executable specified (pass --pe PATH, --manifest FILE, or --game-dir DIR --exe NAME)");
+        return Err(usage_err("no target executable specified (pass --pe PATH, --manifest FILE, or --game-dir DIR --exe NAME)"));
     }
 
     let norm = pe_image::normalize_dll_name(&args.exe);
@@ -1360,11 +1476,17 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
 
     // Map the target PE (.exe or .dll) and, recursively, all statically imported DLLs.
     let pe_data = std::fs::read(&exe_host)?;
+    #[cfg(feature = "cli")]
+    let mut ops_report_json: Option<port_factory::json_output::JsonValue> = None;
     if args.ops_report {
         #[cfg(feature = "cli")]
         {
             let prof = port_factory::scanner::scan_pe_bytes(&norm, &pe_data)?;
-            print!("{}", port_factory::scanner::format_profile_report(&prof, 8));
+            if args.json {
+                ops_report_json = Some(port_factory::json_output::binary_profile_json(&prof, 8));
+            } else {
+                print!("{}", port_factory::scanner::format_profile_report(&prof, 8));
+            }
         }
         #[cfg(not(feature = "cli"))]
         {
@@ -1373,6 +1495,8 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     let t0 = std::time::Instant::now();
     let exe = l.load_pe(&exe_host, &norm, exe_win.clone(), None)?;
+    #[cfg(feature = "cli")]
+    let load_elapsed_ms = t0.elapsed().as_millis() as u64;
     // fndb symbol tables for symbolize()/crash reports (background parse; skipped in offline prewarm).
     if !args.prewarm_aot && args.emit_static_o.is_none() {
         symbols::preload();
@@ -1384,17 +1508,44 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     unsafe { w::teb::set_image_base(exe.base, h.subsystem) };
     w::thread::DEFAULT_STACK_SIZE.store((h.stack_reserve as usize).max(0x10_0000), std::sync::atomic::Ordering::Relaxed);
     let mods = l.modules();
+    let pe_mod_count = mods.iter().filter(|m| !m.is_builtin()).count();
+    let builtin_mod_count = mods.iter().filter(|m| m.is_builtin()).count();
     log::info!(
         "loaded {} modules ({} PE, {} builtin) in {:?}; {} unresolved imports have trap thunks",
         mods.len(),
-        mods.iter().filter(|m| !m.is_builtin()).count(),
-        mods.iter().filter(|m| m.is_builtin()).count(),
+        pe_mod_count,
+        builtin_mod_count,
         t0.elapsed(),
         l.traps.load(std::sync::atomic::Ordering::Relaxed)
     );
 
     if args.list_exports {
         let exports = l.export_list(&exe);
+        if args.json {
+            #[cfg(feature = "cli")]
+            {
+                use port_factory::json_output::{JsonEnvelope, JsonObj, JsonValue};
+                let items: Vec<JsonValue> = exports
+                    .into_iter()
+                    .map(|(ord, name, addr)| {
+                        JsonObj::new()
+                            .u64("ordinal", ord as u64)
+                            .str("name", name)
+                            .str("address", format!("0x{addr:x}"))
+                            .str("rva", format!("0x{:x}", addr.saturating_sub(exe.base)))
+                            .build()
+                    })
+                    .collect();
+                let data = JsonObj::new()
+                    .str("target", norm.clone())
+                    .str("base", format!("0x{:x}", exe.base))
+                    .usize("exports_count", items.len())
+                    .val("exports", JsonValue::Array(items))
+                    .build();
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
+            }
+            return Ok(());
+        }
         println!("=== Exports of {} ({} entries, base=0x{:x}) ===", norm, exports.len(), exe.base);
         for (ord, name, addr) in exports {
             println!("  #{:<5} 0x{:012x} (rva 0x{:08x})  {}", ord, addr, addr - exe.base, name);
@@ -1472,13 +1623,70 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     if args.prewarm_aot {
         let reports = x86_runtime::emu::aot_prewarm_all_mapped(args.aot_max_funcs);
+        if args.json {
+            #[cfg(feature = "cli")]
+            {
+                use port_factory::json_output::{JsonEnvelope, JsonObj, JsonValue};
+                let prewarmed = reports.iter().filter(|r| r.cache_path.is_some()).count();
+                let skipped = reports.len().saturating_sub(prewarmed);
+                let total_roots: usize = reports.iter().map(|r| r.roots).sum();
+                let total_blocks: usize = reports.iter().map(|r| r.blocks).sum();
+                let total_bytes: usize = reports.iter().map(|r| r.code_bytes).sum();
+                let modules: Vec<JsonValue> = reports
+                    .iter()
+                    .map(|r| {
+                        JsonObj::new()
+                            .str("module", r.module.clone())
+                            .usize("roots", r.roots)
+                            .usize("blocks", r.blocks)
+                            .usize("code_bytes", r.code_bytes)
+                            .opt_str(
+                                "cache_path",
+                                r.cache_path.as_ref().map(|p| p.display().to_string()),
+                            )
+                            .opt_str("skipped_reason", r.skipped_reason.clone())
+                            .build()
+                    })
+                    .collect();
+                let data = JsonObj::new()
+                    .usize("modules_prewarmed", prewarmed)
+                    .usize("modules_skipped", skipped)
+                    .usize("total_roots", total_roots)
+                    .usize("total_blocks", total_blocks)
+                    .usize("total_code_bytes", total_bytes)
+                    .val("modules", JsonValue::Array(modules))
+                    .build();
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
+            }
+            return Ok(());
+        }
         print_aot_prewarm_summary(&reports);
         return Ok(());
     }
     if args.diff_test {
         let (pass, fail) = hooks::run_difftests(active_replacements.as_ref());
+        let code = if fail == 0 {
+            run_limits::exit_codes::OK
+        } else {
+            run_limits::exit_codes::VERIFICATION_FAILED
+        };
+        if args.json {
+            #[cfg(feature = "cli")]
+            {
+                use port_factory::json_output::{JsonEnvelope, JsonObj};
+                let data = JsonObj::new()
+                    .usize("passed", pass)
+                    .usize("failed", fail)
+                    .build();
+                let err_msg = (fail > 0).then(|| format!("{fail} differential test(s) failed"));
+                run_limits::write_json_stdout(
+                    &JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty(),
+                );
+            }
+            std::process::exit(code);
+        }
         log::info!("--diff-test: {pass} passed, {fail} failed");
-        std::process::exit(if fail == 0 { 0 } else { 1 });
+        std::process::exit(code);
     }
     hooks::apply_probes(exe.base)?;
     hooks::start_reporter();
@@ -1501,17 +1709,72 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
 
     if args.no_run {
         let u = l.unresolved.lock().unwrap();
-        let mut per: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        let mut per: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for s in u.iter() {
-            let (d, n) = s.split_once('!').unwrap();
-            per.entry(d).or_default().push(n);
+            if let Some((d, n)) = s.split_once('!') {
+                per.entry(d.to_string()).or_default().push(n.to_string());
+            } else {
+                per.entry("unknown".to_string()).or_default().push(s.clone());
+            }
         }
-        for (d, ns) in per {
+        let unresolved_count: usize = per.values().map(Vec::len).sum();
+        let code = if unresolved_count > 0 {
+            run_limits::exit_codes::UNRESOLVED_IMPORTS
+        } else {
+            run_limits::exit_codes::OK
+        };
+        boot_report::write_report_with_override(Some(("no_run", "")), Some(code as u32));
+        if args.json {
+            #[cfg(feature = "cli")]
+            {
+                use port_factory::json_output::{port_runner_no_run_data_json, JsonEnvelope};
+                let data = port_runner_no_run_data_json(
+                    &norm,
+                    exe.base,
+                    h.image_base,
+                    mods.len(),
+                    pe_mod_count,
+                    builtin_mod_count,
+                    load_elapsed_ms,
+                    &per,
+                    ops_report_json,
+                );
+                let err_msg = (unresolved_count > 0).then(|| {
+                    format!("{unresolved_count} unresolved static import(s) across {} DLL(s)", per.len())
+                });
+                run_limits::write_json_stdout(
+                    &JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty(),
+                );
+            }
+            if code != run_limits::exit_codes::OK {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+        for (d, ns) in &per {
             log::info!("unresolved {d} ({}): {}", ns.len(), ns.join(" "));
         }
         log::info!("--no-run: not executing");
-        boot_report::write_report_with_override(Some(("no_run", "")), Some(0));
+        if unresolved_count > 0 {
+            log::error!(
+                "--no-run: {unresolved_count} unresolved static import(s) across {} DLL(s); exiting with code {code}",
+                per.len()
+            );
+            std::process::exit(code);
+        }
         return Ok(());
+    }
+
+    // Install `--max-frames` / `--timeout-secs` / `--json` bounded-run controller
+    // before spawning any Windows guest thread.
+    if args.max_frames.is_some() || args.timeout_secs.is_some() || args.json {
+        run_limits::install(run_limits::RunLimitsConfig {
+            target_exe: norm.clone(),
+            max_frames: args.max_frames,
+            timeout_secs: args.timeout_secs,
+            json_mode: args.json,
+        });
+        run_limits::start_timeout_watchdog();
     }
 
     // Everything Windows-side runs on a Windows thread whose stack size comes
@@ -1640,6 +1903,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         log::info!("port-ios: Windows process exited with code {code}");
+        w::process::record_exit_code(code);
         w::process::run_exit_hooks();
         return Ok(());
     }
@@ -1804,5 +2068,37 @@ mod tests {
         assert!(resolve_fail_on_unimpl_op(None, Some("1"), false));
         assert!(resolve_fail_on_unimpl_op(Some(true), Some("0"), false));
         assert!(!resolve_fail_on_unimpl_op(Some(false), Some("1"), true));
+    }
+
+    #[test]
+    fn parse_json_and_run_limit_flags() {
+        let a = try_parse_args_from(
+            [
+                "--pe",
+                "/tmp/game/app.exe",
+                "--json",
+                "--timeout-secs",
+                "12.5",
+                "--max-frames",
+                "60",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(a.json);
+        assert_eq!(a.timeout_secs, Some(12.5));
+        assert_eq!(a.max_frames, Some(60));
+
+        // Reject 0 / negative / non-numeric values as usage errors.
+        assert!(try_parse_args_from(["--timeout-secs", "0"].into_iter().map(String::from)).is_err());
+        assert!(
+            try_parse_args_from(["--timeout-secs", "-5"].into_iter().map(String::from)).is_err()
+        );
+        assert!(
+            try_parse_args_from(["--timeout-secs", "nan"].into_iter().map(String::from)).is_err()
+        );
+        assert!(try_parse_args_from(["--max-frames", "0"].into_iter().map(String::from)).is_err());
+        assert!(try_parse_args_from(["--max-frames", "abc"].into_iter().map(String::from)).is_err());
     }
 }

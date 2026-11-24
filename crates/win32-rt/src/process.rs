@@ -582,10 +582,32 @@ pub fn exit_reason() -> (String, String) {
 }
 
 /// The code the process is exiting with through [`exit_process`] (ExitProcess, CRT exit
-/// paths, ...), or None (fatal faults, crash reports, still running). For exit hooks.
+/// paths, ...), or None (provisional crash reports before exit, or still running). For exit hooks.
 pub fn exit_code() -> Option<u32> {
     let c = EXIT_CODE.load(std::sync::atomic::Ordering::Acquire);
     (c != u64::MAX).then_some(c as u32)
+}
+
+/// Record the final Windows exit code (first writer wins) before running exit hooks
+/// on paths that terminate via `libc::_exit` directly (e.g. fatal signal handlers).
+pub fn record_exit_code(code: u32) {
+    let _ = EXIT_CODE.compare_exchange(
+        u64::MAX,
+        code as u64,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+/// Map a 32-bit Windows exit/NTSTATUS code to an 8-bit POSIX exit status without
+/// silently collapsing non-zero codes whose low byte is 0 into `0`.
+pub const fn posix_exit_code(win_code: u32) -> i32 {
+    if win_code == 0 {
+        0
+    } else {
+        let low = (win_code & 0xFF) as i32;
+        if low == 0 { 1 } else { low }
+    }
 }
 
 /// Register a function to run once when the process ends: ExitProcess,
@@ -920,11 +942,11 @@ pub fn exit_process(code: u32) -> ! {
     }
     crate::shadow::note_exit("exit_process", code as i64);
     log::info!("process exit, code {code} (0x{code:x})");
-    let _ = EXIT_CODE.compare_exchange(u64::MAX, code as u64, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    record_exit_code(code);
     run_exit_hooks();
     crate::ucrt::stdio::flush_all();
     report_exit_code_to_parent(code);
-    unsafe { libc::_exit(code as i32) }
+    unsafe { libc::_exit(posix_exit_code(code)) }
 }
 
 #[cfg(test)]
