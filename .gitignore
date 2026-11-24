@@ -16,7 +16,7 @@ __pycache__/
 *.log
 
 # Optional upstream reference checkouts (fetched via ./scripts/third_party.sh; no git submodules)
-/third_party/
+/third_party
 
 # Local analysis databases (regenerated from the user's own game install)
 /db/*.sqlite
@@ -30,7 +30,7 @@ __pycache__/
 /.rift
 
 # Ghidra project files (large, local)
-/re/ghidra/*.rep/
+/re/ghidra/*.rep
 /re/ghidra/*.gpr
 /re/ghidra/*.lock*
 /out/ghidra/

@@ -1,4 +1,4 @@
 # Ghidra project (local, large)
-*.rep/
+*.rep
 *.gpr
 *.lock*

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "defaultThreadEnvMode": "worktree",
+  "worktreeSubmodules": "none",
+  "scripts": [
+    {
+      "name": "Setup Worktree",
+      "command": "if [ -x ./scripts/worktree.sh ]; then ./scripts/worktree.sh setup; elif [ -n \"${T3CODE_PROJECT_ROOT:-}\" ] && [ -x \"$T3CODE_PROJECT_ROOT/scripts/worktree.sh\" ]; then \"$T3CODE_PROJECT_ROOT/scripts/worktree.sh\" setup; fi",
+      "icon": "configure",
+      "runOnWorktreeCreate": true,
+      "async": false
+    },
+    {
+      "name": "Clean Worktree Build",
+      "command": "if [ -x ./scripts/worktree.sh ]; then ./scripts/worktree.sh clean; elif [ -n \"${T3CODE_PROJECT_ROOT:-}\" ] && [ -x \"$T3CODE_PROJECT_ROOT/scripts/worktree.sh\" ]; then \"$T3CODE_PROJECT_ROOT/scripts/worktree.sh\" clean; fi",
+      "icon": "configure",
+      "runOnSettle": true
+    },
+    {
+      "name": "Build Runner",
+      "command": "cargo runner-build",
+      "icon": "build"
+    },
+    {
+      "name": "Factory Tests",
+      "command": "cargo factory-test -- --test-threads=1",
+      "icon": "test"
+    },
+    {
+      "name": "Doctor & Hygiene",
+      "command": ".agents/skills/audit-repo-hygiene/scripts/audit_repo_hygiene.sh --doctor",
+      "icon": "lint"
+    },
+    {
+      "name": "Build Shader Worker",
+      "command": "cargo build --release -p dxil-metal --bin dxil-metald",
+      "icon": "build"
+    },
+    {
+      "name": "Bootstrap Host",
+      "command": "./scripts/setup.sh",
+      "icon": "configure"
+    }
+  ]
+}
