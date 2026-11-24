@@ -37,6 +37,9 @@ import time
 from pathlib import Path
 
 
+EXIT_UNIMPL_OP = 86
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
@@ -192,11 +195,16 @@ def run_one_trial(args: argparse.Namespace, runner: Path, steps: list[str], tria
         cmd += ["--pe", args.pe]
     if args.game_dir:
         cmd += ["--game-dir", args.game_dir]
+    if args.fail_on_unimpl_op:
+        cmd += ["--fail-on-unimpl-op"]
+    else:
+        cmd += ["--no-fail-on-unimpl-op"]
     if args.game_args:
         cmd += ["--"] + args.game_args
 
     env = os.environ.copy()
     env["PORT_CONTROL_DIR"] = str(ctl_dir)
+    env["PORT_FAIL_ON_UNIMPL_OP"] = "1" if args.fail_on_unimpl_op else "0"
     if args.nan_boundary:
         env["PORT_NAN_BOUNDARY"] = "1"
     if args.audio_null:
@@ -318,7 +326,14 @@ def run_one_trial(args: argparse.Namespace, runner: Path, steps: list[str], tria
                             proc.wait(timeout=4)
 
                 crashed = proc.returncode not in (0, None, -15)
-                if not reached_ready:
+                hit_unimpl_op = proc.returncode == EXIT_UNIMPL_OP
+                if hit_unimpl_op:
+                    rc = 1
+                    print(
+                        f"{label}: BUG after +{frames_run} frames (unimplemented x86 instruction, exit code {EXIT_UNIMPL_OP})",
+                        flush=True,
+                    )
+                elif not reached_ready:
                     rc = 2
                     print(f"{label}: ERROR (did not reach ready state within {args.timeout_boot}s)", flush=True)
                 elif fail_hits or crashed or not pass_ok:
@@ -377,6 +392,8 @@ def main() -> int:
     ap.add_argument("--nantrace-arm", action="store_true", help="Send 'nantrace on' before steps and 'nantrace off' after")
     ap.add_argument("--nan-boundary", action="store_true", default=True, help="Set PORT_NAN_BOUNDARY=1 (default on)")
     ap.add_argument("--no-nan-boundary", dest="nan_boundary", action="store_false")
+    ap.add_argument("--fail-on-unimpl-op", action="store_true", default=True, help="Pass --fail-on-unimpl-op / PORT_FAIL_ON_UNIMPL_OP=1 (exit 86 on unimplemented x86 op; default on)")
+    ap.add_argument("--no-fail-on-unimpl-op", dest="fail_on_unimpl_op", action="store_false")
     ap.add_argument("--audio-null", action="store_true", default=True, help="Default AW2_AUDIO_BACKEND=null for headless/CI reliability")
     ap.add_argument("--keep-audio", dest="audio_null", action="store_false")
     ap.add_argument("--stop-early", action="store_true", help="Stop executing steps on first --fail-regex hit")

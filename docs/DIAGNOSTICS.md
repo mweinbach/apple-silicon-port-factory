@@ -231,6 +231,7 @@ cargo opsdb -- oracle out/nan_snaps/ --mxcsr 0x1f80
 |---|---|---|
 | `PORT_NAN_TRACE` | `x86-runtime::diag` | Semicolon-separated spec: `module=a.exe,b.dll;range=mod:lo..hi;watch=lo..hi;host=sym;dump_dir=DIR;log=FILE;stores=1;max=N;armed=0\|1`. Zero overhead when unset. |
 | `PORT_NAN_BOUNDARY=1` | `win32-rt` | Logs `[diag-boundary]` whenever non-finite floats cross middleware boundaries (e.g., `NvCloth::setSpheres`). |
+| `PORT_FAIL_ON_UNIMPL_OP=1\|0` | `x86-runtime` / `port-loader` | Aborts with documented exit code `86` (`EXIT_UNIMPL_OP`) and a crash report when the generic interpreter hits an unimplemented x86-64 instruction (CLI `--fail-on-unimpl-op` / `--no-fail-on-unimpl-op`; default **on** for CLI bring-up runs and `live-probe`). |
 | `PORT_JIT_SKIP` / `PORT_JIT_ALLOW` | `x86-runtime::diag` | Comma-separated `module:rva_lo..rva_hi` or absolute VA spans forced onto the interpreter. |
 | `PORT_AOT_SKIP` | `x86-runtime::diag` | Comma-separated `module:rva_lo..rva_hi` spans excluded from AOT lookup (falls back to Live JIT). |
 | `PORT_CONTROL_DIR=DIR` | `port-loader::live_ctl` | Enables frame-paced `<DIR>/cmd.txt` & `<DIR>/status.json` controller (`shot`, `key`, `mouse`, `moveto`, `click`, `wheel`, `pad`, `release`, `nantrace on\|off`, `quit`). |
