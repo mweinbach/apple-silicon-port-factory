@@ -1075,24 +1075,30 @@ pub unsafe extern "win64" fn GetProcessHeap() -> HANDLE {
 }
 
 pub unsafe extern "win64" fn GetProcessHeaps(n: u32, out: *mut HANDLE) -> u32 {
-    if n >= 1 && !out.is_null() {
-        *out = heap::process_heap();
+    let all = heap::all_heaps();
+    if !out.is_null() && (n as usize) >= all.len() {
+        for (i, &h) in all.iter().enumerate() {
+            std::ptr::write_unaligned(out.add(i), h);
+        }
     }
-    1
+    all.len() as u32
 }
 
 pub unsafe extern "win64" fn HeapCreate(_opts: u32, _init: usize, _max: usize) -> HANDLE {
     heap::create_heap()
 }
 
-pub unsafe extern "win64" fn HeapDestroy(_h: HANDLE) -> BOOL {
-    // Blocks of a destroyed heap are not tracked per heap; they leak.
-    stub!("HeapDestroy does not free outstanding blocks");
-    TRUE
+pub unsafe extern "win64" fn HeapDestroy(h: HANDLE) -> BOOL {
+    if heap::destroy_heap(h) {
+        TRUE
+    } else {
+        crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        FALSE
+    }
 }
 
-pub unsafe extern "win64" fn HeapAlloc(_h: HANDLE, flags: u32, size: usize) -> *mut c_void {
-    let p = heap::alloc(size, flags & heap::HEAP_ZERO_MEMORY != 0);
+pub unsafe extern "win64" fn HeapAlloc(h: HANDLE, flags: u32, size: usize) -> *mut c_void {
+    let p = heap::alloc_in(h, size, flags & heap::HEAP_ZERO_MEMORY != 0);
     if p.is_null() {
         crate::teb::set_last_error(err::ERROR_NOT_ENOUGH_MEMORY);
     }
@@ -1140,10 +1146,31 @@ pub unsafe extern "win64" fn HeapUnlock(_h: HANDLE) -> BOOL {
     TRUE
 }
 
-pub unsafe extern "win64" fn HeapWalk(_h: HANDLE, _e: *mut c_void) -> BOOL {
-    stub!("HeapWalk unsupported");
-    crate::teb::set_last_error(err::ERROR_NO_MORE_ITEMS);
-    FALSE
+pub unsafe extern "win64" fn HeapWalk(h: HANDLE, entry: *mut c_void) -> BOOL {
+    if entry.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // PROCESS_HEAP_ENTRY (x64, 40 bytes):
+    // +0 lpData(*mut c_void), +8 cbData(u32), +12 cbOverhead(u8),
+    // +13 iRegionIndex(u8), +14 wFlags(u16; 0x0004 = PROCESS_HEAP_ENTRY_BUSY)
+    let prev = std::ptr::read_unaligned(entry as *const *const c_void);
+    match heap::walk_next(h, prev) {
+        Some((ptr, sz)) => {
+            let p = entry as *mut u8;
+            std::ptr::write_bytes(p, 0, 40);
+            std::ptr::write_unaligned(p as *mut *mut c_void, ptr);
+            std::ptr::write_unaligned(p.add(8) as *mut u32, sz.min(u32::MAX as usize) as u32);
+            std::ptr::write_unaligned(p.add(12), 16u8);
+            std::ptr::write_unaligned(p.add(13), 0u8);
+            std::ptr::write_unaligned(p.add(14) as *mut u16, 0x0004u16); // PROCESS_HEAP_ENTRY_BUSY
+            TRUE
+        }
+        None => {
+            crate::teb::set_last_error(err::ERROR_NO_MORE_ITEMS);
+            FALSE
+        }
+    }
 }
 
 pub unsafe extern "win64" fn HeapSetInformation(_h: HANDLE, _c: u32, _i: *mut c_void, _l: usize) -> BOOL {
@@ -1268,6 +1295,37 @@ mod tests {
             assert_eq!(*(p as *const u8), 0x5A);
             assert_eq!(*((p + 0x11000) as *const u8), 0x5A);
             virtual_free(p, 0, MEM_RELEASE).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_heap_walk_and_destroy_track_and_free_blocks() {
+        unsafe {
+            let h = HeapCreate(0, 0, 0);
+            assert!(!h.is_null());
+            let p1 = HeapAlloc(h, heap::HEAP_ZERO_MEMORY, 64);
+            let p2 = HeapAlloc(h, heap::HEAP_ZERO_MEMORY, 128);
+            assert!(!p1.is_null() && !p2.is_null());
+
+            // Walk live entries on custom heap
+            let mut entry = [0u8; 40];
+            let mut seen = Vec::new();
+            while HeapWalk(h, entry.as_mut_ptr() as *mut c_void) == TRUE {
+                let ptr = (entry.as_ptr() as *const *mut c_void).read_unaligned();
+                let sz = (entry.as_ptr().add(8) as *const u32).read_unaligned();
+                let flags = (entry.as_ptr().add(14) as *const u16).read_unaligned();
+                assert_eq!(flags, 0x0004);
+                seen.push((ptr, sz));
+            }
+            assert_eq!(crate::teb::last_error(), err::ERROR_NO_MORE_ITEMS);
+            assert_eq!(seen.len(), 2);
+            assert!(seen.contains(&(p1, 64)));
+            assert!(seen.contains(&(p2, 128)));
+
+            // Destroying the heap frees outstanding blocks cleanly and rejects double-destroy.
+            assert_eq!(HeapDestroy(h), TRUE);
+            assert_eq!(HeapDestroy(h), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
         }
     }
 }

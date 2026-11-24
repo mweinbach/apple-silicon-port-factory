@@ -172,6 +172,10 @@ pub fn get() -> &'static Loader {
     LOADER.get().expect("loader not initialized")
 }
 
+pub fn try_get() -> Option<&'static Loader> {
+    LOADER.get()
+}
+
 impl Loader {
     fn new_instance(
         game_dir: PathBuf,

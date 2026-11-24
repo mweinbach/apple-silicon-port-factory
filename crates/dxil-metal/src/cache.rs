@@ -730,6 +730,12 @@ impl ShaderPipeline {
         0
     }
 
+    /// Snapshot Tier-1 shader cache stats if the global pipeline has been initialized
+    /// (never spawns `dxil-metald` or loads the converter lazily).
+    pub fn stats_if_initialized() -> Option<CacheStats> {
+        GLOBAL_PIPELINE.get().and_then(|r| r.as_ref().ok()).map(|p| p.stats())
+    }
+
     /// Records every [`compile`](Self::compile) request into `manifest` (for
     /// `dxil-metal prewarm --manifest`). [`global`](Self::global) enables this from the
     /// environment ([`crate::manifest::ManifestWriter::from_env`]).

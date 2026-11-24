@@ -11,20 +11,45 @@ macro_rules! fn_name {
     }};
 }
 
-/// Log that the enclosing API is only partially implemented / faked.
+/// Internal helper used by [`stub!`] and [`failing!`]. Records the hit in
+/// [`crate::stub_registry`] and logs the first 3 hits at `warn`, later ones at `trace`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __record_stub {
+    ($kind:expr, $api:expr, $($arg:tt)*) => {{
+        static SITE: $crate::stub_registry::StubSite = $crate::stub_registry::StubSite::new(
+            $kind,
+            module_path!(),
+            file!(),
+            line!(),
+        );
+        let api: &'static str = $api;
+        let n = SITE.record_hit(
+            api,
+            || ::std::fmt::format(format_args!($($arg)*)),
+        );
+        if n < 3 {
+            ::log::warn!(target: "stub", "STUB {}: {}", api, format_args!($($arg)*));
+        } else {
+            ::log::trace!(target: "stub", "STUB {}: {}", api, format_args!($($arg)*));
+        }
+    }};
+}
+
+/// Log that the enclosing API is only partially implemented / faked and record
+/// the hit in the global [`crate::stub_registry`].
 ///
 /// The first few hits per call site are logged at `warn` (target `stub`),
-/// later ones at `trace`, so `grep STUB` finds every fake behaviour.
+/// later ones at `trace`, so `grep STUB` finds every fake behaviour and the
+/// exit hook prints a ranked summary table.
 #[macro_export]
 macro_rules! stub {
     ($($arg:tt)*) => {{
-        static HITS: ::std::sync::atomic::AtomicU32 = ::std::sync::atomic::AtomicU32::new(0);
-        let n = HITS.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-        if n < 3 {
-            ::log::warn!(target: "stub", "STUB {}: {}", $crate::fn_name!(), format_args!($($arg)*));
-        } else {
-            ::log::trace!(target: "stub", "STUB {}: {}", $crate::fn_name!(), format_args!($($arg)*));
-        }
+        $crate::__record_stub!(
+            $crate::stub_registry::StubKind::Stub,
+            $crate::fn_name!(),
+            $($arg)*
+        );
     }};
 }
 
@@ -53,7 +78,14 @@ macro_rules! failing {
             if e != 0 {
                 $crate::teb::set_last_error(e);
             }
-            $crate::stub!("{} -> {} (last error {})", stringify!($name), stringify!($val), e);
+            $crate::__record_stub!(
+                $crate::stub_registry::StubKind::Failing,
+                stringify!($name),
+                "{} -> {} (last error {})",
+                stringify!($name),
+                stringify!($val),
+                e
+            );
             $val
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -62,7 +94,14 @@ macro_rules! failing {
             if e != 0 {
                 $crate::teb::set_last_error(e);
             }
-            $crate::stub!("{} -> {} (last error {})", stringify!($name), stringify!($val), e);
+            $crate::__record_stub!(
+                $crate::stub_registry::StubKind::Failing,
+                stringify!($name),
+                "{} -> {} (last error {})",
+                stringify!($name),
+                stringify!($val),
+                e
+            );
             $val
         }
     )*};

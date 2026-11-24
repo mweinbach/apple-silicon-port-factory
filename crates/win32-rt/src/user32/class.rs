@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::types::*;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const CS_DBLCLKS: u32 = 0x0008;
@@ -14,14 +15,17 @@ pub const CS_DBLCLKS: u32 = 0x0008;
 pub struct Class {
     pub atom: ATOM,
     pub name: String,
-    pub style: u32,
-    pub wndproc: usize,
+    pub style: AtomicU32,
+    pub wndproc: AtomicUsize,
     pub cls_extra: i32,
     pub wnd_extra: i32,
-    pub instance: usize,
-    pub icon: usize,
+    pub instance: AtomicUsize,
+    pub icon: AtomicUsize,
+    pub icon_sm: AtomicUsize,
     pub cursor: Mutex<usize>,
-    pub background: usize,
+    pub background: AtomicUsize,
+    pub menu_name: AtomicUsize,
+    pub extra: Mutex<Vec<u8>>,
     pub unicode: bool,
 }
 
@@ -107,14 +111,17 @@ pub fn register(d: ClassDesc) -> ATOM {
     t.classes.push(Arc::new(Class {
         atom,
         name: d.name,
-        style: d.style,
-        wndproc: d.wndproc,
+        style: AtomicU32::new(d.style),
+        wndproc: AtomicUsize::new(d.wndproc),
         cls_extra: d.cls_extra,
         wnd_extra: d.wnd_extra,
-        instance: d.instance,
-        icon: d.icon,
+        instance: AtomicUsize::new(d.instance),
+        icon: AtomicUsize::new(d.icon),
+        icon_sm: AtomicUsize::new(d.icon),
         cursor: Mutex::new(d.cursor),
-        background: d.background,
+        background: AtomicUsize::new(d.background),
+        menu_name: AtomicUsize::new(0),
+        extra: Mutex::new(vec![0u8; d.cls_extra.max(0) as usize]),
         unicode: d.unicode,
     }));
     atom
@@ -255,28 +262,28 @@ pub unsafe extern "win64" fn UnregisterClassA(name: LPCSTR, _inst: HINSTANCE) ->
 unsafe fn fill_info(c: &Class, out: *mut WNDCLASSEX, ex: bool) {
     if ex {
         let o = &mut *out;
-        o.style = c.style;
-        o.wndproc = c.wndproc;
+        o.style = c.style.load(Ordering::Relaxed);
+        o.wndproc = c.wndproc.load(Ordering::Relaxed);
         o.cls_extra = c.cls_extra;
         o.wnd_extra = c.wnd_extra;
-        o.instance = c.instance;
-        o.icon = c.icon;
+        o.instance = c.instance.load(Ordering::Relaxed);
+        o.icon = c.icon.load(Ordering::Relaxed);
         o.cursor = *c.cursor.lock().unwrap();
-        o.background = c.background;
-        o.menu_name = 0;
-        o.icon_sm = c.icon;
+        o.background = c.background.load(Ordering::Relaxed);
+        o.menu_name = c.menu_name.load(Ordering::Relaxed);
+        o.icon_sm = c.icon_sm.load(Ordering::Relaxed);
         // class_name is left as passed in by the caller (documented behaviour).
     } else {
         let o = &mut *(out as *mut WNDCLASS);
-        o.style = c.style;
-        o.wndproc = c.wndproc;
+        o.style = c.style.load(Ordering::Relaxed);
+        o.wndproc = c.wndproc.load(Ordering::Relaxed);
         o.cls_extra = c.cls_extra;
         o.wnd_extra = c.wnd_extra;
-        o.instance = c.instance;
-        o.icon = c.icon;
+        o.instance = c.instance.load(Ordering::Relaxed);
+        o.icon = c.icon.load(Ordering::Relaxed);
         o.cursor = *c.cursor.lock().unwrap();
-        o.background = c.background;
-        o.menu_name = 0;
+        o.background = c.background.load(Ordering::Relaxed);
+        o.menu_name = c.menu_name.load(Ordering::Relaxed);
     }
 }
 
@@ -340,6 +347,119 @@ mod tests {
             assert!(find(&ClassName::Name("aw2testclassa".into())).is_some());
             assert_eq!(UnregisterClassW(name.as_ptr(), std::ptr::null_mut()), TRUE);
             assert!(find(&ClassName::Atom(a)).is_none());
+        }
+    }
+
+    #[test]
+    fn nonclient_metrics_a_and_w_succeed() {
+        use super::misc::{LogFontA, LogFontW, NonClientMetricsA, NonClientMetricsW};
+        use core::mem::{offset_of, size_of};
+
+        // Verify exact documented Win32 struct sizes and field byte offsets.
+        assert_eq!(size_of::<LogFontA>(), 60);
+        assert_eq!(size_of::<LogFontW>(), 92);
+        assert_eq!(size_of::<NonClientMetricsA>(), 344);
+        assert_eq!(size_of::<NonClientMetricsW>(), 504);
+
+        assert_eq!(offset_of!(NonClientMetricsA, cb_size), 0);
+        assert_eq!(offset_of!(NonClientMetricsA, i_border_width), 4);
+        assert_eq!(offset_of!(NonClientMetricsA, i_scroll_width), 8);
+        assert_eq!(offset_of!(NonClientMetricsA, i_scroll_height), 12);
+        assert_eq!(offset_of!(NonClientMetricsA, i_caption_width), 16);
+        assert_eq!(offset_of!(NonClientMetricsA, i_caption_height), 20);
+        assert_eq!(offset_of!(NonClientMetricsA, lf_caption_font), 24);
+        assert_eq!(offset_of!(NonClientMetricsA, i_sm_caption_width), 84);
+        assert_eq!(offset_of!(NonClientMetricsA, i_sm_caption_height), 88);
+        assert_eq!(offset_of!(NonClientMetricsA, lf_sm_caption_font), 92);
+        assert_eq!(offset_of!(NonClientMetricsA, i_menu_width), 152);
+        assert_eq!(offset_of!(NonClientMetricsA, i_menu_height), 156);
+        assert_eq!(offset_of!(NonClientMetricsA, lf_menu_font), 160);
+        assert_eq!(offset_of!(NonClientMetricsA, lf_status_font), 220);
+        assert_eq!(offset_of!(NonClientMetricsA, lf_message_font), 280);
+        assert_eq!(offset_of!(NonClientMetricsA, i_padded_border_width), 340);
+
+        assert_eq!(offset_of!(NonClientMetricsW, cb_size), 0);
+        assert_eq!(offset_of!(NonClientMetricsW, i_border_width), 4);
+        assert_eq!(offset_of!(NonClientMetricsW, i_scroll_width), 8);
+        assert_eq!(offset_of!(NonClientMetricsW, i_scroll_height), 12);
+        assert_eq!(offset_of!(NonClientMetricsW, i_caption_width), 16);
+        assert_eq!(offset_of!(NonClientMetricsW, i_caption_height), 20);
+        assert_eq!(offset_of!(NonClientMetricsW, lf_caption_font), 24);
+        assert_eq!(offset_of!(NonClientMetricsW, i_sm_caption_width), 116);
+        assert_eq!(offset_of!(NonClientMetricsW, i_sm_caption_height), 120);
+        assert_eq!(offset_of!(NonClientMetricsW, lf_sm_caption_font), 124);
+        assert_eq!(offset_of!(NonClientMetricsW, i_menu_width), 216);
+        assert_eq!(offset_of!(NonClientMetricsW, i_menu_height), 220);
+        assert_eq!(offset_of!(NonClientMetricsW, lf_menu_font), 224);
+        assert_eq!(offset_of!(NonClientMetricsW, lf_status_font), 316);
+        assert_eq!(offset_of!(NonClientMetricsW, lf_message_font), 408);
+        assert_eq!(offset_of!(NonClientMetricsW, i_padded_border_width), 500);
+
+        unsafe {
+            // NONCLIENTMETRICSA (Vista+ 344 bytes)
+            let mut ncm_a = vec![0u8; 344];
+            (ncm_a.as_mut_ptr() as *mut u32).write_unaligned(344);
+            assert_eq!(
+                super::misc::SystemParametersInfoA(0x0029, 344, ncm_a.as_mut_ptr(), 0),
+                TRUE
+            );
+            assert_eq!((ncm_a.as_ptr().add(4) as *const i32).read_unaligned(), 1);
+            assert_eq!((ncm_a.as_ptr().add(8) as *const i32).read_unaligned(), 17);
+            assert_eq!((ncm_a.as_ptr().add(16) as *const i32).read_unaligned(), 36);
+            assert_eq!((ncm_a.as_ptr().add(24) as *const i32).read_unaligned(), -12);
+            assert_eq!(&ncm_a[24 + 28..24 + 28 + 9], b"Segoe UI\0");
+            assert_eq!((ncm_a.as_ptr().add(84) as *const i32).read_unaligned(), 22);
+            assert_eq!((ncm_a.as_ptr().add(88) as *const i32).read_unaligned(), 22);
+            assert_eq!(&ncm_a[92 + 28..92 + 28 + 9], b"Segoe UI\0");
+            assert_eq!((ncm_a.as_ptr().add(152) as *const i32).read_unaligned(), 19);
+            assert_eq!((ncm_a.as_ptr().add(156) as *const i32).read_unaligned(), 19);
+            assert_eq!(&ncm_a[160 + 28..160 + 28 + 9], b"Segoe UI\0");
+            assert_eq!(&ncm_a[220 + 28..220 + 28 + 9], b"Segoe UI\0");
+            assert_eq!(&ncm_a[280 + 28..280 + 28 + 9], b"Segoe UI\0");
+            assert_eq!((ncm_a.as_ptr().add(340) as *const i32).read_unaligned(), 4);
+
+            // Pre-Vista 340-byte NONCLIENTMETRICSA must not overwrite past byte 340.
+            let mut ncm_a_old = vec![0xAAu8; 344];
+            (ncm_a_old.as_mut_ptr() as *mut u32).write_unaligned(340);
+            assert_eq!(
+                super::misc::SystemParametersInfoA(0x0029, 340, ncm_a_old.as_mut_ptr(), 0),
+                TRUE
+            );
+            assert_eq!(&ncm_a_old[340..344], &[0xAAu8; 4]);
+
+            // NONCLIENTMETRICSW (Vista+ 504 bytes)
+            let mut ncm_w = vec![0u8; 504];
+            (ncm_w.as_mut_ptr() as *mut u32).write_unaligned(504);
+            assert_eq!(
+                super::misc::SystemParametersInfoW(0x0029, 504, ncm_w.as_mut_ptr(), 0),
+                TRUE
+            );
+            assert_eq!((ncm_w.as_ptr().add(24) as *const i32).read_unaligned(), -12);
+            assert_eq!(
+                crate::strings::from_wide(ncm_w.as_ptr().add(24 + 28) as *const u16),
+                "Segoe UI"
+            );
+            assert_eq!((ncm_w.as_ptr().add(116) as *const i32).read_unaligned(), 22);
+            assert_eq!((ncm_w.as_ptr().add(120) as *const i32).read_unaligned(), 22);
+            assert_eq!(
+                crate::strings::from_wide(ncm_w.as_ptr().add(124 + 28) as *const u16),
+                "Segoe UI"
+            );
+            assert_eq!((ncm_w.as_ptr().add(216) as *const i32).read_unaligned(), 19);
+            assert_eq!((ncm_w.as_ptr().add(220) as *const i32).read_unaligned(), 19);
+            assert_eq!(
+                crate::strings::from_wide(ncm_w.as_ptr().add(224 + 28) as *const u16),
+                "Segoe UI"
+            );
+            assert_eq!(
+                crate::strings::from_wide(ncm_w.as_ptr().add(316 + 28) as *const u16),
+                "Segoe UI"
+            );
+            assert_eq!(
+                crate::strings::from_wide(ncm_w.as_ptr().add(408 + 28) as *const u16),
+                "Segoe UI"
+            );
+            assert_eq!((ncm_w.as_ptr().add(500) as *const i32).read_unaligned(), 4);
         }
     }
 }

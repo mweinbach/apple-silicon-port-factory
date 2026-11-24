@@ -515,6 +515,14 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
         l.wait_symbols();
     }
     line(format!("==================== AW2 CRASH REPORT: {title} ===================="));
+    let reason_kind = if title.starts_with("unimplemented import ") {
+        "unimplemented_import"
+    } else if title.contains("stall") || title.contains("hang") {
+        "stall"
+    } else {
+        "crash"
+    };
+    crate::process::record_exit_reason(reason_kind, title);
     let teb = crate::teb::current_raw();
     let win_tid = if teb.is_null() { 0 } else { crate::teb::thread_id() };
     let wname = crate::thread::current_thread_object()

@@ -1159,7 +1159,7 @@ pub fn native_mouse(ev: NativeMouse) {
             }
             let pos = if super::cursor::relative_mode() { client_of(target, super::cursor::cursor_pos()) } else { pos };
             let Some(p) = pos else { return };
-            let dbl = down && clicks >= 2 && clicks % 2 == 0 && window::get(target).is_some_and(|w| w.class.style & super::class::CS_DBLCLKS != 0);
+            let dbl = down && clicks >= 2 && clicks % 2 == 0 && window::get(target).is_some_and(|w| w.class.style.load(Ordering::Relaxed) & super::class::CS_DBLCLKS != 0);
             let (msg, xbtn) = match (button, down, dbl) {
                 (MouseButton::Left, true, false) => (wm::LBUTTONDOWN, 0),
                 (MouseButton::Left, true, true) => (wm::LBUTTONDBLCLK, 0),

@@ -1215,3 +1215,344 @@ fn crypt_string_to_binary_all_flags_and_encode_object_ex_structures() {
         );
     }
 }
+
+#[test]
+fn crypt_binary_to_string_dpapi_and_cert_compare_work() {
+    use crate::misc::wintrust::CryptDataBlob;
+    unsafe {
+        // 1. CryptBinaryToStringA/W round-trip with CryptStringToBinaryA
+        let sample = b"Hello Crypt32 BinaryToString!";
+        let mut cch = 0u32;
+        assert_eq!(
+            CryptBinaryToStringA(
+                sample.as_ptr(),
+                sample.len() as u32,
+                0x0000_0001 | 0x4000_0000, // CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+                std::ptr::null_mut(),
+                &mut cch
+            ),
+            TRUE
+        );
+        assert!(cch > 1);
+        let mut out_a = vec![0u8; cch as usize];
+        assert_eq!(
+            CryptBinaryToStringA(
+                sample.as_ptr(),
+                sample.len() as u32,
+                0x0000_0001 | 0x4000_0000,
+                out_a.as_mut_ptr(),
+                &mut cch
+            ),
+            TRUE
+        );
+        let b64 = std::str::from_utf8(&out_a[..cch as usize]).unwrap();
+        assert_eq!(b64, "SGVsbG8gQ3J5cHQzMiBCaW5hcnlUb1N0cmluZyE=");
+
+        // Wide hex raw
+        let raw_hex = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let mut wcch = 0u32;
+        assert_eq!(
+            CryptBinaryToStringW(
+                raw_hex.as_ptr(),
+                4,
+                0x0000_000C | 0x4000_0000, // HEXRAW | NOCRLF
+                std::ptr::null_mut(),
+                &mut wcch
+            ),
+            TRUE
+        );
+        let mut out_w = vec![0u16; wcch as usize];
+        assert_eq!(
+            CryptBinaryToStringW(
+                raw_hex.as_ptr(),
+                4,
+                0x0000_000C | 0x4000_0000,
+                out_w.as_mut_ptr(),
+                &mut wcch
+            ),
+            TRUE
+        );
+        assert_eq!(String::from_utf16_lossy(&out_w[..wcch as usize]), "deadbeef");
+
+        // 2. CertCompareIntegerBlob (redundant sign-extension bytes match)
+        let i1 = [0x2Au8];
+        let i2 = [0x2Au8, 0x00, 0x00];
+        let b1 = CryptDataBlob { cb_data: 1, pb_data: i1.as_ptr() as *mut u8 };
+        let b2 = CryptDataBlob { cb_data: 3, pb_data: i2.as_ptr() as *mut u8 };
+        assert_eq!(CertCompareIntegerBlob(&b1 as *const _ as *const c_void, &b2 as *const _ as *const c_void), TRUE);
+
+        // 3. CertCompareCertificateName
+        let n1 = b"\x30\x05\x31\x03test";
+        let nb1 = CryptDataBlob { cb_data: n1.len() as u32, pb_data: n1.as_ptr() as *mut u8 };
+        assert_eq!(CertCompareCertificateName(1, &nb1 as *const _ as *const c_void, &nb1 as *const _ as *const c_void), TRUE);
+
+        // 4. CryptProtectData / CryptUnprotectData with entropy + tamper rejection
+        let secret = b"top secret game token 12345";
+        let ent = b"app-entropy";
+        let descr = crate::strings::to_wide_z("session-key");
+        let in_blob = CryptDataBlob { cb_data: secret.len() as u32, pb_data: secret.as_ptr() as *mut u8 };
+        let ent_blob = CryptDataBlob { cb_data: ent.len() as u32, pb_data: ent.as_ptr() as *mut u8 };
+        let mut protected = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptProtectData(
+                &in_blob as *const _ as *const c_void,
+                descr.as_ptr(),
+                &ent_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut protected as *mut _ as *mut c_void
+            ),
+            TRUE
+        );
+        assert!(protected.cb_data > secret.len() as u32);
+
+        let mut recovered = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        let mut out_descr: LPWSTR = std::ptr::null_mut();
+        assert_eq!(
+            CryptUnprotectData(
+                &protected as *const _ as *const c_void,
+                &mut out_descr,
+                &ent_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut recovered as *mut _ as *mut c_void
+            ),
+            TRUE
+        );
+        assert_eq!(
+            std::slice::from_raw_parts(recovered.pb_data, recovered.cb_data as usize),
+            secret
+        );
+        assert_eq!(crate::strings::from_wide(out_descr), "session-key");
+
+        // Wrong entropy fails cleanly with ERROR_INVALID_DATA
+        let bad_ent = b"wrong-entropy";
+        let bad_blob = CryptDataBlob { cb_data: bad_ent.len() as u32, pb_data: bad_ent.as_ptr() as *mut u8 };
+        let mut fail_out = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptUnprotectData(
+                &protected as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                &bad_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        crate::kernel32::memory::LocalFree(protected.pb_data as *mut c_void);
+        crate::kernel32::memory::LocalFree(recovered.pb_data as *mut c_void);
+        crate::kernel32::memory::LocalFree(out_descr as *mut c_void);
+    }
+}
+
+#[test]
+fn dpapi_uses_0600_host_secrets_and_isolates_secrets_and_machine_scope() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct EnvGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_drive: Option<std::ffi::OsString>,
+        prev_user: Option<String>,
+        dirs: Vec<std::path::PathBuf>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
+                None => std::env::remove_var("TRANSLATOR_HOME"),
+            }
+            match &self.prev_drive {
+                Some(v) => std::env::set_var("AW2_DRIVE_C", v),
+                None => std::env::remove_var("AW2_DRIVE_C"),
+            }
+            crate::process::set_env("USERNAME", self.prev_user.as_deref());
+            for d in &self.dirs {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    let base = std::env::temp_dir().join(format!("pf_dpapi_test_{}", std::process::id()));
+    let dir_a = base.join("profile_a");
+    let dir_b = base.join("profile_b");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let _guard = EnvGuard {
+        prev_home: std::env::var_os("TRANSLATOR_HOME"),
+        prev_drive: std::env::var_os("AW2_DRIVE_C"),
+        prev_user: crate::process::get_env("USERNAME"),
+        dirs: vec![base.clone()],
+    };
+
+    std::env::set_var("TRANSLATOR_HOME", &dir_a);
+    std::env::remove_var("AW2_DRIVE_C");
+    crate::process::set_env("USERNAME", Some("alice"));
+
+    unsafe {
+        let payload = b"dpapi-secret-payload-v2";
+        let in_blob = CryptDataBlob {
+            cb_data: payload.len() as u32,
+            pb_data: payload.as_ptr() as *mut u8,
+        };
+
+        // 1. User-scoped protect creates a 32-byte 0600 secret file under profile_a.
+        let mut user_ct = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptProtectData(
+                &in_blob as *const _ as *const c_void,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut user_ct as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        let user_key_path = asn1::dpapi_secret_path(false);
+        let meta = std::fs::metadata(&user_key_path).expect("user secret file must exist");
+        assert_eq!(meta.len(), 32);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        // 2. Same user & same secret decrypts cleanly.
+        let mut out = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptUnprotectData(
+                &user_ct as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut out as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(std::slice::from_raw_parts(out.pb_data, out.cb_data as usize), payload);
+        crate::kernel32::memory::LocalFree(out.pb_data as *mut c_void);
+
+        // 3. Different user ("bob") on same machine CANNOT decrypt alice's user-scoped blob.
+        crate::process::set_env("USERNAME", Some("bob"));
+        let mut fail_out = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptUnprotectData(
+                &user_ct as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        // 4. Same user ("alice") under a DIFFERENT host secret (profile_b) CANNOT decrypt it.
+        crate::process::set_env("USERNAME", Some("alice"));
+        std::env::set_var("TRANSLATOR_HOME", &dir_b);
+        assert_eq!(
+            CryptUnprotectData(
+                &user_ct as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        // 5. CRYPTPROTECT_LOCAL_MACHINE (0x4): distinct 0600 machine secret; decryptable by
+        //    another user ("bob") on the same machine, NOT decryptable under profile_b's secret.
+        std::env::set_var("TRANSLATOR_HOME", &dir_a);
+        crate::process::set_env("USERNAME", Some("alice"));
+        let mut mach_ct = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptProtectData(
+                &in_blob as *const _ as *const c_void,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0x4, // CRYPTPROTECT_LOCAL_MACHINE
+                &mut mach_ct as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        let mach_key_path = asn1::dpapi_secret_path(true);
+        assert_ne!(mach_key_path, user_key_path);
+        let mmeta = std::fs::metadata(&mach_key_path).expect("machine secret file must exist");
+        assert_eq!(mmeta.len(), 32);
+        assert_eq!(mmeta.permissions().mode() & 0o777, 0o600);
+
+        // Another user on the same machine succeeds for CRYPTPROTECT_LOCAL_MACHINE.
+        crate::process::set_env("USERNAME", Some("bob"));
+        let mut mach_out = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptUnprotectData(
+                &mach_ct as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut mach_out as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(std::slice::from_raw_parts(mach_out.pb_data, mach_out.cb_data as usize), payload);
+        crate::kernel32::memory::LocalFree(mach_out.pb_data as *mut c_void);
+
+        // Switching to profile_b's different machine secret fails cleanly.
+        std::env::set_var("TRANSLATOR_HOME", &dir_b);
+        assert_eq!(
+            CryptUnprotectData(
+                &mach_ct as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        // Flipping the scope flag in the envelope fails MAC verification even back on profile_a.
+        std::env::set_var("TRANSLATOR_HOME", &dir_a);
+        let mut tampered = std::slice::from_raw_parts(mach_ct.pb_data, mach_ct.cb_data as usize).to_vec();
+        tampered[8] ^= 0x4;
+        let tampered_blob = CryptDataBlob {
+            cb_data: tampered.len() as u32,
+            pb_data: tampered.as_mut_ptr(),
+        };
+        assert_eq!(
+            CryptUnprotectData(
+                &tampered_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        crate::kernel32::memory::LocalFree(user_ct.pb_data as *mut c_void);
+        crate::kernel32::memory::LocalFree(mach_ct.pb_data as *mut c_void);
+    }
+}

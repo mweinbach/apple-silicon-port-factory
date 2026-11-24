@@ -270,7 +270,7 @@ fn native_desc(w: &Window, d: &WinData) -> crate::macos::NativeDesc {
         exstyle: d.exstyle,
         title: String::from_utf16_lossy(&d.text),
         topmost: d.topmost,
-        dblclks: w.class.style & class::CS_DBLCLKS != 0,
+        dblclks: w.class.style.load(Ordering::Relaxed) & class::CS_DBLCLKS != 0,
     }
 }
 
@@ -552,7 +552,7 @@ pub unsafe fn create_window(a: CreateArgs) -> usize {
         tid,
         class: cls.clone(),
         d: Mutex::new(WinData {
-            wndproc: cls.wndproc,
+            wndproc: cls.wndproc.load(Ordering::Relaxed),
             style: style & !ws::VISIBLE,
             exstyle,
             parent: if style & ws::CHILD != 0 { parent } else { 0 },
@@ -1913,22 +1913,44 @@ pub unsafe extern "win64" fn SetWindowLongA(hwnd: HWND, idx: i32, v: i32) -> i32
     set_long(hwnd as usize, idx, v as isize, 4) as i32
 }
 
+const GCLP_MENUNAME: i32 = -8;
+const GCLP_HBRBACKGROUND: i32 = -10;
 const GCLP_HCURSOR: i32 = -12;
 const GCLP_HICON: i32 = -14;
+const GCLP_HMODULE: i32 = -16;
+const GCL_CBWNDEXTRA: i32 = -18;
+const GCL_CBCLSEXTRA: i32 = -20;
 const GCLP_WNDPROC: i32 = -24;
 const GCL_STYLE: i32 = -26;
 const GCW_ATOM: i32 = -32;
+const GCLP_HICONSM: i32 = -34;
+const ERROR_INVALID_INDEX: u32 = 1413;
 
 pub unsafe extern "win64" fn GetClassLongPtrW(hwnd: HWND, idx: i32) -> usize {
     let Some(w) = require(hwnd as usize) else { return 0 };
+    if idx >= 0 {
+        let extra = w.class.extra.lock().unwrap();
+        let off = idx as usize;
+        if off.saturating_add(8) <= extra.len() {
+            return usize::from_ne_bytes(extra[off..off + 8].try_into().unwrap());
+        }
+        set_error(ERROR_INVALID_INDEX);
+        return 0;
+    }
     match idx {
+        GCLP_MENUNAME => w.class.menu_name.load(Ordering::Relaxed),
+        GCLP_HBRBACKGROUND => w.class.background.load(Ordering::Relaxed),
         GCLP_HCURSOR => *w.class.cursor.lock().unwrap(),
-        GCLP_HICON => w.class.icon,
-        GCLP_WNDPROC => w.class.wndproc,
-        GCL_STYLE => w.class.style as usize,
+        GCLP_HICON => w.class.icon.load(Ordering::Relaxed),
+        GCLP_HMODULE => w.class.instance.load(Ordering::Relaxed),
+        GCL_CBWNDEXTRA => w.class.wnd_extra as usize,
+        GCL_CBCLSEXTRA => w.class.cls_extra as usize,
+        GCLP_WNDPROC => w.class.wndproc.load(Ordering::Relaxed),
+        GCL_STYLE => w.class.style.load(Ordering::Relaxed) as usize,
         GCW_ATOM => w.class.atom as usize,
+        GCLP_HICONSM => w.class.icon_sm.load(Ordering::Relaxed),
         _ => {
-            stub!("GetClassLongPtrW(index {idx}) -> 0");
+            set_error(ERROR_INVALID_INDEX);
             0
         }
     }
@@ -1936,10 +1958,28 @@ pub unsafe extern "win64" fn GetClassLongPtrW(hwnd: HWND, idx: i32) -> usize {
 
 pub unsafe extern "win64" fn SetClassLongPtrW(hwnd: HWND, idx: i32, v: usize) -> usize {
     let Some(w) = require(hwnd as usize) else { return 0 };
+    if idx >= 0 {
+        let mut extra = w.class.extra.lock().unwrap();
+        let off = idx as usize;
+        if off.saturating_add(8) <= extra.len() {
+            let prev = usize::from_ne_bytes(extra[off..off + 8].try_into().unwrap());
+            extra[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+            return prev;
+        }
+        set_error(ERROR_INVALID_INDEX);
+        return 0;
+    }
     match idx {
+        GCLP_MENUNAME => w.class.menu_name.swap(v, Ordering::AcqRel),
+        GCLP_HBRBACKGROUND => w.class.background.swap(v, Ordering::AcqRel),
         GCLP_HCURSOR => std::mem::replace(&mut *w.class.cursor.lock().unwrap(), v),
+        GCLP_HICON => w.class.icon.swap(v, Ordering::AcqRel),
+        GCLP_HMODULE => w.class.instance.swap(v, Ordering::AcqRel),
+        GCLP_WNDPROC => w.class.wndproc.swap(v, Ordering::AcqRel),
+        GCL_STYLE => w.class.style.swap(v as u32, Ordering::AcqRel) as usize,
+        GCLP_HICONSM => w.class.icon_sm.swap(v, Ordering::AcqRel),
         _ => {
-            stub!("SetClassLongPtrW(index {idx}) ignored");
+            set_error(ERROR_INVALID_INDEX);
             0
         }
     }

@@ -73,7 +73,7 @@ pub unsafe fn def_window_proc(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPA
         wm::ERASEBKGND => {
             // The class background brush would be painted here. Nothing is
             // drawn into the Metal layer; report it as erased if a brush exists.
-            window::get(hwnd).map(|w| (w.class.background != 0) as LRESULT).unwrap_or(0)
+            window::get(hwnd).map(|w| (w.class.background.load(std::sync::atomic::Ordering::Relaxed) != 0) as LRESULT).unwrap_or(0)
         }
         wm::SETTEXT => {
             let text = if lparam == 0 { Vec::new() } else { crate::strings::wide_slice(lparam as *const u16).to_vec() };

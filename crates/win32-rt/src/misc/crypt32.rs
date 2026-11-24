@@ -16,6 +16,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use store::{CRYPT_E_NOT_FOUND, ERROR_CALL_NOT_IMPLEMENTED};
 
+pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
 pub(crate) use chain::verify_peer_chain_error;
 #[allow(unused_imports)]
 pub(crate) use chain::{
@@ -37,21 +38,18 @@ pub(crate) fn default_root_store() -> Arc<rustls::RootCertStore> {
     crate::net_tls::root_cert_store()
 }
 
-// @exports PFXImportCertStore CertFindExtension CryptMsgOpenToDecode CryptFindOIDInfo
+// @exports PFXImportCertStore CryptMsgOpenToDecode CryptFindOIDInfo
 failing!(*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND;
     PFXImportCertStore,
-    CertFindExtension,
     CryptMsgOpenToDecode, CryptFindOIDInfo);
 
-// @exports CertCompareCertificateName CertCompareIntegerBlob CertGetCertificateContextProperty CertStrToNameA CertStrToNameW CertVerifySubjectCertificateContext CryptBinaryToStringA CryptBinaryToStringW CryptDecodeObject CryptDecodeObjectEx CryptImportPublicKeyInfo CryptMsgUpdate CryptProtectData CryptUnprotectData CryptVerifyMessageSignature
+// @exports CertGetCertificateContextProperty CertStrToNameA CertStrToNameW CertVerifySubjectCertificateContext CryptDecodeObject CryptDecodeObjectEx CryptImportPublicKeyInfo CryptMsgUpdate CryptVerifyMessageSignature
 failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    CertCompareCertificateName, CertCompareIntegerBlob,
     CertGetCertificateContextProperty,
     CertStrToNameA, CertStrToNameW,
-    CertVerifySubjectCertificateContext, CryptBinaryToStringA,
-    CryptBinaryToStringW, CryptDecodeObject, CryptDecodeObjectEx,
+    CertVerifySubjectCertificateContext,
+    CryptDecodeObject, CryptDecodeObjectEx,
     CryptImportPublicKeyInfo, CryptMsgUpdate,
-    CryptProtectData, CryptUnprotectData,
     CryptVerifyMessageSignature);
 
 // ---------------------------------------------------------------------------
@@ -425,6 +423,89 @@ pub unsafe extern "win64" fn CryptStringToBinaryW(
         pcb_binary,
         pdw_skip,
         pdw_flags,
+    )
+}
+
+pub unsafe extern "win64" fn CryptBinaryToStringA(
+    pb_binary: *const u8,
+    cb_binary: u32,
+    dw_flags: u32,
+    psz_string: LPSTR,
+    pcch_string: *mut u32,
+) -> BOOL {
+    asn1::crypt_binary_to_string_a_impl(pb_binary, cb_binary, dw_flags, psz_string, pcch_string)
+}
+
+pub unsafe extern "win64" fn CryptBinaryToStringW(
+    pb_binary: *const u8,
+    cb_binary: u32,
+    dw_flags: u32,
+    psz_string: LPWSTR,
+    pcch_string: *mut u32,
+) -> BOOL {
+    asn1::crypt_binary_to_string_w_impl(pb_binary, cb_binary, dw_flags, psz_string, pcch_string)
+}
+
+pub unsafe extern "win64" fn CertCompareIntegerBlob(
+    p_int1: *const c_void,
+    p_int2: *const c_void,
+) -> BOOL {
+    asn1::cert_compare_integer_blob_impl(p_int1, p_int2)
+}
+
+pub unsafe extern "win64" fn CertCompareCertificateName(
+    dw_cert_encoding_type: u32,
+    p_cert_name1: *const c_void,
+    p_cert_name2: *const c_void,
+) -> BOOL {
+    asn1::cert_compare_certificate_name_impl(dw_cert_encoding_type, p_cert_name1, p_cert_name2)
+}
+
+pub unsafe extern "win64" fn CertFindExtension(
+    psz_obj_id: LPCSTR,
+    c_extensions: u32,
+    rg_extensions: *mut c_void,
+) -> *mut c_void {
+    asn1::cert_find_extension_impl(psz_obj_id, c_extensions, rg_extensions)
+}
+
+pub unsafe extern "win64" fn CryptProtectData(
+    p_data_in: *const c_void,
+    sz_data_descr: LPCWSTR,
+    p_optional_entropy: *const c_void,
+    pv_reserved: *mut c_void,
+    p_prompt_struct: *const c_void,
+    dw_flags: u32,
+    p_data_out: *mut c_void,
+) -> BOOL {
+    asn1::crypt_protect_data_impl(
+        p_data_in,
+        sz_data_descr,
+        p_optional_entropy,
+        pv_reserved,
+        p_prompt_struct,
+        dw_flags,
+        p_data_out,
+    )
+}
+
+pub unsafe extern "win64" fn CryptUnprotectData(
+    p_data_in: *const c_void,
+    ppsz_data_descr: *mut LPWSTR,
+    p_optional_entropy: *const c_void,
+    pv_reserved: *mut c_void,
+    p_prompt_struct: *const c_void,
+    dw_flags: u32,
+    p_data_out: *mut c_void,
+) -> BOOL {
+    asn1::crypt_unprotect_data_impl(
+        p_data_in,
+        ppsz_data_descr,
+        p_optional_entropy,
+        pv_reserved,
+        p_prompt_struct,
+        dw_flags,
+        p_data_out,
     )
 }
 

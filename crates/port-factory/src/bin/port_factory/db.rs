@@ -2,7 +2,8 @@
 
 use super::{
     scan, usage, workspace_root, ArgCursor, DEFAULT_GAME_PROFILES_TSV, DEFAULT_OPS_TSV,
-    DEFAULT_SHADER_FORMATS_TSV, DEFAULT_WIN32_TSV,
+    DEFAULT_SHADER_FORMATS_TSV, DEFAULT_STUB_BACKLOG_MD, DEFAULT_STUB_INVENTORY_TSV,
+    DEFAULT_WIN32_TSV,
 };
 use anyhow::{bail, Result};
 use pe_image::Pe;
@@ -16,9 +17,14 @@ use port_factory::scaffold::{
     find_missing_ops_in_pe, generate_dll_scaffold, generate_op_scaffold, register_misc_dll_module,
 };
 use port_factory::scanner::collect_pe_files;
+use port_factory::stub_inventory::{
+    check_no_new_stubs_against_file, diff_stub_json_files, format_inventory_tsv,
+    render_stub_backlog_md, scan_workspace_stubs,
+};
 use port_factory::vfs::WinFs;
 use port_factory::win32_db::{Win32Category, Win32Database};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
 pub fn cmd_sync(args: &[String]) -> Result<()> {
@@ -529,6 +535,110 @@ pub fn cmd_doctor(args: &[String]) -> Result<()> {
     }
 
     db_report.ensure_clean()?;
+    Ok(())
+}
+
+pub fn cmd_stub_sync(args: &[String]) -> Result<()> {
+    let mut tsv_path = PathBuf::from(DEFAULT_STUB_INVENTORY_TSV);
+    let mut also_backlog = false;
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--tsv" => tsv_path = cur.next_path_or_usage(),
+            "--backlog" => also_backlog = true,
+            _ => bail!("unknown argument {a:?}"),
+        }
+    }
+    let root = workspace_root();
+    let entries = scan_workspace_stubs(&root)?;
+    let abs_tsv = if tsv_path.is_absolute() {
+        tsv_path.clone()
+    } else {
+        root.join(&tsv_path)
+    };
+    // Enforce zero-new-stub policy when updating an existing inventory.
+    check_no_new_stubs_against_file(&abs_tsv, &entries)?;
+    if let Some(parent) = abs_tsv.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&abs_tsv, format_inventory_tsv(&entries))?;
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in &entries {
+        *by_kind.entry(e.kind.as_str()).or_insert(0) += 1;
+    }
+    println!(
+        "synced {} stub sites (stub={}, failing={}, middleware_stub={}) -> {}",
+        entries.len(),
+        by_kind.get("stub").copied().unwrap_or(0),
+        by_kind.get("failing").copied().unwrap_or(0),
+        by_kind.get("middleware_stub").copied().unwrap_or(0),
+        abs_tsv.display()
+    );
+    if also_backlog {
+        let md = render_stub_backlog_md(&root, &entries)?;
+        let out_md = root.join(DEFAULT_STUB_BACKLOG_MD);
+        fs::write(&out_md, md)?;
+        println!("updated {}", out_md.display());
+    }
+    Ok(())
+}
+
+pub fn cmd_stub_backlog(args: &[String]) -> Result<()> {
+    let mut write = false;
+    let mut out_path = PathBuf::from(DEFAULT_STUB_BACKLOG_MD);
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--write" | "--sync" => write = true,
+            "--out" => {
+                out_path = cur.next_path_or_usage();
+                write = true;
+            }
+            _ => bail!("unknown argument {a:?}"),
+        }
+    }
+    let root = workspace_root();
+    let entries = scan_workspace_stubs(&root)?;
+    let md = render_stub_backlog_md(&root, &entries)?;
+    if write {
+        let abs = if out_path.is_absolute() {
+            out_path
+        } else {
+            root.join(&out_path)
+        };
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, &md)?;
+        println!(
+            "wrote {} ({} remaining stub sites)",
+            abs.display(),
+            entries.len()
+        );
+    } else {
+        print!("{md}");
+    }
+    Ok(())
+}
+
+pub fn cmd_stub_diff(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!("usage: port-factory stub-diff <BEFORE.json> <AFTER.json>");
+    }
+    let diff = diff_stub_json_files(&PathBuf::from(&args[0]), &PathBuf::from(&args[1]))?;
+    print!("{diff}");
+    Ok(())
+}
+
+pub fn cmd_report_diff(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!("usage: port-factory report-diff <BEFORE.json> <AFTER.json>");
+    }
+    let diff = port_factory::report_diff::diff_boot_report_files(
+        &PathBuf::from(&args[0]),
+        &PathBuf::from(&args[1]),
+    )?;
+    print!("{diff}");
     Ok(())
 }
 

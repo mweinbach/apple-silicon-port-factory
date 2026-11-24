@@ -87,26 +87,36 @@ pub unsafe extern "win64" fn SysStringByteLen(b: *const u16) -> u32 {
 pub unsafe extern "win64" fn VariantInit(v: *mut u8) {
     std::ptr::write_bytes(v, 0, 24);
 }
-/// VARIANT: frees BSTRs; releases IUnknown/IDispatch via vtable slot 2.
+/// VARIANT: frees BSTRs and owned SAFEARRAYs; releases IUnknown/IDispatch via vtable slot 2.
 pub unsafe extern "win64" fn VariantClear(v: *mut u8) -> i32 {
     if v.is_null() {
         return 0;
     }
-    let vt = *(v as *const u16);
+    let vt = std::ptr::read_unaligned(v as *const u16);
     const VT_BSTR: u16 = 8;
     const VT_DISPATCH: u16 = 9;
     const VT_UNKNOWN: u16 = 13;
-    match vt {
-        VT_BSTR => SysFreeString(*(v.add(8) as *const *mut u16)),
-        VT_DISPATCH | VT_UNKNOWN => {
-            let obj = *(v.add(8) as *const *mut *const usize);
-            if !obj.is_null() {
-                let release: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*(*obj).add(2));
-                release(obj as *mut c_void);
+    const VT_ARRAY: u16 = 0x2000;
+    const VT_BYREF: u16 = 0x4000;
+    if (vt & VT_BYREF) == 0 {
+        match vt {
+            VT_BSTR => SysFreeString(std::ptr::read_unaligned(v.add(8) as *const *mut u16)),
+            VT_DISPATCH | VT_UNKNOWN => {
+                let obj = std::ptr::read_unaligned(v.add(8) as *const *mut *const usize);
+                if !obj.is_null() {
+                    let release: unsafe extern "win64" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(*(*obj).add(2));
+                    release(obj as *mut c_void);
+                }
             }
+            x if (x & VT_ARRAY) != 0 => {
+                let psa = std::ptr::read_unaligned(v.add(8) as *const *mut u8);
+                if !psa.is_null() {
+                    let _ = SafeArrayDestroy(psa);
+                }
+            }
+            _ => {}
         }
-        x if x & 0x2000 != 0 => stub!("VariantClear: SAFEARRAY payload leaked"),
-        _ => {}
     }
     std::ptr::write_bytes(v, 0, 24);
     0
@@ -168,6 +178,146 @@ pub unsafe extern "win64" fn VariantCopyInd(dst: *mut u8, src: *const u8) -> i32
     VariantCopy(dst, src)
 }
 
+const DISP_E_TYPEMISMATCH: i32 = 0x8002_0005u32 as i32;
+const DISP_E_OVERFLOW: i32 = 0x8002_000Au32 as i32;
+
+const VT_EMPTY: u16 = 0;
+const VT_NULL: u16 = 1;
+const VT_I2: u16 = 2;
+const VT_I4: u16 = 3;
+const VT_R4: u16 = 4;
+const VT_R8: u16 = 5;
+const VT_BSTR: u16 = 8;
+const VT_BOOL: u16 = 11;
+const VT_I1: u16 = 16;
+const VT_UI1: u16 = 17;
+const VT_UI2: u16 = 18;
+const VT_UI4: u16 = 19;
+const VT_I8: u16 = 20;
+const VT_UI8: u16 = 21;
+const VT_INT: u16 = 22;
+const VT_UINT: u16 = 23;
+
+enum CoercedVal {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+    Str(String),
+}
+
+unsafe fn read_variant_value(src: *const u8, vt: u16) -> Result<CoercedVal, i32> {
+    let p = src.add(8);
+    match vt {
+        VT_EMPTY => Ok(CoercedVal::I64(0)),
+        VT_I1 => Ok(CoercedVal::I64(std::ptr::read_unaligned(p as *const i8) as i64)),
+        VT_UI1 => Ok(CoercedVal::U64(std::ptr::read_unaligned(p) as u64)),
+        VT_I2 => Ok(CoercedVal::I64(std::ptr::read_unaligned(p as *const i16) as i64)),
+        VT_UI2 => Ok(CoercedVal::U64(std::ptr::read_unaligned(p as *const u16) as u64)),
+        VT_I4 | VT_INT => Ok(CoercedVal::I64(std::ptr::read_unaligned(p as *const i32) as i64)),
+        VT_UI4 | VT_UINT => Ok(CoercedVal::U64(std::ptr::read_unaligned(p as *const u32) as u64)),
+        VT_I8 => Ok(CoercedVal::I64(std::ptr::read_unaligned(p as *const i64))),
+        VT_UI8 => Ok(CoercedVal::U64(std::ptr::read_unaligned(p as *const u64))),
+        VT_R4 => Ok(CoercedVal::F64(std::ptr::read_unaligned(p as *const f32) as f64)),
+        VT_R8 => Ok(CoercedVal::F64(std::ptr::read_unaligned(p as *const f64))),
+        VT_BOOL => Ok(CoercedVal::Bool(std::ptr::read_unaligned(p as *const i16) != 0)),
+        VT_BSTR => {
+            let bstr = std::ptr::read_unaligned(p as *const *const u16);
+            if bstr.is_null() {
+                Ok(CoercedVal::Str(String::new()))
+            } else {
+                let len = SysStringLen(bstr as *mut u16) as usize;
+                let mut units = Vec::with_capacity(len);
+                for i in 0..len {
+                    units.push(std::ptr::read_unaligned(bstr.add(i)));
+                }
+                Ok(CoercedVal::Str(String::from_utf16_lossy(&units)))
+            }
+        }
+        _ => Err(DISP_E_TYPEMISMATCH),
+    }
+}
+
+fn coerced_to_i64(v: &CoercedVal) -> Result<i64, i32> {
+    match v {
+        CoercedVal::I64(n) => Ok(*n),
+        CoercedVal::U64(n) => i64::try_from(*n).map_err(|_| DISP_E_OVERFLOW),
+        CoercedVal::F64(f) => {
+            if !f.is_finite() {
+                return Err(DISP_E_OVERFLOW);
+            }
+            let r = f.round();
+            if r < i64::MIN as f64 || r >= (i64::MAX as f64) {
+                return Err(DISP_E_OVERFLOW);
+            }
+            Ok(r as i64)
+        }
+        CoercedVal::Bool(b) => Ok(if *b { -1 } else { 0 }),
+        CoercedVal::Str(s) => {
+            let t = s.trim();
+            if let Ok(n) = t.parse::<i64>() {
+                Ok(n)
+            } else if let Ok(f) = t.parse::<f64>() {
+                coerced_to_i64(&CoercedVal::F64(f))
+            } else {
+                Err(DISP_E_TYPEMISMATCH)
+            }
+        }
+    }
+}
+
+fn coerced_to_u64(v: &CoercedVal) -> Result<u64, i32> {
+    match v {
+        CoercedVal::I64(n) => u64::try_from(*n).map_err(|_| DISP_E_OVERFLOW),
+        CoercedVal::U64(n) => Ok(*n),
+        CoercedVal::F64(f) => {
+            if !f.is_finite() || *f < 0.0 || *f >= (u64::MAX as f64) {
+                return Err(DISP_E_OVERFLOW);
+            }
+            Ok(f.round() as u64)
+        }
+        CoercedVal::Bool(b) => Ok(if *b { u64::MAX } else { 0 }),
+        CoercedVal::Str(s) => s.trim().parse::<u64>().map_err(|_| DISP_E_TYPEMISMATCH),
+    }
+}
+
+fn coerced_to_f64(v: &CoercedVal) -> Result<f64, i32> {
+    match v {
+        CoercedVal::I64(n) => Ok(*n as f64),
+        CoercedVal::U64(n) => Ok(*n as f64),
+        CoercedVal::F64(f) => Ok(*f),
+        CoercedVal::Bool(b) => Ok(if *b { -1.0 } else { 0.0 }),
+        CoercedVal::Str(s) => s.trim().parse::<f64>().map_err(|_| DISP_E_TYPEMISMATCH),
+    }
+}
+
+fn coerced_to_bool(v: &CoercedVal) -> Result<bool, i32> {
+    match v {
+        CoercedVal::I64(n) => Ok(*n != 0),
+        CoercedVal::U64(n) => Ok(*n != 0),
+        CoercedVal::F64(f) => Ok(*f != 0.0),
+        CoercedVal::Bool(b) => Ok(*b),
+        CoercedVal::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "#true#" => Ok(true),
+            "false" | "#false#" => Ok(false),
+            other => other
+                .parse::<f64>()
+                .map(|f| f != 0.0)
+                .map_err(|_| DISP_E_TYPEMISMATCH),
+        },
+    }
+}
+
+fn coerced_to_string(v: &CoercedVal) -> String {
+    match v {
+        CoercedVal::I64(n) => n.to_string(),
+        CoercedVal::U64(n) => n.to_string(),
+        CoercedVal::F64(f) => f.to_string(),
+        CoercedVal::Bool(b) => if *b { "True".into() } else { "False".into() },
+        CoercedVal::Str(s) => s.clone(),
+    }
+}
+
 pub unsafe extern "win64" fn VariantChangeType(
     dst: *mut u8,
     src: *const u8,
@@ -181,8 +331,63 @@ pub unsafe extern "win64" fn VariantChangeType(
     if cur_vt == vt {
         return VariantCopy(dst, src);
     }
-    stub!("VariantChangeType({cur_vt} -> {vt}) -> DISP_E_TYPEMISMATCH");
-    0x8002_0005u32 as i32
+    if vt == VT_EMPTY {
+        return VariantClear(dst);
+    }
+    if cur_vt == VT_NULL {
+        return DISP_E_TYPEMISMATCH;
+    }
+    let val = match read_variant_value(src, cur_vt) {
+        Ok(v) => v,
+        Err(hr) => return hr,
+    };
+
+    // Build converted 24-byte VARIANT in a local buffer first so `dst == src` is safe.
+    let mut out = [0u8; 24];
+    std::ptr::write_unaligned(out.as_mut_ptr() as *mut u16, vt);
+    let payload = out.as_mut_ptr().add(8);
+    let conv: Result<(), i32> = match vt {
+        VT_I1 => coerced_to_i64(&val)
+            .and_then(|n| i8::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload as *mut i8, n)),
+        VT_UI1 => coerced_to_u64(&val)
+            .and_then(|n| u8::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload, n)),
+        VT_I2 => coerced_to_i64(&val)
+            .and_then(|n| i16::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload as *mut i16, n)),
+        VT_UI2 => coerced_to_u64(&val)
+            .and_then(|n| u16::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload as *mut u16, n)),
+        VT_I4 | VT_INT => coerced_to_i64(&val)
+            .and_then(|n| i32::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload as *mut i32, n)),
+        VT_UI4 | VT_UINT => coerced_to_u64(&val)
+            .and_then(|n| u32::try_from(n).map_err(|_| DISP_E_OVERFLOW))
+            .map(|n| std::ptr::write_unaligned(payload as *mut u32, n)),
+        VT_I8 => coerced_to_i64(&val).map(|n| std::ptr::write_unaligned(payload as *mut i64, n)),
+        VT_UI8 => coerced_to_u64(&val).map(|n| std::ptr::write_unaligned(payload as *mut u64, n)),
+        VT_R4 => coerced_to_f64(&val).map(|f| std::ptr::write_unaligned(payload as *mut f32, f as f32)),
+        VT_R8 => coerced_to_f64(&val).map(|f| std::ptr::write_unaligned(payload as *mut f64, f)),
+        VT_BOOL => coerced_to_bool(&val).map(|b| {
+            let vb: i16 = if b { -1 } else { 0 };
+            std::ptr::write_unaligned(payload as *mut i16, vb);
+        }),
+        VT_BSTR => {
+            let s = coerced_to_string(&val);
+            let w: Vec<u16> = s.encode_utf16().collect();
+            let bstr = SysAllocStringLen(w.as_ptr(), w.len() as u32);
+            std::ptr::write_unaligned(payload as *mut *mut u16, bstr);
+            Ok(())
+        }
+        _ => Err(DISP_E_TYPEMISMATCH),
+    };
+    if let Err(hr) = conv {
+        return hr;
+    }
+    VariantClear(dst);
+    std::ptr::copy_nonoverlapping(out.as_ptr(), dst, 24);
+    crate::types::S_OK
 }
 
 pub unsafe extern "win64" fn VariantChangeTypeEx(
@@ -443,4 +648,56 @@ pub unsafe extern "win64" fn VariantTimeToSystemTime(_vt: f64, st: *mut u16) -> 
         std::ptr::write_bytes(st, 0, 8);
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variant_clear_frees_safearray_and_change_type_coerces() {
+        unsafe {
+            // 1. VariantClear frees VT_ARRAY | VT_I4 without leaking or hitting a stub.
+            let mut bounds = [0u8; 8];
+            (bounds.as_mut_ptr() as *mut u32).write_unaligned(4); // cElements = 4
+            (bounds.as_mut_ptr().add(4) as *mut i32).write_unaligned(0); // lLbound = 0
+            let psa = SafeArrayCreate(VT_I4, 1, bounds.as_ptr());
+            assert!(!psa.is_null());
+            let mut var = [0u8; 24];
+            VariantInit(var.as_mut_ptr());
+            (var.as_mut_ptr() as *mut u16).write_unaligned(0x2000 | VT_I4);
+            (var.as_mut_ptr().add(8) as *mut *mut u8).write_unaligned(psa);
+            assert_eq!(VariantClear(var.as_mut_ptr()), crate::types::S_OK);
+            assert_eq!((var.as_ptr() as *const u16).read_unaligned(), VT_EMPTY);
+
+            // 2. VariantChangeType: I4 -> BSTR -> R8 -> BOOL -> I2 (including in-place)
+            let mut v_i4 = [0u8; 24];
+            VariantInit(v_i4.as_mut_ptr());
+            (v_i4.as_mut_ptr() as *mut u16).write_unaligned(VT_I4);
+            (v_i4.as_mut_ptr().add(8) as *mut i32).write_unaligned(-42);
+
+            let mut v_str = [0u8; 24];
+            VariantInit(v_str.as_mut_ptr());
+            assert_eq!(VariantChangeType(v_str.as_mut_ptr(), v_i4.as_ptr(), 0, VT_BSTR), crate::types::S_OK);
+            assert_eq!((v_str.as_ptr() as *const u16).read_unaligned(), VT_BSTR);
+            let bstr = (v_str.as_ptr().add(8) as *const *const u16).read_unaligned();
+            assert_eq!(crate::strings::from_wide(bstr), "-42");
+
+            // In-place BSTR -> R8
+            assert_eq!(VariantChangeType(v_str.as_mut_ptr(), v_str.as_ptr(), 0, VT_R8), crate::types::S_OK);
+            assert_eq!((v_str.as_ptr() as *const u16).read_unaligned(), VT_R8);
+            assert_eq!((v_str.as_ptr().add(8) as *const f64).read_unaligned(), -42.0);
+
+            // R8 -> BOOL (-1 = VARIANT_TRUE)
+            let mut v_bool = [0u8; 24];
+            VariantInit(v_bool.as_mut_ptr());
+            assert_eq!(VariantChangeType(v_bool.as_mut_ptr(), v_str.as_ptr(), 0, VT_BOOL), crate::types::S_OK);
+            assert_eq!((v_bool.as_ptr().add(8) as *const i16).read_unaligned(), -1);
+
+            // Overflow check: -42 -> VT_UI4 returns DISP_E_OVERFLOW
+            let mut v_u4 = [0u8; 24];
+            VariantInit(v_u4.as_mut_ptr());
+            assert_eq!(VariantChangeType(v_u4.as_mut_ptr(), v_i4.as_ptr(), 0, VT_UI4), DISP_E_OVERFLOW);
+        }
+    }
 }

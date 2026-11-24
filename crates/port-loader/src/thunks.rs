@@ -215,6 +215,10 @@ unsafe extern "win64" fn trap_handler(id: *const ImportId, ret: usize, regs: *co
     ctx.gpr[7] = r[6]; // rdi
     ctx.gpr[8..16].copy_from_slice(&r[7..15]);
     ctx.rip = ret as u64;
+    win32_rt::process::record_exit_reason(
+        "unimplemented_import",
+        format!("{}!{} (called from {})", id.dll, id.name, win32_rt::symbolize(ret)),
+    );
     win32_rt::crash::report(&format!("unimplemented import {}!{}", id.dll, id.name), None, &ctx);
     exit_hold();
     win32_rt::process::exit_process(STATUS_ENTRYPOINT_NOT_FOUND)

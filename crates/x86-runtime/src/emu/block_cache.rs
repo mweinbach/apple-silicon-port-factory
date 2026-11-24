@@ -112,6 +112,13 @@ pub(super) unsafe fn zeroed_slice<T>(n: usize) -> Box<[T]> {
     Box::from_raw(core::ptr::slice_from_raw_parts_mut(p, n))
 }
 
+/// Cumulative decoded interpreter basic blocks across all threads (incremented only on cold fill).
+static DECODED_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn decoded_blocks_count() -> u64 {
+    DECODED_BLOCKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) enum BlkErr {
     BadRip(usize),
     Invalid([u8; 8]),
@@ -225,6 +232,7 @@ impl BlockCache {
     #[cold]
     #[inline(never)]
     unsafe fn fill(this: *mut BlockCache, ip: u64, misses: &mut u64) -> Result<(usize, usize), BlkErr> {
+        DECODED_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let bc = &mut *this;
         if bc.cursor + BLK_MAX_INSNS > BLK_ARENA_LEN {
             bc.cursor = 0;

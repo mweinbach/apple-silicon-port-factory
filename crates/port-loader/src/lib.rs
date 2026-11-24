@@ -20,6 +20,7 @@ win64_abi::win64_mods! {
 }
 
 mod aot_dylib;
+mod boot_report;
 pub mod ios_host;
 mod shader_prewarm;
 
@@ -31,10 +32,12 @@ fn register_builtin_plugins() {
 }
 
 pub fn run_cli() {
+    boot_report::mark_boot_start();
     register_builtin_plugins();
     init_boot_log();
     if let Err(e) = real_main() {
         let msg = format!("port-runner fatal startup error: {e:#}");
+        boot_report::write_report_with_override(Some(("startup_error", &msg)), Some(1));
         boot_log_line(&msg);
         eprintln!("{msg}");
         write_last_crash(&msg);
@@ -68,6 +71,7 @@ struct Args {
     aot_dir: Option<std::path::PathBuf>,
     audio_harness: bool,
     diff_test: bool,
+    report_json: Option<std::path::PathBuf>,
     game_args: Vec<String>,
     explicit_game_dir: bool,
     explicit_exe: bool,
@@ -98,6 +102,7 @@ fn usage() -> ! {
            --no-game-hooks         disable optional compiled-in game plugin hooks/replacements (alias: --no-aw2-hooks)\n\
            --trace                 log every call through an import (target `trace`)\n\
            --no-run                map + resolve only; report unresolved imports and exit\n\
+           --report-json PATH      write one structured JSON boot report on exit (or $PORT_REPORT_JSON)\n\
            --no-avx                do not re-exec with ROSETTA_ADVERTISE_AVX=1\n\
            --audio-harness         enable plugin audio test harness when supported by the active game plugin\n\
            --diff-test             run differential tests (original vs Rust) and exit\n\
@@ -153,6 +158,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
         aot_dir: None,
         audio_harness: std::env::var_os("AW2_AUDIO_HARNESS").is_some_and(|v| v == "1"),
         diff_test: false,
+        report_json: std::env::var_os("PORT_REPORT_JSON")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from),
         game_args: Vec::new(),
         explicit_game_dir: false,
         explicit_exe: false,
@@ -222,6 +230,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(iter: I) -> Args {
             }
             "--trace" => a.trace = true,
             "--no-run" => a.no_run = true,
+            "--report-json" => {
+                a.report_json = Some(std::path::PathBuf::from(it.next().unwrap_or_else(|| usage())));
+            }
             "--no-avx" => a.no_avx = true,
             "--no-builtin-overrides" => a.no_builtin_overrides = true,
             "--no-game-hooks" | "--no-aw2-hooks" => a.no_game_hooks = true,
@@ -704,6 +715,29 @@ fn register_emu_profiler() {
     use win32_rt::hitch::{FuncStartFn, SymbolizeFn};
     use x86_runtime::emu_prof;
     win32_rt::crash::set_guest_state_hook(x86_runtime::emu::current_guest_state);
+    win32_rt::stub_registry::set_guest_caller_provider(|| {
+        let (gpr, rip) = x86_runtime::emu::current_guest_state()?;
+        let rsp = gpr[4];
+        if let Some(loader) = win32_rt::try_loader() {
+            if rip != 0 && loader.is_guest_pe_code(rip as usize) {
+                return Some(rip);
+            }
+            if rsp >= 0x10000 {
+                if let Some(ret_va) = win32_rt::crash::read_u64(rsp) {
+                    if loader.is_guest_pe_code(ret_va as usize) {
+                        return Some(ret_va);
+                    }
+                }
+            }
+        }
+        if rip != 0 {
+            Some(rip)
+        } else if rsp >= 0x10000 {
+            win32_rt::crash::read_u64(rsp)
+        } else {
+            None
+        }
+    });
     win32_rt::kernel32::memory::set_code_region_hook(x86_runtime::emu::note_code_region);
     if emu_prof::level() == 0 {
         return;
@@ -1099,6 +1133,14 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     w::process::init_trusted_host_env();
     w::process::lock_trusted_runner();
     w::process::init_exit_code_channel();
+    if let Some(ref rpath) = args.report_json {
+        boot_report::configure(
+            rpath.clone(),
+            args.exe.clone(),
+            args.game_dir.display().to_string(),
+            args.manifest_path.as_ref().map(|p| p.display().to_string()),
+        );
+    }
     if child_process_mode {
         log::info!(
             "port-runner: child-process mode — disk-sourced native AOT caches and dylibs disabled (using in-memory translator)"
@@ -1149,6 +1191,11 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if !exe_host.is_file() {
         bail!("{} not found", exe_host.display());
     }
+    boot_report::update_target(
+        exe_host.display().to_string(),
+        game_dir.display().to_string(),
+        args.manifest_path.as_ref().map(|p| p.display().to_string()),
+    );
     let exe_stem = std::path::Path::new(&args.exe)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1435,6 +1482,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             log::info!("unresolved {d} ({}): {}", ns.len(), ns.join(" "));
         }
         log::info!("--no-run: not executing");
+        boot_report::write_report_with_override(Some(("no_run", "")), Some(0));
         return Ok(());
     }
 
@@ -1634,6 +1682,16 @@ mod tests {
         let a = parse_args_from(["--prewarm-shaders"].into_iter().map(String::from));
         assert!(a.prewarm_shaders);
         assert!(!a.prewarm_aot);
+    }
+
+    #[test]
+    fn parse_report_json_flag() {
+        let a = parse_args_from(
+            ["--pe", "/tmp/game/app.exe", "--report-json", "/tmp/report.json"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(a.report_json, Some(std::path::PathBuf::from("/tmp/report.json")));
     }
 
     #[test]
