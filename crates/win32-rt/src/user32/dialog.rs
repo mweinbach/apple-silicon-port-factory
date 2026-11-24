@@ -23,8 +23,11 @@ const DLGWINDOWEXTRA: i32 = 30;
 
 const RT_DIALOG: usize = 5;
 
+#[allow(dead_code)]
+const DS_FIXEDSYS: u32 = 0x0000_0008;
 const DS_SETFONT: u32 = 0x0000_0040;
-const DS_SHELLFONT: u32 = 0x0000_0048;
+#[allow(dead_code)]
+const DS_SHELLFONT: u32 = DS_SETFONT | DS_FIXEDSYS;
 
 const BS_TYPEMASK: u32 = 0x0000_000F;
 const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
@@ -369,8 +372,9 @@ unsafe fn parse_dialog_template(ptr: *const u8, limit: Option<usize>) -> Result<
     // Title
     let title = cur.read_wide_z()?;
 
-    // Optional font info when DS_SETFONT or DS_SHELLFONT is set.
-    if (style & (DS_SETFONT | DS_SHELLFONT)) != 0 {
+    // Optional font info is present iff DS_SETFONT is set (DS_SHELLFONT = DS_SETFONT | DS_FIXEDSYS;
+    // DS_FIXEDSYS alone selects the fixed system font with no font block in the template).
+    if (style & DS_SETFONT) != 0 {
         let _point_size = cur.read_u16()?;
         if is_ex {
             let _weight = cur.read_u16()?;
@@ -414,10 +418,22 @@ unsafe fn parse_dialog_template(ptr: *const u8, limit: Option<usize>) -> Result<
         let (_ititle_ord, ititle) = cur.read_sz_or_ord()?;
 
         let extra_count = cur.read_u16()? as usize;
-        let extra_ptr = if extra_count > 0 {
-            cur.check(extra_count)?;
+        let payload_len = if extra_count == 0 {
+            0
+        } else if is_ex {
+            // DLGITEMTEMPLATEEX.extraCount counts only the creation-data bytes following this WORD.
+            extra_count
+        } else {
+            // Standard DLGITEMTEMPLATE nonzero creation-data size includes the 2-byte size WORD.
+            if extra_count < 2 {
+                return Err(());
+            }
+            extra_count - 2
+        };
+        let extra_ptr = if payload_len > 0 {
+            cur.check(payload_len)?;
             let p = cur.base.add(cur.off) as usize;
-            cur.off += extra_count;
+            cur.off += payload_len;
             p
         } else {
             0
@@ -1889,6 +1905,339 @@ mod tests {
             assert_eq!(DLG_LAST_CMD_ID.load(Ordering::SeqCst), IDCANCEL as usize);
 
             assert_eq!(DestroyWindow(hdlg), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn build_std_header(style: u32, cdit: u16, title: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        push_u32(&mut b, style);
+        push_u32(&mut b, 0);
+        push_u16(&mut b, cdit);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 120);
+        push_u16(&mut b, 80);
+        push_u16(&mut b, 0); // menu
+        push_u16(&mut b, 0); // class
+        push_wide_z(&mut b, title);
+        b
+    }
+
+    fn build_ex_header(style: u32, cdit: u16, title: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        push_u16(&mut b, 1); // dlgVer
+        push_u16(&mut b, 0xFFFF); // signature
+        push_u32(&mut b, 0); // helpID
+        push_u32(&mut b, 0); // exStyle
+        push_u32(&mut b, style);
+        push_u16(&mut b, cdit);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 0);
+        push_u16(&mut b, 120);
+        push_u16(&mut b, 80);
+        push_u16(&mut b, 0); // menu
+        push_u16(&mut b, 0); // class
+        push_wide_z(&mut b, title);
+        b
+    }
+
+    fn push_std_item(buf: &mut Vec<u8>, id: u16, cls: Option<&str>, title: &str, raw_extra_word: u16, payload: &[u8]) {
+        align4(buf);
+        push_u32(buf, ws::CHILD | ws::VISIBLE);
+        push_u32(buf, 0);
+        push_u16(buf, 4);
+        push_u16(buf, 4);
+        push_u16(buf, 40);
+        push_u16(buf, 12);
+        push_u16(buf, id);
+        match cls {
+            Some(name) => push_wide_z(buf, name),
+            None => {
+                push_u16(buf, 0xFFFF);
+                push_u16(buf, 0x0082); // Static
+            }
+        }
+        push_wide_z(buf, title);
+        push_u16(buf, raw_extra_word);
+        buf.extend_from_slice(payload);
+    }
+
+    fn push_ex_item(buf: &mut Vec<u8>, id: u32, cls: Option<&str>, title: &str, extra_count: u16, payload: &[u8]) {
+        align4(buf);
+        push_u32(buf, 0); // helpID
+        push_u32(buf, 0); // exStyle
+        push_u32(buf, ws::CHILD | ws::VISIBLE);
+        push_u16(buf, 4);
+        push_u16(buf, 4);
+        push_u16(buf, 40);
+        push_u16(buf, 12);
+        push_u32(buf, id);
+        match cls {
+            Some(name) => push_wide_z(buf, name),
+            None => {
+                push_u16(buf, 0xFFFF);
+                push_u16(buf, 0x0082); // Static
+            }
+        }
+        push_wide_z(buf, title);
+        push_u16(buf, extra_count);
+        buf.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn dialog_template_ds_fixedsys_without_ds_setfont_has_no_font_block() {
+        unsafe {
+            // 1. Standard zero-control template with DS_FIXEDSYS alone (no DS_SETFONT).
+            let std_zero = build_std_header(ws::POPUP | DS_FIXEDSYS, 0, "StdFixedZero");
+            let parsed = parse_dialog_template(std_zero.as_ptr(), Some(std_zero.len()))
+                .expect("zero-control DS_FIXEDSYS standard template must parse without font block");
+            assert_eq!(String::from_utf16_lossy(&parsed.title), "StdFixedZero");
+            assert!(parsed.items.is_empty());
+
+            // 2. Standard 1-control template with DS_FIXEDSYS alone.
+            let mut std_one = build_std_header(ws::POPUP | DS_FIXEDSYS, 1, "StdFixedOne");
+            push_std_item(&mut std_one, 501, None, "ItemStd", 0, &[]);
+            let parsed = parse_dialog_template(std_one.as_ptr(), Some(std_one.len()))
+                .expect("1-control DS_FIXEDSYS standard template must parse control cleanly");
+            assert_eq!(parsed.items.len(), 1);
+            assert_eq!(parsed.items[0].id, 501);
+            assert_eq!(String::from_utf16_lossy(&parsed.items[0].title), "ItemStd");
+
+            // 3. Extended zero-control template with DS_FIXEDSYS alone.
+            let ex_zero = build_ex_header(ws::POPUP | DS_FIXEDSYS, 0, "ExFixedZero");
+            let parsed = parse_dialog_template(ex_zero.as_ptr(), Some(ex_zero.len()))
+                .expect("zero-control DS_FIXEDSYS extended template must parse without font block");
+            assert_eq!(String::from_utf16_lossy(&parsed.title), "ExFixedZero");
+            assert!(parsed.items.is_empty());
+
+            // 4. Extended 1-control template with DS_FIXEDSYS alone.
+            let mut ex_one = build_ex_header(ws::POPUP | DS_FIXEDSYS, 1, "ExFixedOne");
+            push_ex_item(&mut ex_one, 601, None, "ItemEx", 0, &[]);
+            let parsed = parse_dialog_template(ex_one.as_ptr(), Some(ex_one.len()))
+                .expect("1-control DS_FIXEDSYS extended template must parse control cleanly");
+            assert_eq!(parsed.items.len(), 1);
+            assert_eq!(parsed.items[0].id, 601);
+            assert_eq!(String::from_utf16_lossy(&parsed.items[0].title), "ItemEx");
+
+            // 5. Existing font-block cases: DS_SETFONT alone and DS_SHELLFONT (DS_SETFONT | DS_FIXEDSYS)
+            //    both consume their respective font blocks in standard and extended templates.
+            for style in [ws::POPUP | DS_SETFONT, ws::POPUP | DS_SHELLFONT] {
+                let mut std_font = build_std_header(style, 1, "StdFont");
+                push_u16(&mut std_font, 9);
+                push_wide_z(&mut std_font, "Tahoma");
+                push_std_item(&mut std_font, 502, None, "AfterStdFont", 0, &[]);
+                let p_std = parse_dialog_template(std_font.as_ptr(), Some(std_font.len()))
+                    .expect("standard template with DS_SETFONT/DS_SHELLFONT must parse font block");
+                assert_eq!(p_std.items.len(), 1);
+                assert_eq!(p_std.items[0].id, 502);
+                assert_eq!(String::from_utf16_lossy(&p_std.items[0].title), "AfterStdFont");
+
+                let mut ex_font = build_ex_header(style, 1, "ExFont");
+                push_u16(&mut ex_font, 8);
+                push_u16(&mut ex_font, 400);
+                ex_font.push(0);
+                ex_font.push(1);
+                push_wide_z(&mut ex_font, "MS Shell Dlg 2");
+                push_ex_item(&mut ex_font, 602, None, "AfterExFont", 0, &[]);
+                let p_ex = parse_dialog_template(ex_font.as_ptr(), Some(ex_font.len()))
+                    .expect("extended template with DS_SETFONT/DS_SHELLFONT must parse font block");
+                assert_eq!(p_ex.items.len(), 1);
+                assert_eq!(p_ex.items[0].id, 602);
+                assert_eq!(String::from_utf16_lossy(&p_ex.items[0].title), "AfterExFont");
+            }
+        }
+    }
+
+    static CREATE_PARAM_PTR: AtomicUsize = AtomicUsize::new(0);
+    static CREATE_PARAM_FIRST4: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "win64" fn create_param_capture_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == wm::CREATE && lparam != 0 {
+            let cs = &*(lparam as *const window::CREATESTRUCT);
+            CREATE_PARAM_PTR.store(cs.create_params, Ordering::SeqCst);
+            if cs.create_params != 0 {
+                let v = (cs.create_params as *const u32).read_unaligned();
+                CREATE_PARAM_FIRST4.store(v as usize, Ordering::SeqCst);
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    #[test]
+    fn dialog_template_creation_data_standard_vs_extended_and_wm_create_param() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!crate::macos::active(), "unit tests must stay headless");
+        std::thread::spawn(|| unsafe {
+            let proc_va = create_param_capture_proc as *const () as usize;
+            crate::register_native_va(proc_va as u64, proc_va);
+            let cls_name = "Aw2DlgCreateParamCtrl";
+            let cls_w = crate::strings::to_wide_z(cls_name);
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: proc_va,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls_w.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+
+            // 1. Standard DLGITEMTEMPLATE: size WORD includes itself (size=6 => 2-byte size + 4 payload bytes).
+            let std_payload: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+            let mut std_two = build_std_header(ws::POPUP, 2, "StdExtra");
+            push_std_item(&mut std_two, 301, Some(cls_name), "First", 6, &std_payload);
+            push_std_item(&mut std_two, 302, None, "AfterStd4", 0, &[]);
+            let p_std = parse_dialog_template(std_two.as_ptr(), Some(std_two.len()))
+                .expect("standard item with size=6 (4 payload bytes) + following control must parse");
+            assert_eq!(p_std.items.len(), 2);
+            assert_eq!(p_std.items[0].id, 301);
+            assert_ne!(p_std.items[0].extra_ptr, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(p_std.items[0].extra_ptr as *const u8, 4),
+                &std_payload
+            );
+            assert_eq!(p_std.items[1].id, 302);
+            assert_eq!(String::from_utf16_lossy(&p_std.items[1].title), "AfterStd4");
+
+            // End-to-end headless creation verifies WM_CREATE lpCreateParams pointer and second control.
+            CREATE_PARAM_PTR.store(0, Ordering::SeqCst);
+            CREATE_PARAM_FIRST4.store(0, Ordering::SeqCst);
+            let hdlg_std = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                std_two.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+            );
+            assert!(!hdlg_std.is_null());
+            assert_eq!(CREATE_PARAM_PTR.load(Ordering::SeqCst), p_std.items[0].extra_ptr);
+            assert_eq!(
+                CREATE_PARAM_FIRST4.load(Ordering::SeqCst),
+                u32::from_le_bytes(std_payload) as usize
+            );
+            let mut txt = [0u16; 32];
+            let n = GetDlgItemTextW(hdlg_std, 302, txt.as_mut_ptr(), 32);
+            assert_eq!(String::from_utf16_lossy(&txt[..n as usize]), "AfterStd4");
+            assert_eq!(DestroyWindow(hdlg_std), TRUE);
+
+            // 2. Standard DLGITEMTEMPLATE odd size=5 (3 payload bytes) + DWORD-aligned following control.
+            let std_odd_payload: [u8; 3] = [0xAA, 0xBB, 0xCC];
+            let mut std_odd = build_std_header(ws::POPUP, 2, "StdOdd");
+            push_std_item(&mut std_odd, 303, None, "Odd", 5, &std_odd_payload);
+            push_std_item(&mut std_odd, 304, None, "AfterStdOdd", 0, &[]);
+            let p_odd = parse_dialog_template(std_odd.as_ptr(), Some(std_odd.len()))
+                .expect("standard odd creation-data size=5 + DWORD-aligned successor must parse");
+            assert_eq!(
+                std::slice::from_raw_parts(p_odd.items[0].extra_ptr as *const u8, 3),
+                &std_odd_payload
+            );
+            assert_eq!(p_odd.items[1].id, 304);
+            assert_eq!(String::from_utf16_lossy(&p_odd.items[1].title), "AfterStdOdd");
+
+            // 3. Standard DLGITEMTEMPLATE size=2 (size WORD only, 0 trailing payload bytes) + following control.
+            let mut std_two_only = build_std_header(ws::POPUP, 2, "StdTwo");
+            push_std_item(&mut std_two_only, 305, None, "TwoOnly", 2, &[]);
+            push_std_item(&mut std_two_only, 306, None, "AfterStd2", 0, &[]);
+            let p_two = parse_dialog_template(std_two_only.as_ptr(), Some(std_two_only.len()))
+                .expect("standard creation-data size=2 must consume only the size WORD");
+            assert_eq!(p_two.items[0].extra_ptr, 0);
+            assert_eq!(p_two.items[1].id, 306);
+            assert_eq!(String::from_utf16_lossy(&p_two.items[1].title), "AfterStd2");
+
+            // 4. Malformed standard size=1 must be rejected.
+            let mut std_bad_one = build_std_header(ws::POPUP, 1, "StdBad1");
+            push_std_item(&mut std_bad_one, 307, None, "Bad1", 1, &[]);
+            assert!(
+                parse_dialog_template(std_bad_one.as_ptr(), Some(std_bad_one.len())).is_err(),
+                "standard DLGITEMTEMPLATE creation-data size=1 is malformed and must fail"
+            );
+
+            // 5. Truncated standard payload (size=6 claims 4 payload bytes, only 3 present) must be rejected.
+            let mut std_trunc = build_std_header(ws::POPUP, 1, "StdTrunc");
+            push_std_item(&mut std_trunc, 308, None, "Trunc", 6, &[0x01, 0x02, 0x03]);
+            assert!(
+                parse_dialog_template(std_trunc.as_ptr(), Some(std_trunc.len())).is_err(),
+                "truncated standard creation-data payload must fail"
+            );
+
+            // 6. Extended DLGITEMTEMPLATEEX: extraCount excludes the size WORD (extraCount=4 => 4 bytes follow).
+            let ex_payload: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+            let mut ex_two = build_ex_header(ws::POPUP, 2, "ExExtra");
+            push_ex_item(&mut ex_two, 401, Some(cls_name), "FirstEx", 4, &ex_payload);
+            push_ex_item(&mut ex_two, 402, None, "AfterEx4", 0, &[]);
+            let p_ex = parse_dialog_template(ex_two.as_ptr(), Some(ex_two.len()))
+                .expect("extended item with extraCount=4 + following control must parse");
+            assert_eq!(p_ex.items.len(), 2);
+            assert_eq!(p_ex.items[0].id, 401);
+            assert_eq!(
+                std::slice::from_raw_parts(p_ex.items[0].extra_ptr as *const u8, 4),
+                &ex_payload
+            );
+            assert_eq!(p_ex.items[1].id, 402);
+            assert_eq!(String::from_utf16_lossy(&p_ex.items[1].title), "AfterEx4");
+
+            CREATE_PARAM_PTR.store(0, Ordering::SeqCst);
+            CREATE_PARAM_FIRST4.store(0, Ordering::SeqCst);
+            let hdlg_ex = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                ex_two.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+            );
+            assert!(!hdlg_ex.is_null());
+            assert_eq!(CREATE_PARAM_PTR.load(Ordering::SeqCst), p_ex.items[0].extra_ptr);
+            assert_eq!(
+                CREATE_PARAM_FIRST4.load(Ordering::SeqCst),
+                u32::from_le_bytes(ex_payload) as usize
+            );
+            let n_ex = GetDlgItemTextW(hdlg_ex, 402, txt.as_mut_ptr(), 32);
+            assert_eq!(String::from_utf16_lossy(&txt[..n_ex as usize]), "AfterEx4");
+            assert_eq!(DestroyWindow(hdlg_ex), TRUE);
+
+            // 7. Extended DLGITEMTEMPLATEEX extraCount=1 and extraCount=2 (valid!) + following controls.
+            let mut ex_one = build_ex_header(ws::POPUP, 2, "ExOne");
+            push_ex_item(&mut ex_one, 403, None, "OneByte", 1, &[0x99]);
+            push_ex_item(&mut ex_one, 404, None, "AfterEx1", 0, &[]);
+            let p_ex1 = parse_dialog_template(ex_one.as_ptr(), Some(ex_one.len()))
+                .expect("extended extraCount=1 + DWORD-aligned successor must parse");
+            assert_eq!(
+                std::slice::from_raw_parts(p_ex1.items[0].extra_ptr as *const u8, 1),
+                &[0x99]
+            );
+            assert_eq!(p_ex1.items[1].id, 404);
+            assert_eq!(String::from_utf16_lossy(&p_ex1.items[1].title), "AfterEx1");
+
+            let mut ex_two_b = build_ex_header(ws::POPUP, 2, "ExTwoBytes");
+            push_ex_item(&mut ex_two_b, 405, None, "TwoBytes", 2, &[0xDE, 0xAD]);
+            push_ex_item(&mut ex_two_b, 406, None, "AfterEx2", 0, &[]);
+            let p_ex2 = parse_dialog_template(ex_two_b.as_ptr(), Some(ex_two_b.len()))
+                .expect("extended extraCount=2 + following control must parse");
+            assert_eq!(
+                std::slice::from_raw_parts(p_ex2.items[0].extra_ptr as *const u8, 2),
+                &[0xDE, 0xAD]
+            );
+            assert_eq!(p_ex2.items[1].id, 406);
+            assert_eq!(String::from_utf16_lossy(&p_ex2.items[1].title), "AfterEx2");
+
+            // 8. Truncated extended payload (extraCount=4, only 3 bytes present) must be rejected.
+            let mut ex_trunc = build_ex_header(ws::POPUP, 1, "ExTrunc");
+            push_ex_item(&mut ex_trunc, 407, None, "TruncEx", 4, &[0x01, 0x02, 0x03]);
+            assert!(
+                parse_dialog_template(ex_trunc.as_ptr(), Some(ex_trunc.len())).is_err(),
+                "truncated extended creation-data payload must fail"
+            );
         })
         .join()
         .unwrap();
