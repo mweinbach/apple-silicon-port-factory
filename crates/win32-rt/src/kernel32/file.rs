@@ -8174,27 +8174,26 @@ mod tests {
         std::os::unix::fs::symlink(&runner, &ext_symlink).unwrap();
         std::fs::hard_link(&runner, &ext_hardlink).unwrap();
 
-        path::add_mount("Q:\\", &root);
-        let _guard = path::protect_native_runner_scoped_for_test(&runner);
+        let _guard = path::tests::protect_native_runner_scoped_for_test("V:\\", &root, &runner);
         path::protect_native_subtree(&host_aot);
 
         unsafe {
             // 1. CreateFileW write / truncate / create-always / delete-on-close blocked across
             //    direct paths, case variants, `..` traversal, bundle files, AOT cache, and aliases.
             for win_target in [
-                r"Q:\MockApp.app\Contents\MacOS\port-runner",
-                r"Q:\MOCKAPP.APP\CONTENTS\MACOS\PORT-RUNNER",
-                r"Q:\GuestWork\..\MockApp.app\Contents\MacOS\port-runner",
-                r"Q:\MockApp.app\Contents\MacOS\new_helper",
-                r"Q:\MockApp.app\Contents\Frameworks\libmetalirconverter.dylib",
-                r"Q:\MockApp.app\Contents\Info.plist",
-                r"Q:\MockApp.app\Contents\_CodeSignature\CodeResources",
-                r"Q:\MockApp.app\Contents\Resources\game.toml",
-                r"Q:\MockApp.app\Contents\Resources\AotCache\mod.aot",
-                r"Q:\HostAotCache\cached.aot",
-                r"Q:\HostAotCache\new_entry.aot",
-                r"Q:\GuestWork\symlink_to_runner",
-                r"Q:\GuestWork\hardlink_to_runner",
+                r"V:\MockApp.app\Contents\MacOS\port-runner",
+                r"V:\MOCKAPP.APP\CONTENTS\MACOS\PORT-RUNNER",
+                r"V:\GuestWork\..\MockApp.app\Contents\MacOS\port-runner",
+                r"V:\MockApp.app\Contents\MacOS\new_helper",
+                r"V:\MockApp.app\Contents\Frameworks\libmetalirconverter.dylib",
+                r"V:\MockApp.app\Contents\Info.plist",
+                r"V:\MockApp.app\Contents\_CodeSignature\CodeResources",
+                r"V:\MockApp.app\Contents\Resources\game.toml",
+                r"V:\MockApp.app\Contents\Resources\AotCache\mod.aot",
+                r"V:\HostAotCache\cached.aot",
+                r"V:\HostAotCache\new_entry.aot",
+                r"V:\GuestWork\symlink_to_runner",
+                r"V:\GuestWork\hardlink_to_runner",
             ] {
                 let w = to_wide_z(win_target);
                 let h = CreateFileW(
@@ -8224,12 +8223,12 @@ mod tests {
 
             // 2. Delete, rename/replace (target, source, and ancestor dir), copy-over, rmdir,
             //    SetFileAttributes, hardlink, and symlink creation all fail with ACCESS_DENIED.
-            let w_runner = to_wide_z(r"Q:\MockApp.app\Contents\MacOS\port-runner");
-            let w_guest = to_wide_z(r"Q:\GuestWork\ordinary.txt");
-            let w_dst = to_wide_z(r"Q:\GuestWork\moved_out");
-            let w_app = to_wide_z(r"Q:\MockApp.app");
-            let w_contents = to_wide_z(r"Q:\MockApp.app\Contents");
-            let w_macos = to_wide_z(r"Q:\MockApp.app\Contents\MacOS");
+            let w_runner = to_wide_z(r"V:\MockApp.app\Contents\MacOS\port-runner");
+            let w_guest = to_wide_z(r"V:\GuestWork\ordinary.txt");
+            let w_dst = to_wide_z(r"V:\GuestWork\moved_out");
+            let w_app = to_wide_z(r"V:\MockApp.app");
+            let w_contents = to_wide_z(r"V:\MockApp.app\Contents");
+            let w_macos = to_wide_z(r"V:\MockApp.app\Contents\MacOS");
 
             assert_eq!(DeleteFileW(w_runner.as_ptr()), FALSE);
             assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
@@ -8252,8 +8251,8 @@ mod tests {
             assert_eq!(SetFileAttributesW(w_runner.as_ptr(), FILE_ATTRIBUTE_NORMAL), FALSE);
             assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
 
-            let w_new_hl = to_wide_z(r"Q:\GuestWork\new_hl");
-            let w_new_sl = to_wide_z(r"Q:\GuestWork\new_sl");
+            let w_new_hl = to_wide_z(r"V:\GuestWork\new_hl");
+            let w_new_sl = to_wide_z(r"V:\GuestWork\new_sl");
             assert_eq!(CreateHardLinkW(w_new_hl.as_ptr(), w_runner.as_ptr(), std::ptr::null_mut()), FALSE);
             assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
             assert_eq!(CreateSymbolicLinkW(w_new_sl.as_ptr(), w_runner.as_ptr(), 0), 0);
@@ -8285,7 +8284,7 @@ mod tests {
             assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
             let mut rename_buf = vec![0u8; 20 + 64];
             rename_buf[0] = 1;
-            let dst_u16 = to_wide(r"Q:\GuestWork\renamed_via_handle");
+            let dst_u16 = to_wide(r"V:\GuestWork\renamed_via_handle");
             (rename_buf.as_mut_ptr().add(16) as *mut u32).write_unaligned((dst_u16.len() * 2) as u32);
             std::ptr::copy_nonoverlapping(dst_u16.as_ptr() as *const u8, rename_buf.as_mut_ptr().add(20), dst_u16.len() * 2);
             assert_eq!(SetFileInformationByHandle(h_ro, 3, rename_buf.as_ptr(), rename_buf.len() as u32), FALSE);
@@ -8297,13 +8296,13 @@ mod tests {
             assert_eq!(CloseHandle(h_ro), TRUE);
 
             // 4. UCRT paths (_open write, _unlink, rename) and shell32 SHFileOperationW also refuse protected files.
-            assert_eq!(crate::ucrt::stdio::open_host(r"Q:\MockApp.app\Contents\MacOS\port-runner", 0x0002, 0o644), -1);
-            assert_eq!(crate::ucrt::stdio::open_host(r"Q:\GuestWork\symlink_to_runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::stdio::open_host(r"V:\MockApp.app\Contents\MacOS\port-runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::stdio::open_host(r"V:\GuestWork\symlink_to_runner", 0x0002, 0o644), -1);
             assert_eq!(crate::ucrt::env::_wunlink(w_runner.as_ptr()), -1);
             assert_eq!(crate::ucrt::env::_wrename(w_runner.as_ptr(), w_dst.as_ptr()), -1);
             assert_eq!(crate::ucrt::env::_wrename(w_guest.as_ptr(), w_runner.as_ptr()), -1);
 
-            let mut sh_from = to_wide(r"Q:\MockApp.app\Contents\MacOS\port-runner");
+            let mut sh_from = to_wide(r"V:\MockApp.app\Contents\MacOS\port-runner");
             sh_from.extend_from_slice(&[0, 0]);
             let mut sh_op = [0u8; 56];
             (sh_op.as_mut_ptr().add(8) as *mut u32).write_unaligned(3); // FO_DELETE
@@ -8316,10 +8315,10 @@ mod tests {
             // 5. Ordinary guest data (both in GuestWork and in MockApp.app/Contents/Resources/Game)
             //    remains fully writable, renamable, and removable.
             for writable_win in [
-                r"Q:\GuestWork\ordinary.txt",
-                r"Q:\GuestWork\created_by_guest.txt",
-                r"Q:\MockApp.app\Contents\Resources\Game\save.dat",
-                r"Q:\MockApp.app\Contents\Resources\Game\new_save.dat",
+                r"V:\GuestWork\ordinary.txt",
+                r"V:\GuestWork\created_by_guest.txt",
+                r"V:\MockApp.app\Contents\Resources\Game\save.dat",
+                r"V:\MockApp.app\Contents\Resources\Game\new_save.dat",
             ] {
                 let w = to_wide_z(writable_win);
                 let h = CreateFileW(
@@ -8337,8 +8336,8 @@ mod tests {
                 assert_eq!(nw, 2);
                 assert_eq!(CloseHandle(h), TRUE);
             }
-            let w_new_save = to_wide_z(r"Q:\MockApp.app\Contents\Resources\Game\new_save.dat");
-            let w_moved_save = to_wide_z(r"Q:\MockApp.app\Contents\Resources\Game\moved_save.dat");
+            let w_new_save = to_wide_z(r"V:\MockApp.app\Contents\Resources\Game\new_save.dat");
+            let w_moved_save = to_wide_z(r"V:\MockApp.app\Contents\Resources\Game\moved_save.dat");
             assert_eq!(MoveFileExW(w_new_save.as_ptr(), w_moved_save.as_ptr(), MOVEFILE_REPLACE_EXISTING), TRUE);
             assert_eq!(DeleteFileW(w_moved_save.as_ptr()), TRUE);
         }

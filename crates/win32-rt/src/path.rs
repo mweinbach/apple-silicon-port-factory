@@ -806,27 +806,38 @@ pub fn is_protected_fd(fd: i32) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) struct ProtectedNativeTestGuard {
-    prev: ProtectedNativeSet,
-}
-
-#[cfg(test)]
-impl Drop for ProtectedNativeTestGuard {
-    fn drop(&mut self) {
-        *protected_native().write().unwrap_or_else(|e| e.into_inner()) = self.prev.clone();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn protect_native_runner_scoped_for_test(exe_path: &Path) -> ProtectedNativeTestGuard {
-    let prev = protected_native().read().unwrap_or_else(|e| e.into_inner()).clone();
-    protect_native_runner(exe_path);
-    ProtectedNativeTestGuard { prev }
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct ProtectedNativeTestGuard {
+        prev: ProtectedNativeSet,
+        mount_key: Option<String>,
+    }
+
+    impl Drop for ProtectedNativeTestGuard {
+        fn drop(&mut self) {
+            *protected_native().write().unwrap_or_else(|e| e.into_inner()) = self.prev.clone();
+            if let Some(ref key) = self.mount_key {
+                let mut m = MOUNTS.write().unwrap();
+                m.retain(|x| &x.key != key);
+                drop(m);
+                path_cache().write().unwrap().clear();
+            }
+        }
+    }
+
+    pub(crate) fn protect_native_runner_scoped_for_test(
+        mount_prefix: &str,
+        mount_host: &Path,
+        exe_path: &Path,
+    ) -> ProtectedNativeTestGuard {
+        let key = normalize(mount_prefix).trim_end_matches('\\').to_ascii_uppercase();
+        add_mount(mount_prefix, mount_host);
+        let prev = protected_native().read().unwrap_or_else(|e| e.into_inner()).clone();
+        protect_native_runner(exe_path);
+        ProtectedNativeTestGuard { prev, mount_key: Some(key) }
+    }
+
     #[test]
     fn normalize_paths() {
         assert_eq!(normalize("c:/a/./b/../c"), "C:\\a\\c");
