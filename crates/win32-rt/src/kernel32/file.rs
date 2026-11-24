@@ -2881,7 +2881,7 @@ unsafe fn complete_overlapped_binding_with_hook<F: FnOnce()>(
     let Some(c) = captured else {
         return false;
     };
-    if !(synchronous && (c.modes & FILE_SKIP_SET_EVENT_ON_HANDLE) != 0) {
+    if (c.modes & FILE_SKIP_SET_EVENT_ON_HANDLE) == 0 {
         c.handle_event.set();
     }
 
@@ -8625,9 +8625,11 @@ mod tests {
             assert_eq!(bytes, 654);
             assert_eq!(ov_out, ov_s_ptr);
 
-            // 3. Existing suppression rules remain intact:
-            //    (a) low bit on hEvent suppresses IOCP while still signaling the event;
-            //    (b) FILE_SKIP_COMPLETION_PORT_ON_SUCCESS + FILE_SKIP_SET_EVENT_ON_HANDLE apply on sync.
+            // 3. Suppression rules (SetFileCompletionNotificationModes):
+            //    (a) low bit on hEvent suppresses IOCP while still signaling the explicit event;
+            //    (b) FILE_SKIP_SET_EVENT_ON_HANDLE suppresses the implicit handle event on both
+            //        pending and synchronous completions (never suppressing explicit hEvent);
+            //    (c) FILE_SKIP_COMPLETION_PORT_ON_SUCCESS suppresses IOCP only on sync completions.
             let fake_sock2 = 0x00EE_0002usize as HANDLE;
             register_external_io_handle(fake_sock2);
             assert_eq!(CreateIoCompletionPort(fake_sock2, iocp, 0x9999, 0), iocp);
@@ -8646,7 +8648,24 @@ mod tests {
             prepare_overlapped_pending(&mut ov_sup);
             assert!(!complete_overlapped_io(fake_sock2, &mut ov_sup, STATUS_SUCCESS, 12, false));
             assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0);
-            assert!(b2.io_event.try_take());
+            assert!(!b2.io_event.try_take());
+
+            // Pending completion with explicit event (no low bit): explicit event is set,
+            // implicit handle event remains clear, and exactly one IOCP packet is posted
+            // despite FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (0x1) also being set.
+            assert_eq!(crate::kernel32::threads::ResetEvent(ev2), TRUE);
+            b2.io_event.reset();
+            let mut ov_pend: OVERLAPPED = std::mem::zeroed();
+            ov_pend.h_event = ev2;
+            prepare_overlapped_pending(&mut ov_pend);
+            assert!(complete_overlapped_io(fake_sock2, &mut ov_pend, STATUS_SUCCESS, 56, false));
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0);
+            assert!(!b2.io_event.try_take());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, 0x9999);
+            assert_eq!(bytes, 56);
+            assert_eq!(ov_out, &mut ov_pend as *mut OVERLAPPED);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 20), FALSE);
 
             b2.io_event.reset();
             let mut ov_sync: OVERLAPPED = std::mem::zeroed();
