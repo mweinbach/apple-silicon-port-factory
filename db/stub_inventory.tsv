@@ -1,11 +1,11 @@
 dll	api	kind	file	line	detail
-advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1361	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	406	"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PushMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	384	"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"

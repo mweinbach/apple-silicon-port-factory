@@ -375,13 +375,13 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2995` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
 | `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1361` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
 
 ### `amd_fidelityfx_loader_dx12.dll` (6)

@@ -105,6 +105,11 @@ pub fn cmd_bench(args: &[String]) -> Result<i32> {
     let report = run_benchmarks(&opts)?;
     if print_json {
         print!("{}", format_report_json(&report));
+        return Ok(if report.overall_pass {
+            exit_codes::OK
+        } else {
+            exit_codes::VERIFICATION_FAILED
+        });
     } else {
         print!("{}", format_summary_table(&report));
         if let Some(ref p) = out_path {

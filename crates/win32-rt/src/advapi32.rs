@@ -2672,7 +2672,7 @@ struct CapiProvider {
 
 struct CapiHash {
     alg_id: u32,
-    data: Vec<u8>,
+    ctx: [u64; 64],
     override_val: Option<Vec<u8>>,
 }
 
@@ -2691,11 +2691,21 @@ fn capi_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, C
 }
 
 extern "C" {
-    fn CC_MD5(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA1(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA384(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
-    fn CC_SHA512(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
+    fn CC_MD5_Init(c: *mut c_void) -> i32;
+    fn CC_MD5_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_MD5_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA1_Init(c: *mut c_void) -> i32;
+    fn CC_SHA1_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA1_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA256_Init(c: *mut c_void) -> i32;
+    fn CC_SHA256_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA256_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA384_Init(c: *mut c_void) -> i32;
+    fn CC_SHA384_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA384_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA512_Init(c: *mut c_void) -> i32;
+    fn CC_SHA512_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA512_Final(md: *mut u8, c: *mut c_void) -> i32;
 }
 
 fn capi_hash_len(alg_id: u32) -> Option<usize> {
@@ -2709,19 +2719,46 @@ fn capi_hash_len(alg_id: u32) -> Option<usize> {
     }
 }
 
-unsafe fn capi_compute_digest(alg_id: u32, data: &[u8]) -> Option<Vec<u8>> {
-    let len = capi_hash_len(alg_id)?;
-    let mut out = vec![0u8; len];
-    let ptr = data.as_ptr() as *const c_void;
-    let dlen = data.len() as u32;
+fn capi_hash_ops(
+    alg_id: u32,
+) -> Option<(
+    unsafe extern "C" fn(*mut c_void) -> i32,
+    unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32,
+    unsafe extern "C" fn(*mut u8, *mut c_void) -> i32,
+)> {
     match alg_id {
-        CALG_MD5 => { CC_MD5(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA1 => { CC_SHA1(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_256 => { CC_SHA256(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_384 => { CC_SHA384(ptr, dlen, out.as_mut_ptr()); }
-        CALG_SHA_512 => { CC_SHA512(ptr, dlen, out.as_mut_ptr()); }
-        _ => return None,
+        CALG_MD5 => Some((CC_MD5_Init, CC_MD5_Update, CC_MD5_Final)),
+        CALG_SHA1 => Some((CC_SHA1_Init, CC_SHA1_Update, CC_SHA1_Final)),
+        CALG_SHA_256 => Some((CC_SHA256_Init, CC_SHA256_Update, CC_SHA256_Final)),
+        CALG_SHA_384 => Some((CC_SHA384_Init, CC_SHA384_Update, CC_SHA384_Final)),
+        CALG_SHA_512 => Some((CC_SHA512_Init, CC_SHA512_Update, CC_SHA512_Final)),
+        _ => None,
     }
+}
+
+unsafe fn capi_hash_init(alg_id: u32) -> Option<[u64; 64]> {
+    let (init, _, _) = capi_hash_ops(alg_id)?;
+    let mut ctx = [0u64; 64];
+    init(ctx.as_mut_ptr() as *mut c_void);
+    Some(ctx)
+}
+
+unsafe fn capi_hash_update(alg_id: u32, ctx: &mut [u64; 64], data: &[u8]) {
+    let Some((_, update, _)) = capi_hash_ops(alg_id) else {
+        return;
+    };
+    let ctx_p = ctx.as_mut_ptr() as *mut c_void;
+    for chunk in data.chunks(16 * 1024 * 1024) {
+        update(ctx_p, chunk.as_ptr() as *const c_void, chunk.len() as u32);
+    }
+}
+
+unsafe fn capi_hash_finalize_clone(alg_id: u32, ctx: &[u64; 64]) -> Option<Vec<u8>> {
+    let len = capi_hash_len(alg_id)?;
+    let (_, _, fin) = capi_hash_ops(alg_id)?;
+    let mut tmp = *ctx;
+    let mut out = vec![0u8; len];
+    fin(out.as_mut_ptr(), tmp.as_mut_ptr() as *mut c_void);
     Some(out)
 }
 
@@ -2843,15 +2880,15 @@ pub unsafe extern "win64" fn CryptCreateHash(
     if !capi_providers().lock().unwrap().contains_key(&h_prov) {
         return err(NTE_BAD_UID, FALSE);
     }
-    if capi_hash_len(alg_id).is_none() {
+    let Some(ctx) = capi_hash_init(alg_id) else {
         return err(NTE_BAD_ALGID, FALSE);
-    }
+    };
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_hashes().lock().unwrap().insert(
         h,
         CapiHash {
             alg_id,
-            data: Vec::new(),
+            ctx,
             override_val: None,
         },
     );
@@ -2874,7 +2911,7 @@ pub unsafe extern "win64" fn CryptHashData(
     };
     if dw_data_len > 0 {
         let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
-        h.data.extend_from_slice(slice);
+        capi_hash_update(h.alg_id, &mut h.ctx, slice);
         h.override_val = None;
     }
     TRUE
@@ -2901,7 +2938,7 @@ pub unsafe extern "win64" fn CryptGetHashParam(
             if let Some(ref ov) = h.override_val {
                 ov.clone()
             } else {
-                let Some(d) = capi_compute_digest(h.alg_id, &h.data) else {
+                let Some(d) = capi_hash_finalize_clone(h.alg_id, &h.ctx) else {
                     return err(NTE_BAD_ALGID, FALSE);
                 };
                 d
@@ -2998,6 +3035,23 @@ struct CredentialW {
 }
 const _: () = assert!(std::mem::size_of::<CredentialW>() == 80);
 
+/// Windows x64 `CREDENTIAL_ATTRIBUTEW` (24 bytes).
+#[repr(C)]
+struct CredentialAttributeW {
+    keyword: *mut u16,
+    flags: u32,
+    value_size: u32,
+    value: *mut u8,
+}
+const _: () = assert!(std::mem::size_of::<CredentialAttributeW>() == 24);
+
+#[derive(Clone)]
+struct StoredCredAttr {
+    keyword: String,
+    flags: u32,
+    value: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct StoredCredential {
     flags: u32,
@@ -3007,6 +3061,7 @@ struct StoredCredential {
     last_written: FILETIME,
     blob: Vec<u8>,
     persist: u32,
+    attributes: Vec<StoredCredAttr>,
     target_alias: Option<String>,
     user_name: Option<String>,
 }
@@ -3014,7 +3069,9 @@ struct StoredCredential {
 const CRED_PERSIST_SESSION: u32 = 1;
 const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
 const CRED_PERSIST_ENTERPRISE: u32 = 3;
-const CRED_VAULT_MAGIC: &[u8; 8] = b"PFCRED01";
+const CRED_MAX_ATTRIBUTES: u32 = 64;
+const CRED_VAULT_MAGIC_V1: &[u8; 8] = b"PFCRED01";
+const CRED_VAULT_MAGIC: &[u8; 8] = b"PFCRED02";
 const CRED_VAULT_ENTROPY_LOCAL: &[u8] = b"advapi32-cred-local-v1";
 const CRED_VAULT_ENTROPY_ENTERPRISE: &[u8] = b"advapi32-cred-enterprise-v1";
 const ERROR_WRITE_FAULT_CRED: u32 = 29;
@@ -3179,14 +3236,27 @@ fn encode_cred_vault(map: &std::collections::HashMap<(String, u32), StoredCreden
         push_opt_str(&mut out, &entry.target_alias);
         push_opt_str(&mut out, &entry.user_name);
         push_bytes(&mut out, &entry.blob);
+        out.extend_from_slice(&(entry.attributes.len() as u32).to_le_bytes());
+        for attr in &entry.attributes {
+            push_bytes(&mut out, attr.keyword.as_bytes());
+            out.extend_from_slice(&attr.flags.to_le_bytes());
+            push_bytes(&mut out, &attr.value);
+        }
     }
     out
 }
 
 fn decode_cred_vault(data: &[u8]) -> Option<std::collections::HashMap<(String, u32), StoredCredential>> {
-    if data.len() < 12 || &data[..8] != CRED_VAULT_MAGIC {
+    if data.len() < 12 {
         return None;
     }
+    let has_attrs = if &data[..8] == CRED_VAULT_MAGIC {
+        true
+    } else if &data[..8] == CRED_VAULT_MAGIC_V1 {
+        false
+    } else {
+        return None;
+    };
     let mut pos = 8usize;
     let read_u32 = |pos: &mut usize| -> Option<u32> {
         let end = pos.checked_add(4)?;
@@ -3232,6 +3302,23 @@ fn decode_cred_vault(data: &[u8]) -> Option<std::collections::HashMap<(String, u
         let target_alias = read_opt_str(&mut pos)?;
         let user_name = read_opt_str(&mut pos)?;
         let blob = read_bytes(&mut pos)?;
+        let attributes = if has_attrs {
+            let acount = read_u32(&mut pos)? as usize;
+            let mut attrs = Vec::with_capacity(acount.min(CRED_MAX_ATTRIBUTES as usize));
+            for _ in 0..acount {
+                let keyword = String::from_utf8(read_bytes(&mut pos)?).ok()?;
+                let aflags = read_u32(&mut pos)?;
+                let value = read_bytes(&mut pos)?;
+                attrs.push(StoredCredAttr {
+                    keyword,
+                    flags: aflags,
+                    value,
+                });
+            }
+            attrs
+        } else {
+            Vec::new()
+        };
         let key = (target_name.to_ascii_lowercase(), cred_type);
         map.insert(
             key,
@@ -3243,6 +3330,7 @@ fn decode_cred_vault(data: &[u8]) -> Option<std::collections::HashMap<(String, u
                 last_written: FILETIME::from_u64(ft),
                 blob,
                 persist,
+                attributes,
                 target_alias,
                 user_name,
             },
@@ -3367,9 +3455,37 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, flags: u32) -> 
     };
     let blob = if c.credential_blob_size > 0 && !c.credential_blob.is_null() {
         std::slice::from_raw_parts(c.credential_blob, c.credential_blob_size as usize).to_vec()
+    } else if c.credential_blob_size > 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
     } else {
         Vec::new()
     };
+    let mut attributes = Vec::with_capacity(c.attribute_count.min(CRED_MAX_ATTRIBUTES) as usize);
+    if c.attribute_count > 0 {
+        if c.attributes.is_null() || c.attribute_count > CRED_MAX_ATTRIBUTES {
+            return err(ERROR_INVALID_PARAMETER, FALSE);
+        }
+        let attrs_ptr = c.attributes as *const CredentialAttributeW;
+        for i in 0..c.attribute_count as usize {
+            let a = std::ptr::read_unaligned(attrs_ptr.add(i));
+            let Some(keyword) = crate::strings::from_wide_opt(a.keyword) else {
+                return err(ERROR_INVALID_PARAMETER, FALSE);
+            };
+            let value = if a.value_size > 0 {
+                if a.value.is_null() {
+                    return err(ERROR_INVALID_PARAMETER, FALSE);
+                }
+                std::slice::from_raw_parts(a.value, a.value_size as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            attributes.push(StoredCredAttr {
+                keyword,
+                flags: a.flags,
+                value,
+            });
+        }
+    }
     let key = (target.to_ascii_lowercase(), c.cred_type);
     let mut entry = StoredCredential {
         flags: c.flags,
@@ -3379,6 +3495,7 @@ pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, flags: u32) -> 
         last_written: FILETIME::from_u64(crate::types::now_filetime()),
         blob,
         persist: c.persist,
+        attributes,
         target_alias: crate::strings::from_wide_opt(c.target_alias),
         user_name: crate::strings::from_wide_opt(c.user_name),
     };
@@ -3484,20 +3601,37 @@ pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, ty: u32, _flags: u32, ou
         return err(ERROR_NOT_FOUND, FALSE);
     };
 
-    // Pack `CredentialW` + strings + blob into a single heap allocation so `CredFree` frees all of it.
+    // Pack `CredentialW` + `CredentialAttributeW[]` + strings + blobs into one heap allocation for `CredFree`.
     let target_w = crate::strings::to_wide_z(&e.target_name);
     let comment_w = e.comment.as_deref().map(crate::strings::to_wide_z);
     let alias_w = e.target_alias.as_deref().map(crate::strings::to_wide_z);
     let user_w = e.user_name.as_deref().map(crate::strings::to_wide_z);
+    let attr_keywords_w: Vec<Vec<u16>> = e
+        .attributes
+        .iter()
+        .map(|a| crate::strings::to_wide_z(&a.keyword))
+        .collect();
 
     let mut total = std::mem::size_of::<CredentialW>();
+    let attrs_off = total;
+    total += e.attributes.len() * std::mem::size_of::<CredentialAttributeW>();
     let target_off = total;
     total += target_w.len() * 2;
     let comment_off = comment_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
     let alias_off = alias_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
     let user_off = user_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
+    let mut attr_kw_offs = Vec::with_capacity(e.attributes.len());
+    for kw in &attr_keywords_w {
+        attr_kw_offs.push(total);
+        total += kw.len() * 2;
+    }
     let blob_off = total;
     total += e.blob.len();
+    let mut attr_val_offs = Vec::with_capacity(e.attributes.len());
+    for a in &e.attributes {
+        attr_val_offs.push(total);
+        total += a.value.len();
+    }
 
     let base = crate::heap::alloc(total, true) as *mut u8;
     if base.is_null() {
@@ -3527,6 +3661,31 @@ pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, ty: u32, _flags: u32, ou
         std::ptr::copy_nonoverlapping(e.blob.as_ptr(), p, e.blob.len());
         p
     };
+    let attrs_ptr = if e.attributes.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let arr = base.add(attrs_off) as *mut CredentialAttributeW;
+        for (i, attr) in e.attributes.iter().enumerate() {
+            let kw_ptr = write_w(attr_kw_offs[i], &attr_keywords_w[i]);
+            let val_ptr = if attr.value.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                let p = base.add(attr_val_offs[i]);
+                std::ptr::copy_nonoverlapping(attr.value.as_ptr(), p, attr.value.len());
+                p
+            };
+            std::ptr::write_unaligned(
+                arr.add(i),
+                CredentialAttributeW {
+                    keyword: kw_ptr,
+                    flags: attr.flags,
+                    value_size: attr.value.len() as u32,
+                    value: val_ptr,
+                },
+            );
+        }
+        arr as *mut c_void
+    };
     std::ptr::write_unaligned(
         base as *mut CredentialW,
         CredentialW {
@@ -3539,8 +3698,8 @@ pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, ty: u32, _flags: u32, ou
             _pad: 0,
             credential_blob: blob_ptr,
             persist: e.persist,
-            attribute_count: 0,
-            attributes: std::ptr::null_mut(),
+            attribute_count: e.attributes.len() as u32,
+            attributes: attrs_ptr,
             target_alias: alias_ptr,
             user_name: user_ptr,
         },
@@ -4467,12 +4626,31 @@ mod tests {
             assert_eq!(crate::strings::from_wide(got_meta.user_name), "alice-updated");
             CredFree(out);
 
-            // Restore username "alice" for the loop below.
-            let c_local_restore = make_cred(&target_local, &user, &[], CRED_PERSIST_LOCAL_MACHINE);
+            // Restore username "alice" and attach a credential attribute to verify roundtrip persistence.
+            let attr_kw = crate::strings::to_wide_z("PortFactory:Scope");
+            let attr_val = b"game-launch-token";
+            let mut attr_in = CredentialAttributeW {
+                keyword: attr_kw.as_ptr() as *mut u16,
+                flags: 0,
+                value_size: attr_val.len() as u32,
+                value: attr_val.as_ptr() as *mut u8,
+            };
+            let mut c_local_restore = make_cred(&target_local, &user, &[], CRED_PERSIST_LOCAL_MACHINE);
+            c_local_restore.attribute_count = 1;
+            c_local_restore.attributes = &mut attr_in as *mut _ as *mut c_void;
             assert_eq!(
                 CredWriteW(&c_local_restore as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
                 TRUE
             );
+            assert_eq!(CredReadW(target_local.as_ptr(), 1, 0, &mut out), TRUE);
+            let got_attr_cred = std::ptr::read_unaligned(out as *const CredentialW);
+            assert_eq!(got_attr_cred.attribute_count, 1);
+            assert!(!got_attr_cred.attributes.is_null());
+            let got_attr = std::ptr::read_unaligned(got_attr_cred.attributes as *const CredentialAttributeW);
+            assert_eq!(crate::strings::from_wide(got_attr.keyword), "PortFactory:Scope");
+            assert_eq!(got_attr.value_size as usize, attr_val.len());
+            assert_eq!(std::slice::from_raw_parts(got_attr.value, got_attr.value_size as usize), attr_val);
+            CredFree(out);
 
             for (t, expected) in [(&target_local, &b"local-blob"[..]), (&target_ent, &b"ent-blob"[..])] {
                 assert_eq!(CredReadW(t.as_ptr(), 1, 0, &mut out), TRUE);

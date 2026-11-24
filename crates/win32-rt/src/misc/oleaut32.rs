@@ -542,7 +542,7 @@ fn coerced_to_i64(v: &CoercedVal) -> Result<i64, i32> {
             if !f.is_finite() {
                 return Err(DISP_E_OVERFLOW);
             }
-            let r = f.round();
+            let r = f.round_ties_even();
             if r < i64::MIN as f64 || r >= (i64::MAX as f64) {
                 return Err(DISP_E_OVERFLOW);
             }
@@ -570,7 +570,7 @@ fn coerced_to_u64(v: &CoercedVal) -> Result<u64, i32> {
             if !f.is_finite() || *f < 0.0 || *f >= (u64::MAX as f64) {
                 return Err(DISP_E_OVERFLOW);
             }
-            Ok(f.round() as u64)
+            Ok(f.round_ties_even() as u64)
         }
         CoercedVal::Bool(b) => Ok(if *b { u64::MAX } else { 0 }),
         CoercedVal::Str(s) => s.trim().parse::<u64>().map_err(|_| DISP_E_TYPEMISMATCH),
@@ -1165,6 +1165,28 @@ mod tests {
             let mut v_u4 = [0u8; 24];
             VariantInit(v_u4.as_mut_ptr());
             assert_eq!(VariantChangeType(v_u4.as_mut_ptr(), v_i4.as_ptr(), 0, VT_UI4), DISP_E_OVERFLOW);
+
+            // Halfway float rounding follows OLE Automation ties-to-even semantics.
+            for (input, expected_i4) in [(0.5f64, 0i32), (-0.5, 0), (1.5, 2), (2.5, 2), (-2.5, -2)] {
+                let mut vr = [0u8; 24];
+                let mut vi = [0u8; 24];
+                VariantInit(vr.as_mut_ptr());
+                VariantInit(vi.as_mut_ptr());
+                (vr.as_mut_ptr() as *mut u16).write_unaligned(VT_R8);
+                (vr.as_mut_ptr().add(8) as *mut f64).write_unaligned(input);
+                assert_eq!(VariantChangeType(vi.as_mut_ptr(), vr.as_ptr(), 0, VT_I4), crate::types::S_OK);
+                assert_eq!((vi.as_ptr().add(8) as *const i32).read_unaligned(), expected_i4);
+            }
+            for (input, expected_u4) in [(0.5f64, 0u32), (1.5, 2), (2.5, 2)] {
+                let mut vr = [0u8; 24];
+                let mut vu = [0u8; 24];
+                VariantInit(vr.as_mut_ptr());
+                VariantInit(vu.as_mut_ptr());
+                (vr.as_mut_ptr() as *mut u16).write_unaligned(VT_R8);
+                (vr.as_mut_ptr().add(8) as *mut f64).write_unaligned(input);
+                assert_eq!(VariantChangeType(vu.as_mut_ptr(), vr.as_ptr(), 0, VT_UI4), crate::types::S_OK);
+                assert_eq!((vu.as_ptr().add(8) as *const u32).read_unaligned(), expected_u4);
+            }
         }
     }
 
