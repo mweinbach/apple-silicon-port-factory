@@ -2736,16 +2736,18 @@ impl EventSelectEntry {
         if self.is_stream && !self.connected {
             return 0;
         }
+        let stream_rx_closed = self.is_stream && self.close_fired;
         let mut ev = 0i16;
-        if ((self.mask & FD_READ) != 0 && !self.read_fired)
-            || (self.is_stream && (self.mask & FD_CLOSE) != 0 && !self.close_fired && !self.read_fired)
+        if !stream_rx_closed
+            && !self.read_fired
+            && ((self.mask & FD_READ) != 0 || (self.is_stream && (self.mask & FD_CLOSE) != 0))
         {
             ev |= libc::POLLIN;
         }
         if (self.mask & FD_WRITE) != 0 && self.write_armed {
             ev |= libc::POLLOUT;
         }
-        if (self.mask & FD_OOB) != 0 && !self.oob_fired {
+        if !stream_rx_closed && (self.mask & FD_OOB) != 0 && !self.oob_fired {
             ev |= libc::POLLPRI;
         }
         ev
@@ -2829,6 +2831,8 @@ unsafe fn process_poll_revents(entry: &mut EventSelectEntry, revents: i16) -> (b
         entry.connecting = false;
         entry.close_fired = true;
         entry.read_fired = true;
+        entry.oob_fired = true;
+        entry.accept_fired = true;
         entry.write_armed = false;
         return (false, None);
     }
@@ -2872,7 +2876,11 @@ unsafe fn process_poll_revents(entry: &mut EventSelectEntry, revents: i16) -> (b
         }
     }
 
-    if (entry.mask & FD_OOB) != 0 && !entry.oob_fired && (revents & libc::POLLPRI) != 0 {
+    if !(entry.is_stream && entry.close_fired)
+        && (entry.mask & FD_OOB) != 0
+        && !entry.oob_fired
+        && (revents & libc::POLLPRI) != 0
+    {
         entry.oob_fired = true;
         if entry.record(FD_OOB_BIT, 0) {
             signal = true;
@@ -2887,13 +2895,15 @@ unsafe fn process_poll_revents(entry: &mut EventSelectEntry, revents: i16) -> (b
                     signal = true;
                 }
             }
-        } else {
+        } else if !entry.close_fired {
             let mut avail: i32 = 0;
             let _ = libc::ioctl(entry.fd, libc::FIONREAD, &mut avail);
             if avail > 0 {
-                entry.read_fired = true;
-                if entry.record(FD_READ_BIT, 0) {
-                    signal = true;
+                if !entry.read_fired {
+                    entry.read_fired = true;
+                    if entry.record(FD_READ_BIT, 0) {
+                        signal = true;
+                    }
                 }
             } else {
                 let mut peek_byte = 0u8;
@@ -2904,9 +2914,11 @@ unsafe fn process_poll_revents(entry: &mut EventSelectEntry, revents: i16) -> (b
                     libc::MSG_PEEK | libc::MSG_DONTWAIT,
                 );
                 if rc > 0 {
-                    entry.read_fired = true;
-                    if entry.record(FD_READ_BIT, 0) {
-                        signal = true;
+                    if !entry.read_fired {
+                        entry.read_fired = true;
+                        if entry.record(FD_READ_BIT, 0) {
+                            signal = true;
+                        }
                     }
                 } else if rc == 0 {
                     entry.close_fired = true;
@@ -3155,7 +3167,7 @@ fn event_select_rearm_read(s: usize, oob: bool) {
             entry.read_fired = false;
             wake = true;
         }
-        if wake {
+        if wake && !(entry.is_stream && entry.close_fired) {
             let ww = st.wake_w;
             wake_fd_write(ww);
         }
@@ -6119,6 +6131,186 @@ mod tests {
             assert_eq!(closesocket(cli), 0);
             assert_eq!(closesocket(srv), 0);
             assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn wsa_event_select_stream_eof_is_one_shot_and_stops_rx_polling() {
+        unsafe {
+            let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            assert_ne!(srv, INVALID_SOCKET);
+            let mut sa = [0u8; 16];
+            (sa.as_mut_ptr() as *mut u16).write_unaligned(AF_INET);
+            sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            assert_eq!(bind(srv, sa.as_ptr(), 16), 0);
+            let mut slen = 16i32;
+            assert_eq!(getsockname(srv, sa.as_mut_ptr(), &mut slen), 0);
+            assert_eq!(listen(srv, 4), 0);
+
+            let cli = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            assert_ne!(cli, INVALID_SOCKET);
+            assert_eq!(connect(cli, sa.as_ptr(), 16), 0);
+
+            let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+            assert_ne!(acc, INVALID_SOCKET);
+            let acc_fd = lookup_fd(acc).unwrap();
+
+            let acc_ev = WSACreateEvent();
+            assert!(!acc_ev.is_null());
+            assert_eq!(
+                WSAEventSelect(acc, acc_ev, FD_READ | FD_WRITE | FD_OOB | FD_CLOSE),
+                0
+            );
+
+            // Drain initial FD_WRITE so subsequent waits reflect receive/close transitions.
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 2000, FALSE), 0);
+            let mut ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_ne!(ne.l_network_events & FD_WRITE, 0);
+            assert_eq!(ne.l_network_events & FD_CLOSE, 0);
+
+            // Peer sends buffered data and half-closes (FIN) before receiver reads.
+            let payload = b"before-fin";
+            assert_eq!(
+                send(cli, payload.as_ptr(), payload.len() as i32, 0),
+                payload.len() as i32
+            );
+            assert_eq!(shutdown(cli, 1 /* SD_SEND */), 0);
+
+            // Buffered data must be delivered via FD_READ before terminal FD_CLOSE.
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 2000, FALSE), 0);
+            ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_ne!(ne.l_network_events & FD_READ, 0);
+            assert_eq!(ne.l_network_events & FD_CLOSE, 0);
+
+            let mut buf = [0u8; 32];
+            let got = recv(acc, buf.as_mut_ptr(), buf.len() as i32, 0);
+            assert_eq!(got, payload.len() as i32);
+            assert_eq!(&buf[..got as usize], payload);
+
+            // After draining buffered data, terminal FD_CLOSE fires once.
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 2000, FALSE), 0);
+            ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_ne!(ne.l_network_events & FD_CLOSE, 0);
+            assert_eq!(ne.i_error_code[FD_CLOSE_BIT], 0);
+
+            // Verify stream rx polling (POLLIN and POLLPRI) has ceased and stays off after recv/rearm.
+            {
+                let st = EVENT_SELECT.inner.lock().unwrap();
+                let entry = st.entries.get(&acc).unwrap();
+                assert!(entry.close_fired);
+                assert_eq!(entry.poll_events(), 0);
+            }
+            assert_eq!(recv(acc, buf.as_mut_ptr(), buf.len() as i32, 0), 0);
+            {
+                let st = EVENT_SELECT.inner.lock().unwrap();
+                let entry = st.entries.get(&acc).unwrap();
+                assert!(entry.close_fired);
+                assert_eq!(entry.poll_events(), 0);
+            }
+
+            // Event remains reset and FD_CLOSE does not repeat.
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 80, FALSE), 258 /* WAIT_TIMEOUT */);
+            ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_eq!(ne.l_network_events, 0);
+
+            // Half-close send path (FD_WRITE) still functions without re-firing FD_CLOSE.
+            let reply = b"after-fin";
+            assert_eq!(
+                send(acc, reply.as_ptr(), reply.len() as i32, 0),
+                reply.len() as i32
+            );
+            let mut cli_buf = [0u8; 32];
+            let cli_got = recv(cli, cli_buf.as_mut_ptr(), cli_buf.len() as i32, 0);
+            assert_eq!(cli_got, reply.len() as i32);
+            assert_eq!(&cli_buf[..cli_got as usize], reply);
+
+            event_select_rearm_write(acc);
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 2000, FALSE), 0);
+            ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_ne!(ne.l_network_events & FD_WRITE, 0);
+            assert_eq!(ne.l_network_events & FD_CLOSE, 0);
+            assert_eq!(ne.l_network_events & FD_READ, 0);
+
+            // Direct state-machine checks:
+            // 1. After close_fired on a stream socket, POLLIN/POLLPRI are never requested
+            //    (including FD_OOB-only) and stale POLLIN/POLLHUP/POLLERR revents are idempotent.
+            let mut stream_entry = EventSelectEntry {
+                fd: acc_fd,
+                is_stream: true,
+                event: 0,
+                mask: FD_READ | FD_WRITE | FD_OOB | FD_CLOSE,
+                listening: false,
+                connecting: false,
+                connected: true,
+                read_fired: false,
+                write_armed: false,
+                oob_fired: false,
+                accept_fired: false,
+                close_fired: true,
+                pending_events: 0,
+                pending_errors: [0; FD_MAX_EVENTS],
+            };
+            assert_eq!(stream_entry.poll_events(), 0);
+            assert_eq!(
+                process_poll_revents(&mut stream_entry, libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLPRI),
+                (false, None)
+            );
+            assert_eq!(stream_entry.pending_events, 0);
+
+            // FD_OOB-only stream entry after close_fired must also stop requesting POLLPRI.
+            stream_entry.mask = FD_OOB;
+            assert_eq!(stream_entry.poll_events(), 0);
+
+            // Half-close write interest still requests only POLLOUT; stale POLLHUP/POLLERR alongside
+            // POLLOUT signals only FD_WRITE and never repeats FD_CLOSE.
+            stream_entry.mask = FD_READ | FD_WRITE | FD_OOB | FD_CLOSE;
+            stream_entry.write_armed = true;
+            assert_eq!(stream_entry.poll_events(), libc::POLLOUT);
+            assert_eq!(
+                process_poll_revents(&mut stream_entry, libc::POLLOUT | libc::POLLHUP | libc::POLLERR),
+                (true, None)
+            );
+            assert_eq!(stream_entry.pending_events, FD_WRITE);
+            assert!(!stream_entry.write_armed);
+            assert_eq!(stream_entry.poll_events(), 0);
+
+            // 2. Non-stream (UDP) entries retain POLLIN/POLLPRI interest unaffected by stream EOF rules.
+            let udp_entry = EventSelectEntry {
+                fd: acc_fd,
+                is_stream: false,
+                event: 0,
+                mask: FD_READ | FD_OOB | FD_CLOSE,
+                listening: false,
+                connecting: false,
+                connected: false,
+                read_fired: false,
+                write_armed: false,
+                oob_fired: false,
+                accept_fired: false,
+                close_fired: false,
+                pending_events: 0,
+                pending_errors: [0; FD_MAX_EVENTS],
+            };
+            assert_eq!(udp_entry.poll_events(), libc::POLLIN | libc::POLLPRI);
+
+            // 3. Re-subscribing with a fresh WSAEventSelect observes current EOF once and settles again.
+            assert_eq!(WSAEventSelect(acc, acc_ev, FD_READ | FD_CLOSE), 0);
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 2000, FALSE), 0);
+            ne = WsaNetworkEvents::default();
+            assert_eq!(WSAEnumNetworkEvents(acc, acc_ev, &mut ne), 0);
+            assert_ne!(ne.l_network_events & FD_CLOSE, 0);
+            assert_eq!(WSAWaitForMultipleEvents(1, &acc_ev, FALSE, 80, FALSE), 258 /* WAIT_TIMEOUT */);
+
+            assert_eq!(WSAEventSelect(acc, std::ptr::null_mut(), 0), 0);
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(cli), 0);
+            assert_eq!(closesocket(srv), 0);
+            assert_eq!(WSACloseEvent(acc_ev), TRUE);
         }
     }
 }
