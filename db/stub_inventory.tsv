@@ -1,12 +1,12 @@
 dll	api	kind	file	line	detail
-advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1353	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
+advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2958	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1361	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	406	"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PushMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	384	"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_SetMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	428	"agsDriverExtensionsDX12_SetMarker: unsupported command list {cmd_list:#x}"
@@ -76,11 +76,11 @@ dbghelp.dll	MiniDumpWriteDump	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BO
 dbghelp.dll	StackWalk64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 dbghelp.dll	SymGetLineFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 dbghelp.dll	SymGetLineFromAddrW64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dinput8.dll	configure_devices	stub	crates/win32-rt/src/misc/dinput8.rs	1860	"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"
-dinput8.dll	dev_get_property	stub	crates/win32-rt/src/misc/dinput8.rs	1238	"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"
-dinput8.dll	dev_run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1556	"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"
-dinput8.dll	dev_set_property	stub	crates/win32-rt/src/misc/dinput8.rs	1330	"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"
-dinput8.dll	run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1820	"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"
+dinput8.dll	configure_devices	stub	crates/win32-rt/src/misc/dinput8.rs	1862	"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_get_property	stub	crates/win32-rt/src/misc/dinput8.rs	1239	"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1557	"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_set_property	stub	crates/win32-rt/src/misc/dinput8.rs	1331	"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"
+dinput8.dll	run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1822	"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"
 directml.dll	parse	middleware_stub	crates/win32-rt/src/misc/directml/ops.rs	1048	"DirectML CreateOperator: unsupported operator type {other}"
 dsound.dll	dsb_set_fx	stub	crates/win32-rt/src/misc/dsound/com_vtbl.rs	1458	"IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE"
 dstorage.dll	DStorageCreateCompressionCodec	middleware_stub	crates/win32-rt/src/misc/dstorage.rs	94	"DStorageCreateCompressionCodec: unsupported format {format:#x} -> E_NOTIMPL"
@@ -106,8 +106,8 @@ kernel32.dll	AssignProcessToJobObject	stub	crates/win32-rt/src/kernel32/process.
 kernel32.dll	CloseThreadpoolCleanupGroupMembers	stub	crates/win32-rt/src/kernel32/threadpool.rs	808	"cleanup groups do not track members"
 kernel32.dll	CreateProcessW	stub	crates/win32-rt/src/kernel32/process.rs	1283	"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)
 kernel32.dll	CreateRemoteThread	stub	crates/win32-rt/src/kernel32/threads.rs	60	"CreateRemoteThread into another process"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7046	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7074	"DeviceIoControl code {code:#x} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7057	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7085	"DeviceIoControl code {code:#x} unsupported"
 kernel32.dll	FlushProcessWriteBuffers	stub	crates/win32-rt/src/kernel32/memory.rs	1028	"FlushProcessWriteBuffers approximated by a local fence"
 kernel32.dll	GetCalendarInfoEx	stub	crates/win32-rt/src/kernel32/string.rs	1354	"GetCalendarInfoEx type {ty:#x}"
 kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2111	"GetFileInformationByHandleEx class {class} not supported"
@@ -117,7 +117,7 @@ kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	
 kernel32.dll	InitOnceBeginInitialize	stub	crates/win32-rt/src/sync.rs	744	"INIT_ONCE_ASYNC treated as synchronous"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
-kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6837	"MapViewOfFile3 on another process"
+kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6848	"MapViewOfFile3 on another process"
 kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2526	"MoveFileExA delete-on-reboot ignored"
 kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2519	"MoveFileExW delete-on-reboot ignored"
 kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2198	"SetFileInformationByHandle class {class} not supported"
@@ -147,7 +147,7 @@ libxess_dx11.dll	INTC_D3D12_RegisterDriverCallbacks	middleware_stub	crates/win32
 libxess_dx11.dll	xessD3D11Execute	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	657	"xessD3D11Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX"...
 libxess_dx11.dll	xessStartDump	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	951	"xessStartDump -> XESS_RESULT_ERROR_NOT_IMPLEMENTED"
 libxess_dx11.dll	xess_set_context_parameter_f_impl	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	879	"xessSetContextParameterF(param={param:#x}, value={value}) -> NOT_IMPLEMENTED"
-mmdevapi.dll	activate	stub	crates/win32-rt/src/audio/mmdevapi.rs	591	"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"
+mmdevapi.dll	activate	stub	crates/win32-rt/src/audio/mmdevapi.rs	592	"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"
 mmdevapi.dll	get_buffer_size_limits	stub	crates/win32-rt/src/audio/audioclient.rs	919	"IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)"
 mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/audioclient.rs	885	"IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE"
 mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/spatial.rs	846	"ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE"
@@ -156,15 +156,15 @@ mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	440	"IAudi
 msctf.dll	ctx_track_properties	stub	crates/win32-rt/src/misc/msctf/context.rs	809	"ITfContext::TrackProperties -> E_NOTIMPL"
 nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
 nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type
-ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1582	"KiUserApcDispatcher called directly"
-ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1586	"KiUserCallbackDispatcher called directly"
-ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1578	"KiUserExceptionDispatcher called directly"
-ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2083	"LdrInitializeThunk called directly"
-ntdll.dll	NtCommitTransaction	stub	crates/win32-rt/src/ntdll.rs	722	"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"
-ntdll.dll	NtCreateTransaction	stub	crates/win32-rt/src/ntdll.rs	717	"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"
-ntdll.dll	NtQueryInformationProcess	stub	crates/win32-rt/src/ntdll.rs	230	"NtQueryInformationProcess class {class}"
-ntdll.dll	NtQueryInformationThread	stub	crates/win32-rt/src/ntdll.rs	294	"NtQueryInformationThread class {class}"
-ntdll.dll	NtQuerySystemInformation	stub	crates/win32-rt/src/ntdll.rs	413	"NtQuerySystemInformation class {class}"
+ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1662	"KiUserApcDispatcher called directly"
+ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1666	"KiUserCallbackDispatcher called directly"
+ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1658	"KiUserExceptionDispatcher called directly"
+ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2404	"LdrInitializeThunk called directly"
+ntdll.dll	NtCommitTransaction	stub	crates/win32-rt/src/ntdll.rs	731	"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"
+ntdll.dll	NtCreateTransaction	stub	crates/win32-rt/src/ntdll.rs	726	"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"
+ntdll.dll	NtQueryInformationProcess	stub	crates/win32-rt/src/ntdll.rs	239	"NtQueryInformationProcess class {class}"
+ntdll.dll	NtQueryInformationThread	stub	crates/win32-rt/src/ntdll.rs	303	"NtQueryInformationThread class {class}"
+ntdll.dll	NtQuerySystemInformation	stub	crates/win32-rt/src/ntdll.rs	422	"NtQuerySystemInformation class {class}"
 nvngx_dlss.dll	NVSDK_NGX_D3D12_CreateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	630	"NVSDK_NGX_D3D12_CreateFeature: unsupported feature_id={other} ({}) -> FAIL_FeatureNotSupported", ngx_feature_name(other)
 nvngx_dlss.dll	NVSDK_NGX_VULKAN_CreateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	731	"NVSDK_NGX_VULKAN_CreateFeature(feature_id={feature_id} {}): Vulkan NGX is not implemented -> FAIL_FeatureNotSupported", ngx_feature_name(fe...
 nvngx_dlss.dll	NVSDK_NGX_VULKAN_EvaluateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	744	"NVSDK_NGX_VULKAN_EvaluateFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"
@@ -176,12 +176,12 @@ ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2203	"IPropertyValu
 ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2223	concat!("IPropertyValue::", $method, " -> E_NOTIMPL")
 ole32.dll	pv_get_size	stub	crates/win32-rt/src/misc/ole32.rs	2194	"IPropertyValue::GetSize -> E_NOTIMPL"
 ole32.dll	pv_get_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2176	"IPropertyValue::GetTimeSpan -> E_NOTIMPL"
-ole32.dll	pvs_create_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2581	"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"
-ole32.dll	pvs_create_point	stub	crates/win32-rt/src/misc/ole32.rs	2608	"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"
-ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2639	"IPropertyValueStatics::CreateRect -> E_NOTIMPL"
-ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2658	concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")
-ole32.dll	pvs_create_size	stub	crates/win32-rt/src/misc/ole32.rs	2622	"IPropertyValueStatics::CreateSize -> E_NOTIMPL"
-ole32.dll	pvs_create_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2594	"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"
+ole32.dll	pvs_create_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2582	"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"
+ole32.dll	pvs_create_point	stub	crates/win32-rt/src/misc/ole32.rs	2609	"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"
+ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2640	"IPropertyValueStatics::CreateRect -> E_NOTIMPL"
+ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2659	concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")
+ole32.dll	pvs_create_size	stub	crates/win32-rt/src/misc/ole32.rs	2623	"IPropertyValueStatics::CreateSize -> E_NOTIMPL"
+ole32.dll	pvs_create_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2595	"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"
 oo2core_9_win64.dll	OodleLZ_Compress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	86	"oo2core!OodleLZ_Compress(compressor={compressor}, raw_len={raw_len})"
 oo2core_9_win64.dll	OodleLZ_Decompress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	106	"oo2core!OodleLZ_Decompress(comp={comp_buf_size}, raw={raw_len})"
 physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2336	"PxGeometryQuery::computePenetration unsupported geometry0 {}", geom_type_name(t)

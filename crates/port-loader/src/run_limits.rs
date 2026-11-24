@@ -194,10 +194,8 @@ pub fn install(cfg: RunLimitsConfig) {
         started: Instant::now(),
     });
     if need_present_hook {
-        // SEAM for `toolkit/api-neutral-present-hooks`:
-        // Replace this single registration with the API-neutral present hook registry
-        // once D3D12, D3D11, and Vulkan share one unified present dispatch.
-        win32_rt::d3d12::swapchain::register_present_hook(on_frame_presented);
+        // Driven by the API-neutral present hook registry (D3D12, D3D11, Vulkan).
+        win32_rt::present::register_present_hook(on_frame_presented);
     }
     if need_exit_hook {
         win32_rt::process::register_exit_hook(on_guest_process_exit);
@@ -249,6 +247,13 @@ pub fn start_timeout_watchdog() {
                             );
                             let _ = std::io::stderr().flush();
                         }
+                        crate::boot_report::write_report_with_override(
+                            Some((
+                                "timeout",
+                                &format!("execution timed out after {timeout_secs}s"),
+                            )),
+                            Some(exit_codes::TIMEOUT as u32),
+                        );
                         // Terminate immediately via `_exit` so a deadlocked guest mutex
                         // cannot block the timeout watchdog.
                         unsafe { libc::_exit(exit_codes::TIMEOUT) }

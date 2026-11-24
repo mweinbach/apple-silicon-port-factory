@@ -391,6 +391,7 @@ fn audit_and_verify_commands_emit_valid_json_and_canonical_exit_codes() {
         "win32_apis.tsv",
         "shader_formats.tsv",
         "game_profiles.tsv",
+        "stub_inventory.tsv",
     ] {
         std::fs::copy(repo_root.join("db").join(tsv), fake_ws.join("db").join(tsv)).unwrap();
     }

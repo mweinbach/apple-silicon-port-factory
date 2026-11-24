@@ -19,7 +19,20 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
-_No per-thread backlog files present yet. Parallel threads should add `docs/stub-backlog.d/<thread-or-topic>.md` (see [`docs/stub-backlog.d/README.md`](stub-backlog.d/README.md)) and run `cargo opsdb -- stub-backlog --write`._
+| File | Summary |
+|---|---|
+| [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
+
+### From `docs/stub-backlog.d/guest-corpus-bench.md`
+
+# Stub & API Gap Backlog — `toolkit/guest-corpus-bench`
+
+Exposed while building and running the headless Windows x86-64 guest corpus (`crates/port-loader/tests/os_guest_corpus.rs` and `crates/port-loader/tests/d3d12_e2e.rs`).
+
+| DLL!API | What the test showed | Next step |
+|---|---|---|
+| `user32.dll!wsprintfW` | Missing export in `crates/win32-rt/src/user32/misc.rs`: guest binaries importing `wsprintfW` hit an unresolved-import trap thunk instead of formatting UTF-16 output. | Implement variadic `wsprintfW` via `win64_varargs_thunk!` backed by `ucrt::stdio` wide formatter (1024-char Windows cap) and run `cargo opsdb -- win32-sync`. |
+| `user32.dll!wsprintfA` | Existing implementation in `crates/win32-rt/src/user32/misc.rs` copies the raw format string and ignores variadic arguments (`let _ = (a1, a2);`). | Replace with a real `win64_varargs_thunk!` formatter backed by `ucrt::stdio` narrow printf formatting (1024-char Windows cap). |
 
 ## Proprietary & Vendor Middleware (Legal / Architectural Limits)
 
@@ -99,8 +112,8 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `CloseThreadpoolCleanupGroupMembers` | `stub` | `crates/win32-rt/src/kernel32/threadpool.rs:808` | `"cleanup groups do not track members"` |
 | `CreateProcessW` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1283` | `"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)` |
 | `CreateRemoteThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:60` | `"CreateRemoteThread into another process"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7046` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7074` | `"DeviceIoControl code {code:#x} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7057` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7085` | `"DeviceIoControl code {code:#x} unsupported"` |
 | `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1028` | `"FlushProcessWriteBuffers approximated by a local fence"` |
 | `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
 | `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2111` | `"GetFileInformationByHandleEx class {class} not supported"` |
@@ -110,7 +123,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `InitOnceBeginInitialize` | `stub` | `crates/win32-rt/src/sync.rs:744` | `"INIT_ONCE_ASYNC treated as synchronous"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6837` | `"MapViewOfFile3 on another process"` |
+| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6848` | `"MapViewOfFile3 on another process"` |
 | `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2526` | `"MoveFileExA delete-on-reboot ignored"` |
 | `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2519` | `"MoveFileExW delete-on-reboot ignored"` |
 | `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2198` | `"SetFileInformationByHandle class {class} not supported"` |
@@ -240,12 +253,12 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `pv_get_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2223` | `concat!("IPropertyValue::", $method, " -> E_NOTIMPL")` |
 | `pv_get_size` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2194` | `"IPropertyValue::GetSize -> E_NOTIMPL"` |
 | `pv_get_time_span` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2176` | `"IPropertyValue::GetTimeSpan -> E_NOTIMPL"` |
-| `pvs_create_date_time` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2581` | `"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"` |
-| `pvs_create_point` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2608` | `"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"` |
-| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2639` | `"IPropertyValueStatics::CreateRect -> E_NOTIMPL"` |
-| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2658` | `concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")` |
-| `pvs_create_size` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2622` | `"IPropertyValueStatics::CreateSize -> E_NOTIMPL"` |
-| `pvs_create_time_span` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2594` | `"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"` |
+| `pvs_create_date_time` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2582` | `"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"` |
+| `pvs_create_point` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2609` | `"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"` |
+| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2640` | `"IPropertyValueStatics::CreateRect -> E_NOTIMPL"` |
+| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2659` | `concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")` |
+| `pvs_create_size` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2623` | `"IPropertyValueStatics::CreateSize -> E_NOTIMPL"` |
+| `pvs_create_time_span` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2595` | `"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"` |
 
 ### `physx3common_x64.dll` (12)
 
@@ -345,15 +358,15 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `KiUserApcDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1582` | `"KiUserApcDispatcher called directly"` |
-| `KiUserCallbackDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1586` | `"KiUserCallbackDispatcher called directly"` |
-| `KiUserExceptionDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1578` | `"KiUserExceptionDispatcher called directly"` |
-| `LdrInitializeThunk` | `stub` | `crates/win32-rt/src/ntdll.rs:2083` | `"LdrInitializeThunk called directly"` |
-| `NtCommitTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:722` | `"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtCreateTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:717` | `"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:230` | `"NtQueryInformationProcess class {class}"` |
-| `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:294` | `"NtQueryInformationThread class {class}"` |
-| `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:413` | `"NtQuerySystemInformation class {class}"` |
+| `KiUserApcDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1662` | `"KiUserApcDispatcher called directly"` |
+| `KiUserCallbackDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1666` | `"KiUserCallbackDispatcher called directly"` |
+| `KiUserExceptionDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1658` | `"KiUserExceptionDispatcher called directly"` |
+| `LdrInitializeThunk` | `stub` | `crates/win32-rt/src/ntdll.rs:2404` | `"LdrInitializeThunk called directly"` |
+| `NtCommitTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:731` | `"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"` |
+| `NtCreateTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:726` | `"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"` |
+| `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:239` | `"NtQueryInformationProcess class {class}"` |
+| `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:303` | `"NtQueryInformationThread class {class}"` |
+| `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:422` | `"NtQuerySystemInformation class {class}"` |
 
 ### `advapi32.dll` (8)
 
@@ -362,14 +375,14 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1353` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
+| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2958` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1361` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
 
 ### `amd_fidelityfx_loader_dx12.dll` (6)
 
@@ -392,7 +405,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `activate` | `stub` | `crates/win32-rt/src/audio/mmdevapi.rs:591` | `"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"` |
+| `activate` | `stub` | `crates/win32-rt/src/audio/mmdevapi.rs:592` | `"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"` |
 | `get_buffer_size_limits` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:919` | `"IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)"` |
 | `get_service` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:885` | `"IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE"` |
 | `get_service` | `stub` | `crates/win32-rt/src/audio/spatial.rs:846` | `"ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE"` |
@@ -420,11 +433,11 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `configure_devices` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1860` | `"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"` |
-| `dev_get_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1238` | `"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
-| `dev_run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1556` | `"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"` |
-| `dev_set_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1330` | `"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
-| `run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1820` | `"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"` |
+| `configure_devices` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1862` | `"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"` |
+| `dev_get_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1239` | `"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
+| `dev_run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1557` | `"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"` |
+| `dev_set_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1331` | `"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
+| `run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1822` | `"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"` |
 
 ### `nvngx_dlss.dll` (5)
 
