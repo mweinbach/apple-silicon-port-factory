@@ -13,7 +13,7 @@
 //! (`db/bench_baselines.json`) keyed by host chip (`sysctl -n machdep.cpu.brand_string`)
 //! with a configurable regression tolerance and clear PASS/FAIL status.
 
-use crate::bundle_common::{find_or_build_host_port_runner, TempDirGuard};
+use crate::bundle_common::TempDirGuard;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -86,7 +86,7 @@ pub const WORKLOADS: &[WorkloadSpec] = &[
     },
     WorkloadSpec {
         id: "d3d12_draw_heavy_frame",
-        description: "Headless D3D12 500-draw-call frame submission + GPU fence sync + pixel readback",
+        description: "Headless D3D12 12,000-draw (3x4,000) frame batch + GPU fence sync + pixel readback",
         source: D3D12_DRAW_HEAVY_C,
         extra_cflags: &[],
         libs: &["d3d12", "kernel32"],
@@ -310,7 +310,74 @@ fn prewarm_workload(runner: &Path, work_dir: &Path, exe_path: &Path, aot_dir: &P
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    let has_aot = fs::read_dir(aot_dir)?
+        .flatten()
+        .any(|e| {
+            e.path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("aot"))
+        });
+    if !has_aot {
+        bail!(
+            "prewarm-aot succeeded for {} but produced no .aot cache file in {}",
+            exe_path.display(),
+            aot_dir.display()
+        );
+    }
     Ok(())
+}
+
+/// Parse the total number of live AOT blocks reported by `x86_runtime::emu::aot`
+/// (`emu aot: <mod>: <live>/<total> blocks live ...`). Returns `Some(total_live)`
+/// when at least one AOT block was activated, or `None` if AOT did not activate.
+pub fn aot_live_block_count(log_text: &str) -> Option<usize> {
+    let mut total_live = 0usize;
+    for line in log_text.lines() {
+        if !line.contains("emu aot:") || !line.contains("blocks live") {
+            continue;
+        }
+        let Some(before) = line.split(" blocks live").next() else {
+            continue;
+        };
+        let Some(frac) = before.split_whitespace().last() else {
+            continue;
+        };
+        let Some((live_s, _total_s)) = frac.split_once('/') else {
+            continue;
+        };
+        if let Ok(live) = live_s.parse::<usize>() {
+            total_live = total_live.saturating_add(live);
+        }
+    }
+    (total_live > 0).then_some(total_live)
+}
+
+fn build_host_port_runner(workspace_root: &Path) -> Result<PathBuf> {
+    let status = Command::new("cargo")
+        .current_dir(workspace_root)
+        .args([
+            "build",
+            "-p",
+            "port-loader",
+            "--bin",
+            "port-runner",
+            "--target",
+            "aarch64-apple-darwin",
+        ])
+        .status()
+        .context("building fresh host port-runner via cargo")?;
+    if !status.success() {
+        bail!("failed to build port-runner before benchmarking (cargo exited with {status})");
+    }
+    let bin = workspace_root.join("target/aarch64-apple-darwin/debug/port-runner");
+    if bin.is_file() {
+        return Ok(bin);
+    }
+    bail!(
+        "port-runner binary not found at {} after cargo build",
+        bin.display()
+    )
 }
 
 pub fn parse_bench_result_line(
@@ -375,6 +442,11 @@ fn run_workload(
     fs::create_dir_all(&log_dir)?;
     fs::create_dir_all(&drive_c)?;
 
+    let rust_log = match mode {
+        BenchMode::Aot => "warn,x86_runtime::emu::aot=info",
+        BenchMode::Jit => "warn",
+    };
+
     let mut cmd = Command::new(runner);
     cmd.arg("--pe")
         .arg(exe_path)
@@ -385,7 +457,7 @@ fn run_workload(
         .env("PORT_HEADLESS", "1")
         .env("AW2_HEADLESS", "1")
         .env("PORT_AOT_GUARD", "0")
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", rust_log)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -442,6 +514,16 @@ fn run_workload(
             "benchmark {} failed (exit={code:?}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- log ---\n{log_file}",
             spec.id
         );
+    }
+
+    if mode == BenchMode::Aot {
+        let combined_aot_logs = format!("{log_file}\n{stderr}");
+        if aot_live_block_count(&combined_aot_logs).is_none() {
+            bail!(
+                "benchmark {} ran in AOT mode but AOT blocks were NOT activated (no 'emu aot: ... <live>/<total> blocks live' with live > 0):\n--- stderr ---\n{stderr}\n--- log ---\n{log_file}",
+                spec.id
+            );
+        }
     }
 
     for line in stdout.lines().chain(log_file.lines()) {
@@ -846,7 +928,7 @@ pub fn run_benchmarks(opts: &BenchOptions) -> Result<BenchReport> {
             }
             p.clone()
         }
-        None => find_or_build_host_port_runner(&opts.workspace_root)?,
+        None => build_host_port_runner(&opts.workspace_root)?,
     };
     let runner_profile = if runner.to_string_lossy().contains("/release/") {
         "release".to_string()
@@ -1204,26 +1286,38 @@ const LOCK_HEAVY_JOB_QUEUE_C: &str = r##"
 #define Q_CAP 256
 #define Q_MASK (Q_CAP - 1)
 #define NUM_WORKERS 4
-#define JOBS_PER_SAMPLE 40000
+#define JOBS_PER_SAMPLE 80000
+#define WARMUP_SAMPLES 2
+#define SAMPLES 9
 
 typedef struct {
     SRWLOCK lock;
     CONDITION_VARIABLE not_empty;
     CONDITION_VARIABLE not_full;
+    CONDITION_VARIABLE round_done;
     uint64_t ring[Q_CAP];
     uint32_t head;
     uint32_t tail;
+    uint32_t waiters_empty;
+    uint32_t waiters_full;
+    int ready_workers;
     int shutdown;
-    volatile LONG64 completed;
-    volatile LONG64 checksum;
+    uint32_t completed;
+    uint64_t checksum;
 } JobQueue;
 
 static DWORD WINAPI queue_worker(LPVOID lp) {
     JobQueue *q = (JobQueue *)lp;
+    AcquireSRWLockExclusive(&q->lock);
+    q->ready_workers++;
+    ReleaseSRWLockExclusive(&q->lock);
+    WakeConditionVariable(&q->round_done);
     for (;;) {
         AcquireSRWLockExclusive(&q->lock);
         while (q->head == q->tail && !q->shutdown) {
+            q->waiters_empty++;
             SleepConditionVariableSRW(&q->not_empty, &q->lock, INFINITE, 0);
+            q->waiters_empty--;
         }
         if (q->head == q->tail && q->shutdown) {
             ReleaseSRWLockExclusive(&q->lock);
@@ -1231,13 +1325,25 @@ static DWORD WINAPI queue_worker(LPVOID lp) {
         }
         uint64_t item = q->ring[q->head & Q_MASK];
         q->head++;
+        int wake_prod = (q->waiters_full > 0);
         ReleaseSRWLockExclusive(&q->lock);
-        WakeConditionVariable(&q->not_full);
+        if (wake_prod) {
+            WakeConditionVariable(&q->not_full);
+        }
 
-        /* Tiny deterministic payload mix */
+        /* Deterministic payload mix + locked completion update */
         uint64_t v = (item ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
-        InterlockedAdd64(&q->checksum, (LONG64)(v & 0xFFFFu));
-        InterlockedIncrement64(&q->completed);
+        v ^= (v >> 31);
+        v *= 0x94D049BB133111EBULL;
+
+        AcquireSRWLockExclusive(&q->lock);
+        q->checksum += (v & 0xFFFFu);
+        q->completed++;
+        int is_done = (q->completed == JOBS_PER_SAMPLE);
+        ReleaseSRWLockExclusive(&q->lock);
+        if (is_done) {
+            WakeConditionVariable(&q->round_done);
+        }
     }
 }
 
@@ -1246,13 +1352,63 @@ static int cmp_double(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
-static double run_one_sample(uint64_t *out_checksum) {
+static double run_one_round(JobQueue *q, LARGE_INTEGER freq, uint64_t *out_checksum) {
+    AcquireSRWLockExclusive(&q->lock);
+    q->head = 0;
+    q->tail = 0;
+    q->completed = 0;
+    q->checksum = 0;
+    ReleaseSRWLockExclusive(&q->lock);
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    for (uint32_t i = 1; i <= JOBS_PER_SAMPLE; ++i) {
+        AcquireSRWLockExclusive(&q->lock);
+        while ((q->tail - q->head) >= Q_CAP) {
+            q->waiters_full++;
+            SleepConditionVariableSRW(&q->not_full, &q->lock, INFINITE, 0);
+            q->waiters_full--;
+        }
+        q->ring[q->tail & Q_MASK] = (uint64_t)i;
+        q->tail++;
+        int wake_cons = (q->waiters_empty > 0);
+        ReleaseSRWLockExclusive(&q->lock);
+        if (wake_cons) {
+            WakeConditionVariable(&q->not_empty);
+        }
+    }
+
+    AcquireSRWLockExclusive(&q->lock);
+    while (q->completed < JOBS_PER_SAMPLE) {
+        SleepConditionVariableSRW(&q->round_done, &q->lock, INFINITE, 0);
+    }
+    *out_checksum = q->checksum;
+    ReleaseSRWLockExclusive(&q->lock);
+
+    QueryPerformanceCounter(&t1);
+    return (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+}
+
+int main(void) {
+    uint64_t expected_sum = 0;
+    for (uint32_t i = 1; i <= JOBS_PER_SAMPLE; ++i) {
+        uint64_t v = ((uint64_t)i ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
+        v ^= (v >> 31);
+        v *= 0x94D049BB133111EBULL;
+        expected_sum += (v & 0xFFFFu);
+    }
+
     JobQueue q;
     InitializeSRWLock(&q.lock);
     InitializeConditionVariable(&q.not_empty);
     InitializeConditionVariable(&q.not_full);
+    InitializeConditionVariable(&q.round_done);
     q.head = 0;
     q.tail = 0;
+    q.waiters_empty = 0;
+    q.waiters_full = 0;
+    q.ready_workers = 0;
     q.shutdown = 0;
     q.completed = 0;
     q.checksum = 0;
@@ -1263,59 +1419,36 @@ static double run_one_sample(uint64_t *out_checksum) {
         if (!workers[i]) ExitProcess(1);
     }
 
-    LARGE_INTEGER freq, t0, t1;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
+    AcquireSRWLockExclusive(&q.lock);
+    while (q.ready_workers < NUM_WORKERS) {
+        SleepConditionVariableSRW(&q.round_done, &q.lock, INFINITE, 0);
+    }
+    ReleaseSRWLockExclusive(&q.lock);
 
-    for (uint32_t i = 1; i <= JOBS_PER_SAMPLE; ++i) {
-        AcquireSRWLockExclusive(&q.lock);
-        while ((q.tail - q.head) >= Q_CAP) {
-            SleepConditionVariableSRW(&q.not_full, &q.lock, INFINITE, 0);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+
+    uint64_t cs = 0;
+    for (int w = 0; w < WARMUP_SAMPLES; ++w) {
+        run_one_round(&q, freq, &cs);
+        if (cs != expected_sum) {
+            fprintf(stderr, "FAIL: checksum mismatch %llu != %llu\n", (unsigned long long)cs, (unsigned long long)expected_sum);
+            return 3;
         }
-        q.ring[q.tail & Q_MASK] = (uint64_t)i;
-        q.tail++;
-        ReleaseSRWLockExclusive(&q.lock);
-        WakeConditionVariable(&q.not_empty);
+    }
+
+    double times[SAMPLES];
+    for (int s = 0; s < SAMPLES; ++s) {
+        times[s] = run_one_round(&q, freq, &cs);
+        if (cs != expected_sum) return 4;
     }
 
     AcquireSRWLockExclusive(&q.lock);
     q.shutdown = 1;
     ReleaseSRWLockExclusive(&q.lock);
     WakeAllConditionVariable(&q.not_empty);
-
     WaitForMultipleObjects(NUM_WORKERS, workers, TRUE, 30000);
-    QueryPerformanceCounter(&t1);
-
     for (int i = 0; i < NUM_WORKERS; ++i) CloseHandle(workers[i]);
-    if (q.completed != JOBS_PER_SAMPLE) {
-        fprintf(stderr, "FAIL: completed=%lld expected=%d\n", (long long)q.completed, JOBS_PER_SAMPLE);
-        ExitProcess(2);
-    }
-    *out_checksum = (uint64_t)q.checksum;
-    return (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-}
-
-int main(void) {
-    uint64_t expected_sum = 0;
-    for (uint32_t i = 1; i <= JOBS_PER_SAMPLE; ++i) {
-        uint64_t v = ((uint64_t)i ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
-        expected_sum += (v & 0xFFFFu);
-    }
-
-    /* Warmup */
-    uint64_t cs = 0;
-    run_one_sample(&cs);
-    if (cs != expected_sum) {
-        fprintf(stderr, "FAIL: checksum mismatch %llu != %llu\n", (unsigned long long)cs, (unsigned long long)expected_sum);
-        return 3;
-    }
-
-    const int SAMPLES = 5;
-    double times[5];
-    for (int s = 0; s < SAMPLES; ++s) {
-        times[s] = run_one_sample(&cs);
-        if (cs != expected_sum) return 4;
-    }
 
     qsort(times, SAMPLES, sizeof(double), cmp_double);
     double med = times[SAMPLES / 2];
@@ -1399,7 +1532,10 @@ static const uint8_t kPsCb0ColorDxbc[188] = {
 };
 
 #define CHECK_HR(hr) do { if (FAILED(hr)) { fprintf(stderr, "FAIL hr=0x%08lx line %d\n", (unsigned long)(hr), __LINE__); ExitProcess(1); } } while (0)
-#define DRAWS_PER_FRAME 500
+#define DRAWS_PER_FRAME 4000
+#define FRAMES_PER_SAMPLE 3
+#define WARMUP_FRAMES 12
+#define SAMPLES 9
 #define CB_SLOTS 16
 
 static ID3D12Resource *create_buf(ID3D12Device *dev, D3D12_HEAP_TYPE ht, UINT64 sz, D3D12_RESOURCE_STATES st) {
@@ -1538,14 +1674,8 @@ int main(void) {
     QueryPerformanceFrequency(&freq);
     UINT64 fence_val = 0;
 
-    const int WARMUP = 2;
-    const int SAMPLES = 7;
-    double times[7];
-
-    for (int iter = 0; iter < WARMUP + SAMPLES; ++iter) {
-        LARGE_INTEGER t0, t1;
-        QueryPerformanceCounter(&t0);
-
+    /* Ramp GPU clocks and warm allocator/command-queue state before timing. */
+    for (int w = 0; w < WARMUP_FRAMES; ++w) {
         CHECK_HR(ID3D12CommandAllocator_Reset(alloc));
         CHECK_HR(ID3D12GraphicsCommandList_Reset(cl, alloc, pso));
         ID3D12GraphicsCommandList_ClearRenderTargetView(cl, rtv_cpu, clear_col, 0, NULL);
@@ -1554,7 +1684,6 @@ int main(void) {
         ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, rs);
         ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D12GraphicsCommandList_IASetVertexBuffers(cl, 0, 1, &vbv);
-
         for (int d = 0; d < DRAWS_PER_FRAME; ++d) {
             D3D12_RECT sc = { (d & 3) * 4, (d & 3) * 4, (LONG)W, (LONG)H };
             ID3D12GraphicsCommandList_RSSetScissorRects(cl, 1, &sc);
@@ -1562,7 +1691,6 @@ int main(void) {
                 cl, 0, cb_base + (UINT64)(d % CB_SLOTS) * 256);
             ID3D12GraphicsCommandList_DrawInstanced(cl, 3, 1, 0, 0);
         }
-
         CHECK_HR(ID3D12GraphicsCommandList_Close(cl));
         ID3D12CommandList *lists[1] = { (ID3D12CommandList *)cl };
         ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
@@ -1570,11 +1698,42 @@ int main(void) {
         CHECK_HR(ID3D12CommandQueue_Signal(queue, fence, fence_val));
         CHECK_HR(ID3D12Fence_SetEventOnCompletion(fence, fence_val, fev));
         if (WaitForSingleObject(fev, 10000) != WAIT_OBJECT_0) return 2;
+    }
+
+    double times[SAMPLES];
+    for (int s = 0; s < SAMPLES; ++s) {
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+
+        for (int f = 0; f < FRAMES_PER_SAMPLE; ++f) {
+            CHECK_HR(ID3D12CommandAllocator_Reset(alloc));
+            CHECK_HR(ID3D12GraphicsCommandList_Reset(cl, alloc, pso));
+            ID3D12GraphicsCommandList_ClearRenderTargetView(cl, rtv_cpu, clear_col, 0, NULL);
+            ID3D12GraphicsCommandList_RSSetViewports(cl, 1, &vp);
+            ID3D12GraphicsCommandList_OMSetRenderTargets(cl, 1, &rtv_cpu, FALSE, NULL);
+            ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, rs);
+            ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ID3D12GraphicsCommandList_IASetVertexBuffers(cl, 0, 1, &vbv);
+
+            for (int d = 0; d < DRAWS_PER_FRAME; ++d) {
+                D3D12_RECT sc = { (d & 3) * 4, (d & 3) * 4, (LONG)W, (LONG)H };
+                ID3D12GraphicsCommandList_RSSetScissorRects(cl, 1, &sc);
+                ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(
+                    cl, 0, cb_base + (UINT64)(d % CB_SLOTS) * 256);
+                ID3D12GraphicsCommandList_DrawInstanced(cl, 3, 1, 0, 0);
+            }
+
+            CHECK_HR(ID3D12GraphicsCommandList_Close(cl));
+            ID3D12CommandList *lists[1] = { (ID3D12CommandList *)cl };
+            ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+            fence_val++;
+            CHECK_HR(ID3D12CommandQueue_Signal(queue, fence, fence_val));
+            CHECK_HR(ID3D12Fence_SetEventOnCompletion(fence, fence_val, fev));
+            if (WaitForSingleObject(fev, 10000) != WAIT_OBJECT_0) return 2;
+        }
 
         QueryPerformanceCounter(&t1);
-        if (iter >= WARMUP) {
-            times[iter - WARMUP] = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-        }
+        times[s] = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
     }
 
     /* Verify non-black rendered center pixel via readback */
@@ -1624,9 +1783,10 @@ int main(void) {
 
     qsort(times, SAMPLES, sizeof(double), cmp_double);
     double med = times[SAMPLES / 2];
-    double draws_s = (double)DRAWS_PER_FRAME / (med / 1000.0);
+    int total_draws = DRAWS_PER_FRAME * FRAMES_PER_SAMPLE;
+    double draws_s = (double)total_draws / (med / 1000.0);
     printf("BENCH_RESULT name=d3d12_draw_heavy_frame median_ms=%.3f min_ms=%.3f max_ms=%.3f iters=%d unit=draws/s throughput=%.3f checksum=%08x\n",
-           med, times[0], times[SAMPLES - 1], DRAWS_PER_FRAME, draws_s, rgba);
+           med, times[0], times[SAMPLES - 1], total_draws, draws_s, rgba);
     fflush(stdout);
 
     CloseHandle(fev);
@@ -1723,5 +1883,17 @@ mod tests {
             compare_against_baseline(&[fast], &db, "Apple M9 Unknown", BenchMode::Aot, 0.25, false);
         assert!(!pass_missing);
         assert_eq!(cmp_missing[0].status, CompareStatus::NoBaseline);
+    }
+
+    #[test]
+    fn aot_live_block_count_detects_active_and_inactive_logs() {
+        let active = "[INFO x86_runtime::emu::aot::runtime] emu aot: simd_kernel.exe: 312/315 blocks live (48 KiB code across 1 bank(s))";
+        assert_eq!(aot_live_block_count(active), Some(312));
+
+        let zero = "[INFO x86_runtime::emu::aot::runtime] emu aot: simd_kernel.exe: 0/315 blocks live (0 KiB)";
+        assert_eq!(aot_live_block_count(zero), None);
+
+        let missing = "[INFO x86_runtime::emu::aot] emu aot: simd_kernel.exe: no cache for this build/knobs";
+        assert_eq!(aot_live_block_count(missing), None);
     }
 }

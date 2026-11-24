@@ -3,16 +3,16 @@
   "chips": {
     "Apple M3 Ultra": {
       "aot": {
-        "compression_loop": 11.994,
-        "d3d12_draw_heavy_frame": 1.058,
-        "lock_heavy_job_queue": 22.230,
-        "simd_kernel": 41.818
+        "compression_loop": 11.748,
+        "d3d12_draw_heavy_frame": 18.377,
+        "lock_heavy_job_queue": 44.825,
+        "simd_kernel": 42.007
       },
       "jit": {
-        "compression_loop": 16.883,
-        "d3d12_draw_heavy_frame": 0.977,
-        "lock_heavy_job_queue": 25.841,
-        "simd_kernel": 41.705
+        "compression_loop": 16.531,
+        "d3d12_draw_heavy_frame": 18.169,
+        "lock_heavy_job_queue": 39.912,
+        "simd_kernel": 41.629
       }
     }
   }
