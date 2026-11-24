@@ -76,6 +76,56 @@ pub(super) use xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_e
 use crate::emu::Cpu;
 use core::mem::offset_of;
 
+/// Encoding consumed by `Tr::emit_timestamp`: bit 1 clear selects a raw read. Otherwise
+/// bit 0 selects the verifier clock and bit 2 selects the 24 MHz conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum TscMode {
+    NativeEcv = 0,
+    Native = 1,
+    Scaled = 2,
+    Frozen = 3,
+    From24Mhz = 6,
+}
+
+impl TscMode {
+    fn host() -> Self {
+        static LIVE: std::sync::OnceLock<TscMode> = std::sync::OnceLock::new();
+        *LIVE.get_or_init(|| match super::tsc::counter_frequency() {
+            0 | super::tsc::TSC_NOMINAL_HZ if Self::has_ecv() => Self::NativeEcv,
+            0 | super::tsc::TSC_NOMINAL_HZ => Self::Native,
+            hz if super::tsc::is_24mhz_to_ns(hz) => Self::From24Mhz,
+            _ => Self::Scaled,
+        })
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn has_ecv() -> bool {
+        let mut flag = 0u32;
+        let mut size = size_of::<u32>();
+        // Darwin exposes the EL0 counter feature through this sysctl. Older kernels may omit it.
+        let rc = unsafe {
+            win32_rt::libc::sysctlbyname(
+                c"hw.optional.arm.FEAT_ECV".as_ptr(),
+                (&raw mut flag).cast(),
+                &mut size,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && size == size_of::<u32>() && flag == 1
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn has_ecv() -> bool {
+        false
+    }
+
+    fn for_run(self) -> Self {
+        if super::tsc_is_frozen() { Self::Frozen } else { self }
+    }
+}
+
 /// Fields of [`super::Cpu`] used by translated code.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -111,9 +161,8 @@ pub(super) struct JitScratch {
     pub aot_dir: usize,
     /// `lookup_*` misses served from [`Self::aot_dir`] (drained by [`JitCache::run`]).
     pub aot_probe_hits: u64,
-    /// Non-zero when translated `rdtsc`/`rdtscp` must return deterministic [`crate::emu::GUEST_TSC`]
-    /// (populated from [`crate::emu::tsc_is_frozen`] at translated-code entry).
-    pub tsc_frozen: u8,
+    /// Selected by the executing cache on entry, including for signed static AOT blocks.
+    pub(super) tsc_mode: TscMode,
     /// Non-zero when `fast::Cpu::rset` should maintain `Cpu::last_bits` (mirrors `PORT_JIT_LAST_BITS` / verify).
     pub lb_on: u8,
     /// Bitmask of `Cpu::ymm_hi[0..16]` registers that may be non-zero (0 = all upper halves
@@ -145,7 +194,7 @@ impl Default for JitScratch {
             ctx_ras_cell: 0,
             aot_dir: 0,
             aot_probe_hits: 0,
-            tsc_frozen: 0,
+            tsc_mode: TscMode::Native,
             lb_on: 1,
             ymm_dirty: 0,
             mxcsr: 0x1F80,
@@ -772,7 +821,7 @@ const OFF_TEB: u32 = OFF_JX + offset_of!(JitScratch, teb) as u32;
 const OFF_RAS: u32 = OFF_JX + offset_of!(JitScratch, ras) as u32;
 const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
 const OFF_PROBEHITS: u32 = OFF_JX + offset_of!(JitScratch, aot_probe_hits) as u32;
-const OFF_TSC_FROZEN: u32 = OFF_JX + offset_of!(JitScratch, tsc_frozen) as u32;
+const OFF_TSC_MODE: u32 = OFF_JX + offset_of!(JitScratch, tsc_mode) as u32;
 const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 #[cfg(test)]
@@ -781,7 +830,7 @@ const _: () = assert!(
     OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096
-        && OFF_TSC_FROZEN < 4096
+        && OFF_TSC_MODE < 4096
         && OFF_YMM_DIRTY % 2 == 0
         && OFF_YMM_DIRTY < 2 * 4096
         && OFF_MXCSR % 4 == 0

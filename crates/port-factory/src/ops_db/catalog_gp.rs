@@ -491,7 +491,7 @@ macro_rules! gp_ops {
                 encodings: "Legacy,REX,VEX.128",
                 operand_forms: "IMP,M,R",
                 widths: "8,16,32,64",
-                arm64_pattern: "strb/ldrb Cpu flags | mrs/msr fpcr (ldmxcsr/stmxcsr FTZ/DAZ/RMode) | ldrb w0, [x_rbx, x_rax, uxtw] (xlatb) | dmb ish | CNTVCT_EL0 scaled to 1 GHz | synthetic AVX2 CPUID",
+                arm64_pattern: "strb/ldrb Cpu flags | mrs/msr fpcr (ldmxcsr/stmxcsr FTZ/DAZ/RMode) | ldrb w0, [x_rbx, x_rax, uxtw] (xlatb) | dmb ish | native or scaled CNTVCT_EL0, ordered CNTVCTSS_EL0 on native-rate ECV hosts | synthetic AVX2 CPUID",
                 semantics: "Direct flag updates, MXCSR<->FPCR with host FPCR isolation, xlatb, memory barriers, CPUID leaves. RDTSC returns a 1 GHz guest timestamp in EDX:EAX. RDTSCP also orders prior loads and sets ECX to zero (TSC_AUX).",
                 tier: TranslationTier::JitArm64,
                 source_file: "crates/x86-runtime/src/emu/jit/more.rs",

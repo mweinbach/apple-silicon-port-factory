@@ -392,6 +392,7 @@ pub(super) fn jslot(ip: u64) -> usize {
 /// Per-thread translation cache.
 pub(in crate::emu) struct JitCache {
     pub(super) mem: *mut u8,
+    pub(super) live_tsc_mode: TscMode,
     disabled: bool,
     /// True when executing signed static AOT modules from `__TEXT` with zero `MAP_JIT`
     /// allocation (`self.mem == null`, heap `index` + `ras_ring`, signed `self.enter`).
@@ -475,6 +476,7 @@ impl JitCache {
     pub(in crate::emu) fn new() -> Self {
         Self {
             mem: core::ptr::null_mut(),
+            live_tsc_mode: TscMode::host(),
             disabled: false,
             static_only: false,
             no_jit: false,
@@ -951,7 +953,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
-        cpu.jx.tsc_frozen = u8::from(crate::emu::tsc_is_frozen());
+        cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
         } else if crate::emu::aot::active() {
@@ -1049,7 +1051,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
-        cpu.jx.tsc_frozen = u8::from(crate::emu::tsc_is_frozen());
+        cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
         let mut yd = 0u16;

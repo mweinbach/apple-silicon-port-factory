@@ -48,7 +48,7 @@ fn register_translated_instructions(cases: &mut Cases) {
         let ins = decoder.decode();
         assert!(!ins.is_invalid() && !decoder.can_decode());
         prep.ops[0] = lower(&ins);
-        let mut buf = [0u32; 32];
+        let mut buf = [0u32; 64];
         let a = Asm::new(buf.as_mut_ptr(), 0x1000, buf.len());
         let mut tr = new_tr(a, &prep.ops[..1], &prep, &stubs, false, &mut scratch);
         tr.op(0);
@@ -127,13 +127,13 @@ fn register_translated_instructions(cases: &mut Cases) {
             ("str_imm_gen", "str x2, [x16]"),
         ],
     );
-    let load_mode = format!("ldrb w0, [x15, #{}]", crate::emu::jit::OFF_TSC_FROZEN);
-    let clock = [
-        ("ldrb_imm", load_mode.as_str()),
-        ("cbnz", "cbnz w0, #52"),
+    let load_mode = format!("ldrb w1, [x15, #{}]", crate::emu::jit::OFF_TSC_MODE);
+    let dispatch_and_scale = [
+        ("tbz", "tbz w1, #1, #92"),
+        ("tbnz", "tbnz w1, #0, #80"),
         ("mrs", "mrs x0, cntvct_el0"),
+        ("tbnz", "tbnz w1, #2, #44"),
         ("mrs", "mrs x1, cntfrq_el0"),
-        ("cbz", "cbz x1, #44"),
         ("movz", "movz x2, #0xca00"),
         ("movk", "movk x2, #0x3b9a, lsl #16"),
         ("udiv", "udiv x3, x0, x1"),
@@ -142,14 +142,49 @@ fn register_translated_instructions(cases: &mut Cases) {
         ("mul_madd", "mul x3, x3, x2"),
         ("udiv", "udiv x0, x0, x1"),
         ("add_addsub_shift", "add x0, x3, x0"),
-        ("b_uncond", "b #8"),
-        ("movz", "movz x0, #0x1000"),
+    ];
+    let from_24mhz = [
+        ("mov_orr_log_imm", "mov x2, #0xaaaaaaaaaaaaaaaa"),
+        ("add_addsub_imm", "add x2, x2, #1"),
+        ("umulh", "umulh x1, x0, x2"),
+        ("add_addsub_shift", "add x2, x0, x0, lsl #2"),
+        ("add_addsub_shift", "add x0, x0, x2, lsl #3"),
+        ("add_addsub_shift", "add x0, x0, x1"),
+    ];
+    let split = [
         ("mov_orr_log_shift", "mov w19, w0"),
         ("lsr_ubfm", "lsr x21, x0, #32"),
     ];
+    let mut clock = vec![("ldrb_imm", load_mode.as_str())];
+    clock.extend(dispatch_and_scale);
+    clock.push(("b_uncond", "b #44"));
+    clock.extend(from_24mhz);
+    clock.extend([
+        ("b_uncond", "b #16"),
+        ("movz", "movz x0, #0x1000"),
+        ("b_uncond", "b #8"),
+        ("mrs", "mrs x0, cntvct_el0"),
+    ]);
+    clock.extend(split);
     check("rdtsc", &[0x0f, 0x31], &clock);
-    let mut ordered = vec![("dsb", "dsb ishld"), ("isb", "isb")];
-    ordered.extend_from_slice(&clock);
+    let mut ordered = vec![
+        ("ldrb_imm", load_mode.as_str()),
+        ("dsb", "dsb ishld"),
+        ("cbz", "cbz w1, #108"),
+        ("isb", "isb"),
+    ];
+    ordered.extend(dispatch_and_scale);
+    ordered.push(("b_uncond", "b #52"));
+    ordered.extend(from_24mhz);
+    ordered.extend([
+        ("b_uncond", "b #24"),
+        ("movz", "movz x0, #0x1000"),
+        ("b_uncond", "b #16"),
+        ("mrs", "mrs x0, cntvct_el0"),
+        ("b_uncond", "b #8"),
+        ("mrs", "mrs x0, S3_3_C14_C0_6"),
+    ]);
+    ordered.extend(split);
     ordered.push(("movz", "movz x20, #0"));
     check("rdtscp", &[0x0f, 0x01, 0xf9], &ordered);
 }

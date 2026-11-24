@@ -83,6 +83,71 @@ impl Asm {
 }
 
 impl Tr<'_> {
+    /// Read the guest clock into EDX:EAX with runtime-selected timing and verifier modes.
+    fn emit_timestamp(&mut self, ordered: bool) {
+        self.a.ldr(8, T1, XCPU, OFF_TSC_MODE);
+        let native_ecv = if ordered {
+            // Complete prior loads in all modes. CNTVCTSS_EL0 samples in order
+            // on ECV hosts. Ordinary CNTVCT_EL0 needs an explicit ISB.
+            self.a.dsb_ishld();
+            let ecv = self.a.cbz(false, T1);
+            self.a.isb();
+            Some(ecv)
+        } else {
+            None
+        };
+        let native_rate = self.a.tbz(T1, 1); // NativeEcv or Native
+        let frozen = self.a.tbnz(T1, 0);
+        self.a.mrs_cntvct(T0);
+        let from_24mhz = self.a.tbnz(T1, 2);
+        // Exact 1 GHz conversion: floor(CNTVCT_EL0 * 1_000_000_000 / CNTFRQ_EL0)
+        // mod 2^64 via Euclidean split `v = q*f + r` (`0 <= r < f < 2^32`, so
+        // `r * 1e9 < 4.3e18 < 2^64` never overflows for any 64-bit `CNTVCT_EL0`).
+        self.a.mrs_cntfrq(T1);
+        self.a.mov_imm(true, T2, crate::emu::tsc::TSC_NOMINAL_HZ);
+        self.a.udiv(true, T3, T0, T1);
+        self.a.msub(true, T0, T3, T1, T0);
+        self.a.mul(true, T0, T0, T2);
+        self.a.mul(true, T3, T3, T2);
+        self.a.udiv(true, T0, T0, T1);
+        self.a.addsub_rr(true, false, false, T0, T3, T0, 0);
+        let scaled_done = self.a.b();
+
+        self.a.bind(from_24mhz);
+        // Match scale_counter_to_tsc: 41*x + floor(2*x/3), wrapping at 64 bits.
+        // The repeating-bit part of the Q64 multiplier fits one ORR-immediate.
+        self.a.mov_imm(true, T2, crate::emu::tsc::TWO_THIRDS_Q64 - 1);
+        self.a.addsub_ri(true, false, false, T2, T2, 1, false);
+        self.a.umulh(T1, T0, T2);
+        self.a.addsub_rr(true, false, false, T2, T0, T0, 2); // 5*x
+        self.a.addsub_rr(true, false, false, T0, T0, T2, 3); // 41*x
+        self.a.addsub_rr(true, false, false, T0, T0, T1, 0);
+        let from_24mhz_done = self.a.b();
+
+        self.a.bind(frozen);
+        self.a.mov_imm(true, T0, crate::emu::GUEST_TSC);
+        let frozen_done = self.a.b();
+        self.a.bind(native_rate);
+        self.a.mrs_cntvct(T0);
+        if let Some(ecv) = native_ecv {
+            let native_done = self.a.b();
+            self.a.bind(ecv);
+            self.a.mrs_cntvctss(T0);
+            self.a.bind(native_done);
+        }
+        self.a.bind(frozen_done);
+        self.a.bind(from_24mhz_done);
+        self.a.bind(scaled_done);
+        self.a.mov_rr(false, g(0), T0);
+        self.a.lsr_i(true, g(2), T0, 32);
+        self.set_lb(0, 64);
+        self.set_lb(2, 64);
+        if ordered {
+            self.a.movz(true, g(1), 0, 0);
+            self.set_lb(1, 64);
+        }
+    }
+
     /// Load an 8-bit source operand for `K_HI8` into `dst` (zero-extended to 64 bits).
     pub(super) fn rd_hi8_src(&mut self, k: usize, op: &FastOp, spec: u8, dst: u32) -> Option<u32> {
         if spec & 0x40 != 0 {
@@ -441,45 +506,7 @@ impl Tr<'_> {
                         self.set_lb(0, 64);
                         self.set_lb(2, 64);
                     }
-                    8 => {
-                        // Rdtsc (w == 0) / Rdtscp (w != 0):
-                        // Runtime clock mode via `Cpu::jx.tsc_frozen` so cached JIT/AOT/static-PIC
-                        // blocks run in either live 1 GHz or deterministic `GUEST_TSC` (0x1000)
-                        // mode without clobbering host NZCV flags or caching host pointers/freq.
-                        if w != 0 {
-                            // RDTSCP orders prior loads even when the verifier freezes the value.
-                            self.a.dsb_ishld();
-                            self.a.isb();
-                        }
-                        self.a.ldr(8, T0, XCPU, OFF_TSC_FROZEN);
-                        let frozen = self.a.cbnz(false, T0);
-                        // Exact 1 GHz conversion: floor(CNTVCT_EL0 * 1_000_000_000 / CNTFRQ_EL0)
-                        // mod 2^64 via Euclidean split `v = q*f + r` (`0 <= r < f < 2^32`, so
-                        // `r * 1e9 < 4.3e18 < 2^64` never overflows for any 64-bit `CNTVCT_EL0`).
-                        self.a.mrs_cntvct(T0);
-                        self.a.mrs_cntfrq(T1);
-                        let freq_zero = self.a.cbz(true, T1);
-                        self.a.mov_imm(true, T2, crate::emu::tsc::TSC_NOMINAL_HZ);
-                        self.a.udiv(true, T3, T0, T1);
-                        self.a.msub(true, T0, T3, T1, T0);
-                        self.a.mul(true, T0, T0, T2);
-                        self.a.mul(true, T3, T3, T2);
-                        self.a.udiv(true, T0, T0, T1);
-                        self.a.addsub_rr(true, false, false, T0, T3, T0, 0);
-                        let done = self.a.b();
-                        self.a.bind(frozen);
-                        self.a.mov_imm(true, T0, crate::emu::GUEST_TSC);
-                        self.a.bind(freq_zero);
-                        self.a.bind(done);
-                        self.a.mov_rr(false, g(0), T0);
-                        self.a.lsr_i(true, g(2), T0, 32);
-                        self.set_lb(0, 64);
-                        self.set_lb(2, 64);
-                        if w != 0 {
-                            self.a.movz(true, g(1), 0, 0);
-                            self.set_lb(1, 64);
-                        }
-                    }
+                    8 => self.emit_timestamp(w != 0),
                     9 => {
                         // Cpuid
                         self.flush_flags(self.live[k]);

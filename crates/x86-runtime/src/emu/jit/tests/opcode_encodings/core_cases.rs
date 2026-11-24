@@ -892,9 +892,12 @@ fn register_loads_stores_barriers_sysregs(cases: &mut Cases) {
         a.isb();
     });
 
+    // CNTVCTSS_EL0 in generic system-register syntax for the baseline apple-m1 assembler.
     check_words!(cases, "mrs_cntvct";
         mrs_cntvct(3) => "mrs", "mrs x3, cntvct_el0";
         mrs_cntvct(22) => "mrs", "mrs x22, cntvct_el0";
+        mrs_cntvctss(3) => "mrs", "mrs x3, S3_3_C14_C0_6";
+        mrs_cntvctss(22) => "mrs", "mrs x22, S3_3_C14_C0_6";
     );
 
     check_words!(cases, "mrs_cntfrq";

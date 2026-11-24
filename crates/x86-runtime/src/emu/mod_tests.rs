@@ -803,7 +803,10 @@ fn guest_timestamp_scaling_matches_wide_division_through_wraparound() {
     use super::tsc::{scale_counter_to_tsc, TSC_NOMINAL_HZ};
     for hz in [1, 19_200_000, 24_000_000, TSC_NOMINAL_HZ, u32::MAX as u64] {
         let wrap = ((1u128 << 64) * hz as u128 / TSC_NOMINAL_HZ as u128) as u64;
-        for counter in [0, 1, 2, 3, hz, 1 << 56, wrap.wrapping_sub(1), wrap, wrap.wrapping_add(1), u64::MAX] {
+        for counter in [
+            0, 1, 2, 3, hz, 1 << 56, wrap.wrapping_sub(1), wrap, wrap.wrapping_add(1),
+            u64::MAX - 2, u64::MAX - 1, u64::MAX,
+        ] {
             let expected = (counter as u128 * 1_000_000_000 / hz as u128) as u64;
             assert_eq!(scale_counter_to_tsc(counter, hz), expected, "counter={counter} hz={hz}");
         }

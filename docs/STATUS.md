@@ -54,13 +54,14 @@ regression benchmark for the universal crates.
 
 ## 3. Baseline Test Health
 
-`RDTSC` and `RDTSCP` expose a shared 1 GHz guest clock on Apple Silicon. Differential
+`RDTSC` and `RDTSCP` expose a shared 1 GHz guest clock on Apple Silicon. Translated blocks
+read 1 GHz counters directly and convert 24 MHz counters without division. Differential
 verification can replay a fixed timestamp, including in linked AOT blocks.
 [Guest timestamp semantics](DIAGNOSTICS.md#guest-timestamp-counter)
 
 The checked-in A64 catalog contains all 4,743 encoding forms in Arm's open-source
-September 2026 A-profile release. The offline emitter test matches 1,030 emitted words in
-496 cases to 392 encoding forms across 265 operation pages. Cases exercise all 193
+September 2026 A-profile release. The offline emitter test matches 1,055 emitted words in
+496 cases to 392 encoding forms across 265 operation pages. Cases exercise all 194
 `Asm` methods, the full `RDTSC` and `RDTSCP` sequences, register and locked-memory NOT,
 stub frames, and the static AOT host-call veneer. Clang independently assembled every expected word.
 [Catalog, emitter matches and reproduction commands](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit)

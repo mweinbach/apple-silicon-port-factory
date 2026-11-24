@@ -55,6 +55,13 @@ before reading the same clock. Both write the low and high 32 bits to EAX and ED
 preserve RFLAGS. `RDTSC` preserves RCX. `RDTSCP` writes zero to ECX because the runtime
 exposes one `TSC_AUX` value across guest threads.
 
+JIT and AOT blocks use the executing host's timer mode. A 1 GHz host supplies guest ticks
+directly. A 24 MHz host uses an exact multiply by 125/3 with no division. Other timer rates
+use integer division. For `RDTSCP`, all modes complete prior loads with `DSB ISHLD`.
+At the native rate on a Darwin host advertising FEAT_ECV, the JIT reads the
+self-synchronizing `CNTVCTSS_EL0`. The fallback issues `ISB` before
+sampling `CNTVCT_EL0`.
+
 `verify-x86`, `--diff-test`, shadow comparisons, and `AW2_EMU_VERIFY=1` use a repeatable
 timestamp of `0x1000` so the same instruction can run twice and produce comparable register
 snapshots. `PORT_AOT_VERIFY=1` checks cached machine code and leaves the guest clock live.

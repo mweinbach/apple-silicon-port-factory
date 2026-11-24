@@ -373,7 +373,7 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
         (34, budget_light_enabled() as u64),
         (35, hw_range_enabled() as u64),
         (36, 1u64), // codegen rev 4: XBUD bit-0 ymm_dirty, batched push/pop/ret, JccPair, x_shuf_rr, xmm_hi_live, XA cache, hot/cold split
-        (37, 1u64), // codegen rev 5: live 1 GHz CNTVCT/CNTFRQ RDTSC/RDTSCP with runtime JitScratch::tsc_frozen
+        (37, 2u64), // codegen rev 6 (bits 37..38): runtime native/ECV, scaled, and frozen timestamp paths
     ];
     bits.iter().fold(0u64, |k, &(b, v)| k | v << b)
 }

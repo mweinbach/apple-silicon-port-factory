@@ -387,6 +387,10 @@ impl Asm {
     pub(super) fn mrs_cntvct(&mut self, t: u32) {
         self.emit(0xD53B_E040 | t);
     }
+    /// `mrs xt, cntvctss_el0` (FEAT_ECV self-synchronizing virtual counter).
+    pub(super) fn mrs_cntvctss(&mut self, t: u32) {
+        self.emit(0xD53B_E0C0 | t);
+    }
     /// `mrs xt, cntfrq_el0` (reads the execution host's counter frequency in Hz).
     pub(super) fn mrs_cntfrq(&mut self, t: u32) {
         self.emit(0xD53B_E000 | t);

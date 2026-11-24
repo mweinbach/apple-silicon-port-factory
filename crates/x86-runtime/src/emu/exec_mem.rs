@@ -209,8 +209,8 @@ pub unsafe fn icache_invalidate(start: *mut u8, len: usize) {
 
 /// Magic constant (`"SAOT"`) for [`StaticAotModuleDesc`].
 pub const STATIC_AOT_DESC_MAGIC: u32 = 0x5341_4F54;
-/// Static module ABI. Version 2 reads the clock mode from the current JIT scratch layout.
-pub const STATIC_AOT_DESC_VERSION: u32 = 2;
+/// Version 3 reads a timestamp mode byte. Version 2 interpreted it as a boolean.
+pub const STATIC_AOT_DESC_VERSION: u32 = 3;
 
 /// Module descriptor flags (`StaticAotModuleDesc::flags`).
 pub const STATIC_AOT_MOD_HAS_RAS: u32 = 1 << 0;
@@ -939,8 +939,10 @@ mod tests {
             entries: entries.as_ptr(),
             module_name: name.as_ptr(),
         };
-        let legacy_clock = StaticAotModuleDesc { version: 1, ..desc };
-        assert!(!unsafe { register_static_aot_desc(&legacy_clock) });
+        for version in [1, 2] {
+            let legacy_clock = StaticAotModuleDesc { version, ..desc };
+            assert!(!unsafe { register_static_aot_desc(&legacy_clock) });
+        }
         assert!(unsafe { register_static_aot_desc(&desc) });
         assert_eq!(static_aot_preferred_base("basecheck.dll"), Some(0x1_8000_0000));
         // Wrong runtime base must honestly refuse binding.

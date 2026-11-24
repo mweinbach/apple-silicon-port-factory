@@ -13,6 +13,50 @@ use crate::emu::exec_mem::{
 use crate::emu::BlockCache;
 
 #[test]
+fn timestamp_block_runs_native_scaled_and_frozen_paths() {
+    use crate::emu::{jit_tests::arena_alloc, tsc};
+
+    fn raw_count() -> u64 {
+        let value: u64;
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) value, options(nostack, preserves_flags)) };
+        value
+    }
+
+    let mut cache = JitCache::new();
+    let mut blocks = Box::new(BlockCache::new());
+    let frequency = tsc::counter_frequency();
+    // Each probe reads once, then jumps to a distinct, unlinked block.
+    let probes: [&[u8]; 2] = [
+        &[0x0f, 0x31, 0xeb, 0x01, 0xcc, 0xcc],
+        &[0x0f, 0x01, 0xf9, 0xeb, 0x01, 0xcc, 0xcc],
+    ];
+    for probe in probes {
+        let ip = arena_alloc(32, 16);
+        unsafe { core::ptr::copy_nonoverlapping(probe.as_ptr(), ip, probe.len()) };
+        let code = unsafe { cache.compile_single_for_verify(ip as u64, &mut *blocks) }.unwrap();
+        for mode in [TscMode::Native, TscMode::Scaled, TscMode::From24Mhz, TscMode::Frozen, TscMode::NativeEcv] {
+            if mode == TscMode::NativeEcv && TscMode::host() != mode {
+                continue;
+            }
+            cache.live_tsc_mode = mode;
+            let mut cpu = Cpu::new_zeroed();
+            cpu.rip = ip as u64;
+            let before = raw_count();
+            unsafe { cache.run_code_for_verify(&mut cpu, &mut *blocks, None, code, 16) };
+            let after = raw_count();
+            let stamp = cpu.gpr[2] << 32 | cpu.gpr[0];
+            let expected = |count| match mode.for_run() {
+                TscMode::Frozen => tsc::GUEST_TSC,
+                TscMode::Scaled => tsc::scale_counter_to_tsc(count, frequency),
+                TscMode::From24Mhz => tsc::scale_counter_to_tsc(count, 24_000_000),
+                _ => count,
+            };
+            assert!((expected(before)..=expected(after)).contains(&stamp), "{mode:?} timestamp {stamp}");
+        }
+    }
+}
+
+#[test]
 fn static_only_negative_cache_and_rebind_invalidation() {
     let entries_v1 = [
         StaticAotEntry { rva: 0x1000, code_offset: 0x100, flags: 0 },
