@@ -24,6 +24,7 @@
 
 pub mod anticheat;
 pub mod aot;
+pub mod bench;
 pub mod bundle_common;
 pub mod diag_toolkit;
 pub mod doctor;

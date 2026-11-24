@@ -11,7 +11,7 @@
 mod port_factory;
 
 use anyhow::{bail, Result};
-use port_factory::{bundle, db, diag, scan, steam, usage};
+use port_factory::{bench, bundle, db, diag, scan, steam, usage};
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,6 +67,7 @@ fn main() -> Result<()> {
         "bisect-runtime" | "bisect" => diag::cmd_bisect_runtime(rest),
         "live-probe" | "probe" => diag::cmd_live_probe(rest),
         "nan-trace" => diag::cmd_nan_trace(rest),
+        "bench" | "benchmark" => bench::cmd_bench(rest),
         "-h" | "--help" | "help" => usage(),
         other => bail!("unknown subcommand {other:?}"),
     }

@@ -1,6 +1,7 @@
 //! Shared CLI helpers, default paths, usage output, and subcommand module grouping
 //! for the `port-factory` (`cargo opsdb`) binary.
 
+pub mod bench;
 pub mod bundle;
 pub mod db;
 pub mod diag;
@@ -102,7 +103,9 @@ pub fn usage() -> ! {
            live-probe --manifest TOML|--pe EXE [--game-dir DIR] [--script FILE] [--step CMD...] [--repeat N]\n\
                                                 Frame-paced PORT_CONTROL_DIR automation, PNG capture & pass/fail repro harness\n\
            nan-trace <PE_OR_TOML> [--game-dir DIR] [--module MOD] [--watch LO..HI] [--dump-dir DIR] [--log FILE] [--armed] [--run-oracle] [-- <game-args...>]\n\
-                                                Launch port-runner pre-configured with PORT_NAN_TRACE + PORT_NAN_BOUNDARY (and optional Rosetta oracle)\n"
+                                                Launch port-runner pre-configured with PORT_NAN_TRACE + PORT_NAN_BOUNDARY (and optional Rosetta oracle)\n\
+           bench [--mode aot|jit] [--only W1,W2] [--tolerance 0.25] [--baseline FILE] [--out FILE] [--runner PATH] [--update-baseline] [--no-compare] [--json]\n\
+                                                Build & run Windows x64 guest benchmark workloads, emit JSON, and compare against chip-keyed baseline\n"
     );
     std::process::exit(2);
 }
