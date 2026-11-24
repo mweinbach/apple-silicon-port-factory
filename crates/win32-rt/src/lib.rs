@@ -60,6 +60,7 @@ win64_abi::win64_mods! {
 pub mod config;
 pub mod det_entropy;
 pub mod middleware;
+pub mod present;
 pub mod shadow;
 /// Cross-Apple platform backend alias (`AppKit` on macOS, `UIKit`/host-surface on iOS).
 pub use macos as platform;

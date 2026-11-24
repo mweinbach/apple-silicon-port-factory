@@ -310,10 +310,6 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                 sem.release(1);
             }));
             let n = s.presents.fetch_add(1, Ordering::AcqRel) + 1;
-            if n == 1 && cfg!(target_os = "ios") {
-                crate::thread::sched::promote_current_thread_interactive();
-            }
-            crate::hitch::on_present(n, present_ns);
             d3d12_metal::metal::gpucapture::on_present(n.into());
             d3d12_metal::metal::gpunan::on_present(n.into(), &st.sc.queue);
             if n <= 10 || n % 60 == 0 {
@@ -427,17 +423,8 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
                     d3d12_metal::metal::passtiming::dump(600);
                 }
             }
-            if let Some(script) = std::env::var_os("PORT_INPUT_SCRIPT")
-                .or_else(|| std::env::var_os("AW2_AUTO_PLAY_SCRIPT"))
-                .and_then(|v| v.into_string().ok())
-            {
-                run_input_script_step(s.hwnd, n, &script);
-            }
-            if let Ok(hooks) = PRESENT_HOOKS.read() {
-                for hook in hooks.iter() {
-                    hook(s.hwnd, n);
-                }
-            }
+            drop(st);
+            crate::present::on_present(crate::present::PresentApi::D3d12, s.hwnd, present_ns);
             S_OK
         }
         Err(e) => {
@@ -450,53 +437,7 @@ unsafe fn present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
     }
 }
 
-/// Callback invoked after every successful `IDXGISwapChain::Present` (`(hwnd, frame_number)`).
-pub type PresentHook = fn(usize, u32);
-
-static PRESENT_HOOKS: std::sync::RwLock<Vec<PresentHook>> = std::sync::RwLock::new(Vec::new());
-
-/// Register a per-Present hook (e.g. game-specific automated test drivers or telemetry).
-pub fn register_present_hook(hook: PresentHook) {
-    PRESENT_HOOKS.write().unwrap().push(hook);
-}
-
-/// Generic scripted input runner (`PORT_INPUT_SCRIPT="900:down,960:enter"`).
-fn run_input_script_step(hwnd: usize, frame: u32, script: &str) {
-    use crate::misc::xinput1_4::{self, btn, DeviceInfo, Gamepad};
-    use crate::user32::input::{self, NativeKey};
-    input::force_focus_for_autoplay(hwnd);
-    if frame == 30 {
-        xinput1_4::backend_connect(
-            0,
-            DeviceInfo { name: "Virtual Controller".into(), wireless: false, rumble: false, battery: None },
-        );
-    }
-    for item in script.split(',') {
-        let Some((f, action)) = item.trim().split_once(':') else { continue };
-        let Ok(f) = f.trim().parse::<u32>() else { continue };
-        let down = if frame == f {
-            true
-        } else if frame == f + 6 {
-            false
-        } else {
-            continue;
-        };
-        let (mac, chars, pad): (u16, Vec<u16>, u16) = match action.trim() {
-            "enter" => (0x24, vec![0x0D], btn::A),
-            "space" => (0x31, vec![0x20], btn::A),
-            "a" => (0x24, vec![0x0D], btn::A),
-            "esc" | "b" => (0x35, vec![0x1B], btn::B),
-            "up" => (0x7E, Vec::new(), btn::DPAD_UP),
-            "down" => (0x7D, Vec::new(), btn::DPAD_DOWN),
-            "left" => (0x7B, Vec::new(), btn::DPAD_LEFT),
-            "right" => (0x7C, Vec::new(), btn::DPAD_RIGHT),
-            _ => continue,
-        };
-        log::info!(target: "d3d", "input script: frame {frame} {action} {}", if down { "down" } else { "up" });
-        input::native_key(NativeKey { mac, down, repeat: false, chars: if down { chars } else { Vec::new() } });
-        xinput1_4::backend_update(0, Gamepad { buttons: if down { pad } else { 0 }, ..Default::default() });
-    }
-}
+pub use crate::present::{register_present_hook, PresentHook};
 
 unsafe extern "win64" fn present(this: PS, sync: u32, flags: u32) -> HRESULT {
     crate::shadow::guard_host("dxgi Present");

@@ -533,6 +533,7 @@ unsafe fn get_message(out: *mut MSG, hwnd: usize, min: u32, max: u32) -> BOOL {
         return -1;
     }
     let mut m = retrieve(Filter { hwnd, min, max, kinds: QS_ALLINPUT }, true, true).unwrap();
+    crate::hitch::heartbeat(crate::hitch::HeartbeatKind::MessagePump);
     super::misc::dispatch_getmessage_hook(&mut m, true);
     std::ptr::write_unaligned(out, m);
     (m.message != wm::QUIT) as BOOL
@@ -547,6 +548,7 @@ pub unsafe extern "win64" fn GetMessageA(out: *mut MSG, hwnd: HWND, min: u32, ma
 }
 
 unsafe fn peek_message(out: *mut MSG, hwnd: usize, min: u32, max: u32, flags: u32) -> BOOL {
+    crate::hitch::heartbeat(crate::hitch::HeartbeatKind::MessagePump);
     let remove = flags & PM_REMOVE != 0;
     let f = Filter { hwnd, min, max, kinds: qs_kinds(flags) };
     match retrieve(f, remove, false) {
@@ -647,6 +649,7 @@ pub unsafe extern "win64" fn TranslateMessage(m: *const MSG) -> BOOL {
 }
 
 unsafe fn dispatch(m: *const MSG) -> LRESULT {
+    crate::hitch::heartbeat(crate::hitch::HeartbeatKind::MessagePump);
     if m.is_null() {
         set_error(e::INVALID_PARAMETER);
         return 0;

@@ -119,11 +119,11 @@ fn install_middleware_hooks() {
         && std::env::var_os("PORT_INPUT_SCRIPT").is_none()
         && std::env::var_os("AW2_AUTO_PLAY_SCRIPT").is_none()
     {
-        w::d3d12::swapchain::register_present_hook(aw2_auto_play_step);
+        w::present::register_present_hook(aw2_auto_play_step);
     }
     if std::env::var_os("AW2_CAMERA_TRACE").is_some_and(|v| v != "0") {
         cam_trace::init();
-        w::d3d12::swapchain::register_present_hook(cam_trace::on_present);
+        w::present::register_present_hook(cam_trace::on_present);
     }
 }
 

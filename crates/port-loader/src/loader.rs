@@ -781,6 +781,7 @@ impl Loader {
     /// to the Rust implementations (see `builtin_image`).
     fn add_builtin(&self, name: &str, dll: Option<&'static w::BuiltinDll>) -> Arc<Module> {
         use crate::builtin_image as bi;
+        w::hitch::heartbeat_stage(w::hitch::HeartbeatKind::LoaderMap, &format!("builtin {name}"));
         let mut exports: Vec<bi::ImageExport> = Vec::new();
         if let Some(d) = dll {
             for e in d.exports {
@@ -996,6 +997,7 @@ impl Loader {
     ) -> Result<Arc<Module>> {
         use w::kernel32::module::*;
 
+        w::hitch::heartbeat_stage(w::hitch::HeartbeatKind::LoaderMap, &format!("map {norm}"));
         let data = std::fs::read(host).with_context(|| format!("reading {}", host.display()))?;
         let pe = Pe::parse(&data).with_context(|| format!("parsing {}", host.display()))?;
         let h = &pe.headers;
@@ -1376,6 +1378,10 @@ impl Loader {
             if m.initialized.swap(true, Ordering::AcqRel) {
                 continue;
             }
+            w::hitch::heartbeat_stage(
+                w::hitch::HeartbeatKind::LoaderDllInit,
+                &format!("DllMain({})", m.name),
+            );
             let reserved = if static_load { 1usize } else { 0 };
             for &cb in &m.tls_callbacks {
                 log::debug!("{}: TLS callback {} (PROCESS_ATTACH)", m.name, w::symbolize(cb));
@@ -1460,6 +1466,10 @@ impl Loader {
             w::thread::run_pending_apcs();
         }
         let entry = exe.entry();
+        w::hitch::heartbeat_stage(
+            w::hitch::HeartbeatKind::LoaderEntry,
+            &format!("entry {}", exe.name),
+        );
         log::info!("calling exe entry point {}", w::symbolize(entry));
         #[cfg(target_arch = "x86_64")]
         {

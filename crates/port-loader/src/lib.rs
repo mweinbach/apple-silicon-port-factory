@@ -739,6 +739,10 @@ fn bridge_port_env_vars() {
         ("PORT_PSO_MANIFEST", "AW2_PSO_MANIFEST"),
         ("PORT_SHADERD", "AW2_SHADERD"),
         ("PORT_REGISTRY_TSV", "AW2_REGISTRY_TSV"),
+        ("PORT_HITCH_MS", "AW2_HITCH_MS"),
+        ("PORT_HITCH_OP_MS", "AW2_HITCH_OP_MS"),
+        ("PORT_STALL_MS", "AW2_STALL_MS"),
+        ("PORT_HITCH_LOG", "AW2_HITCH_LOG"),
     ] {
         if let Some(val) = std::env::var_os(primary).filter(|v| !v.is_empty()) {
             std::env::set_var(legacy, val);
@@ -1269,6 +1273,14 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         v8_jitless,
     );
     signals::install_handlers();
+    let live_run = !args.no_run
+        && !args.prewarm_aot
+        && args.emit_static_o.is_none()
+        && !args.list_exports
+        && !args.diff_test;
+    if live_run {
+        w::hitch::start_watchdog();
+    }
     register_emu_profiler();
 
     // Map the target PE (.exe or .dll) and, recursively, all statically imported DLLs.

@@ -1436,13 +1436,16 @@ fn run_port_runner(
     work_dir: &Path,
     headless: bool,
     limit: Duration,
-) -> (Option<i32>, String) {
+) -> (Option<i32>, String, PathBuf) {
     let drive_c = work_dir.join("drive_c");
     let log_dir = work_dir.join("logs");
     let aot_dir = work_dir.join("aot");
+    let ctl_dir = work_dir.join("ctl");
     std::fs::create_dir_all(&drive_c).expect("create drive_c");
     std::fs::create_dir_all(&log_dir).expect("create log_dir");
     std::fs::create_dir_all(&aot_dir).expect("create aot_dir");
+    std::fs::create_dir_all(&ctl_dir).expect("create ctl_dir");
+    std::fs::write(ctl_dir.join("cmd.txt"), "shot vk_frame.png\n").expect("write ctl cmd.txt");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_port-runner"));
     cmd.arg("--pe")
@@ -1452,6 +1455,7 @@ fn run_port_runner(
         .env("PORT_VULKAN_DYLIB", moltenvk)
         .env("PORT_LOG_DIR", &log_dir)
         .env("PORT_AOT_DIR", &aot_dir)
+        .env("PORT_CONTROL_DIR", &ctl_dir)
         .env("AW2_NO_ACTIVATE", "1")
         .env("RUST_LOG", "info")
         .env_remove("PORT_LOG_APPEND")
@@ -1501,7 +1505,40 @@ fn run_port_runner(
         }
         combined.push_str(&log_file);
     }
-    (code, combined)
+    (code, combined, ctl_dir)
+}
+
+fn assert_vulkan_control_channel_answered(ctl_dir: &Path, mode: &str, log: &str) {
+    assert!(
+        !ctl_dir.join("cmd.txt").exists(),
+        "{mode}: PORT_CONTROL_DIR cmd.txt was not consumed by Vulkan PresentHook:\n{log}"
+    );
+    let status_path = ctl_dir.join("status.json");
+    let status = std::fs::read_to_string(&status_path)
+        .unwrap_or_else(|e| panic!("{mode}: missing {}: {e}\n{log}", status_path.display()));
+    assert!(
+        status.contains("\"api\":\"vulkan\""),
+        "{mode}: status.json missing api=vulkan: {status}"
+    );
+    assert!(
+        status.contains("\"cmds\":1"),
+        "{mode}: status.json did not record shot command: {status}"
+    );
+    let shot_path = ctl_dir.join("vk_frame.png");
+    let png = std::fs::read(&shot_path)
+        .unwrap_or_else(|e| panic!("{mode}: missing Vulkan screenshot {}: {e}\n{log}", shot_path.display()));
+    assert!(
+        png.len() > 24 && &png[..8] == b"\x89PNG\r\n\x1a\n" && &png[12..16] == b"IHDR",
+        "{mode}: invalid PNG header in {} ({} bytes)",
+        shot_path.display(),
+        png.len()
+    );
+    let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    assert!(
+        w > 0 && h > 0,
+        "{mode}: unexpected zero PNG dimensions {w}x{h}"
+    );
 }
 
 fn require_e2e_prerequisites(test_name: &str) -> Option<(PathBuf, PathBuf)> {
@@ -1578,13 +1615,14 @@ fn windows_x86_64_vulkan_windowed_present_resize_and_readback() {
 
     let tmp = TempDirGuard::new("port-vulkan-e2e-win");
     let exe = compile_windows_vulkan_exe(&zig, tmp.path());
-    let (code, log) = run_port_runner(&exe, &moltenvk, tmp.path(), false, Duration::from_secs(60));
+    let (code, log, ctl_dir) = run_port_runner(&exe, &moltenvk, tmp.path(), false, Duration::from_secs(60));
 
     assert!(
         log.contains("NSWindow for hwnd"),
         "windowed E2E must create a real AppKit NSWindow + CAMetalLayer:\n{log}"
     );
     assert_vulkan_e2e_markers("windowed", code, &log);
+    assert_vulkan_control_channel_answered(&ctl_dir, "windowed", &log);
     for line in log.lines() {
         if line.starts_with("VK_E2E")
             || line.starts_with("WINDOW_")
@@ -1617,13 +1655,14 @@ fn windows_x86_64_vulkan_headless_present_resize_and_readback() {
 
     let tmp = TempDirGuard::new("port-vulkan-e2e-headless");
     let exe = compile_windows_vulkan_exe(&zig, tmp.path());
-    let (code, log) = run_port_runner(&exe, &moltenvk, tmp.path(), true, Duration::from_secs(60));
+    let (code, log, ctl_dir) = run_port_runner(&exe, &moltenvk, tmp.path(), true, Duration::from_secs(60));
 
     assert!(
         log.contains("created headless offscreen CAMetalLayer"),
         "headless E2E must exercise headless offscreen CAMetalLayer creation:\n{log}"
     );
     assert_vulkan_e2e_markers("headless", code, &log);
+    assert_vulkan_control_channel_answered(&ctl_dir, "headless", &log);
     for line in log.lines() {
         if line.starts_with("VK_E2E")
             || line.starts_with("SWAPCHAIN")
