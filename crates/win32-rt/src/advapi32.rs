@@ -1934,14 +1934,14 @@ pub unsafe extern "win64" fn GetUserProfileDirectoryW(
     if let Some(host) = crate::path::to_host(&dir) {
         let _ = std::fs::create_dir_all(host);
     }
-    let wide = crate::strings::to_wide_z(&dir);
-    let needed = wide.len() as u32;
+    let units = dir.encode_utf16().count() + 1;
+    let needed = units as u32;
     let cap = std::ptr::read_unaligned(lpcch_size);
     if lp_profile_dir.is_null() || cap < needed {
         std::ptr::write_unaligned(lpcch_size, needed);
         return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
     }
-    std::ptr::copy_nonoverlapping(wide.as_ptr(), lp_profile_dir, wide.len());
+    crate::strings::write_wide_z(lp_profile_dir, units, &dir);
     std::ptr::write_unaligned(lpcch_size, needed);
     TRUE
 }
@@ -2473,14 +2473,14 @@ pub unsafe extern "win64" fn QueryServiceConfig2W(
     };
     if info_level == SERVICE_CONFIG_DESCRIPTION {
         let desc = svc.entry.description.lock().unwrap().clone();
-        let wide = crate::strings::to_wide_z(&desc);
-        let need = (8 + wide.len() * 2) as u32;
+        let desc_units = desc.encode_utf16().count() + 1;
+        let need = (8 + desc_units * 2) as u32;
         std::ptr::write_unaligned(pcb_bytes_needed, need);
         if lp_buffer.is_null() || cb_buf_size < need {
             return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
         }
         let str_dst = lp_buffer.add(8) as *mut u16;
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), str_dst, wide.len());
+        crate::strings::write_wide_z(str_dst, desc_units, &desc);
         std::ptr::write_unaligned(lp_buffer as *mut LPWSTR, str_dst);
         return TRUE;
     }
@@ -2501,14 +2501,14 @@ pub unsafe extern "win64" fn QueryServiceConfigW(
     };
     let bin = svc.entry.binary_path.lock().unwrap().clone();
     let disp = svc.entry.display_name.lock().unwrap().clone();
-    let bin_w = crate::strings::to_wide_z(&bin);
-    let disp_w = crate::strings::to_wide_z(&disp);
+    let bin_units = bin.encode_utf16().count() + 1;
+    let disp_units = disp.encode_utf16().count() + 1;
     // QUERY_SERVICE_CONFIGW on x64 is 64 bytes:
     // 0: dwServiceType, 4: dwStartType, 8: dwErrorControl, 12: pad,
     // 16: lpBinaryPathName, 24: lpLoadOrderGroup, 32: dwTagId, 36: pad,
     // 40: lpDependencies, 48: lpServiceStartName, 56: lpDisplayName
     let header_sz = 64usize;
-    let need = (header_sz + (bin_w.len() + disp_w.len()) * 2) as u32;
+    let need = (header_sz + (bin_units + disp_units) * 2) as u32;
     std::ptr::write_unaligned(pcb_bytes_needed, need);
     if lp_config.is_null() || cb_buf_size < need {
         return err(ERROR_INSUFFICIENT_BUFFER, FALSE);
@@ -2519,9 +2519,9 @@ pub unsafe extern "win64" fn QueryServiceConfigW(
     (lp_config.add(4) as *mut u32).write_unaligned(svc.entry.start_type.load(Ordering::Relaxed));
     (lp_config.add(8) as *mut u32).write_unaligned(svc.entry.error_control.load(Ordering::Relaxed));
     let bin_dst = lp_config.add(header_sz) as *mut u16;
-    std::ptr::copy_nonoverlapping(bin_w.as_ptr(), bin_dst, bin_w.len());
-    let disp_dst = bin_dst.add(bin_w.len());
-    std::ptr::copy_nonoverlapping(disp_w.as_ptr(), disp_dst, disp_w.len());
+    crate::strings::write_wide_z(bin_dst, bin_units, &bin);
+    let disp_dst = bin_dst.add(bin_units);
+    crate::strings::write_wide_z(disp_dst, disp_units, &disp);
     (lp_config.add(16) as *mut LPWSTR).write_unaligned(bin_dst);
     (lp_config.add(56) as *mut LPWSTR).write_unaligned(disp_dst);
     TRUE
@@ -2878,6 +2878,25 @@ mod tests {
         }
     }
 
+    unsafe fn read_unaligned_utf16_z(ptr: *const u16, max_units: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for i in 0..max_units {
+            let u = std::ptr::read_unaligned(ptr.add(i));
+            if u == 0 {
+                return out;
+            }
+            out.push(u);
+        }
+        panic!("missing NUL terminator within {max_units} UTF-16 code units");
+    }
+
+    fn odd_sentinel_buf(payload_bytes: usize) -> (Vec<u8>, usize) {
+        let backing = vec![0xA5u8; payload_bytes + 8];
+        let odd_off = if (backing.as_ptr() as usize) & 1 == 0 { 1 } else { 2 };
+        assert_eq!((backing.as_ptr() as usize + odd_off) & 1, 1);
+        (backing, odd_off)
+    }
+
     #[test]
     fn user_profile_directory_uses_vfs() {
         unsafe {
@@ -2887,10 +2906,34 @@ mod tests {
             assert_eq!(GetUserProfileDirectoryW(tok, std::ptr::null_mut(), &mut sz), FALSE);
             assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
             assert!(sz > 4);
-            let mut buf = vec![0u16; sz as usize];
+            let expected_units = sz as usize;
+            let mut buf = vec![0u16; expected_units];
             assert_eq!(GetUserProfileDirectoryW(tok, buf.as_mut_ptr(), &mut sz), TRUE);
+            assert_eq!(sz as usize, expected_units);
             let dir = crate::strings::from_wide(buf.as_ptr());
             assert!(dir.to_ascii_lowercase().starts_with("c:\\users\\"));
+
+            // Odd-address buffer: undersize probe preserves sentinels; exact size writes UTF-16 + NUL safely.
+            let byte_len = expected_units * 2;
+            let (mut odd_backing, odd_off) = odd_sentinel_buf(byte_len);
+            let odd_ptr = odd_backing.as_mut_ptr().add(odd_off) as *mut u16;
+            assert_eq!((odd_ptr as usize) & 1, 1);
+
+            let mut small = (expected_units - 1) as u32;
+            assert_eq!(GetUserProfileDirectoryW(tok, odd_ptr, &mut small), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(small as usize, expected_units);
+            assert!(odd_backing.iter().all(|&b| b == 0xA5));
+
+            let mut exact = expected_units as u32;
+            assert_eq!(GetUserProfileDirectoryW(tok, odd_ptr, &mut exact), TRUE);
+            assert_eq!(exact as usize, expected_units);
+            let got_units = read_unaligned_utf16_z(odd_ptr, expected_units);
+            let expected_utf16: Vec<u16> = dir.encode_utf16().collect();
+            assert_eq!(got_units, expected_utf16);
+            assert_eq!(std::ptr::read_unaligned(odd_ptr.add(expected_utf16.len())), 0u16);
+            assert!(odd_backing[..odd_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_backing[odd_off + byte_len..].iter().all(|&b| b == 0xA5));
 
             // Invalid token fails cleanly.
             assert_eq!(GetUserProfileDirectoryW(std::ptr::null_mut(), buf.as_mut_ptr(), &mut sz), FALSE);
@@ -3236,16 +3279,122 @@ mod tests {
             );
             assert!(!hsvc.is_null());
 
-            // ChangeServiceConfig2W + QueryServiceConfig2W description roundtrip.
+            // ChangeServiceConfig2W + QueryServiceConfig2W description roundtrip (aligned).
             let desc = crate::strings::to_wide_z("Test Service Description");
             let desc_ptr = desc.as_ptr();
             assert_eq!(ChangeServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, &desc_ptr as *const _ as *const c_void), TRUE);
             let mut need = 0u32;
             assert_eq!(QueryServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
             let mut dbuf = vec![0u8; need as usize];
             assert_eq!(QueryServiceConfig2W(hsvc, SERVICE_CONFIG_DESCRIPTION, dbuf.as_mut_ptr(), need, &mut need), TRUE);
             let out_ptr = std::ptr::read_unaligned(dbuf.as_ptr() as *const LPCWSTR);
             assert_eq!(crate::strings::from_wide(out_ptr), "Test Service Description");
+
+            // Odd-address + Unicode (including surrogate pair) tests for QueryServiceConfig2W & QueryServiceConfigW.
+            let u_svc_name = crate::strings::to_wide_z("PortFactoryUnicodeSvc");
+            let u_bin_str = "C:\\Test\\svc_\u{03A9}_\u{1F680}.exe";
+            let u_disp_str = "Display \u{03A9} \u{1F680}";
+            let u_desc_str = "Desc \u{03A9} \u{1F680}";
+            let u_bin_w = crate::strings::to_wide_z(u_bin_str);
+            let u_disp_w = crate::strings::to_wide_z(u_disp_str);
+            let u_desc_w = crate::strings::to_wide_z(u_desc_str);
+            let husvc = CreateServiceW(
+                scm,
+                u_svc_name.as_ptr(),
+                u_disp_w.as_ptr(),
+                0xF01FF,
+                SERVICE_WIN32_OWN_PROCESS,
+                2, // SERVICE_AUTO_START
+                1, // SERVICE_ERROR_NORMAL
+                u_bin_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!husvc.is_null());
+            let u_desc_ptr = u_desc_w.as_ptr();
+            assert_eq!(ChangeServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, &u_desc_ptr as *const _ as *const c_void), TRUE);
+
+            // QueryServiceConfig2W: size probe, undersize, exact odd-address buffer with sentinels, and aligned control.
+            let desc_units = u_desc_str.encode_utf16().count() + 1;
+            let expected_desc_need = (8 + desc_units * 2) as u32;
+            let mut desc_need = 0u32;
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, std::ptr::null_mut(), 0, &mut desc_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(desc_need, expected_desc_need);
+
+            let (mut odd_d2_backing, odd_d2_off) = odd_sentinel_buf(desc_need as usize);
+            let odd_d2_ptr = odd_d2_backing.as_mut_ptr().add(odd_d2_off);
+            assert_eq!((odd_d2_ptr as usize) & 1, 1);
+            let mut got_need = 0u32;
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, odd_d2_ptr, desc_need - 1, &mut got_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(got_need, expected_desc_need);
+            assert!(odd_d2_backing.iter().all(|&b| b == 0xA5));
+
+            assert_eq!(QueryServiceConfig2W(husvc, SERVICE_CONFIG_DESCRIPTION, odd_d2_ptr, desc_need, &mut got_need), TRUE);
+            assert_eq!(got_need, expected_desc_need);
+            let odd_desc_out = std::ptr::read_unaligned(odd_d2_ptr as *const *const u16);
+            assert_eq!(odd_desc_out as usize, odd_d2_ptr as usize + 8);
+            let got_desc_units = read_unaligned_utf16_z(odd_desc_out, desc_units);
+            assert_eq!(got_desc_units, u_desc_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(std::ptr::read_unaligned(odd_desc_out.add(desc_units - 1)), 0u16);
+            assert_eq!(String::from_utf16(&got_desc_units).unwrap(), u_desc_str);
+            assert!(odd_d2_backing[..odd_d2_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_d2_backing[odd_d2_off + desc_need as usize..].iter().all(|&b| b == 0xA5));
+
+            // QueryServiceConfigW: size probe, undersize, exact odd-address buffer with sentinels, and aligned control.
+            let bin_units = u_bin_str.encode_utf16().count() + 1;
+            let disp_units = u_disp_str.encode_utf16().count() + 1;
+            let expected_cfg_need = (64 + (bin_units + disp_units) * 2) as u32;
+            let mut cfg_need = 0u32;
+            assert_eq!(QueryServiceConfigW(husvc, std::ptr::null_mut(), 0, &mut cfg_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(cfg_need, expected_cfg_need);
+
+            let (mut odd_cfg_backing, odd_cfg_off) = odd_sentinel_buf(cfg_need as usize);
+            let odd_cfg_ptr = odd_cfg_backing.as_mut_ptr().add(odd_cfg_off);
+            assert_eq!((odd_cfg_ptr as usize) & 1, 1);
+            let mut cfg_got_need = 0u32;
+            assert_eq!(QueryServiceConfigW(husvc, odd_cfg_ptr, cfg_need - 1, &mut cfg_got_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(cfg_got_need, expected_cfg_need);
+            assert!(odd_cfg_backing.iter().all(|&b| b == 0xA5));
+
+            assert_eq!(QueryServiceConfigW(husvc, odd_cfg_ptr, cfg_need, &mut cfg_got_need), TRUE);
+            assert_eq!(cfg_got_need, expected_cfg_need);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr as *const u32), SERVICE_WIN32_OWN_PROCESS);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr.add(4) as *const u32), 2);
+            assert_eq!(std::ptr::read_unaligned(odd_cfg_ptr.add(8) as *const u32), 1);
+            let odd_bin_out = std::ptr::read_unaligned(odd_cfg_ptr.add(16) as *const *const u16);
+            let odd_disp_out = std::ptr::read_unaligned(odd_cfg_ptr.add(56) as *const *const u16);
+            assert_eq!(odd_bin_out as usize, odd_cfg_ptr as usize + 64);
+            assert_eq!(odd_disp_out as usize, odd_cfg_ptr as usize + 64 + bin_units * 2);
+            let got_bin_units = read_unaligned_utf16_z(odd_bin_out, bin_units);
+            let got_disp_units = read_unaligned_utf16_z(odd_disp_out, disp_units);
+            assert_eq!(got_bin_units, u_bin_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(got_disp_units, u_disp_str.encode_utf16().collect::<Vec<u16>>());
+            assert_eq!(std::ptr::read_unaligned(odd_bin_out.add(bin_units - 1)), 0u16);
+            assert_eq!(std::ptr::read_unaligned(odd_disp_out.add(disp_units - 1)), 0u16);
+            assert_eq!(String::from_utf16(&got_bin_units).unwrap(), u_bin_str);
+            assert_eq!(String::from_utf16(&got_disp_units).unwrap(), u_disp_str);
+            assert!(odd_cfg_backing[..odd_cfg_off].iter().all(|&b| b == 0xA5));
+            assert!(odd_cfg_backing[odd_cfg_off + cfg_need as usize..].iter().all(|&b| b == 0xA5));
+
+            // Aligned QueryServiceConfigW control.
+            let mut aligned_cfg = vec![0u64; (cfg_need as usize).div_ceil(8)];
+            let aligned_ptr = aligned_cfg.as_mut_ptr() as *mut u8;
+            assert_eq!(QueryServiceConfigW(husvc, aligned_ptr, cfg_need, &mut cfg_got_need), TRUE);
+            let al_bin_out = std::ptr::read_unaligned(aligned_ptr.add(16) as *const *const u16);
+            let al_disp_out = std::ptr::read_unaligned(aligned_ptr.add(56) as *const *const u16);
+            assert_eq!(String::from_utf16(&read_unaligned_utf16_z(al_bin_out, bin_units)).unwrap(), u_bin_str);
+            assert_eq!(String::from_utf16(&read_unaligned_utf16_z(al_disp_out, disp_units)).unwrap(), u_disp_str);
+
+            assert_eq!(DeleteService(husvc), TRUE);
+            assert_eq!(CloseServiceHandle(husvc), TRUE);
 
             // Start dispatcher on background thread, verify running status, send STOP via ControlService.
             let dispatcher = std::thread::spawn(move || {
