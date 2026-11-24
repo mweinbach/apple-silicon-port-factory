@@ -358,7 +358,7 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
 /// valid after `_close(fd)` or `_dup2(other, fd)`.
 pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
     use std::os::fd::{FromRawFd, OwnedFd};
-    use crate::kernel32::file::{classify_host_fd, std_handle, wrap_owned_fd, FileKind};
+    use crate::kernel32::file::{classify_host_fd, wrap_owned_fd, FileKind};
     if !fd_valid(fd) {
         errno::set(EBADF);
         return -1;
@@ -372,11 +372,7 @@ pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
             }
         }
     }
-    if (0..=2).contains(&fd) {
-        drop(g);
-        return std_handle(fd as usize) as isize;
-    }
-    let dup_fd = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0);
+    let dup_fd = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
     if dup_fd < 0 {
         errno::set_from_host();
         return -1;
@@ -2252,5 +2248,171 @@ mod tests {
             assert_eq!(_close(cli_fd), 0);
             assert!(crate::handles::get(cli).is_none());
         }
+    }
+
+    #[test]
+    fn std_fd_get_osfhandle_tracks_fd_independently_of_set_std_handle_and_dup2() {
+        use crate::kernel32::file::{CreateFileW, GetStdHandle, SetStdHandle, WriteFile};
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+
+        struct StdFd1Guard {
+            saved_posix_1: i32,
+            saved_std_out: HANDLE,
+        }
+        impl Drop for StdFd1Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    SetStdHandle(STD_OUTPUT_HANDLE, self.saved_std_out);
+                    let _ = libc::dup2(self.saved_posix_1, 1);
+                    let prev = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&1);
+                    if let Some((old_info, _)) = prev {
+                        if let Some(old_h) = old_info.osf_handle {
+                            let _ = crate::handles::close(old_h as HANDLE);
+                        }
+                    }
+                    let _ = libc::close(self.saved_posix_1);
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("aw2_std_osf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("M:\\", &dir);
+
+        unsafe {
+            let create_win = |win_path: &str| -> HANDLE {
+                let p = crate::strings::to_wide_z(win_path);
+                let h = CreateFileW(
+                    p.as_ptr(),
+                    0xC000_0000,
+                    3,
+                    std::ptr::null_mut(),
+                    2, // CREATE_ALWAYS
+                    0x80,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let write_win = |h: HANDLE, data: &[u8]| {
+                let mut written = 0u32;
+                assert_eq!(
+                    WriteFile(h, data.as_ptr() as *const c_void, data.len() as u32, &mut written, std::ptr::null_mut()),
+                    TRUE
+                );
+                assert_eq!(written as usize, data.len());
+            };
+
+            let saved_posix_1 = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3);
+            assert!(saved_posix_1 >= 3);
+            let saved_std_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            let _guard = StdFd1Guard { saved_posix_1, saved_std_out };
+
+            // Open helper files before closing slot 1 so `CreateFileW` / `_open` cannot claim slot 1.
+            let fd_extra = _open(b"M:\\extra.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let h_alias = create_win("M:\\alias.bin");
+            let fd_a = _open(b"M:\\fd1_a.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let fd_b = _open(b"M:\\fd1_b.bin\0".as_ptr(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0x180);
+            let h_win = create_win("M:\\std_win.bin");
+            assert!(fd_extra >= 3 && fd_a >= 3 && fd_b >= 3);
+
+            // 1. With standard slot 1 closed, exporting another fd via _get_osfhandle must use
+            //    min fd 3 and leave closed slot 1 unpopulated; _open_osfhandle aliasing into a
+            //    standard slot preserves the exact transferred Win32 handle.
+            assert_eq!(_close(1), 0);
+            assert!(!fd_valid(1));
+            assert_eq!(_get_osfhandle(1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            let h_extra = _get_osfhandle(fd_extra) as HANDLE;
+            assert_ne!(h_extra, INVALID_HANDLE_VALUE);
+            let extra_obj = crate::kernel32::file::get_file(h_extra).expect("exported FileObj");
+            assert!(extra_obj.fd() >= 3, "internal duplicate must not occupy closed std slot");
+            assert_ne!(libc::fcntl(extra_obj.fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            drop(extra_obj);
+            assert!(!fd_valid(1), "exporting another fd must not populate closed slot 1");
+            assert_eq!(_close(fd_extra), 0);
+
+            let fd_alias = _open_osfhandle(h_alias as isize, O_BINARY);
+            assert!((0..=2).contains(&fd_alias), "expected _open_osfhandle to reuse closed std slot, got {fd_alias}");
+            assert_eq!(_get_osfhandle(fd_alias), h_alias as isize);
+            write_win(h_alias, b"ALIAS");
+            assert_eq!(_close(fd_alias), 0);
+            assert!(crate::handles::get(h_alias).is_none());
+
+            // 2. Bind POSIX fd 1 to file A and redirect Win32 STD_OUTPUT_HANDLE to a distinct file.
+            //    _get_osfhandle(1) must track fd 1 (not STD_OUTPUT_HANDLE), stay cached/stable
+            //    before and after SetStdHandle, support DuplicateHandle lifetime across _dup2,
+            //    and track file B after _dup2(fd_b, 1).
+            assert_eq!(_dup2(fd_a, 1), 0);
+
+            assert_eq!(SetStdHandle(STD_OUTPUT_HANDLE, h_win), TRUE);
+            assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), h_win);
+
+            let h1_a = _get_osfhandle(1) as HANDLE;
+            assert_ne!(h1_a, INVALID_HANDLE_VALUE);
+            assert_ne!(h1_a, h_win);
+            assert_ne!(h1_a, saved_std_out);
+            assert_eq!(_get_osfhandle(1), h1_a as isize); // cached identity stable
+            let h1_a_obj = crate::kernel32::file::get_file(h1_a).expect("fd 1 FileObj");
+            assert!(h1_a_obj.fd() >= 3);
+            assert_ne!(libc::fcntl(h1_a_obj.fd(), libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+            drop(h1_a_obj);
+
+            let mut h1_a_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(
+                    crate::handles::CURRENT_PROCESS,
+                    h1_a,
+                    crate::handles::CURRENT_PROCESS,
+                    &mut h1_a_dup,
+                    0,
+                    0,
+                    2, // DUPLICATE_SAME_ACCESS
+                ),
+                TRUE
+            );
+            assert!(!h1_a_dup.is_null() && h1_a_dup != h1_a);
+
+            write_win(GetStdHandle(STD_OUTPUT_HANDLE), b"WIN-A");
+            write_win(h1_a, b"FD1-A");
+
+            // Redirect POSIX fd 1 to file B; old cached handle retires, DuplicateHandle sibling survives.
+            assert_eq!(_dup2(fd_b, 1), 0);
+            assert!(crate::handles::get(h1_a).is_none());
+            assert!(crate::handles::get(h1_a_dup).is_some());
+            write_win(h1_a_dup, b"+DUP");
+            assert_eq!(CloseHandle(h1_a_dup), TRUE);
+
+            assert_eq!(GetStdHandle(STD_OUTPUT_HANDLE), h_win);
+            let h1_b = _get_osfhandle(1) as HANDLE;
+            assert_ne!(h1_b, INVALID_HANDLE_VALUE);
+            assert_ne!(h1_b, h1_a);
+            assert_ne!(h1_b, h_win);
+            assert_eq!(_get_osfhandle(1), h1_b as isize); // cached identity stable after _dup2
+            let h1_b_obj = crate::kernel32::file::get_file(h1_b).expect("redirected fd 1 FileObj");
+            assert!(h1_b_obj.fd() >= 3);
+            drop(h1_b_obj);
+
+            write_win(h1_b, b"FD1-B");
+            write_win(GetStdHandle(STD_OUTPUT_HANDLE), b"+WIN-B");
+
+            assert_eq!(_close(fd_a), 0);
+            assert_eq!(_close(fd_b), 0);
+            drop(_guard);
+            assert_eq!(CloseHandle(h_win), TRUE);
+
+            assert_eq!(std::fs::read(dir.join("alias.bin")).unwrap(), b"ALIAS");
+            assert_eq!(std::fs::read(dir.join("std_win.bin")).unwrap(), b"WIN-A+WIN-B");
+            assert_eq!(std::fs::read(dir.join("fd1_a.bin")).unwrap(), b"FD1-A+DUP");
+            assert_eq!(std::fs::read(dir.join("fd1_b.bin")).unwrap(), b"FD1-B");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

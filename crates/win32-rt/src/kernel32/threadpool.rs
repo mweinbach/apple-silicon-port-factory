@@ -1163,6 +1163,9 @@ pub unsafe extern "win64" fn WaitForThreadpoolIoCallbacks(pio: *mut TpIo, cancel
         if st.queued_callbacks > 0 {
             st.generation = st.generation.wrapping_add(1);
             st.queued_callbacks = 0;
+            if st.is_idle() {
+                (*pio).cv.notify_all();
+            }
         }
     }
     while !st.is_idle() {
@@ -1709,6 +1712,118 @@ mod tests {
             assert_eq!(CloseHandle(release_ev), TRUE);
             assert_eq!(CloseHandle(waiter_started_ev), TRUE);
             assert_eq!(CloseHandle(waiter_done_ev), TRUE);
+            assert_eq!(CloseHandle(rd), TRUE);
+            assert_eq!(CloseHandle(wr), TRUE);
+        }
+    }
+
+    #[test]
+    fn wait_for_threadpool_io_true_cancel_wakes_waiting_false_waiter() {
+        use crate::kernel32::file::CreatePipe;
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, SetEvent, WaitForSingleObject};
+
+        unsafe extern "win64" fn unexpected_io_cb(
+            _inst: *mut c_void,
+            _ctx: *mut c_void,
+            _ov: *mut c_void,
+            _io_result: u32,
+            _bytes: usize,
+            _io: *mut c_void,
+        ) {
+            panic!("cancelled queued callback must not run");
+        }
+
+        unsafe {
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0), TRUE);
+
+            let pio = CreateThreadpoolIo(
+                rd,
+                unexpected_io_cb as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!pio.is_null());
+
+            // Enter the exact queued-callback-only state (no pending I/O, no running callback,
+            // no worker submitted) so no subsequent I/O or worker completion can wake waiters.
+            let gen_before = {
+                let mut st = (*pio).state.lock().unwrap();
+                st.queued_callbacks = 1;
+                st.generation
+            };
+
+            let false_started_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let false_done_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let obs_locked_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(
+                !false_started_ev.is_null()
+                    && !false_done_ev.is_null()
+                    && !obs_locked_ev.is_null()
+            );
+
+            let pio_addr = pio as usize;
+            let fs_addr = false_started_ev as usize;
+            let fd_addr = false_done_ev as usize;
+            let ol_addr = obs_locked_ev as usize;
+
+            // (1) Earlier WaitForThreadpoolIoCallbacks(pio, FALSE) waiter blocked on queued_callbacks.
+            let false_waiter = std::thread::spawn(move || {
+                SetEvent(fs_addr as HANDLE);
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, FALSE);
+                SetEvent(fd_addr as HANDLE);
+            });
+            assert_eq!(WaitForSingleObject(false_started_ev, 2_000), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(false_done_ev, 50), WAIT_TIMEOUT);
+
+            // (2) Lock-synchronized observer on `(*pio).cv`: signals `obs_locked_ev` while holding
+            // `(*pio).state`, so `WaitForThreadpoolIoCallbacks(pio, TRUE)` cannot acquire the lock
+            // until the observer is blocked inside `cv.wait_timeout`.
+            let observer = std::thread::spawn(move || -> bool {
+                let p = pio_addr as *mut TpIo;
+                let mut st = (*p).state.lock().unwrap();
+                SetEvent(ol_addr as HANDLE);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !st.is_idle() {
+                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    let (guard, timeout) = (*p).cv.wait_timeout(st, rem).unwrap();
+                    st = guard;
+                    if timeout.timed_out() {
+                        return false;
+                    }
+                }
+                true
+            });
+            assert_eq!(WaitForSingleObject(obs_locked_ev, 2_000), WAIT_OBJECT_0);
+
+            // Final queued-callback cancellation must transition `pio` to idle and notify waiters.
+            WaitForThreadpoolIoCallbacks(pio, TRUE);
+
+            assert!(
+                observer.join().unwrap(),
+                "observer timed out on TpIo::cv after TRUE queued-callback cancellation"
+            );
+            assert_eq!(
+                WaitForSingleObject(false_done_ev, 2_000),
+                WAIT_OBJECT_0,
+                "earlier WaitForThreadpoolIoCallbacks(pio, FALSE) remained stuck after TRUE cancellation"
+            );
+            false_waiter.join().unwrap();
+
+            {
+                let st = (*pio).state.lock().unwrap();
+                assert!(st.is_idle());
+                assert_eq!(st.generation, gen_before.wrapping_add(1));
+                assert_eq!(st.cancel_waiters, 0);
+            }
+
+            CloseThreadpoolIo(pio);
+            assert_eq!(CloseHandle(false_started_ev), TRUE);
+            assert_eq!(CloseHandle(false_done_ev), TRUE);
+            assert_eq!(CloseHandle(obs_locked_ev), TRUE);
             assert_eq!(CloseHandle(rd), TRUE);
             assert_eq!(CloseHandle(wr), TRUE);
         }
