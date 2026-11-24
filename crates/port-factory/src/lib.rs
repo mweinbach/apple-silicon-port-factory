@@ -33,6 +33,7 @@ pub mod gpu_shaders;
 pub mod ios_bundle;
 pub mod launcher;
 pub mod ops_db;
+pub mod report_diff;
 pub mod scaffold;
 pub mod scanner;
 pub mod steam_library;

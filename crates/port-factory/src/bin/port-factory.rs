@@ -34,6 +34,7 @@ fn main() -> Result<()> {
         "stub-sync" => db::cmd_stub_sync(rest),
         "stub-backlog" => db::cmd_stub_backlog(rest),
         "stub-diff" => db::cmd_stub_diff(rest),
+        "report-diff" => db::cmd_report_diff(rest),
         "aot" => scan::cmd_aot(rest),
         "aot-crate" => scan::cmd_aot_crate(rest),
         "aot-prewarm" | "prewarm-aot" => bundle::cmd_aot_prewarm(rest),

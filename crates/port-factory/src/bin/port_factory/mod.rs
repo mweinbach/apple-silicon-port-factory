@@ -38,6 +38,7 @@ pub fn usage() -> ! {
            stub-sync [--tsv PATH] [--backlog]   Export checked-in stub inventory (`db/stub_inventory.tsv`) & optional backlog\n\
            stub-backlog [--write] [--out PATH]  Generate `docs/stub-backlog.md` collecting `docs/stub-backlog.d/*.md`\n\
            stub-diff <BEFORE.json> <AFTER.json> Diff two runtime stub snapshots (or boot report JSONs)\n\
+           report-diff <BEFORE.json> <AFTER.json> Diff two `port-runner --report-json` boot reports\n\
          \n\
          Generalized Static AOT & Embedding Commands:\n\
            aot <PE_FILE> [--out PATH.rs] [--max-fns N]\n\

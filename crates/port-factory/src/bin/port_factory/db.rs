@@ -630,6 +630,18 @@ pub fn cmd_stub_diff(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_report_diff(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!("usage: port-factory report-diff <BEFORE.json> <AFTER.json>");
+    }
+    let diff = port_factory::report_diff::diff_boot_report_files(
+        &PathBuf::from(&args[0]),
+        &PathBuf::from(&args[1]),
+    )?;
+    print!("{diff}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

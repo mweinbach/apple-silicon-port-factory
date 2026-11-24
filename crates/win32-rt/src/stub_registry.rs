@@ -133,6 +133,9 @@ pub fn normalize_source_file(file: &str) -> String {
     if let Some(idx) = s.find("crates/win32-rt/src/") {
         return s[idx..].to_string();
     }
+    if let Some(idx) = s.find("win32-rt/src/") {
+        return format!("crates/{}", &s[idx..]);
+    }
     s
 }
 
@@ -159,6 +162,7 @@ pub fn set_guest_caller_provider(f: GuestCallerFn) {
 }
 
 /// Current presented frame number (`0` before the first present).
+/// Uses the API-neutral [`crate::present::present_count`] across D3D12, D3D11, and Vulkan.
 #[inline]
 pub fn current_frame() -> u64 {
     let manual = MANUAL_FRAME.load(Ordering::Acquire);
@@ -170,7 +174,7 @@ pub fn current_frame() -> u64 {
         let f: FrameProviderFn = unsafe { std::mem::transmute(p) };
         return f();
     }
-    crate::dxgi::adapter::global_present_count() as u64
+    crate::present::present_count() as u64
 }
 
 /// Current guest caller virtual address, or `0` if invoked from host code / tests.
@@ -1184,5 +1188,13 @@ mod tests {
         assert_eq!(module_path_to_dll("win32_rt::slstub"), "sl.interposer.dll");
         assert_eq!(module_path_to_dll("win32_rt::misc::secur32::schannel"), "secur32.dll");
         assert_eq!(module_path_to_dll("win32_rt::misc::oo2core_9_win64"), "oo2core_9_win64.dll");
+        assert_eq!(
+            normalize_source_file("/tmp/work/target/win64-abi-aarch64/win32-rt/src/kernel32/threads.rs"),
+            "crates/win32-rt/src/kernel32/threads.rs"
+        );
+        assert_eq!(
+            normalize_source_file("crates/win32-rt/src/misc/ws2_32.rs"),
+            "crates/win32-rt/src/misc/ws2_32.rs"
+        );
     }
 }

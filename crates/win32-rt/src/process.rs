@@ -553,6 +553,33 @@ static EXIT_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new(
 static EXIT_HOOKS_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Code passed to [`exit_process`] (`u64::MAX`: not exiting through it).
 static EXIT_CODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Optional fatal/abnormal exit reason recorded before exit hooks run
+/// (`(exit_kind, detail)` such as `("crash", "access violation")` or `("unimplemented_import", "foo!Bar")`).
+static EXIT_REASON: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Record a structured exit kind and detail (first writer wins; used by crash reports,
+/// unimplemented-import traps, and stall watchdogs before invoking exit hooks).
+pub fn record_exit_reason(kind: &str, detail: impl Into<String>) {
+    if let Ok(mut g) = EXIT_REASON.try_lock() {
+        if g.is_none() {
+            *g = Some((kind.to_string(), detail.into()));
+        }
+    }
+}
+
+/// Return `(exit_kind, detail)` for boot/exit reports.
+pub fn exit_reason() -> (String, String) {
+    if let Ok(g) = EXIT_REASON.try_lock() {
+        if let Some((ref k, ref d)) = *g {
+            return (k.clone(), d.clone());
+        }
+    }
+    match exit_code() {
+        Some(0) => ("clean_exit".to_string(), String::new()),
+        Some(c) => ("nonzero_exit".to_string(), format!("exit code {c} (0x{c:x})")),
+        None => ("unknown".to_string(), String::new()),
+    }
+}
 
 /// The code the process is exiting with through [`exit_process`] (ExitProcess, CRT exit
 /// paths, ...), or None (fatal faults, crash reports, still running). For exit hooks.

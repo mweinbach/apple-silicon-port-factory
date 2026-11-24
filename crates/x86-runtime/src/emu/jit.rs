@@ -33,6 +33,7 @@
 
 mod aot;
 mod cache;
+pub(super) use cache::total_jit_blocks_compiled;
 mod emit;
 mod ext;
 mod lazy;

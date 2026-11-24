@@ -219,7 +219,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:234` | `"GetSystemMetrics({index}) -> 0"` |
 | `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:601` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
 | `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1363` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
-| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:880` | `"ReplyMessage: early reply not supported"` |
+| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:883` | `"ReplyMessage: early reply not supported"` |
 | `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
 | `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
 | `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1718` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
@@ -292,16 +292,16 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `NvLL_VK_DestroyLowLatencyDevice` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_GetLatency` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_GetSleepStatus` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_InitLowLatencyDevice` | `stub` | `crates/win32-rt/src/misc/vulkan_1.rs:3637` | `"NvLL_VK_InitLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)"` |
-| `NvLL_VK_Initialize` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_NotifyOutOfBandQueue` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_SetLatencyMarker` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_SetSleepMode` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_Sleep` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_Unload` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_DestroyLowLatencyDevice` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_GetLatency` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_GetSleepStatus` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_InitLowLatencyDevice` | `stub` | `crates/win32-rt/src/misc/vulkan_1.rs:4500` | `"NvLL_VK_InitLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)"` |
+| `NvLL_VK_Initialize` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_NotifyOutOfBandQueue` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_SetLatencyMarker` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_SetSleepMode` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_Sleep` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
+| `NvLL_VK_Unload` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
 
 ### `ws2_32.dll` (10)
 
