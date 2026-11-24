@@ -2893,10 +2893,29 @@ impl ParsedUri {
 
     fn combine(&self, rel: &str) -> Result<Self, HRESULT> {
         let rel = rel.trim();
-        if rel.contains("://") {
+        let (rel_path, rel_suffix) = match rel.find(['?', '#']) {
+            Some(i) => (&rel[..i], &rel[i..]),
+            None => (rel, ""),
+        };
+        if rel_path.is_empty() {
+            let base_prefix = if rel_suffix.starts_with('?') {
+                match self.raw.find(['?', '#']) {
+                    Some(i) => &self.raw[..i],
+                    None => self.raw.as_str(),
+                }
+            } else {
+                match self.raw.find('#') {
+                    Some(i) => &self.raw[..i],
+                    None => self.raw.as_str(),
+                }
+            };
+            let combined = format!("{base_prefix}{rel_suffix}");
+            return Self::parse(&combined);
+        }
+        if rel_path.contains("://") {
             return Self::parse(rel);
         }
-        let new_path = if rel.starts_with('/') {
+        let new_path = if rel_path.starts_with('/') {
             rel.to_string()
         } else {
             let base_dir = match self.path.rfind('/') {
@@ -4691,6 +4710,207 @@ mod tests {
             assert_eq!(com_call_release(pvs), 1);
             assert_eq!(com_call_release(factory), 0);
             WindowsDeleteString(pv_class);
+        }
+    }
+
+    #[test]
+    fn winrt_uri_combine_preserves_base_path_for_query_and_fragment_references() {
+        unsafe {
+            let uri_class = rust_to_hstring("Windows.Foundation.Uri").unwrap();
+            let urif_iid = crate::com::IID_IUriRuntimeClassFactory.to_bytes();
+            let mut urif: *mut c_void = std::ptr::null_mut();
+            assert_eq!(RoGetActivationFactory(uri_class, urif_iid.as_ptr(), &mut urif), S_OK);
+
+            // (base, rel, expected_abs, expected_raw, expected_path, expected_query, expected_frag)
+            let cases: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+                // Reviewer doc.json examples: query-only and fragment-only keep doc.json.
+                (
+                    "https://example.com/a/doc.json",
+                    "?k=v",
+                    "https://example.com/a/doc.json?k=v",
+                    "https://example.com/a/doc.json?k=v",
+                    "/a/doc.json",
+                    "?k=v",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "#sec",
+                    "https://example.com/a/doc.json#sec",
+                    "https://example.com/a/doc.json#sec",
+                    "/a/doc.json",
+                    "",
+                    "#sec",
+                ),
+                // Replacing existing fragment preserves base query, userinfo, and port.
+                (
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#old",
+                    "#new",
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#new",
+                    "https://user:pw@example.com:8443/a/doc.json?old=1#new",
+                    "/a/doc.json",
+                    "?old=1",
+                    "#new",
+                ),
+                // Query + fragment replaces both existing query and fragment.
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?new=2#frag",
+                    "https://example.com/a/doc.json?new=2#frag",
+                    "https://example.com/a/doc.json?new=2#frag",
+                    "/a/doc.json",
+                    "?new=2",
+                    "#frag",
+                ),
+                // Explicitly empty '?' / '#' / '?#' vs empty reference "".
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?",
+                    "https://example.com/a/doc.json?",
+                    "https://example.com/a/doc.json?",
+                    "/a/doc.json",
+                    "?",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "#",
+                    "https://example.com/a/doc.json?old=1#",
+                    "https://example.com/a/doc.json?old=1#",
+                    "/a/doc.json",
+                    "?old=1",
+                    "#",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "?#",
+                    "https://example.com/a/doc.json?#",
+                    "https://example.com/a/doc.json?#",
+                    "/a/doc.json",
+                    "?",
+                    "#",
+                ),
+                (
+                    "https://example.com/a/doc.json?old=1#old",
+                    "",
+                    "https://example.com/a/doc.json?old=1",
+                    "https://example.com/a/doc.json?old=1",
+                    "/a/doc.json",
+                    "?old=1",
+                    "",
+                ),
+                // Embedded '://' inside query or fragment must not be treated as an absolute URI.
+                (
+                    "https://example.com/a/doc.json",
+                    "?next=https://other.example/x",
+                    "https://example.com/a/doc.json?next=https://other.example/x",
+                    "https://example.com/a/doc.json?next=https://other.example/x",
+                    "/a/doc.json",
+                    "?next=https://other.example/x",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json?a=1",
+                    "#https://other.example/x",
+                    "https://example.com/a/doc.json?a=1#https://other.example/x",
+                    "https://example.com/a/doc.json?a=1#https://other.example/x",
+                    "/a/doc.json",
+                    "?a=1",
+                    "#https://other.example/x",
+                ),
+                // Normal relative-file (including embedded '://' in query) and absolute controls.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "other.json?next=https://other.example/x",
+                    "https://example.com:8443/a/other.json?next=https://other.example/x",
+                    "https://example.com:8443/a/other.json?next=https://other.example/x",
+                    "/a/other.json",
+                    "?next=https://other.example/x",
+                    "",
+                ),
+                (
+                    "https://example.com/a/doc.json",
+                    "https://other.example/x?q=1#f",
+                    "https://other.example/x?q=1#f",
+                    "https://other.example/x?q=1#f",
+                    "/x",
+                    "?q=1",
+                    "#f",
+                ),
+            ];
+
+            let check_uri = |obj: *mut c_void, label: &str, exp_abs: &str, exp_raw: &str, exp_path: &str, exp_q: &str, exp_f: &str| {
+                let mut abs_h = 0usize;
+                let mut raw_h = 0usize;
+                let mut path_h = 0usize;
+                let mut query_h = 0usize;
+                let mut frag_h = 0usize;
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 6, &[&mut abs_h as *mut usize as u64]), S_OK, "{label} AbsoluteUri");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 16, &[&mut raw_h as *mut usize as u64]), S_OK, "{label} RawUri");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 13, &[&mut path_h as *mut usize as u64]), S_OK, "{label} Path");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 14, &[&mut query_h as *mut usize as u64]), S_OK, "{label} Query");
+                assert_eq!(crate::com::com_invoke_hresult(obj, &crate::com::IID_IUriRuntimeClass, 10, &[&mut frag_h as *mut usize as u64]), S_OK, "{label} Fragment");
+                assert_eq!(hstring_to_rust(abs_h), exp_abs, "{label} AbsoluteUri");
+                assert_eq!(hstring_to_rust(raw_h), exp_raw, "{label} RawUri");
+                assert_eq!(hstring_to_rust(path_h), exp_path, "{label} Path");
+                assert_eq!(hstring_to_rust(query_h), exp_q, "{label} Query");
+                assert_eq!(hstring_to_rust(frag_h), exp_f, "{label} Fragment");
+                for h in [abs_h, raw_h, path_h, query_h, frag_h] {
+                    WindowsDeleteString(h);
+                }
+            };
+
+            for &(base, rel, exp_abs, exp_raw, exp_path, exp_q, exp_f) in cases {
+                let base_h = rust_to_hstring(base).unwrap();
+                let rel_h = rust_to_hstring(rel).unwrap();
+
+                // Entry point 1: IUriRuntimeClass::CombineUri (slot 22).
+                let mut base_obj: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        6, // CreateUri
+                        &[base_h as u64, &mut base_obj as *mut *mut c_void as u64],
+                    ),
+                    S_OK
+                );
+                let mut combined_obj: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        base_obj,
+                        &crate::com::IID_IUriRuntimeClass,
+                        22, // CombineUri
+                        &[rel_h as u64, &mut combined_obj as *mut *mut c_void as u64],
+                    ),
+                    S_OK,
+                    "CombineUri({base:?}, {rel:?})"
+                );
+                check_uri(combined_obj, &format!("CombineUri({base:?}, {rel:?})"), exp_abs, exp_raw, exp_path, exp_q, exp_f);
+                assert_eq!(com_call_release(combined_obj), 0);
+                assert_eq!(com_call_release(base_obj), 0);
+
+                // Entry point 2: IUriRuntimeClassFactory::CreateWithRelativeUri (slot 7).
+                let mut factory_combined: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::com::com_invoke_hresult(
+                        urif,
+                        &crate::com::IID_IUriRuntimeClassFactory,
+                        7, // CreateWithRelativeUri
+                        &[base_h as u64, rel_h as u64, &mut factory_combined as *mut *mut c_void as u64],
+                    ),
+                    S_OK,
+                    "CreateWithRelativeUri({base:?}, {rel:?})"
+                );
+                check_uri(factory_combined, &format!("CreateWithRelativeUri({base:?}, {rel:?})"), exp_abs, exp_raw, exp_path, exp_q, exp_f);
+                assert_eq!(com_call_release(factory_combined), 0);
+
+                WindowsDeleteString(rel_h);
+                WindowsDeleteString(base_h);
+            }
+
+            assert_eq!(com_call_release(urif), 0);
+            WindowsDeleteString(uri_class);
         }
     }
 }
