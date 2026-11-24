@@ -3888,6 +3888,8 @@ const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
 const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
 
 const MAX_WATCHED_VNODE_FDS: usize = 512;
+#[cfg(target_vendor = "apple")]
+const DIR_WATCH_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PENDING_DIR_CHANGES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4361,7 +4363,13 @@ impl DirWatcher {
             let initial_snap = snapshot_dir(&root, subtree);
             let mut watched_by_path: HashMap<String, (i32, u64, u64)> = HashMap::new();
             let mut path_by_fd: HashMap<i32, String> = HashMap::new();
-            sync_kqueue_vnodes(kq, &root, &initial_snap, &mut watched_by_path, &mut path_by_fd);
+            let initial_needs_rescan = sync_kqueue_vnodes(
+                kq,
+                &root,
+                &initial_snap,
+                &mut watched_by_path,
+                &mut path_by_fd,
+            );
 
             let watcher = Arc::new(DirWatcher {
                 state: Mutex::new(DirWatcherState {
@@ -4380,7 +4388,16 @@ impl DirWatcher {
             let spawn_res = std::thread::Builder::new()
                 .name("win32-dir-watch".into())
                 .spawn(move || {
-                    dir_watch_kqueue_loop(w_thread, kq, wake_r, root, initial_snap, watched_by_path, path_by_fd);
+                    dir_watch_kqueue_loop(
+                        w_thread,
+                        kq,
+                        wake_r,
+                        root,
+                        initial_snap,
+                        watched_by_path,
+                        path_by_fd,
+                        initial_needs_rescan,
+                    );
                 });
             if let Err(e) = spawn_res {
                 for fd in initial_fds {
@@ -4443,6 +4460,10 @@ fn register_vnode_kevent(kq: i32, fd: i32) -> bool {
     unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) >= 0 }
 }
 
+/// Synchronize kqueue `EVFILT_VNODE` descriptors against `root` and `snap`, prioritizing
+/// directories before files within `MAX_WATCHED_VNODE_FDS`.
+/// Returns `true` when root or any snapshotted entry lacks an active registered vnode fd
+/// (due to the fd cap or open/registration failure), signaling that periodic rescan is needed.
 #[cfg(target_vendor = "apple")]
 fn sync_kqueue_vnodes(
     kq: i32,
@@ -4450,15 +4471,18 @@ fn sync_kqueue_vnodes(
     snap: &BTreeMap<String, DirSnapEntry>,
     watched_by_path: &mut HashMap<String, (i32, u64, u64)>,
     path_by_fd: &mut HashMap<i32, String>,
-) {
+) -> bool {
     let mut desired: Vec<(String, u64, u64)> = Vec::new();
     if let Ok(rm) = std::fs::symlink_metadata(root) {
         desired.push((String::new(), rm.dev(), rm.ino()));
     }
-    // Prioritize directories first so subtree watching always covers every subdirectory,
-    // then add files up to MAX_WATCHED_VNODE_FDS so in-place file writes trigger immediately.
+    // Prioritize directories first so subtree watching covers subdirectories within the
+    // bounded fd budget, then add files up to MAX_WATCHED_VNODE_FDS.
     for (rel, ent) in snap {
         if ent.is_dir {
+            if desired.len() >= MAX_WATCHED_VNODE_FDS {
+                break;
+            }
             desired.push((rel.clone(), ent.dev, ent.ino));
         }
     }
@@ -4506,9 +4530,14 @@ fn sync_kqueue_vnodes(
             }
         }
     }
+
+    // `watched_by_path` keys are a subset of `{""} U snap.keys()`; full coverage holds iff
+    // root (`""`) and every snapshotted entry have an active registered descriptor.
+    watched_by_path.len() < snap.len() + 1 || !watched_by_path.contains_key("")
 }
 
 #[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
 fn dir_watch_kqueue_loop(
     watcher: Arc<DirWatcher>,
     kq: i32,
@@ -4517,15 +4546,36 @@ fn dir_watch_kqueue_loop(
     mut prev_snap: BTreeMap<String, DirSnapEntry>,
     mut watched_by_path: HashMap<String, (i32, u64, u64)>,
     mut path_by_fd: HashMap<i32, String>,
+    mut needs_rescan: bool,
 ) {
     let mut cur_subtree = watcher.state.lock().unwrap().subtree;
     let mut events = [unsafe { std::mem::zeroed::<libc::kevent>() }; 64];
+    let mut next_rescan: Option<Instant> =
+        needs_rescan.then(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
 
     loop {
         if watcher.closed.load(Ordering::Acquire) {
             break;
         }
-        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, std::ptr::null()) };
+        let mut ts_storage = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let ts_ptr = if let Some(dl) = next_rescan {
+            let rem = dl.saturating_duration_since(Instant::now());
+            ts_storage.tv_sec = rem.as_secs() as libc::time_t;
+            ts_storage.tv_nsec = rem.subsec_nanos() as libc::c_long;
+            &ts_storage as *const libc::timespec
+        } else {
+            std::ptr::null()
+        };
+        let n = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                ts_ptr,
+            )
+        };
         if n < 0 {
             if last_errno() == libc::EINTR {
                 continue;
@@ -4562,16 +4612,18 @@ fn dir_watch_kqueue_loop(
             }
         };
 
-        record_events(&events[..n as usize]);
+        if n > 0 {
+            record_events(&events[..n as usize]);
 
-        // Drain any immediately queued events (e.g. rename firing both NOTE_RENAME on file and NOTE_WRITE on dir).
-        let zero_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        for _ in 0..8 {
-            let more = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, &zero_ts) };
-            if more <= 0 {
-                break;
+            // Drain any immediately queued events (e.g. rename firing both NOTE_RENAME on file and NOTE_WRITE on dir).
+            let zero_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            for _ in 0..8 {
+                let more = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), events.len() as i32, &zero_ts) };
+                if more <= 0 {
+                    break;
+                }
+                record_events(&events[..more as usize]);
             }
-            record_events(&events[..more as usize]);
         }
 
         if woke_by_pipe {
@@ -4588,15 +4640,22 @@ fn dir_watch_kqueue_loop(
         if want_subtree && !cur_subtree {
             cur_subtree = true;
             prev_snap = snapshot_dir(&root, true);
-            sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            needs_rescan = sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            next_rescan = if needs_rescan {
+                Some(next_rescan.unwrap_or_else(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL))
+            } else {
+                None
+            };
         }
 
-        if saw_vnode {
+        let rescan_due = next_rescan.is_some_and(|dl| Instant::now() >= dl);
+        if saw_vnode || rescan_due {
             let new_snap = snapshot_dir(&root, cur_subtree);
             let changes = diff_dir_snapshots(&prev_snap, &new_snap, &vnode_written, &vnode_attrib);
             prev_snap = new_snap;
             // Register new vnodes BEFORE completing any request so subsequent watches never miss mutations.
-            sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            needs_rescan = sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            next_rescan = needs_rescan.then(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
 
             if !changes.is_empty() {
                 let mut to_complete: Vec<(Arc<DirWatchRequest>, usize, usize)> = Vec::new();
@@ -9599,5 +9658,182 @@ mod tests {
             assert_eq!(teb::last_error(), err::ERROR_FILE_NOT_FOUND);
             assert_eq!(CloseHandle(cli), TRUE);
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn dir_watch_periodic_rescan_covers_files_beyond_vnode_fd_cap() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, WaitForSingleObject};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = std::env::temp_dir().join(format!("aw2_dirwatch_cap_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Populate 520 files (> MAX_WATCHED_VNODE_FDS = 512). `BTreeMap` orders lexicographically,
+        // so root (1) + `f_0000.txt`..`f_0510.txt` (511) exhaust MAX_WATCHED_VNODE_FDS and
+        // `z_omitted_target.txt` is deterministically omitted from kqueue vnode descriptors.
+        for i in 0..519 {
+            std::fs::write(dir.join(format!("f_{i:04}.txt")), b"a").unwrap();
+        }
+        let target_path = dir.join("z_omitted_target.txt");
+        std::fs::write(&target_path, b"init").unwrap();
+
+        // Preopen the writable target file before attaching watches so in-place writes never
+        // depend on spare per-process fds while the watcher holds up to MAX_WATCHED_VNODE_FDS.
+        let mut target_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+
+        path::add_mount("U:\\", &dir);
+        let win_dir = to_wide_z("U:\\");
+
+        let parse_notify_records = |buf: &[u8], len: usize| -> Vec<(u32, String)> {
+            let mut out = Vec::new();
+            let mut off = 0usize;
+            while off + 12 <= len {
+                let next = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let action = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+                let name_bytes = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as usize;
+                let units: Vec<u16> = buf[off + 12..off + 12 + name_bytes]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                out.push((action, String::from_utf16_lossy(&units)));
+                if next == 0 {
+                    break;
+                }
+                off += next;
+            }
+            out
+        };
+
+        unsafe {
+            // 1. ReadDirectoryChangesW: in-place updates on the deterministically omitted file
+            //    (no rename, no sibling creation) must deliver FILE_ACTION_MODIFIED for both
+            //    FILE_NOTIFY_CHANGE_SIZE and FILE_NOTIFY_CHANGE_LAST_WRITE via periodic rescan.
+            let h_dir = CreateFileW(
+                win_dir.as_ptr(),
+                GENERIC_READ,
+                0x7, // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | 0x4000_0000, // FILE_FLAG_OVERLAPPED
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_dir, INVALID_HANDLE_VALUE);
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+
+            // 1a. Size + LastWrite growth in-place.
+            let mut buf = [0u8; 4096];
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_dir,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    FILE_NOTIFY_CHANGE_SIZE,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"updated-size-payload").unwrap();
+            target_file.flush().unwrap();
+
+            assert_eq!(
+                WaitForSingleObject(ev, 3000),
+                WAIT_OBJECT_0,
+                "ReadDirectoryChangesW(SIZE) missed in-place update on file beyond vnode cap"
+            );
+            let mut got = 0u32;
+            assert_eq!(GetOverlappedResult(h_dir, &mut ov, &mut got, FALSE), TRUE);
+            let recs = parse_notify_records(&buf, got as usize);
+            assert!(
+                recs.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "z_omitted_target.txt"),
+                "expected FILE_ACTION_MODIFIED for z_omitted_target.txt (SIZE), got {recs:?}"
+            );
+
+            // 1b. Same-size in-place LastWrite update (no size change, no rename/create).
+            assert_eq!(ResetEvent(ev), TRUE);
+            buf.fill(0);
+            ov = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                ReadDirectoryChangesW(
+                    h_dir,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    FALSE,
+                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"UPDATED-SIZE-PAYLOAD").unwrap();
+            target_file.flush().unwrap();
+
+            assert_eq!(
+                WaitForSingleObject(ev, 3000),
+                WAIT_OBJECT_0,
+                "ReadDirectoryChangesW(LAST_WRITE) missed same-size in-place update beyond vnode cap"
+            );
+            got = 0;
+            assert_eq!(GetOverlappedResult(h_dir, &mut ov, &mut got, FALSE), TRUE);
+            let recs2 = parse_notify_records(&buf, got as usize);
+            assert!(
+                recs2.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "z_omitted_target.txt"),
+                "expected FILE_ACTION_MODIFIED for z_omitted_target.txt (LAST_WRITE), got {recs2:?}"
+            );
+
+            assert_eq!(CloseHandle(ev), TRUE);
+            assert_eq!(CloseHandle(h_dir), TRUE);
+            // Allow first watcher thread to exit and release its vnode fds before next watch.
+            std::thread::sleep(Duration::from_millis(50));
+
+            // 2. FindFirstChangeNotificationW sequentially for SIZE and LAST_WRITE on the same
+            //    omitted late-sort file.
+            let ch_size = FindFirstChangeNotificationW(win_dir.as_ptr(), FALSE, FILE_NOTIFY_CHANGE_SIZE);
+            assert_ne!(ch_size, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ch_size, 0), WAIT_TIMEOUT);
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"updated-size-payload-grown").unwrap();
+            target_file.flush().unwrap();
+            assert_eq!(
+                WaitForSingleObject(ch_size, 3000),
+                WAIT_OBJECT_0,
+                "FindFirstChangeNotificationW(SIZE) missed in-place growth beyond vnode cap"
+            );
+            assert_eq!(FindCloseChangeNotification(ch_size), TRUE);
+            std::thread::sleep(Duration::from_millis(50));
+
+            let ch_write = FindFirstChangeNotificationW(win_dir.as_ptr(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+            assert_ne!(ch_write, INVALID_HANDLE_VALUE);
+            assert_eq!(WaitForSingleObject(ch_write, 0), WAIT_TIMEOUT);
+            std::thread::sleep(Duration::from_millis(5));
+            target_file.seek(SeekFrom::Start(0)).unwrap();
+            target_file.write_all(b"UPDATED-SIZE-PAYLOAD-GROWN").unwrap();
+            target_file.flush().unwrap();
+            assert_eq!(
+                WaitForSingleObject(ch_write, 3000),
+                WAIT_OBJECT_0,
+                "FindFirstChangeNotificationW(LAST_WRITE) missed in-place write beyond vnode cap"
+            );
+            assert_eq!(FindCloseChangeNotification(ch_write), TRUE);
+        }
+
+        drop(target_file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
