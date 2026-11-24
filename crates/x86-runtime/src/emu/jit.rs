@@ -121,6 +121,9 @@ pub(super) struct JitScratch {
     pub mul: u64,
     /// Address of the executable-memory generation counter ([`crate::emu::mem::code_gen`]).
     pub codegen: usize,
+    /// Address of the shared sharded spinlock table ([`crate::emu::cpu::atomic_locks_ptr`])
+    /// for 16-byte-boundary-crossing LOCK operations.
+    pub atomic_locks: usize,
     /// Cached TEB self pointer (`gs:[0x30]`) for `%gs:` segment-prefixed memory accesses.
     pub teb: u64,
     /// `emu_run_full` context for [`super::jit_host_xfer`] (host calls made from translated
@@ -165,6 +168,7 @@ impl Default for JitScratch {
             table: 0,
             mul: 0,
             codegen: 0,
+            atomic_locks: super::cpu::atomic_locks_ptr(),
             teb: 0,
             ctx_sp: 0,
             ctx_blocks: 0,
@@ -798,6 +802,7 @@ const OFF_BUDGET: u32 = OFF_JX + offset_of!(JitScratch, budget) as u32;
 const OFF_TARGET: u32 = OFF_JX + offset_of!(JitScratch, target) as u32;
 const OFF_TABLE: u32 = OFF_JX + offset_of!(JitScratch, table) as u32;
 const OFF_CODEGEN: u32 = OFF_JX + offset_of!(JitScratch, codegen) as u32;
+const OFF_ATOMIC_LOCKS: u32 = OFF_JX + offset_of!(JitScratch, atomic_locks) as u32;
 const OFF_TEB: u32 = OFF_JX + offset_of!(JitScratch, teb) as u32;
 const OFF_RAS: u32 = OFF_JX + offset_of!(JitScratch, ras) as u32;
 const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
@@ -808,7 +813,9 @@ const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 #[cfg(test)]
 const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u32;
 const _: () = assert!(
-    OFF_AOTDIR % 8 == 0
+    OFF_ATOMIC_LOCKS % 8 == 0
+        && OFF_ATOMIC_LOCKS < 8 * 4096
+        && OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096
         && OFF_TSC_MODE < 4096

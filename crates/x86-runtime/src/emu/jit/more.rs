@@ -57,20 +57,38 @@ impl Asm {
     pub(super) fn v_fcvtn_h(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0E21_6800 | (q as u32) << 30 | vn << 5 | vd);
     }
-    pub(super) fn ldaxr(&mut self, bits: u32, rt: u32, rn: u32) {
+    pub(super) fn ldaddal(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
         let sz = (bits / 8).trailing_zeros();
-        self.emit(0x085F_FC00 | sz << 30 | rn << 5 | rt);
+        self.emit(0x38E0_0000 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
-    pub(super) fn stlxr(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+    pub(super) fn ldclral(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
         let sz = (bits / 8).trailing_zeros();
-        self.emit(0x0800_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
+        self.emit(0x38E0_1000 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
-    pub(super) fn ldaxp_x(&mut self, rt: u32, rt2: u32, rn: u32) {
-        self.emit(0xC87F_8000 | rt2 << 10 | rn << 5 | rt);
+    pub(super) fn ldeoral(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x38E0_2000 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
-    pub(super) fn stlxp_x(&mut self, rs: u32, rt: u32, rt2: u32, rn: u32) {
-        self.emit(0xC820_8000 | rs << 16 | rt2 << 10 | rn << 5 | rt);
+    pub(super) fn ldsetal(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x38E0_3000 | sz << 30 | rs << 16 | rn << 5 | rt);
     }
+    pub(super) fn swpal(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x38E0_8000 | sz << 30 | rs << 16 | rn << 5 | rt);
+    }
+    pub(super) fn casal(&mut self, bits: u32, rs: u32, rt: u32, rn: u32) {
+        let sz = (bits / 8).trailing_zeros();
+        self.emit(0x08E0_FC00 | sz << 30 | rs << 16 | rn << 5 | rt);
+    }
+    pub(super) fn caspal_x(&mut self, rs: u32, rt: u32, rn: u32) {
+        debug_assert!(rs % 2 == 0 && rt % 2 == 0, "caspal register pair must be even");
+        self.emit(0x4860_FC00 | rs << 16 | rn << 5 | rt);
+    }
+    pub(super) fn yield_hint(&mut self) {
+        self.emit(0xD503_203F);
+    }
+    #[cfg(test)]
     pub(super) fn clrex(&mut self) {
         self.emit(0xD503_3F5F);
     }
@@ -1267,6 +1285,54 @@ impl Tr<'_> {
         }
     }
 
+    /// Branch to the 16-byte-boundary-crossing slow path iff `[XA .. XA + bytes)` crosses a
+    /// 16-byte granule boundary. Preserves NZCV; clobbers only `XS`. Returns `None` for 1-byte
+    /// accesses, which can never cross a 16-byte boundary.
+    fn emit_cross16_branch(&mut self, bytes: u32) -> Option<usize> {
+        match bytes {
+            1 => None,
+            16 => {
+                self.a.logic_ri(false, 0, XS, XA, enc_logic_imm(15, false).unwrap());
+                Some(self.a.cbnz(false, XS))
+            }
+            _ => {
+                self.a.logic_ri(false, 0, XS, XA, enc_logic_imm(15, false).unwrap());
+                self.a.addsub_ri(false, false, false, XS, XS, bytes - 1, false);
+                self.a.lsr_i(false, XS, XS, 4);
+                Some(self.a.cbnz(false, XS))
+            }
+        }
+    }
+
+    /// Acquire the sharded spinlock for 16-byte-crossing LOCK ops starting in granule `XA >> 4`.
+    /// Writes the lock pointer into `lock_reg` (caller unlocks via `self.a.stlr(32, ZR, lock_reg)`).
+    /// Clobbers only `lock_reg`, `tmp1`, `tmp2`; preserves NZCV.
+    fn emit_shard_lock_acquire(&mut self, lock_reg: u32, tmp1: u32, tmp2: u32) {
+        self.a.ubfx(tmp1, XA, 4, crate::emu::cpu::ATOMIC_LOCK_SHARD_BITS);
+        self.a.ldr(64, lock_reg, XCPU, OFF_ATOMIC_LOCKS);
+        self.a.addsub_rr(
+            true,
+            false,
+            false,
+            lock_reg,
+            lock_reg,
+            tmp1,
+            crate::emu::cpu::ATOMIC_LOCK_STRIDE_SHIFT,
+        );
+        self.a.movz(false, tmp2, 1, 0);
+        let try_lock = self.a.pos;
+        self.a.swpal(32, tmp2, tmp1, lock_reg);
+        let got = self.a.cbz(false, tmp1);
+        let spin = self.a.pos;
+        self.a.yield_hint();
+        self.a.ldr(32, tmp1, lock_reg, 0);
+        let still_locked = self.a.cbnz(false, tmp1);
+        self.a.patch(still_locked, spin);
+        let retry = self.a.b();
+        self.a.patch(retry, try_lock);
+        self.a.bind(got);
+    }
+
     pub(super) fn emit_atomic_op(&mut self, k: usize, op: &FastOp) {
         let sub = op.x & 0x3F;
         let wb = op.w as u32;
@@ -1290,58 +1356,79 @@ impl Tr<'_> {
                 } else if matches!(sub, 0..=4 | 13 | 14) {
                     self.a.mov_rr(true, T1, g(op.r1));
                 }
-                let align_mask = (wb / 8 - 1) as u64;
-                let unaligned = if wb > 8 {
-                    self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
-                    Some(self.a.cbnz(true, XS))
-                } else {
-                    None
-                };
-                let retry = self.a.pos;
-                self.a.ldaxr(wb, T0, XA);
+                let x = wb == 64;
+                let cross = self.emit_cross16_branch(wb / 8);
+                // Fast path: single-instruction LSE atomics (FEAT_LSE2 supports misaligned
+                // addresses inside a 16-byte granule with single-copy atomicity).
                 match sub {
-                    0 | 14 => self.a.addsub_rr(wb == 64, false, false, T2, T0, T1, 0),
-                    1 => self.a.addsub_rr(wb == 64, true, false, T2, T0, T1, 0),
-                    2 => self.a.logic_rr(wb == 64, 0, T2, T0, T1, 0, 0),
-                    3 => self.a.logic_rr(wb == 64, 1, T2, T0, T1, 0, 0),
-                    4 => self.a.logic_rr(wb == 64, 2, T2, T0, T1, 0, 0),
-                    5 => self.a.addsub_ri(wb == 64, false, false, T2, T0, 1, false),
-                    6 => self.a.addsub_ri(wb == 64, true, false, T2, T0, 1, false),
-                    7 => self.a.emit(sf(wb == 64) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
-                    8 => self.a.addsub_rr(wb == 64, true, false, T2, ZR, T0, 0),
-                    _ => self.a.mov_rr(wb == 64, T2, T1), // xchg
-                }
-                self.a.stlxr(wb, T3, T2, XA);
-                let fail = self.a.cbnz(false, T3);
-                self.a.patch(fail, retry);
-                if let Some(u_fix) = unaligned {
-                    let done = self.a.b();
-                    self.a.bind(u_fix);
-                    self.a.ldr(wb, T0, XA, 0);
-                    self.a.dmb_ishld();
-                    match sub {
-                        0 | 14 => self.a.addsub_rr(wb == 64, false, false, T2, T0, T1, 0),
-                        1 => self.a.addsub_rr(wb == 64, true, false, T2, T0, T1, 0),
-                        2 => self.a.logic_rr(wb == 64, 0, T2, T0, T1, 0, 0),
-                        3 => self.a.logic_rr(wb == 64, 1, T2, T0, T1, 0, 0),
-                        4 => self.a.logic_rr(wb == 64, 2, T2, T0, T1, 0, 0),
-                        5 => self.a.addsub_ri(wb == 64, false, false, T2, T0, 1, false),
-                        6 => self.a.addsub_ri(wb == 64, true, false, T2, T0, 1, false),
-                        7 => self.a.emit(sf(wb == 64) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
-                        8 => self.a.addsub_rr(wb == 64, true, false, T2, ZR, T0, 0),
-                        _ => self.a.mov_rr(wb == 64, T2, T1),
+                    0 | 14 => self.a.ldaddal(wb, T1, T0, XA),
+                    1 => {
+                        self.a.addsub_rr(x, true, false, T2, ZR, T1, 0);
+                        self.a.ldaddal(wb, T2, T0, XA);
                     }
-                    self.a.dmb_ish();
+                    2 => {
+                        self.a.emit(sf(x) | 0x2A20_03E0 | T1 << 16 | 31 << 5 | T2);
+                        self.a.ldclral(wb, T2, T0, XA);
+                    }
+                    3 => self.a.ldsetal(wb, T1, T0, XA),
+                    4 => self.a.ldeoral(wb, T1, T0, XA),
+                    5 => {
+                        self.a.movz(x, T2, 1, 0);
+                        self.a.ldaddal(wb, T2, T0, XA);
+                    }
+                    6 => {
+                        self.a.movn(x, T2, 0, 0);
+                        self.a.ldaddal(wb, T2, T0, XA);
+                    }
+                    7 => {
+                        self.a.movn(x, T2, 0, 0);
+                        self.a.ldeoral(wb, T2, T0, XA);
+                    }
+                    8 => {
+                        self.a.ldr(wb, T0, XA, 0);
+                        let retry = self.a.pos;
+                        self.a.mov_rr(x, T3, T0);
+                        self.a.addsub_rr(x, true, false, T2, ZR, T0, 0);
+                        self.a.casal(wb, T0, T2, XA);
+                        self.a.addsub_rr(x, true, true, ZR, T0, T3, 0);
+                        let fail = self.a.bcond(NE);
+                        self.a.patch(fail, retry);
+                    }
+                    _ => self.a.swpal(wb, T1, T0, XA), // 13: xchg
+                }
+                if let Some(cross) = cross {
+                    let done = self.a.b();
+                    self.a.bind(cross);
+                    self.emit_shard_lock_acquire(XS, T5, T6);
+                    self.a.ldr(wb, T0, XA, 0);
+                    match sub {
+                        0 | 14 => self.a.addsub_rr(x, false, false, T2, T0, T1, 0),
+                        1 => self.a.addsub_rr(x, true, false, T2, T0, T1, 0),
+                        2 => self.a.logic_rr(x, 0, T2, T0, T1, 0, 0),
+                        3 => self.a.logic_rr(x, 1, T2, T0, T1, 0, 0),
+                        4 => self.a.logic_rr(x, 2, T2, T0, T1, 0, 0),
+                        5 => self.a.addsub_ri(x, false, false, T2, T0, 1, false),
+                        6 => self.a.addsub_ri(x, true, false, T2, T0, 1, false),
+                        7 => self.a.emit(sf(x) | 0x2A20_03E0 | T0 << 16 | 31 << 5 | T2),
+                        8 => self.a.addsub_rr(x, true, false, T2, ZR, T0, 0),
+                        _ => self.a.mov_rr(x, T2, T1),
+                    }
                     self.a.str(wb, T2, XA, 0);
+                    self.a.stlr(32, ZR, XS);
                     self.a.bind(done);
                 }
+                self.a.dmb_ish();
                 if matches!(sub, 13 | 14) {
                     self.wr_gpr(op.r1, op.w, T0);
                 }
                 if !matches!(sub, 7 | 13) {
+                    if sub == 3 {
+                        self.a.logic_rr(x, 1, T2, T0, T1, 0, 0);
+                    } else if sub == 4 {
+                        self.a.logic_rr(x, 2, T2, T0, T1, 0, 0);
+                    }
                     let sh = 64 - wb;
                     if wb >= 32 {
-                        let x = wb == 64;
                         match sub {
                             0 | 14 => self.a.addsub_rr(x, false, true, T5, T0, T1, 0),
                             1 => self.a.addsub_rr(x, true, true, T5, T0, T1, 0),
@@ -1376,7 +1463,14 @@ impl Tr<'_> {
                         }
                     }
                     if la & FP != 0 {
-                        self.a.str(8, T2, XCPU, OFF_PFV);
+                        if matches!(sub, 3 | 4) {
+                            self.a.str(8, T2, XCPU, OFF_PFV);
+                        } else if wb >= 32 {
+                            self.a.str(8, T5, XCPU, OFF_PFV);
+                        } else {
+                            self.a.lsr_i(true, T2, T5, sh);
+                            self.a.str(8, T2, XCPU, OFF_PFV);
+                        }
                     }
                     if matches!(sub, 5 | 6) {
                         self.fs.mem &= !(FZ | FS | FO | FP);
@@ -1426,37 +1520,27 @@ impl Tr<'_> {
                 } else {
                     self.a.movz(true, T4, 1, 0);
                     self.a.shiftv(true, 8, T4, T4, T1);
-                    let align_mask = (wb / 8 - 1) as u64;
-                    let unaligned = if wb > 8 {
-                        self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
-                        Some(self.a.cbnz(true, XS))
-                    } else {
-                        None
-                    };
-                    let retry = self.a.pos;
-                    self.a.ldaxr(wb, T0, XA);
+                    let cross = self.emit_cross16_branch(wb / 8);
                     match sub {
-                        10 => self.a.logic_rr(true, 1, T2, T0, T4, 0, 0),
-                        11 => self.a.bic_rr(true, T2, T0, T4),
-                        _ => self.a.logic_rr(true, 2, T2, T0, T4, 0, 0),
+                        10 => self.a.ldsetal(wb, T4, T0, XA),
+                        11 => self.a.ldclral(wb, T4, T0, XA),
+                        _ => self.a.ldeoral(wb, T4, T0, XA),
                     }
-                    self.a.stlxr(wb, T3, T2, XA);
-                    let fail = self.a.cbnz(false, T3);
-                    self.a.patch(fail, retry);
-                    if let Some(u_fix) = unaligned {
+                    if let Some(cross) = cross {
                         let done = self.a.b();
-                        self.a.bind(u_fix);
+                        self.a.bind(cross);
+                        self.emit_shard_lock_acquire(XS, T5, T6);
                         self.a.ldr(wb, T0, XA, 0);
-                        self.a.dmb_ishld();
                         match sub {
                             10 => self.a.logic_rr(true, 1, T2, T0, T4, 0, 0),
                             11 => self.a.bic_rr(true, T2, T0, T4),
                             _ => self.a.logic_rr(true, 2, T2, T0, T4, 0, 0),
                         }
-                        self.a.dmb_ish();
                         self.a.str(wb, T2, XA, 0);
+                        self.a.stlr(32, ZR, XS);
                         self.a.bind(done);
                     }
+                    self.a.dmb_ish();
                     self.a.shiftv(true, 9, T3, T0, T1);
                     self.a.ubfx(T3, T3, 0, 1);
                     self.a.str(8, T3, XCPU, OFF_CF);
@@ -1467,15 +1551,29 @@ impl Tr<'_> {
             15 => {
                 // cmpxchg [mem], r1
                 self.a.mov_rr(true, T1, g(op.r1));
-                let align_mask = (wb / 8 - 1) as u64;
-                let unaligned = if wb > 8 {
-                    self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(align_mask, true).unwrap());
-                    Some(self.a.cbnz(true, XS))
-                } else {
-                    None
-                };
-                let retry = self.a.pos;
-                self.a.ldaxr(wb, T0, XA);
+                let cross = self.emit_cross16_branch(wb / 8);
+                self.a.mov_rr(wb == 64, T0, g(0));
+                self.a.casal(wb, T0, T1, XA);
+                if let Some(cross) = cross {
+                    let done = self.a.b();
+                    self.a.bind(cross);
+                    self.emit_shard_lock_acquire(XS, T5, T6);
+                    self.a.ldr(wb, T0, XA, 0);
+                    if wb == 64 {
+                        self.a.addsub_rr(true, true, true, ZR, g(0), T0, 0);
+                    } else if wb == 32 {
+                        self.a.addsub_rr(false, true, true, ZR, g(0), T0, 0);
+                    } else {
+                        self.a.ubfm(false, T3, g(0), 0, wb - 1);
+                        self.a.addsub_rr(false, true, true, ZR, T3, T0, 0);
+                    }
+                    let no_store = self.a.bcond(NE);
+                    self.a.str(wb, T1, XA, 0);
+                    self.a.bind(no_store);
+                    self.a.stlr(32, ZR, XS);
+                    self.a.bind(done);
+                }
+                self.a.dmb_ish();
                 let sh = 64 - wb;
                 if wb == 64 {
                     self.a.addsub_rr(true, true, true, T2, g(0), T0, 0);
@@ -1487,39 +1585,9 @@ impl Tr<'_> {
                     self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
                     self.a.lsr_i(true, T2, T5, sh);
                 }
-                let mismatch = self.a.bcond(NE);
-                self.a.stlxr(wb, T3, T1, XA);
-                let fail = self.a.cbnz(false, T3);
-                self.a.patch(fail, retry);
-                let done = self.a.b();
-                self.a.bind(mismatch);
-                self.a.clrex();
+                let matched = self.a.bcond(EQ);
                 self.wr_gpr(0, op.w, T0);
-                if let Some(u_fix) = unaligned {
-                    let after_u = self.a.b();
-                    self.a.bind(u_fix);
-                    self.a.ldr(wb, T0, XA, 0);
-                    self.a.dmb_ishld();
-                    if wb == 64 {
-                        self.a.addsub_rr(true, true, true, T2, g(0), T0, 0);
-                    } else if wb == 32 {
-                        self.a.addsub_rr(false, true, true, T2, g(0), T0, 0);
-                    } else {
-                        self.a.lsl_i(true, T3, g(0), sh);
-                        self.a.lsl_i(true, T4, T0, sh);
-                        self.a.addsub_rr(true, true, true, T5, T3, T4, 0);
-                        self.a.lsr_i(true, T2, T5, sh);
-                    }
-                    let u_mis = self.a.bcond(NE);
-                    self.a.dmb_ish();
-                    self.a.str(wb, T1, XA, 0);
-                    let u_done = self.a.b();
-                    self.a.bind(u_mis);
-                    self.wr_gpr(0, op.w, T0);
-                    self.a.bind(u_done);
-                    self.a.bind(after_u);
-                }
-                self.a.bind(done);
+                self.a.bind(matched);
                 if la & FP != 0 {
                     self.a.str(8, T2, XCPU, OFF_PFV);
                 }
@@ -1538,85 +1606,72 @@ impl Tr<'_> {
                 self.a.ubfm(true, T1, g(3), 0, 31);
                 self.a.lsl_i(true, T2, g(1), 32);
                 self.a.logic_rr(true, 1, T1, T1, T2, 0, 0); // desired = ecx:ebx
-                self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(7, true).unwrap());
-                let unaligned = self.a.cbnz(true, XS);
-                let retry = self.a.pos;
-                self.a.ldaxr(64, T2, XA);
-                self.a.addsub_rr(true, true, true, ZR, T2, T0, 0);
-                let mismatch = self.a.bcond(NE);
-                self.a.stlxr(64, T3, T1, XA);
-                let fail = self.a.cbnz(false, T3);
-                self.a.patch(fail, retry);
-                self.a.movz(false, T4, 1, 0);
-                self.a.str(8, T4, XCPU, OFF_ZF);
+                let cross = self.emit_cross16_branch(8).unwrap();
+                self.a.mov_rr(true, T2, T0);
+                self.a.casal(64, T2, T1, XA);
                 let done = self.a.b();
-                self.a.bind(mismatch);
-                self.a.clrex();
-                let store_actual = self.a.b();
-                self.a.bind(unaligned);
+                self.a.bind(cross);
+                self.emit_shard_lock_acquire(XS, T5, T6);
                 self.a.ldr(64, T2, XA, 0);
-                self.a.dmb_ishld();
-                self.a.addsub_rr(true, true, true, ZR, T2, T0, 0);
-                let u_mis = self.a.bcond(NE);
-                self.a.dmb_ish();
+                self.a.logic_rr(true, 2, T3, T2, T0, 0, 0);
+                let no_store = self.a.cbnz(true, T3);
                 self.a.str(64, T1, XA, 0);
+                self.a.bind(no_store);
+                self.a.stlr(32, ZR, XS);
+                self.a.bind(done);
+                self.a.dmb_ish();
+                self.a.logic_rr(true, 2, T3, T2, T0, 0, 0);
+                let mismatch = self.a.cbnz(true, T3);
                 self.a.movz(false, T4, 1, 0);
                 self.a.str(8, T4, XCPU, OFF_ZF);
-                let u_done = self.a.b();
-                self.a.bind(u_mis);
-                self.a.bind(store_actual);
+                let after = self.a.b();
+                self.a.bind(mismatch);
                 self.a.mov_rr(false, g(0), T2);
                 self.a.lsr_i(true, g(2), T2, 32);
                 self.set_lb(0, 32);
                 self.set_lb(2, 32);
                 self.a.str(8, ZR, XCPU, OFF_ZF);
-                self.a.bind(u_done);
-                self.a.bind(done);
+                self.a.bind(after);
                 self.fs.host &= !FZ;
                 self.fs.mem |= FZ;
             }
             _ => {
                 // cmpxchg16b [mem]
-                self.a.logic_ri(true, 0, XS, XA, enc_logic_imm(15, true).unwrap());
-                let unaligned = self.a.cbnz(true, XS);
-                let retry = self.a.pos;
-                self.a.ldaxp_x(T0, T1, XA);
+                let cross = self.emit_cross16_branch(16).unwrap();
+                self.a.mov_rr(true, T0, g(0));
+                self.a.mov_rr(true, T1, g(2));
+                self.a.mov_rr(true, T2, g(3));
+                self.a.mov_rr(true, T3, g(1));
+                self.a.caspal_x(T0, T2, XA);
+                let done = self.a.b();
+                self.a.bind(cross);
+                self.emit_shard_lock_acquire(XS, T5, T6);
+                self.a.ldr(64, T0, XA, 0);
+                self.a.ldr(64, T1, XA, 8);
+                self.a.logic_rr(true, 2, T2, T0, g(0), 0, 0);
+                self.a.logic_rr(true, 2, T3, T1, g(2), 0, 0);
+                self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
+                let no_store = self.a.cbnz(true, T2);
+                self.a.str(64, g(3), XA, 0);
+                self.a.str(64, g(1), XA, 8);
+                self.a.bind(no_store);
+                self.a.stlr(32, ZR, XS);
+                self.a.bind(done);
+                self.a.dmb_ish();
                 self.a.logic_rr(true, 2, T2, T0, g(0), 0, 0);
                 self.a.logic_rr(true, 2, T3, T1, g(2), 0, 0);
                 self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
                 let mismatch = self.a.cbnz(true, T2);
-                self.a.stlxp_x(T4, g(3), g(1), XA);
-                let fail = self.a.cbnz(false, T4);
-                self.a.patch(fail, retry);
                 self.a.movz(false, T4, 1, 0);
                 self.a.str(8, T4, XCPU, OFF_ZF);
-                let done = self.a.b();
+                let after = self.a.b();
                 self.a.bind(mismatch);
-                self.a.clrex();
-                let store_actual = self.a.b();
-                self.a.bind(unaligned);
-                self.a.ldr(64, T0, XA, 0);
-                self.a.ldr(64, T1, XA, 8);
-                self.a.dmb_ishld();
-                self.a.logic_rr(true, 2, T2, T0, g(0), 0, 0);
-                self.a.logic_rr(true, 2, T3, T1, g(2), 0, 0);
-                self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
-                let u_mis = self.a.cbnz(true, T2);
-                self.a.dmb_ish();
-                self.a.str(64, g(3), XA, 0);
-                self.a.str(64, g(1), XA, 8);
-                self.a.movz(false, T4, 1, 0);
-                self.a.str(8, T4, XCPU, OFF_ZF);
-                let u_done = self.a.b();
-                self.a.bind(u_mis);
-                self.a.bind(store_actual);
                 self.a.mov_rr(true, g(0), T0);
                 self.a.mov_rr(true, g(2), T1);
                 self.set_lb(0, 64);
                 self.set_lb(2, 64);
                 self.a.str(8, ZR, XCPU, OFF_ZF);
-                self.a.bind(u_done);
-                self.a.bind(done);
+                self.a.bind(after);
                 self.fs.host &= !FZ;
                 self.fs.mem |= FZ;
             }

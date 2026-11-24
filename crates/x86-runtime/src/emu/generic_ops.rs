@@ -645,7 +645,7 @@ impl Cpu {
                 } else {
                     let expected = ((cpu.gpr[2] as u128) << 64) | (cpu.gpr[0] as u128);
                     let desired = ((cpu.gpr[1] as u128) << 64) | (cpu.gpr[3] as u128);
-                    let fast = if addr & 15 == 0 && (0x1_0000..0x8000_0000_0000).contains(&addr) {
+                    let fast = if addr & 15 == 0 && crate::emu::regfile_ext::is_valid_guest_range(addr, 16) {
                         cas128_full(addr, expected, desired)
                     } else {
                         None
@@ -653,12 +653,12 @@ impl Cpu {
                     let actual = if let Some(a) = fast {
                         a
                     } else {
-                        static CMPXCHG16B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-                        let _g = CMPXCHG16B_LOCK.lock().unwrap();
+                        let _g = super::cpu::lock_atomic_shard(addr);
                         let actual = cpu.read_u128(addr);
                         if actual == expected {
                             cpu.write_u128(addr, desired);
                         }
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                         actual
                     };
                     if actual == expected {
