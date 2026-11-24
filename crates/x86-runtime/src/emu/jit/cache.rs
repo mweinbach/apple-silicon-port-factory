@@ -203,6 +203,11 @@ impl Lse2Region {
 static LSE2_REGIONS: [Lse2Region; MAX_LSE2_REGIONS] = [const { Lse2Region::new() }; MAX_LSE2_REGIONS];
 /// High-water mark of ever-used slots in `LSE2_REGIONS` (`<= MAX_LSE2_REGIONS`).
 static LSE2_REGION_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TOTAL_JIT_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn total_jit_blocks_compiled() -> u64 {
+    TOTAL_JIT_BLOCKS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Register `[code_lo, code_hi)` with paired patch slab `[slab_lo, slab_hi)` (same `MAP_JIT`
 /// mapping, within ±128 MiB). Claims any FREE slot (recycling slots released via
@@ -959,6 +964,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
@@ -1057,6 +1063,7 @@ impl JitCache {
         cpu.jx.table = self.index.as_ptr() as usize;
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
+        cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.
@@ -1363,6 +1370,7 @@ impl JitCache {
             crate::emu::aot::profile_note(ip);
         }
         self.translated += 1;
+        TOTAL_JIT_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if self.translated.is_power_of_two() && self.translated >= 1024 {
             log::info!(
                 "emu jit: {} blocks translated on this thread ({} KiB code, {} flushes, {} ms compiling)",

@@ -71,13 +71,43 @@ const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 pub const VK_MAX_EXTENSION_NAME_SIZE: usize = 256;
 pub const VK_KHR_WIN32_SURFACE_SPEC_VERSION: u32 = 6;
 
+pub const VK_SUBOPTIMAL_KHR: i32 = 1_000_001_003;
+
 pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
 pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
+const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
+const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
+const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: u32 = 8;
+const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
+const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
+const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
+const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
+const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: u32 = 45;
 pub const VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR: u32 = 1_000_009_000;
 pub const VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK: u32 = 1_000_123_000;
 pub const VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT: u32 = 1_000_217_000;
+
+const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
+const VK_IMAGE_ASPECT_COLOR_BIT: u32 = 0x0000_0001;
+const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
+const VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: u32 = 1_000_001_002;
+const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
+const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x0000_0002;
+const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x0000_0004;
+const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x0000_1000;
+const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x0000_2000;
+const VK_ACCESS_TRANSFER_READ_BIT: u32 = 0x0000_0800;
+const VK_QUEUE_FAMILY_IGNORED: u32 = !0u32;
+const VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: u32 = 0x0000_0001;
+
+const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37;
+const VK_FORMAT_R8G8B8A8_SRGB: u32 = 43;
+const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
+const VK_FORMAT_B8G8R8A8_SRGB: u32 = 50;
+const VK_FORMAT_A2B10G10R10_UNORM_PACK32: u32 = 64;
+const VK_FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 
 pub const VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR: u32 = 0x0000_0001;
 
@@ -313,9 +343,217 @@ fn live_instances() -> &'static Mutex<HashMap<usize, InstanceProcs>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn live_devices() -> &'static Mutex<HashSet<usize>> {
-    static SET: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    SET.get_or_init(|| Mutex::new(HashSet::new()))
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkSwapchainCreateInfoKHR {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    surface: u64,
+    min_image_count: u32,
+    image_format: u32,
+    image_color_space: u32,
+    image_extent_width: u32,
+    image_extent_height: u32,
+    image_array_layers: u32,
+    image_usage: u32,
+    image_sharing_mode: u32,
+    queue_family_index_count: u32,
+    p_queue_family_indices: *const u32,
+    pre_transform: u32,
+    composite_alpha: u32,
+    present_mode: u32,
+    clipped: u32,
+    old_swapchain: u64,
+}
+const _: () = assert!(std::mem::size_of::<VkSwapchainCreateInfoKHR>() == 104);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkPresentInfoKHR {
+    s_type: u32,
+    p_next: *const c_void,
+    wait_semaphore_count: u32,
+    p_wait_semaphores: *const u64,
+    swapchain_count: u32,
+    p_swapchains: *const u64,
+    p_image_indices: *const u32,
+    p_results: *mut i32,
+}
+const _: () = assert!(std::mem::size_of::<VkPresentInfoKHR>() == 64);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkBufferCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    size: u64,
+    usage: u32,
+    sharing_mode: u32,
+    queue_family_index_count: u32,
+    p_queue_family_indices: *const u32,
+}
+const _: () = assert!(std::mem::size_of::<VkBufferCreateInfo>() == 56);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkMemoryAllocateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    allocation_size: u64,
+    memory_type_index: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkMemoryAllocateInfo>() == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkCommandPoolCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    queue_family_index: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkCommandPoolCreateInfo>() == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkCommandBufferAllocateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    command_pool: u64,
+    level: u32,
+    command_buffer_count: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkCommandBufferAllocateInfo>() == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkCommandBufferBeginInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    p_inheritance_info: *const c_void,
+}
+const _: () = assert!(std::mem::size_of::<VkCommandBufferBeginInfo>() == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkFenceCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkFenceCreateInfo>() == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkImageMemoryBarrier {
+    s_type: u32,
+    p_next: *const c_void,
+    src_access_mask: u32,
+    dst_access_mask: u32,
+    old_layout: u32,
+    new_layout: u32,
+    src_queue_family_index: u32,
+    dst_queue_family_index: u32,
+    image: u64,
+    aspect_mask: u32,
+    base_mip_level: u32,
+    level_count: u32,
+    base_array_layer: u32,
+    layer_count: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkImageMemoryBarrier>() == 72);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkBufferImageCopy {
+    buffer_offset: u64,
+    buffer_row_length: u32,
+    buffer_image_height: u32,
+    aspect_mask: u32,
+    mip_level: u32,
+    base_array_layer: u32,
+    layer_count: u32,
+    offset_x: i32,
+    offset_y: i32,
+    offset_z: i32,
+    extent_width: u32,
+    extent_height: u32,
+    extent_depth: u32,
+}
+const _: () = assert!(std::mem::size_of::<VkBufferImageCopy>() == 56);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkSubmitInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    wait_semaphore_count: u32,
+    p_wait_semaphores: *const u64,
+    p_wait_dst_stage_mask: *const u32,
+    command_buffer_count: u32,
+    p_command_buffers: *const usize,
+    signal_semaphore_count: u32,
+    p_signal_semaphores: *const u64,
+}
+const _: () = assert!(std::mem::size_of::<VkSubmitInfo>() == 72);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkMemoryType {
+    property_flags: u32,
+    heap_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkMemoryHeap {
+    size: u64,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VkPhysicalDeviceMemoryProperties {
+    memory_type_count: u32,
+    memory_types: [VkMemoryType; 32],
+    memory_heap_count: u32,
+    memory_heaps: [VkMemoryHeap; 16],
+}
+const _: () = assert!(std::mem::size_of::<VkPhysicalDeviceMemoryProperties>() == 520);
+
+fn live_devices() -> &'static Mutex<HashMap<usize, usize>> {
+    static MAP: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy)]
+struct QueueRecord {
+    device: usize,
+    family_index: u32,
+}
+
+fn live_queues() -> &'static Mutex<HashMap<usize, QueueRecord>> {
+    static MAP: OnceLock<Mutex<HashMap<usize, QueueRecord>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct SwapchainRecord {
+    device: usize,
+    hwnd: usize,
+    width: u32,
+    height: u32,
+    format: u32,
+    usage: u32,
+    images: Vec<u64>,
+}
+
+fn live_swapchains() -> &'static Mutex<HashMap<u64, SwapchainRecord>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, SwapchainRecord>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 struct SurfaceRecord {
@@ -672,7 +910,7 @@ impl VulkanBackend {
             if let Some(p) = self.dlsym_ptr(sym) {
                 return Some(p);
             }
-            let dev = live_devices().lock().unwrap().iter().next().copied();
+            let dev = live_devices().lock().unwrap().keys().next().copied();
             if let Some(d) = dev {
                 let p = self.device_proc_raw(d, sym.as_ptr());
                 if !p.is_null() {
@@ -1821,7 +2059,7 @@ pub unsafe extern "win64" fn vkCreateDevice(
     let res = f(physical_device, &translated, sanitize_allocator(allocator), &mut out);
     std::ptr::write_unaligned(device, out);
     if res == VK_SUCCESS && out != 0 {
-        live_devices().lock().unwrap().insert(out);
+        live_devices().lock().unwrap().insert(out, physical_device);
     }
     res
 }
@@ -1831,6 +2069,8 @@ pub unsafe extern "win64" fn vkDestroyDevice(device: usize, allocator: *const c_
         return;
     }
     live_devices().lock().unwrap().remove(&device);
+    live_queues().lock().unwrap().retain(|_, rec| rec.device != device);
+    live_swapchains().lock().unwrap().retain(|_, rec| rec.device != device);
     let Some(vk) = vulkan_backend() else {
         return;
     };
@@ -2323,6 +2563,15 @@ pub unsafe extern "win64" fn vkGetDeviceQueue(
         let f: unsafe extern "C" fn(usize, u32, u32, *mut usize) = std::mem::transmute(ptr);
         let mut q = 0usize;
         f(device, queue_family_idx, queue_idx, &mut q);
+        if q != 0 {
+            live_queues().lock().unwrap().insert(
+                q,
+                QueueRecord {
+                    device,
+                    family_index: queue_family_idx,
+                },
+            );
+        }
         std::ptr::write_unaligned(p_queue, q);
     }
 }
@@ -2585,14 +2834,58 @@ pub unsafe extern "win64" fn vkCreateSwapchainKHR(
     let Some(ptr) = vk.device_proc_ptr(device, c"vkCreateSwapchainKHR") else {
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     };
-    // VkSwapchainCreateInfoKHR::surface sits at byte offset 24 (after sType[4]+pad[4], pNext[8], flags[4]+pad[4]).
-    let surface = std::ptr::read_unaligned((create_info as *const u8).add(24) as *const u64);
-    sync_surface_layer(surface);
-    let f: unsafe extern "C" fn(usize, *const c_void, *const c_void, *mut u64) -> i32 =
-        std::mem::transmute(ptr);
+    let mut info = std::ptr::read_unaligned(create_info as *const VkSwapchainCreateInfoKHR);
+    sync_surface_layer(info.surface);
+
+    // Ensure `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` is enabled whenever the surface supports it
+    // so on-demand `PORT_CONTROL_DIR` `shot` captures can read back swapchain images natively.
+    if info.image_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT == 0 {
+        let phys = live_devices().lock().unwrap().get(&device).copied().unwrap_or(0);
+        if phys != 0 {
+            if let Some(caps_ptr) =
+                vk.any_instance_or_dlsym_ptr(c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+            {
+                let get_caps: unsafe extern "C" fn(usize, u64, *mut [u32; 13]) -> i32 =
+                    std::mem::transmute(caps_ptr);
+                let mut caps = [0u32; 13];
+                if get_caps(phys, info.surface, &mut caps) == VK_SUCCESS
+                    && (caps[12] & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0
+                {
+                    info.image_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                }
+            }
+        }
+    }
+
+    let f: unsafe extern "C" fn(
+        usize,
+        *const VkSwapchainCreateInfoKHR,
+        *const c_void,
+        *mut u64,
+    ) -> i32 = std::mem::transmute(ptr);
     let mut out = 0u64;
-    let res = f(device, create_info, sanitize_allocator(allocator), &mut out);
+    let res = f(device, &info, sanitize_allocator(allocator), &mut out);
     std::ptr::write_unaligned(swapchain, out);
+    if res == VK_SUCCESS && out != 0 {
+        let hwnd = live_surfaces()
+            .lock()
+            .unwrap()
+            .get(&info.surface)
+            .map(|s| s.hwnd)
+            .unwrap_or(0);
+        live_swapchains().lock().unwrap().insert(
+            out,
+            SwapchainRecord {
+                device,
+                hwnd,
+                width: info.image_extent_width,
+                height: info.image_extent_height,
+                format: info.image_format,
+                usage: info.image_usage,
+                images: Vec::new(),
+            },
+        );
+    }
     res
 }
 
@@ -2604,6 +2897,7 @@ pub unsafe extern "win64" fn vkDestroySwapchainKHR(
     if device == 0 || swapchain == 0 {
         return;
     }
+    live_swapchains().lock().unwrap().remove(&swapchain);
     let Some(vk) = vulkan_backend() else {
         return;
     };
@@ -2638,6 +2932,15 @@ pub unsafe extern "win64" fn vkGetSwapchainImagesKHR(
     let mut count = std::ptr::read_unaligned(image_count);
     let res = f(device, swapchain, &mut count, images);
     std::ptr::write_unaligned(image_count, count);
+    if (res == VK_SUCCESS || res == VK_INCOMPLETE) && !images.is_null() && count > 0 {
+        let mut cached = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            cached.push(std::ptr::read_unaligned(images.add(i)));
+        }
+        if let Some(rec) = live_swapchains().lock().unwrap().get_mut(&swapchain) {
+            rec.images = cached;
+        }
+    }
     res
 }
 
@@ -2669,6 +2972,500 @@ pub unsafe extern "win64" fn vkAcquireNextImageKHR(
     res
 }
 
+fn f16_to_u8(h: u16) -> u8 {
+    let s = if h & 0x8000 != 0 { -1.0f32 } else { 1.0f32 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    let f = s * match e {
+        0 => m * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    };
+    (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+fn vk_format_bpp(format: u32) -> Option<usize> {
+    match format {
+        VK_FORMAT_R8G8B8A8_UNORM
+        | VK_FORMAT_R8G8B8A8_SRGB
+        | VK_FORMAT_B8G8R8A8_UNORM
+        | VK_FORMAT_B8G8R8A8_SRGB
+        | VK_FORMAT_A2B10G10R10_UNORM_PACK32 => Some(4),
+        VK_FORMAT_R16G16B16A16_SFLOAT => Some(8),
+        _ => None,
+    }
+}
+
+fn vk_pixels_to_rgb8(format: u32, data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    let bpp = vk_format_bpp(format)?;
+    let total = w.checked_mul(h)?;
+    if data.len() < total.checked_mul(bpp)? {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total * 3);
+    for i in 0..total {
+        let px = &data[i * bpp..][..bpp];
+        match format {
+            VK_FORMAT_R8G8B8A8_UNORM | VK_FORMAT_R8G8B8A8_SRGB => {
+                out.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+            VK_FORMAT_B8G8R8A8_UNORM | VK_FORMAT_B8G8R8A8_SRGB => {
+                out.extend_from_slice(&[px[2], px[1], px[0]]);
+            }
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32 => {
+                let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                let r10 = v & 0x3ff;
+                let g10 = (v >> 10) & 0x3ff;
+                let b10 = (v >> 20) & 0x3ff;
+                out.extend_from_slice(&[
+                    ((r10 * 255 + 511) / 1023) as u8,
+                    ((g10 * 255 + 511) / 1023) as u8,
+                    ((b10 * 255 + 511) / 1023) as u8,
+                ]);
+            }
+            VK_FORMAT_R16G16B16A16_SFLOAT => {
+                let r = f16_to_u8(u16::from_le_bytes([px[0], px[1]]));
+                let g = f16_to_u8(u16::from_le_bytes([px[2], px[3]]));
+                let b = f16_to_u8(u16::from_le_bytes([px[4], px[5]]));
+                out.extend_from_slice(&[r, g, b]);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Captures the swapchain image about to be presented by `vkQueuePresentKHR` into a PNG file
+/// using pure Vulkan transfer commands (`vkCmdCopyImageToBuffer` into a host-visible buffer).
+///
+/// Returns `Ok(true)` if the capture submitted on `queue` and consumed `present_info`'s
+/// `pWaitSemaphores` (so the caller should pass `waitSemaphoreCount = 0` to `vkQueuePresentKHR`),
+/// `Ok(false)` if no semaphores were consumed, or `Err(msg)` if capture could not be performed
+/// before submission.
+unsafe fn capture_vulkan_swapchain_image(
+    vk: &VulkanBackend,
+    queue: usize,
+    swapchain: u64,
+    image_index: u32,
+    present_info: &VkPresentInfoKHR,
+    path: &str,
+    frame_num: u64,
+) -> Result<bool, String> {
+    let mut sc = live_swapchains()
+        .lock()
+        .unwrap()
+        .get(&swapchain)
+        .cloned()
+        .ok_or_else(|| "unknown swapchain".to_string())?;
+    if sc.width == 0 || sc.height == 0 {
+        return Err("zero-sized swapchain".into());
+    }
+    if sc.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT == 0 {
+        return Err("swapchain lacks VK_IMAGE_USAGE_TRANSFER_SRC_BIT".into());
+    }
+    let bpp = vk_format_bpp(sc.format)
+        .ok_or_else(|| format!("unsupported Vulkan swapchain format {}", sc.format))?;
+
+    let device = sc.device;
+    let phys = live_devices()
+        .lock()
+        .unwrap()
+        .get(&device)
+        .copied()
+        .ok_or_else(|| "unknown VkPhysicalDevice for swapchain device".to_string())?;
+    let queue_family = live_queues()
+        .lock()
+        .unwrap()
+        .get(&queue)
+        .map(|q| q.family_index)
+        .unwrap_or(0);
+
+    // Lazily populate swapchain images if the app queried them before interception.
+    if sc.images.get(image_index as usize).copied().unwrap_or(0) == 0 {
+        let get_imgs_ptr = vk
+            .device_proc_ptr(device, c"vkGetSwapchainImagesKHR")
+            .ok_or("missing vkGetSwapchainImagesKHR")?;
+        let get_imgs: unsafe extern "C" fn(usize, u64, *mut u32, *mut u64) -> i32 =
+            std::mem::transmute(get_imgs_ptr);
+        let mut n = 0u32;
+        if get_imgs(device, swapchain, &mut n, std::ptr::null_mut()) == VK_SUCCESS && n > 0 {
+            let mut imgs = vec![0u64; n as usize];
+            if get_imgs(device, swapchain, &mut n, imgs.as_mut_ptr()) == VK_SUCCESS {
+                imgs.truncate(n as usize);
+                sc.images = imgs.clone();
+                if let Some(entry) = live_swapchains().lock().unwrap().get_mut(&swapchain) {
+                    entry.images = imgs;
+                }
+            }
+        }
+    }
+    let image = sc
+        .images
+        .get(image_index as usize)
+        .copied()
+        .filter(|&img| img != 0)
+        .ok_or_else(|| format!("missing VkImage for swapchain image_index={image_index}"))?;
+
+    macro_rules! dev_proc {
+        ($sym:expr, $ty:ty) => {{
+            let p = vk
+                .device_proc_ptr(device, $sym)
+                .ok_or_else(|| format!("missing {:?}", $sym))?;
+            std::mem::transmute::<*const c_void, $ty>(p)
+        }};
+    }
+
+    let get_mem_props_ptr = vk
+        .any_instance_or_dlsym_ptr(c"vkGetPhysicalDeviceMemoryProperties")
+        .ok_or("missing vkGetPhysicalDeviceMemoryProperties")?;
+    let get_mem_props: unsafe extern "C" fn(usize, *mut VkPhysicalDeviceMemoryProperties) =
+        std::mem::transmute(get_mem_props_ptr);
+
+    let create_buf = dev_proc!(
+        c"vkCreateBuffer",
+        unsafe extern "C" fn(usize, *const VkBufferCreateInfo, *const c_void, *mut u64) -> i32
+    );
+    let destroy_buf = dev_proc!(
+        c"vkDestroyBuffer",
+        unsafe extern "C" fn(usize, u64, *const c_void)
+    );
+    let get_buf_reqs = dev_proc!(
+        c"vkGetBufferMemoryRequirements",
+        unsafe extern "C" fn(usize, u64, *mut VkMemoryRequirements)
+    );
+    let alloc_mem = dev_proc!(
+        c"vkAllocateMemory",
+        unsafe extern "C" fn(usize, *const VkMemoryAllocateInfo, *const c_void, *mut u64) -> i32
+    );
+    let free_mem = dev_proc!(
+        c"vkFreeMemory",
+        unsafe extern "C" fn(usize, u64, *const c_void)
+    );
+    let bind_buf_mem = dev_proc!(
+        c"vkBindBufferMemory",
+        unsafe extern "C" fn(usize, u64, u64, u64) -> i32
+    );
+    let map_mem = dev_proc!(
+        c"vkMapMemory",
+        unsafe extern "C" fn(usize, u64, u64, u64, u32, *mut *mut c_void) -> i32
+    );
+    let unmap_mem = dev_proc!(c"vkUnmapMemory", unsafe extern "C" fn(usize, u64));
+    let create_pool = dev_proc!(
+        c"vkCreateCommandPool",
+        unsafe extern "C" fn(usize, *const VkCommandPoolCreateInfo, *const c_void, *mut u64) -> i32
+    );
+    let destroy_pool = dev_proc!(
+        c"vkDestroyCommandPool",
+        unsafe extern "C" fn(usize, u64, *const c_void)
+    );
+    let alloc_cmd = dev_proc!(
+        c"vkAllocateCommandBuffers",
+        unsafe extern "C" fn(usize, *const VkCommandBufferAllocateInfo, *mut usize) -> i32
+    );
+    let begin_cmd = dev_proc!(
+        c"vkBeginCommandBuffer",
+        unsafe extern "C" fn(usize, *const VkCommandBufferBeginInfo) -> i32
+    );
+    let end_cmd = dev_proc!(c"vkEndCommandBuffer", unsafe extern "C" fn(usize) -> i32);
+    let cmd_barrier = dev_proc!(
+        c"vkCmdPipelineBarrier",
+        unsafe extern "C" fn(
+            usize,
+            u32,
+            u32,
+            u32,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            u32,
+            *const VkImageMemoryBarrier,
+        )
+    );
+    let cmd_copy = dev_proc!(
+        c"vkCmdCopyImageToBuffer",
+        unsafe extern "C" fn(usize, u64, u32, u64, u32, *const VkBufferImageCopy)
+    );
+    let create_fence = dev_proc!(
+        c"vkCreateFence",
+        unsafe extern "C" fn(usize, *const VkFenceCreateInfo, *const c_void, *mut u64) -> i32
+    );
+    let destroy_fence = dev_proc!(
+        c"vkDestroyFence",
+        unsafe extern "C" fn(usize, u64, *const c_void)
+    );
+    let wait_fences = dev_proc!(
+        c"vkWaitForFences",
+        unsafe extern "C" fn(usize, u32, *const u64, u32, u64) -> i32
+    );
+    let queue_submit = dev_proc!(
+        c"vkQueueSubmit",
+        unsafe extern "C" fn(usize, u32, *const VkSubmitInfo, u64) -> i32
+    );
+
+    let byte_len = (sc.width as u64) * (sc.height as u64) * (bpp as u64);
+    let buf_ci = VkBufferCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+        size: byte_len,
+        usage: VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        sharing_mode: 0,
+        queue_family_index_count: 0,
+        p_queue_family_indices: std::ptr::null(),
+    };
+    let mut buf = 0u64;
+    let r = create_buf(device, &buf_ci, std::ptr::null(), &mut buf);
+    if r != VK_SUCCESS || buf == 0 {
+        return Err(format!("vkCreateBuffer failed ({r})"));
+    }
+
+    let mut reqs = VkMemoryRequirements::default();
+    get_buf_reqs(device, buf, &mut reqs);
+    let mut mem_props: VkPhysicalDeviceMemoryProperties = std::mem::zeroed();
+    get_mem_props(phys, &mut mem_props);
+    let want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    let mem_type = (0..mem_props.memory_type_count.min(32))
+        .find(|&i| {
+            (reqs.memory_type_bits & (1u32 << i)) != 0
+                && (mem_props.memory_types[i as usize].property_flags & want) == want
+        })
+        .ok_or_else(|| {
+            destroy_buf(device, buf, std::ptr::null());
+            "no HOST_VISIBLE|HOST_COHERENT memory type".to_string()
+        })?;
+
+    let alloc_info = VkMemoryAllocateInfo {
+        s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        p_next: std::ptr::null(),
+        allocation_size: reqs.size.max(byte_len),
+        memory_type_index: mem_type,
+    };
+    let mut mem = 0u64;
+    let r = alloc_mem(device, &alloc_info, std::ptr::null(), &mut mem);
+    if r != VK_SUCCESS || mem == 0 {
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkAllocateMemory failed ({r})"));
+    }
+    let r = bind_buf_mem(device, buf, mem, 0);
+    if r != VK_SUCCESS {
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkBindBufferMemory failed ({r})"));
+    }
+
+    let pool_ci = VkCommandPoolCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+        queue_family_index: queue_family,
+    };
+    let mut pool = 0u64;
+    let r = create_pool(device, &pool_ci, std::ptr::null(), &mut pool);
+    if r != VK_SUCCESS || pool == 0 {
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkCreateCommandPool failed ({r})"));
+    }
+
+    let cmd_ai = VkCommandBufferAllocateInfo {
+        s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        p_next: std::ptr::null(),
+        command_pool: pool,
+        level: 0,
+        command_buffer_count: 1,
+    };
+    let mut cmd = 0usize;
+    let r = alloc_cmd(device, &cmd_ai, &mut cmd);
+    if r != VK_SUCCESS || cmd == 0 {
+        destroy_pool(device, pool, std::ptr::null());
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkAllocateCommandBuffers failed ({r})"));
+    }
+
+    let fence_ci = VkFenceCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+    };
+    let mut fence = 0u64;
+    let r = create_fence(device, &fence_ci, std::ptr::null(), &mut fence);
+    if r != VK_SUCCESS || fence == 0 {
+        destroy_pool(device, pool, std::ptr::null());
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkCreateFence failed ({r})"));
+    }
+
+    let begin_ci = VkCommandBufferBeginInfo {
+        s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        p_next: std::ptr::null(),
+        flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        p_inheritance_info: std::ptr::null(),
+    };
+    let r = begin_cmd(cmd, &begin_ci);
+    if r != VK_SUCCESS {
+        destroy_fence(device, fence, std::ptr::null());
+        destroy_pool(device, pool, std::ptr::null());
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkBeginCommandBuffer failed ({r})"));
+    }
+
+    let to_transfer = VkImageMemoryBarrier {
+        s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        p_next: std::ptr::null(),
+        src_access_mask: 0,
+        dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+        old_layout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+        image,
+        aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    cmd_barrier(
+        cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        1,
+        &to_transfer,
+    );
+
+    let copy = VkBufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+        offset_x: 0,
+        offset_y: 0,
+        offset_z: 0,
+        extent_width: sc.width,
+        extent_height: sc.height,
+        extent_depth: 1,
+    };
+    cmd_copy(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+
+    let to_present = VkImageMemoryBarrier {
+        src_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+        dst_access_mask: 0,
+        old_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        new_layout: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        ..to_transfer
+    };
+    cmd_barrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0,
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        1,
+        &to_present,
+    );
+
+    let r = end_cmd(cmd);
+    if r != VK_SUCCESS {
+        destroy_fence(device, fence, std::ptr::null());
+        destroy_pool(device, pool, std::ptr::null());
+        free_mem(device, mem, std::ptr::null());
+        destroy_buf(device, buf, std::ptr::null());
+        return Err(format!("vkEndCommandBuffer failed ({r})"));
+    }
+
+    let wait_count = if present_info.p_wait_semaphores.is_null() {
+        0
+    } else {
+        present_info.wait_semaphore_count
+    };
+    let wait_stages = vec![VK_PIPELINE_STAGE_TRANSFER_BIT; wait_count as usize];
+    let submit = VkSubmitInfo {
+        s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        p_next: std::ptr::null(),
+        wait_semaphore_count: wait_count,
+        p_wait_semaphores: if wait_count > 0 {
+            present_info.p_wait_semaphores
+        } else {
+            std::ptr::null()
+        },
+        p_wait_dst_stage_mask: if wait_count > 0 {
+            wait_stages.as_ptr()
+        } else {
+            std::ptr::null()
+        },
+        command_buffer_count: 1,
+        p_command_buffers: &cmd,
+        signal_semaphore_count: 0,
+        p_signal_semaphores: std::ptr::null(),
+    };
+
+    let submit_res = queue_submit(queue, 1, &submit, fence);
+    let consumed_semaphores = submit_res == VK_SUCCESS && wait_count > 0;
+    if submit_res == VK_SUCCESS {
+        let wait_res = wait_fences(device, 1, &fence, VK_TRUE, u64::MAX);
+        if wait_res == VK_SUCCESS {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            if map_mem(device, mem, 0, byte_len, 0, &mut mapped) == VK_SUCCESS && !mapped.is_null() {
+                let bytes = std::slice::from_raw_parts(mapped as *const u8, byte_len as usize);
+                match vk_pixels_to_rgb8(sc.format, bytes, sc.width as usize, sc.height as usize) {
+                    Some(rgb) => match d3d12_metal::metal::capture::write_png(
+                        path, sc.width, sc.height, &rgb,
+                    ) {
+                        Ok(()) => log::info!(
+                            target: "vulkan",
+                            "vulkan present #{frame_num}: captured back buffer (fmt={} {}x{}) -> {path}",
+                            sc.format,
+                            sc.width,
+                            sc.height
+                        ),
+                        Err(e) => log::warn!(
+                            target: "vulkan",
+                            "vulkan present #{frame_num}: writing {path}: {e}"
+                        ),
+                    },
+                    None => log::warn!(
+                        target: "vulkan",
+                        "vulkan present #{frame_num}: pixel conversion failed for format {}",
+                        sc.format
+                    ),
+                }
+                unmap_mem(device, mem);
+            }
+        } else {
+            log::warn!(
+                target: "vulkan",
+                "vulkan present #{frame_num}: capture vkWaitForFences failed ({wait_res})"
+            );
+        }
+    } else {
+        log::warn!(
+            target: "vulkan",
+            "vulkan present #{frame_num}: capture vkQueueSubmit failed ({submit_res})"
+        );
+    }
+
+    destroy_fence(device, fence, std::ptr::null());
+    destroy_pool(device, pool, std::ptr::null());
+    free_mem(device, mem, std::ptr::null());
+    destroy_buf(device, buf, std::ptr::null());
+    Ok(consumed_semaphores)
+}
+
 pub unsafe extern "win64" fn vkQueuePresentKHR(queue: usize, present_info: *const c_void) -> i32 {
     if queue == 0 || present_info.is_null() {
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -2679,8 +3476,71 @@ pub unsafe extern "win64" fn vkQueuePresentKHR(queue: usize, present_info: *cons
     let Some(ptr) = vk.any_device_or_instance_or_dlsym_ptr(c"vkQueuePresentKHR") else {
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     };
+
+    let info = std::ptr::read_unaligned(present_info as *const VkPresentInfoKHR);
+    let primary_sc = if info.swapchain_count > 0
+        && !info.p_swapchains.is_null()
+        && !info.p_image_indices.is_null()
+    {
+        Some((
+            std::ptr::read_unaligned(info.p_swapchains),
+            std::ptr::read_unaligned(info.p_image_indices),
+        ))
+    } else {
+        None
+    };
+
+    let hwnd = primary_sc
+        .and_then(|(sc, _)| live_swapchains().lock().unwrap().get(&sc).map(|r| r.hwnd))
+        .unwrap_or(0);
+
+    let next_frame = (crate::present::present_count() as u64) + 1;
+    let capture_path = d3d12_metal::metal::capture::take_pending().or_else(|| {
+        d3d12_metal::metal::capture::config()
+            .filter(|(_, at)| at.contains(&next_frame))
+            .map(|(base, _)| format!("{base}_{next_frame}.png"))
+    });
+
+    let mut patched_info = info;
+    let mut use_patched = false;
+    if let (Some(path), Some((sc, img_idx))) = (capture_path, primary_sc) {
+        match capture_vulkan_swapchain_image(vk, queue, sc, img_idx, &info, &path, next_frame) {
+            Ok(true) => {
+                patched_info.wait_semaphore_count = 0;
+                patched_info.p_wait_semaphores = std::ptr::null();
+                use_patched = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::warn!(target: "vulkan", "vulkan present #{next_frame}: capture skipped ({e})");
+            }
+        }
+    }
+
+    let t0 = crate::hitch::span_begin();
+    let present_scope =
+        crate::hitch::Scope::enter(crate::hitch::ActKind::Present, info.swapchain_count as u64);
     let f: unsafe extern "C" fn(usize, *const c_void) -> i32 = std::mem::transmute(ptr);
-    f(queue, present_info)
+    let res = if use_patched {
+        f(queue, &patched_info as *const VkPresentInfoKHR as *const c_void)
+    } else {
+        f(queue, present_info)
+    };
+    let present_ns = present_scope.elapsed_ns();
+    drop(present_scope);
+    crate::hitch::span_end(t0, crate::hitch::SPAN_PRESENT);
+
+    if res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR {
+        let n = crate::present::on_present(crate::present::PresentApi::Vulkan, hwnd, present_ns);
+        if n <= 10 || n % 60 == 0 {
+            log::info!(
+                target: "vulkan",
+                "vulkan Present #{n} (result {res}, swapchains {})",
+                info.swapchain_count
+            );
+        }
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -3540,9 +4400,12 @@ define_device_proc_interceptors! {
         "vkCmdSetDepthBias" => vkCmdSetDepthBias,
         "vkCmdSetDepthBounds" => vkCmdSetDepthBounds,
         "vkCmdSetExtraPrimitiveOverestimationSizeEXT" => tramp_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
-        // Surface-syncing + allocator-sanitizing swapchain procs
+        // Surface-syncing + allocator-sanitizing + present-hook swapchain/queue procs
+        "vkGetDeviceQueue" => vkGetDeviceQueue,
         "vkCreateSwapchainKHR" => vkCreateSwapchainKHR,
         "vkDestroySwapchainKHR" => vkDestroySwapchainKHR,
+        "vkGetSwapchainImagesKHR" => vkGetSwapchainImagesKHR,
+        "vkQueuePresentKHR" => vkQueuePresentKHR,
         // Already-exported allocator-sanitizing device procs
         "vkCreateShaderModule" => vkCreateShaderModule,
         "vkDestroyShaderModule" => vkDestroyShaderModule,

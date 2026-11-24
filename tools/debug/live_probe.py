@@ -37,6 +37,9 @@ import time
 from pathlib import Path
 
 
+EXIT_UNIMPL_OP = 86
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
@@ -192,11 +195,16 @@ def run_one_trial(args: argparse.Namespace, runner: Path, steps: list[str], tria
         cmd += ["--pe", args.pe]
     if args.game_dir:
         cmd += ["--game-dir", args.game_dir]
+    if args.fail_on_unimpl_op:
+        cmd += ["--fail-on-unimpl-op"]
+    else:
+        cmd += ["--no-fail-on-unimpl-op"]
     if args.game_args:
         cmd += ["--"] + args.game_args
 
     env = os.environ.copy()
     env["PORT_CONTROL_DIR"] = str(ctl_dir)
+    env["PORT_FAIL_ON_UNIMPL_OP"] = "1" if args.fail_on_unimpl_op else "0"
     if args.nan_boundary:
         env["PORT_NAN_BOUNDARY"] = "1"
     if args.audio_null:
@@ -318,7 +326,14 @@ def run_one_trial(args: argparse.Namespace, runner: Path, steps: list[str], tria
                             proc.wait(timeout=4)
 
                 crashed = proc.returncode not in (0, None, -15)
-                if not reached_ready:
+                hit_unimpl_op = proc.returncode == EXIT_UNIMPL_OP
+                if hit_unimpl_op:
+                    rc = 1
+                    print(
+                        f"{label}: BUG after +{frames_run} frames (unimplemented x86 instruction, exit code {EXIT_UNIMPL_OP})",
+                        flush=True,
+                    )
+                elif not reached_ready:
                     rc = 2
                     print(f"{label}: ERROR (did not reach ready state within {args.timeout_boot}s)", flush=True)
                 elif fail_hits or crashed or not pass_ok:
@@ -354,9 +369,39 @@ def run_one_trial(args: argparse.Namespace, runner: Path, steps: list[str], tria
     }
 
 
+def _emit_json_envelope(out_stream, exit_code: int, data, error: str | None) -> int:
+    out_stream.write(json.dumps({
+        "schema_version": 1,
+        "command": "live-probe",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "data": data,
+        "error": error,
+    }, indent=2) + "\n")
+    out_stream.flush()
+    return exit_code
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, json_mode: bool = False, orig_stdout=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._json_mode = json_mode
+        self._orig_stdout = orig_stdout or sys.stdout
+
+    def error(self, message: str):
+        if self._json_mode:
+            _emit_json_envelope(self._orig_stdout, 2, None, message)
+            self.exit(2)
+        super().error(message)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Universal game-agnostic frame-paced PORT_CONTROL_DIR probe (exit 0=CLEAN, 1=BUG, 2=ERROR)"
+    want_json = "--json" in sys.argv[1:]
+    orig_stdout = sys.stdout
+    ap = _JsonArgumentParser(
+        description="Universal game-agnostic frame-paced PORT_CONTROL_DIR probe (exit 0=CLEAN, 1=BUG, 2=ERROR)",
+        json_mode=want_json,
+        orig_stdout=orig_stdout,
     )
     ap.add_argument("--manifest", help="Path to games/<id>/game.toml")
     ap.add_argument("--pe", help="Path to target Windows .exe (if not using --manifest)")
@@ -377,6 +422,8 @@ def main() -> int:
     ap.add_argument("--nantrace-arm", action="store_true", help="Send 'nantrace on' before steps and 'nantrace off' after")
     ap.add_argument("--nan-boundary", action="store_true", default=True, help="Set PORT_NAN_BOUNDARY=1 (default on)")
     ap.add_argument("--no-nan-boundary", dest="nan_boundary", action="store_false")
+    ap.add_argument("--fail-on-unimpl-op", action="store_true", default=True, help="Pass --fail-on-unimpl-op / PORT_FAIL_ON_UNIMPL_OP=1 (exit 86 on unimplemented x86 op; default on)")
+    ap.add_argument("--no-fail-on-unimpl-op", dest="fail_on_unimpl_op", action="store_false")
     ap.add_argument("--audio-null", action="store_true", default=True, help="Default AW2_AUDIO_BACKEND=null for headless/CI reliability")
     ap.add_argument("--keep-audio", dest="audio_null", action="store_false")
     ap.add_argument("--stop-early", action="store_true", help="Stop executing steps on first --fail-regex hit")
@@ -385,6 +432,7 @@ def main() -> int:
     ap.add_argument("--timeout-step", type=float, default=60.0, help="Max seconds per step wait")
     ap.add_argument("--extra-env", action="append", default=[], help="Extra KEY=VAL env var(s) passed to port-runner")
     ap.add_argument("--keep-ctl", action="store_true", help="Keep temporary PORT_CONTROL_DIR for debugging")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
     ap.add_argument("--json-out", help="Write structured JSON trial report to this path")
     ap.add_argument("game_args", nargs=argparse.REMAINDER, help="Extra arguments passed after `--` to the Windows game")
     args = ap.parse_args()
@@ -394,23 +442,48 @@ def main() -> int:
     if not args.manifest and not args.pe:
         ap.error("Provide --manifest <game.toml> or --pe <Game.exe>")
 
-    runner = find_port_runner(args.runner)
-    steps = load_steps(args.step, args.script)
-    trials = []
-    worst_rc = 0
-    for idx in range(1, max(1, args.repeat) + 1):
-        rec = run_one_trial(args, runner, steps, idx)
-        trials.append(rec)
-        if rec["rc"] != 0:
-            worst_rc = rec["rc"]
-            break
+    if args.json:
+        sys.stdout = sys.stderr
 
-    if args.json_out:
-        out_p = Path(args.json_out)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(json.dumps({"trials": trials, "rc": worst_rc}, indent=2) + "\n", encoding="utf-8")
+    try:
+        runner = find_port_runner(args.runner)
+        steps = load_steps(args.step, args.script)
+        trials = []
+        worst_rc = 0
+        for idx in range(1, max(1, args.repeat) + 1):
+            rec = run_one_trial(args, runner, steps, idx)
+            trials.append(rec)
+            if rec["rc"] != 0:
+                worst_rc = rec["rc"]
+                break
 
-    return worst_rc
+        payload = {"trials": trials, "rc": worst_rc}
+        if args.json_out:
+            out_p = Path(args.json_out)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        if args.json:
+            return _emit_json_envelope(
+                orig_stdout,
+                worst_rc,
+                payload,
+                None if worst_rc == 0 else f"live-probe exited with rc={worst_rc}",
+            )
+
+        return worst_rc
+    except SystemExit:
+        raise
+    except ValueError as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 2, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 1, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

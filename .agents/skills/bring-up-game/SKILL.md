@@ -12,36 +12,45 @@ Win32, x86-64, shader, or graphics behavior in the universal crates so every gam
 **Hard policy:** Never commit copyrighted game binaries/assets or personal machine paths, and never
 bypass kernel anti-cheat or DRM. Flag anti-cheat/DRM honestly.
 
-## Step 1 — Audit the Game Install Offline
+## Step 1 — Audit the Game Install Offline (Single Pass)
 
-Run the bundled 7-step offline audit script ([audit_game.sh](./scripts/audit_game.sh)) on the
-user's legally owned Windows game directory before booting:
+Run the unified single-pass offline audit on the user's legally owned Windows game directory before
+booting (parses every PE32+ file once and optionally pre-fills `games/<id>/game.toml`):
 
 ```sh
-.agents/skills/bring-up-game/scripts/audit_game.sh /path/to/Game [MainGame.exe] [--record]
+cargo opsdb -- audit-game /path/to/Game --init-manifest
+# Machine-readable JSON output + manifest generation:
+cargo opsdb -- audit-game /path/to/Game --json --init-manifest
+# Or via the convenience wrapper script:
+.agents/skills/bring-up-game/scripts/audit_game.sh /path/to/Game [MainGame.exe] [--record] [--json] [--init-manifest]
 ```
 
 What to inspect in the output:
-- **Anti-cheat / DRM (`anticheat-audit`):** Kernel drivers (Vanguard, kernel EAC/BattlEye,
-  Ricochet) or anti-tamper watchdogs must be reported honestly as blockers/caveats.
-- **Unresolved imports (`win32-audit`):** Identify missing startup DLLs/exports. Check
+- **Win32 imports by `impl_kind` (`real` / `partial` / `stub` / `failing` / `unresolved`):**
+  `audit-game` (and `win32-audit`) reports resolved counts separately by `impl_kind` from
+  `db/win32_apis.tsv` and explicitly lists every `stub` / `failing` import the game uses. Check
   [game_toml_schema.md](./references/game_toml_schema.md) for which DLLs are overridden by native
   ARM64 builtins (`BUILTIN_OVERRIDES`) vs run as retail PEs via ARM64 JIT (`PhysX3*`, `nrd.dll`,
   compression DLLs `oo2core_*`/`zstd`).
-- **Graphics API (`app-audit`):** D3D12, D3D11 (needs `libdxilconv.dylib` for SM 4/5), or Vulkan
-  (needs `libMoltenVK.dylib`).
-- **.NET / Unity (`dotnet-audit`):** `win32-rt` includes a pure-Rust ECMA-335 CLR/CIL fallback
-  (`hostfxr`/`coreclr`/`mscoree`/`mono-2.0-bdwgc`) in addition to host `dlopen`; check for
-  ReadyToRun images (`--strip-r2r`).
-- **Runtime hazards (`runtime-audit`):** Note `ldmxcsr` FTZ/DAZ, x87, AVX 256→128 narrowing,
-  approx FP, `LOCK` atomics, or RWX/JIT code (V8/Cohtml → set `v8_jitless = true`).
+- **Graphics API & embedded shaders:** D3D12, D3D11 (needs `libdxilconv.dylib` for SM 4/5), or
+  Vulkan (needs `libMoltenVK.dylib`), plus upscalers (DLSS/Streamline, FSR, XeSS) and engine profile.
+- **Anti-cheat / anti-tamper:** Kernel drivers (Vanguard, kernel EAC/BattlEye, Ricochet), direct
+  syscalls/SSNs, RWX/packed sections, or anti-tamper watchdogs are reported honestly as blockers or
+  caveats.
+- **ARM64 AOT coverage estimate:** Aggregate instruction count, JIT coverage percentage, and top
+  unmapped/generic-interp mnemonics.
+- **.NET / Unity & runtime hazards:** Pure-IL/R2R/Mono/IL2CPP counts (`--strip-r2r` via
+  `dotnet-audit` if needed), plus `ldmxcsr` FTZ/DAZ, x87, AVX 256→128 narrowing, approx FP, `LOCK`
+  atomics, and RWX/V8/Cohtml (`v8_jitless = true` is pre-filled automatically when detected).
 - **Steam installs:** Run `cargo opsdb -- steam-postinstall /path/to/Game` to extract
   `installscript.vdf` registry keys and check `_CommonRedist`.
 
-## Step 2 — Create `games/<id>/game.toml`
+## Step 2 — Review Pre-Filled `games/<id>/game.toml`
 
-Copy `games/_template/game.toml` to `games/<id>/game.toml` (see `games/overwatch/game.toml`,
-`games/alan-wake-2/game.toml`, and the complete schema + `BUILTIN_OVERRIDES` table in
+`cargo opsdb -- audit-game /path/to/Game --init-manifest` writes a pre-filled `games/<id>/game.toml`
+with detected `[app]` metadata, `steam_app_id` (from `steam_appid.txt`), `v8_jitless`, and
+`[middleware.*]` entries (or copy `games/_template/game.toml` manually if starting from scratch;
+see `games/overwatch/game.toml`, `games/alan-wake-2/game.toml`, and
 [game_toml_schema.md](./references/game_toml_schema.md)).
 
 Minimal template:

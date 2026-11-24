@@ -1008,11 +1008,241 @@ pub unsafe extern "win64" fn GetNameInfoW(
     0
 }
 
-// @exports gethostbyname gethostbyaddr
-failing!(*mut c_void = std::ptr::null_mut(), err WSAHOST_NOT_FOUND; gethostbyname, gethostbyaddr);
+/// Windows x64 `HOSTENT` (32 bytes): `h_addrtype` and `h_length` are `i16`
+/// (unlike POSIX `int` on LP64!), followed by 4 bytes padding before `h_addr_list`.
+#[repr(C)]
+struct WinHostent {
+    h_name: *mut u8,
+    h_aliases: *mut *mut u8,
+    h_addrtype: i16,
+    h_length: i16,
+    _pad: u32,
+    h_addr_list: *mut *mut u8,
+}
+const _: () = assert!(std::mem::size_of::<WinHostent>() == 32);
 
-// @exports getprotobyname
-failing!(*mut c_void = std::ptr::null_mut(), err WSANO_DATA; getprotobyname);
+/// Windows x64 `PROTOENT` (24 bytes): `p_proto` is `i16`.
+#[repr(C)]
+struct WinProtoent {
+    p_name: *mut u8,
+    p_aliases: *mut *mut u8,
+    p_proto: i16,
+    _pad: [u8; 6],
+}
+const _: () = assert!(std::mem::size_of::<WinProtoent>() == 24);
+
+struct ThreadHostentBuf {
+    hostent: Box<WinHostent>,
+    name: Vec<u8>,
+    alias_ptrs: Vec<*mut u8>,
+    addrs: Vec<[u8; 4]>,
+    addr_ptrs: Vec<*mut u8>,
+}
+
+struct ThreadProtoentBuf {
+    protoent: Box<WinProtoent>,
+    name: Vec<u8>,
+    #[allow(dead_code)]
+    alias_bufs: Vec<Vec<u8>>,
+    alias_ptrs: Vec<*mut u8>,
+}
+
+thread_local! {
+    static TLS_HOSTENT: std::cell::RefCell<Option<ThreadHostentBuf>> = const { std::cell::RefCell::new(None) };
+    static TLS_PROTOENT: std::cell::RefCell<Option<ThreadProtoentBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+unsafe fn store_tls_hostent(canon_name: &str, addrs: Vec<[u8; 4]>) -> *mut c_void {
+    TLS_HOSTENT.with(|cell| {
+        let mut name = canon_name.as_bytes().to_vec();
+        name.push(0);
+        let alias_ptrs = vec![std::ptr::null_mut()];
+        let mut buf = ThreadHostentBuf {
+            hostent: Box::new(WinHostent {
+                h_name: std::ptr::null_mut(),
+                h_aliases: std::ptr::null_mut(),
+                h_addrtype: AF_INET as i16,
+                h_length: 4,
+                _pad: 0,
+                h_addr_list: std::ptr::null_mut(),
+            }),
+            name,
+            alias_ptrs,
+            addrs,
+            addr_ptrs: Vec::new(),
+        };
+        for a in buf.addrs.iter_mut() {
+            buf.addr_ptrs.push(a.as_mut_ptr());
+        }
+        buf.addr_ptrs.push(std::ptr::null_mut());
+        buf.hostent.h_name = buf.name.as_mut_ptr();
+        buf.hostent.h_aliases = buf.alias_ptrs.as_mut_ptr();
+        buf.hostent.h_addr_list = buf.addr_ptrs.as_mut_ptr();
+        let ptr = (&mut *buf.hostent) as *mut WinHostent as *mut c_void;
+        *cell.borrow_mut() = Some(buf);
+        ptr
+    })
+}
+
+pub unsafe extern "win64" fn gethostbyname(name: LPCSTR) -> *mut c_void {
+    let query = if name.is_null() {
+        let mut h = [0u8; 256];
+        if libc::gethostname(h.as_mut_ptr() as *mut libc::c_char, h.len()) == 0 {
+            crate::strings::from_ansi(h.as_ptr())
+        } else {
+            "localhost".to_string()
+        }
+    } else {
+        crate::strings::from_ansi(name)
+    };
+    if let Ok(ip) = query.parse::<Ipv4Addr>() {
+        return store_tls_hostent(&query, vec![ip.octets()]);
+    }
+    let Ok(c_host) = CString::new(query.as_str()) else {
+        return err(WSAHOST_NOT_FOUND, std::ptr::null_mut());
+    };
+    let mut hints: libc::addrinfo = std::mem::zeroed();
+    hints.ai_family = libc::AF_INET;
+    hints.ai_socktype = libc::SOCK_STREAM;
+    hints.ai_flags = libc::AI_CANONNAME;
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    let rc = libc::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut res);
+    if rc != 0 || res.is_null() {
+        return err(WSAHOST_NOT_FOUND, std::ptr::null_mut());
+    }
+    let mut canon = query.clone();
+    let mut addrs: Vec<[u8; 4]> = Vec::new();
+    let mut cur = res;
+    while !cur.is_null() {
+        let ai = &*cur;
+        if cur == res && !ai.ai_canonname.is_null() {
+            canon = crate::strings::from_ansi(ai.ai_canonname as *const u8);
+        }
+        if ai.ai_family == libc::AF_INET && !ai.ai_addr.is_null() {
+            let sin = &*(ai.ai_addr as *const libc::sockaddr_in);
+            let octets = sin.sin_addr.s_addr.to_ne_bytes();
+            if !addrs.contains(&octets) {
+                addrs.push(octets);
+            }
+        }
+        cur = ai.ai_next;
+    }
+    libc::freeaddrinfo(res);
+    if addrs.is_empty() {
+        return err(WSANO_DATA, std::ptr::null_mut());
+    }
+    store_tls_hostent(&canon, addrs)
+}
+
+pub unsafe extern "win64" fn gethostbyaddr(addr: *const u8, len: i32, ty: i32) -> *mut c_void {
+    if addr.is_null() {
+        return err(WSAEFAULT, std::ptr::null_mut());
+    }
+    if ty != AF_INET as i32 || len != 4 {
+        return err(WSAEAFNOSUPPORT, std::ptr::null_mut());
+    }
+    let octets = [
+        addr.read_unaligned(),
+        addr.add(1).read_unaligned(),
+        addr.add(2).read_unaligned(),
+        addr.add(3).read_unaligned(),
+    ];
+    let mut sin: libc::sockaddr_in = std::mem::zeroed();
+    sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+    sin.sin_addr.s_addr = u32::from_ne_bytes(octets);
+    let mut hbuf = [0u8; 256];
+    let rc = libc::getnameinfo(
+        &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        hbuf.as_mut_ptr() as *mut libc::c_char,
+        hbuf.len() as libc::socklen_t,
+        std::ptr::null_mut(),
+        0,
+        0,
+    );
+    let host_name = if rc == 0 {
+        crate::strings::from_ansi(hbuf.as_ptr())
+    } else {
+        Ipv4Addr::from(octets).to_string()
+    };
+    store_tls_hostent(&host_name, vec![octets])
+}
+
+pub unsafe extern "win64" fn getprotobyname(name: LPCSTR) -> *mut c_void {
+    if name.is_null() {
+        return err(WSAEFAULT, std::ptr::null_mut());
+    }
+    let query = crate::strings::from_ansi(name);
+    let Ok(c_name) = CString::new(query.as_str()) else {
+        return err(WSANO_DATA, std::ptr::null_mut());
+    };
+    let pe = libc::getprotobyname(c_name.as_ptr());
+    let (pname, aliases, proto_num): (String, Vec<String>, i16) = if !pe.is_null() {
+        let p = &*pe;
+        let pn = if p.p_name.is_null() {
+            query.clone()
+        } else {
+            crate::strings::from_ansi(p.p_name as *const u8)
+        };
+        let mut als = Vec::new();
+        if !p.p_aliases.is_null() {
+            let mut idx = 0usize;
+            loop {
+                let ap = p.p_aliases.add(idx).read_unaligned();
+                if ap.is_null() {
+                    break;
+                }
+                als.push(crate::strings::from_ansi(ap as *const u8));
+                idx += 1;
+                if idx >= 32 {
+                    break;
+                }
+            }
+        }
+        (pn, als, p.p_proto as i16)
+    } else {
+        match query.to_ascii_lowercase().as_str() {
+            "ip" => ("ip".into(), vec!["IP".into()], 0),
+            "icmp" => ("icmp".into(), vec!["ICMP".into()], 1),
+            "tcp" => ("tcp".into(), vec!["TCP".into()], 6),
+            "udp" => ("udp".into(), vec!["UDP".into()], 17),
+            "ipv6" => ("ipv6".into(), vec!["IPV6".into()], 41),
+            "icmpv6" => ("icmpv6".into(), vec!["ICMPV6".into()], 58),
+            _ => return err(WSANO_DATA, std::ptr::null_mut()),
+        }
+    };
+    TLS_PROTOENT.with(|cell| {
+        let mut name_bytes = pname.into_bytes();
+        name_bytes.push(0);
+        let mut alias_bufs: Vec<Vec<u8>> = aliases
+            .into_iter()
+            .map(|a| {
+                let mut v = a.into_bytes();
+                v.push(0);
+                v
+            })
+            .collect();
+        let mut alias_ptrs: Vec<*mut u8> = alias_bufs.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        alias_ptrs.push(std::ptr::null_mut());
+        let mut buf = ThreadProtoentBuf {
+            protoent: Box::new(WinProtoent {
+                p_name: std::ptr::null_mut(),
+                p_aliases: std::ptr::null_mut(),
+                p_proto: proto_num,
+                _pad: [0; 6],
+            }),
+            name: name_bytes,
+            alias_bufs,
+            alias_ptrs,
+        };
+        buf.protoent.p_name = buf.name.as_mut_ptr();
+        buf.protoent.p_aliases = buf.alias_ptrs.as_mut_ptr();
+        let ptr = (&mut *buf.protoent) as *mut WinProtoent as *mut c_void;
+        *cell.borrow_mut() = Some(buf);
+        ptr
+    })
+}
 
 // --------------------------------------------------------------- sockets
 
@@ -2985,13 +3215,149 @@ pub unsafe extern "win64" fn WSAAccept(
     accept(s, addr, addrlen)
 }
 
-// @exports WSAAsyncSelect WSACancelAsyncRequest WSAConnectByNameA WSAConnectByNameW WSAEnumProtocolsA WSAEnumProtocolsW WSAGetQOSByName WSAHtonl WSAHtons WSAJoinLeaf WSANtohl WSANtohs WSARecvDisconnect WSASendDisconnect WSARecvMsg WSASendMsg
+pub unsafe extern "win64" fn WSAHtonl(s: usize, hostlong: u32, lpnetlong: *mut u32) -> i32 {
+    if lookup_meta(s).is_none() {
+        return err(WSAENOTSOCK, SOCKET_ERROR);
+    }
+    if lpnetlong.is_null() {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
+    lpnetlong.write_unaligned(hostlong.to_be());
+    0
+}
+
+pub unsafe extern "win64" fn WSAHtons(s: usize, hostshort: u16, lpnetshort: *mut u16) -> i32 {
+    if lookup_meta(s).is_none() {
+        return err(WSAENOTSOCK, SOCKET_ERROR);
+    }
+    if lpnetshort.is_null() {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
+    lpnetshort.write_unaligned(hostshort.to_be());
+    0
+}
+
+pub unsafe extern "win64" fn WSANtohl(s: usize, netlong: u32, lphostlong: *mut u32) -> i32 {
+    if lookup_meta(s).is_none() {
+        return err(WSAENOTSOCK, SOCKET_ERROR);
+    }
+    if lphostlong.is_null() {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
+    lphostlong.write_unaligned(u32::from_be(netlong));
+    0
+}
+
+pub unsafe extern "win64" fn WSANtohs(s: usize, netshort: u16, lphostshort: *mut u16) -> i32 {
+    if lookup_meta(s).is_none() {
+        return err(WSAENOTSOCK, SOCKET_ERROR);
+    }
+    if lphostshort.is_null() {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
+    lphostshort.write_unaligned(u16::from_be(netshort));
+    0
+}
+
+pub unsafe extern "win64" fn WSARecvDisconnect(s: usize, _lp_inbound_disconnect_data: *mut c_void) -> i32 {
+    shutdown(s, 0)
+}
+
+pub unsafe extern "win64" fn WSASendDisconnect(s: usize, _lp_outbound_disconnect_data: *mut c_void) -> i32 {
+    shutdown(s, 1)
+}
+
+unsafe fn enum_protocols_impl(
+    lpi_protocols: *const i32,
+    buf: *mut u8,
+    lpdw_buffer_length: *mut u32,
+    wide: bool,
+) -> i32 {
+    if lpdw_buffer_length.is_null() {
+        return err(WSAEFAULT, SOCKET_ERROR);
+    }
+    // Standard Windows Winsock2 TCP/UDP IPv4/IPv6 providers.
+    const ENTRIES: &[(u32, i32, i32, i32, i32, i32, &str)] = &[
+        // (service_flags1, af, max_sa, min_sa, sock_type, proto, name)
+        (0x0002_0066, AF_INET as i32, 16, 16, libc::SOCK_STREAM, libc::IPPROTO_TCP, "MSAFD Tcpip [TCP/IP]"),
+        (0x0002_0209, AF_INET as i32, 16, 16, libc::SOCK_DGRAM, libc::IPPROTO_UDP, "MSAFD Tcpip [UDP/IP]"),
+        (0x0002_0066, AF_INET6 as i32, 28, 28, libc::SOCK_STREAM, libc::IPPROTO_TCP, "MSAFD Tcpip [TCP/IPv6]"),
+        (0x0002_0209, AF_INET6 as i32, 28, 28, libc::SOCK_DGRAM, libc::IPPROTO_UDP, "MSAFD Tcpip [UDP/IPv6]"),
+    ];
+    let mut filter: Vec<i32> = Vec::new();
+    if !lpi_protocols.is_null() {
+        let mut i = 0usize;
+        while i < 64 {
+            let p = lpi_protocols.add(i).read_unaligned();
+            if p == 0 {
+                break;
+            }
+            filter.push(p);
+            i += 1;
+        }
+    }
+    let matched: Vec<_> = ENTRIES
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| filter.is_empty() || filter.contains(&e.5))
+        .collect();
+    let entry_size: usize = if wide { 628 } else { 372 };
+    let needed = (matched.len() * entry_size) as u32;
+    let avail = lpdw_buffer_length.read_unaligned();
+    if buf.is_null() || avail < needed {
+        lpdw_buffer_length.write_unaligned(needed);
+        return err(WSAENOBUFS, SOCKET_ERROR);
+    }
+    for (idx, (cat_idx, &(flags1, af, max_sa, min_sa, stype, proto, name))) in matched.iter().enumerate() {
+        let dst = buf.add(idx * entry_size);
+        std::ptr::write_bytes(dst, 0, entry_size);
+        (dst.add(0) as *mut u32).write_unaligned(flags1);          // dwServiceFlags1
+        (dst.add(36) as *mut u32).write_unaligned(1001 + *cat_idx as u32); // dwCatalogEntryId
+        (dst.add(40) as *mut i32).write_unaligned(1);              // ProtocolChain.ChainLen = BASE_PROTOCOL
+        (dst.add(72) as *mut i32).write_unaligned(2);              // iVersion
+        (dst.add(76) as *mut i32).write_unaligned(af);             // iAddressFamily
+        (dst.add(80) as *mut i32).write_unaligned(max_sa);         // iMaxSockAddr
+        (dst.add(84) as *mut i32).write_unaligned(min_sa);         // iMinSockAddr
+        (dst.add(88) as *mut i32).write_unaligned(stype);          // iSocketType
+        (dst.add(92) as *mut i32).write_unaligned(proto);          // iProtocol
+        (dst.add(100) as *mut i32).write_unaligned(1);             // iNetworkByteOrder = LITTLEENDIAN
+        (dst.add(104) as *mut i32).write_unaligned(0);             // iSecurityScheme
+        (dst.add(108) as *mut u32).write_unaligned(if stype == libc::SOCK_DGRAM { 65507 } else { 0 }); // dwMessageSize
+        // szProtocol starts at offset 116 (256 chars: u8 for A, u16 for W).
+        if wide {
+            crate::strings::write_wide_trunc(name, dst.add(116) as *mut u16, 256);
+        } else {
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(255);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(116), n);
+            *dst.add(116 + n) = 0;
+        }
+    }
+    lpdw_buffer_length.write_unaligned(needed);
+    matched.len() as i32
+}
+
+pub unsafe extern "win64" fn WSAEnumProtocolsA(
+    lpi_protocols: *const i32,
+    lp_protocol_buffer: *mut u8,
+    lpdw_buffer_length: *mut u32,
+) -> i32 {
+    enum_protocols_impl(lpi_protocols, lp_protocol_buffer, lpdw_buffer_length, false)
+}
+
+pub unsafe extern "win64" fn WSAEnumProtocolsW(
+    lpi_protocols: *const i32,
+    lp_protocol_buffer: *mut u8,
+    lpdw_buffer_length: *mut u32,
+) -> i32 {
+    enum_protocols_impl(lpi_protocols, lp_protocol_buffer, lpdw_buffer_length, true)
+}
+
+// @exports WSAAsyncSelect WSACancelAsyncRequest WSAConnectByNameA WSAConnectByNameW WSAGetQOSByName WSAJoinLeaf WSARecvMsg WSASendMsg
 failing!(i32 = SOCKET_ERROR, err WSAEOPNOTSUPP;
     WSAAsyncSelect, WSACancelAsyncRequest, WSAConnectByNameA,
     WSAConnectByNameW,
-    WSAEnumProtocolsA, WSAEnumProtocolsW,
-    WSAGetQOSByName, WSAHtonl, WSAHtons, WSAJoinLeaf,
-    WSANtohl, WSANtohs, WSARecvDisconnect, WSASendDisconnect, WSARecvMsg,
+    WSAGetQOSByName, WSAJoinLeaf, WSARecvMsg,
     WSASendMsg);
 
 /// fd_set: u32 fd_count @0, SOCKET fd_array[64] @8.
@@ -9011,6 +9377,85 @@ mod tests {
             assert_eq!(closesocket(acc), 0);
             assert_eq!(closesocket(cli), 0);
             assert_eq!(closesocket(srv), 0);
+        }
+    }
+
+    #[test]
+    fn host_proto_byteorder_and_enum_protocols_work() {
+        unsafe {
+            // gethostbyname on loopback literal & localhost
+            let he_ptr = gethostbyname(c"127.0.0.1".as_ptr() as *const u8) as *const WinHostent;
+            assert!(!he_ptr.is_null());
+            assert_eq!((*he_ptr).h_addrtype, AF_INET as i16);
+            assert_eq!((*he_ptr).h_length, 4);
+            let first_addr = *(*he_ptr).h_addr_list;
+            assert!(!first_addr.is_null());
+            assert_eq!(std::slice::from_raw_parts(first_addr, 4), &[127, 0, 0, 1]);
+
+            // gethostbyaddr on 127.0.0.1
+            let ip = [127u8, 0, 0, 1];
+            let he2 = gethostbyaddr(ip.as_ptr(), 4, AF_INET as i32) as *const WinHostent;
+            assert!(!he2.is_null());
+            assert!(!(*he2).h_name.is_null());
+
+            // getprotobyname("tcp") / ("udp") / unknown
+            let pe_tcp = getprotobyname(c"tcp".as_ptr() as *const u8) as *const WinProtoent;
+            assert!(!pe_tcp.is_null());
+            assert_eq!((*pe_tcp).p_proto, 6);
+            let pe_udp = getprotobyname(c"udp".as_ptr() as *const u8) as *const WinProtoent;
+            assert!(!pe_udp.is_null());
+            assert_eq!((*pe_udp).p_proto, 17);
+            assert!(getprotobyname(c"definitely_not_a_proto_xyz".as_ptr() as *const u8).is_null());
+            assert_eq!(WSAGetLastError(), WSANO_DATA as i32);
+
+            // WSAHtonl/WSAHtons/WSANtohl/WSANtohs + WSAENOTSOCK validation
+            let s = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            assert_ne!(s, INVALID_SOCKET);
+            let mut nl = 0u32;
+            let mut hl = 0u32;
+            let mut ns = 0u16;
+            let mut hs = 0u16;
+            assert_eq!(WSAHtonl(s, 0x1234_5678, &mut nl), 0);
+            assert_eq!(nl, 0x1234_5678u32.to_be());
+            assert_eq!(WSANtohl(s, nl, &mut hl), 0);
+            assert_eq!(hl, 0x1234_5678);
+            assert_eq!(WSAHtons(s, 0x1234, &mut ns), 0);
+            assert_eq!(ns, 0x1234u16.to_be());
+            assert_eq!(WSANtohs(s, ns, &mut hs), 0);
+            assert_eq!(hs, 0x1234);
+            assert_eq!(WSAHtonl(0xDEAD_BEEF, 1, &mut nl), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAENOTSOCK as i32);
+
+            // WSARecvDisconnect / WSASendDisconnect on connected loopback pair
+            let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            let sa = loopback_sa(0);
+            assert_eq!(bind(srv, sa.as_ptr(), 16), 0);
+            assert_eq!(listen(srv, 1), 0);
+            let mut bound = [0u8; 16];
+            let mut blen = 16i32;
+            assert_eq!(getsockname(srv, bound.as_mut_ptr(), &mut blen), 0);
+            assert_eq!(connect(s, bound.as_ptr(), 16), 0);
+            let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+            assert_ne!(acc, INVALID_SOCKET);
+            assert_eq!(WSASendDisconnect(s, std::ptr::null_mut()), 0);
+            assert_eq!(WSARecvDisconnect(acc, std::ptr::null_mut()), 0);
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(srv), 0);
+            assert_eq!(closesocket(s), 0);
+
+            // WSAEnumProtocolsA / W sizing + filter
+            let mut len = 0u32;
+            assert_eq!(WSAEnumProtocolsA(std::ptr::null(), std::ptr::null_mut(), &mut len), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAENOBUFS as i32);
+            assert_eq!(len, 4 * 372);
+            let mut buf_a = vec![0u8; len as usize];
+            assert_eq!(WSAEnumProtocolsA(std::ptr::null(), buf_a.as_mut_ptr(), &mut len), 4);
+            let tcp_filter = [libc::IPPROTO_TCP, 0];
+            let mut len_w = 0u32;
+            assert_eq!(WSAEnumProtocolsW(tcp_filter.as_ptr(), std::ptr::null_mut(), &mut len_w), SOCKET_ERROR);
+            assert_eq!(len_w, 2 * 628);
+            let mut buf_w = vec![0u8; len_w as usize];
+            assert_eq!(WSAEnumProtocolsW(tcp_filter.as_ptr(), buf_w.as_mut_ptr(), &mut len_w), 2);
         }
     }
 }

@@ -747,6 +747,9 @@ pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> us
     }
     len
 }
+pub unsafe extern "win64" fn wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
+    crate::misc::vcruntime140::wcsstr(haystack, needle)
+}
 pub unsafe extern "win64" fn wcscpy(d: *mut u16, s: *const u16) -> *mut u16 {
     std::ptr::copy(s, d, wcslen(s) + 1);
     d

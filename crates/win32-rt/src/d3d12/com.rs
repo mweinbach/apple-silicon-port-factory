@@ -120,19 +120,133 @@ unsafe extern "win64" fn trap_handler(id: *const TrapId, ret: usize, regs: *cons
     ctx.rip = ret as u64;
     log::error!("guest backtrace:");
     crate::unwind::log_backtrace(&ctx);
-    if let Some(s) = std::env::var("AW2_EXIT_HOLD").ok().and_then(|v| v.parse::<u32>().ok()) {
-        log::error!("AW2_EXIT_HOLD: holding {s} s before exit");
+    crate::crash::report(&format!("unimplemented COM method {}", id.name), None, &ctx);
+    if let Some(s) = std::env::var("PORT_EXIT_HOLD")
+        .or_else(|_| std::env::var("AW2_EXIT_HOLD"))
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        log::error!("EXIT_HOLD: holding {s} s before exit");
         libc::sleep(s);
     }
     crate::process::exit_process(0xC000_0139)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe extern "win64" fn unimplemented_com_trap() -> ! {
+const MAX_COM_TRAPS: usize = 1024;
+
+#[cfg(not(target_arch = "x86_64"))]
+static COM_TRAP_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(not(target_arch = "x86_64"))]
+#[cold]
+#[inline(never)]
+unsafe fn com_trap_dispatch(idx: usize) -> ! {
+    let name = COM_TRAP_NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(idx)
+        .cloned()
+        .unwrap_or_else(|| format!("<unknown COM trap #{idx}>"));
     d3d12_metal::trace::flush();
-    log::error!("UNIMPLEMENTED COM method called on aarch64");
-    eprintln!("UNIMPLEMENTED COM method called on aarch64");
+    let caller = crate::crash::guest_caller_hint()
+        .map(|pc| crate::symbolize(pc as usize))
+        .unwrap_or_else(|| "<unknown caller>".to_string());
+    log::error!("UNIMPLEMENTED {name} (COM method) called from {caller}");
+    eprintln!("UNIMPLEMENTED {name} called from {caller}");
+    let ctx = crate::crash::capture_guest_context()
+        .unwrap_or_else(crate::unwind::Context::zeroed);
+    crate::crash::report(&format!("unimplemented COM method {name}"), None, &ctx);
+    if let Some(s) = std::env::var("PORT_EXIT_HOLD")
+        .or_else(|_| std::env::var("AW2_EXIT_HOLD"))
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        log::error!("EXIT_HOLD: holding {s} s before exit");
+        libc::sleep(s);
+    }
     crate::process::exit_process(0xC000_0139)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[cold]
+#[inline(never)]
+unsafe extern "win64" fn com_trap_entry<const N: usize>() -> ! {
+    com_trap_dispatch(N)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[cold]
+#[inline(never)]
+unsafe extern "win64" fn com_trap_overflow() -> ! {
+    com_trap_dispatch(usize::MAX)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! com_trap_row16 {
+    ($base:expr) => {
+        [
+            com_trap_entry::<{ $base + 0 }>,
+            com_trap_entry::<{ $base + 1 }>,
+            com_trap_entry::<{ $base + 2 }>,
+            com_trap_entry::<{ $base + 3 }>,
+            com_trap_entry::<{ $base + 4 }>,
+            com_trap_entry::<{ $base + 5 }>,
+            com_trap_entry::<{ $base + 6 }>,
+            com_trap_entry::<{ $base + 7 }>,
+            com_trap_entry::<{ $base + 8 }>,
+            com_trap_entry::<{ $base + 9 }>,
+            com_trap_entry::<{ $base + 10 }>,
+            com_trap_entry::<{ $base + 11 }>,
+            com_trap_entry::<{ $base + 12 }>,
+            com_trap_entry::<{ $base + 13 }>,
+            com_trap_entry::<{ $base + 14 }>,
+            com_trap_entry::<{ $base + 15 }>,
+        ]
+    };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! com_trap_block64 {
+    ($base:expr) => {
+        [
+            com_trap_row16!($base + 0),
+            com_trap_row16!($base + 16),
+            com_trap_row16!($base + 32),
+            com_trap_row16!($base + 48),
+        ]
+    };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! com_trap_block256 {
+    ($base:expr) => {
+        [
+            com_trap_block64!($base + 0),
+            com_trap_block64!($base + 64),
+            com_trap_block64!($base + 128),
+            com_trap_block64!($base + 192),
+        ]
+    };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+static COM_TRAP_TABLE: [[[[unsafe extern "win64" fn() -> !; 16]; 4]; 4]; 4] = [
+    com_trap_block256!(0),
+    com_trap_block256!(256),
+    com_trap_block256!(512),
+    com_trap_block256!(768),
+];
+
+#[cfg(not(target_arch = "x86_64"))]
+fn com_trap_fn_ptr(idx: usize) -> usize {
+    let b256 = idx / 256;
+    let rem256 = idx % 256;
+    let b64 = rem256 / 64;
+    let rem64 = rem256 % 64;
+    let r16 = rem64 / 16;
+    let c = rem64 % 16;
+    COM_TRAP_TABLE[b256][b64][r16][c] as *const () as usize
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -158,8 +272,22 @@ fn trap_thunk(name: String) -> usize {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn trap_thunk(_name: String) -> usize {
-    unimplemented_com_trap as *const () as usize
+fn trap_thunk(name: String) -> usize {
+    let mut names = COM_TRAP_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = names.iter().position(|n| n == &name) {
+        return com_trap_fn_ptr(existing);
+    }
+    let idx = names.len();
+    if idx < MAX_COM_TRAPS {
+        names.push(name);
+        com_trap_fn_ptr(idx)
+    } else {
+        log::warn!(
+            target: "d3d",
+            "COM trap table full ({MAX_COM_TRAPS}); {name} using overflow trap"
+        );
+        com_trap_overflow as *const () as usize
+    }
 }
 
 /// Build a vtable for interface `iface` from `(method name, implementation)`
@@ -293,7 +421,7 @@ pub unsafe extern "win64" fn qi<T: ComClass>(this: *mut Obj<T>, riid: *const Gui
         *out = p;
         return S_OK;
     }
-    log::debug!(target: "d3d", "{}::QueryInterface({:?}) -> E_NOINTERFACE", c.name, iid);
+    crate::com::warn_qi_failed_once(c.name, &iid);
     E_NOINTERFACE
 }
 
@@ -494,6 +622,7 @@ mod tests {
                 let mut s = dxgi_object_slots::<Dummy>();
                 s.push(slot!("GetVal" => get_val));
                 s.push(slot!("Missing"));
+                s.push(slot!("MissingTwo"));
                 Class { name: "IDummy", vtbl: build_vtable("IDummy", &s), iids: &[IID_DUMMY] }
             })
         }
@@ -519,7 +648,11 @@ mod tests {
             assert_eq!(getp(o, &WKPDID_D3DDebugObjectName, &mut sz, std::ptr::null_mut()), S_OK);
             assert_eq!(sz, 4);
             assert_eq!((*(o as *mut Obj<Dummy>)).debug_name(), "abc");
-            assert_eq!(thunk_name(*vt.add(7)).as_deref(), Some("IDummy::Missing"));
+            let trap1 = *vt.add(7);
+            let trap2 = *vt.add(8);
+            assert_ne!(trap1, trap2, "distinct missing COM slots must have distinct trap entries");
+            assert_eq!(thunk_name(trap1).as_deref(), Some("IDummy::Missing"));
+            assert_eq!(thunk_name(trap2).as_deref(), Some("IDummy::MissingTwo"));
             assert_eq!(com_release(o), 1);
             assert_eq!(com_release(o), 0);
         }

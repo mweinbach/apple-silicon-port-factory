@@ -118,6 +118,10 @@ pub struct Report {
     pub t_us: [u64; 3],
     pub fault_addr: [u64; 3],
     pub fault_pc: [u64; 3],
+    /// Raw `waitpid` status (or `-errno` when `waitpid < 0`) per run: G1, N, G2.
+    pub run_status: [i32; 3],
+    /// Signal recorded by `on_fault` (`RunHdr::fault_sig`) per run: G1, N, G2.
+    pub fault_sig: [u32; 3],
     pub diff_bytes: u64,
     pub diff_ranges: u32,
     /// Diff ranges where both sides hold pointers into the probe heap arena.

@@ -1,22 +1,28 @@
 //! Diagnostic & verification toolkit CLI subcommands (`runtime-audit`, `verify-x86`,
 //! `oracle`, `bisect-runtime`, `live-probe`, `nan-trace`).
 
-use super::{workspace_root, ArgCursor};
-use anyhow::{bail, Context, Result};
+use super::{emit_json, usage_err, workspace_root, ArgCursor};
+use anyhow::{Context, Result};
 use port_factory::bundle_common::{find_or_build_host_port_runner, TempDirGuard};
 use port_factory::diag_toolkit::{
     audit_pe_runtime_hazards, find_or_build_x86_verify, format_hazard_reports,
     resolve_debug_script, NanTraceSpec,
 };
+use port_factory::json_output::{
+    exit_codes, parse_json, runtime_audit_data_json, JsonEnvelope, JsonObj, JsonValue,
+};
 use port_factory::scanner::collect_pe_files;
 use std::path::PathBuf;
 
-pub fn cmd_runtime_audit(args: &[String]) -> Result<()> {
+pub fn cmd_runtime_audit(args: &[String]) -> Result<i32> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        bail!("usage: port-factory runtime-audit <PE_FILE_OR_DIR...> [--only SUBSTR]");
+        return Err(usage_err(
+            "usage: port-factory runtime-audit <PE_FILE_OR_DIR...> [--only SUBSTR] [--json]",
+        ));
     }
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut only_filter: Option<String> = None;
+    let mut json = false;
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
@@ -26,12 +32,15 @@ pub fn cmd_runtime_audit(args: &[String]) -> Result<()> {
                         .to_ascii_lowercase(),
                 );
             }
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p => paths.push(PathBuf::from(p)),
         }
     }
     if paths.is_empty() {
-        bail!("runtime-audit requires at least one PE file or directory");
+        return Err(usage_err(
+            "runtime-audit requires at least one PE file or directory",
+        ));
     }
     let mut files = Vec::new();
     for p in &paths {
@@ -45,24 +54,37 @@ pub fn cmd_runtime_audit(args: &[String]) -> Result<()> {
         });
     }
     if files.is_empty() {
-        bail!("no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {:?}", paths);
+        return Err(usage_err(format!(
+            "no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {paths:?}"
+        )));
     }
     let mut reports = Vec::new();
+    let mut skipped = Vec::new();
     for f in &files {
         match audit_pe_runtime_hazards(f) {
             Ok(r) => reports.push(r),
-            Err(e) => eprintln!("[SKIP] {}: {e}", f.display()),
+            Err(e) => {
+                if !json {
+                    eprintln!("[SKIP] {}: {e}", f.display());
+                }
+                skipped.push((f.display().to_string(), format!("{e:#}")));
+            }
         }
     }
+    if json {
+        let data = runtime_audit_data_json(&reports, &skipped);
+        return Ok(emit_json(&JsonEnvelope::ok("runtime-audit", data)));
+    }
     print!("{}", format_hazard_reports(&reports));
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_verify_x86(args: &[String]) -> Result<()> {
+pub fn cmd_verify_x86(args: &[String]) -> Result<i32> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
             "usage: port-factory verify-x86 <PE_FILE_OR_DIR...> [options]\n\
              Toolkit options:\n\
+             \x20 --json                Emit stable schema v1 JSON envelope on stdout\n\
              \x20 --oracle              Export FP/SIMD samples and verify on Rosetta 2 x86-64 hardware\n\
              \x20 --oracle-dir DIR      Directory for Rosetta 2 oracle snapshots\n\
              \x20 --oracle-sample N     Samples per binary (default 32 when --oracle is set)\n\
@@ -71,11 +93,12 @@ pub fn cmd_verify_x86(args: &[String]) -> Result<()> {
              \x20  --rva LO..HI, --fp-only, --only SUBSTR, --fast-nan, --strict-nan-payload,\n\
              \x20  --no-fast, --no-jit, --no-aot, --no-linked, --threads N)"
         );
-        return Ok(());
+        return Ok(exit_codes::OK);
     }
     let root = workspace_root();
     let mut run_oracle = false;
     let mut force_build = false;
+    let mut json = false;
     let mut oracle_dir: Option<PathBuf> = None;
     let mut oracle_sample: Option<usize> = None;
     let mut pass_args: Vec<String> = Vec::new();
@@ -85,12 +108,16 @@ pub fn cmd_verify_x86(args: &[String]) -> Result<()> {
         match a {
             "--oracle" => run_oracle = true,
             "--rebuild" => force_build = true,
+            "--json" => json = true,
             "--oracle-dir" => {
-                oracle_dir = Some(PathBuf::from(cur.next_or_err("--oracle-dir requires DIR")?));
+                oracle_dir = Some(cur.next_path_or_err("--oracle-dir requires DIR")?);
             }
             "--oracle-sample" => {
                 let raw = cur.next_or_err("--oracle-sample requires N")?;
-                oracle_sample = Some(raw.parse().context("invalid --oracle-sample")?);
+                oracle_sample = Some(
+                    raw.parse()
+                        .map_err(|_| usage_err(format!("invalid --oracle-sample {raw:?}")))?,
+                );
             }
             other => pass_args.push(other.to_string()),
         }
@@ -113,15 +140,94 @@ pub fn cmd_verify_x86(args: &[String]) -> Result<()> {
             pass_args.push(n.to_string());
         }
     }
+    if json {
+        pass_args.push("--json".to_string());
+    }
 
     let bin = find_or_build_x86_verify(&root, force_build)?;
+
+    if json && run_oracle {
+        let out = std::process::Command::new(&bin)
+            .args(&pass_args)
+            .output()
+            .with_context(|| format!("running {}", bin.display()))?;
+        let verify_code = out.status.code().unwrap_or(exit_codes::RUNTIME_ERROR);
+        let verify_stdout = String::from_utf8_lossy(&out.stdout);
+        let verify_val = parse_json(verify_stdout.trim()).unwrap_or_else(|_| {
+            JsonObj::new()
+                .str("raw_stdout", verify_stdout.trim().to_string())
+                .build()
+        });
+        let verify_data = verify_val
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| verify_val.clone());
+
+        if !out.status.success() {
+            drop(auto_oracle_guard);
+            print!("{verify_stdout}");
+            return Ok(verify_code);
+        }
+
+        let mut oracle_val = JsonValue::Null;
+        let mut oracle_code = exit_codes::OK;
+        if let Some(ref od) = oracle_dir {
+            let script = resolve_debug_script(&root, "x86_oracle.py")?;
+            let max_n = oracle_sample.unwrap_or(32).saturating_mul(16).max(256);
+            let oout = std::process::Command::new("python3")
+                .arg(&script)
+                .arg(od)
+                .arg("--max")
+                .arg(max_n.to_string())
+                .arg("--quiet-matches")
+                .arg("--json")
+                .output()
+                .with_context(|| format!("running {}", script.display()))?;
+            oracle_code = oout.status.code().unwrap_or(exit_codes::RUNTIME_ERROR);
+            let ostdout = String::from_utf8_lossy(&oout.stdout);
+            oracle_val = parse_json(ostdout.trim())
+                .ok()
+                .and_then(|v| v.get("data").cloned())
+                .unwrap_or_else(|| {
+                    JsonObj::new()
+                        .str("raw_stdout", ostdout.trim().to_string())
+                        .build()
+                });
+        }
+        drop(auto_oracle_guard);
+
+        let merged = match verify_data {
+            JsonValue::Object(mut entries) => {
+                entries.push(("oracle".to_string(), oracle_val));
+                JsonValue::Object(entries)
+            }
+            other => JsonObj::new()
+                .val("verify", other)
+                .val("oracle", oracle_val)
+                .build(),
+        };
+        let final_code = if oracle_code != exit_codes::OK {
+            oracle_code
+        } else {
+            verify_code
+        };
+        let err_msg = (final_code != exit_codes::OK)
+            .then(|| format!("verify-x86 exited with code {final_code}"));
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "verify-x86",
+            final_code,
+            merged,
+            err_msg,
+        )));
+    }
+
     let status = std::process::Command::new(&bin)
         .args(&pass_args)
         .status()
         .with_context(|| format!("running {}", bin.display()))?;
     if !status.success() {
         drop(auto_oracle_guard);
-        std::process::exit(status.code().unwrap_or(1));
+        return Ok(status.code().unwrap_or(exit_codes::RUNTIME_ERROR));
     }
 
     if run_oracle {
@@ -139,14 +245,14 @@ pub fn cmd_verify_x86(args: &[String]) -> Result<()> {
                 .with_context(|| format!("running {}", script.display()))?;
             drop(auto_oracle_guard);
             if !ostatus.success() {
-                std::process::exit(ostatus.code().unwrap_or(1));
+                return Ok(ostatus.code().unwrap_or(exit_codes::RUNTIME_ERROR));
             }
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-fn run_debug_python(script_name: &str, args: &[String]) -> Result<()> {
+fn run_debug_python(script_name: &str, args: &[String]) -> Result<i32> {
     let root = workspace_root();
     let script = resolve_debug_script(&root, script_name)?;
     let status = std::process::Command::new("python3")
@@ -154,25 +260,22 @@ fn run_debug_python(script_name: &str, args: &[String]) -> Result<()> {
         .args(args)
         .status()
         .with_context(|| format!("running {}", script.display()))?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    Ok(status.code().unwrap_or(exit_codes::RUNTIME_ERROR))
 }
 
-pub fn cmd_oracle(args: &[String]) -> Result<()> {
+pub fn cmd_oracle(args: &[String]) -> Result<i32> {
     run_debug_python("x86_oracle.py", args)
 }
 
-pub fn cmd_bisect_runtime(args: &[String]) -> Result<()> {
+pub fn cmd_bisect_runtime(args: &[String]) -> Result<i32> {
     run_debug_python("bisect_runtime.py", args)
 }
 
-pub fn cmd_live_probe(args: &[String]) -> Result<()> {
+pub fn cmd_live_probe(args: &[String]) -> Result<i32> {
     run_debug_python("live_probe.py", args)
 }
 
-pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
+pub fn cmd_nan_trace(args: &[String]) -> Result<i32> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
             "usage: port-factory nan-trace <PE_OR_MANIFEST_TOML> [options] [-- <game-args...>]\n\
@@ -191,7 +294,7 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
              \x20 --control-dir DIR     Enable PORT_CONTROL_DIR=DIR\n\
              \x20 --run-oracle          Automatically run Rosetta 2 x86_oracle.py on --dump-dir after exit"
         );
-        return Ok(());
+        return Ok(exit_codes::OK);
     }
     let root = workspace_root();
     let mut target: Option<PathBuf> = None;
@@ -210,7 +313,7 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
                 break;
             }
             "--game-dir" => {
-                game_dir = Some(PathBuf::from(cur.next_or_err("--game-dir requires DIR")?));
+                game_dir = Some(cur.next_path_or_err("--game-dir requires DIR")?);
             }
             "--module" => {
                 spec.modules
@@ -227,31 +330,34 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
                 spec.host_filter = Some(cur.next_or_err("--host requires SUBSTR")?.to_string());
             }
             "--dump-dir" => {
-                spec.dump_dir = Some(PathBuf::from(cur.next_or_err("--dump-dir requires DIR")?));
+                spec.dump_dir = Some(cur.next_path_or_err("--dump-dir requires DIR")?);
             }
             "--log" => {
-                spec.log_file = Some(PathBuf::from(cur.next_or_err("--log requires FILE")?));
+                spec.log_file = Some(cur.next_path_or_err("--log requires FILE")?);
             }
             "--stores" => spec.trace_stores = true,
             "--max" => {
                 let raw = cur.next_or_err("--max requires N")?;
-                spec.max_events = Some(raw.parse().context("invalid --max")?);
+                spec.max_events = Some(
+                    raw.parse()
+                        .map_err(|_| usage_err(format!("invalid --max {raw:?}")))?,
+                );
             }
             "--armed" => spec.start_armed = true,
             "--no-boundary" => boundary = false,
             "--control-dir" => {
-                control_dir = Some(PathBuf::from(
-                    cur.next_or_err("--control-dir requires DIR")?,
-                ));
+                control_dir = Some(cur.next_path_or_err("--control-dir requires DIR")?);
             }
             "--run-oracle" => run_oracle = true,
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p if target.is_none() => target = Some(PathBuf::from(p)),
-            other => bail!("unexpected argument {other:?}"),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
         }
     }
 
-    let target = target.context("nan-trace requires <PE_OR_MANIFEST_TOML>")?;
+    let Some(target) = target else {
+        return Err(usage_err("nan-trace requires <PE_OR_MANIFEST_TOML>"));
+    };
     if let Some(ref dd) = spec.dump_dir {
         std::fs::create_dir_all(dd)?;
     }
@@ -291,10 +397,13 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
                 "\n=== Running Rosetta 2 x86-64 oracle on {} ===",
                 dd.display()
             );
-            run_debug_python(
+            let ocode = run_debug_python(
                 "x86_oracle.py",
                 &[dd.to_string_lossy().into_owned(), "--quiet-matches".into()],
             )?;
+            if ocode != exit_codes::OK {
+                return Ok(ocode);
+            }
         } else {
             eprintln!(
                 "Tip: replay captured snapshots on Rosetta 2 via: cargo opsdb -- oracle {}",
@@ -302,8 +411,5 @@ pub fn cmd_nan_trace(args: &[String]) -> Result<()> {
             );
         }
     }
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    Ok(status.code().unwrap_or(exit_codes::RUNTIME_ERROR))
 }

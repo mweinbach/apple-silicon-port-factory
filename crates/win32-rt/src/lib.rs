@@ -60,7 +60,9 @@ win64_abi::win64_mods! {
 pub mod config;
 pub mod det_entropy;
 pub mod middleware;
+pub mod present;
 pub mod shadow;
+pub mod stub_registry;
 /// Cross-Apple platform backend alias (`AppKit` on macOS, `UIKit`/host-surface on iOS).
 pub use macos as platform;
 /// Re-exported for `aw2-game` (`shadow`), which has no direct `libc` dependency.

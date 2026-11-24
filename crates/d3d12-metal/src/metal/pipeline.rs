@@ -153,6 +153,51 @@ pub fn flush_pso_cache_if_initialized() {
     }
 }
 
+/// Plain snapshot of Tier-1 shader converter and Tier-2 Metal 4 PSO cache counters
+/// for boot reports (`port-runner --report-json`). Never lazily initializes Metal or `dxil-metald`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShaderReportStats {
+    pub tier1_initialized: bool,
+    pub tier1_memory_hits: u64,
+    pub tier1_disk_hits: u64,
+    pub tier1_compiles: u64,
+    pub tier1_failures: u64,
+    pub tier1_compile_ms: u64,
+    pub pso_initialized: bool,
+    pub pso_memory_hits: u64,
+    pub pso_archive_hits: u64,
+    pub pso_compiles: u64,
+    pub pso_failures: u64,
+    pub pso_compile_ms: u64,
+}
+
+/// Snapshot Tier-2 Metal 4 PSO cache stats if initialized (never lazily initializes Metal).
+pub fn pso_cache_stats_if_initialized() -> Option<dxil_metal::pso_cache::PipelineCacheStats> {
+    PSO_CACHE.get().and_then(|r| r.as_ref().ok()).map(|c| c.0.stats())
+}
+
+/// Combined Tier-1 + Tier-2 shader stats snapshot without lazily initializing either subsystem.
+pub fn shader_report_stats_if_initialized() -> ShaderReportStats {
+    let mut s = ShaderReportStats::default();
+    if let Some(t1) = dxil_metal::ShaderPipeline::stats_if_initialized() {
+        s.tier1_initialized = true;
+        s.tier1_memory_hits = t1.memory_hits;
+        s.tier1_disk_hits = t1.disk_hits;
+        s.tier1_compiles = t1.compiles;
+        s.tier1_failures = t1.compile_failures;
+        s.tier1_compile_ms = t1.compile_nanos / 1_000_000;
+    }
+    if let Some(t2) = pso_cache_stats_if_initialized() {
+        s.pso_initialized = true;
+        s.pso_memory_hits = t2.memory_hits;
+        s.pso_archive_hits = t2.archive_hits;
+        s.pso_compiles = t2.compiles;
+        s.pso_failures = t2.failures;
+        s.pso_compile_ms = t2.compile_nanos / 1_000_000;
+    }
+    s
+}
+
 struct Libs(Mutex<HashMap<u128, Retained<MtlLibrary>>>);
 unsafe impl Send for Libs {}
 unsafe impl Sync for Libs {}

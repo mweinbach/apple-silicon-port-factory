@@ -105,6 +105,16 @@ pub fn inspect_pe_dotnet(path: &Path) -> Result<DotNetBinaryReport> {
 
 /// Inspect raw PE bytes for `.NET` / CLR / Mono / `IL2CPP` characteristics.
 pub fn inspect_pe_dotnet_bytes(path: &Path, data: &[u8]) -> Result<DotNetBinaryReport> {
+    let parsed = Pe::parse(data).ok();
+    inspect_pe_dotnet_parsed(path, parsed.as_ref(), data)
+}
+
+/// Inspect an already-parsed [`Pe`] (if PE32+) and raw bytes for `.NET` / CLR / Mono / `IL2CPP` characteristics.
+pub fn inspect_pe_dotnet_parsed(
+    path: &Path,
+    pe_opt: Option<&Pe>,
+    data: &[u8],
+) -> Result<DotNetBinaryReport> {
     let file_name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -123,7 +133,7 @@ pub fn inspect_pe_dotnet_bytes(path: &Path, data: &[u8]) -> Result<DotNetBinaryR
         .as_ref()
         .map_or(pe_image::consts::IMAGE_FILE_MACHINE_AMD64, |c| c.machine);
 
-    if let Ok(pe) = Pe::parse(data) {
+    if let Some(pe) = pe_opt {
         is_pe32_plus = true;
         machine = pe.headers.machine;
         if let Ok(imps) = pe.imports() {

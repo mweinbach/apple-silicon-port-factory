@@ -1777,12 +1777,12 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     let actual = if let Some(a) = fast {
                         a
                     } else {
-                        static FAST_CMPXCHG16B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-                        let _g = FAST_CMPXCHG16B_LOCK.lock().unwrap();
+                        let _g = crate::emu::cpu::lock_atomic_shard(addr);
                         let actual = cpu.read_u128(addr);
                         if actual == expected {
                             cpu.write_u128(addr, desired);
                         }
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                         actual
                     };
                     if actual == expected {

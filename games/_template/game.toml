@@ -66,3 +66,13 @@ legacy_remedy_migration = false
 # "telemetry.dll" = "disabled"
 # "legacy_input.dll" = "alias:xinput1_4.dll"
 # "custom_video.dll" = "builtin:bink2w64.dll"
+
+# Per-game runtime knob defaults (run `port-runner --knobs` to list all registered knobs).
+# Precedence is strictly: process environment > game.toml [knobs] > registry default.
+# Prefer canonical `PORT_*` names (legacy `AW2_*` aliases are also accepted).
+# Knobs that alter ARM64 AOT codegen automatically fold into the `.aot` cache key.
+# [knobs]
+# PORT_METALFX = true
+# PORT_D3D11 = true
+# PORT_VRAM_MB = 8192
+# PORT_AUDIO_RATE = "48000"

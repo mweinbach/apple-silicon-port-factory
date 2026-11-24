@@ -428,7 +428,10 @@ enum FiberCmd {
         thread_obj: Option<Arc<ThreadObj>>,
         caller: Option<(Arc<FiberSync>, usize)>,
     },
-    Exit,
+    Exit {
+        teb: *mut u8,
+        thread_obj: Option<Arc<ThreadObj>>,
+    },
 }
 
 unsafe impl Send for FiberCmd {}
@@ -485,7 +488,7 @@ struct FiberStart {
 extern "C" fn fiber_thread_main(arg: *mut c_void) -> *mut c_void {
     let start_info = unsafe { Box::from_raw(arg as *mut FiberStart) };
     match start_info.sync.wait() {
-        FiberCmd::Exit | FiberCmd::Idle => return std::ptr::null_mut(),
+        FiberCmd::Exit { .. } | FiberCmd::Idle => return std::ptr::null_mut(),
         FiberCmd::Resume { teb, thread_obj, caller } => unsafe {
             let me = libc::pthread_self();
             let hi = libc::pthread_get_stackaddr_np(me) as usize;
@@ -503,6 +506,7 @@ extern "C" fn fiber_thread_main(arg: *mut c_void) -> *mut c_void {
             }
             thread::install_current_thread_context(thread_obj);
             let _ = crate::call_guest8(start_info.start, start_info.param as u64, 0, 0, 0, 0, 0, 0, 0);
+            thread::run_fls_callbacks();
             // Fiber start routine returned without calling `SwitchToFiber`:
             // hand TEB + ThreadObj back to the most recent caller fiber so it
             // resumes cleanly instead of deadlocking.
@@ -648,12 +652,42 @@ pub unsafe extern "win64" fn DeleteFiber(fiber: *mut c_void) {
     if !fiber.is_null() {
         let cur = current_fiber_raw();
         if fiber as usize == cur {
+            thread::run_fls_callbacks();
             ExitThread(0);
         } else {
             let boxed = Box::from_raw(fiber as *mut Fiber);
-            boxed.sync.send(FiberCmd::Exit);
             if let Some(tid) = boxed.pthread {
+                let caller_teb = teb::current_raw();
+                let (saved_base, saved_limit, saved_fiber) = if !caller_teb.is_null() {
+                    (
+                        teb::field::<usize>(caller_teb, teb::off::STACK_BASE),
+                        teb::field::<usize>(caller_teb, teb::off::STACK_LIMIT),
+                        teb::field::<usize>(caller_teb, teb::off::FIBER_DATA),
+                    )
+                } else {
+                    (0, 0, 0)
+                };
+                let caller_obj = thread::take_current_thread_context();
+                if !caller_teb.is_null() {
+                    teb::uninstall();
+                }
+                boxed.sync.send(FiberCmd::Exit {
+                    teb: caller_teb,
+                    thread_obj: caller_obj.clone(),
+                });
                 let _ = libc::pthread_join(tid, std::ptr::null_mut());
+                if !caller_teb.is_null() {
+                    teb::set_field(caller_teb, teb::off::STACK_BASE, saved_base);
+                    teb::set_field(caller_teb, teb::off::STACK_LIMIT, saved_limit);
+                    teb::set_fiber_data(caller_teb, saved_fiber);
+                    teb::install(caller_teb);
+                }
+                thread::install_current_thread_context(caller_obj);
+            } else {
+                boxed.sync.send(FiberCmd::Exit {
+                    teb: std::ptr::null_mut(),
+                    thread_obj: None,
+                });
             }
         }
     }
@@ -702,7 +736,24 @@ pub unsafe extern "win64" fn SwitchToFiber(fiber: *mut c_void) {
             }
             thread::install_current_thread_context(resumed_obj);
         }
-        FiberCmd::Exit | FiberCmd::Idle => {
+        FiberCmd::Exit { teb: exit_teb, thread_obj: exit_obj } => {
+            if !exit_teb.is_null() {
+                if (*old_ptr).stack_base != 0 {
+                    teb::set_field(exit_teb, teb::off::STACK_BASE, (*old_ptr).stack_base);
+                    teb::set_field(exit_teb, teb::off::STACK_LIMIT, (*old_ptr).stack_limit);
+                }
+                teb::set_fiber_data(exit_teb, old_ptr as usize);
+                teb::install(exit_teb);
+            }
+            thread::install_current_thread_context(exit_obj);
+            thread::run_fls_callbacks();
+            let _ = thread::take_current_thread_context();
+            if !exit_teb.is_null() {
+                teb::uninstall();
+            }
+            libc::pthread_exit(std::ptr::null_mut());
+        }
+        FiberCmd::Idle => {
             libc::pthread_exit(std::ptr::null_mut());
         }
     }

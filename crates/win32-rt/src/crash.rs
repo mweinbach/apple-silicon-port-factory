@@ -32,7 +32,7 @@
 use crate::unwind::{self, Context, ExceptionRecord, RBP, RSP};
 use std::cell::UnsafeCell;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,33 @@ static GUEST_STATE: std::sync::OnceLock<GuestStateFn> = std::sync::OnceLock::new
 /// Register the provider for the "guest interpreter state" section of crash reports.
 pub fn set_guest_state_hook(f: GuestStateFn) {
     let _ = GUEST_STATE.set(f);
+}
+
+/// Snapshot the calling thread's innermost guest x86-64 interpreter state as a
+/// [`Context`] suitable for [`report`], if the thread is currently running guest code.
+pub fn capture_guest_context() -> Option<Context> {
+    let (gpr, rip) = GUEST_STATE.get()?()?;
+    let mut ctx = Context::zeroed();
+    ctx.context_flags = unwind::CONTEXT_FULL | unwind::CONTEXT_SEGMENTS;
+    ctx.gpr = gpr;
+    ctx.rip = rip;
+    ctx.mx_csr = 0x1F80;
+    Some(ctx)
+}
+
+/// Best-effort guest caller PC for native traps called from guest code on ARM64
+/// (prefers `[rsp]` when guest RIP is outside a mapped PE module, else guest RIP).
+pub fn guest_caller_hint() -> Option<u64> {
+    let (gpr, rip) = GUEST_STATE.get()?()?;
+    if loader_module(rip) {
+        return Some(rip);
+    }
+    if let Some(caller) = read_u64(gpr[RSP]) {
+        if loader_module(caller) {
+            return Some(caller);
+        }
+    }
+    (rip != 0).then_some(rip)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +325,8 @@ fn guest_frames(guest: Option<([u64; 16], u64)>) -> Vec<u64> {
 
 /// pthread of the process main thread (AppKit), recorded by [`install`].
 static MAIN_PTHREAD: AtomicUsize = AtomicUsize::new(0);
+/// True once [`install`] has registered the `SIGUSR2` snapshot handler.
+static SNAP_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn snapshot_handler(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
     unsafe {
@@ -333,6 +362,7 @@ pub fn install() {
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
+        SNAP_HANDLER_INSTALLED.store(true, Ordering::Release);
     }
 }
 
@@ -340,6 +370,9 @@ static SNAP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Interrupt `pthread`, walk its stack while it is parked, release it.
 unsafe fn snapshot_walk(pthread: usize, max: usize) -> Result<Vec<u64>, &'static str> {
+    if !SNAP_HANDLER_INSTALLED.load(Ordering::Acquire) {
+        return Err("SIGUSR2 snapshot handler not installed");
+    }
     let _guard = SNAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if SNAP.state.load(Ordering::Acquire) != SNAP_IDLE {
         // A previous target timed out and has not left the handler yet.
@@ -423,7 +456,7 @@ fn line(s: impl AsRef<str>) {
 }
 
 fn crash_dir() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("AW2_CRASH_DIR") {
+    if let Some(p) = std::env::var_os("PORT_CRASH_DIR").or_else(|| std::env::var_os("AW2_CRASH_DIR")) {
         return p.into();
     }
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -509,6 +542,14 @@ pub unsafe fn report(title: &str, rec: Option<&ExceptionRecord>, ctx: &Context) 
         l.wait_symbols();
     }
     line(format!("==================== AW2 CRASH REPORT: {title} ===================="));
+    let reason_kind = if title.starts_with("unimplemented import ") {
+        "unimplemented_import"
+    } else if title.contains("stall") || title.contains("hang") {
+        "stall"
+    } else {
+        "crash"
+    };
+    crate::process::record_exit_reason(reason_kind, title);
     let teb = crate::teb::current_raw();
     let win_tid = if teb.is_null() { 0 } else { crate::teb::thread_id() };
     let wname = crate::thread::current_thread_object()

@@ -24,6 +24,8 @@
 
 pub mod anticheat;
 pub mod aot;
+pub mod audit_game;
+pub mod bench;
 pub mod bundle_common;
 pub mod diag_toolkit;
 pub mod doctor;
@@ -31,11 +33,14 @@ pub mod dotnet;
 pub mod game_profiles;
 pub mod gpu_shaders;
 pub mod ios_bundle;
+pub mod json_output;
 pub mod launcher;
 pub mod ops_db;
+pub mod report_diff;
 pub mod scaffold;
 pub mod scanner;
 pub mod steam_library;
 pub mod storage_opt;
+pub mod stub_inventory;
 pub mod vfs;
 pub mod win32_db;

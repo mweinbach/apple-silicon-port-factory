@@ -605,31 +605,123 @@ fn current_thread_cpu_100ns() -> u64 {
     ts.tv_sec as u64 * 10_000_000 + ts.tv_nsec as u64 / 100
 }
 
-pub unsafe extern "win64" fn GetThreadTimes(h: HANDLE, create: *mut FILETIME, exit: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL {
-    let is_self = h == crate::handles::CURRENT_THREAD
-        || crate::handles::get_as::<crate::thread::ThreadObj>(h).is_some_and(|t| t.tid.load(std::sync::atomic::Ordering::Relaxed) as u32 == crate::teb::thread_id());
-    *create = FILETIME::from_u64(process_start_filetime());
-    *exit = FILETIME::default();
-    *kernel = FILETIME::default();
-    if is_self {
-        *user = FILETIME::from_u64(current_thread_cpu_100ns());
-    } else {
-        stub!("GetThreadTimes for another thread returns 0 CPU time");
-        *user = FILETIME::default();
+#[cfg(target_vendor = "apple")]
+fn mach_thread_cpu_times_100ns(port: u32) -> Option<(u64, u64)> {
+    if port == 0 {
+        return None;
+    }
+    const THREAD_BASIC_INFO: i32 = 3;
+    const THREAD_BASIC_INFO_COUNT: u32 = 10;
+    #[repr(C)]
+    struct MachTimeValue {
+        seconds: i32,
+        microseconds: i32,
+    }
+    #[repr(C)]
+    struct MachThreadBasicInfo {
+        user_time: MachTimeValue,
+        system_time: MachTimeValue,
+        cpu_usage: i32,
+        policy: i32,
+        run_state: i32,
+        flags: i32,
+        suspend_count: i32,
+        sleep_time: i32,
+    }
+    extern "C" {
+        fn thread_info(
+            target_act: u32,
+            flavor: i32,
+            thread_info_out: *mut i32,
+            thread_info_out_cnt: *mut u32,
+        ) -> i32;
+    }
+    let mut info: MachThreadBasicInfo = unsafe { std::mem::zeroed() };
+    let mut count = THREAD_BASIC_INFO_COUNT;
+    let kr = unsafe {
+        thread_info(
+            port,
+            THREAD_BASIC_INFO,
+            &mut info as *mut MachThreadBasicInfo as *mut i32,
+            &mut count,
+        )
+    };
+    if kr != 0 {
+        return None;
+    }
+    let user_100ns = (info.user_time.seconds.max(0) as u64) * 10_000_000
+        + (info.user_time.microseconds.max(0) as u64) * 10;
+    let sys_100ns = (info.system_time.seconds.max(0) as u64) * 10_000_000
+        + (info.system_time.microseconds.max(0) as u64) * 10;
+    Some((user_100ns, sys_100ns))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn mach_thread_cpu_times_100ns(_port: u32) -> Option<(u64, u64)> {
+    None
+}
+
+fn thread_handle_cpu_times_100ns(h: HANDLE) -> Result<(u64, u64), u32> {
+    if h == crate::handles::CURRENT_THREAD {
+        return Ok((current_thread_cpu_100ns(), 0));
+    }
+    let Some(t) = crate::handles::get_as::<crate::thread::ThreadObj>(h) else {
+        return Err(crate::types::err::ERROR_INVALID_HANDLE);
+    };
+    if t.tid.load(std::sync::atomic::Ordering::Relaxed) as u32 == crate::teb::thread_id() {
+        return Ok((current_thread_cpu_100ns(), 0));
+    }
+    let port = t.mach_port();
+    if let Some(times) = mach_thread_cpu_times_100ns(port) {
+        return Ok(times);
+    }
+    // Thread either has not started executing yet or has already exited: 0 remaining live Mach time.
+    Ok((0, 0))
+}
+
+pub unsafe extern "win64" fn GetThreadTimes(
+    h: HANDLE,
+    create: *mut FILETIME,
+    exit: *mut FILETIME,
+    kernel: *mut FILETIME,
+    user: *mut FILETIME,
+) -> BOOL {
+    let (user_100ns, kernel_100ns) = match thread_handle_cpu_times_100ns(h) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::teb::set_last_error(e);
+            return FALSE;
+        }
+    };
+    if !create.is_null() {
+        std::ptr::write_unaligned(create, FILETIME::from_u64(process_start_filetime()));
+    }
+    if !exit.is_null() {
+        std::ptr::write_unaligned(exit, FILETIME::default());
+    }
+    if !kernel.is_null() {
+        std::ptr::write_unaligned(kernel, FILETIME::from_u64(kernel_100ns));
+    }
+    if !user.is_null() {
+        std::ptr::write_unaligned(user, FILETIME::from_u64(user_100ns));
     }
     TRUE
 }
 
 pub unsafe extern "win64" fn QueryThreadCycleTime(h: HANDLE, cycles: *mut u64) -> BOOL {
-    let is_self = h == crate::handles::CURRENT_THREAD
-        || crate::handles::get_as::<crate::thread::ThreadObj>(h).is_some_and(|t| t.tid.load(std::sync::atomic::Ordering::Relaxed) as u32 == crate::teb::thread_id());
-    if is_self {
-        // Report CPU time in ns as "cycles" (monotonic, proportional).
-        *cycles = current_thread_cpu_100ns() * 100;
-    } else {
-        stub!("QueryThreadCycleTime for another thread returns 0");
-        *cycles = 0;
+    if cycles.is_null() {
+        crate::teb::set_last_error(crate::types::err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
+    let (user_100ns, kernel_100ns) = match thread_handle_cpu_times_100ns(h) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::teb::set_last_error(e);
+            return FALSE;
+        }
+    };
+    // Report total thread CPU time in ns as monotonic cycle count.
+    std::ptr::write_unaligned(cycles, user_100ns.saturating_add(kernel_100ns).saturating_mul(100));
     TRUE
 }
 
@@ -852,6 +944,25 @@ mod tests {
                 assert_eq!(st_tuple(sd), (0, 0, 0, 0, 0, 0, 0, 0));
                 assert_eq!(st_tuple(dd), (0, 0, 0, 0, 0, 0, 0, 0));
             }
+        }
+    }
+
+    #[test]
+    fn thread_times_and_cycle_time_work_for_self_and_other_thread() {
+        unsafe {
+            let mut c = FILETIME::default();
+            let mut e = FILETIME::default();
+            let mut k = FILETIME::default();
+            let mut u = FILETIME::default();
+            assert_eq!(GetThreadTimes(crate::handles::CURRENT_THREAD, &mut c, &mut e, &mut k, &mut u), TRUE);
+            let mut cyc = 0u64;
+            assert_eq!(QueryThreadCycleTime(crate::handles::CURRENT_THREAD, &mut cyc), TRUE);
+
+            // Invalid handle fails cleanly with ERROR_INVALID_HANDLE.
+            assert_eq!(GetThreadTimes(0xDEAD_BEEF as HANDLE, &mut c, &mut e, &mut k, &mut u), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
+            assert_eq!(QueryThreadCycleTime(0xDEAD_BEEF as HANDLE, &mut cyc), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
         }
     }
 }

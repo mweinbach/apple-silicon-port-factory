@@ -541,6 +541,8 @@ pub fn init(mut cfg: ProcessConfig) {
     // D3D12 API trace (d3d12_metal::trace): flush buffered records at exit.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     register_exit_hook(d3d12_metal::trace::flush);
+    // Global stub registry: emit ranked stub summary table (and optional JSON/diff) at exit.
+    register_exit_hook(crate::stub_registry::log_exit_summary);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,12 +553,61 @@ static EXIT_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new(
 static EXIT_HOOKS_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Code passed to [`exit_process`] (`u64::MAX`: not exiting through it).
 static EXIT_CODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Optional fatal/abnormal exit reason recorded before exit hooks run
+/// (`(exit_kind, detail)` such as `("crash", "access violation")` or `("unimplemented_import", "foo!Bar")`).
+static EXIT_REASON: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Record a structured exit kind and detail (first writer wins; used by crash reports,
+/// unimplemented-import traps, and stall watchdogs before invoking exit hooks).
+pub fn record_exit_reason(kind: &str, detail: impl Into<String>) {
+    if let Ok(mut g) = EXIT_REASON.try_lock() {
+        if g.is_none() {
+            *g = Some((kind.to_string(), detail.into()));
+        }
+    }
+}
+
+/// Return `(exit_kind, detail)` for boot/exit reports.
+pub fn exit_reason() -> (String, String) {
+    if let Ok(g) = EXIT_REASON.try_lock() {
+        if let Some((ref k, ref d)) = *g {
+            return (k.clone(), d.clone());
+        }
+    }
+    match exit_code() {
+        Some(0) => ("clean_exit".to_string(), String::new()),
+        Some(c) => ("nonzero_exit".to_string(), format!("exit code {c} (0x{c:x})")),
+        None => ("unknown".to_string(), String::new()),
+    }
+}
 
 /// The code the process is exiting with through [`exit_process`] (ExitProcess, CRT exit
-/// paths, ...), or None (fatal faults, crash reports, still running). For exit hooks.
+/// paths, ...), or None (provisional crash reports before exit, or still running). For exit hooks.
 pub fn exit_code() -> Option<u32> {
     let c = EXIT_CODE.load(std::sync::atomic::Ordering::Acquire);
     (c != u64::MAX).then_some(c as u32)
+}
+
+/// Record the final Windows exit code (first writer wins) before running exit hooks
+/// on paths that terminate via `libc::_exit` directly (e.g. fatal signal handlers).
+pub fn record_exit_code(code: u32) {
+    let _ = EXIT_CODE.compare_exchange(
+        u64::MAX,
+        code as u64,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+/// Map a 32-bit Windows exit/NTSTATUS code to an 8-bit POSIX exit status without
+/// silently collapsing non-zero codes whose low byte is 0 into `0`.
+pub const fn posix_exit_code(win_code: u32) -> i32 {
+    if win_code == 0 {
+        0
+    } else {
+        let low = (win_code & 0xFF) as i32;
+        if low == 0 { 1 } else { low }
+    }
 }
 
 /// Register a function to run once when the process ends: ExitProcess,
@@ -891,11 +942,11 @@ pub fn exit_process(code: u32) -> ! {
     }
     crate::shadow::note_exit("exit_process", code as i64);
     log::info!("process exit, code {code} (0x{code:x})");
-    let _ = EXIT_CODE.compare_exchange(u64::MAX, code as u64, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    record_exit_code(code);
     run_exit_hooks();
     crate::ucrt::stdio::flush_all();
     report_exit_code_to_parent(code);
-    unsafe { libc::_exit(code as i32) }
+    unsafe { libc::_exit(posix_exit_code(code)) }
 }
 
 #[cfg(test)]

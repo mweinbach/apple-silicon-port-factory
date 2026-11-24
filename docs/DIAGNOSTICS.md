@@ -231,6 +231,7 @@ cargo opsdb -- oracle out/nan_snaps/ --mxcsr 0x1f80
 |---|---|---|
 | `PORT_NAN_TRACE` | `x86-runtime::diag` | Semicolon-separated spec: `module=a.exe,b.dll;range=mod:lo..hi;watch=lo..hi;host=sym;dump_dir=DIR;log=FILE;stores=1;max=N;armed=0\|1`. Zero overhead when unset. |
 | `PORT_NAN_BOUNDARY=1` | `win32-rt` | Logs `[diag-boundary]` whenever non-finite floats cross middleware boundaries (e.g., `NvCloth::setSpheres`). |
+| `PORT_FAIL_ON_UNIMPL_OP=1\|0` | `x86-runtime` / `port-loader` | Aborts with documented exit code `86` (`EXIT_UNIMPL_OP`) and a crash report when the generic interpreter hits an unimplemented x86-64 instruction (CLI `--fail-on-unimpl-op` / `--no-fail-on-unimpl-op`; default **on** for CLI bring-up runs and `live-probe`). |
 | `PORT_JIT_SKIP` / `PORT_JIT_ALLOW` | `x86-runtime::diag` | Comma-separated `module:rva_lo..rva_hi` or absolute VA spans forced onto the interpreter. |
 | `PORT_AOT_SKIP` | `x86-runtime::diag` | Comma-separated `module:rva_lo..rva_hi` spans excluded from AOT lookup (falls back to Live JIT). |
 | `PORT_CONTROL_DIR=DIR` | `port-loader::live_ctl` | Enables frame-paced `<DIR>/cmd.txt` & `<DIR>/status.json` controller (`shot`, `key`, `mouse`, `moveto`, `click`, `wheel`, `pad`, `release`, `nantrace on\|off`, `quit`). |
@@ -242,10 +243,111 @@ cargo opsdb -- oracle out/nan_snaps/ --mxcsr 0x1f80
 
 ---
 
-## 3. Source Files
+## 3. Structured JSON Output (`--json`, Schema v1)
+
+Every audit, verification, inspection, stats, and runner command supports `--json` so scripts and
+agents can consume results deterministically without parsing human-formatted tables.
+
+When `--json` is passed:
+- **stdout** contains **only** a single RFC 8259 JSON object conforming to the top-level envelope
+  below (even on usage, runtime, or guest crash errors).
+- Diagnostics, progress logs, warnings, and (in `port-runner --json`) guest stdout
+  (`STD_OUTPUT_HANDLE` / fd `1`) are routed to **stderr** while the original stdout fd is reserved
+  exclusively (`FD_CLOEXEC`) for the JSON envelope so chatty guests can never interleave with JSON.
+- Shared types and payload builders live in `crates/port-factory/src/json_output.rs`
+  (`port_factory::json_output`), intended for direct reuse by composite commands such as
+  `audit-game`.
+
+### Top-Level Envelope (`schema_version = 1`)
+
+```json
+{
+  "schema_version": 1,
+  "command": "win32-audit",
+  "ok": true,
+  "exit_code": 0,
+  "data": { "...command-specific payload..." },
+  "error": null
+}
+```
+
+| Field | Type | Stability Guarantee |
+|---|---|---|
+| `schema_version` | `integer` (`1`) | Incremented only on breaking field renames or removals. Additive fields do not bump the version. |
+| `command` | `string` | Canonical subcommand name (e.g. `"scan"`, `"win32-audit"`, `"anticheat-audit"`, `"runtime-audit"`, `"doctor"`, `"bundle-verify"`, `"ios-verify"`, `"verify-x86"`, `"oracle"`, `"app-audit"`, `"dotnet-audit"`, `"shader-inspect"`, `"game-profiles"`, `"stats"`, `"win32-stats"`, `"shader-formats"`, `"vfs-resolve"`, `"bundles"`, `"steam-scan"`, `"live-probe"`, `"bisect-runtime"`, `"port-runner"`). |
+| `ok` | `boolean` | `true` iff `exit_code == 0`. |
+| `exit_code` | `integer` | Exact process exit code from the [Exit-Code Table](#4-exit-code-table). |
+| `data` | `object \| null` | Structured command payload (`null` on CLI usage/startup errors). |
+| `error` | `string \| null` | Human-readable failure summary when `ok == false`, otherwise `null`. |
+
+### Command `data` Payloads
+
+| Command | Key `data` fields |
+|---|---|
+| `scan` | `binaries_scanned`, `total_instructions`, `jit_arm64_instructions`, `unmapped_instructions`, `aggregate_jit_coverage_pct`, `recorded_tsv`, `binaries[]` (`binary_name`, `is_dll`, `image_base`, `size_of_image`, `functions_count`, `exports_count`, `jit_coverage_pct`, `imported_dlls[]`, `by_category`, `top_mnemonics[]`, `unmapped_mnemonics[]`), `skipped[]` |
+| `win32-audit` | `binaries_audited`, `total_imports`, `resolved_imports`, `unresolved_imports`, `aggregate_readiness_pct`, `binaries[]` (`binary_name`, `total_imports`, `resolved_imports`, `unresolved_count`, `readiness_pct`, `resolved_by_category`, `detected_middleware[]`, `unresolved[]`, `unresolved_by_dll`) |
+| `anticheat-audit` | `binaries_audited`, `kernel_driver_blockers`, `binaries[]` (`binary_name`, `verdict_code`, `verdict`, `compatible`, `direct_syscalls`, `decoded_ssns[]`, `ud2_count`, `int3_count`, `cpuid_count`, `rdtsc_count`, `xgetbv_count`, `gs_teb_peb_reads`, `kuser_shared_reads`, `sections[]`, `anti_debug_imports[]`, `veh_seh_imports[]`, `memory_unpack_imports[]`, `kernel_driver_imports[]`) |
+| `runtime-audit` | `binaries_audited`, `total_ldmxcsr`, `total_x87_ops`, `total_avx_narrow`, `total_approx_fp`, `total_lock_rmw`, `rwx_binaries`, `binaries[]`, `skipped[]` |
+| `app-audit` | `binaries_audited`, `embedded_shaders_total`, `binaries[]` (`console_pipe_ipc_apis[]`, `desktop_ui_clipboard_dpi_apis[]`, `fs_watcher_mmap_apis[]`, `net_tls_crypto_apis[]`, `gpu_apis_by_backend`, `embedded_shaders_*`, `shader_profiles`) |
+| `dotnet-audit` | `total_binaries`, `pure_il_count`, `r2r_count`, `mixed_mode_count`, `apphost_count`, `unity_mono_count`, `unity_il2cpp_count`, `native_non_dotnet_count`, `runtime_configs[]`, `global_metadata_dat[]`, `host_*_dylib`, `binaries[]` |
+| `doctor` | `mode` (`"check" \| "fix"`), `db_clean`, `drifted_count`, `databases[]` (`file_name`, `path`, `label`, `status`, `drifted`, ...), `vfs` (`root`, `mounts`), `shaders` (`cache_dir`, `dx12_available`, `dx11_available`, `vulkan_spirv_available`), `pe_audits` (optional combined object when PE paths are passed) |
+| `bundle-verify` | `bundles_verified`, `passed_bundles`, `failed_bundles`, `bundles[]` (`app_path`, `passed`, `pass_count`, `warn_count`, `fail_count`, `checks[]`) |
+| `ios-verify` | `bundle_path`, `passed`, `is_ipa`, `bundle_id`, `executable_name`, `macho_arch`, `macho_platform_id`, `macho_platform_name`, `static_aot_modules`, `has_game_toml`, `has_game_dir`, `bundled_exe_present`, `portable_shader_files`, `host_mtl4a_files`, `macos_framework_leaks[]`, `codesign_ok`, `issues[]` |
+| `verify-x86` | `binaries_verified`, `blocks_tested`, `trials_executed`, `linked_traces_tested`, `critical_mismatches`, `config`, `binaries[]` (`module`, `passed`, `fast_mismatches`, `jit_mismatches`, `aot_mismatches`, `linked_aot_mismatches`, `critical_mismatches`, `mismatches[]`), `skipped[]`, optional `oracle` (when `--oracle` is passed) |
+| `oracle` | `unique_snapshots`, `tested`, `skipped_mem`, `divergences`, `cases[]` |
+| `shader-inspect` | `shaders_inspected`, `shaders[]` (`name`, `byte_len`, `format_code`, `format_family`, `shader_model_or_version`, `container_parts[]`, `entry_points[]`, `resource_count`, `embedded_dxbc_count`, `embedded_spirv_count`) |
+| `game-profiles` | `profiles_count`, `synced_tsv`, `profiles[]`, `detected_binaries[]` |
+| `stats` / `win32-stats` / `shader-formats` / `vfs-resolve` / `bundles` / `steam-scan` | Structured inventory/catalog payloads matching the human-readable summaries |
+| `port-runner --no-run` | `target`, `exe_base`, `preferred_base`, `total_modules`, `pe_modules`, `builtin_modules`, `load_elapsed_ms`, `unresolved_count`, `unresolved_by_dll`, `ops_report` (populated when `--ops-report` is also set) |
+| `port-runner` (live run) | `target`, `stop_reason` (`"guest_exit" \| "crash" \| "max_frames" \| "timeout"`), `frames_presented`, `elapsed_ms`, `max_frames`, `timeout_secs`, `guest_exit_code` |
+
+---
+
+## 4. Exit-Code Table
+
+Every command in `port-factory` (`cargo opsdb`), `x86-verify`, `tools/debug/x86_oracle.py`, and
+`port-loader` (`port-runner`) follows this exit-code contract (constants exported at
+`port_factory::json_output::exit_codes` and `port_loader::run_limits::exit_codes`):
+
+| Exit Code | Constant | Meaning | Commands |
+|---:|---|---|---|
+| `0` | `OK` | Success: clean audit, verification passed, `--no-run` had `0` unresolved imports, guest exited `0`, or `--max-frames` reached cleanly. | All commands |
+| `1` | `RUNTIME_ERROR` | General runtime, I/O, PE parse, or internal startup error (also `port-runner` non-zero guest exits pass through their guest exit code). | All commands |
+| `2` | `USAGE_ERROR` | Invalid CLI flags, unknown subcommand, missing required arguments, invalid numeric limit (`<= 0`), or no matching PE inputs. | All commands |
+| `3` | `UNRESOLVED_IMPORTS` | Unresolved static or Win32 imports detected (`unresolved_count > 0`). | `port-runner --no-run`, `win32-audit` |
+| `4` | `VERIFICATION_FAILED` | Verification failure, `db/*.tsv` drift, bundle check failure, or differential mismatch. | `doctor`, `bundle-verify`, `ios-verify`, `verify-x86` / `x86-verify`, `oracle`, `port-runner --diff-test` |
+| `5` | `INCOMPATIBLE` | Hard compatibility blocker detected (e.g. Ring-0 kernel driver imports). | `anticheat-audit` |
+| `124` | `TIMEOUT` | Wall-clock run limit (`--timeout-secs`) exceeded before completion or `--max-frames`. | `port-runner --timeout-secs`, `bisect-runtime` |
+
+---
+
+## 5. Bounded Runs (`--timeout-secs`, `--max-frames`)
+
+`port-runner` supports bounded execution for automated smoke testing and agent loops:
+
+```sh
+# Stop cleanly (exit 0) after 60 presented frames, or abort (exit 124) after 45 seconds
+cargo runner -- --manifest games/<id>/game.toml --game-dir /path/to/Game \
+  --max-frames 60 --timeout-secs 45 --json
+
+# Fast offline import check (exits 0 if all resolved, 3 if any unresolved)
+cargo runner -- --pe /path/to/Game.exe --no-run --ops-report --json
+```
+
+- `--timeout-secs SECS` (positive finite float/integer): starts a wall-clock watchdog thread that
+  flushes the optional JSON summary and terminates via `_exit(124)` even if the guest is deadlocked.
+- `--max-frames N` (integer `>= 1`): counts presented frames through the single API-neutral hook
+  seam `port_loader::run_limits::on_frame_presented(hwnd, frame)` and calls `exit_process(0)` as
+  soon as frame `N` completes.
+
+---
+
+## 6. Source Files
 
 | Tool | Source |
 |---|---|
+| Shared JSON output schema & exit-code table | `crates/port-factory/src/json_output.rs` |
+| Bounded run limits & present hook seam | `crates/port-loader/src/run_limits.rs` |
 | Static hazard auditor & CLI integration | `crates/port-factory/src/diag_toolkit.rs`, `crates/port-factory/src/bin/port-factory.rs` |
 | Offline 4-tier PE/DLL verifier (`x86-verify`) | `crates/x86-runtime/src/emu/verify.rs`, `crates/x86-runtime/src/bin/x86-verify.rs` |
 | Live `NaN`-birth / watchpoint / host tracer | `crates/x86-runtime/src/diag.rs` |

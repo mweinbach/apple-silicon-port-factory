@@ -1,33 +1,44 @@
 //! Database catalog, scaffolding, VFS resolution, and `doctor` subcommand handlers.
 
 use super::{
-    scan, usage, workspace_root, ArgCursor, DEFAULT_GAME_PROFILES_TSV, DEFAULT_OPS_TSV,
-    DEFAULT_SHADER_FORMATS_TSV, DEFAULT_WIN32_TSV,
+    emit_json, scan, usage_err, workspace_root, ArgCursor, DEFAULT_GAME_PROFILES_TSV,
+    DEFAULT_OPS_TSV, DEFAULT_SHADER_FORMATS_TSV, DEFAULT_STUB_BACKLOG_MD,
+    DEFAULT_STUB_INVENTORY_TSV, DEFAULT_WIN32_TSV,
 };
 use anyhow::{bail, Result};
 use pe_image::Pe;
 use port_factory::doctor::check_or_fix_db_tsvs;
 use port_factory::game_profiles::{
-    detect_pe_game_profile, sync_and_format_game_profiles, TOP_GAME_PROFILES,
+    audit_all_game_profiles, detect_pe_game_profile, sync_and_format_game_profiles,
+    TOP_GAME_PROFILES,
 };
 use port_factory::gpu_shaders::sync_and_format_shader_catalog;
+use port_factory::json_output::{
+    doctor_data_json, exit_codes, game_profiles_data_json, ops_stats_data_json,
+    shader_formats_data_json, vfs_resolve_data_json, win32_stats_data_json, JsonEnvelope,
+};
 use port_factory::ops_db::{catalog_stats, lookup_by_id, lookup_by_mnemonic, write_tsv, OPS_CATALOG};
 use port_factory::scaffold::{
     find_missing_ops_in_pe, generate_dll_scaffold, generate_op_scaffold, register_misc_dll_module,
 };
 use port_factory::scanner::collect_pe_files;
+use port_factory::stub_inventory::{
+    check_no_new_stubs_against_file, diff_stub_json_files, format_inventory_tsv,
+    render_stub_backlog_md, scan_workspace_stubs,
+};
 use port_factory::vfs::WinFs;
-use port_factory::win32_db::{Win32Category, Win32Database};
+use port_factory::win32_db::{ImplKind, Win32Category, Win32Database};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
-pub fn cmd_sync(args: &[String]) -> Result<()> {
+pub fn cmd_sync(args: &[String]) -> Result<i32> {
     let mut path = PathBuf::from(DEFAULT_OPS_TSV);
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--tsv" => path = cur.next_path_or_usage(),
-            _ => bail!("unknown argument {a:?}"),
+            "--tsv" => path = cur.next_path_or_err("--tsv requires PATH")?,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
         }
     }
     write_tsv(&path)?;
@@ -39,11 +50,22 @@ pub fn cmd_sync(args: &[String]) -> Result<()> {
         st.total_verified_vectors,
         path.display()
     );
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_stats() -> Result<()> {
+pub fn cmd_stats(args: &[String]) -> Result<i32> {
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
+        }
+    }
     let st = catalog_stats();
+    if json {
+        let data = ops_stats_data_json(&st, OPS_CATALOG);
+        return Ok(emit_json(&JsonEnvelope::ok("stats", data)));
+    }
     println!("=== x86-64 -> ARM64 Operation Translation Database ===");
     println!("  Op families          : {}", st.total_records);
     println!("  JIT_ARM64 families   : {}", st.jit_arm64_records);
@@ -65,18 +87,20 @@ pub fn cmd_stats() -> Result<()> {
             r.arm64_pattern
         );
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_list(args: &[String]) -> Result<()> {
+pub fn cmd_list(args: &[String]) -> Result<i32> {
     let mut cat_filter: Option<String> = None;
     let mut search: Option<String> = None;
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--category" => cat_filter = Some(cur.next_or_usage().to_uppercase()),
-            "--search" => search = Some(cur.next_or_usage().to_lowercase()),
-            _ => bail!("unknown argument {a:?}"),
+            "--category" => {
+                cat_filter = Some(cur.next_or_err("--category requires CAT")?.to_uppercase())
+            }
+            "--search" => search = Some(cur.next_or_err("--search requires STR")?.to_lowercase()),
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
         }
     }
     for r in OPS_CATALOG {
@@ -105,12 +129,12 @@ pub fn cmd_list(args: &[String]) -> Result<()> {
             r.arm64_pattern
         );
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_explain(args: &[String]) -> Result<()> {
+pub fn cmd_explain(args: &[String]) -> Result<i32> {
     let Some(q) = args.first() else {
-        usage();
+        return Err(usage_err("usage: port-factory explain <MNEMONIC_OR_ID>"));
     };
     let mut matches = Vec::new();
     if let Some(r) = lookup_by_id(q) {
@@ -139,16 +163,16 @@ pub fn cmd_explain(args: &[String]) -> Result<()> {
         println!("  Verified Vectors : {}", r.verified_vectors);
         println!();
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_win32_sync(args: &[String]) -> Result<()> {
+pub fn cmd_win32_sync(args: &[String]) -> Result<i32> {
     let mut path = PathBuf::from(DEFAULT_WIN32_TSV);
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--tsv" => path = cur.next_path_or_usage(),
-            _ => bail!("unknown argument {a:?}"),
+            "--tsv" => path = cur.next_path_or_err("--tsv requires PATH")?,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
         }
     }
     let root = workspace_root();
@@ -160,25 +184,36 @@ pub fn cmd_win32_sync(args: &[String]) -> Result<()> {
         *dlls.entry(e.dll.as_str()).or_insert(0) += 1;
     }
     println!(
-        "synced {} Win32 API mappings across {} Windows DLLs -> {}",
+        "synced {} Win32 API mappings across {} Windows DLLs ({} real, {} partial, {} stub, {} failing) -> {}",
         db.entries.len(),
         dlls.len(),
+        db.count_by_impl_kind(ImplKind::Real),
+        db.count_by_impl_kind(ImplKind::Partial),
+        db.count_by_impl_kind(ImplKind::Stub),
+        db.count_by_impl_kind(ImplKind::Failing),
         path.display()
     );
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_win32_stats(args: &[String]) -> Result<()> {
+pub fn cmd_win32_stats(args: &[String]) -> Result<i32> {
     let mut search: Option<String> = None;
+    let mut json = false;
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--search" => search = Some(cur.next_or_usage().to_lowercase()),
-            _ => bail!("unknown argument {a:?}"),
+            "--search" => search = Some(cur.next_or_err("--search requires STR")?.to_lowercase()),
+            "--json" => json = true,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
         }
     }
     let root = workspace_root();
     let db = Win32Database::from_workspace_src(&root)?;
+
+    if json {
+        let data = win32_stats_data_json(&db.entries, search.as_deref());
+        return Ok(emit_json(&JsonEnvelope::ok("win32-stats", data)));
+    }
 
     let mut by_cat: BTreeMap<Win32Category, usize> = BTreeMap::new();
     let mut by_dll: BTreeMap<(&str, Win32Category), usize> = BTreeMap::new();
@@ -190,6 +225,13 @@ pub fn cmd_win32_stats(args: &[String]) -> Result<()> {
     println!("=== Wine-Style Core Windows API Mapping Database ===");
     println!("  Total mapped Win32 APIs : {}", db.entries.len());
     println!("  Total Windows DLLs      : {}", by_dll.len());
+    println!(
+        "  By Implementation Kind  : real={}, partial={}, stub={}, failing={}",
+        db.count_by_impl_kind(ImplKind::Real),
+        db.count_by_impl_kind(ImplKind::Partial),
+        db.count_by_impl_kind(ImplKind::Stub),
+        db.count_by_impl_kind(ImplKind::Failing),
+    );
     println!();
     println!("  {:24} {:>10}", "CATEGORY", "APIS");
     println!("  {}", "-".repeat(38));
@@ -210,18 +252,23 @@ pub fn cmd_win32_stats(args: &[String]) -> Result<()> {
             let hay = format!("{} {} {}", e.dll, e.symbol, e.rust_path).to_lowercase();
             if hay.contains(&q) {
                 println!(
-                    "    {:24} ! {:36} -> {} ({})",
-                    e.dll, e.symbol, e.rust_path, e.source_file
+                    "    {:24} ! {:36} [{:7}] -> {} ({})",
+                    e.dll,
+                    e.symbol,
+                    e.impl_kind.as_str(),
+                    e.rust_path,
+                    e.source_file
                 );
             }
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_game_profiles(args: &[String]) -> Result<()> {
+pub fn cmd_game_profiles(args: &[String]) -> Result<i32> {
     let root = workspace_root();
     let mut sync = false;
+    let mut json = false;
     let mut tsv_path = root.join(DEFAULT_GAME_PROFILES_TSV);
     let mut pe_paths: Vec<PathBuf> = Vec::new();
 
@@ -231,15 +278,45 @@ pub fn cmd_game_profiles(args: &[String]) -> Result<()> {
             "--sync" => sync = true,
             "--tsv" => {
                 sync = true;
-                tsv_path = cur.next_path_or_usage();
+                tsv_path = cur.next_path_or_err("--tsv requires PATH")?;
             }
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p => pe_paths.push(PathBuf::from(p)),
         }
     }
 
     let win_db = Win32Database::from_workspace_src(&root)?;
     let report = sync_and_format_game_profiles(sync.then_some(tsv_path.as_path()), &win_db)?;
+
+    let mut detected = Vec::new();
+    if !pe_paths.is_empty() {
+        let mut files = Vec::new();
+        for p in &pe_paths {
+            files.extend(collect_pe_files(p)?);
+        }
+        for f in &files {
+            if let Ok(bytes) = std::fs::read(f) {
+                if let Ok(pe) = Pe::parse(&bytes) {
+                    if let Some(prof) = detect_pe_game_profile(&pe) {
+                        detected.push((
+                            f.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                            prof.profile_id.to_string(),
+                            prof.engine_family.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if json {
+        let audits = audit_all_game_profiles(&win_db);
+        let synced_str = sync.then(|| tsv_path.display().to_string());
+        let data = game_profiles_data_json(&audits, synced_str.as_deref(), &detected);
+        return Ok(emit_json(&JsonEnvelope::ok("game-profiles", data)));
+    }
+
     print!("{report}");
     if sync {
         println!(
@@ -252,31 +329,17 @@ pub fn cmd_game_profiles(args: &[String]) -> Result<()> {
     if !pe_paths.is_empty() {
         println!();
         println!("=== Detected Game / Engine Profiles for Target Binaries ===");
-        let mut files = Vec::new();
-        for p in &pe_paths {
-            files.extend(collect_pe_files(p)?);
-        }
-        for f in &files {
-            if let Ok(bytes) = std::fs::read(f) {
-                if let Ok(pe) = Pe::parse(&bytes) {
-                    if let Some(prof) = detect_pe_game_profile(&pe) {
-                        println!(
-                            "  * {:32} -> {} [{}]",
-                            f.file_name().unwrap_or_default().to_string_lossy(),
-                            prof.profile_id,
-                            prof.engine_family
-                        );
-                    }
-                }
-            }
+        for (fname, profile_id, engine) in &detected {
+            println!("  * {:32} -> {} [{}]", fname, profile_id, engine);
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_shader_formats(args: &[String]) -> Result<()> {
+pub fn cmd_shader_formats(args: &[String]) -> Result<i32> {
     let root = workspace_root();
     let mut sync = false;
+    let mut json = false;
     let mut tsv_path = root.join(DEFAULT_SHADER_FORMATS_TSV);
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
@@ -284,12 +347,21 @@ pub fn cmd_shader_formats(args: &[String]) -> Result<()> {
             "--sync" => sync = true,
             "--tsv" => {
                 sync = true;
-                tsv_path = cur.next_path_or_usage();
+                tsv_path = cur.next_path_or_err("--tsv requires PATH")?;
             }
-            _ => bail!("unknown argument {a:?}"),
+            "--json" => json = true,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
         }
     }
     let table = sync_and_format_shader_catalog(sync.then_some(tsv_path.as_path()))?;
+    if json {
+        let synced_str = sync.then(|| tsv_path.display().to_string());
+        let data = shader_formats_data_json(
+            dxil_metal::formats::SHADER_FORMAT_CATALOG,
+            synced_str.as_deref(),
+        );
+        return Ok(emit_json(&JsonEnvelope::ok("shader-formats", data)));
+    }
     print!("{table}");
     if sync {
         println!(
@@ -298,10 +370,10 @@ pub fn cmd_shader_formats(args: &[String]) -> Result<()> {
             tsv_path.display()
         );
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_scaffold_op(args: &[String]) -> Result<()> {
+pub fn cmd_scaffold_op(args: &[String]) -> Result<i32> {
     let mut mnemonic: Option<String> = None;
     let mut category = "GP_ALU".to_string();
     let mut arm64_pattern = "/* ARM64 instruction pattern */".to_string();
@@ -310,10 +382,12 @@ pub fn cmd_scaffold_op(args: &[String]) -> Result<()> {
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--category" => category = cur.next_or_usage().to_string(),
-            "--arm64" => arm64_pattern = cur.next_or_usage().to_string(),
-            "--from-pe" => from_pe = Some(cur.next_path_or_usage()),
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            "--category" => {
+                category = cur.next_or_err("--category requires CAT")?.to_string()
+            }
+            "--arm64" => arm64_pattern = cur.next_or_err("--arm64 requires PATTERN")?.to_string(),
+            "--from-pe" => from_pe = Some(cur.next_path_or_err("--from-pe requires PE_FILE")?),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             m => mnemonic = Some(m.to_string()),
         }
     }
@@ -325,7 +399,7 @@ pub fn cmd_scaffold_op(args: &[String]) -> Result<()> {
                 "100.00% of instructions in {} are already covered!",
                 pe_path.display()
             );
-            return Ok(());
+            return Ok(exit_codes::OK);
         }
         println!(
             "=== Untranslated / Non-JIT Ops in {} ({} mnemonics) ===",
@@ -340,19 +414,24 @@ pub fn cmd_scaffold_op(args: &[String]) -> Result<()> {
         }
         println!();
         for m in missing.iter().take(3) {
-            print!("{}", generate_op_scaffold(&m.mnemonic, &category, &arm64_pattern));
+            print!(
+                "{}",
+                generate_op_scaffold(&m.mnemonic, &category, &arm64_pattern)
+            );
         }
-        return Ok(());
+        return Ok(exit_codes::OK);
     }
 
     let Some(mn) = mnemonic else {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory scaffold-op <MNEMONIC> [--category CAT] [--arm64 PATTERN] [--from-pe PE_FILE]",
+        ));
     };
     print!("{}", generate_op_scaffold(&mn, &category, &arm64_pattern));
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_scaffold_dll(args: &[String]) -> Result<()> {
+pub fn cmd_scaffold_dll(args: &[String]) -> Result<i32> {
     let mut dll_name: Option<String> = None;
     let mut pe_files: Vec<PathBuf> = Vec::new();
     let mut write_to_workspace = false;
@@ -360,7 +439,7 @@ pub fn cmd_scaffold_dll(args: &[String]) -> Result<()> {
     for a in args {
         match a.as_str() {
             "--write" => write_to_workspace = true,
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p => {
                 if dll_name.is_none() {
                     dll_name = Some(p.to_string());
@@ -371,7 +450,9 @@ pub fn cmd_scaffold_dll(args: &[String]) -> Result<()> {
         }
     }
     let Some(dll_name) = dll_name else {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory scaffold-dll <DLL_NAME> [PE_FILES...] [--write]",
+        ));
     };
 
     let root = workspace_root();
@@ -393,10 +474,10 @@ pub fn cmd_scaffold_dll(args: &[String]) -> Result<()> {
         );
         print!("{src}");
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_vfs_resolve(args: &[String]) -> Result<()> {
+pub fn cmd_vfs_resolve(args: &[String]) -> Result<i32> {
     let mut drive_c = WinFs::default_translator_root();
     let mut app_dir: Option<PathBuf> = std::env::var_os("PORT_GAME_DIR")
         .or_else(|| std::env::var_os("AW2_GAME_DIR"))
@@ -405,15 +486,21 @@ pub fn cmd_vfs_resolve(args: &[String]) -> Result<()> {
     let mut app_win_dir = "C:\\Games\\App".to_string();
     let mut extra_mounts: Vec<String> = Vec::new();
     let mut queries: Vec<String> = Vec::new();
+    let mut json = false;
 
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--drive-c" | "--translator-home" => drive_c = cur.next_path_or_usage(),
-            "--app-dir" => app_dir = Some(cur.next_path_or_usage()),
-            "--app-win-dir" => app_win_dir = cur.next_or_usage().to_string(),
-            "--mount" => extra_mounts.push(cur.next_or_usage().to_string()),
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            "--drive-c" | "--translator-home" => {
+                drive_c = cur.next_path_or_err("--drive-c requires DIR")?
+            }
+            "--app-dir" => app_dir = Some(cur.next_path_or_err("--app-dir requires DIR")?),
+            "--app-win-dir" => {
+                app_win_dir = cur.next_or_err("--app-win-dir requires PATH")?.to_string()
+            }
+            "--mount" => extra_mounts.push(cur.next_or_err("--mount requires WIN=HOST")?.to_string()),
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             q => queries.push(q.to_string()),
         }
     }
@@ -425,7 +512,34 @@ pub fn cmd_vfs_resolve(args: &[String]) -> Result<()> {
         app_dir.as_ref().map(|_| app_win_dir.as_str()),
     );
     for spec in &extra_mounts {
-        vfs.add_mount_spec(spec).map_err(|e| anyhow::anyhow!(e))?;
+        vfs.add_mount_spec(spec).map_err(|e| usage_err(e))?;
+    }
+
+    if json {
+        let mounts: Vec<(String, String, String)> = vfs
+            .mounts()
+            .iter()
+            .map(|m| {
+                (
+                    m.display.clone(),
+                    m.host.display().to_string(),
+                    m.description.clone(),
+                )
+            })
+            .collect();
+        let resolutions: Vec<(String, String, Option<(String, String, bool)>)> = queries
+            .iter()
+            .map(|q| {
+                let abs = vfs.absolute_win_path(q);
+                let resolved = vfs.to_host(q).map(|(host, mount)| {
+                    let exists = host.exists();
+                    (host.display().to_string(), mount.display.clone(), exists)
+                });
+                (q.clone(), abs, resolved)
+            })
+            .collect();
+        let data = vfs_resolve_data_json(vfs.cwd(), &mounts, &resolutions);
+        return Ok(emit_json(&JsonEnvelope::ok("vfs-resolve", data)));
     }
 
     println!("=== Windows Virtual Filesystem (VFS) Mount Table ===");
@@ -462,43 +576,78 @@ pub fn cmd_vfs_resolve(args: &[String]) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-fn parse_doctor_args(args: &[String]) -> Result<(bool, Vec<String>)> {
+fn parse_doctor_args(args: &[String]) -> Result<(bool, bool, Vec<String>)> {
     let mut fix = false;
+    let mut json = false;
     let mut pe_args = Vec::new();
     for a in args {
         match a.as_str() {
             "--check" => fix = false,
             "--fix" | "--sync" => fix = true,
+            "--json" => json = true,
             s if s.starts_with('-') => {
-                bail!("unknown doctor flag {s:?} (expected --check or --fix)")
+                return Err(usage_err(format!(
+                    "unknown doctor flag {s:?} (expected --check, --fix, or --json)"
+                )));
             }
             p => pe_args.push(p.to_string()),
         }
     }
-    Ok((fix, pe_args))
+    Ok((fix, json, pe_args))
 }
 
-pub fn cmd_doctor(args: &[String]) -> Result<()> {
-    let (fix, pe_args) = parse_doctor_args(args)?;
+pub fn cmd_doctor(args: &[String]) -> Result<i32> {
+    let (fix, json, pe_args) = parse_doctor_args(args)?;
     let root = workspace_root();
-    println!(
-        "=== Translator & Codebase Doctor ({}) ===",
-        if fix { "fix mode" } else { "drift check" }
-    );
 
     // 1-4. Verify (or with `--fix`, synchronize) all four canonical `db/*.tsv` databases:
     //      `db/ops_x86_to_arm64.tsv`, `db/win32_apis.tsv`, `db/shader_formats.tsv`,
     //      and `db/game_profiles.tsv`.
     let db_report = check_or_fix_db_tsvs(&root, &root.join("db"), fix)?;
-    print!("{}", db_report.format_summary());
 
     // 5. Verify standard ~/Translator VFS layout + ShaderCache + Native Pipelines
     let translator_root = WinFs::default_translator_root();
     let _ = WinFs::ensure_drive_c_dirs(&translator_root);
     let vfs = WinFs::with_standard_layout(&translator_root, None, None);
+    let shader_cache = WinFs::default_shader_cache_dir();
+    let dx12_avail = dxil_metal::converter_available();
+    let dx11_avail = dxil_metal::dxilconv::available();
+    let vk_spirv_avail = dxil_metal::spirv_metal::metal_toolchain_available();
+
+    if json {
+        let pe_audits = if !pe_args.is_empty() {
+            Some(scan::run_doctor_pe_audits_json(&pe_args)?)
+        } else {
+            None
+        };
+        let data = doctor_data_json(
+            fix,
+            &db_report,
+            &translator_root.display().to_string(),
+            vfs.mounts().len(),
+            &shader_cache.display().to_string(),
+            dx12_avail,
+            dx11_avail,
+            vk_spirv_avail,
+            pe_audits,
+        );
+        let (code, err_msg) = match db_report.ensure_clean() {
+            Ok(()) => (exit_codes::OK, None),
+            Err(e) => (exit_codes::VERIFICATION_FAILED, Some(format!("{e:#}"))),
+        };
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "doctor", code, data, err_msg,
+        )));
+    }
+
+    println!(
+        "=== Translator & Codebase Doctor ({}) ===",
+        if fix { "fix mode" } else { "drift check" }
+    );
+    print!("{}", db_report.format_summary());
     println!(
         "  [OK]      {:16} : {} ({} active Windows folder mounts)",
         "VFS Root Layout",
@@ -508,10 +657,10 @@ pub fn cmd_doctor(args: &[String]) -> Result<()> {
     println!(
         "  [OK]      {:16} : cache={} (DX12={}, DX11={}, Vulkan SPIR-V={})",
         "Metal Shaders",
-        WinFs::default_shader_cache_dir().display(),
-        dxil_metal::converter_available(),
-        dxil_metal::dxilconv::available(),
-        dxil_metal::spirv_metal::metal_toolchain_available()
+        shader_cache.display(),
+        dx12_avail,
+        dx11_avail,
+        vk_spirv_avail
     );
     println!(
         "  [OK]      {:16} : mscoree.dll + hostfxr.dll + coreclr.dll + mono-2.0-bdwgc.dll + IL2CPP AOT ready",
@@ -521,15 +670,122 @@ pub fn cmd_doctor(args: &[String]) -> Result<()> {
     // 6. Optional PE target scan + Win32 import audit + Anti-Cheat audit + App/GPU audit
     if !pe_args.is_empty() {
         println!();
-        scan::cmd_scan(&pe_args)?;
-        scan::cmd_win32_audit(&pe_args)?;
-        scan::cmd_anticheat_audit(&pe_args)?;
-        scan::cmd_app_audit(&pe_args)?;
-        scan::cmd_dotnet_audit(&pe_args)?;
+        let _ = scan::cmd_scan(&pe_args)?;
+        let _ = scan::cmd_win32_audit(&pe_args)?;
+        let _ = scan::cmd_anticheat_audit(&pe_args)?;
+        let _ = scan::cmd_app_audit(&pe_args)?;
+        let _ = scan::cmd_dotnet_audit(&pe_args)?;
     }
 
-    db_report.ensure_clean()?;
-    Ok(())
+    if let Err(e) = db_report.ensure_clean() {
+        eprintln!("Error: {e:#}");
+        return Ok(exit_codes::VERIFICATION_FAILED);
+    }
+    Ok(exit_codes::OK)
+}
+
+pub fn cmd_stub_sync(args: &[String]) -> Result<i32> {
+    let mut tsv_path = PathBuf::from(DEFAULT_STUB_INVENTORY_TSV);
+    let mut also_backlog = false;
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--tsv" => tsv_path = cur.next_path_or_err("--tsv requires PATH")?,
+            "--backlog" => also_backlog = true,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
+        }
+    }
+    let root = workspace_root();
+    let entries = scan_workspace_stubs(&root)?;
+    let abs_tsv = if tsv_path.is_absolute() {
+        tsv_path.clone()
+    } else {
+        root.join(&tsv_path)
+    };
+    // Enforce zero-new-stub policy when updating an existing inventory.
+    check_no_new_stubs_against_file(&abs_tsv, &entries)?;
+    if let Some(parent) = abs_tsv.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&abs_tsv, format_inventory_tsv(&entries))?;
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in &entries {
+        *by_kind.entry(e.kind.as_str()).or_insert(0) += 1;
+    }
+    println!(
+        "synced {} stub sites (stub={}, failing={}, middleware_stub={}) -> {}",
+        entries.len(),
+        by_kind.get("stub").copied().unwrap_or(0),
+        by_kind.get("failing").copied().unwrap_or(0),
+        by_kind.get("middleware_stub").copied().unwrap_or(0),
+        abs_tsv.display()
+    );
+    if also_backlog {
+        let md = render_stub_backlog_md(&root, &entries)?;
+        let out_md = root.join(DEFAULT_STUB_BACKLOG_MD);
+        fs::write(&out_md, md)?;
+        println!("updated {}", out_md.display());
+    }
+    Ok(exit_codes::OK)
+}
+
+pub fn cmd_stub_backlog(args: &[String]) -> Result<i32> {
+    let mut write = false;
+    let mut out_path = PathBuf::from(DEFAULT_STUB_BACKLOG_MD);
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--write" | "--sync" => write = true,
+            "--out" => {
+                out_path = cur.next_path_or_err("--out requires PATH")?;
+                write = true;
+            }
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
+        }
+    }
+    let root = workspace_root();
+    let entries = scan_workspace_stubs(&root)?;
+    let md = render_stub_backlog_md(&root, &entries)?;
+    if write {
+        let abs = if out_path.is_absolute() {
+            out_path
+        } else {
+            root.join(&out_path)
+        };
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, &md)?;
+        println!(
+            "wrote {} ({} remaining stub sites)",
+            abs.display(),
+            entries.len()
+        );
+    } else {
+        print!("{md}");
+    }
+    Ok(exit_codes::OK)
+}
+
+pub fn cmd_stub_diff(args: &[String]) -> Result<i32> {
+    if args.len() != 2 {
+        return Err(usage_err("usage: port-factory stub-diff <BEFORE.json> <AFTER.json>"));
+    }
+    let diff = diff_stub_json_files(&PathBuf::from(&args[0]), &PathBuf::from(&args[1]))?;
+    print!("{diff}");
+    Ok(exit_codes::OK)
+}
+
+pub fn cmd_report_diff(args: &[String]) -> Result<i32> {
+    if args.len() != 2 {
+        return Err(usage_err("usage: port-factory report-diff <BEFORE.json> <AFTER.json>"));
+    }
+    let diff = port_factory::report_diff::diff_boot_report_files(
+        &PathBuf::from(&args[0]),
+        &PathBuf::from(&args[1]),
+    )?;
+    print!("{diff}");
+    Ok(exit_codes::OK)
 }
 
 #[cfg(test)]
@@ -537,20 +793,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_doctor_args_defaults_to_check_mode_and_supports_fix() {
-        let (fix, pe) = parse_doctor_args(&[]).unwrap();
+    fn parse_doctor_args_defaults_to_check_mode_and_supports_fix_and_json() {
+        let (fix, json, pe) = parse_doctor_args(&[]).unwrap();
         assert!(!fix);
+        assert!(!json);
         assert!(pe.is_empty());
 
-        let (fix, pe) = parse_doctor_args(&["--check".into(), "foo.exe".into()]).unwrap();
+        let (fix, json, pe) =
+            parse_doctor_args(&["--check".into(), "--json".into(), "foo.exe".into()]).unwrap();
         assert!(!fix);
+        assert!(json);
         assert_eq!(pe, vec!["foo.exe"]);
 
-        let (fix, pe) = parse_doctor_args(&["--fix".into(), "dir/a.dll".into()]).unwrap();
+        let (fix, json, pe) = parse_doctor_args(&["--fix".into(), "dir/a.dll".into()]).unwrap();
         assert!(fix);
+        assert!(!json);
         assert_eq!(pe, vec!["dir/a.dll"]);
 
-        let (fix, _) = parse_doctor_args(&["--sync".into()]).unwrap();
+        let (fix, _, _) = parse_doctor_args(&["--sync".into()]).unwrap();
         assert!(fix);
 
         assert!(parse_doctor_args(&["--unknown-flag".into()]).is_err());

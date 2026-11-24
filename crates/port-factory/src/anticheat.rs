@@ -30,6 +30,8 @@ pub static KNOWN_WIN10_SSNS: &[(u32, &str)] = &[
     (0x0006, "NtReadFile"),
     (0x0007, "NtDeviceIoControlFile"),
     (0x0008, "NtWriteFile"),
+    (0x0009, "NtRemoveIoCompletion"),
+    (0x000A, "NtReleaseSemaphore"),
     (0x000D, "NtSetInformationThread"),
     (0x000E, "NtSetEvent"),
     (0x000F, "NtClose"),
@@ -163,6 +165,12 @@ pub fn audit_pe_anticheat(path: &Path) -> Result<AntiCheatAuditReport> {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown.pe")
         .to_string();
+    Ok(audit_pe_anticheat_parsed(&binary_name, &pe))
+}
+
+/// Audit an already-parsed [`Pe`] image for anti-cheat, anti-tamper, packer, and direct-syscall patterns.
+pub fn audit_pe_anticheat_parsed(binary_name: &str, pe: &Pe) -> AntiCheatAuditReport {
+    let binary_name = binary_name.to_string();
 
     let mut sections = Vec::new();
     let mut direct_syscalls = 0u64;
@@ -356,7 +364,7 @@ pub fn audit_pe_anticheat(path: &Path) -> Result<AntiCheatAuditReport> {
         AntiCheatVerdict::CompatibleClean
     };
 
-    Ok(AntiCheatAuditReport {
+    AntiCheatAuditReport {
         binary_name,
         verdict,
         sections,
@@ -373,7 +381,7 @@ pub fn audit_pe_anticheat(path: &Path) -> Result<AntiCheatAuditReport> {
         veh_seh_imports,
         memory_unpack_imports,
         kernel_driver_imports,
-    })
+    }
 }
 
 /// Format a human-readable anti-cheat & anti-tamper compatibility report.

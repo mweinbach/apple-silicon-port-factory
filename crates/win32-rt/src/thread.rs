@@ -102,6 +102,16 @@ impl ThreadObj {
         *self.exit_code.get(&g)
     }
 
+    /// Return this thread's live Darwin Mach port (`0` if not yet started or already exiting).
+    pub fn mach_port(&self) -> u32 {
+        let s = self.suspend.lock().unwrap_or_else(|e| e.into_inner());
+        if s.phase == ThreadPhase::Live {
+            s.mach_port
+        } else {
+            0
+        }
+    }
+
     fn is_current_thread(&self, mach_port: u32) -> bool {
         if current_thread_object().is_some_and(|c| std::ptr::eq(&*c, self)) {
             return true;
@@ -775,7 +785,7 @@ pub fn fls_set(i: u32, v: usize) {
     })
 }
 
-fn run_fls_callbacks() {
+pub(crate) fn run_fls_callbacks() {
     let vals: Vec<usize> = FLS.with(|f| std::mem::take(&mut *f.borrow_mut()));
     for (i, v) in vals.into_iter().enumerate() {
         if v == 0 || i >= MAX_FLS_SLOTS {

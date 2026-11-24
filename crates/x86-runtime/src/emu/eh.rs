@@ -25,6 +25,7 @@ struct Landing {
     xmm: [u128; 16],
     rip: u64,
     eflags: u32,
+    mxcsr: u32,
 }
 
 /// `EH_EMU_ENTRY` record (see the module doc). Lives in the emulator run's frame.
@@ -106,8 +107,15 @@ pub(super) unsafe fn callout<F: FnOnce() -> (u64, u128)>(
             let l = (*(*e).landing.get()).assume_init_ref();
             cpu.gpr = l.gpr;
             cpu.xmm = l.xmm;
+            cpu.clear_all_ymm_hi();
             cpu.rip = l.rip;
             cpu.set_rflags(l.eflags);
+            if l.mxcsr != 0 {
+                let m = l.mxcsr & 0xFFFF;
+                cpu.jx.mxcsr = m;
+                win32_rt::ucrt::runtime::set_guest_mxcsr(m);
+                super::apply_guest_mxcsr_hw(m);
+            }
             cpu.last_bits = [64; 16];
         }
         r
@@ -131,14 +139,15 @@ pub(crate) unsafe fn callout_context(r: *mut EhLink, out: &mut Context) -> bool 
         out.gpr = gpr;
         out.rip = rip;
         out.eflags = eflags;
-        out.mx_csr = 0x1F80;
+        let mx = (*cpu).jx.mxcsr & 0xFFFF;
+        out.mx_csr = mx;
         out.seg_cs = 0x33;
         out.seg_ss = 0x2B;
         out.seg_ds = 0x2B;
         out.seg_es = 0x2B;
         out.seg_gs = 0x2B;
         out.seg_fs = 0x53;
-        out.flt_save[FLT_MXCSR..FLT_MXCSR + 4].copy_from_slice(&0x1F80u32.to_le_bytes());
+        out.flt_save[FLT_MXCSR..FLT_MXCSR + 4].copy_from_slice(&mx.to_le_bytes());
         for (i, x) in xmm.iter().enumerate() {
             out.flt_save[FLT_XMM0 + 16 * i..FLT_XMM0 + 16 * (i + 1)].copy_from_slice(&x.to_le_bytes());
         }
@@ -170,9 +179,13 @@ pub(crate) unsafe fn land(r: *mut EhLink, ctx: &Context) -> ! {
             b.copy_from_slice(&ctx.flt_save[FLT_XMM0 + 16 * i..FLT_XMM0 + 16 * (i + 1)]);
             *x = u128::from_le_bytes(b);
         }
+        let flt_mxcsr = u32::from_le_bytes(
+            ctx.flt_save[FLT_MXCSR..FLT_MXCSR + 4].try_into().unwrap_or([0; 4]),
+        );
+        let mxcsr = if ctx.mx_csr != 0 { ctx.mx_csr } else { flt_mxcsr };
         #[cfg(target_arch = "aarch64")]
         super::aot::record_runtime_callback(ctx.rip, super::aot::CallbackKind::EhContinuation);
-        (*(*e).landing.get()).write(Landing { gpr: ctx.gpr, xmm, rip: ctx.rip, eflags: ctx.eflags });
+        (*(*e).landing.get()).write(Landing { gpr: ctx.gpr, xmm, rip: ctx.rip, eflags: ctx.eflags, mxcsr });
         anchor::jump((*(*e).anchor.get()).as_ptr(), 1)
     }
 }
@@ -562,5 +575,152 @@ mod raise_tests {
         unsafe { win32_rt::unwind::RtlCaptureContext(&mut c) };
         assert_ne!(c.rip, 0);
         assert_eq!(chain::depth(), 0);
+    }
+
+    /// Direct `NtContinue` syscall (`SSN = 0x0043`) and normal `call ntdll!NtContinue` outside
+    /// `NTCONTINUE_STACK` (no active exception callback) must land back in the emulated region
+    /// with the restored guest `Context` instead of falling back to native `restore_context_asm`.
+    #[test]
+    fn direct_ntcontinue_syscall_and_call_resume_outside_capture_scope() {
+        #[repr(C, align(16))]
+        struct Out {
+            rax: u64,
+            rbx: u64,
+            r12: u64,
+            rsp: u64,
+            rflags: u64,
+            mxcsr: u32,
+            _pad: u32,
+            xmm0: u128,
+            xmm6: u128,
+        }
+
+        // Resume target: writes restored registers into `[r15]` (`Out`) and returns `0xBEEF_CAFE`.
+        let mut target_asm = CodeAssembler::new(64).unwrap();
+        target_asm.mov(qword_ptr(r15 + 0x00), rax).unwrap();
+        target_asm.mov(qword_ptr(r15 + 0x08), rbx).unwrap();
+        target_asm.mov(qword_ptr(r15 + 0x10), r12).unwrap();
+        target_asm.mov(qword_ptr(r15 + 0x18), rsp).unwrap();
+        target_asm.pushfq().unwrap();
+        target_asm.pop(rcx).unwrap();
+        target_asm.mov(qword_ptr(r15 + 0x20), rcx).unwrap();
+        target_asm.stmxcsr(dword_ptr(r15 + 0x28)).unwrap();
+        target_asm.movdqu(xmmword_ptr(r15 + 0x30), xmm0).unwrap();
+        target_asm.movdqu(xmmword_ptr(r15 + 0x40), xmm6).unwrap();
+        target_asm.mov(rax, 0xBEEF_CAFEu64).unwrap();
+        target_asm.ret().unwrap();
+        let (target_va, _) = place(target_asm, 256);
+
+        // 1. Direct syscall `NtContinue(rcx=ctx, rdx=0)`: if it returns instead of transferring
+        //    control, `mov eax, 0xDEAD; ret` makes the test fail loudly.
+        let mut sc_asm = CodeAssembler::new(64).unwrap();
+        sc_asm.mov(r10, rcx).unwrap();
+        sc_asm.mov(eax, win32_rt::ntsyscall::ssn::NT_CONTINUE).unwrap();
+        sc_asm.syscall().unwrap();
+        sc_asm.ret().unwrap();
+        let (sc_va, _) = place(sc_asm, 128);
+
+        // 2. Normal `call ntdll!NtContinue` outside `NTCONTINUE_STACK`.
+        let nt_cont_va = native_va(win32_rt::ntdll::NtContinue as *const () as usize);
+        let mut call_asm = CodeAssembler::new(64).unwrap();
+        call_asm.sub(rsp, 0x28).unwrap();
+        call_asm.mov(rax, nt_cont_va).unwrap();
+        call_asm.call(rax).unwrap();
+        call_asm.add(rsp, 0x28).unwrap();
+        call_asm.ret().unwrap();
+        let (call_va, _) = place(call_asm, 128);
+
+        // 3. Direct syscall `NtContinue(NULL, 0)` must return STATUS_INVALID_PARAMETER.
+        for mode in [2u8, 1] {
+            jit::force(mode);
+            let (null_res, _) = unsafe { super::super::emu_run_full(sc_va, [0; 8], [0; 4], [0; 8]) };
+            assert_eq!(
+                null_res as u32,
+                0xC000_000Du32,
+                "mode {mode}: direct NtContinue(NULL) must return STATUS_INVALID_PARAMETER"
+            );
+
+            for (label, entry_va) in [("direct-syscall", sc_va), ("call-ntdll", call_va)] {
+                let mut resume_stack = [0u64; 64];
+                // Place `RET_SENTINEL` at top of resume_stack so `ret` exits `emu_run_full`.
+                let ret_slot = 48;
+                resume_stack[ret_slot] = super::super::RET_SENTINEL;
+                let resume_rsp = &resume_stack[ret_slot] as *const u64 as u64;
+
+                let mut out = Out {
+                    rax: 0,
+                    rbx: 0,
+                    r12: 0,
+                    rsp: 0,
+                    rflags: 0,
+                    mxcsr: 0,
+                    _pad: 0,
+                    xmm0: 0,
+                    xmm6: 0,
+                };
+                // Non-default MXCSR: FTZ (0x8000) | RZ rounding (0x6000) | default masked exceptions (0x1F80).
+                const TEST_MXCSR: u32 = 0xDF80;
+                win32_rt::ucrt::runtime::set_guest_mxcsr(0x1F80);
+                let mut ctx = Context::zeroed();
+                ctx.context_flags = win32_rt::unwind::CONTEXT_FULL;
+                ctx.rip = target_va;
+                ctx.gpr[0] = 0x1111_2222_3333_4444; // rax
+                ctx.gpr[3] = 0x5555_6666_7777_8888; // rbx
+                ctx.gpr[4] = resume_rsp; // rsp
+                ctx.gpr[12] = 0x9999_AAAA_BBBB_CCCC; // r12
+                ctx.gpr[15] = &mut out as *mut Out as u64; // r15
+                ctx.eflags = 0x241; // CF (0x1) | ZF (0x40) | IF (0x200)
+                ctx.mx_csr = TEST_MXCSR;
+                *ctx.xmm_mut(0) = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128.to_le_bytes();
+                *ctx.xmm_mut(6) = 0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444u128.to_le_bytes();
+
+                let (ret, _) = unsafe {
+                    super::super::emu_run_full(
+                        entry_va,
+                        [&ctx as *const Context as u64, 0, 0, 0, 0, 0, 0, 0],
+                        [0; 4],
+                        [0; 8],
+                    )
+                };
+                let tls_mxcsr = win32_rt::ucrt::runtime::guest_mxcsr();
+                win32_rt::ucrt::runtime::set_guest_mxcsr(0x1F80);
+                assert_eq!(ret, 0xBEEF_CAFE, "{label} mode {mode}: unexpected return");
+                assert_eq!(out.rax, 0x1111_2222_3333_4444, "{label} mode {mode}: rax");
+                assert_eq!(out.rbx, 0x5555_6666_7777_8888, "{label} mode {mode}: rbx");
+                assert_eq!(out.r12, 0x9999_AAAA_BBBB_CCCC, "{label} mode {mode}: r12");
+                assert_eq!(out.rsp, resume_rsp, "{label} mode {mode}: rsp");
+                assert_eq!(out.rflags & 0x41, 0x41, "{label} mode {mode}: CF|ZF in rflags");
+                assert_eq!(out.mxcsr, TEST_MXCSR, "{label} mode {mode}: mxcsr");
+                assert_eq!(tls_mxcsr, TEST_MXCSR, "{label} mode {mode}: thread-local guest_mxcsr");
+                assert_eq!(
+                    out.xmm0,
+                    0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128,
+                    "{label} mode {mode}: xmm0"
+                );
+                assert_eq!(
+                    out.xmm6,
+                    0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444u128,
+                    "{label} mode {mode}: xmm6"
+                );
+                assert_eq!(chain::depth(), 0, "{label} mode {mode}: EH chain must be balanced");
+            }
+        }
+        jit::force(0);
+
+        // 4. Calling `dispatch_nt_syscall(NT_CONTINUE, ...)` from Rust with no emulator callout
+        //    and no active capture scope must fail cleanly instead of jumping to x86 RIP on ARM64.
+        let mut fake = Context::zeroed();
+        fake.rip = target_va;
+        let st = unsafe {
+            win32_rt::ntsyscall::dispatch_nt_syscall(
+                win32_rt::ntsyscall::ssn::NT_CONTINUE,
+                &fake as *const Context as u64,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        assert_eq!(st as u32, 0xC000_000Du32);
     }
 }

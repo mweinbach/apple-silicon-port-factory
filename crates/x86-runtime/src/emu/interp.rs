@@ -35,11 +35,77 @@ fn report_fast_mismatch(ip: u64, ins: &Instruction, what: &str, fast_v: u64, gen
     }
 }
 
-/// Log an instruction the generic interpreter has no handler for (once per guest IP). Execution
-/// continues past it as a no-op, so this is usually the first clue for a later divergence.
+/// Documented process exit code when an unimplemented x86-64 instruction is hit
+/// with `--fail-on-unimpl-op` / `PORT_FAIL_ON_UNIMPL_OP=1` enabled.
+pub const EXIT_UNIMPL_OP: u32 = 86;
+
+/// Runtime override for fail-on-unimpl-op:
+/// `0` = defer to `PORT_FAIL_ON_UNIMPL_OP` env var, `1` = force off, `2` = force on.
+static FAIL_ON_UNIMPL_OP_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Explicitly enable or disable failing on unimplemented x86-64 instructions.
+pub fn set_fail_on_unimpl_op(enabled: bool) {
+    FAIL_ON_UNIMPL_OP_OVERRIDE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Clear any programmatic override so `PORT_FAIL_ON_UNIMPL_OP` controls behavior.
+pub fn clear_fail_on_unimpl_op_override() {
+    FAIL_ON_UNIMPL_OP_OVERRIDE.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Parse a boolean env string (`0`/`false`/`no`/`off` -> false, any other non-empty -> true).
+pub fn parse_env_bool(val: &str) -> bool {
+    let t = val.trim();
+    !t.is_empty()
+        && !t.eq_ignore_ascii_case("0")
+        && !t.eq_ignore_ascii_case("false")
+        && !t.eq_ignore_ascii_case("no")
+        && !t.eq_ignore_ascii_case("off")
+}
+
+/// Returns true if hitting an unimplemented x86-64 instruction in the generic
+/// interpreter must abort the process with [`EXIT_UNIMPL_OP`].
+pub fn fail_on_unimpl_op_enabled() -> bool {
+    match FAIL_ON_UNIMPL_OP_OVERRIDE.load(std::sync::atomic::Ordering::Acquire) {
+        1 => false,
+        2 => true,
+        _ => std::env::var("PORT_FAIL_ON_UNIMPL_OP")
+            .ok()
+            .is_some_and(|v| parse_env_bool(&v)),
+    }
+}
+
+/// Handle an instruction the generic interpreter has no handler for.
+///
+/// When `--fail-on-unimpl-op` / `PORT_FAIL_ON_UNIMPL_OP=1` is active (default for
+/// CLI bring-up runs and `live-probe`), logs the instruction, writes a crash report,
+/// and terminates with [`EXIT_UNIMPL_OP`]. Otherwise logs once per guest IP and
+/// continues as a no-op.
 #[cold]
 #[inline(never)]
-fn report_unimplemented(ip: u64, mn: Mnemonic, ins: &Instruction) {
+fn report_unimplemented(ip: u64, mn: Mnemonic, ins: &Instruction, cpu: &Cpu) {
+    if fail_on_unimpl_op_enabled() {
+        let sym = win32_rt::symbolize(ip as usize);
+        log::error!(
+            "emu: UNIMPLEMENTED mnemonic {mn:?} at {ip:#x} ({sym}) `{ins}` — aborting (exit {EXIT_UNIMPL_OP}; disable with --no-fail-on-unimpl-op or PORT_FAIL_ON_UNIMPL_OP=0)"
+        );
+        eprintln!(
+            "emu: UNIMPLEMENTED mnemonic {mn:?} at {ip:#x} ({sym}) `{ins}` — aborting (exit {EXIT_UNIMPL_OP})"
+        );
+        unsafe {
+            let ctx = win32_rt::unwind::guest_context(&cpu.gpr, &cpu.xmm, ip, cpu.rflags());
+            win32_rt::crash::report(
+                &format!("unimplemented x86 instruction {mn:?} `{ins}` at {ip:#x}"),
+                None,
+                &ctx,
+            );
+        }
+        win32_rt::process::exit_process(EXIT_UNIMPL_OP);
+    }
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if g.get_or_insert_with(Default::default).insert(ip) {
@@ -1087,7 +1153,7 @@ unsafe fn emu_run_region(
             }
             Mnemonic::Syscall | Mnemonic::Sysenter => {
                 let ssn = cpu.gpr[0] as u32;
-                let r10 = if cpu.gpr[10] != 0 { cpu.gpr[10] } else { cpu.gpr[1] };
+                let r10 = cpu.gpr[10];
                 let rdx = cpu.gpr[2];
                 let r8 = cpu.gpr[8];
                 let r9 = cpu.gpr[9];
@@ -1095,11 +1161,37 @@ unsafe fn emu_run_region(
                 // Architectural x86-64 SYSCALL saves next RIP in RCX and RFLAGS in R11
                 cpu.gpr[1] = cpu.rip;
                 cpu.gpr[11] = cpu.rflags() as u64;
-                let status = win32_rt::ntsyscall::dispatch_nt_syscall(ssn, r10, rdx, r8, r9, rsp);
-                cpu.gpr[0] = status as i64 as u64;
-                cpu.last_bits[0] = 64;
-                cpu.last_bits[1] = 64;
-                cpu.last_bits[11] = 64;
+                let status_opt = if matches!(
+                    ssn,
+                    win32_rt::ntsyscall::ssn::NT_CONTINUE
+                        | win32_rt::ntsyscall::ssn::NT_RAISE_EXCEPTION
+                ) {
+                    // Wrap control-transferring syscalls in an EH callout so `NtContinue` /
+                    // `NtRaiseException` can land back into this emulated region via `eh::land`
+                    // instead of attempting a native host `restore_context_asm` jump.
+                    let host_fn = win32_rt::ntsyscall::dispatch_nt_syscall as *const () as usize;
+                    eh::callout(&mut cpu, host_fn, *sp_ptr, move || {
+                        let status = win32_rt::ntsyscall::dispatch_nt_syscall(
+                            ssn, r10, rdx, r8, r9, rsp,
+                        );
+                        (status as i64 as u64, 0)
+                    })
+                    .map(|(st, _)| st)
+                } else {
+                    let status =
+                        win32_rt::ntsyscall::dispatch_nt_syscall(ssn, r10, rdx, r8, r9, rsp);
+                    Some(status as i64 as u64)
+                };
+                if let Some(status_u64) = status_opt {
+                    cpu.gpr[0] = status_u64;
+                    cpu.last_bits[0] = 64;
+                    cpu.last_bits[1] = 64;
+                    cpu.last_bits[11] = 64;
+                } else {
+                    // `eh::callout` landed with the restored guest `Context` already in `cpu`.
+                    blk_left = 0;
+                    continue;
+                }
             }
             Mnemonic::Ret => {
                 let rsp = cpu.gpr[4];
@@ -1152,7 +1244,7 @@ unsafe fn emu_run_region(
                         if let Some(p) = prof {
                             p.unhandled(cur_ip, mn);
                         }
-                        report_unimplemented(cur_ip, mn, &ins);
+                        report_unimplemented(cur_ip, mn, &ins, &cpu);
                     } else if let Some(ref pf) = pre_fp {
                         crate::diag::post_ins(pf, &cpu, cur_ip, &ins);
                     }

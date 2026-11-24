@@ -119,6 +119,8 @@ pub unsafe fn compare(c: &Cmp, rep: &mut Report) -> Detail {
         rep.t_us[r] = c.res[r].t_us;
         rep.fault_addr[r] = c.res[r].fault_addr;
         rep.fault_pc[r] = c.res[r].fault_pc;
+        rep.run_status[r] = c.res[r].wait_status;
+        rep.fault_sig[r] = c.res[r].fault_sig;
         rep.pages[r] = c.bufs.hdr(r).npages as u32;
     }
     rep.rax_p = [c.res[3].rax, c.res[4].rax];

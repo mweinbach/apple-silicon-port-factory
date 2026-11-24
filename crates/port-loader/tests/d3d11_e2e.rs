@@ -144,19 +144,23 @@ fn compile_guest_exe(zig: &Path, work_dir: &Path) -> PathBuf {
     exe_path
 }
 
-fn run_guest_in_port_runner(work_dir: &Path, exe_path: &Path, headless: bool) -> (Option<i32>, String) {
+fn run_guest_in_port_runner(work_dir: &Path, exe_path: &Path, headless: bool) -> (Option<i32>, String, PathBuf) {
     let log_dir = work_dir.join("logs");
     let drive_c = work_dir.join("drive_c");
     let aot_dir = work_dir.join("aot");
+    let ctl_dir = work_dir.join("ctl");
     std::fs::create_dir_all(&log_dir).unwrap();
     std::fs::create_dir_all(&drive_c).unwrap();
     std::fs::create_dir_all(&aot_dir).unwrap();
+    std::fs::create_dir_all(&ctl_dir).unwrap();
+    std::fs::write(ctl_dir.join("cmd.txt"), "shot d3d11_frame.png\n").expect("write ctl cmd.txt");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_port-runner"));
     cmd.arg("--pe")
         .arg(exe_path)
         .env("PORT_LOG_DIR", &log_dir)
         .env("PORT_AOT_DIR", &aot_dir)
+        .env("PORT_CONTROL_DIR", &ctl_dir)
         .env("AW2_DRIVE_C", &drive_c)
         .env("TRANSLATOR_HOME", &drive_c)
         .env("RUST_LOG", "info")
@@ -199,7 +203,41 @@ fn run_guest_in_port_runner(work_dir: &Path, exe_path: &Path, headless: bool) ->
         combined.push_str("\n--- stderr ---\n");
         combined.push_str(&stderr);
     }
-    (code, combined)
+    (code, combined, ctl_dir)
+}
+
+fn assert_control_channel_answered(ctl_dir: &Path, mode: &str, log: &str) {
+    assert!(
+        !ctl_dir.join("cmd.txt").exists(),
+        "d3d11_e2e ({mode}): PORT_CONTROL_DIR cmd.txt was not consumed by PresentHook:\n{log}"
+    );
+    let status_path = ctl_dir.join("status.json");
+    let status = std::fs::read_to_string(&status_path)
+        .unwrap_or_else(|e| panic!("d3d11_e2e ({mode}): missing {}: {e}\n{log}", status_path.display()));
+    assert!(
+        status.contains("\"api\":\"d3d11\""),
+        "d3d11_e2e ({mode}): status.json missing api=d3d11: {status}"
+    );
+    assert!(
+        status.contains("\"cmds\":1"),
+        "d3d11_e2e ({mode}): status.json did not record shot command: {status}"
+    );
+    let shot_path = ctl_dir.join("d3d11_frame.png");
+    let png = std::fs::read(&shot_path)
+        .unwrap_or_else(|e| panic!("d3d11_e2e ({mode}): missing screenshot {}: {e}\n{log}", shot_path.display()));
+    assert!(
+        png.len() > 24 && &png[..8] == b"\x89PNG\r\n\x1a\n" && &png[12..16] == b"IHDR",
+        "d3d11_e2e ({mode}): invalid PNG header in {} ({} bytes)",
+        shot_path.display(),
+        png.len()
+    );
+    let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    assert_eq!(
+        (w, h),
+        (256, 256),
+        "d3d11_e2e ({mode}): unexpected PNG dimensions {w}x{h} (expected 256x256)"
+    );
 }
 
 fn assert_guest_output_clean(code: Option<i32>, log: &str, mode: &str) {
@@ -243,8 +281,9 @@ fn d3d11_e2e_headless_offscreen() {
     };
     let tmp = TempDir::new("headless");
     let exe = compile_guest_exe(&zig, tmp.path());
-    let (code, log) = run_guest_in_port_runner(tmp.path(), &exe, true);
+    let (code, log, ctl_dir) = run_guest_in_port_runner(tmp.path(), &exe, true);
     assert_guest_output_clean(code, &log, "headless");
+    assert_control_channel_answered(&ctl_dir, "headless", &log);
     assert!(
         log.contains("swapchain: 256x256 DXGI_FORMAT_R8G8B8A8_UNORM") && log.contains("offscreen"),
         "expected offscreen swapchain log:\n{log}"
@@ -258,8 +297,9 @@ fn d3d11_e2e_windowed_nswindow_swapchain() {
     };
     let tmp = TempDir::new("windowed");
     let exe = compile_guest_exe(&zig, tmp.path());
-    let (code, log) = run_guest_in_port_runner(tmp.path(), &exe, false);
+    let (code, log, ctl_dir) = run_guest_in_port_runner(tmp.path(), &exe, false);
     assert_guest_output_clean(code, &log, "windowed");
+    assert_control_channel_answered(&ctl_dir, "windowed", &log);
     assert!(
         log.contains("NSWindow for hwnd"),
         "windowed run did not create a real NSWindow:\n{log}"

@@ -215,6 +215,10 @@ unsafe extern "win64" fn trap_handler(id: *const ImportId, ret: usize, regs: *co
     ctx.gpr[7] = r[6]; // rdi
     ctx.gpr[8..16].copy_from_slice(&r[7..15]);
     ctx.rip = ret as u64;
+    win32_rt::process::record_exit_reason(
+        "unimplemented_import",
+        format!("{}!{} (called from {})", id.dll, id.name, win32_rt::symbolize(ret)),
+    );
     win32_rt::crash::report(&format!("unimplemented import {}!{}", id.dll, id.name), None, &ctx);
     exit_hold();
     win32_rt::process::exit_process(STATUS_ENTRYPOINT_NOT_FOUND)
@@ -236,6 +240,8 @@ fn push_u64(v: &mut Vec<u8>, x: u64) {
 
 /// A thunk that reports `dll!name` as unimplemented when called.
 pub fn trap_thunk(dll: &str, name: &str, importer: &str) -> usize {
+    let handler = trap_handler as *const () as usize;
+    win32_rt::register_native_va(handler as u64, handler);
     let id = Box::leak(Box::new(ImportId { dll: dll.into(), name: name.into(), importer: importer.into() }));
     let mut c = Vec::with_capacity(80);
     // push r15..r8, rdi, rsi, rbp, rbx, rdx, rcx, rax  (rax ends lowest)
@@ -248,7 +254,7 @@ pub fn trap_thunk(dll: &str, name: &str, importer: &str) -> usize {
     c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
     push_u64(&mut c, id as *const ImportId as u64);
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    push_u64(&mut c, trap_handler as *const () as usize as u64);
+    push_u64(&mut c, handler as u64);
     c.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -285,6 +291,8 @@ unsafe extern "win64" fn trace_handler(id: *const ImportId, ret: usize, regs: *c
 /// A thunk that logs the call and then jumps to `target` with all
 /// argument registers (rcx, rdx, r8, r9, xmm0-3, stack) preserved.
 pub fn trace_thunk(dll: &str, name: &str, importer: &str, target: usize) -> usize {
+    let handler = trace_handler as *const () as usize;
+    win32_rt::register_native_va(handler as u64, handler);
     let id = Box::leak(Box::new(ImportId { dll: dll.into(), name: name.into(), importer: importer.into() }));
     let mut c = Vec::with_capacity(128);
     c.extend_from_slice(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]); // push rcx; push rdx; push r8; push r9
@@ -297,7 +305,7 @@ pub fn trace_thunk(dll: &str, name: &str, importer: &str, target: usize) -> usiz
     c.extend_from_slice(&[0x48, 0x8B, 0x94, 0x24, 0x88, 0, 0, 0]); // mov rdx, [rsp+0x88] (return address)
     c.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x68]); // lea r8, [rsp+0x68] (saved regs)
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, trace_handler
-    push_u64(&mut c, trace_handler as *const () as usize as u64);
+    push_u64(&mut c, handler as u64);
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     for (i, d) in [(0u8, 0x20u8), (1, 0x30), (2, 0x40), (3, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x6F, 0x44 | (i << 3), 0x24, d]); // movdqu xmmi, [rsp+d]

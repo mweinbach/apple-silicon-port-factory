@@ -82,7 +82,7 @@ pub fn install() {
     let _ = std::fs::create_dir_all(&path);
     let _ = CTL_DIR.set(path.clone());
     let _ = STATE.set(Mutex::new(LiveState::new()));
-    w::d3d12::swapchain::register_present_hook(on_present);
+    w::present::register_present_hook(on_present);
     log::info!("live_ctl: enabled at {}", path.display());
 }
 
@@ -405,8 +405,9 @@ fn write_status(dir: &PathBuf, st: &mut LiveState, hwnd: usize, frame: u32) {
     let pad_rem = st.pad_state.map_or(0, |(_, r)| r);
     let mouse_rem = st.mouse_ramp.as_ref().map_or(0, |m| m.rem_frames);
     let (nan_births, host_nans, mem_watches) = x86_runtime::diag::nan_trace_stats();
+    let api = w::present::last_present_api().label();
     let json = format!(
-        "{{\"frame\":{frame},\"fps\":{fps:.1},\"uptime_s\":{uptime:.2},\"hwnd\":{hwnd},\"cmds\":{},\"active_keys\":{active_keys},\"mouse_rem\":{mouse_rem},\"pad_rem\":{pad_rem},\"nan_active\":{},\"nan_births\":{nan_births},\"host_events\":{host_nans},\"mem_watches\":{mem_watches}}}\n",
+        "{{\"frame\":{frame},\"fps\":{fps:.1},\"uptime_s\":{uptime:.2},\"hwnd\":{hwnd},\"api\":\"{api}\",\"cmds\":{},\"active_keys\":{active_keys},\"mouse_rem\":{mouse_rem},\"pad_rem\":{pad_rem},\"nan_active\":{},\"nan_births\":{nan_births},\"host_events\":{host_nans},\"mem_watches\":{mem_watches}}}\n",
         st.last_cmd_count,
         x86_runtime::diag::nan_trace_active()
     );

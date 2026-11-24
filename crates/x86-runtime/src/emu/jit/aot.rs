@@ -341,7 +341,14 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
         (36, 1u64), // codegen rev 4: XBUD bit-0 ymm_dirty, batched push/pop/ret, JccPair, x_shuf_rr, xmm_hi_live, XA cache, hot/cold split
         (37, 3u64), // codegen rev 7 (bits 37..38): shared timestamp conversion stubs
     ];
-    bits.iter().fold(0u64, |k, &(b, v)| k | v << b)
+    let low = bits.iter().fold(0u64, |k, &(b, v)| k | (v << b));
+    debug_assert_eq!(low >> 39, 0, "aot_knob_bits low bitfields overflowed bit 38");
+    // Fold a 25-bit digest of all registry-declared AOT-key knobs (`affects_aot_key == true`)
+    // into bits 39..=63 so any codegen/stub knob set via `PORT_*`, legacy `AW2_*`, or
+    // `game.toml [knobs]` partitions the `.aot` cache key without disturbing bits 0..=38
+    // read by `StubCfg::from_aot_knobs` and static Mach-O emission.
+    let high = (port_manifest::knobs::aot_key_hash() & ((1u64 << 25) - 1)) << 39;
+    low | high
 }
 
 #[cfg(test)]
@@ -388,5 +395,28 @@ mod jit_aot_tests {
         } else {
             assert_eq!(bl_off, veneer_off);
         }
+    }
+
+    #[test]
+    fn aot_knob_bits_folds_registry_aot_key_hash() {
+        let prev = std::env::var_os("PORT_JIT_THUNK_ELIDE");
+        std::env::remove_var("PORT_JIT_THUNK_ELIDE");
+        let base = aot_knob_bits();
+        std::env::set_var("PORT_JIT_THUNK_ELIDE", "2");
+        let changed = aot_knob_bits();
+        match prev {
+            Some(v) => std::env::set_var("PORT_JIT_THUNK_ELIDE", v),
+            None => std::env::remove_var("PORT_JIT_THUNK_ELIDE"),
+        }
+        assert_ne!(
+            base >> 39,
+            changed >> 39,
+            "changing an AOT-key knob must change the folded high-bit digest in aot_knob_bits()"
+        );
+        assert_eq!(
+            base & ((1u64 << 39) - 1),
+            changed & ((1u64 << 39) - 1),
+            "folding registry hash into bits 39..=63 must not alter bits 0..=38"
+        );
     }
 }

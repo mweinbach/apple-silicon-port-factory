@@ -337,6 +337,13 @@ unsafe extern "win64" fn get_device_sc(this: PS, riid: *const Guid, out: *mut *m
 }
 
 unsafe fn do_present(this: PS, sync: u32, flags: u32) -> HRESULT {
+    let t0 = crate::hitch::span_begin();
+    let hr = do_present_inner(this, sync, flags);
+    crate::hitch::span_end(t0, crate::hitch::SPAN_PRESENT);
+    hr
+}
+
+unsafe fn do_present_inner(this: PS, sync: u32, flags: u32) -> HRESULT {
     let s = Obj::get(this);
     if flags & DXGI_PRESENT_TEST != 0 {
         return S_OK;
@@ -344,7 +351,11 @@ unsafe fn do_present(this: PS, sync: u32, flags: u32) -> HRESULT {
     // Flush all pending D3D11 immediate context commands onto the shared queue first.
     s.device.flush_immediate();
     let mut st = s.st.lock().unwrap();
-    match st.sc.present(sync) {
+    let present_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::Present, sync as u64);
+    let res = st.sc.present(sync);
+    let present_ns = present_scope.elapsed_ns();
+    drop(present_scope);
+    match res {
         Ok(v) => {
             st.occluded_logged = false;
             st.present_refresh = crate::dxgi::adapter::record_present();
@@ -365,6 +376,8 @@ unsafe fn do_present(this: PS, sync: u32, flags: u32) -> HRESULT {
             if n == 120 || n % 600 == 0 {
                 d3d12_metal::metal::pipeline::flush_pso_cache();
             }
+            drop(st);
+            crate::present::on_present(crate::present::PresentApi::D3d11, s.hwnd, present_ns);
             S_OK
         }
         Err(e) => {

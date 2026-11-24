@@ -177,6 +177,8 @@ struct RegWatcher {
 
 struct Registry {
     keys: std::collections::BTreeMap<String, std::collections::BTreeMap<String, RegValue>>,
+    /// Original-case leaf key name keyed by lowercased full registry path.
+    key_names: std::collections::BTreeMap<String, String>,
     watchers: Vec<RegWatcher>,
 }
 
@@ -239,7 +241,7 @@ impl Registry {
         for root in ["hkcr", "hkcu", "hklm", "hku", "hkpd", "hkcc"] {
             keys.insert(root.to_string(), std::collections::BTreeMap::new());
         }
-        let mut reg = Self { keys, watchers: Vec::new() };
+        let mut reg = Self { keys, key_names: std::collections::BTreeMap::new(), watchers: Vec::new() };
         // Pre-populate standard .NET Framework 4.8 & .NET 8.0 keys so games, launchers,
         // and installers checking for .NET prerequisites succeed automatically.
         for sub in [
@@ -459,6 +461,7 @@ impl Registry {
             }
             cur.push_str(&seg.to_ascii_lowercase());
             self.keys.entry(cur.clone()).or_default();
+            self.key_names.entry(cur.clone()).or_insert_with(|| seg.to_string());
         }
     }
 
@@ -616,6 +619,7 @@ pub unsafe extern "win64" fn RegCreateKeyExW(key: HANDLE, sub: LPCWSTR, _r: u32,
         if !existed {
             created_parents.push(parent);
             reg.keys.insert(cur.clone(), std::collections::BTreeMap::new());
+            reg.key_names.insert(cur.clone(), seg.to_string());
         }
     }
     // Match the observed parent path of every newly created key (including intermediates)
@@ -966,6 +970,7 @@ pub unsafe extern "win64" fn RegDeleteKeyExW(key: HANDLE, sub: LPCWSTR, _sam: u3
     let full = join_reg_path(&base, &sub_str);
     let mut reg = registry().lock().unwrap();
     if reg.keys.remove(&full).is_some() {
+        reg.key_names.remove(&full);
         let fired = if let Some(parent) = parent_reg_path(&full) {
             reg.take_triggered(&[&full, parent], REG_NOTIFY_CHANGE_NAME)
         } else {
@@ -991,8 +996,10 @@ pub unsafe extern "win64" fn RegDeleteTreeW(key: HANDLE, sub: LPCWSTR) -> u32 {
         return ERROR_FILE_NOT_FOUND;
     }
     reg.keys.retain(|k, _| !k.starts_with(&prefix));
+    reg.key_names.retain(|k, _| !k.starts_with(&prefix));
     if !sub_str.is_empty() {
         reg.keys.remove(&full);
+        reg.key_names.remove(&full);
     } else if let Some(vals) = reg.keys.get_mut(&full) {
         vals.clear();
     }
@@ -1028,7 +1035,8 @@ fn direct_subkeys(reg: &Registry, path: &str) -> Vec<String> {
     for k in reg.keys.keys() {
         if let Some(rest) = k.strip_prefix(&prefix) {
             if !rest.is_empty() && !rest.contains('\\') {
-                subkeys.push(rest.to_string());
+                let display = reg.key_names.get(k).cloned().unwrap_or_else(|| rest.to_string());
+                subkeys.push(display);
             }
         }
     }
@@ -2635,12 +2643,358 @@ pub unsafe extern "win64" fn StartServiceCtrlDispatcherA(
 
 // ------------------------------------------------------- CAPI / Cred*
 
-// @exports CryptAcquireContextW CryptAcquireContextA CryptReleaseContext CryptCreateHash CryptHashData CryptGetHashParam CryptSetHashParam CryptDestroyHash CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptGetProvParam CryptSignHashW CredWriteW
+const CALG_MD5: u32 = 0x0000_8003;
+const CALG_SHA1: u32 = 0x0000_8004;
+const CALG_SHA_256: u32 = 0x0000_800C;
+const CALG_SHA_384: u32 = 0x0000_800D;
+const CALG_SHA_512: u32 = 0x0000_800E;
+
+const HP_ALGID: u32 = 0x0001;
+const HP_HASHVAL: u32 = 0x0002;
+const HP_HASHSIZE: u32 = 0x0004;
+
+const PP_IMPTYPE: u32 = 3;
+const PP_NAME: u32 = 4;
+const PP_VERSION: u32 = 5;
+const PP_CONTAINER: u32 = 6;
+const PP_PROVTYPE: u32 = 16;
+
+const NTE_BAD_ALGID: u32 = 0x8009_0008;
+const NTE_BAD_TYPE: u32 = 0x8009_000A;
+const NTE_BAD_HASH: u32 = 0x8009_0002;
+const NTE_BAD_UID: u32 = 0x8009_0001;
+
+struct CapiProvider {
+    prov_type: u32,
+    prov_name: String,
+    container: String,
+}
+
+struct CapiHash {
+    alg_id: u32,
+    ctx: [u64; 64],
+    override_val: Option<Vec<u8>>,
+}
+
+static NEXT_CAPI_HANDLE: AtomicU64 = AtomicU64::new(0xC000_0001);
+
+fn capi_providers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiProvider>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiProvider>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn capi_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiHash>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiHash>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+extern "C" {
+    fn CC_MD5_Init(c: *mut c_void) -> i32;
+    fn CC_MD5_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_MD5_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA1_Init(c: *mut c_void) -> i32;
+    fn CC_SHA1_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA1_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA256_Init(c: *mut c_void) -> i32;
+    fn CC_SHA256_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA256_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA384_Init(c: *mut c_void) -> i32;
+    fn CC_SHA384_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA384_Final(md: *mut u8, c: *mut c_void) -> i32;
+    fn CC_SHA512_Init(c: *mut c_void) -> i32;
+    fn CC_SHA512_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
+    fn CC_SHA512_Final(md: *mut u8, c: *mut c_void) -> i32;
+}
+
+fn capi_hash_len(alg_id: u32) -> Option<usize> {
+    match alg_id {
+        CALG_MD5 => Some(16),
+        CALG_SHA1 => Some(20),
+        CALG_SHA_256 => Some(32),
+        CALG_SHA_384 => Some(48),
+        CALG_SHA_512 => Some(64),
+        _ => None,
+    }
+}
+
+fn capi_hash_ops(
+    alg_id: u32,
+) -> Option<(
+    unsafe extern "C" fn(*mut c_void) -> i32,
+    unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32,
+    unsafe extern "C" fn(*mut u8, *mut c_void) -> i32,
+)> {
+    match alg_id {
+        CALG_MD5 => Some((CC_MD5_Init, CC_MD5_Update, CC_MD5_Final)),
+        CALG_SHA1 => Some((CC_SHA1_Init, CC_SHA1_Update, CC_SHA1_Final)),
+        CALG_SHA_256 => Some((CC_SHA256_Init, CC_SHA256_Update, CC_SHA256_Final)),
+        CALG_SHA_384 => Some((CC_SHA384_Init, CC_SHA384_Update, CC_SHA384_Final)),
+        CALG_SHA_512 => Some((CC_SHA512_Init, CC_SHA512_Update, CC_SHA512_Final)),
+        _ => None,
+    }
+}
+
+unsafe fn capi_hash_init(alg_id: u32) -> Option<[u64; 64]> {
+    let (init, _, _) = capi_hash_ops(alg_id)?;
+    let mut ctx = [0u64; 64];
+    init(ctx.as_mut_ptr() as *mut c_void);
+    Some(ctx)
+}
+
+unsafe fn capi_hash_update(alg_id: u32, ctx: &mut [u64; 64], data: &[u8]) {
+    let Some((_, update, _)) = capi_hash_ops(alg_id) else {
+        return;
+    };
+    let ctx_p = ctx.as_mut_ptr() as *mut c_void;
+    for chunk in data.chunks(16 * 1024 * 1024) {
+        update(ctx_p, chunk.as_ptr() as *const c_void, chunk.len() as u32);
+    }
+}
+
+unsafe fn capi_hash_finalize_clone(alg_id: u32, ctx: &[u64; 64]) -> Option<Vec<u8>> {
+    let len = capi_hash_len(alg_id)?;
+    let (_, _, fin) = capi_hash_ops(alg_id)?;
+    let mut tmp = *ctx;
+    let mut out = vec![0u8; len];
+    fin(out.as_mut_ptr(), tmp.as_mut_ptr() as *mut c_void);
+    Some(out)
+}
+
+unsafe fn crypt_acquire_context_impl(
+    ph_prov: *mut usize,
+    container: Option<String>,
+    provider: Option<String>,
+    dw_prov_type: u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if ph_prov.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    let prov = CapiProvider {
+        prov_type: dw_prov_type,
+        prov_name: provider.unwrap_or_else(|| "Microsoft Enhanced RSA and AES Cryptographic Provider".into()),
+        container: container.unwrap_or_default(),
+    };
+    capi_providers().lock().unwrap().insert(h, prov);
+    std::ptr::write_unaligned(ph_prov, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptAcquireContextW(
+    ph_prov: *mut usize,
+    sz_container: LPCWSTR,
+    sz_provider: LPCWSTR,
+    dw_prov_type: u32,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_acquire_context_impl(
+        ph_prov,
+        crate::strings::from_wide_opt(sz_container),
+        crate::strings::from_wide_opt(sz_provider),
+        dw_prov_type,
+        dw_flags,
+    )
+}
+
+pub unsafe extern "win64" fn CryptAcquireContextA(
+    ph_prov: *mut usize,
+    sz_container: LPCSTR,
+    sz_provider: LPCSTR,
+    dw_prov_type: u32,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_acquire_context_impl(
+        ph_prov,
+        crate::strings::from_ansi_opt(sz_container),
+        crate::strings::from_ansi_opt(sz_provider),
+        dw_prov_type,
+        dw_flags,
+    )
+}
+
+pub unsafe extern "win64" fn CryptReleaseContext(h_prov: usize, _dw_flags: u32) -> BOOL {
+    if capi_providers().lock().unwrap().remove(&h_prov).is_some() {
+        TRUE
+    } else {
+        err(NTE_BAD_UID, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn CryptGetProvParam(
+    h_prov: usize,
+    dw_param: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get(&h_prov) else {
+        return err(NTE_BAD_UID, FALSE);
+    };
+    let bytes: Vec<u8> = match dw_param {
+        PP_NAME => {
+            let mut v = prov.prov_name.as_bytes().to_vec();
+            v.push(0);
+            v
+        }
+        PP_CONTAINER => {
+            let mut v = prov.container.as_bytes().to_vec();
+            v.push(0);
+            v
+        }
+        PP_PROVTYPE => prov.prov_type.to_le_bytes().to_vec(),
+        PP_VERSION => 0x0000_0200u32.to_le_bytes().to_vec(),
+        PP_IMPTYPE => 2u32.to_le_bytes().to_vec(), // CRYPT_IMPL_SOFTWARE
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+    let need = bytes.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(234 /* ERROR_MORE_DATA */, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptCreateHash(
+    h_prov: usize,
+    alg_id: u32,
+    _h_key: usize,
+    _dw_flags: u32,
+    ph_hash: *mut usize,
+) -> BOOL {
+    if ph_hash.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
+        return err(NTE_BAD_UID, FALSE);
+    }
+    let Some(ctx) = capi_hash_init(alg_id) else {
+        return err(NTE_BAD_ALGID, FALSE);
+    };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_hashes().lock().unwrap().insert(
+        h,
+        CapiHash {
+            alg_id,
+            ctx,
+            override_val: None,
+        },
+    );
+    std::ptr::write_unaligned(ph_hash, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptHashData(
+    h_hash: usize,
+    pb_data: *const u8,
+    dw_data_len: u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if dw_data_len > 0 && pb_data.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut hashes = capi_hashes().lock().unwrap();
+    let Some(h) = hashes.get_mut(&h_hash) else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    if dw_data_len > 0 {
+        let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
+        capi_hash_update(h.alg_id, &mut h.ctx, slice);
+        h.override_val = None;
+    }
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptGetHashParam(
+    h_hash: usize,
+    dw_param: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let hashes = capi_hashes().lock().unwrap();
+    let Some(h) = hashes.get(&h_hash) else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    let bytes: Vec<u8> = match dw_param {
+        HP_ALGID => h.alg_id.to_le_bytes().to_vec(),
+        HP_HASHSIZE => (capi_hash_len(h.alg_id).unwrap_or(0) as u32).to_le_bytes().to_vec(),
+        HP_HASHVAL => {
+            if let Some(ref ov) = h.override_val {
+                ov.clone()
+            } else {
+                let Some(d) = capi_hash_finalize_clone(h.alg_id, &h.ctx) else {
+                    return err(NTE_BAD_ALGID, FALSE);
+                };
+                d
+            }
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+    let need = bytes.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(234 /* ERROR_MORE_DATA */, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptSetHashParam(
+    h_hash: usize,
+    dw_param: u32,
+    pb_data: *const u8,
+    _dw_flags: u32,
+) -> BOOL {
+    if pb_data.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut hashes = capi_hashes().lock().unwrap();
+    let Some(h) = hashes.get_mut(&h_hash) else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    if dw_param == HP_HASHVAL {
+        let Some(len) = capi_hash_len(h.alg_id) else {
+            return err(NTE_BAD_ALGID, FALSE);
+        };
+        h.override_val = Some(std::slice::from_raw_parts(pb_data, len).to_vec());
+        return TRUE;
+    }
+    err(NTE_BAD_TYPE, FALSE)
+}
+
+pub unsafe extern "win64" fn CryptDestroyHash(h_hash: usize) -> BOOL {
+    if capi_hashes().lock().unwrap().remove(&h_hash).is_some() {
+        TRUE
+    } else {
+        err(NTE_BAD_HASH, FALSE)
+    }
+}
+
+// @exports CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptSignHashW
 failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    CryptAcquireContextW, CryptAcquireContextA, CryptReleaseContext, CryptCreateHash, CryptHashData,
-    CryptGetHashParam, CryptSetHashParam, CryptDestroyHash, CryptDecrypt,
-    CryptEncrypt, CryptDestroyKey, CryptExportKey, CryptImportKey,
-    CryptGetUserKey, CryptGetProvParam, CryptSignHashW, CredWriteW);
+    CryptDecrypt, CryptEncrypt, CryptDestroyKey, CryptExportKey,
+    CryptImportKey, CryptGetUserKey, CryptSignHashW);
 
 /// `RtlGenRandom` alias exported by advapi32.dll as `SystemFunction036`.
 pub unsafe extern "win64" fn SystemFunction036(buf: *mut c_void, len: u32) -> u8 {
@@ -2657,28 +3011,732 @@ pub unsafe extern "win64" fn CryptGenRandom(_h_prov: usize, len: u32, buf: *mut 
     crate::ntdll::RtlGenRandom(buf as *mut c_void, len) as BOOL
 }
 
-/// No CSPs are installed.
+/// No legacy CSP registry entries are enumerated.
 pub unsafe extern "win64" fn CryptEnumProvidersW() -> BOOL {
     err(ERROR_NO_MORE_ITEMS, FALSE)
 }
 
-/// The credential store is empty.
-pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, _ty: u32, _flags: u32, out: *mut *mut c_void) -> BOOL {
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+/// Windows x64 `CREDENTIALW` (80 bytes).
+#[repr(C)]
+struct CredentialW {
+    flags: u32,
+    cred_type: u32,
+    target_name: *mut u16,
+    comment: *mut u16,
+    last_written: FILETIME,
+    credential_blob_size: u32,
+    _pad: u32,
+    credential_blob: *mut u8,
+    persist: u32,
+    attribute_count: u32,
+    attributes: *mut c_void,
+    target_alias: *mut u16,
+    user_name: *mut u16,
+}
+const _: () = assert!(std::mem::size_of::<CredentialW>() == 80);
+
+/// Windows x64 `CREDENTIAL_ATTRIBUTEW` (24 bytes).
+#[repr(C)]
+struct CredentialAttributeW {
+    keyword: *mut u16,
+    flags: u32,
+    value_size: u32,
+    value: *mut u8,
+}
+const _: () = assert!(std::mem::size_of::<CredentialAttributeW>() == 24);
+
+#[derive(Clone)]
+struct StoredCredAttr {
+    keyword: String,
+    flags: u32,
+    value: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct StoredCredential {
+    flags: u32,
+    cred_type: u32,
+    target_name: String,
+    comment: Option<String>,
+    last_written: FILETIME,
+    blob: Vec<u8>,
+    persist: u32,
+    attributes: Vec<StoredCredAttr>,
+    target_alias: Option<String>,
+    user_name: Option<String>,
+}
+
+const CRED_PERSIST_SESSION: u32 = 1;
+const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
+const CRED_PERSIST_ENTERPRISE: u32 = 3;
+const CRED_MAX_ATTRIBUTES: u32 = 64;
+const CRED_VAULT_MAGIC_V1: &[u8; 8] = b"PFCRED01";
+const CRED_VAULT_MAGIC: &[u8; 8] = b"PFCRED02";
+const CRED_VAULT_ENTROPY_LOCAL: &[u8] = b"advapi32-cred-local-v1";
+const CRED_VAULT_ENTROPY_ENTERPRISE: &[u8] = b"advapi32-cred-enterprise-v1";
+const ERROR_WRITE_FAULT_CRED: u32 = 29;
+
+fn cred_store_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Cross-process + in-process lock guard for the credential vault.
+/// Holds the in-process mutex and an exclusive POSIX `flock(LOCK_EX)` on `.vault.lock`
+/// so concurrent processes serialise load-modify-rename writes cleanly.
+struct CredStoreGuard {
+    _mem: std::sync::MutexGuard<'static, ()>,
+    flock_file: Option<std::fs::File>,
+}
+
+impl Drop for CredStoreGuard {
+    fn drop(&mut self) {
+        if let Some(ref f) = self.flock_file {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
     }
-    log::debug!("CredReadW({:?}) -> ERROR_NOT_FOUND (empty credential store)", crate::strings::from_wide_opt(target));
+}
+
+fn acquire_cred_store_lock() -> std::io::Result<CredStoreGuard> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let mem = cred_store_lock().lock().unwrap();
+    let lock_path = crate::path::default_translator_root()
+        .join("AppData")
+        .join("Local")
+        .join("Microsoft")
+        .join("Credentials")
+        .join(".vault.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    Ok(CredStoreGuard {
+        _mem: mem,
+        flock_file: Some(file),
+    })
+}
+
+fn acquire_cred_store_lock_best_effort() -> CredStoreGuard {
+    match acquire_cred_store_lock() {
+        Ok(g) => g,
+        Err(_) => CredStoreGuard {
+            _mem: cred_store_lock().lock().unwrap(),
+            flock_file: None,
+        },
+    }
+}
+
+/// Session-scoped (`CRED_PERSIST_SESSION`) credentials stay in memory only.
+fn session_cred_store() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u32), StoredCredential>> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, u32), StoredCredential>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cred_allocs() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredVaultKind {
+    LocalMachine,
+    Enterprise,
+}
+
+impl CredVaultKind {
+    fn path(self) -> std::path::PathBuf {
+        let root = crate::path::default_translator_root();
+        match self {
+            CredVaultKind::LocalMachine => root
+                .join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("Credentials")
+                .join("vault_local.bin"),
+            CredVaultKind::Enterprise => root
+                .join("AppData")
+                .join("Roaming")
+                .join("Microsoft")
+                .join("Credentials")
+                .join("vault_enterprise.bin"),
+        }
+    }
+
+    fn dpapi_local_machine(self) -> bool {
+        matches!(self, CredVaultKind::LocalMachine)
+    }
+
+    fn entropy(self) -> &'static [u8] {
+        match self {
+            CredVaultKind::LocalMachine => CRED_VAULT_ENTROPY_LOCAL,
+            CredVaultKind::Enterprise => CRED_VAULT_ENTROPY_ENTERPRISE,
+        }
+    }
+
+    fn descr(self) -> &'static str {
+        match self {
+            CredVaultKind::LocalMachine => "CredVaultLocal",
+            CredVaultKind::Enterprise => "CredVaultEnterprise",
+        }
+    }
+}
+
+fn encode_cred_vault(map: &std::collections::HashMap<(String, u32), StoredCredential>) -> Vec<u8> {
+    fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    fn push_opt_str(out: &mut Vec<u8>, s: &Option<String>) {
+        match s {
+            Some(v) => {
+                out.push(1);
+                push_bytes(out, v.as_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(CRED_VAULT_MAGIC);
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for entry in map.values() {
+        out.extend_from_slice(&entry.flags.to_le_bytes());
+        out.extend_from_slice(&entry.cred_type.to_le_bytes());
+        out.extend_from_slice(&entry.persist.to_le_bytes());
+        let ft = ((entry.last_written.dwHighDateTime as u64) << 32)
+            | (entry.last_written.dwLowDateTime as u64);
+        out.extend_from_slice(&ft.to_le_bytes());
+        push_bytes(&mut out, entry.target_name.as_bytes());
+        push_opt_str(&mut out, &entry.comment);
+        push_opt_str(&mut out, &entry.target_alias);
+        push_opt_str(&mut out, &entry.user_name);
+        push_bytes(&mut out, &entry.blob);
+        out.extend_from_slice(&(entry.attributes.len() as u32).to_le_bytes());
+        for attr in &entry.attributes {
+            push_bytes(&mut out, attr.keyword.as_bytes());
+            out.extend_from_slice(&attr.flags.to_le_bytes());
+            push_bytes(&mut out, &attr.value);
+        }
+    }
+    out
+}
+
+fn decode_cred_vault(data: &[u8]) -> Option<std::collections::HashMap<(String, u32), StoredCredential>> {
+    if data.len() < 12 {
+        return None;
+    }
+    let has_attrs = if &data[..8] == CRED_VAULT_MAGIC {
+        true
+    } else if &data[..8] == CRED_VAULT_MAGIC_V1 {
+        false
+    } else {
+        return None;
+    };
+    let mut pos = 8usize;
+    let read_u32 = |pos: &mut usize| -> Option<u32> {
+        let end = pos.checked_add(4)?;
+        let v = u32::from_le_bytes(data.get(*pos..end)?.try_into().ok()?);
+        *pos = end;
+        Some(v)
+    };
+    let read_u64 = |pos: &mut usize| -> Option<u64> {
+        let end = pos.checked_add(8)?;
+        let v = u64::from_le_bytes(data.get(*pos..end)?.try_into().ok()?);
+        *pos = end;
+        Some(v)
+    };
+    let read_bytes = |pos: &mut usize| -> Option<Vec<u8>> {
+        let len = read_u32(pos)? as usize;
+        let end = pos.checked_add(len)?;
+        let v = data.get(*pos..end)?.to_vec();
+        *pos = end;
+        Some(v)
+    };
+    let read_opt_str = |pos: &mut usize| -> Option<Option<String>> {
+        let tag = *data.get(*pos)?;
+        *pos += 1;
+        match tag {
+            0 => Some(None),
+            1 => {
+                let b = read_bytes(pos)?;
+                Some(Some(String::from_utf8(b).ok()?))
+            }
+            _ => None,
+        }
+    };
+
+    let count = read_u32(&mut pos)? as usize;
+    let mut map = std::collections::HashMap::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let flags = read_u32(&mut pos)?;
+        let cred_type = read_u32(&mut pos)?;
+        let persist = read_u32(&mut pos)?;
+        let ft = read_u64(&mut pos)?;
+        let target_name = String::from_utf8(read_bytes(&mut pos)?).ok()?;
+        let comment = read_opt_str(&mut pos)?;
+        let target_alias = read_opt_str(&mut pos)?;
+        let user_name = read_opt_str(&mut pos)?;
+        let blob = read_bytes(&mut pos)?;
+        let attributes = if has_attrs {
+            let acount = read_u32(&mut pos)? as usize;
+            let mut attrs = Vec::with_capacity(acount.min(CRED_MAX_ATTRIBUTES as usize));
+            for _ in 0..acount {
+                let keyword = String::from_utf8(read_bytes(&mut pos)?).ok()?;
+                let aflags = read_u32(&mut pos)?;
+                let value = read_bytes(&mut pos)?;
+                attrs.push(StoredCredAttr {
+                    keyword,
+                    flags: aflags,
+                    value,
+                });
+            }
+            attrs
+        } else {
+            Vec::new()
+        };
+        let key = (target_name.to_ascii_lowercase(), cred_type);
+        map.insert(
+            key,
+            StoredCredential {
+                flags,
+                cred_type,
+                target_name,
+                comment,
+                last_written: FILETIME::from_u64(ft),
+                blob,
+                persist,
+                attributes,
+                target_alias,
+                user_name,
+            },
+        );
+    }
+    Some(map)
+}
+
+unsafe fn load_persisted_vault(
+    kind: CredVaultKind,
+) -> std::io::Result<std::collections::HashMap<(String, u32), StoredCredential>> {
+    let path = kind.path();
+    let enc = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new());
+        }
+        Err(e) => return Err(e),
+    };
+    let (_, plain) = crate::misc::crypt32::dpapi_unprotect_bytes(kind.entropy(), &enc)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "failed to decrypt persisted credential vault",
+            )
+        })?;
+    decode_cred_vault(&plain).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "corrupt persisted credential vault",
+        )
+    })
+}
+
+unsafe fn save_persisted_vault(
+    kind: CredVaultKind,
+    map: &std::collections::HashMap<(String, u32), StoredCredential>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = kind.path();
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vault path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let raw = encode_cred_vault(map);
+    let enc = crate::misc::crypt32::dpapi_protect_bytes(
+        kind.dpapi_local_machine(),
+        kind.descr(),
+        kind.entropy(),
+        &raw,
+    )
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "DPAPI encryption of credential vault failed",
+        )
+    })?;
+
+    let mut rnd = [0u8; 8];
+    libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{suffix:016x}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("vault.bin"),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&enc)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+const CRED_PRESERVE_CREDENTIAL_BLOB: u32 = 0x1;
+
+/// Lookup existing credential blob across session and persisted vaults while caller holds `CredStoreGuard`.
+unsafe fn find_existing_cred_blob(key: &(String, u32)) -> Option<Vec<u8>> {
+    if let Some(e) = session_cred_store().lock().unwrap().get(key) {
+        return Some(e.blob.clone());
+    }
+    for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
+        if let Ok(map) = load_persisted_vault(kind) {
+            if let Some(e) = map.get(key) {
+                return Some(e.blob.clone());
+            }
+        }
+    }
+    None
+}
+
+pub unsafe extern "win64" fn CredWriteW(cred_ptr: *const c_void, flags: u32) -> BOOL {
+    if cred_ptr.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if (flags & !CRED_PRESERVE_CREDENTIAL_BLOB) != 0 {
+        return err(crate::types::err::ERROR_INVALID_FLAGS, FALSE);
+    }
+    let preserve_blob = (flags & CRED_PRESERVE_CREDENTIAL_BLOB) != 0;
+    let c = std::ptr::read_unaligned(cred_ptr as *const CredentialW);
+    if !matches!(
+        c.persist,
+        CRED_PERSIST_SESSION | CRED_PERSIST_LOCAL_MACHINE | CRED_PERSIST_ENTERPRISE
+    ) {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if preserve_blob && c.credential_blob_size != 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(target) = crate::strings::from_wide_opt(c.target_name) else {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    };
+    let blob = if c.credential_blob_size > 0 && !c.credential_blob.is_null() {
+        std::slice::from_raw_parts(c.credential_blob, c.credential_blob_size as usize).to_vec()
+    } else if c.credential_blob_size > 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    } else {
+        Vec::new()
+    };
+    let mut attributes = Vec::with_capacity(c.attribute_count.min(CRED_MAX_ATTRIBUTES) as usize);
+    if c.attribute_count > 0 {
+        if c.attributes.is_null() || c.attribute_count > CRED_MAX_ATTRIBUTES {
+            return err(ERROR_INVALID_PARAMETER, FALSE);
+        }
+        let attrs_ptr = c.attributes as *const CredentialAttributeW;
+        for i in 0..c.attribute_count as usize {
+            let a = std::ptr::read_unaligned(attrs_ptr.add(i));
+            let Some(keyword) = crate::strings::from_wide_opt(a.keyword) else {
+                return err(ERROR_INVALID_PARAMETER, FALSE);
+            };
+            let value = if a.value_size > 0 {
+                if a.value.is_null() {
+                    return err(ERROR_INVALID_PARAMETER, FALSE);
+                }
+                std::slice::from_raw_parts(a.value, a.value_size as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            attributes.push(StoredCredAttr {
+                keyword,
+                flags: a.flags,
+                value,
+            });
+        }
+    }
+    let key = (target.to_ascii_lowercase(), c.cred_type);
+    let mut entry = StoredCredential {
+        flags: c.flags,
+        cred_type: c.cred_type,
+        target_name: target,
+        comment: crate::strings::from_wide_opt(c.comment),
+        last_written: FILETIME::from_u64(crate::types::now_filetime()),
+        blob,
+        persist: c.persist,
+        attributes,
+        target_alias: crate::strings::from_wide_opt(c.target_alias),
+        user_name: crate::strings::from_wide_opt(c.user_name),
+    };
+
+    match c.persist {
+        CRED_PERSIST_SESSION => {
+            let _guard = acquire_cred_store_lock_best_effort();
+            if preserve_blob {
+                let Some(existing_blob) = find_existing_cred_blob(&key) else {
+                    return err(ERROR_NOT_FOUND, FALSE);
+                };
+                entry.blob = existing_blob;
+            }
+            session_cred_store().lock().unwrap().insert(key.clone(), entry);
+            // Replace any stale persisted entry for the same (target, type).
+            for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
+                if let Ok(mut map) = load_persisted_vault(kind) {
+                    if map.remove(&key).is_some() {
+                        let _ = save_persisted_vault(kind, &map);
+                    }
+                }
+            }
+            TRUE
+        }
+        CRED_PERSIST_LOCAL_MACHINE | CRED_PERSIST_ENTERPRISE => {
+            let _guard = match acquire_cred_store_lock() {
+                Ok(g) => g,
+                Err(_) => return err(ERROR_WRITE_FAULT_CRED, FALSE),
+            };
+            let (target_kind, other_kind) = if c.persist == CRED_PERSIST_LOCAL_MACHINE {
+                (CredVaultKind::LocalMachine, CredVaultKind::Enterprise)
+            } else {
+                (CredVaultKind::Enterprise, CredVaultKind::LocalMachine)
+            };
+            let mut map = match load_persisted_vault(target_kind) {
+                Ok(m) => m,
+                Err(_) => return err(ERROR_WRITE_FAULT_CRED, FALSE),
+            };
+            if preserve_blob {
+                let existing_blob = map
+                    .get(&key)
+                    .map(|e| e.blob.clone())
+                    .or_else(|| {
+                        session_cred_store()
+                            .lock()
+                            .unwrap()
+                            .get(&key)
+                            .map(|e| e.blob.clone())
+                    })
+                    .or_else(|| {
+                        load_persisted_vault(other_kind)
+                            .ok()
+                            .and_then(|m| m.get(&key).map(|e| e.blob.clone()))
+                    });
+                let Some(existing_blob) = existing_blob else {
+                    return err(ERROR_NOT_FOUND, FALSE);
+                };
+                entry.blob = existing_blob;
+            }
+            map.insert(key.clone(), entry);
+            if save_persisted_vault(target_kind, &map).is_err() {
+                return err(ERROR_WRITE_FAULT_CRED, FALSE);
+            }
+            session_cred_store().lock().unwrap().remove(&key);
+            if let Ok(mut other) = load_persisted_vault(other_kind) {
+                if other.remove(&key).is_some() {
+                    let _ = save_persisted_vault(other_kind, &other);
+                }
+            }
+            TRUE
+        }
+        _ => err(ERROR_INVALID_PARAMETER, FALSE),
+    }
+}
+
+pub unsafe extern "win64" fn CredReadW(target: LPCWSTR, ty: u32, _flags: u32, out: *mut *mut c_void) -> BOOL {
+    if out.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(out, std::ptr::null_mut());
+    let Some(name) = crate::strings::from_wide_opt(target) else {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    };
+    let key = (name.to_ascii_lowercase(), ty);
+    let entry = {
+        let _guard = acquire_cred_store_lock_best_effort();
+        if let Some(e) = session_cred_store().lock().unwrap().get(&key).cloned() {
+            Some(e)
+        } else {
+            let mut found = None;
+            for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
+                if let Ok(map) = load_persisted_vault(kind) {
+                    if let Some(e) = map.get(&key).cloned() {
+                        found = Some(e);
+                        break;
+                    }
+                }
+            }
+            found
+        }
+    };
+    let Some(e) = entry else {
+        return err(ERROR_NOT_FOUND, FALSE);
+    };
+
+    // Pack `CredentialW` + `CredentialAttributeW[]` + strings + blobs into one heap allocation for `CredFree`.
+    let target_w = crate::strings::to_wide_z(&e.target_name);
+    let comment_w = e.comment.as_deref().map(crate::strings::to_wide_z);
+    let alias_w = e.target_alias.as_deref().map(crate::strings::to_wide_z);
+    let user_w = e.user_name.as_deref().map(crate::strings::to_wide_z);
+    let attr_keywords_w: Vec<Vec<u16>> = e
+        .attributes
+        .iter()
+        .map(|a| crate::strings::to_wide_z(&a.keyword))
+        .collect();
+
+    let mut total = std::mem::size_of::<CredentialW>();
+    let attrs_off = total;
+    total += e.attributes.len() * std::mem::size_of::<CredentialAttributeW>();
+    let target_off = total;
+    total += target_w.len() * 2;
+    let comment_off = comment_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
+    let alias_off = alias_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
+    let user_off = user_w.as_ref().map(|w| { let o = total; total += w.len() * 2; o });
+    let mut attr_kw_offs = Vec::with_capacity(e.attributes.len());
+    for kw in &attr_keywords_w {
+        attr_kw_offs.push(total);
+        total += kw.len() * 2;
+    }
+    let blob_off = total;
+    total += e.blob.len();
+    let mut attr_val_offs = Vec::with_capacity(e.attributes.len());
+    for a in &e.attributes {
+        attr_val_offs.push(total);
+        total += a.value.len();
+    }
+
+    let base = crate::heap::alloc(total, true) as *mut u8;
+    if base.is_null() {
+        return err(crate::types::err::ERROR_NOT_ENOUGH_MEMORY, FALSE);
+    }
+    let write_w = |off: usize, units: &[u16]| -> *mut u16 {
+        let p = base.add(off) as *mut u16;
+        for (i, &u) in units.iter().enumerate() {
+            std::ptr::write_unaligned(p.add(i), u);
+        }
+        p
+    };
+    let target_ptr = write_w(target_off, &target_w);
+    let comment_ptr = comment_off
+        .map(|o| write_w(o, comment_w.as_ref().unwrap()))
+        .unwrap_or(std::ptr::null_mut());
+    let alias_ptr = alias_off
+        .map(|o| write_w(o, alias_w.as_ref().unwrap()))
+        .unwrap_or(std::ptr::null_mut());
+    let user_ptr = user_off
+        .map(|o| write_w(o, user_w.as_ref().unwrap()))
+        .unwrap_or(std::ptr::null_mut());
+    let blob_ptr = if e.blob.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let p = base.add(blob_off);
+        std::ptr::copy_nonoverlapping(e.blob.as_ptr(), p, e.blob.len());
+        p
+    };
+    let attrs_ptr = if e.attributes.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let arr = base.add(attrs_off) as *mut CredentialAttributeW;
+        for (i, attr) in e.attributes.iter().enumerate() {
+            let kw_ptr = write_w(attr_kw_offs[i], &attr_keywords_w[i]);
+            let val_ptr = if attr.value.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                let p = base.add(attr_val_offs[i]);
+                std::ptr::copy_nonoverlapping(attr.value.as_ptr(), p, attr.value.len());
+                p
+            };
+            std::ptr::write_unaligned(
+                arr.add(i),
+                CredentialAttributeW {
+                    keyword: kw_ptr,
+                    flags: attr.flags,
+                    value_size: attr.value.len() as u32,
+                    value: val_ptr,
+                },
+            );
+        }
+        arr as *mut c_void
+    };
+    std::ptr::write_unaligned(
+        base as *mut CredentialW,
+        CredentialW {
+            flags: e.flags,
+            cred_type: e.cred_type,
+            target_name: target_ptr,
+            comment: comment_ptr,
+            last_written: e.last_written,
+            credential_blob_size: e.blob.len() as u32,
+            _pad: 0,
+            credential_blob: blob_ptr,
+            persist: e.persist,
+            attribute_count: e.attributes.len() as u32,
+            attributes: attrs_ptr,
+            target_alias: alias_ptr,
+            user_name: user_ptr,
+        },
+    );
+    cred_allocs().lock().unwrap().insert(base as usize);
+    std::ptr::write_unaligned(out, base as *mut c_void);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CredDeleteW(target: LPCWSTR, ty: u32, _flags: u32) -> BOOL {
+    let Some(name) = crate::strings::from_wide_opt(target) else {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    };
+    let key = (name.to_ascii_lowercase(), ty);
+    let _guard = acquire_cred_store_lock_best_effort();
+    if session_cred_store().lock().unwrap().remove(&key).is_some() {
+        return TRUE;
+    }
+    for kind in [CredVaultKind::LocalMachine, CredVaultKind::Enterprise] {
+        if let Ok(mut map) = load_persisted_vault(kind) {
+            if map.remove(&key).is_some() {
+                if save_persisted_vault(kind, &map).is_err() {
+                    return err(ERROR_WRITE_FAULT_CRED, FALSE);
+                }
+                return TRUE;
+            }
+        }
+    }
     err(ERROR_NOT_FOUND, FALSE)
 }
 
-pub unsafe extern "win64" fn CredDeleteW(_target: LPCWSTR, _ty: u32, _flags: u32) -> BOOL {
-    err(ERROR_NOT_FOUND, FALSE)
-}
-
-/// CredReadW never allocates, so there is nothing to free.
 pub unsafe extern "win64" fn CredFree(p: *mut c_void) {
-    if !p.is_null() {
-        stub!("CredFree({p:p}): buffer not allocated by us");
+    if p.is_null() {
+        return;
+    }
+    if cred_allocs().lock().unwrap().remove(&(p as usize)) {
+        crate::heap::free(p);
     }
 }
 
@@ -3439,6 +4497,184 @@ mod tests {
             assert_eq!(CloseServiceHandle(hsvc), TRUE);
             assert_eq!(CloseServiceHandle(scm), TRUE);
             let _ = crate::kernel32::threads::CloseHandle(ev);
+        }
+    }
+
+    #[test]
+    fn capi_hashing_and_credential_store_roundtrip() {
+        unsafe {
+            // 1. CAPI SHA-256 of "abc"
+            let mut hprov: usize = 0;
+            assert_eq!(CryptAcquireContextW(&mut hprov, std::ptr::null(), std::ptr::null(), 24, 0), TRUE);
+            assert_ne!(hprov, 0);
+
+            let mut hhash: usize = 0;
+            assert_eq!(CryptCreateHash(hprov, CALG_SHA_256, 0, 0, &mut hhash), TRUE);
+            assert_eq!(CryptHashData(hhash, b"abc".as_ptr(), 3, 0), TRUE);
+
+            let mut digest = [0u8; 32];
+            let mut dlen = 32u32;
+            assert_eq!(CryptGetHashParam(hhash, HP_HASHVAL, digest.as_mut_ptr(), &mut dlen, 0), TRUE);
+            assert_eq!(dlen, 32);
+            // NIST SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+            assert_eq!(
+                digest,
+                [
+                    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+                    0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+                    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+                    0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+                ]
+            );
+            assert_eq!(CryptDestroyHash(hhash), TRUE);
+            assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
+
+            // 2. CredWriteW / CredReadW / CredFree / CredDeleteW across persistence modes
+            use std::os::unix::fs::PermissionsExt;
+            let tmp_root = std::env::temp_dir().join(format!("pf_cred_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp_root);
+            std::fs::create_dir_all(&tmp_root).unwrap();
+            let prev_home = std::env::var_os("TRANSLATOR_HOME");
+            let prev_drive = std::env::var_os("AW2_DRIVE_C");
+            std::env::set_var("TRANSLATOR_HOME", &tmp_root);
+            std::env::remove_var("AW2_DRIVE_C");
+
+            let make_cred = |target: &[u16], user: &[u16], secret: &[u8], persist: u32| CredentialW {
+                flags: 0,
+                cred_type: 1, // CRED_TYPE_GENERIC
+                target_name: target.as_ptr() as *mut u16,
+                comment: std::ptr::null_mut(),
+                last_written: FILETIME::default(),
+                credential_blob_size: secret.len() as u32,
+                _pad: 0,
+                credential_blob: secret.as_ptr() as *mut u8,
+                persist,
+                attribute_count: 0,
+                attributes: std::ptr::null_mut(),
+                target_alias: std::ptr::null_mut(),
+                user_name: user.as_ptr() as *mut u16,
+            };
+
+            let target_sess = crate::strings::to_wide_z("PortFactory/SessionOnly");
+            let target_local = crate::strings::to_wide_z("PortFactory/LocalMachine");
+            let target_ent = crate::strings::to_wide_z("PortFactory/Enterprise");
+            let user = crate::strings::to_wide_z("alice");
+
+            // Invalid persist is rejected honestly.
+            let bad = make_cred(&target_sess, &user, b"x", 0);
+            assert_eq!(CredWriteW(&bad as *const _ as *const c_void, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            let c_sess = make_cred(&target_sess, &user, b"sess-blob", CRED_PERSIST_SESSION);
+            let c_local = make_cred(&target_local, &user, b"local-blob", CRED_PERSIST_LOCAL_MACHINE);
+            let c_ent = make_cred(&target_ent, &user, b"ent-blob", CRED_PERSIST_ENTERPRISE);
+            assert_eq!(CredWriteW(&c_sess as *const _ as *const c_void, 0), TRUE);
+            assert_eq!(CredWriteW(&c_local as *const _ as *const c_void, 0), TRUE);
+            assert_eq!(CredWriteW(&c_ent as *const _ as *const c_void, 0), TRUE);
+
+            // Vault files exist with 0600 permissions and do not store plaintext secret bytes.
+            for (kind, needle) in [
+                (CredVaultKind::LocalMachine, &b"local-blob"[..]),
+                (CredVaultKind::Enterprise, &b"ent-blob"[..]),
+            ] {
+                let p = kind.path();
+                let meta = std::fs::metadata(&p).expect("persisted vault must exist");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                let raw = std::fs::read(&p).unwrap();
+                assert!(!raw.windows(needle.len()).any(|w| w == needle), "vault must be encrypted");
+            }
+
+            // Simulate a new process by clearing the in-memory session store.
+            session_cred_store().lock().unwrap().clear();
+
+            // Session credential is gone; persisted LOCAL_MACHINE and ENTERPRISE survive.
+            let mut out: *mut c_void = std::ptr::null_mut();
+            assert_eq!(CredReadW(target_sess.as_ptr(), 1, 0, &mut out), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
+
+            // CRED_PRESERVE_CREDENTIAL_BLOB: rejects unknown flags, rejects non-zero blob,
+            // returns ERROR_NOT_FOUND for absent credentials, and preserves existing secret on metadata update.
+            assert_eq!(CredWriteW(&c_local as *const _ as *const c_void, 0x2), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_FLAGS);
+            assert_eq!(
+                CredWriteW(&c_local as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            let target_missing = crate::strings::to_wide_z("PortFactory/Missing");
+            let c_missing = make_cred(&target_missing, &user, &[], CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(
+                CredWriteW(&c_missing as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
+
+            let user_updated = crate::strings::to_wide_z("alice-updated");
+            let c_local_meta = make_cred(&target_local, &user_updated, &[], CRED_PERSIST_LOCAL_MACHINE);
+            assert_eq!(
+                CredWriteW(&c_local_meta as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                TRUE
+            );
+            assert_eq!(CredReadW(target_local.as_ptr(), 1, 0, &mut out), TRUE);
+            let got_meta = std::ptr::read_unaligned(out as *const CredentialW);
+            assert_eq!(got_meta.credential_blob_size as usize, b"local-blob".len());
+            assert_eq!(
+                std::slice::from_raw_parts(got_meta.credential_blob, got_meta.credential_blob_size as usize),
+                b"local-blob"
+            );
+            assert_eq!(crate::strings::from_wide(got_meta.user_name), "alice-updated");
+            CredFree(out);
+
+            // Restore username "alice" and attach a credential attribute to verify roundtrip persistence.
+            let attr_kw = crate::strings::to_wide_z("PortFactory:Scope");
+            let attr_val = b"game-launch-token";
+            let mut attr_in = CredentialAttributeW {
+                keyword: attr_kw.as_ptr() as *mut u16,
+                flags: 0,
+                value_size: attr_val.len() as u32,
+                value: attr_val.as_ptr() as *mut u8,
+            };
+            let mut c_local_restore = make_cred(&target_local, &user, &[], CRED_PERSIST_LOCAL_MACHINE);
+            c_local_restore.attribute_count = 1;
+            c_local_restore.attributes = &mut attr_in as *mut _ as *mut c_void;
+            assert_eq!(
+                CredWriteW(&c_local_restore as *const _ as *const c_void, CRED_PRESERVE_CREDENTIAL_BLOB),
+                TRUE
+            );
+            assert_eq!(CredReadW(target_local.as_ptr(), 1, 0, &mut out), TRUE);
+            let got_attr_cred = std::ptr::read_unaligned(out as *const CredentialW);
+            assert_eq!(got_attr_cred.attribute_count, 1);
+            assert!(!got_attr_cred.attributes.is_null());
+            let got_attr = std::ptr::read_unaligned(got_attr_cred.attributes as *const CredentialAttributeW);
+            assert_eq!(crate::strings::from_wide(got_attr.keyword), "PortFactory:Scope");
+            assert_eq!(got_attr.value_size as usize, attr_val.len());
+            assert_eq!(std::slice::from_raw_parts(got_attr.value, got_attr.value_size as usize), attr_val);
+            CredFree(out);
+
+            for (t, expected) in [(&target_local, &b"local-blob"[..]), (&target_ent, &b"ent-blob"[..])] {
+                assert_eq!(CredReadW(t.as_ptr(), 1, 0, &mut out), TRUE);
+                assert!(!out.is_null());
+                let got = std::ptr::read_unaligned(out as *const CredentialW);
+                assert_eq!(got.credential_blob_size as usize, expected.len());
+                assert_eq!(std::slice::from_raw_parts(got.credential_blob, expected.len()), expected);
+                assert_eq!(crate::strings::from_wide(got.user_name), "alice");
+                CredFree(out);
+
+                assert_eq!(CredDeleteW(t.as_ptr(), 1, 0), TRUE);
+                assert_eq!(CredReadW(t.as_ptr(), 1, 0, &mut out), FALSE);
+                assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
+            }
+
+            match prev_home {
+                Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
+                None => std::env::remove_var("TRANSLATOR_HOME"),
+            }
+            match prev_drive {
+                Some(v) => std::env::set_var("AW2_DRIVE_C", v),
+                None => std::env::remove_var("AW2_DRIVE_C"),
+            }
+            let _ = std::fs::remove_dir_all(&tmp_root);
         }
     }
 }

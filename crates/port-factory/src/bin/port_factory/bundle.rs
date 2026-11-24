@@ -1,12 +1,15 @@
 //! AOT prewarm / static Mach-O emission, iOS/macOS bundle packaging & verification,
 //! external SSD export, and storage asset optimization CLI handlers.
 
-use super::{usage, workspace_root, ArgCursor};
+use super::{emit_json, usage_err, workspace_root, ArgCursor};
 use anyhow::{bail, Context, Result};
 use port_factory::bundle_common::find_or_build_host_port_runner;
 use port_factory::ios_bundle::{
     build_ios_bundle, format_ios_bundle_verify_report, verify_ios_bundle, IosBundleOptions,
     IosTarget,
+};
+use port_factory::json_output::{
+    bundle_verify_data_json, bundles_list_data_json, exit_codes, ios_verify_data_json, JsonEnvelope,
 };
 use port_factory::steam_library::{
     export_app_bundle, format_bundle_verify_report, list_external_volumes, list_packaged_bundles,
@@ -17,38 +20,40 @@ use port_factory::storage_opt::{
     StorageOptOptions, StorageOptProfile,
 };
 use port_factory::vfs::WinFs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
+pub fn cmd_aot_prewarm(args: &[String]) -> Result<i32> {
     let mut pe_path: Option<PathBuf> = None;
     let mut manifest_path: Option<PathBuf> = None;
     let mut game_dir: Option<PathBuf> = None;
     let mut aot_dir: Option<PathBuf> = None;
     let mut max_funcs: Option<usize> = None;
+    let mut json = false;
 
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--manifest" => manifest_path = Some(cur.next_path_or_usage()),
-            "--game-dir" => game_dir = Some(cur.next_path_or_usage()),
-            "--aot-dir" => aot_dir = Some(cur.next_path_or_usage()),
+            "--manifest" => manifest_path = Some(cur.next_path_or_err("--manifest requires FILE")?),
+            "--game-dir" => game_dir = Some(cur.next_path_or_err("--game-dir requires DIR")?),
+            "--aot-dir" => aot_dir = Some(cur.next_path_or_err("--aot-dir requires DIR")?),
             "--max-funcs" | "--aot-max-funcs" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--max-funcs requires N")?;
                 max_funcs = Some(
                     raw.parse()
-                        .with_context(|| format!("invalid --max-funcs {raw:?}"))?,
+                        .map_err(|_| usage_err(format!("invalid --max-funcs {raw:?}")))?,
                 );
             }
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p if pe_path.is_none() => pe_path = Some(PathBuf::from(p)),
-            other => bail!("unexpected argument {other:?}"),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
         }
     }
     if pe_path.is_none() && manifest_path.is_none() {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory aot-prewarm [PE_FILE] [--manifest FILE] [--game-dir DIR] [--aot-dir DIR] [--max-funcs N] [--json]",
+        ));
     }
-    // Allow passing a package/game directory directly to `aot-prewarm <DIR>`:
-    // discover the primary x86-64 PE (`.exe` preferred, else first plugin PE) and set `--game-dir`.
     if let Some(ref pe) = pe_path.clone() {
         if pe.is_dir() {
             if game_dir.is_none() {
@@ -68,22 +73,28 @@ pub fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
                     .or_else(|| discovered.first())
                     .cloned()
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
+                        usage_err(format!(
                             "no valid x86-64 PE32+ binaries (.exe/.dll/.pyd/.node/.ocx) found in {}",
                             pe.display()
-                        )
+                        ))
                     })?;
                 pe_path = Some(primary);
             }
         } else if !pe.is_file() {
-            bail!("PE file or directory not found: {}", pe.display());
+            return Err(usage_err(format!(
+                "PE file or directory not found: {}",
+                pe.display()
+            )));
         } else if !port_factory::scanner::is_valid_x64_pe_file(pe) {
-            bail!("not a valid x86-64 PE32+ binary: {}", pe.display());
+            return Err(usage_err(format!(
+                "not a valid x86-64 PE32+ binary: {}",
+                pe.display()
+            )));
         }
     }
     if let Some(ref mp) = manifest_path {
         if !mp.is_file() {
-            bail!("manifest file not found: {}", mp.display());
+            return Err(usage_err(format!("manifest file not found: {}", mp.display())));
         }
     }
 
@@ -99,6 +110,9 @@ pub fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
         cmd.arg("--pe").arg(pe);
     }
     cmd.arg("--prewarm-aot");
+    if json {
+        cmd.arg("--json");
+    }
     if let Some(ref dir) = aot_dir {
         cmd.arg("--aot-dir").arg(dir);
     }
@@ -112,15 +126,15 @@ pub fn cmd_aot_prewarm(args: &[String]) -> Result<()> {
         print!("{}", String::from_utf8_lossy(&out.stdout));
     }
     if !out.status.success() {
-        if !out.stderr.is_empty() {
+        if !out.stderr.is_empty() && !json {
             eprintln!("{}", String::from_utf8_lossy(&out.stderr));
         }
-        bail!("port-runner --prewarm-aot exited with status {}", out.status);
+        return Ok(out.status.code().unwrap_or(exit_codes::RUNTIME_ERROR));
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
+pub fn cmd_aot_static_obj(args: &[String]) -> Result<i32> {
     let mut input: Option<PathBuf> = None;
     let mut manifest_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -131,33 +145,37 @@ pub fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--manifest" => manifest_path = Some(cur.next_path_or_usage()),
-            "--out" | "-o" => out_path = Some(cur.next_path_or_usage()),
-            "--platform" | "--static-platform" => platform = cur.next_or_usage().to_string(),
-            "--game-dir" => game_dir = Some(cur.next_path_or_usage()),
+            "--manifest" => manifest_path = Some(cur.next_path_or_err("--manifest requires FILE")?),
+            "--out" | "-o" => out_path = Some(cur.next_path_or_err("--out requires PATH")?),
+            "--platform" | "--static-platform" => {
+                platform = cur.next_or_err("--platform requires PLATFORM")?.to_string()
+            }
+            "--game-dir" => game_dir = Some(cur.next_path_or_err("--game-dir requires DIR")?),
             "--max-funcs" | "--aot-max-funcs" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--max-funcs requires N")?;
                 max_funcs = Some(
                     raw.parse()
-                        .with_context(|| format!("invalid --max-funcs {raw:?}"))?,
+                        .map_err(|_| usage_err(format!("invalid --max-funcs {raw:?}")))?,
                 );
             }
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p if input.is_none() => input = Some(PathBuf::from(p)),
-            other => bail!("unexpected argument {other:?}"),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
         }
     }
     if input.is_none() && manifest_path.is_none() {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory aot-static-obj [PE_OR_AOT] --out <DIR_OR_O> [--platform ios|ios-sim|macos]",
+        ));
     }
     if let Some(ref inp) = input {
         if !inp.is_file() {
-            bail!("input file not found: {}", inp.display());
+            return Err(usage_err(format!("input file not found: {}", inp.display())));
         }
     }
     if let Some(ref mp) = manifest_path {
         if !mp.is_file() {
-            bail!("manifest file not found: {}", mp.display());
+            return Err(usage_err(format!("manifest file not found: {}", mp.display())));
         }
     }
     let is_aot = input
@@ -215,10 +233,10 @@ pub fn cmd_aot_static_obj(args: &[String]) -> Result<()> {
             out.status
         );
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
+pub fn cmd_ios_bundle(args: &[String]) -> Result<i32> {
     let mut source: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut target = IosTarget::Device;
@@ -241,27 +259,36 @@ pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--out" | "-o" => out_path = Some(cur.next_path_or_usage()),
+            "--out" | "-o" => out_path = Some(cur.next_path_or_err("--out requires PATH")?),
             "--target" | "--platform" => {
-                let raw = cur.next_or_usage();
-                target = IosTarget::parse(raw).ok_or_else(|| {
-                    anyhow::anyhow!("invalid --target {raw:?} (expected device or sim)")
-                })?;
+                let raw = cur.next_or_err("--target requires device|sim")?;
+                target = IosTarget::parse(raw)
+                    .ok_or_else(|| usage_err(format!("invalid --target {raw:?} (expected device or sim)")))?;
             }
-            "--title" => title_override = Some(cur.next_or_usage().to_string()),
-            "--bundle-id" => bundle_id = Some(cur.next_or_usage().to_string()),
-            "--exe" => exe_override = Some(cur.next_or_usage().to_string()),
-            "--manifest" => manifest_override = Some(cur.next_path_or_usage()),
+            "--title" => title_override = Some(cur.next_or_err("--title requires NAME")?.to_string()),
+            "--bundle-id" => {
+                bundle_id = Some(cur.next_or_err("--bundle-id requires ID")?.to_string())
+            }
+            "--exe" => exe_override = Some(cur.next_or_err("--exe requires NAME")?.to_string()),
+            "--manifest" => {
+                manifest_override = Some(cur.next_path_or_err("--manifest requires FILE")?)
+            }
             "--release" => release = true,
-            "--deployment-target" => deployment_target = cur.next_or_usage().to_string(),
+            "--deployment-target" => {
+                deployment_target = cur
+                    .next_or_err("--deployment-target requires VER")?
+                    .to_string()
+            }
             "--no-static-aot" => emit_static_aot = false,
             "--aot-max-funcs" | "--max-funcs" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--aot-max-funcs requires N")?;
                 aot_max_funcs = raw
                     .parse()
-                    .with_context(|| format!("invalid --aot-max-funcs {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --aot-max-funcs {raw:?}")))?;
             }
-            "--extra-aot-obj" => extra_aot_objs.push(cur.next_path_or_usage()),
+            "--extra-aot-obj" => {
+                extra_aot_objs.push(cur.next_path_or_err("--extra-aot-obj requires FILE.o")?)
+            }
             "--no-precompile-shaders" => precompile_shaders = false,
             "--bundle-shader-cache" => {
                 bundle_shader_cache_from = Some(
@@ -271,11 +298,11 @@ pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
                 );
             }
             "--optimize-storage" | "--storage-profile" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--optimize-storage requires PROFILE")?;
                 let prof = StorageOptProfile::parse(raw).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    usage_err(format!(
                         "invalid --optimize-storage {raw:?} (expected none, lossless, high, or compact)"
-                    )
+                    ))
                 })?;
                 storage_opt = StorageOptOptions::from_profile(prof);
             }
@@ -285,29 +312,29 @@ pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
             }
             "--no-hevc-videos" => storage_opt.hevc_videos = false,
             "--video-max-height" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--video-max-height requires N")?;
                 storage_opt.video_max_height = raw
                     .parse()
-                    .with_context(|| format!("invalid --video-max-height {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --video-max-height {raw:?}")))?;
             }
             "--video-bitrate" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--video-bitrate requires KBPS")?;
                 storage_opt.video_bitrate_kbps = raw
                     .parse()
-                    .with_context(|| format!("invalid --video-bitrate {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --video-bitrate {raw:?}")))?;
             }
             "--max-tex-dim" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--max-tex-dim requires N")?;
                 storage_opt.max_tex_dim = raw
                     .parse()
-                    .with_context(|| format!("invalid --max-tex-dim {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --max-tex-dim {raw:?}")))?;
                 if storage_opt.max_tex_dim > 0 {
                     storage_opt.repack_archives = true;
                 }
             }
             "--strip-unused-dlls" => storage_opt.strip_unused_dlls = true,
             "--keep-lang" => {
-                storage_opt.keep_lang = Some(cur.next_or_usage().to_string());
+                storage_opt.keep_lang = Some(cur.next_or_err("--keep-lang requires CODE")?.to_string());
                 storage_opt.repack_archives = true;
             }
             "--strip-dlc" => {
@@ -315,23 +342,30 @@ pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
                 storage_opt.repack_archives = true;
             }
             "--opt-jobs" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--opt-jobs requires N")?;
                 storage_opt.jobs = raw
                     .parse()
-                    .with_context(|| format!("invalid --opt-jobs {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --opt-jobs {raw:?}")))?;
             }
             "--opt-dry-run" => storage_opt.dry_run = true,
-            "--sign" | "--codesign" => codesign_identity = Some(cur.next_or_usage().to_string()),
-            "--provisioning-profile" => provisioning_profile = Some(cur.next_path_or_usage()),
+            "--sign" | "--codesign" => {
+                codesign_identity = Some(cur.next_or_err("--sign requires ID")?.to_string())
+            }
+            "--provisioning-profile" => {
+                provisioning_profile =
+                    Some(cur.next_path_or_err("--provisioning-profile requires FILE")?)
+            }
             "--xcode-project" | "--xcodegen" => emit_xcodegen_spec = true,
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p if source.is_none() => source = Some(PathBuf::from(p)),
-            other => bail!("unexpected argument {other:?}"),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
         }
     }
 
     let Some(source) = source else {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory ios-bundle <PE_OR_DIR_OR_TOML> --out <PATH.app|PATH.ipa>",
+        ));
     };
     let out_path = out_path.unwrap_or_else(|| {
         let stem = source
@@ -388,27 +422,54 @@ pub fn cmd_ios_bundle(args: &[String]) -> Result<()> {
     }
     print!("{}", format_ios_bundle_verify_report(&rep.verify));
     if !rep.verify.ok() {
-        bail!(
-            "iOS bundle verification reported {} issue(s)",
+        eprintln!(
+            "Error: iOS bundle verification reported {} issue(s)",
             rep.verify.issues.len()
         );
+        return Ok(exit_codes::VERIFICATION_FAILED);
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_ios_verify(args: &[String]) -> Result<()> {
-    let Some(path) = args.first() else {
-        usage();
+pub fn cmd_ios_verify(args: &[String]) -> Result<i32> {
+    let mut path: Option<PathBuf> = None;
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
+            p if path.is_none() => path = Some(PathBuf::from(p)),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
+        }
+    }
+    let Some(path) = path else {
+        return Err(usage_err(
+            "usage: port-factory ios-verify <PATH.app|PATH.ipa> [--json]",
+        ));
     };
-    let rep = verify_ios_bundle(Path::new(path))?;
-    print!("{}", format_ios_bundle_verify_report(&rep));
-    if !rep.ok() {
-        std::process::exit(1);
+    let rep = verify_ios_bundle(&path)?;
+    let code = if rep.ok() {
+        exit_codes::OK
+    } else {
+        exit_codes::VERIFICATION_FAILED
+    };
+    if json {
+        let data = ios_verify_data_json(&rep);
+        let err_msg = (!rep.ok()).then(|| {
+            format!("iOS bundle verification reported {} issue(s)", rep.issues.len())
+        });
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "ios-verify",
+            code,
+            data,
+            err_msg,
+        )));
     }
-    Ok(())
+    print!("{}", format_ios_bundle_verify_report(&rep));
+    Ok(code)
 }
 
-pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
+pub fn cmd_optimize_assets(args: &[String]) -> Result<i32> {
     let mut src_dir: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut manifest_path: Option<PathBuf> = None;
@@ -418,14 +479,16 @@ pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
     let mut cur = ArgCursor::new(args);
     while let Some(a) = cur.next() {
         match a {
-            "--out" | "-o" | "--dst" => out_dir = Some(cur.next_path_or_usage()),
-            "--manifest" | "-m" => manifest_path = Some(cur.next_path_or_usage()),
+            "--out" | "-o" | "--dst" => out_dir = Some(cur.next_path_or_err("--out requires DIR")?),
+            "--manifest" | "-m" => {
+                manifest_path = Some(cur.next_path_or_err("--manifest requires FILE")?)
+            }
             "--profile" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--profile requires PROFILE")?;
                 let prof = StorageOptProfile::parse(raw).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    usage_err(format!(
                         "invalid --profile {raw:?} (expected lossless, high, or compact)"
-                    )
+                    ))
                 })?;
                 opts = StorageOptOptions::from_profile(prof);
                 profile_explicit = true;
@@ -440,22 +503,22 @@ pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
             }
             "--no-hevc-videos" => opts.hevc_videos = false,
             "--video-max-height" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--video-max-height requires N")?;
                 opts.video_max_height = raw
                     .parse()
-                    .with_context(|| format!("invalid --video-max-height {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --video-max-height {raw:?}")))?;
             }
             "--video-bitrate" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--video-bitrate requires KBPS")?;
                 opts.video_bitrate_kbps = raw
                     .parse()
-                    .with_context(|| format!("invalid --video-bitrate {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --video-bitrate {raw:?}")))?;
             }
             "--max-tex-dim" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--max-tex-dim requires N")?;
                 opts.max_tex_dim = raw
                     .parse()
-                    .with_context(|| format!("invalid --max-tex-dim {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --max-tex-dim {raw:?}")))?;
                 if opts.max_tex_dim > 0 {
                     opts.repack_archives = true;
                 }
@@ -463,7 +526,7 @@ pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
             "--strip-unused-dlls" => opts.strip_unused_dlls = true,
             "--no-strip-unused-dlls" => opts.strip_unused_dlls = false,
             "--keep-lang" => {
-                opts.keep_lang = Some(cur.next_or_usage().to_string());
+                opts.keep_lang = Some(cur.next_or_err("--keep-lang requires CODE")?.to_string());
                 opts.repack_archives = true;
             }
             "--strip-dlc" => {
@@ -471,23 +534,25 @@ pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
                 opts.repack_archives = true;
             }
             "--jobs" | "-j" => {
-                let raw = cur.next_or_usage();
+                let raw = cur.next_or_err("--jobs requires N")?;
                 opts.jobs = raw
                     .parse()
-                    .with_context(|| format!("invalid --jobs {raw:?}"))?;
+                    .map_err(|_| usage_err(format!("invalid --jobs {raw:?}")))?;
             }
             "--dry-run" => opts.dry_run = true,
-            s if s.starts_with('-') => bail!("unknown flag {s:?}"),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
             p if src_dir.is_none() => src_dir = Some(PathBuf::from(p)),
-            other => bail!("unexpected argument {other:?}"),
+            other => return Err(usage_err(format!("unexpected argument {other:?}"))),
         }
     }
 
     let Some(src_dir) = src_dir else {
-        usage();
+        return Err(usage_err(
+            "usage: port-factory optimize-assets <SRC_DIR> --out <DST_DIR>",
+        ));
     };
     let Some(out_dir) = out_dir else {
-        bail!("optimize-assets requires --out <DST_DIR>");
+        return Err(usage_err("optimize-assets requires --out <DST_DIR>"));
     };
 
     opts.workspace_root = Some(workspace_root());
@@ -506,12 +571,24 @@ pub fn cmd_optimize_assets(args: &[String]) -> Result<()> {
 
     let rep = optimize_game_assets(&src_dir, &out_dir, &opts, None)?;
     print!("{}", format_storage_opt_report(&rep, &opts));
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_bundles() -> Result<()> {
+pub fn cmd_bundles(args: &[String]) -> Result<i32> {
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            other => return Err(usage_err(format!("unknown bundles flag {other:?}"))),
+        }
+    }
     let root = workspace_root();
     let bundles = list_packaged_bundles(&root);
+    let vols = list_external_volumes();
+    if json {
+        let data = bundles_list_data_json(&bundles, &vols);
+        return Ok(emit_json(&JsonEnvelope::ok("bundles", data)));
+    }
     println!("=== Packaged macOS .app Bundles ({}) ===", bundles.len());
     for b in &bundles {
         let gb = (b.size_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
@@ -535,7 +612,6 @@ pub fn cmd_bundles() -> Result<()> {
             b.path.display()
         );
     }
-    let vols = list_external_volumes();
     println!("\n=== Mounted External Volumes ({}) ===", vols.len());
     if vols.is_empty() {
         println!("  (none mounted under /Volumes/)");
@@ -552,41 +628,70 @@ pub fn cmd_bundles() -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(exit_codes::OK)
 }
 
-pub fn cmd_bundle_verify(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        bail!("bundle-verify requires <PATH.app>");
+pub fn cmd_bundle_verify(args: &[String]) -> Result<i32> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
+            p => paths.push(PathBuf::from(p)),
+        }
     }
+    if paths.is_empty() {
+        return Err(usage_err("bundle-verify requires <PATH.app> [--json]"));
+    }
+    let mut reports = Vec::new();
     let mut all_ok = true;
-    for raw in args {
-        let p = PathBuf::from(raw);
-        let report = verify_app_bundle(&p)?;
-        print!("{}", format_bundle_verify_report(&report));
+    for p in &paths {
+        let report = verify_app_bundle(p)?;
+        if !json {
+            print!("{}", format_bundle_verify_report(&report));
+        }
         if !report.passed() {
             all_ok = false;
         }
+        reports.push(report);
     }
-    if !all_ok {
-        std::process::exit(1);
+    let code = if all_ok {
+        exit_codes::OK
+    } else {
+        exit_codes::VERIFICATION_FAILED
+    };
+    if json {
+        let data = bundle_verify_data_json(&reports);
+        let failed = reports.iter().filter(|r| !r.passed()).count();
+        let err_msg = (!all_ok).then(|| format!("{failed} bundle(s) failed verification"));
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "bundle-verify",
+            code,
+            data,
+            err_msg,
+        )));
     }
-    Ok(())
+    Ok(code)
 }
 
-pub fn cmd_bundle_export(args: &[String]) -> Result<()> {
+pub fn cmd_bundle_export(args: &[String]) -> Result<i32> {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut force = false;
     for a in args {
         match a.as_str() {
             "--force" => force = true,
-            other if other.starts_with('-') => bail!("unknown bundle-export flag {other:?}"),
+            other if other.starts_with('-') => {
+                return Err(usage_err(format!("unknown bundle-export flag {other:?}")))
+            }
             other => positional.push(PathBuf::from(other)),
         }
     }
     if positional.len() != 2 {
-        bail!("bundle-export requires <PATH.app> <DEST_DIR_OR_SSD> [--force]");
+        return Err(usage_err(
+            "bundle-export requires <PATH.app> <DEST_DIR_OR_SSD> [--force]",
+        ));
     }
     export_app_bundle(&positional[0], &positional[1], force)?;
-    Ok(())
+    Ok(exit_codes::OK)
 }

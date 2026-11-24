@@ -586,6 +586,7 @@ fn traps_and_aborts_in_runs_are_recorded_faults() {
     let abort = || -> (u64, u128) { unsafe { libc::abort() } };
     let r = probe("abort", false, &abort, &ok);
     assert_eq!((r.outcome(), r.reason()), (Outcome::Skipped, Reason::GuestFault), "{r:?} diag={:?}", diag());
+    assert_eq!(r.fault_sig[0], libc::SIGABRT as u32, "{r:?}");
     #[cfg(target_arch = "aarch64")]
     {
         let trap = || unsafe {
@@ -627,7 +628,7 @@ fn orchestrator_exits_when_its_parent_is_gone() {
     }
     let mut status = 0i32;
     let t0 = super::run::now_us();
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { super::run::waitpid_retry(pid, &mut status, 0) };
     let dt = super::run::now_us() - t0;
     assert!(libc::WIFEXITED(status), "status {status:#x}");
     assert_eq!(libc::WEXITSTATUS(status), super::run::EXIT_PARENT_GONE);
@@ -787,5 +788,25 @@ fn dumps_name_the_first_writer_of_each_diff_page() {
         pcs.iter().all(|&pc| inside(pc)),
         "{line} store_marker={f:#x} writers={:?}\n{text}",
         pcs.iter().map(|&pc| sym(pc)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn classify_run_exit_treats_watchdog_sigalrm_as_timeout() {
+    // On Darwin/POSIX wait status encoding: low 7 bits = terminating signal, bits 8..15 = exit code.
+    assert_eq!(super::run::classify_run_exit(libc::SIGALRM, 0, 0), super::run::ST_TIMEOUT);
+    assert_eq!(super::run::classify_run_exit(libc::SIGSEGV, 0, 0), super::run::ST_FAULT);
+    assert_eq!(super::run::classify_run_exit(libc::SIGKILL, 0, 0), super::run::ST_FAULT);
+    assert_eq!(super::run::classify_run_exit(-libc::ECHILD, 0, 0), super::run::ST_FAULT);
+    assert_eq!(super::run::classify_run_exit(0, 1, 0), super::run::ST_OK);
+    assert_eq!(super::run::classify_run_exit(0, 1, 1), super::run::ST_OVERFLOW);
+    assert_eq!(super::run::classify_run_exit(0, 0, 0), super::run::ST_FAULT);
+    assert_eq!(
+        super::run::classify_run_exit(super::handler::EXIT_SHARED << 8, 0, 0),
+        super::run::ST_SHARED
+    );
+    assert_eq!(
+        super::run::classify_run_exit(win32_rt::shadow::EXIT_HOST_UNSAFE << 8, 0, 0),
+        super::run::ST_HOST
     );
 }

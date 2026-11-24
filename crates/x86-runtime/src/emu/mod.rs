@@ -88,7 +88,10 @@ pub use dispatch::port_static_aot_host_xfer;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use dispatch::{call_host_dispatched_in, call_lean_in, shadow_lean_xmm, shadow_run_guest, shadow_run_lean};
 
-pub use interp::{emu_run, emu_run_full, emu_run_full_rax, emu_run_with_xmm};
+pub use interp::{
+    clear_fail_on_unimpl_op_override, emu_run, emu_run_full, emu_run_full_rax, emu_run_with_xmm,
+    fail_on_unimpl_op_enabled, parse_env_bool, set_fail_on_unimpl_op, EXIT_UNIMPL_OP,
+};
 #[cfg(test)]
 pub(crate) use interp::{test_last_steps, test_total_steps};
 
@@ -279,6 +282,54 @@ pub struct AotPrewarmReport {
     pub code_bytes: usize,
     pub cache_path: Option<std::path::PathBuf>,
     pub skipped_reason: Option<String>,
+}
+
+/// Snapshot of execution-tier counters for boot reports (`port-runner --report-json`).
+#[derive(Debug, Clone, Default)]
+pub struct TierStats {
+    pub exec_mode: &'static str,
+    pub decoded_interp_blocks: u64,
+    pub jit_blocks_compiled: u64,
+    pub aot_active: bool,
+    pub aot_kills: u64,
+    pub aot_revived: u64,
+    pub static_aot_modules: u64,
+    pub static_aot_blocks: u64,
+    pub static_aot_bytes: u64,
+}
+
+/// Capture process-wide execution tier counters without mutating emulator state.
+pub fn tier_stats() -> TierStats {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mode = match exec_mem::exec_mode() {
+            exec_mem::ExecMode::Auto => "auto",
+            exec_mem::ExecMode::JitWritable => "jit_writable",
+            exec_mem::ExecMode::StaticAotOnly => "static_aot_only",
+            exec_mem::ExecMode::InterpreterOnly => "interpreter_only",
+        };
+        let aot_c = aot::counts();
+        let (s_mods, s_blocks, s_bytes) = exec_mem::static_aot_stats();
+        TierStats {
+            exec_mode: mode,
+            decoded_interp_blocks: block_cache::decoded_blocks_count(),
+            jit_blocks_compiled: jit::total_jit_blocks_compiled(),
+            aot_active: aot::active(),
+            aot_kills: aot_c.kills,
+            aot_revived: aot_c.revived,
+            static_aot_modules: s_mods as u64,
+            static_aot_blocks: s_blocks as u64,
+            static_aot_bytes: s_bytes as u64,
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        TierStats {
+            exec_mode: "interpreter_only",
+            decoded_interp_blocks: block_cache::decoded_blocks_count(),
+            ..TierStats::default()
+        }
+    }
 }
 
 /// Profile-free offline `.aot` block-cache precompiler (no-op on non-aarch64 hosts).

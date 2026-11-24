@@ -1,0 +1,263 @@
+dll	api	kind	file	line	detail
+advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2995	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1361	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
+amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	406	"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"
+amd_ags_x64.dll	agsDriverExtensionsDX12_PushMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	384	"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"
+amd_ags_x64.dll	agsDriverExtensionsDX12_SetMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	428	"agsDriverExtensionsDX12_SetMarker: unsupported command list {cmd_list:#x}"
+amd_fidelityfx_loader_dx12.dll	ffxConfigure	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	394	"ffxConfigure(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+amd_fidelityfx_loader_dx12.dll	ffxCreateContext	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	266	"ffxCreateContext(FRAMEGENERATION): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+amd_fidelityfx_loader_dx12.dll	ffxDispatch	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	540	"ffxDispatch(GENERATEREACTIVEMASK): cleared outReactive to 0.0 (cleared={cleared}, render={}x{}, scale={:.3}, cutoff={:.3}, binary={:.3}, fl...
+amd_fidelityfx_loader_dx12.dll	ffxDispatch	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	558	"ffxDispatch(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+amd_fidelityfx_loader_dx12.dll	ffxQuery	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	620	"ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+amd_fidelityfx_loader_dx12.dll	ffxQuery	middleware_stub	crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs	630	"ffxQuery(INTERPOLATIONTEXTURE_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2447	"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2505	"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptGenerateKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2614	"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGenerateSymmetricKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2528	"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1810	"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1824	"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1859	"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2372	"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2429	"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1941	"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1949	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1964	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1979	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptOpenAlgorithmProvider	stub	crates/win32-rt/src/misc/bcrypt.rs	1720	"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2670	"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2718	"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
+bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
+crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	355	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
+crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	362	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
+crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	42	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
+crypt32.dll	cert_free_certificate_chain_engine_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	593	"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"
+crypt32.dll	cert_free_certificate_chain_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	787	"CertFreeCertificateChain({chain:p}): foreign chain ignored"
+crypt32.dll	cert_verify_certificate_chain_policy_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	807	"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"
+crypt32.dll	crypt_string_to_binary_impl	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	1276	"CryptStringToBinary unsupported flags {flags:#x}"
+crypt32.dll	encode_x509_object	stub	crates/win32-rt/src/misc/crypt32/asn1.rs	941	"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"
+d2d1.dll	geom_tessellate	stub	crates/win32-rt/src/misc/d2d1/geometry.rs	1038	"ID2D1Geometry::Tessellate -> E_NOTIMPL"
+d3d11.dll	check_counter	stub	crates/win32-rt/src/d3d11/device.rs	1074	"ID3D11Device::CheckCounter -> DXGI_ERROR_UNSUPPORTED"
+d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	749	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"
+d3d11.dll	create_counter	stub	crates/win32-rt/src/d3d11/device.rs	958	"ID3D11Device::CreateCounter -> DXGI_ERROR_UNSUPPORTED"
+d3d11.dll	create_device_context_state	stub	crates/win32-rt/src/d3d11/device.rs	1038	"ID3D11Device1::CreateDeviceContextState -> E_NOTIMPL"
+d3d11.dll	create_domain_shader	stub	crates/win32-rt/src/d3d11/device.rs	743	"ID3D11Device::CreateDomainShader -> E_NOTIMPL"
+d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	727	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
+d3d11.dll	create_hull_shader	stub	crates/win32-rt/src/d3d11/device.rs	735	"ID3D11Device::CreateHullShader -> E_NOTIMPL"
+d3d11.dll	draw_auto	stub	crates/win32-rt/src/d3d11/context.rs	2732	"ID3D11DeviceContext::DrawAuto not implemented"
+d3d11.dll	ds_set_shader	stub	crates/win32-rt/src/d3d11/context.rs	1972	"DSSetShader(non-null) ignored"
+d3d11.dll	dxgi_dev_create_surface	stub	crates/win32-rt/src/d3d11/device.rs	1308	"IDXGIDevice::CreateSurface -> E_NOTIMPL"
+d3d11.dll	get_data	stub	crates/win32-rt/src/d3d11/context.rs	2908	"GetData(PIPELINE_STATISTICS) returning zeroes"
+d3d11.dll	hs_set_shader	stub	crates/win32-rt/src/d3d11/context.rs	1969	"HSSetShader(non-null) ignored"
+d3d11.dll	surf_get_dc	stub	crates/win32-rt/src/d3d11/resources.rs	1308	"IDXGISurface1::GetDC -> E_NOTIMPL"
+d3d11.dll	swap_device_context_state	stub	crates/win32-rt/src/d3d11/context.rs	3013	"ID3D11DeviceContext1::SwapDeviceContextState not implemented"
+d3d12.dll	D3D12CreateRootSignatureDeserializer	stub	crates/win32-rt/src/d3d12/mod.rs	191	"D3D12CreateRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()
+d3d12.dll	D3D12CreateVersionedRootSignatureDeserializer	stub	crates/win32-rt/src/d3d12/mod.rs	199	"D3D12CreateVersionedRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()
+dbghelp.dll	MiniDumpWriteDump	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	StackWalk64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	SymGetLineFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	SymGetLineFromAddrW64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dinput8.dll	configure_devices	stub	crates/win32-rt/src/misc/dinput8.rs	1862	"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_get_property	stub	crates/win32-rt/src/misc/dinput8.rs	1239	"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1557	"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"
+dinput8.dll	dev_set_property	stub	crates/win32-rt/src/misc/dinput8.rs	1331	"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"
+dinput8.dll	run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1822	"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"
+directml.dll	parse	middleware_stub	crates/win32-rt/src/misc/directml/ops.rs	1048	"DirectML CreateOperator: unsupported operator type {other}"
+dsound.dll	dsb_set_fx	stub	crates/win32-rt/src/misc/dsound/com_vtbl.rs	1458	"IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE"
+dstorage.dll	DStorageCreateCompressionCodec	middleware_stub	crates/win32-rt/src/misc/dstorage.rs	94	"DStorageCreateCompressionCodec: unsupported format {format:#x} -> E_NOTIMPL"
+dwrite.dll	fac_create_custom_font_collection	stub	crates/win32-rt/src/misc/dwrite.rs	76	"IDWriteFactory::CreateCustomFontCollection -> E_NOTIMPL"
+dwrite.dll	fac_create_custom_font_file_reference	stub	crates/win32-rt/src/misc/dwrite.rs	119	"IDWriteFactory::CreateCustomFontFileReference -> E_NOTIMPL"
+dwrite.dll	fac_create_glyph_run_analysis	stub	crates/win32-rt/src/misc/dwrite.rs	365	"IDWriteFactory::CreateGlyphRunAnalysis -> E_NOTIMPL"
+dwrite.dll	fac_create_text_analyzer	stub	crates/win32-rt/src/misc/dwrite.rs	336	"IDWriteFactory::CreateTextAnalyzer -> E_NOTIMPL"
+dxgi.dll	DXGIGetDebugInterface1	stub	crates/win32-rt/src/dxgi/mod.rs	114	"DXGIGetDebugInterface1({:?}) -> E_NOINTERFACE (no debug layer)", Guid::read(riid).unwrap_or_default()
+dxgi.dll	create_software_adapter	stub	crates/win32-rt/src/dxgi/mod.rs	248	"CreateSoftwareAdapter -> DXGI_ERROR_UNSUPPORTED"
+dxgi.dll	create_swap_chain_unsupported	stub	crates/win32-rt/src/dxgi/mod.rs	275	"CreateSwapChainForCoreWindow/Composition -> DXGI_ERROR_UNSUPPORTED"
+dxgi.dll	enum_warp_adapter	stub	crates/win32-rt/src/dxgi/mod.rs	240	"EnumWarpAdapter: no WARP software rasterizer -> DXGI_ERROR_NOT_FOUND"
+dxgi.dll	get_shared_resource_adapter_luid	stub	crates/win32-rt/src/dxgi/mod.rs	283	"GetSharedResourceAdapterLuid: no shared handles -> E_INVALIDARG"
+dxgi.dll	register_event_stub	stub	crates/win32-rt/src/dxgi/adapter.rs	298	"IDXGIAdapter3 notification event registered; it is never signaled"
+dxgi.dll	register_status_event	stub	crates/win32-rt/src/dxgi/mod.rs	298	"Register*Event (stereo/occlusion/adapters-changed): the event is never signaled"
+dxgi.dll	register_status_window	stub	crates/win32-rt/src/dxgi/mod.rs	290	"Register{{Stereo,Occlusion}}StatusWindow: status changes are never posted"
+dxgi.dll	take_ownership	stub	crates/win32-rt/src/dxgi/adapter.rs	669	"TakeOwnership: exclusive fullscreen is not supported"
+dxgi.dll	wait_for_vblank	stub	crates/win32-rt/src/dxgi/adapter.rs	663	"WaitForVBlank: sleeps one refresh period ({hz} Hz), not synchronized to the display"
+gameinput.dll	gi_get_temporal_reading	stub	crates/win32-rt/src/misc/gameinput.rs	1968	"IGameInput::GetTemporalReading -> E_NOTIMPL"
+gdi32.dll	GetDeviceCaps	stub	crates/win32-rt/src/misc/gdi32.rs	860	"GetDeviceCaps({index}) -> 0"
+hid.dll	HidD_SetNumInputBuffers	stub	crates/win32-rt/src/misc/hid.rs	887	"ring size stays {INPUT_BUFFERS} (asked {n})"
+kernel32.dll	AllocConsole	stub	crates/win32-rt/src/kernel32/file.rs	475	"no separate console window; stdout/stderr of the loader act as the console"
+kernel32.dll	AssignProcessToJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1655	"job objects have no effect"
+kernel32.dll	CloseThreadpoolCleanupGroupMembers	stub	crates/win32-rt/src/kernel32/threadpool.rs	808	"cleanup groups do not track members"
+kernel32.dll	CreateProcessW	stub	crates/win32-rt/src/kernel32/process.rs	1283	"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)
+kernel32.dll	CreateRemoteThread	stub	crates/win32-rt/src/kernel32/threads.rs	60	"CreateRemoteThread into another process"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7057	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7085	"DeviceIoControl code {code:#x} unsupported"
+kernel32.dll	FlushProcessWriteBuffers	stub	crates/win32-rt/src/kernel32/memory.rs	1028	"FlushProcessWriteBuffers approximated by a local fence"
+kernel32.dll	GetCalendarInfoEx	stub	crates/win32-rt/src/kernel32/string.rs	1354	"GetCalendarInfoEx type {ty:#x}"
+kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2111	"GetFileInformationByHandleEx class {class} not supported"
+kernel32.dll	GetGeoInfoW	stub	crates/win32-rt/src/kernel32/string.rs	1125	"GetGeoInfo for geo id {geo} answered with US data"
+kernel32.dll	GetLocaleInfoW	stub	crates/win32-rt/src/kernel32/string.rs	918	"locale {lcid:#x} not available; answering with en-US data"
+kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	"custom NUMBERFMT ignored"
+kernel32.dll	InitOnceBeginInitialize	stub	crates/win32-rt/src/sync.rs	744	"INIT_ONCE_ASYNC treated as synchronous"
+kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
+kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
+kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6848	"MapViewOfFile3 on another process"
+kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2526	"MoveFileExA delete-on-reboot ignored"
+kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2519	"MoveFileExW delete-on-reboot ignored"
+kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2198	"SetFileInformationByHandle class {class} not supported"
+kernel32.dll	SetInformationJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1659	"SetInformationJobObject class {class} ignored"
+kernel32.dll	SetThreadAffinityMask	stub	crates/win32-rt/src/kernel32/threads.rs	244	"thread affinity not applied"
+kernel32.dll	SetThreadGroupAffinity	stub	crates/win32-rt/src/kernel32/threads.rs	250	"thread group affinity not applied"
+kernel32.dll	TerminateThread	stub	crates/win32-rt/src/kernel32/threads.rs	173	"TerminateThread unsupported"
+kernel32.dll	VirtualAlloc2	stub	crates/win32-rt/src/kernel32/memory.rs	575	"VirtualAlloc2 on another process"
+kernel32.dll	VirtualAllocEx	stub	crates/win32-rt/src/kernel32/memory.rs	566	"VirtualAllocEx on another process"
+kernel32.dll	VirtualProtect	stub	crates/win32-rt/src/kernel32/memory.rs	678	"PAGE_GUARD not emulated"
+kernel32.dll	format_message	stub	crates/win32-rt/src/kernel32/process.rs	2180	"message tables in modules are not supported (id {id:#x})"
+kernel32.dll	format_message	stub	crates/win32-rt/src/kernel32/process.rs	2189	"FormatMessage from module message table (id {id:#x})"
+kernel32.dll	get_locale_info	stub	crates/win32-rt/src/kernel32/string.rs	865	"GetLocaleInfo LCTYPE {lctype:#x} unknown"
+kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	362	"MEM_LARGE_PAGES ignored"
+kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	365	"MEM_WRITE_WATCH not tracked"
+kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	368	"PAGE_GUARD not emulated (treated as normal pages)"
+kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	375	"MEM_RESET_UNDO: contents may have been discarded"
+libcurl.dll	easy_getinfo	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1344	"libcurl: unsupported curl_easy_getinfo(info={other:#x})"
+libcurl.dll	easy_setopt	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1158	"libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})"
+libxess.dll	xessD3D12Execute	middleware_stub	crates/win32-rt/src/misc/libxess.rs	594	"xessD3D12Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX"...
+libxess_dx11.dll	INTC_D3D12_GetApplicationInfo	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1186	"INTC_D3D12_GetApplicationInfo -> E_NOINTERFACE"
+libxess_dx11.dll	INTC_D3D12_GetGpuCrashDumpBufferInfo	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1194	"INTC_D3D12_GetGpuCrashDumpBufferInfo (no-op)"
+libxess_dx11.dll	INTC_D3D12_GpuCrashDumpOnCommandListCreate	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1201	"INTC_D3D12_GpuCrashDumpOnCommandListCreate (no-op)"
+libxess_dx11.dll	INTC_D3D12_GpuCrashDumpOnCommandListDestroy	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1208	"INTC_D3D12_GpuCrashDumpOnCommandListDestroy (no-op)"
+libxess_dx11.dll	INTC_D3D12_GpuCrashDumpOnDeviceDestroy	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1212	"INTC_D3D12_GpuCrashDumpOnDeviceDestroy (no-op)"
+libxess_dx11.dll	INTC_D3D12_RegisterDriverCallbacks	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	1219	"INTC_D3D12_RegisterDriverCallbacks (no-op)"
+libxess_dx11.dll	xessD3D11Execute	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	657	"xessD3D11Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX"...
+libxess_dx11.dll	xessStartDump	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	951	"xessStartDump -> XESS_RESULT_ERROR_NOT_IMPLEMENTED"
+libxess_dx11.dll	xess_set_context_parameter_f_impl	middleware_stub	crates/win32-rt/src/misc/libxess_dx11.rs	879	"xessSetContextParameterF(param={param:#x}, value={value}) -> NOT_IMPLEMENTED"
+mmdevapi.dll	activate	stub	crates/win32-rt/src/audio/mmdevapi.rs	592	"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"
+mmdevapi.dll	get_buffer_size_limits	stub	crates/win32-rt/src/audio/audioclient.rs	919	"IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)"
+mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/audioclient.rs	885	"IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE"
+mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/spatial.rs	846	"ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE"
+mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	427	"IAudioClient::Initialize: exclusive mode is not supported -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED"
+mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	440	"IAudioClient::Initialize: loopback capture is not supported -> E_NOTIMPL"
+msctf.dll	ctx_track_properties	stub	crates/win32-rt/src/misc/msctf/context.rs	809	"ITfContext::TrackProperties -> E_NOTIMPL"
+nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
+nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type
+ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1662	"KiUserApcDispatcher called directly"
+ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1666	"KiUserCallbackDispatcher called directly"
+ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1658	"KiUserExceptionDispatcher called directly"
+ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2404	"LdrInitializeThunk called directly"
+ntdll.dll	NtCommitTransaction	stub	crates/win32-rt/src/ntdll.rs	731	"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"
+ntdll.dll	NtCreateTransaction	stub	crates/win32-rt/src/ntdll.rs	726	"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"
+ntdll.dll	NtQueryInformationProcess	stub	crates/win32-rt/src/ntdll.rs	239	"NtQueryInformationProcess class {class}"
+ntdll.dll	NtQueryInformationThread	stub	crates/win32-rt/src/ntdll.rs	303	"NtQueryInformationThread class {class}"
+ntdll.dll	NtQuerySystemInformation	stub	crates/win32-rt/src/ntdll.rs	422	"NtQuerySystemInformation class {class}"
+nvngx_dlss.dll	NVSDK_NGX_D3D12_CreateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	630	"NVSDK_NGX_D3D12_CreateFeature: unsupported feature_id={other} ({}) -> FAIL_FeatureNotSupported", ngx_feature_name(other)
+nvngx_dlss.dll	NVSDK_NGX_VULKAN_CreateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	731	"NVSDK_NGX_VULKAN_CreateFeature(feature_id={feature_id} {}): Vulkan NGX is not implemented -> FAIL_FeatureNotSupported", ngx_feature_name(fe...
+nvngx_dlss.dll	NVSDK_NGX_VULKAN_EvaluateFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	744	"NVSDK_NGX_VULKAN_EvaluateFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"
+nvngx_dlss.dll	NVSDK_NGX_VULKAN_Init	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	702	"NVSDK_NGX_VULKAN_Init: Vulkan NGX upscaling is not implemented -> FAIL_FeatureNotSupported"
+nvngx_dlss.dll	NVSDK_NGX_VULKAN_ReleaseFeature	middleware_stub	crates/win32-rt/src/misc/nvngx_dlss.rs	751	"NVSDK_NGX_VULKAN_ReleaseFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"
+ole32.dll	pv_get_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2167	"IPropertyValue::GetDateTime -> E_NOTIMPL"
+ole32.dll	pv_get_point	stub	crates/win32-rt/src/misc/ole32.rs	2185	"IPropertyValue::GetPoint -> E_NOTIMPL"
+ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2203	"IPropertyValue::GetRect -> E_NOTIMPL"
+ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2223	concat!("IPropertyValue::", $method, " -> E_NOTIMPL")
+ole32.dll	pv_get_size	stub	crates/win32-rt/src/misc/ole32.rs	2194	"IPropertyValue::GetSize -> E_NOTIMPL"
+ole32.dll	pv_get_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2176	"IPropertyValue::GetTimeSpan -> E_NOTIMPL"
+ole32.dll	pvs_create_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2582	"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"
+ole32.dll	pvs_create_point	stub	crates/win32-rt/src/misc/ole32.rs	2609	"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"
+ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2640	"IPropertyValueStatics::CreateRect -> E_NOTIMPL"
+ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2659	concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")
+ole32.dll	pvs_create_size	stub	crates/win32-rt/src/misc/ole32.rs	2623	"IPropertyValueStatics::CreateSize -> E_NOTIMPL"
+ole32.dll	pvs_create_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2595	"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"
+oo2core_9_win64.dll	OodleLZ_Compress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	86	"oo2core!OodleLZ_Compress(compressor={compressor}, raw_len={raw_len})"
+oo2core_9_win64.dll	OodleLZ_Decompress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	106	"oo2core!OodleLZ_Decompress(comp={comp_buf_size}, raw={raw_len})"
+physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2336	"PxGeometryQuery::computePenetration unsupported geometry0 {}", geom_type_name(t)
+physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2346	"PxGeometryQuery::computePenetration unsupported geometry1 {}", geom_type_name(t)
+physx3common_x64.dll	geom_get_world_bounds	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2243	"PxGeometryQuery::getWorldBounds unsupported cooked geometry {}", geom_type_name(gtype)
+physx3common_x64.dll	geom_overlap	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2378	"PxGeometryQuery::overlap unsupported geometry0 {}", geom_type_name(t)
+physx3common_x64.dll	geom_overlap	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2388	"PxGeometryQuery::overlap unsupported geometry1 {}", geom_type_name(t)
+physx3common_x64.dll	geom_point_distance	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2316	"PxGeometryQuery::pointDistance unsupported cooked geometry {}", geom_type_name(gtype)
+physx3common_x64.dll	geom_raycast	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2426	"PxGeometryQuery::raycast unsupported cooked geometry {}", geom_type_name(t)
+physx3common_x64.dll	geom_sweep	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2566	"PxGeometryQuery::sweep unsupported geometry0 {}", geom_type_name(t)
+physx3common_x64.dll	geom_sweep	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2576	"PxGeometryQuery::sweep unsupported geometry1 {}", geom_type_name(t)
+physx3common_x64.dll	mesh_find_overlap_triangle_mesh	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2614	"PxMeshQuery::findOverlapTriangleMesh without cooked triangle mesh payload"
+physx3common_x64.dll	mesh_get_triangle	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2629	"PxMeshQuery::getTriangle without cooked triangle mesh payload"
+physx3common_x64.dll	mesh_sweep	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2642	"PxMeshQuery::sweep without cooked triangle mesh payload"
+physx_64.dll	PxCreateBasePhysics	middleware_stub	crates/win32-rt/src/misc/physx_64.rs	26	"PhysX_64!PxCreateBasePhysics(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x core simulation requires shipping PE...
+physx_64.dll	PxCreatePhysics	middleware_stub	crates/win32-rt/src/misc/physx_64.rs	44	"PhysX_64!PxCreatePhysics(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x core simulation requires shipping PE ([m...
+physx_64.dll	PxRegisterPhysicsSerializers	middleware_stub	crates/win32-rt/src/misc/physx_64.rs	56	"PhysX_64!PxRegisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" | \"5.x\", mode ...
+physx_64.dll	PxUnregisterPhysicsSerializers	middleware_stub	crates/win32-rt/src/misc/physx_64.rs	62	"PhysX_64!PxUnregisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" | \"5.x\", mod...
+physxcooking_64.dll	PxCreateCooking	middleware_stub	crates/win32-rt/src/misc/physxcooking_64.rs	24	"PhysXCooking_64!PxCreateCooking(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x cooking requires shipping PE ([mi...
+powrprof.dll	CallNtPowerInformation	stub	crates/win32-rt/src/misc/powrprof.rs	468	"CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED"
+powrprof.dll	PowerRegisterSuspendResumeNotification	stub	crates/win32-rt/src/misc/powrprof.rs	533	"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"
+powrprof.dll	PowerSettingRegisterNotification	stub	crates/win32-rt/src/misc/powrprof.rs	604	"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"
+secur32.dll	acquire_credentials_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	594	"AcquireCredentialsHandle(pkg={package_name:?}, use={f_credential_use:#x}): inbound unsupported"
+secur32.dll	apply_control_token_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1025	"ApplyControlToken(ctx={id}, token={token_val:?}) -> SEC_E_UNSUPPORTED_FUNCTION"
+secur32.dll	query_context_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1787	"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"
+secur32.dll	query_credentials_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1849	"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }
+shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1733	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
+sl.interposer.dll	slSetConstants	middleware_stub	crates/win32-rt/src/slstub.rs	125	"slSetConstants accepted and dropped (no Streamline features)"
+sl.interposer.dll	slSetTag	middleware_stub	crates/win32-rt/src/slstub.rs	120	"slSetTag({n} tags) accepted and dropped (no Streamline features)"
+ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
+ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
+ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
+ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1062	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
+ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
+ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
+user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	987	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
+user32.dll	DisplayConfigGetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	684	"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
+user32.dll	DisplayConfigSetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	692	"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
+user32.dll	GetSystemMetrics	stub	crates/win32-rt/src/user32/misc.rs	234	"GetSystemMetrics({index}) -> 0"
+user32.dll	RegisterHotKey	stub	crates/win32-rt/src/user32/misc.rs	759	"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize
+user32.dll	RegisterRawInputDevices	stub	crates/win32-rt/src/user32/input.rs	1363	"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"
+user32.dll	ReplyMessage	stub	crates/win32-rt/src/user32/message.rs	883	"ReplyMessage: early reply not supported"
+user32.dll	def_window_proc	stub	crates/win32-rt/src/user32/defproc.rs	154	"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"
+user32.dll	load_cursor	stub	crates/win32-rt/src/user32/cursor.rs	87	"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"
+user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1876	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
+user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	565	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	600	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	622	"GetUserObjectInformation index {index} not supported"
+uxtheme.dll	DrawThemeBackground	stub	crates/win32-rt/src/misc/uxtheme.rs	111	"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"
+uxtheme.dll	TaskDialogIndirect	stub	crates/win32-rt/src/misc/uxtheme.rs	203	"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"
+vulkan_1.dll	NvLL_VK_DestroyLowLatencyDevice	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_GetLatency	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_GetSleepStatus	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_InitLowLatencyDevice	stub	crates/win32-rt/src/misc/vulkan_1.rs	4500	"NvLL_VK_InitLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)"
+vulkan_1.dll	NvLL_VK_Initialize	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_NotifyOutOfBandQueue	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_SetLatencyMarker	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_SetSleepMode	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_Sleep	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+vulkan_1.dll	NvLL_VK_Unload	failing	crates/win32-rt/src/misc/vulkan_1.rs	4504	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
+wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"
+wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
+wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
+wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"
+ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1782	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
+ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSARecvMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSASendMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1319	"WSADuplicateSocket cross-process target pid={pid} unsupported"
+xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	216	"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
+xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	233	"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"
+xinput1_4.dll	XInputGetKeystroke	stub	crates/win32-rt/src/misc/xinput1_4.rs	608	"XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)"
+zstd.dll	ZSTD_compress	middleware_stub	crates/win32-rt/src/misc/zstd.rs	33	"zstd!ZSTD_compress(src_size={src_size})"
+zstd.dll	ZSTD_decompress	middleware_stub	crates/win32-rt/src/misc/zstd.rs	43	"zstd!ZSTD_decompress(compressed_size={compressed_size})"
