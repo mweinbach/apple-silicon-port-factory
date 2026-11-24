@@ -30,7 +30,16 @@ const DS_SETFONT: u32 = 0x0000_0040;
 const DS_SHELLFONT: u32 = DS_SETFONT | DS_FIXEDSYS;
 
 const BS_TYPEMASK: u32 = 0x0000_000F;
+const BS_PUSHBUTTON: u32 = 0x0000_0000;
 const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
+const BS_RADIOBUTTON: u32 = 0x0000_0004;
+const BS_GROUPBOX: u32 = 0x0000_0007;
+const BS_USERBUTTON: u32 = 0x0000_0008;
+const BS_AUTORADIOBUTTON: u32 = 0x0000_0009;
+const BS_SPLITBUTTON: u32 = 0x0000_000C;
+const BS_DEFSPLITBUTTON: u32 = 0x0000_000D;
+const BS_COMMANDLINK: u32 = 0x0000_000E;
+const BS_DEFCOMMANDLINK: u32 = 0x0000_000F;
 
 const BN_CLICKED: usize = 0;
 const IDOK: i32 = 1;
@@ -44,10 +53,12 @@ const DLGC_WANTARROWS: isize = 0x0001;
 const DLGC_WANTTAB: isize = 0x0002;
 const DLGC_WANTALLKEYS: isize = 0x0004;
 const DLGC_WANTMESSAGE: isize = 0x0004;
-const DLGC_WANTCHARS: isize = 0x0080;
-const DLGC_BUTTON: isize = 0x2000;
 const DLGC_DEFPUSHBUTTON: isize = 0x0010;
 const DLGC_UNDEFPUSHBUTTON: isize = 0x0020;
+const DLGC_RADIOBUTTON: isize = 0x0040;
+const DLGC_WANTCHARS: isize = 0x0080;
+const DLGC_STATIC: isize = 0x0100;
+const DLGC_BUTTON: isize = 0x2000;
 
 const VK_TAB: usize = 0x09;
 const VK_RETURN: usize = 0x0D;
@@ -58,7 +69,6 @@ const MAX_TEMPLATE_STR_LEN: usize = 4096;
 
 #[derive(Debug)]
 struct DialogState {
-    modal: bool,
     ended: bool,
     result: isize,
     def_id: u16,
@@ -106,11 +116,17 @@ pub(crate) unsafe extern "win64" fn button_wndproc(hwnd: HWND, msg: u32, wparam:
             0
         }
         wm::GETDLGCODE => {
-            let style = window::get(h).map(|w| w.data().style).unwrap_or(0);
-            if (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON {
-                DLGC_BUTTON | DLGC_DEFPUSHBUTTON
-            } else {
-                DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON
+            let btn_type = window::get(h).map(|w| w.data().style & BS_TYPEMASK).unwrap_or(BS_PUSHBUTTON);
+            match btn_type {
+                BS_DEFPUSHBUTTON | BS_DEFSPLITBUTTON | BS_DEFCOMMANDLINK => {
+                    DLGC_BUTTON | DLGC_DEFPUSHBUTTON
+                }
+                BS_PUSHBUTTON | BS_USERBUTTON | BS_SPLITBUTTON | BS_COMMANDLINK => {
+                    DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON
+                }
+                BS_RADIOBUTTON | BS_AUTORADIOBUTTON => DLGC_BUTTON | DLGC_RADIOBUTTON,
+                BS_GROUPBOX => DLGC_STATIC,
+                _ => DLGC_BUTTON,
             }
         }
         wm::NCDESTROY => {
@@ -550,15 +566,19 @@ unsafe fn def_dlg_proc_impl(hdlg: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
     match msg {
         wm::CLOSE => {
-            let is_modal = dialogs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&h)
-                .is_some_and(|s| s.modal);
-            if is_modal {
-                EndDialog(hdlg, IDCANCEL as isize);
-            } else {
-                DestroyWindow(hdlg);
+            // Win32 DefDlgProc translates an unhandled WM_CLOSE into a posted
+            // WM_COMMAND(IDCANCEL, BN_CLICKED, hwndCancel) so the dialog procedure
+            // can dismiss or veto; suppress it if an IDCANCEL control exists and is disabled.
+            let cancel = GetDlgItem(hdlg, IDCANCEL);
+            let cancel_disabled = !cancel.is_null()
+                && window::get(cancel as usize).is_some_and(|w| !w.data().enabled);
+            if !cancel_disabled {
+                let _ = message::PostMessageW(
+                    hdlg,
+                    wm::COMMAND,
+                    ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as u16 as usize),
+                    cancel as LPARAM,
+                );
             }
             0
         }
@@ -695,7 +715,6 @@ unsafe fn create_dialog_indirect_internal(
     dialogs().lock().unwrap_or_else(|e| e.into_inner()).insert(
         h,
         DialogState {
-            modal,
             ended: false,
             result: 0,
             def_id: 0,
@@ -1304,29 +1323,63 @@ unsafe fn is_dialog_message_impl(hdlg: HWND, lp_msg: *mut MSG, unicode: bool) ->
                     return TRUE;
                 }
                 VK_RETURN => {
-                    let def = send_message(h, DM_GETDEFID, 0, 0) as usize;
-                    let def_id = if (def >> 16) == DC_HASDEFID {
-                        (def & 0xFFFF) as i32
+                    // Activate the focused dialog child when its WM_GETDLGCODE indicates a
+                    // push button; otherwise fall back to DM_GETDEFID / IDOK. Keep disabled
+                    // buttons from activating without mutating the stored default ID.
+                    let focused_push = if target != 0
+                        && target != h
+                        && window::is_child_of(target, h)
+                        && (dlg_code & (DLGC_DEFPUSHBUTTON | DLGC_UNDEFPUSHBUTTON)) != 0
+                    {
+                        window::get(target).map(|w| {
+                            let d = w.data();
+                            (d.id as i32, target as HWND, d.enabled && d.visible)
+                        })
                     } else {
-                        IDOK
+                        None
                     };
-                    let ctrl = GetDlgItem(hdlg, def_id);
-                    send_message(
-                        h,
-                        wm::COMMAND,
-                        ((BN_CLICKED & 0xFFFF) << 16) | (def_id as u16 as usize),
-                        ctrl as LPARAM,
-                    );
+                    if let Some((cmd_id, ctrl, eligible)) = focused_push {
+                        if eligible {
+                            send_message(
+                                h,
+                                wm::COMMAND,
+                                ((BN_CLICKED & 0xFFFF) << 16) | (cmd_id as u16 as usize),
+                                ctrl as LPARAM,
+                            );
+                        }
+                    } else {
+                        let def = send_message(h, DM_GETDEFID, 0, 0) as usize;
+                        let def_id = if (def >> 16) == DC_HASDEFID {
+                            (def & 0xFFFF) as i32
+                        } else {
+                            IDOK
+                        };
+                        let ctrl = GetDlgItem(hdlg, def_id);
+                        let disabled = !ctrl.is_null()
+                            && window::get(ctrl as usize).is_some_and(|w| !w.data().enabled);
+                        if !disabled {
+                            send_message(
+                                h,
+                                wm::COMMAND,
+                                ((BN_CLICKED & 0xFFFF) << 16) | (def_id as u16 as usize),
+                                ctrl as LPARAM,
+                            );
+                        }
+                    }
                     return TRUE;
                 }
                 VK_ESCAPE => {
                     let ctrl = GetDlgItem(hdlg, IDCANCEL);
-                    send_message(
-                        h,
-                        wm::COMMAND,
-                        ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as u16 as usize),
-                        ctrl as LPARAM,
-                    );
+                    let disabled = !ctrl.is_null()
+                        && window::get(ctrl as usize).is_some_and(|w| !w.data().enabled);
+                    if !disabled {
+                        send_message(
+                            h,
+                            wm::COMMAND,
+                            ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as u16 as usize),
+                            ctrl as LPARAM,
+                        );
+                    }
                     return TRUE;
                 }
                 _ => {}
@@ -2514,6 +2567,250 @@ mod tests {
             EnableWindow(h302, FALSE);
             assert_eq!(first_focusable_control(hdlg4 as usize), 0);
             assert_eq!(DestroyWindow(hdlg4), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    static CLOSE_TEST_HANDLE_CLOSE: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_TEST_CLOSE_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_TEST_CMD_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_TEST_CMD_WPARAM: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_TEST_CMD_LPARAM: AtomicIsize = AtomicIsize::new(0);
+
+    unsafe extern "win64" fn close_and_enter_dlg_proc(
+        hdlg: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
+        match msg {
+            wm::INITDIALOG => 1,
+            wm::CLOSE => {
+                CLOSE_TEST_CLOSE_SEEN.fetch_add(1, Ordering::SeqCst);
+                if CLOSE_TEST_HANDLE_CLOSE.load(Ordering::SeqCst) != 0 {
+                    SetWindowLongPtrW(hdlg, DWLP_MSGRESULT, 0x1234);
+                    1 // explicitly handled -> DefDlgProc must not post IDCANCEL
+                } else {
+                    0 // declined -> DefDlgProc posts WM_COMMAND(IDCANCEL)
+                }
+            }
+            wm::COMMAND => {
+                CLOSE_TEST_CMD_COUNT.fetch_add(1, Ordering::SeqCst);
+                CLOSE_TEST_CMD_WPARAM.store(wparam, Ordering::SeqCst);
+                CLOSE_TEST_CMD_LPARAM.store(lparam, Ordering::SeqCst);
+                1 // handled (vetoes dismissal by not calling DestroyWindow/EndDialog)
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn dialog_wm_close_posts_cancellable_idcancel_and_respects_disabled_or_handled_close() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!crate::macos::active(), "unit tests must stay headless");
+        std::thread::spawn(|| unsafe {
+            let dlg_proc_va = close_and_enter_dlg_proc as *const () as usize;
+            crate::register_native_va(dlg_proc_va as u64, dlg_proc_va);
+
+            let mut tmpl = build_std_header(ws::POPUP | ws::CAPTION | ws::SYSMENU, 2, "CloseTest");
+            push_std_ctrl(&mut tmpl, IDOK as u16, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_DEFPUSHBUTTON, "OK");
+            push_std_ctrl(&mut tmpl, IDCANCEL as u16, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_PUSHBUTTON, "Cancel");
+
+            CLOSE_TEST_HANDLE_CLOSE.store(0, Ordering::SeqCst);
+            CLOSE_TEST_CLOSE_SEEN.store(0, Ordering::SeqCst);
+            CLOSE_TEST_CMD_COUNT.store(0, Ordering::SeqCst);
+            CLOSE_TEST_CMD_WPARAM.store(0, Ordering::SeqCst);
+            CLOSE_TEST_CMD_LPARAM.store(0, Ordering::SeqCst);
+
+            let hdlg = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg.is_null());
+            let h_cancel = GetDlgItem(hdlg, IDCANCEL);
+            assert!(!h_cancel.is_null());
+
+            // 1. Declined WM_CLOSE posts (not sends) one WM_COMMAND(IDCANCEL, BN_CLICKED, h_cancel);
+            //    dialog remains alive and dlgproc can veto on dispatch.
+            assert_eq!(SendMessageW(hdlg, wm::CLOSE, 0, 0), 0);
+            assert_eq!(CLOSE_TEST_CLOSE_SEEN.load(Ordering::SeqCst), 1);
+            assert_eq!(window::IsWindow(hdlg), TRUE, "unhandled WM_CLOSE must not destroy dialog");
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 0, "WM_COMMAND must be posted, not sent synchronously");
+
+            let mut qmsg = MSG::default();
+            assert_eq!(message::PeekMessageW(&mut qmsg, hdlg, wm::COMMAND, wm::COMMAND, 1), TRUE);
+            assert_eq!(qmsg.hwnd, hdlg as usize);
+            assert_eq!(qmsg.message, wm::COMMAND);
+            assert_eq!(qmsg.wparam, ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as usize));
+            assert_eq!(qmsg.lparam, h_cancel as LPARAM);
+            assert_eq!(message::PeekMessageW(&mut qmsg, hdlg, wm::COMMAND, wm::COMMAND, 0), FALSE);
+
+            DispatchMessageW(&qmsg);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(CLOSE_TEST_CMD_WPARAM.load(Ordering::SeqCst), ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as usize));
+            assert_eq!(CLOSE_TEST_CMD_LPARAM.load(Ordering::SeqCst), h_cancel as LPARAM);
+            assert_eq!(window::IsWindow(hdlg), TRUE, "vetoed IDCANCEL must keep dialog alive");
+
+            // 2. Disabled IDCANCEL button suppresses posted WM_COMMAND.
+            EnableWindow(h_cancel, FALSE);
+            assert_eq!(SendMessageW(hdlg, wm::CLOSE, 0, 0), 0);
+            assert_eq!(CLOSE_TEST_CLOSE_SEEN.load(Ordering::SeqCst), 2);
+            assert_eq!(message::PeekMessageW(&mut qmsg, hdlg, wm::COMMAND, wm::COMMAND, 1), FALSE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(window::IsWindow(hdlg), TRUE);
+            EnableWindow(h_cancel, TRUE);
+
+            // 3. Explicitly handled WM_CLOSE preserves DWLP_MSGRESULT and posts nothing.
+            CLOSE_TEST_HANDLE_CLOSE.store(1, Ordering::SeqCst);
+            assert_eq!(SendMessageW(hdlg, wm::CLOSE, 0, 0), 0x1234);
+            assert_eq!(message::PeekMessageW(&mut qmsg, hdlg, wm::COMMAND, wm::COMMAND, 1), FALSE);
+            assert_eq!(window::IsWindow(hdlg), TRUE);
+            assert_eq!(DestroyWindow(hdlg), TRUE);
+
+            // 4. Dialog with no IDCANCEL control still posts WM_COMMAND(IDCANCEL, BN_CLICKED, NULL).
+            CLOSE_TEST_HANDLE_CLOSE.store(0, Ordering::SeqCst);
+            let mut tmpl_no_cancel = build_std_header(ws::POPUP | ws::CAPTION | ws::SYSMENU, 1, "NoCancelClose");
+            push_std_ctrl(&mut tmpl_no_cancel, IDOK as u16, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_DEFPUSHBUTTON, "OK");
+            let hdlg2 = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl_no_cancel.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg2.is_null());
+            assert_eq!(SendMessageW(hdlg2, wm::CLOSE, 0, 0), 0);
+            assert_eq!(window::IsWindow(hdlg2), TRUE);
+            let mut qmsg2 = MSG::default();
+            assert_eq!(message::PeekMessageW(&mut qmsg2, hdlg2, wm::COMMAND, wm::COMMAND, 1), TRUE);
+            assert_eq!(qmsg2.wparam, ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as usize));
+            assert_eq!(qmsg2.lparam, 0);
+            assert_eq!(DestroyWindow(hdlg2), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn dialog_enter_activates_focused_push_button_and_respects_non_push_and_disabled_controls() {
+        const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!crate::macos::active(), "unit tests must stay headless");
+        std::thread::spawn(|| unsafe {
+            let dlg_proc_va = close_and_enter_dlg_proc as *const () as usize;
+            crate::register_native_va(dlg_proc_va as u64, dlg_proc_va);
+
+            let mut tmpl = build_std_header(ws::POPUP | ws::CAPTION, 6, "EnterFocusTest");
+            push_std_ctrl(&mut tmpl, 601, 0x0081, ws::CHILD | ws::VISIBLE | ws::TABSTOP, "Edit");
+            push_std_ctrl(&mut tmpl, 602, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_AUTOCHECKBOX, "Check");
+            push_std_ctrl(&mut tmpl, 603, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_AUTORADIOBUTTON, "Radio");
+            push_std_ctrl(&mut tmpl, 604, 0x0080, ws::CHILD | ws::VISIBLE | BS_GROUPBOX, "Group");
+            push_std_ctrl(&mut tmpl, IDOK as u16, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_DEFPUSHBUTTON, "OK");
+            push_std_ctrl(&mut tmpl, IDCANCEL as u16, 0x0080, ws::CHILD | ws::VISIBLE | ws::TABSTOP | BS_PUSHBUTTON, "Cancel");
+
+            let hdlg = CreateDialogIndirectParamW(
+                std::ptr::null_mut(),
+                tmpl.as_ptr(),
+                std::ptr::null_mut(),
+                dlg_proc_va,
+                0,
+            );
+            assert!(!hdlg.is_null());
+            let h_edit = GetDlgItem(hdlg, 601);
+            let h_check = GetDlgItem(hdlg, 602);
+            let h_radio = GetDlgItem(hdlg, 603);
+            let h_group = GetDlgItem(hdlg, 604);
+            let h_ok = GetDlgItem(hdlg, IDOK);
+            let h_cancel = GetDlgItem(hdlg, IDCANCEL);
+
+            // Built-in button_wndproc distinguishes push buttons from checkbox/radio/groupbox.
+            assert_eq!(SendMessageW(h_ok, wm::GETDLGCODE, 0, 0), DLGC_BUTTON | DLGC_DEFPUSHBUTTON);
+            assert_eq!(SendMessageW(h_cancel, wm::GETDLGCODE, 0, 0), DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON);
+            assert_eq!(SendMessageW(h_check, wm::GETDLGCODE, 0, 0), DLGC_BUTTON);
+            assert_eq!(SendMessageW(h_radio, wm::GETDLGCODE, 0, 0), DLGC_BUTTON | DLGC_RADIOBUTTON);
+            assert_eq!(SendMessageW(h_group, wm::GETDLGCODE, 0, 0), DLGC_STATIC);
+
+            let make_key = |hwnd: HWND, vk: usize| MSG {
+                hwnd: hwnd as usize,
+                message: wm::KEYDOWN,
+                wparam: vk,
+                lparam: 0,
+                time: 0,
+                pt: POINT { x: 0, y: 0 },
+                l_private: 0,
+            };
+            let reset_cmd = || {
+                CLOSE_TEST_CMD_COUNT.store(0, Ordering::SeqCst);
+                CLOSE_TEST_CMD_WPARAM.store(0, Ordering::SeqCst);
+                CLOSE_TEST_CMD_LPARAM.store(0, Ordering::SeqCst);
+            };
+
+            // 1. Tab from initial Edit -> Check -> Radio -> OK -> Cancel, then press Enter:
+            //    must deliver ONLY IDCANCEL with Cancel's HWND and leave DM_GETDEFID == IDOK.
+            assert_eq!(input::GetFocus(), h_edit);
+            for expected_focus in [h_check, h_radio, h_ok, h_cancel] {
+                let mut m = make_key(input::GetFocus(), VK_TAB);
+                assert_eq!(IsDialogMessageW(hdlg, &mut m), TRUE);
+                assert_eq!(input::GetFocus(), expected_focus);
+            }
+            reset_cmd();
+            let mut m_ret = make_key(h_cancel, VK_RETURN);
+            assert_eq!(IsDialogMessageW(hdlg, &mut m_ret), TRUE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(CLOSE_TEST_CMD_WPARAM.load(Ordering::SeqCst), ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as usize));
+            assert_eq!(CLOSE_TEST_CMD_LPARAM.load(Ordering::SeqCst), h_cancel as LPARAM);
+            assert_eq!(
+                SendMessageW(hdlg, DM_GETDEFID, 0, 0) as usize,
+                (DC_HASDEFID << 16) | (IDOK as usize),
+                "focused push button activation must not overwrite stored default ID"
+            );
+
+            // 2. Edit and non-push button controls (checkbox, radio, groupbox) do not steal Enter;
+            //    Enter falls back to DM_GETDEFID (IDOK, h_ok).
+            for non_push in [h_edit, h_check, h_radio, h_group] {
+                input::SetFocus(non_push);
+                reset_cmd();
+                let mut m = make_key(non_push, VK_RETURN);
+                assert_eq!(IsDialogMessageW(hdlg, &mut m), TRUE);
+                assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 1);
+                assert_eq!(CLOSE_TEST_CMD_WPARAM.load(Ordering::SeqCst), ((BN_CLICKED & 0xFFFF) << 16) | (IDOK as usize));
+                assert_eq!(CLOSE_TEST_CMD_LPARAM.load(Ordering::SeqCst), h_ok as LPARAM);
+            }
+
+            // 3. Disabled focused push button and disabled default button must not activate on Enter,
+            //    and disabled Cancel must not activate on Escape.
+            input::SetFocus(h_cancel);
+            EnableWindow(h_cancel, FALSE);
+            reset_cmd();
+            let mut m_dis_cancel = make_key(h_cancel, VK_RETURN);
+            assert_eq!(IsDialogMessageW(hdlg, &mut m_dis_cancel), TRUE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 0);
+
+            let mut m_esc_dis = make_key(h_edit, VK_ESCAPE);
+            assert_eq!(IsDialogMessageW(hdlg, &mut m_esc_dis), TRUE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 0);
+
+            input::SetFocus(h_edit);
+            EnableWindow(h_ok, FALSE);
+            reset_cmd();
+            let mut m_dis_def = make_key(h_edit, VK_RETURN);
+            assert_eq!(IsDialogMessageW(hdlg, &mut m_dis_def), TRUE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 0);
+
+            // Re-enabling Cancel restores Escape -> IDCANCEL with h_cancel.
+            EnableWindow(h_cancel, TRUE);
+            reset_cmd();
+            let mut m_esc_ok = make_key(h_edit, VK_ESCAPE);
+            assert_eq!(IsDialogMessageW(hdlg, &mut m_esc_ok), TRUE);
+            assert_eq!(CLOSE_TEST_CMD_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(CLOSE_TEST_CMD_WPARAM.load(Ordering::SeqCst), ((BN_CLICKED & 0xFFFF) << 16) | (IDCANCEL as usize));
+            assert_eq!(CLOSE_TEST_CMD_LPARAM.load(Ordering::SeqCst), h_cancel as LPARAM);
+
+            assert_eq!(DestroyWindow(hdlg), TRUE);
         })
         .join()
         .unwrap();
