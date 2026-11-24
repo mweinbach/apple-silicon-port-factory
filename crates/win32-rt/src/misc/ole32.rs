@@ -2912,6 +2912,10 @@ impl ParsedUri {
             let combined = format!("{base_prefix}{rel_suffix}");
             return Self::parse(&combined);
         }
+        if rel_path.starts_with("//") {
+            let combined = format!("{}:{rel}", self.scheme);
+            return Self::parse(&combined);
+        }
         if rel_path.contains("://") {
             return Self::parse(rel);
         }
@@ -4817,6 +4821,44 @@ mod tests {
                     "/a/doc.json",
                     "?a=1",
                     "#https://other.example/x",
+                ),
+                // Scheme-relative (network-path) references inherit only the base scheme.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "//cdn.example.net/assets/app.js",
+                    "https://cdn.example.net/assets/app.js",
+                    "https://cdn.example.net/assets/app.js",
+                    "/assets/app.js",
+                    "",
+                    "",
+                ),
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "//cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "https://cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "https://cdn.example.net:9443/p/http://origin/img.png?v=2#hero",
+                    "/p/http://origin/img.png",
+                    "?v=2",
+                    "#hero",
+                ),
+                (
+                    "http://example.com/a/doc.json",
+                    "//cdn.example.net?v=1#top",
+                    "http://cdn.example.net/?v=1#top",
+                    "http://cdn.example.net?v=1#top",
+                    "/",
+                    "?v=1",
+                    "#top",
+                ),
+                // Single-slash root-relative reference keeps base authority/port.
+                (
+                    "https://example.com:8443/a/doc.json?old=1#old",
+                    "/root/other.json?k=1#s",
+                    "https://example.com:8443/root/other.json?k=1#s",
+                    "https://example.com:8443/root/other.json?k=1#s",
+                    "/root/other.json",
+                    "?k=1",
+                    "#s",
                 ),
                 // Normal relative-file (including embedded '://' in query) and absolute controls.
                 (
