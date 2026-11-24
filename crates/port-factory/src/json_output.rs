@@ -18,6 +18,7 @@
 //! ```
 
 use crate::anticheat::{lookup_ssn_name, AntiCheatAuditReport, AntiCheatVerdict};
+use crate::audit_game::GameAuditReport;
 use crate::diag_toolkit::RuntimeHazardReport;
 use crate::doctor::{DoctorDbReport, TsvCheckItem, TsvSyncStatus};
 use crate::dotnet::{DotNetAuditSummary, DotNetBinaryReport};
@@ -30,10 +31,11 @@ use crate::steam_library::{
     BundleCheckStatus, BundleVerifyReport, ExternalVolumeInfo, PackagedBundleInfo,
     SteamLibraryScanReport,
 };
-use crate::win32_db::{Win32ApiEntry, Win32Category, Win32ImportAudit};
+use crate::win32_db::{ImplKind, Win32ApiEntry, Win32Category, Win32ImportAudit};
 use dxil_metal::formats::{ShaderFormatSpec, ShaderInspection};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 /// Current stable JSON envelope schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -812,12 +814,29 @@ pub fn win32_audit_item_json(audit: &Win32ImportAudit) -> JsonValue {
             .or_default()
             .push(sym.as_str());
     }
+    let real_cnt = audit.count_by_impl_kind(ImplKind::Real);
+    let partial_cnt = audit.count_by_impl_kind(ImplKind::Partial);
+    let stub_cnt = audit.count_by_impl_kind(ImplKind::Stub);
+    let failing_cnt = audit.count_by_impl_kind(ImplKind::Failing);
     JsonObj::new()
         .str("binary_name", audit.binary_name.clone())
         .usize("total_imports", audit.total_imports)
         .usize("resolved_imports", audit.resolved_win32)
+        .usize("resolved_sibling", audit.resolved_sibling)
         .usize("unresolved_count", audit.unresolved.len())
         .f64("readiness_pct", audit.coverage_pct())
+        .f64("real_readiness_pct", audit.real_coverage_pct())
+        .val(
+            "resolved_by_impl_kind",
+            JsonObj::new()
+                .usize("real", real_cnt)
+                .usize("sibling", audit.resolved_sibling)
+                .usize("partial", partial_cnt)
+                .usize("stub", stub_cnt)
+                .usize("failing", failing_cnt)
+                .usize("unresolved", audit.unresolved.len())
+                .build(),
+        )
         .val(
             "resolved_by_category",
             JsonValue::Object(
@@ -841,6 +860,40 @@ pub fn win32_audit_item_json(audit: &Win32ImportAudit) -> JsonValue {
                             .str("version", mw.version.version)
                             .str("default_mode", mw.family.default_mode.as_str())
                             .str_array("matched_dlls", mw.matched_dlls.iter().cloned())
+                            .build()
+                    })
+                    .collect(),
+            ),
+        )
+        .val(
+            "stubbed_imports",
+            JsonValue::Array(
+                audit
+                    .stubbed_imports
+                    .iter()
+                    .map(|imp| {
+                        JsonObj::new()
+                            .str("dll", imp.dll.clone())
+                            .str("symbol", imp.symbol.clone())
+                            .str("impl_kind", imp.impl_kind.as_str())
+                            .str("source_file", imp.source_file.clone())
+                            .build()
+                    })
+                    .collect(),
+            ),
+        )
+        .val(
+            "partial_imports",
+            JsonValue::Array(
+                audit
+                    .partial_imports
+                    .iter()
+                    .map(|imp| {
+                        JsonObj::new()
+                            .str("dll", imp.dll.clone())
+                            .str("symbol", imp.symbol.clone())
+                            .str("impl_kind", imp.impl_kind.as_str())
+                            .str("source_file", imp.source_file.clone())
                             .build()
                     })
                     .collect(),
@@ -886,18 +939,83 @@ pub fn win32_audit_item_json(audit: &Win32ImportAudit) -> JsonValue {
 pub fn win32_audit_data_json(audits: &[Win32ImportAudit]) -> JsonValue {
     let total_imports: usize = audits.iter().map(|a| a.total_imports).sum();
     let total_resolved: usize = audits.iter().map(|a| a.resolved_win32).sum();
+    let total_real: usize = audits
+        .iter()
+        .map(|a| a.count_by_impl_kind(ImplKind::Real))
+        .sum();
+    let total_sibling: usize = audits.iter().map(|a| a.resolved_sibling).sum();
+    let total_partial: usize = audits
+        .iter()
+        .map(|a| a.count_by_impl_kind(ImplKind::Partial))
+        .sum();
+    let total_stub: usize = audits
+        .iter()
+        .map(|a| a.count_by_impl_kind(ImplKind::Stub))
+        .sum();
+    let total_failing: usize = audits
+        .iter()
+        .map(|a| a.count_by_impl_kind(ImplKind::Failing))
+        .sum();
     let total_unresolved: usize = audits.iter().map(|a| a.unresolved.len()).sum();
     let aggregate_pct = if total_imports == 0 {
         100.0
     } else {
         (total_resolved as f64 * 100.0) / (total_imports as f64)
     };
+    let aggregate_real_pct = if total_imports == 0 {
+        100.0
+    } else {
+        ((total_real + total_sibling) as f64 * 100.0) / (total_imports as f64)
+    };
+
+    let mut stubbed_unique: BTreeMap<(&str, &str), (ImplKind, &str, Vec<&str>)> = BTreeMap::new();
+    for a in audits {
+        for s in &a.stubbed_imports {
+            let entry = stubbed_unique
+                .entry((s.dll.as_str(), s.symbol.as_str()))
+                .or_insert_with(|| (s.impl_kind, s.source_file.as_str(), Vec::new()));
+            if !entry.2.contains(&a.binary_name.as_str()) {
+                entry.2.push(a.binary_name.as_str());
+            }
+        }
+    }
+
     JsonObj::new()
         .usize("binaries_audited", audits.len())
         .usize("total_imports", total_imports)
         .usize("resolved_imports", total_resolved)
         .usize("unresolved_imports", total_unresolved)
         .f64("aggregate_readiness_pct", aggregate_pct)
+        .f64("aggregate_real_readiness_pct", aggregate_real_pct)
+        .val(
+            "resolved_by_impl_kind",
+            JsonObj::new()
+                .usize("real", total_real)
+                .usize("sibling", total_sibling)
+                .usize("partial", total_partial)
+                .usize("stub", total_stub)
+                .usize("failing", total_failing)
+                .usize("unresolved", total_unresolved)
+                .build(),
+        )
+        .usize("stubbed_imports_count", total_stub + total_failing)
+        .val(
+            "stubbed_imports",
+            JsonValue::Array(
+                stubbed_unique
+                    .into_iter()
+                    .map(|((dll, sym), (kind, src, used_by))| {
+                        JsonObj::new()
+                            .str("dll", dll)
+                            .str("symbol", sym)
+                            .str("impl_kind", kind.as_str())
+                            .str("source_file", src)
+                            .str_array("used_by", used_by)
+                            .build()
+                    })
+                    .collect(),
+            ),
+        )
         .val(
             "binaries",
             JsonValue::Array(audits.iter().map(win32_audit_item_json).collect()),
@@ -1473,9 +1591,19 @@ pub fn ops_stats_data_json(st: &CatalogStats, records: &[OpRecord]) -> JsonValue
 /// Structured JSON payload for `port-factory win32-stats --json`.
 pub fn win32_stats_data_json(entries: &[Win32ApiEntry], search: Option<&str>) -> JsonValue {
     let mut by_cat: BTreeMap<Win32Category, usize> = BTreeMap::new();
+    let mut by_impl_kind: BTreeMap<ImplKind, usize> = BTreeMap::new();
     let mut by_dll: BTreeMap<(&str, Win32Category), usize> = BTreeMap::new();
+    for kind in [
+        ImplKind::Real,
+        ImplKind::Partial,
+        ImplKind::Stub,
+        ImplKind::Failing,
+    ] {
+        by_impl_kind.insert(kind, 0);
+    }
     for e in entries {
         *by_cat.entry(e.category).or_insert(0) += 1;
+        *by_impl_kind.entry(e.impl_kind).or_insert(0) += 1;
         *by_dll.entry((e.dll.as_str(), e.category)).or_insert(0) += 1;
     }
     let matches: Vec<JsonValue> = if let Some(q) = search {
@@ -1491,6 +1619,7 @@ pub fn win32_stats_data_json(entries: &[Win32ApiEntry], search: Option<&str>) ->
                     .str("dll", e.dll.clone())
                     .str("symbol", e.symbol.clone())
                     .str("category", e.category.as_str())
+                    .str("impl_kind", e.impl_kind.as_str())
                     .str("rust_path", e.rust_path.clone())
                     .str("source_file", e.source_file.clone())
                     .build()
@@ -1502,6 +1631,15 @@ pub fn win32_stats_data_json(entries: &[Win32ApiEntry], search: Option<&str>) ->
     JsonObj::new()
         .usize("total_apis", entries.len())
         .usize("total_dlls", by_dll.len())
+        .val(
+            "by_impl_kind",
+            JsonValue::Object(
+                by_impl_kind
+                    .into_iter()
+                    .map(|(k, count)| (k.as_str().to_string(), JsonValue::UInt(count as u64)))
+                    .collect(),
+            ),
+        )
         .val(
             "by_category",
             JsonValue::Object(
@@ -1528,6 +1666,275 @@ pub fn win32_stats_data_json(entries: &[Win32ApiEntry], search: Option<&str>) ->
         )
         .opt_str("search", search.map(str::to_string))
         .val("matches", JsonValue::Array(matches))
+        .build()
+}
+
+/// Structured JSON payload for `port-factory audit-game --json`.
+pub fn audit_game_data_json(
+    report: &GameAuditReport,
+    manifest_written_to: Option<&Path>,
+    recorded_tsv: Option<&str>,
+) -> JsonValue {
+    let imp = &report.imports;
+    let gfx = &report.graphics;
+    let ac = &report.anti_tamper;
+    let aot = &report.aot_coverage;
+    let dn = &report.dotnet;
+    let rh = &report.runtime_hazards;
+    let m = &report.suggested_manifest;
+
+    JsonObj::new()
+        .str("game_dir", report.game_dir.display().to_string())
+        .opt_str("main_exe", report.main_exe.clone())
+        .usize("binaries_scanned", report.binaries_scanned)
+        .usize("exe_count", report.exe_count)
+        .usize("dll_count", report.dll_count)
+        .usize("pe_parse_count", report.pe_parse_count)
+        .opt_str("steam_app_id", report.steam_app_id.clone())
+        .str("readiness", report.readiness.as_str())
+        .str_array("blockers", report.blockers.iter().cloned())
+        .val(
+            "imports",
+            JsonObj::new()
+                .usize("total_imports", imp.total_imports)
+                .usize("resolved_total", imp.resolved_total)
+                .usize("resolved_real", imp.resolved_real)
+                .usize("resolved_sibling", imp.resolved_sibling)
+                .usize("resolved_partial", imp.resolved_partial)
+                .usize("resolved_stub", imp.resolved_stub)
+                .usize("resolved_failing", imp.resolved_failing)
+                .usize("unresolved_count", imp.unresolved_count)
+                .f64("resolved_pct", imp.resolved_pct)
+                .f64("real_pct", imp.real_pct)
+                .val(
+                    "by_impl_kind",
+                    JsonObj::new()
+                        .usize("real", imp.resolved_real)
+                        .usize("sibling", imp.resolved_sibling)
+                        .usize("partial", imp.resolved_partial)
+                        .usize("stub", imp.resolved_stub)
+                        .usize("failing", imp.resolved_failing)
+                        .usize("unresolved", imp.unresolved_count)
+                        .build(),
+                )
+                .val(
+                    "stubbed_imports",
+                    JsonValue::Array(
+                        imp.stubbed_imports
+                            .iter()
+                            .map(|s| {
+                                JsonObj::new()
+                                    .str("dll", s.dll.clone())
+                                    .str("symbol", s.symbol.clone())
+                                    .str("impl_kind", s.impl_kind.as_str())
+                                    .str("source_file", s.source_file.clone())
+                                    .str_array("used_by", s.used_by.iter().cloned())
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .val(
+                    "partial_imports",
+                    JsonValue::Array(
+                        imp.partial_imports
+                            .iter()
+                            .map(|p| {
+                                JsonObj::new()
+                                    .str("dll", p.dll.clone())
+                                    .str("symbol", p.symbol.clone())
+                                    .str("impl_kind", p.impl_kind.as_str())
+                                    .str("source_file", p.source_file.clone())
+                                    .str_array("used_by", p.used_by.iter().cloned())
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .val(
+                    "unresolved_imports",
+                    JsonValue::Array(
+                        imp.unresolved_imports
+                            .iter()
+                            .map(|u| {
+                                JsonObj::new()
+                                    .str("dll", u.dll.clone())
+                                    .str("symbol", u.symbol.clone())
+                                    .str_array("used_by", u.used_by.iter().cloned())
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .val(
+                    "detected_middleware",
+                    JsonValue::Array(
+                        imp.detected_middleware
+                            .iter()
+                            .map(|mw| {
+                                JsonObj::new()
+                                    .str("id", mw.family_id.clone())
+                                    .str("display_name", mw.display_name.clone())
+                                    .str("version", mw.version.clone())
+                                    .str("default_mode", mw.default_mode.clone())
+                                    .str_array("matched_dlls", mw.matched_dlls.iter().cloned())
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+        )
+        .val(
+            "graphics",
+            JsonObj::new()
+                .str_array("detected_apis", gfx.detected_apis.iter().cloned())
+                .str_array("upscalers_detected", gfx.upscalers_detected.iter().cloned())
+                .val(
+                    "gpu_backends_detail",
+                    JsonValue::Object(
+                        gfx.gpu_backends_detail
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    JsonValue::Array(
+                                        v.iter().cloned().map(JsonValue::Str).collect(),
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    ),
+                )
+                .usize("embedded_shaders_total", gfx.embedded_shaders_total)
+                .usize("embedded_shaders_dxil", gfx.embedded_shaders_dxil)
+                .usize("embedded_shaders_sm4_5", gfx.embedded_shaders_sm4_5)
+                .usize("embedded_shaders_spirv", gfx.embedded_shaders_spirv)
+                .opt_str("engine_profile_id", gfx.engine_profile_id.clone())
+                .opt_str("engine_profile_family", gfx.engine_profile_family.clone())
+                .build(),
+        )
+        .val(
+            "anti_tamper",
+            JsonObj::new()
+                .str("verdict_code", anticheat_verdict_code(ac.worst_verdict))
+                .str("verdict", ac.worst_verdict.as_str())
+                .bool(
+                    "compatible",
+                    ac.worst_verdict != AntiCheatVerdict::RequiresKernelDriverFallback,
+                )
+                .u64("direct_syscalls", ac.direct_syscalls)
+                .val(
+                    "decoded_ssns",
+                    JsonValue::Array(
+                        ac.decoded_ssns
+                            .iter()
+                            .map(|(ssn, name, count)| {
+                                JsonObj::new()
+                                    .str("ssn", format!("0x{ssn:04x}"))
+                                    .opt_str("name", name.map(str::to_string))
+                                    .u64("count", *count)
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .u64("ud2_count", ac.ud2_count)
+                .u64("cpuid_count", ac.cpuid_count)
+                .u64("rdtsc_count", ac.rdtsc_count)
+                .u64("gs_teb_peb_reads", ac.gs_teb_peb_reads)
+                .u64("kuser_shared_reads", ac.kuser_shared_reads)
+                .str_array("rwx_sections", ac.rwx_sections.iter().cloned())
+                .str_array(
+                    "high_entropy_exec_sections",
+                    ac.high_entropy_exec_sections.iter().cloned(),
+                )
+                .str_array("anti_debug_imports", ac.anti_debug_imports.iter().cloned())
+                .str_array("veh_seh_imports", ac.veh_seh_imports.iter().cloned())
+                .str_array(
+                    "memory_unpack_imports",
+                    ac.memory_unpack_imports.iter().cloned(),
+                )
+                .str_array(
+                    "kernel_driver_imports",
+                    ac.kernel_driver_imports.iter().cloned(),
+                )
+                .build(),
+        )
+        .val(
+            "aot_coverage",
+            JsonObj::new()
+                .u64("total_instructions", aot.total_instructions)
+                .u64("active_instructions", aot.active_instructions)
+                .u64("jit_arm64_instructions", aot.jit_arm64_instructions)
+                .u64("trap_boundary_instructions", aot.trap_boundary_instructions)
+                .u64("unmapped_instructions", aot.unmapped_instructions)
+                .f64("jit_coverage_pct", aot.jit_coverage_pct)
+                .usize("pdata_functions", aot.pdata_functions)
+                .u64("total_code_bytes", aot.total_code_bytes)
+                .val(
+                    "top_unmapped_mnemonics",
+                    JsonValue::Array(
+                        aot.top_unmapped_mnemonics
+                            .iter()
+                            .map(|(mn, cnt)| {
+                                JsonObj::new()
+                                    .str("mnemonic", mn.clone())
+                                    .u64("count", *cnt)
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+        )
+        .val(
+            "dotnet",
+            JsonObj::new()
+                .usize("pure_il_count", dn.pure_il_count)
+                .usize("r2r_count", dn.r2r_count)
+                .usize("mixed_mode_count", dn.mixed_mode_count)
+                .usize("apphost_count", dn.apphost_count)
+                .usize("unity_mono_count", dn.unity_mono_count)
+                .usize("unity_il2cpp_count", dn.unity_il2cpp_count)
+                .usize("native_non_dotnet_count", dn.native_non_dotnet_count)
+                .str_array("runtime_configs", dn.runtime_configs.iter().cloned())
+                .str_array("global_metadata_dat", dn.global_metadata_dat.iter().cloned())
+                .build(),
+        )
+        .val(
+            "runtime_hazards",
+            JsonObj::new()
+                .u64("ldmxcsr_count", rh.ldmxcsr_count)
+                .u64("stmxcsr_count", rh.stmxcsr_count)
+                .u64("x87_op_count", rh.x87_op_count)
+                .u64("avx_narrow_count", rh.avx_narrow_count)
+                .u64("approx_fp_count", rh.approx_fp_count)
+                .u64("lock_rmw_count", rh.lock_rmw_count)
+                .u64("loop_branch_count", rh.loop_branch_count)
+                .usize("rwx_section_count", rh.rwx_section_count)
+                .str_array("notable_imports", rh.notable_imports.iter().cloned())
+                .bool("v8_or_cohtml_detected", rh.v8_or_cohtml_detected)
+                .build(),
+        )
+        .val(
+            "manifest",
+            JsonObj::new()
+                .opt_str("id", m.id.clone())
+                .opt_str("name", m.name.clone())
+                .opt_str("exe", m.exe.clone())
+                .opt_str("win_dir", m.win_dir.clone())
+                .opt_str("log_name", m.log_name.clone())
+                .opt_str("steam_app_id", m.steam_app_id.clone())
+                .bool("v8_jitless", m.v8_jitless.unwrap_or(false))
+                .opt_str(
+                    "written_path",
+                    manifest_written_to.map(|p| p.display().to_string()),
+                )
+                .str("toml", report.suggested_manifest_toml.clone())
+                .build(),
+        )
+        .opt_str("recorded_tsv", recorded_tsv.map(str::to_string))
         .build()
 }
 

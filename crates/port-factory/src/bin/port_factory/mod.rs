@@ -67,6 +67,8 @@ pub fn usage() -> ! {
            stub-backlog [--write] [--out PATH]  Generate `docs/stub-backlog.md` collecting `docs/stub-backlog.d/*.md`\n\
            stub-diff <BEFORE.json> <AFTER.json> Diff two runtime stub snapshots (or boot report JSONs)\n\
            report-diff <BEFORE.json> <AFTER.json> Diff two `port-runner --report-json` boot reports\n\
+           audit-game <GAME_DIR_OR_PE> [--exe EXE] [--init-manifest [PATH]] [--force] [--record] [--id ID] [--name NAME] [--json]\n\
+                                                Single-pass game readiness audit (imports by impl_kind, graphics API, anti-tamper, AOT coverage) & pre-filled game.toml\n\
          \n\
          Generalized Static AOT & Embedding Commands:\n\
            aot <PE_FILE> [--out PATH.rs] [--max-fns N]\n\
