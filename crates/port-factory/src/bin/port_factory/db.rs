@@ -22,7 +22,7 @@ use port_factory::scaffold::{
 };
 use port_factory::scanner::collect_pe_files;
 use port_factory::vfs::WinFs;
-use port_factory::win32_db::{Win32Category, Win32Database};
+use port_factory::win32_db::{ImplKind, Win32Category, Win32Database};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -178,9 +178,13 @@ pub fn cmd_win32_sync(args: &[String]) -> Result<i32> {
         *dlls.entry(e.dll.as_str()).or_insert(0) += 1;
     }
     println!(
-        "synced {} Win32 API mappings across {} Windows DLLs -> {}",
+        "synced {} Win32 API mappings across {} Windows DLLs ({} real, {} partial, {} stub, {} failing) -> {}",
         db.entries.len(),
         dlls.len(),
+        db.count_by_impl_kind(ImplKind::Real),
+        db.count_by_impl_kind(ImplKind::Partial),
+        db.count_by_impl_kind(ImplKind::Stub),
+        db.count_by_impl_kind(ImplKind::Failing),
         path.display()
     );
     Ok(exit_codes::OK)
@@ -215,6 +219,13 @@ pub fn cmd_win32_stats(args: &[String]) -> Result<i32> {
     println!("=== Wine-Style Core Windows API Mapping Database ===");
     println!("  Total mapped Win32 APIs : {}", db.entries.len());
     println!("  Total Windows DLLs      : {}", by_dll.len());
+    println!(
+        "  By Implementation Kind  : real={}, partial={}, stub={}, failing={}",
+        db.count_by_impl_kind(ImplKind::Real),
+        db.count_by_impl_kind(ImplKind::Partial),
+        db.count_by_impl_kind(ImplKind::Stub),
+        db.count_by_impl_kind(ImplKind::Failing),
+    );
     println!();
     println!("  {:24} {:>10}", "CATEGORY", "APIS");
     println!("  {}", "-".repeat(38));
@@ -235,8 +246,12 @@ pub fn cmd_win32_stats(args: &[String]) -> Result<i32> {
             let hay = format!("{} {} {}", e.dll, e.symbol, e.rust_path).to_lowercase();
             if hay.contains(&q) {
                 println!(
-                    "    {:24} ! {:36} -> {} ({})",
-                    e.dll, e.symbol, e.rust_path, e.source_file
+                    "    {:24} ! {:36} [{:7}] -> {} ({})",
+                    e.dll,
+                    e.symbol,
+                    e.impl_kind.as_str(),
+                    e.rust_path,
+                    e.source_file
                 );
             }
         }

@@ -60,6 +60,8 @@ pub fn usage() -> ! {
            win32-stats [--search STR] [--json]  Print summary statistics of mapped Windows DLLs & APIs\n\
            win32-audit <PE_FILE_OR_DIR...> [--json]\n\
                                                 Audit PE imports against the Win32 API database (exit 3 if unresolved)\n\
+           audit-game <GAME_DIR_OR_PE> [--exe EXE] [--init-manifest [PATH]] [--force] [--record] [--id ID] [--name NAME] [--json]\n\
+                                                Single-pass game readiness audit (imports by impl_kind, graphics API, anti-tamper, AOT coverage) & pre-filled game.toml\n\
          \n\
          Generalized Static AOT & Embedding Commands:\n\
            aot <PE_FILE> [--out PATH.rs] [--max-fns N]\n\

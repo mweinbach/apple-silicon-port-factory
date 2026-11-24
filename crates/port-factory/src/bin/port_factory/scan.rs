@@ -5,21 +5,22 @@ use anyhow::{Context, Result};
 use pe_image::{ExportTarget, Pe};
 use port_factory::anticheat::{audit_pe_anticheat, format_anticheat_report, AntiCheatVerdict};
 use port_factory::aot::{compile_pe_file_to_rust, AotOptions};
+use port_factory::audit_game::{audit_game_dir, AuditGameOptions, ReadinessLevel};
 use port_factory::dotnet::{audit_dotnet_paths, strip_ready_to_run_file, DotNetRuntimeKind};
 use port_factory::gpu_shaders::{
     audit_pe_app_capabilities, convert_shader_file, format_app_capability_report,
     inspect_shader_file, precompile_shaders_for_paths,
 };
 use port_factory::json_output::{
-    anticheat_audit_data_json, app_audit_data_json, dotnet_audit_data_json, exit_codes,
-    scan_data_json, shader_inspect_data_json, win32_audit_data_json, JsonEnvelope, JsonObj,
-    JsonValue,
+    anticheat_audit_data_json, app_audit_data_json, audit_game_data_json, dotnet_audit_data_json,
+    exit_codes, scan_data_json, shader_inspect_data_json, win32_audit_data_json, JsonEnvelope,
+    JsonObj, JsonValue,
 };
 use port_factory::scaffold::generate_embeddable_aot_crate;
 use port_factory::scanner::{
     collect_pe_files, format_profile_report, scan_pe_file, write_profiles_tsv,
 };
-use port_factory::win32_db::{audit_pe_imports, format_audit_report, Win32Database};
+use port_factory::win32_db::{audit_pe_imports, format_audit_report, ImplKind, Win32Database};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -142,12 +143,159 @@ pub fn cmd_win32_audit(args: &[String]) -> Result<i32> {
         println!("{}", format_audit_report(audit));
     }
     if files.len() > 1 && total_imports > 0 {
+        let total_real: usize = audits
+            .iter()
+            .map(|a| a.count_by_impl_kind(ImplKind::Real))
+            .sum();
+        let total_sibling: usize = audits.iter().map(|a| a.resolved_sibling).sum();
+        let total_partial: usize = audits
+            .iter()
+            .map(|a| a.count_by_impl_kind(ImplKind::Partial))
+            .sum();
+        let total_stub: usize = audits
+            .iter()
+            .map(|a| a.count_by_impl_kind(ImplKind::Stub))
+            .sum();
+        let total_failing: usize = audits
+            .iter()
+            .map(|a| a.count_by_impl_kind(ImplKind::Failing))
+            .sum();
         println!(
-            "=== Aggregate Win32 Import Readiness Across {} Binaries: {}/{} ({:.2}%) ===",
+            "=== Aggregate Win32 Import Readiness Across {} Binaries: {}/{} resolved ({:.2}%), {}/{} real ({:.2}%) ===",
             files.len(),
             total_resolved,
             total_imports,
-            (total_resolved as f64 * 100.0) / (total_imports as f64)
+            (total_resolved as f64 * 100.0) / (total_imports as f64),
+            total_real + total_sibling,
+            total_imports,
+            ((total_real + total_sibling) as f64 * 100.0) / (total_imports as f64)
+        );
+        println!(
+            "  Breakdown: real={} (+ {} sibling PE), partial={}, stub={}, failing={}, unresolved={}",
+            total_real,
+            total_sibling,
+            total_partial,
+            total_stub,
+            total_failing,
+            total_unresolved
+        );
+    }
+    Ok(code)
+}
+
+pub fn cmd_audit_game(args: &[String]) -> Result<i32> {
+    let mut game_dir: Option<PathBuf> = None;
+    let mut main_exe: Option<PathBuf> = None;
+    let mut init_manifest = false;
+    let mut manifest_out: Option<PathBuf> = None;
+    let mut force = false;
+    let mut record = false;
+    let mut game_id: Option<String> = None;
+    let mut game_name: Option<String> = None;
+    let mut json = false;
+
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--json" => json = true,
+            "--force" => force = true,
+            "--record" => record = true,
+            "--init-manifest" => {
+                init_manifest = true;
+                if let Some(val) = cur.next_opt_value() {
+                    manifest_out = Some(PathBuf::from(val));
+                }
+            }
+            "--exe" => main_exe = Some(cur.next_path_or_err("--exe requires PATH_OR_NAME")?),
+            "--id" => game_id = Some(cur.next_or_err("--id requires ID")?.to_string()),
+            "--name" => game_name = Some(cur.next_or_err("--name requires NAME")?.to_string()),
+            s if s.starts_with('-') => return Err(usage_err(format!("unknown flag {s:?}"))),
+            p => {
+                if game_dir.is_none() {
+                    game_dir = Some(PathBuf::from(p));
+                } else if main_exe.is_none() {
+                    main_exe = Some(PathBuf::from(p));
+                } else {
+                    return Err(usage_err(format!("unexpected positional argument {p:?}")));
+                }
+            }
+        }
+    }
+
+    let Some(game_dir) = game_dir else {
+        return Err(usage_err(
+            "usage: port-factory audit-game <GAME_DIR_OR_PE> [--exe EXE] [--init-manifest [PATH]] [--force] [--record] [--id ID] [--name NAME] [--json]",
+        ));
+    };
+    if !game_dir.exists() {
+        return Err(usage_err(format!(
+            "game directory not found: {}",
+            game_dir.display()
+        )));
+    }
+
+    let root = workspace_root();
+    let db = Win32Database::from_workspace_src(&root)?;
+    let opts = AuditGameOptions {
+        main_exe,
+        game_id,
+        game_name,
+    };
+    let report = audit_game_dir(&game_dir, &db, &opts)?;
+
+    let mut manifest_written: Option<PathBuf> = None;
+    if init_manifest {
+        let out_path = manifest_out.unwrap_or_else(|| report.default_manifest_path(&root));
+        report.write_manifest(&out_path, force)?;
+        manifest_written = Some(out_path);
+    }
+
+    let mut recorded_tsv: Option<String> = None;
+    if record && !report.profiles.is_empty() {
+        let out_path = Path::new(DEFAULT_PROFILES_TSV);
+        write_profiles_tsv(out_path, &report.profiles)?;
+        recorded_tsv = Some(out_path.display().to_string());
+    }
+
+    let code = if report.readiness == ReadinessLevel::Blocked {
+        exit_codes::INCOMPATIBLE
+    } else if report.imports.unresolved_count > 0 {
+        exit_codes::UNRESOLVED_IMPORTS
+    } else {
+        exit_codes::OK
+    };
+
+    if json {
+        let data = audit_game_data_json(
+            &report,
+            manifest_written.as_deref(),
+            recorded_tsv.as_deref(),
+        );
+        let err_msg = match code {
+            exit_codes::INCOMPATIBLE => Some(format!(
+                "Ring-0 kernel driver blocker detected: {}",
+                report.anti_tamper.kernel_driver_imports.join(", ")
+            )),
+            exit_codes::UNRESOLVED_IMPORTS => Some(format!(
+                "{} unresolved Win32 import(s) across {} unique symbol(s)",
+                report.imports.unresolved_count,
+                report.imports.unresolved_imports.len()
+            )),
+            _ => None,
+        };
+        return Ok(emit_json(&JsonEnvelope::with_status(
+            "audit-game",
+            code,
+            data,
+            err_msg,
+        )));
+    }
+
+    print!("{}", report.format_human_report(manifest_written.as_deref()));
+    if let Some(ref tsv) = recorded_tsv {
+        println!(
+            "  Recorded {} binary profile(s) to {tsv}",
+            report.profiles.len()
         );
     }
     Ok(code)
