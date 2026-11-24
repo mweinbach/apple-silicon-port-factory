@@ -712,6 +712,12 @@ const _: () = assert!(std::mem::size_of::<FrameStatistics>() == 32);
 static GLOBAL_PRESENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LAST_PRESENT_REFRESH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Total DXGI `Present` calls recorded across all swapchains in this process.
+#[inline]
+pub fn global_present_count() -> u32 {
+    GLOBAL_PRESENTS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn current_vblank_count() -> (u32, i64) {
     let qpc = crate::kernel32::time::interrupt_time_100ns();
     let hz = crate::macos::display::monitors()

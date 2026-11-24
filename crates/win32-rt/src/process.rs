@@ -541,6 +541,8 @@ pub fn init(mut cfg: ProcessConfig) {
     // D3D12 API trace (d3d12_metal::trace): flush buffered records at exit.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     register_exit_hook(d3d12_metal::trace::flush);
+    // Global stub registry: emit ranked stub summary table (and optional JSON/diff) at exit.
+    register_exit_hook(crate::stub_registry::log_exit_summary);
 }
 
 // ---------------------------------------------------------------------------
