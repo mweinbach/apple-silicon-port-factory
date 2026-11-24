@@ -76,6 +76,16 @@ pub fn audit_pe_app_capabilities(path: &Path) -> Result<AppCapabilityProfile> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
+    Ok(audit_pe_app_capabilities_parsed(&binary_name, &pe, &bytes))
+}
+
+/// Audits an already-parsed [`Pe`] image and its raw bytes for non-gaming, GPU, and embedded shader capabilities.
+pub fn audit_pe_app_capabilities_parsed(
+    binary_name: &str,
+    pe: &Pe,
+    bytes: &[u8],
+) -> AppCapabilityProfile {
+    let binary_name = binary_name.to_string();
 
     let (is_gui_subsystem, is_console_subsystem) = (true, true);
 
@@ -256,7 +266,7 @@ pub fn audit_pe_app_capabilities(path: &Path) -> Result<AppCapabilityProfile> {
         }
     }
 
-    Ok(AppCapabilityProfile {
+    AppCapabilityProfile {
         binary_name,
         is_gui_subsystem,
         is_console_subsystem,
@@ -275,7 +285,7 @@ pub fn audit_pe_app_capabilities(path: &Path) -> Result<AppCapabilityProfile> {
         embedded_shaders_wave32,
         embedded_shaders_wave64,
         shader_profiles,
-    })
+    }
 }
 
 /// Formats a comprehensive multi-binary Non-Gaming & GPU Acceleration Capability Report.

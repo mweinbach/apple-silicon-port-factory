@@ -115,6 +115,11 @@ pub fn audit_pe_bytes_runtime_hazards(
     data: &[u8],
 ) -> Result<RuntimeHazardReport> {
     let pe = Pe::parse(data).with_context(|| format!("parse PE {binary_name}"))?;
+    Ok(audit_pe_parsed_runtime_hazards(binary_name, &pe))
+}
+
+/// Statically audit an already-parsed [`Pe`] image for runtime hazards.
+pub fn audit_pe_parsed_runtime_hazards(binary_name: &str, pe: &Pe) -> RuntimeHazardReport {
     let mut rep = RuntimeHazardReport {
         binary_name: binary_name.to_string(),
         is_dll: pe.headers.is_dll(),
@@ -251,7 +256,7 @@ pub fn audit_pe_bytes_runtime_hazards(
         }
     }
 
-    Ok(rep)
+    rep
 }
 
 /// Format a table of [`RuntimeHazardReport`]s for terminal output.

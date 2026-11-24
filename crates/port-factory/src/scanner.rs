@@ -67,6 +67,11 @@ pub fn scan_pe_file(path: &Path) -> Result<BinaryProfile> {
 /// Scan an in-memory PE32+ image (`Layout::File`).
 pub fn scan_pe_bytes(binary_name: &str, data: &[u8]) -> Result<BinaryProfile> {
     let pe = Pe::parse(data).with_context(|| format!("parse PE {binary_name}"))?;
+    Ok(scan_pe_parsed(binary_name, &pe))
+}
+
+/// Scan an already-parsed [`Pe`] image without re-parsing headers.
+pub fn scan_pe_parsed(binary_name: &str, pe: &Pe) -> BinaryProfile {
     let image_base = pe.headers.image_base;
     let pdata = pe.runtime_functions().unwrap_or_default();
     let exports_count = pe.exports().map(|e| e.entries.len()).unwrap_or(0);
@@ -138,7 +143,7 @@ pub fn scan_pe_bytes(binary_name: &str, data: &[u8]) -> Result<BinaryProfile> {
         decode_range(image_base + start as u64, bytes, &mut prof);
     }
 
-    Ok(prof)
+    prof
 }
 
 fn decode_range(start_ip: u64, bytes: &[u8], prof: &mut BinaryProfile) {
