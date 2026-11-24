@@ -11,7 +11,7 @@
 //! * One process-wide recursive lock serializes all stream operations and
 //!   backs `_lock_file`/`_unlock_file` (simple, deadlock-free).
 
-use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT};
+use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT, EPIPE};
 use crate::strings::{from_ansi, from_wide};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -404,14 +404,50 @@ pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
     h as isize
 }
 
+/// Wait for a pipe fd to become ready for `events` (`POLLIN` or `POLLOUT`) when its shared
+/// kernel open file description has `O_NONBLOCK` set (e.g. after an overlapped Win32 pipe
+/// write on a handle sharing the same open file description). Scoped strictly to `FileKind::Pipe`
+/// without toggling `O_NONBLOCK`. Restores `orig_errno` if `fd` is not a pipe.
+unsafe fn wait_pipe_fd_ready(fd: i32, events: libc::c_short, orig_errno: i32) -> bool {
+    use crate::kernel32::file::{classify_host_fd, FileKind};
+    if classify_host_fd(fd) != FileKind::Pipe {
+        *libc::__error() = orig_errno;
+        return false;
+    }
+    loop {
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let pr = libc::poll(&mut pfd, 1, -1);
+        if pr >= 0 {
+            return true;
+        }
+        if *libc::__error() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
 /// Raw read with CRLF->LF translation in text mode.
 pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
     let info = fd_info(fd);
-    let r = libc::read(fd, buf as *mut c_void, n);
-    if r <= 0 || !info.text || info.raw {
-        if r < 0 {
-            errno::set_from_host();
+    let r = loop {
+        let k = libc::read(fd, buf as *mut c_void, n);
+        if k >= 0 {
+            break k;
         }
+        let e = *libc::__error();
+        if e == libc::EINTR {
+            continue;
+        }
+        if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
+            && wait_pipe_fd_ready(fd, libc::POLLIN, e)
+        {
+            continue;
+        }
+        errno::set_from_host();
+        return -1;
+    };
+    if r == 0 || !info.text || info.raw {
         return r;
     }
     let s = std::slice::from_raw_parts_mut(buf, r as usize);
@@ -467,10 +503,20 @@ pub unsafe fn write_fd(fd: i32, data: &[u8]) -> isize {
     while off < out.len() {
         let r = libc::write(fd, out[off..].as_ptr() as *const c_void, out.len() - off);
         if r < 0 {
-            if *libc::__error() == libc::EINTR {
+            let e = *libc::__error();
+            if e == libc::EINTR {
+                continue;
+            }
+            if (e == libc::EAGAIN || e == libc::EWOULDBLOCK)
+                && wait_pipe_fd_ready(fd, libc::POLLOUT, e)
+            {
                 continue;
             }
             errno::set_from_host();
+            return -1;
+        }
+        if r == 0 {
+            errno::set(EPIPE);
             return -1;
         }
         off += r as usize;
@@ -1975,5 +2021,171 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crt_read_write_block_on_nonblocking_duplex_named_pipe_after_overlapped_write() {
+        use crate::kernel32::file::{
+            CreateFileW, CreateNamedPipeW, DisconnectNamedPipe, GetOverlappedResult, ReadFile,
+            WriteFile, OVERLAPPED,
+        };
+        use crate::kernel32::threads::CloseHandle;
+        use crate::types::{err, INVALID_HANDLE_VALUE, TRUE};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        unsafe {
+            let pname = crate::strings::to_wide_z(&format!(
+                "\\\\.\\pipe\\aw2_crt_nb_pipe_test_{}",
+                std::process::id()
+            ));
+            let srv = CreateNamedPipeW(
+                pname.as_ptr(),
+                0x4000_0003, // PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(srv, INVALID_HANDLE_VALUE);
+
+            let cli = CreateFileW(
+                pname.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                0,
+                std::ptr::null_mut(),
+                3,           // OPEN_EXISTING
+                0x4000_0000, // FILE_FLAG_OVERLAPPED
+                std::ptr::null_mut(),
+            );
+            assert_ne!(cli, INVALID_HANDLE_VALUE);
+
+            let cli_fd = _open_osfhandle(cli as isize, O_BINARY);
+            assert!(cli_fd >= 0);
+
+            // A 1-byte overlapped WriteFile permanently enables O_NONBLOCK on the shared
+            // open file description (visible through cli_fd via F_DUPFD_CLOEXEC).
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let mut nw = 0u32;
+            let ok = WriteFile(cli, b"X".as_ptr() as *const c_void, 1, &mut nw, &mut ov);
+            if ok == 0 {
+                assert_eq!(crate::teb::last_error(), err::ERROR_IO_PENDING);
+                assert_eq!(GetOverlappedResult(cli, &mut ov, &mut nw, TRUE), TRUE);
+            }
+            assert_eq!(nw, 1);
+
+            let mut one = [0u8; 1];
+            let mut nr = 0u32;
+            assert_eq!(ReadFile(srv, one.as_mut_ptr() as *mut c_void, 1, &mut nr, std::ptr::null_mut()), TRUE);
+            assert_eq!(nr, 1);
+            assert_eq!(&one, b"X");
+            assert_ne!(
+                libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "expected shared O_NONBLOCK after overlapped pipe write"
+            );
+
+            // 1. CRT _read on an empty nonblocking pipe must wait for data (not fail with EAGAIN)
+            //    and preserve ordinary short read counts.
+            let (r_tx, r_rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 32];
+                let n = _read(cli_fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                let e = errno::get();
+                let _ = r_tx.send((n, e, buf));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(
+                matches!(r_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "_read on empty pipe returned prematurely instead of waiting"
+            );
+            let msg = b"hello-pipe";
+            assert_eq!(
+                WriteFile(srv, msg.as_ptr() as *const c_void, msg.len() as u32, &mut nw, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(nw as usize, msg.len());
+            let (n, e, buf) = r_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("_read on pipe hung after data arrived");
+            reader.join().unwrap();
+            assert_eq!(n as usize, msg.len(), "_read failed with errno={e}");
+            assert_eq!(&buf[..n as usize], msg);
+
+            // 2. Backpressured CRT _write must wait and resume after partial writes, delivering
+            //    all 256 KiB intact and in exact order while keeping shared O_NONBLOCK intact.
+            let payload: Vec<u8> = (0..256 * 1024usize)
+                .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8)
+                .collect();
+            let payload_send = payload.clone();
+            let (w_tx, w_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let n = _write(
+                    cli_fd,
+                    payload_send.as_ptr() as *const c_void,
+                    payload_send.len() as u32,
+                );
+                let e = errno::get();
+                let _ = w_tx.send((n, e));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(
+                matches!(w_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "backpressured _write returned prematurely instead of waiting"
+            );
+
+            let mut received = Vec::with_capacity(payload.len());
+            let mut chunk = [0u8; 8192];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while received.len() < payload.len() && Instant::now() < deadline {
+                let want = (payload.len() - received.len()).min(chunk.len()) as u32;
+                let mut got = 0u32;
+                assert_eq!(
+                    ReadFile(srv, chunk.as_mut_ptr() as *mut c_void, want, &mut got, std::ptr::null_mut()),
+                    TRUE
+                );
+                assert!(got > 0);
+                received.extend_from_slice(&chunk[..got as usize]);
+            }
+            let (wn, we) = w_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("backpressured _write hung while peer drained");
+            writer.join().unwrap();
+            assert_eq!(wn as usize, payload.len(), "_write failed with errno={we}");
+            assert_eq!(received, payload);
+            assert_ne!(
+                libc::fcntl(cli_fd, libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "CRT retry path must not toggle shared O_NONBLOCK off"
+            );
+
+            // 3. Peer disconnect/close terminates waiting CRT _read with 0 (EOF) and causes
+            //    subsequent CRT _write to fail cleanly with EPIPE.
+            let (eof_tx, eof_rx) = mpsc::channel();
+            let eof_reader = std::thread::spawn(move || {
+                let mut buf = [0u8; 16];
+                let n = _read(cli_fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                let e = errno::get();
+                let _ = eof_tx.send((n, e));
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(matches!(eof_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(DisconnectNamedPipe(srv), TRUE);
+            assert_eq!(CloseHandle(srv), TRUE);
+
+            let (eof_n, eof_e) = eof_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("_read on pipe hung after peer closed");
+            eof_reader.join().unwrap();
+            assert_eq!(eof_n, 0, "expected EOF (0), got {eof_n} errno={eof_e}");
+
+            assert_eq!(_write(cli_fd, b"after-eof".as_ptr() as *const c_void, 9), -1);
+            assert_eq!(errno::get(), EPIPE);
+
+            assert_eq!(_close(cli_fd), 0);
+            assert!(crate::handles::get(cli).is_none());
+        }
     }
 }
