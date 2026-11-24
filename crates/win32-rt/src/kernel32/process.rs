@@ -845,31 +845,77 @@ unsafe fn extract_handle_list(attr_list: *const c_void) -> Result<Option<Vec<HAN
 }
 
 #[cfg(not(target_os = "ios"))]
-fn resolve_guest_exe(raw_exe: &str) -> Result<(String, std::path::PathBuf), u32> {
-    let mut candidates: Vec<String> = Vec::new();
-    let has_sep = raw_exe.contains('\\') || raw_exe.contains('/') || raw_exe.contains(':');
-    let add_with_ext = |list: &mut Vec<String>, base: String| {
-        let has_ext = base
-            .rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|f| f.contains('.'));
-        if !has_ext {
-            list.push(format!("{base}.exe"));
-        }
-        list.push(base);
-    };
-    if has_sep {
-        add_with_ext(&mut candidates, crate::path::absolute(raw_exe));
+fn win_parent_dir(win_path: &str) -> Option<String> {
+    let norm = crate::path::normalize(win_path.trim());
+    let trimmed = norm.trim_end_matches('\\');
+    let sep = trimmed.rfind('\\')?;
+    let dir = &trimmed[..sep];
+    if dir.is_empty() {
+        Some("\\".to_string())
+    } else if dir.len() == 2 && dir.as_bytes()[1] == b':' {
+        Some(format!("{dir}\\"))
     } else {
-        let cwd = crate::path::cwd();
-        add_with_ext(&mut candidates, format!("{}\\{raw_exe}", cwd.trim_end_matches('\\')));
-        if let Some(path_env) = pr::get_env("Path") {
-            for dir in path_env.split(';').filter(|d| !d.trim().is_empty()) {
-                add_with_ext(&mut candidates, format!("{}\\{raw_exe}", dir.trim().trim_end_matches('\\')));
+        Some(dir.to_string())
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn join_win_dir(dir: &str, name: &str) -> String {
+    let cleaned = dir.trim().trim_matches('"').trim();
+    if cleaned.is_empty() {
+        return name.to_string();
+    }
+    let base = cleaned.trim_end_matches(['\\', '/']);
+    if base.is_empty() {
+        format!("\\{name}")
+    } else {
+        format!("{base}\\{name}")
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn resolve_guest_exe_with_dirs(
+    raw_exe: &str,
+    from_app_name: bool,
+    parent_exe: Option<&str>,
+    win_dirs: [&str; 3],
+) -> Result<(String, std::path::PathBuf), u32> {
+    let has_dir = raw_exe.contains('\\') || raw_exe.contains('/') || raw_exe.contains(':');
+    if from_app_name || has_dir {
+        let win = crate::path::absolute(raw_exe);
+        if let Some(host) = crate::path::to_host(&win) {
+            if host.is_file() {
+                return Ok((crate::path::normalize(&win), host));
+            }
+        }
+        return Err(err::ERROR_FILE_NOT_FOUND);
+    }
+
+    let file_name = if raw_exe.contains('.') {
+        raw_exe.to_string()
+    } else {
+        format!("{raw_exe}.exe")
+    };
+
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(app_dir) = parent_exe.and_then(win_parent_dir) {
+        dirs.push(app_dir);
+    }
+    dirs.push(crate::path::cwd());
+    for d in win_dirs {
+        dirs.push(d.to_string());
+    }
+    if let Some(path_env) = pr::get_env("Path") {
+        for raw_dir in path_env.split(';') {
+            let dir = raw_dir.trim().trim_matches('"').trim();
+            if !dir.is_empty() {
+                dirs.push(dir.to_string());
             }
         }
     }
-    for win in candidates {
+
+    for dir in dirs {
+        let win = crate::path::absolute(&join_win_dir(&dir, &file_name));
         if let Some(host) = crate::path::to_host(&win) {
             if host.is_file() {
                 return Ok((crate::path::normalize(&win), host));
@@ -877,6 +923,24 @@ fn resolve_guest_exe(raw_exe: &str) -> Result<(String, std::path::PathBuf), u32>
         }
     }
     Err(err::ERROR_FILE_NOT_FOUND)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn resolve_guest_exe(
+    raw_exe: &str,
+    from_app_name: bool,
+    parent_exe: Option<&str>,
+) -> Result<(String, std::path::PathBuf), u32> {
+    resolve_guest_exe_with_dirs(
+        raw_exe,
+        from_app_name,
+        parent_exe,
+        [
+            crate::kernel32::sysinfo::SYSTEM_DIR,
+            crate::kernel32::sysinfo::SYSTEM16_DIR,
+            crate::kernel32::sysinfo::WINDOWS_DIR,
+        ],
+    )
 }
 
 #[cfg(not(target_os = "ios"))]
@@ -1305,18 +1369,22 @@ pub unsafe extern "win64" fn CreateProcessW(
             }
         }
 
-        let raw_exe = if let Some(ref a) = app_s {
-            a.clone()
+        let (raw_exe, from_app_name) = if let Some(ref a) = app_s {
+            (a.clone(), true)
         } else {
             let parts = pr::split_cmdline(cmd_s.as_deref().unwrap_or(""));
             let Some(first) = parts.into_iter().next().filter(|s| !s.is_empty()) else {
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             };
-            first
+            (first, false)
         };
 
-        let (exe_win, exe_host) = match resolve_guest_exe(&raw_exe) {
+        let (exe_win, exe_host) = match resolve_guest_exe(
+            &raw_exe,
+            from_app_name,
+            pr::try_config().map(|c| c.exe_path.as_str()),
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 set_err(e);
@@ -2759,6 +2827,168 @@ mod tests {
 
         assert!(pr::capture_runner_identity(&inert).is_err());
         assert!(pr::capture_runner_identity(&dir.join("missing_runner")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn resolve_guest_exe_follows_create_process_search_order_and_app_name_rules() {
+        assert_eq!(win_parent_dir("R:\\app\\parent.exe").as_deref(), Some("R:\\app"));
+        assert_eq!(win_parent_dir("R:/app/sub/parent.exe").as_deref(), Some("R:\\app\\sub"));
+        assert_eq!(win_parent_dir("R:\\parent.exe").as_deref(), Some("R:\\"));
+        assert_eq!(win_parent_dir("R:/parent.exe").as_deref(), Some("R:\\"));
+        assert_eq!(win_parent_dir("R:\\"), None);
+        assert_eq!(win_parent_dir("bare.exe"), None);
+
+        let dir = std::env::temp_dir().join(format!("port_factory_resolve_exe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        let cwd_dir = dir.join("cwd");
+        let cwd_sub = cwd_dir.join("sub");
+        let app_sub = app_dir.join("sub");
+        let sys32_dir = dir.join("win").join("system32");
+        let sys16_dir = dir.join("win").join("System");
+        let win_dir = dir.join("win");
+        let path_dir = dir.join("pathdir");
+        for d in [&app_dir, &cwd_dir, &cwd_sub, &app_sub, &sys32_dir, &sys16_dir, &win_dir, &path_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // Seed files across all 6 documented search locations to assert exact precedence.
+        for f in [
+            app_dir.join("tool.exe"),
+            app_dir.join("app_only.exe"),
+            app_sub.join("rel.exe"),
+            dir.join("root_tool.exe"),
+            cwd_dir.join("tool.exe"),
+            cwd_dir.join("cwd_tool.exe"),
+            cwd_dir.join("root_tool.exe"),
+            cwd_dir.join("raw_bin"),
+            cwd_sub.join("rel.exe"),
+            cwd_sub.join("raw_sub"),
+            sys32_dir.join("tool.exe"),
+            sys32_dir.join("sys32_tool.exe"),
+            sys16_dir.join("sys32_tool.exe"),
+            sys16_dir.join("sys16_tool.exe"),
+            win_dir.join("sys16_tool.exe"),
+            win_dir.join("win_tool.exe"),
+            path_dir.join("tool.exe"),
+            path_dir.join("win_tool.exe"),
+            path_dir.join("path_tool.exe"),
+            path_dir.join("script.com"),
+        ] {
+            std::fs::write(&f, b"MZ").unwrap();
+        }
+
+        let prev_cwd = crate::path::cwd();
+        let prev_path = pr::get_env("Path");
+        crate::path::add_mount("R:\\", &dir);
+        crate::path::set_cwd("R:\\cwd");
+        pr::set_env("Path", Some("\"R:\\pathdir\""));
+
+        let win_dirs = ["R:\\win\\system32", "R:\\win\\System", "R:\\win"];
+        let parent_bs = Some("R:\\app\\parent.exe");
+        let parent_fs = Some("R:/app/parent.exe");
+
+        // 1. Bare command-line name precedence: app dir > cwd > system32 > System > Windows > PATH.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\app\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", false, parent_fs, win_dirs).unwrap().0,
+            "R:\\app\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("root_tool", false, Some("R:/parent.exe"), win_dirs).unwrap().0,
+            "R:\\root_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("cwd_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\cwd_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sys32_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\system32\\sys32_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sys16_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\System\\sys16_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("win_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\win\\win_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("path_tool", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\pathdir\\path_tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("script.com", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\pathdir\\script.com"
+        );
+
+        // 2. App-only helper resolves beside parent guest image even when cwd differs.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("app_only", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\app\\app_only.exe"
+        );
+        // Trailing dot suppresses .exe inference on bare command-line names.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool.", false, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+
+        // 3. Explicit lpApplicationName resolves directly against cwd without probing search path or inferring .exe.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\tool.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("app_only.exe", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("path_tool.exe", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("tool", true, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("raw_bin", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\raw_bin"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub/rel.exe", true, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+
+        // 4. Command-line name containing a directory resolves directly relative to cwd/drive without search or .exe inference.
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel.exe", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\rel.exe"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\rel", false, parent_bs, win_dirs),
+            Err(err::ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("sub\\raw_sub", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\sub\\raw_sub"
+        );
+        assert_eq!(
+            resolve_guest_exe_with_dirs("R:tool.exe", false, parent_bs, win_dirs).unwrap().0,
+            "R:\\cwd\\tool.exe"
+        );
+
+        crate::path::set_cwd(&prev_cwd);
+        pr::set_env("Path", prev_path.as_deref());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

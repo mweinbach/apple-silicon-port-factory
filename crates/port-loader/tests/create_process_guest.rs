@@ -13,9 +13,9 @@ mod macos_guest_process_tests {
     use win32_rt::handles::{HANDLE_FLAG_INHERIT};
     use win32_rt::kernel32::file::{CreatePipe, ReadFile, WriteFile};
     use win32_rt::kernel32::process::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess, GetLastError,
-        GetProcessId, InitializeProcThreadAttributeList, OpenProcess, QueryFullProcessImageNameW,
-        TerminateProcess, UpdateProcThreadAttribute,
+        CreateProcessA, CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        GetLastError, GetProcessId, InitializeProcThreadAttributeList, OpenProcess,
+        QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
     };
     use win32_rt::kernel32::threads::{
         CloseHandle, SetHandleInformation, WaitForSingleObject, STILL_ACTIVE,
@@ -985,6 +985,131 @@ mod macos_guest_process_tests {
             let mut code = 0u32;
             assert_eq!(GetExitCodeProcess(hp, &mut code), TRUE);
             assert_eq!(code, 73, "nested child -> grandchild exit code must propagate cleanly");
+            assert_eq!(CloseHandle(ht), TRUE);
+            assert_eq!(CloseHandle(hp), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_process_resolves_parent_app_dir_cwd_path_and_explicit_paths() {
+        let runner = PathBuf::from(env!("CARGO_BIN_EXE_port-runner"));
+        assert!(runner.is_file(), "port-runner binary missing at {}", runner.display());
+        win32_rt::process::set_runner_exe(runner);
+
+        let dir = std::env::temp_dir().join(format!(
+            "port_factory_create_proc_resolve_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        let cwd_dir = dir.join("cwd");
+        let cwd_sub = cwd_dir.join("sub");
+        let path_dir = dir.join("pathdir");
+        let child_cwd = dir.join("child_cwd");
+        for d in [&app_dir, &cwd_dir, &cwd_sub, &path_dir, &child_cwd] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // Distinct benign return codes identify exactly which executable was resolved and launched.
+        std::fs::write(app_dir.join("helper.exe"), build_guest_pe(11, GuestMode::ReturnEntry)).unwrap();
+        std::fs::write(app_dir.join("app_only.exe"), build_guest_pe(12, GuestMode::ReturnEntry)).unwrap();
+        std::fs::write(cwd_dir.join("helper.exe"), build_guest_pe(22, GuestMode::ReturnEntry)).unwrap();
+        std::fs::write(path_dir.join("helper.exe"), build_guest_pe(33, GuestMode::ReturnEntry)).unwrap();
+        std::fs::write(cwd_sub.join("rel.exe"), build_guest_pe(44, GuestMode::ReturnEntry)).unwrap();
+
+        win32_rt::path::add_mount("S:\\", &dir);
+        win32_rt::path::set_cwd("S:\\cwd");
+        win32_rt::process::init(win32_rt::process::ProcessConfig {
+            exe_path: "S:\\app\\parent.exe".into(),
+            cmdline: "\"S:\\app\\parent.exe\"".into(),
+        });
+        win32_rt::process::init_trusted_host_env();
+        win32_rt::process::init_env(&[("Path".into(), "S:\\pathdir".into())]);
+
+        let run_w = |app: Option<&str>, cmd: Option<&str>, cwd: Option<&str>| -> Result<u32, u32> {
+            unsafe {
+                let app_w = app.map(to_wide_z);
+                let mut cmd_w = cmd.map(to_wide_z);
+                let cwd_w = cwd.map(to_wide_z);
+                let mut si = [0u8; 104];
+                (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+                let mut pi = [0u8; 24];
+                let ok = CreateProcessW(
+                    app_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                    cmd_w.as_mut().map_or(std::ptr::null_mut(), |v| v.as_mut_ptr()),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    std::ptr::null_mut(),
+                    cwd_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                    si.as_mut_ptr() as *mut c_void,
+                    pi.as_mut_ptr() as *mut c_void,
+                );
+                if ok == FALSE {
+                    return Err(GetLastError());
+                }
+                let hp = (pi.as_ptr() as *const HANDLE).read_unaligned();
+                let ht = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+                assert_eq!(WaitForSingleObject(hp, 15_000), WAIT_OBJECT_0);
+                let mut code = 0u32;
+                assert_eq!(GetExitCodeProcess(hp, &mut code), TRUE);
+                assert_eq!(CloseHandle(ht), TRUE);
+                assert_eq!(CloseHandle(hp), TRUE);
+                Ok(code)
+            }
+        };
+
+        // 1. Bare command-line name with null lpApplicationName resolves beside parent guest
+        //    image before cwd and PATH (with .exe inferred), independent of lpCurrentDirectory.
+        assert_eq!(run_w(None, Some("helper"), Some("S:\\child_cwd")), Ok(11));
+
+        // 2. App-only helper resolves beside parent guest image even when parent cwd differs.
+        assert_eq!(run_w(None, Some("app_only"), Some("S:\\child_cwd")), Ok(12));
+
+        // 3. Explicit lpApplicationName resolves directly against parent cwd (not parent app dir or PATH)
+        //    and does not infer .exe.
+        assert_eq!(run_w(Some("helper.exe"), None, Some("S:\\child_cwd")), Ok(22));
+        assert_eq!(run_w(Some("helper"), None, None), Err(err::ERROR_FILE_NOT_FOUND));
+        assert_eq!(run_w(Some("app_only.exe"), None, None), Err(err::ERROR_FILE_NOT_FOUND));
+
+        // 4. Explicit relative paths (via lpApplicationName or lpCommandLine) resolve directly against cwd,
+        //    without .exe inference.
+        assert_eq!(run_w(Some("sub\\rel.exe"), None, None), Ok(44));
+        assert_eq!(run_w(None, Some("sub\\rel.exe"), None), Ok(44));
+        assert_eq!(run_w(None, Some("sub\\rel"), None), Err(err::ERROR_FILE_NOT_FOUND));
+
+        // 5. CreateProcessA reuses the common CreateProcessW resolution path.
+        unsafe {
+            let mut cmd_a = b"app_only\0".to_vec();
+            let mut si = [0u8; 104];
+            (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+            let mut pi = [0u8; 24];
+            assert_eq!(
+                CreateProcessA(
+                    std::ptr::null(),
+                    cmd_a.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    std::ptr::null_mut(),
+                    b"S:\\child_cwd\0".as_ptr(),
+                    si.as_mut_ptr() as *mut c_void,
+                    pi.as_mut_ptr() as *mut c_void,
+                ),
+                TRUE,
+                "CreateProcessA(NULL, \"app_only\") failed with {}",
+                GetLastError()
+            );
+            let hp = (pi.as_ptr() as *const HANDLE).read_unaligned();
+            let ht = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+            assert_eq!(WaitForSingleObject(hp, 15_000), WAIT_OBJECT_0);
+            let mut code = 0u32;
+            assert_eq!(GetExitCodeProcess(hp, &mut code), TRUE);
+            assert_eq!(code, 12);
             assert_eq!(CloseHandle(ht), TRUE);
             assert_eq!(CloseHandle(hp), TRUE);
         }

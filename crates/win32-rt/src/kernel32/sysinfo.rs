@@ -767,23 +767,28 @@ fn sysdir_result_a(s: &str, buf: *mut u8, size: u32) -> u32 {
     n as u32
 }
 
+pub(crate) const SYSTEM_DIR: &str = "C:\\Windows\\system32";
+#[allow(dead_code)]
+pub(crate) const SYSTEM16_DIR: &str = "C:\\Windows\\System";
+pub(crate) const WINDOWS_DIR: &str = "C:\\Windows";
+
 pub unsafe extern "win64" fn GetSystemDirectoryW(buf: *mut u16, size: u32) -> u32 {
-    sysdir_result_w("C:\\Windows\\system32", buf, size)
+    sysdir_result_w(SYSTEM_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetSystemDirectoryA(buf: *mut u8, size: u32) -> u32 {
-    sysdir_result_a("C:\\Windows\\system32", buf, size)
+    sysdir_result_a(SYSTEM_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetWindowsDirectoryW(buf: *mut u16, size: u32) -> u32 {
-    sysdir_result_w("C:\\Windows", buf, size)
+    sysdir_result_w(WINDOWS_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetWindowsDirectoryA(buf: *mut u8, size: u32) -> u32 {
-    sysdir_result_a("C:\\Windows", buf, size)
+    sysdir_result_a(WINDOWS_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetSystemWindowsDirectoryW(buf: *mut u16, size: u32) -> u32 {
-    sysdir_result_w("C:\\Windows", buf, size)
+    sysdir_result_w(WINDOWS_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetSystemWindowsDirectoryA(buf: *mut u8, size: u32) -> u32 {
-    sysdir_result_a("C:\\Windows", buf, size)
+    sysdir_result_a(WINDOWS_DIR, buf, size)
 }
 pub unsafe extern "win64" fn GetSystemWow64DirectoryW(buf: *mut u16, size: u32) -> u32 {
     sysdir_result_w("C:\\Windows\\SysWOW64", buf, size)
