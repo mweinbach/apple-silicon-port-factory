@@ -249,8 +249,10 @@ agents can consume results deterministically without parsing human-formatted tab
 
 When `--json` is passed:
 - **stdout** contains **only** a single RFC 8259 JSON object conforming to the top-level envelope
-  below (even on usage or runtime errors).
-- Diagnostics, progress logs, and warnings go to **stderr**.
+  below (even on usage, runtime, or guest crash errors).
+- Diagnostics, progress logs, warnings, and (in `port-runner --json`) guest stdout
+  (`STD_OUTPUT_HANDLE` / fd `1`) are routed to **stderr** while the original stdout fd is reserved
+  exclusively (`FD_CLOEXEC`) for the JSON envelope so chatty guests can never interleave with JSON.
 - Shared types and payload builders live in `crates/port-factory/src/json_output.rs`
   (`port_factory::json_output`), intended for direct reuse by composite commands such as
   `audit-game`.
@@ -296,7 +298,7 @@ When `--json` is passed:
 | `game-profiles` | `profiles_count`, `synced_tsv`, `profiles[]`, `detected_binaries[]` |
 | `stats` / `win32-stats` / `shader-formats` / `vfs-resolve` / `bundles` / `steam-scan` | Structured inventory/catalog payloads matching the human-readable summaries |
 | `port-runner --no-run` | `target`, `exe_base`, `preferred_base`, `total_modules`, `pe_modules`, `builtin_modules`, `load_elapsed_ms`, `unresolved_count`, `unresolved_by_dll`, `ops_report` (populated when `--ops-report` is also set) |
-| `port-runner` (live run) | `target`, `stop_reason` (`"guest_exit" \| "max_frames" \| "timeout"`), `frames_presented`, `elapsed_ms`, `max_frames`, `timeout_secs`, `guest_exit_code` |
+| `port-runner` (live run) | `target`, `stop_reason` (`"guest_exit" \| "crash" \| "max_frames" \| "timeout"`), `frames_presented`, `elapsed_ms`, `max_frames`, `timeout_secs`, `guest_exit_code` |
 
 ---
 

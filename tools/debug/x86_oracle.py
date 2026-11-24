@@ -196,25 +196,35 @@ static void run_snippet(State *st, const uint8_t *ins, size_t ins_len, int has_a
 """
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Verify PORT_NAN_TRACE / x86-verify snapshots on real Rosetta x86-64")
-    ap.add_argument("inputs", nargs="+", help="Snapshot JSON file(s) or dump directory")
-    ap.add_argument("--max", type=int, default=64, help="Maximum unique snapshots to test")
-    ap.add_argument("--mxcsr", type=lambda s: int(s, 0), default=None, help="Override MXCSR value for all snapshots (e.g. 0x9fc0 for FTZ|DAZ, 0x1f80 default)")
-    ap.add_argument("--quiet-matches", action="store_true", help="Only print divergences and summary")
-    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
-    args = ap.parse_args()
+def _emit_json_envelope(out_stream, exit_code: int, data, error: str | None) -> int:
+    out_stream.write(json.dumps({
+        "schema_version": 1,
+        "command": "oracle",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "data": data,
+        "error": error,
+    }, indent=2) + "\n")
+    out_stream.flush()
+    return exit_code
 
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, json_mode: bool = False, orig_stdout=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._json_mode = json_mode
+        self._orig_stdout = orig_stdout or sys.stdout
+
+    def error(self, message: str):
+        if self._json_mode:
+            _emit_json_envelope(self._orig_stdout, 2, None, message)
+            self.exit(2)
+        super().error(message)
+
+
+def _run_main(args, orig_stdout) -> int:
     def emit_json_result(exit_code: int, data, error: str | None) -> int:
-        print(json.dumps({
-            "schema_version": 1,
-            "command": "oracle",
-            "ok": exit_code == 0,
-            "exit_code": exit_code,
-            "data": data,
-            "error": error,
-        }, indent=2))
-        return exit_code
+        return _emit_json_envelope(orig_stdout, exit_code, data, error)
 
     snaps = load_snapshots(args.inputs)
     if not snaps:
@@ -396,6 +406,39 @@ def main() -> int:
 
     print(f"\nOracle summary: {len(tested)} tested, {divergences} divergences.")
     return exit_code
+
+
+def main() -> int:
+    want_json = "--json" in sys.argv[1:]
+    orig_stdout = sys.stdout
+    ap = _JsonArgumentParser(
+        description="Verify PORT_NAN_TRACE / x86-verify snapshots on real Rosetta x86-64",
+        json_mode=want_json,
+        orig_stdout=orig_stdout,
+    )
+    ap.add_argument("inputs", nargs="+", help="Snapshot JSON file(s) or dump directory")
+    ap.add_argument("--max", type=int, default=64, help="Maximum unique snapshots to test")
+    ap.add_argument("--mxcsr", type=lambda s: int(s, 0), default=None, help="Override MXCSR value for all snapshots (e.g. 0x9fc0 for FTZ|DAZ, 0x1f80 default)")
+    ap.add_argument("--quiet-matches", action="store_true", help="Only print divergences and summary")
+    ap.add_argument("--json", action="store_true", help="Emit stable schema v1 JSON envelope on stdout")
+    args = ap.parse_args()
+
+    if args.json:
+        sys.stdout = sys.stderr
+    try:
+        return _run_main(args, orig_stdout)
+    except SystemExit:
+        raise
+    except ValueError as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 2, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if args.json:
+            return _emit_json_envelope(orig_stdout, 1, None, str(exc))
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -472,6 +472,63 @@ fn audit_and_verify_commands_emit_valid_json_and_canonical_exit_codes() {
         assert!(val.get("error").and_then(JsonValue::as_str).is_some());
     }
 
+    // 15. Python diagnostic wrappers emit valid Schema v1 JSON error envelopes on failure
+    let (code, val) = run_pf(&["oracle", "--json"]);
+    assert_eq!(code, exit_codes::USAGE_ERROR);
+    assert_eq!(val.get("command").and_then(JsonValue::as_str), Some("oracle"));
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let (code, val) = run_pf(&["oracle", "/nonexistent/port_factory_snaps_dir", "--json"]);
+    assert_eq!(code, exit_codes::USAGE_ERROR);
+    assert_eq!(val.get("command").and_then(JsonValue::as_str), Some("oracle"));
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let (code, val) = run_pf(&["live-probe", "--json"]);
+    assert_eq!(code, exit_codes::USAGE_ERROR);
+    assert_eq!(
+        val.get("command").and_then(JsonValue::as_str),
+        Some("live-probe")
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let (code, val) = run_pf(&[
+        "live-probe",
+        "--pe",
+        clean_s,
+        "--runner",
+        "/nonexistent/port-runner-bin",
+        "--json",
+    ]);
+    assert_eq!(code, exit_codes::RUNTIME_ERROR);
+    assert_eq!(
+        val.get("command").and_then(JsonValue::as_str),
+        Some("live-probe")
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let (code, val) = run_pf(&["bisect-runtime", "--json"]);
+    assert_eq!(code, exit_codes::USAGE_ERROR);
+    assert_eq!(
+        val.get("command").and_then(JsonValue::as_str),
+        Some("bisect-runtime")
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let (code, val) = run_pf(&[
+        "bisect-runtime",
+        "--cmd",
+        "true",
+        "--extra-env",
+        "BAD_NO_EQUALS",
+        "--json",
+    ]);
+    assert_eq!(code, exit_codes::USAGE_ERROR);
+    assert_eq!(
+        val.get("command").and_then(JsonValue::as_str),
+        Some("bisect-runtime")
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&fake_ws);
 }

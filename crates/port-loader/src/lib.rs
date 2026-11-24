@@ -43,14 +43,14 @@ fn emit_cli_json_error(code: i32, msg: &str) {
     #[cfg(feature = "cli")]
     {
         let env = port_factory::json_output::JsonEnvelope::error("port-runner", code, msg);
-        println!("{}", env.to_json_pretty());
+        run_limits::write_json_stdout(&env.to_json_pretty());
     }
     #[cfg(not(feature = "cli"))]
     {
         let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-        println!(
+        run_limits::write_json_stdout(&format!(
             "{{\"schema_version\":1,\"command\":\"port-runner\",\"ok\":false,\"exit_code\":{code},\"data\":null,\"error\":\"{escaped}\"}}"
-        );
+        ));
     }
 }
 
@@ -62,9 +62,14 @@ fn register_builtin_plugins() {
 }
 
 pub fn run_cli() {
+    let want_json = std::env::args().any(|a| a == "--json");
+    if want_json {
+        // Reserve original fd 1 exclusively for the `--json` envelope and send
+        // guest/host stdout writes to stderr so they can never corrupt JSON stdout.
+        run_limits::reserve_json_stdout();
+    }
     register_builtin_plugins();
     init_boot_log();
-    let want_json = std::env::args().any(|a| a == "--json");
     if let Err(e) = real_main() {
         let code = if e.downcast_ref::<CliUsageError>().is_some() {
             run_limits::exit_codes::USAGE_ERROR
@@ -1116,7 +1121,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                     )
                     .u64("elapsed_ms", rep.elapsed_ms)
                     .build();
-                println!("{}", JsonEnvelope::ok("port-runner", data).to_json_pretty());
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
             }
             return Ok(());
         }
@@ -1450,7 +1455,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                     .usize("exports_count", items.len())
                     .val("exports", JsonValue::Array(items))
                     .build();
-                println!("{}", JsonEnvelope::ok("port-runner", data).to_json_pretty());
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
             }
             return Ok(());
         }
@@ -1564,7 +1569,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                     .usize("total_code_bytes", total_bytes)
                     .val("modules", JsonValue::Array(modules))
                     .build();
-                println!("{}", JsonEnvelope::ok("port-runner", data).to_json_pretty());
+                run_limits::write_json_stdout(&JsonEnvelope::ok("port-runner", data).to_json_pretty());
             }
             return Ok(());
         }
@@ -1587,9 +1592,8 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                     .usize("failed", fail)
                     .build();
                 let err_msg = (fail > 0).then(|| format!("{fail} differential test(s) failed"));
-                println!(
-                    "{}",
-                    JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty()
+                run_limits::write_json_stdout(
+                    &JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty(),
                 );
             }
             std::process::exit(code);
@@ -1650,9 +1654,8 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                 let err_msg = (unresolved_count > 0).then(|| {
                     format!("{unresolved_count} unresolved static import(s) across {} DLL(s)", per.len())
                 });
-                println!(
-                    "{}",
-                    JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty()
+                run_limits::write_json_stdout(
+                    &JsonEnvelope::with_status("port-runner", code, data, err_msg).to_json_pretty(),
                 );
             }
             if code != run_limits::exit_codes::OK {
@@ -1812,6 +1815,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         log::info!("port-ios: Windows process exited with code {code}");
+        w::process::record_exit_code(code);
         w::process::run_exit_hooks();
         return Ok(());
     }

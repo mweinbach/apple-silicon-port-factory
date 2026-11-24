@@ -49,6 +49,16 @@ enum TestPeKind {
     CleanExitZero,
     UnresolvedImport,
     SleepLong,
+    CrashUd2,
+    CrashNullDeref,
+    ChattyStdout,
+}
+
+fn emit_lea_rip(code: &mut Vec<u8>, rex: u8, modrm: u8, text_rva: u32, target_rva: u32) {
+    code.extend_from_slice(&[rex, 0x8D, modrm]);
+    let next_rva = text_rva + code.len() as u32 + 4;
+    let disp = (target_rva as i64 - next_rva as i64) as i32;
+    code.extend_from_slice(&disp.to_le_bytes());
 }
 
 /// Synthesize a minimal valid PE32+ x86-64 executable.
@@ -86,12 +96,17 @@ fn build_test_pe(kind: TestPeKind) -> Vec<u8> {
     put_u32(&mut img, opt + 108, 16);
 
     let imports: Vec<(&str, Vec<&str>)> = match kind {
-        TestPeKind::CleanExitZero => vec![("kernel32.dll", vec!["ExitProcess"])],
+        TestPeKind::CleanExitZero | TestPeKind::CrashUd2 | TestPeKind::CrashNullDeref => {
+            vec![("kernel32.dll", vec!["ExitProcess"])]
+        }
         TestPeKind::UnresolvedImport => vec![
             ("kernel32.dll", vec!["ExitProcess"]),
             ("kernel32.dll", vec!["NonExistentWin32ExportForTest"]),
         ],
         TestPeKind::SleepLong => vec![("kernel32.dll", vec!["Sleep", "ExitProcess"])],
+        TestPeKind::ChattyStdout => {
+            vec![("kernel32.dll", vec!["GetStdHandle", "WriteFile", "ExitProcess"])]
+        }
     };
 
     let desc_size = ((imports.len() + 1) * 20) as u32;
@@ -157,14 +172,53 @@ fn build_test_pe(kind: TestPeKind) -> Vec<u8> {
 
     // Build .text machine code
     let mut code = Vec::new();
-    // sub rsp, 0x28
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    // sub rsp, 0x38 (shadow space + 5th arg + 16-byte alignment)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
     match kind {
         TestPeKind::CleanExitZero | TestPeKind::UnresolvedImport => {
             // xor ecx, ecx
             code.extend_from_slice(&[0x31, 0xC9]);
             // call [rip + ExitProcess]
             emit_call_rip(&mut code, 0x1000, iat_rvas[0]);
+            code.push(0xC3);
+        }
+        TestPeKind::CrashUd2 => {
+            // ud2 -> STATUS_ILLEGAL_INSTRUCTION (0xC000001D)
+            code.extend_from_slice(&[0x0F, 0x0B]);
+        }
+        TestPeKind::CrashNullDeref => {
+            // xor eax, eax; mov eax, [rax] -> STATUS_ACCESS_VIOLATION (0xC0000005)
+            code.extend_from_slice(&[0x31, 0xC0, 0x8B, 0x00]);
+        }
+        TestPeKind::ChattyStdout => {
+            // Place a noisy non-JSON message + DWORD written slot at the end of .rdata.
+            let msg = b"GUEST_NOISE_LINE_1\n{not valid json!\n";
+            let msg_off = 0xA00usize;
+            let msg_rva = rdata_rva + (msg_off - rdata_off) as u32;
+            let written_rva = rdata_rva + (0xA80usize - rdata_off) as u32;
+            img[msg_off..msg_off + msg.len()].copy_from_slice(msg);
+
+            // ecx = STD_OUTPUT_HANDLE (-11 = 0xFFFFFFF5)
+            code.push(0xB9);
+            code.extend_from_slice(&(-11i32 as u32).to_le_bytes());
+            // call GetStdHandle
+            emit_call_rip(&mut code, 0x1000, iat_rvas[0]);
+            // mov rcx, rax (hFile)
+            code.extend_from_slice(&[0x48, 0x89, 0xC1]);
+            // lea rdx, [rip + msg] (ModRM 0x15 -> rdx)
+            emit_lea_rip(&mut code, 0x48, 0x15, 0x1000, msg_rva);
+            // mov r8d, msg.len()
+            code.extend_from_slice(&[0x41, 0xB8]);
+            code.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+            // lea r9, [rip + written] (REX.R=0x4C, ModRM 0x0D -> r9)
+            emit_lea_rip(&mut code, 0x4C, 0x0D, 0x1000, written_rva);
+            // mov qword ptr [rsp+0x20], 0 (lpOverlapped = NULL)
+            code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+            // call WriteFile
+            emit_call_rip(&mut code, 0x1000, iat_rvas[1]);
+            // xor ecx, ecx; call ExitProcess(0)
+            code.extend_from_slice(&[0x31, 0xC9]);
+            emit_call_rip(&mut code, 0x1000, iat_rvas[2]);
             code.push(0xC3);
         }
         TestPeKind::SleepLong => {
@@ -383,6 +437,116 @@ fn port_runner_timeout_secs_and_live_json_run() {
         Some("timeout")
     );
     assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn port_runner_crashing_guest_reports_ok_false_and_crash_code() {
+    let dir = unique_temp_dir("crash");
+    let drive_c = dir.join("drive_c");
+    let crash_dir = dir.join("crash_logs");
+    std::fs::create_dir_all(&drive_c).unwrap();
+    std::fs::create_dir_all(&crash_dir).unwrap();
+
+    let ud2_pe = dir.join("crash_ud2.exe");
+    let av_pe = dir.join("crash_av.exe");
+    std::fs::write(&ud2_pe, build_test_pe(TestPeKind::CrashUd2)).unwrap();
+    std::fs::write(&av_pe, build_test_pe(TestPeKind::CrashNullDeref)).unwrap();
+
+    // 1. UD2 -> STATUS_ILLEGAL_INSTRUCTION (0xC000001D, POSIX exit 29)
+    let out = Command::new(env!("CARGO_BIN_EXE_port-runner"))
+        .args(["--pe", ud2_pe.to_str().unwrap(), "--timeout-secs", "15", "--json"])
+        .env("TRANSLATOR_HOME", &drive_c)
+        .env("AW2_CRASH_DIR", &crash_dir)
+        .env("PORT_HEADLESS", "1")
+        .env("PORT_AOT", "0")
+        .env("PORT_NO_BASE_RETRY", "1")
+        .output()
+        .expect("spawn port-runner ud2");
+    let code = out.status.code().expect("exit code");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code, 0x1D, "ud2 should exit 29 (0xC000001D & 0xff)\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let val = parse_and_check_envelope(code, &stdout, &stderr, &["--pe", "crash_ud2.exe", "--json"]);
+    assert_eq!(val.get("ok").and_then(JsonValue::as_bool), Some(false));
+    let data = val.get("data").unwrap();
+    assert_eq!(data.get("stop_reason").and_then(JsonValue::as_str), Some("crash"));
+    assert_eq!(
+        data.get("guest_exit_code").and_then(JsonValue::as_u64),
+        Some(0xC000_001D)
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    // 2. Null dereference -> STATUS_ACCESS_VIOLATION (0xC0000005, POSIX exit 5)
+    let out = Command::new(env!("CARGO_BIN_EXE_port-runner"))
+        .args(["--pe", av_pe.to_str().unwrap(), "--timeout-secs", "15", "--json"])
+        .env("TRANSLATOR_HOME", &drive_c)
+        .env("AW2_CRASH_DIR", &crash_dir)
+        .env("PORT_HEADLESS", "1")
+        .env("PORT_AOT", "0")
+        .env("PORT_NO_BASE_RETRY", "1")
+        .output()
+        .expect("spawn port-runner av");
+    let code = out.status.code().expect("exit code");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code, 0x05, "null deref should exit 5 (0xC0000005 & 0xff)\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let val = parse_and_check_envelope(code, &stdout, &stderr, &["--pe", "crash_av.exe", "--json"]);
+    assert_eq!(val.get("ok").and_then(JsonValue::as_bool), Some(false));
+    let data = val.get("data").unwrap();
+    assert_eq!(data.get("stop_reason").and_then(JsonValue::as_str), Some("crash"));
+    assert_eq!(
+        data.get("guest_exit_code").and_then(JsonValue::as_u64),
+        Some(0xC000_0005)
+    );
+    assert!(val.get("error").and_then(JsonValue::as_str).is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn port_runner_chatty_guest_stdout_does_not_corrupt_json_envelope() {
+    let dir = unique_temp_dir("chatty");
+    let drive_c = dir.join("drive_c");
+    std::fs::create_dir_all(&drive_c).unwrap();
+
+    let chatty_pe = dir.join("chatty.exe");
+    std::fs::write(&chatty_pe, build_test_pe(TestPeKind::ChattyStdout)).unwrap();
+
+    let args = [
+        "--pe",
+        chatty_pe.to_str().unwrap(),
+        "--timeout-secs",
+        "15",
+        "--json",
+    ];
+    let (code, out, err) = run_runner(&drive_c, &args);
+    assert_eq!(code, exit_codes::OK, "stderr:\n{err}");
+    assert!(
+        !out.contains("GUEST_NOISE_LINE_1"),
+        "guest stdout leaked onto JSON stdout:\n{out}"
+    );
+    assert!(
+        err.contains("GUEST_NOISE_LINE_1"),
+        "expected guest stdout to be routed to stderr, got:\n{err}"
+    );
+    let val = parse_and_check_envelope(code, &out, &err, &args);
+    assert_eq!(val.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        val.get("data")
+            .unwrap()
+            .get("stop_reason")
+            .and_then(JsonValue::as_str),
+        Some("guest_exit")
+    );
+    assert_eq!(
+        val.get("data")
+            .unwrap()
+            .get("guest_exit_code")
+            .and_then(JsonValue::as_u64),
+        Some(0)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
