@@ -11,7 +11,63 @@ pub struct ProcessConfig {
 
 static CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 static MANIFEST_GAME_ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static RUNNER_EXE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+#[cfg(not(target_os = "ios"))]
+pub const CS_CDHASH_LEN: usize = 20;
+#[cfg(not(target_os = "ios"))]
+const CS_OPS_STATUS: libc::c_uint = 0;
+#[cfg(not(target_os = "ios"))]
+const CS_OPS_CDHASH: libc::c_uint = 5;
+#[cfg(not(target_os = "ios"))]
+const CS_VALID: u32 = 0x0000_0001;
+#[cfg(not(target_os = "ios"))]
+const CS_KILLED: u32 = 0x0100_0000;
+#[cfg(not(target_os = "ios"))]
+const POSIX_SPAWN_START_SUSPENDED: libc::c_short = 0x0080;
+#[cfg(not(target_os = "ios"))]
+const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+
+#[cfg(not(target_os = "ios"))]
+extern "C" {
+    fn csops(
+        pid: libc::pid_t,
+        ops: libc::c_uint,
+        useraddr: *mut std::ffi::c_void,
+        usersize: libc::size_t,
+    ) -> libc::c_int;
+}
+
+/// Kernel-backed macOS code-signing identity (`csops`) of a trusted native executable.
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerCodeIdentity {
+    pub cdhash: [u8; CS_CDHASH_LEN],
+    pub cs_flags: u32,
+}
+
+/// Immutable pinned identity of the native host runner used by `CreateProcessW`.
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Debug)]
+pub struct TrustedRunner {
+    pub exe_path: std::path::PathBuf,
+    pub identity: RunnerCodeIdentity,
+    pub dev_ino: (u64, u64),
+}
+
+#[cfg(not(target_os = "ios"))]
+struct TrustedRunnerState {
+    runner: Option<TrustedRunner>,
+    locked: bool,
+}
+
+#[cfg(not(target_os = "ios"))]
+static TRUSTED_RUNNER: Mutex<TrustedRunnerState> = Mutex::new(TrustedRunnerState {
+    runner: None,
+    locked: false,
+});
+
+#[cfg(target_os = "ios")]
+static RUNNER_EXE_IOS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Minimal platform-necessary host environment keys allowed to propagate from the
 /// immutable startup host environment into child processes spawned by `CreateProcessW`
@@ -36,7 +92,9 @@ struct TrustedHostEnv {
     child_env: Vec<(String, String)>,
     user: String,
     headless: bool,
+    #[cfg_attr(target_os = "ios", allow(dead_code))]
     runner_exe_override: Option<std::path::PathBuf>,
+    aot_cache_dirs: Vec<std::path::PathBuf>,
     port_env_overrides: Vec<(String, String)>,
 }
 
@@ -48,14 +106,19 @@ where
 {
     let mut child_env = Vec::new();
     let mut user: Option<String> = None;
+    let mut home: Option<std::path::PathBuf> = None;
     let mut headless = false;
     let mut runner_exe_override: Option<std::path::PathBuf> = None;
+    let mut aot_cache_dirs = Vec::new();
     let mut port_env_overrides = Vec::new();
 
     for (k, v) in iter {
         if TRUSTED_CHILD_HOST_ENV_KEYS.contains(&k.as_str()) {
             if k == "USER" && !v.is_empty() {
                 user = Some(v.clone());
+            }
+            if k == "HOME" && !v.is_empty() {
+                home = Some(std::path::PathBuf::from(&v));
             }
             child_env.push((k, v));
             continue;
@@ -71,9 +134,21 @@ where
             }
             continue;
         }
+        if matches!(k.as_str(), "PORT_AOT_DIR" | "AW2_DLL_AOT_DIR" | "PORT_AOT_FALLBACK_DIR") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                aot_cache_dirs.push(std::path::PathBuf::from(trimmed));
+            }
+            continue;
+        }
         if let Some(name) = k.strip_prefix("PORT_ENV_").or_else(|| k.strip_prefix("AW2ENV_")) {
             port_env_overrides.push((name.to_string(), v));
         }
+    }
+
+    if let Some(ref h) = home {
+        aot_cache_dirs.push(h.join("Library/Caches/port-factory/aot"));
+        aot_cache_dirs.push(h.join("Library/Caches/aw2-port/aot"));
     }
 
     child_env.sort_by(|a, b| a.0.cmp(&b.0));
@@ -83,6 +158,7 @@ where
         user: user.unwrap_or_else(|| "player".into()),
         headless,
         runner_exe_override,
+        aot_cache_dirs,
         port_env_overrides,
     }
 }
@@ -91,9 +167,16 @@ fn trusted_host_env() -> &'static TrustedHostEnv {
     TRUSTED_HOST_ENV.get_or_init(|| capture_trusted_host_env_from(std::env::vars()))
 }
 
-/// Snapshot the minimal trusted host environment once at startup before any guest code runs.
+/// Snapshot the minimal trusted host environment once at startup before any guest code runs,
+/// and protect the current native host executable and host AOT cache roots from guest VFS mutation.
 pub fn init_trusted_host_env() {
-    let _ = trusted_host_env();
+    let env = trusted_host_env();
+    if let Ok(cur_exe) = std::env::current_exe() {
+        crate::path::protect_native_runner(&cur_exe);
+    }
+    for dir in &env.aot_cache_dirs {
+        crate::path::protect_native_subtree(dir);
+    }
 }
 
 /// Return the immutable allowlisted host environment for spawning native child processes.
@@ -106,31 +189,268 @@ pub fn trusted_host_headless() -> bool {
     trusted_host_env().headless
 }
 
-/// Register the host `port-runner` binary path used by `CreateProcessW` on macOS
-/// to spawn real Windows x86-64 child processes.
+#[cfg(not(target_os = "ios"))]
+pub fn kill_and_reap_pid(pid: libc::pid_t) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = libc::waitpid(pid, &mut status, 0);
+            if r < 0 && crate::types::last_errno() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+/// Query the kernel-backed dynamic code-signing status and 20-byte CDHash for `pid` via `csops`.
+/// Fails closed unless `CS_VALID` is set, `CS_KILLED` is clear, and CDHash is non-zero.
+#[cfg(not(target_os = "ios"))]
+pub fn query_pid_code_identity(pid: libc::pid_t) -> Result<RunnerCodeIdentity, String> {
+    let mut cs_flags: u32 = 0;
+    let st_rc = unsafe {
+        csops(
+            pid,
+            CS_OPS_STATUS,
+            (&mut cs_flags as *mut u32).cast::<std::ffi::c_void>(),
+            std::mem::size_of::<u32>(),
+        )
+    };
+    if st_rc != 0 {
+        return Err(format!("csops(CS_OPS_STATUS, pid={pid}) failed errno={}", crate::types::last_errno()));
+    }
+    if (cs_flags & CS_VALID) == 0 || (cs_flags & CS_KILLED) != 0 {
+        return Err(format!("pid={pid} code signature not valid (cs_flags={cs_flags:#010x})"));
+    }
+    let mut cdhash = [0u8; CS_CDHASH_LEN];
+    let cd_rc = unsafe {
+        csops(
+            pid,
+            CS_OPS_CDHASH,
+            cdhash.as_mut_ptr().cast::<std::ffi::c_void>(),
+            cdhash.len(),
+        )
+    };
+    if cd_rc != 0 {
+        return Err(format!("csops(CS_OPS_CDHASH, pid={pid}) failed errno={}", crate::types::last_errno()));
+    }
+    if cdhash.iter().all(|&b| b == 0) {
+        return Err(format!("pid={pid} returned all-zero CDHash"));
+    }
+    Ok(RunnerCodeIdentity { cdhash, cs_flags })
+}
+
+/// Verify that a suspended child process (`POSIX_SPAWN_START_SUSPENDED`) has a kernel-valid
+/// code signature whose CDHash exactly matches `expected` before resuming it.
+#[cfg(not(target_os = "ios"))]
+pub fn verify_suspended_child_identity(
+    pid: libc::pid_t,
+    expected: &RunnerCodeIdentity,
+) -> Result<(), String> {
+    let actual = query_pid_code_identity(pid)?;
+    let mut diff = 0u8;
+    for (a, b) in actual.cdhash.iter().zip(expected.cdhash.iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return Err(format!(
+            "child pid={pid} CDHash mismatch (expected {}, got {})",
+            hex_cdhash(&expected.cdhash),
+            hex_cdhash(&actual.cdhash)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "ios"))]
+fn hex_cdhash(bytes: &[u8; CS_CDHASH_LEN]) -> String {
+    let mut s = String::with_capacity(CS_CDHASH_LEN * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+/// Capture the kernel-backed CDHash of an executable path without running any userspace code
+/// in it: if it is the current process binary (same `(st_dev, st_ino)`), reads `csops(getpid())`
+/// directly; otherwise spawns it once suspended (`POSIX_SPAWN_START_SUSPENDED`), queries `csops`,
+/// and immediately kills and reaps the probe process before returning.
+#[cfg(not(target_os = "ios"))]
+pub fn capture_runner_identity(path: &std::path::Path) -> Result<TrustedRunner, String> {
+    use std::os::unix::fs::MetadataExt;
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| format!("canonicalize runner {}: {e}", path.display()))?;
+    let meta = std::fs::metadata(&canon)
+        .map_err(|e| format!("stat runner {}: {e}", canon.display()))?;
+    if !meta.is_file() {
+        return Err(format!("runner {} is not a regular file", canon.display()));
+    }
+    let dev_ino = (meta.dev(), meta.ino());
+
+    let same_as_self = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| (m.dev(), m.ino()) == dev_ino);
+
+    let identity = if same_as_self {
+        query_pid_code_identity(unsafe { libc::getpid() })?
+    } else {
+        probe_executable_code_identity_suspended(&canon)?
+    };
+    Ok(TrustedRunner { exe_path: canon, identity, dev_ino })
+}
+
+#[cfg(not(target_os = "ios"))]
+fn probe_executable_code_identity_suspended(canon: &std::path::Path) -> Result<RunnerCodeIdentity, String> {
+    use std::ffi::CString;
+    let c_path = CString::new(canon.as_os_str().as_encoded_bytes())
+        .map_err(|_| format!("runner path contains NUL: {}", canon.display()))?;
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
+        let rc = libc::posix_spawnattr_init(&mut attr);
+        if rc != 0 {
+            return Err(format!("posix_spawnattr_init failed: {rc}"));
+        }
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        let rc = libc::posix_spawn_file_actions_init(&mut actions);
+        if rc != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(format!("posix_spawn_file_actions_init failed: {rc}"));
+        }
+        let setup_res = (|| -> Result<(), String> {
+            let flags = POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT;
+            let rc = libc::posix_spawnattr_setflags(&mut attr, flags);
+            if rc != 0 {
+                return Err(format!("posix_spawnattr_setflags failed: {rc}"));
+            }
+            for (fd, mode) in [(0, libc::O_RDONLY), (1, libc::O_WRONLY), (2, libc::O_WRONLY)] {
+                let rc = libc::posix_spawn_file_actions_addopen(
+                    &mut actions,
+                    fd,
+                    c"/dev/null".as_ptr(),
+                    mode,
+                    0,
+                );
+                if rc != 0 {
+                    return Err(format!("posix_spawn_file_actions_addopen(fd={fd}) failed: {rc}"));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup_res {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(e);
+        }
+        let argv = [c_path.as_ptr() as *mut libc::c_char, std::ptr::null_mut()];
+        let envp = [std::ptr::null_mut()];
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_path.as_ptr(),
+            &actions,
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+        if rc != 0 {
+            return Err(format!("posix_spawn probe for {} failed: errno={rc}", canon.display()));
+        }
+        let id_res = query_pid_code_identity(pid);
+        // Probe child is never resumed; kill and reap immediately.
+        kill_and_reap_pid(pid);
+        id_res
+    }
+}
+
+/// Register and pin the host `port-runner` binary path and its kernel-backed signing identity
+/// BEFORE guest code runs. Fails closed if the binary cannot be resolved or validated.
 pub fn set_runner_exe(path: std::path::PathBuf) {
-    *RUNNER_EXE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut st = TRUSTED_RUNNER.lock().unwrap_or_else(|e| e.into_inner());
+        if st.locked {
+            log::warn!("set_runner_exe ignored after trusted runner was locked");
+            return;
+        }
+        match capture_runner_identity(&path) {
+            Ok(tr) => {
+                crate::path::protect_native_runner(&tr.exe_path);
+                st.runner = Some(tr);
+            }
+            Err(e) => {
+                log::warn!("set_runner_exe({}): failed to pin kernel code identity: {e}", path.display());
+                st.runner = None;
+            }
+        }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        crate::path::protect_native_runner(&path);
+        *RUNNER_EXE_IOS.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+}
+
+/// Lock the pinned trusted runner identity immutably before guest code begins executing.
+pub fn lock_trusted_runner() {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = trusted_runner();
+        let mut st = TRUSTED_RUNNER.lock().unwrap_or_else(|e| e.into_inner());
+        st.locked = true;
+    }
+}
+
+/// Return the pinned host `TrustedRunner` (canonical path + kernel-backed CDHash), capturing
+/// it lazily once from startup overrides or `current_exe` (`port-runner`/`aw2-loader`) if not
+/// yet locked. Returns `None` (fail closed) if no valid signed runner identity can be pinned.
+#[cfg(not(target_os = "ios"))]
+pub fn trusted_runner() -> Option<TrustedRunner> {
+    let mut st = TRUSTED_RUNNER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref tr) = st.runner {
+        return Some(tr.clone());
+    }
+    if st.locked {
+        return None;
+    }
+    let candidate = trusted_host_env()
+        .runner_exe_override
+        .clone()
+        .or_else(|| {
+            let cur = std::env::current_exe().ok()?;
+            let stem = cur.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            (stem == "port-runner" || stem == "aw2-loader").then_some(cur)
+        })?;
+    match capture_runner_identity(&candidate) {
+        Ok(tr) => {
+            crate::path::protect_native_runner(&tr.exe_path);
+            st.runner = Some(tr.clone());
+            Some(tr)
+        }
+        Err(e) => {
+            log::warn!("trusted_runner({}): failed to capture kernel identity: {e}", candidate.display());
+            None
+        }
+    }
 }
 
 /// Resolve the host `port-runner` binary path for child guest process launch.
 pub fn runner_exe() -> Option<std::path::PathBuf> {
-    if let Some(pb) = RUNNER_EXE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-        if pb.is_file() {
-            return Some(pb);
-        }
+    #[cfg(not(target_os = "ios"))]
+    {
+        trusted_runner().map(|tr| tr.exe_path)
     }
-    if let Some(ref pb) = trusted_host_env().runner_exe_override {
-        if pb.is_file() {
-            return Some(pb.clone());
-        }
+    #[cfg(target_os = "ios")]
+    {
+        RUNNER_EXE_IOS.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    if let Ok(cur) = std::env::current_exe() {
-        let stem = cur.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if stem == "port-runner" || stem == "aw2-loader" {
-            return Some(cur);
-        }
-    }
-    None
 }
 
 /// Replace the entire Windows environment block (used when booting a child process

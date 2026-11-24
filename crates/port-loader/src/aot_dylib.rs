@@ -7,6 +7,9 @@ use std::sync::Arc;
 /// match each dylib to its corresponding mapped non-builtin PE module, and register every
 /// fully-lowered function entry in `x86_runtime::exe`'s native VA dispatch table.
 pub(crate) fn load_aot_dylibs(mods: &[Arc<Module>]) {
+    if x86_runtime::emu::disk_aot_disabled() {
+        return;
+    }
     let Ok(aot_dylibs) =
         std::env::var("PORT_AOT_DYLIB").or_else(|_| std::env::var("AW2_AOT_DYLIB"))
     else {

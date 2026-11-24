@@ -482,14 +482,26 @@ fn host_or_enoent(p: &str) -> Option<std::path::PathBuf> {
 
 fn mkdir_str(p: &str) -> i32 {
     let Some(h) = host_or_enoent(p) else { return -1 };
+    if crate::path::is_protected_host_write(&h) {
+        errno::set(EACCES);
+        return -1;
+    }
     std::fs::create_dir(&h).map(|_| 0).unwrap_or_else(io_err)
 }
 fn rmdir_str(p: &str) -> i32 {
     let Some(h) = host_or_enoent(p) else { return -1 };
+    if crate::path::is_protected_host_remove_or_rename(&h) {
+        errno::set(EACCES);
+        return -1;
+    }
     std::fs::remove_dir(&h).map(|_| 0).unwrap_or_else(io_err)
 }
 fn remove_str(p: &str) -> i32 {
     let Some(h) = host_or_enoent(p) else { return -1 };
+    if crate::path::is_protected_host_remove_or_rename(&h) {
+        errno::set(EACCES);
+        return -1;
+    }
     if h.is_dir() {
         errno::set(EACCES);
         return -1;
@@ -498,6 +510,12 @@ fn remove_str(p: &str) -> i32 {
 }
 fn rename_str(a: &str, b: &str) -> i32 {
     let (Some(ha), Some(hb)) = (host_or_enoent(a), host_or_enoent(b)) else { return -1 };
+    if crate::path::is_protected_host_remove_or_rename(&ha)
+        || crate::path::is_protected_host_remove_or_rename(&hb)
+    {
+        errno::set(EACCES);
+        return -1;
+    }
     if !ha.exists() {
         errno::set(ENOENT);
         return -1;

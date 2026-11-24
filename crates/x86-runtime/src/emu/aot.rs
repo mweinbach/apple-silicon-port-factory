@@ -128,19 +128,42 @@ fn aot_closure_depth() -> u32 {
     env_u32_any(&["PORT_AOT_CLOSURE", "AW2_DLL_AOT_CLOSURE"], DEFAULT_AOT_CLOSURE)
 }
 
+/// Permanently set when running as a guest-spawned child runner (`PORT_CHILD_PROCESS=1`) so
+/// disk-sourced native `.aot` caches, fallback roots, sidecars, and background builds are
+/// bypassed completely and execution stays on the in-memory translator.
+static DISK_AOT_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Permanently disable all disk-sourced native AOT caches, fallback roots, callback sidecars,
+/// profiles, and background cache builds for this process.
+pub fn set_disk_aot_disabled(disabled: bool) {
+    if disabled {
+        DISK_AOT_DISABLED.store(true, Ordering::Release);
+    }
+}
+
+/// `true` when disk-sourced native AOT caches and sidecars are disabled for this process
+/// (either latched via [`set_disk_aot_disabled`] or signalled by `PORT_CHILD_PROCESS=1`).
+pub fn disk_aot_disabled() -> bool {
+    DISK_AOT_DISABLED.load(Ordering::Acquire)
+        || std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1")
+}
+
 /// `PORT_AOT` / `AW2_DLL_AOT`: 0 = JIT only, 1 = load valid caches, 2 = load valid caches and
 /// build missing (installed when done) or outgrown (for the next run) ones from the profile on a
 /// background thread (implies `PORT_JIT_PROFILE=1`). Unset: 2 for game runs, 0 for
 /// `--diff-test` / `--no-run` / `--prewarm-aot` and unit tests. Forced to 0 for one run by the
-/// crash-loop guard (`bg::session_check`).
+/// crash-loop guard (`bg::session_check`) and permanently forced to 0 when [`disk_aot_disabled`].
 pub(super) fn aot_mode() -> u32 {
     #[cfg(test)]
     if TEST_AOT.with(|c| c.get()) {
         return 1;
     }
+    if disk_aot_disabled() {
+        return 0;
+    }
     static V: OnceLock<u32> = OnceLock::new();
     *V.get_or_init(|| {
-        if crate::diag::jit_filter_active() || crate::diag::nan_trace_has_static_ranges() {
+        if disk_aot_disabled() || crate::diag::jit_filter_active() || crate::diag::nan_trace_has_static_ranges() {
             return 0;
         }
         let set = std::env::var_os("PORT_AOT").is_some() || std::env::var_os("AW2_DLL_AOT").is_some();
@@ -192,9 +215,13 @@ fn verify_mode() -> u32 {
 
 /// `PORT_JIT_PROFILE=1` / `AW2_JIT_PROFILE=1` (or AOT mode 2): record and dump the translated image-block profile.
 fn profile_enabled() -> bool {
+    if disk_aot_disabled() {
+        return false;
+    }
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
-        let on = env_u32_any(&["PORT_JIT_PROFILE", "AW2_JIT_PROFILE"], 0) != 0 || aot_mode() == 2;
+        let on = !disk_aot_disabled()
+            && (env_u32_any(&["PORT_JIT_PROFILE", "AW2_JIT_PROFILE"], 0) != 0 || aot_mode() == 2);
         if on {
             log::info!(
                 "emu aot: recording the JIT block profile (PORT_JIT_PROFILE=1 / PORT_AOT=2) -> {}",
@@ -214,6 +241,9 @@ fn bg_delay() -> std::time::Duration {
 /// `PORT_AOT_BUILD` / `AW2_DLL_AOT_BUILD`: None = off; empty = every mapped module with a profile;
 /// otherwise lower-case module-name substrings.
 fn build_request() -> Option<Vec<String>> {
+    if disk_aot_disabled() {
+        return None;
+    }
     let v = env_var_any(&["PORT_AOT_BUILD", "AW2_DLL_AOT_BUILD"])?;
     let v = v.trim().to_ascii_lowercase();
     match v.as_str() {
@@ -267,6 +297,9 @@ fn legacy_cache_dir() -> Option<PathBuf> {
 /// 2. Auto-discovered `<current_exe>/../Resources/AotCache` (when present)
 /// 3. Legacy `~/Library/Caches/aw2-port/aot` (when no explicit writable dir override is set)
 fn fallback_cache_dirs_for(primary: &Path) -> Vec<PathBuf> {
+    if disk_aot_disabled() {
+        return Vec::new();
+    }
     let primary_canon = std::fs::canonicalize(primary).ok();
     let mut dirs = Vec::new();
     let mut push_unique = |cand: PathBuf| {

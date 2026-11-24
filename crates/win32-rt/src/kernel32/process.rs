@@ -978,6 +978,9 @@ fn build_child_runner_command(
     for (win_prefix, host_dir) in crate::path::list_mounts() {
         command.arg("--mount").arg(format!("{win_prefix}={}", host_dir.display()));
     }
+    command.env("PORT_CHILD_PROCESS", "1");
+    command.env("PORT_AOT", "0");
+    command.env("AW2_DLL_AOT", "0");
     command.env("PORT_CHILD_STDIO", "1");
     command.env("PORT_CHILD_EXE_WIN", exe_win);
     command.env("PORT_CHILD_CMDLINE", effective_cmdline);
@@ -992,28 +995,209 @@ fn build_child_runner_command(
 }
 
 #[cfg(not(target_os = "ios"))]
-fn dup_handle_to_stdio(h: HANDLE, allowed_list: Option<&[HANDLE]>) -> Result<std::process::Stdio, u32> {
-    use std::os::unix::io::FromRawFd;
+const POSIX_SPAWN_START_SUSPENDED: libc::c_short = 0x0080;
+#[cfg(not(target_os = "ios"))]
+const POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+
+#[cfg(not(target_os = "ios"))]
+extern "C" {
+    fn posix_spawn_file_actions_addinherit_np(
+        file_actions: *mut libc::posix_spawn_file_actions_t,
+        filedes: libc::c_int,
+    ) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "ios"))]
+struct OwnedFd(i32);
+#[cfg(not(target_os = "ios"))]
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                let _ = libc::close(self.0);
+            }
+            self.0 = -1;
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+enum ChildStdioTarget {
+    Inherit,
+    DevNull,
+    DupFd(OwnedFd),
+}
+
+#[cfg(not(target_os = "ios"))]
+struct ChildStdioPlan {
+    stdin: ChildStdioTarget,
+    stdout: ChildStdioTarget,
+    stderr: ChildStdioTarget,
+}
+
+#[cfg(not(target_os = "ios"))]
+fn dup_handle_to_child_stdio(h: HANDLE, allowed_list: Option<&[HANDLE]>) -> Result<ChildStdioTarget, u32> {
     if h.is_null() || h == INVALID_HANDLE_VALUE {
-        return Ok(std::process::Stdio::null());
+        return Ok(ChildStdioTarget::DevNull);
     }
     if let Some(list) = allowed_list {
         if !list.contains(&h) {
-            return Ok(std::process::Stdio::null());
+            return Ok(ChildStdioTarget::DevNull);
         }
     } else if !is_inheritable_handle(h) {
-        return Ok(std::process::Stdio::null());
+        return Ok(ChildStdioTarget::DevNull);
     }
     let Some((raw_fd, _kind)) = crate::kernel32::file::file_fd_and_kind(h) else {
         return Err(err::ERROR_INVALID_HANDLE);
     };
-    let dup_fd = unsafe { libc::dup(raw_fd) };
+    let dup_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
     if dup_fd < 0 {
         return Err(errno_to_win32(last_errno()));
     }
+    Ok(ChildStdioTarget::DupFd(OwnedFd(dup_fd)))
+}
+
+#[cfg(not(target_os = "ios"))]
+fn spawn_and_verify_suspended_child(
+    exe_path: &std::path::Path,
+    expected_identity: &pr::RunnerCodeIdentity,
+    args: &[std::ffi::OsString],
+    envs: &[(std::ffi::OsString, std::ffi::OsString)],
+    stdio: &ChildStdioPlan,
+    inherit_fd: Option<i32>,
+) -> Result<libc::pid_t, u32> {
+    use std::ffi::CString;
+
+    let c_exe = CString::new(exe_path.as_os_str().as_encoded_bytes())
+        .map_err(|_| err::ERROR_INVALID_PARAMETER)?;
+    let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
+    c_args.push(c_exe.clone());
+    for a in args {
+        c_args.push(
+            CString::new(a.as_encoded_bytes()).map_err(|_| err::ERROR_INVALID_PARAMETER)?,
+        );
+    }
+    let mut argv_ptrs: Vec<*mut libc::c_char> =
+        c_args.iter().map(|s| s.as_ptr() as *mut libc::c_char).collect();
+    argv_ptrs.push(std::ptr::null_mut());
+
+    let mut c_envs: Vec<CString> = Vec::with_capacity(envs.len());
+    for (k, v) in envs {
+        let mut kv = Vec::with_capacity(k.len() + 1 + v.len());
+        kv.extend_from_slice(k.as_encoded_bytes());
+        kv.push(b'=');
+        kv.extend_from_slice(v.as_encoded_bytes());
+        c_envs.push(CString::new(kv).map_err(|_| err::ERROR_INVALID_PARAMETER)?);
+    }
+    let mut envp_ptrs: Vec<*mut libc::c_char> =
+        c_envs.iter().map(|s| s.as_ptr() as *mut libc::c_char).collect();
+    envp_ptrs.push(std::ptr::null_mut());
+
     unsafe {
-        let _ = libc::fcntl(dup_fd, libc::F_SETFD, 0);
-        Ok(std::process::Stdio::from_raw_fd(dup_fd))
+        let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
+        let rc = libc::posix_spawnattr_init(&mut attr);
+        if rc != 0 {
+            return Err(errno_to_win32(rc));
+        }
+        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
+        let rc = libc::posix_spawn_file_actions_init(&mut actions);
+        if rc != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(errno_to_win32(rc));
+        }
+
+        let wire_res = (|| -> Result<(), u32> {
+            // Start suspended in the kernel BEFORE dyld/initializers execute, and close every
+            // parent fd by default except explicitly wired stdio + exit-code channel fds.
+            let rc = libc::posix_spawnattr_setflags(
+                &mut attr,
+                POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT,
+            );
+            if rc != 0 {
+                return Err(errno_to_win32(rc));
+            }
+            for (target_fd, target) in [
+                (0, &stdio.stdin),
+                (1, &stdio.stdout),
+                (2, &stdio.stderr),
+            ] {
+                let open_mode = if target_fd == 0 { libc::O_RDONLY } else { libc::O_WRONLY };
+                let rc = match target {
+                    ChildStdioTarget::Inherit => {
+                        if libc::fcntl(target_fd, libc::F_GETFD) >= 0 {
+                            posix_spawn_file_actions_addinherit_np(&mut actions, target_fd)
+                        } else {
+                            libc::posix_spawn_file_actions_addopen(
+                                &mut actions,
+                                target_fd,
+                                c"/dev/null".as_ptr(),
+                                open_mode,
+                                0,
+                            )
+                        }
+                    }
+                    ChildStdioTarget::DevNull => libc::posix_spawn_file_actions_addopen(
+                        &mut actions,
+                        target_fd,
+                        c"/dev/null".as_ptr(),
+                        open_mode,
+                        0,
+                    ),
+                    ChildStdioTarget::DupFd(fd) => {
+                        libc::posix_spawn_file_actions_adddup2(&mut actions, fd.0, target_fd)
+                    }
+                };
+                if rc != 0 {
+                    return Err(errno_to_win32(rc));
+                }
+            }
+            if let Some(fd) = inherit_fd {
+                let rc = posix_spawn_file_actions_addinherit_np(&mut actions, fd);
+                if rc != 0 {
+                    return Err(errno_to_win32(rc));
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = wire_res {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+            return Err(e);
+        }
+
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_exe.as_ptr(),
+            &actions,
+            &attr,
+            argv_ptrs.as_ptr(),
+            envp_ptrs.as_ptr(),
+        );
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+        if rc != 0 {
+            return Err(errno_to_win32(rc));
+        }
+
+        // Validate the kernel-backed signing status and CDHash of the exact mapped image
+        // while the child is still suspended before dyld/userspace entry.
+        if let Err(reason) = pr::verify_suspended_child_identity(pid, expected_identity) {
+            log::error!(
+                "CreateProcessW: rejecting spawned child pid={pid} before execution: {reason}"
+            );
+            pr::kill_and_reap_pid(pid);
+            return Err(err::ERROR_ACCESS_DENIED);
+        }
+
+        if libc::kill(pid, libc::SIGCONT) != 0 {
+            let e = last_errno();
+            pr::kill_and_reap_pid(pid);
+            return Err(errno_to_win32(e));
+        }
+
+        Ok(pid)
     }
 }
 
@@ -1159,9 +1343,9 @@ pub unsafe extern "win64" fn CreateProcessW(
             crate::path::cwd()
         };
 
-        let Some(runner) = pr::runner_exe() else {
-            log::warn!("CreateProcessW: port-runner executable not located");
-            set_err(err::ERROR_NOT_SUPPORTED);
+        let Some(trusted_runner) = pr::trusted_runner() else {
+            log::warn!("CreateProcessW: failing closed — no verified trusted host runner pinned");
+            set_err(err::ERROR_ACCESS_DENIED);
             return FALSE;
         };
 
@@ -1175,8 +1359,8 @@ pub unsafe extern "win64" fn CreateProcessW(
         let headless = (flags & CREATE_NO_WINDOW) != 0
             || (si_flags & STARTF_USESTDHANDLES) != 0
             || pr::trusted_host_headless();
-        let mut command = build_child_runner_command(
-            &runner,
+        let command = build_child_runner_command(
+            &trusted_runner.exe_path,
             &exe_host,
             &exe_win,
             &effective_cmdline,
@@ -1185,52 +1369,42 @@ pub unsafe extern "win64" fn CreateProcessW(
             headless,
         );
 
-        if (si_flags & STARTF_USESTDHANDLES) != 0 && inherit != FALSE {
+        let stdio_plan = if (si_flags & STARTF_USESTDHANDLES) != 0 && inherit != FALSE {
             let allowed = handle_list.as_deref();
-            match dup_handle_to_stdio(h_stdin, allowed) {
-                Ok(s) => {
-                    command.stdin(s);
-                }
+            let stdin = match dup_handle_to_child_stdio(h_stdin, allowed) {
+                Ok(s) => s,
                 Err(e) => {
                     set_err(e);
                     return FALSE;
                 }
-            }
-            match dup_handle_to_stdio(h_stdout, allowed) {
-                Ok(s) => {
-                    command.stdout(s);
-                }
+            };
+            let stdout = match dup_handle_to_child_stdio(h_stdout, allowed) {
+                Ok(s) => s,
                 Err(e) => {
                     set_err(e);
                     return FALSE;
                 }
-            }
-            match dup_handle_to_stdio(h_stderr, allowed) {
-                Ok(s) => {
-                    command.stderr(s);
-                }
+            };
+            let stderr = match dup_handle_to_child_stdio(h_stderr, allowed) {
+                Ok(s) => s,
                 Err(e) => {
                     set_err(e);
                     return FALSE;
                 }
+            };
+            ChildStdioPlan { stdin, stdout, stderr }
+        } else {
+            ChildStdioPlan {
+                stdin: ChildStdioTarget::Inherit,
+                stdout: ChildStdioTarget::Inherit,
+                stderr: ChildStdioTarget::Inherit,
             }
-        }
+        };
 
         // Dedicated parent-child pipe to report the full 32-bit guest Windows exit code.
-        // Both ends start FD_CLOEXEC so unrelated concurrent spawns never inherit either end;
-        // `pre_exec` clears FD_CLOEXEC solely on the write end for this child, and the child
-        // immediately re-applies FD_CLOEXEC and removes `PORT_EXIT_CODE_FD` at startup.
-        struct OwnedFd(i32);
-        impl Drop for OwnedFd {
-            fn drop(&mut self) {
-                if self.0 >= 0 {
-                    unsafe {
-                        let _ = libc::close(self.0);
-                    }
-                    self.0 = -1;
-                }
-            }
-        }
+        // Both ends start FD_CLOEXEC and the write end is kept >= 3 so it never collides
+        // with child stdio (0/1/2); `POSIX_SPAWN_CLOEXEC_DEFAULT` + `addinherit_np` passes
+        // only this write end to the child.
         let mut exit_pipe = [-1i32; 2];
         if libc::pipe(exit_pipe.as_mut_ptr()) != 0 {
             set_err(errno_to_win32(last_errno()));
@@ -1243,40 +1417,54 @@ pub unsafe extern "win64" fn CreateProcessW(
             }
         }
         let exit_read_fd = OwnedFd(exit_pipe[0]);
-        let exit_write_fd = OwnedFd(exit_pipe[1]);
-        let child_exit_wfd = exit_write_fd.0;
-        command.env("PORT_EXIT_CODE_FD", child_exit_wfd.to_string());
-        {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(move || {
-                let fl = libc::fcntl(child_exit_wfd, libc::F_GETFD);
-                if fl < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(child_exit_wfd, libc::F_SETFD, fl & !libc::FD_CLOEXEC) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        let mut exit_write_fd = OwnedFd(exit_pipe[1]);
+        if exit_write_fd.0 < 3 {
+            let moved = libc::fcntl(exit_write_fd.0, libc::F_DUPFD_CLOEXEC, 3);
+            if moved < 0 {
+                set_err(errno_to_win32(last_errno()));
+                return FALSE;
+            }
+            exit_write_fd = OwnedFd(moved);
         }
+        let child_exit_wfd = exit_write_fd.0;
 
-        let mut child = match command.spawn() {
-            Ok(c) => c,
+        let args: Vec<std::ffi::OsString> =
+            command.get_args().map(|a| a.to_os_string()).collect();
+        let mut envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = command
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|val| (k.to_os_string(), val.to_os_string())))
+            .collect();
+        envs.push((
+            std::ffi::OsString::from("PORT_EXIT_CODE_FD"),
+            std::ffi::OsString::from(child_exit_wfd.to_string()),
+        ));
+
+        let raw_pid = match spawn_and_verify_suspended_child(
+            &trusted_runner.exe_path,
+            &trusted_runner.identity,
+            &args,
+            &envs,
+            &stdio_plan,
+            Some(child_exit_wfd),
+        ) {
+            Ok(p) => p,
             Err(e) => {
-                set_err(e.raw_os_error().map(errno_to_win32).unwrap_or(err::ERROR_ACCESS_DENIED));
+                set_err(e);
                 return FALSE;
             }
         };
-        // Close parent's write end immediately so EOF arrives as soon as the child exits.
+        // Close parent's write end and temporary duped stdio fds immediately so EOF arrives
+        // as soon as the child exits.
         drop(exit_write_fd);
+        drop(stdio_plan);
 
-        let pid = child.id();
+        let pid = raw_pid as u32;
         let proc_obj = Arc::new(ChildProcessObj {
             pid,
             exe_win,
             exit_code: handles::Guarded::new(None),
             terminated_code: handles::Guarded::new(None),
-            os_pid: std::sync::atomic::AtomicI32::new(pid as i32),
+            os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
         });
         child_processes()
             .lock()
@@ -1291,18 +1479,24 @@ pub unsafe extern "win64" fn CreateProcessW(
         let _ = std::thread::Builder::new()
             .name(format!("win32-child-reap-{pid}"))
             .spawn(move || {
-                use std::os::unix::process::ExitStatusExt;
-                let fallback_code = match child.wait() {
-                    Ok(status) => {
-                        if let Some(c) = status.code() {
-                            c as u32
-                        } else if let Some(sig) = status.signal() {
-                            0xC000_0000u32 | (sig as u32)
-                        } else {
-                            0
-                        }
+                let mut status: libc::c_int = 0;
+                let waited = loop {
+                    let r = libc::waitpid(raw_pid, &mut status, 0);
+                    if r < 0 && last_errno() == libc::EINTR {
+                        continue;
                     }
-                    Err(_) => 1,
+                    break r;
+                };
+                let fallback_code = if waited == raw_pid {
+                    if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status) as u32
+                    } else if libc::WIFSIGNALED(status) {
+                        0xC000_0000u32 | (libc::WTERMSIG(status) as u32)
+                    } else {
+                        0
+                    }
+                } else {
+                    1
                 };
                 // Read the full 32-bit Windows exit code written by `exit_process` (if any).
                 let mut code_buf = [0u8; 4];
@@ -2446,6 +2640,9 @@ mod tests {
         assert!(!env_map.contains_key("DYLD_INSERT_LIBRARIES"));
 
         // Runtime-owned protocol controls and serialized guest environment are explicitly present.
+        assert_eq!(env_map.get("PORT_CHILD_PROCESS").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_AOT").and_then(|v| v.as_deref()), Some("0"));
+        assert_eq!(env_map.get("AW2_DLL_AOT").and_then(|v| v.as_deref()), Some("0"));
         assert_eq!(env_map.get("PORT_CHILD_STDIO").and_then(|v| v.as_deref()), Some("1"));
         assert_eq!(env_map.get("PORT_CHILD_EXE_WIN").and_then(|v| v.as_deref()), Some("C:\\guest.exe"));
         assert_eq!(env_map.get("PORT_CHILD_CWD").and_then(|v| v.as_deref()), Some("C:\\"));
@@ -2456,5 +2653,112 @@ mod tests {
         )
         .expect("decode PORT_CHILD_ENV");
         assert_eq!(decoded, guest_vars);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn suspended_spawn_rejects_mismatched_cdhash_before_execution_and_accepts_verified_binary() {
+        let self_id = pr::query_pid_code_identity(unsafe { libc::getpid() })
+            .expect("current macOS binary must have kernel-backed CDHash");
+        let echo_path = std::path::Path::new("/bin/echo");
+        let echo_trusted = pr::capture_runner_identity(echo_path)
+            .expect("/bin/echo must have kernel-backed CDHash");
+        assert_ne!(
+            self_id.cdhash, echo_trusted.identity.cdhash,
+            "test runner and /bin/echo must have distinct kernel CDHashes"
+        );
+
+        let make_pipe = || -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for &fd in &fds {
+                let fl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if fl >= 0 {
+                    unsafe {
+                        let _ = libc::fcntl(fd, libc::F_SETFD, fl | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            (OwnedFd(fds[0]), OwnedFd(fds[1]))
+        };
+
+        let read_all = |rfd: &OwnedFd| -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 128];
+            loop {
+                let n = unsafe { libc::read(rfd.0, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            out
+        };
+
+        // 1. Mismatched expected identity: /bin/echo is spawned suspended, fails CDHash check,
+        //    is SIGKILLed and reaped before userspace executes, and produces 0 bytes on stdout.
+        let (r1, w1) = make_pipe();
+        let stdio1 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w1),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let res_mismatch = spawn_and_verify_suspended_child(
+            echo_path,
+            &self_id,
+            &[std::ffi::OsString::from("MUST_NOT_EXECUTE")],
+            &[],
+            &stdio1,
+            None,
+        );
+        drop(stdio1);
+        assert_eq!(
+            res_mismatch,
+            Err(err::ERROR_ACCESS_DENIED),
+            "mismatched CDHash must fail closed with ERROR_ACCESS_DENIED"
+        );
+        assert!(
+            read_all(&r1).is_empty(),
+            "rejected child must never execute userspace code or emit output"
+        );
+
+        // 2. Matching trusted identity: /bin/echo passes CDHash check, resumes via SIGCONT,
+        //    writes expected stdout, and exits cleanly with status 0.
+        let (r2, w2) = make_pipe();
+        let stdio2 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w2),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let pid = spawn_and_verify_suspended_child(
+            echo_path,
+            &echo_trusted.identity,
+            &[std::ffi::OsString::from("verified-ok")],
+            &[],
+            &stdio2,
+            None,
+        )
+        .expect("matching kernel CDHash must resume and succeed");
+        drop(stdio2);
+        let out = read_all(&r2);
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(out, b"verified-ok\n");
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn capture_runner_identity_fails_closed_on_missing_or_inert_non_executable_file() {
+        let dir = std::env::temp_dir().join(format!("port_factory_id_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inert = dir.join("not_a_binary.txt");
+        std::fs::write(&inert, b"inert non-executable fixture").unwrap();
+
+        assert!(pr::capture_runner_identity(&inert).is_err());
+        assert!(pr::capture_runner_identity(&dir.join("missing_runner")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

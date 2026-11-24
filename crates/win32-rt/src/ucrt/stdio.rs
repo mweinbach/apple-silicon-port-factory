@@ -11,7 +11,7 @@
 //! * One process-wide recursive lock serializes all stream operations and
 //!   backs `_lock_file`/`_unlock_file` (simple, deadlock-free).
 
-use super::errno::{self, EBADF, EINVAL, ENOENT};
+use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT};
 use crate::strings::{from_ansi, from_wide};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -159,7 +159,17 @@ pub fn open_host(win_path: &str, oflag: i32, pmode: i32) -> i32 {
 }
 
 fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32) -> i32 {
-    let mut f = match oflag & 3 {
+    let acc = oflag & 3;
+    let mutating = acc != O_RDONLY || (oflag & (O_APPEND | O_CREAT | O_TRUNC | O_TEMPORARY)) != 0;
+    if mutating && crate::path::is_protected_host_write(host) {
+        errno::set(EACCES);
+        return -1;
+    }
+    if (oflag & O_TEMPORARY) != 0 && crate::path::is_protected_host_remove_or_rename(host) {
+        errno::set(EACCES);
+        return -1;
+    }
+    let mut f = match acc {
         O_WRONLY => libc::O_WRONLY,
         O_RDWR => libc::O_RDWR,
         _ => libc::O_RDONLY,
@@ -269,7 +279,7 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
     }
     let r = libc::close(fd);
     if let Some((i, Some(p))) = ent {
-        if i.temporary {
+        if i.temporary && !crate::path::is_protected_host_remove_or_rename(&p) {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -577,7 +587,9 @@ pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
         }
         if old_info.temporary {
             if let Some(p) = old_path {
-                let _ = std::fs::remove_file(p);
+                if !crate::path::is_protected_host_remove_or_rename(&p) {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
     }

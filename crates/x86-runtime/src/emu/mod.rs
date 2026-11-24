@@ -231,9 +231,19 @@ pub fn aot_profile_dump() {
 #[cfg(target_arch = "aarch64")]
 pub use aot::{
     aot_cached_preferred_base, aot_prewarm_all_mapped, discover_all_callback_roots,
-    flush_runtime_callbacks, image_fingerprint, record_runtime_callback, AotPrewarmReport,
-    CallbackKind, CallbackRoot, ImageFingerprint,
+    disk_aot_disabled, flush_runtime_callbacks, image_fingerprint, record_runtime_callback,
+    set_disk_aot_disabled, AotPrewarmReport, CallbackKind, CallbackRoot, ImageFingerprint,
 };
+
+/// Permanently disable disk-sourced native AOT caches (no-op on non-aarch64 hosts).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn set_disk_aot_disabled(_disabled: bool) {}
+
+/// True when disk-sourced native AOT caches are disabled (always true on non-aarch64 hosts).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn disk_aot_disabled() -> bool {
+    true
+}
 
 /// True if guest block `ip` is currently backed by a live AOT translation (dynamic or static).
 #[cfg(target_arch = "aarch64")]

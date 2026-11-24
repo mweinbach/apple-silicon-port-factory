@@ -909,6 +909,25 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             bail!("--aot-to-o requires an aarch64 host");
         }
     }
+    let child_process_mode = std::env::var_os("PORT_CHILD_PROCESS").is_some_and(|v| v == "1");
+    if child_process_mode {
+        x86_runtime::emu::set_disk_aot_disabled(true);
+        for k in [
+            "PORT_AOT_DIR",
+            "AW2_DLL_AOT_DIR",
+            "PORT_AOT_FALLBACK_DIR",
+            "PORT_AOT_DYLIB",
+            "AW2_AOT_DYLIB",
+            "PORT_AOT_BUILD",
+            "AW2_DLL_AOT_BUILD",
+            "PORT_JIT_PROFILE",
+            "AW2_JIT_PROFILE",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("PORT_AOT", "0");
+        std::env::set_var("AW2_DLL_AOT", "0");
+    }
     let mut temp_static_aot_stage: Option<std::path::PathBuf> = None;
     if let Some(ref out_dir) = args.emit_static_o {
         // Static signed __TEXT cannot self-patch runtime literal slots or LSE2 traps:
@@ -924,8 +943,10 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
             temp_static_aot_stage = Some(stage);
         }
     }
-    if let Some(ref dir) = args.aot_dir {
-        std::env::set_var("PORT_AOT_DIR", dir);
+    if !child_process_mode {
+        if let Some(ref dir) = args.aot_dir {
+            std::env::set_var("PORT_AOT_DIR", dir);
+        }
     }
     let (manifest, manifest_dir) = match target::discover_with_path(args.manifest_path.as_deref()) {
         Some((m, path)) => (Some(m), path.parent().map(|d| d.to_path_buf())),
@@ -944,28 +965,30 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
                 std::env::set_var("SteamGameId", app_id);
             }
         }
-        if let Some(aot_dir) = &m.aot_dir {
-            let trimmed = aot_dir.trim();
-            if !trimmed.is_empty()
-                && args.aot_dir.is_none()
-                && std::env::var_os("PORT_AOT_DIR").is_none()
-                && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
-            {
-                let p = std::path::PathBuf::from(trimmed);
-                let resolved = if p.is_relative() {
-                    manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
-                } else {
-                    p
-                };
-                std::env::set_var("PORT_AOT_DIR", resolved);
+        if !child_process_mode {
+            if let Some(aot_dir) = &m.aot_dir {
+                let trimmed = aot_dir.trim();
+                if !trimmed.is_empty()
+                    && args.aot_dir.is_none()
+                    && std::env::var_os("PORT_AOT_DIR").is_none()
+                    && std::env::var_os("AW2_DLL_AOT_DIR").is_none()
+                {
+                    let p = std::path::PathBuf::from(trimmed);
+                    let resolved = if p.is_relative() {
+                        manifest_dir.as_ref().map_or(p.clone(), |d| d.join(&p))
+                    } else {
+                        p
+                    };
+                    std::env::set_var("PORT_AOT_DIR", resolved);
+                }
             }
-        }
-        if let Some(aot) = &m.aot_dylibs {
-            if !aot.is_empty()
-                && std::env::var_os("PORT_AOT_DYLIB").is_none()
-                && std::env::var_os("AW2_AOT_DYLIB").is_none()
-            {
-                std::env::set_var("PORT_AOT_DYLIB", aot);
+            if let Some(aot) = &m.aot_dylibs {
+                if !aot.is_empty()
+                    && std::env::var_os("PORT_AOT_DYLIB").is_none()
+                    && std::env::var_os("AW2_AOT_DYLIB").is_none()
+                {
+                    std::env::set_var("PORT_AOT_DYLIB", aot);
+                }
             }
         }
     }
@@ -1070,7 +1093,13 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         w::process::set_runner_exe(cur_exe);
     }
     w::process::init_trusted_host_env();
+    w::process::lock_trusted_runner();
     w::process::init_exit_code_channel();
+    if child_process_mode {
+        log::info!(
+            "port-runner: child-process mode — disk-sourced native AOT caches and dylibs disabled (using in-memory translator)"
+        );
+    }
     raise_fd_limit();
 
     x86_runtime::exe::set_gs_reader(w::teb::gs_read);

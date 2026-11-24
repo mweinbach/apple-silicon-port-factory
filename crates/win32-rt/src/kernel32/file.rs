@@ -49,6 +49,11 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const FILE_READ_DATA: u32 = 0x1;
 const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_APPEND_DATA: u32 = 0x4;
+const FILE_WRITE_EA: u32 = 0x10;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+const DELETE_ACCESS: u32 = 0x0001_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
 
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
@@ -193,6 +198,17 @@ impl FileObj {
     pub fn file(&self) -> &File {
         &self.file
     }
+    /// True if this file handle refers to a protected native host runner/bundle file or
+    /// ancestor directory (verified by both stored host path and live POSIX fd inode/`F_GETPATH`).
+    fn is_protected_native(&self) -> bool {
+        if self.kind != FileKind::Disk && self.kind != FileKind::Dir {
+            return false;
+        }
+        self.host_path
+            .as_deref()
+            .is_some_and(path::is_protected_host_remove_or_rename)
+            || path::is_protected_fd(self.fd())
+    }
     /// Return the active raw POSIX fd for I/O, or a Win32 pipe state error if
     /// this is an unconnected named-pipe server.
     fn io_fd(&self) -> Result<i32, u32> {
@@ -225,7 +241,9 @@ impl Drop for FileObj {
         }
         if *self.delete_on_close.lock().unwrap() {
             if let Some(p) = &self.host_path {
-                let _ = if self.kind == FileKind::Dir { std::fs::remove_dir(p) } else { std::fs::remove_file(p) };
+                if !path::is_protected_host_remove_or_rename(p) {
+                    let _ = if self.kind == FileKind::Dir { std::fs::remove_dir(p) } else { std::fs::remove_file(p) };
+                }
             }
         }
         if self.owned {
@@ -643,6 +661,18 @@ fn create_file_inner(name: &str, access: u32, disposition: u32, flags: u32, hand
     let host = host_path(&win)?;
     let exists = std::fs::symlink_metadata(&host).is_ok();
     let is_dir = host.is_dir();
+
+    let mutating_access = wants_write
+        || (access & (DELETE_ACCESS | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
+    let mutating_disp = matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING)
+        || (disposition == OPEN_ALWAYS && !exists);
+    let delete_on_close = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+    if (mutating_access || mutating_disp || delete_on_close) && path::is_protected_host_write(&host) {
+        return Err(err::ERROR_ACCESS_DENIED);
+    }
+    if (delete_on_close || (access & DELETE_ACCESS) != 0) && path::is_protected_host_remove_or_rename(&host) {
+        return Err(err::ERROR_ACCESS_DENIED);
+    }
 
     if is_dir {
         if flags & FILE_FLAG_BACKUP_SEMANTICS == 0 {
@@ -1178,6 +1208,10 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     if n > 0 && buf.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -1455,6 +1489,10 @@ pub unsafe extern "win64" fn WriteFileEx(
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let caller = crate::thread::ensure_current_thread_object();
     let caller_tid = teb::thread_id();
 
@@ -1811,6 +1849,10 @@ pub unsafe extern "win64" fn SetEndOfFile(h: HANDLE) -> BOOL {
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let pos = libc::lseek(f.fd(), 0, libc::SEEK_CUR);
     if pos < 0 || libc::ftruncate(f.fd(), pos) != 0 {
         set_err(errno_to_win32(last_errno()));
@@ -2071,6 +2113,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
     };
     match class {
         0 => {
+            if f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             // FILE_BASIC_INFO: times (0 = don't change).
             let a = (info.add(8) as *const i64).read_unaligned();
             let w = (info.add(16) as *const i64).read_unaligned();
@@ -2092,6 +2138,13 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
                     return FALSE;
                 }
             };
+            if f.is_protected_native()
+                || path::is_protected_host_remove_or_rename(src)
+                || path::is_protected_host_remove_or_rename(&dst)
+            {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             if !replace && dst.exists() {
                 set_err(err::ERROR_ALREADY_EXISTS);
                 return FALSE;
@@ -2107,6 +2160,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         4 | 21 => {
             // FILE_DISPOSITION_INFO(_EX)
             let del = if class == 4 { *info != 0 } else { (info as *const u32).read_unaligned() & 1 != 0 };
+            if del && f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
             *f.delete_on_close.lock().unwrap() = del;
             TRUE
         }
@@ -2115,6 +2172,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             let len = (info as *const i64).read_unaligned();
             if class == 5 {
                 return TRUE; // allocation hint only
+            }
+            if f.is_protected_native() {
+                set_err(err::ERROR_ACCESS_DENIED);
+                return FALSE;
             }
             if libc::ftruncate(f.fd(), len) != 0 {
                 set_err(errno_to_win32(last_errno()));
@@ -2159,6 +2220,10 @@ pub unsafe extern "win64" fn SetFileTime(h: HANDLE, _c: *const FILETIME, a: *con
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if f.is_protected_native() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let g = |p: *const FILETIME| if p.is_null() { 0 } else { (*p).to_u64() as i64 };
     set_times(&f, g(a), g(w))
 }
@@ -2276,6 +2341,10 @@ pub unsafe extern "win64" fn SetFileAttributesW(name: LPCWSTR, attrs: u32) -> BO
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&host) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     let Ok(m) = std::fs::metadata(&host) else {
         set_err(not_found_err(&host));
         return FALSE;
@@ -2315,6 +2384,9 @@ fn path_op(name: &str, op: impl FnOnce(&Path) -> std::io::Result<()>) -> BOOL {
 
 pub unsafe extern "win64" fn CreateDirectoryW(name: LPCWSTR, _sec: *mut c_void) -> BOOL {
     path_op(&from_wide(name), |p| {
+        if path::is_protected_host_write(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EEXIST))
         } else {
@@ -2324,6 +2396,9 @@ pub unsafe extern "win64" fn CreateDirectoryW(name: LPCWSTR, _sec: *mut c_void) 
 }
 pub unsafe extern "win64" fn CreateDirectoryA(name: LPCSTR, _sec: *mut c_void) -> BOOL {
     path_op(&from_ansi(name), |p| {
+        if path::is_protected_host_write(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EEXIST))
         } else {
@@ -2346,21 +2421,34 @@ pub unsafe extern "win64" fn CreateDirectoryExA(
     CreateDirectoryA(new_dir, sec)
 }
 pub unsafe extern "win64" fn RemoveDirectoryW(name: LPCWSTR) -> BOOL {
-    path_op(&from_wide(name), |p| match std::fs::remove_dir(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-        Err(e) => Err(e),
+    path_op(&from_wide(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        match std::fs::remove_dir(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(e) => Err(e),
+        }
     })
 }
 pub unsafe extern "win64" fn RemoveDirectoryA(name: LPCSTR) -> BOOL {
-    path_op(&from_ansi(name), |p| match std::fs::remove_dir(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-        Err(e) => Err(e),
+    path_op(&from_ansi(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
+        match std::fs::remove_dir(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(e) => Err(e),
+        }
     })
 }
 pub unsafe extern "win64" fn DeleteFileW(name: LPCWSTR) -> BOOL {
     path_op(&from_wide(name), |p| {
+        if path::is_protected_host_remove_or_rename(p) {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        }
         if p.is_dir() {
             Err(std::io::Error::from_raw_os_error(libc::EACCES))
         } else {
@@ -2384,6 +2472,10 @@ pub fn move_file(src: &str, dst: &str, flags: u32) -> BOOL {
             return FALSE;
         }
     };
+    if path::is_protected_host_remove_or_rename(&s) || path::is_protected_host_remove_or_rename(&d) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     if !s.exists() {
         set_err(not_found_err(&s));
         return FALSE;
@@ -2443,6 +2535,10 @@ pub unsafe extern "win64" fn CopyFileW(src: LPCWSTR, dst: LPCWSTR, fail_if_exist
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&d) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     if fail_if_exists != 0 && d.exists() {
         set_err(err::ERROR_FILE_EXISTS);
         return FALSE;
@@ -3012,6 +3108,10 @@ pub unsafe extern "win64" fn CreateHardLinkW(new: LPCWSTR, existing: LPCWSTR, _s
             return FALSE;
         }
     };
+    if path::is_protected_host_write(&n) || path::is_protected_host_alias_target(&e) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
     match std::fs::hard_link(&e, &n) {
         Ok(()) => TRUE,
         Err(x) => {
@@ -3029,6 +3129,10 @@ pub unsafe extern "win64" fn CreateSymbolicLinkW(link: LPCWSTR, target: LPCWSTR,
             return 0;
         }
     };
+    if path::is_protected_host_write(&l) || path::is_protected_host_alias_target(&t) {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return 0;
+    }
     match std::os::unix::fs::symlink(&t, &l) {
         Ok(()) => 1,
         Err(x) => {
@@ -5907,6 +6011,10 @@ pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<St
             set_err(err::ERROR_INVALID_HANDLE);
             return std::ptr::null_mut();
         };
+        if writable && f.is_protected_native() {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return std::ptr::null_mut();
+        }
         let cur = f.file().metadata().map(|m| m.len()).unwrap_or(0);
         if size > cur && writable {
             let _ = f.file().set_len(size);
@@ -8019,5 +8127,227 @@ mod tests {
             assert_eq!(cap_ext.last_bytes.load(Ordering::Acquire), 432);
             CloseThreadpoolIo(pio_ext);
         }
+    }
+
+    #[test]
+    fn protected_native_runner_bundle_and_aot_cache_block_guest_writes_renames_deletes_and_aliases() {
+        use crate::kernel32::threads::CloseHandle;
+        let root = std::env::temp_dir().join(format!("port_factory_vfs_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = root.join("MockApp.app");
+        let contents = app.join("Contents");
+        let macos = contents.join("MacOS");
+        let frameworks = contents.join("Frameworks");
+        let codesig = contents.join("_CodeSignature");
+        let resources = contents.join("Resources");
+        let aot_bundle = resources.join("AotCache");
+        let game_dir = resources.join("Game");
+        let host_aot = root.join("HostAotCache");
+        let guest_work = root.join("GuestWork");
+
+        for d in [&macos, &frameworks, &codesig, &aot_bundle, &game_dir, &host_aot, &guest_work] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let runner = macos.join("port-runner");
+        let dylib = frameworks.join("libmetalirconverter.dylib");
+        let plist = contents.join("Info.plist");
+        let sig_res = codesig.join("CodeResources");
+        let manifest = resources.join("game.toml");
+        let bundled_aot = aot_bundle.join("mod.aot");
+        let host_aot_file = host_aot.join("cached.aot");
+        let game_save = game_dir.join("save.dat");
+        let guest_file = guest_work.join("ordinary.txt");
+
+        std::fs::write(&runner, b"INERT-RUNNER-FIXTURE").unwrap();
+        std::fs::write(&dylib, b"INERT-DYLIB-FIXTURE").unwrap();
+        std::fs::write(&plist, b"<plist/>").unwrap();
+        std::fs::write(&sig_res, b"sig").unwrap();
+        std::fs::write(&manifest, b"name = \"Mock\"\n").unwrap();
+        std::fs::write(&bundled_aot, b"AOT1").unwrap();
+        std::fs::write(&host_aot_file, b"AOT2").unwrap();
+        std::fs::write(&game_save, b"save-v1").unwrap();
+        std::fs::write(&guest_file, b"guest-v1").unwrap();
+
+        // Pre-existing host symlink & hardlink aliases outside the bundle pointing to the runner.
+        let ext_symlink = guest_work.join("symlink_to_runner");
+        let ext_hardlink = guest_work.join("hardlink_to_runner");
+        std::os::unix::fs::symlink(&runner, &ext_symlink).unwrap();
+        std::fs::hard_link(&runner, &ext_hardlink).unwrap();
+
+        path::add_mount("Q:\\", &root);
+        let _guard = path::protect_native_runner_scoped_for_test(&runner);
+        path::protect_native_subtree(&host_aot);
+
+        unsafe {
+            // 1. CreateFileW write / truncate / create-always / delete-on-close blocked across
+            //    direct paths, case variants, `..` traversal, bundle files, AOT cache, and aliases.
+            for win_target in [
+                r"Q:\MockApp.app\Contents\MacOS\port-runner",
+                r"Q:\MOCKAPP.APP\CONTENTS\MACOS\PORT-RUNNER",
+                r"Q:\GuestWork\..\MockApp.app\Contents\MacOS\port-runner",
+                r"Q:\MockApp.app\Contents\MacOS\new_helper",
+                r"Q:\MockApp.app\Contents\Frameworks\libmetalirconverter.dylib",
+                r"Q:\MockApp.app\Contents\Info.plist",
+                r"Q:\MockApp.app\Contents\_CodeSignature\CodeResources",
+                r"Q:\MockApp.app\Contents\Resources\game.toml",
+                r"Q:\MockApp.app\Contents\Resources\AotCache\mod.aot",
+                r"Q:\HostAotCache\cached.aot",
+                r"Q:\HostAotCache\new_entry.aot",
+                r"Q:\GuestWork\symlink_to_runner",
+                r"Q:\GuestWork\hardlink_to_runner",
+            ] {
+                let w = to_wide_z(win_target);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_ALWAYS,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(h, INVALID_HANDLE_VALUE, "write open must be blocked for {win_target}");
+                assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED, "expected ACCESS_DENIED for {win_target}");
+
+                let h_del = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_DELETE_ON_CLOSE,
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(h_del, INVALID_HANDLE_VALUE, "DELETE_ON_CLOSE must be blocked for {win_target}");
+                assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            }
+
+            // 2. Delete, rename/replace (target, source, and ancestor dir), copy-over, rmdir,
+            //    SetFileAttributes, hardlink, and symlink creation all fail with ACCESS_DENIED.
+            let w_runner = to_wide_z(r"Q:\MockApp.app\Contents\MacOS\port-runner");
+            let w_guest = to_wide_z(r"Q:\GuestWork\ordinary.txt");
+            let w_dst = to_wide_z(r"Q:\GuestWork\moved_out");
+            let w_app = to_wide_z(r"Q:\MockApp.app");
+            let w_contents = to_wide_z(r"Q:\MockApp.app\Contents");
+            let w_macos = to_wide_z(r"Q:\MockApp.app\Contents\MacOS");
+
+            assert_eq!(DeleteFileW(w_runner.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_runner.as_ptr(), w_dst.as_ptr(), MOVEFILE_REPLACE_EXISTING), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_guest.as_ptr(), w_runner.as_ptr(), MOVEFILE_REPLACE_EXISTING), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_app.as_ptr(), w_dst.as_ptr(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(MoveFileExW(w_contents.as_ptr(), w_dst.as_ptr(), 0), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(ReplaceFileW(w_runner.as_ptr(), w_guest.as_ptr(), std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CopyFileW(w_guest.as_ptr(), w_runner.as_ptr(), FALSE), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(RemoveDirectoryW(w_macos.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(RemoveDirectoryW(w_app.as_ptr()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(SetFileAttributesW(w_runner.as_ptr(), FILE_ATTRIBUTE_NORMAL), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+            let w_new_hl = to_wide_z(r"Q:\GuestWork\new_hl");
+            let w_new_sl = to_wide_z(r"Q:\GuestWork\new_sl");
+            assert_eq!(CreateHardLinkW(w_new_hl.as_ptr(), w_runner.as_ptr(), std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CreateSymbolicLinkW(w_new_sl.as_ptr(), w_runner.as_ptr(), 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CreateSymbolicLinkW(w_new_sl.as_ptr(), w_macos.as_ptr(), 1), 0);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+            // 3. Handle-based mutations on a read-only handle to the protected runner all fail closed.
+            let h_ro = CreateFileW(
+                w_runner.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_ro, INVALID_HANDLE_VALUE, "read-only open stays allowed");
+            let mut written = 0u32;
+            assert_eq!(WriteFile(h_ro, b"X".as_ptr() as *const c_void, 1, &mut written, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(SetEndOfFile(h_ro), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let del_flag: u8 = 1;
+            assert_eq!(SetFileInformationByHandle(h_ro, 4, &del_flag, 1), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let eof_zero: i64 = 0;
+            assert_eq!(SetFileInformationByHandle(h_ro, 6, &eof_zero as *const i64 as *const u8, 8), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            let mut rename_buf = vec![0u8; 20 + 64];
+            rename_buf[0] = 1;
+            let dst_u16 = to_wide(r"Q:\GuestWork\renamed_via_handle");
+            (rename_buf.as_mut_ptr().add(16) as *mut u32).write_unaligned((dst_u16.len() * 2) as u32);
+            std::ptr::copy_nonoverlapping(dst_u16.as_ptr() as *const u8, rename_buf.as_mut_ptr().add(20), dst_u16.len() * 2);
+            assert_eq!(SetFileInformationByHandle(h_ro, 3, rename_buf.as_ptr(), rename_buf.len() as u32), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert!(CreateFileMappingW(h_ro, std::ptr::null_mut(), 0x04, 0, 0, std::ptr::null()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(ReOpenFile(h_ro, GENERIC_WRITE, 0, 0), INVALID_HANDLE_VALUE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            assert_eq!(CloseHandle(h_ro), TRUE);
+
+            // 4. UCRT paths (_open write, _unlink, rename) and shell32 SHFileOperationW also refuse protected files.
+            assert_eq!(crate::ucrt::stdio::open_host(r"Q:\MockApp.app\Contents\MacOS\port-runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::stdio::open_host(r"Q:\GuestWork\symlink_to_runner", 0x0002, 0o644), -1);
+            assert_eq!(crate::ucrt::env::_wunlink(w_runner.as_ptr()), -1);
+            assert_eq!(crate::ucrt::env::_wrename(w_runner.as_ptr(), w_dst.as_ptr()), -1);
+            assert_eq!(crate::ucrt::env::_wrename(w_guest.as_ptr(), w_runner.as_ptr()), -1);
+
+            let mut sh_from = to_wide(r"Q:\MockApp.app\Contents\MacOS\port-runner");
+            sh_from.extend_from_slice(&[0, 0]);
+            let mut sh_op = [0u8; 56];
+            (sh_op.as_mut_ptr().add(8) as *mut u32).write_unaligned(3); // FO_DELETE
+            (sh_op.as_mut_ptr().add(16) as *mut *const u16).write_unaligned(sh_from.as_ptr());
+            assert_eq!(
+                crate::misc::shell32::SHFileOperationW(sh_op.as_mut_ptr()),
+                err::ERROR_ACCESS_DENIED as i32
+            );
+
+            // 5. Ordinary guest data (both in GuestWork and in MockApp.app/Contents/Resources/Game)
+            //    remains fully writable, renamable, and removable.
+            for writable_win in [
+                r"Q:\GuestWork\ordinary.txt",
+                r"Q:\GuestWork\created_by_guest.txt",
+                r"Q:\MockApp.app\Contents\Resources\Game\save.dat",
+                r"Q:\MockApp.app\Contents\Resources\Game\new_save.dat",
+            ] {
+                let w = to_wide_z(writable_win);
+                let h = CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    CREATE_ALWAYS,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE, "ordinary guest path must remain writable: {writable_win}");
+                let mut nw = 0u32;
+                assert_eq!(WriteFile(h, b"ok".as_ptr() as *const c_void, 2, &mut nw, std::ptr::null_mut()), TRUE);
+                assert_eq!(nw, 2);
+                assert_eq!(CloseHandle(h), TRUE);
+            }
+            let w_new_save = to_wide_z(r"Q:\MockApp.app\Contents\Resources\Game\new_save.dat");
+            let w_moved_save = to_wide_z(r"Q:\MockApp.app\Contents\Resources\Game\moved_save.dat");
+            assert_eq!(MoveFileExW(w_new_save.as_ptr(), w_moved_save.as_ptr(), MOVEFILE_REPLACE_EXISTING), TRUE);
+            assert_eq!(DeleteFileW(w_moved_save.as_ptr()), TRUE);
+        }
+
+        // Protected runner binary remained completely untouched.
+        assert_eq!(std::fs::read(&runner).unwrap(), b"INERT-RUNNER-FIXTURE");
+        assert_eq!(std::fs::read(&dylib).unwrap(), b"INERT-DYLIB-FIXTURE");
+        assert_eq!(std::fs::read(&host_aot_file).unwrap(), b"AOT2");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

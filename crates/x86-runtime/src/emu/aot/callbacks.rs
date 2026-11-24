@@ -1371,6 +1371,9 @@ fn format_callback_tsv(
 /// Flush all runtime-discovered callback RVAs to `<cache>/callbacks/<module>-<fp>.tsv`,
 /// merging with any existing entries for the same fingerprint and pruning stale fingerprints.
 pub fn flush_runtime_callbacks() {
+    if super::disk_aot_disabled() {
+        return;
+    }
     let taken = match RUNTIME_CALLBACKS.try_lock() {
         Ok(mut g) => g.take(),
         Err(_) => return,
@@ -1417,6 +1420,9 @@ pub unsafe fn load_replayed_callback_roots(
     base: usize,
     size: usize,
 ) -> Vec<CallbackRoot> {
+    if super::disk_aot_disabled() {
+        return Vec::new();
+    }
     let Some(fp) = image_fingerprint(base, size) else {
         return Vec::new();
     };

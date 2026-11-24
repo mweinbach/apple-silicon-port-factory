@@ -690,4 +690,305 @@ mod macos_guest_process_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Build a minimal PE32+ executable that invokes `CreateProcessW(child_win_path)` with
+    /// `CREATE_NO_WINDOW`, waits on the child via `WaitForSingleObject`, queries its exit code
+    /// via `GetExitCodeProcess`, and exits with that exact DWORD exit code (or `99` on failure).
+    fn build_nested_spawner_pe(child_win_path: &str) -> Vec<u8> {
+        let mut img = vec![0u8; 0xC00];
+        img[0..2].copy_from_slice(b"MZ");
+        let pe_off = 0x80usize;
+        put_u32(&mut img, 0x3C, pe_off as u32);
+        img[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+        let coff = pe_off + 4;
+        put_u16(&mut img, coff, 0x8664);
+        put_u16(&mut img, coff + 2, 3);
+        put_u16(&mut img, coff + 16, 0xF0);
+        put_u16(&mut img, coff + 18, 0x0022);
+
+        let opt = coff + 20;
+        put_u16(&mut img, opt, 0x020B);
+        put_u32(&mut img, opt + 16, 0x1000);
+        put_u32(&mut img, opt + 20, 0x1000);
+        put_u64(&mut img, opt + 24, 0x0000_0001_4000_0000);
+        put_u32(&mut img, opt + 32, 0x1000);
+        put_u32(&mut img, opt + 36, 0x0200);
+        put_u16(&mut img, opt + 40, 6);
+        put_u16(&mut img, opt + 48, 6);
+        put_u32(&mut img, opt + 56, 0x4000);
+        put_u32(&mut img, opt + 60, 0x0200);
+        put_u16(&mut img, opt + 68, 3);
+        put_u16(&mut img, opt + 70, 0x8160);
+        put_u64(&mut img, opt + 72, 0x10_0000);
+        put_u64(&mut img, opt + 80, 0x1000);
+        put_u64(&mut img, opt + 88, 0x10_0000);
+        put_u64(&mut img, opt + 96, 0x1000);
+        put_u32(&mut img, opt + 108, 16);
+        put_u32(&mut img, opt + 112 + 8, 0x2000);
+        put_u32(&mut img, opt + 112 + 12, 40);
+        put_u32(&mut img, opt + 112 + 12 * 8, 0x2080);
+        put_u32(&mut img, opt + 112 + 12 * 8 + 4, 40);
+
+        let sec = opt + 0xF0;
+        let write_sec = |buf: &mut [u8], idx: usize, name: &[u8; 8], vsize: u32, vaddr: u32, rsize: u32, roff: u32, chars: u32| {
+            let o = sec + idx * 40;
+            buf[o..o + 8].copy_from_slice(name);
+            put_u32(buf, o + 8, vsize);
+            put_u32(buf, o + 12, vaddr);
+            put_u32(buf, o + 16, rsize);
+            put_u32(buf, o + 20, roff);
+            put_u32(buf, o + 36, chars);
+        };
+        write_sec(&mut img, 0, b".text\0\0\0", 0x400, 0x1000, 0x400, 0x200, 0x6000_0020);
+        write_sec(&mut img, 1, b".rdata\0\0", 0x400, 0x2000, 0x400, 0x600, 0xC000_0040);
+        write_sec(&mut img, 2, b".data\0\0\0", 0x200, 0x3000, 0x200, 0xA00, 0xC000_0040);
+
+        let rdata_off = 0x600usize;
+        let rva_to_off = |rva: u32| rdata_off + (rva - 0x2000) as usize;
+        put_u32(&mut img, rva_to_off(0x2000), 0x2040);
+        put_u32(&mut img, rva_to_off(0x200C), 0x20C0);
+        put_u32(&mut img, rva_to_off(0x2010), 0x2080);
+
+        let imports: &[(u32, &[u8])] = &[
+            (0x20E0, b"CreateProcessW\0"),
+            (0x20F8, b"WaitForSingleObject\0"),
+            (0x2118, b"GetExitCodeProcess\0"),
+            (0x2138, b"ExitProcess\0"),
+        ];
+        for (i, &(hn_rva, name)) in imports.iter().enumerate() {
+            put_u64(&mut img, rva_to_off(0x2040 + (i as u32) * 8), hn_rva as u64);
+            put_u64(&mut img, rva_to_off(0x2080 + (i as u32) * 8), hn_rva as u64);
+            put_u16(&mut img, rva_to_off(hn_rva), 0);
+            let dst = rva_to_off(hn_rva) + 2;
+            img[dst..dst + name.len()].copy_from_slice(name);
+        }
+        let dll_name = b"KERNEL32.dll\0";
+        img[rva_to_off(0x20C0)..rva_to_off(0x20C0) + dll_name.len()].copy_from_slice(dll_name);
+
+        // UTF-16LE child path at RVA 0x2160.
+        const RVA_CHILD_PATH: u32 = 0x2160;
+        let wide = to_wide_z(child_win_path);
+        for (i, &u) in wide.iter().enumerate() {
+            put_u16(&mut img, rva_to_off(RVA_CHILD_PATH) + i * 2, u);
+        }
+
+        // .data (RVA 0x3000 -> file offset 0xA00): STARTUPINFOW (104 bytes, cb=104), PI (24 bytes), code (4 bytes).
+        const RVA_SI: u32 = 0x3000;
+        const RVA_PI: u32 = 0x3080;
+        const RVA_CODE: u32 = 0x30A0;
+        put_u32(&mut img, 0xA00, 104); // si.cb = 104
+
+        const IAT_CREATE_PROCESS_W: u32 = 0x2080;
+        const IAT_WAIT_SINGLE: u32 = 0x2088;
+        const IAT_GET_EXIT_CODE: u32 = 0x2090;
+        const IAT_EXIT_PROCESS: u32 = 0x2098;
+
+        let mut code = Vec::new();
+        // sub rsp, 0x58 (16-byte aligned before calls; shadow 0x20 + 6 stack args 0x30 + pad 0x08)
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x58]);
+        // rcx = &child_path, rdx = 0, r8 = 0, r9 = 0
+        emit_lea_rip(&mut code, 0x48, 0x0D, 0x1000, RVA_CHILD_PATH);
+        code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+        // [rsp+0x20] = 0 (inherit = FALSE)
+        code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]);
+        // [rsp+0x28] = CREATE_NO_WINDOW (0x0800_0000)
+        code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28]);
+        code.extend_from_slice(&CREATE_NO_WINDOW.to_le_bytes());
+        // [rsp+0x30] = 0 (env), [rsp+0x38] = 0 (cwd)
+        code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0, 0, 0, 0]);
+        code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 0, 0, 0, 0]);
+        // rax = &si; [rsp+0x40] = rax
+        emit_lea_rip(&mut code, 0x48, 0x05, 0x1000, RVA_SI);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x40]);
+        // rax = &pi; [rsp+0x48] = rax
+        emit_lea_rip(&mut code, 0x48, 0x05, 0x1000, RVA_PI);
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x48]);
+        emit_call_rip(&mut code, 0x1000, IAT_CREATE_PROCESS_W);
+        // test eax, eax; jnz ok
+        code.extend_from_slice(&[0x85, 0xC0, 0x75, 0x0B]);
+        // mov ecx, 99; call ExitProcess
+        code.push(0xB9);
+        code.extend_from_slice(&99u32.to_le_bytes());
+        emit_call_rip(&mut code, 0x1000, IAT_EXIT_PROCESS);
+        // ok: mov rbx, qword ptr [rip + RVA_PI] (pi.hProcess)
+        code.extend_from_slice(&[0x48, 0x8B, 0x1D]);
+        let disp_pi = (RVA_PI as i64 - (0x1000 + code.len() as u32 + 4) as i64) as i32;
+        code.extend_from_slice(&disp_pi.to_le_bytes());
+        // WaitForSingleObject(rbx, 15000)
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+        code.push(0xBA);
+        code.extend_from_slice(&15_000u32.to_le_bytes()); // mov edx, 15000
+        emit_call_rip(&mut code, 0x1000, IAT_WAIT_SINGLE);
+        // GetExitCodeProcess(rbx, &code)
+        code.extend_from_slice(&[0x48, 0x89, 0xD9]);
+        emit_lea_rip(&mut code, 0x48, 0x15, 0x1000, RVA_CODE);
+        emit_call_rip(&mut code, 0x1000, IAT_GET_EXIT_CODE);
+        // mov ecx, dword ptr [rip + RVA_CODE]; call ExitProcess
+        code.extend_from_slice(&[0x8B, 0x0D]);
+        let disp_code = (RVA_CODE as i64 - (0x1000 + code.len() as u32 + 4) as i64) as i32;
+        code.extend_from_slice(&disp_code.to_le_bytes());
+        emit_call_rip(&mut code, 0x1000, IAT_EXIT_PROCESS);
+        code.push(0xC3);
+
+        assert!(code.len() <= 0x400);
+        img[0x200..0x200 + code.len()].copy_from_slice(&code);
+        img
+    }
+
+    #[test]
+    fn child_and_nested_grandchild_bypass_disk_aot_cache_while_top_level_prewarm_still_works() {
+        let runner = PathBuf::from(env!("CARGO_BIN_EXE_port-runner"));
+        assert!(runner.is_file(), "port-runner binary missing at {}", runner.display());
+        win32_rt::process::set_runner_exe(runner.clone());
+
+        let dir = std::env::temp_dir().join(format!("port_factory_child_aot_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fake_home = dir.join("fake_home");
+        let default_aot_dir = fake_home.join("Library/Caches/port-factory/aot");
+        let drive_c = dir.join("drive_c");
+        std::fs::create_dir_all(&default_aot_dir).unwrap();
+        std::fs::create_dir_all(&drive_c).unwrap();
+
+        let grandchild_exe = dir.join("grandchild_73.exe");
+        std::fs::write(&grandchild_exe, build_guest_pe(73, GuestMode::ReturnEntry)).unwrap();
+        let spawner_exe = dir.join("nested_spawner.exe");
+        std::fs::write(&spawner_exe, build_nested_spawner_pe("N:\\grandchild_73.exe")).unwrap();
+
+        // 1. Trusted top-level `--prewarm-aot` populates a benign `.aot` cache in fake_home's
+        //    default user cache directory.
+        let prewarm = std::process::Command::new(&runner)
+            .args([
+                "--pe",
+                grandchild_exe.to_str().unwrap(),
+                "--game-dir",
+                dir.to_str().unwrap(),
+                "--drive-c",
+                drive_c.to_str().unwrap(),
+                "--prewarm-aot",
+            ])
+            .env("HOME", &fake_home)
+            .env("PORT_HEADLESS", "1")
+            .env("PORT_AOT_GUARD", "0")
+            .output()
+            .expect("spawn top-level --prewarm-aot");
+        assert!(
+            prewarm.status.success(),
+            "top-level --prewarm-aot failed: {}",
+            String::from_utf8_lossy(&prewarm.stderr)
+        );
+        let aot_entries: Vec<String> = std::fs::read_dir(&default_aot_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            aot_entries.iter().any(|f| f.starts_with("grandchild_73.exe-") && f.ends_with(".aot")),
+            "expected benign top-level .aot artifact in {aot_entries:?}"
+        );
+
+        // 2. Top-level live run (NOT child mode) continues to use the benign prewarmed cache.
+        let top_run = std::process::Command::new(&runner)
+            .args([
+                "--pe",
+                grandchild_exe.to_str().unwrap(),
+                "--game-dir",
+                dir.to_str().unwrap(),
+                "--drive-c",
+                drive_c.to_str().unwrap(),
+            ])
+            .env("HOME", &fake_home)
+            .env("PORT_AOT", "1")
+            .env("PORT_HEADLESS", "1")
+            .env("PORT_AOT_GUARD", "0")
+            .env("PORT_CHILD_STDIO", "1")
+            .env("PORT_CHILD_LOG_STDERR", "1")
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("spawn top-level live run");
+        let top_stderr = String::from_utf8_lossy(&top_run.stderr);
+        assert_eq!(top_run.status.code(), Some(73), "top-level run stderr:\n{top_stderr}");
+        assert!(
+            top_stderr.contains("emu aot: grandchild_73.exe:") && top_stderr.contains("blocks live"),
+            "trusted top-level run must still load prewarmed AOT cache; stderr:\n{top_stderr}"
+        );
+
+        // 3. Child-mode execution (`PORT_CHILD_PROCESS=1`) MUST bypass ALL disk-sourced AOT caches
+        //    (even when HOME default cache, PORT_AOT_DIR, PORT_AOT_FALLBACK_DIR, and PORT_AOT=1
+        //    are all set) and execute cleanly via the in-memory translator.
+        let child_run = std::process::Command::new(&runner)
+            .args([
+                "--pe",
+                grandchild_exe.to_str().unwrap(),
+                "--game-dir",
+                dir.to_str().unwrap(),
+                "--drive-c",
+                drive_c.to_str().unwrap(),
+            ])
+            .env("HOME", &fake_home)
+            .env("PORT_CHILD_PROCESS", "1")
+            .env("PORT_AOT", "1")
+            .env("PORT_AOT_DIR", &default_aot_dir)
+            .env("PORT_AOT_FALLBACK_DIR", &default_aot_dir)
+            .env("PORT_HEADLESS", "1")
+            .env("PORT_AOT_GUARD", "0")
+            .env("PORT_CHILD_STDIO", "1")
+            .env("PORT_CHILD_LOG_STDERR", "1")
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("spawn child-mode run");
+        let child_stderr = String::from_utf8_lossy(&child_run.stderr);
+        assert_eq!(child_run.status.code(), Some(73), "child-mode run stderr:\n{child_stderr}");
+        assert!(
+            child_stderr.contains("child-process mode — disk-sourced native AOT caches and dylibs disabled"),
+            "expected child-mode disk-AOT bypass log; stderr:\n{child_stderr}"
+        );
+        assert!(
+            !child_stderr.contains("blocks live") && !child_stderr.contains("loading cache"),
+            "child-mode execution must never load disk-sourced .aot artifacts; stderr:\n{child_stderr}"
+        );
+
+        // 4. End-to-end nested child: parent -> CreateProcessW(nested_spawner.exe) ->
+        //    nested CreateProcessW(grandchild_73.exe) propagates exit code 73 cleanly through
+        //    verified suspended spawn + CDHash match + disk-AOT bypass.
+        win32_rt::path::add_mount("N:\\", &dir);
+        win32_rt::path::set_cwd("N:\\");
+        win32_rt::process::init_trusted_host_env();
+        win32_rt::process::init_env(&[]);
+
+        unsafe {
+            let mut si = [0u8; 104];
+            (si.as_mut_ptr() as *mut u32).write_unaligned(104);
+            let mut pi = [0u8; 24];
+            let spawner_w = to_wide_z("N:\\nested_spawner.exe");
+            assert_eq!(
+                CreateProcessW(
+                    spawner_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    FALSE,
+                    CREATE_NO_WINDOW,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    si.as_mut_ptr() as *mut c_void,
+                    pi.as_mut_ptr() as *mut c_void,
+                ),
+                TRUE,
+                "nested spawner CreateProcessW failed with {}",
+                GetLastError()
+            );
+            let hp = (pi.as_ptr() as *const HANDLE).read_unaligned();
+            let ht = (pi.as_ptr().add(8) as *const HANDLE).read_unaligned();
+            assert_eq!(WaitForSingleObject(hp, 20_000), WAIT_OBJECT_0);
+            let mut code = 0u32;
+            assert_eq!(GetExitCodeProcess(hp, &mut code), TRUE);
+            assert_eq!(code, 73, "nested child -> grandchild exit code must propagate cleanly");
+            assert_eq!(CloseHandle(ht), TRUE);
+            assert_eq!(CloseHandle(hp), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

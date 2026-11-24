@@ -786,6 +786,9 @@ fn expand_win_source(win_spec: &str, files_only: bool) -> Result<Vec<PathBuf>, i
 }
 
 fn copy_entry(src: &Path, dst: &Path, no_recursion: bool, files_only: bool) -> Result<(), i32> {
+    if crate::path::is_protected_host_write(dst) {
+        return Err(err::ERROR_ACCESS_DENIED as i32);
+    }
     let meta = std::fs::symlink_metadata(src).map_err(|e| io_err_win32(&e))?;
     if meta.file_type().is_symlink() {
         return Err(err::ERROR_ACCESS_DENIED as i32);
@@ -814,6 +817,9 @@ fn copy_entry(src: &Path, dst: &Path, no_recursion: bool, files_only: bool) -> R
 }
 
 fn delete_entry(src: &Path, no_recursion: bool, files_only: bool) -> Result<(), i32> {
+    if crate::path::is_protected_host_remove_or_rename(src) {
+        return Err(err::ERROR_ACCESS_DENIED as i32);
+    }
     let meta = std::fs::symlink_metadata(src).map_err(|e| io_err_win32(&e))?;
     if meta.is_dir() {
         if files_only {
@@ -831,6 +837,11 @@ fn delete_entry(src: &Path, no_recursion: bool, files_only: bool) -> Result<(), 
 }
 
 fn move_entry(src: &Path, dst: &Path, no_recursion: bool, files_only: bool) -> Result<(), i32> {
+    if crate::path::is_protected_host_remove_or_rename(src)
+        || crate::path::is_protected_host_remove_or_rename(dst)
+    {
+        return Err(err::ERROR_ACCESS_DENIED as i32);
+    }
     let meta = std::fs::symlink_metadata(src).map_err(|e| io_err_win32(&e))?;
     if meta.file_type().is_symlink() {
         return Err(err::ERROR_ACCESS_DENIED as i32);
@@ -884,6 +895,11 @@ fn execute_file_op(w_func: u32, from_list: &[String], to_list: &[String], flags:
             let Some(dst) = crate::path::to_host(&to_list[0]) else {
                 return err::ERROR_PATH_NOT_FOUND as i32;
             };
+            if crate::path::is_protected_host_remove_or_rename(&src)
+                || crate::path::is_protected_host_remove_or_rename(&dst)
+            {
+                return err::ERROR_ACCESS_DENIED as i32;
+            }
             if std::fs::symlink_metadata(&src).is_err() {
                 return err::ERROR_FILE_NOT_FOUND as i32;
             }

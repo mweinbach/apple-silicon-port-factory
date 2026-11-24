@@ -1360,7 +1360,7 @@ pub fn activate() {
             .collect(),
         Err(_) => return,
     };
-    if pending.is_empty() {
+    if pending.is_empty() || super::disk_aot_disabled() {
         return;
     }
     if let Some(sel) = build_request() {

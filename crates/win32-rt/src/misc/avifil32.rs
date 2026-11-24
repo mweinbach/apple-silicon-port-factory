@@ -486,6 +486,9 @@ fn parse_riff_avi(bytes: &[u8]) -> Result<ParsedAvi, i32> {
 fn open_avi_file(win_path: &str, mode: u32) -> Result<usize, i32> {
     let host_path = crate::path::to_host(win_path).ok_or(AVIERR_FILEOPEN)?;
     let writable = (mode & (OF_CREATE | OF_WRITE | OF_READWRITE)) != 0;
+    if writable && crate::path::is_protected_host_write(&host_path) {
+        return Err(AVIERR_FILEOPEN);
+    }
     let create = (mode & OF_CREATE) != 0;
 
     let (streams, chunks, dirty) = if create {

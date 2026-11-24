@@ -490,6 +490,340 @@ pub fn device_name(win: &str) -> Option<&'static str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native runner / bundle write-exclusion guardrails
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+struct ProtectedNativeSet {
+    /// Exact canonicalized protected native files (runner binary, Info.plist, game.toml, etc.).
+    files: Vec<PathBuf>,
+    /// Protected native directory subtrees (e.g. `<App>.app/Contents/{MacOS,Frameworks,PlugIns,_CodeSignature,Resources/AotCache}`).
+    subtrees: Vec<PathBuf>,
+    /// Exact `(st_dev, st_ino)` pairs for protected native files (blocks hardlink & symlink aliases).
+    inodes: Vec<(u64, u64)>,
+}
+
+fn protected_native() -> &'static RwLock<ProtectedNativeSet> {
+    static SET: OnceLock<RwLock<ProtectedNativeSet>> = OnceLock::new();
+    SET.get_or_init(|| RwLock::new(ProtectedNativeSet::default()))
+}
+
+fn lexical_normalize_host(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve existing symlink/case-insensitive prefixes via `canonicalize`, preserving any
+/// non-existent tail components (lexically normalized).
+fn resolve_canonical_host(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let norm = lexical_normalize_host(p);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = norm.as_path();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            let mut out = c;
+            for part in tail.into_iter().rev() {
+                out.push(part);
+            }
+            return lexical_normalize_host(&out);
+        }
+        let Some(name) = cur.file_name() else {
+            return norm;
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            return norm;
+        };
+        if parent == cur {
+            return norm;
+        }
+        cur = parent;
+    }
+}
+
+/// Resolve parent symlinks without following a leaf symlink (catches dangling symlinks placed
+/// inside a protected subtree).
+fn resolve_parent_canonical_host(p: &Path) -> PathBuf {
+    let norm = lexical_normalize_host(p);
+    if let (Some(parent), Some(name)) = (norm.parent(), norm.file_name()) {
+        if !parent.as_os_str().is_empty() {
+            return lexical_normalize_host(&resolve_canonical_host(parent).join(name));
+        }
+    }
+    resolve_canonical_host(&norm)
+}
+
+fn path_components_lower(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect()
+}
+
+fn path_eq_ci(a: &Path, b: &Path) -> bool {
+    path_components_lower(a) == path_components_lower(b)
+}
+
+fn path_eq_or_under_ci(candidate: &Path, root: &Path) -> bool {
+    let cc = path_components_lower(candidate);
+    let rc = path_components_lower(root);
+    cc.len() >= rc.len() && cc[..rc.len()] == rc[..]
+}
+
+fn path_is_ancestor_of_ci(candidate: &Path, target: &Path) -> bool {
+    let cc = path_components_lower(candidate);
+    let tc = path_components_lower(target);
+    !cc.is_empty() && cc.len() <= tc.len() && tc[..cc.len()] == cc[..]
+}
+
+fn file_dev_ino(p: &Path, follow_symlinks: bool) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = if follow_symlinks {
+        std::fs::metadata(p).ok()?
+    } else {
+        std::fs::symlink_metadata(p).ok()?
+    };
+    Some((meta.dev(), meta.ino()))
+}
+
+fn push_unique_path(vec: &mut Vec<PathBuf>, p: PathBuf) {
+    if !vec.iter().any(|existing| path_eq_ci(existing, &p)) {
+        vec.push(p);
+    }
+}
+
+fn push_unique_inode(vec: &mut Vec<(u64, u64)>, dev_ino: (u64, u64)) {
+    if !vec.contains(&dev_ino) {
+        vec.push(dev_ino);
+    }
+}
+
+fn record_dir_file_inodes(set: &mut ProtectedNativeSet, dir: &Path, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if meta.is_file() {
+                if let Some(di) = file_dev_ino(&p, false) {
+                    push_unique_inode(&mut set.inodes, di);
+                }
+            } else if meta.is_dir() {
+                record_dir_file_inodes(set, &p, depth + 1);
+            }
+        }
+    }
+}
+
+/// Detect `<Bundle>.app/Contents` when `exe_path` resides inside `<Bundle>.app/Contents/MacOS/...`.
+pub fn detect_app_bundle_contents(exe_path: &Path) -> Option<PathBuf> {
+    let macos_dir = exe_path.parent()?;
+    if !macos_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("MacOS"))
+    {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if !contents_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("Contents"))
+    {
+        return None;
+    }
+    let app_dir = contents_dir.parent()?;
+    if app_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"))
+    {
+        Some(contents_dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Register a native host runner executable (and, when inside a macOS `.app` bundle, its
+/// native bundle code/frameworks/signature/manifest/AOT subtrees) as protected against guest
+/// VFS writes, truncation, metadata edits, renames, replacement, removal, and link aliases.
+///
+/// Ordinary guest data—including `<Bundle>.app/Contents/Resources/Game/`—remains writable.
+pub fn protect_native_runner(exe_path: &Path) {
+    let canon = resolve_canonical_host(exe_path);
+    let mut set = protected_native().write().unwrap_or_else(|e| e.into_inner());
+    push_unique_path(&mut set.files, canon.clone());
+    if let Some(di) = file_dev_ino(&canon, true) {
+        push_unique_inode(&mut set.inodes, di);
+    }
+
+    if let Some(contents_dir) = detect_app_bundle_contents(&canon) {
+        for sub in ["MacOS", "Frameworks", "PlugIns", "_CodeSignature", "Resources/AotCache"] {
+            let dir = resolve_canonical_host(&contents_dir.join(sub));
+            push_unique_path(&mut set.subtrees, dir.clone());
+            record_dir_file_inodes(&mut set, &dir, 0);
+        }
+        for file_rel in ["Info.plist", "PkgInfo", "Resources/game.toml"] {
+            let f = resolve_canonical_host(&contents_dir.join(file_rel));
+            push_unique_path(&mut set.files, f.clone());
+            if let Some(di) = file_dev_ino(&f, true) {
+                push_unique_inode(&mut set.inodes, di);
+            }
+        }
+    }
+}
+
+/// Register a host native artifact subtree (such as the host AOT block-cache directory) as
+/// protected against guest VFS writes, truncation, renames, replacement, removal, and link aliases.
+pub fn protect_native_subtree(dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let canon = resolve_canonical_host(dir);
+    let mut set = protected_native().write().unwrap_or_else(|e| e.into_inner());
+    push_unique_path(&mut set.subtrees, canon.clone());
+    record_dir_file_inodes(&mut set, &canon, 0);
+}
+
+/// True if `host` (following symlinks or via its canonical parent or inode) targets a
+/// protected native runner file or protected bundle subtree that guest VFS operations must
+/// not create, write, truncate, modify attributes on, or overwrite.
+pub fn is_protected_host_write(host: &Path) -> bool {
+    let set = protected_native().read().unwrap_or_else(|e| e.into_inner());
+    if set.files.is_empty() && set.subtrees.is_empty() && set.inodes.is_empty() {
+        return false;
+    }
+    let canon = resolve_canonical_host(host);
+    let parent_join = resolve_parent_canonical_host(host);
+
+    for cand in [&canon, &parent_join] {
+        if set.files.iter().any(|f| path_eq_ci(cand, f)) {
+            return true;
+        }
+        if set.subtrees.iter().any(|sub| path_eq_or_under_ci(cand, sub)) {
+            return true;
+        }
+    }
+    if !set.inodes.is_empty() {
+        if let Some(di) = file_dev_ino(host, true) {
+            if set.inodes.contains(&di) {
+                return true;
+            }
+        }
+        if let Some(di) = file_dev_ino(host, false) {
+            if set.inodes.contains(&di) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if `host` targets a protected native file/subtree OR any ancestor directory of a
+/// protected native file/subtree (prevents renaming, replacing, or deleting `<App>.app`,
+/// `<App>.app/Contents`, or the runner's containing directory).
+pub fn is_protected_host_remove_or_rename(host: &Path) -> bool {
+    if is_protected_host_write(host) {
+        return true;
+    }
+    let set = protected_native().read().unwrap_or_else(|e| e.into_inner());
+    if set.files.is_empty() && set.subtrees.is_empty() {
+        return false;
+    }
+    let canon = resolve_canonical_host(host);
+    let parent_join = resolve_parent_canonical_host(host);
+    for cand in [&canon, &parent_join] {
+        if set.files.iter().any(|f| path_is_ancestor_of_ci(cand, f)) {
+            return true;
+        }
+        if set.subtrees.iter().any(|sub| path_is_ancestor_of_ci(cand, sub)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `host` is a protected file, subtree, or ancestor that guest hardlinks/symlinks
+/// must not alias.
+pub fn is_protected_host_alias_target(host: &Path) -> bool {
+    is_protected_host_remove_or_rename(host)
+}
+
+/// True if an open POSIX descriptor refers to a protected native file or subtree (verified via
+/// `fstat` inode match and macOS `F_GETPATH`).
+pub fn is_protected_fd(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let (has_inodes, matched_inode) = {
+        let set = protected_native().read().unwrap_or_else(|e| e.into_inner());
+        if set.files.is_empty() && set.subtrees.is_empty() && set.inodes.is_empty() {
+            return false;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let matched = if unsafe { libc::fstat(fd, &mut st) } == 0 {
+            set.inodes.contains(&(st.st_dev as u64, st.st_ino as u64))
+        } else {
+            false
+        };
+        (!set.inodes.is_empty(), matched)
+    };
+    let _ = has_inodes;
+    if matched_inode {
+        return true;
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                return is_protected_host_remove_or_rename(Path::new(s));
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+pub(crate) struct ProtectedNativeTestGuard {
+    prev: ProtectedNativeSet,
+}
+
+#[cfg(test)]
+impl Drop for ProtectedNativeTestGuard {
+    fn drop(&mut self) {
+        *protected_native().write().unwrap_or_else(|e| e.into_inner()) = self.prev.clone();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn protect_native_runner_scoped_for_test(exe_path: &Path) -> ProtectedNativeTestGuard {
+    let prev = protected_native().read().unwrap_or_else(|e| e.into_inner()).clone();
+    protect_native_runner(exe_path);
+    ProtectedNativeTestGuard { prev }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
