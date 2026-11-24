@@ -289,7 +289,19 @@ pub(crate) fn file_fd_and_kind(h: HANDLE) -> Option<(i32, FileKind)> {
     get_file(h).map(|f| (f.fd(), f.kind))
 }
 
-/// Wrap an existing POSIX fd in a non-owning `FileObj` handle (used by CRT `_get_osfhandle` / inherited stdio).
+/// Wrap an owned POSIX fd in an owning `FileObj` handle (used by CRT `_get_osfhandle`).
+pub(crate) fn wrap_owned_fd(
+    fd: std::os::fd::OwnedFd,
+    kind: FileKind,
+    win_path: String,
+    access: u32,
+) -> HANDLE {
+    let o = FileObj::new(File::from(fd), kind, win_path, None, access, 0);
+    handles::insert(Arc::new(o))
+}
+
+/// Wrap an existing POSIX fd in a non-owning `FileObj` handle (used by tests and non-owning wrappers).
+#[allow(dead_code)]
 pub(crate) fn wrap_non_owned_fd(fd: i32, kind: FileKind, win_path: String, access: u32) -> HANDLE {
     let mut o = FileObj::new(
         unsafe { File::from_raw_fd(fd) },
