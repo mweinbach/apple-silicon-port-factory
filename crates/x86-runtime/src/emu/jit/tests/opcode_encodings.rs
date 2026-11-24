@@ -20,7 +20,9 @@ macro_rules! check_words {
     };
 }
 
+mod catalog;
 mod core_cases;
+mod direct_cases;
 mod extension_cases;
 mod vector_cases;
 
@@ -31,6 +33,7 @@ struct Cases {
 }
 
 struct Instruction {
+    case_id: usize,
     case: String,
     page: String,
     asm: String,
@@ -38,15 +41,30 @@ struct Instruction {
 }
 
 impl Cases {
+    fn registered() -> Self {
+        let mut cases = Self::default();
+        core_cases::register(&mut cases);
+        vector_cases::register(&mut cases);
+        extension_cases::register(&mut cases);
+        direct_cases::register(&mut cases);
+        assert!(!cases.words.is_empty(), "empty opcode corpus");
+        cases
+    }
+
     fn check(&mut self, name: &str, expected: &[(&str, &str)], emit: impl FnOnce(&mut Asm)) {
         // Virtual addresses used for patching are independent of the ordinary RW storage.
         let mut storage = vec![0_u32; expected.len() + 1];
         let mut a = Asm::new(storage.as_mut_ptr(), 0x1000, storage.len());
         emit(&mut a);
         assert!(!a.overflow, "{name}: Asm overflow");
-        assert_eq!(a.pos, expected.len(), "{name}: emitted word count");
-        for (index, (&(page, asm), emitted)) in expected.iter().zip(storage).enumerate() {
+        self.record(name, expected, &storage[..a.pos]);
+    }
+
+    fn record(&mut self, name: &str, expected: &[(&str, &str)], words: &[u32]) {
+        assert_eq!(words.len(), expected.len(), "{name}: emitted word count");
+        for (index, (&(page, asm), &emitted)) in expected.iter().zip(words).enumerate() {
             self.words.push(Instruction {
+                case_id: self.count + 1,
                 case: format!("{name}[{index}]"),
                 page: page.to_owned(),
                 asm: asm.to_owned(),
@@ -243,7 +261,7 @@ fn clang_word(line: &str) -> Option<u32> {
     parts.next().is_none().then(|| u32::from_le_bytes(word))
 }
 
-fn verify(table: &Table, words: &[Instruction], listing: &str) -> Result<(), String> {
+fn verify_assembly(words: &[Instruction], listing: &str) -> Result<(), String> {
     let mut lines = listing.lines().map(str::trim).filter(|l| {
         l.starts_with(".Lcase_") || (!l.starts_with("//") && l.contains("// encoding:"))
     });
@@ -261,16 +279,6 @@ fn verify(table: &Table, words: &[Instruction], listing: &str) -> Result<(), Str
                 context()
             )
         })?;
-        let patterns = table
-            .get(&word.page)
-            .ok_or_else(|| format!("{}: missing Arm page", context()))?;
-        if !patterns.iter().any(|pattern| pattern.matches(word.emitted)) {
-            return Err(format!(
-                "{}: emitted {:#010x} does not match the Arm page (clang {expected:#010x})",
-                context(),
-                word.emitted
-            ));
-        }
         if word.emitted != expected {
             return Err(format!(
                 "{}: emitted {:#010x}, clang assembled {expected:#010x}",
@@ -285,6 +293,21 @@ fn verify(table: &Table, words: &[Instruction], listing: &str) -> Result<(), Str
     Ok(())
 }
 
+fn verify(table: &Table, words: &[Instruction], listing: &str) -> Result<(), String> {
+    for word in words {
+        let patterns = table
+            .get(&word.page)
+            .ok_or_else(|| format!("{}: missing Arm page {}", word.case, word.page))?;
+        if !patterns.iter().any(|pattern| pattern.matches(word.emitted)) {
+            return Err(format!(
+                "{} ({:?}): emitted {:#010x} does not match the Arm page {}",
+                word.case, word.asm, word.emitted, word.page
+            ));
+        }
+    }
+    verify_assembly(words, listing)
+}
+
 #[test]
 fn a64_opcode_encodings() {
     let Some(path) = std::env::var_os("PORT_A64_ENCODINGS") else {
@@ -295,11 +318,7 @@ fn a64_opcode_encodings() {
     let tsv = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("PORT_A64_ENCODINGS={path:?}: {e}"));
     let table = parse_table(&tsv).unwrap_or_else(|e| panic!("PORT_A64_ENCODINGS={path:?}: {e}"));
-    let mut cases = Cases::default();
-    core_cases::register(&mut cases);
-    vector_cases::register(&mut cases);
-    extension_cases::register(&mut cases);
-    assert!(!cases.words.is_empty(), "empty opcode corpus");
+    let cases = Cases::registered();
     verify(&table, &cases.words, &assemble(&cases.words)).unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
         "a64_opcode_encodings: verified {} cases ({} emitted words, {} pages in reference)",
@@ -341,6 +360,7 @@ fn verifier_distinguishes_opcode_operand_and_instruction_count() {
     );
     let table = parse_table(&tsv).unwrap();
     let mut word = Instruction {
+        case_id: 1,
         case: "synthetic".into(),
         page: "alias".into(),
         asm: "sample".into(),

@@ -10,6 +10,7 @@ for the port factory. Run it via `cargo opsdb -- <command>` or `./tools/opsdb.sh
 | Component | Code & Data | What it does |
 |---|---|---|
 | **x86-64 → ARM64 Ops DB** | `crates/port-factory/src/ops_db/`, `db/ops_x86_to_arm64.tsv` | Canonical catalog of **48** op families (**46** `JIT_ARM64` + **2** honest `GENERIC_INTERP` x87/legacy families), **989** mnemonics, and `FastOp` kinds `K_1..=K_124`. |
+| **A64 encoding forms and JIT emitter matches** | [A64 catalog](../db/a64_encodings.tsv), [emitter matches](../db/a64_emitter_matches.tsv) | Look up an Arm operation's encodings, operand fields and feature requirements, or find the form used by a JIT test word. [Verification and regeneration](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit) |
 | **Win32 API DB** | `crates/port-factory/src/win32_db.rs`, `db/win32_apis.tsv` | Indexes all **3,241** exports across **86** builtin DLLs in `crates/win32-rt/src/`, including `api-ms-win-*` normalization and `kernel32 ↔ ntdll` forwarding. |
 | **PE Coverage Scanner** | `crates/port-factory/src/scanner.rs`, `db/ops_profiles.tsv` | Disassembles any Windows x86-64 `.exe`/`.dll` and measures ARM64 JIT coverage, instruction mix, and Win32 import readiness. |
 | **Offline `.aot` Prewarmer** | `crates/x86-runtime/src/emu/aot.rs`, `port-factory aot-prewarm` | Drives `port-runner --prewarm-aot` to compile PE `.pdata` + exports + entry + static CFG closures into relocatable ARM64 `.aot` block caches ahead of launch. |

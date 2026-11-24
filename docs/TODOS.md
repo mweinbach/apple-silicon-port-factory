@@ -54,6 +54,8 @@ Related docs: [What's Next](WHATS_NEXT.md) · [What's Needed](WHATS_NEEDED.md) �
 
 - [x] Check finished JIT instruction words against Arm's encoding diagrams and independently
       assembled operands. [Run the A64 emitter test](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit)
+- [x] Check in the complete A64 encoding catalog and precompute the encoding form for each
+      emitted test word. [A64 catalog](../db/a64_encodings.tsv) · [Emitter matches](../db/a64_emitter_matches.tsv)
 - [x] **Parallel offline `.aot` prewarming (`crates/x86-runtime/src/emu/aot.rs`):** Parallelized
       block translation in `aot_prewarm_all_mapped` across `PORT_AOT_THREADS` workers with reused
       `WorkerCaches` and deterministic ascending-IP output (bit-for-bit identical across 1/2/4/8

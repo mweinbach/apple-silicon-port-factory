@@ -48,14 +48,55 @@ cargo x86-verify /path/to/Game.exe --fp-only --rva 0x1000..0x200000
 
 #### Check the A64 words emitted by the JIT
 
-On an Apple Silicon Mac with Xcode command-line tools, set `PORT_A64_ENCODINGS` to
-an external TSV of Arm instruction patterns. Each case calls the real `Asm`
-method, checks its output against the expected instruction page, and compares
-every word with assembly for the same operands. This also checks register order,
-immediate values, addressing modes, and patched PC-relative displacements.
-The reference check skips when the variable is unset.
+[The A64 catalog](../db/a64_encodings.tsv) contains all 4,429 instruction encodings and
+314 alias forms in Arm's September 2026 open-source A-profile release. [The emitter
+matches](../db/a64_emitter_matches.tsv) record each emitted test word, its assembly, its
+intended Arm operation page and the IDs matching both the bits and the assembly mnemonic.
+Each row keeps its case number and word position so repeated instructions in a patched
+sequence are traceable.
+For example, the following commands show both register widths of `LSLV` and the cases that
+emit them.
 
-To build the TSV, extract an Arm A64 ISA XML release outside the checkout and
+```sh
+awk -F '\t' '$1 == "lslv"' db/a64_encodings.tsv
+awk -F '\t' '$5 == "lslv"' db/a64_emitter_matches.tsv
+cargo test -p x86-runtime --lib --target aarch64-apple-darwin -- a64_emitter_matches
+```
+
+The test re-emits the corpus and checks the committed matches offline. Clang independently
+assembled every reference word when the matches were generated, including its register,
+immediate and displacement operands. To refresh the matches after editing the emitters or cases,
+run from the repository root on Apple Silicon with the Xcode command-line tools installed.
+
+```sh
+out_dir="$(mktemp -d)"
+PORT_A64_MATCHES_OUT="$out_dir/matches.tsv" \
+  cargo test -p x86-runtime --lib --target aarch64-apple-darwin -- a64_emitter_matches --nocapture &&
+  mv "$out_dir/matches.tsv" db/a64_emitter_matches.tsv
+```
+
+For a catalog lookup, read `pattern` from bit 31 to bit 0. A word must match every `0`
+and `1` and may take either value at an `x`. Reject a word matching any comma-separated
+pattern in `exclude`. The `mnemonics` column lists the spellings in Arm's assembly grammar,
+including suffixed forms such as `sxtl2`. The `fields` column gives the diagram's variable
+fields as `name[high:low]`. An ID such as `CSINC_64_condsel/CSET` identifies an alias and its base
+encoding. `condition` retains Arm's feature and operand requirements. The word patterns
+assume all architectural features are available. `preferred` records Arm's disassembly
+preference for an alias. A matched row establishes an encoding for the supplied assembly.
+Use the feature condition when selecting an instruction for a particular CPU.
+
+To reproduce the full catalog, download the pinned BSD-licensed archive and pass it to the
+generator. It checks the archive SHA-256 and can compare the result byte for byte with the
+tracked TSV. Omit `--check` to write the catalog to stdout.
+[Arm archive and license](../THIRD_PARTY_NOTICES.md#arm-a64-encoding-data)
+
+```sh
+python3 tools/debug/a64_catalog.py /path/to/AARCHMRS_OPENSOURCE_A_profile_FAT-2026-09.tar.gz --check
+```
+
+For an additional independent check, set `PORT_A64_ENCODINGS` to an external TSV of Arm
+instruction patterns. This test also assembles the operands with Clang. To build the
+external TSV, extract an Arm A64 ISA XML release outside the checkout and
 pass the directory containing its instruction XML files to the converter.
 Its TSV has a `page` column for the instruction's XML filename stem and a `pattern`
 column with 32 bits in most-significant-first order. A variable bit is written as
