@@ -112,6 +112,11 @@ pub struct ComObj<V: 'static, T> {
 impl<V: 'static, T> ComObj<V, T> {
     /// Heap-allocate with refcount 1 and return the interface pointer.
     pub fn create(vtbl: &'static V, inner: T) -> *mut Self {
+        let count = std::mem::size_of::<V>() / std::mem::size_of::<usize>();
+        if count > 0 {
+            let slots = unsafe { std::slice::from_raw_parts(vtbl as *const V as *const usize, count) };
+            crate::com::register_vtable_ptrs(slots);
+        }
         Box::into_raw(Box::new(ComObj { vtbl, refs: AtomicU32::new(1), inner }))
     }
     pub unsafe fn add_ref(this: *mut Self) -> u32 {

@@ -775,7 +775,7 @@ pub fn fls_set(i: u32, v: usize) {
     })
 }
 
-fn run_fls_callbacks() {
+pub(crate) fn run_fls_callbacks() {
     let vals: Vec<usize> = FLS.with(|f| std::mem::take(&mut *f.borrow_mut()));
     for (i, v) in vals.into_iter().enumerate() {
         if v == 0 || i >= MAX_FLS_SLOTS {
