@@ -3889,6 +3889,10 @@ const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
 
 const MAX_WATCHED_VNODE_FDS: usize = 512;
 #[cfg(target_vendor = "apple")]
+const DIR_WATCH_FD_HEADROOM: usize = 64;
+#[cfg(target_vendor = "apple")]
+const DIR_WATCH_EMFILE_BACKOFF_FDS: usize = 16;
+#[cfg(target_vendor = "apple")]
 const DIR_WATCH_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PENDING_DIR_CHANGES: usize = 4096;
 
@@ -3926,14 +3930,26 @@ fn dir_entry_from_meta(m: &std::fs::Metadata) -> DirSnapEntry {
     }
 }
 
-fn snapshot_dir_rec(root: &Path, rel_prefix: &str, subtree: bool, out: &mut BTreeMap<String, DirSnapEntry>) {
+fn snapshot_dir_rec(
+    root: &Path,
+    rel_prefix: &str,
+    subtree: bool,
+    out: &mut BTreeMap<String, DirSnapEntry>,
+) -> Result<(), i32> {
     let dir_path = if rel_prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(rel_prefix.replace('\\', "/"))
     };
-    let Ok(rd) = std::fs::read_dir(&dir_path) else {
-        return;
+    let rd = match std::fs::read_dir(&dir_path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            let raw = e.raw_os_error().unwrap_or(libc::EIO);
+            if raw == libc::ENOENT || (!rel_prefix.is_empty() && (raw == libc::ENOTDIR || raw == libc::EACCES || raw == libc::EPERM)) {
+                return Ok(());
+            }
+            return Err(raw);
+        }
     };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -3949,15 +3965,16 @@ fn snapshot_dir_rec(root: &Path, rel_prefix: &str, subtree: bool, out: &mut BTre
         let is_dir = snap.is_dir;
         out.insert(rel.clone(), snap);
         if is_dir && subtree {
-            snapshot_dir_rec(root, &rel, true, out);
+            snapshot_dir_rec(root, &rel, true, out)?;
         }
     }
+    Ok(())
 }
 
-fn snapshot_dir(root: &Path, subtree: bool) -> BTreeMap<String, DirSnapEntry> {
+fn snapshot_dir(root: &Path, subtree: bool) -> Result<BTreeMap<String, DirSnapEntry>, i32> {
     let mut map = BTreeMap::new();
-    snapshot_dir_rec(root, "", subtree, &mut map);
-    map
+    snapshot_dir_rec(root, "", subtree, &mut map)?;
+    Ok(map)
 }
 
 fn parent_of_rel(rel: &str) -> &str {
@@ -4360,7 +4377,11 @@ impl DirWatcher {
             // Take initial snapshot and attach initial vnode watches SYNCHRONOUSLY before returning
             // so any filesystem change immediately after ReadDirectoryChangesW/FindFirstChangeNotificationW
             // is guaranteed to be observed.
-            let initial_snap = snapshot_dir(&root, subtree);
+            let (initial_snap, snap_failed) = match snapshot_dir(&root, subtree) {
+                Ok(s) => (s, false),
+                Err(_) => (BTreeMap::new(), true),
+            };
+            let mut vnode_budget = effective_vnode_fd_budget(MAX_WATCHED_VNODE_FDS);
             let mut watched_by_path: HashMap<String, (i32, u64, u64)> = HashMap::new();
             let mut path_by_fd: HashMap<i32, String> = HashMap::new();
             let initial_needs_rescan = sync_kqueue_vnodes(
@@ -4369,7 +4390,8 @@ impl DirWatcher {
                 &initial_snap,
                 &mut watched_by_path,
                 &mut path_by_fd,
-            );
+                &mut vnode_budget,
+            ) || snap_failed;
 
             let watcher = Arc::new(DirWatcher {
                 state: Mutex::new(DirWatcherState {
@@ -4396,6 +4418,7 @@ impl DirWatcher {
                         initial_snap,
                         watched_by_path,
                         path_by_fd,
+                        vnode_budget,
                         initial_needs_rescan,
                     );
                 });
@@ -4431,13 +4454,26 @@ impl Drop for DirWatcher {
 }
 
 #[cfg(target_vendor = "apple")]
-fn open_vnode_evtonly(path: &Path) -> Option<i32> {
-    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+fn effective_vnode_fd_budget(max_budget: usize) -> usize {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 || rl.rlim_cur == libc::RLIM_INFINITY {
+        return max_budget;
+    }
+    let soft = usize::try_from(rl.rlim_cur).unwrap_or(usize::MAX);
+    // Keep at least half of RLIMIT_NOFILE (and DIR_WATCH_FD_HEADROOM when soft allows) free
+    // so snapshot_dir() and other process descriptors are never starved.
+    let safe_cap = (soft / 2).min(soft.saturating_sub(DIR_WATCH_FD_HEADROOM).max(1));
+    max_budget.min(safe_cap.max(1))
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_vnode_evtonly(path: &Path) -> Result<i32, i32> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| libc::EINVAL)?;
     let fd = unsafe { libc::open(c.as_ptr(), DARWIN_O_EVTONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        None
+        Err(last_errno())
     } else {
-        Some(fd)
+        Ok(fd)
     }
 }
 
@@ -4461,9 +4497,11 @@ fn register_vnode_kevent(kq: i32, fd: i32) -> bool {
 }
 
 /// Synchronize kqueue `EVFILT_VNODE` descriptors against `root` and `snap`, prioritizing
-/// directories before files within `MAX_WATCHED_VNODE_FDS`.
-/// Returns `true` when root or any snapshotted entry lacks an active registered vnode fd
-/// (due to the fd cap or open/registration failure), signaling that periodic rescan is needed.
+/// directories before files within `*vnode_budget` (bounded by `MAX_WATCHED_VNODE_FDS` and
+/// process `RLIMIT_NOFILE` headroom). On `EMFILE`/`ENFILE`, releases a small slice of
+/// non-root file descriptors and reduces `*vnode_budget` persistently to prevent FD starvation
+/// or open/close churn. Returns `true` when root or any snapshotted entry lacks an active
+/// registered vnode fd, signaling that periodic rescan is needed.
 #[cfg(target_vendor = "apple")]
 fn sync_kqueue_vnodes(
     kq: i32,
@@ -4471,16 +4509,18 @@ fn sync_kqueue_vnodes(
     snap: &BTreeMap<String, DirSnapEntry>,
     watched_by_path: &mut HashMap<String, (i32, u64, u64)>,
     path_by_fd: &mut HashMap<i32, String>,
+    vnode_budget: &mut usize,
 ) -> bool {
+    let limit = (*vnode_budget).min(effective_vnode_fd_budget(MAX_WATCHED_VNODE_FDS));
     let mut desired: Vec<(String, u64, u64)> = Vec::new();
     if let Ok(rm) = std::fs::symlink_metadata(root) {
         desired.push((String::new(), rm.dev(), rm.ino()));
     }
     // Prioritize directories first so subtree watching covers subdirectories within the
-    // bounded fd budget, then add files up to MAX_WATCHED_VNODE_FDS.
+    // bounded fd budget, then add files up to `limit`.
     for (rel, ent) in snap {
         if ent.is_dir {
-            if desired.len() >= MAX_WATCHED_VNODE_FDS {
+            if desired.len() >= limit {
                 break;
             }
             desired.push((rel.clone(), ent.dev, ent.ino));
@@ -4488,7 +4528,7 @@ fn sync_kqueue_vnodes(
     }
     for (rel, ent) in snap {
         if !ent.is_dir {
-            if desired.len() >= MAX_WATCHED_VNODE_FDS {
+            if desired.len() >= limit {
                 break;
             }
             desired.push((rel.clone(), ent.dev, ent.ino));
@@ -4512,6 +4552,7 @@ fn sync_kqueue_vnodes(
     }
 
     // Open and register new vnode fds.
+    let mut hit_fd_limit = false;
     for (rel, dev, ino) in desired {
         if watched_by_path.contains_key(&rel) {
             continue;
@@ -4521,14 +4562,39 @@ fn sync_kqueue_vnodes(
         } else {
             root.join(rel.replace('\\', "/"))
         };
-        if let Some(fd) = open_vnode_evtonly(&full) {
-            if register_vnode_kevent(kq, fd) {
-                watched_by_path.insert(rel.clone(), (fd, dev, ino));
-                path_by_fd.insert(fd, rel);
-            } else {
+        match open_vnode_evtonly(&full) {
+            Ok(fd) => {
+                if register_vnode_kevent(kq, fd) {
+                    watched_by_path.insert(rel.clone(), (fd, dev, ino));
+                    path_by_fd.insert(fd, rel);
+                } else {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            Err(libc::EMFILE | libc::ENFILE) => {
+                hit_fd_limit = true;
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+
+    if hit_fd_limit {
+        // Release a small slice of non-root file descriptors first (preserving root & dirs)
+        // and clamp this watcher's budget so subsequent rescans do not thrash descriptors.
+        let mut to_release: Vec<String> = watched_by_path
+            .keys()
+            .filter(|k| !k.is_empty() && !snap.get(*k).is_some_and(|e| e.is_dir))
+            .cloned()
+            .collect();
+        to_release.sort();
+        for p in to_release.into_iter().rev().take(DIR_WATCH_EMFILE_BACKOFF_FDS) {
+            if let Some((fd, _, _)) = watched_by_path.remove(&p) {
+                path_by_fd.remove(&fd);
                 unsafe { libc::close(fd) };
             }
         }
+        *vnode_budget = watched_by_path.len().max(1);
     }
 
     // `watched_by_path` keys are a subset of `{""} U snap.keys()`; full coverage holds iff
@@ -4546,6 +4612,7 @@ fn dir_watch_kqueue_loop(
     mut prev_snap: BTreeMap<String, DirSnapEntry>,
     mut watched_by_path: HashMap<String, (i32, u64, u64)>,
     mut path_by_fd: HashMap<i32, String>,
+    mut vnode_budget: usize,
     mut needs_rescan: bool,
 ) {
     let mut cur_subtree = watcher.state.lock().unwrap().subtree;
@@ -4639,8 +4706,19 @@ fn dir_watch_kqueue_loop(
         let want_subtree = watcher.state.lock().unwrap().subtree;
         if want_subtree && !cur_subtree {
             cur_subtree = true;
-            prev_snap = snapshot_dir(&root, true);
-            needs_rescan = sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            if let Ok(snap) = snapshot_dir(&root, true) {
+                prev_snap = snap;
+                needs_rescan = sync_kqueue_vnodes(
+                    kq,
+                    &root,
+                    &prev_snap,
+                    &mut watched_by_path,
+                    &mut path_by_fd,
+                    &mut vnode_budget,
+                );
+            } else {
+                needs_rescan = true;
+            }
             next_rescan = if needs_rescan {
                 Some(next_rescan.unwrap_or_else(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL))
             } else {
@@ -4650,11 +4728,38 @@ fn dir_watch_kqueue_loop(
 
         let rescan_due = next_rescan.is_some_and(|dl| Instant::now() >= dl);
         if saw_vnode || rescan_due {
-            let new_snap = snapshot_dir(&root, cur_subtree);
+            let new_snap = match snapshot_dir(&root, cur_subtree) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    if e == libc::EMFILE || e == libc::ENFILE {
+                        vnode_budget = watched_by_path
+                            .len()
+                            .saturating_sub(DIR_WATCH_EMFILE_BACKOFF_FDS)
+                            .max(1);
+                        let _ = sync_kqueue_vnodes(
+                            kq,
+                            &root,
+                            &prev_snap,
+                            &mut watched_by_path,
+                            &mut path_by_fd,
+                            &mut vnode_budget,
+                        );
+                    }
+                    next_rescan = Some(Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
+                    continue;
+                }
+            };
             let changes = diff_dir_snapshots(&prev_snap, &new_snap, &vnode_written, &vnode_attrib);
             prev_snap = new_snap;
             // Register new vnodes BEFORE completing any request so subsequent watches never miss mutations.
-            needs_rescan = sync_kqueue_vnodes(kq, &root, &prev_snap, &mut watched_by_path, &mut path_by_fd);
+            needs_rescan = sync_kqueue_vnodes(
+                kq,
+                &root,
+                &prev_snap,
+                &mut watched_by_path,
+                &mut path_by_fd,
+                &mut vnode_budget,
+            );
             next_rescan = needs_rescan.then(|| Instant::now() + DIR_WATCH_RESCAN_INTERVAL);
 
             if !changes.is_empty() {
@@ -9759,6 +9864,10 @@ mod tests {
             assert!(
                 recs.iter().any(|(a, p)| *a == FILE_ACTION_MODIFIED && p == "z_omitted_target.txt"),
                 "expected FILE_ACTION_MODIFIED for z_omitted_target.txt (SIZE), got {recs:?}"
+            );
+            assert!(
+                !recs.iter().any(|(a, _)| *a == FILE_ACTION_REMOVED || *a == FILE_ACTION_ADDED),
+                "unexpected spurious add/remove under FD pressure: {recs:?}"
             );
 
             // 1b. Same-size in-place LastWrite update (no size change, no rename/create).
