@@ -1069,6 +1069,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if let Ok(cur_exe) = std::env::current_exe() {
         w::process::set_runner_exe(cur_exe);
     }
+    w::process::init_trusted_host_env();
     w::process::init_exit_code_channel();
     raise_fd_limit();
 
@@ -1193,12 +1194,14 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     if let Some(child_cwd) = std::env::var("PORT_CHILD_CWD").ok().filter(|s| !s.is_empty()) {
         w::path::set_cwd(&child_cwd);
     }
+    std::env::remove_var("PORT_CHILD_CWD");
 
     // Process-wide Windows state.
     let exe_win = std::env::var("PORT_CHILD_EXE_WIN")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{game_win_dir}\\{}", args.exe));
+    std::env::remove_var("PORT_CHILD_EXE_WIN");
     let cmdline = if let Some(c) = std::env::var("PORT_CHILD_CMDLINE").ok().filter(|s| !s.is_empty()) {
         c
     } else {
@@ -1213,8 +1216,10 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
         }
         c
     };
+    std::env::remove_var("PORT_CHILD_CMDLINE");
     w::process::init(w::process::ProcessConfig { exe_path: exe_win.clone(), cmdline: cmdline.clone() });
     if let Ok(encoded_env) = std::env::var("PORT_CHILD_ENV") {
+        std::env::remove_var("PORT_CHILD_ENV");
         if let Some(vars) = w::process::decode_env_list(&encoded_env) {
             w::process::replace_env(vars);
         } else {

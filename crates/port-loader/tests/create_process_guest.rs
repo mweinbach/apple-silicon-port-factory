@@ -310,7 +310,23 @@ mod macos_guest_process_tests {
 
         win32_rt::path::add_mount("P:\\", &dir);
         win32_rt::path::set_cwd("P:\\");
+        win32_rt::process::init_trusted_host_env();
         win32_rt::process::init_env(&[]);
+
+        // Guard harmless host-only marker vars to verify they never leak into child guest/host env.
+        struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _g_host_marker = EnvGuard("HOST_ONLY_GUEST_PROC_MARKER", std::env::var_os("HOST_ONLY_GUEST_PROC_MARKER"));
+        std::env::set_var("HOST_ONLY_GUEST_PROC_MARKER", "must-not-reach-child");
+        let _g_aot_marker = EnvGuard("PORT_AOT_DYLIB", std::env::var_os("PORT_AOT_DYLIB"));
+        std::env::set_var("PORT_AOT_DYLIB", "/nonexistent/harmless_marker_must_not_load.dylib");
 
         unsafe {
             // Non-PE binary fails with ERROR_BAD_EXE_FORMAT (193).
@@ -529,6 +545,63 @@ mod macos_guest_process_tests {
             assert_eq!(CloseHandle(err_rd), TRUE);
             assert_eq!(CloseHandle(h_thread), TRUE);
             assert_eq!(CloseHandle(h_proc), TRUE);
+
+            // Verify normal guest virtual-environment inheritance when lpEnvironment == NULL
+            // (parent SetEnvironmentVariableW flows to child without mutating host std::env).
+            let key_w = to_wide_z("CHILD_TAG");
+            let val_w = to_wide_z("inherited-from-virtual-env");
+            assert_eq!(win32_rt::kernel32::process::SetEnvironmentVariableW(key_w.as_ptr(), val_w.as_ptr()), TRUE);
+            assert!(
+                std::env::var_os("CHILD_TAG").is_none(),
+                "SetEnvironmentVariableW must not mutate host std::env"
+            );
+            let (mut inh_in_rd, mut inh_in_wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let (mut inh_out_rd, mut inh_out_wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let (mut inh_err_rd, mut inh_err_wr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut inh_in_rd, &mut inh_in_wr, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+            assert_eq!(CreatePipe(&mut inh_out_rd, &mut inh_out_wr, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+            assert_eq!(CreatePipe(&mut inh_err_rd, &mut inh_err_wr, &mut sa as *mut _ as *mut c_void, 0), TRUE);
+            let mut si_inh = [0u8; 104];
+            (si_inh.as_mut_ptr() as *mut u32).write_unaligned(104);
+            (si_inh.as_mut_ptr().add(60) as *mut u32).write_unaligned(STARTF_USESTDHANDLES);
+            (si_inh.as_mut_ptr().add(80) as *mut HANDLE).write_unaligned(inh_in_rd);
+            (si_inh.as_mut_ptr().add(88) as *mut HANDLE).write_unaligned(inh_out_wr);
+            (si_inh.as_mut_ptr().add(96) as *mut HANDLE).write_unaligned(inh_err_wr);
+            let mut pi_inh = [0u8; 24];
+            assert_eq!(
+                CreateProcessW(
+                    app_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    TRUE,
+                    CREATE_NO_WINDOW,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    si_inh.as_mut_ptr() as *mut c_void,
+                    pi_inh.as_mut_ptr() as *mut c_void,
+                ),
+                TRUE,
+                "inherited-env CreateProcessW failed with {}",
+                GetLastError()
+            );
+            assert_eq!(CloseHandle(inh_in_rd), TRUE);
+            assert_eq!(CloseHandle(inh_out_wr), TRUE);
+            assert_eq!(CloseHandle(inh_err_wr), TRUE);
+            assert_eq!(CloseHandle(inh_in_wr), TRUE);
+            let h_inh_proc = (pi_inh.as_ptr() as *const HANDLE).read_unaligned();
+            let h_inh_thread = (pi_inh.as_ptr().add(8) as *const HANDLE).read_unaligned();
+            assert_eq!(WaitForSingleObject(h_inh_proc, 15_000), WAIT_OBJECT_0);
+            let mut inh_code = 0u32;
+            assert_eq!(GetExitCodeProcess(h_inh_proc, &mut inh_code), TRUE);
+            assert_eq!(inh_code, 42);
+            let inh_stderr = read_all(inh_err_rd);
+            assert_eq!(String::from_utf8_lossy(&inh_stderr), "ERR:inherited-from-virtual-env");
+            assert_eq!(CloseHandle(inh_out_rd), TRUE);
+            assert_eq!(CloseHandle(inh_err_rd), TRUE);
+            assert_eq!(CloseHandle(h_inh_thread), TRUE);
+            assert_eq!(CloseHandle(h_inh_proc), TRUE);
+            assert_eq!(win32_rt::kernel32::process::SetEnvironmentVariableW(key_w.as_ptr(), std::ptr::null()), TRUE);
 
             // Full 32-bit exit code preservation across ExitProcess(>255), normal entrypoint return,
             // and TerminateProcess(>255).

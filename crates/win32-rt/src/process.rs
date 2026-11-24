@@ -13,6 +13,99 @@ static CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 static MANIFEST_GAME_ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static RUNNER_EXE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+/// Minimal platform-necessary host environment keys allowed to propagate from the
+/// immutable startup host environment into child processes spawned by `CreateProcessW`
+/// or host helper tools. Strictly excludes loader/dylib/JIT/AOT/debug override knobs
+/// (e.g. `DYLD_*`, `LD_*`, `PORT_*`, `AW2_*`, `METAL_*`, arbitrary host secrets or markers).
+const TRUSTED_CHILD_HOST_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "__CF_USER_TEXT_ENCODING",
+    "TRANSLATOR_HOME",
+];
+
+struct TrustedHostEnv {
+    child_env: Vec<(String, String)>,
+    user: String,
+    headless: bool,
+    runner_exe_override: Option<std::path::PathBuf>,
+    port_env_overrides: Vec<(String, String)>,
+}
+
+static TRUSTED_HOST_ENV: OnceLock<TrustedHostEnv> = OnceLock::new();
+
+fn capture_trusted_host_env_from<I>(iter: I) -> TrustedHostEnv
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut child_env = Vec::new();
+    let mut user: Option<String> = None;
+    let mut headless = false;
+    let mut runner_exe_override: Option<std::path::PathBuf> = None;
+    let mut port_env_overrides = Vec::new();
+
+    for (k, v) in iter {
+        if TRUSTED_CHILD_HOST_ENV_KEYS.contains(&k.as_str()) {
+            if k == "USER" && !v.is_empty() {
+                user = Some(v.clone());
+            }
+            child_env.push((k, v));
+            continue;
+        }
+        if (k == "PORT_HEADLESS" || k == "AW2_HEADLESS") && v == "1" {
+            headless = true;
+            continue;
+        }
+        if k == "PORT_RUNNER_EXE" {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                runner_exe_override = Some(std::path::PathBuf::from(trimmed));
+            }
+            continue;
+        }
+        if let Some(name) = k.strip_prefix("PORT_ENV_").or_else(|| k.strip_prefix("AW2ENV_")) {
+            port_env_overrides.push((name.to_string(), v));
+        }
+    }
+
+    child_env.sort_by(|a, b| a.0.cmp(&b.0));
+    child_env.dedup_by(|a, b| a.0 == b.0);
+    TrustedHostEnv {
+        child_env,
+        user: user.unwrap_or_else(|| "player".into()),
+        headless,
+        runner_exe_override,
+        port_env_overrides,
+    }
+}
+
+fn trusted_host_env() -> &'static TrustedHostEnv {
+    TRUSTED_HOST_ENV.get_or_init(|| capture_trusted_host_env_from(std::env::vars()))
+}
+
+/// Snapshot the minimal trusted host environment once at startup before any guest code runs.
+pub fn init_trusted_host_env() {
+    let _ = trusted_host_env();
+}
+
+/// Return the immutable allowlisted host environment for spawning native child processes.
+pub fn trusted_child_host_env() -> Vec<(String, String)> {
+    trusted_host_env().child_env.clone()
+}
+
+/// Return whether the host runner was started in headless mode (`PORT_HEADLESS=1` / `AW2_HEADLESS=1`).
+pub fn trusted_host_headless() -> bool {
+    trusted_host_env().headless
+}
+
 /// Register the host `port-runner` binary path used by `CreateProcessW` on macOS
 /// to spawn real Windows x86-64 child processes.
 pub fn set_runner_exe(path: std::path::PathBuf) {
@@ -21,15 +114,14 @@ pub fn set_runner_exe(path: std::path::PathBuf) {
 
 /// Resolve the host `port-runner` binary path for child guest process launch.
 pub fn runner_exe() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("PORT_RUNNER_EXE") {
-        let pb = std::path::PathBuf::from(p.trim());
-        if !pb.as_os_str().is_empty() && pb.is_file() {
-            return Some(pb);
-        }
-    }
     if let Some(pb) = RUNNER_EXE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         if pb.is_file() {
             return Some(pb);
+        }
+    }
+    if let Some(ref pb) = trusted_host_env().runner_exe_override {
+        if pb.is_file() {
+            return Some(pb.clone());
         }
     }
     if let Ok(cur) = std::env::current_exe() {
@@ -278,7 +370,8 @@ static INITIAL_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// through wholesale (host paths would confuse Windows code); only a
 /// Windows-looking base set plus `AW2ENV_<NAME>=value` overrides.
 pub fn init_env(extra: &[(String, String)]) {
-    let user = std::env::var("USER").unwrap_or_else(|_| "player".into());
+    let trusted = trusted_host_env();
+    let user = trusted.user.clone();
     let computer = crate::config::app_config().computer_name;
     let mut vars: Vec<(String, String)> = vec![
         ("ALLUSERSPROFILE".into(), "C:\\ProgramData".into()),
@@ -309,11 +402,7 @@ pub fn init_env(extra: &[(String, String)]) {
         ("USERPROFILE".into(), format!("C:\\users\\{user}")),
         ("windir".into(), "C:\\Windows".into()),
     ];
-    for (k, v) in std::env::vars() {
-        if let Some(name) = k.strip_prefix("PORT_ENV_").or_else(|| k.strip_prefix("AW2ENV_")) {
-            vars.push((name.to_string(), v));
-        }
-    }
+    vars.extend(trusted.port_env_overrides.iter().cloned());
     vars.extend(extra.iter().cloned());
     vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
     vars.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
@@ -569,5 +658,48 @@ mod tests {
         }
         assert_eq!(got, 4);
         assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 0xC000_013Au32);
+    }
+
+    #[test]
+    fn trusted_child_host_env_filters_non_allowlisted_and_late_std_env_mutations() {
+        let synthetic = vec![
+            ("HOME".to_string(), "/tmp/fake-home".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("TMPDIR".to_string(), "/tmp/fake-tmp".to_string()),
+            ("USER".to_string(), "tester".to_string()),
+            ("TRANSLATOR_HOME".to_string(), "/tmp/fake-translator".to_string()),
+            ("PORT_AOT_DYLIB".to_string(), "marker-must-not-pass".to_string()),
+            ("AW2_AOT_DYLIB".to_string(), "marker-must-not-pass".to_string()),
+            ("DYLD_INSERT_LIBRARIES".to_string(), "marker-must-not-pass".to_string()),
+            ("PORT_CHILD_ENV".to_string(), "marker-must-not-pass".to_string()),
+            ("HOST_ONLY_MARKER".to_string(), "host-secret-marker".to_string()),
+            ("PORT_HEADLESS".to_string(), "1".to_string()),
+        ];
+        let snap = capture_trusted_host_env_from(synthetic);
+        let keys: Vec<&str> = snap.child_env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"HOME"));
+        assert!(keys.contains(&"PATH"));
+        assert!(keys.contains(&"TMPDIR"));
+        assert!(keys.contains(&"USER"));
+        assert!(keys.contains(&"TRANSLATOR_HOME"));
+        assert!(!keys.contains(&"PORT_AOT_DYLIB"));
+        assert!(!keys.contains(&"AW2_AOT_DYLIB"));
+        assert!(!keys.contains(&"DYLD_INSERT_LIBRARIES"));
+        assert!(!keys.contains(&"PORT_CHILD_ENV"));
+        assert!(!keys.contains(&"HOST_ONLY_MARKER"));
+        assert!(snap.headless);
+        assert_eq!(snap.user, "tester");
+
+        // Late std::env mutations after startup snapshot must not appear in trusted_child_host_env().
+        init_trusted_host_env();
+        let late_key = "PORT_LATE_MARKER_TEST";
+        let prev = std::env::var_os(late_key);
+        std::env::set_var(late_key, "late-value");
+        let child_env = trusted_child_host_env();
+        match prev {
+            Some(v) => std::env::set_var(late_key, v),
+            None => std::env::remove_var(late_key),
+        }
+        assert!(child_env.iter().all(|(k, _)| k != late_key));
     }
 }

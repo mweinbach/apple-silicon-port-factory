@@ -956,6 +956,42 @@ fn is_inheritable_handle(h: HANDLE) -> bool {
 }
 
 #[cfg(not(target_os = "ios"))]
+fn build_child_runner_command(
+    runner: &std::path::Path,
+    exe_host: &std::path::Path,
+    exe_win: &str,
+    effective_cmdline: &str,
+    child_cwd_win: &str,
+    child_env_vars: &[(String, String)],
+    headless: bool,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(runner);
+    // Start from an empty host environment and populate ONLY immutable minimal platform
+    // necessities captured at startup, followed by explicit runtime-owned protocol values.
+    // Guest variables travel strictly inside `PORT_CHILD_ENV` and can never inject host
+    // loader/AOT/dyld variables into the native child runner.
+    command.env_clear();
+    for (k, v) in pr::trusted_child_host_env() {
+        command.env(k, v);
+    }
+    command.arg("--pe").arg(exe_host);
+    for (win_prefix, host_dir) in crate::path::list_mounts() {
+        command.arg("--mount").arg(format!("{win_prefix}={}", host_dir.display()));
+    }
+    command.env("PORT_CHILD_STDIO", "1");
+    command.env("PORT_CHILD_EXE_WIN", exe_win);
+    command.env("PORT_CHILD_CMDLINE", effective_cmdline);
+    command.env("PORT_CHILD_CWD", child_cwd_win);
+    command.env("PORT_CHILD_ENV", pr::encode_env_list(child_env_vars));
+    command.env("PORT_NO_BASE_RETRY", "1");
+    if headless {
+        command.env("PORT_HEADLESS", "1");
+        command.env("AW2_HEADLESS", "1");
+    }
+    command
+}
+
+#[cfg(not(target_os = "ios"))]
 fn dup_handle_to_stdio(h: HANDLE, allowed_list: Option<&[HANDLE]>) -> Result<std::process::Stdio, u32> {
     use std::os::unix::io::FromRawFd;
     if h.is_null() || h == INVALID_HANDLE_VALUE {
@@ -1136,24 +1172,18 @@ pub unsafe extern "win64" fn CreateProcessW(
             parse_env_block(env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0)
         };
 
-        let mut command = std::process::Command::new(&runner);
-        command.arg("--pe").arg(&exe_host);
-        for (win_prefix, host_dir) in crate::path::list_mounts() {
-            command.arg("--mount").arg(format!("{win_prefix}={}", host_dir.display()));
-        }
-        command.env("PORT_CHILD_STDIO", "1");
-        command.env("PORT_CHILD_EXE_WIN", &exe_win);
-        command.env("PORT_CHILD_CMDLINE", &effective_cmdline);
-        command.env("PORT_CHILD_CWD", &child_cwd_win);
-        command.env("PORT_CHILD_ENV", pr::encode_env_list(&child_env_vars));
-        command.env("PORT_NO_BASE_RETRY", "1");
-        if (flags & CREATE_NO_WINDOW) != 0
+        let headless = (flags & CREATE_NO_WINDOW) != 0
             || (si_flags & STARTF_USESTDHANDLES) != 0
-            || std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
-        {
-            command.env("PORT_HEADLESS", "1");
-            command.env("AW2_HEADLESS", "1");
-        }
+            || pr::trusted_host_headless();
+        let mut command = build_child_runner_command(
+            &runner,
+            &exe_host,
+            &exe_win,
+            &effective_cmdline,
+            &child_cwd_win,
+            &child_env_vars,
+            headless,
+        );
 
         if (si_flags & STARTF_USESTDHANDLES) != 0 && inherit != FALSE {
             let allowed = handle_list.as_deref();
@@ -2364,5 +2394,67 @@ mod tests {
             let enc = pr::encode_env_list(&orig);
             assert_eq!(pr::decode_env_list(&enc).as_deref(), Some(orig.as_slice()));
         }
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn child_runner_command_clears_host_env_and_isolates_protocol_vars() {
+        pr::init_trusted_host_env();
+        let marker_key = "HOST_ONLY_CHILD_ISOLATION_MARKER";
+        let aot_key = "PORT_AOT_DYLIB";
+        let prev_marker = std::env::var_os(marker_key);
+        let prev_aot = std::env::var_os(aot_key);
+        std::env::set_var(marker_key, "host-only-value");
+        std::env::set_var(aot_key, "marker-value-must-not-propagate");
+
+        let guest_vars = vec![
+            ("GUEST_OVERRIDE".to_string(), "guest-value".to_string()),
+            ("PORT_AOT_DYLIB".to_string(), "guest-var-stays-serialized".to_string()),
+        ];
+        let cmd = build_child_runner_command(
+            std::path::Path::new("/usr/bin/true"),
+            std::path::Path::new("/tmp/guest.exe"),
+            "C:\\guest.exe",
+            "\"C:\\guest.exe\"",
+            "C:\\",
+            &guest_vars,
+            true,
+        );
+
+        match prev_marker {
+            Some(v) => std::env::set_var(marker_key, v),
+            None => std::env::remove_var(marker_key),
+        }
+        match prev_aot {
+            Some(v) => std::env::set_var(aot_key, v),
+            None => std::env::remove_var(aot_key),
+        }
+
+        let env_map: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        // Host-only / loader override vars must NOT leak into child host environment.
+        assert!(!env_map.contains_key(marker_key));
+        assert!(!env_map.contains_key(aot_key));
+        assert!(!env_map.contains_key("DYLD_INSERT_LIBRARIES"));
+
+        // Runtime-owned protocol controls and serialized guest environment are explicitly present.
+        assert_eq!(env_map.get("PORT_CHILD_STDIO").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_CHILD_EXE_WIN").and_then(|v| v.as_deref()), Some("C:\\guest.exe"));
+        assert_eq!(env_map.get("PORT_CHILD_CWD").and_then(|v| v.as_deref()), Some("C:\\"));
+        assert_eq!(env_map.get("PORT_NO_BASE_RETRY").and_then(|v| v.as_deref()), Some("1"));
+        assert_eq!(env_map.get("PORT_HEADLESS").and_then(|v| v.as_deref()), Some("1"));
+        let decoded = pr::decode_env_list(
+            env_map.get("PORT_CHILD_ENV").and_then(|v| v.as_deref()).expect("PORT_CHILD_ENV"),
+        )
+        .expect("decode PORT_CHILD_ENV");
+        assert_eq!(decoded, guest_vars);
     }
 }
