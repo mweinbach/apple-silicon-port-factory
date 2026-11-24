@@ -103,10 +103,12 @@ struct FdInfo {
     raw: bool,
     temporary: bool,
     /// Associated Win32 HANDLE and whether the CRT fd owns closing that handle.
-    /// - `Some((h, true))`: created via `_open_osfhandle(h, flags)` -> `_close(fd)`
-    ///   closes the Win32 `FileObj` handle (which closes the underlying POSIX fd once).
+    /// - `Some((h, true))`: created via `_open_osfhandle(h, flags)` on a dedicated
+    ///   duplicated POSIX fd (`F_DUPFD_CLOEXEC`) sharing `h`'s open file description.
+    ///   Retiring `h` via `handles::close(h)` never closes this CRT fd (and preserves any
+    ///   remaining `DuplicateHandle` siblings of `h`); `_close(fd)` closes both `h` and `fd`.
     /// - `Some((h, false))`: lazily wrapped non-owning `FileObj` created by `_get_osfhandle(fd)`
-    ///   -> `_close(fd)` closes the wrapper handle and then `libc::close(fd)`.
+    ///   -> retiring `h` drops only the non-owning wrapper (`FileObj.owned == false`).
     osf_handle: Option<(usize, bool)>,
 }
 
@@ -255,19 +257,17 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
         return bad_fd();
     }
     let ent = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&fd);
-    let mut r = 0;
-    let mut closed_via_handle = false;
     if let Some((info, _)) = &ent {
-        if let Some((h, owns_handle)) = info.osf_handle {
+        if let Some((h, _)) = info.osf_handle {
+            // Owning `_open_osfhandle` descriptors hold a dedicated duplicated POSIX fd
+            // distinct from `FileObj`'s raw fd; non-owning `_get_osfhandle` wrappers have
+            // `FileObj.owned == false`. In both cases retiring `h` never closes `fd`, so
+            // `libc::close(fd)` below closes `fd` cleanly once even when `DuplicateHandle`
+            // keeps another `Arc<FileObj>` alive.
             let _ = crate::handles::close(h as crate::types::HANDLE);
-            if owns_handle {
-                closed_via_handle = true;
-            }
         }
     }
-    if !closed_via_handle {
-        r = libc::close(fd);
-    }
+    let r = libc::close(fd);
     if let Some((i, Some(p))) = ent {
         if i.temporary {
             let _ = std::fs::remove_file(p);
@@ -282,8 +282,13 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
 }
 
 /// Associate a CRT file descriptor with an existing Win32 file/pipe HANDLE,
-/// transferring ownership of `osfhandle` to the returned CRT fd (so `_close(fd)`
-/// closes the Win32 handle and underlying OS fd once).
+/// transferring ownership of `osfhandle` to the returned CRT fd.
+///
+/// Allocates an independent POSIX fd (`F_DUPFD_CLOEXEC`) sharing the same kernel open
+/// file description (offset, flags, pipe buffer) as `osfhandle`'s `FileObj`. Keeping the
+/// CRT fd distinct from `FileObj`'s internal fd guarantees that `_close(fd)` and
+/// `_dup2(src, fd)` retire `osfhandle` cleanly without ever double-closing or late-closing
+/// a reused descriptor, even when duplicate Win32 handles share the same `Arc<FileObj>`.
 pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32 {
     use crate::kernel32::file::{file_fd_and_kind, FileKind};
     use crate::types::{HANDLE, INVALID_HANDLE_VALUE};
@@ -300,10 +305,15 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
         errno::set(EBADF);
         return -1;
     }
+    let crt_fd = libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0);
+    if crt_fd < 0 {
+        errno::set_from_host();
+        return -1;
+    }
     if (flags & O_APPEND) != 0 {
-        let cur = libc::fcntl(raw_fd, libc::F_GETFL);
+        let cur = libc::fcntl(crt_fd, libc::F_GETFL);
         if cur >= 0 {
-            let _ = libc::fcntl(raw_fd, libc::F_SETFL, cur | libc::O_APPEND);
+            let _ = libc::fcntl(crt_fd, libc::F_SETFL, cur | libc::O_APPEND);
         }
     }
     let text = if (flags & O_BINARY) != 0 {
@@ -315,7 +325,7 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
     };
     let raw = kind != FileKind::Disk;
     set_fd_info(
-        raw_fd,
+        crt_fd,
         FdInfo {
             text,
             raw,
@@ -324,7 +334,7 @@ pub unsafe extern "win64" fn _open_osfhandle(osfhandle: isize, flags: i32) -> i3
         },
         None,
     );
-    raw_fd
+    crt_fd
 }
 
 /// Return the Win32 HANDLE backing a CRT file descriptor without transferring ownership.
@@ -350,26 +360,44 @@ pub unsafe extern "win64" fn _get_osfhandle(fd: i32) -> isize {
     }
     let kind = classify_host_fd(fd);
     let h = wrap_non_owned_fd(fd, kind, format!("crt://fd/{fd}"), 0xC000_0000);
-    let mut g = FDS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    if let Some((info, _)) = m.get_mut(&fd) {
-        info.osf_handle = Some((h as usize, false));
-    } else {
-        let raw = kind != crate::kernel32::file::FileKind::Disk;
-        m.insert(
-            fd,
-            (
-                FdInfo {
-                    text: true,
-                    raw,
-                    temporary: false,
-                    osf_handle: Some((h as usize, false)),
-                },
-                None,
-            ),
-        );
+    let mut redundant = None;
+    let out_h = {
+        let mut g = FDS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if let Some((info, _)) = m.get_mut(&fd) {
+            if let Some((existing, _)) = info.osf_handle {
+                if crate::handles::get(existing as crate::types::HANDLE).is_some() {
+                    redundant = Some(h);
+                    existing as isize
+                } else {
+                    info.osf_handle = Some((h as usize, false));
+                    h as isize
+                }
+            } else {
+                info.osf_handle = Some((h as usize, false));
+                h as isize
+            }
+        } else {
+            let raw = kind != crate::kernel32::file::FileKind::Disk;
+            m.insert(
+                fd,
+                (
+                    FdInfo {
+                        text: true,
+                        raw,
+                        temporary: false,
+                        osf_handle: Some((h as usize, false)),
+                    },
+                    None,
+                ),
+            );
+            h as isize
+        }
+    };
+    if let Some(extra) = redundant {
+        let _ = crate::handles::close(extra);
     }
-    h as isize
+    out_h
 }
 
 /// Raw read with CRLF->LF translation in text mode.
@@ -522,15 +550,37 @@ pub unsafe extern "win64" fn _dup(fd: i32) -> i32 {
 }
 
 pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
-    if !fd_valid(fd) {
+    if !fd_valid(fd) || fd2 < 0 {
         return bad_fd();
     }
+    // Self-dup is a validated no-op that preserves `FDS[fd]` and its `osf_handle` association.
+    if fd == fd2 {
+        return 0;
+    }
+    let src_info = fd_info(fd);
     if libc::dup2(fd, fd2) < 0 {
         errno::set_from_host();
         return -1;
     }
-    let i = fd_info(fd);
-    set_fd_info(fd2, FdInfo { temporary: false, osf_handle: None, ..i }, None);
+    // Atomically swap `FDS[fd2]` after `libc::dup2` succeeds so failed dups never disturb
+    // `fd2`, and retire any previous `osf_handle` outside the lock. Because `_open_osfhandle`
+    // allocates its own POSIX fd distinct from `FileObj`'s raw fd (and `_get_osfhandle`
+    // wrappers are non-owning), closing `old_h` never closes the newly duplicated `fd2`.
+    let prev = FDS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(fd2, (FdInfo { temporary: false, osf_handle: None, ..src_info }, None));
+    if let Some((old_info, old_path)) = prev {
+        if let Some((old_h, _)) = old_info.osf_handle {
+            let _ = crate::handles::close(old_h as crate::types::HANDLE);
+        }
+        if old_info.temporary {
+            if let Some(p) = old_path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
     0
 }
 
@@ -1656,5 +1706,162 @@ mod tests {
             assert_ne!(_get_osfhandle(1), -1);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn dup2_and_close_preserve_osfhandle_ownership_and_duplicate_handles() {
+        use crate::kernel32::file::{CreateFileW, ReadFile};
+        use crate::kernel32::threads::{CloseHandle, DuplicateHandle};
+        use crate::types::{HANDLE, INVALID_HANDLE_VALUE, TRUE};
+
+        let dir = std::env::temp_dir().join(format!("aw2_dup2_osf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::path::add_mount("D:\\", &dir);
+        std::fs::write(dir.join("old1.bin"), b"OLD-ONE").unwrap();
+        std::fs::write(dir.join("old2.bin"), b"OLD-TWO").unwrap();
+        std::fs::write(dir.join("old3.bin"), b"OLD-THREE").unwrap();
+        std::fs::write(dir.join("new.bin"), b"NEW-DATA").unwrap();
+
+        unsafe {
+            let open_win = |win_path: &str| -> HANDLE {
+                let p = crate::strings::to_wide_z(win_path);
+                let h = CreateFileW(
+                    p.as_ptr(),
+                    0xC000_0000,
+                    3,
+                    std::ptr::null_mut(),
+                    3, // OPEN_EXISTING
+                    0x80,
+                    std::ptr::null_mut(),
+                );
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                h
+            };
+
+            let read_all_crt = |fd: i32| -> Vec<u8> {
+                assert_eq!(_lseeki64(fd, 0, 0), 0);
+                let mut buf = [0u8; 32];
+                let n = _read(fd, buf.as_mut_ptr() as *mut c_void, buf.len() as u32);
+                assert!(n >= 0, "_read({fd}) failed with errno {}", errno::get());
+                buf[..n as usize].to_vec()
+            };
+
+            let read_win_from_start = |h: HANDLE| -> Vec<u8> {
+                assert_eq!(
+                    crate::kernel32::file::SetFilePointerEx(h, 0, std::ptr::null_mut(), 0),
+                    TRUE
+                );
+                let mut buf = [0u8; 32];
+                let mut got = 0u32;
+                assert_eq!(
+                    ReadFile(h, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got, std::ptr::null_mut()),
+                    TRUE
+                );
+                buf[..got as usize].to_vec()
+            };
+
+            // 1. Self-dup on invalid fd fails with EBADF; self-dup on _open_osfhandle fd is a
+            //    validated no-op preserving both the descriptor and its Win32 handle association.
+            assert_eq!(_dup2(-1, -1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            let h1 = open_win("D:\\old1.bin");
+            let fd1 = _open_osfhandle(h1 as isize, O_BINARY);
+            assert!(fd1 >= 0);
+            assert_eq!(_dup2(fd1, fd1), 0);
+            assert_eq!(_get_osfhandle(fd1), h1 as isize);
+            assert!(crate::handles::get(h1).is_some());
+            assert_eq!(read_all_crt(fd1), b"OLD-ONE");
+
+            // 2. Failed _dup2 (invalid source or invalid dest) preserves valid target & handle.
+            assert_eq!(_dup2(-1, fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_dup2(9999, fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_dup2(fd1, -1), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_get_osfhandle(fd1), h1 as isize);
+            assert!(crate::handles::get(h1).is_some());
+            assert_eq!(read_all_crt(fd1), b"OLD-ONE");
+
+            // 3. Replacing an _open_osfhandle target retires old Win32 handle without closing
+            //    the newly duplicated descriptor, and closing later does not double-close.
+            let fd_src = _open(b"D:\\new.bin\0".as_ptr(), O_RDWR | O_BINARY, 0x180);
+            assert!(fd_src >= 0);
+            assert_eq!(_dup2(fd_src, fd1), 0);
+            assert!(crate::handles::get(h1).is_none(), "old owning handle must be retired");
+            assert_eq!(read_all_crt(fd1), b"NEW-DATA");
+            let h1_new = _get_osfhandle(fd1);
+            assert_ne!(h1_new, -1);
+            assert_ne!(h1_new, h1 as isize);
+            assert_eq!(_close(fd1), 0);
+            assert_eq!(_close(fd1), -1);
+            assert_eq!(errno::get(), EBADF);
+
+            // 4. Replacing an _open_osfhandle target when DuplicateHandle retains another handle
+            //    to the same FileObj: old CRT handle retires, retained duplicate handle stays live
+            //    on the original file, and closing the retained duplicate handle later does NOT
+            //    close the newly duplicated CRT descriptor!
+            let h2 = open_win("D:\\old2.bin");
+            let mut h2_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(
+                    crate::handles::CURRENT_PROCESS,
+                    h2,
+                    crate::handles::CURRENT_PROCESS,
+                    &mut h2_dup,
+                    0,
+                    0,
+                    2, // DUPLICATE_SAME_ACCESS
+                ),
+                TRUE
+            );
+            assert!(!h2_dup.is_null() && h2_dup != h2);
+            let fd2 = _open_osfhandle(h2 as isize, O_BINARY);
+            assert!(fd2 >= 0);
+            assert_eq!(_dup2(fd_src, fd2), 0);
+            assert!(crate::handles::get(h2).is_none());
+            assert!(crate::handles::get(h2_dup).is_some());
+            assert_eq!(read_win_from_start(h2_dup), b"OLD-TWO");
+            assert_eq!(read_all_crt(fd2), b"NEW-DATA");
+
+            // Dropping the last Arc<FileObj> via CloseHandle(h2_dup) must NOT affect fd2!
+            assert_eq!(CloseHandle(h2_dup), TRUE);
+            assert!(crate::handles::get(h2_dup).is_none());
+            assert_eq!(read_all_crt(fd2), b"NEW-DATA");
+            assert_eq!(_close(fd2), 0);
+            assert_eq!(_close(fd_src), 0);
+
+            // 5. _close on an _open_osfhandle fd with a retained DuplicateHandle closes the CRT
+            //    fd immediately while leaving the retained Win32 duplicate handle usable.
+            let h3 = open_win("D:\\old3.bin");
+            let mut h3_dup: HANDLE = std::ptr::null_mut();
+            assert_eq!(
+                DuplicateHandle(
+                    crate::handles::CURRENT_PROCESS,
+                    h3,
+                    crate::handles::CURRENT_PROCESS,
+                    &mut h3_dup,
+                    0,
+                    0,
+                    2,
+                ),
+                TRUE
+            );
+            let fd3 = _open_osfhandle(h3 as isize, O_BINARY);
+            assert!(fd3 >= 0);
+            assert_eq!(_close(fd3), 0);
+            assert!(crate::handles::get(h3).is_none());
+            assert_eq!(_get_osfhandle(fd3), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(_close(fd3), -1);
+            assert_eq!(errno::get(), EBADF);
+            // Retained duplicate handle still reads the original file cleanly!
+            assert_eq!(read_win_from_start(h3_dup), b"OLD-THREE");
+            assert_eq!(CloseHandle(h3_dup), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

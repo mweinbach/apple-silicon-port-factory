@@ -595,44 +595,45 @@ pub unsafe extern "win64" fn RegOpenKeyExA(key: HANDLE, sub: LPCSTR, opts: u32, 
 
 pub unsafe extern "win64" fn RegCreateKeyExW(key: HANDLE, sub: LPCWSTR, _r: u32, _class: LPWSTR, _opts: u32, _sam: u32, _sa: *mut c_void, out: *mut HANDLE, disp: *mut u32) -> u32 {
     if !out.is_null() {
-        *out = std::ptr::null_mut();
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
     }
     if !disp.is_null() {
-        *disp = 0;
+        std::ptr::write_unaligned(disp, 0);
     }
     let Some(base) = resolve_key_path(key) else {
         return ERROR_INVALID_HANDLE;
     };
     let sub_str = crate::strings::from_wide_opt(sub).unwrap_or_default();
     let mut cur = base;
-    let mut created_any = false;
+    let mut created_parents: Vec<String> = Vec::new();
     let mut reg = registry().lock().unwrap();
     let mut existed = reg.keys.contains_key(&cur);
     for seg in sub_str.split(['\\', '/']).filter(|s| !s.is_empty()) {
+        let parent = cur.clone();
         cur.push('\\');
         cur.push_str(&seg.to_ascii_lowercase());
         existed = reg.keys.contains_key(&cur);
         if !existed {
-            created_any = true;
+            created_parents.push(parent);
+            reg.keys.insert(cur.clone(), std::collections::BTreeMap::new());
         }
-        reg.keys.entry(cur.clone()).or_default();
     }
-    let fired = if created_any {
-        if let Some(parent) = parent_reg_path(&cur) {
-            reg.take_triggered(&[&cur, parent], REG_NOTIFY_CHANGE_NAME)
-        } else {
-            reg.take_triggered(&[&cur], REG_NOTIFY_CHANGE_NAME)
-        }
+    // Match the observed parent path of every newly created key (including intermediates)
+    // in a single pass under the registry lock so each one-shot watcher fires at most once,
+    // no-op reopens fire nothing, and direct vs subtree filters remain exact.
+    let fired = if !created_parents.is_empty() {
+        let refs: Vec<&str> = created_parents.iter().map(String::as_str).collect();
+        reg.take_triggered(&refs, REG_NOTIFY_CHANGE_NAME)
     } else {
         Vec::new()
     };
     drop(reg);
     signal_reg_events(fired);
     if !disp.is_null() {
-        *disp = if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY };
+        std::ptr::write_unaligned(disp, if existed { REG_OPENED_EXISTING_KEY } else { REG_CREATED_NEW_KEY });
     }
     if !out.is_null() {
-        *out = handles::insert(Arc::new(RegKey { path: cur.clone() }));
+        std::ptr::write_unaligned(out, handles::insert(Arc::new(RegKey { path: cur.clone() })));
     }
     log::debug!("RegCreateKeyExW({}\\{sub_str}) -> {cur} (existed={existed})", key_desc(key));
     ERROR_SUCCESS
@@ -2950,6 +2951,210 @@ mod tests {
             assert_eq!(RegCloseKey(hchild), ERROR_SUCCESS);
             let _ = RegDeleteTreeW(hkcu, root_sub.as_ptr());
             assert_eq!(CloseHandle(ev), TRUE);
+        }
+    }
+
+    #[test]
+    fn registry_create_key_intermediate_notify_direct_subtree_and_reopen() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, ResetEvent, WaitForSingleObject};
+        unsafe {
+            let hkcu = 0xFFFF_FFFF_8000_0001usize as HANDLE;
+            let parent_sub = crate::strings::to_wide_z("Software\\PortFactoryMultiLevelParent");
+            let _ = RegDeleteTreeW(hkcu, parent_sub.as_ptr());
+            let mut hparent = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hkcu,
+                    parent_sub.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hparent,
+                    std::ptr::null_mut(),
+                ),
+                ERROR_SUCCESS
+            );
+            let root_name = crate::strings::to_wide_z("Root");
+            let mut hroot = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hparent,
+                    root_name.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hroot,
+                    std::ptr::null_mut(),
+                ),
+                ERROR_SUCCESS
+            );
+
+            // Auto-reset events so a single signal is consumed once (proving one-shot deduplication).
+            let ev_root_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            let ev_root_subtree = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            let ev_parent_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            assert!(!ev_root_direct.is_null() && !ev_root_subtree.is_null() && !ev_parent_direct.is_null());
+
+            // 1. Creating two missing levels together (`Mid\Leaf`) under `Root`:
+            //    - `Root` direct watcher MUST fire (direct child `Mid` was created), once.
+            //    - `Root` subtree watcher MUST fire, once (deduplicated across Mid + Leaf).
+            //    - `Parent` direct watcher MUST NOT fire (no direct child of `Parent` was created).
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, FALSE, REG_NOTIFY_CHANGE_NAME, ev_root_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, TRUE, REG_NOTIFY_CHANGE_NAME, ev_root_subtree, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hparent, FALSE, REG_NOTIFY_CHANGE_NAME, ev_parent_direct, TRUE),
+                ERROR_SUCCESS
+            );
+
+            let two_levels = crate::strings::to_wide_z("Mid\\Leaf");
+            let mut hleaf = std::ptr::null_mut();
+            let mut disp = 0u32;
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    two_levels.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_parent_direct, 0), WAIT_TIMEOUT);
+
+            // 2. Reopening existing `Mid\Leaf` (both W and A) is a no-op: fires NO watchers.
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, FALSE, REG_NOTIFY_CHANGE_NAME, ev_root_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                RegNotifyChangeKeyValue(hroot, TRUE, REG_NOTIFY_CHANGE_NAME, ev_root_subtree, TRUE),
+                ERROR_SUCCESS
+            );
+            let mut hreopen_w = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    two_levels.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hreopen_w,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_OPENED_EXISTING_KEY);
+            let mut hreopen_a = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExA(
+                    hroot,
+                    b"Mid\\Leaf\0".as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hreopen_a,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_OPENED_EXISTING_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_TIMEOUT);
+
+            // 3. Creating a grandchild (`Mid\Leaf2`) when `Mid` already exists:
+            //    - `Root` direct watcher MUST NOT fire!
+            //    - `Root` subtree watcher MUST fire!
+            //    - `Mid` direct watcher MUST fire!
+            let mid_w = crate::strings::to_wide_z("Mid");
+            let mut hmid = std::ptr::null_mut();
+            assert_eq!(RegOpenKeyExW(hroot, mid_w.as_ptr(), 0, 0x2001F, &mut hmid), ERROR_SUCCESS);
+            let ev_mid_direct = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            assert!(!ev_mid_direct.is_null());
+            assert_eq!(
+                RegNotifyChangeKeyValue(hmid, FALSE, REG_NOTIFY_CHANGE_NAME, ev_mid_direct, TRUE),
+                ERROR_SUCCESS
+            );
+            let leaf2_w = crate::strings::to_wide_z("Mid\\Leaf2");
+            let mut hleaf2 = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExW(
+                    hroot,
+                    leaf2_w.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf2,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_root_subtree, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_mid_direct, 0), WAIT_OBJECT_0);
+
+            // 4. RegCreateKeyExA creating two missing levels together (`MidA\LeafA`) shares
+            //    the exact same intermediate notification path and wakes `ev_root_direct` once!
+            let mut hleaf_a = std::ptr::null_mut();
+            assert_eq!(
+                RegCreateKeyExA(
+                    hroot,
+                    b"MidA\\LeafA\0".as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    0x2001F,
+                    std::ptr::null_mut(),
+                    &mut hleaf_a,
+                    &mut disp,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(disp, REG_CREATED_NEW_KEY);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(ev_root_direct, 0), WAIT_TIMEOUT);
+            assert_eq!(WaitForSingleObject(ev_parent_direct, 0), WAIT_TIMEOUT);
+
+            // Cleanup.
+            let _ = ResetEvent(ev_parent_direct);
+            assert_eq!(RegCloseKey(hleaf_a), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hleaf2), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hmid), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hreopen_a), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hreopen_w), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hleaf), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hroot), ERROR_SUCCESS);
+            assert_eq!(RegCloseKey(hparent), ERROR_SUCCESS);
+            let _ = RegDeleteTreeW(hkcu, parent_sub.as_ptr());
+            assert_eq!(CloseHandle(ev_mid_direct), TRUE);
+            assert_eq!(CloseHandle(ev_parent_direct), TRUE);
+            assert_eq!(CloseHandle(ev_root_subtree), TRUE);
+            assert_eq!(CloseHandle(ev_root_direct), TRUE);
         }
     }
 

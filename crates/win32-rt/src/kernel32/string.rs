@@ -1482,11 +1482,14 @@ pub unsafe extern "win64" fn PathCchSkipRoot(psz_path: LPCWSTR, ppsz_root_end: *
     if psz_path.is_null() {
         return E_INVALIDARG;
     }
-    let len = wcslen(psz_path);
-    let slice = std::slice::from_raw_parts(psz_path, len);
-    match pathcch_root_len(slice) {
+    // Read into an aligned Vec<u16> without assuming 2-byte alignment of `psz_path`
+    // and without lossy UTF-8 conversion so every UTF-16 code unit offset is exact.
+    let units = crate::strings::read_wide_units_z(psz_path, PATHCCH_MAX_CCH);
+    match pathcch_root_len(&units) {
         Some(off) => {
-            std::ptr::write_unaligned(ppsz_root_end, psz_path.add(off));
+            // Advance by byte offset so odd-aligned guest buffers keep exact provenance.
+            let end_ptr = (psz_path as *const u8).add(off * 2) as LPCWSTR;
+            std::ptr::write_unaligned(ppsz_root_end, end_ptr);
             S_OK
         }
         None => E_INVALIDARG,
@@ -1585,8 +1588,8 @@ pub unsafe extern "win64" fn PathCchCombineEx(
         return E_INVALIDARG;
     }
 
-    let p_in = from_wide_opt(psz_path_in).unwrap_or_default();
-    let p_more = from_wide_opt(psz_more).unwrap_or_default();
+    let p_in = crate::strings::read_wide_z_opt(psz_path_in, PATHCCH_MAX_CCH).unwrap_or_default();
+    let p_more = crate::strings::read_wide_z_opt(psz_more, PATHCCH_MAX_CCH).unwrap_or_default();
 
     let combined = if p_in.is_empty() && p_more.is_empty() {
         String::new()
@@ -1643,8 +1646,14 @@ pub unsafe extern "win64" fn PathCchCombineEx(
         std::ptr::write_unaligned(psz_path_out, 0);
         return STRSAFE_E_INSUFFICIENT_BUFFER;
     }
-    std::ptr::copy_nonoverlapping(wide.as_ptr(), psz_path_out, wide.len());
-    std::ptr::write_unaligned(psz_path_out.add(wide.len()), 0);
+    if !wide.is_empty() {
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr() as *const u8,
+            psz_path_out as *mut u8,
+            wide.len() * 2,
+        );
+    }
+    std::ptr::write_unaligned((psz_path_out as *mut u8).add(wide.len() * 2) as *mut u16, 0);
     S_OK
 }
 
@@ -1732,6 +1741,79 @@ mod tests {
                 STRSAFE_E_INSUFFICIENT_BUFFER
             );
             assert_eq!(tiny[0], 0);
+
+            // Empty string & null input rejected cleanly.
+            let empty = to_wide_z("");
+            let mut empty_end: LPCWSTR = p1.as_ptr();
+            assert_eq!(PathCchSkipRoot(empty.as_ptr(), &mut empty_end), E_INVALIDARG);
+            assert!(empty_end.is_null());
+            assert_eq!(PathCchSkipRoot(std::ptr::null(), &mut empty_end), E_INVALIDARG);
+            assert!(empty_end.is_null());
+
+            // Unaligned (odd-byte) guest UTF-16 buffers AND odd-aligned ppsz_root_end out-pointer
+            // across drive, UNC, extended UNC, lone backslash, empty, and unpaired surrogate units.
+            let mut raw_buf = [0xAAu8; 256];
+            let mut raw_out_ptr = [0x55u8; 16];
+            let odd_out_ptr = raw_out_ptr.as_mut_ptr().add(1) as *mut LPCWSTR;
+
+            let write_odd_units = |buf: &mut [u8], units: &[u16]| -> LPCWSTR {
+                let dst = buf.as_mut_ptr().add(1);
+                for (i, &u) in units.iter().enumerate() {
+                    std::ptr::write_unaligned(dst.add(i * 2) as *mut u16, u);
+                }
+                std::ptr::write_unaligned(dst.add(units.len() * 2) as *mut u16, 0u16);
+                dst as LPCWSTR
+            };
+
+            // Odd-aligned drive path + unpaired surrogate (0xD800) preserved without loss.
+            let mut drive_units = to_wide("C:\\dir\\");
+            drive_units.push(0xD800);
+            drive_units.extend(to_wide("tail.txt"));
+            let odd_in = write_odd_units(&mut raw_buf, &drive_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 3 * 2);
+            let got_units = crate::strings::read_wide_units_z(got_ptr, 64);
+            assert_eq!(got_units, drive_units[3..]);
+
+            // Odd-aligned drive-relative `D:foo` skips 2 code units (`D:`).
+            let drive_rel = to_wide("D:foo");
+            let odd_in = write_odd_units(&mut raw_buf, &drive_rel);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 2 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "foo");
+
+            // Odd-aligned UNC `\\srv\shr\rest` skips `\\srv\shr\`.
+            let unc_units = to_wide("\\\\srv\\shr\\rest");
+            let odd_in = write_odd_units(&mut raw_buf, &unc_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 10 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "rest");
+
+            // Odd-aligned extended UNC `\\?\UNC\host\share\leaf`.
+            let ext_unc_units = to_wide("\\\\?\\UNC\\host\\share\\leaf");
+            let odd_in = write_odd_units(&mut raw_buf, &ext_unc_units);
+            assert_eq!(PathCchSkipRoot(odd_in, odd_out_ptr), S_OK);
+            let got_ptr = std::ptr::read_unaligned(odd_out_ptr);
+            assert_eq!(got_ptr as usize, (odd_in as usize) + 19 * 2);
+            assert_eq!(crate::strings::read_wide_z(got_ptr, 64), "leaf");
+
+            // Odd-aligned empty string fails and writes NULL to odd_out_ptr.
+            let odd_empty = write_odd_units(&mut raw_buf, &[]);
+            assert_eq!(PathCchSkipRoot(odd_empty, odd_out_ptr), E_INVALIDARG);
+            assert!(std::ptr::read_unaligned(odd_out_ptr).is_null());
+
+            // PathCchCombineEx with odd-aligned inputs AND odd-aligned output buffer.
+            let mut raw_in1 = [0u8; 64];
+            let mut raw_in2 = [0u8; 64];
+            let mut raw_comb = [0xCCu8; 128];
+            let odd_base = write_odd_units(&mut raw_in1, &to_wide("C:\\Alpha\\Beta"));
+            let odd_more = write_odd_units(&mut raw_in2, &to_wide("..\\Gamma\\file.bin"));
+            let odd_comb = raw_comb.as_mut_ptr().add(1) as LPWSTR;
+            assert_eq!(PathCchCombineEx(odd_comb, 60, odd_base, odd_more, 0), S_OK);
+            assert_eq!(crate::strings::read_wide_z(odd_comb, 60), "C:\\Alpha\\Gamma\\file.bin");
         }
     }
 }
