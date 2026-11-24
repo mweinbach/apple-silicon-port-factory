@@ -111,8 +111,10 @@ pub(super) unsafe fn callout<F: FnOnce() -> (u64, u128)>(
             cpu.rip = l.rip;
             cpu.set_rflags(l.eflags);
             if l.mxcsr != 0 {
-                cpu.jx.mxcsr = l.mxcsr & 0xFFFF;
-                super::apply_guest_mxcsr_hw(cpu.jx.mxcsr);
+                let m = l.mxcsr & 0xFFFF;
+                cpu.jx.mxcsr = m;
+                win32_rt::ucrt::runtime::set_guest_mxcsr(m);
+                super::apply_guest_mxcsr_hw(m);
             }
             cpu.last_bits = [64; 16];
         }
@@ -137,14 +139,15 @@ pub(crate) unsafe fn callout_context(r: *mut EhLink, out: &mut Context) -> bool 
         out.gpr = gpr;
         out.rip = rip;
         out.eflags = eflags;
-        out.mx_csr = 0x1F80;
+        let mx = (*cpu).jx.mxcsr & 0xFFFF;
+        out.mx_csr = mx;
         out.seg_cs = 0x33;
         out.seg_ss = 0x2B;
         out.seg_ds = 0x2B;
         out.seg_es = 0x2B;
         out.seg_gs = 0x2B;
         out.seg_fs = 0x53;
-        out.flt_save[FLT_MXCSR..FLT_MXCSR + 4].copy_from_slice(&0x1F80u32.to_le_bytes());
+        out.flt_save[FLT_MXCSR..FLT_MXCSR + 4].copy_from_slice(&mx.to_le_bytes());
         for (i, x) in xmm.iter().enumerate() {
             out.flt_save[FLT_XMM0 + 16 * i..FLT_XMM0 + 16 * (i + 1)].copy_from_slice(&x.to_le_bytes());
         }
@@ -655,6 +658,9 @@ mod raise_tests {
                     xmm0: 0,
                     xmm6: 0,
                 };
+                // Non-default MXCSR: FTZ (0x8000) | RZ rounding (0x6000) | default masked exceptions (0x1F80).
+                const TEST_MXCSR: u32 = 0xDF80;
+                win32_rt::ucrt::runtime::set_guest_mxcsr(0x1F80);
                 let mut ctx = Context::zeroed();
                 ctx.context_flags = win32_rt::unwind::CONTEXT_FULL;
                 ctx.rip = target_va;
@@ -664,7 +670,7 @@ mod raise_tests {
                 ctx.gpr[12] = 0x9999_AAAA_BBBB_CCCC; // r12
                 ctx.gpr[15] = &mut out as *mut Out as u64; // r15
                 ctx.eflags = 0x241; // CF (0x1) | ZF (0x40) | IF (0x200)
-                ctx.mx_csr = 0x1F80;
+                ctx.mx_csr = TEST_MXCSR;
                 *ctx.xmm_mut(0) = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128.to_le_bytes();
                 *ctx.xmm_mut(6) = 0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444u128.to_le_bytes();
 
@@ -676,13 +682,16 @@ mod raise_tests {
                         [0; 8],
                     )
                 };
+                let tls_mxcsr = win32_rt::ucrt::runtime::guest_mxcsr();
+                win32_rt::ucrt::runtime::set_guest_mxcsr(0x1F80);
                 assert_eq!(ret, 0xBEEF_CAFE, "{label} mode {mode}: unexpected return");
                 assert_eq!(out.rax, 0x1111_2222_3333_4444, "{label} mode {mode}: rax");
                 assert_eq!(out.rbx, 0x5555_6666_7777_8888, "{label} mode {mode}: rbx");
                 assert_eq!(out.r12, 0x9999_AAAA_BBBB_CCCC, "{label} mode {mode}: r12");
                 assert_eq!(out.rsp, resume_rsp, "{label} mode {mode}: rsp");
                 assert_eq!(out.rflags & 0x41, 0x41, "{label} mode {mode}: CF|ZF in rflags");
-                assert_eq!(out.mxcsr, 0x1F80, "{label} mode {mode}: mxcsr");
+                assert_eq!(out.mxcsr, TEST_MXCSR, "{label} mode {mode}: mxcsr");
+                assert_eq!(tls_mxcsr, TEST_MXCSR, "{label} mode {mode}: thread-local guest_mxcsr");
                 assert_eq!(
                     out.xmm0,
                     0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128,
