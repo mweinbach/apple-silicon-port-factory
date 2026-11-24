@@ -1792,6 +1792,24 @@ impl w::LoaderOps for Loader {
         self.module_at(addr).map(|m| m.base)
     }
 
+    fn is_guest_pe_code(&self, addr: usize) -> bool {
+        let Some(m) = self.module_at(addr) else {
+            return false;
+        };
+        match &m.kind {
+            Kind::Pe { exec_ranges, .. } => {
+                let Some(rva) = addr.checked_sub(m.base) else {
+                    return false;
+                };
+                let Ok(rva32) = u32::try_from(rva) else {
+                    return false;
+                };
+                exec_ranges.iter().any(|&(s, e)| rva32 >= s && rva32 < e)
+            }
+            Kind::Builtin { .. } => false,
+        }
+    }
+
     fn loaded_modules(&self) -> Vec<(usize, u32, String)> {
         self.modules()
             .into_iter()

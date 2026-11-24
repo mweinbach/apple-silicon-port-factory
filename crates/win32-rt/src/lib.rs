@@ -128,6 +128,13 @@ pub fn set_guest_dispatcher(f: GuestDispatcherFn) {
     GUEST_DISPATCHER.store(f as usize, Ordering::Release);
 }
 
+/// Returns `true` when a guest x86-64 translator dispatcher has been installed via
+/// [`set_guest_dispatcher`].
+#[inline]
+pub fn has_guest_dispatcher() -> bool {
+    GUEST_DISPATCHER.load(Ordering::Acquire) != 0
+}
+
 /// Register the `VA_DISPATCH` registrar (`aw2_game::exe::register_native_va`) so COM
 /// vtable method pointers and dynamically resolved builtins are known to `emu_run`.
 pub fn set_native_va_registrar(f: NativeVaRegistrarFn) {
@@ -363,6 +370,11 @@ pub trait LoaderOps: Send + Sync {
     fn module_path(&self, hmod: Option<usize>) -> Option<String>;
     /// HMODULE of the image containing `addr`.
     fn module_from_address(&self, addr: usize) -> Option<usize>;
+    /// Returns `true` strictly if `addr` lies within an executable code section of a real
+    /// mapped guest PE image (excluding synthetic builtin DLLs, PE headers, and data sections).
+    fn is_guest_pe_code(&self, _addr: usize) -> bool {
+        false
+    }
     /// All currently loaded modules as `(image_base, image_size, win_path)`.
     fn loaded_modules(&self) -> Vec<(usize, u32, String)> {
         Vec::new()
@@ -1032,5 +1044,25 @@ mod tests {
         for p in &math {
             assert!(!plain.contains(p), "function {p:#x} present in both plain and pure_float_math tables");
         }
+    }
+
+    pub(crate) struct ScopedGuestDispatcherGuard {
+        prev: usize,
+    }
+
+    impl Drop for ScopedGuestDispatcherGuard {
+        fn drop(&mut self) {
+            GUEST_DISPATCHER.store(self.prev, Ordering::Release);
+        }
+    }
+
+    /// Test-only harness to install a scoped guest callback dispatcher and restore the prior
+    /// value on drop. Never available in production builds.
+    pub(crate) fn install_test_guest_dispatcher(
+        f: Option<GuestDispatcherFn>,
+    ) -> ScopedGuestDispatcherGuard {
+        let next = f.map_or(0, |func| func as usize);
+        let prev = GUEST_DISPATCHER.swap(next, Ordering::AcqRel);
+        ScopedGuestDispatcherGuard { prev }
     }
 }

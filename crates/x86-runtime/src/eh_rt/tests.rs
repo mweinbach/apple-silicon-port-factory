@@ -1530,4 +1530,131 @@ fn exe_try_call_catch_all_through_guest_entry() {
     force(0);
 }
 
+/// End-to-end translated guest x86-64 `RtlInstallFunctionTableCallback` + `RtlLookupFunctionEntry`:
+/// installs real x86-64 callback machine code in committed executable guest memory, dispatches it
+/// through the live ARM64 translator (`exe::call_va8`), rejects unvalidated/non-guest addresses
+/// before invocation, and enforces at-use executable-provenance revalidation after `VirtualProtect`.
+#[test]
+fn rtl_install_function_table_callback_translates_and_dispatches_guest_x86_code() {
+    use std::ffi::c_void;
+    use win32_rt::kernel32::memory::{
+        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+    };
+    use win32_rt::unwind::{
+        RtlDeleteFunctionTable, RtlInstallFunctionTableCallback, RtlLookupFunctionEntry,
+    };
+
+    setup();
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawRuntimeFunction {
+        begin_rva: u32,
+        end_rva: u32,
+        unwind_rva: u32,
+    }
+
+    #[repr(C)]
+    struct GuestCbCtx {
+        expected_pc: u64,
+        rf_ptr: *const RawRuntimeFunction,
+    }
+
+    const RANGE_BASE: u64 = 0x7100_0000;
+    const RANGE_LEN: u32 = 0x2000;
+    const TABLE_ID: u64 = 0x7100_0000 | 3;
+    const TARGET_PC: u64 = RANGE_BASE + 0x240;
+
+    static RF_ENTRY: RawRuntimeFunction = RawRuntimeFunction {
+        begin_rva: 0x200,
+        end_rva: 0x300,
+        unwind_rva: 0x400,
+    };
+
+    unsafe {
+        // Unregistered/non-guest sentinel pointer must be rejected at registration time.
+        assert_eq!(
+            RtlInstallFunctionTableCallback(
+                TABLE_ID,
+                RANGE_BASE,
+                RANGE_LEN,
+                0x0000_0000_1234_5678usize as *const c_void,
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+
+        let page = VirtualAlloc(
+            std::ptr::null_mut(),
+            0x1000,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        ) as *mut u8;
+        assert!(!page.is_null());
+
+        // Tiny x86-64 Win64 GET_RUNTIME_FUNCTION_CALLBACK(rcx = ControlPc, rdx = &GuestCbCtx):
+        //   cmp rcx, [rdx]         ; 48 3B 0A
+        //   jne .miss              ; 75 05
+        //   mov rax, [rdx + 8]     ; 48 8B 42 08
+        //   ret                    ; C3
+        // .miss:
+        //   xor eax, eax           ; 31 C0
+        //   ret                    ; C3
+        let code: [u8; 13] = [
+            0x48, 0x3B, 0x0A,
+            0x75, 0x05,
+            0x48, 0x8B, 0x42, 0x08,
+            0xC3,
+            0x31, 0xC0,
+            0xC3,
+        ];
+        std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+
+        let ctx = GuestCbCtx {
+            expected_pc: TARGET_PC,
+            rf_ptr: &RF_ENTRY,
+        };
+
+        assert_eq!(
+            RtlInstallFunctionTableCallback(
+                TABLE_ID,
+                RANGE_BASE,
+                RANGE_LEN,
+                page as *const c_void,
+                &ctx as *const GuestCbCtx as *const c_void,
+                std::ptr::null(),
+            ),
+            1
+        );
+
+        for mode in MODES {
+            force(mode);
+            let mut out_base = 0u64;
+            let got = RtlLookupFunctionEntry(TARGET_PC, &mut out_base, std::ptr::null_mut());
+            assert_eq!(got as usize, &RF_ENTRY as *const RawRuntimeFunction as usize, "mode {mode}");
+            assert_eq!(out_base, RANGE_BASE, "mode {mode}");
+
+            // In-range non-matching PC runs translated callback and returns NULL.
+            let miss = RtlLookupFunctionEntry(RANGE_BASE + 0x10, &mut out_base, std::ptr::null_mut());
+            assert!(miss.is_null(), "mode {mode}");
+
+            // Out-of-range PC does not match callback range.
+            let oor = RtlLookupFunctionEntry(RANGE_BASE + RANGE_LEN as u64, &mut out_base, std::ptr::null_mut());
+            assert!(oor.is_null(), "mode {mode}");
+        }
+        force(0);
+
+        // Revoking execute permission on the guest callback page must block invocation at use time.
+        let mut old_prot = 0u32;
+        assert_ne!(VirtualProtect(page as *mut c_void, 0x1000, PAGE_READWRITE, &mut old_prot), 0);
+        let mut out_base = 0u64;
+        assert!(RtlLookupFunctionEntry(TARGET_PC, &mut out_base, std::ptr::null_mut()).is_null());
+
+        assert_eq!(RtlDeleteFunctionTable(TABLE_ID as *const _), 1);
+        assert_ne!(VirtualFree(page as *mut c_void, 0, MEM_RELEASE), 0);
+    }
+}
+
 mod fh4;
