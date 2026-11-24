@@ -1215,3 +1215,138 @@ fn crypt_string_to_binary_all_flags_and_encode_object_ex_structures() {
         );
     }
 }
+
+#[test]
+fn crypt_binary_to_string_dpapi_and_cert_compare_work() {
+    use crate::misc::wintrust::CryptDataBlob;
+    unsafe {
+        // 1. CryptBinaryToStringA/W round-trip with CryptStringToBinaryA
+        let sample = b"Hello Crypt32 BinaryToString!";
+        let mut cch = 0u32;
+        assert_eq!(
+            CryptBinaryToStringA(
+                sample.as_ptr(),
+                sample.len() as u32,
+                0x0000_0001 | 0x4000_0000, // CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+                std::ptr::null_mut(),
+                &mut cch
+            ),
+            TRUE
+        );
+        assert!(cch > 1);
+        let mut out_a = vec![0u8; cch as usize];
+        assert_eq!(
+            CryptBinaryToStringA(
+                sample.as_ptr(),
+                sample.len() as u32,
+                0x0000_0001 | 0x4000_0000,
+                out_a.as_mut_ptr(),
+                &mut cch
+            ),
+            TRUE
+        );
+        let b64 = std::str::from_utf8(&out_a[..cch as usize]).unwrap();
+        assert_eq!(b64, "SGVsbG8gQ3J5cHQzMiBCaW5hcnlUb1N0cmluZyE=");
+
+        // Wide hex raw
+        let raw_hex = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let mut wcch = 0u32;
+        assert_eq!(
+            CryptBinaryToStringW(
+                raw_hex.as_ptr(),
+                4,
+                0x0000_000C | 0x4000_0000, // HEXRAW | NOCRLF
+                std::ptr::null_mut(),
+                &mut wcch
+            ),
+            TRUE
+        );
+        let mut out_w = vec![0u16; wcch as usize];
+        assert_eq!(
+            CryptBinaryToStringW(
+                raw_hex.as_ptr(),
+                4,
+                0x0000_000C | 0x4000_0000,
+                out_w.as_mut_ptr(),
+                &mut wcch
+            ),
+            TRUE
+        );
+        assert_eq!(String::from_utf16_lossy(&out_w[..wcch as usize]), "deadbeef");
+
+        // 2. CertCompareIntegerBlob (redundant sign-extension bytes match)
+        let i1 = [0x2Au8];
+        let i2 = [0x2Au8, 0x00, 0x00];
+        let b1 = CryptDataBlob { cb_data: 1, pb_data: i1.as_ptr() as *mut u8 };
+        let b2 = CryptDataBlob { cb_data: 3, pb_data: i2.as_ptr() as *mut u8 };
+        assert_eq!(CertCompareIntegerBlob(&b1 as *const _ as *const c_void, &b2 as *const _ as *const c_void), TRUE);
+
+        // 3. CertCompareCertificateName
+        let n1 = b"\x30\x05\x31\x03test";
+        let nb1 = CryptDataBlob { cb_data: n1.len() as u32, pb_data: n1.as_ptr() as *mut u8 };
+        assert_eq!(CertCompareCertificateName(1, &nb1 as *const _ as *const c_void, &nb1 as *const _ as *const c_void), TRUE);
+
+        // 4. CryptProtectData / CryptUnprotectData with entropy + tamper rejection
+        let secret = b"top secret game token 12345";
+        let ent = b"app-entropy";
+        let descr = crate::strings::to_wide_z("session-key");
+        let in_blob = CryptDataBlob { cb_data: secret.len() as u32, pb_data: secret.as_ptr() as *mut u8 };
+        let ent_blob = CryptDataBlob { cb_data: ent.len() as u32, pb_data: ent.as_ptr() as *mut u8 };
+        let mut protected = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptProtectData(
+                &in_blob as *const _ as *const c_void,
+                descr.as_ptr(),
+                &ent_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut protected as *mut _ as *mut c_void
+            ),
+            TRUE
+        );
+        assert!(protected.cb_data > secret.len() as u32);
+
+        let mut recovered = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        let mut out_descr: LPWSTR = std::ptr::null_mut();
+        assert_eq!(
+            CryptUnprotectData(
+                &protected as *const _ as *const c_void,
+                &mut out_descr,
+                &ent_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut recovered as *mut _ as *mut c_void
+            ),
+            TRUE
+        );
+        assert_eq!(
+            std::slice::from_raw_parts(recovered.pb_data, recovered.cb_data as usize),
+            secret
+        );
+        assert_eq!(crate::strings::from_wide(out_descr), "session-key");
+
+        // Wrong entropy fails cleanly with ERROR_INVALID_DATA
+        let bad_ent = b"wrong-entropy";
+        let bad_blob = CryptDataBlob { cb_data: bad_ent.len() as u32, pb_data: bad_ent.as_ptr() as *mut u8 };
+        let mut fail_out = CryptDataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+        assert_eq!(
+            CryptUnprotectData(
+                &protected as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                &bad_blob as *const _ as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                &mut fail_out as *mut _ as *mut c_void
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_DATA);
+
+        crate::kernel32::memory::LocalFree(protected.pb_data as *mut c_void);
+        crate::kernel32::memory::LocalFree(recovered.pb_data as *mut c_void);
+        crate::kernel32::memory::LocalFree(out_descr as *mut c_void);
+    }
+}

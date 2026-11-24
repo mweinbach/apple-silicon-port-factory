@@ -11,11 +11,11 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **313** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 178 |
-| `failing` (honest-failing macro exports) | 80 |
+| Total remaining stub sites | **262** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 167 |
+| `failing` (honest-failing macro exports) | 40 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 55 |
-| DLLs with remaining stubs | 46 |
+| DLLs with remaining stubs | 45 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
@@ -41,25 +41,25 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
-| `kernel32.dll` | 38 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
-| `crypt32.dll` | 26 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
-| `ws2_32.dll` | 21 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
+| `kernel32.dll` | 34 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `bcrypt.dll` | 20 | Unimplemented CNG algorithm, key-wrap blob, or padding mode | Add remaining CNG algorithms/padding modes (OAEP/PSS/ECDH/3DES) backed by CommonCrypto/ring as games import them. |
-| `advapi32.dll` | 19 | Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class | Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants. |
-| `dbghelp.dll` | 17 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
-| `user32.dll` | 16 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
+| `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `d3d11.dll` | 14 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
+| `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
 | `dxgi.dll` | 10 | Unsupported Windows-only DXGI path (WARP software rasterizer, UWP CoreWindow, exclusive fullscreen ownership, event notifications) | Implement VSync-synchronized WaitForVBlank via CVDisplayLink/CADisplayLink and shared-handle LUID lookup; keep WARP/CoreWindow honestly unsupported. |
 | `vulkan_1.dll` | 10 | Proprietary NVIDIA Reflex Low Latency Vulkan extension (NvLL_VK_*) | Return NVLL_VK_NO_IMPLEMENTATION honestly on Apple Silicon, or map sleep/marker semantics to Metal frame pacing. |
+| `ws2_32.dll` | 10 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
 | `libxess_dx11.dll` | 9 | Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*) | Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks. |
 | `ntdll.dll` | 9 | Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export | Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported. |
+| `advapi32.dll` | 8 | Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class | Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants. |
 | `amd_fidelityfx_loader_dx12.dll` | 6 | AMD FidelityFX Frame Generation / unsupported FFX context variant | Keep upscaler contexts routed to MetalFX; report FFX_API_RETURN_NO_PROVIDER honestly for frame-gen until Metal 4 frame interpolation is wired. |
 | `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
 | `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nvngx_dlss.dll` | 5 | Proprietary NVIDIA NGX DLSS / Vulkan NGX extension | Route D3D12 NGX features through MetalFX temporal/spatial scalers; implement Vulkan NGX -> MetalFX or MoltenVK bridge when needed. |
+| `dbghelp.dll` | 4 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
 | `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `physx_64.dll` | 4 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
 | `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
@@ -69,7 +69,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `d3d12.dll` | 2 | D3D12 root-signature deserializer COM object not yet implemented | Parse DXBC/RTS0 root-signature blobs in win32-rt/src/d3d12 and expose ID3D12RootSignatureDeserializer / VersionedDeserializer. |
 | `libcurl.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `oleaut32.dll` | 2 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `oo2core_9_win64.dll` | 2 | Proprietary RAD Oodle compression (cannot be clean-room reimplemented legally without a license) | Always run the game's shipping oo2core_*_win64.dll PE via x86-runtime ARM64 JIT; keep this honest fallback returning 0 only when no shipping DLL exists. |
 | `sl.interposer.dll` | 2 | Proprietary NVIDIA Streamline plugin host (requires NVIDIA GPU + signed NGX plugins) | Keep honest eErrorFeatureNotSupported reporting; route DLSS/upscaling requests to MetalFX via nvngx_dlss/libxess/FFX bridges. |
 | `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
@@ -88,7 +87,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xinput1_4.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 
-### `kernel32.dll` (38)
+### `kernel32.dll` (34)
 
 - **Reason:** Partial Windows kernel/file/memory/locale/job/threadpool sub-feature
 - **Next step:** Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives.
@@ -108,16 +107,12 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `GetGeoInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1125` | `"GetGeoInfo for geo id {geo} answered with US data"` |
 | `GetLocaleInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:918` | `"locale {lcid:#x} not available; answering with en-US data"` |
 | `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
-| `GetThreadTimes` | `stub` | `crates/win32-rt/src/kernel32/time.rs:617` | `"GetThreadTimes for another thread returns 0 CPU time"` |
-| `HeapDestroy` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1090` | `"HeapDestroy does not free outstanding blocks"` |
-| `HeapWalk` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1144` | `"HeapWalk unsupported"` |
 | `InitOnceBeginInitialize` | `stub` | `crates/win32-rt/src/sync.rs:744` | `"INIT_ONCE_ASYNC treated as synchronous"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
 | `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6837` | `"MapViewOfFile3 on another process"` |
 | `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2526` | `"MoveFileExA delete-on-reboot ignored"` |
 | `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2519` | `"MoveFileExW delete-on-reboot ignored"` |
-| `QueryThreadCycleTime` | `stub` | `crates/win32-rt/src/kernel32/time.rs:630` | `"QueryThreadCycleTime for another thread returns 0"` |
 | `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2198` | `"SetFileInformationByHandle class {class} not supported"` |
 | `SetInformationJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1659` | `"SetInformationJobObject class {class} ignored"` |
 | `SetThreadAffinityMask` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:244` | `"thread affinity not applied"` |
@@ -133,69 +128,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:365` | `"MEM_WRITE_WATCH not tracked"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:368` | `"PAGE_GUARD not emulated (treated as normal pages)"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:375` | `"MEM_RESET_UNDO: contents may have been discarded"` |
-
-### `crypt32.dll` (26)
-
-- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
-- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CertCompareCertificateName` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertCompareIntegerBlob` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertFindExtension` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CertFreeCRLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:357` | `"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"` |
-| `CertFreeCTLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:364` | `"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"` |
-| `CertGetCertificateContextProperty` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameA` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertStrToNameW` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CertVerifySubjectCertificateContext` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptBinaryToStringA` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptBinaryToStringW` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObject` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecodeObjectEx` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptFindOIDInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptMsgOpenToDecode` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `CryptMsgUpdate` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptProtectData` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptUnprotectData` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptVerifyMessageSignature` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:47` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `PFXImportCertStore` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
-| `cert_free_certificate_chain_engine_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:593` | `"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"` |
-| `cert_free_certificate_chain_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:787` | `"CertFreeCertificateChain({chain:p}): foreign chain ignored"` |
-| `cert_verify_certificate_chain_policy_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:807` | `"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"` |
-| `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
-| `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
-
-### `ws2_32.dll` (21)
-
-- **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
-- **Next step:** Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `WSAAsyncSelect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSACancelAsyncRequest` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAEnumProtocolsA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAEnumProtocolsW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAHtonl` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAHtons` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1552` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
-| `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSANtohl` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSANtohs` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSARecvDisconnect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSARecvMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSASendDisconnect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSASendMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:2989` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1089` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
-| `gethostbyaddr` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:1012` | `*mut c_void = std::ptr::null_mut(), err WSAHOST_NOT_FOUND` |
-| `gethostbyname` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:1012` | `*mut c_void = std::ptr::null_mut(), err WSAHOST_NOT_FOUND` |
-| `getprotobyname` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:1015` | `*mut c_void = std::ptr::null_mut(), err WSANO_DATA` |
 
 ### `bcrypt.dll` (20)
 
@@ -225,81 +157,32 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `BCryptVerifySignature` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2122` | `"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"` |
 | `bcrypt_aes_crypt` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2173` | `"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }` |
 
-### `advapi32.dll` (19)
+### `crypt32.dll` (19)
 
-- **Reason:** Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class
-- **Next step:** Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CredFree` | `stub` | `crates/win32-rt/src/advapi32.rs:2681` | `"CredFree({p:p}): buffer not allocated by us"` |
-| `CredWriteW` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptAcquireContextA` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptAcquireContextW` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptCreateHash` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDestroyHash` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetHashParam` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetProvParam` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptHashData` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptReleaseContext` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptSetHashParam` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2639` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1353` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
-
-### `dbghelp.dll` (17)
-
-- **Reason:** Unimplemented DbgHelp stack walk or minidump writer
-- **Next step:** Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump.
+- **Reason:** Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property
+- **Next step:** Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring.
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `MiniDumpWriteDump` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `StackWalk64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymCleanup` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymFromAddr` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymFromAddrW` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetLineFromAddr64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetLineFromAddrW64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetModuleInfo64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetModuleInfoW64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetSearchPath` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetSearchPathW` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetSymFromAddr64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymInitialize` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymInitializeW` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymLoadModule64` | `stub` | `crates/win32-rt/src/misc/dbghelp.rs:48` | `"SymLoadModule64 -> 0"` |
-| `SymSetSearchPath` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymSetSearchPathW` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:149` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-
-### `user32.dll` (16)
-
-- **Reason:** Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature
-- **Next step:** Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:987` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
-| `DisplayConfigGetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:684` | `"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
-| `DisplayConfigSetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:692` | `"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
-| `GetClassLongPtrW` | `stub` | `crates/win32-rt/src/user32/window.rs:1931` | `"GetClassLongPtrW(index {idx}) -> 0"` |
-| `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:234` | `"GetSystemMetrics({index}) -> 0"` |
-| `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:553` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
-| `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1363` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
-| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:880` | `"ReplyMessage: early reply not supported"` |
-| `SetClassLongPtrW` | `stub` | `crates/win32-rt/src/user32/window.rs:1942` | `"SetClassLongPtrW(index {idx}) ignored"` |
-| `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
-| `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
-| `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1670` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
-| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:354` | `"SystemParametersInfo{}(SPI_GETNONCLIENTMETRICS) not supported", if wide { "W" } else { "A" }` |
-| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:359` | `"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:394` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
-| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:416` | `"GetUserObjectInformation index {index} not supported"` |
+| `CertFreeCRLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:354` | `"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"` |
+| `CertFreeCTLContext` | `stub` | `crates/win32-rt/src/misc/crypt32.rs:361` | `"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"` |
+| `CertGetCertificateContextProperty` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CertStrToNameA` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CertStrToNameW` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CertVerifySubjectCertificateContext` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDecodeObject` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDecodeObjectEx` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptFindOIDInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
+| `CryptImportPublicKeyInfo` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptMsgOpenToDecode` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
+| `CryptMsgUpdate` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptVerifyMessageSignature` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:46` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `PFXImportCertStore` | `failing` | `crates/win32-rt/src/misc/crypt32.rs:41` | `*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND` |
+| `cert_free_certificate_chain_engine_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:593` | `"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"` |
+| `cert_free_certificate_chain_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:787` | `"CertFreeCertificateChain({chain:p}): foreign chain ignored"` |
+| `cert_verify_certificate_chain_policy_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:807` | `"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"` |
+| `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
+| `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
 
 ### `d3d11.dll` (14)
 
@@ -322,6 +205,27 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `hs_set_shader` | `stub` | `crates/win32-rt/src/d3d11/context.rs:1969` | `"HSSetShader(non-null) ignored"` |
 | `surf_get_dc` | `stub` | `crates/win32-rt/src/d3d11/resources.rs:1308` | `"IDXGISurface1::GetDC -> E_NOTIMPL"` |
 | `swap_device_context_state` | `stub` | `crates/win32-rt/src/d3d11/context.rs:3013` | `"ID3D11DeviceContext1::SwapDeviceContextState not implemented"` |
+
+### `user32.dll` (13)
+
+- **Reason:** Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature
+- **Next step:** Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:987` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
+| `DisplayConfigGetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:684` | `"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
+| `DisplayConfigSetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:692` | `"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
+| `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:234` | `"GetSystemMetrics({index}) -> 0"` |
+| `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:601` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
+| `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1363` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
+| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:880` | `"ReplyMessage: early reply not supported"` |
+| `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
+| `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
+| `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1718` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
+| `spi` | `stub` | `crates/win32-rt/src/user32/misc.rs:407` | `"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }` |
+| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:442` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
+| `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:464` | `"GetUserObjectInformation index {index} not supported"` |
 
 ### `ole32.dll` (12)
 
@@ -399,6 +303,24 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `NvLL_VK_Sleep` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
 | `NvLL_VK_Unload` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:3641` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
 
+### `ws2_32.dll` (10)
+
+- **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
+- **Next step:** Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `WSAAsyncSelect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSACancelAsyncRequest` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1782` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
+| `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSARecvMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSASendMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1319` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
+
 ### `libxess_dx11.dll` (9)
 
 - **Reason:** Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*)
@@ -432,6 +354,22 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:230` | `"NtQueryInformationProcess class {class}"` |
 | `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:294` | `"NtQueryInformationThread class {class}"` |
 | `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:413` | `"NtQuerySystemInformation class {class}"` |
+
+### `advapi32.dll` (8)
+
+- **Reason:** Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class
+- **Next step:** Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:2950` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1353` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
 
 ### `amd_fidelityfx_loader_dx12.dll` (6)
 
@@ -500,6 +438,18 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `NVSDK_NGX_VULKAN_EvaluateFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:744` | `"NVSDK_NGX_VULKAN_EvaluateFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"` |
 | `NVSDK_NGX_VULKAN_Init` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:702` | `"NVSDK_NGX_VULKAN_Init: Vulkan NGX upscaling is not implemented -> FAIL_FeatureNotSupported"` |
 | `NVSDK_NGX_VULKAN_ReleaseFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:751` | `"NVSDK_NGX_VULKAN_ReleaseFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"` |
+
+### `dbghelp.dll` (4)
+
+- **Reason:** Unimplemented DbgHelp stack walk or minidump writer
+- **Next step:** Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `MiniDumpWriteDump` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `StackWalk64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `SymGetLineFromAddr64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
+| `SymGetLineFromAddrW64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
 
 ### `dwrite.dll` (4)
 
@@ -600,16 +550,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `core_cmd_set_sample_positions` | `middleware_stub` | `crates/win32-rt/src/misc/nri/cmdlist.rs:965` | `"CmdSetSamplePositions: programmable sample positions not supported on Metal"` |
 | `core_create_query_pool` | `middleware_stub` | `crates/win32-rt/src/misc/nri/device.rs:1383` | `"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type` |
-
-### `oleaut32.dll` (2)
-
-- **Reason:** Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion
-- **Next step:** Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `VariantChangeType` | `stub` | `crates/win32-rt/src/misc/oleaut32.rs:184` | `"VariantChangeType({cur_vt} -> {vt}) -> DISP_E_TYPEMISMATCH"` |
-| `VariantClear` | `stub` | `crates/win32-rt/src/misc/oleaut32.rs:108` | `"VariantClear: SAFEARRAY payload leaked"` |
 
 ### `oo2core_9_win64.dll` (2)
 

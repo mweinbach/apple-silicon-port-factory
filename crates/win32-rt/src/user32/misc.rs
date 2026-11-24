@@ -351,9 +351,57 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
             TRUE
         }
         SPI_GETNONCLIENTMETRICS => {
-            stub!("SystemParametersInfo{}(SPI_GETNONCLIENTMETRICS) not supported", if wide { "W" } else { "A" });
-            set_error(e::CALL_NOT_IMPLEMENTED);
-            FALSE
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            // NONCLIENTMETRICSA: 340 bytes (344 with iPaddedBorderWidth)
+            // NONCLIENTMETRICSW: 500 bytes (504 with iPaddedBorderWidth)
+            let base_sz: usize = if wide { 500 } else { 340 };
+            let padded_sz = base_sz + 4;
+            let cb = std::ptr::read_unaligned(pv as *const u32) as usize;
+            if cb < base_sz {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let write_len = cb.min(padded_sz);
+            std::ptr::write_bytes(pv.add(4), 0, write_len - 4);
+            let cap = super::window::nc_insets(ws::CAPTION, 0).1;
+            let ints: [i32; 9] = [
+                1,   // iBorderWidth
+                17,  // iScrollWidth
+                17,  // iScrollHeight
+                36,  // iCaptionWidth
+                cap, // iCaptionHeight
+                22,  // iSmCaptionWidth
+                22,  // iSmCaptionHeight
+                19,  // iMenuWidth
+                19,  // iMenuHeight
+            ];
+            for (i, &val) in ints.iter().enumerate() {
+                std::ptr::write_unaligned(pv.add(4 + i * 4) as *mut i32, val);
+            }
+            // Write 5 LOGFONT{A,W} entries (lfCaptionFont, lfSmCaptionFont, lfMenuFont,
+            // lfStatusFont, lfMessageFont) with standard Windows 10 9pt Segoe UI defaults.
+            let lf_size: usize = if wide { 92 } else { 60 };
+            let mut off = 40usize;
+            for _ in 0..5 {
+                let lf = pv.add(off);
+                std::ptr::write_unaligned(lf as *mut i32, -12); // lfHeight (9pt @ 96 DPI)
+                std::ptr::write_unaligned(lf.add(16) as *mut i32, 400); // lfWeight = FW_NORMAL
+                std::ptr::write_unaligned(lf.add(23), 1u8); // lfCharSet = DEFAULT_CHARSET
+                if wide {
+                    crate::strings::write_wide_trunc("Segoe UI", lf.add(28) as *mut u16, 32);
+                } else {
+                    let face = b"Segoe UI\0";
+                    std::ptr::copy_nonoverlapping(face.as_ptr(), lf.add(28), face.len());
+                }
+                off += lf_size;
+            }
+            if cb >= padded_sz {
+                std::ptr::write_unaligned(pv.add(base_sz) as *mut i32, 4); // iPaddedBorderWidth
+            }
+            TRUE
         }
         _ => {
             stub!("SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" });

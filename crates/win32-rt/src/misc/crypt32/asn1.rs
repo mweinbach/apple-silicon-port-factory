@@ -1373,3 +1373,549 @@ pub(super) unsafe fn crypt_string_to_binary_w_impl(
         pdw_flags,
     )
 }
+
+// ---------------------------------------------------------------------------
+// CryptBinaryToStringA / W
+// ---------------------------------------------------------------------------
+
+const CRYPT_STRING_NOCRLF: u32 = 0x4000_0000;
+const CRYPT_STRING_NOCR: u32 = 0x8000_0000;
+
+fn encode_base64_str(data: &[u8], url_safe: bool) -> String {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let tab = if url_safe { URL } else { STD };
+    let mut out = String::with_capacity(((data.len() + 2) / 3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(tab[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(tab[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(tab[((triple >> 6) & 0x3F) as usize] as char);
+        } else if !url_safe {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(tab[(triple & 0x3F) as usize] as char);
+        } else if !url_safe {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn format_binary_to_string(data: &[u8], flags: u32) -> Option<String> {
+    let eol = if (flags & CRYPT_STRING_NOCRLF) != 0 {
+        ""
+    } else if (flags & CRYPT_STRING_NOCR) != 0 {
+        "\n"
+    } else {
+        "\r\n"
+    };
+    let mode = flags & 0x0FFF_FFFF;
+    let wrap_64 = |raw: &str, nl: &str| -> String {
+        if nl.is_empty() {
+            return raw.to_string();
+        }
+        let mut s = String::with_capacity(raw.len() + (raw.len() / 64 + 1) * nl.len());
+        for chunk in raw.as_bytes().chunks(64) {
+            s.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            s.push_str(nl);
+        }
+        s
+    };
+    match mode {
+        CRYPT_STRING_BASE64 => Some(wrap_64(&encode_base64_str(data, false), eol)),
+        CRYPT_STRING_BASE64URI => {
+            let b = encode_base64_str(data, true);
+            Some(if eol.is_empty() { b } else { format!("{b}{eol}") })
+        }
+        CRYPT_STRING_BASE64HEADER => {
+            let body = wrap_64(&encode_base64_str(data, false), eol);
+            Some(format!(
+                "-----BEGIN CERTIFICATE-----{eol}{body}-----END CERTIFICATE-----{eol}"
+            ))
+        }
+        CRYPT_STRING_BASE64REQUESTHEADER => {
+            let body = wrap_64(&encode_base64_str(data, false), eol);
+            Some(format!(
+                "-----BEGIN NEW CERTIFICATE REQUEST-----{eol}{body}-----END NEW CERTIFICATE REQUEST-----{eol}"
+            ))
+        }
+        CRYPT_STRING_BASE64X509CRLHEADER => {
+            let body = wrap_64(&encode_base64_str(data, false), eol);
+            Some(format!(
+                "-----BEGIN X509 CRL-----{eol}{body}-----END X509 CRL-----{eol}"
+            ))
+        }
+        CRYPT_STRING_HEXRAW => {
+            let mut s = String::with_capacity(data.len() * 2 + eol.len());
+            for &b in data {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+            }
+            s.push_str(eol);
+            Some(s)
+        }
+        CRYPT_STRING_HEX
+        | CRYPT_STRING_HEXASCII
+        | CRYPT_STRING_HEXADDR
+        | CRYPT_STRING_HEXASCIIADDR => {
+            let with_addr = matches!(mode, CRYPT_STRING_HEXADDR | CRYPT_STRING_HEXASCIIADDR);
+            let with_ascii = matches!(mode, CRYPT_STRING_HEXASCII | CRYPT_STRING_HEXASCIIADDR);
+            let mut s = String::new();
+            for (row, chunk) in data.chunks(16).enumerate() {
+                use std::fmt::Write as _;
+                if with_addr {
+                    let _ = write!(s, "{:04x}  ", row * 16);
+                }
+                for (i, &b) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    let _ = write!(s, "{b:02x}");
+                }
+                if with_ascii {
+                    for _ in chunk.len()..16 {
+                        s.push_str("   ");
+                    }
+                    s.push_str("  ");
+                    for &b in chunk {
+                        let ch = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
+                        s.push(ch);
+                    }
+                }
+                s.push_str(eol);
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+pub(super) unsafe fn crypt_binary_to_string_a_impl(
+    pb_binary: *const u8,
+    cb_binary: u32,
+    dw_flags: u32,
+    psz_string: LPSTR,
+    pcch_string: *mut u32,
+) -> BOOL {
+    if pcch_string.is_null() || (cb_binary > 0 && pb_binary.is_null()) {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let slice = if cb_binary == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(pb_binary, cb_binary as usize)
+    };
+    let Some(encoded) = format_binary_to_string(slice, dw_flags) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let bytes = encoded.as_bytes();
+    let needed_with_nul = (bytes.len() + 1) as u32;
+    if psz_string.is_null() {
+        std::ptr::write_unaligned(pcch_string, needed_with_nul);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pcch_string);
+    if cap < needed_with_nul {
+        std::ptr::write_unaligned(pcch_string, needed_with_nul);
+        crate::teb::set_last_error(err::ERROR_MORE_DATA);
+        return FALSE;
+    }
+    if !bytes.is_empty() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), psz_string, bytes.len());
+    }
+    std::ptr::write_unaligned(psz_string.add(bytes.len()), 0);
+    std::ptr::write_unaligned(pcch_string, bytes.len() as u32);
+    TRUE
+}
+
+pub(super) unsafe fn crypt_binary_to_string_w_impl(
+    pb_binary: *const u8,
+    cb_binary: u32,
+    dw_flags: u32,
+    psz_string: LPWSTR,
+    pcch_string: *mut u32,
+) -> BOOL {
+    if pcch_string.is_null() || (cb_binary > 0 && pb_binary.is_null()) {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let slice = if cb_binary == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(pb_binary, cb_binary as usize)
+    };
+    let Some(encoded) = format_binary_to_string(slice, dw_flags) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    let units: Vec<u16> = encoded.encode_utf16().collect();
+    let needed_with_nul = (units.len() + 1) as u32;
+    if psz_string.is_null() {
+        std::ptr::write_unaligned(pcch_string, needed_with_nul);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pcch_string);
+    if cap < needed_with_nul {
+        std::ptr::write_unaligned(pcch_string, needed_with_nul);
+        crate::teb::set_last_error(err::ERROR_MORE_DATA);
+        return FALSE;
+    }
+    for (i, &u) in units.iter().enumerate() {
+        std::ptr::write_unaligned(psz_string.add(i), u);
+    }
+    std::ptr::write_unaligned(psz_string.add(units.len()), 0);
+    std::ptr::write_unaligned(pcch_string, units.len() as u32);
+    TRUE
+}
+
+// ---------------------------------------------------------------------------
+// CertCompareIntegerBlob / CertCompareCertificateName / CertFindExtension
+// ---------------------------------------------------------------------------
+
+unsafe fn read_blob_slice<'a>(blob_ptr: *const c_void) -> Option<&'a [u8]> {
+    if blob_ptr.is_null() {
+        return None;
+    }
+    let blob = std::ptr::read_unaligned(blob_ptr as *const CryptDataBlob);
+    if blob.cb_data == 0 {
+        Some(&[])
+    } else if blob.pb_data.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize))
+    }
+}
+
+fn trim_le_signed_int(mut b: &[u8]) -> &[u8] {
+    while b.len() > 1 {
+        let last = b[b.len() - 1];
+        let prev = b[b.len() - 2];
+        if (last == 0x00 && (prev & 0x80) == 0) || (last == 0xFF && (prev & 0x80) != 0) {
+            b = &b[..b.len() - 1];
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+pub(super) unsafe fn cert_compare_integer_blob_impl(
+    p_int1: *const c_void,
+    p_int2: *const c_void,
+) -> BOOL {
+    let (Some(a), Some(b)) = (read_blob_slice(p_int1), read_blob_slice(p_int2)) else {
+        return FALSE;
+    };
+    (trim_le_signed_int(a) == trim_le_signed_int(b)) as BOOL
+}
+
+pub(super) unsafe fn cert_compare_certificate_name_impl(
+    _dw_cert_encoding_type: u32,
+    p_cert_name1: *const c_void,
+    p_cert_name2: *const c_void,
+) -> BOOL {
+    let (Some(a), Some(b)) = (read_blob_slice(p_cert_name1), read_blob_slice(p_cert_name2)) else {
+        return FALSE;
+    };
+    (a == b) as BOOL
+}
+
+#[repr(C)]
+struct WinCertExtension {
+    psz_obj_id: *const u8,
+    f_critical: BOOL,
+    _pad: u32,
+    value: CryptDataBlob,
+}
+const _: () = assert!(std::mem::size_of::<WinCertExtension>() == 32);
+
+pub(super) unsafe fn cert_find_extension_impl(
+    psz_obj_id: LPCSTR,
+    c_extensions: u32,
+    rg_extensions: *mut c_void,
+) -> *mut c_void {
+    if psz_obj_id.is_null() || rg_extensions.is_null() || c_extensions == 0 {
+        return std::ptr::null_mut();
+    }
+    let want = crate::strings::from_ansi(psz_obj_id);
+    let base = rg_extensions as *mut WinCertExtension;
+    for i in 0..c_extensions as usize {
+        let ext_ptr = base.add(i);
+        let ext = std::ptr::read_unaligned(ext_ptr);
+        if !ext.psz_obj_id.is_null() && crate::strings::from_ansi(ext.psz_obj_id) == want {
+            return ext_ptr as *mut c_void;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// DPAPI: CryptProtectData / CryptUnprotectData (AES-256-CTR + HMAC-SHA256)
+// ---------------------------------------------------------------------------
+
+const DPAPI_MAGIC: &[u8; 8] = b"PFDPAPI1";
+const CRYPTPROTECT_LOCAL_MACHINE: u32 = 0x4;
+
+extern "C" {
+    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
+    fn CCHmac(
+        alg: u32,
+        key: *const c_void,
+        key_len: usize,
+        data: *const c_void,
+        data_len: usize,
+        mac: *mut u8,
+    );
+    fn CCCryptorCreateWithMode(
+        op: u32,
+        mode: u32,
+        alg: u32,
+        padding: u32,
+        iv: *const c_void,
+        key: *const c_void,
+        key_len: usize,
+        tweak: *const c_void,
+        tweak_len: usize,
+        num_rounds: i32,
+        options: u32,
+        cryptor_ref: *mut *mut c_void,
+    ) -> i32;
+    fn CCCryptorUpdate(
+        cryptor_ref: *mut c_void,
+        data_in: *const c_void,
+        data_in_len: usize,
+        data_out: *mut c_void,
+        data_out_avail: usize,
+        data_out_moved: *mut usize,
+    ) -> i32;
+    fn CCCryptorRelease(cryptor_ref: *mut c_void) -> i32;
+}
+
+unsafe fn dpapi_derive_keys(local_machine: bool, entropy: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(b"port-factory-dpapi-v1:");
+    if local_machine {
+        seed.extend_from_slice(b"machine:");
+    } else {
+        seed.extend_from_slice(b"user:");
+        if let Some(u) = crate::process::get_env("USERNAME") {
+            seed.extend_from_slice(u.as_bytes());
+        }
+    }
+    seed.extend_from_slice(b":entropy:");
+    seed.extend_from_slice(&(entropy.len() as u32).to_le_bytes());
+    seed.extend_from_slice(entropy);
+
+    let mut enc_input = seed.clone();
+    enc_input.extend_from_slice(b":enc");
+    let mut enc_key = [0u8; 32];
+    CC_SHA256(enc_input.as_ptr() as *const c_void, enc_input.len() as u32, enc_key.as_mut_ptr());
+
+    let mut mac_input = seed;
+    mac_input.extend_from_slice(b":mac");
+    let mut mac_key = [0u8; 32];
+    CC_SHA256(mac_input.as_ptr() as *const c_void, mac_input.len() as u32, mac_key.as_mut_ptr());
+    (enc_key, mac_key)
+}
+
+unsafe fn dpapi_aes256_ctr(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut cr: *mut c_void = std::ptr::null_mut();
+    let st = CCCryptorCreateWithMode(
+        0,
+        4,
+        0,
+        0,
+        iv.as_ptr() as *const c_void,
+        key.as_ptr() as *const c_void,
+        key.len(),
+        std::ptr::null(),
+        0,
+        0,
+        2,
+        &mut cr,
+    );
+    if st != 0 || cr.is_null() {
+        return None;
+    }
+    let mut out = vec![0u8; data.len()];
+    let mut moved = 0usize;
+    let st2 = CCCryptorUpdate(
+        cr,
+        data.as_ptr() as *const c_void,
+        data.len(),
+        out.as_mut_ptr() as *mut c_void,
+        out.len(),
+        &mut moved,
+    );
+    CCCryptorRelease(cr);
+    if st2 != 0 || moved != data.len() {
+        return None;
+    }
+    Some(out)
+}
+
+unsafe fn dpapi_hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut tag = [0u8; 32];
+    CCHmac(
+        2,
+        key.as_ptr() as *const c_void,
+        key.len(),
+        data.as_ptr() as *const c_void,
+        data.len(),
+        tag.as_mut_ptr(),
+    );
+    tag
+}
+
+pub(super) unsafe fn crypt_protect_data_impl(
+    p_data_in: *const c_void,
+    sz_data_descr: LPCWSTR,
+    p_optional_entropy: *const c_void,
+    _pv_reserved: *mut c_void,
+    _p_prompt_struct: *const c_void,
+    dw_flags: u32,
+    p_data_out: *mut c_void,
+) -> BOOL {
+    let Some(plain) = read_blob_slice(p_data_in) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    if p_data_out.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let entropy = read_blob_slice(p_optional_entropy).unwrap_or(&[]);
+    let descr = crate::strings::from_wide_opt(sz_data_descr).unwrap_or_default();
+    let descr_bytes = descr.as_bytes();
+    let scope_flags = dw_flags & CRYPTPROTECT_LOCAL_MACHINE;
+    let (enc_key, mac_key) = dpapi_derive_keys(scope_flags != 0, entropy);
+
+    let mut nonce = [0u8; 16];
+    libc::arc4random_buf(nonce.as_mut_ptr() as *mut c_void, nonce.len());
+
+    let mut combined_plain = Vec::with_capacity(descr_bytes.len() + plain.len());
+    combined_plain.extend_from_slice(descr_bytes);
+    combined_plain.extend_from_slice(plain);
+    let Some(ct) = dpapi_aes256_ctr(&enc_key, &nonce, &combined_plain) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    };
+
+    let mut env = Vec::with_capacity(8 + 4 + 16 + 4 + 4 + ct.len() + 32);
+    env.extend_from_slice(DPAPI_MAGIC);
+    env.extend_from_slice(&scope_flags.to_le_bytes());
+    env.extend_from_slice(&nonce);
+    env.extend_from_slice(&(descr_bytes.len() as u32).to_le_bytes());
+    env.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    env.extend_from_slice(&ct);
+    let tag = dpapi_hmac_sha256(&mac_key, &env);
+    env.extend_from_slice(&tag);
+
+    let buf = crate::heap::alloc(env.len(), false) as *mut u8;
+    if buf.is_null() {
+        crate::teb::set_last_error(err::ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    std::ptr::copy_nonoverlapping(env.as_ptr(), buf, env.len());
+    std::ptr::write_unaligned(
+        p_data_out as *mut CryptDataBlob,
+        CryptDataBlob {
+            cb_data: env.len() as u32,
+            pb_data: buf,
+        },
+    );
+    TRUE
+}
+
+pub(super) unsafe fn crypt_unprotect_data_impl(
+    p_data_in: *const c_void,
+    ppsz_data_descr: *mut LPWSTR,
+    p_optional_entropy: *const c_void,
+    _pv_reserved: *mut c_void,
+    _p_prompt_struct: *const c_void,
+    _dw_flags: u32,
+    p_data_out: *mut c_void,
+) -> BOOL {
+    let Some(env) = read_blob_slice(p_data_in) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    };
+    if p_data_out.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const MIN_LEN: usize = 8 + 4 + 16 + 4 + 4 + 32;
+    if env.len() < MIN_LEN || &env[..8] != DPAPI_MAGIC {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    let scope_flags = u32::from_le_bytes(env[8..12].try_into().unwrap());
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&env[12..28]);
+    let descr_len = u32::from_le_bytes(env[28..32].try_into().unwrap()) as usize;
+    let plain_len = u32::from_le_bytes(env[32..36].try_into().unwrap()) as usize;
+    let body_end = env.len() - 32;
+    if 36usize.saturating_add(descr_len).saturating_add(plain_len) != body_end {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    let entropy = read_blob_slice(p_optional_entropy).unwrap_or(&[]);
+    let (enc_key, mac_key) = dpapi_derive_keys((scope_flags & CRYPTPROTECT_LOCAL_MACHINE) != 0, entropy);
+    let expected_tag = dpapi_hmac_sha256(&mac_key, &env[..body_end]);
+    let mut diff = 0u8;
+    for (a, b) in expected_tag.iter().zip(env[body_end..].iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    let Some(combined) = dpapi_aes256_ctr(&enc_key, &nonce, &env[36..body_end]) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return FALSE;
+    };
+    let descr_slice = &combined[..descr_len];
+    let plain_slice = &combined[descr_len..];
+
+    let out_buf = if plain_slice.is_empty() {
+        crate::heap::alloc(1, true) as *mut u8
+    } else {
+        let p = crate::heap::alloc(plain_slice.len(), false) as *mut u8;
+        if p.is_null() {
+            crate::teb::set_last_error(err::ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+        std::ptr::copy_nonoverlapping(plain_slice.as_ptr(), p, plain_slice.len());
+        p
+    };
+    if !ppsz_data_descr.is_null() {
+        let s = String::from_utf8_lossy(descr_slice);
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let dbuf = crate::heap::alloc(wide.len() * 2, false) as *mut u16;
+        if !dbuf.is_null() {
+            for (i, &u) in wide.iter().enumerate() {
+                std::ptr::write_unaligned(dbuf.add(i), u);
+            }
+        }
+        std::ptr::write_unaligned(ppsz_data_descr, dbuf);
+    }
+    std::ptr::write_unaligned(
+        p_data_out as *mut CryptDataBlob,
+        CryptDataBlob {
+            cb_data: plain_slice.len() as u32,
+            pb_data: out_buf,
+        },
+    );
+    TRUE
+}

@@ -6,7 +6,9 @@
 //! requested size (so `HeapSize`/`_msize` are exact) and a magic value used to
 //! detect foreign pointers.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
 
 const MAGIC: u32 = 0x4157_3248; // "AW2H"
 const HDR: usize = 16;
@@ -23,17 +25,91 @@ pub const HEAP_GENERATE_EXCEPTIONS: u32 = 0x4;
 pub const HEAP_ZERO_MEMORY: u32 = 0x8;
 pub const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
+const PROCESS_HEAP_ID: u32 = 0x0001_0000;
+
 /// Fake HANDLE values for heaps: process heap is 0x10000, created heaps
 /// count up. They are not entries in the handle table (like Windows, where
 /// heap handles are the heap base address).
 pub fn process_heap() -> *mut c_void {
-    0x0001_0000 as *mut c_void
+    PROCESS_HEAP_ID as usize as *mut c_void
 }
 
 static NEXT_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0x0002_0000);
 
+/// Tracks live custom heaps (`heap_id -> set of live user pointers`).
+/// The process heap stays lock-free on the hot path; custom heaps created via
+/// `HeapCreate` are tracked so `HeapDestroy` frees every outstanding block and
+/// `HeapWalk` enumerates live allocations faithfully.
+fn custom_heaps() -> &'static Mutex<BTreeMap<u32, BTreeSet<usize>>> {
+    static M: OnceLock<Mutex<BTreeMap<u32, BTreeSet<usize>>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 pub fn create_heap() -> *mut c_void {
-    NEXT_HEAP.fetch_add(0x1_0000, std::sync::atomic::Ordering::Relaxed) as *mut c_void
+    let id = NEXT_HEAP.fetch_add(0x1_0000, std::sync::atomic::Ordering::Relaxed) as u32;
+    custom_heaps().lock().unwrap().insert(id, BTreeSet::new());
+    id as usize as *mut c_void
+}
+
+pub fn all_heaps() -> Vec<*mut c_void> {
+    let mut v = vec![process_heap()];
+    for &id in custom_heaps().lock().unwrap().keys() {
+        v.push(id as usize as *mut c_void);
+    }
+    v
+}
+
+pub unsafe fn alloc_in(heap_handle: *mut c_void, size: usize, zero: bool) -> *mut c_void {
+    let heap_id = heap_handle as usize as u32;
+    let tracked = heap_id != 0 && heap_id != PROCESS_HEAP_ID;
+    let p = alloc(size, zero);
+    if !p.is_null() && tracked {
+        let h = (p as *mut u8).sub(HDR) as *mut Header;
+        (*h).heap = heap_id;
+        let mut map = custom_heaps().lock().unwrap();
+        map.entry(heap_id).or_default().insert(p as usize);
+    }
+    p
+}
+
+pub unsafe fn destroy_heap(heap_handle: *mut c_void) -> bool {
+    let heap_id = heap_handle as usize as u32;
+    if heap_id == 0 || heap_id == PROCESS_HEAP_ID {
+        return false;
+    }
+    let blocks = custom_heaps().lock().unwrap().remove(&heap_id);
+    let Some(blocks) = blocks else {
+        return false;
+    };
+    for ptr in blocks {
+        let p = ptr as *mut c_void;
+        if let Some(h) = header(p) {
+            (*h).magic = 0xDEAD_BEEF;
+            (*h).heap = 0;
+            if !crate::shadow::heap_on() {
+                libc::free(h as *mut c_void);
+            }
+        }
+    }
+    true
+}
+
+/// Return the next `(user_ptr, block_size)` in `heap_handle` after `prev_ptr`
+/// (or the first block when `prev_ptr` is null).
+pub unsafe fn walk_next(heap_handle: *mut c_void, prev_ptr: *const c_void) -> Option<(*mut c_void, usize)> {
+    let heap_id = heap_handle as usize as u32;
+    let map = custom_heaps().lock().unwrap();
+    let set = map.get(&heap_id)?;
+    let next_addr = if prev_ptr.is_null() {
+        set.iter().next().copied()
+    } else {
+        set.range((std::ops::Bound::Excluded(prev_ptr as usize), std::ops::Bound::Unbounded))
+            .next()
+            .copied()
+    }?;
+    let p = next_addr as *mut c_void;
+    let sz = size(p).unwrap_or(0);
+    Some((p, sz))
 }
 
 pub unsafe fn alloc(size: usize, zero: bool) -> *mut c_void {
@@ -76,6 +152,12 @@ pub unsafe fn free(p: *mut c_void) -> bool {
     }
     match header(p) {
         Some(h) => {
+            let hid = (*h).heap;
+            if hid != 0 {
+                if let Some(set) = custom_heaps().lock().unwrap().get_mut(&hid) {
+                    set.remove(&(p as usize));
+                }
+            }
             (*h).magic = 0xDEAD_BEEF;
             if !crate::shadow::heap_on() {
                 libc::free(h as *mut c_void);
@@ -104,6 +186,7 @@ pub unsafe fn realloc(p: *mut c_void, new_size: usize, zero: bool, in_place_only
         return std::ptr::null_mut();
     };
     let old = (*h).size;
+    let old_hid = (*h).heap;
     if in_place_only {
         // We can only shrink (or keep) in place safely.
         if new_size <= old {
@@ -118,6 +201,14 @@ pub unsafe fn realloc(p: *mut c_void, new_size: usize, zero: bool, in_place_only
         if !np.is_null() {
             std::ptr::copy_nonoverlapping(p as *const u8, np as *mut u8, old.min(new_size));
             (*h).magic = 0xDEAD_BEEF;
+            if old_hid != 0 {
+                let nh = (np as *mut u8).sub(HDR) as *mut Header;
+                (*nh).heap = old_hid;
+                if let Some(set) = custom_heaps().lock().unwrap().get_mut(&old_hid) {
+                    set.remove(&(p as usize));
+                    set.insert(np as usize);
+                }
+            }
         }
         return np;
     }
@@ -128,6 +219,12 @@ pub unsafe fn realloc(p: *mut c_void, new_size: usize, zero: bool, in_place_only
     let nh = nb as *mut Header;
     (*nh).size = new_size;
     let np = nb.add(HDR);
+    if old_hid != 0 && (np as usize) != (p as usize) {
+        if let Some(set) = custom_heaps().lock().unwrap().get_mut(&old_hid) {
+            set.remove(&(p as usize));
+            set.insert(np as usize);
+        }
+    }
     if zero && new_size > old {
         std::ptr::write_bytes(np.add(old), 0, new_size - old);
     }

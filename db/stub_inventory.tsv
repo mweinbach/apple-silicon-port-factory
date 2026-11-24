@@ -1,22 +1,11 @@
 dll	api	kind	file	line	detail
-advapi32.dll	CredFree	stub	crates/win32-rt/src/advapi32.rs	2681	"CredFree({p:p}): buffer not allocated by us"
-advapi32.dll	CredWriteW	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptAcquireContextA	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptAcquireContextW	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptCreateHash	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyHash	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetHashParam	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetProvParam	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptHashData	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptReleaseContext	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSetHashParam	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2639	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDecrypt	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptDestroyKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptEncrypt	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptExportKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	2950	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1353	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PopMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	406	"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"
 amd_ags_x64.dll	agsDriverExtensionsDX12_PushMarker	middleware_stub	crates/win32-rt/src/misc/amd_ags_x64.rs	384	"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"
@@ -47,26 +36,19 @@ bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryp
 bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
 bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
 bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
-crypt32.dll	CertCompareCertificateName	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertCompareIntegerBlob	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertFindExtension	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	357	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
-crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	364	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
-crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptBinaryToStringA	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptBinaryToStringW	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertFreeCRLContext	stub	crates/win32-rt/src/misc/crypt32.rs	354	"CertFreeCRLContext({ctx:p}): foreign CRL context ignored"
+crypt32.dll	CertFreeCTLContext	stub	crates/win32-rt/src/misc/crypt32.rs	361	"CertFreeCTLContext({ctx:p}): foreign CTL context ignored"
+crypt32.dll	CertGetCertificateContextProperty	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameA	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertStrToNameW	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CertVerifySubjectCertificateContext	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObject	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptDecodeObjectEx	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 crypt32.dll	CryptFindOIDInfo	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 crypt32.dll	CryptMsgOpenToDecode	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
-crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptProtectData	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptUnprotectData	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	47	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptMsgUpdate	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptVerifyMessageSignature	failing	crates/win32-rt/src/misc/crypt32.rs	46	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 crypt32.dll	PFXImportCertStore	failing	crates/win32-rt/src/misc/crypt32.rs	41	*mut c_void = std::ptr::null_mut(), err CRYPT_E_NOT_FOUND
 crypt32.dll	cert_free_certificate_chain_engine_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	593	"CertFreeCertificateChainEngine({engine:p}): foreign engine ignored"
 crypt32.dll	cert_free_certificate_chain_impl	stub	crates/win32-rt/src/misc/crypt32/chain.rs	787	"CertFreeCertificateChain({chain:p}): foreign chain ignored"
@@ -90,23 +72,10 @@ d3d11.dll	surf_get_dc	stub	crates/win32-rt/src/d3d11/resources.rs	1308	"IDXGISur
 d3d11.dll	swap_device_context_state	stub	crates/win32-rt/src/d3d11/context.rs	3013	"ID3D11DeviceContext1::SwapDeviceContextState not implemented"
 d3d12.dll	D3D12CreateRootSignatureDeserializer	stub	crates/win32-rt/src/d3d12/mod.rs	191	"D3D12CreateRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()
 d3d12.dll	D3D12CreateVersionedRootSignatureDeserializer	stub	crates/win32-rt/src/d3d12/mod.rs	199	"D3D12CreateVersionedRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()
-dbghelp.dll	MiniDumpWriteDump	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	StackWalk64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymCleanup	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymFromAddr	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymFromAddrW	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetLineFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetLineFromAddrW64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetModuleInfo64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetModuleInfoW64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetSearchPath	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetSearchPathW	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetSymFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymInitialize	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymInitializeW	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymLoadModule64	stub	crates/win32-rt/src/misc/dbghelp.rs	48	"SymLoadModule64 -> 0"
-dbghelp.dll	SymSetSearchPath	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymSetSearchPathW	failing	crates/win32-rt/src/misc/dbghelp.rs	149	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	MiniDumpWriteDump	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	StackWalk64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	SymGetLineFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+dbghelp.dll	SymGetLineFromAddrW64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 dinput8.dll	configure_devices	stub	crates/win32-rt/src/misc/dinput8.rs	1860	"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"
 dinput8.dll	dev_get_property	stub	crates/win32-rt/src/misc/dinput8.rs	1238	"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"
 dinput8.dll	dev_run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1556	"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"
@@ -145,16 +114,12 @@ kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file
 kernel32.dll	GetGeoInfoW	stub	crates/win32-rt/src/kernel32/string.rs	1125	"GetGeoInfo for geo id {geo} answered with US data"
 kernel32.dll	GetLocaleInfoW	stub	crates/win32-rt/src/kernel32/string.rs	918	"locale {lcid:#x} not available; answering with en-US data"
 kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	"custom NUMBERFMT ignored"
-kernel32.dll	GetThreadTimes	stub	crates/win32-rt/src/kernel32/time.rs	617	"GetThreadTimes for another thread returns 0 CPU time"
-kernel32.dll	HeapDestroy	stub	crates/win32-rt/src/kernel32/memory.rs	1090	"HeapDestroy does not free outstanding blocks"
-kernel32.dll	HeapWalk	stub	crates/win32-rt/src/kernel32/memory.rs	1144	"HeapWalk unsupported"
 kernel32.dll	InitOnceBeginInitialize	stub	crates/win32-rt/src/sync.rs	744	"INIT_ONCE_ASYNC treated as synchronous"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
 kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6837	"MapViewOfFile3 on another process"
 kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2526	"MoveFileExA delete-on-reboot ignored"
 kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2519	"MoveFileExW delete-on-reboot ignored"
-kernel32.dll	QueryThreadCycleTime	stub	crates/win32-rt/src/kernel32/time.rs	630	"QueryThreadCycleTime for another thread returns 0"
 kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2198	"SetFileInformationByHandle class {class} not supported"
 kernel32.dll	SetInformationJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1659	"SetInformationJobObject class {class} ignored"
 kernel32.dll	SetThreadAffinityMask	stub	crates/win32-rt/src/kernel32/threads.rs	244	"thread affinity not applied"
@@ -217,8 +182,6 @@ ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2639	"IProperty
 ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2658	concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")
 ole32.dll	pvs_create_size	stub	crates/win32-rt/src/misc/ole32.rs	2622	"IPropertyValueStatics::CreateSize -> E_NOTIMPL"
 ole32.dll	pvs_create_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2594	"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"
-oleaut32.dll	VariantChangeType	stub	crates/win32-rt/src/misc/oleaut32.rs	184	"VariantChangeType({cur_vt} -> {vt}) -> DISP_E_TYPEMISMATCH"
-oleaut32.dll	VariantClear	stub	crates/win32-rt/src/misc/oleaut32.rs	108	"VariantClear: SAFEARRAY payload leaked"
 oo2core_9_win64.dll	OodleLZ_Compress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	86	"oo2core!OodleLZ_Compress(compressor={compressor}, raw_len={raw_len})"
 oo2core_9_win64.dll	OodleLZ_Decompress	middleware_stub	crates/win32-rt/src/misc/oo2core_9_win64.rs	106	"oo2core!OodleLZ_Decompress(comp={comp_buf_size}, raw={raw_len})"
 physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2336	"PxGeometryQuery::computePenetration unsupported geometry0 {}", geom_type_name(t)
@@ -257,19 +220,16 @@ ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) r
 user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	987	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
 user32.dll	DisplayConfigGetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	684	"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
 user32.dll	DisplayConfigSetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	692	"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
-user32.dll	GetClassLongPtrW	stub	crates/win32-rt/src/user32/window.rs	1931	"GetClassLongPtrW(index {idx}) -> 0"
 user32.dll	GetSystemMetrics	stub	crates/win32-rt/src/user32/misc.rs	234	"GetSystemMetrics({index}) -> 0"
-user32.dll	RegisterHotKey	stub	crates/win32-rt/src/user32/misc.rs	553	"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize
+user32.dll	RegisterHotKey	stub	crates/win32-rt/src/user32/misc.rs	601	"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize
 user32.dll	RegisterRawInputDevices	stub	crates/win32-rt/src/user32/input.rs	1363	"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"
 user32.dll	ReplyMessage	stub	crates/win32-rt/src/user32/message.rs	880	"ReplyMessage: early reply not supported"
-user32.dll	SetClassLongPtrW	stub	crates/win32-rt/src/user32/window.rs	1942	"SetClassLongPtrW(index {idx}) ignored"
 user32.dll	def_window_proc	stub	crates/win32-rt/src/user32/defproc.rs	154	"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"
 user32.dll	load_cursor	stub	crates/win32-rt/src/user32/cursor.rs	87	"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"
-user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1670	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
-user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	354	"SystemParametersInfo{}(SPI_GETNONCLIENTMETRICS) not supported", if wide { "W" } else { "A" }
-user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	359	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
-user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	394	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
-user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	416	"GetUserObjectInformation index {index} not supported"
+user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1718	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
+user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	407	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	442	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
+user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	464	"GetUserObjectInformation index {index} not supported"
 uxtheme.dll	DrawThemeBackground	stub	crates/win32-rt/src/misc/uxtheme.rs	111	"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"
 uxtheme.dll	TaskDialogIndirect	stub	crates/win32-rt/src/misc/uxtheme.rs	203	"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"
 vulkan_1.dll	NvLL_VK_DestroyLowLatencyDevice	failing	crates/win32-rt/src/misc/vulkan_1.rs	3641	i32 = NVLL_VK_NO_IMPLEMENTATION, err 0
@@ -286,27 +246,16 @@ wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	
 wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"
-ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAEnumProtocolsA	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAEnumProtocolsW	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAHtonl	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAHtons	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1552	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
-ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSANtohl	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSANtohs	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSARecvDisconnect	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSARecvMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSASendDisconnect	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSASendMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	2989	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1089	"WSADuplicateSocket cross-process target pid={pid} unsupported"
-ws2_32.dll	gethostbyaddr	failing	crates/win32-rt/src/misc/ws2_32.rs	1012	*mut c_void = std::ptr::null_mut(), err WSAHOST_NOT_FOUND
-ws2_32.dll	gethostbyname	failing	crates/win32-rt/src/misc/ws2_32.rs	1012	*mut c_void = std::ptr::null_mut(), err WSAHOST_NOT_FOUND
-ws2_32.dll	getprotobyname	failing	crates/win32-rt/src/misc/ws2_32.rs	1015	*mut c_void = std::ptr::null_mut(), err WSANO_DATA
+ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1782	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
+ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSARecvMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSASendMsg	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1319	"WSADuplicateSocket cross-process target pid={pid} unsupported"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	216	"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	233	"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"
 xinput1_4.dll	XInputGetKeystroke	stub	crates/win32-rt/src/misc/xinput1_4.rs	608	"XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)"

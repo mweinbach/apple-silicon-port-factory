@@ -1030,7 +1030,7 @@ mod tests {
         }
         // Hit a failing! export once.
         unsafe {
-            let _ = crate::misc::ws2_32::getprotobyname();
+            let _ = crate::misc::ws2_32::WSAJoinLeaf();
         }
 
         let snap = snapshot();
@@ -1052,14 +1052,14 @@ mod tests {
         assert_eq!(snap.entries[1].first_frame, 42);
 
         assert_eq!(snap.entries[2].dll, "ws2_32.dll");
-        assert_eq!(snap.entries[2].api, "getprotobyname");
+        assert_eq!(snap.entries[2].api, "WSAJoinLeaf");
         assert_eq!(snap.entries[2].kind, StubKind::Failing);
         assert_eq!(snap.entries[2].hits, 1);
         assert_eq!(snap.entries[2].first_frame, 42);
 
         let table = snap.format_ranked_table();
         assert!(table.contains("zstd.dll!ZSTD_decompress"));
-        assert!(table.contains("ws2_32.dll!getprotobyname"));
+        assert!(table.contains("ws2_32.dll!WSAJoinLeaf"));
         assert!(table.contains("middleware_stub"));
         assert!(table.contains("failing"));
 
