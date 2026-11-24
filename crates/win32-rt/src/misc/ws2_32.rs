@@ -628,14 +628,15 @@ unsafe fn sockaddr_to_string(sa: *const u8, len: u32) -> Option<String> {
         return None;
     }
     let family = (sa as *const u16).read_unaligned();
-    let port = u16::from_be((sa.add(2) as *const u16).read_unaligned());
     match family {
         AF_INET if len >= 16 => {
-            let a = Ipv4Addr::from(*(sa.add(4) as *const [u8; 4]));
+            let port = u16::from_be((sa.add(2) as *const u16).read_unaligned());
+            let a = Ipv4Addr::from((sa.add(4) as *const [u8; 4]).read_unaligned());
             Some(if port != 0 { format!("{a}:{port}") } else { a.to_string() })
         }
         AF_INET6 if len >= 28 => {
-            let a = Ipv6Addr::from(*(sa.add(8) as *const [u8; 16]));
+            let port = u16::from_be((sa.add(2) as *const u16).read_unaligned());
+            let a = Ipv6Addr::from((sa.add(8) as *const [u8; 16]).read_unaligned());
             let scope = (sa.add(24) as *const u32).read_unaligned();
             let mut s = a.to_string();
             if scope != 0 {
@@ -655,12 +656,12 @@ pub unsafe extern "win64" fn WSAAddressToStringW(sa: *const u8, len: u32, _proto
         return err(WSAEINVAL, SOCKET_ERROR);
     };
     let w = crate::strings::to_wide_z(&s);
-    if out.is_null() || (*out_len as usize) < w.len() {
-        *out_len = w.len() as u32;
+    if out.is_null() || (out_len.read_unaligned() as usize) < w.len() {
+        out_len.write_unaligned(w.len() as u32);
         return err(WSAEFAULT, SOCKET_ERROR);
     }
-    std::ptr::copy_nonoverlapping(w.as_ptr(), out, w.len());
-    *out_len = w.len() as u32;
+    std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, out as *mut u8, std::mem::size_of_val(w.as_slice()));
+    out_len.write_unaligned(w.len() as u32);
     0
 }
 
@@ -671,8 +672,8 @@ pub unsafe extern "win64" fn WSAStringToAddressW(s: *const u16, family: i32, _pr
     let text = crate::strings::from_wide(s);
     match family as u16 {
         AF_INET => {
-            if *len < 16 {
-                *len = 16;
+            if len.read_unaligned() < 16 {
+                len.write_unaligned(16);
                 return err(WSAEFAULT, SOCKET_ERROR);
             }
             let parsed = text.parse::<std::net::SocketAddrV4>().ok().map(|a| (*a.ip(), a.port())).or_else(|| text.parse::<Ipv4Addr>().ok().map(|a| (a, 0)));
@@ -683,12 +684,12 @@ pub unsafe extern "win64" fn WSAStringToAddressW(s: *const u16, family: i32, _pr
             (sa as *mut u16).write_unaligned(AF_INET);
             (sa.add(2) as *mut u16).write_unaligned(port.to_be());
             std::ptr::copy_nonoverlapping(ip.octets().as_ptr(), sa.add(4), 4);
-            *len = 16;
+            len.write_unaligned(16);
             0
         }
         AF_INET6 => {
-            if *len < 28 {
-                *len = 28;
+            if len.read_unaligned() < 28 {
+                len.write_unaligned(28);
                 return err(WSAEFAULT, SOCKET_ERROR);
             }
             let parsed = text
@@ -704,7 +705,7 @@ pub unsafe extern "win64" fn WSAStringToAddressW(s: *const u16, family: i32, _pr
             (sa.add(2) as *mut u16).write_unaligned(port.to_be());
             std::ptr::copy_nonoverlapping(ip.octets().as_ptr(), sa.add(8), 16);
             (sa.add(24) as *mut u32).write_unaligned(scope);
-            *len = 28;
+            len.write_unaligned(28);
             0
         }
         _ => err(WSAEINVAL, SOCKET_ERROR),
@@ -2944,13 +2945,13 @@ pub unsafe extern "win64" fn WSAAddressToStringA(sa: *const u8, len: u32, _proto
         return err(WSAEINVAL, SOCKET_ERROR);
     };
     let need = s.len() + 1;
-    if out.is_null() || (*out_len as usize) < need {
-        *out_len = need as u32;
+    if out.is_null() || (out_len.read_unaligned() as usize) < need {
+        out_len.write_unaligned(need as u32);
         return err(WSAEFAULT, SOCKET_ERROR);
     }
     std::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len());
     *out.add(s.len()) = 0;
-    *out_len = need as u32;
+    out_len.write_unaligned(need as u32);
     0
 }
 
@@ -5237,15 +5238,129 @@ mod tests {
 
     #[test]
     fn string_to_address_and_back() {
+        #[repr(align(8))]
+        struct Aligned<const N: usize>([u8; N]);
+        const GUARD: u8 = 0xA5;
+
         unsafe {
-            let w = crate::strings::to_wide_z("192.168.1.2:8080");
-            let mut sa = [0u8; 16];
-            let mut len = 16i32;
-            assert_eq!(WSAStringToAddressW(w.as_ptr(), 2, std::ptr::null_mut(), sa.as_mut_ptr(), &mut len), 0);
-            let mut out = [0u16; 64];
-            let mut ol = 64u32;
-            assert_eq!(WSAAddressToStringW(sa.as_ptr(), 16, std::ptr::null_mut(), out.as_mut_ptr(), &mut ol), 0);
-            assert_eq!(crate::strings::from_wide(out.as_ptr()), "192.168.1.2:8080");
+            for (family, want_len, text) in [(AF_INET as i32, 16i32, "192.168.1.2:8080"), (AF_INET6 as i32, 28i32, "[fe80::1%3]:8080")] {
+                let want_bytes = want_len as usize;
+                let w = crate::strings::to_wide_z(text);
+                let mut a_in = text.as_bytes().to_vec();
+                a_in.push(0);
+                let need_units = w.len() as u32;
+                let need_ansi = (text.len() + 1) as u32;
+
+                // Odd-aligned length cell and sockaddr buffer for WSAStringToAddressW.
+                let mut len_cell = Aligned([GUARD; 8]);
+                let len_ptr = len_cell.0.as_mut_ptr().add(1) as *mut i32;
+                assert_eq!((len_ptr as usize) % 4, 1);
+                let mut sa_w = Aligned([GUARD; 32]);
+                let sa_w_ptr = sa_w.0.as_mut_ptr().add(1);
+
+                len_ptr.write_unaligned(want_len - 1);
+                assert_eq!(WSAStringToAddressW(w.as_ptr(), family, std::ptr::null_mut(), sa_w_ptr, len_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(len_ptr.read_unaligned(), want_len);
+                assert_eq!(len_cell.0[0], GUARD);
+                assert_eq!(&len_cell.0[5..], &[GUARD; 3]);
+                assert!(sa_w.0.iter().all(|&b| b == GUARD));
+
+                assert_eq!(WSAStringToAddressW(w.as_ptr(), family, std::ptr::null_mut(), sa_w_ptr, len_ptr), 0);
+                assert_eq!(len_ptr.read_unaligned(), want_len);
+                assert_eq!(len_cell.0[0], GUARD);
+                assert_eq!(&len_cell.0[5..], &[GUARD; 3]);
+                assert_eq!(sa_w.0[0], GUARD);
+                assert!(sa_w.0[1 + want_bytes..].iter().all(|&b| b == GUARD));
+
+                // Odd-aligned length cell and sockaddr buffer for WSAStringToAddressA.
+                let mut sa_a = Aligned([GUARD; 32]);
+                let sa_a_ptr = sa_a.0.as_mut_ptr().add(1);
+                len_ptr.write_unaligned(want_len - 1);
+                assert_eq!(WSAStringToAddressA(a_in.as_ptr(), family, std::ptr::null_mut(), sa_a_ptr, len_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(len_ptr.read_unaligned(), want_len);
+                assert!(sa_a.0.iter().all(|&b| b == GUARD));
+
+                assert_eq!(WSAStringToAddressA(a_in.as_ptr(), family, std::ptr::null_mut(), sa_a_ptr, len_ptr), 0);
+                assert_eq!(len_ptr.read_unaligned(), want_len);
+                assert_eq!(sa_a.0[0], GUARD);
+                assert!(sa_a.0[1 + want_bytes..].iter().all(|&b| b == GUARD));
+                assert_eq!(&sa_a.0[1..1 + want_bytes], &sa_w.0[1..1 + want_bytes]);
+
+                // Odd-aligned out_len and odd-aligned UTF-16 output buffer for WSAAddressToStringW.
+                let mut ol_cell = Aligned([GUARD; 8]);
+                let ol_ptr = ol_cell.0.as_mut_ptr().add(1) as *mut u32;
+                assert_eq!((ol_ptr as usize) % 4, 1);
+
+                ol_ptr.write_unaligned(0xDEAD_BEEF);
+                assert_eq!(WSAAddressToStringW(sa_w_ptr, want_len as u32, std::ptr::null_mut(), std::ptr::null_mut(), ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(ol_ptr.read_unaligned(), need_units);
+                assert_eq!(ol_cell.0[0], GUARD);
+                assert_eq!(&ol_cell.0[5..], &[GUARD; 3]);
+
+                let mut out_w = Aligned([GUARD; 64]);
+                let out_w_ptr = out_w.0.as_mut_ptr().add(1) as *mut u16;
+                assert_eq!((out_w_ptr as usize) % 2, 1);
+                ol_ptr.write_unaligned(need_units - 1);
+                assert_eq!(WSAAddressToStringW(sa_w_ptr, want_len as u32, std::ptr::null_mut(), out_w_ptr, ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(ol_ptr.read_unaligned(), need_units);
+                assert!(out_w.0.iter().all(|&b| b == GUARD));
+
+                assert_eq!(WSAAddressToStringW(sa_w_ptr, want_len as u32, std::ptr::null_mut(), out_w_ptr, ol_ptr), 0);
+                assert_eq!(ol_ptr.read_unaligned(), need_units);
+                assert_eq!(crate::strings::from_wide(out_w_ptr), text);
+                assert_eq!(ol_cell.0[0], GUARD);
+                assert_eq!(&ol_cell.0[5..], &[GUARD; 3]);
+                assert_eq!(out_w.0[0], GUARD);
+                assert!(out_w.0[1 + (need_units as usize) * 2..].iter().all(|&b| b == GUARD));
+
+                // Odd-aligned out_len and ANSI output buffer for WSAAddressToStringA.
+                ol_ptr.write_unaligned(0xDEAD_BEEF);
+                assert_eq!(WSAAddressToStringA(sa_a_ptr, want_len as u32, std::ptr::null_mut(), std::ptr::null_mut(), ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(ol_ptr.read_unaligned(), need_ansi);
+                assert_eq!(ol_cell.0[0], GUARD);
+                assert_eq!(&ol_cell.0[5..], &[GUARD; 3]);
+
+                let mut out_a = Aligned([GUARD; 64]);
+                let out_a_ptr = out_a.0.as_mut_ptr().add(1);
+                ol_ptr.write_unaligned(need_ansi - 1);
+                assert_eq!(WSAAddressToStringA(sa_a_ptr, want_len as u32, std::ptr::null_mut(), out_a_ptr, ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                assert_eq!(ol_ptr.read_unaligned(), need_ansi);
+                assert!(out_a.0.iter().all(|&b| b == GUARD));
+
+                assert_eq!(WSAAddressToStringA(sa_a_ptr, want_len as u32, std::ptr::null_mut(), out_a_ptr, ol_ptr), 0);
+                assert_eq!(ol_ptr.read_unaligned(), need_ansi);
+                assert_eq!(crate::strings::from_ansi(out_a_ptr), text);
+                assert_eq!(ol_cell.0[0], GUARD);
+                assert_eq!(&ol_cell.0[5..], &[GUARD; 3]);
+                assert_eq!(out_a.0[0], GUARD);
+                assert!(out_a.0[1 + need_ansi as usize..].iter().all(|&b| b == GUARD));
+            }
+
+            // Truncated sockaddrs (len 2 and 3) must fail cleanly without reading bytes 2..4.
+            let mut ol_cell = Aligned([GUARD; 8]);
+            let ol_ptr = ol_cell.0.as_mut_ptr().add(1) as *mut u32;
+            ol_ptr.write_unaligned(64);
+            let sa_len2 = AF_INET.to_ne_bytes();
+            let sa_len3 = [AF_INET6.to_ne_bytes()[0], AF_INET6.to_ne_bytes()[1], 0u8];
+            for (ptr, len) in [(sa_len2.as_ptr(), 2u32), (sa_len3.as_ptr(), 3u32)] {
+                assert_eq!(WSAAddressToStringW(ptr, len, std::ptr::null_mut(), std::ptr::null_mut(), ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEINVAL as i32);
+                assert_eq!(WSAAddressToStringA(ptr, len, std::ptr::null_mut(), std::ptr::null_mut(), ol_ptr), SOCKET_ERROR);
+                assert_eq!(WSAGetLastError(), WSAEINVAL as i32);
+                assert_eq!(ol_ptr.read_unaligned(), 64);
+                assert_eq!(ol_cell.0[0], GUARD);
+                assert_eq!(&ol_cell.0[5..], &[GUARD; 3]);
+            }
+            assert_eq!(WSAAddressToStringW(sa_len2.as_ptr(), 2, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+            assert_eq!(WSAAddressToStringA(sa_len2.as_ptr(), 2, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()), SOCKET_ERROR);
+            assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
         }
     }
 
