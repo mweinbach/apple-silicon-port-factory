@@ -157,12 +157,7 @@ pub struct FileObj {
     pub flags: u32,
     pub append: bool,
     delete_on_close: Mutex<bool>,
-    iocp: Mutex<Option<(Arc<IoCompletionPort>, usize)>>,
-    tp_io: Mutex<Option<Arc<TpIo>>>,
-    completion_modes: AtomicU8,
-    /// Manual-reset event representing handle completion state (used when
-    /// `GetOverlappedResultEx` waits on the file handle itself with `ov.h_event == NULL`).
-    io_event: Arc<Event>,
+    completion: Arc<IoCompletionBinding>,
     /// Unread peek buffer for pipes (`PeekNamedPipe` fills; `ReadFile`/`ReadFileEx` drains first).
     peek_buf: Mutex<VecDeque<u8>>,
     /// Lazily started kqueue directory watcher for `ReadDirectoryChangesW`.
@@ -183,10 +178,7 @@ impl FileObj {
             flags,
             append: false,
             delete_on_close: Mutex::new(flags & FILE_FLAG_DELETE_ON_CLOSE != 0),
-            iocp: Mutex::new(None),
-            tp_io: Mutex::new(None),
-            completion_modes: AtomicU8::new(0),
-            io_event: Arc::new(Event::new(true, true, None)),
+            completion: Arc::new(IoCompletionBinding::new()),
             peek_buf: Mutex::new(VecDeque::new()),
             dir_watcher: Mutex::new(None),
             named_pipe_server: None,
@@ -251,7 +243,7 @@ impl KObject for FileObj {
         self
     }
     fn waitable(&self) -> Option<&dyn handles::Waitable> {
-        Some(&*self.io_event)
+        Some(&*self.completion.io_event)
     }
 }
 
@@ -891,17 +883,20 @@ pub(crate) unsafe fn prepare_overlapped_pending(ov: *mut OVERLAPPED) {
 }
 
 unsafe fn complete_overlapped(ov: *mut OVERLAPPED, status: usize, n: usize) {
-    // Snapshot guest fields BEFORE publishing terminal `ov.internal` so a polling caller
-    // that frees or reuses `ov` immediately upon observing completion never races with us.
-    let ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event));
+    // Snapshot guest fields and resolve the explicit event handle BEFORE publishing
+    // terminal `ov.internal` so a polling caller can immediately close the event handle
+    // or free/reuse `ov` without racing with any lookup or guest-memory dereference.
+    let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
+    let ev_h = (raw_ev & !1) as HANDLE;
+    let explicit_event = if !ev_h.is_null() {
+        handles::get_as::<Event>(ev_h)
+    } else {
+        None
+    };
     store_ov_internal_high(ov, n);
     store_ov_internal(ov, status);
-    if !ev.is_null() {
-        // Low bit set = "don't signal a completion port"; still a valid event.
-        let ev = (ev as usize & !1) as HANDLE;
-        if let Some(e) = handles::get_as::<Event>(ev) {
-            e.set();
-        }
+    if let Some(e) = explicit_event {
+        e.set();
     }
 }
 
@@ -1037,7 +1032,7 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                 std::ptr::write_unaligned(read, from_peek as u32);
             }
             if !ov.is_null() {
-                complete_overlapped_io(h, ov, STATUS_SUCCESS, from_peek, true);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, from_peek, true);
             }
             return TRUE;
         }
@@ -1051,11 +1046,11 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                     if !read.is_null() {
                         std::ptr::write_unaligned(read, got as u32);
                     }
-                    complete_overlapped_io(h, ov, STATUS_SUCCESS, got, true);
+                    complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, got, true);
                     return TRUE;
                 }
                 Ok(None) => {
-                    f.io_event.reset();
+                    f.completion.io_event.reset();
                     prepare_overlapped_pending(ov);
                     pipe_reactor().submit(PendingPipeOp::new_read(
                         h,
@@ -1144,7 +1139,7 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
                     set_err(err::ERROR_HANDLE_EOF);
                     return FALSE;
                 }
-                complete_overlapped_io(h, ov, STATUS_SUCCESS, got, true);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, got, true);
             }
             TRUE
         }
@@ -1197,7 +1192,7 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
         };
         if n == 0 {
             if !ov.is_null() {
-                complete_overlapped_io(h, ov, STATUS_SUCCESS, 0, true);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, 0, true);
             }
             return TRUE;
         }
@@ -1218,7 +1213,7 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
                         written_so_far += k;
                     }
                     Ok(None) => {
-                        f.io_event.reset();
+                        f.completion.io_event.reset();
                         prepare_overlapped_pending(ov);
                         pipe_reactor().submit(PendingPipeOp::new_write_at(
                             h,
@@ -1241,7 +1236,7 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
             if !written.is_null() {
                 std::ptr::write_unaligned(written, written_so_far as u32);
             }
-            complete_overlapped_io(h, ov, STATUS_SUCCESS, written_so_far, true);
+            complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, written_so_far, true);
             return TRUE;
         }
         // Synchronous blocking pipe write (write full buffer; waits via poll if fd has O_NONBLOCK).
@@ -1314,7 +1309,7 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
                 std::ptr::write_unaligned(written, k as u32);
             }
             if !ov.is_null() {
-                complete_overlapped_io(h, ov, STATUS_SUCCESS, k, true);
+                complete_overlapped_binding(Some(&f.completion), ov, STATUS_SUCCESS, k, true);
             }
             TRUE
         }
@@ -2602,18 +2597,79 @@ impl IoCompletionPort {
     }
 }
 
-/// Shared registry for non-`FileObj` I/O handles (such as Winsock2 `SOCKET` handles)
-/// so `CreateIoCompletionPort`, `SetFileCompletionNotificationModes`, `CancelIo`/`CancelIoEx`,
-/// `GetOverlappedResultEx`, and `CreateThreadpoolIo` work uniformly across files and sockets.
-struct ExternalIoEntry {
-    iocp: Option<(Arc<IoCompletionPort>, usize)>,
-    tp_io: Option<Arc<TpIo>>,
-    completion_modes: u8,
-    event: Arc<Event>,
+/// Shared completion sink state for both `FileObj` and external I/O handles (such as Winsock2
+/// `SOCKET` handles). Held behind an `Arc` without any back-reference to `FileObj` so in-flight
+/// pending operations can retain completion sinks across concurrent `CloseHandle`/`closesocket`
+/// without creating reference cycles.
+pub(crate) struct IoCompletionBinding {
+    iocp: Mutex<Option<(Arc<IoCompletionPort>, usize)>>,
+    tp_io: Mutex<Option<Arc<TpIo>>>,
+    completion_modes: AtomicU8,
+    /// Manual-reset event representing handle completion state (used when
+    /// `GetOverlappedResultEx` waits on the handle itself with `ov.h_event == NULL`).
+    io_event: Arc<Event>,
 }
 
-fn external_io_table() -> &'static Mutex<std::collections::HashMap<usize, ExternalIoEntry>> {
-    static T: OnceLock<Mutex<std::collections::HashMap<usize, ExternalIoEntry>>> = OnceLock::new();
+struct CapturedCompletionBindings {
+    modes: u8,
+    iocp: Option<(Arc<IoCompletionPort>, usize)>,
+    tp_io: Option<Arc<TpIo>>,
+    handle_event: Arc<Event>,
+}
+
+impl IoCompletionBinding {
+    fn new() -> Self {
+        Self {
+            iocp: Mutex::new(None),
+            tp_io: Mutex::new(None),
+            completion_modes: AtomicU8::new(0),
+            io_event: Arc::new(Event::new(true, true, None)),
+        }
+    }
+
+    fn snapshot(&self) -> CapturedCompletionBindings {
+        CapturedCompletionBindings {
+            modes: self.completion_modes.load(Ordering::Relaxed),
+            iocp: self.iocp.lock().unwrap().clone(),
+            tp_io: self.tp_io.lock().unwrap().clone(),
+            handle_event: Arc::clone(&self.io_event),
+        }
+    }
+
+    fn has_sink(&self) -> bool {
+        self.iocp.lock().unwrap().is_some() || self.tp_io.lock().unwrap().is_some()
+    }
+
+    fn bind_iocp(&self, iocp: Arc<IoCompletionPort>, key: usize) -> Result<(), u32> {
+        let mut iocp_g = self.iocp.lock().unwrap();
+        let tp_g = self.tp_io.lock().unwrap();
+        if tp_g.is_some() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        *iocp_g = Some((iocp, key));
+        Ok(())
+    }
+
+    fn bind_tp_io(&self, tp_io: Arc<TpIo>) -> Result<(), u32> {
+        let iocp_g = self.iocp.lock().unwrap();
+        let mut tp_g = self.tp_io.lock().unwrap();
+        if iocp_g.is_some() || tp_g.is_some() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        *tp_g = Some(tp_io);
+        Ok(())
+    }
+
+    fn unbind_tp_io(&self, tp_io: &Arc<TpIo>) {
+        let mut tp_g = self.tp_io.lock().unwrap();
+        if tp_g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, tp_io)) {
+            *tp_g = None;
+        }
+    }
+}
+
+fn external_io_table() -> &'static Mutex<std::collections::HashMap<usize, Arc<IoCompletionBinding>>> {
+    static T: OnceLock<Mutex<std::collections::HashMap<usize, Arc<IoCompletionBinding>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2633,135 +2689,103 @@ pub(crate) fn register_external_cancel_hook(f: ExternalCancelFn) {
 
 pub(crate) fn register_external_io_handle(h: HANDLE) {
     let mut t = external_io_table().lock().unwrap();
-    t.entry(h as usize).or_insert_with(|| ExternalIoEntry {
-        iocp: None,
-        tp_io: None,
-        completion_modes: 0,
-        event: Arc::new(Event::new(true, true, None)),
-    });
+    t.entry(h as usize)
+        .or_insert_with(|| Arc::new(IoCompletionBinding::new()));
 }
 
 pub(crate) fn unregister_external_io_handle(h: HANDLE) {
     external_io_table().lock().unwrap().remove(&(h as usize));
 }
 
-pub(crate) fn external_io_event(h: HANDLE) -> Option<Arc<Event>> {
-    external_io_table().lock().unwrap().get(&(h as usize)).map(|e| Arc::clone(&e.event))
+pub(crate) fn lookup_io_completion_binding(h: HANDLE) -> Option<Arc<IoCompletionBinding>> {
+    if let Some(f) = get_file(h) {
+        return Some(Arc::clone(&f.completion));
+    }
+    external_io_table().lock().unwrap().get(&(h as usize)).cloned()
 }
 
-#[allow(dead_code)]
-pub(crate) fn handle_has_completion_sink(h: HANDLE) -> bool {
-    if let Some(f) = get_file(h) {
-        return f.iocp.lock().unwrap().is_some() || f.tp_io.lock().unwrap().is_some();
-    }
+pub(crate) fn external_io_event(h: HANDLE) -> Option<Arc<Event>> {
     external_io_table()
         .lock()
         .unwrap()
         .get(&(h as usize))
-        .is_some_and(|e| e.iocp.is_some() || e.tp_io.is_some())
+        .map(|e| Arc::clone(&e.io_event))
+}
+
+#[allow(dead_code)]
+pub(crate) fn handle_has_completion_sink(h: HANDLE) -> bool {
+    lookup_io_completion_binding(h).is_some_and(|b| b.has_sink())
 }
 
 /// Bind a `TpIo` completion sink to a `FileObj` or registered external I/O handle (e.g. `SOCKET`).
 /// Fails with `ERROR_INVALID_HANDLE` if `h` is not a valid I/O handle, or `ERROR_INVALID_PARAMETER`
 /// if `h` is already bound to an IOCP or another `TpIo`.
 pub(crate) fn bind_threadpool_io(h: HANDLE, tp_io: Arc<TpIo>) -> Result<(), u32> {
-    if let Some(f) = get_file(h) {
-        let iocp_g = f.iocp.lock().unwrap();
-        let mut tp_g = f.tp_io.lock().unwrap();
-        if iocp_g.is_some() || tp_g.is_some() {
-            return Err(err::ERROR_INVALID_PARAMETER);
-        }
-        *tp_g = Some(tp_io);
-        return Ok(());
-    }
-    let mut ext = external_io_table().lock().unwrap();
-    let Some(entry) = ext.get_mut(&(h as usize)) else {
+    let Some(binding) = lookup_io_completion_binding(h) else {
         return Err(err::ERROR_INVALID_HANDLE);
     };
-    if entry.iocp.is_some() || entry.tp_io.is_some() {
-        return Err(err::ERROR_INVALID_PARAMETER);
-    }
-    entry.tp_io = Some(tp_io);
-    Ok(())
+    binding.bind_tp_io(tp_io)
 }
 
 /// Detach a `TpIo` sink from `h` when `CloseThreadpoolIo` is called.
 pub(crate) fn unbind_threadpool_io(h: HANDLE, tp_io: &Arc<TpIo>) {
-    if let Some(f) = get_file(h) {
-        let mut tp_g = f.tp_io.lock().unwrap();
-        if tp_g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, tp_io)) {
-            *tp_g = None;
-        }
-        return;
-    }
-    let mut ext = external_io_table().lock().unwrap();
-    if let Some(entry) = ext.get_mut(&(h as usize)) {
-        if entry.tp_io.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, tp_io)) {
-            entry.tp_io = None;
-        }
+    if let Some(binding) = lookup_io_completion_binding(h) {
+        binding.unbind_tp_io(tp_io);
     }
 }
 
-/// Complete an overlapped I/O operation on either a `FileObj` or a registered external I/O handle (e.g. SOCKET).
-/// Atomically publishes `InternalHigh` and `Internal` (Release), signals `ov.h_event` (or the handle's event),
-/// and posts to any associated IOCP or dispatches to any bound `TpIo`.
-pub(crate) unsafe fn complete_overlapped_io(
-    h: HANDLE,
+#[inline(always)]
+unsafe fn complete_overlapped_binding_with_hook<F: FnOnce()>(
+    binding: Option<&IoCompletionBinding>,
     ov: *mut OVERLAPPED,
     nt_status: usize,
     bytes: usize,
     synchronous: bool,
+    after_signal: F,
 ) -> bool {
     const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
     const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
     if ov.is_null() {
         return false;
     }
-    // Snapshot all guest OVERLAPPED fields BEFORE publishing terminal `ov.internal` so
-    // a polling caller can immediately free/reuse `ov` once `ov.internal != STATUS_PENDING`
-    // without racing with any subsequent guest-memory dereference.
+    // Capture guest OVERLAPPED fields, explicit event object, completion modes, handle event,
+    // and strong IOCP/TpIo references BEFORE publishing terminal `ov.internal` or signaling any
+    // event so a consumer waking on `ov.internal` or `ov.h_event` can immediately close handles
+    // or free/reuse `ov` without racing with any subsequent handle-table or guest dereference.
     let ov_addr = ov as usize;
     let raw_ev = std::ptr::read_unaligned(std::ptr::addr_of!((*ov).h_event)) as usize;
+    let suppress_iocp = (raw_ev & 1) != 0;
+    let ev_h = (raw_ev & !1) as HANDLE;
+    let explicit_event = if !ev_h.is_null() {
+        handles::get_as::<Event>(ev_h)
+    } else {
+        None
+    };
+    let captured = binding.map(IoCompletionBinding::snapshot);
+
     store_ov_internal_high(ov, bytes);
     store_ov_internal(ov, nt_status);
 
-    let suppress_iocp = (raw_ev & 1) != 0;
-    let ev_h = (raw_ev & !1) as HANDLE;
-    if !ev_h.is_null() {
-        if let Some(e) = handles::get_as::<Event>(ev_h) {
-            e.set();
-        }
+    // Post-publication: zero guest-memory dereferences and zero handle-table lookups.
+    if let Some(e) = explicit_event {
+        e.set();
     }
+    after_signal();
 
-    let (modes, iocp_binding, tp_io_binding, handle_event) = if let Some(f) = get_file(h) {
-        (
-            f.completion_modes.load(Ordering::Relaxed),
-            f.iocp.lock().unwrap().clone(),
-            f.tp_io.lock().unwrap().clone(),
-            Some(Arc::clone(&f.io_event)),
-        )
-    } else {
-        let t = external_io_table().lock().unwrap();
-        if let Some(e) = t.get(&(h as usize)) {
-            (e.completion_modes, e.iocp.clone(), e.tp_io.clone(), Some(Arc::clone(&e.event)))
-        } else {
-            (0, None, None, None)
-        }
+    let Some(c) = captured else {
+        return false;
     };
-
-    if let Some(ev) = handle_event {
-        if !(synchronous && (modes & FILE_SKIP_SET_EVENT_ON_HANDLE) != 0) {
-            ev.set();
-        }
+    if !(synchronous && (c.modes & FILE_SKIP_SET_EVENT_ON_HANDLE) != 0) {
+        c.handle_event.set();
     }
 
     if suppress_iocp {
         return false;
     }
-    if synchronous && nt_status == STATUS_SUCCESS && (modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
+    if synchronous && nt_status == STATUS_SUCCESS && (c.modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 {
         return false;
     }
-    if let Some((iocp, key)) = iocp_binding {
+    if let Some((iocp, key)) = c.iocp {
         iocp.post(IocpPacket {
             bytes: bytes as u32,
             key,
@@ -2770,10 +2794,35 @@ pub(crate) unsafe fn complete_overlapped_io(
         });
         return true;
     }
-    if let Some(tp_io) = tp_io_binding {
+    if let Some(tp_io) = c.tp_io {
         return tp_io.dispatch_completion(ov_addr, ntstatus_to_win32_local(nt_status), bytes);
     }
     false
+}
+
+/// Complete an overlapped I/O operation using a retained `IoCompletionBinding`.
+pub(crate) unsafe fn complete_overlapped_binding(
+    binding: Option<&IoCompletionBinding>,
+    ov: *mut OVERLAPPED,
+    nt_status: usize,
+    bytes: usize,
+    synchronous: bool,
+) -> bool {
+    complete_overlapped_binding_with_hook(binding, ov, nt_status, bytes, synchronous, || {})
+}
+
+/// Complete an overlapped I/O operation on either a `FileObj` or a registered external I/O handle (e.g. SOCKET).
+/// Captures all completion bindings and events before atomically publishing `InternalHigh`/`Internal`,
+/// signaling `ov.h_event` (and the handle's event), and posting to any associated IOCP or `TpIo`.
+pub(crate) unsafe fn complete_overlapped_io(
+    h: HANDLE,
+    ov: *mut OVERLAPPED,
+    nt_status: usize,
+    bytes: usize,
+    synchronous: bool,
+) -> bool {
+    let binding = lookup_io_completion_binding(h);
+    complete_overlapped_binding(binding.as_deref(), ov, nt_status, bytes, synchronous)
 }
 
 #[repr(C)]
@@ -2804,39 +2853,19 @@ pub unsafe extern "win64" fn CreateIoCompletionPort(
         (h, p)
     };
     if !file_handle.is_null() && file_handle != INVALID_HANDLE_VALUE {
-        if let Some(f) = get_file(file_handle) {
-            let mut iocp_g = f.iocp.lock().unwrap();
-            let tp_g = f.tp_io.lock().unwrap();
-            if tp_g.is_some() {
-                drop(tp_g);
-                drop(iocp_g);
-                if existing_port.is_null() {
-                    handles::close(port_handle);
-                }
-                set_err(err::ERROR_INVALID_PARAMETER);
-                return std::ptr::null_mut();
+        let Some(binding) = lookup_io_completion_binding(file_handle) else {
+            if existing_port.is_null() {
+                handles::close(port_handle);
             }
-            *iocp_g = Some((iocp, completion_key));
-        } else {
-            let mut ext = external_io_table().lock().unwrap();
-            if let Some(entry) = ext.get_mut(&(file_handle as usize)) {
-                if entry.tp_io.is_some() {
-                    drop(ext);
-                    if existing_port.is_null() {
-                        handles::close(port_handle);
-                    }
-                    set_err(err::ERROR_INVALID_PARAMETER);
-                    return std::ptr::null_mut();
-                }
-                entry.iocp = Some((iocp, completion_key));
-            } else {
-                drop(ext);
-                if existing_port.is_null() {
-                    handles::close(port_handle);
-                }
-                set_err(err::ERROR_INVALID_HANDLE);
-                return std::ptr::null_mut();
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
+        };
+        if let Err(e) = binding.bind_iocp(iocp, completion_key) {
+            if existing_port.is_null() {
+                handles::close(port_handle);
             }
+            set_err(e);
+            return std::ptr::null_mut();
         }
     }
     port_handle
@@ -2967,12 +2996,8 @@ pub unsafe extern "win64" fn SetFileCompletionNotificationModes(
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if let Some(f) = get_file(file_handle) {
-        f.completion_modes.store(flags, std::sync::atomic::Ordering::Relaxed);
-        return TRUE;
-    }
-    if let Some(ext) = external_io_table().lock().unwrap().get_mut(&(file_handle as usize)) {
-        ext.completion_modes = flags;
+    if let Some(binding) = lookup_io_completion_binding(file_handle) {
+        binding.completion_modes.store(flags, Ordering::Relaxed);
         return TRUE;
     }
     set_err(err::ERROR_INVALID_HANDLE);
@@ -4038,6 +4063,7 @@ enum DirWatchDelivery {
     Overlapped {
         ov: usize,
         tid: u32,
+        binding: Arc<IoCompletionBinding>,
     },
 }
 
@@ -4085,9 +4111,9 @@ impl DirWatchRequest {
                 let win_err = ntstatus_to_win32_local(nt_status);
                 crate::thread::queue_io_completion_apc(thread, *cb, win_err, bytes as u32, *ov);
             },
-            DirWatchDelivery::Overlapped { ov, .. } => unsafe {
-                let _ = complete_overlapped_io(
-                    self.handle as HANDLE,
+            DirWatchDelivery::Overlapped { ov, binding, .. } => unsafe {
+                let _ = complete_overlapped_binding(
+                    Some(binding),
                     *ov as *mut OVERLAPPED,
                     nt_status,
                     bytes,
@@ -4711,7 +4737,7 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
         TRUE
     } else {
         // Publish pending state before `req` can be observed by the watcher thread.
-        f.io_event.reset();
+        f.completion.io_event.reset();
         prepare_overlapped_pending(ov);
         let req = Arc::new(DirWatchRequest {
             handle: h as usize,
@@ -4719,7 +4745,11 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
             len: len as usize,
             filter,
             completed: AtomicBool::new(false),
-            delivery: DirWatchDelivery::Overlapped { ov: ov as usize, tid },
+            delivery: DirWatchDelivery::Overlapped {
+                ov: ov as usize,
+                tid,
+                binding: Arc::clone(&f.completion),
+            },
         });
         let immediate = {
             let mut st = watcher.state.lock().unwrap();
@@ -4731,7 +4761,7 @@ pub unsafe extern "win64" fn ReadDirectoryChangesW(
             }
         };
         if let Some((status, bytes)) = immediate {
-            let _ = complete_overlapped_io(h, ov, status, bytes, false);
+            let _ = complete_overlapped_binding(Some(&f.completion), ov, status, bytes, false);
         }
         // Windows `ReadDirectoryChangesW` returns non-zero (TRUE) for async overlapped start!
         set_err(0);
@@ -4914,8 +4944,8 @@ impl PendingPipeOp {
     fn publish_completion(&self, nt_status: usize, bytes: usize) {
         match &self.delivery {
             PipeDelivery::Overlapped { ov, .. } => unsafe {
-                let _ = complete_overlapped_io(
-                    self.handle as HANDLE,
+                let _ = complete_overlapped_binding(
+                    Some(&self.file.completion),
                     *ov as *mut OVERLAPPED,
                     nt_status,
                     bytes,
@@ -5187,6 +5217,7 @@ enum PendingConnect {
         ov: usize,
         tid: u32,
         completed: Arc<AtomicBool>,
+        binding: Arc<IoCompletionBinding>,
     },
 }
 
@@ -5248,10 +5279,10 @@ impl NamedPipeServer {
                 cv.notify_all();
                 1
             }
-            PendingConnect::Overlapped { handle: h, ov: o, completed, .. } => {
+            PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
                 if !completed.swap(true, Ordering::AcqRel) {
                     unsafe {
-                        let _ = complete_overlapped_io(h as HANDLE, o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
+                        let _ = complete_overlapped_binding(Some(&binding), o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
                     }
                     1
                 } else {
@@ -5274,10 +5305,10 @@ impl NamedPipeServer {
                     *m.lock().unwrap() = Some(STATUS_CANCELLED);
                     cv.notify_all();
                 }
-                PendingConnect::Overlapped { handle: h, ov: o, completed, .. } => {
+                PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
                     if !completed.swap(true, Ordering::AcqRel) {
                         unsafe {
-                            let _ = complete_overlapped_io(h as HANDLE, o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
+                            let _ = complete_overlapped_binding(Some(&binding), o as *mut OVERLAPPED, STATUS_CANCELLED, 0, false);
                         }
                     }
                 }
@@ -5349,11 +5380,11 @@ fn connect_named_pipe_client(
                         *m.lock().unwrap() = Some(STATUS_SUCCESS);
                         cv.notify_all();
                     }
-                    PendingConnect::Overlapped { handle: h, ov: o, completed, .. } => {
+                    PendingConnect::Overlapped { ov: o, completed, binding, .. } => {
                         if !completed.swap(true, Ordering::AcqRel) {
                             unsafe {
-                                let _ = complete_overlapped_io(
-                                    h as HANDLE,
+                                let _ = complete_overlapped_binding(
+                                    Some(&binding),
                                     o as *mut OVERLAPPED,
                                     STATUS_SUCCESS,
                                     0,
@@ -5666,13 +5697,14 @@ pub unsafe extern "win64" fn ConnectNamedPipe(h: HANDLE, ov: *mut OVERLAPPED) ->
             FALSE
         }
     } else {
-        f.io_event.reset();
+        f.completion.io_event.reset();
         prepare_overlapped_pending(ov);
         st.pending_connect = Some(PendingConnect::Overlapped {
             handle: h as usize,
             ov: ov as usize,
             tid,
             completed: Arc::new(AtomicBool::new(false)),
+            binding: Arc::clone(&f.completion),
         });
         drop(st);
         set_err(err::ERROR_IO_PENDING);
@@ -7676,6 +7708,316 @@ mod tests {
             assert_eq!(CloseHandle(h), TRUE);
             assert_eq!(CloseHandle(iocp), TRUE);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn complete_overlapped_captures_iocp_and_handle_event_before_publication() {
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        const WAIT_OBJECT_0: u32 = 0;
+        const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
+        const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
+
+        unsafe {
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            // 1. FileObj (pipe) path: consumer wakes on hEvent right after terminal Internal is
+            // published, immediately closes both the file handle and the event handle, and mutates
+            // `ov.h_event` (with low bit set) in valid stack storage. Completion must STILL set the
+            // retained handle event and post the original completion key/bytes to IOCP.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            let file_key = 0x1122_3344usize;
+            assert_eq!(CreateIoCompletionPort(rd, iocp, file_key, 0), iocp);
+            let file_binding = lookup_io_completion_binding(rd).unwrap();
+            file_binding.io_event.reset();
+
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            prepare_overlapped_pending(&mut ov);
+
+            let ov_ptr = &mut ov as *mut OVERLAPPED;
+            let posted = complete_overlapped_binding_with_hook(
+                Some(&file_binding),
+                ov_ptr,
+                STATUS_SUCCESS,
+                321,
+                false,
+                || {
+                    // Publication boundary: Internal/InternalHigh and explicit hEvent are already
+                    // visible, while handle_event and IOCP delivery have not run yet.
+                    assert_eq!(load_ov_internal(ov_ptr), STATUS_SUCCESS);
+                    assert_eq!(load_ov_internal_high(ov_ptr), 321);
+                    assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+                    assert_eq!(CloseHandle(rd), TRUE);
+                    assert_eq!(CloseHandle(ev), TRUE);
+                    // Mutate `ov.h_event` (including low-bit suppress flag) to prove no post-publish
+                    // guest OVERLAPPED dereference occurs.
+                    (*ov_ptr).h_event = (0xDEAD_BEEF_usize | 1) as HANDLE;
+                },
+            );
+            assert!(posted);
+            assert!(get_file(rd).is_none(), "file handle must already be closed");
+            assert!(
+                file_binding.io_event.try_take(),
+                "retained handle event must still be signaled after CloseHandle(rd)"
+            );
+
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, file_key);
+            assert_eq!(bytes, 321);
+            assert_eq!(ov_out, ov_ptr);
+
+            // Also verify PendingPipeOp's retained Arc<FileObj> completes cleanly even if CloseHandle
+            // already removed the handle BEFORE `complete_overlapped_binding` is entered.
+            let mut ov_late: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_late);
+            let ov_late_ptr = &mut ov_late as *mut OVERLAPPED;
+            assert!(complete_overlapped_binding(
+                Some(&file_binding),
+                ov_late_ptr,
+                STATUS_SUCCESS,
+                77,
+                false,
+            ));
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, file_key);
+            assert_eq!(bytes, 77);
+            assert_eq!(ov_out, ov_late_ptr);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. External/socket handle path: unregistering the handle immediately after hEvent
+            // signal must still deliver the original IOCP packet and handle event.
+            let fake_sock = 0x00EE_0001usize as HANDLE;
+            register_external_io_handle(fake_sock);
+            let sock_key = 0x5566_7788usize;
+            assert_eq!(CreateIoCompletionPort(fake_sock, iocp, sock_key, 0), iocp);
+            let sock_binding = lookup_io_completion_binding(fake_sock).unwrap();
+            sock_binding.io_event.reset();
+
+            let sock_ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!sock_ev.is_null());
+            let mut ov_s: OVERLAPPED = std::mem::zeroed();
+            ov_s.h_event = sock_ev;
+            prepare_overlapped_pending(&mut ov_s);
+            let ov_s_ptr = &mut ov_s as *mut OVERLAPPED;
+
+            let posted_s = complete_overlapped_binding_with_hook(
+                Some(&sock_binding),
+                ov_s_ptr,
+                STATUS_SUCCESS,
+                654,
+                false,
+                || {
+                    assert_eq!(load_ov_internal(ov_s_ptr), STATUS_SUCCESS);
+                    assert_eq!(load_ov_internal_high(ov_s_ptr), 654);
+                    assert_eq!(WaitForSingleObject(sock_ev, 0), WAIT_OBJECT_0);
+                    unregister_external_io_handle(fake_sock);
+                    assert_eq!(CloseHandle(sock_ev), TRUE);
+                    (*ov_s_ptr).h_event = (0xCAFE_BABE_usize | 1) as HANDLE;
+                },
+            );
+            assert!(posted_s);
+            assert!(lookup_io_completion_binding(fake_sock).is_none());
+            assert!(sock_binding.io_event.try_take());
+
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 1000), TRUE);
+            assert_eq!(key, sock_key);
+            assert_eq!(bytes, 654);
+            assert_eq!(ov_out, ov_s_ptr);
+
+            // 3. Existing suppression rules remain intact:
+            //    (a) low bit on hEvent suppresses IOCP while still signaling the event;
+            //    (b) FILE_SKIP_COMPLETION_PORT_ON_SUCCESS + FILE_SKIP_SET_EVENT_ON_HANDLE apply on sync.
+            let fake_sock2 = 0x00EE_0002usize as HANDLE;
+            register_external_io_handle(fake_sock2);
+            assert_eq!(CreateIoCompletionPort(fake_sock2, iocp, 0x9999, 0), iocp);
+            assert_eq!(
+                SetFileCompletionNotificationModes(
+                    fake_sock2,
+                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+                ),
+                TRUE
+            );
+            let b2 = lookup_io_completion_binding(fake_sock2).unwrap();
+            b2.io_event.reset();
+            let ev2 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_sup: OVERLAPPED = std::mem::zeroed();
+            ov_sup.h_event = (ev2 as usize | 1) as HANDLE;
+            prepare_overlapped_pending(&mut ov_sup);
+            assert!(!complete_overlapped_io(fake_sock2, &mut ov_sup, STATUS_SUCCESS, 12, false));
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0);
+            assert!(b2.io_event.try_take());
+
+            b2.io_event.reset();
+            let mut ov_sync: OVERLAPPED = std::mem::zeroed();
+            prepare_overlapped_pending(&mut ov_sync);
+            assert!(!complete_overlapped_io(fake_sock2, &mut ov_sync, STATUS_SUCCESS, 34, true));
+            assert!(!b2.io_event.try_take());
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 20), FALSE);
+
+            unregister_external_io_handle(fake_sock2);
+            assert_eq!(CloseHandle(ev2), TRUE);
+            assert_eq!(CloseHandle(iocp), TRUE);
+        }
+    }
+
+    #[test]
+    fn complete_overlapped_captures_tp_io_before_publication_and_drains_wait() {
+        use crate::kernel32::threadpool::{
+            CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo, TpIo, WaitForThreadpoolIoCallbacks,
+        };
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+        use std::sync::atomic::AtomicUsize;
+
+        const WAIT_OBJECT_0: u32 = 0;
+
+        struct TpCapture {
+            calls: AtomicUsize,
+            last_ov: AtomicUsize,
+            last_res: AtomicUsize,
+            last_bytes: AtomicUsize,
+        }
+
+        unsafe extern "win64" fn tp_io_cb(
+            _inst: *mut c_void,
+            ctx: *mut c_void,
+            ov: *mut c_void,
+            io_result: usize,
+            bytes: usize,
+            _pio: *mut c_void,
+        ) {
+            let cap = &*(ctx as *const TpCapture);
+            cap.last_ov.store(ov as usize, Ordering::Release);
+            cap.last_res.store(io_result, Ordering::Release);
+            cap.last_bytes.store(bytes, Ordering::Release);
+            cap.calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            // 1. FileObj + TpIo: closing the file handle immediately upon hEvent signal must
+            // still dispatch the TpIo callback and drain WaitForThreadpoolIoCallbacks.
+            let mut rd: HANDLE = std::ptr::null_mut();
+            let mut wr: HANDLE = std::ptr::null_mut();
+            assert_eq!(CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 4096), TRUE);
+            let cap_file = Box::new(TpCapture {
+                calls: AtomicUsize::new(0),
+                last_ov: AtomicUsize::new(0),
+                last_res: AtomicUsize::new(usize::MAX),
+                last_bytes: AtomicUsize::new(0),
+            });
+            let pio_file = CreateThreadpoolIo(
+                rd,
+                tp_io_cb as *const c_void,
+                &*cap_file as *const TpCapture as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert!(!pio_file.is_null());
+            StartThreadpoolIo(pio_file);
+
+            let file_binding = lookup_io_completion_binding(rd).unwrap();
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            prepare_overlapped_pending(&mut ov);
+            let ov_ptr = &mut ov as *mut OVERLAPPED;
+
+            let dispatched = complete_overlapped_binding_with_hook(
+                Some(&file_binding),
+                ov_ptr,
+                STATUS_SUCCESS,
+                987,
+                false,
+                || {
+                    assert_eq!(WaitForSingleObject(ev, 0), WAIT_OBJECT_0);
+                    assert_eq!(CloseHandle(rd), TRUE);
+                    assert_eq!(CloseHandle(ev), TRUE);
+                    (*ov_ptr).h_event = (0xBEEF_usize | 1) as HANDLE;
+                },
+            );
+            assert!(dispatched);
+
+            // Bounded WaitForThreadpoolIoCallbacks: must drain promptly (no stuck pending_io).
+            let pio_addr = pio_file as usize;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                WaitForThreadpoolIoCallbacks(pio_addr as *mut TpIo, FALSE);
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .expect("WaitForThreadpoolIoCallbacks must drain after CloseHandle at publication boundary");
+            waiter.join().unwrap();
+
+            assert_eq!(cap_file.calls.load(Ordering::Acquire), 1);
+            assert_eq!(cap_file.last_ov.load(Ordering::Acquire), ov_ptr as usize);
+            assert_eq!(cap_file.last_res.load(Ordering::Acquire), 0);
+            assert_eq!(cap_file.last_bytes.load(Ordering::Acquire), 987);
+            CloseThreadpoolIo(pio_file);
+            assert_eq!(CloseHandle(wr), TRUE);
+
+            // 2. External/socket handle + TpIo: unregistering at the publication boundary must
+            // likewise dispatch the TpIo callback and drain WaitForThreadpoolIoCallbacks.
+            let fake_sock = 0x00EE_0003usize as HANDLE;
+            register_external_io_handle(fake_sock);
+            let cap_ext = Box::new(TpCapture {
+                calls: AtomicUsize::new(0),
+                last_ov: AtomicUsize::new(0),
+                last_res: AtomicUsize::new(usize::MAX),
+                last_bytes: AtomicUsize::new(0),
+            });
+            let pio_ext = CreateThreadpoolIo(
+                fake_sock,
+                tp_io_cb as *const c_void,
+                &*cap_ext as *const TpCapture as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert!(!pio_ext.is_null());
+            StartThreadpoolIo(pio_ext);
+
+            let ext_binding = lookup_io_completion_binding(fake_sock).unwrap();
+            let ev_ext = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let mut ov_ext: OVERLAPPED = std::mem::zeroed();
+            ov_ext.h_event = ev_ext;
+            prepare_overlapped_pending(&mut ov_ext);
+            let ov_ext_ptr = &mut ov_ext as *mut OVERLAPPED;
+
+            let dispatched_ext = complete_overlapped_binding_with_hook(
+                Some(&ext_binding),
+                ov_ext_ptr,
+                STATUS_SUCCESS,
+                432,
+                false,
+                || {
+                    assert_eq!(WaitForSingleObject(ev_ext, 0), WAIT_OBJECT_0);
+                    unregister_external_io_handle(fake_sock);
+                    assert_eq!(CloseHandle(ev_ext), TRUE);
+                    (*ov_ext_ptr).h_event = (0xFACE_usize | 1) as HANDLE;
+                },
+            );
+            assert!(dispatched_ext);
+
+            let pio_ext_addr = pio_ext as usize;
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            let waiter2 = std::thread::spawn(move || {
+                WaitForThreadpoolIoCallbacks(pio_ext_addr as *mut TpIo, FALSE);
+                let _ = tx2.send(());
+            });
+            rx2.recv_timeout(std::time::Duration::from_secs(3))
+                .expect("WaitForThreadpoolIoCallbacks must drain on external handle close at publication boundary");
+            waiter2.join().unwrap();
+
+            assert_eq!(cap_ext.calls.load(Ordering::Acquire), 1);
+            assert_eq!(cap_ext.last_ov.load(Ordering::Acquire), ov_ext_ptr as usize);
+            assert_eq!(cap_ext.last_res.load(Ordering::Acquire), 0);
+            assert_eq!(cap_ext.last_bytes.load(Ordering::Acquire), 432);
+            CloseThreadpoolIo(pio_ext);
         }
     }
 }
