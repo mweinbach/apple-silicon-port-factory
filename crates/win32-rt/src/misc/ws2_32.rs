@@ -1944,16 +1944,6 @@ unsafe fn recvmsg_bufs_from(
     n
 }
 
-unsafe fn recvmsg_bufs(
-    fd: i32,
-    bufs: &[(usize, usize)],
-    pflags: i32,
-    from: Option<(&mut libc::sockaddr_storage, &mut libc::socklen_t)>,
-    msg_flags_out: &mut i32,
-) -> isize {
-    recvmsg_bufs_from(fd, bufs, 0, pflags, from, msg_flags_out)
-}
-
 /// Shared overlapped submission path for `WSASend` and `WSASendTo`.
 ///
 /// For `SOCK_STREAM` sockets, synchronizes admission and any immediate nonblocking write with the
@@ -2239,16 +2229,20 @@ enum RecvStep {
     Error(i32),
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn step_overlapped_recv(
     fd: i32,
     bufs: &[(usize, usize)],
+    total_len: usize,
+    recvd_so_far: &mut usize,
     pflags: i32,
     is_stream: bool,
     want_from: bool,
-    zero_len: bool,
+    from_captured: &mut Option<(libc::sockaddr_storage, libc::socklen_t)>,
+    acc_msg_flags: &mut i32,
 ) -> RecvStep {
     // Zero-length TCP stream receive is a readiness probe that does not consume bytes.
-    if is_stream && zero_len && !want_from {
+    if is_stream && total_len == 0 && !want_from {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -2279,19 +2273,50 @@ unsafe fn step_overlapped_recv(
         };
     }
 
+    let wait_all = is_stream
+        && (pflags & libc::MSG_WAITALL) != 0
+        && (pflags & (libc::MSG_PEEK | libc::MSG_OOB)) == 0
+        && total_len > 0;
     let nb_flags = (pflags & !libc::MSG_WAITALL) | libc::MSG_DONTWAIT;
-    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-    let mut slen: libc::socklen_t;
-    let mut msg_flags = 0i32;
-    let n = loop {
-        slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        let r = if want_from {
-            recvmsg_bufs(fd, bufs, nb_flags, Some((&mut storage, &mut slen)), &mut msg_flags)
+    loop {
+        let mut chunk_flags = 0i32;
+        let capture_from = want_from && from_captured.is_none();
+        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+        let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let r = if capture_from {
+            recvmsg_bufs_from(
+                fd,
+                bufs,
+                *recvd_so_far,
+                nb_flags,
+                Some((&mut storage, &mut slen)),
+                &mut chunk_flags,
+            )
         } else {
-            recvmsg_bufs(fd, bufs, nb_flags, None, &mut msg_flags)
+            recvmsg_bufs_from(fd, bufs, *recvd_so_far, nb_flags, None, &mut chunk_flags)
         };
         if r >= 0 {
-            break r;
+            if capture_from {
+                *from_captured = Some((storage, slen));
+            }
+            *acc_msg_flags |= chunk_flags;
+            let k = r as usize;
+            *recvd_so_far += k;
+            if !wait_all || k == 0 || *recvd_so_far >= total_len {
+                let truncated_dgram = !is_stream && (*acc_msg_flags & libc::MSG_TRUNC) != 0;
+                let nt_status = if truncated_dgram {
+                    win32_to_ntstatus(WSAEMSGSIZE)
+                } else {
+                    STATUS_SUCCESS
+                };
+                return RecvStep::Complete {
+                    nt_status,
+                    bytes: *recvd_so_far,
+                    msg_flags: *acc_msg_flags,
+                    from: from_captured.take(),
+                };
+            }
+            continue;
         }
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
         if e == libc::EINTR {
@@ -2301,19 +2326,6 @@ unsafe fn step_overlapped_recv(
             return RecvStep::Pending;
         }
         return RecvStep::Error(e);
-    };
-
-    let truncated_dgram = !is_stream && (msg_flags & libc::MSG_TRUNC) != 0;
-    let nt_status = if truncated_dgram {
-        win32_to_ntstatus(WSAEMSGSIZE)
-    } else {
-        STATUS_SUCCESS
-    };
-    RecvStep::Complete {
-        nt_status,
-        bytes: n as usize,
-        msg_flags,
-        from: want_from.then_some((storage, slen)),
     }
 }
 
@@ -2423,7 +2435,6 @@ unsafe fn submit_overlapped_recv(
     completion: *mut c_void,
 ) -> i32 {
     let total_len: usize = bufs.iter().map(|&(_, l)| l).sum();
-    let zero_len = total_len == 0;
     let want_from = !from.is_null();
     let issuing_tid = crate::kernel32::threads::GetCurrentThreadId();
     let issuing_thread = if !completion.is_null() {
@@ -2433,9 +2444,28 @@ unsafe fn submit_overlapped_recv(
     };
     let completion_binding = lookup_io_completion_binding(s as HANDLE);
 
+    let mut recvd_so_far = 0usize;
+    let mut from_captured = None;
+    let mut acc_msg_flags = 0i32;
+
     let step = {
         let mut st = ASYNC_IO.inner.lock().unwrap();
-        if has_prior_recv(&st.ops, s) {
+        let step = if has_prior_recv(&st.ops, s) {
+            RecvStep::Pending
+        } else {
+            step_overlapped_recv(
+                fd,
+                &bufs,
+                total_len,
+                &mut recvd_so_far,
+                pflags,
+                is_stream,
+                want_from,
+                &mut from_captured,
+                &mut acc_msg_flags,
+            )
+        };
+        if matches!(step, RecvStep::Pending) {
             prepare_socket_pending(s, ov, completion as usize);
             ensure_async_io_started(&mut st);
             st.ops.push(PendingSocketOp {
@@ -2450,45 +2480,19 @@ unsafe fn submit_overlapped_recv(
                 completion_binding: completion_binding.clone(),
                 kind: AsyncOpKind::Recv {
                     bufs,
-                    pflags: pflags & !libc::MSG_WAITALL,
+                    total_len,
+                    recvd_so_far,
+                    pflags,
                     is_stream,
                     from: from as usize,
                     fromlen: fromlen as usize,
-                    zero_len,
+                    from_captured,
+                    msg_flags: acc_msg_flags,
                 },
             });
             wake_fd_write(st.wake_w);
-            RecvStep::Pending
-        } else {
-            match step_overlapped_recv(fd, &bufs, pflags, is_stream, want_from, zero_len) {
-                RecvStep::Pending => {
-                    prepare_socket_pending(s, ov, completion as usize);
-                    ensure_async_io_started(&mut st);
-                    st.ops.push(PendingSocketOp {
-                        socket_handle: s,
-                        secondary_socket: None,
-                        poll_fd: fd,
-                        poll_events: libc::POLLIN,
-                        overlapped: ov as usize,
-                        issuing_tid,
-                        issuing_thread: issuing_thread.clone(),
-                        completion_routine: completion as usize,
-                        completion_binding: completion_binding.clone(),
-                        kind: AsyncOpKind::Recv {
-                            bufs,
-                            pflags: pflags & !libc::MSG_WAITALL,
-                            is_stream,
-                            from: from as usize,
-                            fromlen: fromlen as usize,
-                            zero_len,
-                        },
-                    });
-                    wake_fd_write(st.wake_w);
-                    RecvStep::Pending
-                }
-                other => other,
-            }
         }
+        step
     };
 
     event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
@@ -3738,11 +3742,14 @@ enum AsyncOpKind {
     TransmitFile(TransmitState),
     Recv {
         bufs: Vec<(usize, usize)>,
+        total_len: usize,
+        recvd_so_far: usize,
         pflags: i32,
         is_stream: bool,
         from: usize,
         fromlen: usize,
-        zero_len: bool,
+        from_captured: Option<(libc::sockaddr_storage, libc::socklen_t)>,
+        msg_flags: i32,
     },
     Send {
         bufs: Vec<(usize, usize)>,
@@ -4349,18 +4356,24 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
         },
         AsyncOpKind::Recv {
             bufs,
+            total_len,
+            recvd_so_far,
             pflags,
             is_stream,
             from,
             fromlen,
-            zero_len,
+            from_captured,
+            msg_flags,
         } => match step_overlapped_recv(
             op.poll_fd,
             bufs,
+            *total_len,
+            recvd_so_far,
             *pflags,
             *is_stream,
             *from != 0,
-            *zero_len,
+            from_captured,
+            msg_flags,
         ) {
             RecvStep::Complete {
                 nt_status,
@@ -7118,11 +7131,14 @@ mod tests {
                 completion_binding: None,
                 kind: AsyncOpKind::Recv {
                     bufs: Vec::new(),
+                    total_len: 0,
+                    recvd_so_far: 0,
                     pflags: 0,
                     is_stream: true,
                     from: 0,
                     fromlen: 0,
-                    zero_len: false,
+                    from_captured: None,
+                    msg_flags: 0,
                 },
             }];
             assert!(has_prior_recv(&dummy_ops, 0x1001));
@@ -8034,6 +8050,328 @@ mod tests {
             assert_eq!(closesocket(acc), 0);
             assert_eq!(closesocket(cli), 0);
             assert_eq!(closesocket(srv), 0);
+        }
+    }
+
+    #[test]
+    fn overlapped_wsa_recv_and_recvfrom_msg_waitall_accumulate_order_eof_and_cancel() {
+        use crate::kernel32::file::{
+            CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, INVALID_HANDLE_VALUE,
+            OVERLAPPED,
+        };
+        use crate::kernel32::threads::{CloseHandle, CreateEventW, WaitForSingleObject};
+
+        unsafe {
+            let mut wd = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, wd.as_mut_ptr()), 0);
+
+            let make_tcp_pair = || -> (usize, usize, usize) {
+                let srv = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+                assert_ne!(srv, INVALID_SOCKET);
+                let mut bind_sa = [0u8; 16];
+                bind_sa[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+                bind_sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+                assert_eq!(bind(srv, bind_sa.as_ptr(), 16), 0);
+                assert_eq!(listen(srv, 4), 0);
+                let mut bound_sa = [0u8; 16];
+                let mut bound_len = 16i32;
+                assert_eq!(getsockname(srv, bound_sa.as_mut_ptr(), &mut bound_len), 0);
+
+                let cli = socket(AF_INET as i32, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+                assert_ne!(cli, INVALID_SOCKET);
+                assert_eq!(connect(cli, bound_sa.as_ptr(), 16), 0);
+                let acc = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+                assert_ne!(acc, INVALID_SOCKET);
+                (srv, cli, acc)
+            };
+
+            let wait_readable = |sock: usize| {
+                let mut pfd = libc::pollfd {
+                    fd: lookup_fd(sock).unwrap(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(libc::poll(&mut pfd, 1, 2000) > 0, "expected readable data on socket");
+            };
+
+            let assert_no_iocp = |iocp: HANDLE, ms: u32| {
+                let mut bytes = 0u32;
+                let mut key = 0usize;
+                let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+                assert_eq!(
+                    GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, ms),
+                    FALSE
+                );
+                assert_eq!(crate::kernel32::process::GetLastError(), WAIT_TIMEOUT);
+            };
+
+            let iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1);
+            assert!(!iocp.is_null());
+
+            let (srv, cli, acc) = make_tcp_pair();
+            assert_eq!(CreateIoCompletionPort(acc as HANDLE, iocp, 0x8201, 0), iocp);
+
+            // 1. Leading byte already buffered before submission + scatter across multiple WSABUFs
+            //    (including zero-length middle buffer): must stay pending on BOTH hEvent and IOCP
+            //    across intermediate short reads and complete exactly once when full.
+            assert_eq!(send(cli, b"A".as_ptr(), 1, 0), 1);
+            wait_readable(acc);
+
+            let ev = CreateEventW(std::ptr::null_mut(), TRUE, TRUE, std::ptr::null());
+            assert!(!ev.is_null());
+            let mut b1 = [0u8; 3];
+            let mut b2 = [0u8; 0];
+            let mut b3 = [0u8; 5];
+            let mut b4 = [0u8; 4];
+            let wbs = [
+                WsaBuf { len: 3, buf: b1.as_mut_ptr() },
+                WsaBuf { len: 0, buf: b2.as_mut_ptr() },
+                WsaBuf { len: 5, buf: b3.as_mut_ptr() },
+                WsaBuf { len: 4, buf: b4.as_mut_ptr() },
+            ];
+            let mut recvd = 99u32;
+            let mut fl = WIN_MSG_WAITALL;
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.h_event = ev;
+            assert_eq!(
+                WSARecv(
+                    acc,
+                    wbs.as_ptr(),
+                    wbs.len() as u32,
+                    &mut recvd,
+                    &mut fl,
+                    &mut ov as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            assert_eq!(WaitForSingleObject(ev, 50), WAIT_TIMEOUT);
+            assert_no_iocp(iocp, 50);
+            let mut res_bytes = 0u32;
+            let mut res_fl = 0u32;
+            assert_eq!(
+                WSAGetOverlappedResult(acc, &mut ov, &mut res_bytes, FALSE, &mut res_fl),
+                FALSE
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_INCOMPLETE as i32);
+
+            // Stage intermediate chunks (still < 12 bytes): must remain pending on event & IOCP.
+            assert_eq!(send(cli, b"BCDE".as_ptr(), 4, 0), 4);
+            assert_eq!(WaitForSingleObject(ev, 60), WAIT_TIMEOUT);
+            assert_no_iocp(iocp, 50);
+            assert_eq!(send(cli, b"FGHI".as_ptr(), 4, 0), 4);
+            assert_eq!(WaitForSingleObject(ev, 60), WAIT_TIMEOUT);
+            assert_no_iocp(iocp, 50);
+
+            // Final chunk completes the 12-byte scatter receive exactly once.
+            assert_eq!(send(cli, b"JKL".as_ptr(), 3, 0), 3);
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ov_out: *mut OVERLAPPED = std::ptr::null_mut();
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x8201);
+            assert_eq!(ov_out, &mut ov as *mut OVERLAPPED);
+            assert_eq!(bytes, 12);
+            assert_eq!(WaitForSingleObject(ev, 2000), WAIT_OBJECT_0);
+            assert_eq!(
+                WSAGetOverlappedResult(acc, &mut ov, &mut res_bytes, FALSE, &mut res_fl),
+                TRUE
+            );
+            assert_eq!(res_bytes, 12);
+            assert_eq!(&b1, b"ABC");
+            assert_eq!(&b3, b"DEFGH");
+            assert_eq!(&b4, b"IJKL");
+            assert_no_iocp(iocp, 50);
+            assert_eq!(CloseHandle(ev), TRUE);
+
+            // 2. Empty-at-submission MSG_WAITALL progressing in the reactor + a second overlapped
+            //    WSARecv queued behind the partially-progressed WAITALL receive stays strictly FIFO.
+            let mut f1 = [0u8; 8];
+            let mut f2 = [0u8; 4];
+            let wb1 = WsaBuf { len: 8, buf: f1.as_mut_ptr() };
+            let wb2 = WsaBuf { len: 4, buf: f2.as_mut_ptr() };
+            let mut ov1: OVERLAPPED = std::mem::zeroed();
+            let mut ov2: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_WAITALL;
+            assert_eq!(
+                WSARecv(acc, &wb1, 1, &mut recvd, &mut fl, &mut ov1 as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            // Partial progress in reactor (3/8 bytes): still pending.
+            assert_eq!(send(cli, b"123".as_ptr(), 3, 0), 3);
+            assert_no_iocp(iocp, 60);
+
+            // Submit second overlapped receive while ov1 is still pending at partial progress.
+            let mut fl2 = 0u32;
+            assert_eq!(
+                WSARecv(acc, &wb2, 1, &mut recvd, &mut fl2, &mut ov2 as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            // Send remaining 5 bytes for ov1 + 4 bytes for ov2: ov1 must complete first with
+            // full 8-byte payload, followed by ov2 with the trailing 4 bytes.
+            assert_eq!(send(cli, b"45678WXYZ".as_ptr(), 9, 0), 9);
+            let mut order = Vec::new();
+            for _ in 0..2 {
+                assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+                assert_eq!(key, 0x8201);
+                order.push((ov_out as usize, bytes));
+            }
+            assert_eq!(
+                order,
+                vec![
+                    (&mut ov1 as *mut OVERLAPPED as usize, 8),
+                    (&mut ov2 as *mut OVERLAPPED as usize, 4),
+                ]
+            );
+            assert_eq!(&f1, b"12345678");
+            assert_eq!(&f2, b"WXYZ");
+            assert_no_iocp(iocp, 50);
+
+            // 3. Cancellation (CancelIoEx) at partial progress under MSG_WAITALL produces a single
+            //    WSA_OPERATION_ABORTED completion.
+            assert_eq!(send(cli, b"PQ".as_ptr(), 2, 0), 2);
+            wait_readable(acc);
+            let mut cbuf = [0u8; 8];
+            let cwb = WsaBuf { len: 8, buf: cbuf.as_mut_ptr() };
+            let mut ov_c: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_WAITALL;
+            assert_eq!(
+                WSARecv(acc, &cwb, 1, &mut recvd, &mut fl, &mut ov_c as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            assert_no_iocp(iocp, 50);
+            assert_eq!(CancelIoEx(acc as HANDLE, &mut ov_c), TRUE);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), FALSE);
+            assert_eq!(ov_out, &mut ov_c as *mut OVERLAPPED);
+            assert_eq!(key, 0x8201);
+            assert_eq!(crate::teb::last_error(), WSA_OPERATION_ABORTED);
+            assert_eq!(
+                WSAGetOverlappedResult(acc, &mut ov_c, &mut res_bytes, FALSE, &mut res_fl),
+                FALSE
+            );
+            assert_eq!(WSAGetLastError(), WSA_OPERATION_ABORTED as i32);
+            assert_no_iocp(iocp, 50);
+
+            // 4. Zero-length overlapped WSARecv with MSG_WAITALL remains a non-consuming readiness probe.
+            let zero_wb = WsaBuf { len: 0, buf: std::ptr::null_mut() };
+            let mut ov_z: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_WAITALL;
+            assert_eq!(
+                WSARecv(acc, &zero_wb, 1, &mut recvd, &mut fl, &mut ov_z as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            assert_no_iocp(iocp, 50);
+            assert_eq!(send(cli, b"Z".as_ptr(), 1, 0), 1);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(ov_out, &mut ov_z as *mut OVERLAPPED);
+            assert_eq!(bytes, 0);
+            let mut z_byte = [0u8; 1];
+            assert_eq!(recv(acc, z_byte.as_mut_ptr(), 1, 0), 1);
+            assert_eq!(&z_byte, b"Z");
+
+            // Invalid overlapped flag combination still fails immediately with WSAEOPNOTSUPP.
+            fl = WIN_MSG_WAITALL | WIN_MSG_PEEK;
+            let mut ov_bad: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(
+                WSARecv(acc, &cwb, 1, &mut recvd, &mut fl, &mut ov_bad as *mut _ as *mut c_void, std::ptr::null_mut()),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSAEOPNOTSUPP as i32);
+
+            // 5. Overlapped WSARecvFrom with MSG_WAITALL (leading byte + staged completion) and
+            //    graceful partial EOF (completes with accumulated byte count).
+            let (srv2, cli2, acc2) = make_tcp_pair();
+            assert_eq!(CreateIoCompletionPort(acc2 as HANDLE, iocp, 0x8202, 0), iocp);
+
+            assert_eq!(send(cli2, b"XY".as_ptr(), 2, 0), 2);
+            wait_readable(acc2);
+            let mut rf1 = [0u8; 2];
+            let mut rf2 = [0u8; 4];
+            let rfwbs = [
+                WsaBuf { len: 2, buf: rf1.as_mut_ptr() },
+                WsaBuf { len: 4, buf: rf2.as_mut_ptr() },
+            ];
+            let mut from_sa = [0u8; 32];
+            let mut from_len = 32i32;
+            let mut ov_rf: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_WAITALL;
+            assert_eq!(
+                WSARecvFrom(
+                    acc2,
+                    rfwbs.as_ptr(),
+                    rfwbs.len() as u32,
+                    &mut recvd,
+                    &mut fl,
+                    from_sa.as_mut_ptr(),
+                    &mut from_len,
+                    &mut ov_rf as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            assert_no_iocp(iocp, 50);
+            assert_eq!(send(cli2, b"Z123".as_ptr(), 4, 0), 4);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x8202);
+            assert_eq!(ov_out, &mut ov_rf as *mut OVERLAPPED);
+            assert_eq!(bytes, 6);
+            assert_eq!(&rf1, b"XY");
+            assert_eq!(&rf2, b"Z123");
+            assert_no_iocp(iocp, 50);
+
+            // Graceful partial EOF on empty-at-submission overlapped WSARecv with MSG_WAITALL.
+            let mut e1 = [0u8; 3];
+            let mut e2 = [0u8; 7];
+            let ewbs = [
+                WsaBuf { len: 3, buf: e1.as_mut_ptr() },
+                WsaBuf { len: 7, buf: e2.as_mut_ptr() },
+            ];
+            let mut ov_eof: OVERLAPPED = std::mem::zeroed();
+            fl = WIN_MSG_WAITALL;
+            assert_eq!(
+                WSARecv(
+                    acc2,
+                    ewbs.as_ptr(),
+                    ewbs.len() as u32,
+                    &mut recvd,
+                    &mut fl,
+                    &mut ov_eof as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            assert_eq!(send(cli2, b"HE".as_ptr(), 2, 0), 2);
+            assert_no_iocp(iocp, 60);
+            assert_eq!(send(cli2, b"LLO".as_ptr(), 3, 0), 3);
+            assert_eq!(closesocket(cli2), 0);
+            assert_eq!(GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ov_out, 2000), TRUE);
+            assert_eq!(key, 0x8202);
+            assert_eq!(ov_out, &mut ov_eof as *mut OVERLAPPED);
+            assert_eq!(bytes, 5);
+            assert_eq!(
+                WSAGetOverlappedResult(acc2, &mut ov_eof, &mut res_bytes, FALSE, &mut res_fl),
+                TRUE
+            );
+            assert_eq!(res_bytes, 5);
+            assert_eq!(&e1, b"HEL");
+            assert_eq!(&e2[..2], b"LO");
+            assert_no_iocp(iocp, 50);
+
+            assert_eq!(closesocket(acc2), 0);
+            assert_eq!(closesocket(srv2), 0);
+            assert_eq!(closesocket(acc), 0);
+            assert_eq!(closesocket(cli), 0);
+            assert_eq!(closesocket(srv), 0);
+            assert_eq!(CloseHandle(iocp), TRUE);
         }
     }
 }
