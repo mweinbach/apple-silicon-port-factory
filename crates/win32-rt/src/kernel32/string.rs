@@ -1496,8 +1496,28 @@ pub unsafe extern "win64" fn PathCchSkipRoot(psz_path: LPCWSTR, ppsz_root_end: *
     }
 }
 
+/// Default Win32 `PathCch` segment-name normalization: strip trailing spaces and
+/// periods from an ordinary segment, retaining a single trailing period only when
+/// immediately preceded by a wildcard character (`*` or `?`).
+fn normalize_pathcch_segment(part: &str) -> &str {
+    let trimmed = part.trim_end_matches([' ', '.']);
+    let had_trailing_dot = part.as_bytes().get(trimmed.len()) == Some(&b'.');
+    if had_trailing_dot
+        && trimmed
+            .as_bytes()
+            .last()
+            .is_some_and(|&b| b == b'*' || b == b'?')
+    {
+        &part[..trimmed.len() + 1]
+    } else {
+        trimmed
+    }
+}
+
 fn canonicalize_pathcch(raw: &str, flags: u32) -> String {
-    let keep_segments = (flags & PATHCCH_DO_NOT_NORMALIZE_SEGMENTS) != 0;
+    // PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH implies PATHCCH_DO_NOT_NORMALIZE_SEGMENTS.
+    let preserve_segments =
+        (flags & (PATHCCH_DO_NOT_NORMALIZE_SEGMENTS | PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH)) != 0;
     let normalized = raw.replace('/', "\\");
     let wide: Vec<u16> = normalized.encode_utf16().collect();
     let root_len = pathcch_root_len(&wide).unwrap_or(0);
@@ -1509,28 +1529,32 @@ fn canonicalize_pathcch(raw: &str, flags: u32) -> String {
 
     let mut segs: Vec<&str> = Vec::new();
     for part in rest_str.split('\\') {
-        if part.is_empty() {
+        if part.is_empty() || part == "." {
             continue;
         }
-        if !keep_segments {
-            if part == "." {
-                continue;
-            }
-            if part == ".." {
-                if let Some(&last) = segs.last() {
-                    if last != ".." {
-                        segs.pop();
-                        continue;
-                    }
-                }
-                if rooted {
+        // Exact "." and ".." components are always resolved prior to segment-name
+        // normalization, preserving drive and UNC root boundaries.
+        if part == ".." {
+            if let Some(&last) = segs.last() {
+                if last != ".." {
+                    segs.pop();
                     continue;
                 }
-                segs.push("..");
+            }
+            if rooted {
                 continue;
             }
+            segs.push("..");
+            continue;
         }
-        segs.push(part);
+        let seg = if preserve_segments {
+            part
+        } else {
+            normalize_pathcch_segment(part)
+        };
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
     }
 
     let mut out = root_str;
@@ -1814,6 +1838,87 @@ mod tests {
             let odd_comb = raw_comb.as_mut_ptr().add(1) as LPWSTR;
             assert_eq!(PathCchCombineEx(odd_comb, 60, odd_base, odd_more, 0), S_OK);
             assert_eq!(crate::strings::read_wide_z(odd_comb, 60), "C:\\Alpha\\Gamma\\file.bin");
+        }
+    }
+
+    #[test]
+    fn path_cch_combine_ex_dot_resolution_and_segment_normalization() {
+        let cases: &[(&str, &str, u32, &str)] = &[
+            // Exact "." and ".." always resolve, including with 0x8 and 0x10.
+            ("C:\\Games\\App\\bin", "..\\data\\./cfg.ini", 0, "C:\\Games\\App\\data\\cfg.ini"),
+            (
+                "C:\\Games\\App\\bin",
+                "..\\data\\./cfg.ini",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\Games\\App\\data\\cfg.ini",
+            ),
+            (
+                "C:\\Games\\App\\bin",
+                "..\\data\\./cfg.ini",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\C:\\Games\\App\\data\\cfg.ini",
+            ),
+            // Trailing spaces and periods normalized by default, preserved by 0x8 and implied by 0x10.
+            ("C:\\dir \\sub", "..\\file. . ", 0, "C:\\dir\\file"),
+            (
+                "C:\\dir \\sub",
+                "..\\file. . ",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\dir \\file. . ",
+            ),
+            (
+                "C:\\dir \\sub",
+                "..\\file. . ",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\C:\\dir \\file. . ",
+            ),
+            ("C:\\a\\b..", ".\\c...\\d ", 0, "C:\\a\\b\\c\\d"),
+            (
+                "C:\\a\\b..",
+                ".\\c...\\d ",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "C:\\a\\b..\\c...\\d ",
+            ),
+            // Windows wildcard rule: retain single trailing period immediately after '*' or '?'.
+            ("C:\\a", "*...", 0, "C:\\a\\*."),
+            ("C:\\a", "foo?. .", 0, "C:\\a\\foo?."),
+            ("C:\\a", "*...", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\a\\*..."),
+            // Drive and UNC root boundaries preserved under default, 0x8, and 0x10.
+            ("C:\\dir", "..\\..\\leaf", 0, "C:\\leaf"),
+            ("C:\\dir", "..\\..\\leaf", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\leaf"),
+            ("C:\\dir", "..\\..", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "C:\\"),
+            ("\\\\srv\\shr\\dir", "..\\..\\leaf", 0, "\\\\srv\\shr\\leaf"),
+            (
+                "\\\\srv\\shr\\dir",
+                "..\\..\\leaf",
+                PATHCCH_DO_NOT_NORMALIZE_SEGMENTS,
+                "\\\\srv\\shr\\leaf",
+            ),
+            (
+                "\\\\srv\\shr\\dir",
+                "..\\..\\leaf. ",
+                PATHCCH_ENSURE_IS_EXTENDED_LENGTH_PATH,
+                "\\\\?\\UNC\\srv\\shr\\leaf. ",
+            ),
+            ("\\\\srv\\shr\\dir", "..\\..", PATHCCH_DO_NOT_NORMALIZE_SEGMENTS, "\\\\srv\\shr\\"),
+        ];
+
+        unsafe {
+            let mut out = [0u16; 512];
+            for &(base, more, flags, expected) in cases {
+                let base_w = to_wide_z(base);
+                let more_w = to_wide_z(more);
+                assert_eq!(
+                    PathCchCombineEx(out.as_mut_ptr(), out.len(), base_w.as_ptr(), more_w.as_ptr(), flags),
+                    S_OK,
+                    "PathCchCombineEx({base:?}, {more:?}, {flags:#x})"
+                );
+                assert_eq!(
+                    from_wide(out.as_ptr()),
+                    expected,
+                    "PathCchCombineEx({base:?}, {more:?}, {flags:#x})"
+                );
+            }
         }
     }
 }
