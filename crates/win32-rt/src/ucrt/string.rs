@@ -521,8 +521,20 @@ pub unsafe extern "win64" fn strxfrm(d: *mut u8, s: *const u8, n: usize) -> usiz
         return len;
     }
     let bytes = std::slice::from_raw_parts(s, strlen(s));
+    if bytes.is_empty() {
+        if n > 0 && !d.is_null() {
+            *d = 0;
+        }
+        return 0;
+    }
     let w = crate::kernel32::string::decode_cp_to_utf16(cp, bytes)
         .unwrap_or_else(|_| String::from_utf8_lossy(bytes).encode_utf16().collect());
+    if w.is_empty() {
+        if n > 0 && !d.is_null() {
+            *d = 0;
+        }
+        return 0;
+    }
     let loc_w = crate::strings::to_wide_z(&bcp47);
     const LCMAP_SORTKEY: u32 = 0x0000_0400;
     let need = crate::kernel32::string::LCMapStringEx(
@@ -537,6 +549,9 @@ pub unsafe extern "win64" fn strxfrm(d: *mut u8, s: *const u8, n: usize) -> usiz
         0,
     );
     if need <= 0 {
+        if n > 0 && !d.is_null() {
+            *d = 0;
+        }
         return 0;
     }
     let mut key = vec![0u8; need as usize];
@@ -991,14 +1006,19 @@ pub unsafe extern "win64" fn _wcsnicoll(a: *const u16, b: *const u16, n: usize) 
 }
 pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> usize {
     let (is_c, _, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
-    if is_c {
-        let len = wcslen(s);
-        if len < n && !d.is_null() {
-            std::ptr::copy_nonoverlapping(s, d, len + 1);
-        }
-        return len;
-    }
     let slen = wcslen(s);
+    if is_c {
+        if slen < n && !d.is_null() {
+            std::ptr::copy_nonoverlapping(s as *const u8, d as *mut u8, (slen + 1) * 2);
+        }
+        return slen;
+    }
+    if slen == 0 {
+        if n > 0 && !d.is_null() {
+            std::ptr::write_unaligned(d, 0);
+        }
+        return 0;
+    }
     let loc_w = crate::strings::to_wide_z(&bcp47);
     const LCMAP_SORTKEY: u32 = 0x0000_0400;
     let need = crate::kernel32::string::LCMapStringEx(
@@ -1013,6 +1033,9 @@ pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> us
         0,
     );
     if need <= 0 {
+        if n > 0 && !d.is_null() {
+            std::ptr::write_unaligned(d, 0);
+        }
         return 0;
     }
     let mut key = vec![0u8; need as usize];
@@ -1030,9 +1053,9 @@ pub unsafe extern "win64" fn wcsxfrm(d: *mut u16, s: *const u16, n: usize) -> us
     let len = key.iter().position(|&b| b == 0).unwrap_or(key.len());
     if len < n && !d.is_null() {
         for (i, &b) in key[..len].iter().enumerate() {
-            *d.add(i) = b as u16;
+            std::ptr::write_unaligned(d.add(i), b as u16);
         }
-        *d.add(len) = 0;
+        std::ptr::write_unaligned(d.add(len), 0);
     }
     len
 }
@@ -1369,6 +1392,20 @@ mod tests {
             let la = strxfrm(ka.as_mut_ptr(), b"\xE4\0".as_ptr(), ka.len());
             let lb = strxfrm(kb.as_mut_ptr(), b"b\0".as_ptr(), kb.len());
             assert!(la > 0 && lb > 0 && strcmp(ka.as_ptr(), kb.as_ptr()) < 0);
+            // Empty source terminates destination with NUL in both strxfrm and wcsxfrm.
+            ka[0] = b'X';
+            assert_eq!(strxfrm(ka.as_mut_ptr(), b"\0".as_ptr(), ka.len()), 0);
+            assert_eq!(ka[0], 0);
+            // Unaligned (odd-addressed) destination buffer works for both non-empty and empty wcsxfrm.
+            let mut raw_unaligned = [0xAAu8; 131];
+            let odd_dst = raw_unaligned.as_mut_ptr().add(1) as *mut u16;
+            let wlen = wcsxfrm(odd_dst, wa.as_ptr(), 64);
+            assert!(wlen > 0);
+            assert_eq!(std::ptr::read_unaligned(odd_dst.add(wlen)), 0);
+            let wempty = [0u16];
+            std::ptr::write_unaligned(odd_dst, 0x1234);
+            assert_eq!(wcsxfrm(odd_dst, wempty.as_ptr(), 64), 0);
+            assert_eq!(std::ptr::read_unaligned(odd_dst), 0);
             assert!(!crate::ucrt::locale::setlocale(1, b"C\0".as_ptr()).is_null());
             assert!(strcoll(b"\xE4\0".as_ptr(), b"b\0".as_ptr()) > 0);
         }
