@@ -343,6 +343,7 @@ const _: () = assert!(std::mem::size_of::<DIPROPCAL>() == 28);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct DIPROPGUIDANDPATH {
     diph: DIPROPHEADER,
     guid_class: Guid,
@@ -1372,21 +1373,13 @@ unsafe extern "win64" fn dev_get_property(this: *mut DeviceObj, prop: *const Gui
             if hdr.dw_size != std::mem::size_of::<DIPROPGUIDANDPATH>() as u32 || hdr.dw_how != DIPH_DEVICE {
                 return DIERR_INVALIDPARAM;
             }
-            // Expose standard Xbox/XInput HID path with `IG_` marker so games/SDL
-            // can pair DirectInput devices with their XInput slots without double-input.
-            let hid_path = format!(
-                "\\\\?\\hid#vid_045e&pid_028e&ig_{:02}#7&{:08x}&0&0000#{{4d1e55b2-f16f-11cf-88cb-001111000030}}",
-                st.slot,
-                0x1000 + st.slot
+            // GameController-backed XInput slots do not correspond to an openable HID
+            // interface in `misc::hid`; honestly reject rather than returning an unopenable path.
+            log::warn!(
+                "dinput8: DIPROP_GUIDANDPATH unsupported for GameController-backed slot {} (no openable HID interface)",
+                st.slot
             );
-            let mut out = DIPROPGUIDANDPATH {
-                diph: hdr,
-                guid_class: crate::misc::hid::GUID_DEVINTERFACE_HID,
-                wsz_path: [0; MAX_PATH],
-            };
-            fill_wide_fixed(&mut out.wsz_path, &hid_path);
-            (diph as *mut DIPROPGUIDANDPATH).write_unaligned(out);
-            DI_OK
+            DIERR_UNSUPPORTED
         }
         DIPROP_INSTANCENAME | DIPROP_PRODUCTNAME | DIPROP_GETPORTDISPLAYNAME | DIPROP_TYPENAME => {
             if hdr.dw_size != std::mem::size_of::<DIPROPSTRING>() as u32 || hdr.dw_how != DIPH_DEVICE {
@@ -2576,14 +2569,18 @@ mod tests {
 
             // Extended GetProperty / SetProperty coverage (GUIDANDPATH, APPDATA, FFGAIN, AUTOCENTER,
             // CALIBRATIONMODE, CALIBRATION, KEYNAME, TYPENAME, GETPORTDISPLAYNAME, USERNAME).
+            // GameController-backed slots have no openable HID interface, so DIPROP_GUIDANDPATH
+            // must return DIERR_UNSUPPORTED honestly without mutating the output buffer.
             let mut gp = DIPROPGUIDANDPATH {
                 diph: DIPROPHEADER { dw_size: 552, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE },
-                guid_class: [0; 16],
-                wsz_path: [0; MAX_PATH],
+                guid_class: [0xA5; 16],
+                wsz_path: [0x5A5A; MAX_PATH],
             };
-            assert_eq!((dvt.get_property)(dev, DIPROP_GUIDANDPATH as *const Guid, &mut gp.diph), DI_OK);
-            assert_eq!(gp.guid_class, crate::misc::hid::GUID_DEVINTERFACE_HID);
-            assert!(crate::strings::from_wide(gp.wsz_path.as_ptr()).contains("ig_00"));
+            assert_eq!((dvt.get_property)(dev, DIPROP_GUIDANDPATH as *const Guid, &mut gp.diph), DIERR_UNSUPPORTED);
+            assert_eq!(gp.guid_class, [0xA5; 16]);
+            assert!(gp.wsz_path.iter().all(|&c| c == 0x5A5A));
+            gp.diph.dw_size = 20;
+            assert_eq!((dvt.get_property)(dev, DIPROP_GUIDANDPATH as *const Guid, &mut gp.diph), DIERR_INVALIDPARAM);
 
             let mut app = DIPROPPOINTER {
                 diph: DIPROPHEADER { dw_size: 24, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET },
