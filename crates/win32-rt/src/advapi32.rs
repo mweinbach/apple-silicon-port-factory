@@ -3267,6 +3267,22 @@ fn capi_alg_to_sym(alg_id: u32) -> Option<(SymAlg, usize)> {
     }
 }
 
+fn capi_valid_sym_key_len(alg_id: u32, sym_alg: SymAlg, cb_key: usize) -> bool {
+    match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => cb_key == 16,
+            CALG_AES_192 => cb_key == 24,
+            CALG_AES_256 => cb_key == 32,
+            _ => matches!(cb_key, 16 | 24 | 32),
+        },
+        SymAlg::Des => cb_key == 8,
+        SymAlg::Des3_112 => cb_key == 16,
+        SymAlg::Des3 => cb_key == 24,
+        SymAlg::Rc2 => (1..=128).contains(&cb_key),
+        SymAlg::Rc4 => (1..=256).contains(&cb_key),
+    }
+}
+
 fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> CapiKey {
     let bs = alg.block_size();
     let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
@@ -3284,7 +3300,8 @@ fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> Cap
             effective_key_len: eff,
             iv: vec![0u8; bs],
             running_iv: vec![0u8; bs],
-            msg_block_len: bs.max(1) as u32,
+            // Microsoft Learn (CryptSetKeyParam KP_MODE_BITS): CAPI CFB defaults to 8-bit (1-byte) feedback.
+            msg_block_len: 1,
             rc4,
         },
     }
@@ -4353,23 +4370,10 @@ pub unsafe extern "win64" fn CryptImportKey(
             let Some((sym_alg, _)) = capi_alg_to_sym(ai_key_alg) else {
                 return err(NTE_BAD_ALGID, FALSE);
             };
-            let raw = blob[12..12 + cb_key].to_vec();
-            let valid_len = match sym_alg {
-                SymAlg::Aes => match ai_key_alg {
-                    CALG_AES_128 => cb_key == 16,
-                    CALG_AES_192 => cb_key == 24,
-                    CALG_AES_256 => cb_key == 32,
-                    _ => matches!(cb_key, 16 | 24 | 32),
-                },
-                SymAlg::Des => cb_key == 8,
-                SymAlg::Des3_112 => cb_key == 16,
-                SymAlg::Des3 => cb_key == 24,
-                SymAlg::Rc2 => (1..=128).contains(&cb_key),
-                SymAlg::Rc4 => (1..=256).contains(&cb_key),
-            };
-            if !valid_len {
+            if !capi_valid_sym_key_len(ai_key_alg, sym_alg, cb_key) {
                 return err(NTE_BAD_DATA, FALSE);
             }
+            let raw = blob[12..12 + cb_key].to_vec();
             capi_sym_key(ai_key_alg, sym_alg, raw, exportable)
         }
         SIMPLEBLOB => {
@@ -4403,6 +4407,9 @@ pub unsafe extern "win64" fn CryptImportKey(
             let Ok(raw_key) = raw else {
                 return err(NTE_BAD_DATA, FALSE);
             };
+            if !capi_valid_sym_key_len(ai_key_alg, sym_alg, raw_key.len()) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
             capi_sym_key(ai_key_alg, sym_alg, raw_key, exportable)
         }
         _ => return err(NTE_BAD_TYPE, FALSE),
@@ -6666,6 +6673,27 @@ mod tests {
 
             let mut h_aes_unwrapped: usize = 0;
             assert_eq!(CryptImportKey(hprov2, sblob.as_ptr(), sblob_len, h_keyx_imp, CRYPT_OAEP, &mut h_aes_unwrapped), TRUE);
+
+            // Default CAPI KP_MODE_BITS must be 8 bits (1 byte for CFB8)
+            let mut mode_bits = 0u32;
+            let mut mb_len = 4u32;
+            assert_eq!(CryptGetKeyParam(h_aes_unwrapped, KP_MODE_BITS, &mut mode_bits as *mut u32 as *mut u8, &mut mb_len, 0), TRUE);
+            assert_eq!(mode_bits, 8);
+
+            // SIMPLEBLOB whose unwrapped session key has invalid length (0 bytes for RC2) must be rejected with NTE_BAD_DATA
+            let mut empty_ct = vec![0u8; 256];
+            let mut empty_len = 0u32;
+            assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, 0, empty_ct.as_mut_ptr(), &mut empty_len, 256), TRUE);
+            let mut bad_sblob = Vec::with_capacity(12 + 256);
+            bad_sblob.push(SIMPLEBLOB as u8);
+            bad_sblob.push(CUR_BLOB_VERSION);
+            bad_sblob.extend_from_slice(&0u16.to_le_bytes());
+            bad_sblob.extend_from_slice(&CALG_RC2.to_le_bytes());
+            bad_sblob.extend_from_slice(&CALG_RSA_KEYX.to_le_bytes());
+            bad_sblob.extend_from_slice(&empty_ct);
+            let mut h_bad_rc2 = 0usize;
+            assert_eq!(CryptImportKey(hprov2, bad_sblob.as_ptr(), bad_sblob.len() as u32, h_keyx_imp, 0, &mut h_bad_rc2), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
 
             let iv = hex("000102030405060708090a0b0c0d0e0f");
             assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_IV, iv.as_ptr(), 0), TRUE);
