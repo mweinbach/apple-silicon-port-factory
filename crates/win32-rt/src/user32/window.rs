@@ -994,6 +994,9 @@ pub unsafe extern "win64" fn EnableWindow(hwnd: HWND, enable: BOOL) -> BOOL {
     if native_control {
         crate::macos::control_set_enabled(hwnd as usize, effective_child_enabled(hwnd as usize));
     }
+    if enable == 0 {
+        super::input::clear_focus_if_in_subtree(hwnd as usize);
+    }
     if was_disabled == (enable != 0) {
         sync_descendant_native_controls(hwnd as usize, false, false, true);
         send_message(hwnd as usize, wm::ENABLE, (enable != 0) as usize, 0);
@@ -1109,6 +1112,7 @@ pub unsafe fn set_window_pos_impl(w: &Arc<Window>, after: usize, x: i32, y: i32,
         if let Some(q) = message::queue_of(w.tid) {
             q.validate(hwnd);
         }
+        super::input::clear_focus_if_in_subtree(hwnd);
         super::input::window_hidden(hwnd);
     }
     if !internal && flags & SWP_NOACTIVATE == 0 && w.data().visible && is_top_level(&w.data()) {
@@ -1975,7 +1979,7 @@ fn set_long(hwnd: usize, idx: i32, val: isize, size: usize) -> isize {
             let mut ss = STYLESTRUCT { old, new: val as u32 };
             let which = if idx == GWL_STYLE { -16isize } else { -20isize } as usize;
             send_message(hwnd, 0x007C, which, &mut ss as *mut STYLESTRUCT as LPARAM); // WM_STYLECHANGING
-            let (sync_ctrl, sync_child_vis, sync_child_en) = {
+            let (sync_ctrl, sync_child_vis, sync_child_en, clear_focus) = {
                 let mut d = w.data();
                 if idx == GWL_STYLE {
                     let was_vis = d.visible;
@@ -1988,19 +1992,28 @@ fn set_long(hwnd: usize, idx: i32, val: isize, size: usize) -> isize {
                     d.style = ss.new;
                     let child_vis_changed = (d.style & ws::CHILD) != 0 && d.visible != was_vis;
                     let child_en_changed = d.enabled != was_en;
-                    (d.native_control.then_some(ss.new), child_vis_changed, child_en_changed)
+                    let lost_focus_eligibility = (was_vis && !d.visible) || (was_en && !d.enabled);
+                    (
+                        d.native_control.then_some(ss.new),
+                        child_vis_changed,
+                        child_en_changed,
+                        lost_focus_eligibility,
+                    )
                 } else {
                     let (_, ex) = framed_top_level_style(d.style, ss.new);
                     ss.new = ex;
                     d.exstyle = ss.new;
                     d.topmost = ss.new & ws::EX_TOPMOST != 0;
-                    (None, false, false)
+                    (None, false, false, false)
                 }
             };
             if let Some(new_style) = sync_ctrl {
                 crate::macos::control_set_visible(hwnd, effective_child_visible(hwnd));
                 crate::macos::control_set_enabled(hwnd, effective_child_enabled(hwnd));
                 crate::macos::control_set_style(hwnd, new_style);
+            }
+            if clear_focus {
+                super::input::clear_focus_if_in_subtree(hwnd);
             }
             if sync_child_vis || sync_child_en {
                 sync_descendant_native_controls(hwnd, false, sync_child_vis, sync_child_en);

@@ -964,7 +964,21 @@ fn edit_replace_selection(hwnd: usize, insert: &[u16], respect_limit: bool) {
         let base_len = text.len() - (sel_end - sel_start);
         let avail = limit.saturating_sub(base_len);
         if to_insert.len() > avail {
-            to_insert = &to_insert[..avail];
+            let mut end = avail;
+            if end > 0 {
+                let prev = to_insert[end - 1];
+                let next = to_insert[end];
+                // Never split a UTF-16 surrogate pair or a CRLF pair at the limit boundary.
+                if (0xD800..=0xDBFF).contains(&prev)
+                    || (prev == b'\r' as u16 && next == b'\n' as u16)
+                {
+                    end -= 1;
+                }
+            }
+            to_insert = &to_insert[..end];
+        }
+        if to_insert.is_empty() && sel_start == sel_end {
+            return;
         }
     }
     text.splice(sel_start..sel_end, to_insert.iter().copied());
@@ -2965,6 +2979,62 @@ mod tests {
                 assert!(norm.text_changed);
                 assert!(!norm.reconcile_native);
             }
+
+            // Win32 WM_CHAR Return at EM_LIMITTEXT must not insert a half CRLF ("\r").
+            assert_eq!(SetWindowTextW(edit, crate::strings::to_wide_z("ab").as_ptr()), TRUE);
+            SendMessageW(edit, wm::EM_LIMITTEXT, 3, 0);
+            SendMessageW(edit, wm::EM_SETSEL, 2, 2);
+            COMMAND_LOG.lock().unwrap().clear();
+            SendMessageW(edit, wm::CHAR, 0x0D, 0);
+            let n5 = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n5]), "ab");
+            assert!(COMMAND_LOG.lock().unwrap().is_empty());
+            SendMessageW(edit, wm::EM_LIMITTEXT, 4, 0);
+            SendMessageW(edit, wm::CHAR, 0x0D, 0);
+            let n6 = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n6]), "ab\r\n");
+
+            // Disabling a focused EDIT (or its container) clears Win32 focus so subsequent
+            // hardware keys do not edit the disabled control.
+            super::super::input::SetFocus(edit);
+            assert_eq!(super::super::input::GetFocus(), edit);
+            EnableWindow(edit, FALSE);
+            assert!(super::super::input::GetFocus().is_null());
+            EnableWindow(edit, TRUE);
+
+            let container = CreateWindowExW(
+                0,
+                parent_cls.as_ptr(),
+                std::ptr::null(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                120,
+                200,
+                60,
+                parent,
+                601,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let child_edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("ok").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                4,
+                4,
+                160,
+                24,
+                container,
+                602,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!container.is_null() && !child_edit.is_null());
+            super::super::input::SetFocus(child_edit);
+            assert_eq!(super::super::input::GetFocus(), child_edit);
+            EnableWindow(container, FALSE);
+            assert!(super::super::input::GetFocus().is_null());
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);

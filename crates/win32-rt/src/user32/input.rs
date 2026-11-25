@@ -177,6 +177,20 @@ pub fn window_going_away(hwnd: usize) {
     }
 }
 
+/// Clear Win32 focus (delivering `WM_KILLFOCUS` and resigning any native AppKit
+/// editor) when the currently focused window is `hwnd` or one of its descendants.
+pub fn clear_focus_if_in_subtree(hwnd: usize) {
+    let cur = FOCUS.load(Ordering::Acquire);
+    if cur != 0 && (cur == hwnd || window::is_child_of(cur, hwnd)) {
+        on_owner(cur, move || {
+            let cur_now = FOCUS.load(Ordering::Acquire);
+            if cur_now == cur && (cur_now == hwnd || window::is_child_of(cur_now, hwnd)) {
+                set_focus(0);
+            }
+        });
+    }
+}
+
 /// A window was hidden or minimized: it loses activation.
 pub fn window_hidden(hwnd: usize) {
     if ACTIVE.load(Ordering::Acquire) == hwnd {
@@ -957,7 +971,7 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
     set_async_key(key, k.down);
     let alt = async_down(VK_MENU);
     let target = target_override.filter(|&h| h != 0).unwrap_or_else(|| FOCUS.load(Ordering::Acquire));
-    if target == 0 {
+    if target == 0 || !window::effective_child_enabled(target) {
         return;
     }
     // Raw input first (Windows delivers WM_INPUT ahead of the legacy message).
