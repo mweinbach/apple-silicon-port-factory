@@ -6,12 +6,15 @@
 //! * Registry: empty, read-only for now. Opens fail with
 //!   ERROR_FILE_NOT_FOUND (logged at debug so we can see what is queried);
 //!   creating/writing keys is a STUB failure.
-//! * Tokens/privileges: a process token exists; no privilege can be enabled
-//!   (AdjustTokenPrivileges reports ERROR_NOT_ALL_ASSIGNED, like a standard
-//!   user without SeLockMemoryPrivilege).
+//! * Tokens/privileges: a process token exists with full `GetTokenInformation`
+//!   coverage; no privilege can be enabled (AdjustTokenPrivileges reports
+//!   ERROR_NOT_ALL_ASSIGNED, like a standard user without SeLockMemoryPrivilege).
 //! * `GetUserNameW`: the host user.
-//! * CAPI (`Crypt*`) and the credential manager (`Cred*`): not implemented /
-//!   empty store.
+//! * CAPI (`Crypt*`): provider containers, hashing (MD2/MD4/MD5/SHA-1/256/384/512),
+//!   symmetric & RSA keys, blobs (`PUBLICKEYBLOB`, `PRIVATEKEYBLOB`, `SIMPLEBLOB`,
+//!   `PLAINTEXTKEYBLOB`), encrypt/decrypt, sign/verify, and key derivation backed by
+//!   `misc::bcrypt` (CommonCrypto + Security.framework).
+//! * Credential manager (`Cred*`): DPAPI-encrypted local/enterprise vault + session store.
 
 use crate::handles;
 use crate::types::*;
@@ -1236,6 +1239,239 @@ pub unsafe extern "win64" fn RegQueryInfoKeyW(
 
 static NEXT_LUID: AtomicU64 = AtomicU64::new(0x1000);
 
+const TOKEN_PRIMARY: u32 = 1;
+const TOKEN_IMPERSONATION: u32 = 2;
+const SECURITY_IMPERSONATION: u32 = 2;
+const ERROR_NO_SUCH_LOGON_SESSION: u32 = 1312;
+const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+const SE_GROUP_MANDATORY: u32 = 0x0000_0001;
+const SE_GROUP_ENABLED_BY_DEFAULT: u32 = 0x0000_0002;
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x0000_0040;
+const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+const SE_PRIVILEGE_ENABLED_BY_DEFAULT: u32 = 0x0000_0001;
+const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+const TOKEN_MANDATORY_POLICY_NO_WRITE_UP: u32 = 1;
+
+struct TokenObj {
+    token_type: u32,
+    imp_level: u32,
+    access: u32,
+    token_id: u64,
+    auth_id: u64,
+    modified_id: u64,
+}
+
+impl handles::KObject for TokenObj {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn type_name(&self) -> &'static str {
+        "Token"
+    }
+}
+
+impl TokenObj {
+    fn access_mask(request: u32) -> u32 {
+        const TOKEN_ALL_ACCESS: u32 = 0x000f_01ff;
+        if request & (0x0200_0000 | 0x1000_0000) != 0 {
+            return TOKEN_ALL_ACCESS;
+        }
+        let mut mask = request & 0x0fff_ffff;
+        for (generic, rights) in [(0x8000_0000, 0x2_0008), (0x4000_0000, 0x2_00e0), (0x2000_0000, 0x2_0000)] {
+            if request & generic != 0 {
+                mask |= rights;
+            }
+        }
+        mask
+    }
+
+    fn resolve(h: HANDLE, required_access: u32) -> Result<Self, u32> {
+        let raw = h as isize;
+        // Windows 8+ pseudo-token handles: GetCurrentProcessToken (-4),
+        // GetCurrentThreadToken (-5), GetCurrentThreadEffectiveToken (-6).
+        // Per Windows docs, -4 and -6 grant TOKEN_QUERY | TOKEN_QUERY_SOURCE (0x0018),
+        // while -5 fails with ERROR_NO_TOKEN (1008) when the thread is not impersonating.
+        let tok = if raw == -4 || raw == -6 {
+            let (token_id, auth_id, modified_id) = process_token_ids();
+            Self {
+                token_type: TOKEN_PRIMARY,
+                imp_level: SECURITY_IMPERSONATION,
+                access: 0x0008 | 0x0010, // TOKEN_QUERY | TOKEN_QUERY_SOURCE
+                token_id,
+                auth_id,
+                modified_id,
+            }
+        } else if raw == -5 {
+            return Err(1008); // ERROR_NO_TOKEN
+        } else if let Some(tok) = handles::get_as::<Self>(h) {
+            Self {
+                token_type: tok.token_type,
+                imp_level: tok.imp_level,
+                access: tok.access,
+                token_id: tok.token_id,
+                auth_id: tok.auth_id,
+                modified_id: tok.modified_id,
+            }
+        } else if handles::get(h).is_some_and(|o| o.type_name() == "Token") {
+            let (token_id, auth_id, modified_id) = process_token_ids();
+            Self {
+                token_type: TOKEN_PRIMARY,
+                imp_level: SECURITY_IMPERSONATION,
+                access: 0x000f_01ff,
+                token_id,
+                auth_id,
+                modified_id,
+            }
+        } else {
+            return Err(ERROR_INVALID_HANDLE);
+        };
+        if (tok.access & required_access) != required_access {
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        Ok(tok)
+    }
+}
+
+fn process_token_ids() -> (u64, u64, u64) {
+    static IDS: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    *IDS.get_or_init(|| {
+        let tid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+        let mid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+        (tid, 0x0000_03E7, mid)
+    })
+}
+
+fn new_process_token_handle(access: u32) -> Arc<TokenObj> {
+    let (token_id, auth_id, modified_id) = process_token_ids();
+    Arc::new(TokenObj {
+        token_type: TOKEN_PRIMARY,
+        imp_level: SECURITY_IMPERSONATION,
+        access,
+        token_id,
+        auth_id,
+        modified_id,
+    })
+}
+
+fn new_token_obj(token_type: u32, imp_level: u32, access: u32) -> Arc<TokenObj> {
+    let tid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+    let mid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+    Arc::new(TokenObj {
+        token_type,
+        imp_level,
+        access,
+        token_id: tid,
+        auth_id: 0x0000_03E7, // SYSTEM_LUID / logon session LUID
+        modified_id: mid,
+    })
+}
+
+fn build_sid(authority: u8, subs: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 4 * subs.len());
+    v.push(1); // SID_REVISION
+    v.push(subs.len() as u8);
+    v.extend_from_slice(&[0, 0, 0, 0, 0, authority]);
+    for &s in subs {
+        v.extend_from_slice(&s.to_le_bytes());
+    }
+    v
+}
+
+fn token_is_elevated() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn token_user_sid() -> Vec<u8> {
+    // S-1-5-1000 (consistent with existing TokenUser SID layout)
+    build_sid(5, &[1000])
+}
+
+fn token_primary_group_sid() -> Vec<u8> {
+    // S-1-5-32-545 (BUILTIN\Users)
+    build_sid(5, &[32, 545])
+}
+
+fn token_integrity_sid() -> Vec<u8> {
+    // S-1-16-8192 (Medium) or S-1-16-12288 (High when root)
+    let rid = if token_is_elevated() { 0x3000 } else { 0x2000 };
+    build_sid(16, &[rid])
+}
+
+fn token_default_groups() -> Vec<(Vec<u8>, u32)> {
+    let std_attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    vec![
+        (build_sid(5, &[32, 545]), std_attrs), // BUILTIN\Users
+        (build_sid(1, &[0]), std_attrs),       // Everyone (World)
+        (build_sid(5, &[4]), std_attrs),       // Interactive
+        (build_sid(5, &[11]), std_attrs),      // Authenticated Users
+        (build_sid(5, &[5, 0, 1]), std_attrs | SE_GROUP_LOGON_ID), // Logon SID
+        (token_integrity_sid(), SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED),
+    ]
+}
+
+fn token_default_privileges() -> Vec<(u64, u32)> {
+    // Standard Windows user token always holds SeChangeNotifyPrivilege (23) enabled by default.
+    vec![(23u64, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED)]
+}
+
+fn sid_hash_byte(sid: &[u8]) -> u8 {
+    if sid.len() < 8 {
+        return 0;
+    }
+    let sub_count = sid[1] as usize;
+    if sub_count > 0 && sid.len() >= 8 + sub_count * 4 {
+        // Low byte of the final SubAuthority (little-endian u32), matching Windows RtlSidHashInitialize.
+        sid[8 + (sub_count - 1) * 4]
+    } else {
+        sid[7]
+    }
+}
+
+fn populate_sid_hash(hash_out: &mut [u64; 32], sids: &[(Vec<u8>, u32)]) {
+    for (i, (sid, _)) in sids.iter().take(64).enumerate() {
+        let b = sid_hash_byte(sid);
+        let bit = 1u64 << i;
+        hash_out[(b & 0x0F) as usize] |= bit;
+        hash_out[16 + ((b >> 4) as usize)] |= bit;
+    }
+}
+
+unsafe fn write_token_groups(groups: &[(Vec<u8>, u32)], buf: *mut u8, buf_len: u32, ret_len: *mut u32) -> BOOL {
+    // TOKEN_GROUPS on x64: DWORD GroupCount (offset 0), 4-byte pad, SID_AND_ATTRIBUTES[N] (offset 8, 16 bytes each)
+    let header_sz = 8usize;
+    let entries_sz = groups.len() * 16;
+    let sids_sz: usize = groups.iter().map(|(s, _)| s.len()).sum();
+    let need = (header_sz + entries_sz + sids_sz) as u32;
+    std::ptr::write_unaligned(ret_len, need);
+    if buf.is_null() || buf_len < need {
+        return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::write_bytes(buf, 0, need as usize);
+    std::ptr::write_unaligned(buf as *mut u32, groups.len() as u32);
+    let mut sid_off = header_sz + entries_sz;
+    for (i, (sid, attrs)) in groups.iter().enumerate() {
+        let dst = buf.add(sid_off);
+        std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+        let ent = buf.add(header_sz + i * 16);
+        std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+        std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+        sid_off += sid.len();
+    }
+    TRUE
+}
+
+unsafe fn write_u32_token_info(val: u32, buf: *mut u8, buf_len: u32, ret_len: *mut u32) -> BOOL {
+    std::ptr::write_unaligned(ret_len, 4);
+    if buf.is_null() || buf_len < 4 {
+        return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::write_unaligned(buf as *mut u32, val);
+    TRUE
+}
+
 pub unsafe extern "win64" fn AllocateLocallyUniqueId(luid: *mut u64) -> BOOL {
     if luid.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
@@ -1245,8 +1481,8 @@ pub unsafe extern "win64" fn AllocateLocallyUniqueId(luid: *mut u64) -> BOOL {
 }
 
 pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, result: *mut BOOL) -> BOOL {
-    if handles::get(token).is_none() {
-        return err(ERROR_INVALID_HANDLE, FALSE);
+    if let Err(e) = TokenObj::resolve(token, 0x0008) {
+        return err(e, FALSE);
     }
     if result.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
@@ -1255,47 +1491,15 @@ pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, 
     TRUE
 }
 
-// The emulated process has a standard primary token. Duplicates keep their own
-// type and impersonation level while referring to the same guest identity.
-struct Token {
-    kind: u32,
-    level: u32,
-    access: u32,
-}
-
-impl handles::KObject for Token {
-    fn type_name(&self) -> &'static str { "Token" }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
-
-impl Token {
-    fn access_mask(request: u32) -> u32 {
-        const TOKEN_ALL_ACCESS: u32 = 0x000f01ff;
-        if request & (0x02000000 | 0x10000000) != 0 { return TOKEN_ALL_ACCESS; }
-        let mut mask = request & 0x0fffffff;
-        for (generic, rights) in [(0x80000000, 0x20008), (0x40000000, 0x200e0), (0x20000000, 0x20000)] {
-            if request & generic != 0 { mask |= rights; }
-        }
-        mask
-    }
-
-    fn resolve(h: HANDLE, access: u32) -> Result<Arc<Self>, u32> {
-        // GetCurrentProcessToken and GetCurrentThreadEffectiveToken pseudo-handles.
-        let token = if matches!(h as isize, -4 | -6) {
-            Arc::new(Self { kind: 1, level: 0, access: 8 })
-        } else {
-            handles::get_as::<Self>(h).ok_or(ERROR_INVALID_HANDLE)?
-        };
-        if token.access & access != access { return Err(ERROR_ACCESS_DENIED); }
-        Ok(token)
-    }
-}
-
 pub unsafe extern "win64" fn OpenProcessToken(process: HANDLE, access: u32, out: *mut HANDLE) -> BOOL {
-    if out.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
-    if !crate::kernel32::process::is_self(process) { return err(ERROR_INVALID_HANDLE, FALSE); }
-    let access = Token::access_mask(access);
-    out.write_unaligned(handles::insert(Arc::new(Token { kind: 1, level: 0, access })));
+    if out.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if !crate::kernel32::process::is_self(process) {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    let access = TokenObj::access_mask(access);
+    std::ptr::write_unaligned(out, handles::insert(new_process_token_handle(access)));
     TRUE
 }
 
@@ -1313,95 +1517,398 @@ pub unsafe extern "win64" fn OpenThreadToken(
     err(1008, FALSE)
 }
 
-const USER_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 0xe8, 3, 0, 0]; // S-1-5-1000
-const USERS_SID: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
-const WORLD_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-const MEDIUM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0];
-const TOKEN_GROUPS: &[(&[u8], u32)] = &[(WORLD_SID, 7), (USERS_SID, 7), (MEDIUM_SID, 0x60)];
-
 pub unsafe extern "win64" fn GetTokenInformation(
-    token: HANDLE, info_class: u32, buf: *mut u8, buf_len: u32, ret_len: *mut u32,
+    token: HANDLE,
+    info_class: u32,
+    buf: *mut u8,
+    buf_len: u32,
+    ret_len: *mut u32,
 ) -> BOOL {
-    if ret_len.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
-    let token = match Token::resolve(token, 8) {
+    if ret_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    // TokenSource (7) requires TOKEN_QUERY_SOURCE (0x0010); all other classes require TOKEN_QUERY (0x0008).
+    let required_access = if info_class == 7 { 0x0010 } else { 0x0008 };
+    let tok = match TokenObj::resolve(token, required_access) {
         Ok(t) => t,
-        Err(e) => return err(e, FALSE),
-    };
-    let fit = |needed: usize| {
-        ret_len.write_unaligned(needed as u32);
-        !buf.is_null() && (buf_len as usize) >= needed
-    };
-    let store_sid = |field: usize, offset: usize, sid: &[u8]| {
-        let dst = buf.add(offset);
-        std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
-        buf.add(field).cast::<*mut u8>().write_unaligned(dst);
+        Err(e) => {
+            std::ptr::write_unaligned(ret_len, 0);
+            return err(e, FALSE);
+        }
     };
     match info_class {
-        1 | 4 | 5 | 25 => { // TokenUser, Owner, PrimaryGroup, IntegrityLevel
-            let (header, sid) = match info_class {
-                1 => (16, USER_SID), 4 => (8, USER_SID),
-                5 => (8, USERS_SID), _ => (16, MEDIUM_SID),
-            };
-            if !fit(header + sid.len()) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
-            std::ptr::write_bytes(buf, 0, header);
-            store_sid(0, header, sid);
-            if info_class == 25 { buf.add(8).cast::<u32>().write_unaligned(0x20); }
-        }
-        2 => { // TOKEN_GROUPS with inline SIDs and absolute pointers into the caller's buffer
-            let header = 8 + 16 * TOKEN_GROUPS.len();
-            let size = header + TOKEN_GROUPS.iter().map(|(s, _)| s.len()).sum::<usize>();
-            if !fit(size) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
-            std::ptr::write_bytes(buf, 0, header);
-            buf.cast::<u32>().write_unaligned(TOKEN_GROUPS.len() as u32);
-            let mut offset = header;
-            for (i, &(sid, attributes)) in TOKEN_GROUPS.iter().enumerate() {
-                let field = 8 + 16 * i;
-                store_sid(field, offset, sid);
-                buf.add(field + 8).cast::<u32>().write_unaligned(attributes);
-                offset += sid.len();
+        // TokenUser (1): TOKEN_USER { SID_AND_ATTRIBUTES { PSID @0, DWORD Attrs @8 } } + user SID
+        1 => {
+            let sid = token_user_sid();
+            let need = (16 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
             }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let dst = buf.add(16);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            TRUE
         }
-        8 | 9 | 12 | 18 | 20 | 21 | 23 | 24 | 26 | 29 => {
-            let value = match info_class {
-                8 => token.kind,
-                9 if token.kind == 2 => token.level,
-                9 => return err(1349, FALSE), // ERROR_BAD_TOKEN_TYPE
-                12 | 18 => 1, // session 1, TokenElevationTypeDefault
-                _ => 0, // standard user, unrestricted, no virtualization/UIAccess/AppContainer
-            };
-            if !fit(4) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
-            buf.cast::<u32>().write_unaligned(value);
+        // TokenGroups (2): TOKEN_GROUPS
+        2 => {
+            let groups = token_default_groups();
+            write_token_groups(&groups, buf, buf_len, ret_len)
         }
-        3 => { // TOKEN_PRIVILEGES: this guest identity holds no privileges.
-            if !fit(4) { return err(ERROR_INSUFFICIENT_BUFFER, FALSE); }
-            buf.cast::<u32>().write_unaligned(0);
+        // TokenPrivileges (3): TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[N] (12 bytes each) }
+        3 => {
+            let privs = token_default_privileges();
+            let need = (4 + privs.len() * 12) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            std::ptr::write_unaligned(buf as *mut u32, privs.len() as u32);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = buf.add(4 + i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            TRUE
         }
+        // TokenOwner (4): TOKEN_OWNER { PSID Owner } + user SID
+        4 => {
+            let sid = token_user_sid();
+            let need = (8 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            let dst = buf.add(8);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            TRUE
+        }
+        // TokenPrimaryGroup (5): TOKEN_PRIMARY_GROUP { PSID PrimaryGroup } + primary group SID
+        5 => {
+            let sid = token_primary_group_sid();
+            let need = (8 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            let dst = buf.add(8);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            TRUE
+        }
+        // TokenDefaultDacl (6): TOKEN_DEFAULT_DACL { PACL DefaultDacl } + 8-byte ACL header
+        6 => {
+            let need = 16u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let acl = buf.add(8);
+            *acl = 2; // ACL_REVISION
+            std::ptr::write_unaligned(acl.add(2) as *mut u16, 8); // AclSize
+            std::ptr::write_unaligned(buf as *mut usize, acl as usize);
+            TRUE
+        }
+        // TokenSource (7): TOKEN_SOURCE { CHAR SourceName[8]; LUID SourceIdentifier } (16 bytes)
+        7 => {
+            let need = 16u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            std::ptr::copy_nonoverlapping(b"User32\0\0".as_ptr(), buf, 8);
+            std::ptr::write_unaligned(buf.add(8) as *mut u64, tok.auth_id);
+            TRUE
+        }
+        // TokenType (8): TOKEN_TYPE (TokenPrimary=1 or TokenImpersonation=2)
+        8 => write_u32_token_info(tok.token_type, buf, buf_len, ret_len),
+        // TokenImpersonationLevel (9): valid only for impersonation tokens; primary tokens return ERROR_INVALID_PARAMETER on Windows.
+        9 => {
+            if tok.token_type != TOKEN_IMPERSONATION {
+                std::ptr::write_unaligned(ret_len, 0);
+                return err(ERROR_INVALID_PARAMETER, FALSE);
+            }
+            write_u32_token_info(tok.imp_level, buf, buf_len, ret_len)
+        }
+        // TokenStatistics (10): TOKEN_STATISTICS (56 bytes on x64)
+        10 => {
+            let need = 56u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 56);
+            std::ptr::write_unaligned(buf.add(0) as *mut u64, tok.token_id);
+            std::ptr::write_unaligned(buf.add(8) as *mut u64, tok.auth_id);
+            std::ptr::write_unaligned(buf.add(16) as *mut i64, i64::MAX); // ExpirationTime (no expiry)
+            std::ptr::write_unaligned(buf.add(24) as *mut u32, tok.token_type);
+            std::ptr::write_unaligned(buf.add(28) as *mut u32, tok.imp_level);
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, 4096); // DynamicCharged
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, 4096); // DynamicAvailable
+            std::ptr::write_unaligned(buf.add(40) as *mut u32, token_default_groups().len() as u32);
+            std::ptr::write_unaligned(buf.add(44) as *mut u32, token_default_privileges().len() as u32);
+            std::ptr::write_unaligned(buf.add(48) as *mut u64, tok.modified_id);
+            TRUE
+        }
+        // TokenRestrictedSids (11): empty TOKEN_GROUPS
+        11 => write_token_groups(&[], buf, buf_len, ret_len),
+        // TokenSessionId (12) -> 1
+        12 => write_u32_token_info(1, buf, buf_len, ret_len),
+        // TokenGroupsAndPrivileges (13): TOKEN_GROUPS_AND_PRIVILEGES (56 bytes header on x64)
+        13 => {
+            let mut sids = vec![(token_user_sid(), 0u32)];
+            sids.extend(token_default_groups());
+            let privs = token_default_privileges();
+            let header_sz = 56usize;
+            let sids_arr_sz = sids.len() * 16;
+            let sids_data_sz: usize = sids.iter().map(|(s, _)| s.len()).sum();
+            let privs_sz = privs.len() * 12;
+            let need = (header_sz + sids_arr_sz + sids_data_sz + privs_sz) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let sids_arr = buf.add(header_sz);
+            let mut sid_data_off = header_sz + sids_arr_sz;
+            for (i, (sid, attrs)) in sids.iter().enumerate() {
+                let dst = buf.add(sid_data_off);
+                std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+                let ent = sids_arr.add(i * 16);
+                std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+                sid_data_off += sid.len();
+            }
+            let privs_ptr = buf.add(sid_data_off);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = privs_ptr.add(i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            std::ptr::write_unaligned(buf.add(0) as *mut u32, sids.len() as u32);
+            std::ptr::write_unaligned(buf.add(4) as *mut u32, (sids_arr_sz + sids_data_sz) as u32);
+            std::ptr::write_unaligned(buf.add(8) as *mut usize, sids_arr as usize);
+            // RestrictedSidCount/Length/Ptr @16, 20, 24 = 0
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, privs.len() as u32);
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, privs_sz as u32);
+            std::ptr::write_unaligned(buf.add(40) as *mut usize, privs_ptr as usize);
+            std::ptr::write_unaligned(buf.add(48) as *mut u64, tok.auth_id);
+            TRUE
+        }
+        // TokenSessionReference (14): reserved; Windows returns ERROR_INVALID_PARAMETER.
+        14 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_INVALID_PARAMETER, FALSE)
+        }
+        // TokenSandBoxInert (15) -> 0
+        15 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenAuditPolicy (16): requires SeSecurityPrivilege; standard user gets ERROR_PRIVILEGE_NOT_HELD.
+        16 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_PRIVILEGE_NOT_HELD, FALSE)
+        }
+        // TokenOrigin (17): TOKEN_ORIGIN { LUID OriginatingLogonSession } (8 bytes)
+        17 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_unaligned(buf as *mut u64, tok.auth_id);
+            TRUE
+        }
+        // TokenElevationType (18): TokenElevationTypeDefault (1)
+        18 => write_u32_token_info(1, buf, buf_len, ret_len),
+        // TokenLinkedToken (19): non-split (default) token has no linked UAC token -> ERROR_NO_SUCH_LOGON_SESSION (1312)
+        19 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_NO_SUCH_LOGON_SESSION, FALSE)
+        }
+        // TokenElevation (20): 1 if root, 0 otherwise
+        20 => write_u32_token_info(token_is_elevated() as u32, buf, buf_len, ret_len),
+        // TokenHasRestrictions (21) -> 0
+        21 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenAccessInformation (22): TOKEN_ACCESS_INFORMATION (88 bytes on x64) + SidHash/RestrictedSidHash/CapabilitiesHash + SidAttr/SIDs + Privileges
+        22 => {
+            // SID_AND_ATTRIBUTES_HASH on x64 is 4 (SidCount) + 4 (pad) + 8 (SidAttr) + 32*8 (Hash) = 272 bytes.
+            const HASH_SZ: usize = 272;
+            let header_sz = 88usize;
+            let mut sids = vec![(token_user_sid(), 0u32)];
+            sids.extend(token_default_groups());
+            let privs = token_default_privileges();
+            let hashes_end = header_sz + HASH_SZ * 3;
+            let sids_arr_sz = sids.len() * 16;
+            let sids_data_sz: usize = sids.iter().map(|(s, _)| s.len()).sum();
+            let privs_off = (hashes_end + sids_arr_sz + sids_data_sz + 7) & !7;
+            let privs_sz = 4 + privs.len() * 12;
+            let need = (privs_off + privs_sz) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let sid_hash = buf.add(header_sz);
+            let restr_hash = sid_hash.add(HASH_SZ);
+            let cap_hash = restr_hash.add(HASH_SZ);
+            let sids_arr = buf.add(hashes_end);
+            let mut sid_data_off = hashes_end + sids_arr_sz;
+            for (i, (sid, attrs)) in sids.iter().enumerate() {
+                let dst = buf.add(sid_data_off);
+                std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+                let ent = sids_arr.add(i * 16);
+                std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+                sid_data_off += sid.len();
+            }
+            let mut hash_entries = [0u64; 32];
+            populate_sid_hash(&mut hash_entries, &sids);
+            std::ptr::write_unaligned(sid_hash as *mut u32, sids.len() as u32);
+            std::ptr::write_unaligned(sid_hash.add(8) as *mut usize, sids_arr as usize);
+            for (i, &entry) in hash_entries.iter().enumerate() {
+                std::ptr::write_unaligned(sid_hash.add(16 + i * 8) as *mut u64, entry);
+            }
+            let privs_ptr = buf.add(privs_off);
+            std::ptr::write_unaligned(privs_ptr as *mut u32, privs.len() as u32);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = privs_ptr.add(4 + i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            std::ptr::write_unaligned(buf.add(0) as *mut usize, sid_hash as usize);
+            std::ptr::write_unaligned(buf.add(8) as *mut usize, restr_hash as usize);
+            std::ptr::write_unaligned(buf.add(16) as *mut usize, privs_ptr as usize);
+            std::ptr::write_unaligned(buf.add(24) as *mut u64, tok.auth_id);
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, tok.token_type);
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, tok.imp_level);
+            std::ptr::write_unaligned(buf.add(40) as *mut u32, TOKEN_MANDATORY_POLICY_NO_WRITE_UP);
+            // Flags @44 = 0, AppContainerNumber @48 = 0, PackageSid @56 = NULL
+            std::ptr::write_unaligned(buf.add(64) as *mut usize, cap_hash as usize);
+            // TrustLevelSid @72 = NULL, SecurityAttributes @80 = NULL
+            TRUE
+        }
+        // TokenVirtualizationAllowed (23) -> 0
+        23 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenVirtualizationEnabled (24) -> 0
+        24 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenIntegrityLevel (25): TOKEN_MANDATORY_LABEL -> Medium (0x2000) or High (0x3000)
+        25 => {
+            let sid = token_integrity_sid();
+            let need = (16 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let dst = buf.add(16);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            std::ptr::write_unaligned(buf.add(8) as *mut u32, SE_GROUP_INTEGRITY);
+            TRUE
+        }
+        // TokenUIAccess (26) -> 0
+        26 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenMandatoryPolicy (27) -> TOKEN_MANDATORY_POLICY_NO_WRITE_UP (1)
+        27 => write_u32_token_info(TOKEN_MANDATORY_POLICY_NO_WRITE_UP, buf, buf_len, ret_len),
+        // TokenLogonSid (28): TOKEN_GROUPS with single logon SID S-1-5-5-0-1
+        28 => {
+            let logon = [(
+                build_sid(5, &[5, 0, 1]),
+                SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED | SE_GROUP_LOGON_ID,
+            )];
+            write_token_groups(&logon, buf, buf_len, ret_len)
+        }
+        // TokenIsAppContainer (29) -> 0
+        29 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenCapabilities (30): empty TOKEN_GROUPS
+        30 => write_token_groups(&[], buf, buf_len, ret_len),
+        // TokenAppContainerSid (31): TOKEN_APPCONTAINER_INFORMATION { PSID TokenAppContainer = NULL } (8 bytes)
+        31 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_unaligned(buf as *mut usize, 0);
+            TRUE
+        }
+        // TokenAppContainerNumber (32) -> 0
+        32 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenUserClaimAttributes (33), TokenDeviceClaimAttributes (34),
+        // TokenRestrictedUserClaimAttributes (35), TokenRestrictedDeviceClaimAttributes (36),
+        // TokenSecurityAttributes (39), TokenSingletonAttributes (43):
+        // CLAIM_SECURITY_ATTRIBUTES_INFORMATION / TOKEN_SECURITY_ATTRIBUTES_INFORMATION (16 bytes on x64):
+        // { WORD Version=1, WORD Reserved=0, DWORD AttributeCount=0, PVOID pAttributeV1=NULL }
+        33 | 34 | 35 | 36 | 39 | 43 => {
+            std::ptr::write_unaligned(ret_len, 16);
+            if buf.is_null() || buf_len < 16 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            std::ptr::write_unaligned(buf as *mut u16, 1); // Version = 1
+            TRUE
+        }
+        // TokenDeviceGroups (37), TokenRestrictedDeviceGroups (38): empty TOKEN_GROUPS
+        37 | 38 => write_token_groups(&[], buf, buf_len, ret_len),
+        // TokenIsRestricted (40) -> 0
+        40 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenProcessTrustLevel (41): PSID = NULL (8 bytes)
+        41 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_unaligned(buf as *mut usize, 0);
+            TRUE
+        }
+        // TokenPrivateNameSpace (42) -> 0
+        42 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenBnoIsolation (44): TOKEN_BNO_ISOLATION_INFORMATION { PWSTR IsolationPrefix=NULL, BOOLEAN IsolationEnabled=0 } (16 bytes)
+        44 => {
+            std::ptr::write_unaligned(ret_len, 16);
+            if buf.is_null() || buf_len < 16 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            TRUE
+        }
+        // TokenChildProcessFlags (45), TokenIsLessPrivilegedAppContainer (46),
+        // TokenIsSandboxed (47), TokenIsAppSilo (48) -> 0
+        45 | 46 | 47 | 48 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // Invalid / out-of-range TOKEN_INFORMATION_CLASS: Windows returns FALSE with ERROR_INVALID_PARAMETER.
         _ => {
-            stub!("GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED");
-            ret_len.write_unaligned(0);
-            return err(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_INVALID_PARAMETER, FALSE)
         }
     }
-    TRUE
 }
 
 pub unsafe extern "win64" fn DuplicateToken(existing: HANDLE, imp_level: u32, out: *mut HANDLE) -> BOOL {
-    DuplicateTokenEx(existing, 0x0c, std::ptr::null_mut(), imp_level, 2, out)
+    DuplicateTokenEx(existing, 0x0c, std::ptr::null_mut(), imp_level, TOKEN_IMPERSONATION, out)
 }
 
 pub unsafe extern "win64" fn DuplicateTokenEx(
-    existing: HANDLE, access: u32, _attr: *mut c_void, imp_level: u32, token_type: u32, out: *mut HANDLE,
+    existing: HANDLE,
+    access: u32,
+    _attr: *mut c_void,
+    imp_level: u32,
+    token_type: u32,
+    out: *mut HANDLE,
 ) -> BOOL {
-    if out.is_null() || !matches!(token_type, 1 | 2) || imp_level > 3 {
+    if out.is_null() || !matches!(token_type, TOKEN_PRIMARY | TOKEN_IMPERSONATION) || imp_level > 3 {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    let original = match Token::resolve(existing, 2) {
+    let original = match TokenObj::resolve(existing, 0x0002) {
         Ok(t) => t,
         Err(e) => return err(e, FALSE),
     };
-    if original.kind == 2 && imp_level > original.level { return err(1346, FALSE); }
-    let access = if access == 0 { original.access } else { Token::access_mask(access) };
-    out.write_unaligned(handles::insert(Arc::new(Token { kind: token_type, level: imp_level, access })));
+    if original.token_type == TOKEN_IMPERSONATION && imp_level > original.imp_level {
+        return err(1346, FALSE);
+    }
+    let new_access = if access == 0 { original.access } else { TokenObj::access_mask(access) };
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(token_type, imp_level, new_access)));
     TRUE
 }
 
@@ -1687,15 +2194,20 @@ pub unsafe extern "win64" fn ConvertSidToStringSidA(sid: *const u8, out: *mut LP
 }
 
 pub unsafe extern "win64" fn CheckTokenMembership(token: HANDLE, sid: *const c_void, is_member: *mut BOOL) -> BOOL {
-    if is_member.is_null() || sid.is_null() { return err(ERROR_INVALID_PARAMETER, FALSE); }
+    if is_member.is_null() || sid.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
     if !token.is_null() {
-        match Token::resolve(token, 8) {
-            Ok(t) if t.kind == 2 => {}
+        match TokenObj::resolve(token, 0x0008) {
+            Ok(t) if t.token_type == TOKEN_IMPERSONATION => {}
             Ok(_) => return err(1309, FALSE), // ERROR_NO_IMPERSONATION_TOKEN
             Err(e) => return err(e, FALSE),
         }
     }
-    let enabled = TOKEN_GROUPS.iter().any(|&(group, flags)| flags & 4 != 0 && EqualSid(sid.cast(), group.as_ptr()) != 0);
+    let groups = token_default_groups();
+    let enabled = groups
+        .iter()
+        .any(|(group, flags)| (flags & SE_GROUP_ENABLED) != 0 && EqualSid(sid.cast(), group.as_ptr()) != 0);
     is_member.write_unaligned(enabled as BOOL);
     TRUE
 }
@@ -2658,37 +3170,195 @@ pub unsafe extern "win64" fn StartServiceCtrlDispatcherA(
 
 // ------------------------------------------------------- CAPI / Cred*
 
+use crate::misc::bcrypt::{CipherMode as BcCipherMode, Digest as BcDigest, IncrementalDigest, Rc4State, RsaKey, SymAlg};
+
+const CALG_MD2: u32 = 0x0000_8001;
+const CALG_MD4: u32 = 0x0000_8002;
 const CALG_MD5: u32 = 0x0000_8003;
 const CALG_SHA1: u32 = 0x0000_8004;
 const CALG_SHA_256: u32 = 0x0000_800C;
 const CALG_SHA_384: u32 = 0x0000_800D;
 const CALG_SHA_512: u32 = 0x0000_800E;
 
+const CALG_DES: u32 = 0x0000_6601;
+const CALG_RC2: u32 = 0x0000_6602;
+const CALG_3DES: u32 = 0x0000_6603;
+const CALG_3DES_112: u32 = 0x0000_6609;
+const CALG_AES_128: u32 = 0x0000_660E;
+const CALG_AES_192: u32 = 0x0000_660F;
+const CALG_AES_256: u32 = 0x0000_6610;
+const CALG_AES: u32 = 0x0000_6611;
+const CALG_RC4: u32 = 0x0000_6801;
+const CALG_RSA_SIGN: u32 = 0x0000_2400;
+const CALG_RSA_KEYX: u32 = 0x0000_A400;
+
+const AT_KEYEXCHANGE: u32 = 1;
+const AT_SIGNATURE: u32 = 2;
+
 const HP_ALGID: u32 = 0x0001;
 const HP_HASHVAL: u32 = 0x0002;
 const HP_HASHSIZE: u32 = 0x0004;
+
+const KP_IV: u32 = 1;
+const KP_SALT: u32 = 2;
+const KP_PADDING: u32 = 3;
+const KP_MODE: u32 = 4;
+const KP_MODE_BITS: u32 = 5;
+const KP_PERMISSIONS: u32 = 6;
+const KP_ALGID: u32 = 7;
+const KP_BLOCKLEN: u32 = 8;
+const KP_KEYLEN: u32 = 9;
+const KP_SALT_EX: u32 = 10;
+const KP_EFFECTIVE_KEYLEN: u32 = 19;
+
+const CRYPT_MODE_CBC: u32 = 1;
+const CRYPT_MODE_ECB: u32 = 2;
+const CRYPT_MODE_CFB: u32 = 4;
+
+const PKCS5_PADDING: u32 = 1;
+
+const CRYPT_ENCRYPT: u32 = 0x0000_0001;
+const CRYPT_DECRYPT: u32 = 0x0000_0002;
+const CRYPT_EXPORT: u32 = 0x0000_0004;
+const CRYPT_READ: u32 = 0x0000_0008;
+const CRYPT_WRITE: u32 = 0x0000_0010;
+const CRYPT_MAC: u32 = 0x0000_0020;
+const CRYPT_EXPORT_KEY: u32 = 0x0000_0040;
+const CRYPT_IMPORT_KEY: u32 = 0x0000_0080;
+
+const CRYPT_EXPORTABLE: u32 = 0x0000_0001;
+const CRYPT_CREATE_SALT: u32 = 0x0000_0004;
+const CRYPT_NO_SALT: u32 = 0x0000_0010;
+const CRYPT_NOHASHOID: u32 = 0x0000_0001;
+const CRYPT_OAEP: u32 = 0x0000_0040;
+const CRYPT_VERIFYCONTEXT: u32 = 0xF000_0000;
+const CRYPT_NEWKEYSET: u32 = 0x0000_0008;
+const CRYPT_DELETEKEYSET: u32 = 0x0000_0010;
+const CRYPT_MACHINE_KEYSET: u32 = 0x0000_0020;
+
+const SIMPLEBLOB: u32 = 0x1;
+const PUBLICKEYBLOB: u32 = 0x6;
+const PRIVATEKEYBLOB: u32 = 0x7;
+const PLAINTEXTKEYBLOB: u32 = 0x8;
+const CUR_BLOB_VERSION: u8 = 2;
 
 const PP_IMPTYPE: u32 = 3;
 const PP_NAME: u32 = 4;
 const PP_VERSION: u32 = 5;
 const PP_CONTAINER: u32 = 6;
 const PP_PROVTYPE: u32 = 16;
+const PP_KEYSET_TYPE: u32 = 27;
 
-const NTE_BAD_ALGID: u32 = 0x8009_0008;
-const NTE_BAD_TYPE: u32 = 0x8009_000A;
-const NTE_BAD_HASH: u32 = 0x8009_0002;
 const NTE_BAD_UID: u32 = 0x8009_0001;
+const NTE_BAD_HASH: u32 = 0x8009_0002;
+const NTE_BAD_KEY: u32 = 0x8009_0003;
+const NTE_BAD_LEN: u32 = 0x8009_0004;
+const NTE_BAD_DATA: u32 = 0x8009_0005;
+const NTE_BAD_SIGNATURE: u32 = 0x8009_0006;
+const NTE_BAD_VER: u32 = 0x8009_0007;
+const NTE_BAD_ALGID: u32 = 0x8009_0008;
+const NTE_BAD_FLAGS: u32 = 0x8009_0009;
+const NTE_BAD_TYPE: u32 = 0x8009_000A;
+const NTE_BAD_KEY_STATE: u32 = 0x8009_000B;
+const NTE_NO_KEY: u32 = 0x8009_000D;
+const NTE_EXISTS: u32 = 0x8009_000F;
+const NTE_PERM: u32 = 0x8009_0010;
+const NTE_BAD_KEYSET: u32 = 0x8009_0016;
+const NTE_FAIL: u32 = 0x8009_0020;
+
+const CAPI_STORE_MAGIC_V1: &[u8; 8] = b"PFCAPI01";
+const CAPI_STORE_MAGIC_V2: &[u8; 8] = b"PFCAPI02";
+const CAPI_ENVELOPE_MAGIC: &[u8; 8] = b"PFCAPIE1";
+
+type CapiDiskKey = (u32, String, String);
+type CapiCacheKey = (bool, u32, String, String);
+
+fn capi_default_provider_name(prov_type: u32) -> &'static str {
+    match prov_type {
+        1 => "Microsoft Strong Cryptographic Provider",
+        24 => "Microsoft Enhanced RSA and AES Cryptographic Provider",
+        _ => "Microsoft Enhanced RSA and AES Cryptographic Provider",
+    }
+}
+
+fn capi_provider_default_rc_key_len(prov_name: &str) -> usize {
+    if prov_name.to_ascii_lowercase().starts_with("microsoft base cryptographic provider") {
+        5 // 40-bit default for Microsoft Base Cryptographic Provider
+    } else {
+        16 // 128-bit default for Strong / Enhanced / AES providers
+    }
+}
+
+fn capi_provider_default_rc2_effective_bits(prov_name: &str, key_len: usize) -> u32 {
+    let lower = prov_name.to_ascii_lowercase();
+    // Per Microsoft Learn (CryptSetKeyParam KP_EFFECTIVE_KEYLEN):
+    // Microsoft Enhanced Cryptographic Provider (v1.0) defaults RC2 effective
+    // key length to 40 bits for backward compatibility with the Base provider,
+    // unlike Strong and Enhanced RSA/AES providers which default to key_len * 8.
+    if lower.starts_with("microsoft base cryptographic provider")
+        || lower.starts_with("microsoft enhanced cryptographic provider")
+    {
+        40
+    } else {
+        (key_len * 8) as u32
+    }
+}
+
+#[derive(Clone)]
+struct StoredUserKey {
+    key: RsaKey,
+    exportable: bool,
+}
+
+#[derive(Clone, Default)]
+struct CapiContainerKeys {
+    keyx: Option<StoredUserKey>,
+    sign: Option<StoredUserKey>,
+}
 
 struct CapiProvider {
     prov_type: u32,
     prov_name: String,
     container: String,
+    machine_keyset: bool,
+    ephemeral: bool,
+    ephemeral_keys: CapiContainerKeys,
 }
 
+#[derive(Clone)]
 struct CapiHash {
+    h_prov: usize,
     alg_id: u32,
-    ctx: [u64; 64],
+    digest: BcDigest,
+    state: IncrementalDigest,
     override_val: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+enum CapiKeyMaterial {
+    Rsa {
+        key: RsaKey,
+    },
+    Symmetric {
+        alg: SymAlg,
+        key: Vec<u8>,
+        salt: Vec<u8>,
+        mode: BcCipherMode,
+        padding: u32,
+        effective_key_len: u32,
+        iv: Vec<u8>,
+        running_iv: Vec<u8>,
+        msg_block_len: u32,
+        rc4: Option<Rc4State>,
+    },
+}
+
+#[derive(Clone)]
+struct CapiKey {
+    alg_id: u32,
+    exportable: bool,
+    permissions: u32,
+    material: CapiKeyMaterial,
 }
 
 static NEXT_CAPI_HANDLE: AtomicU64 = AtomicU64::new(0xC000_0001);
@@ -2699,82 +3369,796 @@ fn capi_providers() -> &'static std::sync::Mutex<std::collections::HashMap<usize
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn capi_containers() -> &'static std::sync::Mutex<std::collections::HashMap<CapiCacheKey, CapiContainerKeys>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<CapiCacheKey, CapiContainerKeys>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn capi_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiHash>> {
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiHash>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-extern "C" {
-    fn CC_MD5_Init(c: *mut c_void) -> i32;
-    fn CC_MD5_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_MD5_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA1_Init(c: *mut c_void) -> i32;
-    fn CC_SHA1_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA1_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA256_Init(c: *mut c_void) -> i32;
-    fn CC_SHA256_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA256_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA384_Init(c: *mut c_void) -> i32;
-    fn CC_SHA384_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA384_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA512_Init(c: *mut c_void) -> i32;
-    fn CC_SHA512_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA512_Final(md: *mut u8, c: *mut c_void) -> i32;
+fn capi_keys() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiKey>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiKey>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn capi_hash_len(alg_id: u32) -> Option<usize> {
+fn capi_alg_to_digest(alg_id: u32) -> Option<BcDigest> {
     match alg_id {
-        CALG_MD5 => Some(16),
-        CALG_SHA1 => Some(20),
-        CALG_SHA_256 => Some(32),
-        CALG_SHA_384 => Some(48),
-        CALG_SHA_512 => Some(64),
+        CALG_MD2 => Some(BcDigest::Md2),
+        CALG_MD4 => Some(BcDigest::Md4),
+        CALG_MD5 => Some(BcDigest::Md5),
+        CALG_SHA1 => Some(BcDigest::Sha1),
+        CALG_SHA_256 => Some(BcDigest::Sha256),
+        CALG_SHA_384 => Some(BcDigest::Sha384),
+        CALG_SHA_512 => Some(BcDigest::Sha512),
         _ => None,
     }
 }
 
-fn capi_hash_ops(
-    alg_id: u32,
-) -> Option<(
-    unsafe extern "C" fn(*mut c_void) -> i32,
-    unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32,
-    unsafe extern "C" fn(*mut u8, *mut c_void) -> i32,
-)> {
+fn capi_alg_to_sym(alg_id: u32) -> Option<(SymAlg, usize)> {
     match alg_id {
-        CALG_MD5 => Some((CC_MD5_Init, CC_MD5_Update, CC_MD5_Final)),
-        CALG_SHA1 => Some((CC_SHA1_Init, CC_SHA1_Update, CC_SHA1_Final)),
-        CALG_SHA_256 => Some((CC_SHA256_Init, CC_SHA256_Update, CC_SHA256_Final)),
-        CALG_SHA_384 => Some((CC_SHA384_Init, CC_SHA384_Update, CC_SHA384_Final)),
-        CALG_SHA_512 => Some((CC_SHA512_Init, CC_SHA512_Update, CC_SHA512_Final)),
+        CALG_AES_128 => Some((SymAlg::Aes, 16)),
+        CALG_AES_192 => Some((SymAlg::Aes, 24)),
+        CALG_AES_256 => Some((SymAlg::Aes, 32)),
+        CALG_AES => Some((SymAlg::Aes, 16)),
+        CALG_3DES => Some((SymAlg::Des3, 24)),
+        CALG_3DES_112 => Some((SymAlg::Des3_112, 16)),
+        CALG_DES => Some((SymAlg::Des, 8)),
+        CALG_RC2 => Some((SymAlg::Rc2, 16)),
+        CALG_RC4 => Some((SymAlg::Rc4, 16)),
         _ => None,
     }
 }
 
-unsafe fn capi_hash_init(alg_id: u32) -> Option<[u64; 64]> {
-    let (init, _, _) = capi_hash_ops(alg_id)?;
-    let mut ctx = [0u64; 64];
-    init(ctx.as_mut_ptr() as *mut c_void);
-    Some(ctx)
+fn capi_valid_sym_key_len(alg_id: u32, sym_alg: SymAlg, cb_key: usize) -> bool {
+    match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => cb_key == 16,
+            CALG_AES_192 => cb_key == 24,
+            CALG_AES_256 => cb_key == 32,
+            _ => matches!(cb_key, 16 | 24 | 32),
+        },
+        SymAlg::Des => cb_key == 8,
+        SymAlg::Des3_112 => cb_key == 16,
+        SymAlg::Des3 => cb_key == 24,
+        SymAlg::Rc2 => (1..=128).contains(&cb_key),
+        SymAlg::Rc4 => (1..=256).contains(&cb_key),
+    }
 }
 
-unsafe fn capi_hash_update(alg_id: u32, ctx: &mut [u64; 64], data: &[u8]) {
-    let Some((_, update, _)) = capi_hash_ops(alg_id) else {
-        return;
+fn capi_default_permissions(exportable: bool) -> u32 {
+    let base = CRYPT_ENCRYPT
+        | CRYPT_DECRYPT
+        | CRYPT_READ
+        | CRYPT_WRITE
+        | CRYPT_MAC
+        | CRYPT_EXPORT_KEY
+        | CRYPT_IMPORT_KEY;
+    if exportable { base | CRYPT_EXPORT } else { base }
+}
+
+fn capi_effective_sym_key(alg: SymAlg, key: &[u8], salt: &[u8]) -> Vec<u8> {
+    if matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) && !salt.is_empty() {
+        let mut out = Vec::with_capacity(key.len() + salt.len());
+        out.extend_from_slice(key);
+        out.extend_from_slice(salt);
+        out
+    } else {
+        key.to_vec()
+    }
+}
+
+unsafe fn capi_salt_from_flags(
+    alg: SymAlg,
+    key_len: usize,
+    dw_flags: u32,
+    hash_tail: Option<&[u8]>,
+) -> Result<Vec<u8>, u32> {
+    let no_salt = (dw_flags & CRYPT_NO_SALT) != 0;
+    let create_salt = (dw_flags & CRYPT_CREATE_SALT) != 0;
+    if no_salt && create_salt {
+        return Err(NTE_BAD_FLAGS);
+    }
+    if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) || no_salt {
+        return Ok(Vec::new());
+    }
+    if create_salt {
+        let salt_len = 16usize.saturating_sub(key_len);
+        if salt_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut salt = vec![0u8; salt_len];
+        if let Some(tail) = hash_tail {
+            let n = tail.len().min(salt_len);
+            salt[..n].copy_from_slice(&tail[..n]);
+        } else if !crate::det_entropy::fill(salt.as_mut_ptr(), salt.len()) {
+            libc::arc4random_buf(salt.as_mut_ptr() as *mut c_void, salt.len());
+        }
+        return Ok(salt);
+    }
+    // Microsoft Learn (Salt Value Functionality): 40-bit RC2/RC4 keys receive an 11-byte
+    // zero salt by default unless CRYPT_NO_SALT is requested.
+    if key_len == 5 {
+        Ok(vec![0u8; 11])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn capi_pkcs5_pad(data: &[u8], bs: usize) -> Vec<u8> {
+    let pad = bs - (data.len() % bs);
+    let mut out = Vec::with_capacity(data.len() + pad);
+    out.extend_from_slice(data);
+    out.resize(data.len() + pad, pad as u8);
+    out
+}
+
+fn capi_pkcs5_unpad(mut data: Vec<u8>, bs: usize) -> Result<Vec<u8>, u32> {
+    if data.is_empty() || data.len() % bs != 0 {
+        return Err(NTE_BAD_DATA);
+    }
+    let pad = *data.last().unwrap() as usize;
+    if pad == 0 || pad > bs || pad > data.len() {
+        return Err(NTE_BAD_DATA);
+    }
+    if data[data.len() - pad..].iter().any(|&b| b as usize != pad) {
+        return Err(NTE_BAD_DATA);
+    }
+    data.truncate(data.len() - pad);
+    Ok(data)
+}
+
+fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<Vec<u8>, u32> {
+    let required = if encrypt {
+        CRYPT_ENCRYPT | CRYPT_EXPORT_KEY
+    } else {
+        CRYPT_DECRYPT | CRYPT_IMPORT_KEY
     };
-    let ctx_p = ctx.as_mut_ptr() as *mut c_void;
-    for chunk in data.chunks(16 * 1024 * 1024) {
-        update(ctx_p, chunk.as_ptr() as *const c_void, chunk.len() as u32);
+    if (sym_key.permissions & required) != required {
+        return Err(NTE_PERM);
+    }
+    let CapiKeyMaterial::Symmetric {
+        alg,
+        key,
+        salt,
+        mode,
+        padding,
+        effective_key_len,
+        iv,
+        msg_block_len,
+        ..
+    } = &sym_key.material
+    else {
+        return Err(NTE_BAD_KEY);
+    };
+    let eff_key = capi_effective_sym_key(*alg, key, salt);
+    if *alg == SymAlg::Rc4 {
+        return Ok(Rc4State::new(&eff_key).apply(data));
+    }
+    let bs = alg.block_size();
+    let use_pkcs7 = *padding == PKCS5_PADDING;
+    if (*mode != BcCipherMode::Cfb || (!encrypt && use_pkcs7)) && (!encrypt || !use_pkcs7) && data.len() % bs != 0 {
+        return Err(NTE_BAD_DATA);
+    }
+    let mut iv_work = iv.clone();
+    if *mode == BcCipherMode::Cfb && use_pkcs7 {
+        if encrypt {
+            let padded = capi_pkcs5_pad(data, bs);
+            return crate::misc::bcrypt::sym_crypt_block_mode(
+                *alg,
+                *mode,
+                true,
+                false,
+                &eff_key,
+                *effective_key_len,
+                &mut iv_work,
+                *msg_block_len as usize,
+                &padded,
+            )
+            .map_err(|_| NTE_BAD_DATA);
+        }
+        let plain = crate::misc::bcrypt::sym_crypt_block_mode(
+            *alg,
+            *mode,
+            false,
+            false,
+            &eff_key,
+            *effective_key_len,
+            &mut iv_work,
+            *msg_block_len as usize,
+            data,
+        )
+        .map_err(|_| NTE_BAD_DATA)?;
+        return capi_pkcs5_unpad(plain, bs);
+    }
+    crate::misc::bcrypt::sym_crypt_block_mode(
+        *alg,
+        *mode,
+        encrypt,
+        use_pkcs7,
+        &eff_key,
+        *effective_key_len,
+        &mut iv_work,
+        *msg_block_len as usize,
+        data,
+    )
+    .map_err(|_| NTE_BAD_DATA)
+}
+
+fn capi_sym_key(
+    prov_name: &str,
+    alg_id: u32,
+    alg: SymAlg,
+    key: Vec<u8>,
+    salt: Vec<u8>,
+    exportable: bool,
+) -> CapiKey {
+    let bs = alg.block_size();
+    let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
+    let eff = if alg == SymAlg::Rc2 {
+        capi_provider_default_rc2_effective_bits(prov_name, key.len())
+    } else {
+        0
+    };
+    let eff_key = capi_effective_sym_key(alg, &key, &salt);
+    let rc4 = (alg == SymAlg::Rc4).then(|| Rc4State::new(&eff_key));
+    CapiKey {
+        alg_id,
+        exportable,
+        permissions: capi_default_permissions(exportable),
+        material: CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            salt,
+            mode,
+            padding: PKCS5_PADDING,
+            effective_key_len: eff,
+            iv: vec![0u8; bs],
+            running_iv: vec![0u8; bs],
+            // Microsoft Learn (CryptSetKeyParam KP_MODE_BITS): CAPI CFB defaults to 8-bit (1-byte) feedback.
+            msg_block_len: 1,
+            rc4,
+        },
     }
 }
 
-unsafe fn capi_hash_finalize_clone(alg_id: u32, ctx: &[u64; 64]) -> Option<Vec<u8>> {
-    let len = capi_hash_len(alg_id)?;
-    let (_, _, fin) = capi_hash_ops(alg_id)?;
-    let mut tmp = *ctx;
-    let mut out = vec![0u8; len];
-    fin(out.as_mut_ptr(), tmp.as_mut_ptr() as *mut c_void);
-    Some(out)
+fn capi_store_lock(machine_keyset: bool) -> &'static std::sync::Mutex<()> {
+    static USER_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    static MACHINE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    if machine_keyset {
+        MACHINE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    } else {
+        USER_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+}
+
+struct CapiStoreGuard {
+    _mem: std::sync::MutexGuard<'static, ()>,
+    flock_file: std::fs::File,
+}
+
+impl Drop for CapiStoreGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.flock_file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_capi_store_lock(machine_keyset: bool) -> std::io::Result<CapiStoreGuard> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let mem = capi_store_lock(machine_keyset).lock().unwrap();
+    let lock_path = capi_store_path(machine_keyset)
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?
+        .join(".containers.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    Ok(CapiStoreGuard { _mem: mem, flock_file: file })
+}
+
+fn capi_store_user() -> String {
+    let raw = crate::process::get_env("USERNAME")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "player".to_string());
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "player".to_string()
+    } else {
+        clean
+    }
+}
+
+fn capi_store_path(machine_keyset: bool) -> std::path::PathBuf {
+    let dir = crate::path::capi_keystore_dir();
+    if machine_keyset {
+        dir.join("machine_containers.bin")
+    } else {
+        let user = capi_store_user();
+        dir.join(format!("user_{user}_containers.bin"))
+    }
+}
+
+fn capi_secret_path(machine_keyset: bool) -> std::path::PathBuf {
+    let dir = crate::path::capi_keystore_dir();
+    if machine_keyset {
+        dir.join("machine.key")
+    } else {
+        let user = capi_store_user();
+        dir.join(format!("user_{user}.key"))
+    }
+}
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Load or atomically generate a 32-byte provider-only host secret stored with
+/// `0600` permissions in the host-private `.capi-keystore` directory (outside
+/// all guest `C:\` mounts and unreachable from guest-callable `CryptUnprotectData`).
+fn load_or_create_capi_secret(machine_keyset: bool) -> std::io::Result<[u8; 32]> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = capi_secret_path(machine_keyset);
+    if let Ok(mut bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            zeroize_bytes(&mut bytes);
+            return Ok(key);
+        }
+        zeroize_bytes(&mut bytes);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CAPI provider host secret has invalid length",
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "CAPI secret path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let mut secret = [0u8; 32];
+    unsafe {
+        libc::arc4random_buf(secret.as_mut_ptr() as *mut c_void, secret.len());
+    }
+    let mut rnd = [0u8; 8];
+    unsafe {
+        libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    }
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{suffix:016x}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("capi.key"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&secret)?;
+        f.sync_all()?;
+    }
+
+    // Use hard_link so racing processes never overwrite an already-created secret.
+    match std::fs::hard_link(&tmp_path, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            Ok(secret)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_path);
+            zeroize_bytes(&mut secret);
+            let mut bytes = std::fs::read(&path)?;
+            if bytes.len() != 32 {
+                zeroize_bytes(&mut bytes);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "CAPI provider host secret has invalid length",
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            zeroize_bytes(&mut bytes);
+            Ok(key)
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(&secret)?;
+                    f.sync_all()?;
+                    Ok(secret)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    zeroize_bytes(&mut secret);
+                    let mut bytes = std::fs::read(&path)?;
+                    if bytes.len() != 32 {
+                        zeroize_bytes(&mut bytes);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CAPI provider host secret has invalid length",
+                        ));
+                    }
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    zeroize_bytes(&mut bytes);
+                    Ok(key)
+                }
+                Err(e) => {
+                    zeroize_bytes(&mut secret);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+fn capi_hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = IncrementalDigest::new(BcDigest::Sha256);
+    inner.update(&ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize_clone();
+    let mut outer = IncrementalDigest::new(BcDigest::Sha256);
+    outer.update(&opad);
+    outer.update(&inner_digest);
+    let out_vec = outer.finalize_clone();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&out_vec[..32]);
+    zeroize_bytes(&mut ipad);
+    zeroize_bytes(&mut opad);
+    out
+}
+
+fn capi_store_aad(machine_keyset: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(48);
+    aad.extend_from_slice(CAPI_ENVELOPE_MAGIC);
+    aad.push(machine_keyset as u8);
+    if machine_keyset {
+        aad.extend_from_slice(b"machine");
+    } else {
+        aad.extend_from_slice(b"user:");
+        aad.extend_from_slice(capi_store_user().as_bytes());
+    }
+    aad
+}
+
+fn derive_capi_store_key(machine_keyset: bool, aad: &[u8]) -> std::io::Result<[u8; 32]> {
+    let mut master = load_or_create_capi_secret(machine_keyset)?;
+    let mut info = Vec::with_capacity(32 + aad.len());
+    info.extend_from_slice(b"port-factory-capi-keystore-v1:");
+    info.extend_from_slice(aad);
+    let key = capi_hmac_sha256(&master, &info);
+    zeroize_bytes(&mut master);
+    Ok(key)
+}
+
+fn seal_capi_store(machine_keyset: bool, plain: &[u8]) -> std::io::Result<Vec<u8>> {
+    let aad = capi_store_aad(machine_keyset);
+    let mut key = derive_capi_store_key(machine_keyset, &aad)?;
+    let mut nonce = [0u8; 12];
+    unsafe {
+        libc::arc4random_buf(nonce.as_mut_ptr() as *mut c_void, nonce.len());
+    }
+    let res = crate::misc::bcrypt::aes_gcm_crypt(true, &key, &nonce, &aad, plain, 16, None);
+    zeroize_bytes(&mut key);
+    let (ct, tag) = res.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "AES-GCM protection of CAPI key store failed")
+    })?;
+    let mut env = Vec::with_capacity(8 + 1 + 12 + ct.len() + 16);
+    env.extend_from_slice(CAPI_ENVELOPE_MAGIC);
+    env.push(machine_keyset as u8);
+    env.extend_from_slice(&nonce);
+    env.extend_from_slice(&ct);
+    env.extend_from_slice(&tag);
+    Ok(env)
+}
+
+fn unseal_capi_store(machine_keyset: bool, env: &[u8]) -> std::io::Result<Vec<u8>> {
+    const HDR_LEN: usize = 8 + 1 + 12;
+    const TAG_LEN: usize = 16;
+    if env.len() < HDR_LEN + TAG_LEN || &env[..8] != CAPI_ENVELOPE_MAGIC || env[8] != (machine_keyset as u8) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid CAPI provider keystore envelope",
+        ));
+    }
+    let nonce = &env[9..21];
+    let ct = &env[HDR_LEN..env.len() - TAG_LEN];
+    let tag = &env[env.len() - TAG_LEN..];
+    let aad = capi_store_aad(machine_keyset);
+    let mut key = derive_capi_store_key(machine_keyset, &aad)?;
+    let res = crate::misc::bcrypt::aes_gcm_crypt(false, &key, nonce, &aad, ct, TAG_LEN, Some(tag));
+    zeroize_bytes(&mut key);
+    let (plain, _) = res.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to authenticate CAPI key store")
+    })?;
+    Ok(plain)
+}
+
+fn encode_capi_containers(map: &std::collections::HashMap<CapiDiskKey, CapiContainerKeys>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(CAPI_STORE_MAGIC_V2);
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    let push_opt_key = |out: &mut Vec<u8>, opt: &Option<StoredUserKey>, alg_id: u32| {
+        if let Some(sk) = opt {
+            if let Some(blob) = sk.key.to_capi_private_blob(alg_id) {
+                out.push(1);
+                out.push(sk.exportable as u8);
+                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob);
+                return;
+            }
+        }
+        out.push(0);
+    };
+    for ((prov_type, prov_key, name), keys) in map {
+        out.extend_from_slice(&prov_type.to_le_bytes());
+        let pb = prov_key.as_bytes();
+        out.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        out.extend_from_slice(pb);
+        let nb = name.as_bytes();
+        out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+        out.extend_from_slice(nb);
+        push_opt_key(&mut out, &keys.keyx, CALG_RSA_KEYX);
+        push_opt_key(&mut out, &keys.sign, CALG_RSA_SIGN);
+    }
+    out
+}
+
+fn decode_capi_containers(data: &[u8]) -> Option<std::collections::HashMap<CapiDiskKey, CapiContainerKeys>> {
+    if data.len() < 12 {
+        return None;
+    }
+    let has_prov_name = if &data[..8] == CAPI_STORE_MAGIC_V2 {
+        true
+    } else if &data[..8] == CAPI_STORE_MAGIC_V1 {
+        false
+    } else {
+        return None;
+    };
+    let mut pos = 8usize;
+    let read_u32 = |pos: &mut usize| -> Option<u32> {
+        let end = pos.checked_add(4)?;
+        let v = u32::from_le_bytes(data.get(*pos..end)?.try_into().ok()?);
+        *pos = end;
+        Some(v)
+    };
+    let read_opt_key = |pos: &mut usize| -> Option<Option<StoredUserKey>> {
+        let tag = *data.get(*pos)?;
+        *pos += 1;
+        match tag {
+            0 => Some(None),
+            1 => {
+                let exp = *data.get(*pos)? != 0;
+                *pos += 1;
+                let len = read_u32(pos)? as usize;
+                let end = pos.checked_add(len)?;
+                let blob = data.get(*pos..end)?;
+                *pos = end;
+                let (rsa, _, is_priv) = RsaKey::from_capi_blob(blob)?;
+                if !is_priv {
+                    return None;
+                }
+                Some(Some(StoredUserKey { key: rsa, exportable: exp }))
+            }
+            _ => None,
+        }
+    };
+    let count = read_u32(&mut pos)? as usize;
+    let mut map = std::collections::HashMap::with_capacity(count.min(256));
+    for _ in 0..count {
+        let prov_type = read_u32(&mut pos)?;
+        let prov_key = if has_prov_name {
+            let plen = read_u32(&mut pos)? as usize;
+            let end = pos.checked_add(plen)?;
+            let s = String::from_utf8(data.get(pos..end)?.to_vec()).ok()?;
+            pos = end;
+            s
+        } else {
+            capi_default_provider_name(prov_type).to_ascii_lowercase()
+        };
+        let nlen = read_u32(&mut pos)? as usize;
+        let end = pos.checked_add(nlen)?;
+        let name = String::from_utf8(data.get(pos..end)?.to_vec()).ok()?;
+        pos = end;
+        let keyx = read_opt_key(&mut pos)?;
+        let sign = read_opt_key(&mut pos)?;
+        map.insert((prov_type, prov_key, name), CapiContainerKeys { keyx, sign });
+    }
+    Some(map)
+}
+
+unsafe fn load_persisted_capi_containers(
+    machine_keyset: bool,
+) -> std::io::Result<std::collections::HashMap<CapiDiskKey, CapiContainerKeys>> {
+    let path = capi_store_path(machine_keyset);
+    let enc = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let mut plain = unseal_capi_store(machine_keyset, &enc)?;
+    let decoded = decode_capi_containers(&plain);
+    zeroize_bytes(&mut plain);
+    decoded.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt CAPI key store"))
+}
+
+unsafe fn save_persisted_capi_containers(
+    machine_keyset: bool,
+    map: &std::collections::HashMap<CapiDiskKey, CapiContainerKeys>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = capi_store_path(machine_keyset);
+    let parent = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let mut raw = encode_capi_containers(map);
+    let enc = seal_capi_store(machine_keyset, &raw);
+    zeroize_bytes(&mut raw);
+    let enc = enc?;
+
+    let mut rnd = [0u8; 8];
+    libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_path = parent.join(format!(".containers.bin.tmp.{}.{suffix:016x}", std::process::id()));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&enc)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+unsafe fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey, exportable: bool) -> Result<(), u32> {
+    let mut provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get_mut(&h_prov) else {
+        return Err(NTE_BAD_UID);
+    };
+    let stored = StoredUserKey { key: rsa, exportable };
+    if prov.ephemeral {
+        if key_spec == AT_SIGNATURE {
+            prov.ephemeral_keys.sign = Some(stored);
+        } else {
+            prov.ephemeral_keys.keyx = Some(stored);
+        }
+        return Ok(());
+    }
+    let machine = prov.machine_keyset;
+    let prov_key = prov.prov_name.to_ascii_lowercase();
+    let disk_key = (prov.prov_type, prov_key.clone(), prov.container.clone());
+    let cache_key = (machine, prov.prov_type, prov_key, prov.container.clone());
+    drop(provs);
+    let _guard = acquire_capi_store_lock(machine).map_err(|_| NTE_FAIL)?;
+    let mut disk = load_persisted_capi_containers(machine).map_err(|_| NTE_FAIL)?;
+    let entry = disk.entry(disk_key).or_default();
+    if key_spec == AT_SIGNATURE {
+        entry.sign = Some(stored.clone());
+    } else {
+        entry.keyx = Some(stored.clone());
+    }
+    save_persisted_capi_containers(machine, &disk).map_err(|_| NTE_FAIL)?;
+    let mut mem = capi_containers().lock().unwrap();
+    let mem_entry = mem.entry(cache_key).or_default();
+    if key_spec == AT_SIGNATURE {
+        mem_entry.sign = Some(stored);
+    } else {
+        mem_entry.keyx = Some(stored);
+    }
+    Ok(())
+}
+
+unsafe fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option<StoredUserKey>, u32> {
+    let provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get(&h_prov) else {
+        return Err(NTE_BAD_UID);
+    };
+    if prov.ephemeral {
+        let k = if key_spec == AT_SIGNATURE {
+            prov.ephemeral_keys.sign.clone()
+        } else {
+            prov.ephemeral_keys.keyx.clone()
+        };
+        return Ok(k);
+    }
+    let machine = prov.machine_keyset;
+    let prov_key = prov.prov_name.to_ascii_lowercase();
+    let disk_key = (prov.prov_type, prov_key.clone(), prov.container.clone());
+    let cache_key = (machine, prov.prov_type, prov_key, prov.container.clone());
+    drop(provs);
+    {
+        let containers = capi_containers().lock().unwrap();
+        if let Some(c) = containers.get(&cache_key) {
+            let k = if key_spec == AT_SIGNATURE { c.sign.clone() } else { c.keyx.clone() };
+            if k.is_some() {
+                return Ok(k);
+            }
+        }
+    }
+    // Load from persisted DPAPI-encrypted store (handles cross-process / post-restart access).
+    let _guard = acquire_capi_store_lock(machine).map_err(|_| NTE_FAIL)?;
+    let disk = load_persisted_capi_containers(machine).map_err(|_| NTE_FAIL)?;
+    let found = disk.get(&disk_key).cloned();
+    if let Some(ref c) = found {
+        capi_containers().lock().unwrap().insert(cache_key, c.clone());
+    }
+    Ok(found.and_then(|c| if key_spec == AT_SIGNATURE { c.sign } else { c.keyx }))
+}
+
+fn capi_hash_value(h: &CapiHash) -> Vec<u8> {
+    if let Some(ref ov) = h.override_val {
+        ov.clone()
+    } else {
+        h.state.finalize_clone()
+    }
 }
 
 unsafe fn crypt_acquire_context_impl(
@@ -2782,16 +4166,74 @@ unsafe fn crypt_acquire_context_impl(
     container: Option<String>,
     provider: Option<String>,
     dw_prov_type: u32,
-    _dw_flags: u32,
+    dw_flags: u32,
 ) -> BOOL {
+    let cname = container.unwrap_or_default();
+    let prov_name = provider
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| capi_default_provider_name(dw_prov_type).to_string());
+    let prov_key = prov_name.to_ascii_lowercase();
+    let machine = (dw_flags & CRYPT_MACHINE_KEYSET) != 0;
+    if (dw_flags & CRYPT_DELETEKEYSET) != 0 {
+        let disk_key = (dw_prov_type, prov_key.clone(), cname.clone());
+        let cache_key = (machine, dw_prov_type, prov_key, cname);
+        let Ok(_guard) = acquire_capi_store_lock(machine) else {
+            return err(NTE_FAIL, FALSE);
+        };
+        let mut disk = match load_persisted_capi_containers(machine) {
+            Ok(d) => d,
+            Err(_) => return err(NTE_FAIL, FALSE),
+        };
+        let removed_disk = disk.remove(&disk_key).is_some();
+        let removed_mem = capi_containers().lock().unwrap().remove(&cache_key).is_some();
+        if removed_disk && save_persisted_capi_containers(machine, &disk).is_err() {
+            return err(NTE_FAIL, FALSE);
+        }
+        if !ph_prov.is_null() {
+            std::ptr::write_unaligned(ph_prov, 0);
+        }
+        return if removed_disk || removed_mem { TRUE } else { err(NTE_BAD_KEYSET, FALSE) };
+    }
     if ph_prov.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let ephemeral = (dw_flags & CRYPT_VERIFYCONTEXT) != 0;
+    if !ephemeral {
+        let disk_key = (dw_prov_type, prov_key.clone(), cname.clone());
+        let cache_key = (machine, dw_prov_type, prov_key, cname.clone());
+        let Ok(_guard) = acquire_capi_store_lock(machine) else {
+            return err(NTE_FAIL, FALSE);
+        };
+        let mut disk = match load_persisted_capi_containers(machine) {
+            Ok(d) => d,
+            Err(_) => return err(NTE_FAIL, FALSE),
+        };
+        if (dw_flags & CRYPT_NEWKEYSET) != 0 {
+            if disk.contains_key(&disk_key) {
+                return err(NTE_EXISTS, FALSE);
+            }
+            disk.insert(disk_key, CapiContainerKeys::default());
+            if save_persisted_capi_containers(machine, &disk).is_err() {
+                return err(NTE_FAIL, FALSE);
+            }
+            capi_containers().lock().unwrap().insert(cache_key, CapiContainerKeys::default());
+        } else {
+            let existed = disk.contains_key(&disk_key);
+            let entry = disk.entry(disk_key).or_default().clone();
+            if !existed && save_persisted_capi_containers(machine, &disk).is_err() {
+                return err(NTE_FAIL, FALSE);
+            }
+            capi_containers().lock().unwrap().insert(cache_key, entry);
+        }
     }
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     let prov = CapiProvider {
         prov_type: dw_prov_type,
-        prov_name: provider.unwrap_or_else(|| "Microsoft Enhanced RSA and AES Cryptographic Provider".into()),
-        container: container.unwrap_or_default(),
+        prov_name,
+        container: cname,
+        machine_keyset: machine,
+        ephemeral,
+        ephemeral_keys: CapiContainerKeys::default(),
     };
     capi_providers().lock().unwrap().insert(h, prov);
     std::ptr::write_unaligned(ph_prov, h);
@@ -2864,6 +4306,7 @@ pub unsafe extern "win64" fn CryptGetProvParam(
             v
         }
         PP_PROVTYPE => prov.prov_type.to_le_bytes().to_vec(),
+        PP_KEYSET_TYPE => (if prov.machine_keyset { CRYPT_MACHINE_KEYSET } else { 0u32 }).to_le_bytes().to_vec(),
         PP_VERSION => 0x0000_0200u32.to_le_bytes().to_vec(),
         PP_IMPTYPE => 2u32.to_le_bytes().to_vec(), // CRYPT_IMPL_SOFTWARE
         _ => return err(NTE_BAD_TYPE, FALSE),
@@ -2876,7 +4319,7 @@ pub unsafe extern "win64" fn CryptGetProvParam(
     let cap = std::ptr::read_unaligned(pdw_data_len);
     std::ptr::write_unaligned(pdw_data_len, need);
     if cap < need {
-        return err(234 /* ERROR_MORE_DATA */, FALSE);
+        return err(ERROR_MORE_DATA, FALSE);
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
     TRUE
@@ -2895,18 +4338,39 @@ pub unsafe extern "win64" fn CryptCreateHash(
     if !capi_providers().lock().unwrap().contains_key(&h_prov) {
         return err(NTE_BAD_UID, FALSE);
     }
-    let Some(ctx) = capi_hash_init(alg_id) else {
+    let Some(digest) = capi_alg_to_digest(alg_id) else {
         return err(NTE_BAD_ALGID, FALSE);
     };
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_hashes().lock().unwrap().insert(
         h,
         CapiHash {
+            h_prov,
             alg_id,
-            ctx,
+            digest,
+            state: IncrementalDigest::new(digest),
             override_val: None,
         },
     );
+    std::ptr::write_unaligned(ph_hash, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDuplicateHash(
+    h_hash: usize,
+    _pdw_reserved: *const u32,
+    _dw_flags: u32,
+    ph_hash: *mut usize,
+) -> BOOL {
+    if ph_hash.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut hashes = capi_hashes().lock().unwrap();
+    let Some(orig) = hashes.get(&h_hash).cloned() else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    hashes.insert(h, orig);
     std::ptr::write_unaligned(ph_hash, h);
     TRUE
 }
@@ -2926,7 +4390,7 @@ pub unsafe extern "win64" fn CryptHashData(
     };
     if dw_data_len > 0 {
         let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
-        capi_hash_update(h.alg_id, &mut h.ctx, slice);
+        h.state.update(slice);
         h.override_val = None;
     }
     TRUE
@@ -2948,17 +4412,8 @@ pub unsafe extern "win64" fn CryptGetHashParam(
     };
     let bytes: Vec<u8> = match dw_param {
         HP_ALGID => h.alg_id.to_le_bytes().to_vec(),
-        HP_HASHSIZE => (capi_hash_len(h.alg_id).unwrap_or(0) as u32).to_le_bytes().to_vec(),
-        HP_HASHVAL => {
-            if let Some(ref ov) = h.override_val {
-                ov.clone()
-            } else {
-                let Some(d) = capi_hash_finalize_clone(h.alg_id, &h.ctx) else {
-                    return err(NTE_BAD_ALGID, FALSE);
-                };
-                d
-            }
-        }
+        HP_HASHSIZE => (h.digest.len() as u32).to_le_bytes().to_vec(),
+        HP_HASHVAL => capi_hash_value(h),
         _ => return err(NTE_BAD_TYPE, FALSE),
     };
     let need = bytes.len() as u32;
@@ -2969,7 +4424,7 @@ pub unsafe extern "win64" fn CryptGetHashParam(
     let cap = std::ptr::read_unaligned(pdw_data_len);
     std::ptr::write_unaligned(pdw_data_len, need);
     if cap < need {
-        return err(234 /* ERROR_MORE_DATA */, FALSE);
+        return err(ERROR_MORE_DATA, FALSE);
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
     TRUE
@@ -2989,9 +4444,7 @@ pub unsafe extern "win64" fn CryptSetHashParam(
         return err(NTE_BAD_HASH, FALSE);
     };
     if dw_param == HP_HASHVAL {
-        let Some(len) = capi_hash_len(h.alg_id) else {
-            return err(NTE_BAD_ALGID, FALSE);
-        };
+        let len = h.digest.len();
         h.override_val = Some(std::slice::from_raw_parts(pb_data, len).to_vec());
         return TRUE;
     }
@@ -3006,10 +4459,1122 @@ pub unsafe extern "win64" fn CryptDestroyHash(h_hash: usize) -> BOOL {
     }
 }
 
-// @exports CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptSignHashW
-failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    CryptDecrypt, CryptEncrypt, CryptDestroyKey, CryptExportKey,
-    CryptImportKey, CryptGetUserKey, CryptSignHashW);
+pub unsafe extern "win64" fn CryptGenKey(
+    h_prov: usize,
+    alg_id: u32,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+    let req_bits = dw_flags >> 16;
+
+    // Asymmetric RSA key generation (AT_KEYEXCHANGE / AT_SIGNATURE / CALG_RSA_KEYX / CALG_RSA_SIGN)
+    if matches!(alg_id, AT_KEYEXCHANGE | AT_SIGNATURE | CALG_RSA_KEYX | CALG_RSA_SIGN) {
+        let bits = if req_bits == 0 { 2048 } else { req_bits };
+        if !(1024..=4096).contains(&bits) || bits % 64 != 0 {
+            return err(NTE_BAD_FLAGS, FALSE);
+        }
+        let Ok(rsa) = RsaKey::generate(bits) else {
+            return err(NTE_BAD_FLAGS, FALSE);
+        };
+        let (key_spec, canonical_alg) = if matches!(alg_id, AT_SIGNATURE | CALG_RSA_SIGN) {
+            (AT_SIGNATURE, CALG_RSA_SIGN)
+        } else {
+            (AT_KEYEXCHANGE, CALG_RSA_KEYX)
+        };
+        if let Err(e) = store_container_user_key(h_prov, key_spec, rsa.clone(), exportable) {
+            return err(e, FALSE);
+        }
+        let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+        capi_keys().lock().unwrap().insert(
+            h,
+            CapiKey {
+                alg_id: canonical_alg,
+                exportable,
+                permissions: capi_default_permissions(exportable),
+                material: CapiKeyMaterial::Rsa { key: rsa },
+            },
+        );
+        std::ptr::write_unaligned(ph_key, h);
+        return TRUE;
+    }
+
+    // Symmetric session key generation
+    let Some((sym_alg, default_len)) = capi_alg_to_sym(alg_id) else {
+        return err(NTE_BAD_ALGID, FALSE);
+    };
+    let key_len = match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => 16,
+            CALG_AES_192 => 24,
+            CALG_AES_256 => 32,
+            CALG_AES => match req_bits {
+                0 | 128 => 16,
+                192 => 24,
+                256 => 32,
+                _ => return err(NTE_BAD_FLAGS, FALSE),
+            },
+            _ => default_len,
+        },
+        SymAlg::Des => 8,
+        SymAlg::Des3_112 => 16,
+        SymAlg::Des3 => 24,
+        SymAlg::Rc2 => {
+            if req_bits == 0 {
+                capi_provider_default_rc_key_len(&prov_name)
+            } else if req_bits % 8 == 0 && (40..=1024).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+        SymAlg::Rc4 => {
+            if req_bits == 0 {
+                capi_provider_default_rc_key_len(&prov_name)
+            } else if req_bits % 8 == 0 && (40..=2048).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+    };
+    let mut raw = vec![0u8; key_len];
+    if !crate::det_entropy::fill(raw.as_mut_ptr(), raw.len()) {
+        libc::arc4random_buf(raw.as_mut_ptr() as *mut c_void, raw.len());
+    }
+    let canonical_alg = if alg_id == CALG_AES {
+        match key_len {
+            16 => CALG_AES_128,
+            24 => CALG_AES_192,
+            _ => CALG_AES_256,
+        }
+    } else {
+        alg_id
+    };
+    let salt = match capi_salt_from_flags(sym_alg, key_len, dw_flags, None) {
+        Ok(s) => s,
+        Err(e) => return err(e, FALSE),
+    };
+    let k = capi_sym_key(&prov_name, canonical_alg, sym_alg, raw, salt, exportable);
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, k);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDeriveKey(
+    h_prov: usize,
+    alg_id: u32,
+    h_base_data: usize,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
+    let Some((sym_alg, default_len)) = capi_alg_to_sym(alg_id) else {
+        return err(NTE_BAD_ALGID, FALSE);
+    };
+    let (digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_base_data) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.digest, capi_hash_value(h))
+    };
+    let req_bits = dw_flags >> 16;
+    let key_len = match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => 16,
+            CALG_AES_192 => 24,
+            CALG_AES_256 => 32,
+            CALG_AES => match req_bits {
+                0 | 128 => 16,
+                192 => 24,
+                256 => 32,
+                _ => return err(NTE_BAD_FLAGS, FALSE),
+            },
+            _ => default_len,
+        },
+        SymAlg::Des => 8,
+        SymAlg::Des3_112 => 16,
+        SymAlg::Des3 => 24,
+        SymAlg::Rc2 | SymAlg::Rc4 => {
+            if req_bits == 0 {
+                capi_provider_default_rc_key_len(&prov_name)
+            } else if req_bits % 8 == 0 && (40..=128).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+    };
+
+    // Microsoft Learn CryptDeriveKey algorithm:
+    // - SHA-2 family (SHA-256/384/512): truncate raw hash directly to key_len bytes.
+    // - Legacy hashes (MD2/MD4/MD5/SHA-1): if hash_len < key_len (or for 3DES/AES),
+    //   expand via H(0x36^64 XOR hash) || H(0x5C^64 XOR hash).
+    let is_sha2 = matches!(digest, BcDigest::Sha256 | BcDigest::Sha384 | BcDigest::Sha512);
+    let derived = if is_sha2 && hash_val.len() >= key_len {
+        hash_val[..key_len].to_vec()
+    } else if !is_sha2 && (hash_val.len() < key_len || matches!(sym_alg, SymAlg::Aes | SymAlg::Des3 | SymAlg::Des3_112)) {
+        let mut buf1 = [0x36u8; 64];
+        let mut buf2 = [0x5Cu8; 64];
+        for (i, &b) in hash_val.iter().take(64).enumerate() {
+            buf1[i] ^= b;
+            buf2[i] ^= b;
+        }
+        let mut exp = digest.hash(&buf1);
+        exp.extend_from_slice(&digest.hash(&buf2));
+        if exp.len() < key_len {
+            return err(NTE_BAD_LEN, FALSE);
+        }
+        exp[..key_len].to_vec()
+    } else {
+        hash_val[..key_len].to_vec()
+    };
+
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+    let hash_tail = hash_val.get(key_len..).unwrap_or(&[]);
+    let salt = match capi_salt_from_flags(sym_alg, key_len, dw_flags, Some(hash_tail)) {
+        Ok(s) => s,
+        Err(e) => return err(e, FALSE),
+    };
+    let k = capi_sym_key(&prov_name, alg_id, sym_alg, derived, salt, exportable);
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, k);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptGetUserKey(
+    h_prov: usize,
+    dw_key_spec: u32,
+    ph_user_key: *mut usize,
+) -> BOOL {
+    if ph_user_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_user_key, 0);
+    if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
+        return err(NTE_BAD_TYPE, FALSE);
+    }
+    let stored = match load_container_user_key(h_prov, dw_key_spec) {
+        Ok(Some(k)) => k,
+        Ok(None) => return err(NTE_NO_KEY, FALSE),
+        Err(e) => return err(e, FALSE),
+    };
+    let alg_id = if dw_key_spec == AT_SIGNATURE { CALG_RSA_SIGN } else { CALG_RSA_KEYX };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(
+        h,
+        CapiKey {
+            alg_id,
+            exportable: stored.exportable,
+            permissions: capi_default_permissions(stored.exportable),
+            material: CapiKeyMaterial::Rsa { key: stored.key },
+        },
+    );
+    std::ptr::write_unaligned(ph_user_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDuplicateKey(
+    h_key: usize,
+    _pdw_reserved: *const u32,
+    _dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(orig) = keys.get(&h_key).cloned() else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    keys.insert(h, orig);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDestroyKey(h_key: usize) -> BOOL {
+    if capi_keys().lock().unwrap().remove(&h_key).is_some() {
+        TRUE
+    } else {
+        err(NTE_BAD_KEY, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn CryptGetKeyParam(
+    h_key: usize,
+    dw_param: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    if (k.permissions & CRYPT_READ) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
+    let bytes: Vec<u8> = match (dw_param, &k.material) {
+        (KP_ALGID, _) => k.alg_id.to_le_bytes().to_vec(),
+        (KP_PERMISSIONS, _) => k.permissions.to_le_bytes().to_vec(),
+        (KP_BLOCKLEN, CapiKeyMaterial::Rsa { key, .. }) => (key.bits() as u32).to_le_bytes().to_vec(),
+        (KP_KEYLEN, CapiKeyMaterial::Rsa { key, .. }) => (key.bits() as u32).to_le_bytes().to_vec(),
+        (KP_BLOCKLEN, CapiKeyMaterial::Symmetric { alg, .. }) => ((alg.block_size() * 8) as u32).to_le_bytes().to_vec(),
+        (KP_KEYLEN, CapiKeyMaterial::Symmetric { key, .. }) => ((key.len() * 8) as u32).to_le_bytes().to_vec(),
+        (KP_IV, CapiKeyMaterial::Symmetric { iv, alg, .. }) if alg.block_size() > 0 => iv.clone(),
+        (KP_SALT, CapiKeyMaterial::Symmetric { salt, .. }) => salt.clone(),
+        (KP_MODE, CapiKeyMaterial::Symmetric { mode, .. }) => {
+            let m = match mode {
+                BcCipherMode::Ecb => CRYPT_MODE_ECB,
+                BcCipherMode::Cfb => CRYPT_MODE_CFB,
+                _ => CRYPT_MODE_CBC,
+            };
+            m.to_le_bytes().to_vec()
+        }
+        (KP_PADDING, CapiKeyMaterial::Symmetric { padding, .. }) => padding.to_le_bytes().to_vec(),
+        (KP_MODE_BITS, CapiKeyMaterial::Symmetric { msg_block_len, .. }) => (*msg_block_len * 8).to_le_bytes().to_vec(),
+        (KP_EFFECTIVE_KEYLEN, CapiKeyMaterial::Symmetric { alg: SymAlg::Rc2, effective_key_len, key, .. }) => {
+            let v = if *effective_key_len == 0 { (key.len() * 8) as u32 } else { *effective_key_len };
+            v.to_le_bytes().to_vec()
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+    let need = bytes.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptSetKeyParam(
+    h_key: usize,
+    dw_param: u32,
+    pb_data: *const u8,
+    _dw_flags: u32,
+) -> BOOL {
+    if pb_data.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    if (k.permissions & CRYPT_WRITE) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
+    if dw_param == KP_PERMISSIONS {
+        let new_perms = std::ptr::read_unaligned(pb_data as *const u32);
+        // Windows CAPI only permits restricting existing key permissions, never adding new ones.
+        if (new_perms & !k.permissions) != 0 {
+            return err(NTE_BAD_FLAGS, FALSE);
+        }
+        k.permissions = new_perms;
+        return TRUE;
+    }
+    let CapiKeyMaterial::Symmetric {
+        alg,
+        ref mut salt,
+        ref mut mode,
+        ref mut padding,
+        ref mut effective_key_len,
+        ref mut iv,
+        ref mut running_iv,
+        ref mut msg_block_len,
+        ref mut rc4,
+        ..
+    } = k.material
+    else {
+        return err(NTE_BAD_TYPE, FALSE);
+    };
+    match dw_param {
+        KP_IV => {
+            let bs = alg.block_size();
+            if bs == 0 {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            let slice = std::slice::from_raw_parts(pb_data, bs);
+            *iv = slice.to_vec();
+            *running_iv = slice.to_vec();
+            TRUE
+        }
+        KP_SALT => {
+            if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            let len = if salt.is_empty() { 11 } else { salt.len() };
+            *salt = std::slice::from_raw_parts(pb_data, len).to_vec();
+            *rc4 = None;
+            TRUE
+        }
+        KP_SALT_EX => {
+            if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            // CRYPT_DATA_BLOB on x64: cbData (u32) at offset 0, pbData (*const u8) at offset 8.
+            let cb_salt = std::ptr::read_unaligned(pb_data as *const u32) as usize;
+            let salt_ptr = std::ptr::read_unaligned(pb_data.add(8) as *const *const u8);
+            if cb_salt > 24 || (cb_salt > 0 && salt_ptr.is_null()) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *salt = if cb_salt == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(salt_ptr, cb_salt).to_vec()
+            };
+            *rc4 = None;
+            TRUE
+        }
+        KP_MODE => {
+            let m = std::ptr::read_unaligned(pb_data as *const u32);
+            match m {
+                CRYPT_MODE_CBC => *mode = BcCipherMode::Cbc,
+                CRYPT_MODE_ECB => *mode = BcCipherMode::Ecb,
+                CRYPT_MODE_CFB => *mode = BcCipherMode::Cfb,
+                _ => return err(NTE_BAD_DATA, FALSE),
+            }
+            TRUE
+        }
+        KP_PADDING => {
+            let p = std::ptr::read_unaligned(pb_data as *const u32);
+            // Microsoft Learn (CryptSetKeyParam): Microsoft-supplied CSPs only support PKCS5_PADDING.
+            if p != PKCS5_PADDING {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *padding = p;
+            TRUE
+        }
+        KP_MODE_BITS => {
+            let bits = std::ptr::read_unaligned(pb_data as *const u32);
+            let bs = alg.block_size() as u32;
+            if bits == 0 || bits % 8 != 0 || bits / 8 > bs {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *msg_block_len = bits / 8;
+            TRUE
+        }
+        KP_EFFECTIVE_KEYLEN if alg == SymAlg::Rc2 => {
+            let bits = std::ptr::read_unaligned(pb_data as *const u32);
+            if !(40..=1024).contains(&bits) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *effective_key_len = bits;
+            TRUE
+        }
+        _ => err(NTE_BAD_TYPE, FALSE),
+    }
+}
+
+pub unsafe extern "win64" fn CryptExportKey(
+    h_key: usize,
+    h_exp_key: usize,
+    dw_blob_type: u32,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    let blob: Vec<u8> = match (dw_blob_type, &k.material) {
+        (PUBLICKEYBLOB, CapiKeyMaterial::Rsa { key, .. }) => {
+            let Some(b) = key.to_capi_public_blob(k.alg_id) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            b
+        }
+        (PRIVATEKEYBLOB, CapiKeyMaterial::Rsa { key, .. }) => {
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
+            }
+            let Some(plain) = key.to_capi_private_blob(k.alg_id) else {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            };
+            if h_exp_key == 0 {
+                plain
+            } else {
+                let Some(exp_k) = keys.get(&h_exp_key) else {
+                    return err(NTE_BAD_KEY, FALSE);
+                };
+                // Per Microsoft Learn (Private Key BLOBs), when hExpKey != 0 everything after the
+                // 8-byte PUBLICKEYSTRUC/BLOBHEADER is encrypted with the wrapping session key.
+                let enc_body = match capi_wrap_sym_bytes(exp_k, true, &plain[8..]) {
+                    Ok(v) => v,
+                    Err(e) => return err(e, FALSE),
+                };
+                let mut out = Vec::with_capacity(8 + enc_body.len());
+                out.extend_from_slice(&plain[..8]);
+                out.extend_from_slice(&enc_body);
+                out
+            }
+        }
+        (PLAINTEXTKEYBLOB, CapiKeyMaterial::Symmetric { key, .. }) => {
+            if h_exp_key != 0 {
+                return err(NTE_BAD_KEY, FALSE);
+            }
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
+            }
+            let mut out = Vec::with_capacity(12 + key.len());
+            out.push(PLAINTEXTKEYBLOB as u8);
+            out.push(CUR_BLOB_VERSION);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&k.alg_id.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+            out
+        }
+        (SIMPLEBLOB, CapiKeyMaterial::Symmetric { key: sym_bytes, .. }) => {
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
+            }
+            let Some(exp_k) = keys.get(&h_exp_key) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            if (exp_k.permissions & (CRYPT_ENCRYPT | CRYPT_EXPORT_KEY)) != (CRYPT_ENCRYPT | CRYPT_EXPORT_KEY) {
+                return err(NTE_PERM, FALSE);
+            }
+            let CapiKeyMaterial::Rsa { key: ref rsa, .. } = exp_k.material else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let ct_be = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.encrypt_oaep(BcDigest::Sha1, &[], sym_bytes)
+            } else {
+                rsa.encrypt_pkcs1(sym_bytes)
+            };
+            let Ok(mut ct) = ct_be else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            // CAPI SIMPLEBLOB stores RSA ciphertext in little-endian byte order.
+            ct.reverse();
+            let mut out = Vec::with_capacity(12 + ct.len());
+            out.push(SIMPLEBLOB as u8);
+            out.push(CUR_BLOB_VERSION);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&k.alg_id.to_le_bytes());
+            out.extend_from_slice(&CALG_RSA_KEYX.to_le_bytes());
+            out.extend_from_slice(&ct);
+            out
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+
+    let need = blob.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(blob.as_ptr(), pb_data, blob.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptImportKey(
+    h_prov: usize,
+    pb_data: *const u8,
+    dw_data_len: u32,
+    h_pub_key: usize,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if pb_data.is_null() || ph_key.is_null() || dw_data_len < 8 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
+    let blob = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
+    let b_type = blob[0] as u32;
+    let b_ver = blob[1];
+    if b_ver != CUR_BLOB_VERSION {
+        return err(NTE_BAD_VER, FALSE);
+    }
+    let ai_key_alg = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+
+    let capi_key = match b_type {
+        PUBLICKEYBLOB | PRIVATEKEYBLOB => {
+            let decrypted_storage: Vec<u8>;
+            let parse_slice = if b_type == PRIVATEKEYBLOB && h_pub_key != 0 {
+                let dec_body = {
+                    let keys = capi_keys().lock().unwrap();
+                    let Some(pk) = keys.get(&h_pub_key) else {
+                        return err(NTE_BAD_KEY, FALSE);
+                    };
+                    match capi_wrap_sym_bytes(pk, false, &blob[8..]) {
+                        Ok(v) => v,
+                        Err(e) => return err(e, FALSE),
+                    }
+                };
+                let mut combined = Vec::with_capacity(8 + dec_body.len());
+                combined.extend_from_slice(&blob[..8]);
+                combined.extend_from_slice(&dec_body);
+                decrypted_storage = combined;
+                decrypted_storage.as_slice()
+            } else {
+                blob
+            };
+            let Some((rsa, blob_alg, is_priv)) = RsaKey::from_capi_blob(parse_slice) else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            let key_spec = if blob_alg == CALG_RSA_SIGN { AT_SIGNATURE } else { AT_KEYEXCHANGE };
+            if is_priv {
+                if let Err(e) = store_container_user_key(h_prov, key_spec, rsa.clone(), exportable) {
+                    return err(e, FALSE);
+                }
+            }
+            let key_exportable = exportable || !is_priv;
+            CapiKey {
+                alg_id: if blob_alg != 0 { blob_alg } else { CALG_RSA_KEYX },
+                exportable: key_exportable,
+                permissions: capi_default_permissions(key_exportable),
+                material: CapiKeyMaterial::Rsa { key: rsa },
+            }
+        }
+        PLAINTEXTKEYBLOB => {
+            if blob.len() < 12 {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let cb_key = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+            if blob.len() < 12 + cb_key {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let Some((sym_alg, _)) = capi_alg_to_sym(ai_key_alg) else {
+                return err(NTE_BAD_ALGID, FALSE);
+            };
+            if !capi_valid_sym_key_len(ai_key_alg, sym_alg, cb_key) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let raw = blob[12..12 + cb_key].to_vec();
+            let salt = match capi_salt_from_flags(sym_alg, raw.len(), dw_flags & CRYPT_NO_SALT, None) {
+                Ok(s) => s,
+                Err(e) => return err(e, FALSE),
+            };
+            capi_sym_key(&prov_name, ai_key_alg, sym_alg, raw, salt, exportable)
+        }
+        SIMPLEBLOB => {
+            if blob.len() < 12 {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let Some((sym_alg, _)) = capi_alg_to_sym(ai_key_alg) else {
+                return err(NTE_BAD_ALGID, FALSE);
+            };
+            let rsa = if h_pub_key == 0 {
+                match load_container_user_key(h_prov, AT_KEYEXCHANGE) {
+                    Ok(Some(stored)) => stored.key,
+                    Ok(None) => return err(NTE_NO_KEY, FALSE),
+                    Err(e) => return err(e, FALSE),
+                }
+            } else {
+                let keys = capi_keys().lock().unwrap();
+                let Some(pk) = keys.get(&h_pub_key) else {
+                    return err(NTE_BAD_KEY, FALSE);
+                };
+                if (pk.permissions & (CRYPT_DECRYPT | CRYPT_IMPORT_KEY)) != (CRYPT_DECRYPT | CRYPT_IMPORT_KEY) {
+                    return err(NTE_PERM, FALSE);
+                }
+                match &pk.material {
+                    CapiKeyMaterial::Rsa { key, .. } => key.clone(),
+                    _ => return err(NTE_BAD_KEY, FALSE),
+                }
+            };
+            let mut ct_be = blob[12..].to_vec();
+            if ct_be.len() != rsa.k() {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            // CAPI SIMPLEBLOB ciphertext is little-endian; reverse to big-endian for RSA decryption.
+            ct_be.reverse();
+            let raw = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.decrypt_oaep(BcDigest::Sha1, &[], &ct_be)
+            } else {
+                rsa.decrypt_pkcs1(&ct_be)
+            };
+            let Ok(raw_key) = raw else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            if !capi_valid_sym_key_len(ai_key_alg, sym_alg, raw_key.len()) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let salt = match capi_salt_from_flags(sym_alg, raw_key.len(), dw_flags & CRYPT_NO_SALT, None) {
+                Ok(s) => s,
+                Err(e) => return err(e, FALSE),
+            };
+            capi_sym_key(&prov_name, ai_key_alg, sym_alg, raw_key, salt, exportable)
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, capi_key);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptEncrypt(
+    h_key: usize,
+    h_hash: usize,
+    final_block: BOOL,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    dw_buf_len: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let in_len = std::ptr::read_unaligned(pdw_data_len) as usize;
+    let is_final = final_block != 0;
+
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    if (k.permissions & CRYPT_ENCRYPT) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
+
+    match &mut k.material {
+        CapiKeyMaterial::Rsa { key: rsa, .. } => {
+            let need = rsa.k();
+            if pb_data.is_null() {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return TRUE;
+            }
+            if (dw_buf_len as usize) < need {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return err(ERROR_MORE_DATA, FALSE);
+            }
+            let pt = std::slice::from_raw_parts(pb_data, in_len).to_vec();
+            if h_hash != 0 {
+                drop(keys);
+                if CryptHashData(h_hash, pt.as_ptr(), pt.len() as u32, 0) == FALSE {
+                    return FALSE;
+                }
+                keys = capi_keys().lock().unwrap();
+            }
+            let Some(k) = keys.get(&h_key) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let CapiKeyMaterial::Rsa { key: rsa, .. } = &k.material else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let ct = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.encrypt_oaep(BcDigest::Sha1, &[], &pt)
+            } else {
+                rsa.encrypt_pkcs1(&pt)
+            };
+            let Ok(mut ct) = ct else {
+                return err(NTE_BAD_LEN, FALSE);
+            };
+            // Legacy CAPI RSA ciphertext is little-endian.
+            ct.reverse();
+            std::ptr::copy_nonoverlapping(ct.as_ptr(), pb_data, ct.len());
+            std::ptr::write_unaligned(pdw_data_len, ct.len() as u32);
+            TRUE
+        }
+        CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            salt,
+            mode,
+            padding,
+            effective_key_len,
+            iv,
+            running_iv,
+            msg_block_len,
+            rc4,
+        } => {
+            let bs = alg.block_size();
+            let use_pkcs7 = *alg != SymAlg::Rc4 && is_final && *padding == PKCS5_PADDING;
+            let need = if *alg == SymAlg::Rc4 {
+                in_len
+            } else if use_pkcs7 {
+                ((in_len / bs) + 1) * bs
+            } else if *mode == BcCipherMode::Cfb {
+                in_len
+            } else {
+                if in_len % bs != 0 {
+                    return err(NTE_BAD_DATA, FALSE);
+                }
+                in_len
+            };
+            if pb_data.is_null() {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return TRUE;
+            }
+            if (dw_buf_len as usize) < need {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return err(ERROR_MORE_DATA, FALSE);
+            }
+            let pt = if in_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(pb_data, in_len).to_vec()
+            };
+
+            let eff_key = capi_effective_sym_key(*alg, key, salt);
+            let out = if *alg == SymAlg::Rc4 {
+                let st = rc4.get_or_insert_with(|| Rc4State::new(&eff_key));
+                let r = st.apply(&pt);
+                if is_final {
+                    *rc4 = Some(Rc4State::new(&eff_key));
+                }
+                r
+            } else {
+                let mut iv_work = running_iv.clone();
+                let (cfb_padded, call_pkcs7);
+                let input_slice: &[u8] = if *mode == BcCipherMode::Cfb && use_pkcs7 {
+                    cfb_padded = capi_pkcs5_pad(&pt, bs);
+                    call_pkcs7 = false;
+                    &cfb_padded
+                } else {
+                    call_pkcs7 = use_pkcs7;
+                    &pt
+                };
+                let res = crate::misc::bcrypt::sym_crypt_block_mode(
+                    *alg,
+                    *mode,
+                    true,
+                    call_pkcs7,
+                    &eff_key,
+                    *effective_key_len,
+                    &mut iv_work,
+                    *msg_block_len as usize,
+                    input_slice,
+                );
+                let Ok(v) = res else {
+                    return err(NTE_BAD_DATA, FALSE);
+                };
+                if is_final {
+                    *running_iv = iv.clone();
+                } else {
+                    *running_iv = iv_work;
+                }
+                v
+            };
+
+            drop(keys);
+            if h_hash != 0 && !pt.is_empty() && CryptHashData(h_hash, pt.as_ptr(), pt.len() as u32, 0) == FALSE {
+                return FALSE;
+            }
+            if !out.is_empty() {
+                std::ptr::copy_nonoverlapping(out.as_ptr(), pb_data, out.len());
+            }
+            std::ptr::write_unaligned(pdw_data_len, out.len() as u32);
+            TRUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CryptDecrypt(
+    h_key: usize,
+    h_hash: usize,
+    final_block: BOOL,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+) -> BOOL {
+    if pb_data.is_null() || pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let in_len = std::ptr::read_unaligned(pdw_data_len) as usize;
+    let is_final = final_block != 0;
+
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    if (k.permissions & CRYPT_DECRYPT) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
+
+    let out = match &mut k.material {
+        CapiKeyMaterial::Rsa { key: rsa, .. } => {
+            if !rsa.has_private() {
+                return err(NTE_BAD_KEY, FALSE);
+            }
+            if in_len != rsa.k() {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let mut ct_be = std::slice::from_raw_parts(pb_data, in_len).to_vec();
+            ct_be.reverse();
+            let res = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.decrypt_oaep(BcDigest::Sha1, &[], &ct_be)
+            } else {
+                rsa.decrypt_pkcs1(&ct_be)
+            };
+            match res {
+                Ok(v) => v,
+                Err(_) => return err(NTE_BAD_DATA, FALSE),
+            }
+        }
+        CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            salt,
+            mode,
+            padding,
+            effective_key_len,
+            iv,
+            running_iv,
+            msg_block_len,
+            rc4,
+        } => {
+            let ct = if in_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(pb_data, in_len).to_vec()
+            };
+            let eff_key = capi_effective_sym_key(*alg, key, salt);
+            if *alg == SymAlg::Rc4 {
+                let st = rc4.get_or_insert_with(|| Rc4State::new(&eff_key));
+                let r = st.apply(&ct);
+                if is_final {
+                    *rc4 = Some(Rc4State::new(&eff_key));
+                }
+                r
+            } else {
+                let bs = alg.block_size();
+                let use_pkcs7 = is_final && *padding == PKCS5_PADDING;
+                if (*mode != BcCipherMode::Cfb || use_pkcs7) && ct.len() % bs != 0 {
+                    return err(NTE_BAD_DATA, FALSE);
+                }
+                let mut iv_work = running_iv.clone();
+                let call_pkcs7 = use_pkcs7 && *mode != BcCipherMode::Cfb;
+                let res = crate::misc::bcrypt::sym_crypt_block_mode(
+                    *alg,
+                    *mode,
+                    false,
+                    call_pkcs7,
+                    &eff_key,
+                    *effective_key_len,
+                    &mut iv_work,
+                    *msg_block_len as usize,
+                    &ct,
+                );
+                let Ok(v) = res else {
+                    return err(NTE_BAD_DATA, FALSE);
+                };
+                let v = if *mode == BcCipherMode::Cfb && use_pkcs7 {
+                    match capi_pkcs5_unpad(v, bs) {
+                        Ok(u) => u,
+                        Err(e) => return err(e, FALSE),
+                    }
+                } else {
+                    v
+                };
+                if is_final {
+                    *running_iv = iv.clone();
+                } else {
+                    *running_iv = iv_work;
+                }
+                v
+            }
+        }
+    };
+
+    drop(keys);
+    if !out.is_empty() {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), pb_data, out.len());
+    }
+    std::ptr::write_unaligned(pdw_data_len, out.len() as u32);
+    if h_hash != 0 && !out.is_empty() && CryptHashData(h_hash, out.as_ptr(), out.len() as u32, 0) == FALSE {
+        return FALSE;
+    }
+    TRUE
+}
+
+unsafe fn crypt_sign_hash_impl(
+    h_hash: usize,
+    dw_key_spec: u32,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    if pdw_sig_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if (dw_flags & !CRYPT_NOHASHOID) != 0 {
+        return err(NTE_BAD_FLAGS, FALSE);
+    }
+    if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
+        return err(NTE_BAD_TYPE, FALSE);
+    }
+    let (h_prov, digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_hash) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.h_prov, h.digest, capi_hash_value(h))
+    };
+    let stored = match load_container_user_key(h_prov, dw_key_spec) {
+        Ok(Some(k)) => k,
+        Ok(None) => return err(NTE_NO_KEY, FALSE),
+        Err(e) => return err(e, FALSE),
+    };
+    let rsa = stored.key;
+    let sig_len = rsa.k() as u32;
+    if pb_signature.is_null() {
+        std::ptr::write_unaligned(pdw_sig_len, sig_len);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_sig_len);
+    std::ptr::write_unaligned(pdw_sig_len, sig_len);
+    if cap < sig_len {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    let d_opt = if (dw_flags & CRYPT_NOHASHOID) != 0 { None } else { Some(digest) };
+    let Ok(mut sig) = rsa.sign_pkcs1(d_opt, &hash_val) else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    // Legacy CAPI RSA signatures are little-endian.
+    sig.reverse();
+    std::ptr::copy_nonoverlapping(sig.as_ptr(), pb_signature, sig.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptSignHashW(
+    h_hash: usize,
+    dw_key_spec: u32,
+    _sz_description: LPCWSTR,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    crypt_sign_hash_impl(h_hash, dw_key_spec, dw_flags, pb_signature, pdw_sig_len)
+}
+
+pub unsafe extern "win64" fn CryptSignHashA(
+    h_hash: usize,
+    dw_key_spec: u32,
+    _sz_description: LPCSTR,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    crypt_sign_hash_impl(h_hash, dw_key_spec, dw_flags, pb_signature, pdw_sig_len)
+}
+
+unsafe fn crypt_verify_signature_impl(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    dw_flags: u32,
+) -> BOOL {
+    if pb_signature.is_null() || dw_sig_len == 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if (dw_flags & !CRYPT_NOHASHOID) != 0 {
+        return err(NTE_BAD_FLAGS, FALSE);
+    }
+    let (digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_hash) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.digest, capi_hash_value(h))
+    };
+    let rsa = {
+        let keys = capi_keys().lock().unwrap();
+        let Some(k) = keys.get(&h_pub_key) else {
+            return err(NTE_BAD_KEY, FALSE);
+        };
+        match &k.material {
+            CapiKeyMaterial::Rsa { key, .. } => key.clone(),
+            _ => return err(NTE_BAD_KEY, FALSE),
+        }
+    };
+    if dw_sig_len as usize != rsa.k() {
+        return err(NTE_BAD_SIGNATURE, FALSE);
+    }
+    let mut sig_be = std::slice::from_raw_parts(pb_signature, dw_sig_len as usize).to_vec();
+    sig_be.reverse();
+    let d_opt = if (dw_flags & CRYPT_NOHASHOID) != 0 { None } else { Some(digest) };
+    if rsa.verify_pkcs1(d_opt, &hash_val, &sig_be) {
+        TRUE
+    } else {
+        err(NTE_BAD_SIGNATURE, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn CryptVerifySignatureW(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    _sz_description: LPCWSTR,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_verify_signature_impl(h_hash, pb_signature, dw_sig_len, h_pub_key, dw_flags)
+}
+
+pub unsafe extern "win64" fn CryptVerifySignatureA(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    _sz_description: LPCSTR,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_verify_signature_impl(h_hash, pb_signature, dw_sig_len, h_pub_key, dw_flags)
+}
 
 /// `RtlGenRandom` alias exported by advapi32.dll as `SystemFunction036`.
 pub unsafe extern "win64" fn SystemFunction036(buf: *mut c_void, len: u32) -> u8 {
@@ -4680,6 +7245,924 @@ mod tests {
                 assert_eq!(CredReadW(t.as_ptr(), 1, 0, &mut out), FALSE);
                 assert_eq!(crate::teb::last_error(), ERROR_NOT_FOUND);
             }
+
+            match prev_home {
+                Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
+                None => std::env::remove_var("TRANSLATOR_HOME"),
+            }
+            match prev_drive {
+                Some(v) => std::env::set_var("AW2_DRIVE_C", v),
+                None => std::env::remove_var("AW2_DRIVE_C"),
+            }
+            let _ = std::fs::remove_dir_all(&tmp_root);
+        }
+    }
+
+    #[test]
+    fn token_information_all_classes_windows_semantics() {
+        unsafe {
+            let mut tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008 | 0x0010 | 0x0002, &mut tok), TRUE);
+            assert!(!tok.is_null());
+
+            // TOKEN_QUERY-only handle cannot be duplicated or query TokenSource (ERROR_ACCESS_DENIED)
+            let mut ro_tok: HANDLE = std::ptr::null_mut();
+            let mut denied_dup: HANDLE = std::ptr::null_mut();
+            let mut src_buf = [0u8; 16];
+            let mut src_need = 0u32;
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut ro_tok), TRUE);
+            assert_eq!(DuplicateToken(ro_tok, SECURITY_IMPERSONATION, &mut denied_dup), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(GetTokenInformation(ro_tok, 7, src_buf.as_mut_ptr(), 16, &mut src_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            let _ = crate::kernel32::threads::CloseHandle(ro_tok);
+
+            // TOKEN_QUERY_SOURCE-only handle can query TokenSource (7) but not TOKEN_QUERY classes
+            let mut src_tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0010, &mut src_tok), TRUE);
+            assert_eq!(GetTokenInformation(src_tok, 7, src_buf.as_mut_ptr(), 16, &mut src_need), TRUE);
+            assert_eq!(src_need, 16);
+            let mut denied_val = 0u32;
+            assert_eq!(GetTokenInformation(src_tok, 8, &mut denied_val as *mut u32 as *mut u8, 4, &mut src_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            let _ = crate::kernel32::threads::CloseHandle(src_tok);
+
+            let mut need = 0u32;
+            // TokenType (8) -> TokenPrimary (1)
+            let mut val = 0u32;
+            assert_eq!(GetTokenInformation(tok, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!((val, need), (TOKEN_PRIMARY, 4));
+
+            // TokenImpersonationLevel (9) on primary token -> ERROR_INVALID_PARAMETER
+            assert_eq!(GetTokenInformation(tok, 9, &mut val as *mut u32 as *mut u8, 4, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            // DuplicateToken creates an impersonation token whose level can be queried
+            let mut imp_tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(DuplicateToken(tok, SECURITY_IMPERSONATION, &mut imp_tok), TRUE);
+            assert_eq!(GetTokenInformation(imp_tok, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, TOKEN_IMPERSONATION);
+            assert_eq!(GetTokenInformation(imp_tok, 9, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, SECURITY_IMPERSONATION);
+
+            // TokenGroups (2): size query + read groups and validate embedded SID pointers
+            assert_eq!(GetTokenInformation(tok, 2, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert!(need >= 8);
+            let mut gbuf = vec![0u8; need as usize];
+            assert_eq!(GetTokenInformation(tok, 2, gbuf.as_mut_ptr(), need, &mut need), TRUE);
+            let gcount = u32::from_le_bytes(gbuf[0..4].try_into().unwrap());
+            assert!(gcount >= 4);
+            let first_sid = std::ptr::read_unaligned(gbuf.as_ptr().add(8) as *const *const u8);
+            assert!((first_sid as usize) >= (gbuf.as_ptr() as usize) && (first_sid as usize) < (gbuf.as_ptr() as usize + gbuf.len()));
+            assert_eq!(*first_sid, 1); // SID_REVISION
+
+            // TokenPrivileges (3)
+            assert_eq!(GetTokenInformation(tok, 3, std::ptr::null_mut(), 0, &mut need), FALSE);
+            let mut pbuf = vec![0u8; need as usize];
+            assert_eq!(GetTokenInformation(tok, 3, pbuf.as_mut_ptr(), need, &mut need), TRUE);
+            assert_eq!(u32::from_le_bytes(pbuf[0..4].try_into().unwrap()), 1);
+
+            // TokenOwner (4), TokenPrimaryGroup (5), TokenDefaultDacl (6), TokenSource (7)
+            for cls in [4u32, 5, 6, 7, 10, 11, 12, 13, 15, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48] {
+                let mut sz = 0u32;
+                assert_eq!(GetTokenInformation(tok, cls, std::ptr::null_mut(), 0, &mut sz), FALSE, "class {cls} size query");
+                assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER, "class {cls} err");
+                assert!(sz > 0, "class {cls} non-zero size");
+                let mut b = vec![0u8; sz as usize];
+                assert_eq!(GetTokenInformation(tok, cls, b.as_mut_ptr(), sz, &mut sz), TRUE, "class {cls} read");
+            }
+
+            // TokenStatistics (10) -> 56 bytes, TokenType=1, stable process TokenId/ModifiedId across opens & pseudo-handles
+            let mut stats = [0u8; 56];
+            assert_eq!(GetTokenInformation(tok, 10, stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(need, 56);
+            let proc_tid = u64::from_le_bytes(stats[0..8].try_into().unwrap());
+            let proc_aid = u64::from_le_bytes(stats[8..16].try_into().unwrap());
+            let proc_mid = u64::from_le_bytes(stats[48..56].try_into().unwrap());
+            assert_ne!(proc_tid, 0);
+            assert_eq!(u32::from_le_bytes(stats[24..28].try_into().unwrap()), TOKEN_PRIMARY);
+
+            let mut tok2: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut tok2), TRUE);
+            let mut stats2 = [0u8; 56];
+            assert_eq!(GetTokenInformation(tok2, 10, stats2.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(u64::from_le_bytes(stats2[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(stats2[8..16].try_into().unwrap()), proc_aid);
+            assert_eq!(u64::from_le_bytes(stats2[48..56].try_into().unwrap()), proc_mid);
+            let _ = crate::kernel32::threads::CloseHandle(tok2);
+
+            let mut pseudo_stats = [0u8; 56];
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 10, pseudo_stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(u64::from_le_bytes(pseudo_stats[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(pseudo_stats[48..56].try_into().unwrap()), proc_mid);
+
+            let mut dup_stats = [0u8; 56];
+            assert_eq!(GetTokenInformation(imp_tok, 10, dup_stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_ne!(u64::from_le_bytes(dup_stats[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(dup_stats[8..16].try_into().unwrap()), proc_aid);
+
+            // TokenAccessInformation (22) -> SidHash populated with user + groups + bit-sliced hash entries
+            let mut ai_need = 0u32;
+            assert_eq!(GetTokenInformation(tok, 22, std::ptr::null_mut(), 0, &mut ai_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            let mut ai_buf = vec![0u8; ai_need as usize];
+            assert_eq!(GetTokenInformation(tok, 22, ai_buf.as_mut_ptr(), ai_need, &mut ai_need), TRUE);
+            let base = ai_buf.as_ptr() as usize;
+            let end = base + ai_buf.len();
+            let sid_hash_ptr = std::ptr::read_unaligned(ai_buf.as_ptr() as *const usize);
+            assert!(sid_hash_ptr >= base && sid_hash_ptr + 272 <= end);
+            let sh = sid_hash_ptr as *const u8;
+            let mut expected_sids = vec![(token_user_sid(), 0u32)];
+            expected_sids.extend(token_default_groups());
+            let sid_count = std::ptr::read_unaligned(sh as *const u32) as usize;
+            assert_eq!(sid_count, expected_sids.len());
+            let sid_attr_ptr = std::ptr::read_unaligned(sh.add(8) as *const usize);
+            assert!(sid_attr_ptr >= base && sid_attr_ptr + sid_count * 16 <= end);
+            for (i, (exp_sid, exp_attrs)) in expected_sids.iter().enumerate() {
+                let ent = (sid_attr_ptr as *const u8).add(i * 16);
+                let sp = std::ptr::read_unaligned(ent as *const usize);
+                let attrs = std::ptr::read_unaligned(ent.add(8) as *const u32);
+                assert!(sp >= base && sp + exp_sid.len() <= end);
+                assert_eq!(std::slice::from_raw_parts(sp as *const u8, exp_sid.len()), exp_sid.as_slice());
+                assert_eq!(attrs, *exp_attrs);
+                let b = sid_hash_byte(exp_sid);
+                let lo = std::ptr::read_unaligned(sh.add(16 + ((b & 0x0F) as usize) * 8) as *const u64);
+                let hi = std::ptr::read_unaligned(sh.add(16 + (16 + ((b >> 4) as usize)) * 8) as *const u64);
+                assert_ne!((lo & hi) & (1u64 << i), 0, "SID {i} missing from SidHash");
+            }
+            let privs_ptr = std::ptr::read_unaligned(ai_buf.as_ptr().add(16) as *const usize);
+            assert!(privs_ptr >= base && privs_ptr + 16 <= end);
+            assert_eq!(std::ptr::read_unaligned(privs_ptr as *const u32), 1);
+
+            // Documented failure classes: 14 (reserved), 16 (SeSecurityPrivilege), 19 (no linked UAC token), 99 (invalid)
+            assert_eq!(GetTokenInformation(tok, 14, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(GetTokenInformation(tok, 16, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_PRIVILEGE_NOT_HELD);
+            assert_eq!(GetTokenInformation(tok, 19, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_NO_SUCH_LOGON_SESSION);
+            assert_eq!(GetTokenInformation(tok, 99, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            // Windows 8+ pseudo-handles: -4 (GetCurrentProcessToken) & -6 (GetCurrentThreadEffectiveToken)
+            // grant TOKEN_QUERY | TOKEN_QUERY_SOURCE, while -5 (GetCurrentThreadToken) returns ERROR_NO_TOKEN
+            // when the thread is not impersonating.
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 12, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, 1);
+            let mut pseudo_src = [0u8; 16];
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 7, pseudo_src.as_mut_ptr(), 16, &mut need), TRUE);
+            assert_eq!(need, 16);
+            assert_eq!(GetTokenInformation((-6isize) as HANDLE, 12, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, 1);
+            assert_eq!(GetTokenInformation((-5isize) as HANDLE, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), 1008); // ERROR_NO_TOKEN
+
+            let _ = crate::kernel32::threads::CloseHandle(imp_tok);
+            let _ = crate::kernel32::threads::CloseHandle(tok);
+        }
+    }
+
+    #[test]
+    fn capi_keys_blobs_encrypt_decrypt_sign_verify_and_windows_vectors() {
+        unsafe {
+            let tmp_root = std::env::temp_dir().join(format!("pf_capi_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp_root);
+            std::fs::create_dir_all(&tmp_root).unwrap();
+            let prev_home = std::env::var_os("TRANSLATOR_HOME");
+            let prev_drive = std::env::var_os("AW2_DRIVE_C");
+            std::env::set_var("TRANSLATOR_HOME", &tmp_root);
+            std::env::remove_var("AW2_DRIVE_C");
+            capi_containers().lock().unwrap().clear();
+
+            let hex = |s: &str| -> Vec<u8> {
+                (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+            };
+            let cname = crate::strings::to_wide_z("PortFactoryCapiUnitTestContainer");
+            let mut hprov: usize = 0;
+            // Clean any prior container, then create fresh
+            let _ = CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET);
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_NEWKEYSET), TRUE);
+
+            // Before keygen, CryptGetUserKey returns NTE_NO_KEY
+            let mut h_missing: usize = 0;
+            assert_eq!(CryptGetUserKey(hprov, AT_SIGNATURE, &mut h_missing), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_NO_KEY);
+
+            // 1. Generate 2048-bit RSA signature & exchange keys
+            let mut h_sign: usize = 0;
+            assert_eq!(CryptGenKey(hprov, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_sign), TRUE);
+            let mut h_keyx: usize = 0;
+            assert_eq!(CryptGenKey(hprov, AT_KEYEXCHANGE, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_keyx), TRUE);
+
+            // Close and reopen same named container -> CryptGetUserKey retrieves persisted keys!
+            assert_eq!(CryptDestroyKey(h_sign), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx), TRUE);
+            assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
+
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, 0), TRUE);
+            assert_eq!(CryptGetUserKey(hprov, AT_SIGNATURE, &mut h_sign), TRUE);
+            assert_eq!(CryptGetUserKey(hprov, AT_KEYEXCHANGE, &mut h_keyx), TRUE);
+
+            // 2. Sign & verify SHA-256 hash (both standard DigestInfo and CRYPT_NOHASHOID)
+            let mut h_hash: usize = 0;
+            assert_eq!(CryptCreateHash(hprov, CALG_SHA_256, 0, 0, &mut h_hash), TRUE);
+            assert_eq!(CryptHashData(h_hash, b"capi sign verify payload".as_ptr(), 24, 0), TRUE);
+
+            let mut sig_len = 0u32;
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0, std::ptr::null_mut(), &mut sig_len), TRUE);
+            assert_eq!(sig_len, 256);
+            let mut sig = vec![0u8; 256];
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0, sig.as_mut_ptr(), &mut sig_len), TRUE);
+
+            // Export PUBLICKEYBLOB, re-import, and verify
+            let mut pub_len = 0u32;
+            assert_eq!(CryptExportKey(h_sign, 0, PUBLICKEYBLOB, 0, std::ptr::null_mut(), &mut pub_len), TRUE);
+            let mut pub_blob = vec![0u8; pub_len as usize];
+            assert_eq!(CryptExportKey(h_sign, 0, PUBLICKEYBLOB, 0, pub_blob.as_mut_ptr(), &mut pub_len), TRUE);
+            assert_eq!(pub_blob[0], PUBLICKEYBLOB as u8);
+            assert_eq!(pub_blob[1], CUR_BLOB_VERSION);
+            assert_eq!(&pub_blob[8..12], b"RSA1");
+
+            let mut h_pub: usize = 0;
+            assert_eq!(CryptImportKey(hprov, pub_blob.as_ptr(), pub_len, 0, 0, &mut h_pub), TRUE);
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), TRUE);
+            // Unsupported CRYPT_X931_FORMAT (0x4) must be rejected honestly in both sign & verify
+            let mut x931_len = 256u32;
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0x4, std::ptr::null_mut(), &mut x931_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0x4, sig.as_mut_ptr(), &mut x931_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0x4), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            sig[0] ^= 0x80;
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_SIGNATURE);
+
+            // Export PRIVATEKEYBLOB & re-import into a fresh verify-context provider
+            let mut priv_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, 0, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut priv_len), TRUE);
+            let mut priv_blob = vec![0u8; priv_len as usize];
+            assert_eq!(CryptExportKey(h_keyx, 0, PRIVATEKEYBLOB, 0, priv_blob.as_mut_ptr(), &mut priv_len), TRUE);
+            assert_eq!(priv_blob[0], PRIVATEKEYBLOB as u8);
+            assert_eq!(&priv_blob[8..12], b"RSA2");
+
+            let mut hprov2: usize = 0;
+            assert_eq!(CryptAcquireContextW(&mut hprov2, std::ptr::null(), std::ptr::null(), 24, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_keyx_imp: usize = 0;
+            assert_eq!(CryptImportKey(hprov2, priv_blob.as_ptr(), priv_len, 0, CRYPT_EXPORTABLE, &mut h_keyx_imp), TRUE);
+
+            // 3. RSA CryptEncrypt / CryptDecrypt (PKCS#1 v1.5 and CRYPT_OAEP)
+            for flags in [0u32, CRYPT_OAEP] {
+                let mut buf = vec![0u8; 256];
+                let msg = b"RSA CAPI message";
+                buf[..msg.len()].copy_from_slice(msg);
+                let mut dlen = msg.len() as u32;
+                assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, flags, buf.as_mut_ptr(), &mut dlen, 256), TRUE);
+                assert_eq!(dlen, 256);
+                assert_eq!(CryptDecrypt(h_keyx_imp, 0, TRUE, flags, buf.as_mut_ptr(), &mut dlen), TRUE);
+                assert_eq!(&buf[..dlen as usize], msg);
+            }
+
+            // 4. AES-128-CBC NIST SP 800-38A known-answer vector via PLAINTEXTKEYBLOB + SIMPLEBLOB wrap/unwrap
+            let key128 = hex("2b7e151628aed2a6abf7158809cf4f3c");
+            let mut pt_blob = Vec::new();
+            pt_blob.push(PLAINTEXTKEYBLOB as u8);
+            pt_blob.push(CUR_BLOB_VERSION);
+            pt_blob.extend_from_slice(&0u16.to_le_bytes());
+            pt_blob.extend_from_slice(&CALG_AES_128.to_le_bytes());
+            pt_blob.extend_from_slice(&16u32.to_le_bytes());
+            pt_blob.extend_from_slice(&key128);
+
+            let mut h_aes: usize = 0;
+            assert_eq!(CryptImportKey(hprov, pt_blob.as_ptr(), pt_blob.len() as u32, 0, CRYPT_EXPORTABLE, &mut h_aes), TRUE);
+
+            // Export as SIMPLEBLOB (RSA-OAEP wrapped) and import back using imported RSA private key
+            let mut sblob_len = 0u32;
+            assert_eq!(CryptExportKey(h_aes, h_keyx, SIMPLEBLOB, CRYPT_OAEP, std::ptr::null_mut(), &mut sblob_len), TRUE);
+            let mut sblob = vec![0u8; sblob_len as usize];
+            assert_eq!(CryptExportKey(h_aes, h_keyx, SIMPLEBLOB, CRYPT_OAEP, sblob.as_mut_ptr(), &mut sblob_len), TRUE);
+            assert_eq!(sblob[0], SIMPLEBLOB as u8);
+            assert_eq!(u32::from_le_bytes(sblob[4..8].try_into().unwrap()), CALG_AES_128);
+            assert_eq!(u32::from_le_bytes(sblob[8..12].try_into().unwrap()), CALG_RSA_KEYX);
+
+            let mut h_aes_unwrapped: usize = 0;
+            assert_eq!(CryptImportKey(hprov2, sblob.as_ptr(), sblob_len, h_keyx_imp, CRYPT_OAEP, &mut h_aes_unwrapped), TRUE);
+
+            // Zero-handle SIMPLEBLOB import resolves AT_KEYEXCHANGE from hprov's container
+            let mut h_aes_zero_pub: usize = 0;
+            assert_eq!(CryptImportKey(hprov, sblob.as_ptr(), sblob_len, 0, CRYPT_OAEP, &mut h_aes_zero_pub), TRUE);
+            let mut zbuf = vec![0u8; 32];
+            zbuf[..16].copy_from_slice(&hex("6bc1bee22e409f96e93d7e117393172a"));
+            let mut zlen = 16u32;
+            let iv_check = hex("000102030405060708090a0b0c0d0e0f");
+            assert_eq!(CryptSetKeyParam(h_aes_zero_pub, KP_IV, iv_check.as_ptr(), 0), TRUE);
+            assert_eq!(CryptEncrypt(h_aes_zero_pub, 0, FALSE, 0, zbuf.as_mut_ptr(), &mut zlen, 32), TRUE);
+            assert_eq!(&zbuf[..16], hex("7649abac8119b246cee98e9b12e9197d").as_slice());
+            assert_eq!(CryptDestroyKey(h_aes_zero_pub), TRUE);
+            // Zero-handle SIMPLEBLOB import on a provider with no AT_KEYEXCHANGE fails with NTE_NO_KEY
+            let mut h_empty_prov: usize = 0;
+            assert_eq!(CryptAcquireContextW(&mut h_empty_prov, std::ptr::null(), std::ptr::null(), 24, CRYPT_VERIFYCONTEXT), TRUE);
+            assert_eq!(CryptImportKey(h_empty_prov, sblob.as_ptr(), sblob_len, 0, CRYPT_OAEP, &mut h_aes_zero_pub), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_NO_KEY);
+            assert_eq!(CryptReleaseContext(h_empty_prov, 0), TRUE);
+
+            // Default CAPI KP_MODE_BITS must be 8 bits (1 byte for CFB8), and ZERO_PADDING (3) is rejected
+            let mut mode_bits = 0u32;
+            let mut mb_len = 4u32;
+            assert_eq!(CryptGetKeyParam(h_aes_unwrapped, KP_MODE_BITS, &mut mode_bits as *mut u32 as *mut u8, &mut mb_len, 0), TRUE);
+            assert_eq!(mode_bits, 8);
+            let zero_pad = 3u32;
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_PADDING, &zero_pad as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            let pkcs5_pad = PKCS5_PADDING;
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_PADDING, &pkcs5_pad as *const u32 as *const u8, 0), TRUE);
+
+            // SIMPLEBLOB whose unwrapped session key has invalid length (0 bytes for RC2) must be rejected with NTE_BAD_DATA
+            let mut empty_ct = vec![0u8; 256];
+            let mut empty_len = 0u32;
+            assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, 0, empty_ct.as_mut_ptr(), &mut empty_len, 256), TRUE);
+            let mut bad_sblob = Vec::with_capacity(12 + 256);
+            bad_sblob.push(SIMPLEBLOB as u8);
+            bad_sblob.push(CUR_BLOB_VERSION);
+            bad_sblob.extend_from_slice(&0u16.to_le_bytes());
+            bad_sblob.extend_from_slice(&CALG_RC2.to_le_bytes());
+            bad_sblob.extend_from_slice(&CALG_RSA_KEYX.to_le_bytes());
+            bad_sblob.extend_from_slice(&empty_ct);
+            let mut h_bad_rc2 = 0usize;
+            assert_eq!(CryptImportKey(hprov2, bad_sblob.as_ptr(), bad_sblob.len() as u32, h_keyx_imp, 0, &mut h_bad_rc2), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+
+            let iv = hex("000102030405060708090a0b0c0d0e0f");
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_IV, iv.as_ptr(), 0), TRUE);
+            let pt = hex("6bc1bee22e409f96e93d7e117393172a");
+            let mut buf = vec![0u8; 32];
+            buf[..16].copy_from_slice(&pt);
+            let mut dlen = 16u32;
+            // Final=FALSE -> no padding, exact NIST SP 800-38A CBC block 1 ciphertext
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, FALSE, 0, buf.as_mut_ptr(), &mut dlen, 32), TRUE);
+            assert_eq!(dlen, 16);
+            assert_eq!(&buf[..16], hex("7649abac8119b246cee98e9b12e9197d").as_slice());
+
+            // Reset IV and test Final=TRUE with PKCS#5 padding + size query + ERROR_MORE_DATA
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_IV, iv.as_ptr(), 0), TRUE);
+            let msg_pad = b"Hello CAPI AES-128-CBC!";
+            let mut qlen = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, std::ptr::null_mut(), &mut qlen, 0), TRUE);
+            assert_eq!(qlen, 32);
+            let mut small = vec![0u8; 24];
+            let mut slen_in = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, small.as_mut_ptr(), &mut slen_in, 24), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_MORE_DATA);
+            assert_eq!(slen_in, 32);
+
+            let mut full = vec![0u8; 32];
+            full[..msg_pad.len()].copy_from_slice(msg_pad);
+            let mut flen = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen, 32), TRUE);
+            assert_eq!(flen, 32);
+            assert_eq!(CryptDecrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen), TRUE);
+            assert_eq!(&full[..flen as usize], msg_pad);
+
+            // 4a. CRYPT_MODE_CFB final-block PKCS#5 padding (including extra block for 16-byte input)
+            let mut h_cfb = 0usize;
+            assert_eq!(CryptDuplicateKey(h_aes_unwrapped, std::ptr::null(), 0, &mut h_cfb), TRUE);
+            let cfb_mode = CRYPT_MODE_CFB;
+            assert_eq!(CryptSetKeyParam(h_cfb, KP_MODE, &cfb_mode as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptSetKeyParam(h_cfb, KP_IV, iv.as_ptr(), 0), TRUE);
+            let mut cfb_qlen = 16u32;
+            assert_eq!(CryptEncrypt(h_cfb, 0, TRUE, 0, std::ptr::null_mut(), &mut cfb_qlen, 0), TRUE);
+            assert_eq!(cfb_qlen, 32, "16-byte final AES-CFB plaintext must pad to 32 bytes in CAPI");
+            let mut cfb_buf = vec![0u8; 32];
+            cfb_buf[..16].copy_from_slice(&pt);
+            let mut cfb_len = 16u32;
+            assert_eq!(CryptEncrypt(h_cfb, 0, TRUE, 0, cfb_buf.as_mut_ptr(), &mut cfb_len, 32), TRUE);
+            assert_eq!(cfb_len, 32);
+            assert_eq!(CryptDecrypt(h_cfb, 0, TRUE, 0, cfb_buf.as_mut_ptr(), &mut cfb_len), TRUE);
+            assert_eq!(cfb_len, 16);
+            assert_eq!(&cfb_buf[..16], pt.as_slice());
+            // Invalid padding on CFB final decrypt must fail with NTE_BAD_DATA
+            let mut bad_cfb = vec![0xFFu8; 16];
+            let mut bad_cfb_len = 16u32;
+            assert_eq!(CryptDecrypt(h_cfb, 0, TRUE, 0, bad_cfb.as_mut_ptr(), &mut bad_cfb_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            assert_eq!(CryptDestroyKey(h_cfb), TRUE);
+
+            // 4b. Encrypted PRIVATEKEYBLOB export/import with session wrapping key (hExpKey != 0)
+            let mut enc_priv_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, h_aes, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut enc_priv_len), TRUE);
+            assert!(enc_priv_len > priv_len, "CBC-encrypted PRIVATEKEYBLOB should include PKCS#5 padding");
+            let mut enc_priv_blob = vec![0u8; enc_priv_len as usize];
+            assert_eq!(CryptExportKey(h_keyx, h_aes, PRIVATEKEYBLOB, 0, enc_priv_blob.as_mut_ptr(), &mut enc_priv_len), TRUE);
+            assert_eq!(&enc_priv_blob[..8], &priv_blob[..8]);
+            assert_ne!(&enc_priv_blob[8..12], b"RSA2", "encrypted PRIVATEKEYBLOB body must not expose plaintext RSA2");
+            // Importing encrypted PRIVATEKEYBLOB without wrapping key or with wrong key must fail
+            let mut h_bad_priv = 0usize;
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, 0, 0, &mut h_bad_priv), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            let mut h_wrong_wrap = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_AES_128, 0, &mut h_wrong_wrap), TRUE);
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, h_wrong_wrap, 0, &mut h_bad_priv), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            assert_eq!(CryptDestroyKey(h_wrong_wrap), TRUE);
+            // Importing with matching wrapping key succeeds and decrypts ciphertext from original RSA key
+            let mut h_keyx_wrapped_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, h_aes, 0, &mut h_keyx_wrapped_imp), TRUE);
+            let mut wrap_ct = vec![0u8; 256];
+            wrap_ct[..13].copy_from_slice(b"wrapped priv!");
+            let mut wrap_len = 13u32;
+            assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, 0, wrap_ct.as_mut_ptr(), &mut wrap_len, 256), TRUE);
+            assert_eq!(CryptDecrypt(h_keyx_wrapped_imp, 0, TRUE, 0, wrap_ct.as_mut_ptr(), &mut wrap_len), TRUE);
+            assert_eq!(&wrap_ct[..wrap_len as usize], b"wrapped priv!");
+            assert_eq!(CryptDestroyKey(h_keyx_wrapped_imp), TRUE);
+            // Reject RSA key as hExpKey for PRIVATEKEYBLOB and nonzero hExpKey for PLAINTEXTKEYBLOB
+            let mut dummy_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, h_sign, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY);
+            assert_eq!(CryptExportKey(h_aes, h_keyx, PLAINTEXTKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY);
+
+            // 4c. KP_PERMISSIONS enforcement across export, decrypt, encrypt, read, write, and monotonic restriction
+            let mut h_perm = 0usize;
+            assert_eq!(CryptDuplicateKey(h_aes, std::ptr::null(), 0, &mut h_perm), TRUE);
+            let mut perms = 0u32;
+            let mut perms_len = 4u32;
+            assert_eq!(CryptGetKeyParam(h_perm, KP_PERMISSIONS, &mut perms as *mut u32 as *mut u8, &mut perms_len, 0), TRUE);
+            assert_ne!(perms & CRYPT_EXPORT, 0);
+            // Remove CRYPT_EXPORT -> PLAINTEXTKEYBLOB & SIMPLEBLOB export fail with NTE_PERM; cannot re-add
+            let no_export = perms & !CRYPT_EXPORT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_export as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptExportKey(h_perm, 0, PLAINTEXTKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptExportKey(h_perm, h_keyx, SIMPLEBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &perms as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            // Remove CRYPT_DECRYPT -> CryptEncrypt works, CryptDecrypt fails with NTE_PERM
+            let no_decrypt = no_export & !CRYPT_DECRYPT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_decrypt as *const u32 as *const u8, 0), TRUE);
+            let mut pbuf = vec![0u8; 32];
+            pbuf[..4].copy_from_slice(b"perm");
+            let mut plen = 4u32;
+            assert_eq!(CryptEncrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen, 32), TRUE);
+            assert_eq!(CryptDecrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            // Remove CRYPT_ENCRYPT -> CryptEncrypt and wrapping PRIVATEKEYBLOB fail with NTE_PERM
+            let no_encrypt = no_decrypt & !CRYPT_ENCRYPT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_encrypt as *const u32 as *const u8, 0), TRUE);
+            let mut plen2 = 4u32;
+            assert_eq!(CryptEncrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen2, 32), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptExportKey(h_keyx, h_perm, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            // Remove CRYPT_READ and CRYPT_WRITE -> GetKeyParam & SetKeyParam fail with NTE_PERM
+            let no_rw = no_encrypt & !(CRYPT_READ | CRYPT_WRITE);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_rw as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptGetKeyParam(h_perm, KP_ALGID, &mut perms as *mut u32 as *mut u8, &mut perms_len, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_rw as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptDestroyKey(h_perm), TRUE);
+
+            // 5. CryptDeriveKey (SHA-256 -> direct truncation; 40-bit RC4 salt semantics)
+            let mut h_pw = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_SHA_256, 0, 0, &mut h_pw), TRUE);
+            assert_eq!(CryptHashData(h_pw, b"abc".as_ptr(), 3, 0), TRUE);
+            let mut h_dk = 0usize;
+            assert_eq!(CryptDeriveKey(hprov2, CALG_AES_128, h_pw, CRYPT_EXPORTABLE, &mut h_dk), TRUE);
+            let mut dk_blob = vec![0u8; 64];
+            let mut dk_len = 64u32;
+            assert_eq!(CryptExportKey(h_dk, 0, PLAINTEXTKEYBLOB, 0, dk_blob.as_mut_ptr(), &mut dk_len), TRUE);
+            assert_eq!(&dk_blob[12..28], &BcDigest::Sha256.hash(b"abc")[..16]);
+            assert_eq!(CryptDestroyKey(h_dk), TRUE);
+            assert_eq!(CryptDestroyHash(h_pw), TRUE);
+
+            // 5b. 40-bit RC4 CryptDeriveKey salt semantics:
+            // - Default: 11 zero bytes appended to 5-byte key
+            // - CRYPT_NO_SALT (0x10): 0 salt bytes (raw 5-byte RC4 key)
+            // - CRYPT_CREATE_SALT (0x04): 11 salt bytes taken from unused hash bytes hash[5..16]
+            let mut h_md5 = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_MD5, 0, 0, &mut h_md5), TRUE);
+            assert_eq!(CryptHashData(h_md5, b"password".as_ptr(), 8, 0), TRUE);
+            let md5_pw = BcDigest::Md5.hash(b"password");
+            let rc4_sample = b"capi 40-bit salt test";
+
+            let mut h_rc4_def = 0usize;
+            let mut h_rc4_nosalt = 0usize;
+            let mut h_rc4_csalt = 0usize;
+            let mut h_rc4_bad = 0usize;
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, 40 << 16, &mut h_rc4_def), TRUE);
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x10, &mut h_rc4_nosalt), TRUE);
+            assert_eq!(
+                CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x04 | CRYPT_EXPORTABLE, &mut h_rc4_csalt),
+                TRUE,
+            );
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x14, &mut h_rc4_bad), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+
+            let mut salt_buf = [0xAAu8; 16];
+            let mut salt_len = 16u32;
+            assert_eq!(CryptGetKeyParam(h_rc4_def, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 11);
+            assert_eq!(&salt_buf[..11], &[0u8; 11]);
+
+            salt_len = 16;
+            assert_eq!(CryptGetKeyParam(h_rc4_nosalt, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 0);
+
+            salt_len = 16;
+            assert_eq!(CryptGetKeyParam(h_rc4_csalt, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 11);
+            assert_eq!(&salt_buf[..11], &md5_pw[5..16]);
+
+            let mut ct_def = rc4_sample.to_vec();
+            let mut ct_nosalt = rc4_sample.to_vec();
+            let mut ct_csalt = rc4_sample.to_vec();
+            let mut rlen = rc4_sample.len() as u32;
+            assert_eq!(CryptEncrypt(h_rc4_def, 0, TRUE, 0, ct_def.as_mut_ptr(), &mut rlen, rlen), TRUE);
+            assert_eq!(CryptEncrypt(h_rc4_nosalt, 0, TRUE, 0, ct_nosalt.as_mut_ptr(), &mut rlen, rlen), TRUE);
+            assert_eq!(CryptEncrypt(h_rc4_csalt, 0, TRUE, 0, ct_csalt.as_mut_ptr(), &mut rlen, rlen), TRUE);
+
+            let mut k_def = md5_pw[..5].to_vec();
+            k_def.extend_from_slice(&[0u8; 11]);
+            assert_eq!(ct_def, Rc4State::new(&k_def).apply(rc4_sample));
+            assert_eq!(ct_nosalt, Rc4State::new(&md5_pw[..5]).apply(rc4_sample));
+            assert_eq!(ct_csalt, Rc4State::new(&md5_pw[..16]).apply(rc4_sample));
+            assert_ne!(ct_def, ct_nosalt);
+            assert_ne!(ct_def, ct_csalt);
+            assert_ne!(ct_nosalt, ct_csalt);
+
+            // Export 5-byte key blob, re-import, apply KP_SALT -> decrypts salted ciphertext cleanly
+            let mut rc4_blob = vec![0u8; 32];
+            let mut rc4_blen = 32u32;
+            assert_eq!(CryptExportKey(h_rc4_csalt, 0, PLAINTEXTKEYBLOB, 0, rc4_blob.as_mut_ptr(), &mut rc4_blen), TRUE);
+            assert_eq!(rc4_blen, 17);
+            let mut h_rc4_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, rc4_blob.as_ptr(), rc4_blen, 0, 0, &mut h_rc4_imp), TRUE);
+            assert_eq!(CryptSetKeyParam(h_rc4_imp, KP_SALT, salt_buf.as_ptr(), 0), TRUE);
+            let mut dec_csalt = ct_csalt.clone();
+            let mut dlen_rc4 = dec_csalt.len() as u32;
+            assert_eq!(CryptDecrypt(h_rc4_imp, 0, TRUE, 0, dec_csalt.as_mut_ptr(), &mut dlen_rc4), TRUE);
+            assert_eq!(&dec_csalt[..dlen_rc4 as usize], rc4_sample);
+
+            assert_eq!(CryptDestroyKey(h_rc4_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_csalt), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_nosalt), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_def), TRUE);
+            assert_eq!(CryptDestroyHash(h_md5), TRUE);
+
+            // RC2 key generation rejects >1024-bit keys (NTE_BAD_FLAGS) and roundtrips 1024-bit export/import
+            let mut h_rc2_bad = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_RC2, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_rc2_bad), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            let mut h_rc2_max = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_RC2, (1024 << 16) | CRYPT_EXPORTABLE, &mut h_rc2_max), TRUE);
+            let mut rc2_blob = vec![0u8; 160];
+            let mut rc2_blen = 160u32;
+            assert_eq!(CryptExportKey(h_rc2_max, 0, PLAINTEXTKEYBLOB, 0, rc2_blob.as_mut_ptr(), &mut rc2_blen), TRUE);
+            assert_eq!(rc2_blen, 12 + 128);
+            let mut h_rc2_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, rc2_blob.as_ptr(), rc2_blen, 0, 0, &mut h_rc2_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc2_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc2_max), TRUE);
+
+            // 6. Real Windows PUBLICKEYBLOB + little-endian CAPI signature interoperability vector
+            // (1024-bit OpenSSL key & SHA-256 PKCS#1 v1.5 signature over "aw2 license test",
+            //  converted to little-endian Windows CAPI format)
+            let mut n_le = hex("CAA2D2172A1AE3E2C6EFB357E25B0C80B4CC77044032EA5AA7C8369F0C7F9786751D7FE853A0FA801EBB4CF3FBC861138952CFD50D1DFC8E5BF91E98DB4D72B369B8A0C0D4E1FC67B89F223152C9DF04049633CE988BE3050BCF92A606B0E65A2DD12E951EC0D4D4A3B1F1732255CFD81FD08164780F02A9288F6998F913A7D1");
+            n_le.reverse();
+            let mut win_pub_blob = Vec::with_capacity(20 + 128);
+            win_pub_blob.push(PUBLICKEYBLOB as u8);
+            win_pub_blob.push(CUR_BLOB_VERSION);
+            win_pub_blob.extend_from_slice(&0u16.to_le_bytes());
+            win_pub_blob.extend_from_slice(&CALG_RSA_SIGN.to_le_bytes());
+            win_pub_blob.extend_from_slice(b"RSA1");
+            win_pub_blob.extend_from_slice(&1024u32.to_le_bytes());
+            win_pub_blob.extend_from_slice(&65537u32.to_le_bytes());
+            win_pub_blob.extend_from_slice(&n_le);
+
+            let mut sig_le = hex("c454e628bf702ee02de25cee7d12c50a459b587bbd50e52246fdb5ad8d4c153437fa8283cbf396dd567c1e6d5c741010f08c87d4fbd895b335e1abf882675a6a8089f1d1508583491f858399a1834536a53094208f5d6cb2e0f8a36d51a56b41e6d20a75e84e4e62cfb5020a3b41532997b7abc208275677c31e5fc3aadac2b9");
+            sig_le.reverse();
+
+            let mut h_win_pub = 0usize;
+            assert_eq!(CryptImportKey(hprov2, win_pub_blob.as_ptr(), win_pub_blob.len() as u32, 0, 0, &mut h_win_pub), TRUE);
+            let mut h_win_hash = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_SHA_256, 0, 0, &mut h_win_hash), TRUE);
+            assert_eq!(CryptHashData(h_win_hash, b"aw2 license test".as_ptr(), 16, 0), TRUE);
+            assert_eq!(CryptVerifySignatureW(h_win_hash, sig_le.as_ptr(), sig_le.len() as u32, h_win_pub, std::ptr::null(), 0), TRUE);
+
+            assert_eq!(CryptDestroyHash(h_win_hash), TRUE);
+            assert_eq!(CryptDestroyKey(h_win_pub), TRUE);
+            assert_eq!(CryptDestroyKey(h_aes_unwrapped), TRUE);
+            assert_eq!(CryptDestroyKey(h_aes), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_pub), TRUE);
+            assert_eq!(CryptDestroyHash(h_hash), TRUE);
+            assert_eq!(CryptDestroyKey(h_sign), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx), TRUE);
+            assert_eq!(CryptReleaseContext(hprov2, 0), TRUE);
+            assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET), TRUE);
+
+            // 7. Persisted container survives simulated restart + preserves non-exportable policy
+            let persist_name = crate::strings::to_wide_z("PortFactoryPersistedNoExport");
+            let mut hp = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_NEWKEYSET), TRUE);
+            let mut hk_noexp = 0usize;
+            // Generate WITHOUT CRYPT_EXPORTABLE
+            assert_eq!(CryptGenKey(hp, AT_KEYEXCHANGE, 2048 << 16, &mut hk_noexp), TRUE);
+            let mut ct = vec![0u8; 256];
+            let secret_msg = b"survives restart";
+            ct[..secret_msg.len()].copy_from_slice(secret_msg);
+            let mut ct_len = secret_msg.len() as u32;
+            assert_eq!(CryptEncrypt(hk_noexp, 0, TRUE, 0, ct.as_mut_ptr(), &mut ct_len, 256), TRUE);
+            assert_eq!(CryptDestroyKey(hk_noexp), TRUE);
+            assert_eq!(CryptReleaseContext(hp, 0), TRUE);
+
+            // Verify provider-encrypted container store and secret live in host-private .capi-keystore
+            // (0700 dir, 0600 files), outside guest mounts, and are NOT decryptable via guest CryptUnprotectData.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let store_p = capi_store_path(false);
+                let secret_p = capi_secret_path(false);
+                let ks_dir = crate::path::capi_keystore_dir();
+                assert_eq!(std::fs::metadata(&ks_dir).unwrap().permissions().mode() & 0o777, 0o700);
+                assert_eq!(std::fs::metadata(&store_p).expect("persisted CAPI store must exist").permissions().mode() & 0o777, 0o600);
+                assert_eq!(std::fs::metadata(&secret_p).expect("CAPI provider secret must exist").permissions().mode() & 0o777, 0o600);
+                assert!(!store_p.to_string_lossy().contains("AppData"));
+                assert!(!store_p.to_string_lossy().contains("ProgramData"));
+
+                // Even if a drive letter mounts the translator root, guest VFS path resolution must refuse host-private keystore paths
+                assert!(crate::path::is_host_private_keystore_path(&store_p));
+                assert!(crate::path::is_host_private_keystore_path(&secret_p));
+                crate::path::add_mount("K:\\", &tmp_root);
+                let store_name = store_p.file_name().unwrap().to_string_lossy();
+                let secret_name = secret_p.file_name().unwrap().to_string_lossy();
+                assert!(crate::path::to_host(&format!("K:\\.capi-keystore\\{store_name}")).is_none(), "guest VFS must not resolve CAPI store");
+                assert!(crate::path::to_host(&format!("K:\\.capi-keystore\\{secret_name}")).is_none(), "guest VFS must not resolve CAPI secret");
+                assert!(crate::path::to_host("K:\\AppData").is_some(), "sibling guest mounts still resolve");
+
+                // Even if given the raw ciphertext bytes, guest-callable CryptUnprotectData must reject them
+                let enc_bytes = std::fs::read(&store_p).unwrap();
+                assert!(crate::misc::crypt32::dpapi_unprotect_bytes(b"", &enc_bytes).is_none());
+                assert!(crate::misc::crypt32::dpapi_unprotect_bytes(b"advapi32-capi-containers-v1", &enc_bytes).is_none());
+            }
+
+            // Machine keyset delete with the same container name MUST NOT touch the user container
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_DELETEKEYSET,
+                ),
+                FALSE,
+            );
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEYSET);
+
+            // Machine container with the same name & provider type is isolated from the user container
+            let mut hp_mach = 0usize;
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp_mach,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_NEWKEYSET,
+                ),
+                TRUE,
+            );
+            let mut ks_type = 0u32;
+            let mut ks_len = 4u32;
+            assert_eq!(
+                CryptGetProvParam(hp_mach, PP_KEYSET_TYPE, &mut ks_type as *mut u32 as *mut u8, &mut ks_len, 0),
+                TRUE,
+            );
+            assert_eq!(ks_type, CRYPT_MACHINE_KEYSET);
+            let mut hk_mach = 0usize;
+            assert_eq!(CryptGenKey(hp_mach, AT_KEYEXCHANGE, 2048 << 16, &mut hk_mach), TRUE);
+            let mut mach_ct = vec![0u8; 256];
+            let mach_msg = b"machine scope key";
+            mach_ct[..mach_msg.len()].copy_from_slice(mach_msg);
+            let mut mach_ct_len = mach_msg.len() as u32;
+            assert_eq!(CryptEncrypt(hk_mach, 0, TRUE, 0, mach_ct.as_mut_ptr(), &mut mach_ct_len, 256), TRUE);
+            assert_eq!(CryptDestroyKey(hk_mach), TRUE);
+            assert_eq!(CryptReleaseContext(hp_mach, 0), TRUE);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mach_store_p = capi_store_path(true);
+                let meta = std::fs::metadata(&mach_store_p).expect("persisted machine CAPI store must exist");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            }
+
+            // Simulate process restart by clearing in-memory container cache
+            capi_containers().lock().unwrap().clear();
+
+            // Reload machine container -> decrypts machine ciphertext, then delete machine container
+            assert_eq!(
+                CryptAcquireContextW(&mut hp_mach, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_MACHINE_KEYSET),
+                TRUE,
+            );
+            let mut hk_mach_reloaded = 0usize;
+            assert_eq!(CryptGetUserKey(hp_mach, AT_KEYEXCHANGE, &mut hk_mach_reloaded), TRUE);
+            assert_eq!(CryptDecrypt(hk_mach_reloaded, 0, TRUE, 0, mach_ct.as_mut_ptr(), &mut mach_ct_len), TRUE);
+            assert_eq!(&mach_ct[..mach_ct_len as usize], mach_msg);
+            assert_eq!(CryptDestroyKey(hk_mach_reloaded), TRUE);
+            assert_eq!(CryptReleaseContext(hp_mach, 0), TRUE);
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp_mach,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_DELETEKEYSET,
+                ),
+                TRUE,
+            );
+
+            // User container MUST survive machine container creation and deletion intact
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, 0), TRUE);
+            ks_len = 4;
+            assert_eq!(CryptGetProvParam(hp, PP_KEYSET_TYPE, &mut ks_type as *mut u32 as *mut u8, &mut ks_len, 0), TRUE);
+            assert_eq!(ks_type, 0);
+            let mut hk_reloaded = 0usize;
+            assert_eq!(CryptGetUserKey(hp, AT_KEYEXCHANGE, &mut hk_reloaded), TRUE);
+
+            // Exportability policy MUST be preserved: PRIVATEKEYBLOB rejected, PUBLICKEYBLOB allowed
+            let mut pl = 0u32;
+            assert_eq!(CryptExportKey(hk_reloaded, 0, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut pl), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY_STATE);
+            assert_eq!(CryptExportKey(hk_reloaded, 0, PUBLICKEYBLOB, 0, std::ptr::null_mut(), &mut pl), TRUE);
+
+            // Decrypt ciphertext encrypted before the simulated restart
+            assert_eq!(CryptDecrypt(hk_reloaded, 0, TRUE, 0, ct.as_mut_ptr(), &mut ct_len), TRUE);
+            assert_eq!(&ct[..ct_len as usize], secret_msg);
+
+            // Incremental CryptHashData + CryptDuplicateHash diverges cleanly without full-input buffering
+            let mut hh1 = 0usize;
+            let mut hh2 = 0usize;
+            assert_eq!(CryptCreateHash(hp, CALG_SHA_256, 0, 0, &mut hh1), TRUE);
+            assert_eq!(CryptHashData(hh1, b"ab".as_ptr(), 2, 0), TRUE);
+            assert_eq!(CryptDuplicateHash(hh1, std::ptr::null(), 0, &mut hh2), TRUE);
+            assert_eq!(CryptHashData(hh1, b"c".as_ptr(), 1, 0), TRUE);
+            assert_eq!(CryptHashData(hh2, b"d".as_ptr(), 1, 0), TRUE);
+            let mut d1 = [0u8; 32];
+            let mut d2 = [0u8; 32];
+            let mut dl = 32u32;
+            assert_eq!(CryptGetHashParam(hh1, HP_HASHVAL, d1.as_mut_ptr(), &mut dl, 0), TRUE);
+            assert_eq!(CryptGetHashParam(hh2, HP_HASHVAL, d2.as_mut_ptr(), &mut dl, 0), TRUE);
+            assert_eq!(d1.as_slice(), BcDigest::Sha256.hash(b"abc").as_slice());
+            assert_eq!(d2.as_slice(), BcDigest::Sha256.hash(b"abd").as_slice());
+            assert_eq!(CryptDestroyHash(hh1), TRUE);
+            assert_eq!(CryptDestroyHash(hh2), TRUE);
+
+            assert_eq!(CryptDestroyKey(hk_reloaded), TRUE);
+            assert_eq!(CryptReleaseContext(hp, 0), TRUE);
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET), TRUE);
+
+            // 8. Distinct CSP names of the same provider type MUST NOT alias or delete each other's containers
+            let csp_base = crate::strings::to_wide_z("Microsoft Base Cryptographic Provider v1.0");
+            let csp_enh = crate::strings::to_wide_z("Microsoft Enhanced Cryptographic Provider v1.0");
+            let shared_cname = crate::strings::to_wide_z("PortFactorySharedContainer");
+            let mut hp_base = 0usize;
+            let mut hp_enh = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp_base, shared_cname.as_ptr(), csp_base.as_ptr(), 1, CRYPT_NEWKEYSET), TRUE);
+            let mut hk_base = 0usize;
+            assert_eq!(CryptGenKey(hp_base, AT_KEYEXCHANGE, 2048 << 16, &mut hk_base), TRUE);
+            let mut base_ct = vec![0u8; 256];
+            let base_msg = b"base csp key";
+            base_ct[..base_msg.len()].copy_from_slice(base_msg);
+            let mut base_ct_len = base_msg.len() as u32;
+            assert_eq!(CryptEncrypt(hk_base, 0, TRUE, 0, base_ct.as_mut_ptr(), &mut base_ct_len, 256), TRUE);
+            assert_eq!(CryptDestroyKey(hk_base), TRUE);
+            assert_eq!(CryptReleaseContext(hp_base, 0), TRUE);
+
+            // Deleting the same container name under Enhanced CSP MUST fail and leave Base CSP untouched
+            assert_eq!(CryptAcquireContextW(&mut hp_enh, shared_cname.as_ptr(), csp_enh.as_ptr(), 1, CRYPT_DELETEKEYSET), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEYSET);
+            // Creating the same container name under Enhanced CSP succeeds independently
+            assert_eq!(CryptAcquireContextW(&mut hp_enh, shared_cname.as_ptr(), csp_enh.as_ptr(), 1, CRYPT_NEWKEYSET), TRUE);
+            let mut hk_enh = 0usize;
+            assert_eq!(CryptGenKey(hp_enh, AT_KEYEXCHANGE, 2048 << 16, &mut hk_enh), TRUE);
+            assert_eq!(CryptDestroyKey(hk_enh), TRUE);
+            assert_eq!(CryptReleaseContext(hp_enh, 0), TRUE);
+            // Delete Enhanced CSP container and simulate restart -> Base CSP container and key still intact
+            assert_eq!(CryptAcquireContextW(&mut hp_enh, shared_cname.as_ptr(), csp_enh.as_ptr(), 1, CRYPT_DELETEKEYSET), TRUE);
+            capi_containers().lock().unwrap().clear();
+            assert_eq!(CryptAcquireContextW(&mut hp_base, shared_cname.as_ptr(), csp_base.as_ptr(), 1, 0), TRUE);
+            let mut hk_base_reloaded = 0usize;
+            assert_eq!(CryptGetUserKey(hp_base, AT_KEYEXCHANGE, &mut hk_base_reloaded), TRUE);
+            assert_eq!(CryptDecrypt(hk_base_reloaded, 0, TRUE, 0, base_ct.as_mut_ptr(), &mut base_ct_len), TRUE);
+            assert_eq!(&base_ct[..base_ct_len as usize], base_msg);
+            assert_eq!(CryptDestroyKey(hk_base_reloaded), TRUE);
+
+            // Base CSP defaults RC2/RC4 to 40 bits (with 11-byte zero salt), whereas Enhanced defaults to 128 bits
+            let mut h_base_rc2 = 0usize;
+            assert_eq!(CryptGenKey(hp_base, CALG_RC2, 0, &mut h_base_rc2), TRUE);
+            let mut kbits = 0u32;
+            let mut kblen = 4u32;
+            assert_eq!(CryptGetKeyParam(h_base_rc2, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 40);
+            assert_eq!(CryptDestroyKey(h_base_rc2), TRUE);
+
+            let mut h_base_md5 = 0usize;
+            assert_eq!(CryptCreateHash(hp_base, CALG_MD5, 0, 0, &mut h_base_md5), TRUE);
+            assert_eq!(CryptHashData(h_base_md5, b"password".as_ptr(), 8, 0), TRUE);
+            let mut h_base_rc4 = 0usize;
+            assert_eq!(CryptDeriveKey(hp_base, CALG_RC4, h_base_md5, 0, &mut h_base_rc4), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_base_rc4, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 40);
+            let mut base_salt = [0xAAu8; 16];
+            let mut base_slen = 16u32;
+            assert_eq!(CryptGetKeyParam(h_base_rc4, KP_SALT, base_salt.as_mut_ptr(), &mut base_slen, 0), TRUE);
+            assert_eq!(base_slen, 11);
+            assert_eq!(&base_salt[..11], &[0u8; 11]);
+            assert_eq!(CryptDestroyKey(h_base_rc4), TRUE);
+            assert_eq!(CryptDestroyHash(h_base_md5), TRUE);
+
+            let mut hp_enh_v = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp_enh_v, std::ptr::null(), csp_enh.as_ptr(), 1, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_enh_rc4_gen = 0usize;
+            assert_eq!(CryptGenKey(hp_enh_v, CALG_RC4, 0, &mut h_enh_rc4_gen), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_enh_rc4_gen, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 128);
+            assert_eq!(CryptDestroyKey(h_enh_rc4_gen), TRUE);
+
+            // Enhanced CSP defaults RC2 effective key length to 40 bits (backward compatibility) even for 128-bit keys
+            let mut h_enh_rc2_gen = 0usize;
+            assert_eq!(CryptGenKey(hp_enh_v, CALG_RC2, 0, &mut h_enh_rc2_gen), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_enh_rc2_gen, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 128);
+            let mut eff_bits = 0u32;
+            let mut eblen = 4u32;
+            assert_eq!(
+                CryptGetKeyParam(h_enh_rc2_gen, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 40);
+            assert_eq!(CryptDestroyKey(h_enh_rc2_gen), TRUE);
+
+            // Importing a 128-bit RC2 key into Enhanced CSP also defaults KP_EFFECTIVE_KEYLEN to 40,
+            // while Strong CSP defaults KP_EFFECTIVE_KEYLEN to 128, producing distinct ciphertext until raised.
+            let mut rc2_pt_blob = Vec::with_capacity(28);
+            rc2_pt_blob.extend_from_slice(&[PLAINTEXTKEYBLOB as u8, CUR_BLOB_VERSION, 0, 0]);
+            rc2_pt_blob.extend_from_slice(&CALG_RC2.to_le_bytes());
+            rc2_pt_blob.extend_from_slice(&16u32.to_le_bytes());
+            rc2_pt_blob.extend_from_slice(&[0x11u8; 16]);
+            let mut h_enh_rc2_imp = 0usize;
+            assert_eq!(
+                CryptImportKey(hp_enh_v, rc2_pt_blob.as_ptr(), rc2_pt_blob.len() as u32, 0, 0, &mut h_enh_rc2_imp),
+                TRUE,
+            );
+            eblen = 4;
+            assert_eq!(
+                CryptGetKeyParam(h_enh_rc2_imp, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 40);
+            let mut enh_ct = [0u8; 16];
+            enh_ct[..8].copy_from_slice(b"12345678");
+            let mut enh_ct_len = 8u32;
+            assert_eq!(CryptEncrypt(h_enh_rc2_imp, 0, TRUE, 0, enh_ct.as_mut_ptr(), &mut enh_ct_len, 16), TRUE);
+
+            let mut hp_strong_v = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp_strong_v, std::ptr::null(), std::ptr::null(), 1, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_strong_rc2_imp = 0usize;
+            assert_eq!(
+                CryptImportKey(hp_strong_v, rc2_pt_blob.as_ptr(), rc2_pt_blob.len() as u32, 0, 0, &mut h_strong_rc2_imp),
+                TRUE,
+            );
+            eblen = 4;
+            assert_eq!(
+                CryptGetKeyParam(h_strong_rc2_imp, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 128);
+            let mut strong_ct = [0u8; 16];
+            strong_ct[..8].copy_from_slice(b"12345678");
+            let mut strong_ct_len = 8u32;
+            assert_eq!(CryptEncrypt(h_strong_rc2_imp, 0, TRUE, 0, strong_ct.as_mut_ptr(), &mut strong_ct_len, 16), TRUE);
+            assert_ne!(&enh_ct[..enh_ct_len as usize], &strong_ct[..strong_ct_len as usize]);
+
+            let eff_128 = 128u32;
+            assert_eq!(CryptSetKeyParam(h_enh_rc2_imp, KP_EFFECTIVE_KEYLEN, &eff_128 as *const u32 as *const u8, 0), TRUE);
+            let mut enh_ct_128 = [0u8; 16];
+            enh_ct_128[..8].copy_from_slice(b"12345678");
+            let mut enh_ct_128_len = 8u32;
+            assert_eq!(CryptEncrypt(h_enh_rc2_imp, 0, TRUE, 0, enh_ct_128.as_mut_ptr(), &mut enh_ct_128_len, 16), TRUE);
+            assert_eq!(&enh_ct_128[..enh_ct_128_len as usize], &strong_ct[..strong_ct_len as usize]);
+
+            assert_eq!(CryptDestroyKey(h_strong_rc2_imp), TRUE);
+            assert_eq!(CryptReleaseContext(hp_strong_v, 0), TRUE);
+            assert_eq!(CryptDestroyKey(h_enh_rc2_imp), TRUE);
+            assert_eq!(CryptReleaseContext(hp_enh_v, 0), TRUE);
+
+            assert_eq!(CryptReleaseContext(hp_base, 0), TRUE);
+            assert_eq!(CryptAcquireContextW(&mut hp_base, shared_cname.as_ptr(), csp_base.as_ptr(), 1, CRYPT_DELETEKEYSET), TRUE);
 
             match prev_home {
                 Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
