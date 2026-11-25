@@ -675,6 +675,187 @@ fn cert_open_store_system_and_find_all_types() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_trust_settings_preserves_application_key_usage_and_error_constraints() {
+    use super::chain::apple_trust::{classify_trust_settings_array, TrustSettingDecision};
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFAllocatorDefault: *const c_void;
+        static kCFTypeArrayCallBacks: c_void;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        fn CFRelease(cf: *const c_void);
+        fn CFArrayCreate(
+            allocator: *const c_void,
+            values: *const *const c_void,
+            num_values: isize,
+            callbacks: *const u8,
+        ) -> *const c_void;
+        fn CFDictionaryCreate(
+            allocator: *const c_void,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            num_values: isize,
+            key_callbacks: *const u8,
+            value_callbacks: *const u8,
+        ) -> *const c_void;
+        fn CFNumberCreate(
+            allocator: *const c_void,
+            the_type: isize,
+            value_ptr: *const c_void,
+        ) -> *const c_void;
+        fn CFStringCreateWithBytes(
+            alloc: *const c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> *const c_void;
+    }
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: isize = 3;
+
+    unsafe {
+        let cf_str = |s: &str| -> *const c_void {
+            CFStringCreateWithBytes(
+                kCFAllocatorDefault,
+                s.as_ptr(),
+                s.len() as isize,
+                K_CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        };
+        let cf_i32 = |v: i32| -> *const c_void {
+            CFNumberCreate(
+                kCFAllocatorDefault,
+                K_CF_NUMBER_SINT32_TYPE,
+                &v as *const i32 as *const c_void,
+            )
+        };
+        let classify_single_dict = |pairs: &[(&str, *const c_void)]| -> TrustSettingDecision {
+            let mut ks = Vec::with_capacity(pairs.len());
+            let mut vs = Vec::with_capacity(pairs.len());
+            for &(k, v) in pairs {
+                ks.push(cf_str(k));
+                vs.push(v);
+            }
+            let dict = CFDictionaryCreate(
+                kCFAllocatorDefault,
+                ks.as_ptr(),
+                vs.as_ptr(),
+                pairs.len() as isize,
+                std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks) as *const u8,
+                std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks) as *const u8,
+            );
+            let arr = CFArrayCreate(
+                kCFAllocatorDefault,
+                &dict,
+                1,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+            );
+            let res = classify_trust_settings_array(arr);
+            CFRelease(arr);
+            CFRelease(dict);
+            for k in ks {
+                CFRelease(k);
+            }
+            res
+        };
+
+        // Empty array -> unconditional Always Trust
+        let empty_arr = CFArrayCreate(
+            kCFAllocatorDefault,
+            std::ptr::null(),
+            0,
+            std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+        );
+        assert_eq!(
+            classify_trust_settings_array(empty_arr),
+            TrustSettingDecision::UnconditionalTrustRoot
+        );
+        CFRelease(empty_arr);
+
+        let n_trust_root = cf_i32(1);
+        let n_trust_as_root = cf_i32(2);
+        let n_deny = cf_i32(3);
+        let n_key_use_any = cf_i32(-1);
+        let n_key_use_sig = cf_i32(1);
+        let n_allowed_err = cf_i32(-2147408880);
+        let s_dummy = cf_str("com.example.app");
+
+        // Unconstrained TrustRoot / TrustAsRoot / Deny / KeyUseAny
+        assert_eq!(
+            classify_single_dict(&[("kSecTrustSettingsResult", n_trust_root)]),
+            TrustSettingDecision::UnconditionalTrustRoot
+        );
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_trust_as_root),
+                ("kSecTrustSettingsKeyUsage", n_key_use_any),
+            ]),
+            TrustSettingDecision::UnconditionalTrustRoot
+        );
+        assert_eq!(
+            classify_single_dict(&[("kSecTrustSettingsResult", n_deny)]),
+            TrustSettingDecision::Denied
+        );
+
+        // Constrained by Application, restrictive KeyUsage, Policy, PolicyString, or AllowedError
+        // MUST NOT be flattened into UnconditionalTrustRoot!
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_trust_root),
+                ("kSecTrustSettingsApplication", s_dummy),
+            ]),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        );
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_trust_root),
+                ("kSecTrustSettingsKeyUsage", n_key_use_sig),
+            ]),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        );
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_trust_as_root),
+                ("kSecTrustSettingsAllowedError", n_allowed_err),
+            ]),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        );
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_trust_root),
+                ("kSecTrustSettingsPolicyString", s_dummy),
+            ]),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        );
+        // Application-scoped Deny must not unconditionally deny across all apps either
+        assert_eq!(
+            classify_single_dict(&[
+                ("kSecTrustSettingsResult", n_deny),
+                ("kSecTrustSettingsApplication", s_dummy),
+            ]),
+            TrustSettingDecision::PolicyRestrictedOrUnspecified
+        );
+
+        for obj in [
+            n_trust_root,
+            n_trust_as_root,
+            n_deny,
+            n_key_use_any,
+            n_key_use_sig,
+            n_allowed_err,
+            s_dummy,
+        ] {
+            CFRelease(obj);
+        }
+    }
+}
+
 #[test]
 fn cert_chain_revocation_flags_fail_closed_and_respect_ignore_flags() {
     use super::chain::{CRYPT_E_REVOCATION_OFFLINE, CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG};

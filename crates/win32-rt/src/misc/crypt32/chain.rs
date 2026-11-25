@@ -38,7 +38,7 @@ const BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG: u32 = 0x4000_0000;
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-mod apple_trust {
+pub(super) mod apple_trust {
     use std::ffi::c_void;
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -62,6 +62,8 @@ mod apple_trust {
         #[cfg(target_os = "macos")]
         fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
         fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+        #[cfg(target_os = "macos")]
+        fn CFDictionaryGetCount(the_dict: *const c_void) -> isize;
         fn CFBooleanGetValue(boolean: *const c_void) -> u8;
         #[cfg(target_os = "macos")]
         fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> u8;
@@ -146,37 +148,40 @@ mod apple_trust {
     }
 
     #[cfg(target_os = "macos")]
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum TrustSettingDecision {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum TrustSettingDecision {
         NotSet,
         UnconditionalTrustRoot,
         Denied,
         PolicyRestrictedOrUnspecified,
     }
 
-    /// Inspect macOS `SecTrustSettingsCopyTrustSettings` for a single certificate in `domain`.
-    /// Per Apple's Trust Settings specification:
+    /// Classify a macOS `SecTrustSettings` `CFArrayRef` of usage-constraint dictionaries.
+    /// Per Apple's `SecTrustSettings.h` specification, ALL specified usage-constraint components
+    /// (`kSecTrustSettingsPolicy`, `kSecTrustSettingsPolicyString`, `kSecTrustSettingsApplication`,
+    /// `kSecTrustSettingsKeyUsage`, `kSecTrustSettingsAllowedError`, or any unrecognized key) must
+    /// match for a rule to apply:
     /// - An empty `trustSettings` array means "Always Trust" unconditionally for all policies.
-    /// - `kSecTrustSettingsResult` == 1 (`TrustRoot`) or 2 (`TrustAsRoot`) with no
-    ///   `kSecTrustSettingsPolicy` restriction grants unconditional root trust.
-    /// - `kSecTrustSettingsResult` == 3 (`Deny`) with no policy restriction denies the cert
-    ///   unconditionally (even if present in the built-in System anchor list).
-    /// - Policy-scoped or `Unspecified` rules are NOT flattened into unrestricted anchors;
-    ///   `evaluate_sec_trust()` evaluates them with the real policy instead.
+    /// - A dictionary is unconditional ONLY when every entry in it is either `kSecTrustSettingsResult`
+    ///   or `kSecTrustSettingsKeyUsage == kSecTrustSettingsKeyUseAny` (`-1` / `0xFFFF_FFFF`).
+    /// - Any dictionary carrying `kSecTrustSettingsPolicy`, `kSecTrustSettingsPolicyString`,
+    ///   `kSecTrustSettingsApplication`, a restrictive `kSecTrustSettingsKeyUsage`,
+    ///   `kSecTrustSettingsAllowedError`, or any unknown constraint key is NOT flattened into
+    ///   unrestricted roots; `evaluate_sec_trust()` evaluates it with Apple's policy engine instead.
     #[cfg(target_os = "macos")]
-    unsafe fn inspect_trust_settings(cert: *const c_void, domain: u32) -> TrustSettingDecision {
+    pub(crate) unsafe fn classify_trust_settings_array(
+        settings: *const c_void,
+    ) -> TrustSettingDecision {
         const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
         const K_CF_NUMBER_SINT32_TYPE: isize = 3;
         const K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT: i32 = 1;
         const K_SEC_TRUST_SETTINGS_RESULT_TRUST_AS_ROOT: i32 = 2;
         const K_SEC_TRUST_SETTINGS_RESULT_DENY: i32 = 3;
+        const K_SEC_TRUST_SETTINGS_KEY_USE_ANY: i32 = -1; // 0xFFFF_FFFF
 
-        let mut settings: *const c_void = std::ptr::null();
-        if SecTrustSettingsCopyTrustSettings(cert, domain, &mut settings) != 0 || settings.is_null()
-        {
+        if settings.is_null() {
             return TrustSettingDecision::NotSet;
         }
-        let _sg = CfRef(settings);
         let count = CFArrayGetCount(settings);
         if count == 0 {
             return TrustSettingDecision::UnconditionalTrustRoot;
@@ -190,22 +195,17 @@ mod apple_trust {
             0,
         );
         let _krg = CfRef(k_result);
-        let k_policy = CFStringCreateWithBytes(
+        let k_key_usage = CFStringCreateWithBytes(
             kCFAllocatorDefault,
-            b"kSecTrustSettingsPolicy".as_ptr(),
-            23,
+            b"kSecTrustSettingsKeyUsage".as_ptr(),
+            25,
             K_CF_STRING_ENCODING_UTF8,
             0,
         );
-        let _kpg = CfRef(k_policy);
-        let k_policy_str = CFStringCreateWithBytes(
-            kCFAllocatorDefault,
-            b"kSecTrustSettingsPolicyString".as_ptr(),
-            29,
-            K_CF_STRING_ENCODING_UTF8,
-            0,
-        );
-        let _kpsg = CfRef(k_policy_str);
+        let _kkug = CfRef(k_key_usage);
+        if k_result.is_null() || k_key_usage.is_null() {
+            return TrustSettingDecision::PolicyRestrictedOrUnspecified;
+        }
 
         let mut saw_unconditional_trust = false;
         for i in 0..count {
@@ -213,25 +213,46 @@ mod apple_trust {
             if dict.is_null() {
                 continue;
             }
-            let has_policy = (!k_policy.is_null() && !CFDictionaryGetValue(dict, k_policy).is_null())
-                || (!k_policy_str.is_null()
-                    && !CFDictionaryGetValue(dict, k_policy_str).is_null());
-            let mut result_val: i32 = K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT;
-            if !k_result.is_null() {
-                let num = CFDictionaryGetValue(dict, k_result);
-                if !num.is_null() {
-                    let mut v: i32 = 0;
-                    if CFNumberGetValue(
-                        num,
-                        K_CF_NUMBER_SINT32_TYPE,
-                        &mut v as *mut i32 as *mut c_void,
-                    ) != 0
-                    {
-                        result_val = v;
-                    }
+            let total_keys = CFDictionaryGetCount(dict);
+            let mut unconstrained_keys: isize = 0;
+
+            let result_num = CFDictionaryGetValue(dict, k_result);
+            let result_val: i32 = if !result_num.is_null() {
+                unconstrained_keys += 1;
+                let mut v: i32 = 0;
+                if CFNumberGetValue(
+                    result_num,
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &mut v as *mut i32 as *mut c_void,
+                ) != 0
+                {
+                    v
+                } else {
+                    0 // malformed kSecTrustSettingsResult -> do not default to TrustRoot
+                }
+            } else {
+                K_SEC_TRUST_SETTINGS_RESULT_TRUST_ROOT
+            };
+
+            let ku_num = CFDictionaryGetValue(dict, k_key_usage);
+            if !ku_num.is_null() {
+                let mut ku: i32 = 0;
+                if CFNumberGetValue(
+                    ku_num,
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &mut ku as *mut i32 as *mut c_void,
+                ) != 0
+                    && ku == K_SEC_TRUST_SETTINGS_KEY_USE_ANY
+                {
+                    unconstrained_keys += 1;
                 }
             }
-            if !has_policy {
+
+            // If ANY other key is present (kSecTrustSettingsPolicy, kSecTrustSettingsPolicyString,
+            // kSecTrustSettingsApplication, kSecTrustSettingsAllowedError, restrictive
+            // kSecTrustSettingsKeyUsage, or any future constraint key), total_keys > unconstrained_keys
+            // and this rule is NOT unconditional.
+            if total_keys == unconstrained_keys {
                 if result_val == K_SEC_TRUST_SETTINGS_RESULT_DENY {
                     return TrustSettingDecision::Denied;
                 }
@@ -247,6 +268,17 @@ mod apple_trust {
         } else {
             TrustSettingDecision::PolicyRestrictedOrUnspecified
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn inspect_trust_settings(cert: *const c_void, domain: u32) -> TrustSettingDecision {
+        let mut settings: *const c_void = std::ptr::null();
+        if SecTrustSettingsCopyTrustSettings(cert, domain, &mut settings) != 0 || settings.is_null()
+        {
+            return TrustSettingDecision::NotSet;
+        }
+        let _sg = CfRef(settings);
+        classify_trust_settings_array(settings)
     }
 
     /// Copy unconditionally trusted root certificates from the macOS System/Admin/User trust
