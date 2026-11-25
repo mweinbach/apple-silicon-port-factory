@@ -1115,6 +1115,54 @@ fn extract_ptr_target_ident(ptr_expr: &str) -> Option<&str> {
     (!ident.is_empty()).then_some(ident)
 }
 
+/// Link targets used by the Win32 catalog. Direct functions and stub-generating macros
+/// use the same scanner as win32-sync. CRT macros and public re-exports also declare
+/// functions; the export table itself only references them.
+pub(crate) fn catalog_rust_items(src: &str) -> BTreeSet<String> {
+    let mut items: BTreeSet<_> = analyze_file_impl_kinds(src).into_keys().collect();
+    let mask = mask_non_code(src);
+    let code = std::str::from_utf8(&mask).unwrap_or("");
+    let add_names = |items: &mut BTreeSet<String>, list: &str| {
+        items.extend(
+            list.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+        );
+    };
+    let mut offset = 0;
+    for line in code.split_inclusive('\n') {
+        let rest = &code[offset..];
+        offset += line.len();
+        if line.starts_with("pub use ") {
+            if let Some((list, _)) = rest.split_once(';') {
+                add_names(&mut items, list);
+            }
+        } else if let Some((name, args)) = line.split_once('!') {
+            if name.is_empty()
+                || !name.bytes().all(is_ident_byte)
+                || matches!(name, "exports" | "macro_rules")
+            {
+                continue;
+            }
+            let open = name.len() + 1 + (args.len() - args.trim_start().len());
+            let Some(&delim) = rest.as_bytes().get(open) else {
+                continue;
+            };
+            let close = match delim {
+                b'(' => b')',
+                b'{' => b'}',
+                b'[' => b']',
+                _ => continue,
+            };
+            if let Some(end) = find_matching_delim(rest.as_bytes(), open, delim, close) {
+                add_names(&mut items, &rest[open + 1..end]);
+            }
+        }
+    }
+    items.extend(extra_exports(src).map(|(sym, _)| format!("EXTRA_EXPORTS[{sym}]")));
+    items
+}
+
 fn scan_dll_table(
     workspace_root: &Path,
     src_root: &Path,
@@ -1339,46 +1387,40 @@ fn scan_extra_exports_and_ordinals(
         }
     }
 
-    // Parse `Export { name: "...", ptr: ... }` inside `pub static EXTRA_EXPORTS: &[...] = &[ ... ];`.
-    // Anchor on the `static EXTRA_EXPORTS` declaration and split after `=` so comments or
-    // earlier code referencing `EXTRA_EXPORTS` never shadow the table.
-    let extra_after = src
-        .split_once("pub static EXTRA_EXPORTS")
-        .or_else(|| src.split_once("static EXTRA_EXPORTS"))
-        .map(|(_, after)| after);
-    if let Some(after) = extra_after {
-        let init = after.split_once('=').map(|(_, rhs)| rhs).unwrap_or(after);
-        let body = init
-            .split_once("&[")
-            .and_then(|(_, b)| b.split_once("];"))
-            .map(|(b, _)| b)
-            .unwrap_or(init);
-        for part in body.split("name:") {
-            let trimmed = part.trim_start();
-            if let Some(rest) = trimmed.strip_prefix('"') {
-                if let Some((sym, after_sym)) = rest.split_once('"') {
-                    if !sym.is_empty()
-                        && !out.iter().any(|e| e.dll == dll_name && e.symbol == sym)
-                    {
-                        let impl_kind = after_sym
-                            .split_once("ptr:")
-                            .and_then(|(_, ptr_tail)| extract_ptr_target_ident(ptr_tail))
-                            .and_then(|ident| file_kinds.get(ident).copied())
-                            .unwrap_or(ImplKind::Real);
-                        out.push(Win32ApiEntry {
-                            dll: dll_name.to_string(),
-                            symbol: sym.to_string(),
-                            ordinal: None,
-                            category: cat,
-                            impl_kind,
-                            rust_path: format!("{mod_path}::EXTRA_EXPORTS[{sym}]"),
-                            source_file: rel_file.clone(),
-                        });
-                    }
-                }
-            }
+    for (sym, after_sym) in extra_exports(src) {
+        if !out.iter().any(|e| e.dll == dll_name && e.symbol == sym) {
+            let impl_kind = after_sym
+                .split_once("ptr:")
+                .and_then(|(_, ptr_tail)| extract_ptr_target_ident(ptr_tail))
+                .and_then(|ident| file_kinds.get(ident).copied())
+                .unwrap_or(ImplKind::Real);
+            out.push(Win32ApiEntry {
+                dll: dll_name.to_string(),
+                symbol: sym.to_string(),
+                ordinal: None,
+                category: cat,
+                impl_kind,
+                rust_path: format!("{mod_path}::EXTRA_EXPORTS[{sym}]"),
+                source_file: rel_file.clone(),
+            });
         }
     }
+}
+
+/// Literal name and pointer fields in the EXTRA_EXPORTS initializer.
+fn extra_exports(src: &str) -> impl Iterator<Item = (&str, &str)> {
+    let after = src
+        .split_once("pub static EXTRA_EXPORTS")
+        .or_else(|| src.split_once("static EXTRA_EXPORTS"))
+        .map_or("", |(_, after)| after);
+    let init = after.split_once('=').map_or(after, |(_, rhs)| rhs);
+    let body = init
+        .split_once("&[")
+        .and_then(|(_, b)| b.split_once("];"))
+        .map_or(init, |(body, _)| body);
+    body.split("name:")
+        .filter_map(|part| part.trim_start().strip_prefix('"')?.split_once('"'))
+        .filter(|(sym, _)| !sym.is_empty())
 }
 
 fn parse_ordinals(src: &str) -> Vec<(u16, String)> {

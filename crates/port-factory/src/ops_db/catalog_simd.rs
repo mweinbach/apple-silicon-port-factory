@@ -19,7 +19,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "ldr/str q0, [xa] | ins v0.s[0], v1.s[0] | ins v0.d[0], v1.d[0] | dup v0.2d, v1.d[0]",
                 semantics: "Legacy SSE preserves YMM bits [255:128]; VEX.128 zeroes YMM upper 128b; VEX.256 processes both 128b lanes",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 160,
             },
             OpRecord {
@@ -35,7 +35,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "fmov s0/d0, wn/xn | umov wn/xn, v0.b/h/s/d[lane] | ins v0.b/h/s/d[lane], wn/xn | ushr+ushl+addv for movmsk",
                 semantics: "Zero-latency GPR<->NEON lane transfers, sign-bit mask extraction, and YMM upper-half zeroing",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 128,
             },
             OpRecord {
@@ -51,7 +51,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "dup v0.16b/8h/4s/2d, v1.b/h/s/d[0] | sxtl/uxtl v0.8h/4s/2d, v1.8b/4h/2s",
                 semantics: "128-bit and 256-bit element broadcasts and chained NEON sxtl/uxtl lane widening",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_ext.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ext.rs",
                 verified_vectors: 112,
             },
             // ---- SIMD Bitwise Logic, Test & Blends (K_37, K_106..=K_109) ----
@@ -68,7 +68,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "eor/orr/and v0.16b, v1.16b, v2.16b | bic v0.16b, v2.16b, v1.16b (for pandn !a & b)",
                 semantics: "Note operand order reversal on PANDN/ANDNPS -> ARM64 BIC; PTEST sets ZF=(a&b)==0, CF=(!a&b)==0",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 112,
             },
             OpRecord {
@@ -84,7 +84,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "zip1/zip2 | sqxtn+sqxtn2 / sqxtun+sqxtun2 | tbl v0.16b, {v1.16b}, v2.16b | ext v0.16b, v1.16b, v2.16b, #imm | sshr+bsl",
                 semantics: "PSHUFB bit 7 zero-masking mapped via BIC+TBL; saturating pack via NEON sqxtn/sqxtun/uqxtn",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 220,
             },
             // ---- SIMD Shifts (K_37, K_39) ----
@@ -101,7 +101,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "ushr/sshr/shl v0, v1, #imm | ext v0.16b, v1.16b, v_zero, #imm | ushl/sshl v0, v1, v_signed_cnt",
                 semantics: "x86 shift counts >= lane width zero (or sign-fill for psraw/psrad) via saturating count clamp before NEON ushl/sshl",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 144,
             },
             // ---- SIMD Integer Arithmetic, Multiply, Min/Max & Compares (K_39..=K_40) ----
@@ -118,7 +118,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "add/sub | sqadd/uqadd/sqsub/uqsub | addp | uzp1+uzp2+sub | abs",
                 semantics: "1:1 NEON lane-wise wrapping & signed/unsigned saturating arithmetic across 8/16/32/64-bit lanes",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 160,
             },
             OpRecord {
@@ -134,7 +134,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "mul | smull+smull2+uzp2 | umull | smin/smax/umin/umax | urhadd | uabdl+uaddlv",
                 semantics: "Widening NEON multiplies + uzp2/addp for high-half products and horizontal multiply-accumulate",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 180,
             },
             OpRecord {
@@ -150,7 +150,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "cmeq/cmgt v0.16b/8h/4s/2d, v1, v2",
                 semantics: "Produces all-1s (0xFF..FF) or all-0s per lane matching NEON cmeq/cmgt directly",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 96,
             },
             // ---- SIMD Floating-Point Scalar, Packed, Conversions & FMA (K_41..=K_42, K_46..=K_51, K_103..=K_105) ----
@@ -167,7 +167,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "fadd/fsub/fmul/fdiv/fsqrt s0/d0 + ins v_dst.s[0]/d[0] | fcmp+bsl for x86 minss/maxss NaN/signed-zero rules",
                 semantics: "Preserves bits [127:32] (ss) or [127:64] (sd) of first source; minss/maxss returns second operand on NaN or -0/+0",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 180,
             },
             OpRecord {
@@ -183,7 +183,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "fadd/fsub/fmul/fdiv/fsqrt v0.4s/2d | fcmgt+bsl for min/max | frintn/m/p/z | faddp | fcmeq/fcmgt",
                 semantics: "128-bit and 256-bit (dual-128b NEON) packed float/double ops with all 32 AVX comparison predicates",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_vec.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/vec.rs",
                 verified_vectors: 240,
             },
             OpRecord {
@@ -199,7 +199,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "scvtf | frintn/frintz + fcvtzs + overflow->0x80000000_00000000 check | fcmp + unordered ZF=PF=CF=1",
                 semantics: "Maps out-of-range/NaN float->int to x86 integer indefinite (INT32_MIN/INT64_MIN) instead of ARM64 saturation",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ops.rs",
                 verified_vectors: 160,
             },
             OpRecord {
@@ -215,7 +215,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "fmadd s0/d0, s1, s2, s3 | fmla v0.4s/2d, v1.4s/2d, v2.4s/2d (with fneg on negated terms)",
                 semantics: "Single-rounding IEEE-754 fused multiply-add across all 72 FMA3 mnemonics; scalar forms preserve upper bits of dst",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_ext.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ext.rs",
                 verified_vectors: 144,
             },
             OpRecord {
@@ -231,9 +231,11 @@ macro_rules! simd_ops {
                 arm64_pattern: "Two-register NEON (lo=v_lo, hi=v_hi) cross-lane tbl / ins / movi",
                 semantics: "Cross-128-bit lane permutations, 128-bit lane insertion/extraction, and full YMM0..15 zeroing",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_ext.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/ext.rs",
                 verified_vectors: 80,
             },
+            // No gather lowering exists yet. The source points at the unimplemented
+            // dispatch reached by these mnemonics; see the catalog caveat in STATUS.
             OpRecord {
                 id: "AVX2_GATHER",
                 fast_kind_id: 113,
@@ -247,7 +249,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "Per-lane mask sign-bit test + indexed guest load + clear mask register",
                 semantics: "Conditionally gathers 32/64-bit elements using VSIB vector index and zeroes mask register upon completion",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/interp.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -263,7 +265,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "aese+aesmc+eor (x86 AES round = ShiftRows+SubBytes+MixColumns+AddRoundKey) | pmull | fcvtl/fcvtn",
                 semantics: "Pairs ARM64 aese(v,0)+aesmc(v)^rk to match x86 aesenc single-round semantics; CLMUL, F16C & SSE4.2 string compare",
                 tier: TranslationTier::JitArm64,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/more.rs",
                 verified_vectors: 96,
             },
             OpRecord {
@@ -279,7 +281,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "rev64+ext+sha1c/sha1p/sha1m/sha1su1 | zip+sha256h+sha256h2 / sha256su0 / sha256su1",
                 semantics: "Hardware ARMv8 FEAT_SHA1/FEAT_SHA256 lowering for all 7 Intel SHA-NI ops; preserves YMM[255:128]; CPUID leaf 7 EBX bit 29 enabled",
                 tier: TranslationTier::JitArm64,
-                source_file: "crates/x86-runtime/src/emu/jit_more.rs",
+                source_file: "crates/x86-runtime/src/emu/jit/more.rs",
                 verified_vectors: 64,
             },
             OpRecord {
@@ -311,7 +313,7 @@ macro_rules! simd_ops {
                 arm64_pattern: "Block terminator / padding boundary",
                 semantics: "Ends basic block decoding; int3 padding and embedded jump-table bytes between functions are never executed as linear instructions",
                 tier: TranslationTier::TrapOrBoundary,
-                source_file: "games/alan-wake-2/crates/aw2-game/src/emu/mod.rs",
+                source_file: "crates/x86-runtime/src/emu/interp.rs",
                 verified_vectors: 8,
             },
         ]
