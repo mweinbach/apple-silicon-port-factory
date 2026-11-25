@@ -56,62 +56,29 @@ tracked in [docs/TODOS.md](TODOS.md).
   `port-runner` + `game.toml` to flush out real-world Win32, CRT, COM, JIT, and GPU assumptions
   that unit tests cannot catch.
 
-### Direct3D 11 completeness (`crates/win32-rt/src/d3d11/`)
-Our new D3D11-on-Metal 4 runtime passes 10 unit/GPU tests (including SM 5.0 compute + VS/PS draw),
-but several methods used by real D3D11 games are still honest stubs (`E_NOTIMPL` / `stub!`):
-- `ID3D11DeviceContext::GenerateMips`
-- Indirect draws & dispatches (`DrawInstancedIndirect`, `DrawIndexedInstancedIndirect`,
-  `DispatchIndirect`, `CopyStructureCount`, `DrawAuto`)
-- `IDXGISurface::Map` / `IDXGISurface1::GetDC` and `OpenSharedResource*` (used by video/UI
-  interop layers)
-- Geometry / Hull / Domain shader stages (if target D3D11 games require them; Metal has no native
-  GS, so any GS support would require mesh/compute lowering or an explicit compatibility boundary)
-- Real-game edge cases: cubemaps, 2D texture arrays, depth-stencil readback, dynamic constant
-  buffer ring pressure, and pipeline statistics queries.
+### Graphics on shipping games
 
-### Vulkan live verification (`crates/win32-rt/src/misc/vulkan_1.rs`)
-- Unit tests and mock-dylib E2E tests pass, but `vulkan_1.rs` still needs **live validation against
-  real `libMoltenVK.dylib`** running a real Windows Vulkan binary (surface creation, swapchain
-  recreation on window resize, dynamic device proc dispatch through `x86-runtime`, and LunarG
-  validation layers).
+- Validate D3D11 mip generation, indirect draws, geometry shaders, depth readback and shared
+  resources on another engine. `DrawAuto` and hull/domain shader creation still have explicit
+  stub paths. The fixture and unit coverage is recorded in [Status](STATUS.md).
+- The Vulkan guest fixture presents and resizes on live MoltenVK. Exercise the same path with
+  a shipping Vulkan title.
+- Check D3D12 barrier and residency behavior on a non-Northlight engine. Spatial MetalFX has
+  run in gameplay. Temporal MetalFX needs validation with a shipping game's depth, motion
+  vectors and jitter.
 
-### D3D12 & MetalFX (`crates/d3d12-metal/`)
-- `MTL4FXSpatialScaler` is live-verified on Metal 4 GPU tests, and needs live in-game verification
-  across FSR / DLSS / XeSS upscale calls (frame pacing, HDR tonemap handoff, resize stability).
-- **Temporal MetalFX (`MTL4FXTemporalScaler`):** Not implemented yet; worth evaluating once
-  spatial scaling is proven in gameplay and we have clean depth + motion vector + jitter plumbing.
-- Multi-engine D3D12 barrier/residency validation on non-Northlight engines (UE5, Unity, Godot,
-  proprietary engines).
+### CPU and Win32 coverage
 
-### CPU execution & `.aot` precompilation (`crates/x86-runtime/`)
-- **Multi-threaded offline `.aot` prewarming:** Large `.exe` files with tens of thousands of
-  `.pdata` functions should prewarm quickly across Apple Silicon cores.
-- **Remaining interpreter-only instructions:** x87 floating-point and rare legacy/AVX2 ops still run
-  through `GENERIC_INTERP`; hot ones encountered in real games should move into `JIT_ARM64`.
-- **Switch/indirect jump-table discovery** during offline `.aot` prewarm so CFG closures cover
-  more blocks before first run without waiting for a runtime profile.
-- **Dynamic codegen / JIT-ed guest runtimes** (Mono, CoreCLR, V8, LuaJIT): need clean detection and
-  explicit policy (`v8_jitless`, `.NET` ReadyToRun stripping, or honest W^X handling).
+- Use profiles from the next offline game to find gaps in parallel AOT prewarming, indirect
+  control flow and interpreter fallbacks. A catalog family can contain an unsupported form.
+- Exercise the APIs the game actually imports, including COM calls resolved at runtime.
+  Static implementation kinds and stub sites are starting points for guest conformance tests.
+- Validate dynamically generated guest code and its memory permissions on managed runtimes.
+  For audio capture, the current WASAPI endpoint supplies paced silent packets.
 
-### Win32, Input & Middleware (`crates/win32-rt/`)
-- **Missing exports uncovered by new games:** Networking (`winhttp`, `wininet`, `ws2_32` edge
-  cases), media (`mfplat` / `mfreadwrite`), `dinput8` real gamepad enumeration (currently returns
-  zero devices; fine for XInput games, needed for older DirectInput-only titles), Steamworks
-  (`steam_api64.dll` runtime gaps), and COM/OLE interfaces used by launchers.
-- **Input & display polish:** Non-US keyboard layouts in `ToUnicode`, mixed-DPI multi-monitor
-  scaling, clipboard payload transfer, and DualSense USB audio-haptics container pairing.
-- **Audio capture endpoints:** WASAPI currently implements render endpoints only; games with voice
-  chat / mic probing may expect a capture endpoint (even if silent or CoreAudio-backed).
+### Packaging and gameplay
 
-### Packaging & distribution workflow (`crates/port-factory/`)
-- Bundle `libdxilconv.dylib` (when built) and `libmetalirconverter.dylib` automatically into
-  converted `.app` bundles under `Contents/Frameworks/` so double-clicked apps don't rely on
-  developer paths.
-- Run `port-factory steam-convert --format app` end-to-end on a real installed game and verify cold
-  launch from Finder.
-
-### Alan Wake 2 specific (`games/alan-wake-2/`)
-- Root-cause and fix the Cauldron Lake terrain/camera drop seen in Return 0: The Cult (logging
-  camera position/direction alongside player height and PhysX ground hits across movement input).
-- Finish the remaining small `wwise-audio` A3 parity items if needed for `AW2_AUDIO=native`
-  (bus `1134869537` gain offset, fade-in→fade-out handoff, Convolution Reverb IR media format).
+- Launch a shipping offline title from its bundle in Finder and verify gameplay and save/load.
+  The packager already stages the runner, worker and available converter libraries.
+- Complete Return 0 and Chapter 1 in Alan Wake 2 with the terrain fix and audio updates enabled.
+  [Ordered milestones](WHATS_NEXT.md)
