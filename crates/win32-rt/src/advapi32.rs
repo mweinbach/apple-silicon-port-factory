@@ -3120,6 +3120,15 @@ const CRYPT_MODE_CFB: u32 = 4;
 const PKCS5_PADDING: u32 = 1;
 const ZERO_PADDING: u32 = 3;
 
+const CRYPT_ENCRYPT: u32 = 0x0000_0001;
+const CRYPT_DECRYPT: u32 = 0x0000_0002;
+const CRYPT_EXPORT: u32 = 0x0000_0004;
+const CRYPT_READ: u32 = 0x0000_0008;
+const CRYPT_WRITE: u32 = 0x0000_0010;
+const CRYPT_MAC: u32 = 0x0000_0020;
+const CRYPT_EXPORT_KEY: u32 = 0x0000_0040;
+const CRYPT_IMPORT_KEY: u32 = 0x0000_0080;
+
 const CRYPT_EXPORTABLE: u32 = 0x0000_0001;
 const CRYPT_NOHASHOID: u32 = 0x0000_0001;
 const CRYPT_OAEP: u32 = 0x0000_0040;
@@ -3152,6 +3161,7 @@ const NTE_BAD_TYPE: u32 = 0x8009_000A;
 const NTE_BAD_KEY_STATE: u32 = 0x8009_000B;
 const NTE_NO_KEY: u32 = 0x8009_000D;
 const NTE_EXISTS: u32 = 0x8009_000F;
+const NTE_PERM: u32 = 0x8009_0010;
 const NTE_BAD_KEYSET: u32 = 0x8009_0016;
 const NTE_FAIL: u32 = 0x8009_0020;
 
@@ -3283,6 +3293,62 @@ fn capi_valid_sym_key_len(alg_id: u32, sym_alg: SymAlg, cb_key: usize) -> bool {
     }
 }
 
+fn capi_default_permissions(exportable: bool) -> u32 {
+    let base = CRYPT_ENCRYPT
+        | CRYPT_DECRYPT
+        | CRYPT_READ
+        | CRYPT_WRITE
+        | CRYPT_MAC
+        | CRYPT_EXPORT_KEY
+        | CRYPT_IMPORT_KEY;
+    if exportable { base | CRYPT_EXPORT } else { base }
+}
+
+fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<Vec<u8>, u32> {
+    let required = if encrypt {
+        CRYPT_ENCRYPT | CRYPT_EXPORT_KEY
+    } else {
+        CRYPT_DECRYPT | CRYPT_IMPORT_KEY
+    };
+    if (sym_key.permissions & required) != required {
+        return Err(NTE_PERM);
+    }
+    let CapiKeyMaterial::Symmetric {
+        alg,
+        key,
+        mode,
+        padding,
+        effective_key_len,
+        iv,
+        msg_block_len,
+        ..
+    } = &sym_key.material
+    else {
+        return Err(NTE_BAD_KEY);
+    };
+    if *alg == SymAlg::Rc4 {
+        return Ok(Rc4State::new(key).apply(data));
+    }
+    let bs = alg.block_size();
+    let use_pkcs7 = *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
+    if *mode != BcCipherMode::Cfb && (!encrypt || !use_pkcs7) && data.len() % bs != 0 {
+        return Err(NTE_BAD_DATA);
+    }
+    let mut iv_work = iv.clone();
+    crate::misc::bcrypt::sym_crypt_block_mode(
+        *alg,
+        *mode,
+        encrypt,
+        use_pkcs7,
+        key,
+        *effective_key_len,
+        &mut iv_work,
+        *msg_block_len as usize,
+        data,
+    )
+    .map_err(|_| NTE_BAD_DATA)
+}
+
 fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> CapiKey {
     let bs = alg.block_size();
     let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
@@ -3291,7 +3357,7 @@ fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> Cap
     CapiKey {
         alg_id,
         exportable,
-        permissions: 0x3F,
+        permissions: capi_default_permissions(exportable),
         material: CapiKeyMaterial::Symmetric {
             alg,
             key,
@@ -3894,7 +3960,7 @@ pub unsafe extern "win64" fn CryptGenKey(
             CapiKey {
                 alg_id: canonical_alg,
                 exportable,
-                permissions: 0x3F,
+                permissions: capi_default_permissions(exportable),
                 material: CapiKeyMaterial::Rsa { key: rsa },
             },
         );
@@ -4060,7 +4126,7 @@ pub unsafe extern "win64" fn CryptGetUserKey(
         CapiKey {
             alg_id,
             exportable: stored.exportable,
-            permissions: 0x3F,
+            permissions: capi_default_permissions(stored.exportable),
             material: CapiKeyMaterial::Rsa { key: stored.key },
         },
     );
@@ -4109,6 +4175,9 @@ pub unsafe extern "win64" fn CryptGetKeyParam(
     let Some(k) = keys.get(&h_key) else {
         return err(NTE_BAD_KEY, FALSE);
     };
+    if (k.permissions & CRYPT_READ) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
     let bytes: Vec<u8> = match (dw_param, &k.material) {
         (KP_ALGID, _) => k.alg_id.to_le_bytes().to_vec(),
         (KP_PERMISSIONS, _) => k.permissions.to_le_bytes().to_vec(),
@@ -4160,8 +4229,16 @@ pub unsafe extern "win64" fn CryptSetKeyParam(
     let Some(k) = keys.get_mut(&h_key) else {
         return err(NTE_BAD_KEY, FALSE);
     };
+    if (k.permissions & CRYPT_WRITE) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
     if dw_param == KP_PERMISSIONS {
-        k.permissions = std::ptr::read_unaligned(pb_data as *const u32);
+        let new_perms = std::ptr::read_unaligned(pb_data as *const u32);
+        // Windows CAPI only permits restricting existing key permissions, never adding new ones.
+        if (new_perms & !k.permissions) != 0 {
+            return err(NTE_BAD_FLAGS, FALSE);
+        }
+        k.permissions = new_perms;
         return TRUE;
     }
     let CapiKeyMaterial::Symmetric {
@@ -4253,14 +4330,39 @@ pub unsafe extern "win64" fn CryptExportKey(
             if !k.exportable {
                 return err(NTE_BAD_KEY_STATE, FALSE);
             }
-            let Some(b) = key.to_capi_private_blob(k.alg_id) else {
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
+            }
+            let Some(plain) = key.to_capi_private_blob(k.alg_id) else {
                 return err(NTE_BAD_KEY_STATE, FALSE);
             };
-            b
+            if h_exp_key == 0 {
+                plain
+            } else {
+                let Some(exp_k) = keys.get(&h_exp_key) else {
+                    return err(NTE_BAD_KEY, FALSE);
+                };
+                // Per Microsoft Learn (Private Key BLOBs), when hExpKey != 0 everything after the
+                // 8-byte PUBLICKEYSTRUC/BLOBHEADER is encrypted with the wrapping session key.
+                let enc_body = match capi_wrap_sym_bytes(exp_k, true, &plain[8..]) {
+                    Ok(v) => v,
+                    Err(e) => return err(e, FALSE),
+                };
+                let mut out = Vec::with_capacity(8 + enc_body.len());
+                out.extend_from_slice(&plain[..8]);
+                out.extend_from_slice(&enc_body);
+                out
+            }
         }
         (PLAINTEXTKEYBLOB, CapiKeyMaterial::Symmetric { key, .. }) => {
+            if h_exp_key != 0 {
+                return err(NTE_BAD_KEY, FALSE);
+            }
             if !k.exportable {
                 return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
             }
             let mut out = Vec::with_capacity(12 + key.len());
             out.push(PLAINTEXTKEYBLOB as u8);
@@ -4275,9 +4377,15 @@ pub unsafe extern "win64" fn CryptExportKey(
             if !k.exportable {
                 return err(NTE_BAD_KEY_STATE, FALSE);
             }
+            if (k.permissions & CRYPT_EXPORT) == 0 {
+                return err(NTE_PERM, FALSE);
+            }
             let Some(exp_k) = keys.get(&h_exp_key) else {
                 return err(NTE_BAD_KEY, FALSE);
             };
+            if (exp_k.permissions & (CRYPT_ENCRYPT | CRYPT_EXPORT_KEY)) != (CRYPT_ENCRYPT | CRYPT_EXPORT_KEY) {
+                return err(NTE_PERM, FALSE);
+            }
             let CapiKeyMaterial::Rsa { key: ref rsa, .. } = exp_k.material else {
                 return err(NTE_BAD_KEY, FALSE);
             };
@@ -4343,19 +4451,40 @@ pub unsafe extern "win64" fn CryptImportKey(
 
     let capi_key = match b_type {
         PUBLICKEYBLOB | PRIVATEKEYBLOB => {
-            let Some((rsa, blob_alg, is_priv)) = RsaKey::from_capi_blob(blob) else {
+            let decrypted_storage: Vec<u8>;
+            let parse_slice = if b_type == PRIVATEKEYBLOB && h_pub_key != 0 {
+                let dec_body = {
+                    let keys = capi_keys().lock().unwrap();
+                    let Some(pk) = keys.get(&h_pub_key) else {
+                        return err(NTE_BAD_KEY, FALSE);
+                    };
+                    match capi_wrap_sym_bytes(pk, false, &blob[8..]) {
+                        Ok(v) => v,
+                        Err(e) => return err(e, FALSE),
+                    }
+                };
+                let mut combined = Vec::with_capacity(8 + dec_body.len());
+                combined.extend_from_slice(&blob[..8]);
+                combined.extend_from_slice(&dec_body);
+                decrypted_storage = combined;
+                decrypted_storage.as_slice()
+            } else {
+                blob
+            };
+            let Some((rsa, blob_alg, is_priv)) = RsaKey::from_capi_blob(parse_slice) else {
                 return err(NTE_BAD_DATA, FALSE);
             };
             let key_spec = if blob_alg == CALG_RSA_SIGN { AT_SIGNATURE } else { AT_KEYEXCHANGE };
             if is_priv {
                 if let Err(e) = store_container_user_key(h_prov, key_spec, rsa.clone(), exportable) {
-            return err(e, FALSE);
-        }
+                    return err(e, FALSE);
+                }
             }
+            let key_exportable = exportable || !is_priv;
             CapiKey {
                 alg_id: if blob_alg != 0 { blob_alg } else { CALG_RSA_KEYX },
-                exportable: exportable || !is_priv,
-                permissions: 0x3F,
+                exportable: key_exportable,
+                permissions: capi_default_permissions(key_exportable),
                 material: CapiKeyMaterial::Rsa { key: rsa },
             }
         }
@@ -4388,6 +4517,9 @@ pub unsafe extern "win64" fn CryptImportKey(
                 let Some(pk) = keys.get(&h_pub_key) else {
                     return err(NTE_BAD_KEY, FALSE);
                 };
+                if (pk.permissions & (CRYPT_DECRYPT | CRYPT_IMPORT_KEY)) != (CRYPT_DECRYPT | CRYPT_IMPORT_KEY) {
+                    return err(NTE_PERM, FALSE);
+                }
                 match &pk.material {
                     CapiKeyMaterial::Rsa { key, .. } => key.clone(),
                     _ => return err(NTE_BAD_KEY, FALSE),
@@ -4440,6 +4572,9 @@ pub unsafe extern "win64" fn CryptEncrypt(
     let Some(k) = keys.get_mut(&h_key) else {
         return err(NTE_BAD_KEY, FALSE);
     };
+    if (k.permissions & CRYPT_ENCRYPT) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
 
     match &mut k.material {
         CapiKeyMaterial::Rsa { key: rsa, .. } => {
@@ -4579,6 +4714,9 @@ pub unsafe extern "win64" fn CryptDecrypt(
     let Some(k) = keys.get_mut(&h_key) else {
         return err(NTE_BAD_KEY, FALSE);
     };
+    if (k.permissions & CRYPT_DECRYPT) == 0 {
+        return err(NTE_PERM, FALSE);
+    }
 
     let out = match &mut k.material {
         CapiKeyMaterial::Rsa { key: rsa, .. } => {
@@ -6725,6 +6863,82 @@ mod tests {
             assert_eq!(flen, 32);
             assert_eq!(CryptDecrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen), TRUE);
             assert_eq!(&full[..flen as usize], msg_pad);
+
+            // 4b. Encrypted PRIVATEKEYBLOB export/import with session wrapping key (hExpKey != 0)
+            let mut enc_priv_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, h_aes, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut enc_priv_len), TRUE);
+            assert!(enc_priv_len > priv_len, "CBC-encrypted PRIVATEKEYBLOB should include PKCS#5 padding");
+            let mut enc_priv_blob = vec![0u8; enc_priv_len as usize];
+            assert_eq!(CryptExportKey(h_keyx, h_aes, PRIVATEKEYBLOB, 0, enc_priv_blob.as_mut_ptr(), &mut enc_priv_len), TRUE);
+            assert_eq!(&enc_priv_blob[..8], &priv_blob[..8]);
+            assert_ne!(&enc_priv_blob[8..12], b"RSA2", "encrypted PRIVATEKEYBLOB body must not expose plaintext RSA2");
+            // Importing encrypted PRIVATEKEYBLOB without wrapping key or with wrong key must fail
+            let mut h_bad_priv = 0usize;
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, 0, 0, &mut h_bad_priv), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            let mut h_wrong_wrap = 0usize;
+            assert_eq!(CryptGenKey(hprov2, CALG_AES_128, 0, &mut h_wrong_wrap), TRUE);
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, h_wrong_wrap, 0, &mut h_bad_priv), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            assert_eq!(CryptDestroyKey(h_wrong_wrap), TRUE);
+            // Importing with matching wrapping key succeeds and decrypts ciphertext from original RSA key
+            let mut h_keyx_wrapped_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, enc_priv_blob.as_ptr(), enc_priv_len, h_aes, 0, &mut h_keyx_wrapped_imp), TRUE);
+            let mut wrap_ct = vec![0u8; 256];
+            wrap_ct[..13].copy_from_slice(b"wrapped priv!");
+            let mut wrap_len = 13u32;
+            assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, 0, wrap_ct.as_mut_ptr(), &mut wrap_len, 256), TRUE);
+            assert_eq!(CryptDecrypt(h_keyx_wrapped_imp, 0, TRUE, 0, wrap_ct.as_mut_ptr(), &mut wrap_len), TRUE);
+            assert_eq!(&wrap_ct[..wrap_len as usize], b"wrapped priv!");
+            assert_eq!(CryptDestroyKey(h_keyx_wrapped_imp), TRUE);
+            // Reject RSA key as hExpKey for PRIVATEKEYBLOB and nonzero hExpKey for PLAINTEXTKEYBLOB
+            let mut dummy_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, h_sign, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY);
+            assert_eq!(CryptExportKey(h_aes, h_keyx, PLAINTEXTKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY);
+
+            // 4c. KP_PERMISSIONS enforcement across export, decrypt, encrypt, read, write, and monotonic restriction
+            let mut h_perm = 0usize;
+            assert_eq!(CryptDuplicateKey(h_aes, std::ptr::null(), 0, &mut h_perm), TRUE);
+            let mut perms = 0u32;
+            let mut perms_len = 4u32;
+            assert_eq!(CryptGetKeyParam(h_perm, KP_PERMISSIONS, &mut perms as *mut u32 as *mut u8, &mut perms_len, 0), TRUE);
+            assert_ne!(perms & CRYPT_EXPORT, 0);
+            // Remove CRYPT_EXPORT -> PLAINTEXTKEYBLOB & SIMPLEBLOB export fail with NTE_PERM; cannot re-add
+            let no_export = perms & !CRYPT_EXPORT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_export as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptExportKey(h_perm, 0, PLAINTEXTKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptExportKey(h_perm, h_keyx, SIMPLEBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &perms as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            // Remove CRYPT_DECRYPT -> CryptEncrypt works, CryptDecrypt fails with NTE_PERM
+            let no_decrypt = no_export & !CRYPT_DECRYPT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_decrypt as *const u32 as *const u8, 0), TRUE);
+            let mut pbuf = vec![0u8; 32];
+            pbuf[..4].copy_from_slice(b"perm");
+            let mut plen = 4u32;
+            assert_eq!(CryptEncrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen, 32), TRUE);
+            assert_eq!(CryptDecrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            // Remove CRYPT_ENCRYPT -> CryptEncrypt and wrapping PRIVATEKEYBLOB fail with NTE_PERM
+            let no_encrypt = no_decrypt & !CRYPT_ENCRYPT;
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_encrypt as *const u32 as *const u8, 0), TRUE);
+            let mut plen2 = 4u32;
+            assert_eq!(CryptEncrypt(h_perm, 0, TRUE, 0, pbuf.as_mut_ptr(), &mut plen2, 32), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptExportKey(h_keyx, h_perm, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut dummy_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            // Remove CRYPT_READ and CRYPT_WRITE -> GetKeyParam & SetKeyParam fail with NTE_PERM
+            let no_rw = no_encrypt & !(CRYPT_READ | CRYPT_WRITE);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_rw as *const u32 as *const u8, 0), TRUE);
+            assert_eq!(CryptGetKeyParam(h_perm, KP_ALGID, &mut perms as *mut u32 as *mut u8, &mut perms_len, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptSetKeyParam(h_perm, KP_PERMISSIONS, &no_rw as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_PERM);
+            assert_eq!(CryptDestroyKey(h_perm), TRUE);
 
             // 5. CryptDeriveKey (SHA-256 -> direct truncation; SHA-1 -> 0x36/0x5C expansion)
             let mut h_pw = 0usize;
