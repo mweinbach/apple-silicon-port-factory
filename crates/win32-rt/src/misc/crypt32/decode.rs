@@ -275,7 +275,10 @@ fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerIte
     match item.tag {
         0x0C | 0x12 | 0x13 | 0x14 | 0x16 | 0x1A => {
             let s = String::from_utf8_lossy(item.val);
-            if unicode {
+            // Per MSDN CERT_RDN_ATTR: CERT_RDN_UTF8_STRING (0x0C) is ALWAYS decoded into
+            // 16-bit Unicode (UTF-16LE) characters (UTF-8 is only on the wire), even when
+            // decoded via X509_NAME or X509_ANY_STRING.
+            if unicode || item.tag == 0x0C {
                 let units: Vec<u16> = s.encode_utf16().collect();
                 let mut bytes = Vec::with_capacity(units.len() * 2 + 2);
                 for u in &units {

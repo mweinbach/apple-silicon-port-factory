@@ -1953,6 +1953,79 @@ const CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG: u32 = 0x0000_0001;
 const CERT_TRUST_HAS_WEAK_SIGNATURE: u32 = 0x0010_0000;
 const TRUST_E_CERT_SIGNATURE: u32 = 0x8009_6004;
 
+fn cert_signed_by_parts(child: &CertDerParts<'_>, parent: &CertDerParts<'_>) -> bool {
+    verify_cert_sig_with_spki(child, parent.spki_alg_inner, parent.spki_key_bits)
+        || verify_rsa_cert_sig_fallback(child, parent.spki_alg_inner, parent.spki_key_bits)
+}
+
+pub(crate) fn verify_cert_signed_by_der(child_der: &[u8], parent_der: &[u8]) -> bool {
+    match (parse_cert_der_parts(child_der), parse_cert_der_parts(parent_der)) {
+        (Some(c), Some(p)) => cert_signed_by_parts(&c, &p),
+        _ => false,
+    }
+}
+
+/// Resolve ONLY cryptographically signature-verified issuers `[leaf, intermediate..., optional_root]`
+/// for building `CERT_CHAIN_CONTEXT.rgpChain[0]->rgpElement`. Unrelated or unverified DN-only
+/// certificates from `hAdditionalStore` or PKCS#7 certificate bags are never emitted as chain elements.
+fn resolve_verified_issuer_path(
+    chain_der: &[Vec<u8>],
+    root_pool: &[Vec<u8>],
+    allow_default_macos: bool,
+) -> Vec<Vec<u8>> {
+    let Some(leaf) = chain_der.first() else {
+        return Vec::new();
+    };
+    let mut path: Vec<Vec<u8>> = vec![leaf.clone()];
+    let excluded_spkis = macos_excluded_root_spkis();
+    for _ in 0..16 {
+        let cur_der = path.last().unwrap().clone();
+        let Some(cur_parts) = parse_cert_der_parts(&cur_der) else {
+            break;
+        };
+        if cur_parts.subject_inner == cur_parts.issuer_inner
+            && cert_signed_by_parts(&cur_parts, &cur_parts)
+        {
+            break;
+        }
+        let find_verified = |pool: &[Vec<u8>], filter_excluded: bool| -> Option<Vec<u8>> {
+            for cand in pool {
+                if path.iter().any(|p| p == cand) {
+                    continue;
+                }
+                let Some(cp) = parse_cert_der_parts(cand) else {
+                    continue;
+                };
+                if filter_excluded && spki_is_excluded(cp.spki_inner, excluded_spkis) {
+                    continue;
+                }
+                if cp.subject_inner == cur_parts.issuer_inner
+                    && cert_signed_by_parts(&cur_parts, &cp)
+                {
+                    return Some(cand.clone());
+                }
+            }
+            None
+        };
+        if let Some(next) = find_verified(&chain_der[1..], false) {
+            path.push(next);
+            continue;
+        }
+        if let Some(root) = find_verified(root_pool, false) {
+            path.push(root);
+            break;
+        }
+        if allow_default_macos {
+            if let Some(root) = find_verified(macos_system_roots_der(), true) {
+                path.push(root);
+                break;
+            }
+        }
+        break;
+    }
+    path
+}
+
 /// Resolve the actual certification path `[leaf, intermediate..., optional_root]` starting from
 /// `chain_der[0]`, selecting issuers from `chain_der[1..]` and `root_pool` by cryptographic
 /// signature match (falling back to issuer/subject DN match if no signature-verified issuer
@@ -2346,9 +2419,18 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         )
     };
 
-    let mut owned_certs = Vec::with_capacity(chain_der.len());
-    let mut element_times = Vec::with_capacity(chain_der.len());
-    for der in &chain_der {
+    let element_root_pool = exclusive_roots_der
+        .as_deref()
+        .unwrap_or(&extra_roots_der);
+    let verified_element_der = resolve_verified_issuer_path(
+        &chain_der,
+        element_root_pool,
+        exclusive_roots_der.is_none(),
+    );
+
+    let mut owned_certs = Vec::with_capacity(verified_element_der.len());
+    let mut element_times = Vec::with_capacity(verified_element_der.len());
+    for der in &verified_element_der {
         if let Some(c) = wintrust::build_owned_cert_context(der, std::ptr::null_mut()) {
             let ci = &*(*c.as_ptr()).p_cert_info;
             element_times.push((ci.not_before, ci.not_after));

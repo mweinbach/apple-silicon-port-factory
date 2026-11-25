@@ -1537,7 +1537,7 @@ fn crypt_string_to_binary_all_flags_and_encode_object_ex_structures() {
         let cn_str = b"Encode Test";
         let attr = CertRdnAttr {
             psz_obj_id: b"2.5.4.3\0".as_ptr(),
-            dw_value_type: 13, // UTF8_STRING
+            dw_value_type: 4, // CERT_RDN_PRINTABLE_STRING (8-bit ASCII for X509_NAME)
             value: CryptDataBlob {
                 cb_data: cn_str.len() as u32,
                 pb_data: cn_str.as_ptr(),
@@ -2424,6 +2424,96 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
                 &[b'C', 0x00, b'a', 0x00, b'f', 0x00, 0xE9, 0x00, 0x00, 0x00],
                 "X509_NAME BMPString must decode as UTF-16LE for stype={stype_name}"
             );
+            crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
+        }
+
+        // 2c. Non-ASCII UTF8String (tag 0x0C) MUST ALSO decode into UTF-16LE units with
+        //     dwValueType == CERT_RDN_UTF8_STRING (13) through BOTH X509_ANY_STRING / X509_NAME
+        //     (non-unicode) and X509_UNICODE_ANY_STRING / X509_UNICODE_NAME, and round-trip via
+        //     CryptEncodeObjectEx(X509_NAME).
+        let utf8_e_acute: [u8; 4] = [0x0C, 0x02, 0xC3, 0xA9]; // "é" (U+00E9) in UTF-8
+        for stype_any in [super::asn1::X509_ANY_STRING, super::asn1::X509_UNICODE_ANY_STRING] {
+            let mut val_ptr: *mut u8 = std::ptr::null_mut();
+            let mut val_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    stype_any as *const u8,
+                    utf8_e_acute.as_ptr(),
+                    utf8_e_acute.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut val_ptr as *mut _ as *mut c_void,
+                    &mut val_len,
+                ),
+                TRUE
+            );
+            let dw_val_type = std::ptr::read_unaligned(val_ptr as *const u32);
+            let cb_val = std::ptr::read_unaligned(val_ptr.add(8) as *const u32);
+            let pb_val = std::ptr::read_unaligned(val_ptr.add(16) as *const *const u8);
+            assert_eq!(dw_val_type, 13, "CERT_RDN_UTF8_STRING");
+            assert_eq!(cb_val, 2);
+            assert_eq!(
+                std::slice::from_raw_parts(pb_val, 4),
+                &[0xE9, 0x00, 0x00, 0x00],
+                "UTF8String must decode as UTF-16LE with NUL terminator for stype={stype_any}"
+            );
+            crate::kernel32::memory::LocalFree(val_ptr as *mut c_void);
+        }
+        let utf8_cafe_val = super::asn1::encode_der_tlv(0x0C, "Café".as_bytes());
+        let mut utf8_atv_body = super::asn1::encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
+        utf8_atv_body.extend_from_slice(&utf8_cafe_val);
+        let utf8_name_der = super::asn1::encode_der_tlv(
+            0x30,
+            &super::asn1::encode_der_tlv(0x31, &super::asn1::encode_der_tlv(0x30, &utf8_atv_body)),
+        );
+        for stype_name in [super::asn1::X509_NAME, X509_UNICODE_NAME] {
+            let mut ni_ptr: *mut CertNameInfo = std::ptr::null_mut();
+            let mut ni_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    stype_name as *const u8,
+                    utf8_name_der.as_ptr(),
+                    utf8_name_der.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut ni_ptr as *mut _ as *mut c_void,
+                    &mut ni_len,
+                ),
+                TRUE
+            );
+            let ni_u = std::ptr::read_unaligned(ni_ptr);
+            let rdn_u = std::ptr::read_unaligned(ni_u.rg_rdn);
+            let attr_u = std::ptr::read_unaligned(rdn_u.rg_rdn_attr);
+            assert_eq!(attr_u.dw_value_type, 13, "CERT_RDN_UTF8_STRING");
+            assert_eq!(attr_u.value.cb_data, 8);
+            assert_eq!(
+                std::slice::from_raw_parts(attr_u.value.pb_data, 10),
+                &[b'C', 0x00, b'a', 0x00, b'f', 0x00, 0xE9, 0x00, 0x00, 0x00],
+                "X509_NAME UTF8String must decode as UTF-16LE for stype={stype_name}"
+            );
+            // Round-trip back through CryptEncodeObjectEx with the same struct type!
+            let mut re_ptr: *mut u8 = std::ptr::null_mut();
+            let mut re_len = 0u32;
+            assert_eq!(
+                CryptEncodeObjectEx(
+                    X509_ASN_ENCODING,
+                    stype_name as *const u8,
+                    ni_ptr as *const c_void,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut re_ptr as *mut _ as *mut c_void,
+                    &mut re_len,
+                ),
+                TRUE
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(re_ptr, re_len as usize),
+                utf8_name_der.as_slice(),
+                "UTF8String X509_NAME decode->encode must round-trip identically for stype={stype_name}"
+            );
+            crate::kernel32::memory::LocalFree(re_ptr as *mut c_void);
             crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
         }
 

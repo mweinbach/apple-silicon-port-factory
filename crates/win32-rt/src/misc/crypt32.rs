@@ -19,7 +19,9 @@ use std::sync::Arc;
 use store::ERROR_CALL_NOT_IMPLEMENTED;
 
 pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
-pub(crate) use chain::{check_chain_revocation_error, verify_peer_chain_error};
+pub(crate) use chain::{
+    check_chain_revocation_error, verify_cert_signed_by_der, verify_peer_chain_error,
+};
 pub(crate) use pkcs::verify_cmsg_signer_info_signature;
 #[allow(unused_imports)]
 pub(crate) use chain::{

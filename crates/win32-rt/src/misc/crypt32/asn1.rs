@@ -570,7 +570,10 @@ unsafe fn encode_rdn_value(
         return Some(encode_der_tlv(0x04, data));
     }
 
-    let text: String = if unicode {
+    // Per MSDN CERT_RDN_ATTR: CERT_RDN_BMP_STRING (12) and CERT_RDN_UTF8_STRING (13) are
+    // ALWAYS supplied as 16-bit Unicode (UTF-16LE) arrays, even for X509_NAME / X509_ANY_STRING.
+    let is_utf16_value = unicode || matches!(raw_ty, CERT_RDN_BMP_STRING | CERT_RDN_UTF8_STRING);
+    let text: String = if is_utf16_value {
         if blob.pb_data.is_null() {
             String::new()
         } else if blob.cb_data == 0 {

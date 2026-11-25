@@ -1652,18 +1652,34 @@ fn verify_standalone_pkcs7(
         return Err(TRUST_E_BAD_DIGEST);
     };
 
-    // Preserve the signer certificate followed by any issuer chain links present in SignedData.
+    // Preserve ONLY the signer certificate followed by cryptographically verified issuer chain
+    // links present in SignedData — never pass unrelated trailing certificates into the chain.
     let mut chain_indices = vec![signer_idx];
     let mut cur = signer_idx;
     for _ in 0..8 {
-        if certs[cur].issuer_raw == certs[cur].subject_raw {
+        if certs[cur].issuer_raw == certs[cur].subject_raw
+            && super::crypt32::verify_cert_signed_by_der(certs[cur].raw_der, certs[cur].raw_der)
+        {
             break;
         }
-        if let Some(next_idx) = certs
+        // Prefer a cryptographically verified self-signed root if multiple certs share the DN.
+        let next_idx = certs
             .iter()
             .enumerate()
-            .position(|(i, c)| !chain_indices.contains(&i) && c.subject_raw == certs[cur].issuer_raw)
-        {
+            .position(|(i, c)| {
+                !chain_indices.contains(&i)
+                    && c.subject_raw == certs[cur].issuer_raw
+                    && c.issuer_raw == c.subject_raw
+                    && super::crypt32::verify_cert_signed_by_der(certs[cur].raw_der, c.raw_der)
+            })
+            .or_else(|| {
+                certs.iter().enumerate().position(|(i, c)| {
+                    !chain_indices.contains(&i)
+                        && c.subject_raw == certs[cur].issuer_raw
+                        && super::crypt32::verify_cert_signed_by_der(certs[cur].raw_der, c.raw_der)
+                })
+            });
+        if let Some(next_idx) = next_idx {
             chain_indices.push(next_idx);
             cur = next_idx;
         } else {
@@ -1690,7 +1706,7 @@ fn verify_standalone_pkcs7(
             }
         })
         .collect();
-    let all_certs_der: Vec<Vec<u8>> = certs.iter().map(|c| c.raw_der.to_vec()).collect();
+    let all_certs_der: Vec<Vec<u8>> = chain_certs.iter().map(|c| c.raw_der.clone()).collect();
     Ok(StandalonePkcs7Result {
         verified: VerifiedAuthenticode { certs: chain_certs, signer },
         encap_content_type_oid,
@@ -3836,6 +3852,227 @@ mod tests {
                 ),
                 TRUST_E_SUBJECT_FORM_UNKNOWN
             );
+        }
+    }
+
+    #[test]
+    fn generic_chain_verify_callback_excludes_unverified_embedded_certs() {
+        fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if body.len() < 0x80 {
+                out.push(body.len() as u8);
+            } else if body.len() < 0x100 {
+                out.push(0x81);
+                out.push(body.len() as u8);
+            } else {
+                out.push(0x82);
+                out.push((body.len() >> 8) as u8);
+                out.push((body.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(body);
+            out
+        }
+
+        // Take a genuinely signed standalone PKCS#7 blob and append an unrelated CA certificate
+        // (`TEST_CA_DER`) into SignedData.certificates (tag 0xA0) without touching the signature.
+        let orig = crate::misc::crypt32::tests::test_vectors::PKCS7_SIGNED_DER;
+        let injected_ca = crate::misc::secur32::tests::TEST_CA_DER;
+        let ci = der_children(orig).unwrap()[0];
+        let ci_kids = der_children(ci.val).unwrap();
+        let sd = der_children(ci_kids[1].val).unwrap()[0];
+        let sd_kids = der_children(sd.val).unwrap();
+        let mut rebuilt_sd = Vec::new();
+        let mut found_certs = false;
+        for child in sd_kids {
+            if child.tag == 0xA0 {
+                found_certs = true;
+                let mut new_certs = child.val.to_vec();
+                new_certs.extend_from_slice(injected_ca);
+                rebuilt_sd.extend_from_slice(&der_tlv(0xA0, &new_certs));
+            } else {
+                rebuilt_sd.extend_from_slice(child.raw);
+            }
+        }
+        assert!(found_certs);
+        let mut rebuilt_ci = Vec::new();
+        rebuilt_ci.extend_from_slice(ci_kids[0].raw);
+        rebuilt_ci.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x30, &rebuilt_sd)));
+        let stuffed_p7 = der_tlv(0x30, &rebuilt_ci);
+
+        // Callback inspects every element in `rgpChain[0]->rgpElement[0..cElement]`.
+        struct PinCbCtx {
+            called: usize,
+            seen_elements: Vec<Vec<u8>>,
+        }
+        unsafe extern "C" fn inspect_chain_cb(
+            _prov_data: u64,
+            _step_err: u64,
+            _reg_settings: u64,
+            c_signer: u64,
+            rgp_signer: u64,
+            pv_policy_arg: u64,
+            _a7: u64,
+            _a8: u64,
+        ) -> u64 {
+            let ctx = &mut *(pv_policy_arg as *mut PinCbCtx);
+            ctx.called += 1;
+            if c_signer == 1 && rgp_signer != 0 {
+                let sptr = *(rgp_signer as *const *const WtdGenericChainPolicySignerInfo);
+                if !sptr.is_null() {
+                    let sinfo = std::ptr::read_unaligned(sptr);
+                    if !sinfo.p_chain_context.is_null() {
+                        let cc = &*(sinfo.p_chain_context as *const CertChainContext);
+                        if cc.c_chain > 0 && !cc.rgp_chain.is_null() {
+                            let simple = &*(*cc.rgp_chain);
+                            for i in 0..simple.c_element as usize {
+                                let el = &*(*simple.rgp_element.add(i));
+                                let cert = &*el.p_cert_context;
+                                let der = std::slice::from_raw_parts(
+                                    cert.pb_cert_encoded,
+                                    cert.cb_cert_encoded as usize,
+                                );
+                                ctx.seen_elements.push(der.to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+            ERROR_SUCCESS as u32 as u64
+        }
+
+        unsafe {
+            let mut cb_ctx = PinCbCtx {
+                called: 0,
+                seen_elements: Vec::new(),
+            };
+            let mut gc_para = [0u8; 0x28];
+            std::ptr::write_unaligned(gc_para.as_mut_ptr() as *mut u32, 0x28u32);
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x18) as *mut usize,
+                inspect_chain_cb as *const () as usize,
+            );
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x20) as *mut *mut c_void,
+                &mut cb_ctx as *mut PinCbCtx as *mut c_void,
+            );
+
+            let mut blob_info = [0u8; 0x38];
+            std::ptr::write_unaligned(blob_info.as_mut_ptr() as *mut u32, 0x38u32);
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x20) as *mut u32,
+                stuffed_p7.len() as u32,
+            );
+            std::ptr::write_unaligned(
+                blob_info.as_mut_ptr().add(0x28) as *mut *const u8,
+                stuffed_p7.as_ptr(),
+            );
+
+            let mut wtd = [0u8; 0x58];
+            std::ptr::write_unaligned(wtd.as_mut_ptr() as *mut u32, 0x58u32);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                gc_para.as_ptr() as *const c_void,
+            );
+            std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_BLOB);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x28) as *mut *const u8,
+                blob_info.as_ptr(),
+            );
+
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+            assert_eq!(cb_ctx.called, 1);
+            assert_eq!(
+                cb_ctx.seen_elements.len(),
+                1,
+                "callback chain must contain only the verified signer path, not unrelated embedded certs"
+            );
+            assert!(
+                !cb_ctx.seen_elements.iter().any(|d| d.as_slice() == injected_ca),
+                "unrelated CA appended to SignedData.certificates must never appear in callback chain"
+            );
+
+            // Direct CertGetCertificateChain with an unrelated CA in hAdditionalStore must emit
+            // ONLY [TEST_LEAF_DER, TEST_CA_DER] (verified issuer path), never the unrelated CA.
+            let leaf_ctx = crate::misc::crypt32::CertCreateCertificateContext(
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_LEAF_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_LEAF_DER.len() as u32,
+            );
+            let add_st = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            let unrelated_ca = crate::misc::crypt32::tests::test_vectors::RSA2048_CA_DER;
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    add_st,
+                    X509_ASN_ENCODING,
+                    unrelated_ca.as_ptr(),
+                    unrelated_ca.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let root_st = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    root_st,
+                    X509_ASN_ENCODING,
+                    injected_ca.as_ptr(),
+                    injected_ca.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let mut eng_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr() as *mut u32, eng_cfg.len() as u32);
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, root_st);
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng_cfg.as_ptr() as *const c_void,
+                    &mut eng,
+                ),
+                1
+            );
+            let mut ch: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertGetCertificateChain(
+                    eng,
+                    leaf_ctx,
+                    std::ptr::null(),
+                    add_st,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ch,
+                ),
+                1
+            );
+            let cc = &*(ch as *const CertChainContext);
+            let simple = &*(*cc.rgp_chain);
+            assert_eq!(simple.c_element, 2, "verified path must contain [leaf, verified root]");
+            let el0 = &*((*(*simple.rgp_element.add(0))).p_cert_context);
+            let el1 = &*((*(*simple.rgp_element.add(1))).p_cert_context);
+            assert_eq!(
+                std::slice::from_raw_parts(el0.pb_cert_encoded, el0.cb_cert_encoded as usize),
+                crate::misc::secur32::tests::TEST_LEAF_DER
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(el1.pb_cert_encoded, el1.cb_cert_encoded as usize),
+                injected_ca
+            );
+            crate::misc::crypt32::CertFreeCertificateChain(ch);
+            crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
+            crate::misc::crypt32::CertCloseStore(root_st, 0);
+            crate::misc::crypt32::CertCloseStore(add_st, 0);
+            crate::misc::crypt32::CertFreeCertificateContext(leaf_ctx);
         }
     }
 }
