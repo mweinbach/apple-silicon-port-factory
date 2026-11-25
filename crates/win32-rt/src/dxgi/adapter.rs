@@ -131,8 +131,8 @@ impl ComClass for Adapter {
                 slot!("CheckInterfaceSupport" => check_interface_support),
                 slot!("GetDesc1" => get_desc1),
                 slot!("GetDesc2" => get_desc2),
-                slot!("RegisterHardwareContentProtectionTeardownStatusEvent" => register_event_stub),
-                slot!("UnregisterHardwareContentProtectionTeardownStatus" => unregister_stub),
+                slot!("RegisterHardwareContentProtectionTeardownStatusEvent" => register_hcp_teardown_event),
+                slot!("UnregisterHardwareContentProtectionTeardownStatus" => unregister_hcp_teardown_event),
                 slot!("QueryVideoMemoryInfo" => query_video_memory_info),
                 slot!("SetVideoMemoryReservation" => set_video_memory_reservation),
                 slot!("RegisterVideoMemoryBudgetChangeNotificationEvent" => register_budget_event),
@@ -294,15 +294,41 @@ pub fn notify_video_memory_budget_change() {
     }
 }
 
-unsafe extern "win64" fn register_event_stub(_this: PA, _ev: HANDLE, cookie: *mut u32) -> HRESULT {
-    stub!("IDXGIAdapter3 notification event registered; it is never signaled");
-    if !cookie.is_null() {
-        *cookie = 1;
+static HCP_TEARDOWN_EVENTS: std::sync::Mutex<Vec<(u32, std::sync::Arc<crate::handles::Event>)>> =
+    std::sync::Mutex::new(Vec::new());
+static NEXT_HCP_COOKIE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+unsafe extern "win64" fn register_hcp_teardown_event(_this: PA, ev: HANDLE, cookie: *mut u32) -> HRESULT {
+    if cookie.is_null() {
+        return E_INVALIDARG;
     }
+    let Some(event) = crate::handles::get_as::<crate::handles::Event>(ev) else {
+        return E_INVALIDARG;
+    };
+    let id = NEXT_HCP_COOKIE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    HCP_TEARDOWN_EVENTS.lock().unwrap().push((id, event));
+    std::ptr::write_unaligned(cookie, id);
+    log::debug!(target: "d3d", "IDXGIAdapter3::RegisterHardwareContentProtectionTeardownStatusEvent -> cookie {id}");
     S_OK
 }
 
-unsafe extern "win64" fn unregister_stub(_this: PA, _cookie: u32) {}
+unsafe extern "win64" fn unregister_hcp_teardown_event(_this: PA, cookie: u32) {
+    HCP_TEARDOWN_EVENTS.lock().unwrap().retain(|&(id, _)| id != cookie);
+}
+
+/// Signal all registered `IDXGIAdapter3::RegisterHardwareContentProtectionTeardownStatusEvent`
+/// wait handles when a protected-content session tears down.
+pub fn notify_hcp_teardown() {
+    let events: Vec<std::sync::Arc<crate::handles::Event>> = HCP_TEARDOWN_EVENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, e)| e.clone())
+        .collect();
+    for ev in events {
+        ev.set();
+    }
+}
 
 #[repr(C)]
 struct VideoMemoryInfo {
@@ -348,7 +374,14 @@ unsafe extern "win64" fn enum_outputs(this: PA, i: u32, out: *mut *mut c_void) -
     order.sort_by_key(|&k| !ms[k].primary);
     let Some(&k) = order.get(i as usize) else { return DXGI_ERROR_NOT_FOUND };
     Obj::add_ref(this);
-    std::ptr::write_unaligned(out, Obj::new(Output { adapter: this, monitor_id: ms[k].id }) as *mut c_void);
+    std::ptr::write_unaligned(
+        out,
+        Obj::new(Output {
+            adapter: this,
+            monitor_id: ms[k].id,
+            owned_device: std::sync::Mutex::new(None),
+        }) as *mut c_void,
+    );
     S_OK
 }
 
@@ -396,12 +429,18 @@ pub unsafe fn output_monitor_rect(p: *mut c_void) -> Option<crate::user32::RECT>
 pub struct Output {
     adapter: PA,
     monitor_id: u32,
+    owned_device: std::sync::Mutex<Option<usize>>,
 }
 unsafe impl Send for Output {}
 unsafe impl Sync for Output {}
 
 impl Drop for Output {
     fn drop(&mut self) {
+        if let Ok(mut guard) = self.owned_device.lock() {
+            if let Some(dev) = guard.take() {
+                release_monitor_ownership(self.monitor_id, dev);
+            }
+        }
         unsafe { Obj::release(self.adapter) };
     }
 }
@@ -658,19 +697,228 @@ unsafe extern "win64" fn find_closest_matching_mode1(this: PO, want: *const Mode
     closest(this, want, out, 32)
 }
 
+const DXGI_ERROR_NOT_CURRENTLY_AVAILABLE: HRESULT = 0x887A_0022u32 as i32;
+
+/// Per-output logical ownership table (`monitor_id -> (device_ptr, exclusive)`).
+///
+/// On Windows 10/11 flip-model swapchains (`DXGI_SWAP_EFFECT_FLIP_DISCARD` /
+/// `FLIP_SEQUENTIAL`), `IDXGIOutput::TakeOwnership` / `ReleaseOwnership` coordinate
+/// logical output ownership between devices while fullscreen presentation runs via
+/// DWM borderless fullscreen (`IDXGISwapChain::SetFullscreenState`).
+fn output_owners() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (usize, bool)>> {
+    static OWNERS: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, (usize, bool)>>> =
+        OnceLock::new();
+    OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn release_monitor_ownership(monitor_id: u32, dev: usize) {
+    if let Ok(mut map) = output_owners().lock() {
+        if map.get(&monitor_id).is_some_and(|&(owner, _)| owner == dev) {
+            map.remove(&monitor_id);
+        }
+    }
+}
+
+/// Hardware VBlank synchronization via CoreVideo `CVDisplayLink` on macOS, with
+/// monotonic refresh-phase pacing when no physical display is attached (headless/CI/iOS).
+mod vblank {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    fn pace_monotonic(hz: u32) {
+        let period_ns = (1_000_000_000u64 / hz.max(1) as u64).max(1_000_000);
+        let now_ns = crate::kernel32::time::interrupt_time_100ns().saturating_mul(100);
+        let rem_ns = period_ns - (now_ns % period_ns);
+        std::thread::sleep(Duration::from_nanos(rem_ns));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod mac {
+        use super::*;
+        use std::collections::HashMap;
+        use std::ffi::c_void;
+
+        #[link(name = "CoreVideo", kind = "framework")]
+        extern "C" {
+            fn CVDisplayLinkCreateWithCGDisplay(
+                display_id: u32,
+                display_link_out: *mut *mut c_void,
+            ) -> i32;
+            fn CVDisplayLinkSetOutputCallback(
+                display_link: *mut c_void,
+                callback: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *const c_void,
+                    u64,
+                    *mut u64,
+                    *mut c_void,
+                ) -> i32,
+                user_info: *mut c_void,
+            ) -> i32;
+            fn CVDisplayLinkStart(display_link: *mut c_void) -> i32;
+            fn CVDisplayLinkRelease(display_link: *mut c_void);
+        }
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+        }
+
+        struct VBlankState {
+            gen: AtomicU64,
+            waiters: AtomicUsize,
+            mu: Mutex<u64>,
+            cv: Condvar,
+        }
+
+        struct DisplayLinkEntry {
+            _link: usize,
+            state: Arc<VBlankState>,
+        }
+
+        unsafe extern "C" fn display_link_cb(
+            _link: *mut c_void,
+            _in_now: *const c_void,
+            _in_output_time: *const c_void,
+            _flags_in: u64,
+            _flags_out: *mut u64,
+            ctx: *mut c_void,
+        ) -> i32 {
+            let st = &*(ctx as *const VBlankState);
+            let next = st.gen.fetch_add(1, Ordering::Release) + 1;
+            if st.waiters.load(Ordering::Acquire) > 0 {
+                if let Ok(mut g) = st.mu.lock() {
+                    *g = next;
+                    st.cv.notify_all();
+                }
+            }
+            0 // kCVReturnSuccess
+        }
+
+        fn link_for_display(display_id: u32) -> Option<Arc<VBlankState>> {
+            static LINKS: OnceLock<Mutex<HashMap<u32, Option<DisplayLinkEntry>>>> = OnceLock::new();
+            let cache = LINKS.get_or_init(|| Mutex::new(HashMap::new()));
+            let cg_id = if display_id > 1 {
+                display_id
+            } else {
+                unsafe { CGMainDisplayID() }
+            };
+            if cg_id == 0 {
+                return None;
+            }
+            let mut map = cache.lock().unwrap();
+            if let Some(entry) = map.get(&cg_id) {
+                return entry.as_ref().map(|e| e.state.clone());
+            }
+
+            let mut link: *mut c_void = std::ptr::null_mut();
+            let mut rc = unsafe { CVDisplayLinkCreateWithCGDisplay(cg_id, &mut link) };
+            if rc != 0 || link.is_null() {
+                let main_id = unsafe { CGMainDisplayID() };
+                if main_id != 0 && main_id != cg_id {
+                    rc = unsafe { CVDisplayLinkCreateWithCGDisplay(main_id, &mut link) };
+                }
+            }
+            if rc != 0 || link.is_null() {
+                map.insert(cg_id, None);
+                return None;
+            }
+
+            let state = Arc::new(VBlankState {
+                gen: AtomicU64::new(0),
+                waiters: AtomicUsize::new(0),
+                mu: Mutex::new(0),
+                cv: Condvar::new(),
+            });
+            // Keep a process-lifetime Arc clone for the CoreVideo callback pointer.
+            let raw_ctx = Arc::into_raw(state.clone()) as *mut c_void;
+            let cb_rc = unsafe { CVDisplayLinkSetOutputCallback(link, display_link_cb, raw_ctx) };
+            let start_rc = if cb_rc == 0 { unsafe { CVDisplayLinkStart(link) } } else { cb_rc };
+            if start_rc != 0 {
+                unsafe {
+                    CVDisplayLinkRelease(link);
+                    drop(Arc::from_raw(raw_ctx as *const VBlankState));
+                }
+                map.insert(cg_id, None);
+                return None;
+            }
+            map.insert(cg_id, Some(DisplayLinkEntry { _link: link as usize, state: state.clone() }));
+            Some(state)
+        }
+
+        pub fn wait(display_id: u32, fallback_hz: u32) -> bool {
+            let Some(st) = link_for_display(display_id) else {
+                pace_monotonic(fallback_hz);
+                return false;
+            };
+            st.waiters.fetch_add(1, Ordering::AcqRel);
+            let start = st.gen.load(Ordering::Acquire);
+            let mut guard = st.mu.lock().unwrap();
+            // Ensure guard reflects at least `start` before waiting.
+            if *guard < start {
+                *guard = start;
+            }
+            let max_wait = Duration::from_micros(
+                (2_500_000u64 / fallback_hz.max(1) as u64).clamp(50_000, 250_000),
+            );
+            let (guard, timeout) = st
+                .cv
+                .wait_timeout_while(guard, max_wait, |g| *g <= start)
+                .unwrap_or_else(|e| e.into_inner());
+            let ticked = *guard > start && !timeout.timed_out();
+            drop(guard);
+            st.waiters.fetch_sub(1, Ordering::AcqRel);
+            ticked
+        }
+    }
+
+    pub fn wait(display_id: u32, fallback_hz: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            mac::wait(display_id, fallback_hz)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = display_id;
+            pace_monotonic(fallback_hz);
+            false
+        }
+    }
+}
+
 unsafe extern "win64" fn wait_for_vblank(this: PO) -> HRESULT {
-    let hz = monitor(Obj::get(this)).refresh_hz.max(1);
-    stub!("WaitForVBlank: sleeps one refresh period ({hz} Hz), not synchronized to the display");
-    std::thread::sleep(std::time::Duration::from_micros(1_000_000 / hz as u64));
+    let m = monitor(Obj::get(this));
+    let hz = m.refresh_hz.max(1);
+    let _hw_vsync = vblank::wait(m.id, hz);
     S_OK
 }
 
-unsafe extern "win64" fn take_ownership(_this: PO, _dev: *mut c_void, _excl: BOOL) -> HRESULT {
-    stub!("TakeOwnership: exclusive fullscreen is not supported");
-    DXGI_ERROR_UNSUPPORTED
+unsafe extern "win64" fn take_ownership(this: PO, dev: *mut c_void, excl: BOOL) -> HRESULT {
+    if dev.is_null() {
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    let out = Obj::get(this);
+    let dev_key = dev as usize;
+    let exclusive = excl != 0;
+    let mut map = output_owners().lock().unwrap();
+    if let Some(&(owner, owner_excl)) = map.get(&out.monitor_id) {
+        if owner != dev_key && (owner_excl || exclusive) {
+            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        }
+    }
+    map.insert(out.monitor_id, (dev_key, exclusive));
+    *out.owned_device.lock().unwrap() = Some(dev_key);
+    S_OK
 }
 
-unsafe extern "win64" fn release_ownership(_this: PO) {}
+unsafe extern "win64" fn release_ownership(this: PO) {
+    let out = Obj::get(this);
+    if let Some(dev) = out.owned_device.lock().unwrap().take() {
+        release_monitor_ownership(out.monitor_id, dev);
+    }
+}
 
 unsafe extern "win64" fn supports_overlays(_this: PO) -> BOOL {
     FALSE
@@ -875,6 +1123,59 @@ mod tests {
                 E_INVALIDARG
             );
             assert_eq!(umd2, 0);
+        }
+    }
+
+    #[test]
+    fn hcp_teardown_notification_registers_signals_and_unregisters() {
+        let ev = std::sync::Arc::new(Event::new(true, false, None));
+        let h = crate::handles::insert(ev.clone());
+        let mut cookie = 0u32;
+        unsafe {
+            assert_eq!(register_hcp_teardown_event(std::ptr::null_mut(), std::ptr::null_mut(), &mut cookie), E_INVALIDARG);
+            assert_eq!(register_hcp_teardown_event(std::ptr::null_mut(), h, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(register_hcp_teardown_event(std::ptr::null_mut(), h, &mut cookie), S_OK);
+            assert!(cookie > 0);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(h, 0), 0x102);
+
+            notify_hcp_teardown();
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(h, 0), 0);
+
+            ev.reset();
+            unregister_hcp_teardown_event(std::ptr::null_mut(), cookie);
+            notify_hcp_teardown();
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(h, 0), 0x102);
+        }
+        crate::handles::close(h);
+    }
+
+    #[test]
+    fn output_take_ownership_and_wait_for_vblank() {
+        unsafe {
+            let mut f_ptr: *mut c_void = std::ptr::null_mut();
+            let mut o1_ptr: *mut c_void = std::ptr::null_mut();
+            let mut o2_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(crate::dxgi::CreateDXGIFactory1(&crate::dxgi::IID_IDXGIFactory1, &mut f_ptr), S_OK);
+            assert_eq!(primary_output(f_ptr as *mut Obj<Factory>, &mut o1_ptr), S_OK);
+            assert_eq!(primary_output(f_ptr as *mut Obj<Factory>, &mut o2_ptr), S_OK);
+
+            let dev_a = 0xA000usize as *mut c_void;
+            let dev_b = 0xB000usize as *mut c_void;
+            assert_eq!(take_ownership(o1_ptr as PO, std::ptr::null_mut(), TRUE), DXGI_ERROR_INVALID_CALL);
+            assert_eq!(take_ownership(o1_ptr as PO, dev_a, TRUE), S_OK);
+            // Same device re-acquiring succeeds; another device fails with NOT_CURRENTLY_AVAILABLE.
+            assert_eq!(take_ownership(o1_ptr as PO, dev_a, TRUE), S_OK);
+            assert_eq!(take_ownership(o2_ptr as PO, dev_b, FALSE), DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+            release_ownership(o1_ptr as PO);
+            assert_eq!(take_ownership(o2_ptr as PO, dev_b, TRUE), S_OK);
+            release_ownership(o2_ptr as PO);
+
+            // WaitForVBlank returns S_OK synchronized to display VBlank (CVDisplayLink on macOS).
+            assert_eq!(wait_for_vblank(o1_ptr as PO), S_OK);
+
+            com_release(o2_ptr);
+            com_release(o1_ptr);
+            com_release(f_ptr);
         }
     }
 }
