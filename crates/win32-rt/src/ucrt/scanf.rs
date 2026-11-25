@@ -299,28 +299,79 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                     _ => !wide_default,
                 });
                 let maxc = if lower == b'c' && width == 0 { 1 } else { maxw };
+                let cp = super::locale::locale_obj_cp(loc);
                 let mut got: Vec<u32> = Vec::new();
-                while got.len() < maxc {
-                    let Some(c) = input.peek() else { break };
-                    let ok = match lower {
-                        b's' => !is_space(c),
-                        b'c' => true,
-                        _ => set.iter().any(|&(a, b)| c >= a && c <= b) != negate,
-                    };
-                    if !ok {
-                        break;
+                if lower == b'c' && !wide && is_wide && cp != 0 {
+                    let mut chars = 0usize;
+                    while chars < maxc {
+                        let Some(b0) = input.peek() else { break };
+                        let need_bytes = if cp == 65001 {
+                            match b0 as u8 {
+                                0x00..=0x7F => 1,
+                                0xC2..=0xDF => 2,
+                                0xE0..=0xEF => 3,
+                                0xF0..=0xF4 => 4,
+                                _ => 1,
+                            }
+                        } else if crate::kernel32::string::IsDBCSLeadByteEx(cp, b0 as u8) != 0 {
+                            2
+                        } else {
+                            1
+                        };
+                        for _ in 0..need_bytes {
+                            let Some(b) = input.peek() else { break };
+                            got.push(b);
+                            input.bump();
+                        }
+                        chars += 1;
                     }
-                    got.push(c);
-                    input.bump();
+                } else {
+                    while got.len() < maxc {
+                        let Some(c) = input.peek() else { break };
+                        let ok = match lower {
+                            b's' => !is_space(c),
+                            b'c' => true,
+                            _ => set.iter().any(|&(a, b)| c >= a && c <= b) != negate,
+                        };
+                        if !ok {
+                            break;
+                        }
+                        got.push(c);
+                        input.bump();
+                    }
                 }
                 if got.is_empty() || (lower == b'c' && got.len() < maxc) && got.is_empty() {
                     break;
                 }
+                // Convert between input width and destination width using LC_CTYPE.
+                let units: Vec<u32> = match (wide, is_wide) {
+                    (false, true) => {
+                        let bytes: Vec<u8> = got.iter().map(|&c| c as u8).collect();
+                        match super::convert::mb_decode_slice_cp(cp, &bytes) {
+                            Ok(w) => w.into_iter().map(|u| u as u32).collect(),
+                            Err(()) => {
+                                super::errno::set(super::errno::EILSEQ);
+                                break;
+                            }
+                        }
+                    }
+                    (true, false) => {
+                        let w: Vec<u16> = got.iter().map(|&c| c as u16).collect();
+                        match super::convert::wc_encode_slice_cp(cp, &w) {
+                            Ok(bytes) => bytes.into_iter().map(|b| b as u32).collect(),
+                            Err(()) => {
+                                super::errno::set(super::errno::EILSEQ);
+                                break;
+                            }
+                        }
+                    }
+                    _ => got.clone(),
+                };
                 converted_any = true;
                 if !suppress {
                     let p = args.next_ptr::<u8>();
                     let cap = if opts & SECURE != 0 { args.next_u64() as u32 as usize } else { usize::MAX };
-                    let need = got.len() + if lower == b'c' { 0 } else { 1 };
+                    let need = units.len() + if lower == b'c' { 0 } else { 1 };
                     if need > cap {
                         if cap > 0 {
                             if is_wide {
@@ -332,18 +383,6 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, a
                         super::errno::set(super::errno::ENOMEM);
                         break;
                     }
-                    // Convert between input width and destination width.
-                    let units: Vec<u32> = match (wide, is_wide) {
-                        (false, true) => {
-                            let bytes: Vec<u8> = got.iter().map(|&c| c as u8).collect();
-                            String::from_utf8_lossy(&bytes).encode_utf16().map(|c| c as u32).collect()
-                        }
-                        (true, false) => {
-                            let w: Vec<u16> = got.iter().map(|&c| c as u16).collect();
-                            String::from_utf16_lossy(&w).bytes().map(|b| b as u32).collect()
-                        }
-                        _ => got.clone(),
-                    };
                     for (k, &u) in units.iter().enumerate() {
                         if is_wide {
                             *(p as *mut u16).add(k) = u as u16;
@@ -454,6 +493,47 @@ mod tests {
             let n = __stdio_common_vsscanf(0, b"1,75\0".as_ptr(), usize::MAX, b"%lf\0".as_ptr(), loc_de, args_de.as_ptr() as *const u8);
             assert_eq!((n, df), (1, 1.75));
             crate::ucrt::locale::_free_locale(loc_de);
+
+            // LC_CTYPE = de-DE (CP1252) & ja-JP (CP932) apply to cross-width %ls/%hs/%lc conversions.
+            let loc_de_ct = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr());
+            assert!(!loc_de_ct.is_null());
+            let mut wbuf = [0u16; 16];
+            let cp1252_in: [u8; 3] = [0xE4, 0x80, 0];
+            let args_w = [wbuf.as_mut_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vsscanf(0, cp1252_in.as_ptr(), usize::MAX, b"%ls\0".as_ptr(), loc_de_ct, args_w.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(&wbuf[..3], &[0x00E4, 0x20AC, 0]);
+
+            let wide_in: Vec<u16> = "ä€\0".encode_utf16().collect();
+            let fmt_hs: Vec<u16> = "%hs\0".encode_utf16().collect();
+            let mut nbuf = [0u8; 16];
+            let args_n = [nbuf.as_mut_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vswscanf(0, wide_in.as_ptr(), usize::MAX, fmt_hs.as_ptr(), loc_de_ct, args_n.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(&nbuf[..3], &[0xE4, 0x80, 0]);
+            crate::ucrt::locale::_free_locale(loc_de_ct);
+
+            let loc_ja_ct = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr());
+            assert!(!loc_ja_ct.is_null());
+            let mut wc = 0u16;
+            let cp932_in: [u8; 3] = [0x82, 0xA0, 0];
+            let args_wc = [&mut wc as *mut u16 as u64];
+            assert_eq!(
+                __stdio_common_vsscanf(0, cp932_in.as_ptr(), usize::MAX, b"%lc\0".as_ptr(), loc_ja_ct, args_wc.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(wc, 0x3042);
+            let wide_ja: Vec<u16> = "あ\0".encode_utf16().collect();
+            assert_eq!(
+                __stdio_common_vswscanf(0, wide_ja.as_ptr(), usize::MAX, fmt_hs.as_ptr(), loc_ja_ct, args_n.as_ptr() as *const u8),
+                1
+            );
+            assert_eq!(&nbuf[..3], &[0x82, 0xA0, 0]);
+            crate::ucrt::locale::_free_locale(loc_ja_ct);
         }
     }
 }

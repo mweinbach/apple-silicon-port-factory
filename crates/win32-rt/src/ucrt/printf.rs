@@ -432,12 +432,28 @@ unsafe fn format_with_locale(
             b'c' | b'C' => {
                 let v = args.next_u64();
                 let is_wide = wide_arg.unwrap_or(if conv8 == b'c' { wide_default } else { !wide_default });
+                let cp = super::locale::locale_obj_cp(loc);
                 let unit: Vec<u32> = if is_wide {
                     let ch = v as u16;
                     if out.wide {
                         vec![ch as u32]
                     } else {
-                        String::from_utf16_lossy(&[ch]).bytes().map(|b| b as u32).collect()
+                        match super::convert::wc_encode_cp(cp, ch) {
+                            Ok(bytes) => bytes.into_iter().map(|b| b as u32).collect(),
+                            Err(()) => {
+                                super::errno::set(super::errno::EILSEQ);
+                                return None;
+                            }
+                        }
+                    }
+                } else if out.wide {
+                    let b = v as u8;
+                    match super::convert::mb_decode_cp(cp, &[b]) {
+                        Ok(Some((w, _))) => w.into_iter().map(|u| u as u32).collect(),
+                        Ok(None) | Err(()) => {
+                            super::errno::set(super::errno::EILSEQ);
+                            return None;
+                        }
                     }
                 } else {
                     vec![v as u8 as u32]
@@ -457,39 +473,75 @@ unsafe fn format_with_locale(
                         }
                     }
                 };
+                let cp = super::locale::locale_obj_cp(loc);
                 let units: Vec<u32> = if conv8 == b'Z' {
                     // ANSI_STRING/UNICODE_STRING*: Length(u16), MaxLength, Buffer.
                     if p == 0 {
-                        str_units("(null)", out.wide)
+                        let null_u = str_units("(null)", out.wide);
+                        match sp.prec {
+                            Some(pr) if null_u.len() > pr => null_u[..pr].to_vec(),
+                            _ => null_u,
+                        }
                     } else {
                         let len = *(p as *const u16) as usize;
                         let buf = *((p + 8) as *const usize);
-                        if is_wide {
+                        let res = if is_wide {
                             let s = std::slice::from_raw_parts(buf as *const u16, len / 2);
-                            conv_wide(s, out.wide)
+                            conv_wide(s, out.wide, cp, sp.prec)
                         } else {
                             let s = std::slice::from_raw_parts(buf as *const u8, len);
-                            conv_narrow(s, out.wide)
+                            conv_narrow(s, out.wide, cp, sp.prec)
+                        };
+                        match res {
+                            Ok(u) => u,
+                            Err(()) => {
+                                super::errno::set(super::errno::EILSEQ);
+                                return None;
+                            }
                         }
                     }
                 } else if p == 0 {
-                    str_units("(null)", out.wide)
+                    let null_u = str_units("(null)", out.wide);
+                    match sp.prec {
+                        Some(pr) if null_u.len() > pr => null_u[..pr].to_vec(),
+                        _ => null_u,
+                    }
                 } else if is_wide {
-                    let n = match sp.prec {
-                        Some(pr) => (0..pr).take_while(|&k| *((p as *const u16).add(k)) != 0).count(),
-                        None => wcslen(p as *const u16),
+                    let n = if out.wide {
+                        match sp.prec {
+                            Some(pr) => (0..pr).take_while(|&k| *((p as *const u16).add(k)) != 0).count(),
+                            None => wcslen(p as *const u16),
+                        }
+                    } else if sp.prec == Some(0) {
+                        0
+                    } else {
+                        wcslen(p as *const u16)
                     };
-                    conv_wide(std::slice::from_raw_parts(p as *const u16, n), out.wide)
+                    match conv_wide(std::slice::from_raw_parts(p as *const u16, n), out.wide, cp, sp.prec) {
+                        Ok(u) => u,
+                        Err(()) => {
+                            super::errno::set(super::errno::EILSEQ);
+                            return None;
+                        }
+                    }
                 } else {
-                    let n = match sp.prec {
-                        Some(pr) => (0..pr).take_while(|&k| *((p as *const u8).add(k)) != 0).count(),
-                        None => strlen(p as *const u8),
+                    let n = if !out.wide {
+                        match sp.prec {
+                            Some(pr) => (0..pr).take_while(|&k| *((p as *const u8).add(k)) != 0).count(),
+                            None => strlen(p as *const u8),
+                        }
+                    } else if sp.prec == Some(0) {
+                        0
+                    } else {
+                        strlen(p as *const u8)
                     };
-                    conv_narrow(std::slice::from_raw_parts(p as *const u8, n), out.wide)
-                };
-                let units = match sp.prec {
-                    Some(pr) if units.len() > pr => units[..pr].to_vec(),
-                    _ => units,
+                    match conv_narrow(std::slice::from_raw_parts(p as *const u8, n), out.wide, cp, sp.prec) {
+                        Ok(u) => u,
+                        Err(()) => {
+                            super::errno::set(super::errno::EILSEQ);
+                            return None;
+                        }
+                    }
                 };
                 pad_field(&mut out, &sp, &units);
             }
@@ -513,25 +565,65 @@ unsafe fn format_with_locale(
     Some(out.units)
 }
 
-fn conv_wide(s: &[u16], out_wide: bool) -> Vec<u32> {
+fn conv_wide(s: &[u16], out_wide: bool, cp: u32, max_out: Option<usize>) -> Result<Vec<u32>, ()> {
     if out_wide {
-        s.iter().map(|&c| c as u32).collect()
-    } else {
-        // wide -> narrow: UTF-8 (our ACP is 65001).
-        String::from_utf16_lossy(s).bytes().map(|b| b as u32).collect()
+        let len = max_out.map_or(s.len(), |pr| pr.min(s.len()));
+        return Ok(s[..len].iter().map(|&c| c as u32).collect());
     }
+    if max_out == Some(0) {
+        return Ok(Vec::new());
+    }
+    let Some(lim) = max_out else {
+        return super::convert::wc_encode_slice_cp(cp, s)
+            .map(|bytes| bytes.into_iter().map(|b| b as u32).collect());
+    };
+    let mut out = Vec::with_capacity(lim.min(s.len() * 2));
+    let mut idx = 0usize;
+    while idx < s.len() && out.len() < lim {
+        let step = if (0xD800..=0xDBFF).contains(&s[idx])
+            && idx + 1 < s.len()
+            && (0xDC00..=0xDFFF).contains(&s[idx + 1])
+        {
+            2
+        } else {
+            1
+        };
+        let bytes = super::convert::wc_encode_slice_cp(cp, &s[idx..idx + step])?;
+        if out.len() + bytes.len() > lim {
+            break;
+        }
+        out.extend(bytes.into_iter().map(|b| b as u32));
+        idx += step;
+    }
+    Ok(out)
 }
 
-fn conv_narrow(s: &[u8], out_wide: bool) -> Vec<u32> {
-    if out_wide {
-        if super::locale::c_locale_active() {
-            s.iter().map(|&b| b as u32).collect()
-        } else {
-            String::from_utf8_lossy(s).encode_utf16().map(|c| c as u32).collect()
-        }
-    } else {
-        s.iter().map(|&b| b as u32).collect()
+fn conv_narrow(s: &[u8], out_wide: bool, cp: u32, max_out: Option<usize>) -> Result<Vec<u32>, ()> {
+    if !out_wide {
+        let len = max_out.map_or(s.len(), |pr| pr.min(s.len()));
+        return Ok(s[..len].iter().map(|&b| b as u32).collect());
     }
+    if max_out == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(max_out.map_or(s.len(), |pr| pr.min(s.len())));
+    let mut pos = 0usize;
+    while pos < s.len() {
+        if max_out.is_some_and(|lim| out.len() >= lim) {
+            break;
+        }
+        match super::convert::mb_decode_cp(cp, &s[pos..]) {
+            Ok(Some((w, used))) => {
+                if max_out.is_some_and(|lim| out.len() + w.len() > lim) {
+                    break;
+                }
+                out.extend(w.into_iter().map(|u| u as u32));
+                pos += used;
+            }
+            Ok(None) | Err(()) => return Err(()),
+        }
+    }
+    Ok(out)
 }
 
 /// Narrow output as bytes.
@@ -849,6 +941,184 @@ mod tests {
                 6
             );
             assert_eq!(__stdio_common_vsprintf(0, std::ptr::null_mut(), 0, fmt.as_ptr(), std::ptr::null_mut(), std::ptr::null()), 6);
+        }
+    }
+
+    #[test]
+    fn lc_ctype_string_and_char_conversions() {
+        unsafe {
+            let wide_ae_euro: Vec<u16> = "ä€\0".encode_utf16().collect();
+            let wide_ja: Vec<u16> = "あい\0".encode_utf16().collect();
+            let cp1252_ae_euro: [u8; 3] = [0xE4, 0x80, 0];
+            let cp932_a: [u8; 3] = [0x82, 0xA0, 0];
+
+            // 1. Global setlocale(LC_CTYPE, "de-DE") selects CP1252.
+            assert!(!crate::ucrt::locale::setlocale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr()).is_null());
+            let mut nbuf = [0u8; 32];
+            let args_w = [wide_ae_euro.as_ptr() as u64];
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%ls\0".as_ptr(),
+                std::ptr::null_mut(),
+                args_w.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&nbuf[..2], &[0xE4, 0x80]);
+
+            // %lc encodes L'€' -> 0x80 in CP1252.
+            let args_lc = [0x20ACu64];
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%lc\0".as_ptr(),
+                std::ptr::null_mut(),
+                args_lc.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 1);
+            assert_eq!(nbuf[0], 0x80);
+
+            // Wide %hs decodes CP1252 [0xE4, 0x80] -> L"ä€" (not U+FFFD).
+            let mut wbuf = [0u16; 32];
+            let fmt_hs: Vec<u16> = "%hs\0".encode_utf16().collect();
+            let args_n = [cp1252_ae_euro.as_ptr() as u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_hs.as_ptr(),
+                std::ptr::null_mut(),
+                args_n.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&wbuf[..2], &[0x00E4, 0x20AC]);
+
+            // Wide %hc decodes CP1252 0x80 -> L'€'.
+            let fmt_hc: Vec<u16> = "%hc\0".encode_utf16().collect();
+            let args_hc = [0x80u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_hc.as_ptr(),
+                std::ptr::null_mut(),
+                args_hc.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 1);
+            assert_eq!(wbuf[0], 0x20AC);
+
+            // Unrepresentable wide char in CP1252 fails with -1 + EILSEQ.
+            crate::ucrt::errno::set(0);
+            let args_ja = [wide_ja.as_ptr() as u64];
+            assert_eq!(
+                __stdio_common_vsprintf(
+                    STANDARD_SNPRINTF_BEHAVIOR,
+                    nbuf.as_mut_ptr(),
+                    nbuf.len(),
+                    b"%ls\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_ja.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+
+            // Restore global C locale, then verify explicit _locale_t overrides.
+            assert!(!crate::ucrt::locale::setlocale(0 /* LC_ALL */, b"C\0".as_ptr()).is_null());
+
+            let loc_de = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%ls\0".as_ptr(),
+                loc_de,
+                args_w.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&nbuf[..2], &[0xE4, 0x80]);
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_hs.as_ptr(),
+                loc_de,
+                args_n.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&wbuf[..2], &[0x00E4, 0x20AC]);
+            crate::ucrt::locale::_free_locale(loc_de);
+
+            // Explicit ja-JP (CP932) DBCS roundtrip, precision boundary, and strict invalid rejection.
+            let loc_ja = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr());
+            assert!(!loc_ja.is_null());
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%.2ls\0".as_ptr(),
+                loc_ja,
+                args_ja.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&nbuf[..2], &[0x82, 0xA0]);
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%.1ls\0".as_ptr(),
+                loc_ja,
+                args_ja.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 0);
+            let args_ja_n = [cp932_a.as_ptr() as u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_hs.as_ptr(),
+                loc_ja,
+                args_ja_n.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 1);
+            assert_eq!(wbuf[0], 0x3042);
+            let bad_cp932: [u8; 3] = [0x81, 0x20, 0];
+            let args_bad = [bad_cp932.as_ptr() as u64];
+            crate::ucrt::errno::set(0);
+            assert_eq!(
+                __stdio_common_vswprintf(
+                    STANDARD_SNPRINTF_BEHAVIOR,
+                    wbuf.as_mut_ptr(),
+                    wbuf.len(),
+                    fmt_hs.as_ptr(),
+                    loc_ja,
+                    args_bad.as_ptr() as *const u8,
+                ),
+                -1
+            );
+            assert_eq!(crate::ucrt::errno::get(), crate::ucrt::errno::EILSEQ);
+            crate::ucrt::locale::_free_locale(loc_ja);
+
+            // Explicit UTF-8 locale handles multi-byte precision on wide-output %hs cleanly.
+            let loc_u8 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE.utf8\0".as_ptr());
+            assert!(!loc_u8.is_null());
+            let fmt_prec_hs: Vec<u16> = "%.2hs\0".encode_utf16().collect();
+            let utf8_src = "ää\0";
+            let args_u8 = [utf8_src.as_ptr() as u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_prec_hs.as_ptr(),
+                loc_u8,
+                args_u8.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&wbuf[..2], &[0x00E4, 0x00E4]);
+            crate::ucrt::locale::_free_locale(loc_u8);
         }
     }
 }

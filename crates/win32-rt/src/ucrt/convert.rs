@@ -584,13 +584,12 @@ pub unsafe extern "win64" fn _ui64tow_s(v: u64, buf: *mut u16, sz: usize, r: i32
 // Multibyte <-> wide (CRT locale code page: 0 = "C" byte mapping, 65001 = UTF-8)
 // ---------------------------------------------------------------------------
 
-/// Decode one multibyte char using the active CRT `LC_CTYPE` code page.
+/// Decode one multibyte char using `cp` (`0` = "C" 1:1 bytes, `65001` = UTF-8, else Windows code page).
 /// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
-fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
+pub(super) fn mb_decode_cp(cp: u32, bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let cp = mb_cp();
     if cp == 0 {
         return Ok(Some((vec![bytes[0] as u16], 1)));
     }
@@ -626,8 +625,29 @@ fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     Ok(Some((w, len)))
 }
 
-pub(super) fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
-    let cp = mb_cp();
+/// Strictly decode an entire multibyte byte slice into UTF-16 under `cp`.
+pub(super) fn mb_decode_slice_cp(cp: u32, bytes: &[u8]) -> Result<Vec<u16>, ()> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match mb_decode_cp(cp, &bytes[pos..]) {
+            Ok(Some((w, used))) => {
+                out.extend_from_slice(&w);
+                pos += used;
+            }
+            Ok(None) | Err(()) => return Err(()),
+        }
+    }
+    Ok(out)
+}
+
+/// Decode one multibyte char using the active CRT `LC_CTYPE` code page.
+/// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
+fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
+    mb_decode_cp(mb_cp(), bytes)
+}
+
+pub(super) fn wc_encode_cp(cp: u32, c: u16) -> Result<Vec<u8>, ()> {
     if cp == 0 {
         if c < 256 {
             Ok(vec![c as u8])
@@ -650,11 +670,14 @@ pub(super) fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
     }
 }
 
-pub(super) fn wc_encode_slice(units: &[u16]) -> Result<Vec<u8>, ()> {
+pub(super) fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
+    wc_encode_cp(mb_cp(), c)
+}
+
+pub(super) fn wc_encode_slice_cp(cp: u32, units: &[u16]) -> Result<Vec<u8>, ()> {
     if units.is_empty() {
         return Ok(Vec::new());
     }
-    let cp = mb_cp();
     if cp == 0 {
         let mut out = Vec::with_capacity(units.len());
         for &u in units {
@@ -683,6 +706,10 @@ pub(super) fn wc_encode_slice(units: &[u16]) -> Result<Vec<u8>, ()> {
             Ok(bytes)
         }
     }
+}
+
+pub(super) fn wc_encode_slice(units: &[u16]) -> Result<Vec<u8>, ()> {
+    wc_encode_slice_cp(mb_cp(), units)
 }
 
 unsafe fn mbs_to_wcs(dst: *mut u16, src: *const u8, n: usize) -> usize {
