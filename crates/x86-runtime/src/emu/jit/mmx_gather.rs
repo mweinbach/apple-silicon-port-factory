@@ -13,26 +13,33 @@ use crate::emu::fast::{self, FastOp};
 use crate::emu::mem;
 
 impl Tr<'_> {
-    /// Load 64-bit MMX register `mm` (`0..7`) from `X87State::regs[mm][0..8]` into `d(vd)`
-    /// (zero-extending bits `[127:64]` of `v(vd)`). Clobbers `XA`.
-    fn load_mmx_d(&mut self, vd: u32, mm: u8) {
+    /// Load `Cpu::jx.x87_state` into `XA` and invalidate the `XA` address cache.
+    fn load_x87_ptr_into_xa(&mut self) {
+        self.xa_key = None;
         self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+    }
+
+    /// Load 64-bit MMX register `mm` (`0..7`) from `X87State::regs[mm][0..8]` into `d(vd)`
+    /// (zero-extending bits `[127:64]` of `v(vd)`). Clobbers `XA` and invalidates `self.xa_key`.
+    fn load_mmx_d(&mut self, vd: u32, mm: u8) {
+        self.load_x87_ptr_into_xa();
         self.a.ldur_stur_v(true, 64, vd, XA, X87_OFF_REGS + (mm as i32 & 7) * 10);
     }
 
-    /// Transition x87 state to MMX mode (`top = 0`, `valid_mask = 0xFF`). Clobbers `XA`, `XS`.
+    /// Transition x87 state to MMX mode (`top = 0`, `valid_mask = 0xFF`). Clobbers `XA`, `XS`
+    /// and invalidates `self.xa_key`.
     fn emit_mmx_tag_valid(&mut self) {
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_ptr_into_xa();
         self.a.str(8, ZR, XA, X87_OFF_TOP);
         self.a.movz(false, XS, 0xFF, 0);
         self.a.str(8, XS, XA, X87_OFF_VALID_MASK);
     }
 
     /// Store `d(vd)` into `X87State::regs[mm][0..8]`, fill exponent bytes `[8..10]` with `0xFFFF`,
-    /// and set `top = 0`, `valid_mask = 0xFF`. Clobbers `XA`, `XS`.
+    /// and set `top = 0`, `valid_mask = 0xFF`. Clobbers `XA`, `XS` and invalidates `self.xa_key`.
     fn store_mmx_d_and_tag(&mut self, vd: u32, mm: u8) {
         let off = X87_OFF_REGS + (mm as i32 & 7) * 10;
-        self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+        self.load_x87_ptr_into_xa();
         self.a.ldur_stur_v(false, 64, vd, XA, off);
         self.a.movz(false, XS, 0xFFFF, 0);
         self.a.ldur_stur(false, 16, XS, XA, off + 8);
@@ -231,6 +238,7 @@ impl Tr<'_> {
 
         // Conservatively mark dst YMM dirty if this gather can write to `Cpu::ymm_hi[d]` so
         // partial faults or normal completion never leave `ymm_dirty` stale.
+        self.xa_key = None;
         self.ymm_clean &= !(1u16 << d);
         self.ymm_clean &= !(1u16 << m);
         if dst_ymm {
@@ -354,7 +362,7 @@ impl Tr<'_> {
                     self.a.addsub_rr(true, false, false, T5, T5, XS, 0);
                 }
                 if is_mmx {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.ldur_stur(true, 64, T1, XA, X87_OFF_REGS + (op.r0 as i32 & 7) * 10);
                     self.a.ldur_stur(true, 64, T2, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
                     self.emit_maskmov_8bytes(k, false);
@@ -480,7 +488,7 @@ impl Tr<'_> {
             }
             K_MMX_MISC => match op.x & 0x3F {
                 MMX_EMMS => {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.str(8, ZR, XA, X87_OFF_VALID_MASK);
                 }
                 MMX_MOVD_MG => {
@@ -493,13 +501,13 @@ impl Tr<'_> {
                     self.store_mmx_d_and_tag(0, op.r0);
                 }
                 MMX_MOVD_GM => {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
                     self.wr_gpr(op.r0, 32, T0);
                     self.emit_mmx_tag_valid();
                 }
                 MMX_MOVD_MEM_M => {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.ldur_stur(true, 32, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
                     self.store_op(k, T0, op, 32);
                     self.emit_mmx_tag_valid();
@@ -518,13 +526,13 @@ impl Tr<'_> {
                     self.store_mmx_d_and_tag(0, op.r0);
                 }
                 MMX_MOVQ_GM => {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
                     self.wr_gpr(op.r0, 64, T0);
                     self.emit_mmx_tag_valid();
                 }
                 MMX_MOVQ_MEM_M => {
-                    self.a.ldr(64, XA, XCPU, OFF_X87_STATE);
+                    self.load_x87_ptr_into_xa();
                     self.a.ldur_stur(true, 64, T0, XA, X87_OFF_REGS + (op.r1 as i32 & 7) * 10);
                     self.store_op(k, T0, op, 64);
                     self.emit_mmx_tag_valid();

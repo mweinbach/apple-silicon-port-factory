@@ -2819,3 +2819,76 @@ fn avx2_gather_jit_and_aot_partial_fault_restart_and_ud() {
         }
     });
 }
+
+/// Regression test for `XA` (`x16`) address-cache invalidation when MMX helpers (`movq mm, [b+i]`,
+/// `movq [b+i], mm`, `paddd mm, [b+i]`, `emms`, `maskmovq`) or `vpgather*` overwrite `XA` in the
+/// same translated block as indexed `[rcx + rdx]` loads/stores.
+#[test]
+fn mmx_and_gather_invalidate_xa_address_cache_in_same_block() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rdx, 16u64).unwrap();
+    // 1. movq mm0, [rcx+rdx] populates xa_key=(rcx, rdx, 0, 0) in load_op, then overwrites XA
+    //    with X87State in store_mmx_d_and_tag. The immediately following indexed load/store MUST
+    //    NOT reuse stale XA (which points at X87State instead of [rcx+rdx]!).
+    a.movq(mm0, qword_ptr(rcx + rdx)).unwrap();
+    a.mov(rax, qword_ptr(rcx + rdx)).unwrap();
+    a.mov(qword_ptr(rcx + 64), rax).unwrap();
+    // 2. movq [rcx+rdx], mm1 populates xa_key in store_op, then emit_mmx_tag_valid overwrites XA.
+    a.movq(mm1, qword_ptr(rcx + 8)).unwrap();
+    a.movq(qword_ptr(rcx + rdx), mm1).unwrap();
+    a.mov(r8, 0x1234_5678_9ABC_DEF0u64 as i64).unwrap();
+    a.mov(qword_ptr(rcx + rdx), r8).unwrap(); // must store to guest [rcx+16], NOT corrupt X87State!
+    a.movq(qword_ptr(rcx + 72), mm0).unwrap(); // verify X87State::regs[0] was NOT corrupted!
+    // 3. Indexed load followed by emms + indexed load
+    a.mov(r9, qword_ptr(rcx + rdx)).unwrap();
+    a.emms().unwrap();
+    a.mov(r10, qword_ptr(rcx + rdx)).unwrap();
+    a.mov(qword_ptr(rcx + 80), r9).unwrap();
+    a.mov(qword_ptr(rcx + 88), r10).unwrap();
+    // 4. Indexed load followed by vpgatherdd + indexed load
+    a.vpxor(xmm1, xmm1, xmm1).unwrap();
+    a.vpcmpeqd(xmm2, xmm2, xmm2).unwrap();
+    a.mov(rax, qword_ptr(rcx + rdx)).unwrap();
+    a.vpgatherdd_3(xmm0, dword_ptr(rcx + xmm1 * 4), xmm2).unwrap();
+    a.mov(r11, qword_ptr(rcx + rdx)).unwrap();
+    a.mov(qword_ptr(rcx + 96), rax).unwrap();
+    a.mov(qword_ptr(rcx + 104), r11).unwrap();
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 128];
+    init[0..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    init[8..16].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+    init[16..24].copy_from_slice(&0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes());
+
+    struct KnobsReset;
+    impl Drop for KnobsReset {
+        fn drop(&mut self) {
+            jit::test_set_knobs(jit::TestKnobs::NONE);
+        }
+    }
+    let _reset = KnobsReset;
+    jit::test_set_knobs(jit::TestKnobs {
+        hw_range: Some(true),
+        lse2_trap: Some(true),
+        ..jit::TestKnobs::NONE
+    });
+
+    let mut generic_ref: Option<Vec<u8>> = None;
+    run_tiers(&code, &init, |out| {
+        if let Some(ref g) = generic_ref {
+            assert_eq!(out, g.as_slice(), "XA address cache stale after MMX/gather");
+        } else {
+            generic_ref = Some(out.to_vec());
+        }
+        let rd64 = |off: usize| u64::from_le_bytes(out[off..off + 8].try_into().unwrap());
+        assert_eq!(rd64(64), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(rd64(72), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(rd64(16), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(rd64(80), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(rd64(88), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(rd64(96), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(rd64(104), 0x1234_5678_9ABC_DEF0);
+    });
+}
