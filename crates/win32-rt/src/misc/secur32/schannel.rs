@@ -1466,6 +1466,7 @@ pub(super) unsafe fn acquire_credentials_impl(
                     const MAX_TLS_PARAMETERS: usize = 32;
                     const MAX_ALPN_IDS_PER_PARAM: usize = 32;
                     const TLS_PARAMETERS_SIZE: usize = 0x28;
+                    const TLS_PARAMS_OPTIONAL: u32 = 0x0000_0001;
                     if p_params.is_null() || (c_params as usize) > MAX_TLS_PARAMETERS {
                         return SEC_E_INTERNAL_ERROR;
                     }
@@ -1478,12 +1479,33 @@ pub(super) unsafe fn acquire_credentials_impl(
                     for i in 0..c_params as usize {
                         // TLS_PARAMETERS (Win64, 0x28 bytes):
                         //   +0x00 cAlpnIds (u32), +0x08 rgstrAlpnIds (PUNICODE_STRING),
-                        //   +0x10 grbitDisabledProtocols (u32), ...
+                        //   +0x10 grbitDisabledProtocols (u32), +0x14 cDisabledCrypto (u32),
+                        //   +0x18 pDisabledCrypto (PCRYPTO_SETTINGS), +0x20 dwFlags (u32)
                         let entry = p_params.add(i * TLS_PARAMETERS_SIZE);
                         let c_alpn_ids = std::ptr::read_unaligned(entry as *const u32) as usize;
                         let rgstr_alpn_ids =
                             std::ptr::read_unaligned(entry.add(0x08) as *const *const u8);
                         let disabled = std::ptr::read_unaligned(entry.add(0x10) as *const u32);
+                        let c_disabled_crypto =
+                            std::ptr::read_unaligned(entry.add(0x14) as *const u32);
+                        let p_disabled_crypto =
+                            std::ptr::read_unaligned(entry.add(0x18) as *const *const c_void);
+                        let param_flags = std::ptr::read_unaligned(entry.add(0x20) as *const u32);
+                        if c_disabled_crypto > 0 {
+                            if p_disabled_crypto.is_null() {
+                                return SEC_E_INTERNAL_ERROR;
+                            }
+                            if (param_flags & TLS_PARAMS_OPTIONAL) != 0 {
+                                log::debug!(
+                                    "AcquireCredentialsHandle(SCH_CREDENTIALS): skipping optional TLS_PARAMETERS[{i}] with cDisabledCrypto={c_disabled_crypto}"
+                                );
+                                continue;
+                            }
+                            log::warn!(
+                                "AcquireCredentialsHandle(SCH_CREDENTIALS): rejecting mandatory TLS_PARAMETERS[{i}] with unsupported cDisabledCrypto={c_disabled_crypto}"
+                            );
+                            return SEC_E_ALGORITHM_MISMATCH;
+                        }
                         let mut alpn_ids = Vec::with_capacity(c_alpn_ids.min(MAX_ALPN_IDS_PER_PARAM));
                         if c_alpn_ids > 0 {
                             if rgstr_alpn_ids.is_null() || c_alpn_ids > MAX_ALPN_IDS_PER_PARAM {
@@ -1521,21 +1543,23 @@ pub(super) unsafe fn acquire_credentials_impl(
                             disabled_protocols: disabled,
                         });
                     }
-                    if has_wildcard {
-                        client_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_CLIENT) == 0;
-                        client_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_CLIENT) == 0;
-                        server_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_SERVER) == 0;
-                        server_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_SERVER) == 0;
-                    } else {
-                        client_enable_tls12 = any_client_12;
-                        client_enable_tls13 = any_client_13;
-                        server_enable_tls12 = any_server_12;
-                        server_enable_tls13 = any_server_13;
-                    }
-                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
-                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
-                    {
-                        return SEC_E_ALGORITHM_MISMATCH;
+                    if !tls_param_rules.is_empty() {
+                        if has_wildcard {
+                            client_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                            client_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                            server_enable_tls12 = (wildcard_disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                            server_enable_tls13 = (wildcard_disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                        } else {
+                            client_enable_tls12 = any_client_12;
+                            client_enable_tls13 = any_client_13;
+                            server_enable_tls12 = any_server_12;
+                            server_enable_tls13 = any_server_13;
+                        }
+                        if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                            || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                        {
+                            return SEC_E_ALGORITHM_MISMATCH;
+                        }
                     }
                 }
             }

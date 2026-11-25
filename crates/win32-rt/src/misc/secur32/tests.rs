@@ -4490,6 +4490,81 @@ fn sch_credentials_v5_honors_multiple_alpn_scoped_tls_parameters() {
         assert_eq!(r_global_h2_tls13, Ok(SP_PROT_TLS1_3_SERVER));
 
         FreeCredentialsHandle(&mut srv_cred_global as *mut _ as *mut c_void);
+
+        // 6. Mandatory TLS_PARAMETERS with nonzero cDisabledCrypto must be rejected honestly
+        //    instead of silently ignored, while TLS_PARAMS_OPTIONAL (1) skips the unsupported entry.
+        let dummy_crypto_settings = [0u8; 0x30];
+        let mut tls_param_crypto = [0u8; 0x28];
+        std::ptr::write_unaligned(tls_param_crypto.as_mut_ptr().add(0x14) as *mut u32, 1u32); // cDisabledCrypto = 1
+        std::ptr::write_unaligned(
+            tls_param_crypto.as_mut_ptr().add(0x18) as *mut *const u8,
+            dummy_crypto_settings.as_ptr(),
+        );
+        std::ptr::write_unaligned(srv_v5.as_mut_ptr().add(0x38) as *mut u32, 1u32);
+        std::ptr::write_unaligned(
+            srv_v5.as_mut_ptr().add(0x40) as *mut *const u8,
+            tls_param_crypto.as_ptr(),
+        );
+        let mut bad_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_v5.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bad_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            super::schannel::SEC_E_ALGORITHM_MISMATCH,
+            "mandatory TLS_PARAMETERS with nonzero cDisabledCrypto must fail rather than silently claim enforcement"
+        );
+
+        // Null pDisabledCrypto with nonzero cDisabledCrypto -> SEC_E_INTERNAL_ERROR.
+        std::ptr::write_unaligned(
+            tls_param_crypto.as_mut_ptr().add(0x18) as *mut *const u8,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_v5.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bad_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_INTERNAL_ERROR
+        );
+
+        // With TLS_PARAMS_OPTIONAL (dwFlags = 1) and valid pDisabledCrypto, the optional entry is skipped.
+        std::ptr::write_unaligned(
+            tls_param_crypto.as_mut_ptr().add(0x18) as *mut *const u8,
+            dummy_crypto_settings.as_ptr(),
+        );
+        std::ptr::write_unaligned(tls_param_crypto.as_mut_ptr().add(0x20) as *mut u32, 1u32); // TLS_PARAMS_OPTIONAL
+        let mut opt_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_v5.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut opt_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        FreeCredentialsHandle(&mut opt_cred as *mut _ as *mut c_void);
+
         crypt32::CertFreeCertificateContext(server_cert);
     }
 }
