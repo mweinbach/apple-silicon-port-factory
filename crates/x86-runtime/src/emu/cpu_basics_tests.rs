@@ -90,6 +90,86 @@ fn run_tiers(code: &[u8], init: &[u8], mut check: impl FnMut(&[u8])) {
 }
 
 #[test]
+fn raw_x87_nan_store_reports_invalid_only_when_consumed() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fnstsw(word_ptr(rcx + 16)).unwrap();
+    a.fxam().unwrap();
+    a.fnstsw(word_ptr(rcx + 18)).unwrap();
+    a.fst(qword_ptr(rcx + 24)).unwrap();
+    a.fnstsw(word_ptr(rcx + 20)).unwrap();
+    a.fnclex().unwrap();
+    a.fstp(qword_ptr(rcx + 32)).unwrap();
+    a.fnstsw(word_ptr(rcx + 22)).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    for quiet_bit in [0, 1u64 << 62] {
+        let mut init = [0u8; 40];
+        init[..8].copy_from_slice(&(0x8000_1234_5678_9000 | quiet_bit).to_le_bytes());
+        init[8..10].copy_from_slice(&0x7fffu16.to_le_bytes());
+        let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+        let check = |out: &[u8]| {
+            let sw = |i| u16::from_le_bytes([out[i], out[i + 1]]);
+            assert_eq!(sw(16) & 0x3f, 0, "FLD m80 is a raw transfer");
+            assert_eq!(sw(18) & 0x473f, 0x0100, "FXAM classifies either NaN without raising IE");
+            let invalid = u16::from(quiet_bit == 0);
+            assert_eq!(sw(20) & 0x3f, invalid, "FST m64");
+            assert_eq!(sw(22) & 0x3f, invalid, "FSTP m64 after FNCLEX");
+            for off in [24, 32] {
+                assert_eq!(&out[off..off + 8], &0x7ff8_0002_468a_cf12u64.to_le_bytes());
+            }
+        };
+        if let Some(control) = &oracle {
+            check(control);
+        }
+        run_tiers(&code, &init, |out| {
+            check(out);
+            if let Some(control) = &oracle {
+                assert_eq!(out, control);
+            }
+        });
+    }
+}
+
+#[test]
+fn fprem_raw_operand_exception_priority() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.fninit().unwrap();
+    a.fld(tbyte_ptr(rcx + 16)).unwrap();
+    a.fld(tbyte_ptr(rcx)).unwrap();
+    a.fprem().unwrap();
+    a.fnstsw(word_ptr(rcx + 32)).unwrap();
+    a.fninit().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let raw = |sig: u64, exponent: u16| {
+        let mut slot = [0; 10];
+        slot[..8].copy_from_slice(&sig.to_le_bytes());
+        slot[8..].copy_from_slice(&exponent.to_le_bytes());
+        slot
+    };
+    let one = raw(1 << 63, 0x3fff);
+    let denormal = raw(1, 0);
+    let snan = raw((1 << 63) | 1, 0x7fff);
+    let qnan = raw((3 << 62) | 1, 0x7fff);
+    for (dividend, divisor, flags) in
+        [(denormal, one, 2), (snan, one, 1), (denormal, snan, 1), (qnan, denormal, 0)]
+    {
+        let mut init = [0; 34];
+        init[..10].copy_from_slice(&dividend);
+        init[16..26].copy_from_slice(&divisor);
+        let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+        run_tiers(&code, &init, |out| {
+            assert_eq!(out[32] & 0x3f, flags);
+            if let Some(control) = &oracle {
+                assert_eq!(&out[32..], &control[32..]);
+            }
+        });
+    }
+}
+
+#[test]
 fn xstate_roundtrip_across_tiers() {
     // Rosetta advertises XSAVE but not XSAVEOPT or XSAVEC. All three save formats are
     // independently checked against the same restored x87, XMM, YMM and MXCSR values.

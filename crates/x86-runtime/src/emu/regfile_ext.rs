@@ -110,6 +110,10 @@ impl Fp80 {
         }
     }
 
+    fn is_signaling_nan(self) -> bool {
+        self.kind == Fp80Kind::Nan && self.sig & (1 << 62) == 0
+    }
+
     /// Round 80-bit extended precision back to IEEE-754 `f64` bits (round-to-nearest, ties-to-even),
     /// matching `fstp qword ptr [mem]` under the default x87 control word (`0x037F`).
     #[inline]
@@ -119,7 +123,7 @@ impl Fp80 {
             Fp80Kind::Zero => s,
             Fp80Kind::Inf => s | 0x7FF0_0000_0000_0000,
             Fp80Kind::Nan => {
-                if (self.sig & (1u64 << 62)) == 0 {
+                if self.is_signaling_nan() {
                     *sw |= 0x0001; // IE
                 }
                 let f = ((self.sig >> 11) & 0x000F_FFFF_FFFF_FFFF) | 0x0008_0000_0000_0000;
@@ -175,9 +179,9 @@ impl Fp80 {
         }
     }
 
-    /// Convert an 80-bit x87 memory operand (`m80fp`, 10 little-endian bytes) to [`Fp80`].
+    /// Decode a raw x87 slot without quieting signaling NaNs. Each instruction applies its own exceptions.
     #[inline]
-    fn from_f80_bytes(b: [u8; 10], sw: &mut u16) -> Self {
+    fn from_f80_bytes(b: [u8; 10]) -> Self {
         let sig = u64::from_le_bytes(b[0..8].try_into().unwrap());
         let se = u16::from_le_bytes([b[8], b[9]]);
         let sign = (se >> 15) as u8;
@@ -186,16 +190,12 @@ impl Fp80 {
             if (sig & 0x7FFF_FFFF_FFFF_FFFF) == 0 {
                 Self { kind: Fp80Kind::Inf, sign, exp: 0, sig: 1u64 << 63 }
             } else {
-                if (sig & (1u64 << 62)) == 0 {
-                    *sw |= 0x0001; // IE
-                }
-                Self { kind: Fp80Kind::Nan, sign, exp: 0, sig: sig | (1u64 << 63) | (1u64 << 62) }
+                Self { kind: Fp80Kind::Nan, sign, exp: 0, sig }
             }
         } else if e == 0 {
             if sig == 0 {
                 Self { kind: Fp80Kind::Zero, sign, exp: 0, sig: 0 }
             } else {
-                *sw |= 0x0002; // DE
                 let clz = sig.leading_zeros() as i32;
                 Self { kind: Fp80Kind::Finite, sign, exp: -16382 - clz, sig: sig << (clz as u32) }
             }
@@ -351,7 +351,7 @@ impl X87State {
     }
 
     fn value(&self, slot: usize) -> Fp80 {
-        Fp80::from_f80_bytes(self.regs[slot], &mut 0)
+        Fp80::from_f80_bytes(self.regs[slot])
     }
 
     #[inline(always)]
@@ -448,6 +448,9 @@ impl X87State {
         let b = self.value(p1);
 
         if a.kind == Fp80Kind::Nan || b.kind == Fp80Kind::Nan {
+            if a.is_signaling_nan() || b.is_signaling_nan() {
+                self.sw |= 0x0001; // IE before quieting the selected NaN.
+            }
             let mut res = if a.kind == Fp80Kind::Nan && b.kind == Fp80Kind::Nan {
                 let pa = a.sig & 0x3FFF_FFFF_FFFF_FFFF;
                 let pb = b.sig & 0x3FFF_FFFF_FFFF_FFFF;
@@ -481,6 +484,13 @@ impl X87State {
             return;
         }
 
+        // A NaN or invalid remainder takes priority over a denormal operand.
+        for (slot, value) in [(p0, a), (p1, b)] {
+            let raw = &self.regs[slot];
+            if value.kind == Fp80Kind::Finite && raw[8] == 0 && raw[9] & 0x7f == 0 {
+                self.sw |= 0x0002;
+            }
+        }
         if a.kind == Fp80Kind::Zero || b.kind == Fp80Kind::Inf {
             // Exact remainder is `a` (including `-0.0` sign); quotient Q = 0 -> C0=C1=C2=C3=0.
             self.sync_top();
