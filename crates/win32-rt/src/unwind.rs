@@ -906,41 +906,53 @@ unsafe fn rd<T: Copy>(a: u64) -> T {
 }
 
 fn safe_rd<T: Copy>(addr: u64) -> Option<T> {
+    safe_rd_with(addr, &mut |a, b| crate::crash::safe_read(a, b))
+}
+
+fn safe_rd_with<T: Copy>(
+    addr: u64,
+    read_mem: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> Option<T> {
     let mut val = std::mem::MaybeUninit::<T>::uninit();
     // SAFETY: `val` is properly sized for `size_of::<T>()` bytes and `T: Copy`.
     let bytes = unsafe {
         std::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, std::mem::size_of::<T>())
     };
-    crate::crash::safe_read(addr, bytes).then(|| unsafe { val.assume_init() })
+    read_mem(addr, bytes).then(|| unsafe { val.assume_init() })
 }
 
-fn is_inside_epilog_safe(mut pc: u64, base: u64, f: &RuntimeFunction) -> bool {
+fn is_inside_epilog_with(
+    mut pc: u64,
+    base: u64,
+    f: &RuntimeFunction,
+    read_mem: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> bool {
     let in_func = |p: u64| {
         p >= base && {
             let r = p - base;
             r >= f.begin_rva as u64 && r < f.end_rva as u64
         }
     };
-    let Some(b0) = safe_rd::<u8>(pc) else { return false };
+    let Some(b0) = safe_rd_with::<u8>(pc, read_mem) else { return false };
     if b0 & 0xf8 == 0x48 {
-        let Some(b1) = safe_rd::<u8>(pc.wrapping_add(1)) else { return false };
+        let Some(b1) = safe_rd_with::<u8>(pc.wrapping_add(1), read_mem) else { return false };
         match b1 {
             0x81 => {
-                if b0 == 0x48 && safe_rd::<u8>(pc.wrapping_add(2)) == Some(0xc4) {
+                if b0 == 0x48 && safe_rd_with::<u8>(pc.wrapping_add(2), read_mem) == Some(0xc4) {
                     pc = pc.wrapping_add(7);
                 } else {
                     return false;
                 }
             }
             0x83 => {
-                if b0 == 0x48 && safe_rd::<u8>(pc.wrapping_add(2)) == Some(0xc4) {
+                if b0 == 0x48 && safe_rd_with::<u8>(pc.wrapping_add(2), read_mem) == Some(0xc4) {
                     pc = pc.wrapping_add(4);
                 } else {
                     return false;
                 }
             }
             0x8d => {
-                let Some(modrm) = safe_rd::<u8>(pc.wrapping_add(2)) else { return false };
+                let Some(modrm) = safe_rd_with::<u8>(pc.wrapping_add(2), read_mem) else { return false };
                 if b0 & 0x06 != 0 || (modrm >> 3) & 7 != 4 || modrm & 7 == 4 {
                     return false;
                 }
@@ -954,10 +966,10 @@ fn is_inside_epilog_safe(mut pc: u64, base: u64, f: &RuntimeFunction) -> bool {
         }
     }
     for _ in 0..64 {
-        let Some(mut op) = safe_rd::<u8>(pc) else { return false };
+        let Some(mut op) = safe_rd_with::<u8>(pc, read_mem) else { return false };
         if op & 0xf0 == 0x40 {
             pc = pc.wrapping_add(1);
-            let Some(next_op) = safe_rd::<u8>(pc) else { return false };
+            let Some(next_op) = safe_rd_with::<u8>(pc, read_mem) else { return false };
             op = next_op;
         }
         match op {
@@ -967,20 +979,20 @@ fn is_inside_epilog_safe(mut pc: u64, base: u64, f: &RuntimeFunction) -> bool {
             }
             0xc2 | 0xc3 => return true,
             0xe9 => {
-                let Some(rel) = safe_rd::<i32>(pc.wrapping_add(1)) else { return false };
+                let Some(rel) = safe_rd_with::<i32>(pc.wrapping_add(1), read_mem) else { return false };
                 pc = pc.wrapping_add(5).wrapping_add(rel as i64 as u64);
                 if in_func(pc) {
                     continue;
                 }
             }
             0xeb => {
-                let Some(rel) = safe_rd::<i8>(pc.wrapping_add(1)) else { return false };
+                let Some(rel) = safe_rd_with::<i8>(pc.wrapping_add(1), read_mem) else { return false };
                 pc = pc.wrapping_add(2).wrapping_add(rel as i64 as u64);
                 if in_func(pc) {
                     continue;
                 }
             }
-            0xf3 => return safe_rd::<u8>(pc.wrapping_add(1)) == Some(0xc3),
+            0xf3 => return safe_rd_with::<u8>(pc.wrapping_add(1), read_mem) == Some(0xc3),
             _ => {}
         }
         return false;
@@ -988,69 +1000,73 @@ fn is_inside_epilog_safe(mut pc: u64, base: u64, f: &RuntimeFunction) -> bool {
     false
 }
 
-fn interpret_epilog_safe(mut pc: u64, ctx: &mut Context) -> bool {
+fn interpret_epilog_with(
+    mut pc: u64,
+    ctx: &mut Context,
+    read_mem: &mut impl FnMut(u64, &mut [u8]) -> bool,
+) -> bool {
     for _ in 0..64 {
         let mut rex = 0u8;
-        let Some(mut op) = safe_rd::<u8>(pc) else { return false };
+        let Some(mut op) = safe_rd_with::<u8>(pc, read_mem) else { return false };
         if op & 0xf0 == 0x40 {
             rex = op & 0x0f;
             pc = pc.wrapping_add(1);
-            let Some(next_op) = safe_rd::<u8>(pc) else { return false };
+            let Some(next_op) = safe_rd_with::<u8>(pc, read_mem) else { return false };
             op = next_op;
         }
         match op {
             0x58..=0x5f => {
                 let r = (op - 0x58) as usize + (rex as usize & 1) * 8;
-                let Some(val) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
+                let Some(val) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
                 ctx.gpr[r] = val;
                 let Some(next_rsp) = ctx.gpr[RSP].checked_add(8) else { return false };
                 ctx.gpr[RSP] = next_rsp;
                 pc = pc.wrapping_add(1);
             }
             0x81 => {
-                let Some(disp) = safe_rd::<i32>(pc.wrapping_add(2)) else { return false };
+                let Some(disp) = safe_rd_with::<i32>(pc.wrapping_add(2), read_mem) else { return false };
                 ctx.gpr[RSP] = ctx.gpr[RSP].wrapping_add(disp as i64 as u64);
                 pc = pc.wrapping_add(6);
             }
             0x83 => {
-                let Some(disp) = safe_rd::<i8>(pc.wrapping_add(2)) else { return false };
+                let Some(disp) = safe_rd_with::<i8>(pc.wrapping_add(2), read_mem) else { return false };
                 ctx.gpr[RSP] = ctx.gpr[RSP].wrapping_add(disp as i64 as u64);
                 pc = pc.wrapping_add(3);
             }
             0x8d => {
-                let Some(modrm) = safe_rd::<u8>(pc.wrapping_add(1)) else { return false };
+                let Some(modrm) = safe_rd_with::<u8>(pc.wrapping_add(1), read_mem) else { return false };
                 let r = (modrm & 7) as usize + (rex as usize & 1) * 8;
                 if modrm >> 6 == 1 {
-                    let Some(disp) = safe_rd::<i8>(pc.wrapping_add(2)) else { return false };
+                    let Some(disp) = safe_rd_with::<i8>(pc.wrapping_add(2), read_mem) else { return false };
                     ctx.gpr[RSP] = ctx.gpr[r].wrapping_add(disp as i64 as u64);
                     pc = pc.wrapping_add(3);
                 } else {
-                    let Some(disp) = safe_rd::<i32>(pc.wrapping_add(2)) else { return false };
+                    let Some(disp) = safe_rd_with::<i32>(pc.wrapping_add(2), read_mem) else { return false };
                     ctx.gpr[RSP] = ctx.gpr[r].wrapping_add(disp as i64 as u64);
                     pc = pc.wrapping_add(6);
                 }
             }
             0xc2 => {
-                let Some(ret) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
-                let Some(imm) = safe_rd::<u16>(pc.wrapping_add(1)) else { return false };
+                let Some(ret) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
+                let Some(imm) = safe_rd_with::<u16>(pc.wrapping_add(1), read_mem) else { return false };
                 let Some(next_rsp) = ctx.gpr[RSP].checked_add(8 + imm as u64) else { return false };
                 ctx.rip = ret;
                 ctx.gpr[RSP] = next_rsp;
                 return true;
             }
             0xc3 | 0xf3 => {
-                let Some(ret) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
+                let Some(ret) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
                 let Some(next_rsp) = ctx.gpr[RSP].checked_add(8) else { return false };
                 ctx.rip = ret;
                 ctx.gpr[RSP] = next_rsp;
                 return true;
             }
             0xe9 => {
-                let Some(rel) = safe_rd::<i32>(pc.wrapping_add(1)) else { return false };
+                let Some(rel) = safe_rd_with::<i32>(pc.wrapping_add(1), read_mem) else { return false };
                 pc = pc.wrapping_add(5).wrapping_add(rel as i64 as u64);
             }
             0xeb => {
-                let Some(rel) = safe_rd::<i8>(pc.wrapping_add(1)) else { return false };
+                let Some(rel) = safe_rd_with::<i8>(pc.wrapping_add(1), read_mem) else { return false };
                 pc = pc.wrapping_add(2).wrapping_add(rel as i64 as u64);
             }
             _ => return false,
@@ -1059,33 +1075,34 @@ fn interpret_epilog_safe(mut pc: u64, ctx: &mut Context) -> bool {
     false
 }
 
-/// Fault-safe single-frame x86-64 `.pdata` unwinder for crash reports and `SIGUSR2`
-/// thread snapshots. Every memory read goes through `mach_vm_read_overwrite` (`safe_rd`),
-/// so corrupt stacks or invalid `.pdata` entries return `false` instead of faulting.
+/// Fault-safe single-frame x86-64 `.pdata` unwinder with a caller-supplied memory reader.
+/// Every memory access (UNWIND_INFO metadata, epilogue instruction bytes, chained
+/// `RuntimeFunction` records, saved registers, and stack slots) uses `read_mem`.
 ///
 /// Set `allow_epilog = false` when `pc` was adjusted back by 1 byte into the preceding
 /// `call` instruction (return addresses): an operand byte like `0xC3` inside `call` is
 /// not an instruction boundary and must not trigger epilogue decoding.
-pub(crate) fn safe_virtual_unwind(
+pub(crate) fn safe_virtual_unwind_with(
     base: u64,
     pc: u64,
     mut f: RuntimeFunction,
     ctx: &mut Context,
     allow_epilog: bool,
+    read_mem: &mut impl FnMut(u64, &mut [u8]) -> bool,
 ) -> bool {
     let mut frame = ctx.gpr[RSP];
     let mut mach_frame = false;
     let mut first = true;
     for _ in 0..32 {
         let Some(info) = base.checked_add(f.unwind_rva as u64) else { return false };
-        let Some(ver_flags) = safe_rd::<u8>(info) else { return false };
+        let Some(ver_flags) = safe_rd_with::<u8>(info, read_mem) else { return false };
         let version = ver_flags & 7;
         if version != 1 && version != 2 {
             return false;
         }
-        let Some(prolog) = safe_rd::<u8>(info.wrapping_add(1)) else { return false };
-        let Some(count) = safe_rd::<u8>(info.wrapping_add(2)) else { return false };
-        let Some(fr) = safe_rd::<u8>(info.wrapping_add(3)) else { return false };
+        let Some(prolog) = safe_rd_with::<u8>(info.wrapping_add(1), read_mem) else { return false };
+        let Some(count) = safe_rd_with::<u8>(info.wrapping_add(2), read_mem) else { return false };
+        let Some(fr) = safe_rd_with::<u8>(info.wrapping_add(3), read_mem) else { return false };
         let frame_reg = (fr & 0xf) as usize;
         let frame_off = (fr >> 4) as u64;
         let codes = info.wrapping_add(4);
@@ -1097,16 +1114,20 @@ pub(crate) fn safe_virtual_unwind(
         let prolog_offset = if pc >= fbegin && pc < fbegin.wrapping_add(prolog as u64) {
             pc - fbegin
         } else {
-            if first && allow_epilog && is_inside_epilog_safe(pc, base, &f) {
-                return interpret_epilog_safe(pc, ctx);
+            if first && allow_epilog && is_inside_epilog_with(pc, base, &f, read_mem) {
+                return interpret_epilog_with(pc, ctx, read_mem);
             }
             u64::MAX
         };
         first = false;
         let mut i = 0usize;
         while i < count as usize {
-            let Some(off) = safe_rd::<u8>(codes.wrapping_add(i as u64 * 2)) else { return false };
-            let Some(b) = safe_rd::<u8>(codes.wrapping_add(i as u64 * 2 + 1)) else { return false };
+            let Some(off) = safe_rd_with::<u8>(codes.wrapping_add(i as u64 * 2), read_mem) else {
+                return false;
+            };
+            let Some(b) = safe_rd_with::<u8>(codes.wrapping_add(i as u64 * 2 + 1), read_mem) else {
+                return false;
+            };
             let code = b & 0xf;
             let inf = b >> 4;
             let sz = if code == UWOP_EPILOG {
@@ -1121,26 +1142,24 @@ pub(crate) fn safe_virtual_unwind(
                 i += sz;
                 continue;
             }
-            let slot16 = |k: usize| -> Option<u64> {
-                safe_rd::<u16>(codes.wrapping_add((i + k) as u64 * 2)).map(|v| v as u64)
-            };
-            let slot32 = || -> Option<u64> {
-                safe_rd::<u32>(codes.wrapping_add((i + 1) as u64 * 2)).map(|v| v as u64)
-            };
             match code {
                 UWOP_PUSH_NONVOL => {
-                    let Some(val) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
+                    let Some(val) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
                     let Some(next_rsp) = ctx.gpr[RSP].checked_add(8) else { return false };
                     ctx.gpr[inf as usize] = val;
                     ctx.gpr[RSP] = next_rsp;
                 }
                 UWOP_ALLOC_LARGE => {
                     let delta = if inf != 0 {
-                        let Some(v) = slot32() else { return false };
-                        v
+                        let Some(v) = safe_rd_with::<u32>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                            return false;
+                        };
+                        v as u64
                     } else {
-                        let Some(v) = slot16(1) else { return false };
-                        v.saturating_mul(8)
+                        let Some(v) = safe_rd_with::<u16>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                            return false;
+                        };
+                        (v as u64).saturating_mul(8)
                     };
                     let Some(next_rsp) = ctx.gpr[RSP].checked_add(delta) else { return false };
                     ctx.gpr[RSP] = next_rsp;
@@ -1155,27 +1174,35 @@ pub(crate) fn safe_virtual_unwind(
                     ctx.gpr[RSP] = frame;
                 }
                 UWOP_SAVE_NONVOL => {
-                    let Some(slot) = slot16(1) else { return false };
-                    let Some(addr) = frame.checked_add(slot.saturating_mul(8)) else { return false };
-                    let Some(val) = safe_rd::<u64>(addr) else { return false };
+                    let Some(slot) = safe_rd_with::<u16>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                        return false;
+                    };
+                    let Some(addr) = frame.checked_add((slot as u64).saturating_mul(8)) else { return false };
+                    let Some(val) = safe_rd_with::<u64>(addr, read_mem) else { return false };
                     ctx.gpr[inf as usize] = val;
                 }
                 UWOP_SAVE_NONVOL_FAR => {
-                    let Some(off32) = slot32() else { return false };
-                    let Some(addr) = frame.checked_add(off32) else { return false };
-                    let Some(val) = safe_rd::<u64>(addr) else { return false };
+                    let Some(off32) = safe_rd_with::<u32>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                        return false;
+                    };
+                    let Some(addr) = frame.checked_add(off32 as u64) else { return false };
+                    let Some(val) = safe_rd_with::<u64>(addr, read_mem) else { return false };
                     ctx.gpr[inf as usize] = val;
                 }
                 UWOP_SAVE_XMM128 => {
-                    let Some(slot) = slot16(1) else { return false };
-                    let Some(addr) = frame.checked_add(slot.saturating_mul(16)) else { return false };
-                    let Some(val) = safe_rd::<[u8; 16]>(addr) else { return false };
+                    let Some(slot) = safe_rd_with::<u16>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                        return false;
+                    };
+                    let Some(addr) = frame.checked_add((slot as u64).saturating_mul(16)) else { return false };
+                    let Some(val) = safe_rd_with::<[u8; 16]>(addr, read_mem) else { return false };
                     *ctx.xmm_mut(inf as usize) = val;
                 }
                 UWOP_SAVE_XMM128_FAR => {
-                    let Some(off32) = slot32() else { return false };
-                    let Some(addr) = frame.checked_add(off32) else { return false };
-                    let Some(val) = safe_rd::<[u8; 16]>(addr) else { return false };
+                    let Some(off32) = safe_rd_with::<u32>(codes.wrapping_add((i + 1) as u64 * 2), read_mem) else {
+                        return false;
+                    };
+                    let Some(addr) = frame.checked_add(off32 as u64) else { return false };
+                    let Some(val) = safe_rd_with::<[u8; 16]>(addr, read_mem) else { return false };
                     *ctx.xmm_mut(inf as usize) = val;
                 }
                 UWOP_PUSH_MACHFRAME => {
@@ -1183,9 +1210,9 @@ pub(crate) fn safe_virtual_unwind(
                         let Some(next_rsp) = ctx.gpr[RSP].checked_add(8) else { return false };
                         ctx.gpr[RSP] = next_rsp;
                     }
-                    let Some(rip) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
+                    let Some(rip) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
                     let Some(rsp_addr) = ctx.gpr[RSP].checked_add(24) else { return false };
-                    let Some(next_rsp) = safe_rd::<u64>(rsp_addr) else { return false };
+                    let Some(next_rsp) = safe_rd_with::<u64>(rsp_addr, read_mem) else { return false };
                     ctx.rip = rip;
                     ctx.gpr[RSP] = next_rsp;
                     mach_frame = true;
@@ -1198,16 +1225,33 @@ pub(crate) fn safe_virtual_unwind(
         if (ver_flags >> 3) as u32 & UNW_FLAG_CHAININFO == 0 {
             break;
         }
-        let Some(chained) = safe_rd::<RuntimeFunction>(handler_data_addr) else { return false };
+        let Some(chained) = safe_rd_with::<RuntimeFunction>(handler_data_addr, read_mem) else {
+            return false;
+        };
         f = chained;
     }
     if !mach_frame {
-        let Some(ret) = safe_rd::<u64>(ctx.gpr[RSP]) else { return false };
+        let Some(ret) = safe_rd_with::<u64>(ctx.gpr[RSP], read_mem) else { return false };
         let Some(next_rsp) = ctx.gpr[RSP].checked_add(8) else { return false };
         ctx.rip = ret;
         ctx.gpr[RSP] = next_rsp;
     }
     true
+}
+
+/// Fault-safe single-frame x86-64 `.pdata` unwinder for crash reports and `SIGUSR2`
+/// thread snapshots. Every memory read goes through `mach_vm_read_overwrite` (`crash::safe_read`),
+/// so corrupt stacks or invalid `.pdata` entries return `false` instead of faulting.
+pub(crate) fn safe_virtual_unwind(
+    base: u64,
+    pc: u64,
+    f: RuntimeFunction,
+    ctx: &mut Context,
+    allow_epilog: bool,
+) -> bool {
+    safe_virtual_unwind_with(base, pc, f, ctx, allow_epilog, &mut |addr, buf| {
+        crate::crash::safe_read(addr, buf)
+    })
 }
 
 unsafe fn is_inside_epilog(mut pc: *const u8, base: u64, f: &RuntimeFunction) -> bool {

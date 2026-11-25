@@ -2,8 +2,8 @@
 
 use super::easy::{
     apply_head_meta, apply_outcome, invoke_header_callback, invoke_write_callback,
-    prepare_transfer, write_error_buffer, CallbackConfig, CurlEasy, CurlMsg, HeadMeta,
-    TransferOutcome, CURLE_ABORTED_BY_CALLBACK, CURLE_FAILED_INIT, EASY_HANDLES,
+    invoke_xferinfo_callback, prepare_transfer, write_error_buffer, CallbackConfig, CurlEasy,
+    CurlMsg, HeadMeta, TransferOutcome, CURLE_ABORTED_BY_CALLBACK, CURLE_FAILED_INIT, EASY_HANDLES,
 };
 use super::http::{execute_http_transfer, TransferSink};
 use crate::handles::HandleTable;
@@ -32,6 +32,12 @@ enum TransferEvent {
     Head(HeadMeta),
     HeaderLine(Vec<u8>),
     BodyChunk(Vec<u8>),
+    Progress {
+        dltotal: i64,
+        dlnow: i64,
+        ultotal: i64,
+        ulnow: i64,
+    },
 }
 
 #[derive(Default)]
@@ -114,11 +120,7 @@ impl TransferSink for MultiWorkerSink {
         self.cancel.load(Ordering::Acquire)
     }
 
-    fn cancel_token(&self) -> Option<Arc<AtomicBool>> {
-        Some(Arc::clone(&self.cancel))
-    }
-
-    fn on_head(&mut self, meta: HeadMeta) {
+    fn on_head(&self, meta: HeadMeta) {
         {
             let mut ch = self.channel.lock().unwrap();
             ch.events.push_back(TransferEvent::Head(meta));
@@ -126,7 +128,7 @@ impl TransferSink for MultiWorkerSink {
         self.multi.signal_activity();
     }
 
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32> {
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32> {
         if self.is_cancelled() {
             return Err(CURLE_ABORTED_BY_CALLBACK);
         }
@@ -138,13 +140,30 @@ impl TransferSink for MultiWorkerSink {
         Ok(())
     }
 
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32> {
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32> {
         if self.is_cancelled() {
             return Err(CURLE_ABORTED_BY_CALLBACK);
         }
         {
             let mut ch = self.channel.lock().unwrap();
             ch.events.push_back(TransferEvent::BodyChunk(data));
+        }
+        self.multi.signal_activity();
+        Ok(())
+    }
+
+    fn on_progress(&self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
+        if self.is_cancelled() {
+            return Err(CURLE_ABORTED_BY_CALLBACK);
+        }
+        {
+            let mut ch = self.channel.lock().unwrap();
+            ch.events.push_back(TransferEvent::Progress {
+                dltotal,
+                dlnow,
+                ultotal,
+                ulnow,
+            });
         }
         self.multi.signal_activity();
         Ok(())
@@ -392,6 +411,21 @@ pub(super) unsafe fn multi_perform(multi: usize, running_handles: *mut i32) -> i
                 TransferEvent::BodyChunk(data) => {
                     if callback_err.is_none() {
                         if let Err(code) = invoke_write_callback(cb, &data) {
+                            callback_err = Some(code);
+                            cancel.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                TransferEvent::Progress {
+                    dltotal,
+                    dlnow,
+                    ultotal,
+                    ulnow,
+                } => {
+                    if callback_err.is_none() {
+                        if let Err(code) =
+                            invoke_xferinfo_callback(cb, dltotal, dlnow, ultotal, ulnow)
+                        {
                             callback_err = Some(code);
                             cancel.store(true, Ordering::Release);
                         }
