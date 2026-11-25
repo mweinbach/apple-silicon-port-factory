@@ -289,11 +289,17 @@ fn dstorage_factory_and_queue_work() {
     );
     assert_ne!(codec, 0);
 
-    // Unsupported / custom compression codecs must fail honestly.
+    // DirectStorage 1.2 only defines GDeflate (1) as a built-in codec:
+    // NONE (0) -> E_INVALIDARG, reserved (2..=0x7F) & custom (>= 0x80) -> E_NOTIMPL.
     let mut bad_codec = 0usize;
     assert_eq!(
         DStorageCreateCompressionCodec(DSTORAGE_COMPRESSION_FORMAT_NONE, 1, 0, &mut bad_codec),
         E_INVALIDARG
+    );
+    assert_eq!(bad_codec, 0);
+    assert_eq!(
+        DStorageCreateCompressionCodec(2, 1, 0, &mut bad_codec),
+        E_NOTIMPL
     );
     assert_eq!(bad_codec, 0);
     assert_eq!(

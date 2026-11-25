@@ -115,15 +115,38 @@ pub unsafe extern "win64" fn slFreeResources(feature: u32, _vp: *const u32) -> i
     OK
 }
 
-/// Tags feed features; none exist, so they are accepted and dropped.
-pub unsafe extern "win64" fn slSetTag(_vp: *const u32, _tags: *const c_void, n: u32, _cmd: *mut c_void) -> i32 {
-    stub!("slSetTag({n} tags) accepted and dropped (no Streamline features)");
-    OK
+/// Native-unsupported (NVIDIA Streamline SDK `source/core/sl.api/sl.cpp`:
+/// `slSetTag` validates `kFeatureCommon` via `slValidateFeatureContext` and checks
+/// `!tags || numTags == 0`). With no NVIDIA Streamline plugins loaded on Apple Silicon,
+/// invalid parameters return `eErrorInvalidParameter` (25) and valid calls return
+/// `eErrorFeatureNotSupported` (32).
+pub unsafe extern "win64" fn slSetTag(
+    _vp: *const u32,
+    tags: *const c_void,
+    n: u32,
+    _cmd: *mut c_void,
+) -> i32 {
+    if tags.is_null() || n == 0 {
+        return ERROR_INVALID_PARAMETER;
+    }
+    log::debug!("slSetTag({n} tags): no Streamline plugins supported -> eErrorFeatureNotSupported");
+    ERROR_FEATURE_NOT_SUPPORTED
 }
 
-pub unsafe extern "win64" fn slSetConstants(_values: *const c_void, _frame: *const c_void, _vp: *const u32) -> i32 {
-    stub!("slSetConstants accepted and dropped (no Streamline features)");
-    OK
+/// Native-unsupported (NVIDIA Streamline SDK `source/core/sl.api/sl.cpp`:
+/// `slSetConstants` validates `kFeatureCommon` via `slValidateFeatureContext`).
+/// Returns `eErrorInvalidParameter` (25) on null pointers and
+/// `eErrorFeatureNotSupported` (32) when no Streamline plugins are supported.
+pub unsafe extern "win64" fn slSetConstants(
+    values: *const c_void,
+    frame: *const c_void,
+    _vp: *const u32,
+) -> i32 {
+    if values.is_null() || frame.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    log::debug!("slSetConstants: no Streamline plugins supported -> eErrorFeatureNotSupported");
+    ERROR_FEATURE_NOT_SUPPORTED
 }
 
 pub unsafe extern "win64" fn slGetFeatureRequirements(feature: u32, _req: *mut c_void) -> i32 {
@@ -229,6 +252,17 @@ mod tests {
             let mut p: *mut c_void = 1 as *mut c_void;
             assert_eq!(slGetFeatureFunction(0, c"slDLSSGetOptimalSettings".as_ptr(), &mut p), ERROR_FEATURE_NOT_SUPPORTED);
             assert!(p.is_null());
+
+            // slSetTag / slSetConstants validate parameters and report eErrorFeatureNotSupported
+            // when no NVIDIA Streamline plugins are loaded (matches sl.cpp).
+            let dummy = 0u64;
+            let dummy_ptr = &dummy as *const u64 as *const c_void;
+            assert_eq!(slSetTag(std::ptr::null(), std::ptr::null(), 1, std::ptr::null_mut()), ERROR_INVALID_PARAMETER);
+            assert_eq!(slSetTag(std::ptr::null(), dummy_ptr, 0, std::ptr::null_mut()), ERROR_INVALID_PARAMETER);
+            assert_eq!(slSetTag(std::ptr::null(), dummy_ptr, 1, std::ptr::null_mut()), ERROR_FEATURE_NOT_SUPPORTED);
+            assert_eq!(slSetConstants(std::ptr::null(), t, std::ptr::null()), ERROR_INVALID_PARAMETER);
+            assert_eq!(slSetConstants(dummy_ptr, std::ptr::null(), std::ptr::null()), ERROR_INVALID_PARAMETER);
+            assert_eq!(slSetConstants(dummy_ptr, t, std::ptr::null()), ERROR_FEATURE_NOT_SUPPORTED);
         }
     }
 }

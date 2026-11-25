@@ -163,7 +163,6 @@ struct XessContextState {
     exposure_multiplier: f32,
     first_execute: bool,
     logged_first_execute: bool,
-    logged_subrect_offset: bool,
 }
 
 impl XessContextState {
@@ -181,7 +180,6 @@ impl XessContextState {
             exposure_multiplier: 1.0,
             first_execute: true,
             logged_first_execute: false,
-            logged_subrect_offset: false,
         }
     }
 }
@@ -417,6 +415,11 @@ fn build_temporal_desc(
         dynamic_resolution: r.dynamic_resolution,
         output_resolution_motion_vectors: r.output_resolution_motion_vectors,
         jittered_motion_vectors: r.jittered_motion_vectors,
+        color_origin: [p.inputColorBase.x, p.inputColorBase.y],
+        depth_origin: [p.inputDepthBase.x, p.inputDepthBase.y],
+        motion_origin: [p.inputMotionVectorBase.x, p.inputMotionVectorBase.y],
+        reactive_origin: [p.inputResponsiveMaskBase.x, p.inputResponsiveMaskBase.y],
+        output_origin: [p.outputColorBase.x, p.outputColorBase.y],
     }
 }
 
@@ -463,7 +466,6 @@ pub extern "win64" fn xessD3D12Init(
     ctx.visible_node_mask = params.visibleNodeMask;
     ctx.first_execute = true;
     ctx.logged_first_execute = false;
-    ctx.logged_subrect_offset = false;
     log::info!(
         target: "d3d",
         "xessD3D12Init(dev={:#x}): output={}x{} quality={} flags={:#x} temporal={}",
@@ -566,7 +568,7 @@ pub extern "win64" fn xessD3D12Execute(
         return XESS_RESULT_ERROR_INVALID_ARGUMENT;
     }
 
-    let (ctx_snapshot, first_execute, should_log_first, should_log_subrect) = {
+    let (ctx_snapshot, first_execute, should_log_first) = {
         let mut map = xess_contexts().lock().unwrap();
         let Some(ctx) = map.get_mut(&context) else {
             return XESS_RESULT_ERROR_INVALID_CONTEXT;
@@ -578,33 +580,8 @@ pub extern "win64" fn xessD3D12Execute(
         ctx.first_execute = false;
         let log_first = !ctx.logged_first_execute;
         ctx.logged_first_execute = true;
-        let has_nonzero_offset = p.inputColorBase != Xess2d::default()
-            || p.inputMotionVectorBase != Xess2d::default()
-            || p.inputDepthBase != Xess2d::default()
-            || p.inputResponsiveMaskBase != Xess2d::default()
-            || p.outputColorBase != Xess2d::default();
-        let log_subrect = has_nonzero_offset && !ctx.logged_subrect_offset;
-        if log_subrect {
-            ctx.logged_subrect_offset = true;
-        }
-        (*ctx, first, log_first, log_subrect)
+        (*ctx, first, log_first)
     };
-
-    if should_log_subrect {
-        crate::stub!(
-            "xessD3D12Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX",
-            p.inputColorBase.x,
-            p.inputColorBase.y,
-            p.inputMotionVectorBase.x,
-            p.inputMotionVectorBase.y,
-            p.inputDepthBase.x,
-            p.inputDepthBase.y,
-            p.inputResponsiveMaskBase.x,
-            p.inputResponsiveMaskBase.y,
-            p.outputColorBase.x,
-            p.outputColorBase.y,
-        );
-    }
 
     let desc = build_temporal_desc(&ctx_snapshot, &p, first_execute);
     let use_temporal = crate::d3d12::cmdlist::temporal_upscale_enabled()
@@ -614,7 +591,7 @@ pub extern "win64" fn xessD3D12Execute(
     if should_log_first {
         log::info!(
             target: "d3d",
-            "xessD3D12Execute: temporal={use_temporal} render={}x{} upscale={}x{} jitter=({:.3},{:.3}) mv_scale=({:.2},{:.2}) pre_exp={:.3} auto_exp={} depth_rev={} out_res_mv={} jit_mv={} depth={} mv={} exp={} reactive={}",
+            "xessD3D12Execute: temporal={use_temporal} render={}x{} upscale={}x{} jitter=({:.3},{:.3}) mv_scale=({:.2},{:.2}) pre_exp={:.3} auto_exp={} depth_rev={} out_res_mv={} jit_mv={} depth={} mv={} exp={} reactive={} color_base=({},{}) out_base=({},{})",
             desc.render_size[0],
             desc.render_size[1],
             desc.upscale_size[0],
@@ -632,6 +609,10 @@ pub extern "win64" fn xessD3D12Execute(
             p.pVelocityTexture != 0,
             !desc.exposure.is_null(),
             !desc.reactive_mask.is_null(),
+            desc.color_origin[0],
+            desc.color_origin[1],
+            desc.output_origin[0],
+            desc.output_origin[1],
         );
     }
 
@@ -641,12 +622,14 @@ pub extern "win64" fn xessD3D12Execute(
         }
     } else {
         unsafe {
-            crate::d3d12::cmdlist::upscale_resources(
+            crate::d3d12::cmdlist::upscale_resources_subrect(
                 cmd_list as *mut c_void,
                 p.pOutputTexture as *mut c_void,
                 p.pColorTexture as *mut c_void,
                 desc.render_size,
                 desc.upscale_size,
+                desc.color_origin,
+                desc.output_origin,
             );
         }
     }
@@ -947,6 +930,11 @@ mod tests {
             resetHistory: 0,
             inputWidth: 1280,
             inputHeight: 720,
+            inputColorBase: Xess2d { x: 16, y: 8 },
+            inputMotionVectorBase: Xess2d { x: 4, y: 2 },
+            inputDepthBase: Xess2d { x: 16, y: 8 },
+            inputResponsiveMaskBase: Xess2d { x: 8, y: 4 },
+            outputColorBase: Xess2d { x: 32, y: 16 },
             ..Default::default()
         };
 
@@ -959,6 +947,11 @@ mod tests {
         assert_eq!(d_first.output as usize, 0x6666);
         assert_eq!(d_first.render_size, [1280, 720]);
         assert_eq!(d_first.upscale_size, [2560, 1440]);
+        assert_eq!(d_first.color_origin, [16, 8]);
+        assert_eq!(d_first.motion_origin, [4, 2]);
+        assert_eq!(d_first.depth_origin, [16, 8]);
+        assert_eq!(d_first.reactive_origin, [8, 4]);
+        assert_eq!(d_first.output_origin, [32, 16]);
         assert_eq!(d_first.jitter_offset, [0.25, -0.125]);
         assert_eq!(d_first.motion_vector_scale, [2.0, -2.0]);
         assert!((d_first.pre_exposure - 3.0).abs() < 1e-6);

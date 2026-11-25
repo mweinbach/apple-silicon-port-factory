@@ -21,6 +21,7 @@ log.workspace = true
 parking_lot_core.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+zstd-sys.workspace = true
 
 # Apple platform backends (macOS + iOS): QuartzCore (`CAMetalLayer`),
 # Foundation, D3D12->Metal 4, GameController + CoreHaptics.
