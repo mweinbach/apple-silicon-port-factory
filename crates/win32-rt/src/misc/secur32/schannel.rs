@@ -396,9 +396,12 @@ struct SchannelCred {
     server_private_key_pkcs8: Option<Vec<u8>>,
     local_cert_der: Option<Vec<u8>>,
     client_configs: Arc<std::sync::Mutex<Vec<(ClientConfigCacheKey, Arc<ClientConfig>)>>>,
-    client_session_cache: Arc<rustls::client::ClientSessionMemoryCache>,
-    server_session_cache: Arc<rustls::server::ServerSessionMemoryCache>,
-    server_ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>,
+    // Partition server resumption state by client-authentication policy so a session or ticket
+    // issued without ASC_REQ_MUTUAL_AUTH can never be resumed into an mTLS context.
+    server_session_cache_no_auth: Arc<rustls::server::ServerSessionMemoryCache>,
+    server_ticketer_no_auth: Option<Arc<dyn rustls::server::ProducesTickets>>,
+    server_session_cache_mtls: Arc<rustls::server::ServerSessionMemoryCache>,
+    server_ticketer_mtls: Option<Arc<dyn rustls::server::ProducesTickets>>,
 }
 
 struct SchannelContext {
@@ -562,7 +565,7 @@ fn build_schannel_tls_config(
     if disable_reconnects {
         config.resumption = rustls::client::Resumption::disabled();
     } else {
-        config.resumption = rustls::client::Resumption::store(cred.client_session_cache.clone());
+        config.resumption = rustls::client::Resumption::in_memory_sessions(64);
     }
     if !alpn.is_empty() {
         config.alpn_protocols = alpn;
@@ -783,9 +786,14 @@ fn build_schannel_server_config(
     if (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0 {
         cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         cfg.send_tls13_tickets = 0;
+    } else if require_client_auth {
+        cfg.session_storage = cred.server_session_cache_mtls.clone();
+        if let Some(ref ticketer) = cred.server_ticketer_mtls {
+            cfg.ticketer = ticketer.clone();
+        }
     } else {
-        cfg.session_storage = cred.server_session_cache.clone();
-        if let Some(ref ticketer) = cred.server_ticketer {
+        cfg.session_storage = cred.server_session_cache_no_auth.clone();
+        if let Some(ref ticketer) = cred.server_ticketer_no_auth {
             cfg.ticketer = ticketer.clone();
         }
     }
@@ -1090,9 +1098,10 @@ pub(super) unsafe fn acquire_credentials_impl(
         server_private_key_pkcs8,
         local_cert_der,
         client_configs: Arc::new(std::sync::Mutex::new(Vec::new())),
-        client_session_cache: Arc::new(rustls::client::ClientSessionMemoryCache::new(64)),
-        server_session_cache: rustls::server::ServerSessionMemoryCache::new(64),
-        server_ticketer: rustls::crypto::ring::Ticketer::new().ok(),
+        server_session_cache_no_auth: rustls::server::ServerSessionMemoryCache::new(64),
+        server_ticketer_no_auth: rustls::crypto::ring::Ticketer::new().ok(),
+        server_session_cache_mtls: rustls::server::ServerSessionMemoryCache::new(64),
+        server_ticketer_mtls: rustls::crypto::ring::Ticketer::new().ok(),
     });
     write_handle(ph_credential, MAGIC_CRED, id);
     if !pts_expiry.is_null() {
