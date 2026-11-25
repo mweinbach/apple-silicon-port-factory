@@ -6,8 +6,8 @@ use crate::teb;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
 
 pub type ThreadProc = unsafe extern "win64" fn(*mut c_void) -> u32;
 pub type ApcProc = unsafe extern "win64" fn(usize);
@@ -64,6 +64,23 @@ pub struct ThreadObj {
     resume_cv: Condvar,
     pub pthread: AtomicUsize,
     pub priority: std::sync::atomic::AtomicI32,
+    /// Per-thread Windows affinity mask (`0` = inherit process affinity mask).
+    pub affinity_mask: AtomicUsize,
+    /// Per-thread Windows processor group (`0` on single-group systems).
+    pub affinity_group: AtomicU16,
+    /// Guest Win32 start address recorded by `CreateThread` (`ThreadQuerySetWin32StartAddress`).
+    pub start_address: AtomicUsize,
+    /// Creation timestamp in 100ns FILETIME ticks (`ThreadTimes`).
+    pub creation_time: AtomicU64,
+    /// Set by `NtSetInformationThread(ThreadHideFromDebugger)`.
+    pub hide_from_debugger: AtomicBool,
+    /// Set by `TerminateThread` to request asynchronous thread termination via `SIGUSR1`.
+    terminate_requested: AtomicBool,
+    /// Set by the `SIGUSR1` handler right before calling `pthread_exit`.
+    terminated_ack: AtomicBool,
+    /// Custom mmap stack allocation `(base_ptr, total_len)` owned by a `spawn`ed thread.
+    /// Taken once by whichever exit path reaps it first (`finish_current_thread` or `terminate_thread`).
+    stack_alloc: Mutex<Option<(usize, usize)>>,
     /// Current activity kind (`hitch::ActKind as u8`; 0 = idle). Lock-free for watchdog inspection.
     pub act_kind: AtomicU8,
     /// Monotonic timestamp (ns) when current activity began.
@@ -91,6 +108,14 @@ impl ThreadObj {
             resume_cv: Condvar::new(),
             pthread: AtomicUsize::new(0),
             priority: std::sync::atomic::AtomicI32::new(0),
+            affinity_mask: AtomicUsize::new(0),
+            affinity_group: AtomicU16::new(0),
+            start_address: AtomicUsize::new(0),
+            creation_time: AtomicU64::new(crate::types::now_filetime()),
+            hide_from_debugger: AtomicBool::new(false),
+            terminate_requested: AtomicBool::new(false),
+            terminated_ack: AtomicBool::new(false),
+            stack_alloc: Mutex::new(None),
             act_kind: AtomicU8::new(0),
             act_start_ns: AtomicU64::new(0),
             act_arg: AtomicU64::new(0),
@@ -219,16 +244,21 @@ impl ThreadObj {
         self.resume_checked().unwrap_or(u32::MAX)
     }
 
-    fn wait_resumed(&self) {
+    fn wait_resumed(&self) -> bool {
         let mut s = self.suspend.lock().unwrap();
-        while s.count > 0 {
+        while s.count > 0 && !self.terminate_requested.load(Ordering::Acquire) {
             s = self.resume_cv.wait(s).unwrap();
+        }
+        if self.terminate_requested.load(Ordering::Acquire) {
+            s.phase = ThreadPhase::Exiting;
+            return false;
         }
         s.phase = ThreadPhase::Live;
         #[cfg(target_vendor = "apple")]
         {
             s.mach_port = sched::current_port();
         }
+        true
     }
 
     fn mark_exiting(&self) {
@@ -330,11 +360,140 @@ fn stack_reaper_tx() -> &'static Mutex<mpsc::Sender<ReapReq>> {
     })
 }
 
-fn enqueue_current_stack_reap() {
-    if let Some((mem, len)) = STACK_ALLOC.with(|c| c.take()) {
-        let pthread = unsafe { libc::pthread_self() as usize };
+fn enqueue_stack_reap_for(obj: &ThreadObj, pthread: usize) {
+    if pthread == 0 {
+        return;
+    }
+    if let Some((mem, len)) = obj.stack_alloc.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = stack_reaper_tx().lock().unwrap().send(ReapReq { pthread, mem, len });
     }
+}
+
+fn enqueue_current_stack_reap() {
+    let pthread = unsafe { libc::pthread_self() as usize };
+    if let Some(obj) = current_thread_object() {
+        enqueue_stack_reap_for(&obj, pthread);
+    }
+    if let Some((mem, len)) = STACK_ALLOC.with(|c| c.take()) {
+        let _ = stack_reaper_tx().lock().unwrap().send(ReapReq { pthread, mem, len });
+    }
+}
+
+extern "C" fn sigusr1_terminate_handler(_sig: libc::c_int) {
+    // Async-signal-safe: reads only thread-local Cell pointer and atomics, zero mutexes.
+    let p = ACT_SLOT.with(|c| c.get());
+    if !p.is_null() {
+        unsafe {
+            if (*p).terminate_requested.load(Ordering::Acquire) {
+                (*p).terminated_ack.store(true, Ordering::Release);
+                libc::pthread_exit(std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+fn install_terminate_signal_handler() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigusr1_terminate_handler as *const () as usize;
+        sa.sa_flags = 0; // Do not set SA_RESTART so blocking syscalls are interrupted immediately.
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    });
+}
+
+/// Terminate `obj` with `code`, matching Windows `TerminateThread` semantics:
+/// - Already-exited threads succeed without altering their exit code.
+/// - Self-termination records `code`, signals waiters, skips `DLL_THREAD_DETACH`, and exits.
+/// - `CREATE_SUSPENDED` threads abort before running their guest entry point.
+/// - Live other threads are interrupted via `SIGUSR1` -> `pthread_exit`, signaled with `code`,
+///   and their custom mmap stack is safely reclaimed after `pthread_join`.
+pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
+    if obj.exit_code().is_some() {
+        return true;
+    }
+    if obj.is_current_thread(obj.mach_port()) {
+        obj.mark_exiting();
+        ACT_SLOT.with(|c| c.set(std::ptr::null()));
+        let t = teb::current_raw();
+        let pthread = unsafe { libc::pthread_self() as usize };
+        obj.pthread.store(0, Ordering::Release);
+        {
+            let g = handles::wait_lock();
+            let slot = obj.exit_code.get(&g);
+            if slot.is_none() {
+                *slot = Some(code);
+            }
+        }
+        handles::notify_object_key(&**obj as *const ThreadObj as usize, usize::MAX);
+        obj.teb.store(0, Ordering::Relaxed);
+        THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, obj));
+        CURRENT.with(|c| *c.borrow_mut() = None);
+        unsafe {
+            teb::uninstall();
+            if !t.is_null() {
+                teb::free_teb(t);
+            }
+        }
+        enqueue_stack_reap_for(obj, pthread);
+        STACK_ALLOC.with(|c| c.set(None));
+        unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+    }
+
+    install_terminate_signal_handler();
+    let (was_starting, pthread) = {
+        let mut s = obj.suspend.lock().unwrap();
+        if s.phase == ThreadPhase::Exiting {
+            return true;
+        }
+        obj.terminate_requested.store(true, Ordering::Release);
+        if s.phase == ThreadPhase::Starting {
+            s.count = 0;
+            s.phase = ThreadPhase::Exiting;
+            obj.resume_cv.notify_all();
+            (true, 0usize)
+        } else {
+            #[cfg(target_vendor = "apple")]
+            if s.kernel_suspended && s.mach_port != 0 {
+                let _ = sched::thread_resume_port(s.mach_port);
+                s.kernel_suspended = false;
+            }
+            s.count = 0;
+            s.self_suspended = false;
+            obj.resume_cv.notify_all();
+            (false, obj.pthread.load(Ordering::Acquire))
+        }
+    };
+
+    if !was_starting && pthread != 0 {
+        unsafe {
+            let _ = libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while !obj.terminated_ack.load(Ordering::Acquire)
+            && obj.exit_code().is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+    obj.mark_exiting();
+    {
+        let g = handles::wait_lock();
+        let slot = obj.exit_code.get(&g);
+        if slot.is_none() {
+            *slot = Some(code);
+        }
+    }
+    handles::notify_object_key(&**obj as *const ThreadObj as usize, usize::MAX);
+    THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, obj));
+    if !was_starting && obj.terminated_ack.load(Ordering::Acquire) {
+        let p = obj.pthread.swap(0, Ordering::AcqRel);
+        enqueue_stack_reap_for(obj, p);
+    }
+    true
 }
 
 /// Fast, allocation-free entry into a tracked thread activity. Returns previous `(kind, start_ns, arg)`.
@@ -514,12 +673,15 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
         h();
     }
     let obj = info.obj.clone();
+    *obj.stack_alloc.lock().unwrap() = Some((info.stack_mem, info.stack_total));
     obj.pthread.store(unsafe { libc::pthread_self() } as usize, Ordering::Relaxed);
     struct ExitGuard(Arc<ThreadObj>);
     impl Drop for ExitGuard {
         fn drop(&mut self) {
             self.0.mark_exiting();
-            enqueue_current_stack_reap();
+            let p = self.0.pthread.swap(0, Ordering::AcqRel);
+            enqueue_stack_reap_for(&self.0, p);
+            STACK_ALLOC.with(|c| c.set(None));
         }
     }
     let _exit_guard = ExitGuard(obj.clone());
@@ -527,8 +689,24 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
     obj.teb.store(t as usize, Ordering::Relaxed);
     ACT_SLOT.with(|c| c.set(&*obj as *const ThreadObj));
     CURRENT.with(|c| *c.borrow_mut() = Some(obj.clone()));
-    obj.wait_resumed();
+    if !obj.wait_resumed() {
+        ACT_SLOT.with(|c| c.set(std::ptr::null()));
+        CURRENT.with(|c| *c.borrow_mut() = None);
+        obj.teb.store(0, Ordering::Relaxed);
+        unsafe {
+            teb::uninstall();
+            if !t.is_null() {
+                teb::free_teb(t);
+            }
+        }
+        return std::ptr::null_mut();
+    }
     sched::apply_self_qos(obj.priority.load(Ordering::Relaxed));
+    let aff = obj.affinity_mask.load(Ordering::Relaxed);
+    if aff != 0 {
+        let pm = crate::kernel32::process::current_process_affinity_mask();
+        sched::apply_affinity_mask(&obj, aff, pm);
+    }
     if let Some(l) = crate::try_loader() {
         l.thread_attach(t, info.is_initial);
     }
@@ -824,6 +1002,12 @@ pub mod sched {
     const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
     const THREAD_PRECEDENCE_POLICY: i32 = 3;
     const THREAD_PRECEDENCE_POLICY_COUNT: u32 = 1;
+    #[cfg(target_os = "macos")]
+    const THREAD_AFFINITY_POLICY: i32 = 4;
+    #[cfg(target_os = "macos")]
+    const THREAD_AFFINITY_POLICY_COUNT: u32 = 1;
+    #[cfg(target_os = "macos")]
+    const THREAD_AFFINITY_TAG_NULL: i32 = 0;
 
     /// `thread_time_constraint_policy_data_t` (all times in mach absolute units).
     #[repr(C)]
@@ -997,6 +1181,31 @@ pub mod sched {
             unsafe {
                 libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
             }
+        }
+    }
+
+    /// Map a Win32 thread affinity mask to a Darwin `THREAD_AFFINITY_POLICY` cache-affinity
+    /// tag (`THREAD_AFFINITY_TAG_NULL` when unconstrained to all process CPUs, or a
+    /// deterministic positive tag for a strict CPU subset so threads sharing a mask share an
+    /// L2/cluster affinity hint without lowering QoS). Best-effort: Apple Silicon XNU may
+    /// return `KERN_NOT_SUPPORTED` when cluster scheduling overrides affinity tags.
+    pub fn apply_affinity_mask(t: &ThreadObj, mask: usize, proc_mask: usize) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(port) = port_of(t) else { return };
+            let tag: i32 = if mask == 0 || mask == proc_mask {
+                THREAD_AFFINITY_TAG_NULL
+            } else if mask.count_ones() == 1 {
+                (mask.trailing_zeros() as i32) + 1
+            } else {
+                let folded = ((mask as u32) ^ ((mask >> 32) as u32)) & 0x7FFF_FFFF;
+                (folded.max(1)) as i32
+            };
+            let _ = unsafe { thread_policy_set(port, THREAD_AFFINITY_POLICY, &tag, THREAD_AFFINITY_POLICY_COUNT) };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (t, mask, proc_mask);
         }
     }
 

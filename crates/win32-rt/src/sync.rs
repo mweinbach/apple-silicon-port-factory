@@ -724,8 +724,9 @@ pub unsafe extern "win64" fn WakeAllConditionVariable(cv: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
-// INIT_ONCE (pointer-sized): low 2 bits state (0 new, 1 running, 2 done),
-// upper bits = context.
+// INIT_ONCE (pointer-sized): low 2 bits state (0 uninitialized, 1 sync running,
+// 2 complete, 3 async running), upper bits = 4-byte-aligned context pointer.
+// Matches Windows RTL_RUN_ONCE / InitOnce* state machine.
 // ---------------------------------------------------------------------------
 
 const INIT_ONCE_CHECK_ONLY: u32 = 1;
@@ -735,14 +736,26 @@ const INIT_ONCE_INIT_FAILED: u32 = 4;
 pub type InitOnceFn = unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> BOOL;
 
 pub unsafe extern "win64" fn InitOnceInitialize(once: *mut c_void) {
-    AtomicWord::from_ptr(once).store(0, Relaxed);
+    if !once.is_null() {
+        AtomicWord::from_ptr(once).store(0, Relaxed);
+    }
 }
 
-pub unsafe extern "win64" fn InitOnceBeginInitialize(once: *mut c_void, flags: u32, pending: *mut BOOL, ctx: *mut *mut c_void) -> BOOL {
-    let a = AtomicWord::from_ptr(once);
-    if flags & INIT_ONCE_ASYNC != 0 {
-        stub!("INIT_ONCE_ASYNC treated as synchronous");
+pub unsafe extern "win64" fn InitOnceBeginInitialize(
+    once: *mut c_void,
+    flags: u32,
+    pending: *mut BOOL,
+    ctx: *mut *mut c_void,
+) -> BOOL {
+    if once.is_null()
+        || pending.is_null()
+        || (flags & !(INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC)) != 0
+        || (flags & (INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC)) == (INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC)
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
+    let a = AtomicWord::from_ptr(once);
     loop {
         let v = a.load(Acquire);
         match v & 3 {
@@ -753,36 +766,114 @@ pub unsafe extern "win64" fn InitOnceBeginInitialize(once: *mut c_void, flags: u
                 }
                 return TRUE;
             }
-            0 => {
+            state => {
                 if flags & INIT_ONCE_CHECK_ONLY != 0 {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
+                    // Per Microsoft Learn (InitOnceBeginInitialize): INIT_ONCE_CHECK_ONLY
+                    // returns FALSE when initialization has not yet completed.
+                    std::ptr::write_unaligned(pending, FALSE);
+                    crate::teb::set_last_error(err::ERROR_GEN_FAILURE);
+                    return FALSE;
                 }
-                if a.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
+                if flags & INIT_ONCE_ASYNC != 0 {
+                    match state {
+                        0 => {
+                            if a.compare_exchange(0, 3, AcqRel, Acquire).is_ok() {
+                                std::ptr::write_unaligned(pending, TRUE);
+                                return TRUE;
+                            }
+                        }
+                        3 => {
+                            // Multiple threads may race asynchronous initialization without blocking.
+                            std::ptr::write_unaligned(pending, TRUE);
+                            return TRUE;
+                        }
+                        _ => {
+                            // Synchronous initialization is already in progress; cannot mix modes.
+                            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                            return FALSE;
+                        }
+                    }
+                } else {
+                    match state {
+                        0 => {
+                            if a.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
+                                std::ptr::write_unaligned(pending, TRUE);
+                                return TRUE;
+                            }
+                        }
+                        1 => {
+                            park(
+                                once as usize,
+                                || a.load(Relaxed) & 3 == 1,
+                                || {},
+                                |_, _| {},
+                                DEFAULT_PARK_TOKEN,
+                                None,
+                            );
+                        }
+                        _ => {
+                            // Asynchronous initialization is already in progress; synchronous call fails.
+                            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                            return FALSE;
+                        }
+                    }
                 }
-            }
-            _ => {
-                if flags & INIT_ONCE_CHECK_ONLY != 0 {
-                    std::ptr::write_unaligned(pending, TRUE);
-                    return TRUE;
-                }
-                park(once as usize, || a.load(Relaxed) & 3 == 1, || {}, |_, _| {}, DEFAULT_PARK_TOKEN, None);
             }
         }
     }
 }
 
 pub unsafe extern "win64" fn InitOnceComplete(once: *mut c_void, flags: u32, ctx: *mut c_void) -> BOOL {
-    let a = AtomicWord::from_ptr(once);
-    if flags & INIT_ONCE_INIT_FAILED != 0 {
-        a.store(0, Release);
-    } else {
-        a.store((ctx as usize & !3) | 2, Release);
+    if once.is_null()
+        || (flags & !(INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)) != 0
+        || (flags & (INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)) == (INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)
+        || ((ctx as usize) & 3) != 0
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
-    unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
-    TRUE
+    let a = AtomicWord::from_ptr(once);
+    if flags & INIT_ONCE_ASYNC != 0 {
+        let done = (ctx as usize & !3) | 2;
+        match a.compare_exchange(3, done, AcqRel, Acquire) {
+            Ok(_) => {
+                unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
+                TRUE
+            }
+            Err(cur) if (cur & 3) == 2 => {
+                // Another racing INIT_ONCE_ASYNC thread won completion first.
+                crate::teb::set_last_error(err::ERROR_GEN_FAILURE);
+                FALSE
+            }
+            Err(_) => {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                FALSE
+            }
+        }
+    } else if flags & INIT_ONCE_INIT_FAILED != 0 {
+        match a.compare_exchange(1, 0, AcqRel, Acquire) {
+            Ok(_) => {
+                unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
+                TRUE
+            }
+            Err(_) => {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                FALSE
+            }
+        }
+    } else {
+        let done = (ctx as usize & !3) | 2;
+        match a.compare_exchange(1, done, AcqRel, Acquire) {
+            Ok(_) => {
+                unpark_all(once as usize, DEFAULT_UNPARK_TOKEN);
+                TRUE
+            }
+            Err(_) => {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                FALSE
+            }
+        }
+    }
 }
 
 pub unsafe extern "win64" fn InitOnceExecuteOnce(once: *mut c_void, f: InitOnceFn, param: *mut c_void, ctx: *mut *mut c_void) -> BOOL {
@@ -1646,5 +1737,76 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(unsafe { *shared.0.get() }, 6000);
+    }
+
+    #[test]
+    fn init_once_async_parallel_race_and_check_only() {
+        use std::sync::Barrier;
+
+        unsafe {
+            let mut once: usize = 0;
+            let p = &mut once as *mut usize as *mut c_void;
+            InitOnceInitialize(p);
+
+            // INIT_ONCE_CHECK_ONLY before completion returns FALSE with ERROR_GEN_FAILURE.
+            let mut pending: BOOL = TRUE;
+            let mut ctx: *mut c_void = std::ptr::null_mut();
+            assert_eq!(InitOnceBeginInitialize(p, INIT_ONCE_CHECK_ONLY, &mut pending, &mut ctx), FALSE);
+            assert_eq!(pending, FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_GEN_FAILURE);
+
+            // Invalid flag combination: INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC.
+            assert_eq!(
+                InitOnceBeginInitialize(p, INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC, &mut pending, &mut ctx),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // 4 threads concurrently call InitOnceBeginInitialize(INIT_ONCE_ASYNC) without blocking each other.
+            // Exactly ONE thread wins InitOnceComplete(INIT_ONCE_ASYNC); the other 3 get FALSE.
+            let shared_once = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(4));
+            let wins = Arc::new(AtomicUsize::new(0));
+            let losses = Arc::new(AtomicUsize::new(0));
+            let hs: Vec<_> = (1usize..=4)
+                .map(|id| {
+                    let so = Arc::clone(&shared_once);
+                    let b = Arc::clone(&barrier);
+                    let w = Arc::clone(&wins);
+                    let l = Arc::clone(&losses);
+                    std::thread::spawn(move || {
+                        let op = &*so as *const AtomicUsize as *mut c_void;
+                        let mut pend: BOOL = FALSE;
+                        let mut out_ctx: *mut c_void = std::ptr::null_mut();
+                        assert_eq!(InitOnceBeginInitialize(op, INIT_ONCE_ASYNC, &mut pend, &mut out_ctx), TRUE);
+                        assert_eq!(pend, TRUE, "all racing async threads must enter pending without blocking");
+                        // Barrier proves all 4 threads entered INIT_ONCE_ASYNC simultaneously (would deadlock if treated as sync!).
+                        b.wait();
+                        let val = (id * 0x100) as *mut c_void;
+                        if InitOnceComplete(op, INIT_ONCE_ASYNC, val) == TRUE {
+                            w.fetch_add(1, AcqRel);
+                        } else {
+                            assert_eq!(crate::teb::last_error(), err::ERROR_GEN_FAILURE);
+                            l.fetch_add(1, AcqRel);
+                        }
+                        crate::teb::uninstall();
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(wins.load(Acquire), 1);
+            assert_eq!(losses.load(Acquire), 3);
+
+            // Subsequent INIT_ONCE_CHECK_ONLY succeeds and returns the winning context.
+            let op = &*shared_once as *const AtomicUsize as *mut c_void;
+            let mut final_pend: BOOL = TRUE;
+            let mut final_ctx: *mut c_void = std::ptr::null_mut();
+            assert_eq!(InitOnceBeginInitialize(op, INIT_ONCE_CHECK_ONLY, &mut final_pend, &mut final_ctx), TRUE);
+            assert_eq!(final_pend, FALSE);
+            let v = final_ctx as usize;
+            assert!([0x100, 0x200, 0x300, 0x400].contains(&v), "unexpected winning ctx {v:#x}");
+        }
     }
 }

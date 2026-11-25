@@ -38,10 +38,11 @@ pub unsafe extern "win64" fn CreateThread(
     });
     match thread::spawn(body, size, flags & CREATE_SUSPENDED != 0, false) {
         Ok(t) => {
+            t.start_address.store(start_addr, Ordering::Relaxed);
             let tid = t.tid.load(Ordering::Relaxed) as u32;
             log::debug!("CreateThread start={} param={param:p} -> tid 0x{tid:x}", crate::symbolize(start as usize));
             if !tid_out.is_null() {
-                *tid_out = tid;
+                std::ptr::write_unaligned(tid_out, tid);
             }
             handles::insert(t)
         }
@@ -56,12 +57,18 @@ pub unsafe extern "win64" fn CreateThread(
 }
 
 pub unsafe extern "win64" fn CreateRemoteThread(p: HANDLE, sec: *mut c_void, stack: usize, start: Option<thread::ThreadProc>, param: *mut c_void, flags: u32, tid: *mut u32) -> HANDLE {
-    if p != handles::CURRENT_PROCESS {
-        stub!("CreateRemoteThread into another process");
+    if crate::kernel32::process::is_self(p) {
+        return CreateThread(sec, stack, start, param, flags, tid);
+    }
+    if handles::get_as::<crate::kernel32::process::ChildProcessObj>(p).is_some() {
+        // Cross-process thread injection requires Mach `task_for_pid` / `thread_create_running`
+        // (blocked by macOS SIP/sandbox without debugger entitlements). Matches Windows when
+        // the process handle lacks PROCESS_CREATE_THREAD / PROCESS_VM_OPERATION.
         set_err(err::ERROR_ACCESS_DENIED);
         return std::ptr::null_mut();
     }
-    CreateThread(sec, stack, start, param, flags, tid)
+    set_err(err::ERROR_INVALID_HANDLE);
+    std::ptr::null_mut()
 }
 
 pub unsafe extern "win64" fn ExitThread(code: u32) {
@@ -169,9 +176,15 @@ pub unsafe extern "win64" fn SuspendThread(h: HANDLE) -> u32 {
     }
 }
 
-pub unsafe extern "win64" fn TerminateThread(_h: HANDLE, _code: u32) -> BOOL {
-    stub!("TerminateThread unsupported");
-    set_err(err::ERROR_ACCESS_DENIED);
+pub unsafe extern "win64" fn TerminateThread(h: HANDLE, code: u32) -> BOOL {
+    if let Some(t) = thread_obj(h) {
+        return thread::terminate_thread(&t, code) as BOOL;
+    }
+    if handles::get_as::<crate::kernel32::process::ChildThreadObj>(h).is_some() {
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    set_err(err::ERROR_INVALID_HANDLE);
     FALSE
 }
 
@@ -240,18 +253,74 @@ pub unsafe extern "win64" fn SetThreadPriorityBoost(_h: HANDLE, _d: BOOL) -> BOO
     TRUE
 }
 
-pub unsafe extern "win64" fn SetThreadAffinityMask(_h: HANDLE, _mask: usize) -> usize {
-    stub!("thread affinity not applied");
-    let n = crate::process::num_cpus();
-    if n >= 64 { usize::MAX } else { (1usize << n) - 1 }
+fn thread_obj_or_ensure(h: HANDLE) -> Option<Arc<ThreadObj>> {
+    if h == handles::CURRENT_THREAD {
+        return Some(thread::ensure_current_thread_object());
+    }
+    handles::get_as::<ThreadObj>(h)
 }
 
-pub unsafe extern "win64" fn SetThreadGroupAffinity(_h: HANDLE, _a: *const c_void, prev: *mut u8) -> BOOL {
-    stub!("thread group affinity not applied");
+pub unsafe extern "win64" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    let Some(t) = thread_obj_or_ensure(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+    if mask == 0 || (mask & !proc_mask) != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let old = t.affinity_mask.swap(mask, Ordering::AcqRel);
+    let prev = if old == 0 { proc_mask } else { old };
+    thread::sched::apply_affinity_mask(&t, mask, proc_mask);
+    prev
+}
+
+pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, group_affinity: *const c_void, prev: *mut u8) -> BOOL {
+    if group_affinity.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(t) = thread_obj_or_ensure(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+    let ga = group_affinity as *const u8;
+    let mask = std::ptr::read_unaligned(ga as *const usize);
+    let group = std::ptr::read_unaligned(ga.add(8) as *const u16);
+    if group != 0 || mask == 0 || (mask & !proc_mask) != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let old_mask = t.affinity_mask.swap(mask, Ordering::AcqRel);
+    let old_group = t.affinity_group.swap(group, Ordering::AcqRel);
+    let prev_mask = if old_mask == 0 { proc_mask } else { old_mask };
     if !prev.is_null() {
         std::ptr::write_bytes(prev, 0, 16);
-        *(prev as *mut usize) = (1usize << crate::process::num_cpus()) - 1;
+        std::ptr::write_unaligned(prev as *mut usize, prev_mask);
+        std::ptr::write_unaligned(prev.add(8) as *mut u16, old_group);
     }
+    thread::sched::apply_affinity_mask(&t, mask, proc_mask);
+    TRUE
+}
+
+pub unsafe extern "win64" fn GetThreadGroupAffinity(h: HANDLE, out: *mut u8) -> BOOL {
+    if out.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let Some(t) = thread_obj_or_ensure(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+    let cur = t.affinity_mask.load(Ordering::Acquire);
+    let mask = if cur == 0 { proc_mask } else { cur };
+    let group = t.affinity_group.load(Ordering::Acquire);
+    std::ptr::write_bytes(out, 0, 16);
+    std::ptr::write_unaligned(out as *mut usize, mask);
+    std::ptr::write_unaligned(out.add(8) as *mut u16, group);
     TRUE
 }
 
@@ -1726,6 +1795,153 @@ mod tests {
 
             assert_eq!(CloseHandle(ev), TRUE);
             assert_eq!(CloseHandle(h), TRUE);
+        }
+    }
+
+    #[test]
+    fn thread_affinity_and_group_affinity_track_previous_masks() {
+        unsafe {
+            let mut proc_mask = 0usize;
+            let mut sys_mask = 0usize;
+            assert_eq!(
+                crate::kernel32::process::GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut proc_mask, &mut sys_mask),
+                TRUE
+            );
+            assert_ne!(proc_mask, 0);
+
+            // Spawn a dedicated test thread so we don't mutate the test runner's affinity mask.
+            let ready = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let done = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let r_u = ready as usize;
+            let d_u = done as usize;
+            let obj = thread::spawn(
+                Box::new(move || {
+                    SetEvent(r_u as HANDLE);
+                    WaitForSingleObject(d_u as HANDLE, 5_000);
+                    0
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn affinity thread");
+            let h = handles::insert(obj);
+            assert_eq!(WaitForSingleObject(ready, 5_000), WAIT_OBJECT_0);
+
+            // First call returns previous (default = proc_mask), sets to 0x1.
+            let prev1 = SetThreadAffinityMask(h, 0x1);
+            assert_eq!(prev1, proc_mask);
+
+            // Second call returns 0x1.
+            let prev2 = SetThreadAffinityMask(h, proc_mask);
+            assert_eq!(prev2, 0x1);
+
+            // Invalid mask (0 or outside proc_mask) fails with ERROR_INVALID_PARAMETER.
+            assert_eq!(SetThreadAffinityMask(h, 0), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // SetThreadGroupAffinity + GetThreadGroupAffinity round-trip.
+            let mut req = [0u8; 16];
+            std::ptr::write_unaligned(req.as_mut_ptr() as *mut usize, 0x1);
+            std::ptr::write_unaligned(req.as_mut_ptr().add(8) as *mut u16, 0);
+            let mut prev_ga = [0xFFu8; 16];
+            assert_eq!(SetThreadGroupAffinity(h, req.as_ptr() as *const c_void, prev_ga.as_mut_ptr()), TRUE);
+            assert_eq!(std::ptr::read_unaligned(prev_ga.as_ptr() as *const usize), proc_mask);
+            assert_eq!(std::ptr::read_unaligned(prev_ga.as_ptr().add(8) as *const u16), 0);
+
+            let mut cur_ga = [0u8; 16];
+            assert_eq!(GetThreadGroupAffinity(h, cur_ga.as_mut_ptr()), TRUE);
+            assert_eq!(std::ptr::read_unaligned(cur_ga.as_ptr() as *const usize), 0x1);
+            assert_eq!(std::ptr::read_unaligned(cur_ga.as_ptr().add(8) as *const u16), 0);
+
+            // Non-zero group rejected with ERROR_INVALID_PARAMETER.
+            std::ptr::write_unaligned(req.as_mut_ptr().add(8) as *mut u16, 1);
+            assert_eq!(SetThreadGroupAffinity(h, req.as_ptr() as *const c_void, std::ptr::null_mut()), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            SetEvent(done);
+            assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(h), TRUE);
+            assert_eq!(CloseHandle(ready), TRUE);
+            assert_eq!(CloseHandle(done), TRUE);
+        }
+    }
+
+    #[test]
+    fn terminate_thread_and_create_remote_thread_semantics() {
+        unsafe {
+            // 1. TerminateThread on a CREATE_SUSPENDED thread aborts before running body.
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ran_c = Arc::clone(&ran);
+            let obj_susp = thread::spawn(
+                Box::new(move || {
+                    ran_c.store(true, Ordering::Release);
+                    0
+                }),
+                64 * 1024,
+                true,
+                false,
+            )
+            .expect("spawn suspended thread");
+            let h_susp = handles::insert(obj_susp);
+            assert_eq!(TerminateThread(h_susp, 0xDEAD_0001), TRUE);
+            assert_eq!(WaitForSingleObject(h_susp, 5_000), WAIT_OBJECT_0);
+            let mut code = 0u32;
+            assert_eq!(GetExitCodeThread(h_susp, &mut code), TRUE);
+            assert_eq!(code, 0xDEAD_0001);
+            assert!(!ran.load(Ordering::Acquire), "suspended terminated thread must not run");
+            assert_eq!(CloseHandle(h_susp), TRUE);
+
+            // 2. TerminateThread on a live sleeping thread signals it with exit code.
+            let ready = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let r_u = ready as usize;
+            let obj_live = thread::spawn(
+                Box::new(move || {
+                    SetEvent(r_u as HANDLE);
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn live thread");
+            let h_live = handles::insert(obj_live);
+            assert_eq!(WaitForSingleObject(ready, 5_000), WAIT_OBJECT_0);
+            assert_eq!(TerminateThread(h_live, 0xBEEF_0042), TRUE);
+            assert_eq!(WaitForSingleObject(h_live, 5_000), WAIT_OBJECT_0);
+            let mut code2 = 0u32;
+            assert_eq!(GetExitCodeThread(h_live, &mut code2), TRUE);
+            assert_eq!(code2, 0xBEEF_0042);
+            // Terminating an already-exited thread succeeds without altering exit code.
+            assert_eq!(TerminateThread(h_live, 999), TRUE);
+            assert_eq!(GetExitCodeThread(h_live, &mut code2), TRUE);
+            assert_eq!(code2, 0xBEEF_0042);
+            assert_eq!(CloseHandle(h_live), TRUE);
+            assert_eq!(CloseHandle(ready), TRUE);
+
+            // 3. Invalid handle -> ERROR_INVALID_HANDLE.
+            assert_eq!(TerminateThread(0x1234usize as HANDLE, 1), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // 4. CreateRemoteThread: invalid/NULL process handle -> ERROR_INVALID_HANDLE; self handle succeeds.
+            unsafe extern "win64" fn remote_entry(param: *mut c_void) -> u32 {
+                (param as usize) as u32 + 7
+            }
+            assert!(CreateRemoteThread(std::ptr::null_mut(), std::ptr::null_mut(), 0, Some(remote_entry), std::ptr::null_mut(), 0, std::ptr::null_mut()).is_null());
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            let self_h = crate::kernel32::process::OpenProcess(0x1FFFFF, FALSE, std::process::id());
+            assert!(!self_h.is_null());
+            let rt = CreateRemoteThread(self_h, std::ptr::null_mut(), 0, Some(remote_entry), 35usize as *mut c_void, 0, std::ptr::null_mut());
+            assert!(!rt.is_null());
+            assert_eq!(WaitForSingleObject(rt, 5_000), WAIT_OBJECT_0);
+            let mut rcode = 0u32;
+            assert_eq!(GetExitCodeThread(rt, &mut rcode), TRUE);
+            assert_eq!(rcode, 42);
+            assert_eq!(CloseHandle(rt), TRUE);
+            assert_eq!(CloseHandle(self_h), TRUE);
         }
     }
 }

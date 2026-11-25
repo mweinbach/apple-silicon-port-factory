@@ -13,10 +13,10 @@ use crate::thread;
 use crate::types::*;
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 type WorkCb = unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void);
@@ -227,17 +227,128 @@ unsafe fn clone_arc_from_raw<T>(ptr: *const T) -> Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Cleanup groups (TP_CALLBACK_ENVIRON tracking)
+// ---------------------------------------------------------------------------
+
+enum CleanupMember {
+    Work(Arc<TpWork>),
+    Timer(Arc<TpTimer>),
+    Wait(Arc<TpWait>),
+    Io(Arc<TpIo>),
+}
+
+impl CleanupMember {
+    fn raw_addr(&self) -> usize {
+        match self {
+            CleanupMember::Work(a) => Arc::as_ptr(a) as usize,
+            CleanupMember::Timer(a) => Arc::as_ptr(a) as usize,
+            CleanupMember::Wait(a) => Arc::as_ptr(a) as usize,
+            CleanupMember::Io(a) => Arc::as_ptr(a) as usize,
+        }
+    }
+}
+
+struct CleanupEntry {
+    member: CleanupMember,
+    obj_ctx: SendPtr,
+    cancel_cb: usize,
+}
+
+struct TpCleanupGroup {
+    members: Mutex<Vec<CleanupEntry>>,
+}
+
+impl TpCleanupGroup {
+    fn add(&self, member: CleanupMember, obj_ctx: *mut c_void, cancel_cb: usize) {
+        self.members.lock().unwrap().push(CleanupEntry {
+            member,
+            obj_ctx: SendPtr(obj_ctx),
+            cancel_cb,
+        });
+    }
+
+    fn remove_by_addr(&self, addr: usize) {
+        self.members.lock().unwrap().retain(|e| e.member.raw_addr() != addr);
+    }
+}
+
+fn cleanup_groups_registry() -> &'static Mutex<HashSet<usize>> {
+    static REG: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Extract `(cleanup_group, cancel_callback)` from a guest `TP_CALLBACK_ENVIRON`
+/// (`V1` or `V3`), validating the cleanup group pointer against `CLEANUP_GROUPS`.
+///
+/// Windows x64 `TP_CALLBACK_ENVIRON` layout (`winnt.h`):
+/// `+0x00 Version (u32: 1 or 3)`, `+0x08 Pool`, `+0x10 CleanupGroup`,
+/// `+0x18 CleanupGroupCancelCallback`.
+unsafe fn extract_cleanup_group(env: *mut c_void) -> Option<(Arc<TpCleanupGroup>, usize)> {
+    if env.is_null() {
+        return None;
+    }
+    let p = env as *const u8;
+    let version = std::ptr::read_unaligned(p as *const u32);
+    if version != 1 && version != 3 {
+        return None;
+    }
+    let cg_ptr = std::ptr::read_unaligned(p.add(0x10) as *const *const TpCleanupGroup);
+    if cg_ptr.is_null() {
+        return None;
+    }
+    let cancel_cb = std::ptr::read_unaligned(p.add(0x18) as *const usize);
+    let reg = cleanup_groups_registry().lock().unwrap();
+    if !reg.contains(&(cg_ptr as usize)) {
+        return None;
+    }
+    Some((clone_arc_from_raw(cg_ptr), cancel_cb))
+}
+
+// ---------------------------------------------------------------------------
 // Work
 // ---------------------------------------------------------------------------
+
+struct TpWorkState {
+    queued: usize,
+    running: usize,
+    generation: u64,
+    cancel_waiters: usize,
+}
+
+impl TpWorkState {
+    fn is_idle(&self) -> bool {
+        self.queued == 0 && self.running == 0
+    }
+}
 
 pub struct TpWork {
     cb: WorkCb,
     ctx: SendPtr,
-    pending: Pending,
+    state: Mutex<TpWorkState>,
+    cv: Condvar,
+    closed: AtomicBool,
+    cleanup_group: Option<Weak<TpCleanupGroup>>,
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolWork(cb: WorkCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpWork {
-    Arc::into_raw(Arc::new(TpWork { cb, ctx: SendPtr(ctx), pending: Pending::new() })) as *mut TpWork
+pub unsafe extern "win64" fn CreateThreadpoolWork(cb: WorkCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpWork {
+    let cg = extract_cleanup_group(env);
+    let arc = Arc::new(TpWork {
+        cb,
+        ctx: SendPtr(ctx),
+        state: Mutex::new(TpWorkState {
+            queued: 0,
+            running: 0,
+            generation: 0,
+            cancel_waiters: 0,
+        }),
+        cv: Condvar::new(),
+        closed: AtomicBool::new(false),
+        cleanup_group: cg.as_ref().map(|(g, _)| Arc::downgrade(g)),
+    });
+    if let Some((group, cancel_cb)) = cg {
+        group.add(CleanupMember::Work(Arc::clone(&arc)), ctx, cancel_cb);
+    }
+    Arc::into_raw(arc) as *mut TpWork
 }
 
 pub unsafe extern "win64" fn SubmitThreadpoolWork(w: *mut TpWork) {
@@ -246,14 +357,38 @@ pub unsafe extern "win64" fn SubmitThreadpoolWork(w: *mut TpWork) {
     }
     let arc = clone_arc_from_raw(w);
     let raw = w as u64;
-    arc.pending.inc();
+    let gen = {
+        let mut st = arc.state.lock().unwrap();
+        if st.cancel_waiters > 0 {
+            return;
+        }
+        st.queued += 1;
+        st.generation
+    };
     submit(Box::new(move || {
+        let should_run = {
+            let mut st = arc.state.lock().unwrap();
+            if st.generation != gen {
+                false
+            } else {
+                st.queued -= 1;
+                st.running += 1;
+                true
+            }
+        };
+        if !should_run {
+            return;
+        }
         unsafe {
             with_callback_instance(|inst| {
                 crate::call_guest8(arc.cb as usize, inst as u64, arc.ctx.0 as u64, raw, 0, 0, 0, 0, 0);
             });
         }
-        arc.pending.dec();
+        let mut st = arc.state.lock().unwrap();
+        st.running -= 1;
+        if st.is_idle() {
+            arc.cv.notify_all();
+        }
     }));
 }
 
@@ -261,16 +396,39 @@ pub unsafe extern "win64" fn WaitForThreadpoolWorkCallbacks(w: *mut TpWork, canc
     if w.is_null() {
         return;
     }
-    if cancel != 0 {
-        log::debug!("WaitForThreadpoolWorkCallbacks: cancel of queued items not supported; waiting instead");
+    let do_cancel = cancel != 0;
+    let mut st = (*w).state.lock().unwrap();
+    if do_cancel {
+        st.cancel_waiters += 1;
+        if st.queued > 0 {
+            st.generation = st.generation.wrapping_add(1);
+            st.queued = 0;
+            if st.is_idle() {
+                (*w).cv.notify_all();
+            }
+        }
     }
-    (*w).pending.wait_zero();
+    while !st.is_idle() {
+        st = (*w).cv.wait(st).unwrap();
+    }
+    if do_cancel {
+        st.cancel_waiters -= 1;
+    }
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolWork(w: *mut TpWork) {
-    if !w.is_null() {
-        drop(Arc::from_raw(w));
+    if w.is_null() {
+        return;
     }
+    if (*w).closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(ref wg) = (*w).cleanup_group {
+        if let Some(g) = wg.upgrade() {
+            g.remove_by_addr(w as usize);
+        }
+    }
+    drop(Arc::from_raw(w));
 }
 
 pub unsafe extern "win64" fn TrySubmitThreadpoolCallback(cb: SimpleCb, ctx: *mut c_void, _env: *mut c_void) -> BOOL {
@@ -311,6 +469,8 @@ pub struct TpTimer {
     /// (period_ms, armed)
     state: Mutex<(u32, bool)>,
     _owner: Option<Arc<dyn Any + Send + Sync>>,
+    closed: AtomicBool,
+    cleanup_group: Option<Weak<TpCleanupGroup>>,
 }
 
 struct TimerEntry {
@@ -410,19 +570,30 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
     }
 }
 
-fn create_timer_inner(cb: WorkCb, ctx: *mut c_void, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpTimer {
-    Arc::into_raw(Arc::new(TpTimer {
+fn create_timer_inner(
+    cb: WorkCb,
+    ctx: *mut c_void,
+    owner: Option<Arc<dyn Any + Send + Sync>>,
+    cg: Option<(Arc<TpCleanupGroup>, usize)>,
+) -> *mut TpTimer {
+    let arc = Arc::new(TpTimer {
         cb,
         ctx: SendPtr(ctx),
         pending: Pending::new(),
         generation: AtomicU64::new(0),
         state: Mutex::new((0, false)),
         _owner: owner,
-    })) as *mut TpTimer
+        closed: AtomicBool::new(false),
+        cleanup_group: cg.as_ref().map(|(g, _)| Arc::downgrade(g)),
+    });
+    if let Some((group, cancel_cb)) = cg {
+        group.add(CleanupMember::Timer(Arc::clone(&arc)), ctx, cancel_cb);
+    }
+    Arc::into_raw(arc) as *mut TpTimer
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolTimer(cb: WorkCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpTimer {
-    create_timer_inner(cb, ctx, None)
+pub unsafe extern "win64" fn CreateThreadpoolTimer(cb: WorkCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpTimer {
+    create_timer_inner(cb, ctx, None, extract_cleanup_group(env))
 }
 
 /// `due`: FILETIME; negative = relative 100ns, positive = absolute UTC; NULL = cancel.
@@ -489,6 +660,14 @@ pub unsafe extern "win64" fn CloseThreadpoolTimer(t: *mut TpTimer) {
     if t.is_null() {
         return;
     }
+    if (*t).closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(ref wg) = (*t).cleanup_group {
+        if let Some(g) = wg.upgrade() {
+            g.remove_by_addr(t as usize);
+        }
+    }
     let arc = Arc::from_raw(t);
     {
         let mut st = arc.state.lock().unwrap();
@@ -510,6 +689,8 @@ pub struct TpWait {
     pending: Pending,
     generation: AtomicU64,
     _owner: Option<Arc<dyn Any + Send + Sync>>,
+    closed: AtomicBool,
+    cleanup_group: Option<Weak<TpCleanupGroup>>,
 }
 
 struct ArmedWait {
@@ -678,18 +859,29 @@ fn disarm_wait(disp: &WaitDispatcher, ptr: *const TpWait) {
     }
 }
 
-fn create_wait_inner(cb: WaitCb, ctx: *mut c_void, owner: Option<Arc<dyn Any + Send + Sync>>) -> *mut TpWait {
-    Arc::into_raw(Arc::new(TpWait {
+fn create_wait_inner(
+    cb: WaitCb,
+    ctx: *mut c_void,
+    owner: Option<Arc<dyn Any + Send + Sync>>,
+    cg: Option<(Arc<TpCleanupGroup>, usize)>,
+) -> *mut TpWait {
+    let arc = Arc::new(TpWait {
         cb,
         ctx: SendPtr(ctx),
         pending: Pending::new(),
         generation: AtomicU64::new(0),
         _owner: owner,
-    })) as *mut TpWait
+        closed: AtomicBool::new(false),
+        cleanup_group: cg.as_ref().map(|(g, _)| Arc::downgrade(g)),
+    });
+    if let Some((group, cancel_cb)) = cg {
+        group.add(CleanupMember::Wait(Arc::clone(&arc)), ctx, cancel_cb);
+    }
+    Arc::into_raw(arc) as *mut TpWait
 }
 
-pub unsafe extern "win64" fn CreateThreadpoolWait(cb: WaitCb, ctx: *mut c_void, _env: *mut c_void) -> *mut TpWait {
-    create_wait_inner(cb, ctx, None)
+pub unsafe extern "win64" fn CreateThreadpoolWait(cb: WaitCb, ctx: *mut c_void, env: *mut c_void) -> *mut TpWait {
+    create_wait_inner(cb, ctx, None, extract_cleanup_group(env))
 }
 
 pub unsafe extern "win64" fn SetThreadpoolWait(w: *mut TpWait, h: HANDLE, timeout: *const FILETIME) {
@@ -753,6 +945,14 @@ pub unsafe extern "win64" fn CloseThreadpoolWait(w: *mut TpWait) {
     if w.is_null() {
         return;
     }
+    if (*w).closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(ref wg) = (*w).cleanup_group {
+        if let Some(g) = wg.upgrade() {
+            g.remove_by_addr(w as usize);
+        }
+    }
     let arc = Arc::from_raw(w);
     arc.generation.fetch_add(1, Ordering::AcqRel);
     disarm_wait(wait_dispatcher(), Arc::as_ptr(&arc));
@@ -802,14 +1002,100 @@ pub unsafe extern "win64" fn SetThreadpoolThreadMinimum(_p: *mut c_void, _n: u32
     TRUE
 }
 pub unsafe extern "win64" fn CreateThreadpoolCleanupGroup() -> *mut c_void {
-    Box::into_raw(Box::new(0u64)) as *mut c_void
+    let arc = Arc::new(TpCleanupGroup {
+        members: Mutex::new(Vec::new()),
+    });
+    let raw = Arc::into_raw(arc) as *mut c_void;
+    cleanup_groups_registry().lock().unwrap().insert(raw as usize);
+    raw
 }
-pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(_g: *mut c_void, _cancel: BOOL, _ctx: *mut c_void) {
-    stub!("cleanup groups do not track members");
+
+pub unsafe extern "win64" fn CloseThreadpoolCleanupGroupMembers(
+    g: *mut c_void,
+    cancel_pending: BOOL,
+    cleanup_ctx: *mut c_void,
+) {
+    if g.is_null() {
+        return;
+    }
+    let group = {
+        let reg = cleanup_groups_registry().lock().unwrap();
+        if !reg.contains(&(g as usize)) {
+            return;
+        }
+        clone_arc_from_raw(g as *const TpCleanupGroup)
+    };
+    let entries = {
+        let mut m = group.members.lock().unwrap();
+        std::mem::take(&mut *m)
+    };
+    let cancel = cancel_pending != 0;
+    for entry in entries {
+        match entry.member {
+            CleanupMember::Work(arc) => {
+                if arc.closed.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                let ptr = Arc::as_ptr(&arc) as *mut TpWork;
+                WaitForThreadpoolWorkCallbacks(ptr, cancel_pending);
+                if cancel && entry.cancel_cb != 0 {
+                    crate::call_guest8(entry.cancel_cb, entry.obj_ctx.0 as u64, cleanup_ctx as u64, 0, 0, 0, 0, 0, 0);
+                }
+                drop(Arc::from_raw(ptr));
+            }
+            CleanupMember::Timer(arc) => {
+                if arc.closed.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                let ptr = Arc::as_ptr(&arc) as *mut TpTimer;
+                WaitForThreadpoolTimerCallbacks(ptr, cancel_pending);
+                {
+                    let mut st = arc.state.lock().unwrap();
+                    arc.generation.fetch_add(1, Ordering::AcqRel);
+                    st.1 = false;
+                }
+                timers().heap.lock().unwrap().retain(|e| !Arc::ptr_eq(&e.timer, &arc));
+                if cancel && entry.cancel_cb != 0 {
+                    crate::call_guest8(entry.cancel_cb, entry.obj_ctx.0 as u64, cleanup_ctx as u64, 0, 0, 0, 0, 0, 0);
+                }
+                drop(Arc::from_raw(ptr));
+            }
+            CleanupMember::Wait(arc) => {
+                if arc.closed.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                let ptr = Arc::as_ptr(&arc) as *mut TpWait;
+                WaitForThreadpoolWaitCallbacks(ptr, cancel_pending);
+                arc.generation.fetch_add(1, Ordering::AcqRel);
+                disarm_wait(wait_dispatcher(), ptr);
+                if cancel && entry.cancel_cb != 0 {
+                    crate::call_guest8(entry.cancel_cb, entry.obj_ctx.0 as u64, cleanup_ctx as u64, 0, 0, 0, 0, 0, 0);
+                }
+                drop(Arc::from_raw(ptr));
+            }
+            CleanupMember::Io(arc) => {
+                if arc.closed.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                let ptr = Arc::as_ptr(&arc) as *mut TpIo;
+                WaitForThreadpoolIoCallbacks(ptr, cancel_pending);
+                crate::kernel32::file::unbind_threadpool_io(arc.file.0, &arc);
+                if cancel && entry.cancel_cb != 0 {
+                    crate::call_guest8(entry.cancel_cb, entry.obj_ctx.0 as u64, cleanup_ctx as u64, 0, 0, 0, 0, 0, 0);
+                }
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
 }
+
 pub unsafe extern "win64" fn CloseThreadpoolCleanupGroup(g: *mut c_void) {
-    if !g.is_null() {
-        drop(Box::from_raw(g as *mut u64));
+    if g.is_null() {
+        return;
+    }
+    let removed = cleanup_groups_registry().lock().unwrap().remove(&(g as usize));
+    if removed {
+        drop(Arc::from_raw(g as *const TpCleanupGroup));
     }
 }
 
@@ -859,7 +1145,7 @@ pub unsafe extern "win64" fn CreateTimerQueueTimer(
     });
     let ctx_ptr = Arc::as_ptr(&ctx) as *mut c_void;
     let owner: Arc<dyn std::any::Any + Send + Sync> = ctx.clone();
-    let tp = create_timer_inner(legacy_timer_trampoline, ctx_ptr, Some(owner));
+    let tp = create_timer_inner(legacy_timer_trampoline, ctx_ptr, Some(owner), None);
     ctx.tp_timer.store(tp, Ordering::Release);
     let due_100ns = -((due_time as i64) * 10_000);
     let ft = FILETIME::from_u64(due_100ns as u64);
@@ -959,7 +1245,7 @@ pub unsafe extern "win64" fn RegisterWaitForSingleObject(
     });
     let ctx_ptr = Arc::as_ptr(&ctx) as *mut c_void;
     let owner: Arc<dyn std::any::Any + Send + Sync> = ctx.clone();
-    let tp = create_wait_inner(legacy_wait_trampoline, ctx_ptr, Some(owner));
+    let tp = create_wait_inner(legacy_wait_trampoline, ctx_ptr, Some(owner), None);
     ctx.tp_wait.store(tp, Ordering::Release);
     let ft;
     let p_ft = if milliseconds == INFINITE {
@@ -1028,6 +1314,8 @@ pub struct TpIo {
     ctx: SendPtr,
     state: Mutex<TpIoState>,
     cv: Condvar,
+    closed: AtomicBool,
+    cleanup_group: Option<Weak<TpCleanupGroup>>,
 }
 
 impl TpIo {
@@ -1108,12 +1396,13 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
     fl: HANDLE,
     pfnio: *const c_void,
     pv: *mut c_void,
-    _pcbe: *mut c_void,
+    pcbe: *mut c_void,
 ) -> *mut TpIo {
     if fl.is_null() || fl == INVALID_HANDLE_VALUE || pfnio.is_null() {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
+    let cg = extract_cleanup_group(pcbe);
     let arc = Arc::new(TpIo {
         file: SendPtr(fl),
         cb: pfnio as usize,
@@ -1126,10 +1415,15 @@ pub unsafe extern "win64" fn CreateThreadpoolIo(
             cancel_waiters: 0,
         }),
         cv: Condvar::new(),
+        closed: AtomicBool::new(false),
+        cleanup_group: cg.as_ref().map(|(g, _)| Arc::downgrade(g)),
     });
     if let Err(e) = crate::kernel32::file::bind_threadpool_io(fl, Arc::clone(&arc)) {
         crate::teb::set_last_error(e);
         return std::ptr::null_mut();
+    }
+    if let Some((group, cancel_cb)) = cg {
+        group.add(CleanupMember::Io(Arc::clone(&arc)), pv, cancel_cb);
     }
     Arc::into_raw(arc) as *mut TpIo
 }
@@ -1177,11 +1471,20 @@ pub unsafe extern "win64" fn WaitForThreadpoolIoCallbacks(pio: *mut TpIo, cancel
 }
 
 pub unsafe extern "win64" fn CloseThreadpoolIo(pio: *mut TpIo) {
-    if !pio.is_null() {
-        let arc = Arc::from_raw(pio);
-        crate::kernel32::file::unbind_threadpool_io(arc.file.0, &arc);
-        drop(arc);
+    if pio.is_null() {
+        return;
     }
+    if (*pio).closed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(ref wg) = (*pio).cleanup_group {
+        if let Some(g) = wg.upgrade() {
+            g.remove_by_addr(pio as usize);
+        }
+    }
+    let arc = Arc::from_raw(pio);
+    crate::kernel32::file::unbind_threadpool_io(arc.file.0, &arc);
+    drop(arc);
 }
 
 #[cfg(test)]
@@ -1826,6 +2129,68 @@ mod tests {
             assert_eq!(CloseHandle(obs_locked_ev), TRUE);
             assert_eq!(CloseHandle(rd), TRUE);
             assert_eq!(CloseHandle(wr), TRUE);
+        }
+    }
+
+    #[test]
+    fn threadpool_cleanup_group_tracks_waits_cancels_and_invokes_cancel_cb() {
+        use std::sync::atomic::AtomicU32;
+
+        struct CgCtx {
+            work_runs: AtomicU32,
+            cancel_calls: AtomicU32,
+            last_cleanup_ctx: AtomicU64,
+        }
+        unsafe extern "win64" fn slow_work(_inst: *mut c_void, ctx: *mut c_void, _w: *mut c_void) {
+            let c = &*(ctx as *const CgCtx);
+            std::thread::sleep(Duration::from_millis(20));
+            c.work_runs.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe extern "win64" fn cancel_cb(obj_ctx: *mut c_void, cleanup_ctx: *mut c_void) {
+            let c = &*(obj_ctx as *const CgCtx);
+            c.last_cleanup_ctx.store(cleanup_ctx as u64, Ordering::Release);
+            c.cancel_calls.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe extern "win64" fn never_timer(_inst: *mut c_void, _ctx: *mut c_void, _t: *mut c_void) {
+            panic!("far-future timer must be cancelled by CloseThreadpoolCleanupGroupMembers");
+        }
+
+        unsafe {
+            let cg = CreateThreadpoolCleanupGroup();
+            assert!(!cg.is_null());
+
+            // Build a Windows TP_CALLBACK_ENVIRON_V3 (72 bytes):
+            // +0x00 Version = 3, +0x10 CleanupGroup = cg, +0x18 CleanupGroupCancelCallback = cancel_cb
+            let mut env = [0u8; 72];
+            std::ptr::write_unaligned(env.as_mut_ptr() as *mut u32, 3u32);
+            std::ptr::write_unaligned(env.as_mut_ptr().add(0x10) as *mut *mut c_void, cg);
+            std::ptr::write_unaligned(env.as_mut_ptr().add(0x18) as *mut usize, cancel_cb as *const () as usize);
+
+            let ctx = Box::new(CgCtx {
+                work_runs: AtomicU32::new(0),
+                cancel_calls: AtomicU32::new(0),
+                last_cleanup_ctx: AtomicU64::new(0),
+            });
+            let ctx_ptr = &*ctx as *const CgCtx as *mut c_void;
+
+            // Attach a Work item and a far-future Timer to the cleanup group.
+            let w = CreateThreadpoolWork(slow_work, ctx_ptr, env.as_mut_ptr() as *mut c_void);
+            let t = CreateThreadpoolTimer(never_timer, ctx_ptr, env.as_mut_ptr() as *mut c_void);
+            assert!(!w.is_null() && !t.is_null());
+
+            SubmitThreadpoolWork(w);
+            let far = FILETIME::from_u64((-60_000_000_000i64) as u64); // 6000 s
+            SetThreadpoolTimer(t, &far, 0, 0);
+
+            // Wait for work to complete, cancel far-future timer, and invoke cancel_cb for both members.
+            let tag = 0x55AA_1234usize as *mut c_void;
+            CloseThreadpoolCleanupGroupMembers(cg, TRUE, tag);
+            assert_eq!(ctx.cancel_calls.load(Ordering::Acquire), 2);
+            assert_eq!(ctx.last_cleanup_ctx.load(Ordering::Acquire), tag as u64);
+
+            // Second call is an empty no-op; closing group frees it cleanly.
+            CloseThreadpoolCleanupGroupMembers(cg, FALSE, std::ptr::null_mut());
+            CloseThreadpoolCleanupGroup(cg);
         }
     }
 }
