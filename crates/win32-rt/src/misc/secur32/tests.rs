@@ -4053,6 +4053,40 @@ fn schannel_cred_rejects_unsupported_nonzero_protocol_masks() {
             ),
             SEC_E_OK
         );
+        // Inbound-only credentials must be rejected by InitializeSecurityContextA (requires SECPKG_CRED_OUTBOUND).
+        let target = b"test.example.com\0";
+        let mut cli_ctx = SecHandle::default();
+        let mut out_buf = SecBuffer {
+            cb_buffer: 0,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: std::ptr::null_mut(),
+        };
+        let mut out_desc = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut out_buf,
+        };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                target.as_ptr(),
+                ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_CONFIDENTIALITY,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut out_desc as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            super::schannel::SEC_E_NO_CREDENTIALS,
+            "InitializeSecurityContext must reject SECPKG_CRED_INBOUND-only credentials"
+        );
+        assert!(out_buf.pv_buffer.is_null() && out_buf.cb_buffer == 0);
+        assert_eq!((cli_ctx.dw_lower, cli_ctx.dw_upper), (0, 0));
+
         FreeCredentialsHandle(&mut cred as *mut _ as *mut c_void);
 
         crypt32::CertFreeCertificateContext(server_cert);

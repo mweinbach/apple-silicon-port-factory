@@ -1636,6 +1636,9 @@ pub(super) unsafe fn initialize_security_context_impl(
         let Some(cred) = CRED_TABLE.get_cloned(cred_id) else {
             return SEC_E_INVALID_HANDLE;
         };
+        if (cred.cred_use & SECPKG_CRED_OUTBOUND) == 0 {
+            return SEC_E_NO_CREDENTIALS;
+        }
         if ph_new_context.is_null() {
             return SEC_E_INVALID_HANDLE;
         }
