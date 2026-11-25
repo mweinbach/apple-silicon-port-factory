@@ -946,8 +946,9 @@ pub fn native_key(k: NativeKey) {
     set_async_key(key, k.down);
     let alt = async_down(VK_MENU);
     // Registered hotkeys (RegisterHotKey) intercept keydown before WM_KEYDOWN,
-    // posting WM_HOTKEY to the registering window/thread.
-    if k.down {
+    // posting WM_HOTKEY to the registering window/thread — unless the foreground
+    // raw-keyboard registration opted out via RIDEV_NOHOTKEYS.
+    if k.down && !raw_nohotkeys_active() {
         let mut mods = 0u32;
         if alt {
             mods |= 0x0001; // MOD_ALT
@@ -1349,6 +1350,7 @@ const _: () = assert!(std::mem::size_of::<RAWINPUTDEVICE>() == 16);
 const RIDEV_REMOVE: u32 = 0x0000_0001;
 const RIDEV_NOLEGACY: u32 = 0x0000_0030;
 const RIDEV_INPUTSINK: u32 = 0x0000_0100;
+const RIDEV_NOHOTKEYS: u32 = 0x0000_0200;
 const RIM_TYPEMOUSE: u32 = 0;
 const RIM_TYPEKEYBOARD: u32 = 1;
 const RID_INPUT: u32 = 0x1000_0003;
@@ -1411,6 +1413,29 @@ fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
         .unwrap()
         .iter()
         .any(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY)
+}
+
+/// True when the foreground application has an active raw keyboard (`(1, 6)`)
+/// registration with `RIDEV_NOHOTKEYS`, disabling application-defined `RegisterHotKey`
+/// interception so keydowns flow through to raw input and normal dispatch.
+fn raw_nohotkeys_active() -> bool {
+    let reg = RAW_REGS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.page == 1 && r.usage == 6 && (r.flags & RIDEV_NOHOTKEYS) != 0)
+        .copied();
+    let Some(reg) = reg else {
+        return false;
+    };
+    if !APP_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    if reg.target != 0 {
+        let act = ACTIVE.load(Ordering::Acquire);
+        return act == reg.target || window::is_child_of(reg.target, act);
+    }
+    FOCUS.load(Ordering::Acquire) != 0 || ACTIVE.load(Ordering::Acquire) != 0
 }
 
 /// Deliver a raw input record to the registered target (if any).
@@ -2261,6 +2286,118 @@ mod tests {
             assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
             assert_eq!(super::super::misc::UnhookWindowsHookEx(h_ms), TRUE);
             release_all_keys();
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn ridev_nohotkeys_disables_hotkey_interception_and_delivers_raw_keydown() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let cls = crate::strings::to_wide_z("RawNoHotkeysTestWnd");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            set_active_window(hwnd as usize, false);
+            set_focus(hwnd as usize);
+
+            // Register Ctrl+A as a hotkey.
+            assert_eq!(
+                super::super::misc::RegisterHotKey(hwnd, 55, 0x0002 /* MOD_CONTROL */, b'A' as u32),
+                TRUE
+            );
+
+            // Register raw keyboard with RIDEV_NOHOTKEYS | RIDEV_NOLEGACY.
+            let dev = RAWINPUTDEVICE {
+                usage_page: 1,
+                usage: 6,
+                flags: RIDEV_NOHOTKEYS | RIDEV_NOLEGACY,
+                target: hwnd as usize,
+            };
+            assert_eq!(RegisterRawInputDevices(&dev, 1, 16), TRUE);
+
+            // Press and release Ctrl+A: hotkey must NOT fire, and raw input must receive BOTH
+            // keydown and keyup for 'A' (not just an orphaned keyup).
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x3B, down: false, repeat: false, chars: Vec::new() });
+            release_all_keys();
+
+            let mut m = MSG::default();
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                FALSE,
+                "RIDEV_NOHOTKEYS must disable WM_HOTKEY interception"
+            );
+
+            // Inspect WM_INPUT records for 'A' (VK 0x41): both make (flags & 1 == 0) and break (flags & 1 == 1).
+            let mut a_events: Vec<(u16, u32)> = Vec::new();
+            while message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE) != 0 {
+                let mut buf = [0u8; 64];
+                let mut sz = buf.len() as u32;
+                let got = GetRawInputData(
+                    m.lparam as usize,
+                    RID_INPUT,
+                    buf.as_mut_ptr(),
+                    &mut sz,
+                    HEADER_SIZE as u32,
+                );
+                assert_eq!(got, 40);
+                let flags = u16::from_le_bytes([buf[26], buf[27]]);
+                let vk = u16::from_le_bytes([buf[30], buf[31]]);
+                let msg = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+                if vk == b'A' as u16 {
+                    a_events.push((flags, msg));
+                }
+            }
+            assert_eq!(
+                a_events,
+                vec![(0, wm::KEYDOWN), (1, wm::KEYUP)],
+                "raw keyboard consumer must receive both keydown and keyup under RIDEV_NOHOTKEYS"
+            );
+
+            // Removing the raw keyboard registration restores normal hotkey interception.
+            let rem = RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 };
+            assert_eq!(RegisterRawInputDevices(&rem, 1, 16), TRUE);
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            release_all_keys();
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                TRUE,
+                "removing RIDEV_NOHOTKEYS registration must restore WM_HOTKEY"
+            );
+            assert_eq!(m.wparam, 55);
+
+            assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 55), TRUE);
             let _ = window::DestroyWindow(hwnd);
         })
         .join()
