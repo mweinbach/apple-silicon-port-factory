@@ -469,8 +469,11 @@ impl Tr<'_> {
                 self.a.str(16, T0, XA, OFF_X87_SW);
             }
             X87_FLDCW => {
-                // Does NOT touch NZCV!
+                // Does NOT touch NZCV! Normalize per `xstate::control_word`: `(cw & 0x1F3F) | 0x40`.
                 self.load_op(k, T0, op, 16);
+                self.a.movz(false, T1, 0x1F3F, 0);
+                self.a.logic_rr(false, 0, T0, T0, T1, 0, 0);
+                self.a.logic_ri(false, 1, T0, T0, enc_logic_imm(0x40, false).unwrap());
                 self.load_x87_state();
                 self.a.str(16, T0, XA, OFF_X87_CW);
             }

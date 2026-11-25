@@ -2054,3 +2054,31 @@ fn x87_mem_arith_preserves_snan_classification() {
     assert_eq!(rd_m80(128), (0xC000_0000_0000_0001, 0x7FFF), "QNaN + m64 denormal preserves ST(0)");
     assert_eq!(rd_u16(70) & 0x0002, 0, "QNaN + m64 denormal suppresses SW.DE");
 }
+
+/// 18. Regression: `fldcw` must normalize reserved bits (15:13, 7 -> 0) and bit 6 (-> 1)
+///     identically across Generic, FastOp, JIT, and AOT (`0x023F -> 0x027F`, `0xFFFF -> 0x1F7F`,
+///     `0x0000 -> 0x0040`) without clobbering EFLAGS.
+#[test]
+fn x87_fldcw_normalizes_reserved_bits() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 64];
+    init[0..2].copy_from_slice(&0x023Fu16.to_le_bytes());
+    init[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    init[4..6].copy_from_slice(&0x0000u16.to_le_bytes());
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        a.fldcw(word_ptr(rcx)).unwrap();
+        a.fnstcw(word_ptr(rcx + 16)).unwrap();
+        a.fldcw(word_ptr(rcx + 2)).unwrap();
+        a.fnstcw(word_ptr(rcx + 18)).unwrap();
+        a.fldcw(word_ptr(rcx + 4)).unwrap();
+        a.fnstcw(word_ptr(rcx + 20)).unwrap();
+    });
+
+    let r = run_diff_x87("fldcw_normalize", &code, &init);
+    let rd_u16 = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    assert_eq!(rd_u16(16), 0x027F, "0x023F -> 0x027F");
+    assert_eq!(rd_u16(18), 0x1F7F, "0xFFFF -> 0x1F7F");
+    assert_eq!(rd_u16(20), 0x0040, "0x0000 -> 0x0040");
+}

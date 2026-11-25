@@ -515,7 +515,7 @@ pub(super) unsafe fn exec_x87_fast(cpu: &mut Cpu, op: &FastOp) {
         X87_FNCLEX => with_x87_mut(|st| st.clear_exceptions()),
         X87_FLDCW => {
             let a = cpu.faddr(op);
-            let cw = cpu.read_mem(a, 16) as u16;
+            let cw = super::super::xstate::control_word(cpu.read_mem(a, 16) as u16);
             if !fault_pending() {
                 with_x87_mut(|st| st.cw = cw);
             }
