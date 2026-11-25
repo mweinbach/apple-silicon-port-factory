@@ -713,6 +713,9 @@ pub struct StreamShared {
     pub ring: Ring,
     pub loopback: Option<LoopbackFeed>,
     pub(super) gain: Option<PlaybackGain>,
+    /// Endpoint software volume/mute handle attached by `OutputStream::open` for streams
+    /// constructed without WASAPI session controls (DirectSound, XAudio2, FMOD, OpenAL, Bink).
+    ep_sw: OnceLock<Arc<super::mmdevapi::EndpointSwAtomic>>,
     pub started: AtomicBool,
     pub underrun_frames: AtomicU64,
     pub callbacks: AtomicU64,
@@ -743,6 +746,7 @@ impl StreamShared {
             ring,
             loopback: None,
             gain: None,
+            ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
@@ -775,6 +779,7 @@ impl StreamShared {
                 ring: lb_ring,
             }),
             gain,
+            ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
@@ -785,6 +790,45 @@ impl StreamShared {
             sema: Semaphore::new(),
             quit: AtomicBool::new(false),
         })
+    }
+
+    /// Lock-free realtime-safe gain application at playback consumption.
+    /// Applies full WASAPI session + stream-channel + endpoint gains when `gain` is present,
+    /// or endpoint software volume/mute (`ep_sw`) for native middleware output streams.
+    #[inline]
+    pub(super) fn apply_playback_gain(&self, samples: &mut [f32], channels: usize) -> bool {
+        if let Some(g) = &self.gain {
+            return g.apply(samples, channels);
+        }
+        let Some(ep_sw) = self.ep_sw.get() else {
+            return false;
+        };
+        if ep_sw.sw_muted.load(Ordering::Acquire) {
+            samples.fill(0.0);
+            return true;
+        }
+        let ch = channels.max(1);
+        let n = ch.min(8);
+        let mut eff = [1.0f32; 8];
+        let mut unity = true;
+        for c in 0..n {
+            let g = f32::from_bits(ep_sw.sw_channels[c].load(Ordering::Acquire));
+            eff[c] = g;
+            if (g - 1.0).abs() > 1e-6 {
+                unity = false;
+            }
+        }
+        if unity {
+            return false;
+        }
+        for frame in samples.chunks_exact_mut(ch) {
+            for (c, sample) in frame.iter_mut().enumerate() {
+                if c < 8 {
+                    *sample *= eff[c];
+                }
+            }
+        }
+        false
     }
 
     pub fn set_event(&self, ev: Arc<crate::handles::Event>) {
@@ -902,6 +946,10 @@ impl OutputStream {
     /// Open (but don't start) a stream of interleaved f32 at `rate`/`channels`.
     /// `io_request` = desired IO cycle in device frames.
     pub fn open(dev: &DeviceInfo, rate: u32, channels: u16, shared: Arc<StreamShared>, io_request: u32) -> Result<OutputStream, String> {
+        if shared.gain.is_none() {
+            let ep_id = super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+            let _ = shared.ep_sw.set(super::mmdevapi::endpoint_software_gain_handle(&ep_id));
+        }
         let kind = if dev.id == 0 { Backend::Null } else { backend() };
         let pump = {
             let s = shared.clone();
@@ -983,7 +1031,7 @@ impl OutputStream {
                                             let got = s.ring.pop_into(&mut lb_buf);
                                             if got > 0 {
                                                 let active = &mut lb_buf[..got * ch];
-                                                let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, ch));
+                                                let muted = s.apply_playback_gain(active, ch);
                                                 if !muted {
                                                     super::audioclient::push_loopback_frames(
                                                         &lb.ep_id,
@@ -1973,7 +2021,7 @@ mod ca {
         let got = s.ring.pop_into(out);
         if got > 0 {
             let active = &mut out[..got * s.ring.channels()];
-            let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, s.ring.channels()));
+            let muted = s.apply_playback_gain(active, s.ring.channels());
             if muted {
                 *flags |= kAudioUnitRenderAction_OutputIsSilence;
             } else if let Some(lb) = &s.loopback {
@@ -2240,7 +2288,7 @@ mod ca {
         let got = s.ring.pop_into(out);
         if got > 0 {
             let active = &mut out[..got * s.ring.channels()];
-            let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, s.ring.channels()));
+            let muted = s.apply_playback_gain(active, s.ring.channels());
             if muted {
                 *flags |= kAudioUnitRenderAction_OutputIsSilence;
             } else if let Some(lb) = &s.loopback {
@@ -2411,5 +2459,35 @@ mod tap_tests {
             assert!(global_uid.is_null(), "global CATapDescription should have nil deviceUID");
             let _: () = msg_send![global, release];
         }
+    }
+
+    #[test]
+    fn middleware_stream_shared_applies_endpoint_software_mute_and_channel_gains() {
+        let _audio_guard = crate::audio::audio_test_lock();
+        super::force_backend(Some(super::Backend::Null));
+        crate::audio::mmdevapi::reset_endpoint_software_gains_for_test();
+
+        let dev = super::null_device();
+        let ep_id = crate::audio::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+        let ep_sw = crate::audio::mmdevapi::endpoint_software_gain_handle(&ep_id);
+        let shared = super::StreamShared::new(super::Ring::new(512, 2));
+        let _out = super::OutputStream::open(&dev, 48_000, 2, shared.clone(), 128).unwrap();
+
+        // Channel software gains apply directly to middleware streams constructed via StreamShared::new.
+        ep_sw.sw_channels[0].store(0.25f32.to_bits(), std::sync::atomic::Ordering::Release);
+        ep_sw.sw_channels[1].store(0.5f32.to_bits(), std::sync::atomic::Ordering::Release);
+        let mut samples = [0.8f32, 0.8, -0.4, 0.4];
+        assert!(!shared.apply_playback_gain(&mut samples, 2));
+        assert!((samples[0] - 0.2).abs() < 1e-5);
+        assert!((samples[1] - 0.4).abs() < 1e-5);
+        assert!((samples[2] + 0.1).abs() < 1e-5);
+        assert!((samples[3] - 0.2).abs() < 1e-5);
+
+        // Endpoint software mute silences middleware output completely.
+        ep_sw.sw_muted.store(true, std::sync::atomic::Ordering::Release);
+        assert!(shared.apply_playback_gain(&mut samples, 2));
+        assert!(samples.iter().all(|&s| s == 0.0));
+
+        crate::audio::mmdevapi::reset_endpoint_software_gains_for_test();
     }
 }

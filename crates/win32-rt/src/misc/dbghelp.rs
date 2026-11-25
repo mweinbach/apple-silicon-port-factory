@@ -1612,14 +1612,17 @@ fn parse_pdb_names_stream_index(pdb_info: &[u8]) -> Option<usize> {
     let _cap = read_le_u32(pdb_info, pos)?;
     pos += 4;
     let present_words = read_le_u32(pdb_info, pos)? as usize;
-    pos += 4;
+    pos = pos.checked_add(4)?;
+    if present_words > pdb_info.len().saturating_sub(pos) / 4 {
+        return None;
+    }
     let mut present_bits = Vec::with_capacity(present_words);
     for _ in 0..present_words {
         present_bits.push(read_le_u32(pdb_info, pos)?);
-        pos += 4;
+        pos = pos.checked_add(4)?;
     }
     let deleted_words = read_le_u32(pdb_info, pos)? as usize;
-    pos += 4 + deleted_words * 4;
+    pos = pos.checked_add(4)?.checked_add(deleted_words.checked_mul(4)?)?;
 
     let present_count: usize = present_bits.iter().map(|w| w.count_ones() as usize).sum();
     for _ in 0..present_count {
@@ -1713,11 +1716,13 @@ fn parse_pdb_line_cache(
         .checked_add(ec_sz)?;
     let mut sec_rvas: Vec<u32> = Vec::new();
     if opt_dbg_sz >= 12 {
-        if let Some(sec_hdr_idx) = read_le_u16(&dbi, opt_dbg_off + 10) {
-            if sec_hdr_idx != 0xFFFF {
-                if let Some(sec_stream) = msf.read_stream(sec_hdr_idx as usize) {
-                    for chunk in sec_stream.chunks_exact(40) {
-                        sec_rvas.push(u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]));
+        if let Some(off) = opt_dbg_off.checked_add(10) {
+            if let Some(sec_hdr_idx) = read_le_u16(&dbi, off) {
+                if sec_hdr_idx != 0xFFFF {
+                    if let Some(sec_stream) = msf.read_stream(sec_hdr_idx as usize) {
+                        for chunk in sec_stream.chunks_exact(40) {
+                            sec_rvas.push(u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]));
+                        }
                     }
                 }
             }
@@ -1746,24 +1751,27 @@ fn parse_pdb_line_cache(
     };
 
     // Walk Module Info Substream starting at DBI offset 64.
+    // Validate the full declared substream against `dbi.len()` so malformed/truncated PDBs
+    // are cleanly rejected instead of panicking during the NUL-terminated name scan.
     let mod_end = 64usize.checked_add(mod_info_sz)?;
-    let mut mpos = 64usize;
-    while mpos + 64 <= mod_end && mpos + 64 <= dbi.len() {
-        let mod_stream = read_le_u16(&dbi, mpos + 34)?;
-        let sym_sz = read_le_u32(&dbi, mpos + 36)? as usize;
-        let c11_sz = read_le_u32(&dbi, mpos + 40)? as usize;
-        let c13_sz = read_le_u32(&dbi, mpos + 44)? as usize;
+    let mod_info = dbi.get(64..mod_end)?;
+    let mut mpos = 0usize;
+    while mpos + 64 <= mod_info.len() {
+        let mod_stream = read_le_u16(mod_info, mpos + 34)?;
+        let sym_sz = read_le_u32(mod_info, mpos + 36)? as usize;
+        let c11_sz = read_le_u32(mod_info, mpos + 40)? as usize;
+        let c13_sz = read_le_u32(mod_info, mpos + 44)? as usize;
         // Skip ModuleName and ObjFileName (two NUL-terminated strings after fixed 64-byte header), align to 4.
         let mut npos = mpos + 64;
         for _ in 0..2 {
-            while npos < mod_end && dbi[npos] != 0 {
+            while let Some(&b) = mod_info.get(npos) {
                 npos += 1;
-            }
-            if npos < mod_end {
-                npos += 1;
+                if b == 0 {
+                    break;
+                }
             }
         }
-        mpos = (npos + 3) & !3;
+        mpos = npos.checked_add(3)? & !3;
 
         if mod_stream == 0xFFFF || c13_sz == 0 {
             continue;
@@ -3344,5 +3352,39 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&sym_root);
         let _ = std::fs::remove_dir_all(&img_root);
+    }
+
+    #[test]
+    fn parse_pdb_line_cache_rejects_truncated_dbi_mod_info_without_panicking() {
+        // Case 1: DBI ModInfoSize exceeds the actual DBI stream length (64 + ModInfoSize > dbi.len()).
+        // Must return None cleanly rather than indexing past `dbi` during module-name scanning.
+        let mut pdb = build_minimal_pdb_with_id("src\\ok.cpp", 0x100, 10, [0x42; 16], 1);
+        let (dbi_sz, dbi_off) = {
+            let msf = MsfFile::parse(&pdb).expect("valid minimal MSF");
+            let (sz, blocks) = &msf.streams[3];
+            (*sz, blocks[0] as usize * msf.block_size)
+        };
+        let oversized = (dbi_sz + 64) as u32;
+        pdb[dbi_off + 24..dbi_off + 28].copy_from_slice(&oversized.to_le_bytes());
+        assert!(
+            parse_pdb_line_cache(&pdb, &[0x1000], None).is_none(),
+            "truncated DBI ModInfoSize must return None without panicking"
+        );
+
+        // Case 2: ModInfoSize fits inside dbi.len(), but ModuleName / ObjFileName lack NUL terminators
+        // before the end of the substream. Must complete without panicking.
+        let mut pdb2 = build_minimal_pdb_with_id("src\\ok.cpp", 0x100, 10, [0x42; 16], 1);
+        let (dbi_sz2, dbi_off2) = {
+            let msf = MsfFile::parse(&pdb2).expect("valid minimal MSF");
+            let (sz, blocks) = &msf.streams[3];
+            (*sz, blocks[0] as usize * msf.block_size)
+        };
+        let valid_mod_sz = dbi_sz2.saturating_sub(64);
+        assert!(valid_mod_sz >= 68);
+        pdb2[dbi_off2 + 24..dbi_off2 + 28].copy_from_slice(&(valid_mod_sz as u32).to_le_bytes());
+        for b in &mut pdb2[dbi_off2 + 64 + 64..dbi_off2 + 64 + valid_mod_sz] {
+            *b = b'A';
+        }
+        let _ = parse_pdb_line_cache(&pdb2, &[0x1000], None);
     }
 }

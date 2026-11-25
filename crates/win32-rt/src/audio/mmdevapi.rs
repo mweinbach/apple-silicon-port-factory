@@ -85,6 +85,13 @@ fn guid_from(s: &str) -> GUID {
     )
 }
 
+/// Compute the deterministic Windows render endpoint ID (`{0.0.0.00000000}.{guid}`)
+/// corresponding to a host `DeviceInfo::uid`.
+pub(super) fn render_endpoint_id_for_uid(uid: &str) -> String {
+    let guid = guid_from(uid);
+    format!("{{0.0.0.00000000}}.{guid:?}").to_ascii_lowercase()
+}
+
 impl Endpoint {
     pub fn new(info: DeviceInfo) -> Endpoint {
         Self::new_with_slot(info, None)
