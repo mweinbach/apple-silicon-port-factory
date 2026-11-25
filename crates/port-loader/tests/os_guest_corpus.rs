@@ -16,7 +16,12 @@ mod guest_corpus_common;
 use guest_corpus_common::{
     compile_c_guest, compile_cpp_guest, find_zig, run_guest_both_modes, TempDir,
 };
+use std::path::PathBuf;
 use std::time::Duration;
+
+fn corpus_compiler() -> PathBuf {
+    find_zig().expect("os_guest_corpus requires Zig 0.16.0 on PATH or in ZIG (see CONTRIBUTING.md)")
+}
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -26,10 +31,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[test]
 fn guest_threads_waits_and_apcs() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_threads_waits_and_apcs: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("threads-waits-apcs");
     let exe = compile_c_guest(
         &zig,
@@ -268,10 +270,7 @@ int main(void) {
 
 #[test]
 fn guest_seh_and_cpp_exceptions() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_seh_and_cpp_exceptions: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("seh-cpp-exc");
     let exe = compile_cpp_guest(
         &zig,
@@ -461,10 +460,7 @@ int main() {
 
 #[test]
 fn guest_tls_and_fls() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_tls_and_fls: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("tls-fls");
     let exe = compile_c_guest(
         &zig,
@@ -585,10 +581,7 @@ int main(void) {
 
 #[test]
 fn guest_iocp() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_iocp: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("iocp");
     let exe = compile_c_guest(&zig, tmp.path(), "iocp_test", IOCP_C, &["kernel32"]);
     run_guest_both_modes(
@@ -757,10 +750,7 @@ int main(void) {
 
 #[test]
 fn guest_fibers() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_fibers: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("fibers");
     let exe = compile_c_guest(&zig, tmp.path(), "fibers_test", FIBERS_C, &["kernel32"]);
     run_guest_both_modes(
@@ -887,10 +877,7 @@ int main(void) {
 
 #[test]
 fn guest_sockets() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_sockets: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("sockets");
     let exe = compile_c_guest(
         &zig,
@@ -1079,10 +1066,7 @@ int main(void) {
 
 #[test]
 fn guest_registry() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_registry: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("registry");
     let exe = compile_c_guest(
         &zig,
@@ -1252,10 +1236,7 @@ int main(void) {
 
 #[test]
 fn guest_file_io_and_paths() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_file_io_and_paths: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("file-io-paths");
     let exe = compile_c_guest(
         &zig,
@@ -1414,10 +1395,7 @@ int main(void) {
 
 #[test]
 fn guest_com_activation() {
-    let Some(zig) = find_zig() else {
-        eprintln!("skipping guest_com_activation: zig not found");
-        return;
-    };
+    let zig = corpus_compiler();
     let tmp = TempDir::new("com-activation");
     let exe = compile_c_guest(
         &zig,

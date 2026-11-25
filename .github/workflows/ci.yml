@@ -67,6 +67,16 @@ jobs:
           rustc -Vv
           cargo -V
           sccache --version
+      - name: Install Zig 0.16.0 for Windows x86-64 guest tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          archive=zig-aarch64-macos-0.16.0.tar.xz
+          curl --fail --location --retry 3 -o "$archive" "https://ziglang.org/download/0.16.0/$archive"
+          echo "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  $archive" | shasum -a 256 -c -
+          tar xf "$archive"
+          compiler="$PWD/${archive%.tar.xz}/zig"
+          test "$("$compiler" version)" = 0.16.0
+          echo "ZIG=$compiler" >> "$GITHUB_ENV"
       - name: Catalog drift check (db/*.tsv match the source)
         run: cargo opsdb -- doctor
       - name: Build the universal runner
@@ -74,9 +84,9 @@ jobs:
       # The library tests and the AOT integration test run from one cargo invocation so the
       # large crates are compiled once for both. Running the AOT test on its own resolves a
       # different feature set and rebuilds win32-rt, x86-runtime and d3d12-metal.
-      - name: Unit tests and AOT multi-module verification
+      - name: Unit tests, AOT multi-module verification and headless Win32 guest corpus
         run: >-
-          cargo factory-test --test aot_multi_module_verify --
+          cargo factory-test --test aot_multi_module_verify --test os_guest_corpus --
           --test-threads=1 --skip shadow::tests::timeouts_and_faults
       # This test forks a child that spins forever and expects the shadow probe to report a
       # timeout. On GitHub-hosted runners it has reported a fault instead; on Apple Silicon
