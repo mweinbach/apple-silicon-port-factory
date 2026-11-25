@@ -1658,3 +1658,63 @@ fn x87_env_fip_fdp_fop_and_exact_subnormal_mul_mem() {
     // After fnstcw (control op): FIP, FOP, FDP all unchanged!
     assert_eq!(&er.data[144 + 12..144 + 24], &er.data[96 + 12..96 + 24], "fnstcw must not alter FIP/FOP/FDP");
 }
+
+/// 12. Regression: mixed QNaN + SNaN x87 arithmetic must prefer the quiet NaN regardless of
+/// 62-bit payload magnitude, while still raising `SW.IE`.
+#[test]
+fn x87_mixed_qnan_snan_prefers_qnan() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 256];
+    // QNaN with small payload: sig = 0xC000_0000_0000_0001, se = 0x7FFF
+    init[0..8].copy_from_slice(&0xC000_0000_0000_0001u64.to_le_bytes());
+    init[8..10].copy_from_slice(&0x7FFFu16.to_le_bytes());
+    // SNaN with maximal 62-bit payload: sig = 0xBFFF_FFFF_FFFF_FFFF, se = 0x7FFF
+    init[16..24].copy_from_slice(&0xBFFF_FFFF_FFFF_FFFFu64.to_le_bytes());
+    init[24..26].copy_from_slice(&0x7FFFu16.to_le_bytes());
+    // SNaN with smaller payload: sig = 0x8000_0000_0000_0002, se = 0x7FFF
+    init[32..40].copy_from_slice(&0x8000_0000_0000_0002u64.to_le_bytes());
+    init[40..42].copy_from_slice(&0x7FFFu16.to_le_bytes());
+
+    let code = assemble(|a| {
+        // Order 1: QNaN + SNaN -> QNaN unchanged, SW.IE set
+        a.fninit().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fld(tbyte_ptr(rcx + 16)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 64)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 80)).unwrap();
+
+        // Order 2: SNaN + QNaN -> QNaN unchanged, SW.IE set
+        a.fnclex().unwrap();
+        a.fld(tbyte_ptr(rcx + 16)).unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 66)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 96)).unwrap();
+
+        // Both SNaN: larger payload quieted (0xFFFF_FFFF_FFFF_FFFF), SW.IE set
+        a.fnclex().unwrap();
+        a.fld(tbyte_ptr(rcx + 32)).unwrap();
+        a.fld(tbyte_ptr(rcx + 16)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fnstsw(word_ptr(rcx + 68)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 112)).unwrap();
+    });
+
+    let r = run_diff_x87("mixed_qnan_snan", &code, &init);
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    let rd_sw = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    const SW_IE: u16 = 0x0001;
+
+    assert_eq!(rd_m80(80), (0xC000_0000_0000_0001, 0x7FFF));
+    assert_ne!(rd_sw(64) & SW_IE, 0);
+    assert_eq!(rd_m80(96), (0xC000_0000_0000_0001, 0x7FFF));
+    assert_ne!(rd_sw(66) & SW_IE, 0);
+    assert_eq!(rd_m80(112), (0xFFFF_FFFF_FFFF_FFFF, 0x7FFF));
+    assert_ne!(rd_sw(68) & SW_IE, 0);
+}

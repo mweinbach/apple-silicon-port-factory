@@ -554,14 +554,22 @@ impl Fp80 {
             *sw |= SW_IE;
         }
         let mut res = if a.kind == Fp80Kind::Nan && b.kind == Fp80Kind::Nan {
-            let pa = a.sig & 0x3FFF_FFFF_FFFF_FFFF;
-            let pb = b.sig & 0x3FFF_FFFF_FFFF_FFFF;
-            if pa > pb {
+            let a_snan = a.is_signaling_nan();
+            let b_snan = b.is_signaling_nan();
+            if !a_snan && b_snan {
                 a
-            } else if pb > pa {
+            } else if a_snan && !b_snan {
                 b
             } else {
-                Self { sign: a.sign & b.sign, ..a }
+                let pa = a.sig & 0x3FFF_FFFF_FFFF_FFFF;
+                let pb = b.sig & 0x3FFF_FFFF_FFFF_FFFF;
+                if pa > pb {
+                    a
+                } else if pb > pa {
+                    b
+                } else {
+                    Self { sign: a.sign & b.sign, ..a }
+                }
             }
         } else if a.kind == Fp80Kind::Nan {
             a
