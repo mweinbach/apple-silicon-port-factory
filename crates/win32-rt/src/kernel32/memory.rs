@@ -71,6 +71,9 @@ fn note_code_region(start: usize, end: usize) {
 unsafe fn host_mprotect(addr: usize, len: usize, prot: i32) -> i32 {
     let start = addr & !(HOST_PAGE - 1);
     let end = (addr + len + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    if (prot & libc::PROT_WRITE) == 0 {
+        HAS_IO_RESTRICTED_PAGES.store(true, std::sync::atomic::Ordering::Release);
+    }
     #[cfg(not(target_arch = "x86_64"))]
     let prot = if prot & libc::PROT_WRITE != 0 {
         prot & !libc::PROT_EXEC
@@ -455,15 +458,11 @@ unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u3
                 }
             }
             if has_non_writable || arm_write_watch {
-                HAS_IO_RESTRICTED_PAGES.store(true, std::sync::atomic::Ordering::Release);
                 host_prot & !libc::PROT_WRITE
             } else {
                 host_prot
             }
         };
-        if p == libc::PROT_NONE {
-            HAS_IO_RESTRICTED_PAGES.store(true, std::sync::atomic::Ordering::Release);
-        }
         let rc = host_mprotect(hp, HOST_PAGE, p);
         if rc != 0 {
             return rc;
@@ -2757,6 +2756,10 @@ mod tests {
                 assert_eq!(WriteFile(pwr, b"rofail!".as_ptr() as *const c_void, 7, &mut written, std::ptr::null_mut()), TRUE);
                 assert_eq!(ReadFile(prd, buf, 7, &mut got, std::ptr::null_mut()), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+                // Kernel EFAULT leaves the unread pipe bytes intact; drain them before the next pipe test.
+                let mut drain_buf = [0u8; 7];
+                assert_eq!(ReadFile(prd, drain_buf.as_mut_ptr() as *mut c_void, 7, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(&drain_buf[..got as usize], b"rofail!");
 
                 // 4. Partial host-page ResetWriteWatch / GetWriteWatch(WRITE_WATCH_FLAG_RESET)
                 //    must fail honestly with ERROR_NOT_SUPPORTED and preserve sibling dirty records!
@@ -2778,6 +2781,34 @@ mod tests {
                 count = addrs.len();
                 assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
                 assert_eq!(count, 0);
+
+                // 5. Ordinary (non-write-watch) RW allocation with first 4 KiB protected PAGE_NOACCESS:
+                //    host_mprotect(..., PROT_NONE) sets HAS_IO_RESTRICTED_PAGES even if no prior
+                //    write-watch or RO restriction existed, so ReadFile into the writable sibling
+                //    succeeds via the isolated alias while the host page stays PROT_NONE.
+                let plain = VirtualAlloc(std::ptr::null_mut(), HOST_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                assert!(!plain.is_null());
+                let plain_base = plain as usize;
+                HAS_IO_RESTRICTED_PAGES.store(false, std::sync::atomic::Ordering::Release);
+                let prev_ww = HAS_WRITE_WATCH_PAGES.swap(false, std::sync::atomic::Ordering::AcqRel);
+                let mut old_p = 0u32;
+                assert_eq!(VirtualProtect(plain, PAGE, PAGE_NOACCESS, &mut old_p), TRUE);
+                assert!(HAS_IO_RESTRICTED_PAGES.load(std::sync::atomic::Ordering::Acquire));
+                let plain_rw_sub = (plain_base + PAGE) as *mut c_void;
+                assert!(needs_io_write_staging(plain_rw_sub as usize, 8));
+                assert_eq!(WriteFile(pwr, b"noacc-rw".as_ptr() as *const c_void, 8, &mut written, std::ptr::null_mut()), TRUE);
+                assert_eq!(ReadFile(prd, plain_rw_sub, 8, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(got, 8);
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(query_host_vm_prot(plain_base), 0, "host page must stay PROT_NONE for NOACCESS sibling");
+                assert_eq!(WriteFile(pwr, b"failnoac".as_ptr() as *const c_void, 8, &mut written, std::ptr::null_mut()), TRUE);
+                assert_eq!(ReadFile(prd, plain, 8, &mut got, std::ptr::null_mut()), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+                // Restore PAGE_READWRITE on subpage 0 to verify the alias write actually landed in subpage 1.
+                assert_eq!(VirtualProtect(plain, PAGE, PAGE_READWRITE, &mut old_p), TRUE);
+                assert_eq!(std::slice::from_raw_parts(plain_rw_sub as *const u8, 8), b"noacc-rw");
+                HAS_WRITE_WATCH_PAGES.store(prev_ww, std::sync::atomic::Ordering::Release);
+                assert_eq!(VirtualFree(plain, 0, MEM_RELEASE), TRUE);
             }
 
             assert_eq!(crate::kernel32::threads::CloseHandle(prd), TRUE);
