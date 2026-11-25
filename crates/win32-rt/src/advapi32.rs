@@ -6,12 +6,15 @@
 //! * Registry: empty, read-only for now. Opens fail with
 //!   ERROR_FILE_NOT_FOUND (logged at debug so we can see what is queried);
 //!   creating/writing keys is a STUB failure.
-//! * Tokens/privileges: a process token exists; no privilege can be enabled
-//!   (AdjustTokenPrivileges reports ERROR_NOT_ALL_ASSIGNED, like a standard
-//!   user without SeLockMemoryPrivilege).
+//! * Tokens/privileges: a process token exists with full `GetTokenInformation`
+//!   coverage; no privilege can be enabled (AdjustTokenPrivileges reports
+//!   ERROR_NOT_ALL_ASSIGNED, like a standard user without SeLockMemoryPrivilege).
 //! * `GetUserNameW`: the host user.
-//! * CAPI (`Crypt*`) and the credential manager (`Cred*`): not implemented /
-//!   empty store.
+//! * CAPI (`Crypt*`): provider containers, hashing (MD2/MD4/MD5/SHA-1/256/384/512),
+//!   symmetric & RSA keys, blobs (`PUBLICKEYBLOB`, `PRIVATEKEYBLOB`, `SIMPLEBLOB`,
+//!   `PLAINTEXTKEYBLOB`), encrypt/decrypt, sign/verify, and key derivation backed by
+//!   `misc::bcrypt` (CommonCrypto + Security.framework).
+//! * Credential manager (`Cred*`): DPAPI-encrypted local/enterprise vault + session store.
 
 use crate::handles;
 use crate::types::*;
@@ -1236,6 +1239,175 @@ pub unsafe extern "win64" fn RegQueryInfoKeyW(
 
 static NEXT_LUID: AtomicU64 = AtomicU64::new(0x1000);
 
+const TOKEN_PRIMARY: u32 = 1;
+const TOKEN_IMPERSONATION: u32 = 2;
+const SECURITY_IMPERSONATION: u32 = 2;
+const ERROR_NO_SUCH_LOGON_SESSION: u32 = 1312;
+const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+const SE_GROUP_MANDATORY: u32 = 0x0000_0001;
+const SE_GROUP_ENABLED_BY_DEFAULT: u32 = 0x0000_0002;
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x0000_0040;
+const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+const SE_PRIVILEGE_ENABLED_BY_DEFAULT: u32 = 0x0000_0001;
+const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+const TOKEN_MANDATORY_POLICY_NO_WRITE_UP: u32 = 1;
+
+struct TokenObj {
+    token_type: u32,
+    imp_level: u32,
+    token_id: u64,
+    auth_id: u64,
+    modified_id: u64,
+}
+
+impl handles::KObject for TokenObj {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn type_name(&self) -> &'static str {
+        "Token"
+    }
+}
+
+fn new_token_obj(token_type: u32, imp_level: u32) -> Arc<TokenObj> {
+    let tid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+    let mid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+    Arc::new(TokenObj {
+        token_type,
+        imp_level,
+        token_id: tid,
+        auth_id: 0x0000_03E7, // SYSTEM_LUID / logon session LUID
+        modified_id: mid,
+    })
+}
+
+fn resolve_token(h: HANDLE) -> Option<TokenObj> {
+    let raw = h as isize;
+    // Windows 8+ pseudo-token handles: GetCurrentProcessToken (-4),
+    // GetCurrentThreadToken (-5), GetCurrentThreadEffectiveToken (-6).
+    if raw == -4 || raw == -6 {
+        return Some(TokenObj {
+            token_type: TOKEN_PRIMARY,
+            imp_level: SECURITY_IMPERSONATION,
+            token_id: 0x100,
+            auth_id: 0x3E7,
+            modified_id: 0x101,
+        });
+    }
+    if raw == -5 {
+        return Some(TokenObj {
+            token_type: TOKEN_IMPERSONATION,
+            imp_level: SECURITY_IMPERSONATION,
+            token_id: 0x102,
+            auth_id: 0x3E7,
+            modified_id: 0x103,
+        });
+    }
+    if let Some(tok) = handles::get_as::<TokenObj>(h) {
+        return Some(TokenObj {
+            token_type: tok.token_type,
+            imp_level: tok.imp_level,
+            token_id: tok.token_id,
+            auth_id: tok.auth_id,
+            modified_id: tok.modified_id,
+        });
+    }
+    if handles::get(h).is_some_and(|o| o.type_name() == "Token") {
+        return Some(TokenObj {
+            token_type: TOKEN_PRIMARY,
+            imp_level: SECURITY_IMPERSONATION,
+            token_id: 0x100,
+            auth_id: 0x3E7,
+            modified_id: 0x101,
+        });
+    }
+    None
+}
+
+fn build_sid(authority: u8, subs: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 4 * subs.len());
+    v.push(1); // SID_REVISION
+    v.push(subs.len() as u8);
+    v.extend_from_slice(&[0, 0, 0, 0, 0, authority]);
+    for &s in subs {
+        v.extend_from_slice(&s.to_le_bytes());
+    }
+    v
+}
+
+fn token_is_elevated() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn token_user_sid() -> Vec<u8> {
+    // S-1-5-1000 (consistent with existing TokenUser SID layout)
+    build_sid(5, &[1000])
+}
+
+fn token_primary_group_sid() -> Vec<u8> {
+    // S-1-5-32-545 (BUILTIN\Users)
+    build_sid(5, &[32, 545])
+}
+
+fn token_integrity_sid() -> Vec<u8> {
+    // S-1-16-8192 (Medium) or S-1-16-12288 (High when root)
+    let rid = if token_is_elevated() { 0x3000 } else { 0x2000 };
+    build_sid(16, &[rid])
+}
+
+fn token_default_groups() -> Vec<(Vec<u8>, u32)> {
+    let std_attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    vec![
+        (build_sid(5, &[32, 545]), std_attrs), // BUILTIN\Users
+        (build_sid(1, &[0]), std_attrs),       // Everyone (World)
+        (build_sid(5, &[4]), std_attrs),       // Interactive
+        (build_sid(5, &[11]), std_attrs),      // Authenticated Users
+        (build_sid(5, &[5, 0, 1]), std_attrs | SE_GROUP_LOGON_ID), // Logon SID
+        (token_integrity_sid(), SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED),
+    ]
+}
+
+fn token_default_privileges() -> Vec<(u64, u32)> {
+    // Standard Windows user token always holds SeChangeNotifyPrivilege (23) enabled by default.
+    vec![(23u64, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED)]
+}
+
+unsafe fn write_token_groups(groups: &[(Vec<u8>, u32)], buf: *mut u8, buf_len: u32, ret_len: *mut u32) -> BOOL {
+    // TOKEN_GROUPS on x64: DWORD GroupCount (offset 0), 4-byte pad, SID_AND_ATTRIBUTES[N] (offset 8, 16 bytes each)
+    let header_sz = 8usize;
+    let entries_sz = groups.len() * 16;
+    let sids_sz: usize = groups.iter().map(|(s, _)| s.len()).sum();
+    let need = (header_sz + entries_sz + sids_sz) as u32;
+    std::ptr::write_unaligned(ret_len, need);
+    if buf.is_null() || buf_len < need {
+        return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::write_bytes(buf, 0, need as usize);
+    std::ptr::write_unaligned(buf as *mut u32, groups.len() as u32);
+    let mut sid_off = header_sz + entries_sz;
+    for (i, (sid, attrs)) in groups.iter().enumerate() {
+        let dst = buf.add(sid_off);
+        std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+        let ent = buf.add(header_sz + i * 16);
+        std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+        std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+        sid_off += sid.len();
+    }
+    TRUE
+}
+
+unsafe fn write_u32_token_info(val: u32, buf: *mut u8, buf_len: u32, ret_len: *mut u32) -> BOOL {
+    std::ptr::write_unaligned(ret_len, 4);
+    if buf.is_null() || buf_len < 4 {
+        return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+    }
+    std::ptr::write_unaligned(buf as *mut u32, val);
+    TRUE
+}
+
 pub unsafe extern "win64" fn AllocateLocallyUniqueId(luid: *mut u64) -> BOOL {
     if luid.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
@@ -1245,7 +1417,7 @@ pub unsafe extern "win64" fn AllocateLocallyUniqueId(luid: *mut u64) -> BOOL {
 }
 
 pub unsafe extern "win64" fn PrivilegeCheck(token: HANDLE, _privs: *mut c_void, result: *mut BOOL) -> BOOL {
-    if handles::get(token).is_none() {
+    if resolve_token(token).is_none() {
         return err(ERROR_INVALID_HANDLE, FALSE);
     }
     if result.is_null() {
@@ -1259,7 +1431,7 @@ pub unsafe extern "win64" fn OpenProcessToken(_proc: HANDLE, _access: u32, out: 
     if out.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    *out = handles::insert(Arc::new(handles::Opaque("Token")));
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_PRIMARY, SECURITY_IMPERSONATION)));
     TRUE
 }
 
@@ -1287,108 +1459,367 @@ pub unsafe extern "win64" fn GetTokenInformation(
     if token.is_null() || ret_len.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
+    let Some(tok) = resolve_token(token) else {
+        std::ptr::write_unaligned(ret_len, 0);
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    };
     match info_class {
-        // TokenUser (1): TOKEN_USER { SID_AND_ATTRIBUTES { PSID @0, DWORD Attrs @8 } } + 12-byte SID
+        // TokenUser (1): TOKEN_USER { SID_AND_ATTRIBUTES { PSID @0, DWORD Attrs @8 } } + user SID
         1 => {
-            let need = 16 + 12;
+            let sid = token_user_sid();
+            let need = (16 + sid.len()) as u32;
             std::ptr::write_unaligned(ret_len, need);
             if buf.is_null() || buf_len < need {
                 return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
             }
             std::ptr::write_bytes(buf, 0, need as usize);
-            let sid = buf.add(16);
-            *sid = 1; // revision
-            *sid.add(1) = 1; // subauthority count
-            *sid.add(7) = 5; // SECURITY_NT_AUTHORITY
-            std::ptr::write_unaligned(sid.add(8) as *mut u32, 1000);
-            std::ptr::write_unaligned(buf as *mut usize, sid as usize);
+            let dst = buf.add(16);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
             TRUE
         }
+        // TokenGroups (2): TOKEN_GROUPS
+        2 => {
+            let groups = token_default_groups();
+            write_token_groups(&groups, buf, buf_len, ret_len)
+        }
+        // TokenPrivileges (3): TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[N] (12 bytes each) }
+        3 => {
+            let privs = token_default_privileges();
+            let need = (4 + privs.len() * 12) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            std::ptr::write_unaligned(buf as *mut u32, privs.len() as u32);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = buf.add(4 + i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            TRUE
+        }
+        // TokenOwner (4): TOKEN_OWNER { PSID Owner } + user SID
+        4 => {
+            let sid = token_user_sid();
+            let need = (8 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            let dst = buf.add(8);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            TRUE
+        }
+        // TokenPrimaryGroup (5): TOKEN_PRIMARY_GROUP { PSID PrimaryGroup } + primary group SID
+        5 => {
+            let sid = token_primary_group_sid();
+            let need = (8 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            let dst = buf.add(8);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            TRUE
+        }
+        // TokenDefaultDacl (6): TOKEN_DEFAULT_DACL { PACL DefaultDacl } + 8-byte ACL header
+        6 => {
+            let need = 16u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let acl = buf.add(8);
+            *acl = 2; // ACL_REVISION
+            std::ptr::write_unaligned(acl.add(2) as *mut u16, 8); // AclSize
+            std::ptr::write_unaligned(buf as *mut usize, acl as usize);
+            TRUE
+        }
+        // TokenSource (7): TOKEN_SOURCE { CHAR SourceName[8]; LUID SourceIdentifier } (16 bytes)
+        7 => {
+            let need = 16u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            std::ptr::copy_nonoverlapping(b"User32\0\0".as_ptr(), buf, 8);
+            std::ptr::write_unaligned(buf.add(8) as *mut u64, tok.auth_id);
+            TRUE
+        }
+        // TokenType (8): TOKEN_TYPE (TokenPrimary=1 or TokenImpersonation=2)
+        8 => write_u32_token_info(tok.token_type, buf, buf_len, ret_len),
+        // TokenImpersonationLevel (9): valid only for impersonation tokens; primary tokens return ERROR_INVALID_PARAMETER on Windows.
+        9 => {
+            if tok.token_type != TOKEN_IMPERSONATION {
+                std::ptr::write_unaligned(ret_len, 0);
+                return err(ERROR_INVALID_PARAMETER, FALSE);
+            }
+            write_u32_token_info(tok.imp_level, buf, buf_len, ret_len)
+        }
+        // TokenStatistics (10): TOKEN_STATISTICS (56 bytes on x64)
+        10 => {
+            let need = 56u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 56);
+            std::ptr::write_unaligned(buf.add(0) as *mut u64, tok.token_id);
+            std::ptr::write_unaligned(buf.add(8) as *mut u64, tok.auth_id);
+            std::ptr::write_unaligned(buf.add(16) as *mut i64, i64::MAX); // ExpirationTime (no expiry)
+            std::ptr::write_unaligned(buf.add(24) as *mut u32, tok.token_type);
+            std::ptr::write_unaligned(buf.add(28) as *mut u32, tok.imp_level);
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, 4096); // DynamicCharged
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, 4096); // DynamicAvailable
+            std::ptr::write_unaligned(buf.add(40) as *mut u32, token_default_groups().len() as u32);
+            std::ptr::write_unaligned(buf.add(44) as *mut u32, token_default_privileges().len() as u32);
+            std::ptr::write_unaligned(buf.add(48) as *mut u64, tok.modified_id);
+            TRUE
+        }
+        // TokenRestrictedSids (11): empty TOKEN_GROUPS
+        11 => write_token_groups(&[], buf, buf_len, ret_len),
         // TokenSessionId (12) -> 1
-        12 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 1);
-            TRUE
-        }
-        // TokenElevationType (18) -> TokenElevationTypeDefault (1)
-        18 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 1);
-            TRUE
-        }
-        // TokenElevation (20) -> 0 (not elevated)
-        20 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
-                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
-            }
-            std::ptr::write_unaligned(buf as *mut u32, 0);
-            TRUE
-        }
-        // TokenIntegrityLevel (25) -> Medium (0x2000)
-        25 => {
-            let need = 16 + 12;
+        12 => write_u32_token_info(1, buf, buf_len, ret_len),
+        // TokenGroupsAndPrivileges (13): TOKEN_GROUPS_AND_PRIVILEGES (56 bytes header on x64)
+        13 => {
+            let mut sids = vec![(token_user_sid(), 0u32)];
+            sids.extend(token_default_groups());
+            let privs = token_default_privileges();
+            let header_sz = 56usize;
+            let sids_arr_sz = sids.len() * 16;
+            let sids_data_sz: usize = sids.iter().map(|(s, _)| s.len()).sum();
+            let privs_sz = privs.len() * 12;
+            let need = (header_sz + sids_arr_sz + sids_data_sz + privs_sz) as u32;
             std::ptr::write_unaligned(ret_len, need);
             if buf.is_null() || buf_len < need {
                 return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
             }
             std::ptr::write_bytes(buf, 0, need as usize);
-            let sid = buf.add(16);
-            *sid = 1;
-            *sid.add(1) = 1;
-            *sid.add(7) = 16; // SECURITY_MANDATORY_LABEL_AUTHORITY
-            std::ptr::write_unaligned(sid.add(8) as *mut u32, 0x2000); // MEDIUM_RID
-            std::ptr::write_unaligned(buf as *mut usize, sid as usize);
-            std::ptr::write_unaligned(buf.add(8) as *mut u32, 0x20); // SE_GROUP_INTEGRITY
+            let sids_arr = buf.add(header_sz);
+            let mut sid_data_off = header_sz + sids_arr_sz;
+            for (i, (sid, attrs)) in sids.iter().enumerate() {
+                let dst = buf.add(sid_data_off);
+                std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+                let ent = sids_arr.add(i * 16);
+                std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+                sid_data_off += sid.len();
+            }
+            let privs_ptr = buf.add(sid_data_off);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = privs_ptr.add(i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            std::ptr::write_unaligned(buf.add(0) as *mut u32, sids.len() as u32);
+            std::ptr::write_unaligned(buf.add(4) as *mut u32, (sids_arr_sz + sids_data_sz) as u32);
+            std::ptr::write_unaligned(buf.add(8) as *mut usize, sids_arr as usize);
+            // RestrictedSidCount/Length/Ptr @16, 20, 24 = 0
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, privs.len() as u32);
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, privs_sz as u32);
+            std::ptr::write_unaligned(buf.add(40) as *mut usize, privs_ptr as usize);
+            std::ptr::write_unaligned(buf.add(48) as *mut u64, tok.auth_id);
             TRUE
+        }
+        // TokenSessionReference (14): reserved; Windows returns ERROR_INVALID_PARAMETER.
+        14 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_INVALID_PARAMETER, FALSE)
+        }
+        // TokenSandBoxInert (15) -> 0
+        15 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenAuditPolicy (16): requires SeSecurityPrivilege; standard user gets ERROR_PRIVILEGE_NOT_HELD.
+        16 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_PRIVILEGE_NOT_HELD, FALSE)
+        }
+        // TokenOrigin (17): TOKEN_ORIGIN { LUID OriginatingLogonSession } (8 bytes)
+        17 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_unaligned(buf as *mut u64, tok.auth_id);
+            TRUE
+        }
+        // TokenElevationType (18): TokenElevationTypeDefault (1)
+        18 => write_u32_token_info(1, buf, buf_len, ret_len),
+        // TokenLinkedToken (19): non-split (default) token has no linked UAC token -> ERROR_NO_SUCH_LOGON_SESSION (1312)
+        19 => {
+            std::ptr::write_unaligned(ret_len, 0);
+            err(ERROR_NO_SUCH_LOGON_SESSION, FALSE)
+        }
+        // TokenElevation (20): 1 if root, 0 otherwise
+        20 => write_u32_token_info(token_is_elevated() as u32, buf, buf_len, ret_len),
+        // TokenHasRestrictions (21) -> 0
+        21 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenAccessInformation (22): TOKEN_ACCESS_INFORMATION (88 bytes on x64) + SidHash/RestrictedSidHash/CapabilitiesHash/Privileges
+        22 => {
+            // SID_AND_ATTRIBUTES_HASH on x64 is 8 + 8 + 32*8 = 272 bytes.
+            const HASH_SZ: usize = 272;
+            let header_sz = 88usize;
+            let privs = token_default_privileges();
+            let privs_sz = 4 + privs.len() * 12;
+            let need = (header_sz + HASH_SZ * 3 + privs_sz) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let sid_hash = buf.add(header_sz);
+            let restr_hash = sid_hash.add(HASH_SZ);
+            let cap_hash = restr_hash.add(HASH_SZ);
+            let privs_ptr = cap_hash.add(HASH_SZ);
+            std::ptr::write_unaligned(privs_ptr as *mut u32, privs.len() as u32);
+            for (i, &(luid, attrs)) in privs.iter().enumerate() {
+                let ent = privs_ptr.add(4 + i * 12);
+                std::ptr::write_unaligned(ent as *mut u64, luid);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, attrs);
+            }
+            std::ptr::write_unaligned(buf.add(0) as *mut usize, sid_hash as usize);
+            std::ptr::write_unaligned(buf.add(8) as *mut usize, restr_hash as usize);
+            std::ptr::write_unaligned(buf.add(16) as *mut usize, privs_ptr as usize);
+            std::ptr::write_unaligned(buf.add(24) as *mut u64, tok.auth_id);
+            std::ptr::write_unaligned(buf.add(32) as *mut u32, tok.token_type);
+            std::ptr::write_unaligned(buf.add(36) as *mut u32, tok.imp_level);
+            std::ptr::write_unaligned(buf.add(40) as *mut u32, TOKEN_MANDATORY_POLICY_NO_WRITE_UP);
+            // Flags @44 = 0, AppContainerNumber @48 = 0, PackageSid @56 = NULL
+            std::ptr::write_unaligned(buf.add(64) as *mut usize, cap_hash as usize);
+            // TrustLevelSid @72 = NULL, SecurityAttributes @80 = NULL
+            TRUE
+        }
+        // TokenVirtualizationAllowed (23) -> 0
+        23 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenVirtualizationEnabled (24) -> 0
+        24 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenIntegrityLevel (25): TOKEN_MANDATORY_LABEL -> Medium (0x2000) or High (0x3000)
+        25 => {
+            let sid = token_integrity_sid();
+            let need = (16 + sid.len()) as u32;
+            std::ptr::write_unaligned(ret_len, need);
+            if buf.is_null() || buf_len < need {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, need as usize);
+            let dst = buf.add(16);
+            std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+            std::ptr::write_unaligned(buf as *mut usize, dst as usize);
+            std::ptr::write_unaligned(buf.add(8) as *mut u32, SE_GROUP_INTEGRITY);
+            TRUE
+        }
+        // TokenUIAccess (26) -> 0
+        26 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenMandatoryPolicy (27) -> TOKEN_MANDATORY_POLICY_NO_WRITE_UP (1)
+        27 => write_u32_token_info(TOKEN_MANDATORY_POLICY_NO_WRITE_UP, buf, buf_len, ret_len),
+        // TokenLogonSid (28): TOKEN_GROUPS with single logon SID S-1-5-5-0-1
+        28 => {
+            let logon = [(
+                build_sid(5, &[5, 0, 1]),
+                SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED | SE_GROUP_LOGON_ID,
+            )];
+            write_token_groups(&logon, buf, buf_len, ret_len)
         }
         // TokenIsAppContainer (29) -> 0
-        29 => {
-            std::ptr::write_unaligned(ret_len, 4);
-            if buf.is_null() || buf_len < 4 {
+        29 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenCapabilities (30): empty TOKEN_GROUPS
+        30 => write_token_groups(&[], buf, buf_len, ret_len),
+        // TokenAppContainerSid (31): TOKEN_APPCONTAINER_INFORMATION { PSID TokenAppContainer = NULL } (8 bytes)
+        31 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
                 return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
             }
-            std::ptr::write_unaligned(buf as *mut u32, 0);
+            std::ptr::write_unaligned(buf as *mut usize, 0);
             TRUE
         }
+        // TokenAppContainerNumber (32) -> 0
+        32 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenUserClaimAttributes (33), TokenDeviceClaimAttributes (34),
+        // TokenRestrictedUserClaimAttributes (35), TokenRestrictedDeviceClaimAttributes (36),
+        // TokenSecurityAttributes (39), TokenSingletonAttributes (43):
+        // CLAIM_SECURITY_ATTRIBUTES_INFORMATION / TOKEN_SECURITY_ATTRIBUTES_INFORMATION (16 bytes on x64):
+        // { WORD Version=1, WORD Reserved=0, DWORD AttributeCount=0, PVOID pAttributeV1=NULL }
+        33 | 34 | 35 | 36 | 39 | 43 => {
+            std::ptr::write_unaligned(ret_len, 16);
+            if buf.is_null() || buf_len < 16 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            std::ptr::write_unaligned(buf as *mut u16, 1); // Version = 1
+            TRUE
+        }
+        // TokenDeviceGroups (37), TokenRestrictedDeviceGroups (38): empty TOKEN_GROUPS
+        37 | 38 => write_token_groups(&[], buf, buf_len, ret_len),
+        // TokenIsRestricted (40) -> 0
+        40 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenProcessTrustLevel (41): PSID = NULL (8 bytes)
+        41 => {
+            std::ptr::write_unaligned(ret_len, 8);
+            if buf.is_null() || buf_len < 8 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_unaligned(buf as *mut usize, 0);
+            TRUE
+        }
+        // TokenPrivateNameSpace (42) -> 0
+        42 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // TokenBnoIsolation (44): TOKEN_BNO_ISOLATION_INFORMATION { PWSTR IsolationPrefix=NULL, BOOLEAN IsolationEnabled=0 } (16 bytes)
+        44 => {
+            std::ptr::write_unaligned(ret_len, 16);
+            if buf.is_null() || buf_len < 16 {
+                return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
+            }
+            std::ptr::write_bytes(buf, 0, 16);
+            TRUE
+        }
+        // TokenChildProcessFlags (45), TokenIsLessPrivilegedAppContainer (46),
+        // TokenIsSandboxed (47), TokenIsAppSilo (48) -> 0
+        45 | 46 | 47 | 48 => write_u32_token_info(0, buf, buf_len, ret_len),
+        // Invalid / out-of-range TOKEN_INFORMATION_CLASS: Windows returns FALSE with ERROR_INVALID_PARAMETER.
         _ => {
-            stub!("GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED");
             std::ptr::write_unaligned(ret_len, 0);
-            err(crate::types::err::ERROR_CALL_NOT_IMPLEMENTED, FALSE)
+            err(ERROR_INVALID_PARAMETER, FALSE)
         }
     }
 }
 
 pub unsafe extern "win64" fn DuplicateToken(
-    _existing: HANDLE,
-    _imp_level: u32,
+    existing: HANDLE,
+    imp_level: u32,
     out: *mut HANDLE,
 ) -> BOOL {
     if out.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    std::ptr::write_unaligned(out, handles::insert(Arc::new(handles::Opaque("Token"))));
+    if resolve_token(existing).is_none() {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_IMPERSONATION, imp_level)));
     TRUE
 }
 
 pub unsafe extern "win64" fn DuplicateTokenEx(
-    _existing: HANDLE,
+    existing: HANDLE,
     _access: u32,
     _attr: *mut c_void,
-    _imp_level: u32,
-    _token_type: u32,
+    imp_level: u32,
+    token_type: u32,
     out: *mut HANDLE,
 ) -> BOOL {
     if out.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    std::ptr::write_unaligned(out, handles::insert(Arc::new(handles::Opaque("Token"))));
+    if resolve_token(existing).is_none() {
+        return err(ERROR_INVALID_HANDLE, FALSE);
+    }
+    let tt = if token_type == TOKEN_IMPERSONATION { TOKEN_IMPERSONATION } else { TOKEN_PRIMARY };
+    std::ptr::write_unaligned(out, handles::insert(new_token_obj(tt, imp_level)));
     TRUE
 }
 
@@ -2643,15 +3074,64 @@ pub unsafe extern "win64" fn StartServiceCtrlDispatcherA(
 
 // ------------------------------------------------------- CAPI / Cred*
 
+use crate::misc::bcrypt::{CipherMode as BcCipherMode, Digest as BcDigest, Rc4State, RsaKey, SymAlg};
+
+const CALG_MD2: u32 = 0x0000_8001;
+const CALG_MD4: u32 = 0x0000_8002;
 const CALG_MD5: u32 = 0x0000_8003;
 const CALG_SHA1: u32 = 0x0000_8004;
 const CALG_SHA_256: u32 = 0x0000_800C;
 const CALG_SHA_384: u32 = 0x0000_800D;
 const CALG_SHA_512: u32 = 0x0000_800E;
 
+const CALG_DES: u32 = 0x0000_6601;
+const CALG_RC2: u32 = 0x0000_6602;
+const CALG_3DES: u32 = 0x0000_6603;
+const CALG_3DES_112: u32 = 0x0000_6609;
+const CALG_AES_128: u32 = 0x0000_660E;
+const CALG_AES_192: u32 = 0x0000_660F;
+const CALG_AES_256: u32 = 0x0000_6610;
+const CALG_AES: u32 = 0x0000_6611;
+const CALG_RC4: u32 = 0x0000_6801;
+const CALG_RSA_SIGN: u32 = 0x0000_2400;
+const CALG_RSA_KEYX: u32 = 0x0000_A400;
+
+const AT_KEYEXCHANGE: u32 = 1;
+const AT_SIGNATURE: u32 = 2;
+
 const HP_ALGID: u32 = 0x0001;
 const HP_HASHVAL: u32 = 0x0002;
 const HP_HASHSIZE: u32 = 0x0004;
+
+const KP_IV: u32 = 1;
+const KP_PADDING: u32 = 3;
+const KP_MODE: u32 = 4;
+const KP_MODE_BITS: u32 = 5;
+const KP_PERMISSIONS: u32 = 6;
+const KP_ALGID: u32 = 7;
+const KP_BLOCKLEN: u32 = 8;
+const KP_KEYLEN: u32 = 9;
+const KP_EFFECTIVE_KEYLEN: u32 = 19;
+
+const CRYPT_MODE_CBC: u32 = 1;
+const CRYPT_MODE_ECB: u32 = 2;
+const CRYPT_MODE_CFB: u32 = 4;
+
+const PKCS5_PADDING: u32 = 1;
+const ZERO_PADDING: u32 = 3;
+
+const CRYPT_EXPORTABLE: u32 = 0x0000_0001;
+const CRYPT_NOHASHOID: u32 = 0x0000_0001;
+const CRYPT_OAEP: u32 = 0x0000_0040;
+const CRYPT_VERIFYCONTEXT: u32 = 0xF000_0000;
+const CRYPT_NEWKEYSET: u32 = 0x0000_0008;
+const CRYPT_DELETEKEYSET: u32 = 0x0000_0010;
+
+const SIMPLEBLOB: u32 = 0x1;
+const PUBLICKEYBLOB: u32 = 0x6;
+const PRIVATEKEYBLOB: u32 = 0x7;
+const PLAINTEXTKEYBLOB: u32 = 0x8;
+const CUR_BLOB_VERSION: u8 = 2;
 
 const PP_IMPTYPE: u32 = 3;
 const PP_NAME: u32 = 4;
@@ -2659,21 +3139,68 @@ const PP_VERSION: u32 = 5;
 const PP_CONTAINER: u32 = 6;
 const PP_PROVTYPE: u32 = 16;
 
-const NTE_BAD_ALGID: u32 = 0x8009_0008;
-const NTE_BAD_TYPE: u32 = 0x8009_000A;
-const NTE_BAD_HASH: u32 = 0x8009_0002;
 const NTE_BAD_UID: u32 = 0x8009_0001;
+const NTE_BAD_HASH: u32 = 0x8009_0002;
+const NTE_BAD_KEY: u32 = 0x8009_0003;
+const NTE_BAD_LEN: u32 = 0x8009_0004;
+const NTE_BAD_DATA: u32 = 0x8009_0005;
+const NTE_BAD_SIGNATURE: u32 = 0x8009_0006;
+const NTE_BAD_VER: u32 = 0x8009_0007;
+const NTE_BAD_ALGID: u32 = 0x8009_0008;
+const NTE_BAD_FLAGS: u32 = 0x8009_0009;
+const NTE_BAD_TYPE: u32 = 0x8009_000A;
+const NTE_BAD_KEY_STATE: u32 = 0x8009_000B;
+const NTE_NO_KEY: u32 = 0x8009_000D;
+const NTE_EXISTS: u32 = 0x8009_000F;
+const NTE_BAD_KEYSET: u32 = 0x8009_0016;
+
+#[derive(Clone, Default)]
+struct CapiContainerKeys {
+    keyx: Option<RsaKey>,
+    sign: Option<RsaKey>,
+}
 
 struct CapiProvider {
     prov_type: u32,
     prov_name: String,
     container: String,
+    ephemeral: bool,
+    ephemeral_keys: CapiContainerKeys,
 }
 
+#[derive(Clone)]
 struct CapiHash {
+    h_prov: usize,
     alg_id: u32,
-    ctx: [u64; 64],
+    digest: BcDigest,
+    data: Vec<u8>,
     override_val: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+enum CapiKeyMaterial {
+    Rsa {
+        key: RsaKey,
+    },
+    Symmetric {
+        alg: SymAlg,
+        key: Vec<u8>,
+        mode: BcCipherMode,
+        padding: u32,
+        effective_key_len: u32,
+        iv: Vec<u8>,
+        running_iv: Vec<u8>,
+        msg_block_len: u32,
+        rc4: Option<Rc4State>,
+    },
+}
+
+#[derive(Clone)]
+struct CapiKey {
+    alg_id: u32,
+    exportable: bool,
+    permissions: u32,
+    material: CapiKeyMaterial,
 }
 
 static NEXT_CAPI_HANDLE: AtomicU64 = AtomicU64::new(0xC000_0001);
@@ -2684,82 +3211,130 @@ fn capi_providers() -> &'static std::sync::Mutex<std::collections::HashMap<usize
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn capi_containers() -> &'static std::sync::Mutex<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, String), CapiContainerKeys>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn capi_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiHash>> {
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiHash>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-extern "C" {
-    fn CC_MD5_Init(c: *mut c_void) -> i32;
-    fn CC_MD5_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_MD5_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA1_Init(c: *mut c_void) -> i32;
-    fn CC_SHA1_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA1_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA256_Init(c: *mut c_void) -> i32;
-    fn CC_SHA256_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA256_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA384_Init(c: *mut c_void) -> i32;
-    fn CC_SHA384_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA384_Final(md: *mut u8, c: *mut c_void) -> i32;
-    fn CC_SHA512_Init(c: *mut c_void) -> i32;
-    fn CC_SHA512_Update(c: *mut c_void, data: *const c_void, len: u32) -> i32;
-    fn CC_SHA512_Final(md: *mut u8, c: *mut c_void) -> i32;
+fn capi_keys() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CapiKey>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CapiKey>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn capi_hash_len(alg_id: u32) -> Option<usize> {
+fn capi_alg_to_digest(alg_id: u32) -> Option<BcDigest> {
     match alg_id {
-        CALG_MD5 => Some(16),
-        CALG_SHA1 => Some(20),
-        CALG_SHA_256 => Some(32),
-        CALG_SHA_384 => Some(48),
-        CALG_SHA_512 => Some(64),
+        CALG_MD2 => Some(BcDigest::Md2),
+        CALG_MD4 => Some(BcDigest::Md4),
+        CALG_MD5 => Some(BcDigest::Md5),
+        CALG_SHA1 => Some(BcDigest::Sha1),
+        CALG_SHA_256 => Some(BcDigest::Sha256),
+        CALG_SHA_384 => Some(BcDigest::Sha384),
+        CALG_SHA_512 => Some(BcDigest::Sha512),
         _ => None,
     }
 }
 
-fn capi_hash_ops(
-    alg_id: u32,
-) -> Option<(
-    unsafe extern "C" fn(*mut c_void) -> i32,
-    unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32,
-    unsafe extern "C" fn(*mut u8, *mut c_void) -> i32,
-)> {
+fn capi_alg_to_sym(alg_id: u32) -> Option<(SymAlg, usize)> {
     match alg_id {
-        CALG_MD5 => Some((CC_MD5_Init, CC_MD5_Update, CC_MD5_Final)),
-        CALG_SHA1 => Some((CC_SHA1_Init, CC_SHA1_Update, CC_SHA1_Final)),
-        CALG_SHA_256 => Some((CC_SHA256_Init, CC_SHA256_Update, CC_SHA256_Final)),
-        CALG_SHA_384 => Some((CC_SHA384_Init, CC_SHA384_Update, CC_SHA384_Final)),
-        CALG_SHA_512 => Some((CC_SHA512_Init, CC_SHA512_Update, CC_SHA512_Final)),
+        CALG_AES_128 => Some((SymAlg::Aes, 16)),
+        CALG_AES_192 => Some((SymAlg::Aes, 24)),
+        CALG_AES_256 => Some((SymAlg::Aes, 32)),
+        CALG_AES => Some((SymAlg::Aes, 16)),
+        CALG_3DES => Some((SymAlg::Des3, 24)),
+        CALG_3DES_112 => Some((SymAlg::Des3_112, 16)),
+        CALG_DES => Some((SymAlg::Des, 8)),
+        CALG_RC2 => Some((SymAlg::Rc2, 16)),
+        CALG_RC4 => Some((SymAlg::Rc4, 16)),
         _ => None,
     }
 }
 
-unsafe fn capi_hash_init(alg_id: u32) -> Option<[u64; 64]> {
-    let (init, _, _) = capi_hash_ops(alg_id)?;
-    let mut ctx = [0u64; 64];
-    init(ctx.as_mut_ptr() as *mut c_void);
-    Some(ctx)
+fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> CapiKey {
+    let bs = alg.block_size();
+    let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
+    let eff = if alg == SymAlg::Rc2 { (key.len() * 8) as u32 } else { 0 };
+    let rc4 = (alg == SymAlg::Rc4).then(|| Rc4State::new(&key));
+    CapiKey {
+        alg_id,
+        exportable,
+        permissions: 0x3F,
+        material: CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            mode,
+            padding: PKCS5_PADDING,
+            effective_key_len: eff,
+            iv: vec![0u8; bs],
+            running_iv: vec![0u8; bs],
+            msg_block_len: bs.max(1) as u32,
+            rc4,
+        },
+    }
 }
 
-unsafe fn capi_hash_update(alg_id: u32, ctx: &mut [u64; 64], data: &[u8]) {
-    let Some((_, update, _)) = capi_hash_ops(alg_id) else {
+fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey) {
+    let mut provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get_mut(&h_prov) else {
         return;
     };
-    let ctx_p = ctx.as_mut_ptr() as *mut c_void;
-    for chunk in data.chunks(16 * 1024 * 1024) {
-        update(ctx_p, chunk.as_ptr() as *const c_void, chunk.len() as u32);
+    if prov.ephemeral {
+        if key_spec == AT_SIGNATURE {
+            prov.ephemeral_keys.sign = Some(rsa);
+        } else {
+            prov.ephemeral_keys.keyx = Some(rsa);
+        }
+    } else {
+        let map_key = (prov.prov_type, prov.container.clone());
+        drop(provs);
+        let mut containers = capi_containers().lock().unwrap();
+        let entry = containers.entry(map_key).or_default();
+        if key_spec == AT_SIGNATURE {
+            entry.sign = Some(rsa);
+        } else {
+            entry.keyx = Some(rsa);
+        }
     }
 }
 
-unsafe fn capi_hash_finalize_clone(alg_id: u32, ctx: &[u64; 64]) -> Option<Vec<u8>> {
-    let len = capi_hash_len(alg_id)?;
-    let (_, _, fin) = capi_hash_ops(alg_id)?;
-    let mut tmp = *ctx;
-    let mut out = vec![0u8; len];
-    fin(out.as_mut_ptr(), tmp.as_mut_ptr() as *mut c_void);
-    Some(out)
+fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option<RsaKey>, u32> {
+    let provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get(&h_prov) else {
+        return Err(NTE_BAD_UID);
+    };
+    if prov.ephemeral {
+        let k = if key_spec == AT_SIGNATURE {
+            prov.ephemeral_keys.sign.clone()
+        } else {
+            prov.ephemeral_keys.keyx.clone()
+        };
+        return Ok(k);
+    }
+    let map_key = (prov.prov_type, prov.container.clone());
+    drop(provs);
+    let containers = capi_containers().lock().unwrap();
+    Ok(containers.get(&map_key).and_then(|c| {
+        if key_spec == AT_SIGNATURE {
+            c.sign.clone()
+        } else {
+            c.keyx.clone()
+        }
+    }))
+}
+
+fn capi_hash_value(h: &CapiHash) -> Vec<u8> {
+    if let Some(ref ov) = h.override_val {
+        ov.clone()
+    } else {
+        h.digest.hash(&h.data)
+    }
 }
 
 unsafe fn crypt_acquire_context_impl(
@@ -2767,16 +3342,39 @@ unsafe fn crypt_acquire_context_impl(
     container: Option<String>,
     provider: Option<String>,
     dw_prov_type: u32,
-    _dw_flags: u32,
+    dw_flags: u32,
 ) -> BOOL {
+    let cname = container.unwrap_or_default();
+    if (dw_flags & CRYPT_DELETEKEYSET) != 0 {
+        let removed = capi_containers().lock().unwrap().remove(&(dw_prov_type, cname)).is_some();
+        if !ph_prov.is_null() {
+            std::ptr::write_unaligned(ph_prov, 0);
+        }
+        return if removed { TRUE } else { err(NTE_BAD_KEYSET, FALSE) };
+    }
     if ph_prov.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let ephemeral = (dw_flags & CRYPT_VERIFYCONTEXT) != 0;
+    if !ephemeral {
+        let mut containers = capi_containers().lock().unwrap();
+        let key = (dw_prov_type, cname.clone());
+        if (dw_flags & CRYPT_NEWKEYSET) != 0 {
+            if containers.contains_key(&key) {
+                return err(NTE_EXISTS, FALSE);
+            }
+            containers.insert(key, CapiContainerKeys::default());
+        } else {
+            containers.entry(key).or_default();
+        }
     }
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     let prov = CapiProvider {
         prov_type: dw_prov_type,
         prov_name: provider.unwrap_or_else(|| "Microsoft Enhanced RSA and AES Cryptographic Provider".into()),
-        container: container.unwrap_or_default(),
+        container: cname,
+        ephemeral,
+        ephemeral_keys: CapiContainerKeys::default(),
     };
     capi_providers().lock().unwrap().insert(h, prov);
     std::ptr::write_unaligned(ph_prov, h);
@@ -2861,7 +3459,7 @@ pub unsafe extern "win64" fn CryptGetProvParam(
     let cap = std::ptr::read_unaligned(pdw_data_len);
     std::ptr::write_unaligned(pdw_data_len, need);
     if cap < need {
-        return err(234 /* ERROR_MORE_DATA */, FALSE);
+        return err(ERROR_MORE_DATA, FALSE);
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
     TRUE
@@ -2880,18 +3478,39 @@ pub unsafe extern "win64" fn CryptCreateHash(
     if !capi_providers().lock().unwrap().contains_key(&h_prov) {
         return err(NTE_BAD_UID, FALSE);
     }
-    let Some(ctx) = capi_hash_init(alg_id) else {
+    let Some(digest) = capi_alg_to_digest(alg_id) else {
         return err(NTE_BAD_ALGID, FALSE);
     };
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_hashes().lock().unwrap().insert(
         h,
         CapiHash {
+            h_prov,
             alg_id,
-            ctx,
+            digest,
+            data: Vec::new(),
             override_val: None,
         },
     );
+    std::ptr::write_unaligned(ph_hash, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDuplicateHash(
+    h_hash: usize,
+    _pdw_reserved: *const u32,
+    _dw_flags: u32,
+    ph_hash: *mut usize,
+) -> BOOL {
+    if ph_hash.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut hashes = capi_hashes().lock().unwrap();
+    let Some(orig) = hashes.get(&h_hash).cloned() else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    hashes.insert(h, orig);
     std::ptr::write_unaligned(ph_hash, h);
     TRUE
 }
@@ -2911,7 +3530,7 @@ pub unsafe extern "win64" fn CryptHashData(
     };
     if dw_data_len > 0 {
         let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
-        capi_hash_update(h.alg_id, &mut h.ctx, slice);
+        h.data.extend_from_slice(slice);
         h.override_val = None;
     }
     TRUE
@@ -2933,17 +3552,8 @@ pub unsafe extern "win64" fn CryptGetHashParam(
     };
     let bytes: Vec<u8> = match dw_param {
         HP_ALGID => h.alg_id.to_le_bytes().to_vec(),
-        HP_HASHSIZE => (capi_hash_len(h.alg_id).unwrap_or(0) as u32).to_le_bytes().to_vec(),
-        HP_HASHVAL => {
-            if let Some(ref ov) = h.override_val {
-                ov.clone()
-            } else {
-                let Some(d) = capi_hash_finalize_clone(h.alg_id, &h.ctx) else {
-                    return err(NTE_BAD_ALGID, FALSE);
-                };
-                d
-            }
-        }
+        HP_HASHSIZE => (h.digest.len() as u32).to_le_bytes().to_vec(),
+        HP_HASHVAL => capi_hash_value(h),
         _ => return err(NTE_BAD_TYPE, FALSE),
     };
     let need = bytes.len() as u32;
@@ -2954,7 +3564,7 @@ pub unsafe extern "win64" fn CryptGetHashParam(
     let cap = std::ptr::read_unaligned(pdw_data_len);
     std::ptr::write_unaligned(pdw_data_len, need);
     if cap < need {
-        return err(234 /* ERROR_MORE_DATA */, FALSE);
+        return err(ERROR_MORE_DATA, FALSE);
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
     TRUE
@@ -2974,9 +3584,7 @@ pub unsafe extern "win64" fn CryptSetHashParam(
         return err(NTE_BAD_HASH, FALSE);
     };
     if dw_param == HP_HASHVAL {
-        let Some(len) = capi_hash_len(h.alg_id) else {
-            return err(NTE_BAD_ALGID, FALSE);
-        };
+        let len = h.digest.len();
         h.override_val = Some(std::slice::from_raw_parts(pb_data, len).to_vec());
         return TRUE;
     }
@@ -2991,10 +3599,950 @@ pub unsafe extern "win64" fn CryptDestroyHash(h_hash: usize) -> BOOL {
     }
 }
 
-// @exports CryptDecrypt CryptEncrypt CryptDestroyKey CryptExportKey CryptImportKey CryptGetUserKey CryptSignHashW
-failing!(BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED;
-    CryptDecrypt, CryptEncrypt, CryptDestroyKey, CryptExportKey,
-    CryptImportKey, CryptGetUserKey, CryptSignHashW);
+pub unsafe extern "win64" fn CryptGenKey(
+    h_prov: usize,
+    alg_id: u32,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
+        return err(NTE_BAD_UID, FALSE);
+    }
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+    let req_bits = dw_flags >> 16;
+
+    // Asymmetric RSA key generation (AT_KEYEXCHANGE / AT_SIGNATURE / CALG_RSA_KEYX / CALG_RSA_SIGN)
+    if matches!(alg_id, AT_KEYEXCHANGE | AT_SIGNATURE | CALG_RSA_KEYX | CALG_RSA_SIGN) {
+        let bits = if req_bits == 0 { 2048 } else { req_bits };
+        if !(1024..=4096).contains(&bits) || bits % 64 != 0 {
+            return err(NTE_BAD_FLAGS, FALSE);
+        }
+        let Ok(rsa) = RsaKey::generate(bits) else {
+            return err(NTE_BAD_FLAGS, FALSE);
+        };
+        let (key_spec, canonical_alg) = if matches!(alg_id, AT_SIGNATURE | CALG_RSA_SIGN) {
+            (AT_SIGNATURE, CALG_RSA_SIGN)
+        } else {
+            (AT_KEYEXCHANGE, CALG_RSA_KEYX)
+        };
+        store_container_user_key(h_prov, key_spec, rsa.clone());
+        let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+        capi_keys().lock().unwrap().insert(
+            h,
+            CapiKey {
+                alg_id: canonical_alg,
+                exportable,
+                permissions: 0x3F,
+                material: CapiKeyMaterial::Rsa { key: rsa },
+            },
+        );
+        std::ptr::write_unaligned(ph_key, h);
+        return TRUE;
+    }
+
+    // Symmetric session key generation
+    let Some((sym_alg, default_len)) = capi_alg_to_sym(alg_id) else {
+        return err(NTE_BAD_ALGID, FALSE);
+    };
+    let key_len = match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => 16,
+            CALG_AES_192 => 24,
+            CALG_AES_256 => 32,
+            CALG_AES => match req_bits {
+                0 | 128 => 16,
+                192 => 24,
+                256 => 32,
+                _ => return err(NTE_BAD_FLAGS, FALSE),
+            },
+            _ => default_len,
+        },
+        SymAlg::Des => 8,
+        SymAlg::Des3_112 => 16,
+        SymAlg::Des3 => 24,
+        SymAlg::Rc2 | SymAlg::Rc4 => {
+            if req_bits == 0 {
+                default_len
+            } else if req_bits % 8 == 0 && (40..=2048).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+    };
+    let mut raw = vec![0u8; key_len];
+    if !crate::det_entropy::fill(raw.as_mut_ptr(), raw.len()) {
+        libc::arc4random_buf(raw.as_mut_ptr() as *mut c_void, raw.len());
+    }
+    let canonical_alg = if alg_id == CALG_AES {
+        match key_len {
+            16 => CALG_AES_128,
+            24 => CALG_AES_192,
+            _ => CALG_AES_256,
+        }
+    } else {
+        alg_id
+    };
+    let k = capi_sym_key(canonical_alg, sym_alg, raw, exportable);
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, k);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDeriveKey(
+    h_prov: usize,
+    alg_id: u32,
+    h_base_data: usize,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
+        return err(NTE_BAD_UID, FALSE);
+    }
+    let Some((sym_alg, default_len)) = capi_alg_to_sym(alg_id) else {
+        return err(NTE_BAD_ALGID, FALSE);
+    };
+    let (digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_base_data) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.digest, capi_hash_value(h))
+    };
+    let req_bits = dw_flags >> 16;
+    let key_len = match sym_alg {
+        SymAlg::Aes => match alg_id {
+            CALG_AES_128 => 16,
+            CALG_AES_192 => 24,
+            CALG_AES_256 => 32,
+            CALG_AES => match req_bits {
+                0 | 128 => 16,
+                192 => 24,
+                256 => 32,
+                _ => return err(NTE_BAD_FLAGS, FALSE),
+            },
+            _ => default_len,
+        },
+        SymAlg::Des => 8,
+        SymAlg::Des3_112 => 16,
+        SymAlg::Des3 => 24,
+        SymAlg::Rc2 | SymAlg::Rc4 => {
+            if req_bits == 0 {
+                default_len
+            } else if req_bits % 8 == 0 && (40..=128).contains(&req_bits) {
+                (req_bits / 8) as usize
+            } else {
+                return err(NTE_BAD_FLAGS, FALSE);
+            }
+        }
+    };
+
+    // Microsoft Learn CryptDeriveKey algorithm:
+    // - SHA-2 family (SHA-256/384/512): truncate raw hash directly to key_len bytes.
+    // - Legacy hashes (MD2/MD4/MD5/SHA-1): if hash_len < key_len (or for 3DES/AES),
+    //   expand via H(0x36^64 XOR hash) || H(0x5C^64 XOR hash).
+    let is_sha2 = matches!(digest, BcDigest::Sha256 | BcDigest::Sha384 | BcDigest::Sha512);
+    let derived = if is_sha2 && hash_val.len() >= key_len {
+        hash_val[..key_len].to_vec()
+    } else if !is_sha2 && (hash_val.len() < key_len || matches!(sym_alg, SymAlg::Aes | SymAlg::Des3 | SymAlg::Des3_112)) {
+        let mut buf1 = [0x36u8; 64];
+        let mut buf2 = [0x5Cu8; 64];
+        for (i, &b) in hash_val.iter().take(64).enumerate() {
+            buf1[i] ^= b;
+            buf2[i] ^= b;
+        }
+        let mut exp = digest.hash(&buf1);
+        exp.extend_from_slice(&digest.hash(&buf2));
+        if exp.len() < key_len {
+            return err(NTE_BAD_LEN, FALSE);
+        }
+        exp[..key_len].to_vec()
+    } else {
+        hash_val[..key_len].to_vec()
+    };
+
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+    let k = capi_sym_key(alg_id, sym_alg, derived, exportable);
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, k);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptGetUserKey(
+    h_prov: usize,
+    dw_key_spec: u32,
+    ph_user_key: *mut usize,
+) -> BOOL {
+    if ph_user_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_user_key, 0);
+    if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
+        return err(NTE_BAD_TYPE, FALSE);
+    }
+    let rsa = match load_container_user_key(h_prov, dw_key_spec) {
+        Ok(Some(k)) => k,
+        Ok(None) => return err(NTE_NO_KEY, FALSE),
+        Err(e) => return err(e, FALSE),
+    };
+    let alg_id = if dw_key_spec == AT_SIGNATURE { CALG_RSA_SIGN } else { CALG_RSA_KEYX };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(
+        h,
+        CapiKey {
+            alg_id,
+            exportable: true,
+            permissions: 0x3F,
+            material: CapiKeyMaterial::Rsa { key: rsa },
+        },
+    );
+    std::ptr::write_unaligned(ph_user_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDuplicateKey(
+    h_key: usize,
+    _pdw_reserved: *const u32,
+    _dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if ph_key.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(orig) = keys.get(&h_key).cloned() else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    keys.insert(h, orig);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptDestroyKey(h_key: usize) -> BOOL {
+    if capi_keys().lock().unwrap().remove(&h_key).is_some() {
+        TRUE
+    } else {
+        err(NTE_BAD_KEY, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn CryptGetKeyParam(
+    h_key: usize,
+    dw_param: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    _dw_flags: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    let bytes: Vec<u8> = match (dw_param, &k.material) {
+        (KP_ALGID, _) => k.alg_id.to_le_bytes().to_vec(),
+        (KP_PERMISSIONS, _) => k.permissions.to_le_bytes().to_vec(),
+        (KP_BLOCKLEN, CapiKeyMaterial::Rsa { key, .. }) => (key.bits() as u32).to_le_bytes().to_vec(),
+        (KP_KEYLEN, CapiKeyMaterial::Rsa { key, .. }) => (key.bits() as u32).to_le_bytes().to_vec(),
+        (KP_BLOCKLEN, CapiKeyMaterial::Symmetric { alg, .. }) => ((alg.block_size() * 8) as u32).to_le_bytes().to_vec(),
+        (KP_KEYLEN, CapiKeyMaterial::Symmetric { key, .. }) => ((key.len() * 8) as u32).to_le_bytes().to_vec(),
+        (KP_IV, CapiKeyMaterial::Symmetric { iv, alg, .. }) if alg.block_size() > 0 => iv.clone(),
+        (KP_MODE, CapiKeyMaterial::Symmetric { mode, .. }) => {
+            let m = match mode {
+                BcCipherMode::Ecb => CRYPT_MODE_ECB,
+                BcCipherMode::Cfb => CRYPT_MODE_CFB,
+                _ => CRYPT_MODE_CBC,
+            };
+            m.to_le_bytes().to_vec()
+        }
+        (KP_PADDING, CapiKeyMaterial::Symmetric { padding, .. }) => padding.to_le_bytes().to_vec(),
+        (KP_MODE_BITS, CapiKeyMaterial::Symmetric { msg_block_len, .. }) => (*msg_block_len * 8).to_le_bytes().to_vec(),
+        (KP_EFFECTIVE_KEYLEN, CapiKeyMaterial::Symmetric { alg: SymAlg::Rc2, effective_key_len, key, .. }) => {
+            let v = if *effective_key_len == 0 { (key.len() * 8) as u32 } else { *effective_key_len };
+            v.to_le_bytes().to_vec()
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+    let need = bytes.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb_data, bytes.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptSetKeyParam(
+    h_key: usize,
+    dw_param: u32,
+    pb_data: *const u8,
+    _dw_flags: u32,
+) -> BOOL {
+    if pb_data.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    if dw_param == KP_PERMISSIONS {
+        k.permissions = std::ptr::read_unaligned(pb_data as *const u32);
+        return TRUE;
+    }
+    let CapiKeyMaterial::Symmetric {
+        alg,
+        ref mut mode,
+        ref mut padding,
+        ref mut effective_key_len,
+        ref mut iv,
+        ref mut running_iv,
+        ref mut msg_block_len,
+        ..
+    } = k.material
+    else {
+        return err(NTE_BAD_TYPE, FALSE);
+    };
+    match dw_param {
+        KP_IV => {
+            let bs = alg.block_size();
+            if bs == 0 {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            let slice = std::slice::from_raw_parts(pb_data, bs);
+            *iv = slice.to_vec();
+            *running_iv = slice.to_vec();
+            TRUE
+        }
+        KP_MODE => {
+            let m = std::ptr::read_unaligned(pb_data as *const u32);
+            match m {
+                CRYPT_MODE_CBC => *mode = BcCipherMode::Cbc,
+                CRYPT_MODE_ECB => *mode = BcCipherMode::Ecb,
+                CRYPT_MODE_CFB => *mode = BcCipherMode::Cfb,
+                _ => return err(NTE_BAD_DATA, FALSE),
+            }
+            TRUE
+        }
+        KP_PADDING => {
+            let p = std::ptr::read_unaligned(pb_data as *const u32);
+            if p != PKCS5_PADDING && p != ZERO_PADDING {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *padding = p;
+            TRUE
+        }
+        KP_MODE_BITS => {
+            let bits = std::ptr::read_unaligned(pb_data as *const u32);
+            let bs = alg.block_size() as u32;
+            if bits == 0 || bits % 8 != 0 || bits / 8 > bs {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *msg_block_len = bits / 8;
+            TRUE
+        }
+        KP_EFFECTIVE_KEYLEN if alg == SymAlg::Rc2 => {
+            let bits = std::ptr::read_unaligned(pb_data as *const u32);
+            if !(40..=1024).contains(&bits) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *effective_key_len = bits;
+            TRUE
+        }
+        _ => err(NTE_BAD_TYPE, FALSE),
+    }
+}
+
+pub unsafe extern "win64" fn CryptExportKey(
+    h_key: usize,
+    h_exp_key: usize,
+    dw_blob_type: u32,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+    let blob: Vec<u8> = match (dw_blob_type, &k.material) {
+        (PUBLICKEYBLOB, CapiKeyMaterial::Rsa { key, .. }) => {
+            let Some(b) = key.to_capi_public_blob(k.alg_id) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            b
+        }
+        (PRIVATEKEYBLOB, CapiKeyMaterial::Rsa { key, .. }) => {
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            let Some(b) = key.to_capi_private_blob(k.alg_id) else {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            };
+            b
+        }
+        (PLAINTEXTKEYBLOB, CapiKeyMaterial::Symmetric { key, .. }) => {
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            let mut out = Vec::with_capacity(12 + key.len());
+            out.push(PLAINTEXTKEYBLOB as u8);
+            out.push(CUR_BLOB_VERSION);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&k.alg_id.to_le_bytes());
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key);
+            out
+        }
+        (SIMPLEBLOB, CapiKeyMaterial::Symmetric { key: sym_bytes, .. }) => {
+            if !k.exportable {
+                return err(NTE_BAD_KEY_STATE, FALSE);
+            }
+            let Some(exp_k) = keys.get(&h_exp_key) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let CapiKeyMaterial::Rsa { key: ref rsa, .. } = exp_k.material else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let ct_be = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.encrypt_oaep(BcDigest::Sha1, &[], sym_bytes)
+            } else {
+                rsa.encrypt_pkcs1(sym_bytes)
+            };
+            let Ok(mut ct) = ct_be else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            // CAPI SIMPLEBLOB stores RSA ciphertext in little-endian byte order.
+            ct.reverse();
+            let mut out = Vec::with_capacity(12 + ct.len());
+            out.push(SIMPLEBLOB as u8);
+            out.push(CUR_BLOB_VERSION);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&k.alg_id.to_le_bytes());
+            out.extend_from_slice(&CALG_RSA_KEYX.to_le_bytes());
+            out.extend_from_slice(&ct);
+            out
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+
+    let need = blob.len() as u32;
+    if pb_data.is_null() {
+        std::ptr::write_unaligned(pdw_data_len, need);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_data_len);
+    std::ptr::write_unaligned(pdw_data_len, need);
+    if cap < need {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    std::ptr::copy_nonoverlapping(blob.as_ptr(), pb_data, blob.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptImportKey(
+    h_prov: usize,
+    pb_data: *const u8,
+    dw_data_len: u32,
+    h_pub_key: usize,
+    dw_flags: u32,
+    ph_key: *mut usize,
+) -> BOOL {
+    if pb_data.is_null() || ph_key.is_null() || dw_data_len < 8 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    std::ptr::write_unaligned(ph_key, 0);
+    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
+        return err(NTE_BAD_UID, FALSE);
+    }
+    let blob = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
+    let b_type = blob[0] as u32;
+    let b_ver = blob[1];
+    if b_ver != CUR_BLOB_VERSION {
+        return err(NTE_BAD_VER, FALSE);
+    }
+    let ai_key_alg = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+    let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
+
+    let capi_key = match b_type {
+        PUBLICKEYBLOB | PRIVATEKEYBLOB => {
+            let Some((rsa, blob_alg, is_priv)) = RsaKey::from_capi_blob(blob) else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            let key_spec = if blob_alg == CALG_RSA_SIGN { AT_SIGNATURE } else { AT_KEYEXCHANGE };
+            if is_priv {
+                store_container_user_key(h_prov, key_spec, rsa.clone());
+            }
+            CapiKey {
+                alg_id: if blob_alg != 0 { blob_alg } else { CALG_RSA_KEYX },
+                exportable: exportable || !is_priv,
+                permissions: 0x3F,
+                material: CapiKeyMaterial::Rsa { key: rsa },
+            }
+        }
+        PLAINTEXTKEYBLOB => {
+            if blob.len() < 12 {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let cb_key = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+            if blob.len() < 12 + cb_key {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let Some((sym_alg, _)) = capi_alg_to_sym(ai_key_alg) else {
+                return err(NTE_BAD_ALGID, FALSE);
+            };
+            let raw = blob[12..12 + cb_key].to_vec();
+            let valid_len = match sym_alg {
+                SymAlg::Aes => match ai_key_alg {
+                    CALG_AES_128 => cb_key == 16,
+                    CALG_AES_192 => cb_key == 24,
+                    CALG_AES_256 => cb_key == 32,
+                    _ => matches!(cb_key, 16 | 24 | 32),
+                },
+                SymAlg::Des => cb_key == 8,
+                SymAlg::Des3_112 => cb_key == 16,
+                SymAlg::Des3 => cb_key == 24,
+                SymAlg::Rc2 => (1..=128).contains(&cb_key),
+                SymAlg::Rc4 => (1..=256).contains(&cb_key),
+            };
+            if !valid_len {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            capi_sym_key(ai_key_alg, sym_alg, raw, exportable)
+        }
+        SIMPLEBLOB => {
+            if blob.len() < 12 {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let Some((sym_alg, _)) = capi_alg_to_sym(ai_key_alg) else {
+                return err(NTE_BAD_ALGID, FALSE);
+            };
+            let rsa = {
+                let keys = capi_keys().lock().unwrap();
+                let Some(pk) = keys.get(&h_pub_key) else {
+                    return err(NTE_BAD_KEY, FALSE);
+                };
+                match &pk.material {
+                    CapiKeyMaterial::Rsa { key, .. } => key.clone(),
+                    _ => return err(NTE_BAD_KEY, FALSE),
+                }
+            };
+            let mut ct_be = blob[12..].to_vec();
+            if ct_be.len() != rsa.k() {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            // CAPI SIMPLEBLOB ciphertext is little-endian; reverse to big-endian for RSA decryption.
+            ct_be.reverse();
+            let raw = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.decrypt_oaep(BcDigest::Sha1, &[], &ct_be)
+            } else {
+                rsa.decrypt_pkcs1(&ct_be)
+            };
+            let Ok(raw_key) = raw else {
+                return err(NTE_BAD_DATA, FALSE);
+            };
+            capi_sym_key(ai_key_alg, sym_alg, raw_key, exportable)
+        }
+        _ => return err(NTE_BAD_TYPE, FALSE),
+    };
+
+    let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
+    capi_keys().lock().unwrap().insert(h, capi_key);
+    std::ptr::write_unaligned(ph_key, h);
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptEncrypt(
+    h_key: usize,
+    h_hash: usize,
+    final_block: BOOL,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+    dw_buf_len: u32,
+) -> BOOL {
+    if pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let in_len = std::ptr::read_unaligned(pdw_data_len) as usize;
+    let is_final = final_block != 0;
+
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+
+    match &mut k.material {
+        CapiKeyMaterial::Rsa { key: rsa, .. } => {
+            let need = rsa.k();
+            if pb_data.is_null() {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return TRUE;
+            }
+            if (dw_buf_len as usize) < need {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return err(ERROR_MORE_DATA, FALSE);
+            }
+            let pt = std::slice::from_raw_parts(pb_data, in_len).to_vec();
+            if h_hash != 0 {
+                drop(keys);
+                if CryptHashData(h_hash, pt.as_ptr(), pt.len() as u32, 0) == FALSE {
+                    return FALSE;
+                }
+                keys = capi_keys().lock().unwrap();
+            }
+            let Some(k) = keys.get(&h_key) else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let CapiKeyMaterial::Rsa { key: rsa, .. } = &k.material else {
+                return err(NTE_BAD_KEY, FALSE);
+            };
+            let ct = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.encrypt_oaep(BcDigest::Sha1, &[], &pt)
+            } else {
+                rsa.encrypt_pkcs1(&pt)
+            };
+            let Ok(mut ct) = ct else {
+                return err(NTE_BAD_LEN, FALSE);
+            };
+            // Legacy CAPI RSA ciphertext is little-endian.
+            ct.reverse();
+            std::ptr::copy_nonoverlapping(ct.as_ptr(), pb_data, ct.len());
+            std::ptr::write_unaligned(pdw_data_len, ct.len() as u32);
+            TRUE
+        }
+        CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            mode,
+            padding,
+            effective_key_len,
+            iv,
+            running_iv,
+            msg_block_len,
+            rc4,
+        } => {
+            let bs = alg.block_size();
+            let use_pkcs7 = is_final && *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
+            let need = if *alg == SymAlg::Rc4 || *mode == BcCipherMode::Cfb {
+                in_len
+            } else if use_pkcs7 {
+                ((in_len / bs) + 1) * bs
+            } else {
+                if in_len % bs != 0 {
+                    return err(NTE_BAD_DATA, FALSE);
+                }
+                in_len
+            };
+            if pb_data.is_null() {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return TRUE;
+            }
+            if (dw_buf_len as usize) < need {
+                std::ptr::write_unaligned(pdw_data_len, need as u32);
+                return err(ERROR_MORE_DATA, FALSE);
+            }
+            let pt = if in_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(pb_data, in_len).to_vec()
+            };
+
+            let out = if *alg == SymAlg::Rc4 {
+                let st = rc4.get_or_insert_with(|| Rc4State::new(key));
+                let r = st.apply(&pt);
+                if is_final {
+                    *rc4 = Some(Rc4State::new(key));
+                }
+                r
+            } else {
+                let mut iv_work = running_iv.clone();
+                let res = crate::misc::bcrypt::sym_crypt_block_mode(
+                    *alg,
+                    *mode,
+                    true,
+                    use_pkcs7,
+                    key,
+                    *effective_key_len,
+                    &mut iv_work,
+                    *msg_block_len as usize,
+                    &pt,
+                );
+                let Ok(v) = res else {
+                    return err(NTE_BAD_DATA, FALSE);
+                };
+                if is_final {
+                    *running_iv = iv.clone();
+                } else {
+                    *running_iv = iv_work;
+                }
+                v
+            };
+
+            drop(keys);
+            if h_hash != 0 && !pt.is_empty() && CryptHashData(h_hash, pt.as_ptr(), pt.len() as u32, 0) == FALSE {
+                return FALSE;
+            }
+            if !out.is_empty() {
+                std::ptr::copy_nonoverlapping(out.as_ptr(), pb_data, out.len());
+            }
+            std::ptr::write_unaligned(pdw_data_len, out.len() as u32);
+            TRUE
+        }
+    }
+}
+
+pub unsafe extern "win64" fn CryptDecrypt(
+    h_key: usize,
+    h_hash: usize,
+    final_block: BOOL,
+    dw_flags: u32,
+    pb_data: *mut u8,
+    pdw_data_len: *mut u32,
+) -> BOOL {
+    if pb_data.is_null() || pdw_data_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let in_len = std::ptr::read_unaligned(pdw_data_len) as usize;
+    let is_final = final_block != 0;
+
+    let mut keys = capi_keys().lock().unwrap();
+    let Some(k) = keys.get_mut(&h_key) else {
+        return err(NTE_BAD_KEY, FALSE);
+    };
+
+    let out = match &mut k.material {
+        CapiKeyMaterial::Rsa { key: rsa, .. } => {
+            if !rsa.has_private() {
+                return err(NTE_BAD_KEY, FALSE);
+            }
+            if in_len != rsa.k() {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            let mut ct_be = std::slice::from_raw_parts(pb_data, in_len).to_vec();
+            ct_be.reverse();
+            let res = if (dw_flags & CRYPT_OAEP) != 0 {
+                rsa.decrypt_oaep(BcDigest::Sha1, &[], &ct_be)
+            } else {
+                rsa.decrypt_pkcs1(&ct_be)
+            };
+            match res {
+                Ok(v) => v,
+                Err(_) => return err(NTE_BAD_DATA, FALSE),
+            }
+        }
+        CapiKeyMaterial::Symmetric {
+            alg,
+            key,
+            mode,
+            padding,
+            effective_key_len,
+            iv,
+            running_iv,
+            msg_block_len,
+            rc4,
+        } => {
+            let ct = if in_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(pb_data, in_len).to_vec()
+            };
+            if *alg == SymAlg::Rc4 {
+                let st = rc4.get_or_insert_with(|| Rc4State::new(key));
+                let r = st.apply(&ct);
+                if is_final {
+                    *rc4 = Some(Rc4State::new(key));
+                }
+                r
+            } else {
+                let bs = alg.block_size();
+                let use_pkcs7 = is_final && *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
+                if *mode != BcCipherMode::Cfb && ct.len() % bs != 0 {
+                    return err(NTE_BAD_DATA, FALSE);
+                }
+                let mut iv_work = running_iv.clone();
+                let res = crate::misc::bcrypt::sym_crypt_block_mode(
+                    *alg,
+                    *mode,
+                    false,
+                    use_pkcs7,
+                    key,
+                    *effective_key_len,
+                    &mut iv_work,
+                    *msg_block_len as usize,
+                    &ct,
+                );
+                let Ok(v) = res else {
+                    return err(NTE_BAD_DATA, FALSE);
+                };
+                if is_final {
+                    *running_iv = iv.clone();
+                } else {
+                    *running_iv = iv_work;
+                }
+                v
+            }
+        }
+    };
+
+    drop(keys);
+    if !out.is_empty() {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), pb_data, out.len());
+    }
+    std::ptr::write_unaligned(pdw_data_len, out.len() as u32);
+    if h_hash != 0 && !out.is_empty() && CryptHashData(h_hash, out.as_ptr(), out.len() as u32, 0) == FALSE {
+        return FALSE;
+    }
+    TRUE
+}
+
+unsafe fn crypt_sign_hash_impl(
+    h_hash: usize,
+    dw_key_spec: u32,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    if pdw_sig_len.is_null() {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
+        return err(NTE_BAD_TYPE, FALSE);
+    }
+    let (h_prov, digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_hash) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.h_prov, h.digest, capi_hash_value(h))
+    };
+    let rsa = match load_container_user_key(h_prov, dw_key_spec) {
+        Ok(Some(k)) => k,
+        Ok(None) => return err(NTE_NO_KEY, FALSE),
+        Err(e) => return err(e, FALSE),
+    };
+    let sig_len = rsa.k() as u32;
+    if pb_signature.is_null() {
+        std::ptr::write_unaligned(pdw_sig_len, sig_len);
+        return TRUE;
+    }
+    let cap = std::ptr::read_unaligned(pdw_sig_len);
+    std::ptr::write_unaligned(pdw_sig_len, sig_len);
+    if cap < sig_len {
+        return err(ERROR_MORE_DATA, FALSE);
+    }
+    let d_opt = if (dw_flags & CRYPT_NOHASHOID) != 0 { None } else { Some(digest) };
+    let Ok(mut sig) = rsa.sign_pkcs1(d_opt, &hash_val) else {
+        return err(NTE_BAD_HASH, FALSE);
+    };
+    // Legacy CAPI RSA signatures are little-endian.
+    sig.reverse();
+    std::ptr::copy_nonoverlapping(sig.as_ptr(), pb_signature, sig.len());
+    TRUE
+}
+
+pub unsafe extern "win64" fn CryptSignHashW(
+    h_hash: usize,
+    dw_key_spec: u32,
+    _sz_description: LPCWSTR,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    crypt_sign_hash_impl(h_hash, dw_key_spec, dw_flags, pb_signature, pdw_sig_len)
+}
+
+pub unsafe extern "win64" fn CryptSignHashA(
+    h_hash: usize,
+    dw_key_spec: u32,
+    _sz_description: LPCSTR,
+    dw_flags: u32,
+    pb_signature: *mut u8,
+    pdw_sig_len: *mut u32,
+) -> BOOL {
+    crypt_sign_hash_impl(h_hash, dw_key_spec, dw_flags, pb_signature, pdw_sig_len)
+}
+
+unsafe fn crypt_verify_signature_impl(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    dw_flags: u32,
+) -> BOOL {
+    if pb_signature.is_null() || dw_sig_len == 0 {
+        return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let (digest, hash_val) = {
+        let hashes = capi_hashes().lock().unwrap();
+        let Some(h) = hashes.get(&h_hash) else {
+            return err(NTE_BAD_HASH, FALSE);
+        };
+        (h.digest, capi_hash_value(h))
+    };
+    let rsa = {
+        let keys = capi_keys().lock().unwrap();
+        let Some(k) = keys.get(&h_pub_key) else {
+            return err(NTE_BAD_KEY, FALSE);
+        };
+        match &k.material {
+            CapiKeyMaterial::Rsa { key, .. } => key.clone(),
+            _ => return err(NTE_BAD_KEY, FALSE),
+        }
+    };
+    if dw_sig_len as usize != rsa.k() {
+        return err(NTE_BAD_SIGNATURE, FALSE);
+    }
+    let mut sig_be = std::slice::from_raw_parts(pb_signature, dw_sig_len as usize).to_vec();
+    sig_be.reverse();
+    let d_opt = if (dw_flags & CRYPT_NOHASHOID) != 0 { None } else { Some(digest) };
+    if rsa.verify_pkcs1(d_opt, &hash_val, &sig_be) {
+        TRUE
+    } else {
+        err(NTE_BAD_SIGNATURE, FALSE)
+    }
+}
+
+pub unsafe extern "win64" fn CryptVerifySignatureW(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    _sz_description: LPCWSTR,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_verify_signature_impl(h_hash, pb_signature, dw_sig_len, h_pub_key, dw_flags)
+}
+
+pub unsafe extern "win64" fn CryptVerifySignatureA(
+    h_hash: usize,
+    pb_signature: *const u8,
+    dw_sig_len: u32,
+    h_pub_key: usize,
+    _sz_description: LPCSTR,
+    dw_flags: u32,
+) -> BOOL {
+    crypt_verify_signature_impl(h_hash, pb_signature, dw_sig_len, h_pub_key, dw_flags)
+}
 
 /// `RtlGenRandom` alias exported by advapi32.dll as `SystemFunction036`.
 pub unsafe extern "win64" fn SystemFunction036(buf: *mut c_void, len: u32) -> u8 {
@@ -4675,6 +6223,278 @@ mod tests {
                 None => std::env::remove_var("AW2_DRIVE_C"),
             }
             let _ = std::fs::remove_dir_all(&tmp_root);
+        }
+    }
+
+    #[test]
+    fn token_information_all_classes_windows_semantics() {
+        unsafe {
+            let mut tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut tok), TRUE);
+            assert!(!tok.is_null());
+
+            let mut need = 0u32;
+            // TokenType (8) -> TokenPrimary (1)
+            let mut val = 0u32;
+            assert_eq!(GetTokenInformation(tok, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!((val, need), (TOKEN_PRIMARY, 4));
+
+            // TokenImpersonationLevel (9) on primary token -> ERROR_INVALID_PARAMETER
+            assert_eq!(GetTokenInformation(tok, 9, &mut val as *mut u32 as *mut u8, 4, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            // DuplicateToken creates an impersonation token whose level can be queried
+            let mut imp_tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(DuplicateToken(tok, SECURITY_IMPERSONATION, &mut imp_tok), TRUE);
+            assert_eq!(GetTokenInformation(imp_tok, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, TOKEN_IMPERSONATION);
+            assert_eq!(GetTokenInformation(imp_tok, 9, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, SECURITY_IMPERSONATION);
+
+            // TokenGroups (2): size query + read groups and validate embedded SID pointers
+            assert_eq!(GetTokenInformation(tok, 2, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert!(need >= 8);
+            let mut gbuf = vec![0u8; need as usize];
+            assert_eq!(GetTokenInformation(tok, 2, gbuf.as_mut_ptr(), need, &mut need), TRUE);
+            let gcount = u32::from_le_bytes(gbuf[0..4].try_into().unwrap());
+            assert!(gcount >= 4);
+            let first_sid = std::ptr::read_unaligned(gbuf.as_ptr().add(8) as *const *const u8);
+            assert!((first_sid as usize) >= (gbuf.as_ptr() as usize) && (first_sid as usize) < (gbuf.as_ptr() as usize + gbuf.len()));
+            assert_eq!(*first_sid, 1); // SID_REVISION
+
+            // TokenPrivileges (3)
+            assert_eq!(GetTokenInformation(tok, 3, std::ptr::null_mut(), 0, &mut need), FALSE);
+            let mut pbuf = vec![0u8; need as usize];
+            assert_eq!(GetTokenInformation(tok, 3, pbuf.as_mut_ptr(), need, &mut need), TRUE);
+            assert_eq!(u32::from_le_bytes(pbuf[0..4].try_into().unwrap()), 1);
+
+            // TokenOwner (4), TokenPrimaryGroup (5), TokenDefaultDacl (6), TokenSource (7)
+            for cls in [4u32, 5, 6, 7, 10, 11, 12, 13, 15, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48] {
+                let mut sz = 0u32;
+                assert_eq!(GetTokenInformation(tok, cls, std::ptr::null_mut(), 0, &mut sz), FALSE, "class {cls} size query");
+                assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER, "class {cls} err");
+                assert!(sz > 0, "class {cls} non-zero size");
+                let mut b = vec![0u8; sz as usize];
+                assert_eq!(GetTokenInformation(tok, cls, b.as_mut_ptr(), sz, &mut sz), TRUE, "class {cls} read");
+            }
+
+            // TokenStatistics (10) -> 56 bytes, TokenType=1, non-zero TokenId
+            let mut stats = [0u8; 56];
+            assert_eq!(GetTokenInformation(tok, 10, stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(need, 56);
+            assert_ne!(u64::from_le_bytes(stats[0..8].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(stats[24..28].try_into().unwrap()), TOKEN_PRIMARY);
+
+            // Documented failure classes: 14 (reserved), 16 (SeSecurityPrivilege), 19 (no linked UAC token), 99 (invalid)
+            assert_eq!(GetTokenInformation(tok, 14, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(GetTokenInformation(tok, 16, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_PRIVILEGE_NOT_HELD);
+            assert_eq!(GetTokenInformation(tok, 19, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_NO_SUCH_LOGON_SESSION);
+            assert_eq!(GetTokenInformation(tok, 99, std::ptr::null_mut(), 0, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
+
+            // Windows 8+ pseudo-handle GetCurrentProcessToken() = -4
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 12, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, 1);
+
+            let _ = crate::kernel32::threads::CloseHandle(imp_tok);
+            let _ = crate::kernel32::threads::CloseHandle(tok);
+        }
+    }
+
+    #[test]
+    fn capi_keys_blobs_encrypt_decrypt_sign_verify_and_windows_vectors() {
+        unsafe {
+            let hex = |s: &str| -> Vec<u8> {
+                (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+            };
+            let cname = crate::strings::to_wide_z("PortFactoryCapiUnitTestContainer");
+            let mut hprov: usize = 0;
+            // Clean any prior container, then create fresh
+            let _ = CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET);
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_NEWKEYSET), TRUE);
+
+            // Before keygen, CryptGetUserKey returns NTE_NO_KEY
+            let mut h_missing: usize = 0;
+            assert_eq!(CryptGetUserKey(hprov, AT_SIGNATURE, &mut h_missing), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_NO_KEY);
+
+            // 1. Generate 2048-bit RSA signature & exchange keys
+            let mut h_sign: usize = 0;
+            assert_eq!(CryptGenKey(hprov, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_sign), TRUE);
+            let mut h_keyx: usize = 0;
+            assert_eq!(CryptGenKey(hprov, AT_KEYEXCHANGE, (2048 << 16) | CRYPT_EXPORTABLE, &mut h_keyx), TRUE);
+
+            // Close and reopen same named container -> CryptGetUserKey retrieves persisted keys!
+            assert_eq!(CryptDestroyKey(h_sign), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx), TRUE);
+            assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
+
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, 0), TRUE);
+            assert_eq!(CryptGetUserKey(hprov, AT_SIGNATURE, &mut h_sign), TRUE);
+            assert_eq!(CryptGetUserKey(hprov, AT_KEYEXCHANGE, &mut h_keyx), TRUE);
+
+            // 2. Sign & verify SHA-256 hash (both standard DigestInfo and CRYPT_NOHASHOID)
+            let mut h_hash: usize = 0;
+            assert_eq!(CryptCreateHash(hprov, CALG_SHA_256, 0, 0, &mut h_hash), TRUE);
+            assert_eq!(CryptHashData(h_hash, b"capi sign verify payload".as_ptr(), 24, 0), TRUE);
+
+            let mut sig_len = 0u32;
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0, std::ptr::null_mut(), &mut sig_len), TRUE);
+            assert_eq!(sig_len, 256);
+            let mut sig = vec![0u8; 256];
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0, sig.as_mut_ptr(), &mut sig_len), TRUE);
+
+            // Export PUBLICKEYBLOB, re-import, and verify
+            let mut pub_len = 0u32;
+            assert_eq!(CryptExportKey(h_sign, 0, PUBLICKEYBLOB, 0, std::ptr::null_mut(), &mut pub_len), TRUE);
+            let mut pub_blob = vec![0u8; pub_len as usize];
+            assert_eq!(CryptExportKey(h_sign, 0, PUBLICKEYBLOB, 0, pub_blob.as_mut_ptr(), &mut pub_len), TRUE);
+            assert_eq!(pub_blob[0], PUBLICKEYBLOB as u8);
+            assert_eq!(pub_blob[1], CUR_BLOB_VERSION);
+            assert_eq!(&pub_blob[8..12], b"RSA1");
+
+            let mut h_pub: usize = 0;
+            assert_eq!(CryptImportKey(hprov, pub_blob.as_ptr(), pub_len, 0, 0, &mut h_pub), TRUE);
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), TRUE);
+            sig[0] ^= 0x80;
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_SIGNATURE);
+
+            // Export PRIVATEKEYBLOB & re-import into a fresh verify-context provider
+            let mut priv_len = 0u32;
+            assert_eq!(CryptExportKey(h_keyx, 0, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut priv_len), TRUE);
+            let mut priv_blob = vec![0u8; priv_len as usize];
+            assert_eq!(CryptExportKey(h_keyx, 0, PRIVATEKEYBLOB, 0, priv_blob.as_mut_ptr(), &mut priv_len), TRUE);
+            assert_eq!(priv_blob[0], PRIVATEKEYBLOB as u8);
+            assert_eq!(&priv_blob[8..12], b"RSA2");
+
+            let mut hprov2: usize = 0;
+            assert_eq!(CryptAcquireContextW(&mut hprov2, std::ptr::null(), std::ptr::null(), 24, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_keyx_imp: usize = 0;
+            assert_eq!(CryptImportKey(hprov2, priv_blob.as_ptr(), priv_len, 0, CRYPT_EXPORTABLE, &mut h_keyx_imp), TRUE);
+
+            // 3. RSA CryptEncrypt / CryptDecrypt (PKCS#1 v1.5 and CRYPT_OAEP)
+            for flags in [0u32, CRYPT_OAEP] {
+                let mut buf = vec![0u8; 256];
+                let msg = b"RSA CAPI message";
+                buf[..msg.len()].copy_from_slice(msg);
+                let mut dlen = msg.len() as u32;
+                assert_eq!(CryptEncrypt(h_keyx, 0, TRUE, flags, buf.as_mut_ptr(), &mut dlen, 256), TRUE);
+                assert_eq!(dlen, 256);
+                assert_eq!(CryptDecrypt(h_keyx_imp, 0, TRUE, flags, buf.as_mut_ptr(), &mut dlen), TRUE);
+                assert_eq!(&buf[..dlen as usize], msg);
+            }
+
+            // 4. AES-128-CBC NIST SP 800-38A known-answer vector via PLAINTEXTKEYBLOB + SIMPLEBLOB wrap/unwrap
+            let key128 = hex("2b7e151628aed2a6abf7158809cf4f3c");
+            let mut pt_blob = Vec::new();
+            pt_blob.push(PLAINTEXTKEYBLOB as u8);
+            pt_blob.push(CUR_BLOB_VERSION);
+            pt_blob.extend_from_slice(&0u16.to_le_bytes());
+            pt_blob.extend_from_slice(&CALG_AES_128.to_le_bytes());
+            pt_blob.extend_from_slice(&16u32.to_le_bytes());
+            pt_blob.extend_from_slice(&key128);
+
+            let mut h_aes: usize = 0;
+            assert_eq!(CryptImportKey(hprov, pt_blob.as_ptr(), pt_blob.len() as u32, 0, CRYPT_EXPORTABLE, &mut h_aes), TRUE);
+
+            // Export as SIMPLEBLOB (RSA-OAEP wrapped) and import back using imported RSA private key
+            let mut sblob_len = 0u32;
+            assert_eq!(CryptExportKey(h_aes, h_keyx, SIMPLEBLOB, CRYPT_OAEP, std::ptr::null_mut(), &mut sblob_len), TRUE);
+            let mut sblob = vec![0u8; sblob_len as usize];
+            assert_eq!(CryptExportKey(h_aes, h_keyx, SIMPLEBLOB, CRYPT_OAEP, sblob.as_mut_ptr(), &mut sblob_len), TRUE);
+            assert_eq!(sblob[0], SIMPLEBLOB as u8);
+            assert_eq!(u32::from_le_bytes(sblob[4..8].try_into().unwrap()), CALG_AES_128);
+            assert_eq!(u32::from_le_bytes(sblob[8..12].try_into().unwrap()), CALG_RSA_KEYX);
+
+            let mut h_aes_unwrapped: usize = 0;
+            assert_eq!(CryptImportKey(hprov2, sblob.as_ptr(), sblob_len, h_keyx_imp, CRYPT_OAEP, &mut h_aes_unwrapped), TRUE);
+
+            let iv = hex("000102030405060708090a0b0c0d0e0f");
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_IV, iv.as_ptr(), 0), TRUE);
+            let pt = hex("6bc1bee22e409f96e93d7e117393172a");
+            let mut buf = vec![0u8; 32];
+            buf[..16].copy_from_slice(&pt);
+            let mut dlen = 16u32;
+            // Final=FALSE -> no padding, exact NIST SP 800-38A CBC block 1 ciphertext
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, FALSE, 0, buf.as_mut_ptr(), &mut dlen, 32), TRUE);
+            assert_eq!(dlen, 16);
+            assert_eq!(&buf[..16], hex("7649abac8119b246cee98e9b12e9197d").as_slice());
+
+            // Reset IV and test Final=TRUE with PKCS#5 padding + size query + ERROR_MORE_DATA
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_IV, iv.as_ptr(), 0), TRUE);
+            let msg_pad = b"Hello CAPI AES-128-CBC!";
+            let mut qlen = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, std::ptr::null_mut(), &mut qlen, 0), TRUE);
+            assert_eq!(qlen, 32);
+            let mut small = vec![0u8; 24];
+            let mut slen_in = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, small.as_mut_ptr(), &mut slen_in, 24), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_MORE_DATA);
+            assert_eq!(slen_in, 32);
+
+            let mut full = vec![0u8; 32];
+            full[..msg_pad.len()].copy_from_slice(msg_pad);
+            let mut flen = msg_pad.len() as u32;
+            assert_eq!(CryptEncrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen, 32), TRUE);
+            assert_eq!(flen, 32);
+            assert_eq!(CryptDecrypt(h_aes_unwrapped, 0, TRUE, 0, full.as_mut_ptr(), &mut flen), TRUE);
+            assert_eq!(&full[..flen as usize], msg_pad);
+
+            // 5. CryptDeriveKey (SHA-256 -> direct truncation; SHA-1 -> 0x36/0x5C expansion)
+            let mut h_pw = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_SHA_256, 0, 0, &mut h_pw), TRUE);
+            assert_eq!(CryptHashData(h_pw, b"abc".as_ptr(), 3, 0), TRUE);
+            let mut h_dk = 0usize;
+            assert_eq!(CryptDeriveKey(hprov2, CALG_AES_128, h_pw, CRYPT_EXPORTABLE, &mut h_dk), TRUE);
+            let mut dk_blob = vec![0u8; 64];
+            let mut dk_len = 64u32;
+            assert_eq!(CryptExportKey(h_dk, 0, PLAINTEXTKEYBLOB, 0, dk_blob.as_mut_ptr(), &mut dk_len), TRUE);
+            assert_eq!(&dk_blob[12..28], &BcDigest::Sha256.hash(b"abc")[..16]);
+            assert_eq!(CryptDestroyKey(h_dk), TRUE);
+            assert_eq!(CryptDestroyHash(h_pw), TRUE);
+
+            // 6. Real Windows PUBLICKEYBLOB + little-endian CAPI signature interoperability vector
+            // (1024-bit OpenSSL key & SHA-256 PKCS#1 v1.5 signature over "aw2 license test",
+            //  converted to little-endian Windows CAPI format)
+            let mut n_le = hex("CAA2D2172A1AE3E2C6EFB357E25B0C80B4CC77044032EA5AA7C8369F0C7F9786751D7FE853A0FA801EBB4CF3FBC861138952CFD50D1DFC8E5BF91E98DB4D72B369B8A0C0D4E1FC67B89F223152C9DF04049633CE988BE3050BCF92A606B0E65A2DD12E951EC0D4D4A3B1F1732255CFD81FD08164780F02A9288F6998F913A7D1");
+            n_le.reverse();
+            let mut win_pub_blob = Vec::with_capacity(20 + 128);
+            win_pub_blob.push(PUBLICKEYBLOB as u8);
+            win_pub_blob.push(CUR_BLOB_VERSION);
+            win_pub_blob.extend_from_slice(&0u16.to_le_bytes());
+            win_pub_blob.extend_from_slice(&CALG_RSA_SIGN.to_le_bytes());
+            win_pub_blob.extend_from_slice(b"RSA1");
+            win_pub_blob.extend_from_slice(&1024u32.to_le_bytes());
+            win_pub_blob.extend_from_slice(&65537u32.to_le_bytes());
+            win_pub_blob.extend_from_slice(&n_le);
+
+            let mut sig_le = hex("c454e628bf702ee02de25cee7d12c50a459b587bbd50e52246fdb5ad8d4c153437fa8283cbf396dd567c1e6d5c741010f08c87d4fbd895b335e1abf882675a6a8089f1d1508583491f858399a1834536a53094208f5d6cb2e0f8a36d51a56b41e6d20a75e84e4e62cfb5020a3b41532997b7abc208275677c31e5fc3aadac2b9");
+            sig_le.reverse();
+
+            let mut h_win_pub = 0usize;
+            assert_eq!(CryptImportKey(hprov2, win_pub_blob.as_ptr(), win_pub_blob.len() as u32, 0, 0, &mut h_win_pub), TRUE);
+            let mut h_win_hash = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_SHA_256, 0, 0, &mut h_win_hash), TRUE);
+            assert_eq!(CryptHashData(h_win_hash, b"aw2 license test".as_ptr(), 16, 0), TRUE);
+            assert_eq!(CryptVerifySignatureW(h_win_hash, sig_le.as_ptr(), sig_le.len() as u32, h_win_pub, std::ptr::null(), 0), TRUE);
+
+            assert_eq!(CryptDestroyHash(h_win_hash), TRUE);
+            assert_eq!(CryptDestroyKey(h_win_pub), TRUE);
+            assert_eq!(CryptDestroyKey(h_aes_unwrapped), TRUE);
+            assert_eq!(CryptDestroyKey(h_aes), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_pub), TRUE);
+            assert_eq!(CryptDestroyHash(h_hash), TRUE);
+            assert_eq!(CryptDestroyKey(h_sign), TRUE);
+            assert_eq!(CryptDestroyKey(h_keyx), TRUE);
+            assert_eq!(CryptReleaseContext(hprov2, 0), TRUE);
+            assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
+            assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET), TRUE);
         }
     }
 }
