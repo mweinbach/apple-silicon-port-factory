@@ -14,17 +14,15 @@ Related docs: [End Goal](END_GOAL.md) · [What's Needed](WHATS_NEEDED.md) ·
 
 <!-- opsdb:catalog -->
 
-- x86-64 operations — 54 families (1 FAST_INTERP, 5 GENERIC_INTERP, 47 JIT_ARM64, 1 TRAP_BOUNDARY), 1017 distinct mnemonics, 4979 cataloged vectors.
+- x86-64 operations — 54 families (1 FAST_INTERP, 6 GENERIC_INTERP, 46 JIT_ARM64, 1 TRAP_BOUNDARY), 1017 distinct mnemonics, 4979 cataloged vectors.
 - Win32 — 4333 exports across 90 DLLs (4239 real, 45 partial, 30 stub, 19 failing).
 - Stub inventory — 153 sites across 24 DLLs.
-- A64 emitter — 1100 test words checked against 4743 encoding forms.
+- A64 emitter — 1104 test words checked against 4743 encoding forms.
 
 <!-- /opsdb:catalog -->
 
 `cargo opsdb -- doctor` verifies these counts. The tiers and vector counts are catalog
-metadata. For example, the AVX2 gather row still says `JIT_ARM64`, but its eight gather
-mnemonics have no lowering or generic handler. Its source link points to the interpreter's
-unimplemented-instruction path. Win32 `real` means the source scanner found no stub marker
+metadata. Win32 `real` means the source scanner found no stub marker
 in the implementation. Individual API behavior still needs a guest test.
 
 ### Diagnostics delivered in #11 and #12

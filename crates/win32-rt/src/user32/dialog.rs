@@ -5,7 +5,6 @@
 //! `GetDlgItemInt`, `SendDlgItemMessage*`, `IsDialogMessage*`,
 //! `CheckDlgButton`, `IsDlgButtonChecked`, `GetNextDlgTabItem`).
 
-use super::class::{self, ClassDesc, ClassName};
 use super::defproc::DefWindowProcW;
 use super::input;
 use super::message::{self, send_message, DispatchMessageA, DispatchMessageW, GetMessageW, PostQuitMessage, SendMessageA, SendMessageW, TranslateMessage};
@@ -13,7 +12,7 @@ use super::window::{self, CreateWindowExW, DestroyWindow, EnableWindow, GetWindo
 use super::*;
 use crate::types::*;
 use std::collections::HashMap;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 pub const DWLP_MSGRESULT: i32 = 0;
 pub const DWLP_DLGPROC: i32 = 8;
@@ -30,16 +29,7 @@ const DS_SETFONT: u32 = 0x0000_0040;
 const DS_SHELLFONT: u32 = DS_SETFONT | DS_FIXEDSYS;
 
 const BS_TYPEMASK: u32 = 0x0000_000F;
-const BS_PUSHBUTTON: u32 = 0x0000_0000;
 const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
-const BS_RADIOBUTTON: u32 = 0x0000_0004;
-const BS_GROUPBOX: u32 = 0x0000_0007;
-const BS_USERBUTTON: u32 = 0x0000_0008;
-const BS_AUTORADIOBUTTON: u32 = 0x0000_0009;
-const BS_SPLITBUTTON: u32 = 0x0000_000C;
-const BS_DEFSPLITBUTTON: u32 = 0x0000_000D;
-const BS_COMMANDLINK: u32 = 0x0000_000E;
-const BS_DEFCOMMANDLINK: u32 = 0x0000_000F;
 
 const BN_CLICKED: usize = 0;
 const IDOK: i32 = 1;
@@ -49,16 +39,11 @@ const DM_GETDEFID: u32 = wm::USER;
 const DM_SETDEFID: u32 = wm::USER + 1;
 const DC_HASDEFID: usize = 0x534B;
 
-const DLGC_WANTARROWS: isize = 0x0001;
 const DLGC_WANTTAB: isize = 0x0002;
 const DLGC_WANTALLKEYS: isize = 0x0004;
 const DLGC_WANTMESSAGE: isize = 0x0004;
 const DLGC_DEFPUSHBUTTON: isize = 0x0010;
 const DLGC_UNDEFPUSHBUTTON: isize = 0x0020;
-const DLGC_RADIOBUTTON: isize = 0x0040;
-const DLGC_WANTCHARS: isize = 0x0080;
-const DLGC_STATIC: isize = 0x0100;
-const DLGC_BUTTON: isize = 0x2000;
 
 const VK_TAB: usize = 0x09;
 const VK_RETURN: usize = 0x0D;
@@ -79,103 +64,9 @@ fn dialogs() -> &'static Mutex<HashMap<usize, DialogState>> {
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Per-button check state (`BST_UNCHECKED = 0`, `BST_CHECKED = 1`, `BST_INDETERMINATE = 2`).
-fn button_checks() -> &'static Mutex<HashMap<usize, u32>> {
-    static B: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
-    B.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Clean up dialog and control metadata when an HWND is freed.
+/// Clean up dialog metadata when an HWND is freed.
 pub(crate) fn forget_dialog(hwnd: usize) {
     dialogs().lock().unwrap_or_else(|e| e.into_inner()).remove(&hwnd);
-    button_checks().lock().unwrap_or_else(|e| e.into_inner()).remove(&hwnd);
-}
-
-// ---------------------------------------------------------------------------
-// Built-in system dialog & control window classes
-// ---------------------------------------------------------------------------
-
-pub(crate) unsafe extern "win64" fn button_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let h = hwnd as usize;
-    match msg {
-        wm::BM_GETCHECK => button_checks().lock().unwrap_or_else(|e| e.into_inner()).get(&h).copied().unwrap_or(0) as LRESULT,
-        wm::BM_SETCHECK => {
-            button_checks().lock().unwrap_or_else(|e| e.into_inner()).insert(h, wparam as u32);
-            0
-        }
-        wm::BM_CLICK => {
-            if let Some(w) = window::get(h) {
-                let (parent, id) = {
-                    let d = w.data();
-                    (d.parent, d.id as u16)
-                };
-                if parent != 0 {
-                    send_message(parent, wm::COMMAND, ((BN_CLICKED & 0xFFFF) << 16) | (id as usize), h as LPARAM);
-                }
-            }
-            0
-        }
-        wm::GETDLGCODE => {
-            let btn_type = window::get(h).map(|w| w.data().style & BS_TYPEMASK).unwrap_or(BS_PUSHBUTTON);
-            match btn_type {
-                BS_DEFPUSHBUTTON | BS_DEFSPLITBUTTON | BS_DEFCOMMANDLINK => {
-                    DLGC_BUTTON | DLGC_DEFPUSHBUTTON
-                }
-                BS_PUSHBUTTON | BS_USERBUTTON | BS_SPLITBUTTON | BS_COMMANDLINK => {
-                    DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON
-                }
-                BS_RADIOBUTTON | BS_AUTORADIOBUTTON => DLGC_BUTTON | DLGC_RADIOBUTTON,
-                BS_GROUPBOX => DLGC_STATIC,
-                _ => DLGC_BUTTON,
-            }
-        }
-        wm::NCDESTROY => {
-            button_checks().lock().unwrap_or_else(|e| e.into_inner()).remove(&h);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-pub(crate) unsafe extern "win64" fn edit_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        wm::GETDLGCODE => DLGC_WANTARROWS | DLGC_WANTCHARS,
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-pub(crate) unsafe extern "win64" fn default_control_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-fn ensure_dialog_classes() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let reg = |name: &str, wndproc: usize, wnd_extra: i32| {
-            if class::find(&ClassName::Name(name.to_string())).is_none() {
-                let _ = class::register(ClassDesc {
-                    name: name.to_string(),
-                    style: 0,
-                    wndproc,
-                    cls_extra: 0,
-                    wnd_extra,
-                    instance: 0,
-                    icon: 0,
-                    cursor: 0,
-                    background: 0,
-                    unicode: true,
-                });
-            }
-        };
-
-        reg("#32770", super::WNDPROC_HANDLE_DEF_DLG_W, DLGWINDOWEXTRA);
-        reg("Button", super::WNDPROC_HANDLE_BUTTON, 0);
-        reg("Edit", super::WNDPROC_HANDLE_EDIT, 0);
-        reg("Static", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
-        reg("ListBox", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
-        reg("ScrollBar", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
-        reg("ComboBox", super::WNDPROC_HANDLE_DEFAULT_CTRL, 0);
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +542,6 @@ unsafe fn create_dialog_indirect_internal(
     init_param: LPARAM,
     modal: bool,
 ) -> HWND {
-    ensure_dialog_classes();
-
     let Ok(tmpl) = parse_dialog_template(tmpl_ptr, tmpl_limit) else {
         set_error(e::INVALID_DATA);
         return std::ptr::null_mut();
@@ -1406,6 +1295,10 @@ pub unsafe extern "win64" fn IsDialogMessageA(hdlg: HWND, lp_msg: *mut MSG) -> B
 
 #[cfg(test)]
 mod tests {
+    use super::super::controls::{
+        BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, DLGC_BUTTON, DLGC_RADIOBUTTON,
+        DLGC_STATIC, DLGC_WANTARROWS, DLGC_WANTCHARS,
+    };
     use super::*;
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 

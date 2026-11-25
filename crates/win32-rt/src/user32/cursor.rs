@@ -130,6 +130,43 @@ fn icons() -> &'static Mutex<HashMap<usize, IconData>> {
     I.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Decoded icon representation handed to the native UI backend for `STATIC` (`SS_ICON`) controls.
+#[derive(Clone, Debug)]
+pub enum IconPayload {
+    /// Standard Windows system icon ID (`IDI_APPLICATION = 32512`..=`IDI_SHIELD = 32518`).
+    Stock(u16),
+    /// Raw PNG bytes from a Vista+ icon resource.
+    Png(Vec<u8>),
+    /// Decoded 32bpp top-down BGRA pixels (`width * height * 4`).
+    Bgra { width: u32, height: u32, pixels: Vec<u8> },
+}
+
+/// Snapshot an `HICON` handle for native rendering (e.g. `SS_ICON` / `STM_SETICON`).
+pub fn icon_payload(hicon: usize) -> Option<IconPayload> {
+    if hicon == 0 {
+        return None;
+    }
+    if hicon >= SYSTEM_ICON_BASE && hicon < SYSTEM_ICON_BASE + 0x8000 {
+        let id = (hicon - SYSTEM_ICON_BASE) as u16;
+        if is_stock_icon_id(id) {
+            return Some(IconPayload::Stock(id));
+        }
+    }
+    let tbl = icons().lock().unwrap_or_else(|e| e.into_inner());
+    let data = tbl.get(&hicon)?;
+    if data.is_png && !data.raw_data.is_empty() {
+        Some(IconPayload::Png(data.raw_data.clone()))
+    } else if data.width > 0 && data.height > 0 && data.bgra_pixels.len() >= (data.width as usize) * (data.height as usize) * 4 {
+        Some(IconPayload::Bgra {
+            width: data.width,
+            height: data.height,
+            pixels: data.bgra_pixels.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 enum IconResId {
     Int(u16),
     Str(String),
