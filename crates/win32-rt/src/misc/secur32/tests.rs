@@ -4179,7 +4179,8 @@ fn sch_credentials_v5_honors_multiple_alpn_scoped_tls_parameters() {
             SEC_E_OK
         );
 
-        let mut run_alpn_handshake = |cli_prot: u32,
+        let run_alpn_handshake = |srv_cred_arg: &mut SecHandle,
+                                  cli_prot: u32,
                                   cli_alpns: &[&[u8]],
                                   srv_alpns: &[&[u8]],
                                   fragment_first: bool|
@@ -4333,7 +4334,7 @@ fn sch_credentials_v5_honors_multiple_alpn_scoped_tls_parameters() {
                     };
                     let mut attr = 0u32;
                     let st = AcceptSecurityContext(
-                        &mut srv_cred as *mut _ as *mut c_void,
+                        srv_cred_arg as *mut _ as *mut c_void,
                         if first_srv { std::ptr::null_mut() } else { &mut s_ctx as *mut _ as *mut c_void },
                         &mut in_desc as *mut _ as *mut c_void,
                         ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM,
@@ -4388,28 +4389,107 @@ fn sch_credentials_v5_honors_multiple_alpn_scoped_tls_parameters() {
         };
 
         // 1. TLS 1.2 client negotiating ALPN "h2" MUST be rejected because entry [1] disables TLS 1.2!
-        let r_h2_tls12 = run_alpn_handshake(SP_PROT_TLS1_2_CLIENT, &[b"h2"], &[b"h2", b"http/1.1"], false);
+        let r_h2_tls12 = run_alpn_handshake(
+            &mut srv_cred,
+            SP_PROT_TLS1_2_CLIENT,
+            &[b"h2"],
+            &[b"h2", b"http/1.1"],
+            false,
+        );
         assert!(
             r_h2_tls12.is_err(),
             "TLS 1.2 client must be rejected on ALPN h2 governed by pTlsParameters[1], got {r_h2_tls12:?}"
         );
 
         // 2. TLS 1.3 client negotiating ALPN "h2" succeeds with TLS 1.3!
-        let r_h2_tls13 = run_alpn_handshake(SP_PROT_TLS1_3_CLIENT, &[b"h2"], &[b"h2", b"http/1.1"], false);
+        let r_h2_tls13 = run_alpn_handshake(
+            &mut srv_cred,
+            SP_PROT_TLS1_3_CLIENT,
+            &[b"h2"],
+            &[b"h2", b"http/1.1"],
+            false,
+        );
         assert_eq!(r_h2_tls13, Ok(SP_PROT_TLS1_3_SERVER));
 
         // 3. TLS 1.2 client negotiating ALPN "http/1.1" matches entry [0] (wildcard) and succeeds!
-        let r_h1_tls12 = run_alpn_handshake(SP_PROT_TLS1_2_CLIENT, &[b"http/1.1"], &[b"h2", b"http/1.1"], false);
+        let r_h1_tls12 = run_alpn_handshake(
+            &mut srv_cred,
+            SP_PROT_TLS1_2_CLIENT,
+            &[b"http/1.1"],
+            &[b"h2", b"http/1.1"],
+            false,
+        );
         assert_eq!(r_h1_tls12, Ok(SP_PROT_TLS1_2_SERVER));
 
         // 4. Fragmented ClientHello on call 1 conservatively enforces entry [1] and still rejects TLS 1.2!
-        let r_frag_tls12 = run_alpn_handshake(SP_PROT_TLS1_2_CLIENT, &[b"h2"], &[b"h2", b"http/1.1"], true);
+        let r_frag_tls12 = run_alpn_handshake(
+            &mut srv_cred,
+            SP_PROT_TLS1_2_CLIENT,
+            &[b"h2"],
+            &[b"h2", b"http/1.1"],
+            true,
+        );
         assert!(
             r_frag_tls12.is_err(),
             "fragmented ClientHello must not bypass pTlsParameters[1] TLS 1.2 disable, got {r_frag_tls12:?}"
         );
 
         FreeCredentialsHandle(&mut srv_cred as *mut _ as *mut c_void);
+
+        // 5. Unconditional (cAlpnIds == 0) restriction disabling TLS 1.2 MUST still apply when
+        //    an ALPN-specific ("h2") entry has grbitDisabledProtocols = 0 (must never re-enable TLS 1.2).
+        let mut tls_params_global = [0u8; 0x28 * 2];
+        // Entry 0 @ +0x00: cAlpnIds = 0, disables TLS 1.2 server unconditionally.
+        std::ptr::write_unaligned(
+            tls_params_global.as_mut_ptr().add(0x10) as *mut u32,
+            SP_PROT_TLS1_2_SERVER,
+        );
+        // Entry 1 @ +0x28: ALPN "h2", grbitDisabledProtocols = 0.
+        std::ptr::write_unaligned(tls_params_global.as_mut_ptr().add(0x28) as *mut u32, 1u32);
+        std::ptr::write_unaligned(
+            tls_params_global.as_mut_ptr().add(0x28 + 0x08) as *mut *const u8,
+            h2_ustr.as_ptr(),
+        );
+        std::ptr::write_unaligned(
+            srv_v5.as_mut_ptr().add(0x40) as *mut *const u8,
+            tls_params_global.as_ptr(),
+        );
+        let mut srv_cred_global = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_v5.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut srv_cred_global as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        let r_global_h2_tls12 = run_alpn_handshake(
+            &mut srv_cred_global,
+            SP_PROT_TLS1_2_CLIENT,
+            &[b"h2"],
+            &[b"h2"],
+            false,
+        );
+        assert!(
+            r_global_h2_tls12.is_err(),
+            "unconditional cAlpnIds==0 TLS 1.2 disable must still reject TLS 1.2 on matched ALPN h2, got {r_global_h2_tls12:?}"
+        );
+        let r_global_h2_tls13 = run_alpn_handshake(
+            &mut srv_cred_global,
+            SP_PROT_TLS1_3_CLIENT,
+            &[b"h2"],
+            &[b"h2"],
+            false,
+        );
+        assert_eq!(r_global_h2_tls13, Ok(SP_PROT_TLS1_3_SERVER));
+
+        FreeCredentialsHandle(&mut srv_cred_global as *mut _ as *mut c_void);
         crypt32::CertFreeCertificateContext(server_cert);
     }
 }

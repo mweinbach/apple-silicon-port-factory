@@ -505,41 +505,30 @@ fn resolve_effective_protocols(
 
     let mut disabled = 0u32;
     let mut matched_any = false;
-    if active_alpn.is_empty() {
+    // Per Windows TLS_PARAMETERS contract, zero-ALPN (`cAlpnIds == 0`) restrictions apply
+    // unconditionally regardless of the negotiated application protocol, so always union them
+    // with any matching ALPN-specific restrictions.
+    for r in &cred.tls_param_rules {
+        if r.alpn_ids.is_empty() {
+            disabled |= r.disabled_protocols;
+            matched_any = true;
+        }
+    }
+    for proto in active_alpn {
         for r in &cred.tls_param_rules {
-            if r.alpn_ids.is_empty() {
+            if !r.alpn_ids.is_empty() && r.alpn_ids.iter().any(|id| id == proto) {
                 disabled |= r.disabled_protocols;
                 matched_any = true;
-            }
-        }
-    } else {
-        let mut uncovered = false;
-        for proto in active_alpn {
-            let mut proto_matched = false;
-            for r in &cred.tls_param_rules {
-                if !r.alpn_ids.is_empty() && r.alpn_ids.iter().any(|id| id == proto) {
-                    disabled |= r.disabled_protocols;
-                    proto_matched = true;
-                    matched_any = true;
-                }
-            }
-            if !proto_matched {
-                uncovered = true;
-            }
-        }
-        if uncovered {
-            for r in &cred.tls_param_rules {
-                if r.alpn_ids.is_empty() {
-                    disabled |= r.disabled_protocols;
-                    matched_any = true;
-                }
             }
         }
     }
     if !matched_any {
         return (base12, base13);
     }
-    ((disabled & bit12) == 0, (disabled & bit13) == 0)
+    (
+        base12 && (disabled & bit12) == 0,
+        base13 && (disabled & bit13) == 0,
+    )
 }
 
 /// Parse offered ALPN protocol IDs from a complete TLS ClientHello record.
@@ -1543,8 +1532,8 @@ pub(super) unsafe fn acquire_credentials_impl(
                         server_enable_tls12 = any_server_12;
                         server_enable_tls13 = any_server_13;
                     }
-                    if (want_outbound && !any_client_12 && !any_client_13)
-                        || (want_inbound && !any_server_12 && !any_server_13)
+                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
                     {
                         return SEC_E_ALGORITHM_MISMATCH;
                     }
