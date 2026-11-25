@@ -66,7 +66,10 @@ const WTD_REVOCATION_CHECK_NONE: u32 = 0x0000_0010;
 const WTD_REVOCATION_CHECK_END_CERT: u32 = 0x0000_0020;
 const WTD_REVOCATION_CHECK_CHAIN: u32 = 0x0000_0040;
 const WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT: u32 = 0x0000_0080;
+const WTD_LIFETIME_SIGNING_FLAG: u32 = 0x0000_0800;
 const WTD_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_1000;
+
+const CERT_CHAIN_POLICY_AUTHENTICODE_TS: usize = 3;
 
 // CertGetCertificateChain dwFlags mapped from WINTRUST_DATA revocation fields
 const CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
@@ -88,6 +91,15 @@ const OID_SPC_INDIRECT_DATA: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37,
 const OID_CTL: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
 const OID_CONTENT_TYPE: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03];
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+const OID_SIGNING_TIME: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05];
+const OID_COUNTER_SIGN: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x06];
+const OID_RFC3161_COUNTER_SIGN: &[u8] =
+    &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x03, 0x03, 0x01];
+const OID_TST_INFO: &[u8] =
+    &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04];
+const OID_TIME_STAMPING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+const OID_KP_LIFETIME_SIGNING: &[u8] =
+    &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x03, 0x0D];
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
 
 const OID_MD5: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05];
@@ -274,6 +286,45 @@ fn parse_asn1_time_filetime(elem: DerElem<'_>) -> u64 {
     }
 }
 
+/// Strictly parse an ASN.1 UTC `UTCTime` (`0x17`) or `GeneralizedTime` (`0x18`) ending in `Z`
+/// into a Windows `FILETIME`, rejecting malformed/non-digit timestamps.
+fn parse_strict_asn1_utc_filetime(elem: DerElem<'_>) -> Option<u64> {
+    let s = std::str::from_utf8(elem.val).ok()?;
+    let body = s.strip_suffix('Z')?;
+    let (year_str, rest) = match elem.tag {
+        0x17 if body.len() == 12 => (&body[0..2], &body[2..]),
+        0x18 if body.len() >= 14 => {
+            let (base, frac) = body.split_at(14);
+            if !frac.is_empty() {
+                let digits = frac.strip_prefix('.')?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+            }
+            (&base[0..4], &base[4..])
+        }
+        _ => return None,
+    };
+    if !year_str.bytes().all(|b| b.is_ascii_digit()) || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let month: u32 = rest[0..2].parse().ok()?;
+    let day: u32 = rest[2..4].parse().ok()?;
+    let hour: u32 = rest[4..6].parse().ok()?;
+    let min: u32 = rest[6..8].parse().ok()?;
+    let sec: u32 = rest[8..10].parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
+    let ft = parse_asn1_time_filetime(elem);
+    (ft > 0).then_some(ft)
+}
+
 struct ParsedCert<'a> {
     version: u32,
     raw_der: &'a [u8],
@@ -419,10 +470,208 @@ struct VerifiedSigner {
     encrypted_hash: Vec<u8>,
 }
 
+struct VerifiedTimestamp {
+    /// Authenticated signing timestamp as Windows FILETIME (100ns ticks since 1601-01-01).
+    signing_filetime: u64,
+    /// DER bytes of the TSA leaf certificate that signed the timestamp.
+    tsa_cert_der: Vec<u8>,
+    /// Candidate intermediate/CA certificates embedded with the timestamp token.
+    tsa_pool_der: Vec<Vec<u8>>,
+}
+
 struct VerifiedAuthenticode {
     certs: Vec<VerifiedCert>,
     all_certs_der: Vec<Vec<u8>>,
     signer: VerifiedSigner,
+    timestamp: Option<VerifiedTimestamp>,
+}
+
+/// Inspect `SignerInfo.unauthenticatedAttributes` (`[1] IMPLICIT`, tag `0xA1`) for either an
+/// RFC 3161 Authenticode timestamp (`1.3.6.1.4.1.311.3.3.1`) or a legacy PKCS#9 countersignature
+/// (`1.2.840.113549.1.9.6`). Verifies the cryptographic signature and digest binding to
+/// `outer_enc_digest`; callers MUST still validate the returned TSA certificate chain against
+/// `CERT_CHAIN_POLICY_AUTHENTICODE_TS` before trusting `signing_filetime`.
+fn extract_verified_timestamp(
+    unauth_attrs: Option<DerElem<'_>>,
+    outer_enc_digest: &[u8],
+    outer_certs: &[ParsedCert<'_>],
+) -> Option<VerifiedTimestamp> {
+    let unauth = unauth_attrs?;
+    let attrs = der_children_bounded(unauth.val, MAX_CMS_AUTH_ATTRS)?;
+    for attr in attrs {
+        if attr.tag != 0x30 {
+            continue;
+        }
+        let Some(ak) = der_children_bounded(attr.val, 8) else {
+            continue;
+        };
+        if ak.len() < 2 || ak[0].tag != 0x06 || ak[1].tag != 0x31 {
+            continue;
+        }
+        if ak[0].val == OID_RFC3161_COUNTER_SIGN {
+            let Some(vals) = der_children_bounded(ak[1].val, 4) else {
+                continue;
+            };
+            let Some(ts_ci) = vals.first().filter(|e| e.tag == 0x30) else {
+                continue;
+            };
+            // Verify TSA SignedData without recursing into nested timestamps.
+            let Ok(ts_p7) = verify_standalone_pkcs7_inner(ts_ci.raw, None, false) else {
+                continue;
+            };
+            if ts_p7.encap_content_type_oid.as_slice() != OID_TST_INFO {
+                continue;
+            }
+            let Some((tst_seq, tst_rem)) = parse_der_elem(&ts_p7.encap_content_der) else {
+                continue;
+            };
+            if !tst_rem.is_empty() || tst_seq.tag != 0x30 {
+                continue;
+            }
+            let Some(tst_kids) = der_children_bounded(tst_seq.val, 16) else {
+                continue;
+            };
+            // RFC 3161 §2.4.2 TSTInfo ::= SEQUENCE { version(1), policy, messageImprint, serialNumber, genTime, ... }
+            if tst_kids.len() < 5
+                || tst_kids[0].tag != 0x02
+                || tst_kids[0].val != [1]
+                || tst_kids[1].tag != 0x06
+                || tst_kids[2].tag != 0x30
+                || tst_kids[3].tag != 0x02
+                || tst_kids[4].tag != 0x18
+            {
+                continue;
+            }
+            let Some(mi_kids) = der_children_bounded(tst_kids[2].val, 4) else {
+                continue;
+            };
+            if mi_kids.len() != 2 || mi_kids[0].tag != 0x30 || mi_kids[1].tag != 0x04 {
+                continue;
+            }
+            let Some(mi_digest) = parse_alg_id_oid(mi_kids[0]).and_then(digest_from_oid) else {
+                continue;
+            };
+            if mi_digest.hash(outer_enc_digest).as_slice() != mi_kids[1].val {
+                continue;
+            }
+            let Some(ft) = parse_strict_asn1_utc_filetime(tst_kids[4]) else {
+                continue;
+            };
+            let Some(tsa_leaf) = ts_p7.verified.certs.first() else {
+                continue;
+            };
+            return Some(VerifiedTimestamp {
+                signing_filetime: ft,
+                tsa_cert_der: tsa_leaf.raw_der.clone(),
+                tsa_pool_der: ts_p7.all_certs_der,
+            });
+        } else if ak[0].val == OID_COUNTER_SIGN {
+            let Some(vals) = der_children_bounded(ak[1].val, 4) else {
+                continue;
+            };
+            let Some(cs_si) = vals.first().filter(|e| e.tag == 0x30) else {
+                continue;
+            };
+            let Some(cs_kids) = der_children_bounded(cs_si.val, 16) else {
+                continue;
+            };
+            if cs_kids.len() < 6 || cs_kids[0].tag != 0x02 {
+                continue;
+            }
+            let tsa_idx = if cs_kids[1].tag == 0x30 {
+                let Some(ias) = der_children_bounded(cs_kids[1].val, 4) else {
+                    continue;
+                };
+                if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
+                    continue;
+                }
+                let want_ser = strip_der_int_sign(ias[1].val);
+                outer_certs.iter().position(|c| {
+                    c.issuer_raw == ias[0].raw && strip_der_int_sign(c.serial_val) == want_ser
+                })
+            } else {
+                None
+            };
+            let Some(tsa_idx) = tsa_idx else {
+                continue;
+            };
+            let Some(tsa_pub) = outer_certs[tsa_idx].rsa_pub.as_ref() else {
+                continue;
+            };
+            let Some(cs_digest) = parse_alg_id_oid(cs_kids[2]).and_then(digest_from_oid) else {
+                continue;
+            };
+            if cs_kids[3].tag != 0xA0 || cs_kids[5].tag != 0x04 {
+                continue;
+            }
+            let aa = cs_kids[3];
+            let cs_enc_digest = cs_kids[5];
+            let Some(aa_list) = der_children_bounded(aa.val, MAX_CMS_AUTH_ATTRS) else {
+                continue;
+            };
+            let expected_md = cs_digest.hash(outer_enc_digest);
+            let mut md_count = 0usize;
+            let mut time_count = 0usize;
+            let mut signing_ft = 0u64;
+            let mut bad_attr = false;
+            for cs_attr in aa_list {
+                if cs_attr.tag != 0x30 {
+                    continue;
+                }
+                let Some(cak) = der_children_bounded(cs_attr.val, 8) else {
+                    bad_attr = true;
+                    break;
+                };
+                if cak.len() >= 2 && cak[0].tag == 0x06 && cak[1].tag == 0x31 {
+                    if cak[0].val == OID_MESSAGE_DIGEST {
+                        let Some(cvals) = der_children_bounded(cak[1].val, 8) else {
+                            bad_attr = true;
+                            break;
+                        };
+                        if cvals.len() != 1
+                            || cvals[0].tag != 0x04
+                            || cvals[0].val != expected_md.as_slice()
+                        {
+                            bad_attr = true;
+                            break;
+                        }
+                        md_count += 1;
+                    } else if cak[0].val == OID_SIGNING_TIME {
+                        let Some(cvals) = der_children_bounded(cak[1].val, 8) else {
+                            bad_attr = true;
+                            break;
+                        };
+                        let Some(ft) = cvals
+                            .first()
+                            .filter(|_| cvals.len() == 1)
+                            .and_then(|e| parse_strict_asn1_utc_filetime(*e))
+                        else {
+                            bad_attr = true;
+                            break;
+                        };
+                        signing_ft = ft;
+                        time_count += 1;
+                    }
+                }
+            }
+            if bad_attr || md_count != 1 || time_count != 1 || signing_ft == 0 {
+                continue;
+            }
+            let mut set_der = Vec::with_capacity(aa.raw.len());
+            set_der.push(0x31);
+            set_der.extend_from_slice(&aa.raw[1..]);
+            let attr_hash = cs_digest.hash(&set_der);
+            if !tsa_pub.verify_pkcs1(Some(cs_digest), &attr_hash, cs_enc_digest.val) {
+                continue;
+            }
+            return Some(VerifiedTimestamp {
+                signing_filetime: signing_ft,
+                tsa_cert_der: outer_certs[tsa_idx].raw_der.to_vec(),
+                tsa_pool_der: outer_certs.iter().map(|c| c.raw_der.to_vec()).collect(),
+            });
+        }
+    }
+    None
 }
 
 /// Extract PE Authenticode slices + embedded PKCS#7 blob and cryptographically verify:
@@ -547,7 +796,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
     }
 
     // Step 2 & 3: Verify at least one SignerInfo against its matching certificate.
-    let mut verified_signer: Option<(usize, VerifiedSigner)> = None;
+    let mut verified_signer: Option<(usize, VerifiedSigner, Option<VerifiedTimestamp>)> = None;
     for si in si_list {
         if si.tag != 0x30 {
             continue;
@@ -634,6 +883,8 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
             // content types (Authenticode always uses OID_SPC_INDIRECT_DATA).
             return Err(TRUST_E_BAD_DIGEST);
         }
+        let unauth_attrs = kids.get(pos + 2).copied().filter(|e| e.tag == 0xA1);
+        let timestamp = extract_verified_timestamp(unauth_attrs, enc_digest.val, &certs);
         verified_signer = Some((
             cert_idx,
             VerifiedSigner {
@@ -641,11 +892,12 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
                 enc_alg_oid_str: decode_oid_str(enc_alg_oid),
                 encrypted_hash: enc_digest.val.to_vec(),
             },
+            timestamp,
         ));
         break;
     }
 
-    let Some((mut cur_idx, signer)) = verified_signer else {
+    let Some((mut cur_idx, signer, timestamp)) = verified_signer else {
         return Err(TRUST_E_BAD_DIGEST);
     };
 
@@ -713,6 +965,7 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         certs: chain,
         all_certs_der,
         signer,
+        timestamp,
     })
 }
 
@@ -1557,6 +1810,14 @@ fn verify_standalone_pkcs7(
     pkcs7_raw: &[u8],
     detached_content: Option<&[u8]>,
 ) -> Result<StandalonePkcs7Result, i32> {
+    verify_standalone_pkcs7_inner(pkcs7_raw, detached_content, true)
+}
+
+fn verify_standalone_pkcs7_inner(
+    pkcs7_raw: &[u8],
+    detached_content: Option<&[u8]>,
+    allow_timestamps: bool,
+) -> Result<StandalonePkcs7Result, i32> {
     let (ci, _) = parse_der_elem(pkcs7_raw).ok_or(TRUST_E_NOSIGNATURE)?;
     if ci.tag != 0x30 {
         return Err(TRUST_E_NOSIGNATURE);
@@ -1638,7 +1899,7 @@ fn verify_standalone_pkcs7(
             .or_insert(idx);
     }
 
-    let mut verified_signer: Option<(usize, VerifiedSigner)> = None;
+    let mut verified_signer: Option<(usize, VerifiedSigner, Option<VerifiedTimestamp>)> = None;
     for si in si_list {
         if si.tag != 0x30 {
             continue;
@@ -1726,6 +1987,12 @@ fn verify_standalone_pkcs7(
                 return Err(TRUST_E_BAD_DIGEST);
             }
         }
+        let unauth_attrs = kids.get(pos + 2).copied().filter(|e| e.tag == 0xA1);
+        let timestamp = if allow_timestamps {
+            extract_verified_timestamp(unauth_attrs, enc_digest.val, &certs)
+        } else {
+            None
+        };
         verified_signer = Some((
             cert_idx,
             VerifiedSigner {
@@ -1733,11 +2000,12 @@ fn verify_standalone_pkcs7(
                 enc_alg_oid_str: decode_oid_str(enc_alg_oid),
                 encrypted_hash: enc_digest.val.to_vec(),
             },
+            timestamp,
         ));
         break;
     }
 
-    let Some((signer_idx, signer)) = verified_signer else {
+    let Some((signer_idx, signer, timestamp)) = verified_signer else {
         return Err(TRUST_E_BAD_DIGEST);
     };
 
@@ -1812,6 +2080,7 @@ fn verify_standalone_pkcs7(
             certs: chain_certs,
             all_certs_der: all_certs_der.clone(),
             signer,
+            timestamp,
         },
         encap_content_type_oid,
         encap_content_der,
@@ -1877,12 +2146,76 @@ struct WtdGenericChainPolicySignerInfo {
     rgp_counter_signer: *const *const WtdGenericChainPolicySignerInfo,
 }
 
+/// Validate a cryptographically verified timestamp's TSA certificate chain against
+/// `CERT_CHAIN_POLICY_AUTHENTICODE_TS` at `ts.signing_filetime`, requiring explicit
+/// `id-kp-timeStamping` (`1.3.6.1.5.5.7.3.8`) EKU on the TSA leaf per RFC 3161 §2.3.
+unsafe fn verify_tsa_timestamp_chain(
+    ts: &VerifiedTimestamp,
+    outer_all_certs_der: &[Vec<u8>],
+    chain_flags: u32,
+    generic_chain: Option<GenericChainPolicy>,
+) -> bool {
+    let has_ts_eku = super::crypt32::cert_eku_oids(&ts.tsa_cert_der)
+        .is_some_and(|oids| oids.iter().any(|o| o.as_slice() == OID_TIME_STAMPING));
+    if !has_ts_eku {
+        return false;
+    }
+    let tsa_ctx = super::crypt32::CertCreateCertificateContext(
+        X509_ASN_ENCODING,
+        ts.tsa_cert_der.as_ptr(),
+        ts.tsa_cert_der.len() as u32,
+    );
+    if tsa_ctx.is_null() {
+        return false;
+    }
+    let tsa_store = super::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+    if !tsa_store.is_null() {
+        for der in ts.tsa_pool_der.iter().chain(outer_all_certs_der.iter()) {
+            let _ = super::crypt32::CertAddEncodedCertificateToStore(
+                tsa_store,
+                X509_ASN_ENCODING,
+                der.as_ptr(),
+                der.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    let tsa_generic = generic_chain.map(|mut gc| {
+        gc.pfn_policy_callback = 0;
+        gc.p_chain_para = std::ptr::null();
+        gc
+    });
+    let stores = [tsa_store];
+    let ts_ft = ts.signing_filetime;
+    let rc = verify_cert_via_chain_policy(
+        tsa_ctx,
+        if tsa_store.is_null() { 0 } else { 1 },
+        if tsa_store.is_null() {
+            std::ptr::null()
+        } else {
+            stores.as_ptr()
+        },
+        &ts_ft as *const u64 as *const c_void,
+        CERT_CHAIN_POLICY_AUTHENTICODE_TS,
+        std::ptr::null(),
+        chain_flags,
+        tsa_generic,
+    );
+    if !tsa_store.is_null() {
+        super::crypt32::CertCloseStore(tsa_store, 0);
+    }
+    super::crypt32::CertFreeCertificateContext(tsa_ctx);
+    rc == ERROR_SUCCESS
+}
+
 unsafe fn verify_pkcs7_signer_chain(
     verified: &VerifiedAuthenticode,
     all_certs_der: &[Vec<u8>],
     policy_oid: usize,
     policy_extra: *const c_void,
     chain_flags: u32,
+    dw_prov_flags: u32,
     generic_chain: Option<GenericChainPolicy>,
 ) -> i32 {
     let Some(leaf) = verified.certs.first() else {
@@ -1909,12 +2242,30 @@ unsafe fn verify_pkcs7_signer_chain(
             );
         }
     }
+    // Per MSDN WINTRUST_DATA: preserve timestamped signatures beyond signing certificate
+    // expiration by evaluating the signer chain at the authenticated TSA signing time, unless
+    // WTD_LIFETIME_SIGNING_FLAG or szOID_KP_LIFETIME_SIGNING restricts validity to the
+    // certificate's lifetime.
+    let lifetime_signing = (dw_prov_flags & WTD_LIFETIME_SIGNING_FLAG) != 0
+        || super::crypt32::cert_eku_oids(&leaf.raw_der)
+            .is_some_and(|oids| oids.iter().any(|o| o.as_slice() == OID_KP_LIFETIME_SIGNING));
+    let verified_ts_ft: Option<u64> = if !lifetime_signing {
+        verified.timestamp.as_ref().and_then(|ts| {
+            verify_tsa_timestamp_chain(ts, all_certs_der, chain_flags, generic_chain)
+                .then_some(ts.signing_filetime)
+        })
+    } else {
+        None
+    };
+    let p_time = verified_ts_ft
+        .as_ref()
+        .map_or(std::ptr::null(), |ft| ft as *const u64 as *const c_void);
     let stores = [extra_store];
     let rc = verify_cert_via_chain_policy(
         leaf_ctx,
         if extra_store.is_null() { 0 } else { 1 },
         if extra_store.is_null() { std::ptr::null() } else { stores.as_ptr() },
-        std::ptr::null(),
+        p_time,
         policy_oid,
         policy_extra,
         chain_flags,
@@ -2245,9 +2596,15 @@ unsafe fn verify_cert_via_chain_policy(
                 f_is_cyclic: 0,
                 p_chain_element: std::ptr::null(),
             };
+            let sft_as_of = if p_time.is_null() {
+                [0u32, 0u32]
+            } else {
+                let ft = std::ptr::read_unaligned(p_time as *const u64);
+                [ft as u32, (ft >> 32) as u32]
+            };
             let prov_signer = CryptProviderSgnr {
                 cb_struct: std::mem::size_of::<CryptProviderSgnr>() as u32,
-                sft_verify_as_of: [0, 0],
+                sft_verify_as_of: sft_as_of,
                 cs_cert_chain: 1,
                 pas_cert_chain: &prov_cert as *const CryptProviderCert,
                 dw_signer_type: 0,
@@ -2547,6 +2904,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                         chain_policy_oid,
                         policy_extra,
                         chain_flags,
+                        dw_prov_flags,
                         generic_chain,
                     );
                     if state_action == WTD_STATEACTION_VERIFY {
@@ -2660,6 +3018,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 chain_policy_oid,
                 policy_extra,
                 chain_flags,
+                dw_prov_flags,
                 generic_chain,
             );
             if state_action == WTD_STATEACTION_VERIFY {
@@ -2697,6 +3056,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                             chain_policy_oid,
                             policy_extra,
                             chain_flags,
+                            dw_prov_flags,
                             generic_chain,
                         );
                         if state_action == WTD_STATEACTION_VERIFY {
@@ -2712,14 +3072,13 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 if obj_slice.len() >= 2 && &obj_slice[..2] == b"MZ" {
                     match verify_pe_authenticode(obj_slice) {
                         Ok(verified) => {
-                            let all_der: Vec<Vec<u8>> =
-                                verified.certs.iter().map(|c| c.raw_der.clone()).collect();
                             let chain_rc = verify_pkcs7_signer_chain(
                                 &verified,
-                                &all_der,
+                                &verified.all_certs_der,
                                 chain_policy_oid,
                                 policy_extra,
                                 chain_flags,
+                                dw_prov_flags,
                                 generic_chain,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
@@ -2739,6 +3098,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 chain_policy_oid,
                                 policy_extra,
                                 chain_flags,
+                                dw_prov_flags,
                                 generic_chain,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
@@ -4821,6 +5181,502 @@ mod tests {
             );
             assert_eq!(cb_ctx.trust_err, 0);
             assert_eq!(cb_ctx.chain_ders, vec![leaf_cert, cross_signed_ca, trusted_root]);
+
+            crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
+            crate::misc::crypt32::CertCloseStore(root_st, 0);
+        }
+    }
+
+    #[test]
+    fn authenticode_honors_verified_timestamps_and_lifetime_signing_flag() {
+        use crate::misc::bcrypt::{Digest, RsaKey};
+
+        fn der_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if val.len() < 0x80 {
+                out.push(val.len() as u8);
+            } else if val.len() <= 0xFF {
+                out.push(0x81);
+                out.push(val.len() as u8);
+            } else {
+                out.push(0x82);
+                out.push((val.len() >> 8) as u8);
+                out.push((val.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(val);
+            out
+        }
+
+        let root_key = RsaKey::generate(2048).expect("gen root");
+        let signer_key = RsaKey::generate(2048).expect("gen signer");
+        let tsa_key = RsaKey::generate(2048).expect("gen tsa");
+        let rogue_tsa_key = RsaKey::generate(2048).expect("gen rogue tsa");
+
+        let der_uint = |bytes: &[u8]| -> Vec<u8> {
+            let trimmed = match bytes.iter().position(|&b| b != 0) {
+                Some(i) => &bytes[i..],
+                None => &[0],
+            };
+            let mut v = Vec::with_capacity(trimmed.len() + 1);
+            if (trimmed[0] & 0x80) != 0 {
+                v.push(0);
+            }
+            v.extend_from_slice(trimmed);
+            der_tlv(0x02, &v)
+        };
+        let mk_spki = |k: &RsaKey| -> Vec<u8> {
+            let mut rsa_pub_body = der_uint(&k.pub_key.n);
+            rsa_pub_body.extend_from_slice(&der_uint(&k.pub_key.e));
+            let rsa_pub_seq = der_tlv(0x30, &rsa_pub_body);
+            let mut bs = vec![0u8];
+            bs.extend_from_slice(&rsa_pub_seq);
+            let mut alg_body = der_tlv(0x06, OID_RSA_ENCRYPTION);
+            alg_body.extend_from_slice(&der_tlv(0x05, &[]));
+            let mut spki_body = der_tlv(0x30, &alg_body);
+            spki_body.extend_from_slice(&der_tlv(0x03, &bs));
+            der_tlv(0x30, &spki_body)
+        };
+        let mk_dn = |cn: &str| -> Vec<u8> {
+            let mut atv = der_tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv.extend_from_slice(&der_tlv(0x0C, cn.as_bytes()));
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &atv)))
+        };
+        let sha256_rsa_alg = {
+            let mut a = der_tlv(0x06, OID_SHA256_WITH_RSA);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let sha256_alg = {
+            let mut a = der_tlv(0x06, OID_SHA256);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let rsa_alg = {
+            let mut a = der_tlv(0x06, OID_RSA_ENCRYPTION);
+            a.extend_from_slice(&der_tlv(0x05, &[]));
+            der_tlv(0x30, &a)
+        };
+        let sign_cert = |serial: u8,
+                         subj: &str,
+                         iss: &str,
+                         not_before: &[u8],
+                         not_after: &[u8],
+                         subj_key: &RsaKey,
+                         iss_key: &RsaKey,
+                         is_ca: bool,
+                         ekus: &[&[u8]]|
+         -> Vec<u8> {
+            let mut val = der_tlv(0x17, not_before);
+            val.extend_from_slice(&der_tlv(0x17, not_after));
+            let mut exts = Vec::new();
+            let mut bc_val = Vec::new();
+            if is_ca {
+                bc_val.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            }
+            let mut bc = der_tlv(0x06, &[0x55, 0x1D, 0x13]);
+            bc.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+            bc.extend_from_slice(&der_tlv(0x04, &der_tlv(0x30, &bc_val)));
+            exts.extend_from_slice(&der_tlv(0x30, &bc));
+            if is_ca {
+                let mut ku = der_tlv(0x06, &[0x55, 0x1D, 0x0F]);
+                ku.extend_from_slice(&der_tlv(0x01, &[0xFF]));
+                ku.extend_from_slice(&der_tlv(0x04, &der_tlv(0x03, &[0x02, 0x04])));
+                exts.extend_from_slice(&der_tlv(0x30, &ku));
+            }
+            if !ekus.is_empty() {
+                let mut seq = Vec::new();
+                for o in ekus {
+                    seq.extend_from_slice(&der_tlv(0x06, o));
+                }
+                let mut eku = der_tlv(0x06, &[0x55, 0x1D, 0x25]);
+                eku.extend_from_slice(&der_tlv(0x04, &der_tlv(0x30, &seq)));
+                exts.extend_from_slice(&der_tlv(0x30, &eku));
+            }
+            let mut tbs_body = der_tlv(0xA0, &der_tlv(0x02, &[0x02]));
+            tbs_body.extend_from_slice(&der_tlv(0x02, &[serial]));
+            tbs_body.extend_from_slice(&sha256_rsa_alg);
+            tbs_body.extend_from_slice(&mk_dn(iss));
+            tbs_body.extend_from_slice(&der_tlv(0x30, &val));
+            tbs_body.extend_from_slice(&mk_dn(subj));
+            tbs_body.extend_from_slice(&mk_spki(subj_key));
+            tbs_body.extend_from_slice(&der_tlv(0xA3, &der_tlv(0x30, &exts)));
+            let tbs = der_tlv(0x30, &tbs_body);
+            let tbs_hash = Digest::Sha256.hash(&tbs);
+            let sig = iss_key.sign_pkcs1(Some(Digest::Sha256), &tbs_hash).expect("sign cert");
+            let mut sig_bits = vec![0u8];
+            sig_bits.extend_from_slice(&sig);
+            let mut body = tbs;
+            body.extend_from_slice(&sha256_rsa_alg);
+            body.extend_from_slice(&der_tlv(0x03, &sig_bits));
+            der_tlv(0x30, &body)
+        };
+
+        let oid_code_signing: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+        let trusted_root = sign_cert(
+            1,
+            "TsTestRoot",
+            "TsTestRoot",
+            b"200101000000Z",
+            b"350101000000Z",
+            &root_key,
+            &root_key,
+            true,
+            &[],
+        );
+        // Expired signer cert (valid 2020..2022, expired now).
+        let expired_signer = sign_cert(
+            2,
+            "ExpiredCodeSigner",
+            "TsTestRoot",
+            b"200101000000Z",
+            b"220101000000Z",
+            &signer_key,
+            &root_key,
+            false,
+            &[oid_code_signing],
+        );
+        // Trusted TSA cert with explicit id-kp-timeStamping EKU (valid 2020..2035).
+        let trusted_tsa = sign_cert(
+            3,
+            "TrustedTSA",
+            "TsTestRoot",
+            b"200101000000Z",
+            b"350101000000Z",
+            &tsa_key,
+            &root_key,
+            false,
+            &[OID_TIME_STAMPING],
+        );
+        // Untrusted self-signed rogue TSA.
+        let rogue_tsa = sign_cert(
+            4,
+            "RogueTSA",
+            "RogueTSA",
+            b"200101000000Z",
+            b"350101000000Z",
+            &rogue_tsa_key,
+            &rogue_tsa_key,
+            false,
+            &[OID_TIME_STAMPING],
+        );
+        // Trusted cert WITHOUT id-kp-timeStamping EKU (must not be accepted as a TSA).
+        let non_tsa_cert = sign_cert(
+            5,
+            "NotATSA",
+            "TsTestRoot",
+            b"200101000000Z",
+            b"350101000000Z",
+            &tsa_key,
+            &root_key,
+            false,
+            &[oid_code_signing],
+        );
+
+        // Build a minimal unsigned PE32+ buffer and compute its Authenticode SHA-256 digest.
+        let mut base_pe = vec![0u8; 0x200];
+        base_pe[0..2].copy_from_slice(b"MZ");
+        base_pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        base_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        base_pe[0x80 + 20..0x80 + 22].copy_from_slice(&0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+        base_pe[0x80 + 24..0x80 + 26].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        base_pe[0x80 + 24 + 108..0x80 + 24 + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+        let pe_digest = compute_pe_authenticode_digest(&base_pe, Digest::Sha256).expect("pe digest");
+
+        // Build SpcIndirectDataContent { data: SEQUENCE { OID, NULL }, messageDigest: DigestInfo { sha256, pe_digest } }
+        let spc_data = der_tlv(0x30, &[der_tlv(0x06, &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x0F]), der_tlv(0x05, &[])].concat());
+        let spc_digest_info = der_tlv(0x30, &[sha256_alg.clone(), der_tlv(0x04, &pe_digest)].concat());
+        let spc_inner = [spc_data, spc_digest_info].concat();
+        let spc_seq = der_tlv(0x30, &spc_inner);
+        let spc_hash = Digest::Sha256.hash(&spc_inner);
+
+        let attr_ct = der_tlv(
+            0x30,
+            &[der_tlv(0x06, OID_CONTENT_TYPE), der_tlv(0x31, &der_tlv(0x06, OID_SPC_INDIRECT_DATA))].concat(),
+        );
+        let attr_md = der_tlv(
+            0x30,
+            &[der_tlv(0x06, OID_MESSAGE_DIGEST), der_tlv(0x31, &der_tlv(0x04, &spc_hash))].concat(),
+        );
+        let aa_inner = [attr_ct, attr_md].concat();
+        let aa_set = der_tlv(0x31, &aa_inner);
+        let aa_a0 = der_tlv(0xA0, &aa_inner);
+        let outer_sig = signer_key
+            .sign_pkcs1(Some(Digest::Sha256), &Digest::Sha256.hash(&aa_set))
+            .expect("sign outer");
+
+        let build_rfc3161_unauth = |ts_cert: &[u8], ts_issuer_cn: &str, ts_serial: u8, ts_key: &RsaKey, imprint_input: &[u8]| -> Vec<u8> {
+            let imprint_hash = Digest::Sha256.hash(imprint_input);
+            let msg_imprint = der_tlv(0x30, &[sha256_alg.clone(), der_tlv(0x04, &imprint_hash)].concat());
+            let tst_info = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    der_tlv(0x06, &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x03, 0x01]),
+                    msg_imprint,
+                    der_tlv(0x02, &[0x42]),
+                    der_tlv(0x18, b"20210601120000Z"),
+                ]
+                .concat(),
+            );
+            let tst_hash = Digest::Sha256.hash(&tst_info);
+            let ts_ct = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_CONTENT_TYPE), der_tlv(0x31, &der_tlv(0x06, OID_TST_INFO))].concat(),
+            );
+            let ts_md = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_MESSAGE_DIGEST), der_tlv(0x31, &der_tlv(0x04, &tst_hash))].concat(),
+            );
+            let ts_aa_inner = [ts_ct, ts_md].concat();
+            let ts_sig = ts_key
+                .sign_pkcs1(Some(Digest::Sha256), &Digest::Sha256.hash(&der_tlv(0x31, &ts_aa_inner)))
+                .expect("sign rfc3161");
+            let ts_ias = der_tlv(0x30, &[mk_dn(ts_issuer_cn), der_tlv(0x02, &[ts_serial])].concat());
+            let ts_si = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    ts_ias,
+                    sha256_alg.clone(),
+                    der_tlv(0xA0, &ts_aa_inner),
+                    rsa_alg.clone(),
+                    der_tlv(0x04, &ts_sig),
+                ]
+                .concat(),
+            );
+            let ts_eci = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_TST_INFO), der_tlv(0xA0, &der_tlv(0x04, &tst_info))].concat(),
+            );
+            let ts_sd = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[3]),
+                    der_tlv(0x31, &sha256_alg),
+                    ts_eci,
+                    der_tlv(0xA0, ts_cert),
+                    der_tlv(0x31, &ts_si),
+                ]
+                .concat(),
+            );
+            let ts_ci = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_SIGNED_DATA), der_tlv(0xA0, &ts_sd)].concat(),
+            );
+            der_tlv(
+                0xA1,
+                &der_tlv(0x30, &[der_tlv(0x06, OID_RFC3161_COUNTER_SIGN), der_tlv(0x31, &ts_ci)].concat()),
+            )
+        };
+
+        let build_legacy_countersign_unauth = |ts_issuer_cn: &str, ts_serial: u8, ts_key: &RsaKey| -> Vec<u8> {
+            let cs_md = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x06, OID_MESSAGE_DIGEST),
+                    der_tlv(0x31, &der_tlv(0x04, &Digest::Sha256.hash(&outer_sig))),
+                ]
+                .concat(),
+            );
+            let cs_time = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_SIGNING_TIME), der_tlv(0x31, &der_tlv(0x17, b"210601120000Z"))].concat(),
+            );
+            let cs_aa_inner = [cs_md, cs_time].concat();
+            let cs_sig = ts_key
+                .sign_pkcs1(Some(Digest::Sha256), &Digest::Sha256.hash(&der_tlv(0x31, &cs_aa_inner)))
+                .expect("sign countersign");
+            let cs_ias = der_tlv(0x30, &[mk_dn(ts_issuer_cn), der_tlv(0x02, &[ts_serial])].concat());
+            let cs_si = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    cs_ias,
+                    sha256_alg.clone(),
+                    der_tlv(0xA0, &cs_aa_inner),
+                    rsa_alg.clone(),
+                    der_tlv(0x04, &cs_sig),
+                ]
+                .concat(),
+            );
+            der_tlv(
+                0xA1,
+                &der_tlv(0x30, &[der_tlv(0x06, OID_COUNTER_SIGN), der_tlv(0x31, &cs_si)].concat()),
+            )
+        };
+
+        let build_signed_pe = |extra_certs: &[&[u8]], unauth: Option<&[u8]>| -> Vec<u8> {
+            let ias = der_tlv(0x30, &[mk_dn("TsTestRoot"), der_tlv(0x02, &[2])].concat());
+            let mut si_body = [
+                der_tlv(0x02, &[1]),
+                ias,
+                sha256_alg.clone(),
+                aa_a0.clone(),
+                rsa_alg.clone(),
+                der_tlv(0x04, &outer_sig),
+            ]
+            .concat();
+            if let Some(u) = unauth {
+                si_body.extend_from_slice(u);
+            }
+            let si = der_tlv(0x30, &si_body);
+            let eci = der_tlv(
+                0x30,
+                &[der_tlv(0x06, OID_SPC_INDIRECT_DATA), der_tlv(0xA0, &spc_seq)].concat(),
+            );
+            let mut certs_inner = expired_signer.clone();
+            for ec in extra_certs {
+                certs_inner.extend_from_slice(ec);
+            }
+            let sd = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[1]),
+                    der_tlv(0x31, &sha256_alg),
+                    eci,
+                    der_tlv(0xA0, &certs_inner),
+                    der_tlv(0x31, &si),
+                ]
+                .concat(),
+            );
+            let p7 = der_tlv(0x30, &[der_tlv(0x06, OID_SIGNED_DATA), der_tlv(0xA0, &sd)].concat());
+            let mut pe = base_pe.clone();
+            let sec_off = pe.len() as u32;
+            let cert_len = (8 + p7.len() + 7) & !7;
+            // DataDirectory[4] (Security) is at optional_header + 112 + 4*8 = 0x80 + 24 + 144 = 0x128
+            pe[0x128..0x12C].copy_from_slice(&sec_off.to_le_bytes());
+            pe[0x12C..0x130].copy_from_slice(&(cert_len as u32).to_le_bytes());
+            pe.extend_from_slice(&(cert_len as u32).to_le_bytes());
+            pe.extend_from_slice(&0x0200u16.to_le_bytes()); // wRevision
+            pe.extend_from_slice(&WIN_CERT_TYPE_PKCS_SIGNED_DATA.to_le_bytes());
+            pe.extend_from_slice(&p7);
+            while pe.len() < sec_off as usize + cert_len {
+                pe.push(0);
+            }
+            pe
+        };
+
+        unsafe {
+            let root_st = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    root_st,
+                    X509_ASN_ENCODING,
+                    trusted_root.as_ptr(),
+                    trusted_root.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let mut eng_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr() as *mut u32, eng_cfg.len() as u32);
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, root_st);
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng_cfg.as_ptr() as *const c_void,
+                    &mut eng,
+                ),
+                1
+            );
+            let gc_with_engine = Some(GenericChainPolicy {
+                h_chain_engine: eng,
+                p_chain_para: std::ptr::null(),
+                dw_flags: 0,
+                pfn_policy_callback: 0,
+                pv_policy_arg: std::ptr::null_mut(),
+                wintrust_data: std::ptr::null_mut(),
+                action_guid: WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                prov_flags: 0,
+                subject_choice: WTD_CHOICE_FILE,
+            });
+
+            // 1. Expired PE without timestamp -> CERT_E_EXPIRED (0x800B_0101).
+            let pe_no_ts = build_signed_pe(&[], None);
+            let v_no_ts = verify_pe_authenticode(&pe_no_ts).expect("pe crypto ok");
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_no_ts, &v_no_ts.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                0x800B_0101u32 as i32
+            );
+
+            // 2. Expired PE with valid trusted RFC 3161 timestamp -> ERROR_SUCCESS;
+            //    with WTD_LIFETIME_SIGNING_FLAG -> CERT_E_EXPIRED.
+            let rfc3161_unauth = build_rfc3161_unauth(&trusted_tsa, "TsTestRoot", 3, &tsa_key, &outer_sig);
+            let pe_rfc3161 = build_signed_pe(&[], Some(&rfc3161_unauth));
+            let v_rfc3161 = verify_pe_authenticode(&pe_rfc3161).expect("pe rfc3161 crypto ok");
+            assert!(v_rfc3161.timestamp.is_some());
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_rfc3161, &v_rfc3161.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                ERROR_SUCCESS,
+                "valid trusted RFC 3161 timestamp must validate expired PE signer at signing time"
+            );
+            assert_eq!(
+                verify_pkcs7_signer_chain(
+                    &v_rfc3161,
+                    &v_rfc3161.all_certs_der,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    WTD_LIFETIME_SIGNING_FLAG,
+                    gc_with_engine,
+                ),
+                0x800B_0101u32 as i32,
+                "WTD_LIFETIME_SIGNING_FLAG must reject expired signer even when validly timestamped"
+            );
+
+            // 3. Forged/untrusted/mismatched/non-TSA RFC 3161 timestamps must NOT rescue expired signer.
+            let rogue_unauth = build_rfc3161_unauth(&rogue_tsa, "RogueTSA", 4, &rogue_tsa_key, &outer_sig);
+            let pe_rogue = build_signed_pe(&[], Some(&rogue_unauth));
+            let v_rogue = verify_pe_authenticode(&pe_rogue).expect("pe rogue crypto ok");
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_rogue, &v_rogue.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                0x800B_0101u32 as i32,
+                "untrusted TSA timestamp must not rescue expired signer"
+            );
+
+            let wrong_imprint_unauth = build_rfc3161_unauth(&trusted_tsa, "TsTestRoot", 3, &tsa_key, b"other-binary-sig");
+            let pe_wrong_imprint = build_signed_pe(&[], Some(&wrong_imprint_unauth));
+            let v_wrong_imprint = verify_pe_authenticode(&pe_wrong_imprint).expect("pe crypto ok");
+            assert!(v_wrong_imprint.timestamp.is_none());
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_wrong_imprint, &v_wrong_imprint.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                0x800B_0101u32 as i32,
+                "timestamp for different outer signature must be ignored"
+            );
+
+            let non_tsa_unauth = build_rfc3161_unauth(&non_tsa_cert, "TsTestRoot", 5, &tsa_key, &outer_sig);
+            let pe_non_tsa = build_signed_pe(&[], Some(&non_tsa_unauth));
+            let v_non_tsa = verify_pe_authenticode(&pe_non_tsa).expect("pe crypto ok");
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_non_tsa, &v_non_tsa.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                0x800B_0101u32 as i32,
+                "timestamp signed by cert without id-kp-timeStamping EKU must not rescue expired signer"
+            );
+
+            // 4. Legacy PKCS#9 counterSign timestamp -> ERROR_SUCCESS, and rejected under WTD_LIFETIME_SIGNING_FLAG.
+            let legacy_unauth = build_legacy_countersign_unauth("TsTestRoot", 3, &tsa_key);
+            let pe_legacy = build_signed_pe(&[trusted_tsa.as_slice()], Some(&legacy_unauth));
+            let v_legacy = verify_pe_authenticode(&pe_legacy).expect("pe legacy crypto ok");
+            assert!(v_legacy.timestamp.is_some());
+            assert_eq!(
+                verify_pkcs7_signer_chain(&v_legacy, &v_legacy.all_certs_der, 2, std::ptr::null(), 0, 0, gc_with_engine),
+                ERROR_SUCCESS,
+                "valid trusted PKCS#9 countersignature must validate expired PE signer at signing time"
+            );
+            assert_eq!(
+                verify_pkcs7_signer_chain(
+                    &v_legacy,
+                    &v_legacy.all_certs_der,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    WTD_LIFETIME_SIGNING_FLAG,
+                    gc_with_engine,
+                ),
+                0x800B_0101u32 as i32,
+                "WTD_LIFETIME_SIGNING_FLAG must reject expired signer under PKCS#9 countersignature too"
+            );
 
             crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
             crate::misc::crypt32::CertCloseStore(root_st, 0);

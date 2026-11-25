@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use store::ERROR_CALL_NOT_IMPLEMENTED;
 
-pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
+pub(crate) use asn1::{cert_eku_oids, dpapi_protect_bytes, dpapi_unprotect_bytes};
 pub(crate) use chain::{
     check_chain_revocation_error, verify_cert_signed_by_der, verify_peer_chain_error,
 };

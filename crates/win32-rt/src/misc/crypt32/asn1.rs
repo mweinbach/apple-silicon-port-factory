@@ -321,7 +321,7 @@ pub(super) fn parse_eku_der_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 /// Extract EKU OIDs from extension `2.5.29.37`, or `None` if the cert has no EKU extension.
-pub(super) fn cert_eku_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn cert_eku_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
     let parts = parse_cert_der_parts(der)?;
     const OID_EKU: &[u8] = &[0x55, 0x1D, 0x25];
     for (oid, _, val) in &parts.extensions {
