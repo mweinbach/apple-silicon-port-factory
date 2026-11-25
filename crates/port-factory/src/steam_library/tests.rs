@@ -736,3 +736,197 @@ fn writes_steam_browser_html_from_template() {
     assert!(!html.contains("__USER_BANNER__"));
     assert!(!html.contains("__OWNED_ROWS__"));
 }
+
+#[cfg(unix)]
+#[test]
+fn copy_game_payload_produces_bundle_passing_external_symlinks_check() {
+    use crate::bundle_common::{codesign_ad_hoc, copy_game_payload};
+    use std::os::unix::fs::symlink;
+
+    let root = make_temp_dir("copy_game_symlinks_bundle");
+    let outside_dir = root.path().join("outside");
+    let game_src = root.path().join("FixtureGame");
+    fs::create_dir_all(&outside_dir).unwrap();
+    fs::create_dir_all(game_src.join("data")).unwrap();
+    fs::create_dir_all(game_src.join("sub")).unwrap();
+    fs::create_dir_all(game_src.join("dir_a")).unwrap();
+    fs::create_dir_all(game_src.join("dir_b")).unwrap();
+
+    fs::write(outside_dir.join("host_secret.txt"), b"HOST_ONLY").unwrap();
+    fs::write(game_src.join("FixtureGame.exe"), b"MZ").unwrap();
+    fs::write(game_src.join("data/asset.bin"), b"GAME_ASSET").unwrap();
+
+    // (1) Escaping symlinks
+    symlink("../outside/host_secret.txt", game_src.join("escape_rel.txt")).unwrap();
+    symlink(&outside_dir, game_src.join("escape_dir")).unwrap();
+    // (2) Dangling symlink
+    symlink("nonexistent_asset.bin", game_src.join("dangling.bin")).unwrap();
+    // (3) Cycles (self, ancestor, ELOOP, mutual directory)
+    symlink(".", game_src.join("loop_self")).unwrap();
+    symlink("..", game_src.join("sub/loop_parent")).unwrap();
+    symlink("cycle_b", game_src.join("cycle_a")).unwrap();
+    symlink("cycle_a", game_src.join("cycle_b")).unwrap();
+    symlink("../dir_b", game_src.join("dir_a/to_b")).unwrap();
+    symlink("../dir_a", game_src.join("dir_b/to_a")).unwrap();
+    // (4) Safe interior relative symlinks
+    symlink("data/asset.bin", game_src.join("safe_alias.bin")).unwrap();
+    symlink(
+        "../data/asset.bin",
+        game_src.join("sub/safe_parent_alias.bin"),
+    )
+    .unwrap();
+
+    // Build a minimal `.app` bundle and copy the fixture game payload into `Contents/Resources/Game`.
+    let app_dir = root.path().join("FixtureGame.app");
+    let contents = app_dir.join("Contents");
+    let macos_dir = contents.join("MacOS");
+    let frameworks_dir = contents.join("Frameworks");
+    let resources_dir = contents.join("Resources");
+    let bundle_game_dir = resources_dir.join("Game");
+    fs::create_dir_all(&macos_dir).unwrap();
+    fs::create_dir_all(&frameworks_dir).unwrap();
+    fs::create_dir_all(&resources_dir).unwrap();
+    fs::write(
+        contents.join("Info.plist"),
+        generate_info_plist("FixtureGame", "FixtureGame", "1"),
+    )
+    .unwrap();
+    fs::write(
+        resources_dir.join("game.toml"),
+        generate_game_manifest_toml("FixtureGame", "FixtureGame", "FixtureGame.exe", "custom"),
+    )
+    .unwrap();
+    // Compile a tiny native Mach-O stub so `codesign --force --sign -` and
+    // `codesign --verify --deep --strict` exercise real signing on macOS without hanging.
+    let stub_rs = root.path().join("stub_bin.rs");
+    let stub_bin = root.path().join("stub_bin");
+    fs::write(&stub_rs, "fn main() {}\n").unwrap();
+    let compiled = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            &stub_rs.to_string_lossy(),
+            "-o",
+            &stub_bin.to_string_lossy(),
+        ])
+        .output()
+        .expect("compile tiny stub binary with rustc");
+    assert!(
+        compiled.status.success(),
+        "stub binary compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::copy(&stub_bin, macos_dir.join("FixtureGame")).unwrap();
+    fs::copy(&stub_bin, macos_dir.join("port-runner")).unwrap();
+    fs::copy(&stub_bin, macos_dir.join("dxil-metald")).unwrap();
+
+    let stub_dylib_rs = root.path().join("stub_dylib.rs");
+    let stub_dylib = frameworks_dir.join("libmetalirconverter.dylib");
+    fs::write(&stub_dylib_rs, "pub extern \"C\" fn stub() {}\n").unwrap();
+    let compiled_dylib = Command::new("rustc")
+        .args([
+            "--edition=2021",
+            "--crate-type",
+            "cdylib",
+            &stub_dylib_rs.to_string_lossy(),
+            "-o",
+            &stub_dylib.to_string_lossy(),
+        ])
+        .output()
+        .expect("compile tiny stub dylib with rustc");
+    assert!(
+        compiled_dylib.status.success(),
+        "stub dylib compile failed: {}",
+        String::from_utf8_lossy(&compiled_dylib.stderr)
+    );
+
+    let copy_report = copy_game_payload(&game_src, &bundle_game_dir, None).unwrap();
+    assert!(copy_report.skipped_symlinks() >= 7);
+
+    // Unsafe links must not exist in the bundled Game tree; safe interior relative links stay.
+    for skipped in [
+        "escape_rel.txt",
+        "escape_dir",
+        "dangling.bin",
+        "loop_self",
+        "sub/loop_parent",
+        "cycle_a",
+        "cycle_b",
+        "dir_b/to_a",
+    ] {
+        assert!(
+            fs::symlink_metadata(bundle_game_dir.join(skipped)).is_err(),
+            "unsafe symlink {skipped} should not be copied into bundle"
+        );
+    }
+    assert!(
+        fs::symlink_metadata(bundle_game_dir.join("safe_alias.bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(bundle_game_dir.join("safe_alias.bin")).unwrap(),
+        b"GAME_ASSET"
+    );
+    assert!(
+        fs::symlink_metadata(bundle_game_dir.join("sub/safe_parent_alias.bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(bundle_game_dir.join("sub/safe_parent_alias.bin")).unwrap(),
+        b"GAME_ASSET"
+    );
+
+    codesign_ad_hoc(&stub_dylib);
+    codesign_ad_hoc(&macos_dir.join("dxil-metald"));
+    codesign_ad_hoc(&macos_dir.join("port-runner"));
+    codesign_ad_hoc(&macos_dir.join("FixtureGame"));
+    codesign_ad_hoc(&app_dir);
+
+    // Fresh `--copy-game` bundle must pass `game_payload`, `external_symlinks`, and `codesign`.
+    let report = verify_app_bundle(&app_dir).unwrap();
+    let check_status = |rep: &BundleVerifyReport, name: &str| {
+        rep.checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| (c.status, c.detail.clone()))
+    };
+    assert_eq!(
+        check_status(&report, "game_payload").map(|(s, _)| s),
+        Some(BundleCheckStatus::Pass)
+    );
+    assert_eq!(
+        check_status(&report, "external_symlinks").map(|(s, _)| s),
+        Some(BundleCheckStatus::Pass),
+        "external_symlinks failed: {:?}",
+        check_status(&report, "external_symlinks")
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        check_status(&report, "codesign").map(|(s, _)| s),
+        Some(BundleCheckStatus::Pass),
+        "codesign failed: {:?}",
+        check_status(&report, "codesign")
+    );
+
+    // `bundle-verify`'s `external_symlinks` check must keep failing if escaping or dangling links
+    // make it into the bundle.
+    let injected_escape = bundle_game_dir.join("injected_escape.txt");
+    symlink(outside_dir.join("host_secret.txt"), &injected_escape).unwrap();
+    let report_escape = verify_app_bundle(&app_dir).unwrap();
+    assert_eq!(
+        check_status(&report_escape, "external_symlinks").map(|(s, _)| s),
+        Some(BundleCheckStatus::Fail)
+    );
+    fs::remove_file(&injected_escape).unwrap();
+
+    let injected_dangling = bundle_game_dir.join("injected_dangling.txt");
+    symlink("does_not_exist.txt", &injected_dangling).unwrap();
+    let report_dangling = verify_app_bundle(&app_dir).unwrap();
+    assert_eq!(
+        check_status(&report_dangling, "external_symlinks").map(|(s, _)| s),
+        Some(BundleCheckStatus::Fail)
+    );
+}

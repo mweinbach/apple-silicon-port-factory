@@ -9,22 +9,23 @@ use super::state::{
 };
 use super::CommandList;
 use dxil_metal::runtime::{
-    ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT, ARGUMENT_BUFFER_UNIFORMS_BIND_POINT,
-    NON_INDEXED_DRAW, VERTEX_BUFFER_BIND_POINT,
+    ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT, ARGUMENT_BUFFER_HULL_DOMAIN_BIND_POINT,
+    ARGUMENT_BUFFER_UNIFORMS_BIND_POINT, NON_INDEXED_DRAW, VERTEX_BUFFER_BIND_POINT,
 };
 use crate::metal::binding;
 use crate::metal::encstats as stats;
 use crate::metal::gpunan;
-use crate::metal::indirect::{IndirectLayout, Work};
+use crate::metal::indirect::{self, IndirectLayout, KernelParams, Work};
+use crate::metal::passtiming as pt;
 use crate::metal::pipeline::{GraphicsPipeline, READS_BUF, READS_TEX};
 use crate::metal::resource::{MtlTexture, Resource};
 use crate::types::Rect;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLClearColor, MTLLoadAction,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderStages, MTLScissorRect, MTLSize, MTLStages,
-    MTLStoreAction, MTLTexture, MTLTextureType, MTLViewport,
+    MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLClearColor,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderStages, MTLScissorRect, MTLSize,
+    MTLStages, MTLStoreAction, MTLTexture, MTLTextureType, MTLViewport,
 };
 use std::sync::Arc;
 
@@ -548,7 +549,7 @@ impl CommandList {
         Ok((e, size))
     }
 
-    fn apply_dynamic(
+    pub(super) fn apply_dynamic(
         &mut self,
         e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
         p: &GraphicsPipeline,
@@ -963,6 +964,76 @@ impl CommandList {
         Ok((e, p, prim))
     }
 
+    /// Evaluates active GPU predication (`self.predication`) for an emulated object+mesh draw
+    /// (`draw_geometry_emulated` / `draw_tessellation_emulated`). When predication is active,
+    /// runs the indirect expansion compute kernel to zero `{x, y, z}` when suppressed and returns
+    /// the GPU VA of the 12-byte `MTLDispatchThreadgroupsIndirectArguments` buffer.
+    fn prepare_predicated_mesh_grid(
+        &mut self,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> Result<Option<u64>, String> {
+        let Some(pred) = self.predication else {
+            return Ok(None);
+        };
+        let ring = self.ring.clone().ok_or("command list is not open")?;
+        let mut grid_bytes = [0u8; 12];
+        grid_bytes[0..4].copy_from_slice(&x.to_le_bytes());
+        grid_bytes[4..8].copy_from_slice(&y.to_le_bytes());
+        grid_bytes[8..12].copy_from_slice(&z.to_le_bytes());
+        let (args_out, params_va) = {
+            let mut r = ring.lock().unwrap();
+            let args_in = r.upload(&grid_bytes, 16)?;
+            let (out, _) = r.alloc(12, 16)?;
+            let (zero_word, zero_n) = Work::DispatchMesh.zero();
+            let p = KernelParams {
+                args: args_in,
+                count: 0,
+                args_out: out,
+                tlab_out: 0,
+                tlab_in: 0,
+                base_ib_va: 0,
+                ib_offset: 0,
+                stride: 12,
+                max_count: 1,
+                work_offset: 0,
+                work_size: 12,
+                out_stride: 12,
+                zero_word,
+                zero_n,
+                tlab_size: 0,
+                tlab_stride: 0,
+                npatch: 0,
+                pred: pred.gpu_va,
+                pred_op: pred.op,
+                ..Default::default()
+            };
+            (out, r.upload(p.bytes(), 256)?)
+        };
+        let k = indirect::kernel()?;
+        let e = self.compute().ok_or("compute encoder")?;
+        self.pt_note_util(pt::synth::EI_EXPAND, 1);
+        e.setComputePipelineState(k);
+        self.compute_pso_bound = false;
+        self.set_table_addr(params_va, 0);
+        e.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: 1, height: 1, depth: 1 },
+            MTLSize { width: 64, height: 1, depth: 1 },
+        );
+        self.note_stage_ran(MTLStages::Dispatch);
+        stats::inc(&stats::c::ei_expand);
+        self.produced(
+            MTLStages::Dispatch,
+            MTLStages::Vertex
+                | MTLStages::Object
+                | MTLStages::Mesh
+                | MTLStages::Fragment
+                | MTLStages::Dispatch,
+        );
+        Ok(Some(args_out))
+    }
+
     /// Encodes a draw through an MSC geometry-emulation pipeline (Metal 4 object + mesh +
     /// fragment), mirroring Apple's `IRRuntime4Draw[Indexed]PrimitivesGeometryEmulation`.
     fn draw_geometry_emulated(
@@ -1061,6 +1132,7 @@ impl CommandList {
             (root, pa, ia, va)
         };
 
+        let pred_grid_va = self.prepare_predicated_mesh_grid(obj_tg_count_x, instances, 1)?;
         let writes_uav = self.gfx_pso_writes_uav(&p);
         if self.gfx.pass_uav_hazard && writes_uav {
             self.end_encoder();
@@ -1097,11 +1169,159 @@ impl CommandList {
             ran |= MTLStages::Fragment;
         }
         self.note_stage_ran(ran);
-        e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-            MTLSize { width: obj_tg_count_x as usize, height: instances as usize, depth: 1 },
-            MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
-            MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+        if let Some(grid_va) = pred_grid_va {
+            e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                grid_va,
+                MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
+                MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+            );
+        } else {
+            e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                MTLSize { width: obj_tg_count_x as usize, height: instances as usize, depth: 1 },
+                MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
+                MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+            );
+        }
+        Ok(())
+    }
+
+    /// Encodes a draw through an MSC tessellation-emulation pipeline (Metal 4 object + mesh +
+    /// fragment), mirroring Apple's `IRRuntime4Draw[Indexed]PatchesTessellationEmulation`.
+    fn draw_tessellation_emulated(
+        &mut self,
+        indexed: Option<(u16, u64)>,
+        count: u32,
+        instances: u32,
+        draw_params: &[u8; 20],
+    ) -> Result<(), String> {
+        if !self.icb.icb_segs.is_empty() {
+            self.flush_draw_batch(true);
+        }
+        let p = self.gfx.pso.clone().ok_or("tessellation draw without a graphics PSO")?;
+        let emu = p.tess_emu.as_ref().ok_or("not a tessellation-emulation PSO")?;
+        let ir_prim = crate::topology::ir_primitive_type(self.gfx.topology)
+            .ok_or_else(|| format!("unsupported tessellation topology {}", self.gfx.topology))?;
+
+        let mesh_overlap: u16 = match emu.output_primitive {
+            1 => 0, // Point
+            2 => 1, // Line
+            _ => 2, // TriangleCW / TriangleCCW
+        };
+        let max_input_prims = emu.gs_max_input_primitives_per_mesh_threadgroup.max(1);
+        let patches_per_obj_tg = emu.hs_max_patches_per_object_threadgroup.max(1);
+        let input_cps = emu.hs_input_control_point_count.max(1);
+        let threads_per_patch = emu.hs_max_object_threads_per_patch.max(1);
+        let obj_tg_vtx_stride = patches_per_obj_tg.saturating_mul(input_cps).max(1);
+        let obj_tg_count_x = count.div_ceil(obj_tg_vtx_stride);
+        if obj_tg_count_x == 0 {
+            return Ok(());
+        }
+        let obj_tg_size = patches_per_obj_tg.saturating_mul(threads_per_patch).max(1);
+        let mesh_tg_size = max_input_prims;
+
+        let (index_type, index_buffer) = match indexed {
+            Some((ir_idx, ib_va)) => (ir_idx, ib_va),
+            None => (NON_INDEXED_DRAW, 0),
+        };
+        let draw_info = dxil_metal::runtime::RuntimeDrawInfo {
+            index_type,
+            primitive_topology: ir_prim,
+            threads_per_patch: threads_per_patch.min(u8::MAX as u32) as u8,
+            max_input_primitives_per_mesh_threadgroup: max_input_prims as u16,
+            object_threadgroup_vertex_stride: obj_tg_vtx_stride as u16,
+            mesh_threadgroup_primitive_stride: (max_input_prims as u16).saturating_sub(mesh_overlap),
+            gs_instance_count: emu.gs_instance_count.min(u16::MAX as u32) as u16,
+            patches_per_object_threadgroup: patches_per_obj_tg as u16,
+            input_control_points_per_patch: input_cps as u16,
+            index_buffer,
+        };
+
+        self.pt_split();
+        let ring = self.ring.clone().ok_or("command list is not open")?;
+        let (root, params_va, info_va, vbs_va) = {
+            let mut r = ring.lock().unwrap();
+            let root = if self.gfx_root.rs.is_some() {
+                if self.gfx_root.is_dirty() {
+                    self.gfx_root.flush(&mut r)?
+                } else {
+                    self.gfx_root.bound
+                }
+            } else {
+                0
+            };
+            let pa = r.upload(draw_params, 16)?;
+            let ia = r.upload(&draw_info.to_bytes(), 16)?;
+            let mut vb_bytes = [0u8; 31 * 16];
+            for s in 0..31usize {
+                let (addr, size, stride) =
+                    if s < self.gfx.vbs.len() { self.gfx.vbs[s] } else { (0, 0, 0) };
+                let rv = dxil_metal::runtime::RuntimeVertexBuffer { addr, length: size, stride };
+                vb_bytes[s * 16..(s + 1) * 16].copy_from_slice(&rv.to_bytes());
+            }
+            let va = r.upload(&vb_bytes, 16)?;
+            (root, pa, ia, va)
+        };
+
+        let pred_grid_va = self.prepare_predicated_mesh_grid(obj_tg_count_x, instances, 1)?;
+        let writes_uav = self.gfx_pso_writes_uav(&p);
+        if self.gfx.pass_uav_hazard && writes_uav {
+            self.end_encoder();
+        }
+        let eff_reads = p.pre_raster_reads | READS_BUF;
+        let (e, size) = unsafe { self.draw_encoder_for(eff_reads)? };
+        self.rp_sync.enc_pre_raster_reads |= eff_reads;
+        self.rp_sync.enc_ps_reads |= p.ps_read_classes;
+        self.rp_sync.enc_uav_used |= writes_uav || p.uses_uav;
+        self.render_mid_barrier(&e);
+        self.record_gfx_draw_uav_writes(
+            writes_uav,
+            p.vs_writes_uav,
+            p.ps_writes_uav,
+            MTLStages::Object | MTLStages::Mesh,
         );
+        self.sync_pre_raster(&e, eff_reads);
+        self.apply_dynamic(&e, &p, size);
+        let fast = self.opts.opt_fast_enc_state;
+        if !(fast && self.rp_sync.enc_render_cache.mesh_stages_bound) {
+            e.setArgumentTable_atStages(&self.table, crate::mesh::STAGES);
+            self.rp_sync.enc_render_cache.mesh_stages_bound = true;
+        }
+        self.bind_table(root);
+        // HS (object-linked) and DS (mesh-linked) read the top-level root signature from bind point 3,
+        // and the MSC tessellator reads its lookup tables from bind point 7.
+        if root != 0 {
+            self.set_table_addr(root, ARGUMENT_BUFFER_HULL_DOMAIN_BIND_POINT as usize);
+        }
+        let tess_tables_va = binding::tessellator_tables_va()?;
+        self.set_table_addr(tess_tables_va, dxil_metal::runtime::TESSELLATOR_TABLES_BIND_POINT as usize);
+        self.set_table_addr(params_va, ARGUMENT_BUFFER_DRAW_ARGUMENTS_BIND_POINT as usize);
+        self.set_table_addr(info_va, ARGUMENT_BUFFER_UNIFORMS_BIND_POINT as usize);
+        self.set_table_addr(vbs_va, VERTEX_BUFFER_BIND_POINT as usize);
+
+        let mut ran = MTLStages::Object | MTLStages::Mesh;
+        if !self.bar.pass_targets.is_empty()
+            || self.active_dsv().is_some_and(|v| v.resource != 0)
+            || p.ps.is_some()
+        {
+            ran |= MTLStages::Fragment;
+        }
+        self.note_stage_ran(ran);
+        unsafe {
+            e.setObjectThreadgroupMemoryLength_atIndex(15360, 0);
+        }
+        if let Some(grid_va) = pred_grid_va {
+            e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                grid_va,
+                MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
+                MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+            );
+        } else {
+            e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                MTLSize { width: obj_tg_count_x as usize, height: instances as usize, depth: 1 },
+                MTLSize { width: obj_tg_size as usize, height: 1, depth: 1 },
+                MTLSize { width: mesh_tg_size as usize, height: 1, depth: 1 },
+            );
+        }
         Ok(())
     }
 
@@ -1124,6 +1344,9 @@ impl CommandList {
                 start_instance_location: first_instance,
             },
         };
+        if self.gfx.pso.as_ref().is_some_and(|p| p.tess_emu.is_some()) {
+            return self.draw_tessellation_emulated(None, vertices, instances, &args.to_bytes());
+        }
         if self.gfx.pso.as_ref().is_some_and(|p| p.gs_emu.is_some()) {
             return self.draw_geometry_emulated(None, vertices, instances, &args.to_bytes());
         }
@@ -1201,6 +1424,14 @@ impl CommandList {
                 start_instance_location: first_instance,
             },
         };
+        if self.gfx.pso.as_ref().is_some_and(|p| p.tess_emu.is_some()) {
+            return self.draw_tessellation_emulated(
+                Some((f.ir, addr)),
+                indices,
+                instances,
+                &args.to_bytes(),
+            );
+        }
         if self.gfx.pso.as_ref().is_some_and(|p| p.gs_emu.is_some()) {
             return self.draw_geometry_emulated(
                 Some((f.ir, addr)),
