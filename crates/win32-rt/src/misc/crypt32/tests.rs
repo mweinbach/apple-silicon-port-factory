@@ -2517,7 +2517,9 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         CERT_MD5_HASH_PROP_ID, CERT_SHA1_HASH_PROP_ID, CERT_SHA256_HASH_PROP_ID,
         CERT_SUBJECT_NAME_MD5_HASH_PROP_ID,
     };
-    use self::test_vectors::{PFX_PBES1_LEGACY, PFX_PBES2_AES256, PKCS7_SIGNED_DER};
+    use self::test_vectors::{
+        PFX_CA_FIRST_NO_KEY_ID, PFX_PBES1_LEGACY, PFX_PBES2_AES256, PKCS7_SIGNED_DER,
+    };
 
     unsafe {
         // 1. PFXImportCertStore: modern PBES2 AES-256-CBC + SHA-256 MAC
@@ -2624,6 +2626,47 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert!(lookup_cert_private_key_and_chain(c_leg).is_some());
         CertFreeCertificateContext(c_leg);
         CertCloseStore(st_leg, 0);
+
+        // 2b. PFXImportCertStore: CA-first PFX with zero localKeyId bag attributes must match
+        //     the private key to the leaf certificate by SPKI, never blindly to the first cert.
+        let blob_noid = CryptDataBlob {
+            cb_data: PFX_CA_FIRST_NO_KEY_ID.len() as u32,
+            pb_data: PFX_CA_FIRST_NO_KEY_ID.as_ptr(),
+        };
+        let empty_pw = crate::strings::to_wide_z("");
+        let st_noid = PFXImportCertStore(&blob_noid as *const _ as *const c_void, empty_pw.as_ptr(), 0);
+        assert!(!st_noid.is_null(), "CA-first attribute-free PFX import must succeed");
+        let c_first = CertEnumCertificatesInStore(st_noid, std::ptr::null_mut());
+        assert!(!c_first.is_null(), "first cert (CA) must be present");
+        let mut cn1 = [0u8; 64];
+        CertGetNameStringA(c_first, 4, 0, std::ptr::null_mut(), cn1.as_mut_ptr(), cn1.len() as u32);
+        assert_eq!(crate::strings::from_ansi(cn1.as_ptr()), "NoIdTestCA");
+        assert!(
+            lookup_cert_private_key_and_chain(c_first).is_none(),
+            "CA cert must NOT receive leaf private key when localKeyId is omitted"
+        );
+        let mut ca_kpi_len = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(c_first, CERT_KEY_PROV_INFO_PROP_ID, std::ptr::null_mut(), &mut ca_kpi_len),
+            FALSE
+        );
+
+        let c_second = CertEnumCertificatesInStore(st_noid, c_first);
+        assert!(!c_second.is_null(), "second cert (leaf) must be present");
+        let mut cn2 = [0u8; 64];
+        CertGetNameStringA(c_second, 4, 0, std::ptr::null_mut(), cn2.as_mut_ptr(), cn2.len() as u32);
+        assert_eq!(crate::strings::from_ansi(cn2.as_ptr()), "NoIdTestLeaf");
+        let (leaf_chain, leaf_key) = lookup_cert_private_key_and_chain(c_second)
+            .expect("leaf cert must match its private key by SPKI without localKeyId");
+        assert_eq!(leaf_chain.len(), 2, "leaf chain should include leaf + CA from store");
+        assert!(!leaf_key.is_empty());
+        let mut leaf_kpi_len = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(c_second, CERT_KEY_PROV_INFO_PROP_ID, std::ptr::null_mut(), &mut leaf_kpi_len),
+            TRUE
+        );
+        assert!(CertEnumCertificatesInStore(st_noid, c_second).is_null());
+        CertCloseStore(st_noid, 0);
 
         // 3. CryptMsgOpenToDecode + chunked CryptMsgUpdate + CryptMsgGetParam
         let h_msg = CryptMsgOpenToDecode(

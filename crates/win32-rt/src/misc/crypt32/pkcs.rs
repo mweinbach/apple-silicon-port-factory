@@ -1497,6 +1497,97 @@ unsafe fn parse_safe_contents(
     Ok(())
 }
 
+/// Returns `true` when `pkcs8_der` (RFC 5958 `PrivateKeyInfo`) cryptographically corresponds
+/// to the `SubjectPublicKeyInfo` of `cert_der`.
+fn pkcs8_matches_cert_spki(pkcs8_der: &[u8], cert_der: &[u8]) -> bool {
+    let Some(parts) = parse_cert_der_parts(cert_der) else {
+        return false;
+    };
+    let expected_spki_full = encode_der_tlv(0x30, parts.spki_inner);
+
+    // Primary check via rustls::crypto::ring (covers RSA >= 2048, ECDSA P-256/P-384, Ed25519).
+    let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()),
+    );
+    if let Ok(signing_key) = crate::net_tls::crypto_provider()
+        .key_provider
+        .load_private_key(pk_der)
+    {
+        if let Some(spki) = signing_key.public_key() {
+            let got = spki.as_ref();
+            return got == parts.spki_inner || got == expected_spki_full.as_slice();
+        }
+    }
+
+    // Fallback for RSA keys rejected by ring's >=2048-bit policy (e.g. legacy 1024-bit PFXs):
+    // compare the PKCS#8 RSAPrivateKey (modulus, publicExponent) against the cert's RSAPublicKey.
+    fn strip_zero(mut s: &[u8]) -> &[u8] {
+        while s.len() > 1 && s[0] == 0 {
+            s = &s[1..];
+        }
+        s
+    }
+    let Some((pki_seq, _)) = parse_der_item(pkcs8_der) else {
+        return false;
+    };
+    if pki_seq.tag != 0x30 {
+        return false;
+    }
+    let Some(pki_kids) = der_item_children(pki_seq.val) else {
+        return false;
+    };
+    if pki_kids.len() < 3 || pki_kids[1].tag != 0x30 || pki_kids[2].tag != 0x04 {
+        return false;
+    }
+    let Some((priv_alg_oid, _)) = parse_alg_id(pki_kids[1]) else {
+        return false;
+    };
+    if priv_alg_oid != OID_RSA_ENCRYPTION {
+        return false;
+    }
+    let Some((rsa_priv_seq, _)) = parse_der_item(pki_kids[2].val) else {
+        return false;
+    };
+    if rsa_priv_seq.tag != 0x30 {
+        return false;
+    }
+    let Some(rsa_priv_kids) = der_item_children(rsa_priv_seq.val) else {
+        return false;
+    };
+    if rsa_priv_kids.len() < 3 || rsa_priv_kids[1].tag != 0x02 || rsa_priv_kids[2].tag != 0x02 {
+        return false;
+    }
+    let Some(spki_kids) = der_item_children(parts.spki_inner) else {
+        return false;
+    };
+    if spki_kids.len() < 2 || spki_kids[0].tag != 0x30 || spki_kids[1].tag != 0x03 {
+        return false;
+    }
+    let Some((pub_alg_oid, _)) = parse_alg_id(spki_kids[0]) else {
+        return false;
+    };
+    if pub_alg_oid != OID_RSA_ENCRYPTION
+        || spki_kids[1].val.len() < 2
+        || spki_kids[1].val[0] != 0
+    {
+        return false;
+    }
+    let Some((rsa_pub_seq, _)) = parse_der_item(&spki_kids[1].val[1..]) else {
+        return false;
+    };
+    if rsa_pub_seq.tag != 0x30 {
+        return false;
+    }
+    let Some(rsa_pub_kids) = der_item_children(rsa_pub_seq.val) else {
+        return false;
+    };
+    if rsa_pub_kids.len() < 2 || rsa_pub_kids[0].tag != 0x02 || rsa_pub_kids[1].tag != 0x02 {
+        return false;
+    }
+    strip_zero(rsa_priv_kids[1].val) == strip_zero(rsa_pub_kids[0].val)
+        && strip_zero(rsa_priv_kids[2].val) == strip_zero(rsa_pub_kids[1].val)
+}
+
 pub(super) unsafe fn pfx_import_cert_store_impl(
     p_pfx: *const c_void,
     sz_password: LPCWSTR,
@@ -1712,8 +1803,9 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         return std::ptr::null_mut();
     }
 
-    for (idx, cert) in certs.iter().enumerate() {
-        // Match private key by localKeyId (or if single key & first cert when localKeyId absent).
+    for cert in &certs {
+        // Match private key by localKeyId first, falling back to cryptographic SPKI matching
+        // when bag attributes (RFC 7292 §4.2) are omitted — never attach blindly by cert index.
         let matched_key = cert
             .local_key_id
             .as_ref()
@@ -1723,11 +1815,9 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                     .map(|k| k.pkcs8_der.clone())
             })
             .or_else(|| {
-                if idx == 0 && keys.len() == 1 && keys[0].local_key_id.is_none() {
-                    Some(keys[0].pkcs8_der.clone())
-                } else {
-                    None
-                }
+                keys.iter()
+                    .find(|k| pkcs8_matches_cert_spki(&k.pkcs8_der, &cert.der))
+                    .map(|k| k.pkcs8_der.clone())
             });
 
         let mut props: Vec<(u32, Vec<u8>)> = Vec::new();
