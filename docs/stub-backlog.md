@@ -11,11 +11,11 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **160** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 119 |
+| Total remaining stub sites | **136** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 95 |
 | `failing` (honest-failing macro exports) | 22 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 19 |
-| DLLs with remaining stubs | 29 |
+| DLLs with remaining stubs | 28 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
@@ -24,6 +24,7 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 | [`crypto-cng-capi.md`](stub-backlog.d/crypto-cng-capi.md) | Stub & API Gap Backlog — `stubs/crypto-cng-capi` |
 | [`graphics.md`](stub-backlog.d/graphics.md) | Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`) |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
+| [`kernel-core.md`](stub-backlog.d/kernel-core.md) | Stub Backlog — `stubs/kernel-core` |
 | [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
 
 ### From `docs/stub-backlog.d/crypto-cng-capi.md`
@@ -143,6 +144,71 @@ Exposed while building and running the headless Windows x86-64 guest corpus (`cr
 | `user32.dll!wsprintfW` | Missing export in `crates/win32-rt/src/user32/misc.rs`: guest binaries importing `wsprintfW` hit an unresolved-import trap thunk instead of formatting UTF-16 output. | Implement variadic `wsprintfW` via `win64_varargs_thunk!` backed by `ucrt::stdio` wide formatter (1024-char Windows cap) and run `cargo opsdb -- win32-sync`. |
 | `user32.dll!wsprintfA` | Existing implementation in `crates/win32-rt/src/user32/misc.rs` copies the raw format string and ignores variadic arguments (`let _ = (a1, a2);`). | Replace with a real `win64_varargs_thunk!` formatter backed by `ucrt::stdio` narrow printf formatting (1024-char Windows cap). |
 
+### From `docs/stub-backlog.d/kernel-core.md`
+
+# Stub Backlog — `stubs/kernel-core`
+
+Scope: 28 stub sites across `crates/win32-rt/src/kernel32/{memory,threads,process,threadpool}.rs`, `crates/win32-rt/src/sync.rs`, and `crates/win32-rt/src/ntdll.rs`.
+
+- **Sites before:** 28
+- **Sites after:** 0
+- **Made real:** 17
+- **Native-unsupported (matches Windows without the feature/capability):** 11
+- **Leftovers:** 0
+
+## Removed Sites
+
+| DLL!API | Location | Disposition | Summary |
+|---|---|---|---|
+| `kernel32.dll!VirtualAlloc` (`MEM_WRITE_WATCH`) | `crates/win32-rt/src/kernel32/memory.rs` | Made real | Hardware write-watch tracking via `PROT_READ` + `try_handle_write_watch_fault` in `signals.rs`, real `GetWriteWatch` (`WRITE_WATCH_FLAG_RESET` partial-reset semantics) and `ResetWriteWatch`. |
+| `kernel32.dll!VirtualAlloc` (`PAGE_GUARD`) | `crates/win32-rt/src/kernel32/memory.rs` | Made real | Maps guard pages `PROT_NONE`, validates against `PAGE_NOACCESS`, and delivers one-shot `STATUS_GUARD_PAGE_VIOLATION` (`0x80000001`) via `consume_guard_page` + `signals.rs` before clearing `PAGE_GUARD`. |
+| `kernel32.dll!VirtualAlloc` (`MEM_RESET_UNDO`) | `crates/win32-rt/src/kernel32/memory.rs` | Made real | Uses Darwin `MADV_FREE_REUSABLE` (7) / `MADV_FREE_REUSE` (8) + `mincore` (`MINCORE_INCORE`) residency tracking to verify pages were not purged before succeeding, failing with `ERROR_INVALID_ADDRESS` if discarded. |
+| `kernel32.dll!VirtualProtect` (`PAGE_GUARD`) | `crates/win32-rt/src/kernel32/memory.rs` | Made real | Real `PAGE_GUARD` arming (`PROT_NONE`), validation against `PAGE_NOACCESS`, and one-shot `STATUS_GUARD_PAGE_VIOLATION` delivery through `signals.rs`. |
+| `kernel32.dll!FlushProcessWriteBuffers` | `crates/win32-rt/src/kernel32/memory.rs` | Made real | Real process-wide IPI barrier on Apple platforms via Mach `task_threads` + serialized per-thread `thread_suspend`/`thread_resume` (XNU `thread_wait` cross-CPU AST/IPI) bracketed by `SeqCst` fences. |
+| `kernel32.dll!TerminateThread` | `crates/win32-rt/src/kernel32/threads.rs` | Made real | Real thread termination for current thread, `CREATE_SUSPENDED` threads, and live sibling threads (`SIGUSR1` async-signal-safe `pthread_exit` + exit code recording + waiter signaling + `pthread_join` stack reaping). |
+| `kernel32.dll!SetThreadAffinityMask` | `crates/win32-rt/src/kernel32/threads.rs` | Made real | Tracks per-thread affinity mask against process affinity mask, validates mask bounds, returns exact previous mask, and applies best-effort Darwin `THREAD_AFFINITY_POLICY` tag without lowering QoS. |
+| `kernel32.dll!SetThreadGroupAffinity` | `crates/win32-rt/src/kernel32/threads.rs` | Made real | Validates group/mask, tracks per-thread group affinity, writes previous `GROUP_AFFINITY`, applies `THREAD_AFFINITY_POLICY`, and pairs with new `GetThreadGroupAffinity`. |
+| `kernel32.dll!AssignProcessToJobObject` | `crates/win32-rt/src/kernel32/process.rs` | Made real | Tracks assigned self and child processes on `JobObj`, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` (`ERROR_NOT_ENOUGH_QUOTA`), updates `IsProcessInJob`, and terminates child members on `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. |
+| `kernel32.dll!SetInformationJobObject` | `crates/win32-rt/src/kernel32/process.rs` | Made real | Validates struct sizes (`ERROR_BAD_LENGTH`) and flags, stores basic/extended limits, UI restrictions, end-of-job action, completion port, CPU rate control, notification limits, and group affinity; reports them back via `QueryInformationJobObject`. |
+| `kernel32.dll!FormatMessageW/A` (`FROM_HMODULE` + `FROM_SYSTEM`) | `crates/win32-rt/src/kernel32/process.rs` | Made real | Parses PE `RT_MESSAGETABLE` (type 11) `MESSAGE_RESOURCE_DATA` / `MESSAGE_RESOURCE_BLOCK` / `MESSAGE_RESOURCE_ENTRY` (Unicode & ANSI), searching module before system fallback. |
+| `kernel32.dll!FormatMessageW/A` (`FROM_HMODULE` only) | `crates/win32-rt/src/kernel32/process.rs` | Made real | Same real PE `RT_MESSAGETABLE` parser returning `ERROR_MR_MID_NOT_FOUND` (317) when an ID is absent and `ERROR_INVALID_PARAMETER` when no source flag is given. |
+| `kernel32.dll!CloseThreadpoolCleanupGroupMembers` | `crates/win32-rt/src/kernel32/threadpool.rs` | Made real | Parses `TP_CALLBACK_ENVIRON` V1/V3 in `CreateThreadpool{Work,Timer,Wait,Io}`, tracks live members in `TpCleanupGroup`, cancels/waits callbacks (including queued `TpWork` cancellation), invokes `CleanupGroupCancelCallback`, and releases member refs without double-close. |
+| `kernel32.dll!InitOnceBeginInitialize` (`INIT_ONCE_ASYNC`) | `crates/win32-rt/src/sync.rs` | Made real | Full 4-state `RTL_RUN_ONCE` machine (`0` uninit, `1` sync, `2` done, `3` async): concurrent non-blocking `INIT_ONCE_ASYNC` racers, single winning `InitOnceComplete(INIT_ONCE_ASYNC)` (`ERROR_GEN_FAILURE` for losers), and Windows-matching `INIT_ONCE_CHECK_ONLY` (`FALSE` + `ERROR_GEN_FAILURE` before completion). |
+| `ntdll.dll!NtQueryInformationProcess` | `crates/win32-rt/src/ntdll.rs` | Made real | Validates handle (`STATUS_INVALID_HANDLE`), adds real `ProcessVmCounters` (Mach `task_info`), `ProcessTimes` (`getrusage`), `ProcessPriorityClass`, `ProcessHandleCount` (`handles::live_count`), `ProcessAffinityMask`, `ProcessSessionInformation`, `ProcessBreakOnTermination`, random `ProcessCookie`, `ProcessSubsystemInformation`, `ProcessProtectionInformation`; returns `STATUS_INVALID_INFO_CLASS` for unsupported/unknown classes. |
+| `ntdll.dll!NtQueryInformationThread` | `crates/win32-rt/src/ntdll.rs` | Made real | Validates handle, fills full `ThreadBasicInformation`, adds real `ThreadTimes` (Mach `thread_info`), `ThreadQuerySetWin32StartAddress`, `ThreadAmILastThread`, tracked `ThreadHideFromDebugger`, `ThreadGroupInformation`, `ThreadNameInformation` (unaligned byte copy); returns `STATUS_INVALID_INFO_CLASS` for unsupported/unknown classes. |
+| `ntdll.dll!NtQuerySystemInformation` | `crates/win32-rt/src/ntdll.rs` | Made real | Adds real `SystemProcessorPerformanceInformation` (Mach `host_processor_info`), `SystemLogicalProcessorInformation` / `Ex`, `SystemKernelDebuggerInformationEx`; returns `STATUS_INVALID_INFO_CLASS` for unsupported/unknown classes (no fabricated telemetry). |
+| `kernel32.dll!VirtualAlloc` (`MEM_LARGE_PAGES`) | `crates/win32-rt/src/kernel32/memory.rs` | Native-unsupported | See table below. |
+| `kernel32.dll!VirtualAllocEx` (foreign process) | `crates/win32-rt/src/kernel32/memory.rs` | Native-unsupported | Current-process pseudo-handle and `OpenProcess(self)` work; foreign processes return `ERROR_ACCESS_DENIED` (invalid/NULL handles return `ERROR_INVALID_HANDLE`). |
+| `kernel32.dll!VirtualAlloc2` (foreign process) | `crates/win32-rt/src/kernel32/memory.rs` | Native-unsupported | `NULL`, `CURRENT_PROCESS`, and `OpenProcess(self)` work; foreign processes return `ERROR_ACCESS_DENIED` (invalid handles return `ERROR_INVALID_HANDLE`). |
+| `kernel32.dll!CreateRemoteThread` (foreign process) | `crates/win32-rt/src/kernel32/threads.rs` | Native-unsupported | `CURRENT_PROCESS` and `OpenProcess(self)` work; foreign processes return `ERROR_ACCESS_DENIED` (invalid/NULL handles return `ERROR_INVALID_HANDLE`). |
+| `kernel32.dll!CreateProcessW` (iOS target) | `crates/win32-rt/src/kernel32/process.rs` | Native-unsupported | macOS spawns real child processes via `posix_spawn`; iOS sandbox forbids child process spawning (`ERROR_NOT_SUPPORTED`). |
+| `ntdll.dll!NtCreateTransaction` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+| `ntdll.dll!NtCommitTransaction` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+| `ntdll.dll!KiUserExceptionDispatcher` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+| `ntdll.dll!KiUserApcDispatcher` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+| `ntdll.dll!KiUserCallbackDispatcher` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+| `ntdll.dll!LdrInitializeThunk` | `crates/win32-rt/src/ntdll.rs` | Native-unsupported | See table below. |
+
+## Native-unsupported (matches Windows without the feature)
+
+| DLL!API | Returned status / error | Reason on Apple Silicon / macOS / iOS | Windows Documentation Citation |
+|---|---|---|---|
+| `kernel32.dll!VirtualAlloc` (`MEM_LARGE_PAGES`) | `NULL`, `ERROR_PRIVILEGE_NOT_HELD` (1314) after parameter validation (`ERROR_INVALID_PARAMETER`) | Apple Silicon XNU does not expose 2 MiB user-mode superpages (`GetLargePageMinimum() == 0`), and standard unprivileged tokens do not hold `SeLockMemoryPrivilege`. | Microsoft Learn: *Large-Page Support* & *VirtualAlloc* — processes without `SeLockMemoryPrivilege` fail with `ERROR_PRIVILEGE_NOT_HELD`; invalid flag/alignment combinations fail with `ERROR_INVALID_PARAMETER`. |
+| `kernel32.dll!VirtualAllocEx` (foreign process handle) | `NULL`, `ERROR_ACCESS_DENIED` (5) for foreign `ChildProcessObj`; `ERROR_INVALID_HANDLE` (6) for `NULL`/invalid handle | macOS SIP and hardened-runtime sandbox block `task_for_pid` / cross-process `mach_vm_allocate` without `com.apple.security.cs.debugger` entitlement. | Microsoft Learn: *VirtualAllocEx* — requires `PROCESS_VM_OPERATION` on target process; lacking access fails with `ERROR_ACCESS_DENIED`, invalid handle fails with `ERROR_INVALID_HANDLE`. |
+| `kernel32.dll!VirtualAlloc2` (foreign process handle) | `NULL`, `ERROR_ACCESS_DENIED` (5) for foreign `ChildProcessObj`; `ERROR_INVALID_HANDLE` (6) for invalid handle (`NULL` targets current process) | Same macOS SIP/sandbox restriction on foreign `task_for_pid`. | Microsoft Learn: *VirtualAlloc2* — `NULL` process handle targets current process; foreign process without `PROCESS_VM_OPERATION` fails with `ERROR_ACCESS_DENIED`. |
+| `kernel32.dll!CreateRemoteThread` (foreign process handle) | `NULL`, `ERROR_ACCESS_DENIED` (5) for foreign `ChildProcessObj`; `ERROR_INVALID_HANDLE` (6) for `NULL`/invalid handle | macOS SIP/sandbox blocks cross-process `thread_create_running` without debugger entitlements. | Microsoft Learn: *CreateRemoteThread* — requires `PROCESS_CREATE_THREAD`, `PROCESS_VM_OPERATION`, etc.; denied access fails with `ERROR_ACCESS_DENIED`. |
+| `kernel32.dll!CreateProcessW` (`target_os = "ios"` only) | `FALSE`, `ERROR_NOT_SUPPORTED` (50) | iOS App Sandbox and kernel policy prohibit `posix_spawn` / child process execution (macOS uses real `posix_spawn`). | Microsoft Learn: *CreateProcessW* & Apple iOS Sandbox documentation (child processes disallowed on iOS). |
+| `ntdll.dll!NtCreateTransaction` | `STATUS_NOT_IMPLEMENTED` (`0xC0000002`), `*out = NULL` | APFS/Darwin has no Kernel Transaction Manager (KTM) or Transactional NTFS (TxF). | Microsoft Learn: *Transactional NTFS (TxF)* (deprecated; unsupported on non-NTFS volumes / systems without KTM). |
+| `ntdll.dll!NtCommitTransaction` | `STATUS_INVALID_HANDLE` (`0xC0000008`) for `NULL`; `STATUS_NOT_IMPLEMENTED` (`0xC0000002`) otherwise | Same absence of KTM/TxF on Darwin/APFS. | Microsoft Learn: *NtCommitTransaction* & *Transactional NTFS (TxF)*. |
+| `ntdll.dll!KiUserExceptionDispatcher` | Exported symbol; logs warning if called directly | Kernel-to-user trap-frame entry point invoked solely by `ntoskrnl.exe` with a kernel-synthesized `CONTEXT`/`EXCEPTION_RECORD` stack frame; no user-mode call ABI. Exceptions dispatch natively via `signals.rs` -> `unwind::dispatch_exception`. | *Windows Internals* / Microsoft Learn: `ntoskrnl!PspLookupKernelUserEntryPoints` (user-mode code resolves address only for hooks/inspection). |
+| `ntdll.dll!KiUserApcDispatcher` | Exported symbol; logs warning if called directly | Kernel-to-user APC trap-frame entry point; user APCs dispatch natively via `thread::run_pending_apcs`. | *Windows Internals* (`PspLookupKernelUserEntryPoints`). |
+| `ntdll.dll!KiUserCallbackDispatcher` | Exported symbol; logs warning if called directly | Kernel-to-user win32k callback trap-frame entry point; window callbacks dispatch natively via `user32/`. | *Windows Internals* (`PspLookupKernelUserEntryPoints`). |
+| `ntdll.dll!LdrInitializeThunk` | Exported symbol; logs warning if called directly | Kernel-to-user initial thread startup entry point; thread initialization runs natively via `thread::thread_main` -> `BaseThreadInitThunk`. | *Windows Internals* (`PspLookupKernelUserEntryPoints`). |
+
+## Leftovers
+
+None — all 28 stub sites in scope have been resolved.
+
 ### From `docs/stub-backlog.d/middleware.md`
 
 # Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions)
@@ -247,12 +313,11 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
-| `kernel32.dll` | 30 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
+| `kernel32.dll` | 15 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
 | `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
-| `ntdll.dll` | 9 | Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export | Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported. |
 | `ws2_32.dll` | 8 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
 | `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
@@ -276,44 +341,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `msctf.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xinput1_4.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-
-### `kernel32.dll` (30)
-
-- **Reason:** Partial Windows kernel/file/memory/locale/job/threadpool sub-feature
-- **Next step:** Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `AllocConsole` | `stub` | `crates/win32-rt/src/kernel32/file.rs:477` | `"no separate console window; stdout/stderr of the loader act as the console"` |
-| `AssignProcessToJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1655` | `"job objects have no effect"` |
-| `CreateProcessW` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1283` | `"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)` |
-| `CreateRemoteThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:60` | `"CreateRemoteThread into another process"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7135` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7163` | `"DeviceIoControl code {code:#x} unsupported"` |
-| `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1045` | `"FlushProcessWriteBuffers approximated by a local fence"` |
-| `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
-| `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2137` | `"GetFileInformationByHandleEx class {class} not supported"` |
-| `GetGeoInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1125` | `"GetGeoInfo for geo id {geo} answered with US data"` |
-| `GetLocaleInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:918` | `"locale {lcid:#x} not available; answering with en-US data"` |
-| `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
-| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
-| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6926` | `"MapViewOfFile3 on another process"` |
-| `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2596` | `"MoveFileExA delete-on-reboot ignored"` |
-| `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2589` | `"MoveFileExW delete-on-reboot ignored"` |
-| `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2268` | `"SetFileInformationByHandle class {class} not supported"` |
-| `SetInformationJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1659` | `"SetInformationJobObject class {class} ignored"` |
-| `TerminateThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:173` | `"TerminateThread unsupported"` |
-| `VirtualAlloc2` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:577` | `"VirtualAlloc2 on another process"` |
-| `VirtualAllocEx` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:568` | `"VirtualAllocEx on another process"` |
-| `VirtualProtect` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:684` | `"PAGE_GUARD not emulated"` |
-| `format_message` | `stub` | `crates/win32-rt/src/kernel32/process.rs:2180` | `"message tables in modules are not supported (id {id:#x})"` |
-| `format_message` | `stub` | `crates/win32-rt/src/kernel32/process.rs:2189` | `"FormatMessage from module message table (id {id:#x})"` |
-| `get_locale_info` | `stub` | `crates/win32-rt/src/kernel32/string.rs:865` | `"GetLocaleInfo LCTYPE {lctype:#x} unknown"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:362` | `"MEM_LARGE_PAGES ignored"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:365` | `"MEM_WRITE_WATCH not tracked"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:369` | `"PAGE_GUARD not emulated"` |
-| `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:377` | `"MEM_RESET_UNDO: contents may have been discarded"` |
 
 ### `crypt32.dll` (19)
 
@@ -341,6 +368,29 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `cert_verify_certificate_chain_policy_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/chain.rs:807` | `"CertVerifyCertificateChainPolicy(oid={policy_id:#x}) -> FALSE"` |
 | `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
 | `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
+
+### `kernel32.dll` (15)
+
+- **Reason:** Partial Windows kernel/file/memory/locale/job/threadpool sub-feature
+- **Next step:** Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `AllocConsole` | `stub` | `crates/win32-rt/src/kernel32/file.rs:477` | `"no separate console window; stdout/stderr of the loader act as the console"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7291` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7319` | `"DeviceIoControl code {code:#x} unsupported"` |
+| `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
+| `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2287` | `"GetFileInformationByHandleEx class {class} not supported"` |
+| `GetGeoInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1125` | `"GetGeoInfo for geo id {geo} answered with US data"` |
+| `GetLocaleInfoW` | `stub` | `crates/win32-rt/src/kernel32/string.rs:918` | `"locale {lcid:#x} not available; answering with en-US data"` |
+| `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
+| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
+| `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
+| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7082` | `"MapViewOfFile3 on another process"` |
+| `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2746` | `"MoveFileExA delete-on-reboot ignored"` |
+| `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2739` | `"MoveFileExW delete-on-reboot ignored"` |
+| `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2418` | `"SetFileInformationByHandle class {class} not supported"` |
+| `get_locale_info` | `stub` | `crates/win32-rt/src/kernel32/string.rs:865` | `"GetLocaleInfo LCTYPE {lctype:#x} unknown"` |
 
 ### `user32.dll` (13)
 
@@ -403,23 +453,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `mesh_get_triangle` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2629` | `"PxMeshQuery::getTriangle without cooked triangle mesh payload"` |
 | `mesh_sweep` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2642` | `"PxMeshQuery::sweep without cooked triangle mesh payload"` |
 
-### `ntdll.dll` (9)
-
-- **Reason:** Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export
-- **Next step:** Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `KiUserApcDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1678` | `"KiUserApcDispatcher called directly"` |
-| `KiUserCallbackDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1682` | `"KiUserCallbackDispatcher called directly"` |
-| `KiUserExceptionDispatcher` | `stub` | `crates/win32-rt/src/ntdll.rs:1674` | `"KiUserExceptionDispatcher called directly"` |
-| `LdrInitializeThunk` | `stub` | `crates/win32-rt/src/ntdll.rs:2420` | `"LdrInitializeThunk called directly"` |
-| `NtCommitTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:747` | `"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtCreateTransaction` | `stub` | `crates/win32-rt/src/ntdll.rs:742` | `"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"` |
-| `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:241` | `"NtQueryInformationProcess class {class}"` |
-| `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:313` | `"NtQueryInformationThread class {class}"` |
-| `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:438` | `"NtQuerySystemInformation class {class}"` |
-
 ### `ws2_32.dll` (8)
 
 - **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
@@ -427,13 +460,13 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `WSAAsyncSelect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSACancelAsyncRequest` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAAsyncSelect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSACancelAsyncRequest` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
 | `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1802` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
-| `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
+| `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
 | `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1322` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
 
 ### `mmdevapi.dll` (6)
@@ -460,7 +493,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `_getch` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:940` | `"_getch returns EOF"` |
 | `_setmbcp` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:274` | `"_setmbcp({cp}) unsupported"` |
 | `open_host_path` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:210` | `"Unicode text modes (0x{oflag:x}) treated as plain text mode"` |
-| `parse_mode` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:1062` | `"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"` |
+| `parse_mode` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:1097` | `"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"` |
 | `setlocale` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:64` | `"setlocale({cat}, {n:?}): locale not available"` |
 | `system` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:952` | `"system({:?}) refused", from_ansi(cmd)` |
 
