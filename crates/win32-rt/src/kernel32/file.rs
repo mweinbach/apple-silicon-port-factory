@@ -597,7 +597,10 @@ pub unsafe extern "win64" fn AllocConsole() -> BOOL {
             if let Some((master_fd, slave_fd)) = open_console_pty() {
                 use std::os::fd::AsRawFd;
                 let sfd = slave_fd.as_raw_fd();
-                let in_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
+                // Keep console input connected to host stdin (dup of fd 0) so ReadConsole/_getch
+                // can receive interactive/piped host input instead of blocking on an unfed PTY master,
+                // while console stdout/stderr write to the real PTY slave drained to host stderr.
+                let in_dup = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3);
                 let out_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
                 let err_dup = libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 3);
                 drop(slave_fd);

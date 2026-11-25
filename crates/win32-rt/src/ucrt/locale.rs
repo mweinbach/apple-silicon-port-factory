@@ -670,6 +670,15 @@ mod tests {
             assert_eq!(from_wide(lc.w_decimal_point), ",");
             assert_eq!(from_wide(lc.w_currency_symbol), "€");
 
+            // Verify mbstowcs / wcstombs honor CP1252 when LC_CTYPE is de-DE!
+            let euro_cp1252 = [0x80u8, 0];
+            let mut w_euro = [0u16; 4];
+            assert_eq!(super::super::convert::mbstowcs(w_euro.as_mut_ptr(), euro_cp1252.as_ptr(), 4), 1);
+            assert_eq!(w_euro[0], 0x20AC);
+            let mut m_euro = [0u8; 8];
+            assert_eq!(super::super::convert::wcstombs(m_euro.as_mut_ptr(), w_euro.as_ptr(), 8), 1);
+            assert_eq!(m_euro[0], 0x80);
+
             // Switching to de-DE.utf8 encodes narrow currency_symbol in UTF-8 without reusing CP1252 cache!
             let r = setlocale(LC_ALL, b"de-DE.utf8\0".as_ptr());
             assert!(!r.is_null());

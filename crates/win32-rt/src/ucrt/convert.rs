@@ -545,45 +545,68 @@ pub unsafe extern "win64" fn _ui64tow_s(v: u64, buf: *mut u16, sz: usize, r: i32
 // Multibyte <-> wide (CRT locale code page: 0 = "C" byte mapping, 65001 = UTF-8)
 // ---------------------------------------------------------------------------
 
-/// Decode one multibyte char. Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
+/// Decode one multibyte char using the active CRT `LC_CTYPE` code page.
+/// Ok((wchar(s), bytes)) / Err(()) = EILSEQ / Ok(None) incomplete.
 fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    if mb_cp() == 0 {
+    let cp = mb_cp();
+    if cp == 0 {
         return Ok(Some((vec![bytes[0] as u16], 1)));
     }
-    let b0 = bytes[0];
-    let len = match b0 {
-        0x00..=0x7F => 1,
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        _ => return Err(()),
-    };
-    if bytes.len() < len {
-        if bytes[1..].iter().all(|&b| b & 0xC0 == 0x80) {
-            return Ok(None);
+    if cp == 65001 {
+        let b0 = bytes[0];
+        let len = match b0 {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return Err(()),
+        };
+        if bytes.len() < len {
+            if bytes[1..].iter().all(|&b| b & 0xC0 == 0x80) {
+                return Ok(None);
+            }
+            return Err(());
         }
+        return match std::str::from_utf8(&bytes[..len]) {
+            Ok(s) => Ok(Some((s.encode_utf16().collect(), len))),
+            Err(_) => Err(()),
+        };
+    }
+    let is_lead = unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, bytes[0]) != 0 };
+    let len = if is_lead { 2 } else { 1 };
+    if bytes.len() < len {
+        return Ok(None);
+    }
+    let w = crate::kernel32::string::decode_cp_to_utf16(cp, &bytes[..len]).map_err(|_| ())?;
+    if w.is_empty() || w.contains(&0xFFFD) {
         return Err(());
     }
-    match std::str::from_utf8(&bytes[..len]) {
-        Ok(s) => Ok(Some((s.encode_utf16().collect(), len))),
-        Err(_) => Err(()),
-    }
+    Ok(Some((w, len)))
 }
 
 fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
-    if mb_cp() == 0 {
+    let cp = mb_cp();
+    if cp == 0 {
         if c < 256 {
             Ok(vec![c as u8])
         } else {
             Err(())
         }
-    } else {
+    } else if cp == 65001 {
         match char::from_u32(c as u32) {
             Some(ch) => Ok(ch.to_string().into_bytes()),
             None => Err(()),
+        }
+    } else {
+        let (bytes, used_default) =
+            crate::kernel32::string::encode_utf16_to_cp(cp, &[c], None).map_err(|_| ())?;
+        if used_default || bytes.is_empty() {
+            Err(())
+        } else {
+            Ok(bytes)
         }
     }
 }

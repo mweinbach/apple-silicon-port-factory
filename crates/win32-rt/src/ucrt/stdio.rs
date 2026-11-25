@@ -910,11 +910,23 @@ pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {
         bad_fd();
         return -1;
     }
-    clear_u8_pending(fd);
+    let is_tell = whence == libc::SEEK_CUR && off == 0;
     let r = libc::lseek(fd, off, whence);
     if r < 0 {
         errno::set_from_host();
+        return -1;
     }
+    if is_tell {
+        let pend_bytes = FD_U8_PENDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&fd))
+            .map(|p| p.raw.len() as i64)
+            .unwrap_or(0);
+        return (r - pend_bytes).max(0);
+    }
+    clear_u8_pending(fd);
     r
 }
 pub unsafe extern "win64" fn _lseek(fd: i32, off: i32, whence: i32) -> i32 {
@@ -2950,6 +2962,21 @@ mod tests {
             }
             assert_eq!(String::from_utf16_lossy(&pipe_units), "ABCD😀");
             assert_eq!(_close(pfds[0]), 0);
+
+            // 8. Querying position via _telli64 mid-surrogate preserves pending low surrogate!
+            std::fs::write(dir.join("tell_surr.txt"), "😀B".as_bytes()).unwrap();
+            let fd_s = _open(b"U:\\tell_surr.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_s >= 0);
+            let mut u = [0u8; 2];
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let hi = u16::from_le_bytes(u);
+            assert!(_telli64(fd_s) >= 0);
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let lo = u16::from_le_bytes(u);
+            assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
+            let b_ch = u16::from_le_bytes(u);
+            assert_eq!(String::from_utf16_lossy(&[hi, lo, b_ch]), "😀B");
+            assert_eq!(_close(fd_s), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
