@@ -540,6 +540,7 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
 /// Thread teardown: FLS callbacks, DLL_THREAD_DETACH, signal waiters, release
 /// the borrowed TSD slots, and schedule custom stack reclamation.
 pub fn finish_current_thread(code: u32) {
+    crate::user32::misc::forget_thread_hotkeys(teb::thread_id());
     if let Some(obj) = current_thread_object() {
         obj.mark_exiting();
     }

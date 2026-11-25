@@ -1069,6 +1069,59 @@ fn geometry_tessellate_rect_concave_l_shape_and_ellipse() {
         assert!(!tris_contain_pt(&sink.tris, 7.5, 15.0), "middle ring must be empty");
         assert!(tris_contain_pt(&sink.tris, 15.0, 15.0), "inner island must be filled");
 
+        // 4e. Self-intersecting zero-signed-area bowtie: (0,0)->(10,10)->(0,10)->(10,0)
+        //     must NOT be discarded; both lobes are filled (area = 25 + 25 = 50).
+        let mut bowtie_geom: *mut c_void = std::ptr::null_mut();
+        let mut bt_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut bowtie_geom), S_OK);
+        assert_eq!(path_geom_open(bowtie_geom as PGeom, &mut bt_sink), S_OK);
+        set_fill_mode(bt_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(bt_sink as PGeomSink, &[(0.0, 0.0), (10.0, 10.0), (0.0, 10.0), (10.0, 0.0)]);
+        assert_eq!(gsink_close(bt_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(bowtie_geom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 50.0).abs() < 1e-2, "bowtie area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 5.0, 2.0), "lower bowtie lobe must be covered");
+        assert!(tris_contain_pt(&sink.tris, 5.0, 8.0), "upper bowtie lobe must be covered");
+        assert!(!tris_contain_pt(&sink.tris, 1.0, 5.0), "outside left of bowtie must be empty");
+        assert!(!tris_contain_pt(&sink.tris, 9.0, 5.0), "outside right of bowtie must be empty");
+
+        // 4f. Two overlapping squares under ALTERNATE (XOR area = 100) vs WINDING (union area = 150).
+        let mut ov_alt: *mut c_void = std::ptr::null_mut();
+        let mut ova_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut ov_alt), S_OK);
+        assert_eq!(path_geom_open(ov_alt as PGeom, &mut ova_sink), S_OK);
+        set_fill_mode(ova_sink, D2D1_FILL_MODE_ALTERNATE);
+        add_ring(ova_sink as PGeomSink, &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        add_ring(ova_sink as PGeomSink, &[(5.0, 0.0), (15.0, 0.0), (15.0, 10.0), (5.0, 10.0)]);
+        assert_eq!(gsink_close(ova_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(ov_alt as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 100.0).abs() < 1e-2, "overlapping ALTERNATE area {}", tri_area_sum(&sink.tris));
+        assert!(!tris_contain_pt(&sink.tris, 7.5, 5.0), "overlap region must be empty under ALTERNATE");
+
+        let mut ov_wind: *mut c_void = std::ptr::null_mut();
+        let mut ovw_sink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut ov_wind), S_OK);
+        assert_eq!(path_geom_open(ov_wind as PGeom, &mut ovw_sink), S_OK);
+        set_fill_mode(ovw_sink, D2D1_FILL_MODE_WINDING);
+        add_ring(ovw_sink as PGeomSink, &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+        add_ring(ovw_sink as PGeomSink, &[(5.0, 0.0), (15.0, 0.0), (15.0, 10.0), (5.0, 10.0)]);
+        assert_eq!(gsink_close(ovw_sink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(ov_wind as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!((tri_area_sum(&sink.tris) - 150.0).abs() < 1e-2, "overlapping WINDING area {}", tri_area_sum(&sink.tris));
+        assert!(tris_contain_pt(&sink.tris, 7.5, 5.0), "overlap region must be filled under WINDING");
+
+        release_com(ovw_sink);
+        release_com(ov_wind);
+        release_com(ova_sink);
+        release_com(ov_alt);
+        release_com(bt_sink);
+        release_com(bowtie_geom);
         release_com(isl_sink);
         release_com(island_geom);
         release_com(ws_sink);

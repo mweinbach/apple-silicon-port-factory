@@ -1264,6 +1264,41 @@ struct HotKeyEntry {
 
 static HOTKEYS: std::sync::Mutex<Vec<HotKeyEntry>> = std::sync::Mutex::new(Vec::new());
 
+struct HotKeyThreadGuard(u32);
+impl Drop for HotKeyThreadGuard {
+    fn drop(&mut self) {
+        forget_thread_hotkeys(self.0);
+    }
+}
+
+thread_local! {
+    static HOTKEY_THREAD_GUARD: std::cell::RefCell<Option<HotKeyThreadGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn arm_hotkey_thread_cleanup(tid: u32) {
+    HOTKEY_THREAD_GUARD.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.as_ref().map_or(true, |g| g.0 != tid) {
+            *guard = Some(HotKeyThreadGuard(tid));
+        }
+    });
+}
+
+fn prune_dead_hotkeys(list: &mut Vec<HotKeyEntry>) {
+    list.retain(|e| {
+        if e.hwnd != 0 && !super::window::exists(e.hwnd) {
+            return false;
+        }
+        if let Some(t) = crate::thread::find_by_tid(e.tid) {
+            if t.exit_code().is_some() {
+                return false;
+            }
+        }
+        true
+    });
+}
+
 /// Remove any registered hotkeys belonging to a destroyed window.
 pub(crate) fn forget_hotkeys(hwnd: usize) {
     if hwnd == 0 {
@@ -1272,13 +1307,23 @@ pub(crate) fn forget_hotkeys(hwnd: usize) {
     HOTKEYS.lock().unwrap().retain(|h| h.hwnd != hwnd);
 }
 
+/// Remove any registered hotkeys belonging to an exiting thread (including
+/// `hwnd == NULL` thread-targeted registrations).
+pub(crate) fn forget_thread_hotkeys(tid: u32) {
+    if tid == 0 {
+        return;
+    }
+    HOTKEYS.lock().unwrap().retain(|h| h.tid != tid);
+}
+
 /// Check if an incoming keydown matches a registered hotkey; if so, post
 /// `WM_HOTKEY` (0x0312) to the target window (or thread queue if `hwnd == 0`)
 /// and return `true` to consume the keystroke.
 pub(crate) fn try_dispatch_hotkey(mods: u32, vk: u32, is_repeat: bool) -> bool {
     let norm_mods = mods & MOD_MASK;
     let matched = {
-        let list = HOTKEYS.lock().unwrap();
+        let mut list = HOTKEYS.lock().unwrap();
+        prune_dead_hotkeys(&mut list);
         list.iter().find(|h| h.mods == norm_mods && h.vk == vk).copied()
     };
     let Some(entry) = matched else {
@@ -1290,7 +1335,8 @@ pub(crate) fn try_dispatch_hotkey(mods: u32, vk: u32, is_repeat: bool) -> bool {
     let lparam = ((entry.mods & 0xFFFF) | ((entry.vk & 0xFFFF) << 16)) as u32 as isize;
     if entry.hwnd != 0 {
         super::message::post_message(entry.hwnd, super::wm::HOTKEY, entry.id as usize, lparam);
-    } else if let Some(q) = super::message::queue_of(entry.tid) {
+    } else {
+        let q = super::message::queue_for(entry.tid);
         q.post(MSG {
             hwnd: 0,
             message: super::wm::HOTKEY,
@@ -1327,10 +1373,15 @@ pub unsafe extern "win64" fn RegisterHotKey(hwnd: HWND, id: i32, mods: u32, vk: 
                 return FALSE;
             }
         }
+    } else {
+        // Ensure a thread message queue exists immediately so a hotkey arriving
+        // before the thread's first PeekMessage/GetMessage is queued rather than dropped.
+        let _ = super::message::queue_for(tid);
     }
     let norm_mods = mods & MOD_MASK;
     let norepeat = (mods & MOD_NOREPEAT) != 0;
     let mut list = HOTKEYS.lock().unwrap();
+    prune_dead_hotkeys(&mut list);
     // Reject if another registration already owns this (mods, vk) pair.
     if list
         .iter()
@@ -1347,6 +1398,8 @@ pub unsafe extern "win64" fn RegisterHotKey(hwnd: HWND, id: i32, mods: u32, vk: 
     } else {
         list.push(HotKeyEntry { hwnd: h, tid, id, mods: norm_mods, norepeat, vk });
     }
+    drop(list);
+    arm_hotkey_thread_cleanup(tid);
     log::debug!("user32: RegisterHotKey(hwnd={h:#x}, id={id}, mods={mods:#x}, vk={vk:#x})");
     TRUE
 }
@@ -3556,6 +3609,48 @@ mod tests {
             assert_eq!(UnregisterHotKey(hwnd, 7), FALSE);
             assert_eq!(crate::teb::last_error(), e::HOTKEY_NOT_REGISTERED);
             let _ = super::super::window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+
+        // 6. Thread-targeted RegisterHotKey(NULL, ...) creates its queue before first pump
+        //    AND automatically releases its hotkey binding when the owning thread exits.
+        std::thread::spawn(|| unsafe {
+            // Register Ctrl+B on a brand-new thread with no window and no prior message pump.
+            assert_eq!(RegisterHotKey(std::ptr::null_mut(), 42, 0x0002, b'B' as u32), TRUE);
+            // Fire Ctrl+B before this thread ever calls PeekMessageW.
+            super::super::input::native_key(super::super::input::NativeKey {
+                mac: 0x3B, down: true, repeat: false, chars: Vec::new(),
+            });
+            super::super::input::native_key(super::super::input::NativeKey {
+                mac: 0x0B, down: true, repeat: false, chars: vec![b'b' as u16],
+            });
+            super::super::input::release_all_keys();
+
+            let mut m = MSG::default();
+            assert_eq!(
+                super::super::message::PeekMessageW(
+                    &mut m,
+                    std::ptr::null_mut(),
+                    wm::HOTKEY,
+                    wm::HOTKEY,
+                    super::super::message::PM_REMOVE,
+                ),
+                TRUE,
+                "hotkey arriving before first pump must be delivered to thread queue"
+            );
+            assert_eq!(m.hwnd, 0);
+            assert_eq!(m.wparam, 42);
+            assert_eq!(m.lparam, ((0x0002u32) | ((b'B' as u32) << 16)) as isize);
+            // Intentionally exit WITHOUT calling UnregisterHotKey to verify teardown cleanup.
+        })
+        .join()
+        .unwrap();
+
+        // A replacement thread must now be able to register Ctrl+B cleanly (no stale conflict).
+        std::thread::spawn(|| unsafe {
+            assert_eq!(RegisterHotKey(std::ptr::null_mut(), 43, 0x0002, b'B' as u32), TRUE);
+            assert_eq!(UnregisterHotKey(std::ptr::null_mut(), 43), TRUE);
         })
         .join()
         .unwrap();

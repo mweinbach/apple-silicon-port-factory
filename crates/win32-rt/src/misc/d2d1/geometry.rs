@@ -1341,10 +1341,196 @@ fn triangulate_ccw_polygon(pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
     }
 }
 
+/// Intersection, T-junction, or collinear overlap point between non-adjacent
+/// closed segments `(a, b)` and `(c, d)`, if any.
+fn seg_touch_or_intersection(
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+    d: (f32, f32),
+) -> Option<(f32, f32)> {
+    let r = ((b.0 - a.0) as f64, (b.1 - a.1) as f64);
+    let s = ((d.0 - c.0) as f64, (d.1 - c.1) as f64);
+    let denom = r.0 * s.1 - r.1 * s.0;
+    let qp = ((c.0 - a.0) as f64, (c.1 - a.1) as f64);
+    const EPS: f64 = 1e-6;
+    if denom.abs() >= 1e-9 {
+        let t = (qp.0 * s.1 - qp.1 * s.0) / denom;
+        let u = (qp.0 * r.1 - qp.1 * r.0) / denom;
+        if t >= -EPS && t <= 1.0 + EPS && u >= -EPS && u <= 1.0 + EPS {
+            let tc = t.clamp(0.0, 1.0);
+            return Some(((a.0 as f64 + tc * r.0) as f32, (a.1 as f64 + tc * r.1) as f32));
+        }
+        return None;
+    }
+    // Parallel / collinear check: detect overlapping collinear segments.
+    let len_r = r.0.hypot(r.1);
+    if len_r < 1e-7 || (qp.0 * r.1 - qp.1 * r.0).abs() > 1e-5 * len_r {
+        return None;
+    }
+    let proj = |p: (f32, f32)| -> f64 {
+        ((p.0 - a.0) as f64) * r.0 + ((p.1 - a.1) as f64) * r.1
+    };
+    let r2 = r.0 * r.0 + r.1 * r.1;
+    let p0 = (proj(c) / r2).min(proj(d) / r2);
+    let p1 = (proj(c) / r2).max(proj(d) / r2);
+    let lo = p0.max(0.0);
+    let hi = p1.min(1.0);
+    if hi - lo > EPS {
+        let mid = 0.5 * (lo + hi);
+        Some(((a.0 as f64 + mid * r.0) as f32, (a.1 as f64 + mid * r.1) as f32))
+    } else {
+        None
+    }
+}
+
+/// Collect all edge-edge intersections / overlaps across a set of closed rings.
+fn collect_edge_intersections(rings: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)> {
+    let mut segs: Vec<((f32, f32), (f32, f32), usize, usize)> = Vec::new();
+    for (ri, pts) in rings.iter().enumerate() {
+        let n = pts.len();
+        for ei in 0..n {
+            segs.push((pts[ei], pts[(ei + 1) % n], ri, ei));
+        }
+    }
+    let mut hits = Vec::new();
+    for i in 0..segs.len() {
+        let (a, b, r1, e1) = segs[i];
+        let n1 = rings[r1].len();
+        for &(c, d, r2, e2) in &segs[i + 1..] {
+            // Adjacent edges in the same ring share an endpoint by construction.
+            if r1 == r2 && (e2 == (e1 + 1) % n1 || e1 == (e2 + 1) % n1) {
+                continue;
+            }
+            if let Some(p) = seg_touch_or_intersection(a, b, c, d) {
+                hits.push(p);
+            }
+        }
+    }
+    hits
+}
+
+/// Exact horizontal-slab trapezoidation for self-intersecting or mutually-intersecting
+/// contours. Evaluates the exact Direct2D fill rule (`ALTERNATE` or `WINDING`, matching
+/// `point_in_subpaths`) on every crossing-free horizontal strip.
+fn tessellate_scanline_slabs(
+    rings: &[Vec<(f32, f32)>],
+    intersections: &[(f32, f32)],
+    fill_mode: u32,
+    out: &mut Vec<D2D1_TRIANGLE>,
+) {
+    let mut ys: Vec<f64> = Vec::new();
+    for pts in rings {
+        for &(_, y) in pts {
+            ys.push(y as f64);
+        }
+    }
+    for &(_, y) in intersections {
+        ys.push(y as f64);
+    }
+    ys.sort_by(|a, b| a.total_cmp(b));
+    let mut unique_ys: Vec<f64> = Vec::with_capacity(ys.len());
+    for y in ys {
+        if unique_ys.last().map_or(true, |&prev| (y - prev).abs() > 1e-5) {
+            unique_ys.push(y);
+        }
+    }
+    if unique_ys.len() < 2 {
+        return;
+    }
+
+    let push_tri = |out: &mut Vec<D2D1_TRIANGLE>, a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        if poly_cross(a, b, c).abs() > 1e-8 {
+            out.push(D2D1_TRIANGLE {
+                point1: D2D1_POINT_2F { x: a.0, y: a.1 },
+                point2: D2D1_POINT_2F { x: b.0, y: b.1 },
+                point3: D2D1_POINT_2F { x: c.0, y: c.1 },
+            });
+        }
+    };
+
+    // (x_mid, x_lo, x_hi, winding_dir)
+    let mut crossings: Vec<(f64, f64, f64, i32)> = Vec::new();
+    for pair in unique_ys.windows(2) {
+        let y_lo = pair[0];
+        let y_hi = pair[1];
+        if y_hi - y_lo <= 1e-6 {
+            continue;
+        }
+        let y_mid = 0.5 * (y_lo + y_hi);
+        crossings.clear();
+        for pts in rings {
+            let n = pts.len();
+            for i in 0..n {
+                let (x0, y0) = (pts[i].0 as f64, pts[i].1 as f64);
+                let (x1, y1) = (pts[(i + 1) % n].0 as f64, pts[(i + 1) % n].1 as f64);
+                if (y0 <= y_mid && y1 > y_mid) || (y1 <= y_mid && y0 > y_mid) {
+                    let inv_dy = 1.0 / (y1 - y0);
+                    let dx = x1 - x0;
+                    let x_lo = x0 + (y_lo - y0) * inv_dy * dx;
+                    let x_mid = x0 + (y_mid - y0) * inv_dy * dx;
+                    let x_hi = x0 + (y_hi - y0) * inv_dy * dx;
+                    let dir = if y1 > y0 { 1 } else { -1 };
+                    crossings.push((x_mid, x_lo, x_hi, dir));
+                }
+            }
+        }
+        crossings.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+        });
+        let mut winding = 0i32;
+        let y_lo_f = y_lo as f32;
+        let y_hi_f = y_hi as f32;
+        for idx in 0..crossings.len().saturating_sub(1) {
+            let (_, xl0, xh0, dir) = crossings[idx];
+            let (_, xl1, xh1, _) = crossings[idx + 1];
+            winding += dir;
+            let filled = if fill_mode == D2D1_FILL_MODE_WINDING {
+                winding != 0
+            } else {
+                (winding & 1) != 0
+            };
+            if !filled {
+                continue;
+            }
+            let bl = (xl0 as f32, y_lo_f);
+            let br = (xl1 as f32, y_lo_f);
+            let tr = (xh1 as f32, y_hi_f);
+            let tl = (xh0 as f32, y_hi_f);
+            push_tri(out, bl, br, tr);
+            push_tri(out, bl, tr, tl);
+        }
+    }
+}
+
 /// Resolve all filled contours under `fill_mode` (`D2D1_FILL_MODE_ALTERNATE` or
 /// `D2D1_FILL_MODE_WINDING`), bridge holes into their enclosing outer contours, and
 /// emit triangles covering the exact filled region.
 fn tessellate_flattened(fg: &FlattenedGeometry, out: &mut Vec<D2D1_TRIANGLE>) {
+    let mut raw_rings: Vec<Vec<(f32, f32)>> = Vec::new();
+    for sp in &fg.subpaths {
+        if !sp.filled || sp.points.len() < 3 {
+            continue;
+        }
+        let pts = clean_ring(&sp.points);
+        if pts.len() >= 3 {
+            raw_rings.push(pts);
+        }
+    }
+    if raw_rings.is_empty() {
+        return;
+    }
+
+    // If any contours self-intersect (e.g. a zero-signed-area bowtie) or cross one another,
+    // decompose via exact horizontal slabs under `fg.fill_mode` BEFORE discarding zero-area rings.
+    let intersections = collect_edge_intersections(&raw_rings);
+    if !intersections.is_empty() {
+        tessellate_scanline_slabs(&raw_rings, &intersections, fg.fill_mode, out);
+        return;
+    }
+
     struct Ring {
         pts: Vec<(f32, f32)>,
         area2: f64,
@@ -1360,14 +1546,7 @@ fn tessellate_flattened(fg: &FlattenedGeometry, out: &mut Vec<D2D1_TRIANGLE>) {
     }
 
     let mut rings: Vec<Ring> = Vec::new();
-    for sp in &fg.subpaths {
-        if !sp.filled || sp.points.len() < 3 {
-            continue;
-        }
-        let pts = clean_ring(&sp.points);
-        if pts.len() < 3 {
-            continue;
-        }
+    for pts in raw_rings {
         let area2 = poly_signed_area2(&pts);
         if area2.abs() < 1e-8 {
             continue;
