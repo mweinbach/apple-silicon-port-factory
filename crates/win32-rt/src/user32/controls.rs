@@ -432,6 +432,20 @@ fn activate_button_click(hwnd: usize, native_check_override: Option<u32>) {
             }
             uncheck_sibling_auto_radios(hwnd, parent);
         }
+        BS_CHECKBOX | BS_3STATE | BS_RADIOBUTTON => {
+            // Manual check/radio styles are controlled solely by the application via
+            // BM_SETCHECK; if AppKit visually toggled the NSButton on click, restore
+            // the stored Win32 check state before notifying the parent.
+            if native && native_check_override.is_some() {
+                let cur = button_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&hwnd)
+                    .map(|s| s.check)
+                    .unwrap_or(BST_UNCHECKED);
+                crate::macos::control_set_check(hwnd, cur);
+            }
+        }
         _ => {}
     }
 
@@ -2281,6 +2295,42 @@ mod tests {
             assert!(!window::effective_child_visible(nested_edit as usize));
             super::super::window::SetWindowLongW(page, super::super::window::GWL_STYLE, (cur_style | ws::VISIBLE) as i32);
             assert!(window::effective_child_visible(nested_edit as usize));
+
+            // Moving the child container updates descendant root-relative rects.
+            assert_eq!(
+                window::root_top_level_and_rect(nested_edit as usize),
+                Some((parent as usize, RECT::new(18, 18, 218, 42)))
+            );
+            assert_eq!(super::super::window::MoveWindow(page, 50, 70, 300, 200, TRUE), TRUE);
+            assert_eq!(
+                window::root_top_level_and_rect(nested_edit as usize),
+                Some((parent as usize, RECT::new(58, 78, 258, 102)))
+            );
+
+            // Manual BS_CHECKBOX / BS_3STATE / BS_RADIOBUTTON native clicks keep
+            // application-controlled state unchanged when parent ignores BN_CLICKED.
+            COMMAND_LOG.lock().unwrap().clear();
+            let h_manual_chk = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Manual").as_ptr(),
+                ws::CHILD | ws::VISIBLE | BS_CHECKBOX,
+                8,
+                80,
+                120,
+                24,
+                parent,
+                403,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!h_manual_chk.is_null());
+            assert_eq!(SendMessageW(h_manual_chk, wm::BM_GETCHECK, 0, 0), BST_UNCHECKED as LRESULT);
+            native_button_clicked(h_manual_chk as usize, Some(BST_CHECKED));
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+            assert_eq!(SendMessageW(h_manual_chk, wm::BM_GETCHECK, 0, 0), BST_UNCHECKED as LRESULT);
+            assert_eq!(*COMMAND_LOG.lock().unwrap(), vec![(403, BN_CLICKED as u16, h_manual_chk as usize)]);
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);

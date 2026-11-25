@@ -1165,6 +1165,8 @@ pub(super) fn progress_window_close() {
 struct ControlTargetIvar {
     hwnd: Cell<usize>,
     is_toggle: Cell<bool>,
+    is_manual_toggle: Cell<bool>,
+    stored_check: Cell<u32>,
 }
 
 define_class!(
@@ -1180,6 +1182,15 @@ define_class!(
         #[unsafe(method(buttonClicked:))]
         fn button_clicked(&self, sender: &NSButton) {
             let hwnd = self.ivars().hwnd.get();
+            if self.ivars().is_manual_toggle.get() {
+                // Restore the application-controlled Win32 state immediately so
+                // clicking a manual BS_CHECKBOX / BS_3STATE / BS_RADIOBUTTON never
+                // leaves the native button out of sync if the parent ignores BN_CLICKED.
+                let cur = self.ivars().stored_check.get();
+                sender.setState(ns_state_from_check(cur));
+                controls::native_button_clicked(hwnd, Some(cur));
+                return;
+            }
             let check = if self.ivars().is_toggle.get() {
                 let st = sender.state();
                 let v = if st == NSControlStateValueOn {
@@ -1189,6 +1200,7 @@ define_class!(
                 } else {
                     controls::BST_UNCHECKED
                 };
+                self.ivars().stored_check.set(v);
                 Some(v)
             } else {
                 None
@@ -1198,11 +1210,35 @@ define_class!(
     }
 );
 
+fn ns_state_from_check(state: u32) -> isize {
+    match state & 0x3 {
+        controls::BST_CHECKED => NSControlStateValueOn,
+        controls::BST_INDETERMINATE => NSControlStateValueMixed,
+        _ => NSControlStateValueOff,
+    }
+}
+
+fn button_toggle_flags(style: u32) -> (bool, bool) {
+    let btn_type = style & controls::BS_TYPEMASK;
+    let is_auto = matches!(
+        btn_type,
+        controls::BS_AUTOCHECKBOX | controls::BS_AUTO3STATE | controls::BS_AUTORADIOBUTTON
+    );
+    let is_manual = matches!(
+        btn_type,
+        controls::BS_CHECKBOX | controls::BS_3STATE | controls::BS_RADIOBUTTON
+    );
+    (is_auto || is_manual, is_manual)
+}
+
 impl AW2ControlTarget {
-    fn new(mtm: MainThreadMarker, hwnd: usize, is_toggle: bool) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, hwnd: usize, style: u32) -> Retained<Self> {
+        let (is_toggle, is_manual_toggle) = button_toggle_flags(style);
         let this = Self::alloc(mtm).set_ivars(ControlTargetIvar {
             hwnd: Cell::new(hwnd),
             is_toggle: Cell::new(is_toggle),
+            is_manual_toggle: Cell::new(is_manual_toggle),
+            stored_check: Cell::new(controls::BST_UNCHECKED),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -1435,7 +1471,7 @@ impl AW2TextDelegate {
 enum NativeControlView {
     Button {
         button: Retained<NSButton>,
-        _target: Retained<AW2ControlTarget>,
+        target: Retained<AW2ControlTarget>,
     },
     GroupBox {
         box_view: Retained<NSBox>,
@@ -1664,21 +1700,12 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                 button.setTitle(&NSString::from_str(&title));
                 button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
                 button.setEnabled(desc.enabled);
-                let is_toggle = matches!(
-                    btn_type,
-                    controls::BS_CHECKBOX
-                        | controls::BS_AUTOCHECKBOX
-                        | controls::BS_3STATE
-                        | controls::BS_AUTO3STATE
-                        | controls::BS_RADIOBUTTON
-                        | controls::BS_AUTORADIOBUTTON
-                );
-                let target = AW2ControlTarget::new(mtm, hwnd, is_toggle);
+                let target = AW2ControlTarget::new(mtm, hwnd, desc.style);
                 unsafe {
                     button.setTarget(Some(&*target));
                     button.setAction(Some(sel!(buttonClicked:)));
                 }
-                NativeControlView::Button { button, _target: target }
+                NativeControlView::Button { button, target }
             }
         }
         NativeControlKind::Edit => {
@@ -2019,13 +2046,10 @@ pub(super) fn control_set_check(hwnd: usize, state: u32) {
     CONTROLS.with(|m| {
         let map = m.borrow();
         let Some(ctrl) = map.get(&hwnd) else { return };
-        if let NativeControlView::Button { button, .. } = &ctrl.view {
-            let v = match state & 0x3 {
-                controls::BST_CHECKED => NSControlStateValueOn,
-                controls::BST_INDETERMINATE => NSControlStateValueMixed,
-                _ => NSControlStateValueOff,
-            };
-            button.setState(v);
+        if let NativeControlView::Button { button, target } = &ctrl.view {
+            let clamped = state & 0x3;
+            target.ivars().stored_check.set(clamped);
+            button.setState(ns_state_from_check(clamped));
         }
     });
 }
@@ -2035,7 +2059,12 @@ pub(super) fn control_set_style(hwnd: usize, style: u32) {
         let map = m.borrow();
         let Some(ctrl) = map.get(&hwnd) else { return };
         match &ctrl.view {
-            NativeControlView::Button { button, .. } => apply_button_style(button, style),
+            NativeControlView::Button { button, target } => {
+                let (is_toggle, is_manual) = button_toggle_flags(style);
+                target.ivars().is_toggle.set(is_toggle);
+                target.ivars().is_manual_toggle.set(is_manual);
+                apply_button_style(button, style);
+            }
             NativeControlView::SingleLineEdit { field, edit_style, .. } => {
                 edit_style.set(style);
                 field.setEditable((style & controls::ES_READONLY) == 0);

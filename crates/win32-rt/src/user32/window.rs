@@ -747,7 +747,7 @@ fn sync_descendant_native_controls(parent_hwnd: usize, sync_frame: bool, sync_vi
 
 /// Walk up `WS_CHILD` ancestors to find the root top-level HWND and this
 /// child's rectangle in that top-level window's client pixel coordinates.
-fn root_top_level_and_rect(hwnd: usize) -> Option<(usize, RECT)> {
+pub(crate) fn root_top_level_and_rect(hwnd: usize) -> Option<(usize, RECT)> {
     let w = get(hwnd)?;
     let (mut cur, mut rect, is_child) = {
         let d = w.data();
