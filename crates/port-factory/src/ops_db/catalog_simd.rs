@@ -294,11 +294,11 @@ macro_rules! simd_ops {
                 encodings: "Legacy",
                 operand_forms: "R,M,IMP",
                 widths: "16,32,64,80",
-                arm64_pattern: "Generic iced-x86 interpreter fallback (x87 ST(0..7) f64 stack + m80fp)",
+                arm64_pattern: "Generic iced-x86 interpreter fallback (raw 80-bit x87 register stack)",
                 semantics: "Interpreted in regfile_ext::exec_x87_ins; not lowered to ARM64 JIT",
                 tier: TranslationTier::GenericInterp,
                 source_file: "crates/x86-runtime/src/emu/regfile_ext.rs",
-                verified_vectors: 16,
+                verified_vectors: 22,
             },
             OpRecord {
                 id: "TRAP_OR_BOUNDARY",
