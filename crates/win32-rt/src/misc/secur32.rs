@@ -366,4 +366,4 @@ pub unsafe extern "win64" fn InitSecurityInterfaceW() -> *mut c_void {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

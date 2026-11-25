@@ -1688,6 +1688,7 @@ unsafe fn verify_pkcs7_signer_chain(
     verified: &VerifiedAuthenticode,
     all_certs_der: &[Vec<u8>],
     policy_oid: usize,
+    policy_extra: *const c_void,
 ) -> i32 {
     let Some(leaf) = verified.certs.first() else {
         return TRUST_E_NOSIGNATURE;
@@ -1720,6 +1721,7 @@ unsafe fn verify_pkcs7_signer_chain(
         if extra_store.is_null() { std::ptr::null() } else { stores.as_ptr() },
         std::ptr::null(),
         policy_oid,
+        policy_extra,
     );
     if !extra_store.is_null() {
         super::crypt32::CertCloseStore(extra_store, 0);
@@ -1962,6 +1964,7 @@ unsafe fn verify_cert_via_chain_policy(
     pah_stores: *const *mut c_void,
     p_time: *const c_void,
     policy_oid: usize,
+    policy_extra: *const c_void,
 ) -> i32 {
     if cert_ctx.is_null() {
         return TRUST_E_NOSIGNATURE;
@@ -2007,6 +2010,12 @@ unsafe fn verify_cert_via_chain_policy(
     }
 
     #[repr(C)]
+    struct PolicyPara {
+        cb_size: u32,
+        dw_flags: u32,
+        pv_extra_policy_para: *const c_void,
+    }
+    #[repr(C)]
     struct PolicyStatus {
         cb_size: u32,
         dw_error: u32,
@@ -2014,6 +2023,16 @@ unsafe fn verify_cert_via_chain_policy(
         l_element_index: i32,
         pv_extra: *mut c_void,
     }
+    let policy_para = PolicyPara {
+        cb_size: std::mem::size_of::<PolicyPara>() as u32,
+        dw_flags: 0,
+        pv_extra_policy_para: policy_extra,
+    };
+    let p_para = if policy_extra.is_null() {
+        std::ptr::null()
+    } else {
+        &policy_para as *const PolicyPara as *const c_void
+    };
     let mut status = PolicyStatus {
         cb_size: std::mem::size_of::<PolicyStatus>() as u32,
         dw_error: 0,
@@ -2024,7 +2043,7 @@ unsafe fn verify_cert_via_chain_policy(
     let pok = super::crypt32::CertVerifyCertificateChainPolicy(
         policy_oid as *const u8,
         chain_ctx,
-        std::ptr::null(),
+        p_para,
         &mut status as *mut PolicyStatus as *mut c_void,
     );
     super::crypt32::CertFreeCertificateChain(chain_ctx);
@@ -2077,6 +2096,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
         return TRUST_E_NOSIGNATURE;
     }
 
+    let p_policy_callback_data = std::ptr::read_unaligned(base.add(0x08) as *const *const c_void);
     let chain_policy_oid: usize = if guid == HTTPSPROV_ACTION {
         4 // CERT_CHAIN_POLICY_SSL
     } else if guid == WINTRUST_ACTION_GENERIC_CERT_VERIFY
@@ -2085,6 +2105,31 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
         1 // CERT_CHAIN_POLICY_BASE
     } else {
         2 // CERT_CHAIN_POLICY_AUTHENTICODE
+    };
+    let policy_extra: *const c_void = if guid == HTTPSPROV_ACTION && !p_policy_callback_data.is_null() {
+        // Validate HTTPSPolicyCallbackData / SSL_EXTRA_CERT_CHAIN_POLICY_PARA (24B on Win64):
+        // cbStruct @ +0x00, dwAuthType @ +0x04 (1=CLIENT, 2=SERVER), fdwChecks @ +0x08, pwszServerName @ +0x10
+        let p = p_policy_callback_data as *const u8;
+        let cb_ssl = std::ptr::read_unaligned(p as *const u32);
+        if cb_ssl < 0x18 {
+            return 0x8007_0057u32 as i32; // E_INVALIDARG
+        }
+        let dw_auth_type = std::ptr::read_unaligned(p.add(0x04) as *const u32);
+        if dw_auth_type != 1 && dw_auth_type != 2 {
+            return 0x8007_0057u32 as i32; // E_INVALIDARG
+        }
+        let fdw_checks = std::ptr::read_unaligned(p.add(0x08) as *const u32);
+        let pwsz_server = std::ptr::read_unaligned(p.add(0x10) as *const *const u16);
+        let ignore_cn = (fdw_checks & 0x0000_1000) != 0; // SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+        if dw_auth_type == 2 && !ignore_cn {
+            let empty_name = pwsz_server.is_null() || crate::strings::from_wide(pwsz_server).is_empty();
+            if empty_name {
+                return 0x800B_010Fu32 as i32; // CERT_E_CN_NO_MATCH
+            }
+        }
+        p_policy_callback_data
+    } else {
+        std::ptr::null()
     };
 
     match union_choice {
@@ -2127,8 +2172,12 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                     let ncerts = verified.certs.len();
                     let all_der: Vec<Vec<u8>> =
                         verified.certs.iter().map(|c| c.raw_der.clone()).collect();
-                    let chain_rc =
-                        verify_pkcs7_signer_chain(&verified, &all_der, chain_policy_oid);
+                    let chain_rc = verify_pkcs7_signer_chain(
+                        &verified,
+                        &all_der,
+                        chain_policy_oid,
+                        policy_extra,
+                    );
                     if state_action == WTD_STATEACTION_VERIFY {
                         let h = alloc_provider_state(verified, data);
                         std::ptr::write_unaligned(state_data_slot, h);
@@ -2234,8 +2283,12 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             }
 
             // Step 3: Validate the catalog signer's certificate chain & action policy.
-            let chain_rc =
-                verify_pkcs7_signer_chain(&p7.verified, &p7.all_certs_der, chain_policy_oid);
+            let chain_rc = verify_pkcs7_signer_chain(
+                &p7.verified,
+                &p7.all_certs_der,
+                chain_policy_oid,
+                policy_extra,
+            );
             if state_action == WTD_STATEACTION_VERIFY {
                 let h = alloc_provider_state(p7.verified, data);
                 std::ptr::write_unaligned(state_data_slot, h);
@@ -2269,6 +2322,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                             &p7.verified,
                             &p7.all_certs_der,
                             chain_policy_oid,
+                            policy_extra,
                         );
                         if state_action == WTD_STATEACTION_VERIFY {
                             let h = alloc_provider_state(p7.verified, data);
@@ -2285,8 +2339,12 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                         Ok(verified) => {
                             let all_der: Vec<Vec<u8>> =
                                 verified.certs.iter().map(|c| c.raw_der.clone()).collect();
-                            let chain_rc =
-                                verify_pkcs7_signer_chain(&verified, &all_der, chain_policy_oid);
+                            let chain_rc = verify_pkcs7_signer_chain(
+                                &verified,
+                                &all_der,
+                                chain_policy_oid,
+                                policy_extra,
+                            );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(verified, data);
                                 std::ptr::write_unaligned(state_data_slot, h);
@@ -2302,6 +2360,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 &p7.verified,
                                 &p7.all_certs_der,
                                 chain_policy_oid,
+                                policy_extra,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(p7.verified, data);
@@ -2350,6 +2409,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 pah_stores,
                 std::ptr::null(),
                 chain_policy_oid,
+                policy_extra,
             );
             super::crypt32::CertFreeCertificateContext(found_cert);
             rc
@@ -2377,7 +2437,14 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             } else {
                 std::ptr::null()
             };
-            verify_cert_via_chain_policy(cert_ctx, ch_stores, pah_stores, p_time, chain_policy_oid)
+            verify_cert_via_chain_policy(
+                cert_ctx,
+                ch_stores,
+                pah_stores,
+                p_time,
+                chain_policy_oid,
+                policy_extra,
+            )
         }
         other => {
             // Per MSDN: unrecognized dwUnionChoice returns TRUST_E_SUBJECT_FORM_UNKNOWN.
@@ -2741,6 +2808,81 @@ mod tests {
                     crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
                 );
             }
+
+            // HTTPSPROV_ACTION forwards WINTRUST_DATA.pPolicyCallbackData (HTTPSPolicyCallbackData)
+            // into CERT_CHAIN_POLICY_SSL so mismatched or missing server names are rejected.
+            let tls_leaf_der = crate::misc::secur32::tests::TEST_LEAF_DER;
+            let tls_cert = crate::misc::crypt32::CertCreateCertificateContext(
+                X509_ASN_ENCODING,
+                tls_leaf_der.as_ptr(),
+                tls_leaf_der.len() as u32,
+            );
+            assert!(!tls_cert.is_null());
+            std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x10) as *mut *const c_void, tls_cert);
+            let wrong_host_w = crate::strings::to_wide_z("wrong.example.com");
+            let right_host_w = crate::strings::to_wide_z("test.example.com");
+            let mut https_para = [0u8; 0x18];
+            std::ptr::write_unaligned(https_para.as_mut_ptr() as *mut u32, 0x18u32); // cbStruct
+            std::ptr::write_unaligned(https_para.as_mut_ptr().add(0x04) as *mut u32, 2u32); // AUTHTYPE_SERVER
+            std::ptr::write_unaligned(https_para.as_mut_ptr().add(0x08) as *mut u32, 0x0100u32); // SECURITY_FLAG_IGNORE_UNKNOWN_CA
+            std::ptr::write_unaligned(
+                https_para.as_mut_ptr().add(0x10) as *mut *const u16,
+                wrong_host_w.as_ptr(),
+            );
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                https_para.as_ptr() as *const c_void,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x800B_010Fu32 as i32, // CERT_E_CN_NO_MATCH
+            );
+            // Missing server name with AUTHTYPE_SERVER (without IGNORE_CN) is also rejected
+            std::ptr::write_unaligned(
+                https_para.as_mut_ptr().add(0x10) as *mut *const u16,
+                std::ptr::null(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x800B_010Fu32 as i32, // CERT_E_CN_NO_MATCH
+            );
+            // Matching SAN hostname passes
+            std::ptr::write_unaligned(
+                https_para.as_mut_ptr().add(0x10) as *mut *const u16,
+                right_host_w.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+            );
+            // Truncated HTTPSPolicyCallbackData -> E_INVALIDARG
+            std::ptr::write_unaligned(https_para.as_mut_ptr() as *mut u32, 8u32);
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    HTTPSPROV_ACTION.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x8007_0057u32 as i32,
+            );
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                std::ptr::null(),
+            );
+            std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x10) as *mut *const c_void, cert);
+            crate::misc::crypt32::CertFreeCertificateContext(tls_cert);
 
             // WTD_CHOICE_SIGNER with real CMSG_SIGNER_INFO matching the cert in `st`
             let cctx = std::ptr::read_unaligned(cert as *const CertContext);
