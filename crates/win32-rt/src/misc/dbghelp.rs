@@ -37,7 +37,7 @@ struct PdbLineCache {
     lines: Vec<PdbLineEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SymModule {
     base: u64,
     size: u32,
@@ -49,8 +49,8 @@ struct SymModule {
 struct SymState {
     search_path: String,
     modules: Vec<SymModule>,
-    /// Per-module base address -> parsed PDB line info (`None` = searched and not found).
-    pdb_lines: HashMap<u64, Option<PdbLineCache>>,
+    /// Per-module identity -> parsed PDB line info (`None` = searched and not found).
+    pdb_lines: HashMap<SymModule, Option<PdbLineCache>>,
 }
 
 fn sym_table() -> &'static Mutex<HashMap<usize, SymState>> {
@@ -231,6 +231,8 @@ pub unsafe extern "win64" fn SymLoadModule64(
     let mut tbl = sym_table().lock().unwrap();
     let st = tbl.entry(proc_key(process)).or_default();
     st.modules.retain(|m| m.base != base);
+    // Invalidate any cached PDB lines (or negative lookup) previously stored for this base address.
+    st.pdb_lines.retain(|m, _| m.base != base);
     st.modules.push(SymModule {
         base,
         size: size_of_dll,
@@ -2066,7 +2068,7 @@ unsafe fn sym_get_line_impl(
     let search_path = st.search_path.clone();
     let cache = st
         .pdb_lines
-        .entry(m.base)
+        .entry(m.clone())
         .or_insert_with(|| load_pdb_for_module(&m, &search_path));
     let Some(cache) = cache.as_ref() else {
         crate::teb::set_last_error(ERROR_INVALID_ADDRESS);
@@ -3602,5 +3604,88 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn sym_load_module64_invalidates_cached_pdb_lines_and_negative_cache_on_replace() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sym_dir = std::env::temp_dir().join(format!("pf_pdb_replace_{uniq}"));
+        std::fs::create_dir_all(&sym_dir).unwrap();
+
+        let pdb_b = build_minimal_pdb_with_id("src\\mod_b.cpp", 0x200, 42, [0x22; 16], 1);
+        std::fs::write(sym_dir.join("mod_b.pdb"), &pdb_b).unwrap();
+        let pdb_c = build_minimal_pdb_with_id("src\\mod_c.cpp", 0x200, 99, [0x33; 16], 1);
+        std::fs::write(sym_dir.join("mod_c.pdb"), &pdb_c).unwrap();
+
+        // Synthetic base address (not a real PE in memory, so fallback `<module>.pdb` lookup is used).
+        let shared_base = 0x0000_0007_1234_0000u64;
+        let query_addr = shared_base + 0x1200; // section 1 default RVA 0x1000 + offset 0x200
+
+        unsafe {
+            let proc_h = 0x7777usize as HANDLE;
+            let sp = format!("{}\0", sym_dir.display());
+            assert_eq!(SymInitialize(proc_h, sp.as_ptr(), FALSE), TRUE);
+
+            let mut disp = 0u32;
+            let mut line = [0u8; 40];
+            (line.as_mut_ptr() as *mut u32).write_unaligned(40);
+
+            // 1. Load module A without a PDB -> populates negative cache at `shared_base`.
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    b"C:\\tmp\\missing_a.dll\0".as_ptr(),
+                    b"missing_a.dll\0".as_ptr(),
+                    shared_base,
+                    0x10_000,
+                ),
+                shared_base
+            );
+            assert_eq!(SymGetLineFromAddr64(proc_h, query_addr, &mut disp, line.as_mut_ptr()), FALSE);
+
+            // 2. Replace at the same base address with module B (valid PDB) -> must invalidate
+            //    the negative cache and resolve `src\mod_b.cpp` line 42.
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    b"C:\\tmp\\mod_b.dll\0".as_ptr(),
+                    b"mod_b.dll\0".as_ptr(),
+                    shared_base,
+                    0x10_000,
+                ),
+                shared_base
+            );
+            assert_eq!(SymGetLineFromAddr64(proc_h, query_addr, &mut disp, line.as_mut_ptr()), TRUE);
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 42);
+            let name_b_ptr = (line.as_ptr().add(24) as *const usize).read_unaligned() as *const u8;
+            assert_eq!(crate::strings::from_ansi(name_b_ptr), "src\\mod_b.cpp");
+
+            // 3. Replace at the same base address with module C (different PDB) -> must invalidate
+            //    the positive cache and resolve `src\mod_c.cpp` line 99 (not stale mod_b).
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    b"C:\\tmp\\mod_c.dll\0".as_ptr(),
+                    b"mod_c.dll\0".as_ptr(),
+                    shared_base,
+                    0x10_000,
+                ),
+                shared_base
+            );
+            assert_eq!(SymGetLineFromAddr64(proc_h, query_addr, &mut disp, line.as_mut_ptr()), TRUE);
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 99);
+            let name_c_ptr = (line.as_ptr().add(24) as *const usize).read_unaligned() as *const u8;
+            assert_eq!(crate::strings::from_ansi(name_c_ptr), "src\\mod_c.cpp");
+
+            assert_eq!(SymCleanup(proc_h), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&sym_dir);
     }
 }
