@@ -7,11 +7,15 @@ for the port factory. Run it via `cargo opsdb -- <command>` or `./tools/opsdb.sh
 
 ## 1. Architecture & Catalogs
 
+`doctor` compares five generated TSVs, checks ops and Win32 source references and verifies the
+published catalog counts. `doctor --fix` refreshes generated rows and the marked block in
+STATUS. Correct broken source references in the generator.
+
 | Component | Code & Data | What it does |
 |---|---|---|
-| **x86-64 → ARM64 Ops DB** | `crates/port-factory/src/ops_db/`, `db/ops_x86_to_arm64.tsv` | Canonical catalog of **48** op families (**46** `JIT_ARM64` + **2** honest `GENERIC_INTERP` x87/legacy families), **989** mnemonics, and `FastOp` kinds `K_1..=K_124`. |
+| **x86-64 → ARM64 Ops DB** | `crates/port-factory/src/ops_db/`, `db/ops_x86_to_arm64.tsv` | Groups mnemonics by implementation tier, with source references and vector counts. [Current totals and known gaps](STATUS.md#catalog-totals) |
 | **A64 encoding forms and JIT emitter matches** | [A64 catalog](../db/a64_encodings.tsv), [emitter matches](../db/a64_emitter_matches.tsv) | Look up an Arm operation's encodings, operand fields and feature requirements, or find the form used by a JIT test word. [Verification and regeneration](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit) |
-| **Win32 API DB** | `crates/port-factory/src/win32_db.rs`, `db/win32_apis.tsv` | Indexes all **3,241** exports across **86** builtin DLLs in `crates/win32-rt/src/`, including `api-ms-win-*` normalization and `kernel32 ↔ ntdll` forwarding. |
+| **Win32 API DB** | `crates/port-factory/src/win32_db.rs`, `db/win32_apis.tsv` | Indexes exports by DLL, symbol, ordinal and implementation kind. Supports `api-ms-win-*` normalization and `kernel32 ↔ ntdll` forwarding. |
 | **PE Coverage Scanner** | `crates/port-factory/src/scanner.rs`, `db/ops_profiles.tsv` | Disassembles any Windows x86-64 `.exe`/`.dll` and measures ARM64 JIT coverage, instruction mix, and Win32 import readiness. |
 | **Offline `.aot` Prewarmer** | `crates/x86-runtime/src/emu/aot.rs`, `port-factory aot-prewarm` | Drives `port-runner --prewarm-aot` to compile PE `.pdata` + exports + entry + static CFG closures into relocatable ARM64 `.aot` block caches ahead of launch. |
 | **Auditors** | `anticheat.rs`, `dotnet.rs`, `gpu_shaders.rs`, `game_profiles.rs` | Audits anti-cheat / direct syscalls / VEH traps, .NET CLR / ReadyToRun / Unity Mono / IL2CPP, desktop/GPU capabilities, embedded shaders, and known engine profiles (`db/game_profiles.tsv`, `db/shader_formats.tsv`). |

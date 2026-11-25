@@ -659,7 +659,7 @@ fn is_ident_byte(b: u8) -> bool {
 
 /// Produce a same-length byte mask of `src` where comments and string/char literals
 /// are replaced with ASCII spaces (preserving newlines and byte offsets).
-fn mask_non_code(src: &str) -> Vec<u8> {
+pub(crate) fn mask_non_code(src: &str) -> Vec<u8> {
     let bytes = src.as_bytes();
     let n = bytes.len();
     let mut out = vec![b' '; n];
