@@ -89,6 +89,15 @@ mod icu {
     pub const ULOC_LAYOUT_RTL: i32 = 1;
     pub const UMS_US: i32 = 1;
 
+    pub type UConverterToUCallback = unsafe extern "C" fn(
+        *const c_void,
+        *mut c_void,
+        *const c_char,
+        i32,
+        i32,
+        *mut i32,
+    );
+
     pub type UConverterFromUCallback = unsafe extern "C" fn(
         *const c_void,
         *mut c_void,
@@ -147,6 +156,15 @@ mod icu {
         pub ucnv_open: unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void,
         pub ucnv_to_uchars: unsafe extern "C" fn(*mut c_void, *mut u16, i32, *const c_char, i32, *mut i32) -> i32,
         pub ucnv_from_uchars: unsafe extern "C" fn(*mut c_void, *mut c_char, i32, *const u16, i32, *mut i32) -> i32,
+        pub ucnv_set_to_u_callback: unsafe extern "C" fn(
+            *mut c_void,
+            UConverterToUCallback,
+            *const c_void,
+            *mut Option<UConverterToUCallback>,
+            *mut *const c_void,
+            *mut i32,
+        ),
+        pub ucnv_to_u_cb_stop: UConverterToUCallback,
         pub ucnv_set_subst_chars: unsafe extern "C" fn(*mut c_void, *const c_char, i8, *mut i32),
         pub ucnv_set_from_u_callback: unsafe extern "C" fn(
             *mut c_void,
@@ -232,6 +250,18 @@ mod icu {
                 ucnv_open: sym!(c"ucnv_open", unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void),
                 ucnv_to_uchars: sym!(c"ucnv_toUChars", unsafe extern "C" fn(*mut c_void, *mut u16, i32, *const c_char, i32, *mut i32) -> i32),
                 ucnv_from_uchars: sym!(c"ucnv_fromUChars", unsafe extern "C" fn(*mut c_void, *mut c_char, i32, *const u16, i32, *mut i32) -> i32),
+                ucnv_set_to_u_callback: sym!(
+                    c"ucnv_setToUCallBack",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        UConverterToUCallback,
+                        *const c_void,
+                        *mut Option<UConverterToUCallback>,
+                        *mut *const c_void,
+                        *mut i32,
+                    )
+                ),
+                ucnv_to_u_cb_stop: sym!(c"UCNV_TO_U_CALLBACK_STOP", UConverterToUCallback),
                 ucnv_set_subst_chars: sym!(c"ucnv_setSubstChars", unsafe extern "C" fn(*mut c_void, *const c_char, i8, *mut i32)),
                 ucnv_set_from_u_callback: sym!(
                     c"ucnv_setFromUCallBack",
@@ -479,12 +509,27 @@ pub unsafe extern "win64" fn GetCPInfoExW(cp: u32, _flags: u32, info: *mut u8) -
 }
 
 pub(crate) fn decode_cp_to_utf16(cp: u32, src: &[u8]) -> Result<Vec<u16>, u32> {
+    decode_cp_to_utf16_strict(cp, src, true)
+}
+
+pub(crate) fn decode_cp_to_utf16_strict(cp: u32, src: &[u8], strict: bool) -> Result<Vec<u16>, u32> {
     if let (Some(a), Some(name)) = (icu::api(), icu_cp_name(cp)) {
         let cn = icu::c_str(name);
         unsafe {
             let mut st = 0i32;
             let cnv = (a.ucnv_open)(cn.as_ptr(), &mut st);
             if !cnv.is_null() && st <= 0 {
+                if strict {
+                    let mut cb_st = 0i32;
+                    (a.ucnv_set_to_u_callback)(
+                        cnv,
+                        a.ucnv_to_u_cb_stop,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut cb_st,
+                    );
+                }
                 let mut out = vec![0u16; src.len() * 2 + 8];
                 st = 0;
                 let n = (a.ucnv_to_uchars)(
@@ -524,7 +569,11 @@ pub(crate) fn decode_cp_to_utf16(cp: u32, src: &[u8]) -> Result<Vec<u16>, u32> {
         }
     }
     let s = decode_cp(cp, src).map_err(|_| err::ERROR_NO_UNICODE_TRANSLATION)?;
-    Ok(s.encode_utf16().collect())
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if strict && units.contains(&0xFFFD) {
+        return Err(err::ERROR_NO_UNICODE_TRANSLATION);
+    }
+    Ok(units)
 }
 
 struct FromUTrackCtx {
@@ -644,7 +693,7 @@ pub unsafe fn mb_to_wide(cp: u32, flags: u32, src: &[u8]) -> Result<Vec<u16>, u3
             };
             Ok(s.encode_utf16().collect())
         }
-        c if valid_cp(c) => decode_cp_to_utf16(c, src),
+        c if valid_cp(c) => decode_cp_to_utf16_strict(c, src, (flags & MB_ERR_INVALID_CHARS) != 0),
         _ => Err(err::ERROR_INVALID_PARAMETER),
     }
 }
@@ -4165,5 +4214,31 @@ mod tests {
         let (lit_932, used_932) = encode_utf16_to_cp(932, &to_wide("?あ"), None).unwrap();
         assert!(!used_932);
         assert_eq!(lit_932, vec![b'?', 0x82, 0xA0]);
+
+        // Strict MultiByteToWideChar(MB_ERR_INVALID_CHARS) rejects lone DBCS lead bytes and
+        // invalid trail sequences with ERROR_NO_UNICODE_TRANSLATION; non-strict succeeds lossily.
+        unsafe {
+            let lone_lead = [0x81u8];
+            let bad_pair = [0x81u8, 0x20];
+            let mut wbuf = [0u16; 8];
+            for cp in [932u32, 936, 949, 950] {
+                assert_eq!(
+                    MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, lone_lead.as_ptr(), 1, wbuf.as_mut_ptr(), 8),
+                    0,
+                    "cp {cp} strict decode must reject lone lead byte"
+                );
+                assert_eq!(teb::last_error(), err::ERROR_NO_UNICODE_TRANSLATION);
+                assert_eq!(
+                    MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, bad_pair.as_ptr(), 2, wbuf.as_mut_ptr(), 8),
+                    0,
+                    "cp {cp} strict decode must reject invalid DBCS sequence"
+                );
+                assert_eq!(teb::last_error(), err::ERROR_NO_UNICODE_TRANSLATION);
+                assert!(
+                    MultiByteToWideChar(cp, 0, lone_lead.as_ptr(), 1, wbuf.as_mut_ptr(), 8) > 0,
+                    "cp {cp} non-strict decode must substitute"
+                );
+            }
+        }
     }
 }

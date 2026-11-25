@@ -2491,6 +2491,20 @@ unsafe fn fill_dir_info_by_handle(f: &FileObj, layout: DirInfoLayout, restart: b
     TRUE
 }
 
+/// Populate Windows `FILE_REMOTE_PROTOCOL_INFO` (116 bytes) in exact Win32 ABI field order:
+/// `@0 USHORT StructureVersion`, `@2 USHORT StructureSize`, `@4 ULONG Protocol`,
+/// `@8 USHORT ProtocolMajorVersion`, `@10 USHORT ProtocolMinorVersion`.
+unsafe fn write_remote_protocol_info(out: *mut u8, fs_type: &str) {
+    std::ptr::write_bytes(out, 0, 116);
+    (out as *mut u16).write_unaligned(2); // StructureVersion (@0)
+    (out.add(2) as *mut u16).write_unaligned(116); // StructureSize (@2)
+    // WNNC_NET_LANMAN (0x0002_0000) for SMB, WNNC_NET_SUN_PC_NFS (0x0007_0000) for NFS.
+    let proto = if fs_type.eq_ignore_ascii_case("nfs") { 0x0007_0000u32 } else { 0x0002_0000u32 };
+    (out.add(4) as *mut u32).write_unaligned(proto); // Protocol (@4)
+    (out.add(8) as *mut u16).write_unaligned(3); // ProtocolMajorVersion (@8)
+    (out.add(10) as *mut u16).write_unaligned(0); // ProtocolMinorVersion (@10)
+}
+
 pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32, out: *mut u8, size: u32) -> BOOL {
     if out.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
@@ -2629,15 +2643,8 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             if !need(116) {
                 return FALSE;
             }
-            std::ptr::write_bytes(out, 0, 116);
-            (out as *mut u16).write_unaligned(116); // StructureSize
-            (out.add(2) as *mut u16).write_unaligned(2); // StructureVersion
             let fs_type = std::ffi::CStr::from_ptr(sfs.f_fstypename.as_ptr()).to_string_lossy();
-            // WNNC_NET_LANMAN (0x0002_0000) for SMB, WNNC_NET_SUN_PC_NFS (0x0007_0000) for NFS.
-            let proto = if fs_type.eq_ignore_ascii_case("nfs") { 0x0007_0000u32 } else { 0x0002_0000u32 };
-            (out.add(4) as *mut u32).write_unaligned(proto);
-            (out.add(8) as *mut u32).write_unaligned(3); // ProtocolMajorVersion
-            (out.add(12) as *mut u32).write_unaligned(0); // ProtocolMinorVersion
+            write_remote_protocol_info(out, &fs_type);
         }
         16 => {
             // FileStorageInfo (28 bytes): report real volume sector sizes via statfs/IOKit.
@@ -11859,5 +11866,23 @@ mod tests {
             crate::kernel32::threads::CloseHandle(hl);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_protocol_info_matches_win32_abi_header_order() {
+        unsafe {
+            let mut buf = [0xAAu8; 116];
+            write_remote_protocol_info(buf.as_mut_ptr(), "smbfs");
+            assert_eq!((buf.as_ptr() as *const u16).read_unaligned(), 2); // StructureVersion @0
+            assert_eq!((buf.as_ptr().add(2) as *const u16).read_unaligned(), 116); // StructureSize @2
+            assert_eq!((buf.as_ptr().add(4) as *const u32).read_unaligned(), 0x0002_0000); // WNNC_NET_LANMAN @4
+            assert_eq!((buf.as_ptr().add(8) as *const u16).read_unaligned(), 3); // ProtocolMajorVersion @8
+            assert_eq!((buf.as_ptr().add(10) as *const u16).read_unaligned(), 0); // ProtocolMinorVersion @10
+
+            write_remote_protocol_info(buf.as_mut_ptr(), "nfs");
+            assert_eq!((buf.as_ptr() as *const u16).read_unaligned(), 2);
+            assert_eq!((buf.as_ptr().add(2) as *const u16).read_unaligned(), 116);
+            assert_eq!((buf.as_ptr().add(4) as *const u32).read_unaligned(), 0x0007_0000); // WNNC_NET_SUN_PC_NFS @4
+        }
     }
 }

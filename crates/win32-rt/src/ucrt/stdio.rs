@@ -208,7 +208,16 @@ fn bad_fd() -> i32 {
 /// Detect or emit BOM for Unicode text modes (`_O_WTEXT`, `fopen(..., "..., ccs=...")`).
 /// Matches MSVC UCRT BOM precedence: an existing BOM overrides the requested encoding;
 /// creating/truncating a new writable file with BOM enabled writes the UTF-16LE or UTF-8 BOM.
-unsafe fn apply_unicode_bom(fd: i32, oflag: i32, requested: TextMode, write_bom_on_new: bool, detect_bom: bool) -> TextMode {
+/// When `ansi_if_no_bom` is true (`_O_WTEXT` / `ccs=UNICODE`), an existing file without a BOM
+/// falls back to `TextMode::AnsiText` per Microsoft Learn.
+unsafe fn apply_unicode_bom(
+    fd: i32,
+    oflag: i32,
+    requested: TextMode,
+    write_bom_on_new: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> TextMode {
     let mut st: libc::stat = std::mem::zeroed();
     if libc::fstat(fd, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return requested;
@@ -225,8 +234,9 @@ unsafe fn apply_unicode_bom(fd: i32, oflag: i32, requested: TextMode, write_bom_
             if !bom.is_empty() {
                 let _ = libc::write(fd, bom.as_ptr() as *const c_void, bom.len());
             }
+            return requested;
         }
-        return requested;
+        return if !can_write && ansi_if_no_bom { TextMode::AnsiText } else { requested };
     }
     if detect_bom {
         let mut head = [0u8; 3];
@@ -243,6 +253,9 @@ unsafe fn apply_unicode_bom(fd: i32, oflag: i32, requested: TextMode, write_bom_
                 let _ = libc::lseek(fd, 3, libc::SEEK_SET);
             }
             return TextMode::Utf8;
+        }
+        if ansi_if_no_bom {
+            return TextMode::AnsiText;
         }
     }
     requested
@@ -325,11 +338,12 @@ fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32, write_bom: boo
         }
     };
     let final_mode = if req_mode.is_unicode() {
-        unsafe { apply_unicode_bom(fd, oflag, req_mode, write_bom, detect_bom) }
+        unsafe { apply_unicode_bom(fd, oflag, req_mode, write_bom, detect_bom, win_mode == O_WTEXT) }
     } else {
         req_mode
     };
     let final_win_mode = match (win_mode, final_mode) {
+        (O_WTEXT, TextMode::AnsiText) => O_TEXT,
         (O_WTEXT, TextMode::Utf8) => O_U8TEXT,
         (O_WTEXT, TextMode::Utf16Le) => O_WTEXT,
         (O_U8TEXT, TextMode::Utf16Le) => O_U16TEXT,
@@ -3494,6 +3508,24 @@ mod tests {
             }
             assert_eq!(got_a, b"\rXY");
             assert_eq!(_close(pfds_a[0]), 0);
+
+            // 12. BOM-less existing file opened with _O_WTEXT (or ccs=UNICODE) falls back to ANSI.
+            std::fs::write(dir.join("nobom_ansi.txt"), b"A\r\nB").unwrap();
+            let fd_w = _open(b"U:\\nobom_ansi.txt\0".as_ptr(), O_RDONLY | O_WTEXT, 0);
+            assert!(fd_w >= 0);
+            let mut ansi_buf = [0u8; 8];
+            let nr = _read(fd_w, ansi_buf.as_mut_ptr() as *mut c_void, 8);
+            assert_eq!(nr, 3);
+            assert_eq!(&ansi_buf[..3], b"A\nB");
+            assert_eq!(_close(fd_w), 0);
+
+            let f_u = fopen(b"U:\\nobom_ansi.txt\0".as_ptr(), b"r, ccs=UNICODE\0".as_ptr());
+            assert!(!f_u.is_null());
+            assert_eq!(fgetwc(f_u), 'A' as u32);
+            assert_eq!(fgetwc(f_u), '\n' as u32);
+            assert_eq!(fgetwc(f_u), 'B' as u32);
+            assert_eq!(fgetwc(f_u), WEOF);
+            assert_eq!(fclose(f_u), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
