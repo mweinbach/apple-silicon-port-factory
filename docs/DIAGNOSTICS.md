@@ -225,6 +225,27 @@ cargo opsdb -- oracle out/nan_snaps/ --mxcsr 0x1f80
 
 ---
 
+### CPU feature and state probes
+
+Run the CPU fixtures on Apple Silicon.
+
+```sh
+cargo test -p x86-runtime --features rosetta-oracle --lib --target aarch64-apple-darwin -- cpu_basics_tests --test-threads=1
+```
+
+The fixtures run the same guest code with generic interpretation, FastOp, live JIT, and a
+serialized and reloaded AOT image. They check that the AOT run installs translated blocks.
+The Rosetta option also executes the guest bytes as x86-64 Mach-O text for FXSAVE, standard
+XSAVE, packed integer operations, and denormal arithmetic. Rosetta does not enumerate
+XSAVEOPT or XSAVEC on the validation host. Those formats have architectural byte-layout,
+mask, and restore tests.
+
+The denormal probes exercise positive and negative inputs in all four masked FTZ/DAZ modes.
+On cores without FEAT_AFP the two mixed modes use instruction-level software handling.
+The test masks AFP on the current host to exercise this fallback. Host callbacks run with
+the embedding thread's saved FPCR.
+
+
 ## 2. Runtime Environment Variable Reference
 
 | Env Var | Component | Purpose |

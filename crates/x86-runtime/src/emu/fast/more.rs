@@ -378,7 +378,7 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
             }
             f.kind = K_VMASKMOV;
         }
-        M::Fldcw | M::Clflush | M::Clflushopt | M::Clwb | M::Xend => {
+        M::Clflush | M::Clflushopt | M::Clwb | M::Xend => {
             f.kind = K_NOP;
         }
         M::Enter => {
@@ -407,7 +407,7 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
             f.kind = K_NOP;
         }
         M::Lahf | M::Sahf | M::Pushf | M::Pushfq | M::Popf | M::Popfq | M::Stmxcsr
-        | M::Vstmxcsr | M::Ldmxcsr | M::Vldmxcsr | M::Fnstcw | M::Fstcw | M::Xlatb | M::Xgetbv
+        | M::Vstmxcsr | M::Xlatb
         | M::Rdtsc | M::Rdtscp | M::Cpuid => {
             f.kind = K_SYS_MISC;
             match mn {
@@ -433,16 +433,7 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
                     f.x = 4;
                     put_mem(ins, &mut f)?;
                 }
-                M::Ldmxcsr | M::Vldmxcsr => {
-                    f.x = 14;
-                    put_mem(ins, &mut f)?;
-                }
-                M::Fnstcw | M::Fstcw => {
-                    f.x = 5;
-                    put_mem(ins, &mut f)?;
-                }
                 M::Xlatb => f.x = 6,
-                M::Xgetbv => f.x = 7,
                 M::Rdtsc => {
                     f.x = 8;
                     f.w = 0;
@@ -1260,106 +1251,13 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     cpu.of = fl & 0x800 != 0;
                 }
                 4 => cpu.write_mem(cpu.faddr(op), 32, cpu.jx.mxcsr as u64), // Stmxcsr / Vstmxcsr
-                5 => cpu.write_mem(cpu.faddr(op), 16, 0x037F), // Fnstcw / Fstcw
                 6 => {
                     // Xlatb
                     let v = cpu.read_mem(cpu.gpr[3].wrapping_add(cpu.gpr[0] & 0xFF), 8);
                     cpu.rset(0, 8, v);
                 }
-                7 => {
-                    // Xgetbv
-                    cpu.gpr[0] = 7;
-                    cpu.gpr[2] = 0;
-                    cpu.last_bits[0] = 64;
-                    cpu.last_bits[2] = 64;
-                }
                 8 => cpu.read_timestamp(op.w != 0), // RDTSC / RDTSCP
-                9 => {
-                    // Cpuid
-                    let leaf = cpu.gpr[0] as u32;
-                    cpu.last_bits[0] = 64;
-                    cpu.last_bits[1] = 64;
-                    cpu.last_bits[2] = 64;
-                    cpu.last_bits[3] = 64;
-                    match leaf {
-                        0 => {
-                            cpu.gpr[0] = 7;
-                            cpu.gpr[3] = 0x756e_6547;
-                            cpu.gpr[2] = 0x4965_6e69;
-                            cpu.gpr[1] = 0x6c65_746e;
-                        }
-                        1 => {
-                            cpu.gpr[0] = 0x0009_06ea;
-                            cpu.gpr[3] = 0x0010_0800;
-                            cpu.gpr[1] = (1 << 0)
-                                | (1 << 1)
-                                | (1 << 5)
-                                | (1 << 9)
-                                | (1 << 12)
-                                | (1 << 13)
-                                | (1 << 19)
-                                | (1 << 20)
-                                | (1 << 22)
-                                | (1 << 23)
-                                | (1 << 25)
-                                | (1 << 26)
-                                | (1 << 27)
-                                | (1 << 28)
-                                | (1 << 29)
-                                | (1 << 30);
-                            cpu.gpr[2] = (1 << 0)
-                                | (1 << 4)
-                                | (1 << 8)
-                                | (1 << 15)
-                                | (1 << 23)
-                                | (1 << 24)
-                                | (1 << 25)
-                                | (1 << 26)
-                                | (1 << 28);
-                        }
-                        7 => {
-                            cpu.gpr[0] = 0;
-                            cpu.gpr[3] = (1 << 0)
-                                | (1 << 3)
-                                | (1 << 5)
-                                | (1 << 7)
-                                | (1 << 8)
-                                | (1 << 9)
-                                | (1 << 10)
-                                | (1 << 18)
-                                | (1 << 19)
-                                | (1 << 29);
-                            cpu.gpr[1] = 0;
-                            cpu.gpr[2] = 0;
-                        }
-                        0x8000_0000 => {
-                            cpu.gpr[0] = 0x8000_0008;
-                            cpu.gpr[3] = 0;
-                            cpu.gpr[1] = 0;
-                            cpu.gpr[2] = 0;
-                        }
-                        0x8000_0001 => {
-                            cpu.gpr[0] = 0;
-                            cpu.gpr[3] = 0;
-                            cpu.gpr[1] = (1 << 0) | (1 << 5) | (1 << 6) | (1 << 8);
-                            cpu.gpr[2] = (1 << 11) | (1 << 20) | (1 << 27) | (1 << 29);
-                        }
-                        0x8000_0002..=0x8000_0004 => {
-                            let brand = b"Apple Silicon M-Series (AW2 Native ARM64)       ";
-                            let off = ((leaf - 0x8000_0002) as usize) * 16;
-                            cpu.gpr[0] = u32::from_le_bytes(brand[off..off + 4].try_into().unwrap()) as u64;
-                            cpu.gpr[3] = u32::from_le_bytes(brand[off + 4..off + 8].try_into().unwrap()) as u64;
-                            cpu.gpr[1] = u32::from_le_bytes(brand[off + 8..off + 12].try_into().unwrap()) as u64;
-                            cpu.gpr[2] = u32::from_le_bytes(brand[off + 12..off + 16].try_into().unwrap()) as u64;
-                        }
-                        _ => {
-                            cpu.gpr[0] = 0;
-                            cpu.gpr[3] = 0;
-                            cpu.gpr[1] = 0;
-                            cpu.gpr[2] = 0;
-                        }
-                    }
-                }
+                9 => cpu.cpuid(),
                 10 => {
                     // 16-bit push
                     let v = match op.w {
@@ -1399,12 +1297,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     cpu.of = false;
                     cpu.set_pf(false);
                 }
-                14 => {
-                    // Ldmxcsr / Vldmxcsr
-                    let m = (cpu.read_mem(cpu.faddr(op), 32) as u32) & 0xFFFF;
-                    cpu.jx.mxcsr = m;
-                    crate::emu::apply_guest_mxcsr_hw(m);
-                }
+
                 _ => {}
             }
         }
@@ -1806,7 +1699,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
             } else {
                 cpu.xmm[op.r1 as usize & 15]
             };
-            sk::pcmpstr(cpu, a, b, op.imm as u8, is_explicit, is_mask);
+            sk::pcmpstr(cpu, a, b, op.imm as u8, is_explicit, is_mask, false);
         }
         K_VSHA_RR | K_VSHA_RM => {
             let d = op.r0 as usize & 15;

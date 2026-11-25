@@ -58,6 +58,11 @@ pub fn has_ecv() -> bool {
 
 #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 fn detect_ecv() -> bool {
+    darwin_feature(c"hw.optional.arm.FEAT_ECV")
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+pub(super) fn darwin_feature(name: &core::ffi::CStr) -> bool {
     // This source is also compiled in generated crates without a libc dependency.
     unsafe extern "C" {
         fn sysctlbyname(
@@ -72,7 +77,7 @@ fn detect_ecv() -> bool {
     let mut size = core::mem::size_of::<u32>();
     let rc = unsafe {
         sysctlbyname(
-            c"hw.optional.arm.FEAT_ECV".as_ptr(),
+            name.as_ptr(),
             (&raw mut flag).cast(),
             &mut size,
             core::ptr::null_mut(),

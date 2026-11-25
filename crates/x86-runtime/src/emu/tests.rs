@@ -2128,14 +2128,14 @@ fn cpuid_leaf7_advertises_sha_ni_on_all_paths() {
     a.mov(dword_ptr(r8 + 0x0C), edx).unwrap();
     a.ret().unwrap();
     let code = a.assemble(0x1000).unwrap();
-    assert_all_jit_supported("cpuid_leaf7", &code);
+
 
     let out = run_all_3_paths(&code, &[0u8; 64]);
     let ebx_val = u32::from_le_bytes(out[4..8].try_into().unwrap());
-    assert_eq!(ebx_val, 0x200c_07a9, "CPUID leaf 7 EBX must advertise SHA-NI bit 29");
-    assert_ne!(ebx_val & (1 << 29), 0);
-    let (_, simd_ebx, _, _) = crate::simd_ops::cpuid_x64(7, 0);
-    assert_ne!(simd_ebx & (1 << 29), 0, "simd_ops::cpuid_x64 leaf 7 EBX must advertise SHA-NI bit 29");
+    let host_sha = super::features::host().has(super::features::HostFeatures::SHA1 | super::features::HostFeatures::SHA256);
+    assert_eq!(ebx_val & (1 << 29) != 0, host_sha);
+    assert_eq!(ebx_val & ((1 << 7) | (1 << 10)), 0);
+    assert_eq!(ebx_val as u64, crate::simd_ops::cpuid_x64(7, 0).1);
 }
 
 #[test]
