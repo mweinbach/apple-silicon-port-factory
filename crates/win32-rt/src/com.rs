@@ -363,6 +363,7 @@ pub fn register_vtable_ptrs(ptrs: &[usize]) {
     for &addr in ptrs {
         if addr != 0 {
             crate::register_native_va(addr as u64, addr);
+            crate::debug_assert_guest_callable(addr, "com::register_vtable_ptrs");
         }
     }
 }
@@ -398,6 +399,7 @@ pub fn register_static_ptr_slice(ptrs: &[crate::Ptr]) {
         let addr = p.0 as usize;
         if addr != 0 {
             crate::register_native_va(addr as u64, addr);
+            crate::debug_assert_guest_callable(addr, "com::register_static_ptr_slice");
         }
     }
 }

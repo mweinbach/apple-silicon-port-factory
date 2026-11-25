@@ -1514,6 +1514,11 @@ static DUMMY_STREAM_MGR: DummyStreamMgr = DummyStreamMgr {
     vtable: &DUMMY_STREAM_MGR_VTBL,
 };
 
+pub(crate) fn register_static_vtables() {
+    let addr = dummy_stream_mgr_vfn as *const () as usize;
+    crate::register_native_va(addr as u64, addr);
+}
+
 static FILE_LOCATION_RESOLVER: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_LANG_BUF: Mutex<[u16; 64]> = Mutex::new({
     let mut b = [0u16; 64];
@@ -1529,6 +1534,11 @@ static CURRENT_LANG_BUF: Mutex<[u16; 64]> = Mutex::new({
 static T_STM_CREATE: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "win64" fn stream_mgr_create(settings: *const u8) -> *mut c_void {
     if native_mode() {
+        register_static_vtables();
+        crate::debug_assert_guest_callable(
+            dummy_stream_mgr_vfn as *const () as usize,
+            "akrec::stream_mgr_create",
+        );
         &DUMMY_STREAM_MGR as *const DummyStreamMgr as *mut c_void
     } else {
         let o: unsafe extern "win64" fn(*const u8) -> *mut c_void =
