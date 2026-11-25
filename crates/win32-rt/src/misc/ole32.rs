@@ -1864,7 +1864,31 @@ enum WinRtPropertyType {
     Boolean = 11,
     String = 12,
     Inspectable = 13,
+    DateTime = 14,
+    TimeSpan = 15,
     Guid = 16,
+    Point = 17,
+    Size = 18,
+    Rect = 19,
+    UInt8Array = 1025,
+    Int16Array = 1026,
+    UInt16Array = 1027,
+    Int32Array = 1028,
+    UInt32Array = 1029,
+    Int64Array = 1030,
+    UInt64Array = 1031,
+    SingleArray = 1032,
+    DoubleArray = 1033,
+    Char16Array = 1034,
+    BooleanArray = 1035,
+    StringArray = 1036,
+    InspectableArray = 1037,
+    DateTimeArray = 1038,
+    TimeSpanArray = 1039,
+    GuidArray = 1040,
+    PointArray = 1041,
+    SizeArray = 1042,
+    RectArray = 1043,
 }
 
 enum PropValData {
@@ -1883,7 +1907,31 @@ enum PropValData {
     String(String),
     #[allow(dead_code)]
     Inspectable(Option<crate::com::ComPtr>),
+    DateTime(i64),
+    TimeSpan(i64),
     Guid(crate::com::Guid),
+    Point([f32; 2]),
+    Size([f32; 2]),
+    Rect([f32; 4]),
+    UInt8Array(Vec<u8>),
+    Int16Array(Vec<i16>),
+    UInt16Array(Vec<u16>),
+    Int32Array(Vec<i32>),
+    UInt32Array(Vec<u32>),
+    Int64Array(Vec<i64>),
+    UInt64Array(Vec<u64>),
+    SingleArray(Vec<f32>),
+    DoubleArray(Vec<f64>),
+    Char16Array(Vec<u16>),
+    BooleanArray(Vec<u8>),
+    StringArray(Vec<String>),
+    InspectableArray(Vec<Option<crate::com::ComPtr>>),
+    GuidArray(Vec<crate::com::Guid>),
+    DateTimeArray(Vec<i64>),
+    TimeSpanArray(Vec<i64>),
+    PointArray(Vec<[f32; 2]>),
+    SizeArray(Vec<[f32; 2]>),
+    RectArray(Vec<[f32; 4]>),
 }
 
 impl PropValData {
@@ -1903,7 +1951,31 @@ impl PropValData {
             Self::Boolean(_) => WinRtPropertyType::Boolean,
             Self::String(_) => WinRtPropertyType::String,
             Self::Inspectable(_) => WinRtPropertyType::Inspectable,
+            Self::DateTime(_) => WinRtPropertyType::DateTime,
+            Self::TimeSpan(_) => WinRtPropertyType::TimeSpan,
             Self::Guid(_) => WinRtPropertyType::Guid,
+            Self::Point(_) => WinRtPropertyType::Point,
+            Self::Size(_) => WinRtPropertyType::Size,
+            Self::Rect(_) => WinRtPropertyType::Rect,
+            Self::UInt8Array(_) => WinRtPropertyType::UInt8Array,
+            Self::Int16Array(_) => WinRtPropertyType::Int16Array,
+            Self::UInt16Array(_) => WinRtPropertyType::UInt16Array,
+            Self::Int32Array(_) => WinRtPropertyType::Int32Array,
+            Self::UInt32Array(_) => WinRtPropertyType::UInt32Array,
+            Self::Int64Array(_) => WinRtPropertyType::Int64Array,
+            Self::UInt64Array(_) => WinRtPropertyType::UInt64Array,
+            Self::SingleArray(_) => WinRtPropertyType::SingleArray,
+            Self::DoubleArray(_) => WinRtPropertyType::DoubleArray,
+            Self::Char16Array(_) => WinRtPropertyType::Char16Array,
+            Self::BooleanArray(_) => WinRtPropertyType::BooleanArray,
+            Self::StringArray(_) => WinRtPropertyType::StringArray,
+            Self::InspectableArray(_) => WinRtPropertyType::InspectableArray,
+            Self::GuidArray(_) => WinRtPropertyType::GuidArray,
+            Self::DateTimeArray(_) => WinRtPropertyType::DateTimeArray,
+            Self::TimeSpanArray(_) => WinRtPropertyType::TimeSpanArray,
+            Self::PointArray(_) => WinRtPropertyType::PointArray,
+            Self::SizeArray(_) => WinRtPropertyType::SizeArray,
+            Self::RectArray(_) => WinRtPropertyType::RectArray,
         }
     }
 
@@ -2159,55 +2231,115 @@ unsafe extern "win64" fn pv_get_guid(this: *mut PropValObj, out: *mut crate::com
     }
 }
 
-unsafe extern "win64" fn pv_get_date_time(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+unsafe extern "win64" fn pv_get_date_time(this: *mut PropValObj, out: *mut i64) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    std::ptr::write_unaligned(out, 0);
-    crate::stub!("IPropertyValue::GetDateTime -> E_NOTIMPL");
-    E_NOTIMPL
+    match crate::com::ComObj::inner(this) {
+        PropValData::DateTime(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => {
+            std::ptr::write_unaligned(out, 0);
+            TYPE_E_TYPEMISMATCH
+        }
+    }
 }
 
-unsafe extern "win64" fn pv_get_time_span(_this: *mut PropValObj, out: *mut i64) -> HRESULT {
+unsafe extern "win64" fn pv_get_time_span(this: *mut PropValObj, out: *mut i64) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    std::ptr::write_unaligned(out, 0);
-    crate::stub!("IPropertyValue::GetTimeSpan -> E_NOTIMPL");
-    E_NOTIMPL
+    match crate::com::ComObj::inner(this) {
+        PropValData::TimeSpan(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => {
+            std::ptr::write_unaligned(out, 0);
+            TYPE_E_TYPEMISMATCH
+        }
+    }
 }
 
-unsafe extern "win64" fn pv_get_point(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+unsafe extern "win64" fn pv_get_point(this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    std::ptr::write_unaligned(out, [0.0; 2]);
-    crate::stub!("IPropertyValue::GetPoint -> E_NOTIMPL");
-    E_NOTIMPL
+    match crate::com::ComObj::inner(this) {
+        PropValData::Point(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => {
+            std::ptr::write_unaligned(out, [0.0; 2]);
+            TYPE_E_TYPEMISMATCH
+        }
+    }
 }
 
-unsafe extern "win64" fn pv_get_size(_this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
+unsafe extern "win64" fn pv_get_size(this: *mut PropValObj, out: *mut [f32; 2]) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    std::ptr::write_unaligned(out, [0.0; 2]);
-    crate::stub!("IPropertyValue::GetSize -> E_NOTIMPL");
-    E_NOTIMPL
+    match crate::com::ComObj::inner(this) {
+        PropValData::Size(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => {
+            std::ptr::write_unaligned(out, [0.0; 2]);
+            TYPE_E_TYPEMISMATCH
+        }
+    }
 }
 
-unsafe extern "win64" fn pv_get_rect(_this: *mut PropValObj, out: *mut [f32; 4]) -> HRESULT {
+unsafe extern "win64" fn pv_get_rect(this: *mut PropValObj, out: *mut [f32; 4]) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    std::ptr::write_unaligned(out, [0.0; 4]);
-    crate::stub!("IPropertyValue::GetRect -> E_NOTIMPL");
-    E_NOTIMPL
+    match crate::com::ComObj::inner(this) {
+        PropValData::Rect(v) => {
+            std::ptr::write_unaligned(out, *v);
+            S_OK
+        }
+        _ => {
+            std::ptr::write_unaligned(out, [0.0; 4]);
+            TYPE_E_TYPEMISMATCH
+        }
+    }
 }
 
-macro_rules! define_pv_array_getter {
-    ($fn_name:ident, $method:literal) => {
+unsafe fn pv_write_pod_array<T: Copy>(
+    items: &[T],
+    out_len: *mut u32,
+    out_ptr: *mut *mut c_void,
+) -> HRESULT {
+    if items.is_empty() {
+        std::ptr::write_unaligned(out_len, 0);
+        std::ptr::write_unaligned(out_ptr, std::ptr::null_mut());
+        return S_OK;
+    }
+    let Some(byte_len) = items.len().checked_mul(std::mem::size_of::<T>()) else {
+        return E_OUTOFMEMORY;
+    };
+    let mem = CoTaskMemAlloc(byte_len) as *mut T;
+    if mem.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    for (i, item) in items.iter().enumerate() {
+        std::ptr::write_unaligned(mem.add(i), *item);
+    }
+    std::ptr::write_unaligned(out_len, items.len() as u32);
+    std::ptr::write_unaligned(out_ptr, mem as *mut c_void);
+    S_OK
+}
+
+macro_rules! define_pv_pod_array_getter {
+    ($fn_name:ident, $variant:ident) => {
         unsafe extern "win64" fn $fn_name(
-            _this: *mut PropValObj,
+            this: *mut PropValObj,
             out_len: *mut u32,
             out_ptr: *mut *mut c_void,
         ) -> HRESULT {
@@ -2220,31 +2352,122 @@ macro_rules! define_pv_array_getter {
             if out_len.is_null() || out_ptr.is_null() {
                 return E_POINTER;
             }
-            crate::stub!(concat!("IPropertyValue::", $method, " -> E_NOTIMPL"));
-            E_NOTIMPL
+            match crate::com::ComObj::inner(this) {
+                PropValData::$variant(items) => pv_write_pod_array(items, out_len, out_ptr),
+                _ => TYPE_E_TYPEMISMATCH,
+            }
         }
     };
 }
 
-define_pv_array_getter!(pv_get_u8_array, "GetUInt8Array");
-define_pv_array_getter!(pv_get_i16_array, "GetInt16Array");
-define_pv_array_getter!(pv_get_u16_array, "GetUInt16Array");
-define_pv_array_getter!(pv_get_i32_array, "GetInt32Array");
-define_pv_array_getter!(pv_get_u32_array, "GetUInt32Array");
-define_pv_array_getter!(pv_get_i64_array, "GetInt64Array");
-define_pv_array_getter!(pv_get_u64_array, "GetUInt64Array");
-define_pv_array_getter!(pv_get_single_array, "GetSingleArray");
-define_pv_array_getter!(pv_get_double_array, "GetDoubleArray");
-define_pv_array_getter!(pv_get_char16_array, "GetChar16Array");
-define_pv_array_getter!(pv_get_boolean_array, "GetBooleanArray");
-define_pv_array_getter!(pv_get_string_array, "GetStringArray");
-define_pv_array_getter!(pv_get_inspectable_array, "GetInspectableArray");
-define_pv_array_getter!(pv_get_guid_array, "GetGuidArray");
-define_pv_array_getter!(pv_get_date_time_array, "GetDateTimeArray");
-define_pv_array_getter!(pv_get_time_span_array, "GetTimeSpanArray");
-define_pv_array_getter!(pv_get_point_array, "GetPointArray");
-define_pv_array_getter!(pv_get_size_array, "GetSizeArray");
-define_pv_array_getter!(pv_get_rect_array, "GetRectArray");
+define_pv_pod_array_getter!(pv_get_u8_array, UInt8Array);
+define_pv_pod_array_getter!(pv_get_i16_array, Int16Array);
+define_pv_pod_array_getter!(pv_get_u16_array, UInt16Array);
+define_pv_pod_array_getter!(pv_get_i32_array, Int32Array);
+define_pv_pod_array_getter!(pv_get_u32_array, UInt32Array);
+define_pv_pod_array_getter!(pv_get_i64_array, Int64Array);
+define_pv_pod_array_getter!(pv_get_u64_array, UInt64Array);
+define_pv_pod_array_getter!(pv_get_single_array, SingleArray);
+define_pv_pod_array_getter!(pv_get_double_array, DoubleArray);
+define_pv_pod_array_getter!(pv_get_char16_array, Char16Array);
+define_pv_pod_array_getter!(pv_get_boolean_array, BooleanArray);
+define_pv_pod_array_getter!(pv_get_guid_array, GuidArray);
+define_pv_pod_array_getter!(pv_get_date_time_array, DateTimeArray);
+define_pv_pod_array_getter!(pv_get_time_span_array, TimeSpanArray);
+define_pv_pod_array_getter!(pv_get_point_array, PointArray);
+define_pv_pod_array_getter!(pv_get_size_array, SizeArray);
+define_pv_pod_array_getter!(pv_get_rect_array, RectArray);
+
+unsafe extern "win64" fn pv_get_string_array(
+    this: *mut PropValObj,
+    out_len: *mut u32,
+    out_ptr: *mut *mut c_void,
+) -> HRESULT {
+    if !out_len.is_null() {
+        std::ptr::write_unaligned(out_len, 0);
+    }
+    if !out_ptr.is_null() {
+        std::ptr::write_unaligned(out_ptr, std::ptr::null_mut());
+    }
+    if out_len.is_null() || out_ptr.is_null() {
+        return E_POINTER;
+    }
+    let PropValData::StringArray(items) = crate::com::ComObj::inner(this) else {
+        return TYPE_E_TYPEMISMATCH;
+    };
+    if items.is_empty() {
+        return S_OK;
+    }
+    let Some(byte_len) = items.len().checked_mul(std::mem::size_of::<usize>()) else {
+        return E_OUTOFMEMORY;
+    };
+    let mem = CoTaskMemAlloc(byte_len) as *mut usize;
+    if mem.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    let mut created = 0usize;
+    for s in items {
+        match rust_to_hstring(s) {
+            Ok(h) => {
+                std::ptr::write_unaligned(mem.add(created), h);
+                created += 1;
+            }
+            Err(hr) => {
+                for j in 0..created {
+                    let h = std::ptr::read_unaligned(mem.add(j));
+                    WindowsDeleteString(h);
+                }
+                CoTaskMemFree(mem as *mut c_void);
+                return hr;
+            }
+        }
+    }
+    std::ptr::write_unaligned(out_len, items.len() as u32);
+    std::ptr::write_unaligned(out_ptr, mem as *mut c_void);
+    S_OK
+}
+
+unsafe extern "win64" fn pv_get_inspectable_array(
+    this: *mut PropValObj,
+    out_len: *mut u32,
+    out_ptr: *mut *mut c_void,
+) -> HRESULT {
+    if !out_len.is_null() {
+        std::ptr::write_unaligned(out_len, 0);
+    }
+    if !out_ptr.is_null() {
+        std::ptr::write_unaligned(out_ptr, std::ptr::null_mut());
+    }
+    if out_len.is_null() || out_ptr.is_null() {
+        return E_POINTER;
+    }
+    let PropValData::InspectableArray(items) = crate::com::ComObj::inner(this) else {
+        return TYPE_E_TYPEMISMATCH;
+    };
+    if items.is_empty() {
+        return S_OK;
+    }
+    let Some(byte_len) = items.len().checked_mul(std::mem::size_of::<*mut c_void>()) else {
+        return E_OUTOFMEMORY;
+    };
+    let mem = CoTaskMemAlloc(byte_len) as *mut *mut c_void;
+    if mem.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    for (i, item) in items.iter().enumerate() {
+        let ptr = match item {
+            Some(cp) => {
+                crate::com::com_call_add_ref(cp.as_ptr());
+                cp.as_ptr()
+            }
+            None => std::ptr::null_mut(),
+        };
+        std::ptr::write_unaligned(mem.add(i), ptr);
+    }
+    std::ptr::write_unaligned(out_len, items.len() as u32);
+    std::ptr::write_unaligned(out_ptr, mem as *mut c_void);
+    S_OK
+}
 
 fn pv_vtbl() -> *const usize {
     static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
@@ -2572,56 +2795,56 @@ fn pvf_act_vtbl() -> *const usize {
 
 unsafe extern "win64" fn pvs_create_date_time(
     _this: *mut c_void,
-    _v: i64,
+    v: i64,
     out: *mut *mut c_void,
 ) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    crate::com::write_null_out(out);
-    crate::stub!("IPropertyValueStatics::CreateDateTime -> E_NOTIMPL");
-    E_NOTIMPL
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::DateTime(v)));
+    S_OK
 }
 
 unsafe extern "win64" fn pvs_create_time_span(
     _this: *mut c_void,
-    _v: i64,
+    v: i64,
     out: *mut *mut c_void,
 ) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    crate::com::write_null_out(out);
-    crate::stub!("IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL");
-    E_NOTIMPL
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::TimeSpan(v)));
+    S_OK
 }
 
 /// Win64 passes the 8-byte `Windows.Foundation.Point { f32 x, f32 y }` struct by value in a GPR.
 unsafe extern "win64" fn pvs_create_point(
     _this: *mut c_void,
-    _point_bits: u64,
+    point_bits: u64,
     out: *mut *mut c_void,
 ) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    crate::com::write_null_out(out);
-    crate::stub!("IPropertyValueStatics::CreatePoint -> E_NOTIMPL");
-    E_NOTIMPL
+    let x = f32::from_bits(point_bits as u32);
+    let y = f32::from_bits((point_bits >> 32) as u32);
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Point([x, y])));
+    S_OK
 }
 
 /// Win64 passes the 8-byte `Windows.Foundation.Size { f32 w, f32 h }` struct by value in a GPR.
 unsafe extern "win64" fn pvs_create_size(
     _this: *mut c_void,
-    _size_bits: u64,
+    size_bits: u64,
     out: *mut *mut c_void,
 ) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    crate::com::write_null_out(out);
-    crate::stub!("IPropertyValueStatics::CreateSize -> E_NOTIMPL");
-    E_NOTIMPL
+    let w = f32::from_bits(size_bits as u32);
+    let h = f32::from_bits((size_bits >> 32) as u32);
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Size([w, h])));
+    S_OK
 }
 
 /// Win64 passes the 16-byte `Windows.Foundation.Rect` struct indirectly by pointer.
@@ -2637,12 +2860,23 @@ unsafe extern "win64" fn pvs_create_rect(
     if rect_ptr.is_null() {
         return E_POINTER;
     }
-    crate::stub!("IPropertyValueStatics::CreateRect -> E_NOTIMPL");
-    E_NOTIMPL
+    let rect = std::ptr::read_unaligned(rect_ptr);
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::Rect(rect)));
+    S_OK
 }
 
-macro_rules! define_pvs_array_creator {
-    ($fn_name:ident, $method:literal) => {
+unsafe fn pvs_read_pod_array<T: Copy>(len: u32, data: *const c_void) -> Vec<T> {
+    let n = len as usize;
+    let mut out = Vec::with_capacity(n);
+    let src = data as *const T;
+    for i in 0..n {
+        out.push(std::ptr::read_unaligned(src.add(i)));
+    }
+    out
+}
+
+macro_rules! define_pvs_pod_array_creator {
+    ($fn_name:ident, $variant:ident, $elem:ty) => {
         unsafe extern "win64" fn $fn_name(
             _this: *mut c_void,
             len: u32,
@@ -2656,31 +2890,96 @@ macro_rules! define_pvs_array_creator {
             if len > 0 && data.is_null() {
                 return E_POINTER;
             }
-            crate::stub!(concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL"));
-            E_NOTIMPL
+            let items = pvs_read_pod_array::<$elem>(len, data);
+            std::ptr::write_unaligned(out, new_prop_val(PropValData::$variant(items)));
+            S_OK
         }
     };
 }
 
-define_pvs_array_creator!(pvs_create_u8_array, "CreateUInt8Array");
-define_pvs_array_creator!(pvs_create_i16_array, "CreateInt16Array");
-define_pvs_array_creator!(pvs_create_u16_array, "CreateUInt16Array");
-define_pvs_array_creator!(pvs_create_i32_array, "CreateInt32Array");
-define_pvs_array_creator!(pvs_create_u32_array, "CreateUInt32Array");
-define_pvs_array_creator!(pvs_create_i64_array, "CreateInt64Array");
-define_pvs_array_creator!(pvs_create_u64_array, "CreateUInt64Array");
-define_pvs_array_creator!(pvs_create_single_array, "CreateSingleArray");
-define_pvs_array_creator!(pvs_create_double_array, "CreateDoubleArray");
-define_pvs_array_creator!(pvs_create_char16_array, "CreateChar16Array");
-define_pvs_array_creator!(pvs_create_boolean_array, "CreateBooleanArray");
-define_pvs_array_creator!(pvs_create_string_array, "CreateStringArray");
-define_pvs_array_creator!(pvs_create_inspectable_array, "CreateInspectableArray");
-define_pvs_array_creator!(pvs_create_guid_array, "CreateGuidArray");
-define_pvs_array_creator!(pvs_create_date_time_array, "CreateDateTimeArray");
-define_pvs_array_creator!(pvs_create_time_span_array, "CreateTimeSpanArray");
-define_pvs_array_creator!(pvs_create_point_array, "CreatePointArray");
-define_pvs_array_creator!(pvs_create_size_array, "CreateSizeArray");
-define_pvs_array_creator!(pvs_create_rect_array, "CreateRectArray");
+define_pvs_pod_array_creator!(pvs_create_u8_array, UInt8Array, u8);
+define_pvs_pod_array_creator!(pvs_create_i16_array, Int16Array, i16);
+define_pvs_pod_array_creator!(pvs_create_u16_array, UInt16Array, u16);
+define_pvs_pod_array_creator!(pvs_create_i32_array, Int32Array, i32);
+define_pvs_pod_array_creator!(pvs_create_u32_array, UInt32Array, u32);
+define_pvs_pod_array_creator!(pvs_create_i64_array, Int64Array, i64);
+define_pvs_pod_array_creator!(pvs_create_u64_array, UInt64Array, u64);
+define_pvs_pod_array_creator!(pvs_create_single_array, SingleArray, f32);
+define_pvs_pod_array_creator!(pvs_create_double_array, DoubleArray, f64);
+define_pvs_pod_array_creator!(pvs_create_char16_array, Char16Array, u16);
+define_pvs_pod_array_creator!(pvs_create_guid_array, GuidArray, crate::com::Guid);
+define_pvs_pod_array_creator!(pvs_create_date_time_array, DateTimeArray, i64);
+define_pvs_pod_array_creator!(pvs_create_time_span_array, TimeSpanArray, i64);
+define_pvs_pod_array_creator!(pvs_create_point_array, PointArray, [f32; 2]);
+define_pvs_pod_array_creator!(pvs_create_size_array, SizeArray, [f32; 2]);
+define_pvs_pod_array_creator!(pvs_create_rect_array, RectArray, [f32; 4]);
+
+unsafe extern "win64" fn pvs_create_boolean_array(
+    _this: *mut c_void,
+    len: u32,
+    data: *const c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    if len > 0 && data.is_null() {
+        return E_POINTER;
+    }
+    let raw = pvs_read_pod_array::<u8>(len, data);
+    let normalized = raw.into_iter().map(|b| u8::from(b != 0)).collect();
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::BooleanArray(normalized)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_string_array(
+    _this: *mut c_void,
+    len: u32,
+    data: *const c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    if len > 0 && data.is_null() {
+        return E_POINTER;
+    }
+    let n = len as usize;
+    let src = data as *const usize;
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        let h = std::ptr::read_unaligned(src.add(i));
+        items.push(hstring_to_rust(h));
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::StringArray(items)));
+    S_OK
+}
+
+unsafe extern "win64" fn pvs_create_inspectable_array(
+    _this: *mut c_void,
+    len: u32,
+    data: *const c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    crate::com::write_null_out(out);
+    if len > 0 && data.is_null() {
+        return E_POINTER;
+    }
+    let n = len as usize;
+    let src = data as *const *mut c_void;
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        let elem = std::ptr::read_unaligned(src.add(i));
+        items.push(crate::com::ComPtr::retain(elem));
+    }
+    std::ptr::write_unaligned(out, new_prop_val(PropValData::InspectableArray(items)));
+    S_OK
+}
 
 fn pvs_vtbl() -> *const usize {
     static VT: std::sync::OnceLock<[usize; 45]> = std::sync::OnceLock::new();
@@ -4627,11 +4926,11 @@ mod tests {
             );
             assert_eq!(got_i32, 1234);
 
-            // Exercise unsupported struct getters on IPropertyValue (slots 21..=25) via actual vtable.
+            // Exercise struct getters on a mismatched Int32 PropertyValue -> TYPE_E_TYPEMISMATCH.
             let mut dt = 0x1122_3344_5566_7788i64;
             assert_eq!(
                 crate::com::com_invoke_hresult(pv, &crate::com::IID_IPropertyValue, 21, &[&mut dt as *mut i64 as u64]),
-                E_NOTIMPL
+                TYPE_E_TYPEMISMATCH
             );
             assert_eq!(dt, 0);
             assert_eq!(
@@ -4647,12 +4946,12 @@ mod tests {
                     25, // GetRect
                     &[&mut rect as *mut [f32; 4] as u64],
                 ),
-                E_NOTIMPL
+                TYPE_E_TYPEMISMATCH
             );
             assert_eq!(rect, [0.0; 4]);
 
-            // Exercise array getters across the full range including near-final (43: GetSizeArray) and final (44: GetRectArray).
-            for slot in [26usize, 38, 39, 42, 43, 44] {
+            // Exercise array getters on mismatched Int32 PropertyValue -> TYPE_E_TYPEMISMATCH.
+            for slot in [26usize, 37, 38, 39, 42, 43, 44] {
                 let mut len = 0xCAFE_BABEu32;
                 let mut ptr = 0xDEAD_BEEFusize as *mut c_void;
                 assert_eq!(
@@ -4662,8 +4961,8 @@ mod tests {
                         slot,
                         &[&mut len as *mut u32 as u64, &mut ptr as *mut *mut c_void as u64],
                     ),
-                    E_NOTIMPL,
-                    "IPropertyValue slot {slot} should return E_NOTIMPL"
+                    TYPE_E_TYPEMISMATCH,
+                    "IPropertyValue slot {slot} should return TYPE_E_TYPEMISMATCH for Int32"
                 );
                 assert_eq!(len, 0, "IPropertyValue slot {slot} must zero out_len");
                 assert!(ptr.is_null(), "IPropertyValue slot {slot} must null out_ptr");
@@ -4682,21 +4981,83 @@ mod tests {
                 assert_eq!(len, 0);
             }
 
-            // Exercise unsupported IPropertyValueStatics struct creators (21..=25).
-            let mut created = 0xDEAD_BEEFusize as *mut c_void;
+            // Round-trip DateTime (slot 21), TimeSpan (22), Point (23), Size (24), Rect (25).
+            let mut created = std::ptr::null_mut::<c_void>();
             assert_eq!(
                 crate::com::com_invoke_hresult(
                     pvs,
                     &crate::com::IID_IPropertyValueStatics,
                     21, // CreateDateTime
-                    &[123456789u64, &mut created as *mut *mut c_void as u64],
+                    &[133_000_000_000_000_000i64 as u64, &mut created as *mut *mut c_void as u64],
                 ),
-                E_NOTIMPL
+                S_OK
             );
-            assert!(created.is_null());
+            let mut ptype = 0i32;
+            let mut is_num = 1u8;
+            let mut got_dt = 0i64;
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::DateTime as i32);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 7, &[&mut is_num as *mut u8 as u64]), S_OK);
+            assert_eq!(is_num, 0);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 21, &[&mut got_dt as *mut i64 as u64]), S_OK);
+            assert_eq!(got_dt, 133_000_000_000_000_000);
+            assert_eq!(com_call_release(created), 0);
 
-            created = 0xDEAD_BEEFusize as *mut c_void;
-            let sample_rect = [0.0f32, 1.0, 100.0, 200.0];
+            created = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    22, // CreateTimeSpan
+                    &[(-5_000_000i64) as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            let mut got_ts = 0i64;
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::TimeSpan as i32);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 22, &[&mut got_ts as *mut i64 as u64]), S_OK);
+            assert_eq!(got_ts, -5_000_000);
+            assert_eq!(com_call_release(created), 0);
+
+            created = std::ptr::null_mut();
+            let pt_bits = (1.5f32.to_bits() as u64) | ((2.25f32.to_bits() as u64) << 32);
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    23, // CreatePoint
+                    &[pt_bits, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            let mut got_pt = [0.0f32; 2];
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::Point as i32);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 23, &[&mut got_pt as *mut [f32; 2] as u64]), S_OK);
+            assert_eq!(got_pt, [1.5, 2.25]);
+            assert_eq!(com_call_release(created), 0);
+
+            created = std::ptr::null_mut();
+            let sz_bits = (640.0f32.to_bits() as u64) | ((480.0f32.to_bits() as u64) << 32);
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    24, // CreateSize
+                    &[sz_bits, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            let mut got_sz = [0.0f32; 2];
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::Size as i32);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 24, &[&mut got_sz as *mut [f32; 2] as u64]), S_OK);
+            assert_eq!(got_sz, [640.0, 480.0]);
+            assert_eq!(com_call_release(created), 0);
+
+            created = std::ptr::null_mut();
+            let sample_rect = [10.0f32, 20.0, 100.0, 200.0];
             assert_eq!(
                 crate::com::com_invoke_hresult(
                     pvs,
@@ -4704,9 +5065,14 @@ mod tests {
                     25, // CreateRect
                     &[&sample_rect as *const [f32; 4] as u64, &mut created as *mut *mut c_void as u64],
                 ),
-                E_NOTIMPL
+                S_OK
             );
-            assert!(created.is_null());
+            let mut got_rect = [0.0f32; 4];
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::Rect as i32);
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 25, &[&mut got_rect as *mut [f32; 4] as u64]), S_OK);
+            assert_eq!(got_rect, sample_rect);
+            assert_eq!(com_call_release(created), 0);
 
             // CreateRect with null rect pointer returns E_POINTER and nulls out-param.
             created = 0xDEAD_BEEFusize as *mut c_void;
@@ -4721,23 +5087,8 @@ mod tests {
             );
             assert!(created.is_null());
 
-            // Exercise IPropertyValueStatics array creators including near-final (43: CreateSizeArray) and final (44: CreateRectArray).
-            let dummy_buf = [0u64; 4];
-            for slot in [26usize, 38, 39, 42, 43, 44] {
-                created = 0xDEAD_BEEFusize as *mut c_void;
-                assert_eq!(
-                    crate::com::com_invoke_hresult(
-                        pvs,
-                        &crate::com::IID_IPropertyValueStatics,
-                        slot,
-                        &[1, dummy_buf.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
-                    ),
-                    E_NOTIMPL,
-                    "IPropertyValueStatics slot {slot} should return E_NOTIMPL"
-                );
-                assert!(created.is_null(), "IPropertyValueStatics slot {slot} must null out-param");
-
-                // Non-zero length with null data pointer returns E_POINTER and nulls out-param.
+            // Error validation on array creators: null data with len > 0 or null out-param -> E_POINTER.
+            for slot in [26usize, 37, 38, 39, 42, 43, 44] {
                 created = 0xDEAD_BEEFusize as *mut c_void;
                 assert_eq!(
                     crate::com::com_invoke_hresult(
@@ -4749,8 +5100,6 @@ mod tests {
                     E_POINTER
                 );
                 assert!(created.is_null());
-
-                // Null out-param returns E_POINTER.
                 assert_eq!(
                     crate::com::com_invoke_hresult(
                         pvs,
@@ -4762,20 +5111,156 @@ mod tests {
                 );
             }
 
-            // Also invoke the final slots directly via raw Win64 vtable function pointers.
+            // Round-trip Int32Array (slot 29), BooleanArray (36), StringArray (37), InspectableArray (38), RectArray (44).
+            let i32s = [7i32, -42, 1024];
+            created = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    29, // CreateInt32Array
+                    &[i32s.len() as u64, i32s.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(crate::com::com_invoke_hresult(created, &crate::com::IID_IPropertyValue, 6, &[&mut ptype as *mut i32 as u64]), S_OK);
+            assert_eq!(ptype, WinRtPropertyType::Int32Array as i32);
+            let mut out_len = 0u32;
+            let mut out_ptr = std::ptr::null_mut::<c_void>();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    created,
+                    &crate::com::IID_IPropertyValue,
+                    29, // GetInt32Array
+                    &[&mut out_len as *mut u32 as u64, &mut out_ptr as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(out_len, 3);
+            assert_eq!(std::slice::from_raw_parts(out_ptr as *const i32, 3), &i32s);
+            CoTaskMemFree(out_ptr);
+            assert_eq!(com_call_release(created), 0);
+
+            let raw_bools = [0u8, 5u8, 1u8];
+            created = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    36, // CreateBooleanArray
+                    &[raw_bools.len() as u64, raw_bools.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    created,
+                    &crate::com::IID_IPropertyValue,
+                    36, // GetBooleanArray
+                    &[&mut out_len as *mut u32 as u64, &mut out_ptr as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(out_len, 3);
+            assert_eq!(std::slice::from_raw_parts(out_ptr as *const u8, 3), &[0, 1, 1]);
+            CoTaskMemFree(out_ptr);
+            assert_eq!(com_call_release(created), 0);
+
+            let h1 = rust_to_hstring("alpha").unwrap();
+            let h2 = rust_to_hstring("").unwrap();
+            let h3 = rust_to_hstring("omega").unwrap();
+            let hstrs = [h1, h2, h3];
+            created = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    37, // CreateStringArray
+                    &[hstrs.len() as u64, hstrs.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            WindowsDeleteString(h1);
+            WindowsDeleteString(h2);
+            WindowsDeleteString(h3);
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    created,
+                    &crate::com::IID_IPropertyValue,
+                    37, // GetStringArray
+                    &[&mut out_len as *mut u32 as u64, &mut out_ptr as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(out_len, 3);
+            let got_hs = std::slice::from_raw_parts(out_ptr as *const usize, 3);
+            assert_eq!(hstring_to_rust(got_hs[0]), "alpha");
+            assert_eq!(hstring_to_rust(got_hs[1]), "");
+            assert_eq!(hstring_to_rust(got_hs[2]), "omega");
+            for &h in got_hs {
+                WindowsDeleteString(h);
+            }
+            CoTaskMemFree(out_ptr);
+            assert_eq!(com_call_release(created), 0);
+
+            // InspectableArray retains COM elements and AddRefs copies on GetInspectableArray.
+            let elem_arr = [pv, std::ptr::null_mut()];
+            created = std::ptr::null_mut();
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    pvs,
+                    &crate::com::IID_IPropertyValueStatics,
+                    38, // CreateInspectableArray
+                    &[elem_arr.len() as u64, elem_arr.as_ptr() as u64, &mut created as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::com::com_invoke_hresult(
+                    created,
+                    &crate::com::IID_IPropertyValue,
+                    38, // GetInspectableArray
+                    &[&mut out_len as *mut u32 as u64, &mut out_ptr as *mut *mut c_void as u64],
+                ),
+                S_OK
+            );
+            assert_eq!(out_len, 2);
+            let got_insps = std::slice::from_raw_parts(out_ptr as *const *mut c_void, 2);
+            assert_eq!(got_insps[0], pv);
+            assert!(got_insps[1].is_null());
+            let _ = com_call_release(got_insps[0]);
+            CoTaskMemFree(out_ptr);
+            assert_eq!(com_call_release(created), 0);
+
+            // Raw vtable call on final slot (44: CreateRectArray / GetRectArray) including 0-len and non-empty.
             type GetRectArrayFn = unsafe extern "win64" fn(*mut c_void, *mut u32, *mut *mut c_void) -> HRESULT;
             type CreateRectArrayFn = unsafe extern "win64" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
             let raw_get_rect_array: GetRectArrayFn = std::mem::transmute(*pv_vtbl_ptr.add(44));
             let raw_create_rect_array: CreateRectArrayFn = std::mem::transmute(*pvs_vtbl_ptr.add(44));
             let mut raw_len = 77u32;
             let mut raw_ptr = 0x1234usize as *mut c_void;
-            assert_eq!(raw_get_rect_array(pv, &mut raw_len, &mut raw_ptr), E_NOTIMPL);
+            assert_eq!(raw_get_rect_array(pv, &mut raw_len, &mut raw_ptr), TYPE_E_TYPEMISMATCH);
             assert_eq!(raw_len, 0);
             assert!(raw_ptr.is_null());
 
-            created = 0x5678usize as *mut c_void;
-            assert_eq!(raw_create_rect_array(pvs, 0, std::ptr::null(), &mut created), E_NOTIMPL);
-            assert!(created.is_null());
+            created = std::ptr::null_mut();
+            assert_eq!(raw_create_rect_array(pvs, 0, std::ptr::null(), &mut created), S_OK);
+            assert!(!created.is_null());
+            raw_len = 99;
+            raw_ptr = 0x1234usize as *mut c_void;
+            assert_eq!(raw_get_rect_array(created, &mut raw_len, &mut raw_ptr), S_OK);
+            assert_eq!(raw_len, 0);
+            assert!(raw_ptr.is_null());
+            assert_eq!(com_call_release(created), 0);
+
+            let rects = [[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]];
+            created = std::ptr::null_mut();
+            assert_eq!(raw_create_rect_array(pvs, 2, rects.as_ptr() as *const c_void, &mut created), S_OK);
+            assert_eq!(raw_get_rect_array(created, &mut raw_len, &mut raw_ptr), S_OK);
+            assert_eq!(raw_len, 2);
+            assert_eq!(std::slice::from_raw_parts(raw_ptr as *const [f32; 4], 2), &rects);
+            CoTaskMemFree(raw_ptr);
+            assert_eq!(com_call_release(created), 0);
 
             assert_eq!(com_call_release(pv), 1);
             assert_eq!(com_call_release(pv_unk), 0);
