@@ -337,12 +337,16 @@ impl Default for StageBindings {
 pub struct ContextState {
     pub vs_com: ComRef,
     pub vs: Option<Arc<ShaderBlob>>,
+    pub vs_ci: Vec<ComRef>,
     pub gs_com: ComRef,
     pub gs: Option<Arc<ShaderBlob>>,
+    pub gs_ci: Vec<ComRef>,
     pub ps_com: ComRef,
     pub ps: Option<Arc<ShaderBlob>>,
+    pub ps_ci: Vec<ComRef>,
     pub cs_com: ComRef,
     pub cs: Option<Arc<ComputeShaderInner>>,
+    pub cs_ci: Vec<ComRef>,
 
     pub vs_bind: StageBindings,
     pub ps_bind: StageBindings,
@@ -390,12 +394,16 @@ impl Default for ContextState {
         Self {
             vs_com: ComRef::default(),
             vs: None,
+            vs_ci: Vec::new(),
             gs_com: ComRef::default(),
             gs: None,
+            gs_ci: Vec::new(),
             ps_com: ComRef::default(),
             ps: None,
+            ps_ci: Vec::new(),
             cs_com: ComRef::default(),
             cs: None,
+            cs_ci: Vec::new(),
             vs_bind: StageBindings::default(),
             ps_bind: StageBindings::default(),
             gs_bind: StageBindings::default(),
@@ -1450,6 +1458,7 @@ pub struct D3d11Context {
     pub flags: u32,
     pub state: Mutex<ContextState>,
     pub recorded: Mutex<Vec<RecordedCmd>>,
+    pub active_context_state: Mutex<Option<ComRef>>,
 }
 
 impl D3d11Context {
@@ -1460,6 +1469,7 @@ impl D3d11Context {
             flags: 0,
             state: Mutex::new(ContextState::default()),
             recorded: Mutex::new(Vec::new()),
+            active_context_state: Mutex::new(None),
         })
     }
 
@@ -1470,6 +1480,7 @@ impl D3d11Context {
             flags,
             state: Mutex::new(ContextState::default()),
             recorded: Mutex::new(Vec::new()),
+            active_context_state: Mutex::new(None),
         })
     }
 
@@ -1945,25 +1956,57 @@ unsafe extern "win64" fn cs_get_uavs(this: PCtx, start: u32, n: u32, views: *mut
     get_uavs(&Obj::get(this).state.lock().unwrap().cs_uavs, start, n, views);
 }
 
-unsafe extern "win64" fn vs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
+unsafe fn capture_class_instances(ci: *const *mut c_void, nci: u32) -> Vec<ComRef> {
+    if ci.is_null() || nci == 0 {
+        return Vec::new();
+    }
+    let count = (nci as usize).min(256);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        out.push(ComRef::from_borrowed(std::ptr::read_unaligned(ci.add(i))));
+    }
+    out
+}
+
+unsafe fn copy_class_instances_out(src: &[ComRef], out_ci: *mut *mut c_void, nci: *mut u32) {
+    if nci.is_null() {
+        return;
+    }
+    if out_ci.is_null() {
+        std::ptr::write_unaligned(nci, src.len() as u32);
+        return;
+    }
+    let cap = std::ptr::read_unaligned(nci) as usize;
+    let copy = cap.min(src.len());
+    for i in 0..copy {
+        src[i].copy_out(out_ci.add(i));
+    }
+    std::ptr::write_unaligned(nci, copy as u32);
+}
+
+unsafe extern "win64" fn vs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.vs_com = ComRef::from_borrowed(shader);
     st.vs = vs_from_ptr(shader);
+    st.vs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn ps_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
+unsafe extern "win64" fn ps_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.ps_com = ComRef::from_borrowed(shader);
     st.ps = ps_from_ptr(shader);
+    st.ps_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn cs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
+unsafe extern "win64" fn cs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.cs_com = ComRef::from_borrowed(shader);
     st.cs = cs_from_ptr(shader);
+    st.cs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
+unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.gs_com = ComRef::from_borrowed(shader);
     st.gs = gs_from_ptr(shader);
+    st.gs_ci = capture_class_instances(ci, nci);
 }
 unsafe extern "win64" fn hs_set_shader(_this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     if !shader.is_null() { stub!("HSSetShader(non-null) ignored"); }
@@ -1972,21 +2015,25 @@ unsafe extern "win64" fn ds_set_shader(_this: PCtx, shader: *mut c_void, _ci: *c
     if !shader.is_null() { stub!("DSSetShader(non-null) ignored"); }
 }
 
-unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    Obj::get(this).state.lock().unwrap().vs_com.copy_out(out);
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.vs_com.copy_out(out);
+    copy_class_instances_out(&st.vs_ci, ci, nci);
 }
-unsafe extern "win64" fn ps_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    Obj::get(this).state.lock().unwrap().ps_com.copy_out(out);
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn ps_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.ps_com.copy_out(out);
+    copy_class_instances_out(&st.ps_ci, ci, nci);
 }
-unsafe extern "win64" fn cs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    Obj::get(this).state.lock().unwrap().cs_com.copy_out(out);
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn cs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.cs_com.copy_out(out);
+    copy_class_instances_out(&st.cs_ci, ci, nci);
 }
-unsafe extern "win64" fn gs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    Obj::get(this).state.lock().unwrap().gs_com.copy_out(out);
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn gs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.gs_com.copy_out(out);
+    copy_class_instances_out(&st.gs_ci, ci, nci);
 }
 unsafe extern "win64" fn hs_get_shader(_this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
     if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
@@ -3008,7 +3055,52 @@ unsafe extern "win64" fn discard_view1(this: PCtx, view: *mut c_void, _rects: *c
     }
 }
 
-unsafe extern "win64" fn swap_device_context_state(_this: PCtx, _state: *mut c_void, prev: *mut *mut c_void) {
-    if !prev.is_null() { std::ptr::write_unaligned(prev, std::ptr::null_mut()); }
-    stub!("ID3D11DeviceContext1::SwapDeviceContextState not implemented");
+unsafe extern "win64" fn swap_device_context_state(
+    this: PCtx,
+    state: *mut c_void,
+    prev: *mut *mut c_void,
+) {
+    if !prev.is_null() {
+        std::ptr::write_unaligned(prev, std::ptr::null_mut());
+    }
+    let ctx = Obj::get(this);
+    if ctx.deferred || state.is_null() {
+        return;
+    }
+    let Some(target) = Obj::<D3d11DeviceContextState>::from_iface(state) else {
+        return;
+    };
+
+    // Determine or lazily materialize the previously active ID3DDeviceContextState object.
+    let mut active_guard = ctx.active_context_state.lock().unwrap();
+    let prev_obj = match active_guard.as_ref() {
+        Some(cr) => cr.clone(),
+        None => {
+            let initial = D3d11DeviceContextState::new_com(
+                ctx.device.clone(),
+                ctx.device.feature_level,
+                ContextState::default(),
+            );
+            // Ownership transfers into ComRef (no extra AddRef).
+            ComRef(initial as usize)
+        }
+    };
+
+    // Swapping in the already-active state is a no-op (still returns it in `ppPreviousState`).
+    if prev_obj.as_ptr() == state {
+        prev_obj.copy_out(prev);
+        *active_guard = Some(prev_obj);
+        return;
+    }
+
+    // Save current context state into the previous state object and load target's state.
+    let current_state = std::mem::take(&mut *ctx.state.lock().unwrap());
+    if let Some(prev_state_obj) = Obj::<D3d11DeviceContextState>::from_iface(prev_obj.as_ptr()) {
+        *Obj::get(prev_state_obj).state.lock().unwrap() = current_state;
+    }
+    let next_state = std::mem::take(&mut *Obj::get(target).state.lock().unwrap());
+    *ctx.state.lock().unwrap() = next_state;
+
+    prev_obj.copy_out(prev);
+    *active_guard = Some(ComRef::from_borrowed(state));
 }

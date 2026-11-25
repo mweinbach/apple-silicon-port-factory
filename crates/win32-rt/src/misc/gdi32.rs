@@ -124,6 +124,9 @@ struct BitmapData {
     bits_ptr: usize,
     stride: usize,
     byte_len: usize,
+    /// True when `bits_ptr` is externally owned (e.g., a DXGI surface staging buffer)
+    /// and must not be freed by `DeleteObject`.
+    external_bits: bool,
 }
 
 impl BitmapData {
@@ -670,9 +673,50 @@ pub unsafe extern "win64" fn CreateDIBSection(
             bits_ptr: bits as usize,
             stride,
             byte_len: total,
+            external_bits: false,
         }),
     );
     h
+}
+
+/// Create a memory DC backed directly by an externally owned top-down 32bpp BGRA pixel buffer
+/// (used by `IDXGISurface1::GetDC`). Caller must release it with [`destroy_external_surface_dc`].
+pub(crate) fn create_external_surface_dc(
+    width: usize,
+    height: usize,
+    stride: usize,
+    bits_ptr: usize,
+    byte_len: usize,
+) -> (usize, usize) {
+    let hbmp = NEXT.fetch_add(4, Ordering::Relaxed);
+    let hdc = NEXT.fetch_add(4, Ordering::Relaxed);
+    let mut dc = DcData::new(0);
+    dc.bitmap = hbmp;
+    let mut m = objs().lock().unwrap();
+    m.insert(
+        hbmp,
+        Obj::Bitmap(BitmapData {
+            width,
+            height,
+            bpp: 32,
+            planes: 1,
+            top_down: true,
+            is_dib: true,
+            bits_ptr,
+            stride,
+            byte_len,
+            external_bits: true,
+        }),
+    );
+    m.insert(hdc, Obj::Dc(dc));
+    (hdc, hbmp)
+}
+
+/// Destroy a DC and external bitmap previously created by [`create_external_surface_dc`].
+pub(crate) fn destroy_external_surface_dc(hdc: usize, hbmp: usize) {
+    let mut m = objs().lock().unwrap();
+    m.remove(&hdc);
+    m.remove(&hbmp);
 }
 
 pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
@@ -684,7 +728,7 @@ pub unsafe extern "win64" fn DeleteObject(h: usize) -> BOOL {
         Some(Obj::Font(_) | Obj::Brush(_) | Obj::Pen(_) | Obj::Region) => TRUE,
         Some(Obj::Bitmap(bm)) => {
             drop(m);
-            if bm.bits_ptr != 0 {
+            if bm.bits_ptr != 0 && !bm.external_bits {
                 crate::heap::free(bm.bits_ptr as *mut std::ffi::c_void);
             }
             TRUE
@@ -885,6 +929,7 @@ pub unsafe extern "win64" fn CreateCompatibleBitmap(_hdc: usize, cx: i32, cy: i3
             bits_ptr: bits as usize,
             stride,
             byte_len: total,
+            external_bits: false,
         }),
     );
     handle
@@ -1021,6 +1066,7 @@ pub unsafe extern "win64" fn CreateBitmap(
             bits_ptr: bits as usize,
             stride,
             byte_len: total,
+            external_bits: false,
         }),
     );
     handle
@@ -1595,6 +1641,7 @@ unsafe fn get_object_impl(h: usize, cb: i32, pv: *mut u8, wide: bool) -> i32 {
                 bits_ptr: 0,
                 stride: 2,
                 byte_len: 2,
+                external_bits: false,
             };
             Some(serialize_bitmap(&def, false))
         } else {

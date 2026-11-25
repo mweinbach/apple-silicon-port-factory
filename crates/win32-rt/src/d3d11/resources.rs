@@ -824,13 +824,7 @@ impl ComClass for D3d11Texture2D {
         if *iid == IID_IDXGISurface || *iid == IID_IDXGISurface1 || *iid == IID_IDXGISurface2 {
             Obj::add_ref(this);
             let t = Obj::get(this);
-            let surf = Obj::new(DxgiSurface {
-                tex_com: this as usize,
-                device: t.device.clone(),
-                core: t.core.clone(),
-                subresource: 0,
-            });
-            return Some(surf as *mut c_void);
+            return Some(DxgiSurface::new_com(this as usize, t.device.clone(), t.core.clone(), 0));
         }
         query_dxgi_resource(this, iid)
     }
@@ -1026,13 +1020,10 @@ unsafe extern "win64" fn dxgi_res_create_subresource_surface(
         );
     }
     com_add_ref(r.res_com as *mut c_void);
-    let surf = Obj::new(DxgiSurface {
-        tex_com: r.res_com,
-        device: r.device.clone(),
-        core: r.core.clone(),
-        subresource: index,
-    });
-    std::ptr::write_unaligned(out_surf, surf as *mut c_void);
+    std::ptr::write_unaligned(
+        out_surf,
+        DxgiSurface::new_com(r.res_com, r.device.clone(), r.core.clone(), index),
+    );
     S_OK
 }
 
@@ -1060,16 +1051,49 @@ unsafe extern "win64" fn dxgi_res_create_shared_handle(
 /// Slot count of `IDXGISurface2` vtable (0..13).
 pub const IDXGI_SURFACE2_SLOT_COUNT: usize = 14;
 
+/// Active GDI DC lock on an `IDXGISurface1` (created via `GetDC`, uploaded on `ReleaseDC`).
+struct SurfaceDcState {
+    hdc: usize,
+    hbmp: usize,
+    width: u32,
+    height: u32,
+}
+
 /// Tear-off `IDXGISurface2` for `ID3D11Texture2D` (14 slots).
 pub struct DxgiSurface {
     tex_com: usize,
     device: Arc<DeviceCore>,
     core: Arc<ResourceCore>,
     subresource: u32,
+    dc_state: Mutex<Option<SurfaceDcState>>,
+}
+
+impl DxgiSurface {
+    /// Wrap an already-AddRef'd `ID3D11Texture2D` pointer as an `IDXGISurface2` COM object.
+    pub fn new_com(
+        tex_com: usize,
+        device: Arc<DeviceCore>,
+        core: Arc<ResourceCore>,
+        subresource: u32,
+    ) -> *mut c_void {
+        Obj::new(DxgiSurface {
+            tex_com,
+            device,
+            core,
+            subresource,
+            dc_state: Mutex::new(None),
+        }) as *mut c_void
+    }
 }
 
 impl Drop for DxgiSurface {
     fn drop(&mut self) {
+        if let Ok(mut g) = self.dc_state.lock() {
+            if let Some(dc) = g.take() {
+                crate::misc::gdi32::destroy_external_surface_dc(dc.hdc, dc.hbmp);
+                self.core.mapped.lock().unwrap().remove(&self.subresource);
+            }
+        }
         unsafe { com_release(self.tex_com as *mut c_void) };
     }
 }
@@ -1301,14 +1325,201 @@ unsafe extern "win64" fn surf_unmap(this: *mut Obj<DxgiSurface>) -> HRESULT {
     }
     S_OK
 }
-unsafe extern "win64" fn surf_get_dc(_this: *mut Obj<DxgiSurface>, _discard: BOOL, hdc: *mut *mut c_void) -> HRESULT {
-    if !hdc.is_null() {
-        std::ptr::write_unaligned(hdc, std::ptr::null_mut());
+unsafe extern "win64" fn surf_get_dc(
+    this: *mut Obj<DxgiSurface>,
+    discard: BOOL,
+    hdc_out: *mut *mut c_void,
+) -> HRESULT {
+    if !hdc_out.is_null() {
+        std::ptr::write_unaligned(hdc_out, std::ptr::null_mut());
     }
-    stub!("IDXGISurface1::GetDC -> E_NOTIMPL");
-    E_NOTIMPL
+    if hdc_out.is_null() {
+        return E_INVALIDARG;
+    }
+    let surf = Obj::get(this);
+    let core = &surf.core;
+    let sub = surf.subresource;
+
+    // Windows requires D3D11_RESOURCE_MISC_GDI_COMPATIBLE, non-MSAA, and a BGRA8 format
+    // (DXGI_FORMAT_B8G8R8A8_UNORM=87, _TYPELESS=90, _UNORM_SRGB=91).
+    let ResourceKind::Texture2D(td) = core.kind else {
+        return d11_failed!(DXGI_ERROR_INVALID_CALL, "IDXGISurface1::GetDC: not a Texture2D");
+    };
+    if (td.MiscFlags & misc_flag::GDI_COMPATIBLE) == 0
+        || td.SampleDesc.Count > 1
+        || !matches!(td.Format, 87 | 90 | 91)
+    {
+        return d11_failed!(
+            DXGI_ERROR_INVALID_CALL,
+            "IDXGISurface1::GetDC: requires GDI_COMPATIBLE non-MSAA BGRA8 texture (fmt={}, samples={}, misc={:#x})",
+            td.Format,
+            td.SampleDesc.Count,
+            td.MiscFlags
+        );
+    }
+
+    let mips = td.MipLevels.max(1);
+    let mip = sub % mips;
+    let width = (td.Width >> mip).max(1);
+    let height = (td.Height >> mip).max(1);
+
+    // Reject concurrent GetDC or Map on the same subresource.
+    {
+        let dc_guard = surf.dc_state.lock().unwrap();
+        if dc_guard.is_some() {
+            return d11_failed!(DXGI_ERROR_INVALID_CALL, "IDXGISurface1::GetDC: DC already acquired");
+        }
+        let mut mapped = core.mapped.lock().unwrap();
+        if mapped.contains_key(&sub) {
+            return d11_failed!(
+                DXGI_ERROR_INVALID_CALL,
+                "IDXGISurface1::GetDC: subresource {sub} is already mapped"
+            );
+        }
+        mapped.insert(
+            sub,
+            MapState {
+                map_type: dxgi_map::READ | dxgi_map::WRITE,
+                writable: true,
+                deferred_scratch: None,
+                row_pitch: 0,
+                depth_pitch: 0,
+            },
+        );
+    }
+
+    let unreserve = || {
+        core.mapped.lock().unwrap().remove(&sub);
+    };
+
+    let had_staging = core.tex_staging.lock().unwrap().is_some();
+    let (staging_buf, layouts) = match core.ensure_tex_staging() {
+        Ok(x) => x,
+        Err(e) => {
+            unreserve();
+            return d11_failed!(E_FAIL, "IDXGISurface1::GetDC staging alloc: {e}");
+        }
+    };
+    let Some(lay) = layouts.get(sub as usize).copied() else {
+        unreserve();
+        return d11_failed!(E_INVALIDARG, "IDXGISurface1::GetDC: subresource {sub} out of range");
+    };
+
+    core.sync_other_devices(&surf.device);
+
+    if discard == 0 {
+        let mtl = core.current_mtl();
+        {
+            let mut exec = surf.device.imm_exec.lock().unwrap();
+            if let Err(e) = exec.ensure_open() {
+                drop(exec);
+                unreserve();
+                return d11_failed!(E_FAIL, "IDXGISurface1::GetDC ensure_open: {e}");
+            }
+            exec.cl.barrier();
+            if let Err(e) = exec.cl.copy_texture_region(
+                CopyLoc::Footprint(&staging_buf, lay.footprint),
+                [0, 0, 0],
+                CopyLoc::Subresource(&mtl, sub),
+                None,
+            ) {
+                drop(exec);
+                unreserve();
+                return d11_failed!(E_FAIL, "IDXGISurface1::GetDC readback copy: {e}");
+            }
+            exec.has_work = true;
+            exec.keep((mtl, staging_buf.clone()));
+        }
+        surf.device.flush_and_wait_idle();
+    } else if had_staging {
+        surf.device.flush_and_wait_idle();
+    }
+
+    let Some(base_ptr) = staging_buf.cpu_ptr() else {
+        unreserve();
+        return d11_failed!(E_FAIL, "IDXGISurface1::GetDC: staging buffer has no cpu_ptr");
+    };
+    let ptr = base_ptr.add(lay.footprint.offset as usize);
+    let stride = lay.footprint.row_pitch as usize;
+    let byte_len = stride.saturating_mul(lay.num_rows as usize);
+    let (hdc, hbmp) = crate::misc::gdi32::create_external_surface_dc(
+        width as usize,
+        height as usize,
+        stride,
+        ptr as usize,
+        byte_len,
+    );
+    *surf.dc_state.lock().unwrap() = Some(SurfaceDcState { hdc, hbmp, width, height });
+    std::ptr::write_unaligned(hdc_out, hdc as *mut c_void);
+    S_OK
 }
-unsafe extern "win64" fn surf_release_dc(_this: *mut Obj<DxgiSurface>, _dirty: *const c_void) -> HRESULT {
+
+unsafe extern "win64" fn surf_release_dc(
+    this: *mut Obj<DxgiSurface>,
+    dirty: *const c_void,
+) -> HRESULT {
+    let surf = Obj::get(this);
+    let Some(dc) = surf.dc_state.lock().unwrap().take() else {
+        return d11_failed!(DXGI_ERROR_INVALID_CALL, "IDXGISurface1::ReleaseDC: no active DC");
+    };
+    crate::misc::gdi32::destroy_external_surface_dc(dc.hdc, dc.hbmp);
+    let core = &surf.core;
+    let sub = surf.subresource;
+    core.mapped.lock().unwrap().remove(&sub);
+
+    // Optional pDirtyRect: when specified and empty, skip GPU upload; otherwise clamp to surface.
+    let (dst_xyz, src_box) = if !dirty.is_null() {
+        let r = std::ptr::read_unaligned(dirty as *const crate::user32::RECT);
+        let left = r.left.clamp(0, dc.width as i32) as u32;
+        let top = r.top.clamp(0, dc.height as i32) as u32;
+        let right = r.right.clamp(0, dc.width as i32) as u32;
+        let bottom = r.bottom.clamp(0, dc.height as i32) as u32;
+        if right <= left || bottom <= top {
+            return S_OK;
+        }
+        (
+            [left, top, 0],
+            Some(d3d12_metal::metal::cmdlist::CopyBox {
+                left,
+                top,
+                front: 0,
+                right,
+                bottom,
+                back: 1,
+            }),
+        )
+    } else {
+        ([0, 0, 0], None)
+    };
+
+    let (staging_buf, layouts) = match core.ensure_tex_staging() {
+        Ok(x) => x,
+        Err(e) => return d11_failed!(E_FAIL, "IDXGISurface1::ReleaseDC staging: {e}"),
+    };
+    let Some(lay) = layouts.get(sub as usize).copied() else {
+        return d11_failed!(E_INVALIDARG, "IDXGISurface1::ReleaseDC: subresource {sub} out of range");
+    };
+    core.sync_other_devices(&surf.device);
+    let mtl = core.current_mtl();
+    {
+        let mut exec = surf.device.imm_exec.lock().unwrap();
+        if let Err(e) = exec.ensure_open() {
+            return d11_failed!(E_FAIL, "IDXGISurface1::ReleaseDC ensure_open: {e}");
+        }
+        exec.cl.barrier();
+        if let Err(e) = exec.cl.copy_texture_region(
+            CopyLoc::Subresource(&mtl, sub),
+            dst_xyz,
+            CopyLoc::Footprint(&staging_buf, lay.footprint),
+            src_box,
+        ) {
+            return d11_failed!(E_FAIL, "IDXGISurface1::ReleaseDC upload copy: {e}");
+        }
+        exec.cl.barrier();
+        exec.has_work = true;
+        exec.keep((mtl, staging_buf));
+    }
+    surf.device.flush_and_wait_idle();
     S_OK
 }
 unsafe extern "win64" fn surf_get_resource(

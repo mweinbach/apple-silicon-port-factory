@@ -744,10 +744,15 @@ unsafe extern "win64" fn create_domain_shader(
     E_NOTIMPL
 }
 
-unsafe extern "win64" fn create_class_linkage(_this: PDev, out: *mut *mut c_void) -> HRESULT {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("ID3D11Device::CreateClassLinkage -> E_NOTIMPL");
-    E_NOTIMPL
+unsafe extern "win64" fn create_class_linkage(this: PDev, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+    }
+    if out.is_null() {
+        return S_FALSE;
+    }
+    std::ptr::write_unaligned(out, D3d11ClassLinkage::new_com(Obj::get(this).core.clone()));
+    S_OK
 }
 
 unsafe extern "win64" fn create_blend_state(
@@ -953,9 +958,24 @@ unsafe extern "win64" fn create_predicate(this: PDev, desc: *const D3D11_QUERY_D
     create_query_inner(this, desc, true, out)
 }
 
-unsafe extern "win64" fn create_counter(_this: PDev, _desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("ID3D11Device::CreateCounter -> DXGI_ERROR_UNSUPPORTED");
+/// Native-unsupported: Apple Silicon Metal exposes only GPU timestamp counters
+/// (`MTLDevice.counterSets == ["timestamp"]`, `MTL4CounterHeapTypeTimestamp`) and
+/// zero device-dependent performance counters (`CheckCounterInfo` reports
+/// `LastDeviceDependentCounter = 0`, `NumSimultaneousCounters = 0`).
+/// Matches Windows D3D11 drivers with no device-dependent counters by validating
+/// `pCounterDesc` (`E_INVALIDARG` on null) and returning `DXGI_ERROR_UNSUPPORTED`
+/// (Microsoft Learn: `ID3D11Device::CreateCounter`).
+unsafe extern "win64" fn create_counter(
+    _this: PDev,
+    desc: *const D3D11_COUNTER_DESC,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+    }
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
     DXGI_ERROR_UNSUPPORTED
 }
 
@@ -1031,12 +1051,74 @@ unsafe extern "win64" fn open_shared_resource_by_name(
 }
 
 unsafe extern "win64" fn create_device_context_state(
-    _this: PDev, _flags: u32, _levels: *const u32, _n: u32, _sdk: u32, _iface: *const Guid,
-    _chosen: *mut u32, out: *mut *mut c_void,
+    this: PDev,
+    _flags: u32,
+    levels: *const u32,
+    n: u32,
+    sdk: u32,
+    iface: *const Guid,
+    chosen: *mut u32,
+    out: *mut *mut c_void,
 ) -> HRESULT {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("ID3D11Device1::CreateDeviceContextState -> E_NOTIMPL");
-    E_NOTIMPL
+    if !out.is_null() {
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
+    }
+    if sdk != D3D11_SDK_VERSION || (n > 0 && levels.is_null()) || iface.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(emulated) = Guid::read(iface) else {
+        return E_INVALIDARG;
+    };
+    if !matches!(
+        emulated,
+        IID_ID3D11Device
+            | IID_ID3D11Device1
+            | crate::dxgi::adapter::IID_ID3D10Device
+            | IID_ID3D10Device1
+    ) {
+        return E_INVALIDARG;
+    }
+    let core = &Obj::get(this).core;
+    let selected_level = if n == 0 {
+        core.feature_level
+    } else {
+        let mut found = None;
+        for i in 0..n as usize {
+            let fl = std::ptr::read_unaligned(levels.add(i));
+            if fl <= core.feature_level
+                && matches!(
+                    fl,
+                    D3D_FEATURE_LEVEL_9_1
+                        | D3D_FEATURE_LEVEL_9_2
+                        | D3D_FEATURE_LEVEL_9_3
+                        | D3D_FEATURE_LEVEL_10_0
+                        | D3D_FEATURE_LEVEL_10_1
+                        | D3D_FEATURE_LEVEL_11_0
+                        | D3D_FEATURE_LEVEL_11_1
+                )
+            {
+                found = Some(fl);
+                break;
+            }
+        }
+        let Some(fl) = found else {
+            return E_INVALIDARG;
+        };
+        fl
+    };
+    if !chosen.is_null() {
+        std::ptr::write_unaligned(chosen, selected_level);
+    }
+    if out.is_null() {
+        return S_FALSE;
+    }
+    let st = D3d11DeviceContextState::new_com(
+        core.clone(),
+        selected_level,
+        super::context::ContextState::default(),
+    );
+    std::ptr::write_unaligned(out, st as *mut c_void);
+    S_OK
 }
 
 unsafe extern "win64" fn check_format_support(_this: PDev, format: u32, out: *mut u32) -> HRESULT {
@@ -1067,11 +1149,26 @@ unsafe extern "win64" fn check_counter_info(_this: PDev, out: *mut D3D11_COUNTER
     }
 }
 
+/// Native-unsupported: Apple Silicon Metal exposes zero device-dependent performance
+/// counters (`CheckCounterInfo` reports `LastDeviceDependentCounter = 0`). Matches
+/// Windows D3D11 drivers without device-dependent counters by validating `pDesc`
+/// (`E_INVALIDARG` on null) and returning `DXGI_ERROR_UNSUPPORTED`
+/// (Microsoft Learn: `ID3D11Device::CheckCounter`).
 unsafe extern "win64" fn check_counter(
-    _this: PDev, _desc: *const c_void, _ty: *mut u32, _active: *mut u32, _name: *mut u8,
-    _name_len: *mut u32, _units: *mut u8, _units_len: *mut u32, _text: *mut u8, _text_len: *mut u32,
+    _this: PDev,
+    desc: *const D3D11_COUNTER_DESC,
+    _ty: *mut u32,
+    _active: *mut u32,
+    _name: *mut u8,
+    _name_len: *mut u32,
+    _units: *mut u8,
+    _units_len: *mut u32,
+    _text: *mut u8,
+    _text_len: *mut u32,
 ) -> HRESULT {
-    stub!("ID3D11Device::CheckCounter -> DXGI_ERROR_UNSUPPORTED");
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
     DXGI_ERROR_UNSUPPORTED
 }
 
@@ -1302,11 +1399,103 @@ unsafe extern "win64" fn dxgi_dev_get_adapter(_this: PGD, out: *mut *mut c_void)
 }
 
 unsafe extern "win64" fn dxgi_dev_create_surface(
-    _this: PGD, _desc: *const c_void, _n: u32, _usage: u32, _shared: *const c_void, out: *mut *mut c_void,
+    this: PGD,
+    desc: *const DXGI_SURFACE_DESC,
+    num_surfaces: u32,
+    dxgi_usage: u32,
+    shared: *const HANDLE,
+    out: *mut *mut c_void,
 ) -> HRESULT {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("IDXGIDevice::CreateSurface -> E_NOTIMPL");
-    E_NOTIMPL
+    if desc.is_null() || num_surfaces == 0 || out.is_null() {
+        return E_INVALIDARG;
+    }
+    for i in 0..num_surfaces as usize {
+        std::ptr::write_unaligned(out.add(i), std::ptr::null_mut());
+    }
+    let sd = std::ptr::read_unaligned(desc);
+    if sd.Width == 0 || sd.Height == 0 {
+        return E_INVALIDARG;
+    }
+    let core = &Obj::get(this).core;
+
+    // If a shared handle is provided, open it as an IDXGISurface (valid for num_surfaces == 1).
+    if !shared.is_null() {
+        let h = std::ptr::read_unaligned(shared);
+        if !h.is_null() {
+            if num_surfaces != 1 {
+                return E_INVALIDARG;
+            }
+            let res_core = match lookup_legacy_shared_resource(h)
+                .or_else(|_| lookup_nt_shared_resource(h))
+            {
+                Ok(c) => c,
+                Err(hr) => return hr,
+            };
+            return wrap_shared_resource(core.clone(), res_core, &IID_IDXGISurface, out);
+        }
+    }
+
+    // Translate DXGI_USAGE flags into D3D11_TEXTURE2D_DESC fields.
+    let cpu_bits = dxgi_usage & 0xF;
+    let (d3d_usage, cpu_access) = match cpu_bits {
+        1 => (usage::DYNAMIC, cpu_access::WRITE),
+        2 | 3 => (usage::STAGING, cpu_access::READ | cpu_access::WRITE),
+        _ => (usage::DEFAULT, 0),
+    };
+    let mut bind_flags = 0u32;
+    if dxgi_usage & 0x10 != 0 {
+        bind_flags |= bind_flag::SHADER_RESOURCE;
+    }
+    if dxgi_usage & 0x20 != 0 {
+        bind_flags |= bind_flag::RENDER_TARGET;
+    }
+    if dxgi_usage & 0x400 != 0 {
+        bind_flags |= bind_flag::UNORDERED_ACCESS;
+    }
+    if d3d_usage == usage::STAGING {
+        bind_flags = 0;
+    }
+    let mut misc_flags = 0u32;
+    if dxgi_usage & 0x80 != 0 {
+        misc_flags |= misc_flag::SHARED;
+    }
+
+    let td = D3D11_TEXTURE2D_DESC {
+        Width: sd.Width,
+        Height: sd.Height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: sd.Format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: sd.SampleDesc.Count.max(1),
+            Quality: sd.SampleDesc.Quality,
+        },
+        Usage: d3d_usage,
+        BindFlags: bind_flags,
+        CPUAccessFlags: cpu_access,
+        MiscFlags: misc_flags,
+    };
+
+    let mut created: Vec<*mut c_void> = Vec::with_capacity(num_surfaces as usize);
+    for _ in 0..num_surfaces {
+        let res = match ResourceCore::new_texture2d(core.clone(), td) {
+            Ok(r) => r,
+            Err(hr) => {
+                for p in created {
+                    com_release(p);
+                }
+                return hr;
+            }
+        };
+        let tex = Obj::new(D3d11Texture2D { device: core.clone(), core: res.clone() });
+        // `DxgiSurface` takes ownership of `tex`'s initial refcount (drops via `com_release`).
+        let surf = DxgiSurface::new_com(tex as usize, core.clone(), res, 0);
+        created.push(surf);
+    }
+    for (i, p) in created.into_iter().enumerate() {
+        std::ptr::write_unaligned(out.add(i), p);
+    }
+    S_OK
 }
 
 unsafe extern "win64" fn dxgi_dev_query_residency(

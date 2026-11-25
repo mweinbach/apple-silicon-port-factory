@@ -3793,3 +3793,314 @@ fn sm5_geometry_shader_emulation_draw_on_metal() {
         com_release(dev);
     }
 }
+
+#[test]
+fn dxgi_device_create_surface_and_gdi_interop_get_dc_on_metal() {
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+    unsafe {
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(
+                std::ptr::null_mut(),
+                driver_type::HARDWARE,
+                std::ptr::null_mut(),
+                create_device_flag::BGRA_SUPPORT,
+                std::ptr::null(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut dev,
+                std::ptr::null_mut(),
+                &mut ctx,
+            ),
+            S_OK
+        );
+
+        // 1. IDXGIDevice::CreateSurface creates real Metal-backed IDXGISurface2 objects.
+        let mut dxgi_dev: *mut c_void = std::ptr::null_mut();
+        assert_eq!(com_query(dev, &IID_IDXGIDevice, &mut dxgi_dev), S_OK);
+        let create_surf: unsafe extern "win64" fn(
+            *mut c_void, *const DXGI_SURFACE_DESC, u32, u32, *const HANDLE, *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dxgi_dev, 8));
+        let sdesc = DXGI_SURFACE_DESC {
+            Width: 8,
+            Height: 4,
+            Format: 87, // DXGI_FORMAT_B8G8R8A8_UNORM
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        };
+        let mut surfs = [std::ptr::null_mut(); 2];
+        assert_eq!(create_surf(dxgi_dev, &sdesc, 0, 0x20, std::ptr::null(), surfs.as_mut_ptr()), E_INVALIDARG);
+        assert_eq!(create_surf(dxgi_dev, &sdesc, 2, 0x20 | 0x10, std::ptr::null(), surfs.as_mut_ptr()), S_OK);
+        assert!(!surfs[0].is_null() && !surfs[1].is_null());
+        let get_desc: unsafe extern "win64" fn(*mut c_void, *mut DXGI_SURFACE_DESC) -> HRESULT =
+            std::mem::transmute(vtbl_slot(surfs[0], 8));
+        let mut got_sd = DXGI_SURFACE_DESC::default();
+        assert_eq!(get_desc(surfs[0], &mut got_sd), S_OK);
+        assert_eq!((got_sd.Width, got_sd.Height, got_sd.Format), (8, 4, 87));
+        com_release(surfs[0]);
+        com_release(surfs[1]);
+        com_release(dxgi_dev);
+
+        // 2. IDXGISurface1::GetDC / ReleaseDC with real GDI32 rasterization into a Metal texture.
+        let create_tex2d: unsafe extern "win64" fn(
+            *mut c_void, *const D3D11_TEXTURE2D_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 5));
+        let copy_res: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 47));
+        let map_fn: unsafe extern "win64" fn(
+            *mut c_void, *mut c_void, u32, u32, u32, *mut D3D11_MAPPED_SUBRESOURCE,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(ctx, 14));
+        let unmap_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 15));
+
+        // Non-GDI_COMPATIBLE texture rejects GetDC with DXGI_ERROR_INVALID_CALL.
+        let non_gdi_td = D3D11_TEXTURE2D_DESC {
+            Width: 4,
+            Height: 4,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 87,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::RENDER_TARGET,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut non_gdi_tex: *mut c_void = std::ptr::null_mut();
+        let mut non_gdi_surf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev, &non_gdi_td, std::ptr::null(), &mut non_gdi_tex), S_OK);
+        assert_eq!(com_query(non_gdi_tex, &IID_IDXGISurface1, &mut non_gdi_surf), S_OK);
+        let get_dc: unsafe extern "win64" fn(*mut c_void, BOOL, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(non_gdi_surf, 11));
+        let rel_dc: unsafe extern "win64" fn(*mut c_void, *const c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(non_gdi_surf, 12));
+        let mut hdc: *mut c_void = std::ptr::null_mut();
+        assert_eq!(get_dc(non_gdi_surf, TRUE, &mut hdc), DXGI_ERROR_INVALID_CALL);
+        assert!(hdc.is_null());
+        com_release(non_gdi_surf);
+        com_release(non_gdi_tex);
+
+        // GDI_COMPATIBLE BGRA8 texture: draw with GDI SetPixel, ReleaseDC, verify GPU readback!
+        let gdi_td = D3D11_TEXTURE2D_DESC {
+            MiscFlags: misc_flag::GDI_COMPATIBLE,
+            ..non_gdi_td
+        };
+        let stg_td = D3D11_TEXTURE2D_DESC {
+            Usage: usage::STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: cpu_access::READ,
+            MiscFlags: 0,
+            ..non_gdi_td
+        };
+        let mut gdi_tex: *mut c_void = std::ptr::null_mut();
+        let mut stg_tex: *mut c_void = std::ptr::null_mut();
+        let mut gdi_surf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_tex2d(dev, &gdi_td, std::ptr::null(), &mut gdi_tex), S_OK);
+        assert_eq!(create_tex2d(dev, &stg_td, std::ptr::null(), &mut stg_tex), S_OK);
+        assert_eq!(com_query(gdi_tex, &IID_IDXGISurface1, &mut gdi_surf), S_OK);
+
+        // ReleaseDC without GetDC -> DXGI_ERROR_INVALID_CALL.
+        assert_eq!(rel_dc(gdi_surf, std::ptr::null()), DXGI_ERROR_INVALID_CALL);
+
+        assert_eq!(get_dc(gdi_surf, TRUE, &mut hdc), S_OK);
+        assert!(!hdc.is_null());
+        // Double GetDC fails while active.
+        let mut hdc2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(get_dc(gdi_surf, TRUE, &mut hdc2), DXGI_ERROR_INVALID_CALL);
+
+        // Draw pixel (1, 2) = COLORREF(R=0x12, G=0x34, B=0x56) = 0x00563412 via real gdi32::SetPixel!
+        crate::misc::gdi32::SetPixel(hdc as usize, 1, 2, 0x0056_3412);
+        assert_eq!(rel_dc(gdi_surf, std::ptr::null()), S_OK);
+
+        // Re-acquire with Discard=FALSE and verify pixel (1,2) survived GPU round-trip!
+        assert_eq!(get_dc(gdi_surf, FALSE, &mut hdc), S_OK);
+        assert_eq!(crate::misc::gdi32::GetPixel(hdc as usize, 1, 2), 0x0056_3412);
+        // Also paint pixel (2, 1) with dirty rect upload.
+        crate::misc::gdi32::SetPixel(hdc as usize, 2, 1, 0x00AA_BBCC);
+        let dirty = crate::user32::RECT::new(2, 1, 3, 2);
+        assert_eq!(rel_dc(gdi_surf, &dirty as *const crate::user32::RECT as *const c_void), S_OK);
+
+        copy_res(ctx, stg_tex, gdi_tex);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE { pData: std::ptr::null_mut(), RowPitch: 0, DepthPitch: 0 };
+        assert_eq!(map_fn(ctx, stg_tex, 0, map_type::READ, 0, &mut mapped), S_OK);
+        let base = mapped.pData as *const u8;
+        let pitch = mapped.RowPitch as usize;
+        // BGRA byte order in B8G8R8A8_UNORM: [B, G, R, A].
+        let p12 = std::slice::from_raw_parts(base.add(2 * pitch + 1 * 4), 4);
+        assert_eq!(&p12[..3], &[0x56, 0x34, 0x12], "GDI pixel (1,2) must match BGRA in Metal texture");
+        let p21 = std::slice::from_raw_parts(base.add(1 * pitch + 2 * 4), 4);
+        assert_eq!(&p21[..3], &[0xAA, 0xBB, 0xCC], "GDI dirty-rect pixel (2,1) must match BGRA");
+        unmap_fn(ctx, stg_tex, 0);
+
+        com_release(gdi_surf);
+        com_release(stg_tex);
+        com_release(gdi_tex);
+        com_release(ctx);
+        com_release(dev);
+    }
+}
+
+#[test]
+fn d3d11_device_context_state_class_linkage_and_counters() {
+    if d3d12_metal::metal::device().is_none() {
+        return;
+    }
+    unsafe {
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(
+                std::ptr::null_mut(),
+                driver_type::HARDWARE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut dev,
+                std::ptr::null_mut(),
+                &mut ctx,
+            ),
+            S_OK
+        );
+
+        // 1. CheckCounter / CreateCounter match Windows when CheckCounterInfo reports 0 counters.
+        let check_info: unsafe extern "win64" fn(*mut c_void, *mut D3D11_COUNTER_INFO) =
+            std::mem::transmute(vtbl_slot(dev, 31));
+        let check_counter_fn: unsafe extern "win64" fn(
+            *mut c_void, *const D3D11_COUNTER_DESC, *mut u32, *mut u32, *mut u8, *mut u32, *mut u8, *mut u32, *mut u8, *mut u32,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 32));
+        let create_counter_fn: unsafe extern "win64" fn(
+            *mut c_void, *const D3D11_COUNTER_DESC, *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 26));
+        let mut cinfo = D3D11_COUNTER_INFO { LastDeviceDependentCounter: 1, NumSimultaneousCounters: 1, NumDetectableParallelUnits: 1 };
+        check_info(dev, &mut cinfo);
+        assert_eq!(cinfo.LastDeviceDependentCounter, 0);
+        let cdesc = D3D11_COUNTER_DESC { Counter: 0x4000_0000, MiscFlags: 0 };
+        let mut ctr: *mut c_void = 1usize as *mut c_void;
+        assert_eq!(create_counter_fn(dev, std::ptr::null(), &mut ctr), E_INVALIDARG);
+        assert!(ctr.is_null());
+        assert_eq!(create_counter_fn(dev, &cdesc, &mut ctr), DXGI_ERROR_UNSUPPORTED);
+        assert_eq!(
+            check_counter_fn(
+                dev, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            check_counter_fn(
+                dev, &cdesc, std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            ),
+            DXGI_ERROR_UNSUPPORTED
+        );
+
+        // 2. ID3D11Device::CreateClassLinkage + CreateClassInstance / GetClassInstance + shader binding.
+        let create_cl: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 19));
+        assert_eq!(create_cl(dev, std::ptr::null_mut()), S_FALSE);
+        let mut cl: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_cl(dev, &mut cl), S_OK);
+        assert!(!cl.is_null());
+
+        let get_ci: unsafe extern "win64" fn(*mut c_void, *const u8, u32, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(cl, 7));
+        let create_ci: unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, u32, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(cl, 8));
+        let mut ci1: *mut c_void = std::ptr::null_mut();
+        let mut ci2: *mut c_void = std::ptr::null_mut();
+        assert_eq!(get_ci(cl, b"gLight\0".as_ptr(), 3, &mut ci1), S_OK);
+        assert_eq!(create_ci(cl, b"CPointLight\0".as_ptr(), 1, 4, 2, 0, &mut ci2), S_OK);
+
+        let ci_get_desc: unsafe extern "win64" fn(*mut c_void, *mut D3D11_CLASS_INSTANCE_DESC) =
+            std::mem::transmute(vtbl_slot(ci2, 8));
+        let ci_get_inst_name: unsafe extern "win64" fn(*mut c_void, *mut u8, *mut usize) =
+            std::mem::transmute(vtbl_slot(ci1, 9));
+        let ci_get_type_name: unsafe extern "win64" fn(*mut c_void, *mut u8, *mut usize) =
+            std::mem::transmute(vtbl_slot(ci2, 10));
+        let mut d2 = D3D11_CLASS_INSTANCE_DESC::default();
+        ci_get_desc(ci2, &mut d2);
+        assert_eq!((d2.ConstantBuffer, d2.BaseConstantBufferOffset, d2.BaseTexture, d2.Created), (1, 4, 2, TRUE));
+        let mut buf = [0u8; 32];
+        let mut len = buf.len();
+        ci_get_inst_name(ci1, buf.as_mut_ptr(), &mut len);
+        assert_eq!(&buf[..len], b"gLight\0");
+        len = buf.len();
+        ci_get_type_name(ci2, buf.as_mut_ptr(), &mut len);
+        assert_eq!(&buf[..len], b"CPointLight\0");
+
+        // Bind class instances via VSSetShader and read back via VSGetShader.
+        let vs_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 11));
+        let vs_get: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32) =
+            std::mem::transmute(vtbl_slot(ctx, 76));
+        let cis = [ci1, ci2];
+        vs_set(ctx, std::ptr::null_mut(), cis.as_ptr(), 2);
+        let mut got_vs: *mut c_void = std::ptr::null_mut();
+        let mut got_cis = [std::ptr::null_mut(); 2];
+        let mut got_n = 2u32;
+        vs_get(ctx, &mut got_vs, got_cis.as_mut_ptr(), &mut got_n);
+        assert_eq!(got_n, 2);
+        assert_eq!(got_cis[0], ci1);
+        assert_eq!(got_cis[1], ci2);
+        com_release(got_cis[0]);
+        com_release(got_cis[1]);
+        com_release(ci2);
+        com_release(ci1);
+        com_release(cl);
+
+        // 3. ID3D11Device1::CreateDeviceContextState + ID3D11DeviceContext1::SwapDeviceContextState.
+        let create_dcs: unsafe extern "win64" fn(
+            *mut c_void, u32, *const u32, u32, u32, *const Guid, *mut u32, *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 47));
+        let swap_dcs: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 131));
+        let ia_set_topo: unsafe extern "win64" fn(*mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 24));
+        let ia_get_topo: unsafe extern "win64" fn(*mut c_void, *mut u32) =
+            std::mem::transmute(vtbl_slot(ctx, 83));
+
+        let fls = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        let mut chosen_fl = 0u32;
+        let mut state_b: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            create_dcs(dev, 0, fls.as_ptr(), 2, D3D11_SDK_VERSION, &IID_ID3D11Device1, &mut chosen_fl, &mut state_b),
+            S_OK
+        );
+        assert_eq!(chosen_fl, D3D_FEATURE_LEVEL_11_1);
+        assert!(!state_b.is_null());
+
+        // Set TRIANGLELIST on initial state A, swap to fresh state B (topology = UNDEFINED),
+        // set LINELIST on state B, swap back to state A -> topology must be TRIANGLELIST!
+        ia_set_topo(ctx, topology::TRIANGLELIST);
+        let mut state_a: *mut c_void = std::ptr::null_mut();
+        swap_dcs(ctx, state_b, &mut state_a);
+        assert!(!state_a.is_null());
+        let mut topo = 99u32;
+        ia_get_topo(ctx, &mut topo);
+        assert_eq!(topo, topology::UNDEFINED);
+        ia_set_topo(ctx, topology::LINELIST);
+
+        let mut prev_b: *mut c_void = std::ptr::null_mut();
+        swap_dcs(ctx, state_a, &mut prev_b);
+        assert_eq!(prev_b, state_b);
+        ia_get_topo(ctx, &mut topo);
+        assert_eq!(topo, topology::TRIANGLELIST);
+
+        // Swap back to B -> must restore LINELIST.
+        swap_dcs(ctx, state_b, std::ptr::null_mut());
+        ia_get_topo(ctx, &mut topo);
+        assert_eq!(topo, topology::LINELIST);
+
+        com_release(prev_b);
+        com_release(state_a);
+        com_release(state_b);
+        com_release(ctx);
+        com_release(dev);
+    }
+}
