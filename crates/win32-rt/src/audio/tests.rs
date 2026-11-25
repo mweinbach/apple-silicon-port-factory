@@ -2248,3 +2248,83 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
         assert_eq!(release(e), 0);
     }
 }
+
+#[test]
+fn loopback_capture_gates_arrival_on_started_state_and_discards_stopped_audio() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        let render_c = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+        assert_eq!(
+            call!(render_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut rc: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc), S_OK);
+        assert_eq!(call!(render_c, AC_START, () -> HRESULT;), S_OK);
+
+        // Initialize loopback capture client WITHOUT calling Start yet.
+        let lb_c = activate_client(d);
+        assert_eq!(
+            call!(lb_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+
+        // Render audio while loopback client is NOT started: polling must return 0 frames.
+        let mut rp: *mut u8 = std::ptr::null_mut();
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 64, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 64 * 2).fill(0.9);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 64, 0), S_OK);
+
+        let mut next = 99u32;
+        assert_eq!(call!(cc, 5 /* GetNextPacketSize */, (*mut u32) -> HRESULT; &mut next), S_OK);
+        assert_eq!(next, 0, "unstarted loopback client must not enqueue audio when polled");
+
+        // Starting loopback must NOT deliver stale audio rendered prior to Start.
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+        assert_eq!(call!(cc, 5, (*mut u32) -> HRESULT; &mut next), S_OK);
+        assert_eq!(next, 0, "Start must discard audio rendered while stopped");
+
+        // Render audio while started, then Stop and drain it.
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 32, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 32 * 2).fill(0.25);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 32, 0), S_OK);
+        assert_eq!(call!(lb_c, AC_STOP, () -> HRESULT;), S_OK);
+
+        let mut cp: *mut u8 = std::ptr::null_mut();
+        let mut nf = 0u32;
+        let mut fl = 0u32;
+        assert_eq!(call!(cc, CC_GET, (*mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT; &mut cp, &mut nf, &mut fl, std::ptr::null_mut(), std::ptr::null_mut()), S_OK);
+        assert_eq!(nf, 32);
+        assert!((*(cp as *const f32) - 0.25).abs() < 1e-4);
+        assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; nf), S_OK);
+
+        // Render MORE audio while stopped + wait past a packet period: polling must stay at 0
+        // (neither live audio nor re-armed silent packets may arrive while stopped).
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 64, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 64 * 2).fill(0.75);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 64, 0), S_OK);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert_eq!(call!(cc, 5, (*mut u32) -> HRESULT; &mut next), S_OK);
+        assert_eq!(next, 0, "stopped loopback client must not enqueue audio or silent packets");
+
+        // Restarting must NOT deliver the 0.75 audio rendered while stopped.
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+        assert_eq!(call!(cc, 5, (*mut u32) -> HRESULT; &mut next), S_OK);
+        assert_eq!(next, 0, "restarting loopback must not deliver audio from stopped interval");
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb_c), 0);
+        assert_eq!(release(rc), 0);
+        assert_eq!(release(render_c), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+}

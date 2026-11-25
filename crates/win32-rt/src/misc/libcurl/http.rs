@@ -6,7 +6,8 @@ use super::easy::{
     CURLE_ABORTED_BY_CALLBACK, CURLE_BAD_CONTENT_ENCODING, CURLE_COULDNT_CONNECT,
     CURLE_COULDNT_RESOLVE_HOST, CURLE_FILESIZE_EXCEEDED, CURLE_GOT_NOTHING,
     CURLE_HTTP_RETURNED_ERROR, CURLE_OK, CURLE_OPERATION_TIMEDOUT, CURLE_PARTIAL_FILE,
-    CURLE_PEER_FAILED_VERIFICATION, CURLE_RECV_ERROR, CURLE_SEND_ERROR, CURLE_SSL_CONNECT_ERROR,
+    CURLE_PEER_FAILED_VERIFICATION, CURLE_RANGE_ERROR, CURLE_RECV_ERROR, CURLE_SEND_ERROR,
+    CURLE_SSL_CONNECT_ERROR,
     CURLE_TOO_MANY_REDIRECTS, CURLE_UNSUPPORTED_PROTOCOL, CURLE_URL_MALFORMAT,
     CURLE_WEIRD_SERVER_REPLY, CURLAUTH_BASIC, CURLAUTH_BEARER, CURLAUTH_DIGEST,
     CURLAUTH_NEGOTIATE, CURLAUTH_NTLM, CURLPROTO_HTTP, CURLPROTO_HTTPS, CURL_IPRESOLVE_V4,
@@ -581,6 +582,7 @@ struct ParsedResponseHead {
     raw_lines: Vec<Vec<u8>>,
     header_bytes: usize,
     content_length: Option<i64>,
+    content_range: Option<String>,
     chunked: bool,
     content_type: Option<String>,
     content_encoding: Option<String>,
@@ -588,6 +590,20 @@ struct ParsedResponseHead {
     httpauth_avail: i32,
     proxyauth_avail: i32,
     retry_after: i64,
+}
+
+/// Parse RFC 9110 `Content-Range: bytes <start>-<end>/<total>` and return `<start>`.
+fn parse_content_range_start(val: &str) -> Option<i64> {
+    let trimmed = val.trim();
+    let rest = trimmed
+        .strip_prefix("bytes ")
+        .or_else(|| {
+            let prefix = trimmed.get(..6)?;
+            prefix.eq_ignore_ascii_case("bytes ").then(|| &trimmed[6..])
+        })?
+        .trim_start();
+    let dash = rest.find('-')?;
+    rest[..dash].trim().parse::<i64>().ok().filter(|&n| n >= 0)
 }
 
 fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, (i32, String, i32)> {
@@ -630,6 +646,7 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
     raw_lines.push(line_buf.clone());
 
     let mut content_length: Option<i64> = None;
+    let mut content_range: Option<String> = None;
     let mut chunked = false;
     let mut content_type: Option<String> = None;
     let mut content_encoding: Option<String> = None;
@@ -668,6 +685,9 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
                         }
                     }
                 }
+                "content-range" => {
+                    content_range = Some(val);
+                }
                 "transfer-encoding" => {
                     if val.to_ascii_lowercase().contains("chunked") {
                         chunked = true;
@@ -705,6 +725,7 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
         raw_lines,
         header_bytes,
         content_length,
+        content_range,
         chunked,
         content_type,
         content_encoding,
@@ -1424,6 +1445,34 @@ pub(super) fn execute_http_transfer(
                 os_errno: 0,
                 ssl_verifyresult: 0,
             };
+        }
+
+        // 8b. Validate resumed download response before delivering any body bytes:
+        // when CURLOPT_RESUME_FROM > 0, the server must reply 206 Partial Content with a
+        // matching Content-Range start offset; otherwise return CURLE_RANGE_ERROR rather
+        // than delivering a full 200 body that would corrupt the caller's partial file.
+        if req.resume_from > 0 {
+            let range_matches = head.status_code == 206
+                && head
+                    .content_range
+                    .as_deref()
+                    .and_then(parse_content_range_start)
+                    == Some(req.resume_from);
+            if !range_matches {
+                return TransferOutcome {
+                    code: CURLE_RANGE_ERROR,
+                    error_msg: Some(format!(
+                        "HTTP server did not honor resume offset {} (status={}, Content-Range={:?})",
+                        req.resume_from, head.status_code, head.content_range
+                    )),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: current_body.len() as i64,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
         }
 
         // 9. Optional Content-Encoding decompression (when ACCEPT_ENCODING is active)

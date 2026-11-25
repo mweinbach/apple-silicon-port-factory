@@ -23,6 +23,7 @@ pub(super) const CURLE_WRITE_ERROR: i32 = 23;
 pub(super) const CURLE_READ_ERROR: i32 = 26;
 pub(super) const CURLE_OUT_OF_MEMORY: i32 = 27;
 pub(super) const CURLE_OPERATION_TIMEDOUT: i32 = 28;
+pub(super) const CURLE_RANGE_ERROR: i32 = 33;
 pub(super) const CURLE_SSL_CONNECT_ERROR: i32 = 35;
 pub(super) const CURLE_ABORTED_BY_CALLBACK: i32 = 42;
 pub(super) const CURLE_BAD_FUNCTION_ARGUMENT: i32 = 43;
@@ -648,6 +649,7 @@ pub(super) struct TransferRequest {
     pub(super) autoreferer: bool,
     pub(super) cookie: Option<String>,
     pub(super) range: Option<String>,
+    pub(super) resume_from: i64,
     pub(super) basic_auth: Option<String>,
     pub(super) bearer_token: Option<String>,
     pub(super) allow_basic_auth: bool,
@@ -940,6 +942,7 @@ pub(super) unsafe fn prepare_transfer(
             autoreferer: opts.autoreferer,
             cookie: opts.cookie,
             range: effective_range,
+            resume_from: opts.resume_from,
             basic_auth,
             bearer_token,
             allow_basic_auth,
@@ -1835,6 +1838,7 @@ pub(super) fn easy_strerror(code: i32) -> *const u8 {
         CURLE_READ_ERROR => b"Failed to open/read local data from file/application\0".as_ptr(),
         CURLE_OUT_OF_MEMORY => b"Out of memory\0".as_ptr(),
         CURLE_OPERATION_TIMEDOUT => b"Timeout was reached\0".as_ptr(),
+        CURLE_RANGE_ERROR => b"Requested range was not delivered by the server\0".as_ptr(),
         CURLE_SSL_CONNECT_ERROR => b"SSL connect error\0".as_ptr(),
         CURLE_ABORTED_BY_CALLBACK => {
             b"Operation was aborted by an application callback\0".as_ptr()

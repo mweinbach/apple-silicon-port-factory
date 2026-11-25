@@ -273,6 +273,8 @@ impl LoopbackMixer {
 /// Per-endpoint in-process render loopback subscriber (for `AUDCLNT_STREAMFLAGS_LOOPBACK`
 /// fallback when CoreAudio Process Tap is unavailable).
 struct LoopbackSub {
+    /// True only while the owning loopback capture client is started (`Start`..`Stop`).
+    active: AtomicBool,
     /// Serializes all render producers and mixes simultaneous streams on a shared timeline.
     mixer: Mutex<LoopbackMixer>,
 }
@@ -288,6 +290,7 @@ impl Drop for LoopbackSub {
 
 fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u16) -> Arc<LoopbackSub> {
     let sub = Arc::new(LoopbackSub {
+        active: AtomicBool::new(false),
         mixer: Mutex::new(LoopbackMixer::new(cap_frames, rate, channels)),
     });
     LOOPBACK_SUB_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -336,6 +339,9 @@ pub(super) fn push_loopback_frames(
             .collect()
     };
     for sub in subs {
+        if !sub.active.load(Ordering::Acquire) {
+            continue;
+        }
         sub.mixer
             .lock()
             .unwrap()
@@ -427,6 +433,11 @@ impl CaptureState {
     /// or in-process render loopback mixer); for silent capture or idle loopback,
     /// paces silent packets.
     fn advance(&mut self, fmt: &WaveFormat, buffer_frames: u32) {
+        // Gate all capture arrival (including loopback) on the started state (`last_tick.is_some()`).
+        // Polling a stopped client must never enqueue new frames or re-arm `last_tick`.
+        let Some(prev) = self.last_tick else {
+            return;
+        };
         let rate = fmt.rate;
         let ch = fmt.channels.max(1) as usize;
         let pkt = self.packet_frames.max(1);
@@ -463,9 +474,6 @@ impl CaptureState {
             }
         }
 
-        let Some(prev) = self.last_tick else {
-            return;
-        };
         let now = Instant::now();
         let dt = now.saturating_duration_since(prev).as_secs_f64();
         self.last_tick = Some(now);
@@ -1090,6 +1098,16 @@ mod client {
             match &mut s.io {
                 StreamIo::Render(r) => Some((r.out.control(), s.padding())),
                 StreamIo::Capture(c) => {
+                    // Discard any loopback audio accumulated while stopped, then enable live capture.
+                    if let Some(lb) = &mut c.loopback {
+                        match &lb.source {
+                            LoopbackSource::CoreAudioTap { ring, .. } => ring.clear(),
+                            LoopbackSource::InProcessBus(sub) => {
+                                sub.mixer.lock().unwrap().clear();
+                                sub.active.store(true, Ordering::Release);
+                            }
+                        }
+                    }
                     c.last_tick = Some(Instant::now());
                     s.shared.started.store(true, Ordering::Release);
                     log::debug!(target: "audio", "IAudioClient::Start (capture)");
@@ -1133,6 +1151,11 @@ mod client {
                     StreamIo::Render(r) => Some(r.out.control()),
                     StreamIo::Capture(c) => {
                         c.advance(&fmt, buf);
+                        if let Some(lb) = &mut c.loopback {
+                            if let LoopbackSource::InProcessBus(sub) = &lb.source {
+                                sub.active.store(false, Ordering::Release);
+                            }
+                        }
                         c.last_tick = None;
                         s.shared.started.store(false, Ordering::Release);
                         None

@@ -906,7 +906,8 @@ fn easy_extended_setopt_and_getinfo_behaviors() {
         assert!(h1.contains("Authorization: Bearer tok-99\r\n"));
         assert!(h1.contains("Range: bytes=4-\r\n"));
         let resp1 = concat!(
-            "HTTP/1.1 200 OK\r\n",
+            "HTTP/1.1 206 Partial Content\r\n",
+            "Content-Range: bytes 4-13/14\r\n",
             "WWW-Authenticate: Basic realm=\"x\", Bearer\r\n",
             "Retry-After: 42\r\n",
             "Content-Length: 10\r\n",
@@ -1151,6 +1152,165 @@ fn easy_redirect_enforces_overall_protocols_allowlist() {
         assert_eq!(curl_easy_perform(easy), CURLE_UNSUPPORTED_PROTOCOL);
 
         curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}
+
+#[test]
+fn easy_resume_from_validates_206_and_content_range() {
+    use super::easy::{CURLE_RANGE_ERROR, CURLOPT_RESUME_FROM};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        // 1. Server ignores Range and replies 200 OK -> must fail with CURLE_RANGE_ERROR and 0 body bytes.
+        let (mut s1, _) = listener.accept().unwrap();
+        let (h1, _) = read_http_request(&mut s1);
+        assert!(h1.contains("Range: bytes=5-\r\n"), "expected Range header: {h1}");
+        s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789")
+            .unwrap();
+        drop(s1);
+
+        // 2. Server replies 206 with mismatched Content-Range start (bytes 0-9/10) -> CURLE_RANGE_ERROR.
+        let (mut s2, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s2);
+        s2.write_all(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\nContent-Length: 10\r\n\r\n0123456789",
+        )
+        .unwrap();
+        drop(s2);
+
+        // 3. Server replies 206 with matching Content-Range: bytes 5-9/10 -> CURLE_OK + tail bytes.
+        let (mut s3, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s3);
+        s3.write_all(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\n\r\n56789",
+        )
+        .unwrap();
+    });
+
+    unsafe {
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/file.bin\0");
+        let mut sink = Box::new(Vec::<u8>::new());
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_RESUME_FROM, 5), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, vec_write_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEDATA, &mut *sink as *mut Vec<u8> as usize),
+            CURLE_OK
+        );
+
+        assert_eq!(curl_easy_perform(easy), CURLE_RANGE_ERROR);
+        assert!(sink.is_empty(), "200 OK on resume must not deliver body bytes");
+
+        assert_eq!(curl_easy_perform(easy), CURLE_RANGE_ERROR);
+        assert!(sink.is_empty(), "mismatched Content-Range must not deliver body bytes");
+
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+        assert_eq!(sink.as_slice(), b"56789");
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}
+
+#[test]
+fn multi_delivers_xferinfo_progress_and_honors_abort() {
+    use super::easy::{
+        CURLE_ABORTED_BY_CALLBACK, CURLOPT_NOPROGRESS, CURLOPT_XFERINFODATA,
+        CURLOPT_XFERINFOFUNCTION,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    unsafe extern "win64" fn progress_abort_cb(
+        clientp: *mut c_void,
+        _dltotal: i64,
+        _dlnow: i64,
+        _ultotal: i64,
+        _ulnow: i64,
+    ) -> i32 {
+        let counter = &*(clientp as *const AtomicUsize);
+        counter.fetch_add(1, Ordering::Relaxed);
+        1 // non-zero aborts the transfer
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s);
+        let body = vec![b'x'; 4096];
+        let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let _ = s.write_all(hdr.as_bytes());
+        let _ = s.write_all(&body);
+    });
+
+    unsafe {
+        crate::register_native_va(
+            progress_abort_cb as *const () as u64,
+            progress_abort_cb as *const () as usize,
+        );
+
+        let multi = curl_multi_init();
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/progress\0");
+        let calls = Box::new(AtomicUsize::new(0));
+        let mut sink = Box::new(Vec::<u8>::new());
+
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_XFERINFOFUNCTION,
+                progress_abort_cb as *const () as usize
+            ),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_XFERINFODATA, &*calls as *const AtomicUsize as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, vec_write_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_WRITEDATA, &mut *sink as *mut Vec<u8> as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_multi_add_handle(multi, easy), CURLM_OK);
+
+        let mut running = 1i32;
+        for _ in 0..200 {
+            assert_eq!(curl_multi_perform(multi, &mut running), CURLM_OK);
+            if running == 0 {
+                break;
+            }
+            let mut numfds = 0i32;
+            assert_eq!(curl_multi_poll(multi, 0, 0, 50, &mut numfds), CURLM_OK);
+        }
+        assert_eq!(running, 0);
+        assert!(calls.load(Ordering::Relaxed) >= 1, "multi must invoke XFERINFOFUNCTION");
+
+        let mut msgs_left = 0i32;
+        let msg_ptr = curl_multi_info_read(multi, &mut msgs_left);
+        assert_ne!(msg_ptr, 0);
+        let msg = std::ptr::read_unaligned(msg_ptr as *const CurlMsg);
+        assert_eq!(msg.easy_handle, easy);
+        assert_eq!(msg.data as u32 as i32, CURLE_ABORTED_BY_CALLBACK);
+
+        assert_eq!(curl_multi_remove_handle(multi, easy), CURLM_OK);
+        curl_easy_cleanup(easy);
+        assert_eq!(curl_multi_cleanup(multi), CURLM_OK);
     }
 
     server.join().unwrap();
