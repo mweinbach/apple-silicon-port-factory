@@ -675,18 +675,71 @@ fn cursor_screen() -> POINT {
 }
 
 fn post_input_to(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM, chars: Vec<u16>) {
-    post_input_to_checked(hwnd, msg, wparam, lparam, chars, false);
+    let _ = post_input_to_checked(hwnd, msg, wparam, lparam, chars, false);
 }
 
-fn post_input_to_checked(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM, chars: Vec<u16>, ll_checked: bool) {
-    let Some(w) = window::get(hwnd) else { return };
-    let Some(q) = message::queue_of(w.tid) else { return };
+fn post_input_to_checked(hwnd: usize, msg: u32, wparam: WPARAM, lparam: LPARAM, chars: Vec<u16>, ll_checked: bool) -> bool {
+    let Some(w) = window::get(hwnd) else { return false };
+    let Some(q) = message::queue_of(w.tid) else { return false };
     q.post_input(InputMsg {
         msg: MSG { hwnd, message: msg, wparam, lparam, time: tick_ms(), pt: cursor_screen(), l_private: 0 },
         chars,
         ll_checked,
         seq: 0,
     });
+    true
+}
+
+/// Queue a deferred `WH_KEYBOARD_LL` callback onto the hook-owning Win32
+/// thread's message queue when an event arrives on a non-Win32 thread (such as
+/// the AppKit main thread) and no legacy keyboard message is queued (e.g.
+/// `RIDEV_NOLEGACY`, hotkey interception, or unfocused input).
+#[allow(clippy::too_many_arguments)]
+fn defer_keyboard_ll_hook(
+    fallback_hwnd: usize,
+    msg: u32,
+    vk: u32,
+    scan: u32,
+    ext: bool,
+    alt: bool,
+    up: bool,
+    time: u32,
+) {
+    if !super::misc::has_hooks(super::misc::WH_KEYBOARD_LL) {
+        return;
+    }
+    let q = super::misc::ll_hook_owner_tid(super::misc::WH_KEYBOARD_LL)
+        .map(message::queue_for)
+        .or_else(|| window::get(fallback_hwnd).and_then(|w| message::queue_of(w.tid)));
+    if let Some(q) = q {
+        q.call(move || {
+            let _ = dispatch_keyboard_ll_hook(msg, vk, scan, ext, alt, up, time);
+        });
+    }
+}
+
+/// Queue a deferred `WH_MOUSE_LL` callback onto the hook-owning Win32 thread's
+/// message queue when an event arrives on a non-Win32 thread and no legacy
+/// mouse message is queued (e.g. `RIDEV_NOLEGACY`, relative mouse mode, or
+/// unfocused input).
+fn defer_mouse_ll_hook(
+    fallback_hwnd: usize,
+    msg: u32,
+    pt: POINT,
+    mouse_data: u32,
+    time: u32,
+) {
+    if !super::misc::has_hooks(super::misc::WH_MOUSE_LL) {
+        return;
+    }
+    let q = super::misc::ll_hook_owner_tid(super::misc::WH_MOUSE_LL)
+        .map(message::queue_for)
+        .or_else(|| window::get(fallback_hwnd).and_then(|w| message::queue_of(w.tid)));
+    if let Some(q) = q {
+        q.call(move || {
+            let _ = dispatch_mouse_ll_hook(msg, pt, mouse_data, time);
+        });
+    }
 }
 
 fn is_keyboard_msg(msg: u32) -> bool {
@@ -881,8 +934,9 @@ pub fn native_key(k: NativeKey) {
         (false, false) => wm::KEYUP,
         (false, true) => wm::SYSKEYUP,
     };
+    let time = tick_ms();
     let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
-        if dispatch_keyboard_ll_hook(msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, tick_ms()) {
+        if dispatch_keyboard_ll_hook(msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time) {
             return;
         }
         true
@@ -908,16 +962,25 @@ pub fn native_key(k: NativeKey) {
             mods |= 0x0008; // MOD_WIN (VK_LWIN / VK_RWIN)
         }
         if super::misc::try_dispatch_hotkey(mods, key.vk as u32, was_down || k.repeat) {
+            if !ll_checked {
+                defer_keyboard_ll_hook(0, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+            }
             return;
         }
     }
     let target = FOCUS.load(Ordering::Acquire);
     if target == 0 {
+        if !ll_checked {
+            defer_keyboard_ll_hook(0, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+        }
         return;
     }
     // Raw input first (Windows delivers WM_INPUT ahead of the legacy message).
     raw_keyboard(key, k.down, msg);
     if raw_nolegacy_active(1, 6) {
+        if !ll_checked {
+            defer_keyboard_ll_hook(target, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+        }
         return;
     }
     let mut lp: u32 = 1 | (key.scan as u32) << 16;
@@ -948,7 +1011,9 @@ pub fn native_key(k: NativeKey) {
     } else {
         Vec::new()
     };
-    post_input_to_checked(target, msg, key.vk as usize, lp as i32 as isize, chars, ll_checked);
+    if !post_input_to_checked(target, msg, key.vk as usize, lp as i32 as isize, chars, ll_checked) && !ll_checked {
+        defer_keyboard_ll_hook(target, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
+    }
 }
 
 /// Modifier key transitions from `flagsChanged:` are delivered as NativeKey too.
@@ -1109,8 +1174,9 @@ pub fn native_raw_mouse(dx: f64, dy: f64) {
 pub fn native_mouse(ev: NativeMouse) {
     match ev {
         NativeMouse::Move { hwnd, client, screen, dx, dy } => {
+            let time = tick_ms();
             let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
-                if dispatch_mouse_ll_hook(wm::MOUSEMOVE, screen, 0, tick_ms()) {
+                if dispatch_mouse_ll_hook(wm::MOUSEMOVE, screen, 0, time) {
                     return;
                 }
                 true
@@ -1124,12 +1190,15 @@ pub fn native_mouse(ev: NativeMouse) {
             if !relative {
                 super::cursor::set_cached_pos(screen);
             }
-            if nsevent_raw_active(tick_ms()) {
+            if nsevent_raw_active(time) {
                 if let Some((x, y)) = accumulate(&RAW_ACC, dx, dy) {
                     raw_mouse(x, y, 0, 0);
                 }
             }
             if relative || raw_nolegacy_active(1, 2) {
+                if !ll_checked {
+                    defer_mouse_ll_hook(hwnd, wm::MOUSEMOVE, screen, 0, time);
+                }
                 return;
             }
             let cap = CAPTURE.load(Ordering::Acquire);
@@ -1139,10 +1208,18 @@ pub fn native_mouse(ev: NativeMouse) {
                 (hwnd, client)
             };
             if target == 0 {
+                if !ll_checked {
+                    defer_mouse_ll_hook(0, wm::MOUSEMOVE, screen, 0, time);
+                }
                 return;
             }
-            if let Some(p) = pos {
-                post_input_to_checked(target, wm::MOUSEMOVE, mk_state(), make_long(p.x, p.y), Vec::new(), ll_checked);
+            let posted = if let Some(p) = pos {
+                post_input_to_checked(target, wm::MOUSEMOVE, mk_state(), make_long(p.x, p.y), Vec::new(), ll_checked)
+            } else {
+                false
+            };
+            if !posted && !ll_checked {
+                defer_mouse_ll_hook(target, wm::MOUSEMOVE, screen, 0, time);
             }
         }
         NativeMouse::Button { hwnd, client, screen, button, down, clicks } => {
@@ -1158,8 +1235,10 @@ pub fn native_mouse(ev: NativeMouse) {
                 (MouseButton::X2, true) => (VK_XBUTTON2, 0x100, 0x200, wm::XBUTTONDOWN, 2),
                 (MouseButton::X2, false) => (VK_XBUTTON2, 0x100, 0x200, wm::XBUTTONUP, 2),
             };
+            let time = tick_ms();
+            let ll_mouse_data = (ll_xbtn << 16) as u32;
             let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
-                if dispatch_mouse_ll_hook(ll_msg, screen, (ll_xbtn << 16) as u32, tick_ms()) {
+                if dispatch_mouse_ll_hook(ll_msg, screen, ll_mouse_data, time) {
                     return;
                 }
                 true
@@ -1172,6 +1251,9 @@ pub fn native_mouse(ev: NativeMouse) {
                 super::cursor::set_cached_pos(screen);
             }
             if raw_nolegacy_active(1, 2) {
+                if !ll_checked {
+                    defer_mouse_ll_hook(hwnd, ll_msg, screen, ll_mouse_data, time);
+                }
                 return;
             }
             let cap = CAPTURE.load(Ordering::Acquire);
@@ -1181,10 +1263,18 @@ pub fn native_mouse(ev: NativeMouse) {
                 (hwnd, client)
             };
             if target == 0 {
+                if !ll_checked {
+                    defer_mouse_ll_hook(0, ll_msg, screen, ll_mouse_data, time);
+                }
                 return;
             }
             let pos = if super::cursor::relative_mode() { client_of(target, super::cursor::cursor_pos()) } else { pos };
-            let Some(p) = pos else { return };
+            let Some(p) = pos else {
+                if !ll_checked {
+                    defer_mouse_ll_hook(target, ll_msg, screen, ll_mouse_data, time);
+                }
+                return;
+            };
             let dbl = down && clicks >= 2 && clicks % 2 == 0 && window::get(target).is_some_and(|w| w.class.style.load(Ordering::Relaxed) & super::class::CS_DBLCLKS != 0);
             let (msg, xbtn) = match (button, down, dbl) {
                 (MouseButton::Left, true, false) => (wm::LBUTTONDOWN, 0),
@@ -1201,17 +1291,20 @@ pub fn native_mouse(ev: NativeMouse) {
                     (if !d { wm::XBUTTONUP } else if dd { wm::XBUTTONDBLCLK } else { wm::XBUTTONDOWN }, x)
                 }
             };
-            post_input_to_checked(target, msg, mk_state() | (xbtn << 16), make_long(p.x, p.y), Vec::new(), ll_checked);
+            if !post_input_to_checked(target, msg, mk_state() | (xbtn << 16), make_long(p.x, p.y), Vec::new(), ll_checked) && !ll_checked {
+                defer_mouse_ll_hook(target, ll_msg, screen, ll_mouse_data, time);
+            }
         }
         NativeMouse::Wheel { screen, delta, horizontal } => {
             if delta == 0 {
                 return;
             }
+            let time = tick_ms();
             let msg = if horizontal { wm::MOUSEHWHEEL } else { wm::MOUSEWHEEL };
             let pos = if super::cursor::relative_mode() { super::cursor::cursor_pos() } else { screen };
             let mouse_data = ((delta as i16 as u16) as u32) << 16;
             let ll_checked = if super::misc::can_invoke_guest_hooks_on_this_thread() {
-                if dispatch_mouse_ll_hook(msg, pos, mouse_data, tick_ms()) {
+                if dispatch_mouse_ll_hook(msg, pos, mouse_data, time) {
                     return;
                 }
                 true
@@ -1219,14 +1312,22 @@ pub fn native_mouse(ev: NativeMouse) {
                 false
             };
             raw_mouse(0, 0, if horizontal { 0x800 } else { 0x400 }, delta as i16 as u16);
-            if raw_nolegacy_active(1, 2) {
-                return;
-            }
             let target = FOCUS.load(Ordering::Acquire);
-            if target == 0 {
+            if raw_nolegacy_active(1, 2) {
+                if !ll_checked {
+                    defer_mouse_ll_hook(target, msg, pos, mouse_data, time);
+                }
                 return;
             }
-            post_input_to_checked(target, msg, mk_state() | ((delta as i16 as u16 as usize) << 16), make_long(pos.x, pos.y), Vec::new(), ll_checked);
+            if target == 0 {
+                if !ll_checked {
+                    defer_mouse_ll_hook(0, msg, pos, mouse_data, time);
+                }
+                return;
+            }
+            if !post_input_to_checked(target, msg, mk_state() | ((delta as i16 as u16 as usize) << 16), make_long(pos.x, pos.y), Vec::new(), ll_checked) && !ll_checked {
+                defer_mouse_ll_hook(target, msg, pos, mouse_data, time);
+            }
         }
     }
 }
@@ -1989,6 +2090,176 @@ mod tests {
                 RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 },
             ];
             assert_eq!(RegisterRawInputDevices(rem.as_ptr(), 2, 16), TRUE);
+            release_all_keys();
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn deferred_low_level_hooks_fire_under_ridev_nolegacy_and_once_without_it() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            static KB_LL_EVENTS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+            static MS_LL_EVENTS: Mutex<Vec<(u32, i32, i32, u32)>> = Mutex::new(Vec::new());
+
+            unsafe extern "win64" fn kb_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                if code >= 0 && lp != 0 {
+                    let ks = (lp as *const super::super::misc::KBDLLHOOKSTRUCT).read_unaligned();
+                    KB_LL_EVENTS.lock().unwrap().push((wp as u32, ks.vk_code));
+                }
+                super::super::misc::CallNextHookEx(0, code, wp, lp)
+            }
+            unsafe extern "win64" fn ms_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                if code >= 0 && lp != 0 {
+                    let ms = (lp as *const super::super::misc::MSLLHOOKSTRUCT).read_unaligned();
+                    MS_LL_EVENTS
+                        .lock()
+                        .unwrap()
+                        .push((wp as u32, ms.pt.x, ms.pt.y, ms.mouse_data));
+                }
+                super::super::misc::CallNextHookEx(0, code, wp, lp)
+            }
+
+            KB_LL_EVENTS.lock().unwrap().clear();
+            MS_LL_EVENTS.lock().unwrap().clear();
+
+            let cls = crate::strings::to_wide_z("DeferredLlNoLegacyWnd");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            set_active_window(hwnd as usize, false);
+            set_focus(hwnd as usize);
+
+            let h_kb = super::super::misc::SetWindowsHookExW(
+                super::super::misc::WH_KEYBOARD_LL,
+                kb_ll_proc as *const () as usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            let h_ms = super::super::misc::SetWindowsHookExW(
+                super::super::misc::WH_MOUSE_LL,
+                ms_ll_proc as *const () as usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_ne!(h_kb, 0);
+            assert_ne!(h_ms, 0);
+
+            // Register both mouse and keyboard with RIDEV_NOLEGACY.
+            let devs = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+            ];
+            assert_eq!(RegisterRawInputDevices(devs.as_ptr(), 2, 16), TRUE);
+
+            // Simulate AppKit main thread where guest hooks cannot execute inline.
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_mouse(NativeMouse::Move {
+                hwnd: hwnd as usize,
+                client: Some(POINT { x: 12, y: 34 }),
+                screen: POINT { x: 12, y: 34 },
+                dx: 5.0,
+                dy: -3.0,
+            });
+            native_mouse(NativeMouse::Button {
+                hwnd: hwnd as usize,
+                client: Some(POINT { x: 12, y: 34 }),
+                screen: POINT { x: 12, y: 34 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+            native_mouse(NativeMouse::Wheel {
+                screen: POINT { x: 12, y: 34 },
+                delta: 120,
+                horizontal: false,
+            });
+            // Hooks must NOT have fired synchronously on the simulated AppKit thread.
+            assert!(KB_LL_EVENTS.lock().unwrap().is_empty());
+            assert!(MS_LL_EVENTS.lock().unwrap().is_empty());
+            super::super::misc::set_force_defer_guest_hooks(false);
+
+            // Pump on the Win32 thread: WM_INPUT arrives, legacy messages stay suppressed,
+            // and all deferred WH_KEYBOARD_LL and WH_MOUSE_LL callbacks fire.
+            let mut m = MSG::default();
+            let mut raw_count = 0usize;
+            while message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE) != 0 {
+                raw_count += 1;
+            }
+            assert!(raw_count >= 4, "expected WM_INPUT messages under RIDEV_NOLEGACY, got {raw_count}");
+            assert_eq!(message::PeekMessageW(&mut m, hwnd, wm::KEYFIRST, wm::KEYLAST, message::PM_REMOVE), FALSE);
+            assert_eq!(message::PeekMessageW(&mut m, hwnd, wm::MOUSEFIRST, wm::MOUSELAST, message::PM_REMOVE), FALSE);
+
+            assert_eq!(
+                KB_LL_EVENTS.lock().unwrap().clone(),
+                vec![(wm::KEYDOWN, b'A' as u32), (wm::KEYUP, b'A' as u32)],
+                "deferred WH_KEYBOARD_LL must fire under RIDEV_NOLEGACY"
+            );
+            assert_eq!(
+                MS_LL_EVENTS.lock().unwrap().clone(),
+                vec![
+                    (wm::MOUSEMOVE, 12, 34, 0),
+                    (wm::LBUTTONDOWN, 12, 34, 0),
+                    (wm::MOUSEWHEEL, 12, 34, (120u16 as u32) << 16),
+                ],
+                "deferred WH_MOUSE_LL must fire under RIDEV_NOLEGACY"
+            );
+
+            // Without RIDEV_NOLEGACY, deferred hooks on the legacy path must fire exactly once (no duplicates).
+            let rem = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_REMOVE, target: 0 },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(rem.as_ptr(), 2, 16), TRUE);
+            KB_LL_EVENTS.lock().unwrap().clear();
+            MS_LL_EVENTS.lock().unwrap().clear();
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_mouse(NativeMouse::Button {
+                hwnd: hwnd as usize,
+                client: Some(POINT { x: 20, y: 25 }),
+                screen: POINT { x: 20, y: 25 },
+                button: MouseButton::Right,
+                down: true,
+                clicks: 1,
+            });
+            super::super::misc::set_force_defer_guest_hooks(false);
+            assert_eq!(message::PeekMessageW(&mut m, hwnd, wm::KEYFIRST, wm::KEYLAST, message::PM_REMOVE), TRUE);
+            assert_eq!(message::PeekMessageW(&mut m, hwnd, wm::MOUSEFIRST, wm::MOUSELAST, message::PM_REMOVE), TRUE);
+            assert_eq!(KB_LL_EVENTS.lock().unwrap().clone(), vec![(wm::KEYDOWN, b'A' as u32)]);
+            assert_eq!(MS_LL_EVENTS.lock().unwrap().clone(), vec![(wm::RBUTTONDOWN, 20, 25, 0)]);
+
+            assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
+            assert_eq!(super::super::misc::UnhookWindowsHookEx(h_ms), TRUE);
             release_all_keys();
             let _ = window::DestroyWindow(hwnd);
         })

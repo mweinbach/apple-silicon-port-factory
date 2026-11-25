@@ -1496,12 +1496,19 @@ struct HookEntry {
     id_hook: i32,
     lpfn: usize,
     tid: u32,
+    /// Thread that installed the hook (receives deferred `WH_KEYBOARD_LL` /
+    /// `WH_MOUSE_LL` callbacks on its message loop when events originate from
+    /// a non-Win32 thread such as the AppKit main thread).
+    owner_tid: u32,
 }
 
 static NEXT_HOOK: AtomicUsize = AtomicUsize::new(0x4000_0010);
 static HOOKS: std::sync::Mutex<Vec<HookEntry>> = std::sync::Mutex::new(Vec::new());
 /// Per-`id_hook` fast-path counters indexed by `(id_hook + 1)` for `-1..=14`.
 static HOOK_COUNTS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Always `false` in production; unit tests toggle this via `tests::set_force_defer_guest_hooks`
+/// to simulate the AppKit main-thread path where guest hooks must be deferred.
+static FORCE_DEFER_GUEST_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct ActiveHookFrame {
     /// Snapshot of matching `(handle, lpfn)` in LIFO dispatch order.
@@ -1530,10 +1537,31 @@ pub(crate) fn has_hooks(id_hook: i32) -> bool {
 
 #[inline]
 pub(crate) fn can_invoke_guest_hooks_on_this_thread() -> bool {
+    if FORCE_DEFER_GUEST_HOOKS.load(Ordering::Acquire) {
+        return false;
+    }
     // When AppKit/UIKit is active, the platform main thread has no Win32 TEB
     // and must never run guest code. In headless / unit-test runs, `active()`
     // is false so tests can run hooks on any thread.
     !(crate::macos::active() && crate::macos::is_main_thread())
+}
+
+/// Return the owning Win32 thread ID for the most recently registered hook of
+/// type `id_hook` so low-level hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) can be
+/// deferred onto that thread's message loop when legacy input messages are not
+/// queued (e.g. under `RIDEV_NOLEGACY`, relative mouse mode, or unfocused input).
+pub(crate) fn ll_hook_owner_tid(id_hook: i32) -> Option<u32> {
+    if !has_hooks(id_hook) {
+        return None;
+    }
+    HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e.id_hook == id_hook)
+        .map(|e| if e.tid != 0 { e.tid } else { e.owner_tid })
+        .filter(|&tid| tid != 0)
 }
 
 fn is_hook_registered(handle: usize) -> bool {
@@ -1635,13 +1663,20 @@ pub unsafe extern "win64" fn SetWindowsHookExW(
         set_error(ERROR_INVALID_FILTER_PROC);
         return 0;
     }
+    let owner_tid = crate::teb::thread_id();
     let h = NEXT_HOOK.fetch_add(4, Ordering::Relaxed);
     {
         let mut hooks = HOOKS.lock().unwrap();
-        hooks.push(HookEntry { handle: h, id_hook, lpfn, tid });
+        hooks.push(HookEntry { handle: h, id_hook, lpfn, tid, owner_tid });
         HOOK_COUNTS[slot].fetch_add(1, Ordering::Release);
     }
-    log::debug!("user32: SetWindowsHookExW(id={id_hook}, lpfn={lpfn:#x}, tid={tid}) -> {h:#x}");
+    if matches!(id_hook, WH_KEYBOARD_LL | WH_MOUSE_LL) {
+        let queue_tid = if tid != 0 { tid } else { owner_tid };
+        if queue_tid != 0 {
+            let _ = super::message::queue_for(queue_tid);
+        }
+    }
+    log::debug!("user32: SetWindowsHookExW(id={id_hook}, lpfn={lpfn:#x}, tid={tid}, owner={owner_tid}) -> {h:#x}");
     h
 }
 
@@ -2718,6 +2753,11 @@ pub unsafe extern "win64" fn LoadStringW(
     std::ptr::write_unaligned(lp_buffer.add(copy_len), 0);
     set_error(0);
     copy_len as i32
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_defer_guest_hooks(defer: bool) {
+    FORCE_DEFER_GUEST_HOOKS.store(defer, Ordering::Release);
 }
 
 #[cfg(test)]
