@@ -3211,15 +3211,9 @@ fn verify_rsa_cert_sig_fallback(
     if pk.len() < 2 || pk[0].tag != 0x02 || pk[1].tag != 0x02 {
         return false;
     }
-    let strip = |mut b: &[u8]| -> Vec<u8> {
-        while b.len() > 1 && b[0] == 0 {
-            b = &b[1..];
-        }
-        b.to_vec()
-    };
-    let rsa = crate::misc::bcrypt::RsaPublicKey {
-        n: strip(pk[0].val),
-        e: strip(pk[1].val),
+    let Some(rsa) = crate::misc::bcrypt::RsaPublicKey::from_asn1_integers(pk[0].val, pk[1].val)
+    else {
+        return false;
     };
     let h = digest.hash(child.tbs_raw);
     rsa.verify_pkcs1(Some(digest), &h, child.sig_bits)

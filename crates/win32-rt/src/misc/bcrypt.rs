@@ -747,6 +747,64 @@ struct RsaKey {
 }
 
 impl RsaPublicKey {
+    /// Upper bound on RSA public modulus length in bytes (8192 bits) for in-tree verification.
+    pub const MAX_MODULUS_BYTES: usize = 1024;
+    /// Minimum RSA modulus length in bytes (512 bits) accepted for X.509/CMS certificates.
+    pub const MIN_ASN1_MODULUS_BYTES: usize = 64;
+    /// Upper bound on RSA public exponent length in bytes (64 bits, matching Windows CNG / OpenSSL).
+    pub const MAX_PUBLIC_EXPONENT_BYTES: usize = 8;
+
+    fn strip_leading_zeros(mut bytes: &[u8]) -> &[u8] {
+        while !bytes.is_empty() && bytes[0] == 0 {
+            bytes = &bytes[1..];
+        }
+        bytes
+    }
+
+    /// Validate RSA public `(n, e)` big-endian byte slices before allocation or modular
+    /// exponentiation: odd modulus `n >= 3` within `MAX_MODULUS_BYTES` (8192 bits) and odd
+    /// exponent `e >= 3` within `MAX_PUBLIC_EXPONENT_BYTES` (64 bits).
+    pub fn validate_public_params<'a>(n_be: &'a [u8], e_be: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+        let n = Self::strip_leading_zeros(n_be);
+        let e = Self::strip_leading_zeros(e_be);
+        if n.is_empty()
+            || n.len() > Self::MAX_MODULUS_BYTES
+            || (n[n.len() - 1] & 1) == 0
+            || (n.len() == 1 && n[0] < 3)
+        {
+            return None;
+        }
+        if e.is_empty()
+            || e.len() > Self::MAX_PUBLIC_EXPONENT_BYTES
+            || (e[e.len() - 1] & 1) == 0
+            || (e.len() == 1 && e[0] < 3)
+        {
+            return None;
+        }
+        Some((n, e))
+    }
+
+    /// Construct a bounded `RsaPublicKey` from ASN.1 DER `RSAPublicKey` `INTEGER` content slices.
+    /// Rejects negative integers, moduli outside 512..=8192 bits or even, and exponents outside
+    /// odd `3..2^64` before copying any bytes.
+    pub fn from_asn1_integers(n_der: &[u8], e_der: &[u8]) -> Option<RsaPublicKey> {
+        if n_der.is_empty()
+            || (n_der[0] & 0x80) != 0
+            || e_der.is_empty()
+            || (e_der[0] & 0x80) != 0
+        {
+            return None;
+        }
+        let (n, e) = Self::validate_public_params(n_der, e_der)?;
+        if n.len() < Self::MIN_ASN1_MODULUS_BYTES {
+            return None;
+        }
+        Some(RsaPublicKey {
+            n: n.to_vec(),
+            e: e.to_vec(),
+        })
+    }
+
     /// `BCRYPT_RSAKEY_BLOB` + public exponent + modulus (big-endian).
     pub fn from_blob(blob: &[u8]) -> Option<RsaPublicKey> {
         let rd = |o: usize| blob.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -757,9 +815,13 @@ impl RsaPublicKey {
         if cb_exp == 0 || cb_mod == 0 {
             return None;
         }
-        let e = blob.get(24..24 + cb_exp)?.to_vec();
-        let n = blob.get(24 + cb_exp..24 + cb_exp + cb_mod)?.to_vec();
-        Some(RsaPublicKey { n, e })
+        let e_raw = blob.get(24..24 + cb_exp)?;
+        let n_raw = blob.get(24 + cb_exp..24 + cb_exp + cb_mod)?;
+        let (n, e) = Self::validate_public_params(n_raw, e_raw)?;
+        Some(RsaPublicKey {
+            n: n.to_vec(),
+            e: e.to_vec(),
+        })
     }
 
     fn bits(&self) -> usize {
@@ -770,14 +832,19 @@ impl RsaPublicKey {
         self.bits().div_ceil(8)
     }
 
-    /// RSAVP1: the encoded message `s^e mod n` (k bytes), or None if s >= n.
+    /// RSAVP1: the encoded message `s^e mod n` (k bytes), or None if parameters are invalid or s >= n.
     fn open(&self, sig: &[u8]) -> Option<Vec<u8>> {
-        let n = bn_from_be(&self.n);
-        let s = bn_from_be(sig);
-        if n.is_empty() || sig.len() > self.k() || bn_cmp(&s, &n) != std::cmp::Ordering::Less {
+        let (n_be, e_be) = Self::validate_public_params(&self.n, &self.e)?;
+        let k = n_be.len();
+        if sig.len() > k {
             return None;
         }
-        Some(bn_to_be(&bn_modexp(&s, &bn_from_be(&self.e), &n), self.k()))
+        let n = bn_from_be(n_be);
+        let s = bn_from_be(sig);
+        if n.is_empty() || bn_cmp(&s, &n) != std::cmp::Ordering::Less {
+            return None;
+        }
+        Some(bn_to_be(&bn_modexp(&s, &bn_from_be(e_be), &n), k))
     }
 
     fn encode_pkcs1_em(&self, digest: Option<Digest>, hash: &[u8]) -> Option<Vec<u8>> {
@@ -2877,6 +2944,23 @@ mod tests {
         assert!(!k.verify_pkcs1(Some(Digest::Sha256), &bad, &hex(SIG_PKCS1)));
         assert!(!k.verify_pss(Digest::Sha256, &bad, 32, &hex(SIG_PSS)));
         assert!(!k.verify_pkcs1(Some(Digest::Sha256), &h, &hex(SIG_PSS)));
+
+        // Oversized or nonsensical RSA parameters must be rejected immediately before bn_modexp.
+        let mut huge_e = vec![0xFFu8; 65_536];
+        huge_e[0] = 0x7F; // positive DER integer, odd, 64 KiB
+        assert!(RsaPublicKey::from_asn1_integers(&k.n, &huge_e).is_none());
+        let huge_e_key = RsaPublicKey {
+            n: k.n.clone(),
+            e: huge_e,
+        };
+        assert!(!huge_e_key.verify_pkcs1(Some(Digest::Sha256), &h, &hex(SIG_PKCS1)));
+
+        let mut huge_n = vec![0xFFu8; RsaPublicKey::MAX_MODULUS_BYTES + 1];
+        huge_n[0] = 0x7F;
+        assert!(RsaPublicKey::from_asn1_integers(&huge_n, &[0x01, 0x00, 0x01]).is_none());
+        assert!(RsaPublicKey::from_asn1_integers(&k.n, &[0x01]).is_none()); // e == 1
+        assert!(RsaPublicKey::from_asn1_integers(&k.n, &[0x02]).is_none()); // even e
+        assert!(RsaPublicKey::from_asn1_integers(&[0x80; 256], &[0x01, 0x00, 0x01]).is_none()); // negative DER
     }
 
     #[test]

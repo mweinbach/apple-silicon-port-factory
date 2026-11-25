@@ -81,6 +81,7 @@ pub(super) const CERT_SUBJECT_PUBLIC_KEY_MD5_HASH_PROP_ID: u32 = 25;
 pub(super) const CERT_DATE_STAMP_PROP_ID: u32 = 27;
 pub(super) const CERT_SUBJECT_NAME_MD5_HASH_PROP_ID: u32 = 29;
 pub(super) const CERT_NCRYPT_KEY_HANDLE_PROP_ID: u32 = 78;
+const CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID: u32 = 99;
 pub(super) const CERT_SHA256_HASH_PROP_ID: u32 = 107;
 
 #[repr(C)]
@@ -734,11 +735,52 @@ pub(super) fn cert_close_store_impl(store: *mut c_void) -> BOOL {
     TRUE
 }
 
+#[derive(Clone, Default)]
+struct CopiedCertMeta {
+    properties: HashMap<u32, Vec<u8>>,
+    key_prov_info: Option<StoredKeyProvInfo>,
+    private_key_pkcs8: Option<Vec<u8>>,
+}
+
+fn is_non_copyable_cert_prop(prop_id: u32) -> bool {
+    matches!(
+        prop_id,
+        CERT_KEY_PROV_HANDLE_PROP_ID
+            | CERT_KEY_CONTEXT_PROP_ID
+            | CERT_NCRYPT_KEY_HANDLE_PROP_ID
+            | CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID
+    )
+}
+
+fn extract_copyable_cert_meta(src: &RegisteredCert) -> CopiedCertMeta {
+    let properties = src
+        .properties
+        .iter()
+        .filter(|(&id, _)| !is_non_copyable_cert_prop(id))
+        .map(|(&id, v)| (id, v.clone()))
+        .collect();
+    CopiedCertMeta {
+        properties,
+        key_prov_info: src.key_prov_info.clone(),
+        private_key_pkcs8: src.private_key_pkcs8.clone(),
+    }
+}
+
 unsafe fn add_der_to_store(
     h_cert_store: *mut c_void,
     der: &[u8],
     dw_add_disposition: u32,
     pp_store_context: *mut *mut c_void,
+) -> BOOL {
+    add_der_to_store_with_source(h_cert_store, der, dw_add_disposition, pp_store_context, None)
+}
+
+unsafe fn add_der_to_store_with_source(
+    h_cert_store: *mut c_void,
+    der: &[u8],
+    dw_add_disposition: u32,
+    pp_store_context: *mut *mut c_void,
+    src_cert_handle: Option<usize>,
 ) -> BOOL {
     let Some(owned) = wintrust::build_owned_cert_context(der, h_cert_store) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
@@ -750,6 +792,10 @@ unsafe fn add_der_to_store(
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
+
+    let copied_meta = src_cert_handle
+        .and_then(|src_h| st.certs.get(&src_h))
+        .map(extract_copyable_cert_meta);
 
     let existing_idx = st.stores[&store_key].certs.iter().position(|&h| {
         st.certs
@@ -765,10 +811,23 @@ unsafe fn add_der_to_store(
             }
             CERT_STORE_ADD_USE_EXISTING => {
                 let h = st.stores[&store_key].certs[idx];
-                if !pp_store_context.is_null() {
-                    if let Some(c) = st.certs.get_mut(&h) {
+                if let Some(c) = st.certs.get_mut(&h) {
+                    if let Some(meta) = copied_meta {
+                        for (id, val) in meta.properties {
+                            c.properties.entry(id).or_insert(val);
+                        }
+                        if c.key_prov_info.is_none() && meta.key_prov_info.is_some() {
+                            c.key_prov_info = meta.key_prov_info;
+                        }
+                        if c.private_key_pkcs8.is_none() && meta.private_key_pkcs8.is_some() {
+                            c.private_key_pkcs8 = meta.private_key_pkcs8;
+                        }
+                    }
+                    if !pp_store_context.is_null() {
                         c.refcount += 1;
                     }
+                }
+                if !pp_store_context.is_null() {
                     std::ptr::write_unaligned(pp_store_context, h as *mut c_void);
                 }
                 return TRUE;
@@ -782,6 +841,11 @@ unsafe fn add_der_to_store(
     }
 
     let h = insert_cert_locked(&mut st, owned, vec![der.to_vec()], None, 0);
+    if let (Some(meta), Some(entry)) = (copied_meta, st.certs.get_mut(&h)) {
+        entry.properties = meta.properties;
+        entry.key_prov_info = meta.key_prov_info;
+        entry.private_key_pkcs8 = meta.private_key_pkcs8;
+    }
     let is_ntauth = {
         let store = st.stores.get_mut(&store_key).unwrap();
         store.certs.push(h);
@@ -813,7 +877,13 @@ pub(super) unsafe fn cert_add_certificate_context_to_store_impl(
         return FALSE;
     }
     let der = std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize);
-    add_der_to_store(h_cert_store, der, dw_add_disposition, pp_store_context)
+    add_der_to_store_with_source(
+        h_cert_store,
+        der,
+        dw_add_disposition,
+        pp_store_context,
+        Some(p_cert_context as usize),
+    )
 }
 
 pub(super) unsafe fn cert_add_encoded_certificate_to_store_impl(

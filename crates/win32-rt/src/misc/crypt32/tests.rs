@@ -6068,3 +6068,440 @@ fn pfx_rejects_unbounded_kdf_iteration_counts() {
         assert_eq!(le_shr, err::ERROR_INVALID_DATA);
     }
 }
+
+#[test]
+fn cms_verify_rejects_oversized_rsa_parameters_immediately() {
+    let tlv = super::asn1::encode_der_tlv;
+    let oid_signed_data = tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02]);
+    let oid_data = tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]);
+    let oid_sha256 = tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]);
+    let oid_rsa = tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]);
+    let alg_sha256 = tlv(0x30, &[oid_sha256.as_slice(), &tlv(0x05, &[])].concat());
+    let alg_rsa = tlv(0x30, &[oid_rsa.as_slice(), &tlv(0x05, &[])].concat());
+    let dn = tlv(
+        0x30,
+        &tlv(
+            0x31,
+            &tlv(0x30, &[tlv(0x06, &[0x55, 0x04, 0x03]), tlv(0x0C, b"HugeRsa")].concat()),
+        ),
+    );
+    let build_cms = |n_bytes: &[u8], e_bytes: &[u8]| -> Vec<u8> {
+        let mut rsa_pub_body = Vec::new();
+        // Prepend 0x00 if MSB set so ASN.1 INTEGER is positive.
+        let n_int = if n_bytes[0] & 0x80 != 0 {
+            [&[0u8][..], n_bytes].concat()
+        } else {
+            n_bytes.to_vec()
+        };
+        let e_int = if e_bytes[0] & 0x80 != 0 {
+            [&[0u8][..], e_bytes].concat()
+        } else {
+            e_bytes.to_vec()
+        };
+        rsa_pub_body.extend_from_slice(&tlv(0x02, &n_int));
+        rsa_pub_body.extend_from_slice(&tlv(0x02, &e_int));
+        let rsa_pub_seq = tlv(0x30, &rsa_pub_body);
+        let spki = tlv(
+            0x30,
+            &[
+                alg_rsa.as_slice(),
+                &tlv(0x03, &[&[0u8][..], rsa_pub_seq.as_slice()].concat()),
+            ]
+            .concat(),
+        );
+        let validity = tlv(
+            0x30,
+            &[tlv(0x17, b"200101000000Z"), tlv(0x17, b"400101000000Z")].concat(),
+        );
+        let serial = tlv(0x02, &[0x42]);
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&tlv(0xA0, &tlv(0x02, &[0x02])));
+        tbs.extend_from_slice(&serial);
+        tbs.extend_from_slice(&alg_sha256);
+        tbs.extend_from_slice(&dn);
+        tbs.extend_from_slice(&validity);
+        tbs.extend_from_slice(&dn);
+        tbs.extend_from_slice(&spki);
+        let cert = tlv(
+            0x30,
+            &[tlv(0x30, &tbs), alg_sha256.clone(), tlv(0x03, &[0x00, 0x01])].concat(),
+        );
+
+        let sid = tlv(0x30, &[dn.as_slice(), serial.as_slice()].concat());
+        let mut sig = vec![0x01u8; n_bytes.len().min(256)];
+        sig[0] = 0x00;
+        let signer_info = tlv(
+            0x30,
+            &[
+                tlv(0x02, &[0x01]),
+                sid,
+                alg_sha256.clone(),
+                alg_rsa.clone(),
+                tlv(0x04, &sig),
+            ]
+            .concat(),
+        );
+        let encap = tlv(
+            0x30,
+            &[oid_data.as_slice(), &tlv(0xA0, &tlv(0x04, b"payload"))].concat(),
+        );
+        let signed_data = tlv(
+            0x30,
+            &[
+                tlv(0x02, &[0x01]),
+                tlv(0x31, &alg_sha256),
+                encap,
+                tlv(0xA0, &cert),
+                tlv(0x31, &signer_info),
+            ]
+            .concat(),
+        );
+        tlv(
+            0x30,
+            &[oid_signed_data.as_slice(), &tlv(0xA0, &signed_data)].concat(),
+        )
+    };
+
+    #[repr(C)]
+    struct VerifyPara {
+        cb_size: u32,
+        encoding: u32,
+        h_prov: usize,
+        pfn: usize,
+        arg: *mut c_void,
+    }
+    let vp = VerifyPara {
+        cb_size: std::mem::size_of::<VerifyPara>() as u32,
+        encoding: X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        h_prov: 0,
+        pfn: 0,
+        arg: std::ptr::null_mut(),
+    };
+
+    unsafe {
+        // 1. 64 KiB RSA public exponent must be rejected immediately (never spun in bn_modexp).
+        let mut mod2048 = vec![0xAAu8; 256];
+        mod2048[0] = 0x81;
+        mod2048[255] = 0x01;
+        let mut exp_64k = vec![0xFFu8; 65_536];
+        exp_64k[0] = 0x7F;
+        let cms_huge_exp = build_cms(&mod2048, &exp_64k);
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                cms_huge_exp.as_ptr(),
+                cms_huge_exp.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006); // NTE_BAD_SIGNATURE
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "64 KiB RSA public exponent must be rejected before bn_modexp: {:?}",
+            t0.elapsed()
+        );
+
+        // 2. Oversized 16384-bit RSA modulus must also be rejected immediately.
+        let mut mod16384 = vec![0xBBu8; 2048];
+        mod16384[0] = 0x81;
+        mod16384[2047] = 0x01;
+        let cms_huge_mod = build_cms(&mod16384, &[0x01, 0x00, 0x01]);
+        let t1 = std::time::Instant::now();
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                cms_huge_mod.as_ptr(),
+                cms_huge_mod.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006);
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(500),
+            "16384-bit RSA modulus must be rejected before bn_modexp: {:?}",
+            t1.elapsed()
+        );
+    }
+}
+
+#[test]
+fn cert_add_certificate_context_to_store_preserves_metadata_and_excludes_key_handles() {
+    use super::store::{
+        CERT_DESCRIPTION_PROP_ID, CERT_FRIENDLY_NAME_PROP_ID, CERT_KEY_CONTEXT_PROP_ID,
+        CERT_KEY_PROV_HANDLE_PROP_ID, CERT_KEY_PROV_INFO_PROP_ID, CERT_STORE_PROV_MEMORY,
+    };
+
+    unsafe {
+        // Import a real PFX with private key + friendlyName.
+        let blob = CryptDataBlob {
+            cb_data: self::test_vectors::PFX_PBES2_AES256.len() as u32,
+            pb_data: self::test_vectors::PFX_PBES2_AES256.as_ptr(),
+        };
+        let pw = crate::strings::to_wide_z("testpass123");
+        let pfx_st = PFXImportCertStore(&blob as *const _ as *const c_void, pw.as_ptr(), 0);
+        assert!(!pfx_st.is_null());
+        let src_cert = CertEnumCertificatesInStore(pfx_st, std::ptr::null_mut());
+        assert!(!src_cert.is_null());
+        assert!(lookup_cert_private_key_and_chain(src_cert).is_some());
+
+        // Set a copyable description property, a CRYPT_KEY_PROV_INFO, and an excluded
+        // CERT_KEY_CONTEXT_PROP_ID (which also sets CERT_KEY_PROV_HANDLE_PROP_ID).
+        let src_desc_w = crate::strings::to_wide_z("Source Desc");
+        let src_desc_blob = CryptDataBlob {
+            cb_data: (src_desc_w.len() * 2) as u32,
+            pb_data: src_desc_w.as_ptr() as *const u8,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                src_cert,
+                CERT_DESCRIPTION_PROP_ID,
+                0,
+                &src_desc_blob as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+
+        let container_w = crate::strings::to_wide_z("CopiedKeyContainer");
+        let prov_w = crate::strings::to_wide_z("Microsoft Software Key Storage Provider");
+        #[repr(C)]
+        struct KeyProvInfo {
+            container: *const u16,
+            prov_name: *const u16,
+            prov_type: u32,
+            flags: u32,
+            c_param: u32,
+            rg_param: *const c_void,
+            key_spec: u32,
+        }
+        let kpi = KeyProvInfo {
+            container: container_w.as_ptr(),
+            prov_name: prov_w.as_ptr(),
+            prov_type: 24,
+            flags: 0,
+            c_param: 0,
+            rg_param: std::ptr::null(),
+            key_spec: 1,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                src_cert,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                0,
+                &kpi as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+
+        #[repr(C)]
+        struct KeyContext {
+            cb_size: u32,
+            _pad: u32,
+            h_crypt_prov: usize,
+            dw_key_spec: u32,
+        }
+        let kc = KeyContext {
+            cb_size: std::mem::size_of::<KeyContext>() as u32,
+            _pad: 0,
+            h_crypt_prov: 0xDEAD_BEEFusize,
+            dw_key_spec: 1,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                src_cert,
+                CERT_KEY_CONTEXT_PROP_ID,
+                0,
+                &kc as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+
+        // 1. Copy into an empty memory store with CERT_STORE_ADD_NEW.
+        let dst_new = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert!(!dst_new.is_null());
+        let mut copied: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddCertificateContextToStore(dst_new, src_cert, CERT_STORE_ADD_NEW, &mut copied),
+            TRUE
+        );
+        assert!(!copied.is_null());
+
+        // Copied context retains friendly name, description, KEY_PROV_INFO, and private key.
+        let mut buf = [0u16; 64];
+        let mut cb = (buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_FRIENDLY_NAME_PROP_ID,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut cb,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(buf.as_ptr()), "PortFactory Friendly");
+
+        cb = (buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_DESCRIPTION_PROP_ID,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut cb,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(buf.as_ptr()), "Source Desc");
+
+        let mut kpi_cb = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kpi_cb,
+            ),
+            TRUE
+        );
+        assert!(kpi_cb >= std::mem::size_of::<KeyProvInfo>() as u32);
+        let mut kpi_buf = vec![0u8; kpi_cb as usize];
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                kpi_buf.as_mut_ptr() as *mut c_void,
+                &mut kpi_cb,
+            ),
+            TRUE
+        );
+        let kpi_out = std::ptr::read_unaligned(kpi_buf.as_ptr() as *const KeyProvInfo);
+        assert_eq!(crate::strings::from_wide(kpi_out.container), "CopiedKeyContainer");
+
+        assert!(
+            lookup_cert_private_key_and_chain(copied).is_some(),
+            "copied PFX certificate must retain its private key association"
+        );
+
+        // Excluded provider/key handle properties MUST NOT be copied.
+        let mut kc_cb = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_KEY_CONTEXT_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kc_cb,
+            ),
+            FALSE
+        );
+        let mut kh_cb = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                copied,
+                CERT_KEY_PROV_HANDLE_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kh_cb,
+            ),
+            FALSE
+        );
+
+        // 2. CERT_STORE_ADD_USE_EXISTING into a store already holding the bare encoded cert:
+        //    existing properties stay intact, missing copyable properties + private key are added,
+        //    and excluded handle properties are still omitted.
+        let dst_exist = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let src_cc = std::ptr::read_unaligned(src_cert as *const crate::misc::wintrust::CertContext);
+        let mut bare: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                dst_exist,
+                X509_ASN_ENCODING,
+                src_cc.pb_cert_encoded,
+                src_cc.cb_cert_encoded,
+                CERT_STORE_ADD_NEW,
+                &mut bare,
+            ),
+            TRUE
+        );
+        assert!(lookup_cert_private_key_and_chain(bare).is_none());
+        let keep_desc_w = crate::strings::to_wide_z("Keep Existing Desc");
+        let keep_desc_blob = CryptDataBlob {
+            cb_data: (keep_desc_w.len() * 2) as u32,
+            pb_data: keep_desc_w.as_ptr() as *const u8,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                bare,
+                CERT_DESCRIPTION_PROP_ID,
+                0,
+                &keep_desc_blob as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+
+        let mut merged: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddCertificateContextToStore(
+                dst_exist,
+                src_cert,
+                2, // CERT_STORE_ADD_USE_EXISTING
+                &mut merged,
+            ),
+            TRUE
+        );
+        assert_eq!(merged, bare);
+
+        // Existing description preserved; missing friendly name, KEY_PROV_INFO, and private key added.
+        cb = (buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                merged,
+                CERT_DESCRIPTION_PROP_ID,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut cb,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(buf.as_ptr()), "Keep Existing Desc");
+
+        cb = (buf.len() * 2) as u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                merged,
+                CERT_FRIENDLY_NAME_PROP_ID,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut cb,
+            ),
+            TRUE
+        );
+        assert_eq!(crate::strings::from_wide(buf.as_ptr()), "PortFactory Friendly");
+
+        assert!(
+            lookup_cert_private_key_and_chain(merged).is_some(),
+            "CERT_STORE_ADD_USE_EXISTING must transfer missing private key association"
+        );
+        let mut kc_cb2 = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                merged,
+                CERT_KEY_CONTEXT_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kc_cb2,
+            ),
+            FALSE
+        );
+
+        CertFreeCertificateContext(merged);
+        CertFreeCertificateContext(bare);
+        CertCloseStore(dst_exist, 0);
+        CertFreeCertificateContext(copied);
+        CertCloseStore(dst_new, 0);
+        CertFreeCertificateContext(src_cert);
+        CertCloseStore(pfx_st, 0);
+    }
+}

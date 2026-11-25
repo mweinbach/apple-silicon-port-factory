@@ -7,26 +7,26 @@ advapi32.dll	CryptGetUserKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL =
 advapi32.dll	CryptImportKey	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 advapi32.dll	CryptSignHashW	failing	crates/win32-rt/src/advapi32.rs	3010	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 advapi32.dll	GetTokenInformation	stub	crates/win32-rt/src/advapi32.rs	1380	"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2447	"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2505	"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGenerateKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2614	"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGenerateSymmetricKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2528	"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1810	"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1824	"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1859	"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2372	"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2429	"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1941	"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1949	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1964	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	1979	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
-bcrypt.dll	BCryptOpenAlgorithmProvider	stub	crates/win32-rt/src/misc/bcrypt.rs	1720	"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2670	"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2718	"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
-bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
-bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
+bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2514	"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptExportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2572	"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptGenerateKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2681	"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGenerateSymmetricKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2595	"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1877	"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1891	"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptGetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	1926	"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2439	"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKey	stub	crates/win32-rt/src/misc/bcrypt.rs	2496	"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2008	"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2016	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2031	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptImportKeyPair	stub	crates/win32-rt/src/misc/bcrypt.rs	2046	"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name
+bcrypt.dll	BCryptOpenAlgorithmProvider	stub	crates/win32-rt/src/misc/bcrypt.rs	1787	"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2737	"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2785	"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2823	"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2124	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
+bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2189	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
+bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2240	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
 crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	53	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 d2d1.dll	geom_tessellate	stub	crates/win32-rt/src/misc/d2d1/geometry.rs	1038	"ID2D1Geometry::Tessellate -> E_NOTIMPL"
 d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"

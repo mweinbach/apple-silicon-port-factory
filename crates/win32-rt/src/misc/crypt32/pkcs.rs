@@ -541,9 +541,8 @@ fn verify_signed_bytes_with_cert_der(
         if pk.len() < 2 || pk[0].tag != 0x02 || pk[1].tag != 0x02 {
             return false;
         }
-        let rsa = RsaPublicKey {
-            n: strip_leading_zero(pk[0].val).to_vec(),
-            e: strip_leading_zero(pk[1].val).to_vec(),
+        let Some(rsa) = RsaPublicKey::from_asn1_integers(pk[0].val, pk[1].val) else {
+            return false;
         };
         let hash = si_digest.hash(to_verify);
         return rsa.verify_pkcs1(Some(si_digest), &hash, signature);
