@@ -856,29 +856,38 @@ pub unsafe extern "win64" fn LoadIconW(inst: HINSTANCE, name: LPCWSTR) -> usize 
     load_icon_impl(inst as usize, name, false, 32, 32, LR_DEFAULTSIZE)
 }
 
-pub unsafe extern "win64" fn DestroyIcon(h: usize) -> BOOL {
+fn destroy_icon_or_cursor(h: usize) -> BOOL {
     if h == 0 {
         set_error(e::INVALID_CURSOR_HANDLE);
         return FALSE;
     }
     if (SYSTEM_BASE..SYSTEM_BASE + 0x10000).contains(&h) {
-        return TRUE;
+        return TRUE; // shared system cursors are never destroyed
     }
+    let mut found = false;
     {
         let mut tbl = icons().lock().unwrap();
         if let Some(icon) = tbl.get(&h) {
             if icon.shared {
-                return TRUE;
+                return TRUE; // shared icons/cursors are never destroyed
             }
             tbl.remove(&h);
-            return TRUE;
+            found = true;
         }
     }
     if cursors().lock().unwrap().remove(&h).is_some() {
-        return TRUE;
+        found = true;
     }
-    set_error(e::INVALID_CURSOR_HANDLE);
-    FALSE
+    if found {
+        TRUE
+    } else {
+        set_error(e::INVALID_CURSOR_HANDLE);
+        FALSE
+    }
+}
+
+pub unsafe extern "win64" fn DestroyIcon(h: usize) -> BOOL {
+    destroy_icon_or_cursor(h)
 }
 
 #[repr(C)]
@@ -992,13 +1001,8 @@ pub unsafe extern "win64" fn CopyIcon(hicon: usize) -> usize {
         set_error(e::INVALID_CURSOR_HANDLE);
         return 0;
     }
-    if let Some(mut icon) = icons().lock().unwrap().get(&hicon).cloned() {
-        icon.shared = false;
-        let handle = NEXT_ICON.fetch_add(4, Ordering::Relaxed);
-        icons().lock().unwrap().insert(handle, icon);
-        return handle;
-    }
-    let shape = cursors()
+    let maybe_icon = icons().lock().unwrap().get(&hicon).cloned();
+    let maybe_shape = cursors()
         .lock()
         .unwrap()
         .get(&hicon)
@@ -1009,13 +1013,23 @@ pub unsafe extern "win64" fn CopyIcon(hicon: usize) -> usize {
                 .then(|| system_shape((hicon - SYSTEM_BASE) as u16))
                 .flatten()
         });
-    let Some(shape) = shape else {
+    if maybe_icon.is_none() && maybe_shape.is_none() {
         set_error(e::INVALID_CURSOR_HANDLE);
         return 0;
+    }
+    let handle = if maybe_shape.is_some() {
+        NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed)
+    } else {
+        NEXT_ICON.fetch_add(4, Ordering::Relaxed)
     };
-    let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
-    cursors().lock().unwrap().insert(hc, Cursor { shape });
-    hc
+    if let Some(shape) = maybe_shape {
+        cursors().lock().unwrap().insert(handle, Cursor { shape });
+    }
+    if let Some(mut icon) = maybe_icon {
+        icon.shared = false;
+        icons().lock().unwrap().insert(handle, icon);
+    }
+    handle
 }
 
 pub unsafe extern "win64" fn CreateIcon(
@@ -1203,15 +1217,7 @@ pub unsafe extern "win64" fn CreateCursor(
 }
 
 pub unsafe extern "win64" fn DestroyCursor(h: usize) -> BOOL {
-    if h >= SYSTEM_BASE && h < SYSTEM_BASE + 0x10000 {
-        return TRUE; // shared system cursors are never destroyed
-    }
-    if cursors().lock().unwrap().remove(&h).is_some() {
-        TRUE
-    } else {
-        set_error(e::INVALID_CURSOR_HANDLE);
-        FALSE
-    }
+    destroy_icon_or_cursor(h)
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,7 +1734,33 @@ mod tests {
             assert_eq!((ii.x_hotspot, ii.y_hotspot), (1, 0));
             crate::misc::gdi32::DeleteObject(ii.hbm_color);
             crate::misc::gdi32::DeleteObject(ii.hbm_mask);
+
+            // CopyIcon / CopyImage on a CreateCursor handle must not deadlock and must copy
+            // both the cursor shape and backing icon data into an independent non-shared handle.
+            let hc_copy = CopyIcon(hc);
+            assert_ne!(hc_copy, 0);
+            assert_ne!(hc_copy, hc);
+            assert!(cursors().lock().unwrap().contains_key(&hc_copy));
+            assert!(icons().lock().unwrap().contains_key(&hc_copy));
+            let mut ii_copy = std::mem::zeroed::<ICONINFO>();
+            assert_eq!(GetIconInfo(hc_copy, &mut ii_copy), TRUE);
+            assert_eq!((ii_copy.f_icon, ii_copy.x_hotspot, ii_copy.y_hotspot), (FALSE, 1, 0));
+            crate::misc::gdi32::DeleteObject(ii_copy.hbm_color);
+            crate::misc::gdi32::DeleteObject(ii_copy.hbm_mask);
+
+            // DestroyCursor must release both cursors() and icons() for non-shared handles.
             assert_eq!(DestroyCursor(hc), TRUE);
+            assert!(!cursors().lock().unwrap().contains_key(&hc));
+            assert!(!icons().lock().unwrap().contains_key(&hc));
+            assert_eq!(GetIconInfo(hc, &mut ii), FALSE);
+            assert_eq!(DestroyCursor(hc), FALSE);
+
+            // Copied cursor remains valid until destroyed, then releases both tables.
+            assert!(cursors().lock().unwrap().contains_key(&hc_copy));
+            assert!(icons().lock().unwrap().contains_key(&hc_copy));
+            assert_eq!(DestroyCursor(hc_copy), TRUE);
+            assert!(!cursors().lock().unwrap().contains_key(&hc_copy));
+            assert!(!icons().lock().unwrap().contains_key(&hc_copy));
 
             // 2. Unknown system cursor ID returns 0 + ERROR_RESOURCE_NAME_NOT_FOUND.
             assert_eq!(LoadCursorW(std::ptr::null_mut(), 55555 as LPCWSTR), 0);
