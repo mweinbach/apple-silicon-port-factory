@@ -268,9 +268,241 @@ fn classify_bidi(ch: char) -> BidiClass {
     }
 }
 
-/// Resolve per-UTF-16-code-unit bidi embedding levels following UAX #9 weak (W1-W7),
-/// neutral (N1-N2), and implicit level (I1-I2) rules for a single paragraph run.
-fn resolve_bidi_levels(units: &[u16], explicit: u8) -> Vec<u8> {
+/// True if `units` contains any UAX #9 explicit bidi formatting control
+/// (`LRE`, `RLE`, `PDF`, `LRO`, `RLO`, `LRI`, `RLI`, `FSI`, `PDI`).
+fn has_explicit_bidi_controls(units: &[u16]) -> bool {
+    units
+        .iter()
+        .any(|&u| matches!(u, 0x202A..=0x202E | 0x2066..=0x2069))
+}
+
+fn is_para_sep(ch: char) -> bool {
+    matches!(ch as u32, 0x000A | 0x000D | 0x001C..=0x001E | 0x0085 | 0x2029)
+}
+
+/// Determine the isolate direction for `U+2068` (FSI) per UAX #9 X5c / P2-P3:
+/// scan forward to the first strong character (`L`, `R`, `AL`) before the matching
+/// `PDI` or paragraph separator, skipping nested isolate scopes.
+fn fsi_is_rtl(units: &[u16], start_after_fsi: usize) -> bool {
+    let mut depth = 0usize;
+    let mut i = start_after_fsi;
+    while i < units.len() {
+        let (ch, step) = decode_u16_at(units, i);
+        let cp = ch as u32;
+        if is_para_sep(ch) {
+            break;
+        }
+        match cp {
+            0x2066..=0x2068 => depth += 1, // LRI / RLI / FSI
+            0x2069 => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ if depth == 0 => match classify_bidi(ch) {
+                BidiClass::R | BidiClass::AL => return true,
+                BidiClass::L => return false,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += step;
+    }
+    false
+}
+
+/// Compute UAX #9 X1-X8 explicit embedding levels per UTF-16 code unit for
+/// `IDWriteTextAnalysisSink::SetBidiLevel`'s `explicitLevel` parameter.
+fn compute_explicit_bidi_levels(units: &[u16], para_level: u8) -> Vec<u8> {
+    const MAX_DEPTH: u8 = 125;
+    let mut out = vec![para_level; units.len()];
+    let mut stack: Vec<(u8, bool)> = Vec::with_capacity(16); // (level, is_isolate)
+    stack.push((para_level, false));
+    let mut overflow_isolate: usize = 0;
+    let mut overflow_embedding: usize = 0;
+    let mut valid_isolate: usize = 0;
+
+    let least_odd_greater = |lv: u8| -> u8 { (lv + 1) | 1 };
+    let least_even_greater = |lv: u8| -> u8 { (lv + 2) & !1 };
+
+    let mut i = 0usize;
+    while i < units.len() {
+        let (ch, step) = decode_u16_at(units, i);
+        let cp = ch as u32;
+        let cur_level = stack.last().map(|e| e.0).unwrap_or(para_level);
+
+        let assigned = match cp {
+            // Paragraph separator resets explicit stack (UAX #9 X8).
+            _ if is_para_sep(ch) => {
+                stack.clear();
+                stack.push((para_level, false));
+                overflow_isolate = 0;
+                overflow_embedding = 0;
+                valid_isolate = 0;
+                para_level
+            }
+            // RLE / RLO: push least odd level > cur_level.
+            0x202B | 0x202E => {
+                let next = least_odd_greater(cur_level);
+                if next <= MAX_DEPTH && overflow_isolate == 0 && overflow_embedding == 0 {
+                    stack.push((next, false));
+                    next
+                } else {
+                    if overflow_isolate == 0 {
+                        overflow_embedding += 1;
+                    }
+                    cur_level
+                }
+            }
+            // LRE / LRO: push least even level > cur_level.
+            0x202A | 0x202D => {
+                let next = least_even_greater(cur_level);
+                if next <= MAX_DEPTH && overflow_isolate == 0 && overflow_embedding == 0 {
+                    stack.push((next, false));
+                    next
+                } else {
+                    if overflow_isolate == 0 {
+                        overflow_embedding += 1;
+                    }
+                    cur_level
+                }
+            }
+            // PDF: pop non-isolate embedding/override.
+            0x202C => {
+                if overflow_isolate > 0 {
+                    // ignore
+                } else if overflow_embedding > 0 {
+                    overflow_embedding -= 1;
+                } else if stack.len() > 1 && !stack.last().unwrap().1 {
+                    stack.pop();
+                }
+                stack.last().map(|e| e.0).unwrap_or(para_level)
+            }
+            // LRI / RLI / FSI: initiator takes outer level, then pushes isolate scope.
+            0x2066..=0x2068 => {
+                let rtl = match cp {
+                    0x2067 => true,
+                    0x2066 => false,
+                    _ => fsi_is_rtl(units, i + step),
+                };
+                let next = if rtl {
+                    least_odd_greater(cur_level)
+                } else {
+                    least_even_greater(cur_level)
+                };
+                if next <= MAX_DEPTH && overflow_isolate == 0 && overflow_embedding == 0 {
+                    valid_isolate += 1;
+                    stack.push((next, true));
+                } else {
+                    overflow_isolate += 1;
+                }
+                cur_level
+            }
+            // PDI: terminate matching isolate scope; PDI itself takes the restored outer level.
+            0x2069 => {
+                if overflow_isolate > 0 {
+                    overflow_isolate -= 1;
+                } else if valid_isolate > 0 {
+                    overflow_embedding = 0;
+                    while let Some((_, is_iso)) = stack.pop() {
+                        if is_iso {
+                            break;
+                        }
+                    }
+                    if stack.is_empty() {
+                        stack.push((para_level, false));
+                    }
+                    valid_isolate -= 1;
+                }
+                stack.last().map(|e| e.0).unwrap_or(para_level)
+            }
+            _ => cur_level,
+        };
+
+        for off in 0..step {
+            out[i + off] = assigned;
+        }
+        i += step;
+    }
+    out
+}
+
+struct IcuBidiApi {
+    ubidi_open: unsafe extern "C" fn() -> *mut c_void,
+    ubidi_close: unsafe extern "C" fn(*mut c_void),
+    ubidi_set_para: unsafe extern "C" fn(*mut c_void, *const u16, i32, u8, *mut u8, *mut i32),
+    ubidi_get_levels: unsafe extern "C" fn(*mut c_void, *mut i32) -> *const u8,
+}
+
+fn icu_bidi_api() -> Option<&'static IcuBidiApi> {
+    static API: OnceLock<Option<IcuBidiApi>> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        for name in [
+            c"/usr/lib/libicucore.A.dylib",
+            c"libicucore.A.dylib",
+            c"libicucore.dylib",
+        ] {
+            handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+            if !handle.is_null() {
+                break;
+            }
+        }
+        if handle.is_null() {
+            return None;
+        }
+        let open = libc::dlsym(handle, c"ubidi_open".as_ptr());
+        let close = libc::dlsym(handle, c"ubidi_close".as_ptr());
+        let set_para = libc::dlsym(handle, c"ubidi_setPara".as_ptr());
+        let get_levels = libc::dlsym(handle, c"ubidi_getLevels".as_ptr());
+        if open.is_null() || close.is_null() || set_para.is_null() || get_levels.is_null() {
+            return None;
+        }
+        Some(IcuBidiApi {
+            ubidi_open: std::mem::transmute(open),
+            ubidi_close: std::mem::transmute(close),
+            ubidi_set_para: std::mem::transmute(set_para),
+            ubidi_get_levels: std::mem::transmute(get_levels),
+        })
+    })
+    .as_ref()
+}
+
+/// Resolve full UAX #9 bidi levels (including explicit embeddings, overrides, isolates,
+/// paired brackets N0, weak types W1-W7, neutrals N1-N2, and implicit levels I1-I2)
+/// via Apple's system `libicucore` (`ubidi_setPara` + `ubidi_getLevels`).
+fn resolve_bidi_levels_icu(units: &[u16], para_level: u8) -> Option<Vec<u8>> {
+    if units.is_empty() {
+        return Some(Vec::new());
+    }
+    let len = i32::try_from(units.len()).ok()?;
+    let api = icu_bidi_api()?;
+    unsafe {
+        let bidi = (api.ubidi_open)();
+        if bidi.is_null() {
+            return None;
+        }
+        let mut err: i32 = 0;
+        (api.ubidi_set_para)(bidi, units.as_ptr(), len, para_level, std::ptr::null_mut(), &mut err);
+        if err > 0 {
+            (api.ubidi_close)(bidi);
+            return None;
+        }
+        let levels_ptr = (api.ubidi_get_levels)(bidi, &mut err);
+        let res = if err <= 0 && !levels_ptr.is_null() {
+            Some(std::slice::from_raw_parts(levels_ptr, units.len()).to_vec())
+        } else {
+            None
+        };
+        (api.ubidi_close)(bidi);
+        res
+    }
+}
+
+/// Pure-Rust fallback resolving per-UTF-16-code-unit bidi embedding levels (W1-W7,
+/// N1-N2, I1-I2) when `libicucore` is unavailable and no explicit bidi controls exist.
+fn resolve_bidi_levels_fallback(units: &[u16], explicit: u8) -> Vec<u8> {
     let mut spans: Vec<(usize, usize, BidiClass)> = Vec::with_capacity(units.len());
     let mut i = 0usize;
     while i < units.len() {
@@ -441,9 +673,21 @@ unsafe extern "win64" fn ta_analyze_bidi(
     } else {
         0
     };
-    let explicit: u8 = if dir == 1 { 1 } else { 0 };
-
-    let levels = resolve_bidi_levels(&units, explicit);
+    let para_level: u8 = if dir == 1 { 1 } else { 0 };
+    let explicit_levels = compute_explicit_bidi_levels(&units, para_level);
+    let resolved_levels = match resolve_bidi_levels_icu(&units, para_level) {
+        Some(lv) => lv,
+        None => {
+            if has_explicit_bidi_controls(&units) {
+                log::warn!(
+                    "dwrite: IDWriteTextAnalyzer::AnalyzeBidi cannot resolve explicit bidi controls without libicucore (len={})",
+                    units.len()
+                );
+                return E_NOTIMPL;
+            }
+            resolve_bidi_levels_fallback(&units, para_level)
+        }
+    };
 
     let sink_vtbl = (sink as *const *const usize).read_unaligned();
     if sink_vtbl.is_null() {
@@ -451,10 +695,14 @@ unsafe extern "win64" fn ta_analyze_bidi(
     }
     let set_bidi = sink_vtbl.add(5).read_unaligned();
     let mut run_start = 0usize;
-    while run_start < levels.len() {
-        let lv = levels[run_start];
+    while run_start < resolved_levels.len() {
+        let exp_lv = explicit_levels[run_start];
+        let res_lv = resolved_levels[run_start];
         let mut run_end = run_start + 1;
-        while run_end < levels.len() && levels[run_end] == lv {
+        while run_end < resolved_levels.len()
+            && explicit_levels[run_end] == exp_lv
+            && resolved_levels[run_end] == res_lv
+        {
             run_end += 1;
         }
         let hr = crate::call_guest8(
@@ -462,8 +710,8 @@ unsafe extern "win64" fn ta_analyze_bidi(
             sink as u64,
             (text_pos + run_start as u32) as u64,
             (run_end - run_start) as u64,
-            explicit as u64,
-            lv as u64,
+            exp_lv as u64,
+            res_lv as u64,
             0,
             0,
             0,

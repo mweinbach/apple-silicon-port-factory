@@ -1922,6 +1922,83 @@ fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeab
             assert_eq!(bsink.bidis, vec![(0, 3, 1, 1), (3, 2, 1, 2), (5, 2, 1, 1)], "sample={sample:?}");
         }
 
+        // Explicit bidi controls (RLO, LRO, LRE, RLI, FSI, paragraph reset) in an LTR paragraph.
+        unsafe extern "win64" fn ltr_get_dir(_this: *mut RtlSource) -> u32 {
+            0 // DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
+        }
+        let ltr_vtbl = [0, 0, 0, rtl_get_text as *const () as usize, 0, ltr_get_dir as *const () as usize, 0, 0];
+        let mut lsrc = RtlSource { vtbl: &ltr_vtbl, text: Vec::new() };
+        let expand_levels = |runs: &[(u32, u32, u8, u8)], total: usize| -> (Vec<u8>, Vec<u8>) {
+            let mut exp = vec![0xFFu8; total];
+            let mut res = vec![0xFFu8; total];
+            for &(pos, len, e, r) in runs {
+                for k in (pos as usize)..((pos + len) as usize) {
+                    exp[k] = e;
+                    res[k] = r;
+                }
+            }
+            (exp, res)
+        };
+
+        // 4a. RLO override: "abc\u202Edef\u202C" -> "def" has explicit=1, resolved=1.
+        let rlo_u16: Vec<u16> = "abc\u{202E}def\u{202C}".encode_utf16().collect();
+        lsrc.text = rlo_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, rlo_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (rlo_exp, rlo_res) = expand_levels(&bsink.bidis, rlo_u16.len());
+        assert_eq!(rlo_exp, vec![0, 0, 0, 1, 1, 1, 1, 0]);
+        assert_eq!(rlo_res, vec![0, 0, 0, 1, 1, 1, 1, 0]);
+
+        // 4b. LRE embedding with Hebrew: "abc\u202Aאב\u202C" -> Hebrew has explicit=2, resolved=3.
+        let lre_u16: Vec<u16> = "abc\u{202A}\u{05D0}\u{05D1}\u{202C}".encode_utf16().collect();
+        lsrc.text = lre_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, lre_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (lre_exp, lre_res) = expand_levels(&bsink.bidis, lre_u16.len());
+        assert_eq!(lre_exp, vec![0, 0, 0, 2, 2, 2, 0]);
+        assert_eq!(lre_res, vec![0, 0, 0, 3, 3, 3, 0]);
+
+        // 4c. RLI isolate with Hebrew + digits: "hi \u2067אב 12\u2069 ok" -> אב at level 1, 12 at level 2.
+        let rli_u16: Vec<u16> = "hi \u{2067}\u{05D0}\u{05D1} 12\u{2069} ok".encode_utf16().collect();
+        lsrc.text = rli_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, rli_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (rli_exp, rli_res) = expand_levels(&bsink.bidis, rli_u16.len());
+        assert_eq!(rli_exp, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(rli_res, vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 0, 0, 0, 0]);
+
+        // 4d. FSI isolate auto-detecting RTL Hebrew + newline resetting RLO stack.
+        let fsi_u16: Vec<u16> = "a\u{2068}\u{05D0}\u{05D1}\u{2069}b".encode_utf16().collect();
+        lsrc.text = fsi_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, fsi_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (fsi_exp, fsi_res) = expand_levels(&bsink.bidis, fsi_u16.len());
+        assert_eq!(fsi_exp, vec![0, 0, 1, 1, 0, 0]);
+        assert_eq!(fsi_res, vec![0, 0, 1, 1, 0, 0]);
+
+        let nl_u16: Vec<u16> = "a\u{202E}bc\nde".encode_utf16().collect();
+        lsrc.text = nl_u16.clone();
+        bsink.bidis.clear();
+        assert_eq!(
+            an_bidi(ta, &mut lsrc as *mut _ as *mut c_void, 0, nl_u16.len() as u32, &mut bsink as *mut _ as *mut c_void),
+            S_OK
+        );
+        let (nl_exp, nl_res) = expand_levels(&bsink.bidis, nl_u16.len());
+        assert_eq!(nl_exp, vec![0, 1, 1, 1, 0, 0, 0]);
+        assert_eq!(nl_res, vec![0, 1, 1, 1, 0, 0, 0]);
+
         // 5. Per-range OpenType features: "fifi" with range 0 (len 2) disabling `liga` and
         //    range 1 (len 2) enabling `liga` on a font with an `fi` ligature produces 2 glyphs
         //    for range 0 and 1 ligature glyph for range 1 (total 3 glyphs, clusterMap [0,1,2,2]).
