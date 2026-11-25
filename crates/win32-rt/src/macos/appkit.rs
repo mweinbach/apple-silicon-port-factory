@@ -1095,7 +1095,7 @@ impl TaskDialogRadioTarget {
 }
 
 pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: bool) -> usize {
-    task_dialog_alert(caption, text, buttons, &[], None, None, false, critical).button_index
+    task_dialog_alert(caption, text, buttons, None, &[], None, None, false, critical).button_index
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1103,6 +1103,7 @@ pub(super) fn task_dialog_alert(
     caption: &str,
     text: &str,
     buttons: &[String],
+    default_button_idx: Option<usize>,
     radios: &[String],
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
@@ -1116,8 +1117,13 @@ pub(super) fn task_dialog_alert(
     a.setMessageText(&NSString::from_str(caption));
     a.setInformativeText(&NSString::from_str(text));
     a.setAlertStyle(if critical { NSAlertStyle::Critical } else { NSAlertStyle::Warning });
-    for b in buttons {
-        a.addButtonWithTitle(&NSString::from_str(b));
+    let custom_default = default_button_idx.filter(|&idx| idx < buttons.len());
+    for (idx, b) in buttons.iter().enumerate() {
+        let btn = a.addButtonWithTitle(&NSString::from_str(b));
+        if let Some(def_idx) = custom_default {
+            let eq = NSString::from_str(if idx == def_idx { "\r" } else { "" });
+            let _: () = unsafe { msg_send![&*btn, setKeyEquivalent: &*eq] };
+        }
     }
 
     const NS_CONTROL_STATE_OFF: isize = 0;

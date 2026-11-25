@@ -837,7 +837,8 @@ impl GlyphRunAnalysisInner {
         }
 
         let m = transform.copied().unwrap_or_default();
-        let rtl_dir = if (run.bidiLevel & 1) != 0 { -1.0f32 } else { 1.0f32 };
+        let is_rtl = (run.bidiLevel & 1) != 0;
+        let rtl_dir = if is_rtl { -1.0f32 } else { 1.0f32 };
 
         let mut pen_x = baseline_x;
         let pen_y = baseline_y;
@@ -859,6 +860,13 @@ impl GlyphRunAnalysisInner {
             } else {
                 DWRITE_GLYPH_OFFSET::default()
             };
+
+            // Per DWRITE_GLYPH_RUN: for RTL runs (odd bidiLevel), the baseline origin is
+            // the right edge of the run, so subtract each glyph's advance before placing
+            // its left-origin outline; LTR runs post-increment the pen after placement.
+            if is_rtl {
+                pen_x -= adv;
+            }
 
             let gx_dip = pen_x + off.advanceOffset * rtl_dir;
             let gy_dip = pen_y - off.ascenderOffset;
@@ -883,7 +891,9 @@ impl GlyphRunAnalysisInner {
                     alpha: rast.alpha,
                 });
             }
-            pen_x += adv * rtl_dir;
+            if !is_rtl {
+                pen_x += adv;
+            }
         }
 
         let bounds = if min_x < max_x && min_y < max_y {

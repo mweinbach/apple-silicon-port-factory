@@ -1549,6 +1549,42 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         release_com(gra_rot);
         release_com(gra_wide);
 
+        // 4c. RTL glyph run (odd bidiLevel) must subtract each glyph's advance BEFORE placing
+        //     its left-origin outline, so a glyph with baseline_x=100 sits to the LEFT of 100.
+        let rtl_adv = [25.0f32];
+        let rtl_run = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: 32.0,
+            glyphCount: 1,
+            glyphIndices: gids.as_ptr(),
+            glyphAdvances: rtl_adv.as_ptr(),
+            glyphOffsets: offs.as_ptr(),
+            isSideways: FALSE,
+            bidiLevel: 1,
+        };
+        let mut gra_rtl: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &rtl_run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                100.0,
+                32.0,
+                &mut gra_rtl,
+            ),
+            S_OK
+        );
+        let mut b_rtl = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rtl as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_rtl), S_OK);
+        // LTR bounds at baseline_x=0 were [bounds.left..bounds.right]; RTL at 100 with adv=25
+        // places the glyph origin at 100 - 25 = 75, so bounds shift by +75 (strictly left of 100+bounds.left).
+        assert_eq!(b_rtl.left, bounds.left + 75, "RTL left bound: ltr={bounds:?}, rtl={b_rtl:?}");
+        assert_eq!(b_rtl.right, bounds.right + 75, "RTL right bound: ltr={bounds:?}, rtl={b_rtl:?}");
+        release_com(gra_rtl);
+
         let mut rp: *mut c_void = std::ptr::null_mut();
         assert_eq!(fac_create_custom_rendering_params(fac as PFactory, 2.2, 0.75, 0.9, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, &mut rp), S_OK);
         let (mut g, mut ec, mut ct) = (0.0f32, 0.0f32, 0.0f32);

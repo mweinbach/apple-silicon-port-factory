@@ -391,6 +391,11 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     }
     let body = body_parts.join("\n\n");
     let labels: Vec<String> = buttons.iter().map(|(_, l)| l.clone()).collect();
+    let default_button_idx: Option<usize> = if cfg.n_default_button != 0 {
+        buttons.iter().position(|(id, _)| *id == cfg.n_default_button)
+    } else {
+        None
+    };
     let radio_labels: Vec<String> = radios.iter().map(|(_, l)| l.clone()).collect();
     let has_selection_controls = !radios.is_empty() || verification_text.is_some();
 
@@ -420,6 +425,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             caption.clone(),
             body.clone(),
             labels.clone(),
+            default_button_idx,
             radio_labels.clone(),
             selected_radio_idx,
             verification_text.clone(),
@@ -955,15 +961,17 @@ mod tests {
                 S_OK
             }
             cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            cfg.n_default_button = 7; // IDNO -> index 1
             cfg.pf_callback = td_cb_keep_open as *const () as usize;
             CB_MSGS.lock().unwrap().clear();
             REJECT_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
 
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, btns, rads, def_rad, ver_txt, ver_chk| {
+                move |_cap, _body, btns, def_btn, rads, def_rad, ver_txt, ver_chk| {
                     step += 1;
                     assert_eq!(btns, &["Yes", "No"]);
+                    assert_eq!(def_btn, Some(1)); // n_default_button == IDNO (7)
                     assert_eq!(rads, &["Option 1", "Option 2"]);
                     assert_eq!(ver_txt, Some("Remember choice"));
                     if step == 1 {

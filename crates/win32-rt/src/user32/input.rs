@@ -1309,7 +1309,7 @@ fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
         .lock()
         .unwrap()
         .iter()
-        .any(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) != 0)
+        .any(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY)
 }
 
 /// Deliver a raw input record to the registered target (if any).
@@ -1399,9 +1399,12 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
             set_error(e::INVALID_WINDOW_HANDLE);
             return FALSE;
         }
-        // Per Microsoft Learn, RIDEV_NOLEGACY is only valid for legacy keyboard (1, 6)
-        // and mouse (1, 2) top-level collections.
-        if (d.flags & RIDEV_NOLEGACY) != 0 && !(d.usage_page == 1 && matches!(d.usage, 2 | 6)) {
+        // Per Microsoft Learn, RIDEV_NOLEGACY (0x30 = RIDEV_EXCLUDE | RIDEV_PAGEONLY) is only
+        // valid for legacy keyboard (1, 6) and mouse (1, 2) top-level collections. Test the full
+        // composite mask so standalone RIDEV_PAGEONLY (0x20) / RIDEV_EXCLUDE (0x10) are not rejected.
+        if (d.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY
+            && !(d.usage_page == 1 && matches!(d.usage, 2 | 6))
+        {
             set_error(e::INVALID_PARAMETER);
             return FALSE;
         }
@@ -1916,10 +1919,27 @@ mod tests {
             SetFocus(hwnd);
             ACTIVE.store(hwnd as usize, Ordering::Release);
 
-            // RIDEV_NOLEGACY on a non-legacy usage (e.g. gamepad 1,5) must fail with INVALID_PARAMETER.
+            // RIDEV_NOLEGACY (0x30) on a non-legacy usage (e.g. gamepad 1,5) must fail with INVALID_PARAMETER.
             let bad = RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_NOLEGACY, target: hwnd as usize };
             assert_eq!(RegisterRawInputDevices(&bad, 1, 16), FALSE);
             assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // Standalone RIDEV_PAGEONLY (0x20) and RIDEV_EXCLUDE (0x10) overlap RIDEV_NOLEGACY's
+            // bits and must NOT be rejected as RIDEV_NOLEGACY or suppress legacy messages.
+            const RIDEV_EXCLUDE: u32 = 0x0000_0010;
+            const RIDEV_PAGEONLY: u32 = 0x0000_0020;
+            let page_only_batch = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_PAGEONLY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_EXCLUDE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(page_only_batch.as_ptr(), 2, 16), TRUE);
+            assert!(!raw_nolegacy_active(1, 2));
+            assert!(!raw_nolegacy_active(1, 6));
+            let rem_page = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 0, flags: RIDEV_REMOVE, target: 0 },
+                RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_REMOVE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(rem_page.as_ptr(), 2, 16), TRUE);
 
             // Register mouse (1,2) and keyboard (1,6) with RIDEV_NOLEGACY.
             let devs = [
