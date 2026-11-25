@@ -212,6 +212,10 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
         }
         3 => {
             // ProcessVmCounters (VM_COUNTERS = 88, VM_COUNTERS_EX = 96, VM_COUNTERS_EX2 = 104)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             let want = if len >= 104 {
                 104u32
             } else if len >= 96 {
@@ -224,16 +228,8 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, want as usize);
-            let (rss, peak) = if is_self {
-                crate::kernel32::process::task_memory()
-            } else {
-                (0, 0)
-            };
-            let private_commit = if is_self {
-                crate::kernel32::memory::committed_private_bytes().max(rss)
-            } else {
-                0
-            };
+            let (rss, peak) = crate::kernel32::process::task_memory();
+            let private_commit = crate::kernel32::memory::committed_private_bytes().max(rss);
             std::ptr::write_unaligned(out.add(0) as *mut usize, peak as usize); // PeakVirtualSize
             std::ptr::write_unaligned(out.add(8) as *mut usize, rss as usize); // VirtualSize
             std::ptr::write_unaligned(out.add(24) as *mut usize, peak as usize); // PeakWorkingSetSize
@@ -250,6 +246,10 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
         }
         4 => {
             // ProcessTimes (KERNEL_USER_TIMES: 32 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(32);
             if len < 32 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -257,7 +257,7 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             std::ptr::write_bytes(out, 0, 32);
             let now = now_filetime();
             let up = crate::kernel32::time::interrupt_time_100ns();
-            let (kernel, user) = if is_self { rusage_process_times_100ns() } else { (0, 0) };
+            let (kernel, user) = rusage_process_times_100ns();
             std::ptr::write_unaligned(out as *mut u64, now.saturating_sub(up)); // CreationTime
             std::ptr::write_unaligned(out.add(16) as *mut u64, kernel); // KernelTime
             std::ptr::write_unaligned(out.add(24) as *mut u64, user); // UserTime
@@ -274,11 +274,19 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
         }
         0x12 => {
             // ProcessPriorityClass (PROCESS_PRIORITY_CLASS: 2 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(2);
             if len < 2 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             let win_class = crate::kernel32::process::GetPriorityClass(h);
+            if win_class == 0 {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             let nt_class: u8 = match win_class {
                 0x40 => 1,    // IDLE_PRIORITY_CLASS
                 0x4000 => 5,  // BELOW_NORMAL_PRIORITY_CLASS
@@ -298,12 +306,23 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             let mut count = 0u32;
-            let _ = crate::kernel32::process::GetProcessHandleCount(h, &mut count);
+            if crate::kernel32::process::GetProcessHandleCount(h, &mut count) == 0 {
+                put_ret(0);
+                return if child.is_some() {
+                    STATUS_ACCESS_DENIED
+                } else {
+                    STATUS_INVALID_HANDLE
+                };
+            }
             std::ptr::write_unaligned(out as *mut u32, count);
             STATUS_SUCCESS
         }
         0x15 => {
             // ProcessAffinityMask (8 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(8);
             if len < 8 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -402,6 +421,10 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
         }
         0x24 => {
             // ProcessCookie (per-process random 32-bit cookie)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(4);
             if len < 4 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -3511,6 +3534,21 @@ mod tests {
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x40, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
             assert_eq!(NtQueryInformationProcess(0xDEADusize as HANDLE, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_INVALID_HANDLE);
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+
+            // Child process handles must propagate STATUS_ACCESS_DENIED for self-only queries
+            // like ProcessHandleCount (0x14) rather than succeeding with a fabricated 0.
+            let child_h = crate::kernel32::process::tests::make_test_child_handle(424242, "C:\\Games\\Child.exe");
+            ret = 99;
+            assert_eq!(NtQueryInformationProcess(child_h, 0x14, buf.as_mut_ptr(), 4, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(ret, 0);
+            assert_eq!(NtQueryInformationProcess(child_h, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 0x12, buf.as_mut_ptr(), 2, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 0x15, buf.as_mut_ptr(), 8, &mut ret), STATUS_ACCESS_DENIED);
+            // Child process queries backed by real ChildProcessObj fields (Basic, ImageFileNameWin32) still succeed.
+            assert_eq!(NtQueryInformationProcess(child_h, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize), 424242);
+            assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
 
             // 2. NtQueryInformationThread classes: ThreadTimes(1), ThreadAmILastThread(0x0C),
             // ThreadHideFromDebugger(0x11) round-trip, ThreadGroupInformation(0x1E), ThreadNameInformation(0x26),

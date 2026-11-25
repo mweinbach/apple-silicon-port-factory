@@ -1836,8 +1836,11 @@ impl Drop for JobObj {
             }
         }
         if kill_on_close {
-            // Terminate any child processes assigned to this job on last-handle close.
-            let _ = self.terminate_children(1);
+            // Terminate all processes associated with this job on last-handle close
+            // (both assigned child processes and the current process if assigned).
+            if self.terminate_children(1) {
+                pr::exit_process(1);
+            }
         }
     }
 }
@@ -2165,16 +2168,18 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
     let st = j.state.lock().unwrap();
     match class {
         1 => {
-            // JobObjectBasicAccountingInformation (48 bytes)
+            // JobObjectBasicAccountingInformation (48 bytes):
+            // +0..32: 4x LARGE_INTEGER times, +32: TotalPageFaultCount (u32),
+            // +36: TotalProcesses (u32), +40: ActiveProcesses (u32), +44: TotalTerminatedProcesses (u32).
             if len < 48 {
                 put_ret(48);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 48);
-            std::ptr::write_unaligned(out.add(32) as *mut u32, st.total_processes);
-            std::ptr::write_unaligned(out.add(36) as *mut u32, st.active_count());
-            std::ptr::write_unaligned(out.add(40) as *mut u32, st.total_terminated);
+            std::ptr::write_unaligned(out.add(36) as *mut u32, st.total_processes);
+            std::ptr::write_unaligned(out.add(40) as *mut u32, st.active_count());
+            std::ptr::write_unaligned(out.add(44) as *mut u32, st.total_terminated);
             put_ret(48);
             TRUE
         }
@@ -2242,9 +2247,9 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
                 return FALSE;
             }
             std::ptr::write_bytes(out, 0, 96);
-            std::ptr::write_unaligned(out.add(32) as *mut u32, st.total_processes);
-            std::ptr::write_unaligned(out.add(36) as *mut u32, st.active_count());
-            std::ptr::write_unaligned(out.add(40) as *mut u32, st.total_terminated);
+            std::ptr::write_unaligned(out.add(36) as *mut u32, st.total_processes);
+            std::ptr::write_unaligned(out.add(40) as *mut u32, st.active_count());
+            std::ptr::write_unaligned(out.add(44) as *mut u32, st.total_terminated);
             std::ptr::copy_nonoverlapping(st.io_counters.as_ptr(), out.add(48), 48);
             put_ret(96);
             TRUE
@@ -3217,7 +3222,7 @@ pub unsafe extern "win64" fn GetBinaryTypeW(_app_name: LPCWSTR, binary_type: *mu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn pointer_codec() {
@@ -3837,6 +3842,25 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 64 * 1024 * 1024);
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 128 * 1024 * 1024);
 
+            // Query JobObjectBasicAccountingInformation (class 1) and BasicAndIoAccounting (class 8)
+            // at the exact Windows ABI offsets: +32 TotalPageFaultCount, +36 TotalProcesses,
+            // +40 ActiveProcesses, +44 TotalTerminatedProcesses.
+            let mut acct = [0u8; 48];
+            assert_eq!(QueryInformationJobObject(job, 1, acct.as_mut_ptr() as *mut c_void, 48, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 48);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(32) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(36) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(40) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(44) as *const u32), 0);
+
+            let mut acct_io = [0u8; 96];
+            assert_eq!(QueryInformationJobObject(job, 8, acct_io.as_mut_ptr() as *mut c_void, 96, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 96);
+            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(32) as *const u32), 0);
+            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(36) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(40) as *const u32), 1);
+            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(44) as *const u32), 0);
+
             // Query JobObjectBasicProcessIdList (class 3).
             let mut pid_list = [0u8; 32];
             assert_eq!(QueryInformationJobObject(job, 3, pid_list.as_mut_ptr() as *mut c_void, 32, &mut ret_len), TRUE);
@@ -3864,6 +3888,10 @@ mod tests {
             assert_eq!(SetInformationJobObject(job, 999, ext.as_ptr() as *const c_void, 4), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
+            // Clear KILL_ON_JOB_CLOSE before closing in-process so the test runner continues
+            // (self-termination on KILL_ON_JOB_CLOSE is tested in the subprocess test below).
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+            assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
 
             // Named job objects release namespace ownership when the last handle closes.
@@ -3889,6 +3917,53 @@ mod tests {
             assert_eq!(fresh_cpu, [0u8; 8]);
             assert_eq!(crate::kernel32::threads::CloseHandle(nj3), TRUE);
         }
+    }
+
+    pub(crate) fn make_test_child_handle(pid: u32, exe_win: &str) -> HANDLE {
+        let obj = Arc::new(ChildProcessObj {
+            pid,
+            exe_win: exe_win.to_string(),
+            exit_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            terminated_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            os_pid: std::sync::atomic::AtomicI32::new(0),
+        });
+        handles::insert(obj)
+    }
+
+    #[test]
+    fn job_object_kill_on_close_terminates_current_process_on_last_handle() {
+        const ENV_KEY: &str = "WIN32_RT_TEST_JOB_KILL_SELF";
+        if std::env::var_os(ENV_KEY).is_some() {
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!job.is_null());
+                let mut ext = [0u8; 144];
+                std::ptr::write_unaligned(
+                    ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                );
+                assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+                assert_eq!(AssignProcessToJobObject(job, handles::CURRENT_PROCESS), TRUE);
+                // Closing the last handle must terminate this process with code 1 and never return.
+                let _ = crate::kernel32::threads::CloseHandle(job);
+                std::process::exit(99);
+            }
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let status = std::process::Command::new(exe)
+            .env(ENV_KEY, "1")
+            .arg("--exact")
+            .arg("kernel32::process::tests::job_object_kill_on_close_terminates_current_process_on_last_handle")
+            .arg("--nocapture")
+            .status()
+            .expect("spawn job kill-on-close child");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "closing last handle of KILL_ON_JOB_CLOSE job containing self must terminate process with code 1"
+        );
     }
 
     #[test]
