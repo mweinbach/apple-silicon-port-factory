@@ -85,7 +85,9 @@ unsafe fn rd<T: Copy>(p: *const u8, o: usize) -> T {
 }
 
 fn in_guest(addr: usize) -> bool {
-    crate::loader::get().module_at(addr).is_some_and(|m| !m.is_builtin())
+    crate::loader::try_get()
+        .and_then(|l| l.module_at(addr))
+        .is_some_and(|m| !m.is_builtin())
 }
 
 unsafe fn fatal(msg: &str, mc: *mut u8) -> ! {
@@ -1587,6 +1589,15 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
             m.state == MEM_COMMIT && (m.protect == PAGE_NOACCESS || (m.protect & PAGE_GUARD) != 0)
         })
     };
+    let sub_blocks_host_write = |p: usize| -> bool {
+        memory::query(p).is_some_and(|m| m.state == MEM_COMMIT && !subpage_allows_access(p, true))
+    };
+    let sibling_requires_emul = |hp: usize| -> bool {
+        (0..4).any(|i| {
+            let sub = hp + i * 0x1000;
+            sub_is_protected(sub) || (is_write && sub_blocks_host_write(sub))
+        })
+    };
     let Some(initial_mbi) = memory::query(eff_addr) else {
         return false;
     };
@@ -1595,17 +1606,17 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     }
     let initial_fault_prot =
         !subpage_allows_access(eff_addr, is_write) || initial_mbi.protect == PAGE_NOACCESS || (initial_mbi.protect & PAGE_GUARD) != 0;
-    let initial_any_sibling_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+    let initial_any_sibling_prot = sibling_requires_emul(hpage);
     // If every 4 KiB subpage touched by the access is logically accessible but shares a
-    // `PROT_NONE` 16 KiB host page with a `PAGE_GUARD` or non-guest `PAGE_NOACCESS` sibling,
-    // emulate the access transparently through an isolated alias mapping so sibling protections
-    // stay intact even under concurrent threads.
+    // restricted 16 KiB host page with a `PAGE_GUARD` / non-guest `PAGE_NOACCESS` sibling
+    // (or a non-writable sibling on a write), emulate the access transparently through an
+    // isolated alias mapping so sibling protections stay intact even under concurrent threads.
     if !initial_fault_prot && initial_any_sibling_prot {
         let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
         if let Some(mbi) = memory::query(eff_addr) {
             let now_fault_prot =
                 !subpage_allows_access(eff_addr, is_write) || mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0;
-            let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+            let now_any_sibling = sibling_requires_emul(hpage);
             if mbi.state == MEM_COMMIT && !now_fault_prot {
                 if !now_any_sibling {
                     return true;
@@ -1616,8 +1627,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
                 });
                 let any_guest_pe_noaccess_sibling = (0..4).any(|i| {
                     let sub = hpage + i * 0x1000;
-                    in_guest(sub)
-                        && memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS)
+                    memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS)
+                        && in_guest(sub)
                 });
                 if (any_sibling_guard || !any_guest_pe_noaccess_sibling || !unwind::has_guest_exception_handler())
                     && try_emulate_subpage_access(fault_addr, is_write, mc, ss)
@@ -1672,9 +1683,14 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     let is_guard = (mbi.protect & PAGE_GUARD) != 0;
     let fault_protected = !subpage_allows_access(eff_addr, is_write) || mbi.protect == PAGE_NOACCESS || is_guard;
     let any_sibling_protected = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
-    if !fault_protected && !any_sibling_protected {
+    if !fault_protected && !sibling_requires_emul(hpage) {
         // Another thread finished unlocking this 16 KiB host page while we waited.
         return true;
+    }
+    if !fault_protected && !any_sibling_protected {
+        // Only a non-writable sibling restricts host writes, and emulation already declined
+        // this instruction above: fail closed instead of retrying the same faulting store.
+        return false;
     }
 
     IN_FAULT.with(|f| f.set(true));
@@ -1692,9 +1708,10 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, eff_fault_addr, is_write);
         if handled {
             let _emul_guard = hpage_lock.lock().unwrap();
-            let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+            let now_any_sibling = sibling_requires_emul(hpage);
             if now_any_sibling && first_blocked_subpage(span_start, span_bytes, is_write).is_none() {
-                // Sibling 4 KiB subpages remain guarded/noaccess (host page stays PROT_NONE):
+                // Sibling 4 KiB subpages keep the host page restricted (PROT_NONE for
+                // guarded/noaccess siblings or PROT_READ for read-only siblings on writes):
                 // emulate this single faulting instruction through an isolated alias.
                 handled = try_emulate_subpage_access(fault_addr, is_write, mc, ss);
             }
@@ -1729,14 +1746,20 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     let still_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
     if !fault_protected {
         if !still_prot {
-            let host_p = memory::win_prot_to_host(mbi.protect);
-            let host_p = if host_p & libc::PROT_WRITE != 0 {
-                host_p & !libc::PROT_EXEC
-            } else {
-                host_p
-            };
+            let any_non_writable = (0..4).any(|i| sub_blocks_host_write(hpage + i * 0x1000));
+            let mut host_p = memory::win_prot_to_host(mbi.protect);
+            if any_non_writable {
+                host_p &= !libc::PROT_WRITE;
+            }
+            if host_p & libc::PROT_WRITE != 0 {
+                host_p &= !libc::PROT_EXEC;
+            }
             if libc::mprotect(hpage as *mut libc::c_void, 0x4000, host_p) == 0 {
-                handled = true;
+                if is_write && (host_p & libc::PROT_WRITE) == 0 {
+                    handled = try_emulate_subpage_access(fault_addr, is_write, mc, ss);
+                } else {
+                    handled = true;
+                }
             }
         }
     } else if still_prot && in_guest(eff_addr) {
@@ -2243,6 +2266,83 @@ mod tests {
             assert_eq!(hi, (ITERS * 2) as u32, "aligned and cross-page subpage atomics must not lose updates");
 
             libc::munmap(raw, 0x8000);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mixed_readonly_and_readwrite_subpages_enforce_ro_and_emulate_rw_writes() {
+        use win32_rt::kernel32::memory::{
+            self, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEM_WRITE_WATCH, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        unsafe {
+            // 1. Ordinary allocation: subpage 0 = PAGE_READONLY | PAGE_GUARD, subpage 1 = PAGE_READWRITE.
+            let p = memory::VirtualAlloc(std::ptr::null_mut(), 0x4000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let base = p as usize;
+            let mut old = 0u32;
+            assert_eq!(memory::VirtualProtect(p, 0x1000, PAGE_READONLY | PAGE_GUARD, &mut old), 1);
+            let res = memory::consume_guard_page(base).expect("consume PAGE_READONLY|PAGE_GUARD");
+            assert!(!res.host_kept_none);
+
+            // Emulate `str w1, [x2, #0]` (0xB900_0041) to PAGE_READWRITE sibling subpage 1.
+            let code: [u32; 1] = [0xB900_0041u32]; // str w1, [x2]
+            let mut mc = [0u8; 832];
+            let mut ss = [0u64; 33];
+            let rw_target = (base + 0x1000) as u64;
+            ss[1] = 0xCAFE_BABE;
+            ss[2] = rw_target;
+            ss[32] = code.as_ptr() as u64;
+            assert!(
+                try_dispatch_guest_page_fault(rw_target, code.as_ptr() as u64, true, mc.as_mut_ptr(), ss.as_mut_ptr()),
+                "write to PAGE_READWRITE sibling next to PAGE_READONLY subpage must be emulated"
+            );
+            assert_eq!(ss[32], code.as_ptr() as u64 + 4);
+            assert_eq!(*(rw_target as *const u32), 0xCAFE_BABE);
+
+            // Attempting to write to PAGE_READONLY subpage 0 must NOT be emulated (must fault).
+            ss[1] = 0xDEAD_C0DE;
+            ss[2] = base as u64;
+            ss[32] = code.as_ptr() as u64;
+            assert!(
+                !try_dispatch_guest_page_fault(base as u64, code.as_ptr() as u64, true, mc.as_mut_ptr(), ss.as_mut_ptr()),
+                "write to PAGE_READONLY subpage must not be emulated"
+            );
+            assert_eq!(*(base as *const u32), 0);
+
+            // 2. Write-watch allocation with PAGE_READONLY subpage 0 + PAGE_READWRITE subpage 1:
+            //    emulated write to subpage 1 records dirtiness in GetWriteWatch while keeping RO enforced.
+            let ww = memory::VirtualAlloc(
+                std::ptr::null_mut(),
+                0x4000,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            );
+            assert!(!ww.is_null());
+            let ww_base = ww as usize;
+            assert_eq!(memory::VirtualProtect(ww, 0x1000, PAGE_READONLY, &mut old), 1);
+            assert!(!memory::try_handle_write_watch_fault(ww_base + 0x1000, true));
+            let ww_rw = (ww_base + 0x1000) as u64;
+            ss[1] = 0x1357_9BDF;
+            ss[2] = ww_rw;
+            ss[32] = code.as_ptr() as u64;
+            assert!(try_dispatch_guest_page_fault(
+                ww_rw,
+                code.as_ptr() as u64,
+                true,
+                mc.as_mut_ptr(),
+                ss.as_mut_ptr()
+            ));
+            assert_eq!(*(ww_rw as *const u32), 0x1357_9BDF);
+            let mut addrs = [std::ptr::null_mut(); 4];
+            let mut count = addrs.len();
+            let mut gran = 0u32;
+            assert_eq!(memory::GetWriteWatch(0, ww, 0x4000, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, ww_base);
+
+            assert_eq!(memory::VirtualFree(p, 0, MEM_RELEASE), 1);
+            assert_eq!(memory::VirtualFree(ww, 0, MEM_RELEASE), 1);
         }
     }
 }
