@@ -3074,6 +3074,75 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
             TRUE
         );
         assert_eq!(scnt, 1);
+
+        // RFC 5652 §5.2.1: CMSG_CONTENT_PARAM & CryptVerifyMessageSignature unwrap the CMS
+        // OCTET STRING for non-DATA content types (szOID_CTL -> raw 0x30 CertificateTrustList DER).
+        let mut ctl_c_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                ctl_ctx.h_crypt_msg,
+                CMSG_CONTENT_PARAM,
+                0,
+                std::ptr::null_mut(),
+                &mut ctl_c_len,
+            ),
+            TRUE
+        );
+        assert_eq!(ctl_c_len, ctl_ctx.cb_ctl_content);
+        let mut ctl_c_buf = vec![0u8; ctl_c_len as usize];
+        assert_eq!(
+            CryptMsgGetParam(
+                ctl_ctx.h_crypt_msg,
+                CMSG_CONTENT_PARAM,
+                0,
+                ctl_c_buf.as_mut_ptr() as *mut c_void,
+                &mut ctl_c_len,
+            ),
+            TRUE
+        );
+        assert_eq!(ctl_c_buf[0], 0x30, "CMSG_CONTENT_PARAM must unwrap CMS OCTET STRING");
+
+        let mut ctl_dec = vec![0u8; ctl_ctx.cb_ctl_content as usize];
+        let mut ctl_dec_len = ctl_dec.len() as u32;
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                ctl_der.as_ptr(),
+                ctl_der.len() as u32,
+                ctl_dec.as_mut_ptr(),
+                &mut ctl_dec_len,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(ctl_dec_len, ctl_ctx.cb_ctl_content);
+        assert_eq!(ctl_dec[0], 0x30);
+
+        // RFC 5652 §5.6: mutating encapContentInfo.eContentType (leaving signedAttrs + signature
+        // intact) MUST fail CryptVerifyMessageSignature with NTE_BAD_SIGNATURE.
+        let oid_ctl: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
+        let oid_data: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+        let mut bad_ct_ctl = ctl_der.to_vec();
+        let ct_pos = bad_ct_ctl
+            .windows(oid_ctl.len())
+            .position(|w| w == oid_ctl)
+            .unwrap();
+        bad_ct_ctl[ct_pos..ct_pos + oid_ctl.len()].copy_from_slice(oid_data);
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                bad_ct_ctl.as_ptr(),
+                bad_ct_ctl.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006);
+
         let ctl_dup = CertDuplicateCTLContext(ctl);
         assert_eq!(ctl_dup, ctl);
         assert_eq!(CertFreeCTLContext(ctl_dup), TRUE);

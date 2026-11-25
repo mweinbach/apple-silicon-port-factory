@@ -64,6 +64,7 @@ const X509_ASN_ENCODING: u32 = 1;
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
 const OID_SPC_INDIRECT_DATA: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04];
 const OID_CTL: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
+const OID_CONTENT_TYPE: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03];
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
 
@@ -520,24 +521,37 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
         }
 
         if let Some(aa) = auth_attrs {
-            let mut found_md = false;
+            let mut md_count = 0usize;
+            let mut ct_count = 0usize;
             for attr in der_children(aa.val).ok_or(TRUST_E_BAD_DIGEST)? {
                 if attr.tag != 0x30 {
                     continue;
                 }
                 let ak = der_children(attr.val).ok_or(TRUST_E_BAD_DIGEST)?;
-                if ak.len() >= 2 && ak[0].tag == 0x06 && ak[0].val == OID_MESSAGE_DIGEST && ak[1].tag == 0x31 {
-                    let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
-                    if vals.len() == 1 && vals[0].tag == 0x04 {
+                if ak.len() >= 2 && ak[0].tag == 0x06 && ak[1].tag == 0x31 {
+                    if ak[0].val == OID_MESSAGE_DIGEST {
+                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
                         let expected_content_md = si_digest.hash(spc_seq.val);
-                        if vals[0].val != expected_content_md.as_slice() {
+                        if vals.len() != 1
+                            || vals[0].tag != 0x04
+                            || vals[0].val != expected_content_md.as_slice()
+                        {
                             return Err(TRUST_E_BAD_DIGEST);
                         }
-                        found_md = true;
+                        md_count += 1;
+                    } else if ak[0].val == OID_CONTENT_TYPE {
+                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        if vals.len() != 1
+                            || vals[0].tag != 0x06
+                            || vals[0].val != OID_SPC_INDIRECT_DATA
+                        {
+                            return Err(TRUST_E_BAD_DIGEST);
+                        }
+                        ct_count += 1;
                     }
                 }
             }
-            if !found_md {
+            if md_count != 1 || ct_count != 1 {
                 return Err(TRUST_E_BAD_DIGEST);
             }
             // Re-encode authenticatedAttributes with EXPLICIT SET tag (0x31) per RFC 2315 §9.3.
@@ -1553,23 +1567,39 @@ fn verify_standalone_pkcs7(
         }
 
         if let Some(aa) = auth_attrs {
-            let mut found_md = false;
+            // Per RFC 5652 §5.3 & §5.6: require exactly one content-type attribute matching
+            // encapContentInfo.eContentType and exactly one message-digest matching hash(content).
+            let mut md_count = 0usize;
+            let mut ct_count = 0usize;
+            let expected_md = si_digest.hash(&content_bytes);
             for attr in der_children(aa.val).ok_or(TRUST_E_BAD_DIGEST)? {
                 if attr.tag != 0x30 {
                     continue;
                 }
                 let ak = der_children(attr.val).ok_or(TRUST_E_BAD_DIGEST)?;
-                if ak.len() >= 2 && ak[0].tag == 0x06 && ak[0].val == OID_MESSAGE_DIGEST && ak[1].tag == 0x31 {
-                    let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
-                    if vals.len() == 1 && vals[0].tag == 0x04 {
-                        if vals[0].val != si_digest.hash(&content_bytes).as_slice() {
+                if ak.len() >= 2 && ak[0].tag == 0x06 && ak[1].tag == 0x31 {
+                    if ak[0].val == OID_MESSAGE_DIGEST {
+                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        if vals.len() != 1
+                            || vals[0].tag != 0x04
+                            || vals[0].val != expected_md.as_slice()
+                        {
                             return Err(TRUST_E_BAD_DIGEST);
                         }
-                        found_md = true;
+                        md_count += 1;
+                    } else if ak[0].val == OID_CONTENT_TYPE {
+                        let vals = der_children(ak[1].val).ok_or(TRUST_E_BAD_DIGEST)?;
+                        if vals.len() != 1
+                            || vals[0].tag != 0x06
+                            || vals[0].val != encap_content_type_oid.as_slice()
+                        {
+                            return Err(TRUST_E_BAD_DIGEST);
+                        }
+                        ct_count += 1;
                     }
                 }
             }
-            if !found_md {
+            if md_count != 1 || ct_count != 1 {
                 return Err(TRUST_E_BAD_DIGEST);
             }
             let mut set_der = Vec::with_capacity(aa.raw.len());
@@ -2841,6 +2871,20 @@ mod tests {
                 &[],
                 "FF23456789ABCDEF102030405060708090A0B0C0"
             ));
+
+            // RFC 5652 §5.6: mutating encapContentInfo.eContentType without changing the
+            // content or signature MUST fail verify_standalone_pkcs7 (content-type mismatch).
+            let mut tampered_ctl = ctl_signed.to_vec();
+            let oid_data: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
+            let pos = tampered_ctl
+                .windows(OID_CTL.len())
+                .position(|w| w == OID_CTL)
+                .expect("CATALOG_CTL_SIGNED_DER must contain OID_CTL in encapContentInfo");
+            tampered_ctl[pos..pos + OID_CTL.len()].copy_from_slice(oid_data);
+            assert_eq!(
+                verify_standalone_pkcs7(&tampered_ctl, None).err(),
+                Some(TRUST_E_BAD_DIGEST)
+            );
 
             // Invalid union choice returns TRUST_E_SUBJECT_FORM_UNKNOWN
             std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, 99);
