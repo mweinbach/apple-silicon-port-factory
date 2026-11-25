@@ -609,7 +609,52 @@ pub unsafe extern "win64" fn GetPwrCapabilities(out: *mut c_void) -> u8 {
     1
 }
 
-fn query_sysctl_timeval_100ns(name: &std::ffi::CStr) -> u64 {
+/// Convert a Unix-epoch calendar `(tv_sec, tv_usec)` timestamp into the current
+/// interrupt-time clock domain (`0` if unset or in the future).
+fn calendar_timeval_to_interrupt_100ns(
+    tv_sec: i64,
+    tv_usec: i32,
+    now_unix_100ns: u64,
+    now_interrupt_100ns: u64,
+) -> u64 {
+    if tv_sec <= 0 {
+        return 0;
+    }
+    let ev_unix_100ns = (tv_sec as u64)
+        .saturating_mul(10_000_000)
+        .saturating_add((tv_usec.max(0) as u64).saturating_mul(10));
+    if ev_unix_100ns > now_unix_100ns {
+        return 0;
+    }
+    let elapsed_100ns = now_unix_100ns - ev_unix_100ns;
+    now_interrupt_100ns.saturating_sub(elapsed_100ns)
+}
+
+fn query_power_event_interrupt_100ns(
+    abs_sysctl: &std::ffi::CStr,
+    cal_sysctl: &std::ffi::CStr,
+) -> u64 {
+    let now_int = crate::kernel32::time::interrupt_time_100ns();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut abs_ticks: u64 = 0;
+        let mut sz = std::mem::size_of::<u64>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                abs_sysctl.as_ptr(),
+                &mut abs_ticks as *mut u64 as *mut c_void,
+                &mut sz,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return crate::kernel32::time::mach_abs_to_100ns(abs_ticks).min(now_int);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = abs_sysctl;
+
     #[repr(C)]
     struct Timeval {
         tv_sec: i64,
@@ -620,7 +665,7 @@ fn query_sysctl_timeval_100ns(name: &std::ffi::CStr) -> u64 {
     let mut sz = std::mem::size_of::<Timeval>();
     unsafe {
         if libc::sysctlbyname(
-            name.as_ptr(),
+            cal_sysctl.as_ptr(),
             &mut tv as *mut Timeval as *mut c_void,
             &mut sz,
             std::ptr::null_mut(),
@@ -628,9 +673,18 @@ fn query_sysctl_timeval_100ns(name: &std::ffi::CStr) -> u64 {
         ) == 0
             && tv.tv_sec > 0
         {
-            return (tv.tv_sec as u64)
-                .saturating_mul(10_000_000)
-                .saturating_add((tv.tv_usec.max(0) as u64).saturating_mul(10));
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            if libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) == 0 && ts.tv_sec > 0 {
+                let now_unix_100ns = (ts.tv_sec as u64)
+                    .saturating_mul(10_000_000)
+                    .saturating_add((ts.tv_nsec.max(0) as u64) / 100);
+                return calendar_timeval_to_interrupt_100ns(
+                    tv.tv_sec,
+                    tv.tv_usec,
+                    now_unix_100ns,
+                    now_int,
+                );
+            }
         }
     }
     0
@@ -860,7 +914,7 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             if out_buf.is_null() || out_len < 8 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            let t = query_sysctl_timeval_100ns(c"kern.waketime");
+            let t = query_power_event_interrupt_100ns(c"kern.wake_abs_time", c"kern.waketime");
             std::ptr::write_unaligned(out_buf as *mut u64, t);
             STATUS_SUCCESS
         }
@@ -868,7 +922,7 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             if out_buf.is_null() || out_len < 8 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            let t = query_sysctl_timeval_100ns(c"kern.sleeptime");
+            let t = query_power_event_interrupt_100ns(c"kern.sleep_abs_time", c"kern.sleeptime");
             std::ptr::write_unaligned(out_buf as *mut u64, t);
             STATUS_SUCCESS
         }
@@ -1362,6 +1416,29 @@ mod tests {
                 ),
                 STATUS_SUCCESS
             );
+            let mut sleep_t = 0u64;
+            assert_eq!(
+                CallNtPowerInformation(
+                    LAST_SLEEP_TIME,
+                    std::ptr::null(),
+                    0,
+                    &mut sleep_t as *mut u64 as *mut c_void,
+                    8,
+                ),
+                STATUS_SUCCESS
+            );
+            // Both LastWakeTime and LastSleepTime must be in the interrupt-time clock domain
+            // (never a larger Unix-epoch calendar timestamp that underflows elapsed-time math).
+            let now_int = crate::kernel32::time::interrupt_time_100ns();
+            assert!(wake_t <= now_int, "LastWakeTime ({wake_t}) exceeded interrupt_time_100ns ({now_int})");
+            assert!(sleep_t <= now_int, "LastSleepTime ({sleep_t}) exceeded interrupt_time_100ns ({now_int})");
+            // Calendar fallback helper must convert Unix timestamps to interrupt-time elapsed offsets.
+            // Event at 1_700_000_000.500000s (17_000_000_005_000_000 * 100ns); 60s later -> 400_000_000.
+            assert_eq!(
+                calendar_timeval_to_interrupt_100ns(1_700_000_000, 500_000, 17_000_000_605_000_000, 1_000_000_000),
+                400_000_000
+            );
+            assert_eq!(calendar_timeval_to_interrupt_100ns(0, 0, 17_000_000_650_000_000, 1_000_000_000), 0);
 
             let mut ppol = [0u8; 76];
             assert_eq!(
