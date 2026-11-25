@@ -623,19 +623,47 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
 unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
     let info = fd_info(fd);
     match info.mode {
-        TextMode::Binary => (raw_read_retry(fd, buf, n), Vec::new()),
-        TextMode::AnsiText => {
-            if info.raw {
+        TextMode::Binary => {
+            let mut pend = take_u8_pending(fd);
+            if pend.raw.is_empty() {
                 return (raw_read_retry(fd, buf, n), Vec::new());
             }
-            let start_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
-            let r = raw_read_retry(fd, buf, n);
-            if r <= 0 {
-                return (r, Vec::new());
+            let take = pend.raw.len().min(n);
+            std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+            pend.raw.drain(..take);
+            store_u8_pending(fd, pend);
+            (take as isize, Vec::new())
+        }
+        TextMode::AnsiText => {
+            let mut pend = take_u8_pending(fd);
+            if info.raw {
+                if pend.raw.is_empty() {
+                    return (raw_read_retry(fd, buf, n), Vec::new());
+                }
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                store_u8_pending(fd, pend);
+                return (take as isize, Vec::new());
             }
-            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(r as usize + 1) } else { Vec::new() };
+            let raw_fd_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let total = if !pend.raw.is_empty() {
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                take
+            } else {
+                let r = raw_read_retry(fd, buf, n);
+                if r <= 0 {
+                    store_u8_pending(fd, pend);
+                    return (r, Vec::new());
+                }
+                r as usize
+            };
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(total + 1) } else { Vec::new() };
             let mut extra_fd = 0usize;
-            let s = std::slice::from_raw_parts_mut(buf, r as usize);
+            let s = std::slice::from_raw_parts_mut(buf, total);
             let mut w = 0;
             let mut i = 0;
             while i < s.len() {
@@ -650,9 +678,21 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                             i += 2;
                             continue;
                         }
+                    } else if !pend.raw.is_empty() {
+                        if pend.raw[0] == b'\n' {
+                            pend.raw.remove(0);
+                            if start_pos >= 0 {
+                                src_pos.push(start_pos + i as i64);
+                            }
+                            s[w] = b'\n';
+                            w += 1;
+                            i += 1;
+                            extra_fd = 1;
+                            continue;
+                        }
                     } else {
                         let mut nb = 0u8;
-                        let k = libc::read(fd, &mut nb as *mut u8 as *mut c_void, 1);
+                        let k = raw_read_retry(fd, &mut nb, 1);
                         if k == 1 {
                             if nb == b'\n' {
                                 if start_pos >= 0 {
@@ -664,7 +704,9 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                                 extra_fd = 1;
                                 continue;
                             }
-                            libc::lseek(fd, -1, libc::SEEK_CUR);
+                            if libc::lseek(fd, -1, libc::SEEK_CUR) < 0 {
+                                pend.raw.push(nb);
+                            }
                         }
                     }
                 }
@@ -675,8 +717,9 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                 w += 1;
                 i += 1;
             }
+            store_u8_pending(fd, pend);
             if start_pos >= 0 {
-                src_pos.push(start_pos + (r as usize + extra_fd) as i64);
+                src_pos.push(start_pos + (total + extra_fd) as i64);
             }
             (w as isize, src_pos)
         }
@@ -689,23 +732,49 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
             if n == 0 {
                 return (0, Vec::new());
             }
-            let start_pos = if track_pos && !info.raw { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
-            let r = raw_read_retry(fd, buf, n);
-            if r <= 0 {
-                return (r, Vec::new());
+            let mut pend = take_u8_pending(fd);
+            let raw_fd_pos = if track_pos && !info.raw { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let mut total = 0usize;
+            if !pend.raw.is_empty() {
+                let take = pend.raw.len().min(n);
+                std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
+                pend.raw.drain(..take);
+                total = take;
             }
-            // If an odd byte arrived, read 1 more byte to complete the UTF-16LE code unit.
-            let mut total = r as usize;
+            if total == 0 || (total < n && total % 2 == 1) {
+                let r = raw_read_retry(fd, buf.add(total), n - total);
+                if r < 0 {
+                    if total > 0 {
+                        let mut restored = Vec::with_capacity(total + pend.raw.len());
+                        restored.extend_from_slice(std::slice::from_raw_parts(buf, total));
+                        restored.extend_from_slice(&pend.raw);
+                        pend.raw = restored;
+                    }
+                    store_u8_pending(fd, pend);
+                    return (-1, Vec::new());
+                }
+                total += r as usize;
+            }
+            if total == 0 {
+                store_u8_pending(fd, pend);
+                return (0, Vec::new());
+            }
+            // If an odd byte arrived, read 1 more byte to complete the UTF-16LE code unit;
+            // if EOF/short, preserve the stray partial byte in per-fd pending state.
             if total % 2 == 1 {
                 let mut extra = 0u8;
-                if raw_read_retry(fd, &mut extra, 1) == 1 && total < n {
+                if total < n && raw_read_retry(fd, &mut extra, 1) == 1 {
                     *buf.add(total) = extra;
                     total += 1;
                 } else {
+                    let stray = *buf.add(total - 1);
+                    pend.raw.insert(0, stray);
                     total -= 1;
                 }
             }
             if info.raw {
+                store_u8_pending(fd, pend);
                 return (total as isize, Vec::new());
             }
             let units = total / 2;
@@ -731,26 +800,58 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                             i += 2;
                             continue;
                         }
+                    } else if pend.raw.len() >= 2 {
+                        if u16::from_le_bytes([pend.raw[0], pend.raw[1]]) == 0x000A {
+                            pend.raw.drain(..2);
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 1;
+                            extra_fd += 2;
+                            continue;
+                        }
                     } else {
                         let mut peek = [0u8; 2];
-                        let pk = libc::read(fd, peek.as_mut_ptr() as *mut c_void, 2);
-                        if pk == 2 {
-                            if u16::from_le_bytes(peek) == 0x000A {
-                                let lf = 0x000Au16.to_le_bytes();
-                                *buf.add(w * 2) = lf[0];
-                                *buf.add(w * 2 + 1) = lf[1];
-                                if start_pos >= 0 {
-                                    src_pos.push(unit_phys);
-                                    src_pos.push(unit_phys);
-                                }
-                                w += 1;
-                                i += 1;
-                                extra_fd = 2;
-                                continue;
+                        let pre = pend.raw.len();
+                        if pre == 1 {
+                            peek[0] = pend.raw[0];
+                        }
+                        let mut have = pre;
+                        let mut pk_total = 0usize;
+                        while have < 2 {
+                            let pk = raw_read_retry(fd, peek.as_mut_ptr().add(have), 2 - have);
+                            if pk <= 0 {
+                                break;
                             }
-                            libc::lseek(fd, -2, libc::SEEK_CUR);
-                        } else if pk == 1 {
-                            libc::lseek(fd, -1, libc::SEEK_CUR);
+                            have += pk as usize;
+                            pk_total += pk as usize;
+                        }
+                        if have == 2 && u16::from_le_bytes(peek) == 0x000A {
+                            pend.raw.clear();
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 1;
+                            extra_fd += 2;
+                            continue;
+                        }
+                        // Non-LF lookahead (or partial 1-byte read): rewind seekable fd, or retain
+                        // in per-fd pending input when seeking is unavailable (e.g. pipes/FIFOs).
+                        if pk_total > 0 {
+                            let from_fd = &peek[pre..have];
+                            if pre > 0 || libc::lseek(fd, -(pk_total as i64), libc::SEEK_CUR) < 0 {
+                                pend.raw.extend_from_slice(from_fd);
+                            }
                         }
                     }
                 }
@@ -764,6 +865,7 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                 w += 1;
                 i += 1;
             }
+            store_u8_pending(fd, pend);
             if start_pos >= 0 {
                 src_pos.push(start_pos + (units * 2 + extra_fd) as i64);
             }
@@ -3276,6 +3378,99 @@ mod tests {
             assert_eq!(fclose(f), 0);
 
             assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
+
+            // 11. Non-seekable FIFO with _O_U16TEXT preserves CR lookahead (full and partial units)
+            //     and translates CRLF across 2-byte reads without losing data.
+            let fifo_path = dir.join("u16_lookahead.fifo");
+            let fifo_c = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(libc::mkfifo(fifo_c.as_ptr(), 0o600), 0);
+            // Open O_RDWR on the FIFO via _open with O_U16TEXT (non-seekable, raw=false).
+            let fd_fifo = _open(b"U:\\u16_lookahead.fifo\0".as_ptr(), O_RDWR | O_U16TEXT, 0);
+            assert!(fd_fifo >= 0);
+            let w_fifo = libc::open(fifo_c.as_ptr(), libc::O_WRONLY);
+            assert!(w_fifo >= 0);
+
+            // Case A: UTF-16LE "\rAB" read 2 bytes at a time -> retains 'A' lookahead on ESPIPE.
+            let payload_rab: Vec<u8> = "\rAB".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert_eq!(
+                libc::write(w_fifo, payload_rab.as_ptr() as *const c_void, payload_rab.len()),
+                payload_rab.len() as isize
+            );
+            let mut got_rab = Vec::new();
+            for _ in 0..3 {
+                let mut u = [0u8; 2];
+                assert_eq!(_read(fd_fifo, u.as_mut_ptr() as *mut c_void, 2), 2);
+                got_rab.push(u16::from_le_bytes(u));
+            }
+            assert_eq!(String::from_utf16_lossy(&got_rab), "\rAB");
+
+            // Case B: UTF-16LE "\r\n\r\r\nC" read 2 bytes at a time -> "\n\r\nC".
+            let payload_crlf: Vec<u8> = "\r\n\r\r\nC".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert_eq!(
+                libc::write(w_fifo, payload_crlf.as_ptr() as *const c_void, payload_crlf.len()),
+                payload_crlf.len() as isize
+            );
+            let mut got_crlf = Vec::new();
+            for _ in 0..4 {
+                let mut u = [0u8; 2];
+                assert_eq!(_read(fd_fifo, u.as_mut_ptr() as *mut c_void, 2), 2);
+                got_crlf.push(u16::from_le_bytes(u));
+            }
+            assert_eq!(String::from_utf16_lossy(&got_crlf), "\n\r\nC");
+
+            // Case C: Partial UTF-16LE lookahead on closed pipe: "\r" + single byte 0x44, then EOF;
+            // and split partial delivery on a live pipe ("\r" + 0x44, then 0x00 -> "\rD").
+            let mut pfds16 = [0i32; 2];
+            assert_eq!(libc::pipe(pfds16.as_mut_ptr()), 0);
+            // Force raw=false on the pipe fd (matching open_host_path on a non-seekable descriptor).
+            set_fd_info(
+                pfds16[0],
+                FdInfo { mode: TextMode::Utf16Le, win_mode: O_U16TEXT, raw: false, temporary: false, osf_handle: None },
+                None,
+            );
+            let writer_fd = pfds16[1];
+            let writer = std::thread::spawn(move || {
+                // Send "\r" (2 bytes) + low byte of 'D' (0x44), pause, then send high byte (0x00) + close.
+                let part1 = [0x0Du8, 0x00, b'D'];
+                assert_eq!(libc::write(writer_fd, part1.as_ptr() as *const c_void, part1.len()), 3);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                let part2 = [0x00u8];
+                assert_eq!(libc::write(writer_fd, part2.as_ptr() as *const c_void, 1), 1);
+                libc::close(writer_fd);
+            });
+            let mut u1 = [0u8; 2];
+            let mut u2 = [0u8; 2];
+            assert_eq!(_read(pfds16[0], u1.as_mut_ptr() as *mut c_void, 2), 2);
+            assert_eq!(_read(pfds16[0], u2.as_mut_ptr() as *mut c_void, 2), 2);
+            assert_eq!(_read(pfds16[0], u2.as_mut_ptr() as *mut c_void, 2), 0);
+            writer.join().unwrap();
+            assert_eq!(String::from_utf16_lossy(&[u16::from_le_bytes(u1), u16::from_le_bytes(u2)]), "\rD");
+            assert_eq!(_close(pfds16[0]), 0);
+
+            libc::close(w_fifo);
+            assert_eq!(_close(fd_fifo), 0);
+
+            // Case D: Non-seekable ANSI text descriptor preserves CR lookahead ("\rXY").
+            let mut pfds_a = [0i32; 2];
+            assert_eq!(libc::pipe(pfds_a.as_mut_ptr()), 0);
+            set_fd_info(
+                pfds_a[0],
+                FdInfo { mode: TextMode::AnsiText, win_mode: O_TEXT, raw: false, temporary: false, osf_handle: None },
+                None,
+            );
+            assert_eq!(libc::write(pfds_a[1], b"\rXY".as_ptr() as *const c_void, 3), 3);
+            libc::close(pfds_a[1]);
+            let mut got_a = Vec::new();
+            loop {
+                let mut b = 0u8;
+                let k = _read(pfds_a[0], &mut b as *mut u8 as *mut c_void, 1);
+                if k <= 0 {
+                    break;
+                }
+                got_a.push(b);
+            }
+            assert_eq!(got_a, b"\rXY");
+            assert_eq!(_close(pfds_a[0]), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -969,12 +969,33 @@ pub unsafe extern "win64" fn _getch() -> i32 {
 
 pub unsafe extern "win64" fn _kbhit() -> i32 {
     let fd = crate::kernel32::file::console_input_fd();
+    let is_tty = libc::isatty(fd) != 0;
+    let mut saved: libc::termios = std::mem::zeroed();
+    let changed_termios =
+        if is_tty && libc::tcgetattr(fd, &mut saved) == 0 && (saved.c_lflag & libc::ICANON) != 0 {
+            let mut noncanon = saved;
+            noncanon.c_lflag &= !libc::ICANON;
+            noncanon.c_cc[libc::VMIN] = 1;
+            noncanon.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(fd, libc::TCSANOW, &noncanon) == 0
+        } else {
+            false
+        };
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    let r = libc::poll(&mut pfd, 1, 0);
+    let r = loop {
+        let n = libc::poll(&mut pfd, 1, 0);
+        if n < 0 && *libc::__error() == libc::EINTR {
+            continue;
+        }
+        break n;
+    };
+    if changed_termios {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &saved);
+    }
     if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
         1
     } else {
@@ -1255,6 +1276,69 @@ mod tests {
 
             assert_eq!(SetStdHandle(STD_INPUT_HANDLE, old_in), TRUE);
             CloseHandle(h_read);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kbhit_and_getch_detect_single_keystroke_on_canonical_pty() {
+        use crate::kernel32::file::{GetStdHandle, SetStdHandle};
+        use crate::kernel32::threads::CloseHandle;
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let slave_name = libc::ptsname(master);
+            assert!(!slave_name.is_null());
+            let slave = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave >= 0);
+
+            // Ensure ICANON is enabled on the PTY slave (normal host terminal state).
+            let mut tio: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
+            tio.c_lflag |= libc::ICANON;
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
+
+            let old_in = GetStdHandle(STD_INPUT_HANDLE);
+            let h_tty = crate::kernel32::file::wrap_owned_fd(
+                std::os::fd::FromRawFd::from_raw_fd(slave),
+                crate::kernel32::file::FileKind::Console,
+                "test-kbhit-pty".into(),
+                0x8000_0000,
+            );
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, h_tty), TRUE);
+
+            // Empty canonical PTY reports 0.
+            assert_eq!(_kbhit(), 0);
+            // Write a single character WITHOUT newline; _kbhit must report 1 and preserve ICANON.
+            assert_eq!(libc::write(master, b"A".as_ptr() as *const c_void, 1), 1);
+            // Allow kernel PTY line discipline to deliver byte to slave queue.
+            let mut ready = 0;
+            for _ in 0..20 {
+                ready = _kbhit();
+                if ready != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(ready, 1, "_kbhit must detect single keystroke on ICANON PTY before Enter");
+
+            let mut after_kbhit: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_kbhit), 0);
+            assert_ne!(after_kbhit.c_lflag & libc::ICANON, 0, "_kbhit must restore ICANON");
+
+            assert_eq!(_getch(), b'A' as i32);
+            assert_eq!(_kbhit(), 0);
+
+            let mut after_getch: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut after_getch), 0);
+            assert_ne!(after_getch.c_lflag & libc::ICANON, 0, "_getch must restore ICANON");
+
+            assert_eq!(SetStdHandle(STD_INPUT_HANDLE, old_in), TRUE);
+            CloseHandle(h_tty);
+            libc::close(master);
         }
     }
 
