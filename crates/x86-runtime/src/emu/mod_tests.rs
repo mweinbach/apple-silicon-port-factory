@@ -762,6 +762,57 @@ mod lean_tests {
         assert_eq!(rax, 0x8005_0033);
     }
 
+    static HOST_TEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HostTextRangeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HostTextRangeGuard {
+        fn enter(start: usize, end: usize) -> Self {
+            let lock = HOST_TEXT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::exe::set_host_text_range(start, end);
+            win32_rt::set_unregistered_host_text_checker(crate::exe::is_unregistered_host_text);
+            Self { _lock: lock }
+        }
+
+        /// Record the exact Mach-O `__TEXT,__text` section of the current test binary so
+        /// heap-allocated guest code buffers never collide with `in_host_text`.
+        fn enter_current_image() -> Self {
+            extern "C" {
+                fn getsectiondata(
+                    mhp: *const core::ffi::c_void,
+                    segname: *const core::ffi::c_char,
+                    sectname: *const core::ffi::c_char,
+                    size: *mut usize,
+                ) -> *const u8;
+            }
+            let (start, end) = unsafe {
+                let mut info: win32_rt::libc::Dl_info = core::mem::zeroed();
+                let anchor = Self::enter_current_image as *const () as *const core::ffi::c_void;
+                assert_ne!(win32_rt::libc::dladdr(anchor, &mut info), 0, "dladdr failed");
+                assert!(!info.dli_fbase.is_null(), "dli_fbase null");
+                let mut size = 0usize;
+                let ptr = getsectiondata(
+                    info.dli_fbase,
+                    c"__TEXT".as_ptr(),
+                    c"__text".as_ptr(),
+                    &mut size,
+                );
+                assert!(!ptr.is_null() && size > 0, "getsectiondata(__TEXT, __text) failed");
+                (ptr as usize, ptr as usize + size)
+            };
+            Self::enter(start, end)
+        }
+    }
+
+    impl Drop for HostTextRangeGuard {
+        fn drop(&mut self) {
+            win32_rt::clear_unregistered_host_text_checker();
+            crate::exe::set_host_text_range(0, 0);
+        }
+    }
+
     #[test]
     fn unregistered_host_text_is_never_authorized_in_lookup_or_cached_dispatch() {
         unsafe extern "win64" fn reg_thunk_target(a: u64) -> u64 {
@@ -771,7 +822,7 @@ mod lean_tests {
         // Record a neutral synthetic host-text range for negative-exclusion checks only.
         let sentinel_base: usize = 0x0000_0007_8000_0000;
         let sentinel_addr: usize = sentinel_base + 0x140;
-        crate::exe::set_host_text_range(sentinel_base, sentinel_base + 0x2000);
+        let _guard = HostTextRangeGuard::enter(sentinel_base, sentinel_base + 0x2000);
         assert!(crate::exe::in_host_text(sentinel_addr));
 
         // 1. Direct lookup, host-callable predicate, and memoized dispatch (cold + warm dcache)
@@ -794,7 +845,153 @@ mod lean_tests {
         assert_eq!(unsafe { call_va8(thunk_va, 10, 0, 0, 0, 0, 0, 0, 0) }, 10 + 0x42);
         crate::exe::unregister_native_va(thunk_va);
         assert_eq!(resolve_host_callable(thunk_va), None);
-        crate::exe::set_host_text_range(0, 0);
+    }
+
+    #[test]
+    fn beginthread_dispatches_host_trampoline_through_call_va8_without_refusal() {
+        // Real x86-64 guest thread entry:
+        //   mov rax, [rcx]
+        //   add rax, 0x2a
+        //   mov [rcx], rax
+        //   ret
+        let guest_fn_va = super::alloc_guest_code(&[
+            0x48, 0x8B, 0x01,
+            0x48, 0x83, 0xC0, 0x2A,
+            0x48, 0x89, 0x01,
+            0xC3,
+        ]);
+        let _guard = HostTextRangeGuard::enter_current_image();
+        assert!(
+            !crate::exe::in_host_text(guest_fn_va as usize),
+            "guest code buffer must lie outside host __TEXT"
+        );
+        win32_rt::set_guest_dispatcher(crate::exe::call_va8);
+        win32_rt::set_native_va_registrar(crate::exe::register_native_va);
+
+        let refusals_before = unregistered_host_refusal_count();
+        let shared = std::sync::atomic::AtomicU64::new(0x1000);
+        unsafe {
+            let entry: unsafe extern "win64" fn(*mut core::ffi::c_void) =
+                core::mem::transmute(guest_fn_va as usize);
+            let h = win32_rt::ucrt::runtime::_beginthread(
+                entry,
+                0,
+                (&shared as *const std::sync::atomic::AtomicU64) as *mut core::ffi::c_void,
+            );
+            assert_ne!(h, usize::MAX, "_beginthread must succeed");
+            assert_ne!(h, 0, "_beginthread handle must be non-null");
+            let wait = win32_rt::kernel32::threads::WaitForSingleObject(
+                h as win32_rt::types::HANDLE,
+                5_000,
+            );
+            assert_eq!(wait, 0, "WaitForSingleObject must return WAIT_OBJECT_0");
+            win32_rt::kernel32::threads::CloseHandle(h as win32_rt::types::HANDLE);
+        }
+        assert_eq!(
+            shared.load(std::sync::atomic::Ordering::Acquire),
+            0x102A,
+            "guest thread body launched via _beginthread must execute through begin_thread_tramp"
+        );
+        assert_eq!(
+            unregistered_host_refusal_count(),
+            refusals_before,
+            "_beginthread must not trigger any unregistered host __TEXT refusal"
+        );
+    }
+
+    #[test]
+    fn nvapi_query_interface_and_static_vtables_dispatch_via_call_va8() {
+        let cout_vtbl_slot0 = unsafe { *win32_rt::misc::msvcp140::COUT.ios.vtable }.0 as usize;
+        let _guard = HostTextRangeGuard::enter_current_image();
+
+        win32_rt::set_guest_dispatcher(crate::exe::call_va8);
+        win32_rt::set_native_va_registrar(crate::exe::register_native_va);
+
+        let refusals_before = unregistered_host_refusal_count();
+
+        // 1. Public API path: nvapi_QueryInterface returns registered host-callable pointers.
+        let p_ver = win32_rt::misc::nvapi64::nvapi_QueryInterface(
+            win32_rt::misc::nvapi64::ID_NVAPI_GET_INTERFACE_VERSION_STRING,
+        );
+        assert_ne!(p_ver, 0);
+        assert!(crate::exe::in_host_text(p_ver));
+        assert!(win32_rt::audit_guest_callable(p_ver, "test_nvapi").is_ok());
+
+        let mut buf = [0u8; 64];
+        let rc = unsafe { call_va8(p_ver as u64, buf.as_mut_ptr() as u64, 0, 0, 0, 0, 0, 0, 0) } as i32;
+        assert_eq!(rc, 0, "NvAPI_GetInterfaceVersionString must return NVAPI_OK via call_va8");
+        let s = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .expect("NUL-terminated NVAPI version string")
+            .to_str()
+            .unwrap();
+        assert!(s.contains("NVAPI"), "unexpected version string: {s:?}");
+
+        // 2. Static data-exported vtable slots (msvcp140::COUT) are registered automatically
+        //    when set_native_va_registrar runs, even before any msvcp140 function is called.
+        assert!(crate::exe::in_host_text(cout_vtbl_slot0));
+        assert_eq!(resolve_host_callable(cout_vtbl_slot0 as u64), Some(cout_vtbl_slot0));
+        assert!(win32_rt::audit_guest_callable(cout_vtbl_slot0, "test_cout_vtbl").is_ok());
+
+        assert_eq!(
+            unregistered_host_refusal_count(),
+            refusals_before,
+            "registered host thunks must not increment refusal count"
+        );
+    }
+
+    #[test]
+    fn unregistered_host_text_refusal_symbolizes_and_audit_helper_catches_escape() {
+        #[inline(never)]
+        unsafe extern "win64" fn unregistered_escape_sentinel(x: u64) -> u64 {
+            x.wrapping_add(1)
+        }
+
+        let addr = unregistered_escape_sentinel as *const () as usize;
+        let _guard = HostTextRangeGuard::enter_current_image();
+        assert!(crate::exe::in_host_text(addr));
+        assert_eq!(resolve_host_callable(addr as u64), None);
+
+        // 1. Audit helper fails cleanly when an unregistered host __TEXT pointer escapes.
+        let err = win32_rt::audit_guest_callable(addr, "regression_test_site")
+            .expect_err("audit_guest_callable must reject unregistered host __TEXT");
+        assert!(err.contains("unregistered host __TEXT"), "unexpected audit err: {err}");
+        assert!(err.contains("regression_test_site"), "missing site in audit err: {err}");
+
+        // 2. dladdr symbolization resolves the sentinel function name.
+        let sym = describe_host_addr(addr);
+        assert!(
+            sym.contains("unregistered_escape_sentinel"),
+            "describe_host_addr should resolve sentinel symbol via dladdr, got: {sym}"
+        );
+
+        // 3. Both call_va8 and call_va8_xmm refuse the unregistered target safely and count it.
+        let before = unregistered_host_refusal_count();
+        assert_eq!(unsafe { call_va8(addr as u64, 41, 0, 0, 0, 0, 0, 0, 0) }, 0);
+        assert_eq!(unregistered_host_refusal_count(), before + 1);
+        assert_eq!(
+            unsafe { crate::simd_ops::call_va8_xmm(addr as u64, 41, 0, 0, 0, 0, 0, 0, 0, [0; 4]) },
+            (0, 0)
+        );
+        assert_eq!(unregistered_host_refusal_count(), before + 2);
+
+        // 4. StrictHostThunkGuard turns a refusal into a panic naming the symbol.
+        let panic_res = std::panic::catch_unwind(|| {
+            let _strict = StrictHostThunkGuard::enter();
+            unsafe { call_va8(addr as u64, 41, 0, 0, 0, 0, 0, 0, 0) }
+        });
+        assert!(panic_res.is_err(), "StrictHostThunkGuard must panic on unregistered host __TEXT");
+
+        // 5. Once registered, audit passes and both call_va8 and call_va8_xmm dispatch natively.
+        crate::exe::register_native_va(addr as u64, addr);
+        assert!(win32_rt::audit_guest_callable(addr, "regression_test_site").is_ok());
+        let after_reg = unregistered_host_refusal_count();
+        assert_eq!(unsafe { call_va8(addr as u64, 41, 0, 0, 0, 0, 0, 0, 0) }, 42);
+        assert_eq!(
+            unsafe { crate::simd_ops::call_va8_xmm(addr as u64, 41, 0, 0, 0, 0, 0, 0, 0, [0; 4]).0 },
+            42
+        );
+        assert_eq!(unregistered_host_refusal_count(), after_reg);
+        crate::exe::unregister_native_va(addr as u64);
     }
 }
 
