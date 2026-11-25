@@ -1082,7 +1082,7 @@ impl Tr<'_> {
                     }
                 }
             }
-            K_VAES_RR..=K_VSHA_RM => self.emit_more_op(k, op),
+            K_VAES_RR..=K_MMX_MISC => self.emit_more_op(k, op),
             _ => unreachable!("unsupported op kind {}", op.kind),
         }
     }

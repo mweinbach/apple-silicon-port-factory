@@ -1609,3 +1609,1213 @@ fn bmi_lzcnt_movbe_and_xsave_ymm_across_tiers() {
         }
     });
 }
+
+/// Every single one of the 113 mnemonics across `MMX_ALIASED` (89), `SIMD_LEGACY_FALLBACK` (16),
+/// and `AVX2_GATHER` (8) across all covered operand forms (reg/reg, reg/mem, mem/reg, reg/imm,
+/// Legacy/VEX.128/VEX.256, VSIB base/nobase/scale/a32/gs) must report `InstructionLowering::Arm64`.
+#[test]
+fn slice4_instruction_lowering_all_113_mnemonics_arm64() {
+    use std::collections::BTreeSet;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    // --- 1. MMX_ALIASED (89 mnemonics) ---
+    a.emms().unwrap();
+    a.db(&[0x0f, 0x0e]).unwrap(); // femms
+    a.pshufw(mm0, mm1, 0x1B).unwrap();
+    a.pshufw(mm0, qword_ptr(rcx), 0xE4).unwrap();
+    a.db(&[0x0f, 0xf7, 0xc1]).unwrap(); // maskmovq mm0, mm1 ([rdi])
+    a.db(&[0x67, 0x0f, 0xf7, 0xc1]).unwrap(); // maskmovq mm0, mm1 ([edi])
+    a.movntq(qword_ptr(rcx), mm0).unwrap();
+    a.cvtpi2ps(xmm0, mm1).unwrap();
+    a.cvtpi2ps(xmm0, qword_ptr(rcx)).unwrap();
+    a.cvtpi2pd(xmm0, mm1).unwrap();
+    a.cvtpi2pd(xmm0, qword_ptr(rcx)).unwrap();
+    a.cvtps2pi(mm0, xmm1).unwrap();
+    a.cvtps2pi(mm0, qword_ptr(rcx)).unwrap();
+    a.cvttps2pi(mm0, xmm1).unwrap();
+    a.cvttps2pi(mm0, qword_ptr(rcx)).unwrap();
+    a.cvtpd2pi(mm0, xmm1).unwrap();
+    a.cvtpd2pi(mm0, xmmword_ptr(rcx)).unwrap();
+    a.cvttpd2pi(mm0, xmm1).unwrap();
+    a.cvttpd2pi(mm0, xmmword_ptr(rcx)).unwrap();
+    a.movdq2q(mm0, xmm1).unwrap();
+    a.movq2dq(xmm0, mm1).unwrap();
+    a.movd(mm0, eax).unwrap();
+    a.movd(mm0, dword_ptr(rcx)).unwrap();
+    a.movd(eax, mm0).unwrap();
+    a.movd(dword_ptr(rcx), mm0).unwrap();
+    a.movq(mm0, mm1).unwrap();
+    a.movq(mm0, rax).unwrap();
+    a.movq(mm0, qword_ptr(rcx)).unwrap();
+    a.movq(rax, mm0).unwrap();
+    a.movq(qword_ptr(rcx), mm0).unwrap();
+    a.pinsrw(mm0, eax, 2).unwrap();
+    a.pinsrw(mm0, rax, 3).unwrap();
+    a.pinsrw(mm0, word_ptr(rcx), 1).unwrap();
+    a.pextrw(eax, mm0, 2).unwrap();
+    a.pextrw(rax, mm0, 3).unwrap();
+    a.pmovmskb(eax, mm0).unwrap();
+    a.pmovmskb(rax, mm0).unwrap();
+
+    macro_rules! mm_rm {
+        ($($m:ident),+ $(,)?) => {
+            $(
+                a.$m(mm0, mm1).unwrap();
+                a.$m(mm0, qword_ptr(rcx)).unwrap();
+            )+
+        };
+    }
+    mm_rm!(
+        paddb, paddw, paddd, paddq, psubb, psubw, psubd, psubq, paddsb, paddsw, paddusb, paddusw,
+        psubsb, psubsw, psubusb, psubusw, pmaddwd, pmullw, pmulhw, pmulhuw, pmuludq, pminub,
+        pmaxub, pminsw, pmaxsw, pavgb, pavgw, psadbw, pand, pandn, por, pxor, pcmpeqb, pcmpeqw,
+        pcmpeqd, pcmpgtb, pcmpgtw, pcmpgtd, packsswb, packuswb, packssdw, punpcklbw, punpcklwd,
+        punpckldq, punpckhbw, punpckhwd, punpckhdq, phaddw, phaddd, phaddsw, phsubw, phsubd,
+        phsubsw, pmaddubsw, pmulhrsw, psignb, psignw, psignd, pabsb, pabsw, pabsd, pshufb
+    );
+    macro_rules! mm_shift {
+        ($($m:ident),+ $(,)?) => {
+            $(
+                a.$m(mm0, mm1).unwrap();
+                a.$m(mm0, qword_ptr(rcx)).unwrap();
+                a.$m(mm0, 3).unwrap();
+            )+
+        };
+    }
+    mm_shift!(psllw, pslld, psllq, psrlw, psrld, psrlq, psraw, psrad);
+    a.palignr(mm0, mm1, 3).unwrap();
+    a.palignr(mm0, qword_ptr(rcx), 5).unwrap();
+
+    // --- 2. SIMD_LEGACY_FALLBACK (16 mnemonics) ---
+    a.phaddsw(xmm0, xmm1).unwrap();
+    a.phaddsw(xmm0, xmmword_ptr(rcx)).unwrap();
+    a.vphaddsw(xmm0, xmm1, xmm2).unwrap();
+    a.vphaddsw(xmm0, xmm1, xmmword_ptr(rcx)).unwrap();
+    a.vphaddsw(ymm0, ymm1, ymm2).unwrap();
+    a.vphaddsw(ymm0, ymm1, ymmword_ptr(rcx)).unwrap();
+    a.phsubsw(xmm0, xmm1).unwrap();
+    a.phsubsw(xmm0, xmmword_ptr(rcx)).unwrap();
+    a.vphsubsw(xmm0, xmm1, xmm2).unwrap();
+    a.vphsubsw(xmm0, xmm1, xmmword_ptr(rcx)).unwrap();
+    a.vphsubsw(ymm0, ymm1, ymm2).unwrap();
+    a.vphsubsw(ymm0, ymm1, ymmword_ptr(rcx)).unwrap();
+    a.dppd(xmm0, xmm1, 0x33).unwrap();
+    a.dppd(xmm0, xmmword_ptr(rcx), 0x12).unwrap();
+    a.vdppd(xmm0, xmm1, xmm2, 0x31).unwrap();
+    a.vdppd(xmm0, xmm1, xmmword_ptr(rcx), 0x23).unwrap();
+    a.phminposuw(xmm0, xmm1).unwrap();
+    a.phminposuw(xmm0, xmmword_ptr(rcx)).unwrap();
+    a.vphminposuw(xmm0, xmm1).unwrap();
+    a.vphminposuw(xmm0, xmmword_ptr(rcx)).unwrap();
+    a.mpsadbw(xmm0, xmm1, 0x05).unwrap();
+    a.mpsadbw(xmm0, xmmword_ptr(rcx), 0x02).unwrap();
+    a.vmpsadbw(xmm0, xmm1, xmm2, 0x05).unwrap();
+    a.vmpsadbw(xmm0, xmm1, xmmword_ptr(rcx), 0x02).unwrap();
+    a.vmpsadbw(ymm0, ymm1, ymm2, 0x2D).unwrap();
+    a.vmpsadbw(ymm0, ymm1, ymmword_ptr(rcx), 0x1B).unwrap();
+    // REX.W pcmpestri64 / vpcmpestri64 / pcmpestrm64 / vpcmpestrm64 (reg & mem)
+    a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc1, 0x08]).unwrap(); // pcmpestri64 xmm0, xmm1, 8
+    a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x61, 0x01, 0x08]).unwrap(); // pcmpestri64 xmm0, [rcx], 8
+    a.db(&[0xc4, 0xe3, 0xf9, 0x61, 0xc1, 0x08]).unwrap(); // vpcmpestri64 xmm0, xmm1, 8
+    a.db(&[0xc4, 0xe3, 0xf9, 0x61, 0x01, 0x08]).unwrap(); // vpcmpestri64 xmm0, [rcx], 8
+    a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x60, 0xc1, 0x08]).unwrap(); // pcmpestrm64 xmm0, xmm1, 8
+    a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x60, 0x01, 0x08]).unwrap(); // pcmpestrm64 xmm0, [rcx], 8
+    a.db(&[0xc4, 0xe3, 0xf9, 0x60, 0xc1, 0x08]).unwrap(); // vpcmpestrm64 xmm0, xmm1, 8
+    a.db(&[0xc4, 0xe3, 0xf9, 0x60, 0x01, 0x08]).unwrap(); // vpcmpestrm64 xmm0, [rcx], 8
+    // maskmovdqu / vmaskmovdqu ([rdi] and [edi])
+    a.db(&[0x66, 0x0f, 0xf7, 0xc1]).unwrap();
+    a.db(&[0x67, 0x66, 0x0f, 0xf7, 0xc1]).unwrap();
+    a.db(&[0xc5, 0xf9, 0xf7, 0xc1]).unwrap();
+    a.db(&[0x67, 0xc5, 0xf9, 0xf7, 0xc1]).unwrap();
+
+    // --- 3. AVX2_GATHER (8 mnemonics × 128/256 + VSIB variants) ---
+    a.vpgatherdd_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm2).unwrap();
+    a.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 4 + 16), ymm2).unwrap();
+    a.vpgatherdd_3(xmm0, dword_ptr(xmm1 * 4 + 0x1000), xmm2).unwrap(); // no base
+    a.vpgatherdd_3(xmm0, dword_ptr(edx + xmm1 * 2 - 4), xmm2).unwrap(); // addr32 + neg disp
+    a.vpgatherdd_3(xmm0, dword_ptr(rdx + xmm1 * 1).gs(), xmm2).unwrap(); // gs segment
+    a.vpgatherdq_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm2).unwrap();
+    a.vpgatherdq_3(ymm0, qword_ptr(rdx + xmm1 * 8), ymm2).unwrap();
+    a.vpgatherqd_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm2).unwrap();
+    a.vpgatherqd_3(xmm0, dword_ptr(rdx + ymm1 * 4), xmm2).unwrap();
+    a.vpgatherqq_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm2).unwrap();
+    a.vpgatherqq_3(ymm0, qword_ptr(rdx + ymm1 * 8), ymm2).unwrap();
+    a.vgatherdps_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm2).unwrap();
+    a.vgatherdps_3(ymm0, dword_ptr(rdx + ymm1 * 4), ymm2).unwrap();
+    a.vgatherdpd_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm2).unwrap();
+    a.vgatherdpd_3(ymm0, qword_ptr(rdx + xmm1 * 8), ymm2).unwrap();
+    a.vgatherqps_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm2).unwrap();
+    a.vgatherqps_3(xmm0, dword_ptr(rdx + ymm1 * 4), xmm2).unwrap();
+    a.vgatherqpd_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm2).unwrap();
+    a.vgatherqpd_3(ymm0, qword_ptr(rdx + ymm1 * 8), ymm2).unwrap();
+
+    let bytes = a.assemble(0x1000_0000).unwrap();
+    let mut seen = BTreeSet::new();
+    let mut total = 0usize;
+    let mut dec = Decoder::with_ip(64, &bytes, 0x1000_0000, DecoderOptions::NONE);
+    while dec.can_decode() {
+        let ins = dec.decode();
+        assert_ne!(ins.mnemonic(), Mnemonic::INVALID, "bad encoding at {:#x}", ins.ip());
+        assert_eq!(
+            instruction_lowering(&ins),
+            InstructionLowering::Arm64,
+            "expected Arm64 lowering for `{ins}` ({:?})",
+            ins.mnemonic()
+        );
+        seen.insert(format!("{:?}", ins.mnemonic()).to_ascii_lowercase());
+        total += 1;
+    }
+    assert!(total >= 210, "expected full operand-form sweep, got {total}");
+    let expected: &[&str] = &[
+        // 89 MMX_ALIASED
+        "emms", "femms", "pshufw", "maskmovq", "movntq", "cvtpi2ps", "cvtpi2pd", "cvtps2pi",
+        "cvttps2pi", "cvtpd2pi", "cvttpd2pi", "movdq2q", "movq2dq", "movd", "movq", "pinsrw",
+        "pextrw", "pmovmskb", "paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd",
+        "psubq", "paddsb", "paddsw", "paddusb", "paddusw", "psubsb", "psubsw", "psubusb",
+        "psubusw", "pmaddwd", "pmullw", "pmulhw", "pmulhuw", "pmuludq", "pminub", "pmaxub",
+        "pminsw", "pmaxsw", "pavgb", "pavgw", "psadbw", "pand", "pandn", "por", "pxor", "pcmpeqb",
+        "pcmpeqw", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd", "packsswb", "packuswb", "packssdw",
+        "punpcklbw", "punpcklwd", "punpckldq", "punpckhbw", "punpckhwd", "punpckhdq", "psllw",
+        "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "phaddw", "phaddd",
+        "phaddsw", "phsubw", "phsubd", "phsubsw", "pmaddubsw", "pmulhrsw", "psignb", "psignw",
+        "psignd", "pabsb", "pabsw", "pabsd", "pshufb", "palignr",
+        // 16 SIMD_LEGACY_FALLBACK (phaddsw/phsubsw share mnemonic with MMX above -> 14 new + 2 shared = 16)
+        "vphaddsw", "vphsubsw", "dppd", "vdppd", "phminposuw", "vphminposuw", "mpsadbw",
+        "vmpsadbw", "pcmpestri64", "vpcmpestri64", "pcmpestrm64", "vpcmpestrm64", "maskmovdqu",
+        "vmaskmovdqu",
+        // 8 AVX2_GATHER
+        "vpgatherdd", "vpgatherdq", "vpgatherqd", "vpgatherqq", "vgatherdps", "vgatherdpd",
+        "vgatherqps", "vgatherqpd",
+    ];
+    for &mn in expected {
+        assert!(seen.contains(mn), "missing mnemonic `{mn}` in slice-4 lowering coverage");
+    }
+}
+
+/// Comprehensive translator-vs-interpreter difftest and known-answer vectors for all 89
+/// `MMX_ALIASED` mnemonics (both register and memory forms), x87/MMX physical aliasing,
+/// `emms`/`femms`, `cvtpi2ps/pd` reg-vs-mem mode transitions, and `cvt(t)ps/pd2pi` across all
+/// 4 MXCSR rounding modes.
+#[test]
+fn mmx_all_89_mnemonics_reg_mem_and_x87_aliasing_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Inputs at [rcx + 0..128]:
+    //   +0:  mm_a = 0x8001_7FFF_FFFE_0180
+    //   +8:  mm_b = 0x7F80_8000_0003_FF7F
+    //   +16: shift_cnt_small = 3
+    //   +24: shift_cnt_big   = 65
+    //   +32: shift_cnt_hi32  = 0x0000_0001_0000_0001 (> 2^32, must clamp to >= width!)
+    //   +40: pshufb_ctrl     = 0x80_87_0F_0A_07_04_01_00 (tests bit-7 zeroing & 3-bit index mask)
+    //   +48: mm_m32768       = 0x8000_8000_7FFF_8000 (for pmulhrsw(-32768,-32768) == 0x8000)
+    //   +56: mask_q          = 0x80_00_80_7F_00_80_01_80 (for maskmovq)
+    //   +64: f32[4]          = [1.5, -2.5, 3.0, -4.0]
+    //   +80: f64[2]          = [2.5, -3.5]
+    //   +96: i32[2]          = [-123456, 789012]
+    //   +112: ymm_sentinel (32 bytes at +112..144)
+    // Outputs written sequentially starting at [rcx + 160].
+    let mut out_off: i32 = 160;
+    let store_mm = |a: &mut CodeAssembler, out_off: &mut i32, r: AsmRegisterMm| {
+        a.movq(qword_ptr(rcx + *out_off), r).unwrap();
+        *out_off += 8;
+    };
+
+    // Load baseline inputs
+    a.movq(mm6, qword_ptr(rcx)).unwrap();
+    a.movq(mm7, qword_ptr(rcx + 8)).unwrap();
+
+    // movd (mm<-r32, mm<-m32, r32<-mm, m32<-mm) + movq (mm<-r64, r64<-mm) + movntq
+    a.mov(eax, 0xCAFE_BABEu32 as i32).unwrap();
+    a.movd(mm0, eax).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.movd(mm1, dword_ptr(rcx + 4)).unwrap();
+    store_mm(&mut a, &mut out_off, mm1);
+    a.movd(edx, mm6).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rdx).unwrap();
+    out_off += 8;
+    a.movd(dword_ptr(rcx + out_off), mm7).unwrap();
+    out_off += 8;
+    a.mov(rax, 0x0123_4567_89AB_CDEFu64 as i64).unwrap();
+    a.movq(mm2, rax).unwrap();
+    a.movq(rdx, mm2).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rdx).unwrap();
+    out_off += 8;
+    a.movntq(qword_ptr(rcx + out_off), mm2).unwrap();
+    out_off += 8;
+
+    // movdq2q & movq2dq (verify movq2dq preserves ymm_hi!)
+    a.vmovdqu(ymm5, ymmword_ptr(rcx + 112)).unwrap();
+    a.movq2dq(xmm5, mm6).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + out_off), ymm5).unwrap();
+    out_off += 32;
+    a.movdq2q(mm3, xmm5).unwrap();
+    store_mm(&mut a, &mut out_off, mm3);
+
+    // pinsrw (r32, r64, m16), pextrw (r32, r64), pmovmskb (r32, r64)
+    a.movq(mm0, mm6).unwrap();
+    a.mov(eax, 0xDEAD_1234u32 as i32).unwrap();
+    a.pinsrw(mm0, eax, 1).unwrap();
+    a.mov(rax, 0xBEEF_0000_0000_5678u64 as i64).unwrap();
+    a.pinsrw(mm0, rax, 3).unwrap();
+    a.pinsrw(mm0, word_ptr(rcx + 10), 2).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.pextrw(eax, mm0, 3).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rax).unwrap();
+    out_off += 8;
+    a.pextrw(rdx, mm0, 1).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rdx).unwrap();
+    out_off += 8;
+    a.pmovmskb(eax, mm6).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rax).unwrap();
+    out_off += 8;
+    a.pmovmskb(rdx, mm7).unwrap();
+    a.mov(qword_ptr(rcx + out_off), rdx).unwrap();
+    out_off += 8;
+
+    // pshufw (reg & mem)
+    a.pshufw(mm0, mm6, 0x1B).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.pshufw(mm0, qword_ptr(rcx + 8), 0xB1).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+
+    // Binary MMX ALU, logic, compare, pack, unpack, SSSE3 — BOTH reg/reg AND reg/mem!
+    macro_rules! run_mm_bin {
+        ($($m:ident),+ $(,)?) => {
+            $(
+                a.movq(mm0, mm6).unwrap();
+                a.$m(mm0, mm7).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+                a.movq(mm0, mm6).unwrap();
+                a.$m(mm0, qword_ptr(rcx + 8)).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+            )+
+        };
+    }
+    run_mm_bin!(
+        paddb, paddw, paddd, paddq, psubb, psubw, psubd, psubq, paddsb, paddsw, paddusb, paddusw,
+        psubsb, psubsw, psubusb, psubusw, pmaddwd, pmullw, pmulhw, pmulhuw, pmuludq, pminub,
+        pmaxub, pminsw, pmaxsw, pavgb, pavgw, psadbw, pand, pandn, por, pxor, pcmpeqb, pcmpeqw,
+        pcmpeqd, pcmpgtb, pcmpgtw, pcmpgtd, packsswb, packuswb, packssdw, punpcklbw, punpcklwd,
+        punpckldq, punpckhbw, punpckhwd, punpckhdq, phaddw, phaddd, phaddsw, phsubw, phsubd,
+        phsubsw, pmaddubsw, pmulhrsw, psignb, psignw, psignd
+    );
+
+    // pmulhrsw(-32768, -32768) special rounding overflow edge case -> 0x8000
+    a.movq(mm0, qword_ptr(rcx + 48)).unwrap();
+    a.pmulhrsw(mm0, qword_ptr(rcx + 48)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+
+    // Unary SSSE3 pabsb/pabsw/pabsd (reg & mem)
+    macro_rules! run_mm_un {
+        ($($m:ident),+ $(,)?) => {
+            $(
+                a.$m(mm0, mm6).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+                a.$m(mm0, qword_ptr(rcx + 8)).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+            )+
+        };
+    }
+    run_mm_un!(pabsb, pabsw, pabsd);
+
+    // pshufb (reg & mem) with 3-bit index masking + bit-7 zeroing
+    a.movq(mm4, qword_ptr(rcx + 40)).unwrap();
+    a.movq(mm0, mm6).unwrap();
+    a.pshufb(mm0, mm4).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.movq(mm0, mm7).unwrap();
+    a.pshufb(mm0, qword_ptr(rcx + 40)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+
+    // palignr across all edge immediates (0, 3, 8, 12, 16, 20), reg & mem
+    for &imm in &[0i32, 3, 8, 12, 16, 20] {
+        a.movq(mm0, mm6).unwrap();
+        a.palignr(mm0, mm7, imm).unwrap();
+        store_mm(&mut a, &mut out_off, mm0);
+    }
+    a.movq(mm0, mm6).unwrap();
+    a.palignr(mm0, qword_ptr(rcx + 8), 5).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+
+    // Shifts: imm (0, 3, 65), reg (3, 65, >2^32), mem (3, >2^32)
+    a.movq(mm3, qword_ptr(rcx + 16)).unwrap(); // 3
+    a.movq(mm4, qword_ptr(rcx + 24)).unwrap(); // 65
+    a.movq(mm5, qword_ptr(rcx + 32)).unwrap(); // 2^32 + 1
+    macro_rules! run_mm_shift {
+        ($($m:ident),+ $(,)?) => {
+            $(
+                for &imm in &[0i32, 3, 65] {
+                    a.movq(mm0, mm6).unwrap();
+                    a.$m(mm0, imm).unwrap();
+                    store_mm(&mut a, &mut out_off, mm0);
+                }
+                for cnt in [mm3, mm4, mm5] {
+                    a.movq(mm0, mm6).unwrap();
+                    a.$m(mm0, cnt).unwrap();
+                    store_mm(&mut a, &mut out_off, mm0);
+                }
+                a.movq(mm0, mm6).unwrap();
+                a.$m(mm0, qword_ptr(rcx + 16)).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+                a.movq(mm0, mm6).unwrap();
+                a.$m(mm0, qword_ptr(rcx + 32)).unwrap();
+                store_mm(&mut a, &mut out_off, mm0);
+            )+
+        };
+    }
+    run_mm_shift!(psllw, pslld, psllq, psrlw, psrld, psrlq, psraw, psrad);
+
+    // maskmovq ([rdi] partial mask, and all-zero mask over unmapped 0x100 must NOT fault)
+    let maskmov_off = out_off;
+    a.movq(qword_ptr(rcx + out_off), mm7).unwrap(); // pre-fill sentinel
+    a.lea(rdi, ptr(rcx + out_off)).unwrap();
+    a.movq(mm0, mm6).unwrap();
+    a.movq(mm1, qword_ptr(rcx + 56)).unwrap();
+    a.db(&[0x0f, 0xf7, 0xc1]).unwrap(); // maskmovq mm0, mm1
+    out_off += 8;
+    a.mov(rdi, 0x100u64).unwrap();
+    a.pxor(mm1, mm1).unwrap();
+    a.db(&[0x0f, 0xf7, 0xc1]).unwrap(); // all-zero mask -> no fault
+
+    // cvtpi2ps/pd (reg & mem) — verify cvtpi2ps preserves xmm[127:64] and ymm_hi!
+    let cvt_off = out_off;
+    a.vmovdqu(ymm2, ymmword_ptr(rcx + 112)).unwrap();
+    a.movq(mm0, qword_ptr(rcx + 96)).unwrap();
+    a.cvtpi2ps(xmm2, mm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + out_off), ymm2).unwrap();
+    out_off += 32;
+    a.vmovdqu(ymm2, ymmword_ptr(rcx + 112)).unwrap();
+    a.cvtpi2ps(xmm2, qword_ptr(rcx + 96)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + out_off), ymm2).unwrap();
+    out_off += 32;
+    a.vmovdqu(ymm2, ymmword_ptr(rcx + 112)).unwrap();
+    a.cvtpi2pd(xmm2, mm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + out_off), ymm2).unwrap();
+    out_off += 32;
+    a.vmovdqu(ymm2, ymmword_ptr(rcx + 112)).unwrap();
+    a.cvtpi2pd(xmm2, qword_ptr(rcx + 96)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + out_off), ymm2).unwrap();
+    out_off += 32;
+
+    // cvtps2pi / cvttps2pi / cvtpd2pi / cvttpd2pi (reg & mem)
+    a.movups(xmm3, xmmword_ptr(rcx + 64)).unwrap();
+    a.movupd(xmm4, xmmword_ptr(rcx + 80)).unwrap();
+    a.cvtps2pi(mm0, xmm3).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvtps2pi(mm0, qword_ptr(rcx + 64)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvttps2pi(mm0, xmm3).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvttps2pi(mm0, qword_ptr(rcx + 64)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvtpd2pi(mm0, xmm4).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvtpd2pi(mm0, xmmword_ptr(rcx + 80)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvttpd2pi(mm0, xmm4).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+    a.cvttpd2pi(mm0, xmmword_ptr(rcx + 80)).unwrap();
+    store_mm(&mut a, &mut out_off, mm0);
+
+    a.emms().unwrap();
+    a.db(&[0x0f, 0x0e]).unwrap(); // femms
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let buf_len = (out_off as usize + 64).next_multiple_of(64);
+    let mut init = vec![0u8; buf_len];
+    init[0..8].copy_from_slice(&0x8001_7FFF_FFFE_0180u64.to_le_bytes());
+    init[8..16].copy_from_slice(&0x7F80_8000_0003_FF7Fu64.to_le_bytes());
+    init[16..24].copy_from_slice(&3u64.to_le_bytes());
+    init[24..32].copy_from_slice(&65u64.to_le_bytes());
+    init[32..40].copy_from_slice(&0x0000_0001_0000_0001u64.to_le_bytes());
+    init[40..48].copy_from_slice(&0x8087_0F0A_0704_0100u64.to_le_bytes());
+    init[48..56].copy_from_slice(&0x8000_8000_7FFF_8000u64.to_le_bytes());
+    init[56..64].copy_from_slice(&0x8000_807F_0080_0180u64.to_le_bytes());
+    for (i, v) in [1.5f32, -2.5, 3.0, -4.0].into_iter().enumerate() {
+        init[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for (i, v) in [2.5f64, -3.5].into_iter().enumerate() {
+        init[80 + i * 8..88 + i * 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    init[96..100].copy_from_slice(&(-123456i32).to_le_bytes());
+    init[100..104].copy_from_slice(&789012i32.to_le_bytes());
+    for i in 0..32usize {
+        init[112 + i] = 0xA0 + (i as u8);
+    }
+
+    let mut generic_ref: Option<Vec<u8>> = None;
+    run_tiers(&code, &init, |out| {
+        if let Some(ref g) = generic_ref {
+            assert_eq!(out, g.as_slice(), "MMX tier mismatch against generic interpreter");
+        } else {
+            generic_ref = Some(out.to_vec());
+        }
+        // Spot-check key known-answer invariants:
+        // 1. movq2dq preserved ymm_hi (bytes 16..32 of the 32-byte slot at 160 + 48 = 208)
+        assert_eq!(&out[208..216], &init[0..8]);
+        assert_eq!(&out[216..224], &[0u8; 8]);
+        assert_eq!(&out[224..240], &init[128..144]);
+        // 2. maskmovq wrote only bytes with mask MSB == 1 (bits 7 of 0x80,0x01,0x80,0x00,0x7F,0x80,0x00,0x80)
+        let mm_out = &out[maskmov_off as usize..maskmov_off as usize + 8];
+        for i in 0..8 {
+            let expected = if init[56 + i] & 0x80 != 0 { init[i] } else { init[8 + i] };
+            assert_eq!(mm_out[i], expected, "maskmovq byte {i}");
+        }
+        // 3. cvtpi2ps preserved xmm[127:64] and ymm_hi
+        let c0 = cvt_off as usize;
+        assert_eq!(&out[c0 + 8..c0 + 32], &init[120..144]);
+        assert_eq!(&out[c0 + 32..c0 + 64], &out[c0..c0 + 32]);
+    });
+
+    // --- Architectural X87State physical aliasing & EMMS/FEMMS/CVTPI2P* mode transition checks ---
+    let run_x87_check = |code: &[u8], init: &[u8], init_x87: Option<regfile_ext::X87State>, check: &dyn Fn(regfile_ext::X87State)| {
+        for (name, fast, compiled, cached) in [
+            ("generic", false, false, false),
+            ("FastOp", true, false, false),
+            ("JIT", true, true, false),
+            ("disk AOT", true, true, true),
+        ] {
+            let code_ptr = jit_tests::arena_alloc(code.len() + 16, 16);
+            let data = jit_tests::arena_alloc(init.len().max(64), 64);
+            unsafe {
+                std::ptr::copy_nonoverlapping(code.as_ptr(), code_ptr, code.len());
+                std::ptr::write_bytes(code_ptr.add(code.len()), 0xcc, 16);
+                std::ptr::copy_nonoverlapping(init.as_ptr(), data, init.len());
+            }
+            let fast_off = TEST_FAST_OFF.with(|s| s.replace(!fast));
+            jit::force(if compiled { 1 } else { 2 });
+            if cached {
+                let ips = Decoder::with_ip(64, code, code_ptr as u64, DecoderOptions::NONE)
+                    .into_iter()
+                    .map(|ins| ins.ip())
+                    .collect::<Vec<_>>();
+                assert!(unsafe { aot::test_install(&ips, || {}).0 } > 0, "{name} aot install");
+            }
+            let saved = regfile_ext::x87_snapshot();
+            if let Some(st) = init_x87 {
+                regfile_ext::x87_restore(st);
+            } else {
+                regfile_ext::x87_reset();
+            }
+            unsafe {
+                emu_run_full(code_ptr as u64, [data as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+            }
+            let after = regfile_ext::x87_snapshot();
+            regfile_ext::x87_restore(saved);
+            if cached {
+                aot::test_uninstall();
+            }
+            jit::force(0);
+            TEST_FAST_OFF.with(|s| s.set(fast_off));
+            check(after);
+        }
+    };
+
+    // Case A: writing mm0..mm7 populates X87State::regs[i][0..8], sets exponent 0xFFFF, top=0, valid_mask=0xFF.
+    let mut a_write = CodeAssembler::new(64).unwrap();
+    let mms = [mm0, mm1, mm2, mm3, mm4, mm5, mm6, mm7];
+    for (i, &r) in mms.iter().enumerate() {
+        a_write.movq(r, qword_ptr(rcx + (i as i32) * 8)).unwrap();
+    }
+    a_write.ret().unwrap();
+    let mut w_init = [0u8; 64];
+    for i in 0..8u64 {
+        let v = 0x1111_2222_3333_4440 + i;
+        w_init[(i as usize) * 8..(i as usize) * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    run_x87_check(&a_write.assemble(0).unwrap(), &w_init, None, &|st| {
+        assert_eq!(st.top, 0);
+        assert_eq!(st.valid_mask, 0xFF);
+        for i in 0..8usize {
+            let expected = 0x1111_2222_3333_4440u64 + i as u64;
+            assert_eq!(&st.regs[i][0..8], &expected.to_le_bytes());
+            assert_eq!(&st.regs[i][8..10], &[0xFF, 0xFF]);
+        }
+    });
+
+    // Case B: emms and femms clear valid_mask=0 while preserving regs[0..8].
+    for is_femms in [false, true] {
+        let mut a_emms = CodeAssembler::new(64).unwrap();
+        a_emms.movq(mm3, qword_ptr(rcx)).unwrap();
+        if is_femms {
+            a_emms.db(&[0x0f, 0x0e]).unwrap();
+        } else {
+            a_emms.emms().unwrap();
+        }
+        a_emms.ret().unwrap();
+        run_x87_check(&a_emms.assemble(0).unwrap(), &w_init, None, &|st| {
+            assert_eq!(st.valid_mask, 0);
+            assert_eq!(&st.regs[3][0..8], &0x1111_2222_3333_4440u64.to_le_bytes());
+            assert_eq!(&st.regs[3][8..10], &[0xFF, 0xFF]);
+        });
+    }
+
+    // Case C: cvtpi2ps/cvtpi2pd MEMORY form does NOT transition x87 to MMX mode (preserves top & valid_mask),
+    // whereas REGISTER form DOES set top=0, valid_mask=0xFF.
+    let mut seed_x87 = regfile_ext::X87State::new();
+    seed_x87.top = 5;
+    seed_x87.valid_mask = 0x18;
+    for is_pd in [false, true] {
+        let mut a_mem = CodeAssembler::new(64).unwrap();
+        if is_pd {
+            a_mem.cvtpi2pd(xmm0, qword_ptr(rcx)).unwrap();
+        } else {
+            a_mem.cvtpi2ps(xmm0, qword_ptr(rcx)).unwrap();
+        }
+        a_mem.ret().unwrap();
+        run_x87_check(&a_mem.assemble(0).unwrap(), &w_init, Some(seed_x87), &|st| {
+            assert_eq!(st.top, 5, "cvtpi2p* mem must not alter x87 top");
+            assert_eq!(st.valid_mask, 0x18, "cvtpi2p* mem must not set MMX valid_mask");
+        });
+
+        let mut a_reg = CodeAssembler::new(64).unwrap();
+        if is_pd {
+            a_reg.cvtpi2pd(xmm0, mm2).unwrap();
+        } else {
+            a_reg.cvtpi2ps(xmm0, mm2).unwrap();
+        }
+        a_reg.ret().unwrap();
+        run_x87_check(&a_reg.assemble(0).unwrap(), &w_init, Some(seed_x87), &|st| {
+            assert_eq!(st.top, 0, "cvtpi2p* reg must transition to MMX top=0");
+            assert_eq!(st.valid_mask, 0xFF, "cvtpi2p* reg must set MMX valid_mask=0xFF");
+        });
+    }
+
+    // --- cvt(t)ps/pd2pi across all 4 MXCSR rounding modes & overflow/NaN/Inf edge values ---
+    let mut a_rc = CodeAssembler::new(64).unwrap();
+    a_rc.ldmxcsr(dword_ptr(rcx)).unwrap();
+    // 6 pairs of f32 at [rcx + 16..64], 6 pairs of f64 at [rcx + 64..160]
+    let mut o = 160i32;
+    for i in 0..6i32 {
+        a_rc.movq(xmm0, qword_ptr(rcx + 16 + i * 8)).unwrap();
+        a_rc.cvtps2pi(mm0, xmm0).unwrap();
+        a_rc.movq(qword_ptr(rcx + o), mm0).unwrap();
+        o += 8;
+        a_rc.cvttps2pi(mm1, qword_ptr(rcx + 16 + i * 8)).unwrap();
+        a_rc.movq(qword_ptr(rcx + o), mm1).unwrap();
+        o += 8;
+        a_rc.movupd(xmm1, xmmword_ptr(rcx + 64 + i * 16)).unwrap();
+        a_rc.cvtpd2pi(mm2, xmm1).unwrap();
+        a_rc.movq(qword_ptr(rcx + o), mm2).unwrap();
+        o += 8;
+        a_rc.cvttpd2pi(mm3, xmmword_ptr(rcx + 64 + i * 16)).unwrap();
+        a_rc.movq(qword_ptr(rcx + o), mm3).unwrap();
+        o += 8;
+    }
+    a_rc.emms().unwrap();
+    a_rc.ret().unwrap();
+    let rc_code = a_rc.assemble(0).unwrap();
+    let f32_pairs: [[f32; 2]; 6] = [
+        [1.5, -1.5],
+        [2.5, -2.5],
+        [f32::NAN, f32::INFINITY],
+        [f32::NEG_INFINITY, 2147483648.0],
+        [-2147483648.0, -2147483904.0],
+        [2147483520.0, -0.5],
+    ];
+    let f64_pairs: [[f64; 2]; 6] = [
+        [1.5, -1.5],
+        [2.5, -2.5],
+        [f64::NAN, f64::INFINITY],
+        [f64::NEG_INFINITY, 2147483648.0],
+        [2147483647.9, -2147483648.9],
+        [-2147483648.0, -0.5],
+    ];
+    for rc_bits in [0x0000u32, 0x2000, 0x4000, 0x6000] {
+        let mut rc_init = vec![0u8; (o as usize + 32).next_multiple_of(64)];
+        rc_init[0..4].copy_from_slice(&(0x1F80 | rc_bits).to_le_bytes());
+        for (i, p) in f32_pairs.iter().enumerate() {
+            rc_init[16 + i * 8..20 + i * 8].copy_from_slice(&p[0].to_bits().to_le_bytes());
+            rc_init[20 + i * 8..24 + i * 8].copy_from_slice(&p[1].to_bits().to_le_bytes());
+        }
+        for (i, p) in f64_pairs.iter().enumerate() {
+            rc_init[64 + i * 16..72 + i * 16].copy_from_slice(&p[0].to_bits().to_le_bytes());
+            rc_init[72 + i * 16..80 + i * 16].copy_from_slice(&p[1].to_bits().to_le_bytes());
+        }
+        let mut g_ref: Option<Vec<u8>> = None;
+        run_tiers(&rc_code, &rc_init, |out| {
+            if let Some(ref g) = g_ref {
+                assert_eq!(out, g.as_slice(), "cvt*2pi mismatch for MXCSR rc={rc_bits:#x}");
+            } else {
+                g_ref = Some(out.to_vec());
+            }
+            // NaN & +Inf must produce x86 integer indefinite 0x8000_0000 (pair 2 at off = 160 + 2*32)
+            let p2 = 160 + 2 * 32;
+            for sub in [0, 8, 16, 24] {
+                let lo = i32::from_le_bytes(out[p2 + sub..p2 + sub + 4].try_into().unwrap());
+                let hi = i32::from_le_bytes(out[p2 + sub + 4..p2 + sub + 8].try_into().unwrap());
+                assert_eq!((lo, hi), (i32::MIN, i32::MIN), "NaN/Inf indefinite rc={rc_bits:#x} sub={sub}");
+            }
+        });
+    }
+}
+
+/// Comprehensive translator-vs-interpreter difftest and known-answer vectors for all 16
+/// `SIMD_LEGACY_FALLBACK` mnemonics: `(v)phaddsw`, `(v)phsubsw`, `(v)phminposuw`,
+/// `(v)mpsadbw` (128 & 256), `(v)dppd` (all masks, rounding modes, NaN suppression & tiebreak),
+/// `(v)pcmpestri64`/`(v)pcmpestrm64` (REX.W 64-bit lengths & flags), and `(v)maskmovdqu`.
+#[test]
+fn simd_legacy_stragglers_all_16_mnemonics_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Inputs at [rcx + 0..256]:
+    //   +0..32:   y_a (16x i16 incl. saturation edges i16::MAX/MIN)
+    //   +32..64:  y_b (16x i16)
+    //   +64..80:  minpos_a (ties at lanes 2 and 5)
+    //   +80..96:  minpos_b (all 0xFFFF except lane 7)
+    //   +96..128: dppd_a (f64 pairs)
+    //   +128..160: dppd_b (f64 pairs, lane 1 has SNaN/Inf for mask-off test)
+    //   +160..176: str_a (for pcmpestr*64)
+    //   +176..192: str_b (for pcmpestr*64)
+    //   +192..208: maskmov_mask (16B)
+    //   +208..240: ymm_sentinel (32B)
+    let mut o = 256i32;
+
+    // 1. (v)phaddsw / (v)phsubsw (Legacy, VEX.128, VEX.256, reg & mem)
+    a.vmovdqu(ymm4, ymmword_ptr(rcx)).unwrap();
+    a.vmovdqu(ymm5, ymmword_ptr(rcx + 32)).unwrap();
+
+    // Legacy phaddsw preserves ymm_hi
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.phaddsw(xmm0, xmm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    let phaddsw_leg_off = o;
+    o += 32;
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.phaddsw(xmm0, xmmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    // VEX.128 zeroes ymm_hi
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.vphaddsw(xmm0, xmm4, xmm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    let phaddsw_v128_off = o;
+    o += 32;
+    a.vphaddsw(xmm0, xmm4, xmmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    // VEX.256
+    a.vphaddsw(ymm0, ymm4, ymm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphaddsw(ymm0, ymm4, ymmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+
+    // phsubsw / vphsubsw
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.phsubsw(xmm0, xmm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.phsubsw(xmm0, xmmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphsubsw(xmm0, xmm4, xmm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphsubsw(xmm0, xmm4, xmmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphsubsw(ymm0, ymm4, ymm5).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphsubsw(ymm0, ymm4, ymmword_ptr(rcx + 32)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+
+    // 2. (v)phminposuw (Legacy & VEX.128, reg & mem, ties & lane 7)
+    let minpos_off = o;
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.movdqu(xmm1, xmmword_ptr(rcx + 64)).unwrap();
+    a.phminposuw(xmm0, xmm1).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.phminposuw(xmm0, xmmword_ptr(rcx + 80)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.vphminposuw(xmm0, xmm1).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vphminposuw(xmm0, xmmword_ptr(rcx + 80)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+
+    // 3. (v)mpsadbw (Legacy, VEX.128, VEX.256 with distinct lo imm[2:0] and hi imm[5:3], reg & mem)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 208)).unwrap();
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.mpsadbw(xmm0, xmm5, 0x05).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.movdqu(xmm0, xmm4).unwrap();
+    a.mpsadbw(xmm0, xmmword_ptr(rcx + 32), 0x06).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmpsadbw(xmm0, xmm4, xmm5, 0x05).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmpsadbw(xmm0, xmm4, xmmword_ptr(rcx + 32), 0x06).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmpsadbw(ymm0, ymm4, ymm5, 0x2D).unwrap(); // lo=5 (a+4, b+4), hi=5 (a+4, b+4)
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmpsadbw(ymm0, ymm4, ymmword_ptr(rcx + 32), 0x1B).unwrap(); // lo=3, hi=3
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+    a.vmpsadbw(ymm0, ymm4, ymm5, 0x3A).unwrap(); // distinct lo=2 vs hi=7!
+    a.vmovdqu(ymmword_ptr(rcx + o), ymm0).unwrap();
+    o += 32;
+
+    // 4. (v)dppd across all mask combinations + masked-off SNaN/Inf suppression + dual-NaN tiebreak
+    let dppd_off = o;
+    a.movupd(xmm2, xmmword_ptr(rcx + 96)).unwrap();
+    a.movupd(xmm3, xmmword_ptr(rcx + 128)).unwrap();
+    for &imm in &[0x00i32, 0x03, 0x11, 0x12, 0x21, 0x23, 0x31, 0x32, 0x33] {
+        a.movupd(xmm0, xmm2).unwrap();
+        a.dppd(xmm0, xmm3, imm).unwrap();
+        a.movupd(xmmword_ptr(rcx + o), xmm0).unwrap();
+        o += 16;
+        a.vdppd(xmm0, xmm2, xmmword_ptr(rcx + 128), imm).unwrap();
+        a.movupd(xmmword_ptr(rcx + o), xmm0).unwrap();
+        o += 16;
+    }
+    // Masked-off lane 1 has SNaN * Inf; imm=0x11 must NOT produce NaN!
+    let dppd_nan_off = o;
+    a.movupd(xmm2, xmmword_ptr(rcx + 112)).unwrap();
+    a.movupd(xmm3, xmmword_ptr(rcx + 144)).unwrap();
+    a.vdppd(xmm0, xmm2, xmm3, 0x11).unwrap();
+    a.movupd(xmmword_ptr(rcx + o), xmm0).unwrap();
+    o += 16;
+    // Both lanes active with dual NaN in lane 1 -> first-operand quieted NaN priority
+    a.vdppd(xmm0, xmm2, xmm3, 0x33).unwrap();
+    a.movupd(xmmword_ptr(rcx + o), xmm0).unwrap();
+    o += 16;
+
+    // 5. REX.W pcmpestri64 / vpcmpestri64 / pcmpestrm64 / vpcmpestrm64 (64-bit RAX/RDX lengths)
+    // Use r11 = rcx as buffer base because pcmpestri64 writes its index result into ECX/RCX.
+    a.mov(r11, rcx).unwrap();
+    a.movdqu(xmm1, xmmword_ptr(r11 + 160)).unwrap();
+    a.movdqu(xmm2, xmmword_ptr(r11 + 176)).unwrap();
+    // Use RAX/RDX with non-zero upper 32 bits (0x1_0000_0004 -> clamped to max_len=16, NOT 4!),
+    // negative i64 (-5 -> abs=5), and i64::MIN (clamped to max_len).
+    let pcmp_off = o;
+    for &(len_a, len_d, imm8) in &[
+        (0x0000_0001_0000_0004u64, 0x0000_0000_0000_0008u64, 0x08u8),
+        ((-5i64) as u64, 10u64, 0x0Cu8),
+        (i64::MIN as u64, (-3i64) as u64, 0x01u8),
+        (4u64, 6u64, 0x14u8),
+        (4u64, 6u64, 0x60u8),
+    ] {
+        // Legacy pcmpestri64 (reg)
+        a.mov(rax, len_a as i64).unwrap();
+        a.mov(rdx, len_d as i64).unwrap();
+        a.movdqu(xmm0, xmm1).unwrap();
+        a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x61, 0xc2, imm8]).unwrap(); // pcmpestri64 xmm0, xmm2, imm8
+        a.pushfq().unwrap();
+        a.pop(r8).unwrap();
+        a.and(r8, 0x8D5).unwrap();
+        a.mov(qword_ptr(r11 + o), rcx).unwrap();
+        a.mov(qword_ptr(r11 + o + 8), r8).unwrap();
+        o += 16;
+
+        // VEX vpcmpestri64 (mem: [r11 + 176] -> ModRM with r11 needs REX.B=1 / VEX.B=0)
+        a.mov(rax, len_a as i64).unwrap();
+        a.mov(rdx, len_d as i64).unwrap();
+        a.lea(r9, ptr(r11 + 176)).unwrap();
+        a.movdqu(xmm0, xmm1).unwrap();
+        // vpcmpestri64 xmm0, [rsi], imm8 (use rsi so VEX.B=1 cleanly)
+        a.mov(rsi, r9).unwrap();
+        a.db(&[0xc4, 0xe3, 0xf9, 0x61, 0x06, imm8]).unwrap();
+        a.pushfq().unwrap();
+        a.pop(r8).unwrap();
+        a.and(r8, 0x8D5).unwrap();
+        a.mov(qword_ptr(r11 + o), rcx).unwrap();
+        a.mov(qword_ptr(r11 + o + 8), r8).unwrap();
+        o += 16;
+
+        // Legacy pcmpestrm64 (reg) — preserves ymm0[255:128]
+        a.mov(rax, len_a as i64).unwrap();
+        a.mov(rdx, len_d as i64).unwrap();
+        a.vmovdqu(ymm0, ymmword_ptr(r11 + 208)).unwrap();
+        a.movdqu(xmm0, xmm1).unwrap();
+        a.db(&[0x66, 0x48, 0x0f, 0x3a, 0x60, 0xc2, imm8]).unwrap();
+        a.pushfq().unwrap();
+        a.pop(r8).unwrap();
+        a.and(r8, 0x8D5).unwrap();
+        a.vmovdqu(ymmword_ptr(r11 + o), ymm0).unwrap();
+        a.mov(qword_ptr(r11 + o + 32), r8).unwrap();
+        o += 48;
+
+        // VEX vpcmpestrm64 (mem: [rsi]) — zeroes ymm0[255:128]
+        a.mov(rax, len_a as i64).unwrap();
+        a.mov(rdx, len_d as i64).unwrap();
+        a.vmovdqu(ymm0, ymmword_ptr(r11 + 208)).unwrap();
+        a.movdqu(xmm0, xmm1).unwrap();
+        a.db(&[0xc4, 0xe3, 0xf9, 0x60, 0x06, imm8]).unwrap();
+        a.pushfq().unwrap();
+        a.pop(r8).unwrap();
+        a.and(r8, 0x8D5).unwrap();
+        a.vmovdqu(ymmword_ptr(r11 + o), ymm0).unwrap();
+        a.mov(qword_ptr(r11 + o + 32), r8).unwrap();
+        o += 48;
+    }
+
+    // 6. (v)maskmovdqu (Legacy & VEX, partial mask + all-zero mask over unmapped 0x100)
+    let maskmovdqu_off = o;
+    a.movdqu(xmm0, xmmword_ptr(r11)).unwrap();
+    a.movdqu(xmm1, xmmword_ptr(r11 + 192)).unwrap();
+    a.movdqu(xmm2, xmmword_ptr(r11 + 32)).unwrap();
+    a.movdqu(xmmword_ptr(r11 + o), xmm2).unwrap();
+    a.lea(rdi, ptr(r11 + o)).unwrap();
+    a.db(&[0x66, 0x0f, 0xf7, 0xc1]).unwrap(); // maskmovdqu xmm0, xmm1
+    o += 16;
+    a.movdqu(xmmword_ptr(r11 + o), xmm2).unwrap();
+    a.lea(rdi, ptr(r11 + o)).unwrap();
+    a.db(&[0xc5, 0xf9, 0xf7, 0xc1]).unwrap(); // vmaskmovdqu xmm0, xmm1
+    o += 16;
+    // All-zero mask over unmapped 0x100 must NOT fault
+    a.mov(rdi, 0x100u64).unwrap();
+    a.vpxor(xmm1, xmm1, xmm1).unwrap();
+    a.db(&[0x66, 0x0f, 0xf7, 0xc1]).unwrap();
+    a.db(&[0xc5, 0xf9, 0xf7, 0xc1]).unwrap();
+
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let buf_len = (o as usize + 64).next_multiple_of(64);
+    let mut init = vec![0u8; buf_len];
+    let ya: [i16; 16] = [
+        30000, 10000, -30000, -10000, i16::MIN, i16::MAX, 100, -200, 32767, 1, -32768, -1, 500,
+        600, -700, 800,
+    ];
+    let yb: [i16; 16] = [
+        -32768, 100, 32767, -100, 20000, 20000, -20000, -20000, 10, 20, 30, 40, -10, -20, -30, -40,
+    ];
+    for i in 0..16 {
+        init[i * 2..i * 2 + 2].copy_from_slice(&ya[i].to_le_bytes());
+        init[32 + i * 2..34 + i * 2].copy_from_slice(&yb[i].to_le_bytes());
+    }
+    let mp_a: [u16; 8] = [500, 200, 42, 999, 100, 42, 77, 1000];
+    let mp_b: [u16; 8] = [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFE];
+    for i in 0..8 {
+        init[64 + i * 2..66 + i * 2].copy_from_slice(&mp_a[i].to_le_bytes());
+        init[80 + i * 2..82 + i * 2].copy_from_slice(&mp_b[i].to_le_bytes());
+    }
+    // dppd_a (+96..112) & dppd_b (+128..144): normal values + signed-zero test
+    init[96..104].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
+    init[104..112].copy_from_slice(&(-2.25f64).to_bits().to_le_bytes());
+    init[128..136].copy_from_slice(&4.0f64.to_bits().to_le_bytes());
+    init[136..144].copy_from_slice(&(-3.0f64).to_bits().to_le_bytes());
+    // dppd_nan_a (+112..128) & dppd_nan_b (+144..160): lane 0 = 2.0 * 3.0, lane 1 = SNaN1 * QNaN2
+    init[112..120].copy_from_slice(&2.0f64.to_bits().to_le_bytes());
+    init[120..128].copy_from_slice(&0x7FF0_0000_0000_1234u64.to_le_bytes()); // SNaN1
+    init[144..152].copy_from_slice(&3.0f64.to_bits().to_le_bytes());
+    init[152..160].copy_from_slice(&0xFFF8_0000_0000_5678u64.to_le_bytes()); // QNaN2
+    // str_a / str_b for pcmpestr*64
+    init[160..176].copy_from_slice(b"hello_world_1234");
+    init[176..192].copy_from_slice(b"helo!_world_5678");
+    // maskmov_mask (16B)
+    init[192..208].copy_from_slice(&[
+        0x80, 0x00, 0xFF, 0x7F, 0x01, 0x81, 0x00, 0x80, 0x7E, 0x80, 0x00, 0x00, 0xFE, 0x7F, 0x80,
+        0x00,
+    ]);
+    for i in 0..32usize {
+        init[208 + i] = 0xC0 + (i as u8);
+    }
+
+    let mut generic_ref: Option<Vec<u8>> = None;
+    run_tiers(&code, &init, |out| {
+        if let Some(ref g) = generic_ref {
+            assert_eq!(out, g.as_slice(), "legacy SIMD straggler tier mismatch");
+        } else {
+            generic_ref = Some(out.to_vec());
+        }
+        // Legacy phaddsw preserves ymm_hi; VEX.128 zeroes ymm_hi
+        assert_eq!(&out[phaddsw_leg_off as usize + 16..phaddsw_leg_off as usize + 32], &init[224..240]);
+        assert_eq!(&out[phaddsw_v128_off as usize + 16..phaddsw_v128_off as usize + 32], &[0u8; 16]);
+        // phminposuw tiebreak: min=42 at lowest index 2; upper 96b zero
+        let mp0 = minpos_off as usize;
+        assert_eq!(u16::from_le_bytes(out[mp0..mp0 + 2].try_into().unwrap()), 42);
+        assert_eq!(u16::from_le_bytes(out[mp0 + 2..mp0 + 4].try_into().unwrap()), 2);
+        assert_eq!(&out[mp0 + 4..mp0 + 16], &[0u8; 12]);
+        // phminposuw lane 7: min=0xFFFE at index 7
+        let mp1 = mp0 + 32;
+        assert_eq!(u16::from_le_bytes(out[mp1..mp1 + 2].try_into().unwrap()), 0xFFFE);
+        assert_eq!(u16::from_le_bytes(out[mp1 + 2..mp1 + 4].try_into().unwrap()), 7);
+        // dppd masked-off SNaN does NOT leak NaN: lane 0 = 2.0 * 3.0 = 6.0, lane 1 = 0.0
+        let dn = dppd_nan_off as usize;
+        assert_eq!(u64::from_le_bytes(out[dn..dn + 8].try_into().unwrap()), 6.0f64.to_bits());
+        assert_eq!(u64::from_le_bytes(out[dn + 8..dn + 16].try_into().unwrap()), 0u64);
+        // dppd dual-NaN: first operand SNaN1 quieted (bit 51 set -> 0x7FF8_0000_0000_1234)
+        assert_eq!(
+            u64::from_le_bytes(out[dn + 16..dn + 24].try_into().unwrap()),
+            0x7FF8_0000_0000_1234
+        );
+        // pcmpestrm64 Legacy preserves ymm_hi vs VEX zeroes ymm_hi (first case at pcmp_off + 32 / +80)
+        let pm_leg = pcmp_off as usize + 32;
+        let pm_vex = pcmp_off as usize + 80;
+        assert_eq!(&out[pm_leg + 16..pm_leg + 32], &init[224..240]);
+        assert_eq!(&out[pm_vex + 16..pm_vex + 32], &[0u8; 16]);
+        // (v)maskmovdqu wrote exact masked bytes
+        for base in [maskmovdqu_off as usize, maskmovdqu_off as usize + 16] {
+            for i in 0..16 {
+                let exp = if init[192 + i] & 0x80 != 0 { init[i] } else { init[32 + i] };
+                assert_eq!(out[base + i], exp, "maskmovdqu byte {i}");
+            }
+        }
+        let _ = dppd_off;
+    });
+
+    // DPPD intermediate rounding & signed-zero test under all 4 MXCSR rounding modes
+    let mut a_dp = CodeAssembler::new(64).unwrap();
+    a_dp.ldmxcsr(dword_ptr(rcx)).unwrap();
+    a_dp.movupd(xmm0, xmmword_ptr(rcx + 16)).unwrap();
+    a_dp.movupd(xmm1, xmmword_ptr(rcx + 32)).unwrap();
+    a_dp.vdppd(xmm2, xmm0, xmm1, 0x33).unwrap();
+    a_dp.movupd(xmmword_ptr(rcx + 48), xmm2).unwrap();
+    a_dp.vdppd(xmm2, xmm0, xmm1, 0x11).unwrap();
+    a_dp.movupd(xmmword_ptr(rcx + 64), xmm2).unwrap();
+    a_dp.vdppd(xmm2, xmm0, xmm1, 0x22).unwrap();
+    a_dp.movupd(xmmword_ptr(rcx + 80), xmm2).unwrap();
+    a_dp.ret().unwrap();
+    let dp_code = a_dp.assemble(0).unwrap();
+    for rc_bits in [0x0000u32, 0x2000, 0x4000, 0x6000] {
+        let mut dp_init = [0u8; 96];
+        dp_init[0..4].copy_from_slice(&(0x1F80 | rc_bits).to_le_bytes());
+        // (-0.0 * 1.0) + (+0.0 * 1.0) -> tests signed-zero under RM (-0.0) vs RN/RP/RZ (+0.0)
+        // Plus lane 0 = (1.0 + 2^-52) * (1.0 + 2^-52) when swapped in a second pass
+        dp_init[16..24].copy_from_slice(&(-0.0f64).to_bits().to_le_bytes());
+        dp_init[24..32].copy_from_slice(&(1.0f64 + f64::EPSILON).to_bits().to_le_bytes());
+        dp_init[32..40].copy_from_slice(&1.0f64.to_bits().to_le_bytes());
+        dp_init[40..48].copy_from_slice(&(-1.0f64 - f64::EPSILON).to_bits().to_le_bytes());
+        let mut g_ref: Option<Vec<u8>> = None;
+        run_tiers(&dp_code, &dp_init, |out| {
+            if let Some(ref g) = g_ref {
+                assert_eq!(out, g.as_slice(), "dppd rounding mismatch rc={rc_bits:#x}");
+            } else {
+                g_ref = Some(out.to_vec());
+            }
+        });
+    }
+}
+
+/// AVX2 gather fault, partial-completion, restartable-state, `#UD` alias, and VSIB addressing
+/// tests across FastOp and Live JIT ARM64 translation.
+#[test]
+fn avx2_gather_jit_and_aot_partial_fault_restart_and_ud() {
+    use super::jit::JitCache;
+
+    // Helper: step one gather block through either FastOp (`use_jit = false`) or Live JIT
+    // (`use_jit = true`). In JIT mode, a faulting lane side-exits back to `cpu.rip` with all
+    // earlier lanes already committed & masked off; we then run the FastOp at `cpu.rip` to
+    // verify the fault address is delivered via `FAULT_PENDING` without re-reading completed lanes.
+    let mut g = CodeAssembler::new(64).unwrap();
+    g.vpgatherqq_3(xmm0, qword_ptr(rcx + xmm1 * 1), xmm2).unwrap();
+    g.ret().unwrap();
+    let code_qq = g.assemble(0).unwrap();
+
+    let mut gqq256 = CodeAssembler::new(64).unwrap();
+    gqq256.vpgatherqq_3(ymm0, qword_ptr(rcx + ymm1 * 1), ymm2).unwrap();
+    gqq256.ret().unwrap();
+    let code_qq256 = gqq256.assemble(0).unwrap();
+
+    let mut jc = Box::new(JitCache::new());
+    let mut bc = Box::new(BlockCache::new());
+
+    for (tier_name, use_jit) in [("FastOp", false), ("JIT", true)] {
+        // --- 1. 128-bit vpgatherqq: lane 0 valid, lane 1 unmapped (0x1000) ---
+        let code_ptr = jit_tests::arena_alloc(code_qq.len() + 16, 16);
+        let tbl_ptr = jit_tests::arena_alloc(64, 16) as *mut u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(code_qq.as_ptr(), code_ptr, code_qq.len());
+            std::ptr::write_bytes(code_ptr.add(code_qq.len()), 0xcc, 16);
+            *tbl_ptr.add(0) = 0x1122_3344_5566_7788;
+            *tbl_ptr.add(1) = 0xAABB_CCDD_EEFF_0011;
+        }
+        let ins_qq = Decoder::with_ip(64, &code_qq, code_ptr as u64, DecoderOptions::NONE).decode();
+        let fop_qq = fast::lower(&ins_qq);
+        assert_eq!(fop_qq.kind, fast::K_VGATHER);
+        let jit_code_qq = if use_jit {
+            Some(unsafe { jc.compile_single_for_verify(code_ptr as u64, &mut *bc) }.expect("compile vpgatherqq"))
+        } else {
+            None
+        };
+        let mut cpu = Cpu::new_zeroed();
+        let stack = jit_tests::arena_alloc(4096, 16);
+        let guest_sp = stack as u64 + 4088;
+        unsafe { (guest_sp as *mut u64).write(RET_SENTINEL) };
+        cpu.gpr[4] = guest_sp;
+        cpu.gpr[1] = 0; // rcx = 0 (indices hold full 64-bit addresses)
+        cpu.rip = code_ptr as u64;
+        cpu.xmm[0] = 0x9999_9999_8888_8888_7777_7777_6666_6666u128;
+        cpu.xmm[1] = (tbl_ptr as u64 as u128) | (0x1000u128 << 64);
+        cpu.xmm[2] = (1u128 << 63) | (1u128 << 127);
+        FAULT_PENDING.with(|p| p.set(None));
+        if let Some(jc_addr) = jit_code_qq {
+            let (ex, _) = unsafe { jc.run_code_for_verify(&mut cpu, &mut *bc, None, jc_addr, 64) };
+            assert_eq!(ex, jit::EXIT_SIDE, "{tier_name}: lane 1 fault must side-exit");
+            assert_eq!(cpu.rip, code_ptr as u64, "{tier_name}: RIP must point at faulting gather");
+            // Prove the ARM64 JIT itself already committed lane 0 & cleared lane 0's mask BEFORE side-exit!
+            assert_eq!(cpu.xmm[0] as u64, 0x1122_3344_5566_7788, "{tier_name}: JIT lane 0 committed");
+            assert_eq!((cpu.xmm[0] >> 64) as u64, 0x9999_9999_8888_8888, "{tier_name}: JIT lane 1 untouched");
+            assert_eq!(cpu.xmm[2] as u64, 0, "{tier_name}: JIT lane 0 mask cleared");
+            assert_eq!((cpu.xmm[2] >> 64) as u64, 1u64 << 63, "{tier_name}: JIT lane 1 mask preserved");
+            // Poison tbl[0] BEFORE the interpreter handles the side-exited op: lane 0 must NOT be re-read!
+            unsafe { *tbl_ptr.add(0) = 0xDEAD_DEAD_DEAD_DEAD };
+            cpu.jx.ctx_sp = 0; // direct FastOp fault check via FAULT_PENDING
+        }
+        unsafe { fast::exec(&mut cpu, &fop_qq) };
+        assert_eq!(
+            FAULT_PENDING.with(|p| p.take()),
+            Some((0x1000, false)),
+            "{tier_name}: vpgatherqq lane 1 must fault at 0x1000"
+        );
+        assert_eq!(cpu.xmm[0] as u64, 0x1122_3344_5566_7788, "{tier_name}: lane 0 committed");
+        assert_eq!((cpu.xmm[0] >> 64) as u64, 0x9999_9999_8888_8888, "{tier_name}: lane 1 untouched");
+        assert_eq!(cpu.xmm[2] as u64, 0, "{tier_name}: lane 0 mask cleared");
+        assert_eq!((cpu.xmm[2] >> 64) as u64, 1u64 << 63, "{tier_name}: lane 1 mask preserved");
+
+        // Poison tbl[0], repair lane 1 index -> &tbl[1], and restart the exact same gather!
+        unsafe { *tbl_ptr.add(0) = 0xDEAD_DEAD_DEAD_DEAD };
+        cpu.xmm[1] = (tbl_ptr as u64 as u128) | ((unsafe { tbl_ptr.add(1) } as u64 as u128) << 64);
+        if let Some(jc_addr) = jit_code_qq {
+            let (ex, _) = unsafe { jc.run_code_for_verify(&mut cpu, &mut *bc, None, jc_addr, 64) };
+            assert_ne!(ex, jit::EXIT_SIDE, "{tier_name}: restarted gather must complete cleanly");
+        } else {
+            unsafe { fast::exec(&mut cpu, &fop_qq) };
+        }
+        assert_eq!(FAULT_PENDING.with(|p| p.take()), None, "{tier_name}: restart must not fault");
+        assert_eq!(
+            cpu.xmm[0] as u64, 0x1122_3344_5566_7788,
+            "{tier_name}: restarted gather must NOT re-read already-completed lane 0"
+        );
+        assert_eq!((cpu.xmm[0] >> 64) as u64, 0xAABB_CCDD_EEFF_0011, "{tier_name}: lane 1 loaded");
+        assert_eq!(cpu.xmm[2], 0, "{tier_name}: mask zeroed on completion");
+        assert_eq!(cpu.ymm_hi[2], 0, "{tier_name}: mask ymm_hi zeroed on completion");
+
+        // --- 2. 256-bit vpgatherqq faulting in upper 128-bit half (lane 2 of 4) ---
+        let code_ptr2 = jit_tests::arena_alloc(code_qq256.len() + 16, 16);
+        let tbl = jit_tests::arena_alloc(64, 16) as *mut u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(code_qq256.as_ptr(), code_ptr2, code_qq256.len());
+            std::ptr::write_bytes(code_ptr2.add(code_qq256.len()), 0xcc, 16);
+            for i in 0..4u64 {
+                *tbl.add(i as usize) = 0xCAFE_0000_0000_0000 + i;
+            }
+        }
+        let ins_qq256 = Decoder::with_ip(64, &code_qq256, code_ptr2 as u64, DecoderOptions::NONE).decode();
+        let fop_qq256 = fast::lower(&ins_qq256);
+        assert_eq!(fop_qq256.kind, fast::K_VGATHER);
+        let jit_code_qq256 = if use_jit {
+            Some(unsafe { jc.compile_single_for_verify(code_ptr2 as u64, &mut *bc) }.expect("compile vpgatherqq256"))
+        } else {
+            None
+        };
+        let mut cpu = Cpu::new_zeroed();
+        let guest_sp2 = stack as u64 + 4088;
+        unsafe { (guest_sp2 as *mut u64).write(RET_SENTINEL) };
+        cpu.gpr[4] = guest_sp2;
+        cpu.gpr[1] = 0;
+        cpu.rip = code_ptr2 as u64;
+        cpu.xmm[0] = 0x1111_1111_1111_1111_2222_2222_2222_2222u128;
+        cpu.ymm_hi[0] = 0x3333_3333_3333_3333_4444_4444_4444_4444u128;
+        // Lane 0: valid, Lane 1: masked off, Lane 2 (ymm_hi lo): 0x1000 FAULT, Lane 3: valid
+        cpu.xmm[1] = (tbl as u64 as u128) | (0x2000u128 << 64);
+        cpu.ymm_hi[1] = 0x1000u128 | ((unsafe { tbl.add(3) } as u64 as u128) << 64);
+        cpu.xmm[2] = 1u128 << 63; // lane 0 active, lane 1 masked off
+        cpu.ymm_hi[2] = (1u128 << 63) | (1u128 << 127); // lanes 2 & 3 active
+        FAULT_PENDING.with(|p| p.set(None));
+        if let Some(jc_addr) = jit_code_qq256 {
+            let (ex, _) = unsafe { jc.run_code_for_verify(&mut cpu, &mut *bc, None, jc_addr, 64) };
+            assert_eq!(ex, jit::EXIT_SIDE, "{tier_name}: ymm lane 2 must side-exit");
+            assert_eq!(cpu.rip, code_ptr2 as u64);
+            assert_eq!(cpu.xmm[0] as u64, 0xCAFE_0000_0000_0000, "{tier_name}: JIT ymm lane 0 committed");
+            assert_eq!((cpu.xmm[0] >> 64) as u64, 0x1111_1111_1111_1111, "{tier_name}: JIT masked lane 1 preserved");
+            assert_eq!(cpu.ymm_hi[0] as u64, 0x4444_4444_4444_4444, "{tier_name}: JIT faulting lane 2 untouched");
+            assert_eq!(cpu.xmm[2], 0, "{tier_name}: JIT lanes 0..1 masks cleared");
+            assert_eq!(cpu.ymm_hi[2], (1u128 << 63) | (1u128 << 127), "{tier_name}: JIT lanes 2..3 masks preserved");
+            unsafe { *tbl.add(0) = 0xBAD0_BAD0_BAD0_BAD0 };
+            cpu.jx.ctx_sp = 0; // direct FastOp fault check via FAULT_PENDING
+        }
+        unsafe { fast::exec(&mut cpu, &fop_qq256) };
+        assert_eq!(FAULT_PENDING.with(|p| p.take()), Some((0x1000, false)), "{tier_name}: ymm lane 2 fault");
+        // Fix lane 2 and poison lane 0, then restart!
+        unsafe { *tbl.add(0) = 0xBAD0_BAD0_BAD0_BAD0 };
+        cpu.ymm_hi[1] = (unsafe { tbl.add(2) } as u64 as u128) | ((unsafe { tbl.add(3) } as u64 as u128) << 64);
+        if let Some(jc_addr) = jit_code_qq256 {
+            let (ex, _) = unsafe { jc.run_code_for_verify(&mut cpu, &mut *bc, None, jc_addr, 64) };
+            assert_ne!(ex, jit::EXIT_SIDE);
+        } else {
+            unsafe { fast::exec(&mut cpu, &fop_qq256) };
+        }
+        assert_eq!(FAULT_PENDING.with(|p| p.take()), None);
+        assert_eq!(cpu.xmm[0] as u64, 0xCAFE_0000_0000_0000);
+        assert_eq!(cpu.ymm_hi[0] as u64, 0xCAFE_0000_0000_0002);
+        assert_eq!((cpu.ymm_hi[0] >> 64) as u64, 0xCAFE_0000_0000_0003);
+        assert_eq!(cpu.xmm[2], 0);
+        assert_eq!(cpu.ymm_hi[2], 0);
+    }
+
+    // Part 2: #UD alias check directly in FastOp (`d==m`, `d==v`, `m==v`)
+    let table32 = [0x1122_3344u32, 0x5566_7788];
+    for &(dst, idx, msk) in &[(xmm0, xmm1, xmm0), (xmm0, xmm0, xmm2), (xmm0, xmm1, xmm1)] {
+        let mut ga = CodeAssembler::new(64).unwrap();
+        ga.vpgatherdd_3(dst, dword_ptr(rcx + idx * 4), msk).unwrap();
+        let bytes = ga.assemble(0x2000).unwrap();
+        let ins = Decoder::with_ip(64, &bytes, 0x2000, DecoderOptions::NO_INVALID_CHECK).decode();
+        let fop = fast::lower(&ins);
+        assert_eq!(fop.kind, fast::K_VGATHER);
+        let mut cpu = Cpu::new_zeroed();
+        cpu.gpr[1] = table32.as_ptr() as u64;
+        cpu.xmm[0] = 0xDEAD_BEEF;
+        cpu.xmm[1] = 0;
+        cpu.xmm[2] = u128::MAX;
+        FAULT_PENDING.with(|p| p.set(None));
+        unsafe { fast::exec(&mut cpu, &fop) };
+        assert_eq!(FAULT_PENDING.with(|p| p.take()), Some((u64::MAX, false)), "FastOp aliasing must fault #UD");
+        assert_eq!(cpu.xmm[0], 0xDEAD_BEEF, "FastOp aliasing must not modify dest");
+    }
+
+    // Part 3: VSIB scale (1/2/4/8), negative disp, negative 32-bit sign-extended index across all 4 tiers.
+    let mut vs = CodeAssembler::new(64).unwrap();
+    vs.lea(rdx, ptr(rcx + 128)).unwrap();
+    vs.vmovdqu(ymm1, ymmword_ptr(rcx)).unwrap(); // i32 indices: [-4, -1, 0, 2, -2, 1, 3, -3]
+    for (idx, scale) in [(0, 1u32), (1, 2), (2, 4), (3, 8)] {
+        vs.vmovdqu(ymm0, ymmword_ptr(rcx + 32)).unwrap();
+        vs.vmovdqu(ymm3, ymmword_ptr(rcx + 64)).unwrap();
+        match scale {
+            1 => vs.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 1 - 4), ymm3).unwrap(),
+            2 => vs.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 2 - 4), ymm3).unwrap(),
+            4 => vs.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 4 - 4), ymm3).unwrap(),
+            _ => vs.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 8 - 4), ymm3).unwrap(),
+        }
+        vs.vmovdqu(ymmword_ptr(rcx + 256 + idx * 32), ymm0).unwrap();
+    }
+    vs.vzeroupper().unwrap();
+    vs.ret().unwrap();
+    let vs_code = vs.assemble(0).unwrap();
+    let mut vs_init = vec![0u8; 512];
+    for (i, v) in [-4i32, -1, 0, 2, -2, 1, 3, -3].into_iter().enumerate() {
+        vs_init[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for i in 0..32usize {
+        vs_init[32 + i] = 0x5A;
+        vs_init[64 + i] = 0x80; // all MSBs set -> all lanes active
+    }
+    for (i, b) in vs_init.iter_mut().enumerate().take(192).skip(96) {
+        *b = ((i.wrapping_mul(37)) ^ 0xA5) as u8;
+    }
+    let mut vs_ref: Option<Vec<u8>> = None;
+    run_tiers(&vs_code, &vs_init, |out| {
+        if let Some(ref g) = vs_ref {
+            assert_eq!(out, g.as_slice(), "VSIB scale/disp/neg-idx tier mismatch");
+        } else {
+            vs_ref = Some(out.to_vec());
+        }
+    });
+}

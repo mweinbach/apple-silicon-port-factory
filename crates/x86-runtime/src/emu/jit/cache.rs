@@ -94,7 +94,22 @@ fn fast_gpr_writes(op: &FastOp, ins: &iced_x86::Instruction) -> Option<u16> {
         | K_VCVT_PH
         | K_VMASKMOV
         | K_VSHA_RR
-        | K_VSHA_RM => 0,
+        | K_VSHA_RM
+        | K_VEXT_RR
+        | K_VEXT_RM
+        | K_MASKMOV_B
+        | K_VGATHER
+        | K_MMX_VSHUF_RR
+        | K_MMX_VSHUF_RM
+        | K_MMX_VINT_RR
+        | K_MMX_VINT_RM => 0,
+        K_MMX_MISC => {
+            if matches!(op.x & 0x3F, MMX_MOVD_GM | MMX_MOVQ_GM | MMX_PEXTRW | MMX_PMOVMSKB) {
+                r0
+            } else {
+                0
+            }
+        }
         K_ALU_RR | K_ALU_RI | K_ALU_RM => {
             if matches!(op.x & 0x3F, A_CMP | A_TEST) {
                 0
@@ -965,6 +980,7 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
+        cpu.jx.x87_state = crate::emu::regfile_ext::x87_state_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = if self.static_only {
             crate::emu::exec_mem::static_probe_table()
@@ -1064,6 +1080,7 @@ impl JitCache {
         cpu.jx.mul = JMUL;
         cpu.jx.codegen = mem::code_gen_ptr();
         cpu.jx.atomic_locks = crate::emu::cpu::atomic_locks_ptr();
+        cpu.jx.x87_state = crate::emu::regfile_ext::x87_state_ptr();
         cpu.jx.tsc_mode = self.live_tsc_mode.for_run();
         cpu.jx.aot_dir = 0;
         // Verifier trials (`verify.rs::seed_trial`) seed `cpu.ymm_hi` directly; compute `ymm_dirty` here.

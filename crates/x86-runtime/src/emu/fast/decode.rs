@@ -1089,7 +1089,9 @@ fn lower_ext(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
 /// Lower one decoded instruction (falls back to [`K_GENERIC`]).
 pub(in crate::emu) fn lower(ins: &Instruction) -> FastOp {
     let mut f = FastOp { ip: ins.ip(), len: ins.len() as u8, ..FastOp::default() };
-    if crate::emu::mmx::uses_mmx(ins) { return f; }
+    if crate::emu::mmx::uses_mmx(ins) || matches!(ins.mnemonic(), Mnemonic::Emms | Mnemonic::Femms) {
+        return super::mmx_gather::lower_mmx_ins(ins, f).unwrap_or(f);
+    }
     if let Some(g) = lower_inner(ins, f) {
         f = g;
     } else if let Some(g) = lower_ext(ins, f) {

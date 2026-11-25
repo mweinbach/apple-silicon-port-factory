@@ -1139,7 +1139,7 @@ pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 cpu.rip = op.imm;
             }
         }
-        K_VAES_RR..=K_VSHA_RM => exec_ext_all_remaining(cpu, op),
+        K_VAES_RR..=K_MMX_MISC => exec_ext_all_remaining(cpu, op),
         _ => {}
     }
 }

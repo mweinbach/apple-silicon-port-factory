@@ -315,7 +315,11 @@ enum X87Source {
 
 /// Architectural x87 register-stack state (`ST(0)..ST(7)` around `top`, `SW` status word, `tag`
 /// mask where bit `phys` is `1` iff physical slot `phys` is non-empty).
+///
+/// `#[repr(C)]`: translated ARM64 MMX/x87 code addresses `regs`, `top`, and `valid_mask` by
+/// compile-time `offset_of!` via `Cpu::jx.x87_state`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
 pub struct X87State {
     // Store the architectural bytes so state transfers preserve SNaNs, unsupported encodings,
     // and the contents of empty slots without an arithmetic conversion.
@@ -754,6 +758,14 @@ fn with_x87_ref<R>(f: impl FnOnce(&X87State) -> R) -> R {
 #[inline(always)]
 pub(super) fn with_x87_mut<R>(f: impl FnOnce(&mut X87State) -> R) -> R {
     TLS_X87.with(|cell| unsafe { f(&mut *cell.get()) })
+}
+
+/// Stable pointer to this thread's architectural [`X87State`] (`TLS_X87`), exposed to translated
+/// ARM64/AOT code via `Cpu::jx.x87_state` for direct zero-relocation MMX/x87 aliasing.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+pub(super) fn x87_state_ptr() -> usize {
+    TLS_X87.with(|cell| cell.get() as usize)
 }
 
 /// Retire a decoded x87 data instruction. FOP is the low 3 bits of the escape

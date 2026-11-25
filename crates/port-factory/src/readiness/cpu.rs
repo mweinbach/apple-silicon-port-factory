@@ -193,19 +193,19 @@ mod tests {
         );
         assert_eq!(scan.decoded, 6);
         for (mnemonic, expected) in [
-            ("cvtpi2ps", Finding::Interpreter),
-            ("pshufw", Finding::Interpreter),
-            ("movntq", Finding::Interpreter),
-            ("pfadd", Finding::Unimplemented),
-            ("xsaveopt", Finding::Interpreter),
-            ("cpuid", Finding::Interpreter),
+            ("cvtpi2ps", None),
+            ("pshufw", None),
+            ("movntq", None),
+            ("pfadd", Some(Finding::Unimplemented)),
+            ("xsaveopt", Some(Finding::Interpreter)),
+            ("cpuid", Some(Finding::Interpreter)),
         ] {
             let kind = scan
                 .findings
                 .iter()
                 .find(|(_, hit)| hit.mnemonic == mnemonic)
                 .map(|((kind, _), _)| *kind);
-            assert_eq!(kind, Some(expected), "{mnemonic}");
+            assert_eq!(kind, expected, "{mnemonic}");
         }
     }
 }

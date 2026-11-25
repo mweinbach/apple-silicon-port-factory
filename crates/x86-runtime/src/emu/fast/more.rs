@@ -642,15 +642,32 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
             f.kind = K_ATOMIC;
         }
         M::Pcmpistri | M::Vpcmpistri | M::Pcmpistrm | M::Vpcmpistrm | M::Pcmpestri
-        | M::Vpcmpestri | M::Pcmpestrm | M::Vpcmpestrm => {
+        | M::Vpcmpestri | M::Pcmpestrm | M::Vpcmpestrm | M::Pcmpestri64 | M::Vpcmpestri64
+        | M::Pcmpestrm64 | M::Vpcmpestrm64 => {
             if n != 3 || k0 != OpKind::Register || ins.op_kind(2) != OpKind::Immediate8 {
                 return None;
             }
-            let is_exp = matches!(mn, M::Pcmpestri | M::Vpcmpestri | M::Pcmpestrm | M::Vpcmpestrm);
-            let is_msk = matches!(mn, M::Pcmpistrm | M::Vpcmpistrm | M::Pcmpestrm | M::Vpcmpestrm);
+            let is_long = matches!(
+                mn,
+                M::Pcmpestri64 | M::Vpcmpestri64 | M::Pcmpestrm64 | M::Vpcmpestrm64
+            );
+            let is_exp = is_long
+                || matches!(mn, M::Pcmpestri | M::Vpcmpestri | M::Pcmpestrm | M::Vpcmpestrm);
+            let is_msk = matches!(
+                mn,
+                M::Pcmpistrm
+                    | M::Vpcmpistrm
+                    | M::Pcmpestrm
+                    | M::Vpcmpestrm
+                    | M::Pcmpestrm64
+                    | M::Vpcmpestrm64
+            );
             f.r0 = xreg(ins.op_register(0))?;
             f.imm = ins.immediate8() as u64;
-            let mut flags = (is_exp as u8) | ((is_msk as u8) << 1) | ((Cpu::is_vex(ins) as u8) << 2);
+            let mut flags = (is_exp as u8)
+                | ((is_msk as u8) << 1)
+                | ((Cpu::is_vex(ins) as u8) << 2)
+                | ((is_long as u8) << 3);
             match k1 {
                 OpKind::Register => {
                     f.r1 = xreg(ins.op_register(1))?;
@@ -664,7 +681,7 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
             f.x = (f.x & 0xC0) | flags;
             f.kind = K_PCMPSTR;
         }
-        _ => return None,
+        _ => return super::mmx_gather::lower_simd_ext_gather(ins, f),
     }
     Some(f)
 }
@@ -1693,6 +1710,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
             let is_explicit = (flags & 1) != 0;
             let is_mask = (flags & 2) != 0;
             let is_vex = (flags & 4) != 0;
+            let is_long = (flags & 8) != 0;
             let is_mem = (flags & 0x20) != 0;
             let a = cpu.xmm[op.r0 as usize & 15];
             let b = if is_mem {
@@ -1700,7 +1718,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
             } else {
                 cpu.xmm[op.r1 as usize & 15]
             };
-            sk::pcmpstr(cpu, a, b, op.imm as u8, is_explicit, is_mask, false, is_vex);
+            sk::pcmpstr(cpu, a, b, op.imm as u8, is_explicit, is_mask, is_long, is_vex);
         }
         K_VSHA_RR | K_VSHA_RM => {
             let d = op.r0 as usize & 15;
@@ -1720,6 +1738,6 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 _ => sk::sha256msg2(src1, src2),
             };
         }
-        _ => {}
+        _ => super::mmx_gather::exec_mmx_gather(cpu, op),
     }
 }

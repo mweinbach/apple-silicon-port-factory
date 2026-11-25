@@ -329,6 +329,17 @@ fn register_lane_permute_and_widening(cases: &mut Cases) {
     }
 
     for &(lane, asm) in &[
+        (0, "dup v28.16b, v19.b[0]"),
+        (3, "dup v28.16b, v19.b[3]"),
+        (7, "dup v28.16b, v19.b[7]"),
+        (15, "dup v28.16b, v19.b[15]"),
+    ] {
+        cases.check("v_dup_lane_b", &[("dup_advsimd_elt", asm)], move |a| {
+            a.v_dup_lane_b(28, 19, lane);
+        });
+    }
+
+    for &(lane, asm) in &[
         (0, "dup v28.4s, v19.s[0]"),
         (1, "dup v28.4s, v19.s[1]"),
         (2, "dup v28.4s, v19.s[2]"),
