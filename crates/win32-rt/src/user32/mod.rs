@@ -47,7 +47,6 @@ pub mod message;
 pub mod misc;
 pub mod monitor;
 pub mod window;
-pub mod wsprintf;
 
 /// Tests that touch process-wide window-system state (activation, focus,
 /// raw-input registrations, the cursor) hold this lock.

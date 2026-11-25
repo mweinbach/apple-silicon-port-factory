@@ -3932,8 +3932,7 @@ user32.dll	VkKeyScanExW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::VkKeySc
 user32.dll	VkKeyScanW	-	WINDOW_INPUT_COM	real	win32_rt::user32::input::VkKeyScanW	crates/win32-rt/src/user32/input.rs
 user32.dll	WaitMessage	-	WINDOW_INPUT_COM	real	win32_rt::user32::message::WaitMessage	crates/win32-rt/src/user32/message.rs
 user32.dll	WindowFromPoint	-	WINDOW_INPUT_COM	real	win32_rt::user32::window::WindowFromPoint	crates/win32-rt/src/user32/window.rs
-user32.dll	wsprintfA	-	WINDOW_INPUT_COM	real	win32_rt::user32::wsprintf::wsprintfA	crates/win32-rt/src/user32/wsprintf.rs
-user32.dll	wsprintfW	-	WINDOW_INPUT_COM	real	win32_rt::user32::wsprintf::wsprintfW	crates/win32-rt/src/user32/wsprintf.rs
+user32.dll	wsprintfA	-	WINDOW_INPUT_COM	real	win32_rt::user32::misc::wsprintfA	crates/win32-rt/src/user32/misc.rs
 uxtheme.dll	CloseThemeData	-	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::CloseThemeData	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	DefSubclassProc	413	WINDOW_INPUT_COM	real	win32_rt::misc::uxtheme::DefSubclassProc	crates/win32-rt/src/misc/uxtheme.rs
 uxtheme.dll	DrawThemeBackground	-	WINDOW_INPUT_COM	stub	win32_rt::misc::uxtheme::DrawThemeBackground	crates/win32-rt/src/misc/uxtheme.rs
