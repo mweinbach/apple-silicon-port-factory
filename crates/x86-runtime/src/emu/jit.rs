@@ -155,6 +155,8 @@ pub(super) struct JitScratch {
     pub ymm_dirty: u16,
     /// Guest x86 `MXCSR` state (`0x1F80` default; bit 15 = FTZ, bit 6 = DAZ, bits 14:13 = RC).
     pub mxcsr: u32,
+    /// Embedding thread FPCR for native calls made directly by generated code.
+    pub host_fpcr: u64,
     /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
@@ -184,6 +186,7 @@ impl Default for JitScratch {
             lb_on: 1,
             ymm_dirty: 0,
             mxcsr: 0x1F80,
+            host_fpcr: 0,
             #[cfg(test)]
             plain_call_hits: 0,
         }
@@ -813,6 +816,7 @@ const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
 const OFF_PROBEHITS: u32 = OFF_JX + offset_of!(JitScratch, aot_probe_hits) as u32;
 const OFF_TSC_MODE: u32 = OFF_JX + offset_of!(JitScratch, tsc_mode) as u32;
 const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
+const OFF_HOST_FPCR: u32 = OFF_JX + offset_of!(JitScratch, host_fpcr) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 #[cfg(test)]
 const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u32;

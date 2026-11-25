@@ -8,6 +8,15 @@ use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, Regist
 
 impl Cpu {
     pub(super) unsafe fn exec_generic_ins(&mut self, ins_ref: &Instruction) -> bool {
+        if super::denorm::software_mode(self.jx.mxcsr) {
+            if let Some(handled) = super::denorm::execute(self, ins_ref) {
+                return handled;
+            }
+        }
+        self.exec_generic_inner(ins_ref)
+    }
+
+    pub(super) unsafe fn exec_generic_inner(&mut self, ins_ref: &Instruction) -> bool {
         let ins = *ins_ref;
         let mn = ins.mnemonic();
         let cpu = self;

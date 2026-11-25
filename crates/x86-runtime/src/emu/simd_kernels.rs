@@ -348,7 +348,8 @@ pub(in crate::emu) fn fp_bin_ps(op: u8, a: u128, b: u128) -> u128 {
             4 => vbslq_f32(vcltq_f32(va, vb), va, vb),
             _ => vbslq_f32(vcgtq_f32(va, vb), va, vb),
         };
-        fq(res)
+        let bits = fq(res);
+        if op >= 4 { super::denorm::minmax_result(bits, false) } else { bits }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -375,7 +376,8 @@ pub(in crate::emu) fn fp_bin_pd(op: u8, a: u128, b: u128) -> u128 {
             4 => vbslq_f64(vcltq_f64(va, vb), va, vb),
             _ => vbslq_f64(vcgtq_f64(va, vb), va, vb),
         };
-        dq(res)
+        let bits = dq(res);
+        if op >= 4 { super::denorm::minmax_result(bits, true) } else { bits }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -427,14 +429,15 @@ pub(in crate::emu) fn sqrt_pd(a: u128) -> u128 {
 
 #[inline(always)]
 pub(in crate::emu) fn rcp_rsqrt_ps(a: u128, is_rsqrt: bool) -> u128 {
+    let a = super::denorm::flush_lanes(a, false);
     #[cfg(target_arch = "aarch64")]
-    unsafe {
+    let result = unsafe {
         let va = qf(a);
         let denom = if is_rsqrt { neon_x86_nan_f32_unary(va, vsqrtq_f32(va)) } else { va };
         fq(vdivq_f32(vdupq_n_f32(1.0), denom))
-    }
+    };
     #[cfg(not(target_arch = "aarch64"))]
-    {
+    let result = {
         let mut out = 0u128;
         for lane in 0..4 {
             let x = f32::from_bits((a >> (lane * 32)) as u32);
@@ -442,7 +445,8 @@ pub(in crate::emu) fn rcp_rsqrt_ps(a: u128, is_rsqrt: bool) -> u128 {
             out |= (r.to_bits() as u128) << (lane * 32);
         }
         out
-    }
+    };
+    super::denorm::flush_lanes(result, false)
 }
 
 #[inline(always)]

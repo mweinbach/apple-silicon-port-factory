@@ -1058,23 +1058,7 @@ impl Tr<'_> {
         self.a.stp_x(12, 13, 31, 32);
         self.a.stp_x(14, 15, 31, 48);
         self.mov_host_lit(XA, h, hva, bail.is_some(), src);
-        // Fast-path FPCR: skip `mrs fpcr` when guest `MXCSR == 0x1F80` (default IEEE-754 state).
-        self.a.ldr(32, XS, XCPU, OFF_MXCSR);
-        self.a.addsub_ri(false, true, false, XS, XS, 1, true); // sub w17, w17, #0x1000
-        self.a.addsub_ri(false, true, false, XS, XS, 0xF80, false); // sub w17, w17, #0xF80
-        self.a.str(64, ZR, 31, 64); // saved_fpcr = 0
-        let fpcr_def = self.a.cbz(false, XS);
-        self.a.mrs_fpcr(XS);
-        self.a.str(64, XS, 31, 64);
-        let fpcr_zero = self.a.cbz(true, XS);
-        self.a.msr_fpcr(ZR);
-        self.a.bind(fpcr_zero);
-        self.a.bind(fpcr_def);
-        self.a.blr(XA);
-        self.a.ldr(64, XS, 31, 64);
-        let fpcr_keep = self.a.cbz(true, XS);
-        self.a.msr_fpcr(XS);
-        self.a.bind(fpcr_keep);
+        self.a.call_with_host_fpcr(64);
         self.a.ldp_x(8, 9, 31, 0);
         self.a.ldp_x(10, 11, 31, 16);
         self.a.ldp_x(12, 13, 31, 32);

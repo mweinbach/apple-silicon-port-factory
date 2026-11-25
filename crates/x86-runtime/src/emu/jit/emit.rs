@@ -395,6 +395,18 @@ impl Asm {
     pub(super) fn mrs_cntfrq(&mut self, t: u32) {
         self.emit(0xD53B_E000 | t);
     }
+    /// Call a native leaf in the embedding FP environment. The call target is in XA,
+    /// arguments are live in x0..7, and XS is the only spare register at these sites.
+    pub(super) fn call_with_host_fpcr(&mut self, stack_slot: u32) {
+        self.mrs_fpcr(XS);
+        self.str(64, XS, 31, stack_slot);
+        self.ldr(64, XS, super::XCPU, super::OFF_HOST_FPCR);
+        self.msr_fpcr(XS);
+        self.blr(super::XA);
+        self.ldr(64, XS, 31, stack_slot);
+        self.msr_fpcr(XS);
+    }
+
     /// `mrs xt, fpcr` (reads ARM64 floating-point control register).
     pub(super) fn mrs_fpcr(&mut self, t: u32) {
         self.emit(0xD53B_4400 | t);

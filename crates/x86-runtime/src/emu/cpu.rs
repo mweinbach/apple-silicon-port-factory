@@ -98,13 +98,9 @@ impl Cpu {
 
 pub(super) const RET_SENTINEL: u64 = 0xDEAD_BEEF_CAFE_0000;
 
-/// Bits of ARM64 `FPCR` controlled by guest x86 `MXCSR`: `FZ` (bit 24) and `RMode` (bits 23:22).
-#[cfg(target_arch = "aarch64")]
-pub(super) const FPCR_GUEST_MASK: u64 = 7u64 << 22;
-
-/// Bits of guest x86 `MXCSR` that affect ARM64 `FPCR`: `FTZ` (bit 15), `RC` (bits 14:13), `DAZ` (bit 6).
-/// When `(mxcsr & MXCSR_FPCR_MASK) == 0` (including the `0x1F80` default), `mxcsr_to_fpcr(mxcsr) == 0`.
-pub(super) const MXCSR_FPCR_MASK: u32 = 0xE040;
+/// ARM rounding, output flush, alternative handling and input flush controls.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(super) const FPCR_GUEST_MASK: u64 = (7u64 << 22) | 3;
 
 /// Convert x86-64 `MXCSR` control bits (`FTZ`=15, `DAZ`=6, `RC`=14:13) to ARM64 `FPCR`
 /// (`FZ`=24, `RMode`=23:22). Note `RMode` swaps `RM`/`RP` relative to `MXCSR.RC`:
@@ -114,8 +110,17 @@ pub(super) const MXCSR_FPCR_MASK: u32 = 0xE040;
 pub(super) fn mxcsr_to_fpcr(mxcsr: u32) -> u64 {
     let rc_lo = ((mxcsr >> 13) & 1) as u64;
     let rc_hi = ((mxcsr >> 14) & 1) as u64;
-    let fz = (((mxcsr >> 15) | (mxcsr >> 6)) & 1) as u64;
-    (fz << 24) | (rc_lo << 23) | (rc_hi << 22)
+    let ftz = u64::from(mxcsr >> 15 & 1);
+    let daz = u64::from(mxcsr >> 6 & 1);
+    let flush = if ftz == daz {
+        ftz << 24
+    } else if super::features::host().has(super::features::HostFeatures::AFP) {
+        // With AH=1 FZ controls outputs only. FIZ can flush inputs independently with AH=0.
+        (ftz << 24) | (ftz << 1) | daz
+    } else {
+        0 // Mixed modes execute through the denormal-aware interpreter.
+    };
+    flush | (rc_lo << 23) | (rc_hi << 22)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -155,7 +160,7 @@ pub(super) fn apply_guest_mxcsr_hw(mxcsr: u32) {
     #[cfg(target_arch = "aarch64")]
     {
         let cur = read_fpcr();
-        let target = (cur & !FPCR_GUEST_MASK) | mxcsr_to_fpcr(mxcsr);
+        let target = mxcsr_to_fpcr(mxcsr);
         if target != cur {
             write_fpcr(target);
         }
@@ -166,62 +171,59 @@ pub(super) fn apply_guest_mxcsr_hw(mxcsr: u32) {
 
 /// RAII guard for one guest execution region (`emu_run_region`): installs the guest thread's
 /// `MXCSR` into hardware `FPCR` on entry and writes back `Cpu::jx.mxcsr` + restores the host's
-/// saved `FPCR` on exit (including EH unwinds). Skips `mrs`/`msr fpcr` completely on the
-/// common path where `MXCSR` has default rounding/FTZ/DAZ bits (`(mxcsr & 0xE040) == 0`).
+/// saved `FPCR` on exit (including EH unwinds).
 pub(super) struct GuestFpcrGuard {
     mxcsr_ptr: *const u32,
     entry_mxcsr: u32,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    saved_host_fpcr: Option<u64>,
+    saved_host_fpcr: u64,
+    previous_host: Option<u64>,
 }
 
 impl GuestFpcrGuard {
     #[inline(always)]
     pub(super) unsafe fn enter(mxcsr_ptr: *const u32) -> Self {
         let entry_mxcsr = *mxcsr_ptr;
-        #[cfg(target_arch = "aarch64")]
-        let saved_host_fpcr = if (entry_mxcsr & MXCSR_FPCR_MASK) != 0 {
-            let saved = read_fpcr();
-            let target = (saved & !FPCR_GUEST_MASK) | mxcsr_to_fpcr(entry_mxcsr);
-            if target != saved {
-                write_fpcr(target);
-            }
-            Some(saved)
-        } else {
-            None
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let saved_host_fpcr = None;
-        Self { mxcsr_ptr, entry_mxcsr, saved_host_fpcr }
+        let saved_host_fpcr = read_fpcr();
+        let previous_host = HOST_FPCR.with(|host| host.replace(Some(saved_host_fpcr)));
+        apply_guest_mxcsr_hw(entry_mxcsr);
+        Self { mxcsr_ptr, entry_mxcsr, saved_host_fpcr, previous_host }
     }
 }
 
 impl Drop for GuestFpcrGuard {
     #[inline(always)]
     fn drop(&mut self) {
+        HOST_FPCR.with(|host| host.set(self.previous_host));
         let cur_m = unsafe { *self.mxcsr_ptr };
         if cur_m != self.entry_mxcsr {
             win32_rt::ucrt::runtime::set_guest_mxcsr(cur_m);
         }
         #[cfg(target_arch = "aarch64")]
         {
-            if let Some(saved) = self.saved_host_fpcr {
-                if read_fpcr() != saved {
-                    write_fpcr(saved);
-                }
-            } else if (cur_m & MXCSR_FPCR_MASK) != 0 {
-                let cur = read_fpcr();
-                if (cur & FPCR_GUEST_MASK) != 0 {
-                    write_fpcr(cur & !FPCR_GUEST_MASK);
-                }
+            if read_fpcr() != self.saved_host_fpcr {
+                write_fpcr(self.saved_host_fpcr);
             }
         }
     }
 }
 
+thread_local! {
+    static HOST_FPCR: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
+pub(super) fn host_fpcr() -> u64 {
+    HOST_FPCR.with(|host| host.get().unwrap_or_else(read_fpcr))
+}
+
+#[inline]
+fn install_fpcr(value: u64) {
+    if read_fpcr() != value { write_fpcr(value); }
+}
+
 /// RAII guard around full host calls (`host_call` / `host_tail_call`): syncs `Cpu::jx.mxcsr`
 /// to `win32_rt`'s thread-local `MXCSR` (for `_controlfp`/`_control87` and nested guest
-/// callbacks), resets hardware `FPCR` to IEEE-754 defaults while host code runs, and pulls
+/// callbacks), installs the embedding thread's saved `FPCR` while host code runs, and pulls
 /// any updated `MXCSR` back into `Cpu::jx.mxcsr` + hardware `FPCR` upon return.
 pub(super) struct HostFpcrGuard {
     mxcsr_ptr: *mut u32,
@@ -232,13 +234,7 @@ impl HostFpcrGuard {
     pub(super) unsafe fn enter(mxcsr_ptr: *mut u32) -> Self {
         let m = *mxcsr_ptr;
         win32_rt::ucrt::runtime::set_guest_mxcsr(m);
-        #[cfg(target_arch = "aarch64")]
-        if (m & MXCSR_FPCR_MASK) != 0 {
-            let cur = read_fpcr();
-            if (cur & FPCR_GUEST_MASK) != 0 {
-                write_fpcr(cur & !FPCR_GUEST_MASK);
-            }
-        }
+        install_fpcr(host_fpcr());
         Self { mxcsr_ptr }
     }
 }
@@ -250,52 +246,26 @@ impl Drop for HostFpcrGuard {
         unsafe {
             *self.mxcsr_ptr = m;
         }
-        if (m & MXCSR_FPCR_MASK) != 0 {
-            apply_guest_mxcsr_hw(m);
-        }
+        apply_guest_mxcsr_hw(m);
     }
 }
 
-/// Lightweight RAII guard for direct leaf host calls (`plain_host_call_asm`/`xfer_plain`/public
-/// host dispatch): clears guest `FPCR` bits (`FZ`/`RMode`) while host code runs (no-op if
-/// already 0) and restores on return.
-pub(super) struct ClearFpcrGuard(#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] Option<u64>);
+/// Installs the embedding FP environment for direct leaf calls, including nested callbacks.
+pub(super) struct ClearFpcrGuard(u64);
 
 impl ClearFpcrGuard {
-    #[inline(always)]
+    #[inline]
     pub(super) fn enter() -> Self {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let cur = read_fpcr();
-            if (cur & FPCR_GUEST_MASK) != 0 {
-                write_fpcr(cur & !FPCR_GUEST_MASK);
-                return Self(Some(cur));
-            }
-        }
-        Self(None)
-    }
-
-    /// Fast path when guest `mxcsr` is known: skips `mrs fpcr` when `(mxcsr & MXCSR_FPCR_MASK) == 0`.
-    #[inline(always)]
-    pub(super) fn enter_for_mxcsr(mxcsr: u32) -> Self {
-        if (mxcsr & MXCSR_FPCR_MASK) != 0 {
-            Self::enter()
-        } else {
-            Self(None)
-        }
+        let saved = read_fpcr();
+        let host = HOST_FPCR.with(|fpcr| fpcr.get().unwrap_or(saved));
+        if host != saved { write_fpcr(host); }
+        Self(saved)
     }
 }
 
 impl Drop for ClearFpcrGuard {
-    #[inline(always)]
-    fn drop(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        if let Some(prev) = self.0 {
-            if read_fpcr() != prev {
-                write_fpcr(prev);
-            }
-        }
-    }
+    #[inline]
+    fn drop(&mut self) { install_fpcr(self.0); }
 }
 
 #[cfg(test)]
@@ -1190,8 +1160,10 @@ pub(super) fn sse_arith32(op: u8, a: f32, b: f32) -> f32 {
         1 => x86_nan32(a, b, a - b),
         2 => x86_nan32(a, b, a * b),
         3 => x86_nan32(a, b, a / b),
-        4 => if a < b { a } else { b },
-        _ => if a > b { a } else { b },
+        _ => {
+            let selected = if (op == 4 && a < b) || (op == 5 && a > b) { a } else { b };
+            f32::from_bits(super::denorm::minmax_result(selected.to_bits().into(), false) as u32)
+        }
     }
 }
 
@@ -1203,8 +1175,10 @@ pub(super) fn sse_arith64(op: u8, a: f64, b: f64) -> f64 {
         1 => x86_nan64(a, b, a - b),
         2 => x86_nan64(a, b, a * b),
         3 => x86_nan64(a, b, a / b),
-        4 => if a < b { a } else { b },
-        _ => if a > b { a } else { b },
+        _ => {
+            let selected = if (op == 4 && a < b) || (op == 5 && a > b) { a } else { b };
+            f64::from_bits(super::denorm::minmax_result(selected.to_bits().into(), true) as u64)
+        }
     }
 }
 
