@@ -145,11 +145,13 @@ pub fn fill_system_info(si: &mut SYSTEM_INFO) {
 }
 
 pub unsafe extern "win64" fn GetSystemInfo(si: *mut SYSTEM_INFO) {
-    fill_system_info(&mut *si);
+    let mut info = std::mem::zeroed();
+    fill_system_info(&mut info);
+    si.write_unaligned(info);
 }
 
 pub unsafe extern "win64" fn GetNativeSystemInfo(si: *mut SYSTEM_INFO) {
-    fill_system_info(&mut *si);
+    GetSystemInfo(si);
 }
 
 #[repr(C)]
@@ -378,36 +380,40 @@ fn compute_ios_memory_status(reported_total: u64, phys_footprint: u64, proc_avai
 }
 
 pub unsafe extern "win64" fn GlobalMemoryStatusEx(m: *mut MEMORYSTATUSEX) -> BOOL {
-    if (*m).dwLength as usize != std::mem::size_of::<MEMORYSTATUSEX>() {
+    let size = std::mem::size_of::<MEMORYSTATUSEX>();
+    if m.is_null() || m.cast::<u32>().read_unaligned() as usize != size {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+    status.dwLength = size as u32;
     let (total, floored) = reported_physical_memory();
     if let Some(proc_avail) = crate::d3d12::mtl::available_headroom_bytes() {
         let fp = crate::d3d12::mtl::process_phys_footprint();
         let (avail, load) = compute_ios_memory_status(total, fp, proc_avail);
-        (*m).dwMemoryLoad = load;
-        (*m).ullTotalPhys = total;
-        (*m).ullAvailPhys = avail;
+        status.dwMemoryLoad = load;
+        status.ullTotalPhys = total;
+        status.ullAvailPhys = avail;
         // iOS has no user-process swap file; report honest Jetsam headroom instead of
         // fabricating 24+ GiB of free pagefile that suppresses engine OOM eviction.
-        (*m).ullTotalPageFile = total;
-        (*m).ullAvailPageFile = avail;
+        status.ullTotalPageFile = total;
+        status.ullAvailPageFile = avail;
     } else {
         let avail = if floored {
             available_physical_memory().max(total / 2).min(total)
         } else {
             available_physical_memory().min(total)
         };
-        (*m).dwMemoryLoad = if total > 0 { (100 - avail * 100 / total) as u32 } else { 0 };
-        (*m).ullTotalPhys = total;
-        (*m).ullAvailPhys = avail;
-        (*m).ullTotalPageFile = total * 2;
-        (*m).ullAvailPageFile = avail + total;
+        status.dwMemoryLoad = if total > 0 { (100 - avail * 100 / total) as u32 } else { 0 };
+        status.ullTotalPhys = total;
+        status.ullAvailPhys = avail;
+        status.ullTotalPageFile = total * 2;
+        status.ullAvailPageFile = avail + total;
     }
-    (*m).ullTotalVirtual = 0x7FFF_FFFE_0000;
-    (*m).ullAvailVirtual = 0x7FF0_0000_0000;
-    (*m).ullAvailExtendedVirtual = 0;
+    status.ullTotalVirtual = 0x7FFF_FFFE_0000;
+    status.ullAvailVirtual = 0x7FF0_0000_0000;
+    status.ullAvailExtendedVirtual = 0;
+    m.write_unaligned(status);
     TRUE
 }
 
@@ -434,8 +440,8 @@ pub fn core_classes() -> (u32, u32) {
 
 fn write_group_affinity(p: *mut u8, mask: usize) {
     unsafe {
-        *(p as *mut usize) = mask;
-        *(p.add(8) as *mut u16) = 0;
+        p.cast::<usize>().write_unaligned(mask);
+        p.add(8).cast::<u16>().write_unaligned(0);
     }
 }
 
@@ -464,7 +470,7 @@ fn build_lpi_ex(relation: u32) -> Vec<u8> {
         let mut e = vec![0u8; 48];
         e[0..4].copy_from_slice(&1u32.to_le_bytes());
         e[4..8].copy_from_slice(&48u32.to_le_bytes());
-        e[28..30].copy_from_slice(&1u16.to_le_bytes());
+        e[30..32].copy_from_slice(&1u16.to_le_bytes());
         write_group_affinity(e[32..].as_mut_ptr(), all_mask);
         out.extend(e);
     }
@@ -515,19 +521,27 @@ fn build_lpi_ex(relation: u32) -> Vec<u8> {
 }
 
 pub unsafe extern "win64" fn GetLogicalProcessorInformationEx(relation: u32, buf: *mut u8, len: *mut u32) -> BOOL {
+    if len.is_null() || !matches!(relation, 0..=4 | 0xffff) {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let data = build_lpi_ex(relation);
-    if buf.is_null() || (*len as usize) < data.len() {
-        *len = data.len() as u32;
+    if buf.is_null() || (len.read_unaligned() as usize) < data.len() {
+        len.write_unaligned(data.len() as u32);
         crate::teb::set_last_error(err::ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
-    *len = data.len() as u32;
+    len.write_unaligned(data.len() as u32);
     TRUE
 }
 
 /// Legacy SYSTEM_LOGICAL_PROCESSOR_INFORMATION (32 bytes each).
 pub unsafe extern "win64" fn GetLogicalProcessorInformation(buf: *mut u8, len: *mut u32) -> BOOL {
+    if len.is_null() {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let n = crate::process::num_cpus() as usize;
     let all: usize = if n >= 64 { usize::MAX } else { (1usize << n) - 1 };
     let mut out: Vec<u8> = Vec::new();
@@ -548,13 +562,13 @@ pub unsafe extern "win64" fn GetLogicalProcessorInformation(buf: *mut u8, len: *
     cache[2..4].copy_from_slice(&128u16.to_le_bytes());
     cache[4..8].copy_from_slice(&(16u32 << 20).to_le_bytes());
     push(all, 2, cache);
-    if buf.is_null() || (*len as usize) < out.len() {
-        *len = out.len() as u32;
+    if buf.is_null() || (len.read_unaligned() as usize) < out.len() {
+        len.write_unaligned(out.len() as u32);
         crate::teb::set_last_error(err::ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
     std::ptr::copy_nonoverlapping(out.as_ptr(), buf, out.len());
-    *len = out.len() as u32;
+    len.write_unaligned(out.len() as u32);
     TRUE
 }
 

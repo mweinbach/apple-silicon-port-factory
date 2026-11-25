@@ -190,3 +190,45 @@ Test path resolution anytime without launching a game:
 ```sh
 cargo opsdb -- vfs-resolve "%USERPROFILE%\Documents\My Games\save.dat" --mount "D:\Mods=/tmp"
 ```
+
+## Readiness for one game
+
+On Apple Silicon macOS, run the following against an installation or a single executable.
+The scan reads PE metadata and decodes instructions without loading or executing the game.
+
+```sh
+cargo opsdb -- readiness /path/to/game
+cargo opsdb -- readiness /path/to/game/Game.exe --json
+```
+
+Directory mode scans regular PE candidates recursively, including extensionless MZ files.
+Single-file mode follows adjacent imported DLLs and the forwarders those imports use. Both preserve relative
+paths and report unscannable images. Directory symlinks are skipped. Package lookup checks
+the importer's directory and the package root with the default DLL overrides. Runtime
+search-path changes, custom manifests, dynamic imports and unpacked code need a boot trace.
+
+- **CPU.** The scanner walks file-backed executable sections, restarting at the entry point, exported RVAs,
+  TLS callbacks and `.pdata` boundaries so leaf code outside function tables is included. Each decoded operand
+  form goes through the runtime lowerer. A generic dispatch with no interpreter handler is
+  listed as `unimplemented` (exit 86 if reached with fail-on-unimplemented enabled).
+  `interpreter_only` identifies handled fallbacks. Guest traps and syscall boundaries have
+  a separate informational row. MMX operands use their own interpreter dispatch. A guest
+  that changes MXCSR can also select software floating-point paths at runtime.
+  Shared EVEX/MVEX forms with narrower handlers are marked
+  `unverified_form`. Each row gives the mnemonic, encoding form, static count and first RVA.
+- **CPUID.** An unimplemented form lists `advertised_but_unimplemented` when all its mapped
+  feature bits are set by the shared guest CPUID query on the scanning host.
+  A binary can contain optional CPU
+  dispatch paths or embedded data. Static hits measure neither reachability nor execution frequency.
+- **Imports.** Every eager and delay-load IAT slot records its DLL, name or ordinal, binding
+  and implementation kind. Builtins use the Win32 catalog and matching stub inventory sites.
+  A `shipped` binding resolves to a guest export. Forwarders inherit the final target's kind.
+  A catalog entry marked `real` describes source classification. Guest tests establish behavior.
+- **Ranking.** Unimplemented instructions and missing imports come first, then failing,
+  stubbed and partial exports, uncertain forms and interpreter costs. Site count breaks ties
+  within a class. Use the listed image paths and RVAs to select a guest test or boot probe.
+
+JSON uses the schema-v1 envelope. Its data contains `assessment`, `ranked_findings`,
+`binaries` and `unscanned`. Exit 1 means the scan was incomplete, 5 means it found a potential
+exit-86 instruction, and 3 means it found an unresolved import. Exit 0 can still include
+degraded paths. See the assessment and findings before selecting a game for live verification.

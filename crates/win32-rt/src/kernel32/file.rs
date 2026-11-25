@@ -162,6 +162,7 @@ pub struct FileObj {
     pub flags: u32,
     pub append: bool,
     delete_on_close: Mutex<bool>,
+    io_priority_hint: AtomicU8,
     completion: Arc<IoCompletionBinding>,
     /// Unread peek buffer for pipes (`PeekNamedPipe` fills; `ReadFile`/`ReadFileEx` drains first).
     peek_buf: Mutex<VecDeque<u8>>,
@@ -183,6 +184,7 @@ impl FileObj {
             flags,
             append: false,
             delete_on_close: Mutex::new(flags & FILE_FLAG_DELETE_ON_CLOSE != 0),
+            io_priority_hint: AtomicU8::new(2), // IoPriorityHintNormal
             completion: Arc::new(IoCompletionBinding::new()),
             peek_buf: Mutex::new(VecDeque::new()),
             dir_watcher: Mutex::new(None),
@@ -2018,6 +2020,10 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    if out.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     let m = match f.file().metadata() {
         Ok(m) => m,
         Err(e) => {
@@ -2069,11 +2075,31 @@ pub unsafe extern "win64" fn GetFileInformationByHandleEx(h: HANDLE, class: u32,
             }
             (out as *mut u32).write_unaligned((w.len() * 2) as u32);
             let room = (size as usize - 4) / 2;
-            std::ptr::copy_nonoverlapping(w.as_ptr(), out.add(4) as *mut u16, w.len().min(room));
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), out.add(4), 2 * w.len().min(room));
             if w.len() > room {
                 set_err(err::ERROR_MORE_DATA);
                 return FALSE;
             }
+        }
+        7 => { // FILE_STREAM_INFO: the unnamed data stream on this volume
+            if !m.is_file() { set_err(err::ERROR_HANDLE_EOF); return FALSE; }
+            let name = to_wide("::$DATA");
+            let name_bytes = name.len() * 2;
+            if !need((24 + name_bytes) as u32) { return FALSE; }
+            out.cast::<u32>().write_unaligned(0); // NextEntryOffset (last stream)
+            out.add(4).cast::<u32>().write_unaligned(name_bytes as u32);
+            put_ft(out.add(8), m.len());
+            put_ft(out.add(16), m.blocks() * 512);
+            std::ptr::copy_nonoverlapping(name.as_ptr().cast::<u8>(), out.add(24), name_bytes);
+        }
+        8 => { // FILE_COMPRESSION_INFO (the guest volume exposes uncompressed files)
+            if !need(16) { return FALSE; }
+            std::ptr::write_bytes(out, 0, 16);
+            put_ft(out, m.len());
+        }
+        12 => { // FILE_IO_PRIORITY_HINT_INFO
+            if !need(4) { return FALSE; }
+            out.cast::<u32>().write_unaligned(f.io_priority_hint.load(Ordering::Relaxed) as u32);
         }
         9 => {
             // FILE_ATTRIBUTE_TAG_INFO
@@ -2121,6 +2147,13 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         set_err(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    let minimum = match class {
+        0 => 40, 3 => 20, 4 => 1, 5 | 6 => 8, 12 | 21 => 4, _ => 0,
+    };
+    if info.is_null() || size < minimum {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     match class {
         0 => {
             if f.is_protected_native() {
@@ -2135,8 +2168,14 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         3 => {
             // FILE_RENAME_INFO { BOOLEAN ReplaceIfExists; HANDLE RootDirectory; DWORD FileNameLength; WCHAR FileName[] }
             let replace = *info != 0;
-            let len = (info.add(16) as *const u32).read_unaligned() as usize / 2;
-            let name = String::from_utf16_lossy(std::slice::from_raw_parts(info.add(20) as *const u16, len));
+            let bytes = info.add(16).cast::<u32>().read_unaligned();
+            if bytes == 0 || bytes % 2 != 0 || bytes > size - 20 {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let units: Vec<u16> = (0..(bytes / 2) as usize)
+                .map(|i| info.add(20 + 2 * i).cast::<u16>().read_unaligned()).collect();
+            let name = String::from_utf16_lossy(&units);
             let Some(src) = &f.host_path else {
                 set_err(err::ERROR_INVALID_HANDLE);
                 return FALSE;
@@ -2180,12 +2219,37 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
         5 | 6 => {
             // FILE_ALLOCATION_INFO / FILE_END_OF_FILE_INFO
             let len = (info as *const i64).read_unaligned();
-            if class == 5 {
-                return TRUE; // allocation hint only
-            }
-            if f.is_protected_native() {
+            if len < 0 { set_err(err::ERROR_INVALID_PARAMETER); return FALSE; }
+            if f.access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA) == 0 || f.is_protected_native() {
                 set_err(err::ERROR_ACCESS_DENIED);
                 return FALSE;
+            }
+            if class == 5 {
+                let meta = match f.file().metadata() {
+                    Ok(m) => m,
+                    Err(e) => { set_err(io_err(&e)); return FALSE; }
+                };
+                if (len as u64) >= meta.len() {
+                    let allocated = meta.blocks() * 512;
+                    let cluster = meta.blksize().max(1);
+                    if (len as u64).next_multiple_of(cluster) < allocated {
+                        // Darwin F_PREALLOCATE can only extend past physical EOF. Shrinking
+                        // reserved space here by changing EOF would expose data to other handles.
+                        set_err(err::ERROR_NOT_SUPPORTED);
+                        return FALSE;
+                    }
+                    let extra = (len as u64).saturating_sub(allocated);
+                    if extra == 0 { return TRUE; }
+                    let mut request = libc::fstore_t {
+                        fst_flags: libc::F_ALLOCATEALL, fst_posmode: libc::F_PEOFPOSMODE,
+                        fst_offset: 0, fst_length: extra as i64, fst_bytesalloc: 0,
+                    };
+                    if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut request) == -1 {
+                        set_err(errno_to_win32(last_errno()));
+                        return FALSE;
+                    }
+                    return TRUE;
+                }
             }
             if libc::ftruncate(f.fd(), len) != 0 {
                 set_err(errno_to_win32(last_errno()));
@@ -2193,8 +2257,14 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             }
             TRUE
         }
+        12 => {
+            let hint = info.cast::<u32>().read_unaligned();
+            if hint > 2 { set_err(err::ERROR_INVALID_PARAMETER); return FALSE; }
+            // Windows treats this as an advisory property of the open file object.
+            f.io_priority_hint.store(hint as u8, Ordering::Relaxed);
+            TRUE
+        }
         _ => {
-            let _ = size;
             stub!("SetFileInformationByHandle class {class} not supported");
             set_err(err::ERROR_INVALID_PARAMETER);
             FALSE
