@@ -25,11 +25,13 @@ Generated databases, Ghidra projects, and logs live in gitignored directories (`
 
 ### Built-in crash reports (`crates/win32-rt/src/crash.rs`)
 On an unhandled guest exception, host fault, `__fastfail`, unresolved-import trap, or CRT abort,
-the runtime logs a structured crash report and writes `out/crash/crash-<pid>-<time>.txt` (override
-with `AW2_CRASH_DIR`). Each report contains the exception code, annotated registers, bytes +
-disassembly at `RIP`, stack scan, and mixed guest/host backtraces for all threads (PE frames unwind
-via `.pdata`; host Rust/system frames walk frame pointers; peer threads are paused briefly via
-`SIGUSR2`).
+the runtime logs a structured crash report and writes both `out/crash/crash-<pid>-<time>.txt` and a
+schema v1 `out/crash/crash-<pid>-<time>.json` sidecar (override with `PORT_CRASH_DIR` /
+`AW2_CRASH_DIR`). Each report contains the exception code, watchdog/heartbeat state, annotated
+registers, bytes + disassembly at `RIP`, and mixed guest/host backtraces for all threads (guest PE
+and dynamic table frames unwind via `.pdata`, including on ARM64 fatal crashes and `SIGUSR2`
+thread snapshots, with stack scanning only as a fallback when unwinding stops early; host
+Rust/system frames walk frame pointers; peer threads are paused briefly via `SIGUSR2`).
 
 ### Critical LLDB + Rosetta warning
 **Never `process launch` an x86-64 Rosetta binary under `lldb`** (especially with
