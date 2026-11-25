@@ -1480,6 +1480,7 @@ enum NativeControlView {
         field: Retained<NSTextField>,
         _delegate: Retained<AW2TextDelegate>,
         programmatic: Cell<bool>,
+        masked: Cell<bool>,
         edit_style: Cell<u32>,
         max_len: Cell<usize>,
         last_text: RefCell<Vec<u16>>,
@@ -1673,6 +1674,57 @@ fn nsimage_from_icon_payload(payload: &IconPayload) -> Option<Retained<NSImage>>
     }
 }
 
+fn build_single_line_edit_field(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    masked: bool,
+    text: &str,
+    style: u32,
+    enabled: bool,
+    visible: bool,
+    delegate: &AW2TextDelegate,
+) -> Retained<NSTextField> {
+    let field: Retained<NSTextField> = if masked {
+        let secure = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
+        Retained::into_super(secure)
+    } else {
+        NSTextField::initWithFrame(NSTextField::alloc(mtm), frame)
+    };
+    field.setStringValue(&NSString::from_str(text));
+    field.setEditable((style & controls::ES_READONLY) == 0);
+    field.setSelectable(true);
+    field.setBordered(true);
+    field.setBezeled(true);
+    field.setDrawsBackground(true);
+    field.setEnabled(enabled);
+    field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+    field.setAlignment(ns_alignment_from_edit(style));
+    field.setWantsLayer(true);
+    field.setHidden(!visible);
+    unsafe { field.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
+    field
+}
+
+fn is_control_first_responder(ctrl: &NativeControl, win: &NSWindow) -> bool {
+    let Some(cur) = win.firstResponder() else { return false };
+    let cur_ptr = (&*cur as *const _) as usize;
+    match &ctrl.view {
+        NativeControlView::SingleLineEdit { field, .. } => {
+            Retained::as_ptr(field) as usize == cur_ptr
+                || field
+                    .currentEditor()
+                    .is_some_and(|ed| Retained::as_ptr(&ed) as usize == cur_ptr)
+        }
+        NativeControlView::MultiLineEdit { text_view, .. } => {
+            Retained::as_ptr(text_view) as usize == cur_ptr
+        }
+        NativeControlView::Button { button, .. } => {
+            Retained::as_ptr(button) as usize == cur_ptr
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeControlDesc) {
     let mtm = mtm();
     let frame = match with_win(parent_hwnd, |p| {
@@ -1746,26 +1798,22 @@ pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeContro
                     last_sel: Cell::new((0, 0)),
                 }
             } else {
-                let field: Retained<NSTextField> = if (desc.style & controls::ES_PASSWORD) != 0 {
-                    let secure = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
-                    Retained::into_super(secure)
-                } else {
-                    NSTextField::initWithFrame(NSTextField::alloc(mtm), frame)
-                };
-                field.setStringValue(&NSString::from_str(&desc.text));
-                field.setEditable(!readonly);
-                field.setSelectable(true);
-                field.setBordered(true);
-                field.setBezeled(true);
-                field.setDrawsBackground(true);
-                field.setEnabled(desc.enabled);
-                field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-                field.setAlignment(ns_alignment_from_edit(desc.style));
-                unsafe { field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+                let masked = (desc.style & controls::ES_PASSWORD) != 0;
+                let field = build_single_line_edit_field(
+                    mtm,
+                    frame,
+                    masked,
+                    &desc.text,
+                    desc.style,
+                    desc.enabled,
+                    desc.visible,
+                    &delegate,
+                );
                 NativeControlView::SingleLineEdit {
                     field,
                     _delegate: delegate,
                     programmatic: Cell::new(false),
+                    masked: Cell::new(masked),
                     edit_style: Cell::new(desc.style),
                     max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
                     last_text: RefCell::new(desc.text.encode_utf16().collect()),
@@ -1847,6 +1895,11 @@ pub(super) fn control_destroy(hwnd: usize) {
             }
             _ => {}
         }
+        with_win(ctrl.parent_hwnd, |p| {
+            if is_control_first_responder(&ctrl, &p.window) {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+        });
         ctrl.view.root_view().removeFromSuperview();
     }
 }
@@ -1905,6 +1958,9 @@ pub(super) fn control_set_text(hwnd: usize, text: String) {
 }
 
 pub(super) fn control_set_visible(hwnd: usize, visible: bool) {
+    if !visible {
+        control_unfocus(hwnd);
+    }
     CONTROLS.with(|m| {
         if let Some(ctrl) = m.borrow().get(&hwnd) {
             ctrl.view.root_view().setHidden(!visible);
@@ -1913,6 +1969,9 @@ pub(super) fn control_set_visible(hwnd: usize, visible: bool) {
 }
 
 pub(super) fn control_set_enabled(hwnd: usize, enabled: bool) {
+    if !enabled {
+        control_unfocus(hwnd);
+    }
     CONTROLS.with(|m| {
         let map = m.borrow();
         let Some(ctrl) = map.get(&hwnd) else { return };
@@ -1934,8 +1993,30 @@ pub(super) fn control_set_readonly(hwnd: usize, readonly: bool) {
         let map = m.borrow();
         let Some(ctrl) = map.get(&hwnd) else { return };
         match &ctrl.view {
-            NativeControlView::SingleLineEdit { field, .. } => field.setEditable(!readonly),
-            NativeControlView::MultiLineEdit { text_view, readonly: ro_cell, enabled, .. } => {
+            NativeControlView::SingleLineEdit { field, edit_style, .. } => {
+                let mut st = edit_style.get();
+                if readonly {
+                    st |= controls::ES_READONLY;
+                } else {
+                    st &= !controls::ES_READONLY;
+                }
+                edit_style.set(st);
+                field.setEditable(!readonly);
+            }
+            NativeControlView::MultiLineEdit {
+                text_view,
+                readonly: ro_cell,
+                enabled,
+                edit_style,
+                ..
+            } => {
+                let mut st = edit_style.get();
+                if readonly {
+                    st |= controls::ES_READONLY;
+                } else {
+                    st &= !controls::ES_READONLY;
+                }
+                edit_style.set(st);
                 ro_cell.set(readonly);
                 text_view.setEditable(enabled.get() && !readonly);
             }
@@ -2003,43 +2084,273 @@ pub(super) fn control_set_limit(hwnd: usize, limit: usize) {
 }
 
 pub(super) fn control_focus(hwnd: usize) {
+    enum FocusTarget {
+        SingleLine(Retained<NSTextField>),
+        MultiLine(Retained<NSTextView>),
+        Button(Retained<NSButton>),
+        ResignWindow,
+    }
     let parent_hwnd = CONTROLS.with(|m| m.borrow().get(&hwnd).map(|c| c.parent_hwnd));
     let Some(ph) = parent_hwnd else { return };
     with_win(ph, |p| {
-        CONTROLS.with(|m| {
+        let target = CONTROLS.with(|m| {
             let map = m.borrow();
-            let Some(ctrl) = map.get(&hwnd) else { return };
-            let cur = p.window.firstResponder();
+            let ctrl = map.get(&hwnd)?;
+            if is_control_first_responder(ctrl, &p.window) {
+                return None;
+            }
             match &ctrl.view {
                 NativeControlView::SingleLineEdit { field, .. } => {
-                    let already = field.currentEditor().is_some_and(|ed| {
-                        cur.as_deref()
-                            .is_some_and(|r| (r as *const _ as usize) == (Retained::as_ptr(&ed) as usize))
-                    });
-                    if !already {
-                        p.window.makeFirstResponder(Some(field));
-                    }
+                    Some(FocusTarget::SingleLine(field.clone()))
                 }
                 NativeControlView::MultiLineEdit { text_view, .. } => {
-                    let already = cur
-                        .as_deref()
-                        .is_some_and(|r| (r as *const _ as usize) == (Retained::as_ptr(text_view) as usize));
-                    if !already {
-                        p.window.makeFirstResponder(Some(text_view));
-                    }
+                    Some(FocusTarget::MultiLine(text_view.clone()))
                 }
                 NativeControlView::Button { button, .. } => {
-                    let already = cur
-                        .as_deref()
-                        .is_some_and(|r| (r as *const _ as usize) == (Retained::as_ptr(button) as usize));
-                    if !already {
-                        p.window.makeFirstResponder(Some(button));
-                    }
+                    Some(FocusTarget::Button(button.clone()))
                 }
-                _ => {}
+                _ => {
+                    // Focusing a non-editable native control (e.g. STATIC or GroupBox)
+                    // should resign any previously focused native editor in this window.
+                    let has_focused = map.values().any(|c| {
+                        c.parent_hwnd == ph && is_control_first_responder(c, &p.window)
+                    });
+                    has_focused.then_some(FocusTarget::ResignWindow)
+                }
             }
         });
+        match target {
+            Some(FocusTarget::SingleLine(field)) => {
+                p.window.makeFirstResponder(Some(&field));
+                if let Some(ed) = field.currentEditor() {
+                    CONTROLS.with(|m| {
+                        if let Some(ctrl) = m.borrow().get(&hwnd) {
+                            if let NativeControlView::SingleLineEdit {
+                                programmatic,
+                                last_sel,
+                                pending_sel,
+                                ..
+                            } = &ctrl.view
+                            {
+                                if let Some((ps, pe)) = pending_sel.take() {
+                                    let len = ed.string().length();
+                                    let lo = ps.min(pe).min(len);
+                                    let hi = ps.max(pe).min(len);
+                                    last_sel.set((lo, hi));
+                                    programmatic.set(true);
+                                    ed.setSelectedRange(NSRange::new(lo, hi - lo));
+                                    programmatic.set(false);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            Some(FocusTarget::MultiLine(text_view)) => {
+                p.window.makeFirstResponder(Some(&text_view));
+            }
+            Some(FocusTarget::Button(button)) => {
+                p.window.makeFirstResponder(Some(&button));
+            }
+            Some(FocusTarget::ResignWindow) => {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+            None => {}
+        }
     });
+}
+
+pub(super) fn control_unfocus(hwnd: usize) {
+    let parent_hwnd = CONTROLS.with(|m| m.borrow().get(&hwnd).map(|c| c.parent_hwnd));
+    let Some(ph) = parent_hwnd else { return };
+    with_win(ph, |p| {
+        let is_focused = CONTROLS.with(|m| {
+            m.borrow()
+                .get(&hwnd)
+                .is_some_and(|ctrl| is_control_first_responder(ctrl, &p.window))
+        });
+        if is_focused {
+            p.window.makeFirstResponder(Some(&p.view));
+        }
+    });
+}
+
+pub(super) fn window_clear_control_focus(top_hwnd: usize) {
+    with_win(top_hwnd, |p| {
+        let has_focused_ctrl = CONTROLS.with(|m| {
+            m.borrow()
+                .values()
+                .any(|ctrl| ctrl.parent_hwnd == top_hwnd && is_control_first_responder(ctrl, &p.window))
+        });
+        if has_focused_ctrl {
+            p.window.makeFirstResponder(Some(&p.view));
+        }
+    });
+}
+
+pub(super) fn control_set_password_mode(hwnd: usize, masked: bool) {
+    let mtm = mtm();
+    struct SwapSnapshot {
+        parent_hwnd: usize,
+        frame: NSRect,
+        text: String,
+        text_units: Vec<u16>,
+        sel: (usize, usize),
+        style: u32,
+        enabled: bool,
+        visible: bool,
+        delegate: Retained<AW2TextDelegate>,
+        old_field: Retained<NSTextField>,
+    }
+
+    let snap = CONTROLS.with(|m| {
+        let map = m.borrow();
+        let ctrl = map.get(&hwnd)?;
+        let NativeControlView::SingleLineEdit {
+            field,
+            _delegate,
+            masked: cur_masked,
+            edit_style,
+            last_sel,
+            pending_sel,
+            ..
+        } = &ctrl.view
+        else {
+            return None;
+        };
+        if cur_masked.get() == masked {
+            return None;
+        }
+        let ed = field.currentEditor();
+        let text = ed
+            .as_ref()
+            .map(|e| e.string().to_string())
+            .unwrap_or_else(|| field.stringValue().to_string());
+        let text_units: Vec<u16> = text.encode_utf16().collect();
+        let len = text_units.len();
+        let (raw_lo, raw_hi) = if let Some(ref e) = ed {
+            let r = e.selectedRange();
+            (r.location, r.location.saturating_add(r.length))
+        } else if let Some((ps, pe)) = pending_sel.get() {
+            (ps, pe)
+        } else {
+            last_sel.get()
+        };
+        let lo = raw_lo.min(raw_hi).min(len);
+        let hi = raw_lo.max(raw_hi).min(len);
+        let mut style = edit_style.get();
+        if masked {
+            style |= controls::ES_PASSWORD;
+        } else {
+            style &= !controls::ES_PASSWORD;
+        }
+        if field.isEditable() {
+            style &= !controls::ES_READONLY;
+        } else {
+            style |= controls::ES_READONLY;
+        }
+        Some(SwapSnapshot {
+            parent_hwnd: ctrl.parent_hwnd,
+            frame: field.frame(),
+            text,
+            text_units,
+            sel: (lo, hi),
+            style,
+            enabled: field.isEnabled(),
+            visible: !field.isHidden(),
+            delegate: _delegate.clone(),
+            old_field: field.clone(),
+        })
+    });
+
+    let Some(snap) = snap else { return };
+
+    let was_focused = with_win(snap.parent_hwnd, |p| {
+        CONTROLS.with(|m| {
+            m.borrow()
+                .get(&hwnd)
+                .is_some_and(|ctrl| is_control_first_responder(ctrl, &p.window))
+        })
+    })
+    .unwrap_or(false);
+
+    // Detach delegate from old field before removing it so ending editing does
+    // not emit stale notifications.
+    unsafe { snap.old_field.setDelegate(None) };
+
+    let new_field = build_single_line_edit_field(
+        mtm,
+        snap.frame,
+        masked,
+        &snap.text,
+        snap.style,
+        snap.enabled,
+        snap.visible,
+        &snap.delegate,
+    );
+
+    with_win(snap.parent_hwnd, |p| {
+        let attached = unsafe { snap.old_field.superview().is_some() };
+        if attached {
+            p.view.replaceSubview_with(&snap.old_field, &new_field);
+        } else {
+            p.view.addSubview(&new_field);
+        }
+    });
+
+    CONTROLS.with(|m| {
+        if let Some(ctrl) = m.borrow_mut().get_mut(&hwnd) {
+            if let NativeControlView::SingleLineEdit {
+                field,
+                masked: cur_masked,
+                edit_style,
+                last_text,
+                last_sel,
+                pending_sel,
+                ..
+            } = &mut ctrl.view
+            {
+                *field = new_field.clone();
+                cur_masked.set(masked);
+                edit_style.set(snap.style);
+                *last_text.borrow_mut() = snap.text_units;
+                last_sel.set(snap.sel);
+                pending_sel.set(Some(snap.sel));
+            }
+        }
+    });
+
+    if was_focused {
+        with_win(snap.parent_hwnd, |p| {
+            if snap.visible && snap.enabled {
+                p.window.makeFirstResponder(Some(&new_field));
+            } else {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+        });
+        if snap.visible && snap.enabled {
+            if let Some(ed) = new_field.currentEditor() {
+                let (lo, hi) = snap.sel;
+                CONTROLS.with(|m| {
+                    if let Some(ctrl) = m.borrow().get(&hwnd) {
+                        if let NativeControlView::SingleLineEdit {
+                            programmatic,
+                            last_sel,
+                            pending_sel,
+                            ..
+                        } = &ctrl.view
+                        {
+                            pending_sel.set(None);
+                            last_sel.set((lo, hi));
+                            programmatic.set(true);
+                            ed.setSelectedRange(NSRange::new(lo, hi.saturating_sub(lo)));
+                            programmatic.set(false);
+                        }
+                    }
+                });
+            }
+        }
+    }
 }
 
 pub(super) fn control_set_check(hwnd: usize, state: u32) {

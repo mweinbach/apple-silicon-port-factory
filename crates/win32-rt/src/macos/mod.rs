@@ -451,7 +451,41 @@ async_ctrl_op!(control_set_enabled(enabled: bool) => control_set_enabled);
 async_ctrl_op!(control_set_readonly(readonly: bool) => control_set_readonly);
 async_ctrl_op!(control_set_selection(start: usize, end: usize) => control_set_selection);
 async_ctrl_op!(control_set_limit(limit: usize) => control_set_limit);
-async_ctrl_op!(control_focus() => control_focus);
+pub fn control_focus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::Focus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_focus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn control_unfocus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::Unfocus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_unfocus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn window_clear_control_focus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::ClearWindowFocus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::window_clear_control_focus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn control_set_password_mode(hwnd: usize, masked: bool) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::SetPasswordMode(hwnd, masked));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_set_password_mode(hwnd, masked));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (hwnd, masked);
+}
 async_ctrl_op!(control_set_check(state: u32) => control_set_check);
 async_ctrl_op!(control_set_style(style: u32) => control_set_style);
 async_ctrl_op!(control_set_icon(payload: Option<crate::user32::cursor::IconPayload>) => control_set_icon);
@@ -633,4 +667,52 @@ pub fn progress_window_close() {
     if active() {
         let _ = run_sync(appkit::progress_window_close);
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedControlOp {
+    Focus(usize),
+    Unfocus(usize),
+    ClearWindowFocus(usize),
+    SetPasswordMode(usize, bool),
+}
+
+#[cfg(test)]
+fn control_op_log() -> &'static Mutex<Option<Vec<RecordedControlOp>>> {
+    static LOG: OnceLock<Mutex<Option<Vec<RecordedControlOp>>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn record_control_op(op: RecordedControlOp) {
+    if let Ok(mut guard) = control_op_log().lock() {
+        if let Some(ref mut v) = *guard {
+            v.push(op);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_control_ops<R>(f: impl FnOnce() -> R) -> (R, Vec<RecordedControlOp>) {
+    {
+        let mut guard = control_op_log().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Vec::new());
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = control_op_log().lock() {
+                *guard = None;
+            }
+        }
+    }
+    let _reset = Reset;
+    let res = f();
+    let ops = control_op_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    (res, ops)
 }

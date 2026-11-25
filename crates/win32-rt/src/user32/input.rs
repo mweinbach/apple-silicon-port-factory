@@ -97,21 +97,43 @@ pub fn native_deactivated(hwnd: usize) {
     super::cursor::update_state();
 }
 
+fn sync_native_focus(old: usize, old_is_native: bool, old_root: usize, new: usize) {
+    let new_is_native = new != 0 && window::get(new).is_some_and(|w| w.data().native_control);
+    let new_root = if new != 0 { top_level_of(new) } else { 0 };
+    if new_is_native {
+        if old_is_native && old_root != 0 && old_root != new_root {
+            crate::macos::control_unfocus(old);
+        }
+        crate::macos::control_focus(new);
+        return;
+    }
+    if old_is_native {
+        crate::macos::control_unfocus(old);
+    }
+    if new_root != 0 && window::get(new_root).is_some_and(|w| w.data().native) {
+        crate::macos::window_clear_control_focus(new_root);
+    } else if !old_is_native && old_root != 0 && window::get(old_root).is_some_and(|w| w.data().native) {
+        crate::macos::window_clear_control_focus(old_root);
+    }
+}
+
 /// Change the keyboard focus; returns the previous focus window.
 pub fn set_focus(hwnd: usize) -> usize {
     let old = FOCUS.swap(hwnd, Ordering::AcqRel);
     if old == hwnd {
         return old;
     }
+    let old_is_native = old != 0 && window::get(old).is_some_and(|w| w.data().native_control);
+    let old_root = if old != 0 { top_level_of(old) } else { 0 };
     if old != 0 && window::exists(old) {
         message::send_message(old, wm::KILLFOCUS, hwnd, 0);
     }
-    if hwnd != 0 && FOCUS.load(Ordering::Acquire) == hwnd {
-        if window::get(hwnd).is_some_and(|w| w.data().native_control) {
-            crate::macos::control_focus(hwnd);
+    if FOCUS.load(Ordering::Acquire) == hwnd {
+        sync_native_focus(old, old_is_native, old_root, hwnd);
+        if hwnd != 0 {
+            message::send_message(hwnd, wm::SETFOCUS, old, 0);
+            super::misc::dispatch_win_event(0x8005 /* EVENT_OBJECT_FOCUS */, hwnd, 0, 0);
         }
-        message::send_message(hwnd, wm::SETFOCUS, old, 0);
-        super::misc::dispatch_win_event(0x8005 /* EVENT_OBJECT_FOCUS */, hwnd, 0, 0);
     }
     old
 }
@@ -142,8 +164,12 @@ pub fn window_going_away(hwnd: usize) {
     if CAPTURE.load(Ordering::Acquire) == hwnd {
         CAPTURE.store(0, Ordering::Release);
     }
-    if FOCUS.load(Ordering::Acquire) == hwnd || window::is_child_of(FOCUS.load(Ordering::Acquire), hwnd) {
+    let cur_focus = FOCUS.load(Ordering::Acquire);
+    if cur_focus != 0 && (cur_focus == hwnd || window::is_child_of(cur_focus, hwnd)) {
         FOCUS.store(0, Ordering::Release);
+        if window::get(cur_focus).is_some_and(|w| w.data().native_control) {
+            crate::macos::control_unfocus(cur_focus);
+        }
     }
     if ACTIVE.load(Ordering::Acquire) == hwnd {
         ACTIVE.store(0, Ordering::Release);

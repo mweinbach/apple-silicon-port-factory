@@ -827,7 +827,7 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
             let style = window::get(h).map(|w| w.data().style).unwrap_or(0);
             let mut map = edit_states().lock().unwrap_or_else(|e| e.into_inner());
             let st = map.entry(h).or_default();
-            if (style & ES_PASSWORD) != 0 {
+            if (style & ES_MULTILINE) == 0 && (style & ES_PASSWORD) != 0 {
                 st.password_char = b'*' as u16;
             }
             drop(map);
@@ -1131,12 +1131,32 @@ pub(crate) unsafe extern "win64" fn edit_wndproc(
             1
         }
         wm::EM_SETPASSWORDCHAR => {
-            edit_states()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(h)
-                .or_default()
-                .password_char = (wparam & 0xFFFF) as u16;
+            let pw = (wparam & 0xFFFF) as u16;
+            let (is_multiline, native) = window::get(h)
+                .map(|w| {
+                    let mut d = w.data();
+                    let multiline = (d.style & ES_MULTILINE) != 0;
+                    if !multiline {
+                        if pw != 0 {
+                            d.style |= ES_PASSWORD;
+                        } else {
+                            d.style &= !ES_PASSWORD;
+                        }
+                    }
+                    (multiline, d.native_control)
+                })
+                .unwrap_or((false, false));
+            if !is_multiline {
+                edit_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(h)
+                    .or_default()
+                    .password_char = pw;
+                if native {
+                    crate::macos::control_set_password_mode(h, pw != 0);
+                }
+            }
             0
         }
         wm::EM_GETPASSWORDCHAR => {
@@ -1764,11 +1784,28 @@ mod tests {
             assert_eq!(SetWindowTextW(h_edit, crate::strings::to_wide_z("Reset").as_ptr()), TRUE);
             assert_eq!(SendMessageW(h_edit, wm::EM_GETMODIFY, 0, 0), 0);
 
-            // Limit text & password char.
+            // Limit text & password char (EM_SETPASSWORDCHAR applies to single-line EDITs only).
             SendMessageW(h_edit, wm::EM_LIMITTEXT, 64, 0);
             assert_eq!(SendMessageW(h_edit, wm::EM_GETLIMITTEXT, 0, 0), 64);
             SendMessageW(h_edit, wm::EM_SETPASSWORDCHAR, b'*' as usize, 0);
-            assert_eq!(SendMessageW(h_edit, wm::EM_GETPASSWORDCHAR, 0, 0), b'*' as LRESULT);
+            assert_eq!(SendMessageW(h_edit, wm::EM_GETPASSWORDCHAR, 0, 0), 0);
+            let h_single = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("pw").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                160,
+                200,
+                24,
+                parent,
+                201,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!h_single.is_null());
+            SendMessageW(h_single, wm::EM_SETPASSWORDCHAR, b'*' as usize, 0);
+            assert_eq!(SendMessageW(h_single, wm::EM_GETPASSWORDCHAR, 0, 0), b'*' as LRESULT);
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
@@ -2331,6 +2368,150 @@ mod tests {
             let _ = PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
             assert_eq!(SendMessageW(h_manual_chk, wm::BM_GETCHECK, 0, 0), BST_UNCHECKED as LRESULT);
             assert_eq!(*COMMAND_LOG.lock().unwrap(), vec![(403, BN_CLICKED as u16, h_manual_chk as usize)]);
+
+            assert_eq!(DestroyWindow(parent), TRUE);
+            assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_focus_clears_native_edit_focus_and_em_setpasswordchar_updates_native_mode() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            use crate::macos::{capture_control_ops, RecordedControlOp};
+
+            let (parent, parent_cls) = make_parent("FocusAndPasswordParent");
+            let custom_child = CreateWindowExW(
+                0,
+                parent_cls.as_ptr(),
+                crate::strings::to_wide_z("CustomChild").as_ptr(),
+                ws::CHILD | ws::VISIBLE,
+                10,
+                10,
+                120,
+                40,
+                parent,
+                500,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("secret").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ws::BORDER,
+                10,
+                60,
+                200,
+                24,
+                parent,
+                501,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let multiline_edit = CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("multi").as_ptr(),
+                ws::CHILD | ws::VISIBLE | ES_MULTILINE,
+                10,
+                100,
+                200,
+                60,
+                parent,
+                502,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!parent.is_null() && !custom_child.is_null() && !edit.is_null() && !multiline_edit.is_null());
+
+            // Simulate native AppKit backing (headless unit tests run with macos::active() == false).
+            window::get(parent as usize).unwrap().data().native = true;
+            window::get(edit as usize).unwrap().data().native_control = true;
+            window::get(multiline_edit as usize).unwrap().data().native_control = true;
+
+            // 1. Focus the native EDIT, then move focus to a custom child window -> must unfocus the native EDIT.
+            let (_, ops) = capture_control_ops(|| {
+                super::super::input::SetFocus(edit);
+                assert_eq!(super::super::input::GetFocus(), edit);
+                super::super::input::SetFocus(custom_child);
+                assert_eq!(super::super::input::GetFocus(), custom_child);
+            });
+            assert_eq!(
+                ops,
+                vec![
+                    RecordedControlOp::Focus(edit as usize),
+                    RecordedControlOp::Unfocus(edit as usize),
+                    RecordedControlOp::ClearWindowFocus(parent as usize),
+                ]
+            );
+
+            // 2. Focus the native EDIT, then move focus to the top-level window -> must unfocus the native EDIT.
+            let (_, ops) = capture_control_ops(|| {
+                super::super::input::SetFocus(edit);
+                super::super::input::SetFocus(parent);
+                assert_eq!(super::super::input::GetFocus(), parent);
+            });
+            assert_eq!(
+                ops,
+                vec![
+                    RecordedControlOp::Focus(edit as usize),
+                    RecordedControlOp::Unfocus(edit as usize),
+                    RecordedControlOp::ClearWindowFocus(parent as usize),
+                ]
+            );
+
+            // 3. Focus the native EDIT, then SetFocus(NULL) -> must unfocus the native EDIT.
+            let (_, ops) = capture_control_ops(|| {
+                super::super::input::SetFocus(edit);
+                super::super::input::SetFocus(std::ptr::null_mut());
+                assert!(super::super::input::GetFocus().is_null());
+            });
+            assert_eq!(
+                ops,
+                vec![
+                    RecordedControlOp::Focus(edit as usize),
+                    RecordedControlOp::Unfocus(edit as usize),
+                ]
+            );
+
+            // 4. EM_SETPASSWORDCHAR on a single-line EDIT toggles ES_PASSWORD, updates the native
+            //    password mode bridge, and preserves text + selection.
+            let mut buf = [0u16; 32];
+            assert_eq!(SendMessageW(edit, wm::EM_GETPASSWORDCHAR, 0, 0), 0);
+            SendMessageW(edit, wm::EM_SETSEL, 1, 4);
+            let (_, ops) = capture_control_ops(|| {
+                SendMessageW(edit, wm::EM_SETPASSWORDCHAR, b'*' as WPARAM, 0);
+            });
+            assert_eq!(ops, vec![RecordedControlOp::SetPasswordMode(edit as usize, true)]);
+            assert_eq!(SendMessageW(edit, wm::EM_GETPASSWORDCHAR, 0, 0), b'*' as LRESULT);
+            let style = super::super::window::GetWindowLongW(edit, super::super::window::GWL_STYLE) as u32;
+            assert_ne!(style & ES_PASSWORD, 0);
+            let n = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "secret");
+            let (mut s, mut e) = (0u32, 0u32);
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (1, 4));
+
+            // Clearing password char back to 0 unmasks the native field and clears ES_PASSWORD.
+            let (_, ops) = capture_control_ops(|| {
+                SendMessageW(edit, wm::EM_SETPASSWORDCHAR, 0, 0);
+            });
+            assert_eq!(ops, vec![RecordedControlOp::SetPasswordMode(edit as usize, false)]);
+            assert_eq!(SendMessageW(edit, wm::EM_GETPASSWORDCHAR, 0, 0), 0);
+            let style = super::super::window::GetWindowLongW(edit, super::super::window::GWL_STYLE) as u32;
+            assert_eq!(style & ES_PASSWORD, 0);
+            let n = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n]), "secret");
+
+            // 5. EM_SETPASSWORDCHAR has no effect on multiline EDIT controls.
+            let (_, ops) = capture_control_ops(|| {
+                SendMessageW(multiline_edit, wm::EM_SETPASSWORDCHAR, b'*' as WPARAM, 0);
+            });
+            assert!(ops.is_empty());
+            assert_eq!(SendMessageW(multiline_edit, wm::EM_GETPASSWORDCHAR, 0, 0), 0);
 
             assert_eq!(DestroyWindow(parent), TRUE);
             assert_eq!(UnregisterClassW(parent_cls.as_ptr(), std::ptr::null_mut()), TRUE);
