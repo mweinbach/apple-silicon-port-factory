@@ -1295,6 +1295,10 @@ define_class!(
 
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &NSNotification) {
+            enum EditChangeNotify {
+                Text(String, usize, usize),
+                Selection(usize, usize),
+            }
             let hwnd = self.ivars().hwnd.get();
             let update = CONTROLS.with(|m| {
                 let map = m.borrow();
@@ -1347,15 +1351,23 @@ define_class!(
                         raw
                     };
                     *last_text.borrow_mut() = norm.units;
-                    last_sel.set((norm.sel_start, norm.sel_end));
+                    let prev_sel = last_sel.replace((norm.sel_start, norm.sel_end));
                     if norm.text_changed {
-                        return Some((final_text, norm.sel_start, norm.sel_end));
+                        return Some(EditChangeNotify::Text(final_text, norm.sel_start, norm.sel_end));
+                    } else if prev_sel != (norm.sel_start, norm.sel_end) {
+                        return Some(EditChangeNotify::Selection(norm.sel_start, norm.sel_end));
                     }
                 }
                 None
             });
-            if let Some((t, lo, hi)) = update {
-                controls::native_edit_text_changed(hwnd, t, lo, hi);
+            match update {
+                Some(EditChangeNotify::Text(t, lo, hi)) => {
+                    controls::native_edit_text_changed(hwnd, t, lo, hi);
+                }
+                Some(EditChangeNotify::Selection(lo, hi)) => {
+                    controls::native_edit_selection_changed(hwnd, lo, hi);
+                }
+                None => {}
             }
         }
     }
@@ -1370,6 +1382,10 @@ define_class!(
 
         #[unsafe(method(textDidChange:))]
         fn text_did_change(&self, _notification: &NSNotification) {
+            enum EditChangeNotify {
+                Text(String, usize, usize),
+                Selection(usize, usize),
+            }
             let hwnd = self.ivars().hwnd.get();
             let update = CONTROLS.with(|m| {
                 let map = m.borrow();
@@ -1424,15 +1440,23 @@ define_class!(
                         None
                     };
                     *last_text.borrow_mut() = norm.units;
-                    last_sel.set((norm.sel_start, norm.sel_end));
+                    let prev_sel = last_sel.replace((norm.sel_start, norm.sel_end));
                     if let Some(win32_text) = final_win32 {
-                        return Some((win32_text, norm.sel_start, norm.sel_end));
+                        return Some(EditChangeNotify::Text(win32_text, norm.sel_start, norm.sel_end));
+                    } else if prev_sel != (norm.sel_start, norm.sel_end) {
+                        return Some(EditChangeNotify::Selection(norm.sel_start, norm.sel_end));
                     }
                 }
                 None
             });
-            if let Some((t, lo, hi)) = update {
-                controls::native_edit_text_changed(hwnd, t, lo, hi);
+            match update {
+                Some(EditChangeNotify::Text(t, lo, hi)) => {
+                    controls::native_edit_text_changed(hwnd, t, lo, hi);
+                }
+                Some(EditChangeNotify::Selection(lo, hi)) => {
+                    controls::native_edit_selection_changed(hwnd, lo, hi);
+                }
+                None => {}
             }
         }
     }

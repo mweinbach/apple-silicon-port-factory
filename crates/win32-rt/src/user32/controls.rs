@@ -316,6 +316,20 @@ pub(crate) fn apply_native_edit_constraints(
         }
     }
 
+    // If the user attempted to insert/replace with non-empty input and style or
+    // limit constraints rejected every inserted unit, reject the edit intact
+    // rather than deleting the previously selected span.
+    if !raw_inserted.is_empty() && inserted.is_empty() {
+        let prev_sel_end = prev.len() - suffix;
+        return NormalizedEdit {
+            units: prev.to_vec(),
+            sel_start: prefix,
+            sel_end: prev_sel_end,
+            text_changed: false,
+            reconcile_native: prev != next,
+        };
+    }
+
     let mut out = Vec::with_capacity(prefix + inserted.len() + suffix);
     out.extend_from_slice(&prev[..prefix]);
     out.extend_from_slice(&inserted);
@@ -2979,6 +2993,34 @@ mod tests {
                 assert!(norm.text_changed);
                 assert!(!norm.reconcile_native);
             }
+
+            // In ES_NUMBER, replacing selected "2" in "123" with "a" must preserve "123"
+            // and the original selection (1, 2) instead of deleting "2".
+            let prev_123: Vec<u16> = "123".encode_utf16().collect();
+            let next_1a3: Vec<u16> = "1a3".encode_utf16().collect();
+            let norm_num = apply_native_edit_constraints(&prev_123, &next_1a3, 2, 2, ES_NUMBER, 0);
+            assert_eq!(String::from_utf16_lossy(&norm_num.units), "123");
+            assert_eq!((norm_num.sel_start, norm_num.sel_end), (1, 2));
+            assert!(!norm_num.text_changed);
+            assert!(norm_num.reconcile_native);
+
+            // Actual deletion in ES_NUMBER (raw_inserted empty) still deletes "2".
+            let next_13: Vec<u16> = "13".encode_utf16().collect();
+            let norm_del = apply_native_edit_constraints(&prev_123, &next_13, 1, 1, ES_NUMBER, 0);
+            assert_eq!(String::from_utf16_lossy(&norm_del.units), "13");
+            assert_eq!((norm_del.sel_start, norm_del.sel_end), (1, 1));
+            assert!(norm_del.text_changed);
+            assert!(!norm_del.reconcile_native);
+
+            // In ES_UPPERCASE, replacing selected "A" with "a" leaves text unchanged ("A")
+            // while advancing the caret to (1, 1).
+            let prev_a: Vec<u16> = "A".encode_utf16().collect();
+            let next_a: Vec<u16> = "a".encode_utf16().collect();
+            let norm_up = apply_native_edit_constraints(&prev_a, &next_a, 1, 1, ES_UPPERCASE, 0);
+            assert_eq!(String::from_utf16_lossy(&norm_up.units), "A");
+            assert_eq!((norm_up.sel_start, norm_up.sel_end), (1, 1));
+            assert!(!norm_up.text_changed);
+            assert!(norm_up.reconcile_native);
 
             // Win32 WM_CHAR Return at EM_LIMITTEXT must not insert a half CRLF ("\r").
             assert_eq!(SetWindowTextW(edit, crate::strings::to_wide_z("ab").as_ptr()), TRUE);
