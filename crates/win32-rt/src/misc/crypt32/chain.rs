@@ -1879,8 +1879,62 @@ const CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG: u32 = 0x0000_0001;
 const CERT_TRUST_HAS_WEAK_SIGNATURE: u32 = 0x0010_0000;
 const TRUST_E_CERT_SIGNATURE: u32 = 0x8009_6004;
 
+/// Resolve the actual certification path `[leaf, intermediate..., optional_root]` starting from
+/// `chain_der[0]`, selecting issuers from `chain_der[1..]` and `root_pool` by cryptographic
+/// signature match (falling back to issuer/subject DN match if no signature-verified issuer
+/// exists in the candidate pool). Unrelated certificates in `hAdditionalStore` are excluded.
+fn resolve_selected_issuer_path<'a>(
+    chain_der: &'a [Vec<u8>],
+    root_pool: &'a [Vec<u8>],
+) -> Vec<&'a [u8]> {
+    let Some(leaf) = chain_der.first() else {
+        return Vec::new();
+    };
+    let mut path: Vec<&'a [u8]> = vec![leaf.as_slice()];
+    for _ in 0..16 {
+        let cur = *path.last().unwrap();
+        let Some(cur_parts) = parse_cert_der_parts(cur) else {
+            break;
+        };
+        if cur_parts.subject_inner == cur_parts.issuer_inner {
+            break;
+        }
+        let find_issuer = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
+            let mut dn_fallback: Option<&'a [u8]> = None;
+            for cand in pool {
+                let cand_slice = cand.as_slice();
+                if path.iter().any(|&p| p == cand_slice) {
+                    continue;
+                }
+                let Some(cp) = parse_cert_der_parts(cand_slice) else {
+                    continue;
+                };
+                if cp.subject_inner != cur_parts.issuer_inner {
+                    continue;
+                }
+                if verify_cert_sig_with_spki(&cur_parts, cp.spki_alg_inner, cp.spki_key_bits) {
+                    return Some(cand_slice);
+                }
+                if dn_fallback.is_none() {
+                    dn_fallback = Some(cand_slice);
+                }
+            }
+            dn_fallback
+        };
+        if let Some(next) = find_issuer(&chain_der[1..]) {
+            path.push(next);
+            continue;
+        }
+        if let Some(root) = find_issuer(root_pool) {
+            path.push(root);
+        }
+        break;
+    }
+    path
+}
+
 /// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
-/// against `chain_der` (and optional trusted root pool `root_pool`).
+/// against the selected certification path resolved from `chain_der` and `root_pool`.
 /// Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
 unsafe fn evaluate_cert_chain_para(
     p_chain_para: *const c_void,
@@ -1895,6 +1949,8 @@ unsafe fn evaluate_cert_chain_para(
     if cb_size < 0x20 {
         return Err(err::ERROR_INVALID_PARAMETER);
     }
+
+    let selected_path = resolve_selected_issuer_path(chain_der, root_pool);
 
     let read_usage_match = |off: usize| -> Result<Option<(u32, Vec<String>)>, u32> {
         let dw_type = std::ptr::read_unaligned(base.add(off) as *const u32);
@@ -1920,9 +1976,10 @@ unsafe fn evaluate_cert_chain_para(
     let mut trust_bits = 0u32;
     let mut para_err = 0u32;
 
-    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08)
+    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08) — checked ONLY on the selected issuer path
+    //    so unrelated certificates in hAdditionalStore never taint EKU validation.
     if let Some((match_type, req_ekus)) = read_usage_match(0x08)? {
-        for der in chain_der {
+        for &der in &selected_path {
             if let Some(raw_oids) = cert_eku_oids(der) {
                 if !raw_oids.is_empty() {
                     let oids: Vec<String> = raw_oids
@@ -1952,7 +2009,7 @@ unsafe fn evaluate_cert_chain_para(
     // 2. RequestedIssuancePolicy (CERT_USAGE_MATCH @ +0x20 when cbSize >= 0x38)
     if cb_size >= 0x38 {
         if let Some((match_type, req_policies)) = read_usage_match(0x20)? {
-            let leaf_policies = chain_der
+            let leaf_policies = selected_path
                 .first()
                 .map(|d| cert_policy_oids(d))
                 .unwrap_or_default();
@@ -1989,7 +2046,7 @@ unsafe fn evaluate_cert_chain_para(
             // Per Windows SDK wincrypt.h:
             //   CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE == 1 (pSerializedInfo)
             //   CERT_STRONG_SIGN_OID_INFO_CHOICE        == 2 (pszOID)
-            // Enforce non-MD2/MD5/SHA-1 signatures for standard OS strong-sign OIDs;
+            // Enforce strong signature algorithms and key lengths for standard OS strong-sign OIDs;
             // fail closed on serialized info or unrecognized OIDs.
             match dw_choice {
                 CERT_STRONG_SIGN_OID_INFO_CHOICE => {
@@ -2022,7 +2079,7 @@ unsafe fn evaluate_cert_chain_para(
                 (dw_strong_flags & CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG) != 0;
 
             let mut weak = false;
-            for (idx, d) in chain_der.iter().enumerate() {
+            for (idx, &d) in selected_path.iter().enumerate() {
                 let is_self_signed = parse_cert_der_parts(d)
                     .is_some_and(|p| p.subject_inner == p.issuer_inner);
                 // Enforce strong signature algorithm on the leaf and all non-self-signed
@@ -2037,22 +2094,6 @@ unsafe fn evaluate_cert_chain_para(
                 if (idx > 0 || !disable_end_check) && !cert_has_strong_public_key(d) {
                     weak = true;
                     break;
-                }
-            }
-            // If the top certificate in chain_der is issued by a root in root_pool, verify
-            // that the issuing root's public key also meets strong-sign key strength.
-            if !weak {
-                if let Some(top_parts) = chain_der.last().and_then(|d| parse_cert_der_parts(d)) {
-                    if top_parts.subject_inner != top_parts.issuer_inner {
-                        if let Some(root_der) = root_pool.iter().find(|r| {
-                            parse_cert_der_parts(r)
-                                .is_some_and(|rp| rp.subject_inner == top_parts.issuer_inner)
-                        }) {
-                            if !cert_has_strong_public_key(root_der) {
-                                weak = true;
-                            }
-                        }
-                    }
                 }
             }
             if weak {

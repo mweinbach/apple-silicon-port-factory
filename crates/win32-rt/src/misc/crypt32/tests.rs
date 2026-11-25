@@ -5162,6 +5162,117 @@ fn macos_trust_store_and_extended_chain_policies() {
         CertFreeCertificateContext(leaf1024_ctx);
         CertFreeCertificateChainEngine(ss_eng);
         CertCloseStore(ss_root_st, 0);
+
+        // Unrelated certificates in hAdditionalStore (e.g. a code-signing-only cert or a weak
+        // 1024-bit RSA cert) MUST NOT taint RequestedUsage or pStrongSignPara evaluation of an
+        // otherwise valid serverAuth chain.
+        let ed_root_st = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                ed_root_st,
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_CA_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_CA_DER.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut ed_eng_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(ed_eng_cfg.as_mut_ptr() as *mut u32, ed_eng_cfg.len() as u32);
+        std::ptr::write_unaligned(ed_eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, ed_root_st);
+        let mut ed_eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertCreateCertificateChainEngine(ed_eng_cfg.as_ptr() as *const c_void, &mut ed_eng),
+            TRUE
+        );
+        let ed_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            crate::misc::secur32::tests::TEST_LEAF_DER.as_ptr(),
+            crate::misc::secur32::tests::TEST_LEAF_DER.len() as u32,
+        );
+        // Populate hAdditionalStore with unrelated clientAuth-only AND 1024-bit RSA certs.
+        let unrelated_add_st = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                unrelated_add_st,
+                X509_ASN_ENCODING,
+                crate::misc::secur32::tests::TEST_MTLS_CLIENT_DER.as_ptr(),
+                crate::misc::secur32::tests::TEST_MTLS_CLIENT_DER.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                unrelated_add_st,
+                X509_ASN_ENCODING,
+                self::test_vectors::RSA1024_LEAF_SHA256_DER.as_ptr(),
+                self::test_vectors::RSA1024_LEAF_SHA256_DER.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let srv_oid_z = b"1.3.6.1.5.5.7.3.1\0";
+        let srv_oids_arr = [srv_oid_z.as_ptr()];
+        let mut cp_unrelated = [0u8; 0x60];
+        std::ptr::write_unaligned(cp_unrelated.as_mut_ptr() as *mut u32, 0x60u32);
+        std::ptr::write_unaligned(cp_unrelated.as_mut_ptr().add(0x08) as *mut u32, 0u32); // AND
+        std::ptr::write_unaligned(cp_unrelated.as_mut_ptr().add(0x10) as *mut u32, 1u32);
+        std::ptr::write_unaligned(
+            cp_unrelated.as_mut_ptr().add(0x18) as *mut *const *const u8,
+            srv_oids_arr.as_ptr(),
+        );
+        std::ptr::write_unaligned(
+            cp_unrelated.as_mut_ptr().add(0x50) as *mut *const u8,
+            ss_para.as_ptr(),
+        );
+        let mut clean_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                ed_eng,
+                ed_leaf_ctx,
+                std::ptr::null(),
+                unrelated_add_st,
+                cp_unrelated.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut clean_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                clean_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "unrelated certs in hAdditionalStore must not taint RequestedUsage or pStrongSignPara"
+        );
+        CertFreeCertificateChain(clean_chain);
+        CertCloseStore(unrelated_add_st, 0);
+        CertFreeCertificateContext(ed_leaf_ctx);
+        CertFreeCertificateChainEngine(ed_eng);
+        CertCloseStore(ed_root_st, 0);
     }
 }
 
