@@ -257,6 +257,10 @@ pub mod topology {
     pub const LINESTRIP_ADJ: u32 = 11;
     pub const TRIANGLELIST_ADJ: u32 = 12;
     pub const TRIANGLESTRIP_ADJ: u32 = 13;
+    pub const PATCHLIST_1: u32 = 33;
+    pub const PATCHLIST_3: u32 = 35;
+    pub const PATCHLIST_4: u32 = 36;
+    pub const PATCHLIST_32: u32 = 64;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +282,15 @@ pub const IID_ID3D11RenderTargetView: Guid = guid("dfdba067-0b8d-4865-875b-d7b45
 pub const IID_ID3D11DepthStencilView: Guid = guid("9fdac92a-1876-48c3-afad-25b94f84a9b6");
 pub const IID_ID3D11UnorderedAccessView: Guid = guid("28acf509-7f5c-48f6-8611-f316010a6380");
 pub const IID_ID3D11VertexShader: Guid = guid("3b301d64-d678-4289-8897-22f8928b72f3");
+pub const IID_ID3D11HullShader: Guid = guid("8e5c6061-628a-4c8e-8264-bbe45cb3d5dd");
+pub const IID_ID3D11DomainShader: Guid = guid("f582c508-0f36-490c-9977-31eece268cfa");
 pub const IID_ID3D11GeometryShader: Guid = guid("38325b96-effb-4022-ba02-2e795b70275c");
 pub const IID_ID3D11PixelShader: Guid = guid("ea82e40d-51dc-4f33-93d4-db7c9125ae8c");
 pub const IID_ID3D11ComputeShader: Guid = guid("4f5b196e-c2bd-495e-bd01-1fded38e4969");
+pub const IID_ID3D11ClassLinkage: Guid = guid("ddf57cba-9543-46e4-a12b-f207a0fe7fed");
+pub const IID_ID3D11ClassInstance: Guid = guid("a6cd7faa-b0b7-4a2f-9436-8662a65797cb");
+pub const IID_ID3DDeviceContextState: Guid = guid("5c1e0d8a-7c23-48f9-8c59-a92958ceff11");
+pub const IID_ID3D10Device1: Guid = guid("9b7e4c8f-342c-4106-a19f-4f2704f689f0");
 pub const IID_ID3D11InputLayout: Guid = guid("e4819ddc-4cf0-4025-bd26-5de82a3e07b7");
 pub const IID_ID3D11BlendState: Guid = guid("75b68faa-347d-4159-8f45-a0640f01cd9a");
 pub const IID_ID3D11BlendState1: Guid = guid("cc86fabe-da55-401d-85e7-e3c9de2877e9");
@@ -323,9 +333,14 @@ pub fn register_names() {
             (IID_ID3D11DepthStencilView, "ID3D11DepthStencilView"),
             (IID_ID3D11UnorderedAccessView, "ID3D11UnorderedAccessView"),
             (IID_ID3D11VertexShader, "ID3D11VertexShader"),
+            (IID_ID3D11HullShader, "ID3D11HullShader"),
+            (IID_ID3D11DomainShader, "ID3D11DomainShader"),
             (IID_ID3D11GeometryShader, "ID3D11GeometryShader"),
             (IID_ID3D11PixelShader, "ID3D11PixelShader"),
             (IID_ID3D11ComputeShader, "ID3D11ComputeShader"),
+            (IID_ID3D11ClassLinkage, "ID3D11ClassLinkage"),
+            (IID_ID3D11ClassInstance, "ID3D11ClassInstance"),
+            (IID_ID3DDeviceContextState, "ID3DDeviceContextState"),
             (IID_ID3D11InputLayout, "ID3D11InputLayout"),
             (IID_ID3D11BlendState, "ID3D11BlendState"),
             (IID_ID3D11BlendState1, "ID3D11BlendState1"),
@@ -677,6 +692,28 @@ pub struct D3D11_COUNTER_INFO {
     pub NumDetectableParallelUnits: u8,
 }
 const _: () = assert!(std::mem::size_of::<D3D11_COUNTER_INFO>() == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct D3D11_COUNTER_DESC {
+    pub Counter: u32,
+    pub MiscFlags: u32,
+}
+const _: () = assert!(std::mem::size_of::<D3D11_COUNTER_DESC>() == 8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct D3D11_CLASS_INSTANCE_DESC {
+    pub InstanceId: u32,
+    pub InstanceIndex: u32,
+    pub TypeId: u32,
+    pub ConstantBuffer: u32,
+    pub BaseConstantBufferOffset: u32,
+    pub BaseTexture: u32,
+    pub BaseSampler: u32,
+    pub Created: BOOL,
+}
+const _: () = assert!(std::mem::size_of::<D3D11_CLASS_INSTANCE_DESC>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
