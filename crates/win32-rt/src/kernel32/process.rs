@@ -555,6 +555,38 @@ fn is_valid_priority_class(c: u32) -> bool {
     matches!(c, 0x20 | 0x40 | 0x80 | 0x100 | 0x4000 | 0x8000)
 }
 
+/// Windows NT base scheduling priority (`KPRIORITY`) corresponding to the current process priority class.
+pub fn current_process_base_priority() -> i32 {
+    match PRIORITY_CLASS.load(Ordering::Acquire) {
+        0x40 => 4,    // IDLE_PRIORITY_CLASS
+        0x4000 => 6,  // BELOW_NORMAL_PRIORITY_CLASS
+        0x20 => 8,    // NORMAL_PRIORITY_CLASS
+        0x8000 => 10, // ABOVE_NORMAL_PRIORITY_CLASS
+        0x80 => 13,   // HIGH_PRIORITY_CLASS
+        0x100 => 24,  // REALTIME_PRIORITY_CLASS
+        _ => 8,
+    }
+}
+
+/// Convert a Win32 relative thread priority (`THREAD_PRIORITY_*`) into an absolute Windows NT
+/// base scheduling priority (`KPRIORITY`) under the current process priority class.
+pub fn thread_base_priority(rel_prio: i32) -> i32 {
+    if PRIORITY_CLASS.load(Ordering::Acquire) == 0x100 {
+        match rel_prio {
+            -15 => 16,
+            15 => 31,
+            d => 24i32.saturating_add(d).clamp(16, 31),
+        }
+    } else {
+        let base = current_process_base_priority();
+        match rel_prio {
+            -15 => 1,
+            15 => 15,
+            d => base.saturating_add(d).clamp(1, 15),
+        }
+    }
+}
+
 pub unsafe extern "win64" fn GetPriorityClass(h: HANDLE) -> u32 {
     if !is_self(h) {
         if handles::get_as::<ChildProcessObj>(h).is_some() {

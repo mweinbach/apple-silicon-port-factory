@@ -167,7 +167,14 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                     0
                 },
             );
-            std::ptr::write_unaligned(out.add(24) as *mut i32, if is_self { 8 } else { 0 }); // BasePriority
+            std::ptr::write_unaligned(
+                out.add(24) as *mut i32,
+                if is_self {
+                    crate::kernel32::process::current_process_base_priority()
+                } else {
+                    0
+                },
+            ); // BasePriority
             std::ptr::write_unaligned(out.add(32) as *mut usize, pid as usize);
             let ppid = if child.is_some() {
                 std::process::id() as usize
@@ -516,13 +523,14 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
                 let proc_mask = crate::kernel32::process::current_process_affinity_mask();
                 let aff = t.affinity_mask.load(std::sync::atomic::Ordering::Acquire);
                 let prio = t.priority.load(std::sync::atomic::Ordering::Relaxed);
+                let base_prio = crate::kernel32::process::thread_base_priority(prio);
                 std::ptr::write_unaligned(out as *mut u32, exit_status);
                 std::ptr::write_unaligned(out.add(8) as *mut usize, tebp);
                 std::ptr::write_unaligned(out.add(16) as *mut usize, std::process::id() as usize);
                 std::ptr::write_unaligned(out.add(24) as *mut usize, tid);
                 std::ptr::write_unaligned(out.add(32) as *mut usize, if aff == 0 { proc_mask } else { aff });
-                std::ptr::write_unaligned(out.add(40) as *mut i32, 8 + prio);
-                std::ptr::write_unaligned(out.add(44) as *mut i32, prio);
+                std::ptr::write_unaligned(out.add(40) as *mut i32, base_prio);
+                std::ptr::write_unaligned(out.add(44) as *mut i32, base_prio);
             } else if let Some(ref ct) = child_thr {
                 let exit_status = ct.process.current_exit_code().unwrap_or(crate::kernel32::threads::STILL_ACTIVE);
                 std::ptr::write_unaligned(out as *mut u32, exit_status);
@@ -3619,9 +3627,37 @@ mod tests {
             );
             assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
 
-            // 2. NtQueryInformationThread classes: ThreadTimes(1), ThreadAmILastThread(0x0C),
-            // ThreadHideFromDebugger(0x11) round-trip, ThreadGroupInformation(0x1E), ThreadNameInformation(0x26),
-            // unknown classes.
+            // 2. NtQueryInformationThread classes: ThreadBasicInformation(0), ThreadTimes(1),
+            // ThreadAmILastThread(0x0C), ThreadHideFromDebugger(0x11) round-trip,
+            // ThreadGroupInformation(0x1E), ThreadNameInformation(0x26), unknown classes.
+            {
+                let orig_proc_prio = crate::kernel32::process::GetPriorityClass(crate::handles::CURRENT_PROCESS);
+                let orig_thr_prio = crate::kernel32::threads::GetThreadPriority(crate::handles::CURRENT_THREAD);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, 0x20), TRUE);
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, 0), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(ret, 48);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(40) as *const i32), 8);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 8);
+                // Below-normal relative priority (-1) maps to absolute NT base priority 7 (never negative).
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -1), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(40) as *const i32), 7);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 7);
+                // THREAD_PRIORITY_IDLE (-15) -> 1, HIGH_PRIORITY_CLASS + (-1) -> 12.
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -15), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 1);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, 0x80), TRUE);
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -1), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 12);
+                assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 13);
+                // Restore original thread and process priorities.
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, orig_thr_prio), TRUE);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, orig_proc_prio), TRUE);
+            }
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 1, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 32);
             // ThreadTimes on an exited thread preserves ExitTime and snapshotted CPU time.
