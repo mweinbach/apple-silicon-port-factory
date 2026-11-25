@@ -1,8 +1,8 @@
 //! Certificate contexts, stores, name formatting, and PKCS#7 message handles for `crypt32.dll`.
 
 use super::asn1::{
-    all_dn_values_lower, encode_der_tlv, parse_cert_der_parts, PKCS_7_ASN_ENCODING,
-    X509_ASN_ENCODING,
+    all_dn_values_lower, encode_der_tlv, parse_cert_der_parts, parse_eku_der_oids,
+    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use super::chain::{cert_verify_time_validity_impl, verify_cert_sig_with_spki};
 use crate::handles::HandleTable;
@@ -419,7 +419,11 @@ pub(super) fn lookup_spki_raw_der(spki_addr: usize) -> Option<Vec<u8>> {
 
 pub(super) fn lookup_cert_for_chain(
     cert_handle: usize,
-) -> Option<(Vec<Vec<u8>>, Option<PeerCertVerifyResult>)> {
+) -> Option<(
+    Vec<Vec<u8>>,
+    Option<PeerCertVerifyResult>,
+    HashMap<Vec<u8>, Vec<Vec<u8>>>,
+)> {
     let st = STORE_STATE.lock().unwrap();
     let entry = st.certs.get(&cert_handle)?;
     let certs = if !entry.peer_chain_der.is_empty() {
@@ -427,7 +431,33 @@ pub(super) fn lookup_cert_for_chain(
     } else {
         vec![entry.owned.raw_der().to_vec()]
     };
-    Some((certs, entry.peer_verify.clone()))
+    let mut eku_props = HashMap::new();
+    let mut collect_store = |store_id: usize| {
+        if store_id != 0 {
+            if let Some(store) = st.stores.get(&store_id) {
+                for h in &store.certs {
+                    if let Some(c) = st.certs.get(h) {
+                        if let Some(raw) = c.properties.get(&CERT_ENHKEY_USAGE_PROP_ID) {
+                            if let Some(oids) = parse_eku_der_oids(raw) {
+                                eku_props.insert(c.owned.raw_der().to_vec(), oids);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    collect_store(entry.owned_store);
+    let cert_store_h = unsafe { (*entry.owned.as_ptr()).h_cert_store as usize };
+    if cert_store_h != entry.owned_store {
+        collect_store(cert_store_h);
+    }
+    if let Some(raw) = entry.properties.get(&CERT_ENHKEY_USAGE_PROP_ID) {
+        if let Some(oids) = parse_eku_der_oids(raw) {
+            eku_props.insert(entry.owned.raw_der().to_vec(), oids);
+        }
+    }
+    Some((certs, entry.peer_verify.clone(), eku_props))
 }
 
 /// Register a TLS peer's certificate chain and return a newly referenced leaf `PCCERT_CONTEXT`
@@ -476,20 +506,37 @@ pub(crate) fn register_peer_cert_chain(
     leaf_handle as *mut c_void
 }
 
-/// Collect DER bytes of all certificates in a registered `HCERTSTORE`.
-pub(crate) fn store_certs_der(h_cert_store: *mut c_void) -> Vec<Vec<u8>> {
+/// Collect DER bytes and any stored `CERT_ENHKEY_USAGE_PROP_ID` restrictions for all
+/// certificates in a registered `HCERTSTORE`.
+pub(super) fn store_certs_with_eku_props(
+    h_cert_store: *mut c_void,
+) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, Vec<Vec<u8>>>) {
     if h_cert_store.is_null() {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
     let st = STORE_STATE.lock().unwrap();
     let Some(store) = st.stores.get(&(h_cert_store as usize)) else {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     };
-    store
-        .certs
-        .iter()
-        .filter_map(|h| st.certs.get(h).map(|c| c.owned.raw_der().to_vec()))
-        .collect()
+    let mut ders = Vec::with_capacity(store.certs.len());
+    let mut eku_props = HashMap::new();
+    for h in &store.certs {
+        if let Some(c) = st.certs.get(h) {
+            let der = c.owned.raw_der().to_vec();
+            if let Some(raw) = c.properties.get(&CERT_ENHKEY_USAGE_PROP_ID) {
+                if let Some(oids) = parse_eku_der_oids(raw) {
+                    eku_props.insert(der.clone(), oids);
+                }
+            }
+            ders.push(der);
+        }
+    }
+    (ders, eku_props)
+}
+
+/// Collect DER bytes of all certificates in a registered `HCERTSTORE`.
+pub(crate) fn store_certs_der(h_cert_store: *mut c_void) -> Vec<Vec<u8>> {
+    store_certs_with_eku_props(h_cert_store).0
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,6 +2363,10 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
             }
         }
     };
+    if dw_prop_id == CERT_ENHKEY_USAGE_PROP_ID && parse_eku_der_oids(&val).is_none() {
+        crate::teb::set_last_error(0x8009_310B); // CRYPT_E_ASN1_BADTAG
+        return FALSE;
+    }
     entry.properties.insert(dw_prop_id, val);
     TRUE
 }

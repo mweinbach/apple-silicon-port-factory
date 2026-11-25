@@ -5815,9 +5815,24 @@ fn macos_trust_store_and_extended_chain_policies() {
             assert!(wc_only);
         }
 
-        // 1) RequestedUsage OR must intersect usages across the entire path: a serverAuth-only
-        //    leaf under a clientAuth-only intermediate MUST FAIL OR {serverAuth, clientAuth}
-        //    with CERT_TRUST_IS_NOT_VALID_FOR_USAGE / CERT_E_WRONG_USAGE!
+        // 1) RequestedUsage OR (per MSDN CERT_USAGE_MATCH remarks): evaluate the OR predicate per
+        //    certificate and require every certificate in the authenticated path to satisfy it.
+        //    - leaf=serverAuth + inter=clientAuth + root=unrestricted PASSES OR {serverAuth, clientAuth}
+        //    - leaf=serverAuth + inter=codeSigning + root=unrestricted FAILS OR {serverAuth, clientAuth}
+        let or_pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(
+                crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+            ),
+        );
+        let or_signing_key = crate::net_tls::crypto_provider()
+            .key_provider
+            .load_private_key(or_pk_der)
+            .expect("load Ed25519 key");
+        let or_spki_der = or_signing_key
+            .public_key()
+            .expect("extract SPKI")
+            .as_ref()
+            .to_vec();
         let mk_eku_cert = |serial: u8, subj: &str, iss: &str, eku_oids: &[&[u8]], is_ca: bool| -> Vec<u8> {
             let tlv = super::asn1::encode_der_tlv;
             let mk_dn = |cn: &str| {
@@ -5825,17 +5840,21 @@ fn macos_trust_store_and_extended_chain_policies() {
                 atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
                 tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
             };
-            let alg = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+            let alg = tlv(0x30, &tlv(0x06, &[0x2B, 0x65, 0x70])); // Ed25519
             let mut val = tlv(0x17, b"200101000000Z");
             val.extend_from_slice(&tlv(0x17, b"400101000000Z"));
-            let mut spki = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]));
-            spki.extend_from_slice(&tlv(0x03, &[0x00, 0x04, serial]));
             let mut exts = Vec::new();
             let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
             bc.extend_from_slice(&tlv(0x01, &[0xFF]));
             let bc_inner = if is_ca { tlv(0x01, &[0xFF]) } else { Vec::new() };
             bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &bc_inner)));
             exts.extend_from_slice(&tlv(0x30, &bc));
+            if is_ca {
+                let mut ku = tlv(0x06, &[0x55, 0x1D, 0x0F]);
+                ku.extend_from_slice(&tlv(0x01, &[0xFF]));
+                ku.extend_from_slice(&tlv(0x04, &tlv(0x03, &[0x02, 0x04]))); // keyCertSign
+                exts.extend_from_slice(&tlv(0x30, &ku));
+            }
             if !eku_oids.is_empty() {
                 let mut es = Vec::new();
                 for e in eku_oids {
@@ -5845,24 +5864,40 @@ fn macos_trust_store_and_extended_chain_policies() {
                 ee.extend_from_slice(&tlv(0x04, &tlv(0x30, &es)));
                 exts.extend_from_slice(&tlv(0x30, &ee));
             }
-            let mut tbs = tlv(0xA0, &tlv(0x02, &[0x02]));
-            tbs.extend_from_slice(&tlv(0x02, &[serial]));
-            tbs.extend_from_slice(&alg);
-            tbs.extend_from_slice(&mk_dn(iss));
-            tbs.extend_from_slice(&tlv(0x30, &val));
-            tbs.extend_from_slice(&mk_dn(subj));
-            tbs.extend_from_slice(&tlv(0x30, &spki));
-            tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &exts)));
-            let mut body = tlv(0x30, &tbs);
+            let mut tbs_body = tlv(0xA0, &tlv(0x02, &[0x02]));
+            tbs_body.extend_from_slice(&tlv(0x02, &[serial]));
+            tbs_body.extend_from_slice(&alg);
+            tbs_body.extend_from_slice(&mk_dn(iss));
+            tbs_body.extend_from_slice(&tlv(0x30, &val));
+            tbs_body.extend_from_slice(&mk_dn(subj));
+            tbs_body.extend_from_slice(&or_spki_der);
+            tbs_body.extend_from_slice(&tlv(0xA3, &tlv(0x30, &exts)));
+            let tbs = tlv(0x30, &tbs_body);
+            let sig = or_signing_key
+                .choose_scheme(&[rustls::SignatureScheme::ED25519])
+                .expect("ed25519")
+                .sign(&tbs)
+                .expect("sign");
+            let mut sig_bits = vec![0u8];
+            sig_bits.extend_from_slice(&sig);
+            let mut body = tbs;
             body.extend_from_slice(&alg);
-            body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+            body.extend_from_slice(&tlv(0x03, &sig_bits));
             tlv(0x30, &body)
         };
         let oid_eku_srv: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
         let oid_eku_cli: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
         let oid_eku_cs: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+        let disjoint_root = mk_eku_cert(20, "DisjointRoot", "DisjointRoot", &[], true);
         let disjoint_leaf = mk_eku_cert(21, "DisjointLeaf", "DisjointInter", &[oid_eku_srv], false);
         let disjoint_inter = mk_eku_cert(22, "DisjointInter", "DisjointRoot", &[oid_eku_cli], true);
+        let disjoint_root_st = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(disjoint_root_st, X509_ASN_ENCODING, disjoint_root.as_ptr(), disjoint_root.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let mut disjoint_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(disjoint_cfg.as_mut_ptr() as *mut u32, disjoint_cfg.len() as u32);
+        std::ptr::write_unaligned(disjoint_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, disjoint_root_st);
+        let mut disjoint_eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(CertCreateCertificateChainEngine(disjoint_cfg.as_ptr() as *const c_void, &mut disjoint_eng), TRUE);
         let disjoint_leaf_ctx = CertCreateCertificateContext(
             X509_ASN_ENCODING,
             disjoint_leaf.as_ptr(),
@@ -5881,7 +5916,7 @@ fn macos_trust_store_and_extended_chain_policies() {
         let mut disjoint_ch: *mut c_void = std::ptr::null_mut();
         assert_eq!(
             CertGetCertificateChain(
-                std::ptr::null_mut(),
+                disjoint_eng,
                 disjoint_leaf_ctx,
                 std::ptr::null(),
                 disjoint_st,
@@ -5893,14 +5928,61 @@ fn macos_trust_store_and_extended_chain_policies() {
             TRUE
         );
         let disjoint_ts = std::ptr::read_unaligned((disjoint_ch as *const u8).add(4) as *const u32);
-        assert_ne!(
-            disjoint_ts & 0x0000_0010, // CERT_TRUST_IS_NOT_VALID_FOR_USAGE
+        assert_eq!(
+            disjoint_ts,
             0,
-            "OR {{serverAuth, clientAuth}} must fail when leaf=serverAuth and inter=clientAuth (empty intersection)"
+            "per MSDN CERT_USAGE_MATCH remarks, OR {{serverAuth, clientAuth}} accepts trusted leaf=serverAuth + inter=clientAuth because each cert satisfies OR"
         );
+        let mut disjoint_st_pol = CertChainPolicyStatus {
+            cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
+            dw_error: 0xDEAD,
+            l_chain_index: -1,
+            l_element_index: -1,
+            pv_extra_policy_status: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                super::chain::CERT_CHAIN_POLICY_BASE as *const u8,
+                disjoint_ch,
+                std::ptr::null(),
+                &mut disjoint_st_pol as *mut CertChainPolicyStatus as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(disjoint_st_pol.dw_error, 0);
         CertFreeCertificateChain(disjoint_ch);
         CertCloseStore(disjoint_st, 0);
+
+        // Conversely, leaf=serverAuth + inter=codeSigning MUST fail OR {serverAuth, clientAuth}
+        // because the intermediate supports neither requested OID.
+        let bad_or_inter = mk_eku_cert(23, "DisjointInter", "DisjointRoot", &[oid_eku_cs], true);
+        let bad_or_st = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(bad_or_st, X509_ASN_ENCODING, bad_or_inter.as_ptr(), bad_or_inter.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let mut bad_or_ch: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                disjoint_eng,
+                disjoint_leaf_ctx,
+                std::ptr::null(),
+                bad_or_st,
+                cp_or.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut bad_or_ch,
+            ),
+            TRUE
+        );
+        let bad_or_ts = std::ptr::read_unaligned((bad_or_ch as *const u8).add(4) as *const u32);
+        assert_ne!(
+            bad_or_ts & 0x0000_0010,
+            0,
+            "OR {{serverAuth, clientAuth}} must fail when inter=codeSigning satisfies neither OID"
+        );
+        CertFreeCertificateChain(bad_or_ch);
+        CertCloseStore(bad_or_st, 0);
         CertFreeCertificateContext(disjoint_leaf_ctx);
+        CertFreeCertificateChainEngine(disjoint_eng);
+        CertCloseStore(disjoint_root_st, 0);
 
         // 2) Cryptographically verified issuer in root_pool MUST beat a DN-colliding different-key
         //    certificate in hAdditionalStore (even if the colliding cert has incompatible EKU & cA=FALSE).
@@ -8521,5 +8603,427 @@ fn crl_decoder_handles_large_lists_and_rejects_failures() {
             over_cap_crl.len() as u32,
         )
         .is_null());
+    }
+}
+
+#[test]
+fn cert_enhkey_usage_prop_enforced_in_chain_and_policy_validation() {
+    use super::asn1::encode_der_tlv as tlv;
+    use super::chain::{CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_SSL};
+    use super::store::{CERT_ENHKEY_USAGE_PROP_ID, CERT_STORE_PROV_MEMORY};
+    use crate::misc::wintrust::CryptDataBlob;
+
+    let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+        ),
+    );
+    let signing_key = crate::net_tls::crypto_provider()
+        .key_provider
+        .load_private_key(pk_der)
+        .expect("load Ed25519 key");
+    let spki_der = signing_key.public_key().expect("extract SPKI").as_ref().to_vec();
+    let alg_ed25519 = tlv(0x30, &tlv(0x06, &[0x2B, 0x65, 0x70]));
+    let mk_dn = |cn: &str| {
+        let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+        atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+        tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+    };
+    let sign_cert = |serial: u8,
+                     subj: &str,
+                     iss: &str,
+                     is_ca: bool,
+                     eku_oids: Option<&[&[u8]]>|
+     -> Vec<u8> {
+        let mut val = tlv(0x17, b"240101000000Z");
+        val.extend_from_slice(&tlv(0x17, b"350101000000Z"));
+        let mut exts = Vec::new();
+        let mut bc_val = Vec::new();
+        if is_ca {
+            bc_val.extend_from_slice(&tlv(0x01, &[0xFF]));
+        }
+        let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+        bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+        bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &bc_val)));
+        exts.extend_from_slice(&tlv(0x30, &bc));
+        if is_ca {
+            let mut ku = tlv(0x06, &[0x55, 0x1D, 0x0F]);
+            ku.extend_from_slice(&tlv(0x01, &[0xFF]));
+            ku.extend_from_slice(&tlv(0x04, &tlv(0x03, &[0x02, 0x04]))); // keyCertSign
+            exts.extend_from_slice(&tlv(0x30, &ku));
+        } else {
+            // SAN DNSName: eku-prop.test
+            let mut san = tlv(0x06, &[0x55, 0x1D, 0x11]);
+            san.extend_from_slice(&tlv(0x04, &tlv(0x30, &tlv(0x82, b"eku-prop.test"))));
+            exts.extend_from_slice(&tlv(0x30, &san));
+        }
+        if let Some(oids) = eku_oids {
+            let mut seq_body = Vec::new();
+            for o in oids {
+                seq_body.extend_from_slice(&tlv(0x06, o));
+            }
+            let mut ee = tlv(0x06, &[0x55, 0x1D, 0x25]);
+            ee.extend_from_slice(&tlv(0x04, &tlv(0x30, &seq_body)));
+            exts.extend_from_slice(&tlv(0x30, &ee));
+        }
+        let mut tbs_body = tlv(0xA0, &tlv(0x02, &[0x02]));
+        tbs_body.extend_from_slice(&tlv(0x02, &[serial]));
+        tbs_body.extend_from_slice(&alg_ed25519);
+        tbs_body.extend_from_slice(&mk_dn(iss));
+        tbs_body.extend_from_slice(&tlv(0x30, &val));
+        tbs_body.extend_from_slice(&mk_dn(subj));
+        tbs_body.extend_from_slice(&spki_der);
+        tbs_body.extend_from_slice(&tlv(0xA3, &tlv(0x30, &exts)));
+        let tbs = tlv(0x30, &tbs_body);
+        let sig = signing_key
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
+            .expect("ed25519 scheme")
+            .sign(&tbs)
+            .expect("ed25519 sign");
+        let mut sig_bits = vec![0u8];
+        sig_bits.extend_from_slice(&sig);
+        let mut body = tbs;
+        body.extend_from_slice(&alg_ed25519);
+        body.extend_from_slice(&tlv(0x03, &sig_bits));
+        tlv(0x30, &body)
+    };
+
+    let oid_srv: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+    let oid_cs: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+    let root_der = sign_cert(1, "EkuPropRoot", "EkuPropRoot", true, None);
+    let no_eku_leaf_der = sign_cert(2, "eku-prop.test", "EkuPropRoot", false, None);
+    let srv_eku_leaf_der =
+        sign_cert(3, "eku-prop.test", "EkuPropRoot", false, Some(&[oid_srv]));
+    let verify_ft: u64 = (1_770_000_000u64 + 11_644_473_600) * 10_000_000;
+
+    unsafe {
+        let root_st = CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                root_st,
+                X509_ASN_ENCODING,
+                root_der.as_ptr(),
+                root_der.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(cfg.as_mut_ptr() as *mut u32, cfg.len() as u32);
+        std::ptr::write_unaligned(cfg.as_mut_ptr().add(0x40) as *mut *mut c_void, root_st);
+        let mut eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(CertCreateCertificateChainEngine(cfg.as_ptr() as *const c_void, &mut eng), TRUE);
+
+        let leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            no_eku_leaf_der.as_ptr(),
+            no_eku_leaf_der.len() as u32,
+        );
+        assert!(!leaf_ctx.is_null());
+
+        let srv_z = b"1.3.6.1.5.5.7.3.1\0";
+        let cs_z = b"1.3.6.1.5.5.7.3.3\0";
+        let make_cp = |oid_arr: &[*const u8]| -> [u8; 0x38] {
+            let mut cp = [0u8; 0x38];
+            std::ptr::write_unaligned(cp.as_mut_ptr() as *mut u32, 0x38u32);
+            std::ptr::write_unaligned(cp.as_mut_ptr().add(0x08) as *mut u32, 0u32); // AND
+            std::ptr::write_unaligned(cp.as_mut_ptr().add(0x10) as *mut u32, oid_arr.len() as u32);
+            std::ptr::write_unaligned(
+                cp.as_mut_ptr().add(0x18) as *mut *const *const u8,
+                oid_arr.as_ptr(),
+            );
+            cp
+        };
+        let srv_arr = [srv_z.as_ptr()];
+        let cs_arr = [cs_z.as_ptr()];
+        let cp_srv = make_cp(&srv_arr);
+        let cp_cs = make_cp(&cs_arr);
+
+        // 1. Before setting CERT_ENHKEY_USAGE_PROP_ID, leaf without EKU extension passes serverAuth.
+        let mut ch0: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                eng,
+                leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                cp_srv.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch0,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned((ch0 as *const u8).add(4) as *const u32), 0);
+        CertFreeCertificateChain(ch0);
+
+        // 2. Malformed DER for CERT_ENHKEY_USAGE_PROP_ID must be rejected cleanly.
+        let bad_der = [0x05u8, 0x00];
+        let bad_blob = CryptDataBlob {
+            cb_data: bad_der.len() as u32,
+            pb_data: bad_der.as_ptr() as *mut u8,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                leaf_ctx,
+                CERT_ENHKEY_USAGE_PROP_ID,
+                0,
+                &bad_blob as *const CryptDataBlob as *const c_void,
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_310B);
+
+        // 3. Restrict leaf via CERT_ENHKEY_USAGE_PROP_ID = {codeSigning}.
+        let cs_eku_der = tlv(0x30, &tlv(0x06, oid_cs));
+        let cs_blob = CryptDataBlob {
+            cb_data: cs_eku_der.len() as u32,
+            pb_data: cs_eku_der.as_ptr() as *mut u8,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                leaf_ctx,
+                CERT_ENHKEY_USAGE_PROP_ID,
+                0,
+                &cs_blob as *const CryptDataBlob as *const c_void,
+            ),
+            TRUE
+        );
+
+        // serverAuth RequestedUsage must now fail with CERT_TRUST_IS_NOT_VALID_FOR_USAGE / CERT_E_WRONG_USAGE.
+        let mut ch_srv: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                eng,
+                leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                cp_srv.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_srv,
+            ),
+            TRUE
+        );
+        assert_ne!(
+            std::ptr::read_unaligned((ch_srv as *const u8).add(4) as *const u32) & 0x10,
+            0
+        );
+        let mut st_base = CertChainPolicyStatus {
+            cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
+            dw_error: 0,
+            l_chain_index: -1,
+            l_element_index: -1,
+            pv_extra_policy_status: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as *const u8,
+                ch_srv,
+                std::ptr::null(),
+                &mut st_base as *mut CertChainPolicyStatus as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st_base.dw_error, 0x800B_0110); // CERT_E_WRONG_USAGE
+        CertFreeCertificateChain(ch_srv);
+
+        // SSL policy even WITHOUT pChainPara must enforce CERT_ENHKEY_USAGE_PROP_ID.
+        let mut ch_nopara: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                eng,
+                leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut ch_nopara,
+            ),
+            TRUE
+        );
+        let mut st_ssl = CertChainPolicyStatus {
+            cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
+            dw_error: 0,
+            l_chain_index: -1,
+            l_element_index: -1,
+            pv_extra_policy_status: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_SSL as *const u8,
+                ch_nopara,
+                std::ptr::null(),
+                &mut st_ssl as *mut CertChainPolicyStatus as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(st_ssl.dw_error, 0x800B_0110); // CERT_E_WRONG_USAGE
+        CertFreeCertificateChain(ch_nopara);
+
+        // codeSigning RequestedUsage must still succeed.
+        let mut ch_cs: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                eng,
+                leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                cp_cs.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_cs,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned((ch_cs as *const u8).add(4) as *const u32), 0);
+        CertFreeCertificateChain(ch_cs);
+
+        // 4. Disjoint DER EKU ({serverAuth}) + CERT_ENHKEY_USAGE_PROP_ID ({codeSigning})
+        // intersects to empty -> fails BOTH serverAuth and codeSigning!
+        let srv_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            srv_eku_leaf_der.as_ptr(),
+            srv_eku_leaf_der.len() as u32,
+        );
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                srv_leaf_ctx,
+                CERT_ENHKEY_USAGE_PROP_ID,
+                0,
+                &cs_blob as *const CryptDataBlob as *const c_void,
+            ),
+            TRUE
+        );
+        for cp in [&cp_srv, &cp_cs] {
+            let mut ch_disj: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                CertGetCertificateChain(
+                    eng,
+                    srv_leaf_ctx,
+                    &verify_ft as *const u64 as *const c_void,
+                    std::ptr::null_mut(),
+                    cp.as_ptr() as *const c_void,
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ch_disj,
+                ),
+                TRUE
+            );
+            assert_ne!(
+                std::ptr::read_unaligned((ch_disj as *const u8).add(4) as *const u32) & 0x10,
+                0,
+                "disjoint DER EKU and CERT_ENHKEY_USAGE_PROP_ID must intersect to empty"
+            );
+            CertFreeCertificateChain(ch_disj);
+        }
+
+        // 5. Empty CERT_ENHKEY_USAGE_PROP_ID (SEQUENCE {}) forbids all usages.
+        let empty_eku = tlv(0x30, &[]);
+        let empty_blob = CryptDataBlob {
+            cb_data: empty_eku.len() as u32,
+            pb_data: empty_eku.as_ptr() as *mut u8,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                leaf_ctx,
+                CERT_ENHKEY_USAGE_PROP_ID,
+                0,
+                &empty_blob as *const CryptDataBlob as *const c_void,
+            ),
+            TRUE
+        );
+        let mut ch_empty: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                eng,
+                leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                cp_cs.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_empty,
+            ),
+            TRUE
+        );
+        assert_ne!(
+            std::ptr::read_unaligned((ch_empty as *const u8).add(4) as *const u32) & 0x10,
+            0
+        );
+        CertFreeCertificateChain(ch_empty);
+
+        // 6. CERT_ENHKEY_USAGE_PROP_ID set on a trusted root CA in hExclusiveRoot restricts
+        // chains terminating at that root.
+        let restricted_root_st =
+            CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let mut root_ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                restricted_root_st,
+                X509_ASN_ENCODING,
+                root_der.as_ptr(),
+                root_der.len() as u32,
+                4,
+                &mut root_ctx,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                root_ctx,
+                CERT_ENHKEY_USAGE_PROP_ID,
+                0,
+                &cs_blob as *const CryptDataBlob as *const c_void,
+            ),
+            TRUE
+        );
+        CertFreeCertificateContext(root_ctx);
+        let mut rcfg = [0u8; 0x60];
+        std::ptr::write_unaligned(rcfg.as_mut_ptr() as *mut u32, rcfg.len() as u32);
+        std::ptr::write_unaligned(
+            rcfg.as_mut_ptr().add(0x40) as *mut *mut c_void,
+            restricted_root_st,
+        );
+        let mut reng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertCreateCertificateChainEngine(rcfg.as_ptr() as *const c_void, &mut reng),
+            TRUE
+        );
+        let clean_leaf = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            no_eku_leaf_der.as_ptr(),
+            no_eku_leaf_der.len() as u32,
+        );
+        let mut ch_root_eku: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                reng,
+                clean_leaf,
+                &verify_ft as *const u64 as *const c_void,
+                std::ptr::null_mut(),
+                cp_srv.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_root_eku,
+            ),
+            TRUE
+        );
+        assert_ne!(
+            std::ptr::read_unaligned((ch_root_eku as *const u8).add(4) as *const u32) & 0x10,
+            0,
+            "root CA CERT_ENHKEY_USAGE_PROP_ID={{codeSigning}} must reject serverAuth"
+        );
+        CertFreeCertificateChain(ch_root_eku);
+        CertFreeCertificateContext(clean_leaf);
+        CertFreeCertificateChainEngine(reng);
+        CertCloseStore(restricted_root_st, 0);
+
+        CertFreeCertificateContext(srv_leaf_ctx);
+        CertFreeCertificateContext(leaf_ctx);
+        CertFreeCertificateChainEngine(eng);
+        CertCloseStore(root_st, 0);
     }
 }

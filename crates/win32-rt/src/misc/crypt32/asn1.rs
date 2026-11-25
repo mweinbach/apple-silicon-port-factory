@@ -302,6 +302,24 @@ pub(super) fn parse_cert_der_parts(der: &[u8]) -> Option<CertDerParts<'_>> {
     })
 }
 
+/// Parse a DER-encoded `CERT_ENHKEY_USAGE` / `CTL_USAGE` (`SEQUENCE OF OBJECT IDENTIFIER`).
+/// Returns `Some(vec![])` for an empty sequence (valid for no usages) and `None` on malformed DER.
+pub(super) fn parse_eku_der_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (seq, rem) = parse_der_item(der)?;
+    if !rem.is_empty() || seq.tag != 0x30 {
+        return None;
+    }
+    let kids = der_item_children(seq.val)?;
+    let mut oids = Vec::with_capacity(kids.len());
+    for k in kids {
+        if k.tag != 0x06 || k.val.is_empty() {
+            return None;
+        }
+        oids.push(k.val.to_vec());
+    }
+    Some(oids)
+}
+
 /// Extract EKU OIDs from extension `2.5.29.37`, or `None` if the cert has no EKU extension.
 pub(super) fn cert_eku_oids(der: &[u8]) -> Option<Vec<Vec<u8>>> {
     let parts = parse_cert_der_parts(der)?;

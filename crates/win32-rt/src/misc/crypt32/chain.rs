@@ -4,7 +4,7 @@
 use super::asn1::{
     cert_eku_oids, der_item_children, parse_cert_der_parts, parse_der_item, CertDerParts,
 };
-use super::store::{lookup_cert_for_chain, store_certs_der};
+use super::store::{lookup_cert_for_chain, store_certs_with_eku_props};
 use crate::handles::HandleTable;
 use crate::misc::wintrust::{
     self, CertChainContext, CertChainElement, CertContext, CertInfo, CertSimpleChain,
@@ -17,6 +17,7 @@ use crate::net_tls::{
 use crate::types::*;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, LazyLock};
 
@@ -923,6 +924,7 @@ const CERT_TRUST_IS_OFFLINE_REVOCATION: u32 = 0x0100_0000;
 struct RegisteredEngine {
     exclusive_roots_der: Option<Vec<Vec<u8>>>,
     additional_certs_der: Vec<Vec<u8>>,
+    cert_eku_props: HashMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
 struct RegisteredChain {
@@ -938,6 +940,7 @@ struct RegisteredChain {
     verify_filetime: Option<u64>,
     exclusive_roots_der: Option<Vec<Vec<u8>>>,
     extra_roots_der: Vec<Vec<u8>>,
+    cert_eku_props: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     default_chain_error: u32,
     revocation_flags: u32,
     revocation_error: u32,
@@ -1222,10 +1225,9 @@ pub(super) fn intermediate_is_valid_ca(
     }
     if let Some(req_eku) = required_eku {
         if let Some(oids) = cert_eku_oids(der) {
-            if !oids.is_empty()
-                && !oids
-                    .iter()
-                    .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
+            if !oids
+                .iter()
+                .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
             {
                 return false;
             }
@@ -1716,10 +1718,15 @@ pub(super) unsafe fn cert_create_certificate_chain_engine_impl(
         std::ptr::null_mut()
     };
 
+    let mut cert_eku_props = HashMap::new();
     let exclusive_roots_der = if !h_exclusive_root.is_null() {
-        Some(store_certs_der(h_exclusive_root))
+        let (ders, props) = store_certs_with_eku_props(h_exclusive_root);
+        cert_eku_props.extend(props);
+        Some(ders)
     } else if !h_restricted_root.is_null() {
-        Some(store_certs_der(h_restricted_root))
+        let (ders, props) = store_certs_with_eku_props(h_restricted_root);
+        cert_eku_props.extend(props);
+        Some(ders)
     } else {
         None
     };
@@ -1728,13 +1735,16 @@ pub(super) unsafe fn cert_create_certificate_chain_engine_impl(
     if c_additional > 0 && !rgh_additional.is_null() {
         for i in 0..c_additional as usize {
             let store_h = std::ptr::read_unaligned(rgh_additional.add(i));
-            additional_certs_der.extend(store_certs_der(store_h));
+            let (ders, props) = store_certs_with_eku_props(store_h);
+            additional_certs_der.extend(ders);
+            cert_eku_props.extend(props);
         }
     }
 
     let id = ENGINES.insert(RegisteredEngine {
         exclusive_roots_der,
         additional_certs_der,
+        cert_eku_props,
     });
     std::ptr::write_unaligned(ph_chain_engine, id as *mut c_void);
     TRUE
@@ -2371,6 +2381,64 @@ fn resolve_selected_issuer_path(
     path
 }
 
+/// Compute a certificate's effective Extended Key Usage OIDs per MSDN `CertGetEnhancedKeyUsage`:
+/// - `None` when neither the X.509 EKU extension nor `CERT_ENHKEY_USAGE_PROP_ID` is present
+///   (certificate is valid for all usages).
+/// - `Some(oids)` when either or both are present, intersecting extension and property OIDs
+///   when both exist (treating `2.5.29.37.0` `anyExtendedKeyUsage` as wildcard on either side).
+///   `Some(vec![])` means the certificate is valid for no usages.
+fn effective_cert_eku_oids(
+    der: &[u8],
+    cert_eku_props: &HashMap<Vec<u8>, Vec<Vec<u8>>>,
+) -> Option<Vec<Vec<u8>>> {
+    const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+    let ext = cert_eku_oids(der);
+    let prop = cert_eku_props.get(der).cloned();
+    match (ext, prop) {
+        (None, None) => None,
+        (Some(e), None) => Some(e),
+        (None, Some(p)) => Some(p),
+        (Some(e), Some(p)) => {
+            let e_any = e.iter().any(|o| o.as_slice() == OID_ANY_EKU);
+            let p_any = p.iter().any(|o| o.as_slice() == OID_ANY_EKU);
+            if e_any && p_any {
+                Some(e)
+            } else if e_any {
+                Some(p)
+            } else if p_any {
+                Some(e)
+            } else {
+                Some(
+                    e.into_iter()
+                        .filter(|eo| p.iter().any(|po| po == eo))
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+/// Return the index of the first certificate in `selected_path` whose effective EKU set
+/// (combining DER EKU extension and stored `CERT_ENHKEY_USAGE_PROP_ID`) excludes all of `allowed_ekus`.
+fn path_violates_eku(
+    selected_path: &[Vec<u8>],
+    cert_eku_props: &HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    allowed_ekus: &[&[u8]],
+) -> Option<i32> {
+    const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+    for (idx, der) in selected_path.iter().enumerate() {
+        if let Some(oids) = effective_cert_eku_oids(der, cert_eku_props) {
+            let ok = oids.iter().any(|o| {
+                o.as_slice() == OID_ANY_EKU || allowed_ekus.iter().any(|req| o.as_slice() == *req)
+            });
+            if !ok {
+                return Some(idx as i32);
+            }
+        }
+    }
+    None
+}
+
 /// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
 /// against the authenticated certification path resolved from `chain_der` and `root_pool`.
 /// Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
@@ -2379,6 +2447,7 @@ unsafe fn evaluate_cert_chain_para(
     chain_der: &[Vec<u8>],
     root_pool: &[Vec<u8>],
     allow_default_macos: bool,
+    cert_eku_props: &HashMap<Vec<u8>, Vec<Vec<u8>>>,
 ) -> Result<(u32, u32), u32> {
     if p_chain_para.is_null() {
         return Ok((0, 0));
@@ -2415,41 +2484,41 @@ unsafe fn evaluate_cert_chain_para(
     let mut trust_bits = 0u32;
     let mut para_err = 0u32;
 
-    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08) — intersect permitted EKUs across the
-    //    entire selected issuer path before applying AND/OR, so an OR request requires at
-    //    least one requested OID to be permitted end-to-end on every cert along the path.
+    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08) — combine each certificate's X.509 EKU
+    //    extension with any stored `CERT_ENHKEY_USAGE_PROP_ID` restriction. Per MSDN
+    //    `CERT_USAGE_MATCH` remarks:
+    //    - `USAGE_MATCH_TYPE_AND`: every certificate in the path must support all requested OIDs.
+    //    - `USAGE_MATCH_TYPE_OR`: evaluate the OR predicate per certificate and require every
+    //      certificate in the path to support at least one requested OID (even if the
+    //      intersection across certificates is empty).
     if let Some((match_type, req_ekus)) = read_usage_match(0x08)? {
         let cert_eku_sets: Vec<Option<Vec<String>>> = selected_path
             .iter()
             .map(|der| {
-                cert_eku_oids(der).and_then(|raw_oids| {
-                    if raw_oids.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            raw_oids
-                                .iter()
-                                .map(|o| wintrust::decode_oid_str(o))
-                                .collect(),
-                        )
-                    }
+                effective_cert_eku_oids(der, cert_eku_props).map(|raw_oids| {
+                    raw_oids
+                        .iter()
+                        .map(|o| wintrust::decode_oid_str(o))
+                        .collect()
                 })
             })
             .collect();
-        let path_authorizes_eku = |req: &str| -> bool {
-            cert_eku_sets.iter().all(|opt_oids| match opt_oids {
+        let cert_supports_eku = |opt_oids: &Option<Vec<String>>, req: &str| -> bool {
+            match opt_oids {
                 None => true,
-                Some(oids) => {
-                    oids.iter().any(|o| o == "2.5.29.37.0") || oids.iter().any(|o| o == req)
-                }
-            })
+                Some(oids) => oids.iter().any(|o| o == "2.5.29.37.0" || o == req),
+            }
         };
         let ok = if match_type == 0 {
             // USAGE_MATCH_TYPE_AND
-            req_ekus.iter().all(|r| path_authorizes_eku(r))
+            cert_eku_sets
+                .iter()
+                .all(|opt| req_ekus.iter().all(|r| cert_supports_eku(opt, r)))
         } else {
             // USAGE_MATCH_TYPE_OR
-            req_ekus.iter().any(|r| path_authorizes_eku(r))
+            cert_eku_sets
+                .iter()
+                .all(|opt| req_ekus.iter().any(|r| cert_supports_eku(opt, r)))
         };
         if !ok {
             trust_bits |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
@@ -2628,9 +2697,9 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         .unwrap_or_else(UnixTime::now);
     let check_ft = verify_filetime.unwrap_or_else(now_filetime);
 
-    let (mut chain_der, peer_verify) =
-        if let Some(pair) = lookup_cert_for_chain(p_cert_context as usize) {
-            pair
+    let (mut chain_der, peer_verify, leaf_eku_props) =
+        if let Some(triple) = lookup_cert_for_chain(p_cert_context as usize) {
+            triple
         } else {
             let cc = std::ptr::read_unaligned(p_cert_context as *const CertContext);
             if cc.pb_cert_encoded.is_null() || cc.cb_cert_encoded == 0 {
@@ -2638,21 +2707,22 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
                 return FALSE;
             }
             let der = std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize);
-            (vec![der.to_vec()], None)
+            (vec![der.to_vec()], None, HashMap::new())
         };
 
-    let (exclusive_roots_der, engine_extra) =
+    let (exclusive_roots_der, engine_extra, mut cert_eku_props) =
         if !h_chain_engine.is_null() && (h_chain_engine as usize) > 1 {
             ENGINES
                 .with(h_chain_engine as usize, |eng| {
                     (
                         eng.exclusive_roots_der.clone(),
                         eng.additional_certs_der.clone(),
+                        eng.cert_eku_props.clone(),
                     )
                 })
-                .unwrap_or((None, Vec::new()))
+                .unwrap_or((None, Vec::new(), HashMap::new()))
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), HashMap::new())
         };
 
     let mut extra_roots_der = peer_verify
@@ -2661,15 +2731,19 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         .unwrap_or_default();
     extra_roots_der.extend(engine_extra);
 
-    // Include any intermediates from hAdditionalStore (without duplicating leaf or intermediates).
-    for der in store_certs_der(h_additional_store) {
+    // Include any intermediates from hAdditionalStore (without duplicating leaf or intermediates)
+    // and carry stored CERT_ENHKEY_USAGE_PROP_ID restrictions from both additional store and leaf.
+    let (add_ders, add_eku_props) = store_certs_with_eku_props(h_additional_store);
+    for der in add_ders {
         if !chain_der.iter().any(|c| c == &der) {
             chain_der.push(der);
         }
     }
+    cert_eku_props.extend(add_eku_props);
+    cert_eku_props.extend(leaf_eku_props);
 
     // Verify chain trust (ignoring hostname here; hostname is checked in CertVerifyCertificateChainPolicy).
-    let default_chain_error = if exclusive_roots_der.is_none() {
+    let mut default_chain_error = if exclusive_roots_der.is_none() {
         if let Some(ref pv) = peer_verify {
             if verify_filetime.is_some() {
                 verify_chain_webpki_at(&chain_der, None, None, &extra_roots_der, true, verify_unix)
@@ -2692,6 +2766,28 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
             verify_unix,
         )
     };
+    // `verify_chain_webpki_at` enforces TLS serverAuth EKU, whereas `CertGetCertificateChain`
+    // is usage-agnostic (EKU checks are driven by `pChainPara.RequestedUsage` and later by
+    // `CertVerifyCertificateChainPolicy`). If WebPKI rejected solely on serverAuth EKU, determine
+    // cryptographic root trust without imposing serverAuth EKU.
+    if default_chain_error == CERT_E_WRONG_USAGE {
+        let mut trust_ok = verify_chain_signatures_to_roots(
+            &chain_der,
+            exclusive_roots_der.as_deref(),
+            &extra_roots_der,
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if !trust_ok {
+            trust_ok = apple_trust::evaluate_sec_trust(
+                &chain_der,
+                exclusive_roots_der.as_deref(),
+                &extra_roots_der,
+                apple_trust::SecTrustPolicyMode::BasicX509,
+                Some(verify_unix.as_secs() as f64),
+            ) == Some(true);
+        }
+        default_chain_error = if trust_ok { 0 } else { CERT_E_UNTRUSTEDROOT };
+    }
 
     let element_root_pool = exclusive_roots_der
         .as_deref()
@@ -2739,6 +2835,7 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         &chain_der,
         strong_root_pool,
         exclusive_roots_der.is_none(),
+        &cert_eku_props,
     ) {
         Ok(pair) => pair,
         Err(le) => {
@@ -2827,6 +2924,7 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
             verify_filetime,
             exclusive_roots_der,
             extra_roots_der,
+            cert_eku_props,
             default_chain_error,
             revocation_flags,
             revocation_error,
@@ -3005,6 +3103,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         verify_ft,
         exclusive_roots,
         extra_roots,
+        cert_eku_props,
         default_chain_error,
         revocation_flags,
         revocation_error,
@@ -3016,6 +3115,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             c.verify_filetime,
             c.exclusive_roots_der.clone(),
             c.extra_roots_der.clone(),
+            c.cert_eku_props.clone(),
             c.default_chain_error,
             c.revocation_flags,
             c.revocation_error,
@@ -3042,6 +3142,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             None,
             None,
             Vec::new(),
+            HashMap::new(),
             ext_err,
             0,
             ext_rev_err,
@@ -3137,7 +3238,6 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         CERT_CHAIN_POLICY_SSL => {
             const OID_SERVER_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
             const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
-            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
             let is_client_auth = ssl_auth_type == 1;
             let mut raw = if is_client_auth {
                 verify_chain_webpki_client_at(
@@ -3190,25 +3290,24 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             }
             // Independent post-checks ensure ignoring one error (e.g. ALLOW_UNKNOWN_CA or
             // IGNORE_CERT_CN_INVALID) never silently masks an un-ignored expiration, wrong TLS
-            // role EKU (serverAuth vs clientAuth), or hostname mismatch!
+            // role EKU (serverAuth vs clientAuth, including CERT_ENHKEY_USAGE_PROP_ID), or
+            // hostname mismatch!
             let required_eku = if is_client_auth {
                 OID_CLIENT_AUTH
             } else {
                 OID_SERVER_AUTH
             };
-            let tls_usage_bad = !ignore_usage
-                && chain_der
-                    .first()
-                    .and_then(|d| cert_eku_oids(d))
-                    .is_some_and(|oids| {
-                        !oids.is_empty()
-                            && !oids.iter().any(|o| {
-                                o.as_slice() == required_eku || o.as_slice() == OID_ANY_EKU
-                            })
-                    });
+            let ssl_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
+            let ssl_path =
+                resolve_selected_issuer_path(&chain_der, ssl_root_pool, exclusive_roots.is_none());
+            let tls_usage_bad_idx = if ignore_usage {
+                None
+            } else {
+                path_violates_eku(&ssl_path, &cert_eku_props, &[required_eku])
+            };
             if raw == 0 {
-                if tls_usage_bad {
-                    (CERT_E_WRONG_USAGE, 0)
+                if let Some(bad_idx) = tls_usage_bad_idx {
+                    (CERT_E_WRONG_USAGE, bad_idx)
                 } else if !ignore_date {
                     if let Some(ti) = first_time_invalid_idx {
                         (CERT_E_EXPIRED, ti as i32)
@@ -3258,22 +3357,22 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         CERT_CHAIN_POLICY_AUTHENTICODE | CERT_CHAIN_POLICY_AUTHENTICODE_TS => {
             const OID_CODE_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
             const OID_TIME_STAMPING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
-            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
             let req_eku = if policy_id == CERT_CHAIN_POLICY_AUTHENTICODE_TS {
                 OID_TIME_STAMPING
             } else {
                 OID_CODE_SIGNING
             };
-            let usage_bad = !ignore_usage
-                && chain_der
-                    .first()
-                    .and_then(|d| cert_eku_oids(d))
-                    .is_some_and(|oids| {
-                        !oids.is_empty()
-                            && !oids
-                                .iter()
-                                .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
-                    });
+            let auth_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
+            let auth_path = resolve_selected_issuer_path(
+                &chain_der,
+                auth_root_pool,
+                exclusive_roots.is_none(),
+            );
+            let usage_bad_idx = if ignore_usage {
+                None
+            } else {
+                path_violates_eku(&auth_path, &cert_eku_props, &[req_eku])
+            };
             let mut trust_ok = default_chain_error == 0
                 || verify_chain_to_root_with_eku(
                     &chain_der,
@@ -3294,8 +3393,8 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             }
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
-            } else if usage_bad {
-                (CERT_E_WRONG_USAGE, 0)
+            } else if let Some(bad_idx) = usage_bad_idx {
+                (CERT_E_WRONG_USAGE, bad_idx)
             } else if !ignore_date && first_time_invalid_idx.is_some() {
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
             } else if !trust_ok && !ignore_ca {
@@ -3325,20 +3424,18 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
             const OID_SMARTCARD_LOGON: &[u8] =
                 &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x02];
-            const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
-            let usage_bad = !ignore_usage
-                && chain_der
-                    .first()
-                    .and_then(|d| cert_eku_oids(d))
-                    .is_some_and(|oids| {
-                        !oids.is_empty()
-                            && !oids.iter().any(|o| {
-                                o.as_slice() == OID_CLIENT_AUTH
-                                    || o.as_slice() == OID_SMARTCARD_LOGON
-                                    || o.as_slice() == OID_ANY_EKU
-                            })
-                    });
             let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
+            let nt_path =
+                resolve_selected_issuer_path(&chain_der, bc_root_pool, exclusive_roots.is_none());
+            let usage_bad_idx = if ignore_usage {
+                None
+            } else {
+                path_violates_eku(
+                    &nt_path,
+                    &cert_eku_props,
+                    &[OID_CLIENT_AUTH, OID_SMARTCARD_LOGON],
+                )
+            };
             let bc_violation = evaluate_basic_constraints_policy(
                 &chain_der,
                 bc_root_pool,
@@ -3362,8 +3459,8 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             });
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
-            } else if usage_bad {
-                (CERT_E_WRONG_USAGE, 0)
+            } else if let Some(bad_idx) = usage_bad_idx {
+                (CERT_E_WRONG_USAGE, bad_idx)
             } else if !ignore_date && first_time_invalid_idx.is_some() {
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
             } else if !trust_ok && !ignore_ca {
