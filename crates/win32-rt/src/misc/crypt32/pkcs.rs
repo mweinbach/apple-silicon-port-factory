@@ -203,7 +203,12 @@ pub(super) struct CmsSignedMessage {
     pub raw_encoded: Vec<u8>,
     pub inner_content_type_oid: String,
     pub inner_content_type_oid_der: Vec<u8>,
+    /// Outer `ContentInfo.content` DER encoding with only the `ContentInfo` wrapper removed
+    /// (returned by `CMSG_BARE_CONTENT_PARAM` — e.g. the DER-encoded `SignedData` SEQUENCE).
     pub bare_content: Vec<u8>,
+    /// Inner `encapContentInfo.eContent` bytes hashed for `messageDigest` verification.
+    pub digest_content: Vec<u8>,
+    /// Application payload returned by `CMSG_CONTENT_PARAM` and `CryptVerifyMessageSignature`.
     pub content: Vec<u8>,
     pub certs_der: Vec<Vec<u8>>,
     pub signers: Vec<CmsSigner>,
@@ -226,7 +231,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
     }
     let inner_oid = eci_kids[0].val;
     let inner_content_type_oid = wintrust::decode_oid_str(inner_oid);
-    let (content, bare_content) = if let Some(ec) = eci_kids.get(1).filter(|e| e.tag == 0xA0) {
+    let (content, digest_content) = if let Some(ec) = eci_kids.get(1).filter(|e| e.tag == 0xA0) {
         if let Some((inner, _)) = parse_der_item(ec.val) {
             if inner.tag == 0x04 || inner.tag == 0x24 {
                 // RFC 5652 §5.2.1 CMS EncapsulatedContentInfo wraps eContent in an OCTET STRING
@@ -236,7 +241,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
             } else {
                 // Legacy PKCS#7 places structured non-DATA content (e.g. SpcIndirectDataContent
                 // SEQUENCE) directly under [0]: CMSG_CONTENT_PARAM returns the full TLV while
-                // CMSG_BARE_CONTENT_PARAM returns its inner value bytes (hashed by messageDigest).
+                // messageDigest hashes its inner value bytes.
                 (inner.raw.to_vec(), inner.val.to_vec())
             }
         } else {
@@ -328,7 +333,8 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
         raw_encoded: raw_encoded.to_vec(),
         inner_content_type_oid,
         inner_content_type_oid_der: inner_oid.to_vec(),
-        bare_content,
+        bare_content: sd_seq.raw.to_vec(),
+        digest_content,
         content,
         certs_der,
         signers,
@@ -346,11 +352,11 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
     }
     let ctype = ci_kids[0].val;
     if ctype == OID_DATA {
-        let data = if let Some(c) = ci_kids.get(1).filter(|e| e.tag == 0xA0) {
+        let (bare, data) = if let Some(c) = ci_kids.get(1).filter(|e| e.tag == 0xA0) {
             let (inner, _) = parse_der_item(c.val)?;
-            extract_octet_string(inner)?
+            (inner.raw.to_vec(), extract_octet_string(inner)?)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         return Some(CmsSignedMessage {
             msg_type: CMSG_DATA,
@@ -358,20 +364,27 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
             raw_encoded: ci.raw.to_vec(),
             inner_content_type_oid: wintrust::decode_oid_str(OID_DATA),
             inner_content_type_oid_der: OID_DATA.to_vec(),
-            bare_content: data.clone(),
+            bare_content: bare,
+            digest_content: data.clone(),
             content: data,
             certs_der: Vec::new(),
             signers: Vec::new(),
         });
     }
     if ctype == OID_ENVELOPED_DATA {
+        let bare = ci_kids
+            .get(1)
+            .filter(|e| e.tag == 0xA0)
+            .map(|e| e.val.to_vec())
+            .unwrap_or_default();
         return Some(CmsSignedMessage {
             msg_type: CMSG_ENVELOPED,
             version: 0,
             raw_encoded: ci.raw.to_vec(),
             inner_content_type_oid: wintrust::decode_oid_str(OID_ENVELOPED_DATA),
             inner_content_type_oid_der: OID_ENVELOPED_DATA.to_vec(),
-            bare_content: Vec::new(),
+            bare_content: bare,
+            digest_content: Vec::new(),
             content: Vec::new(),
             certs_der: Vec::new(),
             signers: Vec::new(),
@@ -415,7 +428,8 @@ fn parse_cms_message(der: &[u8], expected_msg_type: u32) -> Result<CmsSignedMess
                 raw_encoded: der.to_vec(),
                 inner_content_type_oid: wintrust::decode_oid_str(OID_DATA),
                 inner_content_type_oid_der: OID_DATA.to_vec(),
-                bare_content: data.clone(),
+                bare_content: der.to_vec(),
+                digest_content: data.clone(),
                 content: data,
                 certs_der: Vec::new(),
                 signers: Vec::new(),
@@ -432,7 +446,8 @@ fn parse_cms_message(der: &[u8], expected_msg_type: u32) -> Result<CmsSignedMess
                 raw_encoded: seq.raw.to_vec(),
                 inner_content_type_oid: wintrust::decode_oid_str(OID_ENVELOPED_DATA),
                 inner_content_type_oid_der: OID_ENVELOPED_DATA.to_vec(),
-                bare_content: Vec::new(),
+                bare_content: seq.raw.to_vec(),
+                digest_content: Vec::new(),
                 content: Vec::new(),
                 certs_der: Vec::new(),
                 signers: Vec::new(),
@@ -771,7 +786,7 @@ pub(super) unsafe fn crypt_msg_update_impl(
             if f_final != 0 {
                 if let Some(ref mut p) = m.parsed {
                     p.content = m.detached_data.clone();
-                    p.bare_content = m.detached_data.clone();
+                    p.digest_content = m.detached_data.clone();
                 }
                 let deliver = m.stream_output.map(|cb| (cb, m.detached_data.clone()));
                 return Ok(deliver);
@@ -1105,7 +1120,7 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
     if !verify_cms_signer_signature(
         signer,
         &signer_der_owned,
-        &msg.bare_content,
+        &msg.digest_content,
         &msg.inner_content_type_oid_der,
     ) {
         if !cb_cert_ctx.is_null() {

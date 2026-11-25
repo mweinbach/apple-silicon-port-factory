@@ -3356,6 +3356,53 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         let (ci_item, _) = super::asn1::parse_der_item(PKCS7_SIGNED_DER).unwrap();
         let ci_kids = super::asn1::der_item_children(ci_item.val).unwrap();
         let (bare_sd, _) = super::asn1::parse_der_item(ci_kids[1].val).unwrap();
+        // CMSG_BARE_CONTENT_PARAM on a full ContentInfo-wrapped SignedData must return the
+        // encoded SignedData DER (with only the outer ContentInfo removed) so it can be fed
+        // directly into CryptMsgOpenToDecode(CMSG_SIGNED) with certs, signers, and payload intact.
+        let h_full_bare = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!h_full_bare.is_null());
+        assert_eq!(
+            CryptMsgUpdate(
+                h_full_bare,
+                PKCS7_SIGNED_DER.as_ptr(),
+                PKCS7_SIGNED_DER.len() as u32,
+                TRUE,
+            ),
+            TRUE
+        );
+        let mut bare_sd_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                h_full_bare,
+                super::pkcs::CMSG_BARE_CONTENT_PARAM,
+                0,
+                std::ptr::null_mut(),
+                &mut bare_sd_len,
+            ),
+            TRUE
+        );
+        let mut extracted_bare_sd = vec![0u8; bare_sd_len as usize];
+        assert_eq!(
+            CryptMsgGetParam(
+                h_full_bare,
+                super::pkcs::CMSG_BARE_CONTENT_PARAM,
+                0,
+                extracted_bare_sd.as_mut_ptr() as *mut c_void,
+                &mut bare_sd_len,
+            ),
+            TRUE
+        );
+        assert_eq!(extracted_bare_sd.as_slice(), bare_sd.raw);
+        assert_eq!(CryptMsgClose(h_full_bare), TRUE);
+
+        // Round-trip the extracted CMSG_BARE_CONTENT_PARAM SignedData DER into CryptMsgOpenToDecode(CMSG_SIGNED)
         let h_bare = CryptMsgOpenToDecode(
             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
             0,
@@ -3366,7 +3413,12 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert!(!h_bare.is_null());
         assert_eq!(
-            CryptMsgUpdate(h_bare, bare_sd.raw.as_ptr(), bare_sd.raw.len() as u32, TRUE),
+            CryptMsgUpdate(
+                h_bare,
+                extracted_bare_sd.as_ptr(),
+                extracted_bare_sd.len() as u32,
+                TRUE,
+            ),
             TRUE
         );
         let mut bare_type = 0u32;
@@ -3382,6 +3434,19 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
             TRUE
         );
         assert_eq!(bare_type, 2);
+        let mut bare_certs = 0u32;
+        let mut bare_certs_len = 4u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                h_bare,
+                CMSG_CERT_COUNT_PARAM,
+                0,
+                &mut bare_certs as *mut _ as *mut c_void,
+                &mut bare_certs_len,
+            ),
+            TRUE
+        );
+        assert_eq!(bare_certs, 1);
         let mut bare_content = [0u8; 64];
         let mut bare_clen = 64u32;
         assert_eq!(
