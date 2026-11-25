@@ -251,6 +251,10 @@ pub fn classify_instruction(ins: &Instruction) -> Option<&'static OpRecord> {
         return lookup_by_id("GP_ATOMIC_LOCK_RMW");
     }
     let mn = ins.mnemonic();
+    if ins.op0_register().is_mm() || ins.op1_register().is_mm() || mn == M::Maskmovq {
+        let name = format!("{mn:?}");
+        return lookup_by_mnemonic(&name).into_iter().find(|r| r.id == "MMX_ALIASED");
+    }
     match mn {
         M::Mov | M::Movnti => {
             let id = match (ins.op_kind(0), ins.op_kind(1)) {

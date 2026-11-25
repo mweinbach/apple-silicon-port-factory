@@ -766,11 +766,15 @@ impl Cpu {
                 }
             }
             Mnemonic::Fnstcw | Mnemonic::Fstcw => {
-                // Default x87 control word (all exceptions masked, 64-bit precision, round-to-nearest).
                 let a = cpu.eff_addr(ins);
-                cpu.write_mem(a, 16, 0x037F);
+                cpu.write_mem(a, 16, super::regfile_ext::x87_snapshot().cw.into());
             }
-            Mnemonic::Fldcw => {}
+            Mnemonic::Fldcw => {
+                let cw = cpu.read_mem(cpu.eff_addr(ins), 16) as u16;
+                if !super::precise_faults() || super::FAULT_PENDING.with(|p| p.get().is_none()) {
+                    super::regfile_ext::with_x87_mut(|st| st.cw = super::xstate::control_word(cw));
+                }
+            }
             Mnemonic::Dpps | Mnemonic::Vdpps => {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
                     let (s1_op, s2_op, imm_op) = if ins.op_count() >= 4 { (1, 2, 3) } else { (0, 1, 2) };
@@ -1082,10 +1086,60 @@ impl Cpu {
                 cpu.df = fl & 0x400 != 0;
                 cpu.of = fl & 0x800 != 0;
             }
+            Mnemonic::Phaddsw | Mnemonic::Phsubsw | Mnemonic::Vphaddsw | Mnemonic::Vphsubsw => {
+                let (d, ymm) = vops::xmm_reg_info(ins.op_register(0)).unwrap();
+                let src = u32::from(Cpu::is_vex(ins));
+                let (a, ah) = cpu.vsrc(ins, src, ymm);
+                let (b, bh) = cpu.vsrc(ins, src + 1, ymm);
+                let sub = matches!(mn, Mnemonic::Phsubsw | Mnemonic::Vphsubsw);
+                cpu.vdst(ins, d, vops::phadd_sub_sw(a, b, sub), vops::phadd_sub_sw(ah, bh, sub));
+            }
+            Mnemonic::Phminposuw | Mnemonic::Vphminposuw => {
+                let (src, _) = cpu.vsrc(ins, 1, false);
+                let (i, min) = (0..8).map(|i| (i, (src >> (16 * i)) as u16)).min_by_key(|&(_, v)| v).unwrap();
+                cpu.vdst(ins, Cpu::xmm_idx(ins.op_register(0)).unwrap(), u128::from(min) | (i as u128) << 16, 0);
+            }
+            Mnemonic::Mpsadbw | Mnemonic::Vmpsadbw => {
+                let (d, ymm) = vops::xmm_reg_info(ins.op_register(0)).unwrap();
+                let src = u32::from(Cpu::is_vex(ins));
+                let (a, ah) = cpu.vsrc(ins, src, ymm);
+                let (b, bh) = cpu.vsrc(ins, src + 1, ymm);
+                let sad = |a: u128, b: u128, control: u8| {
+                    let (a, b) = (a.to_le_bytes(), b.to_le_bytes());
+                    let i = usize::from(control >> 2 & 1) * 4;
+                    let j = usize::from(control & 3) * 4;
+                    (0..8).fold(0u128, |result, k| {
+                        let sum: u16 = (0..4).map(|n| u16::from(a[i + k + n].abs_diff(b[j + n]))).sum();
+                        result | (u128::from(sum) << (16 * k))
+                    })
+                };
+                let imm = ins.immediate8();
+                cpu.vdst(ins, d, sad(a, b, imm), sad(ah, bh, imm >> 3));
+            }
+            Mnemonic::Dppd | Mnemonic::Vdppd => {
+                let src = u32::from(Cpu::is_vex(ins));
+                let (a, _) = cpu.vsrc(ins, src, false);
+                let (b, _) = cpu.vsrc(ins, src + 1, false);
+                let imm = ins.immediate8();
+                let product = |shift: u32, bit: u8| {
+                    if imm & bit == 0 {
+                        return 0.0;
+                    }
+                    super::sse_arith64(
+                        2,
+                        f64::from_bits((a >> shift) as u64),
+                        f64::from_bits((b >> shift) as u64),
+                    )
+                };
+                let sum = u128::from(super::sse_arith64(0, product(0, 16), product(64, 32)).to_bits());
+                let lo = if imm & 1 != 0 { sum } else { 0 };
+                let hi = if imm & 2 != 0 { sum << 64 } else { 0 };
+                cpu.vdst(ins, Cpu::xmm_idx(ins.op_register(0)).unwrap(), lo | hi, 0);
+            }
             Mnemonic::Phaddd | Mnemonic::Phaddw | Mnemonic::Phsubd | Mnemonic::Phsubw | Mnemonic::Vphaddd
             | Mnemonic::Vphaddw | Mnemonic::Vphsubd | Mnemonic::Vphsubw => {
                 // Horizontal add/sub of adjacent pairs: low half of each 128-bit lane from src1,
-                // high half from src2 (PHSUB: even - odd). 64-bit MMX forms are not handled.
+                // high half from src2 (PHSUB: even - odd). MMX forms use the physical x87 slots in mmx.
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
                     let (s1_op, s2_op) = if ins.op_count() >= 3 { (1, 2) } else { (0, 1) };
                     let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);

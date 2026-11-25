@@ -7,10 +7,21 @@ use super::lazy::{Edges, PF_NONE};
 use super::xmm::{xmm_class, ColdNan, XClass};
 use super::*;
 use crate::emu::fast::{self, FastOp, RNONE};
+use crate::emu::features::{host, HostFeatures};
 use crate::emu::{mem, BLK_MAX_INSNS};
 
 pub(in crate::emu) fn supported(op: &FastOp) -> bool {
     use fast::*;
+    match op.kind {
+        K_SYS_MISC if op.x & 63 == 9 => return false, // CPUID depends on the executing guest thread.
+        K_VAES_RR | K_VAES_RM => return host().has(HostFeatures::AES),
+        K_VSHA_RR | K_VSHA_RM => {
+            return host().has(if op.x & 63 < 4 { HostFeatures::SHA1 } else { HostFeatures::SHA256 })
+        }
+        K_VINT_RR | K_VINT_RM if op.x & 63 == VI_PCLMULQDQ => return host().has(HostFeatures::PMULL),
+        K_BMI_RR | K_BMI_RM if op.x & 63 == 13 => return host().has(HostFeatures::CRC32),
+        _ => {}
+    }
     matches!(
         op.kind,
         K_NOP
@@ -1287,7 +1298,8 @@ impl Tr<'_> {
     /// granule (FEAT_LSE2: no alignment fault, single-copy atomic). rsp alignment is tested
     /// once (side exit at op `k`) until rsp is rewritten.
     pub(super) fn rsp_slot(&mut self, k: usize, op: &FastOp, bits: u32) -> Option<i32> {
-        if memchk_mask() & 8 == 0 || !mem::tso() || !stack_tso() || op.base != 4 || op.index != RNONE || bits > 64 {
+        if !host().has(HostFeatures::LSE2 | HostFeatures::LRCPC2)
+            || memchk_mask() & 8 == 0 || !mem::tso() || !stack_tso() || op.base != 4 || op.index != RNONE || bits > 64 {
             return None;
         }
         let d = op.disp;
@@ -1461,7 +1473,8 @@ impl Tr<'_> {
             let bytes = (bits / 8) as u64;
             let use_plain_ui = !tso && d >= 0 && ((d as u64) & (bytes - 1)) == 0 && ((d as u64) / bytes) < 4096;
             let use_plain_ur = !tso && !use_plain_ui && (-256..=255).contains(&d);
-            let use_tso_ur = tso && (lse2 || bits == 8) && (-256..=255).contains(&d);
+            let unscaled_tso = host().has(HostFeatures::LRCPC2) && (lse2 || bits == 8);
+            let use_tso_ur = tso && unscaled_tso && (-256..=255).contains(&d);
             if use_plain_ui || use_plain_ur || use_tso_ur {
                 let mut lead_lo = 0i32;
                 let mut lead = None;
@@ -1507,7 +1520,7 @@ impl Tr<'_> {
             // Large displacement `[base + disp]` with `hw_range_enabled()` + `ldapur/stlur`:
             // split `disp = hi_4k + lo_9` when `lo_9` fits signed 9 bits and `hi_4k` fits
             // `imm12 << 12`, caching `(base, RNONE, 0, hi_4k)` in `XA` for nearby fields.
-            if hw_range_enabled() && (!tso || lse2 || bits == 8) {
+            if hw_range_enabled() && (!tso || unscaled_tso) {
                 let hi = (d.wrapping_add(256)) & !0xFFF;
                 let lo = d.wrapping_sub(hi);
                 if hi != 0 && (-256..=255).contains(&lo) && (-0xFF_F000..=0xFF_F000).contains(&hi) {
@@ -1538,7 +1551,7 @@ impl Tr<'_> {
             let chk = Self::chk_of(op);
             let tso = mem::tso() && (chk != Chk::Stack || stack_tso()) && !(chk == Chk::Ro && ld);
             let lse2 = lse2_trap_enabled();
-            if !tso || lse2 || bits == 8 {
+            if !tso || (host().has(HostFeatures::LRCPC2) && (lse2 || bits == 8)) {
                 let scale = op.x >> 6;
                 let d = op.disp;
                 let hi = (d.wrapping_add(256)) & !0xFFF;

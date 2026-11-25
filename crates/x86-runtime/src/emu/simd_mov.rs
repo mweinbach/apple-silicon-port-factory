@@ -217,7 +217,14 @@ impl Cpu {
             }
             Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => {
                 let a = cpu.eff_addr(ins);
-                let m = (cpu.read_mem(a, 32) as u32) & 0xFFFF;
+                let m = cpu.read_mem(a, 32) as u32;
+                if m >> 16 != 0 {
+                    super::xstate::Fault::gp().dispatch(cpu, ins.ip());
+                    return true;
+                }
+                if super::precise_faults() && super::FAULT_PENDING.with(|p| p.get().is_some()) {
+                    return true;
+                }
                 cpu.jx.mxcsr = m;
                 super::apply_guest_mxcsr_hw(m);
             }
@@ -1180,8 +1187,11 @@ impl Cpu {
             | Mnemonic::Pcmpestri
             | Mnemonic::Vpcmpestri
             | Mnemonic::Pcmpestrm
-            | Mnemonic::Vpcmpestrm => {
-                let is_explicit = matches!(
+            | Mnemonic::Vpcmpestrm
+            | Mnemonic::Pcmpestri64 | Mnemonic::Vpcmpestri64
+            | Mnemonic::Pcmpestrm64 | Mnemonic::Vpcmpestrm64 => {
+                let long = matches!(mn, Mnemonic::Pcmpestri64 | Mnemonic::Vpcmpestri64 | Mnemonic::Pcmpestrm64 | Mnemonic::Vpcmpestrm64);
+                let is_explicit = long || matches!(
                     mn,
                     Mnemonic::Pcmpestri
                         | Mnemonic::Vpcmpestri
@@ -1190,7 +1200,7 @@ impl Cpu {
                 );
                 let is_mask = matches!(
                     mn,
-                    Mnemonic::Pcmpistrm
+                    Mnemonic::Pcmpestrm64 | Mnemonic::Vpcmpestrm64 | Mnemonic::Pcmpistrm
                         | Mnemonic::Vpcmpistrm
                         | Mnemonic::Pcmpestrm
                         | Mnemonic::Vpcmpestrm
@@ -1201,7 +1211,7 @@ impl Cpu {
                     OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
                     _ => 0,
                 };
-                vops::pcmpstr(cpu, a, b, ins.immediate8(), is_explicit, is_mask);
+                vops::pcmpstr(cpu, a, b, ins.immediate8(), is_explicit, is_mask, long);
             }
             Mnemonic::Cvtps2pd | Mnemonic::Vcvtps2pd | Mnemonic::Cvtdq2pd | Mnemonic::Vcvtdq2pd => {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {

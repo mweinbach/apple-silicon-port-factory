@@ -484,12 +484,6 @@ impl Tr<'_> {
                         self.a.ldr(32, T0, XCPU, OFF_MXCSR);
                         self.store(k, T0, a, 32, Self::chk_of(op));
                     }
-                    5 => {
-                        // Fnstcw
-                        let a = self.addr_into(op, XA);
-                        self.a.mov_imm(false, T0, 0x037F);
-                        self.store(k, T0, a, 16, Self::chk_of(op));
-                    }
                     6 => {
                         // Xlatb
                         self.a.ubfm(true, T0, g(0), 0, 7);
@@ -497,53 +491,7 @@ impl Tr<'_> {
                         self.load(k, T1, XA, 8, Chk::Full);
                         self.wr_gpr(0, 8, T1);
                     }
-                    7 => {
-                        // Xgetbv
-                        self.a.movz(true, g(0), 7, 0);
-                        self.a.movz(true, g(2), 0, 0);
-                        self.set_lb(0, 64);
-                        self.set_lb(2, 64);
-                    }
                     8 => self.emit_timestamp(w != 0),
-                    9 => {
-                        // Cpuid
-                        self.flush_flags(self.live[k]);
-                        self.fs.host = 0;
-                        self.a.mov_rr(false, T0, g(0)); // leaf = eax
-                        let mut exits = Vec::new();
-                        let table: &[(u32, u32, u32, u32, u32)] = &[
-                            (0, 7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
-                            (1, 0x0009_06ea, 0x0010_0800, 0x7ed8_3223, 0x178b_8111),
-                            (7, 0, 0x200c_07a9, 0, 0),
-                            (0x8000_0000, 0x8000_0008, 0, 0, 0),
-                            (0x8000_0001, 0, 0, 0x0000_0161, 0x2810_0800),
-                            (0x8000_0002, 0x6c70_7041, 0x6953_2065, 0x6f63_696c, 0x2d4d_206e),
-                            (0x8000_0003, 0x6972_6553, 0x2820_7365, 0x2032_5741, 0x6974_614e),
-                            (0x8000_0004, 0x4120_6576, 0x3436_4d52, 0x2020_2029, 0x2020_2020),
-                        ];
-                        for &(leaf, ra, rb, rc, rd_v) in table {
-                            self.a.mov_imm(false, T1, leaf as u64);
-                            self.a.addsub_rr(false, true, true, ZR, T0, T1, 0);
-                            let next = self.a.bcond(NE);
-                            self.a.mov_imm(false, g(0), ra as u64);
-                            self.a.mov_imm(false, g(3), rb as u64);
-                            self.a.mov_imm(false, g(1), rc as u64);
-                            self.a.mov_imm(false, g(2), rd_v as u64);
-                            exits.push(self.a.b());
-                            self.a.bind(next);
-                        }
-                        self.a.movz(true, g(0), 0, 0);
-                        self.a.movz(true, g(3), 0, 0);
-                        self.a.movz(true, g(1), 0, 0);
-                        self.a.movz(true, g(2), 0, 0);
-                        for e in exits {
-                            self.a.bind(e);
-                        }
-                        self.set_lb(0, 64);
-                        self.set_lb(1, 64);
-                        self.set_lb(2, 64);
-                        self.set_lb(3, 64);
-                    }
                     10 => {
                         // 16-bit push
                         match w {
@@ -597,34 +545,6 @@ impl Tr<'_> {
                         self.a.str(8, ZR, XCPU, OFF_OF);
                         self.a.str(8, ZR, XCPU, OFF_PFV);
                         self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
-                    }
-                    14 => {
-                        // Ldmxcsr / Vldmxcsr: update `Cpu::jx.mxcsr` and sync ARM64 hardware
-                        // `FPCR` (FZ = bit 24 when FTZ|DAZ set, RMode = bits 23:22 from MXCSR
-                        // RC bits 14:13) without disturbing host NZCV flags. Skip serializing
-                        // `msr fpcr` when unchanged.
-                        let a = self.addr_into(op, XA);
-                        self.load(k, T0, a, 32, Self::chk_of(op));
-                        self.a.ubfm(false, T0, T0, 0, 15);
-                        self.a.str(32, T0, XCPU, OFF_MXCSR);
-                        // RMode: MXCSR[13] -> FPCR[23], MXCSR[14] -> FPCR[22]
-                        self.a.ubfx(T1, T0, 13, 1);
-                        self.a.lsl_i(true, T1, T1, 23);
-                        self.a.ubfx(T2, T0, 14, 1);
-                        self.a.logic_rr(true, 1, T1, T1, T2, 0, 22);
-                        // FZ: (MXCSR[15] | MXCSR[6]) -> FPCR[24]
-                        self.a.ubfx(T2, T0, 15, 1);
-                        self.a.ubfx(T3, T0, 6, 1);
-                        self.a.logic_rr(true, 1, T2, T2, T3, 0, 0);
-                        self.a.logic_rr(true, 1, T1, T1, T2, 0, 24);
-                        // Preserve non-[24:22] bits of FPCR and skip `msr` if already equal.
-                        self.a.mrs_fpcr(T2);
-                        self.a.logic_ri(true, 0, T3, T2, enc_logic_imm(!(7u64 << 22), true).unwrap());
-                        self.a.logic_rr(true, 1, T1, T3, T1, 0, 0);
-                        self.a.logic_rr(true, 2, T3, T2, T1, 0, 0);
-                        let same = self.a.cbz(true, T3);
-                        self.a.msr_fpcr(T1);
-                        self.a.bind(same);
                     }
                     _ => {}
                 }
@@ -1291,8 +1211,8 @@ impl Tr<'_> {
     fn emit_cross16_branch(&mut self, bytes: u32) -> Option<usize> {
         match bytes {
             1 => None,
-            16 => {
-                self.a.logic_ri(false, 0, XS, XA, enc_logic_imm(15, false).unwrap());
+            n if n == 16 || !crate::emu::features::host().has(crate::emu::features::HostFeatures::LSE2) => {
+                self.a.logic_ri(false, 0, XS, XA, enc_logic_imm((n - 1) as u64, false).unwrap());
                 Some(self.a.cbnz(false, XS))
             }
             _ => {

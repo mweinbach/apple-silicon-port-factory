@@ -686,6 +686,9 @@ pub(super) fn enable_lse2_trap() {
 /// Eliminates all per-access alignment checks, `SlowMem` stubs, and `rsp_al` guards, and
 /// emits single-instruction `ldapur`/`stlur [base, #disp]` for `[base + disp]` operands.
 pub(super) fn lse2_trap_enabled() -> bool {
+    if !super::features::host().has(super::features::HostFeatures::LSE2) {
+        return false;
+    }
     #[cfg(test)]
     if let Some(v) = TEST_KNOBS.with(|c| c.get().lse2_trap) {
         return v;

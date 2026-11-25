@@ -864,7 +864,7 @@ impl Cpu {
         let p = addr as usize;
         #[cfg(target_arch = "aarch64")]
         {
-            if (p & 15) + bytes <= 16 {
+            if p & (bytes - 1) == 0 || ((p & 15) + bytes <= 16 && super::features::host().has(super::features::HostFeatures::LSE2)) {
                 let mut cur = read_unaligned_bits(p, bits);
                 loop {
                     let next = f(cur) & mask;
@@ -948,7 +948,7 @@ impl Cpu {
         let p = addr as usize;
         #[cfg(target_arch = "aarch64")]
         {
-            if (p & 15) + bytes <= 16 {
+            if p & (bytes - 1) == 0 || ((p & 15) + bytes <= 16 && super::features::host().has(super::features::HostFeatures::LSE2)) {
                 let actual = lse_casal(p, bits, exp, des);
                 return (actual == exp, actual);
             }
