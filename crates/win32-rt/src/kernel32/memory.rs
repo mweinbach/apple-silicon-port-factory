@@ -176,9 +176,10 @@ struct VmState {
     segs: BTreeMap<usize, Seg>,
     /// Host-page-aligned addresses written inside `MEM_WRITE_WATCH` regions since last reset.
     write_watch_dirty: BTreeSet<usize>,
-    /// Host-page-aligned addresses advised `MADV_FREE_REUSABLE` via `MEM_RESET`.
-    /// Because XNU can silently purge and zero-refault such pages before `MEM_RESET_UNDO`,
-    /// retention cannot be proven from residency alone once a host page is in this set.
+    /// Guest-page-aligned (`4 KiB`) addresses whose enclosing host page was advised
+    /// `MADV_FREE_REUSABLE` via `MEM_RESET`. Tracked per guest 4 KiB page so a partial
+    /// `MEM_RESET_UNDO` on one subpage preserves loss tracking for untouched sibling
+    /// subpages on the same 16 KiB host page.
     reset_discardable: BTreeSet<usize>,
 }
 
@@ -266,12 +267,11 @@ impl VmState {
         }
         let res: Vec<usize> = self
             .reset_discardable
-            .range(hstart..hend)
+            .range(start..end)
             .copied()
-            .filter(|&hp| !self.has_committed_subpage(hp))
             .collect();
-        for hp in res {
-            self.reset_discardable.remove(&hp);
+        for p in res {
+            self.reset_discardable.remove(&p);
         }
     }
     /// Recompute and apply host page protection for `hp` from its surviving committed
@@ -1171,13 +1171,17 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         if end > b + a.size {
             return Err(err::ERROR_INVALID_ADDRESS);
         }
-        // Record every complete host page we hand to XNU `MADV_FREE_REUSABLE`: once marked
-        // discardable, XNU can silently purge and zero-refault the page, so `MEM_RESET_UNDO`
-        // cannot guarantee the original contents survived.
+        // Record every guest 4 KiB subpage inside every complete host page handed to XNU
+        // `MADV_FREE_REUSABLE`: once marked discardable, XNU can silently purge and zero-refault
+        // the page, so `MEM_RESET_UNDO` cannot guarantee the original contents survived.
         let mut hp = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
         let hend = addr.saturating_add(size) & !(HOST_PAGE - 1);
         while hp < hend {
-            vm.reset_discardable.insert(hp);
+            let mut sub = hp;
+            while sub < hp + HOST_PAGE {
+                vm.reset_discardable.insert(sub);
+                sub += PAGE;
+            }
             hp += HOST_PAGE;
         }
         discard_host_pages(addr, size);
@@ -1197,14 +1201,18 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
             return Err(err::ERROR_INVALID_ADDRESS);
         }
         const MADV_FREE_REUSE: i32 = 8;
-        let hstart = start & !(HOST_PAGE - 1);
-        let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-        let discardable: Vec<usize> = vm.reset_discardable.range(hstart..hend).copied().collect();
+        let discardable: Vec<usize> = vm.reset_discardable.range(start..end).copied().collect();
         let any_discardable = !discardable.is_empty();
-        for hp in discardable {
-            // Cancel MADV_FREE_REUSABLE in XNU so future writes stay retained.
-            let _ = libc::madvise(hp as *mut c_void, HOST_PAGE, MADV_FREE_REUSE);
-            vm.reset_discardable.remove(&hp);
+        let mut reused_hpages = BTreeSet::new();
+        for p in discardable {
+            let hp = p & !(HOST_PAGE - 1);
+            if reused_hpages.insert(hp) {
+                // Cancel MADV_FREE_REUSABLE in XNU so future writes stay retained.
+                let _ = libc::madvise(hp as *mut c_void, HOST_PAGE, MADV_FREE_REUSE);
+            }
+            // Clear only the subpages inside `[start, end)` so untouched sibling subpages
+            // on the same 16 KiB host page retain their loss tracking.
+            vm.reset_discardable.remove(&p);
         }
         if any_discardable {
             // XNU does not expose whether a MADV_FREE_REUSABLE page was purged and
@@ -2710,14 +2718,29 @@ mod tests {
         unsafe {
             // MEM_RESET on full host pages marks them MADV_FREE_REUSABLE; MEM_RESET_UNDO
             // must fail honestly with ERROR_INVALID_ADDRESS because XNU cannot prove a
-            // discardable page was not purged and zero-refaulted.
+            // discardable page was not purged and zero-refaulted. On 16 KiB host pages, a
+            // partial MEM_RESET_UNDO on the first 4 KiB must preserve loss tracking for the
+            // remaining 12 KiB sibling subpages.
             let sz = HOST_PAGE * 2;
             let p = VirtualAlloc(std::ptr::null_mut(), sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             assert!(!p.is_null());
             *(p as *mut u64) = 0x1122_3344_5566_7788;
             assert_eq!(VirtualAlloc(p, sz, MEM_RESET, PAGE_READWRITE), p);
-            assert!(VirtualAlloc(p, sz, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
-            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+            if HOST_PAGE > PAGE {
+                assert!(VirtualAlloc(p, PAGE, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+                // Untouched sibling subpages on the same 16 KiB host page still report data loss!
+                let sibling = (p as usize + PAGE) as *mut c_void;
+                assert!(VirtualAlloc(sibling, HOST_PAGE - PAGE, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+                // Second host page also still reports data loss.
+                let hp2 = (p as usize + HOST_PAGE) as *mut c_void;
+                assert!(VirtualAlloc(hp2, HOST_PAGE, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+            } else {
+                assert!(VirtualAlloc(p, sz, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+            }
             // Once MADV_FREE_REUSE has been restored and cleared, a subsequent MEM_RESET_UNDO
             // on retained memory (or a sub-host-page MEM_RESET that never advised MADV_FREE_REUSABLE)
             // succeeds truthfully.
