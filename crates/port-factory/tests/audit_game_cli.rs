@@ -448,3 +448,225 @@ fn win32_audit_and_audit_game_cli_work_end_to_end_on_synthetic_pe_fixtures() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn readiness_uses_real_dispatch_and_classifies_every_import() {
+    let tmp = port_factory::bundle_common::TempDirGuard::new(unique_temp_dir("readiness"));
+    let db = tmp.path().join("db");
+    let game = tmp.path().join("game");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::create_dir_all(game.join("plugins")).unwrap();
+    let mut apis =
+        String::from("dll\tsymbol\tordinal\tcategory\timpl_kind\trust_path\tsource_file\n");
+    for kind in ["real", "partial", "stub", "failing"] {
+        apis.push_str(&format!(
+            "kernel32.dll\t{kind}\t-\tCORE_OS\t{kind}\twin32_rt::api::{kind}\tapi.rs\n"
+        ));
+    }
+    std::fs::write(db.join("win32_apis.tsv"), apis).unwrap();
+    std::fs::write(db.join("stub_inventory.tsv"),
+        "dll\tapi\tkind\tfile\tline\tdetail\nkernel32.dll\tpartial\tstub\tapi.rs\t42\tconditional fallback\n").unwrap();
+    let instructions = [
+        0x48, 0x8b, 0x00, // mov rax,[rax] lowers
+        0x64, 0x48, 0x8b, 0x00, // same Code, FS address falls back
+        0xd9, 0xe8, // fld1, generic x87
+        0x0f, 0x01, 0xee, // rdpkru, exit 86 if reached
+        0xc4, 0xe2, 0x71, 0x90, 0x04, 0x90, // vpgatherdd: catalog JIT claim has no handler
+        0xcc, 0x0f, 0x0b, 0xc3, // guest traps and ret
+    ];
+    let image = build_synthetic_pe(
+        false,
+        &instructions,
+        &[(
+            "API-MS-WIN-CORE-SYNCH-L1-2-0.DLL",
+            &["real", "partial", "stub", "failing", "absent"],
+        )],
+        false,
+    );
+    std::fs::write(game.join("play.exe"), &image).unwrap();
+    // Keep a leaf outside .pdata in a nonstandard-extension plugin.
+    let mut leaf = build_synthetic_pe(true, &[0xc3, 0x0f, 0x01, 0xee], &[], false);
+    let exception = 0x80 + 24 + 112 + 3 * 8;
+    put_u32(&mut leaf, exception, 0x2000);
+    put_u32(&mut leaf, exception + 4, 12);
+    put_u32(&mut leaf, 0x400, 0x1000);
+    put_u32(&mut leaf, 0x404, 0x1001);
+    std::fs::write(game.join("plugins/extra"), leaf).unwrap();
+    let (code, env) = run_pf_json(tmp.path(), &["readiness", game.to_str().unwrap(), "--json"]);
+    assert_eq!(code, exit_codes::INCOMPATIBLE);
+    let data = env.get("data").unwrap();
+    let bins = data.get("binaries").unwrap().as_array().unwrap();
+    assert_eq!(bins.len(), 2);
+    let ins = bins[0].get("instructions").unwrap().as_array().unwrap();
+    let op = |mn| {
+        ins.iter()
+            .find(|x| x.get("mnemonic").unwrap().as_str() == Some(mn))
+            .unwrap()
+    };
+    assert_eq!(op("mov").get("count").unwrap().as_u64(), Some(1));
+    assert_eq!(op("mov").get("first_rva").unwrap().as_u64(), Some(0x1003));
+    assert_eq!(
+        op("fld1").get("kind").unwrap().as_str(),
+        Some("interpreter_only")
+    );
+    assert_eq!(
+        op("rdpkru").get("kind").unwrap().as_str(),
+        Some("unimplemented")
+    );
+    let gather = op("vpgatherdd");
+    assert_eq!(gather.get("kind").unwrap().as_str(), Some("unimplemented"));
+    // Advertisement follows the guest CPU contract and can legitimately change independently.
+    let has_avx2 = x86_runtime::emu::arm64_guest_cpuid(7)[1] & (1 << 5) != 0;
+    let features = gather
+        .get("advertised_but_unimplemented")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        features.iter().any(|v| v.as_str() == Some("AVX2")),
+        has_avx2
+    );
+    assert_eq!(
+        op("int3").get("kind").unwrap().as_str(),
+        Some("guest_boundary")
+    );
+    assert_eq!(
+        op("ud2").get("kind").unwrap().as_str(),
+        Some("guest_boundary")
+    );
+    assert_eq!(ins.len(), 6);
+    let imps = bins[0].get("imports").unwrap().as_array().unwrap();
+    assert_eq!(
+        imps.iter()
+            .map(|x| x.get("kind").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["real", "partial", "stub", "failing", "missing"]
+    );
+    assert_eq!(
+        imps[1].get("stub_sites").unwrap().as_array().unwrap()[0]
+            .get("line")
+            .unwrap()
+            .as_u64(),
+        Some(42)
+    );
+    let top = &data.get("ranked_findings").unwrap().as_array().unwrap()[0];
+    assert_eq!(top.get("kind").unwrap().as_str(), Some("unimplemented"));
+    assert_eq!(top.get("sites").unwrap().as_u64(), Some(2));
+    assert_eq!(top.get("images").unwrap().as_array().unwrap().len(), 2);
+
+    std::fs::write(game.join("broken.dll"), b"MZ").unwrap();
+    let (code, report) = run_pf_json(tmp.path(), &["readiness", game.to_str().unwrap(), "--json"]);
+    assert_eq!(code, exit_codes::RUNTIME_ERROR);
+    assert_eq!(
+        report
+            .get("data")
+            .unwrap()
+            .get("unscanned")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (code, report) = run_pf_json(
+        tmp.path(),
+        &[
+            "readiness",
+            game.join("play.exe").to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(code, exit_codes::INCOMPATIBLE);
+    assert_eq!(
+        report
+            .get("data")
+            .unwrap()
+            .get("binaries")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn readiness_resolves_shipped_and_forwarded_delay_ordinals() {
+    let tmp = port_factory::bundle_common::TempDirGuard::create_unique("readiness-delay").unwrap();
+    let db = tmp.path().join("db");
+    let game = tmp.path().join("game");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::write(db.join("win32_apis.tsv"), "dll\tsymbol\tordinal\tcategory\timpl_kind\trust_path\tsource_file\nkernel32.dll\tExample\t17\tCORE_OS\treal\twin32_rt::api::Example\tapi.rs\n").unwrap();
+    std::fs::write(
+        db.join("stub_inventory.tsv"),
+        "dll\tapi\tkind\tfile\tline\tdetail\n",
+    )
+    .unwrap();
+
+    let dirs = 0x80 + 24 + 112;
+    let raw = 0x400;
+    let mut caller = build_synthetic_pe(false, &[0xc3], &[], false);
+    put_u32(&mut caller, dirs + 13 * 8, 0x2000);
+    put_u32(&mut caller, dirs + 13 * 8 + 4, 64);
+    // Delay descriptor, INT with three ordinals, then the DLL name.
+    put_u32(&mut caller, raw, 1);
+    put_u32(&mut caller, raw + 4, 0x2090);
+    put_u32(&mut caller, raw + 12, 0x2070);
+    put_u32(&mut caller, raw + 16, 0x2040);
+    for i in 0..3 {
+        put_u64(
+            &mut caller,
+            raw + 0x40 + i * 8,
+            (1u64 << 63) | (7 + i as u64),
+        );
+    }
+    caller[raw + 0x90..raw + 0x99].copy_from_slice(b"unit.dll\0");
+    let exe = game.join("play.exe");
+    std::fs::write(&exe, caller).unwrap();
+
+    let mut dll = build_synthetic_pe(true, &[0xc3], &[], false);
+    put_u32(&mut dll, dirs, 0x2000);
+    put_u32(&mut dll, dirs + 4, 0x80);
+    put_u32(&mut dll, raw + 16, 7); // ordinal base
+    put_u32(&mut dll, raw + 20, 2); // exports #7 and #8 only
+    put_u32(&mut dll, raw + 28, 0x2040);
+    put_u32(&mut dll, raw + 0x40, 0x1000); // direct .text export
+    put_u32(&mut dll, raw + 0x44, 0x2050); // forwarder in export directory
+    dll[raw + 0x50..raw + 0x5d].copy_from_slice(b"KERNEL32.#17\0");
+    std::fs::write(game.join("Unit.DLL"), dll).unwrap();
+    let (code, report) = run_pf_json(tmp.path(), &["readiness", exe.to_str().unwrap(), "--json"]);
+    assert_eq!(code, exit_codes::UNRESOLVED_IMPORTS);
+    let binaries = report
+        .get("data")
+        .unwrap()
+        .get("binaries")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(binaries.len(), 2);
+    let play = binaries
+        .iter()
+        .find(|b| b.get("path").unwrap().as_str() == Some("play.exe"))
+        .unwrap();
+    let imports = play.get("imports").unwrap().as_array().unwrap();
+    assert!(imports
+        .iter()
+        .all(|i| i.get("delay").unwrap().as_bool() == Some(true)));
+    assert_eq!(
+        imports
+            .iter()
+            .map(|x| x.get("kind").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["shipped", "real", "missing"]
+    );
+    assert_eq!(imports[1].get("symbol").unwrap().as_str(), Some("#8"));
+    assert!(imports[1]
+        .get("provider")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("kernel32.dll!Example"));
+}

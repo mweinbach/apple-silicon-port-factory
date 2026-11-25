@@ -15,3 +15,9 @@ pe-image.workspace = true
 port-manifest.workspace = true
 dxil-metal.workspace = true
 iced-x86.workspace = true
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+x86-runtime.workspace = true
+
+[build-dependencies]
+syn = { version = "2", features = ["full", "visit"] }

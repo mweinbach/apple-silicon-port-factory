@@ -66,10 +66,8 @@ pub(super) use lazy::{flaglazy_enabled, Edges};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use stubs::plaincall_enabled;
-pub(super) use translate::Term;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(super) use translate::supported;
+pub(super) use more::CPUID_LEAVES;
+pub(super) use translate::{supported, Term};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled};

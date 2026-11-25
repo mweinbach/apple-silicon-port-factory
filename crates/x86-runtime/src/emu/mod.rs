@@ -95,6 +95,34 @@ pub use interp::{
 #[cfg(test)]
 pub(crate) use interp::{test_last_steps, test_total_steps};
 
+/// Static lowering decision for one decoded operand form. This never emits or executes code.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InstructionLowering {
+    Arm64,
+    FastInterpreter,
+    GenericDispatch,
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn instruction_lowering(ins: &iced_x86::Instruction) -> InstructionLowering {
+    let op = fast::lower(ins);
+    if op.kind == fast::K_GENERIC {
+        InstructionLowering::GenericDispatch
+    } else if jit::supported(&op) {
+        InstructionLowering::Arm64
+    } else {
+        InstructionLowering::FastInterpreter
+    }
+}
+
+/// Guest CPUID registers baked into default JIT/AOT code, in EAX, EBX, ECX, EDX order.
+#[cfg(target_arch = "aarch64")]
+pub fn arm64_guest_cpuid(leaf: u32) -> [u32; 4] {
+    jit::CPUID_LEAVES.iter().find(|entry| entry.0 == leaf)
+        .map_or([0; 4], |&(_, a, b, c, d)| [a, b, c, d])
+}
+
 pub use mem::note_code_region;
 
 pub use routes::{

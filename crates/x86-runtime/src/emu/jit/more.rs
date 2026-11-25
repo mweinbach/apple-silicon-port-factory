@@ -7,6 +7,18 @@ use super::*;
 use crate::emu::fast::{self, FastOp};
 use crate::emu::mem;
 
+/// (leaf, EAX, EBX, ECX, EDX) returned by the ARM64 CPUID emitter.
+pub(in crate::emu) const CPUID_LEAVES: &[(u32, u32, u32, u32, u32)] = &[
+    (0, 7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+    (1, 0x0009_06ea, 0x0010_0800, 0x7ed8_3223, 0x178b_8111),
+    (7, 0, 0x200c_07a9, 0, 0),
+    (0x8000_0000, 0x8000_0008, 0, 0, 0),
+    (0x8000_0001, 0, 0, 0x0000_0161, 0x2810_0800),
+    (0x8000_0002, 0x6c70_7041, 0x6953_2065, 0x6f63_696c, 0x2d4d_206e),
+    (0x8000_0003, 0x6972_6553, 0x2820_7365, 0x2032_5741, 0x6974_614e),
+    (0x8000_0004, 0x4120_6576, 0x3436_4d52, 0x2020_2029, 0x2020_2020),
+];
+
 impl Asm {
     pub(super) fn tbz(&mut self, t: u32, bit: u32) -> usize {
         self.emit(0x3600_0000 | (bit >> 5) << 31 | (bit & 31) << 19 | t);
@@ -511,17 +523,7 @@ impl Tr<'_> {
                         self.fs.host = 0;
                         self.a.mov_rr(false, T0, g(0)); // leaf = eax
                         let mut exits = Vec::new();
-                        let table: &[(u32, u32, u32, u32, u32)] = &[
-                            (0, 7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
-                            (1, 0x0009_06ea, 0x0010_0800, 0x7ed8_3223, 0x178b_8111),
-                            (7, 0, 0x200c_07a9, 0, 0),
-                            (0x8000_0000, 0x8000_0008, 0, 0, 0),
-                            (0x8000_0001, 0, 0, 0x0000_0161, 0x2810_0800),
-                            (0x8000_0002, 0x6c70_7041, 0x6953_2065, 0x6f63_696c, 0x2d4d_206e),
-                            (0x8000_0003, 0x6972_6553, 0x2820_7365, 0x2032_5741, 0x6974_614e),
-                            (0x8000_0004, 0x4120_6576, 0x3436_4d52, 0x2020_2029, 0x2020_2020),
-                        ];
-                        for &(leaf, ra, rb, rc, rd_v) in table {
+                        for &(leaf, ra, rb, rc, rd_v) in CPUID_LEAVES {
                             self.a.mov_imm(false, T1, leaf as u64);
                             self.a.addsub_rr(false, true, true, ZR, T0, T1, 0);
                             let next = self.a.bcond(NE);
