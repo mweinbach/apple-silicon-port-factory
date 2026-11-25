@@ -707,6 +707,29 @@ fn autoconvert_pcm16_mono_44k() {
             call!(c, AC_PADDING, (*mut u32) -> HRESULT; &mut pad);
         }
         assert_eq!(pad, 0, "null device did not drain the stream");
+
+        // Verify IAudioClock reports client-format position (441 frames @ 44.1 kHz = 882 bytes)
+        // while IAudioClock2::GetDevicePosition reports endpoint-rate frames (480 frames @ 48 kHz).
+        let mut ck: P = std::ptr::null_mut();
+        assert_eq!(call!(c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioClock, &mut ck), S_OK);
+        let (hr_ck2, ck2) = qi(ck, &IID_IAudioClock2);
+        assert_eq!(hr_ck2, S_OK);
+        let mut freq = 0u64;
+        let mut pos_bytes = 0u64;
+        let mut dev_frames = 0u64;
+        let mut qpc = 0u64;
+        assert_eq!(call!(ck, 3, (*mut u64) -> HRESULT; &mut freq), S_OK);
+        assert_eq!(call!(ck, 4, (*mut u64, *mut u64) -> HRESULT; &mut pos_bytes, &mut qpc), S_OK);
+        assert_eq!(call!(ck2, 3, (*mut u64, *mut u64) -> HRESULT; &mut dev_frames, &mut qpc), S_OK);
+        assert_eq!(freq, 44_100 * 2);
+        assert_eq!(pos_bytes, 441 * 2);
+        assert_eq!(
+            dev_frames, 480,
+            "GetDevicePosition must report endpoint-rate frames (480 @ 48 kHz), not client-rate frames (441 @ 44.1 kHz)"
+        );
+        assert_eq!(release(ck2), 1);
+        assert_eq!(release(ck), 0);
+
         release(rc);
         release(c2);
         assert_eq!(release(c), 0);

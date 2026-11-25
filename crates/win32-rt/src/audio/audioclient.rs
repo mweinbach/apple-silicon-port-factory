@@ -2121,16 +2121,26 @@ mod clock2 {
         if dev_pos.is_null() {
             return E_POINTER;
         }
-        let st = ClockObj::inner(owner(this)).core.st.lock().unwrap();
+        let core = &ClockObj::inner(owner(this)).core;
+        let dev_rate = core.ep.mix_format().rate as u64;
+        let st = core.st.lock().unwrap();
         match st.stream.as_ref() {
             None => AUDCLNT_E_NOT_INITIALIZED,
             Some(s) if is_invalid(s) => AUDCLNT_E_DEVICE_INVALIDATED,
             Some(s) => {
-                let frames = match &s.io {
+                let client_frames = match &s.io {
                     StreamIo::Render(_) => s.shared.ring.consumed() as u64 + s.dropped_silence,
                     StreamIo::Capture(c) => c.device_pos,
                 };
-                std::ptr::write_unaligned(dev_pos, frames);
+                let client_rate = s.fmt.rate as u64;
+                // IAudioClock2::GetDevicePosition reports hardware/endpoint-rate frames rather
+                // than client-format frames when AUTOCONVERTPCM resamples between rates.
+                let dev_frames = if client_rate > 0 && dev_rate > 0 && client_rate != dev_rate {
+                    ((client_frames as u128 * dev_rate as u128) / client_rate as u128) as u64
+                } else {
+                    client_frames
+                };
+                std::ptr::write_unaligned(dev_pos, dev_frames);
                 if !qpc_pos.is_null() {
                     std::ptr::write_unaligned(qpc_pos, crate::kernel32::time::interrupt_time_100ns());
                 }
