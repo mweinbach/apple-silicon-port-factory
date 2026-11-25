@@ -24,6 +24,7 @@ mod decode;
 mod exec;
 mod ext;
 mod more;
+mod x87;
 #[cfg(test)]
 mod tests;
 
@@ -38,6 +39,13 @@ pub(super) use ext::{
 pub(super) use more::{
     K_ATOMIC, K_BIT_EXT, K_HI8, K_PCMPSTR, K_STRING, K_SYS_MISC, K_VAES_RM, K_VAES_RR, K_VCVT_PH,
     K_VMASKMOV, K_VSHA_RM, K_VSHA_RR,
+};
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
+pub(super) use x87::{
+    K_X87, X87_BINOP_MEM, X87_BINOP_ST, X87_CMP_MEM, X87_CMP_ST, X87_FABS, X87_FBLD, X87_FBSTP,
+    X87_FCHS, X87_FCMOV, X87_FDECSTP, X87_FENV, X87_FFREE, X87_FILD, X87_FINCSTP, X87_FIST,
+    X87_FLDCW, X87_FLD_CONST, X87_FLD_MEM, X87_FLD_ST, X87_FNCLEX, X87_FNINIT, X87_FNSTCW,
+    X87_FNSTSW_AX, X87_FNSTSW_M, X87_FST_MEM, X87_FST_ST, X87_FTST, X87_FXAM, X87_FXCH, X87_UNARY,
 };
 
 #[cfg(not(target_endian = "little"))]

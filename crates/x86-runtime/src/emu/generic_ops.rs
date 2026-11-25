@@ -25,7 +25,8 @@ impl Cpu {
             Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence => {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
-            Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
+            Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Fneni | Mnemonic::Fndisi | Mnemonic::Fnsetpm
+            | Mnemonic::Endbr64 | Mnemonic::Endbr32
             | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
             | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
             | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {}

@@ -29,6 +29,8 @@ pub(super) struct JitScratch {
     pub mxcsr: u32,
     /// Embedding thread FPCR for native calls made directly by generated code.
     pub host_fpcr: u64,
+    pub x87_state: usize,
+    pub x87_helpers: usize,
 }
 
 impl Default for JitScratch {
@@ -39,6 +41,8 @@ impl Default for JitScratch {
             table: 0,
             mul: 0,
             codegen: 0,
+            x87_state: 0,
+            x87_helpers: 0,
             teb: 0,
             ctx_sp: 0,
             ctx_blocks: 0,

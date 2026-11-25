@@ -1140,6 +1140,7 @@ pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
             }
         }
         K_VAES_RR..=K_VSHA_RM => exec_ext_all_remaining(cpu, op),
+        K_X87 => super::x87::exec_x87_fast(cpu, op),
         _ => {}
     }
 }

@@ -4,6 +4,7 @@ use super::aot::AotReloc;
 use super::cache::TrScratch;
 use super::emit::{enc_logic_imm, Asm};
 use super::lazy::{Edges, PF_NONE};
+use super::x87::{X87Cold, FCMOV_CC};
 use super::xmm::{xmm_class, ColdNan, XClass};
 use super::*;
 use crate::emu::fast::{self, FastOp, RNONE};
@@ -61,6 +62,7 @@ pub(in crate::emu) fn supported(op: &FastOp) -> bool {
             | K_CMPJ_RI
             | K_CMPJ_RM
             | K_VSHUF_RR..=K_VSHA_RM
+            | K_X87
     )
 }
 
@@ -185,6 +187,10 @@ pub(super) struct SideExit {
     pub(super) xd: u16,
     /// Pending parity byte (`Tr::pf`).
     pub(super) pf: u8,
+    /// Static x87 TOP state at this side exit (flushed before leaving to interpreter).
+    pub(super) x87_top_known: Option<u8>,
+    pub(super) x87_top_dirty: bool,
+    pub(super) x87_sw_top_dirty: bool,
 }
 
 pub(super) struct SlowMem {
@@ -284,6 +290,16 @@ pub(super) struct Tr<'a> {
     pub(super) xd: u16,
     /// Out-of-line NaN fixups.
     pub(super) cold: Vec<ColdNan>,
+    /// Static x87 TOP tracking within the block (`None` = dynamic from `X87State::top`).
+    pub(super) x87_top_known: Option<u8>,
+    /// True when `x87_top_known` is newer than `X87State::top` in memory.
+    pub(super) x87_top_dirty: bool,
+    /// True when `X87State::sw[13:11]` needs to be synced with `top`.
+    pub(super) x87_sw_top_dirty: bool,
+    /// Deferred out-of-line x87 soft-float80 / exception / transcendental stubs.
+    pub(super) x87_colds: Vec<X87Cold>,
+    /// Sites of `bl x87_trampoline` to be patched once the block-local trampoline is emitted.
+    pub(super) x87_tramp_calls: Vec<usize>,
     /// `AW2_JIT_RETLIT`.
     pub(super) retlit: bool,
     /// `ldr` literal sites and their values (pool emitted after the out-of-line code).
@@ -427,6 +443,11 @@ pub(super) fn op_flags(op: &FastOp) -> (u8, u8) {
             2 => (FC, FC),
             _ => (0, 0),
         },
+        K_X87 => match op.x & 0x3F {
+            X87_CMP_ST if (op.w & 16) != 0 => (0, FALL),
+            X87_FCMOV => (cc_reads(FCMOV_CC[op.w as usize & 7]), 0),
+            _ => (0, 0),
+        },
         _ => (0, 0),
     }
 }
@@ -490,9 +511,10 @@ impl Tr<'_> {
             self.track_rsp(k);
         }
         self.xa_key = None;
-        // Every transfer out of the block (terminator, budget exit) sees Cpu::xmm current;
+        // Every transfer out of the block (terminator, budget exit) sees Cpu::xmm and X87State current;
         // terminators (inline plain calls) may write Cpu::xmm0 directly.
         self.xbarrier();
+        self.flush_x87_top();
         if bud_be && self.term_tests_budget(&term) {
             // Leave before the terminator (the interpreter runs it) once the budget is out.
             let se = self.side_exit_here(n - 1);
@@ -545,6 +567,7 @@ impl Tr<'_> {
         self.ymm_colds = ymm_colds;
         self.emit_timestamp_fallbacks();
         self.emit_cold_nan();
+        self.emit_x87_colds();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
             if se.fix == usize::MAX {
@@ -559,6 +582,7 @@ impl Tr<'_> {
             self.flush_flags(need);
             self.flush_lb();
             self.xstore(se.xd);
+            self.flush_x87_top_for_exit(se.x87_top_known, se.x87_top_dirty, se.x87_sw_top_dirty);
             if self.bud_dec {
                 self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - se.k)) as u32, false);
             }
@@ -598,6 +622,8 @@ impl Tr<'_> {
         self.ymm_colds.clear();
         self.tsc_colds.clear();
         self.cold.clear();
+        self.x87_colds.clear();
+        self.x87_tramp_calls.clear();
         self.lits.clear();
         self.lits128.clear();
         self.pool.clear();
@@ -612,6 +638,8 @@ impl Tr<'_> {
         sc.ymm_colds = self.ymm_colds;
         sc.tsc_colds = self.tsc_colds;
         sc.cold = self.cold;
+        sc.x87_colds = self.x87_colds;
+        sc.x87_tramp_calls = self.x87_tramp_calls;
         sc.lits = self.lits;
         sc.lits128 = self.lits128;
         sc.pool = self.pool;
@@ -1100,7 +1128,17 @@ impl Tr<'_> {
     }
 
     pub(super) fn side_exit_here(&mut self, k: usize) -> usize {
-        self.side_exits.push(SideExit { fix: usize::MAX, k, fs: self.fs, lb: self.lb, xd: self.xd, pf: self.pf });
+        self.side_exits.push(SideExit {
+            fix: usize::MAX,
+            k,
+            fs: self.fs,
+            lb: self.lb,
+            xd: self.xd,
+            pf: self.pf,
+            x87_top_known: self.x87_top_known,
+            x87_top_dirty: self.x87_top_dirty,
+            x87_sw_top_dirty: self.x87_sw_top_dirty,
+        });
         self.side_exits.len() - 1
     }
 
@@ -1119,11 +1157,22 @@ impl Tr<'_> {
     pub(super) fn bind_side_exit(&mut self, se: usize, f: usize) {
         // Chain multiple branches to the same side exit through per-site stubs.
         let s = &self.side_exits[se];
-        let (k, fs, lb, xd, pf) = (s.k, s.fs, s.lb, s.xd, s.pf);
+        let (k, fs, lb, xd, pf, x87_top_known, x87_top_dirty, x87_sw_top_dirty) =
+            (s.k, s.fs, s.lb, s.xd, s.pf, s.x87_top_known, s.x87_top_dirty, s.x87_sw_top_dirty);
         if s.fix == usize::MAX {
             self.side_exits[se].fix = f;
         } else {
-            self.side_exits.push(SideExit { fix: f, k, fs, lb, xd, pf });
+            self.side_exits.push(SideExit {
+                fix: f,
+                k,
+                fs,
+                lb,
+                xd,
+                pf,
+                x87_top_known,
+                x87_top_dirty,
+                x87_sw_top_dirty,
+            });
         }
     }
 

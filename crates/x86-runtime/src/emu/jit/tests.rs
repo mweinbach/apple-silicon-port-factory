@@ -1,6 +1,7 @@
 //! Tests for the A64 emitter and JIT cache.
 
 mod opcode_encodings;
+mod x87_tests;
 
 use super::cache::{jslot, MAX_LSE2_REGIONS, NOJIT};
 use super::*;

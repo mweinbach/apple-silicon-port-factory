@@ -42,6 +42,7 @@ mod ops;
 mod stubs;
 mod translate;
 mod vec;
+mod x87;
 mod xmm;
 #[cfg(test)]
 mod tests;
@@ -154,6 +155,12 @@ pub(super) struct JitScratch {
     pub mxcsr: u32,
     /// Embedding thread FPCR for native calls made directly by generated code.
     pub host_fpcr: u64,
+    /// Per-thread x87 FPU state pointer ([`crate::emu::x87::x87_state_ptr`]), refreshed on entry.
+    pub x87_state: usize,
+    /// Static native Rust x87 helper function table ([`crate::emu::x87::x87_helpers_ptr`]),
+    /// allowing AOT & signed static Mach-O blocks to call soft-float80 / transcendental helpers
+    /// with zero runtime relocations.
+    pub x87_helpers: usize,
     /// Test-only: dynamic `DF_PLAIN` / pure-float-math / inline-QPC calls served directly in
     /// `lookup_call` / `lookup_jmp` from `table`.
     #[cfg(test)]
@@ -169,6 +176,8 @@ impl Default for JitScratch {
             mul: 0,
             codegen: 0,
             atomic_locks: super::cpu::atomic_locks_ptr(),
+            x87_state: 0,
+            x87_helpers: super::x87::x87_helpers_ptr(),
             teb: 0,
             ctx_sp: 0,
             ctx_blocks: 0,
@@ -807,6 +816,8 @@ const OFF_TARGET: u32 = OFF_JX + offset_of!(JitScratch, target) as u32;
 const OFF_TABLE: u32 = OFF_JX + offset_of!(JitScratch, table) as u32;
 const OFF_CODEGEN: u32 = OFF_JX + offset_of!(JitScratch, codegen) as u32;
 const OFF_ATOMIC_LOCKS: u32 = OFF_JX + offset_of!(JitScratch, atomic_locks) as u32;
+const OFF_X87_STATE: u32 = OFF_JX + offset_of!(JitScratch, x87_state) as u32;
+const OFF_X87_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, x87_helpers) as u32;
 const OFF_TEB: u32 = OFF_JX + offset_of!(JitScratch, teb) as u32;
 const OFF_RAS: u32 = OFF_JX + offset_of!(JitScratch, ras) as u32;
 const OFF_AOTDIR: u32 = OFF_JX + offset_of!(JitScratch, aot_dir) as u32;
@@ -820,6 +831,10 @@ const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u
 const _: () = assert!(
     OFF_ATOMIC_LOCKS % 8 == 0
         && OFF_ATOMIC_LOCKS < 8 * 4096
+        && OFF_X87_STATE % 8 == 0
+        && OFF_X87_STATE < 8 * 4096
+        && OFF_X87_HELPERS % 8 == 0
+        && OFF_X87_HELPERS < 8 * 4096
         && OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096

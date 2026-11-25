@@ -113,7 +113,7 @@ impl X87State {
         area.write(0, &env)?;
         let mut st = [0; 128];
         for (i, slot) in st.chunks_exact_mut(16).enumerate() {
-            slot[..10].copy_from_slice(&self.regs[self.phys(i as u8)]); // logical ST(i) order
+            slot[..10].copy_from_slice(&self.regs[self.phys(i as u8)][..10]); // logical ST(i) order
         }
         area.write(32, &st)
     }
@@ -132,7 +132,8 @@ impl X87State {
         state.fdp = u64::from_le_bytes(env[16..24].try_into().unwrap()) & pointer_mask;
         for (i, slot) in st.chunks_exact(16).enumerate() {
             let phys = state.phys(i as u8);
-            state.regs[phys].copy_from_slice(&slot[..10]);
+            state.regs[phys][..10].copy_from_slice(&slot[..10]);
+            state.regs[phys][10..16].fill(0);
         }
         Ok(state)
     }
