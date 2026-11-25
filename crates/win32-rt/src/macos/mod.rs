@@ -742,6 +742,7 @@ pub fn task_dialog_alert<F, T>(
     default_radio_idx: Option<usize>,
     verification_text: Option<String>,
     verification_checked: bool,
+    verification_enabled: bool,
     critical: bool,
     timer_origin: &mut std::time::Instant,
     timer_interval: Option<std::time::Duration>,
@@ -771,6 +772,7 @@ where
             default_radio_idx,
             verification_text.as_deref(),
             verification_checked,
+            verification_enabled,
             &mut on_event,
         ) {
             return res;
@@ -797,6 +799,7 @@ where
                 default_radio_idx,
                 verification_text.as_deref(),
                 verification_checked,
+                verification_enabled,
                 critical,
                 timer_origin,
                 timer_interval,
@@ -823,6 +826,7 @@ where
                 default_radio_idx,
                 verification_text.as_deref(),
                 verification_checked,
+                verification_enabled,
                 critical,
                 tx,
                 cancelled_main,
@@ -862,6 +866,7 @@ where
             default_radio_idx,
             verification_text,
             verification_checked,
+            verification_enabled,
             critical,
             timer_origin,
             timer_interval,
@@ -1060,6 +1065,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1078,6 +1085,11 @@ pub(crate) fn last_test_task_dialog_allow_cancellation() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn last_test_task_dialog_verification_enabled() -> bool {
+    LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED.with(|c| c.get())
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn invoke_test_task_dialog_presenter(
     caption: &str,
@@ -1093,9 +1105,11 @@ fn invoke_test_task_dialog_presenter(
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
+    verification_enabled: bool,
     on_event: &mut dyn FnMut(TaskDialogEvent),
 ) -> Option<TaskDialogOutcome> {
     LAST_TEST_TASK_DIALOG_ALLOW_CANCELLATION.with(|c| c.set(allow_cancellation));
+    LAST_TEST_TASK_DIALOG_VERIFICATION_ENABLED.with(|c| c.set(verification_enabled));
     TEST_TASK_DIALOG_PRESENTER.with(|cell| {
         cell.borrow_mut().as_mut().map(|f| {
             f(

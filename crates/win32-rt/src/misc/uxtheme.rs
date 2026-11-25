@@ -466,6 +466,8 @@ struct ActiveTaskDialog {
     selected_radio_idx: Option<usize>,
     verification_text: Option<String>,
     has_verification: bool,
+    verification_out_provided: bool,
+    verification_enabled: bool,
     verified: bool,
     pending_click_button: Option<i32>,
 }
@@ -595,10 +597,11 @@ fn extract_href_attribute(attrs: &str) -> String {
 }
 
 impl ActiveTaskDialog {
-    fn from_page(session_id: u64, page: ParsedTaskDialogPage) -> Self {
+    fn from_page(session_id: u64, page: ParsedTaskDialogPage, verification_out_provided: bool) -> Self {
         let button_enabled = vec![true; page.buttons.len()];
         let radio_enabled = vec![true; page.radios.len()];
         let has_verification = page.verification_text.is_some();
+        let verification_enabled = has_verification && verification_out_provided;
         Self {
             session_id,
             page_generation: 0,
@@ -625,6 +628,8 @@ impl ActiveTaskDialog {
             selected_radio_idx: page.selected_radio_idx,
             verification_text: page.verification_text,
             has_verification,
+            verification_out_provided,
+            verification_enabled,
             verified: page.verified,
             pending_click_button: None,
         }
@@ -653,6 +658,7 @@ impl ActiveTaskDialog {
         self.radios = page.radios;
         self.selected_radio_idx = page.selected_radio_idx;
         self.has_verification = page.verification_text.is_some();
+        self.verification_enabled = self.has_verification && self.verification_out_provided;
         self.verification_text = page.verification_text;
         self.verified = page.verified;
         self.pending_click_button = None;
@@ -1080,7 +1086,7 @@ unsafe extern "win64" fn task_dialog_wndproc(
                 let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
                 map.get_mut(&h)
                     .map(|dlg| {
-                        let notify = if dlg.has_verification {
+                        let notify = if dlg.has_verification && dlg.verification_enabled {
                             let checked = w_param != 0;
                             dlg.verified = checked;
                             (dlg.pf_callback != 0).then_some((
@@ -1200,7 +1206,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     active_task_dialogs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(dialog_hwnd, ActiveTaskDialog::from_page(session_id, initial_page));
+        .insert(
+            dialog_hwnd,
+            ActiveTaskDialog::from_page(session_id, initial_page, !verification_flag.is_null()),
+        );
     let _dialog_guard = TaskDialogHwndGuard { hwnd: dialog_hwnd };
 
     let notify_lp = |msg: u32, wp: u64, lp: u64| -> HRESULT {
@@ -1249,6 +1258,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             radio_enabled: Vec<bool>,
             selected_radio_idx: Option<usize>,
             verification_text: Option<String>,
+            verification_enabled: bool,
             verified: bool,
             critical: bool,
             callback_timer: bool,
@@ -1279,6 +1289,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 radio_enabled: dlg.radio_enabled.clone(),
                 selected_radio_idx: dlg.selected_radio_idx,
                 verification_text: dlg.verification_text.clone(),
+                verification_enabled: dlg.verification_enabled,
                 verified: dlg.verified,
                 critical: dlg.critical,
                 callback_timer: dlg.callback_timer,
@@ -1319,6 +1330,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             snap.selected_radio_idx,
             snap.verification_text,
             snap.verified,
+            snap.verification_enabled,
             snap.critical,
             &mut timer_origin,
             timer_interval,
@@ -1342,7 +1354,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     let has_ver = {
                         let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
                         map.get_mut(&dialog_hwnd).is_some_and(|dlg| {
-                            if dlg.page_generation != presented_gen || !dlg.has_verification {
+                            if dlg.page_generation != presented_gen
+                                || !dlg.has_verification
+                                || !dlg.verification_enabled
+                            {
                                 return false;
                             }
                             dlg.verified = checked;
@@ -1384,13 +1399,13 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                         match presented {
                             crate::macos::TaskDialogOutcome::Completed(ref res) => {
                                 dlg.selected_radio_idx = res.radio_index;
-                                if dlg.has_verification {
+                                if dlg.has_verification && dlg.verification_enabled {
                                     dlg.verified = res.verified;
                                 }
                             }
                             crate::macos::TaskDialogOutcome::Cancelled { radio_index, verified } => {
                                 dlg.selected_radio_idx = radio_index;
-                                if dlg.has_verification {
+                                if dlg.has_verification && dlg.verification_enabled {
                                     dlg.verified = verified;
                                 }
                             }
@@ -2490,6 +2505,8 @@ mod tests {
                         selected_radio_idx: None,
                         verification_text: None,
                         has_verification: false,
+                        verification_out_provided: false,
+                        verification_enabled: false,
                         verified: false,
                         pending_click_button: None,
                     },
@@ -2588,6 +2605,8 @@ mod tests {
                         selected_radio_idx: None,
                         verification_text: None,
                         has_verification: false,
+                        verification_out_provided: false,
+                        verification_enabled: false,
                         verified: false,
                         pending_click_button: None,
                     },
@@ -3324,6 +3343,8 @@ mod tests {
                         selected_radio_idx: None,
                         verification_text: None,
                         has_verification: false,
+                        verification_out_provided: false,
+                        verification_enabled: false,
                         verified: false,
                         pending_click_button: None,
                     },
@@ -3840,6 +3861,110 @@ mod tests {
                 HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
             );
             assert_eq!(hbtn, 0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_disables_verification_checkbox_when_output_pointer_is_null() {
+        std::thread::spawn(|| unsafe {
+            static VER_CLICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+            unsafe extern "win64" fn ver_cb(
+                hwnd: HWND,
+                msg: u32,
+                _wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_CREATED {
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_VERIFICATION, 1, 0);
+                } else if msg == TDN_VERIFICATION_CLICKED {
+                    VER_CLICKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                S_OK
+            }
+
+            let title = crate::strings::to_wide_z("Verify Disabled");
+            let ver_txt = crate::strings::to_wide_z("Do not ask again");
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_flags = TDF_VERIFICATION_FLAG_CHECKED;
+            cfg.dw_common_buttons = TDCBF_OK_BUTTON;
+            cfg.psz_window_title = title.as_ptr();
+            cfg.psz_verification_text = ver_txt.as_ptr();
+            cfg.pf_callback = ver_cb as *const () as usize;
+
+            // 1. Null pfVerificationFlagChecked -> checkbox is shown disabled and cannot trigger
+            //    TDN_VERIFICATION_CLICKED (via native event or TDM_CLICK_VERIFICATION).
+            VER_CLICKS.store(0, std::sync::atomic::Ordering::Release);
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, vt, vc, emit| {
+                    assert_eq!(vt, Some("Do not ask again"));
+                    assert!(vc);
+                    assert!(
+                        !crate::macos::last_test_task_dialog_verification_enabled(),
+                        "null pfVerificationFlagChecked must disable the verification checkbox"
+                    );
+                    emit(crate::macos::TaskDialogEvent::VerificationToggled(false));
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+
+            let mut out_btn = 0;
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut out_btn,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr, S_OK);
+            assert_eq!(out_btn, 1);
+            assert_eq!(
+                VER_CLICKS.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "disabled verification checkbox must not trigger TDN_VERIFICATION_CLICKED"
+            );
+
+            // 2. Non-null pfVerificationFlagChecked -> checkbox is enabled and delivers events.
+            VER_CLICKS.store(0, std::sync::atomic::Ordering::Release);
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, vt, _vc, emit| {
+                    assert_eq!(vt, Some("Do not ask again"));
+                    assert!(
+                        crate::macos::last_test_task_dialog_verification_enabled(),
+                        "non-null pfVerificationFlagChecked must enable the verification checkbox"
+                    );
+                    emit(crate::macos::TaskDialogEvent::VerificationToggled(false));
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: false,
+                    })
+                },
+            )));
+
+            let mut out_ver = TRUE;
+            let hr2 = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut out_btn,
+                std::ptr::null_mut(),
+                &mut out_ver,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr2, S_OK);
+            assert_eq!(out_ver, FALSE);
+            assert_eq!(
+                VER_CLICKS.load(std::sync::atomic::Ordering::Acquire),
+                2,
+                "enabled verification checkbox must deliver both TDM_CLICK_VERIFICATION and toggle events"
+            );
         })
         .join()
         .unwrap();

@@ -1605,6 +1605,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         None,
         None,
         false,
+        false,
         critical,
         &mut origin,
         None,
@@ -1860,6 +1861,7 @@ fn run_task_dialog_alert(
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
+    verification_enabled: bool,
     critical: bool,
     sink: TaskDialogEventSink,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
@@ -1906,8 +1908,11 @@ fn run_task_dialog_alert(
             cb.setTitle(&NSString::from_str(vtext));
             let state = if verification_checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
             let _: () = unsafe { msg_send![&*cb, setState: state] };
-            let _: () = unsafe { msg_send![&*cb, setTarget: &*target] };
-            let _: () = unsafe { msg_send![&*cb, setAction: sel!(verificationToggled:)] };
+            cb.setEnabled(verification_enabled);
+            if verification_enabled {
+                let _: () = unsafe { msg_send![&*cb, setTarget: &*target] };
+                let _: () = unsafe { msg_send![&*cb, setAction: sel!(verificationToggled:)] };
+            }
         }
     }
 
@@ -2146,6 +2151,7 @@ pub(super) fn task_dialog_alert_channel(
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
+    verification_enabled: bool,
     critical: bool,
     tx: std::sync::mpsc::Sender<super::TaskDialogEvent>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2165,6 +2171,7 @@ pub(super) fn task_dialog_alert_channel(
         default_radio_idx,
         verification_text,
         verification_checked,
+        verification_enabled,
         critical,
         TaskDialogEventSink::Channel(tx.clone()),
         Some(&cancelled),
@@ -2246,6 +2253,7 @@ pub(super) fn task_dialog_alert_inline(
     default_radio_idx: Option<usize>,
     verification_text: Option<&str>,
     verification_checked: bool,
+    verification_enabled: bool,
     critical: bool,
     timer_origin: &mut std::time::Instant,
     timer_interval: Option<std::time::Duration>,
@@ -2312,6 +2320,7 @@ pub(super) fn task_dialog_alert_inline(
         default_radio_idx,
         verification_text,
         verification_checked,
+        verification_enabled,
         critical,
         TaskDialogEventSink::Inline(cb_ptr),
         None,
