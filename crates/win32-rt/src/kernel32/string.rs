@@ -1882,44 +1882,79 @@ fn icu_pattern_to_win(pat: &str, force_4digit_year: bool) -> String {
     out.trim().to_string()
 }
 
-fn default_ansi_cp_for(lang: &str, country: &str) -> u32 {
+/// Documented Windows `LOCALE_IDEFAULTANSICODEPAGE` (`0x1004`).
+/// Returns `0` for Unicode-only locales (Indic, Georgian, Armenian, Ethiopic, Khmer, Lao,
+/// Burmese, Tibetan, Sinhala, Maltese, etc.) per the Windows NLS contract.
+fn default_ansi_cp_for(lang: &str, country: &str, script: &str) -> u32 {
     match lang {
         "ja" => 932,
-        "zh" => match country {
-            "TW" | "HK" | "MO" => 950,
-            _ => 936,
+        "zh" => match script {
+            "Hant" => 950,
+            "Hans" => 936,
+            _ => match country {
+                "TW" | "HK" | "MO" => 950,
+                _ => 936,
+            },
         },
         "ko" => 949,
-        "ru" | "uk" | "bg" | "be" | "sr" | "mk" | "kk" | "ky" => 1251,
-        "pl" | "cs" | "sk" | "hu" | "ro" | "hr" | "sl" | "sq" | "bs" => 1250,
-        "el" => 1253,
-        "tr" | "az" => 1254,
-        "he" | "iw" => 1255,
-        "ar" | "fa" | "ur" => 1256,
-        "et" | "lv" | "lt" => 1257,
-        "vi" => 1258,
         "th" => 874,
-        _ => 1252,
+        "el" => 1253,
+        "he" | "iw" => 1255,
+        "vi" => 1258,
+        "et" | "lv" | "lt" => 1257,
+        "ar" | "fa" | "ur" | "ps" | "ug" | "prs" | "ckb" => 1256,
+        "sd" => if script == "Deva" { 0 } else { 1256 },
+        "ku" => if script == "Latn" { 1254 } else { 1256 },
+        "tr" => 1254,
+        "az" | "uz" => match script {
+            "Cyrl" => 1251,
+            "Arab" => 1256,
+            _ => 1254,
+        },
+        "sr" => if script == "Latn" { 1250 } else { 1251 },
+        "bs" => if script == "Cyrl" { 1251 } else { 1250 },
+        "mn" => if script == "Mong" { 0 } else { 1251 },
+        "ru" | "uk" | "bg" | "be" | "mk" | "kk" | "ky" | "tt" | "ba" | "sah" | "tg" => 1251,
+        "pl" | "cs" | "sk" | "hu" | "ro" | "hr" | "sl" | "sq" | "dsb" | "hsb" | "tk" => 1250,
+        "iu" | "tzm" => if script == "Latn" { 1252 } else { 0 },
+        "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "sv" | "fi" | "da" | "nb" | "nn"
+        | "no" | "is" | "fo" | "af" | "eu" | "ca" | "gl" | "id" | "ms" | "sw" | "ga" | "gd"
+        | "cy" | "br" | "co" | "fy" | "lb" | "oc" | "rm" | "st" | "tn" | "xh" | "zu" | "fil"
+        | "ha" | "ig" | "yo" | "quz" | "qu" | "mi" | "se" | "smj" | "smn" | "sms" | "sma"
+        | "arn" | "moh" | "kl" | "rw" | "wo" | "gsw" | "als" | "nso" | "qut" | "jv" | "su"
+        | "mg" | "sn" | "so" | "om" | "ny" | "eo" | "ia" | "la" => {
+            if !script.is_empty() && script != "Latn" {
+                0
+            } else {
+                1252
+            }
+        }
+        _ => 0,
     }
 }
 
-fn default_oem_cp_for(lang: &str, country: &str) -> u32 {
-    match lang {
-        "ja" => 932,
-        "zh" => match country {
-            "TW" | "HK" | "MO" => 950,
-            _ => 936,
-        },
-        "ko" => 949,
-        "en" if country == "US" => 437,
-        "ru" | "uk" | "bg" | "be" | "kk" => 866,
-        "pl" | "cs" | "sk" | "hu" | "ro" | "hr" | "sl" => 852,
-        "el" => 737,
-        "tr" => 857,
-        "he" | "iw" => 862,
-        "ar" => 720,
-        "th" => 874,
-        "et" | "lv" | "lt" => 775,
+/// Documented Windows `LOCALE_IDEFAULTCODEPAGE` (`0x0B`, OEM code page).
+/// Returns `1` (`CP_OEMCP`) for Unicode-only locales per the Windows NLS contract.
+fn default_oem_cp_for(lang: &str, country: &str, script: &str) -> u32 {
+    let ansi = default_ansi_cp_for(lang, country, script);
+    if ansi == 0 {
+        return 1;
+    }
+    match ansi {
+        932 => 932,
+        936 => 936,
+        949 => 949,
+        950 => 950,
+        874 => 874,
+        1250 => 852,
+        1251 => 866,
+        1253 => 737,
+        1254 => 857,
+        1255 => 862,
+        1256 => 720,
+        1257 => 775,
+        1258 => 1258,
+        1252 if lang == "en" && country == "US" => 437,
         _ => 850,
     }
 }
@@ -2144,6 +2179,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
     };
     let lang = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_language)(cloc.as_ptr(), b, cap, s)) }.unwrap_or_default();
     let country = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_country)(cloc.as_ptr(), b, cap, s)) }.unwrap_or_default();
+    let script = unsafe { icu::call_ascii_str(|b, cap, s| (a.uloc_get_script)(cloc.as_ptr(), b, cap, s)) }.unwrap_or_default();
 
     let s: String = match t {
         0x01 | 0x09 => format!("{:04x}", loc.lcid & 0xFFFF),
@@ -2177,7 +2213,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
             icu::call_u16_str(|b, cap, s| (a.uloc_get_display_country)(cloc.as_ptr(), cloc.as_ptr(), b, cap, s))
                 .unwrap_or_default()
         },
-        0x0B => default_oem_cp_for(&lang, &country).to_string(),
+        0x0B => default_oem_cp_for(&lang, &country, &script).to_string(),
         0x0C => {
             let dec = num_sym(icu::UNUM_DECIMAL, icu::UNUM_DECIMAL_SEPARATOR_SYMBOL).unwrap_or_else(|| ".".into());
             if dec == "," { ";".into() } else { ",".into() }
@@ -2330,7 +2366,7 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
         0x7E => date_sym(icu::UDAT_AM_PMS, 0).and_then(|s| s.chars().next()).map(|c| c.to_string()).unwrap_or_else(|| "A".into()),
         0x7F => date_sym(icu::UDAT_AM_PMS, 1).and_then(|s| s.chars().next()).map(|c| c.to_string()).unwrap_or_else(|| "P".into()),
         0x1003 => date_pat(icu::UDAT_MEDIUM, icu::UDAT_NONE, false).unwrap_or_else(|| "h:mm:ss tt".into()),
-        0x1004 => default_ansi_cp_for(&lang, &country).to_string(),
+        0x1004 => default_ansi_cp_for(&lang, &country, &script).to_string(),
         0x1005 => "1".into(),
         0x1006 => best_pat("yMMMM").unwrap_or_else(|| "MMMM yyyy".into()),
         0x1007 => unsafe {
@@ -4378,6 +4414,26 @@ mod tests {
             let mut buf = [0u16; 128];
             assert!(GetLocaleInfoEx(fr.as_ptr(), 0x2A, buf.as_mut_ptr(), 128) > 0);
             assert_eq!(from_wide(buf.as_ptr()), "lundi");
+
+            // Unicode-only locales report 0 for LOCALE_IDEFAULTANSICODEPAGE and 1 for
+            // LOCALE_IDEFAULTCODEPAGE per the Windows NLS contract, while script-aware
+            // locales pick the code page matching their script.
+            let query_ex = |tag: &str, lctype: u32| -> String {
+                let wt = to_wide_z(tag);
+                let mut b = [0u16; 128];
+                assert!(GetLocaleInfoEx(wt.as_ptr(), lctype, b.as_mut_ptr(), 128) > 0, "GetLocaleInfoEx({tag}, 0x{lctype:x}) failed");
+                from_wide(b.as_ptr())
+            };
+            assert_eq!(query_ex("hi-IN", 0x1004), "0");
+            assert_eq!(query_ex("hi-IN", 0x0B), "1");
+            assert_eq!(query_ex("ka-GE", 0x1004), "0");
+            assert_eq!(query_ex("ka-GE", 0x0B), "1");
+            assert_eq!(query_ex("sr-Latn-RS", 0x1004), "1250");
+            assert_eq!(query_ex("sr-Cyrl-RS", 0x1004), "1251");
+            assert_eq!(query_ex("de-DE", 0x1004), "1252");
+            assert_eq!(query_ex("de-DE", 0x0B), "850");
+            assert_eq!(query_ex("en-US", 0x1004), "1252");
+            assert_eq!(query_ex("en-US", 0x0B), "437");
 
             // Invalid LCID returns 0 + ERROR_INVALID_PARAMETER (never silently en-US!)
             assert_eq!(GetLocaleInfoW(0x9999, 0x0E, buf.as_mut_ptr(), 128), 0);

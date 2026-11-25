@@ -1082,6 +1082,28 @@ mod tests {
                 assert!(!r.is_null(), "setlocale({tag}) failed");
                 let saved = from_ansi(r);
                 let saved_cp = ___lc_codepage_func();
+                if tag == "hi-IN" {
+                    // Unicode-only locales have LOCALE_IDEFAULTANSICODEPAGE == 0 and must
+                    // select UTF-8 (65001) so strftime("%B") preserves Devanagari bytes.
+                    assert_eq!(saved_cp, 65001);
+                    let tm = super::super::time::Tm {
+                        tm_sec: 0,
+                        tm_min: 0,
+                        tm_hour: 12,
+                        tm_mday: 15,
+                        tm_mon: 0,
+                        tm_year: 126,
+                        tm_wday: 4,
+                        tm_yday: 14,
+                        tm_isdst: 0,
+                    };
+                    let mut sbuf = [0u8; 64];
+                    let n = super::super::time::strftime(sbuf.as_mut_ptr(), sbuf.len(), b"%B\0".as_ptr(), &tm);
+                    assert!(n > 0);
+                    let month = std::str::from_utf8(&sbuf[..n]).unwrap();
+                    assert!(!month.contains('?'), "hi-IN strftime(\"%B\") must not lose Devanagari: {month:?}");
+                    assert_eq!(month, "जनवरी");
+                }
                 assert!(!setlocale(LC_ALL, b"C\0".as_ptr()).is_null());
                 let csaved = std::ffi::CString::new(saved.as_str()).unwrap();
                 let restored = setlocale(LC_ALL, csaved.as_ptr() as *const u8);
