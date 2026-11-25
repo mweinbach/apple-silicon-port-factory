@@ -34,7 +34,79 @@ pub struct Cpu {
     pub(super) jx: jit::JitScratch,
 }
 
+/// Result of an OS entropy query (`getentropy`) returned to JIT/AOT code in `(x0, x1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(super) struct EntropyResult {
+    /// 64 random bits on success, or `0` on failure.
+    pub val: u64,
+    /// `1` when entropy was produced (`CF = 1`), `0` on failure (`CF = 0`).
+    pub ok: u64,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ENTROPY: core::cell::Cell<Option<fn() -> EntropyResult>> = const { core::cell::Cell::new(None) };
+}
+
+/// Test-only: override `RDRAND`/`RDSEED` entropy generation on the current thread (for
+/// deterministic cross-tier difftests and failure-path `CF = 0` testing).
+#[cfg(test)]
+pub(super) fn with_test_entropy<R>(hook: fn() -> EntropyResult, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<fn() -> EntropyResult>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ENTROPY.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_ENTROPY.with(|slot| slot.replace(Some(hook))));
+    f()
+}
+
+extern "C" {
+    fn getentropy(buf: *mut core::ffi::c_void, buflen: usize) -> core::ffi::c_int;
+}
+
+/// Query real OS cryptographic entropy (`getentropy`) for `RDRAND`/`RDSEED`.
+/// Apple Silicon M-series does not expose ARM `FEAT_RNG` (`RNDR`), so Darwin's
+/// `getentropy(2)` (backed by the kernel CSPRNG / hardware TRNG) is the native source.
+pub(super) extern "C" fn guest_entropy_raw() -> EntropyResult {
+    #[cfg(test)]
+    if let Some(hook) = TEST_ENTROPY.with(|slot| slot.get()) {
+        let res = hook();
+        return if res.ok != 0 {
+            EntropyResult { val: res.val, ok: 1 }
+        } else {
+            EntropyResult { val: 0, ok: 0 }
+        };
+    }
+    let mut buf = [0u8; 8];
+    let rc = unsafe { getentropy(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+    if rc == 0 {
+        EntropyResult { val: u64::from_le_bytes(buf), ok: 1 }
+    } else {
+        EntropyResult { val: 0, ok: 0 }
+    }
+}
+
 impl Cpu {
+    pub(super) fn exec_entropy(&mut self, r0: u8, w: u8) {
+        let res = guest_entropy_raw();
+        let val = if res.ok != 0 { res.val } else { 0 };
+        let i = r0 as usize & 15;
+        match w {
+            16 => self.gpr[i] = (self.gpr[i] & !0xFFFF) | (val & 0xFFFF),
+            32 => self.gpr[i] = val & 0xFFFF_FFFF,
+            _ => self.gpr[i] = val,
+        }
+        self.last_bits[i] = w;
+        self.cf = res.ok != 0;
+        self.zf = false;
+        self.sf = false;
+        self.of = false;
+        self.set_pf(false);
+    }
+
     pub(super) fn read_timestamp(&mut self, ordered: bool) {
         let t = guest_tsc(ordered);
         self.gpr[0] = u64::from(t as u32);

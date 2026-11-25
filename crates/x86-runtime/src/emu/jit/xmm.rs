@@ -110,7 +110,7 @@ pub(super) enum XClass {
 pub(super) fn xmm_class(op: &FastOp) -> XClass {
     use fast::*;
     match op.kind {
-        K_SYS_MISC if matches!(op.x & 0x3F, 9 | 16) => XClass::Barrier,
+        K_SYS_MISC if matches!(op.x & 0x3F, 9 | 13 | 16) => XClass::Barrier,
         K_NOP..=K_CMPJ_RM | K_IMUL_RR..=K_MOVBE_MR | K_BMI_RR | K_BMI_RM | K_LOOP | K_SYS_MISC..=K_ATOMIC => XClass::Free,
         K_VSHUF_RR..=K_CVTF2I_M => XClass::Aware,
         _ => XClass::Barrier,

@@ -1161,6 +1161,13 @@ pub(in crate::emu) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) -> bool {
             2 => cpu.cf = !cpu.cf,
             3 => cpu.df = false,
             4 => cpu.df = true,
+            6 => {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+                }
+            }
             _ => core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst),
         },
         K_SHIFT_MI | K_SHIFT_MCL => {

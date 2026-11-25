@@ -59,7 +59,7 @@ pub(in crate::emu) fn supported(op: &FastOp) -> bool {
             | K_CMPJ_RR
             | K_CMPJ_RI
             | K_CMPJ_RM
-            | K_VSHUF_RR..=K_VSHA_RM
+            | K_VSHUF_RR..=K_VVNNI_RM
     )
 }
 
@@ -392,7 +392,8 @@ pub(super) fn op_flags(op: &FastOp) -> (u8, u8) {
                 (0, 0)
             }
         }
-        K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM | K_VCVT_PH | K_VMASKMOV => (0, 0),
+        K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM | K_VGFNI_RR | K_VGFNI_RM | K_VVNNI_RR
+        | K_VVNNI_RM | K_VCVT_PH | K_VMASKMOV => (0, 0),
         K_SYS_MISC => match op.x & 0x3F {
             0 => (FC | FZ | FS | FP, 0),
             1 => (0, FC | FZ | FS | FP),
@@ -400,7 +401,7 @@ pub(super) fn op_flags(op: &FastOp) -> (u8, u8) {
             // `fnstcw`, `fldcw`, `xgetbv`, `fxsave*`/`xsave*`/`*rstor*`) can observe full guest
             // RFLAGS (stack push, `#GP`/`#PF` VEH dispatch, or non-AFP soft-flush exit).
             2 | 4 | 5 | 7 | 14 | 15 | 16 => (FALL, 0),
-            3 => (0, FALL),
+            3 | 13 => (0, FALL),
             _ => (0, 0),
         },
         K_HI8 => match op.x & 0x3F {
@@ -729,7 +730,8 @@ impl Tr<'_> {
                 K_VSHUF_RR | K_VSHUF_RM | K_VINT_RR | K_VINT_RM | K_VFP_RR | K_VFP_RM
                 | K_VTEST_RR | K_VTEST_RM | K_VBROADCAST | K_PMOVX | K_VBLENDV_RR
                 | K_VBLENDV_RM | K_VFMA_RR | K_VFMA_RM
-                | K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM => mode == VM_V256,
+                | K_VAES_RR | K_VAES_RM | K_VSHA_RR | K_VSHA_RM | K_VGFNI_RR | K_VGFNI_RM
+                | K_VVNNI_RR | K_VVNNI_RM => mode == VM_V256,
                 _ => false,
             };
             if reads_ymm {

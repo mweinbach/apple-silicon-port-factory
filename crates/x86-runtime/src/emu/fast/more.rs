@@ -23,6 +23,12 @@ pub(in crate::emu) const K_PCMPSTR: u8 = 124;
 /// Intel SHA-NI (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`, `sha256rnds2`, `sha256msg1`, `sha256msg2`).
 pub(in crate::emu) const K_VSHA_RR: u8 = 125;
 pub(in crate::emu) const K_VSHA_RM: u8 = 126;
+/// Intel GFNI (`(v)gf2p8mulb`, `(v)gf2p8affineqb`, `(v)gf2p8affineinvqb`, legacy + VEX.128/256).
+pub(in crate::emu) const K_VGFNI_RR: u8 = 127;
+pub(in crate::emu) const K_VGFNI_RM: u8 = 128;
+/// Intel AVX-VNNI (`vpdpbusd`, `vpdpbusds`, `vpdpwssd`, `vpdpwssds`, VEX.128/256).
+pub(in crate::emu) const K_VVNNI_RR: u8 = 129;
+pub(in crate::emu) const K_VVNNI_RM: u8 = 130;
 
 fn lower_hi8_ins(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     use iced_x86::Mnemonic as M;
@@ -274,7 +280,28 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
                 M::Aesimc | M::Vaesimc => 4,
                 _ => 5,
             };
-            lower_v(ins, &mut f, K_VAES_RR, K_VAES_RM, sub, false, None)?;
+            lower_v(ins, &mut f, K_VAES_RR, K_VAES_RM, sub, sub <= 3, None)?;
+        }
+        M::Gf2p8mulb | M::Vgf2p8mulb | M::Gf2p8affineqb | M::Vgf2p8affineqb
+        | M::Gf2p8affineinvqb | M::Vgf2p8affineinvqb => {
+            let sub: u8 = match mn {
+                M::Gf2p8mulb | M::Vgf2p8mulb => 0,
+                M::Gf2p8affineqb | M::Vgf2p8affineqb => 1,
+                _ => 2,
+            };
+            lower_v(ins, &mut f, K_VGFNI_RR, K_VGFNI_RM, sub, true, None)?;
+        }
+        M::Vpdpbusd | M::Vpdpbusds | M::Vpdpwssd | M::Vpdpwssds => {
+            if ins.encoding() != EncodingKind::VEX {
+                return None;
+            }
+            let sub: u8 = match mn {
+                M::Vpdpbusd => 0,
+                M::Vpdpbusds => 1,
+                M::Vpdpwssd => 2,
+                _ => 3,
+            };
+            lower_v(ins, &mut f, K_VVNNI_RR, K_VVNNI_RM, sub, true, None)?;
         }
         M::Sha1rnds4 | M::Sha1nexte | M::Sha1msg1 | M::Sha1msg2 | M::Sha256rnds2 | M::Sha256msg1 | M::Sha256msg2 => {
             if n < 2 || k0 != OpKind::Register || ins.encoding() != EncodingKind::Legacy {
@@ -1149,15 +1176,23 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) -> bool 
             let d = op.r0 as usize & 15;
             let s1 = ((op.imm >> 8) as usize) & 15;
             let sub = op.x & 0x3F;
-            let state = cpu.xmm[s1];
-            let src = if op.kind == K_VAES_RM {
-                cpu.read_u128(cpu.faddr(op))
+            let mode = op.w & 3;
+            let is_256 = mode == VM_V256;
+            let state_lo = cpu.xmm[s1];
+            let state_hi = if is_256 { cpu.ymm_hi[s1] } else { 0 };
+            let (src_lo, src_hi) = if op.kind == K_VAES_RM {
+                let a = cpu.faddr(op);
+                (cpu.read_u128(a), if is_256 { cpu.read_u128(a.wrapping_add(16)) } else { 0 })
             } else {
-                cpu.xmm[op.r1 as usize & 15]
+                let r2 = op.r1 as usize & 15;
+                (cpu.xmm[r2], if is_256 { cpu.ymm_hi[r2] } else { 0 })
             };
-            cpu.xmm[d] = sk::aes_op_128(sub, state, src, op.imm as u8);
-            if (op.w & 3) == VM_V128 {
-                cpu.clear_ymm_hi_reg(d);
+            let imm8 = op.imm as u8;
+            cpu.xmm[d] = sk::aes_op_128(sub, state_lo, src_lo, imm8);
+            match mode {
+                VM_V128 => cpu.clear_ymm_hi_reg(d),
+                VM_V256 => cpu.set_ymm_hi(d, sk::aes_op_128(sub, state_hi, src_hi, imm8)),
+                _ => {}
             }
         }
         K_VCVT_PH => {
@@ -1358,12 +1393,7 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) -> bool 
                 }
                 13 => {
                     // Rdrand / Rdseed
-                    cpu.rset(op.r0, op.w, 0x9E37_79B9_7F4A_7C15);
-                    cpu.cf = true;
-                    cpu.zf = false;
-                    cpu.sf = false;
-                    cpu.of = false;
-                    cpu.set_pf(false);
+                    cpu.exec_entropy(op.r0, op.w);
                 }
                 14 => {
                     // Fldcw
@@ -1825,6 +1855,60 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) -> bool 
                 5 => sk::sha256msg1(src1, src2),
                 _ => sk::sha256msg2(src1, src2),
             };
+        }
+        K_VGFNI_RR | K_VGFNI_RM => {
+            let d = op.r0 as usize & 15;
+            let s1 = ((op.imm >> 8) as usize) & 15;
+            let sub = op.x & 0x3F;
+            let mode = op.w & 3;
+            let is_256 = mode == VM_V256;
+            let (a_lo, a_hi) = (cpu.xmm[s1], if is_256 { cpu.ymm_hi[s1] } else { 0 });
+            let (b_lo, b_hi) = if op.kind == K_VGFNI_RM {
+                let a = cpu.faddr(op);
+                (cpu.read_u128(a), if is_256 { cpu.read_u128(a.wrapping_add(16)) } else { 0 })
+            } else {
+                let r2 = op.r1 as usize & 15;
+                (cpu.xmm[r2], if is_256 { cpu.ymm_hi[r2] } else { 0 })
+            };
+            let imm8 = op.imm as u8;
+            let run = |a, b| match sub {
+                0 => sk::gf2p8mulb(a, b),
+                1 => sk::gf2p8affineqb(a, b, imm8, false),
+                _ => sk::gf2p8affineqb(a, b, imm8, true),
+            };
+            cpu.xmm[d] = run(a_lo, b_lo);
+            match mode {
+                VM_V128 => cpu.clear_ymm_hi_reg(d),
+                VM_V256 => cpu.set_ymm_hi(d, run(a_hi, b_hi)),
+                _ => {}
+            }
+        }
+        K_VVNNI_RR | K_VVNNI_RM => {
+            let d = op.r0 as usize & 15;
+            let s1 = ((op.imm >> 8) as usize) & 15;
+            let sub = op.x & 0x3F;
+            let is_256 = (op.w & 3) == VM_V256;
+            let (dst_lo, dst_hi) = (cpu.xmm[d], if is_256 { cpu.ymm_hi[d] } else { 0 });
+            let (a_lo, a_hi) = (cpu.xmm[s1], if is_256 { cpu.ymm_hi[s1] } else { 0 });
+            let (b_lo, b_hi) = if op.kind == K_VVNNI_RM {
+                let a = cpu.faddr(op);
+                (cpu.read_u128(a), if is_256 { cpu.read_u128(a.wrapping_add(16)) } else { 0 })
+            } else {
+                let r2 = op.r1 as usize & 15;
+                (cpu.xmm[r2], if is_256 { cpu.ymm_hi[r2] } else { 0 })
+            };
+            let run = |dst, a, b| match sub {
+                0 => sk::vpdpbusd(dst, a, b, false),
+                1 => sk::vpdpbusd(dst, a, b, true),
+                2 => sk::vpdpwssd(dst, a, b, false),
+                _ => sk::vpdpwssd(dst, a, b, true),
+            };
+            cpu.xmm[d] = run(dst_lo, a_lo, b_lo);
+            if is_256 {
+                cpu.set_ymm_hi(d, run(dst_hi, a_hi, b_hi));
+            } else {
+                cpu.clear_ymm_hi_reg(d);
+            }
         }
         _ => {}
     }

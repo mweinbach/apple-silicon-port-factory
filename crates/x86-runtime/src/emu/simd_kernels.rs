@@ -3611,6 +3611,115 @@ pub(in crate::emu) fn sha256msg2(src1: u128, src2: u128) -> u128 {
     sha_pack([w16, w17, w18, w19])
 }
 
+// ---- GFNI (GF(2^8) byte multiply and affine transforms) & AVX-VNNI ----
+
+/// Multiply two bytes in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 (0x11B).
+#[inline(always)]
+fn gf2p8_mul_byte(mut a: u8, mut b: u8) -> u8 {
+    let mut res = 0u8;
+    for _ in 0..8 {
+        if (b & 1) != 0 {
+            res ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1B;
+        }
+        b >>= 1;
+    }
+    res
+}
+
+/// Multiplicative inverse in GF(2^8) modulo 0x11B (with inv(0) = 0) via x^254.
+#[inline(always)]
+fn gf2p8_inv_byte(a: u8) -> u8 {
+    let mut cur = gf2p8_mul_byte(a, a); // a^2
+    let mut acc = cur;
+    for _ in 0..6 {
+        cur = gf2p8_mul_byte(cur, cur); // a^4 .. a^128
+        acc = gf2p8_mul_byte(acc, cur);
+    }
+    acc
+}
+
+/// Intel SDM `GF2P8MULB` / `VGF2P8MULB` (one 128-bit lane).
+pub(in crate::emu) fn gf2p8mulb(a: u128, b: u128) -> u128 {
+    let ab = a.to_le_bytes();
+    let bb = b.to_le_bytes();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = gf2p8_mul_byte(ab[i], bb[i]);
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Intel SDM `GF2P8AFFINEQB` / `GF2P8AFFINEINVQB` (one 128-bit lane).
+/// `src1` supplies data bytes `x`, `src2` supplies one 8x8 bit matrix per qword
+/// (row `7 - bit` computes output bit `bit`), XORed with `imm8`.
+pub(in crate::emu) fn gf2p8affineqb(src1: u128, src2: u128, imm8: u8, invert: bool) -> u128 {
+    let xb = src1.to_le_bytes();
+    let mb = src2.to_le_bytes();
+    let mut out = [0u8; 16];
+    for q in 0..2 {
+        let base = q * 8;
+        for j in 0..8 {
+            let x = if invert { gf2p8_inv_byte(xb[base + j]) } else { xb[base + j] };
+            let mut r = 0u8;
+            for bit in 0..8 {
+                let row = mb[base + (7 - bit)];
+                let p = ((row & x).count_ones() & 1) as u8;
+                r |= (p ^ ((imm8 >> bit) & 1)) << bit;
+            }
+            out[base + j] = r;
+        }
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Intel SDM `VPDPBUSD` / `VPDPBUSDS` (one 128-bit lane): unsigned byte `src1` * signed byte `src2`.
+pub(in crate::emu) fn vpdpbusd(dst: u128, src1: u128, src2: u128, saturate: bool) -> u128 {
+    let ab = src1.to_le_bytes();
+    let bb = src2.to_le_bytes();
+    let mut out = [0u8; 16];
+    for lane in 0..4 {
+        let off = lane * 4;
+        let acc = i32::from_le_bytes(dst.to_le_bytes()[off..off + 4].try_into().unwrap());
+        let mut sum = 0i32;
+        for k in 0..4 {
+            sum += (ab[off + k] as i32) * (bb[off + k] as i8 as i32);
+        }
+        let res = if saturate { acc.saturating_add(sum) } else { acc.wrapping_add(sum) };
+        out[off..off + 4].copy_from_slice(&res.to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Intel SDM `VPDPWSSD` / `VPDPWSSDS` (one 128-bit lane): signed word `src1` * signed word `src2`.
+/// Accumulates in 64-bit precision before saturating once so `(-32768)^2 + (-32768)^2` is exact.
+pub(in crate::emu) fn vpdpwssd(dst: u128, src1: u128, src2: u128, saturate: bool) -> u128 {
+    let db = dst.to_le_bytes();
+    let ab = src1.to_le_bytes();
+    let bb = src2.to_le_bytes();
+    let mut out = [0u8; 16];
+    for lane in 0..4 {
+        let off = lane * 4;
+        let acc = i32::from_le_bytes(db[off..off + 4].try_into().unwrap()) as i64;
+        let a0 = i16::from_le_bytes([ab[off], ab[off + 1]]) as i64;
+        let a1 = i16::from_le_bytes([ab[off + 2], ab[off + 3]]) as i64;
+        let b0 = i16::from_le_bytes([bb[off], bb[off + 1]]) as i64;
+        let b1 = i16::from_le_bytes([bb[off + 2], bb[off + 3]]) as i64;
+        let total = acc + a0 * b0 + a1 * b1;
+        let res = if saturate {
+            total.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        } else {
+            total as i32
+        };
+        out[off..off + 4].copy_from_slice(&res.to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

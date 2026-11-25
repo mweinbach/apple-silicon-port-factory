@@ -154,6 +154,8 @@ pub(super) struct JitScratch {
     pub mxcsr: u32,
     /// Embedding thread FPCR for native calls made directly by generated code.
     pub host_fpcr: u64,
+    /// Native OS entropy helper (`super::cpu::guest_entropy_raw`) for `RDRAND`/`RDSEED`.
+    pub entropy_fn: usize,
     /// Pointer to static [`crate::emu::cpu::SysHelpers`] table (CPUID, XSTATE, `#GP` dispatch).
     pub sys_helpers: usize,
     /// Pointer to this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`.
@@ -188,6 +190,7 @@ impl Default for JitScratch {
             ymm_dirty: 0,
             mxcsr: 0x1F80,
             host_fpcr: 0,
+            entropy_fn: super::cpu::guest_entropy_raw as *const () as usize,
             sys_helpers: super::cpu::sys_helpers_ptr(),
             x87_cw: super::regfile_ext::x87_cw_ptr(),
             #[cfg(test)]
@@ -820,6 +823,7 @@ const OFF_PROBEHITS: u32 = OFF_JX + offset_of!(JitScratch, aot_probe_hits) as u3
 const OFF_TSC_MODE: u32 = OFF_JX + offset_of!(JitScratch, tsc_mode) as u32;
 const OFF_YMM_DIRTY: u32 = OFF_JX + offset_of!(JitScratch, ymm_dirty) as u32;
 const OFF_HOST_FPCR: u32 = OFF_JX + offset_of!(JitScratch, host_fpcr) as u32;
+const OFF_ENTROPY_FN: u32 = OFF_JX + offset_of!(JitScratch, entropy_fn) as u32;
 const OFF_MXCSR: u32 = OFF_JX + offset_of!(JitScratch, mxcsr) as u32;
 const OFF_SYS_HELPERS: u32 = OFF_JX + offset_of!(JitScratch, sys_helpers) as u32;
 const OFF_X87_CW: u32 = OFF_JX + offset_of!(JitScratch, x87_cw) as u32;
@@ -831,6 +835,8 @@ const OFF_PLAINHITS: u32 = OFF_JX + offset_of!(JitScratch, plain_call_hits) as u
 const _: () = assert!(
     OFF_ATOMIC_LOCKS % 8 == 0
         && OFF_ATOMIC_LOCKS < 8 * 4096
+        && OFF_ENTROPY_FN % 8 == 0
+        && OFF_ENTROPY_FN < 8 * 4096
         && OFF_AOTDIR % 8 == 0
         && OFF_PROBEHITS % 8 == 0
         && OFF_PROBEHITS < 8 * 4096

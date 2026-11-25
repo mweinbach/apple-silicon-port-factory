@@ -23,13 +23,15 @@ impl Cpu {
             | Mnemonic::Vaesimc
             | Mnemonic::Aeskeygenassist
             | Mnemonic::Vaeskeygenassist => {
-                if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
-                    let (sub, state, src_op, imm8) = match mn {
-                        Mnemonic::Aesimc | Mnemonic::Vaesimc => (4u8, 0u128, 1u32, 0u8),
-                        Mnemonic::Aeskeygenassist | Mnemonic::Vaeskeygenassist => (5, 0, 1, ins.immediate8()),
+                if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
+                    let (sub, (state_lo, state_hi), src_op, imm8) = match mn {
+                        Mnemonic::Aesimc | Mnemonic::Vaesimc => (4u8, (0u128, 0u128), 1u32, 0u8),
+                        Mnemonic::Aeskeygenassist | Mnemonic::Vaeskeygenassist => {
+                            (5, (0, 0), 1, ins.immediate8())
+                        }
                         _ => {
                             let (s1_op, s2_op) = if ins.op_count() >= 3 { (1, 2) } else { (0, 1) };
-                            let st = vops::xmm_idx_fast(ins.op_register(s1_op)).map_or(0, |i| cpu.xmm[i]);
+                            let st = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);
                             let sub = match mn {
                                 Mnemonic::Aesenc | Mnemonic::Vaesenc => 0,
                                 Mnemonic::Aesenclast | Mnemonic::Vaesenclast => 1,
@@ -39,23 +41,56 @@ impl Cpu {
                             (sub, st, s2_op, 0)
                         }
                     };
-                    let src = match ins.op_kind(src_op) {
-                        OpKind::Register => vops::xmm_idx_fast(ins.op_register(src_op)).map_or(0, |i| cpu.xmm[i]),
-                        OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
-                        _ => 0,
+                    let (src_lo, src_hi) = vops::load_vec_op(cpu, ins, src_op, ymm);
+                    let lo = vops::aes_op_128(sub, state_lo, src_lo, imm8);
+                    let hi = if ymm { vops::aes_op_128(sub, state_hi, src_hi, imm8) } else { 0 };
+                    vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
+                }
+            }
+            Mnemonic::Gf2p8mulb
+            | Mnemonic::Vgf2p8mulb
+            | Mnemonic::Gf2p8affineqb
+            | Mnemonic::Vgf2p8affineqb
+            | Mnemonic::Gf2p8affineinvqb
+            | Mnemonic::Vgf2p8affineinvqb => {
+                if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
+                    let is_mul = matches!(mn, Mnemonic::Gf2p8mulb | Mnemonic::Vgf2p8mulb);
+                    let is_inv = matches!(mn, Mnemonic::Gf2p8affineinvqb | Mnemonic::Vgf2p8affineinvqb);
+                    let nregs = ins.op_count() - (!is_mul as u32);
+                    let (s1_op, s2_op) = if nregs >= 3 { (1, 2) } else { (0, 1) };
+                    let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(s1_op), ymm);
+                    let (b_lo, b_hi) = vops::load_vec_op(cpu, ins, s2_op, ymm);
+                    let imm = if is_mul { 0 } else { ins.immediate8() };
+                    let (lo, hi) = if is_mul {
+                        (vops::gf2p8mulb(a_lo, b_lo), if ymm { vops::gf2p8mulb(a_hi, b_hi) } else { 0 })
+                    } else {
+                        (
+                            vops::gf2p8affineqb(a_lo, b_lo, imm, is_inv),
+                            if ymm { vops::gf2p8affineqb(a_hi, b_hi, imm, is_inv) } else { 0 },
+                        )
                     };
-                    cpu.xmm[d] = vops::aes_op_128(sub, state, src, imm8);
-                    if matches!(
-                        mn,
-                        Mnemonic::Vaesenc
-                            | Mnemonic::Vaesenclast
-                            | Mnemonic::Vaesdec
-                            | Mnemonic::Vaesdeclast
-                            | Mnemonic::Vaesimc
-                            | Mnemonic::Vaeskeygenassist
-                    ) {
-                        cpu.clear_ymm_hi_reg(d);
-                    }
+                    vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
+                }
+            }
+            Mnemonic::Vpdpbusd | Mnemonic::Vpdpbusds | Mnemonic::Vpdpwssd | Mnemonic::Vpdpwssds => {
+                if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
+                    let (dst_lo, dst_hi) = vops::load_vec_reg(cpu, ins.op_register(0), ymm);
+                    let (a_lo, a_hi) = vops::load_vec_reg(cpu, ins.op_register(1), ymm);
+                    let (b_lo, b_hi) = vops::load_vec_op(cpu, ins, 2, ymm);
+                    let sat = matches!(mn, Mnemonic::Vpdpbusds | Mnemonic::Vpdpwssds);
+                    let is_word = matches!(mn, Mnemonic::Vpdpwssd | Mnemonic::Vpdpwssds);
+                    let (lo, hi) = if is_word {
+                        (
+                            vops::vpdpwssd(dst_lo, a_lo, b_lo, sat),
+                            if ymm { vops::vpdpwssd(dst_hi, a_hi, b_hi, sat) } else { 0 },
+                        )
+                    } else {
+                        (
+                            vops::vpdpbusd(dst_lo, a_lo, b_lo, sat),
+                            if ymm { vops::vpdpbusd(dst_hi, a_hi, b_hi, sat) } else { 0 },
+                        )
+                    };
+                    vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
                 }
             }
             Mnemonic::Vbroadcastf128 | Mnemonic::Vbroadcasti128 => {
