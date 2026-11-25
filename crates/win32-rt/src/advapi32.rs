@@ -3135,6 +3135,7 @@ const CRYPT_OAEP: u32 = 0x0000_0040;
 const CRYPT_VERIFYCONTEXT: u32 = 0xF000_0000;
 const CRYPT_NEWKEYSET: u32 = 0x0000_0008;
 const CRYPT_DELETEKEYSET: u32 = 0x0000_0010;
+const CRYPT_MACHINE_KEYSET: u32 = 0x0000_0020;
 
 const SIMPLEBLOB: u32 = 0x1;
 const PUBLICKEYBLOB: u32 = 0x6;
@@ -3147,6 +3148,7 @@ const PP_NAME: u32 = 4;
 const PP_VERSION: u32 = 5;
 const PP_CONTAINER: u32 = 6;
 const PP_PROVTYPE: u32 = 16;
+const PP_KEYSET_TYPE: u32 = 27;
 
 const NTE_BAD_UID: u32 = 0x8009_0001;
 const NTE_BAD_HASH: u32 = 0x8009_0002;
@@ -3184,6 +3186,7 @@ struct CapiProvider {
     prov_type: u32,
     prov_name: String,
     container: String,
+    machine_keyset: bool,
     ephemeral: bool,
     ephemeral_keys: CapiContainerKeys,
 }
@@ -3231,8 +3234,8 @@ fn capi_providers() -> &'static std::sync::Mutex<std::collections::HashMap<usize
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn capi_containers() -> &'static std::sync::Mutex<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, String), CapiContainerKeys>>> =
+fn capi_containers() -> &'static std::sync::Mutex<std::collections::HashMap<(bool, u32, String), CapiContainerKeys>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(bool, u32, String), CapiContainerKeys>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -3373,9 +3376,14 @@ fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> Cap
     }
 }
 
-fn capi_store_lock() -> &'static std::sync::Mutex<()> {
-    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    L.get_or_init(|| std::sync::Mutex::new(()))
+fn capi_store_lock(machine_keyset: bool) -> &'static std::sync::Mutex<()> {
+    static USER_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    static MACHINE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    if machine_keyset {
+        MACHINE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    } else {
+        USER_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 }
 
 struct CapiStoreGuard {
@@ -3392,12 +3400,12 @@ impl Drop for CapiStoreGuard {
     }
 }
 
-fn acquire_capi_store_lock() -> std::io::Result<CapiStoreGuard> {
+fn acquire_capi_store_lock(machine_keyset: bool) -> std::io::Result<CapiStoreGuard> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
-    let mem = capi_store_lock().lock().unwrap();
-    let lock_path = capi_store_path()
+    let mem = capi_store_lock(machine_keyset).lock().unwrap();
+    let lock_path = capi_store_path(machine_keyset)
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?
         .join(".containers.lock");
@@ -3425,14 +3433,23 @@ fn acquire_capi_store_lock() -> std::io::Result<CapiStoreGuard> {
     Ok(CapiStoreGuard { _mem: mem, flock_file: file })
 }
 
-fn capi_store_path() -> std::path::PathBuf {
-    crate::path::default_translator_root()
-        .join("AppData")
-        .join("Roaming")
-        .join("Microsoft")
-        .join("Crypto")
-        .join("RSA")
-        .join("containers.bin")
+fn capi_store_path(machine_keyset: bool) -> std::path::PathBuf {
+    let root = crate::path::default_translator_root();
+    if machine_keyset {
+        root.join("ProgramData")
+            .join("Microsoft")
+            .join("Crypto")
+            .join("RSA")
+            .join("MachineKeys")
+            .join("containers.bin")
+    } else {
+        root.join("AppData")
+            .join("Roaming")
+            .join("Microsoft")
+            .join("Crypto")
+            .join("RSA")
+            .join("containers.bin")
+    }
 }
 
 fn encode_capi_containers(map: &std::collections::HashMap<(u32, String), CapiContainerKeys>) -> Vec<u8> {
@@ -3509,8 +3526,10 @@ fn decode_capi_containers(data: &[u8]) -> Option<std::collections::HashMap<(u32,
     Some(map)
 }
 
-unsafe fn load_persisted_capi_containers() -> std::io::Result<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
-    let path = capi_store_path();
+unsafe fn load_persisted_capi_containers(
+    machine_keyset: bool,
+) -> std::io::Result<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
+    let path = capi_store_path(machine_keyset);
     let enc = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
@@ -3523,18 +3542,20 @@ unsafe fn load_persisted_capi_containers() -> std::io::Result<std::collections::
 }
 
 unsafe fn save_persisted_capi_containers(
+    machine_keyset: bool,
     map: &std::collections::HashMap<(u32, String), CapiContainerKeys>,
 ) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let path = capi_store_path();
+    let path = capi_store_path(machine_keyset);
     let parent = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?;
     std::fs::create_dir_all(parent)?;
     let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
     let raw = encode_capi_containers(map);
-    let enc = crate::misc::crypt32::dpapi_protect_bytes(false, "CapiKeyStore", CAPI_STORE_ENTROPY, &raw)
+    let descr = if machine_keyset { "CapiMachineKeyStore" } else { "CapiKeyStore" };
+    let enc = crate::misc::crypt32::dpapi_protect_bytes(machine_keyset, descr, CAPI_STORE_ENTROPY, &raw)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DPAPI protection of CAPI key store failed"))?;
 
     let mut rnd = [0u8; 8];
@@ -3569,19 +3590,21 @@ unsafe fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey, ex
         }
         return Ok(());
     }
-    let map_key = (prov.prov_type, prov.container.clone());
+    let machine = prov.machine_keyset;
+    let disk_key = (prov.prov_type, prov.container.clone());
+    let cache_key = (machine, prov.prov_type, prov.container.clone());
     drop(provs);
-    let _guard = acquire_capi_store_lock().map_err(|_| NTE_FAIL)?;
-    let mut disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
-    let entry = disk.entry(map_key.clone()).or_default();
+    let _guard = acquire_capi_store_lock(machine).map_err(|_| NTE_FAIL)?;
+    let mut disk = load_persisted_capi_containers(machine).map_err(|_| NTE_FAIL)?;
+    let entry = disk.entry(disk_key).or_default();
     if key_spec == AT_SIGNATURE {
         entry.sign = Some(stored.clone());
     } else {
         entry.keyx = Some(stored.clone());
     }
-    save_persisted_capi_containers(&disk).map_err(|_| NTE_FAIL)?;
+    save_persisted_capi_containers(machine, &disk).map_err(|_| NTE_FAIL)?;
     let mut mem = capi_containers().lock().unwrap();
-    let mem_entry = mem.entry(map_key).or_default();
+    let mem_entry = mem.entry(cache_key).or_default();
     if key_spec == AT_SIGNATURE {
         mem_entry.sign = Some(stored);
     } else {
@@ -3603,11 +3626,13 @@ unsafe fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option
         };
         return Ok(k);
     }
-    let map_key = (prov.prov_type, prov.container.clone());
+    let machine = prov.machine_keyset;
+    let disk_key = (prov.prov_type, prov.container.clone());
+    let cache_key = (machine, prov.prov_type, prov.container.clone());
     drop(provs);
     {
         let containers = capi_containers().lock().unwrap();
-        if let Some(c) = containers.get(&map_key) {
+        if let Some(c) = containers.get(&cache_key) {
             let k = if key_spec == AT_SIGNATURE { c.sign.clone() } else { c.keyx.clone() };
             if k.is_some() {
                 return Ok(k);
@@ -3615,11 +3640,11 @@ unsafe fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option
         }
     }
     // Load from persisted DPAPI-encrypted store (handles cross-process / post-restart access).
-    let _guard = acquire_capi_store_lock().map_err(|_| NTE_FAIL)?;
-    let disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
-    let found = disk.get(&map_key).cloned();
+    let _guard = acquire_capi_store_lock(machine).map_err(|_| NTE_FAIL)?;
+    let disk = load_persisted_capi_containers(machine).map_err(|_| NTE_FAIL)?;
+    let found = disk.get(&disk_key).cloned();
     if let Some(ref c) = found {
-        capi_containers().lock().unwrap().insert(map_key, c.clone());
+        capi_containers().lock().unwrap().insert(cache_key, c.clone());
     }
     Ok(found.and_then(|c| if key_spec == AT_SIGNATURE { c.sign } else { c.keyx }))
 }
@@ -3640,18 +3665,20 @@ unsafe fn crypt_acquire_context_impl(
     dw_flags: u32,
 ) -> BOOL {
     let cname = container.unwrap_or_default();
+    let machine = (dw_flags & CRYPT_MACHINE_KEYSET) != 0;
     if (dw_flags & CRYPT_DELETEKEYSET) != 0 {
-        let map_key = (dw_prov_type, cname);
-        let Ok(_guard) = acquire_capi_store_lock() else {
+        let disk_key = (dw_prov_type, cname.clone());
+        let cache_key = (machine, dw_prov_type, cname);
+        let Ok(_guard) = acquire_capi_store_lock(machine) else {
             return err(NTE_FAIL, FALSE);
         };
-        let mut disk = match load_persisted_capi_containers() {
+        let mut disk = match load_persisted_capi_containers(machine) {
             Ok(d) => d,
             Err(_) => return err(NTE_FAIL, FALSE),
         };
-        let removed_disk = disk.remove(&map_key).is_some();
-        let removed_mem = capi_containers().lock().unwrap().remove(&map_key).is_some();
-        if removed_disk && save_persisted_capi_containers(&disk).is_err() {
+        let removed_disk = disk.remove(&disk_key).is_some();
+        let removed_mem = capi_containers().lock().unwrap().remove(&cache_key).is_some();
+        if removed_disk && save_persisted_capi_containers(machine, &disk).is_err() {
             return err(NTE_FAIL, FALSE);
         }
         if !ph_prov.is_null() {
@@ -3664,30 +3691,31 @@ unsafe fn crypt_acquire_context_impl(
     }
     let ephemeral = (dw_flags & CRYPT_VERIFYCONTEXT) != 0;
     if !ephemeral {
-        let key = (dw_prov_type, cname.clone());
-        let Ok(_guard) = acquire_capi_store_lock() else {
+        let disk_key = (dw_prov_type, cname.clone());
+        let cache_key = (machine, dw_prov_type, cname.clone());
+        let Ok(_guard) = acquire_capi_store_lock(machine) else {
             return err(NTE_FAIL, FALSE);
         };
-        let mut disk = match load_persisted_capi_containers() {
+        let mut disk = match load_persisted_capi_containers(machine) {
             Ok(d) => d,
             Err(_) => return err(NTE_FAIL, FALSE),
         };
         if (dw_flags & CRYPT_NEWKEYSET) != 0 {
-            if disk.contains_key(&key) {
+            if disk.contains_key(&disk_key) {
                 return err(NTE_EXISTS, FALSE);
             }
-            disk.insert(key.clone(), CapiContainerKeys::default());
-            if save_persisted_capi_containers(&disk).is_err() {
+            disk.insert(disk_key, CapiContainerKeys::default());
+            if save_persisted_capi_containers(machine, &disk).is_err() {
                 return err(NTE_FAIL, FALSE);
             }
-            capi_containers().lock().unwrap().insert(key, CapiContainerKeys::default());
+            capi_containers().lock().unwrap().insert(cache_key, CapiContainerKeys::default());
         } else {
-            let existed = disk.contains_key(&key);
-            let entry = disk.entry(key.clone()).or_default().clone();
-            if !existed && save_persisted_capi_containers(&disk).is_err() {
+            let existed = disk.contains_key(&disk_key);
+            let entry = disk.entry(disk_key).or_default().clone();
+            if !existed && save_persisted_capi_containers(machine, &disk).is_err() {
                 return err(NTE_FAIL, FALSE);
             }
-            capi_containers().lock().unwrap().insert(key, entry);
+            capi_containers().lock().unwrap().insert(cache_key, entry);
         }
     }
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
@@ -3695,6 +3723,7 @@ unsafe fn crypt_acquire_context_impl(
         prov_type: dw_prov_type,
         prov_name: provider.unwrap_or_else(|| "Microsoft Enhanced RSA and AES Cryptographic Provider".into()),
         container: cname,
+        machine_keyset: machine,
         ephemeral,
         ephemeral_keys: CapiContainerKeys::default(),
     };
@@ -3769,6 +3798,7 @@ pub unsafe extern "win64" fn CryptGetProvParam(
             v
         }
         PP_PROVTYPE => prov.prov_type.to_le_bytes().to_vec(),
+        PP_KEYSET_TYPE => (if prov.machine_keyset { CRYPT_MACHINE_KEYSET } else { 0u32 }).to_le_bytes().to_vec(),
         PP_VERSION => 0x0000_0200u32.to_le_bytes().to_vec(),
         PP_IMPTYPE => 2u32.to_le_bytes().to_vec(), // CRYPT_IMPL_SOFTWARE
         _ => return err(NTE_BAD_TYPE, FALSE),
@@ -7009,15 +7039,89 @@ mod tests {
             // Verify DPAPI-encrypted container store exists on disk with 0600 permissions
             {
                 use std::os::unix::fs::PermissionsExt;
-                let store_p = capi_store_path();
+                let store_p = capi_store_path(false);
                 let meta = std::fs::metadata(&store_p).expect("persisted CAPI store must exist");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            }
+
+            // Machine keyset delete with the same container name MUST NOT touch the user container
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_DELETEKEYSET,
+                ),
+                FALSE,
+            );
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEYSET);
+
+            // Machine container with the same name & provider type is isolated from the user container
+            let mut hp_mach = 0usize;
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp_mach,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_NEWKEYSET,
+                ),
+                TRUE,
+            );
+            let mut ks_type = 0u32;
+            let mut ks_len = 4u32;
+            assert_eq!(
+                CryptGetProvParam(hp_mach, PP_KEYSET_TYPE, &mut ks_type as *mut u32 as *mut u8, &mut ks_len, 0),
+                TRUE,
+            );
+            assert_eq!(ks_type, CRYPT_MACHINE_KEYSET);
+            let mut hk_mach = 0usize;
+            assert_eq!(CryptGenKey(hp_mach, AT_KEYEXCHANGE, 2048 << 16, &mut hk_mach), TRUE);
+            let mut mach_ct = vec![0u8; 256];
+            let mach_msg = b"machine scope key";
+            mach_ct[..mach_msg.len()].copy_from_slice(mach_msg);
+            let mut mach_ct_len = mach_msg.len() as u32;
+            assert_eq!(CryptEncrypt(hk_mach, 0, TRUE, 0, mach_ct.as_mut_ptr(), &mut mach_ct_len, 256), TRUE);
+            assert_eq!(CryptDestroyKey(hk_mach), TRUE);
+            assert_eq!(CryptReleaseContext(hp_mach, 0), TRUE);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mach_store_p = capi_store_path(true);
+                let meta = std::fs::metadata(&mach_store_p).expect("persisted machine CAPI store must exist");
                 assert_eq!(meta.permissions().mode() & 0o777, 0o600);
             }
 
             // Simulate process restart by clearing in-memory container cache
             capi_containers().lock().unwrap().clear();
 
+            // Reload machine container -> decrypts machine ciphertext, then delete machine container
+            assert_eq!(
+                CryptAcquireContextW(&mut hp_mach, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_MACHINE_KEYSET),
+                TRUE,
+            );
+            let mut hk_mach_reloaded = 0usize;
+            assert_eq!(CryptGetUserKey(hp_mach, AT_KEYEXCHANGE, &mut hk_mach_reloaded), TRUE);
+            assert_eq!(CryptDecrypt(hk_mach_reloaded, 0, TRUE, 0, mach_ct.as_mut_ptr(), &mut mach_ct_len), TRUE);
+            assert_eq!(&mach_ct[..mach_ct_len as usize], mach_msg);
+            assert_eq!(CryptDestroyKey(hk_mach_reloaded), TRUE);
+            assert_eq!(CryptReleaseContext(hp_mach, 0), TRUE);
+            assert_eq!(
+                CryptAcquireContextW(
+                    &mut hp_mach,
+                    persist_name.as_ptr(),
+                    std::ptr::null(),
+                    24,
+                    CRYPT_MACHINE_KEYSET | CRYPT_DELETEKEYSET,
+                ),
+                TRUE,
+            );
+
+            // User container MUST survive machine container creation and deletion intact
             assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, 0), TRUE);
+            ks_len = 4;
+            assert_eq!(CryptGetProvParam(hp, PP_KEYSET_TYPE, &mut ks_type as *mut u32 as *mut u8, &mut ks_len, 0), TRUE);
+            assert_eq!(ks_type, 0);
             let mut hk_reloaded = 0usize;
             assert_eq!(CryptGetUserKey(hp, AT_KEYEXCHANGE, &mut hk_reloaded), TRUE);
 
