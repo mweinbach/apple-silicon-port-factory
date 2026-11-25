@@ -6382,6 +6382,61 @@ fn pfx_rejects_unbounded_kdf_iteration_counts() {
             "3 x 1.5M = 4.5M cumulative KDF work across pkcs8ShroudedKeyBag must be rejected"
         );
         assert_eq!(le_shr, err::ERROR_INVALID_DATA);
+
+        // 7. Flat SafeContents / AuthenticatedSafe packed with 200,000 tiny 2-byte NULL TLVs
+        //    must stop before child MAX_PFX_SAFE_BAGS + 1 without materializing an unbounded Vec.
+        let mut tiny_tlvs = Vec::with_capacity(200_000 * 2);
+        for _ in 0..200_000 {
+            tiny_tlvs.extend_from_slice(&[0x05, 0x00]);
+        }
+        // Directly verify der_item_children_bounded accepts exact cap and stops before cap + 1.
+        assert_eq!(
+            super::asn1::der_item_children_bounded(
+                &tiny_tlvs[..super::pkcs::MAX_PFX_SAFE_BAGS * 2],
+                super::pkcs::MAX_PFX_SAFE_BAGS,
+            )
+            .map(|v| v.len()),
+            Some(super::pkcs::MAX_PFX_SAFE_BAGS)
+        );
+        let t_bounded = std::time::Instant::now();
+        assert!(super::asn1::der_item_children_bounded(
+            &tiny_tlvs,
+            super::pkcs::MAX_PFX_SAFE_BAGS,
+        )
+        .is_none());
+        assert!(
+            t_bounded.elapsed() < std::time::Duration::from_millis(200),
+            "der_item_children_bounded should stop immediately before cap + 1"
+        );
+
+        // Flat SafeContents with 200,000 tiny TLVs
+        let flat_tiny_sc_pfx = build_flat_pfx(&tiny_tlvs);
+        let t_sc = std::time::Instant::now();
+        let (h_tiny_sc, le_tiny_sc) = import(&flat_tiny_sc_pfx);
+        assert!(h_tiny_sc.is_null(), "flat SafeContents with 200k tiny TLVs must be rejected");
+        assert_eq!(le_tiny_sc, err::ERROR_INVALID_DATA);
+        assert!(
+            t_sc.elapsed() < std::time::Duration::from_millis(200),
+            "incremental SafeContents parsing should reject immediately on child 513"
+        );
+
+        // Flat AuthenticatedSafe with 200,000 tiny TLVs
+        let tiny_auth_safe = der_tlv_long(0x30, &tiny_tlvs);
+        let mut tiny_as_ci = Vec::new();
+        tiny_as_ci.extend_from_slice(&oid_data);
+        tiny_as_ci.extend_from_slice(&der_tlv_long(0xA0, &der_tlv_long(0x04, &tiny_auth_safe)));
+        let mut tiny_pfx_body = Vec::new();
+        tiny_pfx_body.extend_from_slice(&der_u32(3));
+        tiny_pfx_body.extend_from_slice(&der_tlv_long(0x30, &tiny_as_ci));
+        let flat_tiny_as_pfx = der_tlv_long(0x30, &tiny_pfx_body);
+        let t_as = std::time::Instant::now();
+        let (h_tiny_as, le_tiny_as) = import(&flat_tiny_as_pfx);
+        assert!(h_tiny_as.is_null(), "flat AuthenticatedSafe with 200k tiny TLVs must be rejected");
+        assert_eq!(le_tiny_as, err::ERROR_INVALID_DATA);
+        assert!(
+            t_as.elapsed() < std::time::Duration::from_millis(200),
+            "bounded AuthenticatedSafe parsing should reject immediately on child 513"
+        );
     }
 }
 

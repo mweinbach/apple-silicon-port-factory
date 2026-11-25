@@ -3,8 +3,9 @@
 //! backed by Apple CommonCrypto, `bcrypt`, and `rustls::crypto::ring`.
 
 use super::asn1::{
-    ber_item_children, der_item_children, encode_der_tlv, parse_ber_item, parse_cert_der_parts,
-    parse_der_item, DerItem, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    ber_item_children, der_item_children, der_item_children_bounded, encode_der_tlv,
+    parse_ber_item, parse_cert_der_parts, parse_der_item, DerItem, PKCS_7_ASN_ENCODING,
+    X509_ASN_ENCODING,
 };
 use super::store::{
     add_der_with_meta_to_store, cert_open_store_impl, create_cert_context_from_der,
@@ -137,7 +138,7 @@ fn parse_alg_id(elem: DerItem<'_>) -> Option<(&[u8], Option<DerItem<'_>>)> {
     if elem.tag != 0x30 {
         return None;
     }
-    let kids = der_item_children(elem.val)?;
+    let kids = der_item_children_bounded(elem.val, 8)?;
     if kids.is_empty() || kids[0].tag != 0x06 {
         return None;
     }
@@ -282,7 +283,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
                     if si.tag != 0x30 {
                         continue;
                     }
-                    let Some(kids) = der_item_children(si.val) else {
+                    let Some(kids) = der_item_children_bounded(si.val, 16) else {
                         continue;
                     };
                     if kids.len() < 5 || kids[0].tag != 0x02 {
@@ -290,7 +291,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
                     }
                     let _si_ver = parse_der_u32_val(kids[0].val).unwrap_or(1);
                     let (issuer_raw, serial_be, subject_key_id) = if kids[1].tag == 0x30 {
-                        let Some(ias) = der_item_children(kids[1].val) else {
+                        let Some(ias) = der_item_children_bounded(kids[1].val, 4) else {
                             continue;
                         };
                         if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
@@ -694,7 +695,7 @@ pub(super) fn verify_cms_signer_signature(
         let Some((aa, _)) = parse_der_item(aa_raw) else {
             return false;
         };
-        let Some(attrs) = der_item_children(aa.val) else {
+        let Some(attrs) = der_item_children_bounded(aa.val, 128) else {
             return false;
         };
         let mut md_count = 0usize;
@@ -704,12 +705,12 @@ pub(super) fn verify_cms_signer_signature(
             if attr.tag != 0x30 {
                 continue;
             }
-            let Some(ak) = der_item_children(attr.val) else {
+            let Some(ak) = der_item_children_bounded(attr.val, 8) else {
                 return false;
             };
             if ak.len() >= 2 && ak[0].tag == 0x06 && ak[1].tag == 0x31 {
                 if ak[0].val == OID_MESSAGE_DIGEST {
-                    let Some(vals) = der_item_children(ak[1].val) else {
+                    let Some(vals) = der_item_children_bounded(ak[1].val, 8) else {
                         return false;
                     };
                     if vals.len() != 1 || vals[0].tag != 0x04 || vals[0].val != expected_md.as_slice() {
@@ -717,7 +718,7 @@ pub(super) fn verify_cms_signer_signature(
                     }
                     md_count += 1;
                 } else if ak[0].val == OID_CONTENT_TYPE {
-                    let Some(vals) = der_item_children(ak[1].val) else {
+                    let Some(vals) = der_item_children_bounded(ak[1].val, 8) else {
                         return false;
                     };
                     if vals.len() != 1 || vals[0].tag != 0x06 || vals[0].val != expected_content_type_oid_der {
@@ -1369,7 +1370,7 @@ unsafe fn decrypt_pbe(
         if params.tag != 0x30 {
             return Err(err::ERROR_INVALID_DATA);
         }
-        let pk = der_item_children(params.val).ok_or(err::ERROR_INVALID_DATA)?;
+        let pk = der_item_children_bounded(params.val, 8).ok_or(err::ERROR_INVALID_DATA)?;
         if pk.len() < 2 || pk[0].tag != 0x04 || pk[1].tag != 0x02 {
             return Err(err::ERROR_INVALID_DATA);
         }
@@ -1402,7 +1403,7 @@ unsafe fn decrypt_pbe(
         if params.tag != 0x30 {
             return Err(err::ERROR_INVALID_DATA);
         }
-        let pk = der_item_children(params.val).ok_or(err::ERROR_INVALID_DATA)?;
+        let pk = der_item_children_bounded(params.val, 8).ok_or(err::ERROR_INVALID_DATA)?;
         if pk.len() < 2 {
             return Err(err::ERROR_INVALID_DATA);
         }
@@ -1415,7 +1416,7 @@ unsafe fn decrypt_pbe(
         if kp_elem.tag != 0x30 {
             return Err(err::ERROR_INVALID_DATA);
         }
-        let kp = der_item_children(kp_elem.val).ok_or(err::ERROR_INVALID_DATA)?;
+        let kp = der_item_children_bounded(kp_elem.val, 8).ok_or(err::ERROR_INVALID_DATA)?;
         if kp.len() < 2 || kp[0].tag != 0x04 || kp[1].tag != 0x02 {
             return Err(err::ERROR_INVALID_DATA);
         }
@@ -1498,6 +1499,9 @@ struct PfxBagKey {
     local_key_id: Option<Vec<u8>>,
 }
 
+const MAX_PFX_BAG_ATTRS: usize = 64;
+const MAX_PFX_OCTET_CHUNKS: usize = 4096;
+
 fn parse_bag_attributes(attrs_elem: Option<DerItem<'_>>) -> (Option<String>, Option<Vec<u8>>) {
     let mut friendly = None;
     let mut local_key_id = None;
@@ -1507,23 +1511,24 @@ fn parse_bag_attributes(attrs_elem: Option<DerItem<'_>>) -> (Option<String>, Opt
     if ae.tag != 0x31 {
         return (None, None);
     }
-    let Some(attrs) = der_item_children(ae.val) else {
-        return (None, None);
-    };
-    for attr in attrs {
+    let mut rest = ae.val;
+    let mut count = 0usize;
+    while !rest.is_empty() && count < MAX_PFX_BAG_ATTRS {
+        let Some((attr, next)) = parse_der_item(rest) else {
+            break;
+        };
+        rest = next;
+        count += 1;
         if attr.tag != 0x30 {
             continue;
         }
-        let Some(ak) = der_item_children(attr.val) else {
+        let Some(ak) = der_item_children_bounded(attr.val, 8) else {
             continue;
         };
         if ak.len() < 2 || ak[0].tag != 0x06 || ak[1].tag != 0x31 {
             continue;
         }
-        let Some(vals) = der_item_children(ak[1].val) else {
-            continue;
-        };
-        let Some(first) = vals.first() else {
+        let Some((first, _)) = parse_der_item(ak[1].val) else {
             continue;
         };
         if ak[0].val == OID_FRIENDLY_NAME {
@@ -1562,17 +1567,22 @@ unsafe fn parse_safe_contents(
         if seq.tag != 0x30 {
             return Err(err::ERROR_INVALID_DATA);
         }
-        let bags = der_item_children(seq.val).ok_or(err::ERROR_INVALID_DATA)?;
+        // Parse SafeBag children incrementally and stop before parsing/inserting child
+        // MAX_PFX_SAFE_BAGS + 1 so crafted flat payloads with millions of tiny TLVs cannot
+        // materialize an unbounded Vec<DerItem>.
+        let mut rest = seq.val;
         let mut nested: Vec<(&[u8], usize)> = Vec::new();
-        for bag in bags {
-            *bag_count = bag_count.saturating_add(1);
-            if *bag_count > MAX_PFX_SAFE_BAGS {
+        while !rest.is_empty() {
+            if *bag_count >= MAX_PFX_SAFE_BAGS {
                 return Err(err::ERROR_INVALID_DATA);
             }
+            let (bag, next) = parse_der_item(rest).ok_or(err::ERROR_INVALID_DATA)?;
+            rest = next;
+            *bag_count += 1;
             if bag.tag != 0x30 {
                 continue;
             }
-            let Some(bk) = der_item_children(bag.val) else {
+            let Some(bk) = der_item_children_bounded(bag.val, 8) else {
                 continue;
             };
             if bk.len() < 2 || bk[0].tag != 0x06 || bk[1].tag != 0xA0 {
@@ -1585,7 +1595,7 @@ unsafe fn parse_safe_contents(
             if bag_oid == OID_CERT_BAG {
                 if let Some((cb_seq, _)) = parse_der_item(bag_val) {
                     if cb_seq.tag == 0x30 {
-                        if let Some(cbk) = der_item_children(cb_seq.val) {
+                        if let Some(cbk) = der_item_children_bounded(cb_seq.val, 8) {
                             if cbk.len() >= 2
                                 && cbk[0].tag == 0x06
                                 && cbk[0].val == OID_X509_CERT_TYPE
@@ -1614,7 +1624,7 @@ unsafe fn parse_safe_contents(
                 if epki.tag != 0x30 {
                     return Err(err::ERROR_INVALID_DATA);
                 }
-                let ek = der_item_children(epki.val).ok_or(err::ERROR_INVALID_DATA)?;
+                let ek = der_item_children_bounded(epki.val, 8).ok_or(err::ERROR_INVALID_DATA)?;
                 if ek.len() < 2 || ek[1].tag != 0x04 {
                     return Err(err::ERROR_INVALID_DATA);
                 }
@@ -1679,7 +1689,7 @@ fn extract_pkcs8_public_key_id(pkcs8_der: &[u8]) -> Option<PfxPublicKeyId> {
     if pki_seq.tag != 0x30 {
         return None;
     }
-    let pki_kids = der_item_children(pki_seq.val)?;
+    let pki_kids = der_item_children_bounded(pki_seq.val, 16)?;
     if pki_kids.len() < 3 || pki_kids[1].tag != 0x30 || pki_kids[2].tag != 0x04 {
         return None;
     }
@@ -1691,7 +1701,7 @@ fn extract_pkcs8_public_key_id(pkcs8_der: &[u8]) -> Option<PfxPublicKeyId> {
     if rsa_priv_seq.tag != 0x30 {
         return None;
     }
-    let rsa_priv_kids = der_item_children(rsa_priv_seq.val)?;
+    let rsa_priv_kids = der_item_children_bounded(rsa_priv_seq.val, 16)?;
     if rsa_priv_kids.len() < 3 || rsa_priv_kids[1].tag != 0x02 || rsa_priv_kids[2].tag != 0x02 {
         return None;
     }
@@ -1706,7 +1716,7 @@ fn extract_cert_public_key_ids(cert_der: &[u8]) -> Option<(PfxPublicKeyId, Optio
     let parts = parse_cert_der_parts(cert_der)?;
     let spki_id = PfxPublicKeyId::SpkiInner(parts.spki_inner.to_vec());
     let rsa_id = (|| {
-        let spki_kids = der_item_children(parts.spki_inner)?;
+        let spki_kids = der_item_children_bounded(parts.spki_inner, 8)?;
         if spki_kids.len() < 2 || spki_kids[0].tag != 0x30 || spki_kids[1].tag != 0x03 {
             return None;
         }
@@ -1721,7 +1731,7 @@ fn extract_cert_public_key_ids(cert_der: &[u8]) -> Option<(PfxPublicKeyId, Optio
         if rsa_pub_seq.tag != 0x30 {
             return None;
         }
-        let rsa_pub_kids = der_item_children(rsa_pub_seq.val)?;
+        let rsa_pub_kids = der_item_children_bounded(rsa_pub_seq.val, 8)?;
         if rsa_pub_kids.len() < 2 || rsa_pub_kids[0].tag != 0x02 || rsa_pub_kids[1].tag != 0x02 {
             return None;
         }
@@ -1762,7 +1772,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     }
-    let Some(pfx_kids) = der_item_children(pfx_seq.val) else {
+    let Some(pfx_kids) = der_item_children_bounded(pfx_seq.val, 8) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     };
@@ -1772,7 +1782,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
     }
 
     // authSafe ContentInfo (must be OID_DATA containing SEQUENCE OF ContentInfo)
-    let Some(as_kids) = der_item_children(pfx_kids[1].val) else {
+    let Some(as_kids) = der_item_children_bounded(pfx_kids[1].val, 8) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     };
@@ -1798,7 +1808,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             crate::teb::set_last_error(err::ERROR_INVALID_DATA);
             return std::ptr::null_mut();
         }
-        let Some(mk) = der_item_children(mac_elem.val) else {
+        let Some(mk) = der_item_children_bounded(mac_elem.val, 8) else {
             crate::teb::set_last_error(err::ERROR_INVALID_DATA);
             return std::ptr::null_mut();
         };
@@ -1806,7 +1816,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             crate::teb::set_last_error(err::ERROR_INVALID_DATA);
             return std::ptr::null_mut();
         }
-        let Some(di_kids) = der_item_children(mk[0].val) else {
+        let Some(di_kids) = der_item_children_bounded(mk[0].val, 8) else {
             crate::teb::set_last_error(err::ERROR_INVALID_DATA);
             return std::ptr::null_mut();
         };
@@ -1879,7 +1889,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         }
     }
 
-    // Parse AuthenticatedSafe ::= SEQUENCE OF ContentInfo
+    // Parse AuthenticatedSafe ::= SEQUENCE OF ContentInfo (bounded before inserting child 513).
     let Some((safe_seq, _)) = parse_der_item(&auth_safe_bytes) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
@@ -1888,15 +1898,10 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     }
-    let Some(content_infos) = der_item_children(safe_seq.val) else {
+    let Some(content_infos) = der_item_children_bounded(safe_seq.val, MAX_PFX_SAFE_BAGS) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     };
-
-    if content_infos.len() > MAX_PFX_SAFE_BAGS {
-        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
-        return std::ptr::null_mut();
-    }
 
     let mut certs: Vec<PfxBagCert> = Vec::new();
     let mut keys: Vec<PfxBagKey> = Vec::new();
@@ -1906,7 +1911,7 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         if ci.tag != 0x30 {
             continue;
         }
-        let Some(ck) = der_item_children(ci.val) else {
+        let Some(ck) = der_item_children_bounded(ci.val, 8) else {
             continue;
         };
         if ck.len() < 2 || ck[0].tag != 0x06 || ck[1].tag != 0xA0 {
@@ -1938,14 +1943,14 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             if ed_seq.tag != 0x30 {
                 continue;
             }
-            let Some(edk) = der_item_children(ed_seq.val) else {
+            let Some(edk) = der_item_children_bounded(ed_seq.val, 8) else {
                 continue;
             };
             // EncryptedData ::= SEQUENCE { version, encryptedContentInfo SEQUENCE { contentType, contentEncryptionAlgorithm, [0] IMPLICIT encryptedContent } }
             if edk.len() < 2 || edk[1].tag != 0x30 {
                 continue;
             }
-            let Some(ecik) = der_item_children(edk[1].val) else {
+            let Some(ecik) = der_item_children_bounded(edk[1].val, 8) else {
                 continue;
             };
             if ecik.len() < 3 {
@@ -1955,11 +1960,21 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                 ecik[2].val.to_vec()
             } else if ecik[2].tag == 0xA0 {
                 let mut acc = Vec::new();
-                if let Some(parts) = der_item_children(ecik[2].val) {
-                    for p in parts {
-                        if let Some(b) = extract_octet_string(p) {
-                            acc.extend_from_slice(&b);
-                        }
+                let mut cur = ecik[2].val;
+                let mut chunks = 0usize;
+                while !cur.is_empty() {
+                    if chunks >= MAX_PFX_OCTET_CHUNKS {
+                        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+                        return std::ptr::null_mut();
+                    }
+                    let Some((p, next)) = parse_der_item(cur) else {
+                        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+                        return std::ptr::null_mut();
+                    };
+                    cur = next;
+                    chunks += 1;
+                    if let Some(b) = extract_octet_string(p) {
+                        acc.extend_from_slice(&b);
                     }
                 }
                 acc

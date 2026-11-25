@@ -109,6 +109,25 @@ pub(super) fn der_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
     Some(out)
 }
 
+/// Parse at most `max_items` sibling DER TLV items, returning `None` before parsing or
+/// inserting item `max_items + 1` so crafted payloads with millions of tiny TLVs cannot
+/// trigger unbounded `Vec<DerItem>` allocations before a caller-side count check.
+pub(super) fn der_item_children_bounded(
+    mut buf: &[u8],
+    max_items: usize,
+) -> Option<Vec<DerItem<'_>>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if out.len() >= max_items {
+            return None;
+        }
+        let (it, rest) = parse_der_item(buf)?;
+        out.push(it);
+        buf = rest;
+    }
+    Some(out)
+}
+
 const MAX_BER_DEPTH: usize = 32;
 const MAX_BER_ITEMS: usize = 4096;
 
