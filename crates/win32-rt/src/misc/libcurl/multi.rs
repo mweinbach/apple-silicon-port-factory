@@ -120,11 +120,7 @@ impl TransferSink for MultiWorkerSink {
         self.cancel.load(Ordering::Acquire)
     }
 
-    fn cancel_token(&self) -> Option<Arc<AtomicBool>> {
-        Some(Arc::clone(&self.cancel))
-    }
-
-    fn on_head(&mut self, meta: HeadMeta) {
+    fn on_head(&self, meta: HeadMeta) {
         {
             let mut ch = self.channel.lock().unwrap();
             ch.events.push_back(TransferEvent::Head(meta));
@@ -132,7 +128,7 @@ impl TransferSink for MultiWorkerSink {
         self.multi.signal_activity();
     }
 
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32> {
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32> {
         if self.is_cancelled() {
             return Err(CURLE_ABORTED_BY_CALLBACK);
         }
@@ -144,7 +140,7 @@ impl TransferSink for MultiWorkerSink {
         Ok(())
     }
 
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32> {
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32> {
         if self.is_cancelled() {
             return Err(CURLE_ABORTED_BY_CALLBACK);
         }
@@ -156,7 +152,7 @@ impl TransferSink for MultiWorkerSink {
         Ok(())
     }
 
-    fn on_progress(&mut self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
+    fn on_progress(&self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
         if self.is_cancelled() {
             return Err(CURLE_ABORTED_BY_CALLBACK);
         }

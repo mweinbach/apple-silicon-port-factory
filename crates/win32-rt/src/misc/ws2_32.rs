@@ -221,6 +221,7 @@ fn ntstatus_to_wsa(status: usize) -> u32 {
         0xC000_013C => WSAESHUTDOWN,
         0x8000_0005 => WSAEMSGSIZE,
         0xC000_0008 => WSAENOTSOCK,
+        0xC000_0005 => WSAEFAULT,
         0xC000_000D => WSAEINVAL,
         0xC000_0022 => WSAEACCES,
         s => crate::ntdll::ntstatus_to_win32(s),
@@ -3966,7 +3967,7 @@ unsafe fn try_wsa_recvmsg_once(
         })
         .collect();
     let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-    let want_name = !wmsg.name.is_null() && wmsg.namelen > 0;
+    let want_name = !wmsg.name.is_null();
     let want_ctrl = !wmsg.control.buf.is_null() && wmsg.control.len > 0;
     let mut ctrl_buf = if want_ctrl {
         vec![0u8; (wmsg.control.len as usize).max(256)]
@@ -4001,18 +4002,30 @@ unsafe fn try_wsa_recvmsg_once(
         return Err(e);
     };
 
+    let mut name_err: Option<u32> = None;
     if want_name && pmsg.msg_namelen > 0 {
         let mut out_len = wmsg.namelen;
-        if posix_to_win_sockaddr(
+        match posix_to_win_sockaddr(
             &storage as *const _ as *const libc::sockaddr,
             pmsg.msg_namelen,
             wmsg.name,
             &mut out_len,
-        )
-        .is_ok()
-        {
-            wmsg.namelen = out_len;
+        ) {
+            Ok(()) => {
+                wmsg.namelen = out_len;
+            }
+            Err(wsa) => {
+                name_err = Some(wsa);
+            }
         }
+    }
+    if let Some(wsa) = name_err {
+        let status = match wsa {
+            WSAEFAULT => 0xC000_0005usize, // STATUS_ACCESS_VIOLATION -> WSAEFAULT
+            WSAEINVAL => 0xC000_000Dusize, // STATUS_INVALID_PARAMETER -> WSAEINVAL
+            other => win32_to_ntstatus(other),
+        };
+        return Ok((0, status));
     }
     let ctrunc = if want_ctrl {
         let (written, trunc) = translate_posix_cmsg_to_win(&pmsg, wmsg.control.buf, wmsg.control.len as usize);
@@ -11162,6 +11175,93 @@ mod tests {
             assert_eq!(WSACloseEvent(ev), TRUE);
             assert_eq!(closesocket(rx), 0);
             assert_eq!(closesocket(tx), 0);
+
+            // Undersized WSAMSG.name buffer must fail with WSAEFAULT on both sync and overlapped WSARecvMsg.
+            let rx6 = socket(AF_INET6 as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            let tx6 = socket(AF_INET6 as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            if rx6 != INVALID_SOCKET && tx6 != INVALID_SOCKET {
+                let mut bind6 = [0u8; 28];
+                (bind6.as_mut_ptr() as *mut u16).write_unaligned(AF_INET6);
+                bind6[23] = 1; // ::1
+                if bind(rx6, bind6.as_ptr(), 28) == 0 {
+                    let mut bound6 = [0u8; 28];
+                    let mut blen6 = 28i32;
+                    assert_eq!(getsockname(rx6, bound6.as_mut_ptr(), &mut blen6), 0);
+
+                    // 1. Sync WSARecvMsg with 16-byte name buffer for IPv6 datagram -> SOCKET_ERROR + WSAEFAULT.
+                    let mut p1 = *b"v6sync";
+                    let mut wb1 = WsaBuf { len: p1.len() as u32, buf: p1.as_mut_ptr() };
+                    let sm1 = WsaMsg {
+                        name: bound6.as_mut_ptr(),
+                        namelen: 28,
+                        _pad0: 0,
+                        lp_buffers: &mut wb1,
+                        dw_buffer_count: 1,
+                        _pad1: 0,
+                        control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                        dw_flags: 0,
+                        _pad2: 0,
+                    };
+                    let mut sent6 = 0u32;
+                    assert_eq!(WSASendMsg(tx6, &sm1, 0, &mut sent6, std::ptr::null_mut(), std::ptr::null_mut()), 0);
+
+                    let mut rbuf = [0u8; 32];
+                    let mut rwb = WsaBuf { len: rbuf.len() as u32, buf: rbuf.as_mut_ptr() };
+                    let mut small_name = [0xDDu8; 16];
+                    let mut rmsg = WsaMsg {
+                        name: small_name.as_mut_ptr(),
+                        namelen: 16,
+                        _pad0: 0,
+                        lp_buffers: &mut rwb,
+                        dw_buffer_count: 1,
+                        _pad1: 0,
+                        control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                        dw_flags: 0,
+                        _pad2: 0,
+                    };
+                    let mut got6 = 99u32;
+                    assert_eq!(
+                        WSARecvMsg(rx6, &mut rmsg, &mut got6, std::ptr::null_mut(), std::ptr::null_mut()),
+                        SOCKET_ERROR
+                    );
+                    assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                    assert_eq!(small_name, [0xDDu8; 16]);
+
+                    // 2. Overlapped WSARecvMsg pending -> completed with WSAEFAULT when IPv6 datagram arrives.
+                    let ev6 = WSACreateEvent();
+                    let mut ov6: OVERLAPPED = std::mem::zeroed();
+                    ov6.h_event = ev6;
+                    let mut rmsg2 = WsaMsg {
+                        name: small_name.as_mut_ptr(),
+                        namelen: 16,
+                        _pad0: 0,
+                        lp_buffers: &mut rwb,
+                        dw_buffer_count: 1,
+                        _pad1: 0,
+                        control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                        dw_flags: 0,
+                        _pad2: 0,
+                    };
+                    let mut ov_got6 = 0u32;
+                    assert_eq!(
+                        WSARecvMsg(rx6, &mut rmsg2, &mut ov_got6, &mut ov6 as *mut _ as *mut c_void, std::ptr::null_mut()),
+                        SOCKET_ERROR
+                    );
+                    assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+                    assert_eq!(WSASendMsg(tx6, &sm1, 0, &mut sent6, std::ptr::null_mut(), std::ptr::null_mut()), 0);
+                    let mut xfer6 = 99u32;
+                    let mut flags6 = 0u32;
+                    assert_eq!(WSAGetOverlappedResult(rx6, &mut ov6, &mut xfer6, TRUE, &mut flags6), FALSE);
+                    assert_eq!(WSAGetLastError(), WSAEFAULT as i32);
+                    assert_eq!(WSACloseEvent(ev6), TRUE);
+                }
+            }
+            if tx6 != INVALID_SOCKET {
+                assert_eq!(closesocket(tx6), 0);
+            }
+            if rx6 != INVALID_SOCKET {
+                assert_eq!(closesocket(rx6), 0);
+            }
         }
     }
 

@@ -20,7 +20,6 @@ use rustls::ClientConnection;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -345,13 +344,10 @@ impl StreamingInflater {
 
 pub(super) trait TransferSink {
     fn is_cancelled(&self) -> bool;
-    fn cancel_token(&self) -> Option<Arc<AtomicBool>> {
-        None
-    }
-    fn on_head(&mut self, meta: HeadMeta);
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32>;
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32>;
-    fn on_progress(&mut self, _dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64) -> Result<(), i32> {
+    fn on_head(&self, meta: HeadMeta);
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32>;
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32>;
+    fn on_progress(&self, _dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64) -> Result<(), i32> {
         Ok(())
     }
 }
@@ -366,19 +362,19 @@ impl TransferSink for DirectSink {
         false
     }
 
-    fn on_head(&mut self, meta: HeadMeta) {
+    fn on_head(&self, meta: HeadMeta) {
         apply_head_meta(&self.easy, meta);
     }
 
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32> {
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32> {
         unsafe { invoke_header_callback(self.cb, &line) }
     }
 
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32> {
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32> {
         unsafe { invoke_write_callback(self.cb, &data) }
     }
 
-    fn on_progress(&mut self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
+    fn on_progress(&self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
         unsafe { invoke_xferinfo_callback(self.cb, dltotal, dlnow, ultotal, ulnow) }
     }
 }
@@ -411,41 +407,98 @@ fn remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration>, (i32
     Ok(Some(dl.saturating_duration_since(now)))
 }
 
+/// Maximum single socket read wait before re-checking cancellation and dispatching
+/// periodic progress callbacks during idle network I/O (`CURLOPT_XFERINFOFUNCTION`
+/// contract: periodic invocation even when stalled waiting for headers or body).
+const IDLE_PROGRESS_POLL: Duration = Duration::from_millis(200);
+
+fn bounded_read_timeout(deadline: Option<Instant>) -> Result<Duration, (i32, String, i32)> {
+    let rem = remaining_timeout(deadline)?;
+    Ok(match rem {
+        Some(r) => r.min(IDLE_PROGRESS_POLL),
+        None => IDLE_PROGRESS_POLL,
+    })
+}
+
 struct DeadlineBufReader<'a> {
     inner: &'a mut BufReader<HttpStream>,
+    sink: &'a dyn TransferSink,
     deadline: Option<Instant>,
-    cancel: Option<Arc<AtomicBool>>,
-    cancelled: bool,
+    dltotal: i64,
+    dlnow: &'a std::cell::Cell<i64>,
+    ultotal: i64,
+    ulnow: i64,
+    aborted_code: Option<i32>,
 }
 
 impl DeadlineBufReader<'_> {
     fn prepare_io(&mut self) -> io::Result<()> {
-        if self
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Acquire))
-        {
-            self.cancelled = true;
+        if self.sink.is_cancelled() {
+            self.aborted_code = Some(CURLE_ABORTED_BY_CALLBACK);
             return Err(io::Error::other("Transfer cancelled"));
         }
-        let rem = remaining_timeout(self.deadline)
+        let slice = bounded_read_timeout(self.deadline)
             .map_err(|(_, msg, _)| io::Error::new(io::ErrorKind::TimedOut, msg))?;
-        let _ = self.inner.get_ref().set_timeouts(rem, rem);
+        let _ = self.inner.get_ref().set_timeouts(Some(slice), Some(slice));
+        Ok(())
+    }
+
+    fn on_idle_timeout(&mut self) -> io::Result<()> {
+        let _ = remaining_timeout(self.deadline)
+            .map_err(|(_, msg, _)| io::Error::new(io::ErrorKind::TimedOut, msg))?;
+        if self.sink.is_cancelled() {
+            self.aborted_code = Some(CURLE_ABORTED_BY_CALLBACK);
+            return Err(io::Error::other("Transfer cancelled"));
+        }
+        if let Err(code) = self
+            .sink
+            .on_progress(self.dltotal, self.dlnow.get(), self.ultotal, self.ulnow)
+        {
+            self.aborted_code = Some(code);
+            return Err(io::Error::other("Progress callback aborted transfer"));
+        }
         Ok(())
     }
 }
 
 impl Read for DeadlineBufReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.prepare_io()?;
-        self.inner.read(buf)
+        loop {
+            self.prepare_io()?;
+            match self.inner.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    self.on_idle_timeout()?;
+                }
+                other => return other,
+            }
+        }
     }
 }
 
 impl BufRead for DeadlineBufReader<'_> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.prepare_io()?;
-        self.inner.fill_buf()
+        loop {
+            self.prepare_io()?;
+            let res = match self.inner.fill_buf() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => return Ok(self.inner.buffer()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    self.on_idle_timeout()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn consume(&mut self, amt: usize) {
@@ -742,7 +795,7 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
 pub(super) const CURL_MAX_WRITE_SIZE: usize = 16 * 1024;
 
 fn emit_body_bytes(
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     raw: &[u8],
     size_download: &mut i64,
@@ -1197,19 +1250,36 @@ pub(super) fn execute_http_transfer(
         // 5. Read response head (skipping 1xx interim responses except 101)
         let is_tls = stream.is_tls();
         let mut reader = BufReader::with_capacity(16384, stream);
+        let head_dlnow = std::cell::Cell::new(total_size_download);
+        let head_ultotal = current_body.len() as i64;
 
         let head = loop {
-            let h = match read_response_head(&mut reader) {
+            let mut hreader = DeadlineBufReader {
+                inner: &mut reader,
+                sink,
+                deadline,
+                dltotal: 0,
+                dlnow: &head_dlnow,
+                ultotal: head_ultotal,
+                ulnow: head_ultotal,
+                aborted_code: None,
+            };
+            let h = match read_response_head(&mut hreader) {
                 Ok(h) => h,
                 Err((code, msg, os_errno)) => {
+                    let (final_code, final_msg, final_errno) = if let Some(aborted) = hreader.aborted_code {
+                        (aborted, "Progress callback aborted transfer".to_string(), 0)
+                    } else {
+                        (code, msg, os_errno)
+                    };
                     return TransferOutcome {
-                        code,
-                        error_msg: Some(msg),
+                        code: final_code,
+                        error_msg: Some(final_msg),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
                         content_length_upload: current_body.len() as i64,
                         total_time: start.elapsed().as_secs_f64(),
-                        os_errno,
+                        os_errno: final_errno,
                         ssl_verifyresult: 0,
                     };
                 }
@@ -1586,7 +1656,7 @@ pub(super) fn execute_http_transfer(
 #[allow(clippy::too_many_arguments)]
 fn read_chunked_body(
     reader: &mut BufReader<HttpStream>,
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
     max_filesize: i64,
@@ -1594,19 +1664,23 @@ fn read_chunked_body(
     ultotal: i64,
     deadline: Option<Instant>,
 ) -> Result<(), (i32, String, i32)> {
-    let cancel_token = sink.cancel_token();
+    let dlnow_cell = std::cell::Cell::new(*size_download);
     let mut dreader = DeadlineBufReader {
         inner: reader,
+        sink,
         deadline,
-        cancel: cancel_token,
-        cancelled: false,
+        dltotal,
+        dlnow: &dlnow_cell,
+        ultotal,
+        ulnow: ultotal,
+        aborted_code: None,
     };
     let mut emit_err: Option<(i32, String, i32)> = None;
     let res = net_tls::read_chunked_body_streaming(
         &mut dreader,
         net_tls::DEFAULT_MAX_CHUNK_SIZE,
         |chunk| {
-            if let Err(err) = emit_body_bytes(
+            let r = emit_body_bytes(
                 sink,
                 inflater,
                 chunk,
@@ -1614,7 +1688,9 @@ fn read_chunked_body(
                 max_filesize,
                 dltotal,
                 ultotal,
-            ) {
+            );
+            dlnow_cell.set(*size_download);
+            if let Err(err) = r {
                 emit_err = Some(err);
                 return Err(io::Error::other("Transfer body callback failed"));
             }
@@ -1627,12 +1703,8 @@ fn read_chunked_body(
             if let Some(err) = emit_err {
                 return Err(err);
             }
-            if dreader.cancelled {
-                return Err((
-                    CURLE_ABORTED_BY_CALLBACK,
-                    "Transfer cancelled".to_string(),
-                    0,
-                ));
+            if let Some(code) = dreader.aborted_code {
+                return Err((code, "Progress callback aborted transfer".to_string(), 0));
             }
             if e.kind() == io::ErrorKind::UnexpectedEof {
                 return Err((
@@ -1651,7 +1723,7 @@ fn read_exact_body(
     reader: &mut BufReader<HttpStream>,
     mut remaining: usize,
     buffer_size: usize,
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
     max_filesize: i64,
@@ -1668,8 +1740,8 @@ fn read_exact_body(
                 0,
             ));
         }
-        let rem = remaining_timeout(deadline)?;
-        let _ = reader.get_ref().set_timeouts(rem, rem);
+        let slice = bounded_read_timeout(deadline)?;
+        let _ = reader.get_ref().set_timeouts(Some(slice), Some(slice));
 
         let want = remaining.min(data_buf.len());
         let r = match reader.read(&mut data_buf[..want]) {
@@ -1682,6 +1754,22 @@ fn read_exact_body(
             }
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                let _ = remaining_timeout(deadline)?;
+                if sink.is_cancelled() {
+                    return Err((
+                        CURLE_ABORTED_BY_CALLBACK,
+                        "Transfer cancelled".to_string(),
+                        0,
+                    ));
+                }
+                sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                    .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+                continue;
+            }
             Err(e) => return Err(map_io_err(&e, CURLE_RECV_ERROR)),
         };
         remaining -= r;
@@ -1703,7 +1791,7 @@ fn read_eof_body(
     reader: &mut BufReader<HttpStream>,
     is_tls: bool,
     buffer_size: usize,
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
     max_filesize: i64,
@@ -1720,8 +1808,8 @@ fn read_eof_body(
                 0,
             ));
         }
-        let rem = remaining_timeout(deadline)?;
-        let _ = reader.get_ref().set_timeouts(rem, rem);
+        let slice = bounded_read_timeout(deadline)?;
+        let _ = reader.get_ref().set_timeouts(Some(slice), Some(slice));
 
         match reader.read(&mut data_buf) {
             Ok(0) => return Ok(()),
@@ -1735,6 +1823,22 @@ fn read_eof_body(
                 ultotal,
             )?,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                let _ = remaining_timeout(deadline)?;
+                if sink.is_cancelled() {
+                    return Err((
+                        CURLE_ABORTED_BY_CALLBACK,
+                        "Transfer cancelled".to_string(),
+                        0,
+                    ));
+                }
+                sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                    .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+                continue;
+            }
             // Many HTTPS servers close TCP after Connection: close without TLS close_notify.
             Err(e) if is_tls && e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(map_io_err(&e, CURLE_RECV_ERROR)),

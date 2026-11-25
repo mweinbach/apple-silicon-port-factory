@@ -1409,3 +1409,96 @@ fn easy_write_callback_caps_chunks_at_curl_max_write_size() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_idle_network_io_invokes_progress_callback_and_aborts() {
+    use super::easy::{
+        CURLE_ABORTED_BY_CALLBACK, CURLOPT_NOPROGRESS, CURLOPT_XFERINFODATA,
+        CURLOPT_XFERINFOFUNCTION,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    unsafe extern "win64" fn abort_after_two_calls(
+        clientp: *mut c_void,
+        _dltotal: i64,
+        _dlnow: i64,
+        _ultotal: i64,
+        _ulnow: i64,
+    ) -> i32 {
+        let count = &*(clientp as *const AtomicUsize);
+        let prev = count.fetch_add(1, Ordering::Relaxed);
+        if prev >= 1 { 1 } else { 0 }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_srv = Arc::clone(&done);
+
+    let server = std::thread::spawn(move || {
+        // 1. Stall before sending response headers until client aborts.
+        let (mut s1, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s1);
+        while !done_srv.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(s1);
+
+        // 2. Send headers (Content-Length: 1024) and then stall body until client aborts.
+        let (mut s2, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s2);
+        let _ = s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n");
+        let _ = s2.flush();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if s2.write(&[]).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+
+    unsafe {
+        crate::register_native_va(
+            abort_after_two_calls as *const () as u64,
+            abort_after_two_calls as *const () as usize,
+        );
+
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/stall\0");
+        let calls = AtomicUsize::new(0);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_XFERINFOFUNCTION,
+                abort_after_two_calls as *const () as usize
+            ),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(
+                easy,
+                CURLOPT_XFERINFODATA,
+                (&calls as *const AtomicUsize) as usize
+            ),
+            CURLE_OK
+        );
+
+        // 1. Stalled while waiting for headers -> idle progress fires and aborts with CURLE_ABORTED_BY_CALLBACK.
+        assert_eq!(curl_easy_perform(easy), CURLE_ABORTED_BY_CALLBACK);
+        assert!(calls.load(Ordering::Relaxed) >= 2);
+        done.store(true, Ordering::Release);
+
+        // 2. Stalled after headers during body read -> idle progress fires and aborts with CURLE_ABORTED_BY_CALLBACK.
+        calls.store(0, Ordering::Relaxed);
+        assert_eq!(curl_easy_perform(easy), CURLE_ABORTED_BY_CALLBACK);
+        assert!(calls.load(Ordering::Relaxed) >= 2);
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}
