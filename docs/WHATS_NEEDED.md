@@ -59,7 +59,8 @@ tracked in [docs/TODOS.md](TODOS.md).
 ### Graphics on shipping games
 
 - Validate D3D11 mip generation, indirect draws, geometry shaders, depth readback and shared
-  resources on another engine. The fixture and unit coverage is recorded in [Status](STATUS.md).
+  resources on another engine. `DrawAuto` and hull/domain shader creation still have explicit
+  stub paths. The fixture and unit coverage is recorded in [Status](STATUS.md).
 - The Vulkan guest fixture presents and resizes on live MoltenVK. Exercise the same path with
   a shipping Vulkan title.
 - Check D3D12 barrier and residency behavior on a non-Northlight engine. Spatial MetalFX has
@@ -72,6 +73,8 @@ tracked in [docs/TODOS.md](TODOS.md).
   control flow and interpreter fallbacks. A catalog family can contain an unsupported form.
 - Exercise the APIs the game actually imports, including COM calls resolved at runtime.
   Static implementation kinds and stub sites are starting points for guest conformance tests.
+- Validate dynamically generated guest code and its memory permissions on managed runtimes.
+  For audio capture, the current WASAPI endpoint supplies paced silent packets.
 
 ### Packaging and gameplay
 

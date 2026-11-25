@@ -84,9 +84,9 @@ jobs:
       # The library tests and the AOT integration test run from one cargo invocation so the
       # large crates are compiled once for both. Running the AOT test on its own resolves a
       # different feature set and rebuilds win32-rt, x86-runtime and d3d12-metal.
-      - name: Unit tests and AOT multi-module verification
+      - name: Unit tests, AOT multi-module verification and headless Win32 guest corpus
         run: >-
-          cargo factory-test --test aot_multi_module_verify --
+          cargo factory-test --test aot_multi_module_verify --test os_guest_corpus --
           --test-threads=1 --skip shadow::tests::timeouts_and_faults
       - name: Static readiness against synthetic PEs and Zig guests
         env:
