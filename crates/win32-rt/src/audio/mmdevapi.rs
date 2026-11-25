@@ -1062,6 +1062,8 @@ impl Default for EndpointSwAtomic {
 
 #[derive(Clone)]
 struct EndpointSoftwareGain {
+    /// Whether `logical_channels` has been seeded from explicit setters or HAL master volume.
+    channels_initialized: bool,
     /// Logical fallback control values (audio-tapered scalars in `[0.0, 1.0]`, used by getters
     /// when CoreAudio HAL lacks that control).
     logical_master: f32,
@@ -1084,6 +1086,7 @@ struct EndpointSoftwareGain {
 impl Default for EndpointSoftwareGain {
     fn default() -> Self {
         Self {
+            channels_initialized: false,
             logical_master: 1.0,
             logical_muted: false,
             logical_channels: [1.0; 8],
@@ -1098,6 +1101,10 @@ impl Default for EndpointSoftwareGain {
 
 static ENDPOINT_SW_GAINS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, EndpointSoftwareGain>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Serializes read-modify-HAL-write volume mutations so concurrent master/channel setters
+/// never interleave out of order while keeping `ENDPOINT_SW_GAINS` free of HAL I/O.
+static ENDPOINT_VOL_OP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Return the shared lock-free software gain handle for `ep_id` so render/spatial playback
 /// consumers apply live `IAudioEndpointVolume` updates without acquiring any mutex.
@@ -1193,10 +1200,18 @@ impl EndpointVolumeState {
     }
 
     fn set_master_scalar(&self, scalar: f32) {
+        self.apply_master_scalar_with(scalar, |s| {
+            backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s)
+        });
+    }
+
+    fn apply_master_scalar_with(&self, scalar: f32, set_hw_master: impl FnOnce(f32) -> bool) {
+        let _op_guard = ENDPOINT_VOL_OP_LOCK.lock().unwrap();
         let s = scalar.clamp(0.0, 1.0);
         let gain = self.scalar_to_amplitude_gain(s);
-        let hw_ok = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
+        let hw_ok = set_hw_master(s);
         update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.channels_initialized = true;
             g.logical_master = s;
             g.logical_channels = [s; 8];
             g.hw_master_gain = if hw_ok { Some(gain) } else { None };
@@ -1213,36 +1228,108 @@ impl EndpointVolumeState {
         if let Some(v) = backend::device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32) {
             Some(v)
         } else {
-            Some(read_endpoint_sw_state(&self.ep.id, |g| g.logical_channels[ch]))
+            let (initialized, val) =
+                read_endpoint_sw_state(&self.ep.id, |g| (g.channels_initialized, g.logical_channels[ch]));
+            if initialized {
+                Some(val)
+            } else {
+                Some(backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()).unwrap_or(val))
+            }
         }
     }
 
     fn set_channel_scalar(&self, ch: usize, scalar: f32) -> bool {
+        self.apply_channel_scalar_with(
+            ch,
+            scalar,
+            || backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()),
+            |s| backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s),
+            |c, s| backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), c, s),
+        )
+    }
+
+    fn apply_channel_scalar_with(
+        &self,
+        ch: usize,
+        scalar: f32,
+        get_hw_master: impl FnOnce() -> Option<f32>,
+        set_hw_master: impl FnOnce(f32) -> bool,
+        set_hw_channel: impl FnOnce(u32, f32) -> bool,
+    ) -> bool {
         if ch >= self.channel_count {
             return false;
         }
+        let _op_guard = ENDPOINT_VOL_OP_LOCK.lock().unwrap();
         let s = scalar.clamp(0.0, 1.0);
-        let gain = self.scalar_to_amplitude_gain(s);
-        let hw_ok = backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32, s);
+        let hw_ch_ok = set_hw_channel(ch as u32, s);
         let n_ch = self.channel_count;
-        update_endpoint_sw_gain(&self.ep.id, |g| {
+        if hw_ch_ok {
+            update_endpoint_sw_gain(&self.ep.id, |g| {
+                g.channels_initialized = true;
+                g.logical_channels[ch] = s;
+                g.logical_master = g.logical_channels[..n_ch]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max);
+                g.sw_channels[ch] = 1.0;
+            });
+            return true;
+        }
+
+        // CoreAudio HAL has no per-channel volume on this endpoint. If HAL controls master
+        // volume, rebalance HAL master to `max(logical_channels[..n_ch])` and compute each
+        // channel's software gain relative to that master so raising any channel above a lower
+        // (or zero) hardware master succeeds accurately while other channels keep their exact gain.
+        let current_hw_master = get_hw_master();
+        let (target_master_scalar, had_hw_master) = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let g = map.entry(self.ep.id.clone()).or_default();
+            if !g.channels_initialized {
+                if let Some(hw_s) = current_hw_master {
+                    g.logical_master = hw_s;
+                    g.logical_channels = [hw_s; 8];
+                    g.hw_master_gain = Some(self.scalar_to_amplitude_gain(hw_s));
+                }
+                g.channels_initialized = true;
+            }
             g.logical_channels[ch] = s;
-            g.logical_master = g.logical_channels[..n_ch]
+            let new_master = g.logical_channels[..n_ch]
                 .iter()
                 .copied()
                 .fold(0.0f32, f32::max);
-            // Compute the channel's software linear gain without double-applying master attenuation.
-            g.sw_channels[ch] = if hw_ok {
-                1.0
-            } else if let Some(hm) = g.hw_master_gain {
-                if hm > 1e-6 {
-                    (gain / hm).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                }
+            g.logical_master = new_master;
+            (new_master, g.hw_master_gain.is_some() || current_hw_master.is_some())
+        };
+
+        let hw_master_ok = if had_hw_master {
+            set_hw_master(target_master_scalar)
+        } else {
+            false
+        };
+        let target_master_gain = self.scalar_to_amplitude_gain(target_master_scalar);
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            let eff_hw_gain = if had_hw_master && hw_master_ok {
+                g.hw_master_gain = Some(target_master_gain);
+                Some(target_master_gain)
+            } else if had_hw_master {
+                current_hw_master
+                    .map(|v| self.scalar_to_amplitude_gain(v))
+                    .or(g.hw_master_gain)
             } else {
-                gain
+                g.hw_master_gain = None;
+                None
             };
+            for i in 0..n_ch {
+                let ch_gain = self.scalar_to_amplitude_gain(g.logical_channels[i]);
+                g.sw_channels[i] = match eff_hw_gain {
+                    Some(hm) if hm > 1e-6 => (ch_gain / hm).clamp(0.0, 1.0),
+                    Some(_) => 0.0,
+                    None => ch_gain,
+                };
+            }
+            for i in n_ch..8 {
+                g.sw_channels[i] = if eff_hw_gain.is_some() { 1.0 } else { target_master_gain };
+            }
         });
         true
     }
@@ -1589,5 +1676,117 @@ mod tests {
         assert_eq!(ds.container_id, dualsense_usb_container_id(0));
         assert_eq!(format_guid(&ds.container_id).len(), 38);
         assert_eq!(ds.mix_format().channels, 4);
+    }
+
+    #[test]
+    fn channel_volume_rebalances_hal_master_and_software_gains_above_prior_master() {
+        reset_endpoint_software_gains_for_test();
+        let ep = Arc::new(Endpoint::new(backend::null_device()));
+        let st = EndpointVolumeState::new(ep.clone());
+        let sw_atomic = endpoint_software_gain_handle(&ep.id);
+        let hw_master = std::cell::Cell::new(1.0f32);
+
+        let effective = |hw_s: f32, ch: usize| -> f32 {
+            let sw = f32::from_bits(sw_atomic.sw_channels[ch].load(Ordering::Acquire));
+            st.scalar_to_amplitude_gain(hw_s) * sw
+        };
+
+        // 1. SetMaster(0.0) followed by SetChannel(0, 1.0) on a HAL-master-only endpoint:
+        //    HAL master must rise to 1.0 so ch 0 reaches full unity gain while ch 1 stays silent.
+        st.apply_master_scalar_with(0.0, |s| {
+            hw_master.set(s);
+            true
+        });
+        assert_eq!(hw_master.get(), 0.0);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            1.0,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!(
+            (hw_master.get() - 1.0).abs() < 1e-6,
+            "HAL master must rise to 1.0, got {}",
+            hw_master.get()
+        );
+        assert!(
+            (effective(hw_master.get(), 0) - 1.0).abs() < 1e-6,
+            "channel 0 must reach unity amplitude, got {}",
+            effective(hw_master.get(), 0)
+        );
+        assert!(
+            effective(hw_master.get(), 1).abs() < 1e-6,
+            "channel 1 must stay silenced at 0.0, got {}",
+            effective(hw_master.get(), 1)
+        );
+
+        // 2. Nonzero HAL master (0.5) followed by raising channel 0 to 0.9:
+        //    HAL master rises to 0.9; ch 0 reaches gain(0.9) and ch 1 stays at gain(0.5).
+        st.apply_master_scalar_with(0.5, |s| {
+            hw_master.set(s);
+            true
+        });
+        assert!((hw_master.get() - 0.5).abs() < 1e-6);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.9,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.9).abs() < 1e-6);
+        let want0 = st.scalar_to_amplitude_gain(0.9);
+        let want1 = st.scalar_to_amplitude_gain(0.5);
+        assert!((effective(hw_master.get(), 0) - want0).abs() < 1e-5);
+        assert!((effective(hw_master.get(), 1) - want1).abs() < 1e-5);
+
+        // 3. Lowering channel 0 below channel 1 (to 0.25) lowers HAL master to max(0.25, 0.5) = 0.5
+        //    while keeping both channels at their exact target gains.
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.25,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.5).abs() < 1e-6);
+        let want0_low = st.scalar_to_amplitude_gain(0.25);
+        assert!((effective(hw_master.get(), 0) - want0_low).abs() < 1e-5);
+        assert!((effective(hw_master.get(), 1) - want1).abs() < 1e-5);
+
+        // 4. Fresh uninitialized endpoint with HAL master at 0.4: setting channel 0 to 0.8 must
+        //    preserve channel 1 at 0.4 (not default 1.0) and raise HAL master to 0.8.
+        reset_endpoint_software_gains_for_test();
+        let sw_atomic2 = endpoint_software_gain_handle(&ep.id);
+        hw_master.set(0.4);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.8,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.8).abs() < 1e-6);
+        let eff2 = |ch: usize| -> f32 {
+            let sw = f32::from_bits(sw_atomic2.sw_channels[ch].load(Ordering::Acquire));
+            st.scalar_to_amplitude_gain(hw_master.get()) * sw
+        };
+        assert!((eff2(0) - st.scalar_to_amplitude_gain(0.8)).abs() < 1e-5);
+        assert!((eff2(1) - st.scalar_to_amplitude_gain(0.4)).abs() < 1e-5);
+
+        reset_endpoint_software_gains_for_test();
     }
 }

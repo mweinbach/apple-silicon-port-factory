@@ -888,22 +888,14 @@ const MINIDUMP_SYSTEM_INFO_STREAM: u32 = 7;
 const MINIDUMP_MISC_INFO_STREAM: u32 = 15;
 const MINIDUMP_MISC1_PROCESS_ID: u32 = 0x0000_0001;
 
-// MINIDUMP_TYPE flags requiring full/private process-wide memory enumeration or memory
-// scrubbing that this writer does not implement; reject honestly rather than emitting an
-// unfiltered or partial dump under those flags.
-const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x0000_0002;
-const MINIDUMP_FILTER_MEMORY: u32 = 0x0000_0008;
+// MINIDUMP_TYPE flags actually implemented by this MDMP writer:
+// - MiniDumpNormal (0x0000_0000): standard thread/module/stack/exception/system/misc streams.
+// - MiniDumpFilterModulePaths (0x0000_0080): strips directory paths from module and CodeView PDB entries.
+// Any other content or filtering flag (e.g. MiniDumpWithDataSegs, MiniDumpWithFullMemory,
+// MiniDumpWithHandleData, MiniDumpFilterMemory, MiniDumpWithThreadInfo, MiniDumpFilterTriage, ...)
+// is rejected honestly with ERROR_NOT_SUPPORTED until its stream/filtering is implemented.
 const MINIDUMP_FILTER_MODULE_PATHS: u32 = 0x0000_0080;
-const MINIDUMP_WITH_PRIVATE_RW_MEMORY: u32 = 0x0000_0200;
-const MINIDUMP_WITH_FULL_MEMORY_INFO: u32 = 0x0000_0800;
-const MINIDUMP_WITH_PRIVATE_WC_MEMORY: u32 = 0x0001_0000;
-const MINIDUMP_FILTER_TRIAGE: u32 = 0x0010_0000;
-const MINIDUMP_UNSUPPORTED_FLAGS: u32 = MINIDUMP_WITH_FULL_MEMORY
-    | MINIDUMP_FILTER_MEMORY
-    | MINIDUMP_WITH_PRIVATE_RW_MEMORY
-    | MINIDUMP_WITH_FULL_MEMORY_INFO
-    | MINIDUMP_WITH_PRIVATE_WC_MEMORY
-    | MINIDUMP_FILTER_TRIAGE;
+const MINIDUMP_SUPPORTED_FLAGS: u32 = MINIDUMP_FILTER_MODULE_PATHS;
 
 /// Strip directory components from a module or PDB path for `MiniDumpFilterModulePaths` (`0x80`),
 /// keeping only the filename so usernames and directory layouts are not serialized into dumps.
@@ -1094,7 +1086,7 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    if (dump_type & MINIDUMP_UNSUPPORTED_FLAGS) != 0 {
+    if (dump_type & !MINIDUMP_SUPPORTED_FLAGS) != 0 {
         crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
         return FALSE;
     }
@@ -3102,6 +3094,7 @@ mod tests {
             assert_ne!(h_file, INVALID_HANDLE_VALUE);
 
             // 1. MiniDumpWithFullMemory must fail honestly with ERROR_NOT_SUPPORTED.
+            const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x0000_0002;
             assert_eq!(
                 MiniDumpWriteDump(
                     (-1isize) as HANDLE,
@@ -3512,8 +3505,24 @@ mod tests {
             );
             assert_ne!(h_file, INVALID_HANDLE_VALUE);
 
-            // Unsupported memory-filtering flags must still fail honestly with ERROR_NOT_SUPPORTED.
-            for unsupported in [MINIDUMP_FILTER_MEMORY, MINIDUMP_FILTER_TRIAGE] {
+            // All unsupported content/filtering flags (alone or combined with supported flags)
+            // must fail honestly with ERROR_NOT_SUPPORTED instead of silently omitting streams.
+            const MINIDUMP_WITH_DATA_SEGS: u32 = 0x0000_0001;
+            const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x0000_0002;
+            const MINIDUMP_WITH_HANDLE_DATA: u32 = 0x0000_0004;
+            const MINIDUMP_FILTER_MEMORY: u32 = 0x0000_0008;
+            const MINIDUMP_WITH_THREAD_INFO: u32 = 0x0000_1000;
+            const MINIDUMP_FILTER_TRIAGE: u32 = 0x0010_0000;
+            for unsupported in [
+                MINIDUMP_WITH_DATA_SEGS,
+                MINIDUMP_WITH_FULL_MEMORY,
+                MINIDUMP_WITH_HANDLE_DATA,
+                MINIDUMP_FILTER_MEMORY,
+                MINIDUMP_WITH_THREAD_INFO,
+                MINIDUMP_FILTER_TRIAGE,
+                MINIDUMP_FILTER_MODULE_PATHS | MINIDUMP_WITH_HANDLE_DATA,
+                MINIDUMP_FILTER_MODULE_PATHS | MINIDUMP_WITH_THREAD_INFO,
+            ] {
                 assert_eq!(
                     MiniDumpWriteDump(
                         proc_h,
@@ -3524,7 +3533,8 @@ mod tests {
                         std::ptr::null(),
                         std::ptr::null(),
                     ),
-                    FALSE
+                    FALSE,
+                    "MiniDumpWriteDump must reject unsupported dump_type {unsupported:#x}"
                 );
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
             }
