@@ -381,6 +381,16 @@ pub(super) mod apple_trust {
         (Vec::new(), Vec::new())
     }
 
+    #[derive(Clone, Copy, Debug)]
+    pub enum SecTrustPolicyMode<'a> {
+        BasicX509,
+        /// `SecPolicyCreateSSL(true, hostname_or_null)`: retains TLS ServerAuth EKU checks
+        /// even when `None` omits hostname matching.
+        SslServer(Option<&'a str>),
+        /// `SecPolicyCreateSSL(false, NULL)`: enforces TLS ClientAuth EKU checks.
+        SslClient,
+    }
+
     /// Evaluate a certificate chain against the Apple Security.framework trust engine.
     /// `exclusive_anchors`: if `Some`, trust ONLY those anchors; otherwise combine `extra_anchors`
     /// with the macOS/iOS system trust store.
@@ -388,7 +398,7 @@ pub(super) mod apple_trust {
         chain_der: &[Vec<u8>],
         exclusive_anchors: Option<&[Vec<u8>]>,
         extra_anchors: &[Vec<u8>],
-        ssl_hostname: Option<&str>,
+        policy_mode: SecTrustPolicyMode<'_>,
         verify_unix_secs: Option<f64>,
     ) -> Option<bool> {
         if chain_der.is_empty() {
@@ -423,18 +433,21 @@ pub(super) mod apple_trust {
             }
             let _certs_g = CfRef(cf_certs);
 
-            let policy = if let Some(host) = ssl_hostname {
-                let cf_host = CFStringCreateWithBytes(
-                    kCFAllocatorDefault,
-                    host.as_ptr(),
-                    host.len() as isize,
-                    0x0800_0100, // kCFStringEncodingUTF8
-                    0,
-                );
-                let _hg = CfRef(cf_host);
-                SecPolicyCreateSSL(1, cf_host)
-            } else {
-                SecPolicyCreateBasicX509()
+            let policy = match policy_mode {
+                SecTrustPolicyMode::BasicX509 => SecPolicyCreateBasicX509(),
+                SecTrustPolicyMode::SslServer(Some(host)) => {
+                    let cf_host = CFStringCreateWithBytes(
+                        kCFAllocatorDefault,
+                        host.as_ptr(),
+                        host.len() as isize,
+                        0x0800_0100, // kCFStringEncodingUTF8
+                        0,
+                    );
+                    let _hg = CfRef(cf_host);
+                    SecPolicyCreateSSL(1, cf_host)
+                }
+                SecTrustPolicyMode::SslServer(None) => SecPolicyCreateSSL(1, std::ptr::null()),
+                SecTrustPolicyMode::SslClient => SecPolicyCreateSSL(0, std::ptr::null()),
             };
             if policy.is_null() {
                 return None;
@@ -2863,6 +2876,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
 
     let (mut err_code, mut elem_idx): (u32, i32) = match policy_id {
         CERT_CHAIN_POLICY_SSL => {
+            const OID_SERVER_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
             const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
             const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
             let is_client_auth = ssl_auth_type == 1;
@@ -2885,19 +2899,23 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             };
             // Fall back to Apple Security.framework SecTrust when WebPKI rejects with untrusted root
             // (handles system-installed macOS roots or non-WebPKI chains trusted by Apple's trust store).
+            // Always use a role-aware SSL policy (`SecPolicyCreateSSL(true/false, ...)`) so TLS
+            // ServerAuth/ClientAuth EKU checks remain enforced even when `ignore_cn` omits hostname matching.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if raw == CERT_E_UNTRUSTEDROOT {
                 let verify_secs = Some(verify_unix.as_secs() as f64);
-                let host_arg = if is_client_auth || ignore_cn {
-                    None
+                let sec_mode = if is_client_auth {
+                    apple_trust::SecTrustPolicyMode::SslClient
+                } else if ignore_cn {
+                    apple_trust::SecTrustPolicyMode::SslServer(None)
                 } else {
-                    server_name.as_deref()
+                    apple_trust::SecTrustPolicyMode::SslServer(server_name.as_deref())
                 };
                 if apple_trust::evaluate_sec_trust(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
-                    host_arg,
+                    sec_mode,
                     verify_secs,
                 ) == Some(true)
                 {
@@ -2911,21 +2929,26 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             {
                 raw = 0;
             }
-            // Independent post-checks ensure ignoring one error (e.g. ALLOW_UNKNOWN_CA)
-            // never silently masks an un-ignored expiration, clientAuth EKU, or hostname mismatch!
-            let client_usage_bad = is_client_auth
-                && !ignore_usage
+            // Independent post-checks ensure ignoring one error (e.g. ALLOW_UNKNOWN_CA or
+            // IGNORE_CERT_CN_INVALID) never silently masks an un-ignored expiration, wrong TLS
+            // role EKU (serverAuth vs clientAuth), or hostname mismatch!
+            let required_eku = if is_client_auth {
+                OID_CLIENT_AUTH
+            } else {
+                OID_SERVER_AUTH
+            };
+            let tls_usage_bad = !ignore_usage
                 && chain_der
                     .first()
                     .and_then(|d| cert_eku_oids(d))
                     .is_some_and(|oids| {
                         !oids.is_empty()
                             && !oids.iter().any(|o| {
-                                o.as_slice() == OID_CLIENT_AUTH || o.as_slice() == OID_ANY_EKU
+                                o.as_slice() == required_eku || o.as_slice() == OID_ANY_EKU
                             })
                     });
             if raw == 0 {
-                if client_usage_bad {
+                if tls_usage_bad {
                     (CERT_E_WRONG_USAGE, 0)
                 } else if !ignore_date {
                     if let Some(ti) = first_time_invalid_idx {
@@ -3006,7 +3029,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
-                    None,
+                    apple_trust::SecTrustPolicyMode::BasicX509,
                     Some(verify_unix.as_secs() as f64),
                 ) == Some(true);
             }
@@ -3151,7 +3174,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
-                    None,
+                    apple_trust::SecTrustPolicyMode::BasicX509,
                     Some(verify_unix.as_secs() as f64),
                 ) == Some(true);
             }

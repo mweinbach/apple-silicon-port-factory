@@ -83,7 +83,7 @@ pub(super) const CERT_SUBJECT_NAME_MD5_HASH_PROP_ID: u32 = 29;
 pub(super) const CERT_STORE_ENUM_ARCHIVED_FLAG: u32 = 0x0000_0200;
 pub(super) const CERT_ARCHIVED_PROP_ID: u32 = 19;
 pub(super) const CERT_NCRYPT_KEY_HANDLE_PROP_ID: u32 = 78;
-const CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID: u32 = 99;
+pub(super) const CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID: u32 = 99;
 pub(super) const CERT_SHA256_HASH_PROP_ID: u32 = 107;
 
 #[repr(C)]
@@ -2063,13 +2063,24 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
         return FALSE;
     };
+    const CERT_NCRYPT_KEY_SPEC: u32 = 0xFFFF_FFFF;
     if pv_data.is_null() {
         if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
             entry.key_prov_info = None;
         }
         if dw_prop_id == CERT_KEY_CONTEXT_PROP_ID {
             entry.properties.remove(&CERT_KEY_PROV_HANDLE_PROP_ID);
+            entry.properties.remove(&CERT_NCRYPT_KEY_HANDLE_PROP_ID);
             entry.properties.remove(&CERT_KEY_SPEC_PROP_ID);
+        } else if matches!(
+            dw_prop_id,
+            CERT_KEY_PROV_HANDLE_PROP_ID
+                | CERT_NCRYPT_KEY_HANDLE_PROP_ID
+                | CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID
+        ) {
+            entry.properties.remove(&CERT_KEY_CONTEXT_PROP_ID);
+            entry.properties.remove(&CERT_KEY_PROV_HANDLE_PROP_ID);
+            entry.properties.remove(&CERT_NCRYPT_KEY_HANDLE_PROP_ID);
         }
         entry.properties.remove(&dw_prop_id);
         return TRUE;
@@ -2091,12 +2102,64 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
         let mut raw = vec![0u8; std::mem::size_of::<CertKeyContext>()];
         std::ptr::write_unaligned(raw.as_mut_ptr() as *mut CertKeyContext, normalized);
         entry.properties.insert(CERT_KEY_CONTEXT_PROP_ID, raw);
-        entry
-            .properties
-            .insert(CERT_KEY_PROV_HANDLE_PROP_ID, kc.h_crypt_prov.to_le_bytes().to_vec());
+        if kc.dw_key_spec == CERT_NCRYPT_KEY_SPEC {
+            entry.properties.remove(&CERT_KEY_PROV_HANDLE_PROP_ID);
+            entry
+                .properties
+                .insert(CERT_NCRYPT_KEY_HANDLE_PROP_ID, kc.h_crypt_prov.to_le_bytes().to_vec());
+        } else {
+            entry.properties.remove(&CERT_NCRYPT_KEY_HANDLE_PROP_ID);
+            entry
+                .properties
+                .insert(CERT_KEY_PROV_HANDLE_PROP_ID, kc.h_crypt_prov.to_le_bytes().to_vec());
+        }
         entry
             .properties
             .insert(CERT_KEY_SPEC_PROP_ID, kc.dw_key_spec.to_le_bytes().to_vec());
+        return TRUE;
+    }
+    if matches!(
+        dw_prop_id,
+        CERT_KEY_PROV_HANDLE_PROP_ID
+            | CERT_NCRYPT_KEY_HANDLE_PROP_ID
+            | CERT_NCRYPT_KEY_HANDLE_TRANSFER_PROP_ID
+    ) {
+        // Per Windows SDK wincrypt.h / MSDN CertSetCertificateContextProperty:
+        // pvData IS the opaque HCRYPTPROV / NCRYPT_KEY_HANDLE value itself — NEVER dereference it!
+        let handle = pv_data as usize;
+        let is_ncrypt = dw_prop_id != CERT_KEY_PROV_HANDLE_PROP_ID;
+        let dw_key_spec = if is_ncrypt {
+            CERT_NCRYPT_KEY_SPEC
+        } else {
+            entry
+                .properties
+                .get(&CERT_KEY_SPEC_PROP_ID)
+                .and_then(|b| b.get(..4))
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
+        };
+        let kc = CertKeyContext {
+            cb_size: std::mem::size_of::<CertKeyContext>() as u32,
+            h_crypt_prov: handle,
+            dw_key_spec,
+        };
+        let mut raw = vec![0u8; std::mem::size_of::<CertKeyContext>()];
+        std::ptr::write_unaligned(raw.as_mut_ptr() as *mut CertKeyContext, kc);
+        entry.properties.insert(CERT_KEY_CONTEXT_PROP_ID, raw);
+        if is_ncrypt {
+            entry.properties.remove(&CERT_KEY_PROV_HANDLE_PROP_ID);
+            entry
+                .properties
+                .insert(CERT_NCRYPT_KEY_HANDLE_PROP_ID, handle.to_le_bytes().to_vec());
+            entry
+                .properties
+                .insert(CERT_KEY_SPEC_PROP_ID, dw_key_spec.to_le_bytes().to_vec());
+        } else {
+            entry.properties.remove(&CERT_NCRYPT_KEY_HANDLE_PROP_ID);
+            entry
+                .properties
+                .insert(CERT_KEY_PROV_HANDLE_PROP_ID, handle.to_le_bytes().to_vec());
+        }
         return TRUE;
     }
     if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
@@ -2161,9 +2224,6 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
     let val = match dw_prop_id {
         CERT_KEY_SPEC_PROP_ID | CERT_ACCESS_STATE_PROP_ID => {
             std::ptr::read_unaligned(pv_data as *const u32).to_le_bytes().to_vec()
-        }
-        CERT_KEY_PROV_HANDLE_PROP_ID | CERT_NCRYPT_KEY_HANDLE_PROP_ID => {
-            std::ptr::read_unaligned(pv_data as *const usize).to_le_bytes().to_vec()
         }
         CERT_DATE_STAMP_PROP_ID => {
             std::ptr::read_unaligned(pv_data as *const u64).to_le_bytes().to_vec()

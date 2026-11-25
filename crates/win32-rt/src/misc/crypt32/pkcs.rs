@@ -3,8 +3,8 @@
 //! backed by Apple CommonCrypto, `bcrypt`, and `rustls::crypto::ring`.
 
 use super::asn1::{
-    der_item_children, encode_der_tlv, parse_cert_der_parts, parse_der_item, DerItem,
-    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    ber_item_children, der_item_children, encode_der_tlv, parse_ber_item, parse_cert_der_parts,
+    parse_der_item, DerItem, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use super::store::{
     add_der_with_meta_to_store, cert_open_store_impl, create_cert_context_from_der,
@@ -22,7 +22,7 @@ const CRYPT_E_INVALID_MSG_TYPE: u32 = 0x8009_200A;
 const NTE_BAD_SIGNATURE: u32 = 0x8009_0006;
 const ERROR_INVALID_PASSWORD: u32 = 86;
 
-const CMSG_DATA: u32 = 1;
+pub(super) const CMSG_DATA: u32 = 1;
 const CMSG_SIGNED: u32 = 2;
 const CMSG_ENVELOPED: u32 = 3;
 const CMSG_DETACHED_FLAG: u32 = 0x0000_0004;
@@ -182,7 +182,7 @@ fn extract_octet_string(elem: DerItem<'_>) -> Option<Vec<u8>> {
             return Some(());
         }
         if elem.tag == 0x24 {
-            for child in der_item_children(elem.val)? {
+            for child in ber_item_children(elem.val)? {
                 inner(child, depth + 1, out)?;
             }
             return Some(());
@@ -232,21 +232,21 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
     if sd_seq.tag != 0x30 {
         return None;
     }
-    let sd_kids = der_item_children(sd_seq.val)?;
+    let sd_kids = ber_item_children(sd_seq.val)?;
     if sd_kids.len() < 4 || sd_kids[0].tag != 0x02 || sd_kids[2].tag != 0x30 {
         return None;
     }
     let version = parse_der_u32_val(sd_kids[0].val).unwrap_or(1);
 
     // encapContentInfo ::= SEQUENCE { eContentType OID, [0] EXPLICIT eContent OPTIONAL }
-    let eci_kids = der_item_children(sd_kids[2].val)?;
+    let eci_kids = ber_item_children(sd_kids[2].val)?;
     if eci_kids.is_empty() || eci_kids[0].tag != 0x06 {
         return None;
     }
     let inner_oid = eci_kids[0].val;
     let inner_content_type_oid = wintrust::decode_oid_str(inner_oid);
     let (content, digest_content) = if let Some(ec) = eci_kids.get(1).filter(|e| e.tag == 0xA0) {
-        if let Some((inner, _)) = parse_der_item(ec.val) {
+        if let Some((inner, _)) = parse_ber_item(ec.val) {
             if inner.tag == 0x04 || inner.tag == 0x24 {
                 // RFC 5652 §5.2.1 CMS EncapsulatedContentInfo wraps eContent in an OCTET STRING
                 // regardless of eContentType (both DATA and non-DATA types such as szOID_CTL).
@@ -269,7 +269,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
     let mut signers = Vec::new();
     for &elem in &sd_kids[3..] {
         if elem.tag == 0xA0 {
-            if let Some(list) = der_item_children(elem.val) {
+            if let Some(list) = ber_item_children(elem.val) {
                 for ce in list {
                     if ce.tag == 0x30 {
                         certs_der.push(ce.raw.to_vec());
@@ -277,7 +277,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
                 }
             }
         } else if elem.tag == 0x31 {
-            if let Some(si_list) = der_item_children(elem.val) {
+            if let Some(si_list) = ber_item_children(elem.val) {
                 for si in si_list {
                     if si.tag != 0x30 {
                         continue;
@@ -361,18 +361,18 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
 }
 
 pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
-    let (ci, _) = parse_der_item(der)?;
+    let (ci, _) = parse_ber_item(der)?;
     if ci.tag != 0x30 {
         return None;
     }
-    let ci_kids = der_item_children(ci.val)?;
+    let ci_kids = ber_item_children(ci.val)?;
     if ci_kids.is_empty() || ci_kids[0].tag != 0x06 {
         return None;
     }
     let ctype = ci_kids[0].val;
     if ctype == OID_DATA {
         let (bare, data) = if let Some(c) = ci_kids.get(1).filter(|e| e.tag == 0xA0) {
-            let (inner, _) = parse_der_item(c.val)?;
+            let (inner, _) = parse_ber_item(c.val)?;
             (inner.raw.to_vec(), extract_octet_string(inner)?)
         } else {
             (Vec::new(), Vec::new())
@@ -412,7 +412,7 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
     if ctype != OID_SIGNED_DATA || ci_kids.len() < 2 || ci_kids[1].tag != 0xA0 {
         return None;
     }
-    let (sd_seq, _) = parse_der_item(ci_kids[1].val)?;
+    let (sd_seq, _) = parse_ber_item(ci_kids[1].val)?;
     parse_cms_signed_data(sd_seq, ci.raw)
 }
 
@@ -428,11 +428,11 @@ fn parse_cms_message(der: &[u8], expected_msg_type: u32) -> Result<CmsSignedMess
     }
     match expected_msg_type {
         CMSG_SIGNED => {
-            let (sd_seq, _) = parse_der_item(der).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            let (sd_seq, _) = parse_ber_item(der).ok_or(CRYPT_E_ASN1_BADTAG)?;
             parse_cms_signed_data(sd_seq, sd_seq.raw).ok_or(CRYPT_E_ASN1_BADTAG)
         }
         CMSG_DATA => {
-            let data = if let Some((item, _)) = parse_der_item(der) {
+            let data = if let Some((item, _)) = parse_ber_item(der) {
                 if item.tag == 0x04 || item.tag == 0x24 {
                     extract_octet_string(item).unwrap_or_else(|| der.to_vec())
                 } else {

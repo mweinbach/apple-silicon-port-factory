@@ -109,6 +109,91 @@ pub(super) fn der_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
     Some(out)
 }
 
+const MAX_BER_DEPTH: usize = 32;
+const MAX_BER_ITEMS: usize = 4096;
+
+/// Parse a single BER TLV item, accepting both definite lengths and indefinite-length constructed
+/// containers (`0x80` length terminated by EOC `0x00 0x00`), with hard depth and item-count caps.
+pub(super) fn parse_ber_item(buf: &[u8]) -> Option<(DerItem<'_>, &[u8])> {
+    let mut budget = MAX_BER_ITEMS;
+    parse_ber_item_inner(buf, 0, &mut budget)
+}
+
+fn parse_ber_item_inner<'a>(
+    buf: &'a [u8],
+    depth: usize,
+    budget: &mut usize,
+) -> Option<(DerItem<'a>, &'a [u8])> {
+    if depth > MAX_BER_DEPTH || *budget == 0 || buf.len() < 2 {
+        return None;
+    }
+    *budget -= 1;
+    let tag = buf[0];
+    let lb = buf[1];
+    if lb == 0x80 {
+        // X.690 §8.1.3.6: indefinite length is valid only for constructed encodings (bit 5 set).
+        if (tag & 0x20) == 0 {
+            return None;
+        }
+        let mut cur = &buf[2..];
+        loop {
+            if cur.len() < 2 {
+                return None;
+            }
+            if cur[0] == 0x00 && cur[1] == 0x00 {
+                let val_len = cur.as_ptr() as usize - buf[2..].as_ptr() as usize;
+                let end = 2 + val_len + 2;
+                return Some((
+                    DerItem {
+                        tag,
+                        raw: &buf[..end],
+                        val: &buf[2..2 + val_len],
+                    },
+                    &buf[end..],
+                ));
+            }
+            let (_, next) = parse_ber_item_inner(cur, depth + 1, budget)?;
+            cur = next;
+        }
+    }
+    let (hdr, len) = if (lb & 0x80) == 0 {
+        (2usize, lb as usize)
+    } else {
+        let n = (lb & 0x7F) as usize;
+        if n == 0 || n > 4 || buf.len() < 2 + n {
+            return None;
+        }
+        let mut v = 0usize;
+        for &b in &buf[2..2 + n] {
+            v = (v << 8) | (b as usize);
+        }
+        (2 + n, v)
+    };
+    let end = hdr.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some((
+        DerItem {
+            tag,
+            raw: &buf[..end],
+            val: &buf[hdr..end],
+        },
+        &buf[end..],
+    ))
+}
+
+pub(super) fn ber_item_children(mut buf: &[u8]) -> Option<Vec<DerItem<'_>>> {
+    let mut out = Vec::new();
+    let mut budget = MAX_BER_ITEMS;
+    while !buf.is_empty() {
+        let (it, rest) = parse_ber_item_inner(buf, 0, &mut budget)?;
+        out.push(it);
+        buf = rest;
+    }
+    Some(out)
+}
+
 pub(super) struct CertDerParts<'a> {
     pub(super) tbs_raw: &'a [u8],
     pub(super) sig_alg_inner: &'a [u8],
