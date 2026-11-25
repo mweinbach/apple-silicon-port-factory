@@ -7149,17 +7149,30 @@ fn sys_state_ops_aot_image_and_shifted_base_reload() {
     a.movss(xmm2, dword_ptr(r8 + 44)).unwrap(); // 1.0f
     a.divss(xmm2, dword_ptr(r8 + 48)).unwrap(); // 1.0 / 3.0 under RD -> 0x3eaa_aaaa
     a.movss(dword_ptr(r8 + 52), xmm2).unwrap();
-    // 5. XSAVE64 / XSAVEC64 / FXSAVE64 -> clobber -> XRSTOR64
+    // 5. All 12 XSTATE ops in the built .aot image:
+    //    XSAVE/XSAVE64/XSAVEOPT/XSAVEOPT64/XSAVEC/XSAVEC64/FXSAVE/FXSAVE64 -> clobber ->
+    //    FXRSTOR/FXRSTOR64/XRSTOR/XRSTOR64
     a.mov(eax, 7).unwrap();
     a.xor(edx, edx).unwrap();
+    a.xsave(ptr(r8 + 128)).unwrap();
+    a.xsaveopt(ptr(r8 + 128)).unwrap();
+    a.xsaveopt64(ptr(r8 + 128)).unwrap();
     a.xsave64(ptr(r8 + 128)).unwrap();
+    a.xsavec(ptr(r8 + 1024)).unwrap();
     a.xsavec64(ptr(r8 + 1024)).unwrap();
+    a.fxsave(ptr(r8 + 1920)).unwrap();
     a.fxsave64(ptr(r8 + 1920)).unwrap();
     a.vzeroall().unwrap();
     a.vldmxcsr(dword_ptr(r8 + 40)).unwrap(); // default 0x1f80
     a.vstmxcsr(dword_ptr(r8 + 56)).unwrap();
+    a.fxrstor(ptr(r8 + 1920)).unwrap();
+    a.vzeroall().unwrap();
+    a.fxrstor64(ptr(r8 + 1920)).unwrap();
+    a.vzeroall().unwrap();
     a.mov(eax, 7).unwrap();
     a.xor(edx, edx).unwrap();
+    a.xrstor(ptr(r8 + 128)).unwrap();
+    a.vzeroall().unwrap();
     a.xrstor64(ptr(r8 + 1024)).unwrap();
     a.vmovdqu(ymmword_ptr(r8 + 2432), ymm0).unwrap();
     a.vmovdqu(ymmword_ptr(r8 + 2464), ymm15).unwrap();

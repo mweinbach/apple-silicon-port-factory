@@ -396,7 +396,10 @@ pub(super) fn op_flags(op: &FastOp) -> (u8, u8) {
         K_SYS_MISC => match op.x & 0x3F {
             0 => (FC | FZ | FS | FP, 0),
             1 => (0, FC | FZ | FS | FP),
-            2 => (FALL, 0),
+            // `pushf` and potentially faulting/exiting system-state ops (`stmxcsr`, `ldmxcsr`,
+            // `fnstcw`, `fldcw`, `xgetbv`, `fxsave*`/`xsave*`/`*rstor*`) can observe full guest
+            // RFLAGS (stack push, `#GP`/`#PF` VEH dispatch, or non-AFP soft-flush exit).
+            2 | 4 | 5 | 7 | 14 | 15 | 16 => (FALL, 0),
             3 => (0, FALL),
             _ => (0, 0),
         },
@@ -718,7 +721,7 @@ impl Tr<'_> {
             let mode = op.w & 3;
             let reads_ymm = match op.kind {
                 K_YMM_LANE | K_INSN | K_VMASKMOV => true,
-                K_SYS_MISC if (op.x & 0x3F) == 16 => true,
+                K_SYS_MISC if matches!(op.x & 0x3F, 4 | 5 | 7 | 14 | 15 | 16) => true,
                 K_VST => (op.w >> 4) >= 5,
                 K_MOVMSK => (op.x & 1) != 0,
                 K_VCVT_PD => mode == VM_V256 || (op.w & 4) != 0,

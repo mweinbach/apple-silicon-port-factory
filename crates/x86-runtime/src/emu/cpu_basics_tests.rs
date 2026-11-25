@@ -1823,17 +1823,44 @@ fn xstate_sdm_layout_and_full_ymm_roundtrip_across_tiers() {
     }
     a.ldmxcsr(dword_ptr(r8 + 512)).unwrap();
     a.fldcw(word_ptr(r8 + 520)).unwrap();
-    // Save via XSAVE64, XSAVEC64, FXSAVE64
+    // Save via XSAVE64, XSAVEC64, FXSAVE64, plus non-64 and XSAVEOPT variants
     a.mov(eax, 7).unwrap();
     a.xor(edx, edx).unwrap();
     a.xsave64(ptr(r8 + 576)).unwrap();
     a.xsavec64(ptr(r8 + 1408)).unwrap();
     a.fxsave64(ptr(r8 + 2240)).unwrap();
+    a.xsave(ptr(r8 + 3840)).unwrap();
+    a.xsaveopt(ptr(r8 + 4672)).unwrap();
+    a.xsaveopt64(ptr(r8 + 5504)).unwrap();
+    a.xsavec(ptr(r8 + 6336)).unwrap();
+    a.fxsave(ptr(r8 + 7168)).unwrap();
     // Clobber all 16 YMM regs, MXCSR, and FCW
     a.vzeroall().unwrap();
     a.ldmxcsr(dword_ptr(r8 + 516)).unwrap();
     a.fldcw(word_ptr(r8 + 522)).unwrap();
-    // Restore all 16 YMM regs + MXCSR + FCW from XSAVEC64 compacted image
+    // Round-trip FXSAVE -> FXRSTOR and FXSAVE64 -> FXRSTOR64 (restores XMM0..15, MXCSR, FCW)
+    a.fxrstor(ptr(r8 + 7168)).unwrap();
+    a.vmovdqu(xmmword_ptr(r8 + 7680), xmm0).unwrap();
+    a.vmovdqu(xmmword_ptr(r8 + 7696), xmm15).unwrap();
+    a.vzeroall().unwrap();
+    a.ldmxcsr(dword_ptr(r8 + 516)).unwrap();
+    a.fldcw(word_ptr(r8 + 522)).unwrap();
+    a.fxrstor64(ptr(r8 + 2240)).unwrap();
+    a.vmovdqu(xmmword_ptr(r8 + 7712), xmm0).unwrap();
+    a.vmovdqu(xmmword_ptr(r8 + 7728), xmm15).unwrap();
+    // Round-trip XSAVEOPT64 -> XRSTOR (32-bit operand-size variant)
+    a.vzeroall().unwrap();
+    a.ldmxcsr(dword_ptr(r8 + 516)).unwrap();
+    a.fldcw(word_ptr(r8 + 522)).unwrap();
+    a.mov(eax, 7).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.xrstor(ptr(r8 + 5504)).unwrap();
+    a.vmovdqu(ymmword_ptr(r8 + 7744), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(r8 + 7776), ymm15).unwrap();
+    // Clobber and restore all 16 YMM regs + MXCSR + FCW from XSAVEC64 compacted image via XRSTOR64
+    a.vzeroall().unwrap();
+    a.ldmxcsr(dword_ptr(r8 + 516)).unwrap();
+    a.fldcw(word_ptr(r8 + 522)).unwrap();
     a.mov(eax, 7).unwrap();
     a.xor(edx, edx).unwrap();
     a.xrstor64(ptr(r8 + 1408)).unwrap();
@@ -1853,7 +1880,7 @@ fn xstate_sdm_layout_and_full_ymm_roundtrip_across_tiers() {
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
 
-    let mut init = vec![0u8; 3840];
+    let mut init = vec![0u8; 7872];
     for r in 0..16 {
         for b in 0..32 {
             init[r * 32 + b] = ((r * 37 + b * 13 + 0x11) & 0xff) as u8;
@@ -1865,8 +1892,17 @@ fn xstate_sdm_layout_and_full_ymm_roundtrip_across_tiers() {
     init[522..524].copy_from_slice(&0x037fu16.to_le_bytes());
 
     run_tiers(&code, &init, |out| {
-        // Check Intel SDM layout for XSAVE64 [576..1408), XSAVEC64 [1408..2240), FXSAVE64 [2240..2752)
-        for &(base, kind) in &[(576usize, "xsave64"), (1408, "xsavec64"), (2240, "fxsave64")] {
+        // Check Intel SDM layout for all 8 save variants (XSAVE/64, XSAVEOPT/64, XSAVEC/64, FXSAVE/64)
+        for &(base, kind, is_legacy, is_compact) in &[
+            (576usize, "xsave64", false, false),
+            (1408, "xsavec64", false, true),
+            (2240, "fxsave64", true, false),
+            (3840, "xsave", false, false),
+            (4672, "xsaveopt", false, false),
+            (5504, "xsaveopt64", false, false),
+            (6336, "xsavec", false, true),
+            (7168, "fxsave", true, false),
+        ] {
             assert_eq!(u16::from_le_bytes(out[base..base + 2].try_into().unwrap()), 0x027f, "{kind} FCW");
             assert_eq!(u32::from_le_bytes(out[base + 24..base + 28].try_into().unwrap()), 0x9fc0, "{kind} MXCSR");
             assert_eq!(
@@ -1878,13 +1914,13 @@ fn xstate_sdm_layout_and_full_ymm_roundtrip_across_tiers() {
                 let xmm_off = base + 160 + r * 16;
                 assert_eq!(&out[xmm_off..xmm_off + 16], &init[r * 32..r * 32 + 16], "{kind} XMM{r}");
             }
-            if kind != "fxsave64" {
+            if !is_legacy {
                 let xstate_bv = u64::from_le_bytes(out[base + 512..base + 520].try_into().unwrap());
                 let xcomp_bv = u64::from_le_bytes(out[base + 520..base + 528].try_into().unwrap());
                 assert_eq!(xstate_bv, 7, "{kind} XSTATE_BV");
                 assert_eq!(
                     xcomp_bv,
-                    if kind == "xsavec64" { (1u64 << 63) | 7 } else { 0 },
+                    if is_compact { (1u64 << 63) | 7 } else { 0 },
                     "{kind} XCOMP_BV"
                 );
                 for r in 0..16 {
@@ -1893,6 +1929,13 @@ fn xstate_sdm_layout_and_full_ymm_roundtrip_across_tiers() {
                 }
             }
         }
+        // Check FXRSTOR, FXRSTOR64, and XRSTOR restorations
+        assert_eq!(&out[7680..7696], &init[0..16], "fxrstor XMM0");
+        assert_eq!(&out[7696..7712], &init[15 * 32..15 * 32 + 16], "fxrstor XMM15");
+        assert_eq!(&out[7712..7728], &init[0..16], "fxrstor64 XMM0");
+        assert_eq!(&out[7728..7744], &init[15 * 32..15 * 32 + 16], "fxrstor64 XMM15");
+        assert_eq!(&out[7744..7776], &init[0..32], "xrstor YMM0");
+        assert_eq!(&out[7776..7808], &init[15 * 32..15 * 32 + 32], "xrstor YMM15");
         // Full 16-register YMM round-trip
         assert_eq!(&out[2752..3264], &init[..512], "all 16 YMM regs must survive xsavec64->xrstor64");
         assert_eq!(u32::from_le_bytes(out[3776..3780].try_into().unwrap()), 0x9fc0);
@@ -1949,6 +1992,88 @@ fn ldmxcsr_and_xstate_misalign_gp_resume_across_tiers() {
         assert_eq!(u32::from_le_bytes(out[64..68].try_into().unwrap()), 3, "all 3 #GP faults must fire");
         assert_eq!(u32::from_le_bytes(out[68..72].try_into().unwrap()), 0x1f80, "faulting ldmxcsr must not alter MXCSR");
     });
+    unsafe {
+        win32_rt::unwind::RemoveVectoredExceptionHandler(handler);
+    }
+}
+
+#[test]
+fn sys_state_fault_preserves_flags_and_ymm_before_later_kill_and_vex128() {
+    use std::ffi::c_void;
+    use win32_rt::unwind::{Context, ExceptionRecord, STATUS_ACCESS_VIOLATION};
+    const TAG: u64 = 0x51A7_F1A6;
+    unsafe extern "win64" fn capture_and_skip(p: *mut [*mut c_void; 2]) -> i32 {
+        let record = &*((*p)[0] as *const ExceptionRecord);
+        let ctx = &mut *((*p)[1] as *mut Context);
+        if record.code != STATUS_ACCESS_VIOLATION || ctx.gpr[10] != TAG {
+            return 0;
+        }
+        assert_eq!(record.information[1], u64::MAX, "expected #GP(0) fault");
+        // Store the VEH-observed RFLAGS into r9 and jump straight to the epilogue in r11
+        // (skipping the subsequent `vxorps xmm0, xmm0, xmm0` and `xor ebx, ebx`).
+        ctx.gpr[9] = ctx.eflags as u64;
+        ctx.rip = ctx.gpr[11];
+        -1
+    }
+
+    let handler = unsafe { win32_rt::unwind::AddVectoredExceptionHandler(1, capture_and_skip) };
+    let mut init = vec![0u8; 160];
+    // [0..32): non-zero YMM0 pattern (both low 128 and high 128 non-zero)
+    for (i, b) in init[0..32].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(11).wrapping_add(5);
+    }
+    // [32..36): invalid MXCSR (reserved bit 16 set)
+    init[32..36].copy_from_slice(&0x0001_1f80u32.to_le_bytes());
+
+    for case in 0..3 {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut epilogue = a.create_label();
+        a.push(rbx).unwrap();
+        a.mov(r8, rcx).unwrap();
+        a.mov(r10, TAG as i64).unwrap();
+        a.xor(r9d, r9d).unwrap();
+        a.lea(r11, ptr(epilogue)).unwrap();
+        // Load non-zero YMM0 before entering the faulting block so block_v128_mask sees dirty ymm0.
+        a.vmovdqu(ymm0, ymmword_ptr(r8)).unwrap();
+        let mut blk = a.create_label();
+        a.jmp(blk).unwrap();
+        a.set_label(&mut blk).unwrap();
+        // Set known RFLAGS via `cmp` (`1 - 2` -> CF=1, PF=1, ZF=0, SF=1, OF=0 => 0x85) right
+        // before a faulting sys-state op, followed in the SAME basic block by `vxorps xmm0`
+        // (VEX.128 clear of ymm0_hi) and `xor ebx, ebx` (kills all flags).
+        a.mov(eax, 1).unwrap();
+        a.mov(edx, 2).unwrap();
+        a.mov(ecx, 1).unwrap();
+        a.cmp(eax, edx).unwrap();
+        match case {
+            0 => a.xgetbv().unwrap(),                   // #GP(0): ecx == 1
+            1 => a.ldmxcsr(dword_ptr(r8 + 32)).unwrap(), // #GP(0): reserved bit 16 set
+            _ => a.xsave64(ptr(r8 + 32)).unwrap(),       // #GP(0): misaligned mod 64
+        }
+        a.vxorps(xmm0, xmm0, xmm0).unwrap();
+        a.xor(ebx, ebx).unwrap();
+        a.set_label(&mut epilogue).unwrap();
+        a.mov(qword_ptr(r8 + 64), r9).unwrap();
+        a.vmovdqu(ymmword_ptr(r8 + 96), ymm0).unwrap();
+        a.vzeroupper().unwrap();
+        a.pop(rbx).unwrap();
+        a.ret().unwrap();
+        let code = a.assemble(0).unwrap();
+
+        run_tiers(&code, &init, |out| {
+            let rflags = u64::from_le_bytes(out[64..72].try_into().unwrap());
+            assert_eq!(
+                rflags & 0x8C5,
+                0x85,
+                "case {case}: VEH must observe cmp RFLAGS before faulting sys-state op (got {rflags:#x})"
+            );
+            assert_eq!(
+                &out[96..128],
+                &init[0..32],
+                "case {case}: YMM0 upper half must not be cleared before faulting sys-state op"
+            );
+        });
+    }
     unsafe {
         win32_rt::unwind::RemoveVectoredExceptionHandler(handler);
     }
