@@ -1198,8 +1198,23 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
 // RFC 7292 PKCS#12 / PFXImportCertStore (CommonCrypto PBES1 + PBES2 + HMAC)
 // ---------------------------------------------------------------------------
 
+/// Upper bound on PFX KDF iteration counts across MacData, PBES1, and PBES2.
+/// Comfortably above OWASP PBKDF2 recommendations (600,000) while rejecting
+/// attacker-crafted 32-bit counts (e.g. `0xffffffff`) before entering any KDF loop.
+pub(super) const MAX_PFX_KDF_ITERATIONS: u32 = 2_000_000;
+
 /// RFC 7292 Appendix B.2 PKCS#12 key/IV/MAC derivation.
-fn pkcs12_kdf(digest: Digest, pass_bmp: &[u8], salt: &[u8], iters: u32, id: u8, out_len: usize) -> Vec<u8> {
+fn pkcs12_kdf(
+    digest: Digest,
+    pass_bmp: &[u8],
+    salt: &[u8],
+    iters: u32,
+    id: u8,
+    out_len: usize,
+) -> Option<Vec<u8>> {
+    if iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
+        return None;
+    }
     let v = match digest {
         Digest::Sha384 | Digest::Sha512 => 128usize,
         _ => 64usize,
@@ -1230,7 +1245,7 @@ fn pkcs12_kdf(digest: Digest, pass_bmp: &[u8], salt: &[u8], iters: u32, id: u8, 
     let c = (out_len + u - 1) / u;
     for block_idx in 0..c {
         let mut a = digest.hash_slices(&[&d, &i_buf]);
-        for _ in 1..iters.max(1) {
+        for _ in 1..iters {
             a = digest.hash(&a);
         }
         derived.extend_from_slice(&a);
@@ -1253,7 +1268,7 @@ fn pkcs12_kdf(digest: Digest, pass_bmp: &[u8], salt: &[u8], iters: u32, id: u8, 
         }
     }
     derived.truncate(out_len);
-    derived
+    Some(derived)
 }
 
 fn password_to_bmp_string(pass: Option<&str>) -> Vec<u8> {
@@ -1330,14 +1345,17 @@ unsafe fn decrypt_pbe(
         }
         let salt = pk[0].val;
         let iters = parse_der_u32_val(pk[1].val)?;
+        if iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
+            return None;
+        }
         let (cc_alg, key_len) = match alg_oid {
             OID_PBE_SHA1_3DES_CBC => (K_CC_ALGORITHM_3DES, 24usize),
             OID_PBE_SHA1_RC2_128_CBC => (K_CC_ALGORITHM_RC2, 16usize),
             OID_PBE_SHA1_RC2_40_CBC => (K_CC_ALGORITHM_RC2, 5usize),
             _ => unreachable!(),
         };
-        let key = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 1, key_len);
-        let iv = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 2, 8);
+        let key = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 1, key_len)?;
+        let iv = pkcs12_kdf(Digest::Sha1, pass_bmp, salt, iters, 2, 8)?;
         return cc_decrypt_cbc(cc_alg, &key, &iv, ciphertext);
     }
 
@@ -1401,7 +1419,7 @@ unsafe fn decrypt_pbe(
             return None;
         }
         let key_len = explicit_key_len.unwrap_or(default_key_len);
-        if key_len != default_key_len || iters == 0 {
+        if key_len != default_key_len || iters == 0 || iters > MAX_PFX_KDF_ITERATIONS {
             return None;
         }
         let mut key = vec![0u8; key_len];
@@ -1737,14 +1755,25 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         };
         let expected_mac = di_kids[1].val;
         let salt = mk[1].val;
-        let iters = mk
-            .get(2)
-            .filter(|e| e.tag == 0x02)
-            .and_then(|e| parse_der_u32_val(e.val))
-            .unwrap_or(1);
+        let iters = match mk.get(2) {
+            None => 1u32,
+            Some(e) if e.tag == 0x02 => match parse_der_u32_val(e.val) {
+                Some(n) if (1..=MAX_PFX_KDF_ITERATIONS).contains(&n) => n,
+                _ => {
+                    crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+                    return std::ptr::null_mut();
+                }
+            },
+            Some(_) => {
+                crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+                return std::ptr::null_mut();
+            }
+        };
 
         let check_mac = |bmp: &[u8]| -> bool {
-            let mac_key = pkcs12_kdf(mac_digest, bmp, salt, iters, 3, mac_digest.len());
+            let Some(mac_key) = pkcs12_kdf(mac_digest, bmp, salt, iters, 3, mac_digest.len()) else {
+                return false;
+            };
             let computed = mac_digest.hmac(&mac_key, &auth_safe_bytes);
             computed.as_slice() == expected_mac
         };

@@ -4569,3 +4569,142 @@ fn macos_trust_store_and_extended_chain_policies() {
         CertCloseStore(st, 0);
     }
 }
+
+#[test]
+fn pfx_rejects_unbounded_kdf_iteration_counts() {
+    fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 0x80 {
+            out.push(body.len() as u8);
+        } else if body.len() < 0x100 {
+            out.push(0x81);
+            out.push(body.len() as u8);
+        } else {
+            out.push(0x82);
+            out.push((body.len() >> 8) as u8);
+            out.push((body.len() & 0xFF) as u8);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    fn der_u32(val: u32) -> Vec<u8> {
+        let bytes = val.to_be_bytes();
+        let first = bytes.iter().position(|&b| b != 0).unwrap_or(3);
+        let mut body = Vec::new();
+        if (bytes[first] & 0x80) != 0 {
+            body.push(0);
+        }
+        body.extend_from_slice(&bytes[first..]);
+        der_tlv(0x02, &body)
+    }
+
+    // OIDs in DER content bytes
+    let oid_data = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01]);
+    let oid_enc_data = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x06]);
+    let oid_sha1 = der_tlv(0x06, &[0x2B, 0x0E, 0x03, 0x02, 0x1A]);
+    let oid_pbe_sha1_3des = der_tlv(
+        0x06,
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x01, 0x03],
+    );
+    let oid_pbes2 = der_tlv(
+        0x06,
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D],
+    );
+    let oid_pbkdf2 = der_tlv(
+        0x06,
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0C],
+    );
+    let oid_aes128_cbc = der_tlv(
+        0x06,
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x02],
+    );
+
+    let build_pfx = |auth_safe_bytes: &[u8], mac_data: Option<&[u8]>| -> Vec<u8> {
+        let mut auth_safe_ci = Vec::new();
+        auth_safe_ci.extend_from_slice(&oid_data);
+        auth_safe_ci.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x04, auth_safe_bytes)));
+        let mut pfx_body = Vec::new();
+        pfx_body.extend_from_slice(&der_u32(3));
+        pfx_body.extend_from_slice(&der_tlv(0x30, &auth_safe_ci));
+        if let Some(m) = mac_data {
+            pfx_body.extend_from_slice(m);
+        }
+        der_tlv(0x30, &pfx_body)
+    };
+
+    let build_enc_auth_safe = |alg_id: &[u8]| -> Vec<u8> {
+        let mut eci = Vec::new();
+        eci.extend_from_slice(&oid_data);
+        eci.extend_from_slice(alg_id);
+        eci.extend_from_slice(&der_tlv(0x80, &[0u8; 16]));
+        let mut ed = Vec::new();
+        ed.extend_from_slice(&der_u32(0));
+        ed.extend_from_slice(&der_tlv(0x30, &eci));
+        let mut ci = Vec::new();
+        ci.extend_from_slice(&oid_enc_data);
+        ci.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x30, &ed)));
+        der_tlv(0x30, &der_tlv(0x30, &ci))
+    };
+
+    unsafe {
+        let pw = crate::strings::to_wide_z("pw");
+        let import = |der: &[u8]| -> (*mut c_void, u32) {
+            let blob = CryptDataBlob {
+                cb_data: der.len() as u32,
+                pb_data: der.as_ptr() as *mut u8,
+            };
+            let h = PFXImportCertStore(&blob as *const _ as *const c_void, pw.as_ptr(), 0);
+            (h, crate::teb::last_error())
+        };
+
+        // 1. MacData with 0xffffffff and 0 iterations must be rejected immediately (not spun).
+        for bad_iters in [u32::MAX, super::pkcs::MAX_PFX_KDF_ITERATIONS + 1, 0] {
+            let mut di = Vec::new();
+            di.extend_from_slice(&der_tlv(0x30, &oid_sha1));
+            di.extend_from_slice(&der_tlv(0x04, &[0u8; 20]));
+            let mut mac = Vec::new();
+            mac.extend_from_slice(&der_tlv(0x30, &di));
+            mac.extend_from_slice(&der_tlv(0x04, &[1u8; 8]));
+            mac.extend_from_slice(&der_u32(bad_iters));
+            let pfx = build_pfx(&der_tlv(0x30, &[]), Some(&der_tlv(0x30, &mac)));
+            let (h, le) = import(&pfx);
+            assert!(h.is_null(), "MacData iters={bad_iters} must fail");
+            assert_eq!(le, err::ERROR_INVALID_DATA);
+        }
+
+        // 2. PBES1 with 0xffffffff / MAX+1 / 0 iterations must fail immediately.
+        for bad_iters in [u32::MAX, super::pkcs::MAX_PFX_KDF_ITERATIONS + 1, 0] {
+            let mut pbe_params = Vec::new();
+            pbe_params.extend_from_slice(&der_tlv(0x04, &[2u8; 8]));
+            pbe_params.extend_from_slice(&der_u32(bad_iters));
+            let mut alg = Vec::new();
+            alg.extend_from_slice(&oid_pbe_sha1_3des);
+            alg.extend_from_slice(&der_tlv(0x30, &pbe_params));
+            let pfx = build_pfx(&build_enc_auth_safe(&der_tlv(0x30, &alg)), None);
+            let (h, _) = import(&pfx);
+            assert!(h.is_null(), "PBES1 iters={bad_iters} must fail");
+        }
+
+        // 3. PBES2 with 0xffffffff / MAX+1 / 0 iterations must fail immediately.
+        for bad_iters in [u32::MAX, super::pkcs::MAX_PFX_KDF_ITERATIONS + 1, 0] {
+            let mut pbkdf2_params = Vec::new();
+            pbkdf2_params.extend_from_slice(&der_tlv(0x04, &[3u8; 8]));
+            pbkdf2_params.extend_from_slice(&der_u32(bad_iters));
+            let mut kdf_alg = Vec::new();
+            kdf_alg.extend_from_slice(&oid_pbkdf2);
+            kdf_alg.extend_from_slice(&der_tlv(0x30, &pbkdf2_params));
+            let mut enc_alg = Vec::new();
+            enc_alg.extend_from_slice(&oid_aes128_cbc);
+            enc_alg.extend_from_slice(&der_tlv(0x04, &[4u8; 16]));
+            let mut pbes2_params = Vec::new();
+            pbes2_params.extend_from_slice(&der_tlv(0x30, &kdf_alg));
+            pbes2_params.extend_from_slice(&der_tlv(0x30, &enc_alg));
+            let mut alg = Vec::new();
+            alg.extend_from_slice(&oid_pbes2);
+            alg.extend_from_slice(&der_tlv(0x30, &pbes2_params));
+            let pfx = build_pfx(&build_enc_auth_safe(&der_tlv(0x30, &alg)), None);
+            let (h, _) = import(&pfx);
+            assert!(h.is_null(), "PBES2 iters={bad_iters} must fail");
+        }
+    }
+}

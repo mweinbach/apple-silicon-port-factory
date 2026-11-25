@@ -353,9 +353,23 @@ pub fn aot_live_block_count(log_text: &str) -> Option<usize> {
     (total_live > 0).then_some(total_live)
 }
 
-fn build_host_port_runner(workspace_root: &Path) -> Result<PathBuf> {
-    let status = Command::new("cargo")
-        .current_dir(workspace_root)
+fn runner_artifact(messages: &str) -> Option<PathBuf> {
+    messages.lines().find_map(|line| {
+        let msg = crate::json_output::parse_json(line).ok()?;
+        if msg.get("reason")?.as_str()? == "compiler-artifact"
+            && msg.get("target")?.get("name")?.as_str()? == "port-runner"
+        {
+            msg.get("executable")?.as_str().map(PathBuf::from)
+        } else {
+            None
+        }
+    })
+}
+
+/// Build the guest runner and return Cargo's executable path, including on a cache hit.
+pub fn build_host_port_runner(workspace_dir: &Path) -> Result<PathBuf> {
+    let output = Command::new("cargo")
+        .current_dir(workspace_dir)
         .args([
             "build",
             "-p",
@@ -364,20 +378,16 @@ fn build_host_port_runner(workspace_root: &Path) -> Result<PathBuf> {
             "port-runner",
             "--target",
             "aarch64-apple-darwin",
+            "--message-format=json-render-diagnostics",
         ])
-        .status()
+        .stderr(Stdio::inherit())
+        .output()
         .context("building fresh host port-runner via cargo")?;
-    if !status.success() {
-        bail!("failed to build port-runner before benchmarking (cargo exited with {status})");
+    if !output.status.success() {
+        bail!("port-runner build failed ({})", output.status);
     }
-    let bin = workspace_root.join("target/aarch64-apple-darwin/debug/port-runner");
-    if bin.is_file() {
-        return Ok(bin);
-    }
-    bail!(
-        "port-runner binary not found at {} after cargo build",
-        bin.display()
-    )
+    runner_artifact(std::str::from_utf8(&output.stdout)?)
+        .context("Cargo built port-runner without reporting its executable")
 }
 
 pub fn parse_bench_result_line(
@@ -1809,6 +1819,18 @@ int main(void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_path_comes_from_its_executable_artifact() {
+        let other = r#"{"reason":"compiler-artifact","target":{"name":"other"},"executable":"out/other"}"#;
+        let library = r#"{"reason":"compiler-artifact","target":{"name":"port-runner"},"executable":null}"#;
+        let runner = r#"{"reason":"compiler-artifact","target":{"name":"port-runner"},"fresh":true,"executable":"custom target/bin/runner"}"#;
+        assert_eq!(runner_artifact(&[other, library].join("\n")), None);
+        assert_eq!(
+            runner_artifact(&[other, library, runner].join("\n")),
+            Some(PathBuf::from("custom target/bin/runner"))
+        );
+    }
 
     #[test]
     fn parse_bench_result_line_extracts_all_fields() {

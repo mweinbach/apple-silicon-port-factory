@@ -1731,12 +1731,35 @@ fn map_wintrust_revocation_flags(fdw_revocation_checks: u32, dw_prov_flags: u32)
     chain_flags
 }
 
+#[derive(Clone, Copy, Default)]
+struct GenericChainPolicy {
+    p_chain_para: *const c_void,
+    dw_flags: u32,
+    pv_extra_policy_arg: *const c_void,
+    pfn_policy_callback: usize,
+    pv_policy_arg: *mut c_void,
+}
+
+#[repr(C)]
+struct WtdGenericChainPolicySignerInfo {
+    cb_size: u32,
+    _pad0: u32,
+    p_chain_context: *const c_void,
+    dw_signer_type: u32,
+    _pad1: u32,
+    p_msg_signer_info: *const c_void,
+    dw_error: u32,
+    c_counter_signer: u32,
+    rgp_counter_signer: *const *const WtdGenericChainPolicySignerInfo,
+}
+
 unsafe fn verify_pkcs7_signer_chain(
     verified: &VerifiedAuthenticode,
     all_certs_der: &[Vec<u8>],
     policy_oid: usize,
     policy_extra: *const c_void,
     chain_flags: u32,
+    generic_chain: Option<GenericChainPolicy>,
 ) -> i32 {
     let Some(leaf) = verified.certs.first() else {
         return TRUST_E_NOSIGNATURE;
@@ -1771,6 +1794,7 @@ unsafe fn verify_pkcs7_signer_chain(
         policy_oid,
         policy_extra,
         chain_flags,
+        generic_chain,
     );
     if !extra_store.is_null() {
         super::crypt32::CertCloseStore(extra_store, 0);
@@ -2015,6 +2039,7 @@ unsafe fn verify_cert_via_chain_policy(
     policy_oid: usize,
     policy_extra: *const c_void,
     chain_flags: u32,
+    generic_chain: Option<GenericChainPolicy>,
 ) -> i32 {
     if cert_ctx.is_null() {
         return TRUST_E_NOSIGNATURE;
@@ -2041,14 +2066,16 @@ unsafe fn verify_cert_via_chain_policy(
         std::ptr::null_mut()
     };
 
+    let p_chain_para = generic_chain.map_or(std::ptr::null(), |g| g.p_chain_para);
+    let effective_chain_flags = chain_flags | generic_chain.map_or(0, |g| g.dw_flags);
     let mut chain_ctx: *mut c_void = std::ptr::null_mut();
     let ok = super::crypt32::CertGetCertificateChain(
         std::ptr::null_mut(),
         cert_ctx,
         p_time,
         extra_store,
-        std::ptr::null(),
-        chain_flags,
+        p_chain_para,
+        effective_chain_flags,
         std::ptr::null_mut(),
         &mut chain_ctx,
     );
@@ -2057,6 +2084,39 @@ unsafe fn verify_cert_via_chain_policy(
     }
     if ok == 0 || chain_ctx.is_null() {
         return CERT_E_CHAINING;
+    }
+
+    // Per MSDN WINTRUST_ACTION_GENERIC_CHAIN_VERIFY / WTD_GENERIC_CHAIN_POLICY_DATA:
+    // if the caller supplied a custom final-policy callback, invoke it with the built signer
+    // chain context and return its HRESULT instead of falling back to CERT_CHAIN_POLICY_BASE.
+    if let Some(gc) = generic_chain {
+        if gc.pfn_policy_callback != 0 {
+            let signer_info = WtdGenericChainPolicySignerInfo {
+                cb_size: std::mem::size_of::<WtdGenericChainPolicySignerInfo>() as u32,
+                _pad0: 0,
+                p_chain_context: chain_ctx as *const c_void,
+                dw_signer_type: 0,
+                _pad1: 0,
+                p_msg_signer_info: std::ptr::null(),
+                dw_error: 0,
+                c_counter_signer: 0,
+                rgp_counter_signer: std::ptr::null(),
+            };
+            let rgp_signer = [&signer_info as *const WtdGenericChainPolicySignerInfo];
+            let cb_rc = crate::call_guest8(
+                gc.pfn_policy_callback,
+                0,
+                0,
+                0,
+                1,
+                rgp_signer.as_ptr() as u64,
+                gc.pv_policy_arg as u64,
+                0,
+                0,
+            ) as i32;
+            super::crypt32::CertFreeCertificateChain(chain_ctx);
+            return cb_rc;
+        }
     }
 
     #[repr(C)]
@@ -2073,12 +2133,17 @@ unsafe fn verify_cert_via_chain_policy(
         l_element_index: i32,
         pv_extra: *mut c_void,
     }
+    let effective_policy_extra = if !policy_extra.is_null() {
+        policy_extra
+    } else {
+        generic_chain.map_or(std::ptr::null(), |g| g.pv_extra_policy_arg)
+    };
     let policy_para = PolicyPara {
         cb_size: std::mem::size_of::<PolicyPara>() as u32,
         dw_flags: 0,
-        pv_extra_policy_para: policy_extra,
+        pv_extra_policy_para: effective_policy_extra,
     };
-    let p_para = if policy_extra.is_null() {
+    let p_para = if effective_policy_extra.is_null() {
         std::ptr::null()
     } else {
         &policy_para as *const PolicyPara as *const c_void
@@ -2163,6 +2228,26 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
     } else {
         2 // CERT_CHAIN_POLICY_AUTHENTICODE
     };
+    let generic_chain: Option<GenericChainPolicy> =
+        if guid == WINTRUST_ACTION_GENERIC_CHAIN_VERIFY && !p_policy_callback_data.is_null() {
+            // WTD_GENERIC_CHAIN_POLICY_DATA (Win64, 0x30 bytes):
+            //   cbSize @ +0x00, pChainPara @ +0x08, dwFlags @ +0x10,
+            //   pvExtraPolicyArg @ +0x18, pfnPolicyCallback @ +0x20, pvPolicyArg @ +0x28
+            let p = p_policy_callback_data as *const u8;
+            let cb_gc = std::ptr::read_unaligned(p as *const u32);
+            if cb_gc < 0x30 {
+                return 0x8007_0057u32 as i32; // E_INVALIDARG
+            }
+            Some(GenericChainPolicy {
+                p_chain_para: std::ptr::read_unaligned(p.add(0x08) as *const *const c_void),
+                dw_flags: std::ptr::read_unaligned(p.add(0x10) as *const u32),
+                pv_extra_policy_arg: std::ptr::read_unaligned(p.add(0x18) as *const *const c_void),
+                pfn_policy_callback: std::ptr::read_unaligned(p.add(0x20) as *const usize),
+                pv_policy_arg: std::ptr::read_unaligned(p.add(0x28) as *const *mut c_void),
+            })
+        } else {
+            None
+        };
     let policy_extra: *const c_void = if guid == HTTPSPROV_ACTION && !p_policy_callback_data.is_null() {
         // Validate HTTPSPolicyCallbackData / SSL_EXTRA_CERT_CHAIN_POLICY_PARA (24B on Win64):
         // cbStruct @ +0x00, dwAuthType @ +0x04 (1=CLIENT, 2=SERVER), fdwChecks @ +0x08, pwszServerName @ +0x10
@@ -2235,6 +2320,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                         chain_policy_oid,
                         policy_extra,
                         chain_flags,
+                        generic_chain,
                     );
                     if state_action == WTD_STATEACTION_VERIFY {
                         let h = alloc_provider_state(verified, data);
@@ -2347,6 +2433,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 chain_policy_oid,
                 policy_extra,
                 chain_flags,
+                generic_chain,
             );
             if state_action == WTD_STATEACTION_VERIFY {
                 let h = alloc_provider_state(p7.verified, data);
@@ -2383,6 +2470,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                             chain_policy_oid,
                             policy_extra,
                             chain_flags,
+                            generic_chain,
                         );
                         if state_action == WTD_STATEACTION_VERIFY {
                             let h = alloc_provider_state(p7.verified, data);
@@ -2405,6 +2493,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 chain_policy_oid,
                                 policy_extra,
                                 chain_flags,
+                                generic_chain,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(verified, data);
@@ -2423,6 +2512,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                                 chain_policy_oid,
                                 policy_extra,
                                 chain_flags,
+                                generic_chain,
                             );
                             if state_action == WTD_STATEACTION_VERIFY {
                                 let h = alloc_provider_state(p7.verified, data);
@@ -2493,6 +2583,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 chain_policy_oid,
                 policy_extra,
                 chain_flags,
+                generic_chain,
             );
             super::crypt32::CertFreeCertificateContext(found_cert);
             rc
@@ -2528,6 +2619,7 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 chain_policy_oid,
                 policy_extra,
                 chain_flags,
+                generic_chain,
             )
         }
         other => {
@@ -2950,6 +3042,98 @@ mod tests {
                     wtd.as_mut_ptr() as *mut c_void,
                 ),
                 ERROR_SUCCESS,
+            );
+
+            // WINTRUST_ACTION_GENERIC_CHAIN_VERIFY with WTD_GENERIC_CHAIN_POLICY_DATA MUST invoke
+            // pfnPolicyCallback with the built signer chain and return its HRESULT (rather than
+            // bypassing it with CERT_CHAIN_POLICY_BASE).
+            struct GenericPolicyCtx {
+                called: usize,
+                saw_chain: bool,
+                return_hr: i32,
+            }
+            unsafe extern "C" fn test_generic_chain_policy_cb(
+                _prov_data: u64,
+                _step_err: u64,
+                _reg_settings: u64,
+                c_signer: u64,
+                rgp_signer: u64,
+                pv_policy_arg: u64,
+                _a7: u64,
+                _a8: u64,
+            ) -> u64 {
+                let ctx = &mut *(pv_policy_arg as *mut GenericPolicyCtx);
+                ctx.called += 1;
+                if c_signer == 1 && rgp_signer != 0 {
+                    let sptr = *(rgp_signer as *const *const WtdGenericChainPolicySignerInfo);
+                    if !sptr.is_null() {
+                        let sinfo = std::ptr::read_unaligned(sptr);
+                        ctx.saw_chain = sinfo.cb_size == 0x30 && !sinfo.p_chain_context.is_null();
+                    }
+                }
+                ctx.return_hr as u32 as u64
+            }
+            // Undersized WTD_GENERIC_CHAIN_POLICY_DATA returns E_INVALIDARG.
+            let mut bad_gc = [0u8; 0x30];
+            std::ptr::write_unaligned(bad_gc.as_mut_ptr() as *mut u32, 0x10u32);
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                bad_gc.as_ptr() as *const c_void,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x8007_0057u32 as i32, // E_INVALIDARG
+            );
+            // Restrictive callback returning TRUST_E_EXPLICIT_DISTRUST overrides trust.
+            let mut cb_ctx = GenericPolicyCtx {
+                called: 0,
+                saw_chain: false,
+                return_hr: 0x800B_0111u32 as i32, // TRUST_E_EXPLICIT_DISTRUST
+            };
+            let mut gc_para = [0u8; 0x30];
+            std::ptr::write_unaligned(gc_para.as_mut_ptr() as *mut u32, 0x30u32);
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x20) as *mut usize,
+                test_generic_chain_policy_cb as *const () as usize,
+            );
+            std::ptr::write_unaligned(
+                gc_para.as_mut_ptr().add(0x28) as *mut *mut c_void,
+                &mut cb_ctx as *mut GenericPolicyCtx as *mut c_void,
+            );
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                gc_para.as_ptr() as *const c_void,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                0x800B_0111u32 as i32,
+                "restrictive WTD_GENERIC_CHAIN_POLICY_DATA callback must be invoked and honored"
+            );
+            assert_eq!(cb_ctx.called, 1);
+            assert!(cb_ctx.saw_chain, "callback must receive non-null PCCERT_CHAIN_CONTEXT");
+            // Accepting callback returns ERROR_SUCCESS.
+            cb_ctx.return_hr = ERROR_SUCCESS;
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS,
+            );
+            assert_eq!(cb_ctx.called, 2);
+            // Restore HTTPS policy callback pointer for subsequent revocation checks below.
+            std::ptr::write_unaligned(
+                wtd.as_mut_ptr().add(0x08) as *mut *const c_void,
+                https_para.as_ptr() as *const c_void,
             );
             // Requested revocation checks (via either fdwRevocationChecks or dwProvFlags) MUST
             // fail closed when positive revocation status cannot be obtained, rather than returning

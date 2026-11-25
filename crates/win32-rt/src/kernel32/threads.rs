@@ -89,9 +89,9 @@ pub unsafe extern "win64" fn GetCurrentProcessorNumberEx(out: *mut u8) {
     *out.add(3) = 0;
 }
 
-fn thread_obj(h: HANDLE) -> Option<Arc<ThreadObj>> {
+pub(crate) fn thread_obj(h: HANDLE) -> Option<Arc<ThreadObj>> {
     if h == handles::CURRENT_THREAD {
-        return thread::current_thread_object();
+        return Some(thread::ensure_current_thread_object());
     }
     handles::get_as::<ThreadObj>(h)
 }
@@ -240,18 +240,56 @@ pub unsafe extern "win64" fn SetThreadPriorityBoost(_h: HANDLE, _d: BOOL) -> BOO
     TRUE
 }
 
-pub unsafe extern "win64" fn SetThreadAffinityMask(_h: HANDLE, _mask: usize) -> usize {
-    stub!("thread affinity not applied");
-    let n = crate::process::num_cpus();
-    if n >= 64 { usize::MAX } else { (1usize << n) - 1 }
+pub unsafe extern "win64" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    let Some(t) = thread_obj(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    if mask == 0 || mask & !crate::process::active_processor_mask() != 0 {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    t.affinity.swap(mask, Ordering::Relaxed)
 }
 
-pub unsafe extern "win64" fn SetThreadGroupAffinity(_h: HANDLE, _a: *const c_void, prev: *mut u8) -> BOOL {
-    stub!("thread group affinity not applied");
-    if !prev.is_null() {
-        std::ptr::write_bytes(prev, 0, 16);
-        *(prev as *mut usize) = (1usize << crate::process::num_cpus()) - 1;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+fn group_affinity(mask: usize) -> GroupAffinity {
+    GroupAffinity { mask, group: 0, reserved: [0; 3] }
+}
+
+pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, affinity: *const GroupAffinity, prev: *mut GroupAffinity) -> BOOL {
+    if affinity.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
+    let a = affinity.read_unaligned();
+    if a.group != 0 || a.reserved != [0; 3] {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let old = SetThreadAffinityMask(h, a.mask);
+    if old == 0 { return FALSE; }
+    if !prev.is_null() { prev.write_unaligned(group_affinity(old)); }
+    TRUE
+}
+
+pub unsafe extern "win64" fn GetThreadGroupAffinity(h: HANDLE, out: *mut GroupAffinity) -> BOOL {
+    let Some(t) = thread_obj(h) else {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    };
+    if out.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    out.write_unaligned(group_affinity(t.affinity.load(Ordering::Relaxed)));
     TRUE
 }
 
