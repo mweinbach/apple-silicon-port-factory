@@ -1214,6 +1214,127 @@ impl Cpu {
                     }
                 }
             }
+            Mnemonic::Vgatherdps
+            | Mnemonic::Vgatherdpd
+            | Mnemonic::Vgatherqps
+            | Mnemonic::Vgatherqpd
+            | Mnemonic::Vpgatherdd
+            | Mnemonic::Vpgatherdq
+            | Mnemonic::Vpgatherqd
+            | Mnemonic::Vpgatherqq => {
+                let (elem_bits, idx_bits): (u32, u32) = match mn {
+                    Mnemonic::Vgatherdps | Mnemonic::Vpgatherdd => (32, 32),
+                    Mnemonic::Vgatherdpd | Mnemonic::Vpgatherdq => (64, 32),
+                    Mnemonic::Vgatherqps | Mnemonic::Vpgatherqd => (32, 64),
+                    _ => (64, 64),
+                };
+                if let (Some((d, dst_ymm)), Some((v, idx_ymm)), Some((m, msk_ymm))) = (
+                    vops::xmm_reg_info(ins.op_register(0)),
+                    vops::xmm_reg_info(ins.memory_index()),
+                    vops::xmm_reg_info(ins.op_register(2)),
+                ) {
+                    // Intel SDM: #UD if any two of dest, mask, and vindex specify the same register.
+                    if d == m || d == v || m == v {
+                        super::xstate::Fault::ud().dispatch(cpu, ins.ip());
+                        return true;
+                    }
+                    let count: usize = match (elem_bits, idx_bits) {
+                        (32, 32) => if dst_ymm { 8 } else { 4 },
+                        (64, 32) => if dst_ymm { 4 } else { 2 },
+                        (32, 64) => if idx_ymm { 4 } else { 2 },
+                        _ => if dst_ymm { 4 } else { 2 },
+                    };
+                    let elem_bytes = (elem_bits / 8) as usize;
+                    let per_lane = 16 / elem_bytes;
+                    let idx_per_lane = (128 / idx_bits) as usize;
+                    let base_reg = ins.memory_base();
+                    let is_a32 = base_reg.is_gpr32()
+                        || (base_reg == Register::None && ins.memory_displ_size() == 4);
+                    let base_val = if base_reg != Register::None {
+                        cpu.get_reg(base_reg)
+                    } else {
+                        0
+                    };
+                    let disp = ins.memory_displacement64();
+                    let scale = ins.memory_index_scale() as u64;
+                    let gs_base = if ins.segment_prefix() == Register::GS {
+                        crate::exe::teb_self() as u64
+                    } else {
+                        0
+                    };
+                    let (v_lo, v_hi) = (cpu.xmm[v], if idx_ymm { cpu.ymm_hi[v] } else { 0 });
+                    let mut d_vec = [cpu.xmm[d], if dst_ymm { cpu.ymm_hi[d] } else { 0 }];
+                    let mut m_vec = [cpu.xmm[m], if msk_ymm { cpu.ymm_hi[m] } else { 0 }];
+                    let elem_mask: u128 = if elem_bits == 64 { u64::MAX as u128 } else { u32::MAX as u128 };
+                    let sign_bit = elem_bits - 1;
+                    let mut any_load = false;
+
+                    for i in 0..count {
+                        let half = i / per_lane;
+                        let sh = ((i % per_lane) as u32) * elem_bits;
+                        let m_lane = (m_vec[half] >> sh) & elem_mask;
+                        if ((m_lane >> sign_bit) & 1) != 0 {
+                            let idx_half = i / idx_per_lane;
+                            let idx_sh = ((i % idx_per_lane) as u32) * idx_bits;
+                            let raw_idx = if idx_half == 0 { v_lo } else { v_hi } >> idx_sh;
+                            let signed_idx: u64 = if idx_bits == 32 {
+                                (raw_idx as u32 as i32 as i64) as u64
+                            } else {
+                                raw_idx as u64
+                            };
+                            let mut ea = base_val
+                                .wrapping_add(disp)
+                                .wrapping_add(signed_idx.wrapping_mul(scale));
+                            if is_a32 {
+                                ea = (ea as u32) as u64;
+                            }
+                            if gs_base != 0 {
+                                ea = gs_base.wrapping_add(ea);
+                            }
+                            let mut buf = [0u8; 8];
+                            if !super::regfile_ext::is_valid_guest_range(ea, elem_bytes)
+                                || !win32_rt::crash::safe_read(ea, &mut buf[..elem_bytes])
+                            {
+                                // Precise fault: commit already-completed lanes (leaving this lane's mask set).
+                                cpu.xmm[d] = d_vec[0];
+                                if dst_ymm {
+                                    cpu.set_ymm_hi(d, d_vec[1]);
+                                }
+                                cpu.xmm[m] = m_vec[0];
+                                if msk_ymm {
+                                    cpu.set_ymm_hi(m, m_vec[1]);
+                                }
+                                super::xstate::Fault::pf(ea, false).dispatch(cpu, ins.ip());
+                                return true;
+                            }
+                            any_load = true;
+                            let val = if elem_bits == 64 {
+                                u64::from_le_bytes(buf) as u128
+                            } else {
+                                u32::from_le_bytes(buf[..4].try_into().unwrap()) as u128
+                            };
+                            d_vec[half] = (d_vec[half] & !(elem_mask << sh)) | (val << sh);
+                        }
+                        m_vec[half] &= !(elem_mask << sh);
+                    }
+                    if any_load && super::mem::tso() {
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    }
+                    // VEX.128 vgatherqps/vpgatherqd (vm64x) zeroes dest[127:64] unconditionally.
+                    if elem_bits == 32 && idx_bits == 64 && !idx_ymm {
+                        d_vec[0] &= u64::MAX as u128;
+                    }
+                    cpu.xmm[d] = d_vec[0];
+                    if dst_ymm {
+                        cpu.set_ymm_hi(d, d_vec[1]);
+                    } else {
+                        cpu.clear_ymm_hi_reg(d);
+                    }
+                    // On normal completion the entire mask YMM register is zeroed.
+                    cpu.xmm[m] = 0;
+                    cpu.clear_ymm_hi_reg(m);
+                }
+            }
             Mnemonic::Sha1rnds4
             | Mnemonic::Sha1nexte
             | Mnemonic::Sha1msg1

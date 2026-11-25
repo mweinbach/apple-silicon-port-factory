@@ -240,7 +240,7 @@ impl Cpu {
             _ => {
                 let hi_imm = if IS_VSHUF {
                     match sub {
-                        VS_SHUFPD | VS_BLENDPD => imm8 >> 2,
+                        VS_SHUFPD | VS_BLENDPD | VS_VPERMILPD_I => imm8 >> 2,
                         VS_BLENDPS => imm8 >> 4,
                         _ => imm8,
                     }
@@ -357,6 +357,8 @@ fn vshuf(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
         VS_MOVHLPS => (a & !0xFFFF_FFFF_FFFF_FFFFu128) | (b >> 64),
         VS_SHUFPD => sk::shufpd(a, b, imm),
         VS_VPERMILPS => sk::vpermilps_var(a, b),
+        VS_VPERMILPD_I => sk::shufpd(b, b, imm),
+        VS_VPERMILPD => sk::vpermilpd_var(a, b),
         VS_PALIGNR => sk::palignr(a, b, imm),
         VS_PBLENDW => sk::pblendw_imm(a, b, imm),
         VS_BLENDPS => sk::blendps_imm(a, b, imm & 0x0F),
@@ -441,7 +443,7 @@ fn vint(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
 
 /// `K_VFP_*` sub-ops routed through [`crate::emu::simd_kernels`].
 #[inline(never)]
-fn vfp(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
+fn vfp(sub: u8, a: u128, b: u128, imm: u8, mxcsr: u32) -> u128 {
     const M32: u128 = 0xFFFF_FFFF;
     const M64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
     let f32b = |v: u128| f32::from_bits(v as u32);
@@ -469,10 +471,10 @@ fn vfp(sub: u8, a: u128, b: u128, imm: u8) -> u128 {
         VF_HSUBPS => sk::hadd_sub_ps(a, b, false),
         VF_HADDPD => sk::hadd_sub_pd(a, b, true),
         VF_HSUBPD => sk::hadd_sub_pd(a, b, false),
-        VF_ROUNDSS => (a & !M32) | sk::round_f32(f32b(b), imm).to_bits() as u128,
-        VF_ROUNDSD => (a & !M64) | sk::round_f64(f64b(b), imm).to_bits() as u128,
-        VF_ROUNDPS => sk::round_ps(b, imm),
-        VF_ROUNDPD => sk::round_pd(b, imm),
+        VF_ROUNDSS => (a & !M32) | sk::round_f32(f32b(b), imm, mxcsr).to_bits() as u128,
+        VF_ROUNDSD => (a & !M64) | sk::round_f64(f64b(b), imm, mxcsr).to_bits() as u128,
+        VF_ROUNDPS => sk::round_ps(b, imm, mxcsr),
+        VF_ROUNDPD => sk::round_pd(b, imm, mxcsr),
         VF_CMPSS => {
             let m = if sse_cmp_pred(f32b(a) as f64, f32b(b) as f64, imm) { M32 } else { 0 };
             (a & !M32) | m
@@ -744,8 +746,14 @@ pub(in crate::emu) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
         K_VSHUF_RM => cpu.vexec::<true, _>(op, true, vshuf),
         K_VINT_RR => cpu.vexec::<false, _>(op, false, vint),
         K_VINT_RM => cpu.vexec::<false, _>(op, true, vint),
-        K_VFP_RR => cpu.vexec::<false, _>(op, false, vfp),
-        K_VFP_RM => cpu.vexec::<false, _>(op, true, vfp),
+        K_VFP_RR => {
+            let mxcsr = cpu.jx.mxcsr;
+            cpu.vexec::<false, _>(op, false, |s, a, b, imm| vfp(s, a, b, imm, mxcsr));
+        }
+        K_VFP_RM => {
+            let mxcsr = cpu.jx.mxcsr;
+            cpu.vexec::<false, _>(op, true, |s, a, b, imm| vfp(s, a, b, imm, mxcsr));
+        }
         K_VST => {
             let a = cpu.faddr(op);
             let s = op.r1 as usize & 15;
