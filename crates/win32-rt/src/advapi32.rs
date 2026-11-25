@@ -1292,24 +1292,19 @@ impl TokenObj {
         let raw = h as isize;
         // Windows 8+ pseudo-token handles: GetCurrentProcessToken (-4),
         // GetCurrentThreadToken (-5), GetCurrentThreadEffectiveToken (-6).
+        // Per Windows docs, -4 and -6 grant TOKEN_QUERY | TOKEN_QUERY_SOURCE (0x0018),
+        // while -5 fails with ERROR_NO_TOKEN (1008) when the thread is not impersonating.
         let tok = if raw == -4 || raw == -6 {
             Self {
                 token_type: TOKEN_PRIMARY,
                 imp_level: SECURITY_IMPERSONATION,
-                access: 0x0008, // TOKEN_QUERY
+                access: 0x0008 | 0x0010, // TOKEN_QUERY | TOKEN_QUERY_SOURCE
                 token_id: 0x100,
                 auth_id: 0x3E7,
                 modified_id: 0x101,
             }
         } else if raw == -5 {
-            Self {
-                token_type: TOKEN_IMPERSONATION,
-                imp_level: SECURITY_IMPERSONATION,
-                access: 0x0008, // TOKEN_QUERY
-                token_id: 0x102,
-                auth_id: 0x3E7,
-                modified_id: 0x103,
-            }
+            return Err(1008); // ERROR_NO_TOKEN
         } else if let Some(tok) = handles::get_as::<Self>(h) {
             Self {
                 token_type: tok.token_type,
@@ -1509,7 +1504,9 @@ pub unsafe extern "win64" fn GetTokenInformation(
     if ret_len.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
-    let tok = match TokenObj::resolve(token, 0x0008) {
+    // TokenSource (7) requires TOKEN_QUERY_SOURCE (0x0010); all other classes require TOKEN_QUERY (0x0008).
+    let required_access = if info_class == 7 { 0x0010 } else { 0x0008 };
+    let tok = match TokenObj::resolve(token, required_access) {
         Ok(t) => t,
         Err(e) => {
             std::ptr::write_unaligned(ret_len, 0);
@@ -7206,16 +7203,30 @@ mod tests {
     fn token_information_all_classes_windows_semantics() {
         unsafe {
             let mut tok: HANDLE = std::ptr::null_mut();
-            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008 | 0x0002, &mut tok), TRUE);
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008 | 0x0010 | 0x0002, &mut tok), TRUE);
             assert!(!tok.is_null());
 
-            // TOKEN_QUERY-only handle cannot be duplicated (ERROR_ACCESS_DENIED)
+            // TOKEN_QUERY-only handle cannot be duplicated or query TokenSource (ERROR_ACCESS_DENIED)
             let mut ro_tok: HANDLE = std::ptr::null_mut();
             let mut denied_dup: HANDLE = std::ptr::null_mut();
+            let mut src_buf = [0u8; 16];
+            let mut src_need = 0u32;
             assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut ro_tok), TRUE);
             assert_eq!(DuplicateToken(ro_tok, SECURITY_IMPERSONATION, &mut denied_dup), FALSE);
             assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            assert_eq!(GetTokenInformation(ro_tok, 7, src_buf.as_mut_ptr(), 16, &mut src_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
             let _ = crate::kernel32::threads::CloseHandle(ro_tok);
+
+            // TOKEN_QUERY_SOURCE-only handle can query TokenSource (7) but not TOKEN_QUERY classes
+            let mut src_tok: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0010, &mut src_tok), TRUE);
+            assert_eq!(GetTokenInformation(src_tok, 7, src_buf.as_mut_ptr(), 16, &mut src_need), TRUE);
+            assert_eq!(src_need, 16);
+            let mut denied_val = 0u32;
+            assert_eq!(GetTokenInformation(src_tok, 8, &mut denied_val as *mut u32 as *mut u8, 4, &mut src_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_ACCESS_DENIED);
+            let _ = crate::kernel32::threads::CloseHandle(src_tok);
 
             let mut need = 0u32;
             // TokenType (8) -> TokenPrimary (1)
@@ -7313,9 +7324,18 @@ mod tests {
             assert_eq!(GetTokenInformation(tok, 99, std::ptr::null_mut(), 0, &mut need), FALSE);
             assert_eq!(crate::teb::last_error(), ERROR_INVALID_PARAMETER);
 
-            // Windows 8+ pseudo-handle GetCurrentProcessToken() = -4
+            // Windows 8+ pseudo-handles: -4 (GetCurrentProcessToken) & -6 (GetCurrentThreadEffectiveToken)
+            // grant TOKEN_QUERY | TOKEN_QUERY_SOURCE, while -5 (GetCurrentThreadToken) returns ERROR_NO_TOKEN
+            // when the thread is not impersonating.
             assert_eq!(GetTokenInformation((-4isize) as HANDLE, 12, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
             assert_eq!(val, 1);
+            let mut pseudo_src = [0u8; 16];
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 7, pseudo_src.as_mut_ptr(), 16, &mut need), TRUE);
+            assert_eq!(need, 16);
+            assert_eq!(GetTokenInformation((-6isize) as HANDLE, 12, &mut val as *mut u32 as *mut u8, 4, &mut need), TRUE);
+            assert_eq!(val, 1);
+            assert_eq!(GetTokenInformation((-5isize) as HANDLE, 8, &mut val as *mut u32 as *mut u8, 4, &mut need), FALSE);
+            assert_eq!(crate::teb::last_error(), 1008); // ERROR_NO_TOKEN
 
             let _ = crate::kernel32::threads::CloseHandle(imp_tok);
             let _ = crate::kernel32::threads::CloseHandle(tok);
