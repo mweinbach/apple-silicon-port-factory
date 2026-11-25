@@ -1692,6 +1692,45 @@ int main(void) {
         fprintf(stderr, "FAIL: wsprintfW mismatch\n");
         ExitProcess(2);
     }
+
+    // %c / %C with 0 must emit an embedded NUL, count it in the return length, and not end early.
+    memset(abuf, 0x7F, sizeof(abuf));
+    int na = wsprintfA(abuf, "a%cb", 0);
+    if (na != 3 || abuf[0] != 'a' || abuf[1] != '\0' || abuf[2] != 'b' || abuf[3] != '\0') {
+        fprintf(stderr, "FAIL: wsprintfA %%c NUL (ret=%d)\n", na);
+        ExitProcess(3);
+    }
+    memset(abuf, 0x7F, sizeof(abuf));
+    int nac = wsprintfA(abuf, "a%Cb", 0);
+    if (nac != 3 || abuf[0] != 'a' || abuf[1] != '\0' || abuf[2] != 'b' || abuf[3] != '\0') {
+        fprintf(stderr, "FAIL: wsprintfA %%C NUL (ret=%d)\n", nac);
+        ExitProcess(4);
+    }
+    memset(wbuf, 0x7F, sizeof(wbuf));
+    int nw = wsprintfW(wbuf, L"a%cb", 0);
+    if (nw != 3 || wbuf[0] != L'a' || wbuf[1] != 0 || wbuf[2] != L'b' || wbuf[3] != 0) {
+        fprintf(stderr, "FAIL: wsprintfW %%c NUL (ret=%d)\n", nw);
+        ExitProcess(5);
+    }
+    memset(wbuf, 0x7F, sizeof(wbuf));
+    int nwc = wsprintfW(wbuf, L"a%Cb", 0);
+    if (nwc != 3 || wbuf[0] != L'a' || wbuf[1] != 0 || wbuf[2] != L'b' || wbuf[3] != 0) {
+        fprintf(stderr, "FAIL: wsprintfW %%C NUL (ret=%d)\n", nwc);
+        ExitProcess(6);
+    }
+
+    // Precision must not limit %c / %C output.
+    int npa = wsprintfA(abuf, "%.0c|%.0C|%4.0c|%-4.0C", 'X', (WCHAR)L'Y', 'Z', (WCHAR)L'W');
+    if (npa != 13 || strcmp(abuf, "X|Y|   Z|W   ") != 0) {
+        fprintf(stderr, "FAIL: wsprintfA precision on %%c/%%C (ret=%d, '%s')\n", npa, abuf);
+        ExitProcess(7);
+    }
+    int npw = wsprintfW(wbuf, L"%.0c|%.0C|%4.0c|%-4.0C", (WCHAR)L'X', 'Y', (WCHAR)L'Z', 'W');
+    if (npw != 13 || wcscmp(wbuf, L"X|Y|   Z|W   ") != 0) {
+        fprintf(stderr, "FAIL: wsprintfW precision on %%c/%%C (ret=%d)\n", npw);
+        ExitProcess(8);
+    }
+
     printf("CORPUS_WSPRINTF: PASS ALL\n");
     fflush(stdout);
     return 0;

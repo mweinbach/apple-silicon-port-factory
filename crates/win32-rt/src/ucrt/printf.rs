@@ -31,7 +31,7 @@ impl Fmt {
     unsafe fn at(&self, i: usize) -> u32 {
         match self {
             Fmt::Narrow(p) => *p.add(i) as u32,
-            Fmt::Wide(p) => *p.add(i) as u32,
+            Fmt::Wide(p) => std::ptr::read_unaligned(p.add(i)) as u32,
         }
     }
     fn wide(&self) -> bool {

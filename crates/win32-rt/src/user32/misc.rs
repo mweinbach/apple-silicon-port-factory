@@ -3354,6 +3354,58 @@ mod tests {
             assert_eq!(read_wide_unaligned(odd_out), "val=7 hex=2A str=wide");
             assert_eq!(std::ptr::read_unaligned(odd_out.add(21)), 0);
             assert_eq!(raw[0], 0xA5);
+
+            // %c / %C with 0 argument must emit an embedded NUL, count it in the return length,
+            // and continue formatting subsequent characters rather than terminating early.
+            let mut nul_a = [0xFFu8; 16];
+            let n_c = wsprintfA(nul_a.as_mut_ptr() as u64, c"a%cb".as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(n_c, 3);
+            assert_eq!(&nul_a[..4], &[b'a', 0, b'b', 0]);
+
+            let mut nul_a_upper = [0xFFu8; 16];
+            let n_cu = wsprintfA(nul_a_upper.as_mut_ptr() as u64, c"a%Cb".as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(n_cu, 3);
+            assert_eq!(&nul_a_upper[..4], &[b'a', 0, b'b', 0]);
+
+            let mut nul_w = [0xFFFFu16; 16];
+            let fmt_wc0 = crate::strings::to_wide_z("a%cb");
+            let nw_c = wsprintfW(nul_w.as_mut_ptr() as u64, fmt_wc0.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(nw_c, 3);
+            assert_eq!(&nul_w[..4], &[b'a' as u16, 0, b'b' as u16, 0]);
+
+            let mut nul_w_upper = [0xFFFFu16; 16];
+            let fmt_wcu0 = crate::strings::to_wide_z("a%Cb");
+            let nw_cu = wsprintfW(nul_w_upper.as_mut_ptr() as u64, fmt_wcu0.as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(nw_cu, 3);
+            assert_eq!(&nul_w_upper[..4], &[b'a' as u16, 0, b'b' as u16, 0]);
+
+            // Precision must not limit %c / %C output.
+            let mut prec_a = [0u8; 32];
+            let n_prec_a = wsprintfA(
+                prec_a.as_mut_ptr() as u64,
+                c"%.0c|%.0C|%4.0c|%-4.0C".as_ptr() as u64,
+                b'X' as u64,
+                b'Y' as u64,
+                b'Z' as u64,
+                b'W' as u64,
+                0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(n_prec_a, 13);
+            assert_eq!(crate::strings::from_ansi(prec_a.as_ptr()), "X|Y|   Z|W   ");
+
+            let mut prec_w = [0u16; 32];
+            let fmt_wprec = crate::strings::to_wide_z("%.0c|%.0C|%4.0c|%-4.0C");
+            let n_prec_w = wsprintfW(
+                prec_w.as_mut_ptr() as u64,
+                fmt_wprec.as_ptr() as u64,
+                b'X' as u64,
+                b'Y' as u64,
+                b'Z' as u64,
+                b'W' as u64,
+                0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(n_prec_w, 13);
+            assert_eq!(read_wide_unaligned(prec_w.as_ptr()), "X|Y|   Z|W   ");
         }
     }
 
