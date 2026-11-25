@@ -739,6 +739,9 @@ pub struct StreamShared {
     /// constructed without WASAPI session controls (DirectSound, XAudio2, FMOD, OpenAL, Bink).
     ep_sw: OnceLock<Arc<super::mmdevapi::EndpointSwAtomic>>,
     pub started: AtomicBool,
+    /// Monotonic total frames rendered by the output backend while started (including
+    /// zero-filled underrun periods), in the stream's sample rate.
+    pub rendered_frames: AtomicU64,
     pub underrun_frames: AtomicU64,
     pub callbacks: AtomicU64,
     /// Largest slice the device pulled in one callback.
@@ -770,6 +773,7 @@ impl StreamShared {
             gain: None,
             ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
+            rendered_frames: AtomicU64::new(0),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             max_slice: AtomicU64::new(0),
@@ -806,6 +810,7 @@ impl StreamShared {
             gain,
             ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
+            rendered_frames: AtomicU64::new(0),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
             max_slice: AtomicU64::new(0),
@@ -905,6 +910,7 @@ impl StreamShared {
     /// Realtime-safe: the device consumed `frames` (got `got` of them).
     #[inline]
     pub fn consumed(&self, frames: usize, got: usize) {
+        self.rendered_frames.fetch_add(frames as u64, Ordering::Release);
         if got < frames {
             let miss = (frames - got) as u64;
             self.underrun_frames.fetch_add(miss, Ordering::Relaxed);

@@ -952,13 +952,13 @@ mod spatial_clock2 {
         if core.is_invalid() {
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
-        let stream_frames = SpatialStreamCore::clone_consumed(core);
+        let rendered_frames = core.shared.rendered_frames.load(Ordering::Acquire);
         let dev_rate = core.ep.mix_format().rate as u64;
         let stream_rate = SPATIAL_SAMPLE_RATE as u64;
         let dev_frames = if stream_rate > 0 && dev_rate > 0 && stream_rate != dev_rate {
-            ((stream_frames as u128 * dev_rate as u128) / stream_rate as u128) as u64
+            ((rendered_frames as u128 * dev_rate as u128) / stream_rate as u128) as u64
         } else {
-            stream_frames
+            rendered_frames
         };
         std::ptr::write_unaligned(pos, dev_frames);
         if !qpc.is_null() {

@@ -2184,17 +2184,18 @@ mod clock2 {
             None => AUDCLNT_E_NOT_INITIALIZED,
             Some(s) if is_invalid(s) => AUDCLNT_E_DEVICE_INVALIDATED,
             Some(s) => {
-                let client_frames = match &s.io {
-                    StreamIo::Render(_) => s.shared.ring.consumed() as u64 + s.dropped_silence,
+                let rendered_frames = match &s.io {
+                    StreamIo::Render(_) => s.shared.rendered_frames.load(Ordering::Acquire),
                     StreamIo::Capture(c) => c.device_pos,
                 };
                 let client_rate = s.fmt.rate as u64;
-                // IAudioClock2::GetDevicePosition reports hardware/endpoint-rate frames rather
-                // than client-format frames when AUTOCONVERTPCM resamples between rates.
+                // IAudioClock2::GetDevicePosition reports hardware/endpoint-rate frames rendered
+                // while running (including zero-filled underrun periods), scaled from the stream's
+                // render rate to the endpoint rate when AUTOCONVERTPCM resamples between rates.
                 let dev_frames = if client_rate > 0 && dev_rate > 0 && client_rate != dev_rate {
-                    ((client_frames as u128 * dev_rate as u128) / client_rate as u128) as u64
+                    ((rendered_frames as u128 * dev_rate as u128) / client_rate as u128) as u64
                 } else {
-                    client_frames
+                    rendered_frames
                 };
                 std::ptr::write_unaligned(dev_pos, dev_frames);
                 if !qpc_pos.is_null() {
@@ -2750,5 +2751,35 @@ mod mixer_tests {
             unregister_loopback_source(ep_id, src_b);
             drop(sub);
         }
+    }
+
+    #[test]
+    fn device_clock_advances_through_render_buffer_underruns() {
+        let shared = StreamShared::new(Ring::new(4800, 2));
+        let mut out = vec![0.0f32; 480 * 2];
+
+        // Period 0: 480 submitted frames consumed.
+        shared.ring.push(&vec![0.25f32; 480 * 2]);
+        let (got0, _) = shared.render_period(&mut out, true);
+        shared.consumed(480, got0);
+        assert_eq!(got0, 480);
+
+        // Period 1: empty ring (480-frame underrun rendered as silence).
+        let (got1, silent1) = shared.render_period(&mut out, true);
+        shared.consumed(480, got1);
+        assert_eq!((got1, silent1), (0, true));
+
+        // Period 2: 480 submitted frames consumed.
+        shared.ring.push(&vec![0.50f32; 480 * 2]);
+        let (got2, _) = shared.render_period(&mut out, true);
+        shared.consumed(480, got2);
+        assert_eq!(got2, 480);
+
+        // Client ring consumption only reflects submitted frames (960), whereas the hardware
+        // rendered_frames counter backing IAudioClock2::GetDevicePosition advances through the
+        // middle underrun period to 1440 frames.
+        assert_eq!(shared.ring.consumed(), 960);
+        assert_eq!(shared.underrun_frames.load(Ordering::Relaxed), 480);
+        assert_eq!(shared.rendered_frames.load(Ordering::Acquire), 1440);
     }
 }
