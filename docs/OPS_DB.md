@@ -7,13 +7,14 @@ for the port factory. Run it via `cargo opsdb -- <command>` or `./tools/opsdb.sh
 
 ## 1. Architecture & Catalogs
 
-`doctor` compares five generated TSVs, checks ops and Win32 source references and verifies the
-published catalog counts. `doctor --fix` refreshes generated rows and the marked block in
-STATUS. Correct broken source references in the generator.
+`doctor` compares six generated TSVs (five on non-Apple-Silicon hosts), checks ops and Win32 source
+references and verifies the published catalog counts. `doctor --fix` refreshes generated rows and
+the marked block in STATUS. Correct broken source references in the generator.
 
 | Component | Code & Data | What it does |
 |---|---|---|
 | **x86-64 → ARM64 Ops DB** | `crates/port-factory/src/ops_db/`, `db/ops_x86_to_arm64.tsv` | Groups mnemonics by implementation tier, with source references and vector counts. [Current totals and known gaps](STATUS.md#catalog-totals) |
+| **x86-64 ISA Coverage Ledger** | `crates/port-factory/src/isa_coverage.rs`, `db/isa_coverage.tsv` | Enumerates every `iced-x86` `Code` valid in 64-bit mode (explicitly excluding 16/32-bit-only, 3DNow!, XOP/TBM, Knights MVEX, and privileged/VMX/SGX), synthesizes `reg` and `mem` forms via `OpCodeInfo`, classifies every form through `x86_runtime::emu::instruction_lowering` (`Arm64`, `FastInterpreter`, `MmxDispatch`, `GenericDispatch`, `Boundary`), reports counts and % by `CpuidFeature` and catalog family, and flags any guest-advertised CPUID feature with non-`Arm64` forms (`advertised_but_unimplemented`). Checked for drift by `doctor`. |
 | **A64 encoding forms and JIT emitter matches** | [A64 catalog](../db/a64_encodings.tsv), [emitter matches](../db/a64_emitter_matches.tsv) | Look up an Arm operation's encodings, operand fields and feature requirements, or find the form used by a JIT test word. [Verification and regeneration](DIAGNOSTICS.md#check-the-a64-words-emitted-by-the-jit) |
 | **Win32 API DB** | `crates/port-factory/src/win32_db.rs`, `db/win32_apis.tsv` | Indexes exports by DLL, symbol, ordinal and implementation kind. Supports `api-ms-win-*` normalization and `kernel32 ↔ ntdll` forwarding. |
 | **PE Coverage Scanner** | `crates/port-factory/src/scanner.rs`, `db/ops_profiles.tsv` | Disassembles any Windows x86-64 `.exe`/`.dll` and measures ARM64 JIT coverage, instruction mix, and Win32 import readiness. |
@@ -70,9 +71,12 @@ of the SIMD instruction families exposed for application dispatch.
 cargo opsdb -- win32-sync
 cargo opsdb -- win32-stats --search VirtualAlloc
 
-# Ops DB queries
+# Ops DB & ISA coverage ledger queries
 cargo opsdb -- sync
 cargo opsdb -- stats
+cargo opsdb -- isa-coverage
+cargo opsdb -- isa-coverage --json
+cargo opsdb -- isa-coverage --sync
 cargo opsdb -- list --category SIMD_FP
 cargo opsdb -- explain vfmadd213ps
 
@@ -235,10 +239,42 @@ degraded paths. See the assessment and findings before selecting a game for live
 
 ---
 
-## 4. Guest CPUID Contract & ISA Extension Decision Table
+## 4. Exhaustive x86-64 ISA Coverage Ledger (`isa-coverage`)
+
+On Apple Silicon macOS, `cargo opsdb -- isa-coverage [--json] [--sync]` enumerates every
+`iced_x86::Code` variant in 64-bit mode, lists excluded encodings with explicit reasons
+(`non_instruction`, `mode16_32_only`, `d3now`, `xop_tbm`, `knights_mvex`, `privileged_vmx_sgx`),
+synthesizes representative `reg` and `mem` forms from `OpCodeInfo` (round-tripped through
+`iced-x86`'s 64-bit encoder/decoder), and classifies every form through
+`x86_runtime::emu::instruction_lowering`:
+
+| Class | Meaning |
+|---|---|
+| `Arm64` | Lowered to `FastOp` and compiled to native ARM64/NEON in JIT & `.aot` |
+| `FastInterpreter` | Lowered to `FastOp` but executed in the pre-decoded fast interpreter |
+| `MmxDispatch` | Legacy MMX / MMX-aliased op routed through `emu/mmx.rs` |
+| `GenericDispatch` | Generic `iced-x86` interpreter dispatch (or unimplemented) |
+| `Boundary` | User-mode guest trap/syscall boundary (`int3`, `int1`, `int`, `ud0..2`, `syscall`, `sysenter`) |
+
+The canonical ledger is checked in at [`db/isa_coverage.tsv`](../db/isa_coverage.tsv) and verified
+for drift by `cargo opsdb -- doctor`. Any `CpuidFeature` advertised by the guest CPUID profile that
+still has non-`Arm64` (non-`Boundary`) forms is flagged under `advertised_but_unimplemented`, and
+unit test `isa_coverage::tests::advertised_cpuid_features_have_no_unjustified_non_arm64_forms`
+fails if any advertised extension regresses or falls outside the explicit, justified allow-list
+(and fails if a completed extension is not removed from the allow-list).
+
+```sh
+cargo opsdb -- isa-coverage          # human-readable summary by CpuidFeature and catalog family
+cargo opsdb -- isa-coverage --json   # versioned JSON envelope for dashboards/CI
+cargo opsdb -- isa-coverage --sync   # refresh db/isa_coverage.tsv
+```
+
+---
+
+## 5. Guest CPUID Contract & ISA Extension Decision Table
 
 `crates/x86-runtime/src/emu/cpuid.rs` enforces an **honest-CPUID contract**, verified by
-`crates/x86-runtime/src/emu/cpuid_audit_tests.rs`:
+`crates/x86-runtime/src/emu/cpuid_audit_tests.rs` and `crates/port-factory/src/isa_coverage.rs`:
 
 - Every set CPUID feature bit on leaves `1`, `7.0`, `7.1`, `0xD.1`, `0x8000_0001`, and
   `0x8000_0008` is explicitly mapped and audited against `x86_runtime::emu::instruction_lowering()`.

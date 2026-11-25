@@ -1487,6 +1487,21 @@ pub(in crate::emu) fn test_held() -> usize {
     TEST_HELD.with(|c| c.get())
 }
 
+/// True when `ip` exists in the AOT directory (or a module covering `ip` was killed) and is
+/// currently dead/killed due to revalidation or code-modification invalidation.
+pub(in crate::emu) fn was_killed_at(ip: u64) -> bool {
+    let Ok(g) = DIR.try_read() else { return false };
+    let Some(d) = g.as_ref() else { return false };
+    if let Some(&(mi, bi)) = d.map.get(&ip) {
+        let m = &d.modules[mi as usize];
+        return m.killed || m.dead[bi as usize].load(Ordering::Relaxed) != 0;
+    }
+    let a = ip as usize;
+    d.modules
+        .iter()
+        .any(|m| m.killed && a >= m.base && a - m.base < m.size)
+}
+
 /// Test: dead blocks in this thread's installed test modules.
 #[cfg(test)]
 pub(in crate::emu) fn test_dead() -> usize {

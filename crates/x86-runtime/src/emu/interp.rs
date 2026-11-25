@@ -21,7 +21,7 @@ use super::routes::{
     is_routed_dll_chkstk, is_routed_dll_stack_pos, is_routed_dll_stub, lookup_routed_regfile,
     ExeRoute,
 };
-use super::{eh, fast, jit, jit_stats, note_null_call, regfile, regfile_ext};
+use super::{aot_strict, eh, fast, jit, jit_stats, note_null_call, regfile, regfile_ext};
 use crate::exe::{rd, teb_self, wr};
 use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind};
 
@@ -866,12 +866,16 @@ unsafe fn emu_run_region(
                     budget = budget.min(4096);
                 }
                 let (ex, executed) = (*jit_ptr).run(&mut cpu, code, budget);
-                if jstats {
-                    if after_rip_exit {
-                        jit_stats::rip_rehit();
+                if aot_strict::translated_accounting_enabled() {
+                    let from_aot = !(*jit_ptr).owns_code(code);
+                    aot_strict::record_translated_insns(executed, from_aot);
+                    if jstats {
+                        if after_rip_exit {
+                            jit_stats::rip_rehit();
+                        }
+                        jit_stats::jit_run(ex, executed, cpu.jx.target, cpu.rip, from_aot);
+                        jstats_rip = ex == jit::EXIT_RIP;
                     }
-                    jit_stats::jit_run(ex, executed, cpu.jx.target, cpu.rip);
-                    jstats_rip = ex == jit::EXIT_RIP;
                 }
                 g.steps = g.steps - 1 + executed as usize;
                 g.sample_left = (g.sample_left as i64 - executed).max(1) as u32;
@@ -929,7 +933,9 @@ unsafe fn emu_run_region(
             jit_stats::interp(cur_ip, (*ins_base.add(cur_off)).mnemonic(), op.kind == fast::K_GENERIC);
         }
 
-        if op.kind != fast::K_GENERIC && !(soft_flush && super::denorm::uses_fp(&*ins_base.add(cur_off))) {
+        let is_soft_fp = soft_flush && super::denorm::uses_fp(&*ins_base.add(cur_off));
+        let strict_active = aot_strict::is_active();
+        if op.kind != fast::K_GENERIC && !is_soft_fp {
             if prof_mnem_fast {
                 if let Some(p) = prof {
                     p.mnemonic((*ins_base.add(cur_off)).mnemonic());
@@ -937,7 +943,7 @@ unsafe fn emu_run_region(
             }
             if !verify || !fast::verifiable(op.kind) {
                 let fx;
-                if !verify && !prof_mnem_fast && !precise && !nan_step && !soft_flush {
+                if !verify && !prof_mnem_fast && !precise && !nan_step && !soft_flush && !strict_active {
                     let burst_ok = if !prof_mnem && !jstats && !skipped_jit {
                         if let Some((slot, blk_len)) = head_slot {
                             let mflags = burst_mode_flags_from_base(burst_base_flags, jit_ptr);
@@ -999,6 +1005,13 @@ unsafe fn emu_run_region(
                             burst_budget,
                         );
                         let extra = (exit.steps - 1) as usize;
+                        if jit_on {
+                            aot_strict::record_interp_fast(
+                                cur_ip,
+                                (*ins_base.add(cur_off)).mnemonic(),
+                                exit.steps as u64,
+                            );
+                        }
                         blk_off = exit.next_off;
                         blk_left = exit.next_left;
                         g.steps += extra;
@@ -1008,6 +1021,13 @@ unsafe fn emu_run_region(
                     } else {
                         let (f, n, last) = fast::run_chain(&mut cpu, op, blk_left, g.sample_left.max(1));
                         let extra = (n - 1) as usize;
+                        if jit_on || strict_active {
+                            aot_strict::record_interp_fast(
+                                cur_ip,
+                                (*ins_base.add(cur_off)).mnemonic(),
+                                n as u64,
+                            );
+                        }
                         if jstats && extra != 0 {
                             jit_stats::interp_chain(extra as u64);
                         }
@@ -1019,6 +1039,13 @@ unsafe fn emu_run_region(
                         fx = f;
                     }
                 } else {
+                    if jit_on || strict_active {
+                        aot_strict::record_interp_fast(
+                            cur_ip,
+                            (*ins_base.add(cur_off)).mnemonic(),
+                            1,
+                        );
+                    }
                     let pre_fp = if nan_step {
                         Some(crate::diag::pre_ins(&cpu, &*ins_base.add(cur_off)))
                     } else {
@@ -1030,7 +1057,18 @@ unsafe fn emu_run_region(
                     }
                     if let fast::Fx::FuseJcc = f {
                         // `fuse` guarantees the next slot of this block is the jcc.
-                        let j = &*ops_base.add(blk_off);
+                        let j_off = blk_off;
+                        let j = &*ops_base.add(j_off);
+                        if jit_on || strict_active {
+                            aot_strict::record_interp_fast(
+                                j.ip,
+                                (*ins_base.add(j_off)).mnemonic(),
+                                1,
+                            );
+                        }
+                        if jstats {
+                            jit_stats::interp(j.ip, (*ins_base.add(j_off)).mnemonic(), false);
+                        }
                         blk_off += 1;
                         blk_left -= 1;
                         g.steps += 1;
@@ -1064,6 +1102,9 @@ unsafe fn emu_run_region(
         }
         match mn {
             Mnemonic::Int3 | Mnemonic::Ud2 => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_trap(cur_ip, mn);
+                }
                 let code = if mn == Mnemonic::Int3 {
                     win32_rt::unwind::STATUS_BREAKPOINT
                 } else {
@@ -1113,6 +1154,9 @@ unsafe fn emu_run_region(
             // other vector a #GP in user mode (STATUS_ACCESS_VIOLATION). It used to fall through
             // to the unimplemented no-op, so a fast-fail went on past the `int`.
             Mnemonic::Int => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_trap(cur_ip, mn);
+                }
                 let n = ins.immediate8();
                 let code = match n {
                     0x29 => win32_rt::unwind::STATUS_STACK_BUFFER_OVERRUN,
@@ -1155,6 +1199,9 @@ unsafe fn emu_run_region(
                 break;
             }
             Mnemonic::Syscall | Mnemonic::Sysenter => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_trap(cur_ip, mn);
+                }
                 let ssn = cpu.gpr[0] as u32;
                 let r10 = cpu.gpr[10];
                 let rdx = cpu.gpr[2];
@@ -1197,6 +1244,9 @@ unsafe fn emu_run_region(
                 }
             }
             Mnemonic::Ret => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_generic(cur_ip, mn);
+                }
                 let rsp = cpu.gpr[4];
                 let ret_addr = cpu.read_mem(rsp, 64);
                 let imm = if ins.op_count() > 0 { ins.immediate16() as u64 } else { 0 };
@@ -1204,6 +1254,9 @@ unsafe fn emu_run_region(
                 cpu.rip = ret_addr;
             }
             Mnemonic::Call => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_generic(cur_ip, mn);
+                }
                 let target = match ins.op_kind(0) {
                     OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16 => ins.near_branch_target(),
                     _ => cpu.read_op(&ins, 0, 64),
@@ -1213,6 +1266,9 @@ unsafe fn emu_run_region(
                 }
             }
             Mnemonic::Jmp => {
+                if jit_on || strict_active {
+                    aot_strict::record_interp_generic(cur_ip, mn);
+                }
                 let target = match ins.op_kind(0) {
                     OpKind::NearBranch64 | OpKind::NearBranch32 | OpKind::NearBranch16 => ins.near_branch_target(),
                     _ => cpu.read_op(&ins, 0, 64),
@@ -1227,6 +1283,9 @@ unsafe fn emu_run_region(
                     && ins.flow_control() == FlowControl::ConditionalBranch
                     && !matches!(mn, Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne | Mnemonic::Jrcxz | Mnemonic::Jecxz)
                 {
+                    if jit_on || strict_active {
+                        aot_strict::record_interp_generic(cur_ip, mn);
+                    }
                     if cpu.eval_cc(cc) {
                         let target = ins.near_branch_target();
                         if ins.len() > 2 {
@@ -1238,6 +1297,15 @@ unsafe fn emu_run_region(
                         }
                     }
                 } else {
+                    if jit_on || strict_active {
+                        if is_soft_fp {
+                            aot_strict::record_soft_fp(cur_ip, mn);
+                        } else if super::mmx::uses_mmx(&ins) {
+                            aot_strict::record_interp_mmx(cur_ip, mn);
+                        } else {
+                            aot_strict::record_interp_generic(cur_ip, mn);
+                        }
+                    }
                     let pre_fp = if nan_step {
                         Some(crate::diag::pre_ins(&cpu, &ins))
                     } else {

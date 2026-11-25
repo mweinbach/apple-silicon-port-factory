@@ -15,6 +15,11 @@ use crate::emu::BlockCache;
 
 /// Minimum BFS frontier size before spawning parallel worker threads for CFG discovery.
 const PARALLEL_DISCOVER_MIN_BLOCKS: usize = 512;
+/// Safety cap for intra-`.pdata` BFS hops when default closure depth (`DEFAULT_AOT_CLOSURE`)
+/// is active. Intra-function edges are strictly bounded to the owning `.pdata` function range,
+/// so expanding long sequential/unrolled functions past 128 hops avoids truncating large
+/// functions while keeping cross-leaf and `.pdata`-less traversal bounded at `depth`.
+const MAX_INTRA_PDATA_DEPTH: u32 = 4096;
 
 /// PE32+ data directory `idx` of the image at `[base, base + size)`: `(rva, size)`, None if
 /// absent or out of the image.
@@ -215,16 +220,26 @@ unsafe fn discover_inner(
         .filter(|&(ip, _, _)| in_text(ip))
         .collect();
 
-    for d in 0..=depth {
+    // When `.pdata` is present and caller didn't request a shallow explicit depth
+    // (`depth >= DEFAULT_AOT_CLOSURE`), allow intra-`.pdata` edges (`sf == f`) to expand up to
+    // `MAX_INTRA_PDATA_DEPTH` hops so long sequential/unrolled functions aren't truncated, while
+    // keeping cross-leaf and `.pdata`-less hops strictly bounded by `depth`.
+    let max_depth = if !fmap.is_empty() && depth >= super::DEFAULT_AOT_CLOSURE {
+        depth.max(MAX_INTRA_PDATA_DEPTH)
+    } else {
+        depth
+    };
+
+    for d in 0..=max_depth {
         let mut batch: Vec<(u64, Option<Box<JtRegs>>)> = Vec::new();
         for (ip, hint, is_re) in frontier {
             if is_re {
-                if d == depth {
+                if d == max_depth {
                     continue;
                 }
                 batch.push((ip, hint));
             } else {
-                if !seen.insert(ip) || d == depth {
+                if !seen.insert(ip) || d == max_depth {
                     continue;
                 }
                 if let Some(ref h) = hint {
@@ -328,14 +343,20 @@ unsafe fn discover_inner(
                 let mut is_leaf_entry = false;
                 if !fmap.is_empty() {
                     let sf = func(s);
+                    let past_base_depth = d >= depth;
                     match kind {
                         EdgeKind::Intra | EdgeKind::JumpTable => {
-                            if sf != f {
-                                st.cross += 1;
+                            if sf != f || (past_base_depth && f.is_none()) {
+                                if sf != f {
+                                    st.cross += 1;
+                                }
                                 continue;
                             }
                         }
                         EdgeKind::DirectCall => {
+                            if past_base_depth {
+                                continue;
+                            }
                             if sf.is_some() && sf != f {
                                 st.cross += 1;
                                 continue;
@@ -347,7 +368,7 @@ unsafe fn discover_inner(
                         }
                         EdgeKind::TailBranch => {
                             if sf != f {
-                                if sf.is_none() && valid_code_target(s, &text) {
+                                if !past_base_depth && sf.is_none() && valid_code_target(s, &text) {
                                     // Direct tail-jump from a `.pdata` function into a
                                     // `.pdata`-less leaf helper: follow cleanly without leaking
                                     // caller switch hints.
@@ -357,10 +378,12 @@ unsafe fn discover_inner(
                                     st.cross += 1;
                                     continue;
                                 }
+                            } else if past_base_depth && f.is_none() {
+                                continue;
                             }
                         }
                         EdgeKind::LeaLeaf => {
-                            if sf.is_some() {
+                            if past_base_depth || sf.is_some() {
                                 continue;
                             }
                             out_hint = None;

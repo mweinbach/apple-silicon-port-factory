@@ -3,7 +3,6 @@
 //! through the kernel32 table (lookup falls back between the two).
 
 use crate::heap;
-use crate::kernel32::threads::STILL_ACTIVE;
 use crate::strings::*;
 use crate::teb;
 use crate::types::*;
@@ -30,6 +29,7 @@ pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023u32 as i32;
 pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024u32 as i32;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: NTSTATUS = 0xC000_0047u32 as i32;
 pub const STATUS_FILE_INVALID: NTSTATUS = 0xC000_0098u32 as i32;
+pub const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BBu32 as i32;
 pub const STATUS_INVALID_ADDRESS: NTSTATUS = 0xC000_0141u32 as i32;
 pub const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000_001Au32 as i32;
 pub const STATUS_PORT_NOT_SET: NTSTATUS = 0xC000_0353u32 as i32;
@@ -114,70 +114,252 @@ pub unsafe extern "win64" fn NtCurrentTeb() -> *mut u8 {
     teb::current()
 }
 
+unsafe fn rusage_process_times_100ns() -> (u64, u64) {
+    let mut ru: libc::rusage = std::mem::zeroed();
+    if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+        let user = (ru.ru_utime.tv_sec.max(0) as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((ru.ru_utime.tv_usec.max(0) as u64).saturating_mul(10));
+        let kernel = (ru.ru_stime.tv_sec.max(0) as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((ru.ru_stime.tv_usec.max(0) as u64).saturating_mul(10));
+        (kernel, user)
+    } else {
+        (0, 0)
+    }
+}
+
 pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, out: *mut u8, len: u32, ret: *mut u32) -> NTSTATUS {
     let put_ret = |n: u32| {
         if !ret.is_null() {
-            ret.write_unaligned(n);
+            std::ptr::write_unaligned(ret, n);
         }
     };
+    let is_self = crate::kernel32::process::is_self(h);
+    let child = if is_self {
+        None
+    } else {
+        crate::handles::get_as::<crate::kernel32::process::ChildProcessObj>(h)
+    };
+    if !is_self && child.is_none() {
+        return STATUS_INVALID_HANDLE;
+    }
+    let pid = child.as_ref().map_or_else(std::process::id, |c| c.pid);
     match class {
         0 => {
-            // PROCESS_BASIC_INFORMATION
-            if !crate::kernel32::process::is_self(h) { return STATUS_INVALID_HANDLE; }
+            // ProcessBasicInformation (48 bytes on x64)
+            put_ret(48);
             if len < 48 || out.is_null() {
-                put_ret(48);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, 48);
-            out.cast::<u32>().write_unaligned(STILL_ACTIVE);
-            out.add(8).cast::<usize>().write_unaligned(teb::peb() as usize);
-            out.add(16).cast::<usize>().write_unaligned(crate::process::active_processor_mask());
-            out.add(24).cast::<i32>().write_unaligned(8);
-            out.add(32).cast::<usize>().write_unaligned(std::process::id() as usize);
-            put_ret(48);
+            let exit_status = child
+                .as_ref()
+                .and_then(|c| c.current_exit_code())
+                .unwrap_or(crate::kernel32::threads::STILL_ACTIVE);
+            std::ptr::write_unaligned(out as *mut u32, exit_status);
+            std::ptr::write_unaligned(out.add(8) as *mut usize, if is_self { teb::peb() as usize } else { 0 });
+            std::ptr::write_unaligned(
+                out.add(16) as *mut usize,
+                if is_self {
+                    crate::kernel32::process::current_process_affinity_mask()
+                } else {
+                    0
+                },
+            );
+            std::ptr::write_unaligned(
+                out.add(24) as *mut i32,
+                if is_self {
+                    crate::kernel32::process::current_process_base_priority()
+                } else {
+                    0
+                },
+            ); // BasePriority
+            std::ptr::write_unaligned(out.add(32) as *mut usize, pid as usize);
+            let ppid = if child.is_some() {
+                std::process::id() as usize
+            } else {
+                libc::getppid().max(0) as usize
+            };
+            std::ptr::write_unaligned(out.add(40) as *mut usize, ppid);
+            STATUS_SUCCESS
+        }
+        3 => {
+            // ProcessVmCounters (VM_COUNTERS = 88, VM_COUNTERS_EX = 96, VM_COUNTERS_EX2 = 104)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
+            let want = if len >= 104 {
+                104u32
+            } else if len >= 96 {
+                96u32
+            } else {
+                88u32
+            };
+            put_ret(want);
+            if len < 88 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_bytes(out, 0, want as usize);
+            let (vsize, peak_vsize, rss, peak_rss) = crate::kernel32::process::task_vm_memory();
+            let private_commit = crate::kernel32::memory::committed_private_bytes().max(rss);
+            static PEAK_PRIVATE_COMMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let peak_private = PEAK_PRIVATE_COMMIT
+                .fetch_max(private_commit, std::sync::atomic::Ordering::Relaxed)
+                .max(private_commit);
+            let mut ru: libc::rusage = std::mem::zeroed();
+            let page_faults = if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+                (ru.ru_minflt.max(0) as u64)
+                    .saturating_add(ru.ru_majflt.max(0) as u64)
+                    .min(u32::MAX as u64) as u32
+            } else {
+                0
+            };
+            std::ptr::write_unaligned(out.add(0) as *mut usize, peak_vsize as usize); // PeakVirtualSize
+            std::ptr::write_unaligned(out.add(8) as *mut usize, vsize as usize); // VirtualSize
+            std::ptr::write_unaligned(out.add(16) as *mut u32, page_faults); // PageFaultCount
+            std::ptr::write_unaligned(out.add(24) as *mut usize, peak_rss as usize); // PeakWorkingSetSize
+            std::ptr::write_unaligned(out.add(32) as *mut usize, rss as usize); // WorkingSetSize
+            std::ptr::write_unaligned(out.add(72) as *mut usize, private_commit as usize); // PagefileUsage
+            std::ptr::write_unaligned(out.add(80) as *mut usize, peak_private as usize); // PeakPagefileUsage
+            if want >= 96 {
+                std::ptr::write_unaligned(out.add(88) as *mut usize, private_commit as usize); // PrivateUsage
+            }
+            if want >= 104 {
+                std::ptr::write_unaligned(out.add(96) as *mut usize, rss as usize); // PrivateWorkingSetSize
+            }
             STATUS_SUCCESS
         }
         4 => {
             // ProcessTimes (KERNEL_USER_TIMES: 32 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(32);
             if len < 32 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            if !crate::kernel32::process::is_self(h) { return STATUS_INVALID_HANDLE; }
-            crate::kernel32::time::GetProcessTimes(h, out.cast(), out.add(8).cast(), out.add(16).cast(), out.add(24).cast());
+            std::ptr::write_bytes(out, 0, 32);
+            let created = crate::kernel32::time::process_start_filetime();
+            let (kernel, user) = rusage_process_times_100ns();
+            std::ptr::write_unaligned(out as *mut u64, created); // CreationTime
+            std::ptr::write_unaligned(out.add(16) as *mut u64, kernel); // KernelTime
+            std::ptr::write_unaligned(out.add(24) as *mut u64, user); // UserTime
             STATUS_SUCCESS
         }
         7 => {
             // ProcessDebugPort: 0 = not being debugged.
+            put_ret(8);
             if len < 8 || out.is_null() {
-                put_ret(8);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut usize) = 0;
+            std::ptr::write_unaligned(out as *mut usize, 0);
+            STATUS_SUCCESS
+        }
+        0x12 => {
+            // ProcessPriorityClass (PROCESS_PRIORITY_CLASS: 2 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
+            put_ret(2);
+            if len < 2 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let win_class = crate::kernel32::process::GetPriorityClass(h);
+            if win_class == 0 {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
+            let nt_class: u8 = match win_class {
+                0x40 => 1,    // IDLE_PRIORITY_CLASS
+                0x4000 => 5,  // BELOW_NORMAL_PRIORITY_CLASS
+                0x8000 => 6,  // ABOVE_NORMAL_PRIORITY_CLASS
+                0x80 => 3,    // HIGH_PRIORITY_CLASS
+                0x100 => 4,   // REALTIME_PRIORITY_CLASS
+                _ => 2,       // NORMAL_PRIORITY_CLASS
+            };
+            *out = 1; // Foreground
+            *out.add(1) = nt_class;
+            STATUS_SUCCESS
+        }
+        0x14 => {
+            // ProcessHandleCount (4 bytes)
+            put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let mut count = 0u32;
+            if crate::kernel32::process::GetProcessHandleCount(h, &mut count) == 0 {
+                put_ret(0);
+                return if child.is_some() {
+                    STATUS_ACCESS_DENIED
+                } else {
+                    STATUS_INVALID_HANDLE
+                };
+            }
+            std::ptr::write_unaligned(out as *mut u32, count);
+            STATUS_SUCCESS
+        }
+        0x15 => {
+            // ProcessAffinityMask (8 bytes)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             put_ret(8);
+            if len < 8 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_unaligned(
+                out as *mut usize,
+                crate::kernel32::process::current_process_affinity_mask(),
+            );
+            STATUS_SUCCESS
+        }
+        0x18 => {
+            // ProcessSessionInformation (4 bytes)
+            put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_unaligned(out as *mut u32, 1);
             STATUS_SUCCESS
         }
         0x1A => {
             // ProcessWow64Information: 0 = native 64-bit process.
+            put_ret(8);
             if len < 8 || out.is_null() {
-                put_ret(8);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut usize) = 0;
-            put_ret(8);
+            std::ptr::write_unaligned(out as *mut usize, 0);
             STATUS_SUCCESS
         }
         0x1B | 0x2B | 60 => {
-            // ProcessImageFileName (0x1B) / ProcessImageFileNameWin32 (0x2B)
-            if !crate::kernel32::process::is_self(h) { return STATUS_INVALID_HANDLE; }
-            let win_exe = crate::process::try_config()
-                .map(|c| c.exe_path.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "C:\\Games\\Game.exe".to_string());
+            // ProcessImageFileName (0x1B) / ProcessImageFileNameWin32 (0x2B) / ProcessCommandLineInformation (60)
+            if class == 60 && !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
+            let win_exe = if let Some(ref c) = child {
+                c.exe_win.clone()
+            } else {
+                crate::process::try_config()
+                    .map(|c| c.exe_path.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "C:\\Games\\Game.exe".to_string())
+            };
             let path = if class == 0x1B {
                 crate::path::win32_to_nt_device_path(&win_exe)
-            } else if class == 60 { // ProcessCommandLineInformation
-                from_wide(crate::process::cmdline_w())
+            } else if class == 60 {
+                // ProcessCommandLineInformation
+                if crate::process::try_config().is_some() {
+                    from_wide(crate::process::cmdline_w())
+                } else {
+                    win_exe
+                }
             } else {
                 win_exe
             };
@@ -189,56 +371,87 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, needed as usize);
-            let buf_ptr = out.add(16) as *mut u16;
-            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), buf_ptr.cast(), byte_len);
-            (out as *mut u16).write_unaligned(byte_len as u16);
-            (out.add(2) as *mut u16).write_unaligned((byte_len + 2) as u16);
-            (out.add(8) as *mut usize).write_unaligned(buf_ptr as usize);
+            let buf_ptr = out.add(16);
+            if byte_len > 0 {
+                std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, buf_ptr, byte_len);
+            }
+            std::ptr::write_unaligned(out as *mut u16, byte_len as u16);
+            std::ptr::write_unaligned(out.add(2) as *mut u16, (byte_len + 2) as u16);
+            std::ptr::write_unaligned(out.add(8) as *mut usize, buf_ptr as usize);
+            STATUS_SUCCESS
+        }
+        0x1D => {
+            // ProcessBreakOnTermination (4 bytes)
+            put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_unaligned(out as *mut u32, 0);
             STATUS_SUCCESS
         }
         0x1E => {
             // ProcessDebugObjectHandle: anti-cheats require STATUS_PORT_NOT_SET (0xC0000353)
+            put_ret(8);
             if len < 8 || out.is_null() {
-                put_ret(8);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut usize) = 0;
-            put_ret(8);
+            std::ptr::write_unaligned(out as *mut usize, 0);
             STATUS_PORT_NOT_SET
         }
         0x1F => {
             // ProcessDebugFlags: 1 = NoDebugInherit (= NOT debugged)
+            put_ret(4);
             if len < 4 || out.is_null() {
-                put_ret(4);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut u32) = 1;
-            put_ret(4);
+            std::ptr::write_unaligned(out as *mut u32, 1);
             STATUS_SUCCESS
         }
         0x22 => {
             // ProcessExecuteFlags: MEM_EXECUTE_OPTION_DISABLE (DEP enabled)
+            put_ret(4);
             if len < 4 || out.is_null() {
-                put_ret(4);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut u32) = 0x2F;
-            put_ret(4);
+            std::ptr::write_unaligned(out as *mut u32, 0x2F);
             STATUS_SUCCESS
         }
         0x24 => {
-            // ProcessCookie
+            // ProcessCookie (per-process random 32-bit cookie)
+            if !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
+            put_ret(4);
             if len < 4 || out.is_null() {
-                put_ret(4);
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *(out as *mut u32) = 0x4157_3250;
+            std::ptr::write_unaligned(out as *mut u32, crate::kernel32::process::process_cookie() as u32);
+            STATUS_SUCCESS
+        }
+        0x3D => {
+            // ProcessProtectionInformation (PS_PROTECTION: 1 byte, 0 = unprotected)
+            put_ret(1);
+            if len < 1 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            *out = 0;
+            STATUS_SUCCESS
+        }
+        0x4B => {
+            // ProcessSubsystemInformation (4 bytes: 0 = SubsystemInformationTypeWin32)
             put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_unaligned(out as *mut u32, 0);
             STATUS_SUCCESS
         }
         _ => {
-            let _ = h;
-            stub!("NtQueryInformationProcess class {class}");
+            // Matches Windows NT kernel: unrecognized or unsupported PROCESSINFOCLASS
+            // values return STATUS_INVALID_INFO_CLASS.
+            log::debug!("NtQueryInformationProcess(class={class}) -> STATUS_INVALID_INFO_CLASS");
+            put_ret(0);
             STATUS_INVALID_INFO_CLASS
         }
     }
@@ -254,13 +467,22 @@ pub unsafe extern "win64" fn NtSetInformationProcess(
     STATUS_SUCCESS
 }
 
-pub unsafe extern "win64" fn NtSetInformationThread(_h: HANDLE, class: u32, info: *const c_void, len: u32) -> NTSTATUS {
+pub unsafe extern "win64" fn NtSetInformationThread(h: HANDLE, class: u32, info: *const c_void, len: u32) -> NTSTATUS {
     // Anti-cheats probe ThreadHideFromDebugger (0x11) with non-zero length or non-null
     // buffer to detect naive stubs that unconditionally return STATUS_SUCCESS!
     if class == 0x11 {
         if len != 0 || !info.is_null() {
             return STATUS_INFO_LENGTH_MISMATCH;
         }
+        let target = if h == crate::handles::CURRENT_THREAD {
+            Some(crate::thread::ensure_current_thread_object())
+        } else {
+            crate::handles::get_as::<crate::thread::ThreadObj>(h)
+        };
+        let Some(t) = target else {
+            return STATUS_INVALID_HANDLE;
+        };
+        t.hide_from_debugger.store(true, std::sync::atomic::Ordering::Release);
         return STATUS_SUCCESS;
     }
     log::debug!("NtSetInformationThread(class={class}) accepted");
@@ -268,49 +490,170 @@ pub unsafe extern "win64" fn NtSetInformationThread(_h: HANDLE, class: u32, info
 }
 
 pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out: *mut u8, len: u32, ret: *mut u32) -> NTSTATUS {
+    let put_ret = |n: u32| {
+        if !ret.is_null() {
+            std::ptr::write_unaligned(ret, n);
+        }
+    };
+    let tobj = if h == crate::handles::CURRENT_THREAD {
+        Some(crate::thread::ensure_current_thread_object())
+    } else {
+        crate::handles::get_as::<crate::thread::ThreadObj>(h)
+    };
+    let child_thr = if tobj.is_none() {
+        crate::handles::get_as::<crate::kernel32::process::ChildThreadObj>(h)
+    } else {
+        None
+    };
+    if tobj.is_none() && child_thr.is_none() {
+        return STATUS_INVALID_HANDLE;
+    }
     match class {
-        0 | 1 | 30 => { // ThreadBasicInformation, ThreadTimes, ThreadGroupInformation
-            let need = match class { 0 => 48, 1 => 32, _ => 16 };
-            if !ret.is_null() { ret.write_unaligned(need); }
-            if out.is_null() || len < need { return STATUS_INFO_LENGTH_MISMATCH; }
-            let Some(t) = crate::kernel32::threads::thread_obj(h) else { return STATUS_INVALID_HANDLE };
-            match class {
-                0 => {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    std::ptr::write_bytes(out, 0, 48);
-                    out.cast::<u32>().write_unaligned(t.exit_code().unwrap_or(STILL_ACTIVE));
-                    out.add(8).cast::<usize>().write_unaligned(t.teb.load(Relaxed));
-                    out.add(16).cast::<usize>().write_unaligned(std::process::id() as usize);
-                    out.add(24).cast::<usize>().write_unaligned(t.tid.load(Relaxed));
-                    out.add(32).cast::<usize>().write_unaligned(t.affinity.load(Relaxed));
-                    let priority = 8 + t.priority.load(Relaxed);
-                    out.add(40).cast::<i32>().write_unaligned(priority);
-                    out.add(44).cast::<i32>().write_unaligned(priority);
-                }
-                1 => {
-                    if crate::kernel32::time::GetThreadTimes(h, out.cast(), out.add(8).cast(), out.add(16).cast(), out.add(24).cast()) == FALSE {
-                        return STATUS_INVALID_HANDLE;
-                    }
-                }
-                _ => {
-                    crate::kernel32::threads::GetThreadGroupAffinity(h, out.cast());
-                }
+        0 => {
+            // ThreadBasicInformation (48 bytes on x64)
+            put_ret(48);
+            if len < 48 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
             }
+            std::ptr::write_bytes(out, 0, 48);
+            if let Some(ref t) = tobj {
+                let exit_status = t.exit_code().unwrap_or(crate::kernel32::threads::STILL_ACTIVE);
+                let tid = t.tid.load(std::sync::atomic::Ordering::Relaxed);
+                let tebp = t.teb.load(std::sync::atomic::Ordering::Relaxed);
+                let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+                let aff = t.affinity_mask.load(std::sync::atomic::Ordering::Acquire);
+                let prio = t.priority.load(std::sync::atomic::Ordering::Relaxed);
+                let base_prio = crate::kernel32::process::thread_base_priority(prio);
+                std::ptr::write_unaligned(out as *mut u32, exit_status);
+                std::ptr::write_unaligned(out.add(8) as *mut usize, tebp);
+                std::ptr::write_unaligned(out.add(16) as *mut usize, std::process::id() as usize);
+                std::ptr::write_unaligned(out.add(24) as *mut usize, tid);
+                std::ptr::write_unaligned(out.add(32) as *mut usize, if aff == 0 { proc_mask } else { aff });
+                std::ptr::write_unaligned(out.add(40) as *mut i32, base_prio);
+                std::ptr::write_unaligned(out.add(44) as *mut i32, base_prio);
+            } else if let Some(ref ct) = child_thr {
+                let exit_status = ct.process.current_exit_code().unwrap_or(crate::kernel32::threads::STILL_ACTIVE);
+                std::ptr::write_unaligned(out as *mut u32, exit_status);
+                std::ptr::write_unaligned(out.add(16) as *mut usize, ct.process.pid as usize);
+                std::ptr::write_unaligned(out.add(24) as *mut usize, ct.tid as usize);
+            }
+            STATUS_SUCCESS
+        }
+        1 => {
+            // ThreadTimes (KERNEL_USER_TIMES: 32 bytes)
+            let Some(ref t) = tobj else {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            };
+            put_ret(32);
+            if len < 32 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let (created, exited, kernel, user) = t.times_100ns();
+            std::ptr::write_unaligned(out as *mut u64, created);
+            std::ptr::write_unaligned(out.add(8) as *mut u64, exited);
+            std::ptr::write_unaligned(out.add(16) as *mut u64, kernel);
+            std::ptr::write_unaligned(out.add(24) as *mut u64, user);
+            STATUS_SUCCESS
+        }
+        9 => {
+            // ThreadQuerySetWin32StartAddress (8 bytes)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadQuerySetWin32StartAddress): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
+            put_ret(8);
+            if len < 8 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let start = t.start_address.load(std::sync::atomic::Ordering::Acquire);
+            std::ptr::write_unaligned(out as *mut usize, start);
+            STATUS_SUCCESS
+        }
+        0x0C => {
+            // ThreadAmILastThread (4 bytes)
+            if tobj.is_none() {
+                log::warn!("NtQueryInformationThread(ThreadAmILastThread): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            }
+            put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let live = crate::thread::all_threads()
+                .iter()
+                .filter(|t| t.exit_code().is_none())
+                .count();
+            std::ptr::write_unaligned(out as *mut u32, (live <= 1) as u32);
             STATUS_SUCCESS
         }
         0x11 => {
-            // ThreadHideFromDebugger
+            // ThreadHideFromDebugger (1 byte)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadHideFromDebugger): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
+            put_ret(1);
             if len != 1 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            *out = 0;
-            if !ret.is_null() {
-                *ret = 1;
+            let hidden = t.hide_from_debugger.load(std::sync::atomic::Ordering::Acquire);
+            *out = hidden as u8;
+            STATUS_SUCCESS
+        }
+        0x1E => {
+            // ThreadGroupInformation (GROUP_AFFINITY: 16 bytes)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadGroupInformation): child thread affinity query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
+            put_ret(16);
+            if len < 16 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
             }
+            let proc_mask = crate::kernel32::process::current_process_affinity_mask();
+            let m = t.affinity_mask.load(std::sync::atomic::Ordering::Acquire);
+            let mask = if m == 0 { proc_mask } else { m };
+            let group = t.affinity_group.load(std::sync::atomic::Ordering::Acquire);
+            std::ptr::write_bytes(out, 0, 16);
+            std::ptr::write_unaligned(out as *mut usize, mask);
+            std::ptr::write_unaligned(out.add(8) as *mut u16, group);
+            STATUS_SUCCESS
+        }
+        0x26 => {
+            // ThreadNameInformation (UNICODE_STRING header + UTF-16LE chars)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadNameInformation): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
+            let name = crate::thread::defer_lock(&t.name).clone();
+            let wide: Vec<u16> = name.encode_utf16().collect();
+            let byte_len = wide.len() * 2;
+            let needed = (16 + byte_len + 2) as u32;
+            put_ret(needed);
+            if len < needed || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_bytes(out, 0, needed as usize);
+            let buf_ptr = out.add(16);
+            if byte_len > 0 {
+                std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, buf_ptr, byte_len);
+            }
+            std::ptr::write_unaligned(out as *mut u16, byte_len as u16);
+            std::ptr::write_unaligned(out.add(2) as *mut u16, (byte_len + 2) as u16);
+            std::ptr::write_unaligned(out.add(8) as *mut usize, buf_ptr as usize);
             STATUS_SUCCESS
         }
         _ => {
-            stub!("NtQueryInformationThread class {class}");
+            // Matches Windows NT kernel: unrecognized or unsupported THREADINFOCLASS
+            // values return STATUS_INVALID_INFO_CLASS.
+            log::debug!("NtQueryInformationThread(class={class}) -> STATUS_INVALID_INFO_CLASS");
+            put_ret(0);
             STATUS_INVALID_INFO_CLASS
         }
     }
@@ -319,7 +662,7 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
 pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, len: u32, ret: *mut u32) -> NTSTATUS {
     let put_ret = |n: u32| {
         if !ret.is_null() {
-            ret.write_unaligned(n);
+            std::ptr::write_unaligned(ret, n);
         }
     };
     match class {
@@ -389,15 +732,65 @@ pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, 
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, needed as usize);
-            (out.add(4) as *mut u32).write_unaligned(1); // NumberOfThreads
+            let n_threads = crate::thread::all_threads().len().max(1) as u32;
+            (out.add(4) as *mut u32).write_unaligned(n_threads); // NumberOfThreads
             (out.add(80) as *mut usize).write_unaligned(std::process::id() as usize); // UniqueProcessId
             STATUS_SUCCESS
         }
-        73 => { // SystemLogicalProcessorInformation
-            let mut needed = len;
-            let ok = crate::kernel32::sysinfo::GetLogicalProcessorInformation(out, &mut needed);
+        8 => {
+            // SystemProcessorPerformanceInformation (48 bytes per logical CPU)
+            let ncpus = crate::process::num_cpus().max(1) as usize;
+            let needed = (ncpus * 48) as u32;
             put_ret(needed);
-            if ok == FALSE { STATUS_INFO_LENGTH_MISMATCH } else { STATUS_SUCCESS }
+            if len < needed || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_bytes(out, 0, needed as usize);
+            const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+            extern "C" {
+                fn mach_host_self() -> u32;
+                static mach_task_self_: u32;
+                fn host_processor_info(
+                    host: u32,
+                    flavor: i32,
+                    out_processor_count: *mut u32,
+                    out_processor_info: *mut *mut i32,
+                    out_processor_info_cnt: *mut u32,
+                ) -> i32;
+                fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
+            }
+            let mut proc_cnt: u32 = 0;
+            let mut info_ptr: *mut i32 = std::ptr::null_mut();
+            let mut info_cnt: u32 = 0;
+            if host_processor_info(
+                mach_host_self(),
+                PROCESSOR_CPU_LOAD_INFO,
+                &mut proc_cnt,
+                &mut info_ptr,
+                &mut info_cnt,
+            ) == 0
+                && !info_ptr.is_null()
+            {
+                let hz = libc::sysconf(libc::_SC_CLK_TCK);
+                let tick_100ns = if hz > 0 { 10_000_000u64 / (hz as u64) } else { 100_000u64 };
+                let fill = (proc_cnt as usize).min(ncpus);
+                for cpu in 0..fill {
+                    let base = info_ptr.add(cpu * 4);
+                    let user_t = (*base.add(0) as u32 as u64).saturating_add(*base.add(3) as u32 as u64);
+                    let sys_t = *base.add(1) as u32 as u64;
+                    let idle_t = *base.add(2) as u32 as u64;
+                    let idle_100ns = idle_t.saturating_mul(tick_100ns);
+                    let kernel_100ns = sys_t.saturating_mul(tick_100ns).saturating_add(idle_100ns);
+                    let user_100ns = user_t.saturating_mul(tick_100ns);
+                    let entry = out.add(cpu * 48);
+                    std::ptr::write_unaligned(entry as *mut i64, idle_100ns as i64);
+                    std::ptr::write_unaligned(entry.add(8) as *mut i64, kernel_100ns as i64);
+                    std::ptr::write_unaligned(entry.add(16) as *mut i64, user_100ns as i64);
+                }
+                let bytes = (info_cnt as u64) * 4;
+                let _ = mach_vm_deallocate(mach_task_self_, info_ptr as u64, bytes);
+            }
+            STATUS_SUCCESS
         }
         0x0B => {
             // SystemModuleInformation (RTL_PROCESS_MODULES with 1 clean ntoskrnl.exe entry)
@@ -423,6 +816,17 @@ pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, 
             *out.add(1) = 1; // KdDebuggerNotPresent = TRUE
             STATUS_SUCCESS
         }
+        0x49 => {
+            // SystemLogicalProcessorInformation
+            let mut io_len = len;
+            let ok = crate::kernel32::sysinfo::GetLogicalProcessorInformation(out, &mut io_len);
+            put_ret(io_len);
+            if ok != 0 {
+                STATUS_SUCCESS
+            } else {
+                STATUS_INFO_LENGTH_MISMATCH
+            }
+        }
         0x67 => {
             // SystemCodeIntegrityInformation (8 bytes):
             // Length = 8, CodeIntegrityOptions = 0x01 (CODEINTEGRITY_OPTION_ENABLED, TESTSIGNING = 0)
@@ -434,8 +838,30 @@ pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, 
             (out.add(4) as *mut u32).write_unaligned(0x01); // CODEINTEGRITY_OPTION_ENABLED
             STATUS_SUCCESS
         }
+        0x6B => {
+            // SystemLogicalProcessorInformationEx (RelationAll = 0xFFFF)
+            let mut io_len = len;
+            let ok = crate::kernel32::sysinfo::GetLogicalProcessorInformationEx(0xFFFF, out, &mut io_len);
+            put_ret(io_len);
+            if ok != 0 {
+                STATUS_SUCCESS
+            } else {
+                STATUS_INFO_LENGTH_MISMATCH
+            }
+        }
+        0x9F => {
+            // SystemKernelDebuggerInformationEx (3 bytes: Allowed=0, Enabled=0, Present=0)
+            put_ret(3);
+            if len < 3 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_bytes(out, 0, 3);
+            STATUS_SUCCESS
+        }
         _ => {
-            stub!("NtQuerySystemInformation class {class}");
+            // Matches Windows NT kernel: unrecognized or unsupported SYSTEM_INFORMATION_CLASS
+            // values return STATUS_INVALID_INFO_CLASS.
+            log::debug!("NtQuerySystemInformation(class={class}) -> STATUS_INVALID_INFO_CLASS");
             put_ret(0);
             STATUS_INVALID_INFO_CLASS
         }
@@ -724,6 +1150,9 @@ pub unsafe extern "win64" fn RtlUnsubscribeWnfNotificationWaitForCompletion(_sub
     STATUS_SUCCESS
 }
 
+/// Native-unsupported: Windows Kernel Transaction Manager (KTM / Transactional NTFS,
+/// deprecated by Microsoft) has no equivalent kernel transaction object on Darwin/APFS.
+/// Matches Windows when TxF / KTM is unavailable on non-NTFS volumes (`STATUS_NOT_IMPLEMENTED`).
 pub unsafe extern "win64" fn NtCreateTransaction(
     out: *mut HANDLE,
     _access: u32,
@@ -737,14 +1166,19 @@ pub unsafe extern "win64" fn NtCreateTransaction(
     _desc: *const UNICODE_STRING,
 ) -> NTSTATUS {
     if !out.is_null() {
-        *out = std::ptr::null_mut();
+        std::ptr::write_unaligned(out, std::ptr::null_mut());
     }
-    stub!("NtCreateTransaction -> STATUS_NOT_IMPLEMENTED");
+    log::debug!("NtCreateTransaction: KTM/TxF unavailable on Darwin/APFS -> STATUS_NOT_IMPLEMENTED");
     STATUS_NOT_IMPLEMENTED
 }
 
-pub unsafe extern "win64" fn NtCommitTransaction(_txn: HANDLE, _wait: u8) -> NTSTATUS {
-    stub!("NtCommitTransaction -> STATUS_NOT_IMPLEMENTED");
+/// Native-unsupported: KTM / Transactional NTFS does not exist on Darwin/APFS.
+/// Returns `STATUS_INVALID_HANDLE` for a NULL handle and `STATUS_NOT_IMPLEMENTED` otherwise.
+pub unsafe extern "win64" fn NtCommitTransaction(txn: HANDLE, _wait: u8) -> NTSTATUS {
+    if txn.is_null() {
+        return STATUS_INVALID_HANDLE;
+    }
+    log::debug!("NtCommitTransaction: KTM/TxF unavailable on Darwin/APFS -> STATUS_NOT_IMPLEMENTED");
     STATUS_NOT_IMPLEMENTED
 }
 
@@ -1670,16 +2104,24 @@ pub unsafe extern "win64" fn ZwGetNextThread(
     )
 }
 
+/// Native-unsupported direct call: Windows kernel-to-user trap-frame entry point
+/// (`ntoskrnl!PspLookupKernelUserEntryPoints`). Exported so `GetProcAddress` and
+/// anti-cheat/hook inspection resolve a distinct address in `ntdll.dll`; our runtime
+/// dispatches hardware exceptions via `signals.rs` -> `unwind::dispatch_exception`.
 pub unsafe extern "win64" fn KiUserExceptionDispatcher() {
-    stub!("KiUserExceptionDispatcher called directly");
+    log::warn!("KiUserExceptionDispatcher: kernel-to-user entry point called directly");
 }
 
+/// Native-unsupported direct call: Windows kernel-to-user APC trap-frame entry point.
+/// Exported for address resolution/hooking; user APCs are delivered via `thread::run_pending_apcs`.
 pub unsafe extern "win64" fn KiUserApcDispatcher() {
-    stub!("KiUserApcDispatcher called directly");
+    log::warn!("KiUserApcDispatcher: kernel-to-user entry point called directly");
 }
 
+/// Native-unsupported direct call: Windows kernel-to-user win32k callback entry point.
+/// Exported for address resolution/hooking; window/UI callbacks dispatch natively via `user32/`.
 pub unsafe extern "win64" fn KiUserCallbackDispatcher() {
-    stub!("KiUserCallbackDispatcher called directly");
+    log::warn!("KiUserCallbackDispatcher: kernel-to-user entry point called directly");
 }
 
 pub unsafe extern "win64" fn RtlDispatchException(
@@ -2416,8 +2858,10 @@ pub unsafe extern "win64" fn LdrUnloadDll(hmod: HMODULE) -> NTSTATUS {
     }
 }
 
+/// Native-unsupported direct call: Windows kernel-to-user initial thread startup entry point.
+/// Exported for address resolution/hooking; thread initialization runs natively in `thread::thread_main`.
 pub unsafe extern "win64" fn LdrInitializeThunk(_ctx: *mut c_void, _ntdll_base: *mut c_void) {
-    stub!("LdrInitializeThunk called directly");
+    log::warn!("LdrInitializeThunk: kernel-to-user entry point called directly");
 }
 
 pub unsafe extern "win64" fn RtlUserThreadStart(start: *const c_void, param: *mut c_void) {
@@ -3075,6 +3519,263 @@ mod tests {
             assert_eq!(crate::kernel32::threads::CloseHandle(iocp), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(ev), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(sem), TRUE);
+        }
+    }
+
+    #[test]
+    fn nt_query_info_classes_transactions_and_kernel_entries() {
+        unsafe {
+            // 1. NtQueryInformationProcess classes: VmCounters(3), PriorityClass(0x12), AffinityMask(0x15),
+            // Session(0x18), Cookie(0x24), Protection(0x3D), Subsystem(0x4B), invalid handle, unknown classes.
+            let mut buf = [0u8; 256];
+            let mut ret = 0u32;
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 104);
+            // ProcessVmCounters VirtualSize/PeakVirtualSize reflect actual reserved virtual memory, not just RSS.
+            let before_vsize = std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize);
+            let before_rss = std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize);
+            let reserve_sz = 64usize * 1024 * 1024;
+            let reserved = crate::kernel32::memory::VirtualAlloc(
+                std::ptr::null_mut(),
+                reserve_sz,
+                crate::kernel32::memory::MEM_RESERVE,
+                crate::kernel32::memory::PAGE_NOACCESS,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
+            let after_peak_vsize = std::ptr::read_unaligned(buf.as_ptr().add(0) as *const usize);
+            let after_vsize = std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize);
+            let after_rss = std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize);
+            assert!(
+                after_vsize >= before_vsize + reserve_sz - (4 * 1024 * 1024),
+                "VirtualSize should include untouched 64 MiB reservation (before={before_vsize}, after={after_vsize})"
+            );
+            assert!(after_peak_vsize >= after_vsize);
+            assert!(after_vsize > after_rss && after_rss < before_rss + reserve_sz / 2);
+            assert_eq!(
+                crate::kernel32::memory::VirtualFree(reserved, 0, crate::kernel32::memory::MEM_RELEASE),
+                TRUE
+            );
+            // ProcessTimes (4) reports the process creation timestamp matching GetProcessTimes, not boot time.
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 32);
+            let nt_creation = std::ptr::read_unaligned(buf.as_ptr() as *const u64);
+            let (mut ft_create, mut ft_exit, mut ft_kernel, mut ft_user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            assert_eq!(
+                crate::kernel32::time::GetProcessTimes(
+                    crate::handles::CURRENT_PROCESS,
+                    &mut ft_create,
+                    &mut ft_exit,
+                    &mut ft_kernel,
+                    &mut ft_user,
+                ),
+                TRUE
+            );
+            assert_eq!(nt_creation, ft_create.to_u64());
+            assert_eq!(nt_creation, crate::kernel32::time::process_start_filetime());
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x12, buf.as_mut_ptr(), 2, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 2);
+            assert_eq!(buf[0], 1);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x15, buf.as_mut_ptr(), 8, &mut ret), STATUS_SUCCESS);
+            assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x18, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr() as *const u32), 1);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3D, buf.as_mut_ptr(), 1, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 1);
+            assert_eq!(buf[0], 0);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x4B, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 4);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr() as *const u32), 0);
+            // ProcessCommandLineInformation (0x3C) returns a UNICODE_STRING for self; ProcessTelemetryIdInformation (0x40) is unsupported.
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3C, buf.as_mut_ptr(), buf.len() as u32, &mut ret), STATUS_SUCCESS);
+            assert!(ret >= 18);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x40, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationProcess(0xDEADusize as HANDLE, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_INVALID_HANDLE);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+
+            // Child process handles must propagate STATUS_ACCESS_DENIED for self-only queries
+            // like ProcessHandleCount (0x14) rather than succeeding with a fabricated 0.
+            let child_h = crate::kernel32::process::tests::make_test_child_handle(424242, "C:\\Games\\Child.exe");
+            ret = 99;
+            assert_eq!(NtQueryInformationProcess(child_h, 0x14, buf.as_mut_ptr(), 4, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(ret, 0);
+            assert_eq!(NtQueryInformationProcess(child_h, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 0x12, buf.as_mut_ptr(), 2, &mut ret), STATUS_ACCESS_DENIED);
+            assert_eq!(NtQueryInformationProcess(child_h, 0x15, buf.as_mut_ptr(), 8, &mut ret), STATUS_ACCESS_DENIED);
+            // Child process queries backed by real ChildProcessObj fields (Basic, ImageFileNameWin32) still succeed,
+            // without leaking parent-only ProcessBasicInformation fields (PEB, AffinityMask, BasePriority).
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            let self_aff = std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize);
+            assert_eq!(self_aff, crate::kernel32::process::current_process_affinity_mask());
+            assert_ne!(self_aff, 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 8);
+
+            assert_eq!(NtQueryInformationProcess(child_h, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize), 424242);
+            assert_eq!(
+                std::ptr::read_unaligned(buf.as_ptr().add(40) as *const usize),
+                std::process::id() as usize
+            );
+            assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
+
+            // 2. NtQueryInformationThread classes: ThreadBasicInformation(0), ThreadTimes(1),
+            // ThreadAmILastThread(0x0C), ThreadHideFromDebugger(0x11) round-trip,
+            // ThreadGroupInformation(0x1E), ThreadNameInformation(0x26), unknown classes.
+            {
+                let orig_proc_prio = crate::kernel32::process::GetPriorityClass(crate::handles::CURRENT_PROCESS);
+                let orig_thr_prio = crate::kernel32::threads::GetThreadPriority(crate::handles::CURRENT_THREAD);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, 0x20), TRUE);
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, 0), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(ret, 48);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(40) as *const i32), 8);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 8);
+                // Below-normal relative priority (-1) maps to absolute NT base priority 7 (never negative).
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -1), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(40) as *const i32), 7);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 7);
+                // THREAD_PRIORITY_IDLE (-15) -> 1, HIGH_PRIORITY_CLASS + (-1) -> 12.
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -15), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 1);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, 0x80), TRUE);
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, -1), TRUE);
+                assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(44) as *const i32), 12);
+                assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+                assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 13);
+                // Restore original thread and process priorities.
+                assert_eq!(crate::kernel32::threads::SetThreadPriority(crate::handles::CURRENT_THREAD, orig_thr_prio), TRUE);
+                assert_eq!(crate::kernel32::process::SetPriorityClass(crate::handles::CURRENT_PROCESS, orig_proc_prio), TRUE);
+            }
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 1, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 32);
+            // ThreadTimes on an exited thread preserves ExitTime and snapshotted CPU time.
+            let worker = crate::thread::spawn(
+                Box::new(|| {
+                    let mut acc = 1u64;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_millis(10) {
+                        for _ in 0..10_000 {
+                            acc = std::hint::black_box(acc.wrapping_mul(6364136223846793005).wrapping_add(1));
+                        }
+                    }
+                    std::hint::black_box(acc) as u32
+                }),
+                0,
+                false,
+                false,
+            )
+            .expect("spawn timing worker");
+            let wh = crate::handles::insert(worker);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(wh, 5000), WAIT_OBJECT_0);
+            let mut tbuf = [0u8; 32];
+            assert_eq!(NtQueryInformationThread(wh, 1, tbuf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 32);
+            let t_create = std::ptr::read_unaligned(tbuf.as_ptr() as *const u64);
+            let t_exit = std::ptr::read_unaligned(tbuf.as_ptr().add(8) as *const u64);
+            let t_kernel = std::ptr::read_unaligned(tbuf.as_ptr().add(16) as *const u64);
+            let t_user = std::ptr::read_unaligned(tbuf.as_ptr().add(24) as *const u64);
+            assert!(t_create > 0);
+            assert!(t_exit >= t_create, "expected ExitTime ({t_exit}) >= CreationTime ({t_create})");
+            assert!(t_kernel + t_user > 0, "expected preserved CPU time after thread exit");
+            assert_eq!(crate::kernel32::threads::CloseHandle(wh), TRUE);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0C, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 4);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x1E, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
+            // Child thread handles must NOT fall back to the parent process's affinity/state:
+            // ThreadBasicInformation (0) reports real child pid/tid, while unsupported classes
+            // (including ThreadGroupInformation 0x1E) fail with STATUS_NOT_SUPPORTED.
+            let child_th = crate::kernel32::process::tests::make_test_child_thread_handle(424242, 424243);
+            assert_eq!(NtQueryInformationThread(child_th, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize), 424242);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const usize), 424243);
+            for &(cls, sz) in &[(9u32, 8u32), (0x0C, 4), (0x11, 1), (0x1E, 16), (0x26, 64)] {
+                ret = 99;
+                assert_eq!(
+                    NtQueryInformationThread(child_th, cls, buf.as_mut_ptr(), sz, &mut ret),
+                    STATUS_NOT_SUPPORTED,
+                    "child thread query class 0x{cls:x} must fail honestly with STATUS_NOT_SUPPORTED"
+                );
+                assert_eq!(ret, 0);
+            }
+            assert_eq!(crate::kernel32::threads::CloseHandle(child_th), TRUE);
+            assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
+            // ThreadActualBasePriority (0x19), 0x0D, and unimplemented ThreadIsIoPending (0x10)
+            // return honest STATUS_INVALID_INFO_CLASS rather than misrouting or fabricating 0.
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0D, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x10, buf.as_mut_ptr(), 4, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x19, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
+            let mut hidden = 99u8;
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x11, &mut hidden, 1, &mut ret), STATUS_SUCCESS);
+            assert_eq!(NtSetInformationThread(crate::handles::CURRENT_THREAD, 0x11, std::ptr::null(), 0), STATUS_SUCCESS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x11, &mut hidden, 1, &mut ret), STATUS_SUCCESS);
+            assert_eq!(hidden, 1);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 9999, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
+
+            // Odd-addressed output buffer for ThreadNameInformation (0x26) must not panic on alignment.
+            let name_w = to_wide_z("OddBufThread");
+            assert_eq!(
+                crate::kernel32::threads::SetThreadDescription(crate::handles::CURRENT_THREAD, name_w.as_ptr()),
+                S_OK
+            );
+            let mut unaligned_buf = [0u8; 129];
+            let odd_ptr = unaligned_buf.as_mut_ptr().add(1);
+            assert_eq!((odd_ptr as usize) & 1, 1);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x26, odd_ptr, 128, &mut ret), STATUS_SUCCESS);
+            let got_len = std::ptr::read_unaligned(odd_ptr as *const u16) as usize;
+            assert_eq!(got_len, "OddBufThread".len() * 2);
+            let mut units = vec![0u16; got_len / 2];
+            std::ptr::copy_nonoverlapping(odd_ptr.add(16), units.as_mut_ptr() as *mut u8, got_len);
+            assert_eq!(String::from_utf16_lossy(&units), "OddBufThread");
+
+            // 3. NtQuerySystemInformation classes: ProcessorPerformance(8), LogicalProcessor(0x49),
+            // KernelDebuggerEx(0x9F), unimplemented RegistryQuota(0x25) -> honest STATUS_INVALID_INFO_CLASS.
+            let mut perf_need = 0u32;
+            assert_eq!(NtQuerySystemInformation(8, std::ptr::null_mut(), 0, &mut perf_need), STATUS_INFO_LENGTH_MISMATCH);
+            assert!(perf_need >= 48);
+            let mut perf_buf = vec![0u8; perf_need as usize];
+            assert_eq!(NtQuerySystemInformation(8, perf_buf.as_mut_ptr(), perf_need, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, perf_need);
+            assert_eq!(NtQuerySystemInformation(0x9F, buf.as_mut_ptr(), 3, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 3);
+            assert_eq!(&buf[..3], &[0, 0, 0]);
+            assert_eq!(NtQuerySystemInformation(0x25, buf.as_mut_ptr(), 12, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQuerySystemInformation(9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+
+            // 4. Native-unsupported TxF transactions: STATUS_NOT_IMPLEMENTED / STATUS_INVALID_HANDLE.
+            let mut txn: HANDLE = 0x1234usize as HANDLE;
+            assert_eq!(
+                NtCreateTransaction(&mut txn, 0, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), 0, 0, 0, std::ptr::null(), std::ptr::null()),
+                STATUS_NOT_IMPLEMENTED
+            );
+            assert!(txn.is_null());
+            assert_eq!(NtCommitTransaction(std::ptr::null_mut(), 1), STATUS_INVALID_HANDLE);
+            assert_eq!(NtCommitTransaction(0x1234usize as HANDLE, 1), STATUS_NOT_IMPLEMENTED);
+
+            // 5. Kernel-to-user entry points resolve as distinct export addresses.
+            let addrs = [
+                KiUserExceptionDispatcher as *const () as usize,
+                KiUserApcDispatcher as *const () as usize,
+                KiUserCallbackDispatcher as *const () as usize,
+                LdrInitializeThunk as *const () as usize,
+            ];
+            for i in 0..addrs.len() {
+                assert_ne!(addrs[i], 0);
+                for j in (i + 1)..addrs.len() {
+                    assert_ne!(addrs[i], addrs[j]);
+                }
+            }
         }
     }
 }

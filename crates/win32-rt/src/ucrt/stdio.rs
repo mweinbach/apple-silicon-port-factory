@@ -426,8 +426,19 @@ unsafe fn wait_pipe_fd_ready(fd: i32, events: libc::c_short, orig_errno: i32) ->
 /// Raw read with CRLF->LF translation in text mode.
 pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
     let info = fd_info(fd);
+    let stage_len = if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
+        n.min(1024 * 1024)
+    } else {
+        0
+    };
+    let mut staging = if stage_len > 0 { vec![0u8; stage_len] } else { Vec::new() };
+    let (io_ptr, io_len) = if stage_len > 0 {
+        (staging.as_mut_ptr(), stage_len)
+    } else {
+        (buf, n)
+    };
     let r = loop {
-        let k = libc::read(fd, buf as *mut c_void, n);
+        let k = libc::read(fd, io_ptr as *mut c_void, io_len);
         if k >= 0 {
             break k;
         }
@@ -444,9 +455,16 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
         return -1;
     };
     if r == 0 || !info.text || info.raw {
+        if stage_len > 0 && r > 0 {
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..r as usize]) {
+                *libc::__error() = e;
+                errno::set_from_host();
+                return -1;
+            }
+        }
         return r;
     }
-    let s = std::slice::from_raw_parts_mut(buf, r as usize);
+    let s = std::slice::from_raw_parts_mut(io_ptr, r as usize);
     let mut w = 0;
     let mut i = 0;
     while i < s.len() {
@@ -474,6 +492,13 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
         s[w] = s[i];
         w += 1;
         i += 1;
+    }
+    if stage_len > 0 && w > 0 {
+        if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..w]) {
+            *libc::__error() = e;
+            errno::set_from_host();
+            return -1;
+        }
     }
     w as isize
 }
@@ -531,7 +556,17 @@ pub unsafe extern "win64" fn _write(fd: i32, buf: *const c_void, n: u32) -> i32 
     if !fd_valid(fd) {
         return bad_fd();
     }
-    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, n as usize)) as i32
+    let len = n as usize;
+    if len > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, len) {
+        let mut staging = vec![0u8; len];
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf as *const u8, &mut staging) {
+            *libc::__error() = e;
+            errno::set_from_host();
+            return -1;
+        }
+        return write_fd(fd, &staging) as i32;
+    }
+    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, len)) as i32
 }
 
 pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {

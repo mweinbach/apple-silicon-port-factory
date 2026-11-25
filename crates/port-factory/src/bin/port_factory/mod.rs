@@ -13,6 +13,7 @@ use port_factory::json_output::{exit_codes, JsonEnvelope};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_OPS_TSV: &str = "db/ops_x86_to_arm64.tsv";
+pub const DEFAULT_ISA_COVERAGE_TSV: &str = "db/isa_coverage.tsv";
 pub const DEFAULT_PROFILES_TSV: &str = "db/ops_profiles.tsv";
 pub const DEFAULT_WIN32_TSV: &str = "db/win32_apis.tsv";
 pub const DEFAULT_STUB_INVENTORY_TSV: &str = "db/stub_inventory.tsv";
@@ -55,6 +56,8 @@ pub fn usage() -> ! {
            stats [--json]                       Print summary statistics of the x86-64 -> ARM64 database\n\
            list [--category CAT] [--search STR] List translated op families and their ARM64 patterns\n\
            explain <MNEMONIC_OR_ID>             Show full x86-64 -> ARM64 translation recipe & semantics\n\
+           isa-coverage [--sync] [--tsv PATH] [--json]\n\
+                                                Exhaustive 64-bit iced-x86 ISA coverage ledger by CpuidFeature & family\n\
            readiness <PE_OR_GAME_DIR> [--json]  Rank x86 dispatch gaps and Win32 imports per PE\n\
            scan <PE_FILE_OR_DIR...> [--record] [--top N] [--json]\n\
                                                 Scan .exe/.dll binaries for ARM64 coverage & op mix\n\

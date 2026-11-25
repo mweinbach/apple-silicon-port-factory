@@ -2,7 +2,7 @@
 
 use super::{
     emit_json, scan, usage_err, workspace_root, ArgCursor, DEFAULT_GAME_PROFILES_TSV,
-    DEFAULT_OPS_TSV, DEFAULT_SHADER_FORMATS_TSV, DEFAULT_STUB_BACKLOG_MD,
+    DEFAULT_ISA_COVERAGE_TSV, DEFAULT_OPS_TSV, DEFAULT_SHADER_FORMATS_TSV, DEFAULT_STUB_BACKLOG_MD,
     DEFAULT_STUB_INVENTORY_TSV, DEFAULT_WIN32_TSV,
 };
 use anyhow::{bail, Result};
@@ -51,6 +51,57 @@ pub fn cmd_sync(args: &[String]) -> Result<i32> {
         path.display()
     );
     Ok(exit_codes::OK)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub fn cmd_isa_coverage(args: &[String]) -> Result<i32> {
+    let root = workspace_root();
+    let mut sync = false;
+    let mut json = false;
+    let mut tsv_path = root.join(DEFAULT_ISA_COVERAGE_TSV);
+    let mut cur = ArgCursor::new(args);
+    while let Some(a) = cur.next() {
+        match a {
+            "--sync" => sync = true,
+            "--tsv" => {
+                sync = true;
+                tsv_path = cur.next_path_or_err("--tsv requires PATH")?;
+            }
+            "--json" => json = true,
+            _ => return Err(usage_err(format!("unknown argument {a:?}"))),
+        }
+    }
+    let report = port_factory::isa_coverage::analyze_isa_coverage();
+    if sync {
+        port_factory::isa_coverage::write_isa_coverage_tsv(&tsv_path, &report)?;
+    }
+    if json {
+        let synced_str = sync.then(|| tsv_path.display().to_string());
+        let data = port_factory::isa_coverage::isa_coverage_data_json(
+            &report,
+            synced_str.as_deref(),
+        );
+        return Ok(emit_json(&JsonEnvelope::ok("isa-coverage", data)));
+    }
+    print!(
+        "{}",
+        port_factory::isa_coverage::format_isa_coverage_report(&report)
+    );
+    if sync {
+        println!(
+            "synced {} ISA forms ({} included + {} excluded codes) -> {}",
+            report.forms.len(),
+            report.included_codes,
+            report.excluded.len(),
+            tsv_path.display()
+        );
+    }
+    Ok(exit_codes::OK)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+pub fn cmd_isa_coverage(_: &[String]) -> Result<i32> {
+    bail!("isa-coverage requires Apple Silicon macOS to query the ARM64 lowerer")
 }
 
 pub fn cmd_stats(args: &[String]) -> Result<i32> {
