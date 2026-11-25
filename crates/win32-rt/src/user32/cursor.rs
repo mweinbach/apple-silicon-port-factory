@@ -59,6 +59,36 @@ fn cursors() -> &'static Mutex<HashMap<usize, Cursor>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SharedResKeyId {
+    Int(u16),
+    Str(String),
+}
+
+impl From<&IconResId> for SharedResKeyId {
+    fn from(id: &IconResId) -> Self {
+        match id {
+            IconResId::Int(n) => Self::Int(*n),
+            IconResId::Str(s) => Self::Str(s.to_ascii_uppercase()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedPeResourceKey {
+    inst: usize,
+    is_icon: bool,
+    res_id: SharedResKeyId,
+    want_w: u32,
+    want_h: u32,
+}
+
+fn shared_pe_resources() -> &'static Mutex<HashMap<SharedPeResourceKey, usize>> {
+    static S: std::sync::OnceLock<Mutex<HashMap<SharedPeResourceKey, usize>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn system_shape(id: u16) -> Option<Shape> {
     Some(match id {
         32512 => Shape::Arrow,     // IDC_ARROW
@@ -175,6 +205,21 @@ fn load_cursor_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32,
     } else {
         0
     };
+    let shared = (flags & LR_SHARED) != 0;
+    let cache_key = SharedPeResourceKey {
+        inst,
+        is_icon: false,
+        res_id: SharedResKeyId::from(&res_id),
+        want_w,
+        want_h,
+    };
+    if shared {
+        if let Some(&cached) = shared_pe_resources().lock().unwrap().get(&cache_key) {
+            if cursors().lock().unwrap().contains_key(&cached) {
+                return cached;
+            }
+        }
+    }
 
     let Some(pe) = (unsafe { PeImageView::from_hinstance(inst) }) else {
         set_error(e::RESOURCE_TYPE_NOT_FOUND);
@@ -192,7 +237,6 @@ fn load_cursor_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32,
     }
 
     let ranked = rank_group_icon_entries(&entries, want_w, want_h);
-    let shared = (flags & LR_SHARED) != 0;
     for entry in ranked {
         let Some(cur_bytes) = (unsafe { pe.find_resource_data(RT_CURSOR, &IconResId::Int(entry.icon_id)) }) else {
             continue;
@@ -218,6 +262,23 @@ fn load_cursor_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32,
             let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
             cursors().lock().unwrap().insert(hc, Cursor { shape });
             icons().lock().unwrap().insert(hc, icon_data);
+            if shared {
+                let winner = {
+                    let mut cache = shared_pe_resources().lock().unwrap();
+                    match cache.entry(cache_key) {
+                        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(hc);
+                            hc
+                        }
+                    }
+                };
+                if winner != hc {
+                    cursors().lock().unwrap().remove(&hc);
+                    icons().lock().unwrap().remove(&hc);
+                    return winner;
+                }
+            }
             log::debug!(
                 "user32: loaded PE .rsrc cursor from {inst:#x} ({}x{} hot=({x_hot},{y_hot})) -> {hc:#x}",
                 entry.width,
@@ -950,6 +1011,21 @@ fn load_icon_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32, f
     } else {
         0
     };
+    let shared = (flags & LR_SHARED) != 0;
+    let cache_key = SharedPeResourceKey {
+        inst,
+        is_icon: true,
+        res_id: SharedResKeyId::from(&res_id),
+        want_w,
+        want_h,
+    };
+    if shared {
+        if let Some(&cached) = shared_pe_resources().lock().unwrap().get(&cache_key) {
+            if icons().lock().unwrap().contains_key(&cached) {
+                return cached;
+            }
+        }
+    }
 
     let Some(pe) = (unsafe { PeImageView::from_hinstance(inst) }) else {
         set_error(e::RESOURCE_TYPE_NOT_FOUND);
@@ -967,7 +1043,6 @@ fn load_icon_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32, f
     }
 
     let ranked = rank_group_icon_entries(&entries, want_w, want_h);
-    let shared = (flags & LR_SHARED) != 0;
     for entry in ranked {
         if let Some(icon_bytes) = unsafe { pe.find_resource_data(RT_ICON, &IconResId::Int(entry.icon_id)) } {
             if let Some(icon_data) = decode_icon_resource_bytes(
@@ -988,6 +1063,22 @@ fn load_icon_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32, f
                     icon_data.raw_data.len(),
                 );
                 icons().lock().unwrap().insert(handle, icon_data);
+                if shared {
+                    let winner = {
+                        let mut cache = shared_pe_resources().lock().unwrap();
+                        match cache.entry(cache_key) {
+                            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(handle);
+                                handle
+                            }
+                        }
+                    };
+                    if winner != handle {
+                        icons().lock().unwrap().remove(&handle);
+                        return winner;
+                    }
+                }
                 return handle;
             }
         }
@@ -2029,6 +2120,27 @@ mod tests {
 
             let h_pe_cur = LoadCursorW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR);
             assert_ne!(h_pe_cur, 0);
+            let cur_count_after_first = cursors().lock().unwrap().len();
+            let icon_count_after_first = icons().lock().unwrap().len();
+            // Repeated shared loads (LoadCursorW / LoadCursorA / LoadImageW with LR_SHARED) must
+            // return the exact same cached handle without growing the cursor/icon tables.
+            assert_eq!(LoadCursorW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR), h_pe_cur);
+            assert_eq!(LoadCursorA(img.as_ptr() as HINSTANCE, 202 as LPCSTR), h_pe_cur);
+            assert_eq!(
+                LoadImageW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR, 2, 32, 32, LR_DEFAULTSIZE | LR_SHARED),
+                h_pe_cur
+            );
+            assert_eq!(cursors().lock().unwrap().len(), cur_count_after_first);
+            assert_eq!(icons().lock().unwrap().len(), icon_count_after_first);
+            // Non-shared LoadImageW allocates a distinct handle that DestroyCursor frees cleanly
+            // without affecting the cached shared cursor.
+            let h_nonshared_cur = LoadImageW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR, 2, 32, 32, 0);
+            assert_ne!(h_nonshared_cur, 0);
+            assert_ne!(h_nonshared_cur, h_pe_cur);
+            assert_eq!(DestroyCursor(h_nonshared_cur), TRUE);
+            assert!(!cursors().lock().unwrap().contains_key(&h_nonshared_cur));
+            assert!(!icons().lock().unwrap().contains_key(&h_nonshared_cur));
+
             match cursors().lock().unwrap().get(&h_pe_cur).unwrap().shape.clone() {
                 Shape::Custom(ci) => {
                     assert_eq!((ci.width, ci.height, ci.hotspot_x, ci.hotspot_y), (16, 16, 3, 5));
@@ -2038,6 +2150,8 @@ mod tests {
                 other => panic!("expected Shape::Custom from RT_CURSOR, got {other:?}"),
             }
             assert_eq!(DestroyCursor(h_pe_cur), TRUE);
+            // Shared cursor remains cached after DestroyCursor.
+            assert_eq!(LoadCursorW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR), h_pe_cur);
 
             // 4. PNG-backed RT_CURSOR must decode real pixels into Shape::Custom (never Shape::Blank),
             //    and a corrupt/undecodable PNG cursor resource must fail cleanly rather than returning a blank cursor.
