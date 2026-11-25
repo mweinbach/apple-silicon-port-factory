@@ -17,6 +17,7 @@ use std::sync::{LazyLock, Mutex};
 
 pub(super) const CRYPT_E_NOT_FOUND: u32 = 0x8009_2004;
 const CRYPT_E_NO_MATCH: u32 = 0x8009_2009;
+const NTE_BAD_ALGID: u32 = 0x8009_0008;
 pub(super) const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 
 pub(super) const CERT_QUERY_OBJECT_FILE: u32 = 1;
@@ -1780,6 +1781,80 @@ struct CryptKeyProvParam {
 }
 const _: () = assert!(std::mem::size_of::<CryptKeyProvParam>() == 24);
 
+/// Map an X.509 certificate's `signatureAlgorithm` AlgorithmIdentifier inner bytes to its
+/// exact hash digest per `CryptHashToBeSigned` / `CERT_SIGNATURE_HASH_PROP_ID`, or `None`
+/// when the signature algorithm has no supported single hash digest (causing the caller to
+/// fail with `NTE_BAD_ALGID` rather than silently returning a mismatched SHA-256 hash).
+fn cert_signature_hash_digest(sig_alg_inner: &[u8]) -> Option<crate::misc::bcrypt::Digest> {
+    use crate::misc::bcrypt::Digest;
+
+    const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+    const OID_HASH_SHA1: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
+    const OID_HASH_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    const OID_HASH_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+    const OID_HASH_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+
+    let (oid, params_rest) = super::asn1::parse_der_item(sig_alg_inner)?;
+    if oid.tag != 0x06 {
+        return None;
+    }
+    match oid.val {
+        // md5WithRSAEncryption (1.2.840.113549.1.1.4), md5WithRSA (1.3.14.3.2.3)
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04]
+        | [0x2B, 0x0E, 0x03, 0x02, 0x03] => Some(Digest::Md5),
+        // sha1WithRSAEncryption, sha1WithRSA, ecdsa-with-SHA1, id-dsa-with-sha1, dsaWithSHA1
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05]
+        | [0x2B, 0x0E, 0x03, 0x02, 0x1D]
+        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01]
+        | [0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03]
+        | [0x2B, 0x0E, 0x03, 0x02, 0x1B] => Some(Digest::Sha1),
+        // sha256WithRSAEncryption, ecdsa-with-SHA256, id-dsa-with-sha256
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]
+        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]
+        | [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x02] => Some(Digest::Sha256),
+        // sha384WithRSAEncryption, ecdsa-with-SHA384, id-dsa-with-sha384
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
+        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]
+        | [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03] => Some(Digest::Sha384),
+        // sha512WithRSAEncryption, ecdsa-with-SHA512, id-dsa-with-sha512
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
+        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]
+        | [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x04] => Some(Digest::Sha512),
+        // RSASSA-PSS (1.2.840.113549.1.1.10): RFC 4055 §3.1 DEFAULT hashAlgorithm is SHA-1.
+        OID_RSASSA_PSS => {
+            if params_rest.is_empty() {
+                return Some(Digest::Sha1);
+            }
+            let (params_seq, trailing) = super::asn1::parse_der_item(params_rest)?;
+            if params_seq.tag != 0x30 || !trailing.is_empty() {
+                return None;
+            }
+            let fields = super::asn1::der_item_children_bounded(params_seq.val, 8)?;
+            for f in fields {
+                if f.tag == 0xA0 {
+                    let (alg_seq, rem) = super::asn1::parse_der_item(f.val)?;
+                    if alg_seq.tag != 0x30 || !rem.is_empty() {
+                        return None;
+                    }
+                    let (hash_oid, _) = super::asn1::parse_der_item(alg_seq.val)?;
+                    if hash_oid.tag != 0x06 {
+                        return None;
+                    }
+                    return match hash_oid.val {
+                        OID_HASH_SHA1 => Some(Digest::Sha1),
+                        OID_HASH_SHA256 => Some(Digest::Sha256),
+                        OID_HASH_SHA384 => Some(Digest::Sha384),
+                        OID_HASH_SHA512 => Some(Digest::Sha512),
+                        _ => None,
+                    };
+                }
+            }
+            Some(Digest::Sha1)
+        }
+        _ => None,
+    }
+}
+
 pub(super) unsafe fn cert_get_certificate_context_property_impl(
     p_cert_context: *const c_void,
     dw_prop_id: u32,
@@ -1938,6 +2013,31 @@ pub(super) unsafe fn cert_get_certificate_context_property_impl(
         return TRUE;
     }
 
+    if dw_prop_id == CERT_SIGNATURE_HASH_PROP_ID && stored_prop.is_none() {
+        let Some(bytes) = parse_cert_der_parts(&der_bytes)
+            .and_then(|parts| {
+                cert_signature_hash_digest(parts.sig_alg_inner).map(|dig| dig.hash(parts.tbs_raw))
+            })
+        else {
+            crate::teb::set_last_error(NTE_BAD_ALGID);
+            return FALSE;
+        };
+        let need = bytes.len() as u32;
+        if pv_data.is_null() {
+            std::ptr::write_unaligned(pcb_data, need);
+            return TRUE;
+        }
+        let cap = std::ptr::read_unaligned(pcb_data);
+        if cap < need {
+            std::ptr::write_unaligned(pcb_data, need);
+            crate::teb::set_last_error(err::ERROR_MORE_DATA);
+            return FALSE;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), pv_data as *mut u8, bytes.len());
+        std::ptr::write_unaligned(pcb_data, need);
+        return TRUE;
+    }
+
     let computed: Option<Vec<u8>> = if let Some(p) = stored_prop {
         Some(p)
     } else {
@@ -1948,32 +2048,6 @@ pub(super) unsafe fn cert_get_certificate_context_property_impl(
                 .then(|| crate::misc::bcrypt::Digest::Md5.hash(&der_bytes)),
             CERT_SHA256_HASH_PROP_ID => (!der_bytes.is_empty())
                 .then(|| crate::misc::bcrypt::Digest::Sha256.hash(&der_bytes)),
-            CERT_SIGNATURE_HASH_PROP_ID => parse_cert_der_parts(&der_bytes).map(|parts| {
-                // Hash TBS with the cert's signature digest algorithm (default SHA-256).
-                let dig = if let Some((oid, _)) = super::asn1::parse_der_item(parts.sig_alg_inner) {
-                    match oid.val {
-                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04] => {
-                            crate::misc::bcrypt::Digest::Md5
-                        }
-                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05]
-                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01] => {
-                            crate::misc::bcrypt::Digest::Sha1
-                        }
-                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C]
-                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03] => {
-                            crate::misc::bcrypt::Digest::Sha384
-                        }
-                        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D]
-                        | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04] => {
-                            crate::misc::bcrypt::Digest::Sha512
-                        }
-                        _ => crate::misc::bcrypt::Digest::Sha256,
-                    }
-                } else {
-                    crate::misc::bcrypt::Digest::Sha256
-                };
-                dig.hash(parts.tbs_raw)
-            }),
             CERT_KEY_IDENTIFIER_PROP_ID => parse_cert_der_parts(&der_bytes).map(|parts| {
                 const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E];
                 for (oid, _, val) in &parts.extensions {

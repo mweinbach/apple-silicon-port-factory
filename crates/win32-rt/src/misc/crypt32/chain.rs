@@ -1978,9 +1978,43 @@ pub(crate) fn verify_cert_signed_by_der(child_der: &[u8], parent_der: &[u8]) -> 
     }
 }
 
-/// Resolve ONLY cryptographically signature-verified issuers `[leaf, intermediate..., optional_root]`
-/// for building `CERT_CHAIN_CONTEXT.rgpChain[0]->rgpElement`. Unrelated or unverified DN-only
-/// certificates from `hAdditionalStore` or PKCS#7 certificate bags are never emitted as chain elements.
+fn signed_by_webpki_root(cur: &CertDerParts<'_>, excluded_spkis: &[Vec<u8>]) -> bool {
+    for ta in webpki_roots::TLS_SERVER_ROOTS {
+        if ta.subject.as_ref() != cur.issuer_inner
+            || spki_is_excluded(ta.subject_public_key_info.as_ref(), excluded_spkis)
+        {
+            continue;
+        }
+        if let Some(kids) = der_item_children(ta.subject_public_key_info.as_ref()) {
+            if kids.len() >= 2
+                && kids[0].tag == 0x30
+                && kids[1].tag == 0x03
+                && !kids[1].val.is_empty()
+                && (verify_cert_sig_with_spki(cur, kids[0].val, &kids[1].val[1..])
+                    || verify_rsa_cert_sig_fallback(cur, kids[0].val, &kids[1].val[1..]))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve ONLY cryptographically authenticated issuers `[leaf, intermediate..., optional_root]`
+/// for building `CERT_CHAIN_CONTEXT.rgpChain[0]->rgpElement`.
+///
+/// Every emitted issuer certificate MUST itself be authenticated along the complete path:
+/// 1. **Trusted path (preferred)**: backtracking DFS checks trust-store roots (`root_pool` plus
+///    non-excluded macOS system roots / WebPKI anchors when `allow_default_macos` is true) BEFORE
+///    untrusted `chain_der[1..]` candidates and emits the root directly from the trust store.
+///    Any intermediate taken from `chain_der[1..]` must pass CA basic-constraints checks AND have
+///    its own signature verified by its authenticated parent all the way to a trusted root.
+///    Dead ends backtrack, so a forged certificate in `hAdditionalStore` that copies a genuine
+///    issuer/root SPKI with attacker-chosen serial/extensions is never emitted.
+/// 2. **Untrusted fallback**: if no trusted path exists, backtracking DFS emits an untrusted path
+///    ONLY when every intermediate chains cryptographically to a genuinely self-signed root
+///    (`subject == issuer && cert_signed_by_parts(root, root)`). Without the issuer's private key,
+///    a same-SPKI forgery fails self-signature verification and is excluded, leaving `[leaf]`.
 fn resolve_verified_issuer_path(
     chain_der: &[Vec<u8>],
     root_pool: &[Vec<u8>],
@@ -1989,54 +2023,214 @@ fn resolve_verified_issuer_path(
     let Some(leaf) = chain_der.first() else {
         return Vec::new();
     };
-    let mut path: Vec<Vec<u8>> = vec![leaf.clone()];
+    let Some(leaf_parts) = parse_cert_der_parts(leaf) else {
+        return vec![leaf.clone()];
+    };
+
     let excluded_spkis = macos_excluded_root_spkis();
-    for _ in 0..16 {
-        let cur_der = path.last().unwrap().clone();
-        let Some(cur_parts) = parse_cert_der_parts(&cur_der) else {
-            break;
-        };
-        if cur_parts.subject_inner == cur_parts.issuer_inner
-            && cert_signed_by_parts(&cur_parts, &cur_parts)
-        {
-            break;
+    let mut trusted_roots: Vec<(&[u8], CertDerParts<'_>)> = Vec::new();
+    for der in root_pool {
+        if let Some(p) = parse_cert_der_parts(der) {
+            trusted_roots.push((der.as_slice(), p));
         }
-        let find_verified = |pool: &[Vec<u8>], filter_excluded: bool| -> Option<Vec<u8>> {
-            for cand in pool {
-                if path.iter().any(|p| p == cand) {
-                    continue;
-                }
-                let Some(cp) = parse_cert_der_parts(cand) else {
-                    continue;
-                };
-                if filter_excluded && spki_is_excluded(cp.spki_inner, excluded_spkis) {
-                    continue;
-                }
-                if cp.subject_inner == cur_parts.issuer_inner
-                    && cert_signed_by_parts(&cur_parts, &cp)
-                {
-                    return Some(cand.clone());
-                }
-            }
-            None
-        };
-        if let Some(next) = find_verified(&chain_der[1..], false) {
-            path.push(next);
-            continue;
-        }
-        if let Some(root) = find_verified(root_pool, false) {
-            path.push(root);
-            break;
-        }
-        if allow_default_macos {
-            if let Some(root) = find_verified(macos_system_roots_der(), true) {
-                path.push(root);
-                break;
-            }
-        }
-        break;
     }
-    path
+    if allow_default_macos {
+        for der in macos_system_roots_der() {
+            if let Some(p) = parse_cert_der_parts(der) {
+                if !spki_is_excluded(p.spki_inner, excluded_spkis) {
+                    trusted_roots.push((der.as_slice(), p));
+                }
+            }
+        }
+    }
+
+    let cands = &chain_der[1..];
+    let cand_parts: Vec<Option<CertDerParts<'_>>> =
+        cands.iter().map(|d| parse_cert_der_parts(d)).collect();
+
+    fn intermediate_bc_ok(der: &[u8], non_self_issued_below: usize) -> bool {
+        let Some((is_ca, path_len)) = parse_basic_constraints(der) else {
+            return false;
+        };
+        if !is_ca {
+            return false;
+        }
+        if let Some(max_len) = path_len {
+            if non_self_issued_below > max_len as usize {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs_trusted<'a>(
+        cur_der: &[u8],
+        cur_parts: &CertDerParts<'_>,
+        depth: usize,
+        non_self_issued_below: usize,
+        cands: &'a [Vec<u8>],
+        cand_parts: &[Option<CertDerParts<'a>>],
+        trusted_roots: &[(&[u8], CertDerParts<'_>)],
+        allow_default_macos: bool,
+        excluded_spkis: &[Vec<u8>],
+        visited: &mut [bool],
+        path: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        // Direct exact match or authenticated self-signed match against a trust-store root.
+        if trusted_roots.iter().any(|(root_der, root_parts)| {
+            *root_der == cur_der
+                || (root_parts.subject_inner == cur_parts.subject_inner
+                    && root_parts.spki_inner == cur_parts.spki_inner
+                    && cert_signed_by_parts(cur_parts, root_parts))
+        }) {
+            return true;
+        }
+        // Directly signed by a trust-store root: emit the root directly from the trust store.
+        if let Some((root_der, _)) = trusted_roots.iter().find(|(_, root_parts)| {
+            root_parts.subject_inner == cur_parts.issuer_inner
+                && cert_signed_by_parts(cur_parts, root_parts)
+        }) {
+            if *root_der != cur_der {
+                path.push(root_der.to_vec());
+            }
+            return true;
+        }
+        // Directly signed by a non-excluded WebPKI trust anchor (no root DER to append).
+        if allow_default_macos && signed_by_webpki_root(cur_parts, excluded_spkis) {
+            return true;
+        }
+        if depth >= 16 {
+            return false;
+        }
+        for (i, cand_der) in cands.iter().enumerate() {
+            if visited[i] || cand_der.as_slice() == cur_der {
+                continue;
+            }
+            let Some(cp) = cand_parts[i].as_ref() else {
+                continue;
+            };
+            if cp.subject_inner != cur_parts.issuer_inner
+                || !intermediate_bc_ok(cand_der, non_self_issued_below)
+                || !cert_signed_by_parts(cur_parts, cp)
+            {
+                continue;
+            }
+            visited[i] = true;
+            path.push(cand_der.clone());
+            let next_non_self =
+                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
+            if dfs_trusted(
+                cand_der,
+                cp,
+                depth + 1,
+                next_non_self,
+                cands,
+                cand_parts,
+                trusted_roots,
+                allow_default_macos,
+                excluded_spkis,
+                visited,
+                path,
+            ) {
+                return true;
+            }
+            path.pop();
+            visited[i] = false;
+        }
+        false
+    }
+
+    let mut path = vec![leaf.clone()];
+    let mut visited = vec![false; cands.len()];
+    if dfs_trusted(
+        leaf,
+        &leaf_parts,
+        0,
+        0,
+        cands,
+        &cand_parts,
+        &trusted_roots,
+        allow_default_macos,
+        excluded_spkis,
+        &mut visited,
+        &mut path,
+    ) {
+        return path;
+    }
+
+    // Untrusted fallback: only emit issuers that chain cryptographically to a genuinely
+    // self-signed root (so same-SPKI forgeries without the issuer's private key are rejected).
+    fn dfs_self_signed<'a>(
+        cur_der: &[u8],
+        cur_parts: &CertDerParts<'_>,
+        depth: usize,
+        non_self_issued_below: usize,
+        cands: &'a [Vec<u8>],
+        cand_parts: &[Option<CertDerParts<'a>>],
+        visited: &mut [bool],
+        path: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        if cur_parts.subject_inner == cur_parts.issuer_inner
+            && cert_signed_by_parts(cur_parts, cur_parts)
+        {
+            return true;
+        }
+        if depth >= 16 {
+            return false;
+        }
+        for (i, cand_der) in cands.iter().enumerate() {
+            if visited[i] || cand_der.as_slice() == cur_der {
+                continue;
+            }
+            let Some(cp) = cand_parts[i].as_ref() else {
+                continue;
+            };
+            if cp.subject_inner != cur_parts.issuer_inner || !cert_signed_by_parts(cur_parts, cp) {
+                continue;
+            }
+            let is_self_signed =
+                cp.subject_inner == cp.issuer_inner && cert_signed_by_parts(cp, cp);
+            if !is_self_signed && !intermediate_bc_ok(cand_der, non_self_issued_below) {
+                continue;
+            }
+            visited[i] = true;
+            path.push(cand_der.clone());
+            let next_non_self =
+                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
+            if dfs_self_signed(
+                cand_der,
+                cp,
+                depth + 1,
+                next_non_self,
+                cands,
+                cand_parts,
+                visited,
+                path,
+            ) {
+                return true;
+            }
+            path.pop();
+            visited[i] = false;
+        }
+        false
+    }
+
+    path.truncate(1);
+    visited.fill(false);
+    if dfs_self_signed(
+        leaf,
+        &leaf_parts,
+        0,
+        0,
+        cands,
+        &cand_parts,
+        &mut visited,
+        &mut path,
+    ) {
+        return path;
+    }
+    vec![leaf.clone()]
 }
 
 /// Resolve the actual certification path `[leaf, intermediate..., optional_root]` starting from
@@ -2095,16 +2289,15 @@ fn resolve_selected_issuer_path<'a>(
             }
             None
         };
-        // Search BOTH pools for a cryptographically verified issuer before considering any
-        // name-only fallback, so a DN-colliding unrelated cert in hAdditionalStore can never
-        // shadow the genuine issuer in root_pool.
-        if let Some(next) = find_verified(&chain_der[1..]) {
-            path.push(next);
-            continue;
-        }
+        // Prefer trusted root_pool over untrusted hAdditionalStore candidates so a same-SPKI
+        // forged copy of a trusted root in hAdditionalStore cannot shadow the genuine root.
         if let Some(root) = find_verified(root_pool) {
             path.push(root);
             break;
+        }
+        if let Some(next) = find_verified(&chain_der[1..]) {
+            path.push(next);
+            continue;
         }
         if let Some(next) = find_dn_only(&chain_der[1..]) {
             path.push(next);

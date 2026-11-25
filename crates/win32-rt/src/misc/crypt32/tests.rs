@@ -7828,3 +7828,141 @@ fn cert_set_key_prov_handle_stores_opaque_handle_without_deref_and_ber_cms_decod
         assert!(super::asn1::parse_ber_item(unclosed).is_none());
     }
 }
+
+#[test]
+fn cert_signature_hash_prop_resolves_actual_digest_and_rejects_unsupported() {
+    use super::store::CERT_SIGNATURE_HASH_PROP_ID;
+    use crate::misc::bcrypt::Digest;
+
+    const NTE_BAD_ALGID: u32 = 0x8009_0008;
+    let tlv = super::asn1::encode_der_tlv;
+
+    // Build a minimal syntactically valid X.509 v3 certificate carrying `sig_alg_tlv`
+    // and return `(full_cert_der, tbs_raw_bytes)`.
+    let make_cert = |sig_alg_tlv: &[u8]| -> (Vec<u8>, Vec<u8>) {
+        let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+        atv.extend_from_slice(&tlv(0x0C, b"SigHashTest"));
+        let dn = tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)));
+        let mut validity = tlv(0x17, b"260101000000Z");
+        validity.extend_from_slice(&tlv(0x17, b"360101000000Z"));
+        let mut spki_alg = tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]);
+        spki_alg.extend_from_slice(&[0x05, 0x00]);
+        let mut spki = tlv(0x30, &spki_alg);
+        spki.extend_from_slice(&tlv(0x03, &[0x00, 0x01, 0x02, 0x03]));
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&tlv(0xA0, &tlv(0x02, &[0x02]))); // v3
+        tbs_body.extend_from_slice(&tlv(0x02, &[0x01])); // serial
+        tbs_body.extend_from_slice(sig_alg_tlv);
+        tbs_body.extend_from_slice(&dn);
+        tbs_body.extend_from_slice(&tlv(0x30, &validity));
+        tbs_body.extend_from_slice(&dn);
+        tbs_body.extend_from_slice(&tlv(0x30, &spki));
+        let tbs = tlv(0x30, &tbs_body);
+        let mut cert_body = tbs.clone();
+        cert_body.extend_from_slice(sig_alg_tlv);
+        cert_body.extend_from_slice(&tlv(0x03, &[0x00, 0xAA, 0xBB]));
+        (tlv(0x30, &cert_body), tbs)
+    };
+
+    let query_sig_hash = |cert_der: &[u8]| -> Result<Vec<u8>, u32> {
+        unsafe {
+            let ctx = CertCreateCertificateContext(
+                X509_ASN_ENCODING,
+                cert_der.as_ptr(),
+                cert_der.len() as u32,
+            );
+            assert!(!ctx.is_null());
+            let mut len = 0u32;
+            let ok1 = CertGetCertificateContextProperty(
+                ctx,
+                CERT_SIGNATURE_HASH_PROP_ID,
+                std::ptr::null_mut(),
+                &mut len,
+            );
+            if ok1 == FALSE {
+                let le = crate::teb::last_error();
+                CertFreeCertificateContext(ctx);
+                return Err(le);
+            }
+            let mut buf = vec![0u8; len as usize];
+            let ok2 = CertGetCertificateContextProperty(
+                ctx,
+                CERT_SIGNATURE_HASH_PROP_ID,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut len,
+            );
+            assert_eq!(ok2, TRUE);
+            buf.truncate(len as usize);
+            CertFreeCertificateContext(ctx);
+            Ok(buf)
+        }
+    };
+
+    // 1. DSA-with-SHA1 (1.2.840.10040.4.3) -> exact 20-byte SHA-1(tbs), NOT 32-byte SHA-256.
+    let (dsa_sha1_der, dsa_sha1_tbs) =
+        make_cert(&tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03])));
+    let got_dsa_sha1 = query_sig_hash(&dsa_sha1_der).expect("DSA-with-SHA1 must succeed");
+    assert_eq!(got_dsa_sha1.len(), 20);
+    assert_eq!(got_dsa_sha1, Digest::Sha1.hash(&dsa_sha1_tbs));
+
+    // 2. DSA-with-SHA256 (2.16.840.1.101.3.4.3.2) -> exact 32-byte SHA-256(tbs).
+    let (dsa_sha256_der, dsa_sha256_tbs) = make_cert(&tlv(
+        0x30,
+        &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x02]),
+    ));
+    assert_eq!(
+        query_sig_hash(&dsa_sha256_der).unwrap(),
+        Digest::Sha256.hash(&dsa_sha256_tbs)
+    );
+
+    // 3. RSASSA-PSS with omitted parameters -> RFC 4055 §3.1 default SHA-1 (20 bytes).
+    let oid_pss = tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A]);
+    let (pss_default_der, pss_default_tbs) = make_cert(&tlv(0x30, &oid_pss));
+    assert_eq!(
+        query_sig_hash(&pss_default_der).unwrap(),
+        Digest::Sha1.hash(&pss_default_tbs)
+    );
+
+    // 4. RSASSA-PSS with hashAlgorithm = SHA-384 -> exact 48-byte SHA-384(tbs).
+    let mut pss_384_alg = oid_pss.clone();
+    let hash_384_alg = tlv(
+        0x30,
+        &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]),
+    );
+    pss_384_alg.extend_from_slice(&tlv(0x30, &tlv(0xA0, &hash_384_alg)));
+    let (pss_384_der, pss_384_tbs) = make_cert(&tlv(0x30, &pss_384_alg));
+    let got_pss_384 = query_sig_hash(&pss_384_der).expect("RSASSA-PSS SHA-384 must succeed");
+    assert_eq!(got_pss_384.len(), 48);
+    assert_eq!(got_pss_384, Digest::Sha384.hash(&pss_384_tbs));
+
+    // 5. RSASSA-PSS with hashAlgorithm = SHA-512 -> exact 64-byte SHA-512(tbs).
+    let mut pss_512_alg = oid_pss.clone();
+    let hash_512_alg = tlv(
+        0x30,
+        &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]),
+    );
+    pss_512_alg.extend_from_slice(&tlv(0x30, &tlv(0xA0, &hash_512_alg)));
+    let (pss_512_der, pss_512_tbs) = make_cert(&tlv(0x30, &pss_512_alg));
+    assert_eq!(
+        query_sig_hash(&pss_512_der).unwrap(),
+        Digest::Sha512.hash(&pss_512_tbs)
+    );
+
+    // 6. RSASSA-PSS with unsupported hashAlgorithm (SHA-224) -> NTE_BAD_ALGID (never SHA-256).
+    let mut pss_224_alg = oid_pss;
+    let hash_224_alg = tlv(
+        0x30,
+        &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04]),
+    );
+    pss_224_alg.extend_from_slice(&tlv(0x30, &tlv(0xA0, &hash_224_alg)));
+    let (pss_224_der, _) = make_cert(&tlv(0x30, &pss_224_alg));
+    assert_eq!(query_sig_hash(&pss_224_der), Err(NTE_BAD_ALGID));
+
+    // 7. Ed25519 (TEST_LEAF_DER) and unknown signature OID -> NTE_BAD_ALGID (never SHA-256).
+    assert_eq!(
+        query_sig_hash(crate::misc::secur32::tests::TEST_LEAF_DER),
+        Err(NTE_BAD_ALGID)
+    );
+    let (unk_der, _) = make_cert(&tlv(0x30, &tlv(0x06, &[0x2A, 0x03, 0x04, 0x05, 0x06])));
+    assert_eq!(query_sig_hash(&unk_der), Err(NTE_BAD_ALGID));
+}

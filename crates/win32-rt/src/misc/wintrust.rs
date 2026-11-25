@@ -4125,6 +4125,152 @@ mod tests {
             crate::misc::crypt32::CertFreeCertificateChainEngine(eng);
             crate::misc::crypt32::CertCloseStore(root_st, 0);
             crate::misc::crypt32::CertCloseStore(add_st, 0);
+
+            // Same-SPKI forged issuer attack: copy `TEST_CA_DER`'s exact Subject DN and
+            // SubjectPublicKeyInfo into a forged certificate with an attacker-chosen serial and
+            // invalid signature. Even though single-step `verify_cert_signed_by_der(leaf, fake_ca)`
+            // returns true, `resolve_verified_issuer_path` MUST bind emitted elements to the
+            // authenticated path and NEVER expose `fake_ca` (neither when trusted nor untrusted).
+            let ca_top = der_children(der_children(injected_ca).unwrap()[0].val).unwrap();
+            let ca_tbs_kids = der_children(ca_top[0].val).unwrap();
+            let mut fake_tbs = Vec::new();
+            let mut ca_idx = 0usize;
+            if ca_tbs_kids[0].tag == 0xA0 {
+                fake_tbs.extend_from_slice(ca_tbs_kids[0].raw);
+                ca_idx = 1;
+            }
+            fake_tbs.extend_from_slice(&der_tlv(0x02, &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE])); // forged serial
+            fake_tbs.extend_from_slice(ca_tbs_kids[ca_idx + 1].raw); // sigAlg
+            fake_tbs.extend_from_slice(ca_tbs_kids[ca_idx + 2].raw); // issuer
+            fake_tbs.extend_from_slice(ca_tbs_kids[ca_idx + 3].raw); // validity
+            fake_tbs.extend_from_slice(ca_tbs_kids[ca_idx + 4].raw); // copied subject
+            fake_tbs.extend_from_slice(ca_tbs_kids[ca_idx + 5].raw); // copied SPKI
+            let mut fake_cert_body = der_tlv(0x30, &fake_tbs);
+            fake_cert_body.extend_from_slice(ca_top[1].raw); // sigAlg
+            fake_cert_body.extend_from_slice(&der_tlv(0x03, &[0x00; 65])); // invalid dummy signature
+            let fake_ca_der = der_tlv(0x30, &fake_cert_body);
+            assert_ne!(fake_ca_der.as_slice(), injected_ca);
+            assert!(
+                crate::misc::crypt32::verify_cert_signed_by_der(
+                    crate::misc::secur32::tests::TEST_LEAF_DER,
+                    &fake_ca_der,
+                ),
+                "precondition: same-SPKI forgery verifies child signature on a naive single-step check"
+            );
+
+            // (a) Trusted case: `fake_ca_der` in hAdditionalStore + genuine `TEST_CA_DER` in exclusive
+            //     root store -> chain MUST emit [TEST_LEAF_DER, TEST_CA_DER], never `fake_ca_der`.
+            let fake_add_st =
+                crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    fake_add_st,
+                    X509_ASN_ENCODING,
+                    fake_ca_der.as_ptr(),
+                    fake_ca_der.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let genuine_root_st =
+                crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    genuine_root_st,
+                    X509_ASN_ENCODING,
+                    injected_ca.as_ptr(),
+                    injected_ca.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let mut eng2_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng2_cfg.as_mut_ptr() as *mut u32, eng2_cfg.len() as u32);
+            std::ptr::write_unaligned(
+                eng2_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void,
+                genuine_root_st,
+            );
+            let mut eng2: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng2_cfg.as_ptr() as *const c_void,
+                    &mut eng2,
+                ),
+                1
+            );
+            let mut ch2: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertGetCertificateChain(
+                    eng2,
+                    leaf_ctx,
+                    std::ptr::null(),
+                    fake_add_st,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ch2,
+                ),
+                1
+            );
+            let cc2 = &*(ch2 as *const CertChainContext);
+            assert_eq!(cc2.trust_status.dw_error_status, 0);
+            let simple2 = &*(*cc2.rgp_chain);
+            assert_eq!(simple2.c_element, 2);
+            let e2_1 = &*((*(*simple2.rgp_element.add(1))).p_cert_context);
+            let e2_1_der =
+                std::slice::from_raw_parts(e2_1.pb_cert_encoded, e2_1.cb_cert_encoded as usize);
+            assert_eq!(
+                e2_1_der, injected_ca,
+                "same-SPKI forged issuer in hAdditionalStore must never replace the genuine trust-store root"
+            );
+            crate::misc::crypt32::CertFreeCertificateChain(ch2);
+            crate::misc::crypt32::CertFreeCertificateChainEngine(eng2);
+            crate::misc::crypt32::CertCloseStore(genuine_root_st, 0);
+
+            // (b) Untrusted case: `fake_ca_der` in hAdditionalStore, no trusted root ->
+            //     `fake_ca_der` is NOT self-signed, so chain MUST emit ONLY [TEST_LEAF_DER].
+            let empty_root_st =
+                crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            let mut eng3_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng3_cfg.as_mut_ptr() as *mut u32, eng3_cfg.len() as u32);
+            std::ptr::write_unaligned(
+                eng3_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void,
+                empty_root_st,
+            );
+            let mut eng3: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng3_cfg.as_ptr() as *const c_void,
+                    &mut eng3,
+                ),
+                1
+            );
+            let mut ch3: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertGetCertificateChain(
+                    eng3,
+                    leaf_ctx,
+                    std::ptr::null(),
+                    fake_add_st,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ch3,
+                ),
+                1
+            );
+            let cc3 = &*(ch3 as *const CertChainContext);
+            let simple3 = &*(*cc3.rgp_chain);
+            assert_eq!(
+                simple3.c_element, 1,
+                "unauthenticated same-SPKI forged issuer must not be emitted on untrusted chains either"
+            );
+            crate::misc::crypt32::CertFreeCertificateChain(ch3);
+            crate::misc::crypt32::CertFreeCertificateChainEngine(eng3);
+            crate::misc::crypt32::CertCloseStore(empty_root_st, 0);
+            crate::misc::crypt32::CertCloseStore(fake_add_st, 0);
             crate::misc::crypt32::CertFreeCertificateContext(leaf_ctx);
         }
     }
