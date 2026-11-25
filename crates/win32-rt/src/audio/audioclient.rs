@@ -181,6 +181,18 @@ struct LoopbackMixer {
     sources: std::collections::HashMap<u64, LoopbackSourceQueue>,
 }
 
+/// Result of attempting to drain mixed audio from [`LoopbackMixer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// Drained `n > 0` mixed frames along the common playback timeline.
+    Frames(usize),
+    /// At least one source has buffered audio at `read_frame`, intentionally held while
+    /// waiting for another started source within `LOOPBACK_MIX_SYNC_WAIT`.
+    WaitingForSync,
+    /// No source has unread buffered frames beyond `read_frame` (genuinely idle).
+    Idle,
+}
+
 impl LoopbackMixer {
     fn new(cap_frames: usize, dst_rate: u32, dst_channels: u16) -> Self {
         let ch = dst_channels.max(1) as usize;
@@ -339,13 +351,27 @@ impl LoopbackMixer {
 
     /// Mix up to `max_frames` frames across all buffered render sources aligned on the common
     /// playback timeline into `out` (interleaved float32 at `(dst_rate, dst_channels)`).
+    #[allow(dead_code)]
     fn drain_mixed(&mut self, max_frames: usize, out: &mut Vec<f32>) -> usize {
         self.drain_mixed_at(max_frames, out, Instant::now())
     }
 
+    #[allow(dead_code)]
     fn drain_mixed_at(&mut self, max_frames: usize, out: &mut Vec<f32>, now: Instant) -> usize {
+        match self.drain_mixed_status_at(max_frames, out, now) {
+            DrainOutcome::Frames(n) => n,
+            DrainOutcome::WaitingForSync | DrainOutcome::Idle => 0,
+        }
+    }
+
+    fn drain_mixed_status_at(
+        &mut self,
+        max_frames: usize,
+        out: &mut Vec<f32>,
+        now: Instant,
+    ) -> DrainOutcome {
         if max_frames == 0 {
-            return 0;
+            return DrainOutcome::Idle;
         }
         let ch = self.dst_channels;
         let max_end = self
@@ -357,7 +383,7 @@ impl LoopbackMixer {
             .unwrap_or(self.read_frame);
         if max_end <= self.read_frame {
             self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
-            return 0;
+            return DrainOutcome::Idle;
         }
 
         // Hold advancement to the earliest timeline frontier across actively started sources
@@ -375,7 +401,7 @@ impl LoopbackMixer {
         };
         if target_end <= self.read_frame {
             self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
-            return 0;
+            return DrainOutcome::WaitingForSync;
         }
 
         let take = ((target_end - self.read_frame) as usize).min(max_frames);
@@ -418,7 +444,7 @@ impl LoopbackMixer {
         }
         self.read_frame = drain_end;
         self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
-        take
+        DrainOutcome::Frames(take)
     }
 }
 
@@ -641,6 +667,10 @@ impl CaptureState {
     /// or in-process render loopback mixer); for silent capture or idle loopback,
     /// paces silent packets.
     fn advance(&mut self, fmt: &WaveFormat, buffer_frames: u32) {
+        self.advance_at(fmt, buffer_frames, Instant::now());
+    }
+
+    fn advance_at(&mut self, fmt: &WaveFormat, buffer_frames: u32, now: Instant) {
         // Gate all capture arrival (including loopback) on the started state (`last_tick.is_some()`).
         // Polling a stopped client must never enqueue new frames or re-arm `last_tick`.
         let Some(prev) = self.last_tick else {
@@ -653,36 +683,48 @@ impl CaptureState {
         if let Some(lb) = &mut self.loopback {
             if self.queued_frames < buffer_frames {
                 let max_take = (buffer_frames - self.queued_frames) as usize;
-                let got: u32 = match &lb.source {
+                let outcome = match &lb.source {
                     LoopbackSource::CoreAudioTap { ring, .. } => {
                         let avail = ring.len().min(max_take);
                         if avail > 0 {
                             lb.scratch_f32.resize(avail * ch, 0.0);
-                            ring.pop_into(&mut lb.scratch_f32) as u32
+                            DrainOutcome::Frames(ring.pop_into(&mut lb.scratch_f32))
                         } else {
-                            0
+                            DrainOutcome::Idle
                         }
                     }
                     LoopbackSource::InProcessBus(sub) => {
-                        sub.mixer.lock().unwrap().drain_mixed(max_take, &mut lb.scratch_f32) as u32
+                        sub.mixer
+                            .lock()
+                            .unwrap()
+                            .drain_mixed_status_at(max_take, &mut lb.scratch_f32, now)
                     }
                 };
-                if got > 0 {
-                    let used = got as usize * ch;
-                    let silent = lb.scratch_f32[..used].iter().all(|&x| x == 0.0);
-                    let mut encoded = Vec::new();
-                    encode_from_f32(fmt.sample, &lb.scratch_f32[..used], &mut encoded);
-                    lb.packets.push_back((encoded, got, silent));
-                    self.queued_packets.push_back(got);
-                    self.queued_frames += got;
-                    self.last_tick = Some(Instant::now());
-                    self.frame_accum = 0.0;
-                    return;
+                match outcome {
+                    DrainOutcome::Frames(got_usize) if got_usize > 0 => {
+                        let got = got_usize as u32;
+                        let used = got_usize * ch;
+                        let silent = lb.scratch_f32[..used].iter().all(|&x| x == 0.0);
+                        let mut encoded = Vec::new();
+                        encode_from_f32(fmt.sample, &lb.scratch_f32[..used], &mut encoded);
+                        lb.packets.push_back((encoded, got, silent));
+                        self.queued_packets.push_back(got);
+                        self.queued_frames += got;
+                        self.last_tick = Some(now);
+                        self.frame_accum = 0.0;
+                        return;
+                    }
+                    DrainOutcome::WaitingForSync => {
+                        // A live playback interval is already buffered and waiting briefly for a
+                        // second active render stream within `LOOPBACK_MIX_SYNC_WAIT`; do not
+                        // emit synthetic silence that would stretch or duplicate this interval.
+                        return;
+                    }
+                    DrainOutcome::Frames(_) | DrainOutcome::Idle => {}
                 }
             }
         }
 
-        let now = Instant::now();
         let dt = now.saturating_duration_since(prev).as_secs_f64();
         self.last_tick = Some(now);
         self.frame_accum += dt * rate as f64;
@@ -2523,5 +2565,83 @@ mod mixer_tests {
         assert!((drained[0] - 0.25).abs() < 1e-4);
         unregister_loopback_source(&ep_id, 9002);
         super::super::mmdevapi::reset_endpoint_software_gains_for_test();
+    }
+
+    #[test]
+    fn capture_advance_does_not_insert_synthetic_silence_during_loopback_sync_wait() {
+        let fmt = WaveFormat {
+            rate: 48_000,
+            channels: 2,
+            block_align: 8,
+            sample: SampleType::F32,
+            bits: 32,
+            valid_bits: 32,
+            mask: 0x3,
+            extensible: false,
+        };
+        let sub = register_loopback_sub("test-sync-wait-ep", 4096, 48_000, 2);
+        sub.active.store(true, Ordering::Release);
+        let t0 = Instant::now();
+        {
+            let mut m = sub.mixer.lock().unwrap();
+            m.set_source_started_at(1, true, t0);
+            m.set_source_started_at(2, true, t0);
+            // Source 1 publishes one 10 ms (480-frame) playback interval while Source 2 has not yet.
+            m.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        }
+
+        let mut cap = CaptureState {
+            staging: vec![0u8; 480 * 8],
+            packet_frames: 480,
+            queued_packets: VecDeque::new(),
+            queued_frames: 0,
+            last_tick: Some(t0),
+            frame_accum: 0.0,
+            device_pos: 0,
+            loopback: Some(LoopbackCapture {
+                source: LoopbackSource::InProcessBus(sub.clone()),
+                scratch_f32: Vec::new(),
+                packets: VecDeque::new(),
+            }),
+            _timer: None,
+        };
+
+        // Polling after 12 ms (> 10 ms capture period, < 25 ms sync window) must NOT emit a
+        // synthetic silent packet while Source 1's interval is held waiting for Source 2.
+        cap.advance_at(&fmt, 4800, t0 + Duration::from_millis(12));
+        assert_eq!(
+            cap.queued_frames, 0,
+            "sync wait must not insert synthetic silence for an already-buffered interval"
+        );
+        assert!(cap.queued_packets.is_empty());
+
+        // Source 2 arrives at 13 ms: the next poll queues exactly ONE 480-frame mixed packet (0.7),
+        // not 960 frames (480 silence + 480 mixed).
+        {
+            let mut m = sub.mixer.lock().unwrap();
+            m.push_source_internal(
+                2,
+                None,
+                &vec![0.4f32; 480 * 2],
+                48_000,
+                2,
+                t0 + Duration::from_millis(13),
+            );
+        }
+        cap.advance_at(&fmt, 4800, t0 + Duration::from_millis(14));
+        assert_eq!(cap.queued_frames, 480);
+        assert_eq!(cap.queued_packets.len(), 1);
+        let (bytes, frames, silent) = cap.loopback.as_mut().unwrap().packets.pop_front().unwrap();
+        assert_eq!(frames, 480);
+        assert!(!silent);
+        let first_f32 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert!((first_f32 - 0.7).abs() < 1e-5, "expected mixed 0.7, got {first_f32}");
+
+        // Once the mixer is genuinely idle with no buffered audio, elapsed periods still pace silence.
+        cap.queued_packets.clear();
+        cap.queued_frames = 0;
+        cap.advance_at(&fmt, 4800, t0 + Duration::from_millis(25));
+        assert_eq!(cap.queued_frames, 480);
+        assert_eq!(cap.loopback.as_ref().unwrap().packets.front().map(|p| p.2), Some(true));
     }
 }
