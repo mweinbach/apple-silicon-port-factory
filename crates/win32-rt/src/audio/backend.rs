@@ -28,7 +28,7 @@
 
 use super::ring::Ring;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 /// One host output device as seen by the endpoint layer.
@@ -575,10 +575,144 @@ pub struct LoopbackFeed {
     pub ring: Ring,
 }
 
+/// Lock-free per-channel stream gain state (`IAudioStreamVolume`), safe to read from
+/// the realtime CoreAudio render callback without acquiring any mutex.
+pub struct StreamChannelGain {
+    count: AtomicU32,
+    levels: [AtomicU32; 8],
+}
+
+impl StreamChannelGain {
+    pub fn new(channels: usize) -> Arc<Self> {
+        Arc::new(Self {
+            count: AtomicU32::new(channels.clamp(1, 8) as u32),
+            levels: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+        })
+    }
+
+    pub fn resize(&self, channels: usize) {
+        let new_n = channels.clamp(1, 8);
+        let old_n = self.count.swap(new_n as u32, Ordering::AcqRel) as usize;
+        for slot in self.levels.iter().take(new_n).skip(old_n) {
+            slot.store(1.0f32.to_bits(), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count.load(Ordering::Acquire) as usize
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<f32> {
+        if idx >= self.len() {
+            return None;
+        }
+        Some(f32::from_bits(self.levels[idx].load(Ordering::Acquire)))
+    }
+
+    #[inline]
+    pub fn set(&self, idx: usize, level: f32) -> bool {
+        if idx >= self.len() {
+            return false;
+        }
+        self.levels[idx].store(level.to_bits(), Ordering::Release);
+        true
+    }
+
+    pub fn snapshot(&self) -> [f32; 8] {
+        let mut out = [1.0f32; 8];
+        let n = self.len().min(8);
+        for (dst, src) in out.iter_mut().zip(self.levels.iter()).take(n) {
+            *dst = f32::from_bits(src.load(Ordering::Acquire));
+        }
+        out
+    }
+
+    pub fn set_all(&self, vals: &[f32]) -> bool {
+        let n = self.len();
+        if vals.len() != n {
+            return false;
+        }
+        for (dst, &v) in self.levels.iter().zip(vals.iter()).take(n) {
+            dst.store(v.to_bits(), Ordering::Release);
+        }
+        true
+    }
+}
+
+/// Lock-free playback gain chain evaluated at consumption time (CoreAudio RT callback and
+/// Null clock thread) so `ISimpleAudioVolume`, `IAudioStreamVolume`, and software
+/// `IAudioEndpointVolume` changes apply immediately to already-queued audio.
+pub(super) struct PlaybackGain {
+    session: Arc<super::mmdevapi::SessionState>,
+    stream_ch: Arc<StreamChannelGain>,
+    /// `true` when stream channels map 1:1 to ring channels; `false` when a pre-ring channel
+    /// matrix already applied per-client-channel `stream_ch` gains before downmixing.
+    apply_stream_ch: bool,
+    ep_sw: Arc<super::mmdevapi::EndpointSwAtomic>,
+}
+
+impl PlaybackGain {
+    pub(super) fn new(
+        session: Arc<super::mmdevapi::SessionState>,
+        stream_ch: Arc<StreamChannelGain>,
+        apply_stream_ch: bool,
+        ep_sw: Arc<super::mmdevapi::EndpointSwAtomic>,
+    ) -> Self {
+        Self {
+            session,
+            stream_ch,
+            apply_stream_ch,
+            ep_sw,
+        }
+    }
+
+    /// Apply live session, stream-channel, and software endpoint gains in-place.
+    /// Returns `true` when session/endpoint mute completely silences the buffer.
+    #[inline]
+    pub(super) fn apply(&self, samples: &mut [f32], channels: usize) -> bool {
+        if self.ep_sw.sw_muted.load(Ordering::Acquire) {
+            samples.fill(0.0);
+            return true;
+        }
+        let master = self.session.effective_gain();
+        if master == 0.0 {
+            samples.fill(0.0);
+            return true;
+        }
+        let ch = channels.max(1);
+        let n = ch.min(8);
+        let mut eff = [master; 8];
+        let mut unity = (master - 1.0).abs() <= 1e-6;
+        for c in 0..n {
+            let mut g = master * f32::from_bits(self.ep_sw.sw_channels[c].load(Ordering::Acquire));
+            if self.apply_stream_ch {
+                g *= f32::from_bits(self.stream_ch.levels[c].load(Ordering::Acquire));
+            }
+            eff[c] = g;
+            if (g - 1.0).abs() > 1e-6 {
+                unity = false;
+            }
+        }
+        if unity {
+            return false;
+        }
+        for frame in samples.chunks_exact_mut(ch) {
+            for (c, sample) in frame.iter_mut().enumerate() {
+                let g = if c < 8 { eff[c] } else { master };
+                *sample *= g;
+            }
+        }
+        false
+    }
+}
+
 /// State shared between the client, the IO callback and the pump thread.
 pub struct StreamShared {
     pub ring: Ring,
     pub loopback: Option<LoopbackFeed>,
+    pub(super) gain: Option<PlaybackGain>,
     pub started: AtomicBool,
     pub underrun_frames: AtomicU64,
     pub callbacks: AtomicU64,
@@ -608,6 +742,7 @@ impl StreamShared {
         Arc::new(StreamShared {
             ring,
             loopback: None,
+            gain: None,
             started: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
@@ -620,12 +755,13 @@ impl StreamShared {
         })
     }
 
-    pub fn with_loopback(
+    pub(super) fn with_loopback(
         ring: Ring,
         ep_id: String,
         source_id: u64,
         rate: u32,
         channels: u16,
+        gain: Option<PlaybackGain>,
     ) -> Arc<StreamShared> {
         let lb_cap = ring.capacity().max(8192);
         let lb_ring = Ring::new(lb_cap, channels.max(1) as usize);
@@ -638,6 +774,7 @@ impl StreamShared {
                 channels,
                 ring: lb_ring,
             }),
+            gain,
             started: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
@@ -845,13 +982,17 @@ impl OutputStream {
                                         if super::audioclient::has_loopback_subscribers() {
                                             let got = s.ring.pop_into(&mut lb_buf);
                                             if got > 0 {
-                                                super::audioclient::push_loopback_frames(
-                                                    &lb.ep_id,
-                                                    lb.source_id,
-                                                    &lb_buf[..got * ch],
-                                                    lb.rate,
-                                                    lb.channels,
-                                                );
+                                                let active = &mut lb_buf[..got * ch];
+                                                let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, ch));
+                                                if !muted {
+                                                    super::audioclient::push_loopback_frames(
+                                                        &lb.ep_id,
+                                                        lb.source_id,
+                                                        active,
+                                                        lb.rate,
+                                                        lb.channels,
+                                                    );
+                                                }
                                             }
                                             got
                                         } else {
@@ -1831,9 +1972,13 @@ mod ca {
         let want = out.len() / s.ring.channels();
         let got = s.ring.pop_into(out);
         if got > 0 {
-            if let Some(lb) = &s.loopback {
+            let active = &mut out[..got * s.ring.channels()];
+            let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, s.ring.channels()));
+            if muted {
+                *flags |= kAudioUnitRenderAction_OutputIsSilence;
+            } else if let Some(lb) = &s.loopback {
                 if super::super::audioclient::has_loopback_subscribers() {
-                    lb.ring.push(&out[..got * s.ring.channels()]);
+                    lb.ring.push(active);
                 }
             }
         }
@@ -2094,9 +2239,13 @@ mod ca {
         let want = out.len() / s.ring.channels();
         let got = s.ring.pop_into(out);
         if got > 0 {
-            if let Some(lb) = &s.loopback {
+            let active = &mut out[..got * s.ring.channels()];
+            let muted = s.gain.as_ref().is_some_and(|g| g.apply(active, s.ring.channels()));
+            if muted {
+                *flags |= kAudioUnitRenderAction_OutputIsSilence;
+            } else if let Some(lb) = &s.loopback {
                 if super::super::audioclient::has_loopback_subscribers() {
-                    lb.ring.push(&out[..got * s.ring.channels()]);
+                    lb.ring.push(active);
                 }
             }
         }

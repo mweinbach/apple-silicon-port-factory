@@ -2634,3 +2634,73 @@ fn shared_audio_session_shares_volume_and_mute_across_clients_and_manager() {
         assert_eq!(release(e), 0);
     }
 }
+
+#[test]
+fn session_and_stream_volume_apply_at_playback_consumption_for_queued_audio() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        let render_c = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+        let sess = GUID::new(0xCCDD_1122, 0x3344, 0x5566, [9, 8, 7, 6, 5, 4, 3, 2]);
+        assert_eq!(
+            call!(render_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, &sess),
+            S_OK
+        );
+        let mut rc: P = std::ptr::null_mut();
+        let mut sv: P = std::ptr::null_mut();
+        let mut stv: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc), S_OK);
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_ISimpleAudioVolume, &mut sv), S_OK);
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioStreamVolume, &mut stv), S_OK);
+
+        let lb_c = activate_client(d);
+        assert_eq!(
+            call!(lb_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+
+        // 1. Prefill render buffer BEFORE calling SetMute(TRUE) and Start:
+        //    queued audio must play muted, not unmuted.
+        let mut rp: *mut u8 = std::ptr::null_mut();
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 64, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 64 * 2).fill(0.8);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 64, 0), S_OK);
+        assert_eq!(call!(sv, 5 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, std::ptr::null()), S_OK);
+        assert_eq!(call!(render_c, AC_START, () -> HRESULT;), S_OK);
+        wait_render_drained(render_c);
+        assert_no_live_loopback_audio(cc, "SetMute(TRUE) after prefill must mute already-queued audio");
+        assert_eq!(call!(render_c, AC_STOP, () -> HRESULT;), S_OK);
+
+        // 2. Prefill while MUTED, then unmute + adjust session & channel volumes BEFORE Start:
+        //    queued samples must be preserved and scaled by the live gains at consumption time.
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 64, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 64 * 2).fill(0.8);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 64, 0), S_OK);
+        assert_eq!(call!(sv, 5 /* SetMute */, (i32, *const GUID) -> HRESULT; 0, std::ptr::null()), S_OK);
+        assert_eq!(call_bridge_f32_guid(sv, 3 /* SetMasterVolume */, 0.5f32, std::ptr::null()), S_OK);
+        let ch_vols = [1.0f32, 0.25f32];
+        assert_eq!(call!(stv, 6 /* SetAllVolumes */, (u32, *const f32) -> HRESULT; 2, ch_vols.as_ptr()), S_OK);
+        assert_eq!(call!(render_c, AC_START, () -> HRESULT;), S_OK);
+        let got = wait_loopback_live_f32(cc, 64, 2);
+        assert_eq!(got.len(), 64 * 2);
+        assert!((got[0] - 0.4).abs() < 1e-4, "unmuted prefilled L must play at 0.8*0.5=0.4, got {}", got[0]);
+        assert!((got[1] - 0.1).abs() < 1e-4, "unmuted prefilled R must play at 0.8*0.5*0.25=0.1, got {}", got[1]);
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb_c), 0);
+        assert_eq!(release(stv), 0);
+        assert_eq!(release(sv), 0);
+        assert_eq!(release(rc), 0);
+        assert_eq!(release(render_c), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+}

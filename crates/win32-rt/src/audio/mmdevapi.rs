@@ -15,7 +15,7 @@ use super::com::*;
 use super::format::{default_mask, WaveFormat};
 use crate::types::*;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const eRender: u32 = 0;
@@ -1037,6 +1037,22 @@ impl Drop for RegisteredCallback {
 /// Shared across all `IAudioEndpointVolume` activations on the same endpoint ID so muting or
 /// adjusting volume on one COM instance is immediately observed by all other instances, while
 /// `sw_*` fields avoid double-attenuating channels that CoreAudio HAL already controls in hardware.
+/// Lock-free mirror of an endpoint's software fallback mute & per-channel amplitude gains,
+/// safe to read directly from the realtime CoreAudio IO callback without taking any mutex.
+pub(super) struct EndpointSwAtomic {
+    pub(super) sw_muted: AtomicBool,
+    pub(super) sw_channels: [AtomicU32; 8],
+}
+
+impl Default for EndpointSwAtomic {
+    fn default() -> Self {
+        Self {
+            sw_muted: AtomicBool::new(false),
+            sw_channels: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct EndpointSoftwareGain {
     /// Logical fallback control values (audio-tapered scalars in `[0.0, 1.0]`, used by getters
@@ -1052,6 +1068,8 @@ struct EndpointSoftwareGain {
     /// Master software attenuation is folded directly into `sw_channels` so subsequent
     /// per-channel writes never double-apply master attenuation.
     sw_channels: [f32; 8],
+    /// Lock-free atomic mirror read by playback consumers (`PlaybackGain::apply`).
+    atomic: Arc<EndpointSwAtomic>,
     /// Registered `IAudioEndpointVolumeCallback*` references shared across activations on this endpoint.
     callbacks: Vec<Arc<RegisteredCallback>>,
 }
@@ -1065,6 +1083,7 @@ impl Default for EndpointSoftwareGain {
             hw_master_gain: None,
             sw_muted: false,
             sw_channels: [1.0; 8],
+            atomic: Arc::new(EndpointSwAtomic::default()),
             callbacks: Vec::new(),
         }
     }
@@ -1072,20 +1091,12 @@ impl Default for EndpointSoftwareGain {
 
 static ENDPOINT_SW_GAINS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, EndpointSoftwareGain>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-static ENDPOINT_SW_GAINS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Return `(effective_mute_gain, per_channel_gains)` to apply in software on render/spatial
-/// audio for `ep_id`. Lock-free fast path returns `(1.0, [1.0; 8])` when no software endpoint
-/// gain has been configured.
-pub(super) fn endpoint_software_gains(ep_id: &str) -> (f32, [f32; 8]) {
-    if !ENDPOINT_SW_GAINS_ACTIVE.load(Ordering::Acquire) {
-        return (1.0, [1.0; 8]);
-    }
-    let map = ENDPOINT_SW_GAINS.lock().unwrap();
-    match map.get(ep_id) {
-        Some(g) => (if g.sw_muted { 0.0 } else { 1.0 }, g.sw_channels),
-        None => (1.0, [1.0; 8]),
-    }
+/// Return the shared lock-free software gain handle for `ep_id` so render/spatial playback
+/// consumers apply live `IAudioEndpointVolume` updates without acquiring any mutex.
+pub(super) fn endpoint_software_gain_handle(ep_id: &str) -> Arc<EndpointSwAtomic> {
+    let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+    map.entry(ep_id.to_string()).or_default().atomic.clone()
 }
 
 fn read_endpoint_sw_state<R>(ep_id: &str, f: impl FnOnce(&EndpointSoftwareGain) -> R) -> R {
@@ -1101,16 +1112,21 @@ fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain
     let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
     let entry = map.entry(ep_id.to_string()).or_default();
     f(entry);
-    let active = map.values().any(|g| {
-        g.sw_muted || g.sw_channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
-    });
-    ENDPOINT_SW_GAINS_ACTIVE.store(active, Ordering::Release);
+    entry.atomic.sw_muted.store(entry.sw_muted, Ordering::Release);
+    for (dst, &src) in entry.atomic.sw_channels.iter().zip(entry.sw_channels.iter()) {
+        dst.store(src.to_bits(), Ordering::Release);
+    }
 }
 
 #[cfg(test)]
 pub(super) fn reset_endpoint_software_gains_for_test() {
     let dropped = std::mem::take(&mut *ENDPOINT_SW_GAINS.lock().unwrap());
-    ENDPOINT_SW_GAINS_ACTIVE.store(false, Ordering::Release);
+    for g in dropped.values() {
+        g.atomic.sw_muted.store(false, Ordering::Release);
+        for dst in &g.atomic.sw_channels {
+            dst.store(1.0f32.to_bits(), Ordering::Release);
+        }
+    }
     drop(dropped);
 }
 

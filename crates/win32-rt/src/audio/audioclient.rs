@@ -657,7 +657,7 @@ pub struct ClientState {
 
 pub struct ClientCore {
     pub ep: Arc<Endpoint>,
-    pub(super) channel_volumes: Mutex<Vec<f32>>,
+    pub(super) channel_volumes: Arc<backend::StreamChannelGain>,
     pub st: Mutex<ClientState>,
 }
 
@@ -743,7 +743,7 @@ pub fn new_client(ep: Arc<Endpoint>) -> *mut ClientObj {
         &CLIENT_VTBL,
         Arc::new(ClientCore {
             ep,
-            channel_volumes: Mutex::new(vec![1.0; ch]),
+            channel_volumes: backend::StreamChannelGain::new(ch),
             st: Mutex::new(ClientState::default()),
         }),
     )
@@ -897,12 +897,19 @@ pub fn initialize(
         // display sleep); the client-visible buffer size is decided below.
         let ring_cap = requested.max(2 * backend::MAX_SLICE * f.rate.div_ceil(core.ep.info.rate.max(1)) + 1024);
         let source_id = alloc_loopback_source_id();
+        let gain = backend::PlaybackGain::new(
+            session.clone(),
+            core.channel_volumes.clone(),
+            matrix.is_none(),
+            super::mmdevapi::endpoint_software_gain_handle(&core.ep.id),
+        );
         let shared = StreamShared::with_loopback(
             Ring::new(ring_cap as usize, out_channels as usize),
             core.ep.id.clone(),
             source_id,
             f.rate,
             out_channels,
+            Some(gain),
         );
         let io_request = 512; // device frames; ~one Wwise frame
         let out = match OutputStream::open(&core.ep.info, f.rate, out_channels, shared.clone(), io_request) {
@@ -976,10 +983,7 @@ pub fn initialize(
         (shared, stream)
     };
 
-    {
-        let mut ch_vols = core.channel_volumes.lock().unwrap();
-        ch_vols.resize(f.channels.max(1) as usize, 1.0);
-    }
+    core.channel_volumes.resize(f.channels.max(1) as usize);
     STREAMS_INITIALIZED.fetch_add(1, Ordering::Relaxed);
     LIVE.lock().unwrap().push((core.ep.id.clone(), Arc::downgrade(&shared)));
     {
@@ -1446,9 +1450,11 @@ pub struct IAudioRenderClientVtbl {
 
 pub type RenderObj = ComObj<IAudioRenderClientVtbl, Arc<ClientCore>>;
 
-/// Push `frames` frames from the staging buffer (or silence) into the ring,
-/// applying session/per-channel volume gains and teeing to active loopback subscribers.
-fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frames: u32, flags: u32) {
+/// Push `frames` frames from the staging buffer (or silence) into the ring.
+/// Session (`ISimpleAudioVolume`), 1:1 stream-channel (`IAudioStreamVolume`), and
+/// software endpoint (`IAudioEndpointVolume`) gains are applied lock-free at playback
+/// consumption so volume/mute changes affect already-queued audio immediately.
+fn submit(s: &mut Stream, ch_gains: &[f32; 8], frames: u32, flags: u32) {
     let n = frames as usize;
     let bytes = n * s.fmt.block_align as usize;
     let padding_before = s.padding();
@@ -1468,13 +1474,7 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
         s.frames_written += frames as u64;
         return;
     }
-    let (ep_master, ep_ch_gains) = super::mmdevapi::endpoint_software_gains(ep_id);
-    let eff_master = master_gain * ep_master;
-    let has_ep_ch_gain = ep_ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6);
-    let has_gain = (eff_master - 1.0).abs() > 1e-6
-        || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6)
-        || has_ep_ch_gain;
-    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || eff_master == 0.0 {
+    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
         if let Some(t) = &mut r.tap {
             t.submit(frames, flags, padding_before, None, bytes);
         }
@@ -1490,7 +1490,7 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
         if let Some(t) = &mut r.tap {
             t.submit(frames, flags, padding_before, Some(raw), 0);
         }
-        let pushed: &[f32] = if fmt.sample == SampleType::F32 && r.matrix.is_none() && !has_gain {
+        let pushed: &[f32] = if fmt.sample == SampleType::F32 && r.matrix.is_none() {
             &r.staging[..n * fmt.channels as usize]
         } else {
             if fmt.sample == SampleType::F32 {
@@ -1500,35 +1500,22 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
             } else {
                 to_f32(&fmt, raw, n, &mut r.scratch);
             }
-            if (eff_master - 1.0).abs() > 1e-6 || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6) {
-                let ch = fmt.channels.max(1) as usize;
-                for frame in r.scratch.chunks_exact_mut(ch) {
-                    for (c, sample) in frame.iter_mut().enumerate() {
-                        let cg = ch_gains.get(c).copied().unwrap_or(1.0);
-                        *sample *= eff_master * cg;
-                    }
-                }
-            }
             if let Some(m) = &r.matrix {
-                apply_matrix(m, fmt.channels as usize, r.out_channels as usize, &r.scratch, &mut r.scratch2);
-                if has_ep_ch_gain {
-                    let och = r.out_channels.max(1) as usize;
-                    for frame in r.scratch2.chunks_exact_mut(och) {
-                        for (c, sample) in frame.iter_mut().enumerate() {
-                            *sample *= ep_ch_gains.get(c).copied().unwrap_or(1.0);
-                        }
-                    }
-                }
-                &r.scratch2
-            } else {
-                if has_ep_ch_gain {
-                    let ch = fmt.channels.max(1) as usize;
+                // Pre-downmix per-client-channel gains when channel counts differ; session and
+                // endpoint gains still apply at playback consumption.
+                let ch = fmt.channels.max(1) as usize;
+                if ch_gains.iter().take(ch.min(8)).any(|&g| (g - 1.0).abs() > 1e-6) {
                     for frame in r.scratch.chunks_exact_mut(ch) {
                         for (c, sample) in frame.iter_mut().enumerate() {
-                            *sample *= ep_ch_gains.get(c).copied().unwrap_or(1.0);
+                            if c < 8 {
+                                *sample *= ch_gains[c];
+                            }
                         }
                     }
                 }
+                apply_matrix(m, ch, r.out_channels as usize, &r.scratch, &mut r.scratch2);
+                &r.scratch2
+            } else {
                 &r.scratch
             }
         };
@@ -1596,9 +1583,8 @@ mod render {
         }
         s.pending = None;
         if frames > 0 {
-            let master_gain = s.session.effective_gain();
-            let ch_gains = core.channel_volumes.lock().unwrap().clone();
-            submit(s, &core.ep.id, master_gain, &ch_gains, frames, flags);
+            let ch_gains = core.channel_volumes.snapshot();
+            submit(s, &ch_gains, frames, flags);
         }
         S_OK
     }
@@ -1887,7 +1873,7 @@ mod stream_vol {
     crate::com_iunknown!(StreamVolumeObj, [IID_IAudioStreamVolume]);
 
     pub unsafe extern "win64" fn get_channel_count(this: *mut StreamVolumeObj, out: *mut u32) -> HRESULT {
-        let n = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap().len() as u32;
+        let n = StreamVolumeObj::inner(this).channel_volumes.len() as u32;
         write_out(out, n)
     }
 
@@ -1895,11 +1881,9 @@ mod stream_vol {
         if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
-        let mut vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
-        let Some(slot) = vols.get_mut(idx as usize) else {
+        if !StreamVolumeObj::inner(this).channel_volumes.set(idx as usize, level) {
             return E_INVALIDARG;
-        };
-        *slot = level;
+        }
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume(*mut StreamVolumeObj, u32, f32) -> HRESULT);
@@ -1908,8 +1892,7 @@ mod stream_vol {
         if out.is_null() {
             return E_POINTER;
         }
-        let vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
-        let Some(&v) = vols.get(idx as usize) else {
+        let Some(v) = StreamVolumeObj::inner(this).channel_volumes.get(idx as usize) else {
             return E_INVALIDARG;
         };
         write_out(out, v)
@@ -1919,19 +1902,20 @@ mod stream_vol {
         if levels.is_null() {
             return E_POINTER;
         }
-        let mut vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
-        if count as usize != vols.len() {
+        let vols = &StreamVolumeObj::inner(this).channel_volumes;
+        let n = vols.len();
+        if count as usize != n {
             return E_INVALIDARG;
         }
-        let mut next = Vec::with_capacity(vols.len());
-        for i in 0..vols.len() {
+        let mut next = [1.0f32; 8];
+        for (i, slot) in next.iter_mut().enumerate().take(n) {
             let v = std::ptr::read_unaligned(levels.add(i));
             if !v.is_finite() || !(0.0..=1.0).contains(&v) {
                 return E_INVALIDARG;
             }
-            next.push(v);
+            *slot = v;
         }
-        *vols = next;
+        vols.set_all(&next[..n]);
         S_OK
     }
 
@@ -1939,11 +1923,13 @@ mod stream_vol {
         if levels.is_null() {
             return E_POINTER;
         }
-        let vols = StreamVolumeObj::inner(this).channel_volumes.lock().unwrap();
-        if count as usize != vols.len() {
+        let vols = &StreamVolumeObj::inner(this).channel_volumes;
+        let n = vols.len();
+        if count as usize != n {
             return E_INVALIDARG;
         }
-        for (i, &v) in vols.iter().enumerate() {
+        let snap = vols.snapshot();
+        for (i, &v) in snap.iter().enumerate().take(n) {
             std::ptr::write_unaligned(levels.add(i), v);
         }
         S_OK

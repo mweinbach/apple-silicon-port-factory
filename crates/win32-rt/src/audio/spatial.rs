@@ -503,7 +503,7 @@ pub struct SpatialStreamCore {
     ep: Arc<Endpoint>,
     loopback_source_id: u64,
     session: Arc<SessionState>,
-    channel_volumes: Mutex<[f32; 2]>,
+    channel_volumes: Arc<backend::StreamChannelGain>,
     shared: Arc<StreamShared>,
     /// Live CoreAudio/Null output stream. Lives outside `st` mutex so dropping
     /// it never deadlocks with audio pump/clock/CoreAudio control threads.
@@ -911,10 +911,12 @@ mod spatial_stream_vol {
         idx: u32,
         level: f32,
     ) -> HRESULT {
-        if !level.is_finite() || !(0.0..=1.0).contains(&level) || idx >= 2 {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
-        SpatialStreamVolObj::inner(this).channel_volumes.lock().unwrap()[idx as usize] = level;
+        if !SpatialStreamVolObj::inner(this).channel_volumes.set(idx as usize, level) {
+            return E_INVALIDARG;
+        }
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume(*mut SpatialStreamVolObj, u32, f32) -> HRESULT);
@@ -927,10 +929,9 @@ mod spatial_stream_vol {
         if out.is_null() {
             return E_POINTER;
         }
-        if idx >= 2 {
+        let Some(v) = SpatialStreamVolObj::inner(this).channel_volumes.get(idx as usize) else {
             return E_INVALIDARG;
-        }
-        let v = SpatialStreamVolObj::inner(this).channel_volumes.lock().unwrap()[idx as usize];
+        };
         write_out(out, v)
     }
 
@@ -950,7 +951,7 @@ mod spatial_stream_vol {
         if !l.is_finite() || !r.is_finite() || !(0.0..=1.0).contains(&l) || !(0.0..=1.0).contains(&r) {
             return E_INVALIDARG;
         }
-        *SpatialStreamVolObj::inner(this).channel_volumes.lock().unwrap() = [l, r];
+        SpatialStreamVolObj::inner(this).channel_volumes.set_all(&[l, r]);
         S_OK
     }
 
@@ -965,7 +966,7 @@ mod spatial_stream_vol {
         if count != 2 {
             return E_INVALIDARG;
         }
-        let v = *SpatialStreamVolObj::inner(this).channel_volumes.lock().unwrap();
+        let v = SpatialStreamVolObj::inner(this).channel_volumes.snapshot();
         std::ptr::write_unaligned(levels, v[0]);
         std::ptr::write_unaligned(levels.add(1), v[1]);
         S_OK
@@ -1209,14 +1210,9 @@ mod render_stream {
                 }
             }
 
-            let (ep_master, ep_ch_gains) = crate::audio::mmdevapi::endpoint_software_gains(&core.ep.id);
-            let master_gain = core.session.effective_gain() * ep_master;
-            let ch_vols = *core.channel_volumes.lock().unwrap();
             for pair in mix_buf.chunks_exact_mut(2) {
-                let l = pair[0] * master_gain * ch_vols[0] * ep_ch_gains[0];
-                let r = pair[1] * master_gain * ch_vols[1] * ep_ch_gains[1];
-                pair[0] = if l.is_finite() { l.clamp(-1.0, 1.0) } else { 0.0 };
-                pair[1] = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
+                pair[0] = if pair[0].is_finite() { pair[0].clamp(-1.0, 1.0) } else { 0.0 };
+                pair[1] = if pair[1].is_finite() { pair[1].clamp(-1.0, 1.0) } else { 0.0 };
             }
             core.shared.ring.push(mix_buf);
             last_mixed.clear();
@@ -1502,12 +1498,21 @@ mod client {
         let granted_dynamic = max_dyn.min(MAX_DYNAMIC_OBJECTS);
         let ring_cap = (2 * backend::MAX_SLICE + QUANTUM_FRAMES * 4) as usize;
         let loopback_source_id = alloc_loopback_source_id();
+        let session = SessionState::get_or_create(inner.ep.clone(), None);
+        let channel_volumes = backend::StreamChannelGain::new(2);
+        let gain = backend::PlaybackGain::new(
+            session.clone(),
+            channel_volumes.clone(),
+            true,
+            crate::audio::mmdevapi::endpoint_software_gain_handle(&inner.ep.id),
+        );
         let shared = StreamShared::with_loopback(
             Ring::new(ring_cap, 2),
             inner.ep.id.clone(),
             loopback_source_id,
             SPATIAL_SAMPLE_RATE,
             2,
+            Some(gain),
         );
         shared.set_event(event);
 
@@ -1572,8 +1577,8 @@ mod client {
         let core = Arc::new(SpatialStreamCore {
             ep: inner.ep.clone(),
             loopback_source_id,
-            session: SessionState::get_or_create(inner.ep.clone(), None),
-            channel_volumes: Mutex::new([1.0, 1.0]),
+            session,
+            channel_volumes,
             shared,
             _out: out,
             ctrl,
