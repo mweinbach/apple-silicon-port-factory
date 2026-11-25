@@ -5154,6 +5154,19 @@ pub(crate) mod tests {
         handles::insert(obj)
     }
 
+    pub(crate) fn make_test_child_thread_handle(pid: u32, tid: u32) -> HANDLE {
+        let proc_obj = Arc::new(ChildProcessObj {
+            pid,
+            exe_win: "C:\\Games\\Child.exe".to_string(),
+            exit_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            terminated_code: handles::Guarded::new(None),
+            #[cfg(not(target_os = "ios"))]
+            os_pid: std::sync::atomic::AtomicI32::new(0),
+        });
+        handles::insert(Arc::new(ChildThreadObj { tid, process: proc_obj }))
+    }
+
     #[test]
     fn job_object_kill_on_close_terminates_current_process_on_last_handle() {
         const ENV_KEY: &str = "WIN32_RT_TEST_JOB_KILL_SELF";

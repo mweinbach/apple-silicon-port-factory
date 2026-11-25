@@ -173,15 +173,17 @@ struct VmState {
     segs: BTreeMap<usize, Seg>,
     /// Host-page-aligned addresses written inside `MEM_WRITE_WATCH` regions since last reset.
     write_watch_dirty: BTreeSet<usize>,
-    /// Host-page-aligned addresses that were resident (`MINCORE_INCORE`) when `MEM_RESET` was applied.
-    reset_resident: BTreeSet<usize>,
+    /// Host-page-aligned addresses advised `MADV_FREE_REUSABLE` via `MEM_RESET`.
+    /// Because XNU can silently purge and zero-refault such pages before `MEM_RESET_UNDO`,
+    /// retention cannot be proven from residency alone once a host page is in this set.
+    reset_discardable: BTreeSet<usize>,
 }
 
 static VM: Mutex<VmState> = Mutex::new(VmState {
     allocs: BTreeMap::new(),
     segs: BTreeMap::new(),
     write_watch_dirty: BTreeSet::new(),
-    reset_resident: BTreeSet::new(),
+    reset_discardable: BTreeSet::new(),
 });
 /// Set once any committed page in `VM` is marked `PAGE_NOACCESS` or `PAGE_GUARD`
 /// (e.g. packed executables using demand-decryption). Lets speculative JIT code
@@ -255,13 +257,13 @@ impl VmState {
             self.write_watch_dirty.remove(&hp);
         }
         let res: Vec<usize> = self
-            .reset_resident
+            .reset_discardable
             .range(hstart..hend)
             .copied()
             .filter(|&hp| !self.has_committed_subpage(hp))
             .collect();
         for hp in res {
-            self.reset_resident.remove(&hp);
+            self.reset_discardable.remove(&hp);
         }
     }
     /// Recompute and apply host page protection for `hp` from its surviving committed
@@ -436,11 +438,6 @@ unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u3
         hp += HOST_PAGE;
     }
     0
-}
-
-unsafe fn host_page_is_incore(hpage: usize) -> bool {
-    let mut state: libc::c_char = 0;
-    libc::mincore(hpage as *const c_void, HOST_PAGE, &mut state) == 0 && (state & 1) != 0
 }
 
 /// Record the enclosing host page of `addr` as dirty if it belongs to a
@@ -751,14 +748,13 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         if end > b + a.size {
             return Err(err::ERROR_INVALID_ADDRESS);
         }
-        // Record which complete host pages are currently resident before marking them
-        // MADV_FREE_REUSABLE so MEM_RESET_UNDO can verify whether XNU purged any of them.
+        // Record every complete host page we hand to XNU `MADV_FREE_REUSABLE`: once marked
+        // discardable, XNU can silently purge and zero-refault the page, so `MEM_RESET_UNDO`
+        // cannot guarantee the original contents survived.
         let mut hp = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
         let hend = addr.saturating_add(size) & !(HOST_PAGE - 1);
         while hp < hend {
-            if host_page_is_incore(hp) {
-                vm.reset_resident.insert(hp);
-            }
+            vm.reset_discardable.insert(hp);
             hp += HOST_PAGE;
         }
         discard_host_pages(addr, size);
@@ -778,23 +774,20 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
             return Err(err::ERROR_INVALID_ADDRESS);
         }
         const MADV_FREE_REUSE: i32 = 8;
-        let hstart = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-        let hend = addr.saturating_add(size) & !(HOST_PAGE - 1);
-        let mut any_discarded = false;
-        if hend > hstart {
-            // Cancel MADV_FREE_REUSABLE in XNU so resident pages remain intact.
-            let _ = libc::madvise(hstart as *mut c_void, hend - hstart, MADV_FREE_REUSE);
-            let tracked: Vec<usize> = vm.reset_resident.range(hstart..hend).copied().collect();
-            for hp in tracked {
-                vm.reset_resident.remove(&hp);
-                if !host_page_is_incore(hp) {
-                    any_discarded = true;
-                }
-            }
+        let hstart = start & !(HOST_PAGE - 1);
+        let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+        let discardable: Vec<usize> = vm.reset_discardable.range(hstart..hend).copied().collect();
+        let any_discardable = !discardable.is_empty();
+        for hp in discardable {
+            // Cancel MADV_FREE_REUSABLE in XNU so future writes stay retained.
+            let _ = libc::madvise(hp as *mut c_void, HOST_PAGE, MADV_FREE_REUSE);
+            vm.reset_discardable.remove(&hp);
         }
-        if any_discarded {
-            // Per Microsoft Learn (VirtualAlloc MEM_RESET_UNDO): fail when any page in the
-            // range was discarded by the OS while in MEM_RESET state.
+        if any_discardable {
+            // XNU does not expose whether a MADV_FREE_REUSABLE page was purged and
+            // zero-refaulted prior to MADV_FREE_REUSE (`mincore` would still report it
+            // resident). Fail honestly with ERROR_INVALID_ADDRESS per Microsoft Learn so
+            // callers regenerate cached data instead of reusing silently zeroed pages.
             return Err(err::ERROR_INVALID_ADDRESS);
         }
         return Ok(addr);
@@ -2257,17 +2250,25 @@ mod tests {
     #[test]
     fn mem_reset_and_undo_and_virtual_alloc_ex_and_flush_buffers() {
         unsafe {
-            // MEM_RESET + MEM_RESET_UNDO preserves resident pages and validates addresses.
+            // MEM_RESET on full host pages marks them MADV_FREE_REUSABLE; MEM_RESET_UNDO
+            // must fail honestly with ERROR_INVALID_ADDRESS because XNU cannot prove a
+            // discardable page was not purged and zero-refaulted.
             let sz = HOST_PAGE * 2;
             let p = VirtualAlloc(std::ptr::null_mut(), sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
             assert!(!p.is_null());
             *(p as *mut u64) = 0x1122_3344_5566_7788;
             assert_eq!(VirtualAlloc(p, sz, MEM_RESET, PAGE_READWRITE), p);
-            let undo = VirtualAlloc(p, sz, MEM_RESET_UNDO, PAGE_READWRITE);
-            if !undo.is_null() {
-                assert_eq!(undo, p);
-                assert_eq!(*(p as *const u64), 0x1122_3344_5566_7788);
+            assert!(VirtualAlloc(p, sz, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+            // Once MADV_FREE_REUSE has been restored and cleared, a subsequent MEM_RESET_UNDO
+            // on retained memory (or a sub-host-page MEM_RESET that never advised MADV_FREE_REUSABLE)
+            // succeeds truthfully.
+            *(p as *mut u64) = 0x8877_6655_4433_2211;
+            if HOST_PAGE > PAGE {
+                assert_eq!(VirtualAlloc(p, PAGE, MEM_RESET, PAGE_READWRITE), p);
             }
+            assert_eq!(VirtualAlloc(p, PAGE, MEM_RESET_UNDO, PAGE_READWRITE), p);
+            assert_eq!(*(p as *const u64), 0x8877_6655_4433_2211);
             assert!(VirtualAlloc(std::ptr::null_mut(), sz, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);

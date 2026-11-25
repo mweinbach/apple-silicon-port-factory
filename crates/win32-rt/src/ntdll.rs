@@ -29,6 +29,7 @@ pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023u32 as i32;
 pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024u32 as i32;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: NTSTATUS = 0xC000_0047u32 as i32;
 pub const STATUS_FILE_INVALID: NTSTATUS = 0xC000_0098u32 as i32;
+pub const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BBu32 as i32;
 pub const STATUS_INVALID_ADDRESS: NTSTATUS = 0xC000_0141u32 as i32;
 pub const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000_001Au32 as i32;
 pub const STATUS_PORT_NOT_SET: NTSTATUS = 0xC000_0353u32 as i32;
@@ -534,18 +535,26 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
         }
         9 => {
             // ThreadQuerySetWin32StartAddress (8 bytes)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadQuerySetWin32StartAddress): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
             put_ret(8);
             if len < 8 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            let start = tobj
-                .as_ref()
-                .map_or(0, |t| t.start_address.load(std::sync::atomic::Ordering::Acquire));
+            let start = t.start_address.load(std::sync::atomic::Ordering::Acquire);
             std::ptr::write_unaligned(out as *mut usize, start);
             STATUS_SUCCESS
         }
         0x0C => {
             // ThreadAmILastThread (4 bytes)
+            if tobj.is_none() {
+                log::warn!("NtQueryInformationThread(ThreadAmILastThread): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            }
             put_ret(4);
             if len < 4 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
@@ -559,27 +568,34 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
         }
         0x11 => {
             // ThreadHideFromDebugger (1 byte)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadHideFromDebugger): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
             put_ret(1);
             if len != 1 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            let hidden = tobj
-                .as_ref()
-                .is_some_and(|t| t.hide_from_debugger.load(std::sync::atomic::Ordering::Acquire));
+            let hidden = t.hide_from_debugger.load(std::sync::atomic::Ordering::Acquire);
             *out = hidden as u8;
             STATUS_SUCCESS
         }
         0x1E => {
             // ThreadGroupInformation (GROUP_AFFINITY: 16 bytes)
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadGroupInformation): child thread affinity query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
             put_ret(16);
             if len < 16 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             let proc_mask = crate::kernel32::process::current_process_affinity_mask();
-            let (mask, group) = tobj.as_ref().map_or((proc_mask, 0u16), |t| {
-                let m = t.affinity_mask.load(std::sync::atomic::Ordering::Acquire);
-                (if m == 0 { proc_mask } else { m }, t.affinity_group.load(std::sync::atomic::Ordering::Acquire))
-            });
+            let m = t.affinity_mask.load(std::sync::atomic::Ordering::Acquire);
+            let mask = if m == 0 { proc_mask } else { m };
+            let group = t.affinity_group.load(std::sync::atomic::Ordering::Acquire);
             std::ptr::write_bytes(out, 0, 16);
             std::ptr::write_unaligned(out as *mut usize, mask);
             std::ptr::write_unaligned(out.add(8) as *mut u16, group);
@@ -587,10 +603,12 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
         }
         0x26 => {
             // ThreadNameInformation (UNICODE_STRING header + UTF-16LE chars)
-            let name = tobj
-                .as_ref()
-                .map(|t| t.name.lock().unwrap().clone())
-                .unwrap_or_default();
+            let Some(ref t) = tobj else {
+                log::warn!("NtQueryInformationThread(ThreadNameInformation): child thread query is not supported");
+                put_ret(0);
+                return STATUS_NOT_SUPPORTED;
+            };
+            let name = t.name.lock().unwrap().clone();
             let wide: Vec<u16> = name.encode_utf16().collect();
             let byte_len = wide.len() * 2;
             let needed = (16 + byte_len + 2) as u32;
@@ -3613,6 +3631,23 @@ mod tests {
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0C, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 4);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x1E, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
+            // Child thread handles must NOT fall back to the parent process's affinity/state:
+            // ThreadBasicInformation (0) reports real child pid/tid, while unsupported classes
+            // (including ThreadGroupInformation 0x1E) fail with STATUS_NOT_SUPPORTED.
+            let child_th = crate::kernel32::process::tests::make_test_child_thread_handle(424242, 424243);
+            assert_eq!(NtQueryInformationThread(child_th, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize), 424242);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const usize), 424243);
+            for &(cls, sz) in &[(9u32, 8u32), (0x0C, 4), (0x11, 1), (0x1E, 16), (0x26, 64)] {
+                ret = 99;
+                assert_eq!(
+                    NtQueryInformationThread(child_th, cls, buf.as_mut_ptr(), sz, &mut ret),
+                    STATUS_NOT_SUPPORTED,
+                    "child thread query class 0x{cls:x} must fail honestly with STATUS_NOT_SUPPORTED"
+                );
+                assert_eq!(ret, 0);
+            }
+            assert_eq!(crate::kernel32::threads::CloseHandle(child_th), TRUE);
             assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
             // ThreadActualBasePriority (0x19), 0x0D, and unimplemented ThreadIsIoPending (0x10)
             // return honest STATUS_INVALID_INFO_CLASS rather than misrouting or fabricating 0.
