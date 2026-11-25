@@ -2207,7 +2207,7 @@ pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
             } else {
                 vec![b0]
             };
-            match crate::kernel32::string::decode_cp_to_utf16(cp, &bytes) {
+            match crate::kernel32::string::decode_cp_to_utf16_strict(cp, &bytes, true) {
                 Ok(w) if !w.is_empty() && !w.contains(&0xFFFD) => Some(w[0] as u32),
                 _ => {
                     s.err = true;

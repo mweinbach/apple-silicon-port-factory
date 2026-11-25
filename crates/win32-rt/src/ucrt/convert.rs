@@ -619,7 +619,7 @@ fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     if bytes.len() < len {
         return Ok(None);
     }
-    let w = crate::kernel32::string::decode_cp_to_utf16(cp, &bytes[..len]).map_err(|_| ())?;
+    let w = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &bytes[..len], true).map_err(|_| ())?;
     if w.is_empty() || w.contains(&0xFFFD) {
         return Err(());
     }
@@ -1200,6 +1200,23 @@ mod tests {
             assert_eq!(_atof_l(b"4,25\0".as_ptr(), loc_de), 4.25);
             assert_eq!(strtod(b"1.5\0".as_ptr(), std::ptr::null_mut()), 1.5);
             crate::ucrt::locale::_free_locale(loc_de);
+
+            // Strict multibyte decoding under ja-JP (CP932): invalid lead+trail [0x81, 0x20]
+            // must fail with EILSEQ in mbtowc / mbstowcs rather than silently substituting U+001A.
+            assert!(!crate::ucrt::locale::setlocale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr()).is_null());
+            let mut wc = 0u16;
+            let valid_sjis = [0x82u8, 0xA0, 0]; // 'あ'
+            assert_eq!(mbtowc(&mut wc, valid_sjis.as_ptr(), 2), 2);
+            assert_eq!(wc, 'あ' as u16);
+            let bad_sjis = [0x81u8, 0x20, 0];
+            errno::set(0);
+            assert_eq!(mbtowc(&mut wc, bad_sjis.as_ptr(), 2), -1);
+            assert_eq!(errno::get(), EILSEQ);
+            let mut wout = [0u16; 8];
+            errno::set(0);
+            assert_eq!(mbstowcs(wout.as_mut_ptr(), bad_sjis.as_ptr(), wout.len()), usize::MAX);
+            assert_eq!(errno::get(), EILSEQ);
+            assert!(!crate::ucrt::locale::setlocale(2, b"C\0".as_ptr()).is_null());
         }
     }
     #[test]
