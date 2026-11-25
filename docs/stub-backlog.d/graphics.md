@@ -4,14 +4,15 @@ Scope: 26 stub sites across `d3d12/mod.rs` (2), `dxgi/mod.rs` (7), `dxgi/adapter
 `d3d11/device.rs` (8), `d3d11/context.rs` (5), and `d3d11/resources.rs` (1).
 
 - **Before:** 26 sites
-- **Made real:** 17 sites
+- **Made real:** 16 sites
 - **Native-unsupported (matches Windows without the hardware/OS feature):** 6 sites
-- **Honest leftovers remaining in `db/stub_inventory.tsv`:** 3 sites
+- **Honest leftovers remaining in `db/stub_inventory.tsv`:** 4 sites
 
-## Remaining Leftovers in Scope (3 sites)
+## Remaining Leftovers in Scope (4 sites)
 
 | DLL!API | Location | Why Not Implemented Yet | Next Step |
 |---|---|---|---|
+| `d3d11.dll!ID3D11Device::CreateClassLinkage` | `crates/win32-rt/src/d3d11/device.rs` | Returning `S_OK` without implementing dynamic shader interface dispatch (`SHEX` `IFCE` / `dcl_interface` / `dcl_function_table` / `fcall`) would let apps pass feature detection and then execute the wrong shader implementations. | Parse DXBC `IFCE` interface/type/instance tables, wire `pClassLinkage` at `Create*Shader` and `ppClassInstances` at `{VS,HS,DS,GS,PS,CS}SetShader` into PSO specialization or `dxilconv`/`dxil-metal` `fcall` lowering, then return `S_OK` with an end-to-end GPU test verifying distinct class instances produce distinct shader output. |
 | `d3d11.dll!ID3D11Device::CreateGeometryShaderWithStreamOutput` | `crates/win32-rt/src/d3d11/device.rs` | Apple Metal Shader Converter does not expose stream-out synthesis in its public C header (`metal_irconverter.h`; `IRCompilerSetStreamOutEnabled` / `IRCreateStreamOutFunction` are private undocumented C++ symbols that must not be called). Lowering arbitrary DXBC/DXIL stream-out shaders cleanly requires a DXIL LLVM 3.7 bitcode rewriter that translates `dx.op.storeOutput` / `dx.op.emitStream` into `RWByteAddressBuffer` UAV writes with per-stream atomic vertex counters according to `D3D11_SO_DECLARATION_ENTRY` strides. | Implement a clean-room DXIL stream-out bitcode lowering pass in `crates/dxil-metal` (rewriting stream-out outputs to internal UAV slots + atomic counter buffers), bind `so_targets` UAVs in `d3d11/context.rs`, and verify with a Metal 4 GPU E2E readback test. |
 | `d3d11.dll!ID3D11DeviceContext::DrawAuto` | `crates/win32-rt/src/d3d11/context.rs` | Depends on `CreateGeometryShaderWithStreamOutput` populating per-stream GPU vertex-count atomic buffers for bound `SOSetTargets` buffers. | Once stream-out writes atomic vertex counts per SO target buffer, dispatch a tiny compute helper (or copy directly into a 16-byte `DrawInstancedIndirect` argument buffer `{vertexCount, 1, 0, 0}`) and execute via `CommandList::execute_indirect`. |
 | `d3d11.dll!ID3D11DeviceContext::GetData` (`D3D11_QUERY_PIPELINE_STATISTICS`) | `crates/win32-rt/src/d3d11/context.rs` | CPU-submitted counts (`IAVertices`, `IAPrimitives`, `VSInvocations`, `GSInvocations`, `HSInvocations`, `CSInvocations`) are now accurately accumulated between `Begin` and `End`, but GPU-side counters (`CInvocations`, `CPrimitives`, `PSInvocations`, `GSPrimitives`, `DSInvocations`, and indirect draw counts) cannot be sampled on Apple Silicon because `MTLDevice.counterSets` only exposes `timestamp` (`GPUTimestamp`) and `MTL4CounterHeapType` only defines `Invalid` and `Timestamp` (no `MTLCommonCounterSetStatistic`). The `stub!` stays in place so GPU-side zeroes are never reported silently. | When Apple Metal exposes stage-invocation/clipper hardware counter sets on Apple Silicon, wire them through `d3d12-metal::metal::query` (`MTL4CounterHeap`), or add an opt-in shader-instrumentation pass for `PSInvocations`/`GSPrimitives`/`DSInvocations`. |
@@ -27,7 +28,7 @@ Scope: 26 stub sites across `d3d12/mod.rs` (2), `dxgi/mod.rs` (7), `dxgi/adapter
 | `d3d11.dll!ID3D11Device::CheckCounter` | `crates/win32-rt/src/d3d11/device.rs` | Validates `pDesc` (`E_INVALIDARG` if null) and returns `DXGI_ERROR_UNSUPPORTED`, matching Windows D3D11 drivers whose `CheckCounterInfo` reports `LastDeviceDependentCounter == 0` (Apple Silicon exposes no device-dependent performance counters). | [ID3D11Device::CheckCounter method](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-checkcounter) & [ID3D11Device::CheckCounterInfo](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-checkcounterinfo) |
 | `d3d11.dll!ID3D11Device::CreateCounter` | `crates/win32-rt/src/d3d11/device.rs` | Zeroes `*ppCounter`, validates `pCounterDesc` (`E_INVALIDARG` if null), and returns `DXGI_ERROR_UNSUPPORTED`, matching Windows D3D11 drivers that expose zero device-dependent counters. | [ID3D11Device::CreateCounter method](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createcounter) |
 
-## Resolved Sites — Made Real (17 sites)
+## Resolved Sites — Made Real (16 sites)
 
 | DLL!API | Location | Implementation Summary |
 |---|---|---|
@@ -41,7 +42,6 @@ Scope: 26 stub sites across `d3d12/mod.rs` (2), `dxgi/mod.rs` (7), `dxgi/adapter
 | `dxgi.dll!IDXGIOutput::TakeOwnership` / `ReleaseOwnership` | `crates/win32-rt/src/dxgi/adapter.rs` | Per-output exclusive ownership tracking with `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` conflict reporting, `E_INVALIDARG` on null device, and automatic cleanup on `Drop`. |
 | `d3d11.dll!IDXGIDevice::CreateSurface` | `crates/win32-rt/src/d3d11/device.rs` | Creates `NumSurfaces` real Metal-backed `IDXGISurface2` objects translating `DXGI_USAGE_*` flags into `D3D11_BIND_*` / `D3D11_CPU_ACCESS_*` flags, with rollback on failure. |
 | `d3d11.dll!IDXGISurface1::GetDC` / `ReleaseDC` | `crates/win32-rt/src/d3d11/resources.rs` | Validates `D3D11_RESOURCE_MISC_GDI_COMPATIBLE`, non-MSAA, and `B8G8R8A8_UNORM(_SRGB)`; optionally reads back GPU texture when `Discard == FALSE`; creates a real `gdi32` top-down 32bpp BGRA `HDC` backed by staging memory; uploads dirty rect or full surface to Metal on `ReleaseDC`. |
-| `d3d11.dll!ID3D11Device::CreateClassLinkage` | `crates/win32-rt/src/d3d11/device.rs` | Returns a real `ID3D11ClassLinkage` COM object implementing `GetClassInstance` and `CreateClassInstance`, returning real `ID3D11ClassInstance` objects (`GetClassLinkage`, `GetDesc`, `GetInstanceName`, `GetTypeName`) tracked on shader slots. |
 | `d3d11.dll!ID3D11Device1::CreateDeviceContextState` | `crates/win32-rt/src/d3d11/device.rs` | Validates flags, feature-level array, SDK version, and emulated interface IID (`ID3D10Device` / `ID3D10Device1` / `ID3D11Device` / `ID3D11Device1`), selects the highest supported feature level, and creates a real `ID3DDeviceContextState` holding full `ContextState`. |
 | `d3d11.dll!ID3D11DeviceContext1::SwapDeviceContextState` | `crates/win32-rt/src/d3d11/context.rs` | Lazily materializes the initial context state, swaps the entire immediate `ContextState` atomically with the target `ID3DDeviceContextState`, and returns the previous state in `ppPreviousState`. |
 | `d3d11.dll!ID3D11Device::CreateHullShader` | `crates/win32-rt/src/d3d11/device.rs` | Validates DXBC container bytecode (`E_INVALIDARG` on invalid input, `S_FALSE` when `ppHullShader == NULL`) and creates a real `ID3D11HullShader` COM object. |

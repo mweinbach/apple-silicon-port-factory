@@ -766,15 +766,12 @@ unsafe extern "win64" fn create_domain_shader(
     S_OK
 }
 
-unsafe extern "win64" fn create_class_linkage(this: PDev, out: *mut *mut c_void) -> HRESULT {
+unsafe extern "win64" fn create_class_linkage(_this: PDev, out: *mut *mut c_void) -> HRESULT {
     if !out.is_null() {
         std::ptr::write_unaligned(out, std::ptr::null_mut());
     }
-    if out.is_null() {
-        return S_FALSE;
-    }
-    std::ptr::write_unaligned(out, D3d11ClassLinkage::new_com(Obj::get(this).core.clone()));
-    S_OK
+    stub!("ID3D11Device::CreateClassLinkage -> E_NOTIMPL");
+    E_NOTIMPL
 }
 
 unsafe extern "win64" fn create_blend_state(

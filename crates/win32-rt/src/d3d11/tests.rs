@@ -4016,59 +4016,14 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             DXGI_ERROR_UNSUPPORTED
         );
 
-        // 2. ID3D11Device::CreateClassLinkage + CreateClassInstance / GetClassInstance + shader binding.
+        // 2. ID3D11Device::CreateClassLinkage remains honestly unsupported (E_NOTIMPL) until
+        // dynamic shader interface dispatch (IFCE / fcall lowering) is wired into execution.
         let create_cl: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             std::mem::transmute(vtbl_slot(dev, 19));
-        assert_eq!(create_cl(dev, std::ptr::null_mut()), S_FALSE);
-        let mut cl: *mut c_void = std::ptr::null_mut();
-        assert_eq!(create_cl(dev, &mut cl), S_OK);
-        assert!(!cl.is_null());
-
-        let get_ci: unsafe extern "win64" fn(*mut c_void, *const u8, u32, *mut *mut c_void) -> HRESULT =
-            std::mem::transmute(vtbl_slot(cl, 7));
-        let create_ci: unsafe extern "win64" fn(*mut c_void, *const u8, u32, u32, u32, u32, *mut *mut c_void) -> HRESULT =
-            std::mem::transmute(vtbl_slot(cl, 8));
-        let mut ci1: *mut c_void = std::ptr::null_mut();
-        let mut ci2: *mut c_void = std::ptr::null_mut();
-        assert_eq!(get_ci(cl, b"gLight\0".as_ptr(), 3, &mut ci1), S_OK);
-        assert_eq!(create_ci(cl, b"CPointLight\0".as_ptr(), 1, 4, 2, 0, &mut ci2), S_OK);
-
-        let ci_get_desc: unsafe extern "win64" fn(*mut c_void, *mut D3D11_CLASS_INSTANCE_DESC) =
-            std::mem::transmute(vtbl_slot(ci2, 8));
-        let ci_get_inst_name: unsafe extern "win64" fn(*mut c_void, *mut u8, *mut usize) =
-            std::mem::transmute(vtbl_slot(ci1, 9));
-        let ci_get_type_name: unsafe extern "win64" fn(*mut c_void, *mut u8, *mut usize) =
-            std::mem::transmute(vtbl_slot(ci2, 10));
-        let mut d2 = D3D11_CLASS_INSTANCE_DESC::default();
-        ci_get_desc(ci2, &mut d2);
-        assert_eq!((d2.ConstantBuffer, d2.BaseConstantBufferOffset, d2.BaseTexture, d2.Created), (1, 4, 2, TRUE));
-        let mut buf = [0u8; 32];
-        let mut len = buf.len();
-        ci_get_inst_name(ci1, buf.as_mut_ptr(), &mut len);
-        assert_eq!(&buf[..len], b"gLight\0");
-        len = buf.len();
-        ci_get_type_name(ci2, buf.as_mut_ptr(), &mut len);
-        assert_eq!(&buf[..len], b"CPointLight\0");
-
-        // Bind class instances via VSSetShader and read back via VSGetShader.
-        let vs_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
-            std::mem::transmute(vtbl_slot(ctx, 11));
-        let vs_get: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32) =
-            std::mem::transmute(vtbl_slot(ctx, 76));
-        let cis = [ci1, ci2];
-        vs_set(ctx, std::ptr::null_mut(), cis.as_ptr(), 2);
-        let mut got_vs: *mut c_void = std::ptr::null_mut();
-        let mut got_cis = [std::ptr::null_mut(); 2];
-        let mut got_n = 2u32;
-        vs_get(ctx, &mut got_vs, got_cis.as_mut_ptr(), &mut got_n);
-        assert_eq!(got_n, 2);
-        assert_eq!(got_cis[0], ci1);
-        assert_eq!(got_cis[1], ci2);
-        com_release(got_cis[0]);
-        com_release(got_cis[1]);
-        com_release(ci2);
-        com_release(ci1);
-        com_release(cl);
+        let mut cl: *mut c_void = 1usize as *mut c_void;
+        assert_eq!(create_cl(dev, &mut cl), E_NOTIMPL);
+        assert!(cl.is_null());
+        assert_eq!(create_cl(dev, std::ptr::null_mut()), E_NOTIMPL);
 
         // 3. ID3D11Device1::CreateDeviceContextState + ID3D11DeviceContext1::SwapDeviceContextState.
         let create_dcs: unsafe extern "win64" fn(
@@ -4451,5 +4406,151 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         com_release(vb);
         com_release(ctx);
         com_release(dev);
+    }
+
+    // Regression test: GPU predication (`CommandList::set_predication`) must suppress or allow
+    // both non-indexed and indexed tessellation draws under EQUAL_ZERO (0) and NOT_EQUAL_ZERO (1).
+    {
+        use d3d12_metal::layout::PlacedFootprint;
+        use d3d12_metal::metal::cmdlist::{CommandAllocator, CommandList, CopyLoc, TargetView};
+        use d3d12_metal::metal::pipeline::{GraphicsDesc, GraphicsPipeline};
+        use d3d12_metal::metal::queue::{ListType, Queue};
+        use d3d12_metal::metal::resource::Resource as MtlResource;
+        use d3d12_metal::types::{dim, heap_type, HeapProperties, ResourceDesc};
+
+        let rs = super::state::build_graphics_root_signature();
+        let mut rdesc = D3D11_RASTERIZER_DESC::default_d3d11();
+        rdesc.CullMode = 1; // CULL_NONE
+        let gdesc = GraphicsDesc {
+            vs: &vs_dxbc,
+            ps: Some(&ps_dxbc),
+            blend: D3D11_BLEND_DESC::default_d3d11().to_d3d12(),
+            sample_mask: u32::MAX,
+            raster: d3d12_metal::state::raster_state(&rdesc.to_desc1().to_d3d12()),
+            depth_stencil: d3d12_metal::state::depth_stencil_state(
+                &D3D11_DEPTH_STENCIL_DESC::default_d3d11().to_d3d12(),
+            ),
+            input_layout: vec![dxil_metal::InputElement {
+                semantic_name: "POSITION".to_string(),
+                semantic_index: 0,
+                format: 2,
+                input_slot: 0,
+                aligned_byte_offset: 0,
+                input_slot_class: 0,
+                instance_data_step_rate: 0,
+            }],
+            strip_cut: 0,
+            topology_type: d3d12_metal::topology::topology_type::PATCH,
+            rtv_formats: vec![28],
+            dsv_format: 0,
+            sample_count: 1,
+        };
+        let pso = Arc::new(
+            GraphicsPipeline::new_with_tessellation(rs.clone(), &gdesc, &hs_dxbc, &ds_dxbc, None, "test_pred_tess")
+                .expect("tessellation PSO for predication test"),
+        );
+
+        let queue = Queue::new(ListType::Direct, "pred_tess_q").expect("queue");
+        let alloc = CommandAllocator::new(ListType::Direct).expect("alloc");
+        let mut cl = CommandList::new(ListType::Direct).expect("cl");
+
+        let mk_buf = |bytes: &[u8], hp_ty: u32, name: &str| -> MtlResource {
+            let rd = ResourceDesc {
+                Dimension: dim::BUFFER,
+                Width: bytes.len().max(16) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleCount: 1,
+                Layout: 1,
+                ..Default::default()
+            };
+            let hp = HeapProperties { Type: hp_ty, ..Default::default() };
+            let r = super::resources::new_committed_resource(&rd, &hp, name).expect(name);
+            if !bytes.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.cpu_ptr().unwrap(), bytes.len());
+                }
+            }
+            r
+        };
+
+        let verts: [[f32; 4]; 3] = [
+            [-1.0, -1.0, 0.0, 1.0],
+            [-1.0,  3.0, 0.0, 1.0],
+            [ 3.0, -1.0, 0.0, 1.0],
+        ];
+        let vb_bytes = unsafe { std::slice::from_raw_parts(verts.as_ptr() as *const u8, 48) };
+        let vb = mk_buf(vb_bytes, heap_type::UPLOAD, "pred_tess_vb");
+        let indices: [u32; 3] = [0, 1, 2];
+        let ib_bytes = unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, 12) };
+        let ib = mk_buf(ib_bytes, heap_type::UPLOAD, "pred_tess_ib");
+        let pred_zero = mk_buf(&0u64.to_le_bytes(), heap_type::UPLOAD, "pred_zero");
+        let pred_one = mk_buf(&1u64.to_le_bytes(), heap_type::UPLOAD, "pred_one");
+        let rb = mk_buf(&[0u8; 256 * 8], heap_type::READBACK, "pred_tess_rb");
+
+        let rt_desc = ResourceDesc {
+            Dimension: dim::TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: 28,
+            SampleCount: 1,
+            Flags: 0x1, // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+            ..Default::default()
+        };
+        let rt = super::resources::new_committed_resource(
+            &rt_desc,
+            &HeapProperties { Type: heap_type::DEFAULT, ..Default::default() },
+            "pred_tess_rt",
+        )
+        .expect("rt");
+        let tv = TargetView::rtv(&rt, None).expect("tv");
+        let fp = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 8,
+            height: 8,
+            depth: 1,
+            row_pitch: 256,
+            _pad: 0,
+        };
+
+        let cases: [(&str, bool, u64, u32, u32); 4] = [
+            // (label, indexed, pred_va, pred_op, expected_pixel)
+            ("non-indexed EQUAL_ZERO pred=0 suppresses", false, pred_zero.gpu_va, 0, 0x0000_0000),
+            ("non-indexed EQUAL_ZERO pred=1 allows",     false, pred_one.gpu_va,  0, 0xFFFF_00FF),
+            ("indexed NOT_EQUAL_ZERO pred=1 suppresses", true,  pred_one.gpu_va,  1, 0x0000_0000),
+            ("indexed NOT_EQUAL_ZERO pred=0 allows",     true,  pred_zero.gpu_va, 1, 0xFFFF_00FF),
+        ];
+
+        for (label, indexed, pred_va, pred_op, expected) in cases {
+            alloc.reset();
+            cl.begin(&alloc).expect("begin");
+            unsafe { cl.clear_rtv(&tv, [0.0; 4], &[]).expect("clear") };
+            cl.set_render_targets(vec![tv], None);
+            cl.set_graphics_pipeline(pso.clone());
+            cl.gfx_root.set_root_signature(rs.clone()).expect("rs");
+            cl.set_viewports_raw(&[(0.0, 0.0, 8.0, 8.0, 0.0, 1.0)]);
+            cl.gfx.topology = topology::PATCHLIST_3;
+            cl.gfx.vbs[0] = (vb.gpu_va, 48, 16);
+            cl.gfx.ib = Some((ib.gpu_va, 12, 42)); // DXGI_FORMAT_R32_UINT
+            cl.set_predication(Some((pred_va, pred_op)));
+            if indexed {
+                cl.draw_indexed(3, 1, 0, 0, 0).expect("draw_indexed");
+            } else {
+                cl.draw(3, 1, 0, 0).expect("draw");
+            }
+            cl.set_predication(None);
+            cl.barrier();
+            cl.copy_texture_region(CopyLoc::Footprint(&rb, fp), [0, 0, 0], CopyLoc::Subresource(&rt, 0), None)
+                .expect("readback copy");
+            cl.close().expect("close");
+            let v = queue.submit(&[&cl.cb]);
+            queue.timeline.wait_cpu(v, u64::MAX);
+            let got = unsafe { std::ptr::read_unaligned(rb.cpu_ptr().unwrap() as *const u32) };
+            assert_eq!(got, expected, "predicated tessellation case '{label}': got {got:#010x}, expected {expected:#010x}");
+        }
     }
 }

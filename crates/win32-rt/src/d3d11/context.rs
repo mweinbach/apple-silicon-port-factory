@@ -356,22 +356,16 @@ impl Default for StageBindings {
 pub struct ContextState {
     pub vs_com: ComRef,
     pub vs: Option<Arc<ShaderBlob>>,
-    pub vs_ci: Vec<ComRef>,
     pub hs_com: ComRef,
     pub hs: Option<Arc<ShaderBlob>>,
-    pub hs_ci: Vec<ComRef>,
     pub ds_com: ComRef,
     pub ds: Option<Arc<ShaderBlob>>,
-    pub ds_ci: Vec<ComRef>,
     pub gs_com: ComRef,
     pub gs: Option<Arc<ShaderBlob>>,
-    pub gs_ci: Vec<ComRef>,
     pub ps_com: ComRef,
     pub ps: Option<Arc<ShaderBlob>>,
-    pub ps_ci: Vec<ComRef>,
     pub cs_com: ComRef,
     pub cs: Option<Arc<ComputeShaderInner>>,
-    pub cs_ci: Vec<ComRef>,
 
     pub vs_bind: StageBindings,
     pub ps_bind: StageBindings,
@@ -419,22 +413,16 @@ impl Default for ContextState {
         Self {
             vs_com: ComRef::default(),
             vs: None,
-            vs_ci: Vec::new(),
             hs_com: ComRef::default(),
             hs: None,
-            hs_ci: Vec::new(),
             ds_com: ComRef::default(),
             ds: None,
-            ds_ci: Vec::new(),
             gs_com: ComRef::default(),
             gs: None,
-            gs_ci: Vec::new(),
             ps_com: ComRef::default(),
             ps: None,
-            ps_ci: Vec::new(),
             cs_com: ComRef::default(),
             cs: None,
-            cs_ci: Vec::new(),
             vs_bind: StageBindings::default(),
             ps_bind: StageBindings::default(),
             gs_bind: StageBindings::default(),
@@ -2084,100 +2072,60 @@ unsafe extern "win64" fn cs_get_uavs(this: PCtx, start: u32, n: u32, views: *mut
     get_uavs(&Obj::get(this).state.lock().unwrap().cs_uavs, start, n, views);
 }
 
-unsafe fn capture_class_instances(ci: *const *mut c_void, nci: u32) -> Vec<ComRef> {
-    if ci.is_null() || nci == 0 {
-        return Vec::new();
-    }
-    let count = (nci as usize).min(256);
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        out.push(ComRef::from_borrowed(std::ptr::read_unaligned(ci.add(i))));
-    }
-    out
-}
-
-unsafe fn copy_class_instances_out(src: &[ComRef], out_ci: *mut *mut c_void, nci: *mut u32) {
-    if nci.is_null() {
-        return;
-    }
-    if out_ci.is_null() {
-        std::ptr::write_unaligned(nci, src.len() as u32);
-        return;
-    }
-    let cap = std::ptr::read_unaligned(nci) as usize;
-    let copy = cap.min(src.len());
-    for i in 0..copy {
-        src[i].copy_out(out_ci.add(i));
-    }
-    std::ptr::write_unaligned(nci, copy as u32);
-}
-
-unsafe extern "win64" fn vs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn vs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.vs_com = ComRef::from_borrowed(shader);
     st.vs = vs_from_ptr(shader);
-    st.vs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn ps_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn ps_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.ps_com = ComRef::from_borrowed(shader);
     st.ps = ps_from_ptr(shader);
-    st.ps_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn cs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn cs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.cs_com = ComRef::from_borrowed(shader);
     st.cs = cs_from_ptr(shader);
-    st.cs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.gs_com = ComRef::from_borrowed(shader);
     st.gs = gs_from_ptr(shader);
-    st.gs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn hs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn hs_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.hs_com = ComRef::from_borrowed(shader);
     st.hs = hs_from_ptr(shader);
-    st.hs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn ds_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+unsafe extern "win64" fn ds_set_shader(this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
     let mut st = Obj::get(this).state.lock().unwrap();
     st.ds_com = ComRef::from_borrowed(shader);
     st.ds = domain_shader_from_ptr(shader);
-    st.ds_ci = capture_class_instances(ci, nci);
 }
 
-unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.vs_com.copy_out(out);
-    copy_class_instances_out(&st.vs_ci, ci, nci);
+unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().vs_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
-unsafe extern "win64" fn ps_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.ps_com.copy_out(out);
-    copy_class_instances_out(&st.ps_ci, ci, nci);
+unsafe extern "win64" fn ps_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().ps_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
-unsafe extern "win64" fn cs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.cs_com.copy_out(out);
-    copy_class_instances_out(&st.cs_ci, ci, nci);
+unsafe extern "win64" fn cs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().cs_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
-unsafe extern "win64" fn gs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.gs_com.copy_out(out);
-    copy_class_instances_out(&st.gs_ci, ci, nci);
+unsafe extern "win64" fn gs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().gs_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
-unsafe extern "win64" fn hs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.hs_com.copy_out(out);
-    copy_class_instances_out(&st.hs_ci, ci, nci);
+unsafe extern "win64" fn hs_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().hs_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
-unsafe extern "win64" fn ds_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
-    let st = Obj::get(this).state.lock().unwrap();
-    st.ds_com.copy_out(out);
-    copy_class_instances_out(&st.ds_ci, ci, nci);
+unsafe extern "win64" fn ds_get_shader(this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
+    Obj::get(this).state.lock().unwrap().ds_com.copy_out(out);
+    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
 }
 
 // ---------------------------------------------------------------------------
