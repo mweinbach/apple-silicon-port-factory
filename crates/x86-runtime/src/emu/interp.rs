@@ -639,7 +639,8 @@ unsafe fn emu_run_region(
             ..jit::JitScratch::default()
         },
     };
-    let _fpcr_guard = GuestFpcrGuard::enter(&cpu.jx.mxcsr as *const u32);
+    let _fpcr_guard = GuestFpcrGuard::enter(&raw const cpu.jx.mxcsr);
+    cpu.jx.host_fpcr = super::cpu::host_fpcr();
     if entry_ip != 0 {
         cpu.gpr[0] = rax_in; // rax
     }
@@ -691,6 +692,7 @@ unsafe fn emu_run_region(
     let precise = precise_faults();
     let nan_inst = crate::diag::nan_trace_installed();
     let mut pre: Option<Cpu> = None;
+    let has_afp = super::features::host().has(super::features::HostFeatures::AFP);
     let jit_on = jit::enabled() && !verify && !prof_mnem && !precise;
     // Diagnostic translator coverage counters (`AW2_JIT_STATS`, default off).
     let jstats = jit_on && jit_stats::enabled();
@@ -723,12 +725,13 @@ unsafe fn emu_run_region(
             }
         }
         let cur_ip = cpu.rip;
+        let soft_flush = !has_afp && super::denorm::mixed(cpu.jx.mxcsr);
         let nan_step = nan_inst && crate::diag::nan_trace_covers(cur_ip);
         // Hot-path bypass: a valid compiled block in `JitCache` (not `static_only`, no bound
         // static AOT, matching `va_gen`/`aot_epoch`/`static_aot_gen`) already passed `prep_block`
         // / `aot::check_block`, which rejects `dll_chkstk`, `dll_stack_pos`, `regfile`, and
         // `dll_stub` VAs. Skip the 5 routing probes when outside `exe_gate` and no `SKIP_VA` is armed.
-        let fast_jit_code = if jit_on
+        let fast_jit_code = if jit_on && !soft_flush
             && !jit_skip
             && !nan_step
             && !in_exe_gate(exe_gate, cur_ip)
@@ -844,7 +847,7 @@ unsafe fn emu_run_region(
             }
         }
         let skipped_jit = core::mem::take(&mut jit_skip);
-        if jit_on && !skipped_jit && !nan_step {
+        if jit_on && !soft_flush && !skipped_jit && !nan_step {
             if g.sample_left <= BLK_MAX_INSNS as u32 {
                 // Take the profiler sample now rather than interpreting up to a block's
                 // worth of instructions until the countdown reaches 0.
@@ -926,7 +929,7 @@ unsafe fn emu_run_region(
             jit_stats::interp(cur_ip, (*ins_base.add(cur_off)).mnemonic(), op.kind == fast::K_GENERIC);
         }
 
-        if op.kind != fast::K_GENERIC {
+        if op.kind != fast::K_GENERIC && !(soft_flush && super::denorm::uses_fp(&*ins_base.add(cur_off))) {
             if prof_mnem_fast {
                 if let Some(p) = prof {
                     p.mnemonic((*ins_base.add(cur_off)).mnemonic());
@@ -934,7 +937,7 @@ unsafe fn emu_run_region(
             }
             if !verify || !fast::verifiable(op.kind) {
                 let fx;
-                if !verify && !prof_mnem_fast && !precise && !nan_step {
+                if !verify && !prof_mnem_fast && !precise && !nan_step && !soft_flush {
                     let burst_ok = if !prof_mnem && !jstats && !skipped_jit {
                         if let Some((slot, blk_len)) = head_slot {
                             let mflags = burst_mode_flags_from_base(burst_base_flags, jit_ptr);
@@ -1245,8 +1248,11 @@ unsafe fn emu_run_region(
                             p.unhandled(cur_ip, mn);
                         }
                         report_unimplemented(cur_ip, mn, &ins, &cpu);
-                    } else if let Some(ref pf) = pre_fp {
-                        crate::diag::post_ins(pf, &cpu, cur_ip, &ins);
+                    } else {
+                        super::regfile_ext::record_x87_environment(&cpu, &ins);
+                        if let Some(ref pf) = pre_fp {
+                            crate::diag::post_ins(pf, &cpu, cur_ip, &ins);
+                        }
                     }
                 }
             }

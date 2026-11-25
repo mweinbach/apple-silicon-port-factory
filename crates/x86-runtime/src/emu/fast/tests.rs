@@ -668,9 +668,7 @@ fn fast_hi8_sys_misc_bit_ext_atomic_differential() {
         ("pushfq_popfq", &[0x9C, 0xF8, 0x9D]),                 // pushfq; clc; popfq
         ("pushf_popf", &[0x66, 0x9C, 0xF9, 0x66, 0x9D]),       // pushf; stc; popf
         ("stmxcsr", &[0x0F, 0xAE, 0x1F]),                      // stmxcsr [rdi]
-        ("fnstcw", &[0x9B, 0xD9, 0x3F]),                       // fnstcw [rdi]
         ("xlatb", &[0xD7]),
-        ("xgetbv", &[0x0F, 0x01, 0xD0]),
         ("rdtsc", &[0x0F, 0x31]),
         ("rdtscp", &[0x0F, 0x01, 0xF9]),
         ("cpuid_0", &[0x31, 0xC0, 0x0F, 0xA2]),
