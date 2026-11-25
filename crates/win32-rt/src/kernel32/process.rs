@@ -3698,40 +3698,20 @@ unsafe fn format_inserts(fmt: &str, ignore: bool, wide_args: bool, arg: &mut dyn
     out
 }
 
-/// Look up message `id` inside a loaded PE module's `RT_MESSAGETABLE` (resource type 11).
+/// Search one `MESSAGE_RESOURCE_DATA` blob for message `id`.
 ///
 /// Parses the Windows `MESSAGE_RESOURCE_DATA` / `MESSAGE_RESOURCE_BLOCK` /
 /// `MESSAGE_RESOURCE_ENTRY` binary format (`winnt.h`), supporting both Unicode
 /// (`MESSAGE_RESOURCE_UNICODE = 0x0001`) and ANSI entries.
-unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Result<String, u32> {
-    const RT_MESSAGETABLE: usize = 11;
+unsafe fn search_message_table(data: *const u8, total_len: usize, id: u32) -> Option<String> {
     const MESSAGE_RESOURCE_UNICODE: u16 = 0x0001;
-    let hmod: HMODULE = if source.is_null() {
-        match crate::try_loader().and_then(|l| l.get_module_handle(None)) {
-            Some(base) if base != 0 => base as HMODULE,
-            _ => return Err(err::ERROR_MR_MID_NOT_FOUND),
-        }
-    } else {
-        source as HMODULE
-    };
-    let hres = crate::kernel32::module::FindResourceExW(
-        hmod,
-        RT_MESSAGETABLE as LPCWSTR,
-        1usize as LPCWSTR,
-        lang as u16,
-    );
-    if hres.is_null() {
-        return Err(err::ERROR_MR_MID_NOT_FOUND);
-    }
-    let data = crate::kernel32::module::LoadResource(hmod, hres) as *const u8;
-    let total_len = crate::kernel32::module::SizeofResource(hmod, hres) as usize;
     if data.is_null() || total_len < 4 {
-        return Err(err::ERROR_MR_MID_NOT_FOUND);
+        return None;
     }
     let num_blocks = std::ptr::read_unaligned(data as *const u32) as usize;
-    let header_end = 4usize.checked_add(num_blocks.checked_mul(12).ok_or(err::ERROR_MR_MID_NOT_FOUND)?).ok_or(err::ERROR_MR_MID_NOT_FOUND)?;
+    let header_end = 4usize.checked_add(num_blocks.checked_mul(12)?)?;
     if header_end > total_len {
-        return Err(err::ERROR_MR_MID_NOT_FOUND);
+        return None;
     }
     for b in 0..num_blocks {
         let blk = data.add(4 + b * 12);
@@ -3744,12 +3724,12 @@ unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Re
         let target_idx = id - low_id;
         for idx in 0..=target_idx {
             if off.checked_add(4).is_none_or(|e| e > total_len) {
-                return Err(err::ERROR_MR_MID_NOT_FOUND);
+                break;
             }
             let entry_len = std::ptr::read_unaligned(data.add(off) as *const u16) as usize;
             let entry_flags = std::ptr::read_unaligned(data.add(off + 2) as *const u16);
             if entry_len < 4 || off.checked_add(entry_len).is_none_or(|e| e > total_len) {
-                return Err(err::ERROR_MR_MID_NOT_FOUND);
+                break;
             }
             if idx == target_idx {
                 let payload = data.add(off + 4);
@@ -3764,7 +3744,7 @@ unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Re
                         }
                         units.push(u);
                     }
-                    return Ok(String::from_utf16_lossy(&units));
+                    return Some(String::from_utf16_lossy(&units));
                 } else {
                     let mut bytes = Vec::with_capacity(payload_len);
                     for k in 0..payload_len {
@@ -3774,10 +3754,30 @@ unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Re
                         }
                         bytes.push(ch);
                     }
-                    return Ok(bytes.into_iter().map(|c| c as char).collect());
+                    return Some(bytes.into_iter().map(|c| c as char).collect());
                 }
             }
             off += entry_len;
+        }
+    }
+    None
+}
+
+/// Look up message `id` across all `RT_MESSAGETABLE` (resource type 11) resources in a loaded PE module.
+unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Result<String, u32> {
+    const RT_MESSAGETABLE: u16 = 11;
+    let hmod: HMODULE = if source.is_null() {
+        match crate::try_loader().and_then(|l| l.get_module_handle(None)) {
+            Some(base) if base != 0 => base as HMODULE,
+            _ => return Err(err::ERROR_MR_MID_NOT_FOUND),
+        }
+    } else {
+        source as HMODULE
+    };
+    let tables = crate::kernel32::module::find_all_resources_of_type(hmod, RT_MESSAGETABLE, lang as u16);
+    for (data, total_len) in tables {
+        if let Some(msg) = search_message_table(data, total_len, id) {
+            return Ok(msg);
         }
     }
     Err(err::ERROR_MR_MID_NOT_FOUND)
@@ -5221,26 +5221,70 @@ pub(crate) mod tests {
         pe[opt + 128..opt + 132].copy_from_slice(&rsrc_rva.to_le_bytes());
         pe[opt + 132..opt + 136].copy_from_slice(&0x1000u32.to_le_bytes());
 
-        // 3-level resource directory at rsrc_rva:
+        // 3-level resource directory at rsrc_rva with 3 RT_MESSAGETABLE resources:
+        //   - Named resource "CUSTOM_MT" (id 0x4000)
+        //   - Numeric ID 1 (ids 0x1000..=0x1001, 0x2000)
+        //   - Numeric ID 7 (id 0x3000)
         // +0x00: root dir (1 ID entry: type 11 -> subdir at +0x20)
-        // +0x20: type dir (1 ID entry: id 1 -> subdir at +0x40)
-        // +0x40: name dir (1 ID entry: lang 0x0409 -> data entry at +0x60)
-        // +0x60: IMAGE_RESOURCE_DATA_ENTRY (rva = 0x1100, size = msg_table.len())
+        // +0x20: type dir (1 named entry + 2 ID entries)
+        // +0x60: name string "CUSTOM_MT" (IMAGE_RESOURCE_DIR_STRING_U)
+        // +0x80: lang dir for "CUSTOM_MT" -> data entry at +0xE0 (rva 0x1400)
+        // +0xA0: lang dir for ID 1        -> data entry at +0xF0 (rva 0x1200)
+        // +0xC0: lang dir for ID 7        -> data entry at +0x100 (rva 0x1300)
         let r = rsrc_rva as usize;
         // Root dir
         pe[r + 14..r + 16].copy_from_slice(&1u16.to_le_bytes());
         pe[r + 16..r + 20].copy_from_slice(&11u32.to_le_bytes()); // RT_MESSAGETABLE
         pe[r + 20..r + 24].copy_from_slice(&(0x8000_0000u32 | 0x20).to_le_bytes());
-        // Type dir
-        pe[r + 0x20 + 14..r + 0x20 + 16].copy_from_slice(&1u16.to_le_bytes());
-        pe[r + 0x20 + 16..r + 0x20 + 20].copy_from_slice(&1u32.to_le_bytes()); // ID 1
-        pe[r + 0x20 + 20..r + 0x20 + 24].copy_from_slice(&(0x8000_0000u32 | 0x40).to_le_bytes());
-        // Name dir
-        pe[r + 0x40 + 14..r + 0x40 + 16].copy_from_slice(&1u16.to_le_bytes());
-        pe[r + 0x40 + 16..r + 0x40 + 20].copy_from_slice(&0x0409u32.to_le_bytes()); // en-US
-        pe[r + 0x40 + 20..r + 0x40 + 24].copy_from_slice(&0x60u32.to_le_bytes());
+        // Type dir: 1 named entry, 2 ID entries
+        pe[r + 0x20 + 12..r + 0x20 + 14].copy_from_slice(&1u16.to_le_bytes()); // NumberOfNamedEntries
+        pe[r + 0x20 + 14..r + 0x20 + 16].copy_from_slice(&2u16.to_le_bytes()); // NumberOfIdEntries
+        // Entry 0 (named "CUSTOM_MT" at +0x60) -> lang dir at +0x80
+        pe[r + 0x20 + 16..r + 0x20 + 20].copy_from_slice(&(0x8000_0000u32 | 0x60).to_le_bytes());
+        pe[r + 0x20 + 20..r + 0x20 + 24].copy_from_slice(&(0x8000_0000u32 | 0x80).to_le_bytes());
+        // Entry 1 (ID 1) -> lang dir at +0xA0
+        pe[r + 0x20 + 24..r + 0x20 + 28].copy_from_slice(&1u32.to_le_bytes());
+        pe[r + 0x20 + 28..r + 0x20 + 32].copy_from_slice(&(0x8000_0000u32 | 0xA0).to_le_bytes());
+        // Entry 2 (ID 7) -> lang dir at +0xC0
+        pe[r + 0x20 + 32..r + 0x20 + 36].copy_from_slice(&7u32.to_le_bytes());
+        pe[r + 0x20 + 36..r + 0x20 + 40].copy_from_slice(&(0x8000_0000u32 | 0xC0).to_le_bytes());
+        // String "CUSTOM_MT" at +0x60
+        let name_u16: Vec<u16> = "CUSTOM_MT".encode_utf16().collect();
+        pe[r + 0x60..r + 0x62].copy_from_slice(&(name_u16.len() as u16).to_le_bytes());
+        for (i, u) in name_u16.iter().enumerate() {
+            pe[r + 0x62 + i * 2..r + 0x64 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+        // Lang dir for "CUSTOM_MT" at +0x80 -> data entry at +0xE0
+        pe[r + 0x80 + 14..r + 0x80 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0x80 + 16..r + 0x80 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0x80 + 20..r + 0x80 + 24].copy_from_slice(&0xE0u32.to_le_bytes());
+        // Lang dir for ID 1 at +0xA0 -> data entry at +0xF0
+        pe[r + 0xA0 + 14..r + 0xA0 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0xA0 + 16..r + 0xA0 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0xA0 + 20..r + 0xA0 + 24].copy_from_slice(&0xF0u32.to_le_bytes());
+        // Lang dir for ID 7 at +0xC0 -> data entry at +0x100
+        pe[r + 0xC0 + 14..r + 0xC0 + 16].copy_from_slice(&1u16.to_le_bytes());
+        pe[r + 0xC0 + 16..r + 0xC0 + 20].copy_from_slice(&0x0409u32.to_le_bytes());
+        pe[r + 0xC0 + 20..r + 0xC0 + 24].copy_from_slice(&0x100u32.to_le_bytes());
 
-        // Construct MESSAGE_RESOURCE_DATA
+        let build_single_unicode_mt = |msg_id: u32, text: &str| -> Vec<u8> {
+            let mut tbl = Vec::<u8>::new();
+            tbl.extend_from_slice(&1u32.to_le_bytes()); // NumberOfBlocks = 1
+            tbl.extend_from_slice(&msg_id.to_le_bytes());
+            tbl.extend_from_slice(&msg_id.to_le_bytes());
+            tbl.extend_from_slice(&16u32.to_le_bytes()); // offset of entry 0
+            let units: Vec<u16> = format!("{text}\0").encode_utf16().collect();
+            let entry_len = ((4 + units.len() * 2 + 3) & !3) as u16;
+            tbl.extend_from_slice(&entry_len.to_le_bytes());
+            tbl.extend_from_slice(&1u16.to_le_bytes()); // MESSAGE_RESOURCE_UNICODE
+            for u in &units {
+                tbl.extend_from_slice(&u.to_le_bytes());
+            }
+            tbl.resize(16 + entry_len as usize, 0);
+            tbl
+        };
+
+        // Construct MESSAGE_RESOURCE_DATA for ID 1
         let mut mt = Vec::<u8>::new();
         mt.extend_from_slice(&2u32.to_le_bytes()); // NumberOfBlocks = 2
         // Placeholder for 2 blocks (24 bytes), entries start at offset 28
@@ -5286,10 +5330,21 @@ pub(crate) mod tests {
         mt.extend_from_slice(&e1);
         mt.extend_from_slice(&e2);
 
-        // Data entry at r + 0x60 pointing to RVA 0x1100
-        pe[r + 0x60..r + 0x64].copy_from_slice(&0x1100u32.to_le_bytes());
-        pe[r + 0x64..r + 0x68].copy_from_slice(&(mt.len() as u32).to_le_bytes());
-        pe[0x1100..0x1100 + mt.len()].copy_from_slice(&mt);
+        let mt_id7 = build_single_unicode_mt(0x3000, "From id7: %1");
+        let mt_named = build_single_unicode_mt(0x4000, "From named: %1");
+
+        // Data entry for "CUSTOM_MT" at r + 0xE0 -> RVA 0x1400
+        pe[r + 0xE0..r + 0xE4].copy_from_slice(&0x1400u32.to_le_bytes());
+        pe[r + 0xE4..r + 0xE8].copy_from_slice(&(mt_named.len() as u32).to_le_bytes());
+        pe[0x1400..0x1400 + mt_named.len()].copy_from_slice(&mt_named);
+        // Data entry for ID 1 at r + 0xF0 -> RVA 0x1200
+        pe[r + 0xF0..r + 0xF4].copy_from_slice(&0x1200u32.to_le_bytes());
+        pe[r + 0xF4..r + 0xF8].copy_from_slice(&(mt.len() as u32).to_le_bytes());
+        pe[0x1200..0x1200 + mt.len()].copy_from_slice(&mt);
+        // Data entry for ID 7 at r + 0x100 -> RVA 0x1300
+        pe[r + 0x100..r + 0x104].copy_from_slice(&0x1300u32.to_le_bytes());
+        pe[r + 0x104..r + 0x108].copy_from_slice(&(mt_id7.len() as u32).to_le_bytes());
+        pe[0x1300..0x1300 + mt_id7.len()].copy_from_slice(&mt_id7);
 
         unsafe {
             let hmod = pe.as_ptr() as *const c_void;
@@ -5307,6 +5362,58 @@ pub(crate) mod tests {
             );
             assert_eq!(from_wide(out.as_ptr()), "Hello World!");
             assert_eq!(n, 12);
+
+            // Non-1 numeric RT_MESSAGETABLE resource (ID 7).
+            let n_id7 = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x3000,
+                0x0409,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From id7: World");
+            assert_eq!(n_id7, 15);
+
+            // Named RT_MESSAGETABLE resource ("CUSTOM_MT").
+            let n_named = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod,
+                0x4000,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From named: World");
+            assert_eq!(n_named, 17);
+
+            // Module with ONLY a non-1 numeric RT_MESSAGETABLE resource (no ID 1 at all).
+            let mut pe_no_id1 = pe.clone();
+            pe_no_id1[r + 0x20 + 12..r + 0x20 + 14].copy_from_slice(&0u16.to_le_bytes()); // 0 named
+            pe_no_id1[r + 0x20 + 14..r + 0x20 + 16].copy_from_slice(&1u16.to_le_bytes()); // 1 ID (ID 7 only)
+            pe_no_id1[r + 0x20 + 16..r + 0x20 + 20].copy_from_slice(&7u32.to_le_bytes());
+            pe_no_id1[r + 0x20 + 20..r + 0x20 + 24].copy_from_slice(&(0x8000_0000u32 | 0xC0).to_le_bytes());
+            let hmod_no_id1 = pe_no_id1.as_ptr() as *const c_void;
+            assert!(crate::kernel32::module::FindResourceExW(
+                hmod_no_id1 as HMODULE,
+                11usize as LPCWSTR,
+                1usize as LPCWSTR,
+                0,
+            )
+            .is_null());
+            let n_only_id7 = FormatMessageW(
+                FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                hmod_no_id1,
+                0x3000,
+                0,
+                out.as_mut_ptr(),
+                out.len() as u32,
+                args1.as_ptr(),
+            );
+            assert_eq!(from_wide(out.as_ptr()), "From id7: World");
+            assert_eq!(n_only_id7, 15);
 
             let args2 = [42u64];
             let n2 = FormatMessageW(

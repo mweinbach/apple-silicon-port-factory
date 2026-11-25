@@ -167,7 +167,7 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                     0
                 },
             );
-            std::ptr::write_unaligned(out.add(24) as *mut i32, 8); // BasePriority
+            std::ptr::write_unaligned(out.add(24) as *mut i32, if is_self { 8 } else { 0 }); // BasePriority
             std::ptr::write_unaligned(out.add(32) as *mut usize, pid as usize);
             let ppid = if child.is_some() {
                 std::process::id() as usize
@@ -3600,8 +3600,18 @@ mod tests {
             assert_eq!(NtQueryInformationProcess(child_h, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_ACCESS_DENIED);
             assert_eq!(NtQueryInformationProcess(child_h, 0x12, buf.as_mut_ptr(), 2, &mut ret), STATUS_ACCESS_DENIED);
             assert_eq!(NtQueryInformationProcess(child_h, 0x15, buf.as_mut_ptr(), 8, &mut ret), STATUS_ACCESS_DENIED);
-            // Child process queries backed by real ChildProcessObj fields (Basic, ImageFileNameWin32) still succeed.
+            // Child process queries backed by real ChildProcessObj fields (Basic, ImageFileNameWin32) still succeed,
+            // without leaking parent-only ProcessBasicInformation fields (PEB, AffinityMask, BasePriority).
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            let self_aff = std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize);
+            assert_eq!(self_aff, crate::kernel32::process::current_process_affinity_mask());
+            assert_ne!(self_aff, 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 8);
+
             assert_eq!(NtQueryInformationProcess(child_h, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(16) as *const usize), 0);
+            assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(24) as *const i32), 0);
             assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize), 424242);
             assert_eq!(
                 std::ptr::read_unaligned(buf.as_ptr().add(40) as *const usize),

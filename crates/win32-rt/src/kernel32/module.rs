@@ -607,13 +607,13 @@ unsafe fn res_id_a(p: LPCSTR) -> ResId {
 
 /// Find a directory entry by id in a resource directory at `dir`.
 unsafe fn res_find(root: usize, dir: usize, id: &ResId) -> Option<u32> {
-    let named = *((dir + 12) as *const u16) as usize;
-    let ids = *((dir + 14) as *const u16) as usize;
+    let named = std::ptr::read_unaligned((dir + 12) as *const u16) as usize;
+    let ids = std::ptr::read_unaligned((dir + 14) as *const u16) as usize;
     let entries = dir + 16;
     for i in 0..named + ids {
         let e = entries + i * 8;
-        let name = *(e as *const u32);
-        let off = *((e + 4) as *const u32);
+        let name = std::ptr::read_unaligned(e as *const u32);
+        let off = std::ptr::read_unaligned((e + 4) as *const u32);
         let matches = match id {
             ResId::Int(n) => name & 0x8000_0000 == 0 && name as u16 == *n,
             ResId::Str(s) => {
@@ -621,9 +621,12 @@ unsafe fn res_find(root: usize, dir: usize, id: &ResId) -> Option<u32> {
                     false
                 } else {
                     let p = root + (name & 0x7FFF_FFFF) as usize;
-                    let len = *(p as *const u16) as usize;
-                    let w = std::slice::from_raw_parts((p + 2) as *const u16, len);
-                    String::from_utf16_lossy(w).eq_ignore_ascii_case(s)
+                    let len = std::ptr::read_unaligned(p as *const u16) as usize;
+                    let mut w = Vec::with_capacity(len);
+                    for k in 0..len {
+                        w.push(std::ptr::read_unaligned((p + 2 + k * 2) as *const u16));
+                    }
+                    String::from_utf16_lossy(&w).eq_ignore_ascii_case(s)
                 }
             }
         };
@@ -635,8 +638,103 @@ unsafe fn res_find(root: usize, dir: usize, id: &ResId) -> Option<u32> {
 }
 
 unsafe fn res_first(dir: usize) -> Option<u32> {
-    let n = *((dir + 12) as *const u16) as usize + *((dir + 14) as *const u16) as usize;
-    (n > 0).then(|| *((dir + 16 + 4) as *const u32))
+    let n = std::ptr::read_unaligned((dir + 12) as *const u16) as usize
+        + std::ptr::read_unaligned((dir + 14) as *const u16) as usize;
+    (n > 0).then(|| std::ptr::read_unaligned((dir + 16 + 4) as *const u32))
+}
+
+/// Enumerate every resource data entry of integer type `ty` (both named and numeric-ID resources),
+/// returning `(data_ptr, byte_len)` pairs ordered with exact `lang` matches before language fallbacks.
+pub(crate) unsafe fn find_all_resources_of_type(h: HMODULE, ty: u16, lang: u16) -> Vec<(*const u8, usize)> {
+    let base = if h.is_null() {
+        crate::try_loader().and_then(|l| l.get_module_handle(None)).unwrap_or(0)
+    } else {
+        (h as usize) & !3
+    };
+    if base == 0 {
+        return Vec::new();
+    }
+    let Some((rva, dir_size)) = data_dir(base, 2) else {
+        return Vec::new();
+    };
+    let dir_limit = if dir_size == 0 { usize::MAX } else { dir_size as usize };
+    let in_dir = |off: usize, len: usize| off.checked_add(len).is_some_and(|end| end <= dir_limit);
+    if !in_dir(0, 16) {
+        return Vec::new();
+    }
+    let root = base + rva as usize;
+    let Some(t) = res_find(root, root, &ResId::Int(ty)) else {
+        return Vec::new();
+    };
+    if (t & 0x8000_0000) == 0 {
+        return Vec::new();
+    }
+    let t_off = (t & 0x7FFF_FFFF) as usize;
+    if !in_dir(t_off, 16) {
+        return Vec::new();
+    }
+    let tdir = root + t_off;
+    let named = std::ptr::read_unaligned((tdir + 12) as *const u16) as usize;
+    let ids = std::ptr::read_unaligned((tdir + 14) as *const u16) as usize;
+    let total = named.saturating_add(ids);
+    let mut exact = Vec::new();
+    let mut fallback = Vec::new();
+    for i in 0..total {
+        let e_off = match t_off.checked_add(16).and_then(|x| x.checked_add(i * 8)) {
+            Some(o) if in_dir(o, 8) => o,
+            _ => break,
+        };
+        let off = std::ptr::read_unaligned((root + e_off + 4) as *const u32);
+        let (is_exact, data_off) = if (off & 0x8000_0000) == 0 {
+            (false, off as usize)
+        } else {
+            let l_off = (off & 0x7FFF_FFFF) as usize;
+            if !in_dir(l_off, 16) {
+                continue;
+            }
+            let ldir = root + l_off;
+            let primary_lang = lang & 0x03FF;
+            let picked = if lang != 0 {
+                if let Some(m) = res_find(root, ldir, &ResId::Int(lang)) {
+                    Some((true, m))
+                } else {
+                    (primary_lang != 0 && primary_lang != lang)
+                        .then(|| res_find(root, ldir, &ResId::Int(primary_lang)))
+                        .flatten()
+                        .or_else(|| res_find(root, ldir, &ResId::Int(0x0409)))
+                        .or_else(|| res_find(root, ldir, &ResId::Int(0)))
+                        .or_else(|| res_first(ldir))
+                        .map(|m| (false, m))
+                }
+            } else {
+                res_find(root, ldir, &ResId::Int(0))
+                    .or_else(|| res_find(root, ldir, &ResId::Int(0x0409)))
+                    .or_else(|| res_first(ldir))
+                    .map(|m| (true, m))
+            };
+            match picked {
+                Some((ex, m)) if (m & 0x8000_0000) == 0 => (ex, m as usize),
+                _ => continue,
+            }
+        };
+        if !in_dir(data_off, 8) {
+            continue;
+        }
+        let entry = root + data_off;
+        let data_rva = std::ptr::read_unaligned(entry as *const u32) as usize;
+        let data_size = std::ptr::read_unaligned((entry + 4) as *const u32) as usize;
+        if data_rva == 0 || data_size == 0 {
+            continue;
+        }
+        let item = ((base + data_rva) as *const u8, data_size);
+        if is_exact {
+            exact.push(item);
+        } else {
+            fallback.push(item);
+        }
+    }
+    exact.extend(fallback);
+    exact
 }
 
 unsafe fn find_resource(h: HMODULE, ty: ResId, name: ResId, lang: u16) -> *mut c_void {
