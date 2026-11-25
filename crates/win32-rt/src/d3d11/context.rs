@@ -1363,15 +1363,31 @@ pub(super) fn accumulate_draw_pipeline_stats(
     topology: u32,
     count: u32,
     instances: u32,
+    indexed: bool,
     has_gs: bool,
     has_hs: bool,
 ) {
+    use d3d12_metal::topology::d3d;
+    // Indexed strip topologies can contain primitive-restart cut indices (0xFFFF / 0xFFFFFFFF)
+    // in GPU-resident index buffers, so IA vertex/primitive counts cannot be derived on the CPU.
+    if indexed
+        && matches!(
+            topology,
+            d3d::LINESTRIP | d3d::TRIANGLESTRIP | d3d::LINESTRIP_ADJ | d3d::TRIANGLESTRIP_ADJ
+        )
+    {
+        return;
+    }
     let verts = (count as u64).saturating_mul(instances as u64);
     let prims = d3d11_primitives_per_instance(topology, count as u64)
         .saturating_mul(instances as u64);
     stats.IAVertices = stats.IAVertices.saturating_add(verts);
     stats.IAPrimitives = stats.IAPrimitives.saturating_add(prims);
-    stats.VSInvocations = stats.VSInvocations.saturating_add(verts);
+    // Non-indexed draws invoke VS once per sequential vertex. Indexed draws can reuse cached
+    // vertex-shader outputs for repeated indices, so leave VSInvocations unmeasured for them.
+    if !indexed {
+        stats.VSInvocations = stats.VSInvocations.saturating_add(verts);
+    }
     // Without tessellation, each IA primitive invokes the GS once. When tessellation is active,
     // the number of primitives reaching GS depends on GPU tessellation factors, so do not
     // fabricate GSInvocations from the input-assembler patch count.
@@ -1412,6 +1428,7 @@ unsafe fn exec_draw(
                 st.topology,
                 count,
                 instances,
+                indexed_start.is_some(),
                 st.gs.is_some(),
                 st.hs.is_some(),
             );

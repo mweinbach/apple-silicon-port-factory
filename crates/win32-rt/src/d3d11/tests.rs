@@ -4107,8 +4107,10 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
         com_release(dev);
     }
 
-    // 4. Pipeline statistics: GSInvocations counts IA primitives only when tessellation is inactive;
-    //    when HS is bound with GS, HSInvocations counts patches and GSInvocations is not fabricated.
+    // 4. Pipeline statistics:
+    //    - Non-indexed draws accurately count IA/VS/GS/HS (skipping GSInvocations when HS is bound).
+    //    - Indexed draws do not fabricate VSInvocations from submitted index counts (vertex cache
+    //      reuse makes VSInvocations GPU-dependent), and indexed strips do not guess cut counts.
     {
         let mut s_gs_only = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
         super::context::accumulate_draw_pipeline_stats(
@@ -4116,6 +4118,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             topology::TRIANGLELIST,
             6,
             2,
+            false,
             true,
             false,
         );
@@ -4131,6 +4134,7 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             topology::PATCHLIST_3,
             9,
             2,
+            false,
             true,
             true,
         );
@@ -4139,6 +4143,35 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
         assert_eq!(s_tess_gs.VSInvocations, 18);
         assert_eq!(s_tess_gs.HSInvocations, 6);
         assert_eq!(s_tess_gs.GSInvocations, 0, "must not fabricate GSInvocations from IA patch count");
+
+        let mut s_indexed = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        super::context::accumulate_draw_pipeline_stats(
+            &mut s_indexed,
+            topology::TRIANGLELIST,
+            6,
+            2,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(s_indexed.IAVertices, 12);
+        assert_eq!(s_indexed.IAPrimitives, 4);
+        assert_eq!(s_indexed.VSInvocations, 0, "must not overstate VSInvocations on indexed draws");
+
+        let mut s_indexed_strip = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        super::context::accumulate_draw_pipeline_stats(
+            &mut s_indexed_strip,
+            topology::TRIANGLESTRIP,
+            6,
+            1,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(s_indexed_strip.IAVertices, 0);
+        assert_eq!(s_indexed_strip.IAPrimitives, 0);
+        assert_eq!(s_indexed_strip.VSInvocations, 0);
+        assert_eq!(s_indexed_strip.GSInvocations, 0);
     }
 }
 
