@@ -4,7 +4,7 @@ use crate::types::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[];
 pub static ORDINALS: &[(u16, &str)] = &[];
@@ -121,17 +121,72 @@ enum PowerNotifyTarget {
     Callback { func: usize, context: usize },
 }
 
-#[derive(Clone, Debug)]
+struct NotifyLifecycle {
+    cancelled: bool,
+    in_flight_threads: Vec<std::thread::ThreadId>,
+}
+
 struct PowerNotification {
     kind: PowerNotifyKind,
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     target: PowerNotifyTarget,
+    lifecycle: Mutex<NotifyLifecycle>,
+    done_cv: Condvar,
+}
+
+impl PowerNotification {
+    fn new(kind: PowerNotifyKind, target: PowerNotifyTarget) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            target,
+            lifecycle: Mutex::new(NotifyLifecycle {
+                cancelled: false,
+                in_flight_threads: Vec::new(),
+            }),
+            done_cv: Condvar::new(),
+        })
+    }
+
+    fn try_begin_delivery(self: &Arc<Self>) -> Option<DeliveryGuard> {
+        let mut st = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if st.cancelled {
+            return None;
+        }
+        let tid = std::thread::current().id();
+        st.in_flight_threads.push(tid);
+        Some(DeliveryGuard { entry: Arc::clone(self), tid })
+    }
+
+    /// Mark cancelled and wait until all in-flight deliveries on OTHER threads finish
+    /// (never deadlocks if invoked reentrantly from inside the callback itself).
+    fn cancel_and_wait(&self) {
+        let me = std::thread::current().id();
+        let mut st = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        st.cancelled = true;
+        while st.in_flight_threads.iter().any(|&tid| tid != me) {
+            st = self.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct DeliveryGuard {
+    entry: Arc<PowerNotification>,
+    tid: std::thread::ThreadId,
+}
+
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        let mut st = self.entry.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = st.in_flight_threads.iter().rposition(|&t| t == self.tid) {
+            st.in_flight_threads.remove(pos);
+        }
+        self.entry.done_cv.notify_all();
+    }
 }
 
 static NEXT_NOTIFY_HANDLE: AtomicUsize = AtomicUsize::new(0x7050_0004);
 
-fn notifications() -> &'static Mutex<HashMap<usize, PowerNotification>> {
-    static M: OnceLock<Mutex<HashMap<usize, PowerNotification>>> = OnceLock::new();
+fn notifications() -> &'static Mutex<HashMap<usize, Arc<PowerNotification>>> {
+    static M: OnceLock<Mutex<HashMap<usize, Arc<PowerNotification>>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1074,9 +1129,12 @@ fn current_power_setting_value(guid: [u8; 16]) -> Option<Vec<u8>> {
     }
 }
 
-unsafe fn deliver_to_target(target: &PowerNotifyTarget, pbt_type: u32, setting_buf: Option<&[u8]>) {
-    match *target {
+unsafe fn deliver_to_entry(entry: &Arc<PowerNotification>, pbt_type: u32, setting_buf: Option<&[u8]>) {
+    match entry.target {
         PowerNotifyTarget::Callback { func, context } => {
+            let Some(_guard) = entry.try_begin_delivery() else {
+                return;
+            };
             let setting_ptr = setting_buf.map_or(0u64, |b| b.as_ptr() as u64);
             let _ = crate::call_guest8(
                 func,
@@ -1091,13 +1149,20 @@ unsafe fn deliver_to_target(target: &PowerNotifyTarget, pbt_type: u32, setting_b
             );
         }
         PowerNotifyTarget::Window(hwnd) => {
+            if entry.lifecycle.lock().unwrap_or_else(|e| e.into_inner()).cancelled {
+                return;
+            }
             if let Some(w) = crate::user32::window::get(hwnd) {
                 // Keep an owned copy of `POWERBROADCAST_SETTING` alive until the owning Win32
                 // thread finishes running the window procedure (Windows delivers WM_POWERBROADCAST
                 // as a sent notification so lParam stays valid across the WndProc call).
                 let owned_pkt = setting_buf.map(|b| b.to_vec());
+                let entry_ref = Arc::clone(entry);
                 let q = crate::user32::message::queue_for(w.tid);
                 q.call(move || {
+                    let Some(_guard) = entry_ref.try_begin_delivery() else {
+                        return;
+                    };
                     if crate::user32::window::exists(hwnd) {
                         let lp = owned_pkt.as_ref().map_or(0isize, |b| b.as_ptr() as isize);
                         crate::user32::window::call_window_proc(
@@ -1116,33 +1181,33 @@ unsafe fn deliver_to_target(target: &PowerNotifyTarget, pbt_type: u32, setting_b
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn dispatch_suspend_resume_event(pbt_type: u32) {
-    let targets: Vec<PowerNotifyTarget> = {
+    let entries: Vec<Arc<PowerNotification>> = {
         let map = notifications().lock().unwrap();
         map.values()
             .filter(|n| matches!(n.kind, PowerNotifyKind::SuspendResume))
-            .map(|n| n.target.clone())
+            .cloned()
             .collect()
     };
-    for t in targets {
-        unsafe { deliver_to_target(&t, pbt_type, None) };
+    for entry in entries {
+        unsafe { deliver_to_entry(&entry, pbt_type, None) };
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn dispatch_power_setting_change(guid: [u8; 16], data: &[u8]) {
-    let targets: Vec<PowerNotifyTarget> = {
+    let entries: Vec<Arc<PowerNotification>> = {
         let map = notifications().lock().unwrap();
         map.values()
             .filter(|n| matches!(n.kind, PowerNotifyKind::Setting(g) if g == guid))
-            .map(|n| n.target.clone())
+            .cloned()
             .collect()
     };
-    if targets.is_empty() {
+    if entries.is_empty() {
         return;
     }
     let pkt = build_powerbroadcast_setting(guid, data);
-    for t in targets {
-        unsafe { deliver_to_target(&t, PBT_POWERSETTINGCHANGE, Some(&pkt)) };
+    for entry in entries {
+        unsafe { deliver_to_entry(&entry, PBT_POWERSETTINGCHANGE, Some(&pkt)) };
     }
 }
 
@@ -1161,7 +1226,7 @@ pub unsafe extern "win64" fn PowerRegisterSuspendResumeNotification(
     let handle = NEXT_NOTIFY_HANDLE.fetch_add(4, Ordering::Relaxed);
     notifications().lock().unwrap().insert(
         handle,
-        PowerNotification { kind: PowerNotifyKind::SuspendResume, target },
+        PowerNotification::new(PowerNotifyKind::SuspendResume, target),
     );
     #[cfg(target_os = "macos")]
     macos_power::ensure_power_monitor_started();
@@ -1176,12 +1241,19 @@ pub unsafe extern "win64" fn PowerUnregisterSuspendResumeNotification(
         return err::ERROR_INVALID_PARAMETER;
     }
     let handle = registration_handle as usize;
-    let mut map = notifications().lock().unwrap();
-    if matches!(
-        map.get(&handle),
-        Some(PowerNotification { kind: PowerNotifyKind::SuspendResume, .. })
-    ) {
-        map.remove(&handle);
+    let removed = {
+        let mut map = notifications().lock().unwrap();
+        if matches!(
+            map.get(&handle).map(|n| &n.kind),
+            Some(PowerNotifyKind::SuspendResume)
+        ) {
+            map.remove(&handle)
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = removed {
+        entry.cancel_and_wait();
         0
     } else {
         err::ERROR_INVALID_HANDLE
@@ -1229,10 +1301,8 @@ pub unsafe extern "win64" fn PowerSettingRegisterNotification(
     let mut guid = [0u8; 16];
     std::ptr::copy_nonoverlapping(setting_guid as *const u8, guid.as_mut_ptr(), 16);
     let handle = NEXT_NOTIFY_HANDLE.fetch_add(4, Ordering::Relaxed);
-    notifications().lock().unwrap().insert(
-        handle,
-        PowerNotification { kind: PowerNotifyKind::Setting(guid), target: target.clone() },
-    );
+    let entry = PowerNotification::new(PowerNotifyKind::Setting(guid), target);
+    notifications().lock().unwrap().insert(handle, Arc::clone(&entry));
     #[cfg(target_os = "macos")]
     macos_power::ensure_power_monitor_started();
     std::ptr::write_unaligned(registration_handle, handle as *mut c_void);
@@ -1240,7 +1310,7 @@ pub unsafe extern "win64" fn PowerSettingRegisterNotification(
     // Windows immediately delivers the initial value of the registered power setting.
     if let Some(val) = current_power_setting_value(guid) {
         let pkt = build_powerbroadcast_setting(guid, &val);
-        deliver_to_target(&target, PBT_POWERSETTINGCHANGE, Some(&pkt));
+        deliver_to_entry(&entry, PBT_POWERSETTINGCHANGE, Some(&pkt));
     }
     0
 }
@@ -1252,12 +1322,19 @@ pub unsafe extern "win64" fn PowerSettingUnregisterNotification(
         return err::ERROR_INVALID_PARAMETER;
     }
     let handle = registration_handle as usize;
-    let mut map = notifications().lock().unwrap();
-    if matches!(
-        map.get(&handle),
-        Some(PowerNotification { kind: PowerNotifyKind::Setting(_), .. })
-    ) {
-        map.remove(&handle);
+    let removed = {
+        let mut map = notifications().lock().unwrap();
+        if matches!(
+            map.get(&handle).map(|n| &n.kind),
+            Some(PowerNotifyKind::Setting(_))
+        ) {
+            map.remove(&handle)
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = removed {
+        entry.cancel_and_wait();
         0
     } else {
         err::ERROR_INVALID_HANDLE
@@ -1683,5 +1760,151 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn unregister_synchronizes_in_flight_and_cancels_pending_snapshot_callbacks() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // 1. Cross-thread unregistration must wait until an in-flight callback exits
+        //    before returning ERROR_SUCCESS (prevents context UAF / DLL unload race).
+        struct InFlightSync {
+            entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+            exited: AtomicBool,
+        }
+        unsafe extern "win64" fn blocking_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let sync = &*(ctx as *const InFlightSync);
+            if let Some(tx) = sync.entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = sync.release_rx.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(3));
+            }
+            sync.exited.store(true, Ordering::Release);
+            0
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sync = Box::new(InFlightSync {
+            entered_tx: Mutex::new(Some(entered_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+            exited: AtomicBool::new(false),
+        });
+        let sync_ptr = &*sync as *const InFlightSync as usize;
+        let sub_params: [usize; 2] = [blocking_cb as *const () as usize, sync_ptr];
+        let mut h_block: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerRegisterSuspendResumeNotification(
+                    DEVICE_NOTIFY_CALLBACK,
+                    sub_params.as_ptr() as HANDLE,
+                    &mut h_block,
+                ),
+                0
+            );
+        }
+
+        let dispatcher = std::thread::spawn(|| {
+            dispatch_suspend_resume_event(PBT_APMSUSPEND);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).expect("callback entered");
+
+        let (unreg_done_tx, unreg_done_rx) = mpsc::channel::<u32>();
+        let h_block_addr = h_block as usize;
+        let unreg_thread = std::thread::spawn(move || {
+            let rc = unsafe { PowerUnregisterSuspendResumeNotification(h_block_addr as *mut c_void) };
+            let _ = unreg_done_tx.send(rc);
+        });
+
+        // While callback is still blocked, unregistration MUST NOT return yet.
+        assert!(
+            unreg_done_rx.recv_timeout(Duration::from_millis(60)).is_err(),
+            "PowerUnregisterSuspendResumeNotification must wait for in-flight callback to finish"
+        );
+        assert!(!sync.exited.load(Ordering::Acquire));
+
+        // Release callback -> unregistration completes strictly AFTER callback exits.
+        let _ = release_tx.send(());
+        assert_eq!(unreg_done_rx.recv_timeout(Duration::from_secs(2)), Ok(0));
+        assert!(sync.exited.load(Ordering::Acquire));
+        dispatcher.join().unwrap();
+        unreg_thread.join().unwrap();
+
+        // 2. Canceling another registration that is ALREADY in the same dispatch snapshot
+        //    must prevent that canceled callback from ever being invoked.
+        struct MutualCancel {
+            other_handle: AtomicUsize,
+            invoked: AtomicUsize,
+        }
+        unsafe extern "win64" fn cancel_other_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let st = &*(ctx as *const MutualCancel);
+            st.invoked.fetch_add(1, Ordering::AcqRel);
+            let other = st.other_handle.load(Ordering::Acquire);
+            if other != 0 {
+                let _ = PowerUnregisterSuspendResumeNotification(other as *mut c_void);
+            }
+            0
+        }
+
+        let mc_a = Box::new(MutualCancel { other_handle: AtomicUsize::new(0), invoked: AtomicUsize::new(0) });
+        let mc_b = Box::new(MutualCancel { other_handle: AtomicUsize::new(0), invoked: AtomicUsize::new(0) });
+        let params_a: [usize; 2] = [cancel_other_cb as *const () as usize, &*mc_a as *const MutualCancel as usize];
+        let params_b: [usize; 2] = [cancel_other_cb as *const () as usize, &*mc_b as *const MutualCancel as usize];
+        let (mut h_a, mut h_b) = (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            assert_eq!(PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params_a.as_ptr() as HANDLE, &mut h_a), 0);
+            assert_eq!(PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, params_b.as_ptr() as HANDLE, &mut h_b), 0);
+        }
+        mc_a.other_handle.store(h_b as usize, Ordering::Release);
+        mc_b.other_handle.store(h_a as usize, Ordering::Release);
+
+        dispatch_suspend_resume_event(PBT_APMRESUMESUSPEND);
+        // Whichever ran first canceled the other while it was still pending in the snapshot.
+        let total_calls = mc_a.invoked.load(Ordering::Acquire) + mc_b.invoked.load(Ordering::Acquire);
+        assert_eq!(total_calls, 1, "canceled pending snapshot callback must not be invoked");
+        // Clean up the surviving handle.
+        unsafe {
+            let _ = PowerUnregisterSuspendResumeNotification(h_a);
+            let _ = PowerUnregisterSuspendResumeNotification(h_b);
+        }
+
+        // 3. Reentrant self-unregistration from inside a power-setting callback must not deadlock
+        //    and prevents subsequent dispatch_power_setting_change calls from invoking it.
+        struct SelfCancel {
+            handle: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        unsafe extern "win64" fn self_cancel_cb(ctx: *mut c_void, _ty: u32, _setting: *mut c_void) -> u32 {
+            let sc = &*(ctx as *const SelfCancel);
+            sc.calls.fetch_add(1, Ordering::AcqRel);
+            let h = sc.handle.load(Ordering::Acquire);
+            if h != 0 {
+                let _ = PowerSettingUnregisterNotification(h as *mut c_void);
+            }
+            0
+        }
+        let sc = Box::new(SelfCancel { handle: AtomicUsize::new(0), calls: AtomicUsize::new(0) });
+        let sc_params: [usize; 2] = [self_cancel_cb as *const () as usize, &*sc as *const SelfCancel as usize];
+        let mut h_sc: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_POWER_SAVING_STATUS.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    sc_params.as_ptr() as HANDLE,
+                    &mut h_sc,
+                ),
+                0
+            );
+        }
+        sc.handle.store(h_sc as usize, Ordering::Release);
+        dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &1u32.to_le_bytes());
+        dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &0u32.to_le_bytes());
+        // 1 initial delivery + 1 dispatched delivery (which self-unregistered); 2nd dispatch suppressed.
+        assert_eq!(sc.calls.load(Ordering::Acquire), 2);
     }
 }
