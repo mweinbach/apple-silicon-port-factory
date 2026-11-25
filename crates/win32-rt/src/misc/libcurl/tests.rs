@@ -971,7 +971,9 @@ fn easy_extended_setopt_and_getinfo_behaviors() {
         assert_eq!(crate::strings::from_ansi(method), "GET");
 
         let mut proto = 0i32;
-        assert_eq!(curl_easy_getinfo(easy, CURLINFO_PROTOCOL, &mut proto as *mut i32 as *mut c_void), CURLE_OK);
+        // Verify against the raw upstream ABI value (CURLINFO_LONG + 48 = 0x20_0030).
+        assert_eq!(CURLINFO_PROTOCOL, 0x20_0030);
+        assert_eq!(curl_easy_getinfo(easy, 0x20_0030, &mut proto as *mut i32 as *mut c_void), CURLE_OK);
         assert_eq!(proto, CURLPROTO_HTTP as i32);
 
         let mut auth_avail = 0i32;

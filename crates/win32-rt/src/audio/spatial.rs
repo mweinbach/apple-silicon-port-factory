@@ -19,7 +19,7 @@
 //! Win32 `EventHandle` on each 480-frame (10 ms @ 48 kHz) audio quantum.
 
 use super::audioclient::{
-    alloc_loopback_source_id, push_loopback_frames, unregister_loopback_source,
+    alloc_loopback_source_id, unregister_loopback_source,
 };
 use super::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
 use super::com::*;
@@ -1219,7 +1219,6 @@ mod render_stream {
                 pair[1] = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             }
             core.shared.ring.push(mix_buf);
-            push_loopback_frames(&core.ep.id, core.loopback_source_id, mix_buf, SPATIAL_SAMPLE_RATE, 2);
             last_mixed.clear();
             last_mixed.extend_from_slice(mix_buf);
             *quanta_mixed += 1;
@@ -1502,7 +1501,14 @@ mod client {
 
         let granted_dynamic = max_dyn.min(MAX_DYNAMIC_OBJECTS);
         let ring_cap = (2 * backend::MAX_SLICE + QUANTUM_FRAMES * 4) as usize;
-        let shared = StreamShared::new(Ring::new(ring_cap, 2));
+        let loopback_source_id = alloc_loopback_source_id();
+        let shared = StreamShared::with_loopback(
+            Ring::new(ring_cap, 2),
+            inner.ep.id.clone(),
+            loopback_source_id,
+            SPATIAL_SAMPLE_RATE,
+            2,
+        );
         shared.set_event(event);
 
         // Open CoreAudio output stream, auto-falling back to Backend::Null when
@@ -1565,7 +1571,7 @@ mod client {
         let out_kind = out.kind;
         let core = Arc::new(SpatialStreamCore {
             ep: inner.ep.clone(),
-            loopback_source_id: alloc_loopback_source_id(),
+            loopback_source_id,
             session: SessionState::get_or_create(inner.ep.clone(), None),
             channel_volumes: Mutex::new([1.0, 1.0]),
             shared,

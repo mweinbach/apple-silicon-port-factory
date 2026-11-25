@@ -219,8 +219,8 @@ pub(super) const CURLINFO_LASTSOCKET: i32 = 0x20_001d;
 pub(super) const CURLINFO_CONDITION_UNMET: i32 = 0x20_0023;
 pub(super) const CURLINFO_PRIMARY_PORT: i32 = 0x20_0028;
 pub(super) const CURLINFO_LOCAL_PORT: i32 = 0x20_002a;
-pub(super) const CURLINFO_PROTOCOL: i32 = 0x20_002b;
 pub(super) const CURLINFO_HTTP_VERSION: i32 = 0x20_002e;
+pub(super) const CURLINFO_PROTOCOL: i32 = 0x20_0030;
 
 pub(super) const CURLINFO_TOTAL_TIME: i32 = 0x30_0003;
 pub(super) const CURLINFO_NAMELOOKUP_TIME: i32 = 0x30_0004;

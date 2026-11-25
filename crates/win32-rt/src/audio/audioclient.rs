@@ -288,6 +288,10 @@ impl Drop for LoopbackSub {
     }
 }
 
+pub(super) fn has_loopback_subscribers() -> bool {
+    LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) > 0
+}
+
 fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u16) -> Arc<LoopbackSub> {
     let sub = Arc::new(LoopbackSub {
         active: AtomicBool::new(false),
@@ -892,7 +896,14 @@ pub fn initialize(
         // The ring is allocated for the worst case (a 4096-frame device slice at
         // display sleep); the client-visible buffer size is decided below.
         let ring_cap = requested.max(2 * backend::MAX_SLICE * f.rate.div_ceil(core.ep.info.rate.max(1)) + 1024);
-        let shared = StreamShared::new(Ring::new(ring_cap as usize, out_channels as usize));
+        let source_id = alloc_loopback_source_id();
+        let shared = StreamShared::with_loopback(
+            Ring::new(ring_cap as usize, out_channels as usize),
+            core.ep.id.clone(),
+            source_id,
+            f.rate,
+            out_channels,
+        );
         let io_request = 512; // device frames; ~one Wwise frame
         let out = match OutputStream::open(&core.ep.info, f.rate, out_channels, shared.clone(), io_request) {
             Ok(o) => o,
@@ -950,7 +961,7 @@ pub fn initialize(
             dropped_silence: 0,
             io: StreamIo::Render(RenderState {
                 ep_id: core.ep.id.clone(),
-                source_id: alloc_loopback_source_id(),
+                source_id,
                 out_channels,
                 matrix,
                 out,
@@ -1522,7 +1533,6 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
             }
         };
         s.shared.ring.push(pushed);
-        push_loopback_frames(ep_id, r.source_id, pushed, fmt.rate, r.out_channels);
     }
     s.frames_written += frames as u64;
 }

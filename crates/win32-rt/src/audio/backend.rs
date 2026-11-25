@@ -560,9 +560,25 @@ pub fn ca_sync<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
 // Streams
 // ---------------------------------------------------------------------------
 
+/// Playback-side loopback feed attached to render/spatial `StreamShared` instances.
+///
+/// The playback consumer (CoreAudio RT callback or Null clock thread) feeds samples
+/// strictly as playback consumes them from `StreamShared::ring`, ensuring unstarted
+/// prefill or reset audio never leaks into fallback loopback capture.
+pub struct LoopbackFeed {
+    pub ep_id: String,
+    pub source_id: u64,
+    pub rate: u32,
+    pub channels: u16,
+    /// Lock-free SPSC ring filled by the realtime CoreAudio IO thread and drained by
+    /// the non-RT `wwise-audio-pump` thread into `push_loopback_frames`.
+    pub ring: Ring,
+}
+
 /// State shared between the client, the IO callback and the pump thread.
 pub struct StreamShared {
     pub ring: Ring,
+    pub loopback: Option<LoopbackFeed>,
     pub started: AtomicBool,
     pub underrun_frames: AtomicU64,
     pub callbacks: AtomicU64,
@@ -591,6 +607,37 @@ impl StreamShared {
     pub fn new(ring: Ring) -> Arc<StreamShared> {
         Arc::new(StreamShared {
             ring,
+            loopback: None,
+            started: AtomicBool::new(false),
+            underrun_frames: AtomicU64::new(0),
+            callbacks: AtomicU64::new(0),
+            max_slice: AtomicU64::new(0),
+            event: Mutex::new(None),
+            has_event: AtomicBool::new(false),
+            invalid: AtomicBool::new(false),
+            sema: Semaphore::new(),
+            quit: AtomicBool::new(false),
+        })
+    }
+
+    pub fn with_loopback(
+        ring: Ring,
+        ep_id: String,
+        source_id: u64,
+        rate: u32,
+        channels: u16,
+    ) -> Arc<StreamShared> {
+        let lb_cap = ring.capacity().max(8192);
+        let lb_ring = Ring::new(lb_cap, channels.max(1) as usize);
+        Arc::new(StreamShared {
+            ring,
+            loopback: Some(LoopbackFeed {
+                ep_id,
+                source_id,
+                rate,
+                channels,
+                ring: lb_ring,
+            }),
             started: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
             callbacks: AtomicU64::new(0),
@@ -724,9 +771,34 @@ impl OutputStream {
             std::thread::Builder::new()
                 .name("wwise-audio-pump".into())
                 .spawn(move || {
+                    let mut lb_buf = Vec::<f32>::new();
                     while !s.quit.load(Ordering::Acquire) {
-                        if s.sema.wait() && !s.quit.load(Ordering::Acquire) && s.started.load(Ordering::Acquire) {
-                            s.signal_event();
+                        if s.sema.wait() && !s.quit.load(Ordering::Acquire) {
+                            if let Some(lb) = &s.loopback {
+                                let ch = lb.ring.channels();
+                                loop {
+                                    let avail = lb.ring.len();
+                                    if avail == 0 {
+                                        break;
+                                    }
+                                    let take = avail.min(4096);
+                                    lb_buf.resize(take * ch, 0.0);
+                                    let got = lb.ring.pop_into(&mut lb_buf[..take * ch]);
+                                    if got == 0 {
+                                        break;
+                                    }
+                                    super::audioclient::push_loopback_frames(
+                                        &lb.ep_id,
+                                        lb.source_id,
+                                        &lb_buf[..got * ch],
+                                        lb.rate,
+                                        lb.channels,
+                                    );
+                                }
+                            }
+                            if s.started.load(Ordering::Acquire) {
+                                s.signal_event();
+                            }
                         }
                     }
                 })
@@ -757,6 +829,8 @@ impl OutputStream {
                     std::thread::Builder::new()
                         .name("wwise-audio-null".into())
                         .spawn(move || {
+                            let ch = s.ring.channels();
+                            let mut lb_buf = vec![0.0f32; period * ch];
                             let mut next = std::time::Instant::now();
                             while !s.quit.load(Ordering::Acquire) {
                                 next += dur;
@@ -767,7 +841,25 @@ impl OutputStream {
                                     next = now; // don't burst after a long stall
                                 }
                                 if s.started.load(Ordering::Acquire) {
-                                    let got = s.ring.discard(period);
+                                    let got = if let Some(lb) = &s.loopback {
+                                        if super::audioclient::has_loopback_subscribers() {
+                                            let got = s.ring.pop_into(&mut lb_buf);
+                                            if got > 0 {
+                                                super::audioclient::push_loopback_frames(
+                                                    &lb.ep_id,
+                                                    lb.source_id,
+                                                    &lb_buf[..got * ch],
+                                                    lb.rate,
+                                                    lb.channels,
+                                                );
+                                            }
+                                            got
+                                        } else {
+                                            s.ring.discard(period)
+                                        }
+                                    } else {
+                                        s.ring.discard(period)
+                                    };
                                     s.consumed(period, got);
                                 }
                             }
@@ -1706,6 +1798,13 @@ mod ca {
         }
         let want = out.len() / s.ring.channels();
         let got = s.ring.pop_into(out);
+        if got > 0 {
+            if let Some(lb) = &s.loopback {
+                if super::super::audioclient::has_loopback_subscribers() {
+                    lb.ring.push(&out[..got * s.ring.channels()]);
+                }
+            }
+        }
         s.consumed(want, got);
         0
     }
@@ -1962,6 +2061,13 @@ mod ca {
         }
         let want = out.len() / s.ring.channels();
         let got = s.ring.pop_into(out);
+        if got > 0 {
+            if let Some(lb) = &s.loopback {
+                if super::super::audioclient::has_loopback_subscribers() {
+                    lb.ring.push(&out[..got * s.ring.channels()]);
+                }
+            }
+        }
         s.consumed(want, got);
         0
     }
