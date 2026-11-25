@@ -79,3 +79,36 @@ pub fn configured_version() -> Option<PhysxVersion> {
         .as_deref()
         .and_then(PhysxVersion::from_spec)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proprietary_oodle_and_physx45_have_no_fake_builtins() {
+        // Shipping Oodle and PhysX 4.x/5.x core/cooking DLLs run via ARM64 JIT;
+        // when no shipping PE is present, LoadLibrary must fail with ERROR_MOD_NOT_FOUND
+        // just as on Windows rather than resolving a fake stub builtin.
+        for dll in [
+            "oo2core_9_win64.dll",
+            "oo2core_8_win64.dll",
+            "physx_64.dll",
+            "PhysX_64.dll",
+            "physxcooking_64.dll",
+            "PhysXCooking_64.dll",
+        ] {
+            assert!(
+                crate::find_builtin(dll).is_none(),
+                "unexpected fake builtin for proprietary middleware {dll}"
+            );
+        }
+        assert_eq!(
+            PhysxVersion::from_version_u32(encode_version(4, 1, 2)),
+            Some(PhysxVersion::V4_1)
+        );
+        assert_eq!(
+            PhysxVersion::from_version_u32(encode_version(5, 1, 0)),
+            Some(PhysxVersion::V5)
+        );
+    }
+}
