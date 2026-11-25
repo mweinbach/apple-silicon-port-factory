@@ -139,6 +139,11 @@ pub(super) const DSFXR_LOCSOFTWARE: u32 = 2;
 pub(super) const DSFXR_FAILED: u32 = 4;
 pub(super) const DSFXR_UNKNOWN: u32 = 5;
 
+// Wildcard object GUID for IDirectSoundBuffer8::GetObjectInPath (<dsound.h>: GUID_All_Objects)
+// {aa114de5-c262-4169-a1c8-23d698cc73b5}
+pub(super) const GUID_ALL_OBJECTS: GUID =
+    GUID::new(0xAA11_4DE5, 0xC262, 0x4169, [0xA1, 0xC8, 0x23, 0xD6, 0x98, 0xCC, 0x73, 0xB5]);
+
 // Standard DirectSound 8 FX CLSIDs (<dsound.h>)
 pub(super) const GUID_DSFX_STANDARD_GARGLE: GUID =
     GUID::new(0xDAFD_8210, 0x5711, 0x4B91, [0x9F, 0xE3, 0xF7, 0x5B, 0x7A, 0xE2, 0x79, 0xBF]);

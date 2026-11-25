@@ -629,7 +629,6 @@ unsafe fn sw_lookup_rf(
     pc: u64,
     fn_table_cb: *const c_void,
     mod_base_cb: *const c_void,
-    read_mem_cb: *const c_void,
 ) -> Option<(u64, RuntimeFunction, u64)> {
     if pc < 0x1000 {
         return None;
@@ -640,10 +639,13 @@ unsafe fn sw_lookup_rf(
     let use_custom_ft = !fn_table_cb.is_null() && (fn_table_cb as usize) != default_ft;
     let use_custom_mb = !mod_base_cb.is_null() && (mod_base_cb as usize) != default_mb;
 
+    // Per PFunctionTableAccessRoutine64, both the default lookup and custom
+    // FunctionTableAccessRoutine64 return a PVOID to a RUNTIME_FUNCTION in the
+    // caller's own address space (not a target-process address).
     if !use_custom_ft && !use_custom_mb {
         let (base, rf_ptr) = crate::unwind::lookup_function_entry(pc)?;
         let mut raw = [0u8; 12];
-        if !sw_read_mem(h_process, read_mem_cb, rf_ptr as u64, &mut raw) {
+        if !crate::crash::safe_read(rf_ptr as u64, &mut raw) {
             return None;
         }
         let rf = std::ptr::read_unaligned(raw.as_ptr() as *const RuntimeFunction);
@@ -667,7 +669,7 @@ unsafe fn sw_lookup_rf(
         return None;
     }
     let mut raw = [0u8; 12];
-    if !sw_read_mem(h_process, read_mem_cb, rf_addr, &mut raw) {
+    if !crate::crash::safe_read(rf_addr, &mut raw) {
         return None;
     }
     let rf = std::ptr::read_unaligned(raw.as_ptr() as *const RuntimeFunction);
@@ -697,7 +699,7 @@ unsafe fn sw_unwind_one(
     let allow_epilog = is_first_frame;
 
     let unwound = if let Some((base, rf, _)) =
-        sw_lookup_rf(h_process, lookup_pc, fn_table_cb, mod_base_cb, read_mem_cb)
+        sw_lookup_rf(h_process, lookup_pc, fn_table_cb, mod_base_cb)
     {
         crate::unwind::safe_virtual_unwind_with(base, lookup_pc, rf, ctx, allow_epilog, &mut |addr, buf| {
             sw_read_mem(h_process, read_mem_cb, addr, buf)
@@ -783,7 +785,6 @@ pub unsafe extern "win64" fn StackWalk64(
             ctx.rip,
             function_table_access_routine,
             get_module_base_routine,
-            read_memory_routine,
         )
         .map(|(_, _, ptr)| ptr)
         .unwrap_or(0);
@@ -847,7 +848,6 @@ pub unsafe extern "win64" fn StackWalk64(
         ctx.rip.saturating_sub(1),
         function_table_access_routine,
         get_module_base_routine,
-        read_memory_routine,
     )
     .map(|(_, _, ptr)| ptr)
     .unwrap_or(0);
@@ -2532,9 +2532,10 @@ mod tests {
         use std::sync::OnceLock;
 
         // Synthetic remote address space (unmapped in our own process) served ONLY via custom callbacks.
+        // FunctionTableAccessRoutine returns a caller-local PVOID to a cached RUNTIME_FUNCTION, while
+        // ReadProcessMemoryRoutine only knows target-process addresses (UNWIND_INFO + stack).
         const REMOTE_BASE: u64 = 0x7FFF_1234_0000;
         const REMOTE_STACK: u64 = 0x7FFE_5678_1000;
-        const REMOTE_RF_ADDR: u64 = REMOTE_BASE + 0x4000;
         const REMOTE_UNWIND_RVA: u32 = 0x5000;
 
         struct RemoteImage {
@@ -2579,16 +2580,13 @@ mod tests {
             let img = REMOTE.get().unwrap();
             let size_usize = size as usize;
             let dst = std::slice::from_raw_parts_mut(buf as *mut u8, size_usize);
-            let rf_bytes = std::slice::from_raw_parts(
-                &img.rf as *const RuntimeFunction as *const u8,
-                std::mem::size_of::<RuntimeFunction>(),
-            );
             let stack_bytes = std::slice::from_raw_parts(
                 img.stack.as_ptr() as *const u8,
                 std::mem::size_of_val(&img.stack),
             );
-            let regions: [(u64, &[u8]); 3] = [
-                (REMOTE_RF_ADDR, rf_bytes),
+            // Serve ONLY target-process regions; caller-local pointers (such as &img.rf)
+            // must NOT be routed through ReadProcessMemoryRoutine.
+            let regions: [(u64, &[u8]); 2] = [
                 (REMOTE_BASE + REMOTE_UNWIND_RVA as u64, &img.unwind_info),
                 (REMOTE_STACK, stack_bytes),
             ];
@@ -2611,7 +2609,8 @@ mod tests {
 
         unsafe extern "win64" fn remote_fn_table(_h_proc: HANDLE, addr: u64) -> *mut c_void {
             if (REMOTE_BASE + 0x100..REMOTE_BASE + 0x200).contains(&addr) {
-                REMOTE_RF_ADDR as *mut c_void
+                let img = REMOTE.get().unwrap();
+                &img.rf as *const RuntimeFunction as *mut c_void
             } else {
                 std::ptr::null_mut()
             }

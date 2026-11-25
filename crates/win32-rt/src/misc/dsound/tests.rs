@@ -1519,6 +1519,36 @@ fn dsound8_i3dl2_reverb_full_vtable_preset_and_quality() {
         );
         assert_eq!(res, DSFXR_LOCSOFTWARE);
 
+        // GetObjectInPath with GUID_All_Objects matches installed effects; GUID_NULL does not.
+        let mut null_fx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_NULL,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut null_fx,
+            ),
+            DSERR_OBJECTNOTFOUND
+        );
+        assert!(null_fx.is_null());
+
+        let mut wildcard_fx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_ALL_OBJECTS,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut wildcard_fx,
+            ),
+            DS_OK
+        );
+        assert!(!wildcard_fx.is_null());
+        let wvtbl = *(wildcard_fx as *const *const usize);
+        let wrel: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*wvtbl.add(2));
+        assert_eq!(wrel(wildcard_fx), 0);
+
         let mut fx_obj: *mut c_void = std::ptr::null_mut();
         assert_eq!(
             dsb_get_object_in_path(
