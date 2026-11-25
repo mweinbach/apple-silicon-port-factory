@@ -61,6 +61,7 @@ const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 const X509_ASN_ENCODING: u32 = 1;
 
 // DER OID value bytes
+const OID_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
 const OID_SPC_INDIRECT_DATA: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04];
 const OID_CTL: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
@@ -563,10 +564,9 @@ fn verify_pe_authenticode(bytes: &[u8]) -> Result<VerifiedAuthenticode, i32> {
                 return Err(TRUST_E_BAD_DIGEST);
             }
         } else {
-            let content_hash = si_digest.hash(spc_seq.val);
-            if !rsa_pub.verify_pkcs1(Some(si_digest), &content_hash, enc_digest.val) {
-                return Err(TRUST_E_BAD_DIGEST);
-            }
+            // Per RFC 5652 §5.3 & Authenticode spec, signedAttrs MUST be present for non-id-data
+            // content types (Authenticode always uses OID_SPC_INDIRECT_DATA).
+            return Err(TRUST_E_BAD_DIGEST);
         }
         verified_signer = Some((
             cert_idx,
@@ -1610,6 +1610,10 @@ fn verify_standalone_pkcs7(
                 return Err(TRUST_E_BAD_DIGEST);
             }
         } else {
+            // Per RFC 5652 §5.3, signedAttrs MUST be present whenever eContentType != id-data.
+            if encap_content_type_oid.as_slice() != OID_DATA {
+                return Err(TRUST_E_BAD_DIGEST);
+            }
             let content_hash = si_digest.hash(&content_bytes);
             if !rsa_pub.verify_pkcs1(Some(si_digest), &content_hash, enc_digest.val) {
                 return Err(TRUST_E_BAD_DIGEST);
@@ -2883,6 +2887,21 @@ mod tests {
             tampered_ctl[pos..pos + OID_CTL.len()].copy_from_slice(oid_data);
             assert_eq!(
                 verify_standalone_pkcs7(&tampered_ctl, None).err(),
+                Some(TRUST_E_BAD_DIGEST)
+            );
+
+            // RFC 5652 §5.3: attribute-free SignedData succeeds for id-data, but MUST be
+            // rejected when relabeled as a non-DATA content type (e.g. szOID_CTL).
+            let noattr = crate::misc::crypt32::tests::test_vectors::PKCS7_NOATTR_DATA_DER;
+            assert!(verify_standalone_pkcs7(noattr, None).is_ok());
+            let mut relabeled_noattr = noattr.to_vec();
+            let dpos = relabeled_noattr
+                .windows(OID_DATA.len())
+                .position(|w| w == OID_DATA)
+                .expect("PKCS7_NOATTR_DATA_DER must contain OID_DATA");
+            relabeled_noattr[dpos..dpos + OID_DATA.len()].copy_from_slice(OID_CTL);
+            assert_eq!(
+                verify_standalone_pkcs7(&relabeled_noattr, None).err(),
                 Some(TRUST_E_BAD_DIGEST)
             );
 

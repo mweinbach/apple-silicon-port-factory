@@ -458,6 +458,10 @@ pub(super) fn verify_cms_signer_signature(
         set_der.extend_from_slice(&aa_raw[1..]);
         set_der
     } else {
+        // Per RFC 5652 §5.3, signedAttrs MUST be present whenever eContentType != id-data.
+        if expected_content_type_oid_der != OID_DATA {
+            return false;
+        }
         content_bytes.to_vec()
     };
 

@@ -3185,6 +3185,44 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert_eq!(crate::teb::last_error(), 0x8009_0006);
 
+        // RFC 5652 §5.3: attribute-free SignedData passes CryptVerifyMessageSignature for id-data,
+        // but MUST fail when encapContentInfo.eContentType is relabeled to non-DATA (szOID_CTL).
+        let noattr_der = self::test_vectors::PKCS7_NOATTR_DATA_DER;
+        let mut noattr_out = [0u8; 64];
+        let mut noattr_len = noattr_out.len() as u32;
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                noattr_der.as_ptr(),
+                noattr_der.len() as u32,
+                noattr_out.as_mut_ptr(),
+                &mut noattr_len,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(&noattr_out[..noattr_len as usize], b"noattr-data-payload");
+        let mut relabeled_noattr = noattr_der.to_vec();
+        let dpos = relabeled_noattr
+            .windows(oid_data.len())
+            .position(|w| w == oid_data)
+            .unwrap();
+        relabeled_noattr[dpos..dpos + oid_data.len()].copy_from_slice(oid_ctl);
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                relabeled_noattr.as_ptr(),
+                relabeled_noattr.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006);
+
         let ctl_dup = CertDuplicateCTLContext(ctl);
         assert_eq!(ctl_dup, ctl);
         assert_eq!(CertFreeCTLContext(ctl_dup), TRUE);
