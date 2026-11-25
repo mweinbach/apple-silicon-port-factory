@@ -842,34 +842,32 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 with_x87_mut(|st| st.binop_st(op_code, 1, 0, pop));
                 true
             } else if ins.op_kind(0) == OpKind::Memory {
-                let (rhs, extra) = if is_int {
+                let (rhs, rhs_de) = if is_int {
                     let Some(iv) = read_int_mem(cpu, ins) else {
                         return faulted();
                     };
-                    (Fp80::from_i64(iv), 0u16)
+                    (Fp80::from_i64(iv), false)
                 } else {
                     let addr = cpu.eff_addr(ins);
-                    let mut extra = 0u16;
-                    let v = match ins.memory_size().size() {
+                    match ins.memory_size().size() {
                         8 => {
                             let bits = cpu.read_mem(addr, 64);
                             if faulted() {
                                 return true;
                             }
-                            Fp80::from_f64_bits(bits, &mut extra)
+                            Fp80::from_f64_bits_raw(bits)
                         }
                         4 => {
                             let bits = cpu.read_mem(addr, 32) as u32;
                             if faulted() {
                                 return true;
                             }
-                            Fp80::from_f32_bits(bits, &mut extra)
+                            Fp80::from_f32_bits_raw(bits)
                         }
                         _ => return false,
-                    };
-                    (v, extra)
+                    }
                 };
-                with_x87_mut(|st| st.binop_val(op_code, rhs, extra));
+                with_x87_mut(|st| st.binop_val(op_code, rhs, rhs_de));
                 true
             } else if ins.op_kind(0) == OpKind::Register {
                 let Some(d_idx) = st_reg_index(ins.op_register(0)) else {
@@ -936,7 +934,7 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
             true
         }
         Mnemonic::Ftst => {
-            with_x87_mut(|st| st.compare_val(Fp80::zero(0), 0, true, 0));
+            with_x87_mut(|st| st.compare_val(Fp80::zero(0), false, true, 0));
             true
         }
         Mnemonic::Fcom
@@ -960,34 +958,32 @@ pub(crate) unsafe fn exec_x87_ins(cpu: &mut Cpu, mn: Mnemonic, ins: &Instruction
                 });
                 true
             } else if ins.op_kind(0) == OpKind::Memory {
-                let (rhs, extra) = if is_int {
+                let (rhs, rhs_de) = if is_int {
                     let Some(iv) = read_int_mem(cpu, ins) else {
                         return faulted();
                     };
-                    (Fp80::from_i64(iv), 0u16)
+                    (Fp80::from_i64(iv), false)
                 } else {
                     let addr = cpu.eff_addr(ins);
-                    let mut extra = 0u16;
-                    let v = match ins.memory_size().size() {
+                    match ins.memory_size().size() {
                         8 => {
                             let bits = cpu.read_mem(addr, 64);
                             if faulted() {
                                 return true;
                             }
-                            Fp80::from_f64_bits(bits, &mut extra)
+                            Fp80::from_f64_bits_raw(bits)
                         }
                         4 => {
                             let bits = cpu.read_mem(addr, 32) as u32;
                             if faulted() {
                                 return true;
                             }
-                            Fp80::from_f32_bits(bits, &mut extra)
+                            Fp80::from_f32_bits_raw(bits)
                         }
                         _ => return false,
-                    };
-                    (v, extra)
+                    }
                 };
-                with_x87_mut(|st| st.compare_val(rhs, extra, signaling, pops));
+                with_x87_mut(|st| st.compare_val(rhs, rhs_de, signaling, pops));
                 true
             } else if ins.op_kind(0) == OpKind::Register {
                 let reg_op = if ins.op_count() >= 2 && ins.op_kind(1) == OpKind::Register { 1 } else { 0 };

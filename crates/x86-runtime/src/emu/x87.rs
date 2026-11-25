@@ -108,93 +108,137 @@ impl Fp80 {
         self.kind == Fp80Kind::Nan && (self.sig & (1u64 << 62)) == 0
     }
 
-    /// Convert IEEE-754 `f32` bits to 80-bit extended precision, raising `SW.IE` on sNaN and
-    /// `SW.DE` on subnormal input, matching `fld dword ptr [mem]`.
+    /// Decode IEEE-754 `f32` bits to 80-bit extended precision without quieting sNaNs or
+    /// mutating `sw`, returning `(value, is_denormal)`. Used by memory arithmetic and compare
+    /// instructions so `select_nan` sees the original sNaN/QNaN classification.
     #[inline]
-    pub(super) fn from_f32_bits(bits: u32, sw: &mut u16) -> Self {
+    pub(super) fn from_f32_bits_raw(bits: u32) -> (Self, bool) {
         let sign = (bits >> 31) as u8;
         let e = (bits >> 23) & 0xFF;
         let f = bits & 0x007F_FFFF;
         if e == 0xFF {
             if f == 0 {
-                Self::inf(sign)
+                (Self::inf(sign), false)
             } else {
-                if (f & 0x0040_0000) == 0 {
-                    *sw |= SW_IE;
-                }
-                Self {
-                    kind: Fp80Kind::Nan,
-                    sign,
-                    exp: 0,
-                    sig: (1u64 << 63) | (1u64 << 62) | ((f as u64) << 40),
-                }
+                (
+                    Self {
+                        kind: Fp80Kind::Nan,
+                        sign,
+                        exp: 0,
+                        sig: (1u64 << 63) | ((f as u64) << 40),
+                    },
+                    false,
+                )
             }
         } else if e == 0 {
             if f == 0 {
-                Self::zero(sign)
+                (Self::zero(sign), false)
             } else {
-                *sw |= SW_DE;
                 let f64_val = (f as u64) << 40;
                 let clz = f64_val.leading_zeros() as i32; // f in 1..2^23 -> f64_val bit 62..40 -> clz in 1..=23
+                (
+                    Self {
+                        kind: Fp80Kind::Finite,
+                        sign,
+                        exp: -126 - clz,
+                        sig: f64_val << (clz as u32),
+                    },
+                    true,
+                )
+            }
+        } else {
+            (
                 Self {
                     kind: Fp80Kind::Finite,
                     sign,
-                    exp: -126 - clz,
-                    sig: f64_val << (clz as u32),
-                }
-            }
-        } else {
-            Self {
-                kind: Fp80Kind::Finite,
-                sign,
-                exp: (e as i32) - 127,
-                sig: (1u64 << 63) | ((f as u64) << 40),
-            }
+                    exp: (e as i32) - 127,
+                    sig: (1u64 << 63) | ((f as u64) << 40),
+                },
+                false,
+            )
         }
     }
 
-    /// Convert IEEE-754 `f64` bits to 80-bit extended precision, raising `SW.IE` on sNaN and
-    /// `SW.DE` on subnormal input, matching `fld qword ptr [mem]`.
+    /// Convert IEEE-754 `f32` bits to 80-bit extended precision, raising `SW.IE` on sNaN
+    /// (and quieting it) and `SW.DE` on subnormal input, matching `fld dword ptr [mem]`.
     #[inline]
-    pub(super) fn from_f64_bits(bits: u64, sw: &mut u16) -> Self {
+    pub(super) fn from_f32_bits(bits: u32, sw: &mut u16) -> Self {
+        let (mut v, de) = Self::from_f32_bits_raw(bits);
+        if de {
+            *sw |= SW_DE;
+        } else if v.kind == Fp80Kind::Nan {
+            if v.is_signaling_nan() {
+                *sw |= SW_IE;
+            }
+            v.sig |= 1u64 << 62;
+        }
+        v
+    }
+
+    /// Decode IEEE-754 `f64` bits to 80-bit extended precision without quieting sNaNs or
+    /// mutating `sw`, returning `(value, is_denormal)`. Used by memory arithmetic and compare
+    /// instructions so `select_nan` sees the original sNaN/QNaN classification.
+    #[inline]
+    pub(super) fn from_f64_bits_raw(bits: u64) -> (Self, bool) {
         let sign = (bits >> 63) as u8;
         let e = ((bits >> 52) & 0x7FF) as u32;
         let f = bits & 0x000F_FFFF_FFFF_FFFF;
         if e == 0x7FF {
             if f == 0 {
-                Self::inf(sign)
+                (Self::inf(sign), false)
             } else {
-                if (f & 0x0008_0000_0000_0000) == 0 {
-                    *sw |= SW_IE;
-                }
-                Self {
-                    kind: Fp80Kind::Nan,
-                    sign,
-                    exp: 0,
-                    sig: (1u64 << 63) | (1u64 << 62) | (f << 11),
-                }
+                (
+                    Self {
+                        kind: Fp80Kind::Nan,
+                        sign,
+                        exp: 0,
+                        sig: (1u64 << 63) | (f << 11),
+                    },
+                    false,
+                )
             }
         } else if e == 0 {
             if f == 0 {
-                Self::zero(sign)
+                (Self::zero(sign), false)
             } else {
-                *sw |= SW_DE;
                 let clz = f.leading_zeros() as i32; // f in 1..2^52 -> clz in 12..=63
+                (
+                    Self {
+                        kind: Fp80Kind::Finite,
+                        sign,
+                        exp: -1011 - clz,
+                        sig: f << (clz as u32),
+                    },
+                    true,
+                )
+            }
+        } else {
+            (
                 Self {
                     kind: Fp80Kind::Finite,
                     sign,
-                    exp: -1011 - clz,
-                    sig: f << (clz as u32),
-                }
-            }
-        } else {
-            Self {
-                kind: Fp80Kind::Finite,
-                sign,
-                exp: (e as i32) - 1023,
-                sig: (1u64 << 63) | (f << 11),
-            }
+                    exp: (e as i32) - 1023,
+                    sig: (1u64 << 63) | (f << 11),
+                },
+                false,
+            )
         }
+    }
+
+    /// Convert IEEE-754 `f64` bits to 80-bit extended precision, raising `SW.IE` on sNaN
+    /// (and quieting it) and `SW.DE` on subnormal input, matching `fld qword ptr [mem]`.
+    #[inline]
+    pub(super) fn from_f64_bits(bits: u64, sw: &mut u16) -> Self {
+        let (mut v, de) = Self::from_f64_bits_raw(bits);
+        if de {
+            *sw |= SW_DE;
+        } else if v.kind == Fp80Kind::Nan {
+            if v.is_signaling_nan() {
+                *sw |= SW_IE;
+            }
+            v.sig |= 1u64 << 62;
+        }
+        v
     }
 
     /// Convert IEEE-754 `f64` bits without mutating `sw` (for internal transcendental results).
@@ -1496,11 +1540,12 @@ impl X87State {
         }
     }
 
-    /// Execute binary arithmetic (`X87_OP_*`) between `ST(0)` and a decoded memory operand `rhs`
-    /// (with `rhs_extra_sw` carrying any `IE`/`DE` from loading `m32`/`m64`).
-    pub(super) fn binop_val(&mut self, op: u8, rhs: Fp80, rhs_extra_sw: u16) {
+    /// Execute binary arithmetic (`X87_OP_*`) between `ST(0)` and a raw decoded memory operand `rhs`
+    /// (`rhs_denormal` marks subnormal `m32`/`m64` inputs so `SW.DE` follows the same suppression
+    /// rules as register operands, and unquieted sNaNs reach `Fp80::select_nan` intact).
+    pub(super) fn binop_val(&mut self, op: u8, rhs: Fp80, rhs_denormal: bool) {
         let p0 = self.phys(0);
-        let mut sw = (self.sw & !SW_C1) | rhs_extra_sw;
+        let mut sw = self.sw & !SW_C1;
         if (self.valid_mask & (1 << p0)) == 0 {
             sw |= SW_SF | SW_IE;
             self.set_slot_bytes(p0, Fp80::QNAN_INDEF_BYTES);
@@ -1510,7 +1555,7 @@ impl X87State {
             return;
         }
         let a = self.value(p0);
-        let raw_de = self.raw_denormal(p0);
+        let raw_de = self.raw_denormal(p0) || rhs_denormal;
         let res = Self::apply_binop(op, a, rhs, raw_de, self.cw, &mut sw);
         self.set_slot_bytes(p0, res.to_f80_bytes());
         self.valid_mask |= 1 << p0;
@@ -1589,15 +1634,15 @@ impl X87State {
         code
     }
 
-    pub(super) fn compare_val(&mut self, rhs: Fp80, rhs_extra_sw: u16, signaling: bool, pops: u8) {
+    pub(super) fn compare_val(&mut self, rhs: Fp80, rhs_denormal: bool, signaling: bool, pops: u8) {
         let p0 = self.phys(0);
-        let mut sw = (self.sw & !SW_C_MASK) | rhs_extra_sw;
+        let mut sw = self.sw & !SW_C_MASK;
         let code = if (self.valid_mask & (1 << p0)) == 0 {
             sw |= SW_SF | SW_IE;
             3u8
         } else {
             let a = self.value(p0);
-            if self.raw_denormal(p0)
+            if (self.raw_denormal(p0) || rhs_denormal)
                 && a.kind != Fp80Kind::Nan
                 && rhs.kind != Fp80Kind::Nan
                 && a.kind != Fp80Kind::Unsupported
@@ -2663,19 +2708,17 @@ unsafe extern "C" fn h_binop_st(st: *mut X87State, op_pop: u32, dst: u32, src: u
 }
 
 unsafe extern "C" fn h_binop_f32(st: *mut X87State, op: u32, bits: u32) {
-    let mut extra = 0u16;
-    let rhs = Fp80::from_f32_bits(bits, &mut extra);
-    (*st).binop_val(op as u8, rhs, extra);
+    let (rhs, de) = Fp80::from_f32_bits_raw(bits);
+    (*st).binop_val(op as u8, rhs, de);
 }
 
 unsafe extern "C" fn h_binop_f64(st: *mut X87State, op: u32, bits: u64) {
-    let mut extra = 0u16;
-    let rhs = Fp80::from_f64_bits(bits, &mut extra);
-    (*st).binop_val(op as u8, rhs, extra);
+    let (rhs, de) = Fp80::from_f64_bits_raw(bits);
+    (*st).binop_val(op as u8, rhs, de);
 }
 
 unsafe extern "C" fn h_binop_i64(st: *mut X87State, op: u32, v: i64) {
-    (*st).binop_val(op as u8, Fp80::from_i64(v), 0);
+    (*st).binop_val(op as u8, Fp80::from_i64(v), false);
 }
 
 unsafe extern "C" fn h_unary(st: *mut X87State, op: u32) {
@@ -2689,19 +2732,17 @@ unsafe extern "C" fn h_compare_st(st: *mut X87State, idx: u32, flags: u32) -> u6
 }
 
 unsafe extern "C" fn h_compare_f32(st: *mut X87State, bits: u32, flags: u32) {
-    let mut extra = 0u16;
-    let rhs = Fp80::from_f32_bits(bits, &mut extra);
-    (*st).compare_val(rhs, extra, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
+    let (rhs, de) = Fp80::from_f32_bits_raw(bits);
+    (*st).compare_val(rhs, de, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
 }
 
 unsafe extern "C" fn h_compare_f64(st: *mut X87State, bits: u64, flags: u32) {
-    let mut extra = 0u16;
-    let rhs = Fp80::from_f64_bits(bits, &mut extra);
-    (*st).compare_val(rhs, extra, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
+    let (rhs, de) = Fp80::from_f64_bits_raw(bits);
+    (*st).compare_val(rhs, de, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
 }
 
 unsafe extern "C" fn h_compare_i64(st: *mut X87State, v: i64, flags: u32) {
-    (*st).compare_val(Fp80::from_i64(v), 0, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
+    (*st).compare_val(Fp80::from_i64(v), false, (flags & 1) != 0, ((flags >> 2) & 3) as u8);
 }
 
 unsafe extern "C" fn h_fxam(st: *mut X87State) {

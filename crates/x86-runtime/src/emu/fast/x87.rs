@@ -653,20 +653,19 @@ pub(super) unsafe fn exec_x87_fast(cpu: &mut Cpu, op: &FastOp) {
             let op_code = op.r0;
             let is_int = (op.w & 0x80) != 0;
             let sz = op.w & 0x7F;
-            let mut extra = 0u16;
-            let rhs = if is_int {
+            let (rhs, rhs_de) = if is_int {
                 let v = match sz {
                     2 => cpu.read_mem(a, 16) as u16 as i16 as i64,
                     _ => cpu.read_mem(a, 32) as u32 as i32 as i64,
                 };
-                Fp80::from_i64(v)
+                (Fp80::from_i64(v), false)
             } else if sz == 4 {
-                Fp80::from_f32_bits(cpu.read_mem(a, 32) as u32, &mut extra)
+                Fp80::from_f32_bits_raw(cpu.read_mem(a, 32) as u32)
             } else {
-                Fp80::from_f64_bits(cpu.read_mem(a, 64), &mut extra)
+                Fp80::from_f64_bits_raw(cpu.read_mem(a, 64))
             };
             if !fault_pending() {
-                with_x87_mut(|st| st.binop_val(op_code, rhs, extra));
+                with_x87_mut(|st| st.binop_val(op_code, rhs, rhs_de));
             }
         }
         X87_UNARY => with_x87_mut(|st| st.exec_unary(op.r0)),
@@ -709,23 +708,22 @@ pub(super) unsafe fn exec_x87_fast(cpu: &mut Cpu, op: &FastOp) {
             let sz = op.w & 0x7F;
             let signaling = (op.r1 & 1) != 0;
             let pops = (op.r1 >> 2) & 3;
-            let mut extra = 0u16;
-            let rhs = if is_int {
+            let (rhs, rhs_de) = if is_int {
                 let v = match sz {
                     2 => cpu.read_mem(a, 16) as u16 as i16 as i64,
                     _ => cpu.read_mem(a, 32) as u32 as i32 as i64,
                 };
-                Fp80::from_i64(v)
+                (Fp80::from_i64(v), false)
             } else if sz == 4 {
-                Fp80::from_f32_bits(cpu.read_mem(a, 32) as u32, &mut extra)
+                Fp80::from_f32_bits_raw(cpu.read_mem(a, 32) as u32)
             } else {
-                Fp80::from_f64_bits(cpu.read_mem(a, 64), &mut extra)
+                Fp80::from_f64_bits_raw(cpu.read_mem(a, 64))
             };
             if !fault_pending() {
-                with_x87_mut(|st| st.compare_val(rhs, extra, signaling, pops));
+                with_x87_mut(|st| st.compare_val(rhs, rhs_de, signaling, pops));
             }
         }
-        X87_FTST => with_x87_mut(|st| st.compare_val(Fp80::zero(0), 0, true, 0)),
+        X87_FTST => with_x87_mut(|st| st.compare_val(Fp80::zero(0), false, true, 0)),
         X87_FCMOV => {
             let cond = match op.w {
                 0 => cpu.cf,

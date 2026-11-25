@@ -1981,3 +1981,76 @@ fn x87_fyl2x_near_one_and_fpatan_extended_ratio() {
     assert!((rd_f64(120) - core::f64::consts::FRAC_PI_2).abs() < 1e-15, "atan2(2^-5000, 0) = {}", rd_f64(120));
     assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, (16383 - 5000) as u16), "atan2(2^-5000, 1)");
 }
+
+/// 17. Regression: memory arithmetic (`m64`/`m32`) with a signaling NaN operand must preserve
+///     its sNaN classification into `select_nan` so an existing QNaN in `ST(0)` wins even when
+///     the memory sNaN has a larger payload, while still raising `SW.IE` (and `m64` denormal
+///     does not raise `SW.DE` when `ST(0)` is NaN).
+#[test]
+fn x87_mem_arith_preserves_snan_classification() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 256];
+    let wr_m80 = |buf: &mut [u8], off: usize, sig: u64, se: u16| {
+        buf[off..off + 8].copy_from_slice(&sig.to_le_bytes());
+        buf[off + 8..off + 10].copy_from_slice(&se.to_le_bytes());
+    };
+    // ST(0) QNaN with small payload 0x7FFF:0xC000_0000_0000_0001
+    wr_m80(&mut init, 0, 0xC000_0000_0000_0001, 0x7FFF);
+    // ST(0) sNaN with small payload 0x7FFF:0x8000_0000_0000_0001
+    wr_m80(&mut init, 16, 0x8000_0000_0000_0001, 0x7FFF);
+    // m64 sNaN with max payload: 0x7FF7_FFFF_FFFF_FFFF
+    init[32..40].copy_from_slice(&0x7FF7_FFFF_FFFF_FFFFu64.to_le_bytes());
+    // m32 sNaN with max payload: 0x7FBF_FFFF
+    init[40..44].copy_from_slice(&0x7FBF_FFFFu32.to_le_bytes());
+    // m32 QNaN with small payload: 0x7FC0_0001
+    init[44..48].copy_from_slice(&0x7FC0_0001u32.to_le_bytes());
+    // m64 subnormal: 1u64
+    init[48..56].copy_from_slice(&1u64.to_le_bytes());
+
+    let code = assemble(|a| {
+        // (a) QNaN(ST0) + sNaN(m64, larger payload) -> QNaN(ST0) preserved, SW.IE set
+        a.fninit().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fadd(qword_ptr(rcx + 32)).unwrap();
+        a.fnstsw(word_ptr(rcx + 64)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 80)).unwrap();
+
+        // (b) QNaN(ST0) + sNaN(m32, larger payload) -> QNaN(ST0) preserved, SW.IE set
+        a.fninit().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fadd(dword_ptr(rcx + 40)).unwrap();
+        a.fnstsw(word_ptr(rcx + 66)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 96)).unwrap();
+
+        // (c) sNaN(ST0) + QNaN(m32) -> QNaN(m32) wins, SW.IE set
+        a.fninit().unwrap();
+        a.fld(tbyte_ptr(rcx + 16)).unwrap();
+        a.fadd(dword_ptr(rcx + 44)).unwrap();
+        a.fnstsw(word_ptr(rcx + 68)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 112)).unwrap();
+
+        // (d) QNaN(ST0) + subnormal(m64) -> QNaN(ST0), SW.DE NOT raised
+        a.fninit().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fadd(qword_ptr(rcx + 48)).unwrap();
+        a.fnstsw(word_ptr(rcx + 70)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 128)).unwrap();
+    });
+
+    let r = run_diff_x87("mem_arith_snan_classification", &code, &init);
+    let rd_u16 = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    assert_eq!(rd_m80(80), (0xC000_0000_0000_0001, 0x7FFF), "QNaN + m64 sNaN preserves ST(0)");
+    assert_ne!(rd_u16(64) & 0x0001, 0, "QNaN + m64 sNaN raises SW.IE");
+    assert_eq!(rd_m80(96), (0xC000_0000_0000_0001, 0x7FFF), "QNaN + m32 sNaN preserves ST(0)");
+    assert_ne!(rd_u16(66) & 0x0001, 0, "QNaN + m32 sNaN raises SW.IE");
+    assert_eq!(rd_m80(112), (0xC000_0100_0000_0000, 0x7FFF), "sNaN + m32 QNaN selects m32 QNaN");
+    assert_ne!(rd_u16(68) & 0x0001, 0, "sNaN + m32 QNaN raises SW.IE");
+    assert_eq!(rd_m80(128), (0xC000_0000_0000_0001, 0x7FFF), "QNaN + m64 denormal preserves ST(0)");
+    assert_eq!(rd_u16(70) & 0x0002, 0, "QNaN + m64 denormal suppresses SW.DE");
+}
