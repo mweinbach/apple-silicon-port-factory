@@ -7720,6 +7720,7 @@ const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80C8;
 const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
 
 const ERROR_NOT_A_REPARSE_POINT: u32 = 4390;
+const ERROR_INVALID_REPARSE_DATA: u32 = 4392;
 
 #[derive(Clone, Debug)]
 struct VolumeStorageInfo {
@@ -8457,15 +8458,20 @@ pub unsafe extern "win64" fn DeviceIoControl(
                 set_err(ERROR_NOT_A_REPARSE_POINT);
                 return FALSE;
             };
-            let target_str = target.to_string_lossy().replace('/', "\\");
-            let flags: u32 = if target.is_relative() { 1 } else { 0 }; // SYMLINK_FLAG_RELATIVE
-            let sub_name = if target.is_relative() {
-                target_str.clone()
+            let (flags, sub_name, print_name) = if target.is_relative() {
+                let rel = target.to_string_lossy().replace('/', "\\");
+                (1u32, rel.clone(), rel) // SYMLINK_FLAG_RELATIVE
             } else {
-                format!("\\??\\{target_str}")
+                let win_target = path::to_win(&target)
+                    .or_else(|| std::fs::canonicalize(&target).ok().and_then(|c| path::to_win(&c)));
+                let Some(win_target) = win_target else {
+                    set_err(ERROR_INVALID_REPARSE_DATA);
+                    return FALSE;
+                };
+                (0u32, format!("\\??\\{win_target}"), win_target)
             };
             let sub_w = to_wide(&sub_name);
-            let prt_w = to_wide(&target_str);
+            let prt_w = to_wide(&print_name);
             let sub_bytes = sub_w.len() * 2;
             let prt_bytes = prt_w.len() * 2;
             let data_len = 12 + sub_bytes + prt_bytes;
@@ -11878,7 +11884,7 @@ mod tests {
             assert!(ret >= 16 && r_out[1] > 0);
             crate::kernel32::threads::CloseHandle(hf);
 
-            // Symlink FSCTL_GET_REPARSE_POINT returns valid IO_REPARSE_TAG_SYMLINK buffer.
+            // Symlink FSCTL_GET_REPARSE_POINT translates absolute host target into guest namespace.
             let wl = to_wide_z("V:\\link.bin");
             let hl = CreateFileW(wl.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
             assert_ne!(hl, INVALID_HANDLE_VALUE);
@@ -11888,7 +11894,34 @@ mod tests {
                 TRUE
             );
             assert_eq!((rp.as_ptr() as *const u32).read_unaligned(), IO_REPARSE_TAG_SYMLINK);
+            let sub_off = (rp.as_ptr().add(8) as *const u16).read_unaligned() as usize;
+            let sub_len = (rp.as_ptr().add(10) as *const u16).read_unaligned() as usize;
+            let prt_off = (rp.as_ptr().add(12) as *const u16).read_unaligned() as usize;
+            let prt_len = (rp.as_ptr().add(14) as *const u16).read_unaligned() as usize;
+            let sym_flags = (rp.as_ptr().add(16) as *const u32).read_unaligned();
+            assert_eq!(sym_flags, 0); // absolute symlink
+            let sub_s = String::from_utf16_lossy(&crate::strings::read_wide_slice(rp.as_ptr().add(20 + sub_off) as *const u16, sub_len / 2));
+            let prt_s = String::from_utf16_lossy(&crate::strings::read_wide_slice(rp.as_ptr().add(20 + prt_off) as *const u16, prt_len / 2));
+            assert_eq!(sub_s, "\\??\\V:\\disk.bin");
+            assert_eq!(prt_s, "V:\\disk.bin");
             crate::kernel32::threads::CloseHandle(hl);
+
+            // Relative symlink sets SYMLINK_FLAG_RELATIVE (1) and preserves relative path.
+            let rel_link = dir.join("rel.bin");
+            std::os::unix::fs::symlink("disk.bin", &rel_link).unwrap();
+            let wr = to_wide_z("V:\\rel.bin");
+            let hr = CreateFileW(wr.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(hr, INVALID_HANDLE_VALUE);
+            rp.fill(0);
+            assert_eq!(
+                DeviceIoControl(hr, FSCTL_GET_REPARSE_POINT, std::ptr::null(), 0, rp.as_mut_ptr() as _, 512, &mut ret, std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!((rp.as_ptr().add(16) as *const u32).read_unaligned(), 1);
+            let r_sub_len = (rp.as_ptr().add(10) as *const u16).read_unaligned() as usize;
+            let r_sub_s = String::from_utf16_lossy(&crate::strings::read_wide_slice(rp.as_ptr().add(20) as *const u16, r_sub_len / 2));
+            assert_eq!(r_sub_s, "disk.bin");
+            crate::kernel32::threads::CloseHandle(hr);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

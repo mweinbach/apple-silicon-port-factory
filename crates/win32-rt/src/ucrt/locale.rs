@@ -36,6 +36,16 @@ pub fn mb_cp() -> u32 {
     CTYPE_CP.load(Ordering::Relaxed)
 }
 
+/// Multibyte code page for an optional `_locale_t` (falling back to the current global `LC_CTYPE`).
+pub(super) unsafe fn locale_obj_cp(l: *mut c_void) -> u32 {
+    if l.is_null() {
+        mb_cp()
+    } else {
+        let obj = &*(l as *const LocaleObj);
+        if obj.entry.is_c { 0 } else { obj.entry.cp }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocaleEntry {
     is_c: bool,

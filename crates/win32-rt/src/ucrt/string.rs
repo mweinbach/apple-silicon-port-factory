@@ -24,6 +24,7 @@ pub const _CONTROL: u16 = 0x20;
 pub const _BLANK: u16 = 0x40;
 pub const _HEX: u16 = 0x80;
 pub const _ALPHA: u16 = 0x100;
+pub const _LEADBYTE: u16 = 0x8000;
 
 const fn ctype_of(c: u8) -> u16 {
     let mut t = 0;
@@ -67,39 +68,74 @@ const fn build_ctype() -> [u16; 257] {
 
 pub static CTYPE: [u16; 257] = build_ctype();
 
+/// Build and cache the 257-entry MSVC `__pctype_func` classification table (`index 0 = EOF`)
+/// for `cp`. `"C"` (`0`) and UTF-8 (`65001`) classify only ASCII bytes (`0x00..=0x7F`);
+/// SBCS/DBCS code pages classify `0x80..=0xFF` via `kernel32::string` (marking DBCS lead bytes
+/// with `_LEADBYTE` = `0x8000`).
+fn ctype_table_for_cp(cp: u32) -> &'static [u16; 257] {
+    if cp == 0 || cp == 65001 {
+        return &CTYPE;
+    }
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static TABLES: OnceLock<Mutex<HashMap<u32, &'static [u16; 257]>>> = OnceLock::new();
+    let m = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap();
+    if let Some(&tbl) = g.get(&cp) {
+        return tbl;
+    }
+    let mut tbl = CTYPE;
+    for b in 0x80u8..=0xFF {
+        let is_lead = unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, b) != 0 };
+        if is_lead {
+            tbl[b as usize + 1] = _LEADBYTE;
+            continue;
+        }
+        if let Ok(units) = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &[b], true) {
+            if units.len() == 1 {
+                tbl[b as usize + 1] = crate::kernel32::string::ctype1(units[0]) & 0x1FF;
+            }
+        }
+    }
+    let leaked: &'static [u16; 257] = Box::leak(Box::new(tbl));
+    g.insert(cp, leaked);
+    leaked
+}
+
 pub unsafe extern "win64" fn __pctype_func() -> *const u16 {
-    CTYPE.as_ptr().add(1)
+    ctype_table_for_cp(super::locale::mb_cp()).as_ptr().add(1)
 }
 pub unsafe extern "win64" fn __pwctype_func() -> *const u16 {
     CTYPE.as_ptr().add(1)
 }
 
-/// Classification of an `int` argument as ucrt does it (EOF and 0..=255).
-fn cls(c: i32) -> u16 {
+/// Classification of an `int` argument as ucrt does it (EOF and 0..=255) for `cp`.
+fn cls_cp(c: i32, cp: u32) -> u16 {
     if (-1..=255).contains(&c) {
-        let base = CTYPE[(c + 1) as usize];
-        if c >= 0x80 && !c_locale_active() {
-            // Non-C single-byte locale: we only run UTF-8, where bytes >= 0x80
-            // are lead/trail bytes and classify as nothing.
-            return 0;
-        }
-        base
+        ctype_table_for_cp(cp)[(c + 1) as usize]
     } else {
         0
     }
 }
 
+/// Classification of an `int` argument as ucrt does it (EOF and 0..=255).
+fn cls(c: i32) -> u16 {
+    cls_cp(c, super::locale::mb_cp())
+}
+
 pub unsafe extern "win64" fn _isctype(c: i32, mask: i32) -> i32 {
     (cls(c) & mask as u16) as i32
 }
-pub unsafe extern "win64" fn _isctype_l(c: i32, mask: i32, _l: *mut c_void) -> i32 {
-    _isctype(c, mask)
+pub unsafe extern "win64" fn _isctype_l(c: i32, mask: i32, l: *mut c_void) -> i32 {
+    (cls_cp(c, super::locale::locale_obj_cp(l)) & mask as u16) as i32
 }
 
 macro_rules! ctype_fn {
     ($($name:ident, $name_l:ident => $mask:expr;)*) => {$(
         pub unsafe extern "win64" fn $name(c: i32) -> i32 { (cls(c) & ($mask)) as i32 }
-        pub unsafe extern "win64" fn $name_l(c: i32, _l: *mut c_void) -> i32 { (cls(c) & ($mask)) as i32 }
+        pub unsafe extern "win64" fn $name_l(c: i32, l: *mut c_void) -> i32 {
+            (cls_cp(c, super::locale::locale_obj_cp(l)) & ($mask)) as i32
+        }
     )*};
 }
 
@@ -136,21 +172,43 @@ pub unsafe extern "win64" fn __iscsymf(c: i32) -> i32 {
     (cls(c) & _ALPHA != 0 || c == b'_' as i32) as i32
 }
 
+fn map_narrow_case(c: i32, cp: u32, to_upper: bool) -> i32 {
+    if to_upper {
+        if (b'a' as i32..=b'z' as i32).contains(&c) {
+            return c - 32;
+        }
+    } else if (b'A' as i32..=b'Z' as i32).contains(&c) {
+        return c + 32;
+    }
+    if !(0x80..=0xFF).contains(&c) || cp == 0 || cp == 65001 {
+        return c;
+    }
+    let b = c as u8;
+    if unsafe { crate::kernel32::string::IsDBCSLeadByteEx(cp, b) != 0 } {
+        return c;
+    }
+    if let Ok(units) = crate::kernel32::string::decode_cp_to_utf16_strict(cp, &[b], true) {
+        if units.len() == 1 {
+            let mapped = if to_upper { wupper(units[0]) } else { wlower(units[0]) };
+            if mapped != units[0] {
+                if let Ok((out, used)) = crate::kernel32::string::encode_utf16_to_cp(cp, &[mapped], None) {
+                    if !used && out.len() == 1 {
+                        return out[0] as i32;
+                    }
+                }
+            }
+        }
+    }
+    c
+}
+
 #[inline(never)]
 pub unsafe extern "win64" fn tolower(c: i32) -> i32 {
-    if (b'A' as i32..=b'Z' as i32).contains(&c) {
-        c + 32
-    } else {
-        c
-    }
+    map_narrow_case(c, super::locale::mb_cp(), false)
 }
 #[inline(never)]
 pub unsafe extern "win64" fn toupper(c: i32) -> i32 {
-    if (b'a' as i32..=b'z' as i32).contains(&c) {
-        c - 32
-    } else {
-        c
-    }
+    map_narrow_case(c, super::locale::mb_cp(), true)
 }
 pub unsafe extern "win64" fn _tolower(c: i32) -> i32 {
     c + 32
@@ -158,11 +216,11 @@ pub unsafe extern "win64" fn _tolower(c: i32) -> i32 {
 pub unsafe extern "win64" fn _toupper(c: i32) -> i32 {
     c - 32
 }
-pub unsafe extern "win64" fn _tolower_l(c: i32, _l: *mut c_void) -> i32 {
-    tolower(c)
+pub unsafe extern "win64" fn _tolower_l(c: i32, l: *mut c_void) -> i32 {
+    map_narrow_case(c, super::locale::locale_obj_cp(l), false)
 }
-pub unsafe extern "win64" fn _toupper_l(c: i32, _l: *mut c_void) -> i32 {
-    toupper(c)
+pub unsafe extern "win64" fn _toupper_l(c: i32, l: *mut c_void) -> i32 {
+    map_narrow_case(c, super::locale::locale_obj_cp(l), true)
 }
 
 // Wide classification
@@ -1039,6 +1097,23 @@ mod tests {
             assert_ne!(isspace(b'\n' as i32), 0);
             assert_eq!(isalpha(-1), 0);
             assert_eq!(*__pctype_func().offset(-1), 0);
+
+            // Narrow ctype & case mapping honor the active LC_CTYPE code page (CP1252 de-DE).
+            assert_eq!(isalpha(0xE4), 0); // "C" locale: ASCII-only
+            assert_eq!(isprint(0xE4), 0);
+            assert!(!crate::ucrt::locale::setlocale(0, b"de-DE\0".as_ptr()).is_null());
+            assert_ne!(isalpha(0xE4), 0); // 'ä' in CP1252
+            assert_ne!(islower(0xE4), 0);
+            assert_ne!(isprint(0xE4), 0);
+            assert_ne!(*__pctype_func().add(0xE4) & _ALPHA, 0);
+            assert_eq!(toupper(0xE4), 0xC4); // 'Ä'
+            assert_eq!(tolower(0xC4), 0xE4); // 'ä'
+            // UTF-8 locale leaves bytes >= 0x80 unclassified.
+            assert!(!crate::ucrt::locale::setlocale(0, b"en-US.utf8\0".as_ptr()).is_null());
+            assert_eq!(isalpha(0xE4), 0);
+            assert_eq!(isprint(0xE4), 0);
+            // Restore "C" locale for subsequent serial tests.
+            assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
         }
     }
     #[test]
