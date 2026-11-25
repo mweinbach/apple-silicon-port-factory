@@ -190,14 +190,27 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, want as usize);
-            let (rss, peak) = crate::kernel32::process::task_memory();
+            let (vsize, peak_vsize, rss, peak_rss) = crate::kernel32::process::task_vm_memory();
             let private_commit = crate::kernel32::memory::committed_private_bytes().max(rss);
-            std::ptr::write_unaligned(out.add(0) as *mut usize, peak as usize); // PeakVirtualSize
-            std::ptr::write_unaligned(out.add(8) as *mut usize, rss as usize); // VirtualSize
-            std::ptr::write_unaligned(out.add(24) as *mut usize, peak as usize); // PeakWorkingSetSize
+            static PEAK_PRIVATE_COMMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let peak_private = PEAK_PRIVATE_COMMIT
+                .fetch_max(private_commit, std::sync::atomic::Ordering::Relaxed)
+                .max(private_commit);
+            let mut ru: libc::rusage = std::mem::zeroed();
+            let page_faults = if libc::getrusage(libc::RUSAGE_SELF, &mut ru) == 0 {
+                (ru.ru_minflt.max(0) as u64)
+                    .saturating_add(ru.ru_majflt.max(0) as u64)
+                    .min(u32::MAX as u64) as u32
+            } else {
+                0
+            };
+            std::ptr::write_unaligned(out.add(0) as *mut usize, peak_vsize as usize); // PeakVirtualSize
+            std::ptr::write_unaligned(out.add(8) as *mut usize, vsize as usize); // VirtualSize
+            std::ptr::write_unaligned(out.add(16) as *mut u32, page_faults); // PageFaultCount
+            std::ptr::write_unaligned(out.add(24) as *mut usize, peak_rss as usize); // PeakWorkingSetSize
             std::ptr::write_unaligned(out.add(32) as *mut usize, rss as usize); // WorkingSetSize
             std::ptr::write_unaligned(out.add(72) as *mut usize, private_commit as usize); // PagefileUsage
-            std::ptr::write_unaligned(out.add(80) as *mut usize, peak.max(private_commit) as usize); // PeakPagefileUsage
+            std::ptr::write_unaligned(out.add(80) as *mut usize, peak_private as usize); // PeakPagefileUsage
             if want >= 96 {
                 std::ptr::write_unaligned(out.add(88) as *mut usize, private_commit as usize); // PrivateUsage
             }
@@ -3477,6 +3490,31 @@ mod tests {
             let mut ret = 0u32;
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 104);
+            // ProcessVmCounters VirtualSize/PeakVirtualSize reflect actual reserved virtual memory, not just RSS.
+            let before_vsize = std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize);
+            let before_rss = std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize);
+            let reserve_sz = 64usize * 1024 * 1024;
+            let reserved = crate::kernel32::memory::VirtualAlloc(
+                std::ptr::null_mut(),
+                reserve_sz,
+                crate::kernel32::memory::MEM_RESERVE,
+                crate::kernel32::memory::PAGE_NOACCESS,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
+            let after_peak_vsize = std::ptr::read_unaligned(buf.as_ptr().add(0) as *const usize);
+            let after_vsize = std::ptr::read_unaligned(buf.as_ptr().add(8) as *const usize);
+            let after_rss = std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize);
+            assert!(
+                after_vsize >= before_vsize + reserve_sz - (4 * 1024 * 1024),
+                "VirtualSize should include untouched 64 MiB reservation (before={before_vsize}, after={after_vsize})"
+            );
+            assert!(after_peak_vsize >= after_vsize);
+            assert!(after_vsize > after_rss && after_rss < before_rss + reserve_sz / 2);
+            assert_eq!(
+                crate::kernel32::memory::VirtualFree(reserved, 0, crate::kernel32::memory::MEM_RELEASE),
+                TRUE
+            );
             // ProcessTimes (4) reports the process creation timestamp matching GetProcessTimes, not boot time.
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 32);

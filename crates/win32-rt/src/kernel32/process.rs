@@ -631,23 +631,14 @@ pub unsafe extern "win64" fn SetSearchPathMode(_f: u32) -> BOOL {
     TRUE
 }
 
-pub(crate) fn task_memory() -> (u64, u64) {
-    // On iOS, Jetsam accounts against `task_vm_info.phys_footprint` (which includes Metal
-    // GPU allocations and compressed pages), whereas `resident_size` under-reports by 1-2 GiB.
-    #[cfg(target_os = "ios")]
-    {
-        let fp = crate::d3d12::mtl::process_phys_footprint();
-        if fp != 0 {
-            static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let peak = PEAK.fetch_max(fp, std::sync::atomic::Ordering::Relaxed).max(fp);
-            return (fp, peak);
-        }
-    }
-    // (resident, peak) via mach task_info(MACH_TASK_BASIC_INFO).
+/// Return `(virtual_size, peak_virtual_size, resident_size, peak_resident_size)` in bytes
+/// from Mach `MACH_TASK_BASIC_INFO` (using `phys_footprint` for resident memory on iOS).
+pub(crate) fn task_vm_memory() -> (u64, u64, u64, u64) {
+    static PEAK_VSIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     extern "C" {
         static mach_task_self_: libc::mach_port_t;
     }
-    unsafe {
+    let (vsize, mach_rss, mach_peak_rss) = unsafe {
         let mut info: libc::mach_task_basic_info = std::mem::zeroed();
         let mut count = (std::mem::size_of::<libc::mach_task_basic_info>() / std::mem::size_of::<libc::natural_t>()) as u32;
         let r = libc::task_info(
@@ -657,11 +648,37 @@ pub(crate) fn task_memory() -> (u64, u64) {
             &mut count,
         );
         if r == 0 {
-            (info.resident_size, info.resident_size_max)
+            (info.virtual_size, info.resident_size, info.resident_size_max)
         } else {
-            (0, 0)
+            (0, 0, 0)
         }
-    }
+    };
+    let peak_vsize = PEAK_VSIZE.fetch_max(vsize, Ordering::Relaxed).max(vsize);
+    let (rss, peak_rss) = {
+        // On iOS, Jetsam accounts against `task_vm_info.phys_footprint` (which includes Metal
+        // GPU allocations and compressed pages), whereas `resident_size` under-reports by 1-2 GiB.
+        #[cfg(target_os = "ios")]
+        {
+            let fp = crate::d3d12::mtl::process_phys_footprint();
+            if fp != 0 {
+                static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let peak = PEAK.fetch_max(fp, Ordering::Relaxed).max(fp);
+                (fp, peak)
+            } else {
+                (mach_rss, mach_peak_rss)
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            (mach_rss, mach_peak_rss)
+        }
+    };
+    (vsize, peak_vsize, rss, peak_rss)
+}
+
+pub(crate) fn task_memory() -> (u64, u64) {
+    let (_, _, rss, peak) = task_vm_memory();
+    (rss, peak)
 }
 
 pub unsafe extern "win64" fn K32GetProcessMemoryInfo(_h: HANDLE, out: *mut u8, cb: u32) -> BOOL {
@@ -1774,11 +1791,7 @@ struct JobState {
     job_memory_limit: usize,
     peak_process_memory: usize,
     peak_job_memory: usize,
-    ui_restrictions: u32,
-    end_of_job_time_action: u32,
     completion_port: Option<(usize, Arc<crate::kernel32::file::IoCompletionPort>)>,
-    cpu_rate_control: [u8; 8],
-    notification_limits: [u8; 72],
     group_ids: Vec<u16>,
     group_affinities: Vec<[u8; 16]>,
     members: Vec<JobMember>,
@@ -1799,11 +1812,7 @@ impl JobState {
             job_memory_limit: 0,
             peak_process_memory: 0,
             peak_job_memory: 0,
-            ui_restrictions: 0,
-            end_of_job_time_action: 0,
             completion_port: None,
-            cpu_rate_control: [0u8; 8],
-            notification_limits: [0u8; 72],
             group_ids: vec![0],
             group_affinities: Vec::new(),
             members: Vec::new(),
@@ -2162,22 +2171,29 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             TRUE
         }
         4 => {
-            // JobObjectBasicUIRestrictions (4 bytes)
+            // JobObjectBasicUIRestrictions (4 bytes): accepting 0 (no restrictions) is truthful;
+            // non-zero UI restrictions are not enforced by user32.
             if len != 4 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            st.ui_restrictions = std::ptr::read_unaligned(bytes as *const u32);
+            let mask = std::ptr::read_unaligned(bytes as *const u32);
+            if mask != 0 {
+                log::warn!("SetInformationJobObject(JobObjectBasicUIRestrictions, mask=0x{mask:x}): UI restrictions are not enforced");
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             TRUE
         }
         6 => {
-            // JobObjectEndOfJobTimeInformation (4 bytes)
+            // JobObjectEndOfJobTimeInformation (4 bytes): job time-limit expiry actions are not enforced.
             if len != 4 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            st.end_of_job_time_action = std::ptr::read_unaligned(bytes as *const u32);
-            TRUE
+            log::warn!("SetInformationJobObject(JobObjectEndOfJobTimeInformation): end-of-job-time actions are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
         }
         7 => {
             // JobObjectAssociateCompletionPortInformation (16 bytes on x64):
@@ -2255,13 +2271,15 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             TRUE
         }
         12 => {
-            // JobObjectNotificationLimitInformation (72 bytes on x64)
+            // JobObjectNotificationLimitInformation (72 bytes on x64): threshold notifications
+            // are not enforced; return an honest unsupported failure rather than silently storing.
             if len != 72 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(bytes, st.notification_limits.as_mut_ptr(), 72);
-            TRUE
+            log::warn!("SetInformationJobObject(JobObjectNotificationLimitInformation): notification limits are not enforced");
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
         }
         14 => {
             // JobObjectGroupInformationEx (array of GROUP_AFFINITY, 16 bytes each)
@@ -2288,12 +2306,21 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
         }
         15 => {
             // JobObjectCpuRateControlInformation (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION: 8 bytes:
-            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate})
+            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate}).
+            // Disabling (ControlFlags == 0) is truthful; enabling caps/weights is not enforced
+            // by the host scheduler and must fail honestly rather than pretending to cap CPU.
             if len != 8 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(bytes, st.cpu_rate_control.as_mut_ptr(), 8);
+            let control_flags = std::ptr::read_unaligned(bytes as *const u32);
+            if control_flags != 0 {
+                log::warn!(
+                    "SetInformationJobObject(JobObjectCpuRateControlInformation, flags=0x{control_flags:x}): CPU rate controls are not enforced on macOS/iOS"
+                );
+                set_err(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
             TRUE
         }
         _ => {
@@ -2420,26 +2447,21 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             TRUE
         }
         4 => {
-            // JobObjectBasicUIRestrictions (4 bytes)
+            // JobObjectBasicUIRestrictions (4 bytes): 0 = no UI restrictions active.
             if len < 4 {
                 put_ret(4);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::write_unaligned(out as *mut u32, st.ui_restrictions);
+            std::ptr::write_unaligned(out as *mut u32, 0);
             put_ret(4);
             TRUE
         }
         6 => {
-            // JobObjectEndOfJobTimeInformation (4 bytes)
-            if len < 4 {
-                put_ret(4);
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            std::ptr::write_unaligned(out as *mut u32, st.end_of_job_time_action);
-            put_ret(4);
-            TRUE
+            // JobObjectEndOfJobTimeInformation: not enforced.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
         }
         8 => {
             // JobObjectBasicAndIoAccountingInformation requires real per-job I/O counters
@@ -2487,15 +2509,10 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             TRUE
         }
         12 => {
-            // JobObjectNotificationLimitInformation (72 bytes)
-            if len < 72 {
-                put_ret(72);
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            std::ptr::copy_nonoverlapping(st.notification_limits.as_ptr(), out, 72);
-            put_ret(72);
-            TRUE
+            // JobObjectNotificationLimitInformation: not enforced.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
         }
         14 => {
             // JobObjectGroupInformationEx
@@ -2518,13 +2535,13 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             TRUE
         }
         15 => {
-            // JobObjectCpuRateControlInformation (8 bytes)
+            // JobObjectCpuRateControlInformation (8 bytes): reports disabled (all zeros).
             if len < 8 {
                 put_ret(8);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(st.cpu_rate_control.as_ptr(), out, 8);
+            std::ptr::write_bytes(out, 0, 8);
             put_ret(8);
             TRUE
         }
@@ -4077,17 +4094,31 @@ pub(crate) mod tests {
             assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(4) as *const u32), 1);
             assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(8) as *const usize), std::process::id() as usize);
 
-            // JobObjectCpuRateControlInformation (class 15) uses the 8-byte Windows ABI.
+            // JobObjectCpuRateControlInformation (class 15): validates 8-byte ABI, rejects enabled
+            // CPU caps honestly with ERROR_NOT_SUPPORTED, and accepts disabled (0) cleanly.
             let mut cpu_rate = [0u8; 8];
             std::ptr::write_unaligned(cpu_rate.as_mut_ptr() as *mut u32, 0x05u32); // ENABLE | HARD_CAP
             std::ptr::write_unaligned(cpu_rate.as_mut_ptr().add(4) as *mut u32, 5000u32); // 50%
             assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 12), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_BAD_LENGTH);
-            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 8), TRUE);
-            let mut out_cpu = [0u8; 8];
+            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 8), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            let zero_cpu = [0u8; 8];
+            assert_eq!(SetInformationJobObject(job, 15, zero_cpu.as_ptr() as *const c_void, 8), TRUE);
+            let mut out_cpu = [0xFFu8; 8];
             assert_eq!(QueryInformationJobObject(job, 15, out_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
             assert_eq!(ret_len, 8);
-            assert_eq!(out_cpu, cpu_rate);
+            assert_eq!(out_cpu, zero_cpu);
+
+            // Unenforced UI restrictions (non-zero), end-of-job-time action, and notification limits fail honestly.
+            let ui_mask = 1u32;
+            assert_eq!(SetInformationJobObject(job, 4, &ui_mask as *const u32 as *const c_void, 4), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            let ui_zero = 0u32;
+            assert_eq!(SetInformationJobObject(job, 4, &ui_zero as *const u32 as *const c_void, 4), TRUE);
+            let notif = [0u8; 72];
+            assert_eq!(SetInformationJobObject(job, 12, notif.as_ptr() as *const c_void, 72), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
 
             // Wrong struct size -> ERROR_BAD_LENGTH.
             assert_eq!(SetInformationJobObject(job, 2, ext.as_ptr() as *const c_void, 16), FALSE);
@@ -4109,25 +4140,35 @@ pub(crate) mod tests {
             in_job = FALSE;
             assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, std::ptr::null_mut(), &mut in_job), TRUE);
             assert_eq!(in_job, TRUE);
-            let mut out_cpu_after_close = [0u8; 8];
+            let mut out_basic_after_close = [0u8; 64];
             assert_eq!(
                 QueryInformationJobObject(
                     std::ptr::null_mut(),
-                    15,
-                    out_cpu_after_close.as_mut_ptr() as *mut c_void,
-                    8,
+                    2,
+                    out_basic_after_close.as_mut_ptr() as *mut c_void,
+                    64,
                     &mut ret_len,
                 ),
                 TRUE
             );
-            assert_eq!(out_cpu_after_close, cpu_rate);
+            assert_eq!(
+                std::ptr::read_unaligned(out_basic_after_close.as_ptr().add(16) as *const u32),
+                JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            );
+            assert_eq!(
+                std::ptr::read_unaligned(out_basic_after_close.as_ptr().add(40) as *const u32),
+                1
+            );
 
             // Named job objects release namespace ownership when the last handle closes.
             let jname = to_wide_z("Local\\KernelCoreNamedJobTest");
             let nj1 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
             assert!(!nj1.is_null());
             assert_eq!(crate::teb::last_error(), 0);
-            assert_eq!(SetInformationJobObject(nj1, 15, cpu_rate.as_ptr() as *const c_void, 8), TRUE);
+            let mut nj_basic = [0u8; 64];
+            std::ptr::write_unaligned(nj_basic.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+            std::ptr::write_unaligned(nj_basic.as_mut_ptr().add(40) as *mut u32, 3u32);
+            assert_eq!(SetInformationJobObject(nj1, 2, nj_basic.as_ptr() as *const c_void, 64), TRUE);
             let nj2 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
             assert!(!nj2.is_null());
             assert_eq!(crate::teb::last_error(), err::ERROR_ALREADY_EXISTS);
@@ -4140,9 +4181,9 @@ pub(crate) mod tests {
             let nj3 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
             assert!(!nj3.is_null());
             assert_eq!(crate::teb::last_error(), 0);
-            let mut fresh_cpu = [0xFFu8; 8];
-            assert_eq!(QueryInformationJobObject(nj3, 15, fresh_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
-            assert_eq!(fresh_cpu, [0u8; 8]);
+            let mut fresh_basic = [0xFFu8; 64];
+            assert_eq!(QueryInformationJobObject(nj3, 2, fresh_basic.as_mut_ptr() as *mut c_void, 64, &mut ret_len), TRUE);
+            assert_eq!(fresh_basic, [0u8; 64]);
             assert_eq!(crate::kernel32::threads::CloseHandle(nj3), TRUE);
 
             // JobObjectAssociateCompletionPortInformation (class 7) delivers real IOCP
