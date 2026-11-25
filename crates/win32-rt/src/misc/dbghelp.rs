@@ -881,6 +881,17 @@ const MINIDUMP_SYSTEM_INFO_STREAM: u32 = 7;
 const MINIDUMP_MISC_INFO_STREAM: u32 = 15;
 const MINIDUMP_MISC1_PROCESS_ID: u32 = 0x0000_0001;
 
+// MINIDUMP_TYPE flags requiring full/private process-wide memory enumeration that this writer
+// does not collect; reject honestly rather than emitting a partial dump labeled full-memory.
+const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x0000_0002;
+const MINIDUMP_WITH_PRIVATE_RW_MEMORY: u32 = 0x0000_0200;
+const MINIDUMP_WITH_FULL_MEMORY_INFO: u32 = 0x0000_0800;
+const MINIDUMP_WITH_PRIVATE_WC_MEMORY: u32 = 0x0001_0000;
+const MINIDUMP_UNSUPPORTED_MEMORY_FLAGS: u32 = MINIDUMP_WITH_FULL_MEMORY
+    | MINIDUMP_WITH_PRIVATE_RW_MEMORY
+    | MINIDUMP_WITH_FULL_MEMORY_INFO
+    | MINIDUMP_WITH_PRIVATE_WC_MEMORY;
+
 struct MdmpBuilder {
     buf: Vec<u8>,
 }
@@ -1042,6 +1053,10 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    if (dump_type & MINIDUMP_UNSUPPORTED_MEMORY_FLAGS) != 0 {
+        crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
     let my_pid = std::process::id();
     let is_self_handle = h_process.is_null()
         || (h_process as isize) == -1
@@ -1136,12 +1151,21 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     // Gather thread entries: primary/crashing thread + any other live tracked Win32 threads.
     // For additional threads, capture real CPU context + stack via SIGUSR2 / Mach thread_get_state;
     // never fabricate a zeroed CONTEXT_FULL if a thread's state cannot be captured.
+    let all_threads = crate::thread::all_threads();
     let mut thread_entries: Vec<(u32, u64, Option<(Context, Vec<u8>)>)> = Vec::new();
     let main_tid = exc_thread_id.unwrap_or(current_tid);
-    let main_teb = crate::teb::current() as u64;
+    let main_teb = if main_tid == current_tid {
+        crate::teb::current() as u64
+    } else {
+        all_threads
+            .iter()
+            .find(|t| t.tid.load(Ordering::Relaxed) as u32 == main_tid)
+            .map(|t| t.teb.load(Ordering::Relaxed) as u64)
+            .unwrap_or(0)
+    };
     let main_stack = safe_read_range(active_ctx.gpr[RSP], 64 * 1024);
     thread_entries.push((main_tid, main_teb, Some((active_ctx, main_stack))));
-    for t in crate::thread::all_threads() {
+    for t in &all_threads {
         let tid = t.tid.load(Ordering::Relaxed) as u32;
         if tid != 0 && tid != main_tid && t.exit_code().is_none() {
             let teb = t.teb.load(Ordering::Relaxed) as u64;
@@ -2778,6 +2802,155 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_stale);
             let _ = std::fs::remove_dir_all(&dir_wrong_age);
             let _ = std::fs::remove_dir_all(&dir_good);
+        }
+    }
+
+    #[test]
+    fn minidump_rejects_full_memory_and_uses_exception_thread_teb() {
+        use std::sync::atomic::AtomicU64;
+
+        unsafe extern "win64" fn worker_proc(param: *mut c_void) -> u32 {
+            let state = &*(param as *const (HANDLE, HANDLE, AtomicU64));
+            state.2.store(crate::teb::current() as u64, Ordering::Release);
+            crate::kernel32::threads::SetEvent(state.0);
+            crate::kernel32::threads::WaitForSingleObject(state.1, 10_000);
+            0
+        }
+
+        unsafe {
+            let ev_ready = crate::kernel32::threads::CreateEventW(
+                std::ptr::null_mut(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+            );
+            let ev_done = crate::kernel32::threads::CreateEventW(
+                std::ptr::null_mut(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+            );
+            let state = Box::new((ev_ready, ev_done, AtomicU64::new(0)));
+            let mut worker_tid = 0u32;
+            let h_worker = crate::kernel32::threads::CreateThread(
+                std::ptr::null_mut(),
+                0,
+                Some(worker_proc),
+                &*state as *const (HANDLE, HANDLE, AtomicU64) as *mut c_void,
+                0,
+                &mut worker_tid,
+            );
+            assert!(!h_worker.is_null());
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(ev_ready, 5_000), 0);
+            let worker_teb = state.2.load(Ordering::Acquire);
+            let caller_teb = crate::teb::current() as u64;
+            assert_ne!(worker_teb, 0);
+            assert_ne!(worker_teb, caller_teb);
+
+            let uniq = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let tmp_dir = std::env::temp_dir().join(format!("pf_mdmp_teb_{uniq}"));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            crate::path::add_mount("O:\\", &tmp_dir);
+            let wpath = crate::strings::to_wide_z("O:\\exc.dmp");
+            let h_file = crate::kernel32::file::CreateFileW(
+                wpath.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_file, INVALID_HANDLE_VALUE);
+
+            // 1. MiniDumpWithFullMemory must fail honestly with ERROR_NOT_SUPPORTED.
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    MINIDUMP_WITH_FULL_MEMORY,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // 2. Dumping an exception for `worker_tid` from the caller thread must record
+            //    `worker_teb` (not `caller_teb`) in the primary MINIDUMP_THREAD entry.
+            let mut er: ExceptionRecord = std::mem::zeroed();
+            er.code = 0xC000_0005;
+            let mut ctx = Context::zeroed();
+            ctx.context_flags = crate::unwind::CONTEXT_FULL;
+            ctx.rip = 0x14000_2000;
+            let ep = [&er as *const ExceptionRecord as usize, &ctx as *const Context as usize];
+            #[repr(C, packed(4))]
+            struct ExcInfo {
+                tid: u32,
+                ep: usize,
+                client_ptrs: i32,
+            }
+            let exc_info = ExcInfo { tid: worker_tid, ep: ep.as_ptr() as usize, client_ptrs: 0 };
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    0,
+                    &exc_info as *const ExcInfo as *const u8,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+
+            crate::kernel32::threads::SetEvent(ev_done);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(h_worker, 5_000), 0);
+            crate::kernel32::threads::CloseHandle(h_worker);
+            crate::kernel32::threads::CloseHandle(ev_ready);
+            crate::kernel32::threads::CloseHandle(ev_done);
+            drop(state);
+
+            let mut fsize: i64 = 0;
+            assert_eq!(crate::kernel32::file::GetFileSizeEx(h_file, &mut fsize), TRUE);
+            let mut new_pos: i64 = 0;
+            assert_eq!(crate::kernel32::file::SetFilePointerEx(h_file, 0, &mut new_pos, 0), TRUE);
+            let mut bytes = vec![0u8; fsize as usize];
+            let mut got = 0u32;
+            assert_eq!(
+                crate::kernel32::file::ReadFile(
+                    h_file,
+                    bytes.as_mut_ptr() as *mut c_void,
+                    bytes.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            bytes.truncate(got as usize);
+            crate::kernel32::threads::CloseHandle(h_file);
+            let _ = crate::kernel32::file::DeleteFileW(wpath.as_ptr());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+
+            let num_streams = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let dir_rva = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+            let thr_rva = (0..num_streams)
+                .find_map(|i| {
+                    let off = dir_rva + i * 12;
+                    let stype = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                    (stype == MINIDUMP_THREAD_LIST_STREAM)
+                        .then(|| u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize)
+                })
+                .expect("ThreadListStream missing");
+            let primary_tid = u32::from_le_bytes(bytes[thr_rva + 4..thr_rva + 8].try_into().unwrap());
+            let primary_teb = u64::from_le_bytes(bytes[thr_rva + 20..thr_rva + 28].try_into().unwrap());
+            assert_eq!(primary_tid, worker_tid);
+            assert_eq!(primary_teb, worker_teb, "primary MINIDUMP_THREAD must carry exception thread's TEB");
         }
     }
 }
