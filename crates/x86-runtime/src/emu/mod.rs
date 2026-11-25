@@ -21,6 +21,7 @@
 
 mod block_cache;
 mod cpu;
+mod denorm;
 mod dispatch;
 pub mod eh;
 pub mod exec_mem;

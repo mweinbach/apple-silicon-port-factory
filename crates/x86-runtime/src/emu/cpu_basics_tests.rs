@@ -353,6 +353,60 @@ fn xstate_roundtrip_across_tiers() {
 }
 
 #[test]
+fn independent_denorm_modes_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    for mode in 0..4 {
+        a.ldmxcsr(dword_ptr(rcx + 4 * mode)).unwrap();
+        a.vmovups(ymm0, ymmword_ptr(rcx + 32)).unwrap();
+        a.vmulps(ymm0, ymm0, ymmword_ptr(rcx + 64)).unwrap();
+        a.vmovups(ymmword_ptr(rcx + 96 + 32 * mode), ymm0).unwrap();
+    }
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let mut init = vec![0; 224];
+    for (i, mxcsr) in [0x1f80u32, 0x1fc0, 0x9f80, 0x9fc0].into_iter().enumerate() {
+        init[4 * i..4 * i + 4].copy_from_slice(&mxcsr.to_le_bytes());
+    }
+    for i in 0..8 {
+        let (lhs, rhs): (u32, u32) = match i % 4 {
+            0 => (1, 0x7e80_0000),
+            1 => (0x0080_0000, 0x3f00_0000),
+            2 => (0x0080_0000, 0x3f7f_ffff),
+            _ => (0x3f80_0000, 0x3f80_0000),
+        };
+        init[32 + 4 * i..36 + 4 * i].copy_from_slice(&(lhs | ((i as u32 / 4) << 31)).to_le_bytes());
+        init[64 + 4 * i..68 + 4 * i].copy_from_slice(&rhs.to_le_bytes());
+    }
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    for mask in [0, features::HostFeatures::AFP] {
+        features::without_features(mask, || {
+            run_tiers(&code, &init, |out| {
+                for mode in 0..4 {
+                    let expected = [
+                        if mode & 1 == 0 { 0x3400_0000 } else { 0 },
+                        if mode & 2 == 0 { 0x0040_0000 } else { 0 },
+                        if mode & 2 == 0 { 0x0080_0000 } else { 0 },
+                        0x3f80_0000,
+                    ];
+                    for i in 0..8 {
+                        let off = 96 + 32 * mode + 4 * i;
+                        assert_eq!(
+                            u32::from_le_bytes(out[off..off + 4].try_into().unwrap()),
+                            expected[i % 4] | ((i as u32 / 4) << 31),
+                            "mode {mode}, lane {i}, feature mask {mask}"
+                        );
+                    }
+                }
+                if let Some(control) = &oracle {
+                    assert_eq!(out, control);
+                }
+            })
+        });
+    }
+}
+
+#[test]
 fn cpuid_subleaves_and_feature_fallbacks() {
     use features::HostFeatures as H;
     let leaves = [
@@ -647,6 +701,116 @@ fn mmx_sse_dispatch_vectors() {
 }
 
 #[test]
+fn host_fpcr_survives_default_and_nondefault_guest_modes() {
+    unsafe extern "win64" fn observe() -> u64 {
+        read_fpcr()
+    }
+    const TARGET: u64 = 0x7fff_ed11_0320;
+    let saved_fpcr = read_fpcr();
+    let host = 1 << 22 | 1 << 24;
+    crate::exe::register_native_va(TARGET, observe as *const () as usize);
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.push(rbx).unwrap();
+    a.sub(rsp, 32).unwrap();
+    a.mov(rbx, rcx).unwrap();
+    for i in 0..3 {
+        a.ldmxcsr(dword_ptr(rbx + 4 * i)).unwrap();
+        a.mov(r10, TARGET).unwrap();
+        a.call(r10).unwrap();
+        a.mov(qword_ptr(rbx + 16 + 8 * i), rax).unwrap();
+        a.vmovss(xmm0, dword_ptr(rbx + 48)).unwrap();
+        a.vmulss(xmm0, xmm0, dword_ptr(rbx + 52)).unwrap();
+        a.vmovss(dword_ptr(rbx + 56 + 4 * i), xmm0).unwrap();
+    }
+    a.add(rsp, 32).unwrap();
+    a.pop(rbx).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let mut init = [0u8; 80];
+    for (i, mxcsr) in [0x1f80u32, 0x1fc0, 0x9f80].into_iter().enumerate() {
+        init[4 * i..4 * i + 4].copy_from_slice(&mxcsr.to_le_bytes());
+    }
+    init[48..52].copy_from_slice(&1u32.to_le_bytes());
+    init[52..56].copy_from_slice(&0x7e80_0000u32.to_le_bytes());
+    write_fpcr(host);
+    run_tiers(&code, &init, |out| {
+        assert_eq!(read_fpcr(), host);
+        for i in 0..3 {
+            assert_eq!(u64::from_le_bytes(out[16 + 8 * i..24 + 8 * i].try_into().unwrap()), host);
+            assert_eq!(
+                u32::from_le_bytes(out[56 + 4 * i..60 + 4 * i].try_into().unwrap()),
+                if i == 1 { 0 } else { 0x3400_0000 }
+            );
+        }
+    });
+    write_fpcr(saved_fpcr);
+    crate::exe::unregister_native_va(TARGET);
+}
+
+#[test]
+fn denormal_selection_estimates_and_dot_products() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    for mode in 0..4 {
+        a.ldmxcsr(dword_ptr(rcx + 4 * mode)).unwrap();
+        a.movups(xmm0, xmmword_ptr(rcx + 16)).unwrap();
+        a.minps(xmm0, xmmword_ptr(rcx + 32)).unwrap();
+        a.movups(xmmword_ptr(rcx + 64 + 64 * mode), xmm0).unwrap();
+        a.movups(xmm0, xmmword_ptr(rcx + 32)).unwrap();
+        a.rcpps(xmm1, xmm0).unwrap();
+        a.movups(xmmword_ptr(rcx + 80 + 64 * mode), xmm1).unwrap();
+        a.rsqrtps(xmm1, xmm0).unwrap();
+        a.movups(xmmword_ptr(rcx + 96 + 64 * mode), xmm1).unwrap();
+        a.movups(xmm0, xmmword_ptr(rcx + 48)).unwrap();
+        a.dpps(xmm0, xmm0, 0xff).unwrap();
+        a.movups(xmmword_ptr(rcx + 112 + 64 * mode), xmm0).unwrap();
+    }
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let mut init = vec![0; 320];
+    let words = [
+        0x1f80u32,
+        0x1fc0,
+        0x9f80,
+        0x9fc0,
+        0x3f80_0000,
+        0x3f80_0000,
+        0x3f80_0000,
+        0x3f80_0000,
+        0x807f_ffff,
+        0x007f_ffff,
+        0x8000_0000,
+        0x0000_0000,
+        0x1f80_0000,
+        0x1f80_0000,
+        0x1f80_0000,
+        0x1f80_0000,
+    ];
+    for (i, v) in words.into_iter().enumerate() {
+        init[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    for mask in [0, features::HostFeatures::AFP] {
+        features::without_features(mask, || {
+            run_tiers(&code, &init, |out| {
+                for mode in 0usize..4 {
+                    let at = |op: usize, lane: usize| {
+                        let p: usize = 64 + 64 * mode + 16 * op + 4 * lane;
+                        u32::from_le_bytes(out[p..p + 4].try_into().unwrap())
+                    };
+                    assert_eq!(at(0, 0), if mode & 1 != 0 { 0x8000_0000 } else { 0x807f_ffff });
+                    assert_eq!(at(1, 0), 0xff80_0000);
+                    assert_eq!(at(2, 1), 0x7f80_0000);
+                    assert_eq!(at(3, 0), if mode == 0 { 0x0080_0000 } else { 0 });
+                }
+                if let Some(control) = &oracle {
+                    assert_eq!(&out[64..], &control[64..]);
+                }
+            })
+        });
+    }
+}
+
+#[test]
 fn invalid_state_operand_resumes_from_guest_exception() {
     use std::ffi::c_void;
     use win32_rt::unwind::{Context, ExceptionRecord, STATUS_ACCESS_VIOLATION};
@@ -749,6 +913,61 @@ fn optional_unaligned_atomics_fall_back_across_tiers() {
                 assert_eq!(&out[13..21], &20u64.to_le_bytes());
                 assert_eq!(&out[32..36], &11u32.to_le_bytes());
                 assert_eq!(&out[40..48], &13u64.to_le_bytes());
+            })
+        });
+    }
+}
+
+#[test]
+fn double_precision_denormals_and_scalar_merge_lanes() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    for mode in 0..4 {
+        a.ldmxcsr(dword_ptr(rcx + 4 * mode)).unwrap();
+        a.vmovupd(ymm0, ymmword_ptr(rcx + 32)).unwrap();
+        a.vmulpd(ymm0, ymm0, ymmword_ptr(rcx + 64)).unwrap();
+        a.vmovupd(ymmword_ptr(rcx + 96 + 48 * mode), ymm0).unwrap();
+        a.vmovupd(xmm1, xmmword_ptr(rcx + 32)).unwrap();
+        a.vcvtsd2ss(xmm1, xmm1, xmm1).unwrap();
+        a.vmovups(xmmword_ptr(rcx + 128 + 48 * mode), xmm1).unwrap();
+    }
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+    let mut init = vec![0; 288];
+    for (i, v) in [0x1f80u32, 0x1fc0, 0x9f80, 0x9fc0].into_iter().enumerate() {
+        init[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let lhs = [0x8000_0001_0000_0000u64, 0x0010_0000_0000_0000, 0x8010_0000_0000_0000, 1];
+    let rhs = [0x7fd0_0000_0000_0000u64, 0x3fe0_0000_0000_0000, 0x3fef_ffff_ffff_ffff, 0x7fd0_0000_0000_0000];
+    for i in 0..4 {
+        init[32 + 8 * i..40 + 8 * i].copy_from_slice(&lhs[i].to_le_bytes());
+        init[64 + 8 * i..72 + 8 * i].copy_from_slice(&rhs[i].to_le_bytes());
+    }
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    for mask in [0, features::HostFeatures::AFP] {
+        features::without_features(mask, || {
+            run_tiers(&code, &init, |out| {
+                for mode in 0usize..4 {
+                    let base = 96 + 48 * mode;
+                    let expected = [
+                        if mode & 1 == 0 { 0xbeb0_0000_0000_0000 } else { 1 << 63 },
+                        if mode & 2 == 0 { 0x0008_0000_0000_0000 } else { 0 },
+                        if mode & 2 == 0 { 0x8010_0000_0000_0000 } else { 1 << 63 },
+                        if mode & 1 == 0 { 0x3cb0_0000_0000_0000 } else { 0 },
+                    ];
+                    for (i, word) in expected.into_iter().enumerate() {
+                        assert_eq!(
+                            u64::from_le_bytes(out[base + 8 * i..base + 8 * i + 8].try_into().unwrap()),
+                            word,
+                            "mode {mode} lane {i}"
+                        );
+                    }
+                    // Scalar conversion writes 32 bits; bits 127:32 come verbatim from VEX src1.
+                    assert_eq!(&out[base + 36..base + 48], &init[36..48]);
+                }
+                if let Some(control) = &oracle {
+                    assert_eq!(out, control);
+                }
             })
         });
     }

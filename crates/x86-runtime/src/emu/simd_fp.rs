@@ -83,9 +83,8 @@ impl Cpu {
                         OpKind::Memory => cpu.read_mem(cpu.eff_addr(ins), 32) as u32,
                         _ => 0,
                     };
-                    let x = f32::from_bits(b_bits);
-                    let r = if is_rsqrt { 1.0f32 / sse_sqrt32(x) } else { 1.0f32 / x };
-                    cpu.xmm[d] = (hi & !0xFFFF_FFFF) | (r.to_bits() as u128);
+                    let r = vops::rcp_rsqrt_ps(u128::from(b_bits), is_rsqrt) as u32;
+                    cpu.xmm[d] = (hi & !0xFFFF_FFFF) | u128::from(r);
                     if matches!(mn, Mnemonic::Vrsqrtss | Mnemonic::Vrcpss) {
                         cpu.clear_ymm_hi_reg(d);
                     }

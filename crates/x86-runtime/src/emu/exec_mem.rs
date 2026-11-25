@@ -209,8 +209,8 @@ pub unsafe fn icache_invalidate(start: *mut u8, len: usize) {
 
 /// Magic constant (`"SAOT"`) for [`StaticAotModuleDesc`].
 pub const STATIC_AOT_DESC_MAGIC: u32 = 0x5341_4F54;
-/// Version 4 records the ARM instruction features required by a static image.
-pub const STATIC_AOT_DESC_VERSION: u32 = 4;
+/// Version 5 adds the embedding FPCR slot used by native call stubs.
+pub const STATIC_AOT_DESC_VERSION: u32 = 5;
 
 /// Module descriptor flags (`StaticAotModuleDesc::flags`).
 pub const STATIC_AOT_MOD_HAS_RAS: u32 = 1 << 0;
@@ -943,7 +943,7 @@ mod tests {
             entries: entries.as_ptr(),
             module_name: name.as_ptr(),
         };
-        for version in [1, 2, 3] {
+        for version in [1, 2, 3, 4] {
             let legacy_clock = StaticAotModuleDesc { version, ..desc };
             assert!(!unsafe { register_static_aot_desc(&legacy_clock) });
         }

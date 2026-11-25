@@ -72,6 +72,7 @@ pub(in crate::emu) fn codegen_hash() -> u64 {
         const SRC: &[&[u8]] = &[
             include_bytes!("../features.rs"),
             include_bytes!("../cpuid.rs"),
+            include_bytes!("../denorm.rs"),
             include_bytes!("../mmx.rs"),
             include_bytes!("../xstate.rs"),
             include_bytes!("../jit.rs"),
