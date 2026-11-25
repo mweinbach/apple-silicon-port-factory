@@ -1958,15 +1958,60 @@ unsafe extern "win64" fn gi_get_previous_reading(
 
 unsafe extern "win64" fn gi_get_temporal_reading(
     _this: *mut GameInputObj,
-    _timestamp: u64,
-    _device: *mut DeviceObj,
+    timestamp: u64,
+    device: *mut DeviceObj,
     reading_out: *mut *mut ReadingObj,
 ) -> i32 {
-    if !reading_out.is_null() {
-        std::ptr::write_unaligned(reading_out, std::ptr::null_mut());
+    if reading_out.is_null() {
+        return E_POINTER;
     }
-    crate::stub!("IGameInput::GetTemporalReading -> E_NOTIMPL");
-    E_NOTIMPL
+    std::ptr::write_unaligned(reading_out, std::ptr::null_mut());
+    // Per Microsoft Learn IGameInput::GetTemporalReading: device must be non-null.
+    if device.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(dev_kind) = lookup_device_kind(device) else {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    };
+
+    // Search the device's recorded history for the reading active at `timestamp`
+    // (the latest reading with `timestamp_us <= timestamp`).
+    {
+        let st = runtime_state().lock().unwrap();
+        let mut oldest_for_dev: Option<u64> = None;
+        let mut best: Option<&ReadingSnapshot> = None;
+        for entry in st.history.iter().filter(|e| e.device_kind == dev_kind) {
+            if oldest_for_dev.is_none() {
+                oldest_for_dev = Some(entry.timestamp_us);
+            }
+            if entry.timestamp_us <= timestamp {
+                best = Some(entry);
+            }
+        }
+        if let Some(found) = best {
+            std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+            return S_OK;
+        }
+        if oldest_for_dev.is_some() {
+            // Requested timestamp precedes all buffered readings for this device.
+            return GAMEINPUT_E_READING_NOT_FOUND;
+        }
+    }
+
+    // No history yet for this device: poll live once and return if its timestamp <= requested timestamp.
+    let kind_for_dev = match dev_kind {
+        DeviceKind::Keyboard => GAME_INPUT_KIND_KEYBOARD,
+        DeviceKind::Mouse => GAME_INPUT_KIND_MOUSE,
+        DeviceKind::Gamepad(_) => GAME_INPUT_KIND_GAMEPAD,
+    };
+    if let Some((dk, actual_kind, payload)) = poll_matching_live(kind_for_dev, Some(dev_kind)) {
+        let snap = runtime_state().lock().unwrap().record_or_reuse(dk, actual_kind, payload);
+        if snap.timestamp_us <= timestamp {
+            std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
+            return S_OK;
+        }
+    }
+    GAMEINPUT_E_READING_NOT_FOUND
 }
 
 unsafe extern "win64" fn gi_register_reading_callback(
@@ -2905,6 +2950,62 @@ mod tests {
             assert_eq!(disp_dispatch_fn(disp, 1000), 0);
             assert_eq!(disp_rel(disp), 0);
 
+            assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
+
+    #[test]
+    fn get_temporal_reading_finds_matching_history_snapshot() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        unsafe {
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "TemporalPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            let mut gi_raw = 0usize;
+            assert_eq!(GameInputCreate(&mut gi_raw), S_OK);
+            let gi = gi_raw as *mut GameInputObj;
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+
+            // Null device -> E_INVALIDARG.
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(gi_get_temporal_reading(gi, 1000, std::ptr::null_mut(), &mut out), E_INVALIDARG);
+
+            // Seed two distinct snapshots with known timestamps.
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let mut r1: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(gi_get_current_reading(gi, GAME_INPUT_KIND_GAMEPAD, dev0, &mut r1), S_OK);
+            let t1 = (*r1).snapshot.timestamp_us;
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let mut r2: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(gi_get_current_reading(gi, GAME_INPUT_KIND_GAMEPAD, dev0, &mut r2), S_OK);
+            let t2 = (*r2).snapshot.timestamp_us;
+            assert!(t2 > t1);
+
+            // Timestamp before t1 -> GAMEINPUT_E_READING_NOT_FOUND.
+            assert_eq!(gi_get_temporal_reading(gi, t1.saturating_sub(1), dev0, &mut out), GAMEINPUT_E_READING_NOT_FOUND);
+
+            // Timestamp at t1 (or between t1 and t2) -> returns r1 (A pressed).
+            assert_eq!(gi_get_temporal_reading(gi, t1, dev0, &mut out), S_OK);
+            let mut gs = GameInputGamepadState::default();
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_A, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            // Timestamp >= t2 -> returns r2 (B pressed).
+            assert_eq!(gi_get_temporal_reading(gi, t2 + 1000, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_B, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(rd_release(r1), 0);
+            assert_eq!(rd_release(r2), 0);
             assert_eq!(gi_release(gi), 0);
         }
 

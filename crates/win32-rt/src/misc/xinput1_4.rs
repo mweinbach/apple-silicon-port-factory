@@ -19,6 +19,7 @@
 //! * no deadzone is applied (games apply their own),
 //! * `dwPacketNumber` changes only when the state changes.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -111,6 +112,165 @@ pub struct BatteryInformation {
     pub level: u8,
 }
 
+/// `XINPUT_KEYSTROKE` (8 bytes, `Xinput.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Keystroke {
+    pub virtual_key: u16,
+    pub unicode: u16,
+    pub flags: u16,
+    pub user_index: u8,
+    pub hid_code: u8,
+}
+const _: () = assert!(std::mem::size_of::<Keystroke>() == 8);
+
+pub const XINPUT_KEYSTROKE_KEYDOWN: u16 = 0x0001;
+pub const XINPUT_KEYSTROKE_KEYUP: u16 = 0x0002;
+
+pub mod vk_pad {
+    pub const A: u16 = 0x5800;
+    pub const B: u16 = 0x5801;
+    pub const X: u16 = 0x5802;
+    pub const Y: u16 = 0x5803;
+    pub const RSHOULDER: u16 = 0x5804;
+    pub const LSHOULDER: u16 = 0x5805;
+    pub const LTRIGGER: u16 = 0x5806;
+    pub const RTRIGGER: u16 = 0x5807;
+    pub const DPAD_UP: u16 = 0x5810;
+    pub const DPAD_DOWN: u16 = 0x5811;
+    pub const DPAD_LEFT: u16 = 0x5812;
+    pub const DPAD_RIGHT: u16 = 0x5813;
+    pub const START: u16 = 0x5814;
+    pub const BACK: u16 = 0x5815;
+    pub const LTHUMB_PRESS: u16 = 0x5816;
+    pub const RTHUMB_PRESS: u16 = 0x5817;
+    pub const LTHUMB_UP: u16 = 0x5820;
+    pub const LTHUMB_DOWN: u16 = 0x5821;
+    pub const LTHUMB_RIGHT: u16 = 0x5822;
+    pub const LTHUMB_LEFT: u16 = 0x5823;
+    pub const LTHUMB_UPLEFT: u16 = 0x5824;
+    pub const LTHUMB_UPRIGHT: u16 = 0x5825;
+    pub const LTHUMB_DOWNRIGHT: u16 = 0x5826;
+    pub const LTHUMB_DOWNLEFT: u16 = 0x5827;
+    pub const RTHUMB_UP: u16 = 0x5830;
+    pub const RTHUMB_DOWN: u16 = 0x5831;
+    pub const RTHUMB_RIGHT: u16 = 0x5832;
+    pub const RTHUMB_LEFT: u16 = 0x5833;
+    pub const RTHUMB_UPLEFT: u16 = 0x5834;
+    pub const RTHUMB_UPRIGHT: u16 = 0x5835;
+    pub const RTHUMB_DOWNRIGHT: u16 = 0x5836;
+    pub const RTHUMB_DOWNLEFT: u16 = 0x5837;
+}
+
+const XINPUT_GAMEPAD_TRIGGER_THRESHOLD: u8 = 30;
+const XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE: i32 = 7849;
+const XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE: i32 = 8689;
+const KEYSTROKE_QUEUE_CAP: usize = 64;
+
+fn thumb_vk(x: i16, y: i16, deadzone: i32, base: u16) -> Option<u16> {
+    let xi = x as i32;
+    let yi = y as i32;
+    let pos_x = xi > deadzone;
+    let neg_x = xi < -deadzone;
+    let pos_y = yi > deadzone;
+    let neg_y = yi < -deadzone;
+    match (pos_y, neg_y, pos_x, neg_x) {
+        (true, false, false, false) => Some(base),     // UP
+        (false, true, false, false) => Some(base + 1), // DOWN
+        (false, false, true, false) => Some(base + 2), // RIGHT
+        (false, false, false, true) => Some(base + 3), // LEFT
+        (true, false, false, true) => Some(base + 4),  // UPLEFT
+        (true, false, true, false) => Some(base + 5),  // UPRIGHT
+        (false, true, true, false) => Some(base + 6),  // DOWNRIGHT
+        (false, true, false, true) => Some(base + 7),  // DOWNLEFT
+        _ => None,
+    }
+}
+
+fn push_keystroke(q: &mut VecDeque<Keystroke>, ks: Keystroke) {
+    if q.len() >= KEYSTROKE_QUEUE_CAP {
+        q.pop_front();
+    }
+    q.push_back(ks);
+}
+
+fn diff_gamepad_keystrokes(user: u8, prev: Gamepad, next: Gamepad, q: &mut VecDeque<Keystroke>) {
+    const BUTTON_MAP: &[(u16, u16)] = &[
+        (btn::A, vk_pad::A),
+        (btn::B, vk_pad::B),
+        (btn::X, vk_pad::X),
+        (btn::Y, vk_pad::Y),
+        (btn::RIGHT_SHOULDER, vk_pad::RSHOULDER),
+        (btn::LEFT_SHOULDER, vk_pad::LSHOULDER),
+        (btn::DPAD_UP, vk_pad::DPAD_UP),
+        (btn::DPAD_DOWN, vk_pad::DPAD_DOWN),
+        (btn::DPAD_LEFT, vk_pad::DPAD_LEFT),
+        (btn::DPAD_RIGHT, vk_pad::DPAD_RIGHT),
+        (btn::START, vk_pad::START),
+        (btn::BACK, vk_pad::BACK),
+        (btn::LEFT_THUMB, vk_pad::LTHUMB_PRESS),
+        (btn::RIGHT_THUMB, vk_pad::RTHUMB_PRESS),
+    ];
+    for &(mask, vk) in BUTTON_MAP {
+        let was = (prev.buttons & mask) != 0;
+        let now = (next.buttons & mask) != 0;
+        if was != now {
+            push_keystroke(
+                q,
+                Keystroke {
+                    virtual_key: vk,
+                    unicode: 0,
+                    flags: if now { XINPUT_KEYSTROKE_KEYDOWN } else { XINPUT_KEYSTROKE_KEYUP },
+                    user_index: user,
+                    hid_code: 0,
+                },
+            );
+        }
+    }
+    for (was_t, now_t, vk) in [
+        (prev.left_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, next.left_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, vk_pad::LTRIGGER),
+        (prev.right_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, next.right_trigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD, vk_pad::RTRIGGER),
+    ] {
+        if was_t != now_t {
+            push_keystroke(
+                q,
+                Keystroke {
+                    virtual_key: vk,
+                    unicode: 0,
+                    flags: if now_t { XINPUT_KEYSTROKE_KEYDOWN } else { XINPUT_KEYSTROKE_KEYUP },
+                    user_index: user,
+                    hid_code: 0,
+                },
+            );
+        }
+    }
+    for (prev_dir, next_dir) in [
+        (
+            thumb_vk(prev.thumb_lx, prev.thumb_ly, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, vk_pad::LTHUMB_UP),
+            thumb_vk(next.thumb_lx, next.thumb_ly, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, vk_pad::LTHUMB_UP),
+        ),
+        (
+            thumb_vk(prev.thumb_rx, prev.thumb_ry, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, vk_pad::RTHUMB_UP),
+            thumb_vk(next.thumb_rx, next.thumb_ry, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, vk_pad::RTHUMB_UP),
+        ),
+    ] {
+        if prev_dir != next_dir {
+            if let Some(old_vk) = prev_dir {
+                push_keystroke(
+                    q,
+                    Keystroke { virtual_key: old_vk, unicode: 0, flags: XINPUT_KEYSTROKE_KEYUP, user_index: user, hid_code: 0 },
+                );
+            }
+            if let Some(new_vk) = next_dir {
+                push_keystroke(
+                    q,
+                    Keystroke { virtual_key: new_vk, unicode: 0, flags: XINPUT_KEYSTROKE_KEYDOWN, user_index: user, hid_code: 0 },
+                );
+            }
+        }
+    }
+}
+
 /// Static facts about a connected device (from the backend).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceInfo {
@@ -128,6 +288,7 @@ struct Slot {
     pad: Gamepad,
     packet: u32,
     vibration: (u16, u16),
+    keystrokes: VecDeque<Keystroke>,
 }
 
 #[derive(Clone, Default)]
@@ -136,6 +297,7 @@ struct VirtualPadState {
     pad: Gamepad,
     packet: u32,
     vibration: (u16, u16),
+    keystrokes: VecDeque<Keystroke>,
 }
 
 static SLOTS: Mutex<[Option<Slot>; XUSER_MAX_COUNT]> = Mutex::new([None, None, None, None]);
@@ -152,6 +314,7 @@ static VIRTUAL_PAD: Mutex<VirtualPadState> = Mutex::new(VirtualPadState {
     },
     packet: 0,
     vibration: (0, 0),
+    keystrokes: VecDeque::new(),
 });
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -193,6 +356,7 @@ pub fn backend_disconnect(user: usize) {
         s.connected = false;
         s.pad = Gamepad::default();
         s.vibration = (0, 0);
+        s.keystrokes.clear();
         was
     });
     if was_connected {
@@ -204,8 +368,10 @@ pub fn backend_disconnect(user: usize) {
 pub fn backend_update(user: usize, pad: Gamepad) {
     with_slot(user, |s| {
         if s.connected && s.pad != pad {
+            let prev = s.pad;
             s.pad = pad;
             s.packet = s.packet.wrapping_add(1);
+            diff_gamepad_keystrokes(user as u8, prev, pad, &mut s.keystrokes);
         }
     });
 }
@@ -248,10 +414,16 @@ pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
         } else if v.connected && !connected {
             log::info!("xinput: virtual touch-overlay gamepad disconnected");
         }
+        let prev = v.pad;
         v.connected = connected;
         v.pad = if connected { pad } else { Gamepad::default() };
         if changed {
             v.packet = v.packet.wrapping_add(1);
+            if connected {
+                diff_gamepad_keystrokes(0, prev, v.pad, &mut v.keystrokes);
+            } else {
+                v.keystrokes.clear();
+            }
         }
         let stop_phone = if !connected && v.vibration != (0, 0) {
             v.vibration = (0, 0);
@@ -428,6 +600,7 @@ fn connected(user: u32) -> Result<Slot, u32> {
                     pad: v.pad,
                     packet: v.packet,
                     vibration: v.vibration,
+                    keystrokes: VecDeque::new(),
                 });
             }
             (None, false) => return Err(ERROR_DEVICE_NOT_CONNECTED),
@@ -595,17 +768,39 @@ pub unsafe extern "win64" fn XInputGetBatteryInformation(user: u32, dev_type: u8
     ERROR_SUCCESS
 }
 
-pub unsafe extern "win64" fn XInputGetKeystroke(user: u32, _r: u32, _k: *mut c_void) -> u32 {
-    if user as usize >= XUSER_MAX_COUNT && user != 0xFF {
+pub unsafe extern "win64" fn XInputGetKeystroke(user: u32, _r: u32, k: *mut c_void) -> u32 {
+    if k.is_null() || (user as usize >= XUSER_MAX_COUNT && user != 0xFF) {
         return ERROR_BAD_ARGUMENTS;
     }
     ensure_started();
-    let any_phys = SLOTS.lock().unwrap().iter().enumerate().any(|(i, s)| (user == 0xFF || i == user as usize) && s.as_ref().is_some_and(|s| s.connected));
-    let any_virt = (user == 0xFF || user == 0) && VIRTUAL_PAD.lock().unwrap().connected;
+    let mut slots = SLOTS.lock().unwrap();
+    let mut virt = VIRTUAL_PAD.lock().unwrap();
+    let any_phys = slots
+        .iter()
+        .enumerate()
+        .any(|(i, s)| (user == 0xFF || i == user as usize) && s.as_ref().is_some_and(|s| s.connected));
+    let any_virt = (user == 0xFF || user == 0) && virt.connected;
     if !any_phys && !any_virt {
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-    stub!("XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)");
+    if !ENABLED.load(Ordering::Acquire) {
+        return ERROR_EMPTY;
+    }
+    let range = if user == 0xFF { 0..XUSER_MAX_COUNT } else { (user as usize)..(user as usize + 1) };
+    for idx in range {
+        if let Some(slot) = slots[idx].as_mut().filter(|s| s.connected) {
+            if let Some(ks) = slot.keystrokes.pop_front() {
+                (k as *mut Keystroke).write_unaligned(ks);
+                return ERROR_SUCCESS;
+            }
+        }
+        if idx == 0 && virt.connected {
+            if let Some(ks) = virt.keystrokes.pop_front() {
+                (k as *mut Keystroke).write_unaligned(ks);
+                return ERROR_SUCCESS;
+            }
+        }
+    }
     ERROR_EMPTY
 }
 
@@ -676,7 +871,33 @@ mod tests {
             let mut bi = BatteryInformation::default();
             assert_eq!(XInputGetBatteryInformation(3, 0, &mut bi), ERROR_SUCCESS);
             assert_eq!((bi.ty, bi.level), (BATTERY_TYPE_NIMH, 1)); // 0.3 -> LOW
+
+            // XInputGetKeystroke returns queued button, trigger, and thumbstick events.
+            let mut ks = Keystroke::default();
+            // Drain events queued by earlier update(s) on slot 3: A + LTRIGGER + LTHUMB_LEFT
+            let mut got_vks = Vec::new();
+            while XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                assert_eq!(ks.user_index, 3);
+                got_vks.push((ks.virtual_key, ks.flags));
+            }
+            assert!(got_vks.contains(&(vk_pad::A, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert!(got_vks.contains(&(vk_pad::LTRIGGER, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert!(got_vks.contains(&(vk_pad::LTHUMB_LEFT, XINPUT_KEYSTROKE_KEYDOWN)));
+            assert_eq!(XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void), ERROR_EMPTY);
+
+            // Release all -> KEYUP events delivered via XUSER_INDEX_ANY (0xFF).
+            backend_update(3, Gamepad::default());
+            let mut up_vks = Vec::new();
+            while XInputGetKeystroke(0xFF, 0, &mut ks as *mut _ as *mut c_void) == ERROR_SUCCESS {
+                assert_eq!(ks.user_index, 3);
+                up_vks.push((ks.virtual_key, ks.flags));
+            }
+            assert!(up_vks.contains(&(vk_pad::A, XINPUT_KEYSTROKE_KEYUP)));
+            assert!(up_vks.contains(&(vk_pad::LTRIGGER, XINPUT_KEYSTROKE_KEYUP)));
+            assert!(up_vks.contains(&(vk_pad::LTHUMB_LEFT, XINPUT_KEYSTROKE_KEYUP)));
+
             backend_disconnect(3);
+            assert_eq!(XInputGetKeystroke(3, 0, &mut ks as *mut _ as *mut c_void), ERROR_DEVICE_NOT_CONNECTED);
             assert_eq!(XInputGetState(3, &mut st), ERROR_DEVICE_NOT_CONNECTED);
             assert_eq!(XInputSetState(3, &mut v), ERROR_DEVICE_NOT_CONNECTED);
         }
