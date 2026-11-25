@@ -818,7 +818,7 @@ pub unsafe extern "win64" fn SendMessageW(hwnd: HWND, msg: u32, wparam: WPARAM, 
 /// converted, everything else passes through.
 pub unsafe extern "win64" fn SendMessageA(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        wm::SETTEXT if lparam != 0 => {
+        wm::SETTEXT | wm::EM_REPLACESEL if lparam != 0 => {
             let w = crate::strings::to_wide_z(&crate::strings::from_ansi(lparam as *const u8));
             send_message(hwnd as usize, msg, wparam, w.as_ptr() as LPARAM)
         }
@@ -827,6 +827,20 @@ pub unsafe extern "win64" fn SendMessageA(hwnd: HWND, msg: u32, wparam: WPARAM, 
             let n = send_message(hwnd as usize, msg, wparam, buf.as_mut_ptr() as LPARAM).max(0) as usize;
             let s = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
             crate::strings::write_ansi_trunc(&s, lparam as *mut u8, wparam).1 as LRESULT
+        }
+        wm::EM_GETLINE if lparam != 0 => {
+            let max_chars = (lparam as *const u16).read_unaligned() as usize;
+            if max_chars == 0 {
+                return 0;
+            }
+            let mut wbuf = vec![0u16; max_chars];
+            wbuf[0] = max_chars.min(u16::MAX as usize) as u16;
+            let n = send_message(hwnd as usize, msg, wparam, wbuf.as_mut_ptr() as LPARAM).max(0) as usize;
+            let s = String::from_utf16_lossy(&wbuf[..n.min(wbuf.len())]);
+            let bytes = s.as_bytes();
+            let copy_n = bytes.len().min(max_chars);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), lparam as *mut u8, copy_n);
+            copy_n as LRESULT
         }
         _ => send_message(hwnd as usize, msg, wparam, lparam),
     }

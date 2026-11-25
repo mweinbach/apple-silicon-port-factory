@@ -406,6 +406,97 @@ async_op!(window_minimize(minimize: bool) => window_minimize);
 async_op!(window_set_title(title: String) => window_set_title);
 async_op!(window_activate() => window_activate);
 
+// ---------------------------------------------------------------------------
+// Native child controls (BUTTON / EDIT / STATIC) — all FIFO dispatch_async
+// ---------------------------------------------------------------------------
+
+/// Built-in USER32 control class mapped to a native AppKit view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeControlKind {
+    Button,
+    Edit,
+    Static,
+}
+
+/// Snapshot of a Win32 child control's initial properties for native creation.
+#[derive(Clone, Debug)]
+pub struct NativeControlDesc {
+    pub kind: NativeControlKind,
+    /// Control rect in the root top-level window's client pixel coordinates.
+    pub rect: RECT,
+    pub style: u32,
+    pub exstyle: u32,
+    pub text: String,
+    pub enabled: bool,
+    pub visible: bool,
+}
+
+macro_rules! async_ctrl_op {
+    ($name:ident ( $($a:ident : $t:ty),* ) => $imp:ident) => {
+        pub fn $name(hwnd: usize, $($a: $t),*) {
+            #[cfg(target_os = "macos")]
+            run_async(move || appkit::$imp(hwnd, $($a),*));
+            #[cfg(not(target_os = "macos"))]
+            let _ = (hwnd, $($a),*);
+        }
+    };
+}
+
+async_ctrl_op!(control_create(parent_hwnd: usize, desc: NativeControlDesc) => control_create);
+async_ctrl_op!(control_destroy() => control_destroy);
+async_ctrl_op!(control_set_frame(rect: RECT) => control_set_frame);
+async_ctrl_op!(control_set_text(text: String) => control_set_text);
+async_ctrl_op!(control_set_visible(visible: bool) => control_set_visible);
+pub fn control_set_enabled(hwnd: usize, enabled: bool) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::SetEnabled(hwnd, enabled));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_set_enabled(hwnd, enabled));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (hwnd, enabled);
+}
+async_ctrl_op!(control_set_readonly(readonly: bool) => control_set_readonly);
+async_ctrl_op!(control_set_selection(start: usize, end: usize) => control_set_selection);
+async_ctrl_op!(control_set_limit(limit: usize) => control_set_limit);
+pub fn control_focus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::Focus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_focus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn control_unfocus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::Unfocus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_unfocus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn window_clear_control_focus(hwnd: usize) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::ClearWindowFocus(hwnd));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::window_clear_control_focus(hwnd));
+    #[cfg(not(target_os = "macos"))]
+    let _ = hwnd;
+}
+
+pub fn control_set_password_mode(hwnd: usize, masked: bool) {
+    #[cfg(test)]
+    record_control_op(RecordedControlOp::SetPasswordMode(hwnd, masked));
+    #[cfg(target_os = "macos")]
+    run_async(move || appkit::control_set_password_mode(hwnd, masked));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (hwnd, masked);
+}
+async_ctrl_op!(control_set_check(state: u32) => control_set_check);
+async_ctrl_op!(control_set_style(style: u32) => control_set_style);
+async_ctrl_op!(control_set_icon(payload: Option<crate::user32::cursor::IconPayload>) => control_set_icon);
+
 pub(crate) fn register_shared(hwnd: usize, s: Arc<WindowShared>) {
     shared_map().lock().unwrap().insert(hwnd, s);
 }
@@ -583,4 +674,53 @@ pub fn progress_window_close() {
     if active() {
         let _ = run_sync(appkit::progress_window_close);
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedControlOp {
+    Focus(usize),
+    Unfocus(usize),
+    ClearWindowFocus(usize),
+    SetPasswordMode(usize, bool),
+    SetEnabled(usize, bool),
+}
+
+#[cfg(test)]
+fn control_op_log() -> &'static Mutex<Option<Vec<RecordedControlOp>>> {
+    static LOG: OnceLock<Mutex<Option<Vec<RecordedControlOp>>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn record_control_op(op: RecordedControlOp) {
+    if let Ok(mut guard) = control_op_log().lock() {
+        if let Some(ref mut v) = *guard {
+            v.push(op);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_control_ops<R>(f: impl FnOnce() -> R) -> (R, Vec<RecordedControlOp>) {
+    {
+        let mut guard = control_op_log().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Vec::new());
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = control_op_log().lock() {
+                *guard = None;
+            }
+        }
+    }
+    let _reset = Reset;
+    let res = f();
+    let ops = control_op_log()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    (res, ops)
 }

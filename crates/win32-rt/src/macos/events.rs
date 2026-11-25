@@ -19,12 +19,45 @@ thread_local! {
 pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
     let ty = ev.r#type();
     match ty {
-        NSEventType::KeyDown | NSEventType::KeyUp | NSEventType::FlagsChanged => match translate_key(ev) {
-            KeyAction::Forward => app.sendEvent(ev),
-            KeyAction::Key(k) => input::native_key(k),
-            KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
-            KeyAction::Ignore => {}
-        },
+        NSEventType::KeyDown | NSEventType::KeyUp | NSEventType::FlagsChanged => {
+            if let Some((edit_hwnd, wants_return)) = super::appkit::focused_native_edit_info(ev, mtm) {
+                let has_cmd = ev.modifierFlags().contains(NSEventModifierFlags::Command);
+                match classify_edit_key(ty, ev.keyCode(), has_cmd, wants_return) {
+                    EditKeyRoute::DialogToWin32 => match translate_key(ev) {
+                        KeyAction::Forward => app.sendEvent(ev),
+                        KeyAction::Key(k) => input::native_key_for_hwnd(edit_hwnd, k),
+                        KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
+                        KeyAction::Ignore => {}
+                    },
+                    EditKeyRoute::ModifierBoth => {
+                        match translate_key(ev) {
+                            KeyAction::Key(k) => input::native_key_for_hwnd(edit_hwnd, k),
+                            KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
+                            KeyAction::Forward | KeyAction::Ignore => {}
+                        }
+                        app.sendEvent(ev);
+                    }
+                    EditKeyRoute::CommandToAppKit => {
+                        app.sendEvent(ev);
+                        super::appkit::sync_focused_edit_selection(ev, mtm);
+                    }
+                    EditKeyRoute::AppKitEditWithWin32State => {
+                        if let KeyAction::Key(k) = translate_key(ev) {
+                            input::native_key_state_only(k);
+                        }
+                        app.sendEvent(ev);
+                        super::appkit::sync_focused_edit_selection(ev, mtm);
+                    }
+                }
+                return;
+            }
+            match translate_key(ev) {
+                KeyAction::Forward => app.sendEvent(ev),
+                KeyAction::Key(k) => input::native_key(k),
+                KeyAction::CapsToggle(mac) => input::native_caps_toggle(mac),
+                KeyAction::Ignore => {}
+            }
+        }
         NSEventType::MouseMoved
         | NSEventType::LeftMouseDragged
         | NSEventType::RightMouseDragged
@@ -54,13 +87,23 @@ pub(super) fn handle(app: &NSApplication, ev: &NSEvent, mtm: MainThreadMarker) {
                 }
             };
             input::native_mouse(NativeMouse::Button { hwnd, client, screen, button, down, clicks: ev.clickCount() as i64 });
+            if down && matches!(button, MouseButton::Left) {
+                super::appkit::notify_static_click_if_hit(ev, mtm);
+            }
             // In relative mode the frozen pointer may sit on a title bar;
             // don't let AppKit start a window drag from game clicks.
             if !crate::user32::cursor::relative_mode() || hwnd == 0 {
                 app.sendEvent(ev);
+                if matches!(button, MouseButton::Left) {
+                    super::appkit::sync_focused_edit_selection(ev, mtm);
+                }
             }
         }
         NSEventType::ScrollWheel => {
+            if super::appkit::wheel_targets_native_control(ev, mtm) {
+                app.sendEvent(ev);
+                return;
+            }
             let (_, _, screen) = locate(ev, mtm);
             let (dy, dx) = wheel_notches(ev);
             let (ay, ax) = WHEEL_ACC.with(|a| {
@@ -124,6 +167,43 @@ fn modifier_mask(mac: u16) -> Option<usize> {
         0x3E => 0x2000, // right control
         _ => return None,
     })
+}
+
+/// How a keyboard event should be routed when a native AppKit `EDIT` control
+/// holds first-responder focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditKeyRoute {
+    /// Escape, Tab, or Return without `ES_WANTRETURN`: route to Win32 so
+    /// `IsDialogMessage` handles dialog cancel/navigation/default-button logic.
+    DialogToWin32,
+    /// Modifier key transitions (`FlagsChanged`): update Win32 key state and
+    /// forward to AppKit so both `Shift+Tab` and AppKit text editing stay in sync.
+    ModifierBoth,
+    /// Command shortcut (Cmd+C/V/X/A/Z/Q/H): forward directly to AppKit.
+    CommandToAppKit,
+    /// Regular editing keys (typing, Backspace, Delete, arrows, or Return with
+    /// `ES_WANTRETURN`): update Win32 key state without double-posting `WM_CHAR`,
+    /// and forward to AppKit.
+    AppKitEditWithWin32State,
+}
+
+pub(super) fn classify_edit_key(
+    ty: NSEventType,
+    mac_keycode: u16,
+    has_command: bool,
+    wants_return: bool,
+) -> EditKeyRoute {
+    if ty == NSEventType::FlagsChanged {
+        return EditKeyRoute::ModifierBoth;
+    }
+    if has_command {
+        return EditKeyRoute::CommandToAppKit;
+    }
+    match mac_keycode {
+        0x35 | 0x30 => EditKeyRoute::DialogToWin32, // kVK_Escape, kVK_Tab
+        0x24 | 0x4C if !wants_return => EditKeyRoute::DialogToWin32, // kVK_Return, kVK_ANSI_KeypadEnter
+        _ => EditKeyRoute::AppKitEditWithWin32State,
+    }
 }
 
 /// What a key-class NSEvent (`keyDown:` / `keyUp:` / `flagsChanged:`)
@@ -404,6 +484,137 @@ mod tests {
             assert_eq!(inp::RegisterRawInputDevices(rm.as_ptr(), 2, 16), 1);
             window::DestroyWindow(h);
             class::UnregisterClassW(name.as_ptr(), std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn focused_edit_key_routing_preserves_dialog_keys_and_key_state() {
+        // 1. Escape & Tab always route to Win32 dialog handling regardless of ES_WANTRETURN.
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x35, false, false), EditKeyRoute::DialogToWin32);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x35, false, true), EditKeyRoute::DialogToWin32);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x30, false, false), EditKeyRoute::DialogToWin32);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x30, false, true), EditKeyRoute::DialogToWin32);
+
+        // 2. Return / Keypad Enter route to Win32 unless ES_WANTRETURN is set.
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x24, false, false), EditKeyRoute::DialogToWin32);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x4C, false, false), EditKeyRoute::DialogToWin32);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x24, false, true), EditKeyRoute::AppKitEditWithWin32State);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x4C, false, true), EditKeyRoute::AppKitEditWithWin32State);
+
+        // 3. Modifiers update both Win32 & AppKit; Command shortcuts go to AppKit; normal keys update Win32 state + AppKit.
+        assert_eq!(classify_edit_key(NSEventType::FlagsChanged, 0x38, false, false), EditKeyRoute::ModifierBoth);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x00, true, false), EditKeyRoute::CommandToAppKit);
+        assert_eq!(classify_edit_key(NSEventType::KeyDown, 0x00, false, false), EditKeyRoute::AppKitEditWithWin32State);
+
+        // 4. End-to-end Win32 check: native_key_state_only updates key state without posting WM_CHAR,
+        //    while native_key_for_hwnd(edit_hwnd, Escape) triggers IsDialogMessageW -> IDCANCEL.
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static LAST_CMD_ID: AtomicUsize = AtomicUsize::new(0);
+            LAST_CMD_ID.store(0, Ordering::SeqCst);
+
+            unsafe extern "win64" fn dlg_cmd_proc(
+                h: HWND,
+                m: u32,
+                w: usize,
+                l: isize,
+            ) -> isize {
+                if m == wm::COMMAND {
+                    LAST_CMD_ID.store(w & 0xFFFF, Ordering::SeqCst);
+                    return 0;
+                }
+                crate::user32::dialog::DefDlgProcW(h, m, w, l)
+            }
+
+            let cls = crate::strings::to_wide_z("TestEditDialogKeys");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: crate::user32::register_typed_host_wndproc(dlg_cmd_proc),
+                cls_extra: 0,
+                wnd_extra: 30, // DLGWINDOWEXTRA
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hdlg = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                crate::user32::ws::CAPTION | crate::user32::ws::VISIBLE,
+                0,
+                0,
+                320,
+                160,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let h_edit = window::CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("EDIT").as_ptr(),
+                crate::strings::to_wide_z("").as_ptr(),
+                crate::user32::ws::CHILD | crate::user32::ws::VISIBLE | crate::user32::ws::TABSTOP,
+                10,
+                10,
+                200,
+                24,
+                hdlg,
+                101,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let h_cancel = window::CreateWindowExW(
+                0,
+                crate::strings::to_wide_z("BUTTON").as_ptr(),
+                crate::strings::to_wide_z("Cancel").as_ptr(),
+                crate::user32::ws::CHILD | crate::user32::ws::VISIBLE | crate::user32::ws::TABSTOP,
+                10,
+                50,
+                80,
+                28,
+                hdlg,
+                2, // IDCANCEL
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hdlg.is_null() && !h_edit.is_null() && !h_cancel.is_null());
+            inp::SetFocus(h_edit);
+            drain(hdlg);
+
+            // Typing key via native_key_state_only updates GetAsyncKeyState & GetKeyState without queueing WM_KEYDOWN.
+            inp::native_key_state_only(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            assert!(inp::GetAsyncKeyState(0x41) < 0);
+            assert!(inp::GetKeyState(0x41) < 0);
+            let mut m = MSG::default();
+            assert_eq!(message::PeekMessageW(&mut m, std::ptr::null_mut(), wm::KEYDOWN, wm::CHAR, message::PM_REMOVE), 0);
+            inp::native_key_state_only(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            assert!(inp::GetAsyncKeyState(0x41) >= 0);
+
+            // Dialog Escape routed via native_key_for_hwnd(h_edit, Escape) is consumed by IsDialogMessageW -> IDCANCEL (2).
+            inp::native_key_for_hwnd(h_edit as usize, NativeKey { mac: 0x35, down: true, repeat: false, chars: vec![0x1B] });
+            assert_eq!(message::PeekMessageW(&mut m, std::ptr::null_mut(), wm::KEYDOWN, wm::KEYDOWN, message::PM_REMOVE), 1);
+            assert_eq!(m.hwnd, h_edit as usize);
+            assert_eq!(crate::user32::dialog::IsDialogMessageW(hdlg, &mut m), 1);
+            assert_eq!(LAST_CMD_ID.load(Ordering::SeqCst), 2, "Escape must trigger IDCANCEL");
+            inp::native_key_for_hwnd(h_edit as usize, NativeKey { mac: 0x35, down: false, repeat: false, chars: Vec::new() });
+
+            // Dialog Tab routed via native_key_for_hwnd(h_edit, Tab) moves focus from h_edit to h_cancel.
+            inp::native_key_for_hwnd(h_edit as usize, NativeKey { mac: 0x30, down: true, repeat: false, chars: vec![0x09] });
+            assert_eq!(message::PeekMessageW(&mut m, std::ptr::null_mut(), wm::KEYDOWN, wm::KEYDOWN, message::PM_REMOVE), 1);
+            assert_eq!(crate::user32::dialog::IsDialogMessageW(hdlg, &mut m), 1);
+            assert_eq!(inp::GetFocus(), h_cancel, "Tab must move dialog focus to next tab stop");
+            inp::native_key_for_hwnd(h_edit as usize, NativeKey { mac: 0x30, down: false, repeat: false, chars: Vec::new() });
+
+            window::DestroyWindow(hdlg);
+            class::UnregisterClassW(cls.as_ptr(), std::ptr::null_mut());
         })
         .join()
         .unwrap();
