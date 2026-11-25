@@ -936,8 +936,8 @@ fn coll(c: char, flags: u32) -> (u32, u8) {
 }
 
 pub fn compare_linguistic(a: &[u16], b: &[u16], flags: u32) -> Ordering {
-    let a_norm = normalize_collation_input(a, flags);
-    let b_norm = normalize_collation_input(b, flags);
+    let a_norm = normalize_collation_input("", a, flags);
+    let b_norm = normalize_collation_input("", b, flags);
     let (a, b) = (a_norm.as_ref(), b_norm.as_ref());
     let ignore_case = flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE) != 0;
     let filt = |s: &[u16]| -> Vec<char> {
@@ -1105,16 +1105,20 @@ const NORM_IGNOREWIDTH: u32 = 0x0002_0000;
 /// Shared ICU collator setup so `CompareStringEx`/`CompareStringW` and
 /// `LCMapStringEx(..., LCMAP_SORTKEY, ...)` always produce identical ordering.
 unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
+    let norm_ignore_case = (flags & NORM_IGNORECASE) != 0;
     let ignore_case = (flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE)) != 0;
     let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
     let ignore_symbols = (flags & NORM_IGNORESYMBOLS) != 0;
+    // `NORM_IGNORECASE` suppresses tertiary distinctions (ICU `UCOL_SECONDARY`), whereas
+    // `LINGUISTIC_IGNORECASE` alone suppresses only linguistic casing (applied in
+    // `normalize_collation_input` via locale-aware `u_strToLower`) so non-case tertiary/quaternary
+    // distinctions such as width (`A` vs `Ａ`) and kana type (`か` vs `カ`) remain intact.
     // In CLDR Japanese collation (`ja_JP`), Hiragana/Katakana and kana width are quaternary
-    // distinctions; use `UCOL_QUATERNARY` whenever full comparison is requested without shifted
-    // punctuation so kana/width distinctions stay visible unless `normalize_collation_input`
-    // explicitly folded them for `NORM_IGNOREKANATYPE`/`NORM_IGNOREWIDTH`.
+    // distinctions, so use `UCOL_QUATERNARY` when full comparison is requested without shifted
+    // punctuation.
     let strength = if ignore_diacritics {
         icu::UCOL_PRIMARY
-    } else if ignore_case {
+    } else if norm_ignore_case {
         icu::UCOL_SECONDARY
     } else if !ignore_symbols {
         icu::UCOL_QUATERNARY
@@ -1181,13 +1185,16 @@ fn append_word_sort_weights(key: &mut Vec<u8>, special: &[(u32, u8)]) {
     key.push(0x00);
 }
 
-/// Normalize width (`NORM_IGNOREWIDTH`) and/or kana type (`NORM_IGNOREKANATYPE`) before
+/// Normalize width (`NORM_IGNOREWIDTH`), kana type (`NORM_IGNOREKANATYPE`), and/or linguistic
+/// case folding (`LINGUISTIC_IGNORECASE` / `NORM_IGNORECASE | NORM_LINGUISTIC_CASING`) before
 /// collation and sort-key generation so `CompareStringEx`/`CompareStringW`, `LCMAP_SORTKEY`,
 /// and `LCMAP_HASH` agree across all flag combinations.
-fn normalize_collation_input<'a>(s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
+fn normalize_collation_input<'a>(icu_locale: &str, s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
     let ignore_width = (flags & NORM_IGNOREWIDTH) != 0;
     let ignore_kana = (flags & NORM_IGNOREKANATYPE) != 0;
-    if !ignore_width && !ignore_kana {
+    let linguistic_case = (flags & LINGUISTIC_IGNORECASE) != 0
+        || ((flags & NORM_IGNORECASE) != 0 && (flags & NORM_LINGUISTIC_CASING) != 0);
+    if !ignore_width && !ignore_kana && !linguistic_case {
         return Cow::Borrowed(s);
     }
     let mut out: Vec<u16> = if ignore_width {
@@ -1254,6 +1261,13 @@ fn normalize_collation_input<'a>(s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
         }
         out = folded;
     }
+
+    if linguistic_case {
+        // Apply locale-aware case folding without discarding non-case tertiary distinctions
+        // (fullwidth `Ａ` -> `ａ` stays distinct from `a`, and kana `か`/`カ` stay unchanged).
+        out = icu_case_map(icu_locale, LCMAP_LOWERCASE, &out)
+            .unwrap_or_else(|| out.into_iter().map(wlower).collect());
+    }
     Cow::Owned(out)
 }
 
@@ -1261,8 +1275,8 @@ fn normalize_collation_input<'a>(s: &'a [u16], flags: u32) -> Cow<'a, [u16]> {
 /// (including Windows word sort vs `SORT_STRINGSORT`, `NORM_IGNOREWIDTH`, and `NORM_IGNOREKANATYPE`),
 /// falling back to `compare_linguistic` if ICU is unavailable.
 fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) -> Ordering {
-    let lhs_norm = normalize_collation_input(lhs, flags);
-    let rhs_norm = normalize_collation_input(rhs, flags);
+    let lhs_norm = normalize_collation_input(icu_locale, lhs, flags);
+    let rhs_norm = normalize_collation_input(icu_locale, rhs, flags);
     let (lhs, rhs) = (lhs_norm.as_ref(), rhs_norm.as_ref());
     let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
@@ -1298,7 +1312,7 @@ fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) ->
 /// (including Windows word sort vs `SORT_STRINGSORT`, `NORM_IGNOREWIDTH`, and `NORM_IGNOREKANATYPE`),
 /// falling back to `sort_key` if ICU is unavailable.
 fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
-    let s_norm = normalize_collation_input(s, flags);
+    let s_norm = normalize_collation_input(icu_locale, s, flags);
     let s = s_norm.as_ref();
     let word_sort = (flags & SORT_STRINGSORT) == 0 && (flags & NORM_IGNORESYMBOLS) == 0;
     if let Some(a) = icu::api() {
@@ -1340,7 +1354,7 @@ fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
 
 /// Sort key whose `memcmp` order matches [`compare_linguistic`].
 pub fn sort_key(s: &[u16], flags: u32) -> Vec<u8> {
-    let s_norm = normalize_collation_input(s, flags);
+    let s_norm = normalize_collation_input("", s, flags);
     let s = s_norm.as_ref();
     let ignore_case = flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE) != 0;
     let chars: Vec<char> = char::decode_utf16(s.iter().copied())
@@ -4508,6 +4522,28 @@ mod tests {
             assert_eq!(get_sort_key(&ja, &ka_hira, wk), get_sort_key(&ja, &ka_half, wk));
             assert_eq!(CompareStringEx(ja.as_ptr(), wk, ga_hira.as_ptr(), -1, ga_half.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
             assert_eq!(get_sort_key(&ja, &ga_hira, wk), get_sort_key(&ja, &ga_half, wk));
+
+            // LINGUISTIC_IGNORECASE suppresses only linguistic casing while preserving width & kana.
+            let a_fw_lo = to_wide_z("ａ");
+            assert_eq!(CompareStringEx(en.as_ptr(), LINGUISTIC_IGNORECASE, a_lo.as_ptr(), -1, a_up.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&en, &a_lo, LINGUISTIC_IGNORECASE), get_sort_key(&en, &a_up, LINGUISTIC_IGNORECASE));
+            assert_eq!(CompareStringEx(en.as_ptr(), LINGUISTIC_IGNORECASE, a_fw_lo.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&en, &a_fw_lo, LINGUISTIC_IGNORECASE), get_sort_key(&en, &a_fw, LINGUISTIC_IGNORECASE));
+            assert_ne!(CompareStringEx(en.as_ptr(), LINGUISTIC_IGNORECASE, a_up.as_ptr(), -1, a_fw.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&en, &a_up, LINGUISTIC_IGNORECASE), get_sort_key(&en, &a_fw, LINGUISTIC_IGNORECASE));
+            assert_ne!(CompareStringEx(en.as_ptr(), LINGUISTIC_IGNORECASE, ka_hira.as_ptr(), -1, ka_kata.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_ne!(get_sort_key(&en, &ka_hira, LINGUISTIC_IGNORECASE), get_sort_key(&en, &ka_kata, LINGUISTIC_IGNORECASE));
+            // Turkish linguistic casing under LINGUISTIC_IGNORECASE: i == İ, ı == I, i != I.
+            let tr = to_wide_z("tr-TR");
+            let tr_i = to_wide_z("i");
+            let tr_cap_i_dot = to_wide_z("İ");
+            let tr_dotless_i = to_wide_z("ı");
+            let tr_cap_i = to_wide_z("I");
+            assert_eq!(CompareStringEx(tr.as_ptr(), LINGUISTIC_IGNORECASE, tr_i.as_ptr(), -1, tr_cap_i_dot.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&tr, &tr_i, LINGUISTIC_IGNORECASE), get_sort_key(&tr, &tr_cap_i_dot, LINGUISTIC_IGNORECASE));
+            assert_eq!(CompareStringEx(tr.as_ptr(), LINGUISTIC_IGNORECASE, tr_dotless_i.as_ptr(), -1, tr_cap_i.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&tr, &tr_dotless_i, LINGUISTIC_IGNORECASE), get_sort_key(&tr, &tr_cap_i, LINGUISTIC_IGNORECASE));
+            assert_ne!(CompareStringEx(tr.as_ptr(), LINGUISTIC_IGNORECASE, tr_i.as_ptr(), -1, tr_cap_i.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
         }
     }
 
