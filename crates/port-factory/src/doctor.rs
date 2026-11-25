@@ -14,7 +14,7 @@ use crate::ops_db::{catalog_stats, format_tsv as format_ops_tsv};
 use crate::stub_inventory::{
     check_no_new_stubs_against_file, format_inventory_tsv, scan_workspace_stubs,
 };
-use crate::win32_db::{mask_non_code, ImplKind, Win32Database};
+use crate::win32_db::{catalog_rust_items, ImplKind, Win32Database};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -336,7 +336,12 @@ fn catalog_source_errors<'a>(
     let mut errors = Vec::new();
     for file in source_files.collect::<BTreeSet<_>>() {
         let path = Path::new(file);
-        if path.is_absolute() || !root.join(path).is_file() {
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            || !root.join(path).is_file()
+        {
             errors.push(format!(
                 "catalog source_file does not resolve in the workspace: {file}"
             ));
@@ -347,8 +352,9 @@ fn catalog_source_errors<'a>(
     // EXTRA_EXPORTS[decorated name] row names an element of a generated table.
     let mut modules = BTreeMap::<&str, BTreeSet<String>>::new();
     for path in rust_paths.collect::<BTreeSet<_>>() {
+        // An indexed export can contain punctuation, including double colons.
         let item = path.split('[').next().unwrap_or(path);
-        let Some((module, name)) = item
+        let Some((module, _)) = item
             .strip_prefix("win32_rt::")
             .and_then(|p| p.rsplit_once("::"))
         else {
@@ -362,13 +368,9 @@ fn catalog_source_errors<'a>(
             let src = fs::read_to_string(base.with_extension("rs"))
                 .or_else(|_| fs::read_to_string(base.join("mod.rs")))
                 .unwrap_or_default();
-            let code = mask_non_code(src.split("#[cfg(test)]").next().unwrap_or(""));
-            String::from_utf8_lossy(&code)
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
+            catalog_rust_items(src.split("#[cfg(test)]").next().unwrap_or(""))
         });
+        let name = &path["win32_rt::".len() + module.len() + 2..];
         if !identifiers.contains(name) {
             errors.push(format!(
                 "Win32 rust_path has no matching source item: {path}"
@@ -437,6 +439,24 @@ fn check_catalogs(
     status_doc: Option<&Path>,
     fix: bool,
 ) -> Result<DoctorDbReport> {
+    let win_db = Win32Database::from_workspace_src(workspace_root)?;
+    let stubs = scan_workspace_stubs(workspace_root)?;
+    let mut catalog_errors = catalog_source_errors(
+        workspace_root,
+        crate::ops_db::OPS_CATALOG
+            .iter()
+            .map(|r| r.source_file)
+            .chain(win_db.entries.iter().map(|e| e.source_file.as_str()))
+            .chain(stubs.iter().map(|e| e.file.as_str())),
+        win_db.entries.iter().map(|e| e.rust_path.as_str()),
+    );
+    if fix && !catalog_errors.is_empty() {
+        return Ok(DoctorDbReport {
+            items: Vec::new(),
+            catalog_errors,
+        });
+    }
+
     // 1. x86-64 -> ARM64 Ops Database
     let ops_expected = format_ops_tsv();
     let st = catalog_stats();
@@ -463,7 +483,6 @@ fn check_catalogs(
     )?;
 
     // 2. Win32 API Database
-    let win_db = Win32Database::from_workspace_src(workspace_root)?;
     let win_expected = win_db.format_tsv();
     let dll_count: BTreeSet<&str> = win_db.entries.iter().map(|e| e.dll.as_str()).collect();
     let win_item = check_or_fix_single(
@@ -521,7 +540,6 @@ fn check_catalogs(
     )?;
 
     // 5. Static Stub Inventory + zero-new-stub regression guard
-    let stubs = scan_workspace_stubs(workspace_root)?;
     let stub_tsv_path = db_dir.join("stub_inventory.tsv");
     // Always enforce the zero-new-stub policy (even in --fix mode!) so `doctor --fix`
     // can never silently bless newly added `stub!`/`failing!` sites.
@@ -538,15 +556,6 @@ fn check_catalogs(
         fix,
     )?;
 
-    let mut catalog_errors = catalog_source_errors(
-        workspace_root,
-        crate::ops_db::OPS_CATALOG
-            .iter()
-            .map(|r| r.source_file)
-            .chain(win_db.entries.iter().map(|e| e.source_file.as_str()))
-            .chain(stubs.iter().map(|e| e.file.as_str())),
-        win_db.entries.iter().map(|e| e.rust_path.as_str()),
-    );
     if let Some(doc) = status_doc {
         let a64_rows = |file: &str| -> Result<usize> {
             let path = db_dir.join(file);
@@ -601,7 +610,7 @@ mod tests {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(
             file,
-            "fn Working() {} // Removed\nstatic EXTRA_EXPORTS: () = ();",
+            "fn Working() { Removed(); } // Removed\nexports![Removed];\nstatic EXTRA_EXPORTS: &[Export] = &[Export { name: \"?decorated\", ptr: Working }];",
         )
         .unwrap();
         let errors = catalog_source_errors(
@@ -610,13 +619,19 @@ mod tests {
             [
                 "win32_rt::example::Working",
                 "win32_rt::example::EXTRA_EXPORTS[?decorated]",
+                "win32_rt::example::EXTRA_EXPORTS[missing]",
                 "win32_rt::example::Removed",
                 "win32_rt::old_module::Working",
             ]
             .into_iter(),
         );
-        assert_eq!(errors.len(), 3, "{errors:?}");
-        for missing in ["deleted.rs", "example::Removed", "old_module::Working"] {
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        for missing in [
+            "deleted.rs",
+            "example::Removed",
+            "old_module::Working",
+            "EXTRA_EXPORTS[missing]",
+        ] {
             assert!(errors.iter().any(|e| e.contains(missing)));
         }
     }
