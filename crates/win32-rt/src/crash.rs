@@ -253,17 +253,21 @@ pub struct GuestWalk {
 }
 
 /// Lookup `.pdata` for `pc` without blocking or running guest callbacks.
-/// Returns `(image_base, unwind_pc, runtime_function)`.
-fn lookup_pdata(pc: u64, is_return_addr: bool) -> Option<(u64, u64, pe_image::RuntimeFunction)> {
+/// Returns `(image_base, unwind_pc, runtime_function, allow_epilog)`.
+///
+/// When `unwind_pc` is adjusted back by 1 byte into a preceding `call` instruction,
+/// `allow_epilog` is `false` so operand bytes inside `call` (e.g. `0xC3` in
+/// `FF 53 C3` / `call [rbx-0x3d]`) are never decoded as epilogue instructions.
+fn lookup_pdata(pc: u64, is_return_addr: bool) -> Option<(u64, u64, pe_image::RuntimeFunction, bool)> {
     if pc < 0x1000 || pc == EMU_RET_SENTINEL {
         return None;
     }
     if is_return_addr {
         let prev = pc.saturating_sub(1);
         if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(prev) {
-            return Some((base, prev, rf));
+            return Some((base, prev, rf, false));
         }
-        return unwind::lookup_function_entry_no_callbacks(pc).map(|(b, rf)| (b, pc, rf));
+        return unwind::lookup_function_entry_no_callbacks(pc).map(|(b, rf)| (b, pc, rf, false));
     }
     if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(pc) {
         let begin = base.wrapping_add(rf.begin_rva as u64);
@@ -272,19 +276,19 @@ fn lookup_pdata(pc: u64, is_return_addr: bool) -> Option<(u64, u64, pe_image::Ru
             if pc == begin {
                 if let Some((pbase, prf)) = unwind::lookup_function_entry_no_callbacks(prev) {
                     if pbase.wrapping_add(prf.end_rva as u64) == pc {
-                        return Some((pbase, prev, prf));
+                        return Some((pbase, prev, prf, false));
                     }
                 }
             } else {
-                return Some((base, prev, rf));
+                return Some((base, prev, rf, false));
             }
         }
-        return Some((base, pc, rf));
+        return Some((base, pc, rf, true));
     }
     if follows_call(pc) {
         let prev = pc.saturating_sub(1);
         if let Some((base, rf)) = unwind::lookup_function_entry_no_callbacks(prev) {
-            return Some((base, prev, rf));
+            return Some((base, prev, rf, false));
         }
     }
     None
@@ -328,13 +332,13 @@ pub unsafe fn walk_in_detailed(ctx: &Context, ranges: &[(u64, u64)], max: usize)
         if in_pe {
             let mut next = cur;
             match pdata {
-                Some((base, lookup_pc, rf)) => {
+                Some((base, lookup_pc, rf, allow_epilog)) => {
                     out.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "pdata" });
                     if !in_stack(rsp) || read_u64(rsp).is_none() {
                         complete = false;
                         break;
                     }
-                    if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next) {
+                    if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next, allow_epilog) {
                         complete = false;
                         break;
                     }
@@ -481,7 +485,7 @@ pub fn walk_guest_state(
         }
         let rsp = cur.gpr[RSP];
         match pdata {
-            Some((base, lookup_pc, rf)) => {
+            Some((base, lookup_pc, rf, allow_epilog)) => {
                 frames.push(WalkFrame { pc: cur.rip, in_pe: true, unwound_by: "pdata" });
                 used_pdata = true;
                 if !in_stack(rsp) || read_u64(rsp).is_none() {
@@ -489,7 +493,7 @@ pub fn walk_guest_state(
                     break;
                 }
                 let mut next = cur;
-                if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next) {
+                if !unwind::safe_virtual_unwind(base, lookup_pc, rf, &mut next, allow_epilog) {
                     complete = false;
                     break;
                 }
@@ -1907,6 +1911,48 @@ mod tests {
         let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
         assert_eq!(frames.len(), 1);
         assert!(!complete, "corrupted non-call return address must mark walk incomplete");
+    }
+
+    #[test]
+    fn walk_guest_state_does_not_decode_epilog_inside_call_ending_in_c3() {
+        // Reproduces `FF 53 C3` (`call [rbx - 0x3d]`) ending in 0xC3 (`ret`):
+        // unwinding with `pc - 1` must apply the caller's .pdata unwind codes
+        // (skipping the 0x28-byte local frame) instead of decoding `0xC3` as an epilog.
+        let mut img = vec![0x90u8; 0x1000];
+        // fn0: 0x0100..0x0140, call at 0x011d..0x0120 = FF 53 C3, return PC = 0x0120
+        img[0x011d..0x0120].copy_from_slice(&[0xFF, 0x53, 0xC3]);
+        // fn1: 0x0200..0x0240, call at 0x021d..0x0220 = FF 53 C3, return PC = 0x0220
+        img[0x021d..0x0220].copy_from_slice(&[0xFF, 0x53, 0xC3]);
+        // UNWIND_INFO at 0x0800: sub rsp, 0x28 (UWOP_ALLOC_SMALL info=4)
+        img[0x0800..0x0806].copy_from_slice(&[1, 0x08, 1, 0, 0x08, (4 << 4) | 2]);
+
+        let base = img.as_ptr() as u64;
+        let mut table = [
+            pe_image::RuntimeFunction { begin_rva: 0x0100, end_rva: 0x0140, unwind_rva: 0x0800 },
+            pe_image::RuntimeFunction { begin_rva: 0x0200, end_rva: 0x0240, unwind_rva: 0x0800 },
+        ];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), table.len() as u32, base), 1);
+        }
+
+        // stack[0..5] = fn0's 0x28-byte local frame (zeros); stack[5] = return into fn1;
+        // stack[6..11] = fn1's 0x28-byte local frame (zeros); stack[11] = EMU_RET_SENTINEL.
+        let mut stack = vec![0u64; 24];
+        stack[5] = base + 0x0220;
+        stack[11] = EMU_RET_SENTINEL;
+        let lo = stack.as_ptr() as u64;
+        let hi = lo + (stack.len() as u64) * 8;
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = lo;
+
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(lo, hi)], 16);
+        unsafe {
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+        let pcs: Vec<u64> = walk.frames.iter().map(|f| f.pc).collect();
+        assert_eq!(pcs, vec![base + 0x0120, base + 0x0220], "walk={walk:?}");
+        assert_eq!(walk.method, "pdata");
+        assert!(walk.complete);
     }
 
     #[test]

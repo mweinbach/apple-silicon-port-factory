@@ -1061,11 +1061,16 @@ fn interpret_epilog_safe(mut pc: u64, ctx: &mut Context) -> bool {
 /// Fault-safe single-frame x86-64 `.pdata` unwinder for crash reports and `SIGUSR2`
 /// thread snapshots. Every memory read goes through `mach_vm_read_overwrite` (`safe_rd`),
 /// so corrupt stacks or invalid `.pdata` entries return `false` instead of faulting.
+///
+/// Set `allow_epilog = false` when `pc` was adjusted back by 1 byte into the preceding
+/// `call` instruction (return addresses): an operand byte like `0xC3` inside `call` is
+/// not an instruction boundary and must not trigger epilogue decoding.
 pub(crate) fn safe_virtual_unwind(
     base: u64,
     pc: u64,
     mut f: RuntimeFunction,
     ctx: &mut Context,
+    allow_epilog: bool,
 ) -> bool {
     let mut frame = ctx.gpr[RSP];
     let mut mach_frame = false;
@@ -1091,7 +1096,7 @@ pub(crate) fn safe_virtual_unwind(
         let prolog_offset = if pc >= fbegin && pc < fbegin.wrapping_add(prolog as u64) {
             pc - fbegin
         } else {
-            if first && is_inside_epilog_safe(pc, base, &f) {
+            if first && allow_epilog && is_inside_epilog_safe(pc, base, &f) {
                 return interpret_epilog_safe(pc, ctx);
             }
             u64::MAX
