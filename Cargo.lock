@@ -728,6 +728,9 @@ dependencies = [
  "iced-x86",
  "pe-image",
  "port-manifest",
+ "quote",
+ "syn 2.0.119",
+ "x86-runtime",
 ]
 
 [[package]]
