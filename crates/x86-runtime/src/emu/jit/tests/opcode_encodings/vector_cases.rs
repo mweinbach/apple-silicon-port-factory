@@ -625,6 +625,8 @@ fn register_fp_and_crypto(cases: &mut Cases) {
         (true, 1, 27, 19, "frintm_float", "frintm d27, d19"),
         (true, 2, 27, 19, "frintp_float", "frintp d27, d19"),
         (true, 3, 27, 19, "frintz_float", "frintz d27, d19"),
+        (false, 4, 27, 19, "frinti_float", "frinti s27, s19"),
+        (true, 4, 27, 19, "frinti_float", "frinti d27, d19"),
         (true, 9, 28, 20, "frintm_float", "frintm d28, d20"),
     ] {
         cases.check("s_frint", &[(stem, asm)], move |a| {
@@ -641,6 +643,8 @@ fn register_fp_and_crypto(cases: &mut Cases) {
         (true, 1, 27, 19, "frintm_advsimd", "frintm v27.2d, v19.2d"),
         (true, 2, 27, 19, "frintp_advsimd", "frintp v27.2d, v19.2d"),
         (true, 3, 27, 19, "frintz_advsimd", "frintz v27.2d, v19.2d"),
+        (false, 4, 27, 19, "frinti_advsimd", "frinti v27.4s, v19.4s"),
+        (true, 4, 27, 19, "frinti_advsimd", "frinti v27.2d, v19.2d"),
         (false, 10, 28, 20, "frintp_advsimd", "frintp v28.4s, v20.4s"),
     ] {
         cases.check("v_frint", &[(stem, asm)], move |a| {

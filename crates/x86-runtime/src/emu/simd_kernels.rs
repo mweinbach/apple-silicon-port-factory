@@ -754,8 +754,17 @@ pub(in crate::emu) fn cmp_pd(a: u128, b: u128, imm: u8) -> u128 {
 }
 
 #[inline(always)]
-pub(in crate::emu) fn round_f32(f: f32, imm: u8) -> f32 {
-    match imm & 3 {
+fn resolve_round_mode(imm: u8, mxcsr: u32) -> u8 {
+    if (imm & 4) != 0 {
+        ((mxcsr >> 13) & 3) as u8
+    } else {
+        imm & 3
+    }
+}
+
+#[inline(always)]
+pub(in crate::emu) fn round_f32(f: f32, imm: u8, mxcsr: u32) -> f32 {
+    match resolve_round_mode(imm, mxcsr) {
         0 => f.round_ties_even(),
         1 => f.floor(),
         2 => f.ceil(),
@@ -764,8 +773,8 @@ pub(in crate::emu) fn round_f32(f: f32, imm: u8) -> f32 {
 }
 
 #[inline(always)]
-pub(in crate::emu) fn round_f64(f: f64, imm: u8) -> f64 {
-    match imm & 3 {
+pub(in crate::emu) fn round_f64(f: f64, imm: u8, mxcsr: u32) -> f64 {
+    match resolve_round_mode(imm, mxcsr) {
         0 => f.round_ties_even(),
         1 => f.floor(),
         2 => f.ceil(),
@@ -774,11 +783,12 @@ pub(in crate::emu) fn round_f64(f: f64, imm: u8) -> f64 {
 }
 
 #[inline(always)]
-pub(in crate::emu) fn round_ps(a: u128, imm: u8) -> u128 {
+pub(in crate::emu) fn round_ps(a: u128, imm: u8, mxcsr: u32) -> u128 {
+    let rm = resolve_round_mode(imm, mxcsr);
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let x = qf(a);
-        fq(match imm & 3 {
+        fq(match rm {
             0 => vrndnq_f32(x),
             1 => vrndmq_f32(x),
             2 => vrndpq_f32(x),
@@ -790,18 +800,19 @@ pub(in crate::emu) fn round_ps(a: u128, imm: u8) -> u128 {
         let mut out = 0u128;
         for lane in 0..4 {
             let f = f32::from_bits((a >> (lane * 32)) as u32);
-            out |= (round_f32(f, imm).to_bits() as u128) << (lane * 32);
+            out |= (round_f32(f, rm, 0).to_bits() as u128) << (lane * 32);
         }
         out
     }
 }
 
 #[inline(always)]
-pub(in crate::emu) fn round_pd(a: u128, imm: u8) -> u128 {
+pub(in crate::emu) fn round_pd(a: u128, imm: u8, mxcsr: u32) -> u128 {
+    let rm = resolve_round_mode(imm, mxcsr);
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let x = qd(a);
-        dq(match imm & 3 {
+        dq(match rm {
             0 => vrndnq_f64(x),
             1 => vrndmq_f64(x),
             2 => vrndpq_f64(x),
@@ -813,7 +824,7 @@ pub(in crate::emu) fn round_pd(a: u128, imm: u8) -> u128 {
         let mut out = 0u128;
         for lane in 0..2 {
             let f = f64::from_bits((a >> (lane * 64)) as u64);
-            out |= (round_f64(f, imm).to_bits() as u128) << (lane * 64);
+            out |= (round_f64(f, rm, 0).to_bits() as u128) << (lane * 64);
         }
         out
     }
@@ -2311,6 +2322,14 @@ pub(in crate::emu) fn vpermilps_var(v: u128, ctrl: u128) -> u128 {
     }
 }
 
+/// Variable-control `vpermilpd`: bit 1 of each 64-bit control lane selects qword 0 or 1 of `v`.
+#[inline(always)]
+pub(in crate::emu) fn vpermilpd_var(v: u128, ctrl: u128) -> u128 {
+    let q0 = ((v >> ((((ctrl as u64) >> 1) & 1) as u32 * 64)) as u64) as u128;
+    let q1 = ((v >> (((((ctrl >> 64) as u64) >> 1) & 1) as u32 * 64)) as u64) as u128;
+    q0 | (q1 << 64)
+}
+
 #[inline(always)]
 pub(in crate::emu) fn vpermd_ymm(i_lo: u128, i_hi: u128, t_lo: u128, t_hi: u128) -> (u128, u128) {
     #[cfg(target_arch = "aarch64")]
@@ -3014,43 +3033,70 @@ pub(in crate::emu) fn f16_to_f32_bits(h: u16) -> u32 {
             sign | f.to_bits()
         }
     } else if exp == 0x1F {
-        sign | 0x7F80_0000 | (mant << 13)
+        let quiet = if mant != 0 { 0x0040_0000 } else { 0 };
+        sign | 0x7F80_0000 | quiet | (mant << 13)
     } else {
         sign | ((exp + 112) << 23) | (mant << 13)
     }
 }
 
 #[inline(always)]
-pub(in crate::emu) fn f32_to_f16_bits(bits: u32) -> u16 {
+pub(in crate::emu) fn f32_to_f16_bits(bits: u32, rmode: u8, daz: bool) -> u16 {
+    let sign_bit = (bits >> 31) != 0;
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x007F_FFFF;
     if exp == 0xFF {
-        if mant != 0 {
+        return if mant != 0 {
             sign | 0x7E00 | ((mant >> 13) as u16)
         } else {
             sign | 0x7C00
+        };
+    }
+    if exp == 0 && (mant == 0 || daz) {
+        return sign;
+    }
+    let overflow_mag: u16 = match rmode {
+        0 => 0x7C00,
+        1 => if sign_bit { 0x7C00 } else { 0x7BFF },
+        2 => if sign_bit { 0x7BFF } else { 0x7C00 },
+        _ => 0x7BFF,
+    };
+    if exp > 142 {
+        return sign | overflow_mag;
+    }
+    let round_up = |q: u32, rem: u32, half: u32| -> bool {
+        match rmode {
+            0 => rem > half || (rem == half && (q & 1) != 0),
+            1 => sign_bit && rem != 0,
+            2 => !sign_bit && rem != 0,
+            _ => false,
         }
-    } else if exp > 142 {
-        sign | 0x7C00
-    } else if exp < 113 {
+    };
+    if exp < 113 {
         // Subnormal half-precision range: smallest normal f16 is 2^-14 (f32 exp 113),
         // half-way to smallest subnormal 2^-24 is 2^-25 (f32 exp 102).
         if exp < 102 {
-            sign
+            // Strictly 0 < |x| < 2^-25: rounds to +-0 under RN/RZ, +-2^-24 under directed toward sign.
+            let inc = (rmode == 1 && sign_bit) || (rmode == 2 && !sign_bit);
+            sign | (inc as u16)
         } else {
             let sig = mant | 0x0080_0000;
             let tot = (126 - exp) as u32; // 14..=24
             let q = sig >> tot;
             let half = 1u32 << (tot - 1);
             let rem = sig & ((1u32 << tot) - 1);
-            let round_up = rem > half || (rem == half && (q & 1) != 0);
-            sign | ((q + round_up as u32) as u16)
+            sign | ((q + round_up(q, rem, half) as u32) as u16)
         }
     } else {
-        let e = ((exp - 112) as u16) << 10;
-        let m = ((mant + 0x0FFF + ((mant >> 13) & 1)) >> 13) as u16;
-        sign | (e + m)
+        let q = (((exp - 112) as u32) << 10) | (mant >> 13);
+        let rem = mant & 0x1FFF;
+        let res = q + round_up(q, rem, 0x1000) as u32;
+        if res >= 0x7C00 {
+            sign | overflow_mag
+        } else {
+            sign | (res as u16)
+        }
     }
 }
 
@@ -3072,16 +3118,18 @@ pub(in crate::emu) fn vcvtph2ps(raw: u128, is_256: bool) -> (u128, u128) {
 }
 
 #[inline(always)]
-pub(in crate::emu) fn vcvtps2ph(lo: u128, hi: u128, is_256: bool) -> u128 {
+pub(in crate::emu) fn vcvtps2ph(lo: u128, hi: u128, is_256: bool, imm: u8, mxcsr: u32) -> u128 {
+    let rmode = resolve_round_mode(imm, mxcsr);
+    let daz = (mxcsr & (1 << 6)) != 0;
     let mut packed = 0u128;
     for lane in 0..4 {
         let w32 = (lo >> (lane * 32)) as u32;
-        packed |= (f32_to_f16_bits(w32) as u128) << (lane * 16);
+        packed |= (f32_to_f16_bits(w32, rmode, daz) as u128) << (lane * 16);
     }
     if is_256 {
         for lane in 0..4 {
             let w32 = (hi >> (lane * 32)) as u32;
-            packed |= (f32_to_f16_bits(w32) as u128) << ((lane + 4) * 16);
+            packed |= (f32_to_f16_bits(w32, rmode, daz) as u128) << ((lane + 4) * 16);
         }
     }
     packed
@@ -3138,6 +3186,7 @@ pub(in crate::emu) fn pcmpstr(
     is_explicit: bool,
     is_mask: bool,
     long: bool,
+    is_vex: bool,
 ) {
     let is_words = (imm & 0x01) != 0;
     let is_signed = (imm & 0x02) != 0;
@@ -3413,7 +3462,9 @@ pub(in crate::emu) fn pcmpstr(
             }
             cpu.xmm[0] = m128;
         }
-        cpu.clear_ymm_hi_reg(0);
+        if is_vex {
+            cpu.clear_ymm_hi_reg(0);
+        }
     } else {
         let idx = if int_res2 == 0 {
             n as u64
