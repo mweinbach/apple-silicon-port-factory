@@ -1052,7 +1052,7 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     dump_type: u32,
     exception_param: *const u8,
     user_stream_param: *const u8,
-    _callback_param: *const u8,
+    callback_param: *const u8,
 ) -> BOOL {
     if h_file.is_null() || h_file == INVALID_HANDLE_VALUE {
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
@@ -1061,6 +1061,19 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     if (dump_type & MINIDUMP_UNSUPPORTED_MEMORY_FLAGS) != 0 {
         crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
         return FALSE;
+    }
+    if !callback_param.is_null() {
+        let mut raw = [0u8; 8];
+        if !crate::crash::safe_read(callback_param as u64, &mut raw) {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let cb_routine = usize::from_le_bytes(raw);
+        if cb_routine != 0 {
+            log::debug!("dbghelp: MiniDumpWriteDump with MINIDUMP_CALLBACK_INFORMATION is not supported");
+            crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
+            return FALSE;
+        }
     }
     let my_pid = std::process::id();
     let is_self_handle = h_process.is_null()
@@ -2890,6 +2903,31 @@ mod tests {
                     std::ptr::null(),
                     std::ptr::null(),
                     std::ptr::null(),
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // 1b. Non-null MINIDUMP_CALLBACK_INFORMATION with CallbackRoutine != NULL must
+            //     fail honestly with ERROR_NOT_SUPPORTED instead of silently ignoring callbacks.
+            #[repr(C)]
+            struct CallbackInfo {
+                callback_routine: usize,
+                callback_param: usize,
+            }
+            let cb_info = CallbackInfo {
+                callback_routine: 0x14000_1234,
+                callback_param: 0,
+            };
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &cb_info as *const CallbackInfo as *const u8,
                 ),
                 FALSE
             );
