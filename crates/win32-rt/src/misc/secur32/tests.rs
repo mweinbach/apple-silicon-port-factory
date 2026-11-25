@@ -1441,18 +1441,18 @@ fn query_context_cipher_info_names_creds_and_shutdown_close_notify() {
 #[test]
 fn schannel_server_inbound_accept_security_context_and_all_attributes() {
     use super::schannel::{
-        SecPkgContextBindings, SecPkgContextEapKeyBlock, SecPkgContextFlags,
-        SecPkgContextKeyInfoA, SecPkgContextLifespan, SecPkgContextNegotiationInfo,
-        SecPkgContextProtoInfoA, SecPkgContextSessionInfo, SecPkgCredCipherStrengths,
-        SecPkgCredSupportedAlgs, SCHANNEL_ALERT, SCHANNEL_SESSION, SECPKG_ATTR_AUTHORITY,
-        SECPKG_ATTR_CIPHER_STRENGTHS, SECPKG_ATTR_CLIENT_SPECIFIED_TARGET,
+        SecPkgContextBindings, SecPkgContextCertificates, SecPkgContextEapKeyBlock,
+        SecPkgContextFlags, SecPkgContextKeyInfoA, SecPkgContextLifespan,
+        SecPkgContextNegotiationInfo, SecPkgContextProtoInfoA, SecPkgContextSessionInfo,
+        SecPkgCredCipherStrengths, SecPkgCredSupportedAlgs, SCHANNEL_ALERT, SCHANNEL_SESSION,
+        SECPKG_ATTR_AUTHORITY, SECPKG_ATTR_CIPHER_STRENGTHS, SECPKG_ATTR_CLIENT_SPECIFIED_TARGET,
         SECPKG_ATTR_EAP_KEY_BLOCK, SECPKG_ATTR_ENDPOINT_BINDINGS, SECPKG_ATTR_FLAGS,
-        SECPKG_ATTR_KEY_INFO, SECPKG_ATTR_LIFESPAN, SECPKG_ATTR_LOCAL_CERT_CHAIN,
-        SECPKG_ATTR_LOCAL_CERT_CONTEXT, SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_PROTO_INFO,
-        SECPKG_ATTR_REMOTE_CERT_CHAIN, SECPKG_ATTR_ROOT_STORE, SECPKG_ATTR_SESSION_INFO,
-        SECPKG_ATTR_SUPPORTED_ALGS, SECPKG_ATTR_SUPPORTED_PROTOCOLS, SECPKG_ATTR_UNIQUE_BINDINGS,
-        SECPKG_CRED_ATTR_CIPHER_STRENGTHS, SECPKG_CRED_ATTR_SUPPORTED_ALGS, SECPKG_CRED_INBOUND,
-        SEC_E_NO_CREDENTIALS, SP_PROT_TLS1_2_SERVER, SP_PROT_TLS1_3_SERVER,
+        SECPKG_ATTR_KEY_INFO, SECPKG_ATTR_LIFESPAN, SECPKG_ATTR_LOCAL_CERT_CONTEXT,
+        SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_PROTO_INFO, SECPKG_ATTR_ROOT_STORE,
+        SECPKG_ATTR_SESSION_INFO, SECPKG_ATTR_SUPPORTED_ALGS, SECPKG_ATTR_SUPPORTED_PROTOCOLS,
+        SECPKG_ATTR_UNIQUE_BINDINGS, SECPKG_CRED_ATTR_CIPHER_STRENGTHS,
+        SECPKG_CRED_ATTR_SUPPORTED_ALGS, SECPKG_CRED_INBOUND, SEC_E_NO_CREDENTIALS,
+        SP_PROT_TLS1_2_SERVER, SP_PROT_TLS1_3_SERVER,
     };
 
     unsafe {
@@ -1812,21 +1812,67 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(eap_c.rgb_ivs, eap_s.rgb_ivs);
         assert_ne!(eap_c.rgb_keys, [0u8; 128]);
 
-        // Local cert context & chain on server, remote cert chain on client, root store, algs, strengths, protocols, session info
+        // Local cert context on server, SDK-defined 0x5F (SECPKG_ATTR_REMOTE_CERTIFICATES),
+        // 0x60 (SECPKG_ATTR_CLIENT_CERT_POLICY -> unsupported), 0x67 (SECPKG_ATTR_REMOTE_CERT_CHAIN -> PCCERT_CONTEXT)
         let mut lcert: *mut c_void = std::ptr::null_mut();
         assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_LOCAL_CERT_CONTEXT, &mut lcert as *mut _ as *mut c_void), SEC_E_OK);
         assert!(!lcert.is_null());
         crypt32::CertFreeCertificateContext(lcert);
 
-        let mut lchain: *mut c_void = std::ptr::null_mut();
-        assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_LOCAL_CERT_CHAIN, &mut lchain as *mut _ as *mut c_void), SEC_E_OK);
-        assert!(!lchain.is_null());
-        crypt32::CertFreeCertificateChain(lchain);
+        // 0x5F = SECPKG_ATTR_REMOTE_CERTIFICATES -> SecPkgContext_Certificates (length-prefixed DER chain)
+        let mut rcerts = SecPkgContextCertificates {
+            c_certs: 0,
+            cb_cert_chain: 0,
+            pb_certificate_chain: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut cli_ctx as *mut _ as *mut c_void,
+                0x5F,
+                &mut rcerts as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert!(rcerts.c_certs >= 1);
+        assert!(rcerts.cb_cert_chain > 4 && !rcerts.pb_certificate_chain.is_null());
+        let first_len = u32::from_le_bytes(
+            std::slice::from_raw_parts(rcerts.pb_certificate_chain, 4)
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(first_len, TEST_LEAF_DER.len());
+        assert_eq!(
+            std::slice::from_raw_parts(rcerts.pb_certificate_chain.add(4), first_len),
+            TEST_LEAF_DER
+        );
+        FreeContextBuffer(rcerts.pb_certificate_chain as *mut c_void);
 
-        let mut rchain: *mut c_void = std::ptr::null_mut();
-        assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_REMOTE_CERT_CHAIN, &mut rchain as *mut _ as *mut c_void), SEC_E_OK);
-        assert!(!rchain.is_null());
-        crypt32::CertFreeCertificateChain(rchain);
+        // 0x60 = SECPKG_ATTR_CLIENT_CERT_POLICY (not a local cert chain) -> SEC_E_UNSUPPORTED_FUNCTION
+        let mut policy_buf = [0u8; 32];
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut srv_ctx as *mut _ as *mut c_void,
+                0x60,
+                policy_buf.as_mut_ptr() as *mut c_void,
+            ),
+            SEC_E_UNSUPPORTED_FUNCTION
+        );
+
+        // 0x67 = SECPKG_ATTR_REMOTE_CERT_CHAIN -> PCCERT_CONTEXT whose hCertStore holds the peer chain
+        let mut rchain_cert: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut cli_ctx as *mut _ as *mut c_void,
+                0x67,
+                &mut rchain_cert as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        assert!(!rchain_cert.is_null());
+        let cc_pb = std::ptr::read_unaligned((rchain_cert as *const u8).add(8) as *const *const u8);
+        let cc_cb = std::ptr::read_unaligned((rchain_cert as *const u8).add(16) as *const u32) as usize;
+        assert_eq!(std::slice::from_raw_parts(cc_pb, cc_cb), TEST_LEAF_DER);
+        crypt32::CertFreeCertificateContext(rchain_cert);
 
         let mut rstore: *mut c_void = std::ptr::null_mut();
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_ROOT_STORE, &mut rstore as *mut _ as *mut c_void), SEC_E_OK);
@@ -1856,8 +1902,20 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         let mut sd_s = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sb_s };
         assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_s as *mut _ as *mut c_void), SEC_E_OK);
 
-        let mut alert_tok = [SCHANNEL_ALERT, 2u32, 40u32]; // FATAL handshake_failure
-        let mut sb_a = SecBuffer { cb_buffer: 12, buffer_type: SECBUFFER_TOKEN, pv_buffer: alert_tok.as_mut_ptr() as *mut c_void };
+        // Unsupported fatal/warning alerts are honestly rejected instead of emitting close_notify
+        let mut fatal_alert = [SCHANNEL_ALERT, 2u32, 42u32]; // FATAL bad_certificate
+        let mut sb_f = SecBuffer { cb_buffer: 12, buffer_type: SECBUFFER_TOKEN, pv_buffer: fatal_alert.as_mut_ptr() as *mut c_void };
+        let mut sd_f = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sb_f };
+        assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_f as *mut _ as *mut c_void), SEC_E_UNSUPPORTED_FUNCTION);
+
+        let mut warn_alert = [SCHANNEL_ALERT, 1u32, 42u32]; // WARNING non-close_notify
+        let mut sb_w = SecBuffer { cb_buffer: 12, buffer_type: SECBUFFER_TOKEN, pv_buffer: warn_alert.as_mut_ptr() as *mut c_void };
+        let mut sd_w = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sb_w };
+        assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_w as *mut _ as *mut c_void), SEC_E_UNSUPPORTED_FUNCTION);
+
+        // WARNING close_notify (type=1, number=0) succeeds and queues TLS close_notify
+        let mut close_alert = [SCHANNEL_ALERT, 1u32, 0u32];
+        let mut sb_a = SecBuffer { cb_buffer: 12, buffer_type: SECBUFFER_TOKEN, pv_buffer: close_alert.as_mut_ptr() as *mut c_void };
         let mut sd_a = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sb_a };
         assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_a as *mut _ as *mut c_void), SEC_E_OK);
 

@@ -106,9 +106,9 @@ pub(super) const SECPKG_ATTR_ISSUER_LIST_EX: u32 = 0x59;
 pub(super) const SECPKG_ATTR_CONNECTION_INFO: u32 = 0x5A;
 pub(super) const SECPKG_ATTR_EAP_KEY_BLOCK: u32 = 0x5B;
 pub(super) const SECPKG_ATTR_SESSION_INFO: u32 = 0x5D;
-pub(super) const SECPKG_ATTR_REMOTE_CERT_CHAIN: u32 = 0x5F;
-pub(super) const SECPKG_ATTR_LOCAL_CERT_CHAIN: u32 = 0x60;
+pub(super) const SECPKG_ATTR_REMOTE_CERTIFICATES: u32 = 0x5F;
 pub(super) const SECPKG_ATTR_CIPHER_INFO: u32 = 0x64;
+pub(super) const SECPKG_ATTR_REMOTE_CERT_CHAIN: u32 = 0x67;
 
 pub(super) const SECPKG_CRED_ATTR_NAMES: u32 = 1;
 pub(super) const SECPKG_CRED_ATTR_SUPPORTED_ALGS: u32 = 0x0F;
@@ -264,6 +264,14 @@ pub(super) struct SecPkgCredSupportedAlgs {
 pub(super) struct SecPkgCredCipherStrengths {
     pub(super) dw_minimum_cipher_strength: u32,
     pub(super) dw_maximum_cipher_strength: u32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct SecPkgContextCertificates {
+    pub(super) c_certs: u32,
+    pub(super) cb_cert_chain: u32,
+    pub(super) pb_certificate_chain: *mut u8,
 }
 
 #[repr(C)]
@@ -1548,18 +1556,22 @@ pub(super) unsafe fn apply_control_token_impl(
             })
             .unwrap_or(SEC_E_INVALID_HANDLE),
         Some(SCHANNEL_ALERT) => {
-            // TLS1_ALERT_WARNING (1) or TLS1_ALERT_FATAL (2)
-            let Some(alert_type) = second_word else {
+            // SCHANNEL_ALERT_TOKEN { dwTokenType(2), dwAlertType(1=WARNING|2=FATAL), dwAlertNumber }
+            let (Some(alert_type), Some(num)) = (second_word, alert_num) else {
                 return SEC_E_INVALID_TOKEN;
             };
             if alert_type != 1 && alert_type != 2 {
                 return SEC_E_INVALID_TOKEN;
             }
-            let num = alert_num.unwrap_or(0);
+            // rustls only exposes emitting a TLS warning close_notify (type=1, number=0);
+            // honestly reject fatal or other custom alerts rather than silently emitting
+            // close_notify or discarding the requested alert.
+            if alert_type != 1 || num != 0 {
+                return SEC_E_UNSUPPORTED_FUNCTION;
+            }
             CTXT_TABLE
                 .with_mut(id, |ctx| {
-                    // For close_notify (0) or any fatal alert (2), send TLS close_notify and mark shutdown pending.
-                    if (num == 0 || alert_type == 2) && !ctx.shutdown_sent && !ctx.shutdown_pending {
+                    if !ctx.shutdown_sent && !ctx.shutdown_pending {
                         ctx.conn.send_close_notify();
                         ctx.pending_shutdown_bytes = drain_tls_out(&mut ctx.conn);
                         ctx.shutdown_pending = true;
@@ -2209,7 +2221,10 @@ pub(super) unsafe fn query_context_attributes_impl(
                 unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, pkg_ptr) };
                 SEC_E_OK
             }
-            SECPKG_ATTR_REMOTE_CERT_CONTEXT => {
+            SECPKG_ATTR_REMOTE_CERT_CONTEXT | SECPKG_ATTR_REMOTE_CERT_CHAIN => {
+                // Both SECPKG_ATTR_REMOTE_CERT_CONTEXT (0x53) and SECPKG_ATTR_REMOTE_CERT_CHAIN
+                // (0x67) return a PCCERT_CONTEXT whose hCertStore contains the peer's certificate
+                // chain (freed via CertFreeCertificateContext).
                 let Some(certs) = ctx.conn.peer_certificates() else {
                     return SEC_E_NO_CREDENTIALS;
                 };
@@ -2594,80 +2609,42 @@ pub(super) unsafe fn query_context_attributes_impl(
                 }
                 SEC_E_OK
             }
-            SECPKG_ATTR_REMOTE_CERT_CHAIN => {
+            SECPKG_ATTR_REMOTE_CERTIFICATES => {
+                // Windows SDK schannel.h: 0x5F returns SecPkgContext_Certificates where
+                // pbCertificateChain (freed via FreeContextBuffer) packs each DER cert as
+                // <DWORD length (LE)> <cert DER bytes>.
                 let Some(certs) = ctx.conn.peer_certificates() else {
                     return SEC_E_NO_CREDENTIALS;
                 };
                 if certs.is_empty() {
                     return SEC_E_NO_CREDENTIALS;
                 }
-                let chain_der: Vec<Vec<u8>> = certs.iter().map(|c| c.as_ref().to_vec()).collect();
-                let verify_error = if ctx.manual_validation {
-                    crypt32::verify_peer_chain_error(
-                        &chain_der,
-                        (!ctx.target_name.is_empty()).then_some(ctx.target_name.as_str()),
-                        &ctx.extra_roots_der,
-                        ctx.no_servername_check,
-                    )
-                } else {
-                    0
-                };
-                let cert_ptr = crypt32::register_peer_cert_chain(
-                    &chain_der,
-                    PeerCertVerifyResult {
-                        cert_error: verify_error,
-                        extra_roots_der: ctx.extra_roots_der.clone(),
-                    },
-                );
-                if cert_ptr.is_null() {
-                    return SEC_E_INTERNAL_ERROR;
+                let total_bytes: usize = certs.iter().map(|c| 4 + c.as_ref().len()).sum();
+                let mem = crate::heap::alloc(total_bytes, false) as *mut u8;
+                if mem.is_null() {
+                    return SEC_E_INSUFFICIENT_MEMORY;
                 }
-                let mut chain_ctx: *mut c_void = std::ptr::null_mut();
-                let ok = unsafe {
-                    crypt32::CertGetCertificateChain(
-                        std::ptr::null_mut(),
-                        cert_ptr,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut chain_ctx,
-                    )
-                };
-                unsafe { crypt32::CertFreeCertificateContext(cert_ptr) };
-                if ok == 0 || chain_ctx.is_null() {
-                    return SEC_E_INTERNAL_ERROR;
+                let mut off = 0usize;
+                for c in certs {
+                    let der = c.as_ref();
+                    let len_le = (der.len() as u32).to_le_bytes();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(len_le.as_ptr(), mem.add(off), 4);
+                        off += 4;
+                        std::ptr::copy_nonoverlapping(der.as_ptr(), mem.add(off), der.len());
+                        off += der.len();
+                    }
                 }
-                unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, chain_ctx) };
-                SEC_E_OK
-            }
-            SECPKG_ATTR_LOCAL_CERT_CHAIN => {
-                let Some(ref der) = ctx.local_cert_der else {
-                    return SEC_E_NO_CREDENTIALS;
-                };
-                let cert_ptr = crypt32::duplicate_or_create_cert_context_der(der);
-                if cert_ptr.is_null() {
-                    return SEC_E_INTERNAL_ERROR;
+                unsafe {
+                    std::ptr::write_unaligned(
+                        p_buffer as *mut SecPkgContextCertificates,
+                        SecPkgContextCertificates {
+                            c_certs: certs.len() as u32,
+                            cb_cert_chain: total_bytes as u32,
+                            pb_certificate_chain: mem,
+                        },
+                    );
                 }
-                let mut chain_ctx: *mut c_void = std::ptr::null_mut();
-                let ok = unsafe {
-                    crypt32::CertGetCertificateChain(
-                        std::ptr::null_mut(),
-                        cert_ptr,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null_mut(),
-                        &mut chain_ctx,
-                    )
-                };
-                unsafe { crypt32::CertFreeCertificateContext(cert_ptr) };
-                if ok == 0 || chain_ctx.is_null() {
-                    return SEC_E_INTERNAL_ERROR;
-                }
-                unsafe { std::ptr::write_unaligned(p_buffer as *mut *mut c_void, chain_ctx) };
                 SEC_E_OK
             }
             SECPKG_ATTR_CONNECTION_INFO => {
