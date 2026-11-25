@@ -35,7 +35,7 @@ const BCRYPT_PAD_NONE: u32 = 0x1;
 const BCRYPT_PAD_PKCS1: u32 = 0x2;
 const BCRYPT_PAD_OAEP: u32 = 0x4;
 const BCRYPT_PAD_PSS: u32 = 0x8;
-const BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID: u32 = 0x40;
+const BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID: u32 = 0x10;
 const BCRYPT_SUPPORTED_PAD_PKCS1_ENC: u32 = 0x0000_0002;
 const BCRYPT_SUPPORTED_PAD_PKCS1_SIG: u32 = 0x0000_0004;
 const BCRYPT_SUPPORTED_PAD_OAEP: u32 = 0x0000_0008;
@@ -5896,9 +5896,33 @@ mod tests {
                     32,
                     sig.as_mut_ptr(),
                     256,
-                    BCRYPT_PAD_PKCS1 | BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID
+                    0x0000_0002 | 0x0000_0010, // BCRYPT_PAD_PKCS1 | BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID
                 ),
                 STATUS_SUCCESS
+            );
+            assert_eq!(
+                BCryptVerifySignature(
+                    h_pub,
+                    &mut sha256_pad as *mut _ as *mut c_void,
+                    h.as_mut_ptr(),
+                    32,
+                    sig.as_mut_ptr(),
+                    256,
+                    0x0000_0010, // BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID alone
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                BCryptVerifySignature(
+                    h_pub,
+                    &mut sha256_pad as *mut _ as *mut c_void,
+                    h.as_mut_ptr(),
+                    32,
+                    sig.as_mut_ptr(),
+                    256,
+                    0x0000_0040, // invalid padding flag
+                ),
+                STATUS_INVALID_PARAMETER
             );
 
             assert_eq!(BCryptDestroyKey(h_priv), STATUS_SUCCESS);
