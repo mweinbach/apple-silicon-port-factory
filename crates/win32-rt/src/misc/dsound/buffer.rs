@@ -112,6 +112,7 @@ pub(super) const DSBCAPS_CTRLFREQUENCY: u32 = 0x0000_0020;
 pub(super) const DSBCAPS_CTRLPAN: u32 = 0x0000_0040;
 pub(super) const DSBCAPS_CTRLVOLUME: u32 = 0x0000_0080;
 pub(super) const DSBCAPS_CTRLPOSITIONNOTIFY: u32 = 0x0000_0100;
+pub(super) const DSBCAPS_CTRLFX: u32 = 0x0000_0200;
 pub(super) const DSBCAPS_MUTE3DATMAXDISTANCE: u32 = 0x0002_0000;
 
 // DSBPLAY / DSBSTATUS / DSBLOCK flags
@@ -133,7 +134,358 @@ pub(super) const DSBVOLUME_MAX: i32 = 0;
 pub(super) const DSBSIZE_MIN: u32 = 4;
 pub(super) const DSBSIZE_MAX: u32 = 0x0FFF_FFFF;
 pub(super) const DSBPN_OFFSETSTOP: u32 = 0xFFFF_FFFF;
+pub(super) const DSFX_LOCHARDWARE: u32 = 1;
+pub(super) const DSFXR_LOCSOFTWARE: u32 = 2;
 pub(super) const DSFXR_FAILED: u32 = 4;
+pub(super) const DSFXR_UNKNOWN: u32 = 5;
+
+// Standard DirectSound 8 FX CLSIDs (<dsound.h>)
+pub(super) const GUID_DSFX_STANDARD_GARGLE: GUID =
+    GUID::new(0xDAFD_8210, 0x5711, 0x4B91, [0x9F, 0xE3, 0xF7, 0x5B, 0x7A, 0xE2, 0x79, 0xBF]);
+pub(super) const GUID_DSFX_STANDARD_CHORUS: GUID =
+    GUID::new(0xEFE6_629C, 0x81F7, 0x4281, [0xBD, 0x91, 0xC9, 0xD6, 0x04, 0xA9, 0x5A, 0xF6]);
+pub(super) const GUID_DSFX_STANDARD_FLANGER: GUID =
+    GUID::new(0xEFCA_3D92, 0xDFD8, 0x4672, [0xA6, 0x03, 0x74, 0x20, 0x89, 0x4B, 0xAD, 0x98]);
+pub(super) const GUID_DSFX_STANDARD_ECHO: GUID =
+    GUID::new(0xEF3E_932C, 0xD40B, 0x4F51, [0x8C, 0xCF, 0x3F, 0x98, 0xF1, 0xB2, 0x9D, 0x5D]);
+pub(super) const GUID_DSFX_STANDARD_DISTORTION: GUID =
+    GUID::new(0xEF11_4C90, 0xCD1D, 0x484E, [0x96, 0xE5, 0x09, 0xCF, 0xAF, 0x91, 0x2A, 0x21]);
+pub(super) const GUID_DSFX_STANDARD_COMPRESSOR: GUID =
+    GUID::new(0xEF01_1F79, 0x4000, 0x406D, [0x87, 0xAF, 0xBF, 0xFB, 0x3F, 0xC3, 0x9D, 0x57]);
+pub(super) const GUID_DSFX_STANDARD_PARAMEQ: GUID =
+    GUID::new(0x120C_ED89, 0x3BF4, 0x4173, [0xA1, 0x32, 0x3C, 0xB4, 0x06, 0xCF, 0x32, 0x31]);
+pub(super) const GUID_DSFX_STANDARD_I3DL2REVERB: GUID =
+    GUID::new(0xEF98_5E71, 0xD5C7, 0x42D4, [0xBA, 0x4D, 0x2D, 0x07, 0x3E, 0x2E, 0x96, 0xF4]);
+pub(super) const GUID_DSFX_WAVES_REVERB: GUID =
+    GUID::new(0x87FC_0268, 0x9A55, 0x4360, [0x95, 0xAA, 0x00, 0x4A, 0x1D, 0x9D, 0xE2, 0x6C]);
+
+// DirectSound 8 FX parameter interface IIDs (<dsound.h>)
+pub(super) const IID_IDIRECTSOUNDFXGARGLE: GUID =
+    GUID::new(0xD616_F352, 0xD622, 0x11CE, [0xAA, 0xC5, 0x00, 0x20, 0xAF, 0x0B, 0x99, 0xA3]);
+pub(super) const IID_IDIRECTSOUNDFXCHORUS: GUID =
+    GUID::new(0x8808_42E3, 0x145F, 0x43E6, [0xA9, 0x34, 0xA7, 0x18, 0x06, 0xE5, 0x05, 0x47]);
+pub(super) const IID_IDIRECTSOUNDFXFLANGER: GUID =
+    GUID::new(0x903E_9878, 0x2C92, 0x4072, [0x9B, 0x2C, 0xEA, 0x68, 0xF5, 0x39, 0x67, 0x83]);
+pub(super) const IID_IDIRECTSOUNDFXECHO: GUID =
+    GUID::new(0x8BD2_8EDF, 0x50DB, 0x4E92, [0xA2, 0xBD, 0x44, 0x54, 0x88, 0xD1, 0xED, 0x42]);
+pub(super) const IID_IDIRECTSOUNDFXDISTORTION: GUID =
+    GUID::new(0x8ECF_4326, 0x455F, 0x4D8B, [0xBD, 0xA9, 0x8D, 0x5D, 0x3E, 0x9E, 0x3E, 0x0B]);
+pub(super) const IID_IDIRECTSOUNDFXCOMPRESSOR: GUID =
+    GUID::new(0x4BBD_1154, 0x62F6, 0x4E2C, [0xA1, 0x5C, 0xD3, 0xB6, 0xC4, 0x17, 0xF7, 0xA0]);
+pub(super) const IID_IDIRECTSOUNDFXPARAMEQ: GUID =
+    GUID::new(0xC03C_A9FE, 0xFE90, 0x4204, [0x80, 0x78, 0x82, 0x33, 0x4C, 0xD1, 0x77, 0xDA]);
+pub(super) const IID_IDIRECTSOUNDFXI3DL2REVERB: GUID =
+    GUID::new(0x4B16_6A6A, 0x0D66, 0x43F3, [0x80, 0xE3, 0xEE, 0x62, 0x80, 0xDE, 0xE1, 0xA4]);
+pub(super) const IID_IDIRECTSOUNDFXWAVESREVERB: GUID =
+    GUID::new(0x4685_8C3A, 0x0DC6, 0x45E3, [0xB7, 0x60, 0xD4, 0xEE, 0xF1, 0x6C, 0xB3, 0x25]);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct DsEffectDesc {
+    pub(super) dw_size: u32,
+    pub(super) dw_flags: u32,
+    pub(super) guid_dsfx_class: GUID,
+    pub(super) dw_reserved1: usize,
+    pub(super) dw_reserved2: usize,
+}
+const _: () = assert!(std::mem::size_of::<DsEffectDesc>() == 40);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DsFxKind {
+    Gargle,
+    Chorus,
+    Flanger,
+    Echo,
+    Distortion,
+    Compressor,
+    ParamEq,
+    I3dl2Reverb,
+    WavesReverb,
+}
+
+impl DsFxKind {
+    pub(super) fn from_clsid(g: GUID) -> Option<Self> {
+        if g == GUID_DSFX_STANDARD_GARGLE { Some(Self::Gargle) }
+        else if g == GUID_DSFX_STANDARD_CHORUS { Some(Self::Chorus) }
+        else if g == GUID_DSFX_STANDARD_FLANGER { Some(Self::Flanger) }
+        else if g == GUID_DSFX_STANDARD_ECHO { Some(Self::Echo) }
+        else if g == GUID_DSFX_STANDARD_DISTORTION { Some(Self::Distortion) }
+        else if g == GUID_DSFX_STANDARD_COMPRESSOR { Some(Self::Compressor) }
+        else if g == GUID_DSFX_STANDARD_PARAMEQ { Some(Self::ParamEq) }
+        else if g == GUID_DSFX_STANDARD_I3DL2REVERB { Some(Self::I3dl2Reverb) }
+        else if g == GUID_DSFX_WAVES_REVERB { Some(Self::WavesReverb) }
+        else { None }
+    }
+
+    pub(super) fn clsid(self) -> GUID {
+        match self {
+            Self::Gargle => GUID_DSFX_STANDARD_GARGLE,
+            Self::Chorus => GUID_DSFX_STANDARD_CHORUS,
+            Self::Flanger => GUID_DSFX_STANDARD_FLANGER,
+            Self::Echo => GUID_DSFX_STANDARD_ECHO,
+            Self::Distortion => GUID_DSFX_STANDARD_DISTORTION,
+            Self::Compressor => GUID_DSFX_STANDARD_COMPRESSOR,
+            Self::ParamEq => GUID_DSFX_STANDARD_PARAMEQ,
+            Self::I3dl2Reverb => GUID_DSFX_STANDARD_I3DL2REVERB,
+            Self::WavesReverb => GUID_DSFX_WAVES_REVERB,
+        }
+    }
+
+    pub(super) fn param_iid(self) -> GUID {
+        match self {
+            Self::Gargle => IID_IDIRECTSOUNDFXGARGLE,
+            Self::Chorus => IID_IDIRECTSOUNDFXCHORUS,
+            Self::Flanger => IID_IDIRECTSOUNDFXFLANGER,
+            Self::Echo => IID_IDIRECTSOUNDFXECHO,
+            Self::Distortion => IID_IDIRECTSOUNDFXDISTORTION,
+            Self::Compressor => IID_IDIRECTSOUNDFXCOMPRESSOR,
+            Self::ParamEq => IID_IDIRECTSOUNDFXPARAMEQ,
+            Self::I3dl2Reverb => IID_IDIRECTSOUNDFXI3DL2REVERB,
+            Self::WavesReverb => IID_IDIRECTSOUNDFXWAVESREVERB,
+        }
+    }
+
+    pub(super) fn default_params(self) -> Vec<u8> {
+        let mut v = Vec::new();
+        match self {
+            Self::Gargle => {
+                // DSFXGargle: dwRateHz(20), dwWaveShape(0=TRIANGLE)
+                v.extend_from_slice(&20u32.to_le_bytes());
+                v.extend_from_slice(&0u32.to_le_bytes());
+            }
+            Self::Chorus => {
+                // DSFXChorus (28 bytes): fWetDryMix(50), fDepth(10), fFeedback(25), fFrequency(1.1), lWaveform(1), fDelay(16), lPhase(3)
+                for f in [50.0f32, 10.0, 25.0, 1.1] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&1i32.to_le_bytes());
+                v.extend_from_slice(&16.0f32.to_le_bytes());
+                v.extend_from_slice(&3i32.to_le_bytes());
+            }
+            Self::Flanger => {
+                // DSFXFlanger (28 bytes): fWetDryMix(50), fDepth(100), fFeedback(-50), fFrequency(0.25), lWaveform(1), fDelay(2), lPhase(2)
+                for f in [50.0f32, 100.0, -50.0, 0.25] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&1i32.to_le_bytes());
+                v.extend_from_slice(&2.0f32.to_le_bytes());
+                v.extend_from_slice(&2i32.to_le_bytes());
+            }
+            Self::Echo => {
+                // DSFXEcho (20 bytes): fWetDryMix(50), fFeedback(50), fLeftDelay(500), fRightDelay(500), lPanDelay(0)
+                for f in [50.0f32, 50.0, 500.0, 500.0] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&0i32.to_le_bytes());
+            }
+            Self::Distortion => {
+                // DSFXDistortion (20 bytes): fGain(-18), fEdge(15), fPostEQCenterFrequency(2400), fPostEQBandwidth(2400), fPreLowpassCutoff(8000)
+                for f in [-18.0f32, 15.0, 2400.0, 2400.0, 8000.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::Compressor => {
+                // DSFXCompressor (24 bytes): fGain(0), fAttack(10), fRelease(200), fThreshold(-20), fRatio(3), fPredelay(4)
+                for f in [0.0f32, 10.0, 200.0, -20.0, 3.0, 4.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::ParamEq => {
+                // DSFXParamEq (12 bytes): fCenter(8000), fBandwidth(12), fGain(0)
+                for f in [8000.0f32, 12.0, 0.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::I3dl2Reverb => {
+                // DSFXI3DL2Reverb (48 bytes)
+                v.extend_from_slice(&(-1000i32).to_le_bytes()); // lRoom
+                v.extend_from_slice(&(-100i32).to_le_bytes()); // lRoomHF
+                v.extend_from_slice(&0.0f32.to_le_bytes()); // flRoomRolloffFactor
+                v.extend_from_slice(&1.49f32.to_le_bytes()); // flDecayTime
+                v.extend_from_slice(&0.83f32.to_le_bytes()); // flDecayHFRatio
+                v.extend_from_slice(&(-2602i32).to_le_bytes()); // lReflections
+                v.extend_from_slice(&0.007f32.to_le_bytes()); // flReflectionsDelay
+                v.extend_from_slice(&200i32.to_le_bytes()); // lReverb
+                v.extend_from_slice(&0.011f32.to_le_bytes()); // flReverbDelay
+                v.extend_from_slice(&100.0f32.to_le_bytes()); // flDiffusion
+                v.extend_from_slice(&100.0f32.to_le_bytes()); // flDensity
+                v.extend_from_slice(&5000.0f32.to_le_bytes()); // flHFReference
+            }
+            Self::WavesReverb => {
+                // DSFXWavesReverb (16 bytes): fInGain(0), fReverbMix(0), fReverbTime(1000), fHighFreqRTRatio(0.001)
+                for f in [0.0f32, 0.0, 1000.0, 0.001] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+        }
+        v
+    }
+}
+
+pub(super) struct BufferEffect {
+    pub(super) kind: DsFxKind,
+    pub(super) params: Vec<u8>,
+    delay_l: Vec<f32>,
+    delay_r: Vec<f32>,
+    delay_pos: usize,
+    phase: f32,
+    env: f32,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl BufferEffect {
+    pub(super) fn new(kind: DsFxKind) -> Self {
+        let cap = match kind {
+            DsFxKind::Echo | DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => 96_000,
+            DsFxKind::Chorus | DsFxKind::Flanger => 4_096,
+            _ => 0,
+        };
+        Self {
+            kind,
+            params: kind.default_params(),
+            delay_l: vec![0.0; cap],
+            delay_r: vec![0.0; cap],
+            delay_pos: 0,
+            phase: 0.0,
+            env: 0.0,
+            z1_l: 0.0,
+            z2_l: 0.0,
+            z1_r: 0.0,
+            z2_r: 0.0,
+        }
+    }
+
+    #[inline]
+    fn param_f32(&self, off: usize) -> f32 {
+        self.params
+            .get(off..off + 4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0.0)
+    }
+
+    #[inline]
+    fn param_u32(&self, off: usize) -> u32 {
+        self.params
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    }
+
+    /// Process one stereo sample through this DirectSound 8 software DSP effect.
+    pub(super) fn process_sample(&mut self, l: f32, r: f32, sample_rate: f32) -> (f32, f32) {
+        let sr = sample_rate.max(8_000.0);
+        match self.kind {
+            DsFxKind::Echo => {
+                let wet = (self.param_f32(0).clamp(0.0, 100.0)) * 0.01;
+                let fb = (self.param_f32(4).clamp(0.0, 99.0)) * 0.01;
+                let dl = ((self.param_f32(8).clamp(1.0, 2000.0) * 0.001 * sr) as usize)
+                    .clamp(1, self.delay_l.len().saturating_sub(1));
+                let dr = ((self.param_f32(12).clamp(1.0, 2000.0) * 0.001 * sr) as usize)
+                    .clamp(1, self.delay_r.len().saturating_sub(1));
+                let cap = self.delay_l.len();
+                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * (1.0 - wet) + rl * wet, r * (1.0 - wet) + rr * wet)
+            }
+            DsFxKind::Chorus | DsFxKind::Flanger => {
+                let wet = (self.param_f32(0).clamp(0.0, 100.0)) * 0.01;
+                let depth = (self.param_f32(4).clamp(0.0, 100.0)) * 0.01;
+                let fb = (self.param_f32(8).clamp(-99.0, 99.0)) * 0.01;
+                let freq = self.param_f32(12).clamp(0.0, 10.0);
+                let base_ms = self.param_f32(20).clamp(0.0, 20.0);
+                let cap = self.delay_l.len();
+                let lfo = (self.phase * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                self.phase = (self.phase + freq / sr).fract();
+                let d_samp = ((base_ms * (0.5 + 0.5 * depth * lfo) * 0.001 * sr) as usize)
+                    .clamp(1, cap - 1);
+                let rl = self.delay_l[(self.delay_pos + cap - d_samp) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - d_samp) % cap];
+                self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * (1.0 - wet) + rl * wet, r * (1.0 - wet) + rr * wet)
+            }
+            DsFxKind::Distortion => {
+                let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 0.0) / 20.0);
+                let edge = 1.0 + (self.param_f32(4).clamp(0.0, 100.0) * 0.1);
+                ((l * edge).tanh() * gain, (r * edge).tanh() * gain)
+            }
+            DsFxKind::Gargle => {
+                let rate_hz = self.param_u32(0).clamp(1, 1000) as f32;
+                let shape = self.param_u32(4);
+                let p = self.phase;
+                self.phase = (self.phase + rate_hz / sr).fract();
+                let mod_gain = if shape == 1 {
+                    if p < 0.5 { 1.0 } else { 0.0 }
+                } else if p < 0.5 {
+                    p * 2.0
+                } else {
+                    (1.0 - p) * 2.0
+                };
+                (l * mod_gain, r * mod_gain)
+            }
+            DsFxKind::Compressor => {
+                let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 60.0) / 20.0);
+                let thresh = 10.0f32.powf(self.param_f32(12).clamp(-60.0, 0.0) / 20.0);
+                let ratio = self.param_f32(16).clamp(1.0, 100.0);
+                let peak = l.abs().max(r.abs());
+                let coeff = if peak > self.env { 0.01 } else { 0.001 };
+                self.env += coeff * (peak - self.env);
+                let comp = if self.env > thresh && self.env > 1e-6 {
+                    (thresh + (self.env - thresh) / ratio) / self.env
+                } else {
+                    1.0
+                };
+                (l * comp * gain, r * comp * gain)
+            }
+            DsFxKind::ParamEq => {
+                let fc = self.param_f32(0).clamp(80.0, (sr * 0.45).min(16_000.0));
+                let bw_semi = self.param_f32(4).clamp(1.0, 36.0);
+                let gain_db = self.param_f32(8).clamp(-15.0, 15.0);
+                if gain_db.abs() < 1e-4 {
+                    return (l, r);
+                }
+                let a = 10.0f32.powf(gain_db / 40.0);
+                let w0 = std::f32::consts::TAU * fc / sr;
+                let cos_w0 = w0.cos();
+                let sin_w0 = w0.sin();
+                let q = (1.0 / (2.0 * (bw_semi * 0.0833333 * 0.693147 * 0.5).sinh())).clamp(0.1, 20.0);
+                let alpha = sin_w0 / (2.0 * q);
+                let b0 = 1.0 + alpha * a;
+                let b1 = -2.0 * cos_w0;
+                let b2 = 1.0 - alpha * a;
+                let a0 = 1.0 + alpha / a;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha / a;
+                let inv_a0 = 1.0 / a0;
+                let yl = (b0 * l + self.z1_l) * inv_a0;
+                self.z1_l = b1 * l - a1 * yl + self.z2_l;
+                self.z2_l = b2 * l - a2 * yl;
+                let yr = (b0 * r + self.z1_r) * inv_a0;
+                self.z1_r = b1 * r - a1 * yr + self.z2_r;
+                self.z2_r = b2 * r - a2 * yr;
+                (yl, yr)
+            }
+            DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => {
+                let (in_gain, wet, decay_ms) = if self.kind == DsFxKind::WavesReverb {
+                    let ig = 10.0f32.powf(self.param_f32(0).clamp(-96.0, 0.0) / 20.0);
+                    let mix = 10.0f32.powf(self.param_f32(4).clamp(-96.0, 0.0) / 20.0).min(1.0);
+                    let rt = self.param_f32(8).clamp(1.0, 3000.0);
+                    (ig, mix * 0.5, rt)
+                } else {
+                    let room = 10.0f32.powf((self.param_u32(0) as i32).clamp(-10000, 0) as f32 / 2000.0);
+                    let rt = self.param_f32(12).clamp(0.1, 20.0) * 1000.0;
+                    (1.0, (room * 0.5).min(0.8), rt)
+                };
+                let cap = self.delay_l.len();
+                let dl = ((0.037 * sr) as usize).clamp(1, cap - 1);
+                let dr = ((0.041 * sr) as usize).clamp(1, cap - 1);
+                let fb = 10.0f32.powf((-3.0 * 37.0) / decay_ms.max(40.0)).clamp(0.0, 0.92);
+                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                // Subtle cross-feed + 1-pole damping for natural stereo tail.
+                self.z1_l += 0.35 * (rl - self.z1_l);
+                self.z1_r += 0.35 * (rr - self.z1_r);
+                self.delay_l[self.delay_pos] = (l * in_gain + self.z1_r * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r * in_gain + self.z1_l * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * in_gain + self.z1_l * wet, r * in_gain + self.z1_r * wet)
+            }
+        }
+    }
+}
 
 // 3D constants
 pub(super) const DS3DMODE_NORMAL: u32 = 0;
@@ -834,6 +1186,7 @@ pub(super) struct SecondaryBufferState {
     pub(super) d3d_deferred: Buffer3dParams,
     pub(super) locks: Vec<ActiveLock>,
     pub(super) notifies: Vec<NotifyEntry>,
+    pub(super) effects: Vec<Arc<std::sync::Mutex<BufferEffect>>>,
 }
 
 impl SecondaryBufferState {
@@ -852,6 +1205,7 @@ impl SecondaryBufferState {
             d3d_deferred: Buffer3dParams::default(),
             locks: Vec::new(),
             notifies: Vec::new(),
+            effects: Vec::new(),
         }
     }
 

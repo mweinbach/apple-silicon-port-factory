@@ -2,12 +2,13 @@
 
 use super::buffer::{
     parse_ds_format, resolve_capture_device, resolve_render_device, signal_events, write_ds_format,
-    ActiveLock, Buffer3dParams, CaptureBufferState, D3dVector, Ds3dBuffer, Ds3dListener,
-    DsBufferDesc, DsBufferDesc1, DsCaps, DsbCaps, DsbPositionNotify, DscBufferDesc, DscBufferDesc1,
-    DscCaps, DscbCaps, Listener3dParams, NotifyEntry, SampleMemory, SecondaryBufferState,
-    DS3DMODE_DISABLE, DS3D_DEFERRED, DS3D_IMMEDIATE, DS3D_MAXCONEANGLE, DS3D_MAXDOPPLERFACTOR,
-    DS3D_MAXROLLOFFFACTOR, DS3D_MINDOPPLERFACTOR, DS3D_MINROLLOFFFACTOR, DSBCAPS_CTRL3D,
-    DSBCAPS_CTRLFREQUENCY, DSBCAPS_CTRLPAN, DSBCAPS_CTRLPOSITIONNOTIFY, DSBCAPS_CTRLVOLUME,
+    ActiveLock, Buffer3dParams, BufferEffect, CaptureBufferState, D3dVector, Ds3dBuffer,
+    Ds3dListener, DsBufferDesc, DsBufferDesc1, DsCaps, DsEffectDesc, DsFxKind, DsbCaps,
+    DsbPositionNotify, DscBufferDesc, DscBufferDesc1, DscCaps, DscbCaps, Listener3dParams,
+    NotifyEntry, SampleMemory, SecondaryBufferState, DS3DMODE_DISABLE, DS3D_DEFERRED,
+    DS3D_IMMEDIATE, DS3D_MAXCONEANGLE, DS3D_MAXDOPPLERFACTOR, DS3D_MAXROLLOFFFACTOR,
+    DS3D_MINDOPPLERFACTOR, DS3D_MINROLLOFFFACTOR, DSBCAPS_CTRL3D, DSBCAPS_CTRLFREQUENCY,
+    DSBCAPS_CTRLFX, DSBCAPS_CTRLPAN, DSBCAPS_CTRLPOSITIONNOTIFY, DSBCAPS_CTRLVOLUME,
     DSBCAPS_PRIMARYBUFFER, DSBFREQUENCY_MAX, DSBFREQUENCY_MIN, DSBFREQUENCY_ORIGINAL,
     DSBLOCK_ENTIREBUFFER, DSBLOCK_FROMWRITECURSOR, DSBPAN_LEFT, DSBPAN_RIGHT, DSBPLAY_LOOPING,
     DSBPN_OFFSETSTOP, DSBSIZE_MAX, DSBSIZE_MIN, DSBSTATUS_LOOPING, DSBSTATUS_PLAYING,
@@ -17,12 +18,13 @@ use super::buffer::{
     DSCBSTART_LOOPING, DSCBSTATUS_CAPTURING, DSCBSTATUS_LOOPING, DSCCAPS_CERTIFIED,
     DSCCAPS_MULTIPLECAPTURE, DSERR_ALREADYINITIALIZED, DSERR_CONTROLUNAVAIL, DSERR_FXUNAVAILABLE,
     DSERR_INVALIDCALL, DSERR_INVALIDPARAM, DSERR_NOAGGREGATION, DSERR_OBJECTNOTFOUND,
-    DSERR_PRIOLEVELNEEDED, DSERR_UNINITIALIZED, DSFXR_FAILED, DSSCL_NORMAL, DSSCL_PRIORITY,
-    DSSCL_WRITEPRIMARY, DS_CERTIFIED, DS_OK, IID_ICLASSFACTORY, IID_IDIRECTSOUND,
-    IID_IDIRECTSOUND3DBUFFER, IID_IDIRECTSOUND3DLISTENER, IID_IDIRECTSOUND8,
-    IID_IDIRECTSOUNDBUFFER, IID_IDIRECTSOUNDBUFFER8, IID_IDIRECTSOUNDCAPTURE,
-    IID_IDIRECTSOUNDCAPTURE8, IID_IDIRECTSOUNDCAPTUREBUFFER, IID_IDIRECTSOUNDCAPTUREBUFFER8,
-    IID_IDIRECTSOUNDFULLDUPLEX, IID_IDIRECTSOUNDNOTIFY, STANDARD_CAPTURE_FORMATS,
+    DSERR_PRIOLEVELNEEDED, DSERR_UNINITIALIZED, DSFXR_FAILED, DSFXR_LOCSOFTWARE, DSFXR_UNKNOWN,
+    DSFX_LOCHARDWARE, DSSCL_NORMAL, DSSCL_PRIORITY, DSSCL_WRITEPRIMARY, DS_CERTIFIED, DS_OK,
+    GUID_NULL, IID_ICLASSFACTORY, IID_IDIRECTSOUND, IID_IDIRECTSOUND3DBUFFER,
+    IID_IDIRECTSOUND3DLISTENER, IID_IDIRECTSOUND8, IID_IDIRECTSOUNDBUFFER,
+    IID_IDIRECTSOUNDBUFFER8, IID_IDIRECTSOUNDCAPTURE, IID_IDIRECTSOUNDCAPTURE8,
+    IID_IDIRECTSOUNDCAPTUREBUFFER, IID_IDIRECTSOUNDCAPTUREBUFFER8, IID_IDIRECTSOUNDFULLDUPLEX,
+    IID_IDIRECTSOUNDNOTIFY, STANDARD_CAPTURE_FORMATS,
 };
 use super::mixer::{DsCaptureCore, DsDeviceCore};
 use crate::audio::backend::{self, DeviceInfo};
@@ -1431,32 +1433,166 @@ unsafe extern "win64" fn dsb_restore(this: *mut DsBufferCom) -> HRESULT {
     DS_OK
 }
 
-unsafe extern "win64" fn dsb_set_fx(
+// ---------------------------------------------------------------------------
+// DirectSound 8 Effect Parameter COM Object (`IDirectSoundFX*`)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub(super) struct DsFxCom {
+    vtbl: *const Vtable<5>,
+    refs: AtomicU32,
+    effect: Arc<Mutex<BufferEffect>>,
+}
+
+unsafe extern "win64" fn dsfx_qi(
+    this: *mut DsFxCom,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    write_null_out(ppv);
+    if this.is_null() || riid.is_null() || ppv.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let iid = rd(riid);
+    let obj = &*this;
+    let param_iid = obj.effect.lock().unwrap().kind.param_iid();
+    if iid == IID_IUnknown || iid == param_iid {
+        obj.refs.fetch_add(1, Ordering::AcqRel);
+        wr(ppv, this as *mut c_void);
+        DS_OK
+    } else {
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "win64" fn dsfx_add_ref(this: *mut DsFxCom) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+unsafe extern "win64" fn dsfx_release(this: *mut DsFxCom) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let rem = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if rem == 0 {
+        ACTIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
+        drop(Box::from_raw(this));
+    }
+    rem
+}
+
+unsafe extern "win64" fn dsfx_set_all_parameters(this: *mut DsFxCom, params: *const c_void) -> HRESULT {
+    if this.is_null() || params.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let mut fx = (*this).effect.lock().unwrap();
+    let len = fx.params.len();
+    let slice = std::slice::from_raw_parts(params as *const u8, len);
+    fx.params.copy_from_slice(slice);
+    DS_OK
+}
+
+unsafe extern "win64" fn dsfx_get_all_parameters(this: *mut DsFxCom, params: *mut c_void) -> HRESULT {
+    if this.is_null() || params.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let fx = (*this).effect.lock().unwrap();
+    std::ptr::copy_nonoverlapping(fx.params.as_ptr(), params as *mut u8, fx.params.len());
+    DS_OK
+}
+
+static DSFX_VTBL: Vtable<5> = Vtable([
+    crate::Ptr(dsfx_qi as *const ()),
+    crate::Ptr(dsfx_add_ref as *const ()),
+    crate::Ptr(dsfx_release as *const ()),
+    crate::Ptr(dsfx_set_all_parameters as *const ()),
+    crate::Ptr(dsfx_get_all_parameters as *const ()),
+]);
+
+fn create_dsfx_com(effect: Arc<Mutex<BufferEffect>>) -> *mut DsFxCom {
+    static REG: Once = Once::new();
+    REG.call_once(|| register_static_ptr_slice(&DSFX_VTBL.0));
+    ACTIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+    Box::into_raw(Box::new(DsFxCom {
+        vtbl: &DSFX_VTBL,
+        refs: AtomicU32::new(1),
+        effect,
+    }))
+}
+
+pub(super) unsafe extern "win64" fn dsb_set_fx(
     this: *mut DsBufferCom,
     dw_effects_count: u32,
-    _p_dsfx_desc: *const c_void,
+    p_dsfx_desc: *const c_void,
     pdw_result_codes: *mut u32,
 ) -> HRESULT {
     if this.is_null() {
         return DSERR_INVALIDPARAM;
     }
     let obj = &*this;
+    if obj.is_primary {
+        return DSERR_INVALIDCALL;
+    }
+    let mut st = obj.device.state.lock().unwrap();
+    let Some(b) = st.buffers.get_mut(&obj.buffer_id) else {
+        return DSERR_INVALIDCALL;
+    };
+    if b.playing || !b.locks.is_empty() {
+        return DSERR_INVALIDCALL;
+    }
     if dw_effects_count == 0 {
-        let st = obj.device.state.lock().unwrap();
-        if let Some(b) = st.buffers.get(&obj.buffer_id) {
-            if b.playing {
-                return DSERR_INVALIDCALL;
-            }
-        }
+        b.effects.clear();
         return DS_OK;
     }
-    if !pdw_result_codes.is_null() {
-        for i in 0..(dw_effects_count as usize) {
-            wr(pdw_result_codes.add(i), DSFXR_FAILED);
+    if (b.flags & DSBCAPS_CTRLFX) == 0 {
+        return DSERR_CONTROLUNAVAIL;
+    }
+    if p_dsfx_desc.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+
+    let descs = p_dsfx_desc as *const DsEffectDesc;
+    let mut new_effects = Vec::with_capacity(dw_effects_count as usize);
+    let mut codes = vec![DSFXR_FAILED; dw_effects_count as usize];
+    let mut any_failed = false;
+
+    for i in 0..(dw_effects_count as usize) {
+        let d = rd(descs.add(i));
+        if d.dw_size != std::mem::size_of::<DsEffectDesc>() as u32 {
+            return DSERR_INVALIDPARAM;
+        }
+        if (d.dw_flags & DSFX_LOCHARDWARE) != 0 {
+            codes[i] = DSFXR_FAILED;
+            any_failed = true;
+            continue;
+        }
+        match DsFxKind::from_clsid(d.guid_dsfx_class) {
+            Some(kind) => {
+                new_effects.push(Arc::new(Mutex::new(BufferEffect::new(kind))));
+                codes[i] = DSFXR_LOCSOFTWARE;
+            }
+            None => {
+                codes[i] = DSFXR_UNKNOWN;
+                any_failed = true;
+            }
         }
     }
-    crate::stub!("IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE");
-    DSERR_FXUNAVAILABLE
+
+    if !pdw_result_codes.is_null() {
+        for (i, &code) in codes.iter().enumerate() {
+            wr(pdw_result_codes.add(i), code);
+        }
+    }
+    if any_failed {
+        // DirectSound 8 SetFX is atomic: on any unavailable/unknown DMO CLSID, leave existing FX intact.
+        log::debug!(target: "audio", "IDirectSoundBuffer8::SetFX({dw_effects_count}): unrecognized/hardware FX -> DSERR_FXUNAVAILABLE");
+        return DSERR_FXUNAVAILABLE;
+    }
+    b.effects = new_effects;
+    DS_OK
 }
 
 unsafe extern "win64" fn dsb_acquire_resources(
@@ -1468,27 +1604,57 @@ unsafe extern "win64" fn dsb_acquire_resources(
     if this.is_null() {
         return DSERR_INVALIDPARAM;
     }
+    let obj = &*this;
     if dw_effects_count == 0 {
         return DS_OK;
     }
+    let st = obj.device.state.lock().unwrap();
+    let Some(b) = st.buffers.get(&obj.buffer_id) else {
+        return DSERR_INVALIDCALL;
+    };
+    if dw_effects_count as usize != b.effects.len() {
+        return DSERR_INVALIDPARAM;
+    }
     if !pdw_result_codes.is_null() {
         for i in 0..(dw_effects_count as usize) {
-            wr(pdw_result_codes.add(i), DSFXR_FAILED);
+            wr(pdw_result_codes.add(i), DSFXR_LOCSOFTWARE);
         }
     }
-    DSERR_FXUNAVAILABLE
+    DS_OK
 }
 
-unsafe extern "win64" fn dsb_get_object_in_path(
+pub(super) unsafe extern "win64" fn dsb_get_object_in_path(
     this: *mut DsBufferCom,
-    _rguid_object: *const GUID,
-    _dw_index: u32,
-    _rguid_interface: *const GUID,
+    rguid_object: *const GUID,
+    dw_index: u32,
+    rguid_interface: *const GUID,
     pp_object: *mut *mut c_void,
 ) -> HRESULT {
     write_null_out(pp_object);
-    if this.is_null() || pp_object.is_null() {
+    if this.is_null() || rguid_object.is_null() || rguid_interface.is_null() || pp_object.is_null() {
         return DSERR_INVALIDPARAM;
+    }
+    let obj_guid = rd(rguid_object);
+    let iface_guid = rd(rguid_interface);
+    let obj = &*this;
+    let st = obj.device.state.lock().unwrap();
+    let Some(b) = st.buffers.get(&obj.buffer_id) else {
+        return DSERR_INVALIDCALL;
+    };
+    let mut matched = 0u32;
+    for fx in &b.effects {
+        let kind = fx.lock().unwrap().kind;
+        if obj_guid == GUID_NULL || obj_guid == kind.clsid() {
+            if matched == dw_index {
+                if iface_guid != IID_IUnknown && iface_guid != kind.param_iid() {
+                    return E_NOINTERFACE;
+                }
+                let com = create_dsfx_com(fx.clone());
+                wr(pp_object, com as *mut c_void);
+                return DS_OK;
+            }
+            matched += 1;
+        }
     }
     DSERR_OBJECTNOTFOUND
 }

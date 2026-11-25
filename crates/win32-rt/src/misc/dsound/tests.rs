@@ -1392,3 +1392,90 @@ fn ds7_compat_controls_format_listener_orientation_doppler_and_notify_offset() {
         assert_eq!(ds_release(ds), 0);
     }
 }
+
+#[test]
+fn dsound8_set_fx_get_object_in_path_and_dsp_processing() {
+    unsafe {
+        let ds = make_paused_ds8();
+        let wfx = float_wfx(2, 48_000);
+        let mut impulse = vec![0.0f32; 1024 * 2];
+        impulse[0] = 1.0;
+        impulse[1] = 1.0;
+        let bytes: Vec<u8> = impulse.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // Buffer WITHOUT DSBCAPS_CTRLFX -> DSERR_CONTROLUNAVAIL on SetFX(1).
+        let no_fx_desc = make_desc(DSBCAPS_CTRLVOLUME, bytes.len() as u32, &wfx as *const WAVEFORMATEX as *const u8);
+        let mut raw_nofx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ds_create_sound_buffer(ds, &no_fx_desc as *const DsBufferDesc as *const c_void, &mut raw_nofx, std::ptr::null_mut()), DS_OK);
+        let fx_echo = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID_DSFX_STANDARD_ECHO,
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        let mut res = 0u32;
+        assert_eq!(dsb_set_fx(raw_nofx as *mut DsBufferCom, 1, &fx_echo as *const DsEffectDesc as *const c_void, &mut res), DSERR_CONTROLUNAVAIL);
+        assert_eq!(dsb_release(raw_nofx as *mut DsBufferCom), 0);
+
+        // Buffer WITH DSBCAPS_CTRLFX -> SetFX(Echo) succeeds, GetObjectInPath returns IDirectSoundFXEcho.
+        let fx_desc = make_desc(DSBCAPS_CTRLFX | DSBCAPS_CTRLVOLUME, bytes.len() as u32, &wfx as *const WAVEFORMATEX as *const u8);
+        let mut raw_buf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ds_create_sound_buffer(ds, &fx_desc as *const DsBufferDesc as *const c_void, &mut raw_buf, std::ptr::null_mut()), DS_OK);
+        let buf = raw_buf as *mut DsBufferCom;
+        write_all_bytes(buf, &bytes);
+
+        assert_eq!(dsb_set_fx(buf, 1, &fx_echo as *const DsEffectDesc as *const c_void, &mut res), DS_OK);
+        assert_eq!(res, DSFXR_LOCSOFTWARE);
+
+        // GetObjectInPath returns IDirectSoundFXEcho with SetAllParameters/GetAllParameters.
+        let mut fx_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(dsb_get_object_in_path(buf, &GUID_DSFX_STANDARD_ECHO, 0, &IID_IDIRECTSOUNDFXECHO, &mut fx_obj), DS_OK);
+        assert!(!fx_obj.is_null());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct EchoParams { wet_dry: f32, feedback: f32, left_ms: f32, right_ms: f32, pan_delay: i32 }
+        let set_p = EchoParams { wet_dry: 50.0, feedback: 50.0, left_ms: 1.0, right_ms: 1.0, pan_delay: 0 };
+        let vtbl = *(fx_obj as *const *const usize);
+        let set_fn: unsafe extern "win64" fn(*mut c_void, *const c_void) -> HRESULT = std::mem::transmute(*vtbl.add(3));
+        let get_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(*vtbl.add(4));
+        let rel_fn: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        assert_eq!(set_fn(fx_obj, &set_p as *const EchoParams as *const c_void), DS_OK);
+        let mut got_p = EchoParams { wet_dry: 0.0, feedback: 0.0, left_ms: 0.0, right_ms: 0.0, pan_delay: 0 };
+        assert_eq!(get_fn(fx_obj, &mut got_p as *mut EchoParams as *mut c_void), DS_OK);
+        assert_eq!(got_p.left_ms, 1.0);
+        assert_eq!(rel_fn(fx_obj), 0);
+
+        // Play impulse and verify Echo produces a delayed repeat at 1 ms (~44 frames @ 44.1 kHz / 48 @ 48 kHz).
+        let mix_rate = (&*ds).core.state.lock().unwrap().primary_format.rate;
+        let expected_delay = ((0.001 * mix_rate as f32) as usize).max(1);
+        assert_eq!(dsb_play(buf, 0, 0, 0), DS_OK);
+        let mut out = vec![0.0f32; 128 * 2];
+        (&*ds).core.mix_frames(128, &mut out);
+        assert!((out[0] - 0.5).abs() < 1e-3, "dry impulse={}", out[0]);
+        assert!(
+            out[expected_delay * 2].abs() > 0.2,
+            "expected echo tap at {expected_delay} frames (mix_rate={mix_rate}), got {}",
+            out[expected_delay * 2]
+        );
+        assert_eq!(dsb_stop(buf), DS_OK);
+
+        // Unknown DMO CLSID returns DSERR_FXUNAVAILABLE with DSFXR_UNKNOWN.
+        let bad_fx = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID::new(0xDEAD_BEEF, 0, 0, [1; 8]),
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        assert_eq!(dsb_set_fx(buf, 1, &bad_fx as *const DsEffectDesc as *const c_void, &mut res), DSERR_FXUNAVAILABLE);
+        assert_eq!(res, DSFXR_UNKNOWN);
+
+        // SetFX(0) removes all effects cleanly.
+        assert_eq!(dsb_set_fx(buf, 0, std::ptr::null(), std::ptr::null_mut()), DS_OK);
+        assert_eq!(dsb_get_object_in_path(buf, &GUID_DSFX_STANDARD_ECHO, 0, &IID_IDIRECTSOUNDFXECHO, &mut fx_obj), DSERR_OBJECTNOTFOUND);
+
+        assert_eq!(dsb_release(buf), 0);
+        assert_eq!(ds_release(ds), 0);
+    }
+}

@@ -167,12 +167,62 @@ const _: () = assert!(std::mem::size_of::<XAudio2PerformanceData>() == 64);
 // PCM Format & Sample Decoding (backed by `crate::audio::format`)
 // ============================================================================
 
+const WAVE_FORMAT_ADPCM: u16 = 0x0002;
+const WAVE_FORMAT_ALAW: u16 = 0x0006;
+const WAVE_FORMAT_MULAW: u16 = 0x0007;
+const WAVE_FORMAT_IMA_ADPCM: u16 = 0x0011;
+
+const KSDATAFORMAT_SUBTYPE_ADPCM: GUID =
+    GUID::new(0x0000_0002, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+const KSDATAFORMAT_SUBTYPE_ALAW: GUID =
+    GUID::new(0x0000_0006, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+const KSDATAFORMAT_SUBTYPE_MULAW: GUID =
+    GUID::new(0x0000_0007, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+
+const MS_ADPCM_ADAPTATION_TABLE: [i32; 16] = [
+    230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230,
+];
+const MS_ADPCM_DEFAULT_COEFS: [(i16, i16); 7] = [
+    (256, 0),
+    (512, -256),
+    (0, 0),
+    (192, 64),
+    (240, 0),
+    (460, -208),
+    (392, -232),
+];
+
+const IMA_INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+const IMA_STEP_TABLE: [i32; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum WaveEncoding {
+    Pcm(SampleType),
+    MsAdpcm {
+        samples_per_block: usize,
+        coefs: [(i16, i16); 16],
+        num_coefs: usize,
+    },
+    ImaAdpcm {
+        samples_per_block: usize,
+    },
+    ALaw,
+    MuLaw,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ParsedWaveFormat {
     pub(super) channels: usize,
     pub(super) sample_rate: u32,
     pub(super) block_align: usize,
     pub(super) sample_kind: SampleType,
+    pub(super) encoding: WaveEncoding,
 }
 
 pub(super) unsafe fn parse_wave_format(
@@ -212,9 +262,18 @@ pub(super) unsafe fn parse_wave_format(
             WAVE_FORMAT_PCM
         } else if sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
             WAVE_FORMAT_IEEE_FLOAT
+        } else if sub == KSDATAFORMAT_SUBTYPE_ADPCM {
+            WAVE_FORMAT_ADPCM
+        } else if sub == KSDATAFORMAT_SUBTYPE_ALAW {
+            WAVE_FORMAT_ALAW
+        } else if sub == KSDATAFORMAT_SUBTYPE_MULAW {
+            WAVE_FORMAT_MULAW
         } else {
-            crate::stub!(
-                "XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
+            // Desktop Windows XAudio2.9 rejects unsupported WAVE_FORMAT_EXTENSIBLE SubFormats
+            // (including Xbox-only XMA2) with XAUDIO2_E_INVALID_CALL.
+            log::debug!(
+                target: "audio",
+                "XAudio2 CreateSourceVoice: rejecting unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?} -> XAUDIO2_E_INVALID_CALL"
             );
             return Err(XAUDIO2_E_INVALID_CALL);
         }
@@ -222,47 +281,351 @@ pub(super) unsafe fn parse_wave_format(
         raw_tag
     };
 
-    let sample_kind = match (tag, bits) {
-        (WAVE_FORMAT_PCM, 8) => SampleType::U8,
-        (WAVE_FORMAT_PCM, 16) => SampleType::I16,
-        (WAVE_FORMAT_PCM, 24) => SampleType::I24,
-        (WAVE_FORMAT_PCM, 32) => SampleType::I32,
-        (WAVE_FORMAT_IEEE_FLOAT, 32) => SampleType::F32,
-        (WAVE_FORMAT_IEEE_FLOAT, 64) => SampleType::F64,
-        _ => {
-            crate::stub!(
-                "XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"
-            );
-            return Err(XAUDIO2_E_INVALID_CALL);
+    match (tag, bits) {
+        (WAVE_FORMAT_PCM, 8)
+        | (WAVE_FORMAT_PCM, 16)
+        | (WAVE_FORMAT_PCM, 24)
+        | (WAVE_FORMAT_PCM, 32)
+        | (WAVE_FORMAT_IEEE_FLOAT, 32)
+        | (WAVE_FORMAT_IEEE_FLOAT, 64) => {
+            let sample_kind = match (tag, bits) {
+                (WAVE_FORMAT_PCM, 8) => SampleType::U8,
+                (WAVE_FORMAT_PCM, 16) => SampleType::I16,
+                (WAVE_FORMAT_PCM, 24) => SampleType::I24,
+                (WAVE_FORMAT_PCM, 32) => SampleType::I32,
+                (WAVE_FORMAT_IEEE_FLOAT, 32) => SampleType::F32,
+                _ => SampleType::F64,
+            };
+            let expected_align = (ch as usize) * ((bits as usize) / 8);
+            let block_align = if wfx.nBlockAlign == 0 {
+                expected_align
+            } else if (wfx.nBlockAlign as usize) != expected_align {
+                return Err(XAUDIO2_E_INVALID_CALL);
+            } else {
+                wfx.nBlockAlign as usize
+            };
+            Ok(ParsedWaveFormat {
+                channels: ch as usize,
+                sample_rate: sr,
+                block_align,
+                sample_kind,
+                encoding: WaveEncoding::Pcm(sample_kind),
+            })
         }
-    };
-
-    let expected_align = (ch as usize) * ((bits as usize) / 8);
-    let block_align = if wfx.nBlockAlign == 0 {
-        expected_align
-    } else if (wfx.nBlockAlign as usize) != expected_align {
-        return Err(XAUDIO2_E_INVALID_CALL);
-    } else {
-        wfx.nBlockAlign as usize
-    };
-
-    Ok(ParsedWaveFormat {
-        channels: ch as usize,
-        sample_rate: sr,
-        block_align,
-        sample_kind,
-    })
+        (WAVE_FORMAT_ADPCM, 4) => {
+            if ch > 2 || wfx.nBlockAlign < (ch as u16) * 7 {
+                return Err(XAUDIO2_E_INVALID_CALL);
+            }
+            let block_align = wfx.nBlockAlign as usize;
+            let extra_ptr = (ptr as *const u8).add(std::mem::size_of::<WAVEFORMATEX>());
+            let mut coefs = [(0i16, 0i16); 16];
+            for (i, &c) in MS_ADPCM_DEFAULT_COEFS.iter().enumerate() {
+                coefs[i] = c;
+            }
+            let mut num_coefs = MS_ADPCM_DEFAULT_COEFS.len();
+            let mut samples_per_block = ((block_align - 7 * ch as usize) * 2 / ch as usize) + 2;
+            if raw_tag == WAVE_FORMAT_ADPCM && cb_size >= 4 {
+                let spb = std::ptr::read_unaligned(extra_ptr as *const u16) as usize;
+                let nc = std::ptr::read_unaligned(extra_ptr.add(2) as *const u16) as usize;
+                if spb >= 2 {
+                    samples_per_block = spb;
+                }
+                if nc > 0 && cb_size as usize >= 4 + nc * 4 {
+                    num_coefs = nc.min(coefs.len());
+                    for i in 0..num_coefs {
+                        let c1 = std::ptr::read_unaligned(extra_ptr.add(4 + i * 4) as *const i16);
+                        let c2 = std::ptr::read_unaligned(extra_ptr.add(6 + i * 4) as *const i16);
+                        coefs[i] = (c1, c2);
+                    }
+                }
+            }
+            Ok(ParsedWaveFormat {
+                channels: ch as usize,
+                sample_rate: sr,
+                block_align,
+                sample_kind: SampleType::I16,
+                encoding: WaveEncoding::MsAdpcm {
+                    samples_per_block,
+                    coefs,
+                    num_coefs,
+                },
+            })
+        }
+        (WAVE_FORMAT_IMA_ADPCM, 4) => {
+            if ch > 2 || (wfx.nBlockAlign as usize) < (ch as usize) * 4 {
+                return Err(XAUDIO2_E_INVALID_CALL);
+            }
+            let block_align = wfx.nBlockAlign as usize;
+            let mut samples_per_block = ((block_align - 4 * ch as usize) * 2 / ch as usize) + 1;
+            if raw_tag == WAVE_FORMAT_IMA_ADPCM && cb_size >= 2 {
+                let extra_ptr = (ptr as *const u8).add(std::mem::size_of::<WAVEFORMATEX>());
+                let spb = std::ptr::read_unaligned(extra_ptr as *const u16) as usize;
+                if spb >= 1 {
+                    samples_per_block = spb;
+                }
+            }
+            Ok(ParsedWaveFormat {
+                channels: ch as usize,
+                sample_rate: sr,
+                block_align,
+                sample_kind: SampleType::I16,
+                encoding: WaveEncoding::ImaAdpcm { samples_per_block },
+            })
+        }
+        (WAVE_FORMAT_ALAW, 8) | (WAVE_FORMAT_MULAW, 8) => {
+            let expected_align = ch as usize;
+            let block_align = if wfx.nBlockAlign == 0 {
+                expected_align
+            } else if (wfx.nBlockAlign as usize) != expected_align {
+                return Err(XAUDIO2_E_INVALID_CALL);
+            } else {
+                wfx.nBlockAlign as usize
+            };
+            Ok(ParsedWaveFormat {
+                channels: ch as usize,
+                sample_rate: sr,
+                block_align,
+                sample_kind: SampleType::I16,
+                encoding: if tag == WAVE_FORMAT_ALAW {
+                    WaveEncoding::ALaw
+                } else {
+                    WaveEncoding::MuLaw
+                },
+            })
+        }
+        _ => {
+            // Desktop Windows XAudio2.9 rejects unsupported/invalid format tags and bit depths
+            // with XAUDIO2_E_INVALID_CALL (Microsoft Learn: IXAudio2::CreateSourceVoice).
+            log::debug!(
+                target: "audio",
+                "XAudio2 CreateSourceVoice: rejecting unsupported format tag {tag:#x} bits {bits} -> XAUDIO2_E_INVALID_CALL"
+            );
+            Err(XAUDIO2_E_INVALID_CALL)
+        }
+    }
 }
 
-pub(super) fn decode_pcm_to_f32(fmt: ParsedWaveFormat, raw: &[u8]) -> (Vec<f32>, usize) {
-    let frames = raw.len() / fmt.block_align.max(1);
-    let mut out = Vec::new();
-    decode_pcm_buffer_f32(
-        fmt.sample_kind,
-        &raw[..frames * fmt.block_align],
-        &mut out,
-    );
-    (out, frames)
+#[inline]
+fn decode_alaw_sample(b: u8) -> f32 {
+    let x = b ^ 0x55;
+    let mut t = ((x & 0x0F) as i32) << 4;
+    let seg = ((x & 0x70) >> 4) as i32;
+    match seg {
+        0 => t += 8,
+        1 => t += 0x108,
+        _ => {
+            t += 0x108;
+            t <<= seg - 1;
+        }
+    }
+    let pcm = if (x & 0x80) != 0 { t } else { -t };
+    (pcm as f32) / 32768.0
+}
+
+#[inline]
+fn decode_mulaw_sample(b: u8) -> f32 {
+    let x = !b;
+    let sign = x & 0x80;
+    let exp = ((x >> 4) & 0x07) as i32;
+    let mant = (x & 0x0F) as i32;
+    let mut t = ((mant << 3) + 0x84) << exp;
+    t -= 0x84;
+    let pcm = if sign != 0 { -t } else { t };
+    (pcm as f32) / 32768.0
+}
+
+fn decode_ms_adpcm(
+    raw: &[u8],
+    channels: usize,
+    block_align: usize,
+    samples_per_block: usize,
+    coefs: &[(i16, i16)],
+) -> (Vec<f32>, usize) {
+    let num_blocks = raw.len() / block_align.max(1);
+    let mut out = Vec::with_capacity(num_blocks * samples_per_block * channels);
+    let mut total_frames = 0usize;
+
+    for blk_idx in 0..num_blocks {
+        let blk = &raw[blk_idx * block_align..(blk_idx + 1) * block_align];
+        if blk.len() < 7 * channels {
+            break;
+        }
+        let mut pred = [0usize; 2];
+        let mut delta = [0i32; 2];
+        let mut samp1 = [0i32; 2];
+        let mut samp2 = [0i32; 2];
+        let mut pos = 0usize;
+        for c in 0..channels {
+            pred[c] = (blk[pos] as usize).min(coefs.len().saturating_sub(1));
+            pos += 1;
+        }
+        for c in 0..channels {
+            delta[c] = i16::from_le_bytes([blk[pos], blk[pos + 1]]) as i32;
+            pos += 2;
+        }
+        for c in 0..channels {
+            samp1[c] = i16::from_le_bytes([blk[pos], blk[pos + 1]]) as i32;
+            pos += 2;
+        }
+        for c in 0..channels {
+            samp2[c] = i16::from_le_bytes([blk[pos], blk[pos + 1]]) as i32;
+            pos += 2;
+        }
+
+        // First two samples per channel come directly from the block header (samp2 then samp1).
+        for c in 0..channels {
+            out.push((samp2[c] as f32) / 32768.0);
+        }
+        total_frames += 1;
+        if samples_per_block >= 2 {
+            for c in 0..channels {
+                out.push((samp1[c] as f32) / 32768.0);
+            }
+            total_frames += 1;
+        }
+
+        let mut frames_in_blk = 2usize;
+        let mut ch_cur = 0usize;
+        for &byte in &blk[pos..] {
+            for shift in [4u8, 0u8] {
+                if frames_in_blk >= samples_per_block {
+                    break;
+                }
+                let nib_u = ((byte >> shift) & 0x0F) as usize;
+                let nib_s = if nib_u >= 8 { nib_u as i32 - 16 } else { nib_u as i32 };
+                let (c1, c2) = coefs[pred[ch_cur]];
+                let predicted = ((samp1[ch_cur] * c1 as i32) + (samp2[ch_cur] * c2 as i32)) >> 8;
+                let new_samp = (predicted + nib_s * delta[ch_cur]).clamp(-32768, 32767);
+                samp2[ch_cur] = samp1[ch_cur];
+                samp1[ch_cur] = new_samp;
+                delta[ch_cur] = ((MS_ADPCM_ADAPTATION_TABLE[nib_u] * delta[ch_cur]) >> 8).max(16);
+                out.push((new_samp as f32) / 32768.0);
+                ch_cur += 1;
+                if ch_cur == channels {
+                    ch_cur = 0;
+                    frames_in_blk += 1;
+                    total_frames += 1;
+                }
+            }
+        }
+    }
+    (out, total_frames)
+}
+
+fn decode_ima_adpcm(
+    raw: &[u8],
+    channels: usize,
+    block_align: usize,
+    samples_per_block: usize,
+) -> (Vec<f32>, usize) {
+    let num_blocks = raw.len() / block_align.max(1);
+    let mut out = Vec::with_capacity(num_blocks * samples_per_block * channels);
+    let mut total_frames = 0usize;
+
+    let step_nibble = |nibble: u8, pred: &mut i32, idx: &mut i32| -> i32 {
+        let step = IMA_STEP_TABLE[*idx as usize];
+        let mut diff = step >> 3;
+        if (nibble & 1) != 0 { diff += step >> 2; }
+        if (nibble & 2) != 0 { diff += step >> 1; }
+        if (nibble & 4) != 0 { diff += step; }
+        if (nibble & 8) != 0 { *pred -= diff; } else { *pred += diff; }
+        *pred = (*pred).clamp(-32768, 32767);
+        *idx = (*idx + IMA_INDEX_TABLE[(nibble & 0x0F) as usize]).clamp(0, 88);
+        *pred
+    };
+
+    for blk_idx in 0..num_blocks {
+        let blk = &raw[blk_idx * block_align..(blk_idx + 1) * block_align];
+        if blk.len() < 4 * channels {
+            break;
+        }
+        let mut pred = [0i32; 2];
+        let mut idx = [0i32; 2];
+        for c in 0..channels {
+            let off = c * 4;
+            pred[c] = i16::from_le_bytes([blk[off], blk[off + 1]]) as i32;
+            idx[c] = (blk[off + 2] as i32).clamp(0, 88);
+        }
+        for c in 0..channels {
+            out.push((pred[c] as f32) / 32768.0);
+        }
+        let mut frames_in_blk = 1usize;
+        total_frames += 1;
+
+        let mut pos = 4 * channels;
+        if channels == 1 {
+            while pos < blk.len() && frames_in_blk < samples_per_block {
+                let byte = blk[pos];
+                pos += 1;
+                let s0 = step_nibble(byte & 0x0F, &mut pred[0], &mut idx[0]);
+                out.push((s0 as f32) / 32768.0);
+                frames_in_blk += 1;
+                total_frames += 1;
+                if frames_in_blk < samples_per_block {
+                    let s1 = step_nibble(byte >> 4, &mut pred[0], &mut idx[0]);
+                    out.push((s1 as f32) / 32768.0);
+                    frames_in_blk += 1;
+                    total_frames += 1;
+                }
+            }
+        } else {
+            // Stereo IMA ADPCM interleaves 4-byte (8-sample) chunks per channel.
+            while pos + 8 <= blk.len() && frames_in_blk < samples_per_block {
+                let mut l_chunk = [0.0f32; 8];
+                let mut r_chunk = [0.0f32; 8];
+                for i in 0..4 {
+                    let bl = blk[pos + i];
+                    l_chunk[i * 2] = (step_nibble(bl & 0x0F, &mut pred[0], &mut idx[0]) as f32) / 32768.0;
+                    l_chunk[i * 2 + 1] = (step_nibble(bl >> 4, &mut pred[0], &mut idx[0]) as f32) / 32768.0;
+                    let br = blk[pos + 4 + i];
+                    r_chunk[i * 2] = (step_nibble(br & 0x0F, &mut pred[1], &mut idx[1]) as f32) / 32768.0;
+                    r_chunk[i * 2 + 1] = (step_nibble(br >> 4, &mut pred[1], &mut idx[1]) as f32) / 32768.0;
+                }
+                pos += 8;
+                for i in 0..8 {
+                    if frames_in_blk >= samples_per_block {
+                        break;
+                    }
+                    out.push(l_chunk[i]);
+                    out.push(r_chunk[i]);
+                    frames_in_blk += 1;
+                    total_frames += 1;
+                }
+            }
+        }
+    }
+    (out, total_frames)
+}
+
+pub(super) fn decode_pcm_to_f32(fmt: &ParsedWaveFormat, raw: &[u8]) -> (Vec<f32>, usize) {
+    match &fmt.encoding {
+        WaveEncoding::Pcm(kind) => {
+            let frames = raw.len() / fmt.block_align.max(1);
+            let mut out = Vec::new();
+            decode_pcm_buffer_f32(*kind, &raw[..frames * fmt.block_align], &mut out);
+            (out, frames)
+        }
+        WaveEncoding::MsAdpcm {
+            samples_per_block,
+            coefs,
+            num_coefs,
+        } => decode_ms_adpcm(raw, fmt.channels, fmt.block_align, *samples_per_block, &coefs[..*num_coefs]),
+        WaveEncoding::ImaAdpcm { samples_per_block } => {
+            decode_ima_adpcm(raw, fmt.channels, fmt.block_align, *samples_per_block)
+        }
+        WaveEncoding::ALaw => {
+            let frames = raw.len() / fmt.block_align.max(1);
+            let used = frames * fmt.block_align;
+            let out = raw[..used].iter().map(|&b| decode_alaw_sample(b)).collect();
+            (out, frames)
+        }
+        WaveEncoding::MuLaw => {
+            let frames = raw.len() / fmt.block_align.max(1);
+            let used = frames * fmt.block_align;
+            let out = raw[..used].iter().map(|&b| decode_mulaw_sample(b)).collect();
+            (out, frames)
+        }
+    }
 }
 
 // ============================================================================

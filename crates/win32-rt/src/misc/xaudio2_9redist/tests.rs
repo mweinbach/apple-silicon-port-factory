@@ -271,14 +271,14 @@ fn pcm_formats_and_additive_mixing() {
 
         // Also verify 8-bit, 24-bit, and 32-bit PCM decoding directly.
         let fmt8 = parse_wave_format(&pcm_wfx(1, 48_000, 8)).unwrap();
-        let (d8, n8) = decode_pcm_to_f32(fmt8, &[0, 128, 192]);
+        let (d8, n8) = decode_pcm_to_f32(&fmt8, &[0, 128, 192]);
         assert_eq!(n8, 3);
         assert!((d8[0] - (-1.0)).abs() < 1e-5);
         assert!((d8[1] - 0.0).abs() < 1e-5);
         assert!((d8[2] - 0.5).abs() < 1e-5);
 
         let fmt24 = parse_wave_format(&pcm_wfx(1, 48_000, 24)).unwrap();
-        let (d24, n24) = decode_pcm_to_f32(fmt24, &[0x00, 0x00, 0x80, 0x00, 0x00, 0x40]);
+        let (d24, n24) = decode_pcm_to_f32(&fmt24, &[0x00, 0x00, 0x80, 0x00, 0x00, 0x40]);
         assert_eq!(n24, 2);
         assert!((d24[0] - (-1.0)).abs() < 1e-5);
         assert!((d24[1] - 0.5).abs() < 1e-5);
@@ -288,7 +288,7 @@ fn pcm_formats_and_additive_mixing() {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let (d32, n32) = decode_pcm_to_f32(fmt32, &raw32);
+        let (d32, n32) = decode_pcm_to_f32(&fmt32, &raw32);
         assert_eq!(n32, 2);
         assert!((d32[0] - (-1.0)).abs() < 1e-5);
         assert!((d32[1] - 0.5).abs() < 1e-5);
@@ -2376,5 +2376,129 @@ fn live_effect_chain_ordering_toggling_and_guest_com_xapo() {
         voice_destroy_voice(sv as *mut VoiceHeader);
         voice_destroy_voice(mv as *mut VoiceHeader);
         assert_eq!(xa2_release(xa2), 0);
+    }
+}
+
+#[test]
+fn adpcm_ima_alaw_mulaw_wave_formats_and_rejection() {
+    unsafe {
+        // 1. Microsoft ADPCM (WAVE_FORMAT_ADPCM = 0x0002) mono block decode.
+        #[repr(C, packed(2))]
+        struct AdpcmWfx {
+            wfx: WAVEFORMATEX,
+            samples_per_block: u16,
+            num_coef: u16,
+            coefs: [(i16, i16); 7],
+        }
+        let adpcm_hdr = AdpcmWfx {
+            wfx: WAVEFORMATEX {
+                wFormatTag: 0x0002,
+                nChannels: 1,
+                nSamplesPerSec: 44_100,
+                nAvgBytesPerSec: 22_050,
+                nBlockAlign: 9, // 7-byte header + 2 data bytes (4 nibbles -> 6 samples total)
+                wBitsPerSample: 4,
+                cbSize: 32,
+            },
+            samples_per_block: 6,
+            num_coef: 7,
+            coefs: [
+                (256, 0),
+                (512, -256),
+                (0, 0),
+                (192, 64),
+                (240, 0),
+                (460, -208),
+                (392, -232),
+            ],
+        };
+        let fmt = parse_wave_format(&adpcm_hdr.wfx).expect("MS-ADPCM must parse");
+        let mut blk = Vec::new();
+        blk.push(0u8);
+        blk.extend_from_slice(&100i16.to_le_bytes());
+        blk.extend_from_slice(&16384i16.to_le_bytes());
+        blk.extend_from_slice(&0i16.to_le_bytes());
+        blk.push(0x10); // high=+1, low=0
+        blk.push(0xF0); // high=-1, low=0
+        let (out, frames) = decode_pcm_to_f32(&fmt, &blk);
+        assert_eq!(frames, 6);
+        assert_eq!(out.len(), 6);
+        assert!(out[0].abs() < 1e-4);
+        assert!((out[1] - 0.5).abs() < 1e-4);
+        assert!((out[2] - (16484.0 / 32768.0)).abs() < 1e-4);
+
+        // 2. IMA/DVI ADPCM (0x0011) mono block decode.
+        #[repr(C, packed(2))]
+        struct ImaWfx {
+            wfx: WAVEFORMATEX,
+            samples_per_block: u16,
+        }
+        let ima_hdr = ImaWfx {
+            wfx: WAVEFORMATEX {
+                wFormatTag: 0x0011,
+                nChannels: 1,
+                nSamplesPerSec: 44_100,
+                nAvgBytesPerSec: 22_050,
+                nBlockAlign: 6,
+                wBitsPerSample: 4,
+                cbSize: 2,
+            },
+            samples_per_block: 5,
+        };
+        let ima_fmt = parse_wave_format(&ima_hdr.wfx).expect("IMA-ADPCM must parse");
+        let mut ima_blk = Vec::new();
+        ima_blk.extend_from_slice(&8192i16.to_le_bytes());
+        ima_blk.push(10);
+        ima_blk.push(0);
+        ima_blk.push(0x00);
+        ima_blk.push(0x00);
+        let (ima_out, ima_frames) = decode_pcm_to_f32(&ima_fmt, &ima_blk);
+        assert_eq!(ima_frames, 5);
+        assert!((ima_out[0] - 0.25).abs() < 1e-4);
+
+        // 3. A-law (0x0006) & u-law (0x0007).
+        let alaw_wfx = WAVEFORMATEX {
+            wFormatTag: 0x0006,
+            nChannels: 1,
+            nSamplesPerSec: 8_000,
+            nAvgBytesPerSec: 8_000,
+            nBlockAlign: 1,
+            wBitsPerSample: 8,
+            cbSize: 0,
+        };
+        let alaw_fmt = parse_wave_format(&alaw_wfx).expect("A-law must parse");
+        let (a_out, a_n) = decode_pcm_to_f32(&alaw_fmt, &[0xD5, 0x2A]);
+        assert_eq!(a_n, 2);
+        assert!(a_out[0].abs() < 0.01);
+        assert!(a_out[1].abs() > 0.9);
+
+        let mulaw_wfx = WAVEFORMATEX { wFormatTag: 0x0007, ..alaw_wfx };
+        let mulaw_fmt = parse_wave_format(&mulaw_wfx).expect("u-law must parse");
+        let (u_out, u_n) = decode_pcm_to_f32(&mulaw_fmt, &[0xFF, 0x00]);
+        assert_eq!(u_n, 2);
+        assert!(u_out[0].abs() < 0.01);
+        assert!(u_out[1] < -0.9);
+
+        // 4. Unsupported format tag & unsupported EXTENSIBLE SubFormat -> XAUDIO2_E_INVALID_CALL.
+        let bad_tag = WAVEFORMATEX { wFormatTag: 0x9999, ..alaw_wfx };
+        assert_eq!(parse_wave_format(&bad_tag).unwrap_err(), XAUDIO2_E_INVALID_CALL);
+        let bad_ext = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+                nChannels: 2,
+                nSamplesPerSec: 48_000,
+                nAvgBytesPerSec: 384_000,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: 22,
+            },
+            wValidBitsPerSample: 32,
+            dwChannelMask: 3,
+            SubFormat: GUID::new(0x0000_0166, 0, 0, [0; 8]),
+        };
+        assert_eq!(
+            parse_wave_format(&bad_ext.Format).unwrap_err(),
+            XAUDIO2_E_INVALID_CALL
+        );
     }
 }
