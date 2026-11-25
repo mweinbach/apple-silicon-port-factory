@@ -1566,7 +1566,7 @@ mod client {
         let core = Arc::new(SpatialStreamCore {
             ep: inner.ep.clone(),
             loopback_source_id: alloc_loopback_source_id(),
-            session: SessionState::new(inner.ep.clone()),
+            session: SessionState::get_or_create(inner.ep.clone(), None),
             channel_volumes: Mutex::new([1.0, 1.0]),
             shared,
             _out: out,

@@ -666,8 +666,16 @@ static ENDPOINT_VTBL: IMMEndpointVtbl = IMMEndpointVtbl {
 // IAudioSessionManager / IAudioSessionManager2 + IAudioSessionControl2 + ISimpleAudioVolume
 // ---------------------------------------------------------------------------
 
+const GUID_NULL: GUID = GUID::new(0, 0, 0, [0; 8]);
+
+type SessionKey = (String, (u32, u16, u16, [u8; 8]));
+
+static SESSIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<SessionKey, Arc<SessionState>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 pub(super) struct SessionState {
     pub(super) ep: Arc<Endpoint>,
+    pub(super) session_guid: GUID,
     volume_bits: AtomicU32, // f32::to_bits (default 1.0)
     muted: std::sync::atomic::AtomicBool,
     display_name: Mutex<String>,
@@ -676,15 +684,23 @@ pub(super) struct SessionState {
 }
 
 impl SessionState {
-    pub(super) fn new(ep: Arc<Endpoint>) -> Arc<Self> {
-        Arc::new(Self {
-            ep,
-            volume_bits: AtomicU32::new(1.0f32.to_bits()),
-            muted: std::sync::atomic::AtomicBool::new(false),
-            display_name: Mutex::new(String::new()),
-            icon_path: Mutex::new(String::new()),
-            grouping: Mutex::new(GUID::new(0, 0, 0, [0; 8])),
-        })
+    pub(super) fn get_or_create(ep: Arc<Endpoint>, session_guid: Option<GUID>) -> Arc<Self> {
+        let guid = session_guid.unwrap_or(GUID_NULL);
+        let key = (ep.id.clone(), (guid.data1, guid.data2, guid.data3, guid.data4));
+        let mut map = SESSIONS.lock().unwrap();
+        map.entry(key)
+            .or_insert_with(|| {
+                Arc::new(Self {
+                    ep,
+                    session_guid: guid,
+                    volume_bits: AtomicU32::new(1.0f32.to_bits()),
+                    muted: std::sync::atomic::AtomicBool::new(false),
+                    display_name: Mutex::new(String::new()),
+                    icon_path: Mutex::new(String::new()),
+                    grouping: Mutex::new(GUID_NULL),
+                })
+            })
+            .clone()
     }
 
     #[inline]
@@ -719,7 +735,7 @@ struct IAudioSessionManager2Vtbl {
     unregister_duck_notification: unsafe extern "win64" fn(*mut SessionManagerObj, *mut c_void) -> HRESULT,
 }
 
-type SessionManagerObj = ComObj<IAudioSessionManager2Vtbl, Arc<SessionState>>;
+type SessionManagerObj = ComObj<IAudioSessionManager2Vtbl, Arc<Endpoint>>;
 
 mod session_mgr {
     use super::*;
@@ -727,28 +743,30 @@ mod session_mgr {
 
     pub unsafe extern "win64" fn get_audio_session_control(
         this: *mut SessionManagerObj,
-        _guid: *const GUID,
+        guid: *const GUID,
         _flags: u32,
         out: *mut *mut c_void,
     ) -> HRESULT {
         if out.is_null() {
             return E_POINTER;
         }
-        let st = SessionManagerObj::inner(this).clone();
+        let ep = SessionManagerObj::inner(this).clone();
+        let st = SessionState::get_or_create(ep, GUID::read(guid));
         std::ptr::write_unaligned(out, SessionControlObj::create(&SESSION_CTRL_VTBL, st) as *mut c_void);
         S_OK
     }
 
     pub unsafe extern "win64" fn get_simple_audio_volume(
         this: *mut SessionManagerObj,
-        _guid: *const GUID,
+        guid: *const GUID,
         _flags: u32,
         out: *mut *mut c_void,
     ) -> HRESULT {
         if out.is_null() {
             return E_POINTER;
         }
-        let st = SessionManagerObj::inner(this).clone();
+        let ep = SessionManagerObj::inner(this).clone();
+        let st = SessionState::get_or_create(ep, GUID::read(guid));
         std::ptr::write_unaligned(out, super::new_simple_audio_volume(st));
         S_OK
     }
@@ -783,7 +801,7 @@ static SESSION_MGR_VTBL: IAudioSessionManager2Vtbl = IAudioSessionManager2Vtbl {
 };
 
 fn new_session_manager(ep: Arc<Endpoint>) -> *mut SessionManagerObj {
-    SessionManagerObj::create(&SESSION_MGR_VTBL, SessionState::new(ep))
+    SessionManagerObj::create(&SESSION_MGR_VTBL, ep)
 }
 
 #[repr(C)]
@@ -858,7 +876,12 @@ mod session_ctrl {
         if out.is_null() {
             return E_POINTER;
         }
-        let id = format!("{}|session", SessionControlObj::inner(this).ep.id);
+        let st = SessionControlObj::inner(this);
+        let id = if st.session_guid == GUID_NULL {
+            format!("{}|session", st.ep.id)
+        } else {
+            format!("{}|session|{}", st.ep.id, format_guid(&st.session_guid))
+        };
         std::ptr::write_unaligned(out, co_wstr(&id));
         S_OK
     }
@@ -866,7 +889,12 @@ mod session_ctrl {
         if out.is_null() {
             return E_POINTER;
         }
-        let id = format!("{}|session|{}", SessionControlObj::inner(this).ep.id, std::process::id());
+        let st = SessionControlObj::inner(this);
+        let id = if st.session_guid == GUID_NULL {
+            format!("{}|session|{}", st.ep.id, std::process::id())
+        } else {
+            format!("{}|session|{}|{}", st.ep.id, format_guid(&st.session_guid), std::process::id())
+        };
         std::ptr::write_unaligned(out, co_wstr(&id));
         S_OK
     }
@@ -963,15 +991,53 @@ const DEFAULT_MIN_DB: f32 = -65.25;
 const DEFAULT_MAX_DB: f32 = 0.0;
 const DEFAULT_STEP_DB: f32 = 0.5;
 
-/// Process-wide software endpoint attenuation state applied whenever CoreAudio HAL does not
-/// natively handle an endpoint's master/mute/per-channel volume control (e.g., Null backend,
-/// iOS RemoteIO, or macOS output devices lacking per-channel hardware volume).
-#[derive(Clone)]
+unsafe fn com_slot(obj: usize, i: usize) -> usize {
+    if obj == 0 {
+        return 0;
+    }
+    let vtbl = std::ptr::read_unaligned(obj as *const *const usize);
+    if vtbl.is_null() {
+        return 0;
+    }
+    std::ptr::read_unaligned(vtbl.add(i))
+}
+
+unsafe fn com_add_ref(obj: usize) {
+    let f = com_slot(obj, 1);
+    if f != 0 {
+        crate::call_guest8(f, obj as u64, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+unsafe fn com_release(obj: usize) {
+    let f = com_slot(obj, 2);
+    if f != 0 {
+        crate::call_guest8(f, obj as u64, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+/// Owned COM reference to a registered `IAudioEndpointVolumeCallback*`.
+///
+/// Wrapped in `Arc` inside `EndpointSoftwareGain::callbacks`: registration calls
+/// `AddRef` once, in-flight notification dispatches clone the `Arc` under the lock,
+/// and the COM `Release` executes only when the last `Arc` drops outside all locks
+/// (after both unregistration and every in-flight `OnNotify` have completed).
+struct RegisteredCallback(usize);
+
+impl Drop for RegisteredCallback {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { com_release(self.0) };
+        }
+    }
+}
+
 /// Shared per-endpoint fallback volume/mute control state and software render attenuation.
 ///
 /// Shared across all `IAudioEndpointVolume` activations on the same endpoint ID so muting or
 /// adjusting volume on one COM instance is immediately observed by all other instances, while
 /// `sw_*` fields avoid double-attenuating channels that CoreAudio HAL already controls in hardware.
+#[derive(Clone)]
 struct EndpointSoftwareGain {
     /// Logical fallback control values (used by getters when CoreAudio HAL lacks that control).
     logical_master: f32,
@@ -983,8 +1049,8 @@ struct EndpointSoftwareGain {
     sw_muted: bool,
     /// Per-channel software multipliers (`1.0` for any channel handled by hardware HAL).
     sw_channels: [f32; 8],
-    /// Registered `IAudioEndpointVolumeCallback*` pointers shared across activations on this endpoint.
-    callbacks: Vec<usize>,
+    /// Registered `IAudioEndpointVolumeCallback*` references shared across activations on this endpoint.
+    callbacks: Vec<Arc<RegisteredCallback>>,
 }
 
 impl Default for EndpointSoftwareGain {
@@ -1042,8 +1108,14 @@ fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain
 
 #[cfg(test)]
 pub(super) fn reset_endpoint_software_gains_for_test() {
-    ENDPOINT_SW_GAINS.lock().unwrap().clear();
+    let dropped = std::mem::take(&mut *ENDPOINT_SW_GAINS.lock().unwrap());
     ENDPOINT_SW_GAINS_ACTIVE.store(false, Ordering::Release);
+    drop(dropped);
+}
+
+#[cfg(test)]
+pub(super) fn reset_sessions_for_test() {
+    SESSIONS.lock().unwrap().clear();
 }
 
 struct EndpointVolumeState {
@@ -1143,12 +1215,12 @@ impl EndpointVolumeState {
     /// Dispatch `IAudioEndpointVolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA)`
     /// to every callback registered for this endpoint without holding any lock.
     unsafe fn notify_callbacks(&self, ctx_guid: *const GUID) {
-        let cbs: Vec<usize> = read_endpoint_sw_state(&self.ep.id, |g| g.callbacks.clone());
+        let cbs: Vec<Arc<RegisteredCallback>> = read_endpoint_sw_state(&self.ep.id, |g| g.callbacks.clone());
         if cbs.is_empty() {
             return;
         }
         let guid = if ctx_guid.is_null() {
-            GUID::new(0, 0, 0, [0; 8])
+            GUID_NULL
         } else {
             std::ptr::read_unaligned(ctx_guid)
         };
@@ -1182,17 +1254,13 @@ impl EndpointVolumeState {
         };
         let data_ptr = &data as *const AudioVolumeNotificationData as u64;
         for cb in cbs {
-            if cb == 0 {
-                continue;
-            }
-            let vtbl = std::ptr::read_unaligned(cb as *const *const usize);
-            if vtbl.is_null() {
-                continue;
-            }
-            let on_notify = std::ptr::read_unaligned(vtbl.add(3));
+            let p = cb.0;
+            let on_notify = com_slot(p, 3);
             if on_notify != 0 {
-                crate::call_guest8(on_notify, cb as u64, data_ptr, 0, 0, 0, 0, 0, 0);
+                crate::call_guest8(on_notify, p as u64, data_ptr, 0, 0, 0, 0, 0, 0);
             }
+            // `cb` drops here outside all locks; if unregistered while in flight,
+            // its owned COM reference is released only now after `OnNotify` returns.
         }
     }
 }
@@ -1214,12 +1282,23 @@ mod endpoint_vol {
         if cb.is_null() {
             return E_POINTER;
         }
-        let ep_id = &EndpointVolumeObj::inner(this).ep.id;
+        let ep_id = EndpointVolumeObj::inner(this).ep.id.clone();
         let p = cb as usize;
-        let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
-        let entry = map.entry(ep_id.clone()).or_default();
-        if !entry.callbacks.contains(&p) {
-            entry.callbacks.push(p);
+        // Acquire the COM reference before taking ENDPOINT_SW_GAINS so we never
+        // invoke guest code while holding the registry lock.
+        com_add_ref(p);
+        let duplicate = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let entry = map.entry(ep_id).or_default();
+            if entry.callbacks.iter().any(|c| c.0 == p) {
+                true
+            } else {
+                entry.callbacks.push(Arc::new(RegisteredCallback(p)));
+                false
+            }
+        };
+        if duplicate {
+            com_release(p);
         }
         S_OK
     }
@@ -1230,13 +1309,26 @@ mod endpoint_vol {
         }
         let ep_id = &EndpointVolumeObj::inner(this).ep.id;
         let p = cb as usize;
-        let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
-        let Some(entry) = map.get_mut(ep_id) else {
-            return E_NOTFOUND;
+        let removed = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let Some(entry) = map.get_mut(ep_id) else {
+                return E_NOTFOUND;
+            };
+            entry
+                .callbacks
+                .iter()
+                .position(|c| c.0 == p)
+                .map(|pos| entry.callbacks.remove(pos))
         };
-        let before = entry.callbacks.len();
-        entry.callbacks.retain(|&x| x != p);
-        if entry.callbacks.len() == before { E_NOTFOUND } else { S_OK }
+        match removed {
+            Some(cb_arc) => {
+                // Drop outside the lock: releases the COM ref now if idle, or defers
+                // Release until the last in-flight `notify_callbacks` finishes.
+                drop(cb_arc);
+                S_OK
+            }
+            None => E_NOTFOUND,
+        }
     }
 
     pub unsafe extern "win64" fn get_channel_count(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {

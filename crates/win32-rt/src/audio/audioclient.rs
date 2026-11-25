@@ -508,6 +508,7 @@ pub struct Stream {
     pub buffer_frames: u32,
     pub period_frames: u32,
     pub shared: Arc<StreamShared>,
+    pub(super) session: Arc<SessionState>,
     pending: Option<u32>,
     started: bool,
     pub frames_written: u64,
@@ -652,7 +653,6 @@ pub struct ClientState {
 
 pub struct ClientCore {
     pub ep: Arc<Endpoint>,
-    pub(super) session: Arc<SessionState>,
     pub(super) channel_volumes: Mutex<Vec<f32>>,
     pub st: Mutex<ClientState>,
 }
@@ -735,12 +735,10 @@ pub type ClientObj = ComObj<IAudioClient3Vtbl, Arc<ClientCore>>;
 
 pub fn new_client(ep: Arc<Endpoint>) -> *mut ClientObj {
     let ch = ep.mix_format().channels.max(1) as usize;
-    let session = SessionState::new(ep.clone());
     ClientObj::create(
         &CLIENT_VTBL,
         Arc::new(ClientCore {
             ep,
-            session,
             channel_volumes: Mutex::new(vec![1.0; ch]),
             st: Mutex::new(ClientState::default()),
         }),
@@ -758,7 +756,15 @@ unsafe fn alloc_format(f: &WaveFormat) -> *mut WAVEFORMATEX {
 
 /// Shared-mode Initialize (also used by IAudioClient3::InitializeSharedAudioStream).
 /// Never holds `core.st` across `OutputStream::open` / CoreAudio calls / `LIVE`.
-pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicity: i64, fmt: *const WAVEFORMATEX) -> HRESULT {
+pub fn initialize(
+    core: &ClientCore,
+    mode: u32,
+    flags: u32,
+    dur: i64,
+    periodicity: i64,
+    fmt: *const WAVEFORMATEX,
+    session_guid: Option<GUID>,
+) -> HRESULT {
     {
         let mut st = core.st.lock().unwrap();
         if st.stream.is_some() || st.initializing {
@@ -814,6 +820,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
     let period_frames = frames_for(DEFAULT_PERIOD_HNS, f.rate).max(1);
     let requested = frames_for(dur, f.rate);
 
+    let session = SessionState::get_or_create(core.ep.clone(), session_guid);
     let (shared, stream) = if core.ep.is_capture() || is_loopback {
         let buffer_frames = requested.max(period_frames * 4);
         let shared = StreamShared::new(Ring::new(1, 1));
@@ -861,6 +868,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
             buffer_frames,
             period_frames,
             shared: shared.clone(),
+            session,
             pending: None,
             started: false,
             frames_written: 0,
@@ -935,6 +943,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
             buffer_frames,
             period_frames,
             shared: shared.clone(),
+            session,
             pending: None,
             started: false,
             frames_written: 0,
@@ -990,8 +999,8 @@ mod client {
         }};
     }
 
-    pub unsafe extern "win64" fn initialize(this: *mut C, mode: u32, flags: u32, dur: i64, per: i64, fmt: *const WAVEFORMATEX, _session: *const GUID) -> HRESULT {
-        super::initialize(core(this), mode, flags, dur, per, fmt)
+    pub unsafe extern "win64" fn initialize(this: *mut C, mode: u32, flags: u32, dur: i64, per: i64, fmt: *const WAVEFORMATEX, session: *const GUID) -> HRESULT {
+        super::initialize(core(this), mode, flags, dur, per, fmt, GUID::read(session))
     }
 
     pub unsafe extern "win64" fn get_buffer_size(this: *mut C, out: *mut u32) -> HRESULT {
@@ -1245,12 +1254,12 @@ mod client {
         std::ptr::write_unaligned(out, std::ptr::null_mut());
         let Some(iid) = GUID::read(riid) else { return E_POINTER };
         let c = ClientObj::inner(this).clone();
-        let is_capture = {
+        let (is_capture, session) = {
             let st = c.st.lock().unwrap();
             let Some(s) = st.stream.as_ref() else {
                 return AUDCLNT_E_NOT_INITIALIZED;
             };
-            s.is_capture()
+            (s.is_capture(), s.session.clone())
         };
         if iid == IID_IAudioRenderClient {
             if is_capture {
@@ -1273,13 +1282,13 @@ mod client {
             std::ptr::write_unaligned(out, Clock2Obj::create(&CLOCK2_VTBL, c) as *mut c_void);
             S_OK
         } else if iid == IID_ISimpleAudioVolume {
-            std::ptr::write_unaligned(out, new_simple_audio_volume(c.session.clone()));
+            std::ptr::write_unaligned(out, new_simple_audio_volume(session));
             S_OK
         } else if iid == IID_IAudioStreamVolume {
             std::ptr::write_unaligned(out, StreamVolumeObj::create(stream_vol::vtbl(), c) as *mut c_void);
             S_OK
         } else if iid == IID_IAudioSessionControl || iid == IID_IAudioSessionControl2 {
-            std::ptr::write_unaligned(out, new_session_control(c.session.clone()));
+            std::ptr::write_unaligned(out, new_session_control(session));
             S_OK
         } else {
             // Standard COM behavior: IAudioClient::GetService returns E_NOINTERFACE for
@@ -1377,13 +1386,13 @@ mod client {
         S_OK
     }
 
-    pub unsafe extern "win64" fn initialize_shared_audio_stream(this: *mut C, flags: u32, period_frames: u32, fmt: *const WAVEFORMATEX, _s: *const GUID) -> HRESULT {
+    pub unsafe extern "win64" fn initialize_shared_audio_stream(this: *mut C, flags: u32, period_frames: u32, fmt: *const WAVEFORMATEX, session: *const GUID) -> HRESULT {
         if let Ok(f) = WaveFormat::from_ptr(fmt) {
             if period_frames != frames_for(DEFAULT_PERIOD_HNS, f.rate) {
                 return E_INVALIDARG; // must be one of GetSharedModeEnginePeriod's values
             }
         }
-        super::initialize(core(this), AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, fmt)
+        super::initialize(core(this), AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, fmt, GUID::read(session))
     }
 }
 
@@ -1577,7 +1586,7 @@ mod render {
         }
         s.pending = None;
         if frames > 0 {
-            let master_gain = core.session.effective_gain();
+            let master_gain = s.session.effective_gain();
             let ch_gains = core.channel_volumes.lock().unwrap().clone();
             submit(s, &core.ep.id, master_gain, &ch_gains, frames, flags);
         }

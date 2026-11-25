@@ -140,6 +140,7 @@ impl Fixture {
     fn null() -> Fixture {
         let g = super::audio_test_lock();
         super::mmdevapi::reset_endpoint_software_gains_for_test();
+        super::mmdevapi::reset_sessions_for_test();
         backend::force_backend(Some(Backend::Null));
         super::mmdevapi::refresh();
         super::mmdevapi::refresh_capture();
@@ -2061,11 +2062,20 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         #[repr(C)]
         struct TestVolCb {
             vtbl: *const [usize; 4],
+            refs: AtomicU32,
             calls: usize,
+            epv_to_unregister: P,
+            refs_after_reentrant_unregister: u32,
             last_guid: GUID,
             last_muted: i32,
             last_master: f32,
             last_ch1: f32,
+        }
+        unsafe extern "win64" fn test_vol_add_ref(this: *mut TestVolCb) -> u32 {
+            (*this).refs.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        unsafe extern "win64" fn test_vol_release(this: *mut TestVolCb) -> u32 {
+            (*this).refs.fetch_sub(1, Ordering::SeqCst) - 1
         }
         unsafe extern "win64" fn test_vol_on_notify(this: *mut TestVolCb, data: *const NotifyData) -> HRESULT {
             let cb = &mut *this;
@@ -2075,19 +2085,39 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
             cb.last_muted = d.muted;
             cb.last_master = d.master;
             cb.last_ch1 = d.ch_vols[1];
+            // If armed, unregister mid-dispatch and assert the registration's COM reference
+            // stays alive until `OnNotify` finishes (no premature Release / UAF).
+            if !cb.epv_to_unregister.is_null() {
+                let epv_ptr = cb.epv_to_unregister;
+                cb.epv_to_unregister = std::ptr::null_mut();
+                let hr = call!(epv_ptr, 4 /* UnregisterControlChangeNotify */, (*mut c_void) -> HRESULT; this as *mut c_void);
+                assert_eq!(hr, S_OK);
+                cb.refs_after_reentrant_unregister = cb.refs.load(Ordering::SeqCst);
+            }
             S_OK
         }
+        crate::register_native_va(test_vol_add_ref as *const () as u64, test_vol_add_ref as *const () as usize);
+        crate::register_native_va(test_vol_release as *const () as u64, test_vol_release as *const () as usize);
         crate::register_native_va(test_vol_on_notify as *const () as u64, test_vol_on_notify as *const () as usize);
-        let cb_vtbl: [usize; 4] = [0, 0, 0, test_vol_on_notify as *const () as usize];
+        let cb_vtbl: [usize; 4] = [
+            0,
+            test_vol_add_ref as *const () as usize,
+            test_vol_release as *const () as usize,
+            test_vol_on_notify as *const () as usize,
+        ];
         let mut cb_obj = TestVolCb {
             vtbl: &cb_vtbl,
+            refs: AtomicU32::new(1),
             calls: 0,
+            epv_to_unregister: std::ptr::null_mut(),
+            refs_after_reentrant_unregister: 0,
             last_guid: GUID::new(0, 0, 0, [0; 8]),
             last_muted: -1,
             last_master: -1.0,
             last_ch1: -1.0,
         };
         assert_eq!(call!(epv2, 3 /* RegisterControlChangeNotify */, (*mut c_void) -> HRESULT; &mut cb_obj as *mut TestVolCb as *mut c_void), S_OK);
+        assert_eq!(cb_obj.refs.load(Ordering::SeqCst), 2, "RegisterControlChangeNotify must AddRef the callback");
         let ctx_guid = GUID::new(0x1234_5678, 0x9ABC, 0xDEF0, [1, 2, 3, 4, 5, 6, 7, 8]);
 
         let mut got0_2 = -1.0f32;
@@ -2096,15 +2126,26 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 1, &mut got1_2), S_OK);
         assert!((got0_2 - 0.0).abs() < 1e-6);
         assert!((got1_2 - 0.5).abs() < 1e-6);
+        // Arm re-entrant unregistration during dispatch: callback refcount must stay >= 2
+        // throughout `OnNotify` and drop back to 1 once dispatch completes.
+        cb_obj.epv_to_unregister = epv2;
         assert_eq!(call!(epv, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, &ctx_guid), S_OK);
         assert_eq!(cb_obj.calls, 1, "OnNotify must fire when mute changes on another activation");
         assert_eq!(cb_obj.last_guid, ctx_guid);
         assert_eq!(cb_obj.last_muted, 1);
         assert!((cb_obj.last_ch1 - 0.5).abs() < 1e-6);
+        assert_eq!(
+            cb_obj.refs_after_reentrant_unregister, 2,
+            "in-flight dispatch must retain callback COM ref until OnNotify returns"
+        );
+        assert_eq!(
+            cb_obj.refs.load(Ordering::SeqCst),
+            1,
+            "COM ref must be released once both unregister and in-flight OnNotify finish"
+        );
         let mut muted2 = 0i32;
         assert_eq!(call!(epv2, 15 /* GetMute */, (*mut i32) -> HRESULT; &mut muted2), S_OK);
         assert_eq!(muted2, 1, "second activation must observe mute set via first activation");
-        assert_eq!(call!(epv2, 4 /* UnregisterControlChangeNotify */, (*mut c_void) -> HRESULT; &mut cb_obj as *mut TestVolCb as *mut c_void), S_OK);
         assert_eq!(call!(epv2, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 0, std::ptr::null()), S_OK);
         assert_eq!(cb_obj.calls, 1, "unregistered callback must not fire");
         assert_eq!(release(epv2), 0);
@@ -2390,6 +2431,113 @@ fn loopback_capture_gates_arrival_on_started_state_and_discards_stopped_audio() 
         assert_eq!(release(lb_c), 0);
         assert_eq!(release(rc), 0);
         assert_eq!(release(render_c), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+}
+
+#[test]
+fn shared_audio_session_shares_volume_and_mute_across_clients_and_manager() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        let session_a = GUID::new(0xAAAA_1111, 0x2222, 0x3333, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let session_b = GUID::new(0xBBBB_4444, 0x5555, 0x6666, [8, 7, 6, 5, 4, 3, 2, 1]);
+
+        let c1 = activate_client(d);
+        let c2 = activate_client(d);
+        let c3 = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(c1, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+
+        // c1 and c2 join session_a; c3 joins session_b.
+        assert_eq!(call!(c1, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, &session_a), S_OK);
+        assert_eq!(call!(c2, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, &session_a), S_OK);
+        assert_eq!(call!(c3, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, &session_b), S_OK);
+
+        let mut vol1: P = std::ptr::null_mut();
+        let mut vol2: P = std::ptr::null_mut();
+        let mut vol3: P = std::ptr::null_mut();
+        assert_eq!(call!(c1, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_ISimpleAudioVolume, &mut vol1), S_OK);
+        assert_eq!(call!(c2, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_ISimpleAudioVolume, &mut vol2), S_OK);
+        assert_eq!(call!(c3, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_ISimpleAudioVolume, &mut vol3), S_OK);
+
+        // Activate IAudioSessionManager on the endpoint and open session_a's ISimpleAudioVolume.
+        let mut mgr: P = std::ptr::null_mut();
+        assert_eq!(call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioSessionManager, CLSCTX_ALL, std::ptr::null_mut(), &mut mgr), S_OK);
+        let mut mgr_vol_a: P = std::ptr::null_mut();
+        assert_eq!(call!(mgr, 4 /* GetSimpleAudioVolume */, (*const GUID, u32, *mut P) -> HRESULT; &session_a, 0, &mut mgr_vol_a), S_OK);
+
+        // Changing volume via c1 must immediately reflect in c2 and IAudioSessionManager, not c3.
+        assert_eq!(call_bridge_f32_guid(vol1, 3 /* SetMasterVolume */, 0.25f32, std::ptr::null()), S_OK);
+        let mut v2 = -1.0f32;
+        let mut vm = -1.0f32;
+        let mut v3 = -1.0f32;
+        assert_eq!(call!(vol2, 4 /* GetMasterVolume */, (*mut f32) -> HRESULT; &mut v2), S_OK);
+        assert_eq!(call!(mgr_vol_a, 4 /* GetMasterVolume */, (*mut f32) -> HRESULT; &mut vm), S_OK);
+        assert_eq!(call!(vol3, 4 /* GetMasterVolume */, (*mut f32) -> HRESULT; &mut v3), S_OK);
+        assert!((v2 - 0.25).abs() < 1e-6);
+        assert!((vm - 0.25).abs() < 1e-6);
+        assert!((v3 - 1.0).abs() < 1e-6);
+
+        // Start a loopback capture and verify c2 renders at session_a's 0.25 gain, then silences when c1 mutes.
+        let mut rc2: P = std::ptr::null_mut();
+        assert_eq!(call!(c2, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc2), S_OK);
+        let lb = activate_client(d);
+        assert_eq!(
+            call!(lb, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+        assert_eq!(call!(lb, AC_START, () -> HRESULT;), S_OK);
+
+        let mut rp: *mut u8 = std::ptr::null_mut();
+        assert_eq!(call!(rc2, RC_GET, (u32, *mut *mut u8) -> HRESULT; 32, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 32 * 2).fill(0.8);
+        assert_eq!(call!(rc2, RC_RELEASE, (u32, u32) -> HRESULT; 32, 0), S_OK);
+
+        let mut cp: *mut u8 = std::ptr::null_mut();
+        let mut nf = 0u32;
+        let mut fl = 0u32;
+        assert_eq!(call!(cc, CC_GET, (*mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT; &mut cp, &mut nf, &mut fl, std::ptr::null_mut(), std::ptr::null_mut()), S_OK);
+        assert_eq!(nf, 32);
+        assert!((*(cp as *const f32) - 0.2).abs() < 1e-4, "c2 must observe c1's 0.25 session volume: got {}", *(cp as *const f32));
+        assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; nf), S_OK);
+
+        // Mute session_a via c1 -> c2's GetMute == 1 and c2's submitted audio is silenced; c3 stays unmuted.
+        assert_eq!(call!(vol1, 5 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, std::ptr::null()), S_OK);
+        let mut m2 = 0i32;
+        let mut mm = 0i32;
+        let mut m3 = 1i32;
+        assert_eq!(call!(vol2, 6 /* GetMute */, (*mut i32) -> HRESULT; &mut m2), S_OK);
+        assert_eq!(call!(mgr_vol_a, 6 /* GetMute */, (*mut i32) -> HRESULT; &mut mm), S_OK);
+        assert_eq!(call!(vol3, 6 /* GetMute */, (*mut i32) -> HRESULT; &mut m3), S_OK);
+        assert_eq!(m2, 1);
+        assert_eq!(mm, 1);
+        assert_eq!(m3, 0);
+
+        assert_eq!(call!(rc2, RC_GET, (u32, *mut *mut u8) -> HRESULT; 32, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 32 * 2).fill(0.8);
+        assert_eq!(call!(rc2, RC_RELEASE, (u32, u32) -> HRESULT; 32, 0), S_OK);
+        let mut next = 99u32;
+        assert_eq!(call!(cc, 5 /* GetNextPacketSize */, (*mut u32) -> HRESULT; &mut next), S_OK);
+        assert_eq!(next, 0, "muted session_a must silence c2 render submission");
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb), 0);
+        assert_eq!(release(rc2), 0);
+        assert_eq!(release(mgr_vol_a), 0);
+        assert_eq!(release(mgr), 0);
+        assert_eq!(release(vol3), 0);
+        assert_eq!(release(vol2), 0);
+        assert_eq!(release(vol1), 0);
+        assert_eq!(release(c3), 0);
+        assert_eq!(release(c2), 0);
+        assert_eq!(release(c1), 0);
         assert_eq!(release(d), 0);
         assert_eq!(release(e), 0);
     }
