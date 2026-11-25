@@ -133,7 +133,35 @@ struct FdInfo {
     osf_handle: Option<usize>,
 }
 
+#[derive(Default)]
+struct U8Pending {
+    raw: Vec<u8>,
+    low_surrogate: Option<u16>,
+}
+
 static FDS: Mutex<Option<HashMap<i32, (FdInfo, Option<std::path::PathBuf>)>>> = Mutex::new(None);
+static FD_U8_PENDING: Mutex<Option<HashMap<i32, U8Pending>>> = Mutex::new(None);
+
+fn clear_u8_pending(fd: i32) {
+    if let Some(m) = FD_U8_PENDING.lock().unwrap().as_mut() {
+        m.remove(&fd);
+    }
+}
+
+fn take_u8_pending(fd: i32) -> U8Pending {
+    FD_U8_PENDING
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&fd))
+        .unwrap_or_default()
+}
+
+fn store_u8_pending(fd: i32, pending: U8Pending) {
+    if !pending.raw.is_empty() || pending.low_surrogate.is_some() {
+        FD_U8_PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(fd, pending);
+    }
+}
 static FMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(O_TEXT);
 static COMMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -372,6 +400,7 @@ pub unsafe extern "win64" fn _close(fd: i32) -> i32 {
         return bad_fd();
     }
     let ent = FDS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&fd);
+    clear_u8_pending(fd);
     if let Some((info, _)) = &ent {
         if let Some(h) = info.osf_handle {
             // Both `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and the `FileObj`
@@ -687,13 +716,28 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 return 0;
             }
             let max_u16 = n / 2;
-            let mut raw_buf = vec![0u8; max_u16.max(4)];
-            let r = raw_read_retry(fd, raw_buf.as_mut_ptr(), raw_buf.len());
-            if r <= 0 {
-                return r;
-            }
-            raw_buf.truncate(r as usize);
+            let mut pend = take_u8_pending(fd);
             let mut out_u16: Vec<u16> = Vec::with_capacity(max_u16);
+            if let Some(lo) = pend.low_surrogate.take() {
+                out_u16.push(lo);
+            }
+            let mut raw_buf = std::mem::take(&mut pend.raw);
+            if out_u16.len() < max_u16 && raw_buf.is_empty() {
+                let mut tmp = vec![0u8; max_u16.max(4)];
+                let r = raw_read_retry(fd, tmp.as_mut_ptr(), tmp.len());
+                if r < 0 {
+                    store_u8_pending(fd, U8Pending { raw: raw_buf, low_surrogate: None });
+                    return if out_u16.is_empty() { -1 } else {
+                        for (idx, u) in out_u16.iter().enumerate() {
+                            let bytes = u.to_le_bytes();
+                            *buf.add(idx * 2) = bytes[0];
+                            *buf.add(idx * 2 + 1) = bytes[1];
+                        }
+                        (out_u16.len() * 2) as isize
+                    };
+                }
+                raw_buf.extend_from_slice(&tmp[..r as usize]);
+            }
             let mut consumed = 0usize;
             while consumed < raw_buf.len() && out_u16.len() < max_u16 {
                 let rem = &raw_buf[consumed..];
@@ -706,14 +750,17 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                         }
                     } else {
                         let mut nb = 0u8;
-                        let pk = libc::read(fd, &mut nb as *mut u8 as *mut c_void, 1);
+                        let pk = raw_read_retry(fd, &mut nb, 1);
                         if pk == 1 {
                             if nb == b'\n' {
                                 out_u16.push(b'\n' as u16);
                                 consumed += 1;
                                 continue;
                             }
-                            libc::lseek(fd, -1, libc::SEEK_CUR);
+                            raw_buf.push(nb);
+                            out_u16.push(b'\r' as u16);
+                            consumed += 1;
+                            continue;
                         }
                     }
                 }
@@ -731,20 +778,16 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 };
                 if rem.len() < need {
                     if out_u16.is_empty() {
-                        // Fetch remaining bytes of the first UTF-8 sequence.
-                        let mut seq = rem.to_vec();
+                        // Fetch remaining bytes of the UTF-8 sequence.
                         let mut more = [0u8; 4];
                         let k = raw_read_retry(fd, more.as_mut_ptr(), need - rem.len());
                         if k > 0 {
-                            seq.extend_from_slice(&more[..k as usize]);
+                            raw_buf.extend_from_slice(&more[..k as usize]);
+                            continue;
                         }
-                        let ch = std::str::from_utf8(&seq).ok().and_then(|s| s.chars().next()).unwrap_or('\u{FFFD}');
-                        let mut tmp = [0u16; 2];
-                        let enc = ch.encode_utf16(&mut tmp);
-                        if out_u16.len() + enc.len() <= max_u16 {
-                            out_u16.extend_from_slice(enc);
-                            consumed = raw_buf.len();
-                        }
+                        // EOF mid-sequence: emit replacement char and consume truncated bytes.
+                        out_u16.push(0xFFFD);
+                        consumed = raw_buf.len();
                     }
                     break;
                 }
@@ -752,14 +795,26 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 let mut tmp = [0u16; 2];
                 let enc = ch.encode_utf16(&mut tmp);
                 if out_u16.len() + enc.len() > max_u16 {
+                    // Only happens when a surrogate pair (2 units) lands on the last 1-unit slot.
+                    // Emit the high surrogate now and retain the low surrogate for the next read
+                    // so small (2-byte) or unbuffered reads never stall with 0 bytes (false EOF).
+                    out_u16.push(enc[0]);
+                    pend.low_surrogate = Some(enc[1]);
+                    consumed += need;
                     break;
                 }
                 out_u16.extend_from_slice(enc);
                 consumed += need;
             }
             if consumed < raw_buf.len() {
-                libc::lseek(fd, -((raw_buf.len() - consumed) as i64), libc::SEEK_CUR);
+                let left = raw_buf.len() - consumed;
+                // Rewind seekable regular files so `_tell`/`ftell` stay accurate; on pipes/ttys
+                // where `lseek` fails with ESPIPE, retain the unread bytes in per-fd state.
+                if pend.low_surrogate.is_some() || libc::lseek(fd, -(left as i64), libc::SEEK_CUR) < 0 {
+                    pend.raw = raw_buf[consumed..].to_vec();
+                }
             }
+            store_u8_pending(fd, pend);
             for (idx, u) in out_u16.iter().enumerate() {
                 let bytes = u.to_le_bytes();
                 *buf.add(idx * 2) = bytes[0];
@@ -855,6 +910,7 @@ pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {
         bad_fd();
         return -1;
     }
+    clear_u8_pending(fd);
     let r = libc::lseek(fd, off, whence);
     if r < 0 {
         errno::set_from_host();
@@ -929,6 +985,7 @@ pub unsafe extern "win64" fn _dup2(fd: i32, fd2: i32) -> i32 {
     // `_open_osfhandle` and `_get_osfhandle` keep the CRT fd and `FileObj` on distinct
     // duplicated POSIX fds, closing `old_h` never closes the newly duplicated `fd2`, and any
     // retained `DuplicateHandle` sibling keeps its own `FileObj` fd alive on the original file.
+    clear_u8_pending(fd2);
     let prev = FDS
         .lock()
         .unwrap()
@@ -1188,7 +1245,7 @@ impl Stream {
         }
         // Reading stdin flushes stdout (interactive convenience; Windows does too).
         let cap = if self.mode == BufMode::None {
-            if fd_info(self.fd).mode.is_unicode() { 2 } else { 1 }
+            if fd_info(self.fd).mode.is_unicode() { 4 } else { 1 }
         } else {
             (self.bufsize.max(512)) & !1
         };
@@ -1290,6 +1347,7 @@ impl Stream {
         self.rbuf.clear();
         self.rpos = 0;
         self.unget.clear();
+        clear_u8_pending(self.fd);
         if libc::lseek(self.fd, off, whence) < 0 {
             errno::set_from_host();
             return -1;
@@ -2852,6 +2910,46 @@ mod tests {
             assert!(fopen(b"U:\\bad.txt\0".as_ptr(), b"w, ccs=BOGUS\0".as_ptr()).is_null());
             assert_eq!(errno::get(), EINVAL);
             crate::ucrt::runtime::_set_invalid_parameter_handler(prev_iph);
+
+            // 6. Unbuffered ccs=UTF-8 stream decodes supplementary UTF-16 surrogate pairs cleanly.
+            let f = fopen(b"U:\\surr.txt\0".as_ptr(), b"w, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            let w_surr = crate::strings::to_wide_z("A😀B");
+            assert_eq!(fputws(w_surr.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+            let f = fopen(b"U:\\surr.txt\0".as_ptr(), b"r, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(setvbuf(f, std::ptr::null_mut(), 4, 0), 0); // _IONBF
+            let mut got_units = Vec::new();
+            loop {
+                let ch = fgetwc(f);
+                if ch == WEOF {
+                    break;
+                }
+                got_units.push(ch as u16);
+            }
+            assert_eq!(String::from_utf16_lossy(&got_units), "A😀B");
+            assert_eq!(fclose(f), 0);
+
+            // 7. Non-seekable pipe with _O_U8TEXT preserves unread bytes across small 2-byte reads
+            //    and splits/resumes surrogate pairs cleanly.
+            let mut pfds = [0i32; 2];
+            assert_eq!(libc::pipe(pfds.as_mut_ptr()), 0);
+            assert_eq!(libc::write(pfds[1], "ABCD😀".as_ptr() as *const c_void, 8), 8);
+            libc::close(pfds[1]);
+            assert_eq!(_setmode(pfds[0], O_U8TEXT), O_TEXT);
+            let mut pipe_units = Vec::new();
+            loop {
+                let mut one = [0u8; 2];
+                let n = _read(pfds[0], one.as_mut_ptr() as *mut c_void, 2);
+                if n <= 0 {
+                    break;
+                }
+                assert_eq!(n, 2);
+                pipe_units.push(u16::from_le_bytes(one));
+            }
+            assert_eq!(String::from_utf16_lossy(&pipe_units), "ABCD😀");
+            assert_eq!(_close(pfds[0]), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

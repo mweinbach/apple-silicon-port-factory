@@ -2835,7 +2835,10 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
                         };
                         if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
                             store.fst_flags = libc::F_ALLOCATEALL;
-                            let _ = libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store);
+                            if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
+                                set_err(errno_to_win32(last_errno()));
+                                return FALSE;
+                            }
                         }
                     }
                 }

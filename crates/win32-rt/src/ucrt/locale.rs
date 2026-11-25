@@ -98,18 +98,35 @@ fn sync_atomics(st: &LocaleState) {
     COLLATE_CP.store(collate.cp, Ordering::Relaxed);
 }
 
-fn intern_ansi(s: &str) -> *mut u8 {
-    struct SyncMap(Mutex<HashMap<String, usize>>);
+fn intern_bytes(bytes: &[u8]) -> *mut u8 {
+    struct SyncMap(Mutex<HashMap<Vec<u8>, usize>>);
     unsafe impl Sync for SyncMap {}
     static CACHE: OnceLock<SyncMap> = OnceLock::new();
     let m = &CACHE.get_or_init(|| SyncMap(Mutex::new(HashMap::new()))).0;
     let mut g = m.lock().unwrap();
-    if let Some(&p) = g.get(s) {
+    if let Some(&p) = g.get(bytes) {
         return p as *mut u8;
     }
-    let p = leak_ansi_z(s);
-    g.insert(s.to_string(), p as usize);
+    let mut v = bytes.to_vec();
+    v.push(0);
+    let p = Box::leak(v.into_boxed_slice()).as_mut_ptr();
+    g.insert(bytes.to_vec(), p as usize);
     p
+}
+
+fn intern_ansi(s: &str) -> *mut u8 {
+    intern_bytes(s.as_bytes())
+}
+
+fn intern_in_cp(s: &str, cp: u32) -> *const u8 {
+    if cp == 0 || cp == 65001 {
+        return intern_bytes(s.as_bytes());
+    }
+    let w = to_wide(s);
+    match kstr::encode_utf16_to_cp(cp, &w, Some(b'?')) {
+        Ok((bytes, _)) => intern_bytes(&bytes),
+        Err(_) => intern_bytes(s.as_bytes()),
+    }
 }
 
 fn intern_wide(s: &str) -> *mut u16 {
@@ -429,7 +446,7 @@ fn build_lconv(num: &LocaleEntry, mon: &LocaleEntry) -> *const Lconv {
     if num.is_c && mon.is_c {
         return lconv_c();
     }
-    let key = format!("{}|{}", num.bcp47, mon.bcp47);
+    let key = format!("{}|{}|{}|{}", num.bcp47, num.cp, mon.bcp47, mon.cp);
     struct SyncMap(Mutex<HashMap<String, usize>>);
     unsafe impl Sync for SyncMap {}
     static CACHE: OnceLock<SyncMap> = OnceLock::new();
@@ -469,16 +486,16 @@ fn build_lconv(num: &LocaleEntry, mon: &LocaleEntry) -> *const Lconv {
     };
 
     let lc = Box::leak(Box::new(Lconv {
-        decimal_point: intern_ansi(&dec_pt),
-        thousands_sep: intern_ansi(&thou_sep),
+        decimal_point: intern_in_cp(&dec_pt, num.cp),
+        thousands_sep: intern_in_cp(&thou_sep, num.cp),
         grouping: intern_ansi(&grp),
-        int_curr_symbol: intern_ansi(&int_curr),
-        currency_symbol: intern_ansi(&curr_sym),
-        mon_decimal_point: intern_ansi(&mon_dec),
-        mon_thousands_sep: intern_ansi(&mon_thou),
+        int_curr_symbol: intern_in_cp(&int_curr, mon.cp),
+        currency_symbol: intern_in_cp(&curr_sym, mon.cp),
+        mon_decimal_point: intern_in_cp(&mon_dec, mon.cp),
+        mon_thousands_sep: intern_in_cp(&mon_thou, mon.cp),
         mon_grouping: intern_ansi(&mon_grp),
-        positive_sign: intern_ansi(&pos_s),
-        negative_sign: intern_ansi(&neg_s),
+        positive_sign: intern_in_cp(&pos_s, mon.cp),
+        negative_sign: intern_in_cp(&neg_s, mon.cp),
         int_frac_digits: frac_d,
         frac_digits: frac_d,
         p_cs_precedes: if mon.is_c { 127 } else { 1 },
@@ -640,7 +657,7 @@ mod tests {
             assert_eq!(___lc_codepage_func(), 0);
             assert_eq!(___mb_cur_max_func(), 1);
 
-            // Switch to de-DE (German) and inspect real lconv!
+            // Switch to de-DE (German, default CP1252) and inspect real lconv encoded in CP1252!
             let r = setlocale(LC_ALL, b"de-DE\0".as_ptr());
             assert!(!r.is_null());
             assert!(from_ansi(r).contains("German"), "got {}", from_ansi(r));
@@ -648,9 +665,18 @@ mod tests {
             let lc = &*localeconv();
             assert_eq!(from_ansi(lc.decimal_point), ",");
             assert_eq!(from_ansi(lc.thousands_sep), ".");
-            assert_eq!(from_ansi(lc.currency_symbol), "€");
+            assert_eq!(cstr_slice(lc.currency_symbol), &[0x80]); // Euro sign in CP1252
             assert_eq!(from_ansi(lc.int_curr_symbol), "EUR");
             assert_eq!(from_wide(lc.w_decimal_point), ",");
+            assert_eq!(from_wide(lc.w_currency_symbol), "€");
+
+            // Switching to de-DE.utf8 encodes narrow currency_symbol in UTF-8 without reusing CP1252 cache!
+            let r = setlocale(LC_ALL, b"de-DE.utf8\0".as_ptr());
+            assert!(!r.is_null());
+            assert_eq!(___lc_codepage_func(), 65001);
+            let lc_u8 = &*localeconv();
+            assert_eq!(cstr_slice(lc_u8.currency_symbol), "€".as_bytes());
+            assert_eq!(from_wide(lc_u8.w_currency_symbol), "€");
 
             // Legacy CRT name with Shift-JIS codepage (932 -> MB_CUR_MAX == 2)
             let r = setlocale(LC_ALL, b"Japanese_Japan.932\0".as_ptr());
