@@ -649,11 +649,10 @@ fn scale_i16_axis(raw: i16, invert: bool, lmin: i32, lmax: i32, deadzone: u32, s
     scale_signed_norm(norm, lmin, lmax, deadzone, saturation)
 }
 
-fn scale_u8_trigger(raw: u8, lmin: i32, lmax: i32, deadzone: u32, saturation: u32) -> i32 {
+fn scale_unit_trigger(mut t: f64, lmin: i32, lmax: i32, deadzone: u32, saturation: u32) -> i32 {
     if lmin >= lmax {
         return lmin;
     }
-    let mut t = (raw as f64) / 255.0;
     let dz = (deadzone.min(10000) as f64) / 10000.0;
     let sat = (saturation.clamp(1, 10000) as f64) / 10000.0;
     if t <= dz {
@@ -665,6 +664,10 @@ fn scale_u8_trigger(raw: u8, lmin: i32, lmax: i32, deadzone: u32, saturation: u3
     }
     let span = (lmax as i64 - lmin as i64) as f64;
     (lmin as f64 + t * span).round().clamp(lmin as f64, lmax as f64) as i32
+}
+
+fn scale_u8_trigger(raw: u8, lmin: i32, lmax: i32, deadzone: u32, saturation: u32) -> i32 {
+    scale_unit_trigger((raw as f64) / 255.0, lmin, lmax, deadzone, saturation)
 }
 
 fn dpad_pov(buttons: u16) -> u32 {
@@ -707,6 +710,8 @@ fn button_pressed(pad: &Gamepad, idx: u8) -> bool {
     pad.buttons & bit != 0
 }
 
+const DEFAULT_AXIS_CAL: (i32, i32, i32) = (DEFAULT_AXIS_MIN, 32_767, DEFAULT_AXIS_MAX);
+
 fn axis_value(pad: &Gamepad, aid: AxisId, range: (i32, i32), dz: u32, sat: u32) -> i32 {
     let (lmin, lmax) = range;
     match aid {
@@ -723,6 +728,44 @@ fn axis_value(pad: &Gamepad, aid: AxisId, range: (i32, i32), dz: u32, sat: u32) 
         AxisId::Rz => scale_signed_norm(0.0, lmin, lmax, dz, sat),
         AxisId::Slider0 => scale_u8_trigger(pad.left_trigger, lmin, lmax, dz, sat),
         AxisId::Slider1 => scale_u8_trigger(pad.right_trigger, lmin, lmax, dz, sat),
+    }
+}
+
+/// Uncalibrated physical axis value in `DIPROP_PHYSICALRANGE` (`0..=65535`),
+/// bypassing `DIPROP_CALIBRATION`, `DIPROP_RANGE`, `DIPROP_DEADZONE`, and
+/// `DIPROP_SATURATION` for `DIPROPCALIBRATIONMODE_RAW`.
+fn axis_raw_value(pad: &Gamepad, aid: AxisId) -> i32 {
+    axis_value(pad, aid, (DEFAULT_AXIS_MIN, DEFAULT_AXIS_MAX), 0, 10_000)
+}
+
+fn axis_value_cooked(pad: &Gamepad, aid: AxisId, cal: (i32, i32, i32), range: (i32, i32), dz: u32, sat: u32) -> i32 {
+    if cal == DEFAULT_AXIS_CAL {
+        return axis_value(pad, aid, range, dz, sat);
+    }
+    let (cal_min, cal_center, cal_max) = cal;
+    if cal_min >= cal_max {
+        return axis_value(pad, aid, range, dz, sat);
+    }
+    let raw = axis_raw_value(pad, aid);
+    let (lmin, lmax) = range;
+    match aid {
+        AxisId::Slider0 | AxisId::Slider1 => {
+            let t = ((raw as i64 - cal_min as i64) as f64 / (cal_max as i64 - cal_min as i64) as f64).clamp(0.0, 1.0);
+            scale_unit_trigger(t, lmin, lmax, dz, sat)
+        }
+        _ => {
+            let norm = if cal_min < cal_center && cal_center < cal_max {
+                if raw < cal_center {
+                    ((raw as i64 - cal_center as i64) as f64 / (cal_center as i64 - cal_min as i64) as f64).clamp(-1.0, 0.0)
+                } else {
+                    ((raw as i64 - cal_center as i64) as f64 / (cal_max as i64 - cal_center as i64) as f64).clamp(0.0, 1.0)
+                }
+            } else {
+                let u = ((raw as i64 - cal_min as i64) as f64 / (cal_max as i64 - cal_min as i64) as f64).clamp(0.0, 1.0);
+                u * 2.0 - 1.0
+            };
+            scale_signed_norm(norm, lmin, lmax, dz, sat)
+        }
     }
 }
 
@@ -951,6 +994,22 @@ impl DeviceState {
         self.mappings.iter().find(|m| m.kind == kind).map(|m| m.ofs).unwrap_or(fallback)
     }
 
+    fn sample_axis(&self, pad: &Gamepad, aid: AxisId) -> i32 {
+        if self.calibration_mode == DIPROPCALIBRATIONMODE_RAW {
+            axis_raw_value(pad, aid)
+        } else {
+            let i = aid as usize;
+            axis_value_cooked(
+                pad,
+                aid,
+                self.axis_cals[i],
+                self.axis_ranges[i],
+                self.axis_deadzones[i],
+                self.axis_saturations[i],
+            )
+        }
+    }
+
     fn sample_buffered(&mut self, pad: Gamepad) -> bool {
         if self.buffer_size == 0 || self.mappings.is_empty() {
             self.last_pad = Some(pad);
@@ -973,9 +1032,8 @@ impl DeviceState {
         for m in mappings {
             let (old_v, new_v) = match m.kind {
                 ObjKind::Axis(a) => {
-                    let i = a as usize;
-                    let o = axis_value(&prev, a, self.axis_ranges[i], self.axis_deadzones[i], self.axis_saturations[i]) as u32;
-                    let n = axis_value(&pad, a, self.axis_ranges[i], self.axis_deadzones[i], self.axis_saturations[i]) as u32;
+                    let o = self.sample_axis(&prev, a) as u32;
+                    let n = self.sample_axis(&pad, a) as u32;
                     (o, n)
                 }
                 ObjKind::Pov(0) => (dpad_pov(prev.buttons), dpad_pov(pad.buttons)),
@@ -1527,6 +1585,9 @@ unsafe extern "win64" fn dev_set_property(this: *mut DeviceObj, prop: *const Gui
                 return DIERR_INVALIDPARAM;
             }
             let c = (diph as *const DIPROPCAL).read_unaligned();
+            if c.l_min >= c.l_max || c.l_center < c.l_min || c.l_center > c.l_max {
+                return DIERR_INVALIDPARAM;
+            }
             let Some(axes) = st.resolve_axis_indices(hdr.dw_obj, hdr.dw_how) else {
                 return DIERR_OBJECTNOTFOUND;
             };
@@ -1623,8 +1684,7 @@ unsafe extern "win64" fn dev_get_device_state(this: *mut DeviceObj, cb_data: u32
     for m in &st.mappings {
         match m.kind {
             ObjKind::Axis(a) => {
-                let i = a as usize;
-                let v = axis_value(&pad, a, st.axis_ranges[i], st.axis_deadzones[i], st.axis_saturations[i]);
+                let v = st.sample_axis(&pad, a);
                 (base.add(m.ofs as usize) as *mut i32).write_unaligned(v);
             }
             ObjKind::Pov(p) => {
@@ -2556,6 +2616,110 @@ mod tests {
             assert_eq!((vt.run_control_panel)(di, 0, 1), DIERR_INVALIDPARAM);
             assert_eq!((vt.run_control_panel)(di, 0, 0), DIERR_UNSUPPORTED);
             assert_eq!((vt.configure_devices)(di, 0, std::ptr::null_mut(), 0, std::ptr::null_mut()), DIERR_UNSUPPORTED);
+
+            backend_disconnect(0);
+            assert_eq!((dvt.release)(dev), 0);
+            assert_eq!((vt.release)(di), 0);
+        }
+    }
+
+    #[test]
+    fn raw_calibration_mode_bypasses_range_deadzone_saturation_and_calibration() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for s in 0..XUSER_MAX_COUNT {
+                backend_disconnect(s);
+            }
+            backend_connect(0, DeviceInfo { name: "CalPad".into(), wireless: false, rumble: false, battery: None });
+
+            let mut di_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(DirectInput8Create(0, 0x800, &IID_IDIRECTINPUT8W, &mut di_ptr, std::ptr::null_mut()), S_OK);
+            let di = di_ptr as *mut Obj;
+            let vt = &*(*di).vtbl;
+
+            let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!((vt.create_device)(di, &slot_guid(0), &mut dev_ptr, std::ptr::null_mut()), S_OK);
+            let dev = dev_ptr as *mut DeviceObj;
+            let dvt = &*(*dev).vtbl;
+
+            let df = DIDATAFORMAT { dw_size: 32, dw_obj_size: 24, dw_flags: 1, dw_data_size: 80, dw_num_objs: 0, rgodf: std::ptr::null() };
+            assert_eq!((dvt.set_data_format)(dev, &df), DI_OK);
+
+            // Configure cooked range (-1000..1000), 25% deadzone, 80% saturation, and buffered events.
+            let rng = DIPROPRANGE { diph: DIPROPHEADER { dw_size: 24, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, l_min: -1000, l_max: 1000 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_RANGE as *const Guid, &rng.diph), DI_OK);
+            let dz = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, dw_data: 2500 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_DEADZONE as *const Guid, &dz.diph), DI_OK);
+            let sat = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, dw_data: 8000 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_SATURATION as *const Guid, &sat.diph), DI_OK);
+            let buf_prop = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, dw_data: 16 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_BUFFERSIZE as *const Guid, &buf_prop.diph), DI_OK);
+
+            backend_update(0, GcPad::default().to_xinput());
+            assert_eq!((dvt.acquire)(dev), DI_OK);
+
+            // COOKED mode: moving lx from 0.0 -> 0.2 stays inside 25% deadzone (immediate=0, 0 buffered events).
+            backend_update(0, GcPad { lx: 0.2, ..Default::default() }.to_xinput());
+            let mut js = std::mem::zeroed::<DIJOYSTATE>();
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert_eq!(js.l_x, 0);
+            let mut dod = [DIDEVICEOBJECTDATA::default(); 8];
+            let mut n = 8u32;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+            assert_eq!(n, 0);
+
+            // COOKED mode: lx = 0.85 exceeds 80% saturation -> clamps to l_max (1000).
+            backend_update(0, GcPad { lx: 0.85, ..Default::default() }.to_xinput());
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert_eq!(js.l_x, 1000);
+            n = 8;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+            assert_eq!(n, 1);
+            assert_eq!((dod[0].dw_ofs, dod[0].dw_data as i32), (0, 1000));
+
+            // Switch to DIPROPCALIBRATIONMODE_RAW: range, deadzone, saturation, and calibration are bypassed.
+            let raw_mode = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, dw_data: DIPROPCALIBRATIONMODE_RAW };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &raw_mode.diph), DI_OK);
+
+            // Immediate GetDeviceState at lx = 0.85 must report raw physical (~60620), neither 1000 nor saturated 65535.
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert!((js.l_x - 60_620).abs() <= 4, "expected raw lx ~60620, got {}", js.l_x);
+
+            // Reset to center, drain, then move into the 25% deadzone (lx = 0.2): RAW mode must report
+            // both immediate and buffered raw physical (~39321) rather than deadzoned 0.
+            backend_update(0, GcPad::default().to_xinput());
+            assert_eq!((dvt.poll)(dev), DI_OK);
+            n = 8;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+
+            backend_update(0, GcPad { lx: 0.2, ..Default::default() }.to_xinput());
+            assert_eq!((dvt.poll)(dev), DI_OK);
+            n = 8;
+            assert_eq!((dvt.get_device_data)(dev, 24, dod.as_mut_ptr() as *mut c_void, &mut n, 0), DI_OK);
+            assert_eq!(n, 1);
+            assert_eq!(dod[0].dw_ofs, 0);
+            let buffered_raw = dod[0].dw_data as i32;
+            assert!((buffered_raw - 39_321).abs() <= 4, "expected buffered raw lx ~39321, got {buffered_raw}");
+
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert_eq!(js.l_x, buffered_raw);
+
+            // Custom DIPROP_CALIBRATION shifts center to 39321: ignored in RAW, applied when back in COOKED.
+            let cal = DIPROPCAL { diph: DIPROPHEADER { dw_size: 28, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, l_min: 0, l_center: 39_321, l_max: 65_535 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATION as *const Guid, &cal.diph), DI_OK);
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert_eq!(js.l_x, buffered_raw);
+
+            let cooked_mode = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_DEVICE }, dw_data: DIPROPCALIBRATIONMODE_COOKED };
+            assert_eq!((dvt.set_property)(dev, DIPROP_CALIBRATIONMODE as *const Guid, &cooked_mode.diph), DI_OK);
+            let dz0 = DIPROPDWORD { diph: DIPROPHEADER { dw_size: 20, dw_header_size: 16, dw_obj: 0, dw_how: DIPH_BYOFFSET }, dw_data: 0 };
+            assert_eq!((dvt.set_property)(dev, DIPROP_DEADZONE as *const Guid, &dz0.diph), DI_OK);
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert_eq!(js.l_x, 0);
+            // Physical center (32767) is below the calibrated center (39321), so cooked output is negative.
+            backend_update(0, GcPad::default().to_xinput());
+            assert_eq!((dvt.get_device_state)(dev, 80, &mut js as *mut _ as *mut c_void), DI_OK);
+            assert!(js.l_x < -150, "expected negative calibrated lx, got {}", js.l_x);
 
             backend_disconnect(0);
             assert_eq!((dvt.release)(dev), 0);
