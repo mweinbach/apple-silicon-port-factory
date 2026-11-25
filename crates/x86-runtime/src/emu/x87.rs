@@ -1981,22 +1981,42 @@ impl X87State {
                     return;
                 }
                 let mut dummy = 0u16;
-                let x = f64::from_bits(a.to_f64_bits(RC_RN, &mut dummy));
+                let tiny = a.kind == Fp80Kind::Finite && a.exp <= -64;
+                let x = if tiny { 0.0 } else { f64::from_bits(a.to_f64_bits(RC_RN, &mut dummy)) };
                 match op {
                     X87_UNARY_SIN => {
-                        let r = if a.kind == Fp80Kind::Zero { a } else { sw |= SW_PE; Fp80::from_f64_raw(x.sin()) };
+                        let r = if a.kind == Fp80Kind::Zero {
+                            a
+                        } else if tiny {
+                            sw |= SW_PE;
+                            a
+                        } else {
+                            sw |= SW_PE;
+                            Fp80::from_f64_raw(x.sin())
+                        };
                         self.set_slot_bytes(p0, r.to_f80_bytes());
                         self.sw = sw;
                         self.sync_top();
                     }
                     X87_UNARY_COS => {
-                        let r = if a.kind == Fp80Kind::Zero { Fp80::one() } else { sw |= SW_PE; Fp80::from_f64_raw(x.cos()) };
+                        let r = if a.kind == Fp80Kind::Zero {
+                            Fp80::one()
+                        } else if tiny {
+                            sw |= SW_PE;
+                            Fp80::one()
+                        } else {
+                            sw |= SW_PE;
+                            Fp80::from_f64_raw(x.cos())
+                        };
                         self.set_slot_bytes(p0, r.to_f80_bytes());
                         self.sw = sw;
                         self.sync_top();
                     }
                     X87_UNARY_SINCOS => {
                         let (s_val, c_val) = if a.kind == Fp80Kind::Zero {
+                            (a, Fp80::one())
+                        } else if tiny {
+                            sw |= SW_PE;
                             (a, Fp80::one())
                         } else {
                             sw |= SW_PE;
@@ -2010,6 +2030,9 @@ impl X87State {
                     _ => {
                         // X87_UNARY_PTAN: ST(0) = tan(x), then push +1.0.
                         let t_val = if a.kind == Fp80Kind::Zero {
+                            a
+                        } else if tiny {
+                            sw |= SW_PE;
                             a
                         } else {
                             sw |= SW_PE;
@@ -2045,14 +2068,48 @@ impl X87State {
                     if self.raw_denormal(p0) || self.raw_denormal(p1) {
                         sw |= SW_DE;
                     }
-                    let mut dummy = 0u16;
-                    let xf = f64::from_bits(x.to_f64_bits(RC_RN, &mut dummy));
-                    let yf = f64::from_bits(y.to_f64_bits(RC_RN, &mut dummy));
-                    let r = yf.atan2(xf);
-                    if r != 0.0 {
-                        sw |= SW_PE;
+                    let ext_cw = (self.cw & !0x0300) | 0x0300;
+                    if x.kind == Fp80Kind::Finite && y.kind == Fp80Kind::Finite {
+                        if x.sign == 0 && (x.exp - y.exp) > 64 {
+                            // |y/x| < 2^-64 with x > 0: atan2(y, x) == y/x in extended precision.
+                            let r = Fp80::div(y, x, ext_cw, &mut sw);
+                            sw |= SW_PE;
+                            r
+                        } else {
+                            // Scale both operands by 2^(-max(x.exp, y.exp)) so extended-precision
+                            // ratios outside f64 range (e.g. 2^1024 vs 2^1025 or 2^-5000 vs 2^-4999)
+                            // never overflow to Inf/Inf or collapse to 0/0 before atan2.
+                            let max_exp = x.exp.max(y.exp);
+                            let sx = Fp80 { exp: x.exp - max_exp, ..x };
+                            let sy = Fp80 { exp: y.exp - max_exp, ..y };
+                            let mut dummy = 0u16;
+                            let xf = f64::from_bits(sx.to_f64_bits(RC_RN, &mut dummy));
+                            let yf = f64::from_bits(sy.to_f64_bits(RC_RN, &mut dummy));
+                            let r = yf.atan2(xf);
+                            if r != 0.0 {
+                                sw |= SW_PE;
+                            }
+                            Fp80::from_f64_raw(r)
+                        }
+                    } else {
+                        // One or both operands are Zero/Inf: normalize any Finite operand's exponent
+                        // to 0 so extreme extended exponents never underflow to 0 or overflow to Inf.
+                        let norm = |v: Fp80| {
+                            if v.kind == Fp80Kind::Finite {
+                                Fp80 { exp: 0, ..v }
+                            } else {
+                                v
+                            }
+                        };
+                        let mut dummy = 0u16;
+                        let xf = f64::from_bits(norm(x).to_f64_bits(RC_RN, &mut dummy));
+                        let yf = f64::from_bits(norm(y).to_f64_bits(RC_RN, &mut dummy));
+                        let r = yf.atan2(xf);
+                        if r != 0.0 {
+                            sw |= SW_PE;
+                        }
+                        Fp80::from_f64_raw(r)
                     }
-                    Fp80::from_f64_raw(r)
                 };
                 self.set_slot_bytes(p1, res.to_f80_bytes());
                 self.valid_mask |= 1 << p1;
@@ -2092,11 +2149,18 @@ impl X87State {
                             if self.raw_denormal(p0) {
                                 sw |= SW_DE;
                             }
-                            let mut dummy = 0u16;
-                            let x = f64::from_bits(a.to_f64_bits(RC_RN, &mut dummy));
-                            let r = (x * core::f64::consts::LN_2).exp_m1();
-                            sw |= SW_PE;
-                            Fp80::from_f64_raw(r)
+                            if a.exp <= -64 {
+                                let ext_cw = (self.cw & !0x0300) | 0x0300;
+                                let r = Fp80::mul(a, Fp80::from_f64_raw(core::f64::consts::LN_2), ext_cw, &mut sw);
+                                sw |= SW_PE;
+                                r
+                            } else {
+                                let mut dummy = 0u16;
+                                let x = f64::from_bits(a.to_f64_bits(RC_RN, &mut dummy));
+                                let r = (x * core::f64::consts::LN_2).exp_m1();
+                                sw |= SW_PE;
+                                Fp80::from_f64_raw(r)
+                            }
                         }
                     };
                     self.set_slot_bytes(p0, res.to_f80_bytes());
@@ -2158,6 +2222,12 @@ impl X87State {
                             let mut dummy = 0u16;
                             let log2_x = if mant_frac == 0 {
                                 Fp80::from_i64(x.exp as i64)
+                            } else if x.exp == -1 && x.sig >= 0xC000_0000_0000_0000 {
+                                // x in [0.75, 1.0): x = 1 - diff * 2^-64 with exact non-zero diff
+                                // in 1..=2^62, avoiding catastrophic cancellation near 1.0.
+                                let diff = 0u64.wrapping_sub(x.sig);
+                                let neg_delta = -(diff as f64) * f64::from_bits(0x3BF0_0000_0000_0000);
+                                Fp80::from_f64_raw(neg_delta.ln_1p() * core::f64::consts::LOG2_E)
                             } else {
                                 let frac = (mant_frac as f64) * f64::from_bits(0x3C00_0000_0000_0000);
                                 let log2_m = Fp80::from_f64_raw(frac.ln_1p() * core::f64::consts::LOG2_E);

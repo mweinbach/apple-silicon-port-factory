@@ -1912,3 +1912,72 @@ fn x87_fyl2x_extended_exponent() {
     assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, (16383 + 5010) as u16), "2^5000 * log2(2^1024)");
     assert!((rd_f64(144) - core::f64::consts::LOG2_E).abs() < 1e-12, "2^5000 * log2(1 + 2^-5000)");
 }
+
+/// 16. Regressions for:
+///   (a) `fyl2x` just below 1.0 (`0x3FFE:0xFFFF_FFFF_FFFF_FFFF` = `1 - 2^-64`): must not cancel
+///       to 0.0 (exact value ~= `-7.820865487829389e-20`).
+///   (b) `fpatan` preserving ratios and quadrants across extended exponents (`2^1024` vs `2^1025`,
+///       `2^-5000` vs `2^-4999`, `0.0` vs `2^-5000`, `2^-5000` vs `1.0`).
+#[test]
+fn x87_fyl2x_near_one_and_fpatan_extended_ratio() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 256];
+    let wr_m80 = |buf: &mut [u8], off: usize, sig: u64, se: u16| {
+        buf[off..off + 8].copy_from_slice(&sig.to_le_bytes());
+        buf[off + 8..off + 10].copy_from_slice(&se.to_le_bytes());
+    };
+    wr_m80(&mut init, 0, u64::MAX, 0x3FFE);                             // 1 - 2^-64
+    wr_m80(&mut init, 16, 0x8000_0000_0000_0000, (16383 + 1024) as u16); // 2^1024
+    wr_m80(&mut init, 32, 0x8000_0000_0000_0000, (16383 + 1025) as u16); // 2^1025
+    wr_m80(&mut init, 48, 0x8000_0000_0000_0000, (16383 - 5000) as u16); // 2^-5000
+    wr_m80(&mut init, 64, 0x8000_0000_0000_0000, (16383 - 4999) as u16); // 2^-4999
+
+    let code = assemble(|a| {
+        a.fninit().unwrap();
+        // (a) 1 * log2(1 - 2^-64) ~= -2^-64 * LOG2_E ~= -7.820865487829389e-20
+        a.fld1().unwrap();
+        a.fld(tbyte_ptr(rcx)).unwrap();
+        a.fyl2x().unwrap();
+        a.fstp(qword_ptr(rcx + 96)).unwrap();
+
+        // (b1) atan2(2^1025, 2^1024) = atan(2) ~= 1.1071487177940905
+        a.fld(tbyte_ptr(rcx + 32)).unwrap(); // ST(1) = y = 2^1025
+        a.fld(tbyte_ptr(rcx + 16)).unwrap(); // ST(0) = x = 2^1024
+        a.fpatan().unwrap();
+        a.fstp(qword_ptr(rcx + 104)).unwrap();
+
+        // (b2) atan2(2^-4999, 2^-5000) = atan(2) ~= 1.1071487177940905
+        a.fld(tbyte_ptr(rcx + 64)).unwrap(); // ST(1) = y = 2^-4999
+        a.fld(tbyte_ptr(rcx + 48)).unwrap(); // ST(0) = x = 2^-5000
+        a.fpatan().unwrap();
+        a.fstp(qword_ptr(rcx + 112)).unwrap();
+
+        // (b3) atan2(2^-5000, 0.0) = +pi/2
+        a.fld(tbyte_ptr(rcx + 48)).unwrap(); // ST(1) = y = 2^-5000
+        a.fldz().unwrap();                   // ST(0) = x = 0.0
+        a.fpatan().unwrap();
+        a.fstp(qword_ptr(rcx + 120)).unwrap();
+
+        // (b4) atan2(2^-5000, 1.0) = 2^-5000 (extended m80!)
+        a.fld(tbyte_ptr(rcx + 48)).unwrap(); // ST(1) = y = 2^-5000
+        a.fld1().unwrap();                   // ST(0) = x = 1.0
+        a.fpatan().unwrap();
+        a.fstp(tbyte_ptr(rcx + 128)).unwrap();
+    });
+
+    let r = run_diff_x87("fyl2x_near_one_fpatan_ratio", &code, &init);
+    let rd_f64 = |off: usize| f64::from_bits(u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()));
+    let rd_m80 = |off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(r.data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(r.data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    let want_yl2x = -(2.0f64.powi(-64)) * core::f64::consts::LOG2_E;
+    assert!((rd_f64(96) - want_yl2x).abs() < 1e-32, "fyl2x(1-2^-64) = {}", rd_f64(96));
+    let want_atan2 = 2.0f64.atan();
+    assert!((rd_f64(104) - want_atan2).abs() < 1e-15, "atan2(2^1025, 2^1024) = {}", rd_f64(104));
+    assert!((rd_f64(112) - want_atan2).abs() < 1e-15, "atan2(2^-4999, 2^-5000) = {}", rd_f64(112));
+    assert!((rd_f64(120) - core::f64::consts::FRAC_PI_2).abs() < 1e-15, "atan2(2^-5000, 0) = {}", rd_f64(120));
+    assert_eq!(rd_m80(128), (0x8000_0000_0000_0000, (16383 - 5000) as u16), "atan2(2^-5000, 1)");
+}
