@@ -47,6 +47,9 @@ pub(super) const SCH_CREDENTIALS_VERSION: u32 = 5;
 
 pub(super) const SCH_CRED_NO_SERVERNAME_CHECK: u32 = 0x0000_0004;
 pub(super) const SCH_CRED_MANUAL_CRED_VALIDATION: u32 = 0x0000_0008;
+pub(super) const SCH_CRED_DISABLE_RECONNECTS: u32 = 0x0000_0080;
+
+pub(super) const SSL_SESSION_RECONNECT: u32 = 1;
 
 pub(super) const SP_PROT_TLS1_2_SERVER: u32 = 0x0000_0400;
 pub(super) const SP_PROT_TLS1_2_CLIENT: u32 = 0x0000_0800;
@@ -378,6 +381,8 @@ struct SecPkgInfoW {
 // Internal credential / context tables & shared rustls TLS configuration
 // ---------------------------------------------------------------------------
 
+type ClientConfigCacheKey = (bool, bool, bool, Vec<Vec<u8>>);
+
 #[derive(Clone)]
 struct SchannelCred {
     principal: String,
@@ -385,10 +390,15 @@ struct SchannelCred {
     flags: u32,
     enable_tls12: bool,
     enable_tls13: bool,
+    has_root_store: bool,
     extra_roots_der: Vec<Vec<u8>>,
     server_cert_chain: Vec<Vec<u8>>,
     server_private_key_pkcs8: Option<Vec<u8>>,
     local_cert_der: Option<Vec<u8>>,
+    client_configs: Arc<std::sync::Mutex<Vec<(ClientConfigCacheKey, Arc<ClientConfig>)>>>,
+    client_session_cache: Arc<rustls::client::ClientSessionMemoryCache>,
+    server_session_cache: Arc<rustls::server::ServerSessionMemoryCache>,
+    server_ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>,
 }
 
 struct SchannelContext {
@@ -407,6 +417,9 @@ struct SchannelContext {
     pending_handshake_out: Vec<u8>,
     pending_eof: bool,
     pending_plaintext: Vec<u8>,
+    server_hello_hs_buf: Vec<u8>,
+    server_hello_parsed: bool,
+    tls12_session_id: Vec<u8>,
 }
 
 static CRED_TABLE: HandleTable<SchannelCred> = HandleTable::new(1, 2);
@@ -460,15 +473,29 @@ fn build_schannel_tls_config(
         !cred.server_cert_chain.is_empty() && cred.server_private_key_pkcs8.is_some();
 
     // Fast path onto shared cached `crate::net_tls::build_tls_config` when using
-    // default roots, both TLS 1.2 + 1.3, standard SNI, and no client cert.
+    // default roots, both TLS 1.2 + 1.3, standard SNI, reconnects enabled, and no client cert.
+    let disable_reconnects = (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0;
     if cred.extra_roots_der.is_empty()
         && cred.enable_tls12
         && cred.enable_tls13
         && enable_sni
         && !has_client_cert
+        && !disable_reconnects
     {
         let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
         return Ok(net_tls::build_tls_config(policy, &alpn_refs));
+    }
+
+    // Reuse a cached ClientConfig on this credential when parameters match so rustls keeps the
+    // same ServerCertVerifier / ResolvesClientCert Arc identity required for session resumption.
+    let cache_key: ClientConfigCacheKey =
+        (manual_validation, no_servername_check, enable_sni, alpn.clone());
+    if !disable_reconnects {
+        if let Ok(guard) = cred.client_configs.lock() {
+            if let Some((_, existing)) = guard.iter().find(|(k, _)| *k == cache_key) {
+                return Ok(existing.clone());
+            }
+        }
     }
 
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
@@ -532,10 +559,23 @@ fn build_schannel_tls_config(
         }
     };
     config.enable_sni = enable_sni;
+    if disable_reconnects {
+        config.resumption = rustls::client::Resumption::disabled();
+    } else {
+        config.resumption = rustls::client::Resumption::store(cred.client_session_cache.clone());
+    }
     if !alpn.is_empty() {
         config.alpn_protocols = alpn;
     }
-    Ok(Arc::new(config))
+    let cfg = Arc::new(config);
+    if !disable_reconnects {
+        if let Ok(mut guard) = cred.client_configs.lock() {
+            if guard.len() < 16 {
+                guard.push((cache_key, cfg.clone()));
+            }
+        }
+    }
+    Ok(cfg)
 }
 
 fn map_rustls_error_to_sec(err: &rustls::Error) -> i32 {
@@ -594,6 +634,76 @@ fn inspect_tls_record(buf: &[u8]) -> Result<Option<usize>, usize> {
     Ok(Some(total))
 }
 
+/// Sniff the `ServerHello.session_id` (up to 32 bytes) from TLS handshake records so
+/// `SECPKG_ATTR_SESSION_INFO` can report the negotiated TLS 1.2 session ID alongside
+/// `rustls::HandshakeKind`. Skips TLS 1.3 HelloRetryRequest messages.
+fn capture_server_hello_session_id(ctx: &mut SchannelContext, tls_records: &[u8]) {
+    if ctx.server_hello_parsed {
+        return;
+    }
+    const HRR_RANDOM: [u8; 32] = [
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+        0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+        0x33, 0x9C,
+    ];
+    let mut off = 0usize;
+    while off + 5 <= tls_records.len() {
+        let ctype = tls_records[off];
+        let rec_len = u16::from_be_bytes([tls_records[off + 3], tls_records[off + 4]]) as usize;
+        let end = off + 5 + rec_len;
+        if end > tls_records.len() {
+            break;
+        }
+        if ctype == 22 {
+            let payload = &tls_records[off + 5..end];
+            let cap = 512usize.saturating_sub(ctx.server_hello_hs_buf.len());
+            if cap > 0 {
+                let take = payload.len().min(cap);
+                ctx.server_hello_hs_buf.extend_from_slice(&payload[..take]);
+            }
+        }
+        off = end;
+    }
+    let mut pos = 0usize;
+    while pos + 4 <= ctx.server_hello_hs_buf.len() {
+        let hs_type = ctx.server_hello_hs_buf[pos];
+        let hs_len = u32::from_be_bytes([
+            0,
+            ctx.server_hello_hs_buf[pos + 1],
+            ctx.server_hello_hs_buf[pos + 2],
+            ctx.server_hello_hs_buf[pos + 3],
+        ]) as usize;
+        let body_start = pos + 4;
+        if hs_type == 0x02 {
+            if body_start + 35 > ctx.server_hello_hs_buf.len() {
+                return;
+            }
+            let random = &ctx.server_hello_hs_buf[body_start + 2..body_start + 34];
+            let sid_len = ctx.server_hello_hs_buf[body_start + 34] as usize;
+            if sid_len > 32 {
+                ctx.server_hello_parsed = true;
+                ctx.server_hello_hs_buf.clear();
+                return;
+            }
+            if body_start + 35 + sid_len > ctx.server_hello_hs_buf.len() {
+                return;
+            }
+            if random != HRR_RANDOM {
+                ctx.tls12_session_id =
+                    ctx.server_hello_hs_buf[body_start + 35..body_start + 35 + sid_len].to_vec();
+                ctx.server_hello_parsed = true;
+                ctx.server_hello_hs_buf.clear();
+                return;
+            }
+        }
+        let next = body_start.saturating_add(hs_len);
+        if next > ctx.server_hello_hs_buf.len() {
+            return;
+        }
+        pos = next;
+    }
+}
+
 fn drain_tls_out(conn: &mut Connection) -> Vec<u8> {
     let mut out = Vec::new();
     while conn.wants_write() {
@@ -604,6 +714,24 @@ fn drain_tls_out(conn: &mut Connection) -> Vec<u8> {
         }
     }
     out
+}
+
+pub(super) fn build_inbound_client_root_store(
+    has_root_store: bool,
+    extra_roots_der: &[Vec<u8>],
+) -> Arc<rustls::RootCertStore> {
+    if has_root_store {
+        // When the server supplies a private hRootStore, scope mutual-TLS client trust
+        // strictly to the CAs in that store (never merge public WebPKI roots, and never
+        // fall back to public roots if the supplied store is empty).
+        let mut s = rustls::RootCertStore::empty();
+        for der in extra_roots_der {
+            let _ = s.add(CertificateDer::from(der.as_slice()));
+        }
+        Arc::new(s)
+    } else {
+        net_tls::root_cert_store()
+    }
 }
 
 fn build_schannel_server_config(
@@ -638,18 +766,10 @@ fn build_schannel_server_config(
         .with_protocol_versions(&versions)
         .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
     let mut cfg = if require_client_auth {
-        let roots = if cred.extra_roots_der.is_empty() {
-            net_tls::root_cert_store()
-        } else {
-            let mut s = (*net_tls::root_cert_store()).clone();
-            for der in &cred.extra_roots_der {
-                let _ = s.add(CertificateDer::from(der.as_slice()));
-            }
-            Arc::new(s)
-        };
+        let roots = build_inbound_client_root_store(cred.has_root_store, &cred.extra_roots_der);
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
             .build()
-            .map_err(|_| SEC_E_INTERNAL_ERROR)?;
+            .map_err(|_| SEC_E_NO_CREDENTIALS)?;
         builder
             .with_client_cert_verifier(verifier)
             .with_single_cert(chain, key)
@@ -660,6 +780,15 @@ fn build_schannel_server_config(
             .with_single_cert(chain, key)
             .map_err(|_| SEC_E_NO_CREDENTIALS)?
     };
+    if (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0 {
+        cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        cfg.send_tls13_tickets = 0;
+    } else {
+        cfg.session_storage = cred.server_session_cache.clone();
+        if let Some(ref ticketer) = cred.server_ticketer {
+            cfg.ticketer = ticketer.clone();
+        }
+    }
     if !alpn.is_empty() {
         cfg.alpn_protocols = alpn;
     }
@@ -839,6 +968,7 @@ pub(super) unsafe fn acquire_credentials_impl(
     let mut flags = 0u32;
     let mut enable_tls12 = true;
     let mut enable_tls13 = true;
+    let mut has_root_store = false;
     let mut extra_roots_der = Vec::new();
     let mut server_cert_chain = Vec::new();
     let mut server_private_key_pkcs8 = None;
@@ -891,6 +1021,7 @@ pub(super) unsafe fn acquire_credentials_impl(
                 flags = std::ptr::read_unaligned(base.add(0x48) as *const u32);
                 extract_creds(c_creds, pa_cred);
                 if !h_root_store.is_null() {
+                    has_root_store = true;
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
                 if enabled != 0 {
@@ -913,6 +1044,7 @@ pub(super) unsafe fn acquire_credentials_impl(
                 let p_params = std::ptr::read_unaligned(base.add(0x40) as *const *const u8);
                 extract_creds(c_creds, pa_cred);
                 if !h_root_store.is_null() {
+                    has_root_store = true;
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
                 if c_params > 0 && !p_params.is_null() {
@@ -952,10 +1084,15 @@ pub(super) unsafe fn acquire_credentials_impl(
         flags,
         enable_tls12,
         enable_tls13,
+        has_root_store,
         extra_roots_der,
         server_cert_chain,
         server_private_key_pkcs8,
         local_cert_der,
+        client_configs: Arc::new(std::sync::Mutex::new(Vec::new())),
+        client_session_cache: Arc::new(rustls::client::ClientSessionMemoryCache::new(64)),
+        server_session_cache: rustls::server::ServerSessionMemoryCache::new(64),
+        server_ticketer: rustls::crypto::ring::Ticketer::new().ok(),
     });
     write_handle(ph_credential, MAGIC_CRED, id);
     if !pts_expiry.is_null() {
@@ -1089,6 +1226,9 @@ pub(super) unsafe fn initialize_security_context_impl(
             pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
+            server_hello_hs_buf: Vec::new(),
+            server_hello_parsed: false,
+            tls12_session_id: Vec::new(),
         });
         write_handle(ph_new_context, MAGIC_CTXT, ctx_id);
         if !pf_context_attr.is_null() {
@@ -1212,7 +1352,11 @@ pub(super) unsafe fn initialize_security_context_impl(
                         return SEC_E_INVALID_TOKEN;
                     }
                     Ok(Some(rec_total)) => {
-                        let mut rec = &input[consumed..consumed + rec_total];
+                        let rec_slice = &input[consumed..consumed + rec_total];
+                        if !ctx.is_server {
+                            capture_server_hello_session_id(ctx, rec_slice);
+                        }
+                        let mut rec = rec_slice;
                         while !rec.is_empty() {
                             match ctx.conn.read_tls(&mut rec) {
                                 Ok(0) => break,
@@ -1254,6 +1398,9 @@ pub(super) unsafe fn initialize_security_context_impl(
             }
 
             let out_bytes = drain_tls_out(&mut ctx.conn);
+            if ctx.is_server && !out_bytes.is_empty() {
+                capture_server_hello_session_id(ctx, &out_bytes);
+            }
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
                 if !out_bytes.is_empty() {
                     ctx.pending_handshake_out = out_bytes;
@@ -1353,6 +1500,9 @@ pub(super) unsafe fn accept_security_context_impl(
             pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
+            server_hello_hs_buf: Vec::new(),
+            server_hello_parsed: false,
+            tls12_session_id: Vec::new(),
         });
         (id, true)
     } else {
@@ -1441,7 +1591,11 @@ pub(super) unsafe fn accept_security_context_impl(
                     }
                     Ok(None) => return SEC_E_INVALID_TOKEN,
                     Ok(Some(rec_total)) => {
-                        let mut rec = &input[consumed..consumed + rec_total];
+                        let rec_slice = &input[consumed..consumed + rec_total];
+                        if !ctx.is_server {
+                            capture_server_hello_session_id(ctx, rec_slice);
+                        }
+                        let mut rec = rec_slice;
                         while !rec.is_empty() {
                             match ctx.conn.read_tls(&mut rec) {
                                 Ok(0) => break,
@@ -1487,6 +1641,9 @@ pub(super) unsafe fn accept_security_context_impl(
             }
 
             let out_bytes = drain_tls_out(&mut ctx.conn);
+            if ctx.is_server && !out_bytes.is_empty() {
+                capture_server_hello_session_id(ctx, &out_bytes);
+            }
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
                 if !out_bytes.is_empty() {
                     ctx.pending_handshake_out = out_bytes;
@@ -2660,13 +2817,31 @@ pub(super) unsafe fn query_context_attributes_impl(
                 SEC_E_OK
             }
             SECPKG_ATTR_SESSION_INFO => {
+                let Some(kind) = ctx.conn.handshake_kind() else {
+                    return SEC_E_INVALID_HANDLE;
+                };
+                let dw_flags = match kind {
+                    rustls::HandshakeKind::Resumed => SSL_SESSION_RECONNECT,
+                    rustls::HandshakeKind::Full
+                    | rustls::HandshakeKind::FullWithHelloRetryRequest => 0,
+                };
+                let mut rgb_session_id = [0u8; 32];
+                let cb_session_id = if ctx.conn.protocol_version() == Some(ProtocolVersion::TLSv1_2)
+                    && !ctx.tls12_session_id.is_empty()
+                {
+                    let n = ctx.tls12_session_id.len().min(32);
+                    rgb_session_id[..n].copy_from_slice(&ctx.tls12_session_id[..n]);
+                    n as u32
+                } else {
+                    0
+                };
                 unsafe {
                     std::ptr::write_unaligned(
                         p_buffer as *mut SecPkgContextSessionInfo,
                         SecPkgContextSessionInfo {
-                            dw_flags: 0,
-                            cb_session_id: 0,
-                            rgb_session_id: [0u8; 32],
+                            dw_flags,
+                            cb_session_id,
+                            rgb_session_id,
                         },
                     );
                 }
