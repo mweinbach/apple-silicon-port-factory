@@ -1144,6 +1144,31 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         );
         assert_eq!(face_get_glyph_count(face as PFontFace), 2);
 
+        // 1b. IDWriteFontFace::GetFiles must retain the custom backing file's loader & reference key.
+        let face_get_files_fn: unsafe extern "win64" fn(*mut c_void, *mut u32, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(face).add(4).read_unaligned());
+        let mut fcount = 0u32;
+        assert_eq!(face_get_files_fn(face, &mut fcount, std::ptr::null_mut()), S_OK);
+        assert_eq!(fcount, 1, "custom font face must report its backing font file");
+        let mut out_file: *mut c_void = std::ptr::null_mut();
+        assert_eq!(face_get_files_fn(face, &mut fcount, &mut out_file), S_OK);
+        assert_eq!(fcount, 1);
+        assert!(!out_file.is_null());
+        let ff_get_key: unsafe extern "win64" fn(*mut c_void, *mut *const c_void, *mut u32) -> HRESULT =
+            std::mem::transmute(vtbl_of(out_file).add(3).read_unaligned());
+        let ff_get_loader: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(out_file).add(4).read_unaligned());
+        let mut rk_ptr: *const c_void = std::ptr::null();
+        let mut rk_sz = 0u32;
+        assert_eq!(ff_get_key(out_file, &mut rk_ptr, &mut rk_sz), S_OK);
+        assert_eq!(rk_sz, 4);
+        assert_eq!(std::ptr::read_unaligned(rk_ptr as *const u32), key);
+        let mut got_loader: *mut c_void = std::ptr::null_mut();
+        assert_eq!(ff_get_loader(out_file, &mut got_loader), S_OK);
+        assert_eq!(got_loader, &mut fl as *mut _ as *mut c_void);
+        release_com(got_loader);
+        release_com(out_file);
+
         // 2. CreateCustomFontCollection
         let mut cl = MockColLoader {
             vtbl: &cl_vtbl,

@@ -1731,6 +1731,31 @@ int main(void) {
         ExitProcess(8);
     }
 
+    // >10 formatting arguments (>12 total Win64 args, including 11th+ %s pointer) must all be read
+    // from the guest Win64 stack rather than truncated at 12 slots on ARM64.
+    char big_a[128];
+    int n_many_a = wsprintfA(
+        big_a,
+        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%s,%d,%s",
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "eleven", 12, "thirteen", 14, "fifteen"
+    );
+    const char *exp_a = "1,2,3,4,5,6,7,8,9,10,eleven,12,thirteen,14,fifteen";
+    if (n_many_a != (int)strlen(exp_a) || strcmp(big_a, exp_a) != 0) {
+        fprintf(stderr, "FAIL: wsprintfA >12 args (ret=%d, '%s')\n", n_many_a, big_a);
+        ExitProcess(9);
+    }
+    WCHAR big_w[128];
+    int n_many_w = wsprintfW(
+        big_w,
+        L"%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%s,%d,%s",
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, L"eleven", 12, L"thirteen", 14, L"fifteen"
+    );
+    const WCHAR *exp_w = L"1,2,3,4,5,6,7,8,9,10,eleven,12,thirteen,14,fifteen";
+    if (n_many_w != (int)wcslen(exp_w) || wcscmp(big_w, exp_w) != 0) {
+        fprintf(stderr, "FAIL: wsprintfW >12 args (ret=%d)\n", n_many_w);
+        ExitProcess(10);
+    }
+
     printf("CORPUS_WSPRINTF: PASS ALL\n");
     fflush(stdout);
     return 0;

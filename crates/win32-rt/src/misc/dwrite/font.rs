@@ -5,7 +5,7 @@ use super::abi::*;
 use super::sfnt::{
     default_fallback_metrics, fallback_char_advance_du, fallback_cp_to_gid, fallback_gid_to_char,
     flatten_quad_contour, load_cached_file_bytes, parse_font_bytes_metadata,
-    parse_font_file_metadata, rasterize_glyph, FontMeta, SfntFace,
+    parse_font_file_metadata, rasterize_glyph, CustomFontFileRef, FontMeta, SfntFace,
 };
 use crate::com::{
     com_add_ref, com_call_add_ref, com_from_iface, com_release, qi_helper_bytes,
@@ -103,6 +103,7 @@ impl FontCollectionData {
                     info_strings: info,
                     file_path: None,
                     raw_bytes: None,
+                    custom_file: None,
                 }));
             }
             map.insert(key, (name.to_string(), list));
@@ -629,7 +630,17 @@ pub(super) unsafe fn font_file_metadata_from_ptr(ptr: *mut c_void) -> Option<Vec
     let obj = com_from_iface::<FontFileInner>(ptr, font_file_vtbl())?;
     Some(match &obj.inner.source {
         FontFileSource::LocalPath { path, .. } => parse_font_file_metadata(path),
-        FontFileSource::CustomBytes { bytes, .. } => parse_font_bytes_metadata(Arc::clone(bytes), "CustomFont"),
+        FontFileSource::CustomBytes { bytes, loader, key } => {
+            let custom_ref = Arc::new(CustomFontFileRef {
+                loader: loader.as_ref().and_then(|lp| ComPtr::retain(lp.as_ptr())),
+                key: key.clone(),
+            });
+            let mut metas = parse_font_bytes_metadata(Arc::clone(bytes), "CustomFont");
+            for m in &mut metas {
+                m.custom_file = Some(Arc::clone(&custom_ref));
+            }
+            metas
+        }
     })
 }
 
@@ -656,7 +667,8 @@ unsafe extern "win64" fn face_get_files(
     if this.is_null() || num_files.is_null() {
         return E_POINTER;
     }
-    let has_file = ComObj::inner(this).meta.file_path.is_some();
+    let meta = &ComObj::inner(this).meta;
+    let has_file = meta.file_path.is_some() || (meta.raw_bytes.is_some() && meta.custom_file.is_some());
     let count = if has_file { 1u32 } else { 0u32 };
     if files.is_null() {
         num_files.write_unaligned(count);
@@ -667,8 +679,11 @@ unsafe extern "win64" fn face_get_files(
         num_files.write_unaligned(count);
         return E_NOT_SUFFICIENT_BUFFER;
     }
-    if let Some(ref p) = ComObj::inner(this).meta.file_path {
+    if let Some(ref p) = meta.file_path {
         files.write_unaligned(new_font_file(p.clone()));
+    } else if let (Some(ref bytes), Some(ref cf)) = (&meta.raw_bytes, &meta.custom_file) {
+        let loader_ptr = cf.loader.as_ref().map_or(std::ptr::null_mut(), |lp| lp.as_ptr());
+        files.write_unaligned(new_custom_font_file(Arc::clone(bytes), loader_ptr, cf.key.clone()));
     }
     num_files.write_unaligned(count);
     S_OK

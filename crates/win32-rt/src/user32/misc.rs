@@ -3406,6 +3406,47 @@ mod tests {
             );
             assert_eq!(n_prec_w, 13);
             assert_eq!(read_wide_unaligned(prec_w.as_ptr()), "X|Y|   Z|W   ");
+
+            // On ARM64, guest calls with >12 total Win64 arguments must read all remaining
+            // variadic slots from the caller's guest Win64 stack via `incoming_rsp()`.
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static TEST_WS_RSP_LO: AtomicU64 = AtomicU64::new(0);
+                static TEST_WS_RSP_HI: AtomicU64 = AtomicU64::new(0);
+                fn test_ws_rsp() -> (u64, u64) {
+                    (TEST_WS_RSP_LO.load(Ordering::Acquire), TEST_WS_RSP_HI.load(Ordering::Acquire))
+                }
+                let s11 = c"eleven".as_ptr() as u64;
+                let s13 = c"thirteen".as_ptr() as u64;
+                let mut big_a = [0u8; 128];
+                let fmt_many_a = c"%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%s".as_ptr() as u64;
+                // Win64 stack frame: [0..4] shadow space, [4..15] args 4..14 (15 total args).
+                let mut stack = [0u64; 32];
+                stack[4] = 3;
+                stack[5] = 4;
+                stack[6] = 5;
+                stack[7] = 6;
+                stack[8] = 7;
+                stack[9] = 8;
+                stack[10] = 9;
+                stack[11] = 10;
+                stack[12] = s11;
+                stack[13] = 12;
+                stack[14] = s13;
+                let lo = stack.as_ptr() as u64;
+                TEST_WS_RSP_LO.store(lo, Ordering::Release);
+                TEST_WS_RSP_HI.store(lo + 256, Ordering::Release);
+                crate::set_incoming_rsp_reader(test_ws_rsp);
+                let nm = wsprintfA(big_a.as_mut_ptr() as u64, fmt_many_a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+                TEST_WS_RSP_LO.store(0, Ordering::Release);
+                TEST_WS_RSP_HI.store(0, Ordering::Release);
+                assert_eq!(nm, 39);
+                assert_eq!(
+                    crate::strings::from_ansi(big_a.as_ptr()),
+                    "1,2,3,4,5,6,7,8,9,10,eleven,12,thirteen"
+                );
+            }
         }
     }
 

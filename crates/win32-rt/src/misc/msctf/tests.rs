@@ -982,6 +982,75 @@ fn keystroke_mgr_enumerators_properties_and_exports_lookup() {
         com_call_release(pv_enum);
         com_call_release(tracked);
 
+        // TrackProperties + IEnumTfPropertyValue::Clone must not leak intermediate
+        // owning VT_UNKNOWN refcounts when cloning/reading property values.
+        #[repr(C)]
+        struct RefTrackedUnk {
+            vtbl: *const [usize; 3],
+            refs: std::sync::atomic::AtomicU32,
+        }
+        unsafe extern "win64" fn rtu_qi(_t: *mut RefTrackedUnk, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+            if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+            E_NOINTERFACE
+        }
+        unsafe extern "win64" fn rtu_addref(t: *mut RefTrackedUnk) -> u32 {
+            (*t).refs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+        }
+        unsafe extern "win64" fn rtu_release(t: *mut RefTrackedUnk) -> u32 {
+            (*t).refs.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1
+        }
+        let rtu_vtbl: [usize; 3] = [
+            rtu_qi as *const () as usize,
+            rtu_addref as *const () as usize,
+            rtu_release as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&rtu_vtbl);
+        let mut unk_obj = RefTrackedUnk {
+            vtbl: &rtu_vtbl,
+            refs: std::sync::atomic::AtomicU32::new(1),
+        };
+        let unk_guid = Guid::new(0x11223344, 0x5566, 0x7788, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut unk_prop: *mut c_void = std::ptr::null_mut();
+        assert_eq!((ctx_vt.get_property)(ctx, guid_as_ptr(&unk_guid), &mut unk_prop), S_OK);
+        let unk_prop_vt = &*(*(unk_prop as *const *const ITfPropertyVtbl));
+        let mut unk_var = [0u8; 24];
+        std::ptr::write_unaligned(unk_var.as_mut_ptr() as *mut u16, VT_UNKNOWN);
+        std::ptr::write_unaligned(
+            unk_var.as_mut_ptr().add(8) as *mut usize,
+            &mut unk_obj as *mut RefTrackedUnk as usize,
+        );
+        assert_eq!(
+            (unk_prop_vt.set_value)(unk_prop as *mut PropertyObj, ec, std::ptr::null_mut(), unk_var.as_ptr()),
+            S_OK
+        );
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 2); // caller + property
+        let unk_guids = [guid_as_ptr(&unk_guid)];
+        let mut tracked_u: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            (ctx_vt.track_properties)(ctx, unk_guids.as_ptr(), 1, std::ptr::null(), 0, &mut tracked_u),
+            S_OK
+        );
+        let tpu_vt = &*(*(tracked_u as *const *const super::range::ITfReadOnlyPropertyVtbl));
+        let mut tv_u = [0u8; 24];
+        assert_eq!(
+            (tpu_vt.get_value)(tracked_u as *mut super::range::TrackedPropertyObj, ec, std::ptr::null_mut(), tv_u.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 3); // +1 for enumerator (no double-copy leak!)
+        let en1 = std::ptr::read_unaligned(tv_u.as_ptr().add(8) as *const usize) as *mut c_void;
+        let en1_vt = &*(*(en1 as *const *const super::range::IEnumTfPropertyValueVtbl));
+        let mut en2: *mut c_void = std::ptr::null_mut();
+        assert_eq!((en1_vt.clone)(en1 as *mut super::range::EnumTfPropValObj, &mut en2), S_OK);
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 4); // +1 for cloned enumerator (no double-copy leak!)
+        com_call_release(en2);
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        com_call_release(en1);
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        com_call_release(tracked_u);
+        assert_eq!((unk_prop_vt.clear)(unk_prop as *mut PropertyObj, ec, std::ptr::null_mut()), S_OK);
+        com_call_release(unk_prop);
+        assert_eq!(unk_obj.refs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
         // Invalid TrackProperties arguments return E_INVALIDARG.
         assert_eq!(
             (ctx_vt.track_properties)(ctx, std::ptr::null(), 0, std::ptr::null(), 0, &mut tracked),

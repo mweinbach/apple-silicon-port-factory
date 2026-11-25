@@ -99,6 +99,23 @@ fn parse_name_table(tbl: &[u8]) -> HashMap<u16, String> {
     best.into_iter().map(|(k, (_, v))| (k, v)).collect()
 }
 
+/// Provenance for an in-memory custom `IDWriteFontFile` created via
+/// `CreateCustomFontFileReference`, retained on `FontMeta` so `IDWriteFontFace::GetFiles`
+/// can return a real backing `IDWriteFontFile` carrying the caller's loader and key.
+pub(super) struct CustomFontFileRef {
+    pub(super) loader: Option<crate::com::ComPtr>,
+    pub(super) key: Vec<u8>,
+}
+
+impl std::fmt::Debug for CustomFontFileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomFontFileRef")
+            .field("has_loader", &self.loader.is_some())
+            .field("key_len", &self.key.len())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct FontMeta {
     pub(super) family_name: String,
@@ -115,6 +132,7 @@ pub(super) struct FontMeta {
     pub(super) info_strings: HashMap<u32, String>,
     pub(super) file_path: Option<PathBuf>,
     pub(super) raw_bytes: Option<Arc<Vec<u8>>>,
+    pub(super) custom_file: Option<Arc<CustomFontFileRef>>,
 }
 
 fn parse_sfnt_face_meta(
@@ -333,6 +351,7 @@ fn parse_sfnt_face_meta(
         info_strings,
         file_path: Some(path.to_path_buf()),
         raw_bytes: None,
+        custom_file: None,
     })
 }
 
@@ -510,6 +529,7 @@ fn parse_sfnt_face_meta_slice(
         info_strings,
         file_path: None,
         raw_bytes: Some(Arc::clone(raw)),
+        custom_file: None,
     })
 }
 

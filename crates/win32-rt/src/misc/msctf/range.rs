@@ -732,11 +732,7 @@ unsafe extern "win64" fn enum_pv_clone(
     let cloned_items: Vec<(Guid, OwnedVariant)> = inner
         .items
         .iter()
-        .map(|(g, v)| {
-            let mut raw = [0u8; 24];
-            v.write_copy_to(raw.as_mut_ptr());
-            (*g, OwnedVariant::from_raw(raw.as_ptr()))
-        })
+        .map(|(g, v)| (*g, v.clone_owned()))
         .collect();
     let cloned = new_enum_tf_prop_val(cloned_items, pos);
     std::ptr::write_unaligned(pp_enum, cloned as *mut c_void);
@@ -918,9 +914,7 @@ unsafe extern "win64" fn tprop_get_value(
     let mut items = Vec::with_capacity(inner.props.len());
     for prop in &inner.props {
         let guard = prop.value.lock().unwrap();
-        let mut raw = [0u8; 24];
-        guard.write_copy_to(raw.as_mut_ptr());
-        items.push((prop.guid_type, OwnedVariant::from_raw(raw.as_ptr())));
+        items.push((prop.guid_type, guard.clone_owned()));
     }
     let enumerator = new_enum_tf_prop_val(items, 0);
     std::ptr::write_unaligned(pvar_value as *mut u16, VT_UNKNOWN);

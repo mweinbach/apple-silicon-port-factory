@@ -492,6 +492,14 @@ impl OwnedVariant {
         std::ptr::copy_nonoverlapping(raw.as_ptr(), dst, 24);
     }
 
+    /// Create an independent owning clone (duplicating `VT_BSTR` / `AddRef`'ing COM
+    /// pointers once) without leaking an intermediate owning copy.
+    pub(super) unsafe fn clone_owned(&self) -> Self {
+        let mut raw = [0u8; 24];
+        self.write_copy_to(raw.as_mut_ptr());
+        Self(raw)
+    }
+
     pub(super) fn take_raw(&mut self) -> [u8; 24] {
         std::mem::replace(&mut self.0, [0u8; 24])
     }
