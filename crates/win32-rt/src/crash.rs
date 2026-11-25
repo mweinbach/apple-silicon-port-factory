@@ -458,6 +458,7 @@ pub fn walk_guest_state(
         let pdata = lookup_pdata(cur.rip, is_return_addr);
         let in_pe = loader_module(cur.rip) || pdata.is_some();
         if !in_pe {
+            complete = false;
             break;
         }
         let rsp = cur.gpr[RSP];
@@ -513,6 +514,10 @@ pub fn walk_guest_state(
                 is_return_addr = true;
             }
         }
+    }
+
+    if frames.len() >= max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        complete = false;
     }
 
     let method = match (used_pdata, used_leaf) {
@@ -1823,6 +1828,37 @@ mod tests {
         assert_eq!(walk.frames.len(), 1);
         assert_eq!(walk.frames[0].pc, base + 0x0120);
         assert!(!walk.complete);
+    }
+
+    #[test]
+    fn walk_guest_state_marks_corrupt_return_address_incomplete() {
+        let mut img = vec![0x90u8; 0x1000];
+        // sub rsp, 0x28 (5 qwords), then saved return address at stack[5]
+        img[0x0800..0x0806].copy_from_slice(&[1, 0x08, 1, 0, 0x08, (4 << 4) | 2]);
+        let base = img.as_ptr() as u64;
+        let mut table = [pe_image::RuntimeFunction {
+            begin_rva: 0x0100,
+            end_rva: 0x0140,
+            unwind_rva: 0x0800,
+        }];
+        unsafe {
+            assert_eq!(unwind::RtlAddFunctionTable(table.as_mut_ptr(), 1, base), 1);
+        }
+        let mut stack = vec![0u64; 16];
+        stack[5] = 0x4141_4141_4141_4141; // corrupted non-zero return address outside all PE/dynamic tables
+        let stack_base = stack.as_ptr() as u64;
+        let stack_end = stack_base + (stack.len() as u64) * 8;
+        let mut gpr = [0u64; 16];
+        gpr[RSP] = stack_base;
+
+        let walk = walk_guest_state(Some((gpr, base + 0x0120)), &[(stack_base, stack_end)], 16);
+        unsafe {
+            assert_eq!(unwind::RtlDeleteFunctionTable(table.as_mut_ptr()), 1);
+        }
+        assert_eq!(walk.frames.len(), 1);
+        assert_eq!(walk.frames[0].pc, base + 0x0120);
+        assert_eq!(walk.method, "pdata");
+        assert!(!walk.complete, "corrupt non-zero return address must mark walk incomplete");
     }
 
     #[test]
