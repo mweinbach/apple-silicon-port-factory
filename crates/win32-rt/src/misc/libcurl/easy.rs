@@ -862,6 +862,24 @@ pub(super) unsafe fn prepare_transfer(
         ("GET".to_string(), false)
     };
 
+    // Per libcurl's CURLOPT_RESUME_FROM contract, resuming an HTTP upload or POST is
+    // unsupported and must fail with CURLE_BAD_FUNCTION_ARGUMENT before invoking upload
+    // read callbacks or performing any network I/O.
+    if opts.resume_from > 0
+        && (opts.upload
+            || opts.post
+            || opts.postfields_copied.is_some()
+            || opts.postfields_ptr != 0
+            || method.eq_ignore_ascii_case("PUT")
+            || method.eq_ignore_ascii_case("POST"))
+    {
+        return Err((
+            CURLE_BAD_FUNCTION_ARGUMENT,
+            "HTTP upload/POST resume is not supported".to_string(),
+            cb,
+        ));
+    }
+
     // Snapshot upload body on the caller's thread (so guest pointers and READFUNCTION
     // are always accessed on the calling Windows thread).
     let body = if let Some(ref copied) = opts.postfields_copied {

@@ -1224,6 +1224,82 @@ fn easy_resume_from_validates_206_and_content_range() {
 }
 
 #[test]
+fn easy_resume_from_rejects_http_upload_and_post_before_io() {
+    use super::easy::{
+        CURLE_BAD_FUNCTION_ARGUMENT, CURLOPT_POST, CURLOPT_POSTFIELDS, CURLOPT_READDATA,
+        CURLOPT_READFUNCTION, CURLOPT_RESUME_FROM, CURLOPT_UPLOAD,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    unsafe extern "win64" fn counting_read_cb(
+        _ptr: *mut u8,
+        _size: usize,
+        _nmemb: usize,
+        userdata: *mut c_void,
+    ) -> usize {
+        let counter = &*(userdata as *const AtomicUsize);
+        counter.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    unsafe {
+        crate::register_native_va(
+            counting_read_cb as *const () as u64,
+            counting_read_cb as *const () as usize,
+        );
+        let url = format!("http://{addr}/upload\0");
+        let read_calls = AtomicUsize::new(0);
+
+        // 1. CURLOPT_UPLOAD + positive CURLOPT_RESUME_FROM -> CURLE_BAD_FUNCTION_ARGUMENT
+        //    before invoking READFUNCTION or connecting to the server.
+        let easy_put = curl_easy_init();
+        assert_eq!(curl_easy_setopt(easy_put, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy_put, CURLOPT_UPLOAD, 1), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy_put, CURLOPT_RESUME_FROM, 4), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy_put, CURLOPT_READFUNCTION, counting_read_cb as *const () as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy_put, CURLOPT_READDATA, &read_calls as *const AtomicUsize as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_perform(easy_put), CURLE_BAD_FUNCTION_ARGUMENT);
+        assert_eq!(
+            read_calls.load(Ordering::SeqCst),
+            0,
+            "READFUNCTION must not be invoked when upload resume is rejected"
+        );
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "rejected resumed PUT must not connect to the server"
+        );
+        curl_easy_cleanup(easy_put);
+
+        // 2. CURLOPT_POST / CURLOPT_POSTFIELDS + positive CURLOPT_RESUME_FROM ->
+        //    CURLE_BAD_FUNCTION_ARGUMENT before connecting to the server.
+        let easy_post = curl_easy_init();
+        assert_eq!(curl_easy_setopt(easy_post, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy_post, CURLOPT_POST, 1), CURLE_OK);
+        assert_eq!(
+            curl_easy_setopt(easy_post, CURLOPT_POSTFIELDS, b"payload=1\0".as_ptr() as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_setopt(easy_post, CURLOPT_RESUME_FROM, 2), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy_post), CURLE_BAD_FUNCTION_ARGUMENT);
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "rejected resumed POST must not connect to the server"
+        );
+        curl_easy_cleanup(easy_post);
+    }
+}
+
+#[test]
 fn multi_delivers_xferinfo_progress_and_honors_abort() {
     use super::easy::{
         CURLE_ABORTED_BY_CALLBACK, CURLOPT_NOPROGRESS, CURLOPT_XFERINFODATA,
