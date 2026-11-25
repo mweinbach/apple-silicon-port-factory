@@ -2,22 +2,28 @@
 //! (marshalled from [`super`]); nothing here calls guest code or the TEB.
 
 use super::display;
-use super::{CursorState, NativeDesc, WindowShared};
-use crate::user32::cursor::Shape;
+use super::{CursorState, NativeControlDesc, NativeControlKind, NativeDesc, WindowShared};
+use crate::user32::controls;
+use crate::user32::cursor::{IconPayload, Shape};
 use crate::user32::window::{native_event, NativeEvent};
 use crate::user32::{ws, POINT, RECT};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
-    NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSScreen, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
+    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSBezelStyle,
+    NSBitmapImageRep, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCalibratedRGBColorSpace,
+    NSColor, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSCursor, NSEvent, NSEventMask, NSFont, NSImage, NSImageScaling,
+    NSImageView, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSScrollView, NSSecureTextField, NSTextAlignment,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString,
+    MainThreadMarker, NSData, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol,
+    NSPoint, NSRange, NSRect, NSSize, NSString,
 };
 use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, RefCell};
@@ -330,6 +336,7 @@ struct SavedWindowed {
 struct NativeWin {
     window: Retained<AW2Window>,
     view: Retained<AW2View>,
+    _metal_view: Retained<NSView>,
     _delegate: Retained<AW2WindowDelegate>,
     layer: Retained<CAMetalLayer>,
     shared: Arc<WindowShared>,
@@ -337,12 +344,14 @@ struct NativeWin {
     programmatic: Cell<bool>,
     desc: RefCell<NativeDesc>,
     shown_once: Cell<bool>,
+    has_controls: Cell<bool>,
     /// Saved windowed `NSWindow` state while in DXGI borderless fullscreen.
     dxgi_fullscreen_saved: RefCell<Option<SavedWindowed>>,
 }
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<usize, NativeWin>> = RefCell::new(HashMap::new());
+    static CONTROLS: RefCell<HashMap<usize, NativeControl>> = RefCell::new(HashMap::new());
     static APP_DELEGATE: RefCell<Option<Retained<AW2AppDelegate>>> = const { RefCell::new(None) };
     static ACTIVATED_ONCE: Cell<bool> = const { Cell::new(false) };
 }
@@ -371,6 +380,7 @@ fn frame_changed(hwnd: usize) {
     }) else {
         return;
     };
+    reposition_child_controls(hwnd);
     if !programmatic {
         native_event(hwnd, NativeEvent::Frame { client });
     }
@@ -559,20 +569,29 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
         window.setLevel(NORMAL_LEVEL);
     }
 
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), content.size);
     let view: Retained<AW2View> = unsafe {
         let this = AW2View::alloc(mtm).set_ivars(());
-        msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), content.size)]
+        msg_send![super(this), initWithFrame: bounds]
     };
     // NSViewWidthSizable (2) | NSViewHeightSizable (16) = 18 so live window resize
     // and green-button fullscreen resize the content view automatically.
     let _: () = unsafe { msg_send![&*view, setAutoresizingMask: 18usize] };
+    view.setWantsLayer(true);
+
+    // Host CAMetalLayer on a dedicated full-bleed background subview so native
+    // AppKit child controls added to `view` composite cleanly above it.
+    let metal_view = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+    let _: () = unsafe { msg_send![&*metal_view, setAutoresizingMask: 18usize] };
     let layer = CAMetalLayer::new();
     let win_scale = display::scale_for_rect(&desc.client);
     layer.setContentsScale(win_scale);
     layer.setOpaque(true);
     let _: () = unsafe { msg_send![&*layer, setContentsGravity: &*NSString::from_str("resizeAspect")] };
-    view.setLayer(Some(&layer));
-    view.setWantsLayer(true);
+    metal_view.setLayer(Some(&layer));
+    metal_view.setWantsLayer(true);
+    view.addSubview(&metal_view);
+
     window.setContentView(Some(&view));
     window.makeFirstResponder(Some(&view));
 
@@ -604,12 +623,14 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
             NativeWin {
                 window,
                 view,
+                _metal_view: metal_view,
                 _delegate: delegate,
                 layer,
                 shared,
                 programmatic: Cell::new(false),
                 desc: RefCell::new(desc),
                 shown_once: Cell::new(false),
+                has_controls: Cell::new(false),
                 dxgi_fullscreen_saved: RefCell::new(None),
             },
         )
@@ -618,13 +639,23 @@ pub(super) fn window_create(hwnd: usize, desc: NativeDesc) -> bool {
 }
 
 pub(super) fn window_destroy(hwnd: usize) {
+    let orphan_ctrls: Vec<usize> = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, c)| c.parent_hwnd == hwnd)
+            .map(|(h, _)| *h)
+            .collect()
+    });
+    for ch in orphan_ctrls {
+        control_destroy(ch);
+    }
     let w = WINDOWS.with(|m| m.borrow_mut().remove(&hwnd));
     super::unregister_shared(hwnd);
     if let Some(w) = w {
         w.window.setDelegate(None);
         w.window.orderOut(None);
         w.window.close();
-        let _ = (&w.view, &w.layer);
+        let _ = (&w.view, &w._metal_view, &w.layer);
         log::info!("NSWindow for hwnd {hwnd:#x} destroyed");
     }
     update_presentation();
@@ -643,6 +674,7 @@ pub(super) fn window_set_frame(hwnd: usize, client: RECT) {
         w.desc.borrow_mut().client = client;
         w.shared.set_client_size(client.width(), client.height());
     });
+    reposition_child_controls(hwnd);
     update_presentation();
 }
 
@@ -1130,6 +1162,1475 @@ pub(super) fn progress_window_close() {
             pw.window.close();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Native child controls (BUTTON / EDIT / STATIC)
+// ---------------------------------------------------------------------------
+
+struct ControlTargetIvar {
+    hwnd: Cell<usize>,
+    is_toggle: Cell<bool>,
+    is_manual_toggle: Cell<bool>,
+    stored_check: Cell<u32>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AW2ControlTarget"]
+    #[ivars = ControlTargetIvar]
+    struct AW2ControlTarget;
+
+    unsafe impl NSObjectProtocol for AW2ControlTarget {}
+
+    impl AW2ControlTarget {
+        #[unsafe(method(buttonClicked:))]
+        fn button_clicked(&self, sender: &NSButton) {
+            let hwnd = self.ivars().hwnd.get();
+            if self.ivars().is_manual_toggle.get() {
+                // Restore the application-controlled Win32 state immediately so
+                // clicking a manual BS_CHECKBOX / BS_3STATE / BS_RADIOBUTTON never
+                // leaves the native button out of sync if the parent ignores BN_CLICKED.
+                let cur = self.ivars().stored_check.get();
+                sender.setState(ns_state_from_check(cur));
+                controls::native_button_clicked(hwnd, Some(cur));
+                return;
+            }
+            let check = if self.ivars().is_toggle.get() {
+                let st = sender.state();
+                let v = if st == NSControlStateValueOn {
+                    controls::BST_CHECKED
+                } else if st == NSControlStateValueMixed {
+                    controls::BST_INDETERMINATE
+                } else {
+                    controls::BST_UNCHECKED
+                };
+                self.ivars().stored_check.set(v);
+                Some(v)
+            } else {
+                None
+            };
+            controls::native_button_clicked(hwnd, check);
+        }
+    }
+);
+
+fn ns_state_from_check(state: u32) -> isize {
+    match state & 0x3 {
+        controls::BST_CHECKED => NSControlStateValueOn,
+        controls::BST_INDETERMINATE => NSControlStateValueMixed,
+        _ => NSControlStateValueOff,
+    }
+}
+
+fn button_toggle_flags(style: u32) -> (bool, bool) {
+    let btn_type = style & controls::BS_TYPEMASK;
+    let is_auto = matches!(
+        btn_type,
+        controls::BS_AUTOCHECKBOX | controls::BS_AUTO3STATE | controls::BS_AUTORADIOBUTTON
+    );
+    let is_manual = matches!(
+        btn_type,
+        controls::BS_CHECKBOX | controls::BS_3STATE | controls::BS_RADIOBUTTON
+    );
+    (is_auto || is_manual, is_manual)
+}
+
+impl AW2ControlTarget {
+    fn new(mtm: MainThreadMarker, hwnd: usize, style: u32) -> Retained<Self> {
+        let (is_toggle, is_manual_toggle) = button_toggle_flags(style);
+        let this = Self::alloc(mtm).set_ivars(ControlTargetIvar {
+            hwnd: Cell::new(hwnd),
+            is_toggle: Cell::new(is_toggle),
+            is_manual_toggle: Cell::new(is_manual_toggle),
+            stored_check: Cell::new(controls::BST_UNCHECKED),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AW2TextDelegate"]
+    #[ivars = HwndIvar]
+    struct AW2TextDelegate;
+
+    unsafe impl NSObjectProtocol for AW2TextDelegate {}
+
+    unsafe impl NSControlTextEditingDelegate for AW2TextDelegate {
+        #[unsafe(method(controlTextDidBeginEditing:))]
+        fn control_text_did_begin_editing(&self, _notification: &NSNotification) {
+            let hwnd = self.ivars().hwnd.get();
+            controls::native_control_focused(hwnd);
+            let sel = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::SingleLineEdit {
+                    field,
+                    programmatic,
+                    last_sel,
+                    pending_sel,
+                    ..
+                } = &ctrl.view
+                {
+                    let ed = field.currentEditor()?;
+                    let len = ed.string().length();
+                    if let Some((ps, pe)) = pending_sel.take() {
+                        let lo = ps.min(pe).min(len);
+                        let hi = ps.max(pe).min(len);
+                        programmatic.set(true);
+                        ed.setSelectedRange(NSRange::new(lo, hi - lo));
+                        programmatic.set(false);
+                        last_sel.set((lo, hi));
+                        return Some((lo, hi));
+                    }
+                    let r = ed.selectedRange();
+                    let lo = r.location.min(len);
+                    let hi = r.location.saturating_add(r.length).min(len);
+                    last_sel.set((lo, hi));
+                    return Some((lo, hi));
+                }
+                None
+            });
+            if let Some((lo, hi)) = sel {
+                controls::native_edit_selection_changed(hwnd, lo, hi);
+            }
+        }
+
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            enum EditChangeNotify {
+                Text(String, usize, usize),
+                Selection(usize, usize),
+            }
+            let hwnd = self.ivars().hwnd.get();
+            let update = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::SingleLineEdit {
+                    field,
+                    programmatic,
+                    edit_style,
+                    max_len,
+                    last_text,
+                    last_sel,
+                    pending_sel,
+                    ..
+                } = &ctrl.view
+                {
+                    if programmatic.get() {
+                        return None;
+                    }
+                    pending_sel.set(None);
+                    let raw = field.stringValue().to_string();
+                    let next_units: Vec<u16> = raw.encode_utf16().collect();
+                    let ed = field.currentEditor();
+                    let (lo, hi) = if let Some(ref e) = ed {
+                        let r = e.selectedRange();
+                        (r.location, r.location.saturating_add(r.length))
+                    } else {
+                        (next_units.len(), next_units.len())
+                    };
+                    let norm = controls::apply_native_edit_constraints(
+                        &last_text.borrow(),
+                        &next_units,
+                        lo,
+                        hi,
+                        edit_style.get(),
+                        max_len.get(),
+                    );
+                    let final_text = if norm.reconcile_native {
+                        let s = String::from_utf16_lossy(&norm.units);
+                        programmatic.set(true);
+                        field.setStringValue(&NSString::from_str(&s));
+                        if let Some(ref e) = ed {
+                            e.setSelectedRange(NSRange::new(
+                                norm.sel_start,
+                                norm.sel_end.saturating_sub(norm.sel_start),
+                            ));
+                        }
+                        programmatic.set(false);
+                        s
+                    } else {
+                        raw
+                    };
+                    *last_text.borrow_mut() = norm.units;
+                    let prev_sel = last_sel.replace((norm.sel_start, norm.sel_end));
+                    if norm.text_changed {
+                        return Some(EditChangeNotify::Text(final_text, norm.sel_start, norm.sel_end));
+                    } else if prev_sel != (norm.sel_start, norm.sel_end) {
+                        return Some(EditChangeNotify::Selection(norm.sel_start, norm.sel_end));
+                    }
+                }
+                None
+            });
+            match update {
+                Some(EditChangeNotify::Text(t, lo, hi)) => {
+                    controls::native_edit_text_changed(hwnd, t, lo, hi);
+                }
+                Some(EditChangeNotify::Selection(lo, hi)) => {
+                    controls::native_edit_selection_changed(hwnd, lo, hi);
+                }
+                None => {}
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for AW2TextDelegate {}
+
+    unsafe impl NSTextDelegate for AW2TextDelegate {
+        #[unsafe(method(textDidBeginEditing:))]
+        fn text_did_begin_editing(&self, _notification: &NSNotification) {
+            controls::native_control_focused(self.ivars().hwnd.get());
+        }
+
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, _notification: &NSNotification) {
+            enum EditChangeNotify {
+                Text(String, usize, usize),
+                Selection(usize, usize),
+            }
+            let hwnd = self.ivars().hwnd.get();
+            let update = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::MultiLineEdit {
+                    text_view,
+                    programmatic,
+                    edit_style,
+                    max_len,
+                    last_text,
+                    last_sel,
+                    ..
+                } = &ctrl.view
+                {
+                    if programmatic.get() {
+                        return None;
+                    }
+                    let raw = text_view.string().to_string();
+                    let native_units: Vec<u16> = raw.encode_utf16().collect();
+                    let r = text_view.selectedRange();
+                    let (win32_next, win32_lo, win32_hi) = controls::native_newlines_to_win32(
+                        &native_units,
+                        r.location,
+                        r.location.saturating_add(r.length),
+                    );
+                    let norm = controls::apply_native_edit_constraints(
+                        &last_text.borrow(),
+                        &win32_next,
+                        win32_lo,
+                        win32_hi,
+                        edit_style.get(),
+                        max_len.get(),
+                    );
+                    if norm.reconcile_native {
+                        let (nat_units, nat_lo, nat_hi) = controls::win32_newlines_to_native(
+                            &norm.units,
+                            norm.sel_start,
+                            norm.sel_end,
+                        );
+                        let nat_str = String::from_utf16_lossy(&nat_units);
+                        programmatic.set(true);
+                        text_view.setString(&NSString::from_str(&nat_str));
+                        text_view.setSelectedRange(NSRange::new(
+                            nat_lo,
+                            nat_hi.saturating_sub(nat_lo),
+                        ));
+                        programmatic.set(false);
+                    }
+                    let final_win32 = if norm.text_changed {
+                        Some(String::from_utf16_lossy(&norm.units))
+                    } else {
+                        None
+                    };
+                    *last_text.borrow_mut() = norm.units;
+                    let prev_sel = last_sel.replace((norm.sel_start, norm.sel_end));
+                    if let Some(win32_text) = final_win32 {
+                        return Some(EditChangeNotify::Text(win32_text, norm.sel_start, norm.sel_end));
+                    } else if prev_sel != (norm.sel_start, norm.sel_end) {
+                        return Some(EditChangeNotify::Selection(norm.sel_start, norm.sel_end));
+                    }
+                }
+                None
+            });
+            match update {
+                Some(EditChangeNotify::Text(t, lo, hi)) => {
+                    controls::native_edit_text_changed(hwnd, t, lo, hi);
+                }
+                Some(EditChangeNotify::Selection(lo, hi)) => {
+                    controls::native_edit_selection_changed(hwnd, lo, hi);
+                }
+                None => {}
+            }
+        }
+    }
+
+    unsafe impl NSTextViewDelegate for AW2TextDelegate {
+        #[unsafe(method(textViewDidChangeSelection:))]
+        fn text_view_did_change_selection(&self, _notification: &NSNotification) {
+            let hwnd = self.ivars().hwnd.get();
+            let sel = CONTROLS.with(|m| {
+                let map = m.borrow();
+                let ctrl = map.get(&hwnd)?;
+                if let NativeControlView::MultiLineEdit {
+                    text_view,
+                    programmatic,
+                    last_text,
+                    last_sel,
+                    ..
+                } = &ctrl.view
+                {
+                    if programmatic.get() {
+                        return None;
+                    }
+                    let len = text_view.string().length();
+                    let r = text_view.selectedRange();
+                    let nat_lo = r.location.min(len);
+                    let nat_hi = r.location.saturating_add(r.length).min(len);
+                    let win32_units = last_text.borrow();
+                    let lo = controls::native_offset_to_win32(&win32_units, nat_lo);
+                    let hi = controls::native_offset_to_win32(&win32_units, nat_hi);
+                    if last_sel.replace((lo, hi)) != (lo, hi) {
+                        return Some((lo, hi));
+                    }
+                }
+                None
+            });
+            if let Some((lo, hi)) = sel {
+                controls::native_edit_selection_changed(hwnd, lo, hi);
+            }
+        }
+    }
+);
+
+impl AW2TextDelegate {
+    fn new(mtm: MainThreadMarker, hwnd: usize) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(HwndIvar { hwnd: Cell::new(hwnd) });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+enum NativeControlView {
+    Button {
+        button: Retained<NSButton>,
+        target: Retained<AW2ControlTarget>,
+    },
+    GroupBox {
+        box_view: Retained<NSBox>,
+    },
+    SingleLineEdit {
+        field: Retained<NSTextField>,
+        _delegate: Retained<AW2TextDelegate>,
+        programmatic: Cell<bool>,
+        masked: Cell<bool>,
+        edit_style: Cell<u32>,
+        max_len: Cell<usize>,
+        last_text: RefCell<Vec<u16>>,
+        last_sel: Cell<(usize, usize)>,
+        pending_sel: Cell<Option<(usize, usize)>>,
+    },
+    MultiLineEdit {
+        scroll: Retained<NSScrollView>,
+        text_view: Retained<NSTextView>,
+        _delegate: Retained<AW2TextDelegate>,
+        programmatic: Cell<bool>,
+        readonly: Cell<bool>,
+        enabled: Cell<bool>,
+        edit_style: Cell<u32>,
+        wants_return: Cell<bool>,
+        max_len: Cell<usize>,
+        last_text: RefCell<Vec<u16>>,
+        last_sel: Cell<(usize, usize)>,
+    },
+    StaticLabel {
+        label: Retained<NSTextField>,
+        no_prefix: bool,
+    },
+    StaticIcon {
+        image_view: Retained<NSImageView>,
+    },
+    StaticBox {
+        box_view: Retained<NSBox>,
+    },
+}
+
+impl NativeControlView {
+    fn root_view(&self) -> &NSView {
+        match self {
+            Self::Button { button, .. } => button,
+            Self::GroupBox { box_view } | Self::StaticBox { box_view } => box_view,
+            Self::SingleLineEdit { field, .. } => field,
+            Self::MultiLineEdit { scroll, .. } => scroll,
+            Self::StaticLabel { label, .. } => label,
+            Self::StaticIcon { image_view } => image_view,
+        }
+    }
+}
+
+struct NativeControl {
+    parent_hwnd: usize,
+    kind: NativeControlKind,
+    notify_click: Cell<bool>,
+    rect_px: Cell<RECT>,
+    view: NativeControlView,
+}
+
+fn child_cocoa_rect(parent: &NativeWin, rect: &RECT) -> NSRect {
+    let s = f64::from_bits(parent.shared.scale.load(Ordering::Acquire)).max(1.0);
+    let cv_h = parent.view.bounds().size.height;
+    let x = rect.left as f64 / s;
+    let w = rect.width().max(0) as f64 / s;
+    let h = rect.height().max(0) as f64 / s;
+    let y = cv_h - (rect.top as f64 / s) - h;
+    NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
+fn reposition_child_controls(parent_hwnd: usize) {
+    let items: Vec<(usize, RECT)> = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(_, c)| c.parent_hwnd == parent_hwnd)
+            .map(|(h, c)| (*h, c.rect_px.get()))
+            .collect()
+    });
+    if items.is_empty() {
+        return;
+    }
+    with_win(parent_hwnd, |parent| {
+        CONTROLS.with(|m| {
+            let map = m.borrow();
+            for (ch, rect) in items {
+                if let Some(ctrl) = map.get(&ch) {
+                    let frame = child_cocoa_rect(parent, &rect);
+                    ctrl.view.root_view().setFrame(frame);
+                }
+            }
+        });
+    });
+}
+
+fn apply_button_style(btn: &NSButton, style: u32) {
+    let btn_type = style & controls::BS_TYPEMASK;
+    match btn_type {
+        controls::BS_CHECKBOX | controls::BS_AUTOCHECKBOX => {
+            btn.setButtonType(NSButtonType::Switch);
+            btn.setAllowsMixedState(false);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        controls::BS_3STATE | controls::BS_AUTO3STATE => {
+            btn.setButtonType(NSButtonType::Switch);
+            btn.setAllowsMixedState(true);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        controls::BS_RADIOBUTTON | controls::BS_AUTORADIOBUTTON => {
+            btn.setButtonType(NSButtonType::Radio);
+            btn.setAllowsMixedState(false);
+            btn.setKeyEquivalent(&NSString::from_str(""));
+        }
+        _ => {
+            btn.setButtonType(NSButtonType::MomentaryPushIn);
+            btn.setBezelStyle(NSBezelStyle::Push);
+            btn.setAllowsMixedState(false);
+            if matches!(
+                btn_type,
+                controls::BS_DEFPUSHBUTTON | controls::BS_DEFSPLITBUTTON | controls::BS_DEFCOMMANDLINK
+            ) {
+                btn.setKeyEquivalent(&NSString::from_str("\r"));
+            } else {
+                btn.setKeyEquivalent(&NSString::from_str(""));
+            }
+        }
+    }
+}
+
+fn ns_alignment_from_edit(style: u32) -> NSTextAlignment {
+    match style & 0x3 {
+        controls::ES_CENTER => NSTextAlignment::Center,
+        controls::ES_RIGHT => NSTextAlignment::Right,
+        _ => NSTextAlignment::Left,
+    }
+}
+
+fn ns_alignment_from_static(style: u32) -> NSTextAlignment {
+    match style & controls::SS_TYPEMASK {
+        controls::SS_CENTER => NSTextAlignment::Center,
+        controls::SS_RIGHT => NSTextAlignment::Right,
+        _ => NSTextAlignment::Left,
+    }
+}
+
+fn nsimage_from_icon_payload(payload: &IconPayload) -> Option<Retained<NSImage>> {
+    match payload {
+        IconPayload::Stock(id) => {
+            let name = match *id {
+                32513 | 32515 | 32518 => "NSCaution",       // IDI_ERROR / IDI_WARNING / IDI_SHIELD
+                32514 | 32516 => "NSInfo",                  // IDI_QUESTION / IDI_INFORMATION
+                _ => "NSApplicationIcon",                   // IDI_APPLICATION
+            };
+            NSImage::imageNamed(&NSString::from_str(name))
+        }
+        IconPayload::Png(bytes) => {
+            let data = NSData::with_bytes(bytes);
+            NSImage::initWithData(NSImage::alloc(), &data)
+        }
+        IconPayload::Bgra { width, height, pixels } => {
+            let w = *width as usize;
+            let h = *height as usize;
+            if w == 0 || h == 0 || pixels.len() < w * h * 4 {
+                return None;
+            }
+            let color_space = unsafe { NSCalibratedRGBColorSpace };
+            let rep = unsafe {
+                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(),
+                    std::ptr::null_mut(),
+                    w as isize,
+                    h as isize,
+                    8,
+                    4,
+                    true,
+                    false,
+                    color_space,
+                    (w * 4) as isize,
+                    32,
+                )
+            }?;
+            let dst = rep.bitmapData();
+            if dst.is_null() {
+                return None;
+            }
+            // Convert BGRA -> RGBA into the bitmap backing store.
+            unsafe {
+                let dst_slice = std::slice::from_raw_parts_mut(dst, w * h * 4);
+                for (d, s) in dst_slice.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
+                    d[0] = s[2];
+                    d[1] = s[1];
+                    d[2] = s[0];
+                    d[3] = s[3];
+                }
+            }
+            let img = NSImage::initWithSize(NSImage::alloc(), NSSize::new(w as f64, h as f64));
+            img.addRepresentation(&rep);
+            Some(img)
+        }
+    }
+}
+
+fn build_single_line_edit_field(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    masked: bool,
+    text: &str,
+    style: u32,
+    enabled: bool,
+    visible: bool,
+    delegate: &AW2TextDelegate,
+) -> Retained<NSTextField> {
+    let field: Retained<NSTextField> = if masked {
+        let secure = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
+        Retained::into_super(secure)
+    } else {
+        NSTextField::initWithFrame(NSTextField::alloc(mtm), frame)
+    };
+    field.setStringValue(&NSString::from_str(text));
+    field.setEditable((style & controls::ES_READONLY) == 0);
+    field.setSelectable(true);
+    field.setBordered(true);
+    field.setBezeled(true);
+    field.setDrawsBackground(true);
+    field.setEnabled(enabled);
+    field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+    field.setAlignment(ns_alignment_from_edit(style));
+    field.setWantsLayer(true);
+    field.setHidden(!visible);
+    unsafe { field.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
+    field
+}
+
+fn is_control_first_responder(ctrl: &NativeControl, win: &NSWindow) -> bool {
+    let Some(cur) = win.firstResponder() else { return false };
+    let cur_ptr = (&*cur as *const _) as usize;
+    match &ctrl.view {
+        NativeControlView::SingleLineEdit { field, .. } => {
+            Retained::as_ptr(field) as usize == cur_ptr
+                || field
+                    .currentEditor()
+                    .is_some_and(|ed| Retained::as_ptr(&ed) as usize == cur_ptr)
+        }
+        NativeControlView::MultiLineEdit { text_view, .. } => {
+            Retained::as_ptr(text_view) as usize == cur_ptr
+        }
+        NativeControlView::Button { button, .. } => {
+            Retained::as_ptr(button) as usize == cur_ptr
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn control_create(hwnd: usize, parent_hwnd: usize, desc: NativeControlDesc) {
+    let mtm = mtm();
+    let frame = match with_win(parent_hwnd, |p| {
+        if !p.has_controls.replace(true) {
+            p.layer.setOpaque(false);
+            p.window.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
+        }
+        child_cocoa_rect(p, &desc.rect)
+    }) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let view = match desc.kind {
+        NativeControlKind::Button => {
+            let btn_type = desc.style & controls::BS_TYPEMASK;
+            let title = controls::strip_win32_mnemonic(&desc.text);
+            if btn_type == controls::BS_GROUPBOX {
+                let box_view = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+                box_view.setTitle(&NSString::from_str(&title));
+                NativeControlView::GroupBox { box_view }
+            } else {
+                let button = NSButton::initWithFrame(NSButton::alloc(mtm), frame);
+                apply_button_style(&button, desc.style);
+                button.setTitle(&NSString::from_str(&title));
+                button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                button.setEnabled(desc.enabled);
+                let target = AW2ControlTarget::new(mtm, hwnd, desc.style);
+                unsafe {
+                    button.setTarget(Some(&*target));
+                    button.setAction(Some(sel!(buttonClicked:)));
+                }
+                NativeControlView::Button { button, target }
+            }
+        }
+        NativeControlKind::Edit => {
+            let readonly = (desc.style & controls::ES_READONLY) != 0;
+            let delegate = AW2TextDelegate::new(mtm, hwnd);
+            if (desc.style & controls::ES_MULTILINE) != 0 {
+                let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
+                scroll.setHasVerticalScroller(
+                    (desc.style & (ws::VSCROLL | controls::ES_AUTOVSCROLL)) != 0,
+                );
+                scroll.setHasHorizontalScroller((desc.style & ws::HSCROLL) != 0);
+                scroll.setBorderType(NSBorderType::BezelBorder);
+
+                let content_sz = scroll.contentSize();
+                let tv_frame = NSRect::new(NSPoint::new(0.0, 0.0), content_sz);
+                let text_view = NSTextView::initWithFrame(NSTextView::alloc(mtm), tv_frame);
+                text_view.setEditable(!readonly && desc.enabled);
+                text_view.setSelectable(true);
+                text_view.setRichText(false);
+                text_view.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                text_view.setAlignment(ns_alignment_from_edit(desc.style));
+                text_view.setVerticallyResizable(true);
+                text_view.setHorizontallyResizable((desc.style & ws::HSCROLL) != 0);
+                let win32_units: Vec<u16> = desc.text.encode_utf16().collect();
+                let (nat_units, _, _) = controls::win32_newlines_to_native(&win32_units, 0, 0);
+                text_view.setString(&NSString::from_str(&String::from_utf16_lossy(&nat_units)));
+                text_view.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+                scroll.setDocumentView(Some(&text_view));
+                NativeControlView::MultiLineEdit {
+                    scroll,
+                    text_view,
+                    _delegate: delegate,
+                    programmatic: Cell::new(false),
+                    readonly: Cell::new(readonly),
+                    enabled: Cell::new(desc.enabled),
+                    edit_style: Cell::new(desc.style),
+                    wants_return: Cell::new((desc.style & controls::ES_WANTRETURN) != 0),
+                    max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
+                    last_text: RefCell::new(win32_units),
+                    last_sel: Cell::new((0, 0)),
+                }
+            } else {
+                let masked = (desc.style & controls::ES_PASSWORD) != 0;
+                let field = build_single_line_edit_field(
+                    mtm,
+                    frame,
+                    masked,
+                    &desc.text,
+                    desc.style,
+                    desc.enabled,
+                    desc.visible,
+                    &delegate,
+                );
+                NativeControlView::SingleLineEdit {
+                    field,
+                    _delegate: delegate,
+                    programmatic: Cell::new(false),
+                    masked: Cell::new(masked),
+                    edit_style: Cell::new(desc.style),
+                    max_len: Cell::new(controls::DEFAULT_EDIT_LIMIT),
+                    last_text: RefCell::new(desc.text.encode_utf16().collect()),
+                    last_sel: Cell::new((0, 0)),
+                    pending_sel: Cell::new(None),
+                }
+            }
+        }
+        NativeControlKind::Static => {
+            let st_type = desc.style & controls::SS_TYPEMASK;
+            match st_type {
+                controls::SS_ICON | controls::SS_BITMAP => {
+                    let image_view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
+                    image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                    NativeControlView::StaticIcon { image_view }
+                }
+                controls::SS_ETCHEDHORZ | controls::SS_ETCHEDVERT | controls::SS_ETCHEDFRAME => {
+                    let box_view = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+                    box_view.setBoxType(NSBoxType::Separator);
+                    NativeControlView::StaticBox { box_view }
+                }
+                _ => {
+                    let no_prefix = (desc.style & controls::SS_NOPREFIX) != 0;
+                    let text = if no_prefix {
+                        desc.text.clone()
+                    } else {
+                        controls::strip_win32_mnemonic(&desc.text)
+                    };
+                    let label = if matches!(st_type, controls::SS_SIMPLE | controls::SS_LEFTNOWORDWRAP) {
+                        NSTextField::labelWithString(&NSString::from_str(&text), mtm)
+                    } else {
+                        NSTextField::wrappingLabelWithString(&NSString::from_str(&text), mtm)
+                    };
+                    label.setFrame(frame);
+                    label.setAlignment(ns_alignment_from_static(desc.style));
+                    label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                    label.setEnabled(desc.enabled);
+                    NativeControlView::StaticLabel { label, no_prefix }
+                }
+            }
+        }
+    };
+
+    let root = view.root_view();
+    root.setWantsLayer(true);
+    root.setHidden(!desc.visible);
+    with_win(parent_hwnd, |p| {
+        p.view.addSubview(root);
+    });
+
+    let notify_click = desc.kind == NativeControlKind::Static && (desc.style & controls::SS_NOTIFY) != 0;
+    CONTROLS.with(|m| {
+        m.borrow_mut().insert(
+            hwnd,
+            NativeControl {
+                parent_hwnd,
+                kind: desc.kind,
+                notify_click: Cell::new(notify_click),
+                rect_px: Cell::new(desc.rect),
+                view,
+            },
+        );
+    });
+}
+
+pub(super) fn control_destroy(hwnd: usize) {
+    let ctrl = CONTROLS.with(|m| m.borrow_mut().remove(&hwnd));
+    if let Some(ctrl) = ctrl {
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => unsafe {
+                button.setTarget(None);
+                button.setAction(None);
+            },
+            NativeControlView::SingleLineEdit { field, .. } => unsafe {
+                field.setDelegate(None);
+            },
+            NativeControlView::MultiLineEdit { text_view, .. } => {
+                text_view.setDelegate(None);
+            }
+            _ => {}
+        }
+        with_win(ctrl.parent_hwnd, |p| {
+            if is_control_first_responder(&ctrl, &p.window) {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+            let any_left = CONTROLS.with(|m| m.borrow().values().any(|c| c.parent_hwnd == ctrl.parent_hwnd));
+            if !any_left {
+                p.has_controls.set(false);
+            }
+        });
+        ctrl.view.root_view().removeFromSuperview();
+    }
+}
+
+pub(super) fn control_set_frame(hwnd: usize, rect: RECT) {
+    let parent_hwnd = CONTROLS.with(|m| {
+        let map = m.borrow();
+        let ctrl = map.get(&hwnd)?;
+        ctrl.rect_px.set(rect);
+        Some(ctrl.parent_hwnd)
+    });
+    if let Some(ph) = parent_hwnd {
+        with_win(ph, |p| {
+            let frame = child_cocoa_rect(p, &rect);
+            CONTROLS.with(|m| {
+                if let Some(ctrl) = m.borrow().get(&hwnd) {
+                    ctrl.view.root_view().setFrame(frame);
+                }
+            });
+        });
+    }
+}
+
+pub(super) fn control_set_text(hwnd: usize, text: String) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => {
+                let s = controls::strip_win32_mnemonic(&text);
+                button.setTitle(&NSString::from_str(&s));
+            }
+            NativeControlView::GroupBox { box_view } => {
+                let s = controls::strip_win32_mnemonic(&text);
+                box_view.setTitle(&NSString::from_str(&s));
+            }
+            NativeControlView::SingleLineEdit { field, programmatic, last_text, .. } => {
+                *last_text.borrow_mut() = text.encode_utf16().collect();
+                programmatic.set(true);
+                field.setStringValue(&NSString::from_str(&text));
+                programmatic.set(false);
+            }
+            NativeControlView::MultiLineEdit { text_view, programmatic, last_text, .. } => {
+                let win32_units: Vec<u16> = text.encode_utf16().collect();
+                let (nat_units, _, _) = controls::win32_newlines_to_native(&win32_units, 0, 0);
+                *last_text.borrow_mut() = win32_units;
+                programmatic.set(true);
+                text_view.setString(&NSString::from_str(&String::from_utf16_lossy(&nat_units)));
+                programmatic.set(false);
+            }
+            NativeControlView::StaticLabel { label, no_prefix } => {
+                let s = if *no_prefix { text } else { controls::strip_win32_mnemonic(&text) };
+                label.setStringValue(&NSString::from_str(&s));
+            }
+            NativeControlView::StaticIcon { .. } | NativeControlView::StaticBox { .. } => {}
+        }
+    });
+}
+
+pub(super) fn control_set_visible(hwnd: usize, visible: bool) {
+    if !visible {
+        control_unfocus(hwnd);
+    }
+    CONTROLS.with(|m| {
+        if let Some(ctrl) = m.borrow().get(&hwnd) {
+            ctrl.view.root_view().setHidden(!visible);
+        }
+    });
+}
+
+pub(super) fn control_set_enabled(hwnd: usize, enabled: bool) {
+    if !enabled {
+        control_unfocus(hwnd);
+    }
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, .. } => button.setEnabled(enabled),
+            NativeControlView::SingleLineEdit { field, .. } => field.setEnabled(enabled),
+            NativeControlView::MultiLineEdit { text_view, readonly, enabled: en_cell, .. } => {
+                en_cell.set(enabled);
+                text_view.setEditable(enabled && !readonly.get());
+            }
+            NativeControlView::StaticLabel { label, .. } => label.setEnabled(enabled),
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_readonly(hwnd: usize, readonly: bool) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::SingleLineEdit { field, edit_style, .. } => {
+                let mut st = edit_style.get();
+                if readonly {
+                    st |= controls::ES_READONLY;
+                } else {
+                    st &= !controls::ES_READONLY;
+                }
+                edit_style.set(st);
+                field.setEditable(!readonly);
+            }
+            NativeControlView::MultiLineEdit {
+                text_view,
+                readonly: ro_cell,
+                enabled,
+                edit_style,
+                ..
+            } => {
+                let mut st = edit_style.get();
+                if readonly {
+                    st |= controls::ES_READONLY;
+                } else {
+                    st &= !controls::ES_READONLY;
+                }
+                edit_style.set(st);
+                ro_cell.set(readonly);
+                text_view.setEditable(enabled.get() && !readonly);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_selection(hwnd: usize, start: usize, end: usize) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::SingleLineEdit {
+                field,
+                programmatic,
+                last_sel,
+                pending_sel,
+                ..
+            } => {
+                let len = field.stringValue().length();
+                let lo = start.min(end).min(len);
+                let hi = start.max(end).min(len);
+                last_sel.set((lo, hi));
+                if let Some(ed) = field.currentEditor() {
+                    pending_sel.set(None);
+                    programmatic.set(true);
+                    ed.setSelectedRange(NSRange::new(lo, hi - lo));
+                    programmatic.set(false);
+                } else {
+                    pending_sel.set(Some((lo, hi)));
+                }
+            }
+            NativeControlView::MultiLineEdit {
+                text_view,
+                programmatic,
+                last_text,
+                last_sel,
+                ..
+            } => {
+                let win32_units = last_text.borrow();
+                let win32_len = win32_units.len();
+                let lo = start.min(end).min(win32_len);
+                let hi = start.max(end).min(win32_len);
+                last_sel.set((lo, hi));
+                let nat_len = text_view.string().length();
+                let nat_lo = controls::win32_offset_to_native(&win32_units, lo).min(nat_len);
+                let nat_hi = controls::win32_offset_to_native(&win32_units, hi).min(nat_len);
+                programmatic.set(true);
+                text_view.setSelectedRange(NSRange::new(nat_lo, nat_hi.saturating_sub(nat_lo)));
+                programmatic.set(false);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_limit(hwnd: usize, limit: usize) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::SingleLineEdit { max_len, .. }
+            | NativeControlView::MultiLineEdit { max_len, .. } => {
+                max_len.set(limit);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_focus(hwnd: usize) {
+    enum FocusTarget {
+        SingleLine(Retained<NSTextField>),
+        MultiLine(Retained<NSTextView>),
+        Button(Retained<NSButton>),
+        ResignWindow,
+    }
+    let parent_hwnd = CONTROLS.with(|m| m.borrow().get(&hwnd).map(|c| c.parent_hwnd));
+    let Some(ph) = parent_hwnd else { return };
+    with_win(ph, |p| {
+        let target = CONTROLS.with(|m| {
+            let map = m.borrow();
+            let ctrl = map.get(&hwnd)?;
+            if is_control_first_responder(ctrl, &p.window) {
+                return None;
+            }
+            match &ctrl.view {
+                NativeControlView::SingleLineEdit { field, .. } => {
+                    Some(FocusTarget::SingleLine(field.clone()))
+                }
+                NativeControlView::MultiLineEdit { text_view, .. } => {
+                    Some(FocusTarget::MultiLine(text_view.clone()))
+                }
+                NativeControlView::Button { button, .. } => {
+                    Some(FocusTarget::Button(button.clone()))
+                }
+                _ => {
+                    // Focusing a non-editable native control (e.g. STATIC or GroupBox)
+                    // should resign any previously focused native editor in this window.
+                    let has_focused = map.values().any(|c| {
+                        c.parent_hwnd == ph && is_control_first_responder(c, &p.window)
+                    });
+                    has_focused.then_some(FocusTarget::ResignWindow)
+                }
+            }
+        });
+        match target {
+            Some(FocusTarget::SingleLine(field)) => {
+                p.window.makeFirstResponder(Some(&field));
+                if let Some(ed) = field.currentEditor() {
+                    CONTROLS.with(|m| {
+                        if let Some(ctrl) = m.borrow().get(&hwnd) {
+                            if let NativeControlView::SingleLineEdit {
+                                programmatic,
+                                last_sel,
+                                pending_sel,
+                                ..
+                            } = &ctrl.view
+                            {
+                                if let Some((ps, pe)) = pending_sel.take() {
+                                    let len = ed.string().length();
+                                    let lo = ps.min(pe).min(len);
+                                    let hi = ps.max(pe).min(len);
+                                    last_sel.set((lo, hi));
+                                    programmatic.set(true);
+                                    ed.setSelectedRange(NSRange::new(lo, hi - lo));
+                                    programmatic.set(false);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            Some(FocusTarget::MultiLine(text_view)) => {
+                p.window.makeFirstResponder(Some(&text_view));
+            }
+            Some(FocusTarget::Button(button)) => {
+                p.window.makeFirstResponder(Some(&button));
+            }
+            Some(FocusTarget::ResignWindow) => {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+            None => {}
+        }
+    });
+}
+
+pub(super) fn control_unfocus(hwnd: usize) {
+    let parent_hwnd = CONTROLS.with(|m| m.borrow().get(&hwnd).map(|c| c.parent_hwnd));
+    let Some(ph) = parent_hwnd else { return };
+    with_win(ph, |p| {
+        let is_focused = CONTROLS.with(|m| {
+            m.borrow()
+                .get(&hwnd)
+                .is_some_and(|ctrl| is_control_first_responder(ctrl, &p.window))
+        });
+        if is_focused {
+            p.window.makeFirstResponder(Some(&p.view));
+        }
+    });
+}
+
+pub(super) fn window_clear_control_focus(top_hwnd: usize) {
+    with_win(top_hwnd, |p| {
+        let has_focused_ctrl = CONTROLS.with(|m| {
+            m.borrow()
+                .values()
+                .any(|ctrl| ctrl.parent_hwnd == top_hwnd && is_control_first_responder(ctrl, &p.window))
+        });
+        if has_focused_ctrl {
+            p.window.makeFirstResponder(Some(&p.view));
+        }
+    });
+}
+
+pub(super) fn control_set_password_mode(hwnd: usize, masked: bool) {
+    let mtm = mtm();
+    struct SwapSnapshot {
+        parent_hwnd: usize,
+        frame: NSRect,
+        text: String,
+        text_units: Vec<u16>,
+        sel: (usize, usize),
+        style: u32,
+        enabled: bool,
+        visible: bool,
+        delegate: Retained<AW2TextDelegate>,
+        old_field: Retained<NSTextField>,
+    }
+
+    let snap = CONTROLS.with(|m| {
+        let map = m.borrow();
+        let ctrl = map.get(&hwnd)?;
+        let NativeControlView::SingleLineEdit {
+            field,
+            _delegate,
+            masked: cur_masked,
+            edit_style,
+            last_sel,
+            pending_sel,
+            ..
+        } = &ctrl.view
+        else {
+            return None;
+        };
+        if cur_masked.get() == masked {
+            return None;
+        }
+        let ed = field.currentEditor();
+        let text = ed
+            .as_ref()
+            .map(|e| e.string().to_string())
+            .unwrap_or_else(|| field.stringValue().to_string());
+        let text_units: Vec<u16> = text.encode_utf16().collect();
+        let len = text_units.len();
+        let (raw_lo, raw_hi) = if let Some(ref e) = ed {
+            let r = e.selectedRange();
+            (r.location, r.location.saturating_add(r.length))
+        } else if let Some((ps, pe)) = pending_sel.get() {
+            (ps, pe)
+        } else {
+            last_sel.get()
+        };
+        let lo = raw_lo.min(raw_hi).min(len);
+        let hi = raw_lo.max(raw_hi).min(len);
+        let mut style = edit_style.get();
+        if masked {
+            style |= controls::ES_PASSWORD;
+        } else {
+            style &= !controls::ES_PASSWORD;
+        }
+        if field.isEditable() {
+            style &= !controls::ES_READONLY;
+        } else {
+            style |= controls::ES_READONLY;
+        }
+        Some(SwapSnapshot {
+            parent_hwnd: ctrl.parent_hwnd,
+            frame: field.frame(),
+            text,
+            text_units,
+            sel: (lo, hi),
+            style,
+            enabled: field.isEnabled(),
+            visible: !field.isHidden(),
+            delegate: _delegate.clone(),
+            old_field: field.clone(),
+        })
+    });
+
+    let Some(snap) = snap else { return };
+
+    let was_focused = with_win(snap.parent_hwnd, |p| {
+        CONTROLS.with(|m| {
+            m.borrow()
+                .get(&hwnd)
+                .is_some_and(|ctrl| is_control_first_responder(ctrl, &p.window))
+        })
+    })
+    .unwrap_or(false);
+
+    // Detach delegate from old field before removing it so ending editing does
+    // not emit stale notifications.
+    unsafe { snap.old_field.setDelegate(None) };
+
+    let new_field = build_single_line_edit_field(
+        mtm,
+        snap.frame,
+        masked,
+        &snap.text,
+        snap.style,
+        snap.enabled,
+        snap.visible,
+        &snap.delegate,
+    );
+
+    with_win(snap.parent_hwnd, |p| {
+        let attached = unsafe { snap.old_field.superview().is_some() };
+        if attached {
+            p.view.replaceSubview_with(&snap.old_field, &new_field);
+        } else {
+            p.view.addSubview(&new_field);
+        }
+    });
+
+    CONTROLS.with(|m| {
+        if let Some(ctrl) = m.borrow_mut().get_mut(&hwnd) {
+            if let NativeControlView::SingleLineEdit {
+                field,
+                masked: cur_masked,
+                edit_style,
+                last_text,
+                last_sel,
+                pending_sel,
+                ..
+            } = &mut ctrl.view
+            {
+                *field = new_field.clone();
+                cur_masked.set(masked);
+                edit_style.set(snap.style);
+                *last_text.borrow_mut() = snap.text_units;
+                last_sel.set(snap.sel);
+                pending_sel.set(Some(snap.sel));
+            }
+        }
+    });
+
+    if was_focused {
+        with_win(snap.parent_hwnd, |p| {
+            if snap.visible && snap.enabled {
+                p.window.makeFirstResponder(Some(&new_field));
+            } else {
+                p.window.makeFirstResponder(Some(&p.view));
+            }
+        });
+        if snap.visible && snap.enabled {
+            if let Some(ed) = new_field.currentEditor() {
+                let (lo, hi) = snap.sel;
+                CONTROLS.with(|m| {
+                    if let Some(ctrl) = m.borrow().get(&hwnd) {
+                        if let NativeControlView::SingleLineEdit {
+                            programmatic,
+                            last_sel,
+                            pending_sel,
+                            ..
+                        } = &ctrl.view
+                        {
+                            pending_sel.set(None);
+                            last_sel.set((lo, hi));
+                            programmatic.set(true);
+                            ed.setSelectedRange(NSRange::new(lo, hi.saturating_sub(lo)));
+                            programmatic.set(false);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+pub(super) fn control_set_check(hwnd: usize, state: u32) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        if let NativeControlView::Button { button, target } = &ctrl.view {
+            let clamped = state & 0x3;
+            target.ivars().stored_check.set(clamped);
+            button.setState(ns_state_from_check(clamped));
+        }
+    });
+}
+
+pub(super) fn control_set_style(hwnd: usize, style: u32) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        match &ctrl.view {
+            NativeControlView::Button { button, target } => {
+                let (is_toggle, is_manual) = button_toggle_flags(style);
+                target.ivars().is_toggle.set(is_toggle);
+                target.ivars().is_manual_toggle.set(is_manual);
+                apply_button_style(button, style);
+            }
+            NativeControlView::SingleLineEdit { field, edit_style, .. } => {
+                edit_style.set(style);
+                field.setEditable((style & controls::ES_READONLY) == 0);
+                field.setAlignment(ns_alignment_from_edit(style));
+            }
+            NativeControlView::MultiLineEdit {
+                text_view,
+                readonly,
+                enabled,
+                edit_style,
+                wants_return,
+                ..
+            } => {
+                let ro = (style & controls::ES_READONLY) != 0;
+                readonly.set(ro);
+                edit_style.set(style);
+                wants_return.set((style & controls::ES_WANTRETURN) != 0);
+                text_view.setEditable(enabled.get() && !ro);
+                text_view.setAlignment(ns_alignment_from_edit(style));
+            }
+            NativeControlView::StaticLabel { label, .. } => {
+                ctrl.notify_click.set((style & controls::SS_NOTIFY) != 0);
+                label.setAlignment(ns_alignment_from_static(style));
+            }
+            NativeControlView::StaticIcon { .. } | NativeControlView::StaticBox { .. } => {
+                ctrl.notify_click.set((style & controls::SS_NOTIFY) != 0);
+            }
+            _ => {}
+        }
+    });
+}
+
+pub(super) fn control_set_icon(hwnd: usize, payload: Option<IconPayload>) {
+    CONTROLS.with(|m| {
+        let map = m.borrow();
+        let Some(ctrl) = map.get(&hwnd) else { return };
+        if let NativeControlView::StaticIcon { image_view } = &ctrl.view {
+            let img = payload.as_ref().and_then(nsimage_from_icon_payload);
+            image_view.setImage(img.as_deref());
+        }
+    });
+}
+
+/// If the event targets one of our windows whose AppKit `firstResponder` is a
+/// native `EDIT` control (an `NSTextView` or `NSTextField` field editor),
+/// returns `Some((edit_hwnd, wants_return))`.
+pub(super) fn focused_native_edit_info(ev: &NSEvent, mtm: MainThreadMarker) -> Option<(usize, bool)> {
+    let win = ev
+        .window(mtm)
+        .or_else(|| NSApplication::sharedApplication(mtm).keyWindow())?;
+    let parent_hwnd = hwnd_for_window(&win)?;
+    let resp = win.firstResponder()?;
+    let resp_ptr = (&*resp as *const _) as usize;
+    CONTROLS.with(|m| {
+        for (&ch, ctrl) in m.borrow().iter() {
+            if ctrl.parent_hwnd != parent_hwnd || ctrl.kind != NativeControlKind::Edit {
+                continue;
+            }
+            match &ctrl.view {
+                NativeControlView::MultiLineEdit { text_view, wants_return, .. } => {
+                    if Retained::as_ptr(text_view) as usize == resp_ptr {
+                        return Some((ch, wants_return.get()));
+                    }
+                }
+                NativeControlView::SingleLineEdit { field, .. } => {
+                    if Retained::as_ptr(field) as usize == resp_ptr
+                        || field
+                            .currentEditor()
+                            .is_some_and(|ed| Retained::as_ptr(&ed) as usize == resp_ptr)
+                    {
+                        return Some((ch, false));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
+/// After forwarding a key/mouse event to AppKit, synchronize the focused native
+/// `EDIT` control's live UTF-16 selection range back to Win32 if it changed.
+pub(super) fn sync_focused_edit_selection(ev: &NSEvent, mtm: MainThreadMarker) {
+    let Some((edit_hwnd, _)) = focused_native_edit_info(ev, mtm) else {
+        return;
+    };
+    let changed = CONTROLS.with(|m| {
+        let map = m.borrow();
+        let ctrl = map.get(&edit_hwnd)?;
+        match &ctrl.view {
+            NativeControlView::SingleLineEdit {
+                field,
+                programmatic,
+                last_sel,
+                ..
+            } => {
+                if programmatic.get() {
+                    return None;
+                }
+                let ed = field.currentEditor()?;
+                let len = ed.string().length();
+                let r = ed.selectedRange();
+                let lo = r.location.min(len);
+                let hi = r.location.saturating_add(r.length).min(len);
+                if last_sel.replace((lo, hi)) != (lo, hi) {
+                    return Some((lo, hi));
+                }
+                None
+            }
+            NativeControlView::MultiLineEdit {
+                text_view,
+                programmatic,
+                last_text,
+                last_sel,
+                ..
+            } => {
+                if programmatic.get() {
+                    return None;
+                }
+                let len = text_view.string().length();
+                let r = text_view.selectedRange();
+                let nat_lo = r.location.min(len);
+                let nat_hi = r.location.saturating_add(r.length).min(len);
+                let win32_units = last_text.borrow();
+                let lo = controls::native_offset_to_win32(&win32_units, nat_lo);
+                let hi = controls::native_offset_to_win32(&win32_units, nat_hi);
+                if last_sel.replace((lo, hi)) != (lo, hi) {
+                    return Some((lo, hi));
+                }
+                None
+            }
+            _ => None,
+        }
+    });
+    if let Some((lo, hi)) = changed {
+        controls::native_edit_selection_changed(edit_hwnd, lo, hi);
+    }
+}
+
+/// True when a wheel event lands on a visible, enabled scrollable native child
+/// control (`MultiLineEdit` / `NSScrollView`) so AppKit handles scrolling only
+/// for that control while non-scrollable areas keep Win32 `WM_MOUSEWHEEL`.
+pub(super) fn wheel_targets_native_control(ev: &NSEvent, mtm: MainThreadMarker) -> bool {
+    let Some(win) = ev.window(mtm) else { return false };
+    let Some(parent_hwnd) = hwnd_for_window(&win) else { return false };
+    if !with_win(parent_hwnd, |w| w.has_controls.get()).unwrap_or(false) {
+        return false;
+    }
+    let loc = ev.locationInWindow();
+    CONTROLS.with(|m| {
+        m.borrow().values().any(|c| {
+            if c.parent_hwnd != parent_hwnd {
+                return false;
+            }
+            match &c.view {
+                NativeControlView::MultiLineEdit { scroll, enabled, .. } => {
+                    enabled.get() && !scroll.isHidden() && {
+                        let f = scroll.frame();
+                        loc.x >= f.origin.x
+                            && loc.x <= f.origin.x + f.size.width
+                            && loc.y >= f.origin.y
+                            && loc.y <= f.origin.y + f.size.height
+                    }
+                }
+                _ => false,
+            }
+        })
+    })
+}
+
+/// If a left mouse-down lands on a visible `SS_NOTIFY` `STATIC` control, queue `STN_CLICKED`.
+pub(super) fn notify_static_click_if_hit(ev: &NSEvent, mtm: MainThreadMarker) {
+    let Some(win) = ev.window(mtm) else { return };
+    let Some(parent_hwnd) = hwnd_for_window(&win) else { return };
+    if !with_win(parent_hwnd, |w| w.has_controls.get()).unwrap_or(false) {
+        return;
+    }
+    let loc = ev.locationInWindow();
+    let hit = CONTROLS.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(_, c)| {
+                c.parent_hwnd == parent_hwnd
+                    && c.notify_click.get()
+                    && !c.view.root_view().isHidden()
+                    && {
+                        let f = c.view.root_view().frame();
+                        loc.x >= f.origin.x
+                            && loc.x <= f.origin.x + f.size.width
+                            && loc.y >= f.origin.y
+                            && loc.y <= f.origin.y + f.size.height
+                    }
+            })
+            .map(|(h, _)| *h)
+    });
+    if let Some(h) = hit {
+        controls::native_static_clicked(h);
+    }
 }
 
 #[cfg(test)]

@@ -6505,3 +6505,96 @@ fn cert_add_certificate_context_to_store_preserves_metadata_and_excludes_key_han
         CertCloseStore(pfx_st, 0);
     }
 }
+
+#[test]
+fn pkcs_attributes_encoder_canonically_sorts_attribute_and_value_sets() {
+    #[repr(C)]
+    struct CryptAttr {
+        psz_obj_id: *const u8,
+        c_value: u32,
+        rg_value: *const CryptDataBlob,
+    }
+    #[repr(C)]
+    struct CryptAttrs {
+        c_attr: u32,
+        rg_attr: *const CryptAttr,
+    }
+
+    let val_small = super::asn1::encode_der_tlv(0x04, &[0x01, 0x02]);
+    let val_large = super::asn1::encode_der_tlv(0x04, &[0xFF, 0xFE]);
+    let oid_a = b"1.2.840.113549.1.9.3\0"; // contentType (encodes smaller than messageDigest)
+    let oid_b = b"1.2.840.113549.1.9.4\0"; // messageDigest
+
+    // Deliberately supply values AND attributes in reverse canonical order.
+    let rev_vals = [
+        CryptDataBlob { cb_data: val_large.len() as u32, pb_data: val_large.as_ptr() },
+        CryptDataBlob { cb_data: val_small.len() as u32, pb_data: val_small.as_ptr() },
+    ];
+    let fwd_vals = [
+        CryptDataBlob { cb_data: val_small.len() as u32, pb_data: val_small.as_ptr() },
+        CryptDataBlob { cb_data: val_large.len() as u32, pb_data: val_large.as_ptr() },
+    ];
+    let single_val = [
+        CryptDataBlob { cb_data: val_small.len() as u32, pb_data: val_small.as_ptr() },
+    ];
+
+    let rev_attrs = [
+        CryptAttr { psz_obj_id: oid_b.as_ptr(), c_value: 2, rg_value: rev_vals.as_ptr() },
+        CryptAttr { psz_obj_id: oid_a.as_ptr(), c_value: 1, rg_value: single_val.as_ptr() },
+    ];
+    let fwd_attrs = [
+        CryptAttr { psz_obj_id: oid_a.as_ptr(), c_value: 1, rg_value: single_val.as_ptr() },
+        CryptAttr { psz_obj_id: oid_b.as_ptr(), c_value: 2, rg_value: fwd_vals.as_ptr() },
+    ];
+    let list_rev = CryptAttrs { c_attr: 2, rg_attr: rev_attrs.as_ptr() };
+    let list_fwd = CryptAttrs { c_attr: 2, rg_attr: fwd_attrs.as_ptr() };
+
+    unsafe {
+        let encode = |struct_type: usize, ptr: *const c_void| -> Vec<u8> {
+            let mut out: *mut u8 = std::ptr::null_mut();
+            let mut out_len = 0u32;
+            assert_eq!(
+                CryptEncodeObjectEx(
+                    X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                    struct_type as *const u8,
+                    ptr,
+                    0x8000, // CRYPT_ENCODE_ALLOC_FLAG
+                    std::ptr::null(),
+                    &mut out as *mut _ as *mut c_void,
+                    &mut out_len,
+                ),
+                TRUE
+            );
+            let bytes = std::slice::from_raw_parts(out, out_len as usize).to_vec();
+            crate::kernel32::memory::LocalFree(out as *mut c_void);
+            bytes
+        };
+
+        // PKCS_ATTRIBUTE (22): value SET must be canonically sorted regardless of input order.
+        let enc_attr_rev = encode(22, &rev_attrs[0] as *const _ as *const c_void);
+        let enc_attr_fwd = encode(22, &fwd_attrs[1] as *const _ as *const c_void);
+        assert_eq!(
+            enc_attr_rev, enc_attr_fwd,
+            "PKCS_ATTRIBUTE value SET must be canonically DER-sorted"
+        );
+        let pos_small = enc_attr_rev.windows(val_small.len()).position(|w| w == val_small.as_slice()).unwrap();
+        let pos_large = enc_attr_rev.windows(val_large.len()).position(|w| w == val_large.as_slice()).unwrap();
+        assert!(pos_small < pos_large, "smaller value TLV must precede larger value TLV");
+
+        // PKCS_ATTRIBUTES (48): outer SET OF Attribute must be canonically sorted regardless of input order.
+        let enc_set_rev = encode(48, &list_rev as *const _ as *const c_void);
+        let enc_set_fwd = encode(48, &list_fwd as *const _ as *const c_void);
+        assert_eq!(
+            enc_set_rev, enc_set_fwd,
+            "PKCS_ATTRIBUTES SET OF Attribute must be canonically DER-sorted"
+        );
+        let (outer, _) = super::asn1::parse_der_item(&enc_set_rev).unwrap();
+        assert_eq!(outer.tag, 0x31);
+        let elems = super::asn1::der_item_children(outer.val).unwrap();
+        assert_eq!(elems.len(), 2);
+        assert!(
+            elems[0].raw <= elems[1].raw,
+            "encoded attribute TLVs in SET OF Attribute must be in ascending lexicographical order"
+        );
+    }
+}

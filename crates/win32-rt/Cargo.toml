@@ -28,7 +28,7 @@ zstd-sys.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSDate", "NSRunLoop", "NSNotification", "NSObject", "NSArray", "NSThread", "NSValue", "NSProcessInfo"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSDate", "NSRunLoop", "NSNotification", "NSObject", "NSArray", "NSThread", "NSValue", "NSProcessInfo", "NSData", "NSRange"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "objc2-core-foundation"] }
 # D3D12 -> Metal (src/d3d12, src/dxgi): COM shims over d3d12-metal.
 block2 = "0.6"
@@ -43,7 +43,7 @@ objc2-core-haptics = { version = "0.3", default-features = false, features = ["s
 # macOS-only AppKit window-system backend (NSApplication, NSWindow, NSView,
 # NSEvent, NSScreen, NSPasteboard). iOS uses UIKit/host-surface binding instead.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-quartz-core", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSFont", "NSProgressIndicator", "NSResponder", "NSRunningApplication", "NSTextField", "NSWindow", "NSView", "NSEvent", "NSScreen", "NSCursor", "NSGraphics", "NSColor", "NSTrackingArea", "NSMenu", "NSMenuItem", "NSImage", "NSPasteboard", "NSText", "NSGraphicsContext"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-quartz-core", "NSAlert", "NSApplication", "NSBitmapImageRep", "NSBox", "NSButton", "NSButtonCell", "NSCell", "NSClipView", "NSControl", "NSFont", "NSImageRep", "NSImageView", "NSProgressIndicator", "NSResponder", "NSRunningApplication", "NSScrollView", "NSSecureTextField", "NSTextContainer", "NSTextField", "NSTextView", "NSWindow", "NSView", "NSEvent", "NSScreen", "NSCursor", "NSGraphics", "NSColor", "NSTrackingArea", "NSMenu", "NSMenuItem", "NSImage", "NSPasteboard", "NSText", "NSGraphicsContext"] }
 
 # Real-controller test: needs the process main thread for AppKit /
 # GameController, hence no libtest harness. Skips unless AW2_TEST_GAMEPAD=1.

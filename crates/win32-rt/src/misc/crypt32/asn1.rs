@@ -988,15 +988,18 @@ unsafe fn encode_x509_object(
             }
             let oid_s = crate::strings::from_ansi(a.psz_obj_id);
             let oid_val = wintrust::encode_oid_str(&oid_s).ok_or(err::ERROR_INVALID_DATA)?;
-            let mut set_inner = Vec::new();
+            let mut vals: Vec<&[u8]> = Vec::with_capacity(a.c_value as usize);
             for i in 0..a.c_value as usize {
                 let b = std::ptr::read_unaligned(a.rg_value.add(i));
                 if !b.pb_data.is_null() && b.cb_data > 0 {
-                    set_inner.extend_from_slice(std::slice::from_raw_parts(
-                        b.pb_data,
-                        b.cb_data as usize,
-                    ));
+                    vals.push(std::slice::from_raw_parts(b.pb_data, b.cb_data as usize));
                 }
+            }
+            // X.690 §11.6 / RFC 5652 §5.4: DER SET OF elements must be sorted lexicographically.
+            vals.sort_unstable();
+            let mut set_inner = Vec::new();
+            for v in vals {
+                set_inner.extend_from_slice(v);
             }
             let mut inner = encode_der_tlv(0x06, &oid_val);
             inner.extend_from_slice(&encode_der_tlv(0x31, &set_inner));
@@ -1018,10 +1021,15 @@ unsafe fn encode_x509_object(
             if list.c_attr > 0 && list.rg_attr.is_null() {
                 return Err(err::ERROR_INVALID_DATA);
             }
-            let mut inner = Vec::new();
+            let mut encoded_attrs: Vec<Vec<u8>> = Vec::with_capacity(list.c_attr as usize);
             for i in 0..list.c_attr as usize {
                 let attr_ptr = list.rg_attr.add(i) as *const c_void;
-                let enc = encode_x509_object(PKCS_ATTRIBUTE as *const u8, attr_ptr)?;
+                encoded_attrs.push(encode_x509_object(PKCS_ATTRIBUTE as *const u8, attr_ptr)?);
+            }
+            // X.690 §11.6 / RFC 5652 §5.4: DER SET OF Attribute must be sorted lexicographically.
+            encoded_attrs.sort_unstable();
+            let mut inner = Vec::new();
+            for enc in encoded_attrs {
                 inner.extend_from_slice(&enc);
             }
             Ok(encode_der_tlv(0x31, &inner))

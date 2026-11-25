@@ -2252,6 +2252,14 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
         return TRUST_E_ACTION_UNKNOWN;
     }
 
+    if guid == DRIVER_ACTION_VERIFY {
+        // WHQL driver verification (`DRIVER_ACTION_VERIFY` / `DRIVER_VER_INFO`) enforces
+        // Windows WHQL driver policy rather than ordinary Authenticode code signing; fail
+        // closed honestly instead of accepting non-WHQL code-signing chains.
+        log::debug!("WinVerifyTrust(DRIVER_ACTION_VERIFY) -> TRUST_E_PROVIDER_UNKNOWN");
+        return TRUST_E_PROVIDER_UNKNOWN;
+    }
+
     let base = data as *const u8;
     let cb_struct = std::ptr::read_unaligned(base as *const u32);
     if cb_struct < 0x40 {
@@ -3042,10 +3050,22 @@ mod tests {
             assert_eq!(
                 WinVerifyTrust(
                     std::ptr::null_mut(),
-                    DRIVER_ACTION_VERIFY.as_ptr(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
                     wtd.as_mut_ptr() as *mut c_void,
                 ),
                 TRUST_E_BAD_DIGEST
+            );
+
+            // DRIVER_ACTION_VERIFY (WHQL driver verification) fails closed with
+            // TRUST_E_PROVIDER_UNKNOWN instead of falling back to ordinary Authenticode.
+            std::ptr::write_unaligned(blob_info.as_mut_ptr().add(0x28) as *mut *const u8, pkcs7.as_ptr());
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    DRIVER_ACTION_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                TRUST_E_PROVIDER_UNKNOWN
             );
 
             // WTD_CHOICE_CERT with WINTRUST_ACTION_GENERIC_CERT_VERIFY, GENERIC_CHAIN_VERIFY, and HTTPSPROV_ACTION

@@ -451,14 +451,39 @@ fn cpuid_subleaves_and_feature_fallbacks() {
             let [_, b, c, d] = cpuid::query(1, 0);
             assert_eq!(b >> 16 & 0xff, cores);
             assert_eq!(d >> 23 & 15, 15); // MMX, FXSR, SSE, SSE2
-            assert_eq!(c & ((1 << 5) | (1 << 28) | (1 << 30)), 0); // VMX, AVX, RDRAND
+            assert_eq!(
+                c & ((1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)),
+                (1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
+            ); // FMA, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C
+            assert_eq!(c & ((1 << 5) | (1 << 30)), 0); // VMX, RDRAND
             assert_eq!(c >> 25 & 1, u32::from(features::host().has(H::AES)));
             assert_eq!(c >> 1 & 1, u32::from(features::host().has(H::PMULL)));
             assert_eq!(c >> 20 & 1, u32::from(features::host().has(H::CRC32)));
-            assert_eq!(cpuid::query(7, 0)[1] >> 29 & 1, u32::from(features::host().has(H::SHA1 | H::SHA256)));
-            assert_eq!(cpuid::query(7, 0)[1] & ((1 << 5) | (1 << 7) | (1 << 10) | (1 << 18)), 0);
+            let leaf7_ebx = cpuid::query(7, 0)[1];
+            assert_eq!(leaf7_ebx >> 29 & 1, u32::from(features::host().has(H::SHA1 | H::SHA256)));
+            assert_eq!(
+                leaf7_ebx & ((1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 19)),
+                (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 19)
+            ); // BMI1, AVX2, BMI2, ERMS, ADX
+            assert_eq!(
+                leaf7_ebx
+                    & ((1 << 7)
+                        | (1 << 10)
+                        | (1 << 16)
+                        | (1 << 17)
+                        | (1 << 18)
+                        | (1 << 21)
+                        | (1 << 26)
+                        | (1 << 27)
+                        | (1 << 28)
+                        | (1 << 30)
+                        | (1 << 31)),
+                0
+            ); // No SMEP, INVPCID, RDSEED, or AVX-512
             assert_eq!(cpuid::query(7, 1), [0; 4]);
+            assert_eq!(cpuid::query(0x8000_0001, 0)[2] & (1 << 5), 1 << 5); // LZCNT
             assert_eq!(cpuid::query(0x8000_0001, 0)[2] & (1 << 6), 0);
+            assert_eq!(unsafe { win32_rt::kernel32::sysinfo::GetEnabledXStateFeatures() }, 7);
             assert_eq!(cpuid::query(4, 0)[0] >> 26, cores - 1);
             assert_eq!(cpuid::query(0xb, 0)[1], 1);
             assert_eq!(cpuid::query(0xb, 1), cpuid::query(0x1f, 1));
@@ -971,4 +996,616 @@ fn double_precision_denormals_and_scalar_merge_lanes() {
             })
         });
     }
+}
+
+#[test]
+fn avx_vpermilpd_round_mxcsr_and_pcmpstrm_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // 1. VPERMILPD (128/256 imm8 & var, reg & mem), verifying bit-1 control and 128-bit upper zeroing.
+    a.vmovupd(ymm0, ymmword_ptr(rcx)).unwrap(); // [10.0, 20.0, 30.0, 40.0]
+    a.vmovdqu(ymm1, ymmword_ptr(rcx + 32)).unwrap(); // ctrl = [1, 2, 3, 0] (bit 1 -> [0, 1, 1, 0])
+    a.vmovupd(ymm2, ymm0).unwrap();
+    a.vpermilpd(xmm2, xmm0, 0b01).unwrap(); // lo=[20, 10], upper 128 zeroed
+    a.vmovupd(ymmword_ptr(rcx + 64), ymm2).unwrap();
+    a.vmovupd(ymm2, ymm0).unwrap();
+    a.vpermilpd(xmm2, xmmword_ptr(rcx), 0b11).unwrap(); // lo=[20, 20], upper 128 zeroed
+    a.vmovupd(ymmword_ptr(rcx + 96), ymm2).unwrap();
+    a.vpermilpd(ymm2, ymm0, 0b0110).unwrap(); // lo=[10, 20], hi=[40, 30]
+    a.vmovupd(ymmword_ptr(rcx + 128), ymm2).unwrap();
+    a.vpermilpd(ymm2, ymmword_ptr(rcx), 0b1001).unwrap(); // lo=[20, 10], hi=[30, 40]
+    a.vmovupd(ymmword_ptr(rcx + 160), ymm2).unwrap();
+    a.vmovupd(ymm2, ymm0).unwrap();
+    a.vpermilpd(xmm2, xmm0, xmm1).unwrap(); // bit1 of [1,2]=[0,1] -> [10,20], upper 128 zeroed
+    a.vmovupd(ymmword_ptr(rcx + 192), ymm2).unwrap();
+    a.vpermilpd(ymm2, ymm0, ymm1).unwrap(); // bit1 of [1,2,3,0]=[0,1,1,0] -> [10,20,40,30]
+    a.vmovupd(ymmword_ptr(rcx + 224), ymm2).unwrap();
+    a.vpermilpd(ymm2, ymm0, ymmword_ptr(rcx + 32)).unwrap(); // mem ctrl
+    a.vmovupd(ymmword_ptr(rcx + 256), ymm2).unwrap();
+
+    // 2. (V)ROUND{SS,SD,PS,PD} with imm8[2]=1 (use MXCSR.RC) across all 4 rounding modes.
+    for mode in 0..4 {
+        let base = 320 + mode * 80;
+        a.ldmxcsr(dword_ptr(rcx + 288 + mode * 4)).unwrap();
+        a.vmovups(ymm3, ymmword_ptr(rcx + 640)).unwrap(); // 8x f32: 1.5, -1.5, 1.25, -1.25, 2.5, -2.5, 0.25, -0.25
+        a.vroundps(ymm4, ymm3, 4).unwrap();
+        a.vmovups(ymmword_ptr(rcx + base), ymm4).unwrap();
+        a.vmovupd(ymm5, ymmword_ptr(rcx + 672)).unwrap(); // 4x f64: 1.5, -1.5, 2.25, -2.25
+        a.vroundpd(ymm6, ymm5, 4).unwrap();
+        a.vmovupd(ymmword_ptr(rcx + base + 32), ymm6).unwrap();
+        a.vroundss(xmm7, xmm3, xmm3, 4).unwrap();
+        a.vmovss(dword_ptr(rcx + base + 64), xmm7).unwrap();
+        a.vroundsd(xmm7, xmm5, xmm5, 4).unwrap();
+        a.vmovsd(qword_ptr(rcx + base + 72), xmm7).unwrap();
+    }
+    a.ldmxcsr(dword_ptr(rcx + 288)).unwrap(); // restore RN
+
+    // 3. Legacy PCMPISTRM preserves YMM0[255:128], whereas VPCMPISTRM zeroes YMM0[255:128].
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 704)).unwrap(); // upper half non-zero sentinel
+    a.vmovdqu(xmm1, xmmword_ptr(rcx + 736)).unwrap();
+    a.pcmpistrm(xmm0, xmm1, 0x08).unwrap(); // Equal Each, bitmask in xmm0; ymm0[255:128] preserved!
+    a.vmovdqu(ymmword_ptr(rcx + 768), ymm0).unwrap();
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 704)).unwrap();
+    a.vpcmpistrm(xmm0, xmm1, 0x08).unwrap(); // VEX.128: ymm0[255:128] zeroed!
+    a.vmovdqu(ymmword_ptr(rcx + 800), ymm0).unwrap();
+
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 832];
+    for (i, v) in [10.0f64, 20.0, 30.0, 40.0].into_iter().enumerate() {
+        init[i * 8..i * 8 + 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for (i, v) in [1u64, 2, 3, 0].into_iter().enumerate() {
+        init[32 + i * 8..40 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, rc) in [0u32, 1, 2, 3].into_iter().enumerate() {
+        let mx = 0x1f80 | (rc << 13);
+        init[288 + i * 4..292 + i * 4].copy_from_slice(&mx.to_le_bytes());
+    }
+    for (i, v) in [1.5f32, -1.5, 1.25, -1.25, 2.5, -2.5, 0.25, -0.25].into_iter().enumerate() {
+        init[640 + i * 4..644 + i * 4].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for (i, v) in [1.5f64, -1.5, 2.25, -2.25].into_iter().enumerate() {
+        init[672 + i * 8..680 + i * 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    init[704..720].copy_from_slice(b"hello_world\0\0\0\0\0");
+    init[720..736].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes().repeat(2));
+    init[736..752].copy_from_slice(b"hello_there\0\0\0\0\0");
+
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    run_tiers(&code, &init, |out| {
+        let f64_at = |off: usize| f64::from_bits(u64::from_le_bytes(out[off..off + 8].try_into().unwrap()));
+        let f32_at = |off: usize| f32::from_bits(u32::from_le_bytes(out[off..off + 4].try_into().unwrap()));
+        assert_eq!([f64_at(64), f64_at(72), f64_at(80), f64_at(88)], [20.0, 10.0, 0.0, 0.0]);
+        assert_eq!([f64_at(96), f64_at(104), f64_at(112), f64_at(120)], [20.0, 20.0, 0.0, 0.0]);
+        assert_eq!([f64_at(128), f64_at(136), f64_at(144), f64_at(152)], [10.0, 20.0, 40.0, 30.0]);
+        assert_eq!([f64_at(160), f64_at(168), f64_at(176), f64_at(184)], [20.0, 10.0, 30.0, 40.0]);
+        assert_eq!([f64_at(192), f64_at(200), f64_at(208), f64_at(216)], [10.0, 20.0, 0.0, 0.0]);
+        assert_eq!([f64_at(224), f64_at(232), f64_at(240), f64_at(248)], [10.0, 20.0, 40.0, 30.0]);
+        assert_eq!([f64_at(256), f64_at(264), f64_at(272), f64_at(280)], [10.0, 20.0, 40.0, 30.0]);
+        // Check RD (mode=1) and RU (mode=2) and RZ (mode=3) for vroundps/pd/ss/sd imm=4
+        assert_eq!([f32_at(320 + 80), f32_at(320 + 80 + 4), f32_at(320 + 80 + 8), f32_at(320 + 80 + 12)], [1.0, -2.0, 1.0, -2.0]);
+        assert_eq!([f32_at(320 + 160), f32_at(320 + 160 + 4), f32_at(320 + 160 + 8), f32_at(320 + 160 + 12)], [2.0, -1.0, 2.0, -1.0]);
+        assert_eq!([f32_at(320 + 240), f32_at(320 + 240 + 4), f32_at(320 + 240 + 8), f32_at(320 + 240 + 12)], [1.0, -1.0, 1.0, -1.0]);
+        assert_eq!(f32_at(320 + 80 + 64), 1.0);
+        assert_eq!(f64_at(320 + 160 + 72), 2.0);
+        // Legacy PCMPISTRM preserves YMM0[255:128], VEX VPCMPISTRM zeroes it.
+        assert_eq!(&out[784..800], &init[720..736]);
+        assert_eq!(&out[816..832], &[0u8; 16]);
+        if let Some(control) = &oracle {
+            assert_eq!(out, control);
+        }
+    });
+}
+
+#[test]
+fn f16c_rounding_modes_denormals_and_nans_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // 1. VCVTPH2PS (128 & 256, reg & mem): sNaN quieting, subnormals, upper zeroing.
+    a.vmovdqu(ymm0, ymmword_ptr(rcx)).unwrap(); // sentinel upper half
+    a.vcvtph2ps(xmm0, qword_ptr(rcx)).unwrap(); // 128-bit mem -> zeroes ymm0[255:128]
+    a.vmovups(ymmword_ptr(rcx + 64), ymm0).unwrap();
+    a.vmovdqu(xmm1, xmmword_ptr(rcx)).unwrap();
+    a.vcvtph2ps(ymm2, xmm1).unwrap(); // 256-bit reg
+    a.vmovups(ymmword_ptr(rcx + 96), ymm2).unwrap();
+
+    // 2. VCVTPS2PH across imm=0,1,2,3,4 under MXCSR.RC=RD(1), RU(2), RZ(3), and DAZ/FTZ combos,
+    //    also verifying RFLAGS preservation across imm8 override in JIT.
+    a.vmovups(ymm3, ymmword_ptr(rcx + 128)).unwrap(); // fractional + overflow + min-normal + sNaN
+    a.vmovups(ymm4, ymmword_ptr(rcx + 160)).unwrap(); // subnormals (f32 + f16)
+    // With MXCSR.RC = RD (0x3f80): test imm=0 (RN overrides MXCSR), imm=2 (RU), imm=3 (RZ), imm=4 (MXCSR=RD).
+    a.ldmxcsr(dword_ptr(rcx + 32)).unwrap();
+    a.mov(eax, 1).unwrap();
+    a.sub(eax, 2).unwrap(); // sets CF=1, SF=1, ZF=0, OF=0
+    a.vcvtps2ph(xmm5, ymm3, 0).unwrap();
+    a.setb(byte_ptr(rcx + 56)).unwrap(); // CF must survive vcvtps2ph
+    a.sets(byte_ptr(rcx + 57)).unwrap(); // SF must survive vcvtps2ph
+    a.vmovdqu(xmmword_ptr(rcx + 192), xmm5).unwrap();
+    a.vcvtps2ph(xmmword_ptr(rcx + 208), ymm3, 1).unwrap();
+    a.vcvtps2ph(xmmword_ptr(rcx + 224), ymm3, 2).unwrap();
+    a.vcvtps2ph(xmmword_ptr(rcx + 240), ymm3, 3).unwrap();
+    a.vcvtps2ph(xmmword_ptr(rcx + 256), ymm3, 4).unwrap();
+    // 128-bit reg form zeroes upper 128 bits of dest
+    a.vmovdqu(ymm6, ymmword_ptr(rcx + 128)).unwrap();
+    a.vcvtps2ph(xmm6, xmm3, 2).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 272), ymm6).unwrap();
+
+    // 3. Test DAZ vs FTZ on subnormals under RU (RC=2): 4 modes = (none, DAZ, FTZ, both).
+    for m in 0..4 {
+        a.ldmxcsr(dword_ptr(rcx + 36 + m * 4)).unwrap();
+        a.vcvtps2ph(xmmword_ptr(rcx + 304 + m * 16), ymm4, 4).unwrap();
+        a.vcvtph2ps(ymm7, xmmword_ptr(rcx)).unwrap();
+        a.vmovups(ymmword_ptr(rcx + 368 + m * 32), ymm7).unwrap();
+    }
+    a.ldmxcsr(dword_ptr(rcx + 52)).unwrap(); // restore default 0x1f80
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 512];
+    // [0..16]: 8x f16 inputs: +sNaN, -sNaN, +qNaN, +min_sub, -min_sub, +min_norm, +0, -0
+    for (i, h) in [0x7c01u16, 0xfc01, 0x7e01, 0x0001, 0x8001, 0x0400, 0x0000, 0x8000].into_iter().enumerate() {
+        init[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+    }
+    init[16..32].fill(0xAA); // sentinel for upper 128 bits
+    init[32..36].copy_from_slice(&(0x1f80u32 | (1 << 13)).to_le_bytes()); // RD
+    for (i, mx) in [0x5f80u32, 0x5fc0, 0xdf80, 0xdfc0].into_iter().enumerate() {
+        init[36 + i * 4..40 + i * 4].copy_from_slice(&mx.to_le_bytes());
+    }
+    init[52..56].copy_from_slice(&0x1f80u32.to_le_bytes());
+    // [128..160]: 8x f32: 1.5, 1+2^-12, -(1+2^-12), 65536, -65536, 65520, 2^-14-eps, +sNaN
+    for (i, f) in [
+        0x3fc0_0000u32, 0x3f80_0800, 0xbf80_0800, 0x4780_0000,
+        0xc780_0000, 0x477f_f000, 0x387f_f000, 0x7f80_0001,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        init[128 + i * 4..132 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+    // [160..192]: 8x f32 subnormals/tiny
+    for (i, f) in [
+        0x0000_0001u32, 0x8000_0001, 0x3800_0000, 0xb800_0000,
+        0x3380_0000, 0x3300_0000, 0x387f_e000, 0x387f_c000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        init[160 + i * 4..164 + i * 4].copy_from_slice(&f.to_le_bytes());
+    }
+
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    for mask in [0, features::HostFeatures::AFP] {
+        features::without_features(mask, || {
+            run_tiers(&code, &init, |out| {
+                let u32_at = |off: usize| u32::from_le_bytes(out[off..off + 4].try_into().unwrap());
+                let u16_at = |off: usize| u16::from_le_bytes(out[off..off + 2].try_into().unwrap());
+                // sNaN quieted and 128-bit upper half zeroed
+                assert_eq!(u32_at(64), 0x7fc0_2000);
+                assert_eq!(u32_at(68), 0xffc0_2000);
+                assert_eq!(&out[80..96], &[0u8; 16]);
+                // RFLAGS preserved
+                assert_eq!(out[56], 1);
+                assert_eq!(out[57], 1);
+                // imm=0 (RN) overrides MXCSR.RC=RD: 1.5 -> 0x3e00, 1+2^-12 -> 0x3c00, 65536 -> +Inf (0x7c00)
+                assert_eq!([u16_at(192), u16_at(194), u16_at(196), u16_at(198)], [0x3e00, 0x3c00, 0xbc00, 0x7c00]);
+                // imm=1 (RD): -(1+2^-12) -> 0xbc01, 65536 -> +65504 (0x7bff)
+                assert_eq!([u16_at(208), u16_at(210), u16_at(212), u16_at(214)], [0x3e00, 0x3c00, 0xbc01, 0x7bff]);
+                // imm=2 (RU): 1+2^-12 -> 0x3c01, -65536 -> -65504 (0xfbff)
+                assert_eq!([u16_at(224), u16_at(226), u16_at(228), u16_at(232)], [0x3e00, 0x3c01, 0xbc00, 0xfbff]);
+                // imm=3 (RZ): 65536 -> 0x7bff, -65536 -> 0xfbff
+                assert_eq!([u16_at(246), u16_at(248)], [0x7bff, 0xfbff]);
+                // imm=4 (MXCSR.RC=RD) matches imm=1
+                assert_eq!(&out[256..272], &out[208..224]);
+                // 128-bit reg form zeroed upper 128 bits
+                assert_eq!(&out[288..304], &[0u8; 16]);
+                // Subnormals under RU: +2^-149 -> 0x0001 when DAZ=0 (modes 0,2), 0x0000 when DAZ=1 (modes 1,3)
+                assert_eq!(u16_at(304), 0x0001);
+                assert_eq!(u16_at(320), 0x0000);
+                assert_eq!(u16_at(336), 0x0001);
+                assert_eq!(u16_at(352), 0x0000);
+                if let Some(control) = &oracle {
+                    assert_eq!(out, control);
+                }
+            });
+        });
+    }
+}
+
+#[test]
+fn fma3_all_families_128_and_256_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Load 256-bit f32 inputs: ymm0=a, ymm1=b, ymm2=c
+    a.vmovups(ymm0, ymmword_ptr(rcx)).unwrap();
+    a.vmovups(ymm1, ymmword_ptr(rcx + 32)).unwrap();
+    a.vmovups(ymm2, ymmword_ptr(rcx + 64)).unwrap();
+    // 256-bit PS: all 6 families across 132/213/231 (mix reg and mem forms)
+    a.vmovups(ymm3, ymm0).unwrap();
+    a.vfmadd132ps(ymm3, ymm2, ymm1).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 192), ymm3).unwrap();
+    a.vmovups(ymm3, ymm0).unwrap();
+    a.vfmsub213ps(ymm3, ymm1, ymmword_ptr(rcx + 64)).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 224), ymm3).unwrap();
+    a.vmovups(ymm3, ymm2).unwrap();
+    a.vfnmadd231ps(ymm3, ymm0, ymm1).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 256), ymm3).unwrap();
+    a.vmovups(ymm3, ymm0).unwrap();
+    a.vfnmsub132ps(ymm3, ymm2, ymmword_ptr(rcx + 32)).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 288), ymm3).unwrap();
+    a.vmovups(ymm3, ymm0).unwrap();
+    a.vfmaddsub213ps(ymm3, ymm1, ymm2).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 320), ymm3).unwrap();
+    a.vmovups(ymm3, ymm2).unwrap();
+    a.vfmsubadd231ps(ymm3, ymm0, ymm1).unwrap();
+    a.vmovups(ymmword_ptr(rcx + 352), ymm3).unwrap();
+
+    // 256-bit PD: all 6 families
+    a.vmovupd(ymm4, ymmword_ptr(rcx + 96)).unwrap();
+    a.vmovupd(ymm5, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovupd(ymm6, ymmword_ptr(rcx + 160)).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfmadd213pd(ymm7, ymm5, ymm6).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 384), ymm7).unwrap();
+    a.vmovupd(ymm7, ymm6).unwrap();
+    a.vfmsub231pd(ymm7, ymm4, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 416), ymm7).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfnmadd132pd(ymm7, ymm6, ymm5).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 448), ymm7).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfnmsub213pd(ymm7, ymm5, ymm6).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 480), ymm7).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfmaddsub132pd(ymm7, ymm6, ymm5).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 512), ymm7).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfmsubadd213pd(ymm7, ymm5, ymm6).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 544), ymm7).unwrap();
+
+    // Scalar SS & SD: preserve dest[127:32]/[127:64] and zero dest[255:128], single-rounding exactness
+    a.vmovups(ymm3, ymm0).unwrap();
+    a.vfmsub213ss(xmm3, xmm1, xmm2).unwrap(); // lane 0: (1+2^-23)*(1-2^-23)-1 = -2^-46 (proves true FMA)
+    a.vmovups(ymmword_ptr(rcx + 576), ymm3).unwrap();
+    a.vmovupd(ymm7, ymm4).unwrap();
+    a.vfnmadd231sd(xmm7, xmm5, xmm6).unwrap();
+    a.vmovupd(ymmword_ptr(rcx + 608), ymm7).unwrap();
+
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 640];
+    let p_a: [f32; 8] = [1.0 + f32::from_bits(0x3400_0000), -2.5, 3.25, 0.0, 4.0, -0.5, 1.75, 2.0];
+    let p_b: [f32; 8] = [1.0 - f32::from_bits(0x3400_0000), 4.0, -2.0, -0.0, 0.25, 8.0, -3.0, 5.0];
+    let p_c: [f32; 8] = [1.0, 10.0, 20.0, 0.0, -1.0, 2.0, 3.0, -4.0];
+    for i in 0..8 {
+        init[i * 4..i * 4 + 4].copy_from_slice(&p_a[i].to_bits().to_le_bytes());
+        init[32 + i * 4..36 + i * 4].copy_from_slice(&p_b[i].to_bits().to_le_bytes());
+        init[64 + i * 4..68 + i * 4].copy_from_slice(&p_c[i].to_bits().to_le_bytes());
+    }
+    let d_a: [f64; 4] = [1.0 + f64::from_bits(0x3ca0_0000_0000_0000), -3.5, 2.25, 0.0];
+    let d_b: [f64; 4] = [1.0 - f64::from_bits(0x3ca0_0000_0000_0000), 2.0, -4.0, -0.0];
+    let d_c: [f64; 4] = [1.0, 7.0, 11.0, 0.0];
+    for i in 0..4 {
+        init[96 + i * 8..104 + i * 8].copy_from_slice(&d_a[i].to_bits().to_le_bytes());
+        init[128 + i * 8..136 + i * 8].copy_from_slice(&d_b[i].to_bits().to_le_bytes());
+        init[160 + i * 8..168 + i * 8].copy_from_slice(&d_c[i].to_bits().to_le_bytes());
+    }
+
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    run_tiers(&code, &init, |out| {
+        let f32_at = |off: usize| f32::from_bits(u32::from_le_bytes(out[off..off + 4].try_into().unwrap()));
+        // True single-rounding FMA: (1 + 2^-23)*(1 - 2^-23) - 1 = -2^-46 (unfused mul+sub would give 0.0!)
+        assert_eq!(f32_at(224), -f32::from_bits(0x2880_0000));
+        assert_eq!(f32_at(576), -f32::from_bits(0x2880_0000));
+        // Scalar SS preserves bits [127:32] and zeroes [255:128]
+        assert_eq!(&out[580..592], &init[4..16]);
+        assert_eq!(&out[592..608], &[0u8; 16]);
+        // Scalar SD preserves bits [127:64] and zeroes [255:128]
+        assert_eq!(&out[616..624], &init[104..112]);
+        assert_eq!(&out[624..640], &[0u8; 16]);
+        if let Some(control) = &oracle {
+            assert_eq!(out, control);
+        }
+    });
+}
+
+#[test]
+fn avx2_gathers_all_16_forms_faults_and_aliasing() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // Base pointer to table of 8 u64s (also read as 16 u32s) at [rcx + 64], centered at [rcx + 96] (+32) so negative indices work.
+    a.lea(rdx, ptr(rcx + 96)).unwrap();
+    a.xor(r8, r8).unwrap(); // null base for fault-suppression tests
+
+    // Load common index & mask vectors:
+    // ymm1 = 8x i32 indices: [-2, 0, 999999, 3, -1, 777777, 2, 1]
+    // ymm2 = 4x i64 indices: [-1, 999999999, 2, 0]
+    a.vmovdqu(ymm1, ymmword_ptr(rcx)).unwrap();
+    a.vmovdqu(ymm2, ymmword_ptr(rcx + 32)).unwrap();
+
+    // Helper macro-like sequence: 16 gather encodings writing (dst_ymm, mask_ymm) = 64 bytes per test starting at rcx+256.
+    // 0: vpgatherdd xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 160)).unwrap();
+    a.vpgatherdd_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 256), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 288), ymm3).unwrap();
+    // 1: vpgatherdd ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 160)).unwrap();
+    a.vpgatherdd_3(ymm0, dword_ptr(rdx + ymm1 * 4), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 320), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 352), ymm3).unwrap();
+    // 2: vgatherdps xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 160)).unwrap();
+    a.vgatherdps_3(xmm0, dword_ptr(rdx + xmm1 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 384), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 416), ymm3).unwrap();
+    // 3: vgatherdps ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 160)).unwrap();
+    a.vgatherdps_3(ymm0, dword_ptr(rdx + ymm1 * 4), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 448), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 480), ymm3).unwrap();
+    // 4: vpgatherdq xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vpgatherdq_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 512), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 544), ymm3).unwrap();
+    // 5: vpgatherdq ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vpgatherdq_3(ymm0, qword_ptr(rdx + xmm1 * 8), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 576), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 608), ymm3).unwrap();
+    // 6: vgatherdpd xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vgatherdpd_3(xmm0, qword_ptr(rdx + xmm1 * 8), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 640), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 672), ymm3).unwrap();
+    // 7: vgatherdpd ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vgatherdpd_3(ymm0, qword_ptr(rdx + xmm1 * 8), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 704), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 736), ymm3).unwrap();
+    // 8: vpgatherqd xmm, vm64x (128): dest[127:64] & [255:128] zeroed!
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 224)).unwrap();
+    a.vpgatherqd_3(xmm0, dword_ptr(rdx + xmm2 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 768), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 800), ymm3).unwrap();
+    // 9: vpgatherqd xmm, vm64y (256): 4 lanes into xmm0, dest[255:128] zeroed!
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 224)).unwrap();
+    a.vpgatherqd_3(xmm0, dword_ptr(rdx + ymm2 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 832), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 864), ymm3).unwrap();
+    // 10: vgatherqps xmm, vm64x (128) with ALL-ZERO mask and NULL base (fault suppression + upper zeroing!)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vpxor(ymm3, ymm3, ymm3).unwrap();
+    a.vgatherqps_3(xmm0, dword_ptr(r8 + xmm2 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 896), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 928), ymm3).unwrap();
+    // 11: vgatherqps xmm, vm64y (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 224)).unwrap();
+    a.vgatherqps_3(xmm0, dword_ptr(rdx + ymm2 * 4), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 960), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 992), ymm3).unwrap();
+    // 12: vpgatherqq xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vpgatherqq_3(xmm0, qword_ptr(rdx + xmm2 * 8), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1024), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1056), ymm3).unwrap();
+    // 13: vpgatherqq ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vpgatherqq_3(ymm0, qword_ptr(rdx + ymm2 * 8), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1088), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1120), ymm3).unwrap();
+    // 14: vgatherqpd xmm (128)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vgatherqpd_3(xmm0, qword_ptr(rdx + xmm2 * 8), xmm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1152), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1184), ymm3).unwrap();
+    // 15: vgatherqpd ymm (256)
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 128)).unwrap();
+    a.vmovdqu(ymm3, ymmword_ptr(rcx + 192)).unwrap();
+    a.vgatherqpd_3(ymm0, qword_ptr(rdx + ymm2 * 8), ymm3).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1216), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 1248), ymm3).unwrap();
+
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 1280];
+    // [0..32]: 8x i32 indices (lanes 2 and 5 are huge/unmapped and masked off!)
+    for (i, v) in [-2i32, 0, 999_999, 3, -1, 777_777, 2, 1].into_iter().enumerate() {
+        init[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // [32..64]: 4x i64 indices (lane 1 is huge/unmapped and masked off!)
+    for (i, v) in [-1i64, 999_999_999, 2, 0].into_iter().enumerate() {
+        init[32 + i * 8..40 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    // [64..128]: 16x u32 data table (rdx points at offset 96, i.e., u32 index 8 / u64 index 4)
+    for i in 0u32..16 {
+        let v = 0x1000_0000 + (i + 1) * 0x0101_0101;
+        init[64 + (i as usize) * 4..68 + (i as usize) * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // [128..160]: initial dst sentinel
+    for i in 0u32..8 {
+        let v = 0xAAAA_0000 + i;
+        init[128 + (i as usize) * 4..132 + (i as usize) * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // [160..192]: 32-bit mask (lanes 0,1,3,4,6,7 active; lanes 2,5 masked off)
+    for (i, v) in [0x8000_0000u32, 0x8000_0001, 0x7fff_ffff, 0x8000_0000, 0x8000_0000, 0, 0x8000_0000, 0x8000_0000]
+        .into_iter()
+        .enumerate()
+    {
+        init[160 + i * 4..164 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // [192..224]: 64-bit mask (lanes 0, 3 active; lanes 1, 2 masked off so idx32[2]=999999 & idx64[1]=999999999 suppressed!)
+    for (i, v) in [0x8000_0000_0000_0000u64, 0x7fff_ffff_ffff_ffff, 0, 0x8000_0000_0000_0000]
+        .into_iter()
+        .enumerate()
+    {
+        init[192 + i * 8..200 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    // [224..256]: 32-bit mask for vm64y (lanes 0,2,3 active; lane 1 masked off!)
+    for (i, v) in [0x8000_0000u32, 0x7fff_ffff, 0x8000_0000, 0x8000_0000, 0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]
+        .into_iter()
+        .enumerate()
+    {
+        init[224 + i * 4..228 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    run_tiers(&code, &init, |out| {
+        // Every gather zeroes its entire mask YMM register on completion.
+        for case in 0..16 {
+            let m_off = 256 + case * 64 + 32;
+            assert_eq!(&out[m_off..m_off + 32], &[0u8; 32], "case {case} mask must be zeroed");
+        }
+        // Case 10 (vgatherqps vm64x, all-zero mask, null base): lanes 0..1 preserved, lanes 2..7 zeroed.
+        assert_eq!(&out[896..904], &init[128..136]);
+        assert_eq!(&out[904..928], &[0u8; 24]);
+        if let Some(control) = &oracle {
+            assert_eq!(out, control);
+        }
+    });
+
+    // Direct unit check: #UD on register aliasing (dest == mask, dest == vindex, mask == vindex)
+    // and precise partial fault (lane 0 commits + clears mask; lane 1 faults with mask still set).
+    let table = [0x1122_3344u32, 0x5566_7788];
+    for &(dst, idx, msk) in &[(xmm0, xmm1, xmm0), (xmm0, xmm0, xmm2), (xmm0, xmm1, xmm1)] {
+        let mut g = CodeAssembler::new(64).unwrap();
+        g.vpgatherdd_3(dst, dword_ptr(rcx + idx * 4), msk).unwrap();
+        let bytes = g.assemble(0x1000).unwrap();
+        assert_eq!(
+            Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NONE).decode().mnemonic(),
+            Mnemonic::INVALID,
+            "decoder itself rejects aliased gather as #UD"
+        );
+        let ins = Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NO_INVALID_CHECK).decode();
+        let mut cpu = Cpu::new_zeroed();
+        cpu.gpr[1] = table.as_ptr() as u64;
+        cpu.xmm[0] = 0xDEAD_BEEF;
+        cpu.xmm[1] = 0;
+        cpu.xmm[2] = u128::MAX;
+        FAULT_PENDING.with(|p| p.set(None));
+        unsafe { assert!(cpu.exec_simd_fp_ext(ins.mnemonic(), &ins)) };
+        assert_eq!(FAULT_PENDING.with(|p| p.take()), Some((u64::MAX, false)), "aliasing must fault #UD");
+        assert_eq!(cpu.xmm[0], 0xDEAD_BEEF, "aliasing must not modify dest");
+    }
+    // Partial fault: lane 0 valid (&table[0]), lane 1 unmapped (address 0x1000).
+    let mut cpu = Cpu::new_zeroed();
+    cpu.gpr[1] = 0; // base = 0
+    cpu.xmm[0] = 0x9999_9999_8888_8888_7777_7777_6666_6666u128;
+    // Use vpgatherqq so 64-bit addresses fit cleanly: lane 0 = &table[0], lane 1 = 0x1000 (unmapped).
+    let mut gq = CodeAssembler::new(64).unwrap();
+    gq.vpgatherqq_3(xmm0, qword_ptr(rcx + xmm1 * 1), xmm2).unwrap();
+    let bytes_q = gq.assemble(0x1000).unwrap();
+    let ins_q = Decoder::with_ip(64, &bytes_q, 0x1000, DecoderOptions::NONE).decode();
+    cpu.xmm[1] = (table.as_ptr() as u64 as u128) | (0x1000u128 << 64);
+    cpu.xmm[2] = (1u128 << 63) | (1u128 << 127);
+    FAULT_PENDING.with(|p| p.set(None));
+    unsafe { assert!(cpu.exec_simd_fp_ext(ins_q.mnemonic(), &ins_q)) };
+    assert_eq!(FAULT_PENDING.with(|p| p.take()), Some((0x1000, false)));
+    assert_eq!(cpu.xmm[0] as u64, 0x5566_7788_1122_3344);
+    assert_eq!((cpu.xmm[2] as u64), 0, "completed lane 0 mask cleared");
+    assert_eq!((cpu.xmm[2] >> 64) as u64, 1u64 << 63, "faulting lane 1 mask preserved");
+}
+
+#[test]
+fn bmi_lzcnt_movbe_and_xsave_ymm_across_tiers() {
+    let mut a = CodeAssembler::new(64).unwrap();
+    // BMI1: andn, bextr, blsi, blsmsk, blsr, tzcnt
+    a.mov(rax, 0x0F0F_F0F0_1234_5678u64 as i64).unwrap();
+    a.mov(rdx, 0x00FF_00FF_AAAA_5555u64 as i64).unwrap();
+    a.andn(r8, rax, rdx).unwrap();
+    a.mov(qword_ptr(rcx), r8).unwrap();
+    a.mov(r9, 0x0000_0000_0000_0804u64 as i64).unwrap(); // start=4, len=8
+    a.bextr(r8, rax, r9).unwrap();
+    a.mov(qword_ptr(rcx + 8), r8).unwrap();
+    a.blsi(r8, rax).unwrap();
+    a.mov(qword_ptr(rcx + 16), r8).unwrap();
+    a.blsmsk(r8, rax).unwrap();
+    a.mov(qword_ptr(rcx + 24), r8).unwrap();
+    a.blsr(r8, rax).unwrap();
+    a.mov(qword_ptr(rcx + 32), r8).unwrap();
+    a.tzcnt(r8, rax).unwrap();
+    a.mov(qword_ptr(rcx + 40), r8).unwrap();
+    // BMI2: bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx
+    a.mov(r9, 12u64).unwrap();
+    a.bzhi(r8, rax, r9).unwrap();
+    a.mov(qword_ptr(rcx + 48), r8).unwrap();
+    a.mulx(r8, r9, rax).unwrap(); // rdx * rax -> hi=r8, lo=r9
+    a.mov(qword_ptr(rcx + 56), r8).unwrap();
+    a.mov(qword_ptr(rcx + 64), r9).unwrap();
+    a.pdep(r8, rax, rdx).unwrap();
+    a.mov(qword_ptr(rcx + 72), r8).unwrap();
+    a.pext(r8, rax, rdx).unwrap();
+    a.mov(qword_ptr(rcx + 80), r8).unwrap();
+    a.rorx(r8, rax, 13).unwrap();
+    a.mov(qword_ptr(rcx + 88), r8).unwrap();
+    a.mov(r9, 5u64).unwrap();
+    a.sarx(r8, rax, r9).unwrap();
+    a.mov(qword_ptr(rcx + 96), r8).unwrap();
+    a.shlx(r8, rax, r9).unwrap();
+    a.mov(qword_ptr(rcx + 104), r8).unwrap();
+    a.shrx(r8, rax, r9).unwrap();
+    a.mov(qword_ptr(rcx + 112), r8).unwrap();
+    // LZCNT & MOVBE (16/32/64-bit)
+    a.lzcnt(r8, rax).unwrap();
+    a.mov(qword_ptr(rcx + 120), r8).unwrap();
+    a.movbe(r8, qword_ptr(rcx + 128)).unwrap();
+    a.movbe(qword_ptr(rcx + 136), r8).unwrap();
+    a.movbe(r8d, dword_ptr(rcx + 128)).unwrap();
+    a.mov(dword_ptr(rcx + 144), r8d).unwrap();
+    a.movbe(r8w, word_ptr(rcx + 128)).unwrap();
+    a.mov(word_ptr(rcx + 148), r8w).unwrap();
+    // XSAVE/XRSTOR YMM upper-half roundtrip with AVX2 ymm state
+    a.vmovdqu(ymm0, ymmword_ptr(rcx + 160)).unwrap();
+    a.vpaddd(ymm0, ymm0, ymm0).unwrap();
+    a.mov(eax, 7).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.xsave64(ptr(rcx + 256)).unwrap();
+    a.vzeroall().unwrap();
+    a.xrstor64(ptr(rcx + 256)).unwrap();
+    a.vmovdqu(ymmword_ptr(rcx + 192), ymm0).unwrap();
+    a.vzeroupper().unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 256 + 832];
+    init[128..136].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    for i in 0u32..8 {
+        init[160 + (i as usize) * 4..164 + (i as usize) * 4].copy_from_slice(&(i + 10).to_le_bytes());
+    }
+    let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
+    run_tiers(&code, &init, |out| {
+        // YMM0 doubled and preserved across XSAVE64 -> VZEROALL -> XRSTOR64
+        for i in 0u32..8 {
+            let v = u32::from_le_bytes(out[192 + (i as usize) * 4..196 + (i as usize) * 4].try_into().unwrap());
+            assert_eq!(v, (i + 10) * 2);
+        }
+        // MOVBE round-trip and 32/16-bit byte-swapped values
+        assert_eq!(&out[136..144], &init[128..136]);
+        assert_eq!(u32::from_le_bytes(out[144..148].try_into().unwrap()), 0xEFCD_AB89);
+        assert_eq!(u16::from_le_bytes(out[148..150].try_into().unwrap()), 0xEFCD);
+        if let Some(control) = &oracle {
+            // Compare all deterministic outputs (skip XSAVE legacy x87/FIP/FDP header bytes 256..416
+            // which may differ in host x87 tags, and check YMM save area 256+576..256+592 directly).
+            assert_eq!(&out[..256], &control[..256]);
+            assert_eq!(&out[256 + 576..256 + 592], &control[256 + 576..256 + 592]);
+        }
+    });
 }
