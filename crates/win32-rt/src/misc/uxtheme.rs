@@ -2227,6 +2227,183 @@ mod tests {
     }
 
     #[test]
+    fn task_dialog_wait_loop_pumps_owner_window_posted_messages_and_timers() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            const WM_WORK_DONE: u32 = crate::user32::wm::USER + 77;
+            static OWNER_DIALOG_HWND: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            static OWNER_TIMER_HITS: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+
+            unsafe extern "win64" fn owner_wndproc(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                lp: isize,
+            ) -> isize {
+                if msg == crate::user32::wm::TIMER {
+                    OWNER_TIMER_HITS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    return 0;
+                }
+                if msg == WM_WORK_DONE {
+                    let dlg = OWNER_DIALOG_HWND.load(std::sync::atomic::Ordering::Acquire);
+                    if dlg != 0 {
+                        let done_txt = crate::strings::to_wide_z("Owner Completed");
+                        let _ = crate::user32::message::SendMessageW(
+                            dlg as HWND,
+                            TDM_SET_ELEMENT_TEXT,
+                            TDE_CONTENT,
+                            done_txt.as_ptr() as isize,
+                        );
+                        let _ = crate::user32::message::SendMessageW(
+                            dlg as HWND,
+                            TDM_CLICK_BUTTON,
+                            1,
+                            0,
+                        );
+                    }
+                    return 0;
+                }
+                crate::user32::defproc::DefWindowProcW(hwnd, msg, wp, lp)
+            }
+
+            let cls = crate::strings::to_wide_z("TaskDialogOwnerPumpWnd");
+            let wc = crate::user32::class::WNDCLASS {
+                style: 0,
+                wndproc: crate::user32::register_typed_host_wndproc(owner_wndproc),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = crate::user32::class::RegisterClassW(&wc);
+            let owner_hwnd = crate::user32::window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                crate::user32::ws::POPUP,
+                0,
+                0,
+                100,
+                100,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!owner_hwnd.is_null());
+
+            let dlg_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
+                "#32770_TaskDialog",
+                "Progress",
+                owner_hwnd as usize,
+                task_dialog_wndproc_va(),
+            );
+            let sid = NEXT_TASK_DIALOG_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    dlg_hwnd,
+                    ActiveTaskDialog {
+                        session_id: sid,
+                        modal_open: true,
+                        hinst: 0,
+                        pf_callback: 0,
+                        lp_callback_data: 0,
+                        caption: "Progress".to_string(),
+                        main_inst: String::new(),
+                        content: "Working...".to_string(),
+                        expanded: String::new(),
+                        footer: String::new(),
+                        buttons: vec![(1, "OK".to_string())],
+                        button_enabled: vec![true],
+                        radios: Vec::new(),
+                        radio_enabled: Vec::new(),
+                        selected_radio_idx: None,
+                        has_verification: false,
+                        verified: false,
+                        pending_click_button: None,
+                    },
+                );
+            let _dlg_guard = TaskDialogHwndGuard { hwnd: dlg_hwnd };
+            OWNER_DIALOG_HWND.store(dlg_hwnd, std::sync::atomic::Ordering::Release);
+            OWNER_TIMER_HITS.store(0, std::sync::atomic::Ordering::Release);
+
+            // Start a fast owner-window timer to verify WM_TIMER fires while modal is open.
+            assert_ne!(crate::user32::message::SetTimer(owner_hwnd, 1, 10, 0), 0);
+
+            let (tx, rx) = std::sync::mpsc::channel::<crate::macos::TaskDialogEvent>();
+            let tx_upd = tx.clone();
+            let final_text = std::sync::Arc::new(Mutex::new(String::new()));
+            let final_text_hook = final_text.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |u_sid, upd| {
+                if u_sid == sid {
+                    *final_text_hook.lock().unwrap() = upd.text.clone();
+                    if let Some(bidx) = upd.click_button_idx {
+                        let _ = tx_upd.send(crate::macos::TaskDialogEvent::ButtonClicked(
+                            crate::macos::TaskDialogAlertResult {
+                                button_index: bidx,
+                                radio_index: None,
+                                verified: false,
+                            },
+                        ));
+                    }
+                }
+            })));
+
+            // Background worker posts WM_WORK_DONE to the OWNER HWND (not dialog_hwnd).
+            let owner_addr = owner_hwnd as usize;
+            let worker = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                assert_eq!(
+                    crate::user32::message::PostMessageW(owner_addr as HWND, WM_WORK_DONE, 0, 0),
+                    TRUE
+                );
+            });
+
+            let mut noop = |_ev: crate::macos::TaskDialogEvent| {};
+            let mut noop_timer = |_ms: u32| false;
+            let mut origin = std::time::Instant::now();
+            let outcome = crate::macos::pump_task_dialog_wait_loop(
+                dlg_hwnd,
+                rx,
+                &mut origin,
+                None,
+                &mut noop,
+                &mut noop_timer,
+                || {},
+            );
+            worker.join().unwrap();
+            crate::macos::set_test_task_dialog_updater(None);
+            OWNER_DIALOG_HWND.store(0, std::sync::atomic::Ordering::Release);
+            let _ = crate::user32::message::KillTimer(owner_hwnd, 1);
+            let _ = crate::user32::window::DestroyWindow(owner_hwnd);
+
+            assert_eq!(
+                outcome,
+                crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                    button_index: 0,
+                    radio_index: None,
+                    verified: false,
+                })
+            );
+            assert_eq!(final_text.lock().unwrap().as_str(), "Owner Completed");
+            assert!(
+                OWNER_TIMER_HITS.load(std::sync::atomic::Ordering::Acquire) >= 1,
+                "owner-window WM_TIMER must be dispatched while modal TaskDialog waits"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn track_mouse_event_stores_queries_and_cancels_per_hwnd() {
         unsafe {
             let hwnd = 0x00AB_0010usize;

@@ -490,9 +490,11 @@ pub struct TaskDialogLiveUpdate {
     pub click_button_idx: Option<usize>,
 }
 
-/// Service the owning Win32 thread's message queue (cross-thread `SendMessageW`
-/// sent items and any posted messages for `dialog_hwnd`) and optional periodic
-/// `TDF_CALLBACK_TIMER` ticks while waiting for live native modal events on `rx`.
+/// Service the owning Win32 thread's full window-message queue (cross-thread
+/// `SendMessageW` sent items, posted messages for the dialog and any other
+/// windows owned by the thread such as the parent/owner HWND, and `WM_TIMER`)
+/// plus optional periodic `TDF_CALLBACK_TIMER` ticks while waiting for live
+/// native modal events on `rx`.
 /// `on_timer` receives elapsed milliseconds since `timer_origin` and returns
 /// `true` to reset `timer_origin` (matching `TDN_TIMER` returning `S_FALSE`).
 ///
@@ -502,7 +504,7 @@ pub struct TaskDialogLiveUpdate {
 /// [`TaskDialogOutcome::Quit`] is returned.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn pump_task_dialog_wait_loop<F, T, C>(
-    dialog_hwnd: usize,
+    _dialog_hwnd: usize,
     rx: std::sync::mpsc::Receiver<TaskDialogEvent>,
     timer_origin: &mut std::time::Instant,
     timer_interval: Option<std::time::Duration>,
@@ -520,20 +522,27 @@ where
         let mut quit_code: Option<i32> = None;
         unsafe {
             let mut msg = crate::user32::MSG::default();
-            // PeekMessageW always drains pending cross-thread sent messages first;
-            // also dispatch any posted messages addressed to the dialog HWND.
-            while crate::user32::message::PeekMessageW(
-                &mut msg,
-                dialog_hwnd as crate::types::HWND,
-                0,
-                0,
-                crate::user32::message::PM_REMOVE,
-            ) != 0
-            {
+            // Pump the owning thread's full queue (hWnd == NULL) like a Windows
+            // modal-dialog loop so cross-thread sent messages, owner-window posted
+            // completion messages, and timers are delivered while the dialog is open.
+            // Cap each burst so a perpetually invalid WM_PAINT cannot starve `rx`
+            // or `TDF_CALLBACK_TIMER`.
+            for _ in 0..64 {
+                if crate::user32::message::PeekMessageW(
+                    &mut msg,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    crate::user32::message::PM_REMOVE,
+                ) == 0
+                {
+                    break;
+                }
                 if msg.message == crate::user32::wm::QUIT {
                     quit_code = Some(msg.wparam as i32);
                     break;
                 }
+                let _ = crate::user32::message::TranslateMessage(&msg);
                 crate::user32::message::DispatchMessageW(&msg);
             }
         }
