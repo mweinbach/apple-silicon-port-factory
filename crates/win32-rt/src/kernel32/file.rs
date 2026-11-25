@@ -3836,11 +3836,15 @@ fn find_first(pattern: &str) -> Result<FindObj, u32> {
     let mut v: Vec<FindEntry> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
+            let ep = e.path();
+            if path::is_host_private_keystore_path(&ep) {
+                return None;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             if !wildcard_match(pat, &name) {
                 return None;
             }
-            let m = std::fs::metadata(e.path()).ok()?;
+            let m = std::fs::metadata(ep).ok()?;
             Some(FindEntry { attrs: meta_attrs(&m, &name), times: meta_times(&m), size: if m.is_dir() { 0 } else { m.len() }, name })
         })
         .collect();
@@ -4033,13 +4037,17 @@ fn snapshot_dir_rec(
         }
     };
     for entry in rd.flatten() {
+        let ep = entry.path();
+        if path::is_host_private_keystore_path(&ep) {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let rel = if rel_prefix.is_empty() {
             name
         } else {
             format!("{rel_prefix}\\{name}")
         };
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let Ok(meta) = std::fs::symlink_metadata(ep) else {
             continue;
         };
         let snap = dir_entry_from_meta(&meta);
