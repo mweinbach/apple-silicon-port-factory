@@ -55,6 +55,9 @@ parking_lot_core = "0.9"
 # (zero external dylibs, 100% SSD-portable across Apple Silicon Macs).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+# Vendored BSD-3-Clause Meta Zstandard C library for zstd.dll / libzstd.dll
+# (zero external dylibs, works on both macOS and iOS).
+zstd-sys = { version = "2", default-features = false, features = ["std"] }
 
 [profile.dev]
 opt-level = 1
