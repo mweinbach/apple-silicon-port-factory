@@ -1031,16 +1031,17 @@ impl OutputStream {
                                             let got = s.ring.pop_into(&mut lb_buf);
                                             if got > 0 {
                                                 let active = &mut lb_buf[..got * ch];
-                                                let muted = s.apply_playback_gain(active, ch);
-                                                if !muted {
-                                                    super::audioclient::push_loopback_frames(
-                                                        &lb.ep_id,
-                                                        lb.source_id,
-                                                        active,
-                                                        lb.rate,
-                                                        lb.channels,
-                                                    );
-                                                }
+                                                let _muted = s.apply_playback_gain(active, ch);
+                                                // Publish even when muted (`active` is already
+                                                // zeroed) so the source's loopback timeline keeps
+                                                // advancing in lockstep with other active streams.
+                                                super::audioclient::push_loopback_frames(
+                                                    &lb.ep_id,
+                                                    lb.source_id,
+                                                    active,
+                                                    lb.rate,
+                                                    lb.channels,
+                                                );
                                             }
                                             got
                                         } else {
@@ -2024,7 +2025,10 @@ mod ca {
             let muted = s.apply_playback_gain(active, s.ring.channels());
             if muted {
                 *flags |= kAudioUnitRenderAction_OutputIsSilence;
-            } else if let Some(lb) = &s.loopback {
+            }
+            // Push consumed frames even when muted (`active` is already zeroed) so fallback
+            // loopback capture advances this source's timeline without stalling on unmute.
+            if let Some(lb) = &s.loopback {
                 if super::super::audioclient::has_loopback_subscribers() {
                     lb.ring.push(active);
                 }
@@ -2291,7 +2295,10 @@ mod ca {
             let muted = s.apply_playback_gain(active, s.ring.channels());
             if muted {
                 *flags |= kAudioUnitRenderAction_OutputIsSilence;
-            } else if let Some(lb) = &s.loopback {
+            }
+            // Push consumed frames even when muted (`active` is already zeroed) so fallback
+            // loopback capture advances this source's timeline without stalling on unmute.
+            if let Some(lb) = &s.loopback {
                 if super::super::audioclient::has_loopback_subscribers() {
                     lb.ring.push(active);
                 }

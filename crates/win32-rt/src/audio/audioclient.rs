@@ -258,12 +258,22 @@ impl LoopbackMixer {
                 last_activity: now,
             }
         });
+        let prev_gap = now.saturating_duration_since(entry.last_activity);
         entry.retired = false;
         entry.last_activity = now;
         if let Some(start) = explicit_start {
             if entry.buf.is_empty() {
                 entry.buf_start = start;
             }
+        } else if entry.buf.is_empty()
+            && entry.buf_start < read_frame
+            && prev_gap >= LOOPBACK_MIX_SYNC_WAIT
+        {
+            // A source that had a publication gap longer than the sync window was already
+            // bypassed by `drain_mixed_at`; re-anchor its empty queue to the live playback
+            // frontier so resumed audio mixes immediately instead of being dropped as stale
+            // or stalling subsequent drains.
+            entry.buf_start = read_frame;
         }
 
         let converted: &[f32] = if src_rate == dst_rate && src_ch == dst_ch {
@@ -2223,5 +2233,134 @@ mod mixer_tests {
             480
         );
         assert!(out1.iter().all(|&v| (v - 0.5).abs() < 1e-5));
+    }
+
+    #[test]
+    fn loopback_mixer_resumes_cleanly_after_publication_gap_and_muted_silence() {
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+
+        // 1. Two started render sources: source 2 stops publishing for 100 ms (> 25 ms sync window)
+        //    while source 1 advances read_frame across 10 x 10 ms packets. When source 2 resumes
+        //    publishing alongside source 1, the very first post-gap drain must emit 480 mixed
+        //    frames (0.3 + 0.4 = 0.7) without returning zero or discarding source 2's fresh audio.
+        let mut m_gap = LoopbackMixer::new(16_384, 48_000, 2);
+        m_gap.set_source_started_at(1, true, t0);
+        m_gap.set_source_started_at(2, true, t0);
+        m_gap.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        m_gap.push_source_internal(2, None, &vec![0.4f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_gap.drain_mixed_at(480, &mut out, t0), 480);
+        assert!(out.iter().all(|&v| (v - 0.7).abs() < 1e-5));
+
+        for step in 1u64..=10 {
+            let ts = t0 + Duration::from_millis(step * 10);
+            m_gap.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, ts);
+            let drained = m_gap.drain_mixed_at(480, &mut out, ts + Duration::from_millis(30));
+            assert_eq!(drained, 480, "step {step} should advance cleanly while source 2 is silent");
+            assert!(out.iter().all(|&v| (v - 0.3).abs() < 1e-5));
+        }
+
+        let t_resume = t0 + Duration::from_millis(120);
+        m_gap.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t_resume);
+        m_gap.push_source_internal(2, None, &vec![0.4f32; 480 * 2], 48_000, 2, t_resume);
+        let n_resume = m_gap.drain_mixed_at(480, &mut out, t_resume + Duration::from_millis(1));
+        assert_eq!(n_resume, 480, "first drain after 100 ms gap must not stall");
+        assert!(
+            out.iter().all(|&v| (v - 0.7).abs() < 1e-5),
+            "expected resumed mixed 0.7, got {:?}",
+            &out[..4]
+        );
+
+        // 2. Continuous silent-frame publication while muted keeps timeline in lockstep:
+        //    muted frames contribute 0.0 (preserving source 1 at 0.3), and unmuting mixes 0.7
+        //    immediately on the very next packet.
+        let mut m_mute = LoopbackMixer::new(16_384, 48_000, 2);
+        m_mute.set_source_started_at(1, true, t0);
+        m_mute.set_source_started_at(2, true, t0);
+        for step in 0u64..10 {
+            let ts = t0 + Duration::from_millis(step * 10);
+            m_mute.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, ts);
+            m_mute.push_source_internal(2, None, &vec![0.0f32; 480 * 2], 48_000, 2, ts);
+            assert_eq!(m_mute.drain_mixed_at(480, &mut out, ts), 480);
+            assert!(out.iter().all(|&v| (v - 0.3).abs() < 1e-5));
+        }
+        let t_unmute = t0 + Duration::from_millis(100);
+        m_mute.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t_unmute);
+        m_mute.push_source_internal(2, None, &vec![0.4f32; 480 * 2], 48_000, 2, t_unmute);
+        assert_eq!(m_mute.drain_mixed_at(480, &mut out, t_unmute), 480);
+        assert!(out.iter().all(|&v| (v - 0.7).abs() < 1e-5));
+    }
+
+    #[test]
+    fn null_backend_muted_source_publishes_silent_frames_to_loopback_bus() {
+        let _audio_guard = crate::audio::audio_test_lock();
+        super::super::backend::force_backend(Some(super::super::backend::Backend::Null));
+        super::super::mmdevapi::reset_endpoint_software_gains_for_test();
+
+        let dev = super::super::backend::null_device();
+        let ep_id = super::super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+        let ep_sw = super::super::mmdevapi::endpoint_software_gain_handle(&ep_id);
+        let sub = register_loopback_sub(&ep_id, 16_384, 48_000, 2);
+        sub.active.store(true, Ordering::Release);
+
+        ep_sw.sw_muted.store(true, Ordering::Release);
+        let shared = super::super::backend::StreamShared::with_loopback(
+            super::super::ring::Ring::new(4096, 2),
+            ep_id.clone(),
+            9001,
+            48_000,
+            2,
+            None,
+        );
+        let out_stream =
+            super::super::backend::OutputStream::open(&dev, 48_000, 2, shared.clone(), 480)
+                .unwrap();
+        let ctrl = out_stream.control();
+        set_loopback_source_started(&ep_id, 9001, true);
+        ctrl.start().unwrap();
+
+        // Push non-zero audio while muted: Null backend must still publish silent frames so
+        // the source's loopback timeline advances instead of falling behind.
+        let _ = shared.ring.push(&vec![0.5f32; 960 * 2]);
+        let mut drained = Vec::new();
+        let mut silent_frames = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && silent_frames < 480 {
+            let n = sub.mixer.lock().unwrap().drain_mixed(960, &mut drained);
+            if n > 0 {
+                assert!(
+                    drained.iter().all(|&s| s == 0.0),
+                    "muted stream must publish silence, got {:?}",
+                    &drained[..4]
+                );
+                silent_frames += n;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            silent_frames >= 480,
+            "muted Null stream must advance loopback timeline with silent frames (got {silent_frames})"
+        );
+
+        // Unmute and push fresh audio: must arrive immediately without being dropped as stale.
+        ep_sw.sw_muted.store(false, Ordering::Release);
+        let _ = shared.ring.push(&vec![0.6f32; 960 * 2]);
+        let mut saw_unmuted = false;
+        let deadline2 = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline2 && !saw_unmuted {
+            let n = sub.mixer.lock().unwrap().drain_mixed(960, &mut drained);
+            if n > 0 && drained.iter().any(|&s| (s - 0.6).abs() < 1e-4) {
+                saw_unmuted = true;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(saw_unmuted, "post-unmute audio must arrive immediately on loopback bus");
+
+        ctrl.stop();
+        unregister_loopback_source(&ep_id, 9001);
+        drop(out_stream);
+        super::super::mmdevapi::reset_endpoint_software_gains_for_test();
     }
 }
