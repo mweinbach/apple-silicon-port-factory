@@ -232,6 +232,11 @@ pub struct TemporalUpscaleParams<'a> {
     pub dynamic_resolution: bool,
     pub output_resolution_motion_vectors: bool,
     pub jittered_motion_vectors: bool,
+    pub color_origin: [u32; 2],
+    pub depth_origin: [u32; 2],
+    pub motion_origin: [u32; 2],
+    pub reactive_origin: [u32; 2],
+    pub output_origin: [u32; 2],
     pub fence: Option<&'a ProtocolObject<dyn MTLFence>>,
 }
 
@@ -262,6 +267,11 @@ impl<'a> TemporalUpscaleParams<'a> {
             dynamic_resolution: false,
             output_resolution_motion_vectors: false,
             jittered_motion_vectors: false,
+            color_origin: [0, 0],
+            depth_origin: [0, 0],
+            motion_origin: [0, 0],
+            reactive_origin: [0, 0],
+            output_origin: [0, 0],
             fence: None,
         }
     }
@@ -444,7 +454,7 @@ struct MetalFxRuntime {
     compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
     scalers: Mutex<HashMap<ScalerKey, Option<Arc<Mutex<SpatialScaler>>>>>,
     temporal_scalers: Mutex<HashMap<TemporalScalerKey, Option<Arc<Mutex<TemporalScaler>>>>>,
-    scratch: Mutex<HashMap<(u32, u32, usize, usize), SendTex>>,
+    scratch: Mutex<HashMap<(u32, u32, usize, usize, u8), SendTex>>,
 }
 
 unsafe impl Send for MetalFxRuntime {}
@@ -888,12 +898,26 @@ pub fn scratch_output_texture_with_usage(
     fmt: MTLPixelFormat,
     required_usage: MTLTextureUsage,
 ) -> Option<Retained<MtlTexture>> {
+    scratch_texture_slot(0, w, h, fmt, required_usage)
+}
+
+/// Allocate or retrieve a cached private MetalFX scratch texture in a dedicated
+/// slot (`slot = 0` output, `1` color, `2` depth, `3` motion, `4` reactive) so
+/// simultaneously active subrect staging textures never alias even when their
+/// dimensions and pixel formats match.
+pub fn scratch_texture_slot(
+    slot: u8,
+    w: u32,
+    h: u32,
+    fmt: MTLPixelFormat,
+    required_usage: MTLTextureUsage,
+) -> Option<Retained<MtlTexture>> {
     if w == 0 || h == 0 {
         return None;
     }
     let rt = runtime()?;
     let usage = MTLTextureUsage::ShaderRead | required_usage;
-    let key = (w, h, fmt.0, usage.0);
+    let key = (w, h, fmt.0, usage.0, slot);
     {
         let cache = rt.scratch.lock().unwrap();
         if let Some(t) = cache.get(&key) {
@@ -1627,5 +1651,90 @@ mod tests {
         l.close().unwrap();
         q.execute_command_lists(&mut [&mut l]);
         q.wait_idle();
+    }
+
+    #[test]
+    fn ffx_generate_reactive_mask_and_subrect_upscale_on_gpu() {
+        if super::super::device().is_none() {
+            return;
+        }
+        const R8_UNORM: u32 = 61;
+
+        let q = Queue::new(ListType::Direct, "reactive subrect queue").unwrap();
+        let alloc = CommandAllocator::new(ListType::Direct).unwrap();
+        let mut l = CommandList::new(ListType::Direct).unwrap();
+
+        // 1) FidelityFX autogen reactive mask compute shader verification.
+        let opaque = make_tex(16, 16, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "opaque");
+        let pre = make_tex(16, 16, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "pre");
+        let reactive = make_tex(16, 16, R8_UNORM, resource_flags::ALLOW_UNORDERED_ACCESS, "reactive");
+        let rb_react = make_readback(256 * 16);
+        let fp_react = PlacedFootprint { offset: 0, format: R8_UNORM, width: 16, height: 16, depth: 1, row_pitch: 256, _pad: 0 };
+        let rtv_o = TargetView::rtv(&opaque, None).unwrap();
+        let rtv_p = TargetView::rtv(&pre, None).unwrap();
+
+        // Left half: identical (0.2, 0.2, 0.2) -> delta = 0.0.
+        // Right half: opaque=(0.2, 0.2, 0.2), pre=(0.8, 0.2, 0.2) -> delta=(0.6, 0.0, 0.0).
+        l.begin(&alloc).unwrap();
+        unsafe {
+            l.clear_rtv(&rtv_o, [0.2, 0.2, 0.2, 1.0], &[]).unwrap();
+            l.clear_rtv(&rtv_p, [0.2, 0.2, 0.2, 1.0], &[crate::types::Rect { left: 0, top: 0, right: 8, bottom: 16 }]).unwrap();
+            l.clear_rtv(&rtv_p, [0.8, 0.2, 0.2, 1.0], &[crate::types::Rect { left: 8, top: 0, right: 16, bottom: 16 }]).unwrap();
+        }
+        // USE_COMPONENTS_MAX (8) | APPLY_THRESHOLD (4): scale=1.0, cutoff=0.3, binary=0.9
+        l.generate_reactive_mask(&opaque, &pre, &reactive, [16, 16], 1.0, 0.3, 0.9, 8 | 4).unwrap();
+        l.copy_texture_region(CopyLoc::Footprint(&rb_react, fp_react), [0, 0, 0], CopyLoc::Subresource(&reactive, 0), None).unwrap();
+        l.close().unwrap();
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let bytes = unsafe { std::slice::from_raw_parts(rb_react.cpu_ptr().unwrap() as *const u8, 256 * 16) };
+        let left_v = bytes[8 * 256 + 4] as f32 / 255.0;
+        let right_v = bytes[8 * 256 + 12] as f32 / 255.0;
+        assert!(left_v < 0.02, "identical pixels must produce 0.0 reactivity, got {left_v}");
+        assert!((right_v - 0.9).abs() < 0.02, "above-threshold pixel must produce binary_value=0.9, got {right_v}");
+
+        // 2) Temporal upscale with non-zero input & output subrect base offsets.
+        let color = make_tex(128, 128, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "sub color");
+        let depth = make_tex(128, 128, D32_FLOAT, resource_flags::ALLOW_DEPTH_STENCIL, "sub depth");
+        let motion = make_tex(128, 128, RG16_FLOAT, resource_flags::ALLOW_RENDER_TARGET, "sub motion");
+        let out = make_tex(192, 192, RGBA16_FLOAT, resource_flags::ALLOW_RENDER_TARGET | resource_flags::ALLOW_UNORDERED_ACCESS, "sub out");
+        let rb_out = make_readback(192 * 8 * 192);
+        let fp_out = PlacedFootprint { offset: 0, format: RGBA16_FLOAT, width: 192, height: 192, depth: 1, row_pitch: 192 * 8, _pad: 0 };
+        let rtv_c = TargetView::rtv(&color, None).unwrap();
+        let dsv_d = TargetView::dsv(&depth, None).unwrap();
+        let rtv_m = TargetView::rtv(&motion, None).unwrap();
+        let rtv_out = TargetView::rtv(&out, None).unwrap();
+
+        l.begin(&alloc).unwrap();
+        unsafe {
+            // Color texture: red outside [32..96, 32..96], green inside [32..96, 32..96].
+            l.clear_rtv(&rtv_c, [0.9, 0.1, 0.1, 1.0], &[]).unwrap();
+            l.clear_rtv(&rtv_c, [0.1, 0.8, 0.2, 1.0], &[crate::types::Rect { left: 32, top: 32, right: 96, bottom: 96 }]).unwrap();
+            l.clear_dsv(&dsv_d, true, 0.5, false, 0, &[]).unwrap();
+            l.clear_rtv(&rtv_m, [0.0, 0.0, 0.0, 0.0], &[]).unwrap();
+            l.clear_rtv(&rtv_out, [0.05, 0.05, 0.05, 1.0], &[]).unwrap();
+        }
+        let mut p = TemporalUpscaleParams::new(&out, &color, &depth, &motion, [64, 64], [128, 128]);
+        p.reset = true;
+        p.color_origin = [32, 32];
+        p.depth_origin = [32, 32];
+        p.motion_origin = [32, 32];
+        p.output_origin = [64, 64];
+        l.upscale_temporal_with_backend(&p).unwrap();
+        l.copy_texture_region(CopyLoc::Footprint(&rb_out, fp_out), [0, 0, 0], CopyLoc::Subresource(&out, 0), None).unwrap();
+        l.close().unwrap();
+        q.execute_command_lists(&mut [&mut l]);
+        q.wait_idle();
+
+        let px = unsafe { std::slice::from_raw_parts(rb_out.cpu_ptr().unwrap() as *const u16, 192 * 192 * 4) };
+        let out_bg = (8 * 192 + 8) * 4;
+        assert!((f16_to_f32(px[out_bg]) - 0.05).abs() < 0.03, "outside output subrect was overwritten");
+        let out_mid = (128 * 192 + 128) * 4;
+        let mr = f16_to_f32(px[out_mid]);
+        let mg = f16_to_f32(px[out_mid + 1]);
+        let mb = f16_to_f32(px[out_mid + 2]);
+        assert!((mr - 0.1).abs() < 0.1 && (mg - 0.8).abs() < 0.1 && (mb - 0.2).abs() < 0.1,
+            "subrect temporal upscale should sample green subrect (0.1, 0.8, 0.2), got ({mr}, {mg}, {mb})");
     }
 }

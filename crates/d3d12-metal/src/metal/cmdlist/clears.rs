@@ -1628,6 +1628,21 @@ impl CommandList {
         touch: &[usize],
         tight_stages: bool,
     ) -> Result<(), String> {
+        self.util_dispatch_3tex_with(kernel, tex0, tex1, None, params, threads, touch, tight_stages)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn util_dispatch_3tex_with(
+        &mut self,
+        kernel: &str,
+        tex0: Option<&MtlTexture>,
+        tex1: Option<&MtlTexture>,
+        tex2: Option<&MtlTexture>,
+        params: &[u8],
+        threads: [u32; 3],
+        touch: &[usize],
+        tight_stages: bool,
+    ) -> Result<(), String> {
         let (pso, tg) = clear::kernel_for_dispatch(kernel, self.opts.opt_fast_bind_pso)?;
         let ring = self.ring.clone().ok_or("command list is not open")?;
         let pa = ring.lock().unwrap().upload(params, 256)?;
@@ -1685,6 +1700,9 @@ impl CommandList {
             }
             if let Some(tex) = tex1 {
                 t.setTexture_atIndex(tex.gpuResourceID(), 1);
+            }
+            if let Some(tex) = tex2 {
+                t.setTexture_atIndex(tex.gpuResourceID(), 2);
             }
         }
         e.setArgumentTable(Some(t));

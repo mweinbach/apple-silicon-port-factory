@@ -515,6 +515,11 @@ fn build_temporal_desc(
         dynamic_resolution: render_size != [0, 0],
         output_resolution_motion_vectors: out_res_mv,
         jittered_motion_vectors: (create_flags & NGX_DLSS_FLAG_MV_JITTERED) != 0,
+        color_origin: [0, 0],
+        depth_origin: [0, 0],
+        motion_origin: [0, 0],
+        reactive_origin: [0, 0],
+        output_origin: [0, 0],
     };
     let has_temporal_inputs = depth != 0 && motion != 0;
     Some((desc, has_temporal_inputs))

@@ -240,7 +240,6 @@ struct XessD3D11ContextState {
     network_model: u32,
     first_execute: bool,
     logged_first_execute: bool,
-    logged_subrect_offset: bool,
 }
 
 #[derive(Clone)]
@@ -254,7 +253,6 @@ struct ExecuteSnapshot {
     exposure_multiplier: f32,
     first_execute: bool,
     should_log_first: bool,
-    should_log_subrect: bool,
 }
 
 impl XessD3D11ContextState {
@@ -274,7 +272,6 @@ impl XessD3D11ContextState {
             network_model: 0,
             first_execute: true,
             logged_first_execute: false,
-            logged_subrect_offset: false,
         }
     }
 }
@@ -430,14 +427,21 @@ fn execute_d3d11_upscale(
         params.dynamic_resolution = resolved.dynamic_resolution;
         params.output_resolution_motion_vectors = resolved.output_resolution_motion_vectors;
         params.jittered_motion_vectors = resolved.jittered_motion_vectors;
+        params.color_origin = [p.inputColorBase.x, p.inputColorBase.y];
+        params.depth_origin = [p.inputDepthBase.x, p.inputDepthBase.y];
+        params.motion_origin = [p.inputMotionVectorBase.x, p.inputMotionVectorBase.y];
+        params.reactive_origin = [p.inputResponsiveMaskBase.x, p.inputResponsiveMaskBase.y];
+        params.output_origin = [p.outputColorBase.x, p.outputColorBase.y];
         ring.cl.upscale_temporal_with_backend(&params)
     } else {
         ring.cl
-            .upscale_resource(
+            .upscale_resource_subrect(
                 &output_mtl,
                 &color_mtl,
                 resolved.render_size,
                 resolved.upscale_size,
+                [p.inputColorBase.x, p.inputColorBase.y],
+                [p.outputColorBase.x, p.outputColorBase.y],
             )
             .map(|()| {
                 if metalfx::is_enabled() {
@@ -566,7 +570,6 @@ pub extern "win64" fn xessD3D11Init(
     ctx.init_flags = params.initFlags;
     ctx.first_execute = true;
     ctx.logged_first_execute = false;
-    ctx.logged_subrect_offset = false;
     log::info!(
         target: "d3d",
         "xessD3D11Init(dev={:#x}): output={}x{} quality={} flags={:#x} temporal={}",
@@ -630,15 +633,6 @@ pub extern "win64" fn xessD3D11Execute(
         ctx.first_execute = false;
         let should_log_first = !ctx.logged_first_execute;
         ctx.logged_first_execute = true;
-        let has_nonzero_offset = p.inputColorBase != Xess2d::default()
-            || p.inputMotionVectorBase != Xess2d::default()
-            || p.inputDepthBase != Xess2d::default()
-            || p.inputResponsiveMaskBase != Xess2d::default()
-            || p.outputColorBase != Xess2d::default();
-        let should_log_subrect = has_nonzero_offset && !ctx.logged_subrect_offset;
-        if should_log_subrect {
-            ctx.logged_subrect_offset = true;
-        }
         ExecuteSnapshot {
             device_core: ctx.device_core.clone(),
             exec_ring: ctx.exec_ring.clone(),
@@ -649,25 +643,8 @@ pub extern "win64" fn xessD3D11Execute(
             exposure_multiplier: ctx.exposure_multiplier,
             first_execute,
             should_log_first,
-            should_log_subrect,
         }
     };
-
-    if snap.should_log_subrect {
-        crate::stub!(
-            "xessD3D11Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX",
-            p.inputColorBase.x,
-            p.inputColorBase.y,
-            p.inputMotionVectorBase.x,
-            p.inputMotionVectorBase.y,
-            p.inputDepthBase.x,
-            p.inputDepthBase.y,
-            p.inputResponsiveMaskBase.x,
-            p.inputResponsiveMaskBase.y,
-            p.outputColorBase.x,
-            p.outputColorBase.y,
-        );
-    }
 
     match execute_d3d11_upscale(&snap, &p) {
         Ok(_) => XESS_RESULT_SUCCESS,
@@ -1990,6 +1967,56 @@ mod tests {
             assert!((g2 - 0.20).abs() < 0.05, "spatial upscaled G={g2}");
             assert!((b2 - 0.60).abs() < 0.05, "spatial upscaled B={b2}");
             unmap_fn(imm, stg_tex, 0);
+
+            // 3) Non-zero subrect base offsets: upscale a 32x32 input subrect at (16, 16)
+            //    into a 64x64 output subrect at (32, 32) without disturbing (0, 0).
+            let mut out_rtv: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                create_rtv(dev, out_tex, std::ptr::null(), &mut out_rtv),
+                S_OK
+            );
+            let bg = [0.05f32, 0.05, 0.05, 1.0];
+            clear_rtv(imm, out_rtv, &bg);
+            let sub_color = [0.2f32, 0.9, 0.4, 1.0];
+            clear_rtv(imm, color_rtv, &sub_color);
+            let init_sub = XessD3D11InitParams {
+                outputResolution: Xess2d { x: 64, y: 64 },
+                qualitySetting: XESS_QUALITY_SETTING_BALANCED,
+                initFlags: XESS_INIT_FLAG_NONE,
+            };
+            assert_eq!(xessD3D11Init(xess_ctx, &init_sub), XESS_RESULT_SUCCESS);
+            let exec_sub = XessD3D11ExecuteParams {
+                pColorTexture: color_tex as usize,
+                pVelocityTexture: 0,
+                pDepthTexture: 0,
+                pOutputTexture: out_tex as usize,
+                inputWidth: 32,
+                inputHeight: 32,
+                inputColorBase: Xess2d { x: 16, y: 16 },
+                outputColorBase: Xess2d { x: 32, y: 32 },
+                ..Default::default()
+            };
+            assert_eq!(
+                xessD3D11Execute(xess_ctx, &exec_sub),
+                XESS_RESULT_SUCCESS
+            );
+            copy_res(imm, stg_tex, out_tex);
+            assert_eq!(map_fn(imm, stg_tex, 0, map_type::READ, 0, &mut mapped), S_OK);
+            // Outside output subrect (4, 4) stays at background color (0.05).
+            let bg_ptr = (mapped.pData as *const u8).add(4 * row_bytes + 4 * 8) as *const u16;
+            let bg_r = f16_to_f32(std::ptr::read_unaligned(bg_ptr.add(0)));
+            let bg_g = f16_to_f32(std::ptr::read_unaligned(bg_ptr.add(1)));
+            assert!((bg_r - 0.05).abs() < 0.03 && (bg_g - 0.05).abs() < 0.03, "outside subrect modified: ({bg_r}, {bg_g})");
+            // Inside output subrect (64, 64) receives upscaled sub_color (0.2, 0.9, 0.4).
+            let in_ptr = (mapped.pData as *const u8).add(64 * row_bytes + 64 * 8) as *const u16;
+            let in_r = f16_to_f32(std::ptr::read_unaligned(in_ptr.add(0)));
+            let in_g = f16_to_f32(std::ptr::read_unaligned(in_ptr.add(1)));
+            let in_b = f16_to_f32(std::ptr::read_unaligned(in_ptr.add(2)));
+            assert!((in_r - 0.20).abs() < 0.08, "subrect upscaled R={in_r}");
+            assert!((in_g - 0.90).abs() < 0.08, "subrect upscaled G={in_g}");
+            assert!((in_b - 0.40).abs() < 0.08, "subrect upscaled B={in_b}");
+            unmap_fn(imm, stg_tex, 0);
+            com_release(out_rtv);
 
             assert_eq!(xessDestroyContext(xess_ctx), XESS_RESULT_SUCCESS);
 

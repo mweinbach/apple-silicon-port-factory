@@ -909,6 +909,11 @@ pub struct TemporalUpscaleDesc {
     pub dynamic_resolution: bool,
     pub output_resolution_motion_vectors: bool,
     pub jittered_motion_vectors: bool,
+    pub color_origin: [u32; 2],
+    pub depth_origin: [u32; 2],
+    pub motion_origin: [u32; 2],
+    pub reactive_origin: [u32; 2],
+    pub output_origin: [u32; 2],
 }
 
 pub unsafe fn upscale_temporal(list: *mut c_void, desc: TemporalUpscaleDesc) -> bool {
@@ -926,7 +931,15 @@ pub unsafe fn upscale_temporal(list: *mut c_void, desc: TemporalUpscaleDesc) -> 
         return false;
     };
     let (Some(depth), Some(motion)) = (res_ptr(desc.depth), res_ptr(desc.motion)) else {
-        return upscale_resources(list, desc.output, desc.color, desc.render_size, desc.upscale_size);
+        return upscale_resources_subrect(
+            list,
+            desc.output,
+            desc.color,
+            desc.render_size,
+            desc.upscale_size,
+            desc.color_origin,
+            desc.output_origin,
+        );
     };
     let exposure = if desc.exposure.is_null() { None } else { res_ptr(desc.exposure) };
     let reactive = if desc.reactive_mask.is_null() { None } else { res_ptr(desc.reactive_mask) };
@@ -941,6 +954,11 @@ pub unsafe fn upscale_temporal(list: *mut c_void, desc: TemporalUpscaleDesc) -> 
     let dynamic_resolution = desc.dynamic_resolution;
     let output_resolution_motion_vectors = desc.output_resolution_motion_vectors;
     let jittered_motion_vectors = desc.jittered_motion_vectors;
+    let color_origin = desc.color_origin;
+    let depth_origin = desc.depth_origin;
+    let motion_origin = desc.motion_origin;
+    let reactive_origin = desc.reactive_origin;
+    let output_origin = desc.output_origin;
     rec(this, move |l| {
         let mut params = d3d12_metal::metal::metalfx::TemporalUpscaleParams::new(
             &*d.0,
@@ -961,6 +979,11 @@ pub unsafe fn upscale_temporal(list: *mut c_void, desc: TemporalUpscaleDesc) -> 
         params.dynamic_resolution = dynamic_resolution;
         params.output_resolution_motion_vectors = output_resolution_motion_vectors;
         params.jittered_motion_vectors = jittered_motion_vectors;
+        params.color_origin = color_origin;
+        params.depth_origin = depth_origin;
+        params.motion_origin = motion_origin;
+        params.reactive_origin = reactive_origin;
+        params.output_origin = output_origin;
         if let Err(e) = l.l.upscale_temporal(&params) {
             log::warn!(target: "d3d", "upscale_temporal: {e}");
         }
@@ -975,6 +998,18 @@ pub unsafe fn upscale_resources(
     render_size: [u32; 2],
     upscale_size: [u32; 2],
 ) -> bool {
+    upscale_resources_subrect(list, dst, src, render_size, upscale_size, [0, 0], [0, 0])
+}
+
+pub unsafe fn upscale_resources_subrect(
+    list: *mut c_void,
+    dst: *mut c_void,
+    src: *mut c_void,
+    render_size: [u32; 2],
+    upscale_size: [u32; 2],
+    src_origin: [u32; 2],
+    dst_origin: [u32; 2],
+) -> bool {
     let Some(this) = Obj::<CommandList>::from_iface(list) else {
         log::error!(target: "d3d", "upscale_resources: foreign command list {list:?}");
         return false;
@@ -984,8 +1019,53 @@ pub unsafe fn upscale_resources(
         return false;
     };
     rec(this, move |l| {
-        if let Err(e) = l.l.upscale_resource(&*d.0, &*s.0, render_size, upscale_size) {
+        if let Err(e) = l.l.upscale_resource_subrect(
+            &*d.0,
+            &*s.0,
+            render_size,
+            upscale_size,
+            src_origin,
+            dst_origin,
+        ) {
             log::warn!(target: "d3d", "upscale_resources: {e}");
+        }
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn generate_reactive_mask(
+    list: *mut c_void,
+    opaque: *mut c_void,
+    pre_upscale: *mut c_void,
+    out_reactive: *mut c_void,
+    render_size: [u32; 2],
+    scale: f32,
+    cutoff_threshold: f32,
+    binary_value: f32,
+    flags: u32,
+) -> bool {
+    let Some(this) = Obj::<CommandList>::from_iface(list) else {
+        log::error!(target: "d3d", "generate_reactive_mask: foreign command list {list:?}");
+        return false;
+    };
+    let (Some(o), Some(p), Some(out)) =
+        (res_ptr(opaque), res_ptr(pre_upscale), res_ptr(out_reactive))
+    else {
+        return false;
+    };
+    rec(this, move |l| {
+        if let Err(e) = l.l.generate_reactive_mask(
+            &*o.0,
+            &*p.0,
+            &*out.0,
+            render_size,
+            scale,
+            cutoff_threshold,
+            binary_value,
+            flags,
+        ) {
+            log::warn!(target: "d3d", "generate_reactive_mask: {e}");
         }
     });
     true
