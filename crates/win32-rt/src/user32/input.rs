@@ -1430,15 +1430,36 @@ pub fn raw_mouse_registered() -> bool {
     RAW_REGS.lock().unwrap().iter().any(|r| r.page == 1 && r.usage == 2)
 }
 
+/// Resolve the live target HWND and foreground flag (`RIM_INPUT` vs `RIM_INPUTSINK`)
+/// for a process-wide raw input registration.
+///
+/// On Windows, raw input registrations are scoped to the calling application:
+/// whenever the application is in the foreground (`APP_ACTIVE`), an explicit
+/// `hwndTarget` receives `WM_INPUT` even when another window of the same
+/// application is active, while `hwndTarget == NULL` follows keyboard focus.
+fn raw_active_target(reg: RawReg) -> Option<(usize, bool)> {
+    let fg = APP_ACTIVE.load(Ordering::Acquire);
+    if !fg && reg.flags & RIDEV_INPUTSINK == 0 {
+        return None;
+    }
+    let target = if reg.target != 0 { reg.target } else { FOCUS.load(Ordering::Acquire) };
+    if target == 0 || !window::exists(target) {
+        return None;
+    }
+    Some((target, fg))
+}
+
 /// True when the given legacy HID device (`(1, 2)` mouse or `(1, 6)` keyboard)
-/// is registered with `RIDEV_NOLEGACY`, suppressing legacy `WM_MOUSE*` / `WM_KEY*`
-/// messages while still delivering `WM_INPUT`.
+/// has a live raw-input registration with `RIDEV_NOLEGACY`, suppressing legacy
+/// `WM_MOUSE*` / `WM_KEY*` messages while `WM_INPUT` is delivered to that target.
 fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
-    RAW_REGS
+    let reg = RAW_REGS
         .lock()
         .unwrap()
         .iter()
-        .any(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY)
+        .find(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) == RIDEV_NOLEGACY)
+        .copied();
+    reg.and_then(raw_active_target).is_some()
 }
 
 /// True when the foreground application has an active raw keyboard (`(1, 6)`)
@@ -1451,38 +1472,13 @@ fn raw_nohotkeys_active() -> bool {
         .iter()
         .find(|r| r.page == 1 && r.usage == 6 && (r.flags & RIDEV_NOHOTKEYS) != 0)
         .copied();
-    let Some(reg) = reg else {
-        return false;
-    };
-    if !APP_ACTIVE.load(Ordering::Acquire) {
-        return false;
-    }
-    if reg.target != 0 {
-        let act = ACTIVE.load(Ordering::Acquire);
-        return act == reg.target || window::is_child_of(reg.target, act);
-    }
-    FOCUS.load(Ordering::Acquire) != 0 || ACTIVE.load(Ordering::Acquire) != 0
+    reg.and_then(raw_active_target).is_some_and(|(_, fg)| fg)
 }
 
 /// Deliver a raw input record to the registered target (if any).
 fn raw_deliver(page: u16, usage: u16, build: impl FnOnce(usize) -> Vec<u8>) {
     let reg = RAW_REGS.lock().unwrap().iter().find(|r| r.page == page && r.usage == usage).copied();
-    let Some(reg) = reg else { return };
-    let fg = APP_ACTIVE.load(Ordering::Acquire);
-    if !fg && reg.flags & RIDEV_INPUTSINK == 0 {
-        return;
-    }
-    let target = if reg.target != 0 { reg.target } else { FOCUS.load(Ordering::Acquire) };
-    if target == 0 {
-        return;
-    }
-    if reg.target != 0 && reg.flags & RIDEV_INPUTSINK == 0 {
-        // Without INPUTSINK, only while the target is foreground.
-        let act = ACTIVE.load(Ordering::Acquire);
-        if !(act == reg.target || window::is_child_of(reg.target, act)) {
-            return;
-        }
-    }
+    let Some((target, fg)) = reg.and_then(raw_active_target) else { return };
     let device = if page == 1 && usage == 2 { FAKE_MOUSE_DEVICE } else { FAKE_KEYBOARD_DEVICE };
     let h = raw_store(build(device));
     let wparam = if fg { 0 } else { 1 }; // RIM_INPUT / RIM_INPUTSINK
@@ -2537,6 +2533,129 @@ mod tests {
             assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 77), TRUE);
             assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
             let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn raw_input_nolegacy_delivers_to_registered_target_when_another_app_window_is_active() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let cls = crate::strings::to_wide_z("RawMultiWinNoLegacyCls");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd_a = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let hwnd_b = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd_a.is_null() && !hwnd_b.is_null());
+
+            // Register keyboard + mouse with RIDEV_NOLEGACY targeting window A (no RIDEV_INPUTSINK).
+            let devs = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_NOLEGACY, target: hwnd_a as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_NOLEGACY, target: hwnd_a as usize },
+            ];
+            assert_eq!(RegisterRawInputDevices(devs.as_ptr(), 2, 16), TRUE);
+
+            // Activate independent window B in the same application.
+            set_active_window(hwnd_b as usize, false);
+            set_focus(hwnd_b as usize);
+
+            // Keyboard + mouse events must still deliver WM_INPUT to target A (not drop input)
+            // while suppressing legacy messages on window B.
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_mouse(NativeMouse::Button {
+                hwnd: hwnd_b as usize,
+                client: Some(POINT { x: 10, y: 10 }),
+                screen: POINT { x: 10, y: 10 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+
+            let mut m = MSG::default();
+            let mut raw_a = 0usize;
+            while message::PeekMessageW(&mut m, hwnd_a, wm::INPUT, wm::INPUT, message::PM_REMOVE) != 0 {
+                assert_eq!(m.wparam, 0, "expected foreground RIM_INPUT delivery");
+                raw_a += 1;
+            }
+            assert_eq!(raw_a, 2, "window A must receive both keyboard and mouse WM_INPUT while B is active");
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd_b, wm::KEYFIRST, wm::KEYLAST, message::PM_REMOVE),
+                FALSE
+            );
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd_b, wm::MOUSEFIRST, wm::MOUSELAST, message::PM_REMOVE),
+                FALSE
+            );
+
+            // Once target A is destroyed, legacy delivery to active window B must resume
+            // rather than dropping both raw and legacy input.
+            assert_eq!(window::DestroyWindow(hwnd_a), TRUE);
+            release_all_keys();
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_mouse(NativeMouse::Button {
+                hwnd: hwnd_b as usize,
+                client: Some(POINT { x: 10, y: 10 }),
+                screen: POINT { x: 10, y: 10 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd_b, wm::KEYFIRST, wm::KEYLAST, message::PM_REMOVE),
+                TRUE,
+                "legacy keyboard input must not be suppressed when raw target A is gone"
+            );
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd_b, wm::MOUSEFIRST, wm::MOUSELAST, message::PM_REMOVE),
+                TRUE,
+                "legacy mouse input must not be suppressed when raw target A is gone"
+            );
+
+            let rem = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_REMOVE, target: 0 },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(rem.as_ptr(), 2, 16), TRUE);
+            release_all_keys();
+            let _ = window::DestroyWindow(hwnd_b);
         })
         .join()
         .unwrap();
