@@ -1383,6 +1383,7 @@ pub unsafe extern "win64" fn closesocket(s: usize) -> i32 {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
     async_io_cancel_socket_and_sync(s);
+    clear_socket_ov_result_flags(s);
     event_select_remove_and_sync(s);
     unregister_external_io_handle(s as HANDLE);
     if libc::close(meta.fd) != 0 {
@@ -2659,6 +2660,7 @@ unsafe fn submit_overlapped_send(
                 issuing_tid,
                 STATUS_SUCCESS,
                 total,
+                0,
                 true,
             );
             0
@@ -3186,6 +3188,7 @@ unsafe fn submit_overlapped_recv(
                 issuing_tid,
                 nt_status,
                 bytes,
+                ntstatus_to_wsa_recv_flags(nt_status),
                 true,
             );
             0
@@ -3348,7 +3351,9 @@ pub unsafe extern "win64" fn WSAGetOverlappedResult(
         std::ptr::write_unaligned(cb_transfer, bytes);
     }
     if !flags.is_null() {
-        std::ptr::write_unaligned(flags, ntstatus_to_wsa_recv_flags(status));
+        let out_flags = load_ov_result_flags(s, ov as usize)
+            .unwrap_or_else(|| ntstatus_to_wsa_recv_flags(status));
+        std::ptr::write_unaligned(flags, out_flags);
     }
     if is_io_success_status(status) {
         TRUE
@@ -3949,15 +3954,15 @@ fn posix_recvmsg_flags_to_win(pflags: i32, ctrunc: bool) -> u32 {
 }
 
 /// Execute a single nonblocking `recvmsg` into a guest `WsaMsg`, writing back `name`/`namelen`,
-/// translated `control` buffer, and `dw_flags`. Returns `Ok((bytes, nt_status))`, `Err(0)` for
-/// `EAGAIN`/`EWOULDBLOCK` (pending), or `Err(raw_errno)` for hard errors.
+/// translated `control` buffer, and `dw_flags`. Returns `Ok((bytes, nt_status, wsa_flags))`,
+/// `Err(0)` for `EAGAIN`/`EWOULDBLOCK` (pending), or `Err(raw_errno)` for hard errors.
 unsafe fn try_wsa_recvmsg_once(
     fd: i32,
     is_stream: bool,
     lp_msg: *mut WsaMsg,
     bufs: &[(usize, usize)],
     pflags: i32,
-) -> Result<(usize, usize), i32> {
+) -> Result<(usize, usize, u32), i32> {
     let mut wmsg = std::ptr::read_unaligned(lp_msg);
     let mut iovecs: Vec<libc::iovec> = bufs
         .iter()
@@ -4025,7 +4030,7 @@ unsafe fn try_wsa_recvmsg_once(
             WSAEINVAL => 0xC000_000Dusize, // STATUS_INVALID_PARAMETER -> WSAEINVAL
             other => win32_to_ntstatus(other),
         };
-        return Ok((0, status));
+        return Ok((0, status, 0));
     }
     let ctrunc = if want_ctrl {
         let (written, trunc) = translate_posix_cmsg_to_win(&pmsg, wmsg.control.buf, wmsg.control.len as usize);
@@ -4034,7 +4039,8 @@ unsafe fn try_wsa_recvmsg_once(
     } else {
         false
     };
-    wmsg.dw_flags = posix_recvmsg_flags_to_win(pmsg.msg_flags, ctrunc);
+    let wsa_flags = posix_recvmsg_flags_to_win(pmsg.msg_flags, ctrunc);
+    wmsg.dw_flags = wsa_flags;
     std::ptr::write_unaligned(lp_msg, wmsg);
 
     let nt_status = if !is_stream && (pmsg.msg_flags & libc::MSG_TRUNC) != 0 {
@@ -4042,7 +4048,7 @@ unsafe fn try_wsa_recvmsg_once(
     } else {
         STATUS_SUCCESS
     };
-    Ok((n, nt_status))
+    Ok((n, nt_status, wsa_flags))
 }
 
 /// Execute a single nonblocking `sendmsg` for `WSASendMsg`.
@@ -4112,7 +4118,7 @@ pub unsafe extern "win64" fn WSARecvMsg(
         let deadline = socket_timeout_duration(meta.fd, libc::SO_RCVTIMEO).map(|d| std::time::Instant::now() + d);
         loop {
             match try_wsa_recvmsg_once(meta.fd, is_stream, lp_msg, &bufs, pflags) {
-                Ok((n, nt_status)) => {
+                Ok((n, nt_status, _wsa_flags)) => {
                     event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
                     if !lpdw_number_of_bytes_recvd.is_null() {
                         std::ptr::write_unaligned(lpdw_number_of_bytes_recvd, n as u32);
@@ -4207,7 +4213,7 @@ pub unsafe extern "win64" fn WSARecvMsg(
     event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
 
     match immediate {
-        Some(Ok((n, nt_status))) => {
+        Some(Ok((n, nt_status, wsa_flags))) => {
             if !lpdw_number_of_bytes_recvd.is_null() {
                 std::ptr::write_unaligned(lpdw_number_of_bytes_recvd, n as u32);
             }
@@ -4223,6 +4229,7 @@ pub unsafe extern "win64" fn WSARecvMsg(
                 issuing_tid,
                 nt_status,
                 n,
+                wsa_flags,
                 true,
             );
             0
@@ -4311,6 +4318,7 @@ pub unsafe extern "win64" fn WSASendMsg(
                 issuing_tid,
                 STATUS_SUCCESS,
                 n,
+                0,
                 true,
             );
             0
@@ -5755,11 +5763,13 @@ struct CompletedOp {
     issuing_tid: u32,
     nt_status: usize,
     bytes: usize,
+    wsa_flags: u32,
 }
 
 enum OpStep {
     Pending,
     Complete { nt_status: usize, bytes: usize },
+    CompleteWithFlags { nt_status: usize, bytes: usize, wsa_flags: u32 },
 }
 
 struct AsyncIoInner {
@@ -5786,10 +5796,45 @@ static ASYNC_IO: LazyLock<AsyncIoEngine> = LazyLock::new(|| AsyncIoEngine {
     gen_cv: Condvar::new(),
 });
 
+/// Per-`(socket_handle, overlapped_ptr)` completion flags for overlapped Winsock operations
+/// (e.g., `MSG_CTRUNC` / `MSG_TRUNC` / `MSG_OOB` returned by `WSARecvMsg`) so both completion
+/// routines and `WSAGetOverlappedResult` observe the exact receive flags rather than deriving
+/// them solely from `NTSTATUS`.
+static OVERLAPPED_RESULT_FLAGS: LazyLock<Mutex<HashMap<(usize, usize), u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn store_ov_result_flags(socket_handle: usize, ov: usize, wsa_flags: u32) {
+    if ov == 0 {
+        return;
+    }
+    let mut map = OVERLAPPED_RESULT_FLAGS.lock().unwrap();
+    if wsa_flags == 0 {
+        map.remove(&(socket_handle, ov));
+    } else {
+        map.insert((socket_handle, ov), wsa_flags);
+    }
+}
+
+fn load_ov_result_flags(socket_handle: usize, ov: usize) -> Option<u32> {
+    OVERLAPPED_RESULT_FLAGS
+        .lock()
+        .unwrap()
+        .get(&(socket_handle, ov))
+        .copied()
+}
+
+fn clear_socket_ov_result_flags(socket_handle: usize) {
+    OVERLAPPED_RESULT_FLAGS
+        .lock()
+        .unwrap()
+        .retain(|&(s, _), _| s != socket_handle);
+}
+
 unsafe fn prepare_socket_pending(s: usize, ov: *mut OVERLAPPED, completion_routine: usize) {
     if ov.is_null() {
         return;
     }
+    store_ov_result_flags(s, ov as usize, 0);
     if completion_routine != 0 {
         // When a completion routine is provided, OVERLAPPED.hEvent is ignored by Windows.
         // Use the shared alignment-safe OVERLAPPED helpers without touching hEvent.
@@ -5816,17 +5861,18 @@ unsafe fn finish_overlapped_op(
     issuing_tid: u32,
     nt_status: usize,
     bytes: usize,
+    wsa_flags: u32,
     synchronous: bool,
 ) {
     if ov == 0 {
         return;
     }
+    store_ov_result_flags(socket_handle, ov, wsa_flags);
     let ov_ptr = ov as *mut OVERLAPPED;
     if completion_routine != 0 {
         store_ov_internal_high(ov_ptr, bytes);
         store_ov_internal(ov_ptr, nt_status);
         let wsa_err = ntstatus_to_wsa(nt_status);
-        let wsa_flags = ntstatus_to_wsa_recv_flags(nt_status);
         let target = issuing_thread
             .cloned()
             .or_else(|| crate::thread::find_by_tid(issuing_tid));
@@ -5935,6 +5981,7 @@ fn async_io_cancel_socket_and_sync(s: usize) {
                     op.issuing_tid,
                     STATUS_CANCELLED,
                     0,
+                    0,
                     false,
                 );
             }
@@ -5986,6 +6033,7 @@ unsafe fn ws2_cancel_io_hook(h: HANDLE, ov: *mut OVERLAPPED, ex: bool) -> Option
                 op.issuing_thread.as_ref(),
                 op.issuing_tid,
                 STATUS_CANCELLED,
+                0,
                 0,
                 false,
             );
@@ -6386,7 +6434,11 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
             pflags,
             is_stream,
         } => match try_wsa_recvmsg_once(op.poll_fd, *is_stream, *lp_msg as *mut WsaMsg, bufs, *pflags) {
-            Ok((bytes, nt_status)) => OpStep::Complete { nt_status, bytes },
+            Ok((bytes, nt_status, wsa_flags)) => OpStep::CompleteWithFlags {
+                nt_status,
+                bytes,
+                wsa_flags,
+            },
             Err(0) => OpStep::Pending,
             Err(e) => OpStep::Complete {
                 nt_status: win32_to_ntstatus(errno_to_wsa(e)),
@@ -6625,6 +6677,25 @@ fn async_io_reactor_loop() {
                             issuing_tid: op.issuing_tid,
                             nt_status,
                             bytes,
+                            wsa_flags: ntstatus_to_wsa_recv_flags(nt_status),
+                        });
+                    }
+                    OpStep::CompleteWithFlags {
+                        nt_status,
+                        bytes,
+                        wsa_flags,
+                    } => {
+                        let op = st.ops.remove(idx);
+                        completed.push(CompletedOp {
+                            socket_handle: op.socket_handle,
+                            overlapped: op.overlapped,
+                            completion_routine: op.completion_routine,
+                            completion_binding: op.completion_binding,
+                            issuing_thread: op.issuing_thread,
+                            issuing_tid: op.issuing_tid,
+                            nt_status,
+                            bytes,
+                            wsa_flags,
                         });
                     }
                 }
@@ -6643,6 +6714,7 @@ fn async_io_reactor_loop() {
                         c.issuing_tid,
                         c.nt_status,
                         c.bytes,
+                        c.wsa_flags,
                         false,
                     );
                 }
@@ -11262,6 +11334,194 @@ mod tests {
             if rx6 != INVALID_SOCKET {
                 assert_eq!(closesocket(rx6), 0);
             }
+        }
+    }
+
+    #[test]
+    fn overlapped_wsarecvmsg_preserves_msg_ctrunc_flags_across_apc_and_get_overlapped_result() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+        static APC_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static APC_LAST_ERR: AtomicU32 = AtomicU32::new(u32::MAX);
+        static APC_LAST_BYTES: AtomicU32 = AtomicU32::new(0);
+        static APC_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "win64" fn recvmsg_apc(
+            dw_error: u32,
+            cb_transferred: u32,
+            _ov: usize,
+            dw_flags: u32,
+        ) {
+            APC_LAST_ERR.store(dw_error, Ordering::Release);
+            APC_LAST_BYTES.store(cb_transferred, Ordering::Release);
+            APC_LAST_FLAGS.store(dw_flags, Ordering::Release);
+            APC_CALLS.fetch_add(1, Ordering::AcqRel);
+        }
+
+        unsafe {
+            crate::register_native_va(
+                recvmsg_apc as *const () as u64,
+                recvmsg_apc as *const () as usize,
+            );
+            APC_CALLS.store(0, Ordering::Release);
+            APC_LAST_ERR.store(u32::MAX, Ordering::Release);
+            APC_LAST_BYTES.store(0, Ordering::Release);
+            APC_LAST_FLAGS.store(0, Ordering::Release);
+
+            let rx = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            let tx = socket(AF_INET as i32, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+            assert_ne!(rx, INVALID_SOCKET);
+            assert_ne!(tx, INVALID_SOCKET);
+
+            // Enable IP_PKTINFO so every received datagram produces ancillary control data.
+            let one: i32 = 1;
+            assert_eq!(
+                setsockopt(rx, 0 /* IPPROTO_IP */, 19 /* IP_PKTINFO */, &one as *const i32 as *const u8, 4),
+                0
+            );
+            let sa_bind = loopback_sa(0);
+            assert_eq!(bind(rx, sa_bind.as_ptr(), 16), 0);
+            let mut rx_sa = [0u8; 16];
+            let mut rx_sa_len = 16i32;
+            assert_eq!(getsockname(rx, rx_sa.as_mut_ptr(), &mut rx_sa_len), 0);
+
+            let mut send_dgram = |payload: &[u8]| {
+                let mut p = payload.to_vec();
+                let mut wb = WsaBuf { len: p.len() as u32, buf: p.as_mut_ptr() };
+                let sm = WsaMsg {
+                    name: rx_sa.as_mut_ptr(),
+                    namelen: 16,
+                    _pad0: 0,
+                    lp_buffers: &mut wb,
+                    dw_buffer_count: 1,
+                    _pad1: 0,
+                    control: WsaBuf { len: 0, buf: std::ptr::null_mut() },
+                    dw_flags: 0,
+                    _pad2: 0,
+                };
+                let mut sent = 0u32;
+                assert_eq!(
+                    WSASendMsg(tx, &sm, 0, &mut sent, std::ptr::null_mut(), std::ptr::null_mut()),
+                    0
+                );
+                assert_eq!(sent as usize, payload.len());
+            };
+
+            // 1. Pending overlapped WSARecvMsg with undersized Control.len (4 bytes) and completion
+            //    routine: must report WIN_MSG_CTRUNC in WSAMSG.dw_flags, APC arg4, and repeated
+            //    WSAGetOverlappedResult queries.
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            let mut rbuf = [0u8; 32];
+            let mut rwb = WsaBuf { len: rbuf.len() as u32, buf: rbuf.as_mut_ptr() };
+            let mut tiny_ctrl = [0u8; 4];
+            let mut rmsg = WsaMsg {
+                name: std::ptr::null_mut(),
+                namelen: 0,
+                _pad0: 0,
+                lp_buffers: &mut rwb,
+                dw_buffer_count: 1,
+                _pad1: 0,
+                control: WsaBuf { len: tiny_ctrl.len() as u32, buf: tiny_ctrl.as_mut_ptr() },
+                dw_flags: 0,
+                _pad2: 0,
+            };
+            let mut recvd = 0u32;
+            assert_eq!(
+                WSARecvMsg(
+                    rx,
+                    &mut rmsg,
+                    &mut recvd,
+                    &mut ov as *mut _ as *mut c_void,
+                    recvmsg_apc as *const () as *mut c_void,
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+
+            send_dgram(b"ctrunc-pend");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while APC_CALLS.load(Ordering::Acquire) < 1 && std::time::Instant::now() < deadline {
+                crate::kernel32::time::SleepEx(20, TRUE);
+            }
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 1);
+            assert_eq!(APC_LAST_ERR.load(Ordering::Acquire), 0);
+            assert_eq!(APC_LAST_BYTES.load(Ordering::Acquire), 11);
+            assert_ne!(
+                APC_LAST_FLAGS.load(Ordering::Acquire) & WIN_MSG_CTRUNC,
+                0,
+                "pending WSARecvMsg completion routine must receive WIN_MSG_CTRUNC"
+            );
+            assert_ne!(rmsg.dw_flags & WIN_MSG_CTRUNC, 0);
+            for _ in 0..2 {
+                let mut xfer = 0u32;
+                let mut fl = 0u32;
+                assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer, FALSE, &mut fl), TRUE);
+                assert_eq!(xfer, 11);
+                assert_ne!(
+                    fl & WIN_MSG_CTRUNC,
+                    0,
+                    "WSAGetOverlappedResult must preserve WIN_MSG_CTRUNC across calls"
+                );
+            }
+
+            // 2. Immediate overlapped WSARecvMsg (datagram already queued) with undersized control
+            //    buffer must also preserve WIN_MSG_CTRUNC in both APC arg4 and WSAGetOverlappedResult.
+            send_dgram(b"ctrunc-imm");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            rmsg.control = WsaBuf { len: tiny_ctrl.len() as u32, buf: tiny_ctrl.as_mut_ptr() };
+            rmsg.dw_flags = 0;
+            assert_eq!(
+                WSARecvMsg(
+                    rx,
+                    &mut rmsg,
+                    &mut recvd,
+                    &mut ov as *mut _ as *mut c_void,
+                    recvmsg_apc as *const () as *mut c_void,
+                ),
+                0
+            );
+            assert_eq!(recvd, 10);
+            crate::kernel32::time::SleepEx(0, TRUE);
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 2);
+            assert_ne!(APC_LAST_FLAGS.load(Ordering::Acquire) & WIN_MSG_CTRUNC, 0);
+            let mut xfer2 = 0u32;
+            let mut fl2 = 0u32;
+            assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer2, FALSE, &mut fl2), TRUE);
+            assert_eq!(xfer2, 10);
+            assert_ne!(fl2 & WIN_MSG_CTRUNC, 0);
+
+            // 3. Reusing the same OVERLAPPED with a full 128-byte control buffer must clear flags to 0
+            //    (no stale WIN_MSG_CTRUNC carried over).
+            let mut full_ctrl = [0u8; 128];
+            rmsg.control = WsaBuf { len: full_ctrl.len() as u32, buf: full_ctrl.as_mut_ptr() };
+            rmsg.dw_flags = 0;
+            assert_eq!(
+                WSARecvMsg(
+                    rx,
+                    &mut rmsg,
+                    &mut recvd,
+                    &mut ov as *mut _ as *mut c_void,
+                    recvmsg_apc as *const () as *mut c_void,
+                ),
+                SOCKET_ERROR
+            );
+            assert_eq!(WSAGetLastError(), WSA_IO_PENDING as i32);
+            send_dgram(b"ctrl-ok");
+            let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while APC_CALLS.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline2 {
+                crate::kernel32::time::SleepEx(20, TRUE);
+            }
+            assert_eq!(APC_CALLS.load(Ordering::Acquire), 3);
+            assert_eq!(APC_LAST_FLAGS.load(Ordering::Acquire), 0);
+            assert_eq!(rmsg.dw_flags, 0);
+            let mut xfer3 = 0u32;
+            let mut fl3 = 0xFFFFu32;
+            assert_eq!(WSAGetOverlappedResult(rx, &mut ov, &mut xfer3, FALSE, &mut fl3), TRUE);
+            assert_eq!(xfer3, 7);
+            assert_eq!(fl3, 0);
+
+            assert_eq!(closesocket(rx), 0);
+            assert_eq!(closesocket(tx), 0);
         }
     }
 
