@@ -2310,6 +2310,80 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             "DecodeTest"
         );
 
+        // 2b. Non-ASCII BMPString (tag 0x1E, big-endian UTF-16) MUST preserve UTF-16LE units
+        //     with dwValueType == CERT_RDN_BMP_STRING (12) through BOTH X509_ANY_STRING / X509_NAME
+        //     (non-unicode) and X509_UNICODE_ANY_STRING / X509_UNICODE_NAME.
+        let bmp_e_acute: [u8; 4] = [0x1E, 0x02, 0x00, 0xE9]; // "é" (U+00E9)
+        for stype_any in [super::asn1::X509_ANY_STRING, super::asn1::X509_UNICODE_ANY_STRING] {
+            let mut val_ptr: *mut u8 = std::ptr::null_mut();
+            let mut val_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    stype_any as *const u8,
+                    bmp_e_acute.as_ptr(),
+                    bmp_e_acute.len() as u32,
+                    0x8000, // CRYPT_DECODE_ALLOC_FLAG
+                    std::ptr::null(),
+                    &mut val_ptr as *mut _ as *mut c_void,
+                    &mut val_len,
+                ),
+                TRUE
+            );
+            let dw_val_type = std::ptr::read_unaligned(val_ptr as *const u32);
+            let cb_val = std::ptr::read_unaligned(val_ptr.add(8) as *const u32);
+            let pb_val = std::ptr::read_unaligned(val_ptr.add(16) as *const *const u8);
+            assert_eq!(dw_val_type, 12, "CERT_RDN_BMP_STRING");
+            assert_eq!(cb_val, 2);
+            assert_eq!(
+                std::slice::from_raw_parts(pb_val, 4),
+                &[0xE9, 0x00, 0x00, 0x00],
+                "BMPString must decode as UTF-16LE with NUL terminator for stype={stype_any}"
+            );
+            crate::kernel32::memory::LocalFree(val_ptr as *mut c_void);
+        }
+        // Build DER X509_NAME: SEQUENCE { SET { SEQUENCE { OID(CN=2.5.4.3), BMPString("Café") } } }
+        let bmp_cafe_val = super::asn1::encode_der_tlv(
+            0x1E,
+            &[0x00, b'C', 0x00, b'a', 0x00, b'f', 0x00, 0xE9],
+        );
+        let mut bmp_atv_body = super::asn1::encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
+        bmp_atv_body.extend_from_slice(&bmp_cafe_val);
+        let bmp_name_der = super::asn1::encode_der_tlv(
+            0x30,
+            &super::asn1::encode_der_tlv(0x31, &super::asn1::encode_der_tlv(0x30, &bmp_atv_body)),
+        );
+        for stype_name in [super::asn1::X509_NAME, X509_UNICODE_NAME] {
+            let mut ni_ptr: *mut CertNameInfo = std::ptr::null_mut();
+            let mut ni_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    stype_name as *const u8,
+                    bmp_name_der.as_ptr(),
+                    bmp_name_der.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut ni_ptr as *mut _ as *mut c_void,
+                    &mut ni_len,
+                ),
+                TRUE
+            );
+            let ni_b = std::ptr::read_unaligned(ni_ptr);
+            assert_eq!(ni_b.c_rdn, 1);
+            let rdn_b = std::ptr::read_unaligned(ni_b.rg_rdn);
+            assert_eq!(rdn_b.c_rdn_attr, 1);
+            let attr_b = std::ptr::read_unaligned(rdn_b.rg_rdn_attr);
+            assert_eq!(attr_b.dw_value_type, 12, "CERT_RDN_BMP_STRING");
+            assert_eq!(attr_b.value.cb_data, 8);
+            assert_eq!(
+                std::slice::from_raw_parts(attr_b.value.pb_data, 10),
+                &[b'C', 0x00, b'a', 0x00, b'f', 0x00, 0xE9, 0x00, 0x00, 0x00],
+                "X509_NAME BMPString must decode as UTF-16LE for stype={stype_name}"
+            );
+            crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
+        }
+
         // 3. X509_ENHANCED_KEY_USAGE + X509_INTEGER + X509_ENUMERATED + X509_OBJECT_IDENTIFIER + X509_OCTET_STRING
         let eku_oids = [b"1.3.6.1.5.5.7.3.1\0".as_ptr(), b"1.3.6.1.5.5.7.3.3\0".as_ptr()];
         let eku_in = CertEnhkeyUsage {

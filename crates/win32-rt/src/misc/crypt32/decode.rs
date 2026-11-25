@@ -265,7 +265,11 @@ fn asn1_tag_to_rdn_type(tag: u8) -> u32 {
 }
 
 fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerItem<'_>, unicode: bool) {
-    let rdn_ty = asn1_tag_to_rdn_type(item.tag);
+    let rdn_ty = if item.tag == 0x1E && item.val.len() % 2 != 0 {
+        1 // CERT_RDN_ENCODED_BLOB for malformed odd-length BMPString
+    } else {
+        asn1_tag_to_rdn_type(item.tag)
+    };
     arena.write_u32(field_off, rdn_ty);
     // field_off + 8 is CryptDataBlob (16 bytes)
     match item.tag {
@@ -292,30 +296,22 @@ fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerIte
             }
         }
         0x1E if item.val.len() % 2 == 0 => {
+            // Per MSDN CERT_RDN_ATTR, CERT_RDN_BMP_STRING is always an array of 16-bit
+            // Unicode (UTF-16LE) characters, even when decoded via X509_NAME / X509_ANY_STRING.
             let units: Vec<u16> = item
                 .val
                 .chunks_exact(2)
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect();
-            if unicode {
-                let mut bytes = Vec::with_capacity(units.len() * 2 + 2);
-                for u in &units {
-                    bytes.extend_from_slice(&u.to_le_bytes());
-                }
-                bytes.extend_from_slice(&[0, 0]);
-                let ptr_off = arena.alloc_aligned(bytes.len(), 2);
-                arena.buf[ptr_off..ptr_off + bytes.len()].copy_from_slice(&bytes);
-                arena.write_u32(field_off + 8, (units.len() * 2) as u32);
-                arena.write_ptr(field_off + 16, Some(ptr_off));
-            } else {
-                let s = String::from_utf16_lossy(&units);
-                let mut bytes = s.into_bytes();
-                let len = bytes.len();
-                bytes.push(0);
-                let ptr_off = arena.push_bytes(&bytes);
-                arena.write_u32(field_off + 8, len as u32);
-                arena.write_ptr(field_off + 16, ptr_off);
+            let mut bytes = Vec::with_capacity(units.len() * 2 + 2);
+            for u in &units {
+                bytes.extend_from_slice(&u.to_le_bytes());
             }
+            bytes.extend_from_slice(&[0, 0]);
+            let ptr_off = arena.alloc_aligned(bytes.len(), 2);
+            arena.buf[ptr_off..ptr_off + bytes.len()].copy_from_slice(&bytes);
+            arena.write_u32(field_off + 8, (units.len() * 2) as u32);
+            arena.write_ptr(field_off + 16, Some(ptr_off));
         }
         0x04 => {
             arena.write_blob(field_off + 8, item.val);
