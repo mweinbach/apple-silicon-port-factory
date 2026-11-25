@@ -2047,6 +2047,44 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             TRUE
         );
         let tbs_blob = std::ptr::read_unaligned(signed_info_ptr as *const CryptDataBlob);
+        // Verify X509_CERT reverses signature bytes by default and preserves DER order with
+        // CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG.
+        let (_, _) = super::asn1::parse_der_item(&signed_cert_der).unwrap();
+        let outer_cert_kids =
+            super::asn1::der_item_children(super::asn1::parse_der_item(&signed_cert_der).unwrap().0.val)
+                .unwrap();
+        let der_sig = &outer_cert_kids[2].val[1..];
+        let mut expected_rev_sig = der_sig.to_vec();
+        expected_rev_sig.reverse();
+        let dec_sig_blob =
+            std::ptr::read_unaligned(signed_info_ptr.add(40) as *const crate::misc::wintrust::CryptBitBlob);
+        assert_eq!(
+            std::slice::from_raw_parts(dec_sig_blob.pb_data, dec_sig_blob.cb_data as usize),
+            expected_rev_sig.as_slice()
+        );
+        let mut signed_norev_ptr: *mut u8 = std::ptr::null_mut();
+        let mut signed_norev_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::asn1::X509_CERT as *const u8,
+                signed_cert_der.as_ptr(),
+                signed_cert_der.len() as u32,
+                0x8000 | super::decode::CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG,
+                std::ptr::null(),
+                &mut signed_norev_ptr as *mut _ as *mut c_void,
+                &mut signed_norev_len,
+            ),
+            TRUE
+        );
+        let norev_sig_blob =
+            std::ptr::read_unaligned(signed_norev_ptr.add(40) as *const crate::misc::wintrust::CryptBitBlob);
+        assert_eq!(
+            std::slice::from_raw_parts(norev_sig_blob.pb_data, norev_sig_blob.cb_data as usize),
+            der_sig
+        );
+        crate::kernel32::memory::LocalFree(signed_norev_ptr as *mut c_void);
+
         let mut ci_tbs_ptr: *mut crate::misc::wintrust::CertInfo = std::ptr::null_mut();
         let mut ci_tbs_len = 0u32;
         assert_eq!(
@@ -2587,6 +2625,33 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
             TRUE
         );
         assert_eq!(&content[..clen as usize], b"Hello PKCS7 Signed World!");
+        let mut si_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, CMSG_SIGNER_INFO_PARAM, 0, std::ptr::null_mut(), &mut si_len),
+            TRUE
+        );
+        assert!(si_len > std::mem::size_of::<crate::misc::wintrust::CmsgSignerInfo>() as u32);
+        let mut si_buf = vec![0u8; si_len as usize];
+        assert_eq!(
+            CryptMsgGetParam(
+                h_msg,
+                CMSG_SIGNER_INFO_PARAM,
+                0,
+                si_buf.as_mut_ptr() as *mut c_void,
+                &mut si_len,
+            ),
+            TRUE
+        );
+        let si_val = std::ptr::read_unaligned(
+            si_buf.as_ptr() as *const crate::misc::wintrust::CmsgSignerInfo,
+        );
+        assert!(si_val.auth_attrs_count > 0, "CMSG_SIGNER_INFO_PARAM must include AuthAttrs");
+        assert!(!si_val.auth_attrs_ptr.is_null());
+        let first_attr_oid_ptr =
+            std::ptr::read_unaligned(si_val.auth_attrs_ptr as *const *const u8);
+        assert!(!first_attr_oid_ptr.is_null());
+        assert!(!crate::strings::from_ansi(first_attr_oid_ptr).is_empty());
+
         let mut sci_len = 0u32;
         assert_eq!(
             CryptMsgGetParam(h_msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, std::ptr::null_mut(), &mut sci_len),
@@ -2600,6 +2665,129 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert!(aa_len > 16);
         assert_eq!(CryptMsgClose(h_msg), TRUE);
+
+        // Verify CMSG_SIGNER_INFO_PARAM and CMSG_SIGNER_UNAUTH_ATTR_PARAM preserve unauthenticated
+        // attributes (e.g. countersignature 1.2.840.113549.1.9.6 under implicit tag 0xA1).
+        let sha256_alg_der = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]),
+                encode_der_tlv(0x05, &[]),
+            ]
+            .concat(),
+        );
+        let rsa_alg_der = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]),
+                encode_der_tlv(0x05, &[]),
+            ]
+            .concat(),
+        );
+        let dn_der = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x31,
+                &encode_der_tlv(
+                    0x30,
+                    &[encode_der_tlv(0x06, &[0x55, 0x04, 0x03]), encode_der_tlv(0x0C, b"Test")].concat(),
+                ),
+            ),
+        );
+        let cs_attr = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x06]),
+                encode_der_tlv(0x31, &encode_der_tlv(0x04, &[0x11, 0x22, 0x33])),
+            ]
+            .concat(),
+        );
+        let signer_with_unauth = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x02, &[0x01]),
+                encode_der_tlv(0x30, &[dn_der.clone(), encode_der_tlv(0x02, &[0x07])].concat()),
+                sha256_alg_der.clone(),
+                rsa_alg_der,
+                encode_der_tlv(0x04, &[0xAA, 0xBB]),
+                encode_der_tlv(0xA1, &cs_attr),
+            ]
+            .concat(),
+        );
+        let sd_with_unauth = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02]),
+                encode_der_tlv(
+                    0xA0,
+                    &encode_der_tlv(
+                        0x30,
+                        &[
+                            encode_der_tlv(0x02, &[0x01]),
+                            encode_der_tlv(0x31, &sha256_alg_der),
+                            encode_der_tlv(
+                                0x30,
+                                &encode_der_tlv(
+                                    0x06,
+                                    &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01],
+                                ),
+                            ),
+                            encode_der_tlv(0x31, &signer_with_unauth),
+                        ]
+                        .concat(),
+                    ),
+                ),
+            ]
+            .concat(),
+        );
+        let h_umsg = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            CryptMsgUpdate(h_umsg, sd_with_unauth.as_ptr(), sd_with_unauth.len() as u32, TRUE),
+            TRUE
+        );
+        let mut usi_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(h_umsg, CMSG_SIGNER_INFO_PARAM, 0, std::ptr::null_mut(), &mut usi_len),
+            TRUE
+        );
+        let mut usi_buf = vec![0u8; usi_len as usize];
+        assert_eq!(
+            CryptMsgGetParam(
+                h_umsg,
+                CMSG_SIGNER_INFO_PARAM,
+                0,
+                usi_buf.as_mut_ptr() as *mut c_void,
+                &mut usi_len,
+            ),
+            TRUE
+        );
+        let usi_val = std::ptr::read_unaligned(
+            usi_buf.as_ptr() as *const crate::misc::wintrust::CmsgSignerInfo,
+        );
+        assert_eq!(usi_val.unauth_attrs_count, 1);
+        assert!(!usi_val.unauth_attrs_ptr.is_null());
+        let ua_oid_ptr = std::ptr::read_unaligned(usi_val.unauth_attrs_ptr as *const *const u8);
+        assert_eq!(crate::strings::from_ansi(ua_oid_ptr), "1.2.840.113549.1.9.6");
+        let mut ua_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                h_umsg,
+                super::pkcs::CMSG_SIGNER_UNAUTH_ATTR_PARAM,
+                0,
+                std::ptr::null_mut(),
+                &mut ua_len,
+            ),
+            TRUE
+        );
+        assert!(ua_len >= 16);
+        assert_eq!(CryptMsgClose(h_umsg), TRUE);
 
         // 4. CryptVerifyMessageSignature (valid + tampered rejection)
         #[repr(C)]
@@ -2795,10 +2983,54 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert_eq!(crate::teb::last_error(), 0x8009_0006);
 
-        // 5. Real CRL & CTL context lifecycle (with populated pCtlInfo, hCryptMsg, pbCtlContent)
+        // 5. Real CRL & CTL context lifecycle (reject malformed CRLs; require decoded pCrlInfo)
         let minimal_seq = encode_der_tlv(0x30, &[]);
-        let crl = CertCreateCRLContext(X509_ASN_ENCODING, minimal_seq.as_ptr(), minimal_seq.len() as u32);
+        assert!(
+            CertCreateCRLContext(X509_ASN_ENCODING, minimal_seq.as_ptr(), minimal_seq.len() as u32)
+                .is_null(),
+            "CertCreateCRLContext must reject malformed DER sequence with NULL"
+        );
+        let crl_alg = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]),
+                encode_der_tlv(0x05, &[]),
+            ]
+            .concat(),
+        );
+        let crl_revoked = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x30,
+                &[encode_der_tlv(0x02, &[0x42]), encode_der_tlv(0x17, b"260101000000Z")].concat(),
+            ),
+        );
+        let crl_tbs = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x02, &[0x01]),
+                crl_alg.clone(),
+                dn_der,
+                encode_der_tlv(0x17, b"260101000000Z"),
+                crl_revoked,
+            ]
+            .concat(),
+        );
+        let valid_crl_der = encode_der_tlv(
+            0x30,
+            &[crl_tbs, crl_alg, encode_der_tlv(0x03, &[0x00, 0xDE, 0xAD])].concat(),
+        );
+        let crl = CertCreateCRLContext(
+            X509_ASN_ENCODING,
+            valid_crl_der.as_ptr(),
+            valid_crl_der.len() as u32,
+        );
         assert!(!crl.is_null());
+        // CRL_CONTEXT.pCrlInfo is at offset 24 (after dwCertEncodingType + pbCrlEncoded + cbCrlEncoded)
+        let p_crl_info = std::ptr::read_unaligned((crl as *const u8).add(24) as *const *const u8);
+        assert!(!p_crl_info.is_null(), "CertCreateCRLContext must populate pCrlInfo");
+        let c_crl_entry = std::ptr::read_unaligned(p_crl_info.add(64) as *const u32);
+        assert_eq!(c_crl_entry, 1);
         let crl_dup = CertDuplicateCRLContext(crl);
         assert_eq!(crl_dup, crl);
         assert_eq!(CertFreeCRLContext(crl_dup), TRUE);

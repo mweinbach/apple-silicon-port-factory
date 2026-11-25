@@ -39,6 +39,7 @@ pub(super) const PKCS_ATTRIBUTES: usize = 502;
 const X509_CRL_DIST_POINTS_INTERNAL: usize = 0x1_0001;
 
 pub(super) const CRYPT_DECODE_TO_BE_SIGNED_FLAG: u32 = 0x0000_0002;
+pub(super) const CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG: u32 = 0x0000_0008;
 const CRYPT_DECODE_ALLOC_FLAG: u32 = 0x0000_8000;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310B;
 const CRYPT_E_INVALID_X500_STRING: u32 = 0x8009_2023;
@@ -1169,7 +1170,14 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             if !arena.write_alg_id(off + 16, kids[1]) {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
-            arena.write_bit_blob(off + 40, &kids[2].val[1..], kids[2].val[0] as u32);
+            let sig_bytes = &kids[2].val[1..];
+            if (dw_flags & CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG) == 0 {
+                let mut rev = sig_bytes.to_vec();
+                rev.reverse();
+                arena.write_bit_blob(off + 40, &rev, kids[2].val[0] as u32);
+            } else {
+                arena.write_bit_blob(off + 40, sig_bytes, kids[2].val[0] as u32);
+            }
             Ok(arena)
         }
         X509_CERT_TO_BE_SIGNED => {
@@ -1332,11 +1340,7 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
             let kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
-            if kids.len() < 5 || kids[0].tag != 0x02 || kids[1].tag != 0x30 {
-                return Err(CRYPT_E_ASN1_BADTAG);
-            }
-            let ias = der_item_children(kids[1].val).ok_or(CRYPT_E_ASN1_BADTAG)?;
-            if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
+            if kids.len() < 5 || kids[0].tag != 0x02 || (kids[1].tag != 0x30 && kids[1].tag != 0x80) {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
             let off = arena.alloc_aligned(std::mem::size_of::<CmsgSignerInfo>(), 8);
@@ -1344,10 +1348,16 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
                 off + std::mem::offset_of!(CmsgSignerInfo, dw_version),
                 decode_der_u32(kids[0].val).unwrap_or(1),
             );
-            arena.write_blob(off + std::mem::offset_of!(CmsgSignerInfo, issuer), ias[0].raw);
-            let mut ser_le = ias[1].val.to_vec();
-            ser_le.reverse();
-            arena.write_blob(off + std::mem::offset_of!(CmsgSignerInfo, serial_number), &ser_le);
+            if kids[1].tag == 0x30 {
+                let ias = der_item_children(kids[1].val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+                if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
+                    return Err(CRYPT_E_ASN1_BADTAG);
+                }
+                arena.write_blob(off + std::mem::offset_of!(CmsgSignerInfo, issuer), ias[0].raw);
+                let mut ser_le = ias[1].val.to_vec();
+                ser_le.reverse();
+                arena.write_blob(off + std::mem::offset_of!(CmsgSignerInfo, serial_number), &ser_le);
+            }
             if !arena.write_alg_id(off + std::mem::offset_of!(CmsgSignerInfo, hash_algorithm), kids[2]) {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }

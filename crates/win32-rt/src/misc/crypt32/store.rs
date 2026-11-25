@@ -2110,22 +2110,33 @@ pub(super) unsafe fn cert_create_crl_context_impl(
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     }
-    // Attempt to decode tbsCertList (first child of CertificateList) into CRL_INFO.
+    // Require a valid signed CertificateList SEQUENCE { tbsCertList, sigAlg, sigVal } and
+    // successful CRL_INFO decoding; per MSDN CertCreateCRLContext returns NULL on decode failure.
+    let Some(kids) = super::asn1::der_item_children(seq.val) else {
+        crate::teb::set_last_error(0x8009_310B); // CRYPT_E_ASN1_BADTAG
+        return std::ptr::null_mut();
+    };
+    if kids.len() != 3 || kids[0].tag != 0x30 || kids[1].tag != 0x30 || kids[2].tag != 0x03 {
+        crate::teb::set_last_error(0x8009_310B); // CRYPT_E_ASN1_BADTAG
+        return std::ptr::null_mut();
+    }
     let mut info_ptr: *mut c_void = std::ptr::null_mut();
-    if let Some(kids) = super::asn1::der_item_children(seq.val) {
-        if let Some(tbs) = kids.first() {
-            let mut info_sz = 0u32;
-            let _ = super::decode::crypt_decode_object_ex_impl(
-                X509_ASN_ENCODING,
-                super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
-                tbs.raw.as_ptr(),
-                tbs.raw.len() as u32,
-                0x8000 | super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
-                std::ptr::null(),
-                &mut info_ptr as *mut *mut c_void as *mut c_void,
-                &mut info_sz,
-            );
+    let mut info_sz = 0u32;
+    let decoded_ok = super::decode::crypt_decode_object_ex_impl(
+        X509_ASN_ENCODING,
+        super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+        kids[0].raw.as_ptr(),
+        kids[0].raw.len() as u32,
+        0x8000 | super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
+        std::ptr::null(),
+        &mut info_ptr as *mut *mut c_void as *mut c_void,
+        &mut info_sz,
+    );
+    if decoded_ok == FALSE || info_ptr.is_null() {
+        if !info_ptr.is_null() {
+            crate::kernel32::memory::LocalFree(info_ptr);
         }
+        return std::ptr::null_mut();
     }
     let der = slice.to_vec().into_boxed_slice();
     let ctx = Box::new(CrlContext {

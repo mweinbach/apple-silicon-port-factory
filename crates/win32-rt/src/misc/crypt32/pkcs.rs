@@ -12,7 +12,7 @@ use super::store::{
 };
 use crate::handles::HandleTable;
 use crate::misc::bcrypt::{Digest, RsaPublicKey};
-use crate::misc::wintrust::{self, CmsgSignerInfo, CryptAlgId, CryptDataBlob};
+use crate::misc::wintrust::{self, CryptDataBlob};
 use crate::types::*;
 use std::ffi::c_void;
 
@@ -186,11 +186,10 @@ fn extract_octet_string(elem: DerItem<'_>) -> Option<Vec<u8>> {
 
 #[derive(Clone)]
 pub(super) struct CmsSigner {
-    pub version: u32,
+    pub signer_info_raw: Vec<u8>,
     pub issuer_raw: Vec<u8>,
     pub serial_be: Vec<u8>,
     pub hash_alg_oid: Vec<u8>,
-    pub enc_alg_oid: Vec<u8>,
     pub auth_attrs_raw: Option<Vec<u8>>,
     pub unauth_attrs_raw: Option<Vec<u8>>,
     pub encrypted_hash: Vec<u8>,
@@ -308,7 +307,7 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
                     if kids.len() < 5 || kids[0].tag != 0x02 {
                         continue;
                     }
-                    let si_ver = parse_der_u32_val(kids[0].val).unwrap_or(1);
+                    let _si_ver = parse_der_u32_val(kids[0].val).unwrap_or(1);
                     let (issuer_raw, serial_be) = if kids[1].tag == 0x30 {
                         let Some(ias) = der_item_children(kids[1].val) else {
                             continue;
@@ -333,9 +332,9 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
                     let Some(&enc_alg_elem) = kids.get(pos) else {
                         continue;
                     };
-                    let enc_alg_oid = parse_alg_id(enc_alg_elem)
-                        .map(|(o, _)| o.to_vec())
-                        .unwrap_or_else(|| OID_RSA_ENCRYPTION.to_vec());
+                    if parse_alg_id(enc_alg_elem).is_none() {
+                        continue;
+                    }
                     let Some(&sig_elem) = kids.get(pos + 1) else {
                         continue;
                     };
@@ -348,11 +347,10 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
                         None
                     };
                     signers.push(CmsSigner {
-                        version: si_ver,
+                        signer_info_raw: si.raw.to_vec(),
                         issuer_raw,
                         serial_be,
                         hash_alg_oid: hash_oid.to_vec(),
-                        enc_alg_oid,
                         auth_attrs_raw,
                         unauth_attrs_raw,
                         encrypted_hash: sig_elem.val.to_vec(),
@@ -660,106 +658,18 @@ pub(super) unsafe fn try_get_decode_msg_param(
                     crate::teb::set_last_error(CRYPT_E_NOT_FOUND);
                     return FALSE;
                 };
-                let mut serial_le = signer.serial_be.clone();
-                serial_le.reverse();
-                let hash_oid = wintrust::decode_oid_str(&signer.hash_alg_oid);
-                let enc_oid = wintrust::decode_oid_str(&signer.enc_alg_oid);
-                let hdr_sz = std::mem::size_of::<CmsgSignerInfo>();
-                let total = hdr_sz
-                    + signer.issuer_raw.len()
-                    + serial_le.len()
-                    + hash_oid.len()
-                    + 1
-                    + enc_oid.len()
-                    + 1
-                    + signer.encrypted_hash.len();
-                let need = total as u32;
-                if pv_data.is_null() {
-                    std::ptr::write_unaligned(pcb_data, need);
-                    return TRUE;
-                }
-                let cap = std::ptr::read_unaligned(pcb_data);
-                if cap < need {
-                    std::ptr::write_unaligned(pcb_data, need);
-                    crate::teb::set_last_error(err::ERROR_MORE_DATA);
-                    return FALSE;
-                }
-                let base = pv_data as *mut u8;
-                let mut off = hdr_sz;
-
-                let issuer_ptr = base.add(off);
-                std::ptr::copy_nonoverlapping(
-                    signer.issuer_raw.as_ptr(),
-                    issuer_ptr,
-                    signer.issuer_raw.len(),
-                );
-                off += signer.issuer_raw.len();
-
-                let serial_ptr = base.add(off);
-                std::ptr::copy_nonoverlapping(serial_le.as_ptr(), serial_ptr, serial_le.len());
-                off += serial_le.len();
-
-                let hash_oid_ptr = base.add(off);
-                std::ptr::copy_nonoverlapping(hash_oid.as_ptr(), hash_oid_ptr, hash_oid.len());
-                std::ptr::write_unaligned(hash_oid_ptr.add(hash_oid.len()), 0);
-                off += hash_oid.len() + 1;
-
-                let enc_oid_ptr = base.add(off);
-                std::ptr::copy_nonoverlapping(enc_oid.as_ptr(), enc_oid_ptr, enc_oid.len());
-                std::ptr::write_unaligned(enc_oid_ptr.add(enc_oid.len()), 0);
-                off += enc_oid.len() + 1;
-
-                let enc_hash_ptr = base.add(off);
-                if !signer.encrypted_hash.is_empty() {
-                    std::ptr::copy_nonoverlapping(
-                        signer.encrypted_hash.as_ptr(),
-                        enc_hash_ptr,
-                        signer.encrypted_hash.len(),
-                    );
-                }
-
-                std::ptr::write_unaligned(
-                    pv_data as *mut CmsgSignerInfo,
-                    CmsgSignerInfo {
-                        dw_version: signer.version,
-                        issuer: CryptDataBlob {
-                            cb_data: signer.issuer_raw.len() as u32,
-                            pb_data: issuer_ptr,
-                        },
-                        serial_number: CryptDataBlob {
-                            cb_data: serial_le.len() as u32,
-                            pb_data: serial_ptr,
-                        },
-                        hash_algorithm: CryptAlgId {
-                            psz_obj_id: hash_oid_ptr,
-                            parameters: CryptDataBlob {
-                                cb_data: 0,
-                                pb_data: std::ptr::null(),
-                            },
-                        },
-                        hash_encryption_algorithm: CryptAlgId {
-                            psz_obj_id: enc_oid_ptr,
-                            parameters: CryptDataBlob {
-                                cb_data: 0,
-                                pb_data: std::ptr::null(),
-                            },
-                        },
-                        encrypted_hash: CryptDataBlob {
-                            cb_data: signer.encrypted_hash.len() as u32,
-                            pb_data: if signer.encrypted_hash.is_empty() {
-                                std::ptr::null()
-                            } else {
-                                enc_hash_ptr
-                            },
-                        },
-                        auth_attrs_count: 0,
-                        auth_attrs_ptr: std::ptr::null_mut(),
-                        unauth_attrs_count: 0,
-                        unauth_attrs_ptr: std::ptr::null_mut(),
-                    },
-                );
-                std::ptr::write_unaligned(pcb_data, need);
-                TRUE
+                // Decode the full SignerInfo DER (including AuthAttrs and UnauthAttrs with
+                // relocated backing storage) via PKCS7_SIGNER_INFO.
+                super::decode::crypt_decode_object_ex_impl(
+                    X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                    super::decode::PKCS7_SIGNER_INFO as *const u8,
+                    signer.signer_info_raw.as_ptr(),
+                    signer.signer_info_raw.len() as u32,
+                    0,
+                    std::ptr::null(),
+                    pv_data,
+                    pcb_data,
+                )
             }
             CMSG_SIGNER_CERT_INFO_PARAM => {
                 let Some(signer) = msg.signers.get(dw_index as usize) else {
