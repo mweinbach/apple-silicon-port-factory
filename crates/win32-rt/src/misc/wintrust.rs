@@ -1731,13 +1731,17 @@ fn map_wintrust_revocation_flags(fdw_revocation_checks: u32, dw_prov_flags: u32)
     chain_flags
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct GenericChainPolicy {
     h_chain_engine: *mut c_void,
     p_chain_para: *const c_void,
     dw_flags: u32,
     pfn_policy_callback: usize,
     pv_policy_arg: *mut c_void,
+    wintrust_data: *mut c_void,
+    action_guid: *const u8,
+    prov_flags: u32,
+    subject_choice: u32,
 }
 
 #[repr(C)]
@@ -2088,10 +2092,74 @@ unsafe fn verify_cert_via_chain_policy(
     }
 
     // Per MSDN WINTRUST_ACTION_GENERIC_CHAIN_VERIFY / WTD_GENERIC_CHAIN_POLICY_DATA:
-    // if the caller supplied a custom final-policy callback, invoke it with the built signer
-    // chain context and return its HRESULT instead of falling back to CERT_CHAIN_POLICY_BASE.
+    // if the caller supplied a custom final-policy callback, build a valid CRYPT_PROVIDER_DATA
+    // context (even when WTD_STATEACTION_VERIFY was not requested), invoke the callback with
+    // `pProvData` and the built signer chain context, and return its HRESULT.
     if let Some(gc) = generic_chain {
         if gc.pfn_policy_callback != 0 {
+            let mut trust_step_errors = [0u32; 8];
+            let prov_cert = CryptProviderCert {
+                cb_struct: std::mem::size_of::<CryptProviderCert>() as u32,
+                p_cert: cert_ctx as *const CertContext,
+                f_commercial: 1,
+                f_trusted_root: 0,
+                f_self_signed: 0,
+                f_test_cert: 0,
+                dw_revoked_reason: 0,
+                dw_confidence: 0x1111_0000,
+                dw_error: 0,
+                p_trust_list_context: std::ptr::null_mut(),
+                f_trust_list_signer_cert: 0,
+                p_ctl_context: std::ptr::null_mut(),
+                dw_ctl_error: 0,
+                f_is_cyclic: 0,
+                p_chain_element: std::ptr::null(),
+            };
+            let prov_signer = CryptProviderSgnr {
+                cb_struct: std::mem::size_of::<CryptProviderSgnr>() as u32,
+                sft_verify_as_of: [0, 0],
+                cs_cert_chain: 1,
+                pas_cert_chain: &prov_cert as *const CryptProviderCert,
+                dw_signer_type: 0,
+                ps_signer: std::ptr::null_mut(),
+                dw_error: 0,
+                cs_counter_signers: 0,
+                pas_counter_signers: std::ptr::null_mut(),
+                p_chain_context: chain_ctx as *const CertChainContext,
+            };
+            let mut prov_data = CryptProviderData {
+                cb_struct: std::mem::size_of::<CryptProviderData>() as u32,
+                p_wintrust_data: gc.wintrust_data,
+                f_opened_file: 0,
+                h_wnd_parent: std::ptr::null_mut(),
+                pg_action_id: gc.action_guid,
+                h_prov: 0,
+                dw_error: 0,
+                dw_reg_security_settings: 0,
+                dw_reg_policy_settings: 0,
+                ps_pfns: std::ptr::null_mut(),
+                cdw_trust_step_errors: trust_step_errors.len() as u32,
+                padw_trust_step_errors: trust_step_errors.as_mut_ptr(),
+                ch_stores,
+                pah_stores: pah_stores as *mut c_void,
+                dw_encoding: X509_ASN_ENCODING | 0x0001_0000,
+                h_msg: std::ptr::null_mut(),
+                cs_signers: 1,
+                pas_signers: &prov_signer as *const CryptProviderSgnr,
+                cs_prov_priv_data: 0,
+                pas_prov_priv_data: std::ptr::null_mut(),
+                dw_subject_choice: gc.subject_choice,
+                p_pdsip: std::ptr::null_mut(),
+                psz_usage_oid: std::ptr::null(),
+                f_recall_with_state: 0,
+                sft_system_time: [0, 0],
+                psz_ctl_signer_usage_oid: std::ptr::null(),
+                dw_prov_flags: gc.prov_flags,
+                dw_final_error: 0,
+                p_request_usage: std::ptr::null_mut(),
+                dw_trust_pub_settings: 0,
+                dw_ui_state_flags: 0,
+            };
             let signer_info = WtdGenericChainPolicySignerInfo {
                 cb_size: std::mem::size_of::<WtdGenericChainPolicySignerInfo>() as u32,
                 _pad0: 0,
@@ -2106,9 +2174,9 @@ unsafe fn verify_cert_via_chain_policy(
             let rgp_signer = [&signer_info as *const WtdGenericChainPolicySignerInfo];
             let cb_rc = crate::call_guest8(
                 gc.pfn_policy_callback,
+                &mut prov_data as *mut CryptProviderData as u64,
                 0,
-                0,
-                0,
+                prov_data.dw_reg_policy_settings as u64,
                 1,
                 rgp_signer.as_ptr() as u64,
                 gc.pv_policy_arg as u64,
@@ -2263,6 +2331,10 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
                 dw_flags,
                 pfn_policy_callback: std::ptr::read_unaligned(p.add(0x18) as *const usize),
                 pv_policy_arg: std::ptr::read_unaligned(p.add(0x20) as *const *mut c_void),
+                wintrust_data: data,
+                action_guid: action,
+                prov_flags: dw_prov_flags,
+                subject_choice: union_choice,
             })
         } else {
             None
@@ -3117,10 +3189,12 @@ mod tests {
             struct GenericPolicyCtx {
                 called: usize,
                 saw_chain: bool,
+                saw_prov_data: bool,
+                expected_wtd: *mut c_void,
                 return_hr: i32,
             }
             unsafe extern "C" fn test_generic_chain_policy_cb(
-                _prov_data: u64,
+                prov_data: u64,
                 _step_err: u64,
                 _reg_settings: u64,
                 c_signer: u64,
@@ -3131,6 +3205,15 @@ mod tests {
             ) -> u64 {
                 let ctx = &mut *(pv_policy_arg as *mut GenericPolicyCtx);
                 ctx.called += 1;
+                if prov_data != 0 {
+                    let pd = &*(prov_data as *const CryptProviderData);
+                    ctx.saw_prov_data = pd.cb_struct == std::mem::size_of::<CryptProviderData>() as u32
+                        && pd.p_wintrust_data == ctx.expected_wtd
+                        && !pd.pg_action_id.is_null()
+                        && pd.cs_signers == 1
+                        && !pd.pas_signers.is_null()
+                        && !(*pd.pas_signers).p_chain_context.is_null();
+                }
                 if c_signer == 1 && rgp_signer != 0 {
                     let sptr = *(rgp_signer as *const *const WtdGenericChainPolicySignerInfo);
                     if !sptr.is_null() {
@@ -3167,6 +3250,8 @@ mod tests {
             let mut cb_ctx = GenericPolicyCtx {
                 called: 0,
                 saw_chain: false,
+                saw_prov_data: false,
+                expected_wtd: wtd.as_mut_ptr() as *mut c_void,
                 return_hr: 0x800B_0111u32 as i32, // TRUST_E_EXPLICIT_DISTRUST
             };
             let mut gc_para = [0u8; 0x28];
@@ -3198,6 +3283,10 @@ mod tests {
             );
             assert_eq!(cb_ctx.called, 1);
             assert!(cb_ctx.saw_chain, "callback must receive non-null PCCERT_CHAIN_CONTEXT");
+            assert!(
+                cb_ctx.saw_prov_data,
+                "callback must receive valid non-null PCRYPT_PROVIDER_DATA even without WTD_STATEACTION_VERIFY"
+            );
             // Accepting callback returns ERROR_SUCCESS.
             cb_ctx.return_hr = ERROR_SUCCESS;
             assert_eq!(

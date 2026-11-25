@@ -619,6 +619,31 @@ pub(super) mod apple_trust {
         OfflineOrUnknown,
     }
 
+    /// Select `(certs, anchors, anchors_only)` for Apple Security.framework revocation checking.
+    /// When `end_cert_only` is true (`CERT_CHAIN_REVOCATION_CHECK_END_CERT`), pass only the leaf
+    /// certificate anchored at its direct issuer (if present in the chain/anchors) so Security.framework
+    /// verifies ONLY the end certificate's revocation using its issuer to authenticate OCSP/CRL,
+    /// without failing offline when an intermediate CA's own revocation response is unavailable.
+    pub(crate) fn revocation_eval_inputs<'a>(
+        selected_path: &[&'a [u8]],
+        exclusive_anchors: Option<&'a [Vec<u8>]>,
+        extra_anchors: &'a [Vec<u8>],
+        end_cert_only: bool,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bool) {
+        if end_cert_only {
+            if let Some(&leaf) = selected_path.first() {
+                if let Some(&direct_issuer) = selected_path.get(1) {
+                    return (vec![leaf.to_vec()], vec![direct_issuer.to_vec()], true);
+                }
+                let anchors = exclusive_anchors.unwrap_or(extra_anchors).to_vec();
+                return (vec![leaf.to_vec()], anchors, exclusive_anchors.is_some());
+            }
+        }
+        let certs: Vec<Vec<u8>> = selected_path.iter().map(|c| c.to_vec()).collect();
+        let anchors = exclusive_anchors.unwrap_or(extra_anchors).to_vec();
+        (certs, anchors, exclusive_anchors.is_some())
+    }
+
     /// Evaluate certificate revocation via Apple Security.framework (`SecPolicyCreateRevocation`
     /// with `kSecRevocationUseAnyAvailableMethod | kSecRevocationRequirePositiveResponse`).
     /// Fails closed (`OfflineOrUnknown` or `Revoked`) unless Apple's trust engine positively
@@ -629,6 +654,7 @@ pub(super) mod apple_trust {
         extra_anchors: &[Vec<u8>],
         verify_unix_secs: Option<f64>,
         cache_only: bool,
+        end_cert_only: bool,
     ) -> RevocationCheckResult {
         const K_SEC_REVOCATION_USE_ANY: usize = (1 << 0) | (1 << 1);
         const K_SEC_REVOCATION_REQUIRE_POSITIVE: usize = 1 << 3;
@@ -638,10 +664,17 @@ pub(super) mod apple_trust {
         if chain_der.is_empty() {
             return RevocationCheckResult::OfflineOrUnknown;
         }
+        let root_pool = exclusive_anchors.unwrap_or(extra_anchors);
+        let selected_path = super::resolve_selected_issuer_path(chain_der, root_pool);
+        let (eval_certs, eval_anchors, anchors_only) =
+            revocation_eval_inputs(&selected_path, exclusive_anchors, extra_anchors, end_cert_only);
+        if eval_certs.is_empty() {
+            return RevocationCheckResult::OfflineOrUnknown;
+        }
         unsafe {
-            let mut cert_guards = Vec::with_capacity(chain_der.len());
-            let mut cert_ptrs = Vec::with_capacity(chain_der.len());
-            for der in chain_der {
+            let mut cert_guards = Vec::with_capacity(eval_certs.len());
+            let mut cert_ptrs = Vec::with_capacity(eval_certs.len());
+            for der in &eval_certs {
                 let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
                 if d.is_null() {
                     continue;
@@ -713,11 +746,10 @@ pub(super) mod apple_trust {
                 }
             }
 
-            let anchor_slice = exclusive_anchors.unwrap_or(extra_anchors);
-            if exclusive_anchors.is_some() || !anchor_slice.is_empty() {
-                let mut a_guards = Vec::with_capacity(anchor_slice.len());
-                let mut a_ptrs = Vec::with_capacity(anchor_slice.len());
-                for der in anchor_slice {
+            if anchors_only || !eval_anchors.is_empty() {
+                let mut a_guards = Vec::with_capacity(eval_anchors.len());
+                let mut a_ptrs = Vec::with_capacity(eval_anchors.len());
+                for der in &eval_anchors {
                     let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
                     if d.is_null() {
                         continue;
@@ -738,10 +770,7 @@ pub(super) mod apple_trust {
                 if !cf_anchors.is_null() {
                     let _ag = CfRef(cf_anchors);
                     let _ = SecTrustSetAnchorCertificates(trust, cf_anchors);
-                    let _ = SecTrustSetAnchorCertificatesOnly(
-                        trust,
-                        u8::from(exclusive_anchors.is_some()),
-                    );
+                    let _ = SecTrustSetAnchorCertificatesOnly(trust, u8::from(anchors_only));
                 }
             }
 
@@ -1687,6 +1716,10 @@ pub(crate) fn check_chain_revocation_error(
     let cache_only = (revocation_flags
         & (CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL))
         != 0;
+    let end_cert_only = (revocation_flags & CERT_CHAIN_REVOCATION_CHECK_END_CERT) != 0
+        && (revocation_flags
+            & (CERT_CHAIN_REVOCATION_CHECK_CHAIN | CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT))
+            == 0;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let outcome = apple_trust::evaluate_sec_trust_revocation(
         chain_der,
@@ -1694,10 +1727,18 @@ pub(crate) fn check_chain_revocation_error(
         extra_roots_der,
         verify_unix_secs,
         cache_only,
+        end_cert_only,
     );
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let outcome = {
-        let _ = (chain_der, exclusive_roots_der, extra_roots_der, verify_unix_secs, cache_only);
+        let _ = (
+            chain_der,
+            exclusive_roots_der,
+            extra_roots_der,
+            verify_unix_secs,
+            cache_only,
+            end_cert_only,
+        );
         0u8
     };
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1896,7 +1937,11 @@ fn resolve_selected_issuer_path<'a>(
         let Some(cur_parts) = parse_cert_der_parts(cur) else {
             break;
         };
-        if cur_parts.subject_inner == cur_parts.issuer_inner {
+        // Stop at a genuinely self-signed root, while allowing self-issued key-rollover
+        // intermediates (subject == issuer but signed by a distinct parent cert) to keep walking.
+        if cur_parts.subject_inner == cur_parts.issuer_inner
+            && verify_cert_sig_with_spki(&cur_parts, cur_parts.spki_alg_inner, cur_parts.spki_key_bits)
+        {
             break;
         }
         let find_issuer = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
@@ -2007,23 +2052,61 @@ unsafe fn evaluate_cert_chain_para(
     }
 
     // 2. RequestedIssuancePolicy (CERT_USAGE_MATCH @ +0x20 when cbSize >= 0x38)
+    //    Per RFC 5280 §6.1 / MSDN CERT_CHAIN_PARA: every non-root certificate along the selected
+    //    issuer path must authorize the requested policy (explicitly or via anyPolicy 2.5.29.32.0
+    //    unless inhibited). Policy mappings are not expanded; any unmapped/inhibited path fails closed.
     if cb_size >= 0x38 {
         if let Some((match_type, req_policies)) = read_usage_match(0x20)? {
-            let leaf_policies = selected_path
-                .first()
-                .map(|d| cert_policy_oids(d))
-                .unwrap_or_default();
-            let has_any_policy = leaf_policies.iter().any(|o| o == "2.5.29.32.0");
-            let ok = has_any_policy
-                || if match_type == 0 {
-                    req_policies
-                        .iter()
-                        .all(|r| leaf_policies.iter().any(|o| o == r))
+            const OID_POLICY_MAPPINGS: &[u8] = &[0x55, 0x1D, 0x21]; // 2.5.29.33
+            const OID_INHIBIT_ANY_POLICY: &[u8] = &[0x55, 0x1D, 0x36]; // 2.5.29.54
+
+            // Exclude a trailing self-signed trust-anchor root (trust anchors are not required
+            // to carry certificatePolicies per RFC 5280 §6.1).
+            let non_root_len = if selected_path.len() > 1 {
+                let last = *selected_path.last().unwrap();
+                if parse_cert_der_parts(last).is_some_and(|p| p.subject_inner == p.issuer_inner) {
+                    selected_path.len() - 1
                 } else {
-                    req_policies
-                        .iter()
-                        .any(|r| leaf_policies.iter().any(|o| o == r))
-                };
+                    selected_path.len()
+                }
+            } else {
+                selected_path.len()
+            };
+            let non_root_path = &selected_path[..non_root_len];
+
+            let mut any_policy_inhibited = false;
+            let mut has_unsupported_policy_ext = false;
+            let mut cert_policy_sets: Vec<Vec<String>> = Vec::with_capacity(non_root_path.len());
+            for &der in non_root_path {
+                if let Some(parts) = parse_cert_der_parts(der) {
+                    for (oid, _, _) in &parts.extensions {
+                        if *oid == OID_POLICY_MAPPINGS {
+                            has_unsupported_policy_ext = true;
+                        } else if *oid == OID_INHIBIT_ANY_POLICY {
+                            any_policy_inhibited = true;
+                        }
+                    }
+                }
+                cert_policy_sets.push(cert_policy_oids(der));
+            }
+
+            let path_authorizes_policy = |req: &str| -> bool {
+                if cert_policy_sets.is_empty() || has_unsupported_policy_ext {
+                    return false;
+                }
+                cert_policy_sets.iter().all(|oids| {
+                    oids.iter().any(|o| o == req)
+                        || (!any_policy_inhibited && oids.iter().any(|o| o == "2.5.29.32.0"))
+                })
+            };
+
+            let ok = if match_type == 0 {
+                // USAGE_MATCH_TYPE_AND
+                req_policies.iter().all(|r| path_authorizes_policy(r))
+            } else {
+                // USAGE_MATCH_TYPE_OR
+                req_policies.iter().any(|r| path_authorizes_policy(r))
+            };
             if !ok {
                 trust_bits |=
                     CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_POLICY_CONSTRAINTS;
@@ -2703,9 +2786,11 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
             let require_ee_leaf =
                 (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
+            let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
+            let selected_path = resolve_selected_issuer_path(&chain_der, bc_root_pool);
             let mut violation: Option<(u32, i32)> = None;
             let mut non_self_issued_below = 0usize;
-            for (idx, der) in chain_der.iter().enumerate() {
+            for (idx, &der) in selected_path.iter().enumerate() {
                 let Some(parts) = parse_cert_der_parts(der) else {
                     continue;
                 };

@@ -4299,8 +4299,11 @@ fn macos_trust_store_and_extended_chain_policies() {
                 0x31,
                 &encode_der_tlv(
                     0x30,
-                    &[encode_der_tlv(0x06, &[0x55, 0x04, 0x03]), encode_der_tlv(0x0C, b"Explicit NonCA")]
-                        .concat(),
+                    &[
+                        encode_der_tlv(0x06, &[0x55, 0x04, 0x03]),
+                        encode_der_tlv(0x0C, b"Legacy Root No BC"),
+                    ]
+                    .concat(),
                 ),
             ),
         );
@@ -4434,12 +4437,25 @@ fn macos_trust_store_and_extended_chain_policies() {
         bc_pathlen0_inner.extend_from_slice(&super::asn1::encode_der_tlv(0x02, &[0x00]));
         let bc_pathlen0 = super::asn1::encode_der_tlv(0x30, &bc_pathlen0_inner);
 
+        let rollover_leaf = make_synth_cert(1, "Leaf-Rollover", "RolloverCA", None);
+        let rollover_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            rollover_leaf.as_ptr(),
+            rollover_leaf.len() as u32,
+        );
         let self_issued_rollover = make_synth_cert(2, "RolloverCA", "RolloverCA", Some(&bc_ca_true));
+        let rollover_parent_pathlen0 = make_synth_cert(4, "RolloverCA", "RootCA", Some(&bc_pathlen0));
+        let sub_leaf = make_synth_cert(6, "Leaf-Sub", "SubCA", None);
+        let sub_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            sub_leaf.as_ptr(),
+            sub_leaf.len() as u32,
+        );
         let non_self_sub_ca = make_synth_cert(3, "SubCA", "ParentCA", Some(&bc_ca_true));
-        let pathlen0_issuer = make_synth_cert(4, "ParentCA", "RootCA", Some(&bc_pathlen0));
+        let pathlen0_issuer = make_synth_cert(5, "ParentCA", "RootCA", Some(&bc_pathlen0));
 
-        // Chain [leaf, self_issued_rollover, pathlen0_issuer]: 0 non-self-issued intermediates
-        // below pathlen0_issuer -> MUST PASS!
+        // Chain [rollover_leaf, self_issued_rollover, rollover_parent_pathlen0]: 0 non-self-issued
+        // intermediates below pathlen0_issuer -> MUST PASS!
         let rollover_store = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
         assert_eq!(
             CertAddEncodedCertificateToStore(
@@ -4456,8 +4472,8 @@ fn macos_trust_store_and_extended_chain_policies() {
             CertAddEncodedCertificateToStore(
                 rollover_store,
                 X509_ASN_ENCODING,
-                pathlen0_issuer.as_ptr(),
-                pathlen0_issuer.len() as u32,
+                rollover_parent_pathlen0.as_ptr(),
+                rollover_parent_pathlen0.len() as u32,
                 4,
                 std::ptr::null_mut(),
             ),
@@ -4467,7 +4483,7 @@ fn macos_trust_store_and_extended_chain_policies() {
         assert_eq!(
             CertGetCertificateChain(
                 std::ptr::null_mut(),
-                legacy_leaf_ctx,
+                rollover_leaf_ctx,
                 std::ptr::null(),
                 rollover_store,
                 std::ptr::null(),
@@ -4492,8 +4508,9 @@ fn macos_trust_store_and_extended_chain_policies() {
         );
         CertFreeCertificateChain(rollover_chain);
         CertCloseStore(rollover_store, 0);
+        CertFreeCertificateContext(rollover_leaf_ctx);
 
-        // Chain [leaf, non_self_sub_ca, pathlen0_issuer]: 1 non-self-issued intermediate
+        // Chain [sub_leaf, non_self_sub_ca, pathlen0_issuer]: 1 non-self-issued intermediate
         // below pathlen0_issuer -> MUST FAIL with TRUST_E_BASIC_CONSTRAINTS at index 2!
         let sub_store = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
         assert_eq!(
@@ -4522,7 +4539,7 @@ fn macos_trust_store_and_extended_chain_policies() {
         assert_eq!(
             CertGetCertificateChain(
                 std::ptr::null_mut(),
-                legacy_leaf_ctx,
+                sub_leaf_ctx,
                 std::ptr::null(),
                 sub_store,
                 std::ptr::null(),
@@ -4545,7 +4562,59 @@ fn macos_trust_store_and_extended_chain_policies() {
         assert_eq!(status.l_element_index, 2);
         CertFreeCertificateChain(sub_chain);
         CertCloseStore(sub_store, 0);
+        CertFreeCertificateContext(sub_leaf_ctx);
         CertFreeCertificateContext(legacy_leaf_ctx);
+
+        // Unrelated end-entity cert (cA=FALSE) in hAdditionalStore MUST NOT trigger
+        // TRUST_E_BASIC_CONSTRAINTS on a valid chain.
+        let bc_unrelated_store = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        let unrelated_ee_bc = make_synth_cert(9, "UnrelatedEE", "OtherCA", Some(&super::asn1::encode_der_tlv(0x30, &[])));
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                bc_unrelated_store,
+                X509_ASN_ENCODING,
+                unrelated_ee_bc.as_ptr(),
+                unrelated_ee_bc.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut bc_clean_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                cert,
+                std::ptr::null(),
+                bc_unrelated_store,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut bc_clean_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                bc_clean_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "unrelated cA=FALSE end-entity cert in hAdditionalStore must not fail BASIC_CONSTRAINTS"
+        );
+        CertFreeCertificateChain(bc_clean_chain);
+        CertCloseStore(bc_unrelated_store, 0);
 
         // CERT_CHAIN_POLICY_BASIC_CONSTRAINTS: setting BOTH CA_FLAG and END_ENTITY_FLAG
         // allows either leaf type (both CA leaf and end-entity leaf with BC v2 must pass).
@@ -5273,6 +5342,162 @@ fn macos_trust_store_and_extended_chain_policies() {
         CertFreeCertificateContext(ed_leaf_ctx);
         CertFreeCertificateChainEngine(ed_eng);
         CertCloseStore(ed_root_st, 0);
+
+        // RequestedIssuancePolicy MUST be authorized across the ENTIRE non-root issuer path:
+        // a leaf advertising Policy A under an intermediate advertising ONLY Policy B (no anyPolicy)
+        // MUST fail with CERT_E_INVALID_POLICY, whereas a path where both authorize Policy A
+        // (or the intermediate carries anyPolicy 2.5.29.32.0) MUST pass.
+        let mk_policy_cert = |serial: u8, subj: &str, iss: &str, policy_oids: &[&[u8]], is_ca: bool| -> Vec<u8> {
+            let tlv = super::asn1::encode_der_tlv;
+            let mk_dn = |cn: &str| {
+                let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+                atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+                tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+            };
+            let alg = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+            let mut val = tlv(0x17, b"200101000000Z");
+            val.extend_from_slice(&tlv(0x17, b"400101000000Z"));
+            let mut spki = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]));
+            spki.extend_from_slice(&tlv(0x03, &[0x00, 0x04, serial]));
+            let mut exts = Vec::new();
+            if is_ca {
+                let mut bc = tlv(0x06, &[0x55, 0x1D, 0x13]);
+                bc.extend_from_slice(&tlv(0x01, &[0xFF]));
+                bc.extend_from_slice(&tlv(0x04, &tlv(0x30, &tlv(0x01, &[0xFF]))));
+                exts.extend_from_slice(&tlv(0x30, &bc));
+            }
+            if !policy_oids.is_empty() {
+                let mut pis = Vec::new();
+                for p in policy_oids {
+                    pis.extend_from_slice(&tlv(0x30, &tlv(0x06, p)));
+                }
+                let mut pe = tlv(0x06, &[0x55, 0x1D, 0x20]); // 2.5.29.32 certificatePolicies
+                pe.extend_from_slice(&tlv(0x04, &tlv(0x30, &pis)));
+                exts.extend_from_slice(&tlv(0x30, &pe));
+            }
+            let mut tbs = tlv(0xA0, &tlv(0x02, &[0x02]));
+            tbs.extend_from_slice(&tlv(0x02, &[serial]));
+            tbs.extend_from_slice(&alg);
+            tbs.extend_from_slice(&mk_dn(iss));
+            tbs.extend_from_slice(&tlv(0x30, &val));
+            tbs.extend_from_slice(&mk_dn(subj));
+            tbs.extend_from_slice(&tlv(0x30, &spki));
+            if !exts.is_empty() {
+                tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &exts)));
+            }
+            let mut body = tlv(0x30, &tbs);
+            body.extend_from_slice(&alg);
+            body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+            tlv(0x30, &body)
+        };
+        // Policy A = 1.2.3.4.1, Policy B = 1.2.3.4.2, anyPolicy = 2.5.29.32.0
+        let oid_pol_a: &[u8] = &[0x2A, 0x03, 0x04, 0x01];
+        let oid_pol_b: &[u8] = &[0x2A, 0x03, 0x04, 0x02];
+        let oid_any_pol: &[u8] = &[0x55, 0x1D, 0x20, 0x00];
+
+        let pol_leaf = mk_policy_cert(11, "PolLeaf", "PolInter", &[oid_pol_a], false);
+        let pol_inter_b_only = mk_policy_cert(12, "PolInter", "PolRoot", &[oid_pol_b], true);
+        let pol_inter_any = mk_policy_cert(13, "PolInter", "PolRoot", &[oid_any_pol], true);
+        let pol_root = mk_policy_cert(14, "PolRoot", "PolRoot", &[], true);
+
+        let pol_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            pol_leaf.as_ptr(),
+            pol_leaf.len() as u32,
+        );
+        let pol_a_str = b"1.2.3.4.1\0";
+        let pol_a_arr = [pol_a_str.as_ptr()];
+        let mut cp_pol = [0u8; 0x60];
+        std::ptr::write_unaligned(cp_pol.as_mut_ptr() as *mut u32, 0x60u32);
+        std::ptr::write_unaligned(cp_pol.as_mut_ptr().add(0x20) as *mut u32, 0u32); // AND
+        std::ptr::write_unaligned(cp_pol.as_mut_ptr().add(0x28) as *mut u32, 1u32);
+        std::ptr::write_unaligned(
+            cp_pol.as_mut_ptr().add(0x30) as *mut *const *const u8,
+            pol_a_arr.as_ptr(),
+        );
+
+        // Case 1: leaf has Policy A, intermediate has ONLY Policy B -> MUST set CERT_TRUST_INVALID_POLICY_CONSTRAINTS.
+        let st_pol_b = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(st_pol_b, X509_ASN_ENCODING, pol_inter_b_only.as_ptr(), pol_inter_b_only.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        assert_eq!(CertAddEncodedCertificateToStore(st_pol_b, X509_ASN_ENCODING, pol_root.as_ptr(), pol_root.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let mut ch_pol_b: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                pol_leaf_ctx,
+                std::ptr::null(),
+                st_pol_b,
+                cp_pol.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_pol_b,
+            ),
+            TRUE
+        );
+        let ts_pol_b = std::ptr::read_unaligned((ch_pol_b as *const u8).add(4) as *const u32);
+        assert_ne!(
+            ts_pol_b & 0x0000_0400, // CERT_TRUST_INVALID_POLICY_CONSTRAINTS
+            0,
+            "intermediate allowing only Policy B must fail RequestedIssuancePolicy for Policy A"
+        );
+        CertFreeCertificateChain(ch_pol_b);
+        CertCloseStore(st_pol_b, 0);
+
+        // Case 2: leaf has Policy A, intermediate has anyPolicy, root has no policy extension -> MUST pass policy check!
+        let st_pol_any = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(CertAddEncodedCertificateToStore(st_pol_any, X509_ASN_ENCODING, pol_inter_any.as_ptr(), pol_inter_any.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        assert_eq!(CertAddEncodedCertificateToStore(st_pol_any, X509_ASN_ENCODING, pol_root.as_ptr(), pol_root.len() as u32, 4, std::ptr::null_mut()), TRUE);
+        let mut ch_pol_any: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                pol_leaf_ctx,
+                std::ptr::null(),
+                st_pol_any,
+                cp_pol.as_ptr() as *const c_void,
+                0,
+                std::ptr::null_mut(),
+                &mut ch_pol_any,
+            ),
+            TRUE
+        );
+        let ts_pol_any = std::ptr::read_unaligned((ch_pol_any as *const u8).add(4) as *const u32);
+        assert_eq!(
+            ts_pol_any & 0x0000_0400,
+            0,
+            "leaf Policy A + intermediate anyPolicy + root must satisfy RequestedIssuancePolicy for Policy A"
+        );
+        CertFreeCertificateChain(ch_pol_any);
+        CertCloseStore(st_pol_any, 0);
+        CertFreeCertificateContext(pol_leaf_ctx);
+
+        // Verify CERT_CHAIN_REVOCATION_CHECK_END_CERT scopes Apple Security.framework evaluation
+        // strictly to [leaf] anchored at [direct_issuer] (never requiring intermediate revocation),
+        // while whole-chain flags evaluate the full selected path.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let path3: Vec<&[u8]> = vec![&pol_leaf, &pol_inter_any, &pol_root];
+            let (ec_certs, ec_anchors, ec_only) = super::chain::apple_trust::revocation_eval_inputs(
+                &path3,
+                Some(std::slice::from_ref(&pol_root)),
+                &[],
+                true,
+            );
+            assert_eq!(ec_certs.len(), 1);
+            assert_eq!(ec_certs[0], pol_leaf);
+            assert_eq!(ec_anchors, vec![pol_inter_any.clone()]);
+            assert!(ec_only);
+
+            let (wc_certs, wc_anchors, wc_only) = super::chain::apple_trust::revocation_eval_inputs(
+                &path3,
+                Some(std::slice::from_ref(&pol_root)),
+                &[],
+                false,
+            );
+            assert_eq!(wc_certs.len(), 3);
+            assert_eq!(wc_anchors, vec![pol_root]);
+            assert!(wc_only);
+        }
     }
 }
 
