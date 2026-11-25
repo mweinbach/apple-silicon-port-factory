@@ -234,22 +234,20 @@ macro_rules! simd_ops {
                 source_file: "crates/x86-runtime/src/emu/jit/ext.rs",
                 verified_vectors: 80,
             },
-            // No gather lowering exists yet. The source points at the unimplemented
-            // dispatch reached by these mnemonics; see the catalog caveat in STATUS.
             OpRecord {
                 id: "AVX2_GATHER",
-                fast_kind_id: 113,
-                fast_kind_name: "K_VGATHER",
+                fast_kind_id: 0,
+                fast_kind_name: "K_GENERIC",
                 sub_op: "vpgatherdd,vpgatherdq,vpgatherqd,vpgatherqq,vgatherdps,vgatherdpd,vgatherqps,vgatherqpd",
                 category: OpCategory::Avx256Lane,
                 x86_mnemonics: "vpgatherdd,vpgatherdq,vpgatherqd,vpgatherqq,vgatherdps,vgatherdpd,vgatherqps,vgatherqpd",
                 encodings: "VEX.128,VEX.256",
                 operand_forms: "RM",
                 widths: "128,256",
-                arm64_pattern: "Per-lane mask sign-bit test + indexed guest load + clear mask register",
-                semantics: "Conditionally gathers 32/64-bit elements using VSIB vector index and zeroes mask register upon completion",
-                tier: TranslationTier::JitArm64,
-                source_file: "crates/x86-runtime/src/emu/interp.rs",
+                arm64_pattern: "Generic iced-x86 VSIB handler: per-lane mask sign-bit test, fault suppression, #UD alias check, zero mask",
+                semantics: "Conditionally gathers 32/64-bit elements using VSIB vector index with fault suppression and zeroes mask register upon completion",
+                tier: TranslationTier::GenericInterp,
+                source_file: "crates/x86-runtime/src/emu/simd_fp.rs",
                 verified_vectors: 64,
             },
             OpRecord {

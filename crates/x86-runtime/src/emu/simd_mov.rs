@@ -917,7 +917,7 @@ impl Cpu {
                         _ => 0,
                     };
                     let imm = cpu.read_op(ins, imm_op, 8) as u8;
-                    let r = vops::round_f32(f32::from_bits(b_bits), imm);
+                    let r = vops::round_f32(f32::from_bits(b_bits), imm, cpu.jx.mxcsr);
                     cpu.xmm[d] = (hi & !0xFFFF_FFFF) | (r.to_bits() as u128);
                     cpu.vex128_zero_upper(ins, d);
                 }
@@ -932,7 +932,7 @@ impl Cpu {
                         _ => 0,
                     };
                     let imm = cpu.read_op(ins, imm_op, 8) as u8;
-                    let r = vops::round_f64(f64::from_bits(b_bits), imm);
+                    let r = vops::round_f64(f64::from_bits(b_bits), imm, cpu.jx.mxcsr);
                     cpu.xmm[d] = (hi & !0xFFFF_FFFF_FFFF_FFFF) | (r.to_bits() as u128);
                     cpu.vex128_zero_upper(ins, d);
                 }
@@ -941,8 +941,8 @@ impl Cpu {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
                     let (lo, hi) = vops::load_vec_op(cpu, ins, 1, ymm);
                     let imm = cpu.read_op(ins, 2, 8) as u8;
-                    let d_lo = vops::round_ps(lo, imm);
-                    let d_hi = if ymm { vops::round_ps(hi, imm) } else { 0 };
+                    let d_lo = vops::round_ps(lo, imm, cpu.jx.mxcsr);
+                    let d_hi = if ymm { vops::round_ps(hi, imm, cpu.jx.mxcsr) } else { 0 };
                     vops::store_vec_dst(cpu, ins, d, ymm, d_lo, d_hi);
                 }
             }
@@ -950,8 +950,8 @@ impl Cpu {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
                     let (lo, hi) = vops::load_vec_op(cpu, ins, 1, ymm);
                     let imm = cpu.read_op(ins, 2, 8) as u8;
-                    let d_lo = vops::round_pd(lo, imm);
-                    let d_hi = if ymm { vops::round_pd(hi, imm) } else { 0 };
+                    let d_lo = vops::round_pd(lo, imm, cpu.jx.mxcsr);
+                    let d_hi = if ymm { vops::round_pd(hi, imm, cpu.jx.mxcsr) } else { 0 };
                     vops::store_vec_dst(cpu, ins, d, ymm, d_lo, d_hi);
                 }
             }
@@ -976,7 +976,8 @@ impl Cpu {
             Mnemonic::Vcvtps2ph => {
                 let (s, is_256) = vops::xmm_reg_info(ins.op_register(1)).unwrap_or((0, false));
                 let (lo, hi) = (cpu.xmm[s], if is_256 { cpu.ymm_hi[s] } else { 0 });
-                let packed = vops::vcvtps2ph(lo, hi, is_256);
+                let imm = ins.immediate8();
+                let packed = vops::vcvtps2ph(lo, hi, is_256, imm, cpu.jx.mxcsr);
                 match ins.op_kind(0) {
                     OpKind::Register => {
                         if let Some(d) = vops::xmm_idx_fast(ins.op_register(0)) {
@@ -1161,6 +1162,22 @@ impl Cpu {
                     }
                 }
             }
+            Mnemonic::Vpermilpd => {
+                if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
+                    let (src_lo, src_hi) = vops::load_vec_op(cpu, ins, 1, ymm);
+                    if matches!(ins.op_kind(2), OpKind::Immediate8) {
+                        let imm = cpu.read_op(ins, 2, 8) as u8;
+                        let lo = vops::shufpd(src_lo, src_lo, imm);
+                        let hi = if ymm { vops::shufpd(src_hi, src_hi, imm >> 2) } else { 0 };
+                        vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
+                    } else {
+                        let (ctrl_lo, ctrl_hi) = vops::load_vec_op(cpu, ins, 2, ymm);
+                        let lo = vops::vpermilpd_var(src_lo, ctrl_lo);
+                        let hi = if ymm { vops::vpermilpd_var(src_hi, ctrl_hi) } else { 0 };
+                        vops::store_vec_dst(cpu, ins, d, ymm, lo, hi);
+                    }
+                }
+            }
             Mnemonic::Cvttps2dq | Mnemonic::Vcvttps2dq | Mnemonic::Cvtps2dq | Mnemonic::Vcvtps2dq => {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {
                     let trunc = matches!(mn, Mnemonic::Cvttps2dq | Mnemonic::Vcvttps2dq);
@@ -1211,7 +1228,7 @@ impl Cpu {
                     OpKind::Memory => cpu.read_u128(cpu.eff_addr(ins)),
                     _ => 0,
                 };
-                vops::pcmpstr(cpu, a, b, ins.immediate8(), is_explicit, is_mask, long);
+                vops::pcmpstr(cpu, a, b, ins.immediate8(), is_explicit, is_mask, long, Cpu::is_vex(ins));
             }
             Mnemonic::Cvtps2pd | Mnemonic::Vcvtps2pd | Mnemonic::Cvtdq2pd | Mnemonic::Vcvtdq2pd => {
                 if let Some((d, ymm)) = vops::xmm_reg_info(ins.op_register(0)) {

@@ -713,12 +713,12 @@ pub unsafe extern "win64" fn GetProductInfo(
 }
 
 pub unsafe extern "win64" fn GetEnabledXStateFeatures() -> u64 {
-    0x3 // XSTATE_MASK_LEGACY (FPU + SSE)
+    0x7 // XSTATE_MASK_LEGACY (FPU + SSE) | XSTATE_MASK_AVX (matches CPUID/XCR0)
 }
 
 pub unsafe extern "win64" fn GetXStateFeaturesMask(_context: *const u8, feature_mask: *mut u64) -> BOOL {
     if !feature_mask.is_null() {
-        *feature_mask = 0x3;
+        *feature_mask = 0x7;
     }
     TRUE
 }

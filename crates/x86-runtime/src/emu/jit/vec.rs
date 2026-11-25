@@ -203,20 +203,28 @@ impl Asm {
         self.emit(0x6E20_5800 | vn << 5 | vd);
     }
     pub(super) fn s_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
-        let arm_rmode: u32 = match x86_rmode & 3 {
-            0 => 0, // ties-even (frintn)
-            1 => 2, // floor (frintm)
-            2 => 1, // ceil (frintp)
-            _ => 3, // trunc (frintz)
+        let arm_rmode: u32 = if (x86_rmode & 4) != 0 {
+            7 // current FPCR.RMode (frinti)
+        } else {
+            match x86_rmode & 3 {
+                0 => 0, // ties-even (frintn)
+                1 => 2, // floor (frintm)
+                2 => 1, // ceil (frintp)
+                _ => 3, // trunc (frintz)
+            }
         };
         self.emit(0x1E24_4000 | (is_f64 as u32) << 22 | arm_rmode << 15 | vn << 5 | vd);
     }
     pub(super) fn v_frint(&mut self, is_f64: bool, x86_rmode: u8, vd: u32, vn: u32) {
-        let opc: u32 = match x86_rmode & 3 {
-            0 => 0x4E21_8800, // frintn
-            1 => 0x4E21_9800, // frintm (floor)
-            2 => 0x4EA1_8800, // frintp (ceil)
-            _ => 0x4EA1_9800, // frintz (trunc)
+        let opc: u32 = if (x86_rmode & 4) != 0 {
+            0x6EA1_9800 // current FPCR.RMode (frinti)
+        } else {
+            match x86_rmode & 3 {
+                0 => 0x4E21_8800, // frintn
+                1 => 0x4E21_9800, // frintm (floor)
+                2 => 0x4EA1_8800, // frintp (ceil)
+                _ => 0x4EA1_9800, // frintz (trunc)
+            }
         };
         self.emit(opc | (is_f64 as u32) << 22 | vn << 5 | vd);
     }
@@ -281,6 +289,14 @@ fn shuf_tbl_mask(sub: u8, imm: u8) -> (u64, u64) {
         VS_SHUFPD => {
             let s0 = (m & 1) * 8;
             let s1 = 16 + ((m >> 1) & 1) * 8;
+            for b in 0..8 {
+                idx[b] = (s0 + b) as u8;
+                idx[8 + b] = (s1 + b) as u8;
+            }
+        }
+        VS_VPERMILPD_I => {
+            let s0 = (m & 1) * 8;
+            let s1 = ((m >> 1) & 1) * 8;
             for b in 0..8 {
                 idx[b] = (s0 + b) as u8;
                 idx[8 + b] = (s1 + b) as u8;
@@ -492,7 +508,7 @@ impl Tr<'_> {
                 self.a.v_sqxtun(true, 1, 2, 1);
                 self.a.v_mov(0, 2);
             }
-            VS_PSHUFD | VS_PSHUFLW | VS_PSHUFHW => {
+            VS_PSHUFD | VS_PSHUFLW | VS_PSHUFHW | VS_VPERMILPD_I => {
                 if sub == VS_PSHUFD {
                     match imm8 {
                         0x00 => { self.a.v_dup_lane_s(0, 1, 0); return; }
@@ -558,6 +574,17 @@ impl Tr<'_> {
                 self.a.v_dup(2, 3, T0);
                 self.a.neon_3same(false, 2, 16, 2, 2, 3); // add v2.4s, v2.4s, v3.4s
                 self.a.v_tbl1(0, 0, 2);
+            }
+            VS_VPERMILPD => {
+                // Bit 1 of each 64-bit lane in v1 selects qword 0 or 1 of v0.
+                self.a.v_zip1(3, 2, 0, 0); // v2 = [a0, a0]
+                self.a.v_zip2(3, 3, 0, 0); // v3 = [a1, a1]
+                self.a.movz(true, T0, 2, 0);
+                self.a.v_dup(3, 4, T0);
+                self.a.v_and(4, 1, 4);
+                self.a.v_cmeq0(3, 4, 4); // all-1s where (ctrl & 2) == 0 -> pick a0
+                self.a.v_bsl(4, 2, 3);
+                self.a.v_mov(0, 4);
             }
             VS_PSHUFB => {
                 // Keep bit 7 (so negative indices stay >= 16 -> TBL zeroes them) and low 4 bits.
@@ -1267,7 +1294,7 @@ impl Tr<'_> {
             }
             let hi_imm = if matches!(op.kind, K_VSHUF_RR | K_VSHUF_RM) {
                 match sub {
-                    VS_SHUFPD | VS_BLENDPD => imm8 >> 2,
+                    VS_SHUFPD | VS_BLENDPD | VS_VPERMILPD_I => imm8 >> 2,
                     VS_BLENDPS => imm8 >> 4,
                     _ => imm8,
                 }
