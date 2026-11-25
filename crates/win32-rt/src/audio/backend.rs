@@ -822,6 +822,42 @@ impl StreamShared {
         self.loopback.get()
     }
 
+    /// Consume one rendered hardware period into `out` (`want * channels` samples),
+    /// apply playback gain/mute, and publish the complete rendered interval (including
+    /// any muted frames or zero-filled underrun silence tail) to the loopback feed so
+    /// cross-stream mixer positions stay synchronized across underruns.
+    ///
+    /// Returns `(got_frames, is_silent)`.
+    pub(super) fn render_period(&self, out: &mut [f32], publish_direct: bool) -> (usize, bool) {
+        let ch = self.ring.channels();
+        let want = out.len() / ch;
+        let got = self.ring.pop_into(out);
+        let is_silent = if got > 0 {
+            self.apply_playback_gain(&mut out[..got * ch], ch)
+        } else {
+            true
+        };
+        if want > 0 {
+            if let Some(lb) = self.loopback() {
+                if super::audioclient::has_loopback_subscribers() {
+                    let rendered = &out[..want * ch];
+                    if publish_direct {
+                        super::audioclient::push_loopback_frames(
+                            &lb.ep_id,
+                            lb.source_id,
+                            rendered,
+                            lb.rate,
+                            lb.channels,
+                        );
+                    } else {
+                        lb.ring.push(rendered);
+                    }
+                }
+            }
+        }
+        (got, is_silent)
+    }
+
     /// Lock-free realtime-safe gain application at playback consumption.
     /// Applies full WASAPI session + stream-channel + endpoint gains when `gain` is present,
     /// or endpoint software volume/mute (`ep_sw`) for native middleware output streams.
@@ -1080,27 +1116,12 @@ impl OutputStream {
                                     next = now; // don't burst after a long stall
                                 }
                                 if s.started.load(Ordering::Acquire) {
-                                    let got = if let Some(lb) = s.loopback() {
-                                        if super::audioclient::has_loopback_subscribers() {
-                                            let got = s.ring.pop_into(&mut lb_buf);
-                                            if got > 0 {
-                                                let active = &mut lb_buf[..got * ch];
-                                                let _muted = s.apply_playback_gain(active, ch);
-                                                // Publish even when muted (`active` is already
-                                                // zeroed) so the source's loopback timeline keeps
-                                                // advancing in lockstep with other active streams.
-                                                super::audioclient::push_loopback_frames(
-                                                    &lb.ep_id,
-                                                    lb.source_id,
-                                                    active,
-                                                    lb.rate,
-                                                    lb.channels,
-                                                );
-                                            }
-                                            got
-                                        } else {
-                                            s.ring.discard(period)
-                                        }
+                                    let got = if s.loopback().is_some()
+                                        && super::audioclient::has_loopback_subscribers()
+                                    {
+                                        let (got, _silent) =
+                                            s.render_period(&mut lb_buf[..period * ch], true);
+                                        got
                                     } else {
                                         s.ring.discard(period)
                                     };
@@ -2117,20 +2138,9 @@ mod ca {
             return 0;
         }
         let want = out.len() / s.ring.channels();
-        let got = s.ring.pop_into(out);
-        if got > 0 {
-            let active = &mut out[..got * s.ring.channels()];
-            let muted = s.apply_playback_gain(active, s.ring.channels());
-            if muted {
-                *flags |= kAudioUnitRenderAction_OutputIsSilence;
-            }
-            // Push consumed frames even when muted (`active` is already zeroed) so fallback
-            // loopback capture advances this source's timeline without stalling on unmute.
-            if let Some(lb) = s.loopback() {
-                if super::super::audioclient::has_loopback_subscribers() {
-                    lb.ring.push(active);
-                }
-            }
+        let (got, is_silent) = s.render_period(out, false);
+        if is_silent {
+            *flags |= kAudioUnitRenderAction_OutputIsSilence;
         }
         s.consumed(want, got);
         0
@@ -2387,20 +2397,9 @@ mod ca {
             return 0;
         }
         let want = out.len() / s.ring.channels();
-        let got = s.ring.pop_into(out);
-        if got > 0 {
-            let active = &mut out[..got * s.ring.channels()];
-            let muted = s.apply_playback_gain(active, s.ring.channels());
-            if muted {
-                *flags |= kAudioUnitRenderAction_OutputIsSilence;
-            }
-            // Push consumed frames even when muted (`active` is already zeroed) so fallback
-            // loopback capture advances this source's timeline without stalling on unmute.
-            if let Some(lb) = s.loopback() {
-                if super::super::audioclient::has_loopback_subscribers() {
-                    lb.ring.push(active);
-                }
-            }
+        let (got, is_silent) = s.render_period(out, false);
+        if is_silent {
+            *flags |= kAudioUnitRenderAction_OutputIsSilence;
         }
         s.consumed(want, got);
         0

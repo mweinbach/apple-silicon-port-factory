@@ -1481,20 +1481,34 @@ mod client {
                     S_OK
                 }
                 StreamIo::Capture(c) => {
-                    if c.queued_packets.is_empty() && c.queued_frames == 0 && c.frame_accum == 0.0 {
-                        return S_FALSE;
-                    }
+                    let mut had_data = !c.queued_packets.is_empty()
+                        || c.queued_frames > 0
+                        || c.frame_accum != 0.0;
                     c.queued_packets.clear();
                     if let Some(lb) = &mut c.loopback {
+                        if !lb.packets.is_empty() {
+                            had_data = true;
+                        }
                         lb.packets.clear();
                         match &lb.source {
-                            LoopbackSource::CoreAudioTap { ring, .. } => ring.clear(),
-                            LoopbackSource::InProcessBus(sub) => sub.mixer.lock().unwrap().clear(),
+                            LoopbackSource::CoreAudioTap { ring, .. } => {
+                                if !ring.is_empty() {
+                                    had_data = true;
+                                    ring.clear();
+                                }
+                            }
+                            LoopbackSource::InProcessBus(sub) => {
+                                let mut m = sub.mixer.lock().unwrap();
+                                if m.sources.values().any(|q| !q.buf.is_empty()) {
+                                    had_data = true;
+                                }
+                                m.clear();
+                            }
                         }
                     }
                     c.queued_frames = 0;
                     c.frame_accum = 0.0;
-                    S_OK
+                    if had_data { S_OK } else { S_FALSE }
                 }
             }
         })
@@ -2643,5 +2657,98 @@ mod mixer_tests {
         cap.advance_at(&fmt, 4800, t0 + Duration::from_millis(25));
         assert_eq!(cap.queued_frames, 480);
         assert_eq!(cap.loopback.as_ref().unwrap().packets.front().map(|p| p.2), Some(true));
+    }
+
+    #[test]
+    fn render_period_publishes_underrun_silence_to_preserve_loopback_source_positions() {
+        let _lock = super::super::audio_test_lock();
+        let ep_id = "test-loopback-underrun-sync";
+
+        for publish_direct in [true, false] {
+            let sub = register_loopback_sub(ep_id, 4800, 48_000, 2);
+            sub.active.store(true, Ordering::Release);
+
+            let src_a = alloc_loopback_source_id();
+            let src_b = alloc_loopback_source_id();
+            let shared_a = StreamShared::with_loopback(
+                Ring::new(4800, 2),
+                ep_id.to_string(),
+                src_a,
+                48_000,
+                2,
+                None,
+            );
+            let shared_b = StreamShared::with_loopback(
+                Ring::new(4800, 2),
+                ep_id.to_string(),
+                src_b,
+                48_000,
+                2,
+                None,
+            );
+            set_loopback_source_started(ep_id, src_a, true);
+            set_loopback_source_started(ep_id, src_b, true);
+
+            let drain_lb_ring = |shared: &StreamShared| {
+                if !publish_direct {
+                    let lb = shared.loopback().unwrap();
+                    let ch = lb.ring.channels();
+                    let avail = lb.ring.len();
+                    if avail > 0 {
+                        let mut tmp = vec![0.0f32; avail * ch];
+                        let got = lb.ring.pop_into(&mut tmp);
+                        push_loopback_frames(&lb.ep_id, lb.source_id, &tmp[..got * ch], lb.rate, lb.channels);
+                    }
+                }
+            };
+
+            let mut out_a = vec![0.0f32; 480 * 2];
+            let mut out_b = vec![0.0f32; 480 * 2];
+
+            // Period 0 (frames 0..480): A plays 480 frames of 0.25; B plays only 120 frames of 0.50
+            // (partial underrun: 360 frames of zero-filled tail must still be published).
+            shared_a.ring.push(&vec![0.25f32; 480 * 2]);
+            shared_b.ring.push(&vec![0.50f32; 120 * 2]);
+            assert_eq!(shared_a.render_period(&mut out_a, publish_direct), (480, false));
+            assert_eq!(shared_b.render_period(&mut out_b, publish_direct), (120, false));
+            drain_lb_ring(&shared_a);
+            drain_lb_ring(&shared_b);
+
+            // Period 1 (frames 480..960): A plays 480 frames of 0.25; B completely underruns (0 frames)
+            // and must publish 480 frames of silence so its mixer position advances to frame 960.
+            shared_a.ring.push(&vec![0.25f32; 480 * 2]);
+            assert_eq!(shared_a.render_period(&mut out_a, publish_direct), (480, false));
+            assert_eq!(shared_b.render_period(&mut out_b, publish_direct), (0, true));
+            drain_lb_ring(&shared_a);
+            drain_lb_ring(&shared_b);
+
+            // Period 2 (frames 960..1440): A plays 480 frames of 0.25; B resumes with 480 frames of 0.50.
+            shared_a.ring.push(&vec![0.25f32; 480 * 2]);
+            shared_b.ring.push(&vec![0.50f32; 480 * 2]);
+            assert_eq!(shared_a.render_period(&mut out_a, publish_direct), (480, false));
+            assert_eq!(shared_b.render_period(&mut out_b, publish_direct), (480, false));
+            drain_lb_ring(&shared_a);
+            drain_lb_ring(&shared_b);
+
+            let mut mixed = Vec::new();
+            let frames = sub.mixer.lock().unwrap().drain_mixed(4096, &mut mixed);
+            assert_eq!(frames, 1440, "publish_direct={publish_direct}: expected 3 full 480-frame periods");
+            // Frames 0..120: A (0.25) + B (0.50) = 0.75
+            assert!((mixed[0] - 0.75).abs() < 1e-5);
+            assert!((mixed[119 * 2] - 0.75).abs() < 1e-5);
+            // Frames 120..480: A (0.25) + B partial-underrun tail (0.0) = 0.25
+            assert!((mixed[120 * 2] - 0.25).abs() < 1e-5);
+            assert!((mixed[479 * 2] - 0.25).abs() < 1e-5);
+            // Frames 480..960: A (0.25) + B full-underrun silence (0.0) = 0.25 (NOT 0.75!)
+            assert!((mixed[480 * 2] - 0.25).abs() < 1e-5, "B's resumed audio must not shift back to frame 480");
+            assert!((mixed[959 * 2] - 0.25).abs() < 1e-5);
+            // Frames 960..1440: A (0.25) + B resumed (0.50) = 0.75
+            assert!((mixed[960 * 2] - 0.75).abs() < 1e-5, "B's resumed audio must align at frame 960");
+            assert!((mixed[1439 * 2] - 0.75).abs() < 1e-5);
+
+            unregister_loopback_source(ep_id, src_a);
+            unregister_loopback_source(ep_id, src_b);
+            drop(sub);
+        }
     }
 }
