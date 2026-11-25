@@ -2082,3 +2082,57 @@ fn x87_fldcw_normalizes_reserved_bits() {
     assert_eq!(rd_u16(18), 0x1F7F, "0xFFFF -> 0x1F7F");
     assert_eq!(rd_u16(20), 0x0040, "0x0000 -> 0x0040");
 }
+
+/// 19. Regression: 14-byte (16-bit) `fldenv`/`fnstenv` uses the protected-mode selector layout
+///     where bytes 8..10 hold FCS (not FOP). Loading a 14-byte env with selector `0x1234` must
+///     leave `FOP == 0` in subsequent 28-byte `fnstenv`, and storing a 14-byte env after a data
+///     instruction with non-zero `FOP` must write `0` (FCS) to bytes 8..10.
+#[test]
+fn x87_env14_uses_selector_layout_not_fop() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 128];
+    // 14-byte env at [rcx + 0..14]: CW=0x037F, SW=0, TW=0xFFFF, FIP=0x4455, FCS=0x1234, FDP=0x6677, FDS=0x5678
+    init[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+    init[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+    init[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    init[6..8].copy_from_slice(&0x4455u16.to_le_bytes());
+    init[8..10].copy_from_slice(&0x1234u16.to_le_bytes());
+    init[10..12].copy_from_slice(&0x6677u16.to_le_bytes());
+    init[12..14].copy_from_slice(&0x5678u16.to_le_bytes());
+    // f64 = 1.5 at [rcx + 16..24]
+    init[16..24].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
+    // Pre-fill 14-byte fnstenv output [rcx + 64..78] with 0xAA to prove bytes 8..10 are written as 0
+    for b in &mut init[64..78] {
+        *b = 0xAA;
+    }
+
+    let mut code = Vec::new();
+    // 1. 14-byte fldenv [rcx] (66 D9 21) -> 28-byte fnstenv [rcx + 32] (D9 71 20)
+    code.extend_from_slice(&[0x66, 0xD9, 0x21]);
+    code.extend_from_slice(&[0xD9, 0x71, 0x20]);
+    // 2. Execute data op (fld qword ptr [rcx + 16]) to populate non-zero FOP, then
+    //    14-byte fnstenv [rcx + 64] (66 D9 71 40) and 28-byte fnstenv [rcx + 96] (D9 71 60)
+    let tail = assemble(|a| {
+        a.fld(qword_ptr(rcx + 16)).unwrap();
+        a.fadd(qword_ptr(rcx + 16)).unwrap();
+    });
+    // Strip trailing `ret` from `tail`
+    code.extend_from_slice(&tail[..tail.len() - 1]);
+    code.extend_from_slice(&[0x66, 0xD9, 0x71, 0x40]); // 14-byte fnstenv [rcx + 64]
+    code.extend_from_slice(&[0xD9, 0x71, 0x60]);       // 28-byte fnstenv [rcx + 96]
+    code.push(0xC3); // ret
+
+    let r = run_diff_x87("env14_selector_layout", &code, &init);
+    let rd_u16 = |off: usize| u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap());
+    let rd_u32 = |off: usize| u32::from_le_bytes(r.data[off..off + 4].try_into().unwrap());
+
+    // After 14-byte fldenv with FCS=0x1234: 28-byte fnstenv at +32 must report FIP=0x4455, FDP=0x6677, FOP=0
+    assert_eq!(rd_u32(32 + 12), 0x4455, "14B fldenv FIP preserved");
+    assert_eq!(rd_u16(32 + 18), 0, "14B fldenv must NOT copy FCS 0x1234 into FOP");
+    assert_eq!(rd_u32(32 + 20), 0x6677, "14B fldenv FDP preserved");
+
+    // After data op (fadd st0, st0): 28-byte fnstenv at +96 has non-zero FOP, while 14-byte fnstenv at +64 writes FCS=0
+    assert_ne!(rd_u16(96 + 18), 0, "28B fnstenv must report non-zero FOP after fadd");
+    assert_eq!(rd_u16(64 + 8), 0, "14B fnstenv bytes 8..10 must write FCS=0, not FOP");
+    assert_eq!(rd_u16(64 + 12), 0, "14B fnstenv bytes 12..14 must write FDS=0");
+}

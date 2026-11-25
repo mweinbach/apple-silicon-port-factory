@@ -2455,13 +2455,15 @@ impl X87State {
         let sw = self.status_word();
         let tw = self.full_tag_word();
         if size16 {
+            // 16-bit protected-mode environment (14 bytes, Intel SDM Vol. 1 Fig. 8-9):
+            // bytes 8..10 hold FCS (code-segment selector), NOT FOP; bytes 12..14 hold FDS.
             out[0..2].copy_from_slice(&cw.to_le_bytes());
             out[2..4].copy_from_slice(&sw.to_le_bytes());
             out[4..6].copy_from_slice(&tw.to_le_bytes());
             out[6..8].copy_from_slice(&(self.fip as u16).to_le_bytes());
-            out[8..10].copy_from_slice(&(self.fop & 0x7FF).to_le_bytes());
+            out[8..10].copy_from_slice(&0u16.to_le_bytes()); // FCS
             out[10..12].copy_from_slice(&(self.fdp as u16).to_le_bytes());
-            out[12..14].copy_from_slice(&0u16.to_le_bytes());
+            out[12..14].copy_from_slice(&0u16.to_le_bytes()); // FDS
         } else {
             out[0..2].copy_from_slice(&cw.to_le_bytes());
             out[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
@@ -2481,12 +2483,14 @@ impl X87State {
     /// Load 28-byte (32-bit) or 14-byte (16-bit) x87 environment (`fldenv`/`frstor`).
     pub(super) fn decode_env(&mut self, data: &[u8], size16: bool) {
         let (cw, sw, tw, fip, fop, fdp) = if size16 {
+            // 16-bit protected-mode environment has no FOP field (bytes 8..10 are FCS);
+            // native x86-64 FLDENV leaves FOP zero.
             (
                 u16::from_le_bytes([data[0], data[1]]),
                 u16::from_le_bytes([data[2], data[3]]),
                 u16::from_le_bytes([data[4], data[5]]),
                 u16::from_le_bytes([data[6], data[7]]) as u64,
-                u16::from_le_bytes([data[8], data[9]]) & 0x7FF,
+                0u16,
                 u16::from_le_bytes([data[10], data[11]]) as u64,
             )
         } else {
