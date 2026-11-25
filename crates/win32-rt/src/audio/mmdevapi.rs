@@ -967,21 +967,33 @@ const DEFAULT_STEP_DB: f32 = 0.5;
 /// natively handle an endpoint's master/mute/per-channel volume control (e.g., Null backend,
 /// iOS RemoteIO, or macOS output devices lacking per-channel hardware volume).
 #[derive(Clone)]
+/// Shared per-endpoint fallback volume/mute control state and software render attenuation.
+///
+/// Shared across all `IAudioEndpointVolume` activations on the same endpoint ID so muting or
+/// adjusting volume on one COM instance is immediately observed by all other instances, while
+/// `sw_*` fields avoid double-attenuating channels that CoreAudio HAL already controls in hardware.
 struct EndpointSoftwareGain {
+    /// Logical fallback control values (used by getters when CoreAudio HAL lacks that control).
+    logical_master: f32,
+    logical_muted: bool,
+    logical_channels: [f32; 8],
     /// Software master multiplier (`1.0` when hardware HAL already applies master volume).
-    master: f32,
+    sw_master: f32,
     /// Software mute (`false` when hardware HAL already applies mute).
-    muted: bool,
+    sw_muted: bool,
     /// Per-channel software multipliers (`1.0` for any channel handled by hardware HAL).
-    channels: [f32; 8],
+    sw_channels: [f32; 8],
 }
 
 impl Default for EndpointSoftwareGain {
     fn default() -> Self {
         Self {
-            master: 1.0,
-            muted: false,
-            channels: [1.0; 8],
+            logical_master: 1.0,
+            logical_muted: false,
+            logical_channels: [1.0; 8],
+            sw_master: 1.0,
+            sw_muted: false,
+            sw_channels: [1.0; 8],
         }
     }
 }
@@ -999,8 +1011,17 @@ pub(super) fn endpoint_software_gains(ep_id: &str) -> (f32, [f32; 8]) {
     }
     let map = ENDPOINT_SW_GAINS.lock().unwrap();
     match map.get(ep_id) {
-        Some(g) => (if g.muted { 0.0 } else { g.master }, g.channels),
+        Some(g) => (if g.sw_muted { 0.0 } else { g.sw_master }, g.sw_channels),
         None => (1.0, [1.0; 8]),
+    }
+}
+
+fn read_endpoint_sw_state<R>(ep_id: &str, f: impl FnOnce(&EndpointSoftwareGain) -> R) -> R {
+    let map = ENDPOINT_SW_GAINS.lock().unwrap();
+    if let Some(g) = map.get(ep_id) {
+        f(g)
+    } else {
+        f(&EndpointSoftwareGain::default())
     }
 }
 
@@ -1009,7 +1030,9 @@ fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain
     let entry = map.entry(ep_id.to_string()).or_default();
     f(entry);
     let active = map.values().any(|g| {
-        g.muted || (g.master - 1.0).abs() > 1e-6 || g.channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
+        g.sw_muted
+            || (g.sw_master - 1.0).abs() > 1e-6
+            || g.sw_channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
     });
     ENDPOINT_SW_GAINS_ACTIVE.store(active, Ordering::Release);
 }
@@ -1022,11 +1045,9 @@ pub(super) fn reset_endpoint_software_gains_for_test() {
 
 struct EndpointVolumeState {
     ep: Arc<Endpoint>,
+    channel_count: usize,
     min_db: f32,
     max_db: f32,
-    master_scalar: AtomicU32, // f32 bits
-    channels: Mutex<Vec<f32>>,
-    muted: std::sync::atomic::AtomicBool,
     callbacks: Mutex<Vec<usize>>,
 }
 
@@ -1035,21 +1056,12 @@ impl EndpointVolumeState {
         let is_cap = ep.is_capture();
         let (min_db, max_db) =
             backend::device_volume_range_db(&ep.info, is_cap).unwrap_or((DEFAULT_MIN_DB, DEFAULT_MAX_DB));
-        let master = backend::device_volume_scalar(&ep.info, is_cap).unwrap_or(1.0);
-        let muted = backend::device_mute(&ep.info, is_cap).unwrap_or(false);
-        let ch = ep.mix_format().channels.max(1) as usize;
-        let mut ch_vals = Vec::with_capacity(ch);
-        for i in 0..ch {
-            let v = backend::device_channel_volume_scalar(&ep.info, is_cap, i as u32).unwrap_or(master);
-            ch_vals.push(v);
-        }
+        let channel_count = ep.mix_format().channels.clamp(1, 8) as usize;
         Arc::new(Self {
             ep,
+            channel_count,
             min_db,
             max_db,
-            master_scalar: AtomicU32::new(master.to_bits()),
-            channels: Mutex::new(ch_vals),
-            muted: std::sync::atomic::AtomicBool::new(muted),
             callbacks: Mutex::new(Vec::new()),
         })
     }
@@ -1066,75 +1078,64 @@ impl EndpointVolumeState {
 
     fn current_master_scalar(&self) -> f32 {
         if let Some(v) = backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()) {
-            self.master_scalar.store(v.to_bits(), Ordering::Relaxed);
             v
         } else {
-            f32::from_bits(self.master_scalar.load(Ordering::Relaxed))
+            read_endpoint_sw_state(&self.ep.id, |g| g.logical_master)
         }
     }
 
     fn set_master_scalar(&self, scalar: f32) {
         let s = scalar.clamp(0.0, 1.0);
-        self.master_scalar.store(s.to_bits(), Ordering::Relaxed);
         let hw_ok = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
-        for c in self.channels.lock().unwrap().iter_mut() {
-            *c = s;
-        }
         update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.logical_master = s;
+            g.logical_channels = [s; 8];
             // If CoreAudio hardware applied master volume, avoid double-attenuation in software;
             // otherwise apply the master scalar directly in the software render path.
-            g.master = if hw_ok { 1.0 } else { s };
-            g.channels = [1.0; 8];
+            g.sw_master = if hw_ok { 1.0 } else { s };
+            g.sw_channels = [1.0; 8];
         });
     }
 
     fn current_channel_scalar(&self, ch: usize) -> Option<f32> {
-        let mut chs = self.channels.lock().unwrap();
-        if ch >= chs.len() {
+        if ch >= self.channel_count {
             return None;
         }
         if let Some(v) = backend::device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32) {
-            chs[ch] = v;
             Some(v)
         } else {
-            Some(chs[ch])
+            Some(read_endpoint_sw_state(&self.ep.id, |g| g.logical_channels[ch]))
         }
     }
 
     fn set_channel_scalar(&self, ch: usize, scalar: f32) -> bool {
+        if ch >= self.channel_count {
+            return false;
+        }
         let s = scalar.clamp(0.0, 1.0);
-        {
-            let mut chs = self.channels.lock().unwrap();
-            let Some(slot) = chs.get_mut(ch) else {
-                return false;
-            };
-            *slot = s;
-        }
         let hw_ok = backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32, s);
-        if ch < 8 {
-            update_endpoint_sw_gain(&self.ep.id, |g| {
-                // Apply per-channel attenuation in software whenever CoreAudio HAL does not
-                // expose hardware per-channel volume for this endpoint.
-                g.channels[ch] = if hw_ok { 1.0 } else { s };
-            });
-        }
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.logical_channels[ch] = s;
+            // Apply per-channel attenuation in software whenever CoreAudio HAL does not
+            // expose hardware per-channel volume for this endpoint.
+            g.sw_channels[ch] = if hw_ok { 1.0 } else { s };
+        });
         true
     }
 
     fn current_mute(&self) -> bool {
         if let Some(m) = backend::device_mute(&self.ep.info, self.ep.is_capture()) {
-            self.muted.store(m, Ordering::Relaxed);
             m
         } else {
-            self.muted.load(Ordering::Relaxed)
+            read_endpoint_sw_state(&self.ep.id, |g| g.logical_muted)
         }
     }
 
     fn set_mute(&self, mute: bool) {
-        self.muted.store(mute, Ordering::Relaxed);
         let hw_ok = backend::set_device_mute(&self.ep.info, self.ep.is_capture(), mute);
         update_endpoint_sw_gain(&self.ep.id, |g| {
-            g.muted = if hw_ok { false } else { mute };
+            g.logical_muted = mute;
+            g.sw_muted = if hw_ok { false } else { mute };
         });
     }
 }
@@ -1175,7 +1176,7 @@ mod endpoint_vol {
     }
 
     pub unsafe extern "win64" fn get_channel_count(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
-        let n = EndpointVolumeObj::inner(this).channels.lock().unwrap().len() as u32;
+        let n = EndpointVolumeObj::inner(this).channel_count as u32;
         write_out(out, n)
     }
 

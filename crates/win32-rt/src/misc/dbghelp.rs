@@ -1551,9 +1551,25 @@ fn read_pe_section_rvas(base: u64) -> Vec<u32> {
 }
 
 /// Parse an MSF 7.0 PDB file into a sorted RVA -> (file, line) cache.
-fn parse_pdb_line_cache(pdb_bytes: &[u8], fallback_sec_rvas: &[u32]) -> Option<PdbLineCache> {
+/// When `expected_rsds_id` is `Some((guid, age))`, verifies that the PDB Info Stream (Stream 1)
+/// GUID and age match before accepting the file.
+fn parse_pdb_line_cache(
+    pdb_bytes: &[u8],
+    fallback_sec_rvas: &[u32],
+    expected_rsds_id: Option<([u8; 16], u32)>,
+) -> Option<PdbLineCache> {
     let msf = MsfFile::parse(pdb_bytes)?;
     let pdb_info = msf.read_stream(1)?;
+    if let Some((expected_guid, expected_age)) = expected_rsds_id {
+        if pdb_info.len() < 28 {
+            return None;
+        }
+        let pdb_age = read_le_u32(&pdb_info, 8)?;
+        let pdb_guid = &pdb_info[12..28];
+        if pdb_guid != expected_guid || pdb_age != expected_age {
+            return None;
+        }
+    }
     let names_stream_idx = parse_pdb_names_stream_index(&pdb_info)?;
     let names_stream = msf.read_stream(names_stream_idx)?;
     // `/names` header: Signature(0xEFFEEFFE), HashVersion(4), ByteSize(4), then NUL-terminated strings.
@@ -1729,10 +1745,15 @@ fn parse_pdb_line_cache(pdb_bytes: &[u8], fallback_sec_rvas: &[u32]) -> Option<P
 /// Locate a PDB file on disk for `m` using the PE's CodeView `RSDS` record and `search_path`.
 fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut expected_rsds_id: Option<([u8; 16], u32)> = None;
     let (_, _, cv) = read_pe_debug_metadata(m.base);
     if let Some(ref cv_bytes) = cv {
         // RSDS: 'R','S','D','S'(4), GUID(16), Age(4), NUL-terminated UTF-8 path.
         if cv_bytes.len() > 24 && &cv_bytes[0..4] == b"RSDS" {
+            let mut guid = [0u8; 16];
+            guid.copy_from_slice(&cv_bytes[4..20]);
+            let age = u32::from_le_bytes([cv_bytes[20], cv_bytes[21], cv_bytes[22], cv_bytes[23]]);
+            expected_rsds_id = Some((guid, age));
             let tail = &cv_bytes[24..];
             let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
             let pdb_raw = String::from_utf8_lossy(&tail[..nul]);
@@ -1765,7 +1786,7 @@ fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache>
     let sec_rvas = read_pe_section_rvas(m.base);
     for path in candidates {
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Some(cache) = parse_pdb_line_cache(&bytes, &sec_rvas) {
+            if let Some(cache) = parse_pdb_line_cache(&bytes, &sec_rvas, expected_rsds_id) {
                 return Some(cache);
             }
         }
@@ -2128,14 +2149,24 @@ mod tests {
     /// Build a minimal valid MSF 7.0 PDB containing `/names`, DBI (with 1 module & 1 section
     /// header at RVA 0x1000), and C13 `DEBUG_S_FILECHKSMS` + `DEBUG_S_LINES` entries.
     fn build_minimal_pdb(src_file: &str, seg_offset: u32, line_num: u32) -> Vec<u8> {
+        build_minimal_pdb_with_id(src_file, seg_offset, line_num, [0u8; 16], 1)
+    }
+
+    fn build_minimal_pdb_with_id(
+        src_file: &str,
+        seg_offset: u32,
+        line_num: u32,
+        guid: [u8; 16],
+        age: u32,
+    ) -> Vec<u8> {
         let block_size = 4096usize;
 
         // Stream 1: PDB info stream mapping "/names" -> stream 4
         let mut s1 = Vec::new();
         s1.extend_from_slice(&20000404u32.to_le_bytes()); // Version
         s1.extend_from_slice(&0u32.to_le_bytes()); // Sig
-        s1.extend_from_slice(&1u32.to_le_bytes()); // Age
-        s1.extend_from_slice(&[0u8; 16]); // Guid
+        s1.extend_from_slice(&age.to_le_bytes()); // Age
+        s1.extend_from_slice(&guid); // Guid
         let key_str = b"/names\0";
         s1.extend_from_slice(&(key_str.len() as u32).to_le_bytes());
         s1.extend_from_slice(key_str);
@@ -2615,6 +2646,138 @@ mod tests {
             );
             assert_eq!(sf.addr_pc.offset, REMOTE_BASE + 0x800);
             assert_eq!(ctx.gpr[3], 0x1122_3344_5566_7788, "custom reader must restore remote RBX");
+        }
+    }
+
+    #[test]
+    fn sym_get_line_from_addr_verifies_pdb_guid_and_age_against_rsds() {
+        unsafe {
+            let good_guid = [
+                0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC,
+                0xED, 0xFE, 0x0F,
+            ];
+            let stale_guid = [0xAA; 16];
+            let good_age = 3u32;
+
+            // Build a minimal in-memory PE32+ header with an IMAGE_DIRECTORY_ENTRY_DEBUG RSDS record.
+            let mut pe = vec![0u8; 0x600];
+            pe[0..2].copy_from_slice(b"MZ");
+            pe[60..64].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew = 0x80
+            let nt = 0x80usize;
+            pe[nt..nt + 4].copy_from_slice(b"PE\0\0");
+            pe[nt + 24..nt + 26].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+            // NumberOfRvaAndSizes at opt+108 = nt+132
+            pe[nt + 132..nt + 136].copy_from_slice(&16u32.to_le_bytes());
+            // DataDirectory[6] (Debug) at nt + 24 + 112 + 48 = nt + 184
+            pe[nt + 184..nt + 188].copy_from_slice(&0x300u32.to_le_bytes()); // DebugDir RVA
+            pe[nt + 188..nt + 192].copy_from_slice(&28u32.to_le_bytes()); // DebugDir Size
+            // IMAGE_DEBUG_DIRECTORY at RVA 0x300
+            let dbg = 0x300usize;
+            pe[dbg + 12..dbg + 16].copy_from_slice(&2u32.to_le_bytes()); // IMAGE_DEBUG_TYPE_CODEVIEW
+            let rsds_name = b"matchmod.pdb\0";
+            let cv_len = (24 + rsds_name.len()) as u32;
+            pe[dbg + 16..dbg + 20].copy_from_slice(&cv_len.to_le_bytes()); // SizeOfData
+            pe[dbg + 20..dbg + 24].copy_from_slice(&0x400u32.to_le_bytes()); // AddressOfRawData
+            // RSDS record at RVA 0x400
+            let rsds = 0x400usize;
+            pe[rsds..rsds + 4].copy_from_slice(b"RSDS");
+            pe[rsds + 4..rsds + 20].copy_from_slice(&good_guid);
+            pe[rsds + 20..rsds + 24].copy_from_slice(&good_age.to_le_bytes());
+            pe[rsds + 24..rsds + 24 + rsds_name.len()].copy_from_slice(rsds_name);
+
+            let uniq = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir_stale = std::env::temp_dir().join(format!("pf_pdb_stale_{uniq}"));
+            let dir_wrong_age = std::env::temp_dir().join(format!("pf_pdb_age_{uniq}"));
+            let dir_good = std::env::temp_dir().join(format!("pf_pdb_good_{uniq}"));
+            std::fs::create_dir_all(&dir_stale).unwrap();
+            std::fs::create_dir_all(&dir_wrong_age).unwrap();
+            std::fs::create_dir_all(&dir_good).unwrap();
+
+            // dir_stale has wrong GUID, dir_wrong_age has right GUID but wrong age, dir_good matches both.
+            std::fs::write(
+                dir_stale.join("matchmod.pdb"),
+                build_minimal_pdb_with_id("src\\stale.cpp", 0x100, 999, stale_guid, good_age),
+            )
+            .unwrap();
+            std::fs::write(
+                dir_wrong_age.join("matchmod.pdb"),
+                build_minimal_pdb_with_id("src\\oldage.cpp", 0x100, 888, good_guid, good_age + 1),
+            )
+            .unwrap();
+            std::fs::write(
+                dir_good.join("matchmod.pdb"),
+                build_minimal_pdb_with_id("src\\matched.cpp", 0x100, 42, good_guid, good_age),
+            )
+            .unwrap();
+
+            let pe_base = pe.as_ptr() as u64;
+
+            // 1. Search path with stale -> wrong-age -> good must skip mismatched PDBs and find line 42.
+            let proc_ok = 0x7771usize as HANDLE;
+            let sp_ok = std::ffi::CString::new(format!(
+                "{};{};{}",
+                dir_stale.display(),
+                dir_wrong_age.display(),
+                dir_good.display()
+            ))
+            .unwrap();
+            assert_eq!(SymInitialize(proc_ok, sp_ok.as_ptr() as *const u8, FALSE), TRUE);
+            assert_eq!(
+                SymLoadModule64(
+                    proc_ok,
+                    std::ptr::null_mut(),
+                    c"matchmod.dll".as_ptr() as *const u8,
+                    c"matchmod".as_ptr() as *const u8,
+                    pe_base,
+                    0x10000,
+                ),
+                pe_base
+            );
+            let mut line = [0u8; 40];
+            (line.as_mut_ptr() as *mut u32).write_unaligned(40);
+            let mut disp = 0u32;
+            assert_eq!(
+                SymGetLineFromAddr64(proc_ok, pe_base + 0x1100, &mut disp, line.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 42);
+            let fname = (line.as_ptr().add(24) as *const *const u8).read_unaligned();
+            assert_eq!(crate::strings::from_ansi(fname), "src\\matched.cpp");
+            assert_eq!(SymCleanup(proc_ok), TRUE);
+
+            // 2. Search path with ONLY mismatched PDBs must reject them cleanly (ERROR_INVALID_ADDRESS).
+            let proc_bad = 0x7772usize as HANDLE;
+            let sp_bad = std::ffi::CString::new(format!(
+                "{};{}",
+                dir_stale.display(),
+                dir_wrong_age.display()
+            ))
+            .unwrap();
+            assert_eq!(SymInitialize(proc_bad, sp_bad.as_ptr() as *const u8, FALSE), TRUE);
+            assert_eq!(
+                SymLoadModule64(
+                    proc_bad,
+                    std::ptr::null_mut(),
+                    c"matchmod.dll".as_ptr() as *const u8,
+                    c"matchmod".as_ptr() as *const u8,
+                    pe_base,
+                    0x10000,
+                ),
+                pe_base
+            );
+            assert_eq!(
+                SymGetLineFromAddr64(proc_bad, pe_base + 0x1100, &mut disp, line.as_mut_ptr()),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), ERROR_INVALID_ADDRESS);
+            assert_eq!(SymCleanup(proc_bad), TRUE);
+
+            let _ = std::fs::remove_dir_all(&dir_stale);
+            let _ = std::fs::remove_dir_all(&dir_wrong_age);
+            let _ = std::fs::remove_dir_all(&dir_good);
         }
     }
 }

@@ -2043,6 +2043,25 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         assert!((got0 - 0.0).abs() < 1e-6);
         assert!((got1 - 0.5).abs() < 1e-6);
 
+        // A second IAudioEndpointVolume activation on the same endpoint must observe the shared state.
+        let mut epv2: P = std::ptr::null_mut();
+        assert_eq!(
+            call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioEndpointVolume, CLSCTX_ALL, std::ptr::null_mut(), &mut epv2),
+            S_OK
+        );
+        let mut got0_2 = -1.0f32;
+        let mut got1_2 = -1.0f32;
+        assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 0, &mut got0_2), S_OK);
+        assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 1, &mut got1_2), S_OK);
+        assert!((got0_2 - 0.0).abs() < 1e-6);
+        assert!((got1_2 - 0.5).abs() < 1e-6);
+        assert_eq!(call!(epv, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 1, std::ptr::null()), S_OK);
+        let mut muted2 = 0i32;
+        assert_eq!(call!(epv2, 15 /* GetMute */, (*mut i32) -> HRESULT; &mut muted2), S_OK);
+        assert_eq!(muted2, 1, "second activation must observe mute set via first activation");
+        assert_eq!(call!(epv2, 14 /* SetMute */, (i32, *const GUID) -> HRESULT; 0, std::ptr::null()), S_OK);
+        assert_eq!(release(epv2), 0);
+
         // Render (0.8, 0.8) and verify loopback sees (0.0, 0.4) — proving endpoint channel gains
         // actually affect rendered playback rather than sitting in private COM state.
         let render_c = activate_client(d);
