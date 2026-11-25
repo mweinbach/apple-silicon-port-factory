@@ -1478,6 +1478,8 @@ impl Tr<'_> {
             }
         }
         if can_hoist_ret {
+            // Flush any deferred x87 TOP state before preloading return address / RAS into T0..T2.
+            self.flush_x87_top();
             // Start return-address + shadow-RAS loads FIRST so their latency overlaps pops.
             self.a.ldr(64, T0, g(4), ret_off as u32);
             if self.ras_miss != 0 {

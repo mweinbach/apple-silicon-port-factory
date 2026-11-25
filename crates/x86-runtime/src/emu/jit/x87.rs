@@ -314,7 +314,8 @@ impl Tr<'_> {
     }
 
     /// Flush any deferred static x87 TOP / `SW[13:11]` updates into `X87State`.
-    /// Preserves NZCV and `x87_top_known`.
+    /// Preserves `T0..T2` (live across `ret_preloaded` epilogues and helper arg setup),
+    /// `NZCV`, and `x87_top_known`.
     pub(super) fn flush_x87_top(&mut self) {
         if !self.x87_top_dirty && !self.x87_sw_top_dirty {
             return;
@@ -324,7 +325,7 @@ impl Tr<'_> {
             &mut self.a,
             XA,
             XS,
-            T0,
+            T3,
             self.x87_top_known,
             self.x87_top_dirty,
             self.x87_sw_top_dirty,
@@ -334,12 +335,13 @@ impl Tr<'_> {
     }
 
     /// Flush deferred x87 TOP state for a side-exit snapshot without mutating `self`.
+    /// Preserves `T0..T2` and `NZCV`.
     pub(super) fn flush_x87_top_for_exit(&mut self, top_known: Option<u8>, top_dirty: bool, sw_top_dirty: bool) {
         if !top_dirty && !sw_top_dirty {
             return;
         }
         self.load_x87_state();
-        emit_flush_top_raw(&mut self.a, XA, XS, T0, top_known, top_dirty, sw_top_dirty);
+        emit_flush_top_raw(&mut self.a, XA, XS, T3, top_known, top_dirty, sw_top_dirty);
     }
 
     /// Compute physical slot index `p = (top + delta) & 7` into `rd` (32-bit zero-extended),

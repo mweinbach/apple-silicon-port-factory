@@ -131,7 +131,8 @@ void mainCRTStartup(void) {
                     && op.get("kind").unwrap().as_str() == Some(kind)
             })
         };
-        assert!(reports("fld1", "interpreter_only"));
+        assert!(!reports("fld1", "interpreter_only"));
+        assert!(!reports("fld1", "unimplemented"));
         assert!(reports("cvtpi2ps", "interpreter_only"));
         assert_eq!(reports("rdpkru", "unimplemented"), abort);
         let aot = dir.join(format!("{name}-aot"));

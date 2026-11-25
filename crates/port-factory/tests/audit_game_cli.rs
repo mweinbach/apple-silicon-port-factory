@@ -470,7 +470,8 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
     let instructions = [
         0x48, 0x8b, 0x00, // mov rax,[rax] lowers
         0x64, 0x48, 0x8b, 0x00, // same Code, FS address falls back
-        0xd9, 0xe8, // fld1, generic x87
+        0xd9, 0xe8, // fld1 lowers to native ARM64 x87
+        0x0f, 0x2a, 0xc0, // cvtpi2ps xmm0,mm0: generic interpreter-only
         0x0f, 0x01, 0xee, // rdpkru, exit 86 if reached
         0xc4, 0xe2, 0x71, 0x90, 0x04, 0x90, // vpgatherdd: generic AVX2 gather handler
         0xcc, 0x0f, 0x0b, 0xc3, // guest traps and ret
@@ -515,8 +516,13 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
     };
     assert_eq!(op("mov").get("count").unwrap().as_u64(), Some(1));
     assert_eq!(op("mov").get("first_rva").unwrap().as_u64(), Some(0x1003));
+    assert!(
+        !ins.iter()
+            .any(|x| x.get("mnemonic").unwrap().as_str() == Some("fld1")),
+        "fld1 now lowers to native ARM64"
+    );
     assert_eq!(
-        op("fld1").get("kind").unwrap().as_str(),
+        op("cvtpi2ps").get("kind").unwrap().as_str(),
         Some("interpreter_only")
     );
     assert_eq!(
