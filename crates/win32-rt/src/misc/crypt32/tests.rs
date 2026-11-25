@@ -2286,13 +2286,16 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
         );
         crate::kernel32::memory::LocalFree(oct_out as *mut c_void);
 
+        // Verify Windows SDK numeric identifiers directly (wincrypt.h):
+        // 35 = X509_CRL_DIST_POINTS, 38 = X509_MULTI_BYTE_UINT, 48 = PKCS_ATTRIBUTES
+        assert_eq!(X509_MULTI_BYTE_UINT, 38);
         let uint_der = encode_der_tlv(0x02, &[0x00, 0xAB, 0xCD]);
         let mut uint_out: *mut CryptDataBlob = std::ptr::null_mut();
         let mut uint_len = 0u32;
         assert_eq!(
             CryptDecodeObjectEx(
                 X509_ASN_ENCODING,
-                X509_MULTI_BYTE_UINT as *const u8,
+                38 as *const u8, // X509_MULTI_BYTE_UINT
                 uint_der.as_ptr(),
                 uint_der.len() as u32,
                 0x8000,
@@ -2307,6 +2310,29 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             &[0xCD, 0xAB]
         );
         crate::kernel32::memory::LocalFree(uint_out as *mut c_void);
+
+        let cdp_uri = encode_der_tlv(0x86, b"http://crl.example.com/root.crl");
+        let cdp_der = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(0x30, &encode_der_tlv(0xA0, &encode_der_tlv(0xA0, &cdp_uri))),
+        );
+        let mut cdp_out: *mut u8 = std::ptr::null_mut();
+        let mut cdp_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                35 as *const u8, // X509_CRL_DIST_POINTS
+                cdp_der.as_ptr(),
+                cdp_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut cdp_out as *mut _ as *mut c_void,
+                &mut cdp_len,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned(cdp_out as *const u32), 1);
+        crate::kernel32::memory::LocalFree(cdp_out as *mut c_void);
 
         let oid_der = encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
         let mut oid_out: *mut *const u8 = std::ptr::null_mut();
@@ -2385,7 +2411,7 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
         assert_eq!(u32::from_le_bytes(capi_blob[8..12].try_into().unwrap()), 0x3141_5352);
         crate::kernel32::memory::LocalFree(spki_out);
 
-        // PKCS_ATTRIBUTES accepts implicit unsigned-attributes tag 0xA1
+        // PKCS_ATTRIBUTES (SDK ID 48) accepts implicit unsigned-attributes tag 0xA1 and round-trips via CryptEncodeObjectEx
         let unauth_attr_item = encode_der_tlv(
             0x30,
             &[
@@ -2400,7 +2426,7 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
         assert_eq!(
             CryptDecodeObjectEx(
                 X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                super::decode::PKCS_ATTRIBUTES as *const u8,
+                48 as *const u8, // PKCS_ATTRIBUTES
                 unauth_attrs_a1.as_ptr(),
                 unauth_attrs_a1.len() as u32,
                 0x8000,
@@ -2411,6 +2437,22 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             TRUE
         );
         assert_eq!(std::ptr::read_unaligned(unauth_out as *const u32), 1);
+        let mut enc_attrs_ptr: *mut u8 = std::ptr::null_mut();
+        let mut enc_attrs_len = 0u32;
+        assert_eq!(
+            CryptEncodeObjectEx(
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                48 as *const u8, // PKCS_ATTRIBUTES
+                unauth_out as *const c_void,
+                0x8000,
+                std::ptr::null(),
+                &mut enc_attrs_ptr as *mut _ as *mut c_void,
+                &mut enc_attrs_len,
+            ),
+            TRUE
+        );
+        assert!(enc_attrs_len > 0 && !enc_attrs_ptr.is_null());
+        crate::kernel32::memory::LocalFree(enc_attrs_ptr as *mut c_void);
         crate::kernel32::memory::LocalFree(unauth_out as *mut c_void);
 
         // Unknown struct type -> ERROR_FILE_NOT_FOUND

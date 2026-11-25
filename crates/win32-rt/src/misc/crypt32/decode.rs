@@ -29,14 +29,14 @@ pub(super) const X509_ENUMERATED: usize = 29;
 pub(super) const X509_AUTHORITY_KEY_ID2: usize = 31;
 pub(super) const X509_AUTHORITY_INFO_ACCESS: usize = 32;
 pub(super) const PKCS_CONTENT_INFO: usize = 33;
+pub(super) const X509_CRL_DIST_POINTS: usize = 35;
 pub(super) const X509_DSS_SIGNATURE: usize = 40;
 pub(super) const PKCS_PRIVATE_KEY_INFO: usize = 44;
 pub(super) const PKCS_ENCRYPTED_PRIVATE_KEY_INFO: usize = 45;
+pub(super) const PKCS_ATTRIBUTES: usize = 48;
 pub(super) const CNG_RSA_PUBLIC_KEY_BLOB: usize = 72;
 pub(super) const X509_ALGORITHM_IDENTIFIER: usize = 74;
 pub(super) const PKCS7_SIGNER_INFO: usize = 500;
-pub(super) const PKCS_ATTRIBUTES: usize = 502;
-const X509_CRL_DIST_POINTS_INTERNAL: usize = 0x1_0001;
 
 pub(super) const CRYPT_DECODE_TO_BE_SIGNED_FLAG: u32 = 0x0000_0002;
 pub(super) const CRYPT_DECODE_NO_SIGNATURE_BYTE_REVERSAL_FLAG: u32 = 0x0000_0008;
@@ -518,7 +518,7 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             "2.5.29.15" => X509_KEY_USAGE,
             "2.5.29.17" | "2.5.29.18" => X509_ALTERNATE_NAME,
             "2.5.29.19" => X509_BASIC_CONSTRAINTS2,
-            "2.5.29.31" => X509_CRL_DIST_POINTS_INTERNAL,
+            "2.5.29.31" => X509_CRL_DIST_POINTS,
             "2.5.29.32" => X509_CERT_POLICIES,
             "2.5.29.35" => X509_AUTHORITY_KEY_ID2,
             "2.5.29.37" => X509_ENHANCED_KEY_USAGE,
@@ -1026,7 +1026,7 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) ->
             }
             Ok(arena)
         }
-        X509_CRL_DIST_POINTS_INTERNAL => {
+        X509_CRL_DIST_POINTS => {
             // CRL_DIST_POINTS_INFO (16B): cDistPoint (u32 @ 0), rgDistPoint (*mut CRL_DIST_POINT @ 8)
             // CRL_DIST_POINT (64B):
             //   DistPointName (24B @ 0: dwDistPointNameChoice u32 @ 0, FullName CertAltNameInfo 16B @ 8)

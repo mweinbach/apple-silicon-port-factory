@@ -1896,11 +1896,12 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_SESSION_INFO, &mut sinfo as *mut _ as *mut c_void), SEC_E_OK);
         assert_eq!(sinfo.dw_flags, 0);
 
-        // ApplyControlToken: SCHANNEL_SESSION + SCHANNEL_ALERT + unknown -> SEC_E_UNSUPPORTED_FUNCTION
+        // ApplyControlToken: SCHANNEL_SESSION -> SEC_E_UNSUPPORTED_FUNCTION (no fake success),
+        // SCHANNEL_ALERT (only WARNING close_notify supported), unknown -> SEC_E_UNSUPPORTED_FUNCTION
         let mut sess_tok = [SCHANNEL_SESSION, 2u32]; // SSL_SESSION_DISABLE_RECONNECTS
         let mut sb_s = SecBuffer { cb_buffer: 8, buffer_type: SECBUFFER_TOKEN, pv_buffer: sess_tok.as_mut_ptr() as *mut c_void };
         let mut sd_s = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sb_s };
-        assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_s as *mut _ as *mut c_void), SEC_E_OK);
+        assert_eq!(ApplyControlToken(&mut cli_ctx as *mut _ as *mut c_void, &mut sd_s as *mut _ as *mut c_void), SEC_E_UNSUPPORTED_FUNCTION);
 
         // Unsupported fatal/warning alerts are honestly rejected instead of emitting close_notify
         let mut fatal_alert = [SCHANNEL_ALERT, 2u32, 42u32]; // FATAL bad_certificate

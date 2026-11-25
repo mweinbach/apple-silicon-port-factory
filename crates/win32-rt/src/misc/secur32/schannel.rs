@@ -401,7 +401,6 @@ struct SchannelContext {
     target_name: String,
     context_req: u32,
     context_attr: u32,
-    session_reconnect_enabled: bool,
     shutdown_pending: bool,
     shutdown_sent: bool,
     pending_shutdown_bytes: Vec<u8>,
@@ -1083,7 +1082,6 @@ pub(super) unsafe fn initialize_security_context_impl(
             target_name: stored_target,
             context_req: f_context_req,
             context_attr: ret_attr,
-            session_reconnect_enabled: true,
             shutdown_pending: false,
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
@@ -1324,7 +1322,6 @@ pub(super) unsafe fn accept_security_context_impl(
             target_name: String::new(),
             context_req: f_context_req,
             context_attr: ret_attr,
-            session_reconnect_enabled: true,
             shutdown_pending: false,
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
@@ -1582,18 +1579,16 @@ pub(super) unsafe fn apply_control_token_impl(
         }
         Some(SCHANNEL_SESSION) => {
             // SCHANNEL_SESSION_TOKEN { dwTokenType(3), dwFlags(1=enable, 2=disable reconnects) }
+            // Per MSDN this controls TLS session-ID resumption cache invalidation; until per-context
+            // session-cache control is wired into rustls, honestly report SEC_E_UNSUPPORTED_FUNCTION
+            // rather than claiming success without disabling reconnections.
             let Some(flags) = second_word else {
                 return SEC_E_INVALID_TOKEN;
             };
             if flags != 1 && flags != 2 {
                 return SEC_E_INVALID_TOKEN;
             }
-            CTXT_TABLE
-                .with_mut(id, |ctx| {
-                    ctx.session_reconnect_enabled = flags == 1;
-                    SEC_E_OK
-                })
-                .unwrap_or(SEC_E_INVALID_HANDLE)
+            SEC_E_UNSUPPORTED_FUNCTION
         }
         other => {
             // Per MSDN: unrecognized Schannel control token types return SEC_E_UNSUPPORTED_FUNCTION.
