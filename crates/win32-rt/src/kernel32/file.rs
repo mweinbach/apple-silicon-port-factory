@@ -2826,21 +2826,27 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
                 return FALSE;
             }
             if class == 5 {
-                let cur_len = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let mut st: libc::stat = std::mem::zeroed();
+                let (cur_len, cur_alloc) = if libc::fstat(f.fd(), &mut st) == 0 {
+                    (st.st_size, (st.st_blocks as i64).saturating_mul(512).max(st.st_size))
+                } else {
+                    let l = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+                    (l, l)
+                };
                 if len < cur_len {
                     // Windows shrinks EndOfFile when AllocationSize is set smaller than EOF.
                     if libc::ftruncate(f.fd(), len) != 0 {
                         set_err(errno_to_win32(last_errno()));
                         return FALSE;
                     }
-                } else if len > cur_len {
+                } else if len > cur_alloc {
                     #[cfg(target_vendor = "apple")]
                     {
                         let mut store = libc::fstore_t {
                             fst_flags: libc::F_ALLOCATECONTIG,
                             fst_posmode: libc::F_PEOFPOSMODE,
                             fst_offset: 0,
-                            fst_length: len - cur_len,
+                            fst_length: len - cur_alloc,
                             fst_bytesalloc: 0,
                         };
                         if libc::fcntl(f.fd(), libc::F_PREALLOCATE, &mut store) == -1 {
@@ -11670,6 +11676,25 @@ mod tests {
             std::ptr::copy_nonoverlapping(new_w.as_ptr() as *const u8, ren.as_mut_ptr().add(20), new_w.len() * 2);
             assert_eq!(SetFileInformationByHandle(h, 22, ren.as_ptr(), ren.len() as u32), TRUE);
             assert!(dir.join("renamed.dat").exists());
+
+            // Class 5: FileAllocationInfo repeated same-size reservation does not grow allocation.
+            let wp = to_wide_z("K:\\prealloc.dat");
+            let hp = CreateFileW(wp.as_ptr(), GENERIC_READ | GENERIC_WRITE, 7, std::ptr::null_mut(), CREATE_ALWAYS, 0x80, std::ptr::null_mut());
+            assert_ne!(hp, INVALID_HANDLE_VALUE);
+            let want_alloc: i64 = 65536;
+            assert_eq!(SetFileInformationByHandle(hp, 5, &want_alloc as *const i64 as *const u8, 8), TRUE);
+            let f_pre = get_file(hp).unwrap();
+            let mut st1: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(f_pre.fd(), &mut st1), 0);
+            let alloc1 = (st1.st_blocks as i64) * 512;
+            assert!(alloc1 >= want_alloc, "first preallocate should reserve >= {want_alloc}, got {alloc1}");
+            assert_eq!(SetFileInformationByHandle(hp, 5, &want_alloc as *const i64 as *const u8, 8), TRUE);
+            let mut st2: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(f_pre.fd(), &mut st2), 0);
+            let alloc2 = (st2.st_blocks as i64) * 512;
+            assert_eq!(alloc2, alloc1, "repeated FileAllocationInfo must not over-allocate");
+            drop(f_pre);
+            crate::kernel32::threads::CloseHandle(hp);
 
             crate::kernel32::threads::CloseHandle(h);
             crate::kernel32::threads::CloseHandle(hd);

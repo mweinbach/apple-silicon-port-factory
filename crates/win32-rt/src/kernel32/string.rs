@@ -3171,27 +3171,48 @@ pub unsafe extern "win64" fn GetTimeFormatW(_lcid: u32, flags: u32, st: *const S
     GetTimeFormatEx(std::ptr::null(), flags, st, fmt, out, cap)
 }
 
-/// Parse a Windows `LOCALE_SGROUPING` string (e.g. `"3;0"` -> `[3]`, `"3;2;0"` -> `[3, 2]`).
+/// Parse a Windows `LOCALE_SGROUPING` string into right-to-left group sizes.
+/// A trailing `0` in the returned slice means "stop grouping remaining leading digits";
+/// no trailing `0` means "repeat the last group size" (matching `LOCALE_SGROUPING` where a
+/// trailing `;0` repeats, while omitting `;0` stops after the listed groups).
 fn parse_locale_grouping(s: &str) -> Vec<usize> {
-    let mut groups = Vec::new();
+    let mut parts: Vec<usize> = Vec::new();
     for part in s.split(';') {
         if let Ok(n) = part.trim().parse::<usize>() {
-            if n == 0 {
-                break;
-            }
-            groups.push(n);
+            parts.push(n);
         }
     }
-    groups
+    if parts.is_empty() || parts[0] == 0 {
+        return Vec::new();
+    }
+    if let Some(z) = parts.iter().position(|&n| n == 0) {
+        // `;0` in LOCALE_SGROUPING repeats the preceding group size.
+        parts.truncate(z);
+        parts
+    } else {
+        // No trailing `;0` in LOCALE_SGROUPING: stop grouping remaining leading digits.
+        parts.push(0);
+        parts
+    }
 }
 
-/// Decode Windows `NUMBERFMTW.Grouping` integer (e.g. `3` -> `[3]`, `32` -> `[3, 2]`, `0` -> `[]`).
+/// Decode Windows `NUMBERFMTW.Grouping` integer into right-to-left group sizes:
+/// `0` -> `[]`, `3` -> `[3]` (repeat 3), `32` -> `[3, 2]` (3, then repeat 2),
+/// `30` -> `[3, 0]` (3 once, then stop), `320` -> `[3, 2, 0]` (3, then 2, then stop).
 fn parse_numberfmt_grouping(g: u32) -> Vec<usize> {
     if g == 0 {
         return Vec::new();
     }
     let s = g.to_string();
-    s.bytes().map(|b| (b - b'0') as usize).filter(|&d| d > 0).collect()
+    let mut out = Vec::with_capacity(s.len());
+    for b in s.bytes() {
+        let d = (b - b'0') as usize;
+        out.push(d);
+        if d == 0 {
+            break;
+        }
+    }
+    out
 }
 
 fn format_number_string(
@@ -3273,12 +3294,18 @@ fn format_number_string(
     } else if groups.is_empty() {
         int_trimmed.iter().map(|&d| (b'0' + d) as char).collect()
     } else {
-        // Group digits from right to left using `groups`, repeating the last group size.
+        // Group digits from right to left using `groups`, stopping if a trailing `0` marker
+        // is reached and otherwise repeating the last group size.
         let mut rev_chunks: Vec<String> = Vec::new();
         let mut end = int_trimmed.len();
         let mut gi = 0usize;
         while end > 0 {
             let sz = groups[gi.min(groups.len() - 1)];
+            if sz == 0 {
+                let chunk: String = int_trimmed[..end].iter().map(|&d| (b'0' + d) as char).collect();
+                rev_chunks.push(chunk);
+                break;
+            }
             let start = end.saturating_sub(sz);
             let chunk: String = int_trimmed[start..end].iter().map(|&d| (b'0' + d) as char).collect();
             rev_chunks.push(chunk);
@@ -4303,6 +4330,15 @@ mod tests {
             let v1 = to_wide_z("-1234567.895");
             assert!(GetNumberFormatEx(std::ptr::null(), 0, v1.as_ptr(), &fmt as *const _ as *const c_void, out.as_mut_ptr(), 64) > 0);
             assert_eq!(from_wide(out.as_ptr()), "(12_34_567,90)");
+
+            // Trailing-zero termination marker in NUMBERFMTW.Grouping (30 -> 123456_789; 320 -> 1234_56_789)
+            let v_big = to_wide_z("123456789");
+            let fmt_30 = NumberFmtW { grouping: 30, ..fmt };
+            assert!(GetNumberFormatEx(std::ptr::null(), 0, v_big.as_ptr(), &fmt_30 as *const _ as *const c_void, out.as_mut_ptr(), 64) > 0);
+            assert_eq!(from_wide(out.as_ptr()), "123456_789,00");
+            let fmt_320 = NumberFmtW { grouping: 320, ..fmt };
+            assert!(GetNumberFormatEx(std::ptr::null(), 0, v_big.as_ptr(), &fmt_320 as *const _ as *const c_void, out.as_mut_ptr(), 64) > 0);
+            assert_eq!(from_wide(out.as_ptr()), "1234_56_789,00");
 
             // LeadingZero = 0 omits leading zero for 0.5
             let v2 = to_wide_z("0.5");
