@@ -678,9 +678,14 @@ pub(super) mod apple_trust {
             return RevocationCheckResult::OfflineOrUnknown;
         }
         let root_pool = exclusive_anchors.unwrap_or(extra_anchors);
-        let selected_path = super::resolve_selected_issuer_path(chain_der, root_pool);
+        let selected_path = super::resolve_selected_issuer_path(
+            chain_der,
+            root_pool,
+            exclusive_anchors.is_none(),
+        );
+        let selected_refs: Vec<&[u8]> = selected_path.iter().map(|v| v.as_slice()).collect();
         let (eval_certs, eval_anchors, anchors_only) =
-            revocation_eval_inputs(&selected_path, exclusive_anchors, extra_anchors, end_cert_only);
+            revocation_eval_inputs(&selected_refs, exclusive_anchors, extra_anchors, end_cert_only);
         if eval_certs.is_empty() {
             return RevocationCheckResult::OfflineOrUnknown;
         }
@@ -2020,11 +2025,19 @@ fn resolve_verified_issuer_path(
     root_pool: &[Vec<u8>],
     allow_default_macos: bool,
 ) -> Vec<Vec<u8>> {
+    resolve_verified_issuer_path_status(chain_der, root_pool, allow_default_macos).0
+}
+
+fn resolve_verified_issuer_path_status(
+    chain_der: &[Vec<u8>],
+    root_pool: &[Vec<u8>],
+    allow_default_macos: bool,
+) -> (Vec<Vec<u8>>, bool) {
     let Some(leaf) = chain_der.first() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let Some(leaf_parts) = parse_cert_der_parts(leaf) else {
-        return vec![leaf.clone()];
+        return (vec![leaf.clone()], false);
     };
 
     let excluded_spkis = macos_excluded_root_spkis();
@@ -2156,7 +2169,7 @@ fn resolve_verified_issuer_path(
         &mut visited,
         &mut path,
     ) {
-        return path;
+        return (path, true);
     }
 
     // Untrusted fallback: only emit issuers that chain cryptographically to a genuinely
@@ -2228,77 +2241,59 @@ fn resolve_verified_issuer_path(
         &mut visited,
         &mut path,
     ) {
-        return path;
+        return (path, true);
     }
-    vec![leaf.clone()]
+    (vec![leaf.clone()], false)
 }
 
-/// Resolve the actual certification path `[leaf, intermediate..., optional_root]` starting from
-/// `chain_der[0]`, selecting issuers from `chain_der[1..]` and `root_pool` by cryptographic
-/// signature match (falling back to issuer/subject DN match if no signature-verified issuer
-/// exists in the candidate pool). Unrelated certificates in `hAdditionalStore` are excluded.
-fn resolve_selected_issuer_path<'a>(
-    chain_der: &'a [Vec<u8>],
-    root_pool: &'a [Vec<u8>],
-) -> Vec<&'a [u8]> {
+/// Resolve the certification path `[leaf, intermediate..., optional_root]` starting from
+/// `chain_der[0]` for evaluating `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`,
+/// `pStrongSignPara`), `CERT_CHAIN_POLICY_BASIC_CONSTRAINTS`, and revocation inputs.
+///
+/// Always uses the fully authenticated end-to-end path from [`resolve_verified_issuer_path_status`]
+/// whenever one exists (either to a trusted root or to a cryptographically self-signed root),
+/// so a same-SPKI cloned intermediate or root in `hAdditionalStore` with attacker-chosen
+/// EKU/policy/BasicConstraints extensions can never shadow the authentic issuer. Only falls back
+/// to DN-only walking when no cryptographically authenticated path exists at all.
+fn resolve_selected_issuer_path(
+    chain_der: &[Vec<u8>],
+    root_pool: &[Vec<u8>],
+    allow_default_macos: bool,
+) -> Vec<Vec<u8>> {
     let Some(leaf) = chain_der.first() else {
         return Vec::new();
     };
-    let mut path: Vec<&'a [u8]> = vec![leaf.as_slice()];
+    let (auth_path, is_authenticated) =
+        resolve_verified_issuer_path_status(chain_der, root_pool, allow_default_macos);
+    if is_authenticated {
+        return auth_path;
+    }
+
+    let mut path: Vec<Vec<u8>> = vec![leaf.clone()];
     for _ in 0..16 {
-        let cur = *path.last().unwrap();
-        let Some(cur_parts) = parse_cert_der_parts(cur) else {
+        let cur = path.last().unwrap().clone();
+        let Some(cur_parts) = parse_cert_der_parts(&cur) else {
             break;
         };
-        // Stop at a genuinely self-signed root, while allowing self-issued key-rollover
-        // intermediates (subject == issuer but signed by a distinct parent cert) to keep walking.
         if cur_parts.subject_inner == cur_parts.issuer_inner
-            && verify_cert_sig_with_spki(&cur_parts, cur_parts.spki_alg_inner, cur_parts.spki_key_bits)
+            && cert_signed_by_parts(&cur_parts, &cur_parts)
         {
             break;
         }
-        let find_verified = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
+        let find_dn_only = |pool: &[Vec<u8>]| -> Option<Vec<u8>> {
             for cand in pool {
-                let cand_slice = cand.as_slice();
-                if path.iter().any(|&p| p == cand_slice) {
+                if path.iter().any(|p| p == cand) {
                     continue;
                 }
-                let Some(cp) = parse_cert_der_parts(cand_slice) else {
-                    continue;
-                };
-                if cp.subject_inner == cur_parts.issuer_inner
-                    && verify_cert_sig_with_spki(&cur_parts, cp.spki_alg_inner, cp.spki_key_bits)
-                {
-                    return Some(cand_slice);
-                }
-            }
-            None
-        };
-        let find_dn_only = |pool: &'a [Vec<u8>]| -> Option<&'a [u8]> {
-            for cand in pool {
-                let cand_slice = cand.as_slice();
-                if path.iter().any(|&p| p == cand_slice) {
-                    continue;
-                }
-                let Some(cp) = parse_cert_der_parts(cand_slice) else {
+                let Some(cp) = parse_cert_der_parts(cand) else {
                     continue;
                 };
                 if cp.subject_inner == cur_parts.issuer_inner {
-                    return Some(cand_slice);
+                    return Some(cand.clone());
                 }
             }
             None
         };
-        // Prefer trusted root_pool over untrusted hAdditionalStore candidates so a same-SPKI
-        // forged copy of a trusted root in hAdditionalStore cannot shadow the genuine root.
-        if let Some(root) = find_verified(root_pool) {
-            path.push(root);
-            break;
-        }
-        if let Some(next) = find_verified(&chain_der[1..]) {
-            path.push(next);
-            continue;
-        }
         if let Some(next) = find_dn_only(&chain_der[1..]) {
             path.push(next);
             continue;
@@ -2312,12 +2307,13 @@ fn resolve_selected_issuer_path<'a>(
 }
 
 /// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
-/// against the selected certification path resolved from `chain_der` and `root_pool`.
+/// against the authenticated certification path resolved from `chain_der` and `root_pool`.
 /// Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
 unsafe fn evaluate_cert_chain_para(
     p_chain_para: *const c_void,
     chain_der: &[Vec<u8>],
     root_pool: &[Vec<u8>],
+    allow_default_macos: bool,
 ) -> Result<(u32, u32), u32> {
     if p_chain_para.is_null() {
         return Ok((0, 0));
@@ -2328,7 +2324,7 @@ unsafe fn evaluate_cert_chain_para(
         return Err(err::ERROR_INVALID_PARAMETER);
     }
 
-    let selected_path = resolve_selected_issuer_path(chain_der, root_pool);
+    let selected_path = resolve_selected_issuer_path(chain_der, root_pool, allow_default_macos);
 
     let read_usage_match = |off: usize| -> Result<Option<(u32, Vec<String>)>, u32> {
         let dw_type = std::ptr::read_unaligned(base.add(off) as *const u32);
@@ -2360,7 +2356,7 @@ unsafe fn evaluate_cert_chain_para(
     if let Some((match_type, req_ekus)) = read_usage_match(0x08)? {
         let cert_eku_sets: Vec<Option<Vec<String>>> = selected_path
             .iter()
-            .map(|&der| {
+            .map(|der| {
                 cert_eku_oids(der).and_then(|raw_oids| {
                     if raw_oids.is_empty() {
                         None
@@ -2408,7 +2404,7 @@ unsafe fn evaluate_cert_chain_para(
             // Exclude a trailing self-signed trust-anchor root (trust anchors are not required
             // to carry certificatePolicies per RFC 5280 §6.1).
             let non_root_len = if selected_path.len() > 1 {
-                let last = *selected_path.last().unwrap();
+                let last = selected_path.last().unwrap().as_slice();
                 if parse_cert_der_parts(last).is_some_and(|p| p.subject_inner == p.issuer_inner) {
                     selected_path.len() - 1
                 } else {
@@ -2422,7 +2418,7 @@ unsafe fn evaluate_cert_chain_para(
             let mut any_policy_inhibited = false;
             let mut has_unsupported_policy_ext = false;
             let mut cert_policy_sets: Vec<Vec<String>> = Vec::with_capacity(non_root_path.len());
-            for &der in non_root_path {
+            for der in non_root_path {
                 if let Some(parts) = parse_cert_der_parts(der) {
                     for (oid, _, _) in &parts.extensions {
                         if *oid == OID_POLICY_MAPPINGS {
@@ -2507,7 +2503,7 @@ unsafe fn evaluate_cert_chain_para(
                 (dw_strong_flags & CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG) != 0;
 
             let mut weak = false;
-            for (idx, &d) in selected_path.iter().enumerate() {
+            for (idx, d) in selected_path.iter().enumerate() {
                 // Only exempt a genuine terminating self-signed trust anchor (last element,
                 // subject == issuer, AND self-signature cryptographically verifies). Self-issued
                 // CA rollover certificates (same subject/issuer DN but signed by a previous CA
@@ -2673,8 +2669,12 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
     let strong_root_pool = exclusive_roots_der
         .as_deref()
         .unwrap_or(&extra_roots_der);
-    let (para_trust_bits, chain_para_error) =
-        match evaluate_cert_chain_para(p_chain_para, &chain_der, strong_root_pool) {
+    let (para_trust_bits, chain_para_error) = match evaluate_cert_chain_para(
+        p_chain_para,
+        &chain_der,
+        strong_root_pool,
+        exclusive_roots_der.is_none(),
+    ) {
         Ok(pair) => pair,
         Err(le) => {
             crate::teb::set_last_error(le);
@@ -2812,15 +2812,16 @@ pub(super) fn cert_free_certificate_chain_impl(chain: *mut c_void) {
 fn evaluate_basic_constraints_policy(
     chain_der: &[Vec<u8>],
     root_pool: &[Vec<u8>],
+    allow_default_macos: bool,
     dw_flags: u32,
 ) -> Option<(u32, i32)> {
     const OID_BC2: &[u8] = &[0x55, 0x1D, 0x13];
     const OID_BC1: &[u8] = &[0x55, 0x1D, 0x0A];
     let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
     let require_ee_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
-    let selected_path = resolve_selected_issuer_path(chain_der, root_pool);
+    let selected_path = resolve_selected_issuer_path(chain_der, root_pool, allow_default_macos);
     let mut non_self_issued_below = 0usize;
-    for (idx, &der) in selected_path.iter().enumerate() {
+    for (idx, der) in selected_path.iter().enumerate() {
         let Some(parts) = parse_cert_der_parts(der) else {
             continue;
         };
@@ -3247,7 +3248,13 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         }
         CERT_CHAIN_POLICY_BASIC_CONSTRAINTS => {
             let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
-            evaluate_basic_constraints_policy(&chain_der, bc_root_pool, dw_flags).unwrap_or((0, -1))
+            evaluate_basic_constraints_policy(
+                &chain_der,
+                bc_root_pool,
+                exclusive_roots.is_none(),
+                dw_flags,
+            )
+            .unwrap_or((0, -1))
         }
         CERT_CHAIN_POLICY_NT_AUTH => {
             const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
@@ -3267,8 +3274,12 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                             })
                     });
             let bc_root_pool = exclusive_roots.as_deref().unwrap_or(&extra_roots);
-            let bc_violation =
-                evaluate_basic_constraints_policy(&chain_der, bc_root_pool, dw_flags);
+            let bc_violation = evaluate_basic_constraints_policy(
+                &chain_der,
+                bc_root_pool,
+                exclusive_roots.is_none(),
+                dw_flags,
+            );
             let verified_endpoints = verify_chain_to_root(
                 &chain_der,
                 exclusive_roots.as_deref(),
