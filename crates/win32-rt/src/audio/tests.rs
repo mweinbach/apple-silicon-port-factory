@@ -2089,21 +2089,32 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         let e = enumerator();
         let d = default_device(e);
 
-        // Activate IAudioEndpointVolume and set channel 0 -> 0.0 (silence) and channel 1 -> 0.5.
+        // Activate IAudioEndpointVolume. First set master to -6.0206 dB (exact 0.5 amplitude),
+        // then re-set channel 1 to the exact scalar its getter already reports (must NOT double-attenuate),
+        // and set channel 0 to 0.0 (silence).
+        const MINUS_6DB: f32 = -6.020_6;
         let mut epv: P = std::ptr::null_mut();
         assert_eq!(
             call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioEndpointVolume, CLSCTX_ALL, std::ptr::null_mut(), &mut epv),
             S_OK
         );
+        assert_eq!(call_bridge_f32_guid(epv, 6 /* SetMasterVolumeLevel */, MINUS_6DB, std::ptr::null()), S_OK);
+        let mut master_db = 0.0f32;
+        assert_eq!(call!(epv, 8 /* GetMasterVolumeLevel */, (*mut f32) -> HRESULT; &mut master_db), S_OK);
+        assert!((master_db - MINUS_6DB).abs() < 1e-3, "GetMasterVolumeLevel={master_db}");
+        let mut ch1_reported_scalar = -1.0f32;
+        assert_eq!(call!(epv, 13 /* GetChannelVolumeLevelScalar */, (u32, *mut f32) -> HRESULT; 1, &mut ch1_reported_scalar), S_OK);
+        // Re-applying channel 1's reported scalar must keep channel 1 at -6.0206 dB (0.5 amplitude),
+        // NOT multiply master and channel gains into 0.25!
+        assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 1, ch1_reported_scalar, std::ptr::null()), S_OK);
         assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 0, 0.0f32, std::ptr::null()), S_OK);
-        assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 1, 0.5f32, std::ptr::null()), S_OK);
 
         let mut got0 = -1.0f32;
         let mut got1 = -1.0f32;
         assert_eq!(call!(epv, 13 /* GetChannelVolumeLevelScalar */, (u32, *mut f32) -> HRESULT; 0, &mut got0), S_OK);
         assert_eq!(call!(epv, 13 /* GetChannelVolumeLevelScalar */, (u32, *mut f32) -> HRESULT; 1, &mut got1), S_OK);
         assert!((got0 - 0.0).abs() < 1e-6);
-        assert!((got1 - 0.5).abs() < 1e-6);
+        assert!((got1 - ch1_reported_scalar).abs() < 1e-6);
 
         // A second IAudioEndpointVolume activation on the same endpoint must observe the shared state
         // and receive IAudioEndpointVolumeCallback::OnNotify with the caller's event-context GUID.
@@ -2186,7 +2197,7 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 0, &mut got0_2), S_OK);
         assert_eq!(call!(epv2, 13, (u32, *mut f32) -> HRESULT; 1, &mut got1_2), S_OK);
         assert!((got0_2 - 0.0).abs() < 1e-6);
-        assert!((got1_2 - 0.5).abs() < 1e-6);
+        assert!((got1_2 - ch1_reported_scalar).abs() < 1e-6);
         // Arm re-entrant unregistration during dispatch: callback refcount must stay >= 2
         // throughout `OnNotify` and drop back to 1 once dispatch completes.
         cb_obj.epv_to_unregister = epv2;
@@ -2194,7 +2205,7 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         assert_eq!(cb_obj.calls, 1, "OnNotify must fire when mute changes on another activation");
         assert_eq!(cb_obj.last_guid, ctx_guid);
         assert_eq!(cb_obj.last_muted, 1);
-        assert!((cb_obj.last_ch1 - 0.5).abs() < 1e-6);
+        assert!((cb_obj.last_ch1 - ch1_reported_scalar).abs() < 1e-6);
         assert_eq!(
             cb_obj.refs_after_reentrant_unregister, 2,
             "in-flight dispatch must retain callback COM ref until OnNotify returns"
@@ -2242,7 +2253,20 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
         let got = wait_loopback_live_f32(cc, 32, 2);
         assert_eq!(got.len(), 32 * 2);
         assert!(got[0].abs() < 1e-5, "channel 0 must be silenced by SetChannelVolumeLevelScalar(0, 0.0), got {}", got[0]);
-        assert!((got[1] - 0.4).abs() < 1e-4, "channel 1 must be attenuated to 0.4, got {}", got[1]);
+        assert!((got[1] - 0.4).abs() < 1e-3, "channel 1 must be attenuated by -6.0206 dB (0.5x -> 0.4, not double-attenuated or linear scalar), got {}", got[1]);
+
+        // Also verify audio-tapered scalar 0.5 (-32.625 dB -> ~0.023375 amplitude) attenuates via dB, not linear 0.5.
+        assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 1, 0.5f32, std::ptr::null()), S_OK);
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 32, &mut rp), S_OK);
+        std::slice::from_raw_parts_mut(rp as *mut f32, 32 * 2).fill(0.8);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 32, 0), S_OK);
+        let got_taper = wait_loopback_live_f32(cc, 32, 2);
+        let want_taper = 0.8 * 10.0f32.powf(-32.625 / 20.0);
+        assert!(
+            (got_taper[1] - want_taper).abs() < 1e-3,
+            "audio-tapered scalar 0.5 must attenuate by -32.625 dB ({want_taper}), got {}",
+            got_taper[1]
+        );
 
         // Restore master/channel gains to 1.0 so other tests start clean.
         assert_eq!(call_bridge_f32_guid(epv, 7 /* SetMasterVolumeLevelScalar */, 1.0f32, std::ptr::null()), S_OK);

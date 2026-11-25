@@ -1039,15 +1039,18 @@ impl Drop for RegisteredCallback {
 /// `sw_*` fields avoid double-attenuating channels that CoreAudio HAL already controls in hardware.
 #[derive(Clone)]
 struct EndpointSoftwareGain {
-    /// Logical fallback control values (used by getters when CoreAudio HAL lacks that control).
+    /// Logical fallback control values (audio-tapered scalars in `[0.0, 1.0]`, used by getters
+    /// when CoreAudio HAL lacks that control).
     logical_master: f32,
     logical_muted: bool,
     logical_channels: [f32; 8],
-    /// Software master multiplier (`1.0` when hardware HAL already applies master volume).
-    sw_master: f32,
+    /// Linear amplitude gain already applied by CoreAudio HAL master volume, if any.
+    hw_master_gain: Option<f32>,
     /// Software mute (`false` when hardware HAL already applies mute).
     sw_muted: bool,
-    /// Per-channel software multipliers (`1.0` for any channel handled by hardware HAL).
+    /// Per-channel linear amplitude multipliers applied in software (`1.0` when handled by HAL).
+    /// Master software attenuation is folded directly into `sw_channels` so subsequent
+    /// per-channel writes never double-apply master attenuation.
     sw_channels: [f32; 8],
     /// Registered `IAudioEndpointVolumeCallback*` references shared across activations on this endpoint.
     callbacks: Vec<Arc<RegisteredCallback>>,
@@ -1059,7 +1062,7 @@ impl Default for EndpointSoftwareGain {
             logical_master: 1.0,
             logical_muted: false,
             logical_channels: [1.0; 8],
-            sw_master: 1.0,
+            hw_master_gain: None,
             sw_muted: false,
             sw_channels: [1.0; 8],
             callbacks: Vec::new(),
@@ -1071,7 +1074,7 @@ static ENDPOINT_SW_GAINS: std::sync::LazyLock<Mutex<std::collections::HashMap<St
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static ENDPOINT_SW_GAINS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Return `(effective_master_gain, per_channel_gains)` to apply in software on render/spatial
+/// Return `(effective_mute_gain, per_channel_gains)` to apply in software on render/spatial
 /// audio for `ep_id`. Lock-free fast path returns `(1.0, [1.0; 8])` when no software endpoint
 /// gain has been configured.
 pub(super) fn endpoint_software_gains(ep_id: &str) -> (f32, [f32; 8]) {
@@ -1080,7 +1083,7 @@ pub(super) fn endpoint_software_gains(ep_id: &str) -> (f32, [f32; 8]) {
     }
     let map = ENDPOINT_SW_GAINS.lock().unwrap();
     match map.get(ep_id) {
-        Some(g) => (if g.sw_muted { 0.0 } else { g.sw_master }, g.sw_channels),
+        Some(g) => (if g.sw_muted { 0.0 } else { 1.0 }, g.sw_channels),
         None => (1.0, [1.0; 8]),
     }
 }
@@ -1099,9 +1102,7 @@ fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain
     let entry = map.entry(ep_id.to_string()).or_default();
     f(entry);
     let active = map.values().any(|g| {
-        g.sw_muted
-            || (g.sw_master - 1.0).abs() > 1e-6
-            || g.sw_channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
+        g.sw_muted || g.sw_channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
     });
     ENDPOINT_SW_GAINS_ACTIVE.store(active, Ordering::Release);
 }
@@ -1149,6 +1150,17 @@ impl EndpointVolumeState {
         ((db - self.min_db) / span).clamp(0.0, 1.0)
     }
 
+    /// Convert an audio-tapered endpoint scalar `[0.0, 1.0]` to its linear PCM amplitude gain.
+    /// `0.0` silences completely; positive values convert the corresponding dB level via `10^(dB / 20)`.
+    fn scalar_to_amplitude_gain(&self, scalar: f32) -> f32 {
+        let s = scalar.clamp(0.0, 1.0);
+        if s <= 0.0 {
+            0.0
+        } else {
+            10.0f32.powf(self.scalar_to_db(s) / 20.0).max(0.0)
+        }
+    }
+
     fn current_master_scalar(&self) -> f32 {
         if let Some(v) = backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()) {
             v
@@ -1159,14 +1171,15 @@ impl EndpointVolumeState {
 
     fn set_master_scalar(&self, scalar: f32) {
         let s = scalar.clamp(0.0, 1.0);
+        let gain = self.scalar_to_amplitude_gain(s);
         let hw_ok = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
         update_endpoint_sw_gain(&self.ep.id, |g| {
             g.logical_master = s;
             g.logical_channels = [s; 8];
+            g.hw_master_gain = if hw_ok { Some(gain) } else { None };
             // If CoreAudio hardware applied master volume, avoid double-attenuation in software;
-            // otherwise apply the master scalar directly in the software render path.
-            g.sw_master = if hw_ok { 1.0 } else { s };
-            g.sw_channels = [1.0; 8];
+            // otherwise fold the linear amplitude gain directly into each channel slot.
+            g.sw_channels = if hw_ok { [1.0; 8] } else { [gain; 8] };
         });
     }
 
@@ -1186,12 +1199,27 @@ impl EndpointVolumeState {
             return false;
         }
         let s = scalar.clamp(0.0, 1.0);
+        let gain = self.scalar_to_amplitude_gain(s);
         let hw_ok = backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32, s);
+        let n_ch = self.channel_count;
         update_endpoint_sw_gain(&self.ep.id, |g| {
             g.logical_channels[ch] = s;
-            // Apply per-channel attenuation in software whenever CoreAudio HAL does not
-            // expose hardware per-channel volume for this endpoint.
-            g.sw_channels[ch] = if hw_ok { 1.0 } else { s };
+            g.logical_master = g.logical_channels[..n_ch]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            // Compute the channel's software linear gain without double-applying master attenuation.
+            g.sw_channels[ch] = if hw_ok {
+                1.0
+            } else if let Some(hm) = g.hw_master_gain {
+                if hm > 1e-6 {
+                    (gain / hm).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                gain
+            };
         });
         true
     }
