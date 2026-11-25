@@ -1318,6 +1318,15 @@ pub(super) fn schedule_task_dialog_update(f: impl FnOnce() + Send + 'static) {
 
 const NS_CONTROL_STATE_OFF: isize = 0;
 const NS_CONTROL_STATE_ON: isize = 1;
+/// `NSModalResponseAbort`: cleanly terminates `NSAlert::runModal()` when the
+/// owning Win32 thread receives `WM_QUIT` without synthesizing a button click.
+const TASK_DIALOG_ABORT_CODE: isize = -1001;
+
+#[derive(Clone, Copy, Debug)]
+enum DeferredModalStop {
+    Click(usize),
+    Abort,
+}
 
 #[derive(Clone)]
 enum TaskDialogEventSink {
@@ -1341,8 +1350,9 @@ struct ActiveTaskDialogAlert {
     alert: Retained<NSAlert>,
     radio_buttons: Vec<Retained<NSButton>>,
     sink: TaskDialogEventSink,
-    /// Deferred programmatic dismissal received while a nested modal alert was on top.
-    deferred_click_button_idx: Option<usize>,
+    /// Deferred programmatic dismissal or `WM_QUIT` abort received while a nested
+    /// modal alert was on top.
+    deferred_stop: Option<DeferredModalStop>,
 }
 
 thread_local! {
@@ -1377,7 +1387,11 @@ define_class!(
                         .map(|a| a.sink.clone())
                 });
                 if let Some(sink) = sink {
+                    let is_inline = matches!(sink, TaskDialogEventSink::Inline(_));
                     sink.emit(super::TaskDialogEvent::RadioSelected(tag as usize));
+                    if is_inline && sid != 0 && crate::user32::message::has_pending_quit() {
+                        task_dialog_alert_cancel(sid);
+                    }
                 }
             }
         }
@@ -1395,7 +1409,11 @@ define_class!(
                     .map(|a| a.sink.clone())
             });
             if let Some(sink) = sink {
+                let is_inline = matches!(sink, TaskDialogEventSink::Inline(_));
                 sink.emit(super::TaskDialogEvent::VerificationToggled(checked));
+                if is_inline && sid != 0 && crate::user32::message::has_pending_quit() {
+                    task_dialog_alert_cancel(sid);
+                }
             }
         }
     }
@@ -1428,7 +1446,8 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         &mut noop,
         &mut noop_timer,
     )
-    .button_index
+    .map(|r| r.button_index)
+    .unwrap_or(0)
 }
 
 fn apply_live_update_to_alert(
@@ -1466,7 +1485,7 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
             if is_top {
                 Some(1000 + bidx as isize)
             } else {
-                active.deferred_click_button_idx = Some(bidx);
+                active.deferred_stop = Some(DeferredModalStop::Click(bidx));
                 None
             }
         } else {
@@ -1489,6 +1508,29 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
     }
 }
 
+/// Abort/unwind an active native modal TaskDialog session (e.g. when the
+/// owning Win32 thread receives `WM_QUIT`).
+pub(super) fn task_dialog_alert_cancel(session_id: u64) {
+    let mtm = mtm();
+    let should_stop = ACTIVE_TASK_DIALOG_ALERTS.with(|stack| {
+        let mut s = stack.borrow_mut();
+        let Some(pos) = s.iter().rposition(|a| a.session_id == session_id) else {
+            return false;
+        };
+        let is_top = pos + 1 == s.len();
+        if is_top {
+            true
+        } else {
+            s[pos].deferred_stop = Some(DeferredModalStop::Abort);
+            false
+        }
+    });
+    if should_stop {
+        let app = NSApplication::sharedApplication(mtm);
+        app.stopModalWithCode(TASK_DIALOG_ABORT_CODE);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_task_dialog_alert(
     session_id: u64,
@@ -1502,7 +1544,16 @@ fn run_task_dialog_alert(
     verification_checked: bool,
     critical: bool,
     sink: TaskDialogEventSink,
-) -> super::TaskDialogAlertResult {
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<super::TaskDialogAlertResult> {
+    if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+        if session_id != 0 {
+            PENDING_TASK_DIALOG_UPDATES.with(|map| {
+                map.borrow_mut().remove(&session_id);
+            });
+        }
+        return None;
+    }
     let mtm = mtm();
     let app = NSApplication::sharedApplication(mtm);
     activate_app(&app);
@@ -1578,16 +1629,20 @@ fn run_task_dialog_alert(
                     s.remove(pos);
                 }
                 s.last_mut()
-                    .and_then(|parent| parent.deferred_click_button_idx.take())
+                    .and_then(|parent| parent.deferred_stop.take())
             });
             if self.session_id != 0 {
                 PENDING_TASK_DIALOG_UPDATES.with(|map| {
                     map.borrow_mut().remove(&self.session_id);
                 });
             }
-            if let Some(bidx) = deferred_parent_stop {
+            if let Some(stop) = deferred_parent_stop {
                 let app = NSApplication::sharedApplication(self.mtm);
-                app.stopModalWithCode(1000 + bidx as isize);
+                let code = match stop {
+                    DeferredModalStop::Click(bidx) => 1000 + bidx as isize,
+                    DeferredModalStop::Abort => TASK_DIALOG_ABORT_CODE,
+                };
+                app.stopModalWithCode(code);
             }
         }
     }
@@ -1597,7 +1652,7 @@ fn run_task_dialog_alert(
             alert: a.clone(),
             radio_buttons: radio_buttons.clone(),
             sink,
-            deferred_click_button_idx: None,
+            deferred_stop: None,
         });
     });
     let _active_guard = ActiveAlertGuard { session_id, mtm };
@@ -1616,11 +1671,18 @@ fn run_task_dialog_alert(
         }
     }
 
+    if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return None;
+    }
+
     let r = if let Some(bidx) = pre_clicked {
         1000 + bidx as isize
     } else {
         a.runModal()
     };
+    if r == TASK_DIALOG_ABORT_CODE || cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return None;
+    }
     // NSAlertFirstButtonReturn = 1000
     let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
     let radio_index = if radio_buttons.is_empty() {
@@ -1640,11 +1702,11 @@ fn run_task_dialog_alert(
         false
     };
     let _keep_target_alive = target;
-    super::TaskDialogAlertResult {
+    Some(super::TaskDialogAlertResult {
         button_index,
         radio_index,
         verified,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1660,8 +1722,9 @@ pub(super) fn task_dialog_alert_channel(
     verification_checked: bool,
     critical: bool,
     tx: std::sync::mpsc::Sender<super::TaskDialogEvent>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let res = run_task_dialog_alert(
+    if let Some(res) = run_task_dialog_alert(
         session_id,
         caption,
         text,
@@ -1673,11 +1736,14 @@ pub(super) fn task_dialog_alert_channel(
         verification_checked,
         critical,
         TaskDialogEventSink::Channel(tx.clone()),
-    );
-    let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+        Some(&cancelled),
+    ) {
+        let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
+    }
 }
 
 struct InlineTimerCtx {
+    session_id: u64,
     origin: *mut std::time::Instant,
     cb: *mut dyn FnMut(u32) -> bool,
 }
@@ -1699,6 +1765,9 @@ extern "C" fn inline_task_dialog_timer_cb(_timer: *mut c_void, info: *mut c_void
     .unwrap_or(false);
     if reset {
         unsafe { *ctx.origin = std::time::Instant::now() };
+    }
+    if ctx.session_id != 0 && crate::user32::message::has_pending_quit() {
+        task_dialog_alert_cancel(ctx.session_id);
     }
 }
 
@@ -1737,7 +1806,7 @@ pub(super) fn task_dialog_alert_inline(
     timer_interval: Option<std::time::Duration>,
     on_event: &mut dyn FnMut(super::TaskDialogEvent),
     on_timer: &mut dyn FnMut(u32) -> bool,
-) -> super::TaskDialogAlertResult {
+) -> Option<super::TaskDialogAlertResult> {
     // SAFETY: ACTIVE_TASK_DIALOG_ALERTS and InlineTimerGuard are both torn down before this returns.
     let cb_ptr: *mut dyn FnMut(super::TaskDialogEvent) =
         unsafe { std::mem::transmute::<&mut dyn FnMut(super::TaskDialogEvent), *mut dyn FnMut(super::TaskDialogEvent)>(on_event) };
@@ -1746,6 +1815,7 @@ pub(super) fn task_dialog_alert_inline(
         let timer_cb_ptr: *mut dyn FnMut(u32) -> bool =
             std::mem::transmute::<&mut dyn FnMut(u32) -> bool, *mut dyn FnMut(u32) -> bool>(on_timer);
         let ctx_box = Box::into_raw(Box::new(InlineTimerCtx {
+            session_id,
             origin: timer_origin as *mut std::time::Instant,
             cb: timer_cb_ptr,
         }));
@@ -1794,6 +1864,7 @@ pub(super) fn task_dialog_alert_inline(
         verification_checked,
         critical,
         TaskDialogEventSink::Inline(cb_ptr),
+        None,
     )
 }
 

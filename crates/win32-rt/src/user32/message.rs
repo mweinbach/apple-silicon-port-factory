@@ -779,6 +779,14 @@ pub unsafe extern "win64" fn PostQuitMessage(code: i32) {
     current_queue().post_quit(code);
 }
 
+/// Returns `true` if a `WM_QUIT` (posted via `PostQuitMessage`) is currently
+/// pending on the calling Win32 thread's message queue, without removing it.
+pub(crate) fn has_pending_quit() -> bool {
+    let q = current_queue();
+    let g = handles::wait_lock();
+    q.st.get(&g).quit.is_some()
+}
+
 /// `SendMessage`: direct call on the owning thread; otherwise queue it to
 /// the owner and wait for the reply while still dispatching messages sent
 /// *to us* (so two threads sending to each other cannot deadlock).

@@ -769,7 +769,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
             map.get_mut(&dialog_hwnd).and_then(|dlg| {
                 dlg.modal_open = false;
-                if let Some(ref res) = presented {
+                if let crate::macos::TaskDialogOutcome::Completed(ref res) = presented {
                     dlg.selected_radio_idx = res.radio_index;
                     if dlg.has_verification {
                         dlg.verified = res.verified;
@@ -778,27 +778,38 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 dlg.pending_click_button.take()
             })
         };
-        let (bid, interactive) = if let Some(res) = presented {
-            let bid = consumed_prog_click.unwrap_or_else(|| {
-                buttons
-                    .get(res.button_index)
-                    .map(|(id, _)| *id)
-                    .unwrap_or(buttons[0].0)
-            });
-            (bid, true)
-        } else if buttons.len() == 1 && !has_selection_controls && !callback_timer {
-            // Pure single-button informational dialog with no selection controls or timer
-            // can dismiss in headless mode (matching MessageBox MB_OK).
-            (buttons[0].0, false)
-        } else {
-            // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
-            // TDF_CALLBACK_TIMER require an interactive desktop so we never fabricate user
-            // selections or silently skip timer callbacks.
-            if callback_timer {
-                log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
+        let (bid, interactive) = match presented {
+            crate::macos::TaskDialogOutcome::Completed(res) => {
+                let bid = consumed_prog_click.unwrap_or_else(|| {
+                    buttons
+                        .get(res.button_index)
+                        .map(|(id, _)| *id)
+                        .unwrap_or(buttons[0].0)
+                });
+                (bid, true)
             }
-            let _ = notify(TDN_DESTROYED, 0);
-            return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
+            crate::macos::TaskDialogOutcome::Quit => {
+                // WM_QUIT arrived on the owning thread: exit the modal loop immediately
+                // without synthesizing a button click, leaving the re-posted WM_QUIT
+                // intact for the application's outer message loop.
+                break 0;
+            }
+            crate::macos::TaskDialogOutcome::Unavailable => {
+                if buttons.len() == 1 && !has_selection_controls && !callback_timer {
+                    // Pure single-button informational dialog with no selection controls or timer
+                    // can dismiss in headless mode (matching MessageBox MB_OK).
+                    (buttons[0].0, false)
+                } else {
+                    // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
+                    // TDF_CALLBACK_TIMER require an interactive desktop so we never fabricate user
+                    // selections or silently skip timer callbacks.
+                    if callback_timer {
+                        log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
+                    }
+                    let _ = notify(TDN_DESTROYED, 0);
+                    return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
+                }
+            }
         };
 
         // Per PFTASKDIALOGCALLBACK: returning S_FALSE from TDN_BUTTON_CLICKED keeps the
@@ -1352,7 +1363,7 @@ mod tests {
                             "intermediate radio click must be delivered live before modal dismissal"
                         );
                         // User clicks "Yes" (idx 0); callback returns S_FALSE so the dialog remains open.
-                        Some(crate::macos::TaskDialogAlertResult {
+                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
                             button_index: 0,
                             radio_index: Some(0),
                             verified: false,
@@ -1363,7 +1374,7 @@ mod tests {
                         assert_eq!(def_rad, Some(0));
                         assert!(!ver_chk);
                         // User clicks "No" (idx 1) with radio 0 (ID 201) and verified = false.
-                        Some(crate::macos::TaskDialogAlertResult {
+                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
                             button_index: 1,
                             radio_index: Some(0),
                             verified: false,
@@ -1561,7 +1572,7 @@ mod tests {
                     assert_eq!(body, "Updated Body");
                     assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
                     assert!(!ver_chk); // updated via TDM_CLICK_VERIFICATION(0)
-                    Some(crate::macos::TaskDialogAlertResult {
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
                         button_index: 0,
                         radio_index: def_rad,
                         verified: ver_chk,
@@ -1694,14 +1705,14 @@ mod tests {
                         // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
                         emit(crate::macos::TaskDialogEvent::RadioSelected(0));
                         // Native modal exits with button_index 0 (IDYES = 6) due to stopModalWithCode.
-                        Some(crate::macos::TaskDialogAlertResult {
+                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
                             button_index: 0,
                             radio_index: Some(0),
                             verified: false,
                         })
                     } else {
                         // Second presentation must be reached (not bypassed by a stale pending click!).
-                        Some(crate::macos::TaskDialogAlertResult {
+                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
                             button_index: 1, // IDNO = 7
                             radio_index: Some(0),
                             verified: false,
@@ -1798,10 +1809,18 @@ mod tests {
                 None,
                 &mut noop,
                 &mut noop_timer,
+                || {},
             );
             worker.join().unwrap();
             crate::macos::set_test_task_dialog_updater(None);
-            assert_eq!(res.map(|r| r.button_index), Some(0));
+            assert_eq!(
+                res,
+                crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                    button_index: 0,
+                    radio_index: None,
+                    verified: false,
+                })
+            );
             assert_eq!(saw_text.lock().unwrap().as_str(), "From Worker Thread");
 
             // 3. TDF_CALLBACK_TIMER: pump_task_dialog_wait_loop delivers periodic TDN_TIMER ticks
@@ -1880,9 +1899,17 @@ mod tests {
                 Some(std::time::Duration::from_millis(20)),
                 &mut noop,
                 &mut on_timer,
+                || {},
             );
             crate::macos::set_test_task_dialog_updater(None);
-            assert_eq!(timer_res.map(|r| r.button_index), Some(0));
+            assert_eq!(
+                timer_res,
+                crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                    button_index: 0,
+                    radio_index: None,
+                    verified: false,
+                })
+            );
             assert_eq!(ticks.len(), 3, "expected 3 timer ticks before dismissal: {ticks:?}");
             assert!(ticks[0] >= 50, "first tick should include initial elapsed time: {ticks:?}");
             assert!(ticks[1] > ticks[0], "second tick should increase without reset: {ticks:?}");
@@ -1916,6 +1943,98 @@ mod tests {
                 ),
                 HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
             );
+
+            // 5. WM_QUIT arriving during pump_task_dialog_wait_loop must dismiss/cancel
+            //    the modal session and preserve the exit code for the outer message loop.
+            let quit_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
+                "#32770_TaskDialog",
+                "QuitWaitTitle",
+                0,
+                task_dialog_wndproc_va(),
+            );
+            let _quit_guard = TaskDialogHwndGuard { hwnd: quit_hwnd };
+            let (_qtx, qrx) = std::sync::mpsc::channel::<crate::macos::TaskDialogEvent>();
+            let mut cancelled = false;
+            let mut q_origin = std::time::Instant::now();
+            let mut quit_timer = |_ms: u32| -> bool {
+                crate::user32::message::PostQuitMessage(-7);
+                false
+            };
+            let quit_outcome = crate::macos::pump_task_dialog_wait_loop(
+                quit_hwnd,
+                qrx,
+                &mut q_origin,
+                Some(std::time::Duration::from_millis(5)),
+                &mut noop,
+                &mut quit_timer,
+                || {
+                    cancelled = true;
+                },
+            );
+            assert_eq!(quit_outcome, crate::macos::TaskDialogOutcome::Quit);
+            assert!(cancelled, "WM_QUIT must invoke on_cancel to unwind the native modal");
+            let mut outer_msg = crate::user32::MSG::default();
+            assert_eq!(
+                crate::user32::message::GetMessageW(&mut outer_msg, std::ptr::null_mut(), 0, 0),
+                FALSE,
+                "outer message loop must still receive WM_QUIT"
+            );
+            assert_eq!(outer_msg.message, crate::user32::wm::QUIT);
+            assert_eq!(outer_msg.wparam as i32, -7);
+
+            // 6. End-to-end TaskDialogIndirect unwinds on WM_QUIT without invoking
+            //    TDN_BUTTON_CLICKED (even if a callback would veto button clicks),
+            //    delivers TDN_DESTROYED, and preserves WM_QUIT for the outer loop.
+            static QUIT_CB_LOG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+            unsafe extern "win64" fn quit_td_cb(
+                _hwnd: HWND,
+                msg: u32,
+                _wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                QUIT_CB_LOG.lock().unwrap().push(msg);
+                if msg == TDN_BUTTON_CLICKED {
+                    return S_FALSE_HR;
+                }
+                S_OK
+            }
+            QUIT_CB_LOG.lock().unwrap().clear();
+            let mut quit_cfg: TaskDialogConfig = std::mem::zeroed();
+            quit_cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            quit_cfg.dw_flags = TDF_CALLBACK_TIMER;
+            quit_cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            quit_cfg.psz_window_title = title_w.as_ptr();
+            quit_cfg.pf_callback = quit_td_cb as *const () as usize;
+
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                |_cap, _body, _btns, _db, _rads, _dr, _vt, _vc, _emit| {
+                    crate::user32::message::PostQuitMessage(77);
+                    crate::macos::TaskDialogOutcome::Quit
+                },
+            )));
+            let mut qbtn = 99;
+            let mut qradio = 99;
+            let mut qver = TRUE;
+            let qhr = TaskDialogIndirect(
+                &quit_cfg as *const TaskDialogConfig as *const u8,
+                &mut qbtn,
+                &mut qradio,
+                &mut qver,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(qhr, S_OK);
+            assert_eq!(qbtn, 0);
+            let qlog = QUIT_CB_LOG.lock().unwrap().clone();
+            assert!(!qlog.contains(&TDN_BUTTON_CLICKED), "WM_QUIT must not synthesize TDN_BUTTON_CLICKED: {qlog:?}");
+            assert!(qlog.contains(&TDN_DESTROYED), "WM_QUIT unwind must deliver TDN_DESTROYED: {qlog:?}");
+            let mut outer_msg2 = crate::user32::MSG::default();
+            assert_eq!(
+                crate::user32::message::GetMessageW(&mut outer_msg2, std::ptr::null_mut(), 0, 0),
+                FALSE
+            );
+            assert_eq!(outer_msg2.message, crate::user32::wm::QUIT);
+            assert_eq!(outer_msg2.wparam as i32, 77);
         })
         .join()
         .unwrap();

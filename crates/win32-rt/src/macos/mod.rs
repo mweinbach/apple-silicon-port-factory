@@ -455,6 +455,19 @@ pub struct TaskDialogAlertResult {
     pub verified: bool,
 }
 
+/// Outcome of presenting a modal TaskDialog alert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskDialogOutcome {
+    /// Interactive dialog was dismissed by a button click or `TDM_CLICK_BUTTON`.
+    Completed(TaskDialogAlertResult),
+    /// The dialog-owning Win32 thread received `WM_QUIT`; the native modal
+    /// session has been cancelled/unwound and `PostQuitMessage` has been
+    /// preserved for the outer message loop.
+    Quit,
+    /// No interactive desktop is available (headless / iOS).
+    Unavailable,
+}
+
 /// Live events emitted by an open interactive TaskDialog alert while its modal
 /// session is running, forwarded to the owning Win32 thread immediately.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,21 +493,29 @@ pub struct TaskDialogLiveUpdate {
 /// `TDF_CALLBACK_TIMER` ticks while waiting for live native modal events on `rx`.
 /// `on_timer` receives elapsed milliseconds since `timer_origin` and returns
 /// `true` to reset `timer_origin` (matching `TDN_TIMER` returning `S_FALSE`).
+///
+/// If `WM_QUIT` arrives on the owning thread while waiting, its exit code is
+/// re-posted via `PostQuitMessage` for the outer message loop, `on_cancel` is
+/// invoked to dismiss/unwind the native modal session, and
+/// [`TaskDialogOutcome::Quit`] is returned.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn pump_task_dialog_wait_loop<F, T>(
+pub(crate) fn pump_task_dialog_wait_loop<F, T, C>(
     dialog_hwnd: usize,
     rx: std::sync::mpsc::Receiver<TaskDialogEvent>,
     timer_origin: &mut std::time::Instant,
     timer_interval: Option<std::time::Duration>,
     on_event: &mut F,
     on_timer: &mut T,
-) -> Option<TaskDialogAlertResult>
+    mut on_cancel: C,
+) -> TaskDialogOutcome
 where
     F: FnMut(TaskDialogEvent),
     T: FnMut(u32) -> bool,
+    C: FnMut(),
 {
     let mut next_tick = timer_interval.map(|iv| std::time::Instant::now() + iv);
     loop {
+        let mut quit_code: Option<i32> = None;
         unsafe {
             let mut msg = crate::user32::MSG::default();
             // PeekMessageW always drains pending cross-thread sent messages first;
@@ -507,8 +528,21 @@ where
                 crate::user32::message::PM_REMOVE,
             ) != 0
             {
+                if msg.message == crate::user32::wm::QUIT {
+                    quit_code = Some(msg.wparam as i32);
+                    break;
+                }
                 crate::user32::message::DispatchMessageW(&msg);
             }
+        }
+        if let Some(code) = quit_code {
+            // Preserve WM_QUIT and its exit code for the outer message loop,
+            // then cancel/unwind the native modal dialog session.
+            unsafe {
+                crate::user32::message::PostQuitMessage(code);
+            }
+            on_cancel();
+            return TaskDialogOutcome::Quit;
         }
         let mut wait = std::time::Duration::from_millis(5);
         if let (Some(interval), Some(due)) = (timer_interval, next_tick) {
@@ -522,8 +556,8 @@ where
                     *timer_origin = std::time::Instant::now();
                 }
                 next_tick = Some(std::time::Instant::now() + interval);
-                // Re-drain any messages sent by the timer callback (e.g. TDM_CLICK_BUTTON)
-                // before sleeping on `rx`.
+                // Re-drain any messages sent by the timer callback (e.g. TDM_CLICK_BUTTON
+                // or PostQuitMessage) before sleeping on `rx`.
                 continue;
             }
             let remaining = due.saturating_duration_since(now);
@@ -532,10 +566,15 @@ where
             }
         }
         match rx.recv_timeout(wait) {
-            Ok(TaskDialogEvent::ButtonClicked(res)) => return Some(res),
+            Ok(TaskDialogEvent::ButtonClicked(res)) => return TaskDialogOutcome::Completed(res),
             Ok(other) => on_event(other),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if crate::user32::message::has_pending_quit() {
+                    return TaskDialogOutcome::Quit;
+                }
+                return TaskDialogOutcome::Unavailable;
+            }
         }
     }
 }
@@ -545,7 +584,8 @@ where
 /// to `on_event` and optional `TDF_CALLBACK_TIMER` ticks to `on_timer` on the
 /// calling Win32 thread while the modal session is open.
 /// Also pumps cross-thread Win32 messages targeting `dialog_hwnd` while waiting.
-/// Returns `None` when headless / on iOS (no interactive selection UI available).
+/// Returns [`TaskDialogOutcome::Unavailable`] when headless / on iOS, or
+/// [`TaskDialogOutcome::Quit`] when the owning thread receives `WM_QUIT`.
 #[allow(clippy::too_many_arguments)]
 pub fn task_dialog_alert<F, T>(
     session_id: u64,
@@ -563,11 +603,14 @@ pub fn task_dialog_alert<F, T>(
     timer_interval: Option<std::time::Duration>,
     mut on_event: F,
     mut on_timer: T,
-) -> Option<TaskDialogAlertResult>
+) -> TaskDialogOutcome
 where
     F: FnMut(TaskDialogEvent),
     T: FnMut(u32) -> bool,
 {
+    if crate::user32::message::has_pending_quit() {
+        return TaskDialogOutcome::Quit;
+    }
     #[cfg(test)]
     {
         if let Some(res) = invoke_test_task_dialog_presenter(
@@ -587,10 +630,10 @@ where
     #[cfg(target_os = "macos")]
     {
         if !active() {
-            return None;
+            return TaskDialogOutcome::Unavailable;
         }
         if is_main_thread() {
-            return Some(appkit::task_dialog_alert_inline(
+            return match appkit::task_dialog_alert_inline(
                 session_id,
                 &caption,
                 &text,
@@ -605,8 +648,13 @@ where
                 timer_interval,
                 &mut on_event,
                 &mut on_timer,
-            ));
+            ) {
+                Some(res) => TaskDialogOutcome::Completed(res),
+                None => TaskDialogOutcome::Quit,
+            };
         }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_main = cancelled.clone();
         let (tx, rx) = std::sync::mpsc::channel::<TaskDialogEvent>();
         appkit::schedule_task_dialog_present(move || {
             appkit::task_dialog_alert_channel(
@@ -621,8 +669,10 @@ where
                 verification_checked,
                 critical,
                 tx,
+                cancelled_main,
             );
         });
+        let cancel_flag = cancelled;
         pump_task_dialog_wait_loop(
             dialog_hwnd,
             rx,
@@ -630,6 +680,12 @@ where
             timer_interval,
             &mut on_event,
             &mut on_timer,
+            move || {
+                cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                appkit::schedule_task_dialog_update(move || {
+                    appkit::task_dialog_alert_cancel(session_id);
+                });
+            },
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -651,7 +707,7 @@ where
             &mut on_event,
             &mut on_timer,
         );
-        None
+        TaskDialogOutcome::Unavailable
     }
 }
 
@@ -825,7 +881,7 @@ pub(crate) type TestTaskDialogPresenter = Box<
         Option<&str>,
         bool,
         &mut dyn FnMut(TaskDialogEvent),
-    ) -> Option<TaskDialogAlertResult>,
+    ) -> TaskDialogOutcome,
 >;
 
 #[cfg(test)]
@@ -861,7 +917,7 @@ fn invoke_test_task_dialog_presenter(
     verification_text: Option<&str>,
     verification_checked: bool,
     on_event: &mut dyn FnMut(TaskDialogEvent),
-) -> Option<Option<TaskDialogAlertResult>> {
+) -> Option<TaskDialogOutcome> {
     TEST_TASK_DIALOG_PRESENTER.with(|cell| {
         cell.borrow_mut().as_mut().map(|f| {
             f(
