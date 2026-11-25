@@ -837,12 +837,47 @@ unsafe extern "win64" fn task_dialog_wndproc(
             0
         }
         TDM_CLICK_BUTTON => {
+            let bid = w_param as i32;
+            let cb_info = {
+                let map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get(&h).map(|dlg| (dlg.pf_callback, dlg.lp_callback_data))
+            };
+            let Some((cb, ref_data)) = cb_info else {
+                return 0;
+            };
+            // Deliver TDN_BUTTON_CLICKED synchronously before SendMessage returns so
+            // callers scoping state around TDM_CLICK_BUTTON (e.g. WinForms TaskDialog.Close)
+            // observe the callback within the send and returning S_FALSE prevents dismissal.
+            let cb_hr = if cb != 0 {
+                crate::call_guest8(
+                    cb,
+                    h as u64,
+                    TDN_BUTTON_CLICKED as u64,
+                    bid as u64,
+                    0,
+                    ref_data as u64,
+                    0,
+                    0,
+                    0,
+                ) as HRESULT
+            } else {
+                S_OK
+            };
+            if cb_hr == S_FALSE_HR {
+                return 0;
+            }
             let push = {
                 let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
                 map.get_mut(&h).and_then(|dlg| {
-                    let bid = w_param as i32;
                     dlg.pending_click_button = Some(bid);
-                    let bidx = dlg.buttons.iter().position(|(id, _)| *id == bid);
+                    // Even if `bid` is not one of the configured buttons (e.g. closing an
+                    // OK-only dialog with IDCANCEL), still stop the open native alert while
+                    // `pending_click_button` preserves the exact button ID returned.
+                    let bidx = dlg
+                        .buttons
+                        .iter()
+                        .position(|(id, _)| *id == bid)
+                        .or_else(|| (!dlg.buttons.is_empty()).then_some(0));
                     dlg.live_update(bidx)
                 })
             };
@@ -1257,11 +1292,9 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         }
 
         if let Some(bid) = snap.programmatic_click {
-            let cb_hr = notify(TDN_BUTTON_CLICKED, bid as u64);
-            if cb_hr != S_FALSE_HR {
-                break bid;
-            }
-            continue;
+            // TDM_CLICK_BUTTON already invoked TDN_BUTTON_CLICKED synchronously and only
+            // records `pending_click_button` when the callback allowed dismissal.
+            break bid;
         }
 
         let labels: Vec<String> = snap.buttons.iter().map(|(_, l)| l.clone()).collect();
@@ -1376,23 +1409,24 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             // intact for the application's outer message loop.
             break 0;
         }
+        if let Some(bid) = consumed_prog_click {
+            // TDM_CLICK_BUTTON already invoked TDN_BUTTON_CLICKED synchronously and
+            // confirmed dismissal; exit without re-notifying the callback.
+            break bid;
+        }
         if matches!(presented, crate::macos::TaskDialogOutcome::Navigated) || navigated_while_open {
             continue;
         }
         let (bid, interactive) = match presented {
             crate::macos::TaskDialogOutcome::Completed(res) => {
-                let bid = consumed_prog_click.unwrap_or_else(|| {
-                    snap.buttons
-                        .get(res.button_index)
-                        .map(|(id, _)| *id)
-                        .unwrap_or(snap.buttons[0].0)
-                });
+                let bid = snap
+                    .buttons
+                    .get(res.button_index)
+                    .map(|(id, _)| *id)
+                    .unwrap_or(snap.buttons[0].0);
                 (bid, true)
             }
-            crate::macos::TaskDialogOutcome::Cancelled { .. } => {
-                let bid = consumed_prog_click.unwrap_or(IDCANCEL);
-                (bid, true)
-            }
+            crate::macos::TaskDialogOutcome::Cancelled { .. } => (IDCANCEL, true),
             crate::macos::TaskDialogOutcome::Navigated | crate::macos::TaskDialogOutcome::Quit => {
                 unreachable!()
             }
@@ -2269,10 +2303,16 @@ mod tests {
     fn task_dialog_consumes_live_programmatic_click_once_and_pumps_cross_thread_messages() {
         let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(|| unsafe {
-            // 1. Live TDM_CLICK_BUTTON from TDN_RADIO_BUTTON_CLICKED whose TDN_BUTTON_CLICKED
-            //    returns S_FALSE must NOT be replayed on the next presentation loop iteration.
+            // 1. Live TDM_CLICK_BUTTON from TDN_RADIO_BUTTON_CLICKED delivers TDN_BUTTON_CLICKED
+            //    synchronously before SendMessageW returns:
+            //    - When TDN_BUTTON_CLICKED returns S_FALSE, the native modal is NOT dismissed.
+            //    - When a caller scopes suppression state around SendMessageW (like WinForms
+            //      TaskDialog.Close), TDN_BUTTON_CLICKED runs while the scope is active and is
+            //      NOT fired again after SendMessageW returns.
             static BUTTON_CLICKS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
             static VETO_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            static IN_SCOPED_CLOSE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             static LIVE_DIALOG_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
             unsafe extern "win64" fn prog_click_cb(
@@ -2285,9 +2325,22 @@ mod tests {
                 if msg == TDN_CREATED {
                     LIVE_DIALOG_HWND.store(hwnd as usize, std::sync::atomic::Ordering::Release);
                 } else if msg == TDN_RADIO_BUTTON_CLICKED && wp == 201 {
+                    let before = BUTTON_CLICKS.lock().unwrap().len();
                     let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_BUTTON, 6, 0);
+                    assert_eq!(
+                        BUTTON_CLICKS.lock().unwrap().len(),
+                        before + 1,
+                        "TDM_CLICK_BUTTON must deliver TDN_BUTTON_CLICKED synchronously before returning"
+                    );
+                } else if msg == TDN_RADIO_BUTTON_CLICKED && wp == 202 {
+                    IN_SCOPED_CLOSE.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_CLICK_BUTTON, IDCANCEL as usize, 0);
+                    IN_SCOPED_CLOSE.store(false, std::sync::atomic::Ordering::SeqCst);
                 } else if msg == TDN_BUTTON_CLICKED {
                     BUTTON_CLICKS.lock().unwrap().push(wp as i32);
+                    if IN_SCOPED_CLOSE.load(std::sync::atomic::Ordering::SeqCst) {
+                        return S_OK;
+                    }
                     if VETO_FIRST.swap(false, std::sync::atomic::Ordering::SeqCst) {
                         return S_FALSE_HR;
                     }
@@ -2311,29 +2364,25 @@ mod tests {
             cfg.n_default_radio_button = 202;
             cfg.pf_callback = prog_click_cb as *const () as usize;
 
+            // 1a. S_FALSE inside TDM_CLICK_BUTTON keeps the modal open (no click_button_idx pushed).
             BUTTON_CLICKS.lock().unwrap().clear();
             VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
-            let mut step = 0usize;
+            IN_SCOPED_CLOSE.store(false, std::sync::atomic::Ordering::SeqCst);
+            let pushed_clicks = std::sync::Arc::new(Mutex::new(Vec::<Option<usize>>::new()));
+            let pushed_clicks_hook = pushed_clicks.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                pushed_clicks_hook.lock().unwrap().push(upd.click_button_idx);
+            })));
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
                 move |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
-                    step += 1;
-                    if step == 1 {
-                        // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
-                        emit(crate::macos::TaskDialogEvent::RadioSelected(0));
-                        // Native modal exits with button_index 0 (IDYES = 6) due to stopModalWithCode.
-                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
-                            button_index: 0,
-                            radio_index: Some(0),
-                            verified: false,
-                        })
-                    } else {
-                        // Second presentation must be reached (not bypassed by a stale pending click!).
-                        crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
-                            button_index: 1, // IDNO = 7
-                            radio_index: Some(0),
-                            verified: false,
-                        })
-                    }
+                    // Triggers TDM_CLICK_BUTTON(6) while modal_open == true; callback vetoes with S_FALSE.
+                    emit(crate::macos::TaskDialogEvent::RadioSelected(0));
+                    // Modal remained open; user subsequently clicks IDNO (index 1).
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 1, // IDNO = 7
+                        radio_index: Some(0),
+                        verified: false,
+                    })
                 },
             )));
             let mut btn = 0;
@@ -2349,8 +2398,56 @@ mod tests {
                 S_OK
             );
             crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
             assert_eq!(btn, 7);
             assert_eq!(BUTTON_CLICKS.lock().unwrap().clone(), vec![6, 7]);
+            assert!(
+                pushed_clicks.lock().unwrap().iter().all(|c| c.is_none()),
+                "vetoed TDM_CLICK_BUTTON must not dismiss the active native modal"
+            );
+
+            // 1b. Scoped WinForms TaskDialog.Close pattern: TDM_CLICK_BUTTON(IDCANCEL) on a
+            //     Yes/No dialog runs TDN_BUTTON_CLICKED synchronously while IN_SCOPED_CLOSE is
+            //     true, dismisses the open modal, returns IDCANCEL, and never re-fires TDN_BUTTON_CLICKED.
+            BUTTON_CLICKS.lock().unwrap().clear();
+            VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
+            let pushed_close = std::sync::Arc::new(Mutex::new(Vec::<Option<usize>>::new()));
+            let pushed_close_hook = pushed_close.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                pushed_close_hook.lock().unwrap().push(upd.click_button_idx);
+            })));
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                    emit(crate::macos::TaskDialogEvent::RadioSelected(1));
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: Some(1),
+                        verified: false,
+                    })
+                },
+            )));
+            let mut close_btn = 0;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &cfg as *const TaskDialogConfig as *const u8,
+                    &mut close_btn,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
+            assert_eq!(close_btn, IDCANCEL);
+            assert_eq!(
+                BUTTON_CLICKS.lock().unwrap().clone(),
+                vec![IDCANCEL],
+                "approved TDM_CLICK_BUTTON must fire TDN_BUTTON_CLICKED once synchronously and never replay"
+            );
+            assert!(
+                pushed_close.lock().unwrap().iter().any(|c| c.is_some()),
+                "approved TDM_CLICK_BUTTON must push click_button_idx to dismiss the native alert"
+            );
 
             // 2. Cross-thread SendMessageW to an open dialog HWND while the owner thread waits
             //    in pump_task_dialog_wait_loop must be processed without deadlocking and push
