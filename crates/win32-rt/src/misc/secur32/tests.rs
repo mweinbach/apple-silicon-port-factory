@@ -4365,3 +4365,399 @@ fn sch_credentials_v5_honors_multiple_alpn_scoped_tls_parameters() {
         crypt32::CertFreeCertificateContext(server_cert);
     }
 }
+
+#[test]
+fn schannel_tls13_preserves_trailing_app_data_across_buffer_too_small() {
+    use super::schannel::{
+        ASC_REQ_CONFIDENTIALITY, ASC_REQ_STREAM, ISC_REQ_MANUAL_CRED_VALIDATION,
+        SECPKG_CRED_INBOUND, SEC_E_BUFFER_TOO_SMALL, SP_PROT_TLS1_3_SERVER,
+    };
+
+    unsafe {
+        let server_cert = crypt32::CertCreateCertificateContext(
+            1,
+            TEST_LEAF_DER.as_ptr(),
+            TEST_LEAF_DER.len() as u32,
+        );
+        assert!(!server_cert.is_null());
+        assert!(crypt32::attach_cert_private_key_pkcs8(
+            server_cert,
+            TEST_LEAF_KEY_PKCS8_DER.to_vec()
+        ));
+        let pa_cred = [server_cert as *const c_void];
+        let pkg = b"Schannel\0";
+
+        let mut srv_cfg = [0u8; 0x50];
+        std::ptr::write_unaligned(srv_cfg.as_mut_ptr() as *mut u32, SCHANNEL_CRED_VERSION);
+        std::ptr::write_unaligned(srv_cfg.as_mut_ptr().add(0x04) as *mut u32, 1u32);
+        std::ptr::write_unaligned(
+            srv_cfg.as_mut_ptr().add(0x08) as *mut *const *const c_void,
+            pa_cred.as_ptr(),
+        );
+        std::ptr::write_unaligned(
+            srv_cfg.as_mut_ptr().add(0x38) as *mut u32,
+            SP_PROT_TLS1_3_SERVER,
+        );
+        let mut srv_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_cfg.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut srv_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        let mut cli_cfg = [0u8; 0x50];
+        std::ptr::write_unaligned(cli_cfg.as_mut_ptr() as *mut u32, SCHANNEL_CRED_VERSION);
+        std::ptr::write_unaligned(
+            cli_cfg.as_mut_ptr().add(0x38) as *mut u32,
+            SP_PROT_TLS1_3_CLIENT,
+        );
+        let mut cli_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_OUTBOUND,
+                std::ptr::null_mut(),
+                cli_cfg.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cli_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        let target = b"test.example.com\0";
+        let cli_req = ISC_REQ_ALLOCATE_MEMORY
+            | ISC_REQ_STREAM
+            | ISC_REQ_CONFIDENTIALITY
+            | ISC_REQ_MANUAL_CRED_VALIDATION;
+        let srv_req = ASC_REQ_STREAM | ASC_REQ_CONFIDENTIALITY; // caller-managed output buffer
+        let mut cli_ctx = SecHandle::default();
+        let mut srv_ctx = SecHandle::default();
+
+        // 1. Client -> ClientHello
+        let mut ob0 = SecBuffer {
+            cb_buffer: 0,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: std::ptr::null_mut(),
+        };
+        let mut od0 = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut ob0,
+        };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cli_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                target.as_ptr(),
+                cli_req,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut od0 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_I_CONTINUE_NEEDED
+        );
+        let mut ch = std::slice::from_raw_parts(ob0.pv_buffer as *const u8, ob0.cb_buffer as usize)
+            .to_vec();
+        FreeContextBuffer(ob0.pv_buffer);
+
+        // 2. Server -> ServerHello + EncryptedExtensions + Cert + CertVerify + Finished
+        let mut s_out1 = vec![0u8; 8192];
+        let mut in1 = [
+            SecBuffer {
+                cb_buffer: ch.len() as u32,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: ch.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut ind1 = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 2,
+            p_buffers: in1.as_mut_ptr(),
+        };
+        let mut ob1 = SecBuffer {
+            cb_buffer: s_out1.len() as u32,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: s_out1.as_mut_ptr() as *mut c_void,
+        };
+        let mut od1 = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut ob1,
+        };
+        let mut attr = 0u32;
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                &mut ind1 as *mut _ as *mut c_void,
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut od1 as *mut _ as *mut c_void,
+                &mut attr,
+                std::ptr::null_mut(),
+            ),
+            SEC_I_CONTINUE_NEEDED
+        );
+        let mut s_flight1 = s_out1[..ob1.cb_buffer as usize].to_vec();
+
+        // 3. Client processes server flight -> completes handshake + emits ClientFinished.
+        let mut cin2 = [
+            SecBuffer {
+                cb_buffer: s_flight1.len() as u32,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: s_flight1.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut cind2 = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 2,
+            p_buffers: cin2.as_mut_ptr(),
+        };
+        let mut cob2 = SecBuffer {
+            cb_buffer: 0,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: std::ptr::null_mut(),
+        };
+        let mut cod2 = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut cob2,
+        };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cli_cred as *mut _ as *mut c_void,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                target.as_ptr(),
+                cli_req,
+                0,
+                0,
+                &mut cind2 as *mut _ as *mut c_void,
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut cod2 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        let c_finished =
+            std::slice::from_raw_parts(cob2.pv_buffer as *const u8, cob2.cb_buffer as usize)
+                .to_vec();
+        FreeContextBuffer(cob2.pv_buffer);
+
+        // 4. Client immediately encrypts its first application-data record and coalesces it
+        //    with ClientFinished into a single TCP buffer!
+        let plaintext = b"TLS 1.3 app data coalesced with Finished";
+        let mut wire =
+            vec![0u8; STREAM_HEADER_SIZE as usize + plaintext.len() + STREAM_TRAILER_SIZE as usize];
+        wire[STREAM_HEADER_SIZE as usize..STREAM_HEADER_SIZE as usize + plaintext.len()]
+            .copy_from_slice(plaintext);
+        let mut ebufs = [
+            SecBuffer {
+                cb_buffer: STREAM_HEADER_SIZE,
+                buffer_type: SECBUFFER_STREAM_HEADER,
+                pv_buffer: wire.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: plaintext.len() as u32,
+                buffer_type: SECBUFFER_DATA,
+                pv_buffer: wire.as_mut_ptr().add(STREAM_HEADER_SIZE as usize) as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: STREAM_TRAILER_SIZE,
+                buffer_type: SECBUFFER_STREAM_TRAILER,
+                pv_buffer: wire
+                    .as_mut_ptr()
+                    .add(STREAM_HEADER_SIZE as usize + plaintext.len())
+                    as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut edesc = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 4,
+            p_buffers: ebufs.as_mut_ptr(),
+        };
+        assert_eq!(
+            EncryptMessage(&mut cli_ctx as *mut _ as *mut c_void, 0, &mut edesc as *mut _ as *mut c_void, 0),
+            SEC_E_OK
+        );
+        let app_rec_len = (ebufs[0].cb_buffer + ebufs[1].cb_buffer + ebufs[2].cb_buffer) as usize;
+        let mut combined = c_finished.clone();
+        combined.extend_from_slice(&wire[..app_rec_len]);
+
+        // 5. Server passes `[ClientFinished || AppData]` with a tiny 8-byte output buffer ->
+        //    AcceptSecurityContext MUST return SEC_E_BUFFER_TOO_SMALL (NewSessionTicket flight
+        //    doesn't fit) while remembering `consumed = c_finished.len()`.
+        let mut tiny_out = [0u8; 8];
+        let mut sin_small = [
+            SecBuffer {
+                cb_buffer: combined.len() as u32,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: combined.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut sind_small = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 2,
+            p_buffers: sin_small.as_mut_ptr(),
+        };
+        let mut sob_small = SecBuffer {
+            cb_buffer: tiny_out.len() as u32,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: tiny_out.as_mut_ptr() as *mut c_void,
+        };
+        let mut sod_small = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut sob_small,
+        };
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sind_small as *mut _ as *mut c_void,
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sod_small as *mut _ as *mut c_void,
+                &mut attr,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_BUFFER_TOO_SMALL
+        );
+
+        // 6. Server retries with the same un-advanced input buffer and a full output buffer ->
+        //    MUST succeed (SEC_E_OK), emit the buffered NewSessionTicket flight, AND report
+        //    SECBUFFER_EXTRA for the trailing encrypted application-data record!
+        let mut big_out = vec![0u8; 8192];
+        let mut sin_retry = [
+            SecBuffer {
+                cb_buffer: combined.len() as u32,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: combined.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut sind_retry = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 2,
+            p_buffers: sin_retry.as_mut_ptr(),
+        };
+        let mut sob_retry = SecBuffer {
+            cb_buffer: big_out.len() as u32,
+            buffer_type: SECBUFFER_TOKEN,
+            pv_buffer: big_out.as_mut_ptr() as *mut c_void,
+        };
+        let mut sod_retry = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 1,
+            p_buffers: &mut sob_retry,
+        };
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sind_retry as *mut _ as *mut c_void,
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sod_retry as *mut _ as *mut c_void,
+                &mut attr,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        assert!(sob_retry.cb_buffer > 0, "buffered TLS 1.3 NewSessionTicket flight must be flushed");
+        assert_eq!(
+            sin_retry[1].buffer_type, SECBUFFER_EXTRA,
+            "unconsumed trailing app data must be reported as SECBUFFER_EXTRA on retry"
+        );
+        assert_eq!(sin_retry[1].cb_buffer as usize, app_rec_len);
+
+        // 7. Decrypt the SECBUFFER_EXTRA slice on the server and verify exact plaintext recovery!
+        let extra_off = combined.len() - sin_retry[1].cb_buffer as usize;
+        let mut dec_buf = combined[extra_off..].to_vec();
+        let mut dbufs = [
+            SecBuffer {
+                cb_buffer: dec_buf.len() as u32,
+                buffer_type: SECBUFFER_DATA,
+                pv_buffer: dec_buf.as_mut_ptr() as *mut c_void,
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+            SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_EMPTY,
+                pv_buffer: std::ptr::null_mut(),
+            },
+        ];
+        let mut ddesc = SecBufferDesc {
+            ul_version: 0,
+            c_buffers: 4,
+            p_buffers: dbufs.as_mut_ptr(),
+        };
+        assert_eq!(
+            DecryptMessage(&mut srv_ctx as *mut _ as *mut c_void, &mut ddesc as *mut _ as *mut c_void, 0, std::ptr::null_mut()),
+            SEC_E_OK
+        );
+        let recovered =
+            std::slice::from_raw_parts(dbufs[1].pv_buffer as *const u8, dbufs[1].cb_buffer as usize);
+        assert_eq!(recovered, plaintext);
+
+        DeleteSecurityContext(&mut cli_ctx as *mut _ as *mut c_void);
+        DeleteSecurityContext(&mut srv_ctx as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut cli_cred as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut srv_cred as *mut _ as *mut c_void);
+        crypt32::CertFreeCertificateContext(server_cert);
+    }
+}

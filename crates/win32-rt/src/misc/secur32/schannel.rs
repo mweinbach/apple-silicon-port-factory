@@ -433,6 +433,7 @@ struct SchannelContext {
     shutdown_sent: bool,
     pending_shutdown_bytes: Vec<u8>,
     pending_handshake_out: Vec<u8>,
+    pending_handshake_consumed: Option<usize>,
     pending_eof: bool,
     pending_plaintext: Vec<u8>,
     client_hello_hs_buf: Vec<u8>,
@@ -1268,6 +1269,26 @@ unsafe fn emit_token_output(
     }
 }
 
+unsafe fn find_input_token(p_input: *mut SecBufferDesc) -> (*const u8, usize) {
+    if p_input.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    let desc = std::ptr::read_unaligned(p_input);
+    if desc.p_buffers.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    for i in 0..desc.c_buffers as usize {
+        let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
+        if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
+            && !sb.pv_buffer.is_null()
+            && sb.cb_buffer > 0
+        {
+            return (sb.pv_buffer as *const u8, sb.cb_buffer as usize);
+        }
+    }
+    (std::ptr::null(), 0)
+}
+
 unsafe fn set_input_aux_buffer(
     p_input: *mut SecBufferDesc,
     buf_type: u32,
@@ -1693,6 +1714,7 @@ pub(super) unsafe fn initialize_security_context_impl(
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
             pending_handshake_out: Vec::new(),
+            pending_handshake_consumed: None,
             pending_eof: false,
             pending_plaintext: Vec::new(),
             client_hello_hs_buf: Vec::new(),
@@ -1750,7 +1772,8 @@ pub(super) unsafe fn initialize_security_context_impl(
             }
 
             // Flush any previously drained handshake flight that failed to fit in an earlier
-            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input.
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input,
+            // preserving any unconsumed trailing input as SECBUFFER_EXTRA on retry.
             if !ctx.pending_handshake_out.is_empty() {
                 if let Err(code) =
                     unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
@@ -1758,6 +1781,20 @@ pub(super) unsafe fn initialize_security_context_impl(
                     return code;
                 }
                 ctx.pending_handshake_out.clear();
+                if let Some(prev_consumed) = ctx.pending_handshake_consumed.take() {
+                    let (tok_ptr, tok_len) = unsafe { find_input_token(p_input) };
+                    if !tok_ptr.is_null() && tok_len > prev_consumed {
+                        let extra = tok_len - prev_consumed;
+                        unsafe {
+                            set_input_aux_buffer(
+                                p_input,
+                                SECBUFFER_EXTRA,
+                                tok_ptr.add(prev_consumed) as *mut c_void,
+                                extra as u32,
+                            );
+                        }
+                    }
+                }
                 if !pf_context_attr.is_null() {
                     unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
                 }
@@ -1769,26 +1806,7 @@ pub(super) unsafe fn initialize_security_context_impl(
             }
 
             // Find SECBUFFER_TOKEN in p_input.
-            let mut token_ptr: *const u8 = std::ptr::null();
-            let mut token_len: usize = 0;
-            if !p_input.is_null() {
-                unsafe {
-                    let desc = std::ptr::read_unaligned(p_input);
-                    if !desc.p_buffers.is_null() {
-                        for i in 0..desc.c_buffers as usize {
-                            let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
-                            if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
-                                && !sb.pv_buffer.is_null()
-                                && sb.cb_buffer > 0
-                            {
-                                token_ptr = sb.pv_buffer as *const u8;
-                                token_len = sb.cb_buffer as usize;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            let (token_ptr, token_len) = unsafe { find_input_token(p_input) };
 
             if token_ptr.is_null() || token_len == 0 {
                 let out = drain_tls_out(&mut ctx.conn);
@@ -1881,6 +1899,7 @@ pub(super) unsafe fn initialize_security_context_impl(
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
                 if !out_bytes.is_empty() {
                     ctx.pending_handshake_out = out_bytes;
+                    ctx.pending_handshake_consumed = Some(consumed);
                 }
                 return code;
             }
@@ -2011,6 +2030,7 @@ pub(super) unsafe fn accept_security_context_impl(
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
             pending_handshake_out: Vec::new(),
+            pending_handshake_consumed: None,
             pending_eof: false,
             pending_plaintext: Vec::new(),
             client_hello_hs_buf: Vec::new(),
@@ -2051,7 +2071,8 @@ pub(super) unsafe fn accept_security_context_impl(
             }
 
             // Flush any previously drained server handshake flight that did not fit in an earlier
-            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input.
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input,
+            // preserving any unconsumed trailing input as SECBUFFER_EXTRA on retry.
             if !ctx.pending_handshake_out.is_empty() {
                 if let Err(code) =
                     unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
@@ -2059,6 +2080,20 @@ pub(super) unsafe fn accept_security_context_impl(
                     return code;
                 }
                 ctx.pending_handshake_out.clear();
+                if let Some(prev_consumed) = ctx.pending_handshake_consumed.take() {
+                    let (tok_ptr, tok_len) = unsafe { find_input_token(p_input) };
+                    if !tok_ptr.is_null() && tok_len > prev_consumed {
+                        let extra = tok_len - prev_consumed;
+                        unsafe {
+                            set_input_aux_buffer(
+                                p_input,
+                                SECBUFFER_EXTRA,
+                                tok_ptr.add(prev_consumed) as *mut c_void,
+                                extra as u32,
+                            );
+                        }
+                    }
+                }
                 if !pf_context_attr.is_null() {
                     unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
                 }
@@ -2069,26 +2104,7 @@ pub(super) unsafe fn accept_security_context_impl(
                 };
             }
 
-            let mut token_ptr: *const u8 = std::ptr::null();
-            let mut token_len: usize = 0;
-            if !p_input.is_null() {
-                unsafe {
-                    let desc = std::ptr::read_unaligned(p_input);
-                    if !desc.p_buffers.is_null() {
-                        for i in 0..desc.c_buffers as usize {
-                            let sb = std::ptr::read_unaligned(desc.p_buffers.add(i));
-                            if (sb.buffer_type & !SECBUFFER_ATTRMASK) == SECBUFFER_TOKEN
-                                && !sb.pv_buffer.is_null()
-                                && sb.cb_buffer > 0
-                            {
-                                token_ptr = sb.pv_buffer as *const u8;
-                                token_len = sb.cb_buffer as usize;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            let (token_ptr, token_len) = unsafe { find_input_token(p_input) };
             if token_ptr.is_null() || token_len == 0 {
                 unsafe {
                     let _ = emit_token_output(p_output, &[], allocate_mem);
@@ -2166,6 +2182,7 @@ pub(super) unsafe fn accept_security_context_impl(
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
                 if !out_bytes.is_empty() {
                     ctx.pending_handshake_out = out_bytes;
+                    ctx.pending_handshake_consumed = Some(consumed);
                 }
                 return code;
             }
