@@ -569,24 +569,76 @@ impl Arm64MemOp {
             | Self::AtomicCasp { elem_bytes, .. } => elem_bytes * 2,
         }
     }
-    unsafe fn effective_addr(self, fault_addr: u64, ss: *const u64) -> Option<usize> {
-        match self {
-            Self::GprPairLoad { rn, imm, elem_bytes, .. }
-            | Self::GprPairStore { rn, imm, elem_bytes, .. }
-            | Self::SimdPairLoad { rn, imm, elem_bytes, .. }
-            | Self::SimdPairStore { rn, imm, elem_bytes, .. } => {
+    /// Recover the instruction's exact starting effective address from `insn` and `ss`,
+    /// verifying that `fault_addr` (`FAR_EL1`) falls within `[ea, ea + total_bytes)`.
+    ///
+    /// This handles Apple Silicon reporting `FAR_EL1` at the second 16 KiB host-page
+    /// boundary when an unaligned single-register or pair access starts on an accessible
+    /// host page and crosses into an adjacent host page kept `PROT_NONE` for a sibling.
+    unsafe fn effective_addr(self, insn: u32, fault_addr: u64, ss: *const u64) -> Option<usize> {
+        let total = self.total_bytes();
+        let ea: usize = match self {
+            Self::GprPairLoad { rn, imm, .. }
+            | Self::GprPairStore { rn, imm, .. }
+            | Self::SimdPairLoad { rn, imm, .. }
+            | Self::SimdPairStore { rn, imm, .. } => {
                 // `ss[0..=30]` are X0..X30, `ss[31]` is SP.
+                (*ss.add(rn)).wrapping_add(imm as u64) as usize
+            }
+            Self::AtomicRmw { .. } | Self::AtomicCas { .. } | Self::AtomicCasp { .. } => {
+                let rn = ((insn >> 5) & 0x1F) as usize;
+                *ss.add(rn) as usize
+            }
+            Self::GprLoad { bytes, .. }
+            | Self::GprStore { bytes, .. }
+            | Self::SimdLoad { bytes, .. }
+            | Self::SimdStore { bytes, .. } => {
+                let rn = ((insn >> 5) & 0x1F) as usize;
                 let base = *ss.add(rn);
-                let ea = base.wrapping_add(imm as u64) as usize;
-                let total = elem_bytes * 2;
-                let f = fault_addr as usize;
-                if f >= ea && f < ea.saturating_add(total) {
-                    Some(ea)
+                // 1. Unsigned 12-bit scaled offset: LDR/STR GPR (0x39) or SIMD&FP (0x3D).
+                if (insn & 0x3B00_0000) == 0x3900_0000 {
+                    let imm12 = ((insn >> 10) & 0xFFF) as u64;
+                    base.wrapping_add(imm12 * (bytes as u64)) as usize
+                }
+                // 2. Register-offset: LDR/STR GPR (0x3820_0800) or SIMD&FP (0x3C20_0800).
+                else if (insn & 0x3B20_0C00) == 0x3820_0800 {
+                    let rm = ((insn >> 16) & 0x1F) as usize;
+                    let raw_rm = if rm == 31 { 0u64 } else { *ss.add(rm) };
+                    let option = (insn >> 13) & 7;
+                    let ext = match option {
+                        0b010 => (raw_rm as u32) as u64,              // UXTW
+                        0b011 | 0b111 => raw_rm,                      // LSL / SXTX
+                        0b110 => (raw_rm as i32) as i64 as u64,       // SXTW
+                        _ => return None,
+                    };
+                    let shift = if ((insn >> 12) & 1) != 0 {
+                        bytes.trailing_zeros()
+                    } else {
+                        0
+                    };
+                    base.wrapping_add(ext.wrapping_shl(shift)) as usize
+                }
+                // 3. Unscaled 9-bit signed offset: LDUR/STUR GPR/SIMD (0x38/0x3C) or LDAPUR/STLUR (0x19).
+                else if (insn & 0x3B20_0C00) == 0x3800_0000 || (insn & 0x3F20_0C00) == 0x1900_0000 {
+                    let simm9 = (((insn >> 12) & 0x1FF) as i32) << 23 >> 23;
+                    base.wrapping_add(simm9 as i64 as u64) as usize
+                }
+                // 4. Plain [Xn] base register: LDAR/LDAPR/STLR.
+                else if (insn & 0x3FFF_FC00) == 0x08DF_FC00
+                    || (insn & 0x3FFF_FC00) == 0x38BF_C000
+                    || (insn & 0x3FFF_FC00) == 0x089F_FC00
+                {
+                    base as usize
                 } else {
-                    None
+                    return None;
                 }
             }
-            _ => Some(fault_addr as usize),
+        };
+        let f = fault_addr as usize;
+        if f >= ea && f < ea.saturating_add(total) {
+            Some(ea)
+        } else {
+            None
         }
     }
 }
@@ -753,7 +805,7 @@ unsafe fn decoded_access_span(fault_addr: u64, pc: u64, esr_is_write: bool, ss: 
     if !op.matches_esr_write(esr_is_write) {
         return None;
     }
-    let ea = op.effective_addr(fault_addr, ss)?;
+    let ea = op.effective_addr(insn, fault_addr, ss)?;
     Some((ea, op.total_bytes(), op.requires_write()))
 }
 
@@ -1188,7 +1240,7 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, esr_is_write: bool, mc: *m
         return false;
     }
     let is_write = op.requires_write();
-    let Some(start_addr) = op.effective_addr(fault_addr, ss) else {
+    let Some(start_addr) = op.effective_addr(insn, fault_addr, ss) else {
         return false;
     };
     let total_bytes = op.total_bytes();
@@ -1880,6 +1932,30 @@ mod tests {
             decode_arm64_mem_op(0x4862_FC44),
             Some(Arm64MemOp::AtomicCasp { rs: 2, rt: 4, elem_bytes: 8 })
         ));
+
+        // Verify effective_addr recovers the true starting address even when FAR_EL1
+        // reports the second 16 KiB host-page boundary on a straddling access.
+        let mut ss = [0u64; 33];
+        ss[2] = 0x1000_3FF8; // base X2 = 8 bytes before 16 KiB boundary 0x1000_4000
+        ss[3] = 0x10;        // index X3
+        let far_boundary = 0x1000_4000u64;
+        unsafe {
+            // LDR Q1, [X2, #0] (0x3DC0_0041) straddling 0x1000_3FF8..0x1000_4007
+            let op_q = decode_arm64_mem_op(0x3DC0_0041).unwrap();
+            assert_eq!(op_q.effective_addr(0x3DC0_0041, far_boundary, ss.as_ptr()), Some(0x1000_3FF8));
+            // LDUR Q1, [X2, #-8] (simm9 = -8 = 0x1F8, base = 0x1000_4000)
+            ss[4] = 0x1000_4000;
+            let ldur_q = 0x3CC0_0000 | (0x1F8 << 12) | (4 << 5) | 1;
+            let op_ur = decode_arm64_mem_op(ldur_q).unwrap();
+            assert_eq!(op_ur.effective_addr(ldur_q, far_boundary, ss.as_ptr()), Some(0x1000_3FF8));
+            // LDR X1, [X4, X3, LSL #0] with X4 = 0x1000_3FEC, X3 = 0x10 -> 0x1000_3FFC (straddles 0x1000_4000)
+            ss[4] = 0x1000_3FEC;
+            let ldr_reg = 0xF860_6800 | (3 << 16) | (4 << 5) | 1;
+            let op_reg = decode_arm64_mem_op(ldr_reg).unwrap();
+            assert_eq!(op_reg.effective_addr(ldr_reg, far_boundary, ss.as_ptr()), Some(0x1000_3FFC));
+            // Reject FAR outside [ea, ea + total_bytes)
+            assert_eq!(op_q.effective_addr(0x3DC0_0041, 0x1000_4010, ss.as_ptr()), None);
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

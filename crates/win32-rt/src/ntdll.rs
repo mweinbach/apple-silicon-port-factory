@@ -207,7 +207,12 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             );
             std::ptr::write_unaligned(out.add(24) as *mut i32, 8); // BasePriority
             std::ptr::write_unaligned(out.add(32) as *mut usize, pid as usize);
-            std::ptr::write_unaligned(out.add(40) as *mut usize, libc::getppid().max(0) as usize);
+            let ppid = if child.is_some() {
+                std::process::id() as usize
+            } else {
+                libc::getppid().max(0) as usize
+            };
+            std::ptr::write_unaligned(out.add(40) as *mut usize, ppid);
             STATUS_SUCCESS
         }
         3 => {
@@ -3548,6 +3553,10 @@ mod tests {
             // Child process queries backed by real ChildProcessObj fields (Basic, ImageFileNameWin32) still succeed.
             assert_eq!(NtQueryInformationProcess(child_h, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_SUCCESS);
             assert_eq!(std::ptr::read_unaligned(buf.as_ptr().add(32) as *const usize), 424242);
+            assert_eq!(
+                std::ptr::read_unaligned(buf.as_ptr().add(40) as *const usize),
+                std::process::id() as usize
+            );
             assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
 
             // 2. NtQueryInformationThread classes: ThreadTimes(1), ThreadAmILastThread(0x0C),

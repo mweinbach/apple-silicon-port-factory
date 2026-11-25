@@ -1829,6 +1829,30 @@ int main(void) {
     CHECK(GetExitCodeThread(worker, &wcode) && wcode == 0, "worker exited cleanly with 0");
     CloseHandle(worker);
     CloseHandle(ready_ev);
+    /* Unaligned 16-byte SIMD load/store crossing a 16 KiB host-page boundary (0x3FF8..0x4007):
+       host page 0 (0x0000..0x3FFF) is fully readable/writable, while host page 1 (0x4000..0x7FFF)
+       has accessible subpage 0 (0x4000..0x4FFF) + PAGE_GUARD sibling subpage 1 (0x5000..0x5FFF).
+       Hardware FAR reports 0x4000, so signals.rs must recover the true starting EA 0x3FF8! */
+    uint8_t *hp2 = (uint8_t *)VirtualAlloc(NULL, 0x8000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(hp2 != NULL, "VirtualAlloc 32 KiB cross-host-page region");
+    CHECK(VirtualProtect(hp2 + 0x5000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "guard hp2+0x5000");
+    LONG hits_before_hp2 = g_guard_hits;
+    __m128i xhp_in = _mm_set_epi32(0x44444444, 0x33333333, 0x22222222, 0x11111111);
+    _mm_storeu_si128((__m128i *)(hp2 + 0x3FF8), xhp_in);
+    __m128i xhp_out = _mm_loadu_si128((const __m128i *)(hp2 + 0x3FF8));
+    uint32_t xhp_lanes[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)xhp_lanes, xhp_out);
+    CHECK(g_guard_hits == hits_before_hp2, "cross-16KiB-boundary SIMD did not trip distant guard at 0x5000");
+    CHECK(xhp_lanes[0] == 0x11111111u && xhp_lanes[1] == 0x22222222u
+          && xhp_lanes[2] == 0x33333333u && xhp_lanes[3] == 0x44444444u,
+          "cross-16KiB-boundary 16-byte SIMD store+load recovered exact EA 0x3FF8");
+    CHECK(*(volatile uint32_t *)(hp2 + 0x3FF8) == 0x11111111u
+          && *(volatile uint32_t *)(hp2 + 0x3FFC) == 0x22222222u
+          && *(volatile uint32_t *)(hp2 + 0x4000) == 0x33333333u
+          && *(volatile uint32_t *)(hp2 + 0x4004) == 0x44444444u,
+          "cross-16KiB-boundary bytes landed at exact offsets 0x3FF8..0x4007");
+    CHECK(VirtualFree(hp2, 0, MEM_RELEASE), "VirtualFree hp2");
+
     CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
     printf("CORPUS_KCORE: page_guard_oneshot ok\n");
 

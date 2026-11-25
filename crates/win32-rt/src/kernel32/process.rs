@@ -1703,7 +1703,6 @@ impl JobMember {
 
 struct JobState {
     basic_limits: [u8; 64],
-    io_counters: [u8; 48],
     process_memory_limit: usize,
     job_memory_limit: usize,
     peak_process_memory: usize,
@@ -1725,7 +1724,6 @@ impl JobState {
     fn new(name: Option<String>) -> Self {
         Self {
             basic_limits: [0u8; 64],
-            io_counters: [0u8; 48],
             process_memory_limit: 0,
             job_memory_limit: 0,
             peak_process_memory: 0,
@@ -2240,22 +2238,16 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             TRUE
         }
         8 => {
-            // JobObjectBasicAndIoAccountingInformation (96 bytes = 48 basic + 48 io)
-            if len < 96 {
-                put_ret(96);
-                set_err(err::ERROR_BAD_LENGTH);
-                return FALSE;
-            }
-            std::ptr::write_bytes(out, 0, 96);
-            std::ptr::write_unaligned(out.add(36) as *mut u32, st.total_processes);
-            std::ptr::write_unaligned(out.add(40) as *mut u32, st.active_count());
-            std::ptr::write_unaligned(out.add(44) as *mut u32, st.total_terminated);
-            std::ptr::copy_nonoverlapping(st.io_counters.as_ptr(), out.add(48), 48);
-            put_ret(96);
-            TRUE
+            // JobObjectBasicAndIoAccountingInformation requires real per-job I/O counters
+            // (ReadOperationCount/WriteOperationCount/TransferCount across all I/O subsystems).
+            // Return an honest unsupported failure rather than fabricated zero I/O counters.
+            put_ret(0);
+            set_err(err::ERROR_NOT_SUPPORTED);
+            FALSE
         }
         9 => {
-            // JobObjectExtendedLimitInformation (144 bytes on x64)
+            // JobObjectExtendedLimitInformation (144 bytes on x64).
+            // Per Microsoft Learn, `IoInfo` (+64..112) is "Reserved for future use" and left zeroed.
             if len < 144 {
                 put_ret(144);
                 set_err(err::ERROR_BAD_LENGTH);
@@ -2263,7 +2255,6 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             }
             std::ptr::write_bytes(out, 0, 144);
             std::ptr::copy_nonoverlapping(st.basic_limits.as_ptr(), out, 64);
-            std::ptr::copy_nonoverlapping(st.io_counters.as_ptr(), out.add(64), 48);
             let self_peak = if st.contains_pid(std::process::id()) {
                 task_memory().1 as usize
             } else {
@@ -3842,9 +3833,8 @@ pub(crate) mod tests {
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(112) as *const usize), 64 * 1024 * 1024);
             assert_eq!(std::ptr::read_unaligned(out_ext.as_ptr().add(120) as *const usize), 128 * 1024 * 1024);
 
-            // Query JobObjectBasicAccountingInformation (class 1) and BasicAndIoAccounting (class 8)
-            // at the exact Windows ABI offsets: +32 TotalPageFaultCount, +36 TotalProcesses,
-            // +40 ActiveProcesses, +44 TotalTerminatedProcesses.
+            // Query JobObjectBasicAccountingInformation (class 1) at the exact Windows ABI offsets:
+            // +32 TotalPageFaultCount, +36 TotalProcesses, +40 ActiveProcesses, +44 TotalTerminatedProcesses.
             let mut acct = [0u8; 48];
             assert_eq!(QueryInformationJobObject(job, 1, acct.as_mut_ptr() as *mut c_void, 48, &mut ret_len), TRUE);
             assert_eq!(ret_len, 48);
@@ -3853,13 +3843,13 @@ pub(crate) mod tests {
             assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(40) as *const u32), 1);
             assert_eq!(std::ptr::read_unaligned(acct.as_ptr().add(44) as *const u32), 0);
 
+            // JobObjectBasicAndIoAccountingInformation (class 8) honestly fails with ERROR_NOT_SUPPORTED
+            // until real per-job I/O accounting is wired.
             let mut acct_io = [0u8; 96];
-            assert_eq!(QueryInformationJobObject(job, 8, acct_io.as_mut_ptr() as *mut c_void, 96, &mut ret_len), TRUE);
-            assert_eq!(ret_len, 96);
-            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(32) as *const u32), 0);
-            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(36) as *const u32), 1);
-            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(40) as *const u32), 1);
-            assert_eq!(std::ptr::read_unaligned(acct_io.as_ptr().add(44) as *const u32), 0);
+            ret_len = 99;
+            assert_eq!(QueryInformationJobObject(job, 8, acct_io.as_mut_ptr() as *mut c_void, 96, &mut ret_len), FALSE);
+            assert_eq!(ret_len, 0);
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
 
             // Query JobObjectBasicProcessIdList (class 3).
             let mut pid_list = [0u8; 32];
