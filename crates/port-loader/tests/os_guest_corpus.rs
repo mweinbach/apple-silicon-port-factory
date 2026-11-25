@@ -1767,6 +1767,24 @@ int main(void) {
           && simd_lanes[2] == 0x55667788u && simd_lanes[3] == 0x11223344u,
           "128-bit SIMD store+load round-trip matched on shared host page");
 
+    /* Atomic LOCK operations (`InterlockedIncrement`, `InterlockedExchangeAdd`, `InterlockedExchange`,
+       `InterlockedCompareExchange`, `InterlockedOr`, `InterlockedAnd`, `InterlockedXor`) on accessible
+       subpage 0 while sibling subpages 1..3 remain PAGE_GUARD MUST complete atomically! */
+    volatile LONG *atm = (volatile LONG *)(gp + 0xA0);
+    *atm = 10;
+    CHECK(InterlockedIncrement(atm) == 11, "LOCK INC on shared guarded host page");
+    CHECK(InterlockedExchangeAdd(atm, 5) == 11 && *atm == 16, "LOCK XADD on shared guarded host page");
+    CHECK(InterlockedCompareExchange(atm, 42, 16) == 16 && *atm == 42, "LOCK CMPXCHG match on shared guarded host page");
+    CHECK(InterlockedCompareExchange(atm, 99, 16) == 42 && *atm == 42, "LOCK CMPXCHG mismatch on shared guarded host page");
+    CHECK(InterlockedExchange(atm, 0x0F) == 42 && *atm == 0x0F, "XCHG on shared guarded host page");
+    InterlockedOr(atm, 0xF0);
+    CHECK(*atm == 0xFF, "LOCK OR on shared guarded host page");
+    InterlockedAnd(atm, 0x3C);
+    CHECK(*atm == 0x3C, "LOCK AND on shared guarded host page");
+    InterlockedXor(atm, 0x0F);
+    CHECK(*atm == 0x33, "LOCK XOR on shared guarded host page");
+    CHECK(g_guard_hits == 1, "atomic ops on subpage 0 did not trip sibling guards");
+
     /* Unaligned 16-byte SIMD store at offset 0xFF8 (spanning accessible subpage 0 and
        guarded subpage 1) MUST fire STATUS_GUARD_PAGE_VIOLATION at gp + 0x1000 and then
        complete all 16 bytes across the boundary! */
@@ -1862,6 +1880,29 @@ int main(void) {
     CHECK(g_guard_hits == 1, "sibling subpage 1 in write-watch page remained guarded");
     CHECK(*(volatile uint32_t *)(ww + 0x1020) == 0x12345678u, "sibling write landed after guard");
     RemoveVectoredExceptionHandler(veh);
+
+    /* Write-watch with PAGE_READONLY on subpage 0 and PAGE_READWRITE on subpage 1:
+       ResetWriteWatch and GetWriteWatch(WRITE_WATCH_FLAG_RESET) MUST strip host write
+       permission even though subpage 0 is read-only so subsequent writes to subpage 1
+       are still recorded dirty! */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch before mixed-RO test");
+    CHECK(VirtualProtect(ww + gran * 1, 0x1000, PAGE_READONLY, &old_prot), "subpage 0 PAGE_READONLY in write-watch page");
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1020) = 0x11112222u;
+    count = 32;
+    CHECK(GetWriteWatch(WRITE_WATCH_FLAG_RESET, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch RESET mixed-RO #1");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #1 recorded dirty");
+    /* Second write to writable sibling subpage 1 after RESET MUST trap again! */
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1024) = 0x33334444u;
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch mixed-RO #2");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #2 recorded dirty after GetWriteWatch RESET");
+    /* Same check via ResetWriteWatch! */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch mixed-RO");
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1028) = 0x55556666u;
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch mixed-RO #3");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #3 recorded dirty after ResetWriteWatch");
+    CHECK(VirtualProtect(ww + gran * 1, 0x1000, PAGE_READWRITE, &old_prot), "restore subpage 0 PAGE_READWRITE");
 
     /* ResetWriteWatch clears dirty state and re-arms write traps. */
     CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch");

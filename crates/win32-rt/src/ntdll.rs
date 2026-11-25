@@ -560,15 +560,6 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             std::ptr::write_unaligned(out as *mut u32, (live <= 1) as u32);
             STATUS_SUCCESS
         }
-        0x10 => {
-            // ThreadIsIoPending (4 bytes)
-            put_ret(4);
-            if len < 4 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_unaligned(out as *mut u32, 0);
-            STATUS_SUCCESS
-        }
         0x11 => {
             // ThreadHideFromDebugger (1 byte)
             put_ret(1);
@@ -3530,8 +3521,10 @@ mod tests {
             assert_eq!(ret, 4);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x1E, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
             assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
-            // ThreadActualBasePriority (0x19) and 0x0D are not misrouted.
+            // ThreadActualBasePriority (0x19), 0x0D, and unimplemented ThreadIsIoPending (0x10)
+            // return honest STATUS_INVALID_INFO_CLASS rather than misrouting or fabricating 0.
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0D, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x10, buf.as_mut_ptr(), 4, &mut ret), STATUS_INVALID_INFO_CLASS);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x19, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
             let mut hidden = 99u8;
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x11, &mut hidden, 1, &mut ret), STATUS_SUCCESS);

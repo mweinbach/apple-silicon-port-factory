@@ -261,6 +261,32 @@ impl VmState {
         }
         false
     }
+    /// Rearm write-watch trapping on host page `hp` after clearing its dirty bit:
+    /// inspects EVERY 4 KiB subpage in `[hp, hp + HOST_PAGE)` so a `PAGE_READONLY`
+    /// first subpage never prevents stripping `PROT_WRITE` when a sibling subpage is
+    /// writable, while preserving `PROT_NONE` if any subpage is `PAGE_GUARD`/`PAGE_NOACCESS`.
+    unsafe fn rearm_write_watch_host_page(&self, hp: usize) {
+        if self.has_protected_subpage(hp, None) {
+            return;
+        }
+        let mut has_writable = false;
+        let mut non_write_prot = 0i32;
+        let mut sub = hp;
+        while sub < hp + HOST_PAGE {
+            if let Some((&_s, seg)) = self.segs.range(..=sub).next_back() {
+                if sub < seg.end && seg.state == MEM_COMMIT {
+                    if is_writable_prot(seg.prot) {
+                        has_writable = true;
+                    }
+                    non_write_prot |= win_prot_to_host(seg.prot) & !libc::PROT_WRITE;
+                }
+            }
+            sub += PAGE;
+        }
+        if has_writable {
+            let _ = host_mprotect(hp, HOST_PAGE, non_write_prot);
+        }
+    }
 }
 
 /// Apply host protection for `[start, end)` inside `vm`, preserving `PROT_NONE` on
@@ -951,18 +977,7 @@ pub unsafe extern "win64" fn GetWriteWatch(
             // reset only the pages whose addresses were returned in `addresses`.
             for &hp in &dirty {
                 vm.write_watch_dirty.remove(&hp);
-                if vm.has_protected_subpage(hp, None) {
-                    continue;
-                }
-                if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
-                    if hp < seg.end
-                        && seg.state == MEM_COMMIT
-                        && is_writable_prot(seg.prot)
-                        && (seg.prot & PAGE_GUARD) == 0
-                    {
-                        let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
-                    }
-                }
+                vm.rearm_write_watch_host_page(hp);
             }
         }
         dirty
@@ -1001,18 +1016,7 @@ pub unsafe extern "win64" fn ResetWriteWatch(base: *mut c_void, region_size: usi
     let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).copied().collect();
     for hp in dirty {
         vm.write_watch_dirty.remove(&hp);
-        if vm.has_protected_subpage(hp, None) {
-            continue;
-        }
-        if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
-            if hp < seg.end
-                && seg.state == MEM_COMMIT
-                && is_writable_prot(seg.prot)
-                && (seg.prot & PAGE_GUARD) == 0
-            {
-                let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
-            }
-        }
+        vm.rearm_write_watch_host_page(hp);
     }
     0
 }

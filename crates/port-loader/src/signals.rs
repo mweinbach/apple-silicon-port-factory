@@ -494,8 +494,19 @@ unsafe fn try_emulate_kuser_read(fault_addr: u64, ss: *mut u64) -> bool {
     true
 }
 
-/// Decoded AArch64 memory load or store (GPR scalar, SIMD&FP scalar/128-bit vector,
-/// or non-writeback pair `LDP`/`STP`) for subpage access emulation on 16 KiB Apple Silicon pages.
+/// ARMv8.1 LSE atomic read-modify-write operation kind.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicRmwOp {
+    Add, // LDADD{,A,L,AL}
+    Clr, // LDCLR{,A,L,AL} (mem &= !val)
+    Eor, // LDEOR{,A,L,AL} (mem ^= val)
+    Set, // LDSET{,A,L,AL} (mem |= val)
+    Swp, // SWP{,A,L,AL}
+}
+
+/// Decoded AArch64 memory load, store, or LSE atomic RMW/CAS instruction for subpage
+/// access emulation on 16 KiB Apple Silicon pages.
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy, Debug)]
 enum Arm64MemOp {
@@ -507,26 +518,55 @@ enum Arm64MemOp {
     GprPairStore { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize },
     SimdPairLoad { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
     SimdPairStore { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
+    /// LSE `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`SWP` (`rs` = operand, `rt` = old-value dest).
+    AtomicRmw { op: AtomicRmwOp, rs: usize, rt: usize, bytes: usize },
+    /// LSE `CAS{,A,L,AL}` (`rs` = expected in / old out, `rt` = replacement in).
+    AtomicCas { rs: usize, rt: usize, bytes: usize },
+    /// LSE `CASP{,A,L,AL}` (`rs, rs+1` = expected in / old out, `rt, rt+1` = replacement in).
+    AtomicCasp { rs: usize, rt: usize, elem_bytes: usize },
 }
 
 #[cfg(target_arch = "aarch64")]
 impl Arm64MemOp {
-    fn is_write(self) -> bool {
+    fn is_atomic(self) -> bool {
+        matches!(self, Self::AtomicRmw { .. } | Self::AtomicCas { .. } | Self::AtomicCasp { .. })
+    }
+    /// Logical write-permission requirement (`true` for stores and all LSE RMW/CAS atomics).
+    fn requires_write(self) -> bool {
         matches!(
             self,
-            Self::GprStore { .. } | Self::SimdStore { .. } | Self::GprPairStore { .. } | Self::SimdPairStore { .. }
+            Self::GprStore { .. }
+                | Self::SimdStore { .. }
+                | Self::GprPairStore { .. }
+                | Self::SimdPairStore { .. }
+                | Self::AtomicRmw { .. }
+                | Self::AtomicCas { .. }
+                | Self::AtomicCasp { .. }
         )
+    }
+    /// Check compatibility with hardware `ESR_EL1.WnR`.
+    /// On Apple Silicon, LSE RMW/CAS atomics (`casal`, `ldaddal`, etc.) faulting on a
+    /// `PROT_NONE` page can report `WnR = 0` (read phase of RMW) or `WnR = 1`.
+    fn matches_esr_write(self, esr_is_write: bool) -> bool {
+        if self.is_atomic() {
+            true
+        } else {
+            self.requires_write() == esr_is_write
+        }
     }
     fn total_bytes(self) -> usize {
         match self {
             Self::GprLoad { bytes, .. }
             | Self::GprStore { bytes, .. }
             | Self::SimdLoad { bytes, .. }
-            | Self::SimdStore { bytes, .. } => bytes,
+            | Self::SimdStore { bytes, .. }
+            | Self::AtomicRmw { bytes, .. }
+            | Self::AtomicCas { bytes, .. } => bytes,
             Self::GprPairLoad { elem_bytes, .. }
             | Self::GprPairStore { elem_bytes, .. }
             | Self::SimdPairLoad { elem_bytes, .. }
-            | Self::SimdPairStore { elem_bytes, .. } => elem_bytes * 2,
+            | Self::SimdPairStore { elem_bytes, .. }
+            | Self::AtomicCasp { elem_bytes, .. } => elem_bytes * 2,
         }
     }
     unsafe fn effective_addr(self, fault_addr: u64, ss: *const u64) -> Option<usize> {
@@ -653,7 +693,41 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
         });
     }
 
-    // 4. Scalar GPR load or store.
+    // 4. ARMv8.1 LSE atomics: LDADD/LDCLR/LDEOR/LDSET/SWP, CAS, and CASP.
+    if (insn & 0x3F20_0C00) == 0x3820_0000 {
+        let op = match (insn >> 12) & 0xF {
+            0 => Some(AtomicRmwOp::Add),
+            1 => Some(AtomicRmwOp::Clr),
+            2 => Some(AtomicRmwOp::Eor),
+            3 => Some(AtomicRmwOp::Set),
+            8 => Some(AtomicRmwOp::Swp),
+            _ => None,
+        };
+        if let Some(op) = op {
+            let size = ((insn >> 30) & 3) as usize;
+            let bytes = 1usize << size;
+            let rs = ((insn >> 16) & 0x1F) as usize;
+            let rt = (insn & 0x1F) as usize;
+            return Some(Arm64MemOp::AtomicRmw { op, rs, rt, bytes });
+        }
+    }
+    if (insn & 0x3FA0_7C00) == 0x08A0_7C00 {
+        let size = ((insn >> 30) & 3) as usize;
+        let bytes = 1usize << size;
+        let rs = ((insn >> 16) & 0x1F) as usize;
+        let rt = (insn & 0x1F) as usize;
+        return Some(Arm64MemOp::AtomicCas { rs, rt, bytes });
+    }
+    if (insn & 0xBFA0_7C00) == 0x0820_7C00 {
+        let elem_bytes = if ((insn >> 30) & 1) != 0 { 8usize } else { 4 };
+        let rs = ((insn >> 16) & 0x1F) as usize;
+        let rt = (insn & 0x1F) as usize;
+        if (rs & 1) == 0 && (rt & 1) == 0 && rs < 30 && rt < 30 {
+            return Some(Arm64MemOp::AtomicCasp { rs, rt, elem_bytes });
+        }
+    }
+
+    // 5. Scalar GPR load or store.
     if let Some((rt, bytes)) = decode_arm64_store(insn) {
         return Some(Arm64MemOp::GprStore { rt, bytes });
     }
@@ -668,19 +742,19 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
     None
 }
 
-/// Decode the `(start_addr, byte_len)` of the faulting AArch64 memory instruction at `pc`.
+/// Decode the `(start_addr, byte_len, requires_write)` of the faulting AArch64 memory instruction at `pc`.
 #[cfg(target_arch = "aarch64")]
-unsafe fn decoded_access_span(fault_addr: u64, pc: u64, is_write: bool, ss: *const u64) -> Option<(usize, usize)> {
+unsafe fn decoded_access_span(fault_addr: u64, pc: u64, esr_is_write: bool, ss: *const u64) -> Option<(usize, usize, bool)> {
     if pc < 0x10000 || (pc & 3) != 0 {
         return None;
     }
     let insn = std::ptr::read_unaligned(pc as *const u32);
     let op = decode_arm64_mem_op(insn)?;
-    if op.is_write() != is_write {
+    if !op.matches_esr_write(esr_is_write) {
         return None;
     }
     let ea = op.effective_addr(fault_addr, ss)?;
-    Some((ea, op.total_bytes()))
+    Some((ea, op.total_bytes(), op.requires_write()))
 }
 
 /// Returns `true` iff the 4 KiB page containing `addr` is logically committed and
@@ -813,13 +887,295 @@ unsafe fn isolated_hpage_transfer(start_addr: usize, buf: &mut [u8], is_write: b
     true
 }
 
-/// Emulate one AArch64 GPR, SIMD&FP, or pair load/store against logically accessible 4 KiB
-/// subpage(s) inside a 16 KiB host page kept `PROT_NONE` for a `PAGE_GUARD`/`PAGE_NOACCESS`
-/// sibling. Validates EVERY 4 KiB subpage touched by `[ea, ea + total_bytes)` and performs
-/// the memory transfer through an isolated `mach_vm_remap` alias so the guest VA remains
-/// `PROT_NONE` throughout. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+/// Execute an ARMv8.1 LSE atomic operation (`LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`SWP`,
+/// `CAS`, or `CASP`) at guest address `start_addr` through an isolated `mach_vm_remap`
+/// alias so the guest VA stays strictly `PROT_NONE` throughout.
+///
+/// Naturally aligned single-host-page atomics execute real hardware atomic instructions
+/// (`AtomicU{8,16,32,64}` / `caspal`) directly on the shared physical page frame through
+/// the alias; unaligned or cross-host-page atomics serialize under `UNALIGNED_ATOMIC_LOCK`.
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, mc: *mut u8, ss: *mut u64) -> bool {
+unsafe fn isolated_hpage_atomic(start_addr: usize, op: Arm64MemOp, ss: *mut u64) -> bool {
+    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_remap(
+            target_task: libc::mach_port_t,
+            target_address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            src_task: libc::mach_port_t,
+            src_address: u64,
+            copy: i32,
+            cur_protection: *mut i32,
+            max_protection: *mut i32,
+            inheritance: i32,
+        ) -> i32;
+        fn mach_vm_protect(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+            set_maximum: i32,
+            new_protection: i32,
+        ) -> i32;
+        fn mach_vm_deallocate(target_task: libc::mach_port_t, address: u64, size: u64) -> i32;
+    }
+    const VM_FLAGS_ANYWHERE: i32 = 1;
+    const VM_INHERIT_NONE: i32 = 2;
+    const VM_PROT_RW: i32 = 1 | 2;
+
+    let total_bytes = op.total_bytes();
+    let end_addr = match start_addr.checked_add(total_bytes - 1) {
+        Some(e) => e,
+        None => return false,
+    };
+    let hpage = start_addr & !0x3FFF;
+    let aligned = (start_addr & (total_bytes - 1)) == 0 && (end_addr & !0x3FFF) == hpage;
+
+    if aligned {
+        let task = mach_task_self_;
+        let mut alias: u64 = 0;
+        let mut cur_prot: i32 = 0;
+        let mut max_prot: i32 = 0;
+        if mach_vm_remap(
+            task,
+            &mut alias,
+            0x4000,
+            0,
+            VM_FLAGS_ANYWHERE,
+            task,
+            hpage as u64,
+            0,
+            &mut cur_prot,
+            &mut max_prot,
+            VM_INHERIT_NONE,
+        ) != 0
+        {
+            return false;
+        }
+        if mach_vm_protect(task, alias, 0x4000, 0, VM_PROT_RW) != 0 {
+            let _ = mach_vm_deallocate(task, alias, 0x4000);
+            return false;
+        }
+        let ptr = (alias as usize + (start_addr - hpage)) as *mut u8;
+        match op {
+            Arm64MemOp::AtomicRmw { op: rmw, rs, rt, bytes } => {
+                let val = if rs == 31 { 0u64 } else { *ss.add(rs) };
+                let old: u64 = match bytes {
+                    1 => {
+                        let a = &*(ptr as *const AtomicU8);
+                        let v = val as u8;
+                        (match rmw {
+                            AtomicRmwOp::Add => a.fetch_add(v, Ordering::SeqCst),
+                            AtomicRmwOp::Clr => a.fetch_and(!v, Ordering::SeqCst),
+                            AtomicRmwOp::Eor => a.fetch_xor(v, Ordering::SeqCst),
+                            AtomicRmwOp::Set => a.fetch_or(v, Ordering::SeqCst),
+                            AtomicRmwOp::Swp => a.swap(v, Ordering::SeqCst),
+                        }) as u64
+                    }
+                    2 => {
+                        let a = &*(ptr as *const AtomicU16);
+                        let v = val as u16;
+                        (match rmw {
+                            AtomicRmwOp::Add => a.fetch_add(v, Ordering::SeqCst),
+                            AtomicRmwOp::Clr => a.fetch_and(!v, Ordering::SeqCst),
+                            AtomicRmwOp::Eor => a.fetch_xor(v, Ordering::SeqCst),
+                            AtomicRmwOp::Set => a.fetch_or(v, Ordering::SeqCst),
+                            AtomicRmwOp::Swp => a.swap(v, Ordering::SeqCst),
+                        }) as u64
+                    }
+                    4 => {
+                        let a = &*(ptr as *const AtomicU32);
+                        let v = val as u32;
+                        (match rmw {
+                            AtomicRmwOp::Add => a.fetch_add(v, Ordering::SeqCst),
+                            AtomicRmwOp::Clr => a.fetch_and(!v, Ordering::SeqCst),
+                            AtomicRmwOp::Eor => a.fetch_xor(v, Ordering::SeqCst),
+                            AtomicRmwOp::Set => a.fetch_or(v, Ordering::SeqCst),
+                            AtomicRmwOp::Swp => a.swap(v, Ordering::SeqCst),
+                        }) as u64
+                    }
+                    8 => {
+                        let a = &*(ptr as *const AtomicU64);
+                        match rmw {
+                            AtomicRmwOp::Add => a.fetch_add(val, Ordering::SeqCst),
+                            AtomicRmwOp::Clr => a.fetch_and(!val, Ordering::SeqCst),
+                            AtomicRmwOp::Eor => a.fetch_xor(val, Ordering::SeqCst),
+                            AtomicRmwOp::Set => a.fetch_or(val, Ordering::SeqCst),
+                            AtomicRmwOp::Swp => a.swap(val, Ordering::SeqCst),
+                        }
+                    }
+                    _ => {
+                        let _ = mach_vm_deallocate(task, alias, 0x4000);
+                        return false;
+                    }
+                };
+                if rt < 31 {
+                    *ss.add(rt) = old;
+                }
+            }
+            Arm64MemOp::AtomicCas { rs, rt, bytes } => {
+                let exp = if rs == 31 { 0u64 } else { *ss.add(rs) };
+                let rep = if rt == 31 { 0u64 } else { *ss.add(rt) };
+                let old: u64 = match bytes {
+                    1 => {
+                        let a = &*(ptr as *const AtomicU8);
+                        match a.compare_exchange(exp as u8, rep as u8, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(o) | Err(o) => o as u64,
+                        }
+                    }
+                    2 => {
+                        let a = &*(ptr as *const AtomicU16);
+                        match a.compare_exchange(exp as u16, rep as u16, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(o) | Err(o) => o as u64,
+                        }
+                    }
+                    4 => {
+                        let a = &*(ptr as *const AtomicU32);
+                        match a.compare_exchange(exp as u32, rep as u32, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(o) | Err(o) => o as u64,
+                        }
+                    }
+                    8 => {
+                        let a = &*(ptr as *const AtomicU64);
+                        match a.compare_exchange(exp, rep, Ordering::SeqCst, Ordering::SeqCst) {
+                            Ok(o) | Err(o) => o,
+                        }
+                    }
+                    _ => {
+                        let _ = mach_vm_deallocate(task, alias, 0x4000);
+                        return false;
+                    }
+                };
+                if rs < 31 {
+                    *ss.add(rs) = old;
+                }
+            }
+            Arm64MemOp::AtomicCasp { rs, rt, elem_bytes } => {
+                if elem_bytes == 4 {
+                    let exp = (*ss.add(rs) as u32 as u64) | ((*ss.add(rs + 1) as u32 as u64) << 32);
+                    let rep = (*ss.add(rt) as u32 as u64) | ((*ss.add(rt + 1) as u32 as u64) << 32);
+                    let a = &*(ptr as *const AtomicU64);
+                    let old = match a.compare_exchange(exp, rep, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(o) | Err(o) => o,
+                    };
+                    *ss.add(rs) = (old as u32) as u64;
+                    *ss.add(rs + 1) = ((old >> 32) as u32) as u64;
+                } else {
+                    let mut lo = *ss.add(rs);
+                    let mut hi = *ss.add(rs + 1);
+                    let rep_lo = *ss.add(rt);
+                    let rep_hi = *ss.add(rt + 1);
+                    core::arch::asm!(
+                        "caspal x0, x1, x2, x3, [{p}]",
+                        p = in(reg) ptr,
+                        inout("x0") lo,
+                        inout("x1") hi,
+                        in("x2") rep_lo,
+                        in("x3") rep_hi,
+                        options(nostack),
+                    );
+                    *ss.add(rs) = lo;
+                    *ss.add(rs + 1) = hi;
+                }
+            }
+            _ => {
+                let _ = mach_vm_deallocate(task, alias, 0x4000);
+                return false;
+            }
+        }
+        let _ = mach_vm_deallocate(task, alias, 0x4000);
+        return true;
+    }
+
+    // Unaligned or cross-host-page atomic: serialize via lock and transfer through isolated aliases.
+    static UNALIGNED_ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = UNALIGNED_ATOMIC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cur = [0u8; 16];
+    if !isolated_hpage_transfer(start_addr, &mut cur[..total_bytes], false) {
+        return false;
+    }
+    let mut next = cur;
+    match op {
+        Arm64MemOp::AtomicRmw { op: rmw, rs, rt, bytes } => {
+            let val = if rs == 31 { 0u64 } else { *ss.add(rs) };
+            let mut old_arr = [0u8; 8];
+            old_arr[..bytes].copy_from_slice(&cur[..bytes]);
+            let old = u64::from_le_bytes(old_arr);
+            let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
+            let res = match rmw {
+                AtomicRmwOp::Add => old.wrapping_add(val) & mask,
+                AtomicRmwOp::Clr => (old & !val) & mask,
+                AtomicRmwOp::Eor => (old ^ val) & mask,
+                AtomicRmwOp::Set => (old | val) & mask,
+                AtomicRmwOp::Swp => val & mask,
+            };
+            next[..bytes].copy_from_slice(&res.to_le_bytes()[..bytes]);
+            if !isolated_hpage_transfer(start_addr, &mut next[..bytes], true) {
+                return false;
+            }
+            if rt < 31 {
+                *ss.add(rt) = old;
+            }
+        }
+        Arm64MemOp::AtomicCas { rs, rt, bytes } => {
+            let mask = if bytes == 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 };
+            let exp = (if rs == 31 { 0u64 } else { *ss.add(rs) }) & mask;
+            let rep = (if rt == 31 { 0u64 } else { *ss.add(rt) }) & mask;
+            let mut old_arr = [0u8; 8];
+            old_arr[..bytes].copy_from_slice(&cur[..bytes]);
+            let old = u64::from_le_bytes(old_arr);
+            if old == exp {
+                next[..bytes].copy_from_slice(&rep.to_le_bytes()[..bytes]);
+                if !isolated_hpage_transfer(start_addr, &mut next[..bytes], true) {
+                    return false;
+                }
+            }
+            if rs < 31 {
+                *ss.add(rs) = old;
+            }
+        }
+        Arm64MemOp::AtomicCasp { rs, rt, elem_bytes } => {
+            if elem_bytes == 4 {
+                let old_lo = u32::from_le_bytes(cur[0..4].try_into().unwrap());
+                let old_hi = u32::from_le_bytes(cur[4..8].try_into().unwrap());
+                if old_lo == *ss.add(rs) as u32 && old_hi == *ss.add(rs + 1) as u32 {
+                    next[0..4].copy_from_slice(&(*ss.add(rt) as u32).to_le_bytes());
+                    next[4..8].copy_from_slice(&(*ss.add(rt + 1) as u32).to_le_bytes());
+                    if !isolated_hpage_transfer(start_addr, &mut next[..8], true) {
+                        return false;
+                    }
+                }
+                *ss.add(rs) = old_lo as u64;
+                *ss.add(rs + 1) = old_hi as u64;
+            } else {
+                let old_lo = u64::from_le_bytes(cur[0..8].try_into().unwrap());
+                let old_hi = u64::from_le_bytes(cur[8..16].try_into().unwrap());
+                if old_lo == *ss.add(rs) && old_hi == *ss.add(rs + 1) {
+                    next[0..8].copy_from_slice(&(*ss.add(rt)).to_le_bytes());
+                    next[8..16].copy_from_slice(&(*ss.add(rt + 1)).to_le_bytes());
+                    if !isolated_hpage_transfer(start_addr, &mut next[..16], true) {
+                        return false;
+                    }
+                }
+                *ss.add(rs) = old_lo;
+                *ss.add(rs + 1) = old_hi;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Emulate one AArch64 GPR, SIMD&FP, pair, or LSE atomic instruction against logically
+/// accessible 4 KiB subpage(s) inside a 16 KiB host page kept `PROT_NONE` for a
+/// `PAGE_GUARD`/`PAGE_NOACCESS` sibling. Validates EVERY 4 KiB subpage touched by
+/// `[ea, ea + total_bytes)` and performs the memory transfer through an isolated
+/// `mach_vm_remap` alias so the guest VA remains `PROT_NONE` throughout.
+/// Caller MUST hold `HPAGE_LOCKS[hpage]`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn try_emulate_subpage_access(fault_addr: u64, esr_is_write: bool, mc: *mut u8, ss: *mut u64) -> bool {
     let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
     if pc < 0x10000 || (pc & 3) != 0 {
         return false;
@@ -828,9 +1184,10 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, mc: *mut u
     let Some(op) = decode_arm64_mem_op(insn) else {
         return false;
     };
-    if op.is_write() != is_write {
+    if !op.matches_esr_write(esr_is_write) {
         return false;
     }
+    let is_write = op.requires_write();
     let Some(start_addr) = op.effective_addr(fault_addr, ss) else {
         return false;
     };
@@ -840,6 +1197,19 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, mc: *mut u
     }
     if first_blocked_subpage(start_addr, total_bytes, is_write).is_some() {
         return false;
+    }
+
+    if op.is_atomic() {
+        if !isolated_hpage_atomic(start_addr, op, ss) {
+            return false;
+        }
+        let end_addr = start_addr + total_bytes - 1;
+        win32_rt::kernel32::memory::mark_write_watch_dirty(start_addr);
+        if (end_addr & !0x3FFF) != (start_addr & !0x3FFF) {
+            win32_rt::kernel32::memory::mark_write_watch_dirty(end_addr);
+        }
+        *ss.add(32) = (*ss.add(32) & !0x0000_FFFF_FFFF_FFFF) | pc.wrapping_add(4);
+        return true;
     }
 
     let ns_v = mc.add(MC_NS_ARM64) as *mut u128;
@@ -1082,7 +1452,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     if IN_FAULT.with(|f| f.get()) {
         return false;
     }
-    let (span_start, span_bytes) = decoded_access_span(fault_addr, pc, is_write, ss).unwrap_or((fault_addr as usize, 1));
+    let (span_start, span_bytes, is_write) =
+        decoded_access_span(fault_addr, pc, is_write, ss).unwrap_or((fault_addr as usize, 1, is_write));
     // If an unaligned multi-byte scalar or SIMD access starts on an accessible 4 KiB subpage
     // and spans into a protected or non-writable sibling 4 KiB subpage, report and handle the
     // fault at that protected subpage boundary (matching x86-64 hardware CR2).
@@ -1479,6 +1850,35 @@ mod tests {
         assert!(matches!(
             decode_arm64_mem_op(0xA900_1004),
             Some(Arm64MemOp::GprPairStore { rt1: 4, rt2: 4, elem_bytes: 8, .. })
+        ));
+        // ARMv8.1 LSE atomics: ldaddal, ldclral, ldeoral, ldsetal, swpal, casal, caspal_x
+        assert!(matches!(
+            decode_arm64_mem_op(0xB8E1_0042),
+            Some(Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Add, rs: 1, rt: 2, bytes: 4 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xF8E3_1044),
+            Some(Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Clr, rs: 3, rt: 4, bytes: 8 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0x78E5_2046),
+            Some(Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Eor, rs: 5, rt: 6, bytes: 2 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0x38E7_3048),
+            Some(Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Set, rs: 7, rt: 8, bytes: 1 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xB8E9_804A),
+            Some(Arm64MemOp::AtomicRmw { op: AtomicRmwOp::Swp, rs: 9, rt: 10, bytes: 4 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0xC8EB_FC4C),
+            Some(Arm64MemOp::AtomicCas { rs: 11, rt: 12, bytes: 8 })
+        ));
+        assert!(matches!(
+            decode_arm64_mem_op(0x4862_FC44),
+            Some(Arm64MemOp::AtomicCasp { rs: 2, rt: 4, elem_bytes: 8 })
         ));
     }
 
