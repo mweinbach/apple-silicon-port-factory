@@ -1,4 +1,4 @@
-//! Native arm64/NEON code generation for `K_VAES_RR..=K_VSHA_RM` (`115..=126`),
+//! Native arm64/NEON code generation for `K_VAES_RR..=K_VVNNI_RM` (`115..=130`),
 //! completing 100% native arm64/NEON coverage across all `FastOp` kinds.
 
 use super::emit::{enc_logic_imm, sf, Asm};
@@ -179,6 +179,169 @@ impl Tr<'_> {
         }
     }
 
+    /// Emit one 128-bit lane of AES / VAES (`sub 0..=5`) on `(v0 = state, v1 = round_key) -> v0`.
+    fn emit_vaes_lane(&mut self, sub: u8, imm8: u8) {
+        match sub {
+            0 => {
+                self.a.v_zero(2);
+                self.a.v_aese(0, 2);
+                self.a.v_aesmc(0, 0);
+                self.a.v_eor(0, 0, 1);
+            }
+            1 => {
+                self.a.v_zero(2);
+                self.a.v_aese(0, 2);
+                self.a.v_eor(0, 0, 1);
+            }
+            2 => {
+                self.a.v_zero(2);
+                self.a.v_aesd(0, 2);
+                self.a.v_aesimc(0, 0);
+                self.a.v_eor(0, 0, 1);
+            }
+            3 => {
+                self.a.v_zero(2);
+                self.a.v_aesd(0, 2);
+                self.a.v_eor(0, 0, 1);
+            }
+            4 => {
+                self.a.v_aesimc(0, 1);
+            }
+            _ => {
+                self.a.v_zero(2);
+                self.a.v_aese(1, 2);
+                self.a.mov_imm(true, T0, 0x040B_0E01_0B0E_0104);
+                self.a.mov_imm(true, T1, 0x0C03_0609_0306_090C);
+                self.a.fmov_gf(true, 2, T0);
+                self.a.v_ins_d(2, 1, T1);
+                self.a.v_tbl1(0, 1, 2);
+                self.a.mov_imm(true, T0, (imm8 as u64) << 32);
+                self.a.v_dup(3, 2, T0);
+                self.a.v_eor(0, 0, 2);
+            }
+        }
+    }
+
+    /// Multiply 16 bytes of `a` and `b` in GF(2^8) mod `0x11B` into `dst` (baseline ARMv8.0 NEON).
+    /// `acc`, `cur_b`, `tmp`, and `c1b` (preloaded with `0x1B` in every byte) must be distinct from
+    /// each other and from `a`/`b`; `dst` may alias `a` or `b`. Preserves NZCV.
+    fn emit_gfmul_regs(&mut self, dst: u32, a: u32, b: u32, acc: u32, cur_b: u32, tmp: u32, c1b: u32) {
+        self.a.v_zero(acc);
+        self.a.v_mov(cur_b, b);
+        self.a.movz(false, T1, 8, 0);
+        let lp = self.a.pos;
+        // acc = (acc << 1) ^ ((acc & 0x80) ? 0x1B : 0)
+        self.a.v_cmlt0(0, tmp, acc);
+        self.a.v_shl_i(8, acc, acc, 1);
+        self.a.v_and(tmp, tmp, c1b);
+        self.a.v_eor(acc, acc, tmp);
+        // acc ^= (cur_b & 0x80) ? a : 0
+        self.a.v_cmlt0(0, tmp, cur_b);
+        self.a.v_and(tmp, tmp, a);
+        self.a.v_eor(acc, acc, tmp);
+        self.a.v_shl_i(8, cur_b, cur_b, 1);
+        self.a.addsub_ri(false, true, false, T1, T1, 1, false);
+        let br = self.a.cbnz(false, T1);
+        self.a.patch(br, lp);
+        self.a.v_mov(dst, acc);
+    }
+
+    /// Emit one 128-bit lane of GFNI (`0=gf2p8mulb`, `1=gf2p8affineqb`, `2=gf2p8affineinvqb`)
+    /// on `(v0 = src1, v1 = src2) -> v0`. `c1b` is a free scratch vector (`6` on lo lane, `7` on hi).
+    /// Preserves NZCV and the opposite 256-bit lane register.
+    fn emit_gfni_lane(&mut self, sub: u8, imm8: u8, c1b: u32) {
+        if sub == 0 {
+            self.a.movz(false, T0, 0x1B, 0);
+            self.a.v_dup(0, c1b, T0);
+            self.emit_gfmul_regs(0, 0, 1, 2, 3, 4, c1b);
+            return;
+        }
+        if sub == 2 {
+            // Invert each byte of v0 in GF(2^8) mod 0x11B via x^254 = x^2 * x^4 * ... * x^128
+            // (maps 0 -> 0 with zero branches). Preserves v1 (the 8x8 bit-matrices).
+            self.a.movz(false, T0, 0x1B, 0);
+            self.a.v_dup(0, c1b, T0);
+            self.emit_gfmul_regs(5, 0, 0, 2, 3, 4, c1b); // v5 = x^2
+            self.a.v_mov(0, 5); // v0 = acc = x^2
+            self.a.movz(false, T2, 6, 0);
+            let lp = self.a.pos;
+            self.emit_gfmul_regs(5, 5, 5, 2, 3, 4, c1b); // v5 = v5^2
+            self.emit_gfmul_regs(0, 0, 5, 2, 3, 4, c1b); // v0 = v0 * v5
+            self.a.addsub_ri(false, true, false, T2, T2, 1, false);
+            let br = self.a.cbnz(false, T2);
+            self.a.patch(br, lp);
+        }
+        // Affine transform: for each qword, row k (byte k of qword in v1) yields output bit (7 - k).
+        self.a.v_zero(2); // v2 = result bytes
+        self.a.movz(true, T0, 0, 0);
+        self.a.fmov_gf(true, 4, T0);
+        self.a.mov_imm(true, T0, 0x0808_0808_0808_0808);
+        self.a.v_ins_d(4, 1, T0); // v4 = [0;8, 8;8]
+        self.a.movz(false, T0, 1, 0);
+        self.a.v_dup(0, 5, T0); // v5 = [1;16]
+        self.a.movz(false, T2, 8, 0);
+        let lp = self.a.pos;
+        self.a.v_tbl1(3, 1, 4); // v3 = matrix row k broadcast per qword
+        self.a.v_and(3, 3, 0); // v3 = x & row
+        self.a.v_cnt_16b(3, 3); // v3 = popcount(x & row)
+        self.a.v_and(3, 3, 5); // v3 = parity bit (0 or 1)
+        self.a.v_shl_i(8, 2, 2, 1); // v2 <<= 1
+        self.a.v_orr(2, 2, 3); // v2 |= bit (7 - k)
+        self.a.neon_3same(false, 0, 16, 4, 4, 5); // add v4.16b, v4.16b, v5.16b
+        self.a.addsub_ri(false, true, false, T2, T2, 1, false);
+        let br = self.a.cbnz(false, T2);
+        self.a.patch(br, lp);
+        if imm8 != 0 {
+            self.a.movz(false, T0, imm8 as u32, 0);
+            self.a.v_dup(0, 3, T0);
+            self.a.v_eor(2, 2, 3);
+        }
+        self.a.v_mov(0, 2);
+    }
+
+    /// Emit one 128-bit lane of AVX-VNNI (`0=vpdpbusd`, `1=vpdpbusds`, `2=vpdpwssd`, `3=vpdpwssds`)
+    /// on `(v5 = dst, v0 = src1, v1 = src2) -> v0`. Preserves `v6`, `v7`, and NZCV.
+    fn emit_vnni_lane(&mut self, sub: u8) {
+        match sub {
+            0 | 1 => {
+                // src1: u8, src2: i8 -> each product in [-32640, 32385] fits i16;
+                // sum of 4 products in [-130560, 129540] fits i32 without overflow.
+                self.a.v_uxtl_b(false, 2, 0);
+                self.a.v_sxtl_b(false, 3, 1);
+                self.a.neon_3same(false, 1, 19, 2, 2, 3); // mul v2.8h, v2.8h, v3.8h
+                self.a.v_saddlp(1, 2, 2); // saddlp v2.4s, v2.8h
+                self.a.v_uxtl_b(true, 3, 0);
+                self.a.v_sxtl_b(true, 4, 1);
+                self.a.neon_3same(false, 1, 19, 3, 3, 4); // mul v3.8h, v3.8h, v4.8h
+                self.a.v_saddlp(1, 3, 3); // saddlp v3.4s, v3.8h
+                self.a.neon_3same(false, 2, 23, 2, 2, 3); // addp v2.4s, v2.4s, v3.4s
+                let opc = if sub == 0 { 16 } else { 1 }; // add vs sqadd
+                self.a.neon_3same(false, 2, opc, 0, 5, 2);
+            }
+            2 => {
+                // vpdpwssd: wrapping 32-bit accumulation of pairs of i16*i16 products.
+                self.a.v_smull(false, 1, 2, 0, 1);
+                self.a.v_smull(true, 1, 3, 0, 1);
+                self.a.neon_3same(false, 2, 23, 2, 2, 3); // addp v2.4s, v2.4s, v3.4s
+                self.a.neon_3same(false, 2, 16, 0, 5, 2); // add v0.4s, v5.4s, v2.4s
+            }
+            _ => {
+                // vpdpwssds: accumulate in i64 before saturating to i32 so
+                // (-32768)^2 + (-32768)^2 = +2^31 saturates instead of wrapping negative.
+                self.a.v_smull(false, 1, 2, 0, 1); // v2.4s = p0..p3
+                self.a.v_smull(true, 1, 3, 0, 1); // v3.4s = p4..p7
+                self.a.v_saddlp(2, 2, 2); // v2.2d = [p0+p1, p2+p3] (i64)
+                self.a.v_saddlp(2, 3, 3); // v3.2d = [p4+p5, p6+p7] (i64)
+                self.a.v_sxtl_s(false, 4, 5); // v4.2d = [dst0, dst1] (i64)
+                self.a.neon_3same(false, 3, 16, 2, 2, 4); // add v2.2d, v2.2d, v4.2d
+                self.a.v_sxtl_s(true, 4, 5); // v4.2d = [dst2, dst3] (i64)
+                self.a.neon_3same(false, 3, 16, 3, 3, 4); // add v3.2d, v3.2d, v4.2d
+                self.a.v_sqxtn(false, 2, 0, 2); // sqxtn v0.2s, v2.2d
+                self.a.v_sqxtn(true, 2, 0, 3); // sqxtn2 v0.4s, v3.2d
+            }
+        }
+    }
+
     pub(super) fn emit_more_op(&mut self, k: usize, op: &FastOp) {
         use fast::*;
         let w = op.w;
@@ -188,63 +351,18 @@ impl Tr<'_> {
             K_VAES_RR | K_VAES_RM => {
                 let sub = op.x & 0x3F;
                 let imm8 = op.imm as u8;
-                if op.kind == K_VAES_RM {
-                    let a = self.addr_into(op, XA);
-                    if Self::chk_of(op) == Chk::Full {
-                        let se = self.side_exit_here(k);
-                        self.range_check_to(a, se);
-                    }
-                    self.a.ldr(64, T0, a, 0);
-                    self.a.ldr(64, T1, a, 8);
-                    if mem::tso() {
-                        self.a.dmb_ishld();
-                    }
-                    self.a.fmov_gf(true, 1, T0);
-                    self.a.v_ins_d(1, 1, T1);
-                } else {
-                    self.xsrc(1, op.r1);
-                }
+                let is_256 = (op.w & 3) == VM_V256;
+                self.vload_b(k, op);
                 if sub <= 3 {
                     self.xsrc(0, (op.imm >> 8) as u8);
                 }
-                match sub {
-                    0 => {
-                        self.a.v_zero(2);
-                        self.a.v_aese(0, 2);
-                        self.a.v_aesmc(0, 0);
-                        self.a.v_eor(0, 0, 1);
-                    }
-                    1 => {
-                        self.a.v_zero(2);
-                        self.a.v_aese(0, 2);
-                        self.a.v_eor(0, 0, 1);
-                    }
-                    2 => {
-                        self.a.v_zero(2);
-                        self.a.v_aesd(0, 2);
-                        self.a.v_aesimc(0, 0);
-                        self.a.v_eor(0, 0, 1);
-                    }
-                    3 => {
-                        self.a.v_zero(2);
-                        self.a.v_aesd(0, 2);
-                        self.a.v_eor(0, 0, 1);
-                    }
-                    4 => {
-                        self.a.v_aesimc(0, 1);
-                    }
-                    _ => {
-                        self.a.v_zero(2);
-                        self.a.v_aese(1, 2);
-                        self.a.mov_imm(true, T0, 0x040B_0E01_0B0E_0104);
-                        self.a.mov_imm(true, T1, 0x0C03_0609_0306_090C);
-                        self.a.fmov_gf(true, 2, T0);
-                        self.a.v_ins_d(2, 1, T1);
-                        self.a.v_tbl1(0, 1, 2);
-                        self.a.mov_imm(true, T0, (imm8 as u64) << 32);
-                        self.a.v_dup(3, 2, T0);
-                        self.a.v_eor(0, 0, 2);
-                    }
+                self.emit_vaes_lane(sub, imm8);
+                if is_256 {
+                    let s1 = ((op.imm >> 8) as u32 & 15) * 16;
+                    self.a.v_mov(6, 0);
+                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+                    self.a.v_mov(1, 7);
+                    self.emit_vaes_lane(sub, imm8);
                 }
                 self.vstore_dst(op);
             }
@@ -558,15 +676,40 @@ impl Tr<'_> {
                         self.set_lb(5, 64);
                     }
                     13 => {
-                        // Rdrand / Rdseed: dst = non-zero pseudo-entropy, CF = 1, OF=SF=ZF=AF=PF=0
-                        self.a.mov_imm(true, T0, 0x9E37_79B9_7F4A_7C15);
+                        // Rdrand / Rdseed: real OS entropy via `JitScratch::entropy_fn`
+                        // (`guest_entropy_raw` -> `EntropyResult { val: x0, ok: x1 }`), zero
+                        // static AOT relocations. Intel SDM: on success `dst = val`, `CF = 1`;
+                        // on failure `dst = 0`, `CF = 0`; `OF = SF = ZF = AF = PF = 0` always.
+                        self.a.addsub_ri(true, true, false, 31, 31, 96, false);
+                        self.a.stp_x(XRAS, XBUD, 31, 0);
+                        self.a.stp_x(9, 10, 31, 16);
+                        self.a.stp_x(11, 12, 31, 32);
+                        self.a.stp_x(13, 14, 31, 48);
+                        self.a.stp_x(XCPU, 30, 31, 64);
+                        if self.spill_xmm != 0 {
+                            self.a.bl_to(self.spill_xmm);
+                        }
+                        self.a.ldr(64, XA, XCPU, OFF_ENTROPY_FN);
+                        self.a.call_with_host_fpcr(80);
+                        self.a.ldr(64, XCPU, 31, 64);
+                        if self.reload_xmm != 0 {
+                            self.a.bl_to(self.reload_xmm);
+                        }
+                        self.a.ldp_x(XCPU, 30, 31, 64);
+                        self.a.ldp_x(13, 14, 31, 48);
+                        self.a.ldp_x(11, 12, 31, 32);
+                        self.a.ldp_x(9, 10, 31, 16);
+                        self.a.ldp_x(XRAS, XBUD, 31, 0);
+                        self.a.addsub_ri(true, false, false, 31, 31, 96, false);
+                        self.xa_key = None;
                         self.wr_gpr(op.r0, op.w, T0);
-                        self.a.movz(false, T1, 1, 0);
                         self.a.str(8, T1, XCPU, OFF_CF);
                         self.a.str(8, ZR, XCPU, OFF_ZF);
                         self.a.str(8, ZR, XCPU, OFF_SF);
                         self.a.str(8, ZR, XCPU, OFF_OF);
-                        self.a.str(8, ZR, XCPU, OFF_PFV);
+                        self.a.movz(false, T2, 1, 0);
+                        self.a.str(8, T2, XCPU, OFF_PFV); // odd popcount => PF = 0
+                        self.pf = super::lazy::PF_NONE;
                         self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
                     }
                     _ => {}
@@ -671,6 +814,40 @@ impl Tr<'_> {
                     }
                 }
                 self.xwrite(op.r0, 0);
+            }
+            K_VGFNI_RR | K_VGFNI_RM => {
+                let sub = op.x & 0x3F;
+                let imm8 = op.imm as u8;
+                let is_256 = (op.w & 3) == VM_V256;
+                self.vload_b(k, op);
+                self.xsrc(0, (op.imm >> 8) as u8);
+                self.emit_gfni_lane(sub, imm8, 6);
+                if is_256 {
+                    let s1 = ((op.imm >> 8) as u32 & 15) * 16;
+                    self.a.v_mov(6, 0);
+                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1);
+                    self.a.v_mov(1, 7);
+                    self.emit_gfni_lane(sub, imm8, 7);
+                }
+                self.vstore_dst(op);
+            }
+            K_VVNNI_RR | K_VVNNI_RM => {
+                let sub = op.x & 0x3F;
+                let is_256 = (op.w & 3) == VM_V256;
+                self.vload_b(k, op);
+                self.xsrc(0, (op.imm >> 8) as u8);
+                self.xsrc(5, op.r0);
+                self.emit_vnni_lane(sub);
+                if is_256 {
+                    let d_off = (op.r0 as u32 & 15) * 16;
+                    let s1_off = ((op.imm >> 8) as u32 & 15) * 16;
+                    self.a.v_mov(6, 0);
+                    self.a.ldr(128, 5, XCPU, OFF_YMM_HI + d_off);
+                    self.a.ldr(128, 0, XCPU, OFF_YMM_HI + s1_off);
+                    self.a.v_mov(1, 7);
+                    self.emit_vnni_lane(sub);
+                }
+                self.vstore_dst(op);
             }
             K_VEXT_RR..=K_MMX_MISC => self.emit_mmx_gather_op(k, op),
             _ => unreachable!("unsupported op kind {}", op.kind),

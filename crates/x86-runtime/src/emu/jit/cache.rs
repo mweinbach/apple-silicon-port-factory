@@ -95,6 +95,10 @@ fn fast_gpr_writes(op: &FastOp, ins: &iced_x86::Instruction) -> Option<u16> {
         | K_VMASKMOV
         | K_VSHA_RR
         | K_VSHA_RM
+        | K_VGFNI_RR
+        | K_VGFNI_RM
+        | K_VVNNI_RR
+        | K_VVNNI_RM
         | K_VEXT_RR
         | K_VEXT_RM
         | K_MASKMOV_B

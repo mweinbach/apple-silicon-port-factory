@@ -538,9 +538,9 @@ pub(super) fn lower_more(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
             f.imm = dw as u64;
             match k1 {
                 OpKind::Register => {
-                    let (s, sw) = gpr_of(ins.op_register(1))?;
-                    f.r1 = s;
-                    f.w = sw;
+                    let (idx, bits, hi) = Cpu::reg_idx(ins.op_register(1))?;
+                    f.r1 = (idx as u8) | ((hi as u8) << 7);
+                    f.w = bits as u8;
                     f.kind = K_BMI_RR;
                 }
                 OpKind::Memory => {
@@ -1013,7 +1013,13 @@ pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                     // Crc32
                     let src_bits = wb;
                     let dst_bits = op.imm as u8;
-                    let v = if mem { cpu.read_mem(cpu.faddr(op), src_bits) } else { cpu.rget(op.r1, w) };
+                    let v = if mem {
+                        cpu.read_mem(cpu.faddr(op), src_bits)
+                    } else if op.r1 & 0x80 != 0 {
+                        (cpu.gpr[(op.r1 & 15) as usize] >> 8) & 0xFF
+                    } else {
+                        cpu.rget(op.r1, w)
+                    };
                     let crc = sk::crc32c_step(cpu.rget(op.r0, 32) as u32, v, src_bits);
                     cpu.rset(op.r0, dst_bits, crc as u64);
                 }

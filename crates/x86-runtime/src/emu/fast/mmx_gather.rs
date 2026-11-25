@@ -13,21 +13,21 @@ use iced_x86::{EncodingKind, Instruction, Mnemonic as M};
 
 /// Extended legacy SIMD V-form ops (`VX_*`): `(v)phaddsw`, `(v)phsubsw`, `(v)phminposuw`,
 /// `(v)mpsadbw`, `(v)dppd`.
-pub(in crate::emu) const K_VEXT_RR: u8 = 127;
-pub(in crate::emu) const K_VEXT_RM: u8 = 128;
+pub(in crate::emu) const K_VEXT_RR: u8 = 131;
+pub(in crate::emu) const K_VEXT_RM: u8 = 132;
 /// Byte-masked non-temporal store to `[rdi/edi]`: `x == 0` -> `(v)maskmovdqu` (16B XMM),
 /// `x == 1` -> `maskmovq` (8B MMX + MMX mode transition).
-pub(in crate::emu) const K_MASKMOV_B: u8 = 129;
+pub(in crate::emu) const K_MASKMOV_B: u8 = 133;
 /// AVX2 VSIB gathers (`vpgatherdd/dq/qd/qq`, `vgatherdps/dpd/qps/qpd`, 128 & 256).
-pub(in crate::emu) const K_VGATHER: u8 = 130;
+pub(in crate::emu) const K_VGATHER: u8 = 134;
 /// MMX logic, unpack, pack, shuffle, align and shift ops (64-bit `VS_*` sub-ops).
-pub(in crate::emu) const K_MMX_VSHUF_RR: u8 = 131;
-pub(in crate::emu) const K_MMX_VSHUF_RM: u8 = 132;
+pub(in crate::emu) const K_MMX_VSHUF_RR: u8 = 135;
+pub(in crate::emu) const K_MMX_VSHUF_RM: u8 = 136;
 /// MMX packed integer ALU, multiply, min/max, avg, sad, compare and SSSE3 ops (64-bit `VI_*`).
-pub(in crate::emu) const K_MMX_VINT_RR: u8 = 133;
-pub(in crate::emu) const K_MMX_VINT_RM: u8 = 134;
+pub(in crate::emu) const K_MMX_VINT_RR: u8 = 137;
+pub(in crate::emu) const K_MMX_VINT_RM: u8 = 138;
 /// MMX moves, transfers, `pinsrw`/`pextrw`/`pmovmskb`, FP<->MMX conversions, and `emms`/`femms`.
-pub(in crate::emu) const K_MMX_MISC: u8 = 135;
+pub(in crate::emu) const K_MMX_MISC: u8 = 139;
 
 // `K_VEXT_*` sub-ops (`FastOp::x & 0x3F`).
 pub(in crate::emu) const VX_PHADDSW: u8 = 0;

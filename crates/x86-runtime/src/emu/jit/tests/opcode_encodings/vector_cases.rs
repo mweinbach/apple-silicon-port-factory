@@ -53,6 +53,18 @@ fn register_scalar_and_misc(cases: &mut Cases) {
     cases.check("v_cnt_8b", &[("cnt_advsimd", "cnt v29.8b, v17.8b")], |a| {
         a.v_cnt_8b(29, 17);
     });
+    cases.check("v_cnt_16b", &[("cnt_advsimd", "cnt v29.16b, v17.16b")], |a| {
+        a.v_cnt_16b(29, 17);
+    });
+    for &(size, asm) in &[
+        (0, "saddlp v29.8h, v17.16b"),
+        (1, "saddlp v29.4s, v17.8h"),
+        (2, "saddlp v29.2d, v17.4s"),
+    ] {
+        cases.check("v_saddlp", &[("saddlp_advsimd", asm)], move |a| {
+            a.v_saddlp(size, 29, 17);
+        });
+    }
     cases.check("v_addv_8b", &[("addv_advsimd", "addv b26, v19.8b")], |a| {
         a.v_addv_8b(26, 19);
     });
@@ -513,6 +525,14 @@ fn register_lane_permute_and_widening(cases: &mut Cases) {
         (false, 28, 20, "sshll_advsimd", "sshll v28.8h, v20.8b, #0"),
     ] {
         cases.check("v_sxtl_b", &[(stem, asm)], move |a| a.v_sxtl_b(q, vd, vn));
+    }
+
+    for &(q, vd, vn, stem, asm) in &[
+        (false, 27, 19, "sxtl_sshll_advsimd", "sxtl v27.2d, v19.2s"),
+        (true, 27, 19, "sxtl_sshll_advsimd", "sxtl2 v27.2d, v19.4s"),
+        (false, 28, 20, "sshll_advsimd", "sshll v28.2d, v20.2s, #0"),
+    ] {
+        cases.check("v_sxtl_s", &[(stem, asm)], move |a| a.v_sxtl_s(q, vd, vn));
     }
 
     for &(q, vd, vn, stem, asm) in &[

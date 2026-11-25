@@ -863,6 +863,9 @@ impl Tr<'_> {
                             let a = self.addr_into(op, XA);
                             self.load(k, T0, a, sw, Self::chk_of(op));
                             T0
+                        } else if op.r1 & 0x80 != 0 {
+                            self.a.ubfx(T0, g(op.r1 & 15), 8, 8);
+                            T0
                         } else {
                             self.ua(op.r1, sw)
                         };

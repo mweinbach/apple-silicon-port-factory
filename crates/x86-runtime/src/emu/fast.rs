@@ -48,7 +48,7 @@ pub(super) use mmx_gather::{
 #[cfg_attr(not(target_arch = "aarch64"), allow(unused_imports))]
 pub(super) use more::{
     K_ATOMIC, K_BIT_EXT, K_HI8, K_PCMPSTR, K_STRING, K_SYS_MISC, K_VAES_RM, K_VAES_RR, K_VCVT_PH,
-    K_VMASKMOV, K_VSHA_RM, K_VSHA_RR,
+    K_VGFNI_RM, K_VGFNI_RR, K_VMASKMOV, K_VSHA_RM, K_VSHA_RR, K_VVNNI_RM, K_VVNNI_RR,
 };
 
 #[cfg(not(target_endian = "little"))]
