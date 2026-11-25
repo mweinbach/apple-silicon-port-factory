@@ -371,14 +371,28 @@ pub unsafe fn walk_in_detailed(ctx: &Context, ranges: &[(u64, u64)], max: usize)
             out.push(WalkFrame { pc: cur.rip, in_pe: false, unwound_by: "fp" });
             let mut next = cur;
             let fp = cur.gpr[RBP] & 0x0000_FFFF_FFFF_FFFF;
-            let same = range_of(fp).is_some() && range_of(fp) == range_of(rsp);
-            if fp & 7 != 0 || (same && fp < rsp) || !in_stack(fp) {
+            if fp == 0 {
+                if out.len() <= 1 {
+                    complete = false;
+                }
                 break;
             }
-            let (Some(next_fp), Some(ret)) = (read_u64(fp), read_u64(fp + 8)) else { break };
+            let same = range_of(fp).is_some() && range_of(fp) == range_of(rsp);
+            if fp & 7 != 0 || (same && fp < rsp) || !in_stack(fp) {
+                complete = false;
+                break;
+            }
+            let (Some(next_fp), Some(ret)) = (read_u64(fp), read_u64(fp + 8)) else {
+                complete = false;
+                break;
+            };
             let next_fp = next_fp & 0x0000_FFFF_FFFF_FFFF;
             let ret = ret & 0x0000_FFFF_FFFF_FFFF;
+            if ret == 0 || ret == EMU_RET_SENTINEL {
+                break;
+            }
             if !follows_call(ret) {
+                complete = false;
                 break;
             }
             next.rip = ret;
@@ -386,10 +400,14 @@ pub unsafe fn walk_in_detailed(ctx: &Context, ranges: &[(u64, u64)], max: usize)
             next.gpr[RBP] = next_fp;
             let nsp = next.gpr[RSP];
             if nsp <= rsp && (range_of(nsp).is_none() || range_of(nsp) == range_of(rsp)) {
+                complete = false;
                 break;
             }
             cur = next;
         }
+    }
+    if out.len() >= max && cur.rip != 0 && cur.rip != EMU_RET_SENTINEL {
+        complete = false;
     }
     (out, complete)
 }
@@ -1859,6 +1877,36 @@ mod tests {
         assert_eq!(walk.frames[0].pc, base + 0x0120);
         assert_eq!(walk.method, "pdata");
         assert!(!walk.complete, "corrupt non-zero return address must mark walk incomplete");
+    }
+
+    #[test]
+    fn walk_in_detailed_marks_broken_fp_chain_incomplete() {
+        let mut stack = vec![0u64; 32];
+        let lo = stack.as_ptr() as u64;
+        let hi = lo + (stack.len() as u64) * 8;
+
+        // 1. Misaligned frame pointer
+        let mut ctx = Context::zeroed();
+        ctx.rip = 0x1_0000_1234;
+        ctx.gpr[RSP] = lo;
+        ctx.gpr[RBP] = lo + 3;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "misaligned fp must mark walk incomplete");
+
+        // 2. Out-of-stack frame pointer
+        ctx.gpr[RBP] = hi + 0x1000;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "out-of-stack fp must mark walk incomplete");
+
+        // 3. Valid fp pointing to a non-call (corrupted) return address
+        stack[4] = lo + 8 * 8;
+        stack[5] = 0x4141_4141_4141_4141;
+        ctx.gpr[RBP] = lo + 4 * 8;
+        let (frames, complete) = unsafe { walk_in_detailed(&ctx, &[(lo, hi)], 16) };
+        assert_eq!(frames.len(), 1);
+        assert!(!complete, "corrupted non-call return address must mark walk incomplete");
     }
 
     #[test]
