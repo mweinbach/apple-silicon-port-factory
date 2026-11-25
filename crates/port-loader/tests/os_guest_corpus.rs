@@ -1679,6 +1679,10 @@ int main(void) {
         fprintf(stderr, "FAIL: embedded NUL character field\n");
         return 5;
     }
+    if (wsprintfA(abuf, "A%.0cB", 'X') != 3 || strcmp(abuf, "AXB")) {
+        fprintf(stderr, "FAIL: precision on character field\n");
+        return 6;
+    }
     memset(abuf, '!', sizeof(abuf));
     n = wsprintfA(abuf, "%2000d", 1);
     if (n >= 2000 || abuf[1023] != 0 || abuf[1024] != '!') {

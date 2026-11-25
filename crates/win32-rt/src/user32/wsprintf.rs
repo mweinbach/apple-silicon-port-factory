@@ -174,12 +174,12 @@ unsafe fn format(slots: *const u64, wide: bool) -> i32 {
                 if single && wide_arg.is_some() && src.unit(0) == 0 {
                     Vec::new()
                 } else {
-                    text_field(
-                        src,
-                        wide,
-                        precision.unwrap_or(remaining).min(remaining),
-                        single,
-                    )
+                    let limit = if single {
+                        remaining
+                    } else {
+                        precision.unwrap_or(remaining).min(remaining)
+                    };
+                    text_field(src, wide, limit, single)
                 }
             }
             Ok(c @ (b'd' | b'i' | b'u' | b'x' | b'X' | b'p')) => {
