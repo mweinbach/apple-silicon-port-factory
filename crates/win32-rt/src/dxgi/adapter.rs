@@ -722,7 +722,9 @@ fn release_monitor_ownership(monitor_id: u32, dev: usize) {
 /// Hardware VBlank synchronization via CoreVideo `CVDisplayLink` on macOS, with
 /// monotonic refresh-phase pacing when no physical display is attached (headless/CI/iOS).
 mod vblank {
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::Duration;
 
