@@ -3479,3 +3479,203 @@ fn factory_retains_registered_font_and_collection_loaders_until_unregistered_or_
         assert!(cl2_destroyed.load(Ordering::Acquire), "factory drop must release registered collection loader");
     }
 }
+
+#[test]
+fn text_analyzer_get_glyphs_honors_is_sideways_vertical_alternates_and_fallback_rejection() {
+    use super::analysis::{ta_get_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+    use super::sfnt::FontMeta;
+    use std::collections::HashMap;
+
+    unsafe {
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // 1. With a real CJK system font that provides vertical alternates (`vert`),
+        //    `GetGlyphs(..., isSideways = TRUE)` must select vertical glyph forms for
+        //    Japanese brackets/prolonged-sound mark (`「あー」`) rather than returning
+        //    the horizontal glyphs.
+        let cjk_candidates = [
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/CJKSymbolsFallback.ttc",
+        ];
+        if let Some(font_path) = cjk_candidates
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+        {
+            let mut ffile: *mut c_void = std::ptr::null_mut();
+            let path_w = wide(font_path);
+            assert_eq!(
+                fac_create_font_file_reference(fac as PFactory, path_w.as_ptr(), std::ptr::null(), &mut ffile),
+                S_OK
+            );
+            let mut face: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                fac_create_font_face(
+                    fac as PFactory,
+                    DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION,
+                    1,
+                    &ffile,
+                    0,
+                    DWRITE_FONT_SIMULATIONS_NONE,
+                    &mut face,
+                ),
+                S_OK
+            );
+
+            // "「あー」" = LEFT CORNER BRACKET, HIRAGANA A, PROLONGED SOUND MARK, RIGHT CORNER BRACKET
+            let text: [u16; 4] = [0x300C, 0x3042, 0x30FC, 0x300D];
+            let loc_w = wide("ja-JP");
+            let shape = |sideways: BOOL| -> (Vec<u16>, Vec<u16>, Vec<DWRITE_SHAPING_TEXT_PROPERTIES>, Vec<DWRITE_SHAPING_GLYPH_PROPERTIES>) {
+                let mut cm = [0u16; 4];
+                let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 4];
+                let mut gi = [0u16; 8];
+                let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 8];
+                let mut actual = 0u32;
+                assert_eq!(
+                    ta_get_glyphs(
+                        ta as PTextAnalyzer,
+                        text.as_ptr(),
+                        text.len() as u32,
+                        face,
+                        sideways,
+                        FALSE,
+                        std::ptr::null(),
+                        loc_w.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        gi.len() as u32,
+                        cm.as_mut_ptr(),
+                        tp.as_mut_ptr(),
+                        gi.as_mut_ptr(),
+                        gp.as_mut_ptr(),
+                        &mut actual,
+                    ),
+                    S_OK
+                );
+                assert_eq!(actual, 4);
+                (gi[..4].to_vec(), cm.to_vec(), tp.to_vec(), gp[..4].to_vec())
+            };
+
+            let (horiz_gids, horiz_cm, _, _) = shape(FALSE);
+            let (vert_gids, vert_cm, vert_tp, vert_gp) = shape(TRUE);
+            assert_eq!(horiz_cm, vec![0, 1, 2, 3]);
+            assert_eq!(vert_cm, vec![0, 1, 2, 3]);
+            assert!(vert_gids.iter().all(|&g| g != 0), "vertical glyph IDs must be mapped: {vert_gids:?}");
+            // Corner brackets and prolonged sound mark must substitute to vertical alternates.
+            assert_ne!(
+                vert_gids[0], horiz_gids[0],
+                "isSideways=TRUE must select vertical alternate for '「' (h={}, v={})",
+                horiz_gids[0], vert_gids[0]
+            );
+            assert_ne!(
+                vert_gids[2], horiz_gids[2],
+                "isSideways=TRUE must select vertical alternate for 'ー' (h={}, v={})",
+                horiz_gids[2], vert_gids[2]
+            );
+            assert_ne!(
+                vert_gids[3], horiz_gids[3],
+                "isSideways=TRUE must select vertical alternate for '」' (h={}, v={})",
+                horiz_gids[3], vert_gids[3]
+            );
+
+            let mut adv = [0.0f32; 4];
+            let mut off = [DWRITE_GLYPH_OFFSET::default(); 4];
+            assert_eq!(
+                ta_get_glyph_placements(
+                    ta as PTextAnalyzer,
+                    text.as_ptr(),
+                    vert_cm.as_ptr(),
+                    vert_tp.as_ptr(),
+                    text.len() as u32,
+                    vert_gids.as_ptr(),
+                    vert_gp.as_ptr(),
+                    vert_gids.len() as u32,
+                    face,
+                    24.0f32.to_bits(),
+                    TRUE,
+                    FALSE,
+                    std::ptr::null(),
+                    loc_w.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    adv.as_mut_ptr(),
+                    off.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            assert!(adv.iter().all(|&a| a > 0.0), "vertical advances must be positive: {adv:?}");
+
+            let _ = release_com(face);
+            let _ = release_com(ffile);
+        }
+
+        // 2. Built-in fallback face (no backing SFNT bytes) must honestly return E_NOTIMPL for
+        //    isSideways=TRUE runs rather than silently returning horizontal cmap glyphs.
+        let fallback_meta = Arc::new(FontMeta {
+            family_name: "FallbackOnly".to_string(),
+            face_name: "Regular".to_string(),
+            weight: DWRITE_FONT_WEIGHT_NORMAL,
+            stretch: DWRITE_FONT_STRETCH_NORMAL,
+            style: DWRITE_FONT_STYLE_NORMAL,
+            is_symbol: false,
+            is_monospace: false,
+            face_type: DWRITE_FONT_FACE_TYPE_TRUETYPE,
+            face_index: 0,
+            glyph_count: 256,
+            metrics: super::sfnt::default_fallback_metrics(),
+            info_strings: HashMap::new(),
+            file_path: None,
+            raw_bytes: None,
+            custom_file: None,
+        });
+        let fb_face = new_font_face(FontFaceInner::from_meta(fallback_meta, 0));
+        let latin = ['A' as u16, 'B' as u16];
+        let mut cm = [0u16; 2];
+        let mut tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 2];
+        let mut gi = [0u16; 4];
+        let mut gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 4];
+        let mut actual = 99u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                latin.as_ptr(),
+                latin.len() as u32,
+                fb_face,
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gi.len() as u32,
+                cm.as_mut_ptr(),
+                tp.as_mut_ptr(),
+                gi.as_mut_ptr(),
+                gp.as_mut_ptr(),
+                &mut actual,
+            ),
+            E_NOTIMPL
+        );
+        assert_eq!(actual, 0);
+
+        let _ = release_com(fb_face);
+        let _ = release_com(ta);
+        let _ = release_com(fac);
+    }
+}

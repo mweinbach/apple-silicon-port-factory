@@ -1156,6 +1156,7 @@ struct SubstitutedRunEntry {
     orig_units: Vec<u16>,
     gids: Vec<u16>,
     is_rtl: bool,
+    is_sideways: bool,
     substituted_units: Vec<u16>,
 }
 
@@ -1166,25 +1167,49 @@ fn substituted_run_cache() -> &'static Mutex<VecDeque<SubstitutedRunEntry>> {
     C.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn cache_substituted_run(orig_units: Vec<u16>, gids: Vec<u16>, is_rtl: bool, substituted_units: Vec<u16>) {
+fn cache_substituted_run(
+    orig_units: Vec<u16>,
+    gids: Vec<u16>,
+    is_rtl: bool,
+    is_sideways: bool,
+    substituted_units: Vec<u16>,
+) {
     let mut cache = substituted_run_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(pos) = cache
-        .iter()
-        .position(|e| e.is_rtl == is_rtl && e.orig_units == orig_units && e.gids == gids)
-    {
+    if let Some(pos) = cache.iter().position(|e| {
+        e.is_rtl == is_rtl
+            && e.is_sideways == is_sideways
+            && e.orig_units == orig_units
+            && e.gids == gids
+    }) {
         cache.remove(pos);
     } else if cache.len() >= SUBSTITUTED_RUN_CACHE_CAP {
         cache.pop_front();
     }
-    cache.push_back(SubstitutedRunEntry { orig_units, gids, is_rtl, substituted_units });
+    cache.push_back(SubstitutedRunEntry {
+        orig_units,
+        gids,
+        is_rtl,
+        is_sideways,
+        substituted_units,
+    });
 }
 
-fn lookup_substituted_run(orig_units: &[u16], gids: &[u16], is_rtl: bool) -> Option<Vec<u16>> {
+fn lookup_substituted_run(
+    orig_units: &[u16],
+    gids: &[u16],
+    is_rtl: bool,
+    is_sideways: bool,
+) -> Option<Vec<u16>> {
     let cache = substituted_run_cache().lock().unwrap_or_else(|e| e.into_inner());
     cache
         .iter()
         .rev()
-        .find(|e| e.is_rtl == is_rtl && e.orig_units == orig_units && e.gids == gids)
+        .find(|e| {
+            e.is_rtl == is_rtl
+                && e.is_sideways == is_sideways
+                && e.orig_units == orig_units
+                && e.gids == gids
+        })
         .map(|e| e.substituted_units.clone())
 }
 
@@ -1194,7 +1219,7 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
     text_string: *const u16,
     text_len: u32,
     font_face: *mut c_void,
-    _is_sideways: BOOL,
+    is_sideways: BOOL,
     is_rtl: BOOL,
     script_analysis: *const DWRITE_SCRIPT_ANALYSIS,
     locale_name: *const u16,
@@ -1262,13 +1287,20 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
         feature_ranges,
         units.len(),
     );
-    let complex = super::shaping::needs_complex_shaping(&units, is_rtl != 0, !feat_ranges.is_empty());
+    let sideways = is_sideways != FALSE;
+    let complex = super::shaping::needs_complex_shaping(
+        &units,
+        is_rtl != 0,
+        sideways,
+        !feat_ranges.is_empty(),
+    );
 
     if let Some(shaped) = super::shaping::shape_run_platform(
         &face,
         &units,
         face.meta.metrics.designUnitsPerEm.max(1) as f32,
         is_rtl != 0,
+        sideways,
         no_visual,
         locale.as_deref(),
         &feat_ranges,
@@ -1296,15 +1328,16 @@ pub(super) unsafe extern "win64" fn ta_get_glyphs(
             }
         }
         if was_substituted {
-            cache_substituted_run(orig_units, out_gids, is_rtl != 0, units);
+            cache_substituted_run(orig_units, out_gids, is_rtl != 0, sideways, units);
         }
         return S_OK;
     }
 
     if complex {
         log::warn!(
-            "dwrite: IDWriteTextAnalyzer::GetGlyphs cannot shape complex/RTL/featured run (len={}, family={:?}) without backing SFNT shaper",
+            "dwrite: IDWriteTextAnalyzer::GetGlyphs cannot shape complex/RTL/sideways/featured run (len={}, sideways={}, family={:?}) without backing SFNT shaper",
             units.len(),
+            sideways,
             face.meta.family_name,
         );
         actual_glyph_count.write_unaligned(0);
@@ -1391,7 +1424,7 @@ unsafe fn try_position_glyphs_platform(
         feature_ranges,
         orig_units.len(),
     );
-    let shape_units = lookup_substituted_run(&orig_units, &caller_gids, is_rtl)
+    let shape_units = lookup_substituted_run(&orig_units, &caller_gids, is_rtl, false)
         .unwrap_or(orig_units);
 
     if let Some(shaped) = super::shaping::shape_run_platform(
@@ -1399,6 +1432,7 @@ unsafe fn try_position_glyphs_platform(
         &shape_units,
         em_size,
         is_rtl,
+        false,
         no_visual,
         locale.as_deref(),
         &feat_ranges,
@@ -1423,7 +1457,7 @@ unsafe fn try_position_glyphs_platform(
             }
             return Some(S_OK);
         }
-    } else if super::shaping::needs_complex_shaping(&shape_units, is_rtl, !feat_ranges.is_empty()) {
+    } else if super::shaping::needs_complex_shaping(&shape_units, is_rtl, false, !feat_ranges.is_empty()) {
         log::warn!(
             "dwrite: IDWriteTextAnalyzer::GetGlyphPlacements cannot position complex run (len={}, family={:?})",
             shape_units.len(),

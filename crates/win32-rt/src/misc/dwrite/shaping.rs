@@ -91,10 +91,15 @@ pub(super) unsafe fn read_feature_ranges(
 }
 
 /// Returns `true` when `units` contains scripts, combining marks, join controls,
-/// RTL direction, or explicit OpenType features that cannot be shaped correctly
-/// by a 1:1 `cmap` lookup without script-aware GSUB/GPOS shaping.
-pub(super) fn needs_complex_shaping(units: &[u16], is_rtl: bool, has_features: bool) -> bool {
-    if is_rtl || has_features {
+/// RTL direction, vertical/sideways orientation, or explicit OpenType features that
+/// cannot be shaped correctly by a 1:1 `cmap` lookup without script-aware GSUB/GPOS shaping.
+pub(super) fn needs_complex_shaping(
+    units: &[u16],
+    is_rtl: bool,
+    is_sideways: bool,
+    has_features: bool,
+) -> bool {
+    if is_rtl || is_sideways || has_features {
         return true;
     }
     let mut i = 0usize;
@@ -193,9 +198,11 @@ mod coretext {
     const CT_WRITING_DIRECTION_LTR: i8 = 0;
     const CT_WRITING_DIRECTION_RTL: i8 = 1;
     const CT_RUN_STATUS_RIGHT_TO_LEFT: u32 = 1 << 0;
+    const CT_FONT_ORIENTATION_VERTICAL: i32 = 2;
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFBooleanTrue: *const c_void;
         static kCFTypeArrayCallBacks: u8;
         static kCFTypeDictionaryKeyCallBacks: u8;
         static kCFTypeDictionaryValueCallBacks: u8;
@@ -258,7 +265,9 @@ mod coretext {
         static kCTFontAttributeName: *const c_void;
         static kCTLanguageAttributeName: *const c_void;
         static kCTParagraphStyleAttributeName: *const c_void;
+        static kCTVerticalFormsAttributeName: *const c_void;
         static kCTFontCascadeListAttribute: *const c_void;
+        static kCTFontOrientationAttribute: *const c_void;
         static kCTFontFeatureSettingsAttribute: *const c_void;
         static kCTFontOpenTypeFeatureTag: *const c_void;
         static kCTFontOpenTypeFeatureValue: *const c_void;
@@ -300,6 +309,7 @@ mod coretext {
         base_desc: *const c_void,
         empty_cascade: *const c_void,
         ct_size: f64,
+        is_sideways: bool,
         settings: &[FeatureSetting],
     ) -> Option<CfGuard> {
         let mut feat_dicts: Vec<CfGuard> = Vec::new();
@@ -346,9 +356,25 @@ mod coretext {
         } else {
             None
         };
+        let orient_num = if is_sideways {
+            let orient = CT_FONT_ORIENTATION_VERTICAL;
+            Some(CfGuard(CFNumberCreate(
+                std::ptr::null(),
+                CF_NUMBER_SINT32_TYPE,
+                &orient as *const i32 as *const c_void,
+            )))
+        } else {
+            None
+        };
 
         let mut desc_keys = vec![kCTFontCascadeListAttribute];
         let mut desc_vals = vec![empty_cascade];
+        if let Some(ref onum) = orient_num {
+            if !onum.0.is_null() {
+                desc_keys.push(kCTFontOrientationAttribute);
+                desc_vals.push(onum.0);
+            }
+        }
         if let Some(ref fa) = feat_arr {
             if !fa.0.is_null() {
                 desc_keys.push(kCTFontFeatureSettingsAttribute);
@@ -377,11 +403,13 @@ mod coretext {
         (!ct_font.0.is_null()).then_some(ct_font)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn shape_run(
         face: &FontFaceInner,
         units: &[u16],
         em_size: f32,
         is_rtl: bool,
+        is_sideways: bool,
         no_visual: bool,
         locale: Option<&str>,
         feature_ranges: &[FeatureRange],
@@ -435,7 +463,7 @@ mod coretext {
                 return None;
             }
 
-            let base_ct_font = make_ct_font(base_desc, empty_cascade.0, ct_size, &[])?;
+            let base_ct_font = make_ct_font(base_desc, empty_cascade.0, ct_size, is_sideways, &[])?;
 
             let dir: i8 = if is_rtl { CT_WRITING_DIRECTION_RTL } else { CT_WRITING_DIRECTION_LTR };
             let psetting = CTParagraphStyleSetting {
@@ -469,12 +497,16 @@ mod coretext {
                     ));
                     (!g.0.is_null()).then_some(g)
                 });
-            let mut attr_keys = Vec::with_capacity(3);
-            let mut attr_vals = Vec::with_capacity(3);
+            let mut attr_keys = Vec::with_capacity(4);
+            let mut attr_vals = Vec::with_capacity(4);
             attr_keys.push(kCTFontAttributeName);
             attr_vals.push(base_ct_font.0);
             attr_keys.push(kCTParagraphStyleAttributeName);
             attr_vals.push(pstyle.0);
+            if is_sideways {
+                attr_keys.push(kCTVerticalFormsAttributeName);
+                attr_vals.push(kCFBooleanTrue);
+            }
             if let Some(ref loc) = cf_locale {
                 attr_keys.push(kCTLanguageAttributeName);
                 attr_vals.push(loc.0);
@@ -515,7 +547,13 @@ mod coretext {
                         continue;
                     }
                     let clamped_len = fr.len.min(units.len() - fr.start);
-                    if let Some(rf) = make_ct_font(base_desc, empty_cascade.0, ct_size, &fr.settings) {
+                    if let Some(rf) = make_ct_font(
+                        base_desc,
+                        empty_cascade.0,
+                        ct_size,
+                        is_sideways,
+                        &fr.settings,
+                    ) {
                         CFAttributedStringSetAttribute(
                             m.0 as *mut c_void,
                             CFRange {
@@ -698,22 +736,33 @@ mod coretext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn shape_run_platform(
     face: &FontFaceInner,
     units: &[u16],
     em_size: f32,
     is_rtl: bool,
+    is_sideways: bool,
     no_visual: bool,
     locale: Option<&str>,
     feature_ranges: &[FeatureRange],
 ) -> Option<ShapedRun> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        coretext::shape_run(face, units, em_size, is_rtl, no_visual, locale, feature_ranges)
+        coretext::shape_run(
+            face,
+            units,
+            em_size,
+            is_rtl,
+            is_sideways,
+            no_visual,
+            locale,
+            feature_ranges,
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let _ = (face, units, em_size, is_rtl, no_visual, locale, feature_ranges);
+        let _ = (face, units, em_size, is_rtl, is_sideways, no_visual, locale, feature_ranges);
         None
     }
 }
