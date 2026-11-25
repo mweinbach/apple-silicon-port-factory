@@ -921,6 +921,74 @@ fn keystroke_mgr_enumerators_properties_and_exports_lookup() {
         assert_eq!(std::ptr::read_unaligned(var_out.as_ptr().add(8) as *const i32), 777);
         com_call_release(prop);
 
+        // ITfContext::TrackProperties: track two properties (one set to 777, one empty)
+        // and verify ITfReadOnlyProperty::GetValue returns VT_UNKNOWN -> IEnumTfPropertyValue.
+        let prop_guid2 = Guid::new(0xDEADBEEF, 0xCAFE, 0xBABE, [9, 8, 7, 6, 5, 4, 3, 2]);
+        let prop_ptrs = [guid_as_ptr(&pk_guid), guid_as_ptr(&prop_guid2)];
+        let mut tracked: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            (ctx_vt.track_properties)(ctx, prop_ptrs.as_ptr(), 2, std::ptr::null(), 0, &mut tracked),
+            S_OK
+        );
+        assert!(!tracked.is_null());
+        let tp_vt = &*(*(tracked as *const *const super::range::ITfReadOnlyPropertyVtbl));
+        let mut tguid = [0xFFu8; 16];
+        assert_eq!((tp_vt.get_type)(tracked as *mut super::range::TrackedPropertyObj, tguid.as_mut_ptr()), S_OK);
+        assert_eq!(tguid, GUID_NULL.to_bytes());
+
+        let mut enum_ranges: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            (tp_vt.enum_ranges)(tracked as *mut super::range::TrackedPropertyObj, ec, &mut enum_ranges, std::ptr::null_mut()),
+            S_OK
+        );
+        assert!(!enum_ranges.is_null());
+        com_call_release(enum_ranges);
+
+        let mut tracked_var = [0u8; 24];
+        assert_eq!(
+            (tp_vt.get_value)(
+                tracked as *mut super::range::TrackedPropertyObj,
+                ec,
+                std::ptr::null_mut(),
+                tracked_var.as_mut_ptr()
+            ),
+            S_OK
+        );
+        assert_eq!(std::ptr::read_unaligned(tracked_var.as_ptr() as *const u16), VT_UNKNOWN);
+        let pv_enum = std::ptr::read_unaligned(tracked_var.as_ptr().add(8) as *const usize) as *mut c_void;
+        assert!(!pv_enum.is_null());
+        let pv_vt = &*(*(pv_enum as *const *const super::range::IEnumTfPropertyValueVtbl));
+        let mut vals = [TF_PROPERTYVAL { guid_id: GUID_NULL, var_value: [0u8; 24] }; 2];
+        let mut pv_fetched = 0u32;
+        assert_eq!(
+            (pv_vt.next)(pv_enum as *mut super::range::EnumTfPropValObj, 2, vals.as_mut_ptr(), &mut pv_fetched),
+            S_OK
+        );
+        assert_eq!(pv_fetched, 2);
+        assert_eq!(vals[0].guid_id, pk_guid);
+        assert_eq!(std::ptr::read_unaligned(vals[0].var_value.as_ptr() as *const u16), 3u16); // VT_I4
+        assert_eq!(std::ptr::read_unaligned(vals[0].var_value.as_ptr().add(8) as *const i32), 777);
+        assert_eq!(vals[1].guid_id, prop_guid2);
+        assert_eq!(std::ptr::read_unaligned(vals[1].var_value.as_ptr() as *const u16), VT_EMPTY);
+        assert_eq!((pv_vt.reset)(pv_enum as *mut super::range::EnumTfPropValObj), S_OK);
+        assert_eq!((pv_vt.skip)(pv_enum as *mut super::range::EnumTfPropValObj, 1), S_OK);
+        let mut one_val = TF_PROPERTYVAL { guid_id: GUID_NULL, var_value: [0u8; 24] };
+        assert_eq!(
+            (pv_vt.next)(pv_enum as *mut super::range::EnumTfPropValObj, 1, &mut one_val, &mut pv_fetched),
+            S_OK
+        );
+        assert_eq!(pv_fetched, 1);
+        assert_eq!(one_val.guid_id, prop_guid2);
+        com_call_release(pv_enum);
+        com_call_release(tracked);
+
+        // Invalid TrackProperties arguments return E_INVALIDARG.
+        assert_eq!(
+            (ctx_vt.track_properties)(ctx, std::ptr::null(), 0, std::ptr::null(), 0, &mut tracked),
+            E_INVALIDARG
+        );
+        assert!(tracked.is_null());
+
         let mut start_range: *mut c_void = std::ptr::null_mut();
         assert_eq!((ctx_vt.get_start)(ctx, ec, &mut start_range), S_OK);
         let r_vt = &*(*(start_range as *const *const ITfRangeVtbl));

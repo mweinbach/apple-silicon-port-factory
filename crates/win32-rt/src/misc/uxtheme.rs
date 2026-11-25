@@ -99,17 +99,19 @@ pub unsafe extern "win64" fn GetThemeSysColor(_htheme: usize, color_id: i32) -> 
 
 pub unsafe extern "win64" fn DrawThemeBackground(
     htheme: usize,
-    _hdc: usize,
+    hdc: usize,
     _part: i32,
     _state: i32,
-    _rect: *const u8,
+    rect: *const u8,
     _clip: *const u8,
 ) -> HRESULT {
-    if htheme == 0 {
-        return E_HANDLE;
-    }
-    stub!("DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL");
-    E_NOTIMPL
+    // Visual styles are disabled (`IsThemeActive() == FALSE`, `OpenThemeData*`
+    // returns NULL), so no open HTHEME handles exist in the process handle table.
+    // On Windows `uxtheme!DrawThemeBackground` validates `hTheme` first via
+    // `ValidateHandle` and returns `E_HANDLE` for any handle that is not an open
+    // theme handle, matching Windows Classic / unthemed desktop behavior.
+    let _ = (htheme, hdc, rect);
+    E_HANDLE
 }
 
 pub unsafe extern "win64" fn InitCommonControls() {}
@@ -185,8 +187,98 @@ pub unsafe extern "win64" fn _TrackMouseEvent(tme: *mut u8) -> BOOL {
     TRUE
 }
 
+// `TASKDIALOGCONFIG` and `TASKDIALOG_BUTTON` use `#include <pshpack1.h>` in commctrl.h.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct TaskDialogButton {
+    button_id: i32,
+    button_text: LPCWSTR,
+}
+const _: () = assert!(std::mem::size_of::<TaskDialogButton>() == 12);
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct TaskDialogConfig {
+    cb_size: u32,
+    hwnd_parent: HWND,
+    h_instance: HINSTANCE,
+    dw_flags: u32,
+    dw_common_buttons: u32,
+    psz_window_title: LPCWSTR,
+    main_icon: usize,
+    psz_main_instruction: LPCWSTR,
+    psz_content: LPCWSTR,
+    c_buttons: u32,
+    p_buttons: *const TaskDialogButton,
+    n_default_button: i32,
+    c_radio_buttons: u32,
+    p_radio_buttons: *const TaskDialogButton,
+    n_default_radio_button: i32,
+    psz_verification_text: LPCWSTR,
+    psz_expanded_information: LPCWSTR,
+    psz_expanded_control_text: LPCWSTR,
+    psz_collapsed_control_text: LPCWSTR,
+    footer_icon: usize,
+    psz_footer: LPCWSTR,
+    pf_callback: usize,
+    lp_callback_data: isize,
+    cx_width: u32,
+}
+const _: () = assert!(std::mem::size_of::<TaskDialogConfig>() == 160);
+
+const TDCBF_OK_BUTTON: u32 = 0x0001;
+const TDCBF_YES_BUTTON: u32 = 0x0002;
+const TDCBF_NO_BUTTON: u32 = 0x0004;
+const TDCBF_CANCEL_BUTTON: u32 = 0x0008;
+const TDCBF_RETRY_BUTTON: u32 = 0x0010;
+const TDCBF_CLOSE_BUTTON: u32 = 0x0020;
+
+const TDF_VERIFICATION_FLAG_CHECKED: u32 = 0x0100;
+const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
+
+const TDN_CREATED: u32 = 0;
+const TDN_BUTTON_CLICKED: u32 = 2;
+const TDN_DESTROYED: u32 = 5;
+const TDN_DIALOG_CONSTRUCTED: u32 = 7;
+
+const HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION: HRESULT = 0x8007_05B3u32 as i32;
+
+unsafe fn resolve_task_dialog_str(hinst: HINSTANCE, ptr: LPCWSTR) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let raw = ptr as usize;
+    if raw <= 0xFFFF {
+        let mut buf = [0u16; 512];
+        let n = crate::user32::misc::LoadStringW(hinst, raw as u32, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            String::new()
+        }
+    } else {
+        crate::strings::from_wide(ptr)
+    }
+}
+
+fn strip_accelerator_ampersands(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                out.push('&');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub unsafe extern "win64" fn TaskDialogIndirect(
-    _config: *const u8,
+    config: *const u8,
     button: *mut i32,
     radio_button: *mut i32,
     verification_flag: *mut BOOL,
@@ -200,8 +292,182 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     if !verification_flag.is_null() {
         verification_flag.write_unaligned(FALSE);
     }
-    stub!("TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)");
-    E_NOTIMPL
+    if config.is_null() {
+        return E_INVALIDARG;
+    }
+    let cfg = (config as *const TaskDialogConfig).read_unaligned();
+    if cfg.cb_size != std::mem::size_of::<TaskDialogConfig>() as u32 {
+        return E_INVALIDARG;
+    }
+    if (cfg.c_buttons > 0 && cfg.p_buttons.is_null())
+        || (cfg.c_radio_buttons > 0 && cfg.p_radio_buttons.is_null())
+    {
+        return E_INVALIDARG;
+    }
+
+    let hinst = cfg.h_instance;
+    let title = resolve_task_dialog_str(hinst, cfg.psz_window_title);
+    let main_inst = resolve_task_dialog_str(hinst, cfg.psz_main_instruction);
+    let content = resolve_task_dialog_str(hinst, cfg.psz_content);
+    let expanded = resolve_task_dialog_str(hinst, cfg.psz_expanded_information);
+    let footer = resolve_task_dialog_str(hinst, cfg.psz_footer);
+
+    // Collect custom buttons followed by common buttons in Windows dialog order.
+    let mut buttons: Vec<(i32, String)> = Vec::new();
+    for i in 0..cfg.c_buttons as usize {
+        let b = cfg.p_buttons.add(i).read_unaligned();
+        let bid = b.button_id;
+        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, b.button_text));
+        buttons.push((bid, if label.is_empty() { format!("Button {bid}") } else { label }));
+    }
+    let common = cfg.dw_common_buttons;
+    if (common & TDCBF_OK_BUTTON) != 0 {
+        buttons.push((1, "OK".into()));
+    }
+    if (common & TDCBF_YES_BUTTON) != 0 {
+        buttons.push((6, "Yes".into()));
+    }
+    if (common & TDCBF_NO_BUTTON) != 0 {
+        buttons.push((7, "No".into()));
+    }
+    if (common & TDCBF_RETRY_BUTTON) != 0 {
+        buttons.push((4, "Retry".into()));
+    }
+    if (common & TDCBF_CANCEL_BUTTON) != 0 {
+        buttons.push((2, "Cancel".into()));
+    }
+    if (common & TDCBF_CLOSE_BUTTON) != 0 {
+        buttons.push((8, "Close".into()));
+    }
+    if buttons.is_empty() {
+        buttons.push((1, "OK".into()));
+    }
+
+    // Resolve default radio button selection.
+    let mut selected_radio: i32 = 0;
+    if cfg.c_radio_buttons > 0 && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
+        let mut first_id = 0i32;
+        let mut found_default = false;
+        for i in 0..cfg.c_radio_buttons as usize {
+            let rb = cfg.p_radio_buttons.add(i).read_unaligned();
+            if i == 0 {
+                first_id = rb.button_id;
+            }
+            if cfg.n_default_radio_button != 0 && rb.button_id == cfg.n_default_radio_button {
+                selected_radio = rb.button_id;
+                found_default = true;
+                break;
+            }
+        }
+        if !found_default {
+            selected_radio = first_id;
+        }
+    }
+    let verified: BOOL = if !cfg.psz_verification_text.is_null()
+        && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0
+    {
+        TRUE
+    } else {
+        FALSE
+    };
+
+    // TD_ERROR_ICON == MAKEINTRESOURCEW(-2) == 0xFFFE.
+    let critical = (cfg.main_icon & 0xFFFF) == 0xFFFE && cfg.main_icon <= 0xFFFF;
+    let caption = if title.is_empty() {
+        if critical { "Error".to_string() } else { "Notice".to_string() }
+    } else {
+        title
+    };
+    let mut body_parts: Vec<&str> = Vec::new();
+    for part in [&main_inst, &content, &expanded, &footer] {
+        if !part.is_empty() {
+            body_parts.push(part.as_str());
+        }
+    }
+    let body = body_parts.join("\n\n");
+    let labels: Vec<String> = buttons.iter().map(|(_, l)| l.clone()).collect();
+
+    if cfg.pf_callback != 0 {
+        let _ = crate::call_guest8(
+            cfg.pf_callback,
+            cfg.hwnd_parent as u64,
+            TDN_DIALOG_CONSTRUCTED as u64,
+            0,
+            0,
+            cfg.lp_callback_data as u64,
+            0,
+            0,
+            0,
+        );
+        let _ = crate::call_guest8(
+            cfg.pf_callback,
+            cfg.hwnd_parent as u64,
+            TDN_CREATED as u64,
+            0,
+            0,
+            cfg.lp_callback_data as u64,
+            0,
+            0,
+            0,
+        );
+    }
+
+    let chosen_id = if let Some(idx) = crate::macos::alert(caption, body, labels, critical) {
+        buttons.get(idx).map(|(id, _)| *id).unwrap_or(buttons[0].0)
+    } else if buttons.len() == 1 {
+        buttons[0].0
+    } else {
+        if cfg.pf_callback != 0 {
+            let _ = crate::call_guest8(
+                cfg.pf_callback,
+                cfg.hwnd_parent as u64,
+                TDN_DESTROYED as u64,
+                0,
+                0,
+                cfg.lp_callback_data as u64,
+                0,
+                0,
+                0,
+            );
+        }
+        return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
+    };
+
+    if cfg.pf_callback != 0 {
+        let _ = crate::call_guest8(
+            cfg.pf_callback,
+            cfg.hwnd_parent as u64,
+            TDN_BUTTON_CLICKED as u64,
+            chosen_id as u64,
+            0,
+            cfg.lp_callback_data as u64,
+            0,
+            0,
+            0,
+        );
+        let _ = crate::call_guest8(
+            cfg.pf_callback,
+            cfg.hwnd_parent as u64,
+            TDN_DESTROYED as u64,
+            0,
+            0,
+            cfg.lp_callback_data as u64,
+            0,
+            0,
+            0,
+        );
+    }
+
+    if !button.is_null() {
+        button.write_unaligned(chosen_id);
+    }
+    if !radio_button.is_null() {
+        radio_button.write_unaligned(selected_radio);
+    }
+    if !verification_flag.is_null() {
+        verification_flag.write_unaligned(verified);
+    }
+    S_OK
 }
 
 // ---------------------------------------------------------------------------
@@ -581,13 +847,77 @@ mod tests {
             assert_eq!(OpenThemeDataForDpi(std::ptr::null_mut(), std::ptr::null(), 96), 0);
             assert_eq!(CloseThemeData(0), E_HANDLE);
             assert_eq!(DrawThemeBackground(0, 0, 0, 0, std::ptr::null(), std::ptr::null()), E_HANDLE);
+            // Non-zero unopened HTHEME must also fail with E_HANDLE when visual styles are off.
+            assert_eq!(DrawThemeBackground(0x1234, 1, 1, 1, std::ptr::null(), std::ptr::null()), E_HANDLE);
 
+            // Null config or wrong cbSize returns E_INVALIDARG and clears out params.
             let mut btn = 99;
             let mut radio = 99;
             let mut verified = TRUE;
             let hr = TaskDialogIndirect(std::ptr::null(), &mut btn, &mut radio, &mut verified);
-            assert_eq!(hr, E_NOTIMPL);
+            assert_eq!(hr, E_INVALIDARG);
             assert_eq!((btn, radio, verified), (0, 0, FALSE));
+
+            // Single-button informational TaskDialogIndirect succeeds in headless mode,
+            // resolving default radio button, verification flag, and invoking callback lifecycle.
+            static CB_MSGS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+            unsafe extern "win64" fn td_cb(
+                _hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                CB_MSGS.lock().unwrap().push((msg, wp as u64));
+                S_OK
+            }
+            let title_w = crate::strings::to_wide_z("Notice");
+            let radio_lbl = crate::strings::to_wide_z("Option &1");
+            let ver_lbl = crate::strings::to_wide_z("Remember choice");
+            let radios = [
+                TaskDialogButton { button_id: 201, button_text: radio_lbl.as_ptr() },
+                TaskDialogButton { button_id: 202, button_text: radio_lbl.as_ptr() },
+            ];
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_flags = TDF_VERIFICATION_FLAG_CHECKED;
+            cfg.dw_common_buttons = TDCBF_CLOSE_BUTTON;
+            cfg.psz_window_title = title_w.as_ptr();
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.n_default_radio_button = 202;
+            cfg.psz_verification_text = ver_lbl.as_ptr();
+            cfg.pf_callback = td_cb as *const () as usize;
+
+            CB_MSGS.lock().unwrap().clear();
+            let hr = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            assert_eq!(hr, S_OK);
+            assert_eq!(btn, 8); // IDCLOSE
+            assert_eq!(radio, 202);
+            assert_eq!(verified, TRUE);
+            let msgs = CB_MSGS.lock().unwrap().clone();
+            assert_eq!(
+                msgs,
+                vec![(TDN_DIALOG_CONSTRUCTED, 0), (TDN_CREATED, 0), (TDN_BUTTON_CLICKED, 8), (TDN_DESTROYED, 0)]
+            );
+
+            // Multi-button prompt in headless mode returns HRESULT_FROM_WIN32(ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION).
+            cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            cfg.pf_callback = 0;
+            btn = 99;
+            let hr_multi = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            assert_eq!(hr_multi, HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION);
+            assert_eq!(btn, 0);
         }
     }
 

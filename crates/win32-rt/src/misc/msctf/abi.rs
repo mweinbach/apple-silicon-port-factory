@@ -105,6 +105,8 @@ pub(super) const IID_ITFREADONLYPROPERTY: Guid =
     Guid::new(0x17D49A3D, 0xF8B8, 0x4B2F, [0xB2, 0x54, 0x52, 0x31, 0x9D, 0xD6, 0x4C, 0x53]);
 pub(super) const IID_IENUMTFPROPERTIES: Guid =
     Guid::new(0x19188CB0, 0xACA9, 0x11D2, [0xAF, 0xC5, 0x00, 0x10, 0x5A, 0x27, 0x99, 0xB5]);
+pub(super) const IID_IENUMTFPROPERTYVALUE: Guid =
+    Guid::new(0x8ED8981B, 0x7C10, 0x4D7D, [0x9F, 0xB3, 0xAB, 0x72, 0xE9, 0xC7, 0x5F, 0x72]);
 pub(super) const IID_ITFRANGE: Guid =
     Guid::new(0xAA80E7FF, 0x2021, 0x11D2, [0x93, 0xE0, 0x00, 0x60, 0xB0, 0x67, 0xB8, 0x6E]);
 pub(super) const IID_IENUMTFRANGES: Guid =
@@ -268,6 +270,15 @@ pub(super) struct TF_DISPLAYATTRIBUTE {
     pub(super) b_attr: i32,
 }
 const _: () = assert!(std::mem::size_of::<TF_DISPLAYATTRIBUTE>() == 36);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct TF_PROPERTYVAL {
+    pub(super) guid_id: Guid,
+    pub(super) var_value: [u8; 24],
+}
+const _: () = assert!(std::mem::size_of::<TF_PROPERTYVAL>() == 40);
+const _: () = assert!(std::mem::offset_of!(TF_PROPERTYVAL, var_value) == 16);
 
 // ---------------------------------------------------------------------------
 // Shared COM vtable structs (`ITfSource`, `ITfSourceSingle`, `ITfCompartmentMgr`)

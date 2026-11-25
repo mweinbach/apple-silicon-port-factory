@@ -863,3 +863,115 @@ fn draw_text_layout_with_underline_and_drawing_effect() {
         release_com(dc);
     }
 }
+
+#[test]
+fn geometry_tessellate_rect_concave_l_shape_and_ellipse() {
+    use super::geometry::{
+        geom_tessellate, gsink_add_line, gsink_begin_figure, gsink_close, gsink_end_figure,
+        path_geom_open, PGeom, PGeomSink,
+    };
+
+    #[repr(C)]
+    struct MockTessSink {
+        vtbl: *const [usize; 5],
+        tris: Vec<D2D1_TRIANGLE>,
+    }
+    unsafe extern "win64" fn mock_qi(_this: *mut MockTessSink, _riid: *const u8, ppv: *mut *mut c_void) -> HRESULT {
+        if !ppv.is_null() { ppv.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mock_addref(_this: *mut MockTessSink) -> u32 { 1 }
+    unsafe extern "win64" fn mock_release(_this: *mut MockTessSink) -> u32 { 1 }
+    unsafe extern "win64" fn mock_add_tris(this: *mut MockTessSink, tris: *const D2D1_TRIANGLE, count: u32) {
+        let sink = &mut *this;
+        for i in 0..count as usize {
+            sink.tris.push(tris.add(i).read_unaligned());
+        }
+    }
+    unsafe extern "win64" fn mock_close(_this: *mut MockTessSink) -> HRESULT { S_OK }
+
+    fn tri_area_sum(tris: &[D2D1_TRIANGLE]) -> f32 {
+        tris.iter()
+            .map(|t| {
+                let ax = t.point2.x - t.point1.x;
+                let ay = t.point2.y - t.point1.y;
+                let bx = t.point3.x - t.point1.x;
+                let by = t.point3.y - t.point1.y;
+                0.5 * (ax * by - ay * bx).abs()
+            })
+            .sum()
+    }
+
+    unsafe {
+        let vtbl: [usize; 5] = [
+            mock_qi as *const () as usize,
+            mock_addref as *const () as usize,
+            mock_release as *const () as usize,
+            mock_add_tris as *const () as usize,
+            mock_close as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D2D1CreateFactory(
+                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                &IID_ID2D1_FACTORY as *const GUID as *const u8,
+                std::ptr::null(),
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        // 1. Rectangle (10x20 -> 2 triangles, area 200; scaled by 2x -> area 800).
+        let rect = D2D1_RECT_F { left: 0.0, top: 0.0, right: 10.0, bottom: 20.0 };
+        let mut rgeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_rect_geom(fac as PFactory, &rect, &mut rgeom), S_OK);
+        let mut sink = MockTessSink { vtbl: &vtbl, tris: Vec::new() };
+        assert_eq!(geom_tessellate(rgeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 2);
+        assert!((tri_area_sum(&sink.tris) - 200.0).abs() < 1e-2);
+
+        sink.tris.clear();
+        let scale2 = D2D1_MATRIX_3X2_F { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 5.0, dy: 5.0 };
+        assert_eq!(geom_tessellate(rgeom as PGeom, &scale2, 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 2);
+        assert!((tri_area_sum(&sink.tris) - 800.0).abs() < 1e-2);
+
+        // 2. Concave L-shape polygon (6 vertices -> 4 triangles, area = 10*10 - 5*5 = 75).
+        let mut pgeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_path_geom(fac as PFactory, &mut pgeom), S_OK);
+        let mut psink: *mut c_void = std::ptr::null_mut();
+        assert_eq!(path_geom_open(pgeom as PGeom, &mut psink), S_OK);
+        gsink_begin_figure(psink as PGeomSink, D2D1_POINT_2F { x: 0.0, y: 0.0 }.to_u64(), D2D1_FIGURE_BEGIN_FILLED);
+        for &(x, y) in &[(10.0, 0.0), (10.0, 5.0), (5.0, 5.0), (5.0, 10.0), (0.0, 10.0)] {
+            gsink_add_line(psink as PGeomSink, D2D1_POINT_2F { x, y }.to_u64());
+        }
+        gsink_end_figure(psink as PGeomSink, D2D1_FIGURE_END_CLOSED);
+        assert_eq!(gsink_close(psink as PGeomSink), S_OK);
+
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(pgeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert_eq!(sink.tris.len(), 4);
+        assert!((tri_area_sum(&sink.tris) - 75.0).abs() < 1e-2, "L-shape area {}", tri_area_sum(&sink.tris));
+
+        // 3. Ellipse (r=10 -> area ~ pi*100 = 314.16).
+        let el = D2D1_ELLIPSE { point: D2D1_POINT_2F { x: 0.0, y: 0.0 }, radiusX: 10.0, radiusY: 10.0 };
+        let mut egeom: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_ellipse_geom(fac as PFactory, &el, &mut egeom), S_OK);
+        sink.tris.clear();
+        assert_eq!(geom_tessellate(egeom as PGeom, std::ptr::null(), 0.25, &mut sink as *mut _ as *mut c_void), S_OK);
+        assert!(sink.tris.len() >= 20);
+        let el_area = tri_area_sum(&sink.tris);
+        assert!((el_area - std::f32::consts::PI * 100.0).abs() < 10.0, "ellipse area {el_area}");
+
+        // Null sink returns E_POINTER.
+        assert_eq!(geom_tessellate(rgeom as PGeom, std::ptr::null(), 0.25, std::ptr::null_mut()), E_POINTER);
+
+        release_com(egeom);
+        release_com(psink);
+        release_com(pgeom);
+        release_com(rgeom);
+        release_com(fac);
+    }
+}

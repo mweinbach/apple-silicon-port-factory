@@ -1029,14 +1029,170 @@ unsafe extern "win64" fn geom_simplify(
 }
 crate::win64_bridge!(fn geom_simplify(PGeom, u32, *const D2D1_MATRIX_3X2_F, f32, *mut c_void) -> HRESULT);
 
-unsafe extern "win64" fn geom_tessellate(
-    _this: PGeom,
-    _world: *const D2D1_MATRIX_3X2_F,
-    _tol: f32,
-    _sink: *mut c_void,
+fn triangulate_polygon(raw_pts: &[(f32, f32)], out: &mut Vec<D2D1_TRIANGLE>) {
+    // Strip consecutive duplicate vertices (and closing duplicate).
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(raw_pts.len());
+    for &(x, y) in raw_pts {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        if let Some(&(lx, ly)) = pts.last() {
+            if (x - lx).hypot(y - ly) < 1e-5 {
+                continue;
+            }
+        }
+        pts.push((x, y));
+    }
+    while pts.len() >= 2 {
+        let (fx, fy) = pts[0];
+        let (lx, ly) = *pts.last().unwrap();
+        if (fx - lx).hypot(fy - ly) < 1e-5 {
+            pts.pop();
+        } else {
+            break;
+        }
+    }
+    if pts.len() < 3 {
+        return;
+    }
+
+    // Ensure positive signed area (counter-clockwise in standard coordinates)
+    // so convex corners satisfy cross(b - a, c - b) > 0.
+    let mut area2 = 0.0f64;
+    for i in 0..pts.len() {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % pts.len()];
+        area2 += (x0 as f64) * (y1 as f64) - (x1 as f64) * (y0 as f64);
+    }
+    if area2.abs() < 1e-8 {
+        return;
+    }
+    if area2 < 0.0 {
+        pts.reverse();
+    }
+
+    let cross = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> f64 {
+        ((b.0 - a.0) as f64) * ((c.1 - a.1) as f64) - ((b.1 - a.1) as f64) * ((c.0 - a.0) as f64)
+    };
+    let pt_in_tri = |p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> bool {
+        let c1 = cross(a, b, p);
+        let c2 = cross(b, c, p);
+        let c3 = cross(c, a, p);
+        c1 >= -1e-7 && c2 >= -1e-7 && c3 >= -1e-7
+    };
+
+    let mut idx: Vec<usize> = (0..pts.len()).collect();
+    while idx.len() > 3 {
+        let n = idx.len();
+        let mut ear_pos: Option<usize> = None;
+        for i in 0..n {
+            let i_prev = idx[(i + n - 1) % n];
+            let i_curr = idx[i];
+            let i_next = idx[(i + 1) % n];
+            let a = pts[i_prev];
+            let b = pts[i_curr];
+            let c = pts[i_next];
+            if cross(a, b, c) <= 1e-7 {
+                continue;
+            }
+            let mut contains_other = false;
+            for &k in &idx {
+                if k == i_prev || k == i_curr || k == i_next {
+                    continue;
+                }
+                let p = pts[k];
+                if (p.0 - a.0).abs() < 1e-5 && (p.1 - a.1).abs() < 1e-5
+                    || (p.0 - b.0).abs() < 1e-5 && (p.1 - b.1).abs() < 1e-5
+                    || (p.0 - c.0).abs() < 1e-5 && (p.1 - c.1).abs() < 1e-5
+                {
+                    continue;
+                }
+                if pt_in_tri(p, a, b, c) {
+                    contains_other = true;
+                    break;
+                }
+            }
+            if !contains_other {
+                ear_pos = Some(i);
+                break;
+            }
+        }
+        // Fallback for degenerate / self-touching polygons: clip the best convex (or first) corner
+        // so triangulation always makes progress and terminates in O(n^2).
+        let pos = ear_pos.unwrap_or_else(|| {
+            (0..n)
+                .max_by(|&i, &j| {
+                    let ci = cross(pts[idx[(i + n - 1) % n]], pts[idx[i]], pts[idx[(i + 1) % n]]);
+                    let cj = cross(pts[idx[(j + n - 1) % n]], pts[idx[j]], pts[idx[(j + 1) % n]]);
+                    ci.total_cmp(&cj)
+                })
+                .unwrap_or(0)
+        });
+        let a = pts[idx[(pos + n - 1) % n]];
+        let b = pts[idx[pos]];
+        let c = pts[idx[(pos + 1) % n]];
+        if cross(a, b, c).abs() > 1e-8 {
+            out.push(D2D1_TRIANGLE {
+                point1: D2D1_POINT_2F { x: a.0, y: a.1 },
+                point2: D2D1_POINT_2F { x: b.0, y: b.1 },
+                point3: D2D1_POINT_2F { x: c.0, y: c.1 },
+            });
+        }
+        idx.remove(pos);
+    }
+    if idx.len() == 3 {
+        let a = pts[idx[0]];
+        let b = pts[idx[1]];
+        let c = pts[idx[2]];
+        if cross(a, b, c).abs() > 1e-8 {
+            out.push(D2D1_TRIANGLE {
+                point1: D2D1_POINT_2F { x: a.0, y: a.1 },
+                point2: D2D1_POINT_2F { x: b.0, y: b.1 },
+                point3: D2D1_POINT_2F { x: c.0, y: c.1 },
+            });
+        }
+    }
+}
+
+pub(super) unsafe extern "win64" fn geom_tessellate(
+    this: PGeom,
+    world: *const D2D1_MATRIX_3X2_F,
+    tol: f32,
+    sink: *mut c_void,
 ) -> HRESULT {
-    crate::stub!("ID2D1Geometry::Tessellate -> E_NOTIMPL");
-    E_NOTIMPL
+    if this.is_null() || sink.is_null() {
+        return E_POINTER;
+    }
+    let vtbl = (sink as *const *const usize).read_unaligned();
+    if vtbl.is_null() {
+        return E_INVALIDARG;
+    }
+    let fn_add_triangles = vtbl.add(3).read_unaligned();
+    if fn_add_triangles == 0 {
+        return E_INVALIDARG;
+    }
+    let m = (!world.is_null()).then(|| world.read_unaligned());
+    let fg = ComObj::inner(this).flatten(m.as_ref(), tol.max(0.1));
+    let mut triangles = Vec::new();
+    for sp in &fg.subpaths {
+        if sp.filled && sp.points.len() >= 3 {
+            triangulate_polygon(&sp.points, &mut triangles);
+        }
+    }
+    if !triangles.is_empty() {
+        crate::call_guest8(
+            fn_add_triangles,
+            sink as u64,
+            triangles.as_ptr() as u64,
+            triangles.len() as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+    S_OK
 }
 crate::win64_bridge!(fn geom_tessellate(PGeom, *const D2D1_MATRIX_3X2_F, f32, *mut c_void) -> HRESULT);
 

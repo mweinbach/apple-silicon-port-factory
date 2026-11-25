@@ -844,22 +844,72 @@ pub unsafe extern "win64" fn GetTextExtentPoint32A(hdc: usize, s: LPCSTR, n: i32
     TRUE
 }
 
-pub unsafe extern "win64" fn GetDeviceCaps(_hdc: usize, index: i32) -> i32 {
+pub unsafe extern "win64" fn GetDeviceCaps(hdc: usize, index: i32) -> i32 {
     let mon = crate::user32::monitor::primary_rect();
-    match index {
-        8 | 118 => mon.width(),                                        // HORZRES, DESKTOPHORZRES
-        10 | 117 => mon.height(),                                      // VERTRES, DESKTOPVERTRES
-        12 => 32,                                                      // BITSPIXEL
-        14 => 1,                                                       // PLANES
-        88 | 90 => crate::user32::window::dpi() as i32,                // LOGPIXELSX/Y
-        116 => crate::macos::display::monitors()[0].refresh_hz as i32, // VREFRESH
-        4 => (mon.width() as f64 / 96.0 * 25.4) as i32,                // HORZSIZE (mm)
-        6 => (mon.height() as f64 / 96.0 * 25.4) as i32,               // VERTSIZE (mm)
-        24 => -1,                                                      // NUMCOLORS (>8bpp)
-        _ => {
-            stub!("GetDeviceCaps({index}) -> 0");
-            0
+    let dpi = crate::user32::window::dpi().max(1) as i32;
+    let refresh = crate::macos::display::monitors()
+        .first()
+        .map(|m| m.refresh_hz as i32)
+        .unwrap_or(60);
+
+    // If `hdc` is a memory DC with a non-stock bitmap selected, report its surface
+    // dimensions and color format for HORZRES/VERTRES/BITSPIXEL/PLANES.
+    let mem_surface: Option<(i32, i32, i32, i32)> = if hdc != 0 {
+        let m = objs().lock().unwrap();
+        if let Some(Obj::Dc(dc)) = m.get(&hdc) {
+            if dc.window == 0 {
+                if let Some(Obj::Bitmap(bm)) = m.get(&dc.bitmap) {
+                    Some((bm.width as i32, bm.height as i32, bm.bpp as i32, bm.planes as i32))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         }
+    } else {
+        None
+    };
+
+    let (w, h, bpp, planes) = mem_surface.unwrap_or((mon.width(), mon.height(), 32, 1));
+    match index {
+        0 => 0x4000,                                                 // DRIVERVERSION (4.0)
+        2 => 1,                                                      // TECHNOLOGY (DT_RASDISPLAY)
+        4 => ((w as f64) / (dpi as f64) * 25.4).round() as i32,      // HORZSIZE (mm)
+        6 => ((h as f64) / (dpi as f64) * 25.4).round() as i32,      // VERTSIZE (mm)
+        8 => w,                                                      // HORZRES
+        10 => h,                                                     // VERTRES
+        12 => bpp,                                                   // BITSPIXEL
+        14 => planes,                                                // PLANES
+        16 => -1,                                                    // NUMBRUSHES
+        18 => -1,                                                    // NUMPENS
+        20 => 0,                                                     // NUMMARKERS
+        22 => 0,                                                     // NUMFONTS
+        24 => if bpp <= 8 { 1 << bpp } else { -1 },                  // NUMCOLORS
+        26 => 0,                                                     // PDEVICESIZE
+        28 => 0x01FF,                                                // CURVECAPS
+        30 => 0x00FE,                                                // LINECAPS
+        32 => 0x00FF,                                                // POLYGONALCAPS
+        34 => 0x7804,                                                // TEXTCAPS
+        36 => 1,                                                     // CLIPCAPS (CP_RECTANGLE)
+        38 => 0x7E99,                                                // RASTERCAPS
+        40 => 36,                                                    // ASPECTX
+        42 => 36,                                                    // ASPECTY
+        44 => 51,                                                    // ASPECTXY
+        45 => 3,                                                     // SHADEBLENDCAPS (SB_CONST_ALPHA|SB_PIXEL_ALPHA)
+        88 | 90 => dpi,                                              // LOGPIXELSX / LOGPIXELSY
+        104 => 0,                                                    // SIZEPALETTE
+        106 => 20,                                                   // NUMRESERVED
+        108 => bpp.min(24),                                          // COLORRES
+        110..=115 => 0,                                              // PHYSICAL*, SCALINGFACTOR*
+        116 => refresh,                                              // VREFRESH
+        117 => mon.height(),                                         // DESKTOPVERTRES
+        118 => mon.width(),                                          // DESKTOPHORZRES
+        119 => 0,                                                    // BLTALIGNMENT
+        121 => 0,                                                    // COLORMGMTCAPS (CM_NONE)
+        _ => 0,                                                      // Windows returns 0 for unknown indices
     }
 }
 
@@ -1913,6 +1963,40 @@ mod tests {
             assert_eq!(GetDeviceGammaRamp(0, got.as_mut_ptr()), FALSE);
             assert_eq!(SetDeviceGammaRamp(0, custom.as_ptr()), FALSE);
 
+            DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn get_device_caps_display_and_memdc_indices() {
+        unsafe {
+            assert_eq!(GetDeviceCaps(0, 0), 0x4000); // DRIVERVERSION
+            assert_eq!(GetDeviceCaps(0, 2), 1); // TECHNOLOGY == DT_RASDISPLAY
+            assert!(GetDeviceCaps(0, 8) > 0); // HORZRES
+            assert!(GetDeviceCaps(0, 10) > 0); // VERTRES
+            assert_eq!(GetDeviceCaps(0, 12), 32); // BITSPIXEL
+            assert_eq!(GetDeviceCaps(0, 14), 1); // PLANES
+            assert_eq!(GetDeviceCaps(0, 24), -1); // NUMCOLORS
+            assert_eq!(GetDeviceCaps(0, 36), 1); // CLIPCAPS
+            assert_ne!(GetDeviceCaps(0, 38), 0); // RASTERCAPS
+            assert_eq!(GetDeviceCaps(0, 45), 3); // SHADEBLENDCAPS
+            assert!(GetDeviceCaps(0, 88) >= 96); // LOGPIXELSX
+            assert_eq!(GetDeviceCaps(0, 108), 24); // COLORRES
+            assert!(GetDeviceCaps(0, 116) >= 30); // VREFRESH
+            assert_eq!(GetDeviceCaps(0, 9999), 0); // unknown index -> 0
+
+            // Memory DC with selected 64x32 24bpp DIB reports bitmap dimensions/depth.
+            let dc = CreateCompatibleDC(0);
+            let bmi = make_bmi_header(64, -32, 24);
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(dc, bmi.as_ptr(), 0, &mut bits, std::ptr::null_mut(), 0);
+            let old = SelectObject(dc, hbm);
+            assert_eq!(GetDeviceCaps(dc, 8), 64);
+            assert_eq!(GetDeviceCaps(dc, 10), 32);
+            assert_eq!(GetDeviceCaps(dc, 12), 24);
+            assert_eq!(GetDeviceCaps(dc, 108), 24);
+            SelectObject(dc, old);
+            DeleteObject(hbm);
             DeleteDC(dc);
         }
     }

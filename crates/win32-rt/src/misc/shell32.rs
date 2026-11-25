@@ -1437,6 +1437,116 @@ const fn hresult_from_win32(code: u32) -> HRESULT {
     }
 }
 
+fn percent_decode_utf8(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn known_folder_name_path(name: &str) -> Option<String> {
+    let u = user();
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "desktop" => format!("C:\\users\\{u}\\Desktop"),
+        "personal" | "my documents" | "documents" => format!("C:\\users\\{u}\\Documents"),
+        "local appdata" | "localappdata" => format!("C:\\users\\{u}\\AppData\\Local"),
+        "localappdatalow" | "locallow" => format!("C:\\users\\{u}\\AppData\\LocalLow"),
+        "appdata" | "roamingappdata" | "roaming appdata" => format!("C:\\users\\{u}\\AppData\\Roaming"),
+        "savedgames" | "saved games" => format!("C:\\users\\{u}\\Saved Games"),
+        "downloads" => format!("C:\\users\\{u}\\Downloads"),
+        "profile" | "userprofile" => format!("C:\\users\\{u}"),
+        "pictures" | "my pictures" => format!("C:\\users\\{u}\\Pictures"),
+        "music" | "my music" => format!("C:\\users\\{u}\\Music"),
+        "videos" | "my video" | "my videos" => format!("C:\\users\\{u}\\Videos"),
+        "favorites" => format!("C:\\users\\{u}\\Favorites"),
+        "common appdata" | "programdata" => "C:\\ProgramData".into(),
+        "public" => "C:\\users\\Public".into(),
+        "common documents" | "publicdocuments" => "C:\\users\\Public\\Documents".into(),
+        "common desktop" | "publicdesktop" => "C:\\users\\Public\\Desktop".into(),
+        "windows" => "C:\\Windows".into(),
+        "system" | "system32" => "C:\\Windows\\System32".into(),
+        "systemx86" | "syswow64" => "C:\\Windows\\SysWOW64".into(),
+        "fonts" => "C:\\Windows\\Fonts".into(),
+        "programfiles" | "program files" => "C:\\Program Files".into(),
+        "programfilesx86" | "program files (x86)" => "C:\\Program Files (x86)".into(),
+        "startup" => format!("C:\\users\\{u}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"),
+        _ => return None,
+    })
+}
+
+/// Resolve supported `file:///` URLs, `shell:<KnownFolderName>`, and filesystem-backed
+/// `::{<FOLDERID>}` / `shell:::{<FOLDERID>}` parsing names into `(win_path, is_known_folder_root)`.
+fn resolve_filesystem_parsing_name(raw: &str) -> Option<(String, bool)> {
+    let s = raw.trim();
+    let lower = s.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("file:///")
+        .or_else(|| lower.strip_prefix("file://localhost/"))
+    {
+        let start = s.len() - rest.len();
+        let decoded = percent_decode_utf8(&s[start..]).replace('/', "\\");
+        if decoded.len() >= 2 && decoded.as_bytes()[1] == b':' {
+            return Some((decoded, false));
+        }
+        return None;
+    }
+
+    // `::{<FOLDERID>}[\\subpath]` or `shell:::{<FOLDERID>}[\\subpath]`
+    let guid_body = if let Some(r) = lower.strip_prefix("shell:::") {
+        Some(&s[s.len() - r.len()..])
+    } else if let Some(r) = s.strip_prefix("::") {
+        Some(r)
+    } else {
+        None
+    };
+    if let Some(body) = guid_body {
+        if body.starts_with('{') {
+            if let Some(end) = body.find('}') {
+                let guid = body[..=end].to_ascii_uppercase();
+                if let Some(base) = known_folder_path(&guid) {
+                    let tail = body[end + 1..].trim_start_matches(['\\', '/']);
+                    return Some(if tail.is_empty() {
+                        (base, true)
+                    } else {
+                        (format!("{base}\\{}", tail.replace('/', "\\")), false)
+                    });
+                }
+            }
+        }
+        return None;
+    }
+
+    // `shell:<KnownFolderName>[\\subpath]`
+    if let Some(r) = lower.strip_prefix("shell:") {
+        let body = &s[s.len() - r.len()..];
+        let (head, tail) = match body.find(['\\', '/']) {
+            Some(pos) => (&body[..pos], body[pos + 1..].trim_start_matches(['\\', '/'])),
+            None => (body, ""),
+        };
+        if let Some(base) = known_folder_name_path(head) {
+            return Some(if tail.is_empty() {
+                (base, true)
+            } else {
+                (format!("{base}\\{}", tail.replace('/', "\\")), false)
+            });
+        }
+    }
+    None
+}
+
 /// Reject virtual shell namespaces, CLSID parsing paths, URI schemes, and UNC network shares
 /// before falling through to the local Windows VFS.
 fn is_unsupported_shell_namespace(raw: &str) -> bool {
@@ -1729,11 +1839,18 @@ pub unsafe extern "win64" fn SHCreateItemFromParsingName(
     if raw.is_empty() {
         return E_INVALIDARG;
     }
-    if is_unsupported_shell_namespace(&raw) {
+    let resolved_path = if let Some((mapped, is_known_root)) = resolve_filesystem_parsing_name(&raw) {
+        if is_known_root {
+            ensure_dir(&mapped);
+        }
+        mapped
+    } else if is_unsupported_shell_namespace(&raw) {
         stub!("SHCreateItemFromParsingName: unsupported shell namespace {raw:?}");
         return E_NOTIMPL;
-    }
-    let win_path = crate::path::absolute(&raw);
+    } else {
+        raw
+    };
+    let win_path = crate::path::absolute(&resolved_path);
     let Some(host_path) = crate::path::to_host(&win_path) else {
         return hresult_from_win32(err::ERROR_PATH_NOT_FOUND);
     };
@@ -2026,6 +2143,63 @@ mod tests {
             assert_eq!(read_and_free_name(item_ptr, SIGDN_NORMALDISPLAY), "report.txt");
             assert_eq!(read_and_free_name(item_ptr, SIGDN_PARENTRELATIVEPARSING), "report.txt");
             assert_eq!(read_and_free_name(item_ptr, SIGDN_URL), "file:///S:/ItemTest/sub/report.txt");
+
+            // 3b. file:/// URL (with percent-encoding), shell:<KnownFolderName>, and ::{<FOLDERID>} parsing names.
+            std::fs::write(root.join("sub/my file.txt"), b"space test").unwrap();
+            let url_w = crate::strings::to_wide_z("file:///S:/ItemTest/sub/my%20file.txt");
+            let mut url_item: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(url_w.as_ptr(), std::ptr::null_mut(), iid_item.as_ptr(), &mut url_item),
+                S_OK
+            );
+            assert_eq!(read_and_free_name(url_item, SIGDN_FILESYSPATH), "S:\\ItemTest\\sub\\my file.txt");
+            assert_eq!(crate::com::com_call_release(url_item), 0);
+
+            let missing_url_w = crate::strings::to_wide_z("file:///S:/ItemTest/sub/does_not_exist.txt");
+            let mut missing_url_item: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    missing_url_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut missing_url_item
+                ),
+                hresult_from_win32(err::ERROR_FILE_NOT_FOUND)
+            );
+            assert!(missing_url_item.is_null());
+
+            let docs_win = known_folder_name_path("Documents").unwrap();
+            if crate::path::to_host(&docs_win).is_none() {
+                std::fs::create_dir_all(root.join("docs")).unwrap();
+                crate::path::add_mount(&docs_win, &root.join("docs"));
+            }
+            let shell_docs_w = crate::strings::to_wide_z("shell:Documents");
+            let mut docs_item: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    shell_docs_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut docs_item
+                ),
+                S_OK
+            );
+            assert!(read_and_free_name(docs_item, SIGDN_FILESYSPATH).ends_with("\\Documents"));
+            assert_eq!(crate::com::com_call_release(docs_item), 0);
+
+            let guid_docs_w = crate::strings::to_wide_z("::{FDD39AD0-238F-46AF-ADB4-6C85480369C7}");
+            let mut guid_item: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    guid_docs_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    iid_item.as_ptr(),
+                    &mut guid_item
+                ),
+                S_OK
+            );
+            assert!(read_and_free_name(guid_item, SIGDN_FILESYSPATH).ends_with("\\Documents"));
+            assert_eq!(crate::com::com_call_release(guid_item), 0);
 
             // Unaligned (odd-address) Unicode parsing-name buffer through SHCreateItemFromParsingName.
             std::fs::write(root.join("sub/odd-\u{1F680}.txt"), b"odd unicode").unwrap();
