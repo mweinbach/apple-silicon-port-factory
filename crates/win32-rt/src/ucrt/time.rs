@@ -587,7 +587,17 @@ fn strftime_str_with_names(fmt: &[u32], tm: &Tm, names: &super::locale::TimeLoca
 }
 
 unsafe fn time_names_from_snapshot(ptr: *mut c_void) -> super::locale::TimeLocaleNames {
-    let d = &*(ptr as *const LcTimeData);
+    let d = std::ptr::read_unaligned(ptr as *const LcTimeData);
+    let snapshot_cp = if crate::heap::size(ptr).is_some_and(|sz| sz >= std::mem::size_of::<LcTimeSnapshot>()) {
+        let snap = std::ptr::read_unaligned(ptr as *const LcTimeSnapshot);
+        if snap.magic == LC_TIME_SNAPSHOT_MAGIC {
+            Some(snap.cp)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let read_pair = |w: *const u16, a: *const u8, fallback: &str| -> String {
         if !w.is_null() {
             crate::strings::from_wide(w)
@@ -614,7 +624,9 @@ unsafe fn time_names_from_snapshot(ptr: *mut c_void) -> super::locale::TimeLocal
     let long_date = read_pair(d.w_ww_ldatefmt, d.ww_ldatefmt, "dddd, MMMM dd, yyyy");
     let time_fmt = read_pair(d.w_ww_timefmt, d.ww_timefmt, "HH:mm:ss");
     let is_c = bcp47.is_empty();
-    let cp = if is_c {
+    let cp = if let Some(cp) = snapshot_cp {
+        cp
+    } else if is_c {
         0
     } else {
         let default_cp = crate::kernel32::string::resolve_locale_tag(&bcp47)
@@ -622,8 +634,8 @@ unsafe fn time_names_from_snapshot(ptr: *mut c_void) -> super::locale::TimeLocal
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&c| c != 0 && crate::kernel32::string::valid_cp(c))
             .unwrap_or(65001);
-        // Distinguish `<locale>.utf8` from `<locale>.<ansi_cp>` by checking whether any
-        // non-ASCII narrow string stored in `LcTimeData` matches UTF-8 rather than `default_cp`.
+        // Fallback for caller-synthesized `LcTimeData` without our trailing snapshot trailer:
+        // distinguish `<locale>.utf8` from `<locale>.<ansi_cp>` via stored narrow strings.
         let mut is_utf8 = default_cp == 65001;
         if !is_utf8 {
             for (ptr_a, s) in d
@@ -866,6 +878,18 @@ struct LcTimeData {
     w_ww_locale_name: *const u16,
 }
 
+const LC_TIME_SNAPSHOT_MAGIC: u64 = 0x544E_414D_4553_4350; // "TNAMESCP"
+
+/// Heap block returned by `_Gettnames`: exact 704-byte `__crt_lc_time_data` prefix followed by
+/// the captured `LC_TIME` code page so `_Strftime` preserves non-default selections (e.g. `.850`).
+#[repr(C)]
+struct LcTimeSnapshot {
+    data: LcTimeData,
+    magic: u64,
+    cp: u32,
+    _pad: u32,
+}
+
 pub unsafe extern "win64" fn _Gettnames() -> *mut c_void {
     let names = super::locale::time_locale_names(std::ptr::null_mut());
     let cp = names.cp;
@@ -892,8 +916,14 @@ pub unsafe extern "win64" fn _Gettnames() -> *mut c_void {
         w_ww_timefmt: w(&names.time_fmt),
         w_ww_locale_name: w(&names.bcp47),
     };
-    let p = crate::heap::alloc(std::mem::size_of::<LcTimeData>(), false) as *mut LcTimeData;
-    std::ptr::write(p, d);
+    let snap = LcTimeSnapshot {
+        data: d,
+        magic: LC_TIME_SNAPSHOT_MAGIC,
+        cp,
+        _pad: 0,
+    };
+    let p = crate::heap::alloc(std::mem::size_of::<LcTimeSnapshot>(), false) as *mut LcTimeSnapshot;
+    std::ptr::write(p, snap);
     p as *mut c_void
 }
 pub unsafe extern "win64" fn _W_Gettnames() -> *mut c_void {
@@ -958,6 +988,30 @@ mod tests {
             assert_eq!(String::from_utf16_lossy(&wbuf[..wn_de_snap]), "Dienstag November");
             crate::heap::free(tn_c);
             crate::heap::free(tn_de);
+
+            // Explicit non-default code pages (e.g. de-DE.850 vs de-DE CP1252 vs de-DE.utf8)
+            // are preserved in _Gettnames() snapshots and honored by _Strftime.
+            let mut tm_mar = tm;
+            tm_mar.tm_mon = 2; // March -> German "März"
+            assert!(!crate::ucrt::locale::setlocale(5, b"de-DE.850\0".as_ptr()).is_null());
+            let tn_de850 = _Gettnames();
+            assert!(!tn_de850.is_null());
+            assert!(!crate::ucrt::locale::setlocale(5, b"de-DE\0".as_ptr()).is_null());
+            let tn_de1252 = _Gettnames();
+            assert!(!tn_de1252.is_null());
+            assert!(!crate::ucrt::locale::setlocale(5, b"de-DE.utf8\0".as_ptr()).is_null());
+            let tn_deu8 = _Gettnames();
+            assert!(!tn_deu8.is_null());
+            assert!(!crate::ucrt::locale::setlocale(5, b"C\0".as_ptr()).is_null());
+            let n850 = _Strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%B\0".as_ptr(), &tm_mar, tn_de850);
+            assert_eq!(&nbuf[..n850], &[0x4D, 0x84, 0x72, 0x7A]); // CP850 "März"
+            let n1252 = _Strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%B\0".as_ptr(), &tm_mar, tn_de1252);
+            assert_eq!(&nbuf[..n1252], &[0x4D, 0xE4, 0x72, 0x7A]); // CP1252 "März"
+            let nu8 = _Strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%B\0".as_ptr(), &tm_mar, tn_deu8);
+            assert_eq!(&nbuf[..nu8], "März".as_bytes()); // UTF-8 "März"
+            crate::heap::free(tn_de850);
+            crate::heap::free(tn_de1252);
+            crate::heap::free(tn_deu8);
         }
     }
 }
