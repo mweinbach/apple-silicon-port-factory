@@ -886,16 +886,50 @@ const MINIDUMP_SYSTEM_INFO_STREAM: u32 = 7;
 const MINIDUMP_MISC_INFO_STREAM: u32 = 15;
 const MINIDUMP_MISC1_PROCESS_ID: u32 = 0x0000_0001;
 
-// MINIDUMP_TYPE flags requiring full/private process-wide memory enumeration that this writer
-// does not collect; reject honestly rather than emitting a partial dump labeled full-memory.
+// MINIDUMP_TYPE flags requiring full/private process-wide memory enumeration or memory
+// scrubbing that this writer does not implement; reject honestly rather than emitting an
+// unfiltered or partial dump under those flags.
 const MINIDUMP_WITH_FULL_MEMORY: u32 = 0x0000_0002;
+const MINIDUMP_FILTER_MEMORY: u32 = 0x0000_0008;
+const MINIDUMP_FILTER_MODULE_PATHS: u32 = 0x0000_0080;
 const MINIDUMP_WITH_PRIVATE_RW_MEMORY: u32 = 0x0000_0200;
 const MINIDUMP_WITH_FULL_MEMORY_INFO: u32 = 0x0000_0800;
 const MINIDUMP_WITH_PRIVATE_WC_MEMORY: u32 = 0x0001_0000;
-const MINIDUMP_UNSUPPORTED_MEMORY_FLAGS: u32 = MINIDUMP_WITH_FULL_MEMORY
+const MINIDUMP_FILTER_TRIAGE: u32 = 0x0010_0000;
+const MINIDUMP_UNSUPPORTED_FLAGS: u32 = MINIDUMP_WITH_FULL_MEMORY
+    | MINIDUMP_FILTER_MEMORY
     | MINIDUMP_WITH_PRIVATE_RW_MEMORY
     | MINIDUMP_WITH_FULL_MEMORY_INFO
-    | MINIDUMP_WITH_PRIVATE_WC_MEMORY;
+    | MINIDUMP_WITH_PRIVATE_WC_MEMORY
+    | MINIDUMP_FILTER_TRIAGE;
+
+/// Strip directory components from a module or PDB path for `MiniDumpFilterModulePaths` (`0x80`),
+/// keeping only the filename so usernames and directory layouts are not serialized into dumps.
+fn filter_module_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed)
+}
+
+/// Strip directory components from the embedded PDB path of a CodeView `RSDS` or `NB10` record
+/// when `MiniDumpFilterModulePaths` (`0x80`) is requested.
+fn filter_codeview_pdb_path(cv: Vec<u8>) -> Vec<u8> {
+    let hdr_len = if cv.len() > 24 && &cv[0..4] == b"RSDS" {
+        24usize
+    } else if cv.len() > 16 && &cv[0..4] == b"NB10" {
+        16usize
+    } else {
+        return cv;
+    };
+    let tail = &cv[hdr_len..];
+    let nul_pos = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    let pdb_path = String::from_utf8_lossy(&tail[..nul_pos]);
+    let filtered = filter_module_path(&pdb_path);
+    let mut out = Vec::with_capacity(hdr_len + filtered.len() + 1);
+    out.extend_from_slice(&cv[..hdr_len]);
+    out.extend_from_slice(filtered.as_bytes());
+    out.push(0);
+    out
+}
 
 struct MdmpBuilder {
     buf: Vec<u8>,
@@ -1058,7 +1092,7 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
         crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    if (dump_type & MINIDUMP_UNSUPPORTED_MEMORY_FLAGS) != 0 {
+    if (dump_type & MINIDUMP_UNSUPPORTED_FLAGS) != 0 {
         crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
         return FALSE;
     }
@@ -1341,10 +1375,23 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     write_dir(&mut md, MINIDUMP_MISC_INFO_STREAM, 24, misc_rva);
 
     // 3. Pre-write module names and CodeView records, then ModuleListStream (4)
+    let filter_paths = (dump_type & MINIDUMP_FILTER_MODULE_PATHS) != 0;
     let mut mod_meta: Vec<(u32, u32, u32, (u32, u32))> = Vec::with_capacity(modules.len());
     for m in &modules {
-        let name_rva = md.push_minidump_string(&m.image_name);
+        let dumped_name = if filter_paths {
+            filter_module_path(&m.image_name)
+        } else {
+            m.image_name.as_str()
+        };
+        let name_rva = md.push_minidump_string(dumped_name);
         let (ts, csum, cv) = read_pe_debug_metadata(m.base);
+        let cv = cv.map(|bytes| {
+            if filter_paths {
+                filter_codeview_pdb_path(bytes)
+            } else {
+                bytes
+            }
+        });
         let cv_loc = match cv {
             Some(bytes) => {
                 md.align4();
@@ -3386,5 +3433,174 @@ mod tests {
             *b = b'A';
         }
         let _ = parse_pdb_line_cache(&pdb2, &[0x1000], None);
+    }
+
+    #[test]
+    fn minidump_filter_module_paths_strips_directories_from_module_and_codeview_pdb_paths() {
+        // Construct a synthetic PE32+ image in memory with an RSDS CodeView record containing a
+        // full user build path (`C:\Users\secret_dev\src\secret_game.pdb`).
+        let mut pe = vec![0u8; 0x1000];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[60..64].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+        let nt = 0x80usize;
+        pe[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        pe[nt + 24..nt + 26].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        let num_rva_off = nt + 24 + 108;
+        pe[num_rva_off..num_rva_off + 4].copy_from_slice(&16u32.to_le_bytes());
+        let dbg_dd_off = nt + 24 + 112 + 6 * 8;
+        let dbg_dir_rva = 0x300u32;
+        pe[dbg_dd_off..dbg_dd_off + 4].copy_from_slice(&dbg_dir_rva.to_le_bytes());
+        pe[dbg_dd_off + 4..dbg_dd_off + 8].copy_from_slice(&28u32.to_le_bytes());
+
+        let rsds_rva = 0x400u32;
+        let mut rsds = Vec::new();
+        rsds.extend_from_slice(b"RSDS");
+        let expected_guid = [0x11u8; 16];
+        let expected_age = 7u32;
+        rsds.extend_from_slice(&expected_guid);
+        rsds.extend_from_slice(&expected_age.to_le_bytes());
+        rsds.extend_from_slice(b"C:\\Users\\secret_dev\\src\\secret_game.pdb\0");
+        pe[rsds_rva as usize..rsds_rva as usize + rsds.len()].copy_from_slice(&rsds);
+
+        // IMAGE_DEBUG_DIRECTORY at dbg_dir_rva (28 bytes): +12 Type=2 (CodeView), +16 SizeOfData, +20 AddressOfRawData.
+        let d = dbg_dir_rva as usize;
+        pe[d + 12..d + 16].copy_from_slice(&2u32.to_le_bytes());
+        pe[d + 16..d + 20].copy_from_slice(&(rsds.len() as u32).to_le_bytes());
+        pe[d + 20..d + 24].copy_from_slice(&rsds_rva.to_le_bytes());
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("pf_mdmp_filter_{uniq}"));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        crate::path::add_mount("R:\\", &tmp_dir);
+
+        unsafe {
+            let proc_h = (-1isize) as HANDLE;
+            assert_eq!(SymInitialize(proc_h, std::ptr::null(), FALSE), TRUE);
+            let full_img = b"C:\\Users\\alice\\AppData\\Local\\SecretGame\\secret_game.dll\0";
+            let mod_name = b"secret_game.dll\0";
+            let base = pe.as_ptr() as u64;
+            assert_eq!(
+                SymLoadModule64(
+                    proc_h,
+                    std::ptr::null_mut(),
+                    full_img.as_ptr(),
+                    mod_name.as_ptr(),
+                    base,
+                    pe.len() as u32,
+                ),
+                base
+            );
+
+            let wpath = crate::strings::to_wide_z("R:\\filtered.dmp");
+            let h_file = crate::kernel32::file::CreateFileW(
+                wpath.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_file, INVALID_HANDLE_VALUE);
+
+            // Unsupported memory-filtering flags must still fail honestly with ERROR_NOT_SUPPORTED.
+            for unsupported in [MINIDUMP_FILTER_MEMORY, MINIDUMP_FILTER_TRIAGE] {
+                assert_eq!(
+                    MiniDumpWriteDump(
+                        proc_h,
+                        std::process::id(),
+                        h_file,
+                        unsupported,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    ),
+                    FALSE
+                );
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+            }
+
+            // MiniDumpFilterModulePaths (0x80) succeeds and strips directory prefixes from both
+            // module names and CodeView RSDS PDB paths.
+            assert_eq!(
+                MiniDumpWriteDump(
+                    proc_h,
+                    std::process::id(),
+                    h_file,
+                    MINIDUMP_FILTER_MODULE_PATHS,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+
+            let mut fsize: i64 = 0;
+            assert_eq!(crate::kernel32::file::GetFileSizeEx(h_file, &mut fsize), TRUE);
+            let mut new_pos: i64 = 0;
+            assert_eq!(crate::kernel32::file::SetFilePointerEx(h_file, 0, &mut new_pos, 0), TRUE);
+            let mut bytes = vec![0u8; fsize as usize];
+            let mut got = 0u32;
+            assert_eq!(
+                crate::kernel32::file::ReadFile(
+                    h_file,
+                    bytes.as_mut_ptr() as *mut c_void,
+                    bytes.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            crate::kernel32::threads::CloseHandle(h_file);
+            assert_eq!(SymCleanup(proc_h), TRUE);
+
+            // Locate ModuleListStream (4) and inspect our module's name + CodeView record.
+            let num_streams = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let dir_rva = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+            let mut mod_stream_rva = None;
+            for i in 0..num_streams {
+                let off = dir_rva + i * 12;
+                let stype = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                if stype == MINIDUMP_MODULE_LIST_STREAM {
+                    mod_stream_rva = Some(u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize);
+                }
+            }
+            let mrva = mod_stream_rva.expect("ModuleListStream must exist");
+            let mod_count = u32::from_le_bytes(bytes[mrva..mrva + 4].try_into().unwrap()) as usize;
+            let mut found = false;
+            for i in 0..mod_count {
+                let moff = mrva + 4 + i * 108;
+                let mbase = u64::from_le_bytes(bytes[moff..moff + 8].try_into().unwrap());
+                let name_rva = u32::from_le_bytes(bytes[moff + 20..moff + 24].try_into().unwrap()) as usize;
+                let name_bytes = u32::from_le_bytes(bytes[name_rva..name_rva + 4].try_into().unwrap()) as usize;
+                let units: Vec<u16> = bytes[name_rva + 4..name_rva + 4 + name_bytes]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let name_str = String::from_utf16(&units).unwrap();
+                assert!(
+                    !name_str.contains('\\') && !name_str.contains('/'),
+                    "MiniDumpFilterModulePaths must strip directories from all module names: {name_str:?}"
+                );
+                if mbase == base {
+                    found = true;
+                    assert_eq!(name_str, "secret_game.dll");
+                    let cv_sz = u32::from_le_bytes(bytes[moff + 76..moff + 80].try_into().unwrap()) as usize;
+                    let cv_rva = u32::from_le_bytes(bytes[moff + 80..moff + 84].try_into().unwrap()) as usize;
+                    let cv = &bytes[cv_rva..cv_rva + cv_sz];
+                    assert_eq!(&cv[0..4], b"RSDS");
+                    assert_eq!(&cv[4..20], &expected_guid);
+                    assert_eq!(u32::from_le_bytes(cv[20..24].try_into().unwrap()), expected_age);
+                    let pdb_str = std::str::from_utf8(&cv[24..cv.len() - 1]).unwrap();
+                    assert_eq!(pdb_str, "secret_game.pdb");
+                }
+            }
+            assert!(found, "registered module must appear in ModuleListStream");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
