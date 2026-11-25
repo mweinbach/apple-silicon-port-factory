@@ -325,12 +325,16 @@ fn eval_mem_movzx(
     img_base: u64,
     img_size: u64,
 ) -> JtVal {
-    if ins.is_ip_rel_memory_operand() {
-        return JtVal::Unknown;
-    }
     let msize = ins.memory_size().size();
     if msize != 1 && msize != 2 {
         return JtVal::Unknown;
+    }
+    if ins.is_ip_rel_memory_operand() {
+        return if msize == 1 {
+            JtVal::Index { bound: Some(256) }
+        } else {
+            JtVal::Unknown
+        };
     }
     let scale = ins.memory_index_scale();
     if scale != msize as u32 {
@@ -383,6 +387,9 @@ fn eval_mem_movzx(
             let (_, bound) = extract_idx(regs[ix]);
             JtVal::IndirIndex { tbl_va: disp, elem_bytes: msize as u8, bound }
         }
+        // Byte-loaded switch/bytecode index (`movzx reg, byte ptr [base + disp]`): naturally
+        // bounded to `0..256` without requiring an explicit prior `cmp reg, imm` check.
+        (Some(_), None) if msize == 1 => JtVal::Index { bound: Some(256) },
         _ => JtVal::Unknown,
     }
 }
@@ -622,6 +629,7 @@ pub(super) unsafe fn analyze_block(
         return BlockStep::default();
     };
     let insns = &(&(*bc).arena)[off..off + n];
+    let ops = &(&(*bc).ops)[off..off + n];
     let last = &insns[n - 1];
     let (tgt, next) = (last.near_branch_target(), last.next_ip());
     let fc = last.flow_control();
@@ -630,6 +638,15 @@ pub(super) unsafe fn analyze_block(
 
     if !jt_on {
         let mut step = BlockStep::default();
+        // Whenever an instruction before the block's branch terminator is not supported by the
+        // ARM64 JIT (`!jit::supported`, e.g. `xgetbv`, `ldmxcsr`, `cpuid`), `prep_block_with`
+        // truncates the AOT block right before it and execution resumes at `insns[i].next_ip()`.
+        // Emit that resume IP as an intra-function edge so the tail is precompiled into `.aot`.
+        for i in 0..n.saturating_sub(1) {
+            if !crate::emu::jit::supported(&ops[i]) {
+                step.edges.push((insns[i].next_ip(), EdgeKind::Intra, None));
+            }
+        }
         match fc {
             F::Next | F::IndirectCall => step.edges.push((next, EdgeKind::Intra, None)),
             F::Call => {
@@ -695,8 +712,11 @@ pub(super) unsafe fn analyze_block(
         }
     };
 
-    for ins in insns {
+    let mut step = BlockStep::default();
+
+    for (ins_idx, ins) in insns.iter().enumerate() {
         let mn = ins.mnemonic();
+        let mid_resume = ins_idx + 1 < n && !crate::emu::jit::supported(&ops[ins_idx]);
         if mn == M::Cmp {
             last_cmp = if ins.op_count() >= 2 && ins.op_kind(0) == K::Register {
                 match (gpr_idx(ins.op0_register()), op_imm(ins, 1)) {
@@ -716,6 +736,9 @@ pub(super) unsafe fn analyze_block(
             } else {
                 None
             };
+            if mid_resume {
+                step.edges.push((ins.next_ip(), EdgeKind::Intra, pack_hint(&regs)));
+            }
             continue;
         }
 
@@ -1148,9 +1171,14 @@ pub(super) unsafe fn analyze_block(
                 }
             }
         }
+        if mid_resume {
+            // Mid-block `!jit::supported` op (e.g. `ldmxcsr`, `vldmxcsr`, `xgetbv`, `cpuid`):
+            // `prep_block_with` splits the AOT block right before it and execution resumes at
+            // `ins.next_ip()` after the interpreter steps that single instruction.
+            step.edges.push((ins.next_ip(), EdgeKind::Intra, pack_hint(&regs)));
+        }
     }
 
-    let mut step = BlockStep::default();
     match fc {
         F::Next | F::IndirectCall => {
             step.edges.push((next, EdgeKind::Intra, pack_hint(&regs)));
