@@ -2,7 +2,7 @@
 
 use super::abi::*;
 use super::font::{font_face_from_ptr, rendering_params_values_from_ptr, FontFaceInner};
-use super::sfnt::rasterize_glyph;
+use super::sfnt::rasterize_glyph_transformed;
 use crate::com::{
     com_add_ref, com_call_release, com_release, qi_helper_bytes, register_vtable_once, ComObj,
 };
@@ -837,9 +837,6 @@ impl GlyphRunAnalysisInner {
         }
 
         let m = transform.copied().unwrap_or_default();
-        let scale_x = m.m11.hypot(m.m12).max(1e-3);
-        let scale_y = m.m21.hypot(m.m22).max(1e-3);
-        let eff_em = run.fontEmSize * pixels_per_dip * scale_y;
         let rtl_dir = if (run.bidiLevel & 1) != 0 { -1.0f32 } else { 1.0f32 };
 
         let mut pen_x = baseline_x;
@@ -868,7 +865,7 @@ impl GlyphRunAnalysisInner {
             let gx_px = (gx_dip * m.m11 + gy_dip * m.m21 + m.dx) * pixels_per_dip;
             let gy_px = (gx_dip * m.m12 + gy_dip * m.m22 + m.dy) * pixels_per_dip;
 
-            let rast = rasterize_glyph(&face, gid, eff_em);
+            let rast = rasterize_glyph_transformed(&face, gid, run.fontEmSize, pixels_per_dip, &m);
             if rast.width > 0 && rast.height > 0 {
                 let left = gx_px.round() as i32 + rast.offset_x;
                 let top = gy_px.round() as i32 + rast.offset_y;
@@ -886,7 +883,6 @@ impl GlyphRunAnalysisInner {
                     alpha: rast.alpha,
                 });
             }
-            let _ = scale_x;
             pen_x += adv * rtl_dir;
         }
 

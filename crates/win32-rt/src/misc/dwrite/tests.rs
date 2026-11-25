@@ -1465,6 +1465,65 @@ fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis(
         );
         assert!(tex3.iter().filter(|&&a| a >= 200).count() >= 180);
 
+        // 4b. Non-uniform scale (m11=2, m22=1) and 90-degree rotation must transform glyph
+        //     coverage & bounds, not only glyph origins.
+        let wide_mat = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+        let mut gra_wide: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                &wide_mat,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_wide,
+            ),
+            S_OK
+        );
+        let mut b_wide = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_wide), S_OK);
+        let w_wide = (b_wide.right - b_wide.left) as usize;
+        let h_wide = (b_wide.bottom - b_wide.top) as usize;
+        assert!(w_wide >= w * 2 - 4 && w_wide <= w * 2 + 4, "expected 2x width: base={w}, wide={w_wide}");
+        assert!((h_wide as i32 - h as i32).abs() <= 2, "expected unchanged height: base={h}, wide={h_wide}");
+        let mut tex_wide = vec![0u8; w_wide * h_wide];
+        assert_eq!(
+            gra_create_alpha_texture(gra_wide as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &b_wide, tex_wide.as_mut_ptr(), tex_wide.len() as u32),
+            S_OK
+        );
+        let lit_base = tex1.iter().filter(|&&a| a >= 200).count();
+        let lit_wide = tex_wide.iter().filter(|&&a| a >= 200).count();
+        assert!(lit_wide >= lit_base * 3 / 2, "expected ~2x lit pixels under 2x X-scale: base={lit_base}, wide={lit_wide}");
+
+        // 90-degree CW rotation (m11=0, m12=1, m21=-1, m22=0) on a 2x-wide rectangle swaps aspect ratio.
+        let rot90_wide = DWRITE_MATRIX { m11: 0.0, m12: 2.0, m21: -1.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        let mut gra_rot: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                &rot90_wide,
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra_rot,
+            ),
+            S_OK
+        );
+        let mut b_rot = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra_rot as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &mut b_rot), S_OK);
+        let w_rot = (b_rot.right - b_rot.left) as usize;
+        let h_rot = (b_rot.bottom - b_rot.top) as usize;
+        assert!((w_rot as i32 - h_wide as i32).abs() <= 3, "rotated width {w_rot} should match unrotated height {h_wide}");
+        assert!((h_rot as i32 - w_wide as i32).abs() <= 3, "rotated height {h_rot} should match unrotated width {w_wide}");
+        release_com(gra_rot);
+        release_com(gra_wide);
+
         let mut rp: *mut c_void = std::ptr::null_mut();
         assert_eq!(fac_create_custom_rendering_params(fac as PFactory, 2.2, 0.75, 0.9, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, &mut rp), S_OK);
         let (mut g, mut ec, mut ct) = (0.0f32, 0.0f32, 0.0f32);

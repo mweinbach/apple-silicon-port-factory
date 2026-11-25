@@ -1974,42 +1974,30 @@ unsafe extern "win64" fn gi_get_temporal_reading(
         return GAMEINPUT_E_READING_NOT_FOUND;
     };
 
-    // Search the device's recorded history for the reading active at `timestamp`
-    // (the latest reading with `timestamp_us <= timestamp`).
-    {
-        let st = runtime_state().lock().unwrap();
-        let mut oldest_for_dev: Option<u64> = None;
-        let mut best: Option<&ReadingSnapshot> = None;
-        for entry in st.history.iter().filter(|e| e.device_kind == dev_kind) {
-            if oldest_for_dev.is_none() {
-                oldest_for_dev = Some(entry.timestamp_us);
-            }
-            if entry.timestamp_us <= timestamp {
-                best = Some(entry);
-            }
-        }
-        if let Some(found) = best {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
-            return S_OK;
-        }
-        if oldest_for_dev.is_some() {
-            // Requested timestamp precedes all buffered readings for this device.
-            return GAMEINPUT_E_READING_NOT_FOUND;
-        }
-    }
-
-    // No history yet for this device: poll live once and return if its timestamp <= requested timestamp.
+    // Refresh the newest live boundary before searching history so applications that
+    // poll exclusively through `GetTemporalReading` observe subsequent input changes
+    // (`record_or_reuse` keeps the existing snapshot untouched when state is unchanged).
     let kind_for_dev = match dev_kind {
         DeviceKind::Keyboard => GAME_INPUT_KIND_KEYBOARD,
         DeviceKind::Mouse => GAME_INPUT_KIND_MOUSE,
         DeviceKind::Gamepad(_) => GAME_INPUT_KIND_GAMEPAD,
     };
     if let Some((dk, actual_kind, payload)) = poll_matching_live(kind_for_dev, Some(dev_kind)) {
-        let snap = runtime_state().lock().unwrap().record_or_reuse(dk, actual_kind, payload);
-        if snap.timestamp_us <= timestamp {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
-            return S_OK;
+        let _ = runtime_state().lock().unwrap().record_or_reuse(dk, actual_kind, payload);
+    }
+
+    // Search the device's recorded history for the reading active at `timestamp`
+    // (the latest reading with `timestamp_us <= timestamp`).
+    let st = runtime_state().lock().unwrap();
+    let mut best: Option<&ReadingSnapshot> = None;
+    for entry in st.history.iter().filter(|e| e.device_kind == dev_kind) {
+        if entry.timestamp_us <= timestamp {
+            best = Some(entry);
         }
+    }
+    if let Some(found) = best {
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+        return S_OK;
     }
     GAMEINPUT_E_READING_NOT_FOUND
 }
@@ -3002,6 +2990,24 @@ mod tests {
             assert_eq!(gi_get_temporal_reading(gi, t2 + 1000, dev0, &mut out), S_OK);
             assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
             assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_B, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            // Subsequent backend input changes without calling GetCurrentReading must be
+            // observed by repeated GetTemporalReading queries, while earlier timestamps
+            // still resolve to the historical snapshots.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::X, ..Default::default() });
+            let t_now = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_now + 10_000, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_X, GAME_INPUT_GAMEPAD_X);
+            assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_B, 0);
+            assert_eq!(rd_release(out), 0);
+
+            // Historical query at t1 still returns A pressed.
+            assert_eq!(gi_get_temporal_reading(gi, t1, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons & GAME_INPUT_GAMEPAD_A, GAME_INPUT_GAMEPAD_A);
             assert_eq!(rd_release(out), 0);
 
             assert_eq!(rd_release(r1), 0);

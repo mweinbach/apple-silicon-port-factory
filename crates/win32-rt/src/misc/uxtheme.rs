@@ -239,8 +239,11 @@ const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
 const TDN_CREATED: u32 = 0;
 const TDN_BUTTON_CLICKED: u32 = 2;
 const TDN_DESTROYED: u32 = 5;
+const TDN_RADIO_BUTTON_CLICKED: u32 = 6;
 const TDN_DIALOG_CONSTRUCTED: u32 = 7;
+const TDN_VERIFICATION_CLICKED: u32 = 8;
 
+const S_FALSE_HR: HRESULT = 1;
 const HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION: HRESULT = 0x8007_05B3u32 as i32;
 
 unsafe fn resolve_task_dialog_str(hinst: HINSTANCE, ptr: LPCWSTR) -> String {
@@ -343,33 +346,35 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         buttons.push((1, "OK".into()));
     }
 
-    // Resolve default radio button selection.
-    let mut selected_radio: i32 = 0;
-    if cfg.c_radio_buttons > 0 && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
-        let mut first_id = 0i32;
-        let mut found_default = false;
-        for i in 0..cfg.c_radio_buttons as usize {
-            let rb = cfg.p_radio_buttons.add(i).read_unaligned();
-            if i == 0 {
-                first_id = rb.button_id;
-            }
-            if cfg.n_default_radio_button != 0 && rb.button_id == cfg.n_default_radio_button {
-                selected_radio = rb.button_id;
-                found_default = true;
-                break;
-            }
-        }
-        if !found_default {
-            selected_radio = first_id;
-        }
+    // Collect radio buttons and resolve initial default selection.
+    let mut radios: Vec<(i32, String)> = Vec::with_capacity(cfg.c_radio_buttons as usize);
+    for i in 0..cfg.c_radio_buttons as usize {
+        let rb = cfg.p_radio_buttons.add(i).read_unaligned();
+        let rid = rb.button_id;
+        let label = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, rb.button_text));
+        radios.push((rid, if label.is_empty() { format!("Option {rid}") } else { label }));
     }
-    let verified: BOOL = if !cfg.psz_verification_text.is_null()
-        && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0
-    {
-        TRUE
+    let mut selected_radio_idx: Option<usize> =
+        if !radios.is_empty() && (cfg.dw_flags & TDF_NO_DEFAULT_RADIO_BUTTON) == 0 {
+            if cfg.n_default_radio_button != 0 {
+                radios
+                    .iter()
+                    .position(|(id, _)| *id == cfg.n_default_radio_button)
+                    .or(Some(0))
+            } else {
+                Some(0)
+            }
+        } else {
+            None
+        };
+    let verification_text: Option<String> = if !cfg.psz_verification_text.is_null() {
+        let s = strip_accelerator_ampersands(&resolve_task_dialog_str(hinst, cfg.psz_verification_text));
+        Some(if s.is_empty() { "Confirm".to_string() } else { s })
     } else {
-        FALSE
+        None
     };
+    let mut verified: bool =
+        verification_text.is_some() && (cfg.dw_flags & TDF_VERIFICATION_FLAG_CHECKED) != 0;
 
     // TD_ERROR_ICON == MAKEINTRESOURCEW(-2) == 0xFFFE.
     let critical = (cfg.main_icon & 0xFFFF) == 0xFFFE && cfg.main_icon <= 0xFFFF;
@@ -386,78 +391,89 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
     }
     let body = body_parts.join("\n\n");
     let labels: Vec<String> = buttons.iter().map(|(_, l)| l.clone()).collect();
+    let radio_labels: Vec<String> = radios.iter().map(|(_, l)| l.clone()).collect();
+    let has_selection_controls = !radios.is_empty() || verification_text.is_some();
 
-    if cfg.pf_callback != 0 {
-        let _ = crate::call_guest8(
-            cfg.pf_callback,
-            cfg.hwnd_parent as u64,
-            TDN_DIALOG_CONSTRUCTED as u64,
-            0,
-            0,
-            cfg.lp_callback_data as u64,
-            0,
-            0,
-            0,
-        );
-        let _ = crate::call_guest8(
-            cfg.pf_callback,
-            cfg.hwnd_parent as u64,
-            TDN_CREATED as u64,
-            0,
-            0,
-            cfg.lp_callback_data as u64,
-            0,
-            0,
-            0,
-        );
-    }
-
-    let chosen_id = if let Some(idx) = crate::macos::alert(caption, body, labels, critical) {
-        buttons.get(idx).map(|(id, _)| *id).unwrap_or(buttons[0].0)
-    } else if buttons.len() == 1 {
-        buttons[0].0
-    } else {
+    let notify = |msg: u32, wp: u64| -> HRESULT {
         if cfg.pf_callback != 0 {
-            let _ = crate::call_guest8(
+            crate::call_guest8(
                 cfg.pf_callback,
                 cfg.hwnd_parent as u64,
-                TDN_DESTROYED as u64,
-                0,
+                msg as u64,
+                wp,
                 0,
                 cfg.lp_callback_data as u64,
                 0,
                 0,
                 0,
-            );
+            ) as HRESULT
+        } else {
+            S_OK
         }
-        return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
     };
 
-    if cfg.pf_callback != 0 {
-        let _ = crate::call_guest8(
-            cfg.pf_callback,
-            cfg.hwnd_parent as u64,
-            TDN_BUTTON_CLICKED as u64,
-            chosen_id as u64,
-            0,
-            cfg.lp_callback_data as u64,
-            0,
-            0,
-            0,
-        );
-        let _ = crate::call_guest8(
-            cfg.pf_callback,
-            cfg.hwnd_parent as u64,
-            TDN_DESTROYED as u64,
-            0,
-            0,
-            cfg.lp_callback_data as u64,
-            0,
-            0,
-            0,
-        );
-    }
+    let _ = notify(TDN_DIALOG_CONSTRUCTED, 0);
+    let _ = notify(TDN_CREATED, 0);
 
+    let chosen_id = loop {
+        let presented = crate::macos::task_dialog_alert(
+            caption.clone(),
+            body.clone(),
+            labels.clone(),
+            radio_labels.clone(),
+            selected_radio_idx,
+            verification_text.clone(),
+            verified,
+            critical,
+        );
+        let (bid, interactive) = if let Some(res) = presented {
+            if res.radio_index != selected_radio_idx {
+                selected_radio_idx = res.radio_index;
+                if let Some(ridx) = selected_radio_idx {
+                    if let Some((rid, _)) = radios.get(ridx) {
+                        let _ = notify(TDN_RADIO_BUTTON_CLICKED, *rid as u64);
+                    }
+                }
+            }
+            if verification_text.is_some() && res.verified != verified {
+                verified = res.verified;
+                let _ = notify(TDN_VERIFICATION_CLICKED, if verified { 1 } else { 0 });
+            }
+            let bid = buttons
+                .get(res.button_index)
+                .map(|(id, _)| *id)
+                .unwrap_or(buttons[0].0);
+            (bid, true)
+        } else if buttons.len() == 1 && !has_selection_controls {
+            // Pure single-button informational dialog with no selection controls can
+            // dismiss in headless mode (matching MessageBox MB_OK).
+            (buttons[0].0, false)
+        } else {
+            // Multi-button prompts or dialogs with radio buttons / verification checkboxes
+            // require an interactive desktop so we never fabricate user selections.
+            let _ = notify(TDN_DESTROYED, 0);
+            return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
+        };
+
+        // Per PFTASKDIALOGCALLBACK: returning S_FALSE from TDN_BUTTON_CLICKED keeps the
+        // dialog open instead of dismissing it.
+        let cb_hr = notify(TDN_BUTTON_CLICKED, bid as u64);
+        if cb_hr == S_FALSE_HR {
+            if interactive {
+                continue;
+            }
+            let _ = notify(TDN_DESTROYED, 0);
+            return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
+        }
+        break bid;
+    };
+
+    let _ = notify(TDN_DESTROYED, 0);
+
+    let selected_radio = selected_radio_idx
+        .and_then(|idx| radios.get(idx))
+        .map(|(id, _)| *id)
+        .unwrap_or(0);
     if !button.is_null() {
         button.write_unaligned(chosen_id);
     }
@@ -465,7 +481,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         radio_button.write_unaligned(selected_radio);
     }
     if !verification_flag.is_null() {
-        verification_flag.write_unaligned(verified);
+        verification_flag.write_unaligned(if verified { TRUE } else { FALSE });
     }
     S_OK
 }
@@ -858,8 +874,8 @@ mod tests {
             assert_eq!(hr, E_INVALIDARG);
             assert_eq!((btn, radio, verified), (0, 0, FALSE));
 
-            // Single-button informational TaskDialogIndirect succeeds in headless mode,
-            // resolving default radio button, verification flag, and invoking callback lifecycle.
+            // 1. Single-button informational TaskDialogIndirect (no selection controls)
+            //    succeeds in headless mode and dispatches full callback lifecycle.
             static CB_MSGS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
             unsafe extern "win64" fn td_cb(
                 _hwnd: HWND,
@@ -872,21 +888,17 @@ mod tests {
                 S_OK
             }
             let title_w = crate::strings::to_wide_z("Notice");
-            let radio_lbl = crate::strings::to_wide_z("Option &1");
+            let radio_lbl1 = crate::strings::to_wide_z("Option &1");
+            let radio_lbl2 = crate::strings::to_wide_z("Option &2");
             let ver_lbl = crate::strings::to_wide_z("Remember choice");
             let radios = [
-                TaskDialogButton { button_id: 201, button_text: radio_lbl.as_ptr() },
-                TaskDialogButton { button_id: 202, button_text: radio_lbl.as_ptr() },
+                TaskDialogButton { button_id: 201, button_text: radio_lbl1.as_ptr() },
+                TaskDialogButton { button_id: 202, button_text: radio_lbl2.as_ptr() },
             ];
             let mut cfg: TaskDialogConfig = std::mem::zeroed();
             cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
-            cfg.dw_flags = TDF_VERIFICATION_FLAG_CHECKED;
             cfg.dw_common_buttons = TDCBF_CLOSE_BUTTON;
             cfg.psz_window_title = title_w.as_ptr();
-            cfg.c_radio_buttons = radios.len() as u32;
-            cfg.p_radio_buttons = radios.as_ptr();
-            cfg.n_default_radio_button = 202;
-            cfg.psz_verification_text = ver_lbl.as_ptr();
             cfg.pf_callback = td_cb as *const () as usize;
 
             CB_MSGS.lock().unwrap().clear();
@@ -898,15 +910,126 @@ mod tests {
             );
             assert_eq!(hr, S_OK);
             assert_eq!(btn, 8); // IDCLOSE
-            assert_eq!(radio, 202);
-            assert_eq!(verified, TRUE);
+            assert_eq!(radio, 0);
+            assert_eq!(verified, FALSE);
             let msgs = CB_MSGS.lock().unwrap().clone();
             assert_eq!(
                 msgs,
                 vec![(TDN_DIALOG_CONSTRUCTED, 0), (TDN_CREATED, 0), (TDN_BUTTON_CLICKED, 8), (TDN_DESTROYED, 0)]
             );
 
-            // Multi-button prompt in headless mode returns HRESULT_FROM_WIN32(ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION).
+            // 2. Headless dialog with radio buttons or verification checkbox must NOT fabricate
+            //    selections — returns HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION with zeroed outputs.
+            cfg.dw_flags = TDF_VERIFICATION_FLAG_CHECKED;
+            cfg.c_radio_buttons = radios.len() as u32;
+            cfg.p_radio_buttons = radios.as_ptr();
+            cfg.n_default_radio_button = 202;
+            cfg.psz_verification_text = ver_lbl.as_ptr();
+            btn = 99;
+            radio = 99;
+            verified = TRUE;
+            let hr_sel_headless = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            assert_eq!(hr_sel_headless, HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION);
+            assert_eq!((btn, radio, verified), (0, 0, FALSE));
+
+            // 3. Interactive TaskDialogIndirect renders radio + verification controls, honors
+            //    S_FALSE from TDN_BUTTON_CLICKED to keep the dialog open, and returns the user's
+            //    actual final selections once the callback allows dismissal.
+            static REJECT_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            unsafe extern "win64" fn td_cb_keep_open(
+                _hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                CB_MSGS.lock().unwrap().push((msg, wp as u64));
+                if msg == TDN_BUTTON_CLICKED && REJECT_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return S_FALSE_HR;
+                }
+                S_OK
+            }
+            cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
+            cfg.pf_callback = td_cb_keep_open as *const () as usize;
+            CB_MSGS.lock().unwrap().clear();
+            REJECT_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+            let mut step = 0usize;
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, btns, rads, def_rad, ver_txt, ver_chk| {
+                    step += 1;
+                    assert_eq!(btns, &["Yes", "No"]);
+                    assert_eq!(rads, &["Option 1", "Option 2"]);
+                    assert_eq!(ver_txt, Some("Remember choice"));
+                    if step == 1 {
+                        // Initial defaults: radio index 1 (ID 202), verified = true.
+                        assert_eq!(def_rad, Some(1));
+                        assert!(ver_chk);
+                        // User clicks "Yes" (idx 0) with radio switched to 0 (ID 201) and unchecked;
+                        // callback returns S_FALSE so the dialog must remain open!
+                        Some(crate::macos::TaskDialogAlertResult {
+                            button_index: 0,
+                            radio_index: Some(0),
+                            verified: false,
+                        })
+                    } else {
+                        // Second presentation carries forward the updated selection state.
+                        assert_eq!(def_rad, Some(0));
+                        assert!(!ver_chk);
+                        // User clicks "No" (idx 1) with radio 0 (ID 201) and verified = false.
+                        Some(crate::macos::TaskDialogAlertResult {
+                            button_index: 1,
+                            radio_index: Some(0),
+                            verified: false,
+                        })
+                    }
+                },
+            )));
+            let hr_interactive = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            assert_eq!(hr_interactive, S_OK);
+            assert_eq!(btn, 7); // IDNO (second click after first S_FALSE kept dialog open)
+            assert_eq!(radio, 201); // updated radio choice, not default 202
+            assert_eq!(verified, FALSE); // updated checkbox state, not default TRUE
+            assert_eq!(
+                CB_MSGS.lock().unwrap().clone(),
+                vec![
+                    (TDN_DIALOG_CONSTRUCTED, 0),
+                    (TDN_CREATED, 0),
+                    (TDN_RADIO_BUTTON_CLICKED, 201),
+                    (TDN_VERIFICATION_CLICKED, 0),
+                    (TDN_BUTTON_CLICKED, 6), // IDYES rejected with S_FALSE
+                    (TDN_BUTTON_CLICKED, 7), // IDNO accepted with S_OK
+                    (TDN_DESTROYED, 0),
+                ]
+            );
+
+            // 4. Headless single-button dialog whose callback returns S_FALSE (refusing dismissal)
+            //    must NOT silently return S_OK.
+            cfg.c_radio_buttons = 0;
+            cfg.p_radio_buttons = std::ptr::null();
+            cfg.psz_verification_text = std::ptr::null();
+            cfg.dw_common_buttons = TDCBF_CLOSE_BUTTON;
+            REJECT_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let hr_headless_reject = TaskDialogIndirect(
+                &cfg as *const TaskDialogConfig as *const u8,
+                &mut btn,
+                &mut radio,
+                &mut verified,
+            );
+            assert_eq!(hr_headless_reject, HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION);
+
+            // 5. Multi-button prompt in headless mode returns HRESULT_FROM_WIN32(ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION).
             cfg.dw_common_buttons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
             cfg.pf_callback = 0;
             btn = 99;

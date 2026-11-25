@@ -11,10 +11,10 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
-    NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSScreen, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSButton,
+    NSColor, NSCursor, NSEventMask, NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField,
+    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -1076,7 +1076,39 @@ pub(super) fn clipboard_change_count() -> isize {
 // Alert
 // ---------------------------------------------------------------------------
 
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "PortTaskDialogRadioTarget"]
+    struct TaskDialogRadioTarget;
+
+    impl TaskDialogRadioTarget {
+        #[unsafe(method(radioSelected:))]
+        fn radio_selected(&self, _sender: &AnyObject) {}
+    }
+);
+
+impl TaskDialogRadioTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        unsafe { msg_send![Self::alloc(mtm), init] }
+    }
+}
+
 pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: bool) -> usize {
+    task_dialog_alert(caption, text, buttons, &[], None, None, false, critical).button_index
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn task_dialog_alert(
+    caption: &str,
+    text: &str,
+    buttons: &[String],
+    radios: &[String],
+    default_radio_idx: Option<usize>,
+    verification_text: Option<&str>,
+    verification_checked: bool,
+    critical: bool,
+) -> super::TaskDialogAlertResult {
     let mtm = mtm();
     let app = NSApplication::sharedApplication(mtm);
     activate_app(&app);
@@ -1087,9 +1119,80 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
     for b in buttons {
         a.addButtonWithTitle(&NSString::from_str(b));
     }
+
+    const NS_CONTROL_STATE_OFF: isize = 0;
+    const NS_CONTROL_STATE_ON: isize = 1;
+
+    if let Some(vtext) = verification_text {
+        a.setShowsSuppressionButton(true);
+        if let Some(cb) = a.suppressionButton() {
+            cb.setTitle(&NSString::from_str(vtext));
+            let state = if verification_checked { NS_CONTROL_STATE_ON } else { NS_CONTROL_STATE_OFF };
+            let _: () = unsafe { msg_send![&*cb, setState: state] };
+        }
+    }
+
+    let mut radio_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(radios.len());
+    let _radio_target = if !radios.is_empty() {
+        let target = TaskDialogRadioTarget::new(mtm);
+        let row_h = 24.0f64;
+        let width = 320.0f64;
+        let total_h = row_h * (radios.len() as f64) + 4.0;
+        let container = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, total_h)),
+        );
+        for (idx, label) in radios.iter().enumerate() {
+            let btn = unsafe {
+                NSButton::radioButtonWithTitle_target_action(
+                    &NSString::from_str(label),
+                    Some(&target),
+                    Some(sel!(radioSelected:)),
+                    mtm,
+                )
+            };
+            // Position top-to-bottom in AppKit's bottom-up coordinate system.
+            let y = total_h - ((idx + 1) as f64) * row_h;
+            btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
+            let state = if default_radio_idx == Some(idx) {
+                NS_CONTROL_STATE_ON
+            } else {
+                NS_CONTROL_STATE_OFF
+            };
+            let _: () = unsafe { msg_send![&*btn, setState: state] };
+            container.addSubview(&btn);
+            radio_buttons.push(btn);
+        }
+        a.setAccessoryView(Some(&container));
+        Some(target)
+    } else {
+        None
+    };
+
     let r = a.runModal();
     // NSAlertFirstButtonReturn = 1000
-    (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize
+    let button_index = (r - 1000).clamp(0, buttons.len().saturating_sub(1) as isize) as usize;
+    let radio_index = if radio_buttons.is_empty() {
+        None
+    } else {
+        radio_buttons.iter().position(|b| {
+            let st: isize = unsafe { msg_send![&**b, state] };
+            st == NS_CONTROL_STATE_ON
+        })
+    };
+    let verified = if verification_text.is_some() {
+        a.suppressionButton().is_some_and(|cb| {
+            let st: isize = unsafe { msg_send![&*cb, state] };
+            st == NS_CONTROL_STATE_ON
+        })
+    } else {
+        false
+    };
+    super::TaskDialogAlertResult {
+        button_index,
+        radio_index,
+        verified,
+    }
 }
 
 // ---------------------------------------------------------------------------

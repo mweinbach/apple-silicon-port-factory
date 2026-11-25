@@ -447,6 +447,73 @@ pub fn cursor_warp(p: POINT) {
 // Modal alert (MessageBox)
 // ---------------------------------------------------------------------------
 
+/// Result returned by [`task_dialog_alert`] when displayed interactively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDialogAlertResult {
+    pub button_index: usize,
+    pub radio_index: Option<usize>,
+    pub verified: bool,
+}
+
+/// Show a modal task-dialog alert with push buttons plus optional radio buttons
+/// and verification checkbox; returns the user's actual selections, or `None`
+/// when headless / on iOS (no interactive selection UI available).
+#[allow(clippy::too_many_arguments)]
+pub fn task_dialog_alert(
+    caption: String,
+    text: String,
+    buttons: Vec<String>,
+    radios: Vec<String>,
+    default_radio_idx: Option<usize>,
+    verification_text: Option<String>,
+    verification_checked: bool,
+    critical: bool,
+) -> Option<TaskDialogAlertResult> {
+    #[cfg(test)]
+    {
+        if let Some(res) = invoke_test_task_dialog_presenter(
+            &caption,
+            &text,
+            &buttons,
+            &radios,
+            default_radio_idx,
+            verification_text.as_deref(),
+            verification_checked,
+        ) {
+            return res;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        run_sync(move || {
+            appkit::task_dialog_alert(
+                &caption,
+                &text,
+                &buttons,
+                &radios,
+                default_radio_idx,
+                verification_text.as_deref(),
+                verification_checked,
+                critical,
+            )
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            caption,
+            text,
+            buttons,
+            radios,
+            default_radio_idx,
+            verification_text,
+            verification_checked,
+            critical,
+        );
+        None
+    }
+}
+
 /// Show a modal alert with the given buttons; returns the index of the
 /// button pressed, or `None` when headless / on iOS.
 pub fn alert(caption: String, text: String, buttons: Vec<String>, critical: bool) -> Option<usize> {
@@ -583,4 +650,54 @@ pub fn progress_window_close() {
     if active() {
         let _ = run_sync(appkit::progress_window_close);
     }
+}
+
+#[cfg(test)]
+pub(crate) type TestTaskDialogPresenter = Box<
+    dyn FnMut(
+        &str,
+        &str,
+        &[String],
+        &[String],
+        Option<usize>,
+        Option<&str>,
+        bool,
+    ) -> Option<TaskDialogAlertResult>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TASK_DIALOG_PRESENTER: std::cell::RefCell<Option<TestTaskDialogPresenter>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_task_dialog_presenter(hook: Option<TestTaskDialogPresenter>) {
+    TEST_TASK_DIALOG_PRESENTER.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn invoke_test_task_dialog_presenter(
+    caption: &str,
+    text: &str,
+    buttons: &[String],
+    radios: &[String],
+    default_radio_idx: Option<usize>,
+    verification_text: Option<&str>,
+    verification_checked: bool,
+) -> Option<Option<TaskDialogAlertResult>> {
+    TEST_TASK_DIALOG_PRESENTER.with(|cell| {
+        cell.borrow_mut().as_mut().map(|f| {
+            f(
+                caption,
+                text,
+                buttons,
+                radios,
+                default_radio_idx,
+                verification_text,
+                verification_checked,
+            )
+        })
+    })
 }
