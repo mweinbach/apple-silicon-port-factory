@@ -2363,4 +2363,86 @@ mod mixer_tests {
         drop(out_stream);
         super::super::mmdevapi::reset_endpoint_software_gains_for_test();
     }
+
+    #[test]
+    fn middleware_stream_publishes_to_fallback_loopback_and_unregisters_on_drop() {
+        let _audio_guard = super::super::audio_test_lock();
+        super::super::backend::force_backend(Some(super::super::backend::Backend::Null));
+        super::super::mmdevapi::reset_endpoint_software_gains_for_test();
+
+        let dev = super::super::backend::null_device();
+        let ep_id = super::super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
+        let ep_sw = super::super::mmdevapi::endpoint_software_gain_handle(&ep_id);
+        let sub = register_loopback_sub(&ep_id, 16_384, 48_000, 2);
+        sub.active.store(true, Ordering::Release);
+
+        // Middleware stream constructed via `StreamShared::new` (as DirectSound, XAudio2, FMOD,
+        // OpenAL, and Bink do) must automatically publish into fallback loopback capture.
+        let shared = super::super::backend::StreamShared::new(super::super::ring::Ring::new(4096, 2));
+        let mut out_stream =
+            super::super::backend::OutputStream::open(&dev, 48_000, 2, shared.clone(), 480)
+                .unwrap();
+        out_stream.start().unwrap();
+
+        let mut frame_block = Vec::with_capacity(960 * 2);
+        for _ in 0..960 {
+            frame_block.push(0.6f32);
+            frame_block.push(-0.4f32);
+        }
+        let _ = shared.ring.push(&frame_block);
+
+        let mut drained = Vec::new();
+        let mut saw_raw = false;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && !saw_raw {
+            let n = sub.mixer.lock().unwrap().drain_mixed(960, &mut drained);
+            if n > 0
+                && drained
+                    .chunks_exact(2)
+                    .any(|f| (f[0] - 0.6).abs() < 1e-4 && (f[1] + 0.4).abs() < 1e-4)
+            {
+                saw_raw = true;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            saw_raw,
+            "middleware stream built with StreamShared::new must publish to fallback loopback bus"
+        );
+
+        // Endpoint software channel gains must also reflect in loopback capture for middleware streams.
+        ep_sw.sw_channels[0].store(0.5f32.to_bits(), Ordering::Release);
+        ep_sw.sw_channels[1].store(0.25f32.to_bits(), Ordering::Release);
+        let _ = shared.ring.push(&frame_block);
+        let mut saw_scaled = false;
+        let deadline2 = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline2 && !saw_scaled {
+            let n = sub.mixer.lock().unwrap().drain_mixed(960, &mut drained);
+            if n > 0
+                && drained
+                    .chunks_exact(2)
+                    .any(|f| (f[0] - 0.3).abs() < 1e-4 && (f[1] + 0.1).abs() < 1e-4)
+            {
+                saw_scaled = true;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            saw_scaled,
+            "middleware loopback output must reflect endpoint software channel gains"
+        );
+
+        // Dropping the middleware stream must stop and unregister its loopback source so another
+        // active source can advance without waiting on the dropped stream.
+        drop(out_stream);
+        set_loopback_source_started(&ep_id, 9002, true);
+        push_loopback_frames(&ep_id, 9002, &vec![0.25f32; 480 * 2], 48_000, 2);
+        let n = sub.mixer.lock().unwrap().drain_mixed(480, &mut drained);
+        assert_eq!(n, 480, "dropped middleware stream must not stall remaining loopback sources");
+        assert!((drained[0] - 0.25).abs() < 1e-4);
+        unregister_loopback_source(&ep_id, 9002);
+        super::super::mmdevapi::reset_endpoint_software_gains_for_test();
+    }
 }

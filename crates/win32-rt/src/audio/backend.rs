@@ -573,6 +573,10 @@ pub struct LoopbackFeed {
     /// Lock-free SPSC ring filled by the realtime CoreAudio IO thread and drained by
     /// the non-RT `wwise-audio-pump` thread into `push_loopback_frames`.
     pub ring: Ring,
+    /// True when `OutputStream::open` attached this feed automatically for a native
+    /// middleware stream (`StreamShared::new`), so `StreamControl::start`/`stop` and
+    /// `OutputStream::drop` drive its fallback loopback source registration lifecycle.
+    pub(super) managed_by_stream: bool,
 }
 
 /// Lock-free per-channel stream gain state (`IAudioStreamVolume`), safe to read from
@@ -711,7 +715,7 @@ impl PlaybackGain {
 /// State shared between the client, the IO callback and the pump thread.
 pub struct StreamShared {
     pub ring: Ring,
-    pub loopback: Option<LoopbackFeed>,
+    loopback: OnceLock<LoopbackFeed>,
     pub(super) gain: Option<PlaybackGain>,
     /// Endpoint software volume/mute handle attached by `OutputStream::open` for streams
     /// constructed without WASAPI session controls (DirectSound, XAudio2, FMOD, OpenAL, Bink).
@@ -744,7 +748,7 @@ impl StreamShared {
     pub fn new(ring: Ring) -> Arc<StreamShared> {
         Arc::new(StreamShared {
             ring,
-            loopback: None,
+            loopback: OnceLock::new(),
             gain: None,
             ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
@@ -769,15 +773,18 @@ impl StreamShared {
     ) -> Arc<StreamShared> {
         let lb_cap = ring.capacity().max(8192);
         let lb_ring = Ring::new(lb_cap, channels.max(1) as usize);
+        let loopback = OnceLock::new();
+        let _ = loopback.set(LoopbackFeed {
+            ep_id,
+            source_id,
+            rate,
+            channels,
+            ring: lb_ring,
+            managed_by_stream: false,
+        });
         Arc::new(StreamShared {
             ring,
-            loopback: Some(LoopbackFeed {
-                ep_id,
-                source_id,
-                rate,
-                channels,
-                ring: lb_ring,
-            }),
+            loopback,
             gain,
             ep_sw: OnceLock::new(),
             started: AtomicBool::new(false),
@@ -790,6 +797,11 @@ impl StreamShared {
             sema: Semaphore::new(),
             quit: AtomicBool::new(false),
         })
+    }
+
+    #[inline]
+    pub(super) fn loopback(&self) -> Option<&LoopbackFeed> {
+        self.loopback.get()
     }
 
     /// Lock-free realtime-safe gain application at playback consumption.
@@ -916,6 +928,11 @@ impl StreamControl {
                 return Err(e);
             }
         }
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::set_loopback_source_started(&lb.ep_id, lb.source_id, true);
+            }
+        }
         Ok(())
     }
 
@@ -926,6 +943,11 @@ impl StreamControl {
             ca_sync(move || ca::stop(au));
         }
         self.shared.started.store(false, Ordering::Release);
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::set_loopback_source_started(&lb.ep_id, lb.source_id, false);
+            }
+        }
     }
 }
 
@@ -946,9 +968,23 @@ impl OutputStream {
     /// Open (but don't start) a stream of interleaved f32 at `rate`/`channels`.
     /// `io_request` = desired IO cycle in device frames.
     pub fn open(dev: &DeviceInfo, rate: u32, channels: u16, shared: Arc<StreamShared>, io_request: u32) -> Result<OutputStream, String> {
+        let ep_id = super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
         if shared.gain.is_none() {
-            let ep_id = super::mmdevapi::render_endpoint_id_for_uid(&dev.uid);
             let _ = shared.ep_sw.set(super::mmdevapi::endpoint_software_gain_handle(&ep_id));
+        }
+        if shared.loopback.get().is_none() {
+            let lb_ch = shared.ring.channels().max(1);
+            let lb_cap = shared.ring.capacity().max(8192);
+            let lb_ring = Ring::new(lb_cap, lb_ch);
+            let source_id = super::audioclient::alloc_loopback_source_id();
+            let _ = shared.loopback.set(LoopbackFeed {
+                ep_id,
+                source_id,
+                rate,
+                channels: lb_ch as u16,
+                ring: lb_ring,
+                managed_by_stream: true,
+            });
         }
         let kind = if dev.id == 0 { Backend::Null } else { backend() };
         let pump = {
@@ -959,7 +995,7 @@ impl OutputStream {
                     let mut lb_buf = Vec::<f32>::new();
                     while !s.quit.load(Ordering::Acquire) {
                         if s.sema.wait() && !s.quit.load(Ordering::Acquire) {
-                            if let Some(lb) = &s.loopback {
+                            if let Some(lb) = s.loopback() {
                                 let ch = lb.ring.channels();
                                 loop {
                                     let avail = lb.ring.len();
@@ -1026,7 +1062,7 @@ impl OutputStream {
                                     next = now; // don't burst after a long stall
                                 }
                                 if s.started.load(Ordering::Acquire) {
-                                    let got = if let Some(lb) = &s.loopback {
+                                    let got = if let Some(lb) = s.loopback() {
                                         if super::audioclient::has_loopback_subscribers() {
                                             let got = s.ring.pop_into(&mut lb_buf);
                                             if got > 0 {
@@ -1090,6 +1126,11 @@ impl Drop for OutputStream {
         }
         if let Some(t) = self.pump.take() {
             let _ = t.join();
+        }
+        if let Some(lb) = self.shared.loopback() {
+            if lb.managed_by_stream {
+                super::audioclient::unregister_loopback_source(&lb.ep_id, lb.source_id);
+            }
         }
     }
 }
@@ -2028,7 +2069,7 @@ mod ca {
             }
             // Push consumed frames even when muted (`active` is already zeroed) so fallback
             // loopback capture advances this source's timeline without stalling on unmute.
-            if let Some(lb) = &s.loopback {
+            if let Some(lb) = s.loopback() {
                 if super::super::audioclient::has_loopback_subscribers() {
                     lb.ring.push(active);
                 }
@@ -2298,7 +2339,7 @@ mod ca {
             }
             // Push consumed frames even when muted (`active` is already zeroed) so fallback
             // loopback capture advances this source's timeline without stalling on unmute.
-            if let Some(lb) = &s.loopback {
+            if let Some(lb) = s.loopback() {
                 if super::super::audioclient::has_loopback_subscribers() {
                     lb.ring.push(active);
                 }
