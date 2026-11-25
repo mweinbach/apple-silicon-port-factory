@@ -72,6 +72,12 @@ pub struct ThreadObj {
     pub start_address: AtomicUsize,
     /// Creation timestamp in 100ns FILETIME ticks (`ThreadTimes`).
     pub creation_time: AtomicU64,
+    /// Exit timestamp in 100ns FILETIME ticks (`0` while live; captured on thread teardown).
+    pub exit_time: AtomicU64,
+    /// Terminal kernel CPU time in 100ns ticks, snapshotted before clearing the Mach port.
+    pub final_kernel_time: AtomicU64,
+    /// Terminal user CPU time in 100ns ticks, snapshotted before clearing the Mach port.
+    pub final_user_time: AtomicU64,
     /// Set by `NtSetInformationThread(ThreadHideFromDebugger)`.
     pub hide_from_debugger: AtomicBool,
     /// Set by `TerminateThread` to request asynchronous thread termination via `SIGUSR1`.
@@ -112,6 +118,9 @@ impl ThreadObj {
             affinity_group: AtomicU16::new(0),
             start_address: AtomicUsize::new(0),
             creation_time: AtomicU64::new(crate::types::now_filetime()),
+            exit_time: AtomicU64::new(0),
+            final_kernel_time: AtomicU64::new(0),
+            final_user_time: AtomicU64::new(0),
             hide_from_debugger: AtomicBool::new(false),
             terminate_requested: AtomicBool::new(false),
             terminated_ack: AtomicBool::new(false),
@@ -244,12 +253,56 @@ impl ThreadObj {
         self.resume_checked().unwrap_or(u32::MAX)
     }
 
+    fn snapshot_times_from_port(&self, port: u32) {
+        if let Some((kernel, user)) = sched::thread_cpu_times_100ns(port) {
+            self.final_kernel_time.fetch_max(kernel, Ordering::AcqRel);
+            self.final_user_time.fetch_max(user, Ordering::AcqRel);
+        }
+    }
+
+    /// Return `(creation_time, exit_time, kernel_time, user_time)` in 100ns FILETIME ticks.
+    /// Live threads query Mach `THREAD_BASIC_INFO` under the suspend lock; exited threads
+    /// return the terminal snapshot captured before clearing the Mach port.
+    pub fn times_100ns(&self) -> (u64, u64, u64, u64) {
+        let created = self.creation_time.load(Ordering::Relaxed);
+        let s = self.suspend.lock().unwrap_or_else(|e| e.into_inner());
+        match s.phase {
+            ThreadPhase::Exiting => (
+                created,
+                self.exit_time.load(Ordering::Acquire),
+                self.final_kernel_time.load(Ordering::Acquire),
+                self.final_user_time.load(Ordering::Acquire),
+            ),
+            ThreadPhase::Live => {
+                let port = if s.mach_port != 0 {
+                    s.mach_port
+                } else if self.is_current_thread(0) {
+                    sched::current_port()
+                } else {
+                    0
+                };
+                let (k, u) = sched::thread_cpu_times_100ns(port).unwrap_or((
+                    self.final_kernel_time.load(Ordering::Acquire),
+                    self.final_user_time.load(Ordering::Acquire),
+                ));
+                (created, 0, k, u)
+            }
+            ThreadPhase::Starting => (created, 0, 0, 0),
+        }
+    }
+
     fn wait_resumed(&self) -> bool {
         let mut s = self.suspend.lock().unwrap();
         while s.count > 0 && !self.terminate_requested.load(Ordering::Acquire) {
             s = self.resume_cv.wait(s).unwrap();
         }
         if self.terminate_requested.load(Ordering::Acquire) {
+            let _ = self.exit_time.compare_exchange(
+                0,
+                crate::types::now_filetime(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             s.phase = ThreadPhase::Exiting;
             return false;
         }
@@ -266,6 +319,15 @@ impl ThreadObj {
         if s.phase == ThreadPhase::Exiting {
             return;
         }
+        if s.mach_port != 0 {
+            self.snapshot_times_from_port(s.mach_port);
+        }
+        let _ = self.exit_time.compare_exchange(
+            0,
+            crate::types::now_filetime(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         #[cfg(target_vendor = "apple")]
         if s.kernel_suspended && s.mach_port != 0 {
             let _ = sched::thread_resume_port(s.mach_port);
@@ -449,11 +511,20 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
         }
         obj.terminate_requested.store(true, Ordering::Release);
         if s.phase == ThreadPhase::Starting {
+            let _ = obj.exit_time.compare_exchange(
+                0,
+                crate::types::now_filetime(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             s.count = 0;
             s.phase = ThreadPhase::Exiting;
             obj.resume_cv.notify_all();
             (true, 0usize)
         } else {
+            if s.mach_port != 0 {
+                obj.snapshot_times_from_port(s.mach_port);
+            }
             #[cfg(target_vendor = "apple")]
             if s.kernel_suspended && s.mach_port != 0 {
                 let _ = sched::thread_resume_port(s.mach_port);
@@ -1125,6 +1196,52 @@ pub mod sched {
             return ns.min(u32::MAX as u64) as u32;
         }
         (ns as u128 * denom as u128 / numer as u128).min(u32::MAX as u128) as u32
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct MachTimeValue {
+        seconds: i32,
+        microseconds: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct MachThreadBasicInfo {
+        user_time: MachTimeValue,
+        system_time: MachTimeValue,
+        cpu_usage: i32,
+        policy: i32,
+        run_state: i32,
+        flags: i32,
+        suspend_count: i32,
+        sleep_time: i32,
+    }
+
+    /// Query Mach `THREAD_BASIC_INFO` for `port`, returning `Some((kernel_100ns, user_100ns))`.
+    pub fn thread_cpu_times_100ns(port: u32) -> Option<(u64, u64)> {
+        if port == 0 {
+            return None;
+        }
+        const THREAD_BASIC_INFO: i32 = 3;
+        extern "C" {
+            fn thread_info(target_act: u32, flavor: i32, thread_info_out: *mut i32, count: *mut u32) -> i32;
+        }
+        let mut info = MachThreadBasicInfo::default();
+        let mut count = (std::mem::size_of::<MachThreadBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        let kr = unsafe {
+            thread_info(port, THREAD_BASIC_INFO, &mut info as *mut _ as *mut i32, &mut count)
+        };
+        if kr != 0 {
+            return None;
+        }
+        let user = (info.user_time.seconds.max(0) as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((info.user_time.microseconds.max(0) as u64).saturating_mul(10));
+        let kernel = (info.system_time.seconds.max(0) as u64)
+            .saturating_mul(10_000_000)
+            .saturating_add((info.system_time.microseconds.max(0) as u64).saturating_mul(10));
+        Some((kernel, user))
     }
 
     /// Mach thread port of the current thread (no reference to release).

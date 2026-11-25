@@ -33,6 +33,10 @@ pub trait KObject: Any + Send + Sync {
     fn waitable(&self) -> Option<&dyn Waitable> {
         None
     }
+    /// Called when a handle table entry referencing this object is opened (created or duplicated).
+    fn on_handle_open(&self) {}
+    /// Called after a handle table entry referencing this object is closed (outside the handle table lock).
+    fn on_handle_close(&self) {}
 }
 
 /// State is only accessed while holding [`WAIT_LOCK`] (passed as `&WaitGuard`),
@@ -558,6 +562,7 @@ pub fn live_count() -> u32 {
 }
 
 pub fn insert_with_flags(obj: Arc<dyn KObject>, flags: u32) -> HANDLE {
+    obj.on_handle_open();
     let mut t = table().write().unwrap();
     let h = t.next;
     t.next += 4;
@@ -689,7 +694,12 @@ pub fn close(h: HANDLE) -> bool {
         }
         r
     };
-    removed.is_some()
+    if let Some(obj) = removed {
+        obj.on_handle_close();
+        true
+    } else {
+        false
+    }
 }
 
 pub fn duplicate(h: HANDLE) -> Option<HANDLE> {

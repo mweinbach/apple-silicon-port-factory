@@ -1746,6 +1746,7 @@ fn notify_jobs_of_child_exit(pid: u32, exit_code: u32) {
             }
         }
     }
+    release_inactive_jobs();
 }
 
 /// Current process `(user_100ns, kernel_100ns, page_faults)` from `getrusage(RUSAGE_SELF)`.
@@ -1833,12 +1834,18 @@ impl JobState {
 
 pub struct JobObj {
     state: std::sync::Mutex<JobState>,
+    /// Number of open handle-table entries currently referencing this job object.
+    /// Closing the last handle (`1 -> 0`) unlinks any object name and enforces
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, independently of whether live assigned
+    /// processes retain the job object itself in [`active_jobs`].
+    open_handles: AtomicUsize,
 }
 
 impl JobObj {
     fn new(name: Option<String>) -> Arc<Self> {
         let obj = Arc::new(Self {
             state: std::sync::Mutex::new(JobState::new(name)),
+            open_handles: AtomicUsize::new(0),
         });
         let mut all = all_jobs().lock().unwrap();
         all.retain(|w| w.strong_count() > 0);
@@ -1892,24 +1899,11 @@ impl JobObj {
 
 impl Drop for JobObj {
     fn drop(&mut self) {
-        let (kill_on_close, name) = {
-            let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-            (
-                (st.limit_flags() & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0,
-                st.name.take(),
-            )
-        };
+        let name = self.state.get_mut().unwrap_or_else(|e| e.into_inner()).name.take();
         if let Some(n) = name {
             let mut jobs = named_jobs().lock().unwrap_or_else(|e| e.into_inner());
             if jobs.get(&n).is_some_and(|w| w.strong_count() == 0) {
                 jobs.remove(&n);
-            }
-        }
-        if kill_on_close {
-            // Terminate all processes associated with this job on last-handle close
-            // (both assigned child processes and the current process if assigned).
-            if self.terminate_children(1) {
-                pr::exit_process(1);
             }
         }
     }
@@ -1922,6 +1916,43 @@ impl KObject for JobObj {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn on_handle_open(&self) {
+        self.open_handles.fetch_add(1, Ordering::AcqRel);
+    }
+    fn on_handle_close(&self) {
+        if self.open_handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // Re-check under named_jobs() in case a concurrent Create/OpenJobObject just opened a handle.
+        let mut jobs = named_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        if self.open_handles.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let (kill_on_close, name) = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                (st.limit_flags() & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0,
+                st.name.clone(),
+            )
+        };
+        if let Some(n) = name {
+            if jobs
+                .get(&n)
+                .and_then(|w| w.upgrade())
+                .is_some_and(|cur| std::ptr::eq(Arc::as_ptr(&cur), self))
+            {
+                jobs.remove(&n);
+            }
+        }
+        drop(jobs);
+        if kill_on_close {
+            // Terminate all processes associated with this job on last-handle close
+            // (both assigned child processes and the current process if assigned).
+            if self.terminate_children(1) {
+                pr::exit_process(1);
+            }
+        }
+    }
 }
 
 fn all_jobs() -> &'static std::sync::Mutex<Vec<std::sync::Weak<JobObj>>> {
@@ -1929,8 +1960,29 @@ fn all_jobs() -> &'static std::sync::Mutex<Vec<std::sync::Weak<JobObj>>> {
     JOBS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// Weak namespace for named job objects so closing the last handle drops `JobObj`
-/// (triggering `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and freeing the name for reuse).
+/// Strong references retaining jobs while they have at least one live assigned process
+/// (Windows keeps a job object alive until its last handle is closed AND all associated
+/// processes have terminated).
+fn active_jobs() -> &'static std::sync::Mutex<Vec<Arc<JobObj>>> {
+    static ACTIVE: OnceLock<std::sync::Mutex<Vec<Arc<JobObj>>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn retain_active_job(j: &Arc<JobObj>) {
+    let mut active = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    if !active.iter().any(|x| Arc::ptr_eq(x, j)) {
+        active.push(Arc::clone(j));
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn release_inactive_jobs() {
+    let mut active = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    active.retain(|j| j.state.lock().unwrap_or_else(|e| e.into_inner()).active_count() > 0);
+}
+
+/// Weak namespace for named job objects; entries are unlinked when the last open handle
+/// closes (matching Windows temporary kernel object namespace semantics).
 fn named_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>> {
     static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>>> =
         OnceLock::new();
@@ -1950,16 +2002,22 @@ fn create_job_object_impl(name: Option<String>) -> HANDLE {
         }
     }
     let mut jobs = named_jobs().lock().unwrap();
-    if let Some(existing) = jobs.get(&n).and_then(|w| w.upgrade()) {
+    if let Some(existing) = jobs
+        .get(&n)
+        .and_then(|w| w.upgrade())
+        .filter(|j| j.open_handles.load(Ordering::Acquire) > 0)
+    {
+        let h = handles::insert(existing);
         drop(jobs);
         set_err(err::ERROR_ALREADY_EXISTS);
-        return handles::insert(existing);
+        return h;
     }
     let obj = JobObj::new(Some(n.clone()));
+    let h = handles::insert(Arc::clone(&obj) as Arc<dyn KObject>);
     jobs.insert(n, Arc::downgrade(&obj));
     drop(jobs);
     set_err(0);
-    handles::insert(obj)
+    h
 }
 
 pub unsafe extern "win64" fn CreateJobObjectW(_sec: *mut c_void, name: LPCWSTR) -> HANDLE {
@@ -1976,7 +2034,11 @@ pub unsafe extern "win64" fn OpenJobObjectW(_access: u32, inherit: BOOL, name: L
     };
     let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
     let mut jobs = named_jobs().lock().unwrap();
-    if let Some(existing) = jobs.get(&n).and_then(|w| w.upgrade()) {
+    if let Some(existing) = jobs
+        .get(&n)
+        .and_then(|w| w.upgrade())
+        .filter(|j| j.open_handles.load(Ordering::Acquire) > 0)
+    {
         return handles::insert_with_flags(existing, flags);
     }
     jobs.remove(&n);
@@ -2035,6 +2097,7 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     };
     st.members.push(member);
     st.total_processes = st.total_processes.saturating_add(1);
+    let keep_alive = exited_code.is_none();
     if let Some(ref cp) = st.completion_port {
         post_job_iocp_msg(cp, JOB_OBJECT_MSG_NEW_PROCESS, pid as usize);
         if let Some(code) = exited_code {
@@ -2048,6 +2111,10 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
                 post_job_iocp_msg(cp, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
             }
         }
+    }
+    drop(st);
+    if keep_alive {
+        retain_active_job(&j);
     }
     TRUE
 }
@@ -4036,6 +4103,25 @@ pub(crate) mod tests {
             assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
 
+            // Closing the last job handle without KILL_ON_JOB_CLOSE retains the job while
+            // assigned processes remain alive: IsProcessInJob(self, NULL) and
+            // QueryInformationJobObject(NULL, ...) must continue to see this job.
+            in_job = FALSE;
+            assert_eq!(IsProcessInJob(handles::CURRENT_PROCESS, std::ptr::null_mut(), &mut in_job), TRUE);
+            assert_eq!(in_job, TRUE);
+            let mut out_cpu_after_close = [0u8; 8];
+            assert_eq!(
+                QueryInformationJobObject(
+                    std::ptr::null_mut(),
+                    15,
+                    out_cpu_after_close.as_mut_ptr() as *mut c_void,
+                    8,
+                    &mut ret_len,
+                ),
+                TRUE
+            );
+            assert_eq!(out_cpu_after_close, cpu_rate);
+
             // Named job objects release namespace ownership when the last handle closes.
             let jname = to_wide_z("Local\\KernelCoreNamedJobTest");
             let nj1 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
@@ -4122,6 +4208,43 @@ pub(crate) mod tests {
 
                 assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
                 assert_eq!(crate::kernel32::threads::CloseHandle(cjob), TRUE);
+
+                // A job with a live child stays alive after its last handle closes until the child exits
+                // (delivering IOCP exit/zero notifications and then releasing cleanly).
+                let cjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob2.is_null());
+                std::ptr::write_unaligned(assoc.as_mut_ptr() as *mut usize, 0xBEEF_5678usize);
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob2, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+                let child_obj2 = Arc::new(ChildProcessObj {
+                    pid: 88888,
+                    exe_win: "C:\\Games\\Worker2.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let child_h2 = handles::insert(Arc::clone(&child_obj2) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob2, child_h2), TRUE);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_NEW_PROCESS, 0xBEEF_5678, 88888));
+
+                // Close the last job handle while child 2 is still running.
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob2), TRUE);
+                let mut child2_in_job: BOOL = FALSE;
+                assert_eq!(IsProcessInJob(child_h2, std::ptr::null_mut(), &mut child2_in_job), TRUE);
+                assert_eq!(child2_in_job, TRUE);
+
+                // Once child 2 exits, the retained job still delivers EXIT_PROCESS + ACTIVE_PROCESS_ZERO
+                // and is then destroyed so IsProcessInJob(child_h2, NULL) returns FALSE.
+                child_obj2.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_EXIT_PROCESS, 0xBEEF_5678, 88888));
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!((msg, key, ov as usize), (JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0xBEEF_5678, 0));
+                assert_eq!(IsProcessInJob(child_h2, std::ptr::null_mut(), &mut child2_in_job), TRUE);
+                assert_eq!(child2_in_job, FALSE);
+
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_h2), TRUE);
                 assert_eq!(crate::kernel32::threads::CloseHandle(iocp), TRUE);
             }
         }

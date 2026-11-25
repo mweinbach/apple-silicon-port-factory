@@ -128,49 +128,6 @@ unsafe fn rusage_process_times_100ns() -> (u64, u64) {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct MachTimeValue {
-    seconds: i32,
-    microseconds: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct MachThreadBasicInfo {
-    user_time: MachTimeValue,
-    system_time: MachTimeValue,
-    cpu_usage: i32,
-    policy: i32,
-    run_state: i32,
-    flags: i32,
-    suspend_count: i32,
-    sleep_time: i32,
-}
-
-unsafe fn mach_thread_times_100ns(port: u32) -> (u64, u64) {
-    if port == 0 {
-        return (0, 0);
-    }
-    const THREAD_BASIC_INFO: i32 = 3;
-    extern "C" {
-        fn thread_info(target_act: u32, flavor: i32, thread_info_out: *mut i32, count: *mut u32) -> i32;
-    }
-    let mut info = MachThreadBasicInfo::default();
-    let mut count = (std::mem::size_of::<MachThreadBasicInfo>() / std::mem::size_of::<u32>()) as u32;
-    if thread_info(port, THREAD_BASIC_INFO, &mut info as *mut _ as *mut i32, &mut count) == 0 {
-        let user = (info.user_time.seconds.max(0) as u64)
-            .saturating_mul(10_000_000)
-            .saturating_add((info.user_time.microseconds.max(0) as u64).saturating_mul(10));
-        let kernel = (info.system_time.seconds.max(0) as u64)
-            .saturating_mul(10_000_000)
-            .saturating_add((info.system_time.microseconds.max(0) as u64).saturating_mul(10));
-        (kernel, user)
-    } else {
-        (0, 0)
-    }
-}
-
 pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, out: *mut u8, len: u32, ret: *mut u32) -> NTSTATUS {
     let put_ret = |n: u32| {
         if !ret.is_null() {
@@ -547,19 +504,19 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
         }
         1 => {
             // ThreadTimes (KERNEL_USER_TIMES: 32 bytes)
+            let Some(ref t) = tobj else {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            };
             put_ret(32);
             if len < 32 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            std::ptr::write_bytes(out, 0, 32);
-            if let Some(ref t) = tobj {
-                let created = t.creation_time.load(std::sync::atomic::Ordering::Relaxed);
-                let port = crate::thread::sched::port_of(t).unwrap_or(0);
-                let (kernel, user) = mach_thread_times_100ns(port);
-                std::ptr::write_unaligned(out as *mut u64, created);
-                std::ptr::write_unaligned(out.add(16) as *mut u64, kernel);
-                std::ptr::write_unaligned(out.add(24) as *mut u64, user);
-            }
+            let (created, exited, kernel, user) = t.times_100ns();
+            std::ptr::write_unaligned(out as *mut u64, created);
+            std::ptr::write_unaligned(out.add(8) as *mut u64, exited);
+            std::ptr::write_unaligned(out.add(16) as *mut u64, kernel);
+            std::ptr::write_unaligned(out.add(24) as *mut u64, user);
             STATUS_SUCCESS
         }
         9 => {
@@ -3585,6 +3542,36 @@ mod tests {
             // unknown classes.
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 1, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 32);
+            // ThreadTimes on an exited thread preserves ExitTime and snapshotted CPU time.
+            let worker = crate::thread::spawn(
+                Box::new(|| {
+                    let mut acc = 1u64;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_millis(10) {
+                        for _ in 0..10_000 {
+                            acc = std::hint::black_box(acc.wrapping_mul(6364136223846793005).wrapping_add(1));
+                        }
+                    }
+                    std::hint::black_box(acc) as u32
+                }),
+                0,
+                false,
+                false,
+            )
+            .expect("spawn timing worker");
+            let wh = crate::handles::insert(worker);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(wh, 5000), WAIT_OBJECT_0);
+            let mut tbuf = [0u8; 32];
+            assert_eq!(NtQueryInformationThread(wh, 1, tbuf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 32);
+            let t_create = std::ptr::read_unaligned(tbuf.as_ptr() as *const u64);
+            let t_exit = std::ptr::read_unaligned(tbuf.as_ptr().add(8) as *const u64);
+            let t_kernel = std::ptr::read_unaligned(tbuf.as_ptr().add(16) as *const u64);
+            let t_user = std::ptr::read_unaligned(tbuf.as_ptr().add(24) as *const u64);
+            assert!(t_create > 0);
+            assert!(t_exit >= t_create, "expected ExitTime ({t_exit}) >= CreationTime ({t_create})");
+            assert!(t_kernel + t_user > 0, "expected preserved CPU time after thread exit");
+            assert_eq!(crate::kernel32::threads::CloseHandle(wh), TRUE);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0C, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 4);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x1E, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
