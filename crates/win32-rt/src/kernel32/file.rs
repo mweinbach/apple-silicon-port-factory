@@ -2340,58 +2340,148 @@ pub unsafe extern "win64" fn GetFileInformationByHandle(h: HANDLE, out: *mut u8)
 
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
-fn collect_dir_enum_entries(dir: &Path) -> std::io::Result<Vec<DirEnumEntry>> {
+fn stat_times(st: &libc::stat) -> Times {
+    #[cfg(target_vendor = "apple")]
+    let (bsec, bnsec) = (st.st_birthtime as i64, st.st_birthtime_nsec as i64);
+    #[cfg(not(target_vendor = "apple"))]
+    let (bsec, bnsec) = (0i64, 0i64);
+    let ctime = unix_to_filetime(st.st_ctime as i64, st.st_ctime_nsec as i64);
+    Times {
+        create: if bsec != 0 { unix_to_filetime(bsec, bnsec) } else { ctime },
+        access: unix_to_filetime(st.st_atime as i64, st.st_atime_nsec as i64),
+        write: unix_to_filetime(st.st_mtime as i64, st.st_mtime_nsec as i64),
+        change: ctime,
+    }
+}
+
+fn stat_attrs(st: &libc::stat, name: &str) -> u32 {
+    let mut a = 0;
+    if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+        a |= FILE_ATTRIBUTE_DIRECTORY;
+    } else {
+        a |= FILE_ATTRIBUTE_ARCHIVE;
+    }
+    if (st.st_mode & 0o200) == 0 {
+        a |= FILE_ATTRIBUTE_READONLY;
+    }
+    if name.starts_with('.') && name != "." && name != ".." {
+        a |= FILE_ATTRIBUTE_HIDDEN;
+    }
+    a
+}
+
+unsafe fn collect_dir_enum_entries_fd(dir_fd: libc::c_int) -> std::io::Result<Vec<DirEnumEntry>> {
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
     let mut out = Vec::new();
     // Windows directory enumeration starts with "." and ".." for non-root directories.
-    let m = std::fs::metadata(dir)?;
-    let t = meta_times(&m);
+    let mut dir_st: libc::stat = std::mem::zeroed();
+    if libc::fstat(dir_fd, &mut dir_st) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     out.push(DirEnumEntry {
         name: ".".into(),
         attrs: FILE_ATTRIBUTE_DIRECTORY,
-        times: t,
+        times: stat_times(&dir_st),
         size: 0,
         alloc_size: 0,
-        ino: m.ino(),
+        ino: dir_st.st_ino as u64,
         reparse_tag: 0,
     });
-    let parent_m = dir.parent().and_then(|p| std::fs::metadata(p).ok()).unwrap_or(m);
-    let pt = meta_times(&parent_m);
+    let mut parent_st: libc::stat = std::mem::zeroed();
+    let parent_st = if libc::fstatat(dir_fd, b"..\0".as_ptr() as *const libc::c_char, &mut parent_st, 0) == 0 {
+        parent_st
+    } else {
+        dir_st
+    };
     out.push(DirEnumEntry {
         name: "..".into(),
         attrs: FILE_ATTRIBUTE_DIRECTORY,
-        times: pt,
+        times: stat_times(&parent_st),
         size: 0,
         alloc_size: 0,
-        ino: parent_m.ino(),
+        ino: parent_st.st_ino as u64,
         reparse_tag: 0,
     });
+
+    let dup_fd = libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0);
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let dirp = libc::fdopendir(dup_fd);
+    if dirp.is_null() {
+        let e = std::io::Error::last_os_error();
+        libc::close(dup_fd);
+        return Err(e);
+    }
+    let _dir_guard = DirGuard(dirp);
+    libc::rewinddir(dirp);
+
     let mut children = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let sm = match std::fs::symlink_metadata(entry.path()) {
-            Ok(sm) => sm,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+    loop {
+        #[cfg(target_vendor = "apple")]
+        {
+            *libc::__error() = 0;
+        }
+        let ent = libc::readdir(dirp);
+        if ent.is_null() {
+            #[cfg(target_vendor = "apple")]
+            let e = *libc::__error();
+            #[cfg(not(target_vendor = "apple"))]
+            let e = 0;
+            if e != 0 {
+                return Err(std::io::Error::from_raw_os_error(e));
+            }
+            break;
+        }
+        let name_cstr = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
+        if name_cstr.to_bytes() == b"." || name_cstr.to_bytes() == b".." {
+            continue;
+        }
+        let name = name_cstr.to_string_lossy().into_owned();
+        let mut sm: libc::stat = std::mem::zeroed();
+        if libc::fstatat(dir_fd, name_cstr.as_ptr(), &mut sm, libc::AT_SYMLINK_NOFOLLOW) != 0 {
+            let e = last_errno();
+            if e == libc::ENOENT {
+                continue;
+            }
+            return Err(std::io::Error::from_raw_os_error(e));
+        }
+        let is_symlink = (sm.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+        let m = if is_symlink {
+            let mut target_st: libc::stat = std::mem::zeroed();
+            if libc::fstatat(dir_fd, name_cstr.as_ptr(), &mut target_st, 0) == 0 {
+                target_st
+            } else {
+                sm
+            }
+        } else {
+            sm
         };
-        let is_symlink = sm.file_type().is_symlink();
-        let m = if is_symlink { std::fs::metadata(entry.path()).unwrap_or(sm) } else { sm };
-        let mut attrs = meta_attrs(&m, &name);
+        let is_dir = (m.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        let mut attrs = stat_attrs(&m, &name);
         let reparse_tag = if is_symlink {
             attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
             IO_REPARSE_TAG_SYMLINK
         } else {
             0
         };
-        let len = if m.is_dir() { 0 } else { m.len() };
-        let alloc_size = if m.is_dir() { 0 } else { (m.blocks() * 512).max(len) };
+        let len = if is_dir { 0 } else { m.st_size.max(0) as u64 };
+        let alloc_size = if is_dir { 0 } else { ((m.st_blocks.max(0) as u64) * 512).max(len) };
         children.push(DirEnumEntry {
             name,
             attrs,
-            times: meta_times(&m),
+            times: stat_times(&m),
             size: len,
             alloc_size,
-            ino: m.ino(),
+            ino: m.st_ino as u64,
             reparse_tag,
         });
     }
@@ -2412,13 +2502,9 @@ unsafe fn fill_dir_info_by_handle(f: &FileObj, layout: DirInfoLayout, restart: b
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let Some(host_dir) = &f.host_path else {
-        set_err(err::ERROR_INVALID_HANDLE);
-        return FALSE;
-    };
     let mut guard = f.dir_enum.lock().unwrap();
     if restart || guard.is_none() {
-        match collect_dir_enum_entries(host_dir) {
+        match collect_dir_enum_entries_fd(f.fd()) {
             Ok(entries) => *guard = Some(DirEnumState { entries, cursor: 0 }),
             Err(e) => {
                 *guard = None;
@@ -12105,12 +12191,10 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("secret.txt"), b"data").unwrap();
 
-        // Mode 0444 allows `read_dir` to yield "secret.txt", but denies search (+x) so
-        // `symlink_metadata(child)` fails with EACCES. Enumeration must fail rather than
-        // silently omitting "secret.txt".
+        // Mode 0444 allows `readdir` to yield "secret.txt", but denies search (+x) so
+        // `fstatat(dir_fd, "secret.txt", AT_SYMLINK_NOFOLLOW)` fails with EACCES.
+        // Enumeration must fail rather than silently omitting "secret.txt".
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let res = collect_dir_enum_entries(&sub);
-        // Also verify end-to-end through GetFileInformationByHandleEx(FileFullDirectoryInfo).
         crate::path::add_mount("W:\\", &dir);
         unsafe {
             let wsub = to_wide_z("W:\\unsearchable");
@@ -12131,9 +12215,57 @@ mod tests {
             );
             assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
             crate::kernel32::threads::CloseHandle(hd);
+
+            // Renaming an open directory and replacing its original path must keep enumerating
+            // the opened descriptor's inode (including restart scans), not the replacement dir.
+            let orig_dir = dir.join("orig_dir");
+            let moved_dir = dir.join("moved_dir");
+            std::fs::create_dir_all(&orig_dir).unwrap();
+            std::fs::write(orig_dir.join("original_child.txt"), b"orig").unwrap();
+            let worig = to_wide_z("W:\\orig_dir");
+            let h_orig = CreateFileW(
+                worig.as_ptr(),
+                GENERIC_READ,
+                7,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_orig, INVALID_HANDLE_VALUE);
+            std::fs::rename(&orig_dir, &moved_dir).unwrap();
+            std::fs::create_dir_all(&orig_dir).unwrap();
+            std::fs::write(orig_dir.join("replacement_child.txt"), b"repl").unwrap();
+
+            let read_names = |restart_cls: u32| -> Vec<String> {
+                let mut dbuf = vec![0u8; 4096];
+                let mut names = Vec::new();
+                let mut cls = restart_cls;
+                while GetFileInformationByHandleEx(h_orig, cls, dbuf.as_mut_ptr(), dbuf.len() as u32) != 0 {
+                    let mut off = 0usize;
+                    loop {
+                        let next_off = (dbuf.as_ptr().add(off) as *const u32).read_unaligned() as usize;
+                        let flen = (dbuf.as_ptr().add(off + 60) as *const u32).read_unaligned() as usize;
+                        let u = crate::strings::read_wide_slice(dbuf.as_ptr().add(off + 68) as *const u16, flen / 2);
+                        names.push(String::from_utf16_lossy(&u));
+                        if next_off == 0 {
+                            break;
+                        }
+                        off += next_off;
+                    }
+                    cls = 14;
+                }
+                names
+            };
+            let first = read_names(14);
+            let restarted = read_names(15);
+            for list in [&first, &restarted] {
+                assert!(list.iter().any(|n| n == "original_child.txt"), "got {list:?}");
+                assert!(!list.iter().any(|n| n == "replacement_child.txt"), "got {list:?}");
+            }
+            crate::kernel32::threads::CloseHandle(h_orig);
         }
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(res.err().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

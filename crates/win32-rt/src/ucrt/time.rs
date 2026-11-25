@@ -586,12 +586,90 @@ fn strftime_str_with_names(fmt: &[u32], tm: &Tm, names: &super::locale::TimeLoca
     Some(out)
 }
 
-unsafe fn strftime_impl(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, loc: *mut c_void) -> usize {
+unsafe fn time_names_from_snapshot(ptr: *mut c_void) -> super::locale::TimeLocaleNames {
+    let d = &*(ptr as *const LcTimeData);
+    let read_pair = |w: *const u16, a: *const u8, fallback: &str| -> String {
+        if !w.is_null() {
+            crate::strings::from_wide(w)
+        } else if !a.is_null() {
+            String::from_utf8_lossy(cstr_slice(a)).into_owned()
+        } else {
+            fallback.to_string()
+        }
+    };
+    let bcp47 = if !d.w_ww_locale_name.is_null() {
+        crate::strings::from_wide(d.w_ww_locale_name)
+    } else {
+        String::new()
+    };
+    let days_abbr: [String; 7] = std::array::from_fn(|i| read_pair(d.w_wday_abbr[i], d.wday_abbr[i], DAYS_ABBR[i]));
+    let days: [String; 7] = std::array::from_fn(|i| read_pair(d.w_wday[i], d.wday[i], DAYS[i]));
+    let mon_abbr: [String; 12] = std::array::from_fn(|i| read_pair(d.w_month_abbr[i], d.month_abbr[i], MON_ABBR[i]));
+    let mons: [String; 12] = std::array::from_fn(|i| read_pair(d.w_month[i], d.month[i], MONS[i]));
+    let ampm = [
+        read_pair(d.w_ampm[0], d.ampm[0], "AM"),
+        read_pair(d.w_ampm[1], d.ampm[1], "PM"),
+    ];
+    let short_date = read_pair(d.w_ww_sdatefmt, d.ww_sdatefmt, "MM/dd/yy");
+    let long_date = read_pair(d.w_ww_ldatefmt, d.ww_ldatefmt, "dddd, MMMM dd, yyyy");
+    let time_fmt = read_pair(d.w_ww_timefmt, d.ww_timefmt, "HH:mm:ss");
+    let is_c = bcp47.is_empty();
+    let cp = if is_c {
+        0
+    } else {
+        let default_cp = crate::kernel32::string::resolve_locale_tag(&bcp47)
+            .and_then(|loc| crate::kernel32::string::locale_info_for(&loc, 0x1004))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&c| c != 0 && crate::kernel32::string::valid_cp(c))
+            .unwrap_or(65001);
+        // Distinguish `<locale>.utf8` from `<locale>.<ansi_cp>` by checking whether any
+        // non-ASCII narrow string stored in `LcTimeData` matches UTF-8 rather than `default_cp`.
+        let mut is_utf8 = default_cp == 65001;
+        if !is_utf8 {
+            for (ptr_a, s) in d
+                .month
+                .iter()
+                .zip(mons.iter())
+                .chain(d.wday.iter().zip(days.iter()))
+            {
+                if !ptr_a.is_null() && !s.is_ascii() {
+                    let raw = cstr_slice(*ptr_a);
+                    let cp_enc = super::locale::encode_in_cp(s, default_cp);
+                    if raw == s.as_bytes() && raw != cp_enc.as_slice() {
+                        is_utf8 = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if is_utf8 { 65001 } else { default_cp }
+    };
+    super::locale::TimeLocaleNames {
+        is_c,
+        cp,
+        bcp47,
+        days_abbr,
+        days,
+        mon_abbr,
+        mons,
+        ampm,
+        short_date,
+        long_date,
+        time_fmt,
+    }
+}
+
+unsafe fn strftime_with_names(
+    buf: *mut u8,
+    max: usize,
+    fmt: *const u8,
+    tm: *const Tm,
+    names: &super::locale::TimeLocaleNames,
+) -> usize {
     if buf.is_null() || fmt.is_null() || tm.is_null() || max == 0 {
         super::errno::set(super::errno::EINVAL);
         return 0;
     }
-    let names = super::locale::time_locale_names(loc);
     let raw = cstr_slice(fmt);
     let f: Vec<u32> = if names.cp != 0 && names.cp != 65001 {
         let w = crate::kernel32::string::decode_cp_to_utf16(names.cp, raw)
@@ -619,12 +697,17 @@ unsafe fn strftime_impl(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm,
     bytes.len()
 }
 
-unsafe fn wcsftime_impl(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, loc: *mut c_void) -> usize {
+unsafe fn wcsftime_with_names(
+    buf: *mut u16,
+    max: usize,
+    fmt: *const u16,
+    tm: *const Tm,
+    names: &super::locale::TimeLocaleNames,
+) -> usize {
     if buf.is_null() || fmt.is_null() || tm.is_null() || max == 0 {
         super::errno::set(super::errno::EINVAL);
         return 0;
     }
-    let names = super::locale::time_locale_names(loc);
     let f: Vec<u32> = String::from_utf16_lossy(wide_slice(fmt)).chars().map(|c| c as u32).collect();
     let Some(s) = strftime_str_with_names(&f, &*tm, names) else {
         *buf = 0;
@@ -633,32 +716,42 @@ unsafe fn wcsftime_impl(buf: *mut u16, max: usize, fmt: *const u16, tm: *const T
     };
     let w: Vec<u16> = s.encode_utf16().collect();
     if w.len() >= max {
-        *buf = 0;
+        std::ptr::write_unaligned(buf, 0);
         super::errno::set(super::errno::ERANGE);
         return 0;
     }
-    std::ptr::copy_nonoverlapping(w.as_ptr(), buf, w.len());
-    *buf.add(w.len()) = 0;
+    std::ptr::copy_nonoverlapping(w.as_ptr() as *const u8, buf as *mut u8, w.len() * 2);
+    std::ptr::write_unaligned(buf.add(w.len()), 0);
     w.len()
 }
 
 pub unsafe extern "win64" fn strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm) -> usize {
-    strftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
+    strftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(std::ptr::null_mut()))
 }
 pub unsafe extern "win64" fn _strftime_l(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, l: *mut c_void) -> usize {
-    strftime_impl(buf, max, fmt, tm, l)
+    strftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(l))
 }
-pub unsafe extern "win64" fn _Strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, _names: *mut c_void) -> usize {
-    strftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
+pub unsafe extern "win64" fn _Strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm, names: *mut c_void) -> usize {
+    if names.is_null() {
+        strftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(std::ptr::null_mut()))
+    } else {
+        let snap = time_names_from_snapshot(names);
+        strftime_with_names(buf, max, fmt, tm, &snap)
+    }
 }
 pub unsafe extern "win64" fn wcsftime(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm) -> usize {
-    wcsftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
+    wcsftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(std::ptr::null_mut()))
 }
 pub unsafe extern "win64" fn _wcsftime_l(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, l: *mut c_void) -> usize {
-    wcsftime_impl(buf, max, fmt, tm, l)
+    wcsftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(l))
 }
-pub unsafe extern "win64" fn _Wcsftime(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, _names: *mut c_void) -> usize {
-    wcsftime_impl(buf, max, fmt, tm, std::ptr::null_mut())
+pub unsafe extern "win64" fn _Wcsftime(buf: *mut u16, max: usize, fmt: *const u16, tm: *const Tm, names: *mut c_void) -> usize {
+    if names.is_null() {
+        wcsftime_with_names(buf, max, fmt, tm, super::locale::time_locale_names(std::ptr::null_mut()))
+    } else {
+        let snap = time_names_from_snapshot(names);
+        wcsftime_with_names(buf, max, fmt, tm, &snap)
+    }
 }
 
 pub unsafe extern "win64" fn asctime_s(buf: *mut u8, size: usize, tm: *const Tm) -> i32 {
@@ -848,6 +941,23 @@ mod tests {
             let nc = strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm);
             assert_eq!(&nbuf[..nc], b"Tuesday November");
             crate::ucrt::locale::_free_locale(loc_de);
+
+            // Captured _Gettnames() snapshots are honored by _Strftime / _Wcsftime regardless of
+            // subsequent global LC_TIME changes (matching MSVC STL std::time_put).
+            let tn_c = _Gettnames();
+            assert!(!tn_c.is_null());
+            assert!(!crate::ucrt::locale::setlocale(5, b"de-DE\0".as_ptr()).is_null());
+            let tn_de = _Gettnames();
+            assert!(!tn_de.is_null());
+            let n_c_snap = _Strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm, tn_c);
+            assert_eq!(&nbuf[..n_c_snap], b"Tuesday November");
+            assert!(!crate::ucrt::locale::setlocale(5, b"C\0".as_ptr()).is_null());
+            let n_de_snap = _Strftime(nbuf.as_mut_ptr(), nbuf.len(), b"%A %B\0".as_ptr(), &tm, tn_de);
+            assert_eq!(&nbuf[..n_de_snap], b"Dienstag November");
+            let wn_de_snap = _Wcsftime(wbuf.as_mut_ptr(), wbuf.len(), wfmt.as_ptr(), &tm, tn_de);
+            assert_eq!(String::from_utf16_lossy(&wbuf[..wn_de_snap]), "Dienstag November");
+            crate::heap::free(tn_c);
+            crate::heap::free(tn_de);
         }
     }
 }
