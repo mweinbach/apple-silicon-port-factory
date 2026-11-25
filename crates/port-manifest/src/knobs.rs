@@ -3760,6 +3760,15 @@ pub const KNOBS: &[KnobSpec] = &[
         crates: &["win32-rt"],
     },
     KnobSpec {
+        name: "PORT_STRICT_HOST_THUNK",
+        aliases: &[],
+        kind: KnobType::Bool,
+        default: "0",
+        description: "Panic immediately when call_va8/call_va8_xmm/call_va8_caught refuses an unregistered host __TEXT target.",
+        affects_aot_key: false,
+        crates: &["x86-runtime"],
+    },
+    KnobSpec {
         name: "PORT_STUB_BASELINE_JSON",
         aliases: &[],
         kind: KnobType::Path,

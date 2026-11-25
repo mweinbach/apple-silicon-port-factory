@@ -110,10 +110,10 @@ mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	440	"IAudi
 msctf.dll	ctx_track_properties	stub	crates/win32-rt/src/misc/msctf/context.rs	809	"ITfContext::TrackProperties -> E_NOTIMPL"
 nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
 nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type
-ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1678	"KiUserApcDispatcher called directly"
-ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1682	"KiUserCallbackDispatcher called directly"
-ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1674	"KiUserExceptionDispatcher called directly"
-ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2420	"LdrInitializeThunk called directly"
+ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1679	"KiUserApcDispatcher called directly"
+ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1683	"KiUserCallbackDispatcher called directly"
+ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1675	"KiUserExceptionDispatcher called directly"
+ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2421	"LdrInitializeThunk called directly"
 ntdll.dll	NtCommitTransaction	stub	crates/win32-rt/src/ntdll.rs	747	"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"
 ntdll.dll	NtCreateTransaction	stub	crates/win32-rt/src/ntdll.rs	742	"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"
 ntdll.dll	NtQueryInformationProcess	stub	crates/win32-rt/src/ntdll.rs	241	"NtQueryInformationProcess class {class}"
@@ -151,12 +151,12 @@ secur32.dll	apply_control_token_impl	stub	crates/win32-rt/src/misc/secur32/schan
 secur32.dll	query_context_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1787	"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"
 secur32.dll	query_credentials_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1849	"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }
 shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1733	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
-ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
+ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	953	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
 ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1062	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
-ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
+ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	965	"system({:?}) refused", from_ansi(cmd)
 user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	1024	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
 user32.dll	DisplayConfigGetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	684	"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
 user32.dll	DisplayConfigSetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	692	"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"

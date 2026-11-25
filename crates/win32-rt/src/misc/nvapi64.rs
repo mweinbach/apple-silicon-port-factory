@@ -252,7 +252,7 @@ pub extern "win64" fn NvAPI_D3D12_GetRaytracingCaps(
 
 /// Primary entry point exported by `nvapi64.dll`: maps 32-bit hash IDs to function pointers.
 pub extern "win64" fn nvapi_QueryInterface(id: u32) -> usize {
-    match id {
+    let addr = match id {
         ID_NVAPI_INITIALIZE => NvAPI_Initialize as *const () as usize,
         ID_NVAPI_UNLOAD => NvAPI_Unload as *const () as usize,
         ID_NVAPI_GET_ERROR_MESSAGE => NvAPI_GetErrorMessage as *const () as usize,
@@ -284,7 +284,12 @@ pub extern "win64" fn nvapi_QueryInterface(id: u32) -> usize {
         }
         ID_NVAPI_D3D12_GET_RAYTRACING_CAPS => NvAPI_D3D12_GetRaytracingCaps as *const () as usize,
         _ => 0,
+    };
+    if addr != 0 {
+        crate::register_native_va(addr as u64, addr);
+        crate::debug_assert_guest_callable(addr, "nvapi64::nvapi_QueryInterface");
     }
+    addr
 }
 
 #[cfg(test)]

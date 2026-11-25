@@ -1320,6 +1320,7 @@ pub unsafe extern "win64" fn LdrGetProcedureAddress(
     };
     match resolved {
         Some(p) => {
+            crate::debug_assert_guest_callable(p, "ntdll::LdrGetProcedureAddress");
             std::ptr::write_unaligned(func_addr, p as *const c_void);
             STATUS_SUCCESS
         }
