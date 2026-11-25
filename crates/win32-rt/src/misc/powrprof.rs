@@ -3,6 +3,8 @@
 use crate::types::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -432,7 +434,43 @@ mod macos_power {
         }
     }
 
-    // Background IOKit power-event & power-source notification loop.
+    pub(super) fn query_display_power_on() -> Option<bool> {
+        #[derive(Clone, Copy)]
+        struct CgDisplayApis {
+            main_display_id: unsafe extern "C" fn() -> u32,
+            display_is_asleep: unsafe extern "C" fn(u32) -> u32,
+        }
+        static CG: OnceLock<Option<CgDisplayApis>> = OnceLock::new();
+        let cg = CG
+            .get_or_init(|| unsafe {
+                let lib = libc::dlopen(
+                    c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if lib.is_null() {
+                    return None;
+                }
+                let p_main = libc::dlsym(lib, c"CGMainDisplayID".as_ptr());
+                let p_asleep = libc::dlsym(lib, c"CGDisplayIsAsleep".as_ptr());
+                if p_main.is_null() || p_asleep.is_null() {
+                    return None;
+                }
+                Some(CgDisplayApis {
+                    main_display_id: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> u32>(p_main),
+                    display_is_asleep: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> u32>(p_asleep),
+                })
+            })
+            .as_ref()?;
+        unsafe {
+            let did = (cg.main_display_id)();
+            if did == 0 {
+                return Some(false);
+            }
+            Some((cg.display_is_asleep)(did) == 0)
+        }
+    }
+
+    // Background IOKit power-event, display-power, & power-source notification loop.
     // Runs on its own dedicated thread + CFRunLoop so it never contends with
     // the AppKit main thread or any Win32 thread lock.
     pub(super) fn ensure_power_monitor_started() {
@@ -459,6 +497,10 @@ mod macos_power {
             c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation".as_ptr(),
             libc::RTLD_LAZY | libc::RTLD_LOCAL,
         );
+        let cg = libc::dlopen(
+            c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
         if iokit.is_null() || cf.is_null() {
             return;
         }
@@ -477,11 +519,35 @@ mod macos_power {
         ) -> u32;
         type IoAllowFn = unsafe extern "C" fn(u32, isize) -> i32;
         type IoPortSourceFn = unsafe extern "C" fn(*mut c_void) -> *const c_void;
+        type IoServiceMatchingFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+        type IoServiceGetMatchingFn = unsafe extern "C" fn(u32, *mut c_void) -> u32;
+        type IoAddInterestFn = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void),
+            *mut c_void,
+            *mut u32,
+        ) -> i32;
+        type IoObjectReleaseFn = unsafe extern "C" fn(u32) -> i32;
         type IopsNotifySourceFn =
             unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void) -> *const c_void;
+        type CgRegReconfigFn =
+            unsafe extern "C" fn(unsafe extern "C" fn(u32, u32, *mut c_void), *mut c_void) -> i32;
         type CfRunLoopCurFn = unsafe extern "C" fn() -> *mut c_void;
         type CfRunLoopAddSrcFn = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void);
         type CfRunLoopRunFn = unsafe extern "C" fn();
+        type CfNotifGetLocalFn = unsafe extern "C" fn() -> *mut c_void;
+        type CfNotifAddObserverFn = unsafe extern "C" fn(
+            *mut c_void,
+            *const c_void,
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *const c_void, *const c_void),
+            *const c_void,
+            *const c_void,
+            isize,
+        );
+        type CfStrCreateFn = unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void;
+        type CfReleaseFn = unsafe extern "C" fn(*const c_void);
 
         let (Some(io_reg), Some(io_allow), Some(io_port_src), Some(cf_cur), Some(cf_add), Some(cf_run)) = (
             sym_opt!(iokit, c"IORegisterForSystemPower", IoRegFn),
@@ -513,14 +579,58 @@ mod macos_power {
                     (r.io_allow)(r.root_port, msg_arg as isize);
                 }
                 K_IO_MSG_SYSTEM_WILL_SLEEP => {
+                    super::dispatch_display_power_state(false);
                     super::dispatch_suspend_resume_event(super::PBT_APMSUSPEND);
                     (r.io_allow)(r.root_port, msg_arg as isize);
                 }
                 K_IO_MSG_SYSTEM_HAS_POWERED_ON => {
                     super::dispatch_suspend_resume_event(super::PBT_APMRESUMEAUTOMATIC);
                     super::dispatch_suspend_resume_event(super::PBT_APMRESUMESUSPEND);
+                    if let Some(on) = query_display_power_on() {
+                        super::dispatch_display_power_state(on);
+                    }
                 }
                 _ => {}
+            }
+        }
+        unsafe extern "C" fn display_interest_cb(
+            _ctx: *mut c_void,
+            _svc: u32,
+            msg_type: u32,
+            _msg_arg: *mut c_void,
+        ) {
+            // Exact Apple SDK <IOKit/IOMessage.h> display power-state constants.
+            const K_IO_MSG_DEVICE_WILL_POWER_OFF: u32 = 0xE000_0210;
+            const K_IO_MSG_DEVICE_HAS_POWERED_OFF: u32 = 0xE000_0225;
+            const K_IO_MSG_DEVICE_HAS_POWERED_ON: u32 = 0xE000_0230;
+            match msg_type {
+                K_IO_MSG_DEVICE_WILL_POWER_OFF | K_IO_MSG_DEVICE_HAS_POWERED_OFF => {
+                    super::dispatch_display_power_state(false);
+                }
+                K_IO_MSG_DEVICE_HAS_POWERED_ON => {
+                    super::dispatch_display_power_state(true);
+                }
+                _ => {
+                    if let Some(on) = query_display_power_on() {
+                        super::dispatch_display_power_state(on);
+                    }
+                }
+            }
+        }
+        unsafe extern "C" fn cg_display_reconfig_cb(_display: u32, _flags: u32, _ctx: *mut c_void) {
+            if let Some(on) = query_display_power_on() {
+                super::dispatch_display_power_state(on);
+            }
+        }
+        unsafe extern "C" fn low_power_mode_cb(
+            _center: *mut c_void,
+            _observer: *mut c_void,
+            _name: *const c_void,
+            _object: *const c_void,
+            _user_info: *const c_void,
+        ) {
+            if let Some(saving) = super::query_low_power_mode() {
+                super::dispatch_low_power_mode(saving);
             }
         }
         unsafe extern "C" fn ps_change_cb(_ctx: *mut c_void) {
@@ -537,6 +647,17 @@ mod macos_power {
                     &pct.to_le_bytes(),
                 );
             }
+            if let Some(saving) = super::query_low_power_mode() {
+                super::dispatch_low_power_mode(saving);
+            }
+        }
+
+        // Seed initial display and low-power state before observing changes.
+        if let Some(on) = query_display_power_on() {
+            super::seed_display_power_state(on);
+        }
+        if let Some(saving) = super::query_low_power_mode() {
+            super::seed_low_power_mode(saving);
         }
 
         let ctx = Box::into_raw(Box::new(RootCtx { root_port: 0, io_allow }));
@@ -545,12 +666,66 @@ mod macos_power {
         let root_port = io_reg(ctx as *mut c_void, &mut notify_port, sleep_cb, &mut notifier);
         let rl = cf_cur();
         let mut any_source = false;
+        let mut _display_notifier: u32 = 0;
         if root_port != 0 && !notify_port.is_null() {
             (*ctx).root_port = root_port;
             let src = io_port_src(notify_port);
             if !src.is_null() {
                 cf_add(rl, src, default_mode);
                 any_source = true;
+            }
+            // Subscribe to IODisplayWrangler general interest for display-only sleep/wake
+            // transitions (independent of full system sleep).
+            if let (Some(io_match), Some(io_get), Some(io_interest), Some(io_release)) = (
+                sym_opt!(iokit, c"IOServiceMatching", IoServiceMatchingFn),
+                sym_opt!(iokit, c"IOServiceGetMatchingService", IoServiceGetMatchingFn),
+                sym_opt!(iokit, c"IOServiceAddInterestNotification", IoAddInterestFn),
+                sym_opt!(iokit, c"IOObjectRelease", IoObjectReleaseFn),
+            ) {
+                let matching = io_match(c"IODisplayWrangler".as_ptr());
+                if !matching.is_null() {
+                    let wrangler = io_get(0, matching);
+                    if wrangler != 0 {
+                        let _ = io_interest(
+                            notify_port,
+                            wrangler,
+                            c"IOGeneralInterest".as_ptr(),
+                            display_interest_cb,
+                            std::ptr::null_mut(),
+                            &mut _display_notifier,
+                        );
+                        let _ = io_release(wrangler);
+                    }
+                }
+            }
+        }
+        if !cg.is_null() {
+            if let Some(reg_reconfig) = sym_opt!(cg, c"CGDisplayRegisterReconfigurationCallback", CgRegReconfigFn) {
+                let _ = reg_reconfig(cg_display_reconfig_cb, std::ptr::null_mut());
+            }
+        }
+        if let (Some(get_local), Some(add_obs), Some(cf_str), Some(cf_rel)) = (
+            sym_opt!(cf, c"CFNotificationCenterGetLocalCenter", CfNotifGetLocalFn),
+            sym_opt!(cf, c"CFNotificationCenterAddObserver", CfNotifAddObserverFn),
+            sym_opt!(cf, c"CFStringCreateWithCString", CfStrCreateFn),
+            sym_opt!(cf, c"CFRelease", CfReleaseFn),
+        ) {
+            let center = get_local();
+            let name = cf_str(
+                std::ptr::null(),
+                c"NSProcessInfoPowerStateDidChangeNotification".as_ptr(),
+                K_CFSTRING_ENCODING_UTF8,
+            );
+            if !center.is_null() && !name.is_null() {
+                add_obs(
+                    center,
+                    ctx as *const c_void,
+                    low_power_mode_cb,
+                    name,
+                    std::ptr::null(),
+                    4, // CFNotificationSuspensionBehaviorDeliverImmediately
+                );
+                cf_rel(name);
             }
         }
         if let Some(iops_src_fn) = sym_opt!(iokit, c"IOPSNotificationCreateRunLoopSource", IopsNotifySourceFn) {
@@ -1108,6 +1283,65 @@ fn build_powerbroadcast_setting(guid: [u8; 16], data: &[u8]) -> Vec<u8> {
     buf
 }
 
+#[cfg(target_os = "macos")]
+fn query_display_power_on() -> Option<bool> {
+    macos_power::query_display_power_on()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_display_power_on() -> Option<bool> {
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn query_low_power_mode() -> Option<bool> {
+    Some(objc2_foundation::NSProcessInfo::processInfo().isLowPowerModeEnabled())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn query_low_power_mode() -> Option<bool> {
+    None
+}
+
+// 2 = unknown, 0 = off/disabled, 1 = on/enabled
+#[cfg(any(target_os = "macos", test))]
+static LAST_DISPLAY_POWER_STATE: AtomicU8 = AtomicU8::new(2);
+#[cfg(any(target_os = "macos", test))]
+static LAST_LOW_POWER_MODE: AtomicU8 = AtomicU8::new(2);
+
+#[cfg(any(target_os = "macos", test))]
+fn seed_display_power_state(on: bool) {
+    let val = if on { 1u8 } else { 0u8 };
+    let _ = LAST_DISPLAY_POWER_STATE.compare_exchange(2, val, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn seed_low_power_mode(saving: bool) {
+    let val = if saving { 1u8 } else { 0u8 };
+    let _ = LAST_LOW_POWER_MODE.compare_exchange(2, val, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_display_power_state(on: bool) {
+    let val = if on { 1u8 } else { 0u8 };
+    if LAST_DISPLAY_POWER_STATE.swap(val, Ordering::AcqRel) == val {
+        return;
+    }
+    let payload = (val as u32).to_le_bytes();
+    dispatch_power_setting_change(GUID_CONSOLE_DISPLAY_STATE, &payload);
+    dispatch_power_setting_change(GUID_MONITOR_POWER_ON, &payload);
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn dispatch_low_power_mode(saving: bool) {
+    let val = if saving { 1u8 } else { 0u8 };
+    if LAST_LOW_POWER_MODE.swap(val, Ordering::AcqRel) == val {
+        return;
+    }
+    let payload = (val as u32).to_le_bytes();
+    dispatch_power_setting_change(GUID_POWER_SAVING_STATUS, &payload);
+}
+
 fn current_power_setting_value(guid: [u8; 16]) -> Option<Vec<u8>> {
     if guid == GUID_ACDC_POWER_SOURCE {
         let snap = query_battery_state().unwrap_or_else(fallback_battery_state);
@@ -1124,9 +1358,17 @@ fn current_power_setting_value(guid: [u8; 16]) -> Option<Vec<u8>> {
     } else if guid == GUID_POWERSCHEME_PERSONALITY {
         Some(GUID_TYPICAL_POWER_SAVINGS.to_vec())
     } else if guid == GUID_CONSOLE_DISPLAY_STATE || guid == GUID_MONITOR_POWER_ON {
-        Some(1u32.to_le_bytes().to_vec()) // display on
+        let on = query_display_power_on()?;
+        #[cfg(any(target_os = "macos", test))]
+        seed_display_power_state(on);
+        let v: u32 = if on { 1 } else { 0 };
+        Some(v.to_le_bytes().to_vec())
     } else if guid == GUID_POWER_SAVING_STATUS {
-        Some(0u32.to_le_bytes().to_vec()) // battery saver off
+        let saving = query_low_power_mode()?;
+        #[cfg(any(target_os = "macos", test))]
+        seed_low_power_mode(saving);
+        let v: u32 = if saving { 1 } else { 0 };
+        Some(v.to_le_bytes().to_vec())
     } else {
         None
     }
@@ -1974,6 +2216,117 @@ mod tests {
         assert_ne!(probe.peb_ptr.load(Ordering::Acquire), 0, "gs:[0x60] PEB must be initialized");
         unsafe {
             assert_eq!(PowerUnregisterSuspendResumeNotification(h_sr), 0);
+        }
+    }
+
+    #[test]
+    fn display_power_and_low_power_mode_settings_query_host_and_dispatch_transitions() {
+        static RECEIVED: Mutex<Vec<([u8; 16], u32)>> = Mutex::new(Vec::new());
+        unsafe extern "win64" fn setting_cb(_ctx: *mut c_void, pbt_type: u32, setting: *const u8) -> u32 {
+            if pbt_type == PBT_POWERSETTINGCHANGE && !setting.is_null() {
+                let mut guid = [0u8; 16];
+                std::ptr::copy_nonoverlapping(setting, guid.as_mut_ptr(), 16);
+                let len = std::ptr::read_unaligned(setting.add(16) as *const u32);
+                if len >= 4 {
+                    let val = std::ptr::read_unaligned(setting.add(20) as *const u32);
+                    RECEIVED.lock().unwrap().push((guid, val));
+                }
+            }
+            0
+        }
+
+        // Reset deduplication caches for deterministic testing.
+        LAST_DISPLAY_POWER_STATE.store(2, Ordering::Release);
+        LAST_LOW_POWER_MODE.store(2, Ordering::Release);
+        RECEIVED.lock().unwrap().clear();
+
+        let host_display_on = query_display_power_on();
+        let host_low_power = query_low_power_mode();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(host_display_on.is_some(), "macOS must query real display state via CoreGraphics");
+            assert!(host_low_power.is_some(), "macOS must query real Low Power Mode via NSProcessInfo");
+        }
+
+        let params: [usize; 2] = [setting_cb as *const () as usize, 0];
+        let (mut h_console, mut h_mon, mut h_lpm) =
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_CONSOLE_DISPLAY_STATE.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_console,
+                ),
+                0
+            );
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_MONITOR_POWER_ON.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_mon,
+                ),
+                0
+            );
+            assert_eq!(
+                PowerSettingRegisterNotification(
+                    GUID_POWER_SAVING_STATUS.as_ptr() as *const c_void,
+                    DEVICE_NOTIFY_CALLBACK,
+                    params.as_ptr() as HANDLE,
+                    &mut h_lpm,
+                ),
+                0
+            );
+        }
+
+        // Initial delivery must match the real host query values (not fabricated constants).
+        {
+            let got = RECEIVED.lock().unwrap();
+            if let Some(on) = host_display_on {
+                let want = if on { 1u32 } else { 0u32 };
+                assert!(got.contains(&(GUID_CONSOLE_DISPLAY_STATE, want)));
+                assert!(got.contains(&(GUID_MONITOR_POWER_ON, want)));
+            }
+            if let Some(saving) = host_low_power {
+                let want = if saving { 1u32 } else { 0u32 };
+                assert!(got.contains(&(GUID_POWER_SAVING_STATUS, want)));
+            }
+        }
+
+        // Live display power transitions (off -> off dedup -> on) deliver to BOTH display GUIDs.
+        RECEIVED.lock().unwrap().clear();
+        LAST_DISPLAY_POWER_STATE.store(1, Ordering::Release);
+        dispatch_display_power_state(false);
+        dispatch_display_power_state(false); // duplicate suppressed
+        dispatch_display_power_state(true);
+        let disp_evs = RECEIVED.lock().unwrap().clone();
+        assert_eq!(
+            disp_evs,
+            vec![
+                (GUID_CONSOLE_DISPLAY_STATE, 0),
+                (GUID_MONITOR_POWER_ON, 0),
+                (GUID_CONSOLE_DISPLAY_STATE, 1),
+                (GUID_MONITOR_POWER_ON, 1),
+            ]
+        );
+
+        // Live Low Power Mode transitions deliver to GUID_POWER_SAVING_STATUS with deduplication.
+        RECEIVED.lock().unwrap().clear();
+        LAST_LOW_POWER_MODE.store(0, Ordering::Release);
+        dispatch_low_power_mode(true);
+        dispatch_low_power_mode(true);
+        dispatch_low_power_mode(false);
+        assert_eq!(
+            RECEIVED.lock().unwrap().clone(),
+            vec![(GUID_POWER_SAVING_STATUS, 1), (GUID_POWER_SAVING_STATUS, 0)]
+        );
+
+        unsafe {
+            assert_eq!(PowerSettingUnregisterNotification(h_console), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_mon), 0);
+            assert_eq!(PowerSettingUnregisterNotification(h_lpm), 0);
         }
     }
 }
