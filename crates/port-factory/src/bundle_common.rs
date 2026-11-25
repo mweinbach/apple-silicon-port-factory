@@ -3,8 +3,8 @@
 //! `launcher`, and the `port-factory` CLI.
 
 use anyhow::{bail, Context, Result};
-use std::collections::{BTreeSet, HashSet};
-use std::ffi::OsStr;
+use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
@@ -106,29 +106,106 @@ struct PendingSymlink {
     rel_parent: PathBuf,
 }
 
-/// Normalize `rel_parent.join(raw_target)` lexically relative to the root directory.
-/// Returns `None` if `raw_target` is empty, absolute, has a root/prefix component,
-/// or traverses above the root directory via `..`.
-fn normalize_relative_symlink_target(rel_parent: &Path, raw_target: &Path) -> Option<PathBuf> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelativeResolveError {
+    Escaping,
+    Dangling,
+    Cycle,
+}
+
+#[derive(Debug, Clone)]
+enum ResolveStep {
+    CurDir,
+    ParentDir,
+    Normal(OsString),
+}
+
+fn push_relative_components(
+    raw_target: &Path,
+    front: bool,
+    queue: &mut VecDeque<ResolveStep>,
+) -> std::result::Result<(), RelativeResolveError> {
     if raw_target.as_os_str().is_empty() || raw_target.is_absolute() {
-        return None;
+        return Err(RelativeResolveError::Escaping);
     }
-    let mut parts: Vec<&OsStr> = Vec::new();
-    for comp in rel_parent.components().chain(raw_target.components()) {
+    let mut steps = Vec::new();
+    for comp in raw_target.components() {
         match comp {
-            Component::Normal(s) => parts.push(s),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
+            Component::Normal(s) => steps.push(ResolveStep::Normal(s.to_os_string())),
+            Component::CurDir => steps.push(ResolveStep::CurDir),
+            Component::ParentDir => steps.push(ResolveStep::ParentDir),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(RelativeResolveError::Escaping);
             }
-            Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    let mut out = PathBuf::new();
-    for p in parts {
-        out.push(p);
+    if front {
+        for step in steps.into_iter().rev() {
+            queue.push_front(step);
+        }
+    } else {
+        queue.extend(steps);
     }
-    Some(out)
+    Ok(())
+}
+
+/// Resolve `raw_target` component-by-component starting from `start_dir_canon` (inside
+/// `root_canon`), expanding intermediate symlinks the same way POSIX does.
+///
+/// Rejects any symlink whose target (or any intermediate symlink it traverses) is absolute,
+/// steps above `root_canon` via `..`, exceeds `MAX_SYMLINK_HOPS`, or hits a missing/non-regular
+/// entry. Unlike pure lexical normalization, `..` following an intermediate directory symlink
+/// resolves relative to that symlink's target rather than its link name.
+fn verify_relative_resolution_within_root(
+    root_canon: &Path,
+    start_dir_canon: &Path,
+    raw_target: &Path,
+) -> std::result::Result<(), RelativeResolveError> {
+    const MAX_SYMLINK_HOPS: usize = 40;
+    let mut queue = VecDeque::new();
+    push_relative_components(raw_target, false, &mut queue)?;
+
+    let mut cur = start_dir_canon.to_path_buf();
+    let mut hops = 0usize;
+
+    while let Some(step) = queue.pop_front() {
+        match step {
+            ResolveStep::CurDir => {}
+            ResolveStep::ParentDir => {
+                if cur == root_canon {
+                    return Err(RelativeResolveError::Escaping);
+                }
+                if !cur.pop() || !cur.starts_with(root_canon) {
+                    return Err(RelativeResolveError::Escaping);
+                }
+            }
+            ResolveStep::Normal(name) => {
+                let next = cur.join(&name);
+                let meta = fs::symlink_metadata(&next)
+                    .map_err(|_| RelativeResolveError::Dangling)?;
+                if meta.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(RelativeResolveError::Cycle);
+                    }
+                    let inter_target = fs::read_link(&next)
+                        .map_err(|_| RelativeResolveError::Dangling)?;
+                    push_relative_components(&inter_target, true, &mut queue)?;
+                } else if meta.is_dir() {
+                    cur = next;
+                } else if meta.is_file() {
+                    if !queue.is_empty() {
+                        return Err(RelativeResolveError::Dangling);
+                    }
+                    cur = next;
+                } else {
+                    return Err(RelativeResolveError::Dangling);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn is_symlink_loop_error(err: &std::io::Error) -> bool {
@@ -334,15 +411,15 @@ pub fn copy_dir_recursive_with_report(
             continue;
         }
 
-        let Some(lex_target_rel) =
-            normalize_relative_symlink_target(&link.rel_parent, &raw_target)
-        else {
-            report.symlinks_skipped_escaping += 1;
-            continue;
-        };
-
-        if lex_target_rel == link.rel_path {
-            report.symlinks_skipped_cycle += 1;
+        let src_parent_canon = src_root_canon.join(&link.rel_parent);
+        if let Err(err) =
+            verify_relative_resolution_within_root(&src_root_canon, &src_parent_canon, &raw_target)
+        {
+            match err {
+                RelativeResolveError::Escaping => report.symlinks_skipped_escaping += 1,
+                RelativeResolveError::Dangling => report.symlinks_skipped_dangling += 1,
+                RelativeResolveError::Cycle => report.symlinks_skipped_cycle += 1,
+            }
             continue;
         }
 
@@ -981,8 +1058,90 @@ mod tests {
 
         assert_eq!(report.files_copied, 3);
         assert_eq!(report.symlinks_preserved, 4); // 3 safe links + acyclic `dir_a/to_b`
-        assert_eq!(report.symlinks_skipped_escaping, 5);
-        assert_eq!(report.symlinks_skipped_dangling, 3);
+        assert_eq!(report.symlinks_skipped_escaping, 6);
+        assert_eq!(report.symlinks_skipped_dangling, 2);
         assert_eq!(report.symlinks_skipped_cycle, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_game_payload_preserves_relative_symlink_with_parent_dir_after_dir_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDirGuard::create_unique("port-factory-copy-symlink-dotdot").unwrap();
+        let game_dir = root.path().join("game_src");
+        let dst_dir = root.path().join("game_dst");
+
+        fs::create_dir_all(game_dir.join("a")).unwrap();
+        fs::create_dir_all(game_dir.join("c")).unwrap();
+        fs::create_dir_all(game_dir.join("b/deep/nested")).unwrap();
+        fs::write(game_dir.join("link"), b"ROOT_LINK_FILE").unwrap();
+        fs::write(game_dir.join("b/target.txt"), b"DEEP_TARGET").unwrap();
+
+        // Valid relative symlinks where `..` follows an intermediate directory symlink:
+        // - `a/link` has lexical path `a/link` (equal to itself), yet resolves to root `link`.
+        // - `a/deep_target` lexically underflows root, yet resolves strictly inside root.
+        symlink("../c", game_dir.join("a/alias")).unwrap();
+        symlink("alias/../link", game_dir.join("a/link")).unwrap();
+        symlink("../b/deep/nested", game_dir.join("a/deep_alias")).unwrap();
+        symlink(
+            "deep_alias/../../../b/target.txt",
+            game_dir.join("a/deep_target"),
+        )
+        .unwrap();
+
+        // Still unsafe through the intermediate directory symlink:
+        // - `a/loop_via_alias` resolves to the payload root (ancestor of `a/`) -> cycle.
+        // - `a/bounce_via_alias` steps above payload root and bounces back in -> escaping.
+        symlink("alias/..", game_dir.join("a/loop_via_alias")).unwrap();
+        symlink(
+            "alias/../../game_src/link",
+            game_dir.join("a/bounce_via_alias"),
+        )
+        .unwrap();
+
+        let report = copy_game_payload(&game_dir, &dst_dir, None).unwrap();
+        let dst_canon = fs::canonicalize(&dst_dir).unwrap();
+
+        let preserved_link = dst_dir.join("a/link");
+        assert!(
+            fs::symlink_metadata(&preserved_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a/link should be preserved as a symlink"
+        );
+        assert_eq!(fs::read_link(&preserved_link).unwrap(), Path::new("alias/../link"));
+        assert_eq!(fs::canonicalize(&preserved_link).unwrap(), dst_canon.join("link"));
+        assert_eq!(fs::read(&preserved_link).unwrap(), b"ROOT_LINK_FILE");
+
+        let preserved_deep = dst_dir.join("a/deep_target");
+        assert!(
+            fs::symlink_metadata(&preserved_deep)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a/deep_target should be preserved as a symlink"
+        );
+        assert_eq!(
+            fs::canonicalize(&preserved_deep).unwrap(),
+            dst_canon.join("b/target.txt")
+        );
+        assert_eq!(fs::read(&preserved_deep).unwrap(), b"DEEP_TARGET");
+
+        assert!(
+            fs::symlink_metadata(dst_dir.join("a/loop_via_alias")).is_err(),
+            "ancestor directory cycle through alias must still be skipped"
+        );
+        assert!(
+            fs::symlink_metadata(dst_dir.join("a/bounce_via_alias")).is_err(),
+            "root-escaping bounce through alias must still be skipped"
+        );
+
+        assert_eq!(report.files_copied, 2);
+        assert_eq!(report.symlinks_preserved, 4);
+        assert_eq!(report.symlinks_skipped_escaping, 1);
+        assert_eq!(report.symlinks_skipped_dangling, 0);
+        assert_eq!(report.symlinks_skipped_cycle, 1);
     }
 }
