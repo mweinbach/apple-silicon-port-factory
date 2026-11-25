@@ -1752,11 +1752,14 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_FLAGS, &mut flags as *mut _ as *mut c_void), SEC_E_OK);
         assert_ne!(flags.flags, 0);
 
-        // RFC 5929 §4.1 channel bindings match both each other AND independently computed digest!
+        // RFC 5929 §4.1 endpoint channel bindings match both each other AND independently computed digest,
+        // while SECPKG_ATTR_UNIQUE_BINDINGS honestly returns SEC_E_UNSUPPORTED_FUNCTION (never endpoint data).
         let mut cb_cli = SecPkgContextBindings { bindings_length: 0, bindings: std::ptr::null_mut() };
         let mut cb_srv = SecPkgContextBindings { bindings_length: 0, bindings: std::ptr::null_mut() };
+        let mut cb_uniq = SecPkgContextBindings { bindings_length: 0, bindings: std::ptr::null_mut() };
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_ENDPOINT_BINDINGS, &mut cb_cli as *mut _ as *mut c_void), SEC_E_OK);
-        assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_UNIQUE_BINDINGS, &mut cb_srv as *mut _ as *mut c_void), SEC_E_OK);
+        assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_ENDPOINT_BINDINGS, &mut cb_srv as *mut _ as *mut c_void), SEC_E_OK);
+        assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_UNIQUE_BINDINGS, &mut cb_uniq as *mut _ as *mut c_void), SEC_E_UNSUPPORTED_FUNCTION);
         assert_eq!(cb_cli.bindings_length, cb_srv.bindings_length);
         let b1 = std::slice::from_raw_parts(cb_cli.bindings as *const u8, cb_cli.bindings_length as usize);
         let b2 = std::slice::from_raw_parts(cb_srv.bindings as *const u8, cb_srv.bindings_length as usize);

@@ -2066,12 +2066,20 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             match verify_pe_authenticode(&bytes) {
                 Ok(verified) => {
                     let ncerts = verified.certs.len();
+                    let all_der: Vec<Vec<u8>> =
+                        verified.certs.iter().map(|c| c.raw_der.clone()).collect();
+                    let chain_rc =
+                        verify_pkcs7_signer_chain(&verified, &all_der, chain_policy_oid);
                     if state_action == WTD_STATEACTION_VERIFY {
                         let h = alloc_provider_state(verified, data);
                         std::ptr::write_unaligned(state_data_slot, h);
                     }
-                    log::info!("WinVerifyTrust({label:?}): verified PE Authenticode digest + PKCS#7 RSA signature ({ncerts} cert(s))");
-                    ERROR_SUCCESS
+                    if chain_rc == ERROR_SUCCESS {
+                        log::info!("WinVerifyTrust({label:?}): verified PE Authenticode digest + PKCS#7 signature + signer chain ({ncerts} cert(s))");
+                    } else {
+                        log::warn!("WinVerifyTrust({label:?}): PE Authenticode signer chain rejected ({chain_rc:#010x})");
+                    }
+                    chain_rc
                 }
                 Err(code) => {
                     log::warn!("WinVerifyTrust({label:?}): Authenticode verification failed ({code:#010x})");

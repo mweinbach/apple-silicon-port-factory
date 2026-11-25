@@ -893,19 +893,84 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
         return FALSE;
     };
 
-    // Match signer certificate in embedded certificates by IssuerAndSerialNumber.
-    let signer_cert_der = msg.certs_der.iter().find(|der| {
-        cert_issuer_and_serial(der).is_some_and(|(iss, ser)| {
-            iss == signer.issuer_raw.as_slice()
-                && strip_leading_zero(ser) == strip_leading_zero(&signer.serial_be)
-        })
-    });
-    let Some(signer_der) = signer_cert_der else {
-        crate::teb::set_last_error(CRYPT_E_SIGNER_NOT_FOUND);
-        return FALSE;
-    };
+    // Per MSDN CRYPT_VERIFY_MESSAGE_PARA: when pfnGetSignerCertificate is supplied, invoke the
+    // callback with (pvGetArg, dwCertEncodingType, pSignerId, hMsgCertStore) and use its returned
+    // PCCERT_CONTEXT exclusively (if it returns NULL, reject the signer rather than falling back).
+    let (signer_der_owned, cb_cert_ctx): (Vec<u8>, *mut c_void) =
+        if para.pfn_get_signer_certificate != 0 {
+            let msg_store = super::store::cert_open_store_impl(
+                super::store::CERT_STORE_PROV_MEMORY as *const u8,
+                std::ptr::null(),
+            );
+            if !msg_store.is_null() {
+                for der in &msg.certs_der {
+                    let _ = super::store::cert_add_encoded_certificate_to_store_impl(
+                        msg_store,
+                        X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as u32,
+                        4,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+            let mut ser_le = signer.serial_be.clone();
+            ser_le.reverse();
+            let mut signer_id: crate::misc::wintrust::CertInfo = std::mem::zeroed();
+            signer_id.issuer = CryptDataBlob {
+                cb_data: signer.issuer_raw.len() as u32,
+                pb_data: signer.issuer_raw.as_ptr(),
+            };
+            signer_id.serial_number = CryptDataBlob {
+                cb_data: ser_le.len() as u32,
+                pb_data: ser_le.as_ptr(),
+            };
+            let ctx = crate::call_guest8(
+                para.pfn_get_signer_certificate,
+                para.pv_get_arg as u64,
+                para.dw_msg_and_cert_encoding_type as u64,
+                &signer_id as *const _ as u64,
+                msg_store as u64,
+                0,
+                0,
+                0,
+                0,
+            ) as *mut c_void;
+            if !msg_store.is_null() {
+                let _ = super::store::cert_close_store_impl(msg_store);
+            }
+            if ctx.is_null() {
+                crate::teb::set_last_error(CRYPT_E_SIGNER_NOT_FOUND);
+                return FALSE;
+            }
+            let cc = std::ptr::read_unaligned(ctx as *const crate::misc::wintrust::CertContext);
+            if cc.pb_cert_encoded.is_null() || cc.cb_cert_encoded == 0 {
+                let _ = super::store::cert_free_certificate_context_impl(ctx);
+                crate::teb::set_last_error(CRYPT_E_SIGNER_NOT_FOUND);
+                return FALSE;
+            }
+            let der =
+                std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize).to_vec();
+            (der, ctx)
+        } else {
+            // Default lookup: match signer certificate in embedded certificates by IssuerAndSerialNumber.
+            let signer_cert_der = msg.certs_der.iter().find(|der| {
+                cert_issuer_and_serial(der).is_some_and(|(iss, ser)| {
+                    iss == signer.issuer_raw.as_slice()
+                        && strip_leading_zero(ser) == strip_leading_zero(&signer.serial_be)
+                })
+            });
+            let Some(signer_der) = signer_cert_der else {
+                crate::teb::set_last_error(CRYPT_E_SIGNER_NOT_FOUND);
+                return FALSE;
+            };
+            (signer_der.clone(), std::ptr::null_mut())
+        };
 
-    if !verify_cms_signer_signature(signer, signer_der, &msg.bare_content) {
+    if !verify_cms_signer_signature(signer, &signer_der_owned, &msg.bare_content) {
+        if !cb_cert_ctx.is_null() {
+            let _ = super::store::cert_free_certificate_context_impl(cb_cert_ctx);
+        }
         crate::teb::set_last_error(NTE_BAD_SIGNATURE);
         return FALSE;
     }
@@ -919,6 +984,9 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
             let cap = std::ptr::read_unaligned(pcb_decoded);
             if cap < need {
                 std::ptr::write_unaligned(pcb_decoded, need);
+                if !cb_cert_ctx.is_null() {
+                    let _ = super::store::cert_free_certificate_context_impl(cb_cert_ctx);
+                }
                 crate::teb::set_last_error(err::ERROR_MORE_DATA);
                 return FALSE;
             }
@@ -930,8 +998,14 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
     }
 
     if !pp_signer_cert.is_null() {
-        let ctx = create_cert_context_from_der(signer_der);
+        let ctx = if !cb_cert_ctx.is_null() {
+            cb_cert_ctx
+        } else {
+            create_cert_context_from_der(&signer_der_owned)
+        };
         std::ptr::write_unaligned(pp_signer_cert, ctx);
+    } else if !cb_cert_ctx.is_null() {
+        let _ = super::store::cert_free_certificate_context_impl(cb_cert_ctx);
     }
     TRUE
 }

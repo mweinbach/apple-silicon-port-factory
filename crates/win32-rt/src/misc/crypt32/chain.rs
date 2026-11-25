@@ -65,8 +65,8 @@ mod apple_trust {
         fn CFDataGetLength(the_data: *const c_void) -> isize;
         #[cfg(target_os = "macos")]
         fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
-        #[cfg(target_os = "macos")]
         fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFBooleanGetValue(boolean: *const c_void) -> u8;
         #[cfg(target_os = "macos")]
         fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> u8;
         fn CFDateCreate(allocator: *const c_void, at: f64) -> *const c_void;
@@ -101,6 +101,7 @@ mod apple_trust {
         ) -> i32;
         fn SecTrustSetAnchorCertificatesOnly(trust: *const c_void, anchor_certs_only: u8) -> i32;
         fn SecTrustEvaluateWithError(trust: *const c_void, error: *mut *const c_void) -> u8;
+        fn SecTrustCopyResult(trust: *const c_void) -> *const c_void;
 
         #[cfg(target_os = "macos")]
         fn SecTrustCopyAnchorCertificates(anchors: *mut *const c_void) -> i32;
@@ -434,6 +435,122 @@ mod apple_trust {
             Some(ok != 0)
         }
     }
+
+    /// Evaluate Extended Validation (EV) using Apple's Security.framework EV root & policy table
+    /// (`SecTrustCopyResult` -> `"TrustExtendedValidation"`). Ordinary DV/OV certificates return
+    /// `false` even when they carry a `certificatePolicies` extension.
+    pub fn evaluate_sec_trust_ev(
+        chain_der: &[Vec<u8>],
+        exclusive_anchors: Option<&[Vec<u8>]>,
+        extra_anchors: &[Vec<u8>],
+        verify_unix_secs: Option<f64>,
+    ) -> bool {
+        if chain_der.is_empty() {
+            return false;
+        }
+        unsafe {
+            let mut cert_guards = Vec::with_capacity(chain_der.len());
+            let mut cert_ptrs = Vec::with_capacity(chain_der.len());
+            for der in chain_der {
+                let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                if d.is_null() {
+                    continue;
+                }
+                let _dg = CfRef(d);
+                let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                if !c.is_null() {
+                    cert_ptrs.push(c);
+                    cert_guards.push(CfRef(c));
+                }
+            }
+            if cert_ptrs.is_empty() {
+                return false;
+            }
+            let cf_certs = CFArrayCreate(
+                kCFAllocatorDefault,
+                cert_ptrs.as_ptr(),
+                cert_ptrs.len() as isize,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+            );
+            if cf_certs.is_null() {
+                return false;
+            }
+            let _certs_g = CfRef(cf_certs);
+            let policy = SecPolicyCreateSSL(1, std::ptr::null());
+            if policy.is_null() {
+                return false;
+            }
+            let _pol_g = CfRef(policy);
+            let mut trust: *const c_void = std::ptr::null();
+            if SecTrustCreateWithCertificates(cf_certs, policy, &mut trust) != 0 || trust.is_null() {
+                return false;
+            }
+            let _trust_g = CfRef(trust);
+            if let Some(unix_s) = verify_unix_secs {
+                let cf_abs = unix_s - 978_307_200.0;
+                let date = CFDateCreate(kCFAllocatorDefault, cf_abs);
+                if !date.is_null() {
+                    let _dg = CfRef(date);
+                    let _ = SecTrustSetVerifyDate(trust, date);
+                }
+            }
+            let anchor_slice = exclusive_anchors.unwrap_or(extra_anchors);
+            if exclusive_anchors.is_some() || !anchor_slice.is_empty() {
+                let mut a_guards = Vec::with_capacity(anchor_slice.len());
+                let mut a_ptrs = Vec::with_capacity(anchor_slice.len());
+                for der in anchor_slice {
+                    let d = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len() as isize);
+                    if d.is_null() {
+                        continue;
+                    }
+                    let _dg = CfRef(d);
+                    let c = SecCertificateCreateWithData(kCFAllocatorDefault, d);
+                    if !c.is_null() {
+                        a_ptrs.push(c);
+                        a_guards.push(CfRef(c));
+                    }
+                }
+                let cf_anchors = CFArrayCreate(
+                    kCFAllocatorDefault,
+                    a_ptrs.as_ptr(),
+                    a_ptrs.len() as isize,
+                    std::ptr::addr_of!(kCFTypeArrayCallBacks) as *const u8,
+                );
+                if !cf_anchors.is_null() {
+                    let _ag = CfRef(cf_anchors);
+                    let _ = SecTrustSetAnchorCertificates(trust, cf_anchors);
+                    let _ = SecTrustSetAnchorCertificatesOnly(
+                        trust,
+                        u8::from(exclusive_anchors.is_some()),
+                    );
+                }
+            }
+            let mut err: *const c_void = std::ptr::null();
+            let ok = SecTrustEvaluateWithError(trust, &mut err);
+            let _eg = CfRef(err);
+            if ok == 0 {
+                return false;
+            }
+            let result_dict = SecTrustCopyResult(trust);
+            if result_dict.is_null() {
+                return false;
+            }
+            let _rdg = CfRef(result_dict);
+            let ev_key = CFStringCreateWithBytes(
+                kCFAllocatorDefault,
+                b"TrustExtendedValidation".as_ptr(),
+                23,
+                0x0800_0100,
+                0,
+            );
+            if ev_key.is_null() {
+                return false;
+            }
+            let _ekg = CfRef(ev_key);
+            let ev_val = CFDictionaryGetValue(result_dict, ev_key);
+            !ev_val.is_null() && CFBooleanGetValue(ev_val) != 0
+        }
+    }
 }
 
 pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
@@ -687,10 +804,97 @@ fn spki_inner_sha256(spki_inner: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Parse X.509 `BasicConstraints` (`2.5.29.19`) extension from a DER certificate into
+/// `(is_ca, optional_path_len_constraint)`. Returns `None` if the extension is absent or invalid.
+fn parse_basic_constraints(der: &[u8]) -> Option<(bool, Option<u32>)> {
+    const OID_BC: &[u8] = &[0x55, 0x1D, 0x13];
+    let parts = parse_cert_der_parts(der)?;
+    let (_, _, val) = parts.extensions.iter().find(|(oid, _, _)| *oid == OID_BC)?;
+    let (seq, _) = parse_der_item(val)?;
+    if seq.tag != 0x30 {
+        return None;
+    }
+    let kids = der_item_children(seq.val)?;
+    let mut is_ca = false;
+    let mut path_len = None;
+    for k in kids {
+        if k.tag == 0x01 && !k.val.is_empty() {
+            is_ca = k.val[0] != 0;
+        } else if k.tag == 0x02 && !k.val.is_empty() && k.val.len() <= 4 {
+            let mut n = 0u32;
+            for &b in k.val {
+                n = (n << 8) | b as u32;
+            }
+            path_len = Some(n);
+        }
+    }
+    Some((is_ca, path_len))
+}
+
+/// Enforce RFC 5280 CA constraints on an intermediate certificate acting as an issuer:
+/// - `BasicConstraints` (`2.5.29.19`) MUST be present with `cA = TRUE`.
+/// - If `pathLenConstraint` is present, `intermediates_below` must be `<= path_len`.
+/// - If `KeyUsage` (`2.5.29.15`) is present, bit 5 (`keyCertSign`, mask `0x04` in byte 0) MUST be set.
+/// - If `required_eku` is specified and the intermediate carries a non-empty EKU extension,
+///   it must permit `required_eku` or `anyExtendedKeyUsage`.
+pub(super) fn intermediate_is_valid_ca(
+    der: &[u8],
+    intermediates_below: usize,
+    required_eku: Option<&[u8]>,
+) -> bool {
+    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F];
+    const OID_ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+
+    let Some((is_ca, path_len)) = parse_basic_constraints(der) else {
+        return false;
+    };
+    if !is_ca {
+        return false;
+    }
+    if let Some(max_len) = path_len {
+        if intermediates_below > max_len as usize {
+            return false;
+        }
+    }
+    if let Some(parts) = parse_cert_der_parts(der) {
+        if let Some((_, _, val)) = parts.extensions.iter().find(|(oid, _, _)| *oid == OID_KEY_USAGE) {
+            if let Some((bs, _)) = parse_der_item(val) {
+                // KeyUsage BIT STRING: byte 0 = unused_bits, byte 1 = bits 0..7 (bit 5 = keyCertSign = 0x04)
+                if bs.tag != 0x03 || bs.val.len() < 2 || (bs.val[1] & 0x04) == 0 {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    if let Some(req_eku) = required_eku {
+        if let Some(oids) = cert_eku_oids(der) {
+            if !oids.is_empty()
+                && !oids
+                    .iter()
+                    .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn verify_chain_to_root(
     chain_der: &[Vec<u8>],
     exclusive_roots_der: Option<&[Vec<u8>]>,
     extra_roots_der: &[Vec<u8>],
+) -> Option<VerifiedChainEndpoints> {
+    verify_chain_to_root_with_eku(chain_der, exclusive_roots_der, extra_roots_der, None)
+}
+
+fn verify_chain_to_root_with_eku(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+    required_eku: Option<&[u8]>,
 ) -> Option<VerifiedChainEndpoints> {
     if chain_der.is_empty() {
         return None;
@@ -771,7 +975,10 @@ fn verify_chain_to_root(
                 issuing_ca_spki_inner: issuing_ca_spki.unwrap_or_else(|| spki.clone()),
             });
         }
-        // Otherwise look for an intermediate issuer in chain_der.
+        // Otherwise look for an intermediate CA issuer in chain_der.
+        // Reject end-entity certificates (cA=FALSE / missing BasicConstraints / missing keyCertSign /
+        // violated pathLenConstraint / incompatible intermediate EKU) so a leaf cert can never forge
+        // a subordinate chain.
         let mut next_idx = None;
         for (i, cand) in parsed.iter().enumerate() {
             if visited[i] {
@@ -779,6 +986,7 @@ fn verify_chain_to_root(
             }
             if let Some(p) = cand.as_ref() {
                 if p.subject_inner == cur.issuer_inner
+                    && intermediate_is_valid_ca(&chain_der[i], step, required_eku)
                     && verify_cert_sig_with_spki(cur, p.spki_alg_inner, p.spki_key_bits)
                 {
                     next_idx = Some(i);
@@ -1508,11 +1716,13 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                                 .any(|o| o.as_slice() == req_eku || o.as_slice() == OID_ANY_EKU)
                     });
             let mut trust_ok = default_chain_error == 0
-                || verify_chain_signatures_to_roots(
+                || verify_chain_to_root_with_eku(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
-                );
+                    Some(req_eku),
+                )
+                .is_some();
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if !trust_ok {
                 trust_ok = apple_trust::evaluate_sec_trust(
@@ -1667,24 +1877,33 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             }
         }
         CERT_CHAIN_POLICY_EV => {
-            const OID_CERT_POLICIES: &[u8] = &[0x55, 0x1D, 0x20];
-            let has_policy_ext = chain_der.first().is_some_and(|d| {
-                parse_cert_der_parts(d)
-                    .is_some_and(|p| p.extensions.iter().any(|(oid, _, _)| *oid == OID_CERT_POLICIES))
-            });
+            // Perform genuine Extended Validation via Apple Security.framework's EV policy +
+            // root authorization table (`TrustExtendedValidation`). Ordinary DV/OV certificates
+            // (even those carrying a `certificatePolicies` extension) are rejected with
+            // `CERT_E_WRONG_USAGE`.
             let trust_ok = default_chain_error == 0
                 || verify_chain_signatures_to_roots(
                     &chain_der,
                     exclusive_roots.as_deref(),
                     &extra_roots,
                 );
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let is_ev = apple_trust::evaluate_sec_trust_ev(
+                &chain_der,
+                exclusive_roots.as_deref(),
+                &extra_roots,
+                Some(verify_unix.as_secs() as f64),
+            );
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let is_ev = false;
+
             if default_chain_error == CERT_E_REVOKED {
                 (CERT_E_REVOKED, 0)
             } else if !ignore_date && first_time_invalid_idx.is_some() {
                 (CERT_E_EXPIRED, first_time_invalid_idx.unwrap() as i32)
             } else if !trust_ok && !ignore_ca {
                 (CERT_E_UNTRUSTEDROOT, 0)
-            } else if !has_policy_ext {
+            } else if !is_ev {
                 (CERT_E_WRONG_USAGE, 0)
             } else {
                 (0, -1)

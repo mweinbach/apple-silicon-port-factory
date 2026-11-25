@@ -2423,7 +2423,15 @@ pub(super) unsafe fn query_context_attributes_impl(
                 }
                 SEC_E_OK
             }
-            SECPKG_ATTR_UNIQUE_BINDINGS | SECPKG_ATTR_ENDPOINT_BINDINGS => {
+            SECPKG_ATTR_UNIQUE_BINDINGS => {
+                // RFC 5929 §3 `tls-unique` requires the raw TLS 1.2 first Finished verify_data
+                // bytes and is undefined in TLS 1.3 (RFC 8446 / RFC 9266, where Windows Schannel
+                // returns SEC_E_UNSUPPORTED_FUNCTION). rustls intentionally does not expose TLS 1.2
+                // Finished bytes, so report SEC_E_UNSUPPORTED_FUNCTION rather than returning
+                // endpoint-binding data under the unique-bindings attribute.
+                SEC_E_UNSUPPORTED_FUNCTION
+            }
+            SECPKG_ATTR_ENDPOINT_BINDINGS => {
                 // RFC 5929 §4.1 tls-server-end-point channel binding: hash the server leaf cert
                 // DER with its signature algorithm's digest (substituting SHA-256 for MD5/SHA-1).
                 let server_cert_der = if ctx.is_server {

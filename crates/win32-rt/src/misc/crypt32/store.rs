@@ -92,6 +92,23 @@ pub(crate) struct PeerCertVerifyResult {
     pub extra_roots_der: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
+struct StoredKeyProvParam {
+    dw_param: u32,
+    data: Vec<u8>,
+    dw_flags: u32,
+}
+
+#[derive(Clone, Debug)]
+struct StoredKeyProvInfo {
+    container_name: Option<Vec<u16>>,
+    prov_name: Option<Vec<u16>>,
+    dw_prov_type: u32,
+    dw_flags: u32,
+    params: Vec<StoredKeyProvParam>,
+    dw_key_spec: u32,
+}
+
 struct RegisteredCert {
     owned: OwnedCertContext,
     refcount: usize,
@@ -102,6 +119,8 @@ struct RegisteredCert {
     owned_store: usize,
     /// Arbitrary certificate context properties (`CertSetCertificateContextProperty` / PFX).
     properties: HashMap<u32, Vec<u8>>,
+    /// Deep-copied `CRYPT_KEY_PROV_INFO` when set via `CERT_KEY_PROV_INFO_PROP_ID`.
+    key_prov_info: Option<StoredKeyProvInfo>,
     /// Associated PKCS#8 DER private key (from `PFXImportCertStore` or `attach_cert_private_key`).
     private_key_pkcs8: Option<Vec<u8>>,
 }
@@ -251,6 +270,7 @@ fn insert_cert_locked(
             peer_verify,
             owned_store,
             properties: HashMap::new(),
+            key_prov_info: None,
             private_key_pkcs8: None,
         },
     );
@@ -1617,6 +1637,15 @@ struct CryptKeyProvInfo {
 }
 const _: () = assert!(std::mem::size_of::<CryptKeyProvInfo>() == 48);
 
+#[repr(C)]
+struct CryptKeyProvParam {
+    dw_param: u32,
+    pb_data: *mut u8,
+    cb_data: u32,
+    dw_flags: u32,
+}
+const _: () = assert!(std::mem::size_of::<CryptKeyProvParam>() == 24);
+
 pub(super) unsafe fn cert_get_certificate_context_property_impl(
     p_cert_context: *const c_void,
     dw_prop_id: u32,
@@ -1636,29 +1665,76 @@ pub(super) unsafe fn cert_get_certificate_context_property_impl(
     };
 
     // Check explicit stored properties and private key state on registered contexts first.
-    let (stored_prop, has_priv_key) = {
+    let (stored_prop, stored_kpi, has_priv_key) = {
         let st = STORE_STATE.lock().unwrap();
         if let Some(entry) = st.certs.get(&(p_cert_context as usize)) {
             (
                 entry.properties.get(&dw_prop_id).cloned(),
+                entry.key_prov_info.clone(),
                 entry.private_key_pkcs8.is_some(),
             )
         } else {
-            (None, false)
+            (None, None, false)
         }
     };
 
     // Special case: CERT_KEY_PROV_INFO_PROP_ID (2) contains internal pointers into the caller buffer.
-    if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID && stored_prop.is_none() && has_priv_key {
-        let container_w: Vec<u16> = format!("PFX-{:x}\0", p_cert_context as usize)
-            .encode_utf16()
-            .collect();
-        let prov_w: Vec<u16> = "Microsoft Enhanced RSA and AES Cryptographic Provider\0"
-            .encode_utf16()
-            .collect();
+    if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
+        let kpi = if let Some(s) = stored_kpi {
+            Some(s)
+        } else if has_priv_key {
+            Some(StoredKeyProvInfo {
+                container_name: Some(
+                    format!("PFX-{:x}\0", p_cert_context as usize)
+                        .encode_utf16()
+                        .collect(),
+                ),
+                prov_name: Some(
+                    "Microsoft Enhanced RSA and AES Cryptographic Provider\0"
+                        .encode_utf16()
+                        .collect(),
+                ),
+                dw_prov_type: 24, // PROV_RSA_AES
+                dw_flags: 0,
+                params: Vec::new(),
+                dw_key_spec: 1, // AT_KEYEXCHANGE
+            })
+        } else {
+            None
+        };
+        let Some(kpi) = kpi else {
+            crate::teb::set_last_error(CRYPT_E_NOT_FOUND);
+            return FALSE;
+        };
         let hdr_sz = std::mem::size_of::<CryptKeyProvInfo>();
-        let total = hdr_sz + container_w.len() * 2 + prov_w.len() * 2;
-        let need = total as u32;
+        let param_sz = std::mem::size_of::<CryptKeyProvParam>();
+        let params_off = hdr_sz; // 48 is 8-byte aligned
+        let mut cursor = params_off + kpi.params.len() * param_sz;
+        let cont_off = if let Some(ref c) = kpi.container_name {
+            let o = cursor;
+            cursor += c.len() * 2;
+            Some(o)
+        } else {
+            None
+        };
+        let prov_off = if let Some(ref p) = kpi.prov_name {
+            let o = cursor;
+            cursor += p.len() * 2;
+            Some(o)
+        } else {
+            None
+        };
+        let mut param_data_offs = Vec::with_capacity(kpi.params.len());
+        for pm in &kpi.params {
+            if pm.data.is_empty() {
+                param_data_offs.push(None);
+            } else {
+                let o = cursor;
+                cursor += pm.data.len();
+                param_data_offs.push(Some(o));
+            }
+        }
+        let need = cursor as u32;
         if pv_data.is_null() {
             std::ptr::write_unaligned(pcb_data, need);
             return TRUE;
@@ -1670,24 +1746,58 @@ pub(super) unsafe fn cert_get_certificate_context_property_impl(
             return FALSE;
         }
         let base = pv_data as *mut u8;
-        let cont_ptr = base.add(hdr_sz) as *mut u16;
-        for (i, &u) in container_w.iter().enumerate() {
-            std::ptr::write_unaligned(cont_ptr.add(i), u);
-        }
-        let prov_ptr = cont_ptr.add(container_w.len());
-        for (i, &u) in prov_w.iter().enumerate() {
-            std::ptr::write_unaligned(prov_ptr.add(i), u);
-        }
+        let cont_ptr = if let (Some(o), Some(ref c)) = (cont_off, &kpi.container_name) {
+            let p = base.add(o) as *mut u16;
+            for (i, &u) in c.iter().enumerate() {
+                std::ptr::write_unaligned(p.add(i), u);
+            }
+            p
+        } else {
+            std::ptr::null_mut()
+        };
+        let prov_ptr = if let (Some(o), Some(ref pr)) = (prov_off, &kpi.prov_name) {
+            let p = base.add(o) as *mut u16;
+            for (i, &u) in pr.iter().enumerate() {
+                std::ptr::write_unaligned(p.add(i), u);
+            }
+            p
+        } else {
+            std::ptr::null_mut()
+        };
+        let rg_param_ptr = if kpi.params.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            let arr = base.add(params_off) as *mut CryptKeyProvParam;
+            for (i, pm) in kpi.params.iter().enumerate() {
+                let data_ptr = if let Some(doff) = param_data_offs[i] {
+                    let dp = base.add(doff);
+                    std::ptr::copy_nonoverlapping(pm.data.as_ptr(), dp, pm.data.len());
+                    dp
+                } else {
+                    std::ptr::null_mut()
+                };
+                std::ptr::write_unaligned(
+                    arr.add(i),
+                    CryptKeyProvParam {
+                        dw_param: pm.dw_param,
+                        pb_data: data_ptr,
+                        cb_data: pm.data.len() as u32,
+                        dw_flags: pm.dw_flags,
+                    },
+                );
+            }
+            arr as *mut c_void
+        };
         std::ptr::write_unaligned(
             pv_data as *mut CryptKeyProvInfo,
             CryptKeyProvInfo {
                 pwsz_container_name: cont_ptr,
                 pwsz_prov_name: prov_ptr,
-                dw_prov_type: 24, // PROV_RSA_AES
-                dw_flags: 0,
-                c_prov_param: 0,
-                rg_prov_param: std::ptr::null_mut(),
-                dw_key_spec: 1, // AT_KEYEXCHANGE
+                dw_prov_type: kpi.dw_prov_type,
+                dw_flags: kpi.dw_flags,
+                c_prov_param: kpi.params.len() as u32,
+                rg_prov_param: rg_param_ptr,
+                dw_key_spec: kpi.dw_key_spec,
             },
         );
         std::ptr::write_unaligned(pcb_data, need);
@@ -1820,7 +1930,69 @@ pub(super) unsafe fn cert_set_certificate_context_property_impl(
         return FALSE;
     };
     if pv_data.is_null() {
+        if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
+            entry.key_prov_info = None;
+        }
         entry.properties.remove(&dw_prop_id);
+        return TRUE;
+    }
+    if dw_prop_id == CERT_KEY_PROV_INFO_PROP_ID {
+        // Per MSDN CertSetCertificateContextProperty: CERT_KEY_PROV_INFO_PROP_ID receives a
+        // CRYPT_KEY_PROV_INFO* (NOT a CRYPT_DATA_BLOB*). Deep-copy all pointed-to strings & params.
+        let raw = std::ptr::read_unaligned(pv_data as *const CryptKeyProvInfo);
+        if raw.c_prov_param > 0 && raw.rg_prov_param.is_null() {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let read_wide_z = |p: *const u16| -> Option<Vec<u16>> {
+            if p.is_null() {
+                return None;
+            }
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            loop {
+                let u = std::ptr::read_unaligned(p.add(i));
+                out.push(u);
+                if u == 0 || i >= 4096 {
+                    if u != 0 {
+                        out.push(0);
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            Some(out)
+        };
+        let container_name = read_wide_z(raw.pwsz_container_name);
+        let prov_name = read_wide_z(raw.pwsz_prov_name);
+        let mut params = Vec::with_capacity(raw.c_prov_param as usize);
+        for i in 0..raw.c_prov_param as usize {
+            let pm = std::ptr::read_unaligned(
+                (raw.rg_prov_param as *const CryptKeyProvParam).add(i),
+            );
+            if pm.cb_data > 0 && pm.pb_data.is_null() {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let data = if pm.cb_data == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(pm.pb_data, pm.cb_data as usize).to_vec()
+            };
+            params.push(StoredKeyProvParam {
+                dw_param: pm.dw_param,
+                data,
+                dw_flags: pm.dw_flags,
+            });
+        }
+        entry.key_prov_info = Some(StoredKeyProvInfo {
+            container_name,
+            prov_name,
+            dw_prov_type: raw.dw_prov_type,
+            dw_flags: raw.dw_flags,
+            params,
+            dw_key_spec: raw.dw_key_spec,
+        });
         return TRUE;
     }
     let val = match dw_prop_id {
@@ -1894,10 +2066,25 @@ impl Drop for RegisteredCrl {
 
 struct RegisteredCtl {
     _der: Box<[u8]>,
+    _content_der: Box<[u8]>,
+    _info_buf: *mut c_void,
+    _h_crypt_msg: *mut c_void,
     _ctx: Box<CtlContext>,
     refcount: usize,
 }
 unsafe impl Send for RegisteredCtl {}
+impl Drop for RegisteredCtl {
+    fn drop(&mut self) {
+        if !self._info_buf.is_null() {
+            unsafe {
+                crate::kernel32::memory::LocalFree(self._info_buf);
+            }
+        }
+        if !self._h_crypt_msg.is_null() {
+            let _ = super::pkcs::try_close_decode_msg(self._h_crypt_msg as usize);
+        }
+    }
+}
 
 static CRLS: LazyLock<Mutex<HashMap<usize, RegisteredCrl>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static CTLS: LazyLock<Mutex<HashMap<usize, RegisteredCtl>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -2003,30 +2190,104 @@ pub(super) unsafe fn cert_create_ctl_context_impl(
         return std::ptr::null_mut();
     }
     let slice = std::slice::from_raw_parts(pb_ctl_encoded, cb_ctl_encoded as usize);
-    let Some((seq, _)) = super::asn1::parse_der_item(slice) else {
+    // Extract inner CertificateTrustList DER content from the signed PKCS#7 ContentInfo wrapper.
+    let Some((ci, _)) = super::asn1::parse_der_item(slice) else {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     };
-    if seq.tag != 0x30 {
+    if ci.tag != 0x30 {
         crate::teb::set_last_error(err::ERROR_INVALID_DATA);
         return std::ptr::null_mut();
     }
+    let Some(ci_kids) = super::asn1::der_item_children(ci.val) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+    const OID_CTL: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01];
+    if ci_kids.len() < 2
+        || ci_kids[0].tag != 0x06
+        || ci_kids[0].val != OID_SIGNED_DATA
+        || ci_kids[1].tag != 0xA0
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+    let Some((sd, _)) = super::asn1::parse_der_item(ci_kids[1].val) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    let Some(sd_kids) = super::asn1::der_item_children(sd.val) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    if sd_kids.len() < 3 || sd_kids[2].tag != 0x30 {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+    let Some(eci_kids) = super::asn1::der_item_children(sd_kids[2].val) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    if eci_kids.len() < 2
+        || eci_kids[0].tag != 0x06
+        || eci_kids[0].val != OID_CTL
+        || eci_kids[1].tag != 0xA0
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+    let Some((inner, _)) = super::asn1::parse_der_item(eci_kids[1].val) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+    let ctl_content_slice = if inner.tag == 0x04 { inner.val } else { inner.raw };
+    let Some(p_ctl_info) = super::decode::decode_ctl_info_alloc(ctl_content_slice) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    };
+
+    // Open a real PKCS#7 decode message handle for hCryptMsg so callers can inspect CTL signers.
+    let h_crypt_msg = super::pkcs::crypt_msg_open_to_decode_impl(
+        dw_msg_and_cert_encoding_type,
+        0,
+        0,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    if h_crypt_msg.is_null()
+        || super::pkcs::crypt_msg_update_impl(h_crypt_msg, pb_ctl_encoded, cb_ctl_encoded, TRUE)
+            == FALSE
+    {
+        if !h_crypt_msg.is_null() {
+            let _ = super::pkcs::try_close_decode_msg(h_crypt_msg as usize);
+        }
+        crate::kernel32::memory::LocalFree(p_ctl_info);
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+
     let der = slice.to_vec().into_boxed_slice();
+    let content_der = ctl_content_slice.to_vec().into_boxed_slice();
     let ctx = Box::new(CtlContext {
-        dw_msg_and_cert_encoding_type: dw_msg_and_cert_encoding_type,
+        dw_msg_and_cert_encoding_type,
         pb_ctl_encoded: der.as_ptr(),
         cb_ctl_encoded: der.len() as u32,
-        p_ctl_info: std::ptr::null_mut(),
+        p_ctl_info,
         h_cert_store: std::ptr::null_mut(),
-        h_crypt_msg: std::ptr::null_mut(),
-        pb_ctl_content: der.as_ptr(),
-        cb_ctl_content: der.len() as u32,
+        h_crypt_msg,
+        pb_ctl_content: content_der.as_ptr(),
+        cb_ctl_content: content_der.len() as u32,
     });
     let ptr = &*ctx as *const CtlContext as usize;
     CTLS.lock().unwrap().insert(
         ptr,
         RegisteredCtl {
             _der: der,
+            _content_der: content_der,
+            _info_buf: p_ctl_info,
+            _h_crypt_msg: h_crypt_msg,
             _ctx: ctx,
             refcount: 1,
         },

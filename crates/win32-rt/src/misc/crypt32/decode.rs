@@ -1443,6 +1443,132 @@ pub(super) unsafe fn crypt_decode_object_impl(
     )
 }
 
+/// Decode a DER `CertificateTrustList` into a single-buffer `LocalAlloc`-allocated Win64 `CTL_INFO`
+/// (128B: `dwVersion @ 0`, `SubjectUsage @ 8`, `ListIdentifier @ 24`, `SequenceNumber @ 40`,
+/// `ThisUpdate @ 56`, `NextUpdate @ 64`, `SubjectAlgorithm @ 72`, `cCTLEntry @ 96`,
+/// `rgCTLEntry @ 104`, `cExtension @ 112`, `rgExtension @ 120`).
+pub(super) unsafe fn decode_ctl_info_alloc(ctl_der: &[u8]) -> Option<*mut c_void> {
+    let (root, _) = parse_der_item(ctl_der)?;
+    if root.tag != 0x30 {
+        return None;
+    }
+    let kids = der_item_children(root.val)?;
+    if kids.len() < 3 {
+        return None;
+    }
+    let mut arena = DecodeArena::new();
+    let off = arena.alloc_aligned(128, 8);
+    let mut idx = 0usize;
+    let mut ver = 0u32;
+    if kids.get(idx).is_some_and(|k| k.tag == 0x02) {
+        ver = decode_der_u32(kids[idx].val).unwrap_or(0);
+        idx += 1;
+    }
+    arena.write_u32(off, ver);
+
+    // SubjectUsage ::= SEQUENCE OF OID -> CTL_USAGE (16B @ +8: cUsageIdentifier u32, rgpszUsageIdentifier *mut *mut u8)
+    let usage_seq = *kids.get(idx)?;
+    if usage_seq.tag != 0x30 {
+        return None;
+    }
+    let usage_oids = der_item_children(usage_seq.val)?;
+    arena.write_u32(off + 8, usage_oids.len() as u32);
+    if !usage_oids.is_empty() {
+        let arr = arena.alloc_aligned(usage_oids.len() * 8, 8);
+        arena.write_ptr(off + 16, Some(arr));
+        for (i, o) in usage_oids.iter().enumerate() {
+            if o.tag != 0x06 {
+                return None;
+            }
+            let s = wintrust::decode_oid_str(o.val);
+            let coff = arena.push_cstr(&s);
+            arena.write_ptr(arr + i * 8, Some(coff));
+        }
+    }
+    idx += 1;
+
+    // Optional listIdentifier OCTET STRING -> +24
+    if kids.get(idx).is_some_and(|k| k.tag == 0x04) {
+        arena.write_blob(off + 24, kids[idx].val);
+        idx += 1;
+    }
+    // Optional sequenceNumber INTEGER (LE) -> +40
+    if kids.get(idx).is_some_and(|k| k.tag == 0x02) {
+        let mut seq_le = kids[idx].val.to_vec();
+        seq_le.reverse();
+        arena.write_blob(off + 40, &seq_le);
+        idx += 1;
+    }
+    // ctlThisUpdate Time -> +56
+    let this_upd = *kids.get(idx)?;
+    if this_upd.tag != 0x17 && this_upd.tag != 0x18 {
+        return None;
+    }
+    arena.write_u64(
+        off + 56,
+        wintrust::parse_asn1_time_filetime_raw(this_upd.tag, this_upd.val),
+    );
+    idx += 1;
+    // Optional ctlNextUpdate Time -> +64
+    if kids.get(idx).is_some_and(|k| k.tag == 0x17 || k.tag == 0x18) {
+        arena.write_u64(
+            off + 64,
+            wintrust::parse_asn1_time_filetime_raw(kids[idx].tag, kids[idx].val),
+        );
+        idx += 1;
+    }
+    // subjectAlgorithm AlgorithmIdentifier -> +72 (24B)
+    let subj_alg = *kids.get(idx)?;
+    if !arena.write_alg_id(off + 72, subj_alg) {
+        return None;
+    }
+    idx += 1;
+    // Optional trustedSubjects SEQUENCE OF TrustedSubject -> cCTLEntry @ +96, rgCTLEntry @ +104
+    if kids.get(idx).is_some_and(|k| k.tag == 0x30) {
+        let subjects = der_item_children(kids[idx].val)?;
+        arena.write_u32(off + 96, subjects.len() as u32);
+        if !subjects.is_empty() {
+            // CTL_ENTRY (32B): SubjectIdentifier (16B @ 0), cAttribute (u32 @ 16), rgAttribute (*mut CRYPT_ATTRIBUTE @ 24)
+            let earr = arena.alloc_aligned(subjects.len() * 32, 8);
+            arena.write_ptr(off + 104, Some(earr));
+            for (i, subj) in subjects.iter().enumerate() {
+                if subj.tag != 0x30 {
+                    return None;
+                }
+                let sk = der_item_children(subj.val)?;
+                if sk.is_empty() || sk[0].tag != 0x04 {
+                    return None;
+                }
+                let eo = earr + i * 32;
+                arena.write_blob(eo, sk[0].val);
+                if let Some(attrs) = sk.get(1).filter(|e| e.tag == 0x31) {
+                    if let Some(al) = der_item_children(attrs.val) {
+                        decode_attributes_list_into(&mut arena, eo + 16, &al);
+                    }
+                }
+            }
+        }
+        idx += 1;
+    }
+    // Optional ctlExtensions [0] EXPLICIT Extensions -> cExtension @ +112, rgExtension @ +120
+    if kids.get(idx).is_some_and(|k| k.tag == 0xA0) {
+        if let Some((ext_seq, _)) = parse_der_item(kids[idx].val) {
+            if ext_seq.tag == 0x30 {
+                if let Some(ext_list) = der_item_children(ext_seq.val) {
+                    decode_extensions_into(&mut arena, off + 112, &ext_list);
+                }
+            }
+        }
+    }
+
+    let mem = crate::kernel32::memory::LocalAlloc(0, arena.buf.len().max(1)) as *mut u8;
+    if mem.is_null() {
+        return None;
+    }
+    arena.copy_relocated_into(mem);
+    Some(mem as *mut c_void)
+}
+
 // ---------------------------------------------------------------------------
 // SPKI -> Win32 CAPI PUBLICKEYBLOB helper (ready for CryptImportPublicKeyInfo)
 // ---------------------------------------------------------------------------

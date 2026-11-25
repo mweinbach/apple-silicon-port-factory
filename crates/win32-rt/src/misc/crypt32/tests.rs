@@ -2606,6 +2606,147 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert_eq!(&dec[..dec_len as usize], b"Hello PKCS7 Signed World!");
         assert!(!signer_cert.is_null());
+
+        // 4a. CertSetCertificateContextProperty + CertGetCertificateContextProperty for CERT_KEY_PROV_INFO_PROP_ID
+        #[repr(C)]
+        struct TestKeyProvParam {
+            dw_param: u32,
+            pb_data: *const u8,
+            cb_data: u32,
+            dw_flags: u32,
+        }
+        #[repr(C)]
+        struct TestKeyProvInfo {
+            pwsz_container_name: *const u16,
+            pwsz_prov_name: *const u16,
+            dw_prov_type: u32,
+            dw_flags: u32,
+            c_prov_param: u32,
+            rg_prov_param: *const TestKeyProvParam,
+            dw_key_spec: u32,
+        }
+        let cont_w = crate::strings::to_wide_z("MyKeyContainer");
+        let prov_w = crate::strings::to_wide_z("MyCryptoProvider");
+        let param_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let kpp = TestKeyProvParam {
+            dw_param: 7,
+            pb_data: param_bytes.as_ptr(),
+            cb_data: param_bytes.len() as u32,
+            dw_flags: 0,
+        };
+        let kpi_in = TestKeyProvInfo {
+            pwsz_container_name: cont_w.as_ptr(),
+            pwsz_prov_name: prov_w.as_ptr(),
+            dw_prov_type: 24,
+            dw_flags: 0x20,
+            c_prov_param: 1,
+            rg_prov_param: &kpp,
+            dw_key_spec: 2,
+        };
+        assert_eq!(
+            CertSetCertificateContextProperty(
+                signer_cert,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                0,
+                &kpi_in as *const _ as *const c_void,
+            ),
+            TRUE
+        );
+        let mut kpi_sz = 0u32;
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                signer_cert,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                std::ptr::null_mut(),
+                &mut kpi_sz,
+            ),
+            TRUE
+        );
+        let mut kpi_buf = vec![0u8; kpi_sz as usize];
+        assert_eq!(
+            CertGetCertificateContextProperty(
+                signer_cert,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                kpi_buf.as_mut_ptr() as *mut c_void,
+                &mut kpi_sz,
+            ),
+            TRUE
+        );
+        let kpi_out = std::ptr::read_unaligned(kpi_buf.as_ptr() as *const TestKeyProvInfo);
+        assert_eq!(crate::strings::from_wide(kpi_out.pwsz_container_name), "MyKeyContainer");
+        assert_eq!(crate::strings::from_wide(kpi_out.pwsz_prov_name), "MyCryptoProvider");
+        assert_eq!(kpi_out.dw_prov_type, 24);
+        assert_eq!(kpi_out.dw_flags, 0x20);
+        assert_eq!(kpi_out.dw_key_spec, 2);
+        assert_eq!(kpi_out.c_prov_param, 1);
+        let out_param = std::ptr::read_unaligned(kpi_out.rg_prov_param);
+        assert_eq!(out_param.dw_param, 7);
+        assert_eq!(
+            std::slice::from_raw_parts(out_param.pb_data, out_param.cb_data as usize),
+            &param_bytes
+        );
+
+        // 4b. CryptVerifyMessageSignature honors pfnGetSignerCertificate callback
+        unsafe extern "C" fn reject_signer_cb(
+            _arg: *mut c_void,
+            _enc: u32,
+            _signer_id: *const c_void,
+            _store: *mut c_void,
+        ) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn accept_signer_cb(
+            arg: *mut c_void,
+            enc: u32,
+            signer_id: *const c_void,
+            msg_store: *mut c_void,
+        ) -> *mut c_void {
+            assert_eq!(arg as usize, 0xCAFE);
+            CertGetSubjectCertificateFromStore(msg_store, enc, signer_id)
+        }
+        let vp_reject = VerifyPara {
+            cb_size: std::mem::size_of::<VerifyPara>() as u32,
+            encoding: X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            h_prov: 0,
+            pfn: reject_signer_cb as *const () as usize,
+            arg: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp_reject as *const _ as *const c_void,
+                0,
+                PKCS7_SIGNED_DER.as_ptr(),
+                PKCS7_SIGNED_DER.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_100E); // CRYPT_E_SIGNER_NOT_FOUND
+
+        let vp_accept = VerifyPara {
+            cb_size: std::mem::size_of::<VerifyPara>() as u32,
+            encoding: X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            h_prov: 0,
+            pfn: accept_signer_cb as *const () as usize,
+            arg: 0xCAFEusize as *mut c_void,
+        };
+        let mut cb_signer_out: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp_accept as *const _ as *const c_void,
+                0,
+                PKCS7_SIGNED_DER.as_ptr(),
+                PKCS7_SIGNED_DER.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cb_signer_out,
+            ),
+            TRUE
+        );
+        assert!(!cb_signer_out.is_null());
+        CertFreeCertificateContext(cb_signer_out);
         CertFreeCertificateContext(signer_cert);
 
         // Tamper signature byte -> fails with NTE_BAD_SIGNATURE
@@ -2626,7 +2767,7 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         );
         assert_eq!(crate::teb::last_error(), 0x8009_0006);
 
-        // 5. Real CRL & CTL context lifecycle
+        // 5. Real CRL & CTL context lifecycle (with populated pCtlInfo, hCryptMsg, pbCtlContent)
         let minimal_seq = encode_der_tlv(0x30, &[]);
         let crl = CertCreateCRLContext(X509_ASN_ENCODING, minimal_seq.as_ptr(), minimal_seq.len() as u32);
         assert!(!crl.is_null());
@@ -2635,12 +2776,44 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert_eq!(CertFreeCRLContext(crl_dup), TRUE);
         assert_eq!(CertFreeCRLContext(crl), TRUE);
 
-        let ctl = CertCreateCTLContext(
+        // Invalid/non-CTL input MUST fail CertCreateCTLContext
+        assert!(CertCreateCTLContext(
             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
             minimal_seq.as_ptr(),
             minimal_seq.len() as u32,
+        )
+        .is_null());
+
+        let ctl_der = self::test_vectors::CATALOG_CTL_SIGNED_DER;
+        let ctl = CertCreateCTLContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            ctl_der.as_ptr(),
+            ctl_der.len() as u32,
         );
         assert!(!ctl.is_null());
+        let ctl_ctx = &*(ctl as *const super::store::CtlContext);
+        assert!(!ctl_ctx.p_ctl_info.is_null(), "pCtlInfo must be decoded");
+        assert!(!ctl_ctx.h_crypt_msg.is_null(), "hCryptMsg must be opened");
+        assert!(ctl_ctx.cb_ctl_content > 0 && ctl_ctx.cb_ctl_content < ctl_ctx.cb_ctl_encoded);
+        // CTL_INFO: SubjectUsage.cUsageIdentifier @ +8, cCTLEntry @ +96
+        let usage_cnt = std::ptr::read_unaligned((ctl_ctx.p_ctl_info as *const u8).add(8) as *const u32);
+        let entry_cnt = std::ptr::read_unaligned((ctl_ctx.p_ctl_info as *const u8).add(96) as *const u32);
+        assert_eq!(usage_cnt, 1);
+        assert_eq!(entry_cnt, 1);
+        // hCryptMsg is a live message handle supporting CryptMsgGetParam(CMSG_SIGNER_COUNT_PARAM)
+        let mut scnt = 0u32;
+        let mut scnt_len = 4u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                ctl_ctx.h_crypt_msg,
+                5, // CMSG_SIGNER_COUNT_PARAM
+                0,
+                &mut scnt as *mut _ as *mut c_void,
+                &mut scnt_len,
+            ),
+            TRUE
+        );
+        assert_eq!(scnt, 1);
         let ctl_dup = CertDuplicateCTLContext(ctl);
         assert_eq!(ctl_dup, ctl);
         assert_eq!(CertFreeCTLContext(ctl_dup), TRUE);
@@ -2781,6 +2954,32 @@ fn macos_trust_store_and_extended_chain_policies() {
             ),
             TRUE
         );
+
+        // Trusted non-EV cert MUST fail CERT_CHAIN_POLICY_EV with CERT_E_WRONG_USAGE
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_EV as *const u8,
+                trusted_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, CERT_E_WRONG_USAGE);
+
+        // Enforce CA constraints on intermediates: CA cert accepted, end-entity (no cA=TRUE) rejected
+        let cert_cc = std::ptr::read_unaligned(cert as *const crate::misc::wintrust::CertContext);
+        let ca_der = std::slice::from_raw_parts(cert_cc.pb_cert_encoded, cert_cc.cb_cert_encoded as usize);
+        assert!(super::chain::intermediate_is_valid_ca(ca_der, 0, None));
+        // CATALOG_CTL_SIGNED_DER signer cert has no BasicConstraints CA:TRUE -> MUST be rejected as intermediate
+        let ctl_msg = CryptMsgOpenToDecode(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(CryptMsgUpdate(ctl_msg, self::test_vectors::CATALOG_CTL_SIGNED_DER.as_ptr(), self::test_vectors::CATALOG_CTL_SIGNED_DER.len() as u32, TRUE), TRUE);
+        let mut ee_len = 0u32;
+        assert_eq!(CryptMsgGetParam(ctl_msg, 12 /* CMSG_CERT_PARAM */, 0, std::ptr::null_mut(), &mut ee_len), TRUE);
+        let mut ee_der = vec![0u8; ee_len as usize];
+        assert_eq!(CryptMsgGetParam(ctl_msg, 12, 0, ee_der.as_mut_ptr() as *mut c_void, &mut ee_len), TRUE);
+        assert!(!super::chain::intermediate_is_valid_ca(&ee_der, 0, None));
+        assert_eq!(CryptMsgClose(ctl_msg), TRUE);
 
         // Trusted non-Microsoft root MUST still fail MICROSOFT_ROOT (checked by SPKI key, not name)
         assert_eq!(
