@@ -694,7 +694,9 @@ unsafe fn sw_unwind_one(
     let unwound = if let Some((base, rf, _)) =
         sw_lookup_rf(h_process, lookup_pc, fn_table_cb, mod_base_cb, read_mem_cb)
     {
-        crate::unwind::safe_virtual_unwind(base, lookup_pc, rf, ctx, allow_epilog)
+        crate::unwind::safe_virtual_unwind_with(base, lookup_pc, rf, ctx, allow_epilog, &mut |addr, buf| {
+            sw_read_mem(h_process, read_mem_cb, addr, buf)
+        })
     } else {
         // Leaf function (no `.pdata` entry): return address sits directly at [RSP].
         match sw_read_u64(h_process, read_mem_cb, ctx.gpr[RSP]) {
@@ -2462,6 +2464,157 @@ mod tests {
                 }
             }
             assert!(found, "worker thread {worker_tid} missing from ThreadListStream");
+        }
+    }
+
+    #[test]
+    fn stack_walk64_uses_custom_read_memory_callback_for_non_leaf_unwind() {
+        use std::sync::OnceLock;
+
+        // Synthetic remote address space (unmapped in our own process) served ONLY via custom callbacks.
+        const REMOTE_BASE: u64 = 0x7FFF_1234_0000;
+        const REMOTE_STACK: u64 = 0x7FFE_5678_1000;
+        const REMOTE_RF_ADDR: u64 = REMOTE_BASE + 0x4000;
+        const REMOTE_UNWIND_RVA: u32 = 0x5000;
+
+        struct RemoteImage {
+            rf: RuntimeFunction,
+            unwind_info: [u8; 8],
+            stack: [u64; 8],
+        }
+        static REMOTE: OnceLock<RemoteImage> = OnceLock::new();
+        let _ = REMOTE.get_or_init(|| {
+            // Non-leaf function [0x100..0x200): prolog pushes RBX (reg 3) then allocates 0x20 bytes.
+            // Unwind codes (in reverse prolog order):
+            //   code 0: off=8, UWOP_ALLOC_SMALL (2), info=3 ((3+1)*8 = 0x20) -> 0x32
+            //   code 1: off=4, UWOP_PUSH_NONVOL (0), info=3 (RBX)             -> 0x30
+            let rf = RuntimeFunction {
+                begin_rva: 0x100,
+                end_rva: 0x200,
+                unwind_rva: REMOTE_UNWIND_RVA,
+            };
+            let unwind_info = [
+                1,    // Version=1, Flags=0
+                0x10, // SizeOfProlog
+                2,    // CountOfCodes
+                0,    // FrameRegister=0
+                0x08, 0x32, // UWOP_ALLOC_SMALL 0x20
+                0x04, 0x30, // UWOP_PUSH_NONVOL RBX
+            ];
+            let mut stack = [0u64; 8];
+            // [RSP + 0x00..0x20] = local alloc; [RSP + 0x20] = saved RBX; [RSP + 0x28] = caller RIP.
+            stack[4] = 0x1122_3344_5566_7788; // saved RBX
+            stack[5] = REMOTE_BASE + 0x800;   // caller return RIP
+            stack[6] = 0;                     // terminator
+            RemoteImage { rf, unwind_info, stack }
+        });
+
+        unsafe extern "win64" fn remote_read_mem(
+            _h_proc: HANDLE,
+            base_addr: u64,
+            buf: *mut c_void,
+            size: u32,
+            out_read: *mut u32,
+        ) -> BOOL {
+            let img = REMOTE.get().unwrap();
+            let size_usize = size as usize;
+            let dst = std::slice::from_raw_parts_mut(buf as *mut u8, size_usize);
+            let rf_bytes = std::slice::from_raw_parts(
+                &img.rf as *const RuntimeFunction as *const u8,
+                std::mem::size_of::<RuntimeFunction>(),
+            );
+            let stack_bytes = std::slice::from_raw_parts(
+                img.stack.as_ptr() as *const u8,
+                std::mem::size_of_val(&img.stack),
+            );
+            let regions: [(u64, &[u8]); 3] = [
+                (REMOTE_RF_ADDR, rf_bytes),
+                (REMOTE_BASE + REMOTE_UNWIND_RVA as u64, &img.unwind_info),
+                (REMOTE_STACK, stack_bytes),
+            ];
+            for (start, data) in regions {
+                let end = start + data.len() as u64;
+                if base_addr >= start && base_addr.saturating_add(size as u64) <= end {
+                    let off = (base_addr - start) as usize;
+                    dst.copy_from_slice(&data[off..off + size_usize]);
+                    if !out_read.is_null() {
+                        std::ptr::write_unaligned(out_read, size);
+                    }
+                    return TRUE;
+                }
+            }
+            if !out_read.is_null() {
+                std::ptr::write_unaligned(out_read, 0);
+            }
+            FALSE
+        }
+
+        unsafe extern "win64" fn remote_fn_table(_h_proc: HANDLE, addr: u64) -> *mut c_void {
+            if (REMOTE_BASE + 0x100..REMOTE_BASE + 0x200).contains(&addr) {
+                REMOTE_RF_ADDR as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+
+        unsafe extern "win64" fn remote_mod_base(_h_proc: HANDLE, addr: u64) -> u64 {
+            if (REMOTE_BASE..REMOTE_BASE + 0x10000).contains(&addr) {
+                REMOTE_BASE
+            } else {
+                0
+            }
+        }
+
+        unsafe {
+            crate::register_native_va(remote_read_mem as *const () as u64, remote_read_mem as *const () as usize);
+            crate::register_native_va(remote_fn_table as *const () as u64, remote_fn_table as *const () as usize);
+            crate::register_native_va(remote_mod_base as *const () as u64, remote_mod_base as *const () as usize);
+
+            let mut ctx = Context::zeroed();
+            ctx.rip = REMOTE_BASE + 0x140;
+            ctx.gpr[RSP] = REMOTE_STACK;
+            ctx.gpr[3] = 0; // RBX before unwind
+
+            let mut sf: StackFrame64 = std::mem::zeroed();
+            sf.addr_pc = flat_addr(ctx.rip);
+            sf.addr_stack = flat_addr(ctx.gpr[RSP]);
+            sf.addr_frame = flat_addr(ctx.gpr[RSP]);
+
+            // First call reports the starting non-leaf frame and peeks the caller RIP via remote reader.
+            assert_eq!(
+                StackWalk64(
+                    IMAGE_FILE_MACHINE_AMD64,
+                    0x1234usize as HANDLE,
+                    std::ptr::null_mut(),
+                    &mut sf as *mut StackFrame64 as *mut u8,
+                    &mut ctx as *mut Context as *mut u8,
+                    remote_read_mem as *const () as *const c_void,
+                    remote_fn_table as *const () as *const c_void,
+                    remote_mod_base as *const () as *const c_void,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            assert_eq!(sf.addr_pc.offset, REMOTE_BASE + 0x140);
+            assert_eq!(sf.addr_return.offset, REMOTE_BASE + 0x800);
+
+            // Second call advances to the caller frame and restores RBX from the remote stack.
+            assert_eq!(
+                StackWalk64(
+                    IMAGE_FILE_MACHINE_AMD64,
+                    0x1234usize as HANDLE,
+                    std::ptr::null_mut(),
+                    &mut sf as *mut StackFrame64 as *mut u8,
+                    &mut ctx as *mut Context as *mut u8,
+                    remote_read_mem as *const () as *const c_void,
+                    remote_fn_table as *const () as *const c_void,
+                    remote_mod_base as *const () as *const c_void,
+                    std::ptr::null(),
+                ),
+                TRUE
+            );
+            assert_eq!(sf.addr_pc.offset, REMOTE_BASE + 0x800);
+            assert_eq!(ctx.gpr[3], 0x1122_3344_5566_7788, "custom reader must restore remote RBX");
         }
     }
 }

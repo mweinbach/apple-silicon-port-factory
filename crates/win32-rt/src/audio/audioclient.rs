@@ -107,6 +107,8 @@ impl Drop for CaptureTimer {
 }
 
 struct RenderState {
+    ep_id: String,
+    source_id: u64,
     out_channels: u16,
     matrix: Option<Vec<f32>>,
     out: OutputStream,
@@ -122,17 +124,157 @@ struct RenderState {
     low_latency: bool,
 }
 
+impl Drop for RenderState {
+    fn drop(&mut self) {
+        unregister_loopback_source(&self.ep_id, self.source_id);
+    }
+}
+
 /// Maximum shared-mode buffer duration advertised by `IAudioClient2::GetBufferSizeLimits` (2 s).
 pub const MAX_BUFFER_DURATION_HNS: i64 = 20_000_000;
 
-/// Per-endpoint in-process render loopback subscriber (for `AUDCLNT_STREAMFLAGS_LOOPBACK`).
+static NEXT_LOOPBACK_SOURCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(super) fn alloc_loopback_source_id() -> u64 {
+    NEXT_LOOPBACK_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct LoopbackSourceQueue {
+    converter: Option<super::backend::TapFormatConverter>,
+    /// Converted interleaved float32 samples at `(dst_rate, dst_channels)`.
+    buf: VecDeque<f32>,
+    /// Set when the owning render stream drops; entry is pruned once `buf` drains.
+    retired: bool,
+}
+
+struct LoopbackMixer {
+    dst_rate: u32,
+    dst_channels: usize,
+    cap_samples: usize,
+    sources: std::collections::HashMap<u64, LoopbackSourceQueue>,
+}
+
+impl LoopbackMixer {
+    fn new(cap_frames: usize, dst_rate: u32, dst_channels: u16) -> Self {
+        let ch = dst_channels.max(1) as usize;
+        Self {
+            dst_rate: dst_rate.max(1),
+            dst_channels: ch,
+            cap_samples: cap_frames.max(4096) * ch,
+            sources: std::collections::HashMap::new(),
+        }
+    }
+
+    fn push_source(&mut self, source_id: u64, samples_f32: &[f32], src_rate: u32, src_channels: u16) {
+        let src_ch = src_channels.max(1) as usize;
+        let src_rate = src_rate.max(1);
+        let frames = samples_f32.len() / src_ch;
+        if frames == 0 {
+            return;
+        }
+        let input = &samples_f32[..frames * src_ch];
+        let dst_rate = self.dst_rate;
+        let dst_ch = self.dst_channels;
+        let cap_samples = self.cap_samples;
+
+        let entry = self.sources.entry(source_id).or_insert_with(|| LoopbackSourceQueue {
+            converter: None,
+            buf: VecDeque::new(),
+            retired: false,
+        });
+        entry.retired = false;
+
+        let converted: &[f32] = if src_rate == dst_rate && src_ch == dst_ch {
+            input
+        } else {
+            let needs_new = match entry.converter.as_ref() {
+                Some(c) => !c.matches_src(src_rate, src_ch as u32),
+                None => true,
+            };
+            if needs_new {
+                entry.converter = Some(super::backend::TapFormatConverter::new(
+                    src_rate,
+                    src_ch as u32,
+                    dst_rate,
+                    dst_ch as u32,
+                ));
+            }
+            entry.converter.as_mut().unwrap().convert(input)
+        };
+        if converted.is_empty() {
+            return;
+        }
+        entry.buf.extend(converted.iter().copied());
+        if entry.buf.len() > cap_samples {
+            let drop_samples = ((entry.buf.len() - cap_samples) / dst_ch) * dst_ch;
+            entry.buf.drain(..drop_samples);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.sources.clear();
+    }
+
+    fn retire_source(&mut self, source_id: u64) {
+        if let Some(q) = self.sources.get_mut(&source_id) {
+            q.retired = true;
+            if q.buf.is_empty() {
+                self.sources.remove(&source_id);
+            }
+        }
+    }
+
+    /// Mix up to `max_frames` frames across all buffered render sources on a shared timeline
+    /// into `out` (interleaved float32 at `(dst_rate, dst_channels)`), returning frames written.
+    fn drain_mixed(&mut self, max_frames: usize, out: &mut Vec<f32>) -> usize {
+        if max_frames == 0 {
+            return 0;
+        }
+        let ch = self.dst_channels;
+        let max_avail_frames = self
+            .sources
+            .values()
+            .map(|q| q.buf.len() / ch)
+            .max()
+            .unwrap_or(0);
+        let take = max_avail_frames.min(max_frames);
+        if take == 0 {
+            self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
+            return 0;
+        }
+        let n_samples = take * ch;
+        out.clear();
+        out.resize(n_samples, 0.0);
+        let mut active_count = 0usize;
+        for q in self.sources.values_mut() {
+            let src_frames = (q.buf.len() / ch).min(take);
+            if src_frames == 0 {
+                continue;
+            }
+            active_count += 1;
+            let src_samples = src_frames * ch;
+            for dst in &mut out[..src_samples] {
+                if let Some(s) = q.buf.pop_front() {
+                    *dst += s;
+                }
+            }
+        }
+        if active_count > 1 {
+            for s in &mut out[..n_samples] {
+                *s = s.clamp(-1.0, 1.0);
+            }
+        }
+        self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
+        take
+    }
+}
+
+/// Per-endpoint in-process render loopback subscriber (for `AUDCLNT_STREAMFLAGS_LOOPBACK`
+/// fallback when CoreAudio Process Tap is unavailable).
 struct LoopbackSub {
-    ring: Arc<Ring>,
-    rate: u32,
-    channels: u16,
-    /// Serializes concurrent render producers pushing into `ring` (`Ring` is single-producer /
-    /// single-consumer) and owns the per-subscriber format/sample-rate converter for fallback feeds.
-    producer: Mutex<Option<super::backend::TapFormatConverter>>,
+    /// Serializes all render producers and mixes simultaneous streams on a shared timeline.
+    mixer: Mutex<LoopbackMixer>,
 }
 
 static LOOPBACK_SUB_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -146,10 +288,7 @@ impl Drop for LoopbackSub {
 
 fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u16) -> Arc<LoopbackSub> {
     let sub = Arc::new(LoopbackSub {
-        ring: Arc::new(Ring::new(cap_frames.max(4096), channels.max(1) as usize)),
-        rate: rate.max(1),
-        channels: channels.max(1),
-        producer: Mutex::new(None),
+        mixer: Mutex::new(LoopbackMixer::new(cap_frames, rate, channels)),
     });
     LOOPBACK_SUB_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut bus = LOOPBACK_BUS.lock().unwrap();
@@ -158,10 +297,33 @@ fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u1
     sub
 }
 
-/// Fast-path render tee: zero lock overhead when no loopback capture client is active.
-/// Serializes multi-thread render producers per subscriber and normalizes sample rate +
-/// channel layout to each loopback capture client's format.
-pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_rate: u32, src_channels: u16) {
+pub(super) fn unregister_loopback_source(ep_id: &str, source_id: u64) {
+    if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let subs: Vec<Arc<LoopbackSub>> = {
+        let mut bus = LOOPBACK_BUS.lock().unwrap();
+        bus.retain(|(_, w)| w.strong_count() > 0);
+        bus.iter()
+            .filter(|(id, _)| id == ep_id)
+            .filter_map(|(_, w)| w.upgrade())
+            .collect()
+    };
+    for sub in subs {
+        sub.mixer.lock().unwrap().retire_source(source_id);
+    }
+}
+
+/// Fast-path render tee: zero lock overhead when no in-process loopback capture client is active.
+/// Serializes multi-thread render producers, normalizes sample rate + channel layout per source,
+/// and stages frames per `source_id` so simultaneous streams are mixed on a shared timeline.
+pub(super) fn push_loopback_frames(
+    ep_id: &str,
+    source_id: u64,
+    samples_f32: &[f32],
+    src_rate: u32,
+    src_channels: u16,
+) {
     if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 || samples_f32.is_empty() || src_channels == 0 {
         return;
     }
@@ -173,35 +335,11 @@ pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_rate: u
             .filter_map(|(_, w)| w.upgrade())
             .collect()
     };
-    let src_ch = src_channels as usize;
-    let src_rate = src_rate.max(1);
-    let frames = samples_f32.len() / src_ch;
-    if frames == 0 {
-        return;
-    }
-    let input = &samples_f32[..frames * src_ch];
     for sub in subs {
-        let mut conv_guard = sub.producer.lock().unwrap();
-        if sub.rate == src_rate && sub.channels == src_channels {
-            sub.ring.push(input);
-        } else {
-            let needs_new = match conv_guard.as_ref() {
-                Some(c) => !c.matches_src(src_rate, src_channels as u32),
-                None => true,
-            };
-            if needs_new {
-                *conv_guard = Some(super::backend::TapFormatConverter::new(
-                    src_rate,
-                    src_channels as u32,
-                    sub.rate,
-                    sub.channels as u32,
-                ));
-            }
-            let out = conv_guard.as_mut().unwrap().convert(input);
-            if !out.is_empty() {
-                sub.ring.push(out);
-            }
-        }
+        sub.mixer
+            .lock()
+            .unwrap()
+            .push_source(source_id, samples_f32, src_rate, src_channels);
     }
 }
 
@@ -253,10 +391,19 @@ fn encode_from_f32(sample: SampleType, src: &[f32], out: &mut Vec<u8>) {
     }
 }
 
+/// Single selected loopback audio source for a loopback capture stream.
+/// Chosen once at `IAudioClient::Initialize` time so a stream never switches
+/// dynamically between CoreAudio tap and in-process fallback samples.
+enum LoopbackSource {
+    CoreAudioTap {
+        _tap: LoopbackTap,
+        ring: Arc<Ring>,
+    },
+    InProcessBus(Arc<LoopbackSub>),
+}
+
 struct LoopbackCapture {
-    sub: Arc<LoopbackSub>,
-    _ca_tap: Option<LoopbackTap>,
-    ca_ring: Option<Arc<Ring>>,
+    source: LoopbackSource,
     scratch_f32: Vec<f32>,
     packets: VecDeque<(Vec<u8>, u32, bool)>,
 }
@@ -276,27 +423,31 @@ struct CaptureState {
 
 impl CaptureState {
     /// Advance capture arrival up to `Instant::now()`: for loopback streams,
-    /// drains live frames from the CoreAudio Process Tap or in-process render
-    /// loopback bus; for silent capture or idle loopback, paces silent packets.
+    /// drains live frames from the selected loopback source (CoreAudio Process Tap
+    /// or in-process render loopback mixer); for silent capture or idle loopback,
+    /// paces silent packets.
     fn advance(&mut self, fmt: &WaveFormat, buffer_frames: u32) {
         let rate = fmt.rate;
         let ch = fmt.channels.max(1) as usize;
         let pkt = self.packet_frames.max(1);
 
         if let Some(lb) = &mut self.loopback {
-            // Drain live frames from CoreAudio process tap (if active and non-empty)
-            // or from the in-process WASAPI render loopback ring.
-            let pull_ring = lb
-                .ca_ring
-                .as_ref()
-                .filter(|r| !r.is_empty())
-                .unwrap_or(&lb.sub.ring);
-            let avail_frames = pull_ring.len() as u32;
-            if avail_frames > 0 && self.queued_frames < buffer_frames {
-                let take = avail_frames.min(buffer_frames - self.queued_frames);
-                let n_samples = take as usize * ch;
-                lb.scratch_f32.resize(n_samples, 0.0);
-                let got = pull_ring.pop_into(&mut lb.scratch_f32) as u32;
+            if self.queued_frames < buffer_frames {
+                let max_take = (buffer_frames - self.queued_frames) as usize;
+                let got: u32 = match &lb.source {
+                    LoopbackSource::CoreAudioTap { ring, .. } => {
+                        let avail = ring.len().min(max_take);
+                        if avail > 0 {
+                            lb.scratch_f32.resize(avail * ch, 0.0);
+                            ring.pop_into(&mut lb.scratch_f32) as u32
+                        } else {
+                            0
+                        }
+                    }
+                    LoopbackSource::InProcessBus(sub) => {
+                        sub.mixer.lock().unwrap().drain_mixed(max_take, &mut lb.scratch_f32) as u32
+                    }
+                };
                 if got > 0 {
                     let used = got as usize * ch;
                     let silent = lb.scratch_f32[..used].iter().all(|&x| x == 0.0);
@@ -671,14 +822,18 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
             None
         };
         let loopback = if is_loopback {
-            let sub = register_loopback_sub(&core.ep.id, buffer_frames as usize * 2, f.rate, f.channels);
             let ca_ring = Arc::new(Ring::new(buffer_frames as usize * 2, f.channels.max(1) as usize));
-            let ca_tap = LoopbackTap::try_open(&core.ep.info, ca_ring.clone(), f.rate, f.channels as u32);
-            let ca_ring_opt = ca_tap.as_ref().map(|_| ca_ring);
+            let source = match LoopbackTap::try_open(&core.ep.info, ca_ring.clone(), f.rate, f.channels as u32) {
+                Some(tap) => LoopbackSource::CoreAudioTap { _tap: tap, ring: ca_ring },
+                None => LoopbackSource::InProcessBus(register_loopback_sub(
+                    &core.ep.id,
+                    buffer_frames as usize * 2,
+                    f.rate,
+                    f.channels,
+                )),
+            };
             Some(LoopbackCapture {
-                sub,
-                _ca_tap: ca_tap,
-                ca_ring: ca_ring_opt,
+                source,
                 scratch_f32: Vec::new(),
                 packets: VecDeque::new(),
             })
@@ -777,6 +932,8 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
             frames_written: 0,
             dropped_silence: 0,
             io: StreamIo::Render(RenderState {
+                ep_id: core.ep.id.clone(),
+                source_id: alloc_loopback_source_id(),
                 out_channels,
                 matrix,
                 out,
@@ -1022,9 +1179,9 @@ mod client {
                     c.queued_packets.clear();
                     if let Some(lb) = &mut c.loopback {
                         lb.packets.clear();
-                        lb.sub.ring.clear();
-                        if let Some(cr) = &lb.ca_ring {
-                            cr.clear();
+                        match &lb.source {
+                            LoopbackSource::CoreAudioTap { ring, .. } => ring.clear(),
+                            LoopbackSource::InProcessBus(sub) => sub.mixer.lock().unwrap().clear(),
                         }
                     }
                     c.queued_frames = 0;
@@ -1333,7 +1490,7 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
             }
         };
         s.shared.ring.push(pushed);
-        push_loopback_frames(ep_id, pushed, fmt.rate, r.out_channels);
+        push_loopback_frames(ep_id, r.source_id, pushed, fmt.rate, r.out_channels);
     }
     s.frames_written += frames as u64;
 }

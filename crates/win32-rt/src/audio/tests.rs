@@ -2184,7 +2184,7 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 480, &mut ptr), S_OK);
                 let slice = std::slice::from_raw_parts_mut(ptr as *mut f32, 480 * 2);
-                slice.fill(0.5);
+                slice.fill(0.3);
                 assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 480, 0), S_OK);
             }
         });
@@ -2196,14 +2196,16 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 480, &mut ptr), S_OK);
                 let slice = std::slice::from_raw_parts_mut(ptr as *mut f32, 480 * 2);
-                slice.fill(0.5);
+                slice.fill(0.4);
                 assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 480, 0), S_OK);
             }
         });
         t1.join().unwrap();
         t2.join().unwrap();
 
-        // Drain all resampled 44.1 kHz mono packets: 8 * 480 frames @ 48 kHz = 80 ms -> 3528 frames @ 44.1 kHz.
+        // Drain all mixed + resampled 44.1 kHz mono packets: two simultaneous 40 ms streams
+        // (4 * 480 frames @ 48 kHz each) must mix on a shared 40 ms timeline -> 1764 frames
+        // @ 44.1 kHz (NOT 3528 concatenated frames), with combined amplitude 0.3 + 0.4 = 0.7.
         let mut total_frames = 0u32;
         let mut samples = Vec::new();
         loop {
@@ -2226,10 +2228,14 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
             assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; nf), S_OK);
         }
         assert_eq!(
-            total_frames, 3528,
-            "8 * 480 frames @ 48 kHz must resample cleanly to 3528 frames @ 44.1 kHz under concurrent producers"
+            total_frames, 1764,
+            "two simultaneous 40 ms streams @ 48 kHz must mix to 1764 frames @ 44.1 kHz (shared timeline)"
         );
-        assert!(samples.iter().all(|&v| (v - 0.5).abs() < 1e-4));
+        assert!(
+            samples.iter().all(|&v| (v - 0.7).abs() < 1e-4),
+            "mixed loopback amplitude must be 0.3 + 0.4 = 0.7, got {:?}",
+            &samples[..samples.len().min(8)]
+        );
 
         CoTaskMemFree(mix as P);
         assert_eq!(release(cc), 0);

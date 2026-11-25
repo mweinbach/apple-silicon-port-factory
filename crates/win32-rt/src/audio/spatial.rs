@@ -18,7 +18,9 @@
 //! when headless or `AW2_AUDIO_BACKEND=null`) while signaling the caller's
 //! Win32 `EventHandle` on each 480-frame (10 ms @ 48 kHz) audio quantum.
 
-use super::audioclient::push_loopback_frames;
+use super::audioclient::{
+    alloc_loopback_source_id, push_loopback_frames, unregister_loopback_source,
+};
 use super::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
 use super::com::*;
 use super::format::{SampleType, WaveFormat, WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT};
@@ -499,6 +501,7 @@ impl StreamState {
 
 pub struct SpatialStreamCore {
     ep: Arc<Endpoint>,
+    loopback_source_id: u64,
     session: Arc<SessionState>,
     channel_volumes: Mutex<[f32; 2]>,
     shared: Arc<StreamShared>,
@@ -521,6 +524,7 @@ unsafe fn guest_unknown_call(obj: *mut c_void, slot: usize) -> u32 {
 impl Drop for SpatialStreamCore {
     fn drop(&mut self) {
         self.ctrl.stop();
+        unregister_loopback_source(&self.ep.id, self.loopback_source_id);
         if self.notify_object != 0 {
             unsafe {
                 guest_unknown_call(self.notify_object as *mut c_void, 2);
@@ -1215,7 +1219,7 @@ mod render_stream {
                 pair[1] = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             }
             core.shared.ring.push(mix_buf);
-            push_loopback_frames(&core.ep.id, mix_buf, SPATIAL_SAMPLE_RATE, 2);
+            push_loopback_frames(&core.ep.id, core.loopback_source_id, mix_buf, SPATIAL_SAMPLE_RATE, 2);
             last_mixed.clear();
             last_mixed.extend_from_slice(mix_buf);
             *quanta_mixed += 1;
@@ -1561,6 +1565,7 @@ mod client {
         let out_kind = out.kind;
         let core = Arc::new(SpatialStreamCore {
             ep: inner.ep.clone(),
+            loopback_source_id: alloc_loopback_source_id(),
             session: SessionState::new(inner.ep.clone()),
             channel_volumes: Mutex::new([1.0, 1.0]),
             shared,
