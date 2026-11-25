@@ -733,12 +733,23 @@ fn snapshot_mouse() -> GameInputMouseState {
 // ---------------------------------------------------------------------------
 
 const READING_HISTORY_CAP: usize = 128;
+const DEVICE_RING_COUNT: usize = 2 + xinput1_4::XUSER_MAX_COUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceKind {
     Keyboard,
     Mouse,
     Gamepad(usize),
+}
+
+impl DeviceKind {
+    fn index(self) -> usize {
+        match self {
+            DeviceKind::Keyboard => 0,
+            DeviceKind::Mouse => 1,
+            DeviceKind::Gamepad(slot) => 2 + slot,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -772,7 +783,10 @@ struct CallbackEntry {
 }
 
 struct RuntimeState {
-    history: VecDeque<ReadingSnapshot>,
+    /// Per-device chronological reading history rings (Keyboard, Mouse, Gamepad 0..3)
+    /// so noisy activity on one device (e.g. high-rate mouse movement) never evicts
+    /// the active readings of quiet devices.
+    histories: [VecDeque<ReadingSnapshot>; DEVICE_RING_COUNT],
     next_history_id: u64,
     seq_gamepad: [u64; xinput1_4::XUSER_MAX_COUNT],
     seq_keyboard: u64,
@@ -785,7 +799,7 @@ struct RuntimeState {
 impl RuntimeState {
     fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(READING_HISTORY_CAP),
+            histories: std::array::from_fn(|_| VecDeque::with_capacity(READING_HISTORY_CAP)),
             next_history_id: 0,
             seq_gamepad: [0; xinput1_4::XUSER_MAX_COUNT],
             seq_keyboard: 0,
@@ -794,6 +808,14 @@ impl RuntimeState {
             callbacks: HashMap::new(),
             focus_policy: 0,
         }
+    }
+
+    fn ring(&self, device_kind: DeviceKind) -> &VecDeque<ReadingSnapshot> {
+        &self.histories[device_kind.index()]
+    }
+
+    fn ring_mut(&mut self, device_kind: DeviceKind) -> &mut VecDeque<ReadingSnapshot> {
+        &mut self.histories[device_kind.index()]
     }
 
     fn next_seq(&mut self, device_kind: DeviceKind) -> u64 {
@@ -830,10 +852,10 @@ impl RuntimeState {
         timestamp_us: u64,
     ) -> ReadingSnapshot {
         if let Some(latest) = self
-            .history
+            .ring(device_kind)
             .iter()
             .rev()
-            .find(|e| e.device_kind == device_kind && e.input_kind == input_kind)
+            .find(|e| e.input_kind == input_kind)
         {
             if latest.payload == payload {
                 return latest.clone();
@@ -868,10 +890,11 @@ impl RuntimeState {
             device_kind,
             payload,
         };
-        if self.history.len() >= READING_HISTORY_CAP {
-            self.history.pop_front();
+        let ring = self.ring_mut(device_kind);
+        if ring.len() >= READING_HISTORY_CAP {
+            ring.pop_front();
         }
-        self.history.push_back(snap.clone());
+        ring.push_back(snap.clone());
         snap
     }
 
@@ -1960,18 +1983,31 @@ unsafe extern "win64" fn gi_get_next_reading(
         }
     };
     let ref_id = (*ref_reading).snapshot.history_id;
+    let ref_dev = (*ref_reading).snapshot.device_kind;
 
     {
         let st = runtime_state().lock().unwrap();
-        if let Some(found) = st.history.iter().find(|e| {
-            e.history_id > ref_id
-                && kind_matches_filter(e.input_kind, input_kind)
-                && device_filter.map_or(true, |dk| e.device_kind == dk)
-        }) {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+        let found = match device_filter {
+            Some(dk) => st
+                .ring(dk)
+                .iter()
+                .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+                .cloned(),
+            None => st
+                .histories
+                .iter()
+                .filter_map(|ring| {
+                    ring.iter()
+                        .find(|e| e.history_id > ref_id && kind_matches_filter(e.input_kind, input_kind))
+                })
+                .min_by_key(|e| e.history_id)
+                .cloned(),
+        };
+        if let Some(snap) = found {
+            std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
             return S_OK;
         }
-        if let Some(oldest) = st.history.front() {
+        if let Some(oldest) = st.ring(ref_dev).front() {
             if ref_id < oldest.history_id {
                 return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
             }
@@ -1982,10 +2018,10 @@ unsafe extern "win64" fn gi_get_next_reading(
     if let Some((dev_kind, actual_kind, live_payload)) = poll_matching_live(input_kind, device_filter) {
         let mut st = runtime_state().lock().unwrap();
         let unchanged = st
-            .history
+            .ring(dev_kind)
             .iter()
             .rev()
-            .find(|e| e.device_kind == dev_kind && e.input_kind == actual_kind)
+            .find(|e| e.input_kind == actual_kind)
             .is_some_and(|latest| latest.payload == live_payload);
         if !unchanged {
             let snap = st.push_snapshot(dev_kind, actual_kind, live_payload);
@@ -2021,17 +2057,32 @@ unsafe extern "win64" fn gi_get_previous_reading(
         }
     };
     let ref_id = (*ref_reading).snapshot.history_id;
+    let ref_dev = (*ref_reading).snapshot.device_kind;
 
     let st = runtime_state().lock().unwrap();
-    if let Some(found) = st.history.iter().rev().find(|e| {
-        e.history_id < ref_id
-            && kind_matches_filter(e.input_kind, input_kind)
-            && device_filter.map_or(true, |dk| e.device_kind == dk)
-    }) {
-        std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+    let found = match device_filter {
+        Some(dk) => st
+            .ring(dk)
+            .iter()
+            .rev()
+            .find(|e| e.history_id < ref_id && kind_matches_filter(e.input_kind, input_kind))
+            .cloned(),
+        None => st
+            .histories
+            .iter()
+            .filter_map(|ring| {
+                ring.iter()
+                    .rev()
+                    .find(|e| e.history_id < ref_id && kind_matches_filter(e.input_kind, input_kind))
+            })
+            .max_by_key(|e| e.history_id)
+            .cloned(),
+    };
+    if let Some(snap) = found {
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
         return S_OK;
     }
-    if let Some(oldest) = st.history.front() {
+    if let Some(oldest) = st.ring(ref_dev).front() {
         if ref_id < oldest.history_id {
             return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
         }
@@ -2057,15 +2108,15 @@ unsafe extern "win64" fn gi_get_temporal_reading(
         return GAMEINPUT_E_READING_NOT_FOUND;
     };
 
-    // Search the device's chronological history for the latest reading active at
-    // `timestamp` (`timestamp_us <= timestamp`). Initial connect/init readings and
-    // input transitions are all recorded directly in `history` at event time.
+    // Search the device's own chronological history ring for the latest reading active at
+    // `timestamp` (`timestamp_us <= timestamp`). Each device keeps its own bounded ring so
+    // high-rate activity on another device (e.g. mouse movement) never evicts quiet devices.
     let st = runtime_state().lock().unwrap();
     if let Some(found) = st
-        .history
+        .ring(dev_kind)
         .iter()
         .rev()
-        .find(|e| e.device_kind == dev_kind && e.timestamp_us <= timestamp)
+        .find(|e| e.timestamp_us <= timestamp)
     {
         std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
         return S_OK;
@@ -2457,7 +2508,9 @@ mod tests {
         MOUSE_WHEEL_Y.store(0, Ordering::Relaxed);
         GAMEINPUT_ACTIVE.store(false, Ordering::Release);
         let mut st = runtime_state().lock().unwrap();
-        st.history.clear();
+        for ring in &mut st.histories {
+            ring.clear();
+        }
         st.next_history_id = 0;
         st.seq_gamepad = [0; xinput1_4::XUSER_MAX_COUNT];
         st.seq_keyboard = 0;
@@ -3221,6 +3274,18 @@ mod tests {
             let mut ms_held = GameInputMouseState::default();
             assert_eq!(rd_get_mouse_state(out, &mut ms_held), 1);
             assert_ne!(ms_held.buttons & GAME_INPUT_MOUSE_LEFT_BUTTON, 0);
+            assert_eq!(rd_release(out), 0);
+
+            // >128 mouse state transitions must NOT evict quiet keyboard or gamepad readings.
+            for step in 0..(READING_HISTORY_CAP + 32) as i64 {
+                record_mouse_wheel(0, 1 + (step & 1));
+            }
+            let t_after_mouse_flood = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_mouse_flood, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_X, "quiet gamepad reading must survive mouse flood");
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_mouse_flood, kdev, &mut out), S_OK);
             assert_eq!(rd_release(out), 0);
 
             assert_eq!(gi_release(gi), 0);
