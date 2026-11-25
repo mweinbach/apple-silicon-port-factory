@@ -924,134 +924,8 @@ fn query_power_event_interrupt_100ns(
     0
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct PowerActionPolicy {
-    action: u32,
-    flags: u32,
-    event_code: u32,
-}
-const _: () = assert!(std::mem::size_of::<PowerActionPolicy>() == 12);
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SystemPowerLevel {
-    enable: u8,
-    spare: [u8; 3],
-    battery_level: u32,
-    power_policy: PowerActionPolicy,
-    min_system_state: u32,
-}
-const _: () = assert!(std::mem::size_of::<SystemPowerLevel>() == 24);
-
-/// Windows x64 `SYSTEM_POWER_POLICY` (`winnt.h`, 232 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct SystemPowerPolicy {
-    revision: u32,
-    power_button: PowerActionPolicy,
-    sleep_button: PowerActionPolicy,
-    lid_close: PowerActionPolicy,
-    lid_open_wake: u32,
-    reserved: u32,
-    idle: PowerActionPolicy,
-    idle_timeout: u32,
-    idle_sensitivity: u8,
-    dynamic_throttle: u8,
-    spare2: [u8; 2],
-    min_sleep: u32,
-    max_sleep: u32,
-    reduced_latency_sleep: u32,
-    win_logon_flags: u32,
-    spare3: u32,
-    doze_s4_timeout: u32,
-    broadcast_capacity_resolution: u32,
-    discharge_policy: [SystemPowerLevel; 4],
-    video_timeout: u32,
-    video_dim_display: u8,
-    video_reserved: [u32; 3],
-    spindown_timeout: u32,
-    optimize_for_power: u8,
-    fan_throttle_tolerance: u8,
-    forced_throttle: u8,
-    min_throttle: u8,
-    over_throttled: PowerActionPolicy,
-}
-const _: () = {
-    assert!(std::mem::size_of::<SystemPowerPolicy>() == 232);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, revision) == 0);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, idle_timeout) == 60);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, idle_sensitivity) == 64);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, dynamic_throttle) == 65);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, min_sleep) == 68);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, max_sleep) == 72);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, discharge_policy) == 96);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, video_timeout) == 192);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, video_dim_display) == 196);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, video_reserved) == 200);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, spindown_timeout) == 212);
-    assert!(std::mem::offset_of!(SystemPowerPolicy, over_throttled) == 220);
-};
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ProcessorPowerPolicyInfo {
-    time_check: u32,
-    demote_limit: u32,
-    promote_limit: u32,
-    demote_percent: u8,
-    promote_percent: u8,
-    spare: [u8; 2],
-    flags: u32,
-}
-const _: () = assert!(std::mem::size_of::<ProcessorPowerPolicyInfo>() == 20);
-
-/// Windows x64 `PROCESSOR_POWER_POLICY` (`winnt.h`, 76 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct ProcessorPowerPolicy {
-    revision: u32,
-    dynamic_throttle: u8,
-    spare: [u8; 3],
-    flags: u32,
-    policy_count: u32,
-    policy: [ProcessorPowerPolicyInfo; 3],
-}
-const _: () = {
-    assert!(std::mem::size_of::<ProcessorPowerPolicy>() == 76);
-    assert!(std::mem::offset_of!(ProcessorPowerPolicy, revision) == 0);
-    assert!(std::mem::offset_of!(ProcessorPowerPolicy, dynamic_throttle) == 4);
-    assert!(std::mem::offset_of!(ProcessorPowerPolicy, policy_count) == 12);
-    assert!(std::mem::offset_of!(ProcessorPowerPolicy, policy) == 16);
-};
-
-fn fill_default_system_power_policy(buf: *mut u8) {
-    let policy = SystemPowerPolicy {
-        revision: 1,
-        idle_timeout: 300,      // 300s
-        idle_sensitivity: 50,   // 50%
-        dynamic_throttle: 2,    // PO_THROTTLE_ADAPTIVE
-        min_sleep: 2,           // PowerSystemSleeping1
-        max_sleep: 4,           // PowerSystemSleeping3
-        video_timeout: 600,     // 600s
-        spindown_timeout: 1200, // 1200s
-        ..Default::default()
-    };
-    unsafe {
-        std::ptr::write_unaligned(buf as *mut SystemPowerPolicy, policy);
-    }
-}
-
-fn fill_default_processor_power_policy(buf: *mut u8) {
-    let policy = ProcessorPowerPolicy {
-        revision: 1,
-        dynamic_throttle: 2, // PO_THROTTLE_ADAPTIVE
-        ..Default::default()
-    };
-    unsafe {
-        std::ptr::write_unaligned(buf as *mut ProcessorPowerPolicy, policy);
-    }
-}
+const SYSTEM_POWER_POLICY_SIZE: u32 = 232;
+const PROCESSOR_POWER_POLICY_SIZE: u32 = 76;
 
 pub unsafe extern "win64" fn CallNtPowerInformation(
     info_level: u32,
@@ -1063,7 +937,7 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
     match info_level {
         SYSTEM_POWER_POLICY_AC | SYSTEM_POWER_POLICY_DC => {
             if !in_buf.is_null() || in_len != 0 {
-                if in_buf.is_null() || in_len < 232 {
+                if in_buf.is_null() || in_len < SYSTEM_POWER_POLICY_SIZE {
                     return STATUS_INVALID_PARAMETER;
                 }
                 log::warn!(
@@ -1071,30 +945,32 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
                 );
                 return STATUS_ACCESS_DENIED;
             }
-            if out_buf.is_null() || out_len < 232 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            fill_default_system_power_policy(out_buf as *mut u8);
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerPolicy level={info_level}) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         SYSTEM_POWER_POLICY_CURRENT => {
             if !in_buf.is_null() || in_len != 0 {
                 return STATUS_INVALID_PARAMETER;
             }
-            if out_buf.is_null() || out_len < 232 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            fill_default_system_power_policy(out_buf as *mut u8);
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(SystemPowerPolicyCurrent) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         VERIFY_SYSTEM_POLICY_AC | VERIFY_SYSTEM_POLICY_DC => {
-            if in_buf.is_null() || in_len < 232 {
+            if in_buf.is_null() || in_len < SYSTEM_POWER_POLICY_SIZE {
                 return STATUS_INVALID_PARAMETER;
             }
-            if out_buf.is_null() || out_len < 232 {
+            if out_buf.is_null() || out_len < SYSTEM_POWER_POLICY_SIZE {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            std::ptr::copy_nonoverlapping(in_buf as *const u8, out_buf as *mut u8, 232);
+            std::ptr::copy_nonoverlapping(
+                in_buf as *const u8,
+                out_buf as *mut u8,
+                SYSTEM_POWER_POLICY_SIZE as usize,
+            );
             STATUS_SUCCESS
         }
         SYSTEM_POWER_CAPABILITIES => {
@@ -1177,7 +1053,7 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
         }
         PROCESSOR_POWER_POLICY_AC | PROCESSOR_POWER_POLICY_DC => {
             if !in_buf.is_null() || in_len != 0 {
-                if in_buf.is_null() || in_len < 76 {
+                if in_buf.is_null() || in_len < PROCESSOR_POWER_POLICY_SIZE {
                     return STATUS_INVALID_PARAMETER;
                 }
                 log::warn!(
@@ -1185,30 +1061,32 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
                 );
                 return STATUS_ACCESS_DENIED;
             }
-            if out_buf.is_null() || out_len < 76 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            fill_default_processor_power_policy(out_buf as *mut u8);
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(ProcessorPowerPolicy level={info_level}) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         PROCESSOR_POWER_POLICY_CURRENT => {
             if !in_buf.is_null() || in_len != 0 {
                 return STATUS_INVALID_PARAMETER;
             }
-            if out_buf.is_null() || out_len < 76 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            fill_default_processor_power_policy(out_buf as *mut u8);
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(ProcessorPowerPolicyCurrent) read is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         VERIFY_PROCESSOR_POLICY_AC | VERIFY_PROCESSOR_POLICY_DC => {
-            if in_buf.is_null() || in_len < 76 {
+            if in_buf.is_null() || in_len < PROCESSOR_POWER_POLICY_SIZE {
                 return STATUS_INVALID_PARAMETER;
             }
-            if out_buf.is_null() || out_len < 76 {
+            if out_buf.is_null() || out_len < PROCESSOR_POWER_POLICY_SIZE {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            std::ptr::copy_nonoverlapping(in_buf as *const u8, out_buf as *mut u8, 76);
+            std::ptr::copy_nonoverlapping(
+                in_buf as *const u8,
+                out_buf as *mut u8,
+                PROCESSOR_POWER_POLICY_SIZE as usize,
+            );
             STATUS_SUCCESS
         }
         SYSTEM_WAKE_SOURCE | SYSTEM_HIBER_FILE_SIZE | SYSTEM_HIBER_FILE_INFORMATION => {
@@ -1719,27 +1597,22 @@ mod tests {
     #[test]
     fn call_nt_power_information_levels_and_callback_notifications() {
         unsafe {
-            // 1. Additional CallNtPowerInformation levels
-            let mut pol = [0u8; 232];
-            assert_eq!(
-                CallNtPowerInformation(
-                    SYSTEM_POWER_POLICY_CURRENT,
-                    std::ptr::null(),
-                    0,
-                    pol.as_mut_ptr() as *mut c_void,
-                    pol.len() as u32,
-                ),
-                STATUS_SUCCESS
-            );
-            assert_eq!(u32::from_le_bytes(pol[0..4].try_into().unwrap()), 1); // Revision == 1
-            assert_eq!(u32::from_le_bytes(pol[60..64].try_into().unwrap()), 300); // IdleTimeout
-            assert_eq!(pol[64], 50); // IdleSensitivity
-            assert_eq!(pol[65], 2); // DynamicThrottle
-            assert_eq!(u32::from_le_bytes(pol[68..72].try_into().unwrap()), 2); // MinSleep
-            assert_eq!(u32::from_le_bytes(pol[72..76].try_into().unwrap()), 4); // MaxSleep
-            assert!(pol[96..192].iter().all(|&b| b == 0), "DischargePolicy[4] must remain zeroed");
-            assert_eq!(u32::from_le_bytes(pol[192..196].try_into().unwrap()), 600); // VideoTimeout
-            assert_eq!(u32::from_le_bytes(pol[212..216].try_into().unwrap()), 1200); // SpindownTimeout
+            // 1. Additional CallNtPowerInformation levels: policy reads must report
+            //    STATUS_NOT_IMPLEMENTED honestly instead of fabricating default timeouts.
+            for lvl in [SYSTEM_POWER_POLICY_AC, SYSTEM_POWER_POLICY_DC, SYSTEM_POWER_POLICY_CURRENT] {
+                let mut pol = [0xCCu8; 232];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        pol.as_mut_ptr() as *mut c_void,
+                        pol.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(pol.iter().all(|&b| b == 0xCC), "unsupported system power policy read must not invent values");
+            }
 
             let mut spi = [0xAAu8; 16];
             assert_eq!(
@@ -1789,18 +1662,27 @@ mod tests {
             );
             assert_eq!(calendar_timeval_to_interrupt_100ns(0, 0, 17_000_000_650_000_000, 1_000_000_000), 0);
 
-            let mut ppol = [0u8; 76];
-            assert_eq!(
-                CallNtPowerInformation(
-                    PROCESSOR_POWER_POLICY_CURRENT,
-                    std::ptr::null(),
-                    0,
-                    ppol.as_mut_ptr() as *mut c_void,
-                    ppol.len() as u32,
-                ),
-                STATUS_SUCCESS
-            );
-            assert_eq!(u32::from_le_bytes(ppol[0..4].try_into().unwrap()), 1);
+            for lvl in [
+                PROCESSOR_POWER_POLICY_AC,
+                PROCESSOR_POWER_POLICY_DC,
+                PROCESSOR_POWER_POLICY_CURRENT,
+            ] {
+                let mut ppol = [0xDDu8; 76];
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        ppol.as_mut_ptr() as *mut c_void,
+                        ppol.len() as u32,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert!(
+                    ppol.iter().all(|&b| b == 0xDD),
+                    "unsupported processor power policy read must not invent values"
+                );
+            }
 
             // Policy write attempts must NOT echo unapplied policies back as STATUS_SUCCESS:
             // AC/DC policy updates require host OS privileges (STATUS_ACCESS_DENIED), undersized

@@ -386,7 +386,7 @@ fn with_slot<R>(user: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot0Transition {
     None,
-    Connected(Option<Gamepad>),
+    Connected(Gamepad),
     Disconnected,
     StateChanged(Gamepad),
 }
@@ -395,10 +395,7 @@ fn emit_slot0_transition(transition: Slot0Transition) {
     match transition {
         Slot0Transition::None => {}
         Slot0Transition::Connected(initial_pad) => {
-            crate::misc::gameinput::on_gamepad_connected(0);
-            if let Some(pad) = initial_pad {
-                crate::misc::gameinput::on_gamepad_state_changed(0, &pad);
-            }
+            crate::misc::gameinput::on_gamepad_connected(0, &initial_pad);
         }
         Slot0Transition::Disconnected => {
             crate::misc::gameinput::on_gamepad_disconnected(0);
@@ -438,7 +435,7 @@ fn sync_slot0_keystrokes(
                 diff_gamepad_keystrokes(0, prev, next_pad, now, keystrokes, held_vks);
             }
             if !prev_connected {
-                Slot0Transition::Connected((next_pad != Gamepad::default()).then_some(next_pad))
+                Slot0Transition::Connected(next_pad)
             } else if prev_pad != next_pad {
                 Slot0Transition::StateChanged(next_pad)
             } else {
@@ -487,7 +484,7 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
             let prev_pad = s.pad;
             *s = Slot { connected: true, info, packet: s.packet.wrapping_add(1), ..Default::default() };
             if !was_connected {
-                Slot0Transition::Connected(None)
+                Slot0Transition::Connected(Gamepad::default())
             } else if prev_pad != Gamepad::default() {
                 Slot0Transition::StateChanged(Gamepad::default())
             } else {
@@ -503,8 +500,12 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
         emit_slot0_transition(transition);
     } else {
         match transition {
-            Slot0Transition::Connected(_) => crate::misc::gameinput::on_gamepad_connected(user),
-            Slot0Transition::StateChanged(pad) => crate::misc::gameinput::on_gamepad_state_changed(user, &pad),
+            Slot0Transition::Connected(initial_pad) => {
+                crate::misc::gameinput::on_gamepad_connected(user, &initial_pad);
+            }
+            Slot0Transition::StateChanged(pad) => {
+                crate::misc::gameinput::on_gamepad_state_changed(user, &pad);
+            }
             Slot0Transition::Disconnected | Slot0Transition::None => {}
         }
     }

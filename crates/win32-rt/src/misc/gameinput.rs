@@ -487,22 +487,24 @@ pub fn record_mouse_wheel(dx: i64, dy: i64) {
 
 static GAMEINPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Record a gamepad connection timestamp so `GetTemporalReading` can resolve
-/// the connected device's baseline state at `GetCurrentTimestamp()` without
-/// injecting a synthetic transition ahead of the first real input event.
-pub(crate) fn on_gamepad_connected(slot: usize) {
+/// Capture a gamepad's initial reading at connection time so historical
+/// `GetTemporalReading(t0, ...)` lookups succeed even if input transitions arrive
+/// before the caller's first reading query.
+pub(crate) fn on_gamepad_connected(slot: usize, initial_pad: &xinput1_4::Gamepad) {
     if slot >= xinput1_4::XUSER_MAX_COUNT {
         return;
     }
     let ts = current_timestamp_us();
-    runtime_state().lock().unwrap().connected_at_gamepad[slot] = Some(ts);
+    let payload = ReadingPayload::Gamepad(xinput_to_gamepad_state(initial_pad));
+    let mut st = runtime_state().lock().unwrap();
+    st.set_baseline(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload, ts);
 }
 
 pub(crate) fn on_gamepad_disconnected(slot: usize) {
     if slot >= xinput1_4::XUSER_MAX_COUNT {
         return;
     }
-    runtime_state().lock().unwrap().connected_at_gamepad[slot] = None;
+    runtime_state().lock().unwrap().clear_baseline(DeviceKind::Gamepad(slot));
 }
 
 /// Record a gamepad input transition with its event timestamp immediately when
@@ -515,8 +517,8 @@ pub(crate) fn on_gamepad_state_changed(slot: usize, pad: &xinput1_4::Gamepad) {
     let ts = current_timestamp_us();
     let payload = ReadingPayload::Gamepad(xinput_to_gamepad_state(pad));
     let mut st = runtime_state().lock().unwrap();
-    if st.connected_at_gamepad[slot].is_none() {
-        st.connected_at_gamepad[slot] = Some(ts);
+    if st.baseline(DeviceKind::Gamepad(slot)).is_none() {
+        st.set_baseline(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload.clone(), ts);
     }
     let _ = st.record_or_reuse_at(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload, ts);
 }
@@ -781,9 +783,9 @@ struct RuntimeState {
     seq_gamepad: [u64; xinput1_4::XUSER_MAX_COUNT],
     seq_keyboard: u64,
     seq_mouse: u64,
-    connected_at_gamepad: [Option<u64>; xinput1_4::XUSER_MAX_COUNT],
-    connected_at_keyboard: Option<u64>,
-    connected_at_mouse: Option<u64>,
+    baseline_gamepad: [Option<ReadingSnapshot>; xinput1_4::XUSER_MAX_COUNT],
+    baseline_keyboard: Option<ReadingSnapshot>,
+    baseline_mouse: Option<ReadingSnapshot>,
     next_callback_token: u64,
     callbacks: HashMap<u64, CallbackEntry>,
     focus_policy: u32,
@@ -797,20 +799,76 @@ impl RuntimeState {
             seq_gamepad: [0; xinput1_4::XUSER_MAX_COUNT],
             seq_keyboard: 0,
             seq_mouse: 0,
-            connected_at_gamepad: [None; xinput1_4::XUSER_MAX_COUNT],
-            connected_at_keyboard: None,
-            connected_at_mouse: None,
+            baseline_gamepad: std::array::from_fn(|_| None),
+            baseline_keyboard: None,
+            baseline_mouse: None,
             next_callback_token: 1,
             callbacks: HashMap::new(),
             focus_policy: 0,
         }
     }
 
-    fn connected_at(&self, device_kind: DeviceKind) -> Option<u64> {
+    fn next_seq(&mut self, device_kind: DeviceKind) -> u64 {
         match device_kind {
-            DeviceKind::Keyboard => self.connected_at_keyboard,
-            DeviceKind::Mouse => self.connected_at_mouse,
-            DeviceKind::Gamepad(slot) => self.connected_at_gamepad.get(slot).copied().flatten(),
+            DeviceKind::Keyboard => {
+                self.seq_keyboard = self.seq_keyboard.wrapping_add(1).max(1);
+                self.seq_keyboard
+            }
+            DeviceKind::Mouse => {
+                self.seq_mouse = self.seq_mouse.wrapping_add(1).max(1);
+                self.seq_mouse
+            }
+            DeviceKind::Gamepad(slot) => {
+                self.seq_gamepad[slot] = self.seq_gamepad[slot].wrapping_add(1).max(1);
+                self.seq_gamepad[slot]
+            }
+        }
+    }
+
+    fn baseline(&self, device_kind: DeviceKind) -> Option<&ReadingSnapshot> {
+        match device_kind {
+            DeviceKind::Keyboard => self.baseline_keyboard.as_ref(),
+            DeviceKind::Mouse => self.baseline_mouse.as_ref(),
+            DeviceKind::Gamepad(slot) => self.baseline_gamepad.get(slot).and_then(|b| b.as_ref()),
+        }
+    }
+
+    fn set_baseline(
+        &mut self,
+        device_kind: DeviceKind,
+        input_kind: u32,
+        payload: ReadingPayload,
+        timestamp_us: u64,
+    ) {
+        let seq = self.next_seq(device_kind);
+        let snap = ReadingSnapshot {
+            history_id: 0,
+            sequence_number: seq,
+            timestamp_us,
+            input_kind,
+            device_kind,
+            payload,
+        };
+        match device_kind {
+            DeviceKind::Keyboard => self.baseline_keyboard = Some(snap),
+            DeviceKind::Mouse => self.baseline_mouse = Some(snap),
+            DeviceKind::Gamepad(slot) => {
+                if let Some(entry) = self.baseline_gamepad.get_mut(slot) {
+                    *entry = Some(snap);
+                }
+            }
+        }
+    }
+
+    fn clear_baseline(&mut self, device_kind: DeviceKind) {
+        match device_kind {
+            DeviceKind::Keyboard => self.baseline_keyboard = None,
+            DeviceKind::Mouse => self.baseline_mouse = None,
+            DeviceKind::Gamepad(slot) => {
+                if let Some(entry) = self.baseline_gamepad.get_mut(slot) {
+                    *entry = None;
+                }
+            }
         }
     }
 
@@ -860,20 +918,7 @@ impl RuntimeState {
         timestamp_us: u64,
     ) -> ReadingSnapshot {
         self.next_history_id = self.next_history_id.wrapping_add(1).max(1);
-        let seq = match device_kind {
-            DeviceKind::Keyboard => {
-                self.seq_keyboard = self.seq_keyboard.wrapping_add(1).max(1);
-                self.seq_keyboard
-            }
-            DeviceKind::Mouse => {
-                self.seq_mouse = self.seq_mouse.wrapping_add(1).max(1);
-                self.seq_mouse
-            }
-            DeviceKind::Gamepad(slot) => {
-                self.seq_gamepad[slot] = self.seq_gamepad[slot].wrapping_add(1).max(1);
-                self.seq_gamepad[slot]
-            }
-        };
+        let seq = self.next_seq(device_kind);
         let snap = ReadingSnapshot {
             history_id: self.next_history_id,
             sequence_number: seq,
@@ -883,7 +928,9 @@ impl RuntimeState {
             payload,
         };
         if self.history.len() >= READING_HISTORY_CAP {
-            self.history.pop_front();
+            if let Some(evicted) = self.history.pop_front() {
+                self.clear_baseline(evicted.device_kind);
+            }
         }
         self.history.push_back(snap.clone());
         snap
@@ -1985,9 +2032,11 @@ unsafe extern "win64" fn gi_get_next_reading(
             std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
             return S_OK;
         }
-        if let Some(oldest) = st.history.front() {
-            if ref_id < oldest.history_id {
-                return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+        if ref_id != 0 {
+            if let Some(oldest) = st.history.front() {
+                if ref_id < oldest.history_id {
+                    return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+                }
             }
         }
     }
@@ -1995,12 +2044,14 @@ unsafe extern "win64" fn gi_get_next_reading(
     // At the newest boundary: check once if live input changed since the latest recorded snapshot.
     if let Some((dev_kind, actual_kind, live_payload)) = poll_matching_live(input_kind, device_filter) {
         let mut st = runtime_state().lock().unwrap();
-        let unchanged = st
+        let latest_payload = st
             .history
             .iter()
             .rev()
             .find(|e| e.device_kind == dev_kind && e.input_kind == actual_kind)
-            .is_some_and(|latest| latest.payload == live_payload);
+            .map(|e| &e.payload)
+            .or_else(|| st.baseline(dev_kind).map(|b| &b.payload));
+        let unchanged = latest_payload.is_some_and(|p| *p == live_payload);
         if !unchanged {
             let snap = st.push_snapshot(dev_kind, actual_kind, live_payload);
             if snap.history_id > ref_id {
@@ -2045,9 +2096,11 @@ unsafe extern "win64" fn gi_get_previous_reading(
         std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
         return S_OK;
     }
-    if let Some(oldest) = st.history.front() {
-        if ref_id < oldest.history_id {
-            return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+    if ref_id != 0 {
+        if let Some(oldest) = st.history.front() {
+            if ref_id < oldest.history_id {
+                return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+            }
         }
     }
     GAMEINPUT_E_READING_NOT_FOUND
@@ -2074,49 +2127,24 @@ unsafe extern "win64" fn gi_get_temporal_reading(
     // Search the device's recorded history for the reading active at `timestamp`
     // (the latest reading with `timestamp_us <= timestamp`). Input transitions are
     // stamped when the backend receives them (`on_gamepad_state_changed`,
-    // `on_keyboard_changed`, `on_mouse_changed`), so normal `GetCurrentTimestamp()`
-    // -> `GetTemporalReading()` calls observe them without any future offset.
-    let mut baseline_ts: Option<u64> = None;
-    {
-        let st = runtime_state().lock().unwrap();
-        let mut any_for_dev = false;
-        let mut best: Option<&ReadingSnapshot> = None;
-        for entry in st.history.iter().filter(|e| e.device_kind == dev_kind) {
-            any_for_dev = true;
-            if entry.timestamp_us <= timestamp {
-                best = Some(entry);
-            }
-        }
-        if let Some(found) = best {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
-            return S_OK;
-        }
-        if !any_for_dev {
-            if let Some(conn_ts) = st.connected_at(dev_kind) {
-                if conn_ts <= timestamp {
-                    baseline_ts = Some(conn_ts);
-                }
-            }
+    // `on_keyboard_changed`, `on_mouse_changed`), and each connected device's initial
+    // baseline state is captured at connection/initialization time, so historical
+    // queries never depend on an earlier polling call.
+    let st = runtime_state().lock().unwrap();
+    let mut best: Option<&ReadingSnapshot> = None;
+    for entry in st.history.iter().filter(|e| e.device_kind == dev_kind) {
+        if entry.timestamp_us <= timestamp {
+            best = Some(entry);
         }
     }
-
-    // Connected device with no transitions recorded yet: seed its baseline reading
-    // at its connection/init timestamp (already <= `timestamp`).
-    if let Some(conn_ts) = baseline_ts {
-        let kind_for_dev = match dev_kind {
-            DeviceKind::Keyboard => GAME_INPUT_KIND_KEYBOARD,
-            DeviceKind::Mouse => GAME_INPUT_KIND_MOUSE,
-            DeviceKind::Gamepad(_) => GAME_INPUT_KIND_GAMEPAD,
-        };
-        if let Some((dk, actual_kind, payload)) = poll_matching_live(kind_for_dev, Some(dev_kind)) {
-            let snap = runtime_state()
-                .lock()
-                .unwrap()
-                .record_or_reuse_at(dk, actual_kind, payload, conn_ts);
-            if snap.timestamp_us <= timestamp {
-                std::ptr::write_unaligned(reading_out, ReadingObj::create(snap));
-                return S_OK;
-            }
+    if let Some(found) = best {
+        std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
+        return S_OK;
+    }
+    if let Some(base) = st.baseline(dev_kind) {
+        if base.timestamp_us <= timestamp {
+            std::ptr::write_unaligned(reading_out, ReadingObj::create(base.clone()));
+            return S_OK;
         }
     }
     GAMEINPUT_E_READING_NOT_FOUND
@@ -2444,17 +2472,47 @@ pub extern "win64" fn GameInputCreate(game_input_out: *mut usize) -> i32 {
     let _ = persistent_devices();
     GAMEINPUT_ACTIVE.store(true, Ordering::Release);
     let now = current_timestamp_us();
+    let kbd_snap = snapshot_keyboard();
+    let mouse_snap = snapshot_mouse();
+    let gamepad_snaps: [Option<GameInputGamepadState>; xinput1_4::XUSER_MAX_COUNT] =
+        std::array::from_fn(|slot| {
+            xinput1_4::slot_state(slot).map(|(pad, _)| xinput_to_gamepad_state(&pad))
+        });
     {
         let mut st = runtime_state().lock().unwrap();
-        if st.connected_at_keyboard.is_none() {
-            st.connected_at_keyboard = Some(now);
+        if st.baseline_keyboard.is_none() {
+            st.set_baseline(
+                DeviceKind::Keyboard,
+                GAME_INPUT_KIND_KEYBOARD,
+                ReadingPayload::Keyboard(kbd_snap),
+                now,
+            );
         }
-        if st.connected_at_mouse.is_none() {
-            st.connected_at_mouse = Some(now);
+        if st.baseline_mouse.is_none() {
+            st.set_baseline(
+                DeviceKind::Mouse,
+                GAME_INPUT_KIND_MOUSE,
+                ReadingPayload::Mouse(mouse_snap),
+                now,
+            );
         }
-        for slot in 0..xinput1_4::XUSER_MAX_COUNT {
-            if st.connected_at_gamepad[slot].is_none() && xinput1_4::slot_state(slot).is_some() {
-                st.connected_at_gamepad[slot] = Some(now);
+        for (slot, maybe_gp) in gamepad_snaps.into_iter().enumerate() {
+            if let Some(gp) = maybe_gp {
+                let payload = ReadingPayload::Gamepad(gp);
+                if st.baseline_gamepad[slot].is_none() {
+                    st.set_baseline(DeviceKind::Gamepad(slot), GAME_INPUT_KIND_GAMEPAD, payload, now);
+                } else if !st.history.iter().any(|e| e.device_kind == DeviceKind::Gamepad(slot))
+                    && st.baseline_gamepad[slot]
+                        .as_ref()
+                        .is_some_and(|b| b.payload != payload)
+                {
+                    let _ = st.push_snapshot_at(
+                        DeviceKind::Gamepad(slot),
+                        GAME_INPUT_KIND_GAMEPAD,
+                        payload,
+                        now,
+                    );
+                }
             }
         }
     }
@@ -2494,9 +2552,9 @@ mod tests {
         st.seq_gamepad = [0; xinput1_4::XUSER_MAX_COUNT];
         st.seq_keyboard = 0;
         st.seq_mouse = 0;
-        st.connected_at_gamepad = [None; xinput1_4::XUSER_MAX_COUNT];
-        st.connected_at_keyboard = None;
-        st.connected_at_mouse = None;
+        st.baseline_gamepad = std::array::from_fn(|_| None);
+        st.baseline_keyboard = None;
+        st.baseline_mouse = None;
         st.callbacks.clear();
     }
 
@@ -3110,20 +3168,38 @@ mod tests {
             // Timestamp before device existed -> GAMEINPUT_E_READING_NOT_FOUND.
             assert_eq!(gi_get_temporal_reading(gi, t_before_connect, dev0, &mut out), GAMEINPUT_E_READING_NOT_FOUND);
 
-            // Connected device with no prior GetCurrentReading: normal GetCurrentTimestamp() ->
-            // GetTemporalReading() sequence (no future offset) returns the baseline idle reading.
-            let t_idle = gi_get_current_timestamp(gi);
-            assert_eq!(gi_get_temporal_reading(gi, t_idle, dev0, &mut out), S_OK);
+            // Save t0 BEFORE any reading query, then press A without polling first.
+            // Historical lookup at t0 must still resolve the initial idle baseline captured
+            // at connection time (never returning GAMEINPUT_E_READING_NOT_FOUND).
+            let t0 = gi_get_current_timestamp(gi);
             let mut gs = GameInputGamepadState::default();
-            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
-            assert_eq!(gs.buttons, 0);
-            assert_eq!(rd_release(out), 0);
 
             // Input transitions recorded independently of GetCurrentReading must be returned by
             // exact GetCurrentTimestamp() -> GetTemporalReading() with zero future offset.
             std::thread::sleep(std::time::Duration::from_millis(2));
             xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
             let t1 = gi_get_current_timestamp(gi);
+            assert!(t1 > t0);
+
+            // First ever reading query is for t0 (pre-press) AFTER A was already pressed:
+            assert_eq!(gi_get_temporal_reading(gi, t0, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "baseline at t0 must remain queryable after later input transitions");
+            let mut prev_from_base: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_previous_reading(gi, out, GAME_INPUT_KIND_GAMEPAD, dev0, &mut prev_from_base),
+                GAMEINPUT_E_READING_NOT_FOUND
+            );
+            let mut next_from_base: *mut ReadingObj = std::ptr::null_mut();
+            assert_eq!(
+                gi_get_next_reading(gi, out, GAME_INPUT_KIND_GAMEPAD, dev0, &mut next_from_base),
+                S_OK
+            );
+            assert_eq!(rd_get_gamepad_state(next_from_base, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(next_from_base), 0);
+            assert_eq!(rd_release(out), 0);
+
             assert_eq!(gi_get_temporal_reading(gi, t1, dev0, &mut out), S_OK);
             assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
             assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
@@ -3158,7 +3234,8 @@ mod tests {
             assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_B);
             assert_eq!(rd_release(out), 0);
 
-            // Keyboard transition via user32::input -> exact GetCurrentTimestamp() -> GetTemporalReading().
+            // Keyboard transition via user32::input -> exact GetCurrentTimestamp() -> GetTemporalReading(),
+            // while historical lookup at t0 (before keypress) still resolves the initial baseline.
             crate::user32::input::native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
             let tk = gi_get_current_timestamp(gi);
             assert_eq!(gi_get_temporal_reading(gi, tk, kdev, &mut out), S_OK);
@@ -3167,6 +3244,13 @@ mod tests {
             assert!(
                 keys[..n_keys].iter().any(|k| k.virtual_key == b'A'),
                 "keyboard GetTemporalReading(GetCurrentTimestamp()) must include pressed 'A'"
+            );
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t0, kdev, &mut out), S_OK);
+            let n_base_keys = rd_get_key_state(out, keys.len() as u32, keys.as_mut_ptr()) as usize;
+            assert!(
+                !keys[..n_base_keys].iter().any(|k| k.virtual_key == b'A'),
+                "keyboard baseline at t0 must reflect pre-press state"
             );
             assert_eq!(rd_release(out), 0);
             crate::user32::input::native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
