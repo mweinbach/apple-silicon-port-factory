@@ -3,17 +3,18 @@
 
 use super::display;
 use super::{CursorState, NativeDesc, WindowShared};
-use crate::user32::cursor::Shape;
+use crate::user32::cursor::{CustomCursorImage, Shape};
 use crate::user32::window::{native_event, NativeEvent};
 use crate::user32::{ws, POINT, RECT};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSColor, NSCursor, NSEventMask,
-    NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSScreen, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
+    NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -50,6 +51,24 @@ extern "C" {
     fn CGWindowListCreateImage(bounds: CGRect, list_option: u32, window: u32, image_option: u32) -> *mut c_void;
     fn CGImageGetWidth(img: *mut c_void) -> usize;
     fn CGImageGetHeight(img: *mut c_void) -> usize;
+    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    fn CGColorSpaceRelease(cs: *mut c_void);
+    fn CGDataProviderCreateWithCFData(data: *const c_void) -> *mut c_void;
+    fn CGDataProviderRelease(provider: *mut c_void);
+    fn CGImageCreate(
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bits_per_pixel: usize,
+        bytes_per_row: usize,
+        space: *mut c_void,
+        bitmap_info: u32,
+        provider: *mut c_void,
+        decode: *const f64,
+        should_interpolate: bool,
+        intent: i32,
+    ) -> *mut c_void;
+    fn CGImageRelease(img: *mut c_void);
 }
 
 #[link(name = "ImageIO", kind = "framework")]
@@ -62,6 +81,7 @@ extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(p: *const c_void);
+    fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *const c_void;
     fn CFURLCreateFromFileSystemRepresentation(alloc: *const c_void, buf: *const u8, len: isize, is_dir: bool) -> *const c_void;
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, enc: u32) -> *const c_void;
 }
@@ -915,6 +935,54 @@ pub(super) fn refresh_cursor_for_client(inside: bool) {
     }
 }
 
+fn custom_ns_cursor(img: &CustomCursorImage) -> Option<Retained<NSCursor>> {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w == 0 || h == 0 || img.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+        return None;
+    }
+    unsafe {
+        let cf_data = CFDataCreate(std::ptr::null(), img.rgba.as_ptr(), (w * h * 4) as isize);
+        if cf_data.is_null() {
+            return None;
+        }
+        let provider = CGDataProviderCreateWithCFData(cf_data);
+        CFRelease(cf_data);
+        if provider.is_null() {
+            return None;
+        }
+        let cs = CGColorSpaceCreateDeviceRGB();
+        if cs.is_null() {
+            CGDataProviderRelease(provider);
+            return None;
+        }
+        // kCGBitmapByteOrderDefault (0) | kCGImageAlphaPremultipliedLast (1)
+        let cg_img = CGImageCreate(w, h, 8, 32, w * 4, cs, 1, provider, std::ptr::null(), false, 0);
+        CGColorSpaceRelease(cs);
+        CGDataProviderRelease(provider);
+        if cg_img.is_null() {
+            return None;
+        }
+        let size = NSSize::new(img.width as f64, img.height as f64);
+        let Some(cls) = objc2::runtime::AnyClass::get(c"NSImage") else {
+            CGImageRelease(cg_img);
+            return None;
+        };
+        let alloc: *mut AnyObject = msg_send![cls, alloc];
+        let ns_img_raw: *mut AnyObject = msg_send![alloc, initWithCGImage: cg_img, size: size];
+        CGImageRelease(cg_img);
+        if ns_img_raw.is_null() {
+            return None;
+        }
+        let ns_img = Retained::<NSImage>::from_raw(ns_img_raw.cast())?;
+        let hot = NSPoint::new(
+            (img.hotspot_x as f64).clamp(0.0, img.width.saturating_sub(1) as f64),
+            (img.hotspot_y as f64).clamp(0.0, img.height.saturating_sub(1) as f64),
+        );
+        Some(NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &ns_img, hot))
+    }
+}
+
 fn apply_cursor(s: CursorState) {
     let mtm = mtm();
     let in_client = super::fullscreen_takeover() || super::mouse_in_client();
@@ -945,7 +1013,7 @@ fn apply_cursor(s: CursorState) {
     }
     if !hidden {
         #[allow(deprecated)]
-        let c = match s.shape {
+        let c = match &s.shape {
             Shape::IBeam => NSCursor::IBeamCursor(),
             Shape::Cross => NSCursor::crosshairCursor(),
             Shape::Hand => NSCursor::pointingHandCursor(),
@@ -953,6 +1021,7 @@ fn apply_cursor(s: CursorState) {
             Shape::SizeNS => NSCursor::resizeUpDownCursor(),
             Shape::SizeAll => NSCursor::openHandCursor(),
             Shape::No => NSCursor::operationNotAllowedCursor(),
+            Shape::Custom(img) => custom_ns_cursor(img).unwrap_or_else(NSCursor::arrowCursor),
             _ => NSCursor::arrowCursor(),
         };
         c.set();

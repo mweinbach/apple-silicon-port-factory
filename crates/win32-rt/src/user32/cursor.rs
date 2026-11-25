@@ -13,7 +13,18 @@ use super::*;
 use crate::types::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Premultiplied RGBA8 custom cursor bitmap and hotspot for native `NSCursor` rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomCursorImage {
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    /// Premultiplied RGBA8 top-down pixels (`width * height * 4` bytes).
+    pub rgba: Arc<[u8]>,
+}
 
 /// What a cursor handle looks like on the native side.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +42,8 @@ pub enum Shape {
     No,
     /// Fully transparent custom cursor (AW2 creates one to hide the pointer).
     Blank,
-    /// Custom bitmap cursor (not rendered yet; shown as an arrow).
-    Custom,
+    /// Custom bitmap cursor rendered via native `NSCursor::initWithImage_hotSpot`.
+    Custom(CustomCursorImage),
 }
 
 #[derive(Clone, Debug)]
@@ -68,33 +79,164 @@ fn system_shape(id: u16) -> Option<Shape> {
     })
 }
 
-fn load_cursor(inst: usize, name: *const u16, ansi: bool) -> usize {
-    if inst == 0 && is_int_resource(name) {
-        let id = name as usize as u16;
-        if let Some(shape) = system_shape(id) {
-            let h = SYSTEM_BASE + id as usize;
-            cursors().lock().unwrap().entry(h).or_insert(Cursor { shape });
-            return h;
+const RT_CURSOR: u16 = 1;
+const RT_GROUP_CURSOR: u16 = 12;
+
+fn bgra_to_premul_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut rgba = vec![0u8; bgra.len()];
+    for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+        let a = src[3] as u16;
+        dst[0] = ((src[2] as u16 * a + 127) / 255) as u8;
+        dst[1] = ((src[1] as u16 * a + 127) / 255) as u8;
+        dst[2] = ((src[0] as u16 * a + 127) / 255) as u8;
+        dst[3] = src[3];
+    }
+    rgba
+}
+
+fn shape_from_icon_data(icon: &IconData) -> Shape {
+    let all_transparent = !icon.bgra_pixels.is_empty()
+        && icon.bgra_pixels.chunks_exact(4).all(|px| px[3] == 0);
+    if all_transparent {
+        return Shape::Blank;
+    }
+    let rgba = bgra_to_premul_rgba(&icon.bgra_pixels);
+    Shape::Custom(CustomCursorImage {
+        width: icon.width,
+        height: icon.height,
+        hotspot_x: icon.x_hotspot,
+        hotspot_y: icon.y_hotspot,
+        rgba: Arc::from(rgba),
+    })
+}
+
+/// Parse an `RT_GROUP_CURSOR` directory (`NEWHEADER` + `RESDIR` entries, 14 bytes each).
+fn parse_group_cursor_dir(bytes: &[u8]) -> Vec<GrpIconDirEntry> {
+    if bytes.len() < 6 {
+        return Vec::new();
+    }
+    let res_type = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    if res_type != 2 || count == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(count.min(64));
+    for i in 0..count {
+        let off = 6 + i * 14;
+        if off + 14 > bytes.len() {
+            break;
+        }
+        // CURSORRESDIR: wWidth (u16), wHeight (u16; often 2*height for monochrome),
+        // wPlanes (u16), wBitCount (u16), dwBytesInRes (u32), nID (u16).
+        let w = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as u32;
+        let raw_h = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as u32;
+        let h = if raw_h == w * 2 && w > 0 { w } else { raw_h.max(1) };
+        let bpp = u16::from_le_bytes([bytes[off + 6], bytes[off + 7]]);
+        let icon_id = u16::from_le_bytes([bytes[off + 12], bytes[off + 13]]);
+        out.push(GrpIconDirEntry {
+            width: w.max(1),
+            height: h,
+            bpp: if bpp == 0 { 1 } else { bpp },
+            icon_id,
+        });
+    }
+    out
+}
+
+fn load_cursor_impl(inst: usize, name: *const u16, ansi: bool, cx: i32, cy: i32, flags: u32) -> usize {
+    let Some(res_id) = (unsafe { icon_res_id(name, ansi) }) else {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    };
+
+    if inst == 0 {
+        if let IconResId::Int(id) = res_id {
+            if let Some(shape) = system_shape(id) {
+                let h = SYSTEM_BASE + id as usize;
+                cursors().lock().unwrap().entry(h).or_insert(Cursor { shape });
+                return h;
+            }
+        }
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    }
+
+    let want_w = if cx > 0 {
+        cx as u32
+    } else if (flags & LR_DEFAULTSIZE) != 0 {
+        32
+    } else {
+        0
+    };
+    let want_h = if cy > 0 {
+        cy as u32
+    } else if (flags & LR_DEFAULTSIZE) != 0 {
+        32
+    } else {
+        0
+    };
+
+    let Some(pe) = (unsafe { PeImageView::from_hinstance(inst) }) else {
+        set_error(e::RESOURCE_TYPE_NOT_FOUND);
+        return 0;
+    };
+
+    let Some(group_bytes) = (unsafe { pe.find_resource_data(RT_GROUP_CURSOR, &res_id) }) else {
+        set_error(e::RESOURCE_NAME_NOT_FOUND);
+        return 0;
+    };
+    let entries = parse_group_cursor_dir(group_bytes);
+    if entries.is_empty() {
+        set_error(1812); // ERROR_RESOURCE_DATA_NOT_FOUND
+        return 0;
+    }
+
+    let ranked = rank_group_icon_entries(&entries, want_w, want_h);
+    let shared = (flags & LR_SHARED) != 0;
+    for entry in ranked {
+        let Some(cur_bytes) = (unsafe { pe.find_resource_data(RT_CURSOR, &IconResId::Int(entry.icon_id)) }) else {
+            continue;
+        };
+        // RT_CURSOR payload starts with 4-byte LOCALHEADER { WORD xHotSpot; WORD yHotSpot; }
+        // followed by a DIB (BITMAPINFOHEADER + XOR/AND masks) or PNG image.
+        if cur_bytes.len() < 8 {
+            continue;
+        }
+        let x_hot = u16::from_le_bytes([cur_bytes[0], cur_bytes[1]]) as u32;
+        let y_hot = u16::from_le_bytes([cur_bytes[2], cur_bytes[3]]) as u32;
+        if let Some(mut icon_data) = decode_icon_resource_bytes(
+            &cur_bytes[4..],
+            false,
+            entry.width,
+            entry.height,
+            entry.bpp,
+            shared,
+        ) {
+            icon_data.x_hotspot = x_hot;
+            icon_data.y_hotspot = y_hot;
+            let shape = shape_from_icon_data(&icon_data);
+            let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
+            cursors().lock().unwrap().insert(hc, Cursor { shape });
+            icons().lock().unwrap().insert(hc, icon_data);
+            log::debug!(
+                "user32: loaded PE .rsrc cursor from {inst:#x} ({}x{} hot=({x_hot},{y_hot})) -> {hc:#x}",
+                entry.width,
+                entry.height,
+            );
+            return hc;
         }
     }
-    let n = if is_int_resource(name) {
-        format!("#{}", name as usize)
-    } else if ansi {
-        unsafe { crate::strings::from_ansi(name as *const u8) }
-    } else {
-        unsafe { crate::strings::from_wide(name) }
-    };
-    stub!("LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL");
-    set_error(e::RESOURCE_TYPE_NOT_FOUND);
+
+    set_error(1812); // ERROR_RESOURCE_DATA_NOT_FOUND
     0
 }
 
 pub unsafe extern "win64" fn LoadCursorA(inst: HINSTANCE, name: LPCSTR) -> usize {
-    load_cursor(inst as usize, name as *const u16, true)
+    load_cursor_impl(inst as usize, name as *const u16, true, 32, 32, LR_DEFAULTSIZE | LR_SHARED)
 }
 
 pub unsafe extern "win64" fn LoadCursorW(inst: HINSTANCE, name: LPCWSTR) -> usize {
-    load_cursor(inst as usize, name, false)
+    load_cursor_impl(inst as usize, name, false, 32, 32, LR_DEFAULTSIZE | LR_SHARED)
 }
 
 const RT_ICON: u16 = 3;
@@ -795,8 +937,9 @@ pub unsafe extern "win64" fn CreateIconIndirect(info: *const ICONINFO) -> usize 
     icon.x_hotspot = ii.x_hotspot;
     icon.y_hotspot = ii.y_hotspot;
     icon.bpp = bpp;
+    let shape = shape_from_icon_data(&icon);
     let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
-    cursors().lock().unwrap().insert(hc, Cursor { shape: Shape::Custom });
+    cursors().lock().unwrap().insert(hc, Cursor { shape });
     icons().lock().unwrap().insert(hc, icon);
     hc
 }
@@ -938,11 +1081,13 @@ pub unsafe extern "win64" fn LoadImageW(
     flags: u32,
 ) -> usize {
     match ty {
-        1 => load_icon_impl(inst as usize, name, false, cx, cy, flags), // IMAGE_ICON
-        2 => LoadCursorW(inst, name),                                   // IMAGE_CURSOR
+        1 => load_icon_impl(inst as usize, name, false, cx, cy, flags),   // IMAGE_ICON
+        2 => load_cursor_impl(inst as usize, name, false, cx, cy, flags), // IMAGE_CURSOR
         _ => {
+            let icon = make_solid_icon(cx.max(1) as u32, cy.max(1) as u32, (flags & LR_SHARED) != 0);
+            let shape = shape_from_icon_data(&icon);
             let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
-            cursors().lock().unwrap().insert(hc, Cursor { shape: Shape::Custom });
+            cursors().lock().unwrap().insert(hc, Cursor { shape });
             hc
         }
     }
@@ -958,10 +1103,12 @@ pub unsafe extern "win64" fn LoadImageA(
 ) -> usize {
     match ty {
         1 => load_icon_impl(inst as usize, name as *const u16, true, cx, cy, flags),
-        2 => LoadCursorA(inst, name),
+        2 => load_cursor_impl(inst as usize, name as *const u16, true, cx, cy, flags),
         _ => {
+            let icon = make_solid_icon(cx.max(1) as u32, cy.max(1) as u32, (flags & LR_SHARED) != 0);
+            let shape = shape_from_icon_data(&icon);
             let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
-            cursors().lock().unwrap().insert(hc, Cursor { shape: Shape::Custom });
+            cursors().lock().unwrap().insert(hc, Cursor { shape });
             hc
         }
     }
@@ -971,24 +1118,87 @@ pub unsafe extern "win64" fn CopyImage(h: usize, _ty: u32, _cx: i32, _cy: i32, _
     CopyIcon(h)
 }
 
-pub unsafe extern "win64" fn CreateCursor(_inst: HINSTANCE, _xhot: i32, _yhot: i32, w: i32, h: i32, and: *const u8, xor: *const u8) -> usize {
+/// Decode Win32 monochrome AND/XOR cursor planes (MSB-first, 16-bit row stride)
+/// into top-down BGRA8 pixels.
+///
+/// Win32 monochrome cursor truth table:
+/// * `AND=0, XOR=0` -> opaque black `(0, 0, 0, 255)`
+/// * `AND=0, XOR=1` -> opaque white `(255, 255, 255, 255)`
+/// * `AND=1, XOR=0` -> transparent `(0, 0, 0, 0)`
+/// * `AND=1, XOR=1` -> screen-invert (rendered as opaque black on macOS `NSCursor`,
+///   which has no hardware XOR cursor mode, matching Wine's `macdrv`).
+fn decode_monochrome_cursor_bgra(w: usize, h: usize, and_plane: &[u8], xor_plane: &[u8]) -> Vec<u8> {
+    let stride = ((w + 15) / 16) * 2;
+    let mut bgra = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row = y * stride;
+        for x in 0..w {
+            let byte_idx = row + (x / 8);
+            let shift = 7 - (x % 8);
+            let and_bit = (and_plane[byte_idx] >> shift) & 1;
+            let xor_bit = (xor_plane[byte_idx] >> shift) & 1;
+            let px: [u8; 4] = match (and_bit, xor_bit) {
+                (0, 0) => [0, 0, 0, 0xFF],       // black
+                (0, 1) => [0xFF, 0xFF, 0xFF, 0xFF], // white
+                (1, 0) => [0, 0, 0, 0],          // transparent
+                _ => [0, 0, 0, 0xFF],            // invert fallback -> opaque black
+            };
+            let dst = (y * w + x) * 4;
+            bgra[dst..dst + 4].copy_from_slice(&px);
+        }
+    }
+    bgra
+}
+
+pub unsafe extern "win64" fn CreateCursor(
+    _inst: HINSTANCE,
+    xhot: i32,
+    yhot: i32,
+    w: i32,
+    h: i32,
+    and: *const u8,
+    xor: *const u8,
+) -> usize {
     if w <= 0 || h <= 0 || and.is_null() || xor.is_null() {
         set_error(e::INVALID_PARAMETER);
         return 0;
     }
     // Monochrome masks, rows padded to 16 bits.
-    let stride = (((w + 15) / 16) * 2) as usize;
-    let n = stride * h as usize;
+    let wu = w as usize;
+    let hu = h as usize;
+    let stride = ((wu + 15) / 16) * 2;
+    let n = stride * hu;
     let a = std::slice::from_raw_parts(and, n);
     let x = std::slice::from_raw_parts(xor, n);
     let blank = a.iter().all(|&b| b == 0xFF) && x.iter().all(|&b| b == 0);
-    let shape = if blank { Shape::Blank } else { Shape::Custom };
-    if !blank {
-        stub!("CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow");
-    }
+    let bgra = decode_monochrome_cursor_bgra(wu, hu, a, x);
+    let x_hotspot = xhot.clamp(0, w - 1) as u32;
+    let y_hotspot = yhot.clamp(0, h - 1) as u32;
+    let icon = IconData {
+        f_icon: false,
+        x_hotspot,
+        y_hotspot,
+        width: w as u32,
+        height: h as u32,
+        bpp: 1,
+        is_png: false,
+        raw_data: Vec::new(),
+        bgra_pixels: bgra,
+        and_mask: a.to_vec(),
+        shared: false,
+    };
+    let shape = if blank {
+        Shape::Blank
+    } else {
+        shape_from_icon_data(&icon)
+    };
     let hc = NEXT_CUSTOM.fetch_add(4, Ordering::Relaxed);
     cursors().lock().unwrap().insert(hc, Cursor { shape });
-    log::debug!("CreateCursor {w}x{h} -> {hc:#x} ({})", if blank { "blank" } else { "custom" });
+    icons().lock().unwrap().insert(hc, icon);
+    log::debug!(
+        "CreateCursor {w}x{h} hot=({x_hotspot},{y_hotspot}) -> {hc:#x} ({})",
+        if blank { "blank" } else { "custom" }
+    );
     hc
 }
 
@@ -1484,6 +1694,122 @@ mod tests {
             assert_eq!(GetIconInfo(h_stock, &mut ii), TRUE);
             crate::misc::gdi32::DeleteObject(ii.hbm_color);
             crate::misc::gdi32::DeleteObject(ii.hbm_mask);
+        }
+    }
+
+    #[test]
+    fn custom_bitmap_cursor_and_pe_cursor_resource() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            // 1. Monochrome CreateCursor: pixel (0,0) opaque black (AND=0,XOR=0),
+            //    (1,0) opaque white (AND=0,XOR=1), (2,0) transparent (AND=1,XOR=0),
+            //    (3,0) invert->black (AND=1,XOR=1).
+            let mut and_plane = [0xFFu8; 4]; // 2x2 bytes for 4x2 (16-bit stride = 2)
+            let mut xor_plane = [0x00u8; 4];
+            // Row 0 MSB..: bit7=(0,0), bit6=(1,0), bit5=(2,0), bit4=(3,0)
+            and_plane[0] = 0b0011_1111;
+            xor_plane[0] = 0b0101_0000;
+            let hc = CreateCursor(std::ptr::null_mut(), 1, 0, 4, 2, and_plane.as_ptr(), xor_plane.as_ptr());
+            assert_ne!(hc, 0);
+            let shape = cursors().lock().unwrap().get(&hc).unwrap().shape.clone();
+            match shape {
+                Shape::Custom(img) => {
+                    assert_eq!((img.width, img.height, img.hotspot_x, img.hotspot_y), (4, 2, 1, 0));
+                    assert_eq!(&img.rgba[0..4], &[0, 0, 0, 255]); // black
+                    assert_eq!(&img.rgba[4..8], &[255, 255, 255, 255]); // white
+                    assert_eq!(&img.rgba[8..12], &[0, 0, 0, 0]); // transparent
+                    assert_eq!(&img.rgba[12..16], &[0, 0, 0, 255]); // invert -> black
+                }
+                other => panic!("expected Shape::Custom, got {other:?}"),
+            }
+            let mut ii = std::mem::zeroed::<ICONINFO>();
+            assert_eq!(GetIconInfo(hc, &mut ii), TRUE);
+            assert_eq!(ii.f_icon, FALSE);
+            assert_eq!((ii.x_hotspot, ii.y_hotspot), (1, 0));
+            crate::misc::gdi32::DeleteObject(ii.hbm_color);
+            crate::misc::gdi32::DeleteObject(ii.hbm_mask);
+            assert_eq!(DestroyCursor(hc), TRUE);
+
+            // 2. Unknown system cursor ID returns 0 + ERROR_RESOURCE_NAME_NOT_FOUND.
+            assert_eq!(LoadCursorW(std::ptr::null_mut(), 55555 as LPCWSTR), 0);
+            assert_eq!(crate::teb::last_error(), e::RESOURCE_NAME_NOT_FOUND);
+
+            // 3. Synthetic PE with RT_GROUP_CURSOR (12) + RT_CURSOR (1) containing hotspot (3,5) + 16x16 DIB.
+            let mut img = vec![0u8; 0x3000];
+            const RSRC_RVA: usize = 0x1000;
+            img[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+            img[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            img[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+            img[0x84 + 16..0x84 + 18].copy_from_slice(&0xF0u16.to_le_bytes());
+            let opt = 0x84 + 20;
+            let img_len = img.len() as u32;
+            img[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+            img[opt + 56..opt + 60].copy_from_slice(&img_len.to_le_bytes());
+            img[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+            img[opt + 112 + 16..opt + 112 + 20].copy_from_slice(&(RSRC_RVA as u32).to_le_bytes());
+            img[opt + 112 + 20..opt + 112 + 24].copy_from_slice(&0x2000u32.to_le_bytes());
+
+            let write_dir = |buf: &mut [u8], off: usize, entries: &[(u32, u32)]| {
+                let b = RSRC_RVA + off;
+                buf[b + 14..b + 16].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+                for (i, &(k, v)) in entries.iter().enumerate() {
+                    let e = b + 16 + i * 8;
+                    buf[e..e + 4].copy_from_slice(&k.to_le_bytes());
+                    buf[e + 4..e + 8].copy_from_slice(&v.to_le_bytes());
+                }
+            };
+            let mut dib = Vec::new();
+            dib.extend_from_slice(&40u32.to_le_bytes());
+            dib.extend_from_slice(&16i32.to_le_bytes());
+            dib.extend_from_slice(&32i32.to_le_bytes()); // biHeight = 2*16
+            dib.extend_from_slice(&1u16.to_le_bytes());
+            dib.extend_from_slice(&32u16.to_le_bytes());
+            dib.extend_from_slice(&[0u8; 24]);
+            for _ in 0..(16 * 16) {
+                dib.extend_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+            }
+            dib.extend_from_slice(&vec![0u8; 16 * 4]); // AND mask (32-bit padded rows)
+            let mut cur_res = Vec::with_capacity(4 + dib.len());
+            cur_res.extend_from_slice(&3u16.to_le_bytes()); // xHotSpot
+            cur_res.extend_from_slice(&5u16.to_le_bytes()); // yHotSpot
+            cur_res.extend_from_slice(&dib);
+            let mut grp_res = Vec::new();
+            grp_res.extend_from_slice(&0u16.to_le_bytes());
+            grp_res.extend_from_slice(&2u16.to_le_bytes()); // RES_CURSOR
+            grp_res.extend_from_slice(&1u16.to_le_bytes());
+            grp_res.extend_from_slice(&16u16.to_le_bytes()); // wWidth
+            grp_res.extend_from_slice(&32u16.to_le_bytes()); // wHeight (2*16)
+            grp_res.extend_from_slice(&1u16.to_le_bytes());
+            grp_res.extend_from_slice(&32u16.to_le_bytes());
+            grp_res.extend_from_slice(&(cur_res.len() as u32).to_le_bytes());
+            grp_res.extend_from_slice(&7u16.to_le_bytes()); // RT_CURSOR #7
+
+            let cur_off = 0x300usize;
+            img[RSRC_RVA + cur_off..RSRC_RVA + cur_off + cur_res.len()].copy_from_slice(&cur_res);
+            let grp_off = 0xA00usize;
+            img[RSRC_RVA + grp_off..RSRC_RVA + grp_off + grp_res.len()].copy_from_slice(&grp_res);
+
+            write_dir(&mut img, 0x000, &[(RT_CURSOR as u32, 0x8000_0040), (RT_GROUP_CURSOR as u32, 0x8000_0080)]);
+            write_dir(&mut img, 0x040, &[(7, 0x8000_0100)]);
+            write_dir(&mut img, 0x080, &[(202, 0x8000_0120)]);
+            write_dir(&mut img, 0x100, &[(0x0409, 0x200)]);
+            write_dir(&mut img, 0x120, &[(0x0409, 0x210)]);
+            img[RSRC_RVA + 0x200..RSRC_RVA + 0x204].copy_from_slice(&((RSRC_RVA + cur_off) as u32).to_le_bytes());
+            img[RSRC_RVA + 0x204..RSRC_RVA + 0x208].copy_from_slice(&(cur_res.len() as u32).to_le_bytes());
+            img[RSRC_RVA + 0x210..RSRC_RVA + 0x214].copy_from_slice(&((RSRC_RVA + grp_off) as u32).to_le_bytes());
+            img[RSRC_RVA + 0x214..RSRC_RVA + 0x218].copy_from_slice(&(grp_res.len() as u32).to_le_bytes());
+
+            let h_pe_cur = LoadCursorW(img.as_ptr() as HINSTANCE, 202 as LPCWSTR);
+            assert_ne!(h_pe_cur, 0);
+            match cursors().lock().unwrap().get(&h_pe_cur).unwrap().shape.clone() {
+                Shape::Custom(ci) => {
+                    assert_eq!((ci.width, ci.height, ci.hotspot_x, ci.hotspot_y), (16, 16, 3, 5));
+                    // BGRA [0x10, 0x20, 0x30, 0xFF] -> RGBA [0x30, 0x20, 0x10, 0xFF]
+                    assert_eq!(&ci.rgba[0..4], &[0x30, 0x20, 0x10, 0xFF]);
+                }
+                other => panic!("expected Shape::Custom from RT_CURSOR, got {other:?}"),
+            }
+            assert_eq!(DestroyCursor(h_pe_cur), TRUE);
         }
     }
 }

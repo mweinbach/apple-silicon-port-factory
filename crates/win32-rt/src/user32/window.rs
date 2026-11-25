@@ -691,6 +691,7 @@ fn free_window(hwnd: usize) {
     }
     super::input::forget_window(hwnd);
     super::misc::forget_device_notifications(hwnd);
+    super::misc::forget_hotkeys(hwnd);
     crate::misc::uxtheme::forget_window_subclasses(hwnd);
     super::dialog::forget_dialog(hwnd);
 }

@@ -367,7 +367,7 @@ pub fn caps_on() -> bool {
     ASYNC[VK_CAPITAL as usize].load(Ordering::Relaxed) & 1 != 0
 }
 
-fn release_all_keys() {
+pub(crate) fn release_all_keys() {
     for (i, a) in ASYNC.iter().enumerate() {
         if i != VK_CAPITAL as usize && i != VK_NUMLOCK as usize {
             a.fetch_and(!0x80, Ordering::Relaxed);
@@ -891,12 +891,35 @@ pub fn native_key(k: NativeKey) {
     };
     set_async_key(key, k.down);
     let alt = async_down(VK_MENU);
+    // Registered hotkeys (RegisterHotKey) intercept keydown before WM_KEYDOWN,
+    // posting WM_HOTKEY to the registering window/thread.
+    if k.down {
+        let mut mods = 0u32;
+        if alt {
+            mods |= 0x0001; // MOD_ALT
+        }
+        if async_down(VK_CONTROL) {
+            mods |= 0x0002; // MOD_CONTROL
+        }
+        if async_down(VK_SHIFT) {
+            mods |= 0x0004; // MOD_SHIFT
+        }
+        if async_down(0x5B) || async_down(0x5C) {
+            mods |= 0x0008; // MOD_WIN (VK_LWIN / VK_RWIN)
+        }
+        if super::misc::try_dispatch_hotkey(mods, key.vk as u32, was_down || k.repeat) {
+            return;
+        }
+    }
     let target = FOCUS.load(Ordering::Acquire);
     if target == 0 {
         return;
     }
     // Raw input first (Windows delivers WM_INPUT ahead of the legacy message).
     raw_keyboard(key, k.down, msg);
+    if raw_nolegacy_active(1, 6) {
+        return;
+    }
     let mut lp: u32 = 1 | (key.scan as u32) << 16;
     if key.ext {
         lp |= 1 << 24;
@@ -1106,7 +1129,7 @@ pub fn native_mouse(ev: NativeMouse) {
                     raw_mouse(x, y, 0, 0);
                 }
             }
-            if relative {
+            if relative || raw_nolegacy_active(1, 2) {
                 return;
             }
             let cap = CAPTURE.load(Ordering::Acquire);
@@ -1147,6 +1170,9 @@ pub fn native_mouse(ev: NativeMouse) {
             raw_mouse(0, 0, if down { raw_down } else { raw_up }, 0);
             if !super::cursor::relative_mode() {
                 super::cursor::set_cached_pos(screen);
+            }
+            if raw_nolegacy_active(1, 2) {
+                return;
             }
             let cap = CAPTURE.load(Ordering::Acquire);
             let (target, pos) = if cap != 0 {
@@ -1193,6 +1219,9 @@ pub fn native_mouse(ev: NativeMouse) {
                 false
             };
             raw_mouse(0, 0, if horizontal { 0x800 } else { 0x400 }, delta as i16 as u16);
+            if raw_nolegacy_active(1, 2) {
+                return;
+            }
             let target = FOCUS.load(Ordering::Acquire);
             if target == 0 {
                 return;
@@ -1270,6 +1299,17 @@ fn raw_fetch(h: usize) -> Option<Vec<u8>> {
 
 pub fn raw_mouse_registered() -> bool {
     RAW_REGS.lock().unwrap().iter().any(|r| r.page == 1 && r.usage == 2)
+}
+
+/// True when the given legacy HID device (`(1, 2)` mouse or `(1, 6)` keyboard)
+/// is registered with `RIDEV_NOLEGACY`, suppressing legacy `WM_MOUSE*` / `WM_KEY*`
+/// messages while still delivering `WM_INPUT`.
+fn raw_nolegacy_active(page: u16, usage: u16) -> bool {
+    RAW_REGS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.page == page && r.usage == usage && (r.flags & RIDEV_NOLEGACY) != 0)
 }
 
 /// Deliver a raw input record to the registered target (if any).
@@ -1359,8 +1399,11 @@ pub unsafe extern "win64" fn RegisterRawInputDevices(devs: *const RAWINPUTDEVICE
             set_error(e::INVALID_WINDOW_HANDLE);
             return FALSE;
         }
-        if d.flags & RIDEV_NOLEGACY != 0 {
-            stub!("RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)");
+        // Per Microsoft Learn, RIDEV_NOLEGACY is only valid for legacy keyboard (1, 6)
+        // and mouse (1, 2) top-level collections.
+        if (d.flags & RIDEV_NOLEGACY) != 0 && !(d.usage_page == 1 && matches!(d.usage, 2 | 6)) {
+            set_error(e::INVALID_PARAMETER);
+            return FALSE;
         }
         regs.retain(|r| !(r.page == d.usage_page && r.usage == d.usage));
         regs.push(RawReg { page: d.usage_page, usage: d.usage, flags: d.flags, target: d.target, tid });
@@ -1837,6 +1880,95 @@ mod tests {
 
             assert_eq!(super::misc::UnhookWindowsHookEx(h_k), TRUE);
             assert_eq!(super::misc::UnhookWindowsHookEx(h_m), TRUE);
+            release_all_keys();
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn raw_input_nolegacy_suppresses_legacy_messages_and_keeps_wm_input() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            let cls = crate::strings::to_wide_z("RawNoLegacyTestWnd");
+            let wc = super::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<super::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: super::WNDPROC_HANDLE_DEF_WINDOW_W,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = super::class::RegisterClassExW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0, cls.as_ptr(), std::ptr::null(), ws::POPUP | ws::VISIBLE,
+                0, 0, 200, 200, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            APP_ACTIVE.store(true, Ordering::Release);
+            SetFocus(hwnd);
+            ACTIVE.store(hwnd as usize, Ordering::Release);
+
+            // RIDEV_NOLEGACY on a non-legacy usage (e.g. gamepad 1,5) must fail with INVALID_PARAMETER.
+            let bad = RAWINPUTDEVICE { usage_page: 1, usage: 5, flags: RIDEV_NOLEGACY, target: hwnd as usize };
+            assert_eq!(RegisterRawInputDevices(&bad, 1, 16), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // Register mouse (1,2) and keyboard (1,6) with RIDEV_NOLEGACY.
+            let devs = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_NOLEGACY, target: hwnd as usize },
+            ];
+            assert_eq!(RegisterRawInputDevices(devs.as_ptr(), 2, 16), TRUE);
+
+            // Key press: WM_INPUT delivered, WM_KEYDOWN suppressed, async state updated.
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            let mut m = MSG::default();
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE),
+                TRUE,
+                "WM_INPUT must still arrive under RIDEV_NOLEGACY"
+            );
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::KEYFIRST, wm::KEYLAST, message::PM_REMOVE),
+                FALSE,
+                "WM_KEYDOWN must be suppressed under RIDEV_NOLEGACY"
+            );
+            assert!(GetAsyncKeyState(b'A' as i32) < 0);
+
+            // Mouse button: WM_INPUT delivered, WM_LBUTTONDOWN suppressed.
+            native_mouse(NativeMouse::Button {
+                hwnd: hwnd as usize,
+                client: Some(POINT { x: 10, y: 10 }),
+                screen: POINT { x: 10, y: 10 },
+                button: MouseButton::Left,
+                down: true,
+                clicks: 1,
+            });
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::INPUT, wm::INPUT, message::PM_REMOVE),
+                TRUE,
+                "mouse WM_INPUT must still arrive under RIDEV_NOLEGACY"
+            );
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::MOUSEFIRST, wm::MOUSELAST, message::PM_REMOVE),
+                FALSE,
+                "WM_LBUTTONDOWN must be suppressed under RIDEV_NOLEGACY"
+            );
+
+            // Remove registrations -> legacy messages flow again.
+            let rem = [
+                RAWINPUTDEVICE { usage_page: 1, usage: 2, flags: RIDEV_REMOVE, target: 0 },
+                RAWINPUTDEVICE { usage_page: 1, usage: 6, flags: RIDEV_REMOVE, target: 0 },
+            ];
+            assert_eq!(RegisterRawInputDevices(rem.as_ptr(), 2, 16), TRUE);
             release_all_keys();
             let _ = window::DestroyWindow(hwnd);
         })

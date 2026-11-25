@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::types::*;
+use crate::va::win64_varargs_thunk;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -180,60 +181,91 @@ pub fn virtual_screen() -> RECT {
 }
 
 /// Screen metrics come from the display cache (Win32 pixels); the fixed
-/// ones are Windows 10 defaults at 96 DPI. Unknown indices return 0 (as
-/// Windows does) and are logged as STUB.
+/// ones are Windows 10 defaults at 96 DPI. Per Microsoft Learn, unknown
+/// `SM_*` indices return 0 without setting last error.
 pub unsafe extern "win64" fn GetSystemMetrics(index: i32) -> i32 {
     let p = super::monitor::primary_rect();
     let work = super::monitor::primary_work_area();
     let v = virtual_screen();
     let cap = window::nc_insets(ws::CAPTION, 0).1;
+    let is_ios = cfg!(target_os = "ios");
     match index {
         0 => p.width(),                                                   // SM_CXSCREEN
         1 => p.height(),                                                  // SM_CYSCREEN
+        2 | 3 => 17,                                                      // SM_CXVSCROLL, SM_CYHSCROLL
+        4 => cap,                                                         // SM_CYCAPTION
+        5 | 6 => 1,                                                       // SM_CXBORDER, SM_CYBORDER
+        7 | 8 => 3,                                                       // SM_CXDLGFRAME / SM_CXFIXEDFRAME
+        9 | 10 => 17,                                                     // SM_CYVTHUMB, SM_CXHTHUMB
+        11 | 12 => 32,                                                    // SM_CXICON, SM_CYICON
+        13 | 14 => 32,                                                    // SM_CXCURSOR, SM_CYCURSOR
+        15 => 20,                                                         // SM_CYMENU
         16 => work.width(),                                               // SM_CXFULLSCREEN
         17 => work.height() - cap,                                        // SM_CYFULLSCREEN
+        18 => 0,                                                          // SM_CYKANJIWINDOW
+        19 => if is_ios { 0 } else { 1 },                                 // SM_MOUSEPRESENT
+        20 | 21 => 17,                                                    // SM_CYVSCROLL, SM_CXHSCROLL
+        22 => 0,                                                          // SM_DEBUG
+        23 => 0,                                                          // SM_SWAPBUTTON
+        24..=27 => 0,                                                     // reserved
+        28 | 29 => 136,                                                   // SM_CXMIN, SM_CYMIN
+        30 => 36,                                                         // SM_CXSIZE
+        31 => cap,                                                        // SM_CYSIZE
+        32 | 33 => 4,                                                     // SM_CXFRAME / SM_CXSIZEFRAME
+        34 => 136,                                                        // SM_CXMINTRACK
+        35 => 39,                                                         // SM_CYMINTRACK
+        36 | 37 => 4,                                                     // SM_CXDOUBLECLK, SM_CYDOUBLECLK
+        38 | 39 => 75,                                                    // SM_CXICONSPACING, SM_CYICONSPACING
+        40 => 0,                                                          // SM_MENUDROPALIGNMENT
+        41 => 0,                                                          // SM_PENWINDOWS
+        42 => 1,                                                          // SM_DBCSENABLED
+        43 => if is_ios { 0 } else { 5 },                                 // SM_CMOUSEBUTTONS
+        44 => 0,                                                          // SM_SECURE
+        45 | 46 => 2,                                                     // SM_CXEDGE, SM_CYEDGE
+        47 => 160,                                                        // SM_CXMINSPACING
+        48 => 24,                                                         // SM_CYMINSPACING
+        49 | 50 => 16,                                                    // SM_CXSMICON, SM_CYSMICON
+        51 => 22,                                                         // SM_CYSMCAPTION
+        52 | 53 => 22,                                                    // SM_CXSMSIZE, SM_CYSMSIZE
+        54 | 55 => 19,                                                    // SM_CXMENUSIZE, SM_CYMENUSIZE
+        56 => 8,                                                          // SM_ARRANGE (ARW_HIDE)
+        57 => 160,                                                        // SM_CXMINIMIZED
+        58 => 24,                                                         // SM_CYMINIMIZED
+        59 => v.width() + 16,                                             // SM_CXMAXTRACK
+        60 => v.height() + 16,                                            // SM_CYMAXTRACK
         61 => work.width(),                                               // SM_CXMAXIMIZED
         62 => work.height(),                                              // SM_CYMAXIMIZED
-        59 | 60 => if index == 59 { v.width() + 16 } else { v.height() + 16 }, // SM_CXMAXTRACK
+        63 => 0x1,                                                        // SM_NETWORK
+        64..=66 => 0,                                                     // reserved
+        67 => 0,                                                          // SM_CLEANBOOT
+        68 | 69 => 4,                                                     // SM_CXDRAG, SM_CYDRAG
+        70 => 0,                                                          // SM_SHOWSOUNDS
+        71 | 72 => 15,                                                    // SM_CXMENUCHECK, SM_CYMENUCHECK
+        73 => 0,                                                          // SM_SLOWMACHINE
+        74 => 0,                                                          // SM_MIDEASTENABLED
+        75 => if is_ios { 0 } else { 1 },                                 // SM_MOUSEWHEELPRESENT
         76 => v.left,                                                     // SM_XVIRTUALSCREEN
         77 => v.top,                                                      // SM_YVIRTUALSCREEN
         78 => v.width(),                                                  // SM_CXVIRTUALSCREEN
         79 => v.height(),                                                 // SM_CYVIRTUALSCREEN
         80 => crate::macos::display::monitors().len() as i32,             // SM_CMONITORS
         81 => 1,                                                          // SM_SAMEDISPLAYFORMAT
-        2 | 3 => 17,                                                      // SM_CXVSCROLL, SM_CYHSCROLL
-        4 => cap,                                                         // SM_CYCAPTION
-        5 | 6 => 1,                                                       // SM_CXBORDER, SM_CYBORDER
-        7 | 8 => 3,                                                       // SM_CXDLGFRAME, SM_CYDLGFRAME
-        11 | 12 => 32,                                                    // SM_CXICON, SM_CYICON
-        13 | 14 => 32,                                                    // SM_CXCURSOR, SM_CYCURSOR
-        15 => 20,                                                         // SM_CYMENU
-        19 => 1,                                                          // SM_MOUSEPRESENT
-        23 => 0,                                                          // SM_SWAPBUTTON
-        28 | 29 => 136,                                                   // SM_CXMIN, SM_CYMIN
-        32 | 33 => 4,                                                     // SM_CXFRAME, SM_CYFRAME
-        34 => 136,                                                        // SM_CXMINTRACK
-        35 => 39,                                                         // SM_CYMINTRACK
-        36 | 37 => 4,                                                     // SM_CXDOUBLECLK, SM_CYDOUBLECLK
-        43 => 5,                                                          // SM_CMOUSEBUTTONS
-        49 | 50 => 16,                                                    // SM_CXSMICON, SM_CYSMICON
-        63 => 0x1,                                                        // SM_NETWORK
-        67 => 0,                                                          // SM_CLEANBOOT
-        68 | 69 => 4,                                                     // SM_CXDRAG, SM_CYDRAG
-        75 => 1,                                                          // SM_MOUSEWHEELPRESENT
-        86 => 0,                                                          // SM_TABLETPC
+        82 => 1,                                                          // SM_IMMENABLED
+        83 | 84 => 1,                                                     // SM_CXFOCUSBORDER, SM_CYFOCUSBORDER
+        86 => if is_ios { 1 } else { 0 },                                 // SM_TABLETPC
         87 => 0,                                                          // SM_MEDIACENTER
+        88 => 0,                                                          // SM_STARTER
+        89 => 0,                                                          // SM_SERVERR2
+        91 => if is_ios { 0 } else { 1 },                                 // SM_MOUSEHORIZONTALWHEELPRESENT
         92 => 0,                                                          // SM_CXPADDEDBORDER
-        94 => 0,                                                          // SM_DIGITIZER
-        95 => 0,                                                          // SM_MAXIMUMTOUCHES
+        94 => if is_ios { 0xC1 } else { 0 },                              // SM_DIGITIZER
+        95 => if is_ios { 10 } else { 0 },                                // SM_MAXIMUMTOUCHES
         0x1000 => 0,                                                      // SM_REMOTESESSION
+        0x2000 => 0,                                                      // SM_SHUTTINGDOWN
         0x2001 => 0,                                                      // SM_REMOTECONTROL
-        0x2003 => 1,                                                      // SM_CONVERTIBLESLATEMODE (1 = not slate)
+        0x2003 => if is_ios { 0 } else { 1 },                             // SM_CONVERTIBLESLATEMODE (1 = not slate)
         0x2004 => 0,                                                      // SM_SYSTEMDOCKED
-        _ => {
-            stub!("GetSystemMetrics({index}) -> 0");
-            0
-        }
+        _ => 0,                                                           // Undefined index: Windows returns 0
     }
 }
 
@@ -244,7 +276,9 @@ pub unsafe extern "win64" fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32
     }
     // Scale UI element dimensions linearly with DPI; screen pixel metrics stay unscaled.
     match index {
-        2 | 3 | 4 | 5 | 6 | 7 | 8 | 11 | 12 | 13 | 14 | 15 | 28 | 29 | 32 | 33 | 34 | 35 | 49 | 50 => {
+        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 28 | 29 | 30
+        | 31 | 32 | 33 | 34 | 35 | 38 | 39 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52 | 53 | 54
+        | 55 | 57 | 58 | 71 | 72 | 83 | 84 | 92 => {
             let scaled = (base as i64 * dpi as i64 + 48) / 96;
             scaled as i32
         }
@@ -256,27 +290,122 @@ pub unsafe extern "win64" fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32
 // SystemParametersInfo
 // ---------------------------------------------------------------------------
 
+const SPI_GETBEEP: u32 = 0x0001;
+const SPI_SETBEEP: u32 = 0x0002;
+const SPI_GETMOUSE: u32 = 0x0003;
+const SPI_SETMOUSE: u32 = 0x0004;
+const SPI_GETBORDER: u32 = 0x0005;
+const SPI_SETBORDER: u32 = 0x0006;
+const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
+const SPI_SETKEYBOARDSPEED: u32 = 0x000B;
+const SPI_GETSCREENSAVETIMEOUT: u32 = 0x000E;
+const SPI_SETSCREENSAVETIMEOUT: u32 = 0x000F;
+const SPI_GETSCREENSAVEACTIVE: u32 = 0x0010;
+const SPI_SETSCREENSAVEACTIVE: u32 = 0x0011;
+const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
+const SPI_SETKEYBOARDDELAY: u32 = 0x0017;
+const SPI_GETICONTITLEWRAP: u32 = 0x0019;
+const SPI_GETMENUDROPALIGNMENT: u32 = 0x001B;
+const SPI_GETICONTITLELOGFONT: u32 = 0x001F;
+const SPI_GETFASTTASKSWITCH: u32 = 0x0023;
+const SPI_SETDRAGFULLWINDOWS: u32 = 0x0025;
+const SPI_GETDRAGFULLWINDOWS: u32 = 0x0026;
+const SPI_GETNONCLIENTMETRICS: u32 = 0x0029;
+const SPI_GETMINIMIZEDMETRICS: u32 = 0x002B;
+const SPI_GETICONMETRICS: u32 = 0x002D;
 const SPI_GETWORKAREA: u32 = 0x0030;
 const SPI_GETFILTERKEYS: u32 = 0x0032;
 const SPI_SETFILTERKEYS: u32 = 0x0033;
 const SPI_GETTOGGLEKEYS: u32 = 0x0034;
 const SPI_SETTOGGLEKEYS: u32 = 0x0035;
+const SPI_GETMOUSEKEYS: u32 = 0x0036;
+const SPI_SETMOUSEKEYS: u32 = 0x0037;
+const SPI_GETSHOWSOUNDS: u32 = 0x0038;
 const SPI_GETSTICKYKEYS: u32 = 0x003A;
 const SPI_SETSTICKYKEYS: u32 = 0x003B;
-const SPI_GETSCREENSAVEACTIVE: u32 = 0x0010;
-const SPI_SETSCREENSAVEACTIVE: u32 = 0x0011;
-const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
-const SPI_GETKEYBOARDSPEED: u32 = 0x000A;
-const SPI_GETMOUSE: u32 = 0x0003;
-const SPI_GETMOUSESPEED: u32 = 0x0070;
-const SPI_GETWHEELSCROLLLINES: u32 = 0x0068;
-const SPI_GETWHEELSCROLLCHARS: u32 = 0x006C;
+const SPI_GETSOUNDSENTRY: u32 = 0x0040;
 const SPI_GETHIGHCONTRAST: u32 = 0x0042;
-const SPI_GETNONCLIENTMETRICS: u32 = 0x0029;
-const SPI_GETFONTSMOOTHING: u32 = 0x004A;
 const SPI_GETSCREENREADER: u32 = 0x0046;
-const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 const SPI_GETANIMATION: u32 = 0x0048;
+const SPI_GETFONTSMOOTHING: u32 = 0x004A;
+const SPI_GETSNAPTODEFBUTTON: u32 = 0x005F;
+const SPI_GETMOUSEHOVERWIDTH: u32 = 0x0062;
+const SPI_GETMOUSEHOVERHEIGHT: u32 = 0x0064;
+const SPI_GETMOUSEHOVERTIME: u32 = 0x0066;
+const SPI_GETWHEELSCROLLLINES: u32 = 0x0068;
+const SPI_SETWHEELSCROLLLINES: u32 = 0x0069;
+const SPI_GETWHEELSCROLLCHARS: u32 = 0x006C;
+const SPI_SETWHEELSCROLLCHARS: u32 = 0x006D;
+const SPI_GETMOUSESPEED: u32 = 0x0070;
+const SPI_SETMOUSESPEED: u32 = 0x0071;
+const SPI_GETSCREENSAVERRUNNING: u32 = 0x0072;
+const SPI_GETDESKWALLPAPER: u32 = 0x0073;
+const SPI_GETWINARRANGING: u32 = 0x0082;
+const SPI_GETDOCKMOVING: u32 = 0x0090;
+const SPI_GETKEYBOARDCUES: u32 = 0x100A;
+const SPI_GETMOUSEVANISH: u32 = 0x1020;
+const SPI_GETFLATMENU: u32 = 0x1022;
+const SPI_GETDROPSHADOW: u32 = 0x1024;
+const SPI_GETUIEFFECTS: u32 = 0x103E;
+const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+const SPI_GETFOREGROUNDLOCKTIMEOUT: u32 = 0x2000;
+const SPI_SETFOREGROUNDLOCKTIMEOUT: u32 = 0x2001;
+const SPI_GETACTIVEWNDTRKTIMEOUT: u32 = 0x2002;
+const SPI_GETFOREGROUNDFLASHCOUNT: u32 = 0x2004;
+const SPI_SETFOREGROUNDFLASHCOUNT: u32 = 0x2005;
+const SPI_GETCARETWIDTH: u32 = 0x2006;
+const SPI_SETCARETWIDTH: u32 = 0x2007;
+const SPI_GETFONTSMOOTHINGTYPE: u32 = 0x200A;
+const SPI_GETFONTSMOOTHINGCONTRAST: u32 = 0x200C;
+const SPI_GETFONTSMOOTHINGORIENTATION: u32 = 0x2012;
+const SPI_GETMESSAGEDURATION: u32 = 0x2016;
+
+struct SpiState {
+    beep: u32,
+    mouse: [i32; 3],
+    border: u32,
+    kbd_speed: u32,
+    kbd_delay: u32,
+    screensave_timeout: u32,
+    screensave_active: u32,
+    drag_full_windows: u32,
+    mouse_speed: u32,
+    wheel_lines: u32,
+    wheel_chars: u32,
+    fg_lock_timeout: u32,
+    fg_flash_count: u32,
+    caret_width: u32,
+    sticky_flags: u32,
+    toggle_flags: u32,
+    filter_keys: [u32; 5],
+    mouse_keys: [u32; 6],
+}
+
+fn spi_state() -> &'static std::sync::Mutex<SpiState> {
+    static S: std::sync::OnceLock<std::sync::Mutex<SpiState>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(SpiState {
+            beep: 1,
+            mouse: [6, 10, 1],
+            border: 1,
+            kbd_speed: 31,
+            kbd_delay: 1,
+            screensave_timeout: 600,
+            screensave_active: 0,
+            drag_full_windows: 1,
+            mouse_speed: 10,
+            wheel_lines: 3,
+            wheel_chars: 3,
+            fg_lock_timeout: 200_000,
+            fg_flash_count: 7,
+            caret_width: 1,
+            sticky_flags: 0,
+            toggle_flags: 0,
+            filter_keys: [0; 5],
+            mouse_keys: [0; 6],
+        })
+    })
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -455,76 +584,338 @@ impl NonClientMetricsW {
     }
 }
 
-unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
+const _: () = assert!(std::mem::size_of::<LogFontA>() == 60);
+const _: () = assert!(std::mem::size_of::<LogFontW>() == 92);
+const _: () = assert!(std::mem::size_of::<NonClientMetricsA>() == 344);
+const _: () = assert!(std::mem::size_of::<NonClientMetricsW>() == 504);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, lf_caption_font) == 24);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, i_sm_caption_width) == 84);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, lf_sm_caption_font) == 92);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, i_menu_width) == 152);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, lf_menu_font) == 160);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, lf_status_font) == 220);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, lf_message_font) == 280);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsA, i_padded_border_width) == 340);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, lf_caption_font) == 24);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, i_sm_caption_width) == 116);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, lf_sm_caption_font) == 124);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, i_menu_width) == 216);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, lf_menu_font) == 224);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, lf_status_font) == 316);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, lf_message_font) == 408);
+const _: () = assert!(std::mem::offset_of!(NonClientMetricsW, i_padded_border_width) == 500);
+
+#[inline]
+fn scale_dpi(val: i32, dpi: u32) -> i32 {
+    if dpi < 48 || dpi == 96 {
+        val
+    } else if val >= 0 {
+        ((val as i64 * dpi as i64 + 48) / 96) as i32
+    } else {
+        -((((-val) as i64 * dpi as i64 + 48) / 96) as i32)
+    }
+}
+
+unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi: u32) -> BOOL {
     let put_u32 = |v: u32| {
         if pv.is_null() {
+            set_error(e::INVALID_PARAMETER);
             return FALSE;
         }
-        *(pv as *mut u32) = v;
+        std::ptr::write_unaligned(pv as *mut u32, v);
         TRUE
     };
     match action {
+        SPI_GETBEEP => put_u32(spi_state().lock().unwrap().beep),
+        SPI_SETBEEP => {
+            spi_state().lock().unwrap().beep = (uparam != 0) as u32;
+            TRUE
+        }
         SPI_GETWORKAREA => {
             if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            *(pv as *mut RECT) = super::monitor::primary_work_area();
+            std::ptr::write_unaligned(pv as *mut RECT, super::monitor::primary_work_area());
             TRUE
         }
-        // Accessibility structs: { UINT cbSize; DWORD dwFlags; ... }. Report
-        // all features off; accept SET (games disable the shortcuts while
-        // running and restore them on exit).
-        SPI_GETSTICKYKEYS | SPI_GETTOGGLEKEYS | SPI_GETFILTERKEYS => {
+        // Accessibility structs: { UINT cbSize; DWORD dwFlags; ... }.
+        SPI_GETSTICKYKEYS | SPI_GETTOGGLEKEYS => {
             if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            let size = match action {
-                SPI_GETFILTERKEYS => 24,
-                _ => 8,
-            };
-            std::ptr::write_bytes(pv.add(4), 0, size - 4);
-            *(pv as *mut u32) = size as u32;
+            let st = spi_state().lock().unwrap();
+            let flags = if action == SPI_GETSTICKYKEYS { st.sticky_flags } else { st.toggle_flags };
+            std::ptr::write_unaligned(pv as *mut u32, 8);
+            std::ptr::write_unaligned(pv.add(4) as *mut u32, flags);
             TRUE
         }
-        SPI_SETSTICKYKEYS | SPI_SETTOGGLEKEYS | SPI_SETFILTERKEYS => {
-            log::debug!("SystemParametersInfo set accessibility {action:#x}: accepted (no system effect)");
+        SPI_SETSTICKYKEYS | SPI_SETTOGGLEKEYS => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let flags = std::ptr::read_unaligned(pv.add(4) as *const u32);
+            let mut st = spi_state().lock().unwrap();
+            if action == SPI_SETSTICKYKEYS {
+                st.sticky_flags = flags;
+            } else {
+                st.toggle_flags = flags;
+            }
             TRUE
         }
-        SPI_GETSCREENSAVEACTIVE => put_u32(0),
-        SPI_SETSCREENSAVEACTIVE => TRUE,
-        SPI_GETKEYBOARDDELAY => put_u32(1),
-        SPI_GETKEYBOARDSPEED => put_u32(31),
+        SPI_GETFILTERKEYS => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let fk = spi_state().lock().unwrap().filter_keys;
+            std::ptr::write_unaligned(pv as *mut u32, 24);
+            for (i, &w) in fk.iter().enumerate() {
+                std::ptr::write_unaligned(pv.add(4 + i * 4) as *mut u32, w);
+            }
+            TRUE
+        }
+        SPI_SETFILTERKEYS => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let mut fk = [0u32; 5];
+            for (i, slot) in fk.iter_mut().enumerate() {
+                *slot = std::ptr::read_unaligned(pv.add(4 + i * 4) as *const u32);
+            }
+            spi_state().lock().unwrap().filter_keys = fk;
+            TRUE
+        }
+        SPI_GETMOUSEKEYS => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let mk = spi_state().lock().unwrap().mouse_keys;
+            std::ptr::write_unaligned(pv as *mut u32, 28);
+            for (i, &w) in mk.iter().enumerate() {
+                std::ptr::write_unaligned(pv.add(4 + i * 4) as *mut u32, w);
+            }
+            TRUE
+        }
+        SPI_SETMOUSEKEYS => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let mut mk = [0u32; 6];
+            for (i, slot) in mk.iter_mut().enumerate() {
+                *slot = std::ptr::read_unaligned(pv.add(4 + i * 4) as *const u32);
+            }
+            spi_state().lock().unwrap().mouse_keys = mk;
+            TRUE
+        }
+        SPI_GETBORDER => put_u32(spi_state().lock().unwrap().border),
+        SPI_SETBORDER => {
+            spi_state().lock().unwrap().border = uparam.max(1);
+            TRUE
+        }
+        SPI_GETSCREENSAVETIMEOUT => put_u32(spi_state().lock().unwrap().screensave_timeout),
+        SPI_SETSCREENSAVETIMEOUT => {
+            spi_state().lock().unwrap().screensave_timeout = uparam;
+            TRUE
+        }
+        SPI_GETSCREENSAVEACTIVE => put_u32(spi_state().lock().unwrap().screensave_active),
+        SPI_SETSCREENSAVEACTIVE => {
+            spi_state().lock().unwrap().screensave_active = (uparam != 0) as u32;
+            TRUE
+        }
+        SPI_GETSCREENSAVERRUNNING => put_u32(0),
+        SPI_GETKEYBOARDDELAY => put_u32(spi_state().lock().unwrap().kbd_delay),
+        SPI_SETKEYBOARDDELAY => {
+            spi_state().lock().unwrap().kbd_delay = uparam.min(3);
+            TRUE
+        }
+        SPI_GETKEYBOARDSPEED => put_u32(spi_state().lock().unwrap().kbd_speed),
+        SPI_SETKEYBOARDSPEED => {
+            spi_state().lock().unwrap().kbd_speed = uparam.min(31);
+            TRUE
+        }
         SPI_GETMOUSE => {
             if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            // thresholds 6/10, acceleration 1 (Windows default)
-            let v = pv as *mut i32;
-            *v = 6;
-            *v.add(1) = 10;
-            *v.add(2) = 1;
+            let m = spi_state().lock().unwrap().mouse;
+            for (i, &val) in m.iter().enumerate() {
+                std::ptr::write_unaligned((pv as *mut i32).add(i), val);
+            }
             TRUE
         }
-        SPI_GETMOUSESPEED => put_u32(10),
-        SPI_GETWHEELSCROLLLINES => put_u32(3),
-        SPI_GETWHEELSCROLLCHARS => put_u32(3),
-        SPI_GETFONTSMOOTHING => put_u32(1),
-        SPI_GETSCREENREADER => put_u32(0),
-        SPI_GETCLIENTAREAANIMATION => put_u32(1),
-        SPI_GETHIGHCONTRAST => {
+        SPI_SETMOUSE => {
             if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            // HIGHCONTRAST { UINT cbSize; DWORD dwFlags; LPTSTR lpszDefaultScheme; }
-            *(pv.add(4) as *mut u32) = 0;
-            *(pv.add(8) as *mut usize) = 0;
+            let mut m = [0i32; 3];
+            for (i, slot) in m.iter_mut().enumerate() {
+                *slot = std::ptr::read_unaligned((pv as *const i32).add(i));
+            }
+            spi_state().lock().unwrap().mouse = m;
+            TRUE
+        }
+        SPI_GETMOUSESPEED => put_u32(spi_state().lock().unwrap().mouse_speed),
+        SPI_SETMOUSESPEED => {
+            let v = pv as usize as u32;
+            if !(1..=20).contains(&v) {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            spi_state().lock().unwrap().mouse_speed = v;
+            TRUE
+        }
+        SPI_GETWHEELSCROLLLINES => put_u32(spi_state().lock().unwrap().wheel_lines),
+        SPI_SETWHEELSCROLLLINES => {
+            spi_state().lock().unwrap().wheel_lines = uparam;
+            TRUE
+        }
+        SPI_GETWHEELSCROLLCHARS => put_u32(spi_state().lock().unwrap().wheel_chars),
+        SPI_SETWHEELSCROLLCHARS => {
+            spi_state().lock().unwrap().wheel_chars = uparam;
+            TRUE
+        }
+        SPI_GETICONTITLEWRAP => put_u32(1),
+        SPI_GETMENUDROPALIGNMENT => put_u32(0),
+        SPI_GETFASTTASKSWITCH => put_u32(1),
+        SPI_GETDRAGFULLWINDOWS => put_u32(spi_state().lock().unwrap().drag_full_windows),
+        SPI_SETDRAGFULLWINDOWS => {
+            spi_state().lock().unwrap().drag_full_windows = (uparam != 0) as u32;
+            TRUE
+        }
+        SPI_GETFONTSMOOTHING => put_u32(1),
+        SPI_GETFONTSMOOTHINGTYPE => put_u32(2),        // FE_FONTSMOOTHINGCLEARTYPE
+        SPI_GETFONTSMOOTHINGCONTRAST => put_u32(1200), // standard gamma 1.2
+        SPI_GETFONTSMOOTHINGORIENTATION => put_u32(1), // FE_FONTSMOOTHINGORIENTATIONRGB
+        SPI_GETSCREENREADER => put_u32(0),
+        SPI_GETSHOWSOUNDS => put_u32(0),
+        SPI_GETSNAPTODEFBUTTON => put_u32(0),
+        SPI_GETMOUSEHOVERWIDTH | SPI_GETMOUSEHOVERHEIGHT => put_u32(4),
+        SPI_GETMOUSEHOVERTIME => put_u32(400),
+        SPI_GETWINARRANGING | SPI_GETDOCKMOVING => put_u32(1),
+        SPI_GETKEYBOARDCUES => put_u32(0),
+        SPI_GETMOUSEVANISH => put_u32(0),
+        SPI_GETFLATMENU | SPI_GETDROPSHADOW | SPI_GETUIEFFECTS | SPI_GETCLIENTAREAANIMATION => put_u32(1),
+        SPI_GETFOREGROUNDLOCKTIMEOUT => put_u32(spi_state().lock().unwrap().fg_lock_timeout),
+        SPI_SETFOREGROUNDLOCKTIMEOUT => {
+            spi_state().lock().unwrap().fg_lock_timeout = pv as usize as u32;
+            TRUE
+        }
+        SPI_GETACTIVEWNDTRKTIMEOUT => put_u32(0),
+        SPI_GETFOREGROUNDFLASHCOUNT => put_u32(spi_state().lock().unwrap().fg_flash_count),
+        SPI_SETFOREGROUNDFLASHCOUNT => {
+            spi_state().lock().unwrap().fg_flash_count = pv as usize as u32;
+            TRUE
+        }
+        SPI_GETCARETWIDTH => put_u32(spi_state().lock().unwrap().caret_width),
+        SPI_SETCARETWIDTH => {
+            let v = pv as usize as u32;
+            if v == 0 {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            spi_state().lock().unwrap().caret_width = v;
+            TRUE
+        }
+        SPI_GETMESSAGEDURATION => put_u32(5),
+        SPI_GETDESKWALLPAPER => {
+            if pv.is_null() || uparam == 0 {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            if wide {
+                std::ptr::write_unaligned(pv as *mut u16, 0);
+            } else {
+                std::ptr::write_unaligned(pv, 0);
+            }
+            TRUE
+        }
+        SPI_GETHIGHCONTRAST => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            // HIGHCONTRAST { UINT cbSize; DWORD dwFlags; LPTSTR lpszDefaultScheme; } (16 bytes on x64)
+            std::ptr::write_unaligned(pv.add(4) as *mut u32, 0);
+            std::ptr::write_unaligned(pv.add(8) as *mut usize, 0);
+            TRUE
+        }
+        SPI_GETSOUNDSENTRY => {
+            if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            let cb = std::ptr::read_unaligned(pv as *const u32) as usize;
+            if cb < 48 {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            std::ptr::write_bytes(pv.add(4), 0, cb - 4);
             TRUE
         }
         SPI_GETANIMATION => {
             if pv.is_null() {
+                set_error(e::INVALID_PARAMETER);
                 return FALSE;
             }
-            *(pv.add(4) as *mut i32) = 1;
+            std::ptr::write_unaligned(pv.add(4) as *mut i32, 1);
+            TRUE
+        }
+        SPI_GETMINIMIZEDMETRICS => {
+            // MINIMIZEDMETRICS { UINT cbSize; int iWidth, iHorzGap, iVertGap, iArrange; } (20 bytes)
+            if pv.is_null() || std::ptr::read_unaligned(pv as *const u32) < 20 {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            std::ptr::write_unaligned(pv.add(4) as *mut i32, scale_dpi(154, dpi));
+            std::ptr::write_unaligned(pv.add(8) as *mut i32, 0);
+            std::ptr::write_unaligned(pv.add(12) as *mut i32, 0);
+            std::ptr::write_unaligned(pv.add(16) as *mut i32, 8); // ARW_HIDE
+            TRUE
+        }
+        SPI_GETICONTITLELOGFONT => {
+            let need = if wide { std::mem::size_of::<LogFontW>() } else { std::mem::size_of::<LogFontA>() };
+            if pv.is_null() || (uparam != 0 && (uparam as usize) < need) {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            if wide {
+                let mut lf = LogFontW::segoe_ui_9pt();
+                lf.lf_height = scale_dpi(lf.lf_height, dpi);
+                std::ptr::write_unaligned(pv as *mut LogFontW, lf);
+            } else {
+                let mut lf = LogFontA::segoe_ui_9pt();
+                lf.lf_height = scale_dpi(lf.lf_height, dpi);
+                std::ptr::write_unaligned(pv as *mut LogFontA, lf);
+            }
+            TRUE
+        }
+        SPI_GETICONMETRICS => {
+            // ICONMETRICSA = 16 + 60 = 76 bytes; ICONMETRICSW = 16 + 92 = 108 bytes.
+            let need = if wide { 108usize } else { 76usize };
+            if pv.is_null() || (std::ptr::read_unaligned(pv as *const u32) as usize) < need {
+                set_error(e::INVALID_PARAMETER);
+                return FALSE;
+            }
+            std::ptr::write_unaligned(pv.add(4) as *mut i32, scale_dpi(75, dpi)); // iHorzSpacing
+            std::ptr::write_unaligned(pv.add(8) as *mut i32, scale_dpi(75, dpi)); // iVertSpacing
+            std::ptr::write_unaligned(pv.add(12) as *mut i32, 1); // iTitleWrap
+            if wide {
+                let mut lf = LogFontW::segoe_ui_9pt();
+                lf.lf_height = scale_dpi(lf.lf_height, dpi);
+                std::ptr::write_unaligned(pv.add(16) as *mut LogFontW, lf);
+            } else {
+                let mut lf = LogFontA::segoe_ui_9pt();
+                lf.lf_height = scale_dpi(lf.lf_height, dpi);
+                std::ptr::write_unaligned(pv.add(16) as *mut LogFontA, lf);
+            }
             TRUE
         }
         SPI_GETNONCLIENTMETRICS => {
@@ -545,7 +936,25 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
             let write_len = cb.min(padded_sz);
             let cap = super::window::nc_insets(ws::CAPTION, 0).1;
             if wide {
-                let ncm = NonClientMetricsW::windows_default(cb as u32, cap);
+                let mut ncm = NonClientMetricsW::windows_default(cb as u32, cap);
+                if dpi >= 48 && dpi != 96 {
+                    ncm.i_border_width = scale_dpi(ncm.i_border_width, dpi);
+                    ncm.i_scroll_width = scale_dpi(ncm.i_scroll_width, dpi);
+                    ncm.i_scroll_height = scale_dpi(ncm.i_scroll_height, dpi);
+                    ncm.i_caption_width = scale_dpi(ncm.i_caption_width, dpi);
+                    ncm.i_caption_height = scale_dpi(ncm.i_caption_height, dpi);
+                    ncm.i_sm_caption_width = scale_dpi(ncm.i_sm_caption_width, dpi);
+                    ncm.i_sm_caption_height = scale_dpi(ncm.i_sm_caption_height, dpi);
+                    ncm.i_menu_width = scale_dpi(ncm.i_menu_width, dpi);
+                    ncm.i_menu_height = scale_dpi(ncm.i_menu_height, dpi);
+                    ncm.i_padded_border_width = scale_dpi(ncm.i_padded_border_width, dpi);
+                    let fh = scale_dpi(ncm.lf_caption_font.lf_height, dpi);
+                    ncm.lf_caption_font.lf_height = fh;
+                    ncm.lf_sm_caption_font.lf_height = fh;
+                    ncm.lf_menu_font.lf_height = fh;
+                    ncm.lf_status_font.lf_height = fh;
+                    ncm.lf_message_font.lf_height = fh;
+                }
                 std::ptr::copy_nonoverlapping(
                     &ncm as *const NonClientMetricsW as *const u8,
                     pv,
@@ -562,71 +971,158 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
             TRUE
         }
         _ => {
-            stub!("SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" });
-            set_error(e::CALL_NOT_IMPLEMENTED);
+            // Per Microsoft Learn SystemParametersInfo: invalid/unsupported uiAction
+            // returns FALSE with ERROR_INVALID_PARAMETER.
+            set_error(e::INVALID_PARAMETER);
             FALSE
         }
     }
 }
 
 pub unsafe extern "win64" fn SystemParametersInfoA(action: u32, uparam: u32, pv: *mut u8, _winini: u32) -> BOOL {
-    spi(action, uparam, pv, false)
+    spi(action, uparam, pv, false, 96)
 }
 
 pub unsafe extern "win64" fn SystemParametersInfoW(action: u32, uparam: u32, pv: *mut u8, _winini: u32) -> BOOL {
-    spi(action, uparam, pv, true)
+    spi(action, uparam, pv, true, 96)
 }
 
-pub unsafe extern "win64" fn SystemParametersInfoForDpi(action: u32, uparam: u32, pv: *mut u8, _winini: u32, _dpi: u32) -> BOOL {
-    spi(action, uparam, pv, true)
+pub unsafe extern "win64" fn SystemParametersInfoForDpi(action: u32, uparam: u32, pv: *mut u8, _winini: u32, dpi: u32) -> BOOL {
+    spi(action, uparam, pv, true, dpi)
 }
 
 // ---------------------------------------------------------------------------
-// Window station
+// Window station & Desktop
 // ---------------------------------------------------------------------------
 
 const WINSTA_HANDLE: usize = 0x0000_00A0;
+const DESKTOP_HANDLE: usize = 0x0000_00A4;
 const UOI_FLAGS: i32 = 1;
 const UOI_NAME: i32 = 2;
 const UOI_TYPE: i32 = 3;
+const UOI_USER_SID: i32 = 4;
+const UOI_HEAPSIZE: i32 = 5;
+const UOI_IO: i32 = 6;
 const WSF_VISIBLE: u32 = 1;
 
 pub unsafe extern "win64" fn GetProcessWindowStation() -> usize {
     WINSTA_HANDLE
 }
 
-unsafe fn user_object_info(h: usize, index: i32, pv: *mut u8, len: u32, needed: *mut u32, wide: bool) -> BOOL {
-    if h != WINSTA_HANDLE {
-        stub!("GetUserObjectInformation on handle {h:#x} (only the window station is known)");
+pub unsafe extern "win64" fn CloseWindowStation(h: usize) -> BOOL {
+    if h == WINSTA_HANDLE {
+        TRUE
+    } else {
         set_error(crate::types::err::ERROR_INVALID_HANDLE);
-        return FALSE;
+        FALSE
     }
+}
+
+pub unsafe extern "win64" fn GetThreadDesktop(_tid: u32) -> usize {
+    DESKTOP_HANDLE
+}
+
+pub unsafe extern "win64" fn OpenInputDesktop(_flags: u32, _inherit: BOOL, _access: u32) -> usize {
+    DESKTOP_HANDLE
+}
+
+pub unsafe extern "win64" fn OpenDesktopW(name: LPCWSTR, _flags: u32, _inherit: BOOL, _access: u32) -> usize {
+    if name.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    let s = crate::strings::from_wide(name);
+    if s.eq_ignore_ascii_case("Default") {
+        DESKTOP_HANDLE
+    } else {
+        set_error(crate::types::err::ERROR_FILE_NOT_FOUND);
+        0
+    }
+}
+
+pub unsafe extern "win64" fn OpenDesktopA(name: LPCSTR, flags: u32, inherit: BOOL, access: u32) -> usize {
+    if name.is_null() {
+        set_error(e::INVALID_PARAMETER);
+        return 0;
+    }
+    let w = crate::strings::to_wide_z(&crate::strings::from_ansi(name));
+    OpenDesktopW(w.as_ptr(), flags, inherit, access)
+}
+
+pub unsafe extern "win64" fn CloseDesktop(h: usize) -> BOOL {
+    if h == DESKTOP_HANDLE {
+        TRUE
+    } else {
+        set_error(crate::types::err::ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+unsafe fn user_object_info(h: usize, index: i32, pv: *mut u8, len: u32, needed: *mut u32, wide: bool) -> BOOL {
+    let is_desktop = match h {
+        WINSTA_HANDLE => false,
+        DESKTOP_HANDLE => true,
+        _ => {
+            set_error(crate::types::err::ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
     let s = match index {
         UOI_FLAGS => {
             // USEROBJECTFLAGS { BOOL fInherit; BOOL fReserved; DWORD dwFlags; }
             if !needed.is_null() {
-                *needed = 12;
+                std::ptr::write_unaligned(needed, 12);
             }
             if len < 12 || pv.is_null() {
                 set_error(e::INSUFFICIENT_BUFFER);
                 return FALSE;
             }
-            *(pv as *mut u32) = 0;
-            *(pv.add(4) as *mut u32) = 0;
-            *(pv.add(8) as *mut u32) = WSF_VISIBLE;
+            std::ptr::write_unaligned(pv as *mut u32, 0);
+            std::ptr::write_unaligned(pv.add(4) as *mut u32, 0);
+            std::ptr::write_unaligned(pv.add(8) as *mut u32, if is_desktop { 0 } else { WSF_VISIBLE });
             return TRUE;
         }
-        UOI_NAME => "WinSta0",
-        UOI_TYPE => "WindowStation",
+        UOI_NAME => if is_desktop { "Default" } else { "WinSta0" },
+        UOI_TYPE => if is_desktop { "Desktop" } else { "WindowStation" },
+        UOI_USER_SID => {
+            // Per Microsoft Learn: if no SID is associated with the window station or desktop,
+            // GetUserObjectInformation sets *lpnLengthNeeded = 0 and returns TRUE.
+            if !needed.is_null() {
+                std::ptr::write_unaligned(needed, 0);
+            }
+            return TRUE;
+        }
+        UOI_HEAPSIZE => {
+            if !needed.is_null() {
+                std::ptr::write_unaligned(needed, 4);
+            }
+            if len < 4 || pv.is_null() {
+                set_error(e::INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            // Standard interactive desktop heap size (20 MB in KB).
+            std::ptr::write_unaligned(pv as *mut u32, if is_desktop { 20_480 } else { 0 });
+            return TRUE;
+        }
+        UOI_IO => {
+            if !needed.is_null() {
+                std::ptr::write_unaligned(needed, 4);
+            }
+            if len < 4 || pv.is_null() {
+                set_error(e::INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            std::ptr::write_unaligned(pv as *mut BOOL, TRUE);
+            return TRUE;
+        }
         _ => {
-            stub!("GetUserObjectInformation index {index} not supported");
             set_error(e::INVALID_PARAMETER);
             return FALSE;
         }
     };
     let bytes = if wide { (s.len() + 1) * 2 } else { s.len() + 1 } as u32;
     if !needed.is_null() {
-        *needed = bytes;
+        std::ptr::write_unaligned(needed, bytes);
     }
     if len < bytes || pv.is_null() {
         set_error(e::INSUFFICIENT_BUFFER);
@@ -753,14 +1249,118 @@ pub unsafe extern "win64" fn UnregisterDeviceNotification(h: usize) -> BOOL {
     TRUE
 }
 
-/// Global hotkeys are not delivered (macOS has no equivalent without
-/// accessibility permissions); registration succeeds so callers proceed.
+const MOD_MASK: u32 = 0x000F; // MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN
+const MOD_NOREPEAT: u32 = 0x4000;
+
+#[derive(Clone, Copy, Debug)]
+struct HotKeyEntry {
+    hwnd: usize,
+    tid: u32,
+    id: i32,
+    mods: u32,
+    norepeat: bool,
+    vk: u32,
+}
+
+static HOTKEYS: std::sync::Mutex<Vec<HotKeyEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Remove any registered hotkeys belonging to a destroyed window.
+pub(crate) fn forget_hotkeys(hwnd: usize) {
+    if hwnd == 0 {
+        return;
+    }
+    HOTKEYS.lock().unwrap().retain(|h| h.hwnd != hwnd);
+}
+
+/// Check if an incoming keydown matches a registered hotkey; if so, post
+/// `WM_HOTKEY` (0x0312) to the target window (or thread queue if `hwnd == 0`)
+/// and return `true` to consume the keystroke.
+pub(crate) fn try_dispatch_hotkey(mods: u32, vk: u32, is_repeat: bool) -> bool {
+    let norm_mods = mods & MOD_MASK;
+    let matched = {
+        let list = HOTKEYS.lock().unwrap();
+        list.iter().find(|h| h.mods == norm_mods && h.vk == vk).copied()
+    };
+    let Some(entry) = matched else {
+        return false;
+    };
+    if is_repeat && entry.norepeat {
+        return true;
+    }
+    let lparam = ((entry.mods & 0xFFFF) | ((entry.vk & 0xFFFF) << 16)) as u32 as isize;
+    if entry.hwnd != 0 {
+        super::message::post_message(entry.hwnd, super::wm::HOTKEY, entry.id as usize, lparam);
+    } else if let Some(q) = super::message::queue_of(entry.tid) {
+        q.post(MSG {
+            hwnd: 0,
+            message: super::wm::HOTKEY,
+            wparam: entry.id as usize,
+            lparam,
+            time: tick_ms(),
+            pt: super::cursor::cursor_pos(),
+            l_private: 0,
+        });
+    }
+    true
+}
+
+/// Register a hotkey (`WM_HOTKEY`) for `hwnd` (or the calling thread when `hwnd == NULL`).
+/// Fires whenever the registered `(mods, vk)` combination is pressed while the app receives
+/// keyboard events (note: macOS does not permit background global key capture without
+/// user-granted Accessibility permissions).
 pub unsafe extern "win64" fn RegisterHotKey(hwnd: HWND, id: i32, mods: u32, vk: u32) -> BOOL {
-    stub!("RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize);
+    if vk == 0 || (mods & !(MOD_MASK | MOD_NOREPEAT)) != 0 {
+        set_error(e::INVALID_PARAMETER);
+        return FALSE;
+    }
+    let h = hwnd as usize;
+    let tid = crate::teb::thread_id();
+    if h != 0 {
+        match super::window::get(h) {
+            Some(w) if w.tid == tid => {}
+            Some(_) => {
+                set_error(e::WINDOW_OF_OTHER_THREAD);
+                return FALSE;
+            }
+            None => {
+                set_error(e::INVALID_WINDOW_HANDLE);
+                return FALSE;
+            }
+        }
+    }
+    let norm_mods = mods & MOD_MASK;
+    let norepeat = (mods & MOD_NOREPEAT) != 0;
+    let mut list = HOTKEYS.lock().unwrap();
+    // Reject if another registration already owns this (mods, vk) pair.
+    if list
+        .iter()
+        .any(|e| e.mods == norm_mods && e.vk == vk && !(e.hwnd == h && e.tid == tid && e.id == id))
+    {
+        set_error(e::HOTKEY_ALREADY_REGISTERED);
+        return FALSE;
+    }
+    // Updating an existing (hwnd, tid, id) replaces its key binding in place.
+    if let Some(existing) = list.iter_mut().find(|e| e.hwnd == h && e.tid == tid && e.id == id) {
+        existing.mods = norm_mods;
+        existing.norepeat = norepeat;
+        existing.vk = vk;
+    } else {
+        list.push(HotKeyEntry { hwnd: h, tid, id, mods: norm_mods, norepeat, vk });
+    }
+    log::debug!("user32: RegisterHotKey(hwnd={h:#x}, id={id}, mods={mods:#x}, vk={vk:#x})");
     TRUE
 }
 
-pub unsafe extern "win64" fn UnregisterHotKey(_hwnd: HWND, _id: i32) -> BOOL {
+pub unsafe extern "win64" fn UnregisterHotKey(hwnd: HWND, id: i32) -> BOOL {
+    let h = hwnd as usize;
+    let tid = crate::teb::thread_id();
+    let mut list = HOTKEYS.lock().unwrap();
+    let before = list.len();
+    list.retain(|e| !(e.hwnd == h && e.tid == tid && e.id == id));
+    if list.len() == before {
+        set_error(e::HOTKEY_NOT_REGISTERED);
+        return FALSE;
+    }
     TRUE
 }
 
@@ -1802,20 +2402,49 @@ pub unsafe extern "win64" fn CharLowerBuffW(lpsz: LPWSTR, cch_length: u32) -> u3
     cch_length
 }
 
-pub unsafe extern "win64" fn wsprintfA(
-    out: LPSTR,
-    fmt: LPCSTR,
-    a1: usize,
-    a2: usize,
-) -> i32 {
-    let _ = (a1, a2);
-    if out.is_null() {
+/// Win32 `wsprintfA` / `wsprintfW` output buffer limit (1024 characters including NUL).
+const WSPRINTF_MAX_CHARS: usize = 1023;
+
+unsafe extern "win64" fn wsprintf_a_impl(args: *const u64) -> i32 {
+    let mut va = crate::va::VaList::new(args as *const u8);
+    let out = va.next_ptr::<u8>();
+    let fmt = va.next_ptr::<u8>() as *const u8;
+    if out.is_null() || fmt.is_null() {
         return 0;
     }
-    let s = crate::strings::from_ansi_opt(fmt).unwrap_or_default();
-    crate::strings::write_ansi_trunc(&s, out, 1024);
-    s.len() as i32
+    let Some(bytes) = crate::ucrt::printf::format_narrow_va(fmt, va.as_ptr()) else {
+        std::ptr::write_unaligned(out, 0);
+        return 0;
+    };
+    let n = bytes.len().min(WSPRINTF_MAX_CHARS);
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
+    }
+    std::ptr::write_unaligned(out.add(n), 0);
+    n as i32
 }
+
+unsafe extern "win64" fn wsprintf_w_impl(args: *const u64) -> i32 {
+    let mut va = crate::va::VaList::new(args as *const u8);
+    let out = va.next_ptr::<u16>();
+    let fmt = va.next_ptr::<u16>() as *const u16;
+    if out.is_null() || fmt.is_null() {
+        return 0;
+    }
+    let Some(units) = crate::ucrt::printf::format_wide_va(fmt, va.as_ptr()) else {
+        std::ptr::write_unaligned(out, 0);
+        return 0;
+    };
+    let n = units.len().min(WSPRINTF_MAX_CHARS);
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), out, n);
+    }
+    std::ptr::write_unaligned(out.add(n), 0);
+    n as i32
+}
+
+win64_varargs_thunk!(wsprintfA => wsprintf_a_impl);
+win64_varargs_thunk!(wsprintfW => wsprintf_w_impl);
 
 pub unsafe extern "win64" fn SetProcessDpiAwareness(_value: i32) -> HRESULT {
     S_OK
@@ -1873,8 +2502,12 @@ fn message_box(text: Option<String>, caption: Option<String>, ty: u32) -> i32 {
         }
         None if buttons.len() == 1 => IDOK,
         None => {
-            stub!("MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)");
-            set_error(e::CALL_NOT_IMPLEMENTED);
+            // Native-unsupported in headless/non-interactive mode (`PORT_HEADLESS=1` / no GUI
+            // session): interactive macOS displays a real `NSAlert` above. When there is no
+            // interactive desktop, Windows itself fails multi-choice `MessageBox` with 0 and
+            // `ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION` (1459; Microsoft Learn `MessageBox`).
+            log::warn!(target: "messagebox", "MessageBox type {ty:#x}: non-interactive headless session -> 0 (ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION)");
+            set_error(e::REQUIRES_INTERACTIVE_WINDOWSTATION);
             0
         }
     }
@@ -2654,6 +3287,165 @@ mod tests {
             assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
             assert_eq!(LoadStringW(hinst, 5, buf.as_mut_ptr(), -1), 0);
             assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn wsprintf_a_and_w_format_varargs_and_cap_at_1023() {
+        unsafe {
+            let mut abuf = [0u8; 1040];
+            let fmt_a = c"val=%d hex=%x str=%s".as_ptr() as u64;
+            let s_arg = c"ok".as_ptr() as u64;
+            let n = wsprintfA(abuf.as_mut_ptr() as u64, fmt_a, 42, 0xAB, s_arg, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(n, 20);
+            assert_eq!(crate::strings::from_ansi(abuf.as_ptr()), "val=42 hex=ab str=ok");
+
+            // 1024-char cap (max 1023 formatted chars + NUL).
+            let long_str = format!("{}\0", "X".repeat(1200));
+            let n_cap = wsprintfA(
+                abuf.as_mut_ptr() as u64,
+                c"%s".as_ptr() as u64,
+                long_str.as_ptr() as u64,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(n_cap, 1023);
+            assert_eq!(abuf[1023], 0);
+
+            let mut wbuf = [0u16; 1040];
+            let fmt_w = crate::strings::to_wide_z("val=%d hex=%X str=%s");
+            let ws_arg = crate::strings::to_wide_z("wide");
+            let wn = wsprintfW(
+                wbuf.as_mut_ptr() as u64,
+                fmt_w.as_ptr() as u64,
+                42,
+                0xAB,
+                ws_arg.as_ptr() as u64,
+                0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(wn, 22);
+            assert_eq!(read_wide_unaligned(wbuf.as_ptr()), "val=42 hex=AB str=wide");
+
+            let long_w = crate::strings::to_wide_z(&"Y".repeat(1200));
+            let fmt_ws = crate::strings::to_wide_z("%s");
+            let wn_cap = wsprintfW(
+                wbuf.as_mut_ptr() as u64,
+                fmt_ws.as_ptr() as u64,
+                long_w.as_ptr() as u64,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(wn_cap, 1023);
+            assert_eq!(wbuf[1023], 0);
+        }
+    }
+
+    #[test]
+    fn system_metrics_spi_user_object_info_hotkeys_and_headless_messagebox() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            // 1. GetSystemMetrics covers newly added SM_* indices and returns 0 for unknown.
+            assert_eq!(GetSystemMetrics(42), 1); // SM_DBCSENABLED
+            assert_eq!(GetSystemMetrics(45), 2); // SM_CXEDGE
+            assert_eq!(GetSystemMetrics(82), 1); // SM_IMMENABLED
+            assert_eq!(GetSystemMetrics(9999), 0); // undefined -> 0
+            assert_eq!(GetSystemMetricsForDpi(45, 192), 4); // 2 * 192/96
+
+            // 2. SystemParametersInfo GET/SET persistence + DPI-scaled NONCLIENTMETRICS.
+            let mut lines = 0u32;
+            assert_eq!(SystemParametersInfoW(SPI_SETWHEELSCROLLLINES, 7, std::ptr::null_mut(), 0), TRUE);
+            assert_eq!(SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &mut lines as *mut u32 as *mut u8, 0), TRUE);
+            assert_eq!(lines, 7);
+            assert_eq!(SystemParametersInfoW(SPI_SETWHEELSCROLLLINES, 3, std::ptr::null_mut(), 0), TRUE);
+
+            let mut ncm = std::mem::zeroed::<NonClientMetricsW>();
+            ncm.cb_size = std::mem::size_of::<NonClientMetricsW>() as u32;
+            assert_eq!(
+                SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, ncm.cb_size, &mut ncm as *mut _ as *mut u8, 0, 192),
+                TRUE
+            );
+            assert_eq!(ncm.i_scroll_width, 34); // 17 * 2
+            assert_eq!(ncm.lf_caption_font.lf_height, -24); // -12 * 2
+
+            // Unknown SPI action returns FALSE + ERROR_INVALID_PARAMETER.
+            assert_eq!(SystemParametersInfoW(0xDEAD, 0, std::ptr::null_mut(), 0), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // 3. GetUserObjectInformation on WindowStation AND Desktop handles for all UOI_* indices.
+            let winsta = GetProcessWindowStation();
+            let desk = GetThreadDesktop(0);
+            let mut needed = 0u32;
+            let mut name_buf = [0u16; 32];
+            assert_eq!(GetUserObjectInformationW(desk, UOI_NAME, name_buf.as_mut_ptr() as *mut u8, 64, &mut needed), TRUE);
+            assert_eq!(read_wide_unaligned(name_buf.as_ptr()), "Default");
+            assert_eq!(GetUserObjectInformationW(desk, UOI_TYPE, name_buf.as_mut_ptr() as *mut u8, 64, &mut needed), TRUE);
+            assert_eq!(read_wide_unaligned(name_buf.as_ptr()), "Desktop");
+            let mut heap_kb = 0u32;
+            assert_eq!(GetUserObjectInformationW(desk, UOI_HEAPSIZE, &mut heap_kb as *mut u32 as *mut u8, 4, &mut needed), TRUE);
+            assert!(heap_kb > 0);
+            let mut io_flag: BOOL = 0;
+            assert_eq!(GetUserObjectInformationW(winsta, UOI_IO, &mut io_flag as *mut BOOL as *mut u8, 4, &mut needed), TRUE);
+            assert_eq!(io_flag, TRUE);
+            assert_eq!(GetUserObjectInformationW(winsta, UOI_USER_SID, std::ptr::null_mut(), 0, &mut needed), TRUE);
+            assert_eq!(needed, 0);
+            assert_eq!(GetUserObjectInformationW(0x1234, UOI_NAME, std::ptr::null_mut(), 0, &mut needed), FALSE);
+            assert_eq!(crate::teb::last_error(), crate::types::err::ERROR_INVALID_HANDLE);
+            assert_eq!(GetUserObjectInformationW(winsta, 99, std::ptr::null_mut(), 0, &mut needed), FALSE);
+            assert_eq!(crate::teb::last_error(), e::INVALID_PARAMETER);
+
+            // 4. Headless multi-button MessageBox returns 0 + ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION.
+            let title = crate::strings::to_wide_z("Confirm");
+            let text = crate::strings::to_wide_z("Proceed?");
+            assert_eq!(MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 4 /* MB_YESNO */), 0);
+            assert_eq!(crate::teb::last_error(), e::REQUIRES_INTERACTIVE_WINDOWSTATION);
+            assert_eq!(MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0 /* MB_OK */), IDOK);
+        }
+
+        // 5. RegisterHotKey -> native_key -> WM_HOTKEY -> UnregisterHotKey.
+        std::thread::spawn(|| unsafe {
+            let cls = crate::strings::to_wide_z("HotKeyTestWnd");
+            let wc = super::super::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<super::super::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: super::super::WNDPROC_HANDLE_DEF_WINDOW_W,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = super::super::class::RegisterClassExW(&wc);
+            let hwnd = super::super::window::CreateWindowExW(
+                0, cls.as_ptr(), std::ptr::null(), ws::POPUP,
+                0, 0, 50, 50, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            assert_eq!(RegisterHotKey(hwnd, 7, 0x0002 /* MOD_CONTROL */ | MOD_NOREPEAT, b'A' as u32), TRUE);
+            // Duplicate registration with different ID fails with HOTKEY_ALREADY_REGISTERED.
+            assert_eq!(RegisterHotKey(hwnd, 8, 0x0002, b'A' as u32), FALSE);
+            assert_eq!(crate::teb::last_error(), e::HOTKEY_ALREADY_REGISTERED);
+
+            // Press Ctrl + 'A' (mac 0x3B = LCtrl, 0x00 = 'A').
+            super::super::input::native_key(super::super::input::NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            super::super::input::native_key(super::super::input::NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            // Repeat must be suppressed by MOD_NOREPEAT.
+            super::super::input::native_key(super::super::input::NativeKey { mac: 0x00, down: true, repeat: true, chars: vec![b'a' as u16] });
+            super::super::input::release_all_keys();
+
+            let mut m = MSG::default();
+            assert_eq!(super::super::message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, super::super::message::PM_REMOVE), TRUE);
+            assert_eq!(m.wparam, 7);
+            assert_eq!(m.lparam, ((0x0002u32) | ((b'A' as u32) << 16)) as isize);
+            assert_eq!(super::super::message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, super::super::message::PM_REMOVE), FALSE);
+
+            assert_eq!(UnregisterHotKey(hwnd, 7), TRUE);
+            assert_eq!(UnregisterHotKey(hwnd, 7), FALSE);
+            assert_eq!(crate::teb::last_error(), e::HOTKEY_NOT_REGISTERED);
+            let _ = super::super::window::DestroyWindow(hwnd);
         })
         .join()
         .unwrap();

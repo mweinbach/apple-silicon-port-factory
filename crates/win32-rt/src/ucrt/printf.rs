@@ -555,6 +555,28 @@ unsafe fn fmt_wide(opts: u64, fmt: *const u16, va: *const u8) -> Option<Vec<u16>
     format(Fmt::Wide(fmt), true, opts, &mut a).map(|u| u.iter().map(|&c| c as u16).collect())
 }
 
+/// Format a narrow Win32 printf format string using `va_list` without triggering
+/// CRT invalid-parameter handlers (used by `user32!wsprintfA`).
+pub(crate) unsafe fn format_narrow_va(fmt: *const u8, va: *const u8) -> Option<Vec<u8>> {
+    if fmt.is_null() {
+        return None;
+    }
+    let mut a = VaList::new(va);
+    format(Fmt::Narrow(fmt), false, 0, &mut a).map(|u| units_to_bytes(&u))
+}
+
+/// Format a wide Win32 printf format string using `va_list` without triggering
+/// CRT invalid-parameter handlers (used by `user32!wsprintfW`, where `%s`/`%c`
+/// are wide and `%S`/`%C` are narrow).
+pub(crate) unsafe fn format_wide_va(fmt: *const u16, va: *const u8) -> Option<Vec<u16>> {
+    if fmt.is_null() {
+        return None;
+    }
+    let mut a = VaList::new(va);
+    format(Fmt::Wide(fmt), true, LEGACY_WIDE_SPECIFIERS, &mut a)
+        .map(|u| u.iter().map(|&c| c as u16).collect())
+}
+
 pub unsafe extern "win64" fn __stdio_common_vsprintf(
     opts: u64,
     buf: *mut u8,

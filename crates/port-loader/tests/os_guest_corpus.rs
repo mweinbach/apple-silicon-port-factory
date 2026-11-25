@@ -1650,7 +1650,6 @@ int main(void) {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "expected failure: docs/stub-backlog.d/guest-corpus-bench.md (user32.dll!wsprintfW, user32.dll!wsprintfA)"]
 fn guest_user32_wsprintf_backlog() {
     let Some(zig) = find_zig() else {
         eprintln!("skipping guest_user32_wsprintf_backlog: zig not found");

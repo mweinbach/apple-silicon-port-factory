@@ -125,8 +125,10 @@ thread_local! {
     static LAST_KEY: RefCell<Option<(MSG, Vec<u16>)>> = const { RefCell::new(None) };
     /// (time, pos) of the message most recently retrieved (GetMessageTime/Pos).
     static LAST_MSG: std::cell::Cell<(u32, POINT)> = const { std::cell::Cell::new((0, POINT { x: 0, y: 0 })) };
-    /// Nesting depth of incoming inter-thread sends being processed.
-    static IN_SEND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Active stack of incoming inter-thread sent messages being processed on this thread.
+    /// Each slot holds `Some(reply)` until answered early via `ReplyMessage` (which takes it
+    /// to `None` and wakes the sender immediately) or when the window procedure returns.
+    static ACTIVE_REPLIES: RefCell<Vec<Option<Arc<Reply>>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn now_ms() -> u64 {
@@ -347,19 +349,33 @@ impl Filter {
     }
 }
 
+fn complete_reply(rep: Arc<Reply>, r: LRESULT) {
+    let g = handles::wait_lock();
+    *rep.result.get(&g) = Some(r);
+    drop(g);
+    handles::notify_object_key(&*rep as *const Reply as usize, usize::MAX);
+}
+
 fn run_sent(s: Sent) {
     match s {
         Sent::Call(f) => f(),
         Sent::Msg { hwnd, msg, wparam, lparam, reply } => {
-            IN_SEND.with(|c| c.set(c.get() + 1));
+            struct ReplyPopGuard;
+            impl Drop for ReplyPopGuard {
+                fn drop(&mut self) {
+                    if let Some(Some(rep)) = ACTIVE_REPLIES.with(|v| v.borrow_mut().pop()) {
+                        complete_reply(rep, 0);
+                    }
+                }
+            }
+            ACTIVE_REPLIES.with(|v| v.borrow_mut().push(reply));
+            let guard = ReplyPopGuard;
             super::misc::dispatch_callwndproc_hook(hwnd, msg, wparam, lparam, false);
             let r = super::window::call_window_proc(hwnd, msg, wparam, lparam);
-            IN_SEND.with(|c| c.set(c.get() - 1));
-            if let Some(rep) = reply {
-                let g = handles::wait_lock();
-                *rep.result.get(&g) = Some(r);
-                drop(g);
-                handles::notify_object_key(&*rep as *const Reply as usize, usize::MAX);
+            let pending = ACTIVE_REPLIES.with(|v| v.borrow_mut().pop()).flatten();
+            std::mem::forget(guard);
+            if let Some(rep) = pending {
+                complete_reply(rep, r);
             }
         }
     }
@@ -614,7 +630,7 @@ pub unsafe extern "win64" fn GetMessageExtraInfo() -> LPARAM {
 }
 
 pub unsafe extern "win64" fn InSendMessage() -> BOOL {
-    (IN_SEND.with(|c| c.get()) > 0) as BOOL
+    ACTIVE_REPLIES.with(|v| !v.borrow().is_empty()) as BOOL
 }
 
 /// `TranslateMessage`: posts `WM_CHAR`/`WM_SYSCHAR` for the characters
@@ -877,11 +893,19 @@ pub unsafe extern "win64" fn SendNotifyMessageW(hwnd: HWND, msg: u32, wparam: WP
     send_notify(hwnd as usize, msg, wparam, lparam)
 }
 
-pub unsafe extern "win64" fn ReplyMessage(_r: LRESULT) -> BOOL {
-    // Replies are delivered when the window procedure returns; early reply
-    // is not supported (the sender keeps waiting until then).
-    stub!("ReplyMessage: early reply not supported");
-    FALSE
+pub unsafe extern "win64" fn ReplyMessage(r: LRESULT) -> BOOL {
+    let entry = ACTIVE_REPLIES.with(|v| {
+        let mut s = v.borrow_mut();
+        s.last_mut().map(|slot| slot.take())
+    });
+    match entry {
+        None => FALSE, // not processing an inter-thread sent message
+        Some(Some(rep)) => {
+            complete_reply(rep, r);
+            TRUE
+        }
+        Some(None) => TRUE, // already replied or fire-and-forget SendNotifyMessage
+    }
 }
 
 pub unsafe extern "win64" fn CallWindowProcW(p: usize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1209,5 +1233,100 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn reply_message_unblocks_cross_thread_sender_early() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const WM_EARLY_REPLY: u32 = wm::USER + 0x55;
+
+        static SENDER_GOT_REPLY: AtomicBool = AtomicBool::new(false);
+        static WNDPROC_OBSERVED_SENDER_UNBLOCKED: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "win64" fn reply_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_EARLY_REPLY {
+                assert_eq!(InSendMessage(), TRUE);
+                assert_eq!(ReplyMessage(0x1234), TRUE);
+                // Second ReplyMessage on same send returns TRUE without overwriting.
+                assert_eq!(ReplyMessage(0x9999), TRUE);
+                // Wait up to 2s to prove sender unblocked BEFORE WndProc returned!
+                let start = std::time::Instant::now();
+                while !SENDER_GOT_REPLY.load(Ordering::Acquire) && start.elapsed().as_millis() < 2000 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                WNDPROC_OBSERVED_SENDER_UNBLOCKED.store(
+                    SENDER_GOT_REPLY.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                return 0x7777; // must NOT overwrite the early 0x1234 reply
+            }
+            super::defproc::DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        SENDER_GOT_REPLY.store(false, Ordering::Release);
+        WNDPROC_OBSERVED_SENDER_UNBLOCKED.store(false, Ordering::Release);
+
+        // Outside an inter-thread SendMessage, ReplyMessage returns FALSE.
+        unsafe {
+            assert_eq!(InSendMessage(), FALSE);
+            assert_eq!(ReplyMessage(1), FALSE);
+        }
+
+        let (tx_hwnd, rx_hwnd) = std::sync::mpsc::channel::<usize>();
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<()>();
+
+        let owner = std::thread::spawn(move || unsafe {
+            let cls = crate::strings::to_wide_z("EarlyReplyTestWnd");
+            let wc = super::class::WNDCLASSEX {
+                cb_size: std::mem::size_of::<super::class::WNDCLASSEX>() as u32,
+                style: 0,
+                wndproc: super::register_typed_host_wndproc(reply_wndproc),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+                icon_sm: 0,
+            };
+            let _ = super::class::RegisterClassExW(&wc);
+            let hwnd = super::window::CreateWindowExW(
+                0, cls.as_ptr(), std::ptr::null(), ws::POPUP,
+                0, 0, 50, 50, std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            tx_hwnd.send(hwnd as usize).unwrap();
+
+            // Pump until sender finishes.
+            let mut m = MSG::default();
+            while rx_done.try_recv().is_err() {
+                let _ = PeekMessageW(&mut m, std::ptr::null_mut(), 0, 0, PM_REMOVE);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let _ = super::window::DestroyWindow(hwnd);
+        });
+
+        let hwnd = rx_hwnd.recv().unwrap();
+        let sender = std::thread::spawn(move || unsafe {
+            let res = SendMessageW(hwnd as HWND, WM_EARLY_REPLY, 0, 0);
+            assert_eq!(res, 0x1234, "sender must receive early ReplyMessage value");
+            SENDER_GOT_REPLY.store(true, Ordering::Release);
+        });
+        sender.join().unwrap();
+        tx_done.send(()).unwrap();
+        owner.join().unwrap();
+
+        assert!(
+            WNDPROC_OBSERVED_SENDER_UNBLOCKED.load(Ordering::Acquire),
+            "sender must unblock before receiver WndProc returns"
+        );
     }
 }
