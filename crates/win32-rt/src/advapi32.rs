@@ -1399,6 +1399,28 @@ fn token_default_privileges() -> Vec<(u64, u32)> {
     vec![(23u64, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED)]
 }
 
+fn sid_hash_byte(sid: &[u8]) -> u8 {
+    if sid.len() < 8 {
+        return 0;
+    }
+    let sub_count = sid[1] as usize;
+    if sub_count > 0 && sid.len() >= 8 + sub_count * 4 {
+        // Low byte of the final SubAuthority (little-endian u32), matching Windows RtlSidHashInitialize.
+        sid[8 + (sub_count - 1) * 4]
+    } else {
+        sid[7]
+    }
+}
+
+fn populate_sid_hash(hash_out: &mut [u64; 32], sids: &[(Vec<u8>, u32)]) {
+    for (i, (sid, _)) in sids.iter().take(64).enumerate() {
+        let b = sid_hash_byte(sid);
+        let bit = 1u64 << i;
+        hash_out[(b & 0x0F) as usize] |= bit;
+        hash_out[16 + ((b >> 4) as usize)] |= bit;
+    }
+}
+
 unsafe fn write_token_groups(groups: &[(Vec<u8>, u32)], buf: *mut u8, buf_len: u32, ret_len: *mut u32) -> BOOL {
     // TOKEN_GROUPS on x64: DWORD GroupCount (offset 0), 4-byte pad, SID_AND_ATTRIBUTES[N] (offset 8, 16 bytes each)
     let header_sz = 8usize;
@@ -1690,14 +1712,20 @@ pub unsafe extern "win64" fn GetTokenInformation(
         20 => write_u32_token_info(token_is_elevated() as u32, buf, buf_len, ret_len),
         // TokenHasRestrictions (21) -> 0
         21 => write_u32_token_info(0, buf, buf_len, ret_len),
-        // TokenAccessInformation (22): TOKEN_ACCESS_INFORMATION (88 bytes on x64) + SidHash/RestrictedSidHash/CapabilitiesHash/Privileges
+        // TokenAccessInformation (22): TOKEN_ACCESS_INFORMATION (88 bytes on x64) + SidHash/RestrictedSidHash/CapabilitiesHash + SidAttr/SIDs + Privileges
         22 => {
-            // SID_AND_ATTRIBUTES_HASH on x64 is 8 + 8 + 32*8 = 272 bytes.
+            // SID_AND_ATTRIBUTES_HASH on x64 is 4 (SidCount) + 4 (pad) + 8 (SidAttr) + 32*8 (Hash) = 272 bytes.
             const HASH_SZ: usize = 272;
             let header_sz = 88usize;
+            let mut sids = vec![(token_user_sid(), 0u32)];
+            sids.extend(token_default_groups());
             let privs = token_default_privileges();
+            let hashes_end = header_sz + HASH_SZ * 3;
+            let sids_arr_sz = sids.len() * 16;
+            let sids_data_sz: usize = sids.iter().map(|(s, _)| s.len()).sum();
+            let privs_off = (hashes_end + sids_arr_sz + sids_data_sz + 7) & !7;
             let privs_sz = 4 + privs.len() * 12;
-            let need = (header_sz + HASH_SZ * 3 + privs_sz) as u32;
+            let need = (privs_off + privs_sz) as u32;
             std::ptr::write_unaligned(ret_len, need);
             if buf.is_null() || buf_len < need {
                 return err(crate::types::err::ERROR_INSUFFICIENT_BUFFER, FALSE);
@@ -1706,7 +1734,24 @@ pub unsafe extern "win64" fn GetTokenInformation(
             let sid_hash = buf.add(header_sz);
             let restr_hash = sid_hash.add(HASH_SZ);
             let cap_hash = restr_hash.add(HASH_SZ);
-            let privs_ptr = cap_hash.add(HASH_SZ);
+            let sids_arr = buf.add(hashes_end);
+            let mut sid_data_off = hashes_end + sids_arr_sz;
+            for (i, (sid, attrs)) in sids.iter().enumerate() {
+                let dst = buf.add(sid_data_off);
+                std::ptr::copy_nonoverlapping(sid.as_ptr(), dst, sid.len());
+                let ent = sids_arr.add(i * 16);
+                std::ptr::write_unaligned(ent as *mut usize, dst as usize);
+                std::ptr::write_unaligned(ent.add(8) as *mut u32, *attrs);
+                sid_data_off += sid.len();
+            }
+            let mut hash_entries = [0u64; 32];
+            populate_sid_hash(&mut hash_entries, &sids);
+            std::ptr::write_unaligned(sid_hash as *mut u32, sids.len() as u32);
+            std::ptr::write_unaligned(sid_hash.add(8) as *mut usize, sids_arr as usize);
+            for (i, &entry) in hash_entries.iter().enumerate() {
+                std::ptr::write_unaligned(sid_hash.add(16 + i * 8) as *mut u64, entry);
+            }
+            let privs_ptr = buf.add(privs_off);
             std::ptr::write_unaligned(privs_ptr as *mut u32, privs.len() as u32);
             for (i, &(luid, attrs)) in privs.iter().enumerate() {
                 let ent = privs_ptr.add(4 + i * 12);
@@ -6992,6 +7037,39 @@ mod tests {
             assert_eq!(need, 56);
             assert_ne!(u64::from_le_bytes(stats[0..8].try_into().unwrap()), 0);
             assert_eq!(u32::from_le_bytes(stats[24..28].try_into().unwrap()), TOKEN_PRIMARY);
+
+            // TokenAccessInformation (22) -> SidHash populated with user + groups + bit-sliced hash entries
+            let mut ai_need = 0u32;
+            assert_eq!(GetTokenInformation(tok, 22, std::ptr::null_mut(), 0, &mut ai_need), FALSE);
+            assert_eq!(crate::teb::last_error(), ERROR_INSUFFICIENT_BUFFER);
+            let mut ai_buf = vec![0u8; ai_need as usize];
+            assert_eq!(GetTokenInformation(tok, 22, ai_buf.as_mut_ptr(), ai_need, &mut ai_need), TRUE);
+            let base = ai_buf.as_ptr() as usize;
+            let end = base + ai_buf.len();
+            let sid_hash_ptr = std::ptr::read_unaligned(ai_buf.as_ptr() as *const usize);
+            assert!(sid_hash_ptr >= base && sid_hash_ptr + 272 <= end);
+            let sh = sid_hash_ptr as *const u8;
+            let mut expected_sids = vec![(token_user_sid(), 0u32)];
+            expected_sids.extend(token_default_groups());
+            let sid_count = std::ptr::read_unaligned(sh as *const u32) as usize;
+            assert_eq!(sid_count, expected_sids.len());
+            let sid_attr_ptr = std::ptr::read_unaligned(sh.add(8) as *const usize);
+            assert!(sid_attr_ptr >= base && sid_attr_ptr + sid_count * 16 <= end);
+            for (i, (exp_sid, exp_attrs)) in expected_sids.iter().enumerate() {
+                let ent = (sid_attr_ptr as *const u8).add(i * 16);
+                let sp = std::ptr::read_unaligned(ent as *const usize);
+                let attrs = std::ptr::read_unaligned(ent.add(8) as *const u32);
+                assert!(sp >= base && sp + exp_sid.len() <= end);
+                assert_eq!(std::slice::from_raw_parts(sp as *const u8, exp_sid.len()), exp_sid.as_slice());
+                assert_eq!(attrs, *exp_attrs);
+                let b = sid_hash_byte(exp_sid);
+                let lo = std::ptr::read_unaligned(sh.add(16 + ((b & 0x0F) as usize) * 8) as *const u64);
+                let hi = std::ptr::read_unaligned(sh.add(16 + (16 + ((b >> 4) as usize)) * 8) as *const u64);
+                assert_ne!((lo & hi) & (1u64 << i), 0, "SID {i} missing from SidHash");
+            }
+            let privs_ptr = std::ptr::read_unaligned(ai_buf.as_ptr().add(16) as *const usize);
+            assert!(privs_ptr >= base && privs_ptr + 16 <= end);
+            assert_eq!(std::ptr::read_unaligned(privs_ptr as *const u32), 1);
 
             // Documented failure classes: 14 (reserved), 16 (SeSecurityPrivilege), 19 (no linked UAC token), 99 (invalid)
             assert_eq!(GetTokenInformation(tok, 14, std::ptr::null_mut(), 0, &mut need), FALSE);
