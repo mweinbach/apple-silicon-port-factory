@@ -192,7 +192,7 @@ user32.dll	RegisterRawInputDevices	stub	crates/win32-rt/src/user32/input.rs	1363
 user32.dll	ReplyMessage	stub	crates/win32-rt/src/user32/message.rs	883	"ReplyMessage: early reply not supported"
 user32.dll	def_window_proc	stub	crates/win32-rt/src/user32/defproc.rs	154	"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"
 user32.dll	load_cursor	stub	crates/win32-rt/src/user32/cursor.rs	87	"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"
-user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1861	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
+user32.dll	message_box	stub	crates/win32-rt/src/user32/misc.rs	1876	"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"
 user32.dll	spi	stub	crates/win32-rt/src/user32/misc.rs	565	"SystemParametersInfo{}({action:#x}, {uparam}) not supported -> FALSE", if wide { "W" } else { "A" }
 user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	600	"GetUserObjectInformation on handle {h:#x} (only the window station is known)"
 user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	622	"GetUserObjectInformation index {index} not supported"

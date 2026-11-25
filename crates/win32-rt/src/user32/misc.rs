@@ -1802,6 +1802,21 @@ pub unsafe extern "win64" fn CharLowerBuffW(lpsz: LPWSTR, cch_length: u32) -> u3
     cch_length
 }
 
+pub unsafe extern "win64" fn wsprintfA(
+    out: LPSTR,
+    fmt: LPCSTR,
+    a1: usize,
+    a2: usize,
+) -> i32 {
+    let _ = (a1, a2);
+    if out.is_null() {
+        return 0;
+    }
+    let s = crate::strings::from_ansi_opt(fmt).unwrap_or_default();
+    crate::strings::write_ansi_trunc(&s, out, 1024);
+    s.len() as i32
+}
+
 pub unsafe extern "win64" fn SetProcessDpiAwareness(_value: i32) -> HRESULT {
     S_OK
 }

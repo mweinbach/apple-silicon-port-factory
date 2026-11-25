@@ -2115,7 +2115,7 @@ pub unsafe fn resume_at(ctx: &Context, cur: Cur) -> ! {
 /// The calling guest frame's context if the innermost record is an emulated region whose
 /// in-flight host call is `host_fn` (i.e. guest code called `host_fn` directly), with its
 /// cursor; else `None`.
-pub(crate) unsafe fn guest_caller_context(host_fn: usize, ctx: &mut Context) -> Option<Cur> {
+unsafe fn guest_caller_context(host_fn: usize, ctx: &mut Context) -> Option<Cur> {
     let h = eh_hooks()?;
     let head = (h.head)();
     if head.is_null() || (*head).kind != EH_EMU_ENTRY || (h.callout_fn)(head) != host_fn {
