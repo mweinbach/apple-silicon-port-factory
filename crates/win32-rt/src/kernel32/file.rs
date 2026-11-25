@@ -2423,6 +2423,27 @@ unsafe fn collect_dir_enum_entries_fd(dir_fd: libc::c_int) -> std::io::Result<Ve
     let _dir_guard = DirGuard(dirp);
     libc::rewinddir(dirp);
 
+    let live_dir_path: Option<PathBuf> = {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let mut pbuf = [0u8; libc::PATH_MAX as usize];
+            if libc::fcntl(dir_fd, libc::F_GETPATH, pbuf.as_mut_ptr()) == 0 {
+                let cstr = std::ffi::CStr::from_ptr(pbuf.as_ptr() as *const libc::c_char);
+                Some(PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes())))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
+    };
+    if live_dir_path.as_deref().is_some_and(path::is_host_private_keystore_path) {
+        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
+
     let mut children = Vec::new();
     loop {
         #[cfg(target_vendor = "apple")]
@@ -2443,6 +2464,14 @@ unsafe fn collect_dir_enum_entries_fd(dir_fd: libc::c_int) -> std::io::Result<Ve
         let name_cstr = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
         if name_cstr.to_bytes() == b"." || name_cstr.to_bytes() == b".." {
             continue;
+        }
+        #[cfg(unix)]
+        if let Some(ref base) = live_dir_path {
+            use std::os::unix::ffi::OsStrExt;
+            let child_path = base.join(std::ffi::OsStr::from_bytes(name_cstr.to_bytes()));
+            if path::is_host_private_keystore_path(&child_path) {
+                continue;
+            }
         }
         let name = name_cstr.to_string_lossy().into_owned();
         let mut sm: libc::stat = std::mem::zeroed();
@@ -4603,11 +4632,15 @@ fn find_first(pattern: &str) -> Result<FindObj, u32> {
     let mut v: Vec<FindEntry> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
+            let ep = e.path();
+            if path::is_host_private_keystore_path(&ep) {
+                return None;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             if !wildcard_match(pat, &name) {
                 return None;
             }
-            let m = std::fs::metadata(e.path()).ok()?;
+            let m = std::fs::metadata(ep).ok()?;
             Some(FindEntry { attrs: meta_attrs(&m, &name), times: meta_times(&m), size: if m.is_dir() { 0 } else { m.len() }, name })
         })
         .collect();
@@ -4800,13 +4833,17 @@ fn snapshot_dir_rec(
         }
     };
     for entry in rd.flatten() {
+        let ep = entry.path();
+        if path::is_host_private_keystore_path(&ep) {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let rel = if rel_prefix.is_empty() {
             name
         } else {
             format!("{rel_prefix}\\{name}")
         };
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let Ok(meta) = std::fs::symlink_metadata(ep) else {
             continue;
         };
         let snap = dir_entry_from_meta(&meta);
