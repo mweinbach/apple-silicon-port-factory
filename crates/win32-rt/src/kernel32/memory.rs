@@ -238,23 +238,51 @@ impl VmState {
             self.reset_resident.remove(&hp);
         }
     }
+    /// Returns `true` if any committed 4 KiB subpage in the enclosing `HOST_PAGE`
+    /// outside `exclude_range` (if given) has `PAGE_NOACCESS` or `PAGE_GUARD`.
+    fn has_protected_subpage(&self, hpage: usize, exclude_range: Option<(usize, usize)>) -> bool {
+        if HOST_PAGE <= PAGE {
+            return false;
+        }
+        let mut sub = hpage;
+        while sub < hpage + HOST_PAGE {
+            let excluded = exclude_range.is_some_and(|(s, e)| sub >= s && sub < e);
+            if !excluded {
+                if let Some((&_ss, sseg)) = self.segs.range(..=sub).next_back() {
+                    if sub < sseg.end
+                        && sseg.state == MEM_COMMIT
+                        && ((sseg.prot & 0xFF) == PAGE_NOACCESS || (sseg.prot & PAGE_GUARD) != 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            sub += PAGE;
+        }
+        false
+    }
 }
 
-/// Apply host protection for `[start, end)` inside `vm`, stripping `PROT_WRITE` on
-/// clean (not-yet-written) host pages of `MEM_WRITE_WATCH` allocations so the first
-/// store triggers `try_handle_write_watch_fault`.
+/// Apply host protection for `[start, end)` inside `vm`, preserving `PROT_NONE` on
+/// any enclosing 16 KiB host page that contains a `PAGE_GUARD` or `PAGE_NOACCESS`
+/// sibling subpage outside `[start, end)`, and stripping `PROT_WRITE` on clean
+/// (not-yet-written) host pages of `MEM_WRITE_WATCH` allocations so the first store
+/// triggers `try_handle_write_watch_fault`.
 unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u32, write_watch: bool) -> i32 {
     let base_host = win_prot_to_host(prot);
-    if !write_watch || !is_writable_prot(prot) || (prot & PAGE_GUARD) != 0 {
-        return host_mprotect(start, end - start, base_host);
+    let wants_none = (prot & 0xFF) == PAGE_NOACCESS || (prot & PAGE_GUARD) != 0;
+    if wants_none {
+        return host_mprotect(start, end - start, libc::PROT_NONE);
     }
     let mut hp = start & !(HOST_PAGE - 1);
     let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
     while hp < hend {
-        let p = if vm.write_watch_dirty.contains(&hp) {
-            base_host
-        } else {
+        let p = if vm.has_protected_subpage(hp, Some((start, end))) {
+            libc::PROT_NONE
+        } else if write_watch && is_writable_prot(prot) && !vm.write_watch_dirty.contains(&hp) {
             base_host & !libc::PROT_WRITE
+        } else {
+            base_host
         };
         let rc = host_mprotect(hp, HOST_PAGE, p);
         if rc != 0 {
@@ -270,12 +298,32 @@ unsafe fn host_page_is_incore(hpage: usize) -> bool {
     libc::mincore(hpage as *const c_void, HOST_PAGE, &mut state) == 0 && (state & 1) != 0
 }
 
+/// Record the enclosing host page of `addr` as dirty if it belongs to a
+/// `MEM_WRITE_WATCH` allocation (used when a write is emulated on a 16 KiB host
+/// page kept `PROT_NONE` for a `PAGE_GUARD`/`PAGE_NOACCESS` sibling).
+pub fn mark_write_watch_dirty(addr: usize) {
+    if !HAS_WRITE_WATCH_PAGES.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let page = addr & !(PAGE - 1);
+    let hpage = addr & !(HOST_PAGE - 1);
+    let mut vm = VM.lock().unwrap();
+    if vm.alloc_containing(page).is_some_and(|(_, a)| a.write_watch) {
+        vm.write_watch_dirty.insert(hpage);
+    }
+}
+
 /// Handle a hardware write fault on a clean `MEM_WRITE_WATCH` host page.
 ///
 /// Called from the host `SIGBUS`/`SIGSEGV` handler before guest exception dispatch.
 /// Returns `true` when `fault_addr` lies in a committed, writable, non-guard page of
-/// a `MEM_WRITE_WATCH` allocation, records the host page as written, enables
+/// a `MEM_WRITE_WATCH` allocation and no sibling 4 KiB subpage on the same 16 KiB host
+/// page is `PAGE_GUARD` or `PAGE_NOACCESS`: records the host page as written, enables
 /// `PROT_WRITE`, and lets the faulting instruction retry natively.
+///
+/// When a sibling 4 KiB subpage is `PAGE_GUARD` or `PAGE_NOACCESS`, returns `false`
+/// without altering host protection so the fault handler emulates the single store
+/// without exposing the protected sibling.
 pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) -> bool {
     if !is_write || !HAS_WRITE_WATCH_PAGES.load(std::sync::atomic::Ordering::Acquire) {
         return false;
@@ -297,6 +345,9 @@ pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) ->
         || !is_writable_prot(seg.prot)
         || (seg.prot & PAGE_GUARD) != 0
     {
+        return false;
+    }
+    if vm.has_protected_subpage(hpage, Some((page, page + PAGE))) {
         return false;
     }
     vm.write_watch_dirty.insert(hpage);
@@ -334,24 +385,7 @@ pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult
     let new_prot = old_prot & !PAGE_GUARD;
     vm.set_range(page, page + PAGE, MEM_COMMIT, new_prot);
 
-    let mut sibling_protected = false;
-    if HOST_PAGE > PAGE {
-        let mut sub = hpage;
-        while sub < hpage + HOST_PAGE {
-            if sub != page {
-                if let Some((&_ss, sseg)) = vm.segs.range(..=sub).next_back() {
-                    if sub < sseg.end
-                        && sseg.state == MEM_COMMIT
-                        && ((sseg.prot & 0xFF) == PAGE_NOACCESS || (sseg.prot & PAGE_GUARD) != 0)
-                    {
-                        sibling_protected = true;
-                        break;
-                    }
-                }
-            }
-            sub += PAGE;
-        }
-    }
+    let sibling_protected = vm.has_protected_subpage(hpage, Some((page, page + PAGE)));
 
     if !sibling_protected {
         let host_p = if write_watch && is_writable_prot(new_prot) && !vm.write_watch_dirty.contains(&hpage) {
@@ -898,38 +932,48 @@ pub unsafe extern "win64" fn GetWriteWatch(
     };
     let hstart = start & !(HOST_PAGE - 1);
     let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-    let mut vm = VM.lock().unwrap();
-    let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
-        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
-        return u32::MAX;
-    };
-    if !alloc.write_watch || end > alloc_base + alloc.size {
-        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
-        return u32::MAX;
-    }
+    // Read caller capacity BEFORE acquiring `VM` so a fault on a clean `MEM_WRITE_WATCH`
+    // or `PAGE_GUARD` output buffer cannot self-deadlock on `VM`.
     let cap = std::ptr::read_unaligned(count);
-    let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).take(cap).copied().collect();
+    let dirty: Vec<usize> = {
+        let mut vm = VM.lock().unwrap();
+        let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return u32::MAX;
+        };
+        if !alloc.write_watch || end > alloc_base + alloc.size {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return u32::MAX;
+        }
+        let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).take(cap).copied().collect();
+        if (flags & WRITE_WATCH_FLAG_RESET) != 0 {
+            // Per Microsoft Learn (GetWriteWatch): when WRITE_WATCH_FLAG_RESET is set,
+            // reset only the pages whose addresses were returned in `addresses`.
+            for &hp in &dirty {
+                vm.write_watch_dirty.remove(&hp);
+                if vm.has_protected_subpage(hp, None) {
+                    continue;
+                }
+                if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
+                    if hp < seg.end
+                        && seg.state == MEM_COMMIT
+                        && is_writable_prot(seg.prot)
+                        && (seg.prot & PAGE_GUARD) == 0
+                    {
+                        let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
+                    }
+                }
+            }
+        }
+        dirty
+    };
+    // Write guest output buffers strictly AFTER releasing `VM` so output buffers residing
+    // on clean `MEM_WRITE_WATCH` or `PAGE_GUARD` pages fault cleanly without deadlocking.
     for (i, &hp) in dirty.iter().enumerate() {
         std::ptr::write_unaligned(addresses.add(i), hp as *mut c_void);
     }
     std::ptr::write_unaligned(count, dirty.len());
     std::ptr::write_unaligned(granularity, HOST_PAGE as u32);
-    if (flags & WRITE_WATCH_FLAG_RESET) != 0 {
-        // Per Microsoft Learn (GetWriteWatch): when WRITE_WATCH_FLAG_RESET is set,
-        // reset only the pages whose addresses were returned in `addresses`.
-        for hp in dirty {
-            vm.write_watch_dirty.remove(&hp);
-            if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
-                if hp < seg.end
-                    && seg.state == MEM_COMMIT
-                    && is_writable_prot(seg.prot)
-                    && (seg.prot & PAGE_GUARD) == 0
-                {
-                    let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
-                }
-            }
-        }
-    }
     0
 }
 
@@ -957,6 +1001,9 @@ pub unsafe extern "win64" fn ResetWriteWatch(base: *mut c_void, region_size: usi
     let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).copied().collect();
     for hp in dirty {
         vm.write_watch_dirty.remove(&hp);
+        if vm.has_protected_subpage(hp, None) {
+            continue;
+        }
         if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
             if hp < seg.end
                 && seg.state == MEM_COMMIT
@@ -1857,6 +1904,27 @@ mod tests {
             count = addrs.len();
             assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
             assert_eq!(count, 0);
+
+            // On 16 KiB host pages, a PAGE_GUARD or PAGE_NOACCESS sibling subpage prevents
+            // try_handle_write_watch_fault from lifting host protection on the whole host page;
+            // emulated stores record dirtiness via mark_write_watch_dirty instead.
+            if HOST_PAGE > PAGE {
+                let mut old = 0u32;
+                let p0 = base as usize;
+                assert_eq!(VirtualProtect((p0 + PAGE) as *mut c_void, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
+                assert!(
+                    !try_handle_write_watch_fault(p0 + 16, true),
+                    "write-watch fast path must not unprotect a host page with a PAGE_GUARD sibling"
+                );
+                mark_write_watch_dirty(p0 + 16);
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 1);
+                assert_eq!(addrs[0] as usize, p0);
+                // Clear sibling guard and verify normal reset.
+                assert_eq!(VirtualProtect((p0 + PAGE) as *mut c_void, PAGE, PAGE_READWRITE, &mut old), TRUE);
+                assert_eq!(ResetWriteWatch(base, region_sz), 0);
+            }
 
             // Non-write-watch region rejected with u32::MAX / ERROR_INVALID_PARAMETER.
             let plain = VirtualAlloc(std::ptr::null_mut(), HOST_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);

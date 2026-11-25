@@ -409,22 +409,22 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             std::ptr::write_unaligned(out as *mut u32, crate::kernel32::process::process_cookie() as u32);
             STATUS_SUCCESS
         }
-        0x3C => {
-            // ProcessSubsystemInformation (4 bytes: 0 = SubsystemInformationTypeWin32)
-            put_ret(4);
-            if len < 4 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_unaligned(out as *mut u32, 0);
-            STATUS_SUCCESS
-        }
-        0x40 => {
+        0x3D => {
             // ProcessProtectionInformation (PS_PROTECTION: 1 byte, 0 = unprotected)
             put_ret(1);
             if len < 1 || out.is_null() {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             *out = 0;
+            STATUS_SUCCESS
+        }
+        0x4B => {
+            // ProcessSubsystemInformation (4 bytes: 0 = SubsystemInformationTypeWin32)
+            put_ret(4);
+            if len < 4 || out.is_null() {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            std::ptr::write_unaligned(out as *mut u32, 0);
             STATUS_SUCCESS
         }
         _ => {
@@ -547,7 +547,7 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             std::ptr::write_unaligned(out as *mut usize, start);
             STATUS_SUCCESS
         }
-        0x0D => {
+        0x0C => {
             // ThreadAmILastThread (4 bytes)
             put_ret(4);
             if len < 4 || out.is_null() {
@@ -581,7 +581,7 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             *out = hidden as u8;
             STATUS_SUCCESS
         }
-        0x19 => {
+        0x1E => {
             // ThreadGroupInformation (GROUP_AFFINITY: 16 bytes)
             put_ret(16);
             if len < 16 || out.is_null() {
@@ -3497,7 +3497,7 @@ mod tests {
     fn nt_query_info_classes_transactions_and_kernel_entries() {
         unsafe {
             // 1. NtQueryInformationProcess classes: VmCounters(3), PriorityClass(0x12), AffinityMask(0x15),
-            // Session(0x18), Cookie(0x24), Subsystem(0x3C), invalid handle, unknown class.
+            // Session(0x18), Cookie(0x24), Protection(0x3D), Subsystem(0x4B), invalid handle, unknown classes.
             let mut buf = [0u8; 256];
             let mut ret = 0u32;
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
@@ -3509,17 +3509,30 @@ mod tests {
             assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x18, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
             assert_eq!(std::ptr::read_unaligned(buf.as_ptr() as *const u32), 1);
-            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3C, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3D, buf.as_mut_ptr(), 1, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 1);
+            assert_eq!(buf[0], 0);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x4B, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 4);
             assert_eq!(std::ptr::read_unaligned(buf.as_ptr() as *const u32), 0);
+            // ProcessCommandLineInformation (0x3C) and ProcessTelemetryIdInformation (0x40) are not misrouted.
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3C, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x40, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
             assert_eq!(NtQueryInformationProcess(0xDEADusize as HANDLE, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_INVALID_HANDLE);
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
 
-            // 2. NtQueryInformationThread classes: ThreadTimes(1), ThreadHideFromDebugger(0x11) round-trip,
-            // ThreadGroupInformation(0x19), ThreadNameInformation(0x26), unknown class.
+            // 2. NtQueryInformationThread classes: ThreadTimes(1), ThreadAmILastThread(0x0C),
+            // ThreadHideFromDebugger(0x11) round-trip, ThreadGroupInformation(0x1E), ThreadNameInformation(0x26),
+            // unknown classes.
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 1, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 32);
-            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x19, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0C, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 4);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x1E, buf.as_mut_ptr(), 16, &mut ret), STATUS_SUCCESS);
             assert_ne!(std::ptr::read_unaligned(buf.as_ptr() as *const usize), 0);
+            // ThreadActualBasePriority (0x19) and 0x0D are not misrouted.
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x0D, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x19, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
             let mut hidden = 99u8;
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x11, &mut hidden, 1, &mut ret), STATUS_SUCCESS);
             assert_eq!(NtSetInformationThread(crate::handles::CURRENT_THREAD, 0x11, std::ptr::null(), 0), STATUS_SUCCESS);

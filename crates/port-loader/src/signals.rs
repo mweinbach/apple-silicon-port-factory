@@ -569,6 +569,7 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u
             }
         }
         let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+        win32_rt::kernel32::memory::mark_write_watch_dirty(fault_addr as usize);
     } else {
         let Some(ld) = decode_arm64_load(insn) else {
             return false;
@@ -777,7 +778,12 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
                     memory::query(hpage + i * 0x1000)
                         .is_some_and(|m| m.state == MEM_COMMIT && (m.protect & PAGE_GUARD) != 0)
                 });
-                if (any_sibling_guard || !unwind::has_guest_exception_handler())
+                let any_guest_pe_noaccess_sibling = (0..4).any(|i| {
+                    let sub = hpage + i * 0x1000;
+                    in_guest(sub)
+                        && memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS)
+                });
+                if (any_sibling_guard || !any_guest_pe_noaccess_sibling || !unwind::has_guest_exception_handler())
                     && try_emulate_subpage_access(fault_addr, is_write, ss, mbi.protect)
                 {
                     return true;
@@ -819,7 +825,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     }
     LAST_RACE_RETRY.with(|c| c.set((0, 0)));
 
-    let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
+    let hpage_lock = &HPAGE_LOCKS[(hpage >> 14) & 63];
+    let mut hpage_guard = Some(hpage_lock.lock().unwrap());
     let Some(mbi) = memory::query(addr) else {
         return false;
     };
@@ -840,18 +847,27 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         // Windows clears PAGE_GUARD atomically BEFORE delivering STATUS_GUARD_PAGE_VIOLATION
         // so that VirtualQuery inside the handler observes the underlying protection and
         // returning EXCEPTION_CONTINUE_EXECUTION completes the faulting access once.
-        let consumed = memory::consume_guard_page(addr);
+        let _consumed = memory::consume_guard_page(addr);
+        // Release HPAGE_LOCKS before dispatching the VEH on `PageFaultHelper` (a separate
+        // OS thread). If the VEH accesses the just-consumed 4 KiB page while a sibling 4 KiB
+        // subpage keeps the 16 KiB host page PROT_NONE, the helper thread faults and acquires
+        // this same lock to emulate that access; holding it across dispatch would deadlock.
+        drop(hpage_guard.take());
         handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, fault_addr, is_write);
         if handled {
-            if let Some(res) = consumed {
-                if res.host_kept_none {
-                    // Sibling 4 KiB subpages remain guarded/noaccess: emulate this single
-                    // faulting instruction without exposing the sibling subpages.
+            let _emul_guard = hpage_lock.lock().unwrap();
+            if let Some(now_mbi) = memory::query(addr) {
+                let now_fault_prot =
+                    now_mbi.protect == PAGE_NOACCESS || (now_mbi.protect & PAGE_GUARD) != 0;
+                let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+                if now_mbi.state == MEM_COMMIT && !now_fault_prot && now_any_sibling {
+                    // Sibling 4 KiB subpages remain guarded/noaccess (host page stays PROT_NONE):
+                    // emulate this single faulting instruction without exposing sibling subpages.
                     handled = try_emulate_subpage_access(
                         fault_addr,
                         is_write,
                         ss,
-                        res.old_prot & !PAGE_GUARD,
+                        now_mbi.protect,
                     );
                 }
             }
