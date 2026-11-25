@@ -89,6 +89,16 @@ mod icu {
     pub const ULOC_LAYOUT_RTL: i32 = 1;
     pub const UMS_US: i32 = 1;
 
+    pub type UConverterFromUCallback = unsafe extern "C" fn(
+        *const c_void,
+        *mut c_void,
+        *const u16,
+        i32,
+        i32,
+        i32,
+        *mut i32,
+    );
+
     pub struct IcuNls {
         pub uloc_to_language_tag: unsafe extern "C" fn(*const c_char, *mut c_char, i32, i8, *mut i32) -> i32,
         pub uloc_for_language_tag: unsafe extern "C" fn(*const c_char, *mut c_char, i32, *mut i32, *mut i32) -> i32,
@@ -137,6 +147,16 @@ mod icu {
         pub ucnv_open: unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void,
         pub ucnv_to_uchars: unsafe extern "C" fn(*mut c_void, *mut u16, i32, *const c_char, i32, *mut i32) -> i32,
         pub ucnv_from_uchars: unsafe extern "C" fn(*mut c_void, *mut c_char, i32, *const u16, i32, *mut i32) -> i32,
+        pub ucnv_set_subst_chars: unsafe extern "C" fn(*mut c_void, *const c_char, i8, *mut i32),
+        pub ucnv_set_from_u_callback: unsafe extern "C" fn(
+            *mut c_void,
+            UConverterFromUCallback,
+            *const c_void,
+            *mut Option<UConverterFromUCallback>,
+            *mut *const c_void,
+            *mut i32,
+        ),
+        pub ucnv_from_u_cb_substitute: UConverterFromUCallback,
         pub ucnv_get_max_char_size: unsafe extern "C" fn(*const c_void) -> i8,
         pub ucnv_close: unsafe extern "C" fn(*mut c_void),
     }
@@ -212,6 +232,19 @@ mod icu {
                 ucnv_open: sym!(c"ucnv_open", unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void),
                 ucnv_to_uchars: sym!(c"ucnv_toUChars", unsafe extern "C" fn(*mut c_void, *mut u16, i32, *const c_char, i32, *mut i32) -> i32),
                 ucnv_from_uchars: sym!(c"ucnv_fromUChars", unsafe extern "C" fn(*mut c_void, *mut c_char, i32, *const u16, i32, *mut i32) -> i32),
+                ucnv_set_subst_chars: sym!(c"ucnv_setSubstChars", unsafe extern "C" fn(*mut c_void, *const c_char, i8, *mut i32)),
+                ucnv_set_from_u_callback: sym!(
+                    c"ucnv_setFromUCallBack",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        UConverterFromUCallback,
+                        *const c_void,
+                        *mut Option<UConverterFromUCallback>,
+                        *mut *const c_void,
+                        *mut i32,
+                    )
+                ),
+                ucnv_from_u_cb_substitute: sym!(c"UCNV_FROM_U_CALLBACK_SUBSTITUTE", UConverterFromUCallback),
                 ucnv_get_max_char_size: sym!(c"ucnv_getMaxCharSize", unsafe extern "C" fn(*const c_void) -> i8),
                 ucnv_close: sym!(c"ucnv_close", unsafe extern "C" fn(*mut c_void)),
             })
@@ -494,6 +527,28 @@ pub(crate) fn decode_cp_to_utf16(cp: u32, src: &[u8]) -> Result<Vec<u16>, u32> {
     Ok(s.encode_utf16().collect())
 }
 
+struct FromUTrackCtx {
+    used: bool,
+    fallback: icu::UConverterFromUCallback,
+}
+
+unsafe extern "C" fn track_from_u_subst_cb(
+    context: *const c_void,
+    args: *mut c_void,
+    code_units: *const u16,
+    length: i32,
+    code_point: i32,
+    reason: i32,
+    err: *mut i32,
+) {
+    let ctx = &mut *(context as *mut FromUTrackCtx);
+    // UCNV_UNASSIGNED (0), UCNV_ILLEGAL (1), UCNV_IRREGULAR (2)
+    if (0..=2).contains(&reason) {
+        ctx.used = true;
+    }
+    (ctx.fallback)(std::ptr::null(), args, code_units, length, code_point, reason, err);
+}
+
 pub(crate) fn encode_utf16_to_cp(cp: u32, src: &[u16], default: Option<u8>) -> Result<(Vec<u8>, bool), u32> {
     if let (Some(a), Some(name)) = (icu::api(), icu_cp_name(cp)) {
         let cn = icu::c_str(name);
@@ -501,6 +556,25 @@ pub(crate) fn encode_utf16_to_cp(cp: u32, src: &[u16], default: Option<u8>) -> R
             let mut st = 0i32;
             let cnv = (a.ucnv_open)(cn.as_ptr(), &mut st);
             if !cnv.is_null() && st <= 0 {
+                // Configure converter substitution character (Windows default '?' or caller-supplied
+                // byte) and track every substitution via ICU's FromU callback instead of scanning
+                // output bytes (DBCS converters like CP932/CP936 use 0xFC 0xFC or 0x3F by default).
+                let rep = default.unwrap_or(b'?');
+                let mut sub_st = 0i32;
+                (a.ucnv_set_subst_chars)(cnv, &rep as *const u8 as *const c_char, 1, &mut sub_st);
+                let mut track = FromUTrackCtx {
+                    used: false,
+                    fallback: a.ucnv_from_u_cb_substitute,
+                };
+                let mut cb_st = 0i32;
+                (a.ucnv_set_from_u_callback)(
+                    cnv,
+                    track_from_u_subst_cb,
+                    &mut track as *mut FromUTrackCtx as *const c_void,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut cb_st,
+                );
                 let mut out = vec![0u8; src.len() * 4 + 8];
                 st = 0;
                 let n = (a.ucnv_from_uchars)(
@@ -513,6 +587,7 @@ pub(crate) fn encode_utf16_to_cp(cp: u32, src: &[u16], default: Option<u8>) -> R
                 );
                 if st == 15 && n > 0 {
                     out.resize(n as usize + 1, 0);
+                    track.used = false;
                     st = 0;
                     let n2 = (a.ucnv_from_uchars)(
                         cnv,
@@ -525,23 +600,14 @@ pub(crate) fn encode_utf16_to_cp(cp: u32, src: &[u16], default: Option<u8>) -> R
                     (a.ucnv_close)(cnv);
                     if st <= 0 && n2 >= 0 {
                         out.truncate(n2 as usize);
-                        return Ok((out, false));
+                        return Ok((out, track.used));
                     }
                     return Err(err::ERROR_NO_UNICODE_TRANSLATION);
                 }
                 (a.ucnv_close)(cnv);
                 if st <= 0 && n >= 0 {
                     out.truncate(n as usize);
-                    let mut used = false;
-                    // ICU writes 0x1A (SUB) for unmapped chars; replace with Windows default char ('?' or caller's).
-                    let rep = default.unwrap_or(b'?');
-                    for b in &mut out {
-                        if *b == 0x1A && !src.contains(&0x1A) {
-                            *b = rep;
-                            used = true;
-                        }
-                    }
-                    return Ok((out, used));
+                    return Ok((out, track.used));
                 }
             }
         }
@@ -4071,5 +4137,33 @@ mod tests {
             assert_eq!(GetCalendarInfoEx(de.as_ptr(), 1, std::ptr::null(), 0x999, buf.as_mut_ptr(), 128, std::ptr::null_mut()), 0);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_FLAGS);
         }
+    }
+
+    #[test]
+    fn encode_cp_tracks_icu_substitutions_across_dbcs_and_sbcs() {
+        // CP932 (Shift-JIS): '€' is unmappable; ICU default would be FC FC unless configured.
+        let (bytes, used) = encode_utf16_to_cp(932, &to_wide("A€B"), None).unwrap();
+        assert!(used, "CP932 must report substitution for unmappable '€'");
+        assert_eq!(bytes, b"A?B");
+
+        // Caller-supplied default byte must be respected for DBCS too.
+        let (bytes_custom, used_custom) = encode_utf16_to_cp(932, &to_wide("A€B"), Some(b'_')).unwrap();
+        assert!(used_custom);
+        assert_eq!(bytes_custom, b"A_B");
+
+        // CP936 (GBK) / CP949 / CP950 / CP1252: unmappable supplementary char reports substitution.
+        for cp in [932u32, 936, 949, 950, 1252] {
+            let (b, u) = encode_utf16_to_cp(cp, &to_wide("X😀Y"), Some(b'!')).unwrap();
+            assert!(u, "cp {cp} must report substitution for '😀'");
+            assert_eq!(b, b"X!Y", "cp {cp} must emit caller default byte");
+        }
+
+        // Literal '?' and 0x1A must NOT falsely trigger used_default.
+        let (lit_1252, used_1252) = encode_utf16_to_cp(1252, &to_wide("?\x1A€"), None).unwrap();
+        assert!(!used_1252);
+        assert_eq!(lit_1252, vec![b'?', 0x1A, 0x80]);
+        let (lit_932, used_932) = encode_utf16_to_cp(932, &to_wide("?あ"), None).unwrap();
+        assert!(!used_932);
+        assert_eq!(lit_932, vec![b'?', 0x82, 0xA0]);
     }
 }

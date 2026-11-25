@@ -1169,6 +1169,9 @@ pub unsafe extern "win64" fn _eof(fd: i32) -> i32 {
     if cur < 0 || end < 0 {
         return -1;
     }
+    if has_u8_pending(fd) {
+        return 0;
+    }
     (cur >= end) as i32
 }
 
@@ -3288,7 +3291,7 @@ mod tests {
             assert_eq!(String::from_utf16_lossy(&pipe_units), "ABCD😀");
             assert_eq!(_close(pfds[0]), 0);
 
-            // 8. Querying position via _telli64 mid-surrogate preserves pending low surrogate!
+            // 8. Querying position via _telli64 and _eof mid-surrogate preserves pending low surrogate!
             std::fs::write(dir.join("tell_surr.txt"), "😀B".as_bytes()).unwrap();
             let fd_s = _open(b"U:\\tell_surr.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
             assert!(fd_s >= 0);
@@ -3296,12 +3299,29 @@ mod tests {
             assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
             let hi = u16::from_le_bytes(u);
             assert!(_telli64(fd_s) >= 0);
+            assert_eq!(_eof(fd_s), 0);
             assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
             let lo = u16::from_le_bytes(u);
             assert_eq!(_read(fd_s, u.as_mut_ptr() as *mut c_void, 2), 2);
             let b_ch = u16::from_le_bytes(u);
             assert_eq!(String::from_utf16_lossy(&[hi, lo, b_ch]), "😀B");
+            assert_eq!(_eof(fd_s), 1);
             assert_eq!(_close(fd_s), 0);
+
+            // File ending with a single supplementary char: _eof must stay 0 while low surrogate is pending.
+            std::fs::write(dir.join("eof_surr.txt"), "😀".as_bytes()).unwrap();
+            let fd_e = _open(b"U:\\eof_surr.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_e >= 0);
+            let mut eof_units = Vec::new();
+            while _eof(fd_e) == 0 {
+                let mut one = [0u8; 2];
+                let n = _read(fd_e, one.as_mut_ptr() as *mut c_void, 2);
+                assert_eq!(n, 2);
+                eof_units.push(u16::from_le_bytes(one));
+            }
+            assert_eq!(String::from_utf16_lossy(&eof_units), "😀");
+            assert_eq!(_eof(fd_e), 1);
+            assert_eq!(_close(fd_e), 0);
 
             // 9. Buffered ccs=UTF-8 ftell/fgetpos/fseek/fsetpos and read->write discard_read
             //    track physical UTF-8 byte offsets accurately across BOM, multibyte, and CRLF.
@@ -3363,11 +3383,14 @@ mod tests {
             assert_eq!(fgetwc(f), WEOF);
             assert_eq!(fclose(f), 0);
 
-            // DBCS locale (ja-JP -> CP932) roundtrip via fputwc/fgetwc.
+            // DBCS locale (ja-JP -> CP932) roundtrip via fputwc/fgetwc, and unmappable char -> EILSEQ.
             assert!(!crate::ucrt::locale::setlocale(0, b"ja-JP\0".as_ptr()).is_null());
             let f = fopen(b"U:\\cp932.txt\0".as_ptr(), b"w\0".as_ptr());
             assert!(!f.is_null());
             assert_eq!(fputwc('あ' as u16, f), 'あ' as u32);
+            assert_eq!(fputwc('€' as u16, f), WEOF); // unmappable in CP932 -> must reject, not emit FC FC
+            assert_eq!(errno::get(), EILSEQ);
+            clearerr(f);
             assert_eq!(fputwc('Z' as u16, f), 'Z' as u32);
             assert_eq!(fclose(f), 0);
             assert_eq!(std::fs::read(dir.join("cp932.txt")).unwrap(), vec![0x82, 0xA0, b'Z']);
