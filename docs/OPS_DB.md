@@ -56,6 +56,14 @@ cargo runner -- --pe /path/to/Game/Game.exe --prewarm-aot
 Default cache directory: `~/Library/Caches/port-factory/aot` (override with `PORT_AOT_DIR`; reads
 legacy `~/Library/Caches/aw2-port/aot` as a fallback when no env override is set).
 
+The runtime queries optional ARM crypto, CRC, unaligned atomic, RCpc2, and floating-point
+features before using the associated instructions. Dynamic cache keys include the detected
+feature set. Signed static descriptors carry these bits into the target process, which rejects
+an incompatible image before registering its blocks. Guest CPUID reads topology on the
+executing thread, including the configured `PORT_NUM_CPUS` count. Leaf 0xD reports an
+832-byte x87/SSE/YMM image with YMM upper halves at byte 576. Its state mask is independent
+of the SIMD instruction families exposed for application dispatch.
+
 ### Syncing & querying the Ops and Win32 databases
 ```sh
 # Always run win32-sync after adding/removing/moving exports in crates/win32-rt
@@ -204,10 +212,13 @@ search-path changes, custom manifests, dynamic imports and unpacked code need a 
   form goes through the runtime lowerer. A generic dispatch with no interpreter handler is
   listed as `unimplemented` (exit 86 if reached with fail-on-unimplemented enabled).
   `interpreter_only` identifies handled fallbacks. Guest traps and syscall boundaries have
-  a separate informational row. Shared EVEX/MVEX forms with narrower handlers are marked
+  a separate informational row. MMX operands use their own interpreter dispatch. A guest
+  that changes MXCSR can also select software floating-point paths at runtime.
+  Shared EVEX/MVEX forms with narrower handlers are marked
   `unverified_form`. Each row gives the mnemonic, encoding form, static count and first RVA.
 - **CPUID.** An unimplemented form lists `advertised_but_unimplemented` when all its mapped
-  feature bits are set in the ARM64 JIT/AOT guest profile. A binary can contain optional CPU
+  feature bits are set by the shared guest CPUID query on the scanning host.
+  A binary can contain optional CPU
   dispatch paths or embedded data. Static hits measure neither reachability nor execution frequency.
 - **Imports.** Every eager and delay-load IAT slot records its DLL, name or ordinal, binding
   and implementation kind. Builtins use the Win32 catalog and matching stub inventory sites.

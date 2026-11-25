@@ -20,4 +20,5 @@ iced-x86.workspace = true
 x86-runtime.workspace = true
 
 [build-dependencies]
+quote = "1"
 syn = { version = "2", features = ["full", "visit"] }

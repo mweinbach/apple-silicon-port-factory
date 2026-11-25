@@ -526,7 +526,7 @@ fn readiness_uses_real_dispatch_and_classifies_every_import() {
     let gather = op("vpgatherdd");
     assert_eq!(gather.get("kind").unwrap().as_str(), Some("unimplemented"));
     // Advertisement follows the guest CPU contract and can legitimately change independently.
-    let has_avx2 = x86_runtime::emu::arm64_guest_cpuid(7)[1] & (1 << 5) != 0;
+    let has_avx2 = x86_runtime::simd_ops::cpuid_x64(7, 0).1 & (1 << 5) != 0;
     let features = gather
         .get("advertised_but_unimplemented")
         .unwrap()

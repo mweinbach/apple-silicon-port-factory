@@ -21,13 +21,17 @@
 
 mod block_cache;
 mod cpu;
+mod denorm;
 mod dispatch;
 pub mod eh;
 pub mod exec_mem;
 mod fast;
+mod features;
+pub(crate) mod cpuid;
 mod generic_ops;
 mod interp;
 mod mem;
+mod mmx;
 pub mod regfile;
 pub mod regfile_ext;
 mod routes;
@@ -35,6 +39,7 @@ mod simd_fp;
 mod simd_kernels;
 mod simd_mov;
 mod tsc;
+mod xstate;
 #[cfg(target_arch = "aarch64")]
 mod jit;
 #[cfg(not(target_arch = "aarch64"))]
@@ -53,6 +58,8 @@ pub mod verify;
 mod sse_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod jit_tests;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod cpu_basics_tests;
 #[cfg(test)]
 mod mod_tests;
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -101,6 +108,7 @@ pub(crate) use interp::{test_last_steps, test_total_steps};
 pub enum InstructionLowering {
     Arm64,
     FastInterpreter,
+    MmxDispatch,
     GenericDispatch,
 }
 
@@ -108,19 +116,15 @@ pub enum InstructionLowering {
 pub fn instruction_lowering(ins: &iced_x86::Instruction) -> InstructionLowering {
     let op = fast::lower(ins);
     if op.kind == fast::K_GENERIC {
+        if mmx::uses_mmx(ins) {
+            return InstructionLowering::MmxDispatch;
+        }
         InstructionLowering::GenericDispatch
     } else if jit::supported(&op) {
         InstructionLowering::Arm64
     } else {
         InstructionLowering::FastInterpreter
     }
-}
-
-/// Guest CPUID registers baked into default JIT/AOT code, in EAX, EBX, ECX, EDX order.
-#[cfg(target_arch = "aarch64")]
-pub fn arm64_guest_cpuid(leaf: u32) -> [u32; 4] {
-    jit::CPUID_LEAVES.iter().find(|entry| entry.0 == leaf)
-        .map_or([0; 4], |&(_, a, b, c, d)| [a, b, c, d])
 }
 
 pub use mem::note_code_region;
@@ -157,7 +161,9 @@ use cpu::{enter_precise_oracle, leave_precise_oracle};
 use cpu::PRECISE_LOCAL;
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_imports)]
-use cpu::{mxcsr_to_fpcr, read_fpcr, write_fpcr, FPCR_GUEST_MASK, MXCSR_FPCR_MASK};
+use cpu::{read_fpcr, write_fpcr};
+#[cfg(all(test, target_arch = "aarch64"))]
+use cpu::FPCR_GUEST_MASK;
 
 #[cfg(target_arch = "aarch64")]
 use dispatch::jit_host_xfer;

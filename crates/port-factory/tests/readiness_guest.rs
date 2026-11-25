@@ -79,7 +79,7 @@ fn readiness_matches_the_guest_in_live_jit_and_prewarmed_aot() {
             "-fno-omit-frame-pointer",
             "-Wl,-e,mainCRTStartup",
         ];
-        if x86_runtime::emu::arm64_guest_cpuid(7)[1] & (1 << 5) != 0 {
+        if x86_runtime::simd_ops::cpuid_x64(7, 0).1 & (1 << 5) != 0 {
             flags.push("-DEXPECT_AVX2");
         }
         if abort {
@@ -105,6 +105,10 @@ void mainCRTStartup(void) {
     if (ebx & (1u << 5)) ExitProcess(41);
 #endif
     if (one() != 1.0) ExitProcess(42);
+    unsigned converted;
+    __asm__ volatile ("movd %1, %%mm0; cvtpi2ps %%mm0, %%xmm0; movd %%xmm0, %0; emms"
+        : "=r"(converted) : "r"(2) : "mm0", "xmm0");
+    if (converted != 0x40000000u) ExitProcess(43); // float32 2.0
 #ifdef EXERCISE_ABORT
     __asm__ volatile ("rdpkru" : : "c"(0) : "eax", "edx");
 #endif
@@ -128,6 +132,7 @@ void mainCRTStartup(void) {
             })
         };
         assert!(reports("fld1", "interpreter_only"));
+        assert!(reports("cvtpi2ps", "interpreter_only"));
         assert_eq!(reports("rdpkru", "unimplemented"), abort);
         let aot = dir.join(format!("{name}-aot"));
         for mode in ["jit", "prewarm", "aot"] {

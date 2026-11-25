@@ -6,7 +6,8 @@ use iced_x86::{
 };
 use pe_image::{ExportTarget, Exports, Pe};
 use std::collections::{BTreeMap, BTreeSet};
-use x86_runtime::emu::{arm64_guest_cpuid, instruction_lowering, InstructionLowering};
+use x86_runtime::emu::{instruction_lowering, InstructionLowering};
+use x86_runtime::simd_ops::cpuid_x64;
 
 include!(concat!(env!("OUT_DIR"), "/generic_handlers.rs"));
 
@@ -25,7 +26,7 @@ pub(super) struct InstructionUse {
 }
 
 // Architectural CPUID bit positions (iced-x86 CpuidFeature). Read the values from the
-// ARM64 emitter's actual guest profile. Unmapped feature IDs carry no advertisement claim.
+// shared runtime guest profile. Unmapped feature IDs carry no advertisement claim.
 fn advertised(feature: CpuidFeature) -> bool {
     use CpuidFeature::*;
     let (leaf, reg, bit) = match feature {
@@ -67,9 +68,12 @@ fn advertised(feature: CpuidFeature) -> bool {
         SYSCALL => (0x8000_0001, 3, 11),
         LZCNT => (0x8000_0001, 2, 5),
         RDTSCP => (0x8000_0001, 3, 27),
+        XSAVEOPT => return cpuid_x64(0xd, 1).0 & 1 != 0,
+        XSAVEC => return cpuid_x64(0xd, 1).0 & 2 != 0,
         _ => return false,
     };
-    arm64_guest_cpuid(leaf)[reg] & (1 << bit) != 0
+    let (eax, ebx, ecx, edx) = cpuid_x64(leaf, 0);
+    [eax, ebx, ecx, edx][reg] & (1 << bit) != 0
 }
 
 impl CpuScan {
@@ -84,6 +88,9 @@ impl CpuScan {
             self.decoded += 1;
             let mn = ins.mnemonic();
             let finding = match instruction_lowering(&ins) {
+                InstructionLowering::MmxDispatch if !has_mmx_handler(&ins) => {
+                    Finding::Unimplemented
+                }
                 // These encodings have masks, vector lengths or register files outside
                 // the SSE/AVX2 model. A shared mnemonic can select a narrower handler.
                 InstructionLowering::GenericDispatch
@@ -163,5 +170,42 @@ impl CpuScan {
             }
         }
         Ok(scan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_follows_mmx_xstate_and_cpuid_dispatch() {
+        let mut scan = CpuScan::default();
+        scan.decode(
+            &[
+                0x0f, 0x2a, 0xc1, // cvtpi2ps xmm0, mm1
+                0x0f, 0x70, 0xc1, 0x1b, // pshufw mm0, mm1, 0x1b
+                0x0f, 0xe7, 0x00, // movntq [rax], mm0
+                0x0f, 0x0f, 0xc1, 0x9e, // pfadd mm0, mm1 (unsupported 3DNow!)
+                0x0f, 0xae, 0x30, // xsaveopt [rax]
+                0x0f, 0xa2, // cpuid
+            ],
+            0x1000,
+        );
+        assert_eq!(scan.decoded, 6);
+        for (mnemonic, expected) in [
+            ("cvtpi2ps", Finding::Interpreter),
+            ("pshufw", Finding::Interpreter),
+            ("movntq", Finding::Interpreter),
+            ("pfadd", Finding::Unimplemented),
+            ("xsaveopt", Finding::Interpreter),
+            ("cpuid", Finding::Interpreter),
+        ] {
+            let kind = scan
+                .findings
+                .iter()
+                .find(|(_, hit)| hit.mnemonic == mnemonic)
+                .map(|((kind, _), _)| *kind);
+            assert_eq!(kind, Some(expected), "{mnemonic}");
+        }
     }
 }

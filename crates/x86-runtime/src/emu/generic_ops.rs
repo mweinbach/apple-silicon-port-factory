@@ -8,9 +8,19 @@ use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, Regist
 
 impl Cpu {
     pub(super) unsafe fn exec_generic_ins(&mut self, ins_ref: &Instruction) -> bool {
+        if super::denorm::software_mode(self.jx.mxcsr) {
+            if let Some(handled) = super::denorm::execute(self, ins_ref) {
+                return handled;
+            }
+        }
+        self.exec_generic_inner(ins_ref)
+    }
+
+    pub(super) unsafe fn exec_generic_inner(&mut self, ins_ref: &Instruction) -> bool {
         let ins = *ins_ref;
         let mn = ins.mnemonic();
         let cpu = self;
+        if super::mmx::uses_mmx(&ins) { return super::mmx::execute(cpu, &ins); }
         match mn {
             Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence => {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -18,7 +28,9 @@ impl Cpu {
             Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
             | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
             | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
-            | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq | Mnemonic::Emms | Mnemonic::Femms => {}
+            | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {}
+            Mnemonic::Emms | Mnemonic::Femms => super::mmx::emms(),
+            Mnemonic::Maskmovdqu | Mnemonic::Vmaskmovdqu => super::mmx::maskmovdqu(cpu, &ins),
             Mnemonic::Clc => cpu.cf = false,
             Mnemonic::Stc => cpu.cf = true,
             Mnemonic::Cmc => cpu.cf = !cpu.cf,
@@ -685,104 +697,13 @@ impl Cpu {
                     cpu.write_op(&ins, 1, bits, a);
                 }
             }
-            Mnemonic::Cpuid => {
-                let leaf = cpu.gpr[0] as u32;
-                cpu.last_bits[0] = 64;
-                cpu.last_bits[1] = 64;
-                cpu.last_bits[2] = 64;
-                cpu.last_bits[3] = 64;
-                match leaf {
-                    0 => {
-                        cpu.gpr[0] = 7;
-                        cpu.gpr[3] = 0x756e_6547; // "Genu"
-                        cpu.gpr[2] = 0x4965_6e69; // "ineI"
-                        cpu.gpr[1] = 0x6c65_746e; // "ntel"
-                    }
-                    1 => {
-                        cpu.gpr[0] = 0x0009_06ea;
-                        cpu.gpr[3] = 0x0010_0800;
-                        // SSE3(0), PCLMULQDQ(1), VMX(5), SSSE3(9), FMA(12), CMPXCHG16B(13),
-                        // SSE4.1(19), SSE4.2(20), MOVBE(22), POPCNT(23), AES(25), XSAVE(26),
-                        // OSXSAVE(27), AVX(28), F16C(29), RDRAND(30)
-                        cpu.gpr[1] = (1 << 0)
-                            | (1 << 1)
-                            | (1 << 5)
-                            | (1 << 9)
-                            | (1 << 12)
-                            | (1 << 13)
-                            | (1 << 19)
-                            | (1 << 20)
-                            | (1 << 22)
-                            | (1 << 23)
-                            | (1 << 25)
-                            | (1 << 26)
-                            | (1 << 27)
-                            | (1 << 28)
-                            | (1 << 29)
-                            | (1 << 30);
-                        // FPU(0), TSC(4), CX8(8), CMOV(15), MMX(23), FXSR(24), SSE(25), SSE2(26), HTT(28)
-                        cpu.gpr[2] = (1 << 0)
-                            | (1 << 4)
-                            | (1 << 8)
-                            | (1 << 15)
-                            | (1 << 23)
-                            | (1 << 24)
-                            | (1 << 25)
-                            | (1 << 26)
-                            | (1 << 28);
-                    }
-                    7 => {
-                        cpu.gpr[0] = 0;
-                        // FSGSBASE(0), BMI1(3), AVX2(5), SMEP(7), BMI2(8), ERMS(9), INVPCID(10),
-                        // RDSEED(18), ADX(19), SHA-NI(29).
-                        cpu.gpr[3] = (1 << 0)
-                            | (1 << 3)
-                            | (1 << 5)
-                            | (1 << 7)
-                            | (1 << 8)
-                            | (1 << 9)
-                            | (1 << 10)
-                            | (1 << 18)
-                            | (1 << 19)
-                            | (1 << 29);
-                        cpu.gpr[1] = 0;
-                        cpu.gpr[2] = 0;
-                    }
-                    0x8000_0000 => {
-                        cpu.gpr[0] = 0x8000_0008;
-                        cpu.gpr[3] = 0;
-                        cpu.gpr[1] = 0;
-                        cpu.gpr[2] = 0;
-                    }
-                    0x8000_0001 => {
-                        cpu.gpr[0] = 0;
-                        cpu.gpr[3] = 0;
-                        // LAHF_LM(0), LZCNT/ABM(5), SSE4A(6), PREFETCHW(8)
-                        cpu.gpr[1] = (1 << 0) | (1 << 5) | (1 << 6) | (1 << 8);
-                        // SYSCALL(11), NX(20), RDTSCP(27), LM(29)
-                        cpu.gpr[2] = (1 << 11) | (1 << 20) | (1 << 27) | (1 << 29);
-                    }
-                    0x8000_0002..=0x8000_0004 => {
-                        let brand = b"Apple Silicon M-Series (AW2 Native ARM64)       ";
-                        let off = ((leaf - 0x8000_0002) as usize) * 16;
-                        cpu.gpr[0] = u32::from_le_bytes(brand[off..off + 4].try_into().unwrap()) as u64;
-                        cpu.gpr[3] = u32::from_le_bytes(brand[off + 4..off + 8].try_into().unwrap()) as u64;
-                        cpu.gpr[1] = u32::from_le_bytes(brand[off + 8..off + 12].try_into().unwrap()) as u64;
-                        cpu.gpr[2] = u32::from_le_bytes(brand[off + 12..off + 16].try_into().unwrap()) as u64;
-                    }
-                    _ => {
-                        cpu.gpr[0] = 0;
-                        cpu.gpr[3] = 0;
-                        cpu.gpr[1] = 0;
-                        cpu.gpr[2] = 0;
-                    }
+            Mnemonic::Cpuid => cpu.cpuid(),
+            Mnemonic::Xgetbv | Mnemonic::Fxsave | Mnemonic::Fxsave64 | Mnemonic::Fxrstor | Mnemonic::Fxrstor64
+            | Mnemonic::Xsave | Mnemonic::Xsave64 | Mnemonic::Xsaveopt | Mnemonic::Xsaveopt64 | Mnemonic::Xsavec
+            | Mnemonic::Xsavec64 | Mnemonic::Xrstor | Mnemonic::Xrstor64 => {
+                if let Err(fault) = cpu.exec_xstate(&ins) {
+                    fault.dispatch(cpu, ins.ip());
                 }
-            }
-            Mnemonic::Xgetbv => {
-                cpu.gpr[0] = 7;
-                cpu.gpr[2] = 0;
-                cpu.last_bits[0] = 64;
-                cpu.last_bits[2] = 64;
             }
             Mnemonic::Rdtsc | Mnemonic::Rdtscp => cpu.read_timestamp(mn == Mnemonic::Rdtscp),
             // Unprivileged x86-64 system-table / machine-status store instructions
