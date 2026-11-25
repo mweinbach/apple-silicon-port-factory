@@ -100,8 +100,13 @@ cargo test -p win32-rt --lib --target aarch64-apple-darwin -- d3d11 misc::vulkan
 cargo check -p aw2-game --no-default-features --target aarch64-apple-darwin
 ```
 
+The headless Win32 corpus builds its Windows x86-64 fixtures with Zig 0.16.0. Install that
+version on your PATH or set `ZIG` to its executable, then run
+`cargo test -p port-loader --target aarch64-apple-darwin --test os_guest_corpus -- --test-threads=1`.
+Each guest must pass with both the live JIT and its prewarmed AOT cache.
+
 Continuous integration (`.github/workflows/ci.yml`) runs the repo hygiene audit, checks 1–3 above,
-the AOT multi-module verification test, the `aw2-game` check and an iOS library check on every
+the headless Win32 corpus, the AOT multi-module verification test, the `aw2-game` check and an iOS library check on every
 pull request. It runs on GitHub-hosted runners without a physical GPU, so the Metal 4, audio and
 end-to-end tests in step 4 still need to be run locally on Apple Silicon hardware.
 
