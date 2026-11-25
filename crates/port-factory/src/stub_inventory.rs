@@ -1192,8 +1192,8 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.dll == "oo2core_9_win64.dll" && e.kind == "middleware_stub"),
-            "expected oo2core_9_win64.dll middleware_stub"
+                .any(|e| e.dll == "physx3common_x64.dll" && e.kind == "middleware_stub"),
+            "expected physx3common_x64.dll middleware_stub"
         );
         // TSV round-trip preserves exact entries
         let tsv = format_inventory_tsv(&entries);

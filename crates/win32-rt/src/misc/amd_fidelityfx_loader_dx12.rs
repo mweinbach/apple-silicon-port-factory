@@ -263,8 +263,11 @@ pub unsafe extern "win64" fn ffxCreateContext(
             FFX_API_RETURN_OK
         }
         FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION => {
-            crate::stub!(
-                "ffxCreateContext(FRAMEGENERATION): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`, `ffx_api_types.h`):
+            // returns `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider is installed.
+            log::debug!(
+                target: "d3d",
+                "ffxCreateContext(FRAMEGENERATION): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             FFX_API_RETURN_NO_PROVIDER
         }
@@ -391,7 +394,12 @@ pub unsafe extern "win64" fn ffxConfigure(context: *mut usize, header: *const Ff
     match ty & FFX_API_EFFECT_MASK {
         FFX_API_EFFECT_ID_UPSCALE | FFX_API_EFFECT_ID_FRAMEGENERATIONSWAPCHAIN => FFX_API_RETURN_OK,
         FFX_API_EFFECT_ID_FRAMEGENERATION => {
-            crate::stub!("ffxConfigure(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER");
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): returns
+            // `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider exists.
+            log::debug!(
+                target: "d3d",
+                "ffxConfigure(ty={ty:#x}): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
+            );
             FFX_API_RETURN_NO_PROVIDER
         }
         _ => FFX_API_RETURN_NO_PROVIDER,
@@ -516,6 +524,11 @@ pub unsafe extern "win64" fn ffxDispatch(context: *mut usize, header: *const Ffx
                             dynamic_resolution,
                             output_resolution_motion_vectors: output_res_mv,
                             jittered_motion_vectors: jittered_mv,
+                            color_origin: [0, 0],
+                            depth_origin: [0, 0],
+                            motion_origin: [0, 0],
+                            reactive_origin: [0, 0],
+                            output_origin: [0, 0],
                         },
                     );
                 } else {
@@ -534,19 +547,36 @@ pub unsafe extern "win64" fn ffxDispatch(context: *mut usize, header: *const Ffx
             let desc = std::ptr::read_unaligned(
                 header as *const FfxDispatchDescUpscaleGenerateReactiveMask,
             );
-            let cleared = clear_reactive_mask_to_zero(desc.command_list, desc.out_reactive.resource);
+            let computed = if !desc.command_list.is_null()
+                && !desc.color_opaque_only.resource.is_null()
+                && !desc.color_pre_upscale.resource.is_null()
+                && !desc.out_reactive.resource.is_null()
+            {
+                crate::d3d12::cmdlist::generate_reactive_mask(
+                    desc.command_list,
+                    desc.color_opaque_only.resource,
+                    desc.color_pre_upscale.resource,
+                    desc.out_reactive.resource,
+                    desc.render_size,
+                    desc.scale,
+                    desc.cutoff_threshold,
+                    desc.binary_value,
+                    desc.flags,
+                )
+            } else {
+                clear_reactive_mask_to_zero(desc.command_list, desc.out_reactive.resource)
+            };
             if !ctx.logged_gen_reactive {
                 ctx.logged_gen_reactive = true;
-                crate::stub!(
-                    "ffxDispatch(GENERATEREACTIVEMASK): cleared outReactive to 0.0 (cleared={cleared}, render={}x{}, scale={:.3}, cutoff={:.3}, binary={:.3}, flags={:#x}, opaque={}, pre_upscale={})",
+                log::info!(
+                    target: "d3d",
+                    "ffxDispatch(GENERATEREACTIVEMASK): computed={computed} render={}x{} scale={:.3} cutoff={:.3} binary={:.3} flags={:#x}",
                     desc.render_size[0],
                     desc.render_size[1],
                     desc.scale,
                     desc.cutoff_threshold,
                     desc.binary_value,
                     desc.flags,
-                    !desc.color_opaque_only.resource.is_null(),
-                    !desc.color_pre_upscale.resource.is_null(),
                 );
             }
             FFX_API_RETURN_OK
@@ -555,8 +585,11 @@ pub unsafe extern "win64" fn ffxDispatch(context: *mut usize, header: *const Ffx
             FFX_API_RETURN_OK
         }
         _ if (ty & FFX_API_EFFECT_MASK) == FFX_API_EFFECT_ID_FRAMEGENERATION => {
-            crate::stub!(
-                "ffxDispatch(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): returns
+            // `FFX_API_RETURN_NO_PROVIDER` (4) when no frame-generation provider exists.
+            log::debug!(
+                target: "d3d",
+                "ffxDispatch(ty={ty:#x}): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             FFX_API_RETURN_NO_PROVIDER
         }
@@ -617,8 +650,11 @@ pub unsafe extern "win64" fn ffxQuery(context: *mut usize, header: *mut FfxApiHe
             if !out_cmd.is_null() {
                 std::ptr::write_unaligned(out_cmd, 0);
             }
-            crate::stub!(
-                "ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): no frame-generation
+            // swapchain provider is installed -> `FFX_API_RETURN_NO_PROVIDER` (4).
+            log::debug!(
+                target: "d3d",
+                "ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             return FFX_API_RETURN_NO_PROVIDER;
         }
@@ -627,8 +663,11 @@ pub unsafe extern "win64" fn ffxQuery(context: *mut usize, header: *mut FfxApiHe
             if !out_tex.is_null() {
                 std::ptr::write_unaligned(out_tex, [0; 6]);
             }
-            crate::stub!(
-                "ffxQuery(INTERPOLATIONTEXTURE_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"
+            // Native-unsupported (AMD FidelityFX SDK `ffx_api.cpp`): no frame-generation
+            // swapchain provider is installed -> `FFX_API_RETURN_NO_PROVIDER` (4).
+            log::debug!(
+                target: "d3d",
+                "ffxQuery(INTERPOLATIONTEXTURE_DX12): no frame-generation provider -> FFX_API_RETURN_NO_PROVIDER"
             );
             return FFX_API_RETURN_NO_PROVIDER;
         }
@@ -1089,12 +1128,61 @@ mod tests {
                     ffxDispatch(&mut ctx, &desc as *const _ as *const FfxApiHeader),
                     FFX_API_RETURN_OK
                 );
+
+                // Exercise real GPU reactive-mask compute pass when opaque & pre-upscale inputs are bound.
+                let color_rd = d3d12_metal::types::ResourceDesc {
+                    Dimension: d3d12_metal::types::dim::TEXTURE2D,
+                    Width: 16,
+                    Height: 16,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: 28, // DXGI_FORMAT_R8G8B8A8_UNORM
+                    SampleCount: 1,
+                    Flags: d3d12_metal::types::resource_flags::ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let mut opaque_tex: *mut c_void = std::ptr::null_mut();
+                let mut pre_tex: *mut c_void = std::ptr::null_mut();
+                assert_eq!(
+                    crate::d3d12::resource::create_committed(
+                        &hp,
+                        0,
+                        &color_rd,
+                        0,
+                        std::ptr::null(),
+                        &crate::d3d12::vtables::IID_ID3D12Resource,
+                        &mut opaque_tex
+                    ),
+                    crate::types::S_OK
+                );
+                assert_eq!(
+                    crate::d3d12::resource::create_committed(
+                        &hp,
+                        0,
+                        &color_rd,
+                        0,
+                        std::ptr::null(),
+                        &crate::d3d12::vtables::IID_ID3D12Resource,
+                        &mut pre_tex
+                    ),
+                    crate::types::S_OK
+                );
+                desc.color_opaque_only.resource = opaque_tex;
+                desc.color_pre_upscale.resource = pre_tex;
+                desc.flags = (1 << 0) | (1 << 2) | (1 << 3); // APPLY_TONEMAP | APPLY_THRESHOLD | USE_COMPONENTS_MAX
+                assert_eq!(
+                    ffxDispatch(&mut ctx, &desc as *const _ as *const FfxApiHeader),
+                    FFX_API_RETURN_OK
+                );
+
                 let vtbl = std::ptr::read_unaligned(list as *const *const usize);
                 // ID3D12GraphicsCommandList::Close is vtable slot 9.
                 let close_fn: unsafe extern "win64" fn(*mut c_void) -> crate::types::HRESULT =
                     std::mem::transmute(std::ptr::read_unaligned(vtbl.add(9)));
                 assert_eq!(close_fn(list), crate::types::S_OK);
                 crate::d3d12::cs::flush();
+                crate::d3d12::com::com_release(pre_tex);
+                crate::d3d12::com::com_release(opaque_tex);
                 crate::d3d12::com::com_release(tex);
                 crate::d3d12::com::com_release(list);
                 crate::d3d12::com::com_release(alloc);

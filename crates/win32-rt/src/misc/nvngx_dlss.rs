@@ -515,6 +515,11 @@ fn build_temporal_desc(
         dynamic_resolution: render_size != [0, 0],
         output_resolution_motion_vectors: out_res_mv,
         jittered_motion_vectors: (create_flags & NGX_DLSS_FLAG_MV_JITTERED) != 0,
+        color_origin: [0, 0],
+        depth_origin: [0, 0],
+        motion_origin: [0, 0],
+        reactive_origin: [0, 0],
+        output_origin: [0, 0],
     };
     let has_temporal_inputs = depth != 0 && motion != 0;
     Some((desc, has_temporal_inputs))
@@ -627,7 +632,11 @@ pub extern "win64" fn NVSDK_NGX_D3D12_CreateFeature(
         }
         other => {
             unsafe { std::ptr::write_unaligned(out_handle, 0) };
-            crate::stub!(
+            // Native-unsupported (NVIDIA NGX SDK `nvsdk_ngx_defs.h`): NVIDIA-only
+            // hardware features (FrameGeneration, DeepDVC, RayReconstruction) are
+            // unavailable on non-NVIDIA GPUs (`NVSDK_NGX_Result_FAIL_FeatureNotSupported`).
+            log::debug!(
+                target: "d3d",
                 "NVSDK_NGX_D3D12_CreateFeature: unsupported feature_id={other} ({}) -> FAIL_FeatureNotSupported",
                 ngx_feature_name(other)
             );
@@ -699,7 +708,14 @@ pub extern "win64" fn NVSDK_NGX_VULKAN_Init(
     _feature_info: usize,
     _sdk_version: u32,
 ) -> i32 {
-    crate::stub!("NVSDK_NGX_VULKAN_Init: Vulkan NGX upscaling is not implemented -> FAIL_FeatureNotSupported");
+    // Native-unsupported (NVIDIA NGX SDK `nvsdk_ngx_vk.h`, `nvsdk_ngx_defs.h`):
+    // Vulkan NGX requires an NVIDIA Vulkan driver (`VK_NVX_binary_import` /
+    // `VK_NVX_image_view_handle`), returning `NVSDK_NGX_Result_FAIL_FeatureNotSupported`
+    // on non-NVIDIA hardware.
+    log::debug!(
+        target: "d3d",
+        "NVSDK_NGX_VULKAN_Init: non-NVIDIA GPU -> FAIL_FeatureNotSupported"
+    );
     NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED
 }
 
@@ -728,8 +744,11 @@ pub extern "win64" fn NVSDK_NGX_VULKAN_CreateFeature(
     if !out_handle.is_null() {
         unsafe { std::ptr::write_unaligned(out_handle, 0) };
     }
-    crate::stub!(
-        "NVSDK_NGX_VULKAN_CreateFeature(feature_id={feature_id} {}): Vulkan NGX is not implemented -> FAIL_FeatureNotSupported",
+    // Native-unsupported (NVIDIA NGX SDK `nvsdk_ngx_vk.h`): no NVIDIA Vulkan NGX
+    // driver on Apple Silicon -> `NVSDK_NGX_Result_FAIL_FeatureNotSupported`.
+    log::debug!(
+        target: "d3d",
+        "NVSDK_NGX_VULKAN_CreateFeature(feature_id={feature_id} {}): non-NVIDIA GPU -> FAIL_FeatureNotSupported",
         ngx_feature_name(feature_id)
     );
     NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED
@@ -741,15 +760,21 @@ pub extern "win64" fn NVSDK_NGX_VULKAN_EvaluateFeature(
     _params: usize,
     _callback: usize,
 ) -> i32 {
-    crate::stub!(
-        "NVSDK_NGX_VULKAN_EvaluateFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"
+    // Native-unsupported (NVIDIA NGX SDK `nvsdk_ngx_vk.h`): no NVIDIA Vulkan NGX
+    // driver on Apple Silicon -> `NVSDK_NGX_Result_FAIL_FeatureNotSupported`.
+    log::debug!(
+        target: "d3d",
+        "NVSDK_NGX_VULKAN_EvaluateFeature: non-NVIDIA GPU -> FAIL_FeatureNotSupported"
     );
     NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED
 }
 
 pub extern "win64" fn NVSDK_NGX_VULKAN_ReleaseFeature(_feature_handle: usize) -> i32 {
-    crate::stub!(
-        "NVSDK_NGX_VULKAN_ReleaseFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"
+    // Native-unsupported (NVIDIA NGX SDK `nvsdk_ngx_vk.h`): no NVIDIA Vulkan NGX
+    // driver on Apple Silicon -> `NVSDK_NGX_Result_FAIL_FeatureNotSupported`.
+    log::debug!(
+        target: "d3d",
+        "NVSDK_NGX_VULKAN_ReleaseFeature: non-NVIDIA GPU -> FAIL_FeatureNotSupported"
     );
     NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED
 }
@@ -1008,6 +1033,10 @@ mod tests {
             assert_eq!(sr, 0);
         }
 
+        assert_eq!(
+            NVSDK_NGX_VULKAN_Init(0, std::ptr::null(), 0, 0, 0, 0, 0, 0, 0),
+            NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED
+        );
         let mut h = 0x1234usize;
         assert_eq!(
             NVSDK_NGX_VULKAN_CreateFeature(0, NVSDK_NGX_FEATURE_SUPER_SAMPLING, vk_params, &mut h),

@@ -11,11 +11,11 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **234** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 146 |
-| `failing` (honest-failing macro exports) | 33 |
-| `middleware_stub` (third-party/engine middleware fallbacks) | 55 |
-| DLLs with remaining stubs | 43 |
+| Total remaining stub sites | **188** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 145 |
+| `failing` (honest-failing macro exports) | 24 |
+| `middleware_stub` (third-party/engine middleware fallbacks) | 19 |
+| DLLs with remaining stubs | 31 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
@@ -23,6 +23,7 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 |---|---|
 | [`crypto-cng-capi.md`](stub-backlog.d/crypto-cng-capi.md) | Stub & API Gap Backlog — `stubs/crypto-cng-capi` |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
+| [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
 
 ### From `docs/stub-backlog.d/crypto-cng-capi.md`
 
@@ -88,21 +89,105 @@ Exposed while building and running the headless Windows x86-64 guest corpus (`cr
 | `user32.dll!wsprintfW` | Missing export in `crates/win32-rt/src/user32/misc.rs`: guest binaries importing `wsprintfW` hit an unresolved-import trap thunk instead of formatting UTF-16 output. | Implement variadic `wsprintfW` via `win64_varargs_thunk!` backed by `ucrt::stdio` wide formatter (1024-char Windows cap) and run `cargo opsdb -- win32-sync`. |
 | `user32.dll!wsprintfA` | Existing implementation in `crates/win32-rt/src/user32/misc.rs` copies the raw format string and ignores variadic arguments (`let _ = (a1, a2);`). | Replace with a real `win64_varargs_thunk!` formatter backed by `ucrt::stdio` narrow printf formatting (1024-char Windows cap). |
 
+### From `docs/stub-backlog.d/middleware.md`
+
+# Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions)
+
+Scope: 61 static stub sites across vendor middleware DLLs (`amd_ags_x64`, `amd_fidelityfx_loader_dx12`, `libxess`, `libxess_dx11`, `nvngx_dlss`, `sl.interposer`, `oo2core_9_win64`, `physx_64`, `physxcooking_64`, `physx3common_x64`, `zstd`, `directml`, `dstorage`, `nri`) and `vulkan_1.dll` (`nvlowlatencyvk.dll`).
+
+- **Before:** 61 sites in scope
+- **After:** 15 sites remaining in scope (46 sites eliminated)
+  - **Made real:** 6 sites
+  - **Removed fake proprietary overrides (Rule 4 — shipping PE runs via ARM64 JIT; absent DLL returns `ERROR_MOD_NOT_FOUND`):** 7 sites
+  - **Native-unsupported (matches Windows without vendor hardware/feature):** 33 sites
+  - **Leftovers (honest partial implementations kept in place):** 15 sites
+
+## Removed Sites — Made Real (6)
+
+| DLL!API | Disposition | Implementation |
+|---|---|---|
+| `zstd.dll!ZSTD_compress` | Made real | Backed by vendored BSD-3-Clause `zstd-sys` (Meta Zstandard 1.6.0) with null-pointer safety and full unit round-trip/error tests in `crates/win32-rt/src/misc/zstd.rs`. |
+| `zstd.dll!ZSTD_decompress` | Made real | Backed by vendored BSD-3-Clause `zstd-sys` (Meta Zstandard 1.6.0) with null-pointer safety and corrupt/small-buffer error tests in `crates/win32-rt/src/misc/zstd.rs`. |
+| `dstorage.dll!DStorageCreateCompressionCodec` | Made real | Complete DirectStorage 1.2 built-in codec dispatch (`DSTORAGE_COMPRESSION_FORMAT_GDEFLATE` -> real GDeflate v1 codec; `NONE` -> `E_INVALIDARG`; custom `>= 0x80` & reserved `2..=0x7F` -> `E_NOTIMPL` per Microsoft Learn `DStorageCreateCompressionCodec`). |
+| `amd_fidelityfx_loader_dx12.dll!ffxDispatch` (`GENERATEREACTIVEMASK`) | Made real | Implemented real Metal GPU compute shader `port_ffx_gen_reactive_2d` in `crates/d3d12-metal` (`clear.rs`, `metalfx_rt.rs`) matching FidelityFX FSR3 autogen reactive mask (`APPLY_TONEMAP`, `APPLY_INVERSETONEMAP`, `APPLY_THRESHOLD`, `USE_COMPONENTS_MAX`, `scale`, `cutoff_threshold`, `binary_value`), verified via GPU readback test. |
+| `libxess.dll!xessD3D12Execute` | Made real | Implemented non-zero input/output subrect base offsets (`inputColorBase`, `inputDepthBase`, `inputMotionVectorBase`, `inputResponsiveMaskBase`, `outputColorBase`) in `crates/d3d12-metal` via dedicated-slot Metal staging blits (zero overhead at `[0, 0]`), verified via GPU readback test. |
+| `libxess_dx11.dll!xessD3D11Execute` | Made real | Wired non-zero subrect base offsets through `d3d12-metal` `TemporalUpscaleParams` and `upscale_resource_subrect`, verified via D3D11 GPU readback test. |
+
+## Removed Sites — Fake Proprietary Middleware Overrides Removed (7)
+
+Per Rule 4, games shipping these proprietary DLLs execute their real Windows x86-64 PE via the ARM64 JIT (`DefaultDllMode::Guest`), and when no shipping DLL is present `LoadLibrary` fails with `ERROR_MOD_NOT_FOUND` (126), matching Windows.
+
+| DLL!API | Disposition | Reason |
+|---|---|---|
+| `oo2core_9_win64.dll!OodleLZ_Compress` | Removed fake override | Proprietary RAD Oodle codec; deleted `crates/win32-rt/src/misc/oo2core_9_win64.rs` so shipping `oo2core_*_win64.dll` runs via ARM64 JIT and absent DLL fails with `ERROR_MOD_NOT_FOUND`. |
+| `oo2core_9_win64.dll!OodleLZ_Decompress` | Removed fake override | Proprietary RAD Oodle codec; deleted `crates/win32-rt/src/misc/oo2core_9_win64.rs`. |
+| `physx_64.dll!PxCreateBasePhysics` | Removed fake override | NVIDIA PhysX 4.x/5.x core simulation; deleted `crates/win32-rt/src/misc/physx_64.rs` so shipping `PhysX_64.dll` runs via ARM64 JIT (`[middleware.physx] mode = "guest"`). |
+| `physx_64.dll!PxCreatePhysics` | Removed fake override | NVIDIA PhysX 4.x/5.x core simulation; deleted `crates/win32-rt/src/misc/physx_64.rs`. |
+| `physx_64.dll!PxRegisterPhysicsSerializers` | Removed fake override | NVIDIA PhysX 4.x/5.x serializers; deleted `crates/win32-rt/src/misc/physx_64.rs`. |
+| `physx_64.dll!PxUnregisterPhysicsSerializers` | Removed fake override | NVIDIA PhysX 4.x/5.x serializers; deleted `crates/win32-rt/src/misc/physx_64.rs`. |
+| `physxcooking_64.dll!PxCreateCooking` | Removed fake override | NVIDIA PhysX 4.x/5.x cooking; deleted `crates/win32-rt/src/misc/physxcooking_64.rs` so shipping `PhysXCooking_64.dll` runs via ARM64 JIT. |
+
+## Native-unsupported (matches Windows without the feature) (33)
+
+| DLL!API | Behavior on Apple Silicon | Windows / Vendor SDK Citation |
+|---|---|---|
+| `amd_ags_x64.dll!agsDriverExtensionsDX12_PushMarker` | Forwards recognized D3D12 command lists to Metal debug markers (`AGS_SUCCESS`); returns `AGS_EXTENSION_NOT_SUPPORTED` (`7`) on foreign/non-AMD command lists. | AMD GPUOpen AGS SDK `amd_ags.h`: on non-AMD GPUs `extensionsSupported == 0` and DX12 driver-extension calls return `AGS_EXTENSION_NOT_SUPPORTED` (`7`). |
+| `amd_ags_x64.dll!agsDriverExtensionsDX12_PopMarker` | Forwards recognized D3D12 command lists to Metal debug markers (`AGS_SUCCESS`); returns `AGS_EXTENSION_NOT_SUPPORTED` (`7`) on foreign/non-AMD command lists. | AMD GPUOpen AGS SDK `amd_ags.h`: `AGS_EXTENSION_NOT_SUPPORTED` (`7`) without AMD driver extension context. |
+| `amd_ags_x64.dll!agsDriverExtensionsDX12_SetMarker` | Forwards recognized D3D12 command lists to Metal debug markers (`AGS_SUCCESS`); returns `AGS_EXTENSION_NOT_SUPPORTED` (`7`) on foreign/non-AMD command lists. | AMD GPUOpen AGS SDK `amd_ags.h`: `AGS_EXTENSION_NOT_SUPPORTED` (`7`) without AMD driver extension context. |
+| `amd_fidelityfx_loader_dx12.dll!ffxCreateContext` (`FRAMEGENERATION`) | Zeroes `*context = 0` and returns `FFX_API_RETURN_NO_PROVIDER` (`4`). | AMD FidelityFX SDK `ffx_api.cpp` / `ffx_api_types.h`: returns `FFX_API_RETURN_NO_PROVIDER` (`4`) when no frame-generation provider is installed (upscaler contexts remain routed to MetalFX; future Metal 4 `MTL4FXFrameInterpolator` optional). |
+| `amd_fidelityfx_loader_dx12.dll!ffxConfigure` (`FRAMEGENERATION`) | Returns `FFX_API_RETURN_NO_PROVIDER` (`4`). | AMD FidelityFX SDK `ffx_api.cpp`: `FFX_API_RETURN_NO_PROVIDER` (`4`) with no frame-generation provider. |
+| `amd_fidelityfx_loader_dx12.dll!ffxDispatch` (`FRAMEGENERATION`) | Returns `FFX_API_RETURN_NO_PROVIDER` (`4`). | AMD FidelityFX SDK `ffx_api.cpp`: `FFX_API_RETURN_NO_PROVIDER` (`4`) with no frame-generation provider. |
+| `amd_fidelityfx_loader_dx12.dll!ffxQuery` (`INTERPOLATIONCOMMANDLIST_DX12`) | Zeroes `*out_cmd = 0` and returns `FFX_API_RETURN_NO_PROVIDER` (`4`). | AMD FidelityFX SDK `ffx_api.cpp`: `FFX_API_RETURN_NO_PROVIDER` (`4`) with no frame-generation swapchain provider. |
+| `amd_fidelityfx_loader_dx12.dll!ffxQuery` (`INTERPOLATIONTEXTURE_DX12`) | Zeroes `*out_tex = [0; 6]` and returns `FFX_API_RETURN_NO_PROVIDER` (`4`). | AMD FidelityFX SDK `ffx_api.cpp`: `FFX_API_RETURN_NO_PROVIDER` (`4`) with no frame-generation swapchain provider. |
+| `libxess_dx11.dll!xessSetContextParameterF` | Validates context and finite value, returns `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (`-7`). | Intel XeSS SDK `xess.h`: retail non-Intel XeSS runtimes expose no Intel-driver-internal float context parameters and return `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (`-7`). |
+| `libxess_dx11.dll!xessStartDump` | Validates context and non-null params/path, returns `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (`-7`). | Intel XeSS SDK `xess_debug.h`: retail `libxess_dx11.dll` builds omit Intel debug frame-dump capture and return `XESS_RESULT_ERROR_NOT_IMPLEMENTED` (`-7`). |
+| `libxess_dx11.dll!INTC_D3D12_GetApplicationInfo` | Returns `E_NOINTERFACE` (`0x80004002`). | Intel Graphics Extensions (`igdext64.dll` / `IntelExtensionsFramework`): no Intel `INTCExtensionContext` exists on non-Intel GPUs. |
+| `libxess_dx11.dll!INTC_D3D12_GetGpuCrashDumpBufferInfo` | Void no-op. | Intel Graphics Extensions (`igdext64.dll`): Intel UMD crash-dump hook has no Intel GPU driver on non-Intel GPUs. |
+| `libxess_dx11.dll!INTC_D3D12_GpuCrashDumpOnCommandListCreate` | Void no-op. | Intel Graphics Extensions (`igdext64.dll`): Intel UMD crash-dump hook has no Intel GPU driver on non-Intel GPUs. |
+| `libxess_dx11.dll!INTC_D3D12_GpuCrashDumpOnCommandListDestroy` | Void no-op. | Intel Graphics Extensions (`igdext64.dll`): Intel UMD crash-dump hook has no Intel GPU driver on non-Intel GPUs. |
+| `libxess_dx11.dll!INTC_D3D12_GpuCrashDumpOnDeviceDestroy` | Void no-op. | Intel Graphics Extensions (`igdext64.dll`): Intel UMD crash-dump hook has no Intel GPU driver on non-Intel GPUs. |
+| `libxess_dx11.dll!INTC_D3D12_RegisterDriverCallbacks` | Void no-op. | Intel Graphics Extensions (`igdext64.dll`): Intel UMD callback hook has no Intel GPU driver on non-Intel GPUs. |
+| `nvngx_dlss.dll!NVSDK_NGX_D3D12_CreateFeature` (non-SR/ISP features) | Zeroes `*out_handle = 0` and returns `NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED` (`0xBAD0_0001`). (`SuperSampling` and `ImageSignalProcessing` run on MetalFX.) | NVIDIA NGX SDK `nvsdk_ngx_defs.h`: GPUs lacking Tensor Core / Optical Flow features (`FrameGeneration`, `DeepDVC`, `RayReconstruction`) return `NVSDK_NGX_Result_FAIL_FeatureNotSupported`. |
+| `nvngx_dlss.dll!NVSDK_NGX_VULKAN_Init` | Returns `NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED` (`0xBAD0_0001`). | NVIDIA NGX SDK `nvsdk_ngx_vk.h` / `nvsdk_ngx_defs.h`: requires NVIDIA Vulkan driver (`VK_NVX_binary_import`); non-NVIDIA GPUs return `NVSDK_NGX_Result_FAIL_FeatureNotSupported`. |
+| `nvngx_dlss.dll!NVSDK_NGX_VULKAN_CreateFeature` | Zeroes `*out_handle = 0` and returns `NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED` (`0xBAD0_0001`). | NVIDIA NGX SDK `nvsdk_ngx_vk.h`: returns `NVSDK_NGX_Result_FAIL_FeatureNotSupported` on non-NVIDIA GPUs. |
+| `nvngx_dlss.dll!NVSDK_NGX_VULKAN_EvaluateFeature` | Returns `NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED` (`0xBAD0_0001`). | NVIDIA NGX SDK `nvsdk_ngx_vk.h`: returns `NVSDK_NGX_Result_FAIL_FeatureNotSupported` on non-NVIDIA GPUs. |
+| `nvngx_dlss.dll!NVSDK_NGX_VULKAN_ReleaseFeature` | Returns `NVSDK_NGX_RESULT_FAIL_FEATURE_NOT_SUPPORTED` (`0xBAD0_0001`). | NVIDIA NGX SDK `nvsdk_ngx_vk.h`: returns `NVSDK_NGX_Result_FAIL_FeatureNotSupported` on non-NVIDIA GPUs. |
+| `sl.interposer.dll!slSetTag` | Returns `eErrorInvalidParameter` (`25`) if `tags == NULL \|\| n == 0`, else `eErrorFeatureNotSupported` (`32`). | NVIDIA Streamline SDK `source/core/sl.api/sl.cpp` (`slSetTag` -> `slValidateFeatureContext(kFeatureCommon, ctx)`): returns `eErrorFeatureNotSupported` when no Streamline plugins are supported on non-NVIDIA GPUs. |
+| `sl.interposer.dll!slSetConstants` | Returns `eErrorInvalidParameter` (`25`) if `values == NULL \|\| frame == NULL`, else `eErrorFeatureNotSupported` (`32`). | NVIDIA Streamline SDK `source/core/sl.api/sl.cpp` (`slSetConstants` -> `slValidateFeatureContext(kFeatureCommon, ctx)`): returns `eErrorFeatureNotSupported` when no Streamline plugins are supported on non-NVIDIA GPUs. |
+| `vulkan_1.dll!NvLL_VK_Initialize` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h` (`nvlowlatencyvk.dll`): returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) on non-NVIDIA GPUs without `VK_NV_low_latency`. |
+| `vulkan_1.dll!NvLL_VK_Unload` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_InitLowLatencyDevice` | Zeroes `*signal_sem = 0` when non-null and returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_DestroyLowLatencyDevice` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_SetSleepMode` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_Sleep` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_GetSleepStatus` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_SetLatencyMarker` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_GetLatency` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+| `vulkan_1.dll!NvLL_VK_NotifyOutOfBandQueue` | Returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`). | NVIDIA Reflex Vulkan SDK `NvLowLatencyVk.h`: returns `NVLL_VK_NO_IMPLEMENTATION` (`-3`) without NVIDIA Reflex driver. |
+
+## Remaining Leftovers in Scope (15)
+
+| DLL!API | Kind | Location | What Is Missing | Concrete Next Step |
+|---|---|---|---|---|
+| `physx3common_x64.dll!geom_get_world_bounds` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry (`ConvexMesh`, `TriangleMesh`, `HeightField`) bounds not parsed (analytic Sphere/Plane/Capsule/Box implemented). | Prefer shipping `PhysX3Common_x64.dll` via ARM64 JIT (`DefaultDllMode::Guest`), or parse PhysX 3.4 cooked `Gu::ConvexMeshData` / `Gu::TriangleMeshData` / `Gu::HeightFieldData` AABBs. |
+| `physx3common_x64.dll!geom_point_distance` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry point-distance query not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement GJK/BVH closest-point over cooked PhysX 3.4 mesh payloads. |
+| `physx3common_x64.dll!geom_compute_penetration` (2 sites: geom0, geom1) | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry penetration depth/direction (MTD) not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement EPA/SAT penetration over cooked convex/triangle/heightfield meshes. |
+| `physx3common_x64.dll!geom_overlap` (2 sites: geom0, geom1) | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry overlap test not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement BVH/SAT overlap against cooked meshes. |
+| `physx3common_x64.dll!geom_raycast` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry raycast not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement BVH33/BVH34 ray-triangle and ray-convex-hull intersection. |
+| `physx3common_x64.dll!geom_sweep` (2 sites: geom0, geom1) | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | Cooked geometry shape sweep not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement GJK-raycast/TOI sweep over cooked meshes. |
+| `physx3common_x64.dll!mesh_find_overlap_triangle_mesh` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | `PxMeshQuery::findOverlapTriangleMesh` requires cooked triangle mesh BVH/index payload decoding. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or decode `Gu::TriangleMesh` vertex/index/BVH buffers. |
+| `physx3common_x64.dll!mesh_get_triangle` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | `PxMeshQuery::getTriangle` requires cooked triangle mesh vertex/index/adjacency decoding. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or decode `Gu::TriangleMesh` vertex/index/adjacency tables. |
+| `physx3common_x64.dll!mesh_sweep` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs` | `PxMeshQuery::sweep` over triangle array not implemented. | Run shipping `PhysX3Common_x64.dll` via ARM64 JIT, or implement analytic shape-vs-triangle sweep loop in `physx3common_x64.rs`. |
+| `directml.dll!parse` | `middleware_stub` | `crates/win32-rt/src/misc/directml/ops.rs` | Only ~35 core DirectML operators are implemented; remaining DML 1.x / FL 5.0 operators (`Gather`, `Scatter`, `Resample`, `Resize`, `TopK`, `Pad`, `Tile`, `Cast`, `RNN`/`LSTM`/`GRU`, `QuantizeLinear`/`DequantizeLinear`, `MultiheadAttention`, etc.) return `E_NOTIMPL`. | Implement missing `DML_OPERATOR_*` descriptors and CPU/Metal compute kernels as games request them, with per-operator unit tests. |
+| `nri.dll!core_cmd_set_sample_positions` | `middleware_stub` | `crates/win32-rt/src/misc/nri/cmdlist.rs` | `ID3D12GraphicsCommandList1::SetSamplePositions` is not yet wired to Metal's `MTLRenderPassDescriptor::setSamplePositions:count:` (`D3D12_OPTIONS2.ProgrammableSamplePositionsTier` currently reports `0`). | Wire `SetSamplePositions` in `d3d12-metal` (`MTL4RenderPassDescriptor` / `MTLRenderPassDescriptor` programmable sample positions on Apple GPU family 7+) and `win32-rt/src/d3d12`, then forward `CmdSetSamplePositions` to it. |
+| `nri.dll!core_create_query_pool` | `middleware_stub` | `crates/win32-rt/src/misc/nri/device.rs` | `QueryType::PIPELINE_STATISTICS` (`2`) and `QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE` (`3`) return `NRI_RESULT_UNSUPPORTED` (`TIMESTAMP` and `OCCLUSION` are implemented). | Back `ACCELERATION_STRUCTURE_COMPACTED_SIZE` with a readback buffer + `EmitRaytracingAccelerationStructurePostbuildInfo` (`COMPACTED_SIZE`), and wire `PIPELINE_STATISTICS` once `d3d12-metal` exposes `MTL4CounterHeap` pipeline-statistics queries. |
+
 ## Proprietary & Vendor Middleware (Legal / Architectural Limits)
 
 These modules wrap proprietary third-party SDKs or GPU-vendor-specific extensions. Where a game ships its own Windows x86-64 PE DLL (e.g., Oodle `oo2core_*_win64.dll`, PhysX 4/5 `PhysX_64.dll`, `zstd.dll`), `port-runner` executes the real shipping PE through the ARM64 JIT rather than overriding it.
 
 | DLL | Remaining Sites | Reason | Next Step |
 |---|---:|---|---|
-| `amd_ags_x64.dll` | 3 | AMD GPU Services vendor extension on non-D3D12 command list | Forward recognized D3D12 debug markers to Metal command-buffer labels; return failure on foreign pointers. |
-| `amd_fidelityfx_loader_dx12.dll` | 6 | AMD FidelityFX Frame Generation / unsupported FFX context variant | Keep upscaler contexts routed to MetalFX; report FFX_API_RETURN_NO_PROVIDER honestly for frame-gen until Metal 4 frame interpolation is wired. |
-| `libxess.dll` | 1 | Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*) | Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks. |
-| `libxess_dx11.dll` | 9 | Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*) | Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks. |
-| `nvngx_dlss.dll` | 5 | Proprietary NVIDIA NGX DLSS / Vulkan NGX extension | Route D3D12 NGX features through MetalFX temporal/spatial scalers; implement Vulkan NGX -> MetalFX or MoltenVK bridge when needed. |
-| `oo2core_9_win64.dll` | 2 | Proprietary RAD Oodle compression (cannot be clean-room reimplemented legally without a license) | Always run the game's shipping oo2core_*_win64.dll PE via x86-runtime ARM64 JIT; keep this honest fallback returning 0 only when no shipping DLL exists. |
-| `physx_64.dll` | 4 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
-| `physxcooking_64.dll` | 1 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
-| `sl.interposer.dll` | 2 | Proprietary NVIDIA Streamline plugin host (requires NVIDIA GPU + signed NGX plugins) | Keep honest eErrorFeatureNotSupported reporting; route DLSS/upscaling requests to MetalFX via nvngx_dlss/libxess/FFX bridges. |
 
 ## Remaining Stubs by DLL
 
@@ -115,40 +200,28 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
 | `dxgi.dll` | 10 | Unsupported Windows-only DXGI path (WARP software rasterizer, UWP CoreWindow, exclusive fullscreen ownership, event notifications) | Implement VSync-synchronized WaitForVBlank via CVDisplayLink/CADisplayLink and shared-handle LUID lookup; keep WARP/CoreWindow honestly unsupported. |
-| `vulkan_1.dll` | 10 | Proprietary NVIDIA Reflex Low Latency Vulkan extension (NvLL_VK_*) | Return NVLL_VK_NO_IMPLEMENTATION honestly on Apple Silicon, or map sleep/marker semantics to Metal frame pacing. |
 | `ws2_32.dll` | 10 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
-| `libxess_dx11.dll` | 9 | Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*) | Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks. |
 | `ntdll.dll` | 9 | Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export | Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported. |
-| `amd_fidelityfx_loader_dx12.dll` | 6 | AMD FidelityFX Frame Generation / unsupported FFX context variant | Keep upscaler contexts routed to MetalFX; report FFX_API_RETURN_NO_PROVIDER honestly for frame-gen until Metal 4 frame interpolation is wired. |
 | `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
 | `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `nvngx_dlss.dll` | 5 | Proprietary NVIDIA NGX DLSS / Vulkan NGX extension | Route D3D12 NGX features through MetalFX temporal/spatial scalers; implement Vulkan NGX -> MetalFX or MoltenVK bridge when needed. |
 | `dbghelp.dll` | 4 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
 | `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `physx_64.dll` | 4 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
 | `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
 | `wintrust.dll` | 4 | Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS) | Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed. |
-| `amd_ags_x64.dll` | 3 | AMD GPU Services vendor extension on non-D3D12 command list | Forward recognized D3D12 debug markers to Metal command-buffer labels; return failure on foreign pointers. |
 | `powrprof.dll` | 3 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `d3d12.dll` | 2 | D3D12 root-signature deserializer COM object not yet implemented | Parse DXBC/RTS0 root-signature blobs in win32-rt/src/d3d12 and expose ID3D12RootSignatureDeserializer / VersionedDeserializer. |
 | `libcurl.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `oo2core_9_win64.dll` | 2 | Proprietary RAD Oodle compression (cannot be clean-room reimplemented legally without a license) | Always run the game's shipping oo2core_*_win64.dll PE via x86-runtime ARM64 JIT; keep this honest fallback returning 0 only when no shipping DLL exists. |
-| `sl.interposer.dll` | 2 | Proprietary NVIDIA Streamline plugin host (requires NVIDIA GPU + signed NGX plugins) | Keep honest eErrorFeatureNotSupported reporting; route DLSS/upscaling requests to MetalFX via nvngx_dlss/libxess/FFX bridges. |
 | `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xaudio2_9redist.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `zstd.dll` | 2 | Open-source Zstandard compression fallback (no native zstd crate linked yet) | Run shipping zstd.dll via ARM64 JIT, or add a clean-room / zstd-safe native backend with unit round-trip tests. |
 | `d2d1.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `directml.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `dsound.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `dstorage.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `gameinput.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `gdi32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `hid.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `libxess.dll` | 1 | Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*) | Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks. |
 | `msctf.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `physxcooking_64.dll` | 1 | NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT) | Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest". |
 | `shell32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `xinput1_4.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 
@@ -322,24 +395,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `take_ownership` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:669` | `"TakeOwnership: exclusive fullscreen is not supported"` |
 | `wait_for_vblank` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:663` | `"WaitForVBlank: sleeps one refresh period ({hz} Hz), not synchronized to the display"` |
 
-### `vulkan_1.dll` (10)
-
-- **Reason:** Proprietary NVIDIA Reflex Low Latency Vulkan extension (NvLL_VK_*)
-- **Next step:** Return NVLL_VK_NO_IMPLEMENTATION honestly on Apple Silicon, or map sleep/marker semantics to Metal frame pacing.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `NvLL_VK_DestroyLowLatencyDevice` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_GetLatency` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_GetSleepStatus` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_InitLowLatencyDevice` | `stub` | `crates/win32-rt/src/misc/vulkan_1.rs:4500` | `"NvLL_VK_InitLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)"` |
-| `NvLL_VK_Initialize` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_NotifyOutOfBandQueue` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_SetLatencyMarker` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_SetSleepMode` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_Sleep` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-| `NvLL_VK_Unload` | `failing` | `crates/win32-rt/src/misc/vulkan_1.rs:4504` | `i32 = NVLL_VK_NO_IMPLEMENTATION, err 0` |
-
 ### `ws2_32.dll` (10)
 
 - **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
@@ -358,23 +413,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `WSASendMsg` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3357` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
 | `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1319` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
 
-### `libxess_dx11.dll` (9)
-
-- **Reason:** Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*)
-- **Next step:** Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `INTC_D3D12_GetApplicationInfo` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1186` | `"INTC_D3D12_GetApplicationInfo -> E_NOINTERFACE"` |
-| `INTC_D3D12_GetGpuCrashDumpBufferInfo` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1194` | `"INTC_D3D12_GetGpuCrashDumpBufferInfo (no-op)"` |
-| `INTC_D3D12_GpuCrashDumpOnCommandListCreate` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1201` | `"INTC_D3D12_GpuCrashDumpOnCommandListCreate (no-op)"` |
-| `INTC_D3D12_GpuCrashDumpOnCommandListDestroy` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1208` | `"INTC_D3D12_GpuCrashDumpOnCommandListDestroy (no-op)"` |
-| `INTC_D3D12_GpuCrashDumpOnDeviceDestroy` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1212` | `"INTC_D3D12_GpuCrashDumpOnDeviceDestroy (no-op)"` |
-| `INTC_D3D12_RegisterDriverCallbacks` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:1219` | `"INTC_D3D12_RegisterDriverCallbacks (no-op)"` |
-| `xessD3D11Execute` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:657` | `"xessD3D11Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX"...` |
-| `xessStartDump` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:951` | `"xessStartDump -> XESS_RESULT_ERROR_NOT_IMPLEMENTED"` |
-| `xess_set_context_parameter_f_impl` | `middleware_stub` | `crates/win32-rt/src/misc/libxess_dx11.rs:879` | `"xessSetContextParameterF(param={param:#x}, value={value}) -> NOT_IMPLEMENTED"` |
-
 ### `ntdll.dll` (9)
 
 - **Reason:** Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export
@@ -391,20 +429,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:239` | `"NtQueryInformationProcess class {class}"` |
 | `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:303` | `"NtQueryInformationThread class {class}"` |
 | `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:422` | `"NtQuerySystemInformation class {class}"` |
-
-### `amd_fidelityfx_loader_dx12.dll` (6)
-
-- **Reason:** AMD FidelityFX Frame Generation / unsupported FFX context variant
-- **Next step:** Keep upscaler contexts routed to MetalFX; report FFX_API_RETURN_NO_PROVIDER honestly for frame-gen until Metal 4 frame interpolation is wired.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `ffxConfigure` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:394` | `"ffxConfigure(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"` |
-| `ffxCreateContext` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:266` | `"ffxCreateContext(FRAMEGENERATION): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"` |
-| `ffxDispatch` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:540` | `"ffxDispatch(GENERATEREACTIVEMASK): cleared outReactive to 0.0 (cleared={cleared}, render={}x{}, scale={:.3}, cutoff={:.3}, binary={:.3}, fl...` |
-| `ffxDispatch` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:558` | `"ffxDispatch(ty={ty:#x}): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"` |
-| `ffxQuery` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:620` | `"ffxQuery(INTERPOLATIONCOMMANDLIST_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"` |
-| `ffxQuery` | `middleware_stub` | `crates/win32-rt/src/misc/amd_fidelityfx_loader_dx12.rs:630` | `"ffxQuery(INTERPOLATIONTEXTURE_DX12): frame generation is not supported -> FFX_API_RETURN_NO_PROVIDER"` |
 
 ### `mmdevapi.dll` (6)
 
@@ -447,19 +471,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `dev_set_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1331` | `"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
 | `run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1822` | `"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"` |
 
-### `nvngx_dlss.dll` (5)
-
-- **Reason:** Proprietary NVIDIA NGX DLSS / Vulkan NGX extension
-- **Next step:** Route D3D12 NGX features through MetalFX temporal/spatial scalers; implement Vulkan NGX -> MetalFX or MoltenVK bridge when needed.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `NVSDK_NGX_D3D12_CreateFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:630` | `"NVSDK_NGX_D3D12_CreateFeature: unsupported feature_id={other} ({}) -> FAIL_FeatureNotSupported", ngx_feature_name(other)` |
-| `NVSDK_NGX_VULKAN_CreateFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:731` | `"NVSDK_NGX_VULKAN_CreateFeature(feature_id={feature_id} {}): Vulkan NGX is not implemented -> FAIL_FeatureNotSupported", ngx_feature_name(fe...` |
-| `NVSDK_NGX_VULKAN_EvaluateFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:744` | `"NVSDK_NGX_VULKAN_EvaluateFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"` |
-| `NVSDK_NGX_VULKAN_Init` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:702` | `"NVSDK_NGX_VULKAN_Init: Vulkan NGX upscaling is not implemented -> FAIL_FeatureNotSupported"` |
-| `NVSDK_NGX_VULKAN_ReleaseFeature` | `middleware_stub` | `crates/win32-rt/src/misc/nvngx_dlss.rs:751` | `"NVSDK_NGX_VULKAN_ReleaseFeature: Vulkan NGX is not implemented -> FAIL_FeatureNotSupported"` |
-
 ### `dbghelp.dll` (4)
 
 - **Reason:** Unimplemented DbgHelp stack walk or minidump writer
@@ -484,18 +495,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `fac_create_glyph_run_analysis` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:365` | `"IDWriteFactory::CreateGlyphRunAnalysis -> E_NOTIMPL"` |
 | `fac_create_text_analyzer` | `stub` | `crates/win32-rt/src/misc/dwrite.rs:336` | `"IDWriteFactory::CreateTextAnalyzer -> E_NOTIMPL"` |
 
-### `physx_64.dll` (4)
-
-- **Reason:** NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT)
-- **Next step:** Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest".
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `PxCreateBasePhysics` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:26` | `"PhysX_64!PxCreateBasePhysics(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x core simulation requires shipping PE...` |
-| `PxCreatePhysics` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:44` | `"PhysX_64!PxCreatePhysics(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x core simulation requires shipping PE ([m...` |
-| `PxRegisterPhysicsSerializers` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:56` | `"PhysX_64!PxRegisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" \| \"5.x\", mode ...` |
-| `PxUnregisterPhysicsSerializers` | `middleware_stub` | `crates/win32-rt/src/misc/physx_64.rs:62` | `"PhysX_64!PxUnregisterPhysicsSerializers: PhysX 4.x/5.x serializers require shipping PE ([middleware.physx] version = \"4.1\" \| \"5.x\", mod...` |
-
 ### `secur32.dll` (4)
 
 - **Reason:** Server-side Schannel (INBOUND) or uncommon context/credential attribute
@@ -519,17 +518,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `Tbsip_Submit_Command` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1661` | `"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"` |
 | `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1415` | `"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"` |
 | `WinVerifyTrust` | `stub` | `crates/win32-rt/src/misc/wintrust.rs:1439` | `"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"` |
-
-### `amd_ags_x64.dll` (3)
-
-- **Reason:** AMD GPU Services vendor extension on non-D3D12 command list
-- **Next step:** Forward recognized D3D12 debug markers to Metal command-buffer labels; return failure on foreign pointers.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `agsDriverExtensionsDX12_PopMarker` | `middleware_stub` | `crates/win32-rt/src/misc/amd_ags_x64.rs:406` | `"agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}"` |
-| `agsDriverExtensionsDX12_PushMarker` | `middleware_stub` | `crates/win32-rt/src/misc/amd_ags_x64.rs:384` | `"agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}"` |
-| `agsDriverExtensionsDX12_SetMarker` | `middleware_stub` | `crates/win32-rt/src/misc/amd_ags_x64.rs:428` | `"agsDriverExtensionsDX12_SetMarker: unsupported command list {cmd_list:#x}"` |
 
 ### `powrprof.dll` (3)
 
@@ -572,26 +560,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `core_cmd_set_sample_positions` | `middleware_stub` | `crates/win32-rt/src/misc/nri/cmdlist.rs:965` | `"CmdSetSamplePositions: programmable sample positions not supported on Metal"` |
 | `core_create_query_pool` | `middleware_stub` | `crates/win32-rt/src/misc/nri/device.rs:1383` | `"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type` |
 
-### `oo2core_9_win64.dll` (2)
-
-- **Reason:** Proprietary RAD Oodle compression (cannot be clean-room reimplemented legally without a license)
-- **Next step:** Always run the game's shipping oo2core_*_win64.dll PE via x86-runtime ARM64 JIT; keep this honest fallback returning 0 only when no shipping DLL exists.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `OodleLZ_Compress` | `middleware_stub` | `crates/win32-rt/src/misc/oo2core_9_win64.rs:86` | `"oo2core!OodleLZ_Compress(compressor={compressor}, raw_len={raw_len})"` |
-| `OodleLZ_Decompress` | `middleware_stub` | `crates/win32-rt/src/misc/oo2core_9_win64.rs:106` | `"oo2core!OodleLZ_Decompress(comp={comp_buf_size}, raw={raw_len})"` |
-
-### `sl.interposer.dll` (2)
-
-- **Reason:** Proprietary NVIDIA Streamline plugin host (requires NVIDIA GPU + signed NGX plugins)
-- **Next step:** Keep honest eErrorFeatureNotSupported reporting; route DLSS/upscaling requests to MetalFX via nvngx_dlss/libxess/FFX bridges.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `slSetConstants` | `middleware_stub` | `crates/win32-rt/src/slstub.rs:125` | `"slSetConstants accepted and dropped (no Streamline features)"` |
-| `slSetTag` | `middleware_stub` | `crates/win32-rt/src/slstub.rs:120` | `"slSetTag({n} tags) accepted and dropped (no Streamline features)"` |
-
 ### `uxtheme.dll` (2)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -611,16 +579,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `parse_wave_format` | `middleware_stub` | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs:216` | `"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"` |
 | `parse_wave_format` | `middleware_stub` | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs:233` | `"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"` |
-
-### `zstd.dll` (2)
-
-- **Reason:** Open-source Zstandard compression fallback (no native zstd crate linked yet)
-- **Next step:** Run shipping zstd.dll via ARM64 JIT, or add a clean-room / zstd-safe native backend with unit round-trip tests.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `ZSTD_compress` | `middleware_stub` | `crates/win32-rt/src/misc/zstd.rs:33` | `"zstd!ZSTD_compress(src_size={src_size})"` |
-| `ZSTD_decompress` | `middleware_stub` | `crates/win32-rt/src/misc/zstd.rs:43` | `"zstd!ZSTD_decompress(compressed_size={compressed_size})"` |
 
 ### `d2d1.dll` (1)
 
@@ -649,15 +607,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `dsb_set_fx` | `stub` | `crates/win32-rt/src/misc/dsound/com_vtbl.rs:1458` | `"IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE"` |
 
-### `dstorage.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `DStorageCreateCompressionCodec` | `middleware_stub` | `crates/win32-rt/src/misc/dstorage.rs:94` | `"DStorageCreateCompressionCodec: unsupported format {format:#x} -> E_NOTIMPL"` |
-
 ### `gameinput.dll` (1)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -685,15 +634,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---|---|---|
 | `HidD_SetNumInputBuffers` | `stub` | `crates/win32-rt/src/misc/hid.rs:887` | `"ring size stays {INPUT_BUFFERS} (asked {n})"` |
 
-### `libxess.dll` (1)
-
-- **Reason:** Intel XeSS debug dump / Intel GPU crash-dump vendor extension (INTC_D3D12_*)
-- **Next step:** Keep XeSS execute routed through MetalFX; leave proprietary Intel GPA/crash-dump callbacks as documented unsupported hooks.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `xessD3D12Execute` | `middleware_stub` | `crates/win32-rt/src/misc/libxess.rs:594` | `"xessD3D12Execute: non-zero subrect base offsets color=({},{}) mv=({},{}) depth=({},{}) reactive=({},{}) out=({},{}) not applied by MetalFX"...` |
-
 ### `msctf.dll` (1)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -702,15 +642,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | API | Kind | Location | Detail |
 |---|---|---|---|
 | `ctx_track_properties` | `stub` | `crates/win32-rt/src/misc/msctf/context.rs:809` | `"ITfContext::TrackProperties -> E_NOTIMPL"` |
-
-### `physxcooking_64.dll` (1)
-
-- **Reason:** NVIDIA PhysX 4.x/5.x C++ ABI (vtable layout varies by build; shipping DLL runs natively under ARM64 JIT)
-- **Next step:** Run shipping PhysX_64.dll / PhysXCooking_64.dll under ARM64 JIT via [middleware.physx] mode = "guest".
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `PxCreateCooking` | `middleware_stub` | `crates/win32-rt/src/misc/physxcooking_64.rs:24` | `"PhysXCooking_64!PxCreateCooking(version={formatted}, detected={detected}, configured={:?}): PhysX 4.x/5.x cooking requires shipping PE ([mi...` |
 
 ### `shell32.dll` (1)
 
