@@ -1694,3 +1694,94 @@ fn dsound8_compressor_honors_attack_release_predelay_and_sample_rate() {
         "impulse should emerge after 48 samples (1 ms @ 48 kHz), got {delayed}"
     );
 }
+
+#[test]
+fn dsound8_echo_pan_delay_and_remaining_fx_parameters() {
+    // 1. DSFXEcho lPanDelay: left-only impulse stays on L when lPanDelay == 0,
+    //    and alternates onto R (at dl + dr) then back to L when lPanDelay == 1.
+    let make_echo = |pan_delay: i32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Echo);
+        let mut raw = Vec::with_capacity(20);
+        for f in [50.0f32, 50.0, 1.0, 1.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&pan_delay.to_le_bytes());
+        fx.params = raw;
+        fx
+    };
+    let mut echo_normal = make_echo(0);
+    let mut echo_pan = make_echo(1);
+    let mut norm_r_peak = 0.0f32;
+    let mut pan_r_at_96 = 0.0f32;
+    let mut pan_l_at_144 = 0.0f32;
+    for i in 0..160 {
+        let in_l = if i == 0 { 1.0 } else { 0.0 };
+        let (_, nr) = echo_normal.process_sample(in_l, 0.0, 48_000.0);
+        norm_r_peak = norm_r_peak.max(nr.abs());
+        let (pl, pr) = echo_pan.process_sample(in_l, 0.0, 48_000.0);
+        if i == 96 {
+            pan_r_at_96 = pr;
+        }
+        if i == 144 {
+            pan_l_at_144 = pl;
+        }
+    }
+    assert!(norm_r_peak < 1e-6, "lPanDelay=0 must not leak left impulse to right ({norm_r_peak})");
+    assert!(pan_r_at_96 > 0.2, "lPanDelay=1 must bounce left echo onto right at 2*48 frames ({pan_r_at_96})");
+    assert!(pan_l_at_144 > 0.1, "lPanDelay=1 must bounce right echo back to left at 3*48 frames ({pan_l_at_144})");
+
+    // 2. DSFXChorus lPhase creates stereo L/R divergence on identical L/R input.
+    let make_chorus = |waveform: i32, phase: i32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Chorus);
+        let mut raw = Vec::with_capacity(28);
+        for f in [100.0f32, 100.0, 0.0, 5.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&waveform.to_le_bytes());
+        raw.extend_from_slice(&10.0f32.to_le_bytes());
+        raw.extend_from_slice(&phase.to_le_bytes());
+        fx.params = raw;
+        fx
+    };
+    let mut ch_inphase = make_chorus(0, 2); // triangle, 0 deg
+    let mut ch_quad = make_chorus(0, 3);    // triangle, +90 deg
+    let mut max_diff_inphase = 0.0f32;
+    let mut max_diff_quad = 0.0f32;
+    for i in 0..2000 {
+        let x = ((i as f32) * 0.07).sin();
+        let (l0, r0) = ch_inphase.process_sample(x, x, 48_000.0);
+        max_diff_inphase = max_diff_inphase.max((l0 - r0).abs());
+        let (l1, r1) = ch_quad.process_sample(x, x, 48_000.0);
+        max_diff_quad = max_diff_quad.max((l1 - r1).abs());
+    }
+    assert!(max_diff_inphase < 1e-6, "lPhase=0deg must keep L==R");
+    assert!(max_diff_quad > 0.05, "lPhase=90deg must produce stereo modulation diff ({max_diff_quad})");
+
+    // 3. DSFXDistortion honors fPreLowpassCutoff / fPostEQCenterFrequency.
+    let make_dist = |post_fc: f32, pre_lp: f32| -> BufferEffect {
+        let mut fx = BufferEffect::new(DsFxKind::Distortion);
+        let mut raw = Vec::with_capacity(20);
+        for f in [0.0f32, 20.0, post_fc, 400.0, pre_lp] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        fx.params = raw;
+        fx
+    };
+    let mut dist_hi = make_dist(4000.0, 8000.0);
+    let mut dist_lo = make_dist(300.0, 300.0);
+    let mut rms_hi = 0.0f32;
+    let mut rms_lo = 0.0f32;
+    for i in 0..1024 {
+        let x = ((i as f32) * std::f32::consts::TAU * 4000.0 / 48_000.0).sin() * 0.5;
+        let y_hi = dist_hi.process_sample(x, x, 48_000.0).0;
+        let y_lo = dist_lo.process_sample(x, x, 48_000.0).0;
+        if i >= 256 {
+            rms_hi += y_hi * y_hi;
+            rms_lo += y_lo * y_lo;
+        }
+    }
+    assert!(
+        rms_hi > rms_lo * 5.0,
+        "4 kHz tone should pass 4 kHz post-EQ/8 kHz pre-LP ({rms_hi}) much stronger than 300 Hz ({rms_lo})"
+    );
+}

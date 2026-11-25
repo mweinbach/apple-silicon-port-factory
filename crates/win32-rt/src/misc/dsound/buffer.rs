@@ -397,6 +397,8 @@ pub(super) struct BufferEffect {
     delay_pos: usize,
     phase: f32,
     env: f32,
+    lp_l: f32,
+    lp_r: f32,
     z1_l: f32,
     z2_l: f32,
     z1_r: f32,
@@ -421,6 +423,8 @@ impl BufferEffect {
             delay_pos: 0,
             phase: 0.0,
             env: 0.0,
+            lp_l: 0.0,
+            lp_r: 0.0,
             z1_l: 0.0,
             z2_l: 0.0,
             z1_r: 0.0,
@@ -444,6 +448,11 @@ impl BufferEffect {
             .unwrap_or(0)
     }
 
+    #[inline]
+    fn param_i32(&self, off: usize) -> i32 {
+        self.param_u32(off) as i32
+    }
+
     /// Process one stereo sample through this DirectSound 8 software DSP effect.
     pub(super) fn process_sample(&mut self, l: f32, r: f32, sample_rate: f32) -> (f32, f32) {
         let sr = sample_rate.max(8_000.0);
@@ -455,11 +464,13 @@ impl BufferEffect {
                     .clamp(1, self.delay_l.len().saturating_sub(1));
                 let dr = ((self.param_f32(12).clamp(1.0, 2000.0) * 0.001 * sr) as usize)
                     .clamp(1, self.delay_r.len().saturating_sub(1));
+                let pan_delay = self.param_i32(16) != 0;
                 let cap = self.delay_l.len();
                 let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
                 let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
-                self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
-                self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
+                let (fb_l, fb_r) = if pan_delay { (rr, rl) } else { (rl, rr) };
+                self.delay_l[self.delay_pos] = (l + fb_l * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + fb_r * fb).clamp(-4.0, 4.0);
                 self.delay_pos = (self.delay_pos + 1) % cap;
                 (l * (1.0 - wet) + rl * wet, r * (1.0 - wet) + rr * wet)
             }
@@ -468,14 +479,33 @@ impl BufferEffect {
                 let depth = (self.param_f32(4).clamp(0.0, 100.0)) * 0.01;
                 let fb = (self.param_f32(8).clamp(-99.0, 99.0)) * 0.01;
                 let freq = self.param_f32(12).clamp(0.0, 10.0);
+                let waveform = self.param_i32(16); // 0 = TRIANGLE, 1 = SIN
                 let base_ms = self.param_f32(20).clamp(0.0, 20.0);
+                let phase_diff = match self.param_i32(24) {
+                    0 => 0.5,  // -180 deg
+                    1 => 0.75, // -90 deg
+                    2 => 0.0,  // 0 deg
+                    3 => 0.25, // +90 deg
+                    4 => 0.5,  // +180 deg
+                    _ => 0.0,
+                };
+                let eval_lfo = |p: f32| -> f32 {
+                    if waveform == 0 {
+                        if p < 0.5 { p * 2.0 } else { (1.0 - p) * 2.0 }
+                    } else {
+                        (p * std::f32::consts::TAU).sin() * 0.5 + 0.5
+                    }
+                };
                 let cap = self.delay_l.len();
-                let lfo = (self.phase * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                let lfo_l = eval_lfo(self.phase);
+                let lfo_r = eval_lfo((self.phase + phase_diff).fract());
                 self.phase = (self.phase + freq / sr).fract();
-                let d_samp = ((base_ms * (0.5 + 0.5 * depth * lfo) * 0.001 * sr) as usize)
+                let d_samp_l = ((base_ms * (0.5 + 0.5 * depth * lfo_l) * 0.001 * sr) as usize)
                     .clamp(1, cap - 1);
-                let rl = self.delay_l[(self.delay_pos + cap - d_samp) % cap];
-                let rr = self.delay_r[(self.delay_pos + cap - d_samp) % cap];
+                let d_samp_r = ((base_ms * (0.5 + 0.5 * depth * lfo_r) * 0.001 * sr) as usize)
+                    .clamp(1, cap - 1);
+                let rl = self.delay_l[(self.delay_pos + cap - d_samp_l) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - d_samp_r) % cap];
                 self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
                 self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
                 self.delay_pos = (self.delay_pos + 1) % cap;
@@ -484,7 +514,36 @@ impl BufferEffect {
             DsFxKind::Distortion => {
                 let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 0.0) / 20.0);
                 let edge = 1.0 + (self.param_f32(4).clamp(0.0, 100.0) * 0.1);
-                ((l * edge).tanh() * gain, (r * edge).tanh() * gain)
+                let post_fc = self.param_f32(8).clamp(100.0, (sr * 0.45).min(8_000.0));
+                let post_bw = self.param_f32(12).clamp(100.0, 8_000.0);
+                let pre_lp_fc = self.param_f32(16).clamp(100.0, (sr * 0.45).min(8_000.0));
+
+                // 1-pole pre-lowpass filter (fPreLowpassCutoff) before nonlinear waveshaping.
+                let lp_alpha = (1.0 - (-std::f32::consts::TAU * pre_lp_fc / sr).exp()).clamp(0.0, 1.0);
+                self.lp_l += lp_alpha * (l - self.lp_l);
+                self.lp_r += lp_alpha * (r - self.lp_r);
+                let dl = (self.lp_l * edge).tanh();
+                let dr = (self.lp_r * edge).tanh();
+
+                // 2-pole RBJ constant-0dB-peak bandpass post-EQ (fPostEQCenterFrequency / fPostEQBandwidth).
+                let w0 = std::f32::consts::TAU * post_fc / sr;
+                let cos_w0 = w0.cos();
+                let sin_w0 = w0.sin();
+                let q = (post_fc / post_bw).clamp(0.25, 10.0);
+                let alpha = sin_w0 / (2.0 * q);
+                let b0 = alpha;
+                let b2 = -alpha;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+                let inv_a0 = 1.0 / a0;
+                let yl = (b0 * dl + self.z1_l) * inv_a0;
+                self.z1_l = -a1 * yl + self.z2_l;
+                self.z2_l = b2 * dl - a2 * yl;
+                let yr = (b0 * dr + self.z1_r) * inv_a0;
+                self.z1_r = -a1 * yr + self.z2_r;
+                self.z2_r = b2 * dr - a2 * yr;
+                (yl * gain, yr * gain)
             }
             DsFxKind::Gargle => {
                 let rate_hz = self.param_u32(0).clamp(1, 1000) as f32;
@@ -569,30 +628,67 @@ impl BufferEffect {
                 self.z2_r = b2 * r - a2 * yr;
                 (yl, yr)
             }
-            DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => {
-                let (in_gain, wet, decay_ms) = if self.kind == DsFxKind::WavesReverb {
-                    let ig = 10.0f32.powf(self.param_f32(0).clamp(-96.0, 0.0) / 20.0);
-                    let mix = 10.0f32.powf(self.param_f32(4).clamp(-96.0, 0.0) / 20.0).min(1.0);
-                    let rt = self.param_f32(8).clamp(1.0, 3000.0);
-                    (ig, mix * 0.5, rt)
-                } else {
-                    let room = 10.0f32.powf((self.param_u32(0) as i32).clamp(-10000, 0) as f32 / 2000.0);
-                    let rt = self.param_f32(12).clamp(0.1, 20.0) * 1000.0;
-                    (1.0, (room * 0.5).min(0.8), rt)
-                };
+            DsFxKind::WavesReverb => {
+                let in_gain = 10.0f32.powf(self.param_f32(0).clamp(-96.0, 0.0) / 20.0);
+                let wet = 10.0f32.powf(self.param_f32(4).clamp(-96.0, 0.0) / 20.0).min(1.0) * 0.5;
+                let decay_ms = self.param_f32(8).clamp(0.001, 3000.0);
+                let hf_ratio = self.param_f32(12).clamp(0.001, 0.999);
                 let cap = self.delay_l.len();
                 let dl = ((0.037 * sr) as usize).clamp(1, cap - 1);
                 let dr = ((0.041 * sr) as usize).clamp(1, cap - 1);
                 let fb = 10.0f32.powf((-3.0 * 37.0) / decay_ms.max(40.0)).clamp(0.0, 0.92);
+                let damp = (0.08 + 0.87 * hf_ratio).clamp(0.05, 0.98);
                 let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
                 let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
-                // Subtle cross-feed + 1-pole damping for natural stereo tail.
-                self.z1_l += 0.35 * (rl - self.z1_l);
-                self.z1_r += 0.35 * (rr - self.z1_r);
+                self.z1_l += damp * (rl - self.z1_l);
+                self.z1_r += damp * (rr - self.z1_r);
                 self.delay_l[self.delay_pos] = (l * in_gain + self.z1_r * fb).clamp(-4.0, 4.0);
                 self.delay_r[self.delay_pos] = (r * in_gain + self.z1_l * fb).clamp(-4.0, 4.0);
                 self.delay_pos = (self.delay_pos + 1) % cap;
                 (l * in_gain + self.z1_l * wet, r * in_gain + self.z1_r * wet)
+            }
+            DsFxKind::I3dl2Reverb => {
+                let room = 10.0f32.powf(self.param_i32(0).clamp(-10_000, 0) as f32 / 2000.0);
+                let room_hf = 10.0f32.powf(self.param_i32(4).clamp(-10_000, 0) as f32 / 2000.0);
+                let decay_ms = self.param_f32(12).clamp(0.1, 20.0) * 1000.0;
+                let decay_hf = self.param_f32(16).clamp(0.1, 2.0);
+                let refl_gain = (room * 10.0f32.powf(self.param_i32(20).clamp(-10_000, 1000) as f32 / 2000.0))
+                    .min(1.0);
+                let refl_delay_s = self.param_f32(24).clamp(0.0, 0.3);
+                let late_gain = (room * 10.0f32.powf(self.param_i32(28).clamp(-10_000, 2000) as f32 / 2000.0))
+                    .min(1.0);
+                let reverb_delay_s = self.param_f32(32).clamp(0.0, 0.1);
+                let diffusion = self.param_f32(36).clamp(0.0, 100.0) * 0.01;
+                let density = self.param_f32(40).clamp(0.0, 100.0) * 0.01;
+                let hf_ref = self.param_f32(44).clamp(20.0, 20_000.0);
+
+                let cap = self.delay_l.len();
+                let d_refl = ((refl_delay_s * sr).round() as usize).clamp(1, cap - 1);
+                let late_base_s = (refl_delay_s + reverb_delay_s + 0.025 + 0.012 * density).min(0.95);
+                let dl = ((late_base_s * sr).round() as usize).clamp(1, cap - 1);
+                let dr = (((late_base_s + 0.004) * sr).round() as usize).clamp(1, cap - 1);
+                let fb = 10.0f32
+                    .powf((-3.0 * (late_base_s * 1000.0)) / decay_ms.max(100.0))
+                    .clamp(0.0, 0.92);
+                let hf_cutoff = (hf_ref * decay_hf * (0.15 + 0.85 * room_hf)).clamp(20.0, sr * 0.45);
+                let damp = (1.0 - (-std::f32::consts::TAU * hf_cutoff / sr).exp()).clamp(0.02, 0.98);
+
+                let er_l = self.delay_l[(self.delay_pos + cap - d_refl) % cap];
+                let er_r = self.delay_r[(self.delay_pos + cap - d_refl) % cap];
+                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                self.z1_l += damp * (rl - self.z1_l);
+                self.z1_r += damp * (rr - self.z1_r);
+                let cross = 0.5 * diffusion;
+                let fb_l = self.z1_l * (1.0 - cross) + self.z1_r * cross;
+                let fb_r = self.z1_r * (1.0 - cross) + self.z1_l * cross;
+                self.delay_l[self.delay_pos] = (l + fb_l * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + fb_r * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (
+                    l + er_l * refl_gain + self.z1_l * late_gain,
+                    r + er_r * refl_gain + self.z1_r * late_gain,
+                )
             }
         }
     }
