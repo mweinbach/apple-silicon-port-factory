@@ -11,22 +11,80 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **115** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 74 |
-| `failing` (honest-failing macro exports) | 22 |
-| `middleware_stub` (third-party/engine middleware fallbacks) | 19 |
-| DLLs with remaining stubs | 26 |
+| Total remaining stub sites | **80** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 53 |
+| `failing` (honest-failing macro exports) | 12 |
+| `middleware_stub` (third-party/engine middleware fallbacks) | 15 |
+| DLLs with remaining stubs | 19 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
 | File | Summary |
 |---|---|
+| [`com-audio-net.md`](stub-backlog.d/com-audio-net.md) | Stubs 7: COM/OLE, Audio, Winsock, libcurl and DbgHelp (`stubs/com-audio-net`) |
 | [`crypto-cng-capi.md`](stub-backlog.d/crypto-cng-capi.md) | Stub & API Gap Backlog — `stubs/crypto-cng-capi` |
 | [`graphics.md`](stub-backlog.d/graphics.md) | Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`) |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
 | [`kernel-core.md`](stub-backlog.d/kernel-core.md) | Stub Backlog — `stubs/kernel-core` |
 | [`kernel-files-nls.md`](stub-backlog.d/kernel-files-nls.md) | Stub Backlog — `stubs/kernel-files-nls` |
 | [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
+
+### From `docs/stub-backlog.d/com-audio-net.md`
+
+# Stubs 7: COM/OLE, Audio, Winsock, libcurl and DbgHelp (`stubs/com-audio-net`)
+
+Scope: **37** stub sites across 7 DLLs (`ole32.dll`, `dbghelp.dll`, `mmdevapi.dll`, `dsound.dll`, `xaudio2_9redist.dll`, `ws2_32.dll`, `libcurl.dll`) reduced from **37 → 0** (**34 made real**, **3 native-unsupported matching Windows without the feature**, **0 leftovers**).
+
+## Made Real (34 sites)
+
+| DLL!API | File | Implementation Summary |
+|---|---|---|
+| `ole32.dll!IPropertyValue::GetDateTime` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.DateTime` (`i64` UniversalTime). |
+| `ole32.dll!IPropertyValue::GetTimeSpan` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.TimeSpan` (`i64` Duration). |
+| `ole32.dll!IPropertyValue::GetPoint` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Point` (`{ f32, f32 }`). |
+| `ole32.dll!IPropertyValue::GetSize` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Size` (`{ f32, f32 }`). |
+| `ole32.dll!IPropertyValue::GetRect` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Rect` (`{ f32, f32, f32, f32 }`). |
+| `ole32.dll!IPropertyValue::Get*Array` (19 types) | `crates/win32-rt/src/misc/ole32.rs` | CoTaskMem-allocated array getters for all 19 WinRT `PropertyType` array variants (`UInt8Array`..`RectArray`), duplicating `HSTRING`s and `AddRef`ing `IInspectable*` elements. |
+| `ole32.dll!IPropertyValueStatics::CreateDateTime` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::DateTime`. |
+| `ole32.dll!IPropertyValueStatics::CreateTimeSpan` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::TimeSpan`. |
+| `ole32.dll!IPropertyValueStatics::CreatePoint` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Point` (with Win64 XMM ABI bridge). |
+| `ole32.dll!IPropertyValueStatics::CreateSize` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Size` (with Win64 XMM ABI bridge). |
+| `ole32.dll!IPropertyValueStatics::CreateRect` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Rect`. |
+| `ole32.dll!IPropertyValueStatics::Create*Array` (19 types) | `crates/win32-rt/src/misc/ole32.rs` | Copies input slices into retained `PropertyValue` array variants (`BooleanArray` normalized, `StringArray` duplicated, `InspectableArray` `AddRef`/`Release`-managed). |
+| `dbghelp.dll!StackWalk64` | `crates/win32-rt/src/misc/dbghelp.rs` | Unwinds x64 frames via `crate::unwind::safe_virtual_unwind` (`.pdata`), supporting `ReadMemoryRoutine`, `FunctionTableAccessRoutine`, `GetModuleBaseRoutine`, and leaf-frame `[RSP]` fallback. |
+| `dbghelp.dll!MiniDumpWriteDump` | `crates/win32-rt/src/misc/dbghelp.rs` | Emits valid Microsoft `MDMP` (`0x504D444D`) files via `WriteFile` with `SystemInfoStream`, `MiscInfoStream`, `ModuleListStream` (PE timestamp/checksum/RSDS CodeView), `ThreadListStream`, `MemoryListStream`, optional `ExceptionStream`, and user streams. |
+| `dbghelp.dll!SymGetLineFromAddr64` | `crates/win32-rt/src/misc/dbghelp.rs` | Pure-Rust MSF 7.0 + `/names` + DBI + CodeView C13 (`DEBUG_S_FILECHKSMS` / `DEBUG_S_LINES`) PDB reader; returns `ERROR_MOD_NOT_FOUND` (126) / `ERROR_INVALID_ADDRESS` (487) when absent. |
+| `dbghelp.dll!SymGetLineFromAddrW64` | `crates/win32-rt/src/misc/dbghelp.rs` | Wide UTF-16 wrapper backed by the same MSF 7.0 / C13 PDB reader. |
+| `mmdevapi.dll!IMMDevice::Activate` | `crates/win32-rt/src/audio/mmdevapi.rs` | Implemented `IAudioEndpointVolume` (21-slot COM vtable backed by CoreAudio HAL `VirtualMainVolume`/`VolumeScalar`/`Mute`/`VolumeRangeDecibels` on macOS, atomic fallback on Null/iOS); unknown IIDs return standard COM `E_NOINTERFACE`. |
+| `mmdevapi.dll!IAudioClient::GetService` | `crates/win32-rt/src/audio/audioclient.rs` | Implemented `IAudioClock2`, `ISimpleAudioVolume`, `IAudioStreamVolume` (per-channel gain applied live in `submit()`), and `IAudioSessionControl`/`2`; unknown IIDs return `E_NOINTERFACE`. |
+| `mmdevapi.dll!IAudioClient2::GetBufferSizeLimits` | `crates/win32-rt/src/audio/audioclient.rs` | Validates format and out-pointers and computes real shared-mode min/max buffer duration bounds (`MIN_PERIOD_HNS` / `DEFAULT_PERIOD_HNS` to `20_000_000` hns). |
+| `mmdevapi.dll!IAudioClient::Initialize(LOOPBACK)` | `crates/win32-rt/src/audio/audioclient.rs` | Real loopback capture via macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private aggregate device + `IOProc`, dynamically resolved) with automatic fallback to an in-process per-endpoint WASAPI render loopback bus. |
+| `mmdevapi.dll!ISpatialAudioObjectRenderStream::GetService` | `crates/win32-rt/src/audio/spatial.rs` | Implemented `IAudioClock`, `IAudioClock2`, `ISimpleAudioVolume`, `IAudioStreamVolume` (applied live in `EndUpdatingAudioObjects`), and `IAudioSessionControl`/`2`; unknown IIDs return `E_NOINTERFACE`. |
+| `dsound.dll!IDirectSoundBuffer8::SetFX` | `crates/win32-rt/src/misc/dsound/com_vtbl.rs` | Full DirectSound 8 software DSP chain (`SetFX`, `AcquireResources`, `GetObjectInPath`) for all 9 standard effects (`Gargle`, `Chorus`, `Flanger`, `Echo`, `Distortion`, `Compressor`, `ParamEq`, `I3DL2Reverb`, `WavesReverb`) with live stereo DSP in `mix_dsound_frames` and real `IDirectSoundFX*` COM objects. |
+| `xaudio2_9redist.dll!parse_wave_format` (Extensible SubFormat) | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs` | Decodes `KSDATAFORMAT_SUBTYPE_{ADPCM,ALAW,MULAW}` in addition to PCM/IEEE_FLOAT; rejects invalid/unsupported subtypes with `XAUDIO2_E_INVALID_CALL` matching desktop Windows `xaudio2_9redist.dll`. |
+| `xaudio2_9redist.dll!parse_wave_format` (Format Tag) | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs` | Real block/sample decoders for MS-ADPCM (`0x0002`), IMA/DVI ADPCM (`0x0011`), ITU G.711 A-law (`0x0006`), and μ-law (`0x0007`); rejects invalid tags and Xbox-only XMA2 with `XAUDIO2_E_INVALID_CALL`. |
+| `ws2_32.dll!WSAAsyncSelect` | `crates/win32-rt/src/misc/ws2_32.rs` | Reuses the background `poll(2)` reactor to post real Win32 window messages (`PostMessageW(hwnd, wmsg, sock, WSAMAKESELECTREPLY(ev, err))`), sets guest nonblocking mode, and inherits across `accept`. |
+| `ws2_32.dll!WSACancelAsyncRequest` | `crates/win32-rt/src/misc/ws2_32.rs` | Backed by an async-task state registry returning `0` on pending cancellation, `WSAEALREADY` on completed tasks, and `WSAEINVAL` on invalid/null handles. |
+| `ws2_32.dll!WSAConnectByNameA` | `crates/win32-rt/src/misc/ws2_32.rs` | Resolves host/service via `getaddrinfo` (including dual-stack IPv4-mapped IPv6), connects with `WinTimeVal` timeout, populates `LocalAddress`/`RemoteAddress`, and returns `BOOL`. |
+| `ws2_32.dll!WSAConnectByNameW` | `crates/win32-rt/src/misc/ws2_32.rs` | UTF-16 variant sharing `connect_by_name_impl`. |
+| `ws2_32.dll!WSAJoinLeaf` | `crates/win32-rt/src/misc/ws2_32.rs` | Real IPv4 (`IP_ADD_MEMBERSHIP`) and IPv6 (`IPV6_JOIN_GROUP`) multicast group membership join plus optional `connect` for `JL_SENDER_ONLY`/`JL_BOTH`. |
+| `ws2_32.dll!WSARecvMsg` | `crates/win32-rt/src/misc/ws2_32.rs` | Real POSIX `recvmsg(2)` with Win64 `WSAMSG`/`WSACMSGHDR` ↔ Darwin `cmsghdr` translation (`IP_PKTINFO`, `IPV6_PKTINFO`, `IP_TTL`, `IP_TOS`, `IPV6_HOPLIMIT`, `IPV6_TCLASS`), sync + overlapped `ASYNC_IO` reactor support, and `WSAID_WSARECVMSG` extension thunk. |
+| `ws2_32.dll!WSASendMsg` | `crates/win32-rt/src/misc/ws2_32.rs` | Real POSIX `sendmsg(2)` with Win64 `WSAMSG`/`WSACMSGHDR` translation, sync + overlapped `ASYNC_IO` reactor support, and `WSAID_WSASENDMSG` extension thunk. |
+| `ws2_32.dll!WSAIoctl` | `crates/win32-rt/src/misc/ws2_32.rs` | Implemented `SIOCATMARK`, `SIO_KEEPALIVE_VALS`, `SIO_GET_INTERFACE_LIST`, `SIO_ADDRESS_LIST_QUERY`, `SIO_ROUTING_INTERFACE_QUERY`, plus `WSAID_WSARECVMSG`/`WSAID_WSASENDMSG`; unknown IOCTLs return standard `WSAEOPNOTSUPP`. |
+| `libcurl.dll!curl_easy_setopt` | `crates/win32-rt/src/misc/libcurl/easy.rs` | Wired `CURLOPT_IPRESOLVE`, `CURLOPT_PROTOCOLS`/`_REDIR_PROTOCOLS`/`_STR`, `CURLOPT_RESOLVE`, `CURLOPT_XOAUTH2_BEARER`, `CURLOPT_UNRESTRICTED_AUTH`, `CURLOPT_RESUME_FROM`/`_LARGE`, `CURLOPT_MAXFILESIZE`/`_LARGE`, `CURLOPT_DEFAULT_PROTOCOL`, `CURLOPT_REQUEST_TARGET`, `CURLOPT_TCP_KEEPALIVE`/`_KEEPIDLE`/`_KEEPINTVL`, `CURLOPT_BUFFERSIZE`, and `CURLOPT_XFERINFOFUNCTION`/`_NOPROGRESS`; disabled protocols return `CURLE_NOT_BUILT_IN` and unknown options return `CURLE_UNKNOWN_OPTION`. |
+| `libcurl.dll!curl_easy_getinfo` | `crates/win32-rt/src/misc/libcurl/easy.rs` | Implemented full HTTP/HTTPS timing (`APPCONNECT`/`PRETRANSFER`/`STARTTRANSFER`/`REDIRECT`/`NAMELOOKUP`/`CONNECT` double and `_T`), `PRIMARY_PORT`, `LOCAL_IP`, `LOCAL_PORT`, `SCHEME`, `PROTOCOL`, `EFFECTIVE_METHOD`, `FILETIME`/`_T`, `CONDITION_UNMET`, `HTTPAUTH_AVAIL`, `PROXYAUTH_AVAIL`, `RETRY_AFTER`, `ACTIVESOCKET`/`LASTSOCKET`; unknown info IDs return `CURLE_UNKNOWN_OPTION`. |
+
+## Native-unsupported (matches Windows without the feature) (3 sites)
+
+| DLL!API | Returned Code | Windows Behavior & Documentation Citation |
+|---|---|---|
+| `mmdevapi.dll!IAudioClient::Initialize` (`AUDCLNT_SHAREMODE_EXCLUSIVE`) | `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` (`0x8889000E`) | Matches [Microsoft Learn `IAudioClient::Initialize`](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize): when an audio endpoint does not allow exclusive-mode hardware takeover (Windows sound setting "Allow applications to take exclusive control of this device" unchecked, Bluetooth/virtual endpoints, or macOS/iOS shared CoreAudio/`AVAudioSession` routing), Windows returns `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` so callers fall back to `AUDCLNT_SHAREMODE_SHARED`. |
+| `ws2_32.dll!WSADuplicateSocketA` / `WSADuplicateSocketW` (cross-process `pid != current_pid`) | `SOCKET_ERROR` with `WSAEOPNOTSUPP` (`10045`) | Matches [Microsoft Learn `WSADuplicateSocketW`](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaduplicatesocketw): same-process duplication works via `dup(2)` + protocol-info token; cross-process fd injection into an external macOS process we do not host cannot exist natively, so the provider returns `WSAEOPNOTSUPP`. |
+| `ws2_32.dll!WSAGetQOSByName` | `FALSE` with `WSAEOPNOTSUPP` (`10045`) | Matches [Microsoft Learn `WSAGetQOSByName`](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsagetqosbyname): Winsock2 RSVP/QOS templates were deprecated in Windows Vista and the built-in Windows TCP/IP service provider (`MSAFD Tcpip`) does not advertise `XP1_QOS_SUPPORTED`, returning `FALSE` with `WSAEOPNOTSUPP` after parameter validation. |
+
+## Leftovers
+
+None — **0** remaining stub sites in scope.
 
 ### From `docs/stub-backlog.d/crypto-cng-capi.md`
 
@@ -360,24 +418,17 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 |---|---:|---|---|
 | `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
 | `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
-| `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
-| `ws2_32.dll` | 8 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
-| `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `d3d11.dll` | 4 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
-| `dbghelp.dll` | 4 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
 | `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
 | `wintrust.dll` | 4 | Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS) | Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed. |
 | `powrprof.dll` | 3 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `libcurl.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `xaudio2_9redist.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `d2d1.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `directml.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `dsound.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `gameinput.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `gdi32.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `hid.dll` | 1 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
@@ -433,26 +484,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:611` | `"GetUserObjectInformation on handle {h:#x} (only the window station is known)"` |
 | `user_object_info` | `stub` | `crates/win32-rt/src/user32/misc.rs:633` | `"GetUserObjectInformation index {index} not supported"` |
 
-### `ole32.dll` (12)
-
-- **Reason:** Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion
-- **Next step:** Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `pv_get_date_time` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2167` | `"IPropertyValue::GetDateTime -> E_NOTIMPL"` |
-| `pv_get_point` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2185` | `"IPropertyValue::GetPoint -> E_NOTIMPL"` |
-| `pv_get_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2203` | `"IPropertyValue::GetRect -> E_NOTIMPL"` |
-| `pv_get_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2223` | `concat!("IPropertyValue::", $method, " -> E_NOTIMPL")` |
-| `pv_get_size` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2194` | `"IPropertyValue::GetSize -> E_NOTIMPL"` |
-| `pv_get_time_span` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2176` | `"IPropertyValue::GetTimeSpan -> E_NOTIMPL"` |
-| `pvs_create_date_time` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2582` | `"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"` |
-| `pvs_create_point` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2609` | `"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"` |
-| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2640` | `"IPropertyValueStatics::CreateRect -> E_NOTIMPL"` |
-| `pvs_create_rect` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2659` | `concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")` |
-| `pvs_create_size` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2623` | `"IPropertyValueStatics::CreateSize -> E_NOTIMPL"` |
-| `pvs_create_time_span` | `stub` | `crates/win32-rt/src/misc/ole32.rs:2595` | `"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"` |
-
 ### `physx3common_x64.dll` (12)
 
 - **Reason:** PhysX 3.4 geometry/mesh query path without cooked mesh payload
@@ -472,36 +503,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `mesh_find_overlap_triangle_mesh` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2614` | `"PxMeshQuery::findOverlapTriangleMesh without cooked triangle mesh payload"` |
 | `mesh_get_triangle` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2629` | `"PxMeshQuery::getTriangle without cooked triangle mesh payload"` |
 | `mesh_sweep` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2642` | `"PxMeshQuery::sweep without cooked triangle mesh payload"` |
-
-### `ws2_32.dll` (8)
-
-- **Reason:** Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication
-- **Next step:** Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `WSAAsyncSelect` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSACancelAsyncRequest` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameA` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAConnectByNameW` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAGetQOSByName` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `WSAIoctl` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1802` | `"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"` |
-| `WSAJoinLeaf` | `failing` | `crates/win32-rt/src/misc/ws2_32.rs:3474` | `i32 = SOCKET_ERROR, err WSAEOPNOTSUPP` |
-| `duplicate_socket_into_info` | `stub` | `crates/win32-rt/src/misc/ws2_32.rs:1322` | `"WSADuplicateSocket cross-process target pid={pid} unsupported"` |
-
-### `mmdevapi.dll` (6)
-
-- **Reason:** Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID)
-- **Next step:** Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `activate` | `stub` | `crates/win32-rt/src/audio/mmdevapi.rs:592` | `"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"` |
-| `get_buffer_size_limits` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:919` | `"IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)"` |
-| `get_service` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:885` | `"IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE"` |
-| `get_service` | `stub` | `crates/win32-rt/src/audio/spatial.rs:846` | `"ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE"` |
-| `initialize` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:427` | `"IAudioClient::Initialize: exclusive mode is not supported -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED"` |
-| `initialize` | `stub` | `crates/win32-rt/src/audio/audioclient.rs:440` | `"IAudioClient::Initialize: loopback capture is not supported -> E_NOTIMPL"` |
 
 ### `dinput8.dll` (5)
 
@@ -527,18 +528,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `create_geometry_shader_so` | `stub` | `crates/win32-rt/src/d3d11/device.rs:748` | `"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"` |
 | `draw_auto` | `stub` | `crates/win32-rt/src/d3d11/context.rs:2913` | `"ID3D11DeviceContext::DrawAuto not implemented"` |
 | `get_data` | `stub` | `crates/win32-rt/src/d3d11/context.rs:3094` | `"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"` |
-
-### `dbghelp.dll` (4)
-
-- **Reason:** Unimplemented DbgHelp stack walk or minidump writer
-- **Next step:** Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `MiniDumpWriteDump` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `StackWalk64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetLineFromAddr64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `SymGetLineFromAddrW64` | `failing` | `crates/win32-rt/src/misc/dbghelp.rs:503` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
 
 ### `dwrite.dll` (4)
 
@@ -587,16 +576,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `PowerRegisterSuspendResumeNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:533` | `"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"` |
 | `PowerSettingRegisterNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:604` | `"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"` |
 
-### `libcurl.dll` (2)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `easy_getinfo` | `middleware_stub` | `crates/win32-rt/src/misc/libcurl/easy.rs:1344` | `"libcurl: unsupported curl_easy_getinfo(info={other:#x})"` |
-| `easy_setopt` | `middleware_stub` | `crates/win32-rt/src/misc/libcurl/easy.rs:1158` | `"libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})"` |
-
 ### `nri.dll` (2)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -617,16 +596,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `DrawThemeBackground` | `stub` | `crates/win32-rt/src/misc/uxtheme.rs:111` | `"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"` |
 | `TaskDialogIndirect` | `stub` | `crates/win32-rt/src/misc/uxtheme.rs:203` | `"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"` |
 
-### `xaudio2_9redist.dll` (2)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `parse_wave_format` | `middleware_stub` | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs:216` | `"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"` |
-| `parse_wave_format` | `middleware_stub` | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs:233` | `"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"` |
-
 ### `d2d1.dll` (1)
 
 - **Reason:** Partial or unimplemented Windows/middleware sub-feature
@@ -644,15 +613,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | API | Kind | Location | Detail |
 |---|---|---|---|
 | `parse` | `middleware_stub` | `crates/win32-rt/src/misc/directml/ops.rs:1048` | `"DirectML CreateOperator: unsupported operator type {other}"` |
-
-### `dsound.dll` (1)
-
-- **Reason:** Partial or unimplemented Windows/middleware sub-feature
-- **Next step:** Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `dsb_set_fx` | `stub` | `crates/win32-rt/src/misc/dsound/com_vtbl.rs:1458` | `"IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE"` |
 
 ### `gameinput.dll` (1)
 

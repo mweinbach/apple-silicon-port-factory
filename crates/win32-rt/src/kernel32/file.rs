@@ -5032,36 +5032,56 @@ fn snapshot_dir_rec(
     } else {
         root.join(rel_prefix.replace('\\', "/"))
     };
-    let rd = match std::fs::read_dir(&dir_path) {
-        Ok(rd) => rd,
-        Err(e) => {
-            let raw = e.raw_os_error().unwrap_or(libc::EIO);
-            if raw == libc::ENOENT || (!rel_prefix.is_empty() && (raw == libc::ENOTDIR || raw == libc::EACCES || raw == libc::EPERM)) {
-                return Ok(());
+    for attempt in 0..3 {
+        let rd = match std::fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
+            Err(e) => {
+                let raw = e.raw_os_error().unwrap_or(libc::EIO);
+                if raw == libc::ENOENT
+                    || (!rel_prefix.is_empty() && (raw == libc::ENOTDIR || raw == libc::EACCES || raw == libc::EPERM))
+                {
+                    return Ok(());
+                }
+                return Err(raw);
             }
-            return Err(raw);
+        };
+        let mut entries: Vec<(String, DirSnapEntry)> = Vec::new();
+        let mut raced_vanished = false;
+        for entry in rd.flatten() {
+            let ep = entry.path();
+            if path::is_host_private_keystore_path(&ep) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if rel_prefix.is_empty() {
+                name
+            } else {
+                format!("{rel_prefix}\\{name}")
+            };
+            let meta = match std::fs::symlink_metadata(&ep) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 2 => {
+                    // An entry vanished between read_dir() and lstat() (e.g. concurrent
+                    // rename(alpha, beta)). Retry this directory read so rename pairs stay
+                    // intact in one snapshot instead of tearing into REMOVED + ADDED.
+                    raced_vanished = true;
+                    break;
+                }
+                Err(_) => continue,
+            };
+            entries.push((rel, dir_entry_from_meta(&meta)));
         }
-    };
-    for entry in rd.flatten() {
-        let ep = entry.path();
-        if path::is_host_private_keystore_path(&ep) {
+        if raced_vanished {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let rel = if rel_prefix.is_empty() {
-            name
-        } else {
-            format!("{rel_prefix}\\{name}")
-        };
-        let Ok(meta) = std::fs::symlink_metadata(ep) else {
-            continue;
-        };
-        let snap = dir_entry_from_meta(&meta);
-        let is_dir = snap.is_dir;
-        out.insert(rel.clone(), snap);
-        if is_dir && subtree {
-            snapshot_dir_rec(root, &rel, true, out)?;
+        for (rel, snap) in entries {
+            let is_dir = snap.is_dir;
+            out.insert(rel.clone(), snap);
+            if is_dir && subtree {
+                snapshot_dir_rec(root, &rel, true, out)?;
+            }
         }
+        return Ok(());
     }
     Ok(())
 }

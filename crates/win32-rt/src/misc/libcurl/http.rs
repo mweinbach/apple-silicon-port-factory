@@ -1,22 +1,25 @@
 //! HTTP/1.1 + TLS transport engine and streaming content decoding for `libcurl.dll`.
 
 use super::easy::{
-    apply_head_meta, invoke_header_callback, invoke_write_callback, CallbackConfig, CurlEasy,
-    HeadMeta, TransferOutcome, TransferRequest, CURLE_ABORTED_BY_CALLBACK,
-    CURLE_BAD_CONTENT_ENCODING, CURLE_COULDNT_CONNECT, CURLE_COULDNT_RESOLVE_HOST,
-    CURLE_GOT_NOTHING, CURLE_HTTP_RETURNED_ERROR, CURLE_OK, CURLE_OPERATION_TIMEDOUT,
-    CURLE_PARTIAL_FILE, CURLE_PEER_FAILED_VERIFICATION, CURLE_RECV_ERROR, CURLE_SEND_ERROR,
-    CURLE_SSL_CONNECT_ERROR, CURLE_TOO_MANY_REDIRECTS, CURLE_UNSUPPORTED_PROTOCOL,
-    CURLE_URL_MALFORMAT, CURLE_WEIRD_SERVER_REPLY, CURL_REDIR_POST_301, CURL_REDIR_POST_302,
-    CURL_REDIR_POST_303,
+    apply_head_meta, invoke_header_callback, invoke_write_callback, invoke_xferinfo_callback,
+    CallbackConfig, CurlEasy, HeadMeta, TransferOutcome, TransferRequest,
+    CURLE_ABORTED_BY_CALLBACK, CURLE_BAD_CONTENT_ENCODING, CURLE_COULDNT_CONNECT,
+    CURLE_COULDNT_RESOLVE_HOST, CURLE_FILESIZE_EXCEEDED, CURLE_GOT_NOTHING,
+    CURLE_HTTP_RETURNED_ERROR, CURLE_OK, CURLE_OPERATION_TIMEDOUT, CURLE_PARTIAL_FILE,
+    CURLE_PEER_FAILED_VERIFICATION, CURLE_RANGE_ERROR, CURLE_RECV_ERROR, CURLE_SEND_ERROR,
+    CURLE_SSL_CONNECT_ERROR,
+    CURLE_TOO_MANY_REDIRECTS, CURLE_UNSUPPORTED_PROTOCOL, CURLE_URL_MALFORMAT,
+    CURLE_WEIRD_SERVER_REPLY, CURLAUTH_BASIC, CURLAUTH_BEARER, CURLAUTH_DIGEST,
+    CURLAUTH_NEGOTIATE, CURLAUTH_NTLM, CURLPROTO_HTTP, CURLPROTO_HTTPS, CURL_IPRESOLVE_V4,
+    CURL_IPRESOLVE_V6, CURL_REDIR_POST_301, CURL_REDIR_POST_302, CURL_REDIR_POST_303,
 };
-use crate::misc::zlib1::{ZlibStream, Z_DATA_ERROR};
+use crate::misc::zlib1::{InflateStreamError, ZlibStream, Z_DATA_ERROR};
 use crate::net_tls::{self, HttpStream, TlsVerifyPolicy};
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -109,7 +112,7 @@ impl ParsedUrl {
     }
 }
 
-fn parse_url(raw: &str) -> Result<ParsedUrl, (i32, String)> {
+fn parse_url_with_default(raw: &str, default_proto: Option<&str>) -> Result<ParsedUrl, (i32, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err((CURLE_URL_MALFORMAT, "Empty URL".to_string()));
@@ -125,7 +128,17 @@ fn parse_url(raw: &str) -> Result<ParsedUrl, (i32, String)> {
         }
         (sl, r)
     } else {
-        ("http".to_string(), without_frag)
+        let def = default_proto
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http".to_string());
+        if def != "http" && def != "https" {
+            return Err((
+                CURLE_UNSUPPORTED_PROTOCOL,
+                format!("Unsupported default protocol: {def}"),
+            ));
+        }
+        (def, without_frag)
     };
 
     let (authority, path_and_query) = match rest.find(['/', '?']) {
@@ -200,7 +213,66 @@ fn resolve_redirect(base: &ParsedUrl, location: &str) -> Result<ParsedUrl, (i32,
     ) else {
         return Err((CURLE_URL_MALFORMAT, "Empty redirect Location".to_string()));
     };
-    parse_url(&resolved)
+    parse_url_with_default(&resolved, None)
+}
+
+fn scheme_proto_bit(scheme: &str) -> u32 {
+    if scheme.eq_ignore_ascii_case("https") {
+        CURLPROTO_HTTPS
+    } else {
+        CURLPROTO_HTTP
+    }
+}
+
+fn parse_auth_header_mask(val: &str) -> i32 {
+    let mut mask = 0i32;
+    let lower = val.to_ascii_lowercase();
+    for tok in lower.split([',', ' ', '\t']) {
+        match tok.trim() {
+            "basic" => mask |= CURLAUTH_BASIC,
+            "digest" => mask |= CURLAUTH_DIGEST,
+            "negotiate" => mask |= CURLAUTH_NEGOTIATE,
+            "ntlm" => mask |= CURLAUTH_NTLM,
+            "bearer" => mask |= CURLAUTH_BEARER,
+            _ => {}
+        }
+    }
+    mask
+}
+
+/// Match `CURLOPT_RESOLVE` entries (`[+]host:port:addr[,addr...]`) for `(host, port)`.
+fn lookup_resolve_override(entries: &[String], host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let mut matched: Option<Vec<SocketAddr>> = None;
+    for raw in entries {
+        let s = raw.trim();
+        if let Some(removed) = s.strip_prefix('-') {
+            if let Some((h, pstr)) = removed.rsplit_once(':') {
+                if h.eq_ignore_ascii_case(host) && pstr.parse::<u16>().ok() == Some(port) {
+                    matched = None;
+                }
+            }
+            continue;
+        }
+        let s = s.strip_prefix('+').unwrap_or(s);
+        let mut parts = s.splitn(3, ':');
+        let (Some(h), Some(pstr), Some(addrs_str)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if !h.eq_ignore_ascii_case(host) || pstr.parse::<u16>().ok() != Some(port) {
+            continue;
+        }
+        let mut out = Vec::new();
+        for tok in addrs_str.split(',') {
+            let clean = tok.trim().trim_start_matches('[').trim_end_matches(']');
+            if let Ok(ip) = clean.parse::<IpAddr>() {
+                out.push(SocketAddr::new(ip, port));
+            }
+        }
+        if !out.is_empty() {
+            matched = Some(out);
+        }
+    }
+    matched
 }
 
 // Streaming gzip/deflate decoder backed by `zlib1::ZlibStream`.
@@ -209,6 +281,7 @@ struct StreamingInflater {
     finished: bool,
     produced_any: bool,
     raw_deflate_fallback: bool,
+    total_decoded: i64,
 }
 
 impl StreamingInflater {
@@ -224,44 +297,103 @@ impl StreamingInflater {
             finished: false,
             produced_any: false,
             raw_deflate_fallback,
+            total_decoded: 0,
         })
     }
 
-    fn decompress(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), i32> {
+    /// Stream decoded output through a fixed `CURL_MAX_WRITE_SIZE` (16 KiB) buffer,
+    /// enforcing `max_decoded` (`CURLOPT_MAXFILESIZE`) before allocating or delivering
+    /// any output slice to `on_chunk`. Returns `Ok(true)` if at least one decoded slice
+    /// was emitted during this call.
+    fn decompress_streaming(
+        &mut self,
+        input: &[u8],
+        max_decoded: i64,
+        mut on_chunk: impl FnMut(&[u8]) -> Result<(), (i32, String, i32)>,
+    ) -> Result<bool, (i32, String, i32)> {
         if input.is_empty() || self.finished {
-            return Ok(());
+            return Ok(false);
         }
-        let out_start = out.len();
-        match self.stream.inflate_chunk(input, out) {
+        let mut scratch = [0u8; CURL_MAX_WRITE_SIZE];
+        let mut emitted = false;
+        let mut total_decoded = self.total_decoded;
+        let mut produced_any = self.produced_any;
+
+        let res = self.stream.inflate_chunk_streaming(input, &mut scratch, |slice| {
+            let next_decoded = total_decoded.saturating_add(slice.len() as i64);
+            if max_decoded > 0 && next_decoded > max_decoded {
+                return Err((
+                    CURLE_FILESIZE_EXCEEDED,
+                    format!("Maximum file size ({max_decoded}) exceeded"),
+                    0,
+                ));
+            }
+            total_decoded = next_decoded;
+            produced_any = true;
+            emitted = true;
+            on_chunk(slice)
+        });
+        self.total_decoded = total_decoded;
+        self.produced_any = produced_any;
+
+        match res {
             Ok(done) => {
-                if out.len() > out_start {
-                    self.produced_any = true;
-                }
                 if done {
                     self.finished = true;
                 }
-                Ok(())
+                Ok(emitted)
             }
-            Err(Z_DATA_ERROR)
-                if self.raw_deflate_fallback && !self.produced_any && out.len() == out_start =>
+            Err(InflateStreamError::Callback(err)) => Err(err),
+            Err(InflateStreamError::Zlib(Z_DATA_ERROR))
+                if self.raw_deflate_fallback && !self.produced_any =>
             {
-                // Retry as raw RFC 1951 deflate (-15).
+                // Retry as raw RFC 1951 deflate (-15) when zlib header parsing fails before output.
                 self.raw_deflate_fallback = false;
-                self.stream =
-                    ZlibStream::new_inflate(-15).map_err(|_| CURLE_BAD_CONTENT_ENCODING)?;
-                let done = self
-                    .stream
-                    .inflate_chunk(input, out)
-                    .map_err(|_| CURLE_BAD_CONTENT_ENCODING)?;
-                if out.len() > out_start {
-                    self.produced_any = true;
+                self.stream = ZlibStream::new_inflate(-15).map_err(|_| {
+                    (
+                        CURLE_BAD_CONTENT_ENCODING,
+                        "Content-Encoding decompression failed".to_string(),
+                        0,
+                    )
+                })?;
+                let mut total_decoded = self.total_decoded;
+                let mut produced_any = self.produced_any;
+                let retry = self.stream.inflate_chunk_streaming(input, &mut scratch, |slice| {
+                    let next_decoded = total_decoded.saturating_add(slice.len() as i64);
+                    if max_decoded > 0 && next_decoded > max_decoded {
+                        return Err((
+                            CURLE_FILESIZE_EXCEEDED,
+                            format!("Maximum file size ({max_decoded}) exceeded"),
+                            0,
+                        ));
+                    }
+                    total_decoded = next_decoded;
+                    produced_any = true;
+                    emitted = true;
+                    on_chunk(slice)
+                });
+                self.total_decoded = total_decoded;
+                self.produced_any = produced_any;
+                match retry {
+                    Ok(done) => {
+                        if done {
+                            self.finished = true;
+                        }
+                        Ok(emitted)
+                    }
+                    Err(InflateStreamError::Callback(err)) => Err(err),
+                    Err(InflateStreamError::Zlib(_)) => Err((
+                        CURLE_BAD_CONTENT_ENCODING,
+                        "Content-Encoding decompression failed".to_string(),
+                        0,
+                    )),
                 }
-                if done {
-                    self.finished = true;
-                }
-                Ok(())
             }
-            Err(_) => Err(CURLE_BAD_CONTENT_ENCODING),
+            Err(InflateStreamError::Zlib(_)) => Err((
+                CURLE_BAD_CONTENT_ENCODING,
+                "Content-Encoding decompression failed".to_string(),
+                0,
+            )),
         }
     }
 }
@@ -272,12 +404,12 @@ impl StreamingInflater {
 
 pub(super) trait TransferSink {
     fn is_cancelled(&self) -> bool;
-    fn cancel_token(&self) -> Option<Arc<AtomicBool>> {
-        None
+    fn on_head(&self, meta: HeadMeta);
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32>;
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32>;
+    fn on_progress(&self, _dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64) -> Result<(), i32> {
+        Ok(())
     }
-    fn on_head(&mut self, meta: HeadMeta);
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32>;
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32>;
 }
 
 pub(super) struct DirectSink {
@@ -290,16 +422,20 @@ impl TransferSink for DirectSink {
         false
     }
 
-    fn on_head(&mut self, meta: HeadMeta) {
+    fn on_head(&self, meta: HeadMeta) {
         apply_head_meta(&self.easy, meta);
     }
 
-    fn on_header_line(&mut self, line: Vec<u8>) -> Result<(), i32> {
+    fn on_header_line(&self, line: Vec<u8>) -> Result<(), i32> {
         unsafe { invoke_header_callback(self.cb, &line) }
     }
 
-    fn on_body_chunk(&mut self, data: Vec<u8>) -> Result<(), i32> {
+    fn on_body_chunk(&self, data: Vec<u8>) -> Result<(), i32> {
         unsafe { invoke_write_callback(self.cb, &data) }
+    }
+
+    fn on_progress(&self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> Result<(), i32> {
+        unsafe { invoke_xferinfo_callback(self.cb, dltotal, dlnow, ultotal, ulnow) }
     }
 }
 
@@ -331,41 +467,98 @@ fn remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration>, (i32
     Ok(Some(dl.saturating_duration_since(now)))
 }
 
+/// Maximum single socket read wait before re-checking cancellation and dispatching
+/// periodic progress callbacks during idle network I/O (`CURLOPT_XFERINFOFUNCTION`
+/// contract: periodic invocation even when stalled waiting for headers or body).
+const IDLE_PROGRESS_POLL: Duration = Duration::from_millis(200);
+
+fn bounded_read_timeout(deadline: Option<Instant>) -> Result<Duration, (i32, String, i32)> {
+    let rem = remaining_timeout(deadline)?;
+    Ok(match rem {
+        Some(r) => r.min(IDLE_PROGRESS_POLL),
+        None => IDLE_PROGRESS_POLL,
+    })
+}
+
 struct DeadlineBufReader<'a> {
     inner: &'a mut BufReader<HttpStream>,
+    sink: &'a dyn TransferSink,
     deadline: Option<Instant>,
-    cancel: Option<Arc<AtomicBool>>,
-    cancelled: bool,
+    dltotal: i64,
+    dlnow: &'a std::cell::Cell<i64>,
+    ultotal: i64,
+    ulnow: i64,
+    aborted_code: Option<i32>,
 }
 
 impl DeadlineBufReader<'_> {
     fn prepare_io(&mut self) -> io::Result<()> {
-        if self
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Acquire))
-        {
-            self.cancelled = true;
+        if self.sink.is_cancelled() {
+            self.aborted_code = Some(CURLE_ABORTED_BY_CALLBACK);
             return Err(io::Error::other("Transfer cancelled"));
         }
-        let rem = remaining_timeout(self.deadline)
+        let slice = bounded_read_timeout(self.deadline)
             .map_err(|(_, msg, _)| io::Error::new(io::ErrorKind::TimedOut, msg))?;
-        let _ = self.inner.get_ref().set_timeouts(rem, rem);
+        let _ = self.inner.get_ref().set_timeouts(Some(slice), Some(slice));
+        Ok(())
+    }
+
+    fn on_idle_timeout(&mut self) -> io::Result<()> {
+        let _ = remaining_timeout(self.deadline)
+            .map_err(|(_, msg, _)| io::Error::new(io::ErrorKind::TimedOut, msg))?;
+        if self.sink.is_cancelled() {
+            self.aborted_code = Some(CURLE_ABORTED_BY_CALLBACK);
+            return Err(io::Error::other("Transfer cancelled"));
+        }
+        if let Err(code) = self
+            .sink
+            .on_progress(self.dltotal, self.dlnow.get(), self.ultotal, self.ulnow)
+        {
+            self.aborted_code = Some(code);
+            return Err(io::Error::other("Progress callback aborted transfer"));
+        }
         Ok(())
     }
 }
 
 impl Read for DeadlineBufReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.prepare_io()?;
-        self.inner.read(buf)
+        loop {
+            self.prepare_io()?;
+            match self.inner.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    self.on_idle_timeout()?;
+                }
+                other => return other,
+            }
+        }
     }
 }
 
 impl BufRead for DeadlineBufReader<'_> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.prepare_io()?;
-        self.inner.fill_buf()
+        loop {
+            self.prepare_io()?;
+            let res = match self.inner.fill_buf() {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => return Ok(self.inner.buffer()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    self.on_idle_timeout()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn consume(&mut self, amt: usize) {
@@ -414,7 +607,12 @@ fn build_http_request(
         |k: &str| provided.iter().any(|x| x == k) || suppressed.iter().any(|x| x == k);
 
     let mut wire = Vec::with_capacity(512 + body.len());
-    let _ = write!(wire, "{method} {} HTTP/1.1\r\n", url.path_and_query);
+    let target = req
+        .request_target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&url.path_and_query);
+    let _ = write!(wire, "{method} {target} HTTP/1.1\r\n");
 
     if !has_custom("host") {
         let _ = write!(wire, "Host: {}\r\n", url.host_header(port_override));
@@ -453,9 +651,13 @@ fn build_http_request(
         }
     }
     if include_credentials && !has_custom("authorization") {
-        if let Some(creds) = req.basic_auth.as_deref().or(url.userinfo.as_deref()) {
-            let encoded = net_tls::base64_encode(creds.as_bytes());
-            let _ = write!(wire, "Authorization: Basic {encoded}\r\n");
+        if let Some(ref bearer) = req.bearer_token {
+            let _ = write!(wire, "Authorization: Bearer {bearer}\r\n");
+        } else if req.allow_basic_auth {
+            if let Some(creds) = req.basic_auth.as_deref().or(url.userinfo.as_deref()) {
+                let encoded = net_tls::base64_encode(creds.as_bytes());
+                let _ = write!(wire, "Authorization: Basic {encoded}\r\n");
+            }
         }
     }
     if !has_custom("connection") {
@@ -493,10 +695,28 @@ struct ParsedResponseHead {
     raw_lines: Vec<Vec<u8>>,
     header_bytes: usize,
     content_length: Option<i64>,
+    content_range: Option<String>,
     chunked: bool,
     content_type: Option<String>,
     content_encoding: Option<String>,
     location: Option<String>,
+    httpauth_avail: i32,
+    proxyauth_avail: i32,
+    retry_after: i64,
+}
+
+/// Parse RFC 9110 `Content-Range: bytes <start>-<end>/<total>` and return `<start>`.
+fn parse_content_range_start(val: &str) -> Option<i64> {
+    let trimmed = val.trim();
+    let rest = trimmed
+        .strip_prefix("bytes ")
+        .or_else(|| {
+            let prefix = trimmed.get(..6)?;
+            prefix.eq_ignore_ascii_case("bytes ").then(|| &trimmed[6..])
+        })?
+        .trim_start();
+    let dash = rest.find('-')?;
+    rest[..dash].trim().parse::<i64>().ok().filter(|&n| n >= 0)
 }
 
 fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, (i32, String, i32)> {
@@ -539,10 +759,14 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
     raw_lines.push(line_buf.clone());
 
     let mut content_length: Option<i64> = None;
+    let mut content_range: Option<String> = None;
     let mut chunked = false;
     let mut content_type: Option<String> = None;
     let mut content_encoding: Option<String> = None;
     let mut location: Option<String> = None;
+    let mut httpauth_avail: i32 = 0;
+    let mut proxyauth_avail: i32 = 0;
+    let mut retry_after: i64 = 0;
 
     for _ in 0..MAX_HEADERS {
         let n = net_tls::read_line_limited(reader, &mut line_buf, MAX_HEADER_LINE)
@@ -574,6 +798,9 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
                         }
                     }
                 }
+                "content-range" => {
+                    content_range = Some(val);
+                }
                 "transfer-encoding" => {
                     if val.to_ascii_lowercase().contains("chunked") {
                         chunked = true;
@@ -588,6 +815,19 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
                 "location" => {
                     location = Some(val);
                 }
+                "www-authenticate" => {
+                    httpauth_avail |= parse_auth_header_mask(&val);
+                }
+                "proxy-authenticate" => {
+                    proxyauth_avail |= parse_auth_header_mask(&val);
+                }
+                "retry-after" => {
+                    if let Ok(secs) = val.parse::<i64>() {
+                        if secs >= 0 {
+                            retry_after = secs;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -598,35 +838,80 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ParsedResponseHead, 
         raw_lines,
         header_bytes,
         content_length,
+        content_range,
         chunked,
         content_type,
         content_encoding,
         location,
+        httpauth_avail,
+        proxyauth_avail,
+        retry_after,
     })
 }
 
+/// Maximum bytes delivered in a single `CURLOPT_WRITEFUNCTION` invocation per
+/// libcurl's documented contract (`CURL_MAX_WRITE_SIZE`, 16 KiB), independent
+/// of `CURLOPT_BUFFERSIZE`.
+pub(super) const CURL_MAX_WRITE_SIZE: usize = 16 * 1024;
+
 fn emit_body_bytes(
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     raw: &[u8],
     size_download: &mut i64,
+    max_filesize: i64,
+    dltotal: i64,
+    ultotal: i64,
 ) -> Result<(), (i32, String, i32)> {
     if raw.is_empty() {
         return Ok(());
     }
     if let Some(ref mut inf) = inflater {
-        let mut decoded = Vec::with_capacity(raw.len().saturating_mul(2));
-        inf.decompress(raw, &mut decoded)
-            .map_err(|code| (code, "Content-Encoding decompression failed".to_string(), 0))?;
-        if !decoded.is_empty() {
-            *size_download += decoded.len() as i64;
-            sink.on_body_chunk(decoded)
-                .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
-        }
-    } else {
+        // Track transferred (wire/encoded) bytes separately from decompressed output
+        // so `dlnow` matches `dltotal` (Content-Length) and `CURLINFO_SIZE_DOWNLOAD_T`
+        // per libcurl's progress and transfer-size contracts.
         *size_download += raw.len() as i64;
-        sink.on_body_chunk(raw.to_vec())
+        if max_filesize > 0 && *size_download > max_filesize {
+            return Err((
+                CURLE_FILESIZE_EXCEEDED,
+                format!("Maximum file size ({max_filesize}) exceeded"),
+                0,
+            ));
+        }
+        let dlnow = *size_download;
+        let emitted = inf.decompress_streaming(raw, max_filesize, |chunk| {
+            if sink.is_cancelled() {
+                return Err((
+                    CURLE_ABORTED_BY_CALLBACK,
+                    "Transfer cancelled".to_string(),
+                    0,
+                ));
+            }
+            sink.on_body_chunk(chunk.to_vec())
+                .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
+            sink.on_progress(dltotal, dlnow, ultotal, ultotal)
+                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+            Ok(())
+        })?;
+        if !emitted {
+            sink.on_progress(dltotal, dlnow, ultotal, ultotal)
+                .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+        }
+        return Ok(());
+    }
+    for chunk in raw.chunks(CURL_MAX_WRITE_SIZE) {
+        *size_download += chunk.len() as i64;
+        if max_filesize > 0 && *size_download > max_filesize {
+            return Err((
+                CURLE_FILESIZE_EXCEEDED,
+                format!("Maximum file size ({max_filesize}) exceeded"),
+                0,
+            ));
+        }
+        sink.on_body_chunk(chunk.to_vec())
             .map_err(|code| (code, "Write callback aborted transfer".to_string(), 0))?;
+        sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+            .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
     }
     Ok(())
 }
@@ -659,7 +944,7 @@ pub(super) fn execute_http_transfer(
         };
     }
 
-    let mut initial_url = match parse_url(&req.url) {
+    let mut initial_url = match parse_url_with_default(&req.url, req.default_protocol.as_deref()) {
         Ok(u) => u,
         Err((code, msg)) => {
             return TransferOutcome {
@@ -674,6 +959,18 @@ pub(super) fn execute_http_transfer(
             };
         }
     };
+    if (req.allowed_protocols & scheme_proto_bit(&initial_url.scheme)) == 0 {
+        return TransferOutcome {
+            code: CURLE_UNSUPPORTED_PROTOCOL,
+            error_msg: Some(format!("Protocol {:?} disabled by CURLOPT_PROTOCOLS", initial_url.scheme)),
+            size_download: 0,
+            size_upload: 0,
+            content_length_upload: req.body.len() as i64,
+            total_time: start.elapsed().as_secs_f64(),
+            os_errno: 0,
+            ssl_verifyresult: 0,
+        };
+    }
     if req.port_override != 0 {
         initial_url.port = Some(req.port_override);
     }
@@ -685,6 +982,7 @@ pub(super) fn execute_http_transfer(
     let mut current_body = req.body.clone();
     let mut current_referer: Option<String> = None;
     let mut redirect_count: i32 = 0;
+    let mut redirect_time: f64 = 0.0;
     let mut num_connects: i32 = 0;
     let mut total_size_download: i64 = 0;
     let mut total_size_upload: i64 = 0;
@@ -733,23 +1031,35 @@ pub(super) fn execute_http_transfer(
             }
         };
 
-        // 1. DNS resolution
+        // 1. DNS resolution (honoring CURLOPT_RESOLVE and CURLOPT_IPRESOLVE)
+        let eff_port = current_url.effective_port(current_port_override);
         let addr_str = current_url.socket_addr_str(current_port_override);
-        let addrs: Vec<_> = match addr_str.to_socket_addrs() {
-            Ok(iter) => iter.collect(),
-            Err(e) => {
-                return TransferOutcome {
-                    code: CURLE_COULDNT_RESOLVE_HOST,
-                    error_msg: Some(format!("Could not resolve host {}: {e}", current_url.host)),
-                    size_download: total_size_download,
-                    size_upload: total_size_upload,
-                    content_length_upload: current_body.len() as i64,
-                    total_time: start.elapsed().as_secs_f64(),
-                    os_errno: e.raw_os_error().unwrap_or(0),
-                    ssl_verifyresult: 0,
-                };
+        let mut addrs: Vec<SocketAddr> = if let Some(ov) =
+            lookup_resolve_override(&req.resolve_entries, &current_url.host, eff_port)
+        {
+            ov
+        } else {
+            match addr_str.to_socket_addrs() {
+                Ok(iter) => iter.collect(),
+                Err(e) => {
+                    return TransferOutcome {
+                        code: CURLE_COULDNT_RESOLVE_HOST,
+                        error_msg: Some(format!("Could not resolve host {}: {e}", current_url.host)),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: current_body.len() as i64,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno: e.raw_os_error().unwrap_or(0),
+                        ssl_verifyresult: 0,
+                    };
+                }
             }
         };
+        if req.ipresolve == CURL_IPRESOLVE_V4 {
+            addrs.retain(|a| a.is_ipv4());
+        } else if req.ipresolve == CURL_IPRESOLVE_V6 {
+            addrs.retain(|a| a.is_ipv6());
+        }
         if addrs.is_empty() {
             return TransferOutcome {
                 code: CURLE_COULDNT_RESOLVE_HOST,
@@ -767,6 +1077,7 @@ pub(super) fn execute_http_transfer(
         // 2. TCP connect
         let mut connected_tcp = None;
         let mut primary_ip = None;
+        let mut primary_port: i32 = eff_port as i32;
         let mut last_err: Option<io::Error> = None;
         for sock_addr in &addrs {
             if sink.is_cancelled() {
@@ -784,6 +1095,7 @@ pub(super) fn execute_http_transfer(
             match TcpStream::connect_timeout(sock_addr, connect_timeout) {
                 Ok(tcp) => {
                     primary_ip = Some(sock_addr.ip().to_string());
+                    primary_port = sock_addr.port() as i32;
                     connected_tcp = Some(tcp);
                     break;
                 }
@@ -813,6 +1125,39 @@ pub(super) fn execute_http_transfer(
         };
         num_connects += 1;
         let _ = tcp.set_nodelay(req.tcp_nodelay);
+        if req.tcp_keepalive {
+            let fd = tcp.as_raw_fd();
+            let one: i32 = 1;
+            let idle = req.tcp_keepidle.max(1) as i32;
+            let intvl = req.tcp_keepintvl.max(1) as i32;
+            unsafe {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_KEEPALIVE,
+                    &one as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPALIVE,
+                    &idle as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPINTVL,
+                    &intvl as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                );
+            }
+        }
+        let (local_ip, local_port) = match tcp.local_addr() {
+            Ok(la) => (Some(la.ip().to_string()), la.port() as i32),
+            Err(_) => (None, 0),
+        };
         let connect_time = start.elapsed().as_secs_f64();
 
         // 3. Optional TLS handshake (via shared crate::net_tls config & HttpStream)
@@ -920,6 +1265,13 @@ pub(super) fn execute_http_transfer(
         };
         let _ = stream.set_timeouts(io_timeout, io_timeout);
 
+        let appconnect_time = if stream.is_tls() {
+            start.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let pretransfer_time = start.elapsed().as_secs_f64();
+
         // 4. Send HTTP/1.1 request
         let same_origin = current_url.origin_key(current_port_override) == initial_origin;
         let wire_req = build_http_request(
@@ -929,7 +1281,7 @@ pub(super) fn execute_http_transfer(
             &current_method,
             &current_body,
             current_referer.as_deref(),
-            same_origin,
+            same_origin || req.unrestricted_auth,
         );
         if req.verbose {
             log::debug!(
@@ -940,25 +1292,153 @@ pub(super) fn execute_http_transfer(
             );
         }
         total_request_size += wire_req.len() as i32;
-        total_size_upload = current_body.len() as i64;
+        let req_header_len = wire_req.len().saturating_sub(current_body.len());
+        let upload_total = current_body.len() as i64;
+        total_size_upload = 0;
 
+        // Dispatch initial upload progress before sending any request bytes so a caller
+        // uploading a body can observe (ultotal, 0) or abort before request I/O begins.
+        if sink.is_cancelled() {
+            return TransferOutcome {
+                code: CURLE_ABORTED_BY_CALLBACK,
+                error_msg: Some("Transfer cancelled".to_string()),
+                size_download: total_size_download,
+                size_upload: total_size_upload,
+                content_length_upload: upload_total,
+                total_time: start.elapsed().as_secs_f64(),
+                os_errno: 0,
+                ssl_verifyresult: 0,
+            };
+        }
+        if upload_total > 0 {
+            if let Err(code) = sink.on_progress(0, total_size_download, upload_total, 0) {
+                return TransferOutcome {
+                    code,
+                    error_msg: Some("Progress callback aborted transfer".to_string()),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: upload_total,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
+        }
+
+        const UPLOAD_WRITE_CHUNK: usize = 64 * 1024;
         let mut written = 0usize;
         while written < wire_req.len() {
-            match stream.write(&wire_req[written..]) {
+            if sink.is_cancelled() {
+                return TransferOutcome {
+                    code: CURLE_ABORTED_BY_CALLBACK,
+                    error_msg: Some("Transfer cancelled".to_string()),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: upload_total,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
+            let slice = match bounded_read_timeout(deadline) {
+                Ok(d) => d,
+                Err((code, msg, os_errno)) => {
+                    return TransferOutcome {
+                        code,
+                        error_msg: Some(msg),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: upload_total,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            };
+            let _ = stream.set_timeouts(Some(slice), Some(slice));
+            let end = (written + UPLOAD_WRITE_CHUNK).min(wire_req.len());
+            match stream.write(&wire_req[written..end]) {
                 Ok(0) => {
                     return TransferOutcome {
                         code: CURLE_SEND_ERROR,
                         error_msg: Some("Failed writing request: connection closed".to_string()),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
-                        content_length_upload: current_body.len() as i64,
+                        content_length_upload: upload_total,
                         total_time: start.elapsed().as_secs_f64(),
                         os_errno: 0,
                         ssl_verifyresult: 0,
                     };
                 }
-                Ok(n) => written += n,
+                Ok(n) => {
+                    let prev_upload = total_size_upload;
+                    written += n;
+                    total_size_upload = written.saturating_sub(req_header_len) as i64;
+                    if total_size_upload > prev_upload {
+                        if let Err(code) = sink.on_progress(
+                            0,
+                            total_size_download,
+                            upload_total,
+                            total_size_upload,
+                        ) {
+                            return TransferOutcome {
+                                code,
+                                error_msg: Some("Progress callback aborted transfer".to_string()),
+                                size_download: total_size_download,
+                                size_upload: total_size_upload,
+                                content_length_upload: upload_total,
+                                total_time: start.elapsed().as_secs_f64(),
+                                os_errno: 0,
+                                ssl_verifyresult: 0,
+                            };
+                        }
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if let Err((code, msg, os_errno)) = remaining_timeout(deadline) {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some(msg),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if sink.is_cancelled() {
+                        return TransferOutcome {
+                            code: CURLE_ABORTED_BY_CALLBACK,
+                            error_msg: Some("Transfer cancelled".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if let Err(code) =
+                        sink.on_progress(0, total_size_download, upload_total, total_size_upload)
+                    {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some("Progress callback aborted transfer".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let (code, msg, os_errno) = map_io_err(&e, CURLE_SEND_ERROR);
                     return TransferOutcome {
@@ -966,7 +1446,7 @@ pub(super) fn execute_http_transfer(
                         error_msg: Some(format!("Failed sending HTTP request: {msg}")),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
-                        content_length_upload: current_body.len() as i64,
+                        content_length_upload: upload_total,
                         total_time: start.elapsed().as_secs_f64(),
                         os_errno,
                         ssl_verifyresult: 0,
@@ -974,24 +1454,119 @@ pub(super) fn execute_http_transfer(
                 }
             }
         }
-        let _ = stream.flush();
-
-        // 5. Read response head (skipping 1xx interim responses except 101)
-        let is_tls = stream.is_tls();
-        let mut reader = BufReader::with_capacity(16384, stream);
-
-        let head = loop {
-            let h = match read_response_head(&mut reader) {
-                Ok(h) => h,
+        loop {
+            let slice = match bounded_read_timeout(deadline) {
+                Ok(d) => d,
                 Err((code, msg, os_errno)) => {
                     return TransferOutcome {
                         code,
                         error_msg: Some(msg),
                         size_download: total_size_download,
                         size_upload: total_size_upload,
-                        content_length_upload: current_body.len() as i64,
+                        content_length_upload: upload_total,
                         total_time: start.elapsed().as_secs_f64(),
                         os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            };
+            let _ = stream.set_timeouts(Some(slice), Some(slice));
+            match stream.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if let Err((code, msg, os_errno)) = remaining_timeout(deadline) {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some(msg),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if sink.is_cancelled() {
+                        return TransferOutcome {
+                            code: CURLE_ABORTED_BY_CALLBACK,
+                            error_msg: Some("Transfer cancelled".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    if let Err(code) =
+                        sink.on_progress(0, total_size_download, upload_total, total_size_upload)
+                    {
+                        return TransferOutcome {
+                            code,
+                            error_msg: Some("Progress callback aborted transfer".to_string()),
+                            size_download: total_size_download,
+                            size_upload: total_size_upload,
+                            content_length_upload: upload_total,
+                            total_time: start.elapsed().as_secs_f64(),
+                            os_errno: 0,
+                            ssl_verifyresult: 0,
+                        };
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    let (code, msg, os_errno) = map_io_err(&e, CURLE_SEND_ERROR);
+                    return TransferOutcome {
+                        code,
+                        error_msg: Some(format!("Failed flushing HTTP request: {msg}")),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: upload_total,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            }
+        }
+
+        // 5. Read response head (skipping 1xx interim responses except 101)
+        let is_tls = stream.is_tls();
+        let mut reader = BufReader::with_capacity(16384, stream);
+        let head_dlnow = std::cell::Cell::new(total_size_download);
+        let head_ultotal = current_body.len() as i64;
+
+        let head = loop {
+            let mut hreader = DeadlineBufReader {
+                inner: &mut reader,
+                sink,
+                deadline,
+                dltotal: 0,
+                dlnow: &head_dlnow,
+                ultotal: head_ultotal,
+                ulnow: head_ultotal,
+                aborted_code: None,
+            };
+            let h = match read_response_head(&mut hreader) {
+                Ok(h) => h,
+                Err((code, msg, os_errno)) => {
+                    let (final_code, final_msg, final_errno) = if let Some(aborted) = hreader.aborted_code {
+                        (aborted, "Progress callback aborted transfer".to_string(), 0)
+                    } else {
+                        (code, msg, os_errno)
+                    };
+                    return TransferOutcome {
+                        code: final_code,
+                        error_msg: Some(final_msg),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: current_body.len() as i64,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno: final_errno,
                         ssl_verifyresult: 0,
                     };
                 }
@@ -1040,6 +1615,8 @@ pub(super) fn execute_http_transfer(
             .as_ref()
             .and_then(|r| r.as_ref().ok().map(ParsedUrl::to_url_string));
 
+        let starttransfer_time = start.elapsed().as_secs_f64();
+        let proto_bit = scheme_proto_bit(&current_url.scheme);
         // Publish response metadata BEFORE callbacks so curl_easy_getinfo works inside callbacks.
         sink.on_head(HeadMeta {
             response_code: head.status_code,
@@ -1047,6 +1624,13 @@ pub(super) fn execute_http_transfer(
             request_size: total_request_size,
             redirect_count,
             num_connects,
+            primary_port,
+            local_port,
+            protocol: proto_bit as i32,
+            condition_unmet: i32::from(head.status_code == 304),
+            httpauth_avail: head.httpauth_avail,
+            proxyauth_avail: head.proxyauth_avail,
+            retry_after: head.retry_after,
             content_length_download: if head.chunked {
                 -1
             } else {
@@ -1056,8 +1640,15 @@ pub(super) fn execute_http_transfer(
             content_type: head.content_type.clone(),
             redirect_url: redirect_url_str,
             primary_ip,
+            local_ip,
+            scheme: current_url.scheme.to_ascii_uppercase(),
+            effective_method: current_method.clone(),
             namelookup_time,
             connect_time,
+            appconnect_time,
+            pretransfer_time,
+            starttransfer_time,
+            redirect_time,
         });
 
         // Deliver header lines to HEADERFUNCTION
@@ -1111,6 +1702,24 @@ pub(super) fn execute_http_transfer(
                         };
                     }
                 };
+                let next_proto_bit = scheme_proto_bit(&next_url.scheme);
+                if (req.allowed_protocols & next_proto_bit) == 0
+                    || (req.redir_protocols & next_proto_bit) == 0
+                {
+                    return TransferOutcome {
+                        code: CURLE_UNSUPPORTED_PROTOCOL,
+                        error_msg: Some(format!(
+                            "Redirect protocol {:?} disabled by CURLOPT_PROTOCOLS / CURLOPT_REDIR_PROTOCOLS",
+                            next_url.scheme
+                        )),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: current_body.len() as i64,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno: 0,
+                        ssl_verifyresult: 0,
+                    };
+                }
                 if req.autoreferer {
                     current_referer = Some(current_url.to_url_string());
                 }
@@ -1132,6 +1741,7 @@ pub(super) fn execute_http_transfer(
                 }
                 current_url = next_url;
                 redirect_count += 1;
+                redirect_time = start.elapsed().as_secs_f64();
                 continue;
             }
         }
@@ -1153,6 +1763,27 @@ pub(super) fn execute_http_transfer(
             };
         }
 
+        // 7b. Max file size check on declared Content-Length
+        if req.max_filesize > 0 {
+            if let Some(cl) = head.content_length {
+                if cl > req.max_filesize {
+                    return TransferOutcome {
+                        code: CURLE_FILESIZE_EXCEEDED,
+                        error_msg: Some(format!(
+                            "Maximum file size ({}) exceeded (Content-Length: {cl})",
+                            req.max_filesize
+                        )),
+                        size_download: total_size_download,
+                        size_upload: total_size_upload,
+                        content_length_upload: current_body.len() as i64,
+                        total_time: start.elapsed().as_secs_f64(),
+                        os_errno: 0,
+                        ssl_verifyresult: 0,
+                    };
+                }
+            }
+        }
+
         // 8. Bodyless responses
         let no_body = req.nobody
             || current_method.eq_ignore_ascii_case("HEAD")
@@ -1170,6 +1801,34 @@ pub(super) fn execute_http_transfer(
                 os_errno: 0,
                 ssl_verifyresult: 0,
             };
+        }
+
+        // 8b. Validate resumed download response before delivering any body bytes:
+        // when CURLOPT_RESUME_FROM > 0, the server must reply 206 Partial Content with a
+        // matching Content-Range start offset; otherwise return CURLE_RANGE_ERROR rather
+        // than delivering a full 200 body that would corrupt the caller's partial file.
+        if req.resume_from > 0 {
+            let range_matches = head.status_code == 206
+                && head
+                    .content_range
+                    .as_deref()
+                    .and_then(parse_content_range_start)
+                    == Some(req.resume_from);
+            if !range_matches {
+                return TransferOutcome {
+                    code: CURLE_RANGE_ERROR,
+                    error_msg: Some(format!(
+                        "HTTP server did not honor resume offset {} (status={}, Content-Range={:?})",
+                        req.resume_from, head.status_code, head.content_range
+                    )),
+                    size_download: total_size_download,
+                    size_upload: total_size_upload,
+                    content_length_upload: current_body.len() as i64,
+                    total_time: start.elapsed().as_secs_f64(),
+                    os_errno: 0,
+                    ssl_verifyresult: 0,
+                };
+            }
         }
 
         // 9. Optional Content-Encoding decompression (when ACCEPT_ENCODING is active)
@@ -1199,30 +1858,59 @@ pub(super) fn execute_http_transfer(
         };
 
         // 10. Read response body (chunked / Content-Length / close-delimited)
+        let dltotal = if head.chunked {
+            0
+        } else {
+            head.content_length.unwrap_or(0)
+        };
+        let ultotal = current_body.len() as i64;
+        if let Err(code) = sink.on_progress(dltotal, total_size_download, ultotal, ultotal) {
+            return TransferOutcome {
+                code,
+                error_msg: Some("Progress callback aborted transfer".to_string()),
+                size_download: total_size_download,
+                size_upload: total_size_upload,
+                content_length_upload: ultotal,
+                total_time: start.elapsed().as_secs_f64(),
+                os_errno: 0,
+                ssl_verifyresult: 0,
+            };
+        }
         let body_res: Result<(), (i32, String, i32)> = if head.chunked {
             read_chunked_body(
                 &mut reader,
                 sink,
                 &mut inflater,
                 &mut total_size_download,
+                req.max_filesize,
+                dltotal,
+                ultotal,
                 deadline,
             )
         } else if let Some(cl) = head.content_length {
             read_exact_body(
                 &mut reader,
                 cl as usize,
+                req.buffer_size,
                 sink,
                 &mut inflater,
                 &mut total_size_download,
+                req.max_filesize,
+                dltotal,
+                ultotal,
                 deadline,
             )
         } else {
             read_eof_body(
                 &mut reader,
                 is_tls,
+                req.buffer_size,
                 sink,
                 &mut inflater,
                 &mut total_size_download,
+                req.max_filesize,
+                dltotal,
+                ultotal,
                 deadline,
             )
         };
@@ -1252,26 +1940,44 @@ pub(super) fn execute_http_transfer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_chunked_body(
     reader: &mut BufReader<HttpStream>,
-    sink: &mut dyn TransferSink,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
+    max_filesize: i64,
+    dltotal: i64,
+    ultotal: i64,
     deadline: Option<Instant>,
 ) -> Result<(), (i32, String, i32)> {
-    let cancel_token = sink.cancel_token();
+    let dlnow_cell = std::cell::Cell::new(*size_download);
     let mut dreader = DeadlineBufReader {
         inner: reader,
+        sink,
         deadline,
-        cancel: cancel_token,
-        cancelled: false,
+        dltotal,
+        dlnow: &dlnow_cell,
+        ultotal,
+        ulnow: ultotal,
+        aborted_code: None,
     };
     let mut emit_err: Option<(i32, String, i32)> = None;
     let res = net_tls::read_chunked_body_streaming(
         &mut dreader,
         net_tls::DEFAULT_MAX_CHUNK_SIZE,
         |chunk| {
-            if let Err(err) = emit_body_bytes(sink, inflater, chunk, size_download) {
+            let r = emit_body_bytes(
+                sink,
+                inflater,
+                chunk,
+                size_download,
+                max_filesize,
+                dltotal,
+                ultotal,
+            );
+            dlnow_cell.set(*size_download);
+            if let Err(err) = r {
                 emit_err = Some(err);
                 return Err(io::Error::other("Transfer body callback failed"));
             }
@@ -1284,12 +1990,8 @@ fn read_chunked_body(
             if let Some(err) = emit_err {
                 return Err(err);
             }
-            if dreader.cancelled {
-                return Err((
-                    CURLE_ABORTED_BY_CALLBACK,
-                    "Transfer cancelled".to_string(),
-                    0,
-                ));
+            if let Some(code) = dreader.aborted_code {
+                return Err((code, "Progress callback aborted transfer".to_string(), 0));
             }
             if e.kind() == io::ErrorKind::UnexpectedEof {
                 return Err((
@@ -1303,15 +2005,20 @@ fn read_chunked_body(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_exact_body(
     reader: &mut BufReader<HttpStream>,
     mut remaining: usize,
-    sink: &mut dyn TransferSink,
+    buffer_size: usize,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
+    max_filesize: i64,
+    dltotal: i64,
+    ultotal: i64,
     deadline: Option<Instant>,
 ) -> Result<(), (i32, String, i32)> {
-    let mut data_buf = vec![0u8; 16384];
+    let mut data_buf = vec![0u8; buffer_size.max(1024)];
     while remaining > 0 {
         if sink.is_cancelled() {
             return Err((
@@ -1320,8 +2027,8 @@ fn read_exact_body(
                 0,
             ));
         }
-        let rem = remaining_timeout(deadline)?;
-        let _ = reader.get_ref().set_timeouts(rem, rem);
+        let slice = bounded_read_timeout(deadline)?;
+        let _ = reader.get_ref().set_timeouts(Some(slice), Some(slice));
 
         let want = remaining.min(data_buf.len());
         let r = match reader.read(&mut data_buf[..want]) {
@@ -1334,23 +2041,52 @@ fn read_exact_body(
             }
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                let _ = remaining_timeout(deadline)?;
+                if sink.is_cancelled() {
+                    return Err((
+                        CURLE_ABORTED_BY_CALLBACK,
+                        "Transfer cancelled".to_string(),
+                        0,
+                    ));
+                }
+                sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                    .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+                continue;
+            }
             Err(e) => return Err(map_io_err(&e, CURLE_RECV_ERROR)),
         };
         remaining -= r;
-        emit_body_bytes(sink, inflater, &data_buf[..r], size_download)?;
+        emit_body_bytes(
+            sink,
+            inflater,
+            &data_buf[..r],
+            size_download,
+            max_filesize,
+            dltotal,
+            ultotal,
+        )?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_eof_body(
     reader: &mut BufReader<HttpStream>,
     is_tls: bool,
-    sink: &mut dyn TransferSink,
+    buffer_size: usize,
+    sink: &dyn TransferSink,
     inflater: &mut Option<StreamingInflater>,
     size_download: &mut i64,
+    max_filesize: i64,
+    dltotal: i64,
+    ultotal: i64,
     deadline: Option<Instant>,
 ) -> Result<(), (i32, String, i32)> {
-    let mut data_buf = vec![0u8; 16384];
+    let mut data_buf = vec![0u8; buffer_size.max(1024)];
     loop {
         if sink.is_cancelled() {
             return Err((
@@ -1359,13 +2095,37 @@ fn read_eof_body(
                 0,
             ));
         }
-        let rem = remaining_timeout(deadline)?;
-        let _ = reader.get_ref().set_timeouts(rem, rem);
+        let slice = bounded_read_timeout(deadline)?;
+        let _ = reader.get_ref().set_timeouts(Some(slice), Some(slice));
 
         match reader.read(&mut data_buf) {
             Ok(0) => return Ok(()),
-            Ok(k) => emit_body_bytes(sink, inflater, &data_buf[..k], size_download)?,
+            Ok(k) => emit_body_bytes(
+                sink,
+                inflater,
+                &data_buf[..k],
+                size_download,
+                max_filesize,
+                dltotal,
+                ultotal,
+            )?,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                let _ = remaining_timeout(deadline)?;
+                if sink.is_cancelled() {
+                    return Err((
+                        CURLE_ABORTED_BY_CALLBACK,
+                        "Transfer cancelled".to_string(),
+                        0,
+                    ));
+                }
+                sink.on_progress(dltotal, *size_download, ultotal, ultotal)
+                    .map_err(|code| (code, "Progress callback aborted transfer".to_string(), 0))?;
+                continue;
+            }
             // Many HTTPS servers close TCP after Connection: close without TLS close_notify.
             Err(e) if is_tls && e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(map_io_err(&e, CURLE_RECV_ERROR)),

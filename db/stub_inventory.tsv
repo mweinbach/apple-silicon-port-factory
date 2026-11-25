@@ -23,17 +23,12 @@ d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	794	"ID3
 d3d11.dll	create_geometry_shader_so	stub	crates/win32-rt/src/d3d11/device.rs	748	"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"
 d3d11.dll	draw_auto	stub	crates/win32-rt/src/d3d11/context.rs	2913	"ID3D11DeviceContext::DrawAuto not implemented"
 d3d11.dll	get_data	stub	crates/win32-rt/src/d3d11/context.rs	3094	"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"
-dbghelp.dll	MiniDumpWriteDump	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	StackWalk64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetLineFromAddr64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
-dbghelp.dll	SymGetLineFromAddrW64	failing	crates/win32-rt/src/misc/dbghelp.rs	503	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 dinput8.dll	configure_devices	stub	crates/win32-rt/src/misc/dinput8.rs	1862	"IDirectInput8::ConfigureDevices -> DIERR_UNSUPPORTED"
 dinput8.dll	dev_get_property	stub	crates/win32-rt/src/misc/dinput8.rs	1239	"IDirectInputDevice8::GetProperty({other:#x}) -> DIERR_UNSUPPORTED"
 dinput8.dll	dev_run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1557	"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"
 dinput8.dll	dev_set_property	stub	crates/win32-rt/src/misc/dinput8.rs	1331	"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"
 dinput8.dll	run_control_panel	stub	crates/win32-rt/src/misc/dinput8.rs	1822	"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"
 directml.dll	parse	middleware_stub	crates/win32-rt/src/misc/directml/ops.rs	1048	"DirectML CreateOperator: unsupported operator type {other}"
-dsound.dll	dsb_set_fx	stub	crates/win32-rt/src/misc/dsound/com_vtbl.rs	1458	"IDirectSoundBuffer8::SetFX({dw_effects_count} effects) -> DSERR_FXUNAVAILABLE"
 dwrite.dll	fac_create_custom_font_collection	stub	crates/win32-rt/src/misc/dwrite.rs	76	"IDWriteFactory::CreateCustomFontCollection -> E_NOTIMPL"
 dwrite.dll	fac_create_custom_font_file_reference	stub	crates/win32-rt/src/misc/dwrite.rs	119	"IDWriteFactory::CreateCustomFontFileReference -> E_NOTIMPL"
 dwrite.dll	fac_create_glyph_run_analysis	stub	crates/win32-rt/src/misc/dwrite.rs	365	"IDWriteFactory::CreateGlyphRunAnalysis -> E_NOTIMPL"
@@ -41,29 +36,9 @@ dwrite.dll	fac_create_text_analyzer	stub	crates/win32-rt/src/misc/dwrite.rs	336	
 gameinput.dll	gi_get_temporal_reading	stub	crates/win32-rt/src/misc/gameinput.rs	1968	"IGameInput::GetTemporalReading -> E_NOTIMPL"
 gdi32.dll	GetDeviceCaps	stub	crates/win32-rt/src/misc/gdi32.rs	910	"GetDeviceCaps({index}) -> 0"
 hid.dll	HidD_SetNumInputBuffers	stub	crates/win32-rt/src/misc/hid.rs	887	"ring size stays {INPUT_BUFFERS} (asked {n})"
-libcurl.dll	easy_getinfo	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1344	"libcurl: unsupported curl_easy_getinfo(info={other:#x})"
-libcurl.dll	easy_setopt	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1158	"libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})"
-mmdevapi.dll	activate	stub	crates/win32-rt/src/audio/mmdevapi.rs	592	"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"
-mmdevapi.dll	get_buffer_size_limits	stub	crates/win32-rt/src/audio/audioclient.rs	919	"IAudioClient2::GetBufferSizeLimits -> E_NOTIMPL (no offload)"
-mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/audioclient.rs	885	"IAudioClient::GetService({iid:?} = {what}) -> E_NOINTERFACE"
-mmdevapi.dll	get_service	stub	crates/win32-rt/src/audio/spatial.rs	846	"ISpatialAudioObjectRenderStream::GetService({iid:?}) -> E_NOINTERFACE"
-mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	427	"IAudioClient::Initialize: exclusive mode is not supported -> AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED"
-mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	440	"IAudioClient::Initialize: loopback capture is not supported -> E_NOTIMPL"
 msctf.dll	ctx_track_properties	stub	crates/win32-rt/src/misc/msctf/context.rs	809	"ITfContext::TrackProperties -> E_NOTIMPL"
 nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
 nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type
-ole32.dll	pv_get_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2167	"IPropertyValue::GetDateTime -> E_NOTIMPL"
-ole32.dll	pv_get_point	stub	crates/win32-rt/src/misc/ole32.rs	2185	"IPropertyValue::GetPoint -> E_NOTIMPL"
-ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2203	"IPropertyValue::GetRect -> E_NOTIMPL"
-ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2223	concat!("IPropertyValue::", $method, " -> E_NOTIMPL")
-ole32.dll	pv_get_size	stub	crates/win32-rt/src/misc/ole32.rs	2194	"IPropertyValue::GetSize -> E_NOTIMPL"
-ole32.dll	pv_get_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2176	"IPropertyValue::GetTimeSpan -> E_NOTIMPL"
-ole32.dll	pvs_create_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2582	"IPropertyValueStatics::CreateDateTime -> E_NOTIMPL"
-ole32.dll	pvs_create_point	stub	crates/win32-rt/src/misc/ole32.rs	2609	"IPropertyValueStatics::CreatePoint -> E_NOTIMPL"
-ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2640	"IPropertyValueStatics::CreateRect -> E_NOTIMPL"
-ole32.dll	pvs_create_rect	stub	crates/win32-rt/src/misc/ole32.rs	2659	concat!("IPropertyValueStatics::", $method, " -> E_NOTIMPL")
-ole32.dll	pvs_create_size	stub	crates/win32-rt/src/misc/ole32.rs	2623	"IPropertyValueStatics::CreateSize -> E_NOTIMPL"
-ole32.dll	pvs_create_time_span	stub	crates/win32-rt/src/misc/ole32.rs	2595	"IPropertyValueStatics::CreateTimeSpan -> E_NOTIMPL"
 physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2336	"PxGeometryQuery::computePenetration unsupported geometry0 {}", geom_type_name(t)
 physx3common_x64.dll	geom_compute_penetration	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2346	"PxGeometryQuery::computePenetration unsupported geometry1 {}", geom_type_name(t)
 physx3common_x64.dll	geom_get_world_bounds	middleware_stub	crates/win32-rt/src/misc/physx3common_x64.rs	2243	"PxGeometryQuery::getWorldBounds unsupported cooked geometry {}", geom_type_name(gtype)
@@ -103,14 +78,4 @@ wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	
 wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"
-ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1802	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
-ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1322	"WSADuplicateSocket cross-process target pid={pid} unsupported"
-xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	216	"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
-xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	233	"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"
 xinput1_4.dll	XInputGetKeystroke	stub	crates/win32-rt/src/misc/xinput1_4.rs	608	"XInputGetKeystroke: keystroke events not generated (ERROR_EMPTY)"
