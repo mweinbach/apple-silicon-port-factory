@@ -47,7 +47,6 @@ const BCRYPT_ASYMMETRIC_ENCRYPTION_INTERFACE: u32 = 3;
 const BCRYPT_SECRET_AGREEMENT_INTERFACE: u32 = 4;
 const BCRYPT_SIGNATURE_INTERFACE: u32 = 5;
 const BCRYPT_RNG_INTERFACE: u32 = 6;
-const BCRYPT_KEY_DERIVATION_INTERFACE: u32 = 7;
 
 const BCRYPT_RSAPUBLIC_MAGIC: u32 = 0x3141_5352; // "RSA1"
 const BCRYPT_RSAPRIVATE_MAGIC: u32 = 0x3241_5352; // "RSA2"
@@ -2897,7 +2896,6 @@ enum AlgKind {
     Rsa,
     Ecc { usage: EccUsage, curve: Option<EccCurve> },
     Rng,
-    Kdf,
 }
 
 impl AlgKind {
@@ -2909,7 +2907,6 @@ impl AlgKind {
             Self::Ecc { usage: EccUsage::Ecdh, .. } => BCRYPT_SECRET_AGREEMENT_INTERFACE,
             Self::Ecc { usage: EccUsage::Ecdsa, .. } => BCRYPT_SIGNATURE_INTERFACE,
             Self::Rng => BCRYPT_RNG_INTERFACE,
-            Self::Kdf => BCRYPT_KEY_DERIVATION_INTERFACE,
         }
     }
 }
@@ -3100,9 +3097,6 @@ pub unsafe extern "win64" fn BCryptOpenAlgorithmProvider(out: *mut *mut c_void, 
             "ECDH_P521" => AlgKind::Ecc { usage: EccUsage::Ecdh, curve: Some(EccCurve::P521) },
             "ECDH" => AlgKind::Ecc { usage: EccUsage::Ecdh, curve: None },
             "RNG" | "FIPS186DSARNG" => AlgKind::Rng,
-            "PBKDF2" | "SP800_108_CTR_HMAC" | "SP800_56A_CONCAT" | "CAPI_KDF" | "TLS1_1_KDF" | "TLS1_2_KDF" | "HKDF" => {
-                AlgKind::Kdf
-            }
             _ => {
                 // Unknown algorithm identifier: Windows CNG returns STATUS_NOT_FOUND.
                 log::debug!("BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND");
@@ -3229,7 +3223,7 @@ pub unsafe extern "win64" fn BCryptGetProperty(h: *mut c_void, prop: *const u16,
             return put_ecc_curve_name_list(out, out_len, result);
         }
         let value = match (p.as_str(), a.kind) {
-            ("ObjectLength" | "MultiObjectLength", _) => u32v(OBJECT_LENGTH),
+            ("ObjectLength", _) => u32v(OBJECT_LENGTH),
             ("AlgorithmName", _) => wide_bytes(&a.name),
             ("PrimitiveType", k) => u32v(k.primitive_type()),
             ("IsKeyedHash", AlgKind::Hash(_)) => u32v(a.hmac as u32),
@@ -4921,6 +4915,22 @@ mod tests {
             let mut got = 0u32;
             assert_eq!(BCryptGetProperty(ha, w("HashDigestLength").as_ptr(), &mut v as *mut u32 as *mut u8, 4, &mut got, 0), 0);
             assert_eq!((v, got), (32, 4));
+            // MultiObjectLength requires an 8-byte BCRYPT_MULTI_OBJECT_LENGTH_STRUCT for multihash;
+            // reject honestly until multihash is implemented.
+            let mut multi_buf = [0u8; 8];
+            assert_eq!(
+                BCryptGetProperty(ha, w("MultiObjectLength").as_ptr(), multi_buf.as_mut_ptr(), 8, &mut got, 0),
+                STATUS_NOT_SUPPORTED
+            );
+            // KDF algorithm providers require BCryptKeyDerivation key flow; reject honestly until implemented.
+            for kdf_name in ["PBKDF2", "HKDF", "SP800_108_CTR_HMAC", "TLS1_2_KDF"] {
+                let mut h_kdf = std::ptr::null_mut();
+                assert_eq!(
+                    BCryptOpenAlgorithmProvider(&mut h_kdf, w(kdf_name).as_ptr(), std::ptr::null(), 0),
+                    STATUS_NOT_FOUND
+                );
+                assert!(h_kdf.is_null());
+            }
             let mut hh = std::ptr::null_mut();
             assert_eq!(BCryptCreateHash(ha, &mut hh, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, 0), 0);
             let msg = b"aw2 license test";
