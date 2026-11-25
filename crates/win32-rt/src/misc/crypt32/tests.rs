@@ -2831,6 +2831,81 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert!(ua_len >= 16);
         assert_eq!(CryptMsgClose(h_umsg), TRUE);
 
+        // 3b. CryptMsgOpenToDecode with CMSG_STREAM_INFO invokes pfnStreamOutput and propagates failure
+        #[repr(C)]
+        struct TestStreamInfo {
+            cb_content: u32,
+            pfn_stream_output: usize,
+            pv_arg: *mut c_void,
+        }
+        unsafe extern "C" fn collect_stream_cb(
+            pv_arg: *mut c_void,
+            pb_data: *const u8,
+            cb_data: u32,
+            f_final: BOOL,
+        ) -> BOOL {
+            let out = &mut *(pv_arg as *mut (Vec<u8>, bool));
+            if !pb_data.is_null() && cb_data > 0 {
+                out.0.extend_from_slice(std::slice::from_raw_parts(pb_data, cb_data as usize));
+            }
+            if f_final != 0 {
+                out.1 = true;
+            }
+            TRUE
+        }
+        unsafe extern "C" fn fail_stream_cb(
+            _pv_arg: *mut c_void,
+            _pb_data: *const u8,
+            _cb_data: u32,
+            _f_final: BOOL,
+        ) -> BOOL {
+            crate::teb::set_last_error(0x8009_0020);
+            FALSE
+        }
+        let mut streamed: (Vec<u8>, bool) = (Vec::new(), false);
+        let mut sinfo_ok = TestStreamInfo {
+            cb_content: 0xFFFF_FFFF,
+            pfn_stream_output: collect_stream_cb as *const () as usize,
+            pv_arg: &mut streamed as *mut _ as *mut c_void,
+        };
+        let h_smsg = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            &mut sinfo_ok as *mut _ as *mut c_void,
+        );
+        assert!(!h_smsg.is_null());
+        assert_eq!(
+            CryptMsgUpdate(h_smsg, PKCS7_SIGNED_DER.as_ptr(), PKCS7_SIGNED_DER.len() as u32, TRUE),
+            TRUE
+        );
+        assert!(streamed.1, "pfnStreamOutput must receive fFinal=TRUE");
+        assert_eq!(streamed.0.as_slice(), b"Hello PKCS7 Signed World!");
+        assert_eq!(CryptMsgClose(h_smsg), TRUE);
+
+        let mut sinfo_fail = TestStreamInfo {
+            cb_content: 0xFFFF_FFFF,
+            pfn_stream_output: fail_stream_cb as *const () as usize,
+            pv_arg: std::ptr::null_mut(),
+        };
+        let h_fmsg = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            &mut sinfo_fail as *mut _ as *mut c_void,
+        );
+        assert!(!h_fmsg.is_null());
+        assert_eq!(
+            CryptMsgUpdate(h_fmsg, PKCS7_SIGNED_DER.as_ptr(), PKCS7_SIGNED_DER.len() as u32, TRUE),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0020);
+        assert_eq!(CryptMsgClose(h_fmsg), TRUE);
+
         // 4. CryptVerifyMessageSignature (valid + tampered rejection)
         #[repr(C)]
         struct VerifyPara {

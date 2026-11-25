@@ -536,6 +536,7 @@ pub(super) fn verify_cms_signer_signature(
 struct DecodingMsg {
     flags: u32,
     expected_msg_type: u32,
+    stream_output: Option<(usize, usize)>,
     buf: Vec<u8>,
     detached_data: Vec<u8>,
     header_done: bool,
@@ -550,15 +551,29 @@ pub(super) unsafe fn crypt_msg_open_to_decode_impl(
     dw_msg_type: u32,
     _h_crypt_prov: usize,
     _p_recipient_info: *mut c_void,
-    _p_stream_info: *mut c_void,
+    p_stream_info: *mut c_void,
 ) -> *mut c_void {
     if (dw_msg_encoding_type & (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING)) == 0 {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
+    let stream_output = if !p_stream_info.is_null() {
+        // CMSG_STREAM_INFO (Win64): cbContent @ +0x00, pfnStreamOutput @ +0x08, pvArg @ +0x10
+        let p = p_stream_info as *const u8;
+        let pfn = std::ptr::read_unaligned(p.add(0x08) as *const usize);
+        let pv_arg = std::ptr::read_unaligned(p.add(0x10) as *const usize);
+        if pfn == 0 {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+        Some((pfn, pv_arg))
+    } else {
+        None
+    };
     let id = DECODE_MSGS.insert(DecodingMsg {
         flags: dw_flags,
         expected_msg_type: dw_msg_type,
+        stream_output,
         buf: Vec::new(),
         detached_data: Vec::new(),
         header_done: false,
@@ -590,8 +605,10 @@ pub(super) unsafe fn crypt_msg_update_impl(
                     p.content = m.detached_data.clone();
                     p.bare_content = m.detached_data.clone();
                 }
+                let deliver = m.stream_output.map(|cb| (cb, m.detached_data.clone()));
+                return Ok(deliver);
             }
-            return Ok(());
+            return Ok(None);
         }
         m.buf.extend_from_slice(chunk);
         if f_final != 0 {
@@ -601,13 +618,37 @@ pub(super) unsafe fn crypt_msg_update_impl(
             if m.expected_msg_type != 0 && parsed.msg_type != m.expected_msg_type {
                 return Err(CRYPT_E_INVALID_MSG_TYPE);
             }
+            let deliver = if (m.flags & CMSG_DETACHED_FLAG) == 0 {
+                m.stream_output.map(|cb| (cb, parsed.content.clone()))
+            } else {
+                None
+            };
             m.parsed = Some(parsed);
             m.header_done = true;
+            return Ok(deliver);
         }
-        Ok(())
+        Ok(None)
     });
     match res {
-        Some(Ok(())) => TRUE,
+        Some(Ok(Some(((pfn, pv_arg), content)))) => {
+            let ok = crate::call_guest8(
+                pfn,
+                pv_arg as u64,
+                content.as_ptr() as u64,
+                content.len() as u64,
+                TRUE as u64,
+                0,
+                0,
+                0,
+                0,
+            ) as i32;
+            if ok == FALSE {
+                FALSE
+            } else {
+                TRUE
+            }
+        }
+        Some(Ok(None)) => TRUE,
         Some(Err(code)) => {
             crate::teb::set_last_error(code);
             FALSE

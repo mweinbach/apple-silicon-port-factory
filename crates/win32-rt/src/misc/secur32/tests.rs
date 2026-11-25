@@ -375,6 +375,29 @@ fn schannel_full_tls13_handshake_alpn_data_cert_chain_spki_and_shutdown() {
             b"h2"
         );
 
+        // Verify RFC 9190 §2.3 EAP-TLS 1.3 key derivation matches peer rustls exporter byte-for-byte
+        let mut eap13 = super::schannel::SecPkgContextEapKeyBlock {
+            rgb_keys: [0; 128],
+            rgb_ivs: [0xFF; 64],
+        };
+        assert_eq!(
+            QueryContextAttributesA(
+                &mut ctx as *mut SecHandle as *mut c_void,
+                super::schannel::SECPKG_ATTR_EAP_KEY_BLOCK,
+                &mut eap13 as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        let mut expected_eap13 = [0u8; 128];
+        srv.export_keying_material(
+            &mut expected_eap13,
+            b"EXPORTER_EAP_TLS_Key_Material",
+            Some(&[0x0Du8]),
+        )
+        .unwrap();
+        assert_eq!(eap13.rgb_keys, expected_eap13);
+        assert_eq!(eap13.rgb_ivs, [0u8; 64]);
+
         // Peer cert context + CertGetCertificateChain + CertVerifyCertificateChainPolicy + CryptEncodeObjectEx(SPKI)
         let mut cert_ptr: *mut c_void = std::ptr::null_mut();
         assert_eq!(
@@ -949,6 +972,26 @@ fn sch_credentials_v5_tls12_and_custom_chain_engine_exclusive_root() {
             assert_eq!(st, SEC_I_CONTINUE_NEEDED);
         }
         assert!(done, "TLS 1.2 handshake did not complete");
+
+        // Verify RFC 5216 §2.3 EAP-TLS 1.2 key derivation matches peer rustls exporter (128B keys + 64B IVs)
+        let mut eap12 = super::schannel::SecPkgContextEapKeyBlock {
+            rgb_keys: [0; 128],
+            rgb_ivs: [0; 64],
+        };
+        assert_eq!(
+            QueryContextAttributesW(
+                &mut ctx as *mut _ as *mut c_void,
+                super::schannel::SECPKG_ATTR_EAP_KEY_BLOCK,
+                &mut eap12 as *mut _ as *mut c_void,
+            ),
+            SEC_E_OK
+        );
+        let mut expected_eap12 = [0u8; 192];
+        srv.export_keying_material(&mut expected_eap12, b"client EAP encryption", None)
+            .unwrap();
+        assert_eq!(eap12.rgb_keys, expected_eap12[..128]);
+        assert_eq!(eap12.rgb_ivs, expected_eap12[128..192]);
+        assert_ne!(eap12.rgb_ivs, [0u8; 64]);
 
         let mut cinfo = std::mem::zeroed::<SecPkgContextConnectionInfo>();
         assert_eq!(
@@ -1809,7 +1852,8 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(QueryContextAttributesA(&mut cli_ctx as *mut _ as *mut c_void, SECPKG_ATTR_EAP_KEY_BLOCK, &mut eap_c as *mut _ as *mut c_void), SEC_E_OK);
         assert_eq!(QueryContextAttributesA(&mut srv_ctx as *mut _ as *mut c_void, SECPKG_ATTR_EAP_KEY_BLOCK, &mut eap_s as *mut _ as *mut c_void), SEC_E_OK);
         assert_eq!(eap_c.rgb_keys, eap_s.rgb_keys);
-        assert_eq!(eap_c.rgb_ivs, eap_s.rgb_ivs);
+        assert_eq!(eap_c.rgb_ivs, [0u8; 64], "RFC 9190 §2.3 TLS 1.3 EAP-TLS derives 128B Key_Material with zero IV block");
+        assert_eq!(eap_s.rgb_ivs, [0u8; 64]);
         assert_ne!(eap_c.rgb_keys, [0u8; 128]);
 
         // Local cert context on server, SDK-defined 0x5F (SECPKG_ATTR_REMOTE_CERTIFICATES),

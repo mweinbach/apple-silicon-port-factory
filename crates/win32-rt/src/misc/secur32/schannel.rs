@@ -2571,21 +2571,41 @@ pub(super) unsafe fn query_context_attributes_impl(
                 SEC_E_OK
             }
             SECPKG_ATTR_EAP_KEY_BLOCK => {
-                // RFC 5216 / RFC 5705 TLS exporter for EAP-TLS keying material (128B keys + 64B IVs).
-                let mut mat = [0u8; 192];
-                if ctx
-                    .conn
-                    .export_keying_material(&mut mat, b"client EAP encryption", None)
-                    .is_err()
-                {
-                    return SEC_E_INVALID_HANDLE;
-                }
                 let mut kb = SecPkgContextEapKeyBlock {
                     rgb_keys: [0u8; 128],
                     rgb_ivs: [0u8; 64],
                 };
-                kb.rgb_keys.copy_from_slice(&mat[..128]);
-                kb.rgb_ivs.copy_from_slice(&mat[128..192]);
+                match ctx.conn.protocol_version() {
+                    Some(ProtocolVersion::TLSv1_3) => {
+                        // RFC 9190 §2.3 (EAP-TLS 1.3):
+                        // Key_Material = TLS-Exporter("EXPORTER_EAP_TLS_Key_Material", 0x0D, 128)
+                        if ctx
+                            .conn
+                            .export_keying_material(
+                                &mut kb.rgb_keys,
+                                b"EXPORTER_EAP_TLS_Key_Material",
+                                Some(&[0x0Du8]),
+                            )
+                            .is_err()
+                        {
+                            return SEC_E_INVALID_HANDLE;
+                        }
+                    }
+                    Some(ProtocolVersion::TLSv1_2) => {
+                        // RFC 5216 §2.3 / RFC 5705 (EAP-TLS 1.2): 128B keys + 64B IVs
+                        let mut mat = [0u8; 192];
+                        if ctx
+                            .conn
+                            .export_keying_material(&mut mat, b"client EAP encryption", None)
+                            .is_err()
+                        {
+                            return SEC_E_INVALID_HANDLE;
+                        }
+                        kb.rgb_keys.copy_from_slice(&mat[..128]);
+                        kb.rgb_ivs.copy_from_slice(&mat[128..192]);
+                    }
+                    _ => return SEC_E_INVALID_HANDLE,
+                }
                 unsafe {
                     std::ptr::write_unaligned(p_buffer as *mut SecPkgContextEapKeyBlock, kb);
                 }
