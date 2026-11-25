@@ -3120,7 +3120,6 @@ const CRYPT_MODE_ECB: u32 = 2;
 const CRYPT_MODE_CFB: u32 = 4;
 
 const PKCS5_PADDING: u32 = 1;
-const ZERO_PADDING: u32 = 3;
 
 const CRYPT_ENCRYPT: u32 = 0x0000_0001;
 const CRYPT_DECRYPT: u32 = 0x0000_0002;
@@ -4502,7 +4501,8 @@ pub unsafe extern "win64" fn CryptSetKeyParam(
         }
         KP_PADDING => {
             let p = std::ptr::read_unaligned(pb_data as *const u32);
-            if p != PKCS5_PADDING && p != ZERO_PADDING {
+            // Microsoft Learn (CryptSetKeyParam): Microsoft-supplied CSPs only support PKCS5_PADDING.
+            if p != PKCS5_PADDING {
                 return err(NTE_BAD_DATA, FALSE);
             }
             *padding = p;
@@ -7093,11 +7093,16 @@ mod tests {
             assert_eq!(crate::teb::last_error(), NTE_NO_KEY);
             assert_eq!(CryptReleaseContext(h_empty_prov, 0), TRUE);
 
-            // Default CAPI KP_MODE_BITS must be 8 bits (1 byte for CFB8)
+            // Default CAPI KP_MODE_BITS must be 8 bits (1 byte for CFB8), and ZERO_PADDING (3) is rejected
             let mut mode_bits = 0u32;
             let mut mb_len = 4u32;
             assert_eq!(CryptGetKeyParam(h_aes_unwrapped, KP_MODE_BITS, &mut mode_bits as *mut u32 as *mut u8, &mut mb_len, 0), TRUE);
             assert_eq!(mode_bits, 8);
+            let zero_pad = 3u32;
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_PADDING, &zero_pad as *const u32 as *const u8, 0), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_DATA);
+            let pkcs5_pad = PKCS5_PADDING;
+            assert_eq!(CryptSetKeyParam(h_aes_unwrapped, KP_PADDING, &pkcs5_pad as *const u32 as *const u8, 0), TRUE);
 
             // SIMPLEBLOB whose unwrapped session key has invalid length (0 bytes for RC2) must be rejected with NTE_BAD_DATA
             let mut empty_ct = vec![0u8; 256];
