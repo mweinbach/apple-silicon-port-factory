@@ -159,6 +159,29 @@ pub unsafe extern "win64" fn InitializeSecurityContextW(
     )
 }
 
+pub unsafe extern "win64" fn AcceptSecurityContext(
+    ph_credential: *mut c_void,
+    ph_context: *mut c_void,
+    p_input: *mut c_void,
+    f_context_req: u32,
+    _target_data_rep: u32,
+    ph_new_context: *mut c_void,
+    p_output: *mut c_void,
+    pf_context_attr: *mut u32,
+    pts_expiry: *mut i64,
+) -> i32 {
+    schannel::accept_security_context_impl(
+        ph_credential as *mut SecHandle,
+        ph_context as *mut SecHandle,
+        p_input as *mut SecBufferDesc,
+        f_context_req,
+        ph_new_context as *mut SecHandle,
+        p_output as *mut SecBufferDesc,
+        pf_context_attr,
+        pts_expiry,
+    )
+}
+
 pub unsafe extern "win64" fn CompleteAuthToken(
     ph_context: *mut c_void,
     _p_token: *mut c_void,
@@ -292,6 +315,7 @@ unsafe fn build_table(wide: bool) -> *mut c_void {
         QuerySecurityPackageInfoA as *const () as usize
     };
     let free_cred = FreeCredentialsHandle as *const () as usize;
+    let accept_ctx = AcceptSecurityContext as *const () as usize;
     let complete = CompleteAuthToken as *const () as usize;
     let del_ctx = DeleteSecurityContext as *const () as usize;
     let apply_ctl = ApplyControlToken as *const () as usize;
@@ -300,8 +324,8 @@ unsafe fn build_table(wide: bool) -> *mut c_void {
     let dec = DecryptMessage as *const () as usize;
 
     for f in [
-        unsup, query_cred, acq, init_ctx, query_ctx, query_pkg, free_cred, complete, del_ctx,
-        apply_ctl, free_buf, enc, dec,
+        unsup, query_cred, acq, init_ctx, accept_ctx, query_ctx, query_pkg, free_cred, complete,
+        del_ctx, apply_ctl, free_buf, enc, dec,
     ] {
         crate::register_native_va(f as u64, f);
     }
@@ -312,6 +336,7 @@ unsafe fn build_table(wide: bool) -> *mut c_void {
     slots[3] = free_cred; // FreeCredentialsHandle
     slots[4] = 0; // Reserved2
     slots[5] = init_ctx; // InitializeSecurityContext
+    slots[6] = accept_ctx; // AcceptSecurityContext
     slots[7] = complete; // CompleteAuthToken
     slots[8] = del_ctx; // DeleteSecurityContext
     slots[9] = apply_ctl; // ApplyControlToken
