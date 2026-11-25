@@ -226,17 +226,81 @@ impl VmState {
             self.segs.remove(&k);
         }
     }
+    /// Returns `true` if any 4 KiB subpage in `[hp, hp + HOST_PAGE)` is `MEM_COMMIT`.
+    fn has_committed_subpage(&self, hp: usize) -> bool {
+        let mut sub = hp;
+        while sub < hp + HOST_PAGE {
+            if let Some((&_s, seg)) = self.segs.range(..=sub).next_back() {
+                if sub < seg.end && seg.state == MEM_COMMIT {
+                    return true;
+                }
+            }
+            sub += PAGE;
+        }
+        false
+    }
+    /// Clear write-watch / reset tracking for host pages in `[start, end)` that no longer
+    /// contain any committed 4 KiB subpage (so decommitting a single 4 KiB subpage never
+    /// discards tracking for surviving committed siblings in the same 16 KiB host page).
     fn clear_tracking_in(&mut self, start: usize, end: usize) {
         let hstart = start & !(HOST_PAGE - 1);
         let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-        let dirty: Vec<usize> = self.write_watch_dirty.range(hstart..hend).copied().collect();
+        let dirty: Vec<usize> = self
+            .write_watch_dirty
+            .range(hstart..hend)
+            .copied()
+            .filter(|&hp| !self.has_committed_subpage(hp))
+            .collect();
         for hp in dirty {
             self.write_watch_dirty.remove(&hp);
         }
-        let res: Vec<usize> = self.reset_resident.range(hstart..hend).copied().collect();
+        let res: Vec<usize> = self
+            .reset_resident
+            .range(hstart..hend)
+            .copied()
+            .filter(|&hp| !self.has_committed_subpage(hp))
+            .collect();
         for hp in res {
             self.reset_resident.remove(&hp);
         }
+    }
+    /// Recompute and apply host page protection for `hp` from its surviving committed
+    /// 4 KiB subpages: keeps `PROT_NONE` when no subpages are committed or any sibling
+    /// is `PAGE_GUARD`/`PAGE_NOACCESS`, and strips `PROT_WRITE` when a clean
+    /// `MEM_WRITE_WATCH` writable subpage needs write trapping armed.
+    unsafe fn restore_host_page_prot(&self, hp: usize) {
+        if self.has_protected_subpage(hp, None) {
+            let _ = host_mprotect(hp, HOST_PAGE, libc::PROT_NONE);
+            return;
+        }
+        let mut has_committed = false;
+        let mut host_prot = 0i32;
+        let mut arm_write_watch = false;
+        let is_dirty = self.write_watch_dirty.contains(&hp);
+        let mut sub = hp;
+        while sub < hp + HOST_PAGE {
+            if let Some((&_s, seg)) = self.segs.range(..=sub).next_back() {
+                if sub < seg.end && seg.state == MEM_COMMIT {
+                    has_committed = true;
+                    host_prot |= win_prot_to_host(seg.prot);
+                    if !is_dirty
+                        && is_writable_prot(seg.prot)
+                        && self.alloc_containing(sub).is_some_and(|(_, a)| a.write_watch)
+                    {
+                        arm_write_watch = true;
+                    }
+                }
+            }
+            sub += PAGE;
+        }
+        let final_prot = if !has_committed {
+            libc::PROT_NONE
+        } else if arm_write_watch {
+            host_prot & !libc::PROT_WRITE
+        } else {
+            host_prot
+        };
+        let _ = host_mprotect(hp, HOST_PAGE, final_prot);
     }
     /// Returns `true` if any committed 4 KiB subpage in the enclosing `HOST_PAGE`
     /// outside `exclude_range` (if given) has `PAGE_NOACCESS` or `PAGE_GUARD`.
@@ -835,6 +899,8 @@ pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32>
         };
         let start = addr & !(PAGE - 1);
         let end = if size == 0 { b + a.size } else { (addr + size + PAGE - 1) & !(PAGE - 1) };
+        let mut touched_partial_hpages = [0usize; 2];
+        let mut touched_partial_count = 0usize;
         if end > start {
             // Always release every complete 16 KiB host page inside [start, end) via
             // `mmap(PROT_NONE, MAP_FIXED)` so physical RAM is returned immediately to
@@ -857,19 +923,35 @@ pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32>
                 if start < inner_start {
                     let _ = host_mprotect(start, inner_start - start, libc::PROT_READ | libc::PROT_WRITE);
                     std::ptr::write_bytes(start as *mut u8, 0, inner_start - start);
+                    touched_partial_hpages[touched_partial_count] = start & !(HOST_PAGE - 1);
+                    touched_partial_count += 1;
                 }
                 if inner_end < end {
                     let _ = host_mprotect(inner_end, end - inner_end, libc::PROT_READ | libc::PROT_WRITE);
                     std::ptr::write_bytes(inner_end as *mut u8, 0, end - inner_end);
+                    touched_partial_hpages[touched_partial_count] = inner_end & !(HOST_PAGE - 1);
+                    touched_partial_count += 1;
                 }
             } else {
                 // Entire range lies inside one or two partial 16 KiB host pages.
                 let _ = host_mprotect(start, end - start, libc::PROT_READ | libc::PROT_WRITE);
                 std::ptr::write_bytes(start as *mut u8, 0, end - start);
+                let h0 = start & !(HOST_PAGE - 1);
+                let h1 = (end - 1) & !(HOST_PAGE - 1);
+                touched_partial_hpages[touched_partial_count] = h0;
+                touched_partial_count += 1;
+                if h1 != h0 {
+                    touched_partial_hpages[touched_partial_count] = h1;
+                    touched_partial_count += 1;
+                }
             }
         }
         vm.set_range(start, end, MEM_RESERVE, 0);
         vm.clear_tracking_in(start, end);
+        for &hp in &touched_partial_hpages[..touched_partial_count] {
+            vm.restore_host_page_prot(hp);
+            note_hpage_prot_change(hp, hp + HOST_PAGE);
+        }
         return Ok(());
     }
     Err(err::ERROR_INVALID_PARAMETER)
@@ -1928,6 +2010,85 @@ mod tests {
                 // Clear sibling guard and verify normal reset.
                 assert_eq!(VirtualProtect((p0 + PAGE) as *mut c_void, PAGE, PAGE_READWRITE, &mut old), TRUE);
                 assert_eq!(ResetWriteWatch(base, region_sz), 0);
+            }
+
+            // On 16 KiB host pages, decommitting a single 4 KiB subpage must preserve
+            // write-watch trapping on clean surviving siblings and preserve dirty state on
+            // already-written surviving siblings until all subpages are decommitted or reset.
+            if HOST_PAGE > PAGE {
+                #[cfg(target_vendor = "apple")]
+                unsafe fn query_host_vm_prot(addr: usize) -> i32 {
+                    const VM_REGION_BASIC_INFO_64: i32 = 9;
+                    const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+                    extern "C" {
+                        fn mach_task_self() -> u32;
+                        fn mach_vm_region(
+                            target_task: u32,
+                            address: *mut u64,
+                            size: *mut u64,
+                            flavor: i32,
+                            info: *mut i32,
+                            info_cnt: *mut u32,
+                            object_name: *mut u32,
+                        ) -> i32;
+                    }
+                    let mut query_addr = addr as u64;
+                    let mut query_size = 0u64;
+                    let mut info = [0i32; 9];
+                    let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+                    let mut obj = 0u32;
+                    let kr = mach_vm_region(
+                        mach_task_self(),
+                        &mut query_addr,
+                        &mut query_size,
+                        VM_REGION_BASIC_INFO_64,
+                        info.as_mut_ptr(),
+                        &mut count,
+                        &mut obj,
+                    );
+                    assert_eq!(kr, 0, "mach_vm_region failed: {kr}");
+                    assert!(query_addr <= addr as u64 && (addr as u64) < query_addr + query_size);
+                    info[0]
+                }
+
+                // 1. Clean host page: decommit subpage 0 -> host page must rearm read-only (no VM_PROT_WRITE).
+                let p2 = (base as usize) + HOST_PAGE * 2;
+                assert_eq!(VirtualFree(p2 as *mut c_void, PAGE, MEM_DECOMMIT), TRUE);
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(
+                    query_host_vm_prot(p2) & libc::PROT_WRITE,
+                    0,
+                    "clean write-watch host page must keep PROT_WRITE stripped after sibling subpage decommit"
+                );
+                // Subsequent write fault on surviving sibling subpage 1 is still tracked.
+                assert!(try_handle_write_watch_fault(p2 + PAGE + 8, true));
+                *((p2 + PAGE) as *mut u32) = 0x1357_2468;
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 1);
+                assert_eq!(addrs[0] as usize, p2);
+
+                // 2. Dirty host page: decommit sibling subpage 2 -> dirty record for surviving subpage 1 stays intact.
+                assert_eq!(VirtualFree((p2 + PAGE * 2) as *mut c_void, PAGE, MEM_DECOMMIT), TRUE);
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 1);
+                assert_eq!(addrs[0] as usize, p2);
+
+                // ResetWriteWatch clears dirty state and rearms write trapping on the remaining committed subpages.
+                assert_eq!(ResetWriteWatch(base, region_sz), 0);
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(query_host_vm_prot(p2) & libc::PROT_WRITE, 0);
+
+                // 3. Decommit remaining committed subpages -> host page drops to PROT_NONE and tracking clears.
+                assert!(try_handle_write_watch_fault(p2 + PAGE + 16, true));
+                assert_eq!(VirtualFree((p2 + PAGE) as *mut c_void, PAGE, MEM_DECOMMIT), TRUE);
+                assert_eq!(VirtualFree((p2 + PAGE * 3) as *mut c_void, PAGE, MEM_DECOMMIT), TRUE);
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 0);
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(query_host_vm_prot(p2), 0);
             }
 
             // Non-write-watch region rejected with u32::MAX / ERROR_INVALID_PARAMETER.

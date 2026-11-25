@@ -260,10 +260,9 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, 32);
-            let now = now_filetime();
-            let up = crate::kernel32::time::interrupt_time_100ns();
+            let created = crate::kernel32::time::process_start_filetime();
             let (kernel, user) = rusage_process_times_100ns();
-            std::ptr::write_unaligned(out as *mut u64, now.saturating_sub(up)); // CreationTime
+            std::ptr::write_unaligned(out as *mut u64, created); // CreationTime
             std::ptr::write_unaligned(out.add(16) as *mut u64, kernel); // KernelTime
             std::ptr::write_unaligned(out.add(24) as *mut u64, user); // UserTime
             STATUS_SUCCESS
@@ -3521,6 +3520,28 @@ mod tests {
             let mut ret = 0u32;
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 3, buf.as_mut_ptr(), 104, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 104);
+            // ProcessTimes (4) reports the process creation timestamp matching GetProcessTimes, not boot time.
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 4, buf.as_mut_ptr(), 32, &mut ret), STATUS_SUCCESS);
+            assert_eq!(ret, 32);
+            let nt_creation = std::ptr::read_unaligned(buf.as_ptr() as *const u64);
+            let (mut ft_create, mut ft_exit, mut ft_kernel, mut ft_user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            assert_eq!(
+                crate::kernel32::time::GetProcessTimes(
+                    crate::handles::CURRENT_PROCESS,
+                    &mut ft_create,
+                    &mut ft_exit,
+                    &mut ft_kernel,
+                    &mut ft_user,
+                ),
+                TRUE
+            );
+            assert_eq!(nt_creation, ft_create.to_u64());
+            assert_eq!(nt_creation, crate::kernel32::time::process_start_filetime());
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x12, buf.as_mut_ptr(), 2, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 2);
             assert_eq!(buf[0], 1);
