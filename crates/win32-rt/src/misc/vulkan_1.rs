@@ -4487,8 +4487,20 @@ fn intercepted_instance_or_device_proc(name: &str) -> Option<*const ()> {
 
 // ---------------------------------------------------------------------------
 // NVIDIA Low Latency Vulkan (`nvlowlatencyvk.dll` routed here)
-// Honest NVLL_VK_NO_IMPLEMENTATION (-3) on non-NVIDIA Apple Silicon GPUs.
+// Native-unsupported (NVIDIA Reflex SDK `NvLowLatencyVk.h`): on non-NVIDIA GPUs
+// lacking the NVIDIA Reflex Vulkan driver / `VK_NV_low_latency`, every `NvLL_VK_*`
+// entry point returns `NVLL_VK_NO_IMPLEMENTATION` (-3).
 // ---------------------------------------------------------------------------
+
+pub unsafe extern "win64" fn NvLL_VK_Initialize() -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_Initialize: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_Unload() -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_Unload: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
 
 pub unsafe extern "win64" fn NvLL_VK_InitLowLatencyDevice(
     _vk_device: usize,
@@ -4497,21 +4509,60 @@ pub unsafe extern "win64" fn NvLL_VK_InitLowLatencyDevice(
     if !signal_sem.is_null() {
         std::ptr::write_unaligned(signal_sem, 0);
     }
-    crate::stub!("NvLL_VK_InitLowLatencyDevice -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    log::debug!(target: "vulkan", "NvLL_VK_InitLowLatencyDevice: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
     NVLL_VK_NO_IMPLEMENTATION
 }
 
-crate::failing!(i32 = NVLL_VK_NO_IMPLEMENTATION, err 0;
-    NvLL_VK_Initialize,
-    NvLL_VK_Unload,
-    NvLL_VK_DestroyLowLatencyDevice,
-    NvLL_VK_SetSleepMode,
-    NvLL_VK_Sleep,
-    NvLL_VK_GetSleepStatus,
-    NvLL_VK_SetLatencyMarker,
-    NvLL_VK_GetLatency,
-    NvLL_VK_NotifyOutOfBandQueue,
-);
+pub unsafe extern "win64" fn NvLL_VK_DestroyLowLatencyDevice(_vk_device: usize) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_DestroyLowLatencyDevice: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_SetSleepMode(
+    _vk_device: usize,
+    _sleep_params: *const c_void,
+) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_SetSleepMode: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_Sleep(_vk_device: usize, _signal_value: u64) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_Sleep: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_GetSleepStatus(
+    _vk_device: usize,
+    _sleep_status: *mut c_void,
+) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_GetSleepStatus: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_SetLatencyMarker(
+    _vk_device: usize,
+    _marker_params: *const c_void,
+) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_SetLatencyMarker: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_GetLatency(
+    _vk_device: usize,
+    _latency_results: *mut c_void,
+) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_GetLatency: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
+
+pub unsafe extern "win64" fn NvLL_VK_NotifyOutOfBandQueue(
+    _vk_device: usize,
+    _queue: usize,
+    _queue_type: u32,
+) -> i32 {
+    log::debug!(target: "vulkan", "NvLL_VK_NotifyOutOfBandQueue: non-NVIDIA GPU -> NVLL_VK_NO_IMPLEMENTATION (-3)");
+    NVLL_VK_NO_IMPLEMENTATION
+}
 
 #[cfg(test)]
 mod tests {
@@ -4965,14 +5016,40 @@ mod tests {
             );
             assert_eq!(null_ci_inst, 0);
 
-            // NVIDIA Reflex Vulkan is honestly reported as not implemented on Apple Silicon.
+            // NVIDIA Reflex Vulkan is native-unsupported on Apple Silicon: all 10
+            // NvLL_VK_* exports match NvLowLatencyVk.h on non-NVIDIA hardware (-3).
+            for sym in [
+                "NvLL_VK_Initialize",
+                "NvLL_VK_Unload",
+                "NvLL_VK_InitLowLatencyDevice",
+                "NvLL_VK_DestroyLowLatencyDevice",
+                "NvLL_VK_SetSleepMode",
+                "NvLL_VK_Sleep",
+                "NvLL_VK_GetSleepStatus",
+                "NvLL_VK_SetLatencyMarker",
+                "NvLL_VK_GetLatency",
+                "NvLL_VK_NotifyOutOfBandQueue",
+            ] {
+                assert!(
+                    crate::lookup("nvlowlatencyvk.dll", sym).is_some(),
+                    "missing nvlowlatencyvk.dll export: {sym}"
+                );
+            }
             assert_eq!(NvLL_VK_Initialize(), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_Unload(), NVLL_VK_NO_IMPLEMENTATION);
             let mut reflex_sem: u64 = 0x1234;
             assert_eq!(
                 NvLL_VK_InitLowLatencyDevice(1, &mut reflex_sem),
                 NVLL_VK_NO_IMPLEMENTATION
             );
             assert_eq!(reflex_sem, 0);
+            assert_eq!(NvLL_VK_DestroyLowLatencyDevice(1), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_SetSleepMode(1, std::ptr::null()), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_Sleep(1, 0), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_GetSleepStatus(1, std::ptr::null_mut()), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_SetLatencyMarker(1, std::ptr::null()), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_GetLatency(1, std::ptr::null_mut()), NVLL_VK_NO_IMPLEMENTATION);
+            assert_eq!(NvLL_VK_NotifyOutOfBandQueue(1, 0, 0), NVLL_VK_NO_IMPLEMENTATION);
 
             let ext_ptrs = [
                 c"VK_KHR_surface".as_ptr(),

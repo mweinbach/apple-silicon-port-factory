@@ -87,12 +87,18 @@ pub extern "win64" fn DStorageCreateCompressionCodec(
     unsafe {
         wr(ppv, 0);
     }
+    // Microsoft DirectStorage 1.0 - 1.2 (`dstorage.h`, Microsoft Learn
+    // `DStorageCreateCompressionCodec`) defines only one built-in compression
+    // codec: `DSTORAGE_COMPRESSION_FORMAT_GDEFLATE` (1). `NONE` (0) is rejected
+    // with `E_INVALIDARG`; custom formats (`>= 0x80`, handled by the app via
+    // `IDStorageCustomDecompressionQueue`) and reserved IDs (`2..=0x7F`) have
+    // no built-in codec and return `E_NOTIMPL`.
     match format {
         DSTORAGE_COMPRESSION_FORMAT_GDEFLATE => {}
         DSTORAGE_COMPRESSION_FORMAT_NONE => return abi::E_INVALIDARG,
         _ => {
-            crate::stub!(
-                "DStorageCreateCompressionCodec: unsupported format {format:#x} -> E_NOTIMPL"
+            log::debug!(
+                "DStorageCreateCompressionCodec: no built-in codec for format {format:#x} -> E_NOTIMPL"
             );
             return abi::E_NOTIMPL;
         }

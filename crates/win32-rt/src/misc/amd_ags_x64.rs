@@ -381,7 +381,10 @@ pub extern "win64" fn agsDriverExtensionsDX12_PushMarker(
     }
     let list_ptr = cmd_list as *mut c_void;
     if unsafe { crate::d3d12::cmdlist::from_ptr(list_ptr) }.is_none() {
-        crate::stub!("agsDriverExtensionsDX12_PushMarker: unsupported command list {cmd_list:#x}");
+        // Native-unsupported (AMD GPUOpen AGS SDK `amd_ags.h`): on non-AMD GPUs
+        // `agsDriverExtensionsDX12_CreateDevice` reports `extensionsSupported = 0`,
+        // and marker calls without an AMD driver extension return `AGS_EXTENSION_NOT_SUPPORTED` (7).
+        log::debug!("agsDriverExtensionsDX12_PushMarker: non-AMD/foreign command list {cmd_list:#x} -> AGS_EXTENSION_NOT_SUPPORTED");
         return AGS_EXTENSION_NOT_SUPPORTED;
     }
     unsafe {
@@ -403,7 +406,9 @@ pub extern "win64" fn agsDriverExtensionsDX12_PopMarker(
     }
     let list_ptr = cmd_list as *mut c_void;
     if unsafe { crate::d3d12::cmdlist::from_ptr(list_ptr) }.is_none() {
-        crate::stub!("agsDriverExtensionsDX12_PopMarker: unsupported command list {cmd_list:#x}");
+        // Native-unsupported (AMD GPUOpen AGS SDK `amd_ags.h`): returns
+        // `AGS_EXTENSION_NOT_SUPPORTED` (7) when AMD driver extensions are absent.
+        log::debug!("agsDriverExtensionsDX12_PopMarker: non-AMD/foreign command list {cmd_list:#x} -> AGS_EXTENSION_NOT_SUPPORTED");
         return AGS_EXTENSION_NOT_SUPPORTED;
     }
     unsafe {
@@ -425,7 +430,9 @@ pub extern "win64" fn agsDriverExtensionsDX12_SetMarker(
     }
     let list_ptr = cmd_list as *mut c_void;
     if unsafe { crate::d3d12::cmdlist::from_ptr(list_ptr) }.is_none() {
-        crate::stub!("agsDriverExtensionsDX12_SetMarker: unsupported command list {cmd_list:#x}");
+        // Native-unsupported (AMD GPUOpen AGS SDK `amd_ags.h`): returns
+        // `AGS_EXTENSION_NOT_SUPPORTED` (7) when AMD driver extensions are absent.
+        log::debug!("agsDriverExtensionsDX12_SetMarker: non-AMD/foreign command list {cmd_list:#x} -> AGS_EXTENSION_NOT_SUPPORTED");
         return AGS_EXTENSION_NOT_SUPPORTED;
     }
     unsafe {
@@ -571,6 +578,21 @@ mod tests {
         assert_eq!(
             agsDriverExtensionsDX12_SetMarker(0, 0, b"pt\0".as_ptr()),
             AGS_INVALID_ARGS
+        );
+        // Foreign / non-AMD command list returns AGS_EXTENSION_NOT_SUPPORTED (7).
+        let mut fake_list = 0usize;
+        let fake_ptr = &mut fake_list as *mut usize as usize;
+        assert_eq!(
+            agsDriverExtensionsDX12_PushMarker(0, fake_ptr, b"pass\0".as_ptr()),
+            AGS_EXTENSION_NOT_SUPPORTED
+        );
+        assert_eq!(
+            agsDriverExtensionsDX12_PopMarker(0, fake_ptr),
+            AGS_EXTENSION_NOT_SUPPORTED
+        );
+        assert_eq!(
+            agsDriverExtensionsDX12_SetMarker(0, fake_ptr, b"pt\0".as_ptr()),
+            AGS_EXTENSION_NOT_SUPPORTED
         );
 
         if crate::d3d12::mtl::device().is_none() {

@@ -85,25 +85,43 @@ impl CommandList {
             .output
             .texture_view(d_fmt, MTLTextureType::Type2D, (0, 1), (0, 1))
             .ok_or("upscale_temporal: output view")?;
+        let st_w = st.width() as u32;
+        let st_h = st.height() as u32;
+        let dt_w = dt.width() as u32;
+        let dt_h = dt.height() as u32;
+        if params.color_origin[0] >= st_w
+            || params.color_origin[1] >= st_h
+            || params.output_origin[0] >= dt_w
+            || params.output_origin[1] >= dt_h
+        {
+            return Err(format!(
+                "upscale_temporal: subrect origin out of bounds (color_origin={:?} in {}x{}, output_origin={:?} in {}x{})",
+                params.color_origin, st_w, st_h, params.output_origin, dt_w, dt_h
+            ));
+        }
+        let avail_src_w = st_w - params.color_origin[0];
+        let avail_src_h = st_h - params.color_origin[1];
+        let avail_dst_w = dt_w - params.output_origin[0];
+        let avail_dst_h = dt_h - params.output_origin[1];
         let x0 = if params.render_size[0] > 0 {
-            params.render_size[0].min(st.width() as u32)
+            params.render_size[0].min(avail_src_w)
         } else {
-            st.width() as u32
+            avail_src_w
         };
         let y0 = if params.render_size[1] > 0 {
-            params.render_size[1].min(st.height() as u32)
+            params.render_size[1].min(avail_src_h)
         } else {
-            st.height() as u32
+            avail_src_h
         };
         let w = if params.upscale_size[0] > 0 {
-            params.upscale_size[0].min(dt.width() as u32)
+            params.upscale_size[0].min(avail_dst_w)
         } else {
-            dt.width() as u32
+            avail_dst_w
         };
         let h = if params.upscale_size[1] > 0 {
-            params.upscale_size[1].min(dt.height() as u32)
+            params.upscale_size[1].min(avail_dst_h)
         } else {
-            dt.height() as u32
+            avail_dst_h
         };
         if w == 0 || h == 0 {
             return Ok(UpscaleBackend::BilinearCompute);
@@ -205,15 +223,36 @@ impl CommandList {
         }
 
         let fallback_touch = [touch[0], touch[1]];
+        let src_origin = params.color_origin;
+        let dst_origin = params.output_origin;
         if x0 == w && y0 == h {
-            if touch[0] == touch[1] && s_fmt == d_fmt {
+            if touch[0] == touch[1] && s_fmt == d_fmt && src_origin == dst_origin {
                 return Ok(UpscaleBackend::BilinearCompute);
             }
             if s_fmt == d_fmt {
-                self.copy_upscale_1to1(&sv, &dv, w, h, &fallback_touch, tight_stages)?;
+                self.copy_upscale_1to1(
+                    &sv,
+                    &dv,
+                    src_origin,
+                    dst_origin,
+                    w,
+                    h,
+                    &fallback_touch,
+                    tight_stages,
+                )?;
                 return Ok(UpscaleBackend::BilinearCompute);
             }
-            let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
+            let p = TexParams {
+                u: [src_origin[0], src_origin[1], dst_origin[0], dst_origin[1]],
+                f: [0.0; 4],
+                x0,
+                y0,
+                z0: 0,
+                w,
+                h,
+                d: 1,
+                _pad: [0; 2],
+            };
             self.util_dispatch_with(
                 "port_upscale_2d_f",
                 Some(&sv),
@@ -228,6 +267,8 @@ impl CommandList {
         if self.try_upscale_metalfx(
             &sv,
             &dv,
+            src_origin,
+            dst_origin,
             x0,
             y0,
             w,
@@ -239,7 +280,17 @@ impl CommandList {
         )? {
             return Ok(UpscaleBackend::SpatialMetalFx);
         }
-        let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
+        let p = TexParams {
+            u: [src_origin[0], src_origin[1], dst_origin[0], dst_origin[1]],
+            f: [0.0; 4],
+            x0,
+            y0,
+            z0: 0,
+            w,
+            h,
+            d: 1,
+            _pad: [0; 2],
+        };
         self.util_dispatch_with(
             "port_upscale_2d_f",
             Some(&sv),
@@ -252,6 +303,73 @@ impl CommandList {
         Ok(UpscaleBackend::BilinearCompute)
     }
 
+    /// Blit a `[origin.x .. origin.x + w, origin.y .. origin.y + h]` subrect
+    /// from `src` into a dedicated MetalFX staging texture (`slot`) at `(0, 0)`.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_subrect_to_scratch(
+        &mut self,
+        src: &MtlTexture,
+        origin: [u32; 2],
+        w: u32,
+        h: u32,
+        slot: u8,
+        fmt: MTLPixelFormat,
+        usage: MTLTextureUsage,
+        touch: &[usize],
+        tight_stages: bool,
+    ) -> Result<Option<Retained<MtlTexture>>, String> {
+        let sw = src.width() as u32;
+        let sh = src.height() as u32;
+        if w == 0 || h == 0 || origin[0].saturating_add(w) > sw || origin[1].saturating_add(h) > sh
+        {
+            return Ok(None);
+        }
+        let Some(dst) =
+            crate::metal::metalfx::scratch_texture_slot(slot, w, h, fmt, usage)
+        else {
+            return Ok(None);
+        };
+        let masked = tight_stages && !legacy_barriers() && barrier_masks();
+        let ib_tight = self.ib_tight_active();
+        if masked {
+            self.add_pend(UTIL_STAGES, MTLStages::Blit);
+            if ib_tight {
+                for &r in touch {
+                    self.ib_note_touch_before_tight(r, MTLStages::Blit);
+                }
+            } else {
+                for &r in touch {
+                    self.ib_note(r);
+                }
+            }
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+        let e = self
+            .compute_blit_touch(touch)
+            .ok_or("metalfx subrect input blit encoder")?;
+        unsafe {
+            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                src,
+                0,
+                0,
+                MTLOrigin { x: origin[0] as usize, y: origin[1] as usize, z: 0 },
+                MTLSize { width: w as usize, height: h as usize, depth: 1 },
+                &dst,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        self.note_stage_ran(MTLStages::Blit);
+        if masked {
+            self.add_pend(MTLStages::Blit, UTIL_STAGES);
+        } else {
+            self.need_full(FullWhy::ClearUav);
+        }
+        Ok(Some(dst))
+    }
+
     /// Shared post-encode scratch-blit and barrier epilogue for both temporal
     /// and spatial MetalFX passes.
     #[allow(clippy::too_many_arguments)]
@@ -259,6 +377,7 @@ impl CommandList {
         &mut self,
         scratch: Option<Retained<MtlTexture>>,
         dv: &MtlTexture,
+        dst_origin: [u32; 2],
         w: u32,
         h: u32,
         touch: &[usize],
@@ -280,7 +399,7 @@ impl CommandList {
                     dv,
                     0,
                     0,
-                    MTLOrigin { x: 0, y: 0, z: 0 },
+                    MTLOrigin { x: dst_origin[0] as usize, y: dst_origin[1] as usize, z: 0 },
                 );
             }
             self.note_stage_ran(MTLStages::Blit);
@@ -387,39 +506,66 @@ impl CommandList {
             None
         };
 
-        let in_w = sv.width() as u32;
-        let in_h = sv.height() as u32;
+        let has_input_subrect = params.color_origin != [0, 0]
+            || params.depth_origin != [0, 0]
+            || params.motion_origin != [0, 0]
+            || (reactive_v_and_fmt.is_some() && params.reactive_origin != [0, 0]);
+
+        let (in_w, in_h) = if has_input_subrect {
+            (x0, y0)
+        } else {
+            (sv.width() as u32, sv.height() as u32)
+        };
         let exp_mv_w = if params.output_resolution_motion_vectors { w } else { in_w };
         let exp_mv_h = if params.output_resolution_motion_vectors { h } else { in_h };
-        if depth_v.width() as u32 != in_w
-            || depth_v.height() as u32 != in_h
-            || motion_v.width() as u32 != exp_mv_w
-            || motion_v.height() as u32 != exp_mv_h
-        {
-            log::warn!(
-                target: "d3d",
-                "metalfx: temporal input size mismatch (color={}x{}, depth={}x{}, motion={}x{}, out_res_mv={})",
-                in_w,
-                in_h,
-                depth_v.width(),
-                depth_v.height(),
-                motion_v.width(),
-                motion_v.height(),
-                params.output_resolution_motion_vectors,
-            );
-            return Ok(false);
-        }
-        if let Some((rv, _)) = &reactive_v_and_fmt {
-            if rv.width() as u32 != in_w || rv.height() as u32 != in_h {
+        if has_input_subrect {
+            if params.color_origin[0].saturating_add(in_w) > sv.width() as u32
+                || params.color_origin[1].saturating_add(in_h) > sv.height() as u32
+                || params.depth_origin[0].saturating_add(in_w) > depth_v.width() as u32
+                || params.depth_origin[1].saturating_add(in_h) > depth_v.height() as u32
+                || params.motion_origin[0].saturating_add(exp_mv_w) > motion_v.width() as u32
+                || params.motion_origin[1].saturating_add(exp_mv_h) > motion_v.height() as u32
+            {
+                return Ok(false);
+            }
+            if let Some((rv, _)) = &reactive_v_and_fmt {
+                if params.reactive_origin[0].saturating_add(in_w) > rv.width() as u32
+                    || params.reactive_origin[1].saturating_add(in_h) > rv.height() as u32
+                {
+                    reactive_v_and_fmt = None;
+                }
+            }
+        } else {
+            if depth_v.width() as u32 != in_w
+                || depth_v.height() as u32 != in_h
+                || motion_v.width() as u32 != exp_mv_w
+                || motion_v.height() as u32 != exp_mv_h
+            {
                 log::warn!(
                     target: "d3d",
-                    "metalfx: ignoring temporal reactive mask size mismatch (color={}x{}, reactive={}x{})",
+                    "metalfx: temporal input size mismatch (color={}x{}, depth={}x{}, motion={}x{}, out_res_mv={})",
                     in_w,
                     in_h,
-                    rv.width(),
-                    rv.height(),
+                    depth_v.width(),
+                    depth_v.height(),
+                    motion_v.width(),
+                    motion_v.height(),
+                    params.output_resolution_motion_vectors,
                 );
-                reactive_v_and_fmt = None;
+                return Ok(false);
+            }
+            if let Some((rv, _)) = &reactive_v_and_fmt {
+                if rv.width() as u32 != in_w || rv.height() as u32 != in_h {
+                    log::warn!(
+                        target: "d3d",
+                        "metalfx: ignoring temporal reactive mask size mismatch (color={}x{}, reactive={}x{})",
+                        in_w,
+                        in_h,
+                        rv.width(),
+                        rv.height(),
+                    );
+                    reactive_v_and_fmt = None;
+                }
             }
         }
         let (reactive_v, reactive_fmt) = match reactive_v_and_fmt {
@@ -496,35 +642,42 @@ impl CommandList {
             );
             return Ok(false);
         }
-        if !sv.usage().contains(scaler.color_usage)
-            || !depth_v.usage().contains(scaler.depth_usage)
-            || !motion_v.usage().contains(scaler.motion_usage)
-        {
-            log::warn!(
-                target: "d3d",
-                "metalfx: temporal input usage mismatch (color={:?}/{:?}, depth={:?}/{:?}, motion={:?}/{:?})",
-                sv.usage(),
-                scaler.color_usage,
-                depth_v.usage(),
-                scaler.depth_usage,
-                motion_v.usage(),
-                scaler.motion_usage,
-            );
-            return Ok(false);
-        }
-        if let (Some(rv), Some(req)) = (&reactive_v, scaler.reactive_usage) {
-            if !rv.usage().contains(req) {
+        if !has_input_subrect {
+            if !sv.usage().contains(scaler.color_usage)
+                || !depth_v.usage().contains(scaler.depth_usage)
+                || !motion_v.usage().contains(scaler.motion_usage)
+            {
                 log::warn!(
                     target: "d3d",
-                    "metalfx: temporal reactive mask usage mismatch ({:?}/{:?})",
-                    rv.usage(),
-                    req,
+                    "metalfx: temporal input usage mismatch (color={:?}/{:?}, depth={:?}/{:?}, motion={:?}/{:?})",
+                    sv.usage(),
+                    scaler.color_usage,
+                    depth_v.usage(),
+                    scaler.depth_usage,
+                    motion_v.usage(),
+                    scaler.motion_usage,
                 );
                 return Ok(false);
             }
+            if let (Some(rv), Some(req)) = (&reactive_v, scaler.reactive_usage) {
+                if !rv.usage().contains(req) {
+                    log::warn!(
+                        target: "d3d",
+                        "metalfx: temporal reactive mask usage mismatch ({:?}/{:?})",
+                        rv.usage(),
+                        req,
+                    );
+                    return Ok(false);
+                }
+            }
         }
+        let color_usage = scaler.color_usage;
+        let depth_usage = scaler.depth_usage;
+        let motion_usage = scaler.motion_usage;
+        let reactive_usage = scaler.reactive_usage.unwrap_or(MTLTextureUsage::ShaderRead);
         let direct_ok = dv.storageMode() == MTLStorageMode::Private
             && dv.usage().contains(scaler.output_usage)
+            && params.output_origin == [0, 0]
             && w == dv.width() as u32
             && h == dv.height() as u32;
         let scratch = if direct_ok {
@@ -545,6 +698,68 @@ impl CommandList {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
         }
+        let (staged_color, staged_depth, staged_motion, staged_reactive) = if has_input_subrect {
+            let Some(sc) = self.blit_subrect_to_scratch(
+                sv,
+                params.color_origin,
+                in_w,
+                in_h,
+                1,
+                s_fmt,
+                color_usage,
+                touch,
+                tight_stages,
+            )?
+            else {
+                return Ok(false);
+            };
+            let Some(sd) = self.blit_subrect_to_scratch(
+                &depth_v,
+                params.depth_origin,
+                in_w,
+                in_h,
+                2,
+                depth_fmt,
+                depth_usage,
+                touch,
+                tight_stages,
+            )?
+            else {
+                return Ok(false);
+            };
+            let Some(sm) = self.blit_subrect_to_scratch(
+                &motion_v,
+                params.motion_origin,
+                exp_mv_w,
+                exp_mv_h,
+                3,
+                motion_fmt,
+                motion_usage,
+                touch,
+                tight_stages,
+            )?
+            else {
+                return Ok(false);
+            };
+            let sr = if let (Some(rv), Some(rf)) = (&reactive_v, reactive_fmt) {
+                self.blit_subrect_to_scratch(
+                    rv,
+                    params.reactive_origin,
+                    in_w,
+                    in_h,
+                    4,
+                    rf,
+                    reactive_usage,
+                    touch,
+                    tight_stages,
+                )?
+            } else {
+                None
+            };
+            (Some(sc), Some(sd), Some(sm), sr)
+        } else {
+            (None, None, None, None)
+        };
         if let (Some((src_exp, exp_ptr)), Some(dst_exp)) = (&exp_convert_src, &exp_v) {
             let exp_touch = [0usize, *exp_ptr];
             self.util_dispatch_with(
@@ -562,12 +777,12 @@ impl CommandList {
 
         let mfx_dst: &MtlTexture = scratch.as_deref().unwrap_or(dv);
         let inputs = crate::metal::metalfx::TemporalEncodeInputs {
-            color: sv,
-            depth: &depth_v,
-            motion: &motion_v,
+            color: staged_color.as_deref().unwrap_or(sv),
+            depth: staged_depth.as_deref().unwrap_or(&depth_v),
+            motion: staged_motion.as_deref().unwrap_or(&motion_v),
             output: mfx_dst,
             exposure: exp_v.as_deref(),
-            reactive_mask: reactive_v.as_deref(),
+            reactive_mask: staged_reactive.as_deref().or(reactive_v.as_deref()),
             content_w: x0,
             content_h: y0,
             jitter_offset: params.jitter_offset,
@@ -584,6 +799,7 @@ impl CommandList {
         self.finish_metalfx_output_blit(
             scratch,
             dv,
+            params.output_origin,
             w,
             h,
             touch,
@@ -723,15 +939,67 @@ impl CommandList {
         render_size: [u32; 2],
         upscale_size: [u32; 2],
     ) -> Result<(), String> {
-        self.upscale_resource_with(dst, src, render_size, upscale_size, barrier_tight_stages())
+        self.upscale_resource_with_origins(
+            dst,
+            src,
+            render_size,
+            upscale_size,
+            [0, 0],
+            [0, 0],
+            barrier_tight_stages(),
+        )
     }
 
+    /// 2D upscale between arbitrary source/destination subrects (`src_origin` -> `dst_origin`).
+    pub fn upscale_resource_subrect(
+        &mut self,
+        dst: &Resource,
+        src: &Resource,
+        render_size: [u32; 2],
+        upscale_size: [u32; 2],
+        src_origin: [u32; 2],
+        dst_origin: [u32; 2],
+    ) -> Result<(), String> {
+        self.upscale_resource_with_origins(
+            dst,
+            src,
+            render_size,
+            upscale_size,
+            src_origin,
+            dst_origin,
+            barrier_tight_stages(),
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn upscale_resource_with(
         &mut self,
         dst: &Resource,
         src: &Resource,
         render_size: [u32; 2],
         upscale_size: [u32; 2],
+        tight_stages: bool,
+    ) -> Result<(), String> {
+        self.upscale_resource_with_origins(
+            dst,
+            src,
+            render_size,
+            upscale_size,
+            [0, 0],
+            [0, 0],
+            tight_stages,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn upscale_resource_with_origins(
+        &mut self,
+        dst: &Resource,
+        src: &Resource,
+        render_size: [u32; 2],
+        upscale_size: [u32; 2],
+        src_origin: [u32; 2],
+        dst_origin: [u32; 2],
         tight_stages: bool,
     ) -> Result<(), String> {
         self.flush_icb_prepass_if_pending();
@@ -753,37 +1021,73 @@ impl CommandList {
         let dv = dst
             .texture_view(d_fmt, MTLTextureType::Type2D, (0, 1), (0, 1))
             .ok_or("upscale_resource: dst view")?;
+        let st_w = st.width() as u32;
+        let st_h = st.height() as u32;
+        let dt_w = dt.width() as u32;
+        let dt_h = dt.height() as u32;
+        if src_origin[0] >= st_w
+            || src_origin[1] >= st_h
+            || dst_origin[0] >= dt_w
+            || dst_origin[1] >= dt_h
+        {
+            return Err(format!(
+                "upscale_resource: subrect origin out of bounds (src_origin={src_origin:?} in {st_w}x{st_h}, dst_origin={dst_origin:?} in {dt_w}x{dt_h})"
+            ));
+        }
+        let avail_src_w = st_w - src_origin[0];
+        let avail_src_h = st_h - src_origin[1];
+        let avail_dst_w = dt_w - dst_origin[0];
+        let avail_dst_h = dt_h - dst_origin[1];
         let x0 = if render_size[0] > 0 {
-            render_size[0].min(st.width() as u32)
+            render_size[0].min(avail_src_w)
         } else {
-            st.width() as u32
+            avail_src_w
         };
         let y0 = if render_size[1] > 0 {
-            render_size[1].min(st.height() as u32)
+            render_size[1].min(avail_src_h)
         } else {
-            st.height() as u32
+            avail_src_h
         };
         let w = if upscale_size[0] > 0 {
-            upscale_size[0].min(dt.width() as u32)
+            upscale_size[0].min(avail_dst_w)
         } else {
-            dt.width() as u32
+            avail_dst_w
         };
         let h = if upscale_size[1] > 0 {
-            upscale_size[1].min(dt.height() as u32)
+            upscale_size[1].min(avail_dst_h)
         } else {
-            dt.height() as u32
+            avail_dst_h
         };
         if w == 0 || h == 0 {
             return Ok(());
         }
         if x0 == w && y0 == h {
-            if touch[0] == touch[1] && s_fmt == d_fmt {
+            if touch[0] == touch[1] && s_fmt == d_fmt && src_origin == dst_origin {
                 return Ok(());
             }
             if s_fmt == d_fmt {
-                return self.copy_upscale_1to1(&sv, &dv, w, h, &touch, tight_stages);
+                return self.copy_upscale_1to1(
+                    &sv,
+                    &dv,
+                    src_origin,
+                    dst_origin,
+                    w,
+                    h,
+                    &touch,
+                    tight_stages,
+                );
             }
-            let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
+            let p = TexParams {
+                u: [src_origin[0], src_origin[1], dst_origin[0], dst_origin[1]],
+                f: [0.0; 4],
+                x0,
+                y0,
+                z0: 0,
+                w,
+                h,
+                d: 1,
+                _pad: [0; 2],
+            };
             return self.util_dispatch_with(
                 "port_upscale_2d_f",
                 Some(&sv),
@@ -809,7 +1113,20 @@ impl CommandList {
             );
             self.need_full(FullWhy::ClearUav);
         }
-        if self.try_upscale_metalfx(&sv, &dv, x0, y0, w, h, s_fmt, d_fmt, &touch, tight_stages)? {
+        if self.try_upscale_metalfx(
+            &sv,
+            &dv,
+            src_origin,
+            dst_origin,
+            x0,
+            y0,
+            w,
+            h,
+            s_fmt,
+            d_fmt,
+            &touch,
+            tight_stages,
+        )? {
             if crate::metal::gpunan::is_capturing() && self.open {
                 self.flush_pending_mfx_wait_fence();
                 self.end_encoder();
@@ -827,7 +1144,17 @@ impl CommandList {
             }
             return Ok(());
         }
-        let p = TexParams { u: [0; 4], f: [0.0; 4], x0, y0, z0: 0, w, h, d: 1, _pad: [0; 2] };
+        let p = TexParams {
+            u: [src_origin[0], src_origin[1], dst_origin[0], dst_origin[1]],
+            f: [0.0; 4],
+            x0,
+            y0,
+            z0: 0,
+            w,
+            h,
+            d: 1,
+            _pad: [0; 2],
+        };
         self.util_dispatch_with(
             "port_upscale_2d_f",
             Some(&sv),
@@ -854,10 +1181,95 @@ impl CommandList {
         Ok(())
     }
 
+    /// FidelityFX FSR3 autogen reactive mask pass (`port_ffx_gen_reactive_2d`):
+    /// computes `out_reactive` from `opaque` and `pre_upscale` color textures
+    /// honoring `APPLY_TONEMAP` (1), `APPLY_INVERSETONEMAP` (2),
+    /// `APPLY_THRESHOLD` (4), and `USE_COMPONENTS_MAX` (8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_reactive_mask(
+        &mut self,
+        opaque: &Resource,
+        pre_upscale: &Resource,
+        out_reactive: &Resource,
+        render_size: [u32; 2],
+        scale: f32,
+        cutoff_threshold: f32,
+        binary_value: f32,
+        flags: u32,
+    ) -> Result<(), String> {
+        use crate::metal::clear::{self, FfxReactiveParams};
+
+        self.flush_icb_prepass_if_pending();
+        out_reactive.register_ptr();
+        opaque.register_ptr();
+        pre_upscale.register_ptr();
+        out_reactive.mark_gpu_used();
+        opaque.mark_gpu_used();
+        pre_upscale.mark_gpu_used();
+        let touch = [
+            out_reactive as *const Resource as usize,
+            opaque as *const Resource as usize,
+            pre_upscale as *const Resource as usize,
+        ];
+        self.disc_unmark(touch[0]);
+        self.flush_clears_for(&touch)?;
+
+        let ot = opaque.texture().ok_or("generate_reactive_mask: opaque has no texture")?;
+        let pt = pre_upscale
+            .texture()
+            .ok_or("generate_reactive_mask: pre_upscale has no texture")?;
+        let dt = out_reactive
+            .texture()
+            .ok_or("generate_reactive_mask: out_reactive has no texture")?;
+        let o_fmt = crate::format::view_format(opaque.desc.Format, opaque.mtl_format);
+        let p_fmt = crate::format::view_format(pre_upscale.desc.Format, pre_upscale.mtl_format);
+        let d_fmt = crate::format::view_format(out_reactive.desc.Format, out_reactive.mtl_format);
+        let ov = opaque
+            .texture_view(o_fmt, MTLTextureType::Type2D, (0, 1), (0, 1))
+            .ok_or("generate_reactive_mask: opaque view")?;
+        let pv = pre_upscale
+            .texture_view(p_fmt, MTLTextureType::Type2D, (0, 1), (0, 1))
+            .ok_or("generate_reactive_mask: pre_upscale view")?;
+        let dv = out_reactive
+            .texture_view(d_fmt, MTLTextureType::Type2D, (0, 1), (0, 1))
+            .ok_or("generate_reactive_mask: out_reactive view")?;
+
+        let max_w = (ot.width() as u32).min(pt.width() as u32).min(dt.width() as u32);
+        let max_h = (ot.height() as u32).min(pt.height() as u32).min(dt.height() as u32);
+        let w = if render_size[0] > 0 { render_size[0].min(max_w) } else { max_w };
+        let h = if render_size[1] > 0 { render_size[1].min(max_h) } else { max_h };
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        let params = FfxReactiveParams {
+            width: w,
+            height: h,
+            flags,
+            _pad0: 0,
+            scale: if scale.is_finite() { scale } else { 1.0 },
+            cutoff_threshold: if cutoff_threshold.is_finite() { cutoff_threshold } else { 0.0 },
+            binary_value: if binary_value.is_finite() { binary_value } else { 0.0 },
+            _pad1: 0.0,
+        };
+        self.util_dispatch_3tex_with(
+            "port_ffx_gen_reactive_2d",
+            Some(&ov),
+            Some(&pv),
+            Some(&dv),
+            clear::bytes_of(&params),
+            [w, h, 1],
+            &touch,
+            barrier_tight_stages(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn copy_upscale_1to1(
         &mut self,
         sv: &MtlTexture,
         dv: &MtlTexture,
+        src_origin: [u32; 2],
+        dst_origin: [u32; 2],
         w: u32,
         h: u32,
         touch: &[usize],
@@ -889,12 +1301,12 @@ impl CommandList {
                 sv,
                 0,
                 0,
-                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLOrigin { x: src_origin[0] as usize, y: src_origin[1] as usize, z: 0 },
                 MTLSize { width: w as usize, height: h as usize, depth: 1 },
                 dv,
                 0,
                 0,
-                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLOrigin { x: dst_origin[0] as usize, y: dst_origin[1] as usize, z: 0 },
             );
         }
         self.note_stage_ran(MTLStages::Blit);
@@ -923,6 +1335,8 @@ impl CommandList {
         &mut self,
         sv: &MtlTexture,
         dv: &MtlTexture,
+        src_origin: [u32; 2],
+        dst_origin: [u32; 2],
         x0: u32,
         y0: u32,
         w: u32,
@@ -946,9 +1360,15 @@ impl CommandList {
         {
             return Ok(false);
         }
+        let has_src_subrect = src_origin != [0, 0];
+        let (in_w, in_h) = if has_src_subrect {
+            (x0, y0)
+        } else {
+            (sv.width() as u32, sv.height() as u32)
+        };
         let Some(scaler_arc) = crate::metal::metalfx::get_or_create_scaler(
-            sv.width() as u32,
-            sv.height() as u32,
+            in_w,
+            in_h,
             s_fmt,
             w,
             h,
@@ -957,10 +1377,12 @@ impl CommandList {
             return Ok(false);
         };
         let mut scaler = scaler_arc.lock().unwrap();
-        if !sv.usage().contains(scaler.color_usage) {
+        if !has_src_subrect && !sv.usage().contains(scaler.color_usage) {
             return Ok(false);
         }
+        let color_usage = scaler.color_usage;
         let direct_ok = dv.usage().contains(scaler.output_usage)
+            && dst_origin == [0, 0]
             && w == dv.width() as u32
             && h == dv.height() as u32;
         let scratch = if direct_ok {
@@ -978,16 +1400,37 @@ impl CommandList {
         if !self.icb.icb_segs.is_empty() {
             self.flush_draw_batch(false);
         }
+        let staged_src = if has_src_subrect {
+            let Some(sc) = self.blit_subrect_to_scratch(
+                sv,
+                src_origin,
+                in_w,
+                in_h,
+                1,
+                s_fmt,
+                color_usage,
+                touch,
+                tight_stages,
+            )?
+            else {
+                return Ok(false);
+            };
+            Some(sc)
+        } else {
+            None
+        };
         let mfx_fence = self.sync_queue_before_metalfx();
 
+        let mfx_src: &MtlTexture = staged_src.as_deref().unwrap_or(sv);
         let mfx_dst: &MtlTexture = scratch.as_deref().unwrap_or(dv);
-        scaler.encode(&self.cb, sv, mfx_dst, x0, y0, mfx_fence.as_deref());
+        scaler.encode(&self.cb, mfx_src, mfx_dst, x0, y0, mfx_fence.as_deref());
         drop(scaler);
         self.finish_opaque_metalfx_pass(mfx_fence.as_deref());
 
         self.finish_metalfx_output_blit(
             scratch,
             dv,
+            dst_origin,
             w,
             h,
             touch,
@@ -997,13 +1440,13 @@ impl CommandList {
         Ok(true)
     }
 
-    /// The utility-kernel argument table (one buffer, two textures).
+    /// The utility-kernel argument table (one buffer, three textures).
     pub(super) fn ensure_util_table(&mut self) -> Result<Retained<MtlArgumentTable>, String> {
         if self.util_table.is_none() {
             let d = crate::metal::device().ok_or("no device")?;
             let desc = MTL4ArgumentTableDescriptor::new();
             desc.setMaxBufferBindCount(1);
-            desc.setMaxTextureBindCount(2);
+            desc.setMaxTextureBindCount(3);
             desc.setInitializeBindings(true);
             desc.setLabel(Some(&objc2_foundation::NSString::from_str(
                 "aw2 utility kernels",
