@@ -1295,13 +1295,14 @@ impl TokenObj {
         // Per Windows docs, -4 and -6 grant TOKEN_QUERY | TOKEN_QUERY_SOURCE (0x0018),
         // while -5 fails with ERROR_NO_TOKEN (1008) when the thread is not impersonating.
         let tok = if raw == -4 || raw == -6 {
+            let (token_id, auth_id, modified_id) = process_token_ids();
             Self {
                 token_type: TOKEN_PRIMARY,
                 imp_level: SECURITY_IMPERSONATION,
                 access: 0x0008 | 0x0010, // TOKEN_QUERY | TOKEN_QUERY_SOURCE
-                token_id: 0x100,
-                auth_id: 0x3E7,
-                modified_id: 0x101,
+                token_id,
+                auth_id,
+                modified_id,
             }
         } else if raw == -5 {
             return Err(1008); // ERROR_NO_TOKEN
@@ -1315,13 +1316,14 @@ impl TokenObj {
                 modified_id: tok.modified_id,
             }
         } else if handles::get(h).is_some_and(|o| o.type_name() == "Token") {
+            let (token_id, auth_id, modified_id) = process_token_ids();
             Self {
                 token_type: TOKEN_PRIMARY,
                 imp_level: SECURITY_IMPERSONATION,
                 access: 0x000f_01ff,
-                token_id: 0x100,
-                auth_id: 0x3E7,
-                modified_id: 0x101,
+                token_id,
+                auth_id,
+                modified_id,
             }
         } else {
             return Err(ERROR_INVALID_HANDLE);
@@ -1331,6 +1333,27 @@ impl TokenObj {
         }
         Ok(tok)
     }
+}
+
+fn process_token_ids() -> (u64, u64, u64) {
+    static IDS: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    *IDS.get_or_init(|| {
+        let tid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+        let mid = NEXT_LUID.fetch_add(1, Ordering::Relaxed);
+        (tid, 0x0000_03E7, mid)
+    })
+}
+
+fn new_process_token_handle(access: u32) -> Arc<TokenObj> {
+    let (token_id, auth_id, modified_id) = process_token_ids();
+    Arc::new(TokenObj {
+        token_type: TOKEN_PRIMARY,
+        imp_level: SECURITY_IMPERSONATION,
+        access,
+        token_id,
+        auth_id,
+        modified_id,
+    })
 }
 
 fn new_token_obj(token_type: u32, imp_level: u32, access: u32) -> Arc<TokenObj> {
@@ -1476,7 +1499,7 @@ pub unsafe extern "win64" fn OpenProcessToken(process: HANDLE, access: u32, out:
         return err(ERROR_INVALID_HANDLE, FALSE);
     }
     let access = TokenObj::access_mask(access);
-    std::ptr::write_unaligned(out, handles::insert(new_token_obj(TOKEN_PRIMARY, SECURITY_IMPERSONATION, access)));
+    std::ptr::write_unaligned(out, handles::insert(new_process_token_handle(access)));
     TRUE
 }
 
@@ -5427,6 +5450,9 @@ unsafe fn crypt_sign_hash_impl(
     if pdw_sig_len.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
+    if (dw_flags & !CRYPT_NOHASHOID) != 0 {
+        return err(NTE_BAD_FLAGS, FALSE);
+    }
     if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
         return err(NTE_BAD_TYPE, FALSE);
     }
@@ -5494,6 +5520,9 @@ unsafe fn crypt_verify_signature_impl(
 ) -> BOOL {
     if pb_signature.is_null() || dw_sig_len == 0 {
         return err(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    if (dw_flags & !CRYPT_NOHASHOID) != 0 {
+        return err(NTE_BAD_FLAGS, FALSE);
     }
     let (digest, hash_val) = {
         let hashes = capi_hashes().lock().unwrap();
@@ -7304,12 +7333,34 @@ mod tests {
                 assert_eq!(GetTokenInformation(tok, cls, b.as_mut_ptr(), sz, &mut sz), TRUE, "class {cls} read");
             }
 
-            // TokenStatistics (10) -> 56 bytes, TokenType=1, non-zero TokenId
+            // TokenStatistics (10) -> 56 bytes, TokenType=1, stable process TokenId/ModifiedId across opens & pseudo-handles
             let mut stats = [0u8; 56];
             assert_eq!(GetTokenInformation(tok, 10, stats.as_mut_ptr(), 56, &mut need), TRUE);
             assert_eq!(need, 56);
-            assert_ne!(u64::from_le_bytes(stats[0..8].try_into().unwrap()), 0);
+            let proc_tid = u64::from_le_bytes(stats[0..8].try_into().unwrap());
+            let proc_aid = u64::from_le_bytes(stats[8..16].try_into().unwrap());
+            let proc_mid = u64::from_le_bytes(stats[48..56].try_into().unwrap());
+            assert_ne!(proc_tid, 0);
             assert_eq!(u32::from_le_bytes(stats[24..28].try_into().unwrap()), TOKEN_PRIMARY);
+
+            let mut tok2: HANDLE = std::ptr::null_mut();
+            assert_eq!(OpenProcessToken((-1isize) as HANDLE, 0x0008, &mut tok2), TRUE);
+            let mut stats2 = [0u8; 56];
+            assert_eq!(GetTokenInformation(tok2, 10, stats2.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(u64::from_le_bytes(stats2[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(stats2[8..16].try_into().unwrap()), proc_aid);
+            assert_eq!(u64::from_le_bytes(stats2[48..56].try_into().unwrap()), proc_mid);
+            let _ = crate::kernel32::threads::CloseHandle(tok2);
+
+            let mut pseudo_stats = [0u8; 56];
+            assert_eq!(GetTokenInformation((-4isize) as HANDLE, 10, pseudo_stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_eq!(u64::from_le_bytes(pseudo_stats[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(pseudo_stats[48..56].try_into().unwrap()), proc_mid);
+
+            let mut dup_stats = [0u8; 56];
+            assert_eq!(GetTokenInformation(imp_tok, 10, dup_stats.as_mut_ptr(), 56, &mut need), TRUE);
+            assert_ne!(u64::from_le_bytes(dup_stats[0..8].try_into().unwrap()), proc_tid);
+            assert_eq!(u64::from_le_bytes(dup_stats[8..16].try_into().unwrap()), proc_aid);
 
             // TokenAccessInformation (22) -> SidHash populated with user + groups + bit-sliced hash entries
             let mut ai_need = 0u32;
@@ -7436,6 +7487,14 @@ mod tests {
             let mut h_pub: usize = 0;
             assert_eq!(CryptImportKey(hprov, pub_blob.as_ptr(), pub_len, 0, 0, &mut h_pub), TRUE);
             assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), TRUE);
+            // Unsupported CRYPT_X931_FORMAT (0x4) must be rejected honestly in both sign & verify
+            let mut x931_len = 256u32;
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0x4, std::ptr::null_mut(), &mut x931_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            assert_eq!(CryptSignHashW(h_hash, AT_SIGNATURE, std::ptr::null(), 0x4, sig.as_mut_ptr(), &mut x931_len), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+            assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0x4), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
             sig[0] ^= 0x80;
             assert_eq!(CryptVerifySignatureW(h_hash, sig.as_ptr(), sig_len, h_pub, std::ptr::null(), 0), FALSE);
             assert_eq!(crate::teb::last_error(), NTE_BAD_SIGNATURE);
