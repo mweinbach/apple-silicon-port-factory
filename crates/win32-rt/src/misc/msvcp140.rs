@@ -34,7 +34,7 @@ use crate::sync::{
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 
 pub static ORDINALS: &[(u16, &str)] = &[];
 
@@ -2239,26 +2239,34 @@ pub static CERR: StaticOstream = StaticOstream {
     },
 };
 
+pub(crate) fn register_static_vtables() {
+    crate::register_native_va(
+        chore_work_callback as *const () as usize as u64,
+        chore_work_callback as *const () as usize,
+    );
+    for p in FACET_VTABLE
+        .iter()
+        .chain(CTYPE_CHAR_VTABLE.iter())
+        .chain(CODECVT_U32_VTABLE.iter())
+        .chain(CODECVT_W_VTABLE.iter())
+        .chain(BASIC_STREAMBUF_VTABLE.iter())
+        .chain(STDIO_STREAMBUF_VTABLE.iter())
+        .chain(BASIC_IOS_VTABLE.iter())
+    {
+        let fn_addr = p.0 as usize;
+        crate::register_native_va(fn_addr as u64, fn_addr);
+    }
+}
+
 fn ensure_vtables_registered() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        crate::register_native_va(
-            chore_work_callback as *const () as usize as u64,
-            chore_work_callback as *const () as usize,
-        );
-        for p in FACET_VTABLE
-            .iter()
-            .chain(CTYPE_CHAR_VTABLE.iter())
-            .chain(CODECVT_U32_VTABLE.iter())
-            .chain(CODECVT_W_VTABLE.iter())
-            .chain(BASIC_STREAMBUF_VTABLE.iter())
-            .chain(STDIO_STREAMBUF_VTABLE.iter())
-            .chain(BASIC_IOS_VTABLE.iter())
-        {
-            let fn_addr = p.0 as usize;
-            crate::register_native_va(fn_addr as u64, fn_addr);
-        }
-    });
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if crate::has_native_va_registrar() {
+        register_static_vtables();
+        REGISTERED.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub static ID_CODECVT_D: LocaleId = LocaleId(UnsafeCell::new([5, 0]));

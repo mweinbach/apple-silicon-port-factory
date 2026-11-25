@@ -1422,6 +1422,7 @@ fn run_with_args(mut args: Args, embedded_host: bool) -> anyhow::Result<()> {
     }
     w::set_guest_dispatcher(x86_runtime::exe::call_va8);
     w::set_native_va_registrar(x86_runtime::exe::register_native_va);
+    w::set_unregistered_host_text_checker(x86_runtime::exe::is_unregistered_host_text);
     for d in w::builtin_dlls() {
         for e in d.exports {
             let p = e.ptr.0 as usize;

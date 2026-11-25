@@ -89,10 +89,11 @@ pub(crate) use cpu::set_precise_faults_local;
 pub use tsc::GUEST_TSC;
 
 pub use dispatch::{
-    call_host_dispatched, call_host_for_va, call_host_with_xmm, call_va8, peek_incoming_rsp,
-    read_caller_extra_args, set_incoming_rsp, set_outgoing_rsp, take_incoming_rsp,
-    take_outgoing_rsp,
+    call_host_dispatched, call_host_for_va, call_host_with_xmm, call_va8, describe_host_addr,
+    peek_incoming_rsp, read_caller_extra_args, set_incoming_rsp, set_outgoing_rsp,
+    take_incoming_rsp, take_outgoing_rsp, unregistered_host_refusal_count, StrictHostThunkGuard,
 };
+pub(crate) use dispatch::refuse_unregistered_host_text;
 #[cfg(target_arch = "aarch64")]
 pub use dispatch::port_static_aot_host_xfer;
 #[cfg(target_arch = "aarch64")]
