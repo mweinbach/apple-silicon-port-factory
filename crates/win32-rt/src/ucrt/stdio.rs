@@ -237,7 +237,10 @@ unsafe fn apply_unicode_bom(
     ansi_if_no_bom: bool,
 ) -> Result<TextMode, i32> {
     let mut st: libc::stat = std::mem::zeroed();
-    if libc::fstat(fd, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+    if libc::fstat(fd, &mut st) != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Ok(requested);
     }
     let acc = oflag & 3;
@@ -271,8 +274,12 @@ unsafe fn apply_unicode_bom(
         let mut head = [0u8; 3];
         let n = loop {
             let r = libc::pread(fd, head.as_mut_ptr() as *mut c_void, 3, 0);
-            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+            if r < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+                if e == libc::EINTR {
+                    continue;
+                }
+                return Err(e);
             }
             break r;
         };
@@ -1053,38 +1060,41 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                         }
                     }
                 }
-                let b0 = rem[0];
-                let need = if b0 < 0x80 {
-                    1
-                } else if (0xC2..=0xDF).contains(&b0) {
-                    2
-                } else if (0xE0..=0xEF).contains(&b0) {
-                    3
-                } else if (0xF0..=0xF4).contains(&b0) {
-                    4
-                } else {
-                    1
-                };
-                if rem.len() < need {
-                    if out_u16.is_empty() {
-                        // Fetch remaining bytes of the UTF-8 sequence.
-                        let mut more = [0u8; 4];
-                        let k = raw_read_retry(fd, more.as_mut_ptr(), need - rem.len());
-                        if k > 0 {
-                            raw_buf.extend_from_slice(&more[..k as usize]);
-                            continue;
-                        }
-                        // EOF mid-sequence: emit replacement char and consume truncated bytes.
-                        out_u16.push(0xFFFD);
-                        if start_pos >= 0 {
-                            src_pos.push(char_phys);
-                            src_pos.push(char_phys);
-                        }
-                        consumed = raw_buf.len();
+                let (ch, step) = match std::str::from_utf8(rem) {
+                    Ok(s) => {
+                        let c = s.chars().next().unwrap();
+                        (c, c.len_utf8())
                     }
-                    break;
-                }
-                let ch = std::str::from_utf8(&rem[..need]).ok().and_then(|s| s.chars().next()).unwrap_or('\u{FFFD}');
+                    Err(e) if e.valid_up_to() > 0 => {
+                        let s = std::str::from_utf8(&rem[..e.valid_up_to()]).unwrap();
+                        let c = s.chars().next().unwrap();
+                        (c, c.len_utf8())
+                    }
+                    Err(e) => match e.error_len() {
+                        Some(bad_len) => ('\u{FFFD}', bad_len),
+                        None => {
+                            if out_u16.is_empty() {
+                                // Incomplete UTF-8 sequence at end of buffer: fetch up to 4 - rem.len()
+                                // more bytes so a valid sequence spanning reads decodes cleanly.
+                                let want = 4usize.saturating_sub(rem.len()).max(1);
+                                let mut more = [0u8; 4];
+                                let k = raw_read_retry(fd, more.as_mut_ptr(), want);
+                                if k > 0 {
+                                    raw_buf.extend_from_slice(&more[..k as usize]);
+                                    continue;
+                                }
+                                // EOF mid-sequence: emit replacement char and consume truncated bytes.
+                                out_u16.push(0xFFFD);
+                                if start_pos >= 0 {
+                                    src_pos.push(char_phys);
+                                    src_pos.push(char_phys);
+                                }
+                                consumed = raw_buf.len();
+                            }
+                            break;
+                        }
+                    },
+                };
                 let mut tmp = [0u16; 2];
                 let enc = ch.encode_utf16(&mut tmp);
                 if out_u16.len() + enc.len() > max_u16 {
@@ -1097,7 +1107,7 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                         src_pos.push(char_phys);
                     }
                     pend.low_surrogate = Some(enc[1]);
-                    consumed += need;
+                    consumed += step;
                     break;
                 }
                 out_u16.extend_from_slice(enc);
@@ -1106,7 +1116,7 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                         src_pos.push(char_phys);
                     }
                 }
-                consumed += need;
+                consumed += step;
             }
             if consumed < raw_buf.len() {
                 let left = raw_buf.len() - consumed;
@@ -3673,6 +3683,31 @@ mod tests {
             );
             libc::close(ro_fd);
             assert_eq!(std::fs::metadata(&ro_empty).unwrap().len(), 0);
+
+            // 15. BOM inspection pread failure (EBADF on O_WRONLY fd) propagates Err instead of
+            //     silently treating the file as BOM-less.
+            let wo_nonempty = dir.join("bom_pread_fail.txt");
+            std::fs::write(&wo_nonempty, b"\xFF\xFEA\x00").unwrap();
+            let c_wo_ne = std::ffi::CString::new(wo_nonempty.as_os_str().as_encoded_bytes()).unwrap();
+            let wo_fd = libc::open(c_wo_ne.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            assert!(wo_fd >= 0);
+            assert_eq!(
+                apply_unicode_bom(wo_fd, O_WRONLY | O_APPEND | O_U8TEXT, TextMode::Utf8, false, true, false),
+                Err(libc::EBADF)
+            );
+            libc::close(wo_fd);
+
+            // 16. Malformed UTF-8 lead in _O_U8TEXT replaces only the invalid prefix (never
+            //     swallowing valid following ASCII bytes like "ABC").
+            let bad_u8 = dir.join("malformed_u8.txt");
+            std::fs::write(&bad_u8, b"\xE2ABC\xE2\x82D").unwrap();
+            let fd_bad = _open(b"U:\\malformed_u8.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_bad >= 0);
+            let mut u16_out = [0u16; 16];
+            let got = _read(fd_bad, u16_out.as_mut_ptr() as *mut c_void, 32);
+            assert_eq!(got, 12);
+            assert_eq!(&u16_out[..6], &[0xFFFD, b'A' as u16, b'B' as u16, b'C' as u16, 0xFFFD, b'D' as u16]);
+            assert_eq!(_close(fd_bad), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

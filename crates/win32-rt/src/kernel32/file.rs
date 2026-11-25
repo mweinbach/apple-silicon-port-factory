@@ -2894,42 +2894,102 @@ pub unsafe extern "win64" fn SetFileInformationByHandle(h: HANDLE, class: u32, i
             let len = name_bytes / 2;
             let raw_units = crate::strings::read_wide_slice(info.add(20) as *const u16, len);
             let rel_name = String::from_utf16_lossy(&raw_units);
-            let target_win = if !root_dir.is_null() {
+            let live_path_for = |fd: libc::c_int, fallback: Option<&PathBuf>| -> Option<PathBuf> {
+                #[cfg(target_vendor = "apple")]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let mut pbuf = [0u8; libc::PATH_MAX as usize];
+                    if fd >= 0 && libc::fcntl(fd, libc::F_GETPATH, pbuf.as_mut_ptr()) == 0 {
+                        let cstr = std::ffi::CStr::from_ptr(pbuf.as_ptr() as *const libc::c_char);
+                        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes())));
+                    }
+                }
+                fallback.cloned()
+            };
+            let Some(src) = live_path_for(f.fd(), f.host_path.as_ref()) else {
+                set_err(err::ERROR_INVALID_HANDLE);
+                return FALSE;
+            };
+            if !root_dir.is_null() {
                 let Some(root_obj) = get_file(root_dir) else {
                     set_err(err::ERROR_INVALID_HANDLE);
                     return FALSE;
                 };
-                format!("{}\\{}", root_obj.win_path.trim_end_matches('\\'), rel_name.trim_start_matches('\\'))
-            } else {
-                rel_name
-            };
-            let Some(src) = &f.host_path else {
-                set_err(err::ERROR_INVALID_HANDLE);
-                return FALSE;
-            };
-            let dst = match host_path(&target_win) {
-                Ok(p) => p,
-                Err(e) => {
-                    set_err(e);
+                if root_obj.kind != FileKind::Dir {
+                    set_err(err::ERROR_INVALID_PARAMETER);
                     return FALSE;
                 }
-            };
-            if f.is_protected_native()
-                || path::is_protected_host_remove_or_rename(src)
-                || path::is_protected_host_remove_or_rename(&dst)
-            {
-                set_err(err::ERROR_ACCESS_DENIED);
-                return FALSE;
-            }
-            if !replace && dst.exists() {
-                set_err(err::ERROR_ALREADY_EXISTS);
-                return FALSE;
-            }
-            match std::fs::rename(src, &dst) {
-                Ok(()) => TRUE,
-                Err(e) => {
-                    set_err(io_err(&e));
+                let rel_posix = rel_name.replace('\\', "/");
+                let rel_trimmed = rel_posix.trim_start_matches('/');
+                if rel_trimmed.is_empty()
+                    || rel_trimmed.contains('\0')
+                    || rel_trimmed.split('/').any(|seg| seg == "..")
+                {
+                    set_err(err::ERROR_INVALID_NAME);
+                    return FALSE;
+                }
+                if let Some(root_live) = live_path_for(root_obj.fd(), root_obj.host_path.as_ref()) {
+                    let dst_check = root_live.join(rel_trimmed);
+                    if f.is_protected_native()
+                        || root_obj.is_protected_native()
+                        || path::is_protected_host_remove_or_rename(&src)
+                        || path::is_protected_host_remove_or_rename(&dst_check)
+                        || path::is_host_private_keystore_path(&dst_check)
+                    {
+                        set_err(err::ERROR_ACCESS_DENIED);
+                        return FALSE;
+                    }
+                } else if f.is_protected_native() || root_obj.is_protected_native() || path::is_protected_host_remove_or_rename(&src) {
+                    set_err(err::ERROR_ACCESS_DENIED);
+                    return FALSE;
+                }
+                let Ok(src_c) = std::ffi::CString::new(src.as_os_str().as_encoded_bytes()) else {
+                    set_err(err::ERROR_INVALID_NAME);
+                    return FALSE;
+                };
+                let Ok(rel_c) = std::ffi::CString::new(rel_trimmed.as_bytes()) else {
+                    set_err(err::ERROR_INVALID_NAME);
+                    return FALSE;
+                };
+                if !replace {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    if libc::fstatat(root_obj.fd(), rel_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 {
+                        set_err(err::ERROR_ALREADY_EXISTS);
+                        return FALSE;
+                    }
+                }
+                if libc::renameat(libc::AT_FDCWD, src_c.as_ptr(), root_obj.fd(), rel_c.as_ptr()) == 0 {
+                    TRUE
+                } else {
+                    set_err(errno_to_win32(last_errno()));
                     FALSE
+                }
+            } else {
+                let dst = match host_path(&rel_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set_err(e);
+                        return FALSE;
+                    }
+                };
+                if f.is_protected_native()
+                    || path::is_protected_host_remove_or_rename(&src)
+                    || path::is_protected_host_remove_or_rename(&dst)
+                    || path::is_host_private_keystore_path(&dst)
+                {
+                    set_err(err::ERROR_ACCESS_DENIED);
+                    return FALSE;
+                }
+                if !replace && dst.exists() {
+                    set_err(err::ERROR_ALREADY_EXISTS);
+                    return FALSE;
+                }
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => TRUE,
+                    Err(e) => {
+                        set_err(io_err(&e));
+                        FALSE
+                    }
                 }
             }
         }
@@ -11894,6 +11954,33 @@ mod tests {
             std::ptr::copy_nonoverlapping(new_w.as_ptr() as *const u8, ren.as_mut_ptr().add(20), new_w.len() * 2);
             assert_eq!(SetFileInformationByHandle(h, 22, ren.as_ptr(), ren.len() as u32), TRUE);
             assert!(dir.join("renamed.dat").exists());
+
+            // Class 22 with RootDirectory renamed after handle open resolves through root_obj.fd(),
+            // never through an unrelated replacement directory created at the original pathname.
+            let root_orig = dir.join("root_a");
+            let root_moved = dir.join("root_b");
+            std::fs::create_dir_all(&root_orig).unwrap();
+            let src_rel = dir.join("move_me.dat");
+            std::fs::write(&src_rel, b"payload").unwrap();
+            let wr_orig = to_wide_z("K:\\root_a");
+            let hr_dir = CreateFileW(wr_orig.as_ptr(), GENERIC_READ, 7, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut());
+            assert_ne!(hr_dir, INVALID_HANDLE_VALUE);
+            std::fs::rename(&root_orig, &root_moved).unwrap();
+            std::fs::create_dir_all(&root_orig).unwrap(); // unrelated replacement at original path
+            let w_src_rel = to_wide_z("K:\\move_me.dat");
+            let h_mv = CreateFileW(w_src_rel.as_ptr(), GENERIC_READ | GENERIC_WRITE | 0x0001_0000, 7, std::ptr::null_mut(), OPEN_EXISTING, 0x80, std::ptr::null_mut());
+            assert_ne!(h_mv, INVALID_HANDLE_VALUE);
+            let mut ren_fd = vec![0u8; 64];
+            (ren_fd.as_mut_ptr() as *mut u32).write_unaligned(1);
+            (ren_fd.as_mut_ptr().add(8) as *mut HANDLE).write_unaligned(hr_dir);
+            let dest_w = to_wide("landed.dat");
+            (ren_fd.as_mut_ptr().add(16) as *mut u32).write_unaligned((dest_w.len() * 2) as u32);
+            std::ptr::copy_nonoverlapping(dest_w.as_ptr() as *const u8, ren_fd.as_mut_ptr().add(20), dest_w.len() * 2);
+            assert_eq!(SetFileInformationByHandle(h_mv, 22, ren_fd.as_ptr(), ren_fd.len() as u32), TRUE);
+            assert!(root_moved.join("landed.dat").exists(), "rename must land inside renamed root_b via fd");
+            assert!(!root_orig.join("landed.dat").exists(), "rename must not target unrelated replacement root_a");
+            crate::kernel32::threads::CloseHandle(h_mv);
+            crate::kernel32::threads::CloseHandle(hr_dir);
 
             // Class 0 (FileBasicInfo) updates the open inode via fstat/fchmod even after the
             // original path has been renamed and replaced by another file.
