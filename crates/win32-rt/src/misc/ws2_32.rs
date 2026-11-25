@@ -1819,8 +1819,9 @@ pub unsafe extern "win64" fn send(s: usize, buf: *const u8, len: i32, flags: i32
     let Some(fd) = lookup_fd(s) else {
         return err(WSAENOTSOCK, SOCKET_ERROR);
     };
+    let want = len.max(0) as usize;
     loop {
-        let n = libc::send(fd, buf as *const c_void, len.max(0) as usize, flags);
+        let n = send_from_guest(fd, buf, want, flags);
         if n >= 0 {
             return n as i32;
         }
@@ -1853,11 +1854,21 @@ pub unsafe extern "win64" fn sendto(s: usize, buf: *const u8, len: i32, flags: i
         Ok(v) => v,
         Err(e) => return err(e, SOCKET_ERROR),
     };
+    let want = len.max(0) as usize;
+    let needs_stage = want > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, want);
+    let mut staging = Vec::new();
+    if needs_stage {
+        staging.resize(want, 0);
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf, &mut staging) {
+            return err(errno_to_wsa(e), SOCKET_ERROR);
+        }
+    }
+    let io_ptr = if needs_stage { staging.as_ptr() as *const c_void } else { buf as *const c_void };
     loop {
         let n = libc::sendto(
             fd,
-            buf as *const c_void,
-            len.max(0) as usize,
+            io_ptr,
+            want,
             flags,
             &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
             plen,
@@ -2107,11 +2118,51 @@ unsafe fn sendmsg_bufs_from(
         msg.msg_name = storage as *const libc::sockaddr_storage as *mut c_void;
         msg.msg_namelen = *plen;
     }
-    msg.msg_iov = iovecs.as_mut_ptr();
-    msg.msg_iovlen = iovecs.len() as libc::c_int;
+    let needs_stage = iovecs
+        .iter()
+        .any(|iv| crate::kernel32::memory::needs_io_read_staging(iv.iov_base as usize, iv.iov_len));
+    let mut staging = Vec::new();
+    let mut stage_iov;
+    if needs_stage {
+        let total: usize = iovecs.iter().map(|iv| iv.iov_len).sum();
+        staging.resize(total, 0);
+        let mut off = 0usize;
+        for iv in &iovecs {
+            if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(
+                iv.iov_base as *const u8,
+                &mut staging[off..off + iv.iov_len],
+            ) {
+                *libc::__error() = e;
+                return -1;
+            }
+            off += iv.iov_len;
+        }
+        stage_iov = libc::iovec {
+            iov_base: staging.as_mut_ptr() as *mut c_void,
+            iov_len: staging.len(),
+        };
+        msg.msg_iov = &mut stage_iov;
+        msg.msg_iovlen = 1;
+    } else {
+        msg.msg_iov = iovecs.as_mut_ptr();
+        msg.msg_iovlen = iovecs.len() as libc::c_int;
+    }
     let mut storage = [0u32; 8];
     if let Some(info) = control { info.attach(&mut msg, &mut storage); }
     libc::sendmsg(fd, &msg, pflags)
+}
+
+unsafe fn send_from_guest(fd: i32, src: *const u8, len: usize, flags: i32) -> isize {
+    if len == 0 || !crate::kernel32::memory::needs_io_read_staging(src as usize, len) {
+        return libc::send(fd, src as *const c_void, len, flags);
+    }
+    let cap = len.min(1024 * 1024);
+    let mut tmp = vec![0u8; cap];
+    if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(src, &mut tmp) {
+        *libc::__error() = e;
+        return -1;
+    }
+    libc::send(fd, tmp.as_ptr() as *const c_void, cap, flags)
 }
 
 enum OverlappedSendStep {
@@ -4837,7 +4888,7 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
             loop {
                 let rem = (*send_len - *sent_so_far) as usize;
                 let ptr = (*send_buf as *const u8).add(*sent_so_far as usize);
-                let n = libc::send(op.poll_fd, ptr as *const c_void, rem, libc::MSG_DONTWAIT);
+                let n = send_from_guest(op.poll_fd, ptr, rem, libc::MSG_DONTWAIT);
                 if n > 0 {
                     *sent_so_far += n as u32;
                     if *sent_so_far >= *send_len {
@@ -5404,9 +5455,9 @@ unsafe extern "win64" fn ext_connect_ex(
         }
         let mut sent_so_far = 0u32;
         while sent_so_far < send_len {
-            let n = libc::send(
+            let n = send_from_guest(
                 meta.fd,
-                send_buf.add(sent_so_far as usize) as *const c_void,
+                send_buf.add(sent_so_far as usize),
                 (send_len - sent_so_far) as usize,
                 libc::MSG_DONTWAIT,
             );

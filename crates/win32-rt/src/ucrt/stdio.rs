@@ -556,7 +556,17 @@ pub unsafe extern "win64" fn _write(fd: i32, buf: *const c_void, n: u32) -> i32 
     if !fd_valid(fd) {
         return bad_fd();
     }
-    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, n as usize)) as i32
+    let len = n as usize;
+    if len > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, len) {
+        let mut staging = vec![0u8; len];
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf as *const u8, &mut staging) {
+            *libc::__error() = e;
+            errno::set_from_host();
+            return -1;
+        }
+        return write_fd(fd, &staging) as i32;
+    }
+    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, len)) as i32
 }
 
 pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {

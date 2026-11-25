@@ -602,6 +602,179 @@ unsafe fn copy_into_restricted_hpage_via_alias(_hp: usize, _off_in_hp: usize, _s
     Err(libc::EFAULT)
 }
 
+/// Read `dst.len()` bytes from offset `off_in_hp` of host page `hp` via an isolated ephemeral
+/// read-only `mach_vm_remap` alias mapping so the guest mapping at `hp` keeps `PROT_NONE`
+/// throughout — concurrent guest threads touching `PAGE_GUARD` or `PAGE_NOACCESS` sibling
+/// subpages on `hp` are never exposed and the guard bit is never consumed.
+#[cfg(target_vendor = "apple")]
+unsafe fn copy_from_restricted_hpage_via_alias(hp: usize, off_in_hp: usize, dst: &mut [u8]) -> Result<(), i32> {
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_remap(
+            target_task: libc::mach_port_t,
+            target_address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            src_task: libc::mach_port_t,
+            src_address: u64,
+            copy: i32,
+            cur_protection: *mut i32,
+            max_protection: *mut i32,
+            inheritance: i32,
+        ) -> i32;
+        fn mach_vm_protect(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+            set_maximum: i32,
+            new_protection: i32,
+        ) -> i32;
+        fn mach_vm_deallocate(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+        ) -> i32;
+    }
+    const VM_FLAGS_ANYWHERE: i32 = 1;
+    const VM_INHERIT_NONE: i32 = 2;
+    const VM_PROT_READ: i32 = 1;
+
+    let task = mach_task_self_;
+    let mut alias: u64 = 0;
+    let mut cur_prot: i32 = 0;
+    let mut max_prot: i32 = 0;
+    if mach_vm_remap(
+        task,
+        &mut alias,
+        HOST_PAGE as u64,
+        0,
+        VM_FLAGS_ANYWHERE,
+        task,
+        hp as u64,
+        0,
+        &mut cur_prot,
+        &mut max_prot,
+        VM_INHERIT_NONE,
+    ) != 0
+    {
+        return Err(libc::EFAULT);
+    }
+    if mach_vm_protect(task, alias, HOST_PAGE as u64, 0, VM_PROT_READ) != 0 {
+        let _ = mach_vm_deallocate(task, alias, HOST_PAGE as u64);
+        return Err(libc::EFAULT);
+    }
+    std::ptr::copy_nonoverlapping((alias as usize + off_in_hp) as *const u8, dst.as_mut_ptr(), dst.len());
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    let _ = mach_vm_deallocate(task, alias, HOST_PAGE as u64);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+unsafe fn copy_from_restricted_hpage_via_alias(_hp: usize, _off_in_hp: usize, _dst: &mut [u8]) -> Result<(), i32> {
+    Err(libc::EFAULT)
+}
+
+/// Returns `true` if `[addr, addr + len)` overlaps any VM-tracked host page kept `PROT_NONE`
+/// due to a `PAGE_GUARD` or `PAGE_NOACCESS` sibling while containing a logically readable
+/// 4 KiB subpage in `[addr, addr + len)` (so direct kernel `write`/`send` copyin would fail
+/// with `EFAULT` unless staged through an isolated read-only alias).
+pub fn needs_io_read_staging(addr: usize, len: usize) -> bool {
+    if len == 0
+        || addr == 0
+        || !HAS_IO_RESTRICTED_PAGES.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return false;
+    }
+    let start_hp = addr & !(HOST_PAGE - 1);
+    let end = addr.saturating_add(len);
+    let end_hp = end.saturating_add(HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    let vm = VM.lock().unwrap();
+    let mut hp = start_hp;
+    while hp < end_hp {
+        if vm.has_protected_subpage(hp, None) {
+            let mut sub = hp;
+            while sub < hp + HOST_PAGE {
+                if sub + PAGE > addr && sub < end {
+                    if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
+                        if sub < seg.end
+                            && seg.state == MEM_COMMIT
+                            && (seg.prot & 0xFF) != PAGE_NOACCESS
+                            && (seg.prot & PAGE_GUARD) == 0
+                        {
+                            return true;
+                        }
+                    }
+                }
+                sub += PAGE;
+            }
+        }
+        hp = match hp.checked_add(HOST_PAGE) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    false
+}
+
+/// Read `dst.len()` bytes from guest memory at `src` into `dst`, transparently copying any
+/// readable 4 KiB subpage on a `PROT_NONE` 16 KiB host page through an isolated read-only
+/// `mach_vm_remap` alias without consuming or exposing protected siblings.
+///
+/// Validates all touched VM-tracked 4 KiB subpages up front and returns `Err(libc::EFAULT)`
+/// if any touched VM subpage is uncommitted, `PAGE_NOACCESS`, or `PAGE_GUARD`.
+pub unsafe fn read_guest_io_bytes(src: *const u8, dst: &mut [u8]) -> Result<(), i32> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    if src.is_null() {
+        return Err(libc::EFAULT);
+    }
+    if !HAS_IO_RESTRICTED_PAGES.load(std::sync::atomic::Ordering::Acquire) {
+        std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+        return Ok(());
+    }
+    let src_addr = src as usize;
+    let Some(src_end) = src_addr.checked_add(dst.len()) else {
+        return Err(libc::EFAULT);
+    };
+    let vm = VM.lock().unwrap();
+    let mut p = src_addr & !(PAGE - 1);
+    let p_end = src_end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    while p < p_end {
+        if vm.alloc_containing(p).is_some() {
+            let Some((&_s, seg)) = vm.segs.range(..=p).next_back() else {
+                return Err(libc::EFAULT);
+            };
+            if p >= seg.end
+                || seg.state != MEM_COMMIT
+                || (seg.prot & 0xFF) == PAGE_NOACCESS
+                || (seg.prot & PAGE_GUARD) != 0
+            {
+                return Err(libc::EFAULT);
+            }
+        }
+        p = match p.checked_add(PAGE) {
+            Some(next) => next,
+            None => return Err(libc::EFAULT),
+        };
+    }
+    let mut off = 0usize;
+    while off < dst.len() {
+        let cur = src_addr + off;
+        let hp = cur & !(HOST_PAGE - 1);
+        let hp_end = hp.saturating_add(HOST_PAGE);
+        let chunk = (hp_end - cur).min(dst.len() - off);
+        if vm.has_protected_subpage(hp, None) {
+            copy_from_restricted_hpage_via_alias(hp, cur - hp, &mut dst[off..off + chunk])?;
+        } else {
+            std::ptr::copy_nonoverlapping(cur as *const u8, dst.as_mut_ptr().add(off), chunk);
+        }
+        off += chunk;
+    }
+    Ok(())
+}
+
 /// Copy `src` into guest memory at `dst`, transparently handling clean `MEM_WRITE_WATCH`
 /// pages (marking only the actually written host pages dirty and lifting host `PROT_WRITE`)
 /// and writable 4 KiB subpages sharing a 16 KiB host page with non-writable/protected siblings
@@ -2804,9 +2977,32 @@ mod tests {
                 assert_eq!(WriteFile(pwr, b"failnoac".as_ptr() as *const c_void, 8, &mut written, std::ptr::null_mut()), TRUE);
                 assert_eq!(ReadFile(prd, plain, 8, &mut got, std::ptr::null_mut()), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+                let mut drain_noacc = [0u8; 8];
+                assert_eq!(ReadFile(prd, drain_noacc.as_mut_ptr() as *mut c_void, 8, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(&drain_noacc[..got as usize], b"failnoac");
                 // Restore PAGE_READWRITE on subpage 0 to verify the alias write actually landed in subpage 1.
                 assert_eq!(VirtualProtect(plain, PAGE, PAGE_READWRITE, &mut old_p), TRUE);
                 assert_eq!(std::slice::from_raw_parts(plain_rw_sub as *const u8, 8), b"noacc-rw");
+
+                // 6. WriteFile source on a readable 4 KiB sibling sharing a 16 KiB host page with
+                //    a PAGE_GUARD sibling succeeds via the isolated read-only alias without
+                //    consuming or exposing PAGE_GUARD, while reading from the guarded subpage fails.
+                assert_eq!(VirtualProtect(plain, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old_p), TRUE);
+                assert!(needs_io_read_staging(plain_rw_sub as usize, 8));
+                assert_eq!(WriteFile(pwr, plain_rw_sub, 8, &mut written, std::ptr::null_mut()), TRUE);
+                assert_eq!(written, 8);
+                let mut rx = [0u8; 8];
+                assert_eq!(ReadFile(prd, rx.as_mut_ptr() as *mut c_void, 8, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(&rx[..got as usize], b"noacc-rw");
+                // Guard bit on subpage 0 must still be armed and host page still PROT_NONE.
+                assert_eq!(query(plain_base).unwrap().protect, PAGE_READWRITE | PAGE_GUARD);
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(query_host_vm_prot(plain_base), 0, "host page must stay PROT_NONE for PAGE_GUARD sibling");
+                // Passing the PAGE_GUARD subpage itself as a WriteFile source fails cleanly with ERROR_NOACCESS.
+                assert_eq!(WriteFile(pwr, plain, 8, &mut written, std::ptr::null_mut()), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+                assert_eq!(query(plain_base).unwrap().protect, PAGE_READWRITE | PAGE_GUARD);
+
                 HAS_WRITE_WATCH_PAGES.store(prev_ww, std::sync::atomic::Ordering::Release);
                 assert_eq!(VirtualFree(plain, 0, MEM_RELEASE), TRUE);
             }

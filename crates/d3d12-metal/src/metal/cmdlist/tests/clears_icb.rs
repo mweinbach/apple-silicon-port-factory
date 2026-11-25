@@ -819,6 +819,7 @@ fn g45_stage_b_gfx_desc_table_exact_resolves_per_resource_vs_ps_ia_binds_and_gua
         vs: pso_base.vs.clone(),
         ps: pso_base.ps.clone(),
         gs_emu: None,
+        tess_emu: None,
         pre_raster_reads: 0,
         vs_reads_cbv_or_ia: false,
         vs_writes_uav: false,

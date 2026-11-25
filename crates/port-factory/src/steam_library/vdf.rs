@@ -222,10 +222,16 @@ pub fn scan_post_install(game_dir: &Path) -> PostInstallSummary {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
             let fname = entry.file_name().to_string_lossy().into_owned();
             let lower = fname.to_ascii_lowercase();
-            if path.is_dir() {
+            if ft.is_dir() {
                 if lower == "_commonredist" || lower == "redist" || lower == "support" {
                     summary.common_redist_dirs.push(path.clone());
                 }

@@ -437,8 +437,8 @@ d3d11.dll	D3D11CreateDevice	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d11::D3D11Cr
 d3d11.dll	D3D11CreateDeviceAndSwapChain	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d11::D3D11CreateDeviceAndSwapChain	crates/win32-rt/src/d3d11/mod.rs
 d3d11.dll	D3D11On12CreateDevice	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d11::D3D11On12CreateDevice	crates/win32-rt/src/d3d11/mod.rs
 d3d12.dll	D3D12CreateDevice	101	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12CreateDevice	crates/win32-rt/src/d3d12/mod.rs
-d3d12.dll	D3D12CreateRootSignatureDeserializer	107	GRAPHICS_MEDIA_AUDIO	stub	win32_rt::d3d12::D3D12CreateRootSignatureDeserializer	crates/win32-rt/src/d3d12/mod.rs
-d3d12.dll	D3D12CreateVersionedRootSignatureDeserializer	108	GRAPHICS_MEDIA_AUDIO	stub	win32_rt::d3d12::D3D12CreateVersionedRootSignatureDeserializer	crates/win32-rt/src/d3d12/mod.rs
+d3d12.dll	D3D12CreateRootSignatureDeserializer	107	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12CreateRootSignatureDeserializer	crates/win32-rt/src/d3d12/mod.rs
+d3d12.dll	D3D12CreateVersionedRootSignatureDeserializer	108	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12CreateVersionedRootSignatureDeserializer	crates/win32-rt/src/d3d12/mod.rs
 d3d12.dll	D3D12EnableExperimentalFeatures	110	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12EnableExperimentalFeatures	crates/win32-rt/src/d3d12/mod.rs
 d3d12.dll	D3D12GetDebugInterface	102	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12GetDebugInterface	crates/win32-rt/src/d3d12/mod.rs
 d3d12.dll	D3D12GetInterface	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::d3d12::D3D12GetInterface	crates/win32-rt/src/d3d12/mod.rs
@@ -507,7 +507,7 @@ dxgi.dll	CreateDXGIFactory	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::dxgi::CreateDXG
 dxgi.dll	CreateDXGIFactory1	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::dxgi::CreateDXGIFactory1	crates/win32-rt/src/dxgi/mod.rs
 dxgi.dll	CreateDXGIFactory2	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::dxgi::CreateDXGIFactory2	crates/win32-rt/src/dxgi/mod.rs
 dxgi.dll	DXGIDeclareAdapterRemovalSupport	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::dxgi::DXGIDeclareAdapterRemovalSupport	crates/win32-rt/src/dxgi/mod.rs
-dxgi.dll	DXGIGetDebugInterface1	-	GRAPHICS_MEDIA_AUDIO	stub	win32_rt::dxgi::DXGIGetDebugInterface1	crates/win32-rt/src/dxgi/mod.rs
+dxgi.dll	DXGIGetDebugInterface1	-	GRAPHICS_MEDIA_AUDIO	real	win32_rt::dxgi::DXGIGetDebugInterface1	crates/win32-rt/src/dxgi/mod.rs
 eossdk-win64-shipping.dll	EOS_Achievements_CopyAchievementDefinitionV2ByIndex	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_Achievements_CopyAchievementDefinitionV2ByIndex	crates/win32-rt/src/eossdk.rs
 eossdk-win64-shipping.dll	EOS_Achievements_CopyPlayerAchievementByAchievementId	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_Achievements_CopyPlayerAchievementByAchievementId	crates/win32-rt/src/eossdk.rs
 eossdk-win64-shipping.dll	EOS_Achievements_DefinitionV2_Release	-	ENGINE_MIDDLEWARE	real	win32_rt::eossdk::EOS_Achievements_DefinitionV2_Release	crates/win32-rt/src/eossdk.rs
@@ -2808,13 +2808,13 @@ sl.interposer.dll	CreateDXGIFactory	-	ENGINE_MIDDLEWARE	real	win32_rt::dxgi::Cre
 sl.interposer.dll	CreateDXGIFactory1	-	ENGINE_MIDDLEWARE	real	win32_rt::dxgi::CreateDXGIFactory1	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	CreateDXGIFactory2	-	ENGINE_MIDDLEWARE	real	win32_rt::dxgi::CreateDXGIFactory2	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	D3D12CreateDevice	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12CreateDevice	crates/win32-rt/src/slstub.rs
-sl.interposer.dll	D3D12CreateRootSignatureDeserializer	-	ENGINE_MIDDLEWARE	stub	win32_rt::d3d12::D3D12CreateRootSignatureDeserializer	crates/win32-rt/src/slstub.rs
-sl.interposer.dll	D3D12CreateVersionedRootSignatureDeserializer	-	ENGINE_MIDDLEWARE	stub	win32_rt::d3d12::D3D12CreateVersionedRootSignatureDeserializer	crates/win32-rt/src/slstub.rs
+sl.interposer.dll	D3D12CreateRootSignatureDeserializer	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12CreateRootSignatureDeserializer	crates/win32-rt/src/slstub.rs
+sl.interposer.dll	D3D12CreateVersionedRootSignatureDeserializer	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12CreateVersionedRootSignatureDeserializer	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	D3D12EnableExperimentalFeatures	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12EnableExperimentalFeatures	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	D3D12GetDebugInterface	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12GetDebugInterface	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	D3D12SerializeRootSignature	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12SerializeRootSignature	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	D3D12SerializeVersionedRootSignature	-	ENGINE_MIDDLEWARE	real	win32_rt::d3d12::D3D12SerializeVersionedRootSignature	crates/win32-rt/src/slstub.rs
-sl.interposer.dll	DXGIGetDebugInterface1	-	ENGINE_MIDDLEWARE	stub	win32_rt::dxgi::DXGIGetDebugInterface1	crates/win32-rt/src/slstub.rs
+sl.interposer.dll	DXGIGetDebugInterface1	-	ENGINE_MIDDLEWARE	real	win32_rt::dxgi::DXGIGetDebugInterface1	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	slAllocateResources	-	ENGINE_MIDDLEWARE	real	win32_rt::slstub::slAllocateResources	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	slEvaluateFeature	-	ENGINE_MIDDLEWARE	real	win32_rt::slstub::slEvaluateFeature	crates/win32-rt/src/slstub.rs
 sl.interposer.dll	slFreeResources	-	ENGINE_MIDDLEWARE	real	win32_rt::slstub::slFreeResources	crates/win32-rt/src/slstub.rs
