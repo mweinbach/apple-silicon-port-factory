@@ -573,25 +573,40 @@ unsafe fn encode_rdn_value(
     // Per MSDN CERT_RDN_ATTR: CERT_RDN_BMP_STRING (12) and CERT_RDN_UTF8_STRING (13) are
     // ALWAYS supplied as 16-bit Unicode (UTF-16LE) arrays, even for X509_NAME / X509_ANY_STRING.
     let is_utf16_value = unicode || matches!(raw_ty, CERT_RDN_BMP_STRING | CERT_RDN_UTF8_STRING);
-    let text: String = if is_utf16_value {
-        if blob.pb_data.is_null() {
-            String::new()
+    if !is_utf16_value {
+        // Preserve raw 8-bit octets verbatim for non-Unicode string types (e.g. T61String).
+        let raw_bytes: Vec<u8> = if blob.pb_data.is_null() {
+            Vec::new()
         } else if blob.cb_data == 0 {
-            crate::strings::from_wide(blob.pb_data as *const u16)
+            let mut len = 0usize;
+            while *blob.pb_data.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(blob.pb_data, len).to_vec()
         } else {
-            let units = crate::strings::read_wide_slice(
-                blob.pb_data as *const u16,
-                (blob.cb_data as usize) / 2,
-            );
-            String::from_utf16_lossy(&units)
-        }
-    } else if blob.pb_data.is_null() {
+            std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize).to_vec()
+        };
+        let tag = match raw_ty {
+            CERT_RDN_NUMERIC_STRING => 0x12,
+            CERT_RDN_PRINTABLE_STRING => 0x13,
+            CERT_RDN_TELETEX_STRING => 0x14,
+            CERT_RDN_IA5_STRING => 0x16,
+            CERT_RDN_VISIBLE_STRING => 0x1A,
+            _ => 0x0C,
+        };
+        return Some(encode_der_tlv(tag, &raw_bytes));
+    }
+
+    let text: String = if blob.pb_data.is_null() {
         String::new()
     } else if blob.cb_data == 0 {
-        crate::strings::from_ansi(blob.pb_data)
+        crate::strings::from_wide(blob.pb_data as *const u16)
     } else {
-        let s = std::slice::from_raw_parts(blob.pb_data, blob.cb_data as usize);
-        String::from_utf8_lossy(s).into_owned()
+        let units = crate::strings::read_wide_slice(
+            blob.pb_data as *const u16,
+            (blob.cb_data as usize) / 2,
+        );
+        String::from_utf16_lossy(&units)
     };
 
     match raw_ty {

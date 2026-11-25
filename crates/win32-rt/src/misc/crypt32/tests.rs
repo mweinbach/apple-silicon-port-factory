@@ -2517,6 +2517,104 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
             crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
         }
 
+        // 2d. T61String (tag 0x14, CERT_RDN_T61_STRING = 5) with non-UTF-8 octets (0xA3):
+        //     - X509_ANY_STRING / X509_NAME preserve exact 8-bit octet [0xA3, 0x00] (no U+FFFD!)
+        //       and round-trip identically through CryptEncodeObjectEx(X509_NAME).
+        //     - X509_UNICODE_ANY_STRING / X509_UNICODE_NAME fall back to 8-bit U+00A3 -> [0xA3, 0x00, 0x00, 0x00].
+        let t61_a3: [u8; 3] = [0x14, 0x01, 0xA3];
+        {
+            let mut val_ptr: *mut u8 = std::ptr::null_mut();
+            let mut val_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_ANY_STRING as *const u8,
+                    t61_a3.as_ptr(),
+                    t61_a3.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut val_ptr as *mut _ as *mut c_void,
+                    &mut val_len,
+                ),
+                TRUE
+            );
+            assert_eq!(std::ptr::read_unaligned(val_ptr as *const u32), 5); // CERT_RDN_T61_STRING
+            assert_eq!(std::ptr::read_unaligned(val_ptr.add(8) as *const u32), 1);
+            let pb = std::ptr::read_unaligned(val_ptr.add(16) as *const *const u8);
+            assert_eq!(std::slice::from_raw_parts(pb, 2), &[0xA3, 0x00]);
+            crate::kernel32::memory::LocalFree(val_ptr as *mut c_void);
+
+            let mut wval_ptr: *mut u8 = std::ptr::null_mut();
+            let mut wval_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_UNICODE_ANY_STRING as *const u8,
+                    t61_a3.as_ptr(),
+                    t61_a3.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut wval_ptr as *mut _ as *mut c_void,
+                    &mut wval_len,
+                ),
+                TRUE
+            );
+            assert_eq!(std::ptr::read_unaligned(wval_ptr as *const u32), 5);
+            assert_eq!(std::ptr::read_unaligned(wval_ptr.add(8) as *const u32), 2);
+            let wpb = std::ptr::read_unaligned(wval_ptr.add(16) as *const *const u8);
+            assert_eq!(std::slice::from_raw_parts(wpb, 4), &[0xA3, 0x00, 0x00, 0x00]);
+            crate::kernel32::memory::LocalFree(wval_ptr as *mut c_void);
+        }
+        let mut t61_atv_body = super::asn1::encode_der_tlv(0x06, &[0x55, 0x04, 0x03]);
+        t61_atv_body.extend_from_slice(&t61_a3);
+        let t61_name_der = super::asn1::encode_der_tlv(
+            0x30,
+            &super::asn1::encode_der_tlv(0x31, &super::asn1::encode_der_tlv(0x30, &t61_atv_body)),
+        );
+        {
+            let mut ni_ptr: *mut CertNameInfo = std::ptr::null_mut();
+            let mut ni_len = 0u32;
+            assert_eq!(
+                CryptDecodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_NAME as *const u8,
+                    t61_name_der.as_ptr(),
+                    t61_name_der.len() as u32,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut ni_ptr as *mut _ as *mut c_void,
+                    &mut ni_len,
+                ),
+                TRUE
+            );
+            let ni_t = std::ptr::read_unaligned(ni_ptr);
+            let rdn_t = std::ptr::read_unaligned(ni_t.rg_rdn);
+            let attr_t = std::ptr::read_unaligned(rdn_t.rg_rdn_attr);
+            assert_eq!(attr_t.dw_value_type, 5);
+            assert_eq!(attr_t.value.cb_data, 1);
+            assert_eq!(std::slice::from_raw_parts(attr_t.value.pb_data, 2), &[0xA3, 0x00]);
+            let mut re_ptr: *mut u8 = std::ptr::null_mut();
+            let mut re_len = 0u32;
+            assert_eq!(
+                CryptEncodeObjectEx(
+                    X509_ASN_ENCODING,
+                    super::asn1::X509_NAME as *const u8,
+                    ni_ptr as *const c_void,
+                    0x8000,
+                    std::ptr::null(),
+                    &mut re_ptr as *mut _ as *mut c_void,
+                    &mut re_len,
+                ),
+                TRUE
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(re_ptr, re_len as usize),
+                t61_name_der.as_slice()
+            );
+            crate::kernel32::memory::LocalFree(re_ptr as *mut c_void);
+            crate::kernel32::memory::LocalFree(ni_ptr as *mut c_void);
+        }
+
         // 3. X509_ENHANCED_KEY_USAGE + X509_INTEGER + X509_ENUMERATED + X509_OBJECT_IDENTIFIER + X509_OCTET_STRING
         let eku_oids = [b"1.3.6.1.5.5.7.3.1\0".as_ptr(), b"1.3.6.1.5.5.7.3.3\0".as_ptr()];
         let eku_in = CertEnhkeyUsage {

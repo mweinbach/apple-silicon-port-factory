@@ -273,13 +273,32 @@ fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerIte
     arena.write_u32(field_off, rdn_ty);
     // field_off + 8 is CryptDataBlob (16 bytes)
     match item.tag {
-        0x0C | 0x12 | 0x13 | 0x14 | 0x16 | 0x1A => {
-            let s = String::from_utf8_lossy(item.val);
+        0x0C => {
             // Per MSDN CERT_RDN_ATTR: CERT_RDN_UTF8_STRING (0x0C) is ALWAYS decoded into
             // 16-bit Unicode (UTF-16LE) characters (UTF-8 is only on the wire), even when
             // decoded via X509_NAME or X509_ANY_STRING.
-            if unicode || item.tag == 0x0C {
-                let units: Vec<u16> = s.encode_utf16().collect();
+            let s = String::from_utf8_lossy(item.val);
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let mut bytes = Vec::with_capacity(units.len() * 2 + 2);
+            for u in &units {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[0, 0]);
+            let ptr_off = arena.alloc_aligned(bytes.len(), 2);
+            arena.buf[ptr_off..ptr_off + bytes.len()].copy_from_slice(&bytes);
+            arena.write_u32(field_off + 8, (units.len() * 2) as u32);
+            arena.write_ptr(field_off + 16, Some(ptr_off));
+        }
+        0x12 | 0x13 | 0x14 | 0x16 | 0x1A => {
+            if unicode {
+                // Per MSDN CERT_RDN_ATTR (especially CERT_RDN_T61_STRING 0x14): try UTF-8
+                // first, falling back to 8-bit zero-extended code units rather than inserting
+                // U+FFFD replacement characters for valid non-UTF-8 octets.
+                let units: Vec<u16> = if let Ok(utf8) = std::str::from_utf8(item.val) {
+                    utf8.encode_utf16().collect()
+                } else {
+                    item.val.iter().map(|&b| b as u16).collect()
+                };
                 let mut bytes = Vec::with_capacity(units.len() * 2 + 2);
                 for u in &units {
                     bytes.extend_from_slice(&u.to_le_bytes());
@@ -290,7 +309,9 @@ fn decode_rdn_value_into(arena: &mut DecodeArena, field_off: usize, item: DerIte
                 arena.write_u32(field_off + 8, (units.len() * 2) as u32);
                 arena.write_ptr(field_off + 16, Some(ptr_off));
             } else {
-                let mut bytes = s.as_bytes().to_vec();
+                // Preserve exact 8-bit octets + NUL terminator without lossy UTF-8 rewriting.
+                let mut bytes = Vec::with_capacity(item.val.len() + 1);
+                bytes.extend_from_slice(item.val);
                 let len = bytes.len();
                 bytes.push(0);
                 let ptr_off = arena.push_bytes(&bytes);
