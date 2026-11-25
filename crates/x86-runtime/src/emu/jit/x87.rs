@@ -26,9 +26,9 @@ use super::*;
 use crate::emu::fast::{self, FastOp};
 use crate::emu::mem;
 use crate::emu::x87::{
-    X87Helpers, OFF_X87_CW, OFF_X87_FIP, OFF_X87_SW, OFF_X87_TOP, OFF_X87_VALID, SW_C0, SW_C1,
-    SW_C2, SW_C3, SW_IE, SW_SF, X87_CONST_ONE, X87_CONST_ZERO, X87_OP_ADD, X87_OP_DIV, X87_OP_MUL,
-    X87_OP_SUB, X87_OP_SUBR, X87_UNARY_RNDINT, X87_UNARY_SQRT,
+    X87Helpers, OFF_X87_CW, OFF_X87_FDP, OFF_X87_FIP, OFF_X87_FOP, OFF_X87_SW, OFF_X87_TOP,
+    OFF_X87_VALID, SW_C0, SW_C1, SW_C2, SW_C3, SW_IE, SW_SF, X87_CONST_ONE, X87_CONST_ZERO,
+    X87_OP_ADD, X87_OP_DIV, X87_OP_MUL, X87_OP_SUB, X87_OP_SUBR, X87_UNARY_RNDINT, X87_UNARY_SQRT,
 };
 use core::mem::offset_of;
 
@@ -1123,6 +1123,27 @@ impl Tr<'_> {
             }
             _ => unreachable!("invalid K_X87 sub-op {sub}"),
         }
+        self.emit_record_x87_env(op);
+    }
+
+    /// Update x87 environment metadata (`FIP`, `FOP`, and for memory data instructions `FDP`)
+    /// after a data x87 instruction succeeds, matching `regfile_ext::record_x87_environment`.
+    /// Preserves `NZCV` (so fused `fcomi`/`fucomi` flags remain live).
+    fn emit_record_x87_env(&mut self, op: &FastOp) {
+        if (op.imm & fast::X87_ENV_RECORD) == 0 {
+            return;
+        }
+        let fop = (op.imm & 0x7FF) as u32;
+        let has_mem = (op.imm & fast::X87_ENV_HAS_MEM) != 0;
+        let fdp_reg = if has_mem { Some(self.addr_into(op, T1)) } else { None };
+        self.load_x87_state();
+        self.mov_lit(T0, op.ip);
+        self.a.str(64, T0, XA, OFF_X87_FIP);
+        if let Some(r) = fdp_reg {
+            self.a.str(64, r, XA, OFF_X87_FDP);
+        }
+        self.a.movz(false, T0, fop, 0);
+        self.a.str(16, T0, XA, OFF_X87_FOP);
     }
 
     /// Execute one scalar ARM64 FP binary op on `(v0, v1) -> v0` with `FPCR` isolated from
@@ -1313,10 +1334,20 @@ impl Tr<'_> {
         emit_f80_to_f64_exact(&mut self.a, T4, T5, T0, T2, XS, &mut cold_sites);
         self.a.fmov_gf(true, 0, T0);
         // Execute isolated native ARM64 f64 op -> d0, FPSR in T5.
-        // Once `IOC|DZC|OFC|UFC == 0` passes, `d0` is guaranteed normal finite or ±0.0 so
-        // `T6` is no longer needed for cold recovery and can safely hold the result bits.
+        // An exact f64 subnormal result (e.g. 2^-1022 * 0.5 = 2^-1023) does not set FPSR.UFC,
+        // so verify `d0` is normal or ±0.0 in T0 BEFORE overwriting T6 (which holds the loaded
+        // memory RHS required by `X87ColdKind::BinopMem`).
         self.emit_isolated_fp_binop(XA, true, op_code, T5, T0, T2, XS, &mut cold_sites);
-        self.a.fmov_fg(true, T6, 0);
+        self.a.fmov_fg(true, T0, 0);
+        self.a.ubfx(T2, T0, 52, 11);
+        self.a.addsub_ri(false, true, true, ZR, T2, 0x7FF, false);
+        cold_sites.push(self.a.bcond(EQ));
+        let res_norm = self.a.cbnz(false, T2);
+        self.a.lsl_i(true, T2, T0, 1);
+        cold_sites.push(self.a.cbnz(true, T2)); // exact subnormal -> cold with T6 intact!
+        self.a.bind(res_norm);
+        // Past this point `emit_f64_to_f80` cannot branch to cold; T6 is safe to reuse.
+        self.a.mov_rr(true, T6, T0);
         emit_f64_to_f80(&mut self.a, T6, T0, T2, T3, T4, XS, &mut cold_sites);
         self.a.stp_x(T0, T2, T1, 0);
         self.a.ldr(16, T0, XA, OFF_X87_SW);

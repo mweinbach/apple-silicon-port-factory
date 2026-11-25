@@ -63,7 +63,6 @@ fn assert_x87_eq(label: &str, got: &X87State, want: &X87State) {
 /// Asserts all three produce bit-for-bit identical `rax`, memory buffer, and `X87State`,
 /// and returns the verified result.
 fn run_diff_x87(label: &str, bytes: &[u8], init_data: &[u8]) -> RunResult {
-    let _guard = X87Guard::new();
     let code_cap = (bytes.len() + 64).max(256);
     let code = arena_alloc(code_cap, 16);
     unsafe {
@@ -71,14 +70,23 @@ fn run_diff_x87(label: &str, bytes: &[u8], init_data: &[u8]) -> RunResult {
         core::ptr::write_bytes(code.add(bytes.len()), 0xCC, 16);
     }
     let data_len = init_data.len().max(64);
-    let d_gen = arena_alloc(data_len, 64);
-    let d_fast = arena_alloc(data_len, 64);
-    let d_jit = arena_alloc(data_len, 64);
+    let d_buf = arena_alloc(data_len, 64);
+    run_diff_x87_at(label, code, d_buf, data_len, init_data)
+}
 
-    // 1. Generic interpreter (pure `exec_generic_ins` reference)
+fn run_diff_x87_at(
+    label: &str,
+    code: *mut u8,
+    d_buf: *mut u8,
+    data_len: usize,
+    init_data: &[u8],
+) -> RunResult {
+    let _guard = X87Guard::new();
+
+    // 1. Generic interpreter (pure `exec_generic_ins` + `record_x87_environment`, matching `interp.rs`)
     let gen_res = unsafe {
-        core::ptr::write_bytes(d_gen, 0, data_len);
-        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_gen, init_data.len());
+        core::ptr::write_bytes(d_buf, 0, data_len);
+        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_buf, init_data.len());
         x87_reset();
         let stack = arena_alloc(0x4000, 16);
         let rsp_val = stack as u64 + 0x3F00;
@@ -86,7 +94,7 @@ fn run_diff_x87(label: &str, bytes: &[u8], init_data: &[u8]) -> RunResult {
         core::ptr::write_unaligned(rsp_val as *mut u64, sentinel);
         let mut cpu = Cpu::new_zeroed();
         cpu.rip = code as u64;
-        cpu.gpr[1] = d_gen as u64; // rcx
+        cpu.gpr[1] = d_buf as u64; // rcx
         cpu.gpr[4] = rsp_val; // rsp
         let mut steps = 0usize;
         while cpu.rip != sentinel && steps < 20_000 {
@@ -110,28 +118,29 @@ fn run_diff_x87(label: &str, bytes: &[u8], init_data: &[u8]) -> RunResult {
                     cpu.exec_generic_ins(&ins),
                     "{label}: generic interpreter failed on {ins:?}"
                 );
+                crate::emu::regfile_ext::record_x87_environment(&cpu, &ins);
             }
             steps += 1;
         }
         assert_eq!(cpu.rip, sentinel, "{label}: generic interpreter did not return cleanly");
         RunResult {
             rax: cpu.gpr[0],
-            data: core::slice::from_raw_parts(d_gen, init_data.len()).to_vec(),
+            data: core::slice::from_raw_parts(d_buf, init_data.len()).to_vec(),
             x87: x87_snapshot(),
         }
     };
 
     // 2. FastOp interpreter (`jit::force(2)`)
     let fast_res = unsafe {
-        core::ptr::write_bytes(d_fast, 0, data_len);
-        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_fast, init_data.len());
+        core::ptr::write_bytes(d_buf, 0, data_len);
+        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_buf, init_data.len());
         x87_reset();
         jit::force(2);
-        let (ret_rax, _) = emu_run_full(code as u64, [d_fast as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+        let (ret_rax, _) = emu_run_full(code as u64, [d_buf as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
         jit::force(0);
         RunResult {
             rax: ret_rax,
-            data: core::slice::from_raw_parts(d_fast, init_data.len()).to_vec(),
+            data: core::slice::from_raw_parts(d_buf, init_data.len()).to_vec(),
             x87: x87_snapshot(),
         }
     };
@@ -139,15 +148,15 @@ fn run_diff_x87(label: &str, bytes: &[u8], init_data: &[u8]) -> RunResult {
     // 3. Live ARM64 JIT (`jit::force(1)`)
     let jit_before = jit::test_executed();
     let jit_res = unsafe {
-        core::ptr::write_bytes(d_jit, 0, data_len);
-        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_jit, init_data.len());
+        core::ptr::write_bytes(d_buf, 0, data_len);
+        core::ptr::copy_nonoverlapping(init_data.as_ptr(), d_buf, init_data.len());
         x87_reset();
         jit::force(1);
-        let (ret_rax, _) = emu_run_full(code as u64, [d_jit as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+        let (ret_rax, _) = emu_run_full(code as u64, [d_buf as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
         jit::force(0);
         RunResult {
             rax: ret_rax,
-            data: core::slice::from_raw_parts(d_jit, init_data.len()).to_vec(),
+            data: core::slice::from_raw_parts(d_buf, init_data.len()).to_vec(),
             x87: x87_snapshot(),
         }
     };
@@ -1230,11 +1239,11 @@ fn x87_aot_inclusion_and_static_macho_zero_relocs() {
     init[8..16].copy_from_slice(&4.0f64.to_bits().to_le_bytes());
     init[16..24].copy_from_slice(&(core::f64::consts::FRAC_PI_4).to_bits().to_le_bytes());
     init[32..42].copy_from_slice(&[0x21, 0x43, 0x65, 0x87, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    let ref_res = run_diff_x87("x87_aot_vs_jit_interp", &bytes, &init);
+    let d_aot = arena_alloc(init.len(), 64);
+    let ref_res = run_diff_x87_at("x87_aot_vs_jit_interp", code, d_aot, init.len(), &init);
 
     let batch = unsafe { aot::VerifyAotBatch::build(&ips, 1) }.expect("build VerifyAotBatch for x87");
     let (enter, entry_code) = batch.block_entry(code as u64).expect("x87 block entry in AOT batch");
-    let d_aot = arena_alloc(init.len(), 64);
     let stack = arena_alloc(0x4000, 16);
     let rsp_val = stack as u64 + 0x3F00;
     let sentinel = 0xDEAD_BEEF_CAFE_0000u64;
@@ -1551,4 +1560,101 @@ fn x87_add_sub_zero_precision_rounding() {
 
     assert_eq!(rd_m80(176), (0x8000_0000_0000_0008, 0x3FFF));
     assert_eq!(rd_sw(76) & SW_PE, 0, "PC=64 RN (x + 0) must stay exact with PE=0");
+}
+
+/// 11. Regressions for:
+///   (a) `BinopMem` producing an exact `f64` subnormal without setting `FPSR.UFC` (e.g.
+///       `2^-1022 * 0.5 = 2^-1023`, `2^-1022 / 2.0 = 2^-1023`, `(2^-1022 + 2^-1023) - 2^-1022`):
+///       must preserve the loaded RHS in `T6` when branching to the cold helper!
+///   (b) x87 environment bookkeeping (`FIP`, `FDP`, `FOP`) across Generic, FastOp, Live JIT,
+///       `fnstenv`, and `fxsave`: data instructions update `FIP`/`FOP` (and `FDP` if memory),
+///       while control instructions (`fnstcw`) leave `FIP`/`FDP`/`FOP` untouched.
+#[test]
+fn x87_env_fip_fdp_fop_and_exact_subnormal_mul_mem() {
+    let _guard = X87Guard::new();
+    let mut init = vec![0u8; 768];
+    let min_norm: f64 = f64::from_bits(0x0010_0000_0000_0000); // 2^-1022
+    let half: f64 = 0.5;
+    let two: f64 = 2.0;
+    let one_and_half_min: f64 = f64::from_bits(0x0018_0000_0000_0000); // 1.5 * 2^-1022
+    init[0..8].copy_from_slice(&min_norm.to_bits().to_le_bytes());
+    init[8..16].copy_from_slice(&half.to_bits().to_le_bytes());
+    init[16..24].copy_from_slice(&two.to_bits().to_le_bytes());
+    init[24..32].copy_from_slice(&one_and_half_min.to_bits().to_le_bytes());
+    init[32..34].copy_from_slice(&0x027Fu16.to_le_bytes()); // CW: PC=53, RN
+
+    // (a) Exact f64 subnormal results in BinopMem (PC=53, FPSR.UFC == 0)
+    let subnorm_code = assemble(|a| {
+        a.fninit().unwrap();
+        a.fldcw(word_ptr(rcx + 32)).unwrap();
+        // 2^-1022 * 0.5 = 2^-1023 (exact normal 80-bit: sig=0x8000..0, se=0x3C00)
+        a.fld(qword_ptr(rcx)).unwrap();
+        a.fmul(qword_ptr(rcx + 8)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 64)).unwrap();
+
+        // 2^-1022 / 2.0 = 2^-1023
+        a.fld(qword_ptr(rcx)).unwrap();
+        a.fdiv(qword_ptr(rcx + 16)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 80)).unwrap();
+
+        // 1.5 * 2^-1022 - 2^-1022 = 2^-1023
+        a.fld(qword_ptr(rcx + 24)).unwrap();
+        a.fsub(qword_ptr(rcx)).unwrap();
+        a.fstp(tbyte_ptr(rcx + 96)).unwrap();
+    });
+    let sr = run_diff_x87("exact_subnormal_binop_mem", &subnorm_code, &init);
+    let rd_m80 = |data: &[u8], off: usize| -> (u64, u16) {
+        (
+            u64::from_le_bytes(data[off..off + 8].try_into().unwrap()),
+            u16::from_le_bytes(data[off + 8..off + 10].try_into().unwrap()),
+        )
+    };
+    // 2^-1023 in 80-bit extended: unbiased exp = -1023 -> biased = 16383 - 1023 = 15360 = 0x3C00
+    assert_eq!(rd_m80(&sr.data, 64), (0x8000_0000_0000_0000, 0x3C00), "2^-1022 * 0.5");
+    assert_eq!(rd_m80(&sr.data, 80), (0x8000_0000_0000_0000, 0x3C00), "2^-1022 / 2.0");
+    assert_eq!(rd_m80(&sr.data, 96), (0x8000_0000_0000_0000, 0x3C00), "1.5*2^-1022 - 2^-1022");
+
+    // (b) x87 environment bookkeeping (FIP/FDP/FOP) via fnstenv AND fxsave
+    let env_code = assemble(|a| {
+        a.fninit().unwrap();
+        // Memory data op: sets FIP, FDP = rcx + 8, FOP = DD 41 -> ((5 << 8) | 0x41) = 0x0541
+        a.fld(qword_ptr(rcx + 8)).unwrap();
+        a.fnstenv(ptr(rcx + 64)).unwrap();
+        a.fxsave64(ptr(rcx + 192)).unwrap(); // 16-byte aligned (d_buf is 64-byte aligned)
+        // Non-memory data op: updates FIP & FOP (D8 C0 -> 0x00C0), preserves FDP = rcx + 8
+        a.fadd_2(st0, st0).unwrap();
+        a.fnstenv(ptr(rcx + 96)).unwrap();
+        // Control op: must NOT alter FIP, FDP, or FOP!
+        a.fnstcw(word_ptr(rcx + 128)).unwrap();
+        a.fnstenv(ptr(rcx + 144)).unwrap();
+    });
+    let code_cap = (env_code.len() + 64).max(256);
+    let code = arena_alloc(code_cap, 16);
+    unsafe {
+        core::ptr::copy_nonoverlapping(env_code.as_ptr(), code, env_code.len());
+        core::ptr::write_bytes(code.add(env_code.len()), 0xCC, 16);
+    }
+    let d_buf = arena_alloc(init.len(), 64);
+    let er = run_diff_x87_at("x87_env_fip_fdp_fop", code, d_buf, init.len(), &init);
+
+    // Verify exact non-zero FIP/FDP/FOP recorded by fld and fadd, preserved across fnstcw!
+    let fip_after_fld = u32::from_le_bytes(er.data[64 + 12..64 + 16].try_into().unwrap());
+    let fop_after_fld = u16::from_le_bytes(er.data[64 + 18..64 + 20].try_into().unwrap());
+    let fdp_after_fld = u32::from_le_bytes(er.data[64 + 20..64 + 24].try_into().unwrap());
+    assert_ne!(fip_after_fld, 0, "fnstenv after fld must record non-zero FIP");
+    assert_eq!(fdp_after_fld, (d_buf as u64 + 8) as u32, "fnstenv after fld must record FDP = rcx + 8");
+    assert_ne!(fop_after_fld, 0, "fnstenv after fld must record non-zero FOP");
+    // fxsave at +192: FOP at +6, FIP (64-bit) at +8, FDP (64-bit) at +16
+    assert_eq!(u16::from_le_bytes(er.data[192 + 6..192 + 8].try_into().unwrap()), fop_after_fld);
+    assert_eq!(u64::from_le_bytes(er.data[192 + 8..192 + 16].try_into().unwrap()) as u32, fip_after_fld);
+    assert_eq!(u64::from_le_bytes(er.data[192 + 16..192 + 24].try_into().unwrap()), d_buf as u64 + 8);
+    // After fadd st0, st0: FIP moved forward, FOP updated, FDP preserved!
+    let fip_after_fadd = u32::from_le_bytes(er.data[96 + 12..96 + 16].try_into().unwrap());
+    let fop_after_fadd = u16::from_le_bytes(er.data[96 + 18..96 + 20].try_into().unwrap());
+    let fdp_after_fadd = u32::from_le_bytes(er.data[96 + 20..96 + 24].try_into().unwrap());
+    assert_ne!(fip_after_fadd, fip_after_fld, "fadd must advance FIP");
+    assert_eq!(fop_after_fadd, 0x00C0, "fadd st0, st0 FOP must be 0x00C0");
+    assert_eq!(fdp_after_fadd, fdp_after_fld, "non-memory fadd must preserve FDP");
+    // After fnstcw (control op): FIP, FOP, FDP all unchanged!
+    assert_eq!(&er.data[144 + 12..144 + 24], &er.data[96 + 12..96 + 24], "fnstcw must not alter FIP/FOP/FDP");
 }

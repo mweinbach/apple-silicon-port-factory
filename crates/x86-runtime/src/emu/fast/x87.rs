@@ -21,6 +21,12 @@ use iced_x86::{Instruction, MemorySize, Mnemonic};
 /// Pre-decoded x87 FPU instruction (`FastOp::x & 0x3F` holds the `X87_*` sub-op).
 pub(in crate::emu) const K_X87: u8 = 127;
 
+/// Bit flags in `FastOp::imm` for `K_X87` environment bookkeeping (`FIP`/`FDP`/`FOP`):
+/// low 11 bits hold the x87 opcode (`((escape & 7) << 8) | modrm`).
+pub(in crate::emu) const X87_ENV_RECORD: u64 = 1 << 16;
+/// Set alongside `X87_ENV_RECORD` when the data instruction has a memory operand (`FDP` updated).
+pub(in crate::emu) const X87_ENV_HAS_MEM: u64 = 1 << 17;
+
 // `FastOp::x & 0x3F` sub-op codes (0..=27; high 2 bits of `x` are reserved for SIB scale).
 pub(in crate::emu) const X87_FNINIT: u8 = 0;
 pub(in crate::emu) const X87_FNCLEX: u8 = 1;
@@ -89,6 +95,24 @@ fn set_sub(f: &mut FastOp, sub: u8) {
 fn fenv_size16(ins: &Instruction) -> bool {
     matches!(ins.memory_size(), MemorySize::FpuEnv14 | MemorySize::FpuState94)
         || matches!(ins.memory_size().size(), 14 | 94)
+}
+
+/// Compute the 11-bit x87 `FOP` (`((escape_byte & 7) << 8) | modrm`) directly from the decoded
+/// `iced_x86::Instruction` without dereferencing guest memory, matching `regfile_ext::record_x87_environment`.
+fn encode_x87_fop(ins: &Instruction) -> Option<u16> {
+    let mut enc = iced_x86::Encoder::new(64);
+    enc.encode(ins, ins.ip()).ok()?;
+    let buf = enc.take_buffer();
+    let mut bytes = buf.iter().copied().skip_while(|b| {
+        matches!(
+            b,
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0x40..=0x4f | 0xf2 | 0xf3
+        )
+    });
+    let (Some(op @ 0xd8..=0xdf), Some(modrm)) = (bytes.next(), bytes.next()) else {
+        return None;
+    };
+    Some((u16::from(op & 7) << 8) | u16::from(modrm))
 }
 
 pub(super) fn lower_x87(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
@@ -435,6 +459,25 @@ pub(super) fn lower_x87(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
         }
         _ => return None,
     }
+    let sub = f.x & 0x3F;
+    let is_control = matches!(
+        sub,
+        X87_FNINIT
+            | X87_FNCLEX
+            | X87_FLDCW
+            | X87_FNSTCW
+            | X87_FNSTSW_AX
+            | X87_FNSTSW_M
+            | X87_FENV
+    );
+    if !is_control {
+        if let Some(fop) = encode_x87_fop(ins) {
+            let has_mem = (0..n).any(|i| ins.op_kind(i) == OpKind::Memory);
+            f.imm = X87_ENV_RECORD
+                | if has_mem { X87_ENV_HAS_MEM } else { 0 }
+                | (fop as u64);
+        }
+    }
     Some(f)
 }
 
@@ -756,5 +799,20 @@ pub(super) unsafe fn exec_x87_fast(cpu: &mut Cpu, op: &FastOp) {
             }
         }
         _ => {}
+    }
+    if (op.imm & X87_ENV_RECORD) != 0 && !fault_pending() {
+        let fop = (op.imm & 0x7FF) as u16;
+        let fdp = if (op.imm & X87_ENV_HAS_MEM) != 0 {
+            Some(cpu.faddr(op))
+        } else {
+            None
+        };
+        with_x87_mut(|st| {
+            st.fip = op.ip;
+            st.fop = fop;
+            if let Some(addr) = fdp {
+                st.fdp = addr;
+            }
+        });
     }
 }
