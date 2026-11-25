@@ -114,6 +114,7 @@ pub(super) struct FontMeta {
     pub(super) metrics: DWRITE_FONT_METRICS,
     pub(super) info_strings: HashMap<u32, String>,
     pub(super) file_path: Option<PathBuf>,
+    pub(super) raw_bytes: Option<Arc<Vec<u8>>>,
 }
 
 fn parse_sfnt_face_meta(
@@ -331,7 +332,204 @@ fn parse_sfnt_face_meta(
         },
         info_strings,
         file_path: Some(path.to_path_buf()),
+        raw_bytes: None,
     })
+}
+
+fn parse_sfnt_face_meta_slice(
+    raw: &Arc<Vec<u8>>,
+    sfnt_offset: usize,
+    face_index: u32,
+    is_ttc: bool,
+    default_stem: &str,
+) -> Option<FontMeta> {
+    let b = raw.as_slice();
+    let hdr = b.get(sfnt_offset..sfnt_offset.checked_add(12)?)?;
+    let sfnt_ver = be_u32(hdr, 0)?;
+    let face_type = match sfnt_ver {
+        0x0001_0000 | 0x7472_7565 => {
+            if is_ttc {
+                DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION
+            } else {
+                DWRITE_FONT_FACE_TYPE_TRUETYPE
+            }
+        }
+        0x4F54_544F => DWRITE_FONT_FACE_TYPE_CFF,
+        _ => return None,
+    };
+    let num_tables = be_u16(hdr, 4)? as usize;
+    if num_tables == 0 || num_tables > 256 {
+        return None;
+    }
+    let dir = b.get(sfnt_offset + 12..sfnt_offset + 12 + num_tables * 16)?;
+    let mut tables: HashMap<[u8; 4], (usize, usize)> = HashMap::with_capacity(num_tables);
+    for i in 0..num_tables {
+        let base = i * 16;
+        let tag = [dir[base], dir[base + 1], dir[base + 2], dir[base + 3]];
+        let off = be_u32(dir, base + 8)? as usize;
+        let len = be_u32(dir, base + 12)? as usize;
+        if off.saturating_add(len) <= b.len() {
+            tables.insert(tag, (off, len));
+        }
+    }
+    let load_tbl = |tag: &[u8; 4]| -> Option<&[u8]> {
+        let &(off, len) = tables.get(tag)?;
+        b.get(off..off + len.min(256 * 1024))
+    };
+
+    let head = load_tbl(b"head")?;
+    let upem = be_u16(head, 18).unwrap_or(2048).max(16);
+    let mac_style = be_u16(head, 44).unwrap_or(0);
+    let hhea = load_tbl(b"hhea");
+    let maxp = load_tbl(b"maxp");
+    let os2 = load_tbl(b"OS/2");
+    let post = load_tbl(b"post");
+    let name_tbl = load_tbl(b"name");
+
+    let glyph_count = maxp.and_then(|t| be_u16(t, 4)).unwrap_or(256).max(1);
+    let hhea_asc = hhea.and_then(|t| be_i16(t, 4)).unwrap_or(((upem as i32 * 80) / 100) as i16);
+    let hhea_desc = hhea.and_then(|t| be_i16(t, 6)).unwrap_or(-((upem as i32 * 20) / 100) as i16);
+    let hhea_gap = hhea.and_then(|t| be_i16(t, 8)).unwrap_or(0);
+
+    let mut weight = if (mac_style & 1) != 0 { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL };
+    let mut stretch = DWRITE_FONT_STRETCH_NORMAL;
+    let mut style = if (mac_style & 2) != 0 { DWRITE_FONT_STYLE_ITALIC } else { DWRITE_FONT_STYLE_NORMAL };
+    let mut ascent = hhea_asc.max(0) as u16;
+    let mut descent = hhea_desc.unsigned_abs();
+    let mut line_gap = hhea_gap;
+    let mut cap_height = ((upem as u32 * 70) / 100) as u16;
+    let mut x_height = ((upem as u32 * 50) / 100) as u16;
+    let mut strike_pos = ((upem as i32 * 26) / 100) as i16;
+    let mut strike_thick = ((upem as u32 * 5) / 100).max(1) as u16;
+
+    if let Some(t) = os2 {
+        let ver = be_u16(t, 0).unwrap_or(0);
+        if let Some(w) = be_u16(t, 4) {
+            if (100..=999).contains(&w) { weight = w as u32; }
+        }
+        if let Some(st) = be_u16(t, 6) {
+            if (1..=9).contains(&st) { stretch = st as u32; }
+        }
+        if let Some(ss) = be_i16(t, 26) { if ss > 0 { strike_thick = ss as u16; } }
+        if let Some(sp) = be_i16(t, 28) { strike_pos = sp; }
+        let fs_sel = be_u16(t, 62).unwrap_or(0);
+        if (fs_sel & 1) != 0 {
+            style = DWRITE_FONT_STYLE_ITALIC;
+        } else if (fs_sel & (1 << 9)) != 0 {
+            style = DWRITE_FONT_STYLE_OBLIQUE;
+        }
+        if (fs_sel & (1 << 5)) != 0 && weight < 600 {
+            weight = DWRITE_FONT_WEIGHT_BOLD;
+        }
+        if (fs_sel & (1 << 7)) != 0 {
+            if let Some(ta) = be_i16(t, 68) { ascent = ta.max(0) as u16; }
+            if let Some(td) = be_i16(t, 70) { descent = td.unsigned_abs(); }
+            if let Some(tg) = be_i16(t, 72) { line_gap = tg; }
+        } else {
+            if let Some(wa) = be_u16(t, 74) { if wa > 0 { ascent = wa; } }
+            if let Some(wd) = be_u16(t, 76) { if wd > 0 { descent = wd; } }
+        }
+        if ver >= 2 {
+            if let Some(xh) = be_i16(t, 86) { if xh > 0 { x_height = xh as u16; } }
+            if let Some(ch) = be_i16(t, 88) { if ch > 0 { cap_height = ch as u16; } }
+        }
+    }
+
+    let mut underline_pos = -((upem as i32 * 10) / 100) as i16;
+    let mut underline_thick = ((upem as u32 * 5) / 100).max(1) as u16;
+    let mut is_monospace = false;
+    if let Some(t) = post {
+        if let Some(up) = be_i16(t, 8) { underline_pos = up; }
+        if let Some(ut) = be_i16(t, 10) { if ut > 0 { underline_thick = ut as u16; } }
+        if let Some(fp) = be_u32(t, 12) { is_monospace = fp != 0; }
+    }
+
+    let names = name_tbl.map(parse_name_table).unwrap_or_default();
+    let family_name = names
+        .get(&16)
+        .or_else(|| names.get(&1))
+        .cloned()
+        .unwrap_or_else(|| default_stem.to_string());
+    let face_name = names
+        .get(&17)
+        .or_else(|| names.get(&2))
+        .cloned()
+        .unwrap_or_else(|| "Regular".to_string());
+    let lower_fam = family_name.to_ascii_lowercase();
+    if lower_fam.contains("mono")
+        || lower_fam.contains("courier")
+        || lower_fam.contains("menlo")
+        || lower_fam.contains("consolas")
+    {
+        is_monospace = true;
+    }
+    let is_symbol = lower_fam.contains("symbol")
+        || lower_fam.contains("wingding")
+        || lower_fam.contains("webding");
+
+    let mut info_strings = HashMap::new();
+    for &(name_id, info_id) in &[
+        (0u16, DWRITE_INFO_COPYRIGHT_NOTICE),
+        (5, DWRITE_INFO_VERSION_STRINGS),
+        (7, DWRITE_INFO_TRADEMARK),
+        (8, DWRITE_INFO_MANUFACTURER),
+        (9, DWRITE_INFO_DESIGNER),
+        (10, DWRITE_INFO_DESCRIPTION),
+        (13, DWRITE_INFO_LICENSE_DESCRIPTION),
+        (4, DWRITE_INFO_FULL_NAME),
+        (6, DWRITE_INFO_POSTSCRIPT_NAME),
+    ] {
+        if let Some(v) = names.get(&name_id) {
+            info_strings.insert(info_id, v.clone());
+        }
+    }
+
+    Some(FontMeta {
+        family_name,
+        face_name,
+        weight,
+        stretch,
+        style,
+        is_symbol,
+        is_monospace,
+        face_type,
+        face_index,
+        glyph_count,
+        metrics: DWRITE_FONT_METRICS {
+            designUnitsPerEm: upem,
+            ascent,
+            descent,
+            lineGap: line_gap,
+            capHeight: cap_height,
+            xHeight: x_height,
+            underlinePosition: underline_pos,
+            underlineThickness: underline_thick,
+            strikethroughPosition: strike_pos,
+            strikethroughThickness: strike_thick,
+        },
+        info_strings,
+        file_path: None,
+        raw_bytes: Some(Arc::clone(raw)),
+    })
+}
+
+pub(super) fn parse_font_bytes_metadata(raw: Arc<Vec<u8>>, default_stem: &str) -> Vec<FontMeta> {
+    let b = raw.as_slice();
+    let Some(tag) = be_u32(b, 0) else { return Vec::new() };
+    if tag == 0x7474_6366 {
+        let num_fonts = be_u32(b, 8).unwrap_or(0).min(32) as usize;
+        let mut out = Vec::with_capacity(num_fonts);
+        for i in 0..num_fonts {
+            if let Some(off) = be_u32(b, 12 + i * 4) {
+                if let Some(meta) = parse_sfnt_face_meta_slice(&raw, off as usize, i as u32, true, default_stem) {
+                    out.push(meta);
+                }
+            }
+        }
+        out
+    } else {
+        parse_sfnt_face_meta_slice(&raw, 0, 0, false, default_stem).into_iter().collect()
+    }
 }
 
 pub(super) fn parse_font_file_metadata(path: &Path) -> Vec<FontMeta> {

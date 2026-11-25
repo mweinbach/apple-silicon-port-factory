@@ -4,12 +4,12 @@
 use super::abi::*;
 use super::sfnt::{
     default_fallback_metrics, fallback_char_advance_du, fallback_cp_to_gid, fallback_gid_to_char,
-    flatten_quad_contour, load_cached_file_bytes, parse_font_file_metadata, rasterize_glyph,
-    FontMeta, SfntFace,
+    flatten_quad_contour, load_cached_file_bytes, parse_font_bytes_metadata,
+    parse_font_file_metadata, rasterize_glyph, FontMeta, SfntFace,
 };
 use crate::com::{
-    com_add_ref, com_from_iface, com_release, qi_helper_bytes, register_vtable_once,
-    write_null_out, ComObj,
+    com_add_ref, com_call_add_ref, com_from_iface, com_release, qi_helper_bytes,
+    register_vtable_once, write_null_out, ComObj, ComPtr,
 };
 use crate::strings::read_wide_z;
 use crate::types::*;
@@ -102,6 +102,7 @@ impl FontCollectionData {
                     metrics: default_fallback_metrics(),
                     info_strings: info,
                     file_path: None,
+                    raw_bytes: None,
                 }));
             }
             map.insert(key, (name.to_string(), list));
@@ -121,6 +122,28 @@ impl FontCollectionData {
             index_by_lower.insert(fam.name.to_ascii_lowercase(), i);
         }
 
+        Self { families, index_by_lower }
+    }
+
+    pub(super) fn from_metas(metas: Vec<Arc<FontMeta>>) -> Self {
+        let mut by_family: HashMap<String, (String, Vec<Arc<FontMeta>>)> = HashMap::new();
+        for meta in metas {
+            let key = meta.family_name.to_ascii_lowercase();
+            by_family
+                .entry(key)
+                .or_insert_with(|| (meta.family_name.clone(), Vec::new()))
+                .1
+                .push(meta);
+        }
+        let mut families: Vec<Arc<FontFamilyData>> = by_family
+            .into_values()
+            .map(|(name, fonts)| Arc::new(FontFamilyData { name, fonts }))
+            .collect();
+        families.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        let mut index_by_lower = HashMap::with_capacity(families.len());
+        for (i, fam) in families.iter().enumerate() {
+            index_by_lower.insert(fam.name.to_ascii_lowercase(), i);
+        }
         Self { families, index_by_lower }
     }
 
@@ -248,10 +271,11 @@ pub(crate) struct FontFaceInner {
 
 impl FontFaceInner {
     pub(super) fn from_meta(meta: Arc<FontMeta>, simulations: u32) -> Arc<Self> {
-        let sfnt = meta.file_path.as_ref().and_then(|p| {
-            let bytes = load_cached_file_bytes(p)?;
-            SfntFace::from_bytes(bytes, meta.face_index).map(Arc::new)
-        });
+        let sfnt = meta
+            .raw_bytes
+            .clone()
+            .or_else(|| meta.file_path.as_ref().and_then(|p| load_cached_file_bytes(p)))
+            .and_then(|bytes| SfntFace::from_bytes(bytes, meta.face_index).map(Arc::new));
         Arc::new(Self { meta, simulations, sfnt })
     }
 
@@ -321,9 +345,20 @@ impl FontFaceInner {
     }
 }
 
+pub(super) enum FontFileSource {
+    LocalPath {
+        path: PathBuf,
+        path_wide: Vec<u16>,
+    },
+    CustomBytes {
+        bytes: Arc<Vec<u8>>,
+        loader: Option<ComPtr>,
+        key: Vec<u8>,
+    },
+}
+
 pub(super) struct FontFileInner {
-    path: PathBuf,
-    path_wide: Vec<u16>,
+    source: FontFileSource,
 }
 
 struct RenderingParamsInner {
@@ -496,13 +531,28 @@ unsafe extern "win64" fn ff_file_get_ref_key(
     if this.is_null() || key_ptr.is_null() || key_size.is_null() {
         return E_POINTER;
     }
-    let w = &ComObj::inner(this).path_wide;
-    key_ptr.write_unaligned(w.as_ptr() as *const c_void);
-    key_size.write_unaligned((w.len() * 2) as u32);
+    match &ComObj::inner(this).source {
+        FontFileSource::LocalPath { path_wide, .. } => {
+            key_ptr.write_unaligned(path_wide.as_ptr() as *const c_void);
+            key_size.write_unaligned((path_wide.len() * 2) as u32);
+        }
+        FontFileSource::CustomBytes { key, .. } => {
+            key_ptr.write_unaligned(key.as_ptr() as *const c_void);
+            key_size.write_unaligned(key.len() as u32);
+        }
+    }
     S_OK
 }
-unsafe extern "win64" fn ff_file_get_loader(_this: PFontFile, loader: *mut *mut c_void) -> HRESULT {
+unsafe extern "win64" fn ff_file_get_loader(this: PFontFile, loader: *mut *mut c_void) -> HRESULT {
     write_null_out(loader);
+    if this.is_null() || loader.is_null() {
+        return E_POINTER;
+    }
+    if let FontFileSource::CustomBytes { loader: Some(ref lp), .. } = ComObj::inner(this).source {
+        com_call_add_ref(lp.as_ptr());
+        loader.write_unaligned(lp.as_ptr());
+        return S_OK;
+    }
     E_NOTIMPL
 }
 pub(super) unsafe extern "win64" fn ff_file_analyze(
@@ -515,7 +565,10 @@ pub(super) unsafe extern "win64" fn ff_file_analyze(
     if this.is_null() || is_supported.is_null() || file_type.is_null() || num_faces.is_null() {
         return E_POINTER;
     }
-    let metas = parse_font_file_metadata(&ComObj::inner(this).path);
+    let metas = match &ComObj::inner(this).source {
+        FontFileSource::LocalPath { path, .. } => parse_font_file_metadata(path),
+        FontFileSource::CustomBytes { bytes, .. } => parse_font_bytes_metadata(Arc::clone(bytes), "CustomFont"),
+    };
     if metas.is_empty() {
         is_supported.write_unaligned(FALSE);
         file_type.write_unaligned(DWRITE_FONT_FILE_TYPE_UNKNOWN);
@@ -556,11 +609,28 @@ fn font_file_vtbl() -> *const usize {
 
 pub(super) fn new_font_file(path: PathBuf) -> *mut c_void {
     let path_wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-    ComObj::new(font_file_vtbl(), FontFileInner { path, path_wide }) as *mut c_void
+    ComObj::new(font_file_vtbl(), FontFileInner { source: FontFileSource::LocalPath { path, path_wide } })
+        as *mut c_void
 }
 
-pub(super) unsafe fn font_file_path_from_ptr(ptr: *mut c_void) -> Option<PathBuf> {
-    com_from_iface::<FontFileInner>(ptr, font_file_vtbl()).map(|obj| obj.inner.path.clone())
+pub(super) unsafe fn new_custom_font_file(
+    bytes: Arc<Vec<u8>>,
+    loader: *mut c_void,
+    key: Vec<u8>,
+) -> *mut c_void {
+    let lp = ComPtr::retain(loader);
+    ComObj::new(
+        font_file_vtbl(),
+        FontFileInner { source: FontFileSource::CustomBytes { bytes, loader: lp, key } },
+    ) as *mut c_void
+}
+
+pub(super) unsafe fn font_file_metadata_from_ptr(ptr: *mut c_void) -> Option<Vec<FontMeta>> {
+    let obj = com_from_iface::<FontFileInner>(ptr, font_file_vtbl())?;
+    Some(match &obj.inner.source {
+        FontFileSource::LocalPath { path, .. } => parse_font_file_metadata(path),
+        FontFileSource::CustomBytes { bytes, .. } => parse_font_bytes_metadata(Arc::clone(bytes), "CustomFont"),
+    })
 }
 
 // ============================================================================
@@ -1293,6 +1363,11 @@ pub(super) fn new_rendering_params(gamma: f32, contrast: f32, ct: f32, pg: u32, 
             rendering_mode: rm,
         },
     ) as *mut c_void
+}
+
+pub(super) unsafe fn rendering_params_values_from_ptr(ptr: *mut c_void) -> Option<(f32, f32, f32)> {
+    com_from_iface::<RenderingParamsInner>(ptr, rendering_params_vtbl())
+        .map(|obj| (obj.inner.gamma, obj.inner.enhanced_contrast, obj.inner.clear_type_level))
 }
 
 // ============================================================================

@@ -820,3 +820,523 @@ fn text_layout_alignments_nowrap_min_width_and_clusters() {
         release_com(fac);
     }
 }
+
+#[test]
+fn custom_font_file_and_collection_loaders_text_analyzer_and_glyph_run_analysis() {
+    use super::analysis::{
+        gra_create_alpha_texture, gra_get_alpha_blend_params, gra_get_alpha_texture_bounds,
+        ta_get_gdi_compatible_glyph_placements, ta_get_glyph_placements, ta_get_glyphs,
+        PGlyphRunAnalysis, PTextAnalyzer,
+    };
+    use crate::user32::RECT;
+
+    // Mock IDWriteFontFileStream + IDWriteFontFileLoader + IDWriteFontFileEnumerator + IDWriteFontCollectionLoader
+    #[repr(C)]
+    struct MockStream {
+        vtbl: *const [usize; 7],
+        bytes: Vec<u8>,
+    }
+    unsafe extern "win64" fn ms_qi(_t: *mut MockStream, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn ms_addref(_t: *mut MockStream) -> u32 { 1 }
+    unsafe extern "win64" fn ms_release(t: *mut MockStream) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn ms_read_frag(
+        t: *mut MockStream,
+        frag_start: *mut *const c_void,
+        off: u64,
+        size: u64,
+        frag_ctx: *mut *mut c_void,
+    ) -> HRESULT {
+        let s = &*t;
+        if (off + size) as usize > s.bytes.len() {
+            return E_INVALIDARG;
+        }
+        frag_start.write_unaligned(s.bytes.as_ptr().add(off as usize) as *const c_void);
+        frag_ctx.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+    unsafe extern "win64" fn ms_rel_frag(_t: *mut MockStream, _ctx: *mut c_void) {}
+    unsafe extern "win64" fn ms_get_size(t: *mut MockStream, sz: *mut u64) -> HRESULT {
+        sz.write_unaligned((*t).bytes.len() as u64);
+        S_OK
+    }
+    unsafe extern "win64" fn ms_get_time(_t: *mut MockStream, tm: *mut u64) -> HRESULT {
+        tm.write_unaligned(0);
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockFileLoader {
+        vtbl: *const [usize; 4],
+        stream_vtbl: *const [usize; 7],
+        ttf: Vec<u8>,
+    }
+    unsafe extern "win64" fn mfl_qi(_t: *mut MockFileLoader, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mfl_addref(_t: *mut MockFileLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mfl_release(_t: *mut MockFileLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mfl_create_stream(
+        t: *mut MockFileLoader,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_stream: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let st = Box::into_raw(Box::new(MockStream { vtbl: l.stream_vtbl, bytes: l.ttf.clone() }));
+        out_stream.write_unaligned(st as *mut c_void);
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockEnum {
+        vtbl: *const [usize; 5],
+        fac: PFactory,
+        file_loader: *mut c_void,
+        idx: usize,
+    }
+    unsafe extern "win64" fn me_qi(_t: *mut MockEnum, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn me_addref(_t: *mut MockEnum) -> u32 { 1 }
+    unsafe extern "win64" fn me_release(t: *mut MockEnum) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn me_move_next(t: *mut MockEnum, has: *mut BOOL) -> HRESULT {
+        let e = &mut *t;
+        if e.idx == 0 {
+            e.idx = 1;
+            has.write_unaligned(TRUE);
+        } else {
+            has.write_unaligned(FALSE);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn me_get_cur(t: *mut MockEnum, out: *mut *mut c_void) -> HRESULT {
+        let e = &*t;
+        let key = 42u32;
+        fac_create_custom_font_file_reference(
+            e.fac,
+            &key as *const u32 as *const c_void,
+            4,
+            e.file_loader,
+            out,
+        )
+    }
+
+    #[repr(C)]
+    struct MockColLoader {
+        vtbl: *const [usize; 4],
+        enum_vtbl: *const [usize; 5],
+        file_loader: *mut c_void,
+    }
+    unsafe extern "win64" fn mcl_qi(_t: *mut MockColLoader, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn mcl_addref(_t: *mut MockColLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mcl_release(_t: *mut MockColLoader) -> u32 { 1 }
+    unsafe extern "win64" fn mcl_create_enum(
+        t: *mut MockColLoader,
+        fac: *mut c_void,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_enum: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let en = Box::into_raw(Box::new(MockEnum {
+            vtbl: l.enum_vtbl,
+            fac: fac as PFactory,
+            file_loader: l.file_loader,
+            idx: 0,
+        }));
+        out_enum.write_unaligned(en as *mut c_void);
+        S_OK
+    }
+
+    // Mock IDWriteTextAnalysisSource + IDWriteTextAnalysisSink
+    #[repr(C)]
+    struct MockSource {
+        vtbl: *const [usize; 8],
+        text: Vec<u16>,
+    }
+    unsafe extern "win64" fn src_qi(_t: *mut MockSource, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn src_addref(_t: *mut MockSource) -> u32 { 1 }
+    unsafe extern "win64" fn src_release(_t: *mut MockSource) -> u32 { 1 }
+    unsafe extern "win64" fn src_get_at(t: *mut MockSource, pos: u32, ptr: *mut *const u16, len: *mut u32) -> HRESULT {
+        let s = &*t;
+        if pos as usize >= s.text.len() {
+            ptr.write_unaligned(std::ptr::null());
+            len.write_unaligned(0);
+        } else {
+            ptr.write_unaligned(s.text.as_ptr().add(pos as usize));
+            len.write_unaligned((s.text.len() - pos as usize) as u32);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_before(_t: *mut MockSource, _pos: u32, ptr: *mut *const u16, len: *mut u32) -> HRESULT {
+        ptr.write_unaligned(std::ptr::null());
+        len.write_unaligned(0);
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_dir(_t: *mut MockSource) -> u32 { 0 }
+    unsafe extern "win64" fn src_get_loc(_t: *mut MockSource, _pos: u32, len: *mut u32, loc: *mut *const u16) -> HRESULT {
+        len.write_unaligned(0);
+        loc.write_unaligned(std::ptr::null());
+        S_OK
+    }
+    unsafe extern "win64" fn src_get_ns(_t: *mut MockSource, _pos: u32, len: *mut u32, ns: *mut *mut c_void) -> HRESULT {
+        len.write_unaligned(0);
+        ns.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+
+    #[repr(C)]
+    struct MockSink {
+        vtbl: *const [usize; 7],
+        scripts: Vec<(u32, u32, u16)>,
+        bps: Vec<u8>,
+        bidis: Vec<(u32, u32, u8, u8)>,
+    }
+    unsafe extern "win64" fn snk_qi(_t: *mut MockSink, _r: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() { p.write_unaligned(std::ptr::null_mut()); }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn snk_addref(_t: *mut MockSink) -> u32 { 1 }
+    unsafe extern "win64" fn snk_release(_t: *mut MockSink) -> u32 { 1 }
+    unsafe extern "win64" fn snk_set_script(t: *mut MockSink, pos: u32, len: u32, sa: *const DWRITE_SCRIPT_ANALYSIS) -> HRESULT {
+        (*t).scripts.push((pos, len, (*sa).script));
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_bps(t: *mut MockSink, _pos: u32, len: u32, bps: *const DWRITE_LINE_BREAKPOINT) -> HRESULT {
+        for i in 0..len as usize {
+            (*t).bps.push(bps.add(i).read_unaligned().bits);
+        }
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_bidi(t: *mut MockSink, pos: u32, len: u32, exp: u8, res: u8) -> HRESULT {
+        (*t).bidis.push((pos, len, exp, res));
+        S_OK
+    }
+    unsafe extern "win64" fn snk_set_ns(_t: *mut MockSink, _pos: u32, _len: u32, _ns: *mut c_void) -> HRESULT {
+        S_OK
+    }
+
+    unsafe {
+        let stream_vtbl: [usize; 7] = [
+            ms_qi as *const () as usize,
+            ms_addref as *const () as usize,
+            ms_release as *const () as usize,
+            ms_read_frag as *const () as usize,
+            ms_rel_frag as *const () as usize,
+            ms_get_size as *const () as usize,
+            ms_get_time as *const () as usize,
+        ];
+        let fl_vtbl: [usize; 4] = [
+            mfl_qi as *const () as usize,
+            mfl_addref as *const () as usize,
+            mfl_release as *const () as usize,
+            mfl_create_stream as *const () as usize,
+        ];
+        let en_vtbl: [usize; 5] = [
+            me_qi as *const () as usize,
+            me_addref as *const () as usize,
+            me_release as *const () as usize,
+            me_move_next as *const () as usize,
+            me_get_cur as *const () as usize,
+        ];
+        let cl_vtbl: [usize; 4] = [
+            mcl_qi as *const () as usize,
+            mcl_addref as *const () as usize,
+            mcl_release as *const () as usize,
+            mcl_create_enum as *const () as usize,
+        ];
+        let src_vtbl: [usize; 8] = [
+            src_qi as *const () as usize,
+            src_addref as *const () as usize,
+            src_release as *const () as usize,
+            src_get_at as *const () as usize,
+            src_get_before as *const () as usize,
+            src_get_dir as *const () as usize,
+            src_get_loc as *const () as usize,
+            src_get_ns as *const () as usize,
+        ];
+        let snk_vtbl: [usize; 7] = [
+            snk_qi as *const () as usize,
+            snk_addref as *const () as usize,
+            snk_release as *const () as usize,
+            snk_set_script as *const () as usize,
+            snk_set_bps as *const () as usize,
+            snk_set_bidi as *const () as usize,
+            snk_set_ns as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&stream_vtbl);
+        crate::com::register_vtable_ptrs(&fl_vtbl);
+        crate::com::register_vtable_ptrs(&en_vtbl);
+        crate::com::register_vtable_ptrs(&cl_vtbl);
+        crate::com::register_vtable_ptrs(&src_vtbl);
+        crate::com::register_vtable_ptrs(&snk_vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        let ttf = build_synthetic_ttf();
+        let mut fl = MockFileLoader { vtbl: &fl_vtbl, stream_vtbl: &stream_vtbl, ttf };
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void), S_OK);
+        assert_eq!(
+            fac_register_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+
+        // 1. CreateCustomFontFileReference -> Analyze -> CreateFontFace
+        let key = 0x1234u32;
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_file_reference(
+                fac as PFactory,
+                &key as *const u32 as *const c_void,
+                4,
+                &mut fl as *mut _ as *mut c_void,
+                &mut ffile,
+            ),
+            S_OK
+        );
+        let mut supported = FALSE;
+        let mut ftype = 0u32;
+        let mut face_type = 0u32;
+        let mut nfaces = 0u32;
+        assert_eq!(
+            ff_file_analyze(ffile as PFontFile, &mut supported, &mut ftype, &mut face_type, &mut nfaces),
+            S_OK
+        );
+        assert_eq!((supported, ftype, nfaces), (TRUE, DWRITE_FONT_FILE_TYPE_TRUETYPE, 1));
+
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        assert_eq!(face_get_glyph_count(face as PFontFace), 2);
+
+        // 2. CreateCustomFontCollection
+        let mut cl = MockColLoader {
+            vtbl: &cl_vtbl,
+            enum_vtbl: &en_vtbl,
+            file_loader: &mut fl as *mut _ as *mut c_void,
+        };
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, &mut cl as *mut _ as *mut c_void), S_OK);
+        let mut col: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_collection(
+                fac as PFactory,
+                &mut cl as *mut _ as *mut c_void,
+                &key as *const u32 as *const c_void,
+                4,
+                &mut col,
+            ),
+            S_OK
+        );
+        let get_cnt: unsafe extern "win64" fn(*mut c_void) -> u32 =
+            std::mem::transmute(vtbl_of(col).add(3).read_unaligned());
+        assert_eq!(get_cnt(col), 1);
+
+        // 3. CreateTextAnalyzer: AnalyzeScript, AnalyzeBidi, AnalyzeLineBreakpoints, GetGlyphs, GetGlyphPlacements
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+        let text_u16: Vec<u16> = "A \u{05D0}".encode_utf16().collect(); // Latin 'A', space, Hebrew Alef
+        let mut src = MockSource { vtbl: &src_vtbl, text: text_u16.clone() };
+        let mut snk = MockSink { vtbl: &snk_vtbl, scripts: Vec::new(), bps: Vec::new(), bidis: Vec::new() };
+
+        let an_script: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(3).read_unaligned());
+        let an_bidi: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(4).read_unaligned());
+        let an_bp: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_of(ta).add(6).read_unaligned());
+        assert_eq!(an_script(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert_eq!(snk.scripts.len(), 2); // Latin run + Hebrew run
+        assert_eq!(an_bidi(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert!(snk.bidis.iter().any(|&(_, _, _, res)| res == 1)); // Hebrew resolved level 1
+        assert_eq!(an_bp(ta, &mut src as *mut _ as *mut c_void, 0, text_u16.len() as u32, &mut snk as *mut _ as *mut c_void), S_OK);
+        assert_eq!(snk.bps.len(), 3);
+        assert_ne!(snk.bps[1] & (1 << 4), 0); // space isWhitespace
+
+        let a_u16 = [b'A' as u16];
+        let mut cmap = [0u16; 1];
+        let mut tprops = [DWRITE_SHAPING_TEXT_PROPERTIES::default(); 1];
+        let mut gids = [0u16; 1];
+        let mut gprops = [DWRITE_SHAPING_GLYPH_PROPERTIES::default(); 1];
+        let mut actual = 0u32;
+        assert_eq!(
+            ta_get_glyphs(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                1,
+                face,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                1,
+                cmap.as_mut_ptr(),
+                tprops.as_mut_ptr(),
+                gids.as_mut_ptr(),
+                gprops.as_mut_ptr(),
+                &mut actual,
+            ),
+            S_OK
+        );
+        assert_eq!((actual, gids[0], cmap[0]), (1, 1, 0));
+
+        let mut adv = [0.0f32; 1];
+        let mut offs = [DWRITE_GLYPH_OFFSET::default(); 1];
+        assert_eq!(
+            ta_get_glyph_placements(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                offs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert!((adv[0] - 14.4).abs() < 1e-2, "expected 720*20/1000=14.4, got {}", adv[0]);
+
+        let mut gdi_adv = [0.0f32; 1];
+        assert_eq!(
+            ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                a_u16.as_ptr(),
+                cmap.as_ptr(),
+                tprops.as_ptr(),
+                1,
+                gids.as_ptr(),
+                gprops.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                1.0f32.to_bits(),
+                std::ptr::null(),
+                FALSE,
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                gdi_adv.as_mut_ptr(),
+                offs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert_eq!(gdi_adv[0], 14.0);
+
+        // 4. CreateGlyphRunAnalysis: GetAlphaTextureBounds + CreateAlphaTexture (1x1 & 3x1) + GetAlphaBlendParams
+        let run = DWRITE_GLYPH_RUN {
+            fontFace: face,
+            fontEmSize: 32.0,
+            glyphCount: 1,
+            glyphIndices: gids.as_ptr(),
+            glyphAdvances: adv.as_ptr(),
+            glyphOffsets: offs.as_ptr(),
+            isSideways: FALSE,
+            bidiLevel: 0,
+        };
+        let mut gra: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_glyph_run_analysis(
+                fac as PFactory,
+                &run,
+                1.0,
+                std::ptr::null(),
+                DWRITE_RENDERING_MODE_DEFAULT,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                32.0,
+                &mut gra,
+            ),
+            S_OK
+        );
+        let mut bounds = RECT::default();
+        assert_eq!(gra_get_alpha_texture_bounds(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &mut bounds), S_OK);
+        let w = (bounds.right - bounds.left) as usize;
+        let h = (bounds.bottom - bounds.top) as usize;
+        assert!(w >= 15 && h >= 15, "bounds={bounds:?}");
+
+        let mut tex1 = vec![0u8; w * h];
+        assert_eq!(
+            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_ALIASED_1X1, &bounds, tex1.as_mut_ptr(), tex1.len() as u32),
+            S_OK
+        );
+        assert!(tex1.iter().filter(|&&a| a >= 200).count() >= 60);
+
+        let mut tex3 = vec![0u8; w * h * 3];
+        assert_eq!(
+            gra_create_alpha_texture(gra as PGlyphRunAnalysis, DWRITE_TEXTURE_CLEARTYPE_3X1, &bounds, tex3.as_mut_ptr(), tex3.len() as u32),
+            S_OK
+        );
+        assert!(tex3.iter().filter(|&&a| a >= 200).count() >= 180);
+
+        let mut rp: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_custom_rendering_params(fac as PFactory, 2.2, 0.75, 0.9, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, &mut rp), S_OK);
+        let (mut g, mut ec, mut ct) = (0.0f32, 0.0f32, 0.0f32);
+        assert_eq!(gra_get_alpha_blend_params(gra as PGlyphRunAnalysis, rp, &mut g, &mut ec, &mut ct), S_OK);
+        assert_eq!((g, ec, ct), (2.2, 0.75, 0.9));
+
+        assert_eq!(fac_unregister_font_collection_loader(fac as PFactory, &mut cl as *mut _ as *mut c_void), S_OK);
+        assert_eq!(fac_unregister_font_file_loader(fac as PFactory, &mut fl as *mut _ as *mut c_void), S_OK);
+
+        release_com(rp);
+        release_com(gra);
+        release_com(ta);
+        release_com(col);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+    }
+}

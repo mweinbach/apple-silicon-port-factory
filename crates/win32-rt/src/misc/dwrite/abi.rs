@@ -12,7 +12,12 @@ pub const DWRITE_E_FILEFORMAT: HRESULT = 0x8898_5000u32 as i32;
 pub const DWRITE_E_NOFONT: HRESULT = 0x8898_5002u32 as i32;
 pub const DWRITE_E_FILENOTFOUND: HRESULT = 0x8898_5003u32 as i32;
 pub const DWRITE_E_FILEACCESS: HRESULT = 0x8898_5004u32 as i32;
+pub const DWRITE_E_ALREADYREGISTERED: HRESULT = 0x8898_5006u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
+
+// Texture types (IDWriteGlyphRunAnalysis)
+pub const DWRITE_TEXTURE_ALIASED_1X1: u32 = 0;
+pub const DWRITE_TEXTURE_CLEARTYPE_3X1: u32 = 1;
 
 // Factory types
 pub const DWRITE_FACTORY_TYPE_SHARED: u32 = 0;
@@ -113,6 +118,8 @@ pub(super) const G_IDWRITE_GDI_INTEROP: Guid = guid("1edd9491-9853-4299-898f-643
 pub(super) const G_IDWRITE_BITMAP_RENDER_TARGET: Guid = guid("5e5a32a3-8dff-4773-9ff6-0696eab77267");
 pub(super) const G_IDWRITE_INLINE_OBJECT: Guid = guid("8339fde3-106f-47ab-8373-1c6295eb10b3");
 pub(super) const G_IDWRITE_NUMBER_SUBSTITUTION: Guid = guid("14885cc9-bab0-4f90-b6ed-5c366a2cd03d");
+pub(super) const G_IDWRITE_TEXT_ANALYZER: Guid = guid("b7e6163e-7f46-43b4-84b3-e4e6249c365d");
+pub(super) const G_IDWRITE_GLYPH_RUN_ANALYSIS: Guid = guid("7d97dbf7-e085-42d4-81e3-6a883bdef118");
 
 pub const IID_IUNKNOWN: GUID = IID_IUnknown.to_win_guid();
 pub const IID_IDWRITE_FACTORY: GUID = G_IDWRITE_FACTORY.to_win_guid();
@@ -134,8 +141,37 @@ pub const IID_IDWRITE_GDI_INTEROP: GUID = G_IDWRITE_GDI_INTEROP.to_win_guid();
 pub const IID_IDWRITE_BITMAP_RENDER_TARGET: GUID = G_IDWRITE_BITMAP_RENDER_TARGET.to_win_guid();
 pub const IID_IDWRITE_INLINE_OBJECT: GUID = G_IDWRITE_INLINE_OBJECT.to_win_guid();
 pub const IID_IDWRITE_NUMBER_SUBSTITUTION: GUID = G_IDWRITE_NUMBER_SUBSTITUTION.to_win_guid();
-pub const IID_IDWRITE_TEXT_ANALYZER: GUID =
-    guid("b7e6163e-7f46-43b4-84b3-e4e6249c365d").to_win_guid();
+pub const IID_IDWRITE_TEXT_ANALYZER: GUID = G_IDWRITE_TEXT_ANALYZER.to_win_guid();
+pub const IID_IDWRITE_GLYPH_RUN_ANALYSIS: GUID = G_IDWRITE_GLYPH_RUN_ANALYSIS.to_win_guid();
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DWRITE_SCRIPT_ANALYSIS {
+    pub script: u16,
+    pub shapes: u32,
+}
+const _: () = assert!(std::mem::size_of::<DWRITE_SCRIPT_ANALYSIS>() == 8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DWRITE_LINE_BREAKPOINT {
+    pub bits: u8,
+}
+const _: () = assert!(std::mem::size_of::<DWRITE_LINE_BREAKPOINT>() == 1);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DWRITE_SHAPING_TEXT_PROPERTIES {
+    pub bits: u16,
+}
+const _: () = assert!(std::mem::size_of::<DWRITE_SHAPING_TEXT_PROPERTIES>() == 2);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DWRITE_SHAPING_GLYPH_PROPERTIES {
+    pub bits: u16,
+}
+const _: () = assert!(std::mem::size_of::<DWRITE_SHAPING_GLYPH_PROPERTIES>() == 2);
 
 // ============================================================================
 // DirectWrite Win64 ABI Structs
