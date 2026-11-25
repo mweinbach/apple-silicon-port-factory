@@ -569,8 +569,16 @@ pub unsafe extern "win64" fn IsWow64Process2(_h: HANDLE, proc_m: *mut u16, nativ
 pub unsafe extern "win64" fn GetProcessVersion(_pid: u32) -> u32 {
     (teb::OS_MAJOR << 16) | teb::OS_MINOR
 }
-pub unsafe extern "win64" fn GetProcessHandleCount(_h: HANDLE, n: *mut u32) -> BOOL {
-    *n = 64;
+pub unsafe extern "win64" fn GetProcessHandleCount(h: HANDLE, n: *mut u32) -> BOOL {
+    if n.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if !is_self(h) {
+        set_err(err::ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    std::ptr::write_unaligned(n, handles::live_count());
     TRUE
 }
 pub unsafe extern "win64" fn SetProcessInformation(_h: HANDLE, class: u32, _i: *const c_void, _n: u32) -> BOOL {
@@ -1703,17 +1711,18 @@ struct JobState {
     ui_restrictions: u32,
     end_of_job_time_action: u32,
     completion_port: Option<(usize, usize)>,
-    cpu_rate_control: [u8; 12],
+    cpu_rate_control: [u8; 8],
     notification_limits: [u8; 72],
     group_ids: Vec<u16>,
     group_affinities: Vec<[u8; 16]>,
     members: Vec<JobMember>,
     total_processes: u32,
     total_terminated: u32,
+    name: Option<String>,
 }
 
 impl JobState {
-    fn new() -> Self {
+    fn new(name: Option<String>) -> Self {
         Self {
             basic_limits: [0u8; 64],
             io_counters: [0u8; 48],
@@ -1724,13 +1733,14 @@ impl JobState {
             ui_restrictions: 0,
             end_of_job_time_action: 0,
             completion_port: None,
-            cpu_rate_control: [0u8; 12],
+            cpu_rate_control: [0u8; 8],
             notification_limits: [0u8; 72],
             group_ids: vec![0],
             group_affinities: Vec::new(),
             members: Vec::new(),
             total_processes: 0,
             total_terminated: 0,
+            name,
         }
     }
 
@@ -1756,9 +1766,9 @@ pub struct JobObj {
 }
 
 impl JobObj {
-    fn new() -> Arc<Self> {
+    fn new(name: Option<String>) -> Arc<Self> {
         let obj = Arc::new(Self {
-            state: std::sync::Mutex::new(JobState::new()),
+            state: std::sync::Mutex::new(JobState::new(name)),
         });
         let mut all = all_jobs().lock().unwrap();
         all.retain(|w| w.strong_count() > 0);
@@ -1812,9 +1822,19 @@ impl JobObj {
 
 impl Drop for JobObj {
     fn drop(&mut self) {
-        let kill_on_close = (self.state.get_mut().unwrap_or_else(|e| e.into_inner()).limit_flags()
-            & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-            != 0;
+        let (kill_on_close, name) = {
+            let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+            (
+                (st.limit_flags() & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0,
+                st.name.take(),
+            )
+        };
+        if let Some(n) = name {
+            let mut jobs = named_jobs().lock().unwrap_or_else(|e| e.into_inner());
+            if jobs.get(&n).is_some_and(|w| w.strong_count() == 0) {
+                jobs.remove(&n);
+            }
+        }
         if kill_on_close {
             // Terminate any child processes assigned to this job on last-handle close.
             let _ = self.terminate_children(1);
@@ -1836,26 +1856,35 @@ fn all_jobs() -> &'static std::sync::Mutex<Vec<std::sync::Weak<JobObj>>> {
     JOBS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Weak namespace for named job objects so closing the last handle drops `JobObj`
+/// (triggering `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and freeing the name for reuse).
+fn named_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>> {
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<JobObj>>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn create_job_object_impl(name: Option<String>) -> HANDLE {
     let Some(n) = name.filter(|s| !s.is_empty()) else {
         set_err(0);
-        return handles::insert(JobObj::new());
+        return handles::insert(JobObj::new(None));
     };
-    let mut names = handles::named_objects().lock().unwrap();
-    if let Some(existing) = names.get(&n) {
-        if existing.as_any().is::<JobObj>() {
-            let h = handles::insert(existing.clone());
-            drop(names);
-            set_err(err::ERROR_ALREADY_EXISTS);
-            return h;
+    {
+        let other = handles::named_objects().lock().unwrap();
+        if other.contains_key(&n) {
+            set_err(err::ERROR_INVALID_HANDLE);
+            return std::ptr::null_mut();
         }
-        drop(names);
-        set_err(err::ERROR_INVALID_HANDLE);
-        return std::ptr::null_mut();
     }
-    let obj = JobObj::new();
-    names.insert(n, obj.clone());
-    drop(names);
+    let mut jobs = named_jobs().lock().unwrap();
+    if let Some(existing) = jobs.get(&n).and_then(|w| w.upgrade()) {
+        drop(jobs);
+        set_err(err::ERROR_ALREADY_EXISTS);
+        return handles::insert(existing);
+    }
+    let obj = JobObj::new(Some(n.clone()));
+    jobs.insert(n, Arc::downgrade(&obj));
+    drop(jobs);
     set_err(0);
     handles::insert(obj)
 }
@@ -1873,14 +1902,13 @@ pub unsafe extern "win64" fn OpenJobObjectW(_access: u32, inherit: BOOL, name: L
         return std::ptr::null_mut();
     };
     let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
-    let names = handles::named_objects().lock().unwrap();
-    match names.get(&n) {
-        Some(o) if o.as_any().is::<JobObj>() => handles::insert_with_flags(o.clone(), flags),
-        _ => {
-            set_err(err::ERROR_FILE_NOT_FOUND);
-            std::ptr::null_mut()
-        }
+    let mut jobs = named_jobs().lock().unwrap();
+    if let Some(existing) = jobs.get(&n).and_then(|w| w.upgrade()) {
+        return handles::insert_with_flags(existing, flags);
     }
+    jobs.remove(&n);
+    set_err(err::ERROR_FILE_NOT_FOUND);
+    std::ptr::null_mut()
 }
 
 pub unsafe extern "win64" fn OpenJobObjectA(access: u32, inherit: BOOL, name: LPCSTR) -> HANDLE {
@@ -2075,12 +2103,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             TRUE
         }
         15 => {
-            // JobObjectCpuRateControlInformation (12 bytes)
-            if len != 12 {
+            // JobObjectCpuRateControlInformation (JOBOBJECT_CPU_RATE_CONTROL_INFORMATION: 8 bytes:
+            // DWORD ControlFlags + 4-byte union CpuRate/Weight/{MinRate,MaxRate})
+            if len != 8 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(bytes, st.cpu_rate_control.as_mut_ptr(), 12);
+            std::ptr::copy_nonoverlapping(bytes, st.cpu_rate_control.as_mut_ptr(), 8);
             TRUE
         }
         _ => {
@@ -2289,14 +2318,14 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
             TRUE
         }
         15 => {
-            // JobObjectCpuRateControlInformation (12 bytes)
-            if len < 12 {
-                put_ret(12);
+            // JobObjectCpuRateControlInformation (8 bytes)
+            if len < 8 {
+                put_ret(8);
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
-            std::ptr::copy_nonoverlapping(st.cpu_rate_control.as_ptr(), out, 12);
-            put_ret(12);
+            std::ptr::copy_nonoverlapping(st.cpu_rate_control.as_ptr(), out, 8);
+            put_ret(8);
             TRUE
         }
         _ => {
@@ -3815,6 +3844,18 @@ mod tests {
             assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(4) as *const u32), 1);
             assert_eq!(std::ptr::read_unaligned(pid_list.as_ptr().add(8) as *const usize), std::process::id() as usize);
 
+            // JobObjectCpuRateControlInformation (class 15) uses the 8-byte Windows ABI.
+            let mut cpu_rate = [0u8; 8];
+            std::ptr::write_unaligned(cpu_rate.as_mut_ptr() as *mut u32, 0x05u32); // ENABLE | HARD_CAP
+            std::ptr::write_unaligned(cpu_rate.as_mut_ptr().add(4) as *mut u32, 5000u32); // 50%
+            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 12), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_BAD_LENGTH);
+            assert_eq!(SetInformationJobObject(job, 15, cpu_rate.as_ptr() as *const c_void, 8), TRUE);
+            let mut out_cpu = [0u8; 8];
+            assert_eq!(QueryInformationJobObject(job, 15, out_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
+            assert_eq!(ret_len, 8);
+            assert_eq!(out_cpu, cpu_rate);
+
             // Wrong struct size -> ERROR_BAD_LENGTH.
             assert_eq!(SetInformationJobObject(job, 2, ext.as_ptr() as *const c_void, 16), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_BAD_LENGTH);
@@ -3824,6 +3865,29 @@ mod tests {
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
             assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
+
+            // Named job objects release namespace ownership when the last handle closes.
+            let jname = to_wide_z("Local\\KernelCoreNamedJobTest");
+            let nj1 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj1.is_null());
+            assert_eq!(crate::teb::last_error(), 0);
+            assert_eq!(SetInformationJobObject(nj1, 15, cpu_rate.as_ptr() as *const c_void, 8), TRUE);
+            let nj2 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj2.is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_ALREADY_EXISTS);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj1), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj2), TRUE);
+            // OpenJobObject fails once all handles have closed.
+            assert!(OpenJobObjectW(0x1F001F, FALSE, jname.as_ptr()).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+            // Recreating with the same name yields a brand-new job with fresh zeroed state.
+            let nj3 = CreateJobObjectW(std::ptr::null_mut(), jname.as_ptr());
+            assert!(!nj3.is_null());
+            assert_eq!(crate::teb::last_error(), 0);
+            let mut fresh_cpu = [0xFFu8; 8];
+            assert_eq!(QueryInformationJobObject(nj3, 15, fresh_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
+            assert_eq!(fresh_cpu, [0u8; 8]);
+            assert_eq!(crate::kernel32::threads::CloseHandle(nj3), TRUE);
         }
     }
 

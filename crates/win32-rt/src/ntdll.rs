@@ -355,8 +355,10 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, needed as usize);
-            let buf_ptr = out.add(16) as *mut u16;
-            std::ptr::copy_nonoverlapping(wide.as_ptr(), buf_ptr, wide.len());
+            let buf_ptr = out.add(16);
+            if byte_len > 0 {
+                std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, buf_ptr, byte_len);
+            }
             std::ptr::write_unaligned(out as *mut u16, byte_len as u16);
             std::ptr::write_unaligned(out.add(2) as *mut u16, (byte_len + 2) as u16);
             std::ptr::write_unaligned(out.add(8) as *mut usize, buf_ptr as usize);
@@ -405,18 +407,6 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_unaligned(out as *mut u32, crate::kernel32::process::process_cookie() as u32);
-            STATUS_SUCCESS
-        }
-        0x31 => {
-            // ProcessCycleTime (PROCESS_CYCLE_TIME_INFORMATION: 16 bytes)
-            put_ret(16);
-            if len < 16 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            let (k, u) = if is_self { rusage_process_times_100ns() } else { (0, 0) };
-            // Approximate cycles at 3 GHz (300 cycles per 100ns tick).
-            std::ptr::write_unaligned(out as *mut u64, k.saturating_add(u).saturating_mul(300));
-            std::ptr::write_unaligned(out.add(8) as *mut u64, 0);
             STATUS_SUCCESS
         }
         0x3C => {
@@ -557,15 +547,6 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             std::ptr::write_unaligned(out as *mut usize, start);
             STATUS_SUCCESS
         }
-        0x0C => {
-            // ThreadPerformanceCount (8 bytes)
-            put_ret(8);
-            if len < 8 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_unaligned(out as *mut i64, 0);
-            STATUS_SUCCESS
-        }
         0x0D => {
             // ThreadAmILastThread (4 bytes)
             put_ret(4);
@@ -600,21 +581,6 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
             *out = hidden as u8;
             STATUS_SUCCESS
         }
-        0x17 => {
-            // ThreadCycleTime (THREAD_CYCLE_TIME_INFORMATION: 16 bytes)
-            put_ret(16);
-            if len < 16 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            let (k, u) = tobj
-                .as_ref()
-                .and_then(|t| crate::thread::sched::port_of(t))
-                .map(|p| mach_thread_times_100ns(p))
-                .unwrap_or((0, 0));
-            std::ptr::write_unaligned(out as *mut u64, k.saturating_add(u).saturating_mul(300));
-            std::ptr::write_unaligned(out.add(8) as *mut u64, 0);
-            STATUS_SUCCESS
-        }
         0x19 => {
             // ThreadGroupInformation (GROUP_AFFINITY: 16 bytes)
             put_ret(16);
@@ -645,9 +611,9 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
             std::ptr::write_bytes(out, 0, needed as usize);
-            let buf_ptr = out.add(16) as *mut u16;
-            if !wide.is_empty() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), buf_ptr, wide.len());
+            let buf_ptr = out.add(16);
+            if byte_len > 0 {
+                std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, buf_ptr, byte_len);
             }
             std::ptr::write_unaligned(out as *mut u16, byte_len as u16);
             std::ptr::write_unaligned(out.add(2) as *mut u16, (byte_len + 2) as u16);
@@ -810,34 +776,6 @@ pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, 
             std::ptr::copy_nonoverlapping(path.as_ptr(), out.add(48), path.len());
             STATUS_SUCCESS
         }
-        0x15 => {
-            // SystemFileCacheInformation (64 bytes on x64)
-            put_ret(64);
-            if len < 64 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_bytes(out, 0, 64);
-            STATUS_SUCCESS
-        }
-        0x17 => {
-            // SystemInterruptInformation (24 bytes per logical CPU)
-            let needed = (crate::process::num_cpus().max(1) as usize * 24) as u32;
-            put_ret(needed);
-            if len < needed || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_bytes(out, 0, needed as usize);
-            STATUS_SUCCESS
-        }
-        0x21 => {
-            // SystemExceptionInformation (16 bytes)
-            put_ret(16);
-            if len < 16 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_bytes(out, 0, 16);
-            STATUS_SUCCESS
-        }
         0x23 => {
             // SystemKernelDebuggerInformation (2 bytes):
             // KdDebuggerEnabled = 0, KdDebuggerNotPresent = 1
@@ -847,22 +785,6 @@ pub unsafe extern "win64" fn NtQuerySystemInformation(class: u32, out: *mut u8, 
             }
             *out = 0; // KdDebuggerEnabled = FALSE
             *out.add(1) = 1; // KdDebuggerNotPresent = TRUE
-            STATUS_SUCCESS
-        }
-        0x25 => {
-            // SystemRegistryQuotaInformation (12 bytes)
-            put_ret(12);
-            if len < 12 || out.is_null() {
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            std::ptr::write_unaligned(out as *mut u32, 0x1000_0000); // RegistryQuotaAllowed
-            std::ptr::write_unaligned(out.add(4) as *mut u32, 0x0010_0000); // RegistryQuotaUsed
-            std::ptr::write_unaligned(out.add(8) as *mut u32, 0x0001_0000); // PagedPoolSize
-            STATUS_SUCCESS
-        }
-        0x2D => {
-            // SystemLookasideInformation (0 entries)
-            put_ret(0);
             STATUS_SUCCESS
         }
         0x49 => {
@@ -3605,8 +3527,24 @@ mod tests {
             assert_eq!(hidden, 1);
             assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 9999, buf.as_mut_ptr(), 16, &mut ret), STATUS_INVALID_INFO_CLASS);
 
+            // Odd-addressed output buffer for ThreadNameInformation (0x26) must not panic on alignment.
+            let name_w = to_wide_z("OddBufThread");
+            assert_eq!(
+                crate::kernel32::threads::SetThreadDescription(crate::handles::CURRENT_THREAD, name_w.as_ptr()),
+                S_OK
+            );
+            let mut unaligned_buf = [0u8; 129];
+            let odd_ptr = unaligned_buf.as_mut_ptr().add(1);
+            assert_eq!((odd_ptr as usize) & 1, 1);
+            assert_eq!(NtQueryInformationThread(crate::handles::CURRENT_THREAD, 0x26, odd_ptr, 128, &mut ret), STATUS_SUCCESS);
+            let got_len = std::ptr::read_unaligned(odd_ptr as *const u16) as usize;
+            assert_eq!(got_len, "OddBufThread".len() * 2);
+            let mut units = vec![0u16; got_len / 2];
+            std::ptr::copy_nonoverlapping(odd_ptr.add(16), units.as_mut_ptr() as *mut u8, got_len);
+            assert_eq!(String::from_utf16_lossy(&units), "OddBufThread");
+
             // 3. NtQuerySystemInformation classes: ProcessorPerformance(8), LogicalProcessor(0x49),
-            // KernelDebuggerEx(0x9F), unknown class.
+            // KernelDebuggerEx(0x9F), unimplemented RegistryQuota(0x25) -> honest STATUS_INVALID_INFO_CLASS.
             let mut perf_need = 0u32;
             assert_eq!(NtQuerySystemInformation(8, std::ptr::null_mut(), 0, &mut perf_need), STATUS_INFO_LENGTH_MISMATCH);
             assert!(perf_need >= 48);
@@ -3616,6 +3554,7 @@ mod tests {
             assert_eq!(NtQuerySystemInformation(0x9F, buf.as_mut_ptr(), 3, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 3);
             assert_eq!(&buf[..3], &[0, 0, 0]);
+            assert_eq!(NtQuerySystemInformation(0x25, buf.as_mut_ptr(), 12, &mut ret), STATUS_INVALID_INFO_CLASS);
             assert_eq!(NtQuerySystemInformation(9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
 
             // 4. Native-unsupported TxF transactions: STATUS_NOT_IMPLEMENTED / STATUS_INVALID_HANDLE.

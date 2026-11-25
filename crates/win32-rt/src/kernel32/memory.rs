@@ -303,32 +303,69 @@ pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) ->
     host_mprotect(hpage, HOST_PAGE, win_prot_to_host(seg.prot)) == 0
 }
 
+/// Outcome of consuming a one-shot `PAGE_GUARD` bit on a faulting 4 KiB page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardConsumeResult {
+    /// Logical protection before `PAGE_GUARD` was cleared.
+    pub old_prot: u32,
+    /// `true` when the enclosing 16 KiB host page had to remain `PROT_NONE` because
+    /// another 4 KiB sibling subpage in the same host page still has `PAGE_GUARD` or
+    /// `PAGE_NOACCESS` (callers must emulate the single faulting access rather than
+    /// exposing sibling subpages).
+    pub host_kept_none: bool,
+}
+
 /// Atomically consume a one-shot `PAGE_GUARD` bit on the faulting 4 KiB page and
-/// restore its underlying protection (mirroring Windows before delivering
-/// `STATUS_GUARD_PAGE_VIOLATION`).
+/// restore host protection if no sibling 4 KiB subpage in the enclosing host page
+/// still carries `PAGE_GUARD` or `PAGE_NOACCESS`.
 ///
-/// Returns `Some(previous_protect)` if `fault_addr` was on a committed `PAGE_GUARD`
-/// page (now cleared to `previous_protect & !PAGE_GUARD`), or `None` otherwise.
-pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<u32> {
+/// Mirrors Windows clearing `PAGE_GUARD` before delivering `STATUS_GUARD_PAGE_VIOLATION`,
+/// while preserving remaining 4 KiB sibling protections on 16 KiB Apple Silicon host pages.
+pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult> {
     let page = fault_addr & !(PAGE - 1);
     let hpage = fault_addr & !(HOST_PAGE - 1);
     let mut vm = VM.lock().unwrap();
     let write_watch = vm.alloc_containing(page).is_some_and(|(_, a)| a.write_watch);
-    let (&_s, seg) = vm.segs.range(..=page).next_back()?;
+    let (&_s, &seg) = vm.segs.range(..=page).next_back()?;
     if page >= seg.end || seg.state != MEM_COMMIT || (seg.prot & PAGE_GUARD) == 0 {
         return None;
     }
     let old_prot = seg.prot;
     let new_prot = old_prot & !PAGE_GUARD;
     vm.set_range(page, page + PAGE, MEM_COMMIT, new_prot);
-    let host_p = if write_watch && is_writable_prot(new_prot) && !vm.write_watch_dirty.contains(&hpage) {
-        win_prot_to_host(new_prot) & !libc::PROT_WRITE
-    } else {
-        win_prot_to_host(new_prot)
-    };
-    let _ = host_mprotect(page, PAGE, host_p);
+
+    let mut sibling_protected = false;
+    if HOST_PAGE > PAGE {
+        let mut sub = hpage;
+        while sub < hpage + HOST_PAGE {
+            if sub != page {
+                if let Some((&_ss, sseg)) = vm.segs.range(..=sub).next_back() {
+                    if sub < sseg.end
+                        && sseg.state == MEM_COMMIT
+                        && ((sseg.prot & 0xFF) == PAGE_NOACCESS || (sseg.prot & PAGE_GUARD) != 0)
+                    {
+                        sibling_protected = true;
+                        break;
+                    }
+                }
+            }
+            sub += PAGE;
+        }
+    }
+
+    if !sibling_protected {
+        let host_p = if write_watch && is_writable_prot(new_prot) && !vm.write_watch_dirty.contains(&hpage) {
+            win_prot_to_host(new_prot) & !libc::PROT_WRITE
+        } else {
+            win_prot_to_host(new_prot)
+        };
+        let _ = host_mprotect(page, PAGE, host_p);
+    }
     note_hpage_prot_change(page, page + PAGE);
-    Some(old_prot)
+    Some(GuardConsumeResult {
+        old_prot,
+        host_kept_none: sibling_protected,
+    })
 }
 
 /// Register a PE image (or other host-managed range) so VirtualQuery
@@ -1713,25 +1750,55 @@ mod tests {
             assert_eq!(VirtualProtect(p, 0x1000, PAGE_NOACCESS | PAGE_GUARD, &mut old), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
-            // Setting PAGE_GUARD updates VirtualQuery and arms the guard bit.
-            assert_eq!(VirtualProtect(p, HOST_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
+            // Setting PAGE_GUARD on a single 4 KiB subpage inside a 16 KiB host page clears
+            // cleanly when no sibling subpage is guarded/noaccess.
+            assert_eq!(VirtualProtect(p, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
             assert_eq!(old, PAGE_READWRITE);
             let q = query(p as usize).unwrap();
             assert_eq!(q.protect, PAGE_READWRITE | PAGE_GUARD);
 
-            // Consuming the guard page clears PAGE_GUARD atomically (one-shot) and restores RW access.
-            assert_eq!(consume_guard_page(p as usize), Some(PAGE_READWRITE | PAGE_GUARD));
+            let res = consume_guard_page(p as usize).expect("first consume");
+            assert_eq!(res.old_prot, PAGE_READWRITE | PAGE_GUARD);
+            assert!(!res.host_kept_none);
             assert_eq!(consume_guard_page(p as usize), None);
             let q2 = query(p as usize).unwrap();
             assert_eq!(q2.protect, PAGE_READWRITE);
             *(p as *mut u32) = 0x1234_5678;
             assert_eq!(*(p as *const u32), 0x1234_5678);
 
-            // VirtualAlloc with MEM_COMMIT | PAGE_GUARD directly.
-            let p2 = VirtualAlloc(std::ptr::null_mut(), HOST_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
+            // Guarding a full 16 KiB range and consuming only the first 4 KiB subpage preserves
+            // sibling PAGE_GUARD protections (keeping the host page PROT_NONE until all siblings clear).
+            assert_eq!(VirtualProtect(p, HOST_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
+            let first = consume_guard_page(p as usize).expect("consume subpage 0");
+            assert_eq!(first.old_prot, PAGE_READWRITE | PAGE_GUARD);
+            if HOST_PAGE > PAGE {
+                assert!(first.host_kept_none, "host page must stay PROT_NONE while sibling subpages remain guarded");
+                assert_eq!(query((p as usize) + PAGE).unwrap().protect, PAGE_READWRITE | PAGE_GUARD);
+                for sub in 1..(HOST_PAGE / PAGE) {
+                    let r = consume_guard_page((p as usize) + sub * PAGE).expect("consume sibling");
+                    assert_eq!(r.host_kept_none, sub + 1 < HOST_PAGE / PAGE);
+                }
+            }
+            // Once all siblings are consumed, native access is restored.
+            *(p as *mut u32) = 0x5566_7788;
+            assert_eq!(*(p as *const u32), 0x5566_7788);
+
+            // Guarding page 0 next to a PAGE_NOACCESS sibling keeps the host page PROT_NONE
+            // so the PAGE_NOACCESS sibling is never exposed.
+            if HOST_PAGE > PAGE {
+                assert_eq!(VirtualProtect((p as usize + PAGE) as *mut c_void, PAGE, PAGE_NOACCESS, &mut old), TRUE);
+                assert_eq!(VirtualProtect(p, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
+                let r = consume_guard_page(p as usize).expect("consume next to PAGE_NOACCESS");
+                assert!(r.host_kept_none, "PAGE_NOACCESS sibling must remain protected");
+                assert_eq!(VirtualProtect((p as usize + PAGE) as *mut c_void, PAGE, PAGE_READWRITE, &mut old), TRUE);
+            }
+
+            // VirtualAlloc with MEM_COMMIT | PAGE_GUARD directly (single 4 KiB page).
+            let p2 = VirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
             assert!(!p2.is_null());
             assert_eq!(query(p2 as usize).unwrap().protect, PAGE_READWRITE | PAGE_GUARD);
-            assert_eq!(consume_guard_page(p2 as usize), Some(PAGE_READWRITE | PAGE_GUARD));
+            let r2 = consume_guard_page(p2 as usize).expect("consume p2");
+            assert!(!r2.host_kept_none);
             *(p2 as *mut u32) = 0xCAFE_BABE;
             assert_eq!(*(p2 as *const u32), 0xCAFE_BABE);
 

@@ -552,6 +552,11 @@ pub fn insert(obj: Arc<dyn KObject>) -> HANDLE {
     insert_with_flags(obj, 0)
 }
 
+/// Number of currently open kernel handles in the process handle table.
+pub fn live_count() -> u32 {
+    table().read().unwrap().map.len() as u32
+}
+
 pub fn insert_with_flags(obj: Arc<dyn KObject>, flags: u32) -> HANDLE {
     let mut t = table().write().unwrap();
     let h = t.next;

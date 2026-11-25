@@ -492,6 +492,115 @@ unsafe fn try_emulate_kuser_read(fault_addr: u64, ss: *mut u64) -> bool {
     true
 }
 
+/// Decode a single AArch64 general-purpose store instruction (no writeback) so
+/// writes to a logically writable 4 KiB subpage sharing a `PROT_NONE` 16 KiB host
+/// page with a `PAGE_GUARD`/`PAGE_NOACCESS` sibling can complete without exposing
+/// the protected siblings. Returns `(rt, bytes)`.
+#[cfg(target_arch = "aarch64")]
+fn decode_arm64_store(insn: u32) -> Option<(usize, usize)> {
+    let rt = (insn & 0x1F) as usize;
+    let size = ((insn >> 30) & 3) as usize;
+    let bytes = 1usize << size;
+    // STLR{B,H,}
+    if (insn & 0x3FFF_FC00) == 0x089F_FC00 {
+        return Some((rt, bytes));
+    }
+    // STLUR{B,H,}
+    if (insn & 0x3FE0_0C00) == 0x1900_0000 {
+        return Some((rt, bytes));
+    }
+    // Unsigned-offset STR{B,H,W,X}: xx11_1001_00ii_iiii_iiii_iinn_nnnt_tttt
+    if (insn & 0x3FC0_0000) == 0x3900_0000 {
+        return Some((rt, bytes));
+    }
+    // Unscaled STUR or register-offset STR (no writeback): xx11_1000_00...
+    if (insn & 0x3FC0_0000) == 0x3800_0000 {
+        let is_stur = (insn & 0x0020_0C00) == 0x0000_0000;
+        let is_reg = (insn & 0x0020_0C00) == 0x0020_0800;
+        if is_stur || is_reg {
+            return Some((rt, bytes));
+        }
+    }
+    None
+}
+
+/// Emulate one AArch64 GPR load or store against a logically accessible 4 KiB subpage
+/// inside a 16 KiB host page that is kept `PROT_NONE` because a sibling 4 KiB subpage
+/// is still `PAGE_GUARD` or `PAGE_NOACCESS`. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u64, logical_prot: u32) -> bool {
+    use win32_rt::kernel32::memory::{
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    if (logical_prot & 0xFF) == PAGE_NOACCESS || (logical_prot & PAGE_GUARD) != 0 {
+        return false;
+    }
+    let writable = matches!(
+        logical_prot & 0xFF,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    );
+    if is_write && !writable {
+        return false;
+    }
+    let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
+    if pc < 0x10000 || (pc & 3) != 0 {
+        return false;
+    }
+    let insn = std::ptr::read_unaligned(pc as *const u32);
+    let hpage = (fault_addr as usize) & !0x3FFF;
+    let p = fault_addr as usize as *mut u8;
+    if is_write {
+        let Some((rt, bytes)) = decode_arm64_store(insn) else {
+            return false;
+        };
+        let val = if rt == 31 { 0u64 } else { *ss.add(rt) };
+        if libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            return false;
+        }
+        core::sync::atomic::fence(Ordering::Release);
+        match bytes {
+            1 => std::ptr::write_unaligned(p, val as u8),
+            2 => std::ptr::write_unaligned(p as *mut u16, val as u16),
+            4 => std::ptr::write_unaligned(p as *mut u32, val as u32),
+            8 => std::ptr::write_unaligned(p as *mut u64, val),
+            _ => {
+                let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+                return false;
+            }
+        }
+        let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+    } else {
+        let Some(ld) = decode_arm64_load(insn) else {
+            return false;
+        };
+        if libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_READ) != 0 {
+            return false;
+        }
+        let val: u64 = match (ld.bytes, ld.signed_64, ld.signed_32) {
+            (1, false, false) => std::ptr::read_unaligned(p) as u64,
+            (1, true, false) => std::ptr::read_unaligned(p as *const i8) as i64 as u64,
+            (1, false, true) => std::ptr::read_unaligned(p as *const i8) as i32 as u32 as u64,
+            (2, false, false) => std::ptr::read_unaligned(p as *const u16) as u64,
+            (2, true, false) => std::ptr::read_unaligned(p as *const i16) as i64 as u64,
+            (2, false, true) => std::ptr::read_unaligned(p as *const i16) as i32 as u32 as u64,
+            (4, false, false) => std::ptr::read_unaligned(p as *const u32) as u64,
+            (4, true, false) => std::ptr::read_unaligned(p as *const i32) as i64 as u64,
+            (8, false, false) => std::ptr::read_unaligned(p as *const u64),
+            _ => {
+                let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+                return false;
+            }
+        };
+        core::sync::atomic::fence(Ordering::Acquire);
+        let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
+        if ld.rt < 31 {
+            *ss.add(ld.rt) = val;
+        }
+    }
+    *ss.add(32) = (*ss.add(32) & !0x0000_FFFF_FFFF_FFFF) | pc.wrapping_add(4);
+    true
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn deliver_page_fault_inner(code: u32, addr: u64, is_write: bool, gpr: [u64; 16], guest_rip: u64) -> bool {
     let xmm = [0u128; 16];
@@ -628,22 +737,13 @@ static HPAGE_LOCKS: std::sync::LazyLock<[std::sync::Mutex<()>; 64]> =
 /// eagerly unlock every `PAGE_NOACCESS` 4 KiB sibling inside the same 16 KiB host
 /// page so no thread can ever race into a still-encrypted sibling sub-page.
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool) -> bool {
+unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool, ss: *mut u64) -> bool {
     use win32_rt::kernel32::memory::{self, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     thread_local! {
         static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static LAST_RACE_RETRY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     }
     if IN_FAULT.with(|f| f.get()) {
-        return false;
-    }
-    if !unwind::has_guest_exception_handler() {
-        return false;
-    }
-    // Only dispatch guest VEH handlers on threads that own a Windows TEB.
-    // Non-guest host background threads (e.g. AOT builders) have TEB == null and
-    // would fault immediately on `gs:[0x60]` inside any guest VEH handler.
-    if win32_rt::teb::current_raw().is_null() {
         return false;
     }
     let addr = fault_addr as usize;
@@ -659,9 +759,42 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     if initial_mbi.state != MEM_COMMIT {
         return false;
     }
-    let pre_protected = initial_mbi.protect == PAGE_NOACCESS
-        || (initial_mbi.protect & PAGE_GUARD) != 0
-        || (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+    let initial_fault_prot = initial_mbi.protect == PAGE_NOACCESS || (initial_mbi.protect & PAGE_GUARD) != 0;
+    let initial_any_sibling_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+    // If the faulting 4 KiB subpage is logically accessible but shares a `PROT_NONE` 16 KiB
+    // host page with a `PAGE_GUARD` or non-guest `PAGE_NOACCESS` sibling, emulate the access
+    // transparently (even if no VEH handler is currently registered) so sibling protections stay intact.
+    if !initial_fault_prot && initial_any_sibling_prot {
+        let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
+        if let Some(mbi) = memory::query(addr) {
+            let now_fault_prot = mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0;
+            let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+            if mbi.state == MEM_COMMIT && !now_fault_prot {
+                if !now_any_sibling {
+                    return true;
+                }
+                let any_sibling_guard = (0..4).any(|i| {
+                    memory::query(hpage + i * 0x1000)
+                        .is_some_and(|m| m.state == MEM_COMMIT && (m.protect & PAGE_GUARD) != 0)
+                });
+                if (any_sibling_guard || !unwind::has_guest_exception_handler())
+                    && try_emulate_subpage_access(fault_addr, is_write, ss, mbi.protect)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    if !unwind::has_guest_exception_handler() {
+        return false;
+    }
+    // Only dispatch guest VEH handlers on threads that own a Windows TEB.
+    // Non-guest host background threads (e.g. AOT builders) have TEB == null and
+    // would fault immediately on `gs:[0x60]` inside any guest VEH handler.
+    if win32_rt::teb::current_raw().is_null() {
+        return false;
+    }
+    let pre_protected = initial_fault_prot || initial_any_sibling_prot;
     if !pre_protected {
         // Cross-core race: another thread just unlocked this 16 KiB host page via
         // VirtualProtect while our read fault was already in flight to the kernel.
@@ -707,8 +840,22 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         // Windows clears PAGE_GUARD atomically BEFORE delivering STATUS_GUARD_PAGE_VIOLATION
         // so that VirtualQuery inside the handler observes the underlying protection and
         // returning EXCEPTION_CONTINUE_EXECUTION completes the faulting access once.
-        let _ = memory::consume_guard_page(addr);
+        let consumed = memory::consume_guard_page(addr);
         handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, fault_addr, is_write);
+        if handled {
+            if let Some(res) = consumed {
+                if res.host_kept_none {
+                    // Sibling 4 KiB subpages remain guarded/noaccess: emulate this single
+                    // faulting instruction without exposing the sibling subpages.
+                    handled = try_emulate_subpage_access(
+                        fault_addr,
+                        is_write,
+                        ss,
+                        res.old_prot & !PAGE_GUARD,
+                    );
+                }
+            }
+        }
         IN_FAULT.with(|f| f.set(false));
         return handled;
     }
@@ -786,7 +933,7 @@ extern "C" fn handler(sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut li
                 return;
             }
             let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
-            if try_dispatch_guest_page_fault(clean_fault, pc, is_write) {
+            if try_dispatch_guest_page_fault(clean_fault, pc, is_write, ss) {
                 return;
             }
         }

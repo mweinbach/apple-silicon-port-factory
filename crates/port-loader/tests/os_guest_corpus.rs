@@ -1722,18 +1722,29 @@ int main(void) {
     CHECK(VirtualProtect(gp, 0x4000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "VirtualProtect PAGE_GUARD");
     CHECK(old_prot == PAGE_READWRITE, "old prot was PAGE_READWRITE");
 
-    /* First write triggers STATUS_GUARD_PAGE_VIOLATION once; guard clears before handler runs. */
+    /* First write to 4 KiB subpage 0 triggers STATUS_GUARD_PAGE_VIOLATION once; guard clears
+       before handler runs while sibling 4 KiB subpages 1..3 remain guarded! */
     *(volatile uint32_t *)(gp + 0x40) = 0x13572468u;
-    CHECK(g_guard_hits == 1, "guard page fired exactly once");
+    CHECK(g_guard_hits == 1, "guard page 0 fired exactly once");
     CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x40), "guard fault address matches");
     CHECK(g_guard_kind == 1, "guard fault kind is write (1)");
-    CHECK(g_guard_prot_in_veh == PAGE_READWRITE, "PAGE_GUARD already cleared inside VEH");
+    CHECK(g_guard_prot_in_veh == PAGE_READWRITE, "PAGE_GUARD already cleared on subpage 0 inside VEH");
     CHECK(*(volatile uint32_t *)(gp + 0x40) == 0x13572468u, "write completed after VEH continue");
 
-    /* Second access must NOT fault again. */
+    MEMORY_BASIC_INFORMATION mbi_sib;
+    CHECK(VirtualQuery(gp + 0x1000, &mbi_sib, sizeof(mbi_sib)) != 0, "VirtualQuery sibling subpage 1");
+    CHECK(mbi_sib.Protect == (PAGE_READWRITE | PAGE_GUARD), "sibling subpage 1 still PAGE_GUARD");
+
+    /* Second access to subpage 0 must NOT fault again, even while subpage 1 stays guarded. */
     *(volatile uint32_t *)(gp + 0x44) = 0x24681357u;
-    CHECK(g_guard_hits == 1, "guard page did not fire a second time");
-    CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write succeeded");
+    CHECK(g_guard_hits == 1, "subpage 0 did not fire a second time");
+    CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write to subpage 0 succeeded");
+
+    /* First write to sibling 4 KiB subpage 1 MUST fire STATUS_GUARD_PAGE_VIOLATION independently. */
+    *(volatile uint32_t *)(gp + 0x1040) = 0x89ABCDEFu;
+    CHECK(g_guard_hits == 2, "sibling subpage 1 fired its own guard violation");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1040), "sibling guard fault address matches");
+    CHECK(*(volatile uint32_t *)(gp + 0x1040) == 0x89ABCDEFu, "sibling write completed");
     CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
     RemoveVectoredExceptionHandler(veh);
     printf("CORPUS_KCORE: page_guard_oneshot ok\n");
