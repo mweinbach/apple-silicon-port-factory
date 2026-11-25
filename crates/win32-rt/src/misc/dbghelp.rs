@@ -1108,21 +1108,90 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     }
 
     // Collect caller user streams (`MINIDUMP_USER_STREAM_INFORMATION`, packed(4): +0 count(4), +4 array_ptr(8)).
+    // Never silently truncate a stream or drop streams past the cap; fail honestly instead.
+    const MAX_USER_STREAMS: usize = 64;
+    const MAX_USER_STREAM_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_TOTAL_USER_STREAM_BYTES: usize = 64 * 1024 * 1024;
     let mut user_streams: Vec<(u32, Vec<u8>)> = Vec::new();
     if !user_stream_param.is_null() {
-        let count = std::ptr::read_unaligned(user_stream_param as *const u32) as usize;
-        let arr_ptr = std::ptr::read_unaligned(user_stream_param.add(4) as *const *const u8);
-        if count > 0 && !arr_ptr.is_null() {
+        let mut info_raw = [0u8; 12];
+        if !crate::crash::safe_read(user_stream_param as u64, &mut info_raw) {
+            crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        let count = u32::from_le_bytes([info_raw[0], info_raw[1], info_raw[2], info_raw[3]]) as usize;
+        let arr_ptr = u64::from_le_bytes([
+            info_raw[4],
+            info_raw[5],
+            info_raw[6],
+            info_raw[7],
+            info_raw[8],
+            info_raw[9],
+            info_raw[10],
+            info_raw[11],
+        ]);
+        if count > 0 {
+            if arr_ptr == 0 {
+                crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            if count > MAX_USER_STREAMS {
+                log::debug!(
+                    "dbghelp: MiniDumpWriteDump user stream count {} exceeds limit {}",
+                    count,
+                    MAX_USER_STREAMS
+                );
+                crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
+                return FALSE;
+            }
+            let mut total_user_bytes = 0usize;
             // MINIDUMP_USER_STREAM (packed(4)): +0 Type(4), +4 BufferSize(4), +8 Buffer(8) = 16 bytes.
-            for i in 0..count.min(64) {
-                let elem = arr_ptr.add(i * 16);
-                let stype = std::ptr::read_unaligned(elem as *const u32);
-                let sz = std::ptr::read_unaligned(elem.add(4) as *const u32) as usize;
-                let ptr = std::ptr::read_unaligned(elem.add(8) as *const u64);
-                let mut data = vec![0u8; sz.min(16 * 1024 * 1024)];
-                if !data.is_empty() && ptr != 0 {
+            for i in 0..count {
+                let Some(elem_addr) = arr_ptr.checked_add((i as u64) * 16) else {
+                    crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let mut elem = [0u8; 16];
+                if !crate::crash::safe_read(elem_addr, &mut elem) {
+                    crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                }
+                let stype = u32::from_le_bytes([elem[0], elem[1], elem[2], elem[3]]);
+                let sz = u32::from_le_bytes([elem[4], elem[5], elem[6], elem[7]]) as usize;
+                let ptr = u64::from_le_bytes([
+                    elem[8], elem[9], elem[10], elem[11], elem[12], elem[13], elem[14], elem[15],
+                ]);
+                if sz > MAX_USER_STREAM_BYTES {
+                    log::debug!(
+                        "dbghelp: MiniDumpWriteDump user stream {} size {} exceeds limit {}",
+                        i,
+                        sz,
+                        MAX_USER_STREAM_BYTES
+                    );
+                    crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
+                    return FALSE;
+                }
+                total_user_bytes = match total_user_bytes.checked_add(sz) {
+                    Some(t) if t <= MAX_TOTAL_USER_STREAM_BYTES => t,
+                    _ => {
+                        log::debug!(
+                            "dbghelp: MiniDumpWriteDump total user stream size exceeds limit {}",
+                            MAX_TOTAL_USER_STREAM_BYTES
+                        );
+                        crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
+                        return FALSE;
+                    }
+                };
+                let mut data = Vec::new();
+                if sz > 0 {
+                    if ptr == 0 {
+                        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                    data.resize(sz, 0);
                     if !crate::crash::safe_read(ptr, &mut data) {
-                        data.clear();
+                        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
                     }
                 }
                 user_streams.push((stype, data));
@@ -2932,6 +3001,92 @@ mod tests {
                 FALSE
             );
             assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            // 1c. Oversized user stream (>16 MiB), too many user streams (>64), or
+            //     non-empty user stream with NULL buffer must fail honestly instead of
+            //     silently truncating or dropping caller diagnostic data.
+            #[repr(C, packed(4))]
+            struct UserStream {
+                stype: u32,
+                size: u32,
+                buf: u64,
+            }
+            #[repr(C, packed(4))]
+            struct UserStreamInfo {
+                count: u32,
+                array: u64,
+            }
+            let tiny = [0xABu8; 4];
+            let oversized_stream = UserStream {
+                stype: 0x0001_0001,
+                size: (16 * 1024 * 1024) + 1,
+                buf: tiny.as_ptr() as u64,
+            };
+            let oversized_info = UserStreamInfo {
+                count: 1,
+                array: &oversized_stream as *const UserStream as u64,
+            };
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    0,
+                    std::ptr::null(),
+                    &oversized_info as *const UserStreamInfo as *const u8,
+                    std::ptr::null(),
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            let many_streams: Vec<UserStream> = (0..65)
+                .map(|i| UserStream {
+                    stype: 0x0001_0000 + i,
+                    size: tiny.len() as u32,
+                    buf: tiny.as_ptr() as u64,
+                })
+                .collect();
+            let many_info = UserStreamInfo {
+                count: many_streams.len() as u32,
+                array: many_streams.as_ptr() as u64,
+            };
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    0,
+                    std::ptr::null(),
+                    &many_info as *const UserStreamInfo as *const u8,
+                    std::ptr::null(),
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+
+            let null_buf_stream = UserStream {
+                stype: 0x0001_0002,
+                size: 16,
+                buf: 0,
+            };
+            let null_buf_info = UserStreamInfo {
+                count: 1,
+                array: &null_buf_stream as *const UserStream as u64,
+            };
+            assert_eq!(
+                MiniDumpWriteDump(
+                    (-1isize) as HANDLE,
+                    std::process::id(),
+                    h_file,
+                    0,
+                    std::ptr::null(),
+                    &null_buf_info as *const UserStreamInfo as *const u8,
+                    std::ptr::null(),
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
             // 2. Dumping an exception for `worker_tid` from the caller thread must record
             //    `worker_teb` (not `caller_teb`) in the primary MINIDUMP_THREAD entry.

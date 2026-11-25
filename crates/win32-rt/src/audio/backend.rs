@@ -1426,6 +1426,46 @@ mod ca {
         interleave_buf: Vec<f32>,
     }
 
+    /// Construct a `CATapDescription` scoped to `device_uid` (stream 0) when a specific
+    /// output endpoint UID is supplied, or a stereo global tap when `device_uid` is `None`.
+    /// Returns a retained Objective-C `CATapDescription*` that the caller must `release`.
+    pub(super) unsafe fn build_tap_description(
+        device_uid: Option<&str>,
+    ) -> Result<*mut objc2::runtime::AnyObject, String> {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2_foundation::{NSArray, NSString};
+
+        let Some(cls) = AnyClass::get(c"CATapDescription") else {
+            return Err("CATapDescription class unavailable (requires macOS 14.2+)".into());
+        };
+        let alloc_obj: *mut AnyObject = msg_send![cls, alloc];
+        if alloc_obj.is_null() {
+            return Err("CATapDescription alloc returned null".into());
+        }
+        let empty_arr = NSArray::<AnyObject>::new();
+        let tap_desc: *mut AnyObject = match device_uid {
+            Some(uid) => {
+                if uid.is_empty() || uid == "aw2-null" {
+                    let _: () = msg_send![alloc_obj, release];
+                    return Err("ProcessTap requires a valid output device UID".into());
+                }
+                let uid_ns = NSString::from_str(uid);
+                msg_send![
+                    alloc_obj,
+                    initExcludingProcesses: &*empty_arr,
+                    andDeviceUID: &*uid_ns,
+                    withStream: 0isize
+                ]
+            }
+            None => msg_send![alloc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_arr],
+        };
+        if tap_desc.is_null() {
+            return Err("CATapDescription init returned null".into());
+        }
+        Ok(tap_desc)
+    }
+
     /// macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private
     /// aggregate device + IOProc) for system/endpoint loopback capture.
     /// Dynamically resolved via `dlsym` so older macOS versions degrade cleanly.
@@ -1451,8 +1491,8 @@ mod ca {
             target_channels: u32,
         ) -> Result<Self, String> {
             use objc2::msg_send;
-            use objc2::runtime::{AnyClass, AnyObject};
-            use objc2_foundation::{NSArray, NSString};
+            use objc2::runtime::AnyObject;
+            use objc2_foundation::NSString;
 
             type CreateTapFn = unsafe extern "C" fn(*const AnyObject, *mut AudioObjectID) -> OSStatus;
             type DestroyTapFn = unsafe extern "C" fn(AudioObjectID) -> OSStatus;
@@ -1546,15 +1586,7 @@ mod ca {
                 let start_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStart")?);
                 let stop_dev: StartStopFn = std::mem::transmute(sym(c"AudioDeviceStop")?);
 
-                let Some(cls) = AnyClass::get(c"CATapDescription") else {
-                    return Err("CATapDescription class unavailable (requires macOS 14.2+)".into());
-                };
-                let alloc_obj: *mut AnyObject = msg_send![cls, alloc];
-                let empty_arr = NSArray::<AnyObject>::new();
-                let tap_desc: *mut AnyObject = msg_send![alloc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_arr];
-                if tap_desc.is_null() {
-                    return Err("CATapDescription init returned null".into());
-                }
+                let tap_desc = build_tap_description(device_uid)?;
                 let tap_uuid: *mut AnyObject = msg_send![tap_desc, UUID];
                 let tap_uid_ns: *mut NSString = msg_send![tap_uuid, UUIDString];
                 let tap_uid = if !tap_uid_ns.is_null() {
@@ -1639,7 +1671,7 @@ mod ca {
                         let is_f32 = asbd.mFormatID == kAudioFormatLinearPCM
                             && (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
                             && asbd.mBitsPerChannel == 32;
-                        if !is_f32 || asbd.mChannelsPerFrame == 0 || asbd.mSampleRate <= 0.0 {
+                        if !is_f32 || asbd.mChannelsPerFrame == 0 || asbd.mChannelsPerFrame > 8 || asbd.mSampleRate <= 0.0 {
                             let _ = destroy_agg(agg_id);
                             let _ = destroy_tap(tap_id);
                             return Err(format!(
@@ -2192,4 +2224,43 @@ pub fn create_private_aggregate(uid: &str, name: &str, sub_uid: &str) -> Result<
 #[cfg(all(test, target_os = "macos"))]
 pub fn destroy_private_aggregate(id: u32) -> Result<(), String> {
     ca_sync(move || ca::aggregate::destroy(id))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tap_tests {
+    use super::ca;
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2_foundation::NSString;
+
+    #[test]
+    fn process_tap_description_scopes_to_selected_endpoint_uid() {
+        unsafe {
+            let desc = match ca::build_tap_description(Some("BuiltInSpeakerDevice")) {
+                Ok(d) => d,
+                Err(e) if e.contains("unavailable") => return,
+                Err(e) => panic!("unexpected error building device-scoped tap: {e}"),
+            };
+            let uid_ns: *mut NSString = msg_send![desc, deviceUID];
+            assert!(!uid_ns.is_null(), "device-scoped CATapDescription must set deviceUID");
+            assert_eq!((*uid_ns).to_string(), "BuiltInSpeakerDevice");
+            let stream_num: *mut AnyObject = msg_send![desc, stream];
+            assert!(!stream_num.is_null(), "device-scoped CATapDescription must set stream");
+            let stream_idx: isize = msg_send![stream_num, integerValue];
+            assert_eq!(stream_idx, 0);
+            let exclusive: Bool = msg_send![desc, isExclusive];
+            assert!(exclusive.as_bool());
+            let _: () = msg_send![desc, release];
+
+            // Reject invalid/null endpoint UIDs rather than silently creating a global tap.
+            assert!(ca::build_tap_description(Some("")).is_err());
+            assert!(ca::build_tap_description(Some("aw2-null")).is_err());
+
+            // Explicit None builds an unscoped global tap.
+            let global = ca::build_tap_description(None).expect("global tap description");
+            let global_uid: *mut NSString = msg_send![global, deviceUID];
+            assert!(global_uid.is_null(), "global CATapDescription should have nil deviceUID");
+            let _: () = msg_send![global, release];
+        }
+    }
 }
