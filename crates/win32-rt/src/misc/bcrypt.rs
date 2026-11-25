@@ -2825,6 +2825,9 @@ pub(crate) fn aes_gcm_crypt(
     Ok((out, tag))
 }
 
+const BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG: u32 = 0x0000_0001;
+const BCRYPT_AUTH_MODE_IN_PROGRESS_FLAG: u32 = 0x0000_0002;
+
 #[repr(C)]
 struct BcryptAuthCipherModeInfo {
     cb_size: u32,
@@ -3786,11 +3789,30 @@ unsafe fn bcrypt_crypt(
     let bs = alg.block_size();
     let pkcs7 = (flags & BCRYPT_BLOCK_PADDING) != 0;
 
+    // Validate AEAD auth-mode info up front (including size-query calls) and reject
+    // chained AEAD calls (`BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG` / `IN_PROGRESS`) honestly
+    // instead of reusing the nonce/counter across chunks as independent one-shot messages.
+    let aead_info = if matches!(mode, CipherMode::Gcm | CipherMode::Ccm) {
+        if alg != SymAlg::Aes || padding_info.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let info = std::ptr::read_unaligned(padding_info as *const BcryptAuthCipherModeInfo);
+        if (info.dw_flags & (BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG | BCRYPT_AUTH_MODE_IN_PROGRESS_FLAG)) != 0 {
+            return STATUS_NOT_SUPPORTED;
+        }
+        if info.dw_flags != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        Some(info)
+    } else {
+        None
+    };
+
     // Size-query path (output == NULL): return exact required output buffer size without mutating state.
     // Per Microsoft Learn (BCryptEncrypt/BCryptDecrypt), empty-message AES-GCM/AES-CCM calls
     // (pbInput == NULL, cbInput == 0, pbOutput == NULL, cbOutput == 0) must still run AEAD tag
     // generation / verification rather than short-circuiting as a size query.
-    let is_aead_empty = matches!(mode, CipherMode::Gcm | CipherMode::Ccm) && in_slice.is_empty();
+    let is_aead_empty = aead_info.is_some() && in_slice.is_empty();
     if output.is_null() && !is_aead_empty {
         let need = match (alg, mode) {
             (SymAlg::Rc4, _) => in_slice.len(),
@@ -3828,10 +3850,7 @@ unsafe fn bcrypt_crypt(
 
     let out_bytes = match mode {
         CipherMode::Gcm | CipherMode::Ccm => {
-            if alg != SymAlg::Aes || padding_info.is_null() {
-                return STATUS_INVALID_PARAMETER;
-            }
-            let info = std::ptr::read_unaligned(padding_info as *const BcryptAuthCipherModeInfo);
+            let info = aead_info.unwrap();
             let nonce = bytes(info.pb_nonce, info.cb_nonce);
             let aad = bytes(info.pb_auth_data, info.cb_auth_data);
             let tag_len = info.cb_tag as usize;
@@ -5662,6 +5681,72 @@ mod tests {
                     0,
                 ),
                 STATUS_AUTH_TAG_MISMATCH
+            );
+
+            // Chained CCM calls must be rejected honestly (STATUS_NOT_SUPPORTED) rather than
+            // restarting the counter on each chunk.
+            let mut chain_tag = [0u8; 8];
+            let mut chain_auth = BcryptAuthCipherModeInfo {
+                cb_size: std::mem::size_of::<BcryptAuthCipherModeInfo>() as u32,
+                dw_info_version: 1,
+                pb_nonce: nonce.as_mut_ptr(),
+                cb_nonce: nonce.len() as u32,
+                pb_auth_data: aad.as_ptr() as *mut u8,
+                cb_auth_data: aad.len() as u32,
+                pb_tag: chain_tag.as_mut_ptr(),
+                cb_tag: 8,
+                pb_mac_context: std::ptr::null_mut(),
+                cb_mac_context: 0,
+                cb_aad: 0,
+                cb_data: 0,
+                dw_flags: BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG,
+            };
+            let mut chain_out = vec![0u8; pt.len()];
+            assert_eq!(
+                BCryptEncrypt(
+                    h_ccm,
+                    pt.as_ptr(),
+                    pt.len() as u32,
+                    &mut chain_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    chain_out.as_mut_ptr(),
+                    chain_out.len() as u32,
+                    &mut out_len,
+                    0,
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            assert_eq!(
+                BCryptDecrypt(
+                    h_ccm,
+                    ct.as_ptr(),
+                    ct.len() as u32,
+                    &mut chain_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    chain_out.as_mut_ptr(),
+                    chain_out.len() as u32,
+                    &mut out_len,
+                    0,
+                ),
+                STATUS_NOT_SUPPORTED
+            );
+            // Size-query with chained flag also rejected honestly
+            assert_eq!(
+                BCryptEncrypt(
+                    h_ccm,
+                    pt.as_ptr(),
+                    pt.len() as u32,
+                    &mut chain_auth as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut out_len,
+                    0,
+                ),
+                STATUS_NOT_SUPPORTED
             );
 
             // Zero-length AES-CCM with NULL input & NULL output must still generate & verify auth tag

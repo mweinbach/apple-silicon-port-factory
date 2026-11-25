@@ -3266,6 +3266,21 @@ fn capi_provider_default_rc_key_len(prov_name: &str) -> usize {
     }
 }
 
+fn capi_provider_default_rc2_effective_bits(prov_name: &str, key_len: usize) -> u32 {
+    let lower = prov_name.to_ascii_lowercase();
+    // Per Microsoft Learn (CryptSetKeyParam KP_EFFECTIVE_KEYLEN):
+    // Microsoft Enhanced Cryptographic Provider (v1.0) defaults RC2 effective
+    // key length to 40 bits for backward compatibility with the Base provider,
+    // unlike Strong and Enhanced RSA/AES providers which default to key_len * 8.
+    if lower.starts_with("microsoft base cryptographic provider")
+        || lower.starts_with("microsoft enhanced cryptographic provider")
+    {
+        40
+    } else {
+        (key_len * 8) as u32
+    }
+}
+
 #[derive(Clone)]
 struct StoredUserKey {
     key: RsaKey,
@@ -3552,10 +3567,21 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
     .map_err(|_| NTE_BAD_DATA)
 }
 
-fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, salt: Vec<u8>, exportable: bool) -> CapiKey {
+fn capi_sym_key(
+    prov_name: &str,
+    alg_id: u32,
+    alg: SymAlg,
+    key: Vec<u8>,
+    salt: Vec<u8>,
+    exportable: bool,
+) -> CapiKey {
     let bs = alg.block_size();
     let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
-    let eff = if alg == SymAlg::Rc2 { (key.len() * 8) as u32 } else { 0 };
+    let eff = if alg == SymAlg::Rc2 {
+        capi_provider_default_rc2_effective_bits(prov_name, key.len())
+    } else {
+        0
+    };
     let eff_key = capi_effective_sym_key(alg, &key, &salt);
     let rc4 = (alg == SymAlg::Rc4).then(|| Rc4State::new(&eff_key));
     CapiKey {
@@ -4517,7 +4543,7 @@ pub unsafe extern "win64" fn CryptGenKey(
         Ok(s) => s,
         Err(e) => return err(e, FALSE),
     };
-    let k = capi_sym_key(canonical_alg, sym_alg, raw, salt, exportable);
+    let k = capi_sym_key(&prov_name, canonical_alg, sym_alg, raw, salt, exportable);
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_keys().lock().unwrap().insert(h, k);
     std::ptr::write_unaligned(ph_key, h);
@@ -4610,7 +4636,7 @@ pub unsafe extern "win64" fn CryptDeriveKey(
         Ok(s) => s,
         Err(e) => return err(e, FALSE),
     };
-    let k = capi_sym_key(alg_id, sym_alg, derived, salt, exportable);
+    let k = capi_sym_key(&prov_name, alg_id, sym_alg, derived, salt, exportable);
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_keys().lock().unwrap().insert(h, k);
     std::ptr::write_unaligned(ph_key, h);
@@ -4983,9 +5009,13 @@ pub unsafe extern "win64" fn CryptImportKey(
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
     std::ptr::write_unaligned(ph_key, 0);
-    if !capi_providers().lock().unwrap().contains_key(&h_prov) {
-        return err(NTE_BAD_UID, FALSE);
-    }
+    let prov_name = {
+        let provs = capi_providers().lock().unwrap();
+        let Some(p) = provs.get(&h_prov) else {
+            return err(NTE_BAD_UID, FALSE);
+        };
+        p.prov_name.clone()
+    };
     let blob = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
     let b_type = blob[0] as u32;
     let b_ver = blob[1];
@@ -5053,7 +5083,7 @@ pub unsafe extern "win64" fn CryptImportKey(
                 Ok(s) => s,
                 Err(e) => return err(e, FALSE),
             };
-            capi_sym_key(ai_key_alg, sym_alg, raw, salt, exportable)
+            capi_sym_key(&prov_name, ai_key_alg, sym_alg, raw, salt, exportable)
         }
         SIMPLEBLOB => {
             if blob.len() < 12 {
@@ -5102,7 +5132,7 @@ pub unsafe extern "win64" fn CryptImportKey(
                 Ok(s) => s,
                 Err(e) => return err(e, FALSE),
             };
-            capi_sym_key(ai_key_alg, sym_alg, raw_key, salt, exportable)
+            capi_sym_key(&prov_name, ai_key_alg, sym_alg, raw_key, salt, exportable)
         }
         _ => return err(NTE_BAD_TYPE, FALSE),
     };
@@ -8001,6 +8031,75 @@ mod tests {
             assert_eq!(CryptGetKeyParam(h_enh_rc4_gen, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
             assert_eq!(kbits, 128);
             assert_eq!(CryptDestroyKey(h_enh_rc4_gen), TRUE);
+
+            // Enhanced CSP defaults RC2 effective key length to 40 bits (backward compatibility) even for 128-bit keys
+            let mut h_enh_rc2_gen = 0usize;
+            assert_eq!(CryptGenKey(hp_enh_v, CALG_RC2, 0, &mut h_enh_rc2_gen), TRUE);
+            kblen = 4;
+            assert_eq!(CryptGetKeyParam(h_enh_rc2_gen, KP_KEYLEN, &mut kbits as *mut u32 as *mut u8, &mut kblen, 0), TRUE);
+            assert_eq!(kbits, 128);
+            let mut eff_bits = 0u32;
+            let mut eblen = 4u32;
+            assert_eq!(
+                CryptGetKeyParam(h_enh_rc2_gen, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 40);
+            assert_eq!(CryptDestroyKey(h_enh_rc2_gen), TRUE);
+
+            // Importing a 128-bit RC2 key into Enhanced CSP also defaults KP_EFFECTIVE_KEYLEN to 40,
+            // while Strong CSP defaults KP_EFFECTIVE_KEYLEN to 128, producing distinct ciphertext until raised.
+            let mut rc2_pt_blob = Vec::with_capacity(28);
+            rc2_pt_blob.extend_from_slice(&[PLAINTEXTKEYBLOB as u8, CUR_BLOB_VERSION, 0, 0]);
+            rc2_pt_blob.extend_from_slice(&CALG_RC2.to_le_bytes());
+            rc2_pt_blob.extend_from_slice(&16u32.to_le_bytes());
+            rc2_pt_blob.extend_from_slice(&[0x11u8; 16]);
+            let mut h_enh_rc2_imp = 0usize;
+            assert_eq!(
+                CryptImportKey(hp_enh_v, rc2_pt_blob.as_ptr(), rc2_pt_blob.len() as u32, 0, 0, &mut h_enh_rc2_imp),
+                TRUE,
+            );
+            eblen = 4;
+            assert_eq!(
+                CryptGetKeyParam(h_enh_rc2_imp, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 40);
+            let mut enh_ct = [0u8; 16];
+            enh_ct[..8].copy_from_slice(b"12345678");
+            let mut enh_ct_len = 8u32;
+            assert_eq!(CryptEncrypt(h_enh_rc2_imp, 0, TRUE, 0, enh_ct.as_mut_ptr(), &mut enh_ct_len, 16), TRUE);
+
+            let mut hp_strong_v = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp_strong_v, std::ptr::null(), std::ptr::null(), 1, CRYPT_VERIFYCONTEXT), TRUE);
+            let mut h_strong_rc2_imp = 0usize;
+            assert_eq!(
+                CryptImportKey(hp_strong_v, rc2_pt_blob.as_ptr(), rc2_pt_blob.len() as u32, 0, 0, &mut h_strong_rc2_imp),
+                TRUE,
+            );
+            eblen = 4;
+            assert_eq!(
+                CryptGetKeyParam(h_strong_rc2_imp, KP_EFFECTIVE_KEYLEN, &mut eff_bits as *mut u32 as *mut u8, &mut eblen, 0),
+                TRUE,
+            );
+            assert_eq!(eff_bits, 128);
+            let mut strong_ct = [0u8; 16];
+            strong_ct[..8].copy_from_slice(b"12345678");
+            let mut strong_ct_len = 8u32;
+            assert_eq!(CryptEncrypt(h_strong_rc2_imp, 0, TRUE, 0, strong_ct.as_mut_ptr(), &mut strong_ct_len, 16), TRUE);
+            assert_ne!(&enh_ct[..enh_ct_len as usize], &strong_ct[..strong_ct_len as usize]);
+
+            let eff_128 = 128u32;
+            assert_eq!(CryptSetKeyParam(h_enh_rc2_imp, KP_EFFECTIVE_KEYLEN, &eff_128 as *const u32 as *const u8, 0), TRUE);
+            let mut enh_ct_128 = [0u8; 16];
+            enh_ct_128[..8].copy_from_slice(b"12345678");
+            let mut enh_ct_128_len = 8u32;
+            assert_eq!(CryptEncrypt(h_enh_rc2_imp, 0, TRUE, 0, enh_ct_128.as_mut_ptr(), &mut enh_ct_128_len, 16), TRUE);
+            assert_eq!(&enh_ct_128[..enh_ct_128_len as usize], &strong_ct[..strong_ct_len as usize]);
+
+            assert_eq!(CryptDestroyKey(h_strong_rc2_imp), TRUE);
+            assert_eq!(CryptReleaseContext(hp_strong_v, 0), TRUE);
+            assert_eq!(CryptDestroyKey(h_enh_rc2_imp), TRUE);
             assert_eq!(CryptReleaseContext(hp_enh_v, 0), TRUE);
 
             assert_eq!(CryptReleaseContext(hp_base, 0), TRUE);
