@@ -644,76 +644,77 @@ unsafe fn res_first(dir: usize) -> Option<u32> {
 }
 
 /// Enumerate every resource data entry of integer type `ty` (both named and numeric-ID resources),
-/// returning `(data_ptr, byte_len)` pairs ordered with exact `lang` matches before language fallbacks.
-pub(crate) unsafe fn find_all_resources_of_type(h: HMODULE, ty: u16, lang: u16) -> Vec<(*const u8, usize)> {
+/// returning `(data_ptr, byte_len)` pairs.
+///
+/// When `lang != 0`, restricts lookup strictly to that explicit LANGID and returns
+/// `Err(1815)` (`ERROR_RESOURCE_LANG_NOT_FOUND`) if resources of type `ty` exist but none
+/// matches `lang`. Language fallback (`0` -> `0x0409` -> first entry) is reserved for `lang == 0`.
+pub(crate) unsafe fn find_all_resources_of_type(
+    h: HMODULE,
+    ty: u16,
+    lang: u16,
+) -> Result<Vec<(*const u8, usize)>, u32> {
+    const ERROR_RESOURCE_LANG_NOT_FOUND: u32 = 1815;
     let base = if h.is_null() {
         crate::try_loader().and_then(|l| l.get_module_handle(None)).unwrap_or(0)
     } else {
         (h as usize) & !3
     };
     if base == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some((rva, dir_size)) = data_dir(base, 2) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let dir_limit = if dir_size == 0 { usize::MAX } else { dir_size as usize };
     let in_dir = |off: usize, len: usize| off.checked_add(len).is_some_and(|end| end <= dir_limit);
     if !in_dir(0, 16) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let root = base + rva as usize;
     let Some(t) = res_find(root, root, &ResId::Int(ty)) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if (t & 0x8000_0000) == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let t_off = (t & 0x7FFF_FFFF) as usize;
     if !in_dir(t_off, 16) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let tdir = root + t_off;
     let named = std::ptr::read_unaligned((tdir + 12) as *const u16) as usize;
     let ids = std::ptr::read_unaligned((tdir + 14) as *const u16) as usize;
     let total = named.saturating_add(ids);
-    let mut exact = Vec::new();
-    let mut fallback = Vec::new();
+    let mut out = Vec::new();
+    let mut saw_resource = false;
     for i in 0..total {
         let e_off = match t_off.checked_add(16).and_then(|x| x.checked_add(i * 8)) {
             Some(o) if in_dir(o, 8) => o,
             _ => break,
         };
+        saw_resource = true;
         let off = std::ptr::read_unaligned((root + e_off + 4) as *const u32);
-        let (is_exact, data_off) = if (off & 0x8000_0000) == 0 {
-            (false, off as usize)
+        let data_off = if (off & 0x8000_0000) == 0 {
+            if lang != 0 {
+                continue;
+            }
+            off as usize
         } else {
             let l_off = (off & 0x7FFF_FFFF) as usize;
             if !in_dir(l_off, 16) {
                 continue;
             }
             let ldir = root + l_off;
-            let primary_lang = lang & 0x03FF;
             let picked = if lang != 0 {
-                if let Some(m) = res_find(root, ldir, &ResId::Int(lang)) {
-                    Some((true, m))
-                } else {
-                    (primary_lang != 0 && primary_lang != lang)
-                        .then(|| res_find(root, ldir, &ResId::Int(primary_lang)))
-                        .flatten()
-                        .or_else(|| res_find(root, ldir, &ResId::Int(0x0409)))
-                        .or_else(|| res_find(root, ldir, &ResId::Int(0)))
-                        .or_else(|| res_first(ldir))
-                        .map(|m| (false, m))
-                }
+                res_find(root, ldir, &ResId::Int(lang))
             } else {
                 res_find(root, ldir, &ResId::Int(0))
                     .or_else(|| res_find(root, ldir, &ResId::Int(0x0409)))
                     .or_else(|| res_first(ldir))
-                    .map(|m| (true, m))
             };
             match picked {
-                Some((ex, m)) if (m & 0x8000_0000) == 0 => (ex, m as usize),
+                Some(m) if (m & 0x8000_0000) == 0 => m as usize,
                 _ => continue,
             }
         };
@@ -726,15 +727,12 @@ pub(crate) unsafe fn find_all_resources_of_type(h: HMODULE, ty: u16, lang: u16) 
         if data_rva == 0 || data_size == 0 {
             continue;
         }
-        let item = ((base + data_rva) as *const u8, data_size);
-        if is_exact {
-            exact.push(item);
-        } else {
-            fallback.push(item);
-        }
+        out.push(((base + data_rva) as *const u8, data_size));
     }
-    exact.extend(fallback);
-    exact
+    if out.is_empty() && lang != 0 && saw_resource {
+        return Err(ERROR_RESOURCE_LANG_NOT_FOUND);
+    }
+    Ok(out)
 }
 
 unsafe fn find_resource(h: HMODULE, ty: ResId, name: ResId, lang: u16) -> *mut c_void {

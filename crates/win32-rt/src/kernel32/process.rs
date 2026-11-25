@@ -3806,7 +3806,7 @@ unsafe fn lookup_module_message(source: *const c_void, id: u32, lang: u32) -> Re
     } else {
         source as HMODULE
     };
-    let tables = crate::kernel32::module::find_all_resources_of_type(hmod, RT_MESSAGETABLE, lang as u16);
+    let tables = crate::kernel32::module::find_all_resources_of_type(hmod, RT_MESSAGETABLE, lang as u16)?;
     for (data, total_len) in tables {
         if let Some(msg) = search_message_table(data, total_len, id) {
             return Ok(msg);
@@ -3830,19 +3830,20 @@ unsafe fn format_message(flags: u32, source: *const c_void, id: u32, lang: u32, 
         // are specified, search the module's RT_MESSAGETABLE first and fall back to the
         // system message table if not found.
         let from_mod = if (flags & FORMAT_MESSAGE_FROM_HMODULE) != 0 {
-            lookup_module_message(source, id, lang).ok()
+            Some(lookup_module_message(source, id, lang))
         } else {
             None
         };
         match from_mod {
-            Some(m) => m,
-            None if (flags & FORMAT_MESSAGE_FROM_SYSTEM) != 0 => match system_message(id) {
+            Some(Ok(m)) => m,
+            _ if (flags & FORMAT_MESSAGE_FROM_SYSTEM) != 0 => match system_message(id) {
                 Some(m) => format!("{m}\r\n"),
                 None => {
                     log::debug!("FormatMessage: no system text for {id:#x}");
                     return Err(err::ERROR_MR_MID_NOT_FOUND);
                 }
             },
+            Some(Err(e)) => return Err(e),
             None => return Err(err::ERROR_MR_MID_NOT_FOUND),
         }
     } else {
@@ -5563,6 +5564,22 @@ pub(crate) mod tests {
             );
             assert!(n_sys > 0);
             assert!(from_wide(out.as_ptr()).contains("file specified"));
+
+            // Explicit unavailable LANGID (0x040C fr-FR on en-US-only module) must fail with
+            // ERROR_RESOURCE_LANG_NOT_FOUND (1815) rather than silently falling back to English.
+            assert_eq!(
+                FormatMessageW(
+                    FORMAT_MESSAGE_FROM_HMODULE | FORMAT_MESSAGE_IGNORE_INSERTS,
+                    hmod,
+                    0x1000,
+                    0x040C,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    std::ptr::null(),
+                ),
+                0
+            );
+            assert_eq!(crate::teb::last_error(), 1815);
 
             // Missing ID -> 0 and ERROR_MR_MID_NOT_FOUND (317).
             assert_eq!(

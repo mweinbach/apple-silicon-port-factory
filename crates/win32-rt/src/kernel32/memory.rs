@@ -359,6 +359,30 @@ impl VmState {
         }
         false
     }
+    /// Returns `true` if any host page in `[hstart, hend)` contains a committed 4 KiB
+    /// subpage outside `[start_page, end_page)`, meaning a host-page-granularity write-watch
+    /// reset would discard dirty tracking for sibling guest pages outside the caller's range.
+    fn has_committed_sibling_outside(&self, hstart: usize, hend: usize, start_page: usize, end_page: usize) -> bool {
+        if HOST_PAGE <= PAGE {
+            return false;
+        }
+        let mut hp = hstart;
+        while hp < hend {
+            let mut sub = hp;
+            while sub < hp + HOST_PAGE {
+                if sub < start_page || sub >= end_page {
+                    if let Some((&_s, seg)) = self.segs.range(..=sub).next_back() {
+                        if sub < seg.end && seg.state == MEM_COMMIT {
+                            return true;
+                        }
+                    }
+                }
+                sub += PAGE;
+            }
+            hp += HOST_PAGE;
+        }
+        false
+    }
     /// Rearm write-watch trapping on host page `hp` after clearing its dirty bit:
     /// inspects EVERY 4 KiB subpage in `[hp, hp + HOST_PAGE)` so a `PAGE_READONLY`
     /// first subpage never prevents stripping `PROT_WRITE` when a sibling subpage is
@@ -504,9 +528,86 @@ pub fn needs_io_write_staging(addr: usize, len: usize) -> bool {
     false
 }
 
+/// Write `src` into offset `off_in_hp` of host page `hp` via an isolated ephemeral
+/// `mach_vm_remap` alias mapping so the guest mapping at `hp` keeps its exact host
+/// protection (`PROT_READ` / `PROT_NONE`) throughout — concurrent guest threads touching
+/// read-only, no-access, or guard sibling subpages on `hp` are never exposed to a writable window.
+#[cfg(target_vendor = "apple")]
+unsafe fn copy_into_restricted_hpage_via_alias(hp: usize, off_in_hp: usize, src: &[u8]) -> Result<(), i32> {
+    extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_vm_remap(
+            target_task: libc::mach_port_t,
+            target_address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            src_task: libc::mach_port_t,
+            src_address: u64,
+            copy: i32,
+            cur_protection: *mut i32,
+            max_protection: *mut i32,
+            inheritance: i32,
+        ) -> i32;
+        fn mach_vm_protect(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+            set_maximum: i32,
+            new_protection: i32,
+        ) -> i32;
+        fn mach_vm_deallocate(
+            target_task: libc::mach_port_t,
+            address: u64,
+            size: u64,
+        ) -> i32;
+    }
+    const VM_FLAGS_ANYWHERE: i32 = 1;
+    const VM_INHERIT_NONE: i32 = 2;
+    const VM_PROT_READ: i32 = 1;
+    const VM_PROT_WRITE: i32 = 2;
+
+    let task = mach_task_self_;
+    let mut alias: u64 = 0;
+    let mut cur_prot: i32 = 0;
+    let mut max_prot: i32 = 0;
+    if mach_vm_remap(
+        task,
+        &mut alias,
+        HOST_PAGE as u64,
+        0,
+        VM_FLAGS_ANYWHERE,
+        task,
+        hp as u64,
+        0, // copy = FALSE: share the exact underlying physical page frame
+        &mut cur_prot,
+        &mut max_prot,
+        VM_INHERIT_NONE,
+    ) != 0
+    {
+        return Err(libc::EFAULT);
+    }
+    if mach_vm_protect(task, alias, HOST_PAGE as u64, 0, VM_PROT_READ | VM_PROT_WRITE) != 0 {
+        let _ = mach_vm_deallocate(task, alias, HOST_PAGE as u64);
+        return Err(libc::EFAULT);
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    std::ptr::copy_nonoverlapping(src.as_ptr(), (alias as usize + off_in_hp) as *mut u8, src.len());
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    let _ = mach_vm_deallocate(task, alias, HOST_PAGE as u64);
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+unsafe fn copy_into_restricted_hpage_via_alias(_hp: usize, _off_in_hp: usize, _src: &[u8]) -> Result<(), i32> {
+    Err(libc::EFAULT)
+}
+
 /// Copy `src` into guest memory at `dst`, transparently handling clean `MEM_WRITE_WATCH`
 /// pages (marking only the actually written host pages dirty and lifting host `PROT_WRITE`)
-/// and writable 4 KiB subpages sharing a 16 KiB host page with non-writable/protected siblings.
+/// and writable 4 KiB subpages sharing a 16 KiB host page with non-writable/protected siblings
+/// (copying through an isolated writable `mach_vm_remap` alias so the guest mapping's sibling
+/// protections are never loosened).
 ///
 /// Validates all touched VM-tracked 4 KiB subpages before mutating memory and returns
 /// `Err(libc::EFAULT)` if any touched VM subpage is uncommitted, non-writable, or `PAGE_GUARD`.
@@ -549,8 +650,9 @@ pub unsafe fn write_guest_io_bytes(dst: *mut u8, src: &[u8]) -> Result<(), i32> 
             None => return Err(libc::EFAULT),
         };
     }
-    // 2. Copy host-page by host-page, recording write-watch dirty pages and temporarily
-    //    lifting PROT_WRITE when a restricted sibling shares the 16 KiB host page.
+    // 2. Copy host-page by host-page, recording write-watch dirty pages. When a restricted
+    //    sibling shares the 16 KiB host page, copy through an isolated writable alias so the
+    //    guest mapping stays PROT_READ/PROT_NONE throughout.
     let mut off = 0usize;
     while off < src.len() {
         let cur = dst_addr + off;
@@ -570,16 +672,15 @@ pub unsafe fn write_guest_io_bytes(dst: *mut u8, src: &[u8]) -> Result<(), i32> 
         let has_restricted_sibling =
             vm.has_protected_subpage(hp, None) || vm.has_non_writable_subpage(hp, None);
         let was_clean_ww = touches_ww && !vm.write_watch_dirty.contains(&hp);
-        if touches_ww {
-            vm.write_watch_dirty.insert(hp);
-        }
         if has_restricted_sibling {
-            if host_mprotect(hp, HOST_PAGE, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-                return Err(libc::EFAULT);
+            copy_into_restricted_hpage_via_alias(hp, cur - hp, &src[off..off + chunk])?;
+            if touches_ww {
+                vm.write_watch_dirty.insert(hp);
             }
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(off), cur as *mut u8, chunk);
-            let _ = vm.restore_host_page_prot(hp);
         } else {
+            if touches_ww {
+                vm.write_watch_dirty.insert(hp);
+            }
             if was_clean_ww {
                 let _ = vm.restore_host_page_prot(hp);
             }
@@ -1237,14 +1338,25 @@ pub unsafe extern "win64" fn GetWriteWatch(
     // Read caller capacity BEFORE acquiring `VM` so a fault on a clean `MEM_WRITE_WATCH`
     // or `PAGE_GUARD` output buffer cannot self-deadlock on `VM`.
     let cap = std::ptr::read_unaligned(count);
+    let start_page = start & !(PAGE - 1);
+    let end_page = (end + PAGE - 1) & !(PAGE - 1);
     let dirty: Vec<usize> = {
         let mut vm = VM.lock().unwrap();
-        let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
+        let Some((alloc_base, alloc)) = vm.alloc_containing(start_page) else {
             crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
             return u32::MAX;
         };
         if !alloc.write_watch || end > alloc_base + alloc.size {
             crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+            return u32::MAX;
+        }
+        if (flags & WRITE_WATCH_FLAG_RESET) != 0
+            && vm.has_committed_sibling_outside(hstart, hend, start_page, end_page)
+        {
+            log::warn!(
+                "GetWriteWatch(WRITE_WATCH_FLAG_RESET, {base:p}, {region_size:#x}): partial {HOST_PAGE}-byte host-page reset would discard sibling dirty pages"
+            );
+            crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
             return u32::MAX;
         }
         let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).take(cap).copied().collect();
@@ -1278,15 +1390,24 @@ pub unsafe extern "win64" fn ResetWriteWatch(base: *mut c_void, region_size: usi
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return u32::MAX;
     };
+    let start_page = start & !(PAGE - 1);
+    let end_page = (end + PAGE - 1) & !(PAGE - 1);
     let hstart = start & !(HOST_PAGE - 1);
     let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
     let mut vm = VM.lock().unwrap();
-    let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
+    let Some((alloc_base, alloc)) = vm.alloc_containing(start_page) else {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return u32::MAX;
     };
     if !alloc.write_watch || end > alloc_base + alloc.size {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    }
+    if vm.has_committed_sibling_outside(hstart, hend, start_page, end_page) {
+        log::warn!(
+            "ResetWriteWatch({base:p}, {region_size:#x}): partial {HOST_PAGE}-byte host-page reset would discard sibling dirty pages"
+        );
+        crate::teb::set_last_error(err::ERROR_NOT_SUPPORTED);
         return u32::MAX;
     }
     let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).copied().collect();
@@ -2636,6 +2757,27 @@ mod tests {
                 assert_eq!(WriteFile(pwr, b"rofail!".as_ptr() as *const c_void, 7, &mut written, std::ptr::null_mut()), TRUE);
                 assert_eq!(ReadFile(prd, buf, 7, &mut got, std::ptr::null_mut()), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+
+                // 4. Partial host-page ResetWriteWatch / GetWriteWatch(WRITE_WATCH_FLAG_RESET)
+                //    must fail honestly with ERROR_NOT_SUPPORTED and preserve sibling dirty records!
+                assert_eq!(ResetWriteWatch(buf, PAGE), u32::MAX);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                count = addrs.len();
+                assert_eq!(
+                    GetWriteWatch(WRITE_WATCH_FLAG_RESET, buf, PAGE, addrs.as_mut_ptr(), &mut count, &mut gran),
+                    u32::MAX
+                );
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                // Non-resetting GetWriteWatch still reports the dirty host page intact.
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 1);
+                assert_eq!(addrs[0] as usize, base);
+                // Full host-page reset succeeds cleanly.
+                assert_eq!(ResetWriteWatch(buf, HOST_PAGE), 0);
+                count = addrs.len();
+                assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+                assert_eq!(count, 0);
             }
 
             assert_eq!(crate::kernel32::threads::CloseHandle(prd), TRUE);
