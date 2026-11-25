@@ -991,7 +991,7 @@ fn edit_replace_selection(hwnd: usize, insert: &[u16], respect_limit: bool) {
             }
             to_insert = &to_insert[..end];
         }
-        if to_insert.is_empty() && sel_start == sel_end {
+        if !insert.is_empty() && to_insert.is_empty() {
             return;
         }
     }
@@ -3022,8 +3022,19 @@ mod tests {
             assert!(!norm_up.text_changed);
             assert!(norm_up.reconcile_native);
 
-            // Win32 WM_CHAR Return at EM_LIMITTEXT must not insert a half CRLF ("\r").
+            // Win32 WM_CHAR Return at EM_LIMITTEXT must not insert a half CRLF ("\r")
+            // and must preserve any selected text when the limit rejects the insertion.
             assert_eq!(SetWindowTextW(edit, crate::strings::to_wide_z("ab").as_ptr()), TRUE);
+            SendMessageW(edit, wm::EM_LIMITTEXT, 2, 0);
+            SendMessageW(edit, wm::EM_SETSEL, 1, 2);
+            COMMAND_LOG.lock().unwrap().clear();
+            SendMessageW(edit, wm::CHAR, 0x0D, 0);
+            let n_sel = GetWindowTextW(edit, buf.as_mut_ptr(), 32) as usize;
+            assert_eq!(String::from_utf16_lossy(&buf[..n_sel]), "ab");
+            SendMessageW(edit, wm::EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            assert_eq!((s, e), (1, 2));
+            assert!(COMMAND_LOG.lock().unwrap().is_empty());
+
             SendMessageW(edit, wm::EM_LIMITTEXT, 3, 0);
             SendMessageW(edit, wm::EM_SETSEL, 2, 2);
             COMMAND_LOG.lock().unwrap().clear();
