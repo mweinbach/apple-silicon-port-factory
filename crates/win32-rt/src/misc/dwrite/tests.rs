@@ -3265,3 +3265,217 @@ fn gdi_compatible_glyph_placements_honors_transform() {
         let _ = fs::remove_file(&tmp_path);
     }
 }
+
+#[test]
+fn factory_retains_registered_font_and_collection_loaders_until_unregistered_or_dropped() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    #[repr(C)]
+    struct CountingLoader {
+        vtbl: *const [usize; 4],
+        refs: AtomicU32,
+        destroyed: Arc<AtomicBool>,
+        stream_vtbl: *const [usize; 7],
+        ttf: Vec<u8>,
+    }
+
+    #[repr(C)]
+    struct CountingStream {
+        vtbl: *const [usize; 7],
+        data: Vec<u8>,
+    }
+
+    unsafe extern "win64" fn cs_qi(_: *mut CountingStream, _: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() {
+            p.write_unaligned(std::ptr::null_mut());
+        }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn cs_addref(_: *mut CountingStream) -> u32 { 1 }
+    unsafe extern "win64" fn cs_release(t: *mut CountingStream) -> u32 {
+        drop(Box::from_raw(t));
+        0
+    }
+    unsafe extern "win64" fn cs_read_frag(
+        t: *mut CountingStream,
+        frag_start: *mut *const c_void,
+        offset: u64,
+        size: u64,
+        ctx: *mut *mut c_void,
+    ) -> HRESULT {
+        let s = &*t;
+        if (offset + size) as usize > s.data.len() {
+            return E_INVALIDARG;
+        }
+        frag_start.write_unaligned(s.data.as_ptr().add(offset as usize) as *const c_void);
+        ctx.write_unaligned(std::ptr::null_mut());
+        S_OK
+    }
+    unsafe extern "win64" fn cs_rel_frag(_: *mut CountingStream, _: *mut c_void) {}
+    unsafe extern "win64" fn cs_get_size(t: *mut CountingStream, out: *mut u64) -> HRESULT {
+        out.write_unaligned((*t).data.len() as u64);
+        S_OK
+    }
+    unsafe extern "win64" fn cs_get_time(_: *mut CountingStream, out: *mut u64) -> HRESULT {
+        out.write_unaligned(0);
+        S_OK
+    }
+
+    unsafe extern "win64" fn cl_qi(_: *mut CountingLoader, _: *const u8, p: *mut *mut c_void) -> HRESULT {
+        if !p.is_null() {
+            p.write_unaligned(std::ptr::null_mut());
+        }
+        E_NOINTERFACE
+    }
+    unsafe extern "win64" fn cl_addref(t: *mut CountingLoader) -> u32 {
+        (*t).refs.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    unsafe extern "win64" fn cl_release(t: *mut CountingLoader) -> u32 {
+        let prev = (*t).refs.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            (*t).destroyed.store(true, Ordering::Release);
+            drop(Box::from_raw(t));
+            0
+        } else {
+            prev - 1
+        }
+    }
+    unsafe extern "win64" fn cl_create_stream(
+        t: *mut CountingLoader,
+        _key: *const c_void,
+        _key_sz: u32,
+        out_stream: *mut *mut c_void,
+    ) -> HRESULT {
+        let l = &*t;
+        let st = Box::into_raw(Box::new(CountingStream {
+            vtbl: l.stream_vtbl,
+            data: l.ttf.clone(),
+        }));
+        out_stream.write_unaligned(st as *mut c_void);
+        S_OK
+    }
+
+    unsafe {
+        let stream_vtbl: [usize; 7] = [
+            cs_qi as *const () as usize,
+            cs_addref as *const () as usize,
+            cs_release as *const () as usize,
+            cs_read_frag as *const () as usize,
+            cs_rel_frag as *const () as usize,
+            cs_get_size as *const () as usize,
+            cs_get_time as *const () as usize,
+        ];
+        let loader_vtbl: [usize; 4] = [
+            cl_qi as *const () as usize,
+            cl_addref as *const () as usize,
+            cl_release as *const () as usize,
+            cl_create_stream as *const () as usize,
+        ];
+        crate::com::register_vtable_ptrs(&stream_vtbl);
+        crate::com::register_vtable_ptrs(&loader_vtbl);
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+
+        let ttf = build_synthetic_ttf();
+
+        // 1. FontFileLoader: register increments refcount so releasing caller's construction
+        //    ref keeps it alive for CreateCustomFontFileReference; unregister releases it.
+        let fl_destroyed = Arc::new(AtomicBool::new(false));
+        let fl = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&fl_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: ttf.clone(),
+        }));
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, fl as *mut c_void), S_OK);
+        assert_eq!((*fl).refs.load(Ordering::Acquire), 2);
+        // Duplicate registration must fail without leaking an extra reference.
+        assert_eq!(
+            fac_register_font_file_loader(fac as PFactory, fl as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+        assert_eq!((*fl).refs.load(Ordering::Acquire), 2);
+
+        // Caller drops its own construction reference; factory must keep loader alive.
+        assert_eq!(release_com(fl as *mut c_void), 1);
+        assert!(!fl_destroyed.load(Ordering::Acquire));
+
+        let key = 7u32;
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_custom_font_file_reference(
+                fac as PFactory,
+                &key as *const u32 as *const c_void,
+                4,
+                fl as *mut c_void,
+                &mut ffile,
+            ),
+            S_OK
+        );
+        assert!(!ffile.is_null());
+        assert_eq!(release_com(ffile), 0);
+        assert!(!fl_destroyed.load(Ordering::Acquire), "factory must still hold registered file loader");
+
+        // Unregister releases the factory's reference and destroys the loader.
+        assert_eq!(fac_unregister_font_file_loader(fac as PFactory, fl as *mut c_void), S_OK);
+        assert!(fl_destroyed.load(Ordering::Acquire), "unregister must release font file loader");
+
+        // 2. FontCollectionLoader: same retain/release lifecycle on unregister.
+        let cl1_destroyed = Arc::new(AtomicBool::new(false));
+        let cl1 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&cl1_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, cl1 as *mut c_void), S_OK);
+        assert_eq!((*cl1).refs.load(Ordering::Acquire), 2);
+        assert_eq!(
+            fac_register_font_collection_loader(fac as PFactory, cl1 as *mut c_void),
+            DWRITE_E_ALREADYREGISTERED
+        );
+        assert_eq!((*cl1).refs.load(Ordering::Acquire), 2);
+        assert_eq!(release_com(cl1 as *mut c_void), 1);
+        assert!(!cl1_destroyed.load(Ordering::Acquire));
+        assert_eq!(fac_unregister_font_collection_loader(fac as PFactory, cl1 as *mut c_void), S_OK);
+        assert!(cl1_destroyed.load(Ordering::Acquire), "unregister must release collection loader");
+
+        // 3. Loaders still registered when the factory is released are released on factory Drop.
+        let fl2_destroyed = Arc::new(AtomicBool::new(false));
+        let fl2 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&fl2_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        let cl2_destroyed = Arc::new(AtomicBool::new(false));
+        let cl2 = Box::into_raw(Box::new(CountingLoader {
+            vtbl: &loader_vtbl,
+            refs: AtomicU32::new(1),
+            destroyed: Arc::clone(&cl2_destroyed),
+            stream_vtbl: &stream_vtbl,
+            ttf: Vec::new(),
+        }));
+        assert_eq!(fac_register_font_file_loader(fac as PFactory, fl2 as *mut c_void), S_OK);
+        assert_eq!(fac_register_font_collection_loader(fac as PFactory, cl2 as *mut c_void), S_OK);
+        assert_eq!(release_com(fl2 as *mut c_void), 1);
+        assert_eq!(release_com(cl2 as *mut c_void), 1);
+        assert!(!fl2_destroyed.load(Ordering::Acquire));
+        assert!(!cl2_destroyed.load(Ordering::Acquire));
+
+        assert_eq!(release_com(fac), 0);
+        assert!(fl2_destroyed.load(Ordering::Acquire), "factory drop must release registered file loader");
+        assert!(cl2_destroyed.load(Ordering::Acquire), "factory drop must release registered collection loader");
+    }
+}

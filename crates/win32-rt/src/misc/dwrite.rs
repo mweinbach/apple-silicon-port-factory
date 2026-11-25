@@ -15,7 +15,7 @@ pub(crate) use sfnt::rasterize_glyph;
 
 use crate::com::{
     com_add_ref, com_call_release, com_release, qi_helper_bytes, read_guid_from_bytes,
-    register_vtable_once, write_null_out, ComObj, IID_IUnknown,
+    register_vtable_once, write_null_out, ComObj, ComPtr, IID_IUnknown,
 };
 use crate::strings::{read_wide_slice, read_wide_z};
 use crate::types::*;
@@ -43,8 +43,19 @@ pub static ORDINALS: &[(u16, &str)] = &[];
 
 struct FactoryInner {
     _factory_type: u32,
-    font_file_loaders: Mutex<Vec<usize>>,
-    font_collection_loaders: Mutex<Vec<usize>>,
+    font_file_loaders: Mutex<Vec<ComPtr>>,
+    font_collection_loaders: Mutex<Vec<ComPtr>>,
+}
+
+impl Drop for FactoryInner {
+    fn drop(&mut self) {
+        let file_loaders =
+            std::mem::take(self.font_file_loaders.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let col_loaders =
+            std::mem::take(self.font_collection_loaders.get_mut().unwrap_or_else(|e| e.into_inner()));
+        drop(file_loaders);
+        drop(col_loaders);
+    }
 }
 
 type PFactory = *mut ComObj<FactoryInner>;
@@ -169,30 +180,57 @@ unsafe extern "win64" fn fac_create_custom_font_collection(
     out.write_unaligned(new_font_collection(data));
     S_OK
 }
-unsafe extern "win64" fn fac_register_font_collection_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
-    if this.is_null() || loader.is_null() {
+unsafe fn register_loader_in(registry: &Mutex<Vec<ComPtr>>, loader: *mut c_void) -> HRESULT {
+    if loader.is_null() {
         return E_INVALIDARG;
     }
-    let mut list = ComObj::inner(this).font_collection_loaders.lock().unwrap();
     let addr = loader as usize;
-    if list.contains(&addr) {
+    if registry.lock().unwrap().iter().any(|p| p.as_usize() == addr) {
         return DWRITE_E_ALREADYREGISTERED;
     }
-    list.push(addr);
+    let Some(retained) = ComPtr::retain(loader) else {
+        return E_INVALIDARG;
+    };
+    let mut list = registry.lock().unwrap();
+    if list.iter().any(|p| p.as_usize() == addr) {
+        drop(list);
+        drop(retained);
+        return DWRITE_E_ALREADYREGISTERED;
+    }
+    list.push(retained);
     S_OK
 }
-unsafe extern "win64" fn fac_unregister_font_collection_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
-    if this.is_null() || loader.is_null() {
+
+unsafe fn unregister_loader_in(registry: &Mutex<Vec<ComPtr>>, loader: *mut c_void) -> HRESULT {
+    if loader.is_null() {
         return E_INVALIDARG;
     }
-    let mut list = ComObj::inner(this).font_collection_loaders.lock().unwrap();
     let addr = loader as usize;
-    if let Some(pos) = list.iter().position(|&p| p == addr) {
-        list.remove(pos);
+    let removed = {
+        let mut list = registry.lock().unwrap();
+        list.iter()
+            .position(|p| p.as_usize() == addr)
+            .map(|pos| list.remove(pos))
+    };
+    if let Some(owned) = removed {
+        drop(owned);
         S_OK
     } else {
         E_INVALIDARG
     }
+}
+
+unsafe extern "win64" fn fac_register_font_collection_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    register_loader_in(&ComObj::inner(this).font_collection_loaders, loader)
+}
+unsafe extern "win64" fn fac_unregister_font_collection_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
+    unregister_loader_in(&ComObj::inner(this).font_collection_loaders, loader)
 }
 unsafe extern "win64" fn fac_create_font_file_reference(
     this: PFactory,
@@ -387,29 +425,16 @@ crate::win64_bridge!(fn fac_create_custom_rendering_params(
 ) -> HRESULT);
 
 unsafe extern "win64" fn fac_register_font_file_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
-    if this.is_null() || loader.is_null() {
+    if this.is_null() {
         return E_INVALIDARG;
     }
-    let mut list = ComObj::inner(this).font_file_loaders.lock().unwrap();
-    let addr = loader as usize;
-    if list.contains(&addr) {
-        return DWRITE_E_ALREADYREGISTERED;
-    }
-    list.push(addr);
-    S_OK
+    register_loader_in(&ComObj::inner(this).font_file_loaders, loader)
 }
 unsafe extern "win64" fn fac_unregister_font_file_loader(this: PFactory, loader: *mut c_void) -> HRESULT {
-    if this.is_null() || loader.is_null() {
+    if this.is_null() {
         return E_INVALIDARG;
     }
-    let mut list = ComObj::inner(this).font_file_loaders.lock().unwrap();
-    let addr = loader as usize;
-    if let Some(pos) = list.iter().position(|&p| p == addr) {
-        list.remove(pos);
-        S_OK
-    } else {
-        E_INVALIDARG
-    }
+    unregister_loader_in(&ComObj::inner(this).font_file_loaders, loader)
 }
 unsafe extern "win64" fn fac_create_text_format(
     this: PFactory,
