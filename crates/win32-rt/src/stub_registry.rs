@@ -1004,33 +1004,30 @@ mod tests {
         set_manual_frame_for_test(Some(17));
         set_guest_caller_provider(test_caller_va);
 
-        // Hit a middleware stub (zstd) 5 times and an Oodle stub 2 times.
+        // Record two middleware stubs (5 hits and 2 hits) via synthetic StubSites
+        // so this test stays decoupled from live DLL implementations.
+        static TEST_MW_SITE_A: StubSite = StubSite::new(
+            StubKind::Stub,
+            "win32_rt::misc::directml::ops",
+            "crates/win32-rt/src/misc/directml/ops.rs",
+            1048,
+        );
+        static TEST_MW_SITE_B: StubSite = StubSite::new(
+            StubKind::Stub,
+            "win32_rt::misc::physx3common_x64",
+            "crates/win32-rt/src/misc/physx3common_x64.rs",
+            2642,
+        );
         for _ in 0..5 {
-            let _ = crate::misc::zstd::ZSTD_decompress(
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-                64,
-            );
+            TEST_MW_SITE_A.record_hit("CreateOperator", || {
+                "DirectML CreateOperator: unsupported operator type 9999".to_string()
+            });
         }
         set_manual_frame_for_test(Some(42));
         for _ in 0..2 {
-            let _ = crate::misc::oo2core_9_win64::OodleLZ_Decompress(
-                std::ptr::null(),
-                16,
-                std::ptr::null_mut(),
-                32,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
+            TEST_MW_SITE_B.record_hit("mesh_sweep", || {
+                "PxMeshQuery::sweep without cooked triangle mesh payload".to_string()
+            });
         }
         // Hit a synthetic StubKind::Failing site once (decoupled from live ws2_32 exports).
         static TEST_FAILING_SITE: StubSite = StubSite::new(
@@ -1048,15 +1045,15 @@ mod tests {
         assert_eq!(snap.total_hits, 8);
 
         // Ranked descending by hit count.
-        assert_eq!(snap.entries[0].dll, "zstd.dll");
-        assert_eq!(snap.entries[0].api, "ZSTD_decompress");
+        assert_eq!(snap.entries[0].dll, "directml.dll");
+        assert_eq!(snap.entries[0].api, "CreateOperator");
         assert_eq!(snap.entries[0].kind, StubKind::MiddlewareStub);
         assert_eq!(snap.entries[0].hits, 5);
         assert_eq!(snap.entries[0].first_frame, 17);
         assert_eq!(snap.entries[0].first_guest_caller_va, 0x14000_BEEF);
 
-        assert_eq!(snap.entries[1].dll, "oo2core_9_win64.dll");
-        assert_eq!(snap.entries[1].api, "OodleLZ_Decompress");
+        assert_eq!(snap.entries[1].dll, "physx3common_x64.dll");
+        assert_eq!(snap.entries[1].api, "mesh_sweep");
         assert_eq!(snap.entries[1].kind, StubKind::MiddlewareStub);
         assert_eq!(snap.entries[1].hits, 2);
         assert_eq!(snap.entries[1].first_frame, 42);
@@ -1068,7 +1065,7 @@ mod tests {
         assert_eq!(snap.entries[2].first_frame, 42);
 
         let table = snap.format_ranked_table();
-        assert!(table.contains("zstd.dll!ZSTD_decompress"));
+        assert!(table.contains("directml.dll!CreateOperator"));
         assert!(table.contains("ws2_32.dll!TestFailingExport"));
         assert!(table.contains("middleware_stub"));
         assert!(table.contains("failing"));
