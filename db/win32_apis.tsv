@@ -890,7 +890,7 @@ kernel32.dll	CheckRemoteDebuggerPresent	-	CORE_OS	real	win32_rt::kernel32::proce
 kernel32.dll	CloseHandle	-	CORE_OS	real	win32_rt::kernel32::threads::CloseHandle	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	CloseThreadpool	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpool	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	CloseThreadpoolCleanupGroup	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpoolCleanupGroup	crates/win32-rt/src/kernel32/threadpool.rs
-kernel32.dll	CloseThreadpoolCleanupGroupMembers	-	CORE_OS	stub	win32_rt::kernel32::threadpool::CloseThreadpoolCleanupGroupMembers	crates/win32-rt/src/kernel32/threadpool.rs
+kernel32.dll	CloseThreadpoolCleanupGroupMembers	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpoolCleanupGroupMembers	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	CloseThreadpoolIo	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpoolIo	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	CloseThreadpoolTimer	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpoolTimer	crates/win32-rt/src/kernel32/threadpool.rs
 kernel32.dll	CloseThreadpoolWait	-	CORE_OS	real	win32_rt::kernel32::threadpool::CloseThreadpoolWait	crates/win32-rt/src/kernel32/threadpool.rs
@@ -1186,6 +1186,7 @@ kernel32.dll	GetTempPathW	-	CORE_OS	real	win32_rt::kernel32::file::GetTempPathW	
 kernel32.dll	GetThreadContext	-	CORE_OS	real	win32_rt::kernel32::threads::GetThreadContext	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	GetThreadDescription	-	CORE_OS	real	win32_rt::kernel32::threads::GetThreadDescription	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	GetThreadErrorMode	-	CORE_OS	real	win32_rt::kernel32::process::GetThreadErrorMode	crates/win32-rt/src/kernel32/process.rs
+kernel32.dll	GetThreadGroupAffinity	-	CORE_OS	real	win32_rt::kernel32::threads::GetThreadGroupAffinity	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	GetThreadId	-	CORE_OS	real	win32_rt::kernel32::threads::GetThreadId	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	GetThreadInformation	-	CORE_OS	real	win32_rt::kernel32::process::GetThreadInformation	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	GetThreadLocale	-	CORE_OS	real	win32_rt::kernel32::string::GetThreadLocale	crates/win32-rt/src/kernel32/string.rs
@@ -1244,7 +1245,7 @@ kernel32.dll	HeapSize	-	CORE_OS	real	win32_rt::kernel32::memory::HeapSize	crates
 kernel32.dll	HeapUnlock	-	CORE_OS	real	win32_rt::kernel32::memory::HeapUnlock	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	HeapValidate	-	CORE_OS	real	win32_rt::kernel32::memory::HeapValidate	crates/win32-rt/src/kernel32/memory.rs
 kernel32.dll	HeapWalk	-	CORE_OS	real	win32_rt::kernel32::memory::HeapWalk	crates/win32-rt/src/kernel32/memory.rs
-kernel32.dll	InitOnceBeginInitialize	-	CORE_OS	partial	win32_rt::sync::InitOnceBeginInitialize	crates/win32-rt/src/sync.rs
+kernel32.dll	InitOnceBeginInitialize	-	CORE_OS	real	win32_rt::sync::InitOnceBeginInitialize	crates/win32-rt/src/sync.rs
 kernel32.dll	InitOnceComplete	-	CORE_OS	real	win32_rt::sync::InitOnceComplete	crates/win32-rt/src/sync.rs
 kernel32.dll	InitOnceExecuteOnce	-	CORE_OS	real	win32_rt::sync::InitOnceExecuteOnce	crates/win32-rt/src/sync.rs
 kernel32.dll	InitOnceInitialize	-	CORE_OS	real	win32_rt::sync::InitOnceInitialize	crates/win32-rt/src/sync.rs
@@ -1445,12 +1446,12 @@ kernel32.dll	SetProcessWorkingSetSize	-	CORE_OS	real	win32_rt::kernel32::process
 kernel32.dll	SetProcessWorkingSetSizeEx	-	CORE_OS	real	win32_rt::kernel32::process::SetProcessWorkingSetSizeEx	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	SetSearchPathMode	-	CORE_OS	real	win32_rt::kernel32::process::SetSearchPathMode	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	SetStdHandle	-	CORE_OS	real	win32_rt::kernel32::file::SetStdHandle	crates/win32-rt/src/kernel32/file.rs
-kernel32.dll	SetThreadAffinityMask	-	CORE_OS	stub	win32_rt::kernel32::threads::SetThreadAffinityMask	crates/win32-rt/src/kernel32/threads.rs
+kernel32.dll	SetThreadAffinityMask	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadAffinityMask	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadContext	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadContext	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadDescription	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadDescription	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadErrorMode	-	CORE_OS	real	win32_rt::kernel32::process::SetThreadErrorMode	crates/win32-rt/src/kernel32/process.rs
 kernel32.dll	SetThreadExecutionState	-	CORE_OS	real	win32_rt::kernel32::process::SetThreadExecutionState	crates/win32-rt/src/kernel32/process.rs
-kernel32.dll	SetThreadGroupAffinity	-	CORE_OS	stub	win32_rt::kernel32::threads::SetThreadGroupAffinity	crates/win32-rt/src/kernel32/threads.rs
+kernel32.dll	SetThreadGroupAffinity	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadGroupAffinity	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadIdealProcessor	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadIdealProcessor	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadIdealProcessorEx	-	CORE_OS	real	win32_rt::kernel32::threads::SetThreadIdealProcessorEx	crates/win32-rt/src/kernel32/threads.rs
 kernel32.dll	SetThreadInformation	-	CORE_OS	real	win32_rt::kernel32::process::SetThreadInformation	crates/win32-rt/src/kernel32/process.rs
@@ -4261,11 +4262,11 @@ ws2_32.dll	WSAPoll	-	NET_RPC	real	win32_rt::misc::ws2_32::WSAPoll	crates/win32-r
 ws2_32.dll	WSARecv	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecv	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSARecvDisconnect	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvDisconnect	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSARecvFrom	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvFrom	crates/win32-rt/src/misc/ws2_32.rs
-ws2_32.dll	WSARecvMsg	-	NET_RPC	failing	win32_rt::misc::ws2_32::WSARecvMsg	crates/win32-rt/src/misc/ws2_32.rs
+ws2_32.dll	WSARecvMsg	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvMsg	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSAResetEvent	-	NET_RPC	real	win32_rt::misc::ws2_32::WSAResetEvent	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASend	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASend	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASendDisconnect	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendDisconnect	crates/win32-rt/src/misc/ws2_32.rs
-ws2_32.dll	WSASendMsg	-	NET_RPC	failing	win32_rt::misc::ws2_32::WSASendMsg	crates/win32-rt/src/misc/ws2_32.rs
+ws2_32.dll	WSASendMsg	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendMsg	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASendTo	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendTo	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASetEvent	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASetEvent	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASetLastError	112	NET_RPC	real	win32_rt::misc::ws2_32::WSASetLastError	crates/win32-rt/src/misc/ws2_32.rs

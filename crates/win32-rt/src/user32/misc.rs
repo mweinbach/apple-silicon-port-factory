@@ -208,6 +208,11 @@ pub unsafe extern "win64" fn GetSystemMetrics(index: i32) -> i32 {
         11 | 12 => 32,                                                    // SM_CXICON, SM_CYICON
         13 | 14 => 32,                                                    // SM_CXCURSOR, SM_CYCURSOR
         15 => 20,                                                         // SM_CYMENU
+        9 | 10 | 20 | 21 => 17,                                            // scroll thumbs and arrow dimensions
+        30 | 31 => cap.max(1),                                              // SM_CXSIZE / SM_CYSIZE
+        38 | 39 => 75,                                                      // SM_CXICONSPACING / SM_CYICONSPACING
+        45 | 46 => 2,                                                       // SM_CXEDGE / SM_CYEDGE
+        83 | 84 => 1,                                                       // SM_CXFOCUSBORDER / SM_CYFOCUSBORDER
         19 => 1,                                                          // SM_MOUSEPRESENT
         23 => 0,                                                          // SM_SWAPBUTTON
         28 | 29 => 136,                                                   // SM_CXMIN, SM_CYMIN
@@ -244,7 +249,7 @@ pub unsafe extern "win64" fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32
     }
     // Scale UI element dimensions linearly with DPI; screen pixel metrics stay unscaled.
     match index {
-        2 | 3 | 4 | 5 | 6 | 7 | 8 | 11 | 12 | 13 | 14 | 15 | 28 | 29 | 32 | 33 | 34 | 35 | 49 | 50 => {
+        2..=15 | 20 | 21 | 28..=39 | 45 | 46 | 49 | 50 | 83 | 84 => {
             let scaled = (base as i64 * dpi as i64 + 48) / 96;
             scaled as i32
         }
@@ -460,7 +465,7 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
         if pv.is_null() {
             return FALSE;
         }
-        *(pv as *mut u32) = v;
+        pv.cast::<u32>().write_unaligned(v);
         TRUE
     };
     match action {
@@ -468,7 +473,7 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
             if pv.is_null() {
                 return FALSE;
             }
-            *(pv as *mut RECT) = super::monitor::primary_work_area();
+            pv.cast::<RECT>().write_unaligned(super::monitor::primary_work_area());
             TRUE
         }
         // Accessibility structs: { UINT cbSize; DWORD dwFlags; ... }. Report
@@ -505,6 +510,12 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool) -> BOOL {
             *v.add(2) = 1;
             TRUE
         }
+        0x0005 => put_u32(GetSystemMetrics(5) as u32), // SPI_GETBORDER
+        0x0026 => put_u32(TRUE as u32),                 // SPI_GETDRAGFULLWINDOWS
+        0x0062 => put_u32(GetSystemMetrics(36) as u32), // SPI_GETMOUSEHOVERWIDTH
+        0x0064 => put_u32(GetSystemMetrics(37) as u32), // SPI_GETMOUSEHOVERHEIGHT
+        0x200e => put_u32(GetSystemMetrics(83) as u32), // SPI_GETFOCUSBORDERWIDTH
+        0x2010 => put_u32(GetSystemMetrics(84) as u32), // SPI_GETFOCUSBORDERHEIGHT
         SPI_GETMOUSESPEED => put_u32(10),
         SPI_GETWHEELSCROLLLINES => put_u32(3),
         SPI_GETWHEELSCROLLCHARS => put_u32(3),
