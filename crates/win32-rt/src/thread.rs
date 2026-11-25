@@ -393,9 +393,6 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<ThreadObj>>> = const { RefCell::new(None) };
     static ACT_SLOT: Cell<*const ThreadObj> = const { Cell::new(std::ptr::null()) };
     static FLS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// Custom mmap stack allocation `(base_ptr, total_len)` owned by a `thread::spawn`ed
-    /// thread, handed off to the stack reaper on exit.
-    static STACK_ALLOC: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 static THREADS: Mutex<Vec<Arc<ThreadObj>>> = Mutex::new(Vec::new());
@@ -430,8 +427,15 @@ fn stack_reaper_tx() -> &'static Mutex<mpsc::Sender<ReapReq>> {
                     unsafe {
                         // `pthread_join` guarantees the thread has completely exited
                         // and is no longer executing on its custom mmap stack before munmap.
-                        let _ = libc::pthread_join(req.pthread as libc::pthread_t, std::ptr::null_mut());
-                        libc::munmap(req.mem as *mut c_void, req.len);
+                        let rc = libc::pthread_join(req.pthread as libc::pthread_t, std::ptr::null_mut());
+                        if rc == 0 {
+                            libc::munmap(req.mem as *mut c_void, req.len);
+                        } else {
+                            log::warn!(
+                                "stack reaper: pthread_join({:#x}) failed (rc={rc}); skipping munmap",
+                                req.pthread
+                            );
+                        }
                     }
                 }
             });
@@ -439,23 +443,15 @@ fn stack_reaper_tx() -> &'static Mutex<mpsc::Sender<ReapReq>> {
     })
 }
 
-fn enqueue_stack_reap_for(obj: &ThreadObj, pthread: usize) {
+fn enqueue_stack_reap_for(obj: &ThreadObj, pthread: usize) -> bool {
     if pthread == 0 {
-        return;
+        return false;
     }
     if let Some((mem, len)) = defer_lock(&obj.stack_alloc).take() {
         let _ = defer_lock(stack_reaper_tx()).send(ReapReq { pthread, mem, len });
+        return true;
     }
-}
-
-fn enqueue_current_stack_reap() {
-    let pthread = unsafe { libc::pthread_self() as usize };
-    if let Some(obj) = current_thread_object() {
-        enqueue_stack_reap_for(&obj, pthread);
-    }
-    if let Some((mem, len)) = STACK_ALLOC.with(|c| c.take()) {
-        let _ = defer_lock(stack_reaper_tx()).send(ReapReq { pthread, mem, len });
-    }
+    false
 }
 
 #[inline(always)]
@@ -654,7 +650,6 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
             }
         }
         enqueue_stack_reap_for(obj, pthread);
-        STACK_ALLOC.with(|c| c.set(None));
         unsafe { libc::pthread_exit(std::ptr::null_mut()) }
     }
 
@@ -864,8 +859,6 @@ pub static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 struct StartInfo {
     obj: Arc<ThreadObj>,
     body: Box<dyn FnOnce() -> u32 + Send>,
-    stack_mem: usize,
-    stack_total: usize,
     stack_lo: usize,
     stack_hi: usize,
     is_initial: bool,
@@ -922,12 +915,11 @@ pub fn spawn_with_start_address(
         let obj = ThreadObj::new(suspended);
         obj.tid.store(teb::alloc_tid() as usize, Ordering::Relaxed);
         obj.start_address.store(start_address, Ordering::Release);
+        *defer_lock(&obj.stack_alloc) = Some((mem as usize, total));
         defer_lock(&THREADS).push(obj.clone());
         let info = Box::new(StartInfo {
             obj: obj.clone(),
             body,
-            stack_mem: mem as usize,
-            stack_total: total,
             stack_lo: lo,
             stack_hi: hi,
             is_initial,
@@ -944,12 +936,18 @@ pub fn spawn_with_start_address(
         libc::pthread_attr_destroy(&mut attr);
         if rc != 0 {
             drop(Box::from_raw(info_ptr));
+            let _ = defer_lock(&obj.stack_alloc).take();
             libc::munmap(mem, total);
             defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, &obj));
             obj.mark_exiting();
             return Err(std::io::Error::from_raw_os_error(rc));
         }
-        obj.pthread.store(th as usize, Ordering::Relaxed);
+        {
+            let s = defer_lock(&obj.suspend);
+            if s.phase != ThreadPhase::Exiting {
+                obj.pthread.store(th as usize, Ordering::Release);
+            }
+        }
         Ok(obj)
     }
 }
@@ -964,20 +962,23 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
         libc::sigaddset(&mut set, libc::SIGUSR1);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
-    STACK_ALLOC.with(|c| c.set(Some((info.stack_mem, info.stack_total))));
     if let Some(h) = THREAD_START_HOOK.get() {
         h();
     }
     let obj = info.obj.clone();
-    *obj.stack_alloc.lock().unwrap() = Some((info.stack_mem, info.stack_total));
-    obj.pthread.store(unsafe { libc::pthread_self() } as usize, Ordering::Relaxed);
+    {
+        let s = defer_lock(&obj.suspend);
+        if s.phase != ThreadPhase::Exiting {
+            obj.pthread.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
+        }
+    }
     struct ExitGuard(Arc<ThreadObj>);
     impl Drop for ExitGuard {
         fn drop(&mut self) {
             self.0.mark_exiting();
-            let p = self.0.pthread.swap(0, Ordering::AcqRel);
+            self.0.pthread.store(0, Ordering::Release);
+            let p = unsafe { libc::pthread_self() as usize };
             enqueue_stack_reap_for(&self.0, p);
-            STACK_ALLOC.with(|c| c.set(None));
         }
     }
     let _exit_guard = ExitGuard(obj.clone());
@@ -1015,7 +1016,8 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
 /// the borrowed TSD slots, and schedule custom stack reclamation.
 pub fn finish_current_thread(code: u32) {
     ACT_SLOT.with(|c| c.set(std::ptr::null()));
-    if let Some(obj) = current_thread_object() {
+    let obj = current_thread_object();
+    if let Some(ref obj) = obj {
         obj.mark_exiting();
     }
     run_fls_callbacks();
@@ -1025,15 +1027,15 @@ pub fn finish_current_thread(code: u32) {
             l.thread_detach(t);
         }
     }
-    if let Some(obj) = current_thread_object() {
+    if let Some(ref obj) = obj {
         obj.pthread.store(0, Ordering::Release);
         {
             let g = handles::wait_lock();
             *obj.exit_code.get(&g) = Some(code);
         }
-        handles::notify_object_key(&*obj as *const ThreadObj as usize, usize::MAX);
+        handles::notify_object_key(&**obj as *const ThreadObj as usize, usize::MAX);
         obj.teb.store(0, Ordering::Relaxed);
-        defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, &obj));
+        defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, obj));
     }
     CURRENT.with(|c| *c.borrow_mut() = None);
     unsafe {
@@ -1042,7 +1044,10 @@ pub fn finish_current_thread(code: u32) {
             teb::free_teb(t);
         }
     }
-    enqueue_current_stack_reap();
+    if let Some(ref obj) = obj {
+        let pthread = unsafe { libc::pthread_self() as usize };
+        enqueue_stack_reap_for(obj, pthread);
+    }
 }
 
 /// `ExitThread` from Windows code: tear down and exit the host thread.
@@ -1623,6 +1628,36 @@ pub mod sched {
             })
             .join()
             .unwrap();
+        }
+
+        #[test]
+        fn stack_reap_ownership_is_consumed_once_across_teardown_paths() {
+            // Burst of short-lived threads exercises the race between creator publishing
+            // `obj.pthread` and child running `finish_current_thread` + `ExitGuard::drop`.
+            let mut objs = Vec::new();
+            for i in 0u32..32 {
+                let obj = super::super::spawn(Box::new(move || i), 64 * 1024, false, false)
+                    .expect("spawn short-lived thread");
+                objs.push((i, obj));
+            }
+            for (i, obj) in objs {
+                let dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while obj.exit_code().is_none() || super::super::defer_lock(&obj.stack_alloc).is_some() {
+                    assert!(std::time::Instant::now() < dl, "short-lived thread {i} did not finish teardown");
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                assert_eq!(obj.exit_code(), Some(i));
+                // Once teardown ran, `stack_alloc` must be consumed and `pthread` must
+                // never be overwritten with a stale handle by the creator.
+                assert!(
+                    super::super::defer_lock(&obj.stack_alloc).is_none(),
+                    "stack_alloc must be consumed exactly once by teardown"
+                );
+                assert_eq!(obj.pthread.load(Ordering::Acquire), 0);
+                // Calling `enqueue_stack_reap_for` again (simulating a second teardown path)
+                // must be a no-op and never enqueue duplicate reclamation.
+                assert!(!super::super::enqueue_stack_reap_for(&obj, 0x1234));
+            }
         }
     }
 }
