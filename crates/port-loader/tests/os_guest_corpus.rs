@@ -71,8 +71,8 @@ const THREADS_WAITS_APCS_C: &str = r##"
 } while (0)
 
 typedef struct {
-    HANDLE ev_ready;
-    HANDLE ev_go;
+    HANDLE batch_queued;
+    HANDLE worker_step;
     volatile LONG apc_log[8];
     volatile LONG apc_count;
     DWORD sleep_ret;
@@ -93,14 +93,15 @@ static void WINAPI test_apc_proc(ULONG_PTR param) {
 
 static DWORD WINAPI apc_worker(LPVOID lp) {
     ApcCtx *ctx = (ApcCtx *)lp;
-    SetEvent(ctx->ev_ready);
-    /* Wait alertably in SleepEx until APCs arrive. */
+    SetEvent(ctx->worker_step);
+    /* Both callbacks must be pending when SleepEx enters the first alertable wait. */
+    CHECK(WaitForSingleObject(ctx->batch_queued, 5000) == WAIT_OBJECT_0, "wait for first APC batch");
     ctx->sleep_ret = SleepEx(10000, TRUE);
-    SetEvent(ctx->ev_go);
+    SetEvent(ctx->worker_step);
 
     /* Wait alertably in WaitForSingleObjectEx on unsignaled event. */
     ctx->wfso_ret = WaitForSingleObjectEx(ctx->ev_wait_target, 10000, TRUE);
-    SetEvent(ctx->ev_go);
+    SetEvent(ctx->worker_step);
 
     /* Wait alertably in WaitForMultipleObjectsEx on two unsignaled events. */
     HANDLE hs[2] = { ctx->ev_dummy, ctx->ev_wait_target };
@@ -218,28 +219,30 @@ int main(void) {
     /* 4. Alertable waits + QueueUserAPC FIFO delivery */
     ApcCtx *ctx = (ApcCtx *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     CHECK(ctx != NULL && (((uintptr_t)ctx & 0xFULL) == 0), "aligned ApcCtx");
-    ctx->ev_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
-    ctx->ev_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ctx->batch_queued = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ctx->worker_step = CreateEventW(NULL, FALSE, FALSE, NULL);
     ctx->ev_wait_target = CreateEventW(NULL, TRUE, FALSE, NULL);
     ctx->ev_dummy = CreateEventW(NULL, TRUE, FALSE, NULL);
 
     HANDLE apc_th = CreateThread(NULL, 0, apc_worker, ctx, 0, NULL);
     CHECK(apc_th != NULL, "CreateThread apc_worker");
-    CHECK(WaitForSingleObject(ctx->ev_ready, 5000) == WAIT_OBJECT_0, "wait apc_worker ready");
-    Sleep(30); /* let worker enter SleepEx */
+    CHECK(WaitForSingleObject(ctx->worker_step, 5000) == WAIT_OBJECT_0, "wait apc_worker ready");
 
     /* Queue two APCs to verify FIFO order and WAIT_IO_COMPLETION */
     CHECK(QueueUserAPC(test_apc_proc, apc_th, ((ULONG_PTR)ctx) | 1u) != 0, "QueueUserAPC #1");
     CHECK(QueueUserAPC(test_apc_proc, apc_th, ((ULONG_PTR)ctx) | 2u) != 0, "QueueUserAPC #2");
-    CHECK(WaitForSingleObject(ctx->ev_go, 5000) == WAIT_OBJECT_0, "worker finished SleepEx");
+    CHECK(SetEvent(ctx->batch_queued), "release first APC batch");
+    CHECK(WaitForSingleObject(ctx->worker_step, 5000) == WAIT_OBJECT_0, "worker finished SleepEx");
     CHECK(ctx->sleep_ret == WAIT_IO_COMPLETION, "SleepEx returned WAIT_IO_COMPLETION");
-    CHECK(ctx->apc_count >= 1 && ctx->apc_log[0] == 1, "first APC tag == 1");
+    CHECK(ctx->apc_count == 2 && ctx->apc_log[0] == 1 && ctx->apc_log[1] == 2,
+          "SleepEx delivered APCs #1 and #2 in FIFO order");
     printf("CORPUS_THREADS: alertable_sleepex_apc ok\n");
 
     Sleep(30); /* let worker enter WaitForSingleObjectEx */
     CHECK(QueueUserAPC(test_apc_proc, apc_th, ((ULONG_PTR)ctx) | 3u) != 0, "QueueUserAPC #3");
-    CHECK(WaitForSingleObject(ctx->ev_go, 5000) == WAIT_OBJECT_0, "worker finished WFSOEx");
+    CHECK(WaitForSingleObject(ctx->worker_step, 5000) == WAIT_OBJECT_0, "worker finished WFSOEx");
     CHECK(ctx->wfso_ret == WAIT_IO_COMPLETION, "WFSOEx returned WAIT_IO_COMPLETION");
+    CHECK(ctx->apc_count == 3 && ctx->apc_log[2] == 3, "WFSOEx delivered APC #3");
 
     Sleep(30); /* let worker enter WaitForMultipleObjectsEx */
     CHECK(QueueUserAPC(test_apc_proc, apc_th, ((ULONG_PTR)ctx) | 4u) != 0, "QueueUserAPC #4");
@@ -252,8 +255,8 @@ int main(void) {
     DWORD exit_code = 0;
     CHECK(GetExitCodeThread(apc_th, &exit_code) && exit_code == 0x55AAu, "GetExitCodeThread == 0x55AA");
     CloseHandle(apc_th);
-    CloseHandle(ctx->ev_ready);
-    CloseHandle(ctx->ev_go);
+    CloseHandle(ctx->batch_queued);
+    CloseHandle(ctx->worker_step);
     CloseHandle(ctx->ev_wait_target);
     CloseHandle(ctx->ev_dummy);
     VirtualFree(ctx, 0, MEM_RELEASE);
