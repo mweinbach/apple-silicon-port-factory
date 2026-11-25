@@ -8386,7 +8386,7 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     d[12..16].copy_from_slice(&vol.max_physical_pages.to_le_bytes());
                     d[16..20].copy_from_slice(&vol.alignment_mask.to_le_bytes());
                     d[22] = 1; // CommandQueueing
-                    d[25] = vol.bus_type as u8;
+                    d[24] = vol.bus_type as u8; // BusType (@24)
                     put(&d)
                 }
                 2 => {
@@ -8472,11 +8472,30 @@ pub unsafe extern "win64" fn DeviceIoControl(
                     put(&d)
                 }
                 13 => {
-                    // StorageDeviceCopyOffloadProperty -> DEVICE_COPY_OFFLOAD_DESCRIPTOR (40 bytes)
-                    let mut d = [0u8; 40];
-                    d[0..4].copy_from_slice(&40u32.to_le_bytes());
-                    d[4..8].copy_from_slice(&40u32.to_le_bytes());
-                    d[8..12].copy_from_slice(&vol.max_transfer_length.to_le_bytes());
+                    // StorageDeviceCopyOffloadProperty -> DEVICE_COPY_OFFLOAD_DESCRIPTOR (48 bytes)
+                    // @0  DWORD     Version (48)
+                    // @4  DWORD     Size (48)
+                    // @8  DWORD     MaximumTokenLifetime
+                    // @12 DWORD     DefaultTokenLifetime
+                    // @16 DWORDLONG MaximumTransferSize
+                    // @24 DWORDLONG OptimalTransferCount
+                    // @32 DWORD     MaximumDataDescriptors
+                    // @36 DWORD     MaximumTransferLengthPerDescriptor
+                    // @40 DWORD     OptimalTransferLengthPerDescriptor
+                    // @44 WORD      OptimalTransferLengthGranularity
+                    // @46 BYTE[2]   Reserved
+                    let mut d = [0u8; 48];
+                    let max_xfer = vol.max_transfer_length as u64;
+                    d[0..4].copy_from_slice(&48u32.to_le_bytes());
+                    d[4..8].copy_from_slice(&48u32.to_le_bytes());
+                    d[8..12].copy_from_slice(&0u32.to_le_bytes()); // MaximumTokenLifetime
+                    d[12..16].copy_from_slice(&0u32.to_le_bytes()); // DefaultTokenLifetime
+                    d[16..24].copy_from_slice(&max_xfer.to_le_bytes()); // MaximumTransferSize
+                    d[24..32].copy_from_slice(&max_xfer.to_le_bytes()); // OptimalTransferCount
+                    d[32..36].copy_from_slice(&1u32.to_le_bytes()); // MaximumDataDescriptors
+                    d[36..40].copy_from_slice(&vol.max_transfer_length.to_le_bytes()); // MaximumTransferLengthPerDescriptor
+                    d[40..44].copy_from_slice(&vol.max_transfer_length.to_le_bytes()); // OptimalTransferLengthPerDescriptor
+                    d[44..46].copy_from_slice(&1u16.to_le_bytes()); // OptimalTransferLengthGranularity
                     put(&d)
                 }
                 15 => {
@@ -11970,7 +11989,7 @@ mod tests {
                 (7, 12),
                 (8, 12),
                 (12, 20),
-                (13, 40),
+                (13, 48),
                 (15, 12),
                 (48, 16),
             ] {
@@ -11993,6 +12012,23 @@ mod tests {
                 );
                 assert!(ret >= min_sz, "prop={prop} ret={ret} < {min_sz}");
                 assert_eq!((out.as_ptr() as *const u32).read_unaligned(), min_sz, "prop={prop} Version");
+                if prop == 1 {
+                    assert_eq!((out.as_ptr().add(4) as *const u32).read_unaligned(), 32);
+                    assert_ne!(out[24], 0, "STORAGE_ADAPTER_DESCRIPTOR.BusType at @24");
+                }
+                if prop == 13 {
+                    assert_eq!(ret, 48);
+                    assert_eq!((out.as_ptr().add(4) as *const u32).read_unaligned(), 48);
+                    assert_eq!((out.as_ptr().add(8) as *const u32).read_unaligned(), 0); // MaximumTokenLifetime
+                    assert_eq!((out.as_ptr().add(12) as *const u32).read_unaligned(), 0); // DefaultTokenLifetime
+                    let max_xfer = (out.as_ptr().add(16) as *const u64).read_unaligned();
+                    assert!(max_xfer > 0, "DEVICE_COPY_OFFLOAD_DESCRIPTOR.MaximumTransferSize at @16");
+                    assert_eq!((out.as_ptr().add(24) as *const u64).read_unaligned(), max_xfer);
+                    assert_eq!((out.as_ptr().add(32) as *const u32).read_unaligned(), 1);
+                    assert_eq!((out.as_ptr().add(36) as *const u32).read_unaligned(), max_xfer as u32);
+                    assert_eq!((out.as_ptr().add(40) as *const u32).read_unaligned(), max_xfer as u32);
+                    assert_eq!((out.as_ptr().add(44) as *const u16).read_unaligned(), 1);
+                }
             }
 
             // Unsupported property IDs (including old misnumbered 11, 17, and 50) return ERROR_NOT_SUPPORTED.
