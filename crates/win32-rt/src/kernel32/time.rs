@@ -592,10 +592,10 @@ pub fn process_start_filetime() -> u64 {
 pub unsafe extern "win64" fn GetProcessTimes(_h: HANDLE, create: *mut FILETIME, exit: *mut FILETIME, kernel: *mut FILETIME, user: *mut FILETIME) -> BOOL {
     let mut ru: libc::rusage = std::mem::zeroed();
     libc::getrusage(libc::RUSAGE_SELF, &mut ru);
-    *create = FILETIME::from_u64(process_start_filetime());
-    *exit = FILETIME::default();
-    *kernel = FILETIME::from_u64(timeval_to_100ns(ru.ru_stime));
-    *user = FILETIME::from_u64(timeval_to_100ns(ru.ru_utime));
+    create.write_unaligned(FILETIME::from_u64(process_start_filetime()));
+    exit.write_unaligned(FILETIME::default());
+    kernel.write_unaligned(FILETIME::from_u64(timeval_to_100ns(ru.ru_stime)));
+    user.write_unaligned(FILETIME::from_u64(timeval_to_100ns(ru.ru_utime)));
     TRUE
 }
 
