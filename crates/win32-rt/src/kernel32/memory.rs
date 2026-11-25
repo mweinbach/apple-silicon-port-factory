@@ -192,6 +192,11 @@ static HAS_NOACCESS_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Set once any `MEM_WRITE_WATCH` allocation is created so write-fault handlers can
 /// skip taking `VM.lock()` when write-watch is unused.
 static HAS_WRITE_WATCH_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once any VM host page has host `PROT_WRITE` stripped while containing a
+/// logically writable 4 KiB subpage (clean `MEM_WRITE_WATCH` or mixed subpage
+/// protections on 16 KiB host pages), so kernel I/O paths know to check whether
+/// destination staging is needed to avoid `EFAULT`.
+static HAS_IO_RESTRICTED_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl VmState {
     fn alloc_containing(&self, addr: usize) -> Option<(usize, Alloc)> {
@@ -426,11 +431,15 @@ unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u3
                 }
             }
             if has_non_writable || arm_write_watch {
+                HAS_IO_RESTRICTED_PAGES.store(true, std::sync::atomic::Ordering::Release);
                 host_prot & !libc::PROT_WRITE
             } else {
                 host_prot
             }
         };
+        if p == libc::PROT_NONE {
+            HAS_IO_RESTRICTED_PAGES.store(true, std::sync::atomic::Ordering::Release);
+        }
         let rc = host_mprotect(hp, HOST_PAGE, p);
         if rc != 0 {
             return rc;
@@ -438,6 +447,147 @@ unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u3
         hp += HOST_PAGE;
     }
     0
+}
+
+/// Returns `true` if `[addr, addr + len)` overlaps any VM-tracked host page whose
+/// host `PROT_WRITE` is currently stripped while containing a logically writable 4 KiB
+/// subpage (either a clean `MEM_WRITE_WATCH` page or a writable 4 KiB subpage sharing
+/// a 16 KiB host page with a non-writable/protected sibling). Kernel read/recv syscalls
+/// would otherwise fail with `EFAULT` when copying into such pages.
+pub fn needs_io_write_staging(addr: usize, len: usize) -> bool {
+    if len == 0
+        || addr == 0
+        || (!HAS_WRITE_WATCH_PAGES.load(std::sync::atomic::Ordering::Acquire)
+            && !HAS_IO_RESTRICTED_PAGES.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return false;
+    }
+    let start_hp = addr & !(HOST_PAGE - 1);
+    let end = addr.saturating_add(len);
+    let end_hp = end.saturating_add(HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    let vm = VM.lock().unwrap();
+    let mut hp = start_hp;
+    while hp < end_hp {
+        let is_dirty = vm.write_watch_dirty.contains(&hp);
+        let mut has_writable_in_range = false;
+        let mut has_clean_ww = false;
+        let mut sub = hp;
+        while sub < hp + HOST_PAGE {
+            if sub + PAGE > addr && sub < end {
+                if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
+                    if sub < seg.end
+                        && seg.state == MEM_COMMIT
+                        && is_writable_prot(seg.prot)
+                        && (seg.prot & PAGE_GUARD) == 0
+                    {
+                        has_writable_in_range = true;
+                        if !is_dirty && vm.alloc_containing(sub).is_some_and(|(_, a)| a.write_watch) {
+                            has_clean_ww = true;
+                        }
+                    }
+                }
+            }
+            sub += PAGE;
+        }
+        if has_writable_in_range
+            && (has_clean_ww
+                || vm.has_non_writable_subpage(hp, None)
+                || vm.has_protected_subpage(hp, None))
+        {
+            return true;
+        }
+        hp = match hp.checked_add(HOST_PAGE) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    false
+}
+
+/// Copy `src` into guest memory at `dst`, transparently handling clean `MEM_WRITE_WATCH`
+/// pages (marking only the actually written host pages dirty and lifting host `PROT_WRITE`)
+/// and writable 4 KiB subpages sharing a 16 KiB host page with non-writable/protected siblings.
+///
+/// Validates all touched VM-tracked 4 KiB subpages before mutating memory and returns
+/// `Err(libc::EFAULT)` if any touched VM subpage is uncommitted, non-writable, or `PAGE_GUARD`.
+pub unsafe fn write_guest_io_bytes(dst: *mut u8, src: &[u8]) -> Result<(), i32> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if dst.is_null() {
+        return Err(libc::EFAULT);
+    }
+    if !HAS_WRITE_WATCH_PAGES.load(std::sync::atomic::Ordering::Acquire)
+        && !HAS_IO_RESTRICTED_PAGES.load(std::sync::atomic::Ordering::Acquire)
+    {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        return Ok(());
+    }
+    let dst_addr = dst as usize;
+    let Some(dst_end) = dst_addr.checked_add(src.len()) else {
+        return Err(libc::EFAULT);
+    };
+    let mut vm = VM.lock().unwrap();
+    // 1. Validate every touched VM-tracked 4 KiB subpage up front before mutating anything.
+    let mut p = dst_addr & !(PAGE - 1);
+    let p_end = dst_end.saturating_add(PAGE - 1) & !(PAGE - 1);
+    while p < p_end {
+        if vm.alloc_containing(p).is_some() {
+            let Some((&_s, seg)) = vm.segs.range(..=p).next_back() else {
+                return Err(libc::EFAULT);
+            };
+            if p >= seg.end
+                || seg.state != MEM_COMMIT
+                || !is_writable_prot(seg.prot)
+                || (seg.prot & PAGE_GUARD) != 0
+            {
+                return Err(libc::EFAULT);
+            }
+        }
+        p = match p.checked_add(PAGE) {
+            Some(next) => next,
+            None => return Err(libc::EFAULT),
+        };
+    }
+    // 2. Copy host-page by host-page, recording write-watch dirty pages and temporarily
+    //    lifting PROT_WRITE when a restricted sibling shares the 16 KiB host page.
+    let mut off = 0usize;
+    while off < src.len() {
+        let cur = dst_addr + off;
+        let hp = cur & !(HOST_PAGE - 1);
+        let hp_end = hp.saturating_add(HOST_PAGE);
+        let chunk = (hp_end - cur).min(src.len() - off);
+        let mut touches_ww = false;
+        let mut sub = cur & !(PAGE - 1);
+        let sub_end = (cur + chunk).saturating_add(PAGE - 1) & !(PAGE - 1);
+        while sub < sub_end {
+            if vm.alloc_containing(sub).is_some_and(|(_, a)| a.write_watch) {
+                touches_ww = true;
+                break;
+            }
+            sub += PAGE;
+        }
+        let has_restricted_sibling =
+            vm.has_protected_subpage(hp, None) || vm.has_non_writable_subpage(hp, None);
+        let was_clean_ww = touches_ww && !vm.write_watch_dirty.contains(&hp);
+        if touches_ww {
+            vm.write_watch_dirty.insert(hp);
+        }
+        if has_restricted_sibling {
+            if host_mprotect(hp, HOST_PAGE, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+                return Err(libc::EFAULT);
+            }
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(off), cur as *mut u8, chunk);
+            let _ = vm.restore_host_page_prot(hp);
+        } else {
+            if was_clean_ww {
+                let _ = vm.restore_host_page_prot(hp);
+            }
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(off), cur as *mut u8, chunk);
+        }
+        off += chunk;
+    }
+    Ok(())
 }
 
 /// Record the enclosing host page of `addr` as dirty if it belongs to a
@@ -2323,6 +2473,174 @@ mod tests {
             }
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             worker.join().unwrap();
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    unsafe fn query_host_vm_prot(addr: usize) -> i32 {
+        const VM_REGION_BASIC_INFO_64: i32 = 9;
+        const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn mach_vm_region(
+                target_task: u32,
+                address: *mut u64,
+                size: *mut u64,
+                flavor: i32,
+                info: *mut i32,
+                info_cnt: *mut u32,
+                object_name: *mut u32,
+            ) -> i32;
+        }
+        let mut query_addr = addr as u64;
+        let mut query_size = 0u64;
+        let mut info = [0i32; 9];
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut obj = 0u32;
+        let kr = mach_vm_region(
+            mach_task_self(),
+            &mut query_addr,
+            &mut query_size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut obj,
+        );
+        assert_eq!(kr, 0, "mach_vm_region failed: {kr}");
+        info[0]
+    }
+
+    #[test]
+    fn write_watch_and_mixed_subpage_kernel_io_reads() {
+        use crate::kernel32::file::{CreatePipe, PeekNamedPipe, ReadFile, ReadFileEx, WriteFile, OVERLAPPED};
+        unsafe {
+            // 1. Clean MEM_WRITE_WATCH buffer (2 host pages) passed directly to disk ReadFile,
+            //    overlapped ReadFile, ReadFileEx, and ResetWriteWatch + re-read.
+            let region_sz = HOST_PAGE * 2;
+            let buf = VirtualAlloc(
+                std::ptr::null_mut(),
+                region_sz,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            );
+            assert!(!buf.is_null());
+            let base = buf as usize;
+            let mut addrs = [std::ptr::null_mut::<c_void>(); 8];
+            let mut count = addrs.len();
+            let mut gran = 0u32;
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 0);
+
+            // Create a temporary disk file under virtual W:\ drive.
+            let tmp_dir = std::env::temp_dir().join(format!("win32rt_ww_io_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            let tmp_file = tmp_dir.join("payload.bin");
+            std::fs::write(&tmp_file, b"hello write-watch disk io!").unwrap();
+            crate::path::add_mount("W:", &tmp_dir);
+            let hdisk = crate::kernel32::file::create_file(
+                "W:\\payload.bin",
+                0x8000_0000, // GENERIC_READ
+                3,           // OPEN_EXISTING
+                0,
+            )
+            .expect("open test disk file");
+
+            // Sync disk ReadFile into clean MEM_WRITE_WATCH page 0: succeeds and marks ONLY page 0 dirty!
+            let mut got = 0u32;
+            assert_eq!(ReadFile(hdisk, buf, region_sz as u32, &mut got, std::ptr::null_mut()), TRUE);
+            assert_eq!(got, 26);
+            assert_eq!(std::slice::from_raw_parts(buf as *const u8, 26), b"hello write-watch disk io!");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base);
+
+            // ResetWriteWatch rearms page 0; overlapped ReadFile at offset 6 into page 1 marks ONLY page 1 dirty!
+            assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+            let mut ov: OVERLAPPED = std::mem::zeroed();
+            ov.offset = 6;
+            let page1 = (base + HOST_PAGE) as *mut c_void;
+            assert_eq!(ReadFile(hdisk, page1, 11, &mut got, &mut ov), TRUE);
+            assert_eq!(got, 11);
+            assert_eq!(std::slice::from_raw_parts(page1 as *const u8, 11), b"write-watch");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base + HOST_PAGE);
+
+            // ResetWriteWatch + ReadFileEx into clean page 0 also succeeds and marks page 0 dirty.
+            assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+            let mut ov_ex: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ReadFileEx(hdisk, buf, 5, &mut ov_ex, None), TRUE);
+            assert_eq!(std::slice::from_raw_parts(buf as *const u8, 5), b"hello");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base);
+            assert_eq!(crate::kernel32::threads::CloseHandle(hdisk), TRUE);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+
+            // 2. Clean MEM_WRITE_WATCH buffer with anonymous pipe: PeekNamedPipe + sync ReadFile + overlapped ReadFile.
+            assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+            let (mut prd, mut pwr) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(CreatePipe(&mut prd, &mut pwr, std::ptr::null_mut(), 0), TRUE);
+            let mut written = 0u32;
+            assert_eq!(WriteFile(pwr, b"pipe-sync!".as_ptr() as *const c_void, 10, &mut written, std::ptr::null_mut()), TRUE);
+            let mut peeked = 0u32;
+            assert_eq!(
+                PeekNamedPipe(prd, page1, 10, &mut peeked, std::ptr::null_mut(), std::ptr::null_mut()),
+                TRUE
+            );
+            assert_eq!(peeked, 10);
+            assert_eq!(std::slice::from_raw_parts(page1 as *const u8, 10), b"pipe-sync!");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base + HOST_PAGE);
+
+            assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+            assert_eq!(ReadFile(prd, buf, 10, &mut got, std::ptr::null_mut()), TRUE);
+            assert_eq!(got, 10);
+            assert_eq!(std::slice::from_raw_parts(buf as *const u8, 10), b"pipe-sync!");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base);
+
+            // Overlapped pipe ReadFile into clean page 1 after ResetWriteWatch.
+            assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+            assert_eq!(WriteFile(pwr, b"pipe-ov".as_ptr() as *const c_void, 7, &mut written, std::ptr::null_mut()), TRUE);
+            let mut pov: OVERLAPPED = std::mem::zeroed();
+            assert_eq!(ReadFile(prd, page1, 7, &mut got, &mut pov), TRUE);
+            assert_eq!(got, 7);
+            assert_eq!(std::slice::from_raw_parts(page1 as *const u8, 7), b"pipe-ov");
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, buf, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, base + HOST_PAGE);
+
+            // 3. Mixed 4 KiB PAGE_READONLY + 4 KiB PAGE_READWRITE subpages on one 16 KiB host page:
+            //    pipe ReadFile into the writable sibling succeeds while keeping host page PROT_READ,
+            //    and ReadFile into the PAGE_READONLY sibling fails cleanly.
+            if HOST_PAGE > PAGE {
+                let mut old_prot = 0u32;
+                assert_eq!(VirtualProtect(buf, PAGE, PAGE_READONLY, &mut old_prot), TRUE);
+                assert_eq!(ResetWriteWatch(buf, region_sz), 0);
+                let rw_sub = (base + PAGE) as *mut c_void;
+                assert_eq!(WriteFile(pwr, b"subpage".as_ptr() as *const c_void, 7, &mut written, std::ptr::null_mut()), TRUE);
+                assert_eq!(ReadFile(prd, rw_sub, 7, &mut got, std::ptr::null_mut()), TRUE);
+                assert_eq!(got, 7);
+                assert_eq!(std::slice::from_raw_parts(rw_sub as *const u8, 7), b"subpage");
+                #[cfg(target_vendor = "apple")]
+                assert_eq!(query_host_vm_prot(base), 1, "host page must stay PROT_READ for RO sibling");
+                assert_eq!(WriteFile(pwr, b"rofail!".as_ptr() as *const c_void, 7, &mut written, std::ptr::null_mut()), TRUE);
+                assert_eq!(ReadFile(prd, buf, 7, &mut got, std::ptr::null_mut()), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOACCESS);
+            }
+
+            assert_eq!(crate::kernel32::threads::CloseHandle(prd), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(pwr), TRUE);
+            assert_eq!(VirtualFree(buf, 0, MEM_RELEASE), TRUE);
         }
     }
 }

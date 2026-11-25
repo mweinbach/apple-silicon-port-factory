@@ -92,19 +92,19 @@ gameinput.dll	gi_get_temporal_reading	stub	crates/win32-rt/src/misc/gameinput.rs
 gdi32.dll	GetDeviceCaps	stub	crates/win32-rt/src/misc/gdi32.rs	866	"GetDeviceCaps({index}) -> 0"
 hid.dll	HidD_SetNumInputBuffers	stub	crates/win32-rt/src/misc/hid.rs	887	"ring size stays {INPUT_BUFFERS} (asked {n})"
 kernel32.dll	AllocConsole	stub	crates/win32-rt/src/kernel32/file.rs	477	"no separate console window; stdout/stderr of the loader act as the console"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7127	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7155	"DeviceIoControl code {code:#x} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7226	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7254	"DeviceIoControl code {code:#x} unsupported"
 kernel32.dll	GetCalendarInfoEx	stub	crates/win32-rt/src/kernel32/string.rs	1354	"GetCalendarInfoEx type {ty:#x}"
-kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2137	"GetFileInformationByHandleEx class {class} not supported"
+kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2230	"GetFileInformationByHandleEx class {class} not supported"
 kernel32.dll	GetGeoInfoW	stub	crates/win32-rt/src/kernel32/string.rs	1125	"GetGeoInfo for geo id {geo} answered with US data"
 kernel32.dll	GetLocaleInfoW	stub	crates/win32-rt/src/kernel32/string.rs	918	"locale {lcid:#x} not available; answering with en-US data"
 kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	"custom NUMBERFMT ignored"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
-kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6918	"MapViewOfFile3 on another process"
-kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2596	"MoveFileExA delete-on-reboot ignored"
-kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2589	"MoveFileExW delete-on-reboot ignored"
-kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2268	"SetFileInformationByHandle class {class} not supported"
+kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	7017	"MapViewOfFile3 on another process"
+kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2689	"MoveFileExA delete-on-reboot ignored"
+kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2682	"MoveFileExW delete-on-reboot ignored"
+kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2361	"SetFileInformationByHandle class {class} not supported"
 kernel32.dll	get_locale_info	stub	crates/win32-rt/src/kernel32/string.rs	865	"GetLocaleInfo LCTYPE {lctype:#x} unknown"
 libcurl.dll	easy_getinfo	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1344	"libcurl: unsupported curl_easy_getinfo(info={other:#x})"
 libcurl.dll	easy_setopt	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1158	"libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})"
@@ -152,7 +152,7 @@ shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs
 ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
-ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1062	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
+ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1087	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
 ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
 user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	987	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
@@ -174,13 +174,13 @@ wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	
 wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1439	"WinVerifyTrust(choice={union_choice}) -> TRUST_E_NOSIGNATURE"
-ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
 ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1802	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
-ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3423	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
 ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1322	"WSADuplicateSocket cross-process target pid={pid} unsupported"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	216	"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	233	"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"

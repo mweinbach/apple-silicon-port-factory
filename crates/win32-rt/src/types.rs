@@ -125,6 +125,7 @@ pub fn errno_to_win32(e: i32) -> u32 {
         libc::EMFILE | libc::ENFILE => ERROR_TOO_MANY_OPEN_FILES,
         libc::ENOTEMPTY => ERROR_DIR_NOT_EMPTY,
         libc::EPIPE => ERROR_BROKEN_PIPE,
+        libc::EFAULT => ERROR_NOACCESS,
         libc::ENAMETOOLONG => ERROR_INVALID_NAME,
         libc::EISDIR => ERROR_ACCESS_DENIED,
         libc::ENOSPC => 112, // ERROR_DISK_FULL
