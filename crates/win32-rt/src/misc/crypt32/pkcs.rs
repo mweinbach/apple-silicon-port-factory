@@ -170,6 +170,7 @@ fn strip_leading_zero(mut b: &[u8]) -> &[u8] {
 /// Maximum nesting depth allowed for recursive BER constructed OCTET STRINGs and
 /// PKCS#12 `safeContentsBag` containers. Prevents stack exhaustion on crafted inputs.
 pub(super) const MAX_PFX_NESTING_DEPTH: usize = 32;
+pub(super) const MAX_PFX_SAFE_BAGS: usize = 512;
 
 fn extract_octet_string(elem: DerItem<'_>) -> Option<Vec<u8>> {
     fn inner(elem: DerItem<'_>, depth: usize, out: &mut Vec<u8>) -> Option<()> {
@@ -1519,6 +1520,7 @@ unsafe fn parse_safe_contents(
     pass_bmp: &[u8],
     certs: &mut Vec<PfxBagCert>,
     keys: &mut Vec<PfxBagKey>,
+    bag_count: &mut usize,
 ) -> Result<(), u32> {
     let mut worklist: Vec<(&[u8], usize)> = vec![(der, 0)];
     while let Some((cur_der, depth)) = worklist.pop() {
@@ -1532,6 +1534,10 @@ unsafe fn parse_safe_contents(
         let bags = der_item_children(seq.val).ok_or(err::ERROR_INVALID_DATA)?;
         let mut nested: Vec<(&[u8], usize)> = Vec::new();
         for bag in bags {
+            *bag_count = bag_count.saturating_add(1);
+            if *bag_count > MAX_PFX_SAFE_BAGS {
+                return Err(err::ERROR_INVALID_DATA);
+            }
             if bag.tag != 0x30 {
                 continue;
             }
@@ -1599,15 +1605,27 @@ unsafe fn parse_safe_contents(
     Ok(())
 }
 
-/// Returns `true` when `pkcs8_der` (RFC 5958 `PrivateKeyInfo`) cryptographically corresponds
-/// to the `SubjectPublicKeyInfo` of `cert_der`.
-fn pkcs8_matches_cert_spki(pkcs8_der: &[u8], cert_der: &[u8]) -> bool {
-    let Some(parts) = parse_cert_der_parts(cert_der) else {
-        return false;
-    };
-    let expected_spki_full = encode_der_tlv(0x30, parts.spki_inner);
+/// Precomputed public-key identifier derived once per PKCS#8 private key (`O(K)`) so
+/// certificate-to-key matching without `localKeyId` runs in `O(C + K)` via `HashMap`
+/// instead of `O(C * K)` repeated private-key loads.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PfxPublicKeyId {
+    /// Inner contents of the ASN.1 `SubjectPublicKeyInfo` SEQUENCE.
+    SpkiInner(Vec<u8>),
+    /// Stripped `(modulus, publicExponent)` for legacy <2048-bit RSA keys rejected by `ring`.
+    RsaModExp(Vec<u8>, Vec<u8>),
+}
 
-    // Primary check via rustls::crypto::ring (covers RSA >= 2048, ECDSA P-256/P-384, Ed25519).
+fn strip_leading_zero_bytes(mut s: &[u8]) -> &[u8] {
+    while s.len() > 1 && s[0] == 0 {
+        s = &s[1..];
+    }
+    s
+}
+
+/// Derive a `PfxPublicKeyId` once from an RFC 5958 `PrivateKeyInfo` (`pkcs8_der`).
+fn extract_pkcs8_public_key_id(pkcs8_der: &[u8]) -> Option<PfxPublicKeyId> {
+    // Primary path via rustls::crypto::ring (covers RSA >= 2048, ECDSA P-256/P-384, Ed25519).
     let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
         rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.to_vec()),
     );
@@ -1617,77 +1635,72 @@ fn pkcs8_matches_cert_spki(pkcs8_der: &[u8], cert_der: &[u8]) -> bool {
     {
         if let Some(spki) = signing_key.public_key() {
             let got = spki.as_ref();
-            return got == parts.spki_inner || got == expected_spki_full.as_slice();
+            if let Some((seq, rest)) = parse_der_item(got) {
+                if seq.tag == 0x30 && rest.is_empty() {
+                    return Some(PfxPublicKeyId::SpkiInner(seq.val.to_vec()));
+                }
+            }
+            return Some(PfxPublicKeyId::SpkiInner(got.to_vec()));
         }
     }
 
-    // Fallback for RSA keys rejected by ring's >=2048-bit policy (e.g. legacy 1024-bit PFXs):
-    // compare the PKCS#8 RSAPrivateKey (modulus, publicExponent) against the cert's RSAPublicKey.
-    fn strip_zero(mut s: &[u8]) -> &[u8] {
-        while s.len() > 1 && s[0] == 0 {
-            s = &s[1..];
-        }
-        s
-    }
-    let Some((pki_seq, _)) = parse_der_item(pkcs8_der) else {
-        return false;
-    };
+    // Fallback for legacy RSA keys rejected by ring's >=2048-bit policy (e.g. 1024-bit PFXs).
+    let (pki_seq, _) = parse_der_item(pkcs8_der)?;
     if pki_seq.tag != 0x30 {
-        return false;
+        return None;
     }
-    let Some(pki_kids) = der_item_children(pki_seq.val) else {
-        return false;
-    };
+    let pki_kids = der_item_children(pki_seq.val)?;
     if pki_kids.len() < 3 || pki_kids[1].tag != 0x30 || pki_kids[2].tag != 0x04 {
-        return false;
+        return None;
     }
-    let Some((priv_alg_oid, _)) = parse_alg_id(pki_kids[1]) else {
-        return false;
-    };
+    let (priv_alg_oid, _) = parse_alg_id(pki_kids[1])?;
     if priv_alg_oid != OID_RSA_ENCRYPTION {
-        return false;
+        return None;
     }
-    let Some((rsa_priv_seq, _)) = parse_der_item(pki_kids[2].val) else {
-        return false;
-    };
+    let (rsa_priv_seq, _) = parse_der_item(pki_kids[2].val)?;
     if rsa_priv_seq.tag != 0x30 {
-        return false;
+        return None;
     }
-    let Some(rsa_priv_kids) = der_item_children(rsa_priv_seq.val) else {
-        return false;
-    };
+    let rsa_priv_kids = der_item_children(rsa_priv_seq.val)?;
     if rsa_priv_kids.len() < 3 || rsa_priv_kids[1].tag != 0x02 || rsa_priv_kids[2].tag != 0x02 {
-        return false;
+        return None;
     }
-    let Some(spki_kids) = der_item_children(parts.spki_inner) else {
-        return false;
-    };
-    if spki_kids.len() < 2 || spki_kids[0].tag != 0x30 || spki_kids[1].tag != 0x03 {
-        return false;
-    }
-    let Some((pub_alg_oid, _)) = parse_alg_id(spki_kids[0]) else {
-        return false;
-    };
-    if pub_alg_oid != OID_RSA_ENCRYPTION
-        || spki_kids[1].val.len() < 2
-        || spki_kids[1].val[0] != 0
-    {
-        return false;
-    }
-    let Some((rsa_pub_seq, _)) = parse_der_item(&spki_kids[1].val[1..]) else {
-        return false;
-    };
-    if rsa_pub_seq.tag != 0x30 {
-        return false;
-    }
-    let Some(rsa_pub_kids) = der_item_children(rsa_pub_seq.val) else {
-        return false;
-    };
-    if rsa_pub_kids.len() < 2 || rsa_pub_kids[0].tag != 0x02 || rsa_pub_kids[1].tag != 0x02 {
-        return false;
-    }
-    strip_zero(rsa_priv_kids[1].val) == strip_zero(rsa_pub_kids[0].val)
-        && strip_zero(rsa_priv_kids[2].val) == strip_zero(rsa_pub_kids[1].val)
+    Some(PfxPublicKeyId::RsaModExp(
+        strip_leading_zero_bytes(rsa_priv_kids[1].val).to_vec(),
+        strip_leading_zero_bytes(rsa_priv_kids[2].val).to_vec(),
+    ))
+}
+
+/// Extract O(1) lookup keys (`SpkiInner` and optional `RsaModExp`) from an X.509 certificate DER.
+fn extract_cert_public_key_ids(cert_der: &[u8]) -> Option<(PfxPublicKeyId, Option<PfxPublicKeyId>)> {
+    let parts = parse_cert_der_parts(cert_der)?;
+    let spki_id = PfxPublicKeyId::SpkiInner(parts.spki_inner.to_vec());
+    let rsa_id = (|| {
+        let spki_kids = der_item_children(parts.spki_inner)?;
+        if spki_kids.len() < 2 || spki_kids[0].tag != 0x30 || spki_kids[1].tag != 0x03 {
+            return None;
+        }
+        let (pub_alg_oid, _) = parse_alg_id(spki_kids[0])?;
+        if pub_alg_oid != OID_RSA_ENCRYPTION
+            || spki_kids[1].val.len() < 2
+            || spki_kids[1].val[0] != 0
+        {
+            return None;
+        }
+        let (rsa_pub_seq, _) = parse_der_item(&spki_kids[1].val[1..])?;
+        if rsa_pub_seq.tag != 0x30 {
+            return None;
+        }
+        let rsa_pub_kids = der_item_children(rsa_pub_seq.val)?;
+        if rsa_pub_kids.len() < 2 || rsa_pub_kids[0].tag != 0x02 || rsa_pub_kids[1].tag != 0x02 {
+            return None;
+        }
+        Some(PfxPublicKeyId::RsaModExp(
+            strip_leading_zero_bytes(rsa_pub_kids[0].val).to_vec(),
+            strip_leading_zero_bytes(rsa_pub_kids[1].val).to_vec(),
+        ))
+    })();
+    Some((spki_id, rsa_id))
 }
 
 pub(super) unsafe fn pfx_import_cert_store_impl(
@@ -1837,8 +1850,14 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         return std::ptr::null_mut();
     };
 
+    if content_infos.len() > MAX_PFX_SAFE_BAGS {
+        crate::teb::set_last_error(err::ERROR_INVALID_DATA);
+        return std::ptr::null_mut();
+    }
+
     let mut certs: Vec<PfxBagCert> = Vec::new();
     let mut keys: Vec<PfxBagKey> = Vec::new();
+    let mut bag_count = 0usize;
 
     for ci in content_infos {
         if ci.tag != 0x30 {
@@ -1857,9 +1876,14 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
             let Some(sc_bytes) = extract_octet_string(oct) else {
                 continue;
             };
-            if let Err(code) =
-                parse_safe_contents(&sc_bytes, password_utf8, &pass_bmp, &mut certs, &mut keys)
-            {
+            if let Err(code) = parse_safe_contents(
+                &sc_bytes,
+                password_utf8,
+                &pass_bmp,
+                &mut certs,
+                &mut keys,
+                &mut bag_count,
+            ) {
                 crate::teb::set_last_error(code);
                 return std::ptr::null_mut();
             }
@@ -1902,9 +1926,14 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
                 crate::teb::set_last_error(ERROR_INVALID_PASSWORD);
                 return std::ptr::null_mut();
             };
-            if let Err(code) =
-                parse_safe_contents(&plain, password_utf8, &pass_bmp, &mut certs, &mut keys)
-            {
+            if let Err(code) = parse_safe_contents(
+                &plain,
+                password_utf8,
+                &pass_bmp,
+                &mut certs,
+                &mut keys,
+                &mut bag_count,
+            ) {
                 crate::teb::set_last_error(code);
                 return std::ptr::null_mut();
             }
@@ -1916,22 +1945,44 @@ pub(super) unsafe fn pfx_import_cert_store_impl(
         return std::ptr::null_mut();
     }
 
+    // Precompute O(1) localKeyId index and lazily precompute O(K) public-key index once if any
+    // certificate needs fallback SPKI matching (bounding matching to O(C + K) instead of O(C * K)).
+    let mut keys_by_local_id: std::collections::HashMap<&[u8], usize> =
+        std::collections::HashMap::with_capacity(keys.len());
+    for (idx, k) in keys.iter().enumerate() {
+        if let Some(ref id) = k.local_key_id {
+            keys_by_local_id.entry(id.as_slice()).or_insert(idx);
+        }
+    }
+    let mut keys_by_pub_id: Option<std::collections::HashMap<PfxPublicKeyId, usize>> = None;
+
     for cert in &certs {
-        // Match private key by localKeyId first, falling back to cryptographic SPKI matching
-        // when bag attributes (RFC 7292 §4.2) are omitted — never attach blindly by cert index.
+        // Match private key by localKeyId first, falling back to precomputed cryptographic SPKI
+        // matching when bag attributes (RFC 7292 §4.2) are omitted — never attach blindly by index.
         let matched_key = cert
             .local_key_id
             .as_ref()
-            .and_then(|id| {
-                keys.iter()
-                    .find(|k| k.local_key_id.as_ref() == Some(id))
-                    .map(|k| k.pkcs8_der.clone())
-            })
+            .and_then(|id| keys_by_local_id.get(id.as_slice()).copied())
             .or_else(|| {
-                keys.iter()
-                    .find(|k| pkcs8_matches_cert_spki(&k.pkcs8_der, &cert.der))
-                    .map(|k| k.pkcs8_der.clone())
-            });
+                if keys.is_empty() {
+                    return None;
+                }
+                let pub_map = keys_by_pub_id.get_or_insert_with(|| {
+                    let mut m = std::collections::HashMap::with_capacity(keys.len());
+                    for (idx, k) in keys.iter().enumerate() {
+                        if let Some(pub_id) = extract_pkcs8_public_key_id(&k.pkcs8_der) {
+                            m.entry(pub_id).or_insert(idx);
+                        }
+                    }
+                    m
+                });
+                let (spki_id, rsa_id) = extract_cert_public_key_ids(&cert.der)?;
+                pub_map
+                    .get(&spki_id)
+                    .copied()
+                    .or_else(|| rsa_id.and_then(|rid| pub_map.get(&rid).copied()))
+            })
+            .map(|idx| keys[idx].pkcs8_der.clone());
 
         let mut props: Vec<(u32, Vec<u8>)> = Vec::new();
         if let Some(ref name) = cert.friendly_name {

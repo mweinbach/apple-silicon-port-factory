@@ -5448,5 +5448,110 @@ fn pfx_rejects_unbounded_kdf_iteration_counts() {
         let (h_oct, le_oct) = import(&deep_oct_pfx);
         assert!(h_oct.is_null(), "deeply nested constructed OCTET STRING must be rejected");
         assert_eq!(le_oct, err::ERROR_INVALID_DATA);
+
+        // 5. Flat MAC-less PFX bag-count cap and O(C + K) precomputed SPKI matching:
+        //    (a) Exceeding MAX_PFX_SAFE_BAGS fails immediately with ERROR_INVALID_DATA.
+        //    (b) Many attribute-free cert bags + many non-matching plaintext key bags within the
+        //        cap completes linearly without quadratic C*K key loads or mismatched key attachment.
+        let oid_key_bag = der_tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x0A, 0x01, 0x01],
+        );
+        let oid_cert_bag = der_tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x0A, 0x01, 0x03],
+        );
+        let oid_x509_cert = der_tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x16, 0x01],
+        );
+        let mk_cert_bag = |cert_der: &[u8]| -> Vec<u8> {
+            let mut cb = Vec::new();
+            cb.extend_from_slice(&oid_x509_cert);
+            cb.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x04, cert_der)));
+            let mut bag = Vec::new();
+            bag.extend_from_slice(&oid_cert_bag);
+            bag.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x30, &cb)));
+            der_tlv(0x30, &bag)
+        };
+        let mk_key_bag = |pkcs8_der: &[u8]| -> Vec<u8> {
+            let mut bag = Vec::new();
+            bag.extend_from_slice(&oid_key_bag);
+            bag.extend_from_slice(&der_tlv(0xA0, pkcs8_der));
+            der_tlv(0x30, &bag)
+        };
+        let der_tlv_long = |tag: u8, body: &[u8]| -> Vec<u8> {
+            let mut out = vec![tag];
+            if body.len() < 0x80 {
+                out.push(body.len() as u8);
+            } else if body.len() < 0x100 {
+                out.push(0x81);
+                out.push(body.len() as u8);
+            } else if body.len() < 0x1_0000 {
+                out.push(0x82);
+                out.push((body.len() >> 8) as u8);
+                out.push((body.len() & 0xFF) as u8);
+            } else {
+                out.push(0x83);
+                out.push((body.len() >> 16) as u8);
+                out.push(((body.len() >> 8) & 0xFF) as u8);
+                out.push((body.len() & 0xFF) as u8);
+            }
+            out.extend_from_slice(body);
+            out
+        };
+        let build_flat_pfx = |bags_concat: &[u8]| -> Vec<u8> {
+            let sc = der_tlv_long(0x30, bags_concat);
+            let mut ci_data = Vec::new();
+            ci_data.extend_from_slice(&oid_data);
+            ci_data.extend_from_slice(&der_tlv_long(0xA0, &der_tlv_long(0x04, &sc)));
+            let auth_safe = der_tlv_long(0x30, &der_tlv_long(0x30, &ci_data));
+            let mut as_ci = Vec::new();
+            as_ci.extend_from_slice(&oid_data);
+            as_ci.extend_from_slice(&der_tlv_long(0xA0, &der_tlv_long(0x04, &auth_safe)));
+            let mut body = Vec::new();
+            body.extend_from_slice(&der_u32(3));
+            body.extend_from_slice(&der_tlv_long(0x30, &as_ci));
+            der_tlv_long(0x30, &body)
+        };
+
+        // (a) Too many bags (> MAX_PFX_SAFE_BAGS) rejected with ERROR_INVALID_DATA.
+        let one_cert_bag = mk_cert_bag(crate::misc::secur32::tests::TEST_CA_DER);
+        let mut too_many_bags = Vec::new();
+        for _ in 0..=super::pkcs::MAX_PFX_SAFE_BAGS {
+            too_many_bags.extend_from_slice(&one_cert_bag);
+        }
+        let over_cap_pfx = build_flat_pfx(&too_many_bags);
+        let (h_over, le_over) = import(&over_cap_pfx);
+        assert!(h_over.is_null(), "PFX exceeding MAX_PFX_SAFE_BAGS must be rejected");
+        assert_eq!(le_over, err::ERROR_INVALID_DATA);
+
+        // (b) 150 certs without localKeyId + 150 non-matching plaintext keys (C=150, K=150)
+        //     must complete in linear O(C + K) time and attach 0 mismatched keys.
+        let one_nonmatching_key_bag = mk_key_bag(crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER);
+        let mut many_bags = Vec::new();
+        for _ in 0..150 {
+            many_bags.extend_from_slice(&one_cert_bag);
+        }
+        for _ in 0..150 {
+            many_bags.extend_from_slice(&one_nonmatching_key_bag);
+        }
+        let many_pfx = build_flat_pfx(&many_bags);
+        let t0 = std::time::Instant::now();
+        let (h_many, _) = import(&many_pfx);
+        let elapsed = t0.elapsed();
+        assert!(!h_many.is_null(), "valid bounded flat PFX must import cleanly");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "O(C + K) PFX matching took too long: {elapsed:?}"
+        );
+        let first_c = CertEnumCertificatesInStore(h_many, std::ptr::null_mut());
+        assert!(!first_c.is_null());
+        assert!(
+            lookup_cert_private_key_and_chain(first_c).is_none(),
+            "non-matching key must never attach to TEST_CA_DER"
+        );
+        CertFreeCertificateContext(first_c);
+        CertCloseStore(h_many, 0);
     }
 }

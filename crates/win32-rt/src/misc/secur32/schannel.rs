@@ -393,8 +393,10 @@ struct SchannelCred {
     principal: String,
     cred_use: u32,
     flags: u32,
-    enable_tls12: bool,
-    enable_tls13: bool,
+    client_enable_tls12: bool,
+    client_enable_tls13: bool,
+    server_enable_tls12: bool,
+    server_enable_tls13: bool,
     has_root_store: bool,
     extra_roots_der: Vec<Vec<u8>>,
     server_cert_chain: Vec<Vec<u8>>,
@@ -484,8 +486,8 @@ fn build_schannel_tls_config(
     // default roots, both TLS 1.2 + 1.3, standard SNI, reconnects enabled, and no client cert.
     let disable_reconnects = (cred.flags & SCH_CRED_DISABLE_RECONNECTS) != 0;
     if cred.extra_roots_der.is_empty()
-        && cred.enable_tls12
-        && cred.enable_tls13
+        && cred.client_enable_tls12
+        && cred.client_enable_tls13
         && enable_sni
         && !has_client_cert
         && !disable_reconnects
@@ -507,10 +509,10 @@ fn build_schannel_tls_config(
     }
 
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
-    if cred.enable_tls13 {
+    if cred.client_enable_tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    if cred.enable_tls12 {
+    if cred.client_enable_tls12 {
         versions.push(&rustls::version::TLS12);
     }
     if versions.is_empty() {
@@ -859,10 +861,10 @@ fn build_schannel_server_config(
         return Err(SEC_E_NO_CREDENTIALS);
     }
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::with_capacity(2);
-    if cred.enable_tls13 {
+    if cred.server_enable_tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    if cred.enable_tls12 {
+    if cred.server_enable_tls12 {
         versions.push(&rustls::version::TLS12);
     }
     if versions.is_empty() {
@@ -1097,8 +1099,10 @@ pub(super) unsafe fn acquire_credentials_impl(
     }
 
     let mut flags = 0u32;
-    let mut enable_tls12 = true;
-    let mut enable_tls13 = true;
+    let mut client_enable_tls12 = true;
+    let mut client_enable_tls13 = true;
+    let mut server_enable_tls12 = true;
+    let mut server_enable_tls13 = true;
     let mut has_root_store = false;
     let mut extra_roots_der = Vec::new();
     let mut server_cert_chain = Vec::new();
@@ -1156,11 +1160,17 @@ pub(super) unsafe fn acquire_credentials_impl(
                     extra_roots_der = crypt32::store_certs_der(h_root_store);
                 }
                 if enabled != 0 {
-                    let want_12 = (enabled & (SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_2_SERVER)) != 0;
-                    let want_13 = (enabled & (SP_PROT_TLS1_3_CLIENT | SP_PROT_TLS1_3_SERVER)) != 0;
-                    if want_12 || want_13 {
-                        enable_tls12 = want_12;
-                        enable_tls13 = want_13;
+                    let want_c12 = (enabled & SP_PROT_TLS1_2_CLIENT) != 0;
+                    let want_c13 = (enabled & SP_PROT_TLS1_3_CLIENT) != 0;
+                    let want_s12 = (enabled & SP_PROT_TLS1_2_SERVER) != 0;
+                    let want_s13 = (enabled & SP_PROT_TLS1_3_SERVER) != 0;
+                    if want_c12 || want_c13 {
+                        client_enable_tls12 = want_c12;
+                        client_enable_tls13 = want_c13;
+                    }
+                    if want_s12 || want_s13 {
+                        server_enable_tls12 = want_s12;
+                        server_enable_tls13 = want_s13;
                     }
                 }
             }
@@ -1181,19 +1191,13 @@ pub(super) unsafe fn acquire_credentials_impl(
                 if c_params > 0 && !p_params.is_null() {
                     // TLS_PARAMETERS.grbitDisabledProtocols @ +0x10
                     let disabled = std::ptr::read_unaligned(p_params.add(0x10) as *const u32);
-                    let mask12 = if want_inbound && !want_outbound {
-                        SP_PROT_TLS1_2_SERVER
-                    } else {
-                        SP_PROT_TLS1_2_CLIENT
-                    };
-                    let mask13 = if want_inbound && !want_outbound {
-                        SP_PROT_TLS1_3_SERVER
-                    } else {
-                        SP_PROT_TLS1_3_CLIENT
-                    };
-                    enable_tls12 = (disabled & mask12) == 0;
-                    enable_tls13 = (disabled & mask13) == 0;
-                    if !enable_tls12 && !enable_tls13 {
+                    client_enable_tls12 = (disabled & SP_PROT_TLS1_2_CLIENT) == 0;
+                    client_enable_tls13 = (disabled & SP_PROT_TLS1_3_CLIENT) == 0;
+                    server_enable_tls12 = (disabled & SP_PROT_TLS1_2_SERVER) == 0;
+                    server_enable_tls13 = (disabled & SP_PROT_TLS1_3_SERVER) == 0;
+                    if (want_outbound && !client_enable_tls12 && !client_enable_tls13)
+                        || (want_inbound && !server_enable_tls12 && !server_enable_tls13)
+                    {
                         return SEC_E_ALGORITHM_MISMATCH;
                     }
                 }
@@ -1213,8 +1217,10 @@ pub(super) unsafe fn acquire_credentials_impl(
         principal,
         cred_use: f_credential_use,
         flags,
-        enable_tls12,
-        enable_tls13,
+        client_enable_tls12,
+        client_enable_tls13,
+        server_enable_tls12,
+        server_enable_tls13,
         has_root_store,
         extra_roots_der,
         server_cert_chain,
@@ -1231,7 +1237,7 @@ pub(super) unsafe fn acquire_credentials_impl(
         std::ptr::write_unaligned(pts_expiry, i64::MAX);
     }
     log::debug!(
-        "AcquireCredentialsHandle(pkg={package_name:?}, tls12={enable_tls12}, tls13={enable_tls13}, flags={flags:#x}) -> id={id}"
+        "AcquireCredentialsHandle(pkg={package_name:?}, cli=({client_enable_tls12},{client_enable_tls13}), srv=({server_enable_tls12},{server_enable_tls13}), flags={flags:#x}) -> id={id}"
     );
     SEC_E_OK
 }
@@ -3203,18 +3209,18 @@ pub(super) unsafe fn query_credentials_attributes_impl(
         SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS => {
             let mut prot = 0u32;
             if (cred.cred_use & SECPKG_CRED_OUTBOUND) != 0 {
-                if cred.enable_tls12 {
+                if cred.client_enable_tls12 {
                     prot |= SP_PROT_TLS1_2_CLIENT;
                 }
-                if cred.enable_tls13 {
+                if cred.client_enable_tls13 {
                     prot |= SP_PROT_TLS1_3_CLIENT;
                 }
             }
             if (cred.cred_use & SECPKG_CRED_INBOUND) != 0 {
-                if cred.enable_tls12 {
+                if cred.server_enable_tls12 {
                     prot |= SP_PROT_TLS1_2_SERVER;
                 }
-                if cred.enable_tls13 {
+                if cred.server_enable_tls13 {
                     prot |= SP_PROT_TLS1_3_SERVER;
                 }
             }
