@@ -517,6 +517,15 @@ unsafe fn interp_burst(
                     next_left: 0,
                 };
             }
+            fast::Fx::Yield => {
+                return BurstExit {
+                    fx: fast::Fx::Done,
+                    steps: n,
+                    last_ip: (*op).ip,
+                    next_off: 0,
+                    next_left: 0,
+                };
+            }
             fast::Fx::FuseJcc => unreachable!(),
         }
     }

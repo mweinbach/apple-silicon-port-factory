@@ -243,6 +243,7 @@ impl Asm {
     pub(super) fn v_scvtf_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E21_D800 | vn << 5 | vd);
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn v_frintn_4s(&mut self, vd: u32, vn: u32) {
         self.emit(0x4E21_8800 | vn << 5 | vd);
     }
@@ -1105,7 +1106,7 @@ impl Tr<'_> {
                 let src = if sub == VF_CVTTPS2DQ {
                     1
                 } else {
-                    self.a.v_frintn_4s(5, 1);
+                    self.a.v_frint(false, 4, 5, 1);
                     5
                 };
                 self.a.v_fcvtzs_4s(0, src);

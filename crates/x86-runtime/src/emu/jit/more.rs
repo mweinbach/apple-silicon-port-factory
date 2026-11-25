@@ -2,7 +2,8 @@
 //! completing 100% native arm64/NEON coverage across all `FastOp` kinds.
 
 use super::emit::{enc_logic_imm, sf, Asm};
-use super::translate::{stack_tso, Chk, Cond, FlagState, Src, Tr};
+use super::lazy::PF_NONE;
+use super::translate::{stack_tso, Chk, Cond, FlagState, Src, SysCold, SysColdKind, Tr};
 use super::*;
 use crate::emu::fast::{self, FastOp};
 use crate::emu::mem;
@@ -144,6 +145,300 @@ impl Tr<'_> {
             self.a.bl_to(if ordered { self.rdtscp_slow } else { self.rdtsc_slow });
             self.a.b_to(back);
         }
+    }
+
+    /// Inline `ldmxcsr`/`vldmxcsr`: validate reserved bits (`m >> 16 != 0` -> `#GP(0)`), store
+    /// `Cpu::jx.mxcsr`, and update hardware `FPCR` (`RMode`, `FZ`, plus `FEAT_AFP` `AH`/`FIZ`
+    /// when present) without clobbering `NZCV` or exiting to the interpreter.
+    fn emit_ldmxcsr(&mut self, k: usize, op: &FastOp) {
+        self.load_op(k, T0, op, 32);
+        // Reserved bits [31:16] must be zero; check flag-free via `lsr` + `cbnz`.
+        self.a.lsr_i(false, T1, T0, 16);
+        let gp_fix = self.a.cbnz(false, T1);
+        self.sys_colds.push(SysCold {
+            fix: gp_fix,
+            k,
+            kind: SysColdKind::FaultGp,
+            fs: self.fs,
+            lb: self.lb,
+            xd: self.xd,
+            pf: self.pf,
+        });
+        self.a.str(32, T0, XCPU, OFF_MXCSR);
+        // RMode: MXCSR RC bits 14:13 map 00->00 (RN), 01->10 (RM), 10->01 (RP), 11->11 (RZ).
+        self.a.ubfx(T1, T0, 13, 1);
+        self.a.ubfx(T2, T0, 14, 1);
+        self.a.lsl_i(true, T1, T1, 23);
+        self.a.logic_rr(true, 1, T1, T1, T2, 0, 22);
+        self.a.ubfx(T2, T0, 15, 1); // ftz
+        self.a.ubfx(T3, T0, 6, 1); // daz
+        self.a.logic_rr(true, 2, T4, T2, T3, 0, 0); // mixed = ftz ^ daz
+        if crate::emu::features::host().has(crate::emu::features::HostFeatures::AFP) {
+            // Exact match for `cpu::mxcsr_to_fpcr`: FZ = ftz; if mixed, AH = ftz and FIZ = daz.
+            self.a.logic_rr(true, 1, T1, T1, T2, 0, 24);
+            self.a.addsub_rr(true, true, false, T4, ZR, T4, 0); // 0 if equal, !0 if mixed
+            self.a.logic_rr(true, 1, T5, T3, T2, 0, 1); // (ftz << 1) | daz
+            self.a.logic_rr(true, 0, T5, T5, T4, 0, 0);
+            self.a.logic_rr(true, 1, T1, T1, T5, 0, 0);
+        } else {
+            // Without FEAT_AFP, ARM64 FPCR only has combined FZ (both input and output flush).
+            // Equal FTZ==DAZ stays 100% native; mixed FTZ!=DAZ exits cleanly to soft_flush.
+            let soft_fix = self.a.cbnz(true, T4);
+            self.sys_colds.push(SysCold {
+                fix: soft_fix,
+                k,
+                kind: SysColdKind::SoftFlushExit,
+                fs: self.fs,
+                lb: self.lb,
+                xd: self.xd,
+                pf: self.pf,
+            });
+            self.a.logic_rr(true, 1, T1, T1, T2, 0, 24);
+        }
+        self.a.mrs_fpcr(T2);
+        self.a.logic_rr(true, 2, T2, T2, T1, 0, 0);
+        let skip = self.a.cbz(true, T2);
+        self.a.msr_fpcr(T1);
+        self.a.bind(skip);
+    }
+
+    /// Inline `fnstcw`/`fstcw`: read this thread's `X87State::cw` via `Cpu::jx.x87_cw`.
+    fn emit_fnstcw(&mut self, k: usize, op: &FastOp) {
+        let a = self.addr_into(op, XA);
+        self.a.ldr(64, T1, XCPU, OFF_X87_CW);
+        self.a.ldr(16, T0, T1, 0);
+        self.store(k, T0, a, 16, Self::chk_of(op));
+    }
+
+    /// Inline `fldcw`: load m16, apply architectural mask `(v & 0x1f3f) | 0x40`, store to `X87State::cw`.
+    fn emit_fldcw(&mut self, k: usize, op: &FastOp) {
+        self.load_op(k, T0, op, 16);
+        self.a.movz(false, T1, 0x1F3F, 0);
+        self.a.logic_rr(false, 0, T0, T0, T1, 0, 0);
+        self.a.logic_ri(false, 1, T0, T0, enc_logic_imm(0x40, false).unwrap());
+        self.a.ldr(64, T1, XCPU, OFF_X87_CW);
+        self.a.str(16, T0, T1, 0);
+    }
+
+    /// Native `cpuid` via `Cpu::jx.sys_helpers.cpuid`: queries the single shared `cpuid::query`
+    /// table on the executing thread with zero baked addresses and full FPCR/XMM preservation.
+    fn emit_cpuid(&mut self, k: usize) {
+        self.flush_flags(self.live[k]);
+        self.fs.host = 0;
+        if self.xpin {
+            self.a.bl_to(self.spill_xmm);
+        }
+        // Frame (96B, 16B-aligned): [0..72) x7..x15, [72..80) saved FPCR, [80..96) [u32; 4] out.
+        self.a.addsub_ri(true, true, false, 31, 31, 96, false);
+        self.a.stp_x(7, 8, 31, 0);
+        self.a.stp_x(9, 10, 31, 16);
+        self.a.stp_x(11, 12, 31, 32);
+        self.a.stp_x(13, 14, 31, 48);
+        self.a.str(64, 15, 31, 64);
+        self.a.mov_rr(false, 0, g(0)); // w0 = leaf (eax)
+        self.a.mov_rr(false, 1, g(1)); // w1 = subleaf (ecx)
+        self.a.addsub_ri(true, false, false, 2, 31, 80, false); // x2 = &mut [u32; 4]
+        self.a.ldr(64, XA, XCPU, OFF_SYS_HELPERS);
+        self.a.ldr(64, XA, XA, SYS_CPUID_OFF);
+        self.a.call_with_host_fpcr(72);
+        self.a.ldp_x(7, 8, 31, 0);
+        self.a.ldp_x(9, 10, 31, 16);
+        self.a.ldp_x(11, 12, 31, 32);
+        self.a.ldp_x(13, 14, 31, 48);
+        self.a.ldr(64, 15, 31, 64);
+        if self.xpin {
+            self.a.bl_to(self.reload_xmm);
+        }
+        // 32-bit loads zero-extend bits 63:32 of RAX/RBX/RCX/RDX.
+        self.a.ldr(32, g(0), 31, 80); // eax
+        self.a.ldr(32, g(3), 31, 84); // ebx
+        self.a.ldr(32, g(1), 31, 88); // ecx
+        self.a.ldr(32, g(2), 31, 92); // edx
+        self.a.addsub_ri(true, false, false, 31, 31, 96, false);
+        self.set_lb(0, 64);
+        self.set_lb(1, 64);
+        self.set_lb(2, 64);
+        self.set_lb(3, 64);
+    }
+
+    /// Inline `xgetbv`: `#GP(0)` if `ecx != 0`; otherwise `eax = XCR0 (7)`, `edx = 0`.
+    fn emit_xgetbv(&mut self, k: usize) {
+        let gp_fix = self.a.cbnz(false, g(1));
+        self.sys_colds.push(SysCold {
+            fix: gp_fix,
+            k,
+            kind: SysColdKind::FaultGp,
+            fs: self.fs,
+            lb: self.lb,
+            xd: self.xd,
+            pf: self.pf,
+        });
+        self.a.movz(false, g(0), crate::emu::cpuid::XCR0, 0);
+        self.a.movz(true, g(2), 0, 0);
+        self.set_lb(0, 64);
+        self.set_lb(2, 64);
+    }
+
+    /// Native `FXSAVE*`/`FXRSTOR*`/`XSAVE*`/`XRSTOR*` via `Cpu::jx.sys_helpers.xstate`.
+    fn emit_xstate(&mut self, k: usize, op: &FastOp) {
+        self.flush_flags(FALL);
+        self.fs.host = 0;
+        self.flush_lb();
+        let a = self.addr_into(op, XA);
+        self.a.mov_rr(true, T2, a); // x2 = guest area address
+        if self.xpin {
+            self.a.bl_to(self.spill_xmm);
+        }
+        for i in 0..8 {
+            self.a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
+        }
+        if self.ras_miss != 0 {
+            self.a.str(64, XRAS, XCPU, OFF_RAS);
+        }
+        self.a.mov_imm(true, T3, op.ip);
+        self.a.str(64, T3, XCPU, OFF_RIP);
+        self.a.addsub_ri(true, true, false, 31, 31, 16, false);
+        self.a.stp_x(XBUD, XCPU, 31, 0);
+        self.a.mov_rr(true, 0, XCPU); // x0 = cpu
+        self.a.movz(false, 1, op.w as u32, 0); // w1 = xstate flags
+        // x2 = addr, x3 = op.ip
+        self.a.ldr(64, XS, XCPU, OFF_HOST_FPCR);
+        self.a.msr_fpcr(XS);
+        self.a.ldr(64, XA, XCPU, OFF_SYS_HELPERS);
+        self.a.ldr(64, XA, XA, SYS_XSTATE_OFF);
+        self.a.blr(XA);
+        self.a.ldp_x(XBUD, XCPU, 31, 0);
+        self.a.addsub_ri(true, false, false, 31, 31, 16, false);
+        let abn = self.a.cbnz(false, T0);
+        self.sys_colds.push(SysCold {
+            fix: abn,
+            k,
+            kind: SysColdKind::XstateAbnormal,
+            fs: self.fs,
+            lb: self.lb,
+            xd: 0,
+            pf: PF_NONE,
+        });
+        // Normal completion: reload caller-saved guest GPRs r10..r15 (`HG[10..16]`), XRAS, XMMs.
+        for i in 5..8 {
+            self.a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
+        }
+        if self.ras_miss != 0 {
+            self.a.ldr(64, XRAS, XCPU, OFF_RAS);
+        }
+        if self.xpin {
+            self.a.bl_to(self.reload_xmm);
+        }
+        if op.w & crate::emu::xstate::XS_FLAG_RESTORE != 0 {
+            self.a.ldr(16, XS, XCPU, OFF_YMM_DIRTY);
+            self.a.addsub_ri(false, true, true, ZR, XS, 0, false);
+            self.a.cset(XS, NE);
+            self.a.bfxil0(XBUD, XS, 1);
+            self.ymm_clean = 0;
+        }
+    }
+
+    /// Out-of-line cold exits for `#GP(0)` faults, non-AFP mixed MXCSR, and abnormal XSTATE exits.
+    pub(super) fn emit_sys_colds(&mut self) {
+        let n = self.ops.len();
+        let mut colds = core::mem::take(&mut self.sys_colds);
+        for c in &colds {
+            self.a.bind(c.fix);
+            let saved = (self.fs, self.lb, self.pf);
+            self.fs = c.fs;
+            self.lb = c.lb;
+            self.pf = c.pf;
+            match c.kind {
+                SysColdKind::FaultGp => {
+                    self.flush_flags(FALL);
+                    self.flush_lb();
+                    self.xstore(c.xd);
+                    if self.xpin {
+                        self.a.bl_to(self.spill_xmm);
+                    }
+                    for i in 0..8 {
+                        self.a.stp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
+                    }
+                    if self.ras_miss != 0 {
+                        self.a.str(64, XRAS, XCPU, OFF_RAS);
+                    }
+                    if self.bud_dec {
+                        self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - c.k)) as u32, false);
+                    }
+                    self.a.addsub_ri(true, true, false, 31, 31, 16, false);
+                    self.a.stp_x(XBUD, XCPU, 31, 0);
+                    self.a.mov_imm(true, T1, self.ops[c.k].ip);
+                    self.a.str(64, T1, XCPU, OFF_RIP);
+                    self.a.mov_rr(true, 0, XCPU);
+                    self.a.ldr(64, XS, XCPU, OFF_HOST_FPCR);
+                    self.a.msr_fpcr(XS);
+                    self.a.ldr(64, XA, XCPU, OFF_SYS_HELPERS);
+                    self.a.ldr(64, XA, XA, SYS_FAULT_GP_OFF);
+                    self.a.blr(XA);
+                    self.a.ldp_x(XBUD, XCPU, 31, 0);
+                    self.a.addsub_ri(true, false, false, 31, 31, 16, false);
+                    for i in 0..8 {
+                        self.a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
+                    }
+                    if self.xpin {
+                        self.a.bl_to(self.reload_xmm);
+                    }
+                    if self.ras_miss != 0 {
+                        self.a.ldr(64, XRAS, XCPU, OFF_RAS);
+                    }
+                    self.a.movz(false, 0, EXIT_RIP as u32, 0);
+                    self.a.b_to(self.exit);
+                }
+                SysColdKind::SoftFlushExit => {
+                    self.a.mrs_fpcr(T2);
+                    self.a.logic_rr(true, 2, T2, T2, T1, 0, 0);
+                    let skip = self.a.cbz(true, T2);
+                    self.a.msr_fpcr(T1);
+                    self.a.bind(skip);
+                    self.flush_flags(self.live[c.k + 1]);
+                    self.flush_lb();
+                    self.xstore(c.xd);
+                    if self.bud_dec && n > c.k + 1 {
+                        self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - (c.k + 1))) as u32, false);
+                    }
+                    let next_ip = self.ops[c.k].ip.wrapping_add(self.ops[c.k].len as u64);
+                    self.a.mov_imm(true, T0, next_ip);
+                    self.a.str(64, T0, XCPU, OFF_RIP);
+                    self.a.movz(false, 0, EXIT_RIP as u32, 0);
+                    self.a.b_to(self.exit);
+                }
+                SysColdKind::XstateAbnormal => {
+                    self.a.addsub_ri(false, true, false, T1, T0, 1, false);
+                    let is_fault = self.a.cbnz(false, T1);
+                    let next_ip = self.ops[c.k].ip.wrapping_add(self.ops[c.k].len as u64);
+                    self.a.mov_imm(true, T1, next_ip);
+                    self.a.str(64, T1, XCPU, OFF_RIP);
+                    if self.bud_dec && n > c.k + 1 {
+                        self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - (c.k + 1))) as u32, false);
+                    }
+                    let done = self.a.b();
+                    self.a.bind(is_fault);
+                    if self.bud_dec {
+                        self.a.addsub_ri(true, false, false, XBUD, XBUD, (2 * (n - c.k)) as u32, false);
+                    }
+                    self.a.bind(done);
+                    for i in 0..8 {
+                        self.a.ldp_x(HG[2 * i], HG[2 * i + 1], XCPU, (OFF_GPR + 16 * i as u32) as i32);
+                    }
+                    if self.xpin {
+                        self.a.bl_to(self.reload_xmm);
+                    }
+                    if self.ras_miss != 0 {
+                        self.a.ldr(64, XRAS, XCPU, OFF_RAS);
+                    }
+                    self.a.movz(false, 0, EXIT_RIP as u32, 0);
+                    self.a.b_to(self.exit);
+                }
+            }
+            (self.fs, self.lb, self.pf) = saved;
+        }
+        colds.clear();
+        self.sys_colds = colds;
     }
 
     /// Load an 8-bit source operand for `K_HI8` into `dst` (zero-extended to 64 bits).
@@ -507,6 +802,7 @@ impl Tr<'_> {
                         self.a.ldr(32, T0, XCPU, OFF_MXCSR);
                         self.store(k, T0, a, 32, Self::chk_of(op));
                     }
+                    5 => self.emit_ldmxcsr(k, op),
                     6 => {
                         // Xlatb
                         self.a.ubfm(true, T0, g(0), 0, 7);
@@ -514,7 +810,9 @@ impl Tr<'_> {
                         self.load(k, T1, XA, 8, Chk::Full);
                         self.wr_gpr(0, 8, T1);
                     }
+                    7 => self.emit_fnstcw(k, op),
                     8 => self.emit_timestamp(w != 0),
+                    9 => self.emit_cpuid(k),
                     10 => {
                         // 16-bit push
                         match w {
@@ -569,6 +867,9 @@ impl Tr<'_> {
                         self.a.str(8, ZR, XCPU, OFF_PFV);
                         self.fs = FlagState { src: Src::None, host: 0, mem: FALL };
                     }
+                    14 => self.emit_fldcw(k, op),
+                    15 => self.emit_xgetbv(k),
+                    16 => self.emit_xstate(k, op),
                     _ => {}
                 }
             }

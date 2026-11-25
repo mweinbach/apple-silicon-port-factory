@@ -13,7 +13,6 @@ use crate::emu::{mem, BLK_MAX_INSNS};
 pub(in crate::emu) fn supported(op: &FastOp) -> bool {
     use fast::*;
     match op.kind {
-        K_SYS_MISC if op.x & 63 == 9 => return false, // CPUID depends on the executing guest thread.
         K_VAES_RR | K_VAES_RM => return host().has(HostFeatures::AES),
         K_VSHA_RR | K_VSHA_RM => {
             return host().has(if op.x & 63 < 4 { HostFeatures::SHA1 } else { HostFeatures::SHA256 })
@@ -176,6 +175,26 @@ pub(super) fn stack_tso() -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SysColdKind {
+    /// `#GP(0)` at `ops[k].ip` (`xgetbv` with `ecx != 0`, `ldmxcsr` with reserved bits set).
+    FaultGp,
+    /// Non-AFP `ldmxcsr` installed mixed FTZ/DAZ (`Cpu::jx.mxcsr` written; `T1` holds target FPCR).
+    SoftFlushExit,
+    /// `jit_helper_xstate` returned non-zero (`1` = soft_flush exit at next_ip, `2` = fault).
+    XstateAbnormal,
+}
+
+pub(super) struct SysCold {
+    pub(super) fix: usize,
+    pub(super) k: usize,
+    pub(super) kind: SysColdKind,
+    pub(super) fs: FlagState,
+    pub(super) lb: [u8; 16],
+    pub(super) xd: u16,
+    pub(super) pf: u8,
+}
+
 pub(super) struct SideExit {
     pub(super) fix: usize,
     pub(super) k: usize,
@@ -257,6 +276,8 @@ pub(super) struct Tr<'a> {
     pub(super) ymm_colds: Vec<(usize, usize, u16)>,
     /// (branch to fallback, resume after counter sample, ordered read).
     pub(super) tsc_colds: Vec<(usize, usize, bool)>,
+    /// Deferred cold paths for system/state ops (`#GP(0)`, non-AFP `ldmxcsr`, XSTATE abnormal exit).
+    pub(super) sys_colds: Vec<SysCold>,
     /// Bitmasks of guest `xmm0..15` whose upper bits `[127:32]` / `[127:64]` are known 0.
     pub(super) xmm_hi32_zero: u16,
     pub(super) xmm_hi64_zero: u16,
@@ -545,6 +566,7 @@ impl Tr<'_> {
         self.ymm_colds = ymm_colds;
         self.emit_timestamp_fallbacks();
         self.emit_cold_nan();
+        self.emit_sys_colds();
         let mut ses = core::mem::take(&mut self.side_exits);
         for se in &ses {
             if se.fix == usize::MAX {
@@ -597,6 +619,7 @@ impl Tr<'_> {
         self.link_conds.clear();
         self.ymm_colds.clear();
         self.tsc_colds.clear();
+        self.sys_colds.clear();
         self.cold.clear();
         self.lits.clear();
         self.lits128.clear();
@@ -611,6 +634,7 @@ impl Tr<'_> {
         sc.link_conds = self.link_conds;
         sc.ymm_colds = self.ymm_colds;
         sc.tsc_colds = self.tsc_colds;
+        sc.sys_colds = self.sys_colds;
         sc.cold = self.cold;
         sc.lits = self.lits;
         sc.lits128 = self.lits128;
@@ -694,6 +718,7 @@ impl Tr<'_> {
             let mode = op.w & 3;
             let reads_ymm = match op.kind {
                 K_YMM_LANE | K_INSN | K_VMASKMOV => true,
+                K_SYS_MISC if (op.x & 0x3F) == 16 => true,
                 K_VST => (op.w >> 4) >= 5,
                 K_MOVMSK => (op.x & 1) != 0,
                 K_VCVT_PD => mode == VM_V256 || (op.w & 4) != 0,
@@ -740,6 +765,14 @@ impl Tr<'_> {
         self.xmm_hi64_live[body] = live64;
         for k in (0..body).rev() {
             let op = self.ops[k];
+            // Ops that can raise `#GP`/`#PF` or exit to soft-flush expose full XMM registers.
+            if op.kind == K_SYS_MISC && matches!(op.x & 0x3F, 4 | 5 | 7 | 14 | 15 | 16) {
+                live32 = 0xFFFF;
+                live64 = 0xFFFF;
+                self.xmm_hi32_live[k] = live32;
+                self.xmm_hi64_live[k] = live64;
+                continue;
+            }
             // When software range checks are active, any memory op can side-exit and expose
             // full XMM registers to the interpreter.
             if !hw && (op.base != RNONE || op.index != RNONE || Self::chk_of(&op) == Chk::Full) {

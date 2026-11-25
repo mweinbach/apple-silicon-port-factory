@@ -254,3 +254,131 @@ fn lse2_regions_recycle_and_jit_cache_drop_reclaims_slots() {
         }
     }
 }
+
+#[test]
+fn sys_state_arm64_emitter_encodes_all_ops_with_zero_relocs() {
+    use super::cache::{new_tr, Prep, StubAddrs, TrScratch};
+    use super::emit::Asm;
+    use super::lazy::Edges;
+    use crate::emu::fast::{lower, FastOp};
+    use crate::emu::features::{without_features, HostFeatures};
+    use crate::emu::BLK_MAX_INSNS;
+    use iced_x86::code_asm::*;
+    use iced_x86::{Decoder, DecoderOptions};
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.cpuid().unwrap();
+    a.xgetbv().unwrap();
+    a.fldcw(word_ptr(rcx)).unwrap();
+    a.fnstcw(word_ptr(rcx)).unwrap();
+    a.fstcw(word_ptr(rcx)).unwrap();
+    a.ldmxcsr(dword_ptr(rcx)).unwrap();
+    a.vldmxcsr(dword_ptr(rcx)).unwrap();
+    a.stmxcsr(dword_ptr(rcx)).unwrap();
+    a.vstmxcsr(dword_ptr(rcx)).unwrap();
+    a.fxsave(ptr(rcx)).unwrap();
+    a.fxsave64(ptr(rcx)).unwrap();
+    a.fxrstor(ptr(rcx)).unwrap();
+    a.fxrstor64(ptr(rcx)).unwrap();
+    a.xsave(ptr(rcx)).unwrap();
+    a.xsave64(ptr(rcx)).unwrap();
+    a.xsaveopt(ptr(rcx)).unwrap();
+    a.xsaveopt64(ptr(rcx)).unwrap();
+    a.xsavec(ptr(rcx)).unwrap();
+    a.xsavec64(ptr(rcx)).unwrap();
+    a.xrstor(ptr(rcx)).unwrap();
+    a.xrstor64(ptr(rcx)).unwrap();
+    let bytes = a.assemble(0x1_0000_0000).unwrap();
+
+    let stubs = StubAddrs {
+        exit: 0x1000,
+        lookup_rip: 0x1100,
+        lookup_jmp: 0x1200,
+        lookup_call: 0x1300,
+        host_xfer: 0x1400,
+        ras_miss: 0x1500,
+        spill_xmm: 0x1600,
+        reload_xmm: 0x1700,
+        clear_ymm_hi: 0x1800,
+        rdtsc_slow: 0x1900,
+        rdtscp_slow: 0x1a00,
+    };
+
+    for disable_mask in [0u8, HostFeatures::AFP] {
+        without_features(disable_mask, || {
+            let mut scratch = TrScratch::new();
+            let mut dec = Decoder::with_ip(64, &bytes, 0x1_0000_0000, DecoderOptions::NONE);
+            let mut count = 0usize;
+            while dec.can_decode() {
+                let ins = dec.decode();
+                let op = lower(&ins);
+                assert!(supported(&op), "expected JIT/AOT support for `{ins}` (mask={disable_mask})");
+                let mut prep = Prep {
+                    ops: [FastOp::default(); BLK_MAX_INSNS],
+                    k: 1,
+                    host: false,
+                    wr: [0; BLK_MAX_INSNS],
+                    term: Term::Fall(ins.next_ip()),
+                    target_host: false,
+                    lazy: false,
+                    edge: Edges { live: [0; 2], kill: [0; 2] },
+                    live_out: 0,
+                };
+                prep.ops[0] = op;
+                let mut buf = vec![0u32; 512];
+                let asm = Asm::new(buf.as_mut_ptr(), 0x2000, buf.len());
+                let mut tr = new_tr(asm, &prep.ops[..1], &prep, &stubs, true, &mut scratch);
+                let main = tr.translate(prep.term, 0);
+                assert!(!tr.a.overflow, "buffer overflow translating `{ins}`");
+                assert!(main > 0 && tr.a.pos > 0, "empty translation for `{ins}`");
+                assert!(
+                    tr.relocs.is_empty(),
+                    "`{ins}` emitted runtime relocs ({:?}), breaking static Mach-O AOT",
+                    tr.relocs
+                );
+                let words = &buf[..tr.a.pos];
+                match ins.mnemonic() {
+                    iced_x86::Mnemonic::Cpuid => {
+                        let want_ldr = 0xF940_0000 | ((OFF_SYS_HELPERS / 8) << 10) | (XCPU << 5) | XA;
+                        assert!(words.contains(&want_ldr), "cpuid must load OFF_SYS_HELPERS");
+                        assert!(words.contains(&(0xD63F_0000 | (XA << 5))), "cpuid must emit blr x16");
+                    }
+                    iced_x86::Mnemonic::Xgetbv => {
+                        assert!(
+                            words.iter().any(|&w| (w & 0xFF00_001F) == (0x3500_0000 | g(1))),
+                            "xgetbv must check ecx != 0 with cbnz w20"
+                        );
+                        let want_xcr0 = 0x5280_0000 | (crate::emu::cpuid::XCR0 << 5) | g(0);
+                        assert!(words.contains(&want_xcr0), "xgetbv must load XCR0 into w19");
+                    }
+                    iced_x86::Mnemonic::Ldmxcsr | iced_x86::Mnemonic::Vldmxcsr => {
+                        let want_str = 0xB900_0000 | ((OFF_MXCSR / 4) << 10) | (XCPU << 5) | T0;
+                        assert!(words.contains(&want_str), "{ins} must store OFF_MXCSR");
+                        assert!(words.contains(&(0xD53B_4400 | T2)), "{ins} must read FPCR via mrs");
+                        assert!(words.contains(&(0xD51B_4400 | T1)), "{ins} must write FPCR via msr");
+                    }
+                    iced_x86::Mnemonic::Fldcw | iced_x86::Mnemonic::Fnstcw | iced_x86::Mnemonic::Fstcw => {
+                        let want_ldr = 0xF940_0000 | ((OFF_X87_CW / 8) << 10) | (XCPU << 5) | T1;
+                        assert!(words.contains(&want_ldr), "{ins} must load OFF_X87_CW");
+                    }
+                    iced_x86::Mnemonic::Stmxcsr | iced_x86::Mnemonic::Vstmxcsr => {
+                        let want_ldr = 0xB940_0000 | ((OFF_MXCSR / 4) << 10) | (XCPU << 5) | T0;
+                        assert!(words.contains(&want_ldr), "{ins} must load OFF_MXCSR");
+                    }
+                    iced_x86::Mnemonic::Wait => {
+                        // `fstcw` assembles as `fwait` (9B) + `fnstcw`; `fwait` is a NOP on x86-64.
+                    }
+                    _ => {
+                        let want_ldr = 0xF940_0000 | ((OFF_SYS_HELPERS / 8) << 10) | (XCPU << 5) | XA;
+                        assert!(words.contains(&want_ldr), "{ins} must load OFF_SYS_HELPERS");
+                        assert!(words.contains(&(0xD63F_0000 | (XA << 5))), "{ins} must emit blr x16");
+                    }
+                }
+                tr.return_scratch(&mut scratch);
+                count += 1;
+            }
+            // 21 assembled ops (`fstcw` emits `fwait` + `fnstcw` = 22 decoded instructions).
+            assert_eq!(count, 22);
+        });
+    }
+}

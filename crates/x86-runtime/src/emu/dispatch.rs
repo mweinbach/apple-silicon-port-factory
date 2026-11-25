@@ -1230,7 +1230,7 @@ pub(super) unsafe fn apply_fx(
     prof: Option<&'static crate::emu_prof::ThreadProf>,
 ) -> Option<(u64, u128)> {
     match fx {
-        fast::Fx::Done | fast::Fx::FuseJcc => None,
+        fast::Fx::Done | fast::Fx::FuseJcc | fast::Fx::Yield => None,
         fast::Fx::JccNear(target) | fast::Fx::Jmp(target) => {
             apply_xfer_tail(cpu, target, false, entry_ip, blocks_ptr, sp_ptr, prof)
         }
@@ -1247,7 +1247,7 @@ pub(super) unsafe fn apply_fx(
 /// ever used after their guest address matched.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
-unsafe fn jit_ras_publish(cpu: &Cpu) {
+pub(super) unsafe fn jit_ras_publish(cpu: &Cpu) {
     let cell = cpu.jx.ctx_ras_cell as *mut u64;
     if !cell.is_null() {
         *cell = cpu.jx.ras;

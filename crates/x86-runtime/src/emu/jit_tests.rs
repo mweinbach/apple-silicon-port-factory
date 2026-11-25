@@ -7115,3 +7115,148 @@ fn unaligned_lock_ops_all_subops_tier_and_flag_parity() {
         assert_eq!(rep.emitted_blocks, img.blocks.len());
     }
 }
+
+#[test]
+fn sys_state_ops_aot_image_and_shifted_base_reload() {
+    use crate::emu::static_macho::{emit_macho_object_from_aot_bytes, MachoPlatform};
+    use iced_x86::code_asm::*;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.push(rbx).unwrap();
+    a.mov(r8, rcx).unwrap();
+    // 1. CPUID leaf 0 & 0xd/0
+    a.xor(eax, eax).unwrap();
+    a.xor(ecx, ecx).unwrap();
+    a.cpuid().unwrap();
+    a.mov(dword_ptr(r8), eax).unwrap();
+    a.mov(dword_ptr(r8 + 4), ebx).unwrap();
+    a.mov(dword_ptr(r8 + 8), ecx).unwrap();
+    a.mov(dword_ptr(r8 + 12), edx).unwrap();
+    // 2. XGETBV(0)
+    a.xor(ecx, ecx).unwrap();
+    a.xgetbv().unwrap();
+    a.mov(dword_ptr(r8 + 16), eax).unwrap();
+    a.mov(dword_ptr(r8 + 20), edx).unwrap();
+    // 3. FLDCW / FNSTCW / FSTCW
+    a.fldcw(word_ptr(r8 + 24)).unwrap();
+    a.fnstcw(word_ptr(r8 + 28)).unwrap();
+    a.fstcw(word_ptr(r8 + 30)).unwrap();
+    // 4. LDMXCSR / VLDMXCSR / STMXCSR / VSTMXCSR + FP arithmetic & cvt under RD+FTZ+DAZ
+    a.ldmxcsr(dword_ptr(r8 + 32)).unwrap();
+    a.stmxcsr(dword_ptr(r8 + 36)).unwrap();
+    a.vmovdqu(ymm0, ymmword_ptr(r8 + 64)).unwrap();
+    a.vmovdqu(ymm15, ymmword_ptr(r8 + 96)).unwrap();
+    a.movss(xmm2, dword_ptr(r8 + 44)).unwrap(); // 1.0f
+    a.divss(xmm2, dword_ptr(r8 + 48)).unwrap(); // 1.0 / 3.0 under RD -> 0x3eaa_aaaa
+    a.movss(dword_ptr(r8 + 52), xmm2).unwrap();
+    // 5. XSAVE64 / XSAVEC64 / FXSAVE64 -> clobber -> XRSTOR64
+    a.mov(eax, 7).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.xsave64(ptr(r8 + 128)).unwrap();
+    a.xsavec64(ptr(r8 + 1024)).unwrap();
+    a.fxsave64(ptr(r8 + 1920)).unwrap();
+    a.vzeroall().unwrap();
+    a.vldmxcsr(dword_ptr(r8 + 40)).unwrap(); // default 0x1f80
+    a.vstmxcsr(dword_ptr(r8 + 56)).unwrap();
+    a.mov(eax, 7).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.xrstor64(ptr(r8 + 1024)).unwrap();
+    a.vmovdqu(ymmword_ptr(r8 + 2432), ymm0).unwrap();
+    a.vmovdqu(ymmword_ptr(r8 + 2464), ymm15).unwrap();
+    a.vzeroupper().unwrap();
+    // Restore default MXCSR/FCW
+    a.ldmxcsr(dword_ptr(r8 + 40)).unwrap();
+    a.fldcw(word_ptr(r8 + 26)).unwrap();
+    a.pop(rbx).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(0).unwrap();
+
+    let mut init = vec![0u8; 2560];
+    init[24..26].copy_from_slice(&0x027fu16.to_le_bytes()); // test FCW
+    init[26..28].copy_from_slice(&0x037fu16.to_le_bytes()); // default FCW
+    init[32..36].copy_from_slice(&0xbfc0u32.to_le_bytes()); // RD + FTZ + DAZ
+    init[40..44].copy_from_slice(&0x1f80u32.to_le_bytes()); // default MXCSR
+    init[44..48].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+    init[48..52].copy_from_slice(&3.0f32.to_bits().to_le_bytes());
+    for i in 0..64 {
+        init[64 + i] = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+
+    // Build and execute at two distinct guest bases (simulating ASLR / shifted-base reload),
+    // verifying zero runtime relocations, macOS & iOS static Mach-O emission, and bit-exact
+    // parity with the generic interpreter.
+    let mut reference = None;
+    for shift in [0usize, 0x1000] {
+        let code_cap = ((bytes.len() + 64) + 15) & !15;
+        let code_raw = arena_alloc(code_cap + shift, 64);
+        let code = unsafe { code_raw.add(shift) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
+            core::ptr::write_bytes(code.add(bytes.len()), 0xcc, 16);
+        }
+
+        // Reference run in generic interpreter
+        let data_interp = arena_alloc(init.len(), 64);
+        unsafe { core::ptr::copy_nonoverlapping(init.as_ptr(), data_interp, init.len()) };
+        let fast_off = TEST_FAST_OFF.with(|s| s.replace(true));
+        jit::force(2);
+        unsafe {
+            emu_run_full(code as u64, [data_interp as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+        }
+        jit::force(0);
+        TEST_FAST_OFF.with(|s| s.set(fast_off));
+        let interp_out = unsafe { core::slice::from_raw_parts(data_interp, init.len()) }.to_vec();
+        if let Some(ref first) = reference {
+            assert_eq!(&interp_out, first);
+        } else {
+            reference = Some(interp_out.clone());
+        }
+
+        // Build .aot image via build_image_for_test
+        let ips: Vec<u64> = iced_x86::Decoder::with_ip(64, &bytes, code as u64, iced_x86::DecoderOptions::NONE)
+            .into_iter()
+            .map(|ins| ins.ip())
+            .collect();
+        let mut bc = Box::new(BlockCache::new());
+        let img = unsafe { aot::build_image_for_test(&mut *bc, &ips) }
+            .expect("build .aot image for sys/state ops");
+        assert!(!img.blocks.is_empty());
+        assert!(img.blocks.iter().all(|b| b.reloc_n == 0), "sys/state ops must emit 0 relocs");
+
+        let key = aot::AotKey {
+            image_hash: [0xA1B2_C3D4_E5F6_0718 ^ shift as u64, 0x1928_3746_5564_7382],
+            image_base: code as u64,
+            image_size: code_cap as u64,
+            codegen_hash: aot::codegen_hash(),
+            knobs: jit::aot_knob_bits(),
+        };
+        let aot_bytes = aot::encode_for_test("sys_state_ops_test.dll", &key, &img);
+        for plat in [MachoPlatform::MacOs, MachoPlatform::Ios] {
+            let (_obj, rep) = emit_macho_object_from_aot_bytes(&aot_bytes, plat)
+                .unwrap_or_else(|e| panic!("static Mach-O emit ({plat}) failed: {e}"));
+            assert_eq!(rep.skipped_reloc_blocks, 0, "{plat}: 0 skipped blocks");
+            assert_eq!(rep.emitted_blocks, img.blocks.len(), "{plat}: all blocks emitted");
+        }
+
+        // Execute through installed disk AOT cache (reloaded at fresh host MAP_JIT base)
+        let data_aot = arena_alloc(init.len(), 64);
+        unsafe { core::ptr::copy_nonoverlapping(init.as_ptr(), data_aot, init.len()) };
+        let before = jit::test_aot_installs();
+        assert!(unsafe { aot::test_install(&ips, || {}).0 } > 0);
+        jit::force(1);
+        unsafe {
+            emu_run_full(code as u64, [data_aot as u64, 0, 0, 0, 0, 0, 0, 0], [0; 4], [0; 8]);
+        }
+        jit::force(0);
+        aot::test_uninstall();
+        assert!(jit::test_aot_installs() > before, "shift={shift}: AOT blocks must actually execute");
+        let aot_out = unsafe { core::slice::from_raw_parts(data_aot, init.len()) };
+        assert_eq!(aot_out, interp_out.as_slice(), "shift={shift}: AOT output must match generic interpreter");
+        assert_eq!(u32::from_le_bytes(aot_out[16..20].try_into().unwrap()), 7, "xgetbv XCR0");
+        assert_eq!(u16::from_le_bytes(aot_out[28..30].try_into().unwrap()), 0x027f, "fnstcw");
+        assert_eq!(u16::from_le_bytes(aot_out[30..32].try_into().unwrap()), 0x027f, "fstcw");
+        assert_eq!(u32::from_le_bytes(aot_out[36..40].try_into().unwrap()), 0xbfc0, "stmxcsr");
+        assert_eq!(u32::from_le_bytes(aot_out[52..56].try_into().unwrap()), 0x3eaa_aaaa, "RD divss");
+        assert_eq!(&aot_out[2432..2496], &init[64..128], "YMM0/YMM15 round-trip in AOT");
+    }
+}

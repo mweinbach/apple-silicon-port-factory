@@ -728,8 +728,8 @@ pub(in crate::emu) unsafe fn exec(cpu: &mut Cpu, op: &FastOp) -> Fx {
             cpu.rset(op.r0, 8, v);
         }
         _ => {
-            if op.kind >= K_VSHUF_RR {
-                exec_ext(cpu, op);
+            if op.kind >= K_VSHUF_RR && exec_ext(cpu, op) {
+                return Fx::Yield;
             }
         }
     }
@@ -737,9 +737,10 @@ pub(in crate::emu) unsafe fn exec(cpu: &mut Cpu, op: &FastOp) -> Fx {
 }
 
 /// Handlers for kinds >= [`K_VSHUF_RR`] (SSE/AVX and the extra integer ops). Out of line so
-/// the hot integer `exec`/`run_chain` code stays compact; all of them return [`Fx::Done`].
+/// the hot integer `exec`/`run_chain` code stays compact. Returns `true` when the caller must
+/// yield out of a fast burst/chain (e.g. after a fault dispatch or non-AFP mixed MXCSR switch).
 #[inline(never)]
-pub(in crate::emu) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
+pub(in crate::emu) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) -> bool {
     let w = op.w;
     match op.kind {
         K_VSHUF_RR => cpu.vexec::<true, _>(op, false, vshuf),
@@ -1262,8 +1263,9 @@ pub(in crate::emu) unsafe fn exec_ext(cpu: &mut Cpu, op: &FastOp) {
                 cpu.rset(op.r0, gw, val);
             }
         }
-        _ => exec_ext_more(cpu, op),
+        _ => return exec_ext_more(cpu, op),
     }
+    false
 }
 
 /// Whether a fast op of this kind may be re-executed on a shadow CPU for verification

@@ -807,6 +807,14 @@ pub fn x87_reset() {
     with_x87_mut(|cur| *cur = X87State::new());
 }
 
+/// Address of this thread's `X87State::cw` field for inline `fldcw`/`fnstcw`/`fstcw`
+/// in translated ARM64 code.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(super) fn x87_cw_ptr() -> usize {
+    TLS_X87.with(|cell| unsafe { core::ptr::addr_of_mut!((*cell.get()).cw) as usize })
+}
+
 // =================================================================================================
 // Clean `#[inline]` helpers on `&mut Cpu` for `DF_REGFILE` (`Rf` delegation) and `emu`
 // =================================================================================================

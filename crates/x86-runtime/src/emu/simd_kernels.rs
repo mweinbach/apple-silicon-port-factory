@@ -853,7 +853,7 @@ pub(in crate::emu) fn cvtdq2ps(a: u128) -> u128 {
 pub(in crate::emu) fn cvtps2dq(a: u128, trunc: bool) -> u128 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let r = if trunc { qf(a) } else { vrndnq_f32(qf(a)) };
+        let r = if trunc { qf(a) } else { vrndiq_f32(qf(a)) };
         let lo = vcgeq_f32(r, vdupq_n_f32(-2147483648.0));
         let hi = vcltq_f32(r, vdupq_n_f32(2147483648.0));
         let ok = vandq_u32(lo, hi);
