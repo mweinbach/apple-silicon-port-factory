@@ -191,7 +191,7 @@ fn hex_float(v: f64, prec: Option<usize>, upper: bool) -> String {
     }
 }
 
-fn fmt_float(out: &mut Out, sp: &Spec, v: f64, conv: u8, opts: u64) {
+unsafe fn fmt_float(out: &mut Out, sp: &Spec, v: f64, conv: u8, opts: u64, loc: *mut c_void) {
     let upper = conv.is_ascii_uppercase();
     let neg = v.is_sign_negative();
     let a = v.abs();
@@ -248,18 +248,55 @@ fn fmt_float(out: &mut Out, sp: &Spec, v: f64, conv: u8, opts: u64) {
     } else {
         ""
     };
-    let total = sign.len() + body.len();
-    if sp.zero && !sp.left && v.is_finite() && sp.width > total {
-        let (pfx, rest) = if body.starts_with("0x") || body.starts_with("0X") { body.split_at(2) } else { ("", body.as_str()) };
-        let s = format!("{sign}{pfx}{}{rest}", "0".repeat(sp.width - total));
-        out.push_str(&s);
+    let dec_units: Vec<u32> = if out.wide {
+        super::locale::numeric_decimal_wide(loc).iter().map(|&u| u as u32).collect()
     } else {
-        pad_field(out, sp, &str_units(&format!("{sign}{body}"), out.wide));
+        super::locale::numeric_decimal_narrow(loc).iter().map(|&b| b as u32).collect()
+    };
+    let localize = |s: &str| -> Vec<u32> {
+        let mut u = Vec::with_capacity(s.len() + dec_units.len());
+        for b in s.bytes() {
+            if b == b'.' {
+                u.extend_from_slice(&dec_units);
+            } else {
+                u.push(b as u32);
+            }
+        }
+        u
+    };
+    let (pfx, rest) = if body.starts_with("0x") || body.starts_with("0X") {
+        body.split_at(2)
+    } else {
+        ("", body.as_str())
+    };
+    let rest_units = localize(rest);
+    let total = sign.len() + pfx.len() + rest_units.len();
+    if sp.zero && !sp.left && v.is_finite() && sp.width > total {
+        out.push_str(sign);
+        out.push_str(pfx);
+        out.pad(sp.width - total, b'0' as u32);
+        out.push_units(&rest_units);
+    } else {
+        let mut units = Vec::with_capacity(total);
+        units.extend(sign.bytes().map(|b| b as u32));
+        units.extend(pfx.bytes().map(|b| b as u32));
+        units.extend_from_slice(&rest_units);
+        pad_field(out, sp, &units);
     }
 }
 
-/// Core formatter. Returns `None` on an invalid format (e.g. `%n`).
+/// Core formatter using active global locale. Returns `None` on an invalid format (e.g. `%n`).
 pub unsafe fn format(fmt: Fmt, out_wide: bool, opts: u64, args: &mut VaList) -> Option<Vec<u32>> {
+    format_with_locale(fmt, out_wide, opts, std::ptr::null_mut(), args)
+}
+
+unsafe fn format_with_locale(
+    fmt: Fmt,
+    out_wide: bool,
+    opts: u64,
+    loc: *mut c_void,
+    args: &mut VaList,
+) -> Option<Vec<u32>> {
     let mut out = Out { wide: out_wide, units: Vec::new() };
     let fw = fmt.wide();
     // In wide functions, does plain %s/%c mean wide? (legacy MS behaviour)
@@ -458,7 +495,7 @@ pub unsafe fn format(fmt: Fmt, out_wide: bool, opts: u64, args: &mut VaList) -> 
             }
             b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => {
                 let v = args.next_f64();
-                fmt_float(&mut out, &sp, v, conv8, opts);
+                fmt_float(&mut out, &sp, v, conv8, opts, loc);
             }
             b'n' => {
                 let _ = args.next_u64();
@@ -535,24 +572,24 @@ unsafe fn store<T: Copy + From<u8>>(res: &[T], buf: *mut T, count: usize, opts: 
     -1
 }
 
-unsafe fn fmt_narrow(opts: u64, fmt: *const u8, va: *const u8) -> Option<Vec<u8>> {
+unsafe fn fmt_narrow(opts: u64, fmt: *const u8, loc: *mut c_void, va: *const u8) -> Option<Vec<u8>> {
     if fmt.is_null() {
         super::runtime::invalid_parameter("printf: format is NULL");
         super::errno::set(super::errno::EINVAL);
         return None;
     }
     let mut a = VaList::new(va);
-    format(Fmt::Narrow(fmt), false, opts, &mut a).map(|u| units_to_bytes(&u))
+    format_with_locale(Fmt::Narrow(fmt), false, opts, loc, &mut a).map(|u| units_to_bytes(&u))
 }
 
-unsafe fn fmt_wide(opts: u64, fmt: *const u16, va: *const u8) -> Option<Vec<u16>> {
+unsafe fn fmt_wide(opts: u64, fmt: *const u16, loc: *mut c_void, va: *const u8) -> Option<Vec<u16>> {
     if fmt.is_null() {
         super::runtime::invalid_parameter("wprintf: format is NULL");
         super::errno::set(super::errno::EINVAL);
         return None;
     }
     let mut a = VaList::new(va);
-    format(Fmt::Wide(fmt), true, opts, &mut a).map(|u| u.iter().map(|&c| c as u16).collect())
+    format_with_locale(Fmt::Wide(fmt), true, opts, loc, &mut a).map(|u| u.iter().map(|&c| c as u16).collect())
 }
 
 pub unsafe extern "win64" fn __stdio_common_vsprintf(
@@ -560,10 +597,10 @@ pub unsafe extern "win64" fn __stdio_common_vsprintf(
     buf: *mut u8,
     count: usize,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_narrow(opts, fmt, va) {
+    match fmt_narrow(opts, fmt, loc, va) {
         Some(r) => store(&r, buf, count, opts),
         None => -1,
     }
@@ -574,10 +611,10 @@ pub unsafe extern "win64" fn __stdio_common_vswprintf(
     buf: *mut u16,
     count: usize,
     fmt: *const u16,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_wide(opts, fmt, va) {
+    match fmt_wide(opts, fmt, loc, va) {
         Some(r) => store(&r, buf, count, opts),
         None => -1,
     }
@@ -605,10 +642,10 @@ pub unsafe extern "win64" fn __stdio_common_vsprintf_s(
     buf: *mut u8,
     size: usize,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_narrow(opts, fmt, va) {
+    match fmt_narrow(opts, fmt, loc, va) {
         Some(r) => store_s(&r, buf, size),
         None => -1,
     }
@@ -619,10 +656,10 @@ pub unsafe extern "win64" fn __stdio_common_vswprintf_s(
     buf: *mut u16,
     size: usize,
     fmt: *const u16,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_wide(opts, fmt, va) {
+    match fmt_wide(opts, fmt, loc, va) {
         Some(r) => store_s(&r, buf, size),
         None => -1,
     }
@@ -663,10 +700,10 @@ pub unsafe extern "win64" fn __stdio_common_vsnprintf_s(
     size: usize,
     count: usize,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_narrow(opts, fmt, va) {
+    match fmt_narrow(opts, fmt, loc, va) {
         Some(r) => store_sn(&r, buf, size, count),
         None => -1,
     }
@@ -678,10 +715,10 @@ pub unsafe extern "win64" fn __stdio_common_vsnwprintf_s(
     size: usize,
     count: usize,
     fmt: *const u16,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_wide(opts, fmt, va) {
+    match fmt_wide(opts, fmt, loc, va) {
         Some(r) => store_sn(&r, buf, size, count),
         None => -1,
     }
@@ -689,7 +726,7 @@ pub unsafe extern "win64" fn __stdio_common_vsnwprintf_s(
 
 /// Stream printf (used by stdio.rs and msvcrt).
 pub unsafe fn vfprintf_impl(opts: u64, stream: *mut c_void, fmt: *const u8, va: *const u8) -> i32 {
-    match fmt_narrow(opts, fmt, va) {
+    match fmt_narrow(opts, fmt, std::ptr::null_mut(), va) {
         Some(r) => super::stdio::write_stream_bytes(stream, &r),
         None => -1,
     }
@@ -699,30 +736,33 @@ pub unsafe extern "win64" fn __stdio_common_vfprintf(
     opts: u64,
     stream: *mut c_void,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    vfprintf_impl(opts, stream, fmt, va)
+    match fmt_narrow(opts, fmt, loc, va) {
+        Some(r) => super::stdio::write_stream_bytes(stream, &r),
+        None => -1,
+    }
 }
 
 pub unsafe extern "win64" fn __stdio_common_vfprintf_s(
     opts: u64,
     stream: *mut c_void,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    vfprintf_impl(opts, stream, fmt, va)
+    __stdio_common_vfprintf(opts, stream, fmt, loc, va)
 }
 
 pub unsafe extern "win64" fn __stdio_common_vfwprintf(
     opts: u64,
     stream: *mut c_void,
     fmt: *const u16,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
-    match fmt_wide(opts, fmt, va) {
+    match fmt_wide(opts, fmt, loc, va) {
         Some(r) => super::stdio::write_stream_wide(stream, &r),
         None => -1,
     }
@@ -777,6 +817,23 @@ mod tests {
             assert_eq!(f("%f %f", &[b(f64::INFINITY), b(f64::NAN)]), "inf nan");
             assert_eq!(f("%a", &[b(1.0)]), "0x1p+0");
             assert_eq!(f("%.0f %#.0f", &[b(2.5), b(2.0)]), "2 2.");
+
+            // LC_NUMERIC = de-DE formats floats with ',' via both global locale and explicit _locale_t.
+            let loc_de = crate::ucrt::locale::_create_locale(4 /* LC_NUMERIC */, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            let mut buf = [0u8; 32];
+            let args = [b(1.5)];
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                buf.as_mut_ptr(),
+                buf.len(),
+                b"%.2f\0".as_ptr(),
+                loc_de,
+                args.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 4);
+            assert_eq!(&buf[..4], b"1,50");
+            crate::ucrt::locale::_free_locale(loc_de);
         }
     }
 

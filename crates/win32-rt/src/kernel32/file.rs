@@ -8114,6 +8114,57 @@ unsafe fn query_volume_storage_info(f: &FileObj) -> VolumeStorageInfo {
     info
 }
 
+/// Enumerate allocated `[offset, length)` ranges inside `[req_off, range_end)` using
+/// `SEEK_DATA`/`SEEK_HOLE`, always restoring `saved_pos` on both success and failure.
+/// Only `ENXIO` is treated as "no more data/holes"; any other `errno` (e.g. `ENOTSUP`,
+/// `EIO`, `ESPIPE`, `EINVAL`) is propagated instead of silently reporting holes.
+fn query_allocated_ranges_with<F>(
+    saved_pos: i64,
+    req_off: i64,
+    range_end: i64,
+    mut seek: F,
+) -> Result<Vec<(i64, i64)>, i32>
+where
+    F: FnMut(i64, libc::c_int) -> Result<i64, i32>,
+{
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    let mut cur = req_off;
+    while cur < range_end {
+        let data_start = match seek(cur, libc::SEEK_DATA) {
+            Ok(p) => p,
+            Err(libc::ENXIO) => break,
+            Err(e) => {
+                let _ = seek(saved_pos, libc::SEEK_SET);
+                return Err(e);
+            }
+        };
+        if data_start >= range_end {
+            break;
+        }
+        let hole_start = match seek(data_start, libc::SEEK_HOLE) {
+            Ok(p) => Some(p),
+            Err(libc::ENXIO) => None,
+            Err(e) => {
+                let _ = seek(saved_pos, libc::SEEK_SET);
+                return Err(e);
+            }
+        };
+        let end = match hole_start {
+            Some(p) if p <= range_end => p,
+            _ => range_end,
+        };
+        if end > data_start {
+            ranges.push((data_start, end - data_start));
+        }
+        if hole_start.is_none() || end >= range_end {
+            break;
+        }
+        cur = end;
+    }
+    let _ = seek(saved_pos, libc::SEEK_SET);
+    Ok(ranges)
+}
+
 pub unsafe extern "win64" fn DeviceIoControl(
     h: HANDLE,
     code: u32,
@@ -8511,33 +8562,33 @@ pub unsafe extern "win64" fn DeviceIoControl(
                 set_err(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-            let file_len = f.file().metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let file_len = match f.file().metadata() {
+                Ok(m) => m.len() as i64,
+                Err(e) => {
+                    set_err(io_err(&e));
+                    return FALSE;
+                }
+            };
             let range_end = req_off.saturating_add(req_len).min(file_len);
             if req_off >= range_end {
                 return put_exact(&[]);
             }
             // Query real allocated ranges via SEEK_DATA/SEEK_HOLE (preserving file offset).
             let saved_pos = libc::lseek(f.fd(), 0, libc::SEEK_CUR);
-            let mut ranges: Vec<(i64, i64)> = Vec::new();
-            let mut cur = req_off;
-            while cur < range_end {
-                let data_start = libc::lseek(f.fd(), cur, libc::SEEK_DATA);
-                if data_start < 0 || data_start >= range_end {
-                    break;
-                }
-                let hole_start = libc::lseek(f.fd(), data_start, libc::SEEK_HOLE);
-                let end = if hole_start < 0 || hole_start > range_end { range_end } else { hole_start };
-                if end > data_start {
-                    ranges.push((data_start, end - data_start));
-                }
-                if hole_start < 0 || end >= range_end {
-                    break;
-                }
-                cur = end;
+            if saved_pos < 0 {
+                set_err(errno_to_win32(last_errno()));
+                return FALSE;
             }
-            if saved_pos >= 0 {
-                libc::lseek(f.fd(), saved_pos, libc::SEEK_SET);
-            }
+            let ranges = match query_allocated_ranges_with(saved_pos, req_off, range_end, |off, whence| {
+                let r = libc::lseek(f.fd(), off, whence);
+                if r < 0 { Err(last_errno()) } else { Ok(r) }
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    set_err(errno_to_win32(e));
+                    return FALSE;
+                }
+            };
             let max_entries = (out_len as usize) / 16;
             let count = ranges.len().min(max_entries);
             let mut buf = Vec::with_capacity(count * 16);
@@ -11942,5 +11993,56 @@ mod tests {
             assert_eq!((buf.as_ptr().add(2) as *const u16).read_unaligned(), 116);
             assert_eq!((buf.as_ptr().add(4) as *const u32).read_unaligned(), 0x0007_0000); // WNNC_NET_SUN_PC_NFS @4
         }
+    }
+
+    #[test]
+    fn query_allocated_ranges_propagates_non_enxio_errors_and_restores_pos() {
+        // 1. Normal ENXIO after one allocated extent succeeds and restores saved_pos.
+        let mut restored = None;
+        let ranges = query_allocated_ranges_with(42, 0, 8192, |off, whence| match whence {
+            libc::SEEK_DATA => {
+                if off == 0 {
+                    Ok(1024)
+                } else {
+                    Err(libc::ENXIO)
+                }
+            }
+            libc::SEEK_HOLE => Ok(4096),
+            libc::SEEK_SET => {
+                restored = Some(off);
+                Ok(off)
+            }
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(ranges, vec![(1024, 3072)]);
+        assert_eq!(restored, Some(42));
+
+        // 2. Non-ENXIO failure on SEEK_DATA (e.g. ENOTSUP / EIO) restores saved_pos and returns Err.
+        let mut restored_err = None;
+        let err_data = query_allocated_ranges_with(77, 0, 8192, |off, whence| match whence {
+            libc::SEEK_DATA => Err(libc::ENOTSUP),
+            libc::SEEK_SET => {
+                restored_err = Some(off);
+                Ok(off)
+            }
+            _ => unreachable!(),
+        });
+        assert_eq!(err_data, Err(libc::ENOTSUP));
+        assert_eq!(restored_err, Some(77));
+
+        // 3. Non-ENXIO failure on SEEK_HOLE restores saved_pos and returns Err rather than truncating.
+        let mut restored_hole = None;
+        let err_hole = query_allocated_ranges_with(99, 0, 8192, |off, whence| match whence {
+            libc::SEEK_DATA => Ok(0),
+            libc::SEEK_HOLE => Err(libc::EIO),
+            libc::SEEK_SET => {
+                restored_hole = Some(off);
+                Ok(off)
+            }
+            _ => unreachable!(),
+        });
+        assert_eq!(err_hole, Err(libc::EIO));
+        assert_eq!(restored_hole, Some(99));
     }
 }

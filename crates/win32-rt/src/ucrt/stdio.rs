@@ -329,13 +329,24 @@ fn open_host_path(
     }
     // If BOM detection is requested on a write-only append/existing file, open RDWR internally
     // so `pread` can inspect the BOM at offset 0.
+    let mut upgraded_rdwr = false;
     if detect_bom && acc == O_WRONLY && (oflag & O_TRUNC) == 0 {
         f = (f & !libc::O_ACCMODE) | libc::O_RDWR;
+        upgraded_rdwr = true;
     }
     f |= libc::O_CLOEXEC;
     let mode = if pmode & 0x80 != 0 { 0o644 } else { 0o444 }; // _S_IWRITE
     let c = std::ffi::CString::new(host.as_os_str().as_encoded_bytes()).unwrap();
-    let fd = unsafe { libc::open(c.as_ptr(), f, mode as libc::c_uint) };
+    let mut fd = unsafe { libc::open(c.as_ptr(), f, mode as libc::c_uint) };
+    let mut bom_readable = true;
+    if fd < 0 && upgraded_rdwr {
+        // Microsoft Learn `fopen(..., "a, ccs=...")`: if read/write open fails (e.g. a
+        // write-only file denying read access), retry with write-only access and keep the
+        // requested Unicode encoding without BOM inspection.
+        let wronly_f = (f & !libc::O_ACCMODE) | libc::O_WRONLY;
+        fd = unsafe { libc::open(c.as_ptr(), wronly_f, mode as libc::c_uint) };
+        bom_readable = false;
+    }
     if fd < 0 {
         errno::set_from_host();
         return -1;
@@ -361,7 +372,16 @@ fn open_host_path(
         }
     };
     let final_mode = if req_mode.is_unicode() {
-        unsafe { apply_unicode_bom(fd, oflag, req_mode, write_bom, detect_bom, ansi_if_no_bom) }
+        unsafe {
+            apply_unicode_bom(
+                fd,
+                oflag,
+                req_mode,
+                write_bom,
+                detect_bom && bom_readable,
+                ansi_if_no_bom,
+            )
+        }
     } else {
         req_mode
     };
@@ -3561,6 +3581,27 @@ mod tests {
             assert_eq!(fputwc('!' as u16, f_ap), '!' as u32);
             assert_eq!(fclose(f_ap), 0);
             assert_eq!(std::fs::read(dir.join("aplus_u8.txt")).unwrap(), "\u{FEFF}Hi!".as_bytes());
+
+            // 13. Write-only host file (mode 0200): fopen("a, ccs=UTF-8") retries O_WRONLY when
+            //     opportunistic O_RDWR BOM inspection gets EACCES and appends in requested UTF-8.
+            let wo_path = dir.join("writeonly_u8.txt");
+            std::fs::write(&wo_path, b"pre:").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wo_path, std::fs::Permissions::from_mode(0o200)).unwrap();
+            }
+            let f_wo = fopen(b"U:\\writeonly_u8.txt\0".as_ptr(), b"a, ccs=UTF-8\0".as_ptr());
+            assert!(!f_wo.is_null(), "write-only append with ccs=UTF-8 must fall back to O_WRONLY");
+            let w_app: Vec<u16> = "ok\0".encode_utf16().collect();
+            assert!(fputws(w_app.as_ptr(), f_wo) >= 0);
+            assert_eq!(fclose(f_wo), 0);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wo_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            assert_eq!(std::fs::read(&wo_path).unwrap(), b"pre:ok");
         }
 
         let _ = std::fs::remove_dir_all(&dir);

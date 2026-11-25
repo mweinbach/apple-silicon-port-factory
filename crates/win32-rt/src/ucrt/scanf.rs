@@ -47,7 +47,7 @@ unsafe fn fmt_at(fmt: *const u8, wide: bool, i: usize) -> u32 {
 
 /// Returns number of assigned fields, or -1 (EOF) on input failure before
 /// the first conversion.
-unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, args: &mut VaList) -> i32 {
+unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, loc: *mut c_void, args: &mut VaList) -> i32 {
     let wide = input.wide;
     let wide_default = wide && opts & LEGACY_WIDE != 0;
     let mut assigned = 0;
@@ -231,7 +231,23 @@ unsafe fn scan(input: &mut Input, fmt: *const u8, opts: u64, args: &mut VaList) 
                     let q = Input { wide: inp.wide, p: inp.p, len: inp.len, pos: start + k };
                     q.peek().unwrap_or(0)
                 };
-                let (v, used, _) = super::convert::scan_float(&get);
+                let mut dec_buf = [0u32; 8];
+                let dec_len = if wide {
+                    let u = super::locale::numeric_decimal_wide(loc);
+                    let n = u.len().min(dec_buf.len());
+                    for (idx, &c) in u[..n].iter().enumerate() {
+                        dec_buf[idx] = c as u32;
+                    }
+                    n
+                } else {
+                    let b = super::locale::numeric_decimal_narrow(loc);
+                    let n = b.len().min(dec_buf.len());
+                    for (idx, &c) in b[..n].iter().enumerate() {
+                        dec_buf[idx] = c as u32;
+                    }
+                    n
+                };
+                let (v, used, _) = super::convert::scan_float_with_dec(&get, &dec_buf[..dec_len]);
                 if used == 0 {
                     break;
                 }
@@ -365,7 +381,7 @@ pub unsafe extern "win64" fn __stdio_common_vsscanf(
     buf: *const u8,
     count: usize,
     fmt: *const u8,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
     if buf.is_null() || fmt.is_null() {
@@ -375,7 +391,7 @@ pub unsafe extern "win64" fn __stdio_common_vsscanf(
     }
     let mut input = Input { wide: false, p: buf, len: count, pos: 0 };
     let mut a = VaList::new(va);
-    scan(&mut input, fmt, opts, &mut a)
+    scan(&mut input, fmt, opts, loc, &mut a)
 }
 
 pub unsafe extern "win64" fn __stdio_common_vswscanf(
@@ -383,7 +399,7 @@ pub unsafe extern "win64" fn __stdio_common_vswscanf(
     buf: *const u16,
     count: usize,
     fmt: *const u16,
-    _loc: *mut c_void,
+    loc: *mut c_void,
     va: *const u8,
 ) -> i32 {
     if buf.is_null() || fmt.is_null() {
@@ -393,7 +409,7 @@ pub unsafe extern "win64" fn __stdio_common_vswscanf(
     }
     let mut input = Input { wide: true, p: buf as *const u8, len: count, pos: 0 };
     let mut a = VaList::new(va);
-    scan(&mut input, fmt as *const u8, opts, &mut a)
+    scan(&mut input, fmt as *const u8, opts, loc, &mut a)
 }
 
 #[cfg(test)]
@@ -429,6 +445,15 @@ mod tests {
             let args2: [u64; 2] = [&mut x as *mut _ as u64, &mut y as *mut _ as u64];
             let n = __stdio_common_vsscanf(0, b"10x20\0".as_ptr(), usize::MAX, b"%dx%d\0".as_ptr(), std::ptr::null_mut(), args2.as_ptr() as *const u8);
             assert_eq!((n, x, y), (2, 10, 20));
+
+            // LC_NUMERIC = de-DE uses ',' in sscanf/swscanf float conversions.
+            let loc_de = crate::ucrt::locale::_create_locale(4 /* LC_NUMERIC */, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            let mut df: f64 = 0.0;
+            let args_de: [u64; 1] = [&mut df as *mut _ as u64];
+            let n = __stdio_common_vsscanf(0, b"1,75\0".as_ptr(), usize::MAX, b"%lf\0".as_ptr(), loc_de, args_de.as_ptr() as *const u8);
+            assert_eq!((n, df), (1, 1.75));
+            crate::ucrt::locale::_free_locale(loc_de);
         }
     }
 }

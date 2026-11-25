@@ -41,8 +41,8 @@ pub(super) unsafe fn locale_obj_cp(l: *mut c_void) -> u32 {
     if l.is_null() {
         mb_cp()
     } else {
-        let obj = &*(l as *const LocaleObj);
-        if obj.entry.is_c { 0 } else { obj.entry.cp }
+        let e = &(*(l as *const LocaleObj)).cats[(LC_CTYPE - 1) as usize];
+        if e.is_c { 0 } else { e.cp }
     }
 }
 
@@ -53,14 +53,79 @@ pub(super) unsafe fn ctype_cp_and_icu(l: *mut c_void) -> (u32, String) {
         let e = &st.cats[(LC_CTYPE - 1) as usize];
         (e.is_c, e.cp, e.bcp47.clone())
     } else {
-        let obj = &*(l as *const LocaleObj);
-        (obj.entry.is_c, obj.entry.cp, obj.entry.bcp47.clone())
+        let e = &(*(l as *const LocaleObj)).cats[(LC_CTYPE - 1) as usize];
+        (e.is_c, e.cp, e.bcp47.clone())
     };
     if is_c || cp == 0 {
         return (0, String::new());
     }
     let icu_id = kstr::resolve_locale_tag(&bcp47).map(|r| r.icu_id).unwrap_or_default();
     (cp, icu_id)
+}
+
+struct NumericDecimal {
+    narrow: &'static [u8],
+    wide: &'static [u16],
+}
+
+static C_NUMERIC_DEC: NumericDecimal = NumericDecimal {
+    narrow: b".",
+    wide: &[b'.' as u16],
+};
+
+static ACTIVE_NUMERIC_DEC: std::sync::atomic::AtomicPtr<NumericDecimal> =
+    std::sync::atomic::AtomicPtr::new(&C_NUMERIC_DEC as *const NumericDecimal as *mut NumericDecimal);
+
+fn numeric_decimal_for_entry(num: &LocaleEntry) -> &'static NumericDecimal {
+    if num.is_c {
+        return &C_NUMERIC_DEC;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), &'static NumericDecimal>>> = OnceLock::new();
+    let m = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (num.bcp47.clone(), num.cp);
+    let mut g = m.lock().unwrap();
+    if let Some(&d) = g.get(&key) {
+        return d;
+    }
+    let dec_str = kstr::resolve_locale_tag(&num.bcp47)
+        .and_then(|loc| kstr::locale_info_for(&loc, 0x0E))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".into());
+    let wide_vec: Vec<u16> = dec_str.encode_utf16().collect();
+    let narrow_vec: Vec<u8> = if num.cp == 0 || num.cp == 65001 {
+        dec_str.into_bytes()
+    } else {
+        kstr::encode_utf16_to_cp(num.cp, &wide_vec, Some(b'.'))
+            .ok()
+            .map(|(b, _)| b)
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| b".".to_vec())
+    };
+    let narrow: &'static [u8] = Box::leak(narrow_vec.into_boxed_slice());
+    let wide: &'static [u16] = Box::leak(wide_vec.into_boxed_slice());
+    let leaked: &'static NumericDecimal = Box::leak(Box::new(NumericDecimal { narrow, wide }));
+    g.insert(key, leaked);
+    leaked
+}
+
+/// Active `LC_NUMERIC` narrow decimal separator bytes (encoded in the locale's code page).
+pub(super) unsafe fn numeric_decimal_narrow(l: *mut c_void) -> &'static [u8] {
+    if l.is_null() {
+        (*ACTIVE_NUMERIC_DEC.load(Ordering::Acquire)).narrow
+    } else {
+        let e = &(*(l as *const LocaleObj)).cats[(LC_NUMERIC - 1) as usize];
+        numeric_decimal_for_entry(e).narrow
+    }
+}
+
+/// Active `LC_NUMERIC` wide (UTF-16) decimal separator code units.
+pub(super) unsafe fn numeric_decimal_wide(l: *mut c_void) -> &'static [u16] {
+    if l.is_null() {
+        (*ACTIVE_NUMERIC_DEC.load(Ordering::Acquire)).wide
+    } else {
+        let e = &(*(l as *const LocaleObj)).cats[(LC_NUMERIC - 1) as usize];
+        numeric_decimal_for_entry(e).wide
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +185,7 @@ fn global_state() -> &'static Mutex<LocaleState> {
 fn sync_atomics(st: &LocaleState) {
     let ctype = &st.cats[(LC_CTYPE - 1) as usize];
     let collate = &st.cats[(LC_COLLATE - 1) as usize];
+    let numeric = &st.cats[(LC_NUMERIC - 1) as usize];
     C_LOCALE.store(ctype.is_c, Ordering::Relaxed);
     CTYPE_CP.store(ctype.cp, Ordering::Relaxed);
     COLLATE_CP.store(collate.cp, Ordering::Relaxed);
@@ -129,6 +195,8 @@ fn sync_atomics(st: &LocaleState) {
         kstr::resolve_locale_tag(&ctype.bcp47).map(|r| r.icu_id).unwrap_or_default()
     };
     super::string::refresh_global_ctype_tables(if ctype.is_c { 0 } else { ctype.cp }, &icu_id);
+    let dec = numeric_decimal_for_entry(numeric);
+    ACTIVE_NUMERIC_DEC.store(dec as *const NumericDecimal as *mut NumericDecimal, Ordering::Release);
 }
 
 fn intern_bytes(bytes: &[u8]) -> *mut u8 {
@@ -634,7 +702,7 @@ pub unsafe extern "win64" fn ___mb_cur_max_l_func(l: *mut c_void) -> i32 {
         return ___mb_cur_max_func();
     }
     let obj = &*(l as *const LocaleObj);
-    obj.entry.max_char_size()
+    obj.cats[(LC_CTYPE - 1) as usize].max_char_size()
 }
 
 pub unsafe extern "win64" fn ___lc_locale_name_func() -> *const *const u16 {
@@ -677,28 +745,57 @@ pub unsafe extern "win64" fn _lock_locales() {}
 #[inline(never)]
 pub unsafe extern "win64" fn _unlock_locales() {}
 
-/// `_locale_t` handles: heap object carrying the resolved [`LocaleEntry`].
+/// `_locale_t` handles: heap object carrying per-category [`LocaleEntry`] values
+/// (indexed `LC_COLLATE(1) - 1` .. `LC_TIME(5) - 1`, unspecified categories default to `"C"`).
 struct LocaleObj {
-    entry: LocaleEntry,
+    cats: [LocaleEntry; 5],
+}
+
+fn build_locale_obj(cat: i32, raw: &str) -> Option<*mut c_void> {
+    let mut cats = [
+        LocaleEntry::c_locale(),
+        LocaleEntry::c_locale(),
+        LocaleEntry::c_locale(),
+        LocaleEntry::c_locale(),
+        LocaleEntry::c_locale(),
+    ];
+    if cat == LC_ALL && raw.contains(';') && raw.contains('=') {
+        for part in raw.split(';') {
+            let (k, v) = part.split_once('=')?;
+            let idx = match k.trim() {
+                "LC_COLLATE" => 0,
+                "LC_CTYPE" => 1,
+                "LC_MONETARY" => 2,
+                "LC_NUMERIC" => 3,
+                "LC_TIME" => 4,
+                _ => return None,
+            };
+            cats[idx] = parse_single_locale(v)?;
+        }
+    } else {
+        let entry = parse_single_locale(raw)?;
+        if cat == LC_ALL {
+            for slot in &mut cats {
+                *slot = entry.clone();
+            }
+        } else {
+            cats[(cat - 1) as usize] = entry;
+        }
+    }
+    Some(Box::into_raw(Box::new(LocaleObj { cats })) as *mut c_void)
 }
 
 pub unsafe extern "win64" fn _create_locale(cat: i32, name: *const u8) -> *mut c_void {
     if !(LC_ALL..=LC_TIME).contains(&cat) || name.is_null() {
         return std::ptr::null_mut();
     }
-    match parse_single_locale(&from_ansi(name)) {
-        Some(entry) => Box::into_raw(Box::new(LocaleObj { entry })) as *mut c_void,
-        None => std::ptr::null_mut(),
-    }
+    build_locale_obj(cat, &from_ansi(name)).unwrap_or(std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn _wcreate_locale(cat: i32, name: *const u16) -> *mut c_void {
     if !(LC_ALL..=LC_TIME).contains(&cat) || name.is_null() {
         return std::ptr::null_mut();
     }
-    match parse_single_locale(&from_wide(name)) {
-        Some(entry) => Box::into_raw(Box::new(LocaleObj { entry })) as *mut c_void,
-        None => std::ptr::null_mut(),
-    }
+    build_locale_obj(cat, &from_wide(name)).unwrap_or(std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn _free_locale(l: *mut c_void) {
     if !l.is_null() {
@@ -706,8 +803,8 @@ pub unsafe extern "win64" fn _free_locale(l: *mut c_void) {
     }
 }
 pub unsafe extern "win64" fn _get_current_locale() -> *mut c_void {
-    let entry = global_state().lock().unwrap().cats[(LC_CTYPE - 1) as usize].clone();
-    Box::into_raw(Box::new(LocaleObj { entry })) as *mut c_void
+    let cats = global_state().lock().unwrap().cats.clone();
+    Box::into_raw(Box::new(LocaleObj { cats })) as *mut c_void
 }
 pub unsafe extern "win64" fn __acrt_get_qualified_locale(_a: *const c_void, _b: *mut c_void, _c: *mut c_void) -> i32 {
     0

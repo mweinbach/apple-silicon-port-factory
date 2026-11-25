@@ -205,8 +205,17 @@ pub unsafe extern "win64" fn _wtoi64(s: *const u16) -> i64 {
 // Floating point parsing
 // ---------------------------------------------------------------------------
 
-/// Parse the longest valid floating-point prefix. Returns (value, consumed).
+/// Parse the longest valid floating-point prefix using ASCII `'.'` as decimal separator.
 pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
+    scan_float_with_dec(get, &[b'.' as u32])
+}
+
+/// Parse the longest valid floating-point prefix recognizing `dec` as the `LC_NUMERIC`
+/// radix separator (for both decimal and hexadecimal floats). Returns `(value, consumed, range_err)`.
+pub fn scan_float_with_dec(get: &dyn Fn(usize) -> u32, dec: &[u32]) -> (f64, usize, bool) {
+    let matches_dec = |k: usize| -> bool {
+        !dec.is_empty() && dec.iter().enumerate().all(|(idx, &u)| get(k + idx) == u)
+    };
     let mut i = 0;
     while is_space(get(i)) {
         i += 1;
@@ -265,9 +274,9 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
                     exp += 4;
                 }
                 j += 1;
-            } else if c == b'.' as u32 && !seen_dot {
+            } else if !seen_dot && matches_dec(j) {
                 seen_dot = true;
-                j += 1;
+                j += dec.len();
             } else {
                 break;
             }
@@ -309,8 +318,8 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
         j += 1;
         digits += 1;
     }
-    if get(j) == b'.' as u32 {
-        let mut k = j + 1;
+    if matches_dec(j) {
+        let mut k = j + dec.len();
         let mut frac = String::from(".");
         while (get(k) as u8).is_ascii_digit() && get(k) < 0x80 {
             frac.push(get(k) as u8 as char);
@@ -348,13 +357,19 @@ pub fn scan_float(get: &dyn Fn(usize) -> u32) -> (f64, usize, bool) {
     (v, j, range)
 }
 
-pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
+unsafe fn strtod_impl(s: *const u8, end: *mut *const u8, loc: *mut c_void) -> f64 {
     if s.is_null() {
         errno::set(EINVAL);
         invalid_parameter("strtod");
         return 0.0;
     }
-    let (v, n, range) = scan_float(&nget(s));
+    let dec_bytes = super::locale::numeric_decimal_narrow(loc);
+    let mut dec_buf = [0u32; 8];
+    let dec_len = dec_bytes.len().min(dec_buf.len());
+    for (idx, &b) in dec_bytes[..dec_len].iter().enumerate() {
+        dec_buf[idx] = b as u32;
+    }
+    let (v, n, range) = scan_float_with_dec(&nget(s), &dec_buf[..dec_len]);
     if range {
         errno::set(ERANGE);
     }
@@ -363,8 +378,34 @@ pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
     }
     v
 }
+
+unsafe fn wcstod_impl(s: *const u16, end: *mut *const u16, loc: *mut c_void) -> f64 {
+    if s.is_null() {
+        errno::set(EINVAL);
+        invalid_parameter("wcstod");
+        return 0.0;
+    }
+    let dec_units = super::locale::numeric_decimal_wide(loc);
+    let mut dec_buf = [0u32; 8];
+    let dec_len = dec_units.len().min(dec_buf.len());
+    for (idx, &u) in dec_units[..dec_len].iter().enumerate() {
+        dec_buf[idx] = u as u32;
+    }
+    let (v, n, range) = scan_float_with_dec(&wget(s), &dec_buf[..dec_len]);
+    if range {
+        errno::set(ERANGE);
+    }
+    if !end.is_null() {
+        *end = s.add(n);
+    }
+    v
+}
+
+pub unsafe extern "win64" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
+    strtod_impl(s, end, std::ptr::null_mut())
+}
 pub unsafe extern "win64" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
-    let v = strtod(s, end);
+    let v = strtod_impl(s, end, std::ptr::null_mut());
     let f = v as f32;
     if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
         errno::set(ERANGE);
@@ -372,43 +413,41 @@ pub unsafe extern "win64" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
     f
 }
 pub unsafe extern "win64" fn strtold(s: *const u8, end: *mut *const u8) -> f64 {
-    strtod(s, end)
+    strtod_impl(s, end, std::ptr::null_mut())
 }
-pub unsafe extern "win64" fn _strtod_l(s: *const u8, end: *mut *const u8, _l: *mut c_void) -> f64 {
-    strtod(s, end)
+pub unsafe extern "win64" fn _strtod_l(s: *const u8, end: *mut *const u8, l: *mut c_void) -> f64 {
+    strtod_impl(s, end, l)
 }
-pub unsafe extern "win64" fn _strtof_l(s: *const u8, end: *mut *const u8, _l: *mut c_void) -> f32 {
-    strtof(s, end)
-}
-pub unsafe extern "win64" fn atof(s: *const u8) -> f64 {
-    strtod(s, std::ptr::null_mut())
-}
-pub unsafe extern "win64" fn _atof_l(s: *const u8, _l: *mut c_void) -> f64 {
-    atof(s)
-}
-pub unsafe extern "win64" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
-    if s.is_null() {
-        errno::set(EINVAL);
-        invalid_parameter("wcstod");
-        return 0.0;
-    }
-    let (v, n, range) = scan_float(&wget(s));
-    if range {
+pub unsafe extern "win64" fn _strtof_l(s: *const u8, end: *mut *const u8, l: *mut c_void) -> f32 {
+    let v = strtod_impl(s, end, l);
+    let f = v as f32;
+    if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
         errno::set(ERANGE);
     }
-    if !end.is_null() {
-        *end = s.add(n);
-    }
-    v
+    f
+}
+pub unsafe extern "win64" fn atof(s: *const u8) -> f64 {
+    strtod_impl(s, std::ptr::null_mut(), std::ptr::null_mut())
+}
+pub unsafe extern "win64" fn _atof_l(s: *const u8, l: *mut c_void) -> f64 {
+    strtod_impl(s, std::ptr::null_mut(), l)
+}
+pub unsafe extern "win64" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
+    wcstod_impl(s, end, std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn wcstof(s: *const u16, end: *mut *const u16) -> f32 {
-    wcstod(s, end) as f32
+    let v = wcstod_impl(s, end, std::ptr::null_mut());
+    let f = v as f32;
+    if (f.is_infinite() && !v.is_infinite()) || (f == 0.0 && v != 0.0) {
+        errno::set(ERANGE);
+    }
+    f
 }
 pub unsafe extern "win64" fn wcstold(s: *const u16, end: *mut *const u16) -> f64 {
-    wcstod(s, end)
+    wcstod_impl(s, end, std::ptr::null_mut())
 }
 pub unsafe extern "win64" fn _wtof(s: *const u16) -> f64 {
-    wcstod(s, std::ptr::null_mut())
+    wcstod_impl(s, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1171,35 @@ mod tests {
             assert!(strtod(b"nan(ind)\0".as_ptr(), std::ptr::null_mut()).is_nan());
             assert_eq!(strtod(b"1.\0".as_ptr(), &mut e), 1.0);
             assert_eq!(strtod(b".5\0".as_ptr(), std::ptr::null_mut()), 0.5);
+
+            // LC_NUMERIC = de-DE uses ',' as decimal point for strtod/strtof/atof/wcstod/_wtof.
+            assert!(!crate::ucrt::locale::setlocale(4 /* LC_NUMERIC */, b"de-DE\0".as_ptr()).is_null());
+            let de = b"1,5rest\0";
+            assert_eq!(strtod(de.as_ptr(), &mut e), 1.5);
+            assert_eq!(e.offset_from(de.as_ptr()), 3);
+            assert_eq!(strtod(b"0x1,8p1\0".as_ptr(), std::ptr::null_mut()), 3.0);
+            assert_eq!(strtof(b"2,25\0".as_ptr(), std::ptr::null_mut()), 2.25);
+            assert_eq!(atof(b"3,5\0".as_ptr()), 3.5);
+            // Under de-DE, '.' is no longer the decimal separator.
+            let dot = b"1.5\0";
+            assert_eq!(strtod(dot.as_ptr(), &mut e), 1.0);
+            assert_eq!(e.offset_from(dot.as_ptr()), 1);
+            let wde: Vec<u16> = "1,5x\0".encode_utf16().collect();
+            let mut we = std::ptr::null();
+            assert_eq!(wcstod(wde.as_ptr(), &mut we), 1.5);
+            assert_eq!(we.offset_from(wde.as_ptr()), 3);
+            let whalf: Vec<u16> = ",5\0".encode_utf16().collect();
+            assert_eq!(_wtof(whalf.as_ptr()), 0.5);
+            // Restore global "C" and verify explicit _locale_t honors LC_NUMERIC independently.
+            assert!(!crate::ucrt::locale::setlocale(4, b"C\0".as_ptr()).is_null());
+            let loc_de = crate::ucrt::locale::_create_locale(4, b"de-DE\0".as_ptr());
+            assert!(!loc_de.is_null());
+            assert_eq!(_strtod_l(de.as_ptr(), &mut e, loc_de), 1.5);
+            assert_eq!(e.offset_from(de.as_ptr()), 3);
+            assert_eq!(_strtof_l(b"2,5\0".as_ptr(), std::ptr::null_mut(), loc_de), 2.5);
+            assert_eq!(_atof_l(b"4,25\0".as_ptr(), loc_de), 4.25);
+            assert_eq!(strtod(b"1.5\0".as_ptr(), std::ptr::null_mut()), 1.5);
+            crate::ucrt::locale::_free_locale(loc_de);
         }
     }
     #[test]
