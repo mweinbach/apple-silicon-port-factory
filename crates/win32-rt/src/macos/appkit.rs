@@ -92,6 +92,15 @@ struct CFRunLoopSourceContext {
     perform: Option<extern "C" fn(*mut c_void)>,
 }
 
+#[repr(C)]
+struct CFRunLoopTimerContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
+    copy_description: Option<extern "C" fn(*const c_void) -> *const c_void>,
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFRunLoopCommonModes: *const c_void;
@@ -100,11 +109,23 @@ extern "C" {
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *const c_void;
     fn CFURLCreateFromFileSystemRepresentation(alloc: *const c_void, buf: *const u8, len: isize, is_dir: bool) -> *const c_void;
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, enc: u32) -> *const c_void;
+    fn CFAbsoluteTimeGetCurrent() -> f64;
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopSourceCreate(alloc: *const c_void, order: isize, ctx: *mut CFRunLoopSourceContext) -> *mut c_void;
     fn CFRunLoopAddSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
     fn CFRunLoopSourceSignal(src: *mut c_void);
     fn CFRunLoopWakeUp(rl: *mut c_void);
+    fn CFRunLoopTimerCreate(
+        alloc: *const c_void,
+        fire_date: f64,
+        interval: f64,
+        flags: usize,
+        order: isize,
+        callout: extern "C" fn(*mut c_void, *mut c_void),
+        ctx: *mut CFRunLoopTimerContext,
+    ) -> *mut c_void;
+    fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
+    fn CFRunLoopTimerInvalidate(timer: *mut c_void);
 }
 
 /// Capture one of our windows (or, with `whole_screen`, every on-screen
@@ -1389,8 +1410,25 @@ impl TaskDialogRadioTarget {
 
 pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: bool) -> usize {
     let mut noop = |_ev: super::TaskDialogEvent| {};
-    task_dialog_alert_inline(0, caption, text, buttons, None, &[], None, None, false, critical, &mut noop)
-        .button_index
+    let mut noop_timer = |_ms: u32| false;
+    let mut origin = std::time::Instant::now();
+    task_dialog_alert_inline(
+        0,
+        caption,
+        text,
+        buttons,
+        None,
+        &[],
+        None,
+        None,
+        false,
+        critical,
+        &mut origin,
+        None,
+        &mut noop,
+        &mut noop_timer,
+    )
+    .button_index
 }
 
 fn apply_live_update_to_alert(
@@ -1639,6 +1677,50 @@ pub(super) fn task_dialog_alert_channel(
     let _ = tx.send(super::TaskDialogEvent::ButtonClicked(res));
 }
 
+struct InlineTimerCtx {
+    origin: *mut std::time::Instant,
+    cb: *mut dyn FnMut(u32) -> bool,
+}
+
+extern "C" fn inline_task_dialog_timer_cb(_timer: *mut c_void, info: *mut c_void) {
+    if info.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(info as *mut InlineTimerCtx) };
+    let now = std::time::Instant::now();
+    let elapsed_ms = unsafe {
+        now.saturating_duration_since(*ctx.origin)
+            .as_millis()
+            .min(u32::MAX as u128) as u32
+    };
+    let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        (*ctx.cb)(elapsed_ms)
+    }))
+    .unwrap_or(false);
+    if reset {
+        unsafe { *ctx.origin = std::time::Instant::now() };
+    }
+}
+
+struct InlineTimerGuard {
+    timer: *mut c_void,
+    ctx: *mut InlineTimerCtx,
+}
+
+impl Drop for InlineTimerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.timer.is_null() {
+                CFRunLoopTimerInvalidate(self.timer);
+                CFRelease(self.timer as *const c_void);
+            }
+            if !self.ctx.is_null() {
+                drop(Box::from_raw(self.ctx));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn task_dialog_alert_inline(
     session_id: u64,
@@ -1651,11 +1733,55 @@ pub(super) fn task_dialog_alert_inline(
     verification_text: Option<&str>,
     verification_checked: bool,
     critical: bool,
+    timer_origin: &mut std::time::Instant,
+    timer_interval: Option<std::time::Duration>,
     on_event: &mut dyn FnMut(super::TaskDialogEvent),
+    on_timer: &mut dyn FnMut(u32) -> bool,
 ) -> super::TaskDialogAlertResult {
-    // SAFETY: ACTIVE_TASK_DIALOG_ALERT is cleared by ActiveAlertGuard before this function returns.
+    // SAFETY: ACTIVE_TASK_DIALOG_ALERTS and InlineTimerGuard are both torn down before this returns.
     let cb_ptr: *mut dyn FnMut(super::TaskDialogEvent) =
         unsafe { std::mem::transmute::<&mut dyn FnMut(super::TaskDialogEvent), *mut dyn FnMut(super::TaskDialogEvent)>(on_event) };
+    let _timer_guard = timer_interval.and_then(|iv| unsafe {
+        let secs = iv.as_secs_f64().max(0.005);
+        let timer_cb_ptr: *mut dyn FnMut(u32) -> bool =
+            std::mem::transmute::<&mut dyn FnMut(u32) -> bool, *mut dyn FnMut(u32) -> bool>(on_timer);
+        let ctx_box = Box::into_raw(Box::new(InlineTimerCtx {
+            origin: timer_origin as *mut std::time::Instant,
+            cb: timer_cb_ptr,
+        }));
+        let mut cf_ctx = CFRunLoopTimerContext {
+            version: 0,
+            info: ctx_box as *mut c_void,
+            retain: None,
+            release: None,
+            copy_description: None,
+        };
+        let timer = CFRunLoopTimerCreate(
+            std::ptr::null(),
+            CFAbsoluteTimeGetCurrent() + secs,
+            secs,
+            0,
+            0,
+            inline_task_dialog_timer_cb,
+            &mut cf_ctx,
+        );
+        if timer.is_null() {
+            drop(Box::from_raw(ctx_box));
+            return None;
+        }
+        let rl = CFRunLoopGetCurrent();
+        CFRunLoopAddTimer(rl, timer, kCFRunLoopCommonModes);
+        let modal_mode = CFStringCreateWithCString(
+            std::ptr::null(),
+            c"NSModalPanelRunLoopMode".as_ptr(),
+            0x0800_0100,
+        );
+        if !modal_mode.is_null() {
+            CFRunLoopAddTimer(rl, timer, modal_mode);
+            CFRelease(modal_mode);
+        }
+        Some(InlineTimerGuard { timer, ctx: ctx_box })
+    });
     run_task_dialog_alert(
         session_id,
         caption,

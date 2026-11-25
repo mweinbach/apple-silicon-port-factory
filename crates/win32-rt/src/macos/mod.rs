@@ -476,17 +476,24 @@ pub struct TaskDialogLiveUpdate {
 }
 
 /// Service the owning Win32 thread's message queue (cross-thread `SendMessageW`
-/// sent items and any posted messages for `dialog_hwnd`) while waiting for live
-/// native modal events on `rx`.
+/// sent items and any posted messages for `dialog_hwnd`) and optional periodic
+/// `TDF_CALLBACK_TIMER` ticks while waiting for live native modal events on `rx`.
+/// `on_timer` receives elapsed milliseconds since `timer_origin` and returns
+/// `true` to reset `timer_origin` (matching `TDN_TIMER` returning `S_FALSE`).
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn pump_task_dialog_wait_loop<F>(
+pub(crate) fn pump_task_dialog_wait_loop<F, T>(
     dialog_hwnd: usize,
     rx: std::sync::mpsc::Receiver<TaskDialogEvent>,
+    timer_origin: &mut std::time::Instant,
+    timer_interval: Option<std::time::Duration>,
     on_event: &mut F,
+    on_timer: &mut T,
 ) -> Option<TaskDialogAlertResult>
 where
     F: FnMut(TaskDialogEvent),
+    T: FnMut(u32) -> bool,
 {
+    let mut next_tick = timer_interval.map(|iv| std::time::Instant::now() + iv);
     loop {
         unsafe {
             let mut msg = crate::user32::MSG::default();
@@ -503,7 +510,28 @@ where
                 crate::user32::message::DispatchMessageW(&msg);
             }
         }
-        match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+        let mut wait = std::time::Duration::from_millis(5);
+        if let (Some(interval), Some(due)) = (timer_interval, next_tick) {
+            let now = std::time::Instant::now();
+            if now >= due {
+                let elapsed_ms = now
+                    .saturating_duration_since(*timer_origin)
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
+                if on_timer(elapsed_ms) {
+                    *timer_origin = std::time::Instant::now();
+                }
+                next_tick = Some(std::time::Instant::now() + interval);
+                // Re-drain any messages sent by the timer callback (e.g. TDM_CLICK_BUTTON)
+                // before sleeping on `rx`.
+                continue;
+            }
+            let remaining = due.saturating_duration_since(now);
+            if remaining < wait {
+                wait = remaining;
+            }
+        }
+        match rx.recv_timeout(wait) {
             Ok(TaskDialogEvent::ButtonClicked(res)) => return Some(res),
             Ok(other) => on_event(other),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -514,11 +542,12 @@ where
 
 /// Show a modal task-dialog alert with push buttons plus optional radio buttons
 /// and verification checkbox, forwarding radio/checkbox selection changes live
-/// to `on_event` on the calling Win32 thread while the modal session is open.
+/// to `on_event` and optional `TDF_CALLBACK_TIMER` ticks to `on_timer` on the
+/// calling Win32 thread while the modal session is open.
 /// Also pumps cross-thread Win32 messages targeting `dialog_hwnd` while waiting.
 /// Returns `None` when headless / on iOS (no interactive selection UI available).
 #[allow(clippy::too_many_arguments)]
-pub fn task_dialog_alert<F>(
+pub fn task_dialog_alert<F, T>(
     session_id: u64,
     dialog_hwnd: usize,
     caption: String,
@@ -530,10 +559,14 @@ pub fn task_dialog_alert<F>(
     verification_text: Option<String>,
     verification_checked: bool,
     critical: bool,
+    timer_origin: &mut std::time::Instant,
+    timer_interval: Option<std::time::Duration>,
     mut on_event: F,
+    mut on_timer: T,
 ) -> Option<TaskDialogAlertResult>
 where
     F: FnMut(TaskDialogEvent),
+    T: FnMut(u32) -> bool,
 {
     #[cfg(test)]
     {
@@ -568,7 +601,10 @@ where
                 verification_text.as_deref(),
                 verification_checked,
                 critical,
+                timer_origin,
+                timer_interval,
                 &mut on_event,
+                &mut on_timer,
             ));
         }
         let (tx, rx) = std::sync::mpsc::channel::<TaskDialogEvent>();
@@ -587,7 +623,14 @@ where
                 tx,
             );
         });
-        pump_task_dialog_wait_loop(dialog_hwnd, rx, &mut on_event)
+        pump_task_dialog_wait_loop(
+            dialog_hwnd,
+            rx,
+            timer_origin,
+            timer_interval,
+            &mut on_event,
+            &mut on_timer,
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -603,7 +646,10 @@ where
             verification_text,
             verification_checked,
             critical,
+            timer_origin,
+            timer_interval,
             &mut on_event,
+            &mut on_timer,
         );
         None
     }

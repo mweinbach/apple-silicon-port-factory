@@ -234,14 +234,19 @@ const TDCBF_RETRY_BUTTON: u32 = 0x0010;
 const TDCBF_CLOSE_BUTTON: u32 = 0x0020;
 
 const TDF_VERIFICATION_FLAG_CHECKED: u32 = 0x0100;
+const TDF_CALLBACK_TIMER: u32 = 0x0800;
 const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
 
 const TDN_CREATED: u32 = 0;
 const TDN_BUTTON_CLICKED: u32 = 2;
+const TDN_TIMER: u32 = 4;
 const TDN_DESTROYED: u32 = 5;
 const TDN_RADIO_BUTTON_CLICKED: u32 = 6;
 const TDN_DIALOG_CONSTRUCTED: u32 = 7;
 const TDN_VERIFICATION_CLICKED: u32 = 8;
+
+/// Standard Windows TaskDialog `TDF_CALLBACK_TIMER` notification period (~200 ms).
+const TASK_DIALOG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 const TDM_CLICK_BUTTON: u32 = crate::user32::wm::USER + 102;
 const TDM_SET_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 108;
@@ -679,6 +684,10 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         }
     };
 
+    let callback_timer = (cfg.dw_flags & TDF_CALLBACK_TIMER) != 0 && cfg.pf_callback != 0;
+    let timer_interval = callback_timer.then_some(TASK_DIALOG_TIMER_INTERVAL);
+    let mut timer_origin = std::time::Instant::now();
+
     let _ = notify(TDN_DIALOG_CONSTRUCTED, 0);
     let _ = notify(TDN_CREATED, 0);
 
@@ -719,6 +728,8 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             verification_text.clone(),
             cur_verified,
             critical,
+            &mut timer_origin,
+            timer_interval,
             |ev| match ev {
                 crate::macos::TaskDialogEvent::RadioSelected(ridx) => {
                     let rid_opt = {
@@ -750,6 +761,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 }
                 crate::macos::TaskDialogEvent::ButtonClicked(_) => {}
             },
+            |elapsed_ms| notify(TDN_TIMER, elapsed_ms as u64) == S_FALSE_HR,
         );
         // Consume any programmatic TDM_CLICK_BUTTON triggered while the native modal was open
         // so it is delivered exactly once and never replayed if TDN_BUTTON_CLICKED returns S_FALSE.
@@ -774,13 +786,17 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     .unwrap_or(buttons[0].0)
             });
             (bid, true)
-        } else if buttons.len() == 1 && !has_selection_controls {
-            // Pure single-button informational dialog with no selection controls can
-            // dismiss in headless mode (matching MessageBox MB_OK).
+        } else if buttons.len() == 1 && !has_selection_controls && !callback_timer {
+            // Pure single-button informational dialog with no selection controls or timer
+            // can dismiss in headless mode (matching MessageBox MB_OK).
             (buttons[0].0, false)
         } else {
-            // Multi-button prompts or dialogs with radio buttons / verification checkboxes
-            // require an interactive desktop so we never fabricate user selections.
+            // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
+            // TDF_CALLBACK_TIMER require an interactive desktop so we never fabricate user
+            // selections or silently skip timer callbacks.
+            if callback_timer {
+                log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
+            }
             let _ = notify(TDN_DESTROYED, 0);
             return HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION;
         };
@@ -1773,11 +1789,133 @@ mod tests {
                 let _ = crate::user32::message::SendMessageW(dlg_hwnd as HWND, TDM_CLICK_BUTTON, 1, 0);
             });
             let mut noop = |_ev: crate::macos::TaskDialogEvent| {};
-            let res = crate::macos::pump_task_dialog_wait_loop(dlg_hwnd, rx, &mut noop);
+            let mut noop_timer = |_ms: u32| false;
+            let mut origin = std::time::Instant::now();
+            let res = crate::macos::pump_task_dialog_wait_loop(
+                dlg_hwnd,
+                rx,
+                &mut origin,
+                None,
+                &mut noop,
+                &mut noop_timer,
+            );
             worker.join().unwrap();
             crate::macos::set_test_task_dialog_updater(None);
             assert_eq!(res.map(|r| r.button_index), Some(0));
             assert_eq!(saw_text.lock().unwrap().as_str(), "From Worker Thread");
+
+            // 3. TDF_CALLBACK_TIMER: pump_task_dialog_wait_loop delivers periodic TDN_TIMER ticks
+            //    with elapsed ms, resets tick origin when callback returns S_FALSE, and allows the
+            //    timer callback to dismiss the dialog live via TDM_CLICK_BUTTON.
+            let timer_hwnd = crate::user32::window::create_virtual_dialog_hwnd(
+                "#32770_TaskDialog",
+                "TimerTitle",
+                0,
+                task_dialog_wndproc_va(),
+            );
+            let timer_sid = NEXT_TASK_DIALOG_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            active_task_dialogs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    timer_hwnd,
+                    ActiveTaskDialog {
+                        session_id: timer_sid,
+                        modal_open: true,
+                        hinst: 0,
+                        pf_callback: 0,
+                        lp_callback_data: 0,
+                        caption: "TimerTitle".to_string(),
+                        main_inst: String::new(),
+                        content: "Waiting".to_string(),
+                        expanded: String::new(),
+                        footer: String::new(),
+                        buttons: vec![(1, "OK".to_string())],
+                        radios: Vec::new(),
+                        selected_radio_idx: None,
+                        has_verification: false,
+                        verified: false,
+                        pending_click_button: None,
+                    },
+                );
+            let _timer_guard = TaskDialogHwndGuard { hwnd: timer_hwnd };
+            let (ttx, trx) = std::sync::mpsc::channel::<crate::macos::TaskDialogEvent>();
+            let ttx_upd = ttx.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |u_sid, upd| {
+                if u_sid == timer_sid {
+                    if let Some(bidx) = upd.click_button_idx {
+                        let _ = ttx_upd.send(crate::macos::TaskDialogEvent::ButtonClicked(
+                            crate::macos::TaskDialogAlertResult {
+                                button_index: bidx,
+                                radio_index: None,
+                                verified: false,
+                            },
+                        ));
+                    }
+                }
+            })));
+
+            let mut ticks: Vec<u32> = Vec::new();
+            let mut t_origin = std::time::Instant::now() - std::time::Duration::from_millis(50);
+            let mut on_timer = |elapsed_ms: u32| -> bool {
+                ticks.push(elapsed_ms);
+                match ticks.len() {
+                    1 => false, // S_OK: keep accumulating elapsed ms
+                    2 => true,  // S_FALSE: reset tick origin
+                    _ => {
+                        let _ = crate::user32::message::SendMessageW(
+                            timer_hwnd as HWND,
+                            TDM_CLICK_BUTTON,
+                            1,
+                            0,
+                        );
+                        false
+                    }
+                }
+            };
+            let timer_res = crate::macos::pump_task_dialog_wait_loop(
+                timer_hwnd,
+                trx,
+                &mut t_origin,
+                Some(std::time::Duration::from_millis(20)),
+                &mut noop,
+                &mut on_timer,
+            );
+            crate::macos::set_test_task_dialog_updater(None);
+            assert_eq!(timer_res.map(|r| r.button_index), Some(0));
+            assert_eq!(ticks.len(), 3, "expected 3 timer ticks before dismissal: {ticks:?}");
+            assert!(ticks[0] >= 50, "first tick should include initial elapsed time: {ticks:?}");
+            assert!(ticks[1] > ticks[0], "second tick should increase without reset: {ticks:?}");
+            assert!(
+                ticks[2] < ticks[1],
+                "third tick should reset after S_FALSE on second tick: {ticks:?}"
+            );
+
+            // 4. Headless TaskDialogIndirect with TDF_CALLBACK_TIMER must refuse honestly
+            //    rather than silently dismissing without running the timer.
+            unsafe extern "win64" fn noop_td_cb(
+                _hwnd: HWND,
+                _msg: u32,
+                _wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                S_OK
+            }
+            let mut timer_cfg: TaskDialogConfig = std::mem::zeroed();
+            timer_cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            timer_cfg.dw_flags = TDF_CALLBACK_TIMER;
+            timer_cfg.dw_common_buttons = TDCBF_OK_BUTTON;
+            timer_cfg.pf_callback = noop_td_cb as *const () as usize;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &timer_cfg as *const TaskDialogConfig as *const u8,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
+            );
         })
         .join()
         .unwrap();
