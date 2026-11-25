@@ -11,7 +11,7 @@
 //! * One process-wide recursive lock serializes all stream operations and
 //!   backs `_lock_file`/`_unlock_file` (simple, deadlock-free).
 
-use super::errno::{self, EACCES, EBADF, EINVAL, ENOENT, EPIPE};
+use super::errno::{self, EACCES, EBADF, EILSEQ, EINVAL, ENOENT, EPIPE};
 use crate::strings::{from_ansi, from_wide};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -161,6 +161,15 @@ fn store_u8_pending(fd: i32, pending: U8Pending) {
     if !pending.raw.is_empty() || pending.low_surrogate.is_some() {
         FD_U8_PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(fd, pending);
     }
+}
+
+fn has_u8_pending(fd: i32) -> bool {
+    FD_U8_PENDING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&fd))
+        .is_some_and(|p| !p.raw.is_empty() || p.low_surrogate.is_some())
 }
 static FMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(O_TEXT);
 static COMMODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -604,14 +613,28 @@ unsafe fn raw_write_all(fd: i32, out: &[u8]) -> bool {
 
 /// Raw read with CRLF->LF and Unicode (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) translation.
 pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
+    read_fd_tracked(fd, buf, n, false).0
+}
+
+/// Like [`read_fd`], and when `track_pos` is true on a seekable translated descriptor,
+/// also returns a `len + 1` table mapping each translated buffer index to the physical
+/// file byte offset where its source character starts (with the final entry equal to the
+/// physical offset after the last translated byte).
+unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
     let info = fd_info(fd);
     match info.mode {
-        TextMode::Binary => raw_read_retry(fd, buf, n),
+        TextMode::Binary => (raw_read_retry(fd, buf, n), Vec::new()),
         TextMode::AnsiText => {
-            let r = raw_read_retry(fd, buf, n);
-            if r <= 0 || info.raw {
-                return r;
+            if info.raw {
+                return (raw_read_retry(fd, buf, n), Vec::new());
             }
+            let start_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let r = raw_read_retry(fd, buf, n);
+            if r <= 0 {
+                return (r, Vec::new());
+            }
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(r as usize + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
             let s = std::slice::from_raw_parts_mut(buf, r as usize);
             let mut w = 0;
             let mut i = 0;
@@ -619,7 +642,12 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 if s[i] == b'\r' {
                     if i + 1 < s.len() {
                         if s[i + 1] == b'\n' {
-                            i += 1;
+                            if start_pos >= 0 {
+                                src_pos.push(start_pos + i as i64);
+                            }
+                            s[w] = b'\n';
+                            w += 1;
+                            i += 2;
                             continue;
                         }
                     } else {
@@ -627,33 +655,44 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                         let k = libc::read(fd, &mut nb as *mut u8 as *mut c_void, 1);
                         if k == 1 {
                             if nb == b'\n' {
+                                if start_pos >= 0 {
+                                    src_pos.push(start_pos + i as i64);
+                                }
                                 s[w] = b'\n';
                                 w += 1;
                                 i += 1;
+                                extra_fd = 1;
                                 continue;
                             }
                             libc::lseek(fd, -1, libc::SEEK_CUR);
                         }
                     }
                 }
+                if start_pos >= 0 {
+                    src_pos.push(start_pos + i as i64);
+                }
                 s[w] = s[i];
                 w += 1;
                 i += 1;
             }
-            w as isize
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (r as usize + extra_fd) as i64);
+            }
+            (w as isize, src_pos)
         }
         TextMode::Utf16Le => {
             // MSVC UCRT requires even byte count for UTF-16 Unicode modes.
             if n % 2 != 0 {
                 errno::set(EINVAL);
-                return -1;
+                return (-1, Vec::new());
             }
             if n == 0 {
-                return 0;
+                return (0, Vec::new());
             }
+            let start_pos = if track_pos && !info.raw { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
             let r = raw_read_retry(fd, buf, n);
             if r <= 0 {
-                return r;
+                return (r, Vec::new());
             }
             // If an odd byte arrived, read 1 more byte to complete the UTF-16LE code unit.
             let mut total = r as usize;
@@ -667,18 +706,29 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 }
             }
             if info.raw {
-                return total as isize;
+                return (total as isize, Vec::new());
             }
             let units = total / 2;
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(total + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
             let mut w = 0usize;
             let mut i = 0usize;
             while i < units {
+                let unit_phys = start_pos + (i * 2) as i64;
                 let u = u16::from_le_bytes([*buf.add(i * 2), *buf.add(i * 2 + 1)]);
                 if u == 0x000D {
                     if i + 1 < units {
                         let next_u = u16::from_le_bytes([*buf.add((i + 1) * 2), *buf.add((i + 1) * 2 + 1)]);
                         if next_u == 0x000A {
-                            i += 1;
+                            let lf = 0x000Au16.to_le_bytes();
+                            *buf.add(w * 2) = lf[0];
+                            *buf.add(w * 2 + 1) = lf[1];
+                            if start_pos >= 0 {
+                                src_pos.push(unit_phys);
+                                src_pos.push(unit_phys);
+                            }
+                            w += 1;
+                            i += 2;
                             continue;
                         }
                     } else {
@@ -689,8 +739,13 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                                 let lf = 0x000Au16.to_le_bytes();
                                 *buf.add(w * 2) = lf[0];
                                 *buf.add(w * 2 + 1) = lf[1];
+                                if start_pos >= 0 {
+                                    src_pos.push(unit_phys);
+                                    src_pos.push(unit_phys);
+                                }
                                 w += 1;
                                 i += 1;
+                                extra_fd = 2;
                                 continue;
                             }
                             libc::lseek(fd, -2, libc::SEEK_CUR);
@@ -702,24 +757,39 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 let bytes = u.to_le_bytes();
                 *buf.add(w * 2) = bytes[0];
                 *buf.add(w * 2 + 1) = bytes[1];
+                if start_pos >= 0 {
+                    src_pos.push(unit_phys);
+                    src_pos.push(unit_phys);
+                }
                 w += 1;
                 i += 1;
             }
-            (w * 2) as isize
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (units * 2 + extra_fd) as i64);
+            }
+            ((w * 2) as isize, src_pos)
         }
         TextMode::Utf8 => {
             if n % 2 != 0 {
                 errno::set(EINVAL);
-                return -1;
+                return (-1, Vec::new());
             }
             if n == 0 {
-                return 0;
+                return (0, Vec::new());
             }
             let max_u16 = n / 2;
             let mut pend = take_u8_pending(fd);
+            let raw_fd_pos = if track_pos { libc::lseek(fd, 0, libc::SEEK_CUR) } else { -1 };
+            let start_pos = if raw_fd_pos >= 0 { (raw_fd_pos - pend.raw.len() as i64).max(0) } else { -1 };
+            let mut src_pos = if start_pos >= 0 { Vec::with_capacity(n + 1) } else { Vec::new() };
+            let mut extra_fd = 0usize;
             let mut out_u16: Vec<u16> = Vec::with_capacity(max_u16);
             if let Some(lo) = pend.low_surrogate.take() {
                 out_u16.push(lo);
+                if start_pos >= 0 {
+                    src_pos.push(start_pos);
+                    src_pos.push(start_pos);
+                }
             }
             let mut raw_buf = std::mem::take(&mut pend.raw);
             if out_u16.len() < max_u16 && raw_buf.is_empty() {
@@ -727,24 +797,34 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 let r = raw_read_retry(fd, tmp.as_mut_ptr(), tmp.len());
                 if r < 0 {
                     store_u8_pending(fd, U8Pending { raw: raw_buf, low_surrogate: None });
-                    return if out_u16.is_empty() { -1 } else {
+                    return if out_u16.is_empty() {
+                        (-1, Vec::new())
+                    } else {
                         for (idx, u) in out_u16.iter().enumerate() {
                             let bytes = u.to_le_bytes();
                             *buf.add(idx * 2) = bytes[0];
                             *buf.add(idx * 2 + 1) = bytes[1];
                         }
-                        (out_u16.len() * 2) as isize
+                        if start_pos >= 0 {
+                            src_pos.push(start_pos);
+                        }
+                        ((out_u16.len() * 2) as isize, src_pos)
                     };
                 }
                 raw_buf.extend_from_slice(&tmp[..r as usize]);
             }
             let mut consumed = 0usize;
             while consumed < raw_buf.len() && out_u16.len() < max_u16 {
+                let char_phys = start_pos + (consumed + extra_fd) as i64;
                 let rem = &raw_buf[consumed..];
                 if !info.raw && rem[0] == b'\r' {
                     if rem.len() >= 2 {
                         if rem[1] == b'\n' {
                             out_u16.push(b'\n' as u16);
+                            if start_pos >= 0 {
+                                src_pos.push(char_phys);
+                                src_pos.push(char_phys);
+                            }
                             consumed += 2;
                             continue;
                         }
@@ -754,11 +834,20 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                         if pk == 1 {
                             if nb == b'\n' {
                                 out_u16.push(b'\n' as u16);
+                                if start_pos >= 0 {
+                                    src_pos.push(char_phys);
+                                    src_pos.push(char_phys);
+                                }
                                 consumed += 1;
+                                extra_fd += 1;
                                 continue;
                             }
                             raw_buf.push(nb);
                             out_u16.push(b'\r' as u16);
+                            if start_pos >= 0 {
+                                src_pos.push(char_phys);
+                                src_pos.push(char_phys);
+                            }
                             consumed += 1;
                             continue;
                         }
@@ -787,6 +876,10 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                         }
                         // EOF mid-sequence: emit replacement char and consume truncated bytes.
                         out_u16.push(0xFFFD);
+                        if start_pos >= 0 {
+                            src_pos.push(char_phys);
+                            src_pos.push(char_phys);
+                        }
                         consumed = raw_buf.len();
                     }
                     break;
@@ -799,11 +892,20 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                     // Emit the high surrogate now and retain the low surrogate for the next read
                     // so small (2-byte) or unbuffered reads never stall with 0 bytes (false EOF).
                     out_u16.push(enc[0]);
+                    if start_pos >= 0 {
+                        src_pos.push(char_phys);
+                        src_pos.push(char_phys);
+                    }
                     pend.low_surrogate = Some(enc[1]);
                     consumed += need;
                     break;
                 }
                 out_u16.extend_from_slice(enc);
+                if start_pos >= 0 {
+                    for _ in 0..(enc.len() * 2) {
+                        src_pos.push(char_phys);
+                    }
+                }
                 consumed += need;
             }
             if consumed < raw_buf.len() {
@@ -820,7 +922,10 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
                 *buf.add(idx * 2) = bytes[0];
                 *buf.add(idx * 2 + 1) = bytes[1];
             }
-            (out_u16.len() * 2) as isize
+            if start_pos >= 0 {
+                src_pos.push(start_pos + (consumed + extra_fd) as i64);
+            }
+            ((out_u16.len() * 2) as isize, src_pos)
         }
     }
 }
@@ -1124,6 +1229,9 @@ struct Stream {
     wbuf: Vec<u8>,
     /// Read-ahead data (already translated); `rpos` = next byte.
     rbuf: Vec<u8>,
+    /// Physical file byte offset for each index in `rbuf` (length `rbuf.len() + 1`
+    /// when populated for seekable translated modes, empty otherwise).
+    rbuf_src_pos: Vec<i64>,
     rpos: usize,
     /// Pushed-back bytes (ungetc), LIFO.
     unget: Vec<u8>,
@@ -1164,6 +1272,7 @@ fn with_table<R>(f: impl FnOnce(&mut StreamTable) -> R) -> R {
                     err: false,
                     wbuf: Vec::new(),
                     rbuf: Vec::new(),
+                    rbuf_src_pos: Vec::new(),
                     rpos: 0,
                     unget: Vec::new(),
                     // stderr unbuffered; stdout line-buffered on a tty.
@@ -1205,15 +1314,38 @@ impl Stream {
         true
     }
 
+    /// Logical physical-file offset corresponding to the current read position,
+    /// using the per-byte source-offset table when `rbuf` holds translated input.
+    fn logical_read_pos(&self) -> Option<i64> {
+        if !self.rbuf_src_pos.is_empty() && self.rpos < self.rbuf_src_pos.len() {
+            if self.unget.is_empty() {
+                return Some(self.rbuf_src_pos[self.rpos]);
+            }
+            if self.unget.len() <= self.rpos {
+                return Some(self.rbuf_src_pos[self.rpos - self.unget.len()]);
+            }
+            let extra = (self.unget.len() - self.rpos) as i64;
+            return Some((self.rbuf_src_pos[0] - extra).max(0));
+        }
+        None
+    }
+
     /// Drop read-ahead, seeking the fd back so its position is logical.
     unsafe fn discard_read(&mut self) {
-        let pending = (self.rbuf.len() - self.rpos) + self.unget.len();
-        if pending > 0 {
-            // Translated data: exact only for binary streams (same as Windows'
-            // text-mode caveats for ftell).
-            libc::lseek(self.fd, -(pending as i64), libc::SEEK_CUR);
+        if let Some(target) = self.logical_read_pos() {
+            if self.rpos < self.rbuf.len() || !self.unget.is_empty() || has_u8_pending(self.fd) {
+                libc::lseek(self.fd, target, libc::SEEK_SET);
+                clear_u8_pending(self.fd);
+            }
+        } else {
+            let pending = (self.rbuf.len() - self.rpos) + self.unget.len();
+            if pending > 0 {
+                libc::lseek(self.fd, -(pending as i64), libc::SEEK_CUR);
+                clear_u8_pending(self.fd);
+            }
         }
         self.rbuf.clear();
+        self.rbuf_src_pos.clear();
         self.rpos = 0;
         self.unget.clear();
     }
@@ -1262,10 +1394,12 @@ impl Stream {
             (self.bufsize.max(512)) & !1
         };
         self.rbuf.resize(cap, 0);
+        self.rbuf_src_pos.clear();
         self.rpos = 0;
-        let n = read_fd(self.fd, self.rbuf.as_mut_ptr(), cap);
+        let (n, src_pos) = read_fd_tracked(self.fd, self.rbuf.as_mut_ptr(), cap, true);
         if n <= 0 {
             self.rbuf.clear();
+            self.rbuf_src_pos.clear();
             if n == 0 {
                 self.eof = true;
             } else {
@@ -1274,6 +1408,7 @@ impl Stream {
             return false;
         }
         self.rbuf.truncate(n as usize);
+        self.rbuf_src_pos = src_pos;
         true
     }
 
@@ -1318,6 +1453,9 @@ impl Stream {
                 if !self.wbuf.is_empty() {
                     self.flush();
                 }
+                self.rbuf.clear();
+                self.rbuf_src_pos.clear();
+                self.rpos = 0;
                 let r = read_fd(self.fd, out[n..].as_mut_ptr(), out.len() - n);
                 if r <= 0 {
                     if r == 0 {
@@ -1338,12 +1476,25 @@ impl Stream {
     }
 
     unsafe fn tell(&mut self) -> i64 {
+        if !self.wbuf.is_empty() && !self.flush() {
+            return -1;
+        }
+        if let Some(p) = self.logical_read_pos() {
+            return p;
+        }
         let pos = libc::lseek(self.fd, 0, libc::SEEK_CUR);
         if pos < 0 {
             errno::set_from_host();
             return -1;
         }
-        pos + self.wbuf.len() as i64 - (self.rbuf.len() - self.rpos) as i64 - self.unget.len() as i64
+        let pend_u8 = FD_U8_PENDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&self.fd))
+            .map(|p| p.raw.len() as i64)
+            .unwrap_or(0);
+        pos - pend_u8 - (self.rbuf.len() - self.rpos) as i64 - self.unget.len() as i64
     }
 
     unsafe fn seek(&mut self, off: i64, whence: i32) -> i32 {
@@ -1352,18 +1503,22 @@ impl Stream {
         }
         let (off, whence) = if whence == libc::SEEK_CUR {
             let cur = self.tell();
+            if cur < 0 {
+                return -1;
+            }
             (cur + off, libc::SEEK_SET)
         } else {
             (off, whence)
         };
-        self.rbuf.clear();
-        self.rpos = 0;
-        self.unget.clear();
-        clear_u8_pending(self.fd);
         if libc::lseek(self.fd, off, whence) < 0 {
             errno::set_from_host();
             return -1;
         }
+        self.rbuf.clear();
+        self.rbuf_src_pos.clear();
+        self.rpos = 0;
+        self.unget.clear();
+        clear_u8_pending(self.fd);
         self.eof = false;
         0
     }
@@ -1485,6 +1640,7 @@ fn new_stream(fd: i32, mf: &ModeFlags) -> *mut FILE {
                 err: false,
                 wbuf: Vec::new(),
                 rbuf: Vec::new(),
+                rbuf_src_pos: Vec::new(),
                 rpos: 0,
                 unget: Vec::new(),
                 mode: BufMode::Full,
@@ -1800,23 +1956,63 @@ pub unsafe extern "win64" fn fgetwc(fp: *mut FILE) -> u32 {
             return Some(u16::from_le_bytes([lo, hi]) as u32);
         }
         let b0 = s.getc()?;
-        if b0 < 0x80 || super::locale::c_locale_active() {
+        let cp = super::locale::mb_cp();
+        if b0 < 0x80 || cp == 0 {
             return Some(b0 as u32);
         }
-        // UTF-8 multibyte (our locale's codepage is 65001).
-        let need = if b0 >= 0xF0 {
-            3
-        } else if b0 >= 0xE0 {
-            2
+        if cp == 65001 {
+            let need = match b0 {
+                0xC2..=0xDF => 1,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF4 => 3,
+                _ => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    return None;
+                }
+            };
+            let mut v = vec![b0];
+            for _ in 0..need {
+                match s.getc() {
+                    Some(b) => v.push(b),
+                    None => {
+                        s.err = true;
+                        errno::set(EILSEQ);
+                        return None;
+                    }
+                }
+            }
+            match std::str::from_utf8(&v) {
+                Ok(st) => st.encode_utf16().next().map(|c| c as u32),
+                Err(_) => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    None
+                }
+            }
         } else {
-            1
-        };
-        let mut v = vec![b0];
-        for _ in 0..need {
-            v.push(s.getc()?);
+            let is_lead = crate::kernel32::string::IsDBCSLeadByteEx(cp, b0) != 0;
+            let bytes = if is_lead {
+                match s.getc() {
+                    Some(b1) => vec![b0, b1],
+                    None => {
+                        s.err = true;
+                        errno::set(EILSEQ);
+                        return None;
+                    }
+                }
+            } else {
+                vec![b0]
+            };
+            match crate::kernel32::string::decode_cp_to_utf16(cp, &bytes) {
+                Ok(w) if !w.is_empty() && !w.contains(&0xFFFD) => Some(w[0] as u32),
+                _ => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    None
+                }
+            }
         }
-        let st = String::from_utf8_lossy(&v);
-        st.encode_utf16().next().map(|c| c as u32)
     });
     r.flatten().unwrap_or(WEOF)
 }
@@ -1831,17 +2027,55 @@ fn stream_is_unicode(fp: *mut FILE) -> bool {
     with_stream(fp as *mut c_void, |s| fd_info(s.fd).mode.is_unicode()).unwrap_or(false)
 }
 
+/// Write wide code units to a `FILE*` stream (used by `fputws` and `vfwprintf`).
+/// Unicode streams (`_O_WTEXT`/`_O_U16TEXT`/`_O_U8TEXT`) receive UTF-16LE bytes;
+/// narrow text/binary streams encode via the active CRT `LC_CTYPE` code page.
+pub unsafe fn write_stream_wide(fp: *mut c_void, units: &[u16]) -> i32 {
+    let _l = Locked::new();
+    with_stream(fp, |st| {
+        let bytes = if fd_info(st.fd).mode.is_unicode() {
+            let mut out = Vec::with_capacity(units.len() * 2);
+            for &u in units {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out
+        } else {
+            match super::convert::wc_encode_slice(units) {
+                Ok(b) => b,
+                Err(()) => {
+                    st.err = true;
+                    errno::set(EILSEQ);
+                    return -1;
+                }
+            }
+        };
+        if st.write(&bytes) == bytes.len() {
+            units.len() as i32
+        } else {
+            -1
+        }
+    })
+    .unwrap_or(-1)
+}
+
 pub unsafe extern "win64" fn fputwc(c: u16, fp: *mut FILE) -> u32 {
     let _l = Locked::new();
-    let unicode = stream_is_unicode(fp);
-    let bytes: Vec<u8> = if unicode {
-        c.to_le_bytes().to_vec()
-    } else if c < 0x80 || super::locale::c_locale_active() && c < 0x100 {
-        vec![c as u8]
-    } else {
-        String::from_utf16_lossy(&[c]).into_bytes()
-    };
-    let ok = with_stream(fp as *mut c_void, |s| s.write(&bytes) == bytes.len()).unwrap_or(false);
+    let ok = with_stream(fp as *mut c_void, |s| {
+        let bytes = if fd_info(s.fd).mode.is_unicode() {
+            c.to_le_bytes().to_vec()
+        } else {
+            match super::convert::wc_encode(c) {
+                Ok(b) => b,
+                Err(()) => {
+                    s.err = true;
+                    errno::set(EILSEQ);
+                    return false;
+                }
+            }
+        };
+        s.write(&bytes) == bytes.len()
+    })
+    .unwrap_or(false);
     if ok { c as u32 } else { WEOF }
 }
 pub unsafe extern "win64" fn putwc(c: u16, fp: *mut FILE) -> u32 {
@@ -1856,20 +2090,8 @@ pub unsafe extern "win64" fn fputws(s: *const u16, fp: *mut FILE) -> i32 {
         errno::set(EINVAL);
         return -1;
     }
-    let _l = Locked::new();
-    let unicode = stream_is_unicode(fp);
-    let bytes: Vec<u8> = if unicode {
-        let units = crate::strings::read_wide_units_z(s, crate::strings::DEFAULT_MAX_STR_LEN);
-        let mut out = Vec::with_capacity(units.len() * 2);
-        for u in units {
-            out.extend_from_slice(&u.to_le_bytes());
-        }
-        out
-    } else {
-        from_wide(s).into_bytes()
-    };
-    let ok = with_stream(fp as *mut c_void, |st| st.write(&bytes) == bytes.len()).unwrap_or(false);
-    if ok { 0 } else { -1 }
+    let units = crate::strings::read_wide_units_z(s, crate::strings::DEFAULT_MAX_STR_LEN);
+    if write_stream_wide(fp as *mut c_void, &units) < 0 { -1 } else { 0 }
 }
 
 pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
@@ -1880,10 +2102,11 @@ pub unsafe extern "win64" fn ungetwc(c: u32, fp: *mut FILE) -> u32 {
     let unicode = stream_is_unicode(fp);
     let bytes: Vec<u8> = if unicode {
         (c as u16).to_le_bytes().to_vec()
-    } else if c < 0x80 {
-        vec![c as u8]
     } else {
-        String::from_utf16_lossy(&[c as u16]).into_bytes()
+        match super::convert::wc_encode(c as u16) {
+            Ok(b) => b,
+            Err(()) => return WEOF,
+        }
     };
     with_stream(fp as *mut c_void, |s| {
         for b in bytes.iter().rev() {
@@ -2977,6 +3200,82 @@ mod tests {
             let b_ch = u16::from_le_bytes(u);
             assert_eq!(String::from_utf16_lossy(&[hi, lo, b_ch]), "😀B");
             assert_eq!(_close(fd_s), 0);
+
+            // 9. Buffered ccs=UTF-8 ftell/fgetpos/fseek/fsetpos and read->write discard_read
+            //    track physical UTF-8 byte offsets accurately across BOM, multibyte, and CRLF.
+            std::fs::write(dir.join("bom_pos.txt"), "\u{FEFF}ABCDαβ\r\n😀Z".as_bytes()).unwrap();
+            let f = fopen(b"U:\\bom_pos.txt\0".as_ptr(), b"r+, ccs=UTF-8\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), 'A' as u32);
+            let pos_b = ftell(f);
+            assert_eq!(pos_b, 4); // 3-byte BOM + 1-byte 'A'
+            let mut gpos_b = 0i64;
+            assert_eq!(fgetpos(f, &mut gpos_b), 0);
+            assert_eq!(gpos_b, 4);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            assert_eq!(fgetwc(f), 'C' as u32);
+            assert_eq!(fgetwc(f), 'D' as u32);
+            assert_eq!(fgetwc(f), 'α' as u32);
+            let pos_beta = ftell(f);
+            assert_eq!(pos_beta, 9); // 3 + 4 + 2('α')
+            assert_eq!(fgetwc(f), 'β' as u32);
+            assert_eq!(fgetwc(f), '\n' as u32);
+            let pos_emoji = ftell(f);
+            assert_eq!(pos_emoji, 13); // 9 + 2('β') + 2("\r\n")
+            // Restore saved position before 'B' via fsetpos -> reads 'B' without BOM corruption.
+            assert_eq!(fsetpos(f, &gpos_b), 0);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            // Restore saved position before '😀' via fseek -> reads surrogate pair + 'Z'.
+            assert_eq!(fseek(f, pos_emoji, 0), 0);
+            let em_hi = fgetwc(f) as u16;
+            let em_lo = fgetwc(f) as u16;
+            let z_ch = fgetwc(f) as u16;
+            assert_eq!(String::from_utf16_lossy(&[em_hi, em_lo, z_ch]), "😀Z");
+            // Read-then-write (discard_read) on r+ ccs=UTF-8 repositions at exact physical offset.
+            assert_eq!(fseek(f, pos_b, 0), 0);
+            assert_eq!(fgetwc(f), 'B' as u32); // consumes 'B' (offset 5), buffers rest
+            assert_eq!(fputwc('X' as u16, f), 'X' as u32); // overwrites 'C' at physical offset 5
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(dir.join("bom_pos.txt")).unwrap(), "\u{FEFF}ABXDαβ\r\n😀Z".as_bytes());
+
+            // 10. Non-Unicode wide text stdio honors the active LC_CTYPE code page (CP1252 / CP932).
+            assert!(!crate::ucrt::locale::setlocale(0, b"de-DE\0".as_ptr()).is_null());
+            let f = fopen(b"U:\\cp1252.txt\0".as_ptr(), b"w\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fputwc('€' as u16, f), '€' as u32);
+            assert_eq!(fputwc('A' as u16, f), 'A' as u32);
+            let w_euro = crate::strings::to_wide_z("€B");
+            assert_eq!(fputws(w_euro.as_ptr(), f), 0);
+            assert_eq!(fclose(f), 0);
+            // CP1252 encodes '€' as single byte 0x80 (not UTF-8 E2 82 AC).
+            assert_eq!(std::fs::read(dir.join("cp1252.txt")).unwrap(), vec![0x80, b'A', 0x80, b'B']);
+
+            let f = fopen(b"U:\\cp1252.txt\0".as_ptr(), b"r\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), 'A' as u32);
+            assert_eq!(ungetwc('€' as u32, f), '€' as u32);
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), '€' as u32);
+            assert_eq!(fgetwc(f), 'B' as u32);
+            assert_eq!(fgetwc(f), WEOF);
+            assert_eq!(fclose(f), 0);
+
+            // DBCS locale (ja-JP -> CP932) roundtrip via fputwc/fgetwc.
+            assert!(!crate::ucrt::locale::setlocale(0, b"ja-JP\0".as_ptr()).is_null());
+            let f = fopen(b"U:\\cp932.txt\0".as_ptr(), b"w\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fputwc('あ' as u16, f), 'あ' as u32);
+            assert_eq!(fputwc('Z' as u16, f), 'Z' as u32);
+            assert_eq!(fclose(f), 0);
+            assert_eq!(std::fs::read(dir.join("cp932.txt")).unwrap(), vec![0x82, 0xA0, b'Z']);
+            let f = fopen(b"U:\\cp932.txt\0".as_ptr(), b"r\0".as_ptr());
+            assert!(!f.is_null());
+            assert_eq!(fgetwc(f), 'あ' as u32);
+            assert_eq!(fgetwc(f), 'Z' as u32);
+            assert_eq!(fclose(f), 0);
+
+            assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
         }
 
         let _ = std::fs::remove_dir_all(&dir);

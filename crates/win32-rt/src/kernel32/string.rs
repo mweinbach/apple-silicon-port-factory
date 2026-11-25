@@ -75,6 +75,7 @@ mod icu {
 
     pub const UCOL_ALTERNATE_HANDLING: i32 = 1;
     pub const UCOL_CASE_FIRST: i32 = 2;
+    pub const UCOL_CASE_LEVEL: i32 = 3;
     pub const UCOL_STRENGTH: i32 = 5;
     pub const UCOL_NUMERIC_COLLATION: i32 = 7;
 
@@ -124,6 +125,7 @@ mod icu {
         pub ucurr_get_name: unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16,
         pub ucol_open: unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void,
         pub ucol_set_attribute: unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32),
+        pub ucol_strcoll: unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32,
         pub ucol_get_sort_key: unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32,
         pub ucol_close: unsafe extern "C" fn(*mut c_void),
         pub u_str_to_lower: unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32,
@@ -198,6 +200,7 @@ mod icu {
                 ucurr_get_name: sym!(c"ucurr_getName", unsafe extern "C" fn(*const u16, *const c_char, i32, *mut i8, *mut i32, *mut i32) -> *const u16),
                 ucol_open: sym!(c"ucol_open", unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void),
                 ucol_set_attribute: sym!(c"ucol_setAttribute", unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32)),
+                ucol_strcoll: sym!(c"ucol_strcoll", unsafe extern "C" fn(*const c_void, *const u16, i32, *const u16, i32) -> i32),
                 ucol_get_sort_key: sym!(c"ucol_getSortKey", unsafe extern "C" fn(*const c_void, *const u16, i32, *mut u8, i32) -> i32),
                 ucol_close: sym!(c"ucol_close", unsafe extern "C" fn(*mut c_void)),
                 u_str_to_lower: sym!(c"u_strToLower", unsafe extern "C" fn(*mut u16, i32, *const u16, i32, *const c_char, *mut i32) -> i32),
@@ -892,7 +895,7 @@ fn ord_to_cstr(o: Ordering) -> i32 {
 }
 
 pub unsafe extern "win64" fn CompareStringEx(
-    _locale: LPCWSTR,
+    locale: LPCWSTR,
     flags: u32,
     a: LPCWSTR,
     na: i32,
@@ -906,15 +909,33 @@ pub unsafe extern "win64" fn CompareStringEx(
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    let Some(loc) = resolve_locale_name_w(locale) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    };
     let _ = NORM_LINGUISTIC_CASING;
-    ord_to_cstr(compare_linguistic(wslice(a, na), wslice(b, nb), flags))
+    let icu_loc = if loc.invariant { "" } else { loc.icu_id.as_str() };
+    ord_to_cstr(compare_for_locale(icu_loc, wslice(a, na), wslice(b, nb), flags))
 }
 
-pub unsafe extern "win64" fn CompareStringW(_lcid: u32, flags: u32, a: LPCWSTR, na: i32, b: LPCWSTR, nb: i32) -> i32 {
-    CompareStringEx(std::ptr::null(), flags, a, na, b, nb, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+pub unsafe extern "win64" fn CompareStringW(lcid: u32, flags: u32, a: LPCWSTR, na: i32, b: LPCWSTR, nb: i32) -> i32 {
+    if a.is_null() || b.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(loc) = resolve_lcid(lcid) else {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let icu_loc = if loc.invariant { "" } else { loc.icu_id.as_str() };
+    ord_to_cstr(compare_for_locale(icu_loc, wslice(a, na), wslice(b, nb), flags))
 }
 
 pub unsafe extern "win64" fn CompareStringA(lcid: u32, flags: u32, a: LPCSTR, na: i32, b: LPCSTR, nb: i32) -> i32 {
+    if a.is_null() || b.is_null() {
+        set_err(err::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let conv = |p: LPCSTR, n: i32| -> Vec<u16> {
         let s = if n < 0 { cstr_slice(p) } else { std::slice::from_raw_parts(p, n as usize) };
         String::from_utf8_lossy(s).encode_utf16().collect()
@@ -959,6 +980,65 @@ const LCMAP_TRADITIONAL_CHINESE: u32 = 0x0400_0000;
 const NORM_IGNOREKANATYPE: u32 = 0x0001_0000;
 const NORM_IGNOREWIDTH: u32 = 0x0002_0000;
 
+/// Shared ICU collator setup so `CompareStringEx`/`CompareStringW` and
+/// `LCMapStringEx(..., LCMAP_SORTKEY, ...)` always produce identical ordering.
+unsafe fn configure_ucollator(a: &icu::IcuNls, col: *mut c_void, flags: u32) {
+    let ignore_case = (flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE)) != 0;
+    let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
+    let strength = if ignore_diacritics {
+        icu::UCOL_PRIMARY
+    } else if ignore_case {
+        icu::UCOL_SECONDARY
+    } else {
+        icu::UCOL_TERTIARY
+    };
+    let mut ast = 0i32;
+    (a.ucol_set_attribute)(col, icu::UCOL_STRENGTH, strength, &mut ast);
+    if ignore_diacritics && !ignore_case {
+        ast = 0;
+        (a.ucol_set_attribute)(col, icu::UCOL_CASE_LEVEL, icu::UCOL_ON, &mut ast);
+    }
+    ast = 0;
+    (a.ucol_set_attribute)(col, icu::UCOL_CASE_FIRST, icu::UCOL_LOWER_FIRST, &mut ast);
+    if (flags & NORM_IGNORESYMBOLS) != 0 {
+        ast = 0;
+        (a.ucol_set_attribute)(col, icu::UCOL_ALTERNATE_HANDLING, icu::UCOL_SHIFTED, &mut ast);
+    }
+    if (flags & SORT_DIGITSASNUMBERS) != 0 {
+        ast = 0;
+        (a.ucol_set_attribute)(col, icu::UCOL_NUMERIC_COLLATION, icu::UCOL_ON, &mut ast);
+    }
+}
+
+/// Locale-aware comparison via Apple ICU (`ucol_strcoll`), matching `sort_key_for_locale`,
+/// falling back to `compare_linguistic` if ICU is unavailable.
+fn compare_for_locale(icu_locale: &str, lhs: &[u16], rhs: &[u16], flags: u32) -> Ordering {
+    if let Some(a) = icu::api() {
+        let cloc = icu::c_str(icu_locale);
+        unsafe {
+            let mut st = 0i32;
+            let col = (a.ucol_open)(cloc.as_ptr(), &mut st);
+            if !col.is_null() && st <= 0 {
+                configure_ucollator(a, col, flags);
+                let r = (a.ucol_strcoll)(
+                    col,
+                    lhs.as_ptr(),
+                    lhs.len() as i32,
+                    rhs.as_ptr(),
+                    rhs.len() as i32,
+                );
+                (a.ucol_close)(col);
+                return match r {
+                    x if x < 0 => Ordering::Less,
+                    x if x > 0 => Ordering::Greater,
+                    _ => Ordering::Equal,
+                };
+            }
+        }
+    }
+    compare_linguistic(lhs, rhs, flags)
+}
+
 /// Locale-aware sort key via Apple ICU (`ucol_getSortKey`), falling back to
 /// `sort_key` if ICU is unavailable.
 fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
@@ -968,27 +1048,7 @@ fn sort_key_for_locale(icu_locale: &str, s: &[u16], flags: u32) -> Vec<u8> {
             let mut st = 0i32;
             let col = (a.ucol_open)(cloc.as_ptr(), &mut st);
             if !col.is_null() && st <= 0 {
-                let ignore_case = (flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE)) != 0;
-                let ignore_diacritics = (flags & (NORM_IGNORENONSPACE | LINGUISTIC_IGNOREDIACRITIC)) != 0;
-                let strength = if ignore_diacritics {
-                    icu::UCOL_PRIMARY
-                } else if ignore_case {
-                    icu::UCOL_SECONDARY
-                } else {
-                    icu::UCOL_TERTIARY
-                };
-                let mut ast = 0i32;
-                (a.ucol_set_attribute)(col, icu::UCOL_STRENGTH, strength, &mut ast);
-                ast = 0;
-                (a.ucol_set_attribute)(col, icu::UCOL_CASE_FIRST, icu::UCOL_LOWER_FIRST, &mut ast);
-                if (flags & NORM_IGNORESYMBOLS) != 0 {
-                    ast = 0;
-                    (a.ucol_set_attribute)(col, icu::UCOL_ALTERNATE_HANDLING, icu::UCOL_SHIFTED, &mut ast);
-                }
-                if (flags & SORT_DIGITSASNUMBERS) != 0 {
-                    ast = 0;
-                    (a.ucol_set_attribute)(col, icu::UCOL_NUMERIC_COLLATION, icu::UCOL_ON, &mut ast);
-                }
+                configure_ucollator(a, col, flags);
                 let mut buf = vec![0u8; s.len() * 6 + 16];
                 let need = (a.ucol_get_sort_key)(col, s.as_ptr(), s.len() as i32, buf.as_mut_ptr(), buf.len() as i32);
                 if need as usize > buf.len() {
@@ -3811,6 +3871,57 @@ mod tests {
                 0
             );
             assert_eq!(teb::last_error(), err::ERROR_INVALID_FLAGS);
+
+            // CompareStringEx / CompareStringW must match LCMapStringEx(LCMAP_SORTKEY) ordering.
+            let get_sort_key = |loc: &[u16], s: &[u16], flags: u32| -> Vec<u8> {
+                let need = LCMapStringEx(
+                    loc.as_ptr(),
+                    LCMAP_SORTKEY | flags,
+                    s.as_ptr(),
+                    -1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert!(need > 0);
+                let mut k = vec![0u8; need as usize];
+                let got = LCMapStringEx(
+                    loc.as_ptr(),
+                    LCMAP_SORTKEY | flags,
+                    s.as_ptr(),
+                    -1,
+                    k.as_mut_ptr() as LPWSTR,
+                    need,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(got, need);
+                k
+            };
+            let ae = to_wide_z("ä");
+            let zz = to_wide_z("z");
+            let sv = to_wide_z("sv-SE");
+            // en-US: 'ä' sorts before 'z' in BOTH CompareStringEx/W and LCMAP_SORTKEY.
+            assert_eq!(CompareStringEx(en.as_ptr(), 0, ae.as_ptr(), -1, zz.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_LESS_THAN);
+            assert_eq!(CompareStringW(0x0409, 0, ae.as_ptr(), -1, zz.as_ptr(), -1), CSTR_LESS_THAN);
+            assert!(get_sort_key(&en, &ae, 0) < get_sort_key(&en, &zz, 0));
+            // sv-SE: 'ä' sorts after 'z' in BOTH CompareStringEx and LCMAP_SORTKEY.
+            assert_eq!(CompareStringEx(sv.as_ptr(), 0, ae.as_ptr(), -1, zz.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_GREATER_THAN);
+            assert!(get_sort_key(&sv, &ae, 0) > get_sort_key(&sv, &zz, 0));
+            // Numeric collation & ignore-diacritics-case-sensitive consistency.
+            let f2 = to_wide_z("file2");
+            let f10 = to_wide_z("file10");
+            assert_eq!(CompareStringEx(en.as_ptr(), SORT_DIGITSASNUMBERS, f2.as_ptr(), -1, f10.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_LESS_THAN);
+            assert!(get_sort_key(&en, &f2, SORT_DIGITSASNUMBERS) < get_sort_key(&en, &f10, SORT_DIGITSASNUMBERS));
+            let a_lo = to_wide_z("a");
+            let a_up = to_wide_z("A");
+            assert_eq!(CompareStringEx(en.as_ptr(), NORM_IGNORENONSPACE, ae.as_ptr(), -1, a_lo.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_EQUAL);
+            assert_eq!(get_sort_key(&en, &ae, NORM_IGNORENONSPACE), get_sort_key(&en, &a_lo, NORM_IGNORENONSPACE));
+            assert_eq!(CompareStringEx(en.as_ptr(), NORM_IGNORENONSPACE, a_lo.as_ptr(), -1, a_up.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), 0), CSTR_LESS_THAN);
+            assert!(get_sort_key(&en, &a_lo, NORM_IGNORENONSPACE) < get_sort_key(&en, &a_up, NORM_IGNORENONSPACE));
         }
     }
 

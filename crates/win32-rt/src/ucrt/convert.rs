@@ -587,7 +587,7 @@ fn mb_decode(bytes: &[u8]) -> Result<Option<(Vec<u16>, usize)>, ()> {
     Ok(Some((w, len)))
 }
 
-fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
+pub(super) fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
     let cp = mb_cp();
     if cp == 0 {
         if c < 256 {
@@ -604,6 +604,41 @@ fn wc_encode(c: u16) -> Result<Vec<u8>, ()> {
         let (bytes, used_default) =
             crate::kernel32::string::encode_utf16_to_cp(cp, &[c], None).map_err(|_| ())?;
         if used_default || bytes.is_empty() {
+            Err(())
+        } else {
+            Ok(bytes)
+        }
+    }
+}
+
+pub(super) fn wc_encode_slice(units: &[u16]) -> Result<Vec<u8>, ()> {
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cp = mb_cp();
+    if cp == 0 {
+        let mut out = Vec::with_capacity(units.len());
+        for &u in units {
+            if u < 256 {
+                out.push(u as u8);
+            } else {
+                return Err(());
+            }
+        }
+        Ok(out)
+    } else if cp == 65001 {
+        let mut out = String::with_capacity(units.len());
+        for r in char::decode_utf16(units.iter().copied()) {
+            match r {
+                Ok(ch) => out.push(ch),
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(out.into_bytes())
+    } else {
+        let (bytes, used_default) =
+            crate::kernel32::string::encode_utf16_to_cp(cp, units, None).map_err(|_| ())?;
+        if used_default {
             Err(())
         } else {
             Ok(bytes)

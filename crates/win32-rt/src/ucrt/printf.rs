@@ -723,17 +723,7 @@ pub unsafe extern "win64" fn __stdio_common_vfwprintf(
     va: *const u8,
 ) -> i32 {
     match fmt_wide(opts, fmt, va) {
-        Some(r) => {
-            // Text streams in ANSI mode: wide chars go out via the locale's
-            // multibyte encoding (UTF-8 here).
-            let s = String::from_utf16_lossy(&r);
-            let n = super::stdio::write_stream_bytes(stream, s.as_bytes());
-            if n < 0 {
-                n
-            } else {
-                r.len() as i32
-            }
-        }
+        Some(r) => super::stdio::write_stream_wide(stream, &r),
         None => -1,
     }
 }
