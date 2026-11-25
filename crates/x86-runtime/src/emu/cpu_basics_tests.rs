@@ -2110,9 +2110,12 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
     //   +112: (min_f32_normal * 0.5) as f64 (8B)
     //   +120: fldcw input (0xFFFF -> masked to 0x1F7F), +122: restore fcw (0x037F)
     //   +124: default mxcsr (0x1F80)
-    // Results start at +128: 16 * 64 = 1024 bytes -> total 1152 bytes.
+    //   +128: [+1.5f64, -1.5f64, +2.5f64, -denorm_f64(0x8000_0000_0000_0001)] (32B)
+    // Results start at +160: 16 * 96 = 1536 bytes -> total 1696 bytes.
+    //   +64: vcvtpd2dq([+1.5, -1.5, +2.5, -denorm_f64]) (16 bytes)
+    //   +80: cvtpd2dq([+1.5, -1.5]) (8 bytes)
     for m in 0..16i32 {
-        let out_off = 128 + m * 64;
+        let out_off = 160 + m * 96;
         if m & 1 == 0 {
             a.ldmxcsr(dword_ptr(r8 + m * 4)).unwrap();
             a.stmxcsr(dword_ptr(r8 + out_off + 52)).unwrap();
@@ -2154,6 +2157,11 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
         a.xorps(xmm0, xmm0).unwrap();
         a.cvtsd2ss(xmm0, qword_ptr(r8 + 112)).unwrap();
         a.movss(dword_ptr(r8 + out_off + 48), xmm0).unwrap();
+        // vcvtpd2dq([+1.5, -1.5, +2.5, -denorm_f64]) and cvtpd2dq([+1.5, -1.5])
+        a.vcvtpd2dq(xmm0, ymmword_ptr(r8 + 128)).unwrap();
+        a.vmovdqu(xmmword_ptr(r8 + out_off + 64), xmm0).unwrap();
+        a.cvtpd2dq(xmm0, xmmword_ptr(r8 + 128)).unwrap();
+        a.movq(qword_ptr(r8 + out_off + 80), xmm0).unwrap();
         // fldcw / fnstcw bit-mask check
         a.fldcw(word_ptr(r8 + 120)).unwrap();
         a.fnstcw(word_ptr(r8 + out_off + 56)).unwrap();
@@ -2163,7 +2171,7 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
     a.ret().unwrap();
     let code = a.assemble(0).unwrap();
 
-    let mut init = vec![0u8; 1152];
+    let mut init = vec![0u8; 1696];
     for m in 0u32..16 {
         let rc = m & 3;
         let daz = (m >> 2) & 1;
@@ -2188,6 +2196,10 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
     init[120..122].copy_from_slice(&0xffffu16.to_le_bytes());
     init[122..124].copy_from_slice(&0x037fu16.to_le_bytes());
     init[124..128].copy_from_slice(&0x1f80u32.to_le_bytes());
+    init[128..136].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
+    init[136..144].copy_from_slice(&(-1.5f64).to_bits().to_le_bytes());
+    init[144..152].copy_from_slice(&2.5f64.to_bits().to_le_bytes());
+    init[152..160].copy_from_slice(&0x8000_0000_0000_0001u64.to_le_bytes()); // smallest -denorm f64
 
     let oracle = cfg!(feature = "rosetta-oracle").then(|| rosetta(&code, &init));
     let saved_fpcr = read_fpcr();
@@ -2199,7 +2211,7 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
                     let rc = m & 3;
                     let daz = (m >> 2) & 1 != 0;
                     let ftz = (m >> 3) & 1 != 0;
-                    let off = 128 + (m as usize) * 64;
+                    let off = 160 + (m as usize) * 96;
                     let u32_at = |o: usize| u32::from_le_bytes(out[off + o..off + o + 4].try_into().unwrap());
                     let i32_at = |o: usize| i32::from_le_bytes(out[off + o..off + o + 4].try_into().unwrap());
                     let want_mxcsr = 0x1f80 | (rc << 13) | (u32::from(daz) << 6) | (u32::from(ftz) << 15);
@@ -2265,6 +2277,17 @@ fn mxcsr_16_mode_matrix_arith_sqrt_cvt_across_tiers() {
                         if ftz { 0 } else { 0x0040_0000 },
                         "m={m} mask={disable_mask} cvtsd2ss"
                     );
+                    // vcvtpd2dq([+1.5, -1.5, +2.5, -denorm_f64]) and cvtpd2dq([+1.5, -1.5])
+                    assert_eq!(i32_at(64), match rc { 0 | 2 => 2, _ => 1 }, "m={m} vcvtpd2dq[0]");
+                    assert_eq!(i32_at(68), match rc { 0 | 1 => -2, _ => -1 }, "m={m} vcvtpd2dq[1]");
+                    assert_eq!(i32_at(72), match rc { 0 | 1 | 3 => 2, _ => 3 }, "m={m} vcvtpd2dq[2]");
+                    assert_eq!(
+                        i32_at(76),
+                        if rc == 1 && !daz { -1 } else { 0 },
+                        "m={m} mask={disable_mask} vcvtpd2dq[-denorm]"
+                    );
+                    assert_eq!(i32_at(80), match rc { 0 | 2 => 2, _ => 1 }, "m={m} cvtpd2dq[0]");
+                    assert_eq!(i32_at(84), match rc { 0 | 1 => -2, _ => -1 }, "m={m} cvtpd2dq[1]");
                 }
                 if let Some(control) = &oracle {
                     assert_eq!(out, control, "mask={disable_mask} diverged from Rosetta oracle");

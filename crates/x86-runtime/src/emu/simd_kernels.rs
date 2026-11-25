@@ -937,7 +937,7 @@ pub(in crate::emu) fn cvtpd2dq(lo: u128, hi: u128, src_256: bool, trunc: bool) -
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let cvt2 = |v: u128| -> uint32x2_t {
-            let r = if trunc { vrndq_f64(qd(v)) } else { vrndnq_f64(qd(v)) };
+            let r = if trunc { vrndq_f64(qd(v)) } else { vrndiq_f64(qd(v)) };
             let ok = vandq_u64(
                 vcgeq_f64(r, vdupq_n_f64(-2147483648.0)),
                 vcltq_f64(r, vdupq_n_f64(2147483648.0)),
