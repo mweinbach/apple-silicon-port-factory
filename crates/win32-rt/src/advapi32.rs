@@ -3104,6 +3104,7 @@ const HP_HASHVAL: u32 = 0x0002;
 const HP_HASHSIZE: u32 = 0x0004;
 
 const KP_IV: u32 = 1;
+const KP_SALT: u32 = 2;
 const KP_PADDING: u32 = 3;
 const KP_MODE: u32 = 4;
 const KP_MODE_BITS: u32 = 5;
@@ -3111,6 +3112,7 @@ const KP_PERMISSIONS: u32 = 6;
 const KP_ALGID: u32 = 7;
 const KP_BLOCKLEN: u32 = 8;
 const KP_KEYLEN: u32 = 9;
+const KP_SALT_EX: u32 = 10;
 const KP_EFFECTIVE_KEYLEN: u32 = 19;
 
 const CRYPT_MODE_CBC: u32 = 1;
@@ -3130,6 +3132,8 @@ const CRYPT_EXPORT_KEY: u32 = 0x0000_0040;
 const CRYPT_IMPORT_KEY: u32 = 0x0000_0080;
 
 const CRYPT_EXPORTABLE: u32 = 0x0000_0001;
+const CRYPT_CREATE_SALT: u32 = 0x0000_0004;
+const CRYPT_NO_SALT: u32 = 0x0000_0010;
 const CRYPT_NOHASHOID: u32 = 0x0000_0001;
 const CRYPT_OAEP: u32 = 0x0000_0040;
 const CRYPT_VERIFYCONTEXT: u32 = 0xF000_0000;
@@ -3208,6 +3212,7 @@ enum CapiKeyMaterial {
     Symmetric {
         alg: SymAlg,
         key: Vec<u8>,
+        salt: Vec<u8>,
         mode: BcCipherMode,
         padding: u32,
         effective_key_len: u32,
@@ -3307,6 +3312,54 @@ fn capi_default_permissions(exportable: bool) -> u32 {
     if exportable { base | CRYPT_EXPORT } else { base }
 }
 
+fn capi_effective_sym_key(alg: SymAlg, key: &[u8], salt: &[u8]) -> Vec<u8> {
+    if matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) && !salt.is_empty() {
+        let mut out = Vec::with_capacity(key.len() + salt.len());
+        out.extend_from_slice(key);
+        out.extend_from_slice(salt);
+        out
+    } else {
+        key.to_vec()
+    }
+}
+
+unsafe fn capi_salt_from_flags(
+    alg: SymAlg,
+    key_len: usize,
+    dw_flags: u32,
+    hash_tail: Option<&[u8]>,
+) -> Result<Vec<u8>, u32> {
+    let no_salt = (dw_flags & CRYPT_NO_SALT) != 0;
+    let create_salt = (dw_flags & CRYPT_CREATE_SALT) != 0;
+    if no_salt && create_salt {
+        return Err(NTE_BAD_FLAGS);
+    }
+    if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) || no_salt {
+        return Ok(Vec::new());
+    }
+    if create_salt {
+        let salt_len = 16usize.saturating_sub(key_len);
+        if salt_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut salt = vec![0u8; salt_len];
+        if let Some(tail) = hash_tail {
+            let n = tail.len().min(salt_len);
+            salt[..n].copy_from_slice(&tail[..n]);
+        } else if !crate::det_entropy::fill(salt.as_mut_ptr(), salt.len()) {
+            libc::arc4random_buf(salt.as_mut_ptr() as *mut c_void, salt.len());
+        }
+        return Ok(salt);
+    }
+    // Microsoft Learn (Salt Value Functionality): 40-bit RC2/RC4 keys receive an 11-byte
+    // zero salt by default unless CRYPT_NO_SALT is requested.
+    if key_len == 5 {
+        Ok(vec![0u8; 11])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<Vec<u8>, u32> {
     let required = if encrypt {
         CRYPT_ENCRYPT | CRYPT_EXPORT_KEY
@@ -3319,6 +3372,7 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
     let CapiKeyMaterial::Symmetric {
         alg,
         key,
+        salt,
         mode,
         padding,
         effective_key_len,
@@ -3329,8 +3383,9 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
     else {
         return Err(NTE_BAD_KEY);
     };
+    let eff_key = capi_effective_sym_key(*alg, key, salt);
     if *alg == SymAlg::Rc4 {
-        return Ok(Rc4State::new(key).apply(data));
+        return Ok(Rc4State::new(&eff_key).apply(data));
     }
     let bs = alg.block_size();
     let use_pkcs7 = *padding == PKCS5_PADDING && matches!(*mode, BcCipherMode::Ecb | BcCipherMode::Cbc);
@@ -3343,7 +3398,7 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
         *mode,
         encrypt,
         use_pkcs7,
-        key,
+        &eff_key,
         *effective_key_len,
         &mut iv_work,
         *msg_block_len as usize,
@@ -3352,11 +3407,12 @@ fn capi_wrap_sym_bytes(sym_key: &CapiKey, encrypt: bool, data: &[u8]) -> Result<
     .map_err(|_| NTE_BAD_DATA)
 }
 
-fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> CapiKey {
+fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, salt: Vec<u8>, exportable: bool) -> CapiKey {
     let bs = alg.block_size();
     let mode = if alg == SymAlg::Rc4 { BcCipherMode::Na } else { BcCipherMode::Cbc };
     let eff = if alg == SymAlg::Rc2 { (key.len() * 8) as u32 } else { 0 };
-    let rc4 = (alg == SymAlg::Rc4).then(|| Rc4State::new(&key));
+    let eff_key = capi_effective_sym_key(alg, &key, &salt);
+    let rc4 = (alg == SymAlg::Rc4).then(|| Rc4State::new(&eff_key));
     CapiKey {
         alg_id,
         exportable,
@@ -3364,6 +3420,7 @@ fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> Cap
         material: CapiKeyMaterial::Symmetric {
             alg,
             key,
+            salt,
             mode,
             padding: PKCS5_PADDING,
             effective_key_len: eff,
@@ -4041,7 +4098,11 @@ pub unsafe extern "win64" fn CryptGenKey(
     } else {
         alg_id
     };
-    let k = capi_sym_key(canonical_alg, sym_alg, raw, exportable);
+    let salt = match capi_salt_from_flags(sym_alg, key_len, dw_flags, None) {
+        Ok(s) => s,
+        Err(e) => return err(e, FALSE),
+    };
+    let k = capi_sym_key(canonical_alg, sym_alg, raw, salt, exportable);
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_keys().lock().unwrap().insert(h, k);
     std::ptr::write_unaligned(ph_key, h);
@@ -4125,7 +4186,12 @@ pub unsafe extern "win64" fn CryptDeriveKey(
     };
 
     let exportable = (dw_flags & CRYPT_EXPORTABLE) != 0;
-    let k = capi_sym_key(alg_id, sym_alg, derived, exportable);
+    let hash_tail = hash_val.get(key_len..).unwrap_or(&[]);
+    let salt = match capi_salt_from_flags(sym_alg, key_len, dw_flags, Some(hash_tail)) {
+        Ok(s) => s,
+        Err(e) => return err(e, FALSE),
+    };
+    let k = capi_sym_key(alg_id, sym_alg, derived, salt, exportable);
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
     capi_keys().lock().unwrap().insert(h, k);
     std::ptr::write_unaligned(ph_key, h);
@@ -4216,6 +4282,7 @@ pub unsafe extern "win64" fn CryptGetKeyParam(
         (KP_BLOCKLEN, CapiKeyMaterial::Symmetric { alg, .. }) => ((alg.block_size() * 8) as u32).to_le_bytes().to_vec(),
         (KP_KEYLEN, CapiKeyMaterial::Symmetric { key, .. }) => ((key.len() * 8) as u32).to_le_bytes().to_vec(),
         (KP_IV, CapiKeyMaterial::Symmetric { iv, alg, .. }) if alg.block_size() > 0 => iv.clone(),
+        (KP_SALT, CapiKeyMaterial::Symmetric { salt, .. }) => salt.clone(),
         (KP_MODE, CapiKeyMaterial::Symmetric { mode, .. }) => {
             let m = match mode {
                 BcCipherMode::Ecb => CRYPT_MODE_ECB,
@@ -4273,12 +4340,14 @@ pub unsafe extern "win64" fn CryptSetKeyParam(
     }
     let CapiKeyMaterial::Symmetric {
         alg,
+        ref mut salt,
         ref mut mode,
         ref mut padding,
         ref mut effective_key_len,
         ref mut iv,
         ref mut running_iv,
         ref mut msg_block_len,
+        ref mut rc4,
         ..
     } = k.material
     else {
@@ -4293,6 +4362,33 @@ pub unsafe extern "win64" fn CryptSetKeyParam(
             let slice = std::slice::from_raw_parts(pb_data, bs);
             *iv = slice.to_vec();
             *running_iv = slice.to_vec();
+            TRUE
+        }
+        KP_SALT => {
+            if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            let len = if salt.is_empty() { 11 } else { salt.len() };
+            *salt = std::slice::from_raw_parts(pb_data, len).to_vec();
+            *rc4 = None;
+            TRUE
+        }
+        KP_SALT_EX => {
+            if !matches!(alg, SymAlg::Rc2 | SymAlg::Rc4) {
+                return err(NTE_BAD_TYPE, FALSE);
+            }
+            // CRYPT_DATA_BLOB on x64: cbData (u32) at offset 0, pbData (*const u8) at offset 8.
+            let cb_salt = std::ptr::read_unaligned(pb_data as *const u32) as usize;
+            let salt_ptr = std::ptr::read_unaligned(pb_data.add(8) as *const *const u8);
+            if cb_salt > 24 || (cb_salt > 0 && salt_ptr.is_null()) {
+                return err(NTE_BAD_DATA, FALSE);
+            }
+            *salt = if cb_salt == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(salt_ptr, cb_salt).to_vec()
+            };
+            *rc4 = None;
             TRUE
         }
         KP_MODE => {
@@ -4533,7 +4629,11 @@ pub unsafe extern "win64" fn CryptImportKey(
                 return err(NTE_BAD_DATA, FALSE);
             }
             let raw = blob[12..12 + cb_key].to_vec();
-            capi_sym_key(ai_key_alg, sym_alg, raw, exportable)
+            let salt = match capi_salt_from_flags(sym_alg, raw.len(), dw_flags & CRYPT_NO_SALT, None) {
+                Ok(s) => s,
+                Err(e) => return err(e, FALSE),
+            };
+            capi_sym_key(ai_key_alg, sym_alg, raw, salt, exportable)
         }
         SIMPLEBLOB => {
             if blob.len() < 12 {
@@ -4572,7 +4672,11 @@ pub unsafe extern "win64" fn CryptImportKey(
             if !capi_valid_sym_key_len(ai_key_alg, sym_alg, raw_key.len()) {
                 return err(NTE_BAD_DATA, FALSE);
             }
-            capi_sym_key(ai_key_alg, sym_alg, raw_key, exportable)
+            let salt = match capi_salt_from_flags(sym_alg, raw_key.len(), dw_flags & CRYPT_NO_SALT, None) {
+                Ok(s) => s,
+                Err(e) => return err(e, FALSE),
+            };
+            capi_sym_key(ai_key_alg, sym_alg, raw_key, salt, exportable)
         }
         _ => return err(NTE_BAD_TYPE, FALSE),
     };
@@ -4648,6 +4752,7 @@ pub unsafe extern "win64" fn CryptEncrypt(
         CapiKeyMaterial::Symmetric {
             alg,
             key,
+            salt,
             mode,
             padding,
             effective_key_len,
@@ -4682,11 +4787,12 @@ pub unsafe extern "win64" fn CryptEncrypt(
                 std::slice::from_raw_parts(pb_data, in_len).to_vec()
             };
 
+            let eff_key = capi_effective_sym_key(*alg, key, salt);
             let out = if *alg == SymAlg::Rc4 {
-                let st = rc4.get_or_insert_with(|| Rc4State::new(key));
+                let st = rc4.get_or_insert_with(|| Rc4State::new(&eff_key));
                 let r = st.apply(&pt);
                 if is_final {
-                    *rc4 = Some(Rc4State::new(key));
+                    *rc4 = Some(Rc4State::new(&eff_key));
                 }
                 r
             } else {
@@ -4696,7 +4802,7 @@ pub unsafe extern "win64" fn CryptEncrypt(
                     *mode,
                     true,
                     use_pkcs7,
-                    key,
+                    &eff_key,
                     *effective_key_len,
                     &mut iv_work,
                     *msg_block_len as usize,
@@ -4771,6 +4877,7 @@ pub unsafe extern "win64" fn CryptDecrypt(
         CapiKeyMaterial::Symmetric {
             alg,
             key,
+            salt,
             mode,
             padding,
             effective_key_len,
@@ -4784,11 +4891,12 @@ pub unsafe extern "win64" fn CryptDecrypt(
             } else {
                 std::slice::from_raw_parts(pb_data, in_len).to_vec()
             };
+            let eff_key = capi_effective_sym_key(*alg, key, salt);
             if *alg == SymAlg::Rc4 {
-                let st = rc4.get_or_insert_with(|| Rc4State::new(key));
+                let st = rc4.get_or_insert_with(|| Rc4State::new(&eff_key));
                 let r = st.apply(&ct);
                 if is_final {
-                    *rc4 = Some(Rc4State::new(key));
+                    *rc4 = Some(Rc4State::new(&eff_key));
                 }
                 r
             } else {
@@ -4803,7 +4911,7 @@ pub unsafe extern "win64" fn CryptDecrypt(
                     *mode,
                     false,
                     use_pkcs7,
-                    key,
+                    &eff_key,
                     *effective_key_len,
                     &mut iv_work,
                     *msg_block_len as usize,
@@ -6970,7 +7078,7 @@ mod tests {
             assert_eq!(crate::teb::last_error(), NTE_PERM);
             assert_eq!(CryptDestroyKey(h_perm), TRUE);
 
-            // 5. CryptDeriveKey (SHA-256 -> direct truncation; SHA-1 -> 0x36/0x5C expansion)
+            // 5. CryptDeriveKey (SHA-256 -> direct truncation; 40-bit RC4 salt semantics)
             let mut h_pw = 0usize;
             assert_eq!(CryptCreateHash(hprov2, CALG_SHA_256, 0, 0, &mut h_pw), TRUE);
             assert_eq!(CryptHashData(h_pw, b"abc".as_ptr(), 3, 0), TRUE);
@@ -6982,6 +7090,80 @@ mod tests {
             assert_eq!(&dk_blob[12..28], &BcDigest::Sha256.hash(b"abc")[..16]);
             assert_eq!(CryptDestroyKey(h_dk), TRUE);
             assert_eq!(CryptDestroyHash(h_pw), TRUE);
+
+            // 5b. 40-bit RC4 CryptDeriveKey salt semantics:
+            // - Default: 11 zero bytes appended to 5-byte key
+            // - CRYPT_NO_SALT (0x10): 0 salt bytes (raw 5-byte RC4 key)
+            // - CRYPT_CREATE_SALT (0x04): 11 salt bytes taken from unused hash bytes hash[5..16]
+            let mut h_md5 = 0usize;
+            assert_eq!(CryptCreateHash(hprov2, CALG_MD5, 0, 0, &mut h_md5), TRUE);
+            assert_eq!(CryptHashData(h_md5, b"password".as_ptr(), 8, 0), TRUE);
+            let md5_pw = BcDigest::Md5.hash(b"password");
+            let rc4_sample = b"capi 40-bit salt test";
+
+            let mut h_rc4_def = 0usize;
+            let mut h_rc4_nosalt = 0usize;
+            let mut h_rc4_csalt = 0usize;
+            let mut h_rc4_bad = 0usize;
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, 40 << 16, &mut h_rc4_def), TRUE);
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x10, &mut h_rc4_nosalt), TRUE);
+            assert_eq!(
+                CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x04 | CRYPT_EXPORTABLE, &mut h_rc4_csalt),
+                TRUE,
+            );
+            assert_eq!(CryptDeriveKey(hprov2, CALG_RC4, h_md5, (40 << 16) | 0x14, &mut h_rc4_bad), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_FLAGS);
+
+            let mut salt_buf = [0xAAu8; 16];
+            let mut salt_len = 16u32;
+            assert_eq!(CryptGetKeyParam(h_rc4_def, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 11);
+            assert_eq!(&salt_buf[..11], &[0u8; 11]);
+
+            salt_len = 16;
+            assert_eq!(CryptGetKeyParam(h_rc4_nosalt, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 0);
+
+            salt_len = 16;
+            assert_eq!(CryptGetKeyParam(h_rc4_csalt, KP_SALT, salt_buf.as_mut_ptr(), &mut salt_len, 0), TRUE);
+            assert_eq!(salt_len, 11);
+            assert_eq!(&salt_buf[..11], &md5_pw[5..16]);
+
+            let mut ct_def = rc4_sample.to_vec();
+            let mut ct_nosalt = rc4_sample.to_vec();
+            let mut ct_csalt = rc4_sample.to_vec();
+            let mut rlen = rc4_sample.len() as u32;
+            assert_eq!(CryptEncrypt(h_rc4_def, 0, TRUE, 0, ct_def.as_mut_ptr(), &mut rlen, rlen), TRUE);
+            assert_eq!(CryptEncrypt(h_rc4_nosalt, 0, TRUE, 0, ct_nosalt.as_mut_ptr(), &mut rlen, rlen), TRUE);
+            assert_eq!(CryptEncrypt(h_rc4_csalt, 0, TRUE, 0, ct_csalt.as_mut_ptr(), &mut rlen, rlen), TRUE);
+
+            let mut k_def = md5_pw[..5].to_vec();
+            k_def.extend_from_slice(&[0u8; 11]);
+            assert_eq!(ct_def, Rc4State::new(&k_def).apply(rc4_sample));
+            assert_eq!(ct_nosalt, Rc4State::new(&md5_pw[..5]).apply(rc4_sample));
+            assert_eq!(ct_csalt, Rc4State::new(&md5_pw[..16]).apply(rc4_sample));
+            assert_ne!(ct_def, ct_nosalt);
+            assert_ne!(ct_def, ct_csalt);
+            assert_ne!(ct_nosalt, ct_csalt);
+
+            // Export 5-byte key blob, re-import, apply KP_SALT -> decrypts salted ciphertext cleanly
+            let mut rc4_blob = vec![0u8; 32];
+            let mut rc4_blen = 32u32;
+            assert_eq!(CryptExportKey(h_rc4_csalt, 0, PLAINTEXTKEYBLOB, 0, rc4_blob.as_mut_ptr(), &mut rc4_blen), TRUE);
+            assert_eq!(rc4_blen, 17);
+            let mut h_rc4_imp = 0usize;
+            assert_eq!(CryptImportKey(hprov2, rc4_blob.as_ptr(), rc4_blen, 0, 0, &mut h_rc4_imp), TRUE);
+            assert_eq!(CryptSetKeyParam(h_rc4_imp, KP_SALT, salt_buf.as_ptr(), 0), TRUE);
+            let mut dec_csalt = ct_csalt.clone();
+            let mut dlen_rc4 = dec_csalt.len() as u32;
+            assert_eq!(CryptDecrypt(h_rc4_imp, 0, TRUE, 0, dec_csalt.as_mut_ptr(), &mut dlen_rc4), TRUE);
+            assert_eq!(&dec_csalt[..dlen_rc4 as usize], rc4_sample);
+
+            assert_eq!(CryptDestroyKey(h_rc4_imp), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_csalt), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_nosalt), TRUE);
+            assert_eq!(CryptDestroyKey(h_rc4_def), TRUE);
+            assert_eq!(CryptDestroyHash(h_md5), TRUE);
 
             // 6. Real Windows PUBLICKEYBLOB + little-endian CAPI signature interoperability vector
             // (1024-bit OpenSSL key & SHA-256 PKCS#1 v1.5 signature over "aw2 license test",
