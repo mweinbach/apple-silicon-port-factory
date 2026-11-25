@@ -3460,22 +3460,48 @@ mod tests {
             assert_eq!(wn_cap, 1023);
             assert_eq!(wbuf[1023], 0);
 
-            // Odd-address (unaligned) UTF-16 output buffer must work without UB/alignment panic.
+            // Odd-address (unaligned) UTF-16 output buffer, format string, and wide string
+            // arguments (full, precision-limited, and narrow %S/%ls conversion) must all work
+            // without misaligned-pointer panics or UB.
             let mut raw = vec![0xA5u8; 128];
             let odd_out = raw.as_mut_ptr().add(1) as *mut u16;
             assert!(!odd_out.is_aligned(), "expected odd-address unaligned u16 pointer");
+            let mut raw_arg = vec![0xA5u8; 64];
+            let odd_arg = raw_arg.as_mut_ptr().add(1) as *mut u16;
+            assert!(!odd_arg.is_aligned(), "expected odd-address unaligned u16 string argument");
+            for (k, &ch) in ws_arg.iter().enumerate() {
+                std::ptr::write_unaligned(odd_arg.add(k), ch);
+            }
+            let fmt_odd_w = crate::strings::to_wide_z("s=%s ls=%ls p=%.2s");
+            let mut raw_fmt = vec![0xA5u8; 64];
+            let odd_fmt = raw_fmt.as_mut_ptr().add(1) as *mut u16;
+            for (k, &ch) in fmt_odd_w.iter().enumerate() {
+                std::ptr::write_unaligned(odd_fmt.add(k), ch);
+            }
             let wn_odd = wsprintfW(
                 odd_out as u64,
-                fmt_w.as_ptr() as u64,
-                7,
-                0x2A,
-                ws_arg.as_ptr() as u64,
+                odd_fmt as u64,
+                odd_arg as u64,
+                odd_arg as u64,
+                odd_arg as u64,
                 0, 0, 0, 0, 0, 0, 0,
             );
-            assert_eq!(wn_odd, 21);
-            assert_eq!(read_wide_unaligned(odd_out), "val=7 hex=2A str=wide");
-            assert_eq!(std::ptr::read_unaligned(odd_out.add(21)), 0);
+            assert_eq!(wn_odd, 19);
+            assert_eq!(read_wide_unaligned(odd_out), "s=wide ls=wide p=wi");
+            assert_eq!(std::ptr::read_unaligned(odd_out.add(19)), 0);
             assert_eq!(raw[0], 0xA5);
+
+            let mut abuf_odd = [0u8; 64];
+            let na_odd = wsprintfA(
+                abuf_odd.as_mut_ptr() as u64,
+                c"S=%S ls=%ls p=%.2S".as_ptr() as u64,
+                odd_arg as u64,
+                odd_arg as u64,
+                odd_arg as u64,
+                0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_eq!(na_odd, 19);
+            assert_eq!(crate::strings::from_ansi(abuf_odd.as_ptr()), "S=wide ls=wide p=wi");
 
             // %c / %C with 0 argument must emit an embedded NUL, count it in the return length,
             // and continue formatting subsequent characters rather than terminating early.
