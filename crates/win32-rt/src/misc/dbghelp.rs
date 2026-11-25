@@ -1853,10 +1853,84 @@ fn parse_pdb_line_cache(
     Some(PdbLineCache { ansi_files, wide_files, lines })
 }
 
+fn push_unique_path(out: &mut Vec<PathBuf>, p: PathBuf) {
+    if !p.as_os_str().is_empty() && !out.contains(&p) {
+        out.push(p);
+    }
+}
+
+fn looks_like_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[1] == b':') || p.contains('\\')
+}
+
+/// Resolve a guest Windows path (via `crate::path::to_host`) and/or native host path into
+/// candidate host `PathBuf`s.
+fn push_guest_or_host_file(out: &mut Vec<PathBuf>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let is_win = looks_like_windows_path(trimmed);
+    if !is_win {
+        push_unique_path(out, PathBuf::from(trimmed));
+    }
+    if let Some(host) = crate::path::to_host(trimmed) {
+        push_unique_path(out, host);
+    }
+    if is_win {
+        push_unique_path(out, PathBuf::from(trimmed));
+    }
+}
+
+/// Resolve `dir + fname` where `dir` may be either a guest Windows directory (e.g. `C:\Symbols`
+/// or a guest-CWD-relative directory) or a native host directory (e.g. `/tmp/syms`).
+fn push_dir_file_candidates(out: &mut Vec<PathBuf>, dir: &str, fname: &str) {
+    let dir = dir.trim();
+    if dir.is_empty() || fname.is_empty() {
+        return;
+    }
+    let is_win = looks_like_windows_path(dir);
+    if !is_win {
+        push_unique_path(out, PathBuf::from(dir).join(fname));
+    }
+    let dir_clean = dir.trim_end_matches(['\\', '/']);
+    let joined_win = if dir_clean.len() == 2 && dir_clean.as_bytes()[1] == b':' {
+        format!("{dir_clean}\\{fname}")
+    } else if dir_clean.is_empty() {
+        format!("\\{fname}")
+    } else {
+        format!("{dir_clean}\\{fname}")
+    };
+    if let Some(host_file) = crate::path::to_host(&joined_win) {
+        push_unique_path(out, host_file);
+    }
+    if let Some(host_dir) = crate::path::to_host(dir) {
+        push_unique_path(out, host_dir.join(fname));
+    }
+    if is_win {
+        push_unique_path(out, PathBuf::from(dir).join(fname));
+    }
+}
+
+/// Extract the parent directory of a Windows or POSIX path string.
+fn parent_dir_str(p: &str) -> Option<&str> {
+    let trimmed = p.trim();
+    let idx = trimmed.rfind(['\\', '/'])?;
+    if idx == 0 {
+        Some(&trimmed[..1])
+    } else if idx == 2 && trimmed.as_bytes()[1] == b':' {
+        Some(&trimmed[..=idx])
+    } else {
+        Some(&trimmed[..idx])
+    }
+}
+
 /// Locate a PDB file on disk for `m` using the PE's CodeView `RSDS` record and `search_path`.
 fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut expected_rsds_id: Option<([u8; 16], u32)> = None;
+    let img_parent = parent_dir_str(&m.image_name);
     let (_, _, cv) = read_pe_debug_metadata(m.base);
     if let Some(ref cv_bytes) = cv {
         // RSDS: 'R','S','D','S'(4), GUID(16), Age(4), NUL-terminated UTF-8 path.
@@ -1869,29 +1943,33 @@ fn load_pdb_for_module(m: &SymModule, search_path: &str) -> Option<PdbLineCache>
             let nul = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
             let pdb_raw = String::from_utf8_lossy(&tail[..nul]);
             if !pdb_raw.is_empty() {
-                candidates.push(PathBuf::from(pdb_raw.as_ref()));
-                if let Some(fname) = pdb_raw.rsplit(['\\', '/']).next() {
-                    for dir in search_path.split(';').filter(|d| !d.is_empty()) {
-                        candidates.push(PathBuf::from(dir).join(fname));
+                push_guest_or_host_file(&mut candidates, pdb_raw.as_ref());
+                if let Some(fname) = pdb_raw.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()) {
+                    if let Some(parent) = img_parent {
+                        push_dir_file_candidates(&mut candidates, parent, fname);
+                    }
+                    for dir in search_path.split(';').filter(|d| !d.trim().is_empty()) {
+                        push_dir_file_candidates(&mut candidates, dir, fname);
                     }
                 }
             }
         }
     }
     // Also check `<module_name>.pdb` beside the image and in every search-path directory.
-    let pdb_fname = format!(
-        "{}.pdb",
-        m.module_name
-            .trim_end_matches(".dll")
-            .trim_end_matches(".exe")
-    );
-    if let Some(parent) = PathBuf::from(&m.image_name).parent() {
-        if !parent.as_os_str().is_empty() {
-            candidates.push(parent.join(&pdb_fname));
-        }
+    let stem = if m.module_name.len() > 4
+        && (m.module_name[m.module_name.len() - 4..].eq_ignore_ascii_case(".dll")
+            || m.module_name[m.module_name.len() - 4..].eq_ignore_ascii_case(".exe"))
+    {
+        &m.module_name[..m.module_name.len() - 4]
+    } else {
+        &m.module_name
+    };
+    let pdb_fname = format!("{stem}.pdb");
+    if let Some(parent) = img_parent {
+        push_dir_file_candidates(&mut candidates, parent, &pdb_fname);
     }
-    for dir in search_path.split(';').filter(|d| !d.is_empty()) {
-        candidates.push(PathBuf::from(dir).join(&pdb_fname));
+    for dir in search_path.split(';').filter(|d| !d.trim().is_empty()) {
+        push_dir_file_candidates(&mut candidates, dir, &pdb_fname);
     }
 
     let sec_rvas = read_pe_section_rvas(m.base);
@@ -3159,5 +3237,112 @@ mod tests {
             assert_eq!(primary_tid, worker_tid);
             assert_eq!(primary_teb, worker_teb, "primary MINIDUMP_THREAD must carry exception thread's TEB");
         }
+    }
+
+    #[test]
+    fn sym_get_line_from_addr_resolves_guest_windows_search_and_image_paths() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sym_root = std::env::temp_dir().join(format!("pf_pdb_win_sym_{uniq}"));
+        let sym_dir = sym_root.join("Symbols");
+        let img_root = std::env::temp_dir().join(format!("pf_pdb_win_img_{uniq}"));
+        let img_dir = img_root.join("Bin");
+        std::fs::create_dir_all(&sym_dir).unwrap();
+        std::fs::create_dir_all(&img_dir).unwrap();
+
+        let guid: [u8; 16] = [
+            0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98,
+            0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE, 0x0F, 0x10,
+        ];
+        let age: u32 = 1;
+        let pdb_sym = build_minimal_pdb_with_id("src\\win_search.cpp", 0x100, 77, guid, age);
+        let pdb_img = build_minimal_pdb_with_id("src\\win_adjacent.cpp", 0x200, 88, guid, age);
+        std::fs::write(sym_dir.join("winsearch.pdb"), &pdb_sym).unwrap();
+        std::fs::write(img_dir.join("winadj.pdb"), &pdb_img).unwrap();
+
+        crate::path::add_mount("S:\\", &sym_root);
+        crate::path::add_mount("G:\\", &img_root);
+
+        let make_pe = |rsds_name: &[u8]| -> Vec<u8> {
+            let mut pe = vec![0u8; 0x600];
+            pe[0..2].copy_from_slice(b"MZ");
+            pe[60..64].copy_from_slice(&0x80u32.to_le_bytes());
+            let nt = 0x80usize;
+            pe[nt..nt + 4].copy_from_slice(b"PE\0\0");
+            pe[nt + 24..nt + 26].copy_from_slice(&0x20Bu16.to_le_bytes());
+            pe[nt + 132..nt + 136].copy_from_slice(&16u32.to_le_bytes());
+            pe[nt + 184..nt + 188].copy_from_slice(&0x300u32.to_le_bytes());
+            pe[nt + 188..nt + 192].copy_from_slice(&28u32.to_le_bytes());
+            let dbg = 0x300usize;
+            pe[dbg + 12..dbg + 16].copy_from_slice(&2u32.to_le_bytes());
+            let cv_len = (24 + rsds_name.len()) as u32;
+            pe[dbg + 16..dbg + 20].copy_from_slice(&cv_len.to_le_bytes());
+            pe[dbg + 20..dbg + 24].copy_from_slice(&0x400u32.to_le_bytes());
+            let rsds = 0x400usize;
+            pe[rsds..rsds + 4].copy_from_slice(b"RSDS");
+            pe[rsds + 4..rsds + 20].copy_from_slice(&guid);
+            pe[rsds + 20..rsds + 24].copy_from_slice(&age.to_le_bytes());
+            pe[rsds + 24..rsds + 24 + rsds_name.len()].copy_from_slice(rsds_name);
+            pe
+        };
+        let pe_search = make_pe(b"X:\\missing\\winsearch.pdb\0");
+        let pe_adj = make_pe(b"X:\\missing\\winadj.pdb\0");
+        let base_search = pe_search.as_ptr() as u64;
+        let base_adj = pe_adj.as_ptr() as u64;
+
+        unsafe {
+            // 1. Guest Windows search path (`S:\Symbols`) via SymInitialize resolves the PDB.
+            let proc1 = 0x5555usize as HANDLE;
+            assert_eq!(SymInitialize(proc1, c"S:\\Symbols".as_ptr() as *const u8, FALSE), TRUE);
+            assert_eq!(
+                SymLoadModule64(
+                    proc1,
+                    std::ptr::null_mut(),
+                    c"C:\\Nowhere\\winsearch.dll".as_ptr() as *const u8,
+                    c"winsearch".as_ptr() as *const u8,
+                    base_search,
+                    0x10000,
+                ),
+                base_search
+            );
+            let mut disp = 0u32;
+            let mut line = [0u8; 40];
+            (line.as_mut_ptr() as *mut u32).write_unaligned(40);
+            assert_eq!(
+                SymGetLineFromAddr64(proc1, base_search + 0x1100, &mut disp, line.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!((line.as_ptr().add(16) as *const u32).read_unaligned(), 77);
+            assert_eq!(SymCleanup(proc1), TRUE);
+
+            // 2. Guest Windows image path (`G:\Bin\winadj.dll`) resolves adjacent `G:\Bin\winadj.pdb`
+            //    even when no search path is configured.
+            let proc2 = 0x5556usize as HANDLE;
+            assert_eq!(SymInitialize(proc2, std::ptr::null(), FALSE), TRUE);
+            assert_eq!(
+                SymLoadModule64(
+                    proc2,
+                    std::ptr::null_mut(),
+                    c"G:\\Bin\\winadj.dll".as_ptr() as *const u8,
+                    c"winadj".as_ptr() as *const u8,
+                    base_adj,
+                    0x10000,
+                ),
+                base_adj
+            );
+            let mut line2 = [0u8; 40];
+            (line2.as_mut_ptr() as *mut u32).write_unaligned(40);
+            assert_eq!(
+                SymGetLineFromAddr64(proc2, base_adj + 0x1200, &mut disp, line2.as_mut_ptr()),
+                TRUE
+            );
+            assert_eq!((line2.as_ptr().add(16) as *const u32).read_unaligned(), 88);
+            assert_eq!(SymCleanup(proc2), TRUE);
+        }
+
+        let _ = std::fs::remove_dir_all(&sym_root);
+        let _ = std::fs::remove_dir_all(&img_root);
     }
 }
