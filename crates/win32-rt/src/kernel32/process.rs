@@ -222,17 +222,24 @@ impl ChildProcessObj {
     #[cfg(not(target_os = "ios"))]
     fn finish_reaped(&self, guest_code: Option<u32>, fallback_code: u32) {
         self.os_pid.store(0, Ordering::Release);
-        {
+        let newly_finished = {
             let g = handles::wait_lock();
             let slot = self.exit_code.get(&g);
             if slot.is_none() {
                 let term_code = *self.terminated_code.get(&g);
                 // Prefer an explicit 32-bit guest exit code if the child completed ExitProcess/return;
                 // otherwise prefer the 32-bit code passed to TerminateProcess over POSIX signal fallback.
-                *slot = Some(guest_code.or(term_code).unwrap_or(fallback_code));
+                let final_code = guest_code.or(term_code).unwrap_or(fallback_code);
+                *slot = Some(final_code);
+                Some(final_code)
+            } else {
+                None
             }
-        }
+        };
         handles::notify_object_key(handles::obj_key(self), usize::MAX);
+        if let Some(code) = newly_finished {
+            notify_jobs_of_child_exit(self.pid, code);
+        }
     }
 }
 
@@ -1702,6 +1709,44 @@ impl JobMember {
 }
 
 const JOB_OBJECT_LIMIT_JOB_TIME: u32 = 0x0004;
+const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+const JOB_OBJECT_MSG_EXIT_PROCESS: u32 = 7;
+const JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS: u32 = 8;
+
+fn post_job_iocp_msg(cp: &(usize, Arc<crate::kernel32::file::IoCompletionPort>), msg: u32, payload: usize) {
+    cp.1.post(crate::kernel32::file::IocpPacket {
+        bytes: msg,
+        key: cp.0,
+        overlapped: payload,
+        internal_status: crate::ntdll::STATUS_SUCCESS as usize,
+    });
+}
+
+#[cfg(not(target_os = "ios"))]
+fn notify_jobs_of_child_exit(pid: u32, exit_code: u32) {
+    let jobs: Vec<Arc<JobObj>> = {
+        let mut all = all_jobs().lock().unwrap();
+        all.retain(|w| w.strong_count() > 0);
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let exit_msg = if (0x8000_0000..=0xCFFF_FFFF).contains(&exit_code) {
+        JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+    } else {
+        JOB_OBJECT_MSG_EXIT_PROCESS
+    };
+    for jo in jobs {
+        let st = jo.state.lock().unwrap();
+        if st.contains_pid(pid) {
+            if let Some(ref cp) = st.completion_port {
+                post_job_iocp_msg(cp, exit_msg, pid as usize);
+                if st.active_count() == 0 {
+                    post_job_iocp_msg(cp, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
+                }
+            }
+        }
+    }
+}
 
 /// Current process `(user_100ns, kernel_100ns, page_faults)` from `getrusage(RUSAGE_SELF)`.
 fn self_rusage_snapshot() -> (u64, u64, u64) {
@@ -1730,7 +1775,7 @@ struct JobState {
     peak_job_memory: usize,
     ui_restrictions: u32,
     end_of_job_time_action: u32,
-    completion_port: Option<(usize, usize)>,
+    completion_port: Option<(usize, Arc<crate::kernel32::file::IoCompletionPort>)>,
     cpu_rate_control: [u8; 8],
     notification_limits: [u8; 72],
     group_ids: Vec<u16>,
@@ -1984,8 +2029,26 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
         st.self_assign_rusage = Some(snap);
         st.self_period_rusage = Some((snap.0, snap.1));
     }
+    let exited_code = match &member {
+        JobMember::Child(c) => c.current_exit_code(),
+        JobMember::SelfProc(_) => None,
+    };
     st.members.push(member);
     st.total_processes = st.total_processes.saturating_add(1);
+    if let Some(ref cp) = st.completion_port {
+        post_job_iocp_msg(cp, JOB_OBJECT_MSG_NEW_PROCESS, pid as usize);
+        if let Some(code) = exited_code {
+            let msg = if (0x8000_0000..=0xCFFF_FFFF).contains(&code) {
+                JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+            } else {
+                JOB_OBJECT_MSG_EXIT_PROCESS
+            };
+            post_job_iocp_msg(cp, msg, pid as usize);
+            if st.active_count() == 0 {
+                post_job_iocp_msg(cp, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
+            }
+        }
+    }
     TRUE
 }
 
@@ -2050,14 +2113,27 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
             TRUE
         }
         7 => {
-            // JobObjectAssociateCompletionPortInformation (16 bytes on x64)
+            // JobObjectAssociateCompletionPortInformation (16 bytes on x64):
+            // +0: PVOID CompletionKey, +8: HANDLE CompletionPort.
             if len != 16 {
                 set_err(err::ERROR_BAD_LENGTH);
                 return FALSE;
             }
             let key = std::ptr::read_unaligned(bytes as *const usize);
-            let port = std::ptr::read_unaligned(bytes.add(8) as *const usize);
-            st.completion_port = Some((key, port));
+            let port = std::ptr::read_unaligned(bytes.add(8) as *const HANDLE);
+            if port.is_null() {
+                st.completion_port = None;
+                return TRUE;
+            }
+            if st.completion_port.is_some() {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            let Some(iocp) = handles::get_as::<crate::kernel32::file::IoCompletionPort>(port) else {
+                set_err(err::ERROR_INVALID_HANDLE);
+                return FALSE;
+            };
+            st.completion_port = Some((key, iocp));
             TRUE
         }
         9 => {
@@ -3982,6 +4058,72 @@ pub(crate) mod tests {
             assert_eq!(QueryInformationJobObject(nj3, 15, fresh_cpu.as_mut_ptr() as *mut c_void, 8, &mut ret_len), TRUE);
             assert_eq!(fresh_cpu, [0u8; 8]);
             assert_eq!(crate::kernel32::threads::CloseHandle(nj3), TRUE);
+
+            // JobObjectAssociateCompletionPortInformation (class 7) delivers real IOCP
+            // notifications on process assignment and child exit (including ACTIVE_PROCESS_ZERO).
+            #[cfg(not(target_os = "ios"))]
+            {
+                let iocp = crate::kernel32::file::CreateIoCompletionPort(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                );
+                assert!(!iocp.is_null());
+                let cjob = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob.is_null());
+
+                // Bogus port handle -> ERROR_INVALID_HANDLE.
+                let mut assoc = [0u8; 16];
+                std::ptr::write_unaligned(assoc.as_mut_ptr() as *mut usize, 0xCAFE_1234usize);
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, 0xDEADusize as HANDLE);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+                // Valid IOCP association succeeds; re-associating a non-null port fails with ERROR_INVALID_PARAMETER.
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+                let child_obj = Arc::new(ChildProcessObj {
+                    pid: 77777,
+                    exe_win: "C:\\Games\\Worker.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let child_h = handles::insert(Arc::clone(&child_obj) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob, child_h), TRUE);
+
+                let mut msg: u32 = 0;
+                let mut key: usize = 0;
+                let mut ov: *mut crate::kernel32::file::OVERLAPPED = std::ptr::null_mut();
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_NEW_PROCESS);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 77777);
+
+                // Child exit posts EXIT_PROCESS followed by ACTIVE_PROCESS_ZERO.
+                child_obj.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_EXIT_PROCESS);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 77777);
+
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO);
+                assert_eq!(key, 0xCAFE_1234);
+                assert_eq!(ov as usize, 0);
+
+                // NULL completion port disassociates cleanly.
+                std::ptr::write_unaligned(assoc.as_mut_ptr().add(8) as *mut HANDLE, std::ptr::null_mut());
+                assert_eq!(SetInformationJobObject(cjob, 7, assoc.as_ptr() as *const c_void, 16), TRUE);
+
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(iocp), TRUE);
+            }
         }
     }
 
