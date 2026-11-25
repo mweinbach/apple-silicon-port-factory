@@ -126,11 +126,20 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, uc: *mut lib
                 if sig == libc::SIGILL || bytes == [0x0F, 0x0B] {
                     rec.code = unwind::STATUS_ILLEGAL_INSTRUCTION;
                 } else {
-                    rec.code = unwind::STATUS_ACCESS_VIOLATION;
+                    let is_write = (err & 2) != 0;
+                    if win32_rt::kernel32::memory::try_handle_write_watch_fault(fault_addr as usize, is_write) {
+                        return;
+                    }
+                    let is_guard = win32_rt::kernel32::memory::consume_guard_page(fault_addr as usize).is_some();
+                    rec.code = if is_guard {
+                        unwind::STATUS_GUARD_PAGE_VIOLATION
+                    } else {
+                        unwind::STATUS_ACCESS_VIOLATION
+                    };
                     rec.number_parameters = 2;
                     let kind = if fault_addr as usize == rip {
                         8
-                    } else if err & 2 != 0 {
+                    } else if is_write {
                         1
                     } else {
                         0
@@ -138,11 +147,13 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, uc: *mut lib
                     rec.information[0] = kind;
                     rec.information[1] = fault_addr;
                     // Fault on a Windows thread's stack guard -> stack overflow.
-                    let t = win32_rt::teb::current_raw();
-                    if !t.is_null() {
-                        let lo: usize = win32_rt::teb::field(t, win32_rt::teb::off::STACK_LIMIT);
-                        if (fault_addr as usize) < lo && (fault_addr as usize) + 0x10000 >= lo {
-                            fatal("stack overflow (STATUS_STACK_OVERFLOW)", mc);
+                    if !is_guard {
+                        let t = win32_rt::teb::current_raw();
+                        if !t.is_null() {
+                            let lo: usize = win32_rt::teb::field(t, win32_rt::teb::off::STACK_LIMIT);
+                            if (fault_addr as usize) < lo && (fault_addr as usize) + 0x10000 >= lo {
+                                fatal("stack overflow (STATUS_STACK_OVERFLOW)", mc);
+                            }
                         }
                     }
                 }
@@ -482,12 +493,18 @@ unsafe fn try_emulate_kuser_read(fault_addr: u64, ss: *mut u64) -> bool {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn deliver_page_av_inner(addr: u64, is_write: bool, gpr: [u64; 16], guest_rip: u64) -> bool {
+unsafe fn deliver_page_fault_inner(code: u32, addr: u64, is_write: bool, gpr: [u64; 16], guest_rip: u64) -> bool {
     let xmm = [0u128; 16];
+    if code == unwind::STATUS_GUARD_PAGE_VIOLATION {
+        let kind = if is_write { 1u64 } else { 0u64 };
+        let mut rec = unwind::guest_exception_record(code, guest_rip, &[kind, addr]);
+        let mut ctx = unwind::guest_context(&gpr, &xmm, guest_rip, 0x202);
+        return unwind::dispatch_veh_guest(&mut rec, &mut ctx);
+    }
     let kinds: &[u64] = if is_write { &[1, 8, 0] } else { &[8, 0] };
     for &kind in kinds {
         let rip = if kind == 8 { addr } else { guest_rip };
-        let mut rec = unwind::guest_exception_record(unwind::STATUS_ACCESS_VIOLATION, rip, &[kind, addr]);
+        let mut rec = unwind::guest_exception_record(code, rip, &[kind, addr]);
         let mut ctx = unwind::guest_context(&gpr, &xmm, rip, 0x202);
         if unwind::dispatch_veh_guest(&mut rec, &mut ctx) {
             return true;
@@ -513,6 +530,7 @@ struct PageFaultHelper {
 #[cfg(target_arch = "aarch64")]
 struct PageFaultReq {
     teb: *mut u8,
+    code: u32,
     addr: u64,
     is_write: bool,
     gpr: [u64; 16],
@@ -546,7 +564,7 @@ impl PageFaultHelper {
                     if !job.teb.is_null() {
                         win32_rt::teb::install(job.teb);
                     }
-                    let res = deliver_page_av_inner(job.addr, job.is_write, job.gpr, job.guest_rip);
+                    let res = deliver_page_fault_inner(job.code, job.addr, job.is_write, job.gpr, job.guest_rip);
                     if !job.teb.is_null() {
                         win32_rt::teb::uninstall();
                     }
@@ -560,7 +578,7 @@ impl PageFaultHelper {
         Self { req, resp }
     }
 
-    unsafe fn dispatch(&self, addr: u64, is_write: bool) -> bool {
+    unsafe fn dispatch(&self, code: u32, addr: u64, is_write: bool) -> bool {
         let teb = win32_rt::teb::current_raw();
         let (gpr, guest_rip) = x86_runtime::emu::current_guest_state().unwrap_or(([0u64; 16], addr));
         if !teb.is_null() {
@@ -568,7 +586,7 @@ impl PageFaultHelper {
         }
         {
             let mut g = self.req.0.lock().unwrap();
-            *g = Some(PageFaultReq { teb, addr, is_write, gpr, guest_rip });
+            *g = Some(PageFaultReq { teb, code, addr, is_write, gpr, guest_rip });
             self.req.1.notify_one();
         }
         let ok = {
@@ -588,11 +606,11 @@ impl PageFaultHelper {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn deliver_page_av(addr: u64, is_write: bool) -> bool {
+unsafe fn deliver_page_fault(code: u32, addr: u64, is_write: bool) -> bool {
     thread_local! {
         static HELPER: std::cell::OnceCell<PageFaultHelper> = const { std::cell::OnceCell::new() };
     }
-    HELPER.with(|h| h.get_or_init(PageFaultHelper::new).dispatch(addr, is_write))
+    HELPER.with(|h| h.get_or_init(PageFaultHelper::new).dispatch(code, addr, is_write))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -675,7 +693,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     if mbi.state != MEM_COMMIT {
         return false;
     }
-    let fault_protected = mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0;
+    let is_guard = (mbi.protect & PAGE_GUARD) != 0;
+    let fault_protected = mbi.protect == PAGE_NOACCESS || is_guard;
     let any_sibling_protected = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
     if !fault_protected && !any_sibling_protected {
         // Another thread finished unlocking this 16 KiB host page while we waited.
@@ -684,22 +703,33 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
 
     IN_FAULT.with(|f| f.set(true));
     let mut handled = false;
+    if is_guard {
+        // Windows clears PAGE_GUARD atomically BEFORE delivering STATUS_GUARD_PAGE_VIOLATION
+        // so that VirtualQuery inside the handler observes the underlying protection and
+        // returning EXCEPTION_CONTINUE_EXECUTION completes the faulting access once.
+        let _ = memory::consume_guard_page(addr);
+        handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, fault_addr, is_write);
+        IN_FAULT.with(|f| f.set(false));
+        return handled;
+    }
     if fault_protected {
-        handled = deliver_page_av(fault_addr, false);
+        handled = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, fault_addr, false);
         if !handled {
             IN_FAULT.with(|f| f.set(false));
             return false;
         }
     }
-    // Unlock any sibling 4 KiB encrypted sub-pages sharing this 16 KiB host page.
+    // Unlock any sibling 4 KiB encrypted PAGE_NOACCESS sub-pages sharing this 16 KiB host page
+    // (never eagerly consume sibling PAGE_GUARD pages).
     let fault_page4 = addr & !0xFFF;
     for i in 0..4 {
         let sub = hpage + i * 0x1000;
         if sub == fault_page4 {
             continue;
         }
-        if sub_is_protected(sub) && in_guest(sub) {
-            let _ = deliver_page_av(sub as u64, false);
+        let sub_noaccess = memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS);
+        if sub_noaccess && in_guest(sub) {
+            let _ = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, sub as u64, false);
         }
     }
     // Restore host readability if any non-guest/permanent PAGE_NOACCESS sibling
@@ -751,8 +781,12 @@ extern "C" fn handler(sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut li
             let esr: u32 = rd(mc, 8);
             let ec = (esr >> 26) & 0x3F;
             let is_write = (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0;
+            let clean_fault = fault_addr & 0x0000_FFFF_FFFF_FFFF;
+            if win32_rt::kernel32::memory::try_handle_write_watch_fault(clean_fault as usize, is_write) {
+                return;
+            }
             let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
-            if try_dispatch_guest_page_fault(fault_addr & 0x0000_FFFF_FFFF_FFFF, pc, is_write) {
+            if try_dispatch_guest_page_fault(clean_fault, pc, is_write) {
                 return;
             }
         }

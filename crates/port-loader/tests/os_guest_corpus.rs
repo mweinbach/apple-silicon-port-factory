@@ -1646,6 +1646,166 @@ int main(void) {
 "##;
 
 // ---------------------------------------------------------------------------
+// Kernel-core VM guard pages, MEM_WRITE_WATCH, affinity, job objects & InitOnce async
+// ---------------------------------------------------------------------------
+
+#[test]
+fn guest_kernel_core_guard_page_and_write_watch() {
+    let Some(zig) = find_zig() else {
+        eprintln!("skipping guest_kernel_core_guard_page_and_write_watch: zig not found");
+        return;
+    };
+    let tmp = TempDir::new("kernel-core-vm");
+    let exe = compile_c_guest(
+        &zig,
+        tmp.path(),
+        "kernel_core_vm",
+        KERNEL_CORE_VM_C,
+        &["kernel32"],
+    );
+    run_guest_both_modes(
+        "kernel_core_vm",
+        &exe,
+        tmp.path(),
+        &[
+            "CORPUS_KCORE: page_guard_oneshot ok",
+            "CORPUS_KCORE: write_watch_hw ok",
+            "CORPUS_KCORE: mem_large_pages_and_reset_undo ok",
+            "CORPUS_KCORE: affinity_and_flush ok",
+            "CORPUS_KCORE: PASS ALL",
+        ],
+        DEFAULT_TIMEOUT,
+    );
+}
+
+const KERNEL_CORE_VM_C: &str = r##"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (line %d, err=%lu)\n", (msg), __LINE__, (unsigned long)GetLastError()); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+static volatile LONG g_guard_hits = 0;
+static volatile ULONG_PTR g_guard_addr = 0;
+static volatile ULONG_PTR g_guard_kind = 99;
+static volatile DWORD g_guard_prot_in_veh = 0;
+
+static LONG CALLBACK guard_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+        InterlockedIncrement(&g_guard_hits);
+        g_guard_kind = ep->ExceptionRecord->ExceptionInformation[0];
+        g_guard_addr = ep->ExceptionRecord->ExceptionInformation[1];
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)g_guard_addr, &mbi, sizeof(mbi)) != 0) {
+            g_guard_prot_in_veh = mbi.Protect;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int main(void) {
+    /* 1. Real one-shot PAGE_GUARD via VirtualProtect + VEH STATUS_GUARD_PAGE_VIOLATION */
+    PVOID veh = AddVectoredExceptionHandler(1, guard_veh);
+    CHECK(veh != NULL, "AddVectoredExceptionHandler");
+
+    uint8_t *gp = (uint8_t *)VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(gp != NULL, "VirtualAlloc guard region");
+    DWORD old_prot = 0;
+    CHECK(VirtualProtect(gp, 0x4000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "VirtualProtect PAGE_GUARD");
+    CHECK(old_prot == PAGE_READWRITE, "old prot was PAGE_READWRITE");
+
+    /* First write triggers STATUS_GUARD_PAGE_VIOLATION once; guard clears before handler runs. */
+    *(volatile uint32_t *)(gp + 0x40) = 0x13572468u;
+    CHECK(g_guard_hits == 1, "guard page fired exactly once");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x40), "guard fault address matches");
+    CHECK(g_guard_kind == 1, "guard fault kind is write (1)");
+    CHECK(g_guard_prot_in_veh == PAGE_READWRITE, "PAGE_GUARD already cleared inside VEH");
+    CHECK(*(volatile uint32_t *)(gp + 0x40) == 0x13572468u, "write completed after VEH continue");
+
+    /* Second access must NOT fault again. */
+    *(volatile uint32_t *)(gp + 0x44) = 0x24681357u;
+    CHECK(g_guard_hits == 1, "guard page did not fire a second time");
+    CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write succeeded");
+    CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
+    RemoveVectoredExceptionHandler(veh);
+    printf("CORPUS_KCORE: page_guard_oneshot ok\n");
+
+    /* 2. Real hardware MEM_WRITE_WATCH + GetWriteWatch + ResetWriteWatch */
+    SIZE_T ww_size = 0x40000; /* 256 KiB */
+    uint8_t *ww = (uint8_t *)VirtualAlloc(NULL, ww_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    CHECK(ww != NULL, "VirtualAlloc MEM_WRITE_WATCH");
+
+    PVOID addrs[32];
+    ULONG_PTR count = 32;
+    DWORD gran = 0;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "initial GetWriteWatch");
+    CHECK(count == 0, "initially 0 dirty pages");
+    CHECK(gran >= 4096 && (gran & (gran - 1)) == 0, "valid power-of-2 granularity");
+
+    /* Touch page 1 and page 3 (at granularity stride). */
+    *(volatile uint32_t *)(ww + gran * 1 + 8) = 0xAA55AA55u;
+    *(volatile uint32_t *)(ww + gran * 3 + 16) = 0x55AA55AAu;
+
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch after writes");
+    CHECK(count == 2, "2 pages recorded dirty");
+    CHECK(addrs[0] == (PVOID)(ww + gran * 1), "dirty page 0 == gran*1");
+    CHECK(addrs[1] == (PVOID)(ww + gran * 3), "dirty page 1 == gran*3");
+
+    /* ResetWriteWatch clears dirty state and re-arms write traps. */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch");
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch after reset");
+    CHECK(count == 0, "0 dirty pages after ResetWriteWatch");
+
+    /* Writing page 2 after reset triggers a fresh write-watch record. */
+    *(volatile uint32_t *)(ww + gran * 2) = 0xCAFEBABEu;
+    count = 32;
+    CHECK(GetWriteWatch(WRITE_WATCH_FLAG_RESET, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch RESET");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 2), "re-armed dirty page 2 recorded");
+    CHECK(VirtualFree(ww, 0, MEM_RELEASE), "VirtualFree write-watch region");
+    printf("CORPUS_KCORE: write_watch_hw ok\n");
+
+    /* 3. MEM_LARGE_PAGES without SeLockMemoryPrivilege + MEM_RESET/MEM_RESET_UNDO */
+    PVOID lp = VirtualAlloc(NULL, 2 * 1024 * 1024, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    CHECK(lp == NULL && GetLastError() == ERROR_PRIVILEGE_NOT_HELD, "MEM_LARGE_PAGES -> ERROR_PRIVILEGE_NOT_HELD");
+
+    uint8_t *rp = (uint8_t *)VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(rp != NULL, "VirtualAlloc reset region");
+    *(volatile uint64_t *)rp = 0x0123456789ABCDEFull;
+    CHECK(VirtualAlloc(rp, 0x10000, MEM_RESET, PAGE_READWRITE) == rp, "MEM_RESET");
+    PVOID undo = VirtualAlloc(rp, 0x10000, MEM_RESET_UNDO, PAGE_READWRITE);
+    if (undo != NULL) {
+        CHECK(*(volatile uint64_t *)rp == 0x0123456789ABCDEFull, "MEM_RESET_UNDO data intact");
+    }
+    CHECK(VirtualFree(rp, 0, MEM_RELEASE), "VirtualFree reset region");
+    printf("CORPUS_KCORE: mem_large_pages_and_reset_undo ok\n");
+
+    /* 4. SetThreadAffinityMask returns previous mask + FlushProcessWriteBuffers */
+    DWORD_PTR pm = 0, sm = 0;
+    CHECK(GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm != 0, "GetProcessAffinityMask");
+    DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), 1);
+    CHECK(prev == pm, "first SetThreadAffinityMask returns process mask");
+    DWORD_PTR prev2 = SetThreadAffinityMask(GetCurrentThread(), pm);
+    CHECK(prev2 == 1, "second SetThreadAffinityMask returns previous 1");
+    FlushProcessWriteBuffers();
+    printf("CORPUS_KCORE: affinity_and_flush ok\n");
+
+    printf("CORPUS_KCORE: PASS ALL\n");
+    fflush(stdout);
+    return 0;
+}
+"##;
+
+// ---------------------------------------------------------------------------
 // Backlog expected failure: user32.dll!wsprintfW / wsprintfA
 // ---------------------------------------------------------------------------
 

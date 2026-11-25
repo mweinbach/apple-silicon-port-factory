@@ -6,7 +6,7 @@
 
 use crate::heap;
 use crate::types::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -37,6 +37,8 @@ pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 pub const PAGE_GUARD: u32 = 0x100;
+pub const WRITE_WATCH_FLAG_RESET: u32 = 0x01;
+const LARGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 const PAGE: usize = 0x1000;
 #[cfg(target_arch = "x86_64")]
@@ -117,7 +119,29 @@ pub unsafe fn parse_extended_alignment(ext: *const c_void, count: u32) -> Result
     Ok(align)
 }
 
+#[inline]
+fn is_writable_prot(prot: u32) -> bool {
+    matches!(
+        prot & 0xFF,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+#[inline]
+fn validate_page_prot(prot: u32) -> Result<(), u32> {
+    let base = prot & 0xFF;
+    // Per Microsoft Learn (Memory Protection Constants): PAGE_GUARD cannot be
+    // combined with PAGE_NOACCESS (or an empty base protection).
+    if (prot & PAGE_GUARD) != 0 && (base == 0 || base == PAGE_NOACCESS) {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+    Ok(())
+}
+
 pub fn win_prot_to_host(p: u32) -> i32 {
+    if p & PAGE_GUARD != 0 {
+        return libc::PROT_NONE;
+    }
     match p & 0xff {
         PAGE_NOACCESS => libc::PROT_NONE,
         PAGE_READONLY => libc::PROT_READ,
@@ -141,18 +165,31 @@ struct Alloc {
     size: usize,
     prot: u32,
     kind: u32, // MEM_PRIVATE / MEM_IMAGE / MEM_MAPPED
+    write_watch: bool,
 }
 
 struct VmState {
     allocs: BTreeMap<usize, Alloc>,
     segs: BTreeMap<usize, Seg>,
+    /// Host-page-aligned addresses written inside `MEM_WRITE_WATCH` regions since last reset.
+    write_watch_dirty: BTreeSet<usize>,
+    /// Host-page-aligned addresses that were resident (`MINCORE_INCORE`) when `MEM_RESET` was applied.
+    reset_resident: BTreeSet<usize>,
 }
 
-static VM: Mutex<VmState> = Mutex::new(VmState { allocs: BTreeMap::new(), segs: BTreeMap::new() });
+static VM: Mutex<VmState> = Mutex::new(VmState {
+    allocs: BTreeMap::new(),
+    segs: BTreeMap::new(),
+    write_watch_dirty: BTreeSet::new(),
+    reset_resident: BTreeSet::new(),
+});
 /// Set once any committed page in `VM` is marked `PAGE_NOACCESS` or `PAGE_GUARD`
 /// (e.g. packed executables using demand-decryption). Lets speculative JIT code
 /// readers avoid taking `VM.lock()` on normal games and multi-threaded `.aot` prewarm.
 static HAS_NOACCESS_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once any `MEM_WRITE_WATCH` allocation is created so write-fault handlers can
+/// skip taking `VM.lock()` when write-watch is unused.
+static HAS_WRITE_WATCH_PAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl VmState {
     fn alloc_containing(&self, addr: usize) -> Option<(usize, Alloc)> {
@@ -189,13 +226,116 @@ impl VmState {
             self.segs.remove(&k);
         }
     }
+    fn clear_tracking_in(&mut self, start: usize, end: usize) {
+        let hstart = start & !(HOST_PAGE - 1);
+        let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+        let dirty: Vec<usize> = self.write_watch_dirty.range(hstart..hend).copied().collect();
+        for hp in dirty {
+            self.write_watch_dirty.remove(&hp);
+        }
+        let res: Vec<usize> = self.reset_resident.range(hstart..hend).copied().collect();
+        for hp in res {
+            self.reset_resident.remove(&hp);
+        }
+    }
+}
+
+/// Apply host protection for `[start, end)` inside `vm`, stripping `PROT_WRITE` on
+/// clean (not-yet-written) host pages of `MEM_WRITE_WATCH` allocations so the first
+/// store triggers `try_handle_write_watch_fault`.
+unsafe fn apply_range_host_prot(vm: &VmState, start: usize, end: usize, prot: u32, write_watch: bool) -> i32 {
+    let base_host = win_prot_to_host(prot);
+    if !write_watch || !is_writable_prot(prot) || (prot & PAGE_GUARD) != 0 {
+        return host_mprotect(start, end - start, base_host);
+    }
+    let mut hp = start & !(HOST_PAGE - 1);
+    let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    while hp < hend {
+        let p = if vm.write_watch_dirty.contains(&hp) {
+            base_host
+        } else {
+            base_host & !libc::PROT_WRITE
+        };
+        let rc = host_mprotect(hp, HOST_PAGE, p);
+        if rc != 0 {
+            return rc;
+        }
+        hp += HOST_PAGE;
+    }
+    0
+}
+
+unsafe fn host_page_is_incore(hpage: usize) -> bool {
+    let mut state: libc::c_char = 0;
+    libc::mincore(hpage as *const c_void, HOST_PAGE, &mut state) == 0 && (state & 1) != 0
+}
+
+/// Handle a hardware write fault on a clean `MEM_WRITE_WATCH` host page.
+///
+/// Called from the host `SIGBUS`/`SIGSEGV` handler before guest exception dispatch.
+/// Returns `true` when `fault_addr` lies in a committed, writable, non-guard page of
+/// a `MEM_WRITE_WATCH` allocation, records the host page as written, enables
+/// `PROT_WRITE`, and lets the faulting instruction retry natively.
+pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) -> bool {
+    if !is_write || !HAS_WRITE_WATCH_PAGES.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let page = fault_addr & !(PAGE - 1);
+    let hpage = fault_addr & !(HOST_PAGE - 1);
+    let mut vm = VM.lock().unwrap();
+    let Some((_, alloc)) = vm.alloc_containing(page) else {
+        return false;
+    };
+    if !alloc.write_watch {
+        return false;
+    }
+    let Some((&_s, &seg)) = vm.segs.range(..=page).next_back() else {
+        return false;
+    };
+    if page >= seg.end
+        || seg.state != MEM_COMMIT
+        || !is_writable_prot(seg.prot)
+        || (seg.prot & PAGE_GUARD) != 0
+    {
+        return false;
+    }
+    vm.write_watch_dirty.insert(hpage);
+    host_mprotect(hpage, HOST_PAGE, win_prot_to_host(seg.prot)) == 0
+}
+
+/// Atomically consume a one-shot `PAGE_GUARD` bit on the faulting 4 KiB page and
+/// restore its underlying protection (mirroring Windows before delivering
+/// `STATUS_GUARD_PAGE_VIOLATION`).
+///
+/// Returns `Some(previous_protect)` if `fault_addr` was on a committed `PAGE_GUARD`
+/// page (now cleared to `previous_protect & !PAGE_GUARD`), or `None` otherwise.
+pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<u32> {
+    let page = fault_addr & !(PAGE - 1);
+    let hpage = fault_addr & !(HOST_PAGE - 1);
+    let mut vm = VM.lock().unwrap();
+    let write_watch = vm.alloc_containing(page).is_some_and(|(_, a)| a.write_watch);
+    let (&_s, seg) = vm.segs.range(..=page).next_back()?;
+    if page >= seg.end || seg.state != MEM_COMMIT || (seg.prot & PAGE_GUARD) == 0 {
+        return None;
+    }
+    let old_prot = seg.prot;
+    let new_prot = old_prot & !PAGE_GUARD;
+    vm.set_range(page, page + PAGE, MEM_COMMIT, new_prot);
+    let host_p = if write_watch && is_writable_prot(new_prot) && !vm.write_watch_dirty.contains(&hpage) {
+        win_prot_to_host(new_prot) & !libc::PROT_WRITE
+    } else {
+        win_prot_to_host(new_prot)
+    };
+    let _ = host_mprotect(page, PAGE, host_p);
+    note_hpage_prot_change(page, page + PAGE);
+    Some(old_prot)
 }
 
 /// Register a PE image (or other host-managed range) so VirtualQuery
 /// reports it as MEM_IMAGE with the given per-range protections.
 pub fn register_image(base: usize, size: usize, ranges: &[(usize, usize, u32)]) {
     let mut vm = VM.lock().unwrap();
-    vm.allocs.insert(base, Alloc { size, prot: PAGE_EXECUTE_WRITECOPY, kind: MEM_IMAGE });
+    vm.allocs.insert(base, Alloc { size, prot: PAGE_EXECUTE_WRITECOPY, kind: MEM_IMAGE, write_watch: false });
     vm.set_range(base, base + size, MEM_COMMIT, PAGE_READONLY);
     for &(s, e, p) in ranges {
         vm.set_range(s, e, MEM_COMMIT, p);
@@ -275,7 +415,7 @@ pub fn update_protection(start: usize, end: usize, prot: u32) {
 pub fn register_mapped_view(base: usize, size: usize, prot: u32) {
     {
         let mut vm = VM.lock().unwrap();
-        vm.allocs.insert(base, Alloc { size, prot, kind: MEM_MAPPED });
+        vm.allocs.insert(base, Alloc { size, prot, kind: MEM_MAPPED, write_watch: false });
         vm.set_range(base, base + size, MEM_COMMIT, prot);
     }
     if is_exec(prot) {
@@ -358,22 +498,98 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
     if memdiag() && (prot & 0xF0 != 0 || ty & MEM_RESET != 0) {
         memdiag_log(format_args!("VirtualAlloc(addr={addr:#x}, size={size:#x}, ty={ty:#x}, prot={prot:#x})"));
     }
+    validate_page_prot(prot)?;
     if ty & MEM_LARGE_PAGES != 0 {
-        stub!("MEM_LARGE_PAGES ignored");
+        // Per Microsoft Learn (VirtualAlloc / Large-Page Support):
+        // - MEM_LARGE_PAGES requires MEM_RESERVE | MEM_COMMIT, cannot combine with
+        //   MEM_WRITE_WATCH, PAGE_GUARD, or PAGE_NOACCESS, and requires 2 MiB
+        //   multiple size and address alignment.
+        // - Even with valid parameters, Windows fails with ERROR_PRIVILEGE_NOT_HELD
+        //   when the process token lacks SeLockMemoryPrivilege (and Apple Silicon
+        //   XNU does not expose 2 MiB user superpages).
+        if (ty & (MEM_RESERVE | MEM_COMMIT)) != (MEM_RESERVE | MEM_COMMIT)
+            || (ty & MEM_WRITE_WATCH) != 0
+            || (prot & PAGE_GUARD) != 0
+            || (prot & 0xFF) == PAGE_NOACCESS
+            || (size % LARGE_PAGE_SIZE) != 0
+            || (addr != 0 && (addr % LARGE_PAGE_SIZE) != 0)
+        {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        return Err(err::ERROR_PRIVILEGE_NOT_HELD);
     }
-    if ty & MEM_WRITE_WATCH != 0 {
-        stub!("MEM_WRITE_WATCH not tracked");
+    if ty & MEM_WRITE_WATCH != 0 && (ty & MEM_RESERVE) == 0 {
+        // Per Microsoft Learn (VirtualAlloc): MEM_WRITE_WATCH must be specified with MEM_RESERVE.
+        return Err(err::ERROR_INVALID_PARAMETER);
     }
-    if prot & PAGE_GUARD != 0 {
-        stub!("PAGE_GUARD not emulated (treated as normal pages)");
+    if (prot & PAGE_GUARD) != 0 && (ty & MEM_COMMIT) == 0 && (ty & (MEM_RESET | MEM_RESET_UNDO)) == 0 {
+        // Guard pages only apply to committed pages.
+        return Err(err::ERROR_INVALID_PARAMETER);
     }
     if ty & MEM_RESET != 0 {
+        if addr == 0 {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        }
+        let start = addr & !(PAGE - 1);
+        let end = (addr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
+        let mut vm = VM.lock().unwrap();
+        let Some((b, a)) = vm.alloc_containing(start) else {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        };
+        if end > b + a.size {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        }
+        // Record which complete host pages are currently resident before marking them
+        // MADV_FREE_REUSABLE so MEM_RESET_UNDO can verify whether XNU purged any of them.
+        let mut hp = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+        let hend = addr.saturating_add(size) & !(HOST_PAGE - 1);
+        while hp < hend {
+            if host_page_is_incore(hp) {
+                vm.reset_resident.insert(hp);
+            }
+            hp += HOST_PAGE;
+        }
         discard_host_pages(addr, size);
         return Ok(addr);
     }
     if ty & MEM_RESET_UNDO != 0 {
-        stub!("MEM_RESET_UNDO: contents may have been discarded");
+        if addr == 0 {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        }
+        let start = addr & !(PAGE - 1);
+        let end = (addr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
+        let mut vm = VM.lock().unwrap();
+        let Some((b, a)) = vm.alloc_containing(start) else {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        };
+        if end > b + a.size {
+            return Err(err::ERROR_INVALID_ADDRESS);
+        }
+        const MADV_FREE_REUSE: i32 = 8;
+        let hstart = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+        let hend = addr.saturating_add(size) & !(HOST_PAGE - 1);
+        let mut any_discarded = false;
+        if hend > hstart {
+            // Cancel MADV_FREE_REUSABLE in XNU so resident pages remain intact.
+            let _ = libc::madvise(hstart as *mut c_void, hend - hstart, MADV_FREE_REUSE);
+            let tracked: Vec<usize> = vm.reset_resident.range(hstart..hend).copied().collect();
+            for hp in tracked {
+                vm.reset_resident.remove(&hp);
+                if !host_page_is_incore(hp) {
+                    any_discarded = true;
+                }
+            }
+        }
+        if any_discarded {
+            // Per Microsoft Learn (VirtualAlloc MEM_RESET_UNDO): fail when any page in the
+            // range was discarded by the OS while in MEM_RESET state.
+            return Err(err::ERROR_INVALID_ADDRESS);
+        }
         return Ok(addr);
+    }
+    let write_watch = (ty & MEM_WRITE_WATCH) != 0;
+    if write_watch {
+        HAS_WRITE_WATCH_PAGES.store(true, std::sync::atomic::Ordering::Release);
     }
     let mut vm = VM.lock().unwrap();
     if ty & MEM_RESERVE != 0 && ty & MEM_REPLACE_PLACEHOLDER != 0 {
@@ -382,13 +598,16 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
             return Err(err::ERROR_INVALID_ADDRESS);
         }
         let sz = (size + PAGE - 1) & !(PAGE - 1);
-        vm.allocs.insert(addr, Alloc { size: sz, prot, kind: MEM_PRIVATE });
+        vm.allocs.insert(addr, Alloc { size: sz, prot, kind: MEM_PRIVATE, write_watch });
         vm.set_range(addr, addr + sz, MEM_RESERVE, 0);
         if ty & MEM_COMMIT != 0 {
-            if host_mprotect(addr, sz, win_prot_to_host(prot)) != 0 {
+            if apply_range_host_prot(&vm, addr, addr + sz, prot, write_watch) != 0 {
                 return Err(err::ERROR_INVALID_PARAMETER);
             }
             vm.set_range(addr, addr + sz, MEM_COMMIT, prot);
+            if (prot & PAGE_GUARD) != 0 || (prot & 0xFF) == PAGE_NOACCESS {
+                note_hpage_prot_change(addr, addr + sz);
+            }
         }
         return Ok(addr);
     }
@@ -396,13 +615,16 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         let a = addr & !(GRANULARITY - 1);
         let sz = ((addr + size + PAGE - 1) & !(PAGE - 1)) - if addr != 0 { a } else { 0 };
         let base = reserve_aligned(a, sz, align).ok_or(if addr != 0 { err::ERROR_INVALID_ADDRESS } else { err::ERROR_NOT_ENOUGH_MEMORY })?;
-        vm.allocs.insert(base, Alloc { size: sz, prot, kind: MEM_PRIVATE });
+        vm.allocs.insert(base, Alloc { size: sz, prot, kind: MEM_PRIVATE, write_watch });
         vm.set_range(base, base + sz, MEM_RESERVE, 0);
         if ty & MEM_COMMIT != 0 {
-            if host_mprotect(base, sz, win_prot_to_host(prot)) != 0 {
+            if apply_range_host_prot(&vm, base, base + sz, prot, write_watch) != 0 {
                 return Err(err::ERROR_INVALID_PARAMETER);
             }
             vm.set_range(base, base + sz, MEM_COMMIT, prot);
+            if (prot & PAGE_GUARD) != 0 || (prot & 0xFF) == PAGE_NOACCESS {
+                note_hpage_prot_change(base, base + sz);
+            }
         }
         return Ok(if addr != 0 { addr & !(PAGE - 1) } else { base });
     }
@@ -418,10 +640,13 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         if end > b + a.size {
             return Err(err::ERROR_INVALID_ADDRESS);
         }
-        if host_mprotect(start, end - start, win_prot_to_host(prot)) != 0 {
+        if apply_range_host_prot(&vm, start, end, prot, a.write_watch) != 0 {
             return Err(err::ERROR_INVALID_PARAMETER);
         }
         vm.set_range(start, end, MEM_COMMIT, prot);
+        if (prot & PAGE_GUARD) != 0 || (prot & 0xFF) == PAGE_NOACCESS {
+            note_hpage_prot_change(start, end);
+        }
         return Ok(addr);
     }
     Err(err::ERROR_INVALID_PARAMETER)
@@ -484,6 +709,7 @@ pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32>
             libc::munmap(b as *mut c_void, a.size);
             vm.allocs.remove(&b);
             vm.remove_range(b, b + a.size);
+            vm.clear_tracking_in(b, b + a.size);
             return Ok(());
         }
         // mimalloc over-allocates with VirtualAlloc(MEM_RESERVE) and then trims
@@ -503,6 +729,7 @@ pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32>
             vm.allocs.insert(end, Alloc { size: (b + a.size) - end, ..a });
         }
         vm.remove_range(addr, end);
+        vm.clear_tracking_in(addr, end);
         return Ok(());
     }
     if ty & MEM_DECOMMIT != 0 {
@@ -545,6 +772,7 @@ pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32>
             }
         }
         vm.set_range(start, end, MEM_RESERVE, 0);
+        vm.clear_tracking_in(start, end);
         return Ok(());
     }
     Err(err::ERROR_INVALID_PARAMETER)
@@ -562,18 +790,29 @@ pub unsafe extern "win64" fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u3
 }
 
 pub unsafe extern "win64" fn VirtualAllocEx(proc_: HANDLE, addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void {
-    if !proc_.is_null() && proc_ != crate::handles::CURRENT_PROCESS {
-        stub!("VirtualAllocEx on another process");
+    if is_self_process_handle(proc_) {
+        return VirtualAlloc(addr, size, ty, prot);
+    }
+    if crate::handles::get_as::<crate::kernel32::process::ChildProcessObj>(proc_).is_some() {
+        // Cross-process VM allocation requires Mach `task_for_pid` (blocked by macOS SIP/sandbox
+        // without debugger entitlements). Matches Windows when the handle lacks PROCESS_VM_OPERATION.
         crate::teb::set_last_error(err::ERROR_ACCESS_DENIED);
         return std::ptr::null_mut();
     }
-    VirtualAlloc(addr, size, ty, prot)
+    crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+    std::ptr::null_mut()
 }
 
 pub unsafe extern "win64" fn VirtualAlloc2(proc_: HANDLE, addr: *mut c_void, size: usize, ty: u32, prot: u32, ext: *mut c_void, next: u32) -> *mut c_void {
-    if !proc_.is_null() && proc_ != crate::handles::CURRENT_PROCESS {
-        stub!("VirtualAlloc2 on another process");
-        crate::teb::set_last_error(err::ERROR_ACCESS_DENIED);
+    // Per Microsoft Learn (VirtualAlloc2): a NULL process handle targets the current process.
+    if !proc_.is_null() && !is_self_process_handle(proc_) {
+        if crate::handles::get_as::<crate::kernel32::process::ChildProcessObj>(proc_).is_some() {
+            // Cross-process VM allocation is unsupported on macOS/iOS without debugger entitlements;
+            // matches Windows when the handle lacks PROCESS_VM_OPERATION.
+            crate::teb::set_last_error(err::ERROR_ACCESS_DENIED);
+        } else {
+            crate::teb::set_last_error(err::ERROR_INVALID_HANDLE);
+        }
         return std::ptr::null_mut();
     }
     let align = match parse_extended_alignment(ext, next) {
@@ -598,23 +837,99 @@ pub unsafe extern "win64" fn VirtualAlloc2FromApp(proc_: HANDLE, addr: *mut c_vo
 }
 
 pub unsafe extern "win64" fn GetWriteWatch(
-    _flags: u32,
-    _base: *mut c_void,
-    _region_size: usize,
-    _addresses: *mut *mut c_void,
+    flags: u32,
+    base: *mut c_void,
+    region_size: usize,
+    addresses: *mut *mut c_void,
     count: *mut usize,
     granularity: *mut u32,
 ) -> u32 {
-    if !count.is_null() {
-        *count = 0;
+    if (flags & !WRITE_WATCH_FLAG_RESET) != 0
+        || base.is_null()
+        || region_size == 0
+        || addresses.is_null()
+        || count.is_null()
+        || granularity.is_null()
+    {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
     }
-    if !granularity.is_null() {
-        *granularity = PAGE as u32;
+    let start = base as usize;
+    let Some(end) = start.checked_add(region_size) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    };
+    let hstart = start & !(HOST_PAGE - 1);
+    let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    let mut vm = VM.lock().unwrap();
+    let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    };
+    if !alloc.write_watch || end > alloc_base + alloc.size {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    }
+    let cap = std::ptr::read_unaligned(count);
+    let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).take(cap).copied().collect();
+    for (i, &hp) in dirty.iter().enumerate() {
+        std::ptr::write_unaligned(addresses.add(i), hp as *mut c_void);
+    }
+    std::ptr::write_unaligned(count, dirty.len());
+    std::ptr::write_unaligned(granularity, HOST_PAGE as u32);
+    if (flags & WRITE_WATCH_FLAG_RESET) != 0 {
+        // Per Microsoft Learn (GetWriteWatch): when WRITE_WATCH_FLAG_RESET is set,
+        // reset only the pages whose addresses were returned in `addresses`.
+        for hp in dirty {
+            vm.write_watch_dirty.remove(&hp);
+            if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
+                if hp < seg.end
+                    && seg.state == MEM_COMMIT
+                    && is_writable_prot(seg.prot)
+                    && (seg.prot & PAGE_GUARD) == 0
+                {
+                    let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
+                }
+            }
+        }
     }
     0
 }
 
-pub unsafe extern "win64" fn ResetWriteWatch(_base: *mut c_void, _region_size: usize) -> u32 {
+pub unsafe extern "win64" fn ResetWriteWatch(base: *mut c_void, region_size: usize) -> u32 {
+    if base.is_null() || region_size == 0 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    }
+    let start = base as usize;
+    let Some(end) = start.checked_add(region_size) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    };
+    let hstart = start & !(HOST_PAGE - 1);
+    let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
+    let mut vm = VM.lock().unwrap();
+    let Some((alloc_base, alloc)) = vm.alloc_containing(start & !(PAGE - 1)) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    };
+    if !alloc.write_watch || end > alloc_base + alloc.size {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return u32::MAX;
+    }
+    let dirty: Vec<usize> = vm.write_watch_dirty.range(hstart..hend).copied().collect();
+    for hp in dirty {
+        vm.write_watch_dirty.remove(&hp);
+        if let Some((&_s, seg)) = vm.segs.range(..=hp).next_back() {
+            if hp < seg.end
+                && seg.state == MEM_COMMIT
+                && is_writable_prot(seg.prot)
+                && (seg.prot & PAGE_GUARD) == 0
+            {
+                let _ = host_mprotect(hp, HOST_PAGE, win_prot_to_host(seg.prot) & !libc::PROT_WRITE);
+            }
+        }
+    }
     0
 }
 
@@ -672,28 +987,33 @@ pub fn hpage_had_prot_change(hpage: usize) -> bool {
 }
 
 pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot: u32, old: *mut u32) -> BOOL {
+    if size == 0 {
+        crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if let Err(e) = validate_page_prot(prot) {
+        crate::teb::set_last_error(e);
+        return FALSE;
+    }
     let start = addr as usize & !(PAGE - 1);
     let end = (addr as usize + size + PAGE - 1) & !(PAGE - 1);
-    if prot & PAGE_GUARD != 0 {
-        stub!("PAGE_GUARD not emulated");
-    }
     let prev = query(start).map(|i| i.protect).unwrap_or(PAGE_READWRITE);
     if memdiag() && (prot | prev) & 0xF0 != 0 {
         memdiag_log(format_args!("VirtualProtect({addr:p}, {size:#x}, {prot:#x}) prev={prev:#x}"));
     }
-    let mut host_prot = win_prot_to_host(prot);
     let mut deferred_noaccess_sibling = false;
     let mprotect_rc = {
         let mut vm = VM.lock().unwrap();
+        let write_watch = vm.alloc_containing(start).is_some_and(|(_, a)| a.write_watch);
         if vm.alloc_containing(start).is_some() {
             vm.set_range(start, end, MEM_COMMIT, prot);
         }
         // On 16 KiB host pages (Apple Silicon), if a sub-host-page non-writable
         // VirtualProtect (e.g. PAGE_EXECUTE_READ after decrypting one 4 KiB page)
-        // still shares its 16 KiB hardware page with another PAGE_NOACCESS 4 KiB
-        // sub-page, keep the host page PROT_NONE until all sibling sub-pages are
+        // still shares its 16 KiB hardware page with another PAGE_NOACCESS / PAGE_GUARD
+        // 4 KiB sub-page, keep the host page PROT_NONE until all sibling sub-pages are
         // unlocked so other threads cannot race into still-encrypted siblings.
-        let is_writable = matches!(prot & 0xFF, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
+        let is_writable = is_writable_prot(prot);
         if HOST_PAGE > PAGE && !is_writable && prot != PAGE_NOACCESS && (prot & PAGE_GUARD) == 0 && (end - start) < HOST_PAGE {
             let hbase = start & !(HOST_PAGE - 1);
             let mut sub = hbase;
@@ -706,9 +1026,6 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
                 }
                 sub += PAGE;
             }
-            if deferred_noaccess_sibling {
-                host_prot = libc::PROT_NONE;
-            }
         }
         if prev == PAGE_NOACCESS
             || (prev & PAGE_GUARD) != 0
@@ -720,14 +1037,18 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
         }
         // Keep `host_mprotect` serialized under `VM` so concurrent VirtualProtect calls
         // on sibling 4 KiB sub-pages within one 16 KiB host page cannot apply out of order.
-        host_mprotect(start, end - start, host_prot)
+        if deferred_noaccess_sibling {
+            host_mprotect(start, end - start, libc::PROT_NONE)
+        } else {
+            apply_range_host_prot(&vm, start, end, prot, write_watch)
+        }
     };
     if mprotect_rc != 0 {
         crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
         return FALSE;
     }
     if !old.is_null() {
-        *old = if prev == 0 { PAGE_NOACCESS } else { prev };
+        std::ptr::write_unaligned(old, if prev == 0 { PAGE_NOACCESS } else { prev });
     }
     if is_exec(prot) || is_exec(prev) {
         note_code_region(start, end);
@@ -1023,9 +1344,47 @@ pub unsafe extern "win64" fn FlushInstructionCache(_p: HANDLE, a: *const c_void,
 }
 
 pub unsafe extern "win64" fn FlushProcessWriteBuffers() {
-    // Windows issues an IPI to every CPU. A local SeqCst fence is weaker;
-    // documented so it can be revisited if lock-free code misbehaves.
-    stub!("FlushProcessWriteBuffers approximated by a local fence");
+    // Issue a real process-wide IPI/serialization barrier across every active thread in
+    // this task. On Darwin, `thread_suspend` invokes XNU `thread_wait`, delivering a
+    // cross-CPU AST/IPI to any core running that thread and waiting until it leaves
+    // userspace (full hardware memory barrier + pipeline serialization) before we
+    // immediately resume it. Serializing callers with `FLUSH_LOCK` prevents mutual
+    // suspension, and zero heap allocations occur between suspend and resume.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(target_vendor = "apple")]
+    {
+        static FLUSH_LOCK: Mutex<()> = Mutex::new(());
+        let _g = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+            fn mach_thread_self() -> libc::mach_port_t;
+            fn task_threads(
+                target_task: libc::mach_port_t,
+                act_list: *mut *mut libc::mach_port_t,
+                act_list_cnt: *mut u32,
+            ) -> i32;
+            fn thread_suspend(target_act: libc::mach_port_t) -> i32;
+            fn thread_resume(target_act: libc::mach_port_t) -> i32;
+            fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> i32;
+            fn mach_vm_deallocate(task: libc::mach_port_t, address: u64, size: u64) -> i32;
+        }
+        let task = mach_task_self_;
+        let me = mach_thread_self();
+        let mut list: *mut libc::mach_port_t = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        if task_threads(task, &mut list, &mut count) == 0 && !list.is_null() {
+            for i in 0..count as usize {
+                let port = *list.add(i);
+                if port != me && thread_suspend(port) == 0 {
+                    let _ = thread_resume(port);
+                }
+                let _ = mach_port_deallocate(task, port);
+            }
+            let bytes = (count as u64) * (std::mem::size_of::<libc::mach_port_t>() as u64);
+            let _ = mach_vm_deallocate(task, list as u64, bytes);
+        }
+        let _ = mach_port_deallocate(task, me);
+    }
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -1036,11 +1395,11 @@ pub unsafe extern "win64" fn PrefetchVirtualMemory(_p: HANDLE, _n: usize, _e: *m
 /// Release only the complete host pages lying entirely inside `[addr, addr + size)`.
 ///
 /// Windows discards at 4 KB granularity but Apple Silicon host pages are 16 KB, and the kernel
-/// rounds an `madvise` range outward to whole host pages. Using `MADV_FREE_REUSABLE` (9 on
+/// rounds an `madvise` range outward to whole host pages. Using `MADV_FREE_REUSABLE` (7 on
 /// Darwin) immediately deducts reclaimed pages from XNU's `phys_footprint` ledger (critical
 /// for staying under iOS Jetsam limits), falling back to `MADV_FREE` if rejected.
 unsafe fn discard_host_pages(addr: usize, size: usize) {
-    const MADV_FREE_REUSABLE: i32 = 9;
+    const MADV_FREE_REUSABLE: i32 = 7;
     let start = (addr + HOST_PAGE - 1) & !(HOST_PAGE - 1);
     let end = (addr + size) & !(HOST_PAGE - 1);
     if end > start {
@@ -1326,6 +1685,178 @@ mod tests {
             assert_eq!(HeapDestroy(h), TRUE);
             assert_eq!(HeapDestroy(h), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
+        }
+    }
+
+    #[test]
+    fn mem_large_pages_matches_windows_without_privilege() {
+        unsafe {
+            // Invalid flag combination / misalignment -> ERROR_INVALID_PARAMETER.
+            assert!(VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert!(VirtualAlloc(std::ptr::null_mut(), LARGE_PAGE_SIZE, MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Valid 2 MiB MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES without SeLockMemoryPrivilege -> ERROR_PRIVILEGE_NOT_HELD.
+            assert!(VirtualAlloc(std::ptr::null_mut(), LARGE_PAGE_SIZE, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_PRIVILEGE_NOT_HELD);
+        }
+    }
+
+    #[test]
+    fn page_guard_validation_and_oneshot_consumption() {
+        unsafe {
+            // PAGE_GUARD | PAGE_NOACCESS is invalid per Windows docs.
+            let p = VirtualAlloc(std::ptr::null_mut(), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let mut old = 0u32;
+            assert_eq!(VirtualProtect(p, 0x1000, PAGE_NOACCESS | PAGE_GUARD, &mut old), FALSE);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            // Setting PAGE_GUARD updates VirtualQuery and arms the guard bit.
+            assert_eq!(VirtualProtect(p, HOST_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), TRUE);
+            assert_eq!(old, PAGE_READWRITE);
+            let q = query(p as usize).unwrap();
+            assert_eq!(q.protect, PAGE_READWRITE | PAGE_GUARD);
+
+            // Consuming the guard page clears PAGE_GUARD atomically (one-shot) and restores RW access.
+            assert_eq!(consume_guard_page(p as usize), Some(PAGE_READWRITE | PAGE_GUARD));
+            assert_eq!(consume_guard_page(p as usize), None);
+            let q2 = query(p as usize).unwrap();
+            assert_eq!(q2.protect, PAGE_READWRITE);
+            *(p as *mut u32) = 0x1234_5678;
+            assert_eq!(*(p as *const u32), 0x1234_5678);
+
+            // VirtualAlloc with MEM_COMMIT | PAGE_GUARD directly.
+            let p2 = VirtualAlloc(std::ptr::null_mut(), HOST_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
+            assert!(!p2.is_null());
+            assert_eq!(query(p2 as usize).unwrap().protect, PAGE_READWRITE | PAGE_GUARD);
+            assert_eq!(consume_guard_page(p2 as usize), Some(PAGE_READWRITE | PAGE_GUARD));
+            *(p2 as *mut u32) = 0xCAFE_BABE;
+            assert_eq!(*(p2 as *const u32), 0xCAFE_BABE);
+
+            assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);
+            assert_eq!(VirtualFree(p2, 0, MEM_RELEASE), TRUE);
+        }
+    }
+
+    #[test]
+    fn write_watch_tracks_resets_and_validates() {
+        unsafe {
+            // MEM_WRITE_WATCH without MEM_RESERVE fails with ERROR_INVALID_PARAMETER.
+            assert!(VirtualAlloc(std::ptr::null_mut(), 0x10000, MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            let region_sz = HOST_PAGE * 4;
+            let base = VirtualAlloc(std::ptr::null_mut(), region_sz, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            assert!(!base.is_null());
+
+            // Initially 0 dirty pages.
+            let mut addrs = [std::ptr::null_mut(); 8];
+            let mut count = addrs.len();
+            let mut gran = 0u32;
+            assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 0);
+            assert_eq!(gran, HOST_PAGE as u32);
+
+            // Simulate hardware write faults on host page 1 and host page 3.
+            let p1 = (base as usize) + HOST_PAGE;
+            let p3 = (base as usize) + HOST_PAGE * 3;
+            assert!(try_handle_write_watch_fault(p1 + 16, true));
+            *(p1 as *mut u32) = 0xAAAA_BBBB;
+            assert!(try_handle_write_watch_fault(p3 + 64, true));
+            *(p3 as *mut u32) = 0xCCCC_DDDD;
+
+            // Non-reset query returns both pages in ascending order.
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 2);
+            assert_eq!(addrs[0] as usize, p1);
+            assert_eq!(addrs[1] as usize, p3);
+
+            // Partial reset (capacity 1) resets ONLY the first returned page (p1), leaving p3 dirty.
+            count = 1;
+            assert_eq!(GetWriteWatch(WRITE_WATCH_FLAG_RESET, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, p1);
+
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 1);
+            assert_eq!(addrs[0] as usize, p3);
+
+            // ResetWriteWatch clears remaining dirty pages.
+            assert_eq!(ResetWriteWatch(base, region_sz), 0);
+            count = addrs.len();
+            assert_eq!(GetWriteWatch(0, base, region_sz, addrs.as_mut_ptr(), &mut count, &mut gran), 0);
+            assert_eq!(count, 0);
+
+            // Non-write-watch region rejected with u32::MAX / ERROR_INVALID_PARAMETER.
+            let plain = VirtualAlloc(std::ptr::null_mut(), HOST_PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!plain.is_null());
+            assert_eq!(GetWriteWatch(0, plain, HOST_PAGE, addrs.as_mut_ptr(), &mut count, &mut gran), u32::MAX);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(ResetWriteWatch(plain, HOST_PAGE), u32::MAX);
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(VirtualFree(base, 0, MEM_RELEASE), TRUE);
+            assert_eq!(VirtualFree(plain, 0, MEM_RELEASE), TRUE);
+        }
+    }
+
+    #[test]
+    fn mem_reset_and_undo_and_virtual_alloc_ex_and_flush_buffers() {
+        unsafe {
+            // MEM_RESET + MEM_RESET_UNDO preserves resident pages and validates addresses.
+            let sz = HOST_PAGE * 2;
+            let p = VirtualAlloc(std::ptr::null_mut(), sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 0x1122_3344_5566_7788;
+            assert_eq!(VirtualAlloc(p, sz, MEM_RESET, PAGE_READWRITE), p);
+            let undo = VirtualAlloc(p, sz, MEM_RESET_UNDO, PAGE_READWRITE);
+            if !undo.is_null() {
+                assert_eq!(undo, p);
+                assert_eq!(*(p as *const u64), 0x1122_3344_5566_7788);
+            }
+            assert!(VirtualAlloc(std::ptr::null_mut(), sz, MEM_RESET_UNDO, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_ADDRESS);
+            assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);
+
+            // VirtualAllocEx: CURRENT_PROCESS and OpenProcess(self) succeed; NULL/bogus -> ERROR_INVALID_HANDLE.
+            let p_ex = VirtualAllocEx(crate::handles::CURRENT_PROCESS, std::ptr::null_mut(), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p_ex.is_null());
+            assert_eq!(VirtualFree(p_ex, 0, MEM_RELEASE), TRUE);
+
+            let self_h = crate::kernel32::process::OpenProcess(0x1FFFFF, FALSE, std::process::id());
+            assert!(!self_h.is_null());
+            let p_ex2 = VirtualAllocEx(self_h, std::ptr::null_mut(), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p_ex2.is_null());
+            assert_eq!(VirtualFree(p_ex2, 0, MEM_RELEASE), TRUE);
+            assert_eq!(crate::kernel32::threads::CloseHandle(self_h), TRUE);
+
+            assert!(VirtualAllocEx(std::ptr::null_mut(), std::ptr::null_mut(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // VirtualAlloc2: NULL process handle targets current process per Windows docs.
+            let p2 = VirtualAlloc2(std::ptr::null_mut(), std::ptr::null_mut(), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!p2.is_null());
+            assert_eq!(VirtualFree(p2, 0, MEM_RELEASE), TRUE);
+            assert!(VirtualAlloc2(0xDEADusize as HANDLE, std::ptr::null_mut(), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0).is_null());
+            assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_HANDLE);
+
+            // FlushProcessWriteBuffers completes cleanly under multi-threaded load.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let s2 = std::sync::Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+            for _ in 0..8 {
+                FlushProcessWriteBuffers();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            worker.join().unwrap();
         }
     }
 }
