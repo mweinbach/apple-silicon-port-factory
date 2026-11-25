@@ -262,6 +262,38 @@ pub fn set_device_volume_scalar(dev: &DeviceInfo, is_capture: bool, scalar: f32)
     }
 }
 
+pub fn device_channel_volume_scalar(dev: &DeviceInfo, is_capture: bool, channel: u32) -> Option<f32> {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::device_channel_volume_scalar(id, is_capture, channel))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channel);
+        None
+    }
+}
+
+pub fn set_device_channel_volume_scalar(dev: &DeviceInfo, is_capture: bool, channel: u32, scalar: f32) -> bool {
+    if dev.id == 0 || backend() != Backend::CoreAudio {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let id = dev.id;
+        ca_sync(move || ca::set_device_channel_volume_scalar(id, is_capture, channel, scalar))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_capture, channel, scalar);
+        false
+    }
+}
+
 pub fn device_mute(dev: &DeviceInfo, is_capture: bool) -> Option<bool> {
     if dev.id == 0 || backend() != Backend::CoreAudio {
         return None;
@@ -310,6 +342,137 @@ pub fn device_volume_range_db(dev: &DeviceInfo, is_capture: bool) -> Option<(f32
     }
 }
 
+/// Real-time safe channel-layout converter + linear resampler for ProcessTap loopback audio.
+/// Converts interleaved float32 input `(src_rate, src_channels)` into `(dst_rate, dst_channels)`
+/// using preallocated buffers so the CoreAudio IOProc never allocates on the realtime thread.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct TapFormatConverter {
+    src_rate: u32,
+    src_channels: usize,
+    dst_rate: u32,
+    dst_channels: usize,
+    /// Preallocated scratch buffer for channel-converted frames (`src_rate`, `dst_channels`).
+    ch_buf: Vec<f32>,
+    /// Preallocated scratch buffer for resampled output frames (`dst_rate`, `dst_channels`).
+    out_buf: Vec<f32>,
+    /// Exact rational input-frame cursor numerator in units of `1 / dst_rate` input frames
+    /// (zero floating-point drift across arbitrary stream durations).
+    phase_num: u64,
+    /// Last channel-converted frame from the previous callback (for interpolation across boundaries).
+    prev_frame: [f32; 8],
+    has_prev: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl TapFormatConverter {
+    pub(crate) fn new(src_rate: u32, src_channels: u32, dst_rate: u32, dst_channels: u32) -> Self {
+        let sc = src_channels.clamp(1, 8) as usize;
+        let dc = dst_channels.clamp(1, 8) as usize;
+        Self {
+            src_rate: src_rate.max(1),
+            src_channels: sc,
+            dst_rate: dst_rate.max(1),
+            dst_channels: dc,
+            ch_buf: Vec::with_capacity(4096 * dc),
+            out_buf: Vec::with_capacity(8192 * dc),
+            phase_num: 0,
+            prev_frame: [0.0; 8],
+            has_prev: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_passthrough(&self) -> bool {
+        self.src_rate == self.dst_rate && self.src_channels == self.dst_channels
+    }
+
+    /// Convert interleaved float32 input samples and return a slice of interleaved float32 output
+    /// samples in `(dst_rate, dst_channels)`.
+    pub(crate) fn convert<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        if self.is_passthrough() {
+            return input;
+        }
+        let sc = self.src_channels;
+        let dc = self.dst_channels;
+        let in_frames = input.len() / sc;
+        if in_frames == 0 {
+            return &[];
+        }
+
+        // Step 1: Channel conversion (src_channels -> dst_channels).
+        let ch_src: &[f32] = if sc == dc {
+            &input[..in_frames * sc]
+        } else {
+            self.ch_buf.clear();
+            let cap_frames = self.ch_buf.capacity() / dc;
+            let frames = in_frames.min(cap_frames.max(in_frames));
+            if self.ch_buf.capacity() < frames * dc {
+                self.ch_buf.reserve(frames * dc - self.ch_buf.capacity());
+            }
+            for f in 0..frames {
+                let base = f * sc;
+                if dc == 1 {
+                    let mut sum = 0.0f32;
+                    for c in 0..sc {
+                        sum += input[base + c];
+                    }
+                    self.ch_buf.push(sum / sc as f32);
+                } else if sc == 1 {
+                    let s = input[base];
+                    for c in 0..dc {
+                        self.ch_buf.push(if c < 2 { s } else { 0.0 });
+                    }
+                } else {
+                    for c in 0..dc {
+                        self.ch_buf.push(if c < sc { input[base + c] } else { 0.0 });
+                    }
+                }
+            }
+            &self.ch_buf
+        };
+
+        if self.src_rate == self.dst_rate {
+            return ch_src;
+        }
+
+        // Step 2: Exact-ratio linear resampling (src_rate -> dst_rate).
+        let src_frames = ch_src.len() / dc;
+        let sr = self.src_rate as u64;
+        let dr = self.dst_rate as u64;
+        let inv_dr = 1.0f32 / self.dst_rate as f32;
+        self.out_buf.clear();
+        if !self.has_prev {
+            for c in 0..dc {
+                self.prev_frame[c] = ch_src[c];
+            }
+            self.has_prev = true;
+        }
+
+        let mut pos_num = self.phase_num;
+        let limit_num = (src_frames as u64) * dr;
+        while pos_num < limit_num {
+            let idx = (pos_num / dr) as usize;
+            let frac = (pos_num % dr) as f32 * inv_dr;
+            for c in 0..dc {
+                let s0 = if idx == 0 {
+                    self.prev_frame[c]
+                } else {
+                    ch_src[(idx - 1) * dc + c]
+                };
+                let s1 = ch_src[idx.min(src_frames - 1) * dc + c];
+                self.out_buf.push(s0 + (s1 - s0) * frac);
+            }
+            pos_num += sr;
+        }
+        self.phase_num = pos_num - limit_num;
+        let last_base = (src_frames - 1) * dc;
+        for c in 0..dc {
+            self.prev_frame[c] = ch_src[last_base + c];
+        }
+        &self.out_buf
+    }
+}
+
 /// Optional live macOS 14.2+ CoreAudio Process Tap for system loopback capture.
 pub struct LoopbackTap {
     #[cfg(target_os = "macos")]
@@ -317,11 +480,11 @@ pub struct LoopbackTap {
 }
 
 impl LoopbackTap {
-    /// Attempt to open a macOS 14.2+ CoreAudio process tap feeding `ring`.
+    /// Attempt to open a macOS 14.2+ CoreAudio process tap feeding `ring` in `(target_rate, target_channels)`.
     /// Returns `None` when headless, on the Null backend, on iOS, on macOS < 14.2,
     /// or when audio-capture TCC permission is not granted (caller falls back to
     /// in-process WASAPI render loopback).
-    pub fn try_open(dev: &DeviceInfo, ring: Arc<Ring>) -> Option<Self> {
+    pub fn try_open(dev: &DeviceInfo, ring: Arc<Ring>, target_rate: u32, target_channels: u32) -> Option<Self> {
         let headless = std::env::var("PORT_HEADLESS").is_ok_and(|v| v == "1")
             || std::env::var("AW2_HEADLESS").is_ok_and(|v| v == "1");
         if headless || dev.id == 0 || backend() != Backend::CoreAudio {
@@ -330,7 +493,7 @@ impl LoopbackTap {
         #[cfg(target_os = "macos")]
         {
             let uid = dev.uid.clone();
-            match ca_sync(move || ca::ProcessTap::open(ring, Some(&uid))) {
+            match ca_sync(move || ca::ProcessTap::open(ring, Some(&uid), target_rate, target_channels)) {
                 Ok(tap) => {
                     log::info!(target: "audio", "CoreAudio ProcessTap opened for loopback capture on '{}'", dev.name);
                     Some(Self { tap: Some(tap) })
@@ -343,7 +506,7 @@ impl LoopbackTap {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = ring;
+            let _ = (ring, target_rate, target_channels);
             None
         }
     }
@@ -730,6 +893,8 @@ mod ca {
     const kAudioDevicePropertyVolumeScalar: u32 = fourcc(b"volm");
     const kAudioDevicePropertyMute: u32 = fourcc(b"mute");
     const kAudioDevicePropertyVolumeRangeDecibels: u32 = fourcc(b"vdb#");
+    const kAudioDevicePropertyStreamFormat: u32 = fourcc(b"sfmt");
+    const kAudioTapPropertyFormat: u32 = fourcc(b"tfmt");
 
     const kAudioUnitType_Output: u32 = fourcc(b"auou");
     const kAudioUnitSubType_HALOutput: u32 = fourcc(b"ahal");
@@ -744,6 +909,7 @@ mod ca {
     const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
     const kAudioFormatFlagIsFloat: u32 = 1;
     const kAudioFormatFlagIsPacked: u32 = 8;
+    const kAudioFormatFlagIsNonInterleaved: u32 = 1 << 5;
     const kAudioUnitRenderAction_OutputIsSilence: u32 = 1 << 4;
     const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
@@ -767,6 +933,7 @@ mod ca {
     }
 
     #[repr(C)]
+    #[derive(Default)]
     struct AudioStreamBasicDescription {
         mSampleRate: f64,
         mFormatID: u32,
@@ -1092,6 +1259,37 @@ mod ca {
         }
     }
 
+    /// Query CoreAudio HAL per-channel scalar volume `[0.0, 1.0]` (`channel` is 0-based -> CoreAudio element `channel + 1`).
+    pub fn device_channel_volume_scalar(id: AudioObjectID, is_capture: bool, channel: u32) -> Option<f32> {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let a = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: scope,
+            mElement: channel.saturating_add(1),
+        };
+        let mut v: f32 = 0.0;
+        let mut n = std::mem::size_of::<f32>() as u32;
+        if unsafe { AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut n, &mut v as *mut f32 as *mut c_void) } == 0
+            && n == 4
+        {
+            Some(v.clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    }
+
+    /// Set CoreAudio HAL per-channel scalar volume `[0.0, 1.0]` (`channel` is 0-based -> CoreAudio element `channel + 1`).
+    pub fn set_device_channel_volume_scalar(id: AudioObjectID, is_capture: bool, channel: u32, scalar: f32) -> bool {
+        let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
+        let a = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: scope,
+            mElement: channel.saturating_add(1),
+        };
+        let v = scalar.clamp(0.0, 1.0);
+        unsafe { AudioObjectSetPropertyData(id, &a, 0, std::ptr::null(), 4, &v as *const f32 as *const c_void) == 0 }
+    }
+
     /// Query CoreAudio HAL device mute flag.
     pub fn device_mute(id: AudioObjectID, is_capture: bool) -> Option<bool> {
         let scope = if is_capture { kAudioDevicePropertyScopeInput } else { kAudioDevicePropertyScopeOutput };
@@ -1125,6 +1323,14 @@ mod ca {
         }
     }
 
+    struct TapIoCtx {
+        ring: Arc<Ring>,
+        converter: TapFormatConverter,
+        non_interleaved: bool,
+        src_channels: usize,
+        interleave_buf: Vec<f32>,
+    }
+
     /// macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private
     /// aggregate device + IOProc) for system/endpoint loopback capture.
     /// Dynamically resolved via `dlsym` so older macOS versions degrade cleanly.
@@ -1132,7 +1338,9 @@ mod ca {
         tap_id: AudioObjectID,
         agg_id: AudioObjectID,
         io_proc_id: *mut c_void,
-        _ring: Arc<Ring>,
+        /// Heap-allocated context owned by `ProcessTap` and freed strictly AFTER
+        /// `AudioDeviceStop` and `AudioDeviceDestroyIOProcID` in `Drop`.
+        ctx: *mut TapIoCtx,
         destroy_tap_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
         destroy_agg_fn: unsafe extern "C" fn(AudioObjectID) -> OSStatus,
         stop_fn: unsafe extern "C" fn(AudioObjectID, *mut c_void) -> OSStatus,
@@ -1141,7 +1349,12 @@ mod ca {
     unsafe impl Send for ProcessTap {}
 
     impl ProcessTap {
-        pub fn open(ring: Arc<Ring>, device_uid: Option<&str>) -> Result<Self, String> {
+        pub fn open(
+            ring: Arc<Ring>,
+            device_uid: Option<&str>,
+            target_rate: u32,
+            target_channels: u32,
+        ) -> Result<Self, String> {
             use objc2::msg_send;
             use objc2::runtime::{AnyClass, AnyObject};
             use objc2_foundation::{NSArray, NSString};
@@ -1175,18 +1388,47 @@ mod ca {
                 if in_data.is_null() || client_data.is_null() {
                     return 0;
                 }
-                let ring = &*(client_data as *const Ring);
+                let ctx = &mut *(client_data as *mut TapIoCtx);
                 let nbufs = (*in_data).mNumberBuffers as usize;
                 if nbufs == 0 {
                     return 0;
                 }
-                let b0 = &(*in_data).mBuffers[0];
-                if !b0.mData.is_null() && b0.mDataByteSize >= 4 {
-                    let samples = std::slice::from_raw_parts(
-                        b0.mData as *const f32,
-                        (b0.mDataByteSize / 4) as usize,
-                    );
-                    ring.push(samples);
+                if ctx.non_interleaved {
+                    let ch = ctx.src_channels.min(nbufs);
+                    let bufs = std::slice::from_raw_parts((*in_data).mBuffers.as_ptr(), ch);
+                    let frames = bufs
+                        .iter()
+                        .map(|b| if b.mData.is_null() { 0 } else { (b.mDataByteSize / 4) as usize })
+                        .min()
+                        .unwrap_or(0);
+                    let cap_frames = ctx.interleave_buf.capacity() / ch.max(1);
+                    let frames = frames.min(cap_frames);
+                    if frames == 0 {
+                        return 0;
+                    }
+                    ctx.interleave_buf.clear();
+                    for f in 0..frames {
+                        for b in bufs.iter() {
+                            let s = *(b.mData as *const f32).add(f);
+                            ctx.interleave_buf.push(s);
+                        }
+                    }
+                    let converted = ctx.converter.convert(&ctx.interleave_buf);
+                    if !converted.is_empty() {
+                        ctx.ring.push(converted);
+                    }
+                } else {
+                    let b0 = &(*in_data).mBuffers[0];
+                    if !b0.mData.is_null() && b0.mDataByteSize >= 4 {
+                        let samples = std::slice::from_raw_parts(
+                            b0.mData as *const f32,
+                            (b0.mDataByteSize / 4) as usize,
+                        );
+                        let converted = ctx.converter.convert(samples);
+                        if !converted.is_empty() {
+                            ctx.ring.push(converted);
+                        }
+                    }
                 }
                 0
             }
@@ -1293,9 +1535,44 @@ mod ca {
                     return Err(format!("AudioHardwareCreateAggregateDevice for tap failed: {st2}"));
                 }
 
+                // Query actual ProcessTap stream format (rate, channels, interleaved vs planar, float32)
+                // so the IOProc converts channel layout and resamples into the client's capture format.
+                let tap_asbd = get::<AudioStreamBasicDescription>(tap_id, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal)
+                    .or_else(|| get::<AudioStreamBasicDescription>(agg_id, kAudioDevicePropertyStreamFormat, kAudioDevicePropertyScopeInput));
+                let (src_rate, src_channels, non_interleaved) = match tap_asbd {
+                    Some(asbd) => {
+                        let is_f32 = asbd.mFormatID == kAudioFormatLinearPCM
+                            && (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && asbd.mBitsPerChannel == 32;
+                        if !is_f32 || asbd.mChannelsPerFrame == 0 || asbd.mSampleRate <= 0.0 {
+                            let _ = destroy_agg(agg_id);
+                            let _ = destroy_tap(tap_id);
+                            return Err(format!(
+                                "ProcessTap unsupported stream format (fmt={:#x}, bits={}, ch={}, rate={})",
+                                asbd.mFormatID, asbd.mBitsPerChannel, asbd.mChannelsPerFrame, asbd.mSampleRate
+                            ));
+                        }
+                        (
+                            asbd.mSampleRate.round() as u32,
+                            asbd.mChannelsPerFrame,
+                            (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
+                        )
+                    }
+                    None => (48_000, 2, false),
+                };
+
+                let ctx = Box::into_raw(Box::new(TapIoCtx {
+                    ring,
+                    converter: TapFormatConverter::new(src_rate, src_channels, target_rate, target_channels),
+                    non_interleaved,
+                    src_channels: src_channels.clamp(1, 8) as usize,
+                    interleave_buf: Vec::with_capacity(4096 * src_channels.clamp(1, 8) as usize),
+                }));
+
                 let mut io_proc_id: *mut c_void = std::ptr::null_mut();
-                let st3 = create_ioproc(agg_id, tap_ioproc, Arc::as_ptr(&ring) as *mut c_void, &mut io_proc_id);
+                let st3 = create_ioproc(agg_id, tap_ioproc, ctx as *mut c_void, &mut io_proc_id);
                 if st3 != 0 {
+                    drop(Box::from_raw(ctx));
                     let _ = destroy_agg(agg_id);
                     let _ = destroy_tap(tap_id);
                     return Err(format!("AudioDeviceCreateIOProcID failed: {st3}"));
@@ -1303,6 +1580,7 @@ mod ca {
                 let st4 = start_dev(agg_id, io_proc_id);
                 if st4 != 0 {
                     let _ = destroy_ioproc(agg_id, io_proc_id);
+                    drop(Box::from_raw(ctx));
                     let _ = destroy_agg(agg_id);
                     let _ = destroy_tap(tap_id);
                     return Err(format!("AudioDeviceStart(tap) failed: {st4}"));
@@ -1311,7 +1589,7 @@ mod ca {
                     tap_id,
                     agg_id,
                     io_proc_id,
-                    _ring: ring,
+                    ctx,
                     destroy_tap_fn: destroy_tap,
                     destroy_agg_fn: destroy_agg,
                     stop_fn: stop_dev,
@@ -1328,6 +1606,10 @@ mod ca {
                 let _ = (self.destroy_ioproc_fn)(self.agg_id, self.io_proc_id);
                 let _ = (self.destroy_agg_fn)(self.agg_id);
                 let _ = (self.destroy_tap_fn)(self.tap_id);
+                if !self.ctx.is_null() {
+                    drop(Box::from_raw(self.ctx));
+                    self.ctx = std::ptr::null_mut();
+                }
             }
         }
     }

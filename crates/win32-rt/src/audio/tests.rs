@@ -139,6 +139,7 @@ struct Fixture {
 impl Fixture {
     fn null() -> Fixture {
         let g = super::audio_test_lock();
+        super::mmdevapi::reset_endpoint_software_gains_for_test();
         backend::force_backend(Some(Backend::Null));
         super::mmdevapi::refresh();
         super::mmdevapi::refresh_capture();
@@ -1991,4 +1992,127 @@ fn wasapi_services_buffer_limits_and_loopback_capture() {
         assert_eq!(release(d), 0);
         assert_eq!(release(e), 0);
     }
+}
+
+/// Call a 4-arg COM vtable slot `(this, u32, f32, *const GUID) -> HRESULT` via the win64 bridge.
+unsafe fn call_bridge_u32_f32_guid(obj: P, idx: usize, ch: u32, val: f32, ctx: *const GUID) -> HRESULT {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let br: unsafe extern "C" fn(
+            u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            f64, f64, f64, f64,
+        ) -> HRESULT = std::mem::transmute(slot(obj, idx));
+        br(
+            obj as u64,
+            ch as u64,
+            0,
+            ctx as u64,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0.0,
+            0.0,
+            f64::from_bits(val.to_bits() as u64),
+            0.0,
+        )
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        call!(obj, idx, (u32, f32, *const GUID) -> HRESULT; ch, val, ctx)
+    }
+}
+
+#[test]
+fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_format() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        // Activate IAudioEndpointVolume and set channel 0 -> 0.0 (silence) and channel 1 -> 0.5.
+        let mut epv: P = std::ptr::null_mut();
+        assert_eq!(
+            call!(d, DEV_ACTIVATE, (*const GUID, u32, *mut c_void, *mut P) -> HRESULT; &IID_IAudioEndpointVolume, CLSCTX_ALL, std::ptr::null_mut(), &mut epv),
+            S_OK
+        );
+        assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 0, 0.0f32, std::ptr::null()), S_OK);
+        assert_eq!(call_bridge_u32_f32_guid(epv, 11 /* SetChannelVolumeLevelScalar */, 1, 0.5f32, std::ptr::null()), S_OK);
+
+        let mut got0 = -1.0f32;
+        let mut got1 = -1.0f32;
+        assert_eq!(call!(epv, 13 /* GetChannelVolumeLevelScalar */, (u32, *mut f32) -> HRESULT; 0, &mut got0), S_OK);
+        assert_eq!(call!(epv, 13 /* GetChannelVolumeLevelScalar */, (u32, *mut f32) -> HRESULT; 1, &mut got1), S_OK);
+        assert!((got0 - 0.0).abs() < 1e-6);
+        assert!((got1 - 0.5).abs() < 1e-6);
+
+        // Render (0.8, 0.8) and verify loopback sees (0.0, 0.4) — proving endpoint channel gains
+        // actually affect rendered playback rather than sitting in private COM state.
+        let render_c = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+        assert_eq!(
+            call!(render_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut rc: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc), S_OK);
+
+        let lb_c = activate_client(d);
+        assert_eq!(
+            call!(lb_c, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK, 200_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+
+        let mut rp: *mut u8 = std::ptr::null_mut();
+        assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 32, &mut rp), S_OK);
+        let samples = std::slice::from_raw_parts_mut(rp as *mut f32, 32 * 2);
+        samples.fill(0.8);
+        assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 32, 0), S_OK);
+
+        let mut cap_ptr: *mut u8 = std::ptr::null_mut();
+        let mut cap_frames = 0u32;
+        let mut cap_flags = 0u32;
+        assert_eq!(
+            call!(cc, CC_GET, (*mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT; &mut cap_ptr, &mut cap_frames, &mut cap_flags, std::ptr::null_mut(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(cap_frames, 32);
+        let got = std::slice::from_raw_parts(cap_ptr as *const f32, 32 * 2);
+        assert!(got[0].abs() < 1e-5, "channel 0 must be silenced by SetChannelVolumeLevelScalar(0, 0.0), got {}", got[0]);
+        assert!((got[1] - 0.4).abs() < 1e-4, "channel 1 must be attenuated to 0.4, got {}", got[1]);
+        assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; 32), S_OK);
+
+        // Restore master/channel gains to 1.0 so other tests start clean.
+        assert_eq!(call_bridge_f32_guid(epv, 7 /* SetMasterVolumeLevelScalar */, 1.0f32, std::ptr::null()), S_OK);
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb_c), 0);
+        assert_eq!(release(rc), 0);
+        assert_eq!(release(render_c), 0);
+        assert_eq!(release(epv), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+
+    // Verify TapFormatConverter handles stereo 48 kHz -> mono 48 kHz downmix and 48 kHz -> 44.1 kHz resampling.
+    let mut downmix = super::backend::TapFormatConverter::new(48_000, 2, 48_000, 1);
+    let stereo_in = [0.2f32, 0.6, 1.0, 0.0, -0.4, 0.4];
+    let mono_out = downmix.convert(&stereo_in);
+    assert_eq!(mono_out.len(), 3);
+    assert!((mono_out[0] - 0.4).abs() < 1e-6);
+    assert!((mono_out[1] - 0.5).abs() < 1e-6);
+    assert!(mono_out[2].abs() < 1e-6);
+
+    let mut resample = super::backend::TapFormatConverter::new(48_000, 2, 44_100, 1);
+    let mut stereo_48k = Vec::with_capacity(480 * 2);
+    for _ in 0..480 {
+        stereo_48k.push(0.6);
+        stereo_48k.push(0.2);
+    }
+    let mono_44k = resample.convert(&stereo_48k);
+    // 480 frames @ 48 kHz = 10 ms -> 441 frames @ 44.1 kHz
+    assert_eq!(mono_44k.len(), 441);
+    assert!(mono_44k.iter().all(|&s| (s - 0.4).abs() < 1e-5));
 }

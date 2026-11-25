@@ -1024,3 +1024,76 @@ fn easy_extended_setopt_and_getinfo_behaviors() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_httpauth_mask_rejects_unsupported_and_gates_credentials() {
+    use super::easy::{
+        CURLE_NOT_BUILT_IN, CURLAUTH_BASIC, CURLAUTH_BEARER, CURLAUTH_DIGEST, CURLAUTH_NEGOTIATE,
+        CURLAUTH_NTLM, CURLOPT_HTTPAUTH, CURLOPT_USERPWD, CURLOPT_XOAUTH2_BEARER,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        // 1. CURLAUTH_NONE: must NOT send Authorization even when USERPWD is set
+        let (mut s1, _) = listener.accept().unwrap();
+        let (h1, _) = read_http_request(&mut s1);
+        assert!(
+            !h1.to_ascii_lowercase().contains("authorization:"),
+            "CURLAUTH_NONE must not send Authorization header: {h1}"
+        );
+        s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+        drop(s1);
+
+        // 2. CURLAUTH_BEARER only (no XOAUTH2_BEARER, USERPWD set): must NOT leak Basic
+        let (mut s2, _) = listener.accept().unwrap();
+        let (h2, _) = read_http_request(&mut s2);
+        assert!(
+            !h2.to_ascii_lowercase().contains("authorization:"),
+            "CURLAUTH_BEARER without bearer token must not fall back to Basic: {h2}"
+        );
+        s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+        drop(s2);
+
+        // 3. CURLAUTH_BEARER with XOAUTH2_BEARER: sends Bearer (not Basic)
+        let (mut s3, _) = listener.accept().unwrap();
+        let (h3, _) = read_http_request(&mut s3);
+        assert!(h3.contains("Authorization: Bearer secret-tok\r\n"));
+        assert!(!h3.contains("Authorization: Basic"));
+        s3.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+    });
+
+    unsafe {
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/auth\0");
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_USERPWD, b"alice:pw\0".as_ptr() as usize), CURLE_OK);
+
+        // Unsupported Digest/NTLM/Negotiate-only modes must fail honestly with CURLE_NOT_BUILT_IN.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST as usize), CURLE_NOT_BUILT_IN);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, CURLAUTH_NTLM as usize), CURLE_NOT_BUILT_IN);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE as usize), CURLE_NOT_BUILT_IN);
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_HTTPAUTH, (CURLAUTH_DIGEST | CURLAUTH_NTLM) as usize),
+            CURLE_NOT_BUILT_IN
+        );
+
+        // Supported modes accepted.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, CURLAUTH_BASIC as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, 0 /* CURLAUTH_NONE */), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+
+        // Bearer-only without token must not send Basic from USERPWD.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_HTTPAUTH, CURLAUTH_BEARER as usize), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+
+        // Bearer-only with token sends Bearer.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_XOAUTH2_BEARER, b"secret-tok\0".as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_OK);
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}

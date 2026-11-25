@@ -539,9 +539,11 @@ fn build_http_request(
     if include_credentials && !has_custom("authorization") {
         if let Some(ref bearer) = req.bearer_token {
             let _ = write!(wire, "Authorization: Bearer {bearer}\r\n");
-        } else if let Some(creds) = req.basic_auth.as_deref().or(url.userinfo.as_deref()) {
-            let encoded = net_tls::base64_encode(creds.as_bytes());
-            let _ = write!(wire, "Authorization: Basic {encoded}\r\n");
+        } else if req.allow_basic_auth {
+            if let Some(creds) = req.basic_auth.as_deref().or(url.userinfo.as_deref()) {
+                let encoded = net_tls::base64_encode(creds.as_bytes());
+                let _ = write!(wire, "Authorization: Basic {encoded}\r\n");
+            }
         }
     }
     if !has_custom("connection") {

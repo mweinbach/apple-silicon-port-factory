@@ -657,7 +657,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
         let loopback = if is_loopback {
             let sub = register_loopback_sub(&core.ep.id, buffer_frames as usize * 2, f.channels);
             let ca_ring = Arc::new(Ring::new(buffer_frames as usize * 2, f.channels.max(1) as usize));
-            let ca_tap = LoopbackTap::try_open(&core.ep.info, ca_ring.clone());
+            let ca_tap = LoopbackTap::try_open(&core.ep.info, ca_ring.clone(), f.rate, f.channels as u32);
             let ca_ring_opt = ca_tap.as_ref().map(|_| ca_ring);
             Some(LoopbackCapture {
                 sub,
@@ -1252,9 +1252,13 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
         s.frames_written += frames as u64;
         return;
     }
-    let has_gain = (master_gain - 1.0).abs() > 1e-6
-        || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6);
-    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || master_gain == 0.0 {
+    let (ep_master, ep_ch_gains) = super::mmdevapi::endpoint_software_gains(ep_id);
+    let eff_master = master_gain * ep_master;
+    let has_ep_ch_gain = ep_ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6);
+    let has_gain = (eff_master - 1.0).abs() > 1e-6
+        || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6)
+        || has_ep_ch_gain;
+    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || eff_master == 0.0 {
         if let Some(t) = &mut r.tap {
             t.submit(frames, flags, padding_before, None, bytes);
         }
@@ -1280,19 +1284,35 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
             } else {
                 to_f32(&fmt, raw, n, &mut r.scratch);
             }
-            if has_gain {
+            if (eff_master - 1.0).abs() > 1e-6 || ch_gains.iter().any(|&g| (g - 1.0).abs() > 1e-6) {
                 let ch = fmt.channels.max(1) as usize;
                 for frame in r.scratch.chunks_exact_mut(ch) {
                     for (c, sample) in frame.iter_mut().enumerate() {
                         let cg = ch_gains.get(c).copied().unwrap_or(1.0);
-                        *sample *= master_gain * cg;
+                        *sample *= eff_master * cg;
                     }
                 }
             }
             if let Some(m) = &r.matrix {
                 apply_matrix(m, fmt.channels as usize, r.out_channels as usize, &r.scratch, &mut r.scratch2);
+                if has_ep_ch_gain {
+                    let och = r.out_channels.max(1) as usize;
+                    for frame in r.scratch2.chunks_exact_mut(och) {
+                        for (c, sample) in frame.iter_mut().enumerate() {
+                            *sample *= ep_ch_gains.get(c).copied().unwrap_or(1.0);
+                        }
+                    }
+                }
                 &r.scratch2
             } else {
+                if has_ep_ch_gain {
+                    let ch = fmt.channels.max(1) as usize;
+                    for frame in r.scratch.chunks_exact_mut(ch) {
+                        for (c, sample) in frame.iter_mut().enumerate() {
+                            *sample *= ep_ch_gains.get(c).copied().unwrap_or(1.0);
+                        }
+                    }
+                }
                 &r.scratch
             }
         };

@@ -436,6 +436,7 @@ pub(super) struct CurlEasyOptions {
     pub(super) bearer_token: Option<String>,
     pub(super) unrestricted_auth: bool,
     pub(super) httpauth: i32,
+    pub(super) httpauth_explicit: bool,
     pub(super) tcp_nodelay: bool,
     pub(super) tcp_keepalive: bool,
     pub(super) tcp_keepidle: u32,
@@ -500,6 +501,7 @@ impl Default for CurlEasyOptions {
             bearer_token: None,
             unrestricted_auth: false,
             httpauth: CURLAUTH_BASIC,
+            httpauth_explicit: false,
             tcp_nodelay: true,
             tcp_keepalive: false,
             tcp_keepidle: 60,
@@ -648,6 +650,7 @@ pub(super) struct TransferRequest {
     pub(super) range: Option<String>,
     pub(super) basic_auth: Option<String>,
     pub(super) bearer_token: Option<String>,
+    pub(super) allow_basic_auth: bool,
     pub(super) unrestricted_auth: bool,
     pub(super) accept_encoding: Option<String>,
     pub(super) http_content_decoding: bool,
@@ -883,7 +886,12 @@ pub(super) unsafe fn prepare_transfer(
         Vec::new()
     };
 
-    let basic_auth = if let Some(ref up) = opts.userpwd {
+    let allow_basic_auth = (opts.httpauth & CURLAUTH_BASIC) != 0;
+    let allow_bearer_auth = !opts.httpauth_explicit || (opts.httpauth & CURLAUTH_BEARER) != 0;
+
+    let basic_auth = if !allow_basic_auth {
+        None
+    } else if let Some(ref up) = opts.userpwd {
         Some(up.clone())
     } else if opts.username.is_some() || opts.password.is_some() {
         Some(format!(
@@ -891,6 +899,12 @@ pub(super) unsafe fn prepare_transfer(
             opts.username.as_deref().unwrap_or(""),
             opts.password.as_deref().unwrap_or("")
         ))
+    } else {
+        None
+    };
+
+    let bearer_token = if allow_bearer_auth {
+        opts.bearer_token
     } else {
         None
     };
@@ -927,7 +941,8 @@ pub(super) unsafe fn prepare_transfer(
             cookie: opts.cookie,
             range: effective_range,
             basic_auth,
-            bearer_token: opts.bearer_token,
+            bearer_token,
+            allow_basic_auth,
             unrestricted_auth: opts.unrestricted_auth,
             accept_encoding: opts.accept_encoding,
             http_content_decoding: opts.http_content_decoding,
@@ -1410,7 +1425,15 @@ pub(super) unsafe fn easy_setopt(easy: usize, option: i32, param: usize) -> i32 
             opts.unrestricted_auth = long_val != 0;
         }
         CURLOPT_HTTPAUTH => {
+            // Only CURLAUTH_NONE (0), CURLAUTH_BASIC, and CURLAUTH_BEARER are built in.
+            // Reject explicit requests for Digest/NTLM/Negotiate-only modes honestly rather
+            // than silently downgrading them to preemptive Basic authentication.
+            const SUPPORTED_AUTH: i32 = CURLAUTH_BASIC | CURLAUTH_BEARER;
+            if long_val != 0 && (long_val & SUPPORTED_AUTH) == 0 {
+                return CURLE_NOT_BUILT_IN;
+            }
             opts.httpauth = long_val;
+            opts.httpauth_explicit = true;
         }
         CURLOPT_XOAUTH2_BEARER => {
             opts.bearer_token = crate::strings::from_ansi_opt(param as *const u8);

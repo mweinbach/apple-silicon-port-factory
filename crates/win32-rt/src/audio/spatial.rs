@@ -1205,11 +1205,12 @@ mod render_stream {
                 }
             }
 
-            let master_gain = core.session.effective_gain();
+            let (ep_master, ep_ch_gains) = crate::audio::mmdevapi::endpoint_software_gains(&core.ep.id);
+            let master_gain = core.session.effective_gain() * ep_master;
             let ch_vols = *core.channel_volumes.lock().unwrap();
             for pair in mix_buf.chunks_exact_mut(2) {
-                let l = pair[0] * master_gain * ch_vols[0];
-                let r = pair[1] * master_gain * ch_vols[1];
+                let l = pair[0] * master_gain * ch_vols[0] * ep_ch_gains[0];
+                let r = pair[1] * master_gain * ch_vols[1] * ep_ch_gains[1];
                 pair[0] = if l.is_finite() { l.clamp(-1.0, 1.0) } else { 0.0 };
                 pair[1] = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             }

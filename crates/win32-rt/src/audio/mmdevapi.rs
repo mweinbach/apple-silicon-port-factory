@@ -963,6 +963,63 @@ const DEFAULT_MIN_DB: f32 = -65.25;
 const DEFAULT_MAX_DB: f32 = 0.0;
 const DEFAULT_STEP_DB: f32 = 0.5;
 
+/// Process-wide software endpoint attenuation state applied whenever CoreAudio HAL does not
+/// natively handle an endpoint's master/mute/per-channel volume control (e.g., Null backend,
+/// iOS RemoteIO, or macOS output devices lacking per-channel hardware volume).
+#[derive(Clone)]
+struct EndpointSoftwareGain {
+    /// Software master multiplier (`1.0` when hardware HAL already applies master volume).
+    master: f32,
+    /// Software mute (`false` when hardware HAL already applies mute).
+    muted: bool,
+    /// Per-channel software multipliers (`1.0` for any channel handled by hardware HAL).
+    channels: [f32; 8],
+}
+
+impl Default for EndpointSoftwareGain {
+    fn default() -> Self {
+        Self {
+            master: 1.0,
+            muted: false,
+            channels: [1.0; 8],
+        }
+    }
+}
+
+static ENDPOINT_SW_GAINS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, EndpointSoftwareGain>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static ENDPOINT_SW_GAINS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Return `(effective_master_gain, per_channel_gains)` to apply in software on render/spatial
+/// audio for `ep_id`. Lock-free fast path returns `(1.0, [1.0; 8])` when no software endpoint
+/// gain has been configured.
+pub(super) fn endpoint_software_gains(ep_id: &str) -> (f32, [f32; 8]) {
+    if !ENDPOINT_SW_GAINS_ACTIVE.load(Ordering::Acquire) {
+        return (1.0, [1.0; 8]);
+    }
+    let map = ENDPOINT_SW_GAINS.lock().unwrap();
+    match map.get(ep_id) {
+        Some(g) => (if g.muted { 0.0 } else { g.master }, g.channels),
+        None => (1.0, [1.0; 8]),
+    }
+}
+
+fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain)) {
+    let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+    let entry = map.entry(ep_id.to_string()).or_default();
+    f(entry);
+    let active = map.values().any(|g| {
+        g.muted || (g.master - 1.0).abs() > 1e-6 || g.channels.iter().any(|&c| (c - 1.0).abs() > 1e-6)
+    });
+    ENDPOINT_SW_GAINS_ACTIVE.store(active, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(super) fn reset_endpoint_software_gains_for_test() {
+    ENDPOINT_SW_GAINS.lock().unwrap().clear();
+    ENDPOINT_SW_GAINS_ACTIVE.store(false, Ordering::Release);
+}
+
 struct EndpointVolumeState {
     ep: Arc<Endpoint>,
     min_db: f32,
@@ -981,12 +1038,17 @@ impl EndpointVolumeState {
         let master = backend::device_volume_scalar(&ep.info, is_cap).unwrap_or(1.0);
         let muted = backend::device_mute(&ep.info, is_cap).unwrap_or(false);
         let ch = ep.mix_format().channels.max(1) as usize;
+        let mut ch_vals = Vec::with_capacity(ch);
+        for i in 0..ch {
+            let v = backend::device_channel_volume_scalar(&ep.info, is_cap, i as u32).unwrap_or(master);
+            ch_vals.push(v);
+        }
         Arc::new(Self {
             ep,
             min_db,
             max_db,
             master_scalar: AtomicU32::new(master.to_bits()),
-            channels: Mutex::new(vec![master; ch]),
+            channels: Mutex::new(ch_vals),
             muted: std::sync::atomic::AtomicBool::new(muted),
             callbacks: Mutex::new(Vec::new()),
         })
@@ -1014,10 +1076,49 @@ impl EndpointVolumeState {
     fn set_master_scalar(&self, scalar: f32) {
         let s = scalar.clamp(0.0, 1.0);
         self.master_scalar.store(s.to_bits(), Ordering::Relaxed);
-        let _ = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
+        let hw_ok = backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s);
         for c in self.channels.lock().unwrap().iter_mut() {
             *c = s;
         }
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            // If CoreAudio hardware applied master volume, avoid double-attenuation in software;
+            // otherwise apply the master scalar directly in the software render path.
+            g.master = if hw_ok { 1.0 } else { s };
+            g.channels = [1.0; 8];
+        });
+    }
+
+    fn current_channel_scalar(&self, ch: usize) -> Option<f32> {
+        let mut chs = self.channels.lock().unwrap();
+        if ch >= chs.len() {
+            return None;
+        }
+        if let Some(v) = backend::device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32) {
+            chs[ch] = v;
+            Some(v)
+        } else {
+            Some(chs[ch])
+        }
+    }
+
+    fn set_channel_scalar(&self, ch: usize, scalar: f32) -> bool {
+        let s = scalar.clamp(0.0, 1.0);
+        {
+            let mut chs = self.channels.lock().unwrap();
+            let Some(slot) = chs.get_mut(ch) else {
+                return false;
+            };
+            *slot = s;
+        }
+        let hw_ok = backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32, s);
+        if ch < 8 {
+            update_endpoint_sw_gain(&self.ep.id, |g| {
+                // Apply per-channel attenuation in software whenever CoreAudio HAL does not
+                // expose hardware per-channel volume for this endpoint.
+                g.channels[ch] = if hw_ok { 1.0 } else { s };
+            });
+        }
+        true
     }
 
     fn current_mute(&self) -> bool {
@@ -1031,7 +1132,10 @@ impl EndpointVolumeState {
 
     fn set_mute(&self, mute: bool) {
         self.muted.store(mute, Ordering::Relaxed);
-        let _ = backend::set_device_mute(&self.ep.info, self.ep.is_capture(), mute);
+        let hw_ok = backend::set_device_mute(&self.ep.info, self.ep.is_capture(), mute);
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.muted = if hw_ok { false } else { mute };
+        });
     }
 }
 
@@ -1109,11 +1213,9 @@ mod endpoint_vol {
         if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
             return E_INVALIDARG;
         }
-        let mut chs = st.channels.lock().unwrap();
-        let Some(slot) = chs.get_mut(ch as usize) else {
+        if !st.set_channel_scalar(ch as usize, st.db_to_scalar(db)) {
             return E_INVALIDARG;
-        };
-        *slot = st.db_to_scalar(db);
+        }
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume_db(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
@@ -1122,12 +1224,9 @@ mod endpoint_vol {
         if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
-        let st = EndpointVolumeObj::inner(this);
-        let mut chs = st.channels.lock().unwrap();
-        let Some(slot) = chs.get_mut(ch as usize) else {
+        if !EndpointVolumeObj::inner(this).set_channel_scalar(ch as usize, level) {
             return E_INVALIDARG;
-        };
-        *slot = level;
+        }
         S_OK
     }
     crate::win64_bridge!(fn set_channel_volume_scalar(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
@@ -1137,8 +1236,7 @@ mod endpoint_vol {
             return E_POINTER;
         }
         let st = EndpointVolumeObj::inner(this);
-        let chs = st.channels.lock().unwrap();
-        let Some(&s) = chs.get(ch as usize) else {
+        let Some(s) = st.current_channel_scalar(ch as usize) else {
             return E_INVALIDARG;
         };
         write_out(out, st.scalar_to_db(s))
@@ -1149,8 +1247,7 @@ mod endpoint_vol {
             return E_POINTER;
         }
         let st = EndpointVolumeObj::inner(this);
-        let chs = st.channels.lock().unwrap();
-        let Some(&s) = chs.get(ch as usize) else {
+        let Some(s) = st.current_channel_scalar(ch as usize) else {
             return E_INVALIDARG;
         };
         write_out(out, s)
