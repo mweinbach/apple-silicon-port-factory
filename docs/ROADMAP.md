@@ -82,7 +82,7 @@ offline `.aot` prewarming, and general Win32/graphics fixes.
   that boots straight into prewarmed ARM64 code.
 
 ### Track D — Alan Wake 2 Playable Slice (`games/alan-wake-2/`)
-- Diagnose and fix the Cauldron Lake movement/camera drop issue observed in Return 0: The Cult.
+- Recheck the Cauldron Lake terrain fix during the full Return 0 playthrough.
 - Play through Return 0 and Chapter 1 start-to-finish on native ARM64 with MetalFX upscaling and
   either CoreAudio WASAPI or `AW2_AUDIO=native`, with save/load working cleanly under `~/Translator`.
 - Retire remaining A3/A4 audio parity rough edges documented in [docs/AUDIO.md](AUDIO.md) as needed
