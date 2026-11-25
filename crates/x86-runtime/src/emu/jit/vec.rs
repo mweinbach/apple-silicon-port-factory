@@ -24,6 +24,12 @@ impl Asm {
     pub(super) fn v_cnt_8b(&mut self, vd: u32, vn: u32) {
         self.emit(0x0E20_5800 | vn << 5 | vd);
     }
+    pub(super) fn v_cnt_16b(&mut self, vd: u32, vn: u32) {
+        self.emit(0x4E20_5800 | vn << 5 | vd);
+    }
+    pub(super) fn v_saddlp(&mut self, size: u32, vd: u32, vn: u32) {
+        self.emit(0x4E20_2800 | (size & 3) << 22 | vn << 5 | vd);
+    }
     pub(super) fn v_addv_8b(&mut self, vd: u32, vn: u32) {
         self.emit(0x0E31_B800 | vn << 5 | vd);
     }
@@ -155,6 +161,9 @@ impl Asm {
     }
     pub(super) fn v_sxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x0F08_A400 | (q as u32) << 30 | vn << 5 | vd);
+    }
+    pub(super) fn v_sxtl_s(&mut self, q: bool, vd: u32, vn: u32) {
+        self.emit(0x0F20_A400 | (q as u32) << 30 | vn << 5 | vd);
     }
     pub(super) fn v_uxtl_b(&mut self, q: bool, vd: u32, vn: u32) {
         self.emit(0x2F08_A400 | (q as u32) << 30 | vn << 5 | vd);
@@ -365,7 +374,10 @@ impl Tr<'_> {
     /// Load `b` for a V-form op into `v1` (and `v7` for the upper 128-bit lane if `VM_V256`).
     pub(super) fn vload_b(&mut self, k: usize, op: &FastOp) {
         use fast::*;
-        let mem_form = matches!(op.kind, K_VSHUF_RM | K_VINT_RM | K_VFP_RM);
+        let mem_form = matches!(
+            op.kind,
+            K_VSHUF_RM | K_VINT_RM | K_VFP_RM | K_VAES_RM | K_VGFNI_RM | K_VVNNI_RM
+        );
         let is_256 = (op.w & 3) == VM_V256;
         if !mem_form {
             // (`ldr q1, [cpu, #xmm]` unless the XMM cache holds the register.)
@@ -1852,6 +1864,10 @@ impl Tr<'_> {
                 4 => {
                     self.a.movz(false, T0, 1, 0);
                     self.a.str(8, T0, XCPU, OFF_DF);
+                }
+                6 => {
+                    self.a.dsb_ish();
+                    self.a.isb();
                 }
                 _ => self.a.dmb_ish(),
             },

@@ -2291,6 +2291,12 @@ pub unsafe fn call_va8_xmm(
 ) -> (u64, u128) {
     #[cfg(target_arch = "x86_64")]
     {
+        if crate::emu::resolve_host_callable(va_or_addr).is_none()
+            && crate::exe::in_host_text(va_or_addr as usize)
+        {
+            crate::emu::refuse_unregistered_host_text("simd_ops::call_va8_xmm", va_or_addr);
+            return (0, 0);
+        }
         let addr = crate::exe::lookup_trampoline_or_mapped(va_or_addr);
         set_tls_xmm_in(xmm);
         let f: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
@@ -2364,6 +2370,12 @@ unsafe fn call_va8_xmm_bridge(
         c.incoming_rsp.set((0, 0));
         return (r_gpr, r_xmm);
     }
+    let clean_va = va_or_addr & !(1u64 << 46);
+    if crate::exe::in_host_text(clean_va as usize) {
+        crate::emu::refuse_unregistered_host_text("simd_ops::call_va8_xmm", clean_va);
+        c.rax_in.set(prev_rax);
+        return (0, 0);
+    }
     let target = (crate::exe::lookup_trampoline_or_mapped(va_or_addr) & !(1usize << 46)) as u64;
     crate::emu::set_incoming_rsp(out_rsp, out_limit);
     let r = crate::emu::emu_run_full_rax(target, gpr, xmm, s_extra, prev_rax);
@@ -2384,6 +2396,13 @@ pub unsafe fn call_va8_caught(
     arg7: u64,
     arg8: u64,
 ) -> Result<u64, crate::exe::CxxException> {
+    let clean_va = va_or_addr & !(1u64 << 46);
+    if crate::emu::resolve_host_callable(clean_va).is_none()
+        && crate::exe::in_host_text(clean_va as usize)
+    {
+        crate::emu::refuse_unregistered_host_text("simd_ops::call_va8_caught", clean_va);
+        return Ok(0);
+    }
     let (out_rsp, out_limit) = crate::emu::take_outgoing_rsp();
     let s_extra = crate::emu::read_caller_extra_args(out_rsp, out_limit);
     #[cfg(target_arch = "x86_64")]
