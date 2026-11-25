@@ -939,6 +939,31 @@ impl Tr<'_> {
         self.a.bind(ok);
     }
 
+    // Clear just the fraction bits of exponent-zero lanes; preserve the sign and NaN payloads.
+    fn flush_denorm_lanes(&mut self, reg: u32, double: bool) {
+        let (width, exponent, fraction) = if double {
+            (3, 0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
+        } else {
+            (2, 0x7f80_0000, 0x007f_ffff)
+        };
+        self.a.mov_imm(double, T0, exponent);
+        self.a.v_dup(width, 3, T0);
+        self.a.v_and(3, 3, reg);
+        self.a.v_cmeq0(width, 3, 3);
+        self.a.mov_imm(double, T0, fraction);
+        self.a.v_dup(width, 4, T0);
+        self.a.v_and(3, 3, 4);
+        self.a.v_bic(reg, reg, 3);
+    }
+
+    pub(super) fn flush_minmax_result(&mut self, reg: u32, double: bool) {
+        self.a.ldr(32, T0, XCPU, OFF_MXCSR);
+        self.a.ubfx(T0, T0, 6, 1);
+        let keep = self.a.cbz(false, T0);
+        self.flush_denorm_lanes(reg, double);
+        self.a.bind(keep);
+    }
+
     /// Emit one 128-bit lane of `K_VFP_*` on `(v0 = a, v1 = b) -> v0`.
     pub(super) fn emit_vfp_lane(&mut self, sub: u8, imm8: u8) {
         use fast::*;
@@ -949,6 +974,7 @@ impl Tr<'_> {
                 let is_max = sub == 5 || sub == 11;
                 self.a.fcmp(is_sd, 0, 1);
                 self.a.s_fcsel(is_sd, 2, 0, 1, if is_max { GT } else { MI });
+                self.flush_minmax_result(2, is_sd);
                 self.a.fmov_fg(is_sd, T0, 2);
                 if is_sd {
                     self.a.v_ins_d(0, 0, T0);
@@ -984,6 +1010,7 @@ impl Tr<'_> {
                     self.a.v_fcmgt(is_pd, 2, 1, 0);
                 }
                 self.a.v_bsl(2, 0, 1);
+                self.flush_minmax_result(2, is_pd);
                 self.a.v_mov(0, 2);
             }
             // addps/subps/mulps/divps and *pd: vector FP + inline NaN payload fixup.
@@ -1064,34 +1091,42 @@ impl Tr<'_> {
                 self.a.v_mov(0, 3);
             }
             VF_RCPSS => {
+                self.flush_denorm_lanes(1, false);
                 self.a.mov_imm(false, T0, 0x3F80_0000);
                 self.a.fmov_gf(false, 2, T0);
                 self.a.s_farith(false, 3, 2, 2, 1);
+                self.flush_denorm_lanes(2, false);
                 self.a.fmov_fg(false, T0, 2);
                 self.a.v_ins_s(0, 0, T0);
             }
             // rsqrt: x86 NaN rules on the sqrt (sqrt(-x) = -qNaN indefinite, NaN quieted),
             // then 1/r (which propagates that NaN unchanged). Vector ops only (NZCV kept).
             VF_RSQRTSS => {
+                self.flush_denorm_lanes(1, false);
                 self.a.v_fsqrt(false, 2, 1);
                 self.emit_vnan_check_fix(false, true);
                 self.a.mov_imm(false, T0, 0x3F80_0000);
                 self.a.fmov_gf(false, 3, T0);
                 self.a.s_farith(false, 3, 2, 3, 2);
+                self.flush_denorm_lanes(2, false);
                 self.a.fmov_fg(false, T0, 2);
                 self.a.v_ins_s(0, 0, T0);
             }
             VF_RCPPS => {
+                self.flush_denorm_lanes(1, false);
                 self.a.mov_imm(false, T0, 0x3F80_0000);
                 self.a.v_dup(2, 2, T0);
                 self.a.v_farith(false, 3, 0, 2, 1);
+                self.flush_denorm_lanes(0, false);
             }
             VF_RSQRTPS => {
+                self.flush_denorm_lanes(1, false);
                 self.a.v_fsqrt(false, 2, 1);
                 self.emit_vnan_check_fix(false, true);
                 self.a.mov_imm(false, T0, 0x3F80_0000);
                 self.a.v_dup(2, 3, T0);
                 self.a.v_farith(false, 3, 0, 3, 2);
+                self.flush_denorm_lanes(0, false);
             }
             // addsub / hadd / hsub: lane-wise `l op r` + the x86 NaN fixup with `l` as the
             // first source (both NaN -> l quieted; invalid -> -qNaN indefinite).

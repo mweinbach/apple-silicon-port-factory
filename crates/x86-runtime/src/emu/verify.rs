@@ -661,6 +661,8 @@ fn is_forbidden_ins(ins: &Instruction) -> bool {
             | Xsave64
             | Xsaveopt
             | Xsaveopt64
+            | Xsavec
+            | Xsavec64
             | Xrstor
             | Xrstor64
             | Cli

@@ -20,7 +20,7 @@ use super::stubs::{emit_stubs, emit_stubs_cfg, hostcall_enabled, plaincall_enabl
 use super::translate::stack_tso;
 use super::xmm::{fast_nan_enabled, retlit_enabled, xmm_pin_enabled, xmmreg_enabled};
 use super::*;
-use crate::emu::{mem, to_mapped_addr, BlockCache, BLK_MAX_INSNS};
+use crate::emu::{mem, to_mapped_addr, BlockCache};
 
 /// Word offsets of the shared stubs at the start of an AOT region: enter, exit,
 /// lookup_rip, lookup_jmp, lookup_call, host_xfer, ras_miss, spill_xmm, reload_xmm,
@@ -329,7 +329,7 @@ pub(in crate::emu) fn aot_knob_bits() -> u64 {
         (16, stack_tso() as u64),
         (17, crate::exe::aw2_registry_active() as u64),
         (18, crate::emu::fast_enabled() as u64),
-        (19, (BLK_MAX_INSNS as u64) & 0xFF), // 8 bits
+        (19, u64::from(crate::emu::features::host().bits())), // 8 bits; block length is in codegen_hash
         (27, aot_probe_enabled() as u64),
         (28, 3u64), // codegen rev 3 (2 bits: 28..29)
         (30, xmm_pin_enabled() as u64),

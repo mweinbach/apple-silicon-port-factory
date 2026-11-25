@@ -756,7 +756,7 @@ unsafe fn plain_host_call_asm(cpu: &mut Cpu, host_fn: usize, args_rsp: u64) {
         rd::<u64>(r + 0x30),
         rd::<u64>(r + 0x38),
     ];
-    let _fpcr = ClearFpcrGuard::enter_for_mxcsr(cpu.jx.mxcsr);
+    let _fpcr = ClearFpcrGuard::enter();
     let (rax, _q0) = host_call_asm(host_fn, &gpr, &[0u128; 4], &[0u64; 8]);
     cpu.gpr[0] = rax;
     cpu.last_bits[0] = 64;
@@ -816,6 +816,7 @@ impl XferOutcome {
     #[inline(always)]
     fn into_jit(self, cpu: &mut Cpu) -> u64 {
         match self {
+            XferOutcome::Continue { .. } if super::denorm::software_mode(cpu.jx.mxcsr) => jit::EXIT_RIP,
             XferOutcome::Continue { check_vagen: true } => jit_xfer_done(cpu),
             XferOutcome::Continue { check_vagen: false } => 0,
             XferOutcome::JitExit(code) => code,
@@ -1377,7 +1378,7 @@ unsafe fn xfer_plain(cpu: &mut Cpu, target: u64, args_rsp: u64) -> bool {
     } else {
         [0u128; 4]
     };
-    let _fpcr = ClearFpcrGuard::enter_for_mxcsr(cpu.jx.mxcsr);
+    let _fpcr = ClearFpcrGuard::enter();
     let (rax, q0) = host_call_asm(h, &gpr, &xmm, &[0; 8]);
     if bail && rax == 0 {
         return false;
