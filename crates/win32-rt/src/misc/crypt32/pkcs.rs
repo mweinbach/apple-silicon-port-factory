@@ -167,18 +167,30 @@ fn strip_leading_zero(mut b: &[u8]) -> &[u8] {
 }
 
 /// Extract concatenated OCTET STRING bytes (handles both primitive 0x04 and BER constructed 0x24).
+/// Maximum nesting depth allowed for recursive BER constructed OCTET STRINGs and
+/// PKCS#12 `safeContentsBag` containers. Prevents stack exhaustion on crafted inputs.
+pub(super) const MAX_PFX_NESTING_DEPTH: usize = 32;
+
 fn extract_octet_string(elem: DerItem<'_>) -> Option<Vec<u8>> {
-    if elem.tag == 0x04 {
-        return Some(elem.val.to_vec());
-    }
-    if elem.tag == 0x24 {
-        let mut out = Vec::new();
-        for child in der_item_children(elem.val)? {
-            out.extend_from_slice(&extract_octet_string(child)?);
+    fn inner(elem: DerItem<'_>, depth: usize, out: &mut Vec<u8>) -> Option<()> {
+        if depth > MAX_PFX_NESTING_DEPTH {
+            return None;
         }
-        return Some(out);
+        if elem.tag == 0x04 {
+            out.extend_from_slice(elem.val);
+            return Some(());
+        }
+        if elem.tag == 0x24 {
+            for child in der_item_children(elem.val)? {
+                inner(child, depth + 1, out)?;
+            }
+            return Some(());
+        }
+        None
     }
-    None
+    let mut out = Vec::new();
+    inner(elem, 0, &mut out)?;
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,69 +1520,80 @@ unsafe fn parse_safe_contents(
     certs: &mut Vec<PfxBagCert>,
     keys: &mut Vec<PfxBagKey>,
 ) -> Result<(), u32> {
-    let (seq, _) = parse_der_item(der).ok_or(err::ERROR_INVALID_DATA)?;
-    if seq.tag != 0x30 {
-        return Err(err::ERROR_INVALID_DATA);
-    }
-    let bags = der_item_children(seq.val).ok_or(err::ERROR_INVALID_DATA)?;
-    for bag in bags {
-        if bag.tag != 0x30 {
-            continue;
+    let mut worklist: Vec<(&[u8], usize)> = vec![(der, 0)];
+    while let Some((cur_der, depth)) = worklist.pop() {
+        if depth > MAX_PFX_NESTING_DEPTH {
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let Some(bk) = der_item_children(bag.val) else {
-            continue;
-        };
-        if bk.len() < 2 || bk[0].tag != 0x06 || bk[1].tag != 0xA0 {
-            continue;
+        let (seq, _) = parse_der_item(cur_der).ok_or(err::ERROR_INVALID_DATA)?;
+        if seq.tag != 0x30 {
+            return Err(err::ERROR_INVALID_DATA);
         }
-        let bag_oid = bk[0].val;
-        let bag_val = bk[1].val;
-        let (friendly_name, local_key_id) = parse_bag_attributes(bk.get(2).copied());
+        let bags = der_item_children(seq.val).ok_or(err::ERROR_INVALID_DATA)?;
+        let mut nested: Vec<(&[u8], usize)> = Vec::new();
+        for bag in bags {
+            if bag.tag != 0x30 {
+                continue;
+            }
+            let Some(bk) = der_item_children(bag.val) else {
+                continue;
+            };
+            if bk.len() < 2 || bk[0].tag != 0x06 || bk[1].tag != 0xA0 {
+                continue;
+            }
+            let bag_oid = bk[0].val;
+            let bag_val = bk[1].val;
+            let (friendly_name, local_key_id) = parse_bag_attributes(bk.get(2).copied());
 
-        if bag_oid == OID_CERT_BAG {
-            if let Some((cb_seq, _)) = parse_der_item(bag_val) {
-                if cb_seq.tag == 0x30 {
-                    if let Some(cbk) = der_item_children(cb_seq.val) {
-                        if cbk.len() >= 2
-                            && cbk[0].tag == 0x06
-                            && cbk[0].val == OID_X509_CERT_TYPE
-                            && cbk[1].tag == 0xA0
-                        {
-                            if let Some((oct, _)) = parse_der_item(cbk[1].val) {
-                                if let Some(cert_der) = extract_octet_string(oct) {
-                                    certs.push(PfxBagCert {
-                                        der: cert_der,
-                                        friendly_name,
-                                        local_key_id,
-                                    });
+            if bag_oid == OID_CERT_BAG {
+                if let Some((cb_seq, _)) = parse_der_item(bag_val) {
+                    if cb_seq.tag == 0x30 {
+                        if let Some(cbk) = der_item_children(cb_seq.val) {
+                            if cbk.len() >= 2
+                                && cbk[0].tag == 0x06
+                                && cbk[0].val == OID_X509_CERT_TYPE
+                                && cbk[1].tag == 0xA0
+                            {
+                                if let Some((oct, _)) = parse_der_item(cbk[1].val) {
+                                    if let Some(cert_der) = extract_octet_string(oct) {
+                                        certs.push(PfxBagCert {
+                                            der: cert_der,
+                                            friendly_name,
+                                            local_key_id,
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            } else if bag_oid == OID_KEY_BAG {
+                keys.push(PfxBagKey {
+                    pkcs8_der: bag_val.to_vec(),
+                    local_key_id,
+                });
+            } else if bag_oid == OID_PKCS8_SHROUDED_KEY_BAG {
+                let (epki, _) = parse_der_item(bag_val).ok_or(err::ERROR_INVALID_DATA)?;
+                if epki.tag != 0x30 {
+                    return Err(err::ERROR_INVALID_DATA);
+                }
+                let ek = der_item_children(epki.val).ok_or(err::ERROR_INVALID_DATA)?;
+                if ek.len() < 2 || ek[1].tag != 0x04 {
+                    return Err(err::ERROR_INVALID_DATA);
+                }
+                let pkcs8 = decrypt_pbe(ek[0], ek[1].val, password_utf8, pass_bmp)
+                    .ok_or(ERROR_INVALID_PASSWORD)?;
+                keys.push(PfxBagKey {
+                    pkcs8_der: pkcs8,
+                    local_key_id,
+                });
+            } else if bag_oid == OID_SAFE_CONTENTS_BAG {
+                nested.push((bag_val, depth + 1));
             }
-        } else if bag_oid == OID_KEY_BAG {
-            keys.push(PfxBagKey {
-                pkcs8_der: bag_val.to_vec(),
-                local_key_id,
-            });
-        } else if bag_oid == OID_PKCS8_SHROUDED_KEY_BAG {
-            let (epki, _) = parse_der_item(bag_val).ok_or(err::ERROR_INVALID_DATA)?;
-            if epki.tag != 0x30 {
-                return Err(err::ERROR_INVALID_DATA);
-            }
-            let ek = der_item_children(epki.val).ok_or(err::ERROR_INVALID_DATA)?;
-            if ek.len() < 2 || ek[1].tag != 0x04 {
-                return Err(err::ERROR_INVALID_DATA);
-            }
-            let pkcs8 = decrypt_pbe(ek[0], ek[1].val, password_utf8, pass_bmp)
-                .ok_or(ERROR_INVALID_PASSWORD)?;
-            keys.push(PfxBagKey {
-                pkcs8_der: pkcs8,
-                local_key_id,
-            });
-        } else if bag_oid == OID_SAFE_CONTENTS_BAG {
-            parse_safe_contents(bag_val, password_utf8, pass_bmp, certs, keys)?;
+        }
+        // Push in reverse order so nested SafeContents bags are traversed in document order.
+        for item in nested.into_iter().rev() {
+            worklist.push(item);
         }
     }
     Ok(())

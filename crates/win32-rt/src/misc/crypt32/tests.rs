@@ -4706,5 +4706,41 @@ fn pfx_rejects_unbounded_kdf_iteration_counts() {
             let (h, _) = import(&pfx);
             assert!(h.is_null(), "PBES2 iters={bad_iters} must fail");
         }
+
+        // 4. Deeply nested safeContentsBag containers and constructed BER octet strings must
+        //    fail cleanly with ERROR_INVALID_DATA instead of exhausting stack space.
+        let oid_safe_contents_bag = der_tlv(
+            0x06,
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x0C, 0x0A, 0x01, 0x06],
+        );
+        let mut nested_sc = der_tlv(0x30, &[]);
+        for _ in 0..=super::pkcs::MAX_PFX_NESTING_DEPTH + 4 {
+            let mut bag_body = Vec::new();
+            bag_body.extend_from_slice(&oid_safe_contents_bag);
+            bag_body.extend_from_slice(&der_tlv(0xA0, &nested_sc));
+            nested_sc = der_tlv(0x30, &der_tlv(0x30, &bag_body));
+        }
+        let mut sc_ci = Vec::new();
+        sc_ci.extend_from_slice(&oid_data);
+        sc_ci.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x04, &nested_sc)));
+        let deep_pfx = build_pfx(&der_tlv(0x30, &der_tlv(0x30, &sc_ci)), None);
+        let (h_deep, le_deep) = import(&deep_pfx);
+        assert!(h_deep.is_null(), "deeply nested safeContentsBag must be rejected");
+        assert_eq!(le_deep, err::ERROR_INVALID_DATA);
+
+        let mut deep_oct = der_tlv(0x04, &der_tlv(0x30, &[]));
+        for _ in 0..=super::pkcs::MAX_PFX_NESTING_DEPTH + 4 {
+            deep_oct = der_tlv(0x24, &deep_oct);
+        }
+        let mut as_ci = Vec::new();
+        as_ci.extend_from_slice(&oid_data);
+        as_ci.extend_from_slice(&der_tlv(0xA0, &deep_oct));
+        let mut pfx_body = Vec::new();
+        pfx_body.extend_from_slice(&der_u32(3));
+        pfx_body.extend_from_slice(&der_tlv(0x30, &as_ci));
+        let deep_oct_pfx = der_tlv(0x30, &pfx_body);
+        let (h_oct, le_oct) = import(&deep_oct_pfx);
+        assert!(h_oct.is_null(), "deeply nested constructed OCTET STRING must be rejected");
+        assert_eq!(le_oct, err::ERROR_INVALID_DATA);
     }
 }
