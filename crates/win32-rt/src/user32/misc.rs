@@ -1316,6 +1316,16 @@ pub(crate) fn forget_thread_hotkeys(tid: u32) {
     HOTKEYS.lock().unwrap().retain(|h| h.tid != tid);
 }
 
+/// Return `true` if a live registered hotkey matches `(mods, vk)` without posting
+/// `WM_HOTKEY` yet (used when `WH_KEYBOARD_LL` evaluation must be deferred onto a
+/// Win32 thread before deciding whether the hotkey is suppressed).
+pub(crate) fn has_matching_hotkey(mods: u32, vk: u32) -> bool {
+    let norm_mods = mods & MOD_MASK;
+    let mut list = HOTKEYS.lock().unwrap();
+    prune_dead_hotkeys(&mut list);
+    list.iter().any(|h| h.mods == norm_mods && h.vk == vk)
+}
+
 /// Check if an incoming keydown matches a registered hotkey; if so, post
 /// `WM_HOTKEY` (0x0312) to the target window (or thread queue if `hwnd == 0`)
 /// and return `true` to consume the keystroke.

@@ -1060,15 +1060,30 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
     out_len: u32,
 ) -> i32 {
     match info_level {
-        SYSTEM_POWER_POLICY_AC | SYSTEM_POWER_POLICY_DC | SYSTEM_POWER_POLICY_CURRENT => {
+        SYSTEM_POWER_POLICY_AC | SYSTEM_POWER_POLICY_DC => {
+            if !in_buf.is_null() || in_len != 0 {
+                if in_buf.is_null() || in_len < 232 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                log::warn!(
+                    "powrprof: CallNtPowerInformation cannot apply system power policy update (level={info_level}) from user space"
+                );
+                return STATUS_ACCESS_DENIED;
+            }
             if out_buf.is_null() || out_len < 232 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            if !in_buf.is_null() && in_len >= 232 {
-                std::ptr::copy_nonoverlapping(in_buf as *const u8, out_buf as *mut u8, 232);
-            } else {
-                fill_default_system_power_policy(out_buf as *mut u8);
+            fill_default_system_power_policy(out_buf as *mut u8);
+            STATUS_SUCCESS
+        }
+        SYSTEM_POWER_POLICY_CURRENT => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
             }
+            if out_buf.is_null() || out_len < 232 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            fill_default_system_power_policy(out_buf as *mut u8);
             STATUS_SUCCESS
         }
         VERIFY_SYSTEM_POLICY_AC | VERIFY_SYSTEM_POLICY_DC => {
@@ -1166,15 +1181,30 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             std::ptr::write_unaligned(out_buf as *mut u32, 0);
             STATUS_SUCCESS
         }
-        PROCESSOR_POWER_POLICY_AC | PROCESSOR_POWER_POLICY_DC | PROCESSOR_POWER_POLICY_CURRENT => {
+        PROCESSOR_POWER_POLICY_AC | PROCESSOR_POWER_POLICY_DC => {
+            if !in_buf.is_null() || in_len != 0 {
+                if in_buf.is_null() || in_len < 76 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                log::warn!(
+                    "powrprof: CallNtPowerInformation cannot apply processor power policy update (level={info_level}) from user space"
+                );
+                return STATUS_ACCESS_DENIED;
+            }
             if out_buf.is_null() || out_len < 76 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            if !in_buf.is_null() && in_len >= 76 {
-                std::ptr::copy_nonoverlapping(in_buf as *const u8, out_buf as *mut u8, 76);
-            } else {
-                fill_default_processor_power_policy(out_buf as *mut u8);
+            fill_default_processor_power_policy(out_buf as *mut u8);
+            STATUS_SUCCESS
+        }
+        PROCESSOR_POWER_POLICY_CURRENT => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
             }
+            if out_buf.is_null() || out_len < 76 {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            fill_default_processor_power_policy(out_buf as *mut u8);
             STATUS_SUCCESS
         }
         VERIFY_PROCESSOR_POLICY_AC | VERIFY_PROCESSOR_POLICY_DC => {
@@ -1777,6 +1807,82 @@ mod tests {
                 STATUS_SUCCESS
             );
             assert_eq!(u32::from_le_bytes(ppol[0..4].try_into().unwrap()), 1);
+
+            // Policy write attempts must NOT echo unapplied policies back as STATUS_SUCCESS:
+            // AC/DC policy updates require host OS privileges (STATUS_ACCESS_DENIED), undersized
+            // inputs return STATUS_INVALID_PARAMETER, and *_CURRENT levels are read-only.
+            let mut custom_sys = [0xAAu8; 232];
+            custom_sys[0..4].copy_from_slice(&1u32.to_le_bytes());
+            let mut out_sys = [0x55u8; 232];
+            for lvl in [SYSTEM_POWER_POLICY_AC, SYSTEM_POWER_POLICY_DC] {
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        custom_sys.len() as u32,
+                        out_sys.as_mut_ptr() as *mut c_void,
+                        out_sys.len() as u32,
+                    ),
+                    STATUS_ACCESS_DENIED
+                );
+                assert!(out_sys.iter().all(|&b| b == 0x55), "rejected write must not overwrite out_buf");
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_sys.as_ptr() as *const c_void,
+                        16,
+                        out_sys.as_mut_ptr() as *mut c_void,
+                        out_sys.len() as u32,
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+            }
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_POWER_POLICY_CURRENT,
+                    custom_sys.as_ptr() as *const c_void,
+                    custom_sys.len() as u32,
+                    out_sys.as_mut_ptr() as *mut c_void,
+                    out_sys.len() as u32,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
+
+            let custom_proc = [0xBBu8; 76];
+            let mut out_proc = [0x44u8; 76];
+            for lvl in [PROCESSOR_POWER_POLICY_AC, PROCESSOR_POWER_POLICY_DC] {
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        custom_proc.len() as u32,
+                        out_proc.as_mut_ptr() as *mut c_void,
+                        out_proc.len() as u32,
+                    ),
+                    STATUS_ACCESS_DENIED
+                );
+                assert!(out_proc.iter().all(|&b| b == 0x44));
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        custom_proc.as_ptr() as *const c_void,
+                        8,
+                        out_proc.as_mut_ptr() as *mut c_void,
+                        out_proc.len() as u32,
+                    ),
+                    STATUS_INVALID_PARAMETER
+                );
+            }
+            assert_eq!(
+                CallNtPowerInformation(
+                    PROCESSOR_POWER_POLICY_CURRENT,
+                    custom_proc.as_ptr() as *const c_void,
+                    custom_proc.len() as u32,
+                    out_proc.as_mut_ptr() as *mut c_void,
+                    out_proc.len() as u32,
+                ),
+                STATUS_INVALID_PARAMETER
+            );
 
             // Privileged admin-only level returns STATUS_ACCESS_DENIED; unknown returns STATUS_INVALID_PARAMETER.
             assert_eq!(

@@ -962,7 +962,33 @@ pub fn native_key(k: NativeKey) {
         if async_down(0x5B) || async_down(0x5C) {
             mods |= 0x0008; // MOD_WIN (VK_LWIN / VK_RWIN)
         }
-        if super::misc::try_dispatch_hotkey(mods, key.vk as u32, was_down || k.repeat) {
+        let is_repeat = was_down || k.repeat;
+        if !ll_checked
+            && super::misc::has_hooks(super::misc::WH_KEYBOARD_LL)
+            && super::misc::has_matching_hotkey(mods, key.vk as u32)
+        {
+            // Defer both WH_KEYBOARD_LL evaluation and conditional WM_HOTKEY posting
+            // onto the hook-owning Win32 thread so a suppressing hook blocks the hotkey.
+            let vk = key.vk as u32;
+            let scan = key.scan as u32;
+            let ext = key.ext;
+            let up = !k.down;
+            let q = super::misc::ll_hook_owner_tid(super::misc::WH_KEYBOARD_LL)
+                .map(message::queue_for)
+                .or_else(|| {
+                    let target = FOCUS.load(Ordering::Acquire);
+                    window::get(target).and_then(|w| message::queue_of(w.tid))
+                });
+            if let Some(q) = q {
+                q.call(move || {
+                    if !dispatch_keyboard_ll_hook(msg, vk, scan, ext, alt_after, up, time) {
+                        let _ = super::misc::try_dispatch_hotkey(mods, vk, is_repeat);
+                    }
+                });
+                return;
+            }
+        }
+        if super::misc::try_dispatch_hotkey(mods, key.vk as u32, is_repeat) {
             if !ll_checked {
                 defer_keyboard_ll_hook(0, msg, key.vk as u32, key.scan as u32, key.ext, alt_after, !k.down, time);
             }
@@ -2398,6 +2424,118 @@ mod tests {
             assert_eq!(m.wparam, 55);
 
             assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 55), TRUE);
+            let _ = window::DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn deferred_keyboard_ll_hook_suppresses_or_allows_registered_hotkey() {
+        let _g = super::super::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            static SUPPRESS_A: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(true);
+            static SEEN_VKS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+            unsafe extern "win64" fn hotkey_ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                if code >= 0 && lp != 0 {
+                    let ks = (lp as *const super::super::misc::KBDLLHOOKSTRUCT).read_unaligned();
+                    SEEN_VKS.lock().unwrap().push((wp as u32, ks.vk_code));
+                    if ks.vk_code == b'A' as u32 && SUPPRESS_A.load(Ordering::Acquire) {
+                        return 1;
+                    }
+                }
+                super::super::misc::CallNextHookEx(0, code, wp, lp)
+            }
+
+            SEEN_VKS.lock().unwrap().clear();
+            let cls = crate::strings::to_wide_z("DeferredHotkeyLlWnd");
+            let wc = class::WNDCLASS {
+                style: 0,
+                wndproc: register_typed_host_wndproc(defproc::DefWindowProcW),
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name: cls.as_ptr() as usize,
+            };
+            let _ = class::RegisterClassW(&wc);
+            let hwnd = window::CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                std::ptr::null(),
+                ws::POPUP,
+                0,
+                0,
+                200,
+                200,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            set_active_window(hwnd as usize, false);
+            set_focus(hwnd as usize);
+
+            let h_kb = super::super::misc::SetWindowsHookExW(
+                super::super::misc::WH_KEYBOARD_LL,
+                hotkey_ll_proc as *const () as usize,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_ne!(h_kb, 0);
+            assert_eq!(
+                super::super::misc::RegisterHotKey(hwnd, 77, 0x0002 /* MOD_CONTROL */, b'A' as u32),
+                TRUE
+            );
+
+            // 1. Suppressing WH_KEYBOARD_LL hook on deferred AppKit path must prevent WM_HOTKEY.
+            SUPPRESS_A.store(true, Ordering::Release);
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x3B, down: false, repeat: false, chars: Vec::new() });
+            assert!(SEEN_VKS.lock().unwrap().is_empty(), "hook must remain deferred on AppKit thread");
+            super::super::misc::set_force_defer_guest_hooks(false);
+            release_all_keys();
+
+            let mut m = MSG::default();
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                FALSE,
+                "deferred WH_KEYBOARD_LL returning nonzero must suppress WM_HOTKEY"
+            );
+            assert!(
+                SEEN_VKS.lock().unwrap().contains(&(wm::KEYDOWN, b'A' as u32)),
+                "deferred WH_KEYBOARD_LL must have observed the hotkey keydown"
+            );
+
+            // 2. Allowing WH_KEYBOARD_LL hook on deferred AppKit path must deliver WM_HOTKEY.
+            SEEN_VKS.lock().unwrap().clear();
+            SUPPRESS_A.store(false, Ordering::Release);
+            super::super::misc::set_force_defer_guest_hooks(true);
+            native_key(NativeKey { mac: 0x3B, down: true, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x00, down: true, repeat: false, chars: vec![b'a' as u16] });
+            native_key(NativeKey { mac: 0x00, down: false, repeat: false, chars: Vec::new() });
+            native_key(NativeKey { mac: 0x3B, down: false, repeat: false, chars: Vec::new() });
+            super::super::misc::set_force_defer_guest_hooks(false);
+            release_all_keys();
+
+            assert_eq!(
+                message::PeekMessageW(&mut m, hwnd, wm::HOTKEY, wm::HOTKEY, message::PM_REMOVE),
+                TRUE,
+                "deferred WH_KEYBOARD_LL returning 0 must allow WM_HOTKEY delivery"
+            );
+            assert_eq!(m.wparam, 77);
+
+            assert_eq!(super::super::misc::UnregisterHotKey(hwnd, 77), TRUE);
+            assert_eq!(super::super::misc::UnhookWindowsHookEx(h_kb), TRUE);
             let _ = window::DestroyWindow(hwnd);
         })
         .join()
