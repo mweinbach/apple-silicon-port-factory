@@ -1,7 +1,7 @@
-//! CI supplies Zig and a freshly built runner. Only these test-owned guests execute.
+//! CI supplies Zig. Cargo supplies both executable paths. Only these test-owned guests execute.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use port_factory::bench::{aot_live_block_count, WORKLOADS};
+use port_factory::bench::{aot_live_block_count, build_host_port_runner, WORKLOADS};
 use port_factory::bundle_common::TempDirGuard;
 use port_factory::json_output::{parse_json, JsonValue};
 use std::fs;
@@ -49,7 +49,7 @@ fn report(exe: &Path) -> (i32, JsonValue) {
 }
 
 #[test]
-#[ignore = "requires Zig and cargo runner-build; exercised by CI"]
+#[ignore = "requires Zig; exercised by CI"]
 fn readiness_matches_the_guest_in_live_jit_and_prewarmed_aot() {
     let tmp = TempDirGuard::create_unique("readiness-guest").unwrap();
     let dir = tmp.path();
@@ -70,17 +70,7 @@ fn readiness_matches_the_guest_in_live_jit_and_prewarmed_aot() {
                 && imp.get("kind").unwrap().as_str() == Some("real")
         ));
 
-    let test_bin = std::env::current_exe().unwrap();
-    let runner = test_bin
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("port-runner");
-    assert!(
-        runner.is_file(),
-        "build port-runner in the same Cargo profile first"
-    );
+    let runner = build_host_port_runner(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
     for abort in [false, true] {
         let name = if abort { "unsupported" } else { "x87" };
         let mut flags = vec![
