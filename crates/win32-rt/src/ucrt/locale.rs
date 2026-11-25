@@ -468,9 +468,44 @@ fn build_lconv(num: &LocaleEntry, mon: &LocaleEntry) -> *const Lconv {
         (".".to_string(), ",".to_string(), "\x03".to_string())
     };
 
-    let (int_curr, curr_sym, mon_dec, mon_thou, mon_grp, pos_s, neg_s, frac_d) = if mon.is_c {
-        (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), 127u8)
+    let (
+        int_curr,
+        curr_sym,
+        mon_dec,
+        mon_thou,
+        mon_grp,
+        pos_s,
+        neg_s,
+        frac_d,
+        p_cs_precedes,
+        p_sep_by_space,
+        n_cs_precedes,
+        n_sep_by_space,
+        p_sign_posn,
+        n_sign_posn,
+    ) = if mon.is_c {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            127u8,
+            127u8,
+            127u8,
+            127u8,
+            127u8,
+            127u8,
+            127u8,
+        )
     } else if let Some(loc) = kstr::resolve_locale_tag(&mon.bcp47) {
+        let q_u8 = |lctype: u32, def: u8| -> u8 {
+            kstr::locale_info_for(&loc, lctype)
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(def)
+        };
         (
             kstr::locale_info_for(&loc, 0x15).unwrap_or_else(|| "USD".into()),
             kstr::locale_info_for(&loc, 0x14).unwrap_or_else(|| "$".into()),
@@ -479,10 +514,31 @@ fn build_lconv(num: &LocaleEntry, mon: &LocaleEntry) -> *const Lconv {
             grouping_bytes(&kstr::locale_info_for(&loc, 0x18).unwrap_or_else(|| "3;0".into())),
             kstr::locale_info_for(&loc, 0x50).unwrap_or_default(),
             kstr::locale_info_for(&loc, 0x51).unwrap_or_else(|| "-".into()),
-            kstr::locale_info_for(&loc, 0x19).and_then(|s| s.parse::<u8>().ok()).unwrap_or(2),
+            q_u8(0x19, 2),
+            q_u8(0x54, 1),
+            q_u8(0x55, 0),
+            q_u8(0x56, 1),
+            q_u8(0x57, 0),
+            q_u8(0x52, 3),
+            q_u8(0x53, 1),
         )
     } else {
-        ("USD".into(), "$".into(), ".".into(), ",".into(), "\x03".into(), String::new(), "-".into(), 2u8)
+        (
+            "USD".into(),
+            "$".into(),
+            ".".into(),
+            ",".into(),
+            "\x03".into(),
+            String::new(),
+            "-".into(),
+            2u8,
+            1u8,
+            0u8,
+            1u8,
+            0u8,
+            3u8,
+            1u8,
+        )
     };
 
     let lc = Box::leak(Box::new(Lconv {
@@ -498,12 +554,12 @@ fn build_lconv(num: &LocaleEntry, mon: &LocaleEntry) -> *const Lconv {
         negative_sign: intern_in_cp(&neg_s, mon.cp),
         int_frac_digits: frac_d,
         frac_digits: frac_d,
-        p_cs_precedes: if mon.is_c { 127 } else { 1 },
-        p_sep_by_space: if mon.is_c { 127 } else { 0 },
-        n_cs_precedes: if mon.is_c { 127 } else { 1 },
-        n_sep_by_space: if mon.is_c { 127 } else { 0 },
-        p_sign_posn: if mon.is_c { 127 } else { 3 },
-        n_sign_posn: if mon.is_c { 127 } else { 0 },
+        p_cs_precedes,
+        p_sep_by_space,
+        n_cs_precedes,
+        n_sep_by_space,
+        p_sign_posn,
+        n_sign_posn,
         w_decimal_point: intern_wide(&dec_pt),
         w_thousands_sep: intern_wide(&thou_sep),
         w_int_curr_symbol: intern_wide(&int_curr),
@@ -669,6 +725,23 @@ mod tests {
             assert_eq!(from_ansi(lc.int_curr_symbol), "EUR");
             assert_eq!(from_wide(lc.w_decimal_point), ",");
             assert_eq!(from_wide(lc.w_currency_symbol), "€");
+            // German monetary placement: "1.234,56 €" / "-1.234,56 €"
+            assert_eq!(lc.p_cs_precedes, 0);
+            assert_eq!(lc.p_sep_by_space, 1);
+            assert_eq!(lc.n_cs_precedes, 0);
+            assert_eq!(lc.n_sep_by_space, 1);
+            assert_eq!(lc.p_sign_posn, 1);
+            assert_eq!(lc.n_sign_posn, 1);
+
+            // en-IN secondary grouping propagates into localeconv().grouping as [3, 2].
+            assert!(!setlocale(LC_ALL, b"en-IN\0".as_ptr()).is_null());
+            let lc_in = &*localeconv();
+            assert_eq!(cstr_slice(lc_in.grouping), &[3, 2]);
+            assert_eq!(lc_in.p_cs_precedes, 1);
+            assert_eq!(lc_in.p_sep_by_space, 0);
+
+            // Restore de-DE before CP1252 mbstowcs/wcstombs assertions.
+            assert!(!setlocale(LC_ALL, b"de-DE\0".as_ptr()).is_null());
 
             // Verify mbstowcs / wcstombs honor CP1252 when LC_CTYPE is de-DE!
             let euro_cp1252 = [0x80u8, 0];

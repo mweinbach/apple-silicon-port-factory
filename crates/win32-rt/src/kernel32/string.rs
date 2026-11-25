@@ -70,6 +70,7 @@ mod icu {
 
     pub const UNUM_MAX_FRACTION_DIGITS: i32 = 6;
     pub const UNUM_GROUPING_SIZE: i32 = 10;
+    pub const UNUM_SECONDARY_GROUPING_SIZE: i32 = 15;
 
     pub const UCAL_FIRST_DAY_OF_WEEK: i32 = 1;
 
@@ -129,6 +130,7 @@ mod icu {
         pub unum_open: unsafe extern "C" fn(i32, *const u16, i32, *const c_char, *mut c_void, *mut i32) -> *mut c_void,
         pub unum_get_symbol: unsafe extern "C" fn(*const c_void, i32, *mut u16, i32, *mut i32) -> i32,
         pub unum_get_attribute: unsafe extern "C" fn(*const c_void, i32) -> i32,
+        pub unum_to_pattern: unsafe extern "C" fn(*const c_void, i8, *mut u16, i32, *mut i32) -> i32,
         pub unum_close: unsafe extern "C" fn(*mut c_void),
         pub udat_open: unsafe extern "C" fn(i32, i32, *const c_char, *const u16, i32, *const u16, i32, *mut i32) -> *mut c_void,
         pub udat_to_pattern: unsafe extern "C" fn(*const c_void, i8, *mut u16, i32, *mut i32) -> i32,
@@ -223,6 +225,7 @@ mod icu {
                 unum_open: sym!(c"unum_open", unsafe extern "C" fn(i32, *const u16, i32, *const c_char, *mut c_void, *mut i32) -> *mut c_void),
                 unum_get_symbol: sym!(c"unum_getSymbol", unsafe extern "C" fn(*const c_void, i32, *mut u16, i32, *mut i32) -> i32),
                 unum_get_attribute: sym!(c"unum_getAttribute", unsafe extern "C" fn(*const c_void, i32) -> i32),
+                unum_to_pattern: sym!(c"unum_toPattern", unsafe extern "C" fn(*const c_void, i8, *mut u16, i32, *mut i32) -> i32),
                 unum_close: sym!(c"unum_close", unsafe extern "C" fn(*mut c_void)),
                 udat_open: sym!(c"udat_open", unsafe extern "C" fn(i32, i32, *const c_char, *const u16, i32, *const u16, i32, *mut i32) -> *mut c_void),
                 udat_to_pattern: sym!(c"udat_toPattern", unsafe extern "C" fn(*const c_void, i8, *mut u16, i32, *mut i32) -> i32),
@@ -1870,6 +1873,98 @@ fn date_order(pat: &str) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CurrencyPlacement {
+    p_cs_precedes: u8,
+    p_sep_by_space: u8,
+    n_cs_precedes: u8,
+    n_sep_by_space: u8,
+    p_sign_posn: u8,
+    n_sign_posn: u8,
+    win_icurrency: u8,
+    win_inegcurr: u8,
+}
+
+fn parse_currency_subpattern(sub: &str, is_neg: bool) -> (u8, u8, u8) {
+    let chars: Vec<char> = sub.chars().filter(|&c| c != '\'').collect();
+    let curr_pos = chars.iter().position(|&c| c == '¤');
+    let num_start = chars.iter().position(|&c| c == '#' || c == '0');
+    let num_end = chars.iter().rposition(|&c| c == '#' || c == '0').map(|i| i + 1);
+    let (Some(cp), Some(ns), Some(ne)) = (curr_pos, num_start, num_end) else {
+        return (1, 0, if is_neg { 1 } else { 3 });
+    };
+    let cs_precedes = if cp < ns { 1u8 } else { 0u8 };
+    let between = if cs_precedes == 1 {
+        &chars[cp + 1..ns]
+    } else if ne <= cp {
+        &chars[ne..cp]
+    } else {
+        &[]
+    };
+    let sep_by_space = if between.iter().any(|c| c.is_whitespace()) { 1u8 } else { 0u8 };
+    let sign_posn = if !is_neg {
+        if cs_precedes == 1 { 3 } else { 1 }
+    } else if chars.contains(&'(') && chars.contains(&')') {
+        0
+    } else {
+        let mp = chars.iter().position(|&c| c == '-' || c == '\u{2212}').unwrap_or(0);
+        if mp < cp && mp < ns {
+            1
+        } else if mp > cp && mp >= ne {
+            2
+        } else if cs_precedes == 1 {
+            4
+        } else {
+            3
+        }
+    };
+    (cs_precedes, sep_by_space, sign_posn)
+}
+
+fn parse_currency_pattern(pat: &str) -> CurrencyPlacement {
+    let (pos_sub, neg_sub_owned) = match pat.split_once(';') {
+        Some((p, n)) => (p, n.to_string()),
+        None => (pat, format!("-{pat}")),
+    };
+    let (p_cs_precedes, p_sep_by_space, p_sign_posn) = parse_currency_subpattern(pos_sub, false);
+    let (n_cs_precedes, n_sep_by_space, n_sign_posn) = parse_currency_subpattern(&neg_sub_owned, true);
+    let win_icurrency = match (p_cs_precedes, p_sep_by_space) {
+        (1, 0) => 0, // $1.1
+        (0, 0) => 1, // 1.1$
+        (1, 1) => 2, // $ 1.1
+        _ => 3,      // 1.1 $
+    };
+    let win_inegcurr = match (n_cs_precedes, n_sep_by_space, n_sign_posn) {
+        (1, 0, 0) => 0,  // ($1.1)
+        (1, 0, 1) => 1,  // -$1.1
+        (1, 0, 4) => 2,  // $-1.1
+        (1, 0, 2) => 3,  // $1.1-
+        (0, 0, 0) => 4,  // (1.1$)
+        (0, 0, 1) => 5,  // -1.1$
+        (0, 0, 3) => 6,  // 1.1-$
+        (0, 0, 2) => 7,  // 1.1$-
+        (0, 1, 1) => 8,  // -1.1 $
+        (1, 1, 1) => 9,  // -$ 1.1
+        (0, 1, 2) => 10, // 1.1 $-
+        (1, 1, 2) => 11, // $ 1.1-
+        (1, 1, 4) => 12, // $ -1.1
+        (0, 1, 3) => 13, // 1.1- $
+        (1, 1, 0) => 14, // ($ 1.1)
+        (0, 1, 0) => 15, // (1.1 $)
+        _ => 1,
+    };
+    CurrencyPlacement {
+        p_cs_precedes,
+        p_sep_by_space,
+        n_cs_precedes,
+        n_sep_by_space,
+        p_sign_posn,
+        n_sign_posn,
+        win_icurrency,
+        win_inegcurr,
+    }
+}
+
 /// Query a Windows `LCTYPE` value for any resolved locale using Apple ICU.
 pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<String> {
     if loc.invariant {
@@ -1906,6 +2001,20 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
             (a.unum_close)(nf);
             Some(v)
         }
+    };
+    let curr_placement = || -> CurrencyPlacement {
+        unsafe {
+            let mut st = 0i32;
+            let nf = (a.unum_open)(icu::UNUM_CURRENCY, std::ptr::null(), 0, cloc.as_ptr(), std::ptr::null_mut(), &mut st);
+            if !nf.is_null() && st <= 0 {
+                let pat = icu::call_u16_str(|b, cap, s| (a.unum_to_pattern)(nf, 0, b, cap, s));
+                (a.unum_close)(nf);
+                if let Some(p) = pat {
+                    return parse_currency_pattern(&p);
+                }
+            }
+        }
+        parse_currency_pattern("¤#,##0.00")
     };
     let date_pat = |tstyle: i32, dstyle: i32, force4y: bool| -> Option<String> {
         unsafe {
@@ -1994,8 +2103,16 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
         0x0E => num_sym(icu::UNUM_DECIMAL, icu::UNUM_DECIMAL_SEPARATOR_SYMBOL).unwrap_or_else(|| ".".into()),
         0x0F => num_sym(icu::UNUM_DECIMAL, icu::UNUM_GROUPING_SEPARATOR_SYMBOL).unwrap_or_else(|| ",".into()),
         0x10 | 0x18 => {
-            let g = num_attr(icu::UNUM_DECIMAL, icu::UNUM_GROUPING_SIZE).unwrap_or(3).max(0);
-            if g == 0 { "0".into() } else { format!("{g};0") }
+            let style = if t == 0x18 { icu::UNUM_CURRENCY } else { icu::UNUM_DECIMAL };
+            let g1 = num_attr(style, icu::UNUM_GROUPING_SIZE).unwrap_or(3).max(0);
+            let g2 = num_attr(style, icu::UNUM_SECONDARY_GROUPING_SIZE).unwrap_or(0).max(0);
+            if g1 == 0 {
+                "0".into()
+            } else if g2 > 0 && g2 != g1 {
+                format!("{g1};{g2};0")
+            } else {
+                format!("{g1};0")
+            }
         }
         0x11 => "2".into(),
         0x12 => "1".into(),
@@ -2015,8 +2132,8 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
             .or_else(|| num_sym(icu::UNUM_DECIMAL, icu::UNUM_GROUPING_SEPARATOR_SYMBOL))
             .unwrap_or_else(|| ",".into()),
         0x19 | 0x1A => num_attr(icu::UNUM_CURRENCY, icu::UNUM_MAX_FRACTION_DIGITS).unwrap_or(2).max(0).to_string(),
-        0x1B => "0".into(),
-        0x1C => "0".into(),
+        0x1B => curr_placement().win_icurrency.to_string(),
+        0x1C => curr_placement().win_inegcurr.to_string(),
         0x1D => {
             let p = date_pat(icu::UDAT_NONE, icu::UDAT_SHORT, true).unwrap_or_else(|| "M/d/yyyy".into());
             extract_sep(&p, "/")
@@ -2053,9 +2170,12 @@ pub(crate) fn locale_info_for(loc: &ResolvedLocale, lctype: u32) -> Option<Strin
         0x44..=0x4F => date_sym(icu::UDAT_SHORT_MONTHS, (t - 0x44) as i32).unwrap_or_default(),
         0x50 => String::new(),
         0x51 => num_sym(icu::UNUM_DECIMAL, icu::UNUM_MINUS_SIGN_SYMBOL).unwrap_or_else(|| "-".into()),
-        0x52 => "3".into(),
-        0x53 => "0".into(),
-        0x54 | 0x55 | 0x56 | 0x57 => "1".into(),
+        0x52 => curr_placement().p_sign_posn.to_string(),
+        0x53 => curr_placement().n_sign_posn.to_string(),
+        0x54 => curr_placement().p_cs_precedes.to_string(),
+        0x55 => curr_placement().p_sep_by_space.to_string(),
+        0x56 => curr_placement().n_cs_precedes.to_string(),
+        0x57 => curr_placement().n_sep_by_space.to_string(),
         0x59 => lang,
         0x5A => country,
         0x5B => geo_by_iso2(&country).map(|g| g.geoid.to_string()).unwrap_or_else(|| "244".into()),
@@ -4189,11 +4309,18 @@ mod tests {
             assert!(GetNumberFormatEx(std::ptr::null(), 0, v2.as_ptr(), &fmt as *const _ as *const c_void, out.as_mut_ptr(), 64) > 0);
             assert_eq!(from_wide(out.as_ptr()), ",50");
 
-            // Locale default formatting for de-DE vs en-US
+            // Locale default formatting for de-DE vs en-US and secondary grouping for en-IN/hi-IN
             let de = to_wide_z("de-DE");
             let v3 = to_wide_z("1234.5");
             assert!(GetNumberFormatEx(de.as_ptr(), 0, v3.as_ptr(), std::ptr::null(), out.as_mut_ptr(), 64) > 0);
             assert_eq!(from_wide(out.as_ptr()), "1.234,50");
+
+            let en_in = to_wide_z("en-IN");
+            let v4 = to_wide_z("123456789");
+            assert!(GetNumberFormatEx(en_in.as_ptr(), 0, v4.as_ptr(), std::ptr::null(), out.as_mut_ptr(), 64) > 0);
+            assert_eq!(from_wide(out.as_ptr()), "12,34,56,789.00");
+            assert!(GetLocaleInfoEx(en_in.as_ptr(), 0x10, out.as_mut_ptr(), 64) > 0);
+            assert_eq!(from_wide(out.as_ptr()), "3;2;0");
 
             // Non-zero flags with custom NUMBERFMT fails with ERROR_INVALID_FLAGS
             assert_eq!(GetNumberFormatEx(std::ptr::null(), 1, v3.as_ptr(), &fmt as *const _ as *const c_void, out.as_mut_ptr(), 64), 0);
