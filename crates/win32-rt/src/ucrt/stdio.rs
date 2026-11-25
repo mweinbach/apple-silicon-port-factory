@@ -208,8 +208,8 @@ fn bad_fd() -> i32 {
 /// Detect or emit BOM for Unicode text modes (`_O_WTEXT`, `fopen(..., "..., ccs=...")`).
 /// Matches MSVC UCRT BOM precedence: an existing BOM overrides the requested encoding;
 /// creating/truncating a new writable file with BOM enabled writes the UTF-16LE or UTF-8 BOM.
-/// When `ansi_if_no_bom` is true (`_O_WTEXT` / `ccs=UNICODE`), an existing file without a BOM
-/// falls back to `TextMode::AnsiText` per Microsoft Learn.
+/// When `ansi_if_no_bom` is true (low-level `_open(..., _O_WTEXT)`), an existing file without a
+/// BOM falls back to `TextMode::AnsiText`; for `fopen(..., "..., ccs=UNICODE")` it stays UTF-16LE.
 unsafe fn apply_unicode_bom(
     fd: i32,
     oflag: i32,
@@ -224,6 +224,7 @@ unsafe fn apply_unicode_bom(
     }
     let acc = oflag & 3;
     let can_write = acc == O_WRONLY || acc == O_RDWR;
+    let can_read = acc == O_RDONLY || acc == O_RDWR;
     if st.st_size == 0 {
         if can_write && write_bom_on_new {
             let bom: &[u8] = match requested {
@@ -243,13 +244,13 @@ unsafe fn apply_unicode_bom(
         let n = libc::pread(fd, head.as_mut_ptr() as *mut c_void, 3, 0);
         let is_append = (oflag & O_APPEND) != 0;
         if n >= 2 && head[0] == 0xFF && head[1] == 0xFE {
-            if !is_append {
+            if !is_append || can_read {
                 let _ = libc::lseek(fd, 2, libc::SEEK_SET);
             }
             return TextMode::Utf16Le;
         }
         if n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF {
-            if !is_append {
+            if !is_append || can_read {
                 let _ = libc::lseek(fd, 3, libc::SEEK_SET);
             }
             return TextMode::Utf8;
@@ -262,21 +263,43 @@ unsafe fn apply_unicode_bom(
 }
 
 pub fn open_host(win_path: &str, oflag: i32, pmode: i32) -> i32 {
-    open_host_bom(win_path, oflag, pmode, (oflag & O_WTEXT) != 0, (oflag & O_WTEXT) != 0)
+    let wtext = (oflag & O_WTEXT) != 0;
+    open_host_bom(win_path, oflag, pmode, wtext, wtext, wtext)
 }
 
-fn open_host_bom(win_path: &str, oflag: i32, pmode: i32, write_bom: bool, detect_bom: bool) -> i32 {
+fn open_host_bom(
+    win_path: &str,
+    oflag: i32,
+    pmode: i32,
+    write_bom: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> i32 {
     let Some(host) = crate::path::to_host(win_path) else {
         if crate::path::device_name(win_path) == Some("NUL") {
-            return open_host_path(std::path::Path::new("/dev/null"), oflag, pmode, write_bom, detect_bom);
+            return open_host_path(
+                std::path::Path::new("/dev/null"),
+                oflag,
+                pmode,
+                write_bom,
+                detect_bom,
+                ansi_if_no_bom,
+            );
         }
         errno::set(ENOENT);
         return -1;
     };
-    open_host_path(&host, oflag, pmode, write_bom, detect_bom)
+    open_host_path(&host, oflag, pmode, write_bom, detect_bom, ansi_if_no_bom)
 }
 
-fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32, write_bom: bool, detect_bom: bool) -> i32 {
+fn open_host_path(
+    host: &std::path::Path,
+    oflag: i32,
+    pmode: i32,
+    write_bom: bool,
+    detect_bom: bool,
+    ansi_if_no_bom: bool,
+) -> i32 {
     let acc = oflag & 3;
     let mutating = acc != O_RDONLY || (oflag & (O_APPEND | O_CREAT | O_TRUNC | O_TEMPORARY)) != 0;
     if mutating && crate::path::is_protected_host_write(host) {
@@ -338,7 +361,7 @@ fn open_host_path(host: &std::path::Path, oflag: i32, pmode: i32, write_bom: boo
         }
     };
     let final_mode = if req_mode.is_unicode() {
-        unsafe { apply_unicode_bom(fd, oflag, req_mode, write_bom, detect_bom, win_mode == O_WTEXT) }
+        unsafe { apply_unicode_bom(fd, oflag, req_mode, write_bom, detect_bom, ansi_if_no_bom) }
     } else {
         req_mode
     };
@@ -1777,7 +1800,7 @@ unsafe fn fopen_str(path: &str, mode: &str) -> *mut FILE {
         super::runtime::invalid_parameter("fopen: bad mode");
         return std::ptr::null_mut();
     };
-    let fd = open_host_bom(path, mf.oflag, 0x180, mf.write_bom, mf.detect_bom);
+    let fd = open_host_bom(path, mf.oflag, 0x180, mf.write_bom, mf.detect_bom, false);
     if fd < 0 {
         log::debug!("fopen({path:?}, {mode:?}) failed: errno {}", errno::get());
         return std::ptr::null_mut();
@@ -3509,7 +3532,9 @@ mod tests {
             assert_eq!(got_a, b"\rXY");
             assert_eq!(_close(pfds_a[0]), 0);
 
-            // 12. BOM-less existing file opened with _O_WTEXT (or ccs=UNICODE) falls back to ANSI.
+            // 12. BOM-less existing file: _open(_O_WTEXT) falls back to ANSI, whereas
+            //     fopen("r, ccs=UNICODE") stays UTF-16LE per Microsoft Learn; readable append
+            //     streams ("a+, ccs=UTF-8" / "a+, ccs=UTF-16LE") skip the BOM on read and append on write.
             std::fs::write(dir.join("nobom_ansi.txt"), b"A\r\nB").unwrap();
             let fd_w = _open(b"U:\\nobom_ansi.txt\0".as_ptr(), O_RDONLY | O_WTEXT, 0);
             assert!(fd_w >= 0);
@@ -3519,13 +3544,23 @@ mod tests {
             assert_eq!(&ansi_buf[..3], b"A\nB");
             assert_eq!(_close(fd_w), 0);
 
-            let f_u = fopen(b"U:\\nobom_ansi.txt\0".as_ptr(), b"r, ccs=UNICODE\0".as_ptr());
+            let nobom_u16: Vec<u8> = "AB".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            std::fs::write(dir.join("nobom_u16.txt"), &nobom_u16).unwrap();
+            let f_u = fopen(b"U:\\nobom_u16.txt\0".as_ptr(), b"r, ccs=UNICODE\0".as_ptr());
             assert!(!f_u.is_null());
             assert_eq!(fgetwc(f_u), 'A' as u32);
-            assert_eq!(fgetwc(f_u), '\n' as u32);
             assert_eq!(fgetwc(f_u), 'B' as u32);
             assert_eq!(fgetwc(f_u), WEOF);
             assert_eq!(fclose(f_u), 0);
+
+            std::fs::write(dir.join("aplus_u8.txt"), "\u{FEFF}Hi".as_bytes()).unwrap();
+            let f_ap = fopen(b"U:\\aplus_u8.txt\0".as_ptr(), b"a+, ccs=UTF-8\0".as_ptr());
+            assert!(!f_ap.is_null());
+            assert_eq!(fgetwc(f_ap), 'H' as u32); // BOM skipped on readable append stream
+            assert_eq!(fgetwc(f_ap), 'i' as u32);
+            assert_eq!(fputwc('!' as u16, f_ap), '!' as u32);
+            assert_eq!(fclose(f_ap), 0);
+            assert_eq!(std::fs::read(dir.join("aplus_u8.txt")).unwrap(), "\u{FEFF}Hi!".as_bytes());
         }
 
         let _ = std::fs::remove_dir_all(&dir);
