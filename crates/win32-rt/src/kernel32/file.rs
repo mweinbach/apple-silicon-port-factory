@@ -2343,34 +2343,37 @@ const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 fn collect_dir_enum_entries(dir: &Path) -> std::io::Result<Vec<DirEnumEntry>> {
     let mut out = Vec::new();
     // Windows directory enumeration starts with "." and ".." for non-root directories.
-    if let Ok(m) = std::fs::metadata(dir) {
-        let t = meta_times(&m);
-        out.push(DirEnumEntry {
-            name: ".".into(),
-            attrs: FILE_ATTRIBUTE_DIRECTORY,
-            times: t,
-            size: 0,
-            alloc_size: 0,
-            ino: m.ino(),
-            reparse_tag: 0,
-        });
-        let parent_m = dir.parent().and_then(|p| std::fs::metadata(p).ok()).unwrap_or(m);
-        let pt = meta_times(&parent_m);
-        out.push(DirEnumEntry {
-            name: "..".into(),
-            attrs: FILE_ATTRIBUTE_DIRECTORY,
-            times: pt,
-            size: 0,
-            alloc_size: 0,
-            ino: parent_m.ino(),
-            reparse_tag: 0,
-        });
-    }
+    let m = std::fs::metadata(dir)?;
+    let t = meta_times(&m);
+    out.push(DirEnumEntry {
+        name: ".".into(),
+        attrs: FILE_ATTRIBUTE_DIRECTORY,
+        times: t,
+        size: 0,
+        alloc_size: 0,
+        ino: m.ino(),
+        reparse_tag: 0,
+    });
+    let parent_m = dir.parent().and_then(|p| std::fs::metadata(p).ok()).unwrap_or(m);
+    let pt = meta_times(&parent_m);
+    out.push(DirEnumEntry {
+        name: "..".into(),
+        attrs: FILE_ATTRIBUTE_DIRECTORY,
+        times: pt,
+        size: 0,
+        alloc_size: 0,
+        ino: parent_m.ino(),
+        reparse_tag: 0,
+    });
     let mut children = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        let Ok(entry) = entry else { continue };
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(sm) = std::fs::symlink_metadata(entry.path()) else { continue };
+        let sm = match std::fs::symlink_metadata(entry.path()) {
+            Ok(sm) => sm,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         let is_symlink = sm.file_type().is_symlink();
         let m = if is_symlink { std::fs::metadata(entry.path()).unwrap_or(sm) } else { sm };
         let mut attrs = meta_attrs(&m, &name);
@@ -2418,6 +2421,7 @@ unsafe fn fill_dir_info_by_handle(f: &FileObj, layout: DirInfoLayout, restart: b
         match collect_dir_enum_entries(host_dir) {
             Ok(entries) => *guard = Some(DirEnumState { entries, cursor: 0 }),
             Err(e) => {
+                *guard = None;
                 set_err(io_err(&e));
                 return FALSE;
             }
@@ -12044,5 +12048,47 @@ mod tests {
         });
         assert_eq!(err_hole, Err(libc::EIO));
         assert_eq!(restored_hole, Some(99));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_enum_propagates_child_metadata_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aw2_direnum_err_{}", std::process::id()));
+        let sub = dir.join("unsearchable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secret.txt"), b"data").unwrap();
+
+        // Mode 0444 allows `read_dir` to yield "secret.txt", but denies search (+x) so
+        // `symlink_metadata(child)` fails with EACCES. Enumeration must fail rather than
+        // silently omitting "secret.txt".
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let res = collect_dir_enum_entries(&sub);
+        // Also verify end-to-end through GetFileInformationByHandleEx(FileFullDirectoryInfo).
+        crate::path::add_mount("W:\\", &dir);
+        unsafe {
+            let wsub = to_wide_z("W:\\unsearchable");
+            let hd = CreateFileW(
+                wsub.as_ptr(),
+                GENERIC_READ,
+                7,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(hd, INVALID_HANDLE_VALUE);
+            let mut buf = [0u8; 512];
+            assert_eq!(
+                GetFileInformationByHandleEx(hd, 14 /* FileFullDirectoryInfo */, buf.as_mut_ptr() as _, buf.len() as u32),
+                FALSE
+            );
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            crate::kernel32::threads::CloseHandle(hd);
+        }
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(res.err().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
