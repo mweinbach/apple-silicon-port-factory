@@ -42,6 +42,7 @@ pub fn configure(path: PathBuf, exe: String, game_dir: String, manifest: Option<
         started_at,
     });
     drop(g);
+    x86_runtime::emu::enable_translated_accounting();
     win32_rt::process::register_exit_hook(write_exit_report);
 }
 
@@ -95,6 +96,7 @@ pub fn write_report_with_override(
 
     let stub_snap = win32_rt::stub_registry::snapshot();
     let tiers = x86_runtime::emu::tier_stats();
+    let aot_fallbacks = x86_runtime::emu::aot_fallback_report();
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let shaders = d3d12_metal::metal::pipeline::shader_report_stats_if_initialized();
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -238,6 +240,101 @@ pub fn write_report_with_override(
     let _ = writeln!(out, "    \"static_aot_modules\": {},", tiers.static_aot_modules);
     let _ = writeln!(out, "    \"static_aot_blocks\": {},", tiers.static_aot_blocks);
     let _ = writeln!(out, "    \"static_aot_bytes\": {}", tiers.static_aot_bytes);
+    let _ = writeln!(out, "  }},");
+
+    // Strict AOT fallback accounting (`PORT_AOT_STRICT=report|fail`)
+    let _ = writeln!(out, "  \"aot_fallbacks\": {{");
+    let _ = writeln!(
+        out,
+        "    \"strict_mode\": {},",
+        json_quote(aot_fallbacks.strict_mode)
+    );
+    let _ = writeln!(out, "    \"aot_insns\": {},", aot_fallbacks.aot_insns);
+    let _ = writeln!(
+        out,
+        "    \"runtime_jit_insns\": {},",
+        aot_fallbacks.runtime_jit_insns
+    );
+    let _ = writeln!(
+        out,
+        "    \"runtime_jit_compiles\": {},",
+        aot_fallbacks.runtime_jit_compiles
+    );
+    let _ = writeln!(
+        out,
+        "    \"interp_fast_steps\": {},",
+        aot_fallbacks.interp_fast_steps
+    );
+    let _ = writeln!(
+        out,
+        "    \"interp_generic_steps\": {},",
+        aot_fallbacks.interp_generic_steps
+    );
+    let _ = writeln!(
+        out,
+        "    \"interp_mmx_steps\": {},",
+        aot_fallbacks.interp_mmx_steps
+    );
+    let _ = writeln!(
+        out,
+        "    \"interp_trap_steps\": {},",
+        aot_fallbacks.interp_trap_steps
+    );
+    let _ = writeln!(out, "    \"soft_fp_steps\": {},", aot_fallbacks.soft_fp_steps);
+    let _ = writeln!(
+        out,
+        "    \"total_fallbacks\": {},",
+        aot_fallbacks.total_fallbacks
+    );
+    let _ = writeln!(out, "    \"runtime_jit_reasons\": [");
+    for (idx, (reason, count)) in aot_fallbacks.runtime_jit_reasons.iter().enumerate() {
+        let comma = if idx + 1 < aot_fallbacks.runtime_jit_reasons.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "      {{\"reason\":{},\"count\":{}}}{comma}",
+            json_quote(reason),
+            count
+        );
+    }
+    let _ = writeln!(out, "    ],");
+    let _ = writeln!(out, "    \"top_mnemonics\": [");
+    for (idx, (mn, count)) in aot_fallbacks.top_mnemonics.iter().enumerate() {
+        let comma = if idx + 1 < aot_fallbacks.top_mnemonics.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "      {{\"mnemonic\":{},\"count\":{}}}{comma}",
+            json_quote(mn),
+            count
+        );
+    }
+    let _ = writeln!(out, "    ],");
+    let _ = writeln!(out, "    \"top_sites\": [");
+    for (idx, s) in aot_fallbacks.top_sites.iter().enumerate() {
+        let comma = if idx + 1 < aot_fallbacks.top_sites.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "      {{\"location\":{},\"ip\":{},\"kind\":{},\"mnemonic\":{},\"count\":{}}}{comma}",
+            json_quote(&s.location),
+            s.ip,
+            json_quote(s.kind),
+            json_quote(&s.mnemonic),
+            s.count
+        );
+    }
+    let _ = writeln!(out, "    ],");
+    let _ = writeln!(out, "    \"top_jit_compiles\": [");
+    for (idx, s) in aot_fallbacks.top_jit_compiles.iter().enumerate() {
+        let comma = if idx + 1 < aot_fallbacks.top_jit_compiles.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "      {{\"location\":{},\"ip\":{},\"reason\":{},\"count\":{}}}{comma}",
+            json_quote(&s.location),
+            s.ip,
+            json_quote(&s.reason),
+            s.count
+        );
+    }
+    let _ = writeln!(out, "    ]");
     let _ = writeln!(out, "  }},");
 
     // Shader & PSO stats

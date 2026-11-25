@@ -447,11 +447,23 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
             continue;
         }
 
+        let key = unsafe { module_key(base, size) };
         let mut roots = unsafe { discover_pe_roots(base, size, 0) };
         let replayed = unsafe { super::callbacks::load_replayed_callback_roots(&name, base, size) };
         let replayed_count = replayed.len();
-        if !replayed.is_empty() {
+        let prof_rvas = read_profile(&name, &key.image_hash);
+        let prof_count = prof_rvas.len();
+        if !replayed.is_empty() || !prof_rvas.is_empty() {
+            let text = unsafe { super::format::exec_sections(base, size) };
             roots.extend(replayed.into_iter().map(|c| c.rva));
+            for rva in prof_rvas {
+                let ip = base as u64 + rva as u64;
+                if (rva as usize) < size
+                    && text.iter().any(|&(s, e)| (s as u64..e as u64).contains(&ip))
+                {
+                    roots.push(rva);
+                }
+            }
             roots.sort_unstable();
             roots.dedup();
         }
@@ -470,13 +482,12 @@ pub fn aot_prewarm_all_mapped(max_roots_per_module: usize) -> Vec<AotPrewarmRepo
             });
             continue;
         }
-        if replayed_count > 0 {
+        if replayed_count > 0 || prof_count > 0 {
             log::info!(
-                "emu aot: prewarm {name}: merged {replayed_count} runtime-replayed callback root(s) by image fingerprint"
+                "emu aot: prewarm {name}: merged {replayed_count} runtime-replayed callback root(s) and {prof_count} profiled block root(s)"
             );
         }
 
-        let key = unsafe { module_key(base, size) };
         let t0 = std::time::Instant::now();
         let (ips, cl) =
             unsafe { discover_with_threads(&mut pool, base, size, &roots, depth, threads) };
@@ -599,7 +610,13 @@ pub(super) unsafe fn build_all(pending: &[(String, usize, usize)], sel: &[String
         }
         let (base, size) = (*base, *size);
         let key = module_key(base, size);
-        let prof = read_profile(name, &key.image_hash);
+        let mut prof = read_profile(name, &key.image_hash);
+        let replayed = super::callbacks::load_replayed_callback_roots(name, base, size);
+        if !replayed.is_empty() {
+            prof.extend(replayed.into_iter().map(|c| c.rva));
+            prof.sort_unstable();
+            prof.dedup();
+        }
         if prof.is_empty() {
             log::info!(
                 "emu aot: {name}: no profile ({}); skipped",

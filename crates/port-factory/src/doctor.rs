@@ -572,9 +572,35 @@ fn check_catalogs(
         );
         catalog_errors.extend(check_status_counts(doc, &counts, fix)?);
     }
+    let mut items = vec![ops_item, win_item, shader_item, gp_item, stub_item];
+
+    // 6. Exhaustive x86-64 ISA Coverage Ledger (Apple Silicon macOS lowerer)
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        let isa_rep = crate::isa_coverage::analyze_isa_coverage();
+        let isa_expected = crate::isa_coverage::format_isa_coverage_tsv(&isa_rep);
+        let isa_item = check_or_fix_single(
+            "isa_coverage.tsv",
+            db_dir.join("isa_coverage.tsv"),
+            "ISA Coverage",
+            format!(
+                "{} forms across {} codes ({} Arm64 {:.1}%, {} advertised gaps)",
+                isa_rep.forms.len(),
+                isa_rep.included_codes,
+                isa_rep.totals.arm64,
+                isa_rep.totals.arm64_pct(),
+                isa_rep.advertised_but_unimplemented.len(),
+            ),
+            "cargo opsdb -- isa-coverage --sync",
+            &isa_expected,
+            fix,
+        )?;
+        items.push(isa_item);
+    }
+
     Ok(DoctorDbReport {
         catalog_errors,
-        items: vec![ops_item, win_item, shader_item, gp_item, stub_item],
+        items,
     })
 }
 
@@ -663,11 +689,17 @@ mod tests {
         let root = workspace_root();
         let tmp = make_temp_db_dir("missing_and_sync");
 
-        // 1. Empty db_dir -> all 5 TSVs reported missing, check mode fails without creating files.
+        let expected_tsv_count = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            6
+        } else {
+            5
+        };
+
+        // 1. Empty db_dir -> all canonical TSVs reported missing, check mode fails without creating files.
         let missing_rep = check_or_fix_db_tsvs(&root, tmp.path(), false).unwrap();
-        assert_eq!(missing_rep.items.len(), 5);
+        assert_eq!(missing_rep.items.len(), expected_tsv_count);
         assert!(missing_rep.has_drift());
-        assert_eq!(missing_rep.drifted_items().len(), 5);
+        assert_eq!(missing_rep.drifted_items().len(), expected_tsv_count);
         for item in &missing_rep.items {
             assert!(matches!(item.status, TsvSyncStatus::Missing { .. }));
             assert!(
@@ -683,6 +715,9 @@ mod tests {
         assert!(err_msg.contains("shader_formats.tsv"));
         assert!(err_msg.contains("game_profiles.tsv"));
         assert!(err_msg.contains("stub_inventory.tsv"));
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            assert!(err_msg.contains("isa_coverage.tsv"));
+        }
 
         // 2. Fix mode writes all five canonical TSVs cleanly.
         let fixed_rep = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
@@ -711,13 +746,17 @@ mod tests {
         let seeded = check_or_fix_db_tsvs(&root, tmp.path(), true).unwrap();
         assert!(seeded.ensure_clean().is_ok());
 
-        for target_file in [
+        let mut target_files = vec![
             "ops_x86_to_arm64.tsv",
             "win32_apis.tsv",
             "shader_formats.tsv",
             "game_profiles.tsv",
             "stub_inventory.tsv",
-        ] {
+        ];
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            target_files.push("isa_coverage.tsv");
+        }
+        for target_file in target_files {
             let p = tmp.path().join(target_file);
             let orig = fs::read_to_string(&p).unwrap();
             let mutated = format!("{orig}STALE_DRIFT_SENTINEL\tdummy\n");

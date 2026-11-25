@@ -20,6 +20,7 @@
 //! - [`fast`], [`jit`], [`aot`], [`static_macho`], [`verify`], [`eh`], [`regfile`], [`simd_kernels`], [`simd_mov`], [`simd_fp`]
 
 mod block_cache;
+mod aot_strict;
 mod cpu;
 mod denorm;
 mod dispatch;
@@ -94,6 +95,13 @@ pub use dispatch::{
 pub use dispatch::port_static_aot_host_xfer;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use dispatch::{call_host_dispatched_in, call_lean_in, shadow_lean_xmm, shadow_run_guest, shadow_run_lean};
+
+pub use aot_strict::{
+    aot_fallback_report, aot_strict_mode, clear_aot_strict_mode_override,
+    enable_translated_accounting, format_aot_fallback_summary, reset_aot_fallback_counters,
+    set_aot_strict_mode, translated_accounting_enabled, AotFallbackReport, AotFallbackSite,
+    AotStrictMode, EXIT_AOT_FALLBACK,
+};
 
 pub use interp::{
     clear_fail_on_unimpl_op_override, emu_run, emu_run_full, emu_run_full_rax, emu_run_with_xmm,

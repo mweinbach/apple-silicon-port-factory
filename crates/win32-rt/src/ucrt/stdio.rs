@@ -727,6 +727,31 @@ pub unsafe fn read_fd(fd: i32, buf: *mut u8, n: usize) -> isize {
 /// physical offset after the last translated byte).
 unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
     let info = fd_info(fd);
+    if n % 2 != 0 && matches!(info.mode, TextMode::Utf16Le | TextMode::Utf8) {
+        errno::set(EINVAL);
+        return (-1, Vec::new());
+    }
+    let stage_len = if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
+        n.min(1024 * 1024)
+    } else {
+        0
+    };
+    if stage_len > 0 {
+        let mut staging = vec![0u8; stage_len];
+        let (r, pos) = read_fd_tracked_inner(fd, info, staging.as_mut_ptr(), stage_len, track_pos);
+        if r > 0 {
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf, &staging[..r as usize]) {
+                *libc::__error() = e;
+                errno::set_from_host();
+                return (-1, Vec::new());
+            }
+        }
+        return (r, pos);
+    }
+    read_fd_tracked_inner(fd, info, buf, n, track_pos)
+}
+
+unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
     match info.mode {
         TextMode::Binary => {
             let mut pend = take_u8_pending(fd);
@@ -1239,7 +1264,17 @@ pub unsafe extern "win64" fn _write(fd: i32, buf: *const c_void, n: u32) -> i32 
     if !fd_valid(fd) {
         return bad_fd();
     }
-    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, n as usize)) as i32
+    let len = n as usize;
+    if len > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, len) {
+        let mut staging = vec![0u8; len];
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf as *const u8, &mut staging) {
+            *libc::__error() = e;
+            errno::set_from_host();
+            return -1;
+        }
+        return write_fd(fd, &staging) as i32;
+    }
+    write_fd(fd, std::slice::from_raw_parts(buf as *const u8, len)) as i32
 }
 
 pub unsafe extern "win64" fn _lseeki64(fd: i32, off: i64, whence: i32) -> i64 {

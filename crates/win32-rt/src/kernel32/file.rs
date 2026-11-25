@@ -894,7 +894,18 @@ pub unsafe extern "win64" fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_g
 }
 
 pub unsafe extern "win64" fn WriteConsoleW(h: HANDLE, buf: *const u16, n: u32, written: *mut u32, _r: *mut c_void) -> BOOL {
-    let s = String::from_utf16_lossy(std::slice::from_raw_parts(buf, n as usize));
+    let byte_len = (n as usize).saturating_mul(2);
+    let s = if byte_len > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, byte_len) {
+        let mut raw = vec![0u8; byte_len];
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf as *const u8, &mut raw) {
+            set_err(errno_to_win32(e));
+            return FALSE;
+        }
+        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf16_lossy(std::slice::from_raw_parts(buf, n as usize))
+    };
     let ok = WriteFile(h, s.as_ptr() as _, s.len() as u32, std::ptr::null_mut(), std::ptr::null_mut());
     if !written.is_null() {
         *written = if ok != 0 { n } else { 0 };
@@ -918,7 +929,13 @@ pub unsafe extern "win64" fn ReadConsoleW(h: HANDLE, buf: *mut u16, n: u32, read
     }
     let w = to_wide(&String::from_utf8_lossy(&tmp[..got as usize]));
     let k = w.len().min(n as usize);
-    std::ptr::copy_nonoverlapping(w.as_ptr(), buf, k);
+    if k > 0 {
+        let bytes = std::slice::from_raw_parts(w.as_ptr() as *const u8, k * 2);
+        if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf as *mut u8, bytes) {
+            set_err(errno_to_win32(e));
+            return FALSE;
+        }
+    }
     if !read.is_null() {
         *read = k as u32;
     }
@@ -1273,25 +1290,36 @@ unsafe fn complete_overlapped(ov: *mut OVERLAPPED, status: usize, n: usize) {
     }
 }
 
-/// Drain up to `dst.len()` bytes from `f.peek_buf`.
-fn drain_peek_buf(f: &FileObj, dst: &mut [u8]) -> usize {
-    let mut pb = f.peek_buf.lock().unwrap();
-    let k = pb.len().min(dst.len());
-    for slot in dst.iter_mut().take(k) {
-        *slot = pb.pop_front().unwrap();
+/// Drain up to `n` bytes from `f.peek_buf` into guest memory `dst`, staging through
+/// `memory::write_guest_io_bytes` when `dst` overlaps write-watch or mixed-subpage memory.
+unsafe fn drain_peek_buf(f: &FileObj, dst: *mut u8, n: usize) -> Result<usize, i32> {
+    if n == 0 {
+        return Ok(0);
     }
-    k
+    let mut pb = f.peek_buf.lock().unwrap();
+    let k = pb.len().min(n);
+    if k == 0 {
+        return Ok(0);
+    }
+    if crate::kernel32::memory::needs_io_write_staging(dst as usize, k) {
+        let mut tmp = Vec::with_capacity(k);
+        for i in 0..k {
+            tmp.push(pb[i]);
+        }
+        crate::kernel32::memory::write_guest_io_bytes(dst, &tmp)?;
+        for _ in 0..k {
+            pb.pop_front();
+        }
+    } else {
+        let slice = std::slice::from_raw_parts_mut(dst, k);
+        for slot in slice.iter_mut() {
+            *slot = pb.pop_front().unwrap();
+        }
+    }
+    Ok(k)
 }
 
-/// Try a genuinely nonblocking read on a pipe/socket fd.
-/// - For `AF_UNIX` `SOCK_STREAM` pipes (`CreatePipe`, `CreateNamedPipeW`/`A`), uses per-call
-///   `recv(..., MSG_DONTWAIT)` without ever modifying open-file-description status flags
-///   (`O_NONBLOCK`), so `DuplicateHandle` and inherited/redirected child stdio stay blocking.
-/// - For external POSIX `S_IFIFO` descriptors (`ENOTSOCK`), ensures `O_NONBLOCK` is enabled
-///   (without toggling it back off) so `read()` can never block the caller or shared pipe reactor.
-/// Returns `Ok(Some(n))` (`n == 0` means EOF/broken pipe), `Ok(None)` if would block,
-/// or `Err(errno)`.
-unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<Option<usize>, i32> {
+unsafe fn try_nonblocking_pipe_read_raw(fd: i32, buf: *mut u8, n: usize) -> Result<Option<usize>, i32> {
     if n == 0 {
         return Ok(Some(0));
     }
@@ -1338,13 +1366,33 @@ unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<O
     }
 }
 
-/// Try a genuinely nonblocking write on a pipe/socket fd.
-/// On Darwin XNU, `AF_UNIX` `SOCK_STREAM` ignores `MSG_DONTWAIT` on `send()` when `O_NONBLOCK`
-/// is clear and blocks in `sosend`; enabling `O_NONBLOCK` once (never toggling it back off) on
-/// the write fd guarantees nonblocking `write()` for both socketpair-backed pipes and raw
-/// `S_IFIFO` descriptors, while synchronous `WriteFile`/`ReadFile` handle `EAGAIN` via `poll`.
-/// Returns `Ok(Some(n))`, `Ok(None)` if would block, or `Err(errno)`.
-unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Result<Option<usize>, i32> {
+/// Try a genuinely nonblocking read on a pipe/socket fd.
+/// - For `AF_UNIX` `SOCK_STREAM` pipes (`CreatePipe`, `CreateNamedPipeW`/`A`), uses per-call
+///   `recv(..., MSG_DONTWAIT)` without ever modifying open-file-description status flags
+///   (`O_NONBLOCK`), so `DuplicateHandle` and inherited/redirected child stdio stay blocking.
+/// - For external POSIX `S_IFIFO` descriptors (`ENOTSOCK`), ensures `O_NONBLOCK` is enabled
+///   (without toggling it back off) so `read()` can never block the caller or shared pipe reactor.
+/// Returns `Ok(Some(n))` (`n == 0` means EOF/broken pipe), `Ok(None)` if would block,
+/// or `Err(errno)`.
+unsafe fn try_nonblocking_pipe_read(fd: i32, buf: *mut u8, n: usize) -> Result<Option<usize>, i32> {
+    if n == 0 {
+        return Ok(Some(0));
+    }
+    if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
+        let cap = n.min(1024 * 1024);
+        let mut tmp = vec![0u8; cap];
+        return match try_nonblocking_pipe_read_raw(fd, tmp.as_mut_ptr(), cap) {
+            Ok(Some(got)) => {
+                crate::kernel32::memory::write_guest_io_bytes(buf, &tmp[..got])?;
+                Ok(Some(got))
+            }
+            other => other,
+        };
+    }
+    try_nonblocking_pipe_read_raw(fd, buf, n)
+}
+
+unsafe fn try_nonblocking_pipe_write_raw(fd: i32, buf: *const u8, n: usize) -> Result<Option<usize>, i32> {
     if n == 0 {
         return Ok(Some(0));
     }
@@ -1371,6 +1419,25 @@ unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Resul
     }
 }
 
+/// Try a genuinely nonblocking write on a pipe/socket fd.
+/// On Darwin XNU, `AF_UNIX` `SOCK_STREAM` ignores `MSG_DONTWAIT` on `send()` when `O_NONBLOCK`
+/// is clear and blocks in `sosend`; enabling `O_NONBLOCK` once (never toggling it back off) on
+/// the write fd guarantees nonblocking `write()` for both socketpair-backed pipes and raw
+/// `S_IFIFO` descriptors, while synchronous `WriteFile`/`ReadFile` handle `EAGAIN` via `poll`.
+/// Returns `Ok(Some(n))`, `Ok(None)` if would block, or `Err(errno)`.
+unsafe fn try_nonblocking_pipe_write(fd: i32, buf: *const u8, n: usize) -> Result<Option<usize>, i32> {
+    if n == 0 {
+        return Ok(Some(0));
+    }
+    if crate::kernel32::memory::needs_io_read_staging(buf as usize, n) {
+        let cap = n.min(1024 * 1024);
+        let mut tmp = vec![0u8; cap];
+        crate::kernel32::memory::read_guest_io_bytes(buf, &mut tmp)?;
+        return try_nonblocking_pipe_write_raw(fd, tmp.as_ptr(), cap);
+    }
+    try_nonblocking_pipe_write_raw(fd, buf, n)
+}
+
 pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut OVERLAPPED) -> BOOL {
     if let Some(r) = crate::misc::hid::read_file(h, buf, n, read, ov) {
         return r;
@@ -1395,12 +1462,13 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
             }
         };
         let fd = target.fd();
-        let slice = if n == 0 {
-            &mut [][..]
-        } else {
-            std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+        let from_peek = match drain_peek_buf(&f, buf as *mut u8, n as usize) {
+            Ok(k) => k,
+            Err(e) => {
+                set_err(errno_to_win32(e));
+                return FALSE;
+            }
         };
-        let from_peek = drain_peek_buf(&f, slice);
         if from_peek > 0 || n == 0 {
             if !read.is_null() {
                 std::ptr::write_unaligned(read, from_peek as u32);
@@ -1445,8 +1513,19 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
             }
         }
         // Synchronous blocking pipe read (also waits via poll if fd has O_NONBLOCK).
+        let stage_len = if crate::kernel32::memory::needs_io_write_staging(buf as usize, n as usize) {
+            (n as usize).min(1024 * 1024)
+        } else {
+            0
+        };
+        let mut staging = if stage_len > 0 { vec![0u8; stage_len] } else { Vec::new() };
+        let (io_ptr, io_len) = if stage_len > 0 {
+            (staging.as_mut_ptr() as *mut c_void, stage_len)
+        } else {
+            (buf, n as usize)
+        };
         let r = loop {
-            let k = libc::read(fd, buf, n as usize);
+            let k = libc::read(fd, io_ptr, io_len);
             if k < 0 {
                 let e = last_errno();
                 if e == libc::EINTR {
@@ -1472,31 +1551,21 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
             set_err(err::ERROR_BROKEN_PIPE);
             return FALSE;
         }
+        if stage_len > 0 {
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(buf as *mut u8, &staging[..r as usize]) {
+                set_err(errno_to_win32(e));
+                return FALSE;
+            }
+        }
         if !read.is_null() {
             std::ptr::write_unaligned(read, r as u32);
         }
         return TRUE;
     }
 
-    let slice = if n == 0 {
-        &mut [][..]
-    } else {
-        std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
-    };
     let io_scope = (f.kind == FileKind::Disk).then(|| crate::hitch::Scope::enter(crate::hitch::ActKind::FileIo, n as u64));
-    let res = if !ov.is_null() && f.kind == FileKind::Disk {
-        let off = read_ov_offset(ov);
-        read_full_at(f.file(), slice, off)
-    } else {
-        use std::io::Read;
-        let mut file = f.file();
-        loop {
-            match file.read(slice) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                r => break r,
-            }
-        }
-    };
+    let off = (!ov.is_null() && f.kind == FileKind::Disk).then(|| read_ov_offset(ov));
+    let res = read_file_into_guest(&f, buf as *mut u8, n as usize, off);
     if let Some(sc) = io_scope {
         let elapsed_ns = sc.elapsed_ns();
         drop(sc);
@@ -1522,6 +1591,69 @@ pub unsafe extern "win64" fn ReadFile(h: HANDLE, buf: *mut c_void, n: u32, read:
             log::warn!("ReadFile({:?}, n={n}) failed: {e}", f.win_path);
             set_err(io_err(&e));
             FALSE
+        }
+    }
+}
+
+unsafe fn read_file_into_guest(f: &FileObj, buf: *mut u8, n: usize, off: Option<u64>) -> std::io::Result<usize> {
+    if n == 0 {
+        return Ok(0);
+    }
+    if crate::kernel32::memory::needs_io_write_staging(buf as usize, n) {
+        let chunk_cap = n.min(1024 * 1024);
+        let mut staging = vec![0u8; chunk_cap];
+        if let Some(mut cur_off) = off {
+            let mut done = 0usize;
+            while done < n {
+                let want = (n - done).min(chunk_cap);
+                let got = read_full_at(f.file(), &mut staging[..want], cur_off)?;
+                if got == 0 {
+                    break;
+                }
+                crate::kernel32::memory::write_guest_io_bytes(buf.add(done), &staging[..got])
+                    .map_err(std::io::Error::from_raw_os_error)?;
+                done += got;
+                cur_off += got as u64;
+                if got < want {
+                    break;
+                }
+            }
+            return Ok(done);
+        }
+        use std::io::Read;
+        let mut file = f.file();
+        let mut done = 0usize;
+        while done < n {
+            let want = (n - done).min(chunk_cap);
+            let got = loop {
+                match file.read(&mut staging[..want]) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    r => break r?,
+                }
+            };
+            if got == 0 {
+                break;
+            }
+            crate::kernel32::memory::write_guest_io_bytes(buf.add(done), &staging[..got])
+                .map_err(std::io::Error::from_raw_os_error)?;
+            done += got;
+            if f.kind != FileKind::Disk || got < want {
+                break;
+            }
+        }
+        return Ok(done);
+    }
+    let slice = std::slice::from_raw_parts_mut(buf, n);
+    if let Some(cur_off) = off {
+        read_full_at(f.file(), slice, cur_off)
+    } else {
+        use std::io::Read;
+        let mut file = f.file();
+        loop {
+            match file.read(slice) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => break r,
+            }
         }
     }
 }
@@ -1615,13 +1747,23 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
                 return FALSE;
             }
         };
+        let needs_stage = crate::kernel32::memory::needs_io_read_staging(buf as usize, n as usize);
+        let mut staging = Vec::new();
+        if needs_stage {
+            staging.resize(n as usize, 0);
+            if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf as *const u8, &mut staging) {
+                set_err(errno_to_win32(e));
+                return FALSE;
+            }
+        }
+        let src_base = if needs_stage { staging.as_ptr() } else { buf as *const u8 };
         let mut done = 0usize;
         while done < n as usize {
             if conn.as_ref().is_some_and(|c| c.is_disconnected()) {
                 set_err(err::ERROR_BROKEN_PIPE);
                 return FALSE;
             }
-            let r = libc::write(fd, (buf as *const u8).add(done) as *const c_void, n as usize - done);
+            let r = libc::write(fd, src_base.add(done) as *const c_void, n as usize - done);
             if r < 0 {
                 let e = last_errno();
                 if e == libc::EINTR {
@@ -1652,30 +1794,9 @@ pub unsafe extern "win64" fn WriteFile(h: HANDLE, buf: *const c_void, n: u32, wr
         return TRUE;
     }
 
-    let slice = if n == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(buf as *const u8, n as usize)
-    };
     let io_scope = (f.kind == FileKind::Disk).then(|| crate::hitch::Scope::enter(crate::hitch::ActKind::FileIo, n as u64));
-    let res = if !ov.is_null() && f.kind == FileKind::Disk {
-        let off = read_ov_offset(ov);
-        if off == u64::MAX {
-            // 0xFFFFFFFF/0xFFFFFFFF = append
-            use std::io::{Seek, Write};
-            let mut file = f.file();
-            file.seek(std::io::SeekFrom::End(0)).and_then(|_| file.write_all(slice)).map(|_| slice.len())
-        } else {
-            f.file().write_all_at(slice, off).map(|_| slice.len())
-        }
-    } else {
-        use std::io::{Seek, Write};
-        let mut file = f.file();
-        if f.append {
-            let _ = file.seek(std::io::SeekFrom::End(0));
-        }
-        file.write_all(slice).map(|_| slice.len())
-    };
+    let off = (!ov.is_null() && f.kind == FileKind::Disk).then(|| read_ov_offset(ov));
+    let res = write_file_from_guest(&f, buf as *const u8, n as usize, off);
     if let Some(sc) = io_scope {
         let elapsed_ns = sc.elapsed_ns();
         drop(sc);
@@ -1727,12 +1848,13 @@ pub unsafe extern "win64" fn ReadFileEx(
             }
         };
         let fd = target.fd();
-        let slice = if n == 0 {
-            &mut [][..]
-        } else {
-            std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
+        let from_peek = match drain_peek_buf(&f, buf as *mut u8, n as usize) {
+            Ok(k) => k,
+            Err(e) => {
+                set_err(errno_to_win32(e));
+                return FALSE;
+            }
         };
-        let from_peek = drain_peek_buf(&f, slice);
         if from_peek > 0 || n == 0 {
             store_ov_internal_high(ov, from_peek);
             store_ov_internal(ov, STATUS_SUCCESS);
@@ -1780,24 +1902,8 @@ pub unsafe extern "win64" fn ReadFileEx(
         }
     }
 
-    let slice = if n == 0 {
-        &mut [][..]
-    } else {
-        std::slice::from_raw_parts_mut(buf as *mut u8, n as usize)
-    };
-    let res = if f.kind == FileKind::Disk {
-        let off = read_ov_offset(ov);
-        read_full_at(f.file(), slice, off)
-    } else {
-        use std::io::Read;
-        let mut file = f.file();
-        loop {
-            match file.read(slice) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                r => break r,
-            }
-        }
-    };
+    let off = (f.kind == FileKind::Disk).then(|| read_ov_offset(ov));
+    let res = read_file_into_guest(&f, buf as *mut u8, n as usize, off);
     match res {
         Ok(got) => {
             if got == 0 && n > 0 && f.kind == FileKind::Disk {
@@ -1892,28 +1998,8 @@ pub unsafe extern "win64" fn WriteFileEx(
         }
     }
 
-    let slice = if n == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(buf as *const u8, n as usize)
-    };
-    let res = if f.kind == FileKind::Disk {
-        let off = read_ov_offset(ov);
-        if off == u64::MAX {
-            use std::io::{Seek, Write};
-            let mut file = f.file();
-            file.seek(std::io::SeekFrom::End(0)).and_then(|_| file.write_all(slice)).map(|_| slice.len())
-        } else {
-            f.file().write_all_at(slice, off).map(|_| slice.len())
-        }
-    } else {
-        use std::io::{Seek, Write};
-        let mut file = f.file();
-        if f.append {
-            let _ = file.seek(std::io::SeekFrom::End(0));
-        }
-        file.write_all(slice).map(|_| slice.len())
-    };
+    let off = (f.kind == FileKind::Disk).then(|| read_ov_offset(ov));
+    let res = write_file_from_guest(&f, buf as *const u8, n as usize, off);
     match res {
         Ok(k) => {
             store_ov_internal_high(ov, k);
@@ -1928,6 +2014,70 @@ pub unsafe extern "win64" fn WriteFileEx(
             set_err(io_err(&e));
             FALSE
         }
+    }
+}
+
+unsafe fn write_file_from_guest(f: &FileObj, buf: *const u8, n: usize, off: Option<u64>) -> std::io::Result<usize> {
+    if n == 0 {
+        return Ok(0);
+    }
+    use std::io::{Seek, Write};
+    if crate::kernel32::memory::needs_io_read_staging(buf as usize, n) {
+        let chunk_cap = n.min(1024 * 1024);
+        let mut staging = vec![0u8; chunk_cap];
+        if let Some(mut cur_off) = off {
+            if cur_off == u64::MAX {
+                let mut file = f.file();
+                file.seek(std::io::SeekFrom::End(0))?;
+                let mut done = 0usize;
+                while done < n {
+                    let want = (n - done).min(chunk_cap);
+                    crate::kernel32::memory::read_guest_io_bytes(buf.add(done), &mut staging[..want])
+                        .map_err(std::io::Error::from_raw_os_error)?;
+                    file.write_all(&staging[..want])?;
+                    done += want;
+                }
+                return Ok(done);
+            }
+            let mut done = 0usize;
+            while done < n {
+                let want = (n - done).min(chunk_cap);
+                crate::kernel32::memory::read_guest_io_bytes(buf.add(done), &mut staging[..want])
+                    .map_err(std::io::Error::from_raw_os_error)?;
+                f.file().write_all_at(&staging[..want], cur_off)?;
+                done += want;
+                cur_off += want as u64;
+            }
+            return Ok(done);
+        }
+        let mut file = f.file();
+        if f.append {
+            let _ = file.seek(std::io::SeekFrom::End(0));
+        }
+        let mut done = 0usize;
+        while done < n {
+            let want = (n - done).min(chunk_cap);
+            crate::kernel32::memory::read_guest_io_bytes(buf.add(done), &mut staging[..want])
+                .map_err(std::io::Error::from_raw_os_error)?;
+            file.write_all(&staging[..want])?;
+            done += want;
+        }
+        return Ok(done);
+    }
+    let slice = std::slice::from_raw_parts(buf, n);
+    if let Some(cur_off) = off {
+        if cur_off == u64::MAX {
+            let mut file = f.file();
+            file.seek(std::io::SeekFrom::End(0)).and_then(|_| file.write_all(slice)).map(|_| slice.len())
+        } else {
+            f.file().write_all_at(slice, cur_off).map(|_| slice.len())
+        }
+    } else {
+        let mut file = f.file();
+        if f.append {
+            let _ = file.seek(std::io::SeekFrom::End(0));
+        }
+        file.write_all(slice).map(|_| slice.len())
     }
 }
 
@@ -6693,28 +6843,28 @@ fn pipe_reactor() -> &'static PipeIoReactor {
                             } else {
                                 let step_res: Option<(usize, usize)> = match op.kind {
                                     PipeOpKind::Read => {
-                                        let dst = unsafe { std::slice::from_raw_parts_mut(op.buf as *mut u8, op.len) };
-                                        let from_peek = drain_peek_buf(&op.file, dst);
-                                        if from_peek > 0 {
-                                            Some((STATUS_SUCCESS, from_peek))
-                                        } else {
-                                            match unsafe { try_nonblocking_pipe_read(op.fd, op.buf as *mut u8, op.len) } {
-                                                Ok(Some(0)) => Some((STATUS_PIPE_BROKEN, 0)),
-                                                Ok(Some(got)) => Some((STATUS_SUCCESS, got)),
-                                                Ok(None) => {
-                                                    if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                                                        Some((STATUS_PIPE_BROKEN, 0))
-                                                    } else {
-                                                        None
+                                        match unsafe { drain_peek_buf(&op.file, op.buf as *mut u8, op.len) } {
+                                            Ok(from_peek) if from_peek > 0 => Some((STATUS_SUCCESS, from_peek)),
+                                            Err(e) => Some((win32_to_ntstatus(errno_to_win32(e)), 0)),
+                                            Ok(_) => {
+                                                match unsafe { try_nonblocking_pipe_read(op.fd, op.buf as *mut u8, op.len) } {
+                                                    Ok(Some(0)) => Some((STATUS_PIPE_BROKEN, 0)),
+                                                    Ok(Some(got)) => Some((STATUS_SUCCESS, got)),
+                                                    Ok(None) => {
+                                                        if (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                                                            Some((STATUS_PIPE_BROKEN, 0))
+                                                        } else {
+                                                            None
+                                                        }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    let w = if e == libc::EPIPE || e == libc::ECONNRESET {
-                                                        err::ERROR_BROKEN_PIPE
-                                                    } else {
-                                                        errno_to_win32(e)
-                                                    };
-                                                    Some((win32_to_ntstatus(w), 0))
+                                                    Err(e) => {
+                                                        let w = if e == libc::EPIPE || e == libc::ECONNRESET {
+                                                            err::ERROR_BROKEN_PIPE
+                                                        } else {
+                                                            errno_to_win32(e)
+                                                        };
+                                                        Some((win32_to_ntstatus(w), 0))
+                                                    }
                                                 }
                                             }
                                         }
@@ -7121,8 +7271,10 @@ pub unsafe extern "win64" fn PeekNamedPipe(
         let mut peeked_kernel = 0usize;
 
         if want > 0 {
+            let needs_stage = crate::kernel32::memory::needs_io_write_staging(buf as usize, want);
+            let mut stage = if needs_stage { vec![0u8; want] } else { Vec::new() };
             let from_pb = pb.len().min(want);
-            let dst = buf as *mut u8;
+            let dst = if needs_stage { stage.as_mut_ptr() } else { buf as *mut u8 };
             for i in 0..from_pb {
                 std::ptr::write_unaligned(dst.add(i), pb[i]);
             }
@@ -7202,6 +7354,10 @@ pub unsafe extern "win64" fn PeekNamedPipe(
                         }
                     }
                 }
+            }
+            if needs_stage && copied > 0 {
+                crate::kernel32::memory::write_guest_io_bytes(buf as *mut u8, &stage[..copied])
+                    .map_err(errno_to_win32)?;
             }
         }
 
@@ -7611,7 +7767,7 @@ pub fn mapping_size(h: HANDLE) -> Option<u64> {
 
 pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<String>) -> HANDLE {
     if let Some(n) = &name {
-        if let Some(o) = handles::named_objects().lock().unwrap().get(n).cloned() {
+        if let Some(o) = crate::thread::defer_lock(handles::named_objects()).get(n).cloned() {
             if o.as_any().is::<MappingObj>() {
                 set_err(err::ERROR_ALREADY_EXISTS);
                 return handles::insert(o);
@@ -7664,7 +7820,7 @@ pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<St
     }
     let obj: Arc<dyn KObject> = Arc::new(MappingObj { file, size, writable, exec, name: name.clone(), win_path });
     if let Some(n) = name {
-        handles::named_objects().lock().unwrap().insert(n, obj.clone());
+        crate::thread::defer_lock(handles::named_objects()).insert(n, obj.clone());
     }
     set_err(0);
     handles::insert(obj)
@@ -7700,7 +7856,7 @@ pub unsafe extern "win64" fn CreateFileMappingFromApp(
 }
 pub unsafe extern "win64" fn OpenFileMappingW(_access: u32, _inherit: BOOL, name: LPCWSTR) -> HANDLE {
     let n = from_wide(name);
-    match handles::named_objects().lock().unwrap().get(&n).cloned() {
+    match crate::thread::defer_lock(handles::named_objects()).get(&n).cloned() {
         Some(o) if o.as_any().is::<MappingObj>() => handles::insert(o),
         _ => {
             set_err(err::ERROR_FILE_NOT_FOUND);

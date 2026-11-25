@@ -29,6 +29,7 @@ fn period_secs() -> u64 {
         let s = std::env::var("AW2_JIT_STATS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
         if s != 0 {
             log::info!("emu jit stats: enabled (AW2_JIT_STATS={s}s)");
+            win32_rt::process::register_exit_hook(flush_on_exit);
         }
         s
     })
@@ -43,7 +44,11 @@ pub(super) fn enabled() -> bool {
 #[derive(Default)]
 struct Counts {
     jit_insns: u64,
+    aot_insns: u64,
+    runtime_jit_insns: u64,
     jit_entries: u64,
+    aot_entries: u64,
+    runtime_jit_entries: u64,
     /// EXIT_RIP, EXIT_CALL, EXIT_JMP, EXIT_JCC, EXIT_SIDE, other, zero-progress.
     exits: [u64; 7],
     rip_rehit: u64,
@@ -76,7 +81,11 @@ impl Counts {
 
     fn merge_into(&mut self, g: &mut Counts) {
         g.jit_insns += self.jit_insns;
+        g.aot_insns += self.aot_insns;
+        g.runtime_jit_insns += self.runtime_jit_insns;
         g.jit_entries += self.jit_entries;
+        g.aot_entries += self.aot_entries;
+        g.runtime_jit_entries += self.runtime_jit_entries;
         for i in 0..self.exits.len() {
             g.exits[i] += self.exits[i];
         }
@@ -131,14 +140,36 @@ struct Global {
 
 static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 
+struct TlsCounts(RefCell<Option<Counts>>);
+
+impl Drop for TlsCounts {
+    fn drop(&mut self) {
+        if let Ok(mut b) = self.0.try_borrow_mut() {
+            if let Some(c) = b.as_mut() {
+                if c.events > 0 {
+                    if let Ok(mut g) = GLOBAL.lock() {
+                        let now = Instant::now();
+                        let g = g.get_or_insert_with(|| Global {
+                            c: Counts::new(),
+                            start: now,
+                            last: now,
+                        });
+                        c.merge_into(&mut g.c);
+                    }
+                }
+            }
+        }
+    }
+}
+
 std::thread_local! {
-    static TLS: RefCell<Option<Counts>> = const { RefCell::new(None) };
+    static TLS: TlsCounts = const { TlsCounts(RefCell::new(None)) };
 }
 
 #[inline]
 fn with<F: FnOnce(&mut Counts)>(f: F) {
     TLS.with(|t| {
-        let mut b = t.borrow_mut();
+        let mut b = t.0.borrow_mut();
         let c = b.get_or_insert_with(Counts::new);
         f(c);
         c.events += 1;
@@ -160,12 +191,49 @@ fn flush(c: &mut Counts) {
     }
 }
 
+/// Process exit hook: merge current thread's buffered counters and emit the cumulative summary.
+fn flush_on_exit() {
+    if !enabled() {
+        return;
+    }
+    let _ = TLS.try_with(|t| {
+        if let Ok(mut b) = t.0.try_borrow_mut() {
+            if let Some(c) = b.as_mut() {
+                if c.events > 0 {
+                    if let Ok(mut g) = GLOBAL.try_lock() {
+                        let now = Instant::now();
+                        let g = g.get_or_insert_with(|| Global {
+                            c: Counts::new(),
+                            start: now,
+                            last: now,
+                        });
+                        c.merge_into(&mut g.c);
+                    }
+                }
+            }
+        }
+    });
+    if let Ok(g) = GLOBAL.try_lock() {
+        if let Some(g) = g.as_ref() {
+            log::info!("{}", report(&g.c, Instant::now().duration_since(g.start).as_secs_f64()));
+        }
+    }
+}
+
 /// Translated code ran `executed` guest instructions and exited with `ex`.
 #[inline]
-pub(super) fn jit_run(ex: u64, executed: i64, target: u64, rip: u64) {
+pub(super) fn jit_run(ex: u64, executed: i64, target: u64, rip: u64, from_aot: bool) {
     with(|c| {
+        let n = executed.max(0) as u64;
         c.jit_entries += 1;
-        c.jit_insns += executed.max(0) as u64;
+        c.jit_insns += n;
+        if from_aot {
+            c.aot_entries += 1;
+            c.aot_insns += n;
+        } else {
+            c.runtime_jit_entries += 1;
+            c.runtime_jit_insns += n;
+        }
         let i = match ex {
             super::jit::EXIT_RIP => 0,
             super::jit::EXIT_CALL => 1,
@@ -334,9 +402,13 @@ fn report(c: &Counts, secs: f64) -> String {
     let _ = writeln!(o, "emu jit stats (cumulative, all threads, {secs:.0}s):");
     let _ = writeln!(
         o,
-        "  guest instrs {total}: jit {} ({:.2}%), interp generic {} ({:.2}%), interp fast {} ({:.2}%)",
+        "  guest instrs {total}: jit {} ({:.2}% [aot {} ({:.2}%), runtime_jit {} ({:.2}%)]), interp generic {} ({:.2}%), interp fast {} ({:.2}%)",
         c.jit_insns,
         pct(c.jit_insns, total),
+        c.aot_insns,
+        pct(c.aot_insns, total),
+        c.runtime_jit_insns,
+        pct(c.runtime_jit_insns, total),
         c.interp_generic,
         pct(c.interp_generic, total),
         c.interp_fast,
@@ -344,8 +416,10 @@ fn report(c: &Counts, secs: f64) -> String {
     );
     let _ = writeln!(
         o,
-        "  jit entries {} ({:.1} instrs/entry); exits: rip {} (re-entered at once {}), host call {}, host jmp {}, host jcc {}, side {}, other {}, zero-progress {}",
+        "  jit entries {} (aot {}, runtime_jit {}, {:.1} instrs/entry); exits: rip {} (re-entered at once {}), host call {}, host jmp {}, host jcc {}, side {}, other {}, zero-progress {}",
         c.jit_entries,
+        c.aot_entries,
+        c.runtime_jit_entries,
         c.jit_insns as f64 / c.jit_entries.max(1) as f64,
         c.exits[0],
         c.rip_rehit,
