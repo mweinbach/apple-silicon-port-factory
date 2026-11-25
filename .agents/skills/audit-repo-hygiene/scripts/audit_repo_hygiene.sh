@@ -50,7 +50,7 @@ fi
 echo "[2/7] Checking db/*.tsv storage (plain-text catalogs, Git LFS for large tables)..."
 LFS_BAD=0
 LFS_LIMIT=$((1024 * 1024))
-PLAIN_CATALOGS=" db/ops_x86_to_arm64.tsv db/win32_apis.tsv db/shader_formats.tsv db/game_profiles.tsv db/stub_inventory.tsv "
+PLAIN_CATALOGS=" db/ops_x86_to_arm64.tsv db/isa_coverage.tsv db/win32_apis.tsv db/shader_formats.tsv db/game_profiles.tsv db/stub_inventory.tsv "
 while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     ATTR="$(git check-attr filter -- "$f" | awk -F': ' '{print $NF}')"

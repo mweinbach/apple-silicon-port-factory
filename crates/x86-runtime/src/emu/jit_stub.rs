@@ -117,6 +117,11 @@ impl JitCache {
         None
     }
 
+    #[inline(always)]
+    pub(super) fn owns_code(&self, _code: usize) -> bool {
+        false
+    }
+
     pub(super) unsafe fn run(&mut self, _cpu: &mut Cpu, _code: usize, _budget: i64) -> (u64, i64) {
         unreachable!("block translator is aarch64-only")
     }

@@ -27,7 +27,7 @@ pub(super) struct InstructionUse {
 
 // Architectural CPUID bit positions (iced-x86 CpuidFeature). Read the values from the
 // shared runtime guest profile. Unmapped feature IDs carry no advertisement claim.
-fn advertised(feature: CpuidFeature) -> bool {
+pub(crate) fn advertised(feature: CpuidFeature) -> bool {
     use CpuidFeature::*;
     let (leaf, reg, bit) = match feature {
         FPU => (1, 3, 0),

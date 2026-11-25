@@ -2933,3 +2933,299 @@ fn image_fingerprint_dir64_normalizes_with_rewritten_optional_header_image_base(
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn closure_discovers_mid_block_resume_after_non_jit_op() {
+    let mut img = vec![0u8; 0x3000];
+    let base = img.as_ptr() as usize;
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    w16(&mut img, 0, 0x5A4D);
+    w32(&mut img, 0x3C, 0x40);
+    w32(&mut img, 0x40, 0x0000_4550);
+    w16(&mut img, 0x44, 0x8664);
+    w16(&mut img, 0x46, 2);
+    w16(&mut img, 0x54, 240);
+    let opt = 0x58;
+    w16(&mut img, opt, 0x20B);
+    w32(&mut img, opt + 16, 0x1000);
+    w64(&mut img, opt + 24, base as u64);
+    w32(&mut img, opt + 56, 0x3000);
+    w32(&mut img, opt + 108, 16);
+    // .pdata @ 0x2000 (2 functions)
+    w32(&mut img, opt + 112 + 3 * 8, 0x2000);
+    w32(&mut img, opt + 112 + 3 * 8 + 4, 24);
+    let sec0 = opt + 240;
+    img[sec0..sec0 + 5].copy_from_slice(b".text");
+    w32(&mut img, sec0 + 8, 0x1000);
+    w32(&mut img, sec0 + 12, 0x1000);
+    w32(&mut img, sec0 + 16, 0x1000);
+    w32(&mut img, sec0 + 20, 0x1000);
+    w32(&mut img, sec0 + 36, 0x6000_0020);
+    let sec1 = sec0 + 40;
+    img[sec1..sec1 + 6].copy_from_slice(b".rdata");
+    w32(&mut img, sec1 + 8, 0x1000);
+    w32(&mut img, sec1 + 12, 0x2000);
+    w32(&mut img, sec1 + 16, 0x1000);
+    w32(&mut img, sec1 + 20, 0x2000);
+    w32(&mut img, sec1 + 36, 0x4000_0040);
+
+    // Function 1 @ 0x1000: mov eax, 1 (5B); ldmxcsr [rsp+8] (5B: 0F AE 54 24 08); add eax, 2 (3B); ret (1B)
+    let f1: [u8; 14] = [
+        0xB8, 1, 0, 0, 0, // +0x1000: mov eax, 1
+        0x0F, 0xAE, 0x54, 0x24, 0x08, // +0x1005: ldmxcsr [rsp+8]
+        0x83, 0xC0, 0x02, // +0x100A: add eax, 2 (resume IP!)
+        0xC3, // +0x100D: ret
+    ];
+    img[0x1000..0x1000 + f1.len()].copy_from_slice(&f1);
+
+    // Function 2 @ 0x1040: xor ecx, ecx (2B); xgetbv (3B: 0F 01 D0); add eax, 7 (3B); ret (1B)
+    let f2: [u8; 9] = [
+        0x31, 0xC9, // +0x1040: xor ecx, ecx
+        0x0F, 0x01, 0xD0, // +0x1042: xgetbv
+        0x83, 0xC0, 0x07, // +0x1045: add eax, 7 (resume IP!)
+        0xC3, // +0x1048: ret
+    ];
+    img[0x1040..0x1040 + f2.len()].copy_from_slice(&f2);
+
+    w32(&mut img, 0x2000, 0x1000);
+    w32(&mut img, 0x2004, 0x1020);
+    w32(&mut img, 0x2008, 0x2100);
+    w32(&mut img, 0x200C, 0x1040);
+    w32(&mut img, 0x2010, 0x1060);
+    w32(&mut img, 0x2014, 0x2100);
+    img[0x2100] = 0x01;
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, _) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000, 0x1040], DEFAULT_AOT_CLOSURE) };
+    assert!(
+        ips.contains(&(base as u64 + 0x100A)),
+        "expected post-ldmxcsr resume IP +0x100A in discovered blocks: {ips:#x?}"
+    );
+    assert!(
+        ips.contains(&(base as u64 + 0x1045)),
+        "expected post-xgetbv resume IP +0x1045 in discovered blocks: {ips:#x?}"
+    );
+}
+
+#[test]
+fn closure_discovers_deep_intra_pdata_chain_past_128_hops() {
+    let mut img = vec![0u8; 0x5000];
+    let base = img.as_ptr() as usize;
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    w16(&mut img, 0, 0x5A4D);
+    w32(&mut img, 0x3C, 0x40);
+    w32(&mut img, 0x40, 0x0000_4550);
+    w16(&mut img, 0x44, 0x8664);
+    w16(&mut img, 0x46, 2);
+    w16(&mut img, 0x54, 240);
+    let opt = 0x58;
+    w16(&mut img, opt, 0x20B);
+    w32(&mut img, opt + 16, 0x1000);
+    w64(&mut img, opt + 24, base as u64);
+    w32(&mut img, opt + 56, 0x5000);
+    w32(&mut img, opt + 108, 16);
+    // .pdata @ 0x4000 (2 functions: main chain + callee)
+    w32(&mut img, opt + 112 + 3 * 8, 0x4000);
+    w32(&mut img, opt + 112 + 3 * 8 + 4, 24);
+    let sec0 = opt + 240;
+    img[sec0..sec0 + 5].copy_from_slice(b".text");
+    w32(&mut img, sec0 + 8, 0x3000);
+    w32(&mut img, sec0 + 12, 0x1000);
+    w32(&mut img, sec0 + 16, 0x3000);
+    w32(&mut img, sec0 + 20, 0x1000);
+    w32(&mut img, sec0 + 36, 0x6000_0020);
+    let sec1 = sec0 + 40;
+    img[sec1..sec1 + 6].copy_from_slice(b".rdata");
+    w32(&mut img, sec1 + 8, 0x1000);
+    w32(&mut img, sec1 + 12, 0x4000);
+    w32(&mut img, sec1 + 16, 0x1000);
+    w32(&mut img, sec1 + 20, 0x4000);
+    w32(&mut img, sec1 + 36, 0x4000_0040);
+
+    // Helper callee @ 0x3800: ret
+    img[0x3800] = 0xC3;
+
+    // 150 sequential `call 0x3800` blocks inside one `.pdata` function @ 0x1000..0x2000.
+    let mut cur = 0x1000usize;
+    for _ in 0..150 {
+        let rel = (0x3800i32) - ((cur + 5) as i32);
+        img[cur] = 0xE8;
+        img[cur + 1..cur + 5].copy_from_slice(&rel.to_le_bytes());
+        cur += 5;
+    }
+    let tail_rva = cur as u32;
+    img[cur] = 0xC3; // ret at hop 150
+
+    w32(&mut img, 0x4000, 0x1000);
+    w32(&mut img, 0x4004, 0x2000);
+    w32(&mut img, 0x4008, 0x4100);
+    w32(&mut img, 0x400C, 0x3800);
+    w32(&mut img, 0x4010, 0x3810);
+    w32(&mut img, 0x4014, 0x4100);
+    img[0x4100] = 0x01;
+
+    let mut bc = Box::new(BlockCache::new());
+    // Explicit shallow depth (10) still truncates cleanly.
+    let (shallow, _) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000], 10) };
+    assert!(!shallow.contains(&(base as u64 + tail_rva as u64)));
+
+    // Default closure depth expands the full intra-.pdata chain past 128 hops!
+    let (deep, _) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000], DEFAULT_AOT_CLOSURE) };
+    assert!(
+        deep.contains(&(base as u64 + tail_rva as u64)),
+        "expected intra-.pdata block at hop 150 (+{tail_rva:#x}) to be discovered"
+    );
+}
+
+#[test]
+fn closure_discovers_byte_loaded_switch_jump_table() {
+    let mut img = vec![0u8; 0x3000];
+    let base = img.as_ptr() as usize;
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    w16(&mut img, 0, 0x5A4D);
+    w32(&mut img, 0x3C, 0x40);
+    w32(&mut img, 0x40, 0x0000_4550);
+    w16(&mut img, 0x44, 0x8664);
+    w16(&mut img, 0x46, 2);
+    w16(&mut img, 0x54, 240);
+    let opt = 0x58;
+    w16(&mut img, opt, 0x20B);
+    w32(&mut img, opt + 16, 0x1000);
+    w64(&mut img, opt + 24, base as u64);
+    w32(&mut img, opt + 56, 0x3000);
+    w32(&mut img, opt + 108, 16);
+    w32(&mut img, opt + 112 + 3 * 8, 0x2000);
+    w32(&mut img, opt + 112 + 3 * 8 + 4, 12);
+    let sec0 = opt + 240;
+    img[sec0..sec0 + 5].copy_from_slice(b".text");
+    w32(&mut img, sec0 + 8, 0x1000);
+    w32(&mut img, sec0 + 12, 0x1000);
+    w32(&mut img, sec0 + 16, 0x1000);
+    w32(&mut img, sec0 + 20, 0x1000);
+    w32(&mut img, sec0 + 36, 0x6000_0020);
+    let sec1 = sec0 + 40;
+    img[sec1..sec1 + 6].copy_from_slice(b".rdata");
+    w32(&mut img, sec1 + 8, 0x1000);
+    w32(&mut img, sec1 + 12, 0x2000);
+    w32(&mut img, sec1 + 16, 0x1000);
+    w32(&mut img, sec1 + 20, 0x2000);
+    w32(&mut img, sec1 + 36, 0x4000_0040);
+
+    // 4-entry RVA32 jump table @ 0x2200 pointing to cases @ 0x1100, 0x1110, 0x1120, 0x1130.
+    let cases = [0x1100u32, 0x1110, 0x1120, 0x1130];
+    for (i, &c) in cases.iter().enumerate() {
+        w32(&mut img, 0x2200 + i * 4, c);
+        img[c as usize..c as usize + 6].copy_from_slice(&[0xB8, i as u8, 0, 0, 0, 0xC3]);
+    }
+
+    // Dispatch @ 0x1000 (NO prior `cmp` bound; relies on `movzx eax, byte ptr [rsi]`):
+    //   lea r9, [rip - 0x1007]              ; r9 = image base
+    //   movzx eax, byte ptr [rsi]           ; 0F B6 06
+    //   mov eax, dword ptr [r9 + rax*4 + 0x2200] ; 41 8B 84 81 00 22 00 00
+    //   add rax, r9                         ; 4C 01 C8
+    //   jmp rax                             ; FF E0
+    let mut code = Vec::new();
+    let lea_disp: i32 = -0x1007;
+    code.extend_from_slice(&[0x4C, 0x8D, 0x0D]);
+    code.extend_from_slice(&lea_disp.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0xB6, 0x06]);
+    code.extend_from_slice(&[0x41, 0x8B, 0x84, 0x81, 0x00, 0x22, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x01, 0xC8]);
+    code.extend_from_slice(&[0xFF, 0xE0]);
+    img[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+
+    // .pdata: 0x1000..0x1200
+    w32(&mut img, 0x2000, 0x1000);
+    w32(&mut img, 0x2004, 0x1200);
+    w32(&mut img, 0x2008, 0x2100);
+    img[0x2100] = 0x01;
+
+    let mut bc = Box::new(BlockCache::new());
+    let (ips, cl) = unsafe { discover(&mut *bc, base, img.len(), &[0x1000], DEFAULT_AOT_CLOSURE) };
+    assert_eq!(cl.jt_tables, 1, "expected byte-loaded jump table resolved");
+    for c in cases {
+        assert!(
+            ips.contains(&(base as u64 + c as u64)),
+            "missing byte-loaded switch case +{c:#x} in {ips:#x?}"
+        );
+    }
+}
+
+#[test]
+fn runtime_callback_replay_triggers_bg_rebuild() {
+    use super::callbacks::clear_runtime_callbacks_for_test;
+    let dir = std::env::temp_dir().join(format!("port_aot_cb_bg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let prev_aot_dir = std::env::var_os("PORT_AOT_DIR");
+    let prev_aw2_dir = std::env::var_os("AW2_DLL_AOT_DIR");
+    std::env::set_var("PORT_AOT_DIR", &dir);
+    std::env::remove_var("AW2_DLL_AOT_DIR");
+    clear_runtime_callbacks_for_test();
+
+    let mut img = vec![0u8; 0x3000];
+    let base = img.as_ptr() as usize;
+    let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    w16(&mut img, 0, 0x5A4D);
+    w32(&mut img, 0x3C, 0x40);
+    w32(&mut img, 0x40, 0x0000_4550);
+    w16(&mut img, 0x44, 0x8664);
+    w16(&mut img, 0x46, 1);
+    w16(&mut img, 0x54, 240);
+    let opt = 0x58;
+    w16(&mut img, opt, 0x20B);
+    w32(&mut img, opt + 16, 0x1000);
+    w64(&mut img, opt + 24, base as u64);
+    w32(&mut img, opt + 56, 0x3000);
+    w32(&mut img, opt + 108, 16);
+    let sec0 = opt + 240;
+    img[sec0..sec0 + 5].copy_from_slice(b".text");
+    w32(&mut img, sec0 + 8, 0x1000);
+    w32(&mut img, sec0 + 12, 0x1000);
+    w32(&mut img, sec0 + 16, 0x1000);
+    w32(&mut img, sec0 + 20, 0x1000);
+    w32(&mut img, sec0 + 36, 0x6000_0020);
+
+    // Entry @ 0x1000 and opaque indirect target @ 0x1200 (not referenced statically).
+    img[0x1000..0x1006].copy_from_slice(&[0xB8, 1, 0, 0, 0, 0xC3]);
+    img[0x1200..0x1206].copy_from_slice(&[0xB8, 2, 0, 0, 0, 0xC3]);
+
+    let mod_name = "cb_bg_rebuild_test.dll";
+    module_mapped(mod_name, base, img.len());
+    let key = unsafe { module_key(base, img.len()) };
+
+    // Before recording any runtime callback or profile, bg_job has nothing to build.
+    assert!(bg_job(mod_name, base, img.len(), key, Some(&[base as u64 + 0x1000])).is_none());
+
+    // Record runtime callback @ +0x1200 and flush; bg_job must now schedule a rebuild because
+    // the loaded cache only has +0x1000 (100% of replayed roots missing).
+    assert!(record_runtime_callback(base as u64 + 0x1200, CallbackKind::GenericCallback));
+    flush_runtime_callbacks();
+    let job = bg_job(mod_name, base, img.len(), key, Some(&[base as u64 + 0x1000]));
+    assert!(job.is_some(), "expected bg_job to schedule rebuild for missing replayed callback");
+
+    if let Ok(mut m) = MAPPED.lock() {
+        m.retain(|x| x.name != mod_name);
+    }
+    clear_runtime_callbacks_for_test();
+    match prev_aot_dir {
+        Some(v) => std::env::set_var("PORT_AOT_DIR", v),
+        None => std::env::remove_var("PORT_AOT_DIR"),
+    }
+    match prev_aw2_dir {
+        Some(v) => std::env::set_var("AW2_DLL_AOT_DIR", v),
+        None => std::env::remove_var("AW2_DLL_AOT_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

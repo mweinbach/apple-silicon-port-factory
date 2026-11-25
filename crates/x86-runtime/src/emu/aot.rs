@@ -41,7 +41,9 @@ pub(super) use format::{codegen_hash, decode, AotKey};
 pub(super) use format::encode_for_test;
 pub use runtime::{activate, module_mapped};
 pub(crate) use runtime::resolve_guest_va;
-pub(super) use runtime::{active, counts, epoch, find, note_code_region, probe_table, revalidate};
+pub(super) use runtime::{
+    active, counts, epoch, find, note_code_region, probe_table, revalidate, was_killed_at,
+};
 #[cfg(test)]
 pub(super) use runtime::revive_enabled;
 #[cfg(test)]
@@ -122,7 +124,7 @@ fn reloc_roots_enabled() -> bool {
 /// Default static CFG closure depth (BFS steps from each root; overridable via
 /// `PORT_AOT_CLOSURE` / `AW2_DLL_AOT_CLOSURE`). Deep enough to traverse full intra-function
 /// CFGs (loops, diamond chains, switch handlers, and `.pdata`-less leaf callees).
-const DEFAULT_AOT_CLOSURE: u32 = 128;
+pub(super) const DEFAULT_AOT_CLOSURE: u32 = 128;
 
 fn aot_closure_depth() -> u32 {
     env_u32_any(&["PORT_AOT_CLOSURE", "AW2_DLL_AOT_CLOSURE"], DEFAULT_AOT_CLOSURE)
