@@ -1674,6 +1674,11 @@ int main(void) {
         fprintf(stderr, "FAIL: variadic stack arguments\n");
         return 3;
     }
+    if (wsprintfA(abuf, "A%cB", 0) != 3 || memcmp(abuf, "A\0B", 4) ||
+        wsprintfW(wbuf, L"A%CB", 0) != 3 || memcmp(wbuf, L"A\0B", 4*sizeof(WCHAR))) {
+        fprintf(stderr, "FAIL: embedded NUL character field\n");
+        return 5;
+    }
     memset(abuf, '!', sizeof(abuf));
     n = wsprintfA(abuf, "%2000d", 1);
     if (n >= 2000 || abuf[1023] != 0 || abuf[1024] != '!') {

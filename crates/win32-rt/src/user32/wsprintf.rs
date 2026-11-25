@@ -38,7 +38,7 @@ unsafe fn text_field(src: Text, out_wide: bool, limit: usize, single: bool) -> V
     let mut i = 0;
     while result.len() < limit {
         let ch = src.unit(i);
-        if ch == 0 {
+        if ch == 0 && !single {
             break;
         }
         i += 1;
@@ -171,12 +171,16 @@ unsafe fn format(slots: *const u64, wide: bool) -> i32 {
                     },
                     wide: wide_arg.unwrap_or(wide != c.is_ascii_uppercase()),
                 };
-                text_field(
-                    src,
-                    wide,
-                    precision.unwrap_or(remaining).min(remaining),
-                    single,
-                )
+                if single && wide_arg.is_some() && src.unit(0) == 0 {
+                    Vec::new()
+                } else {
+                    text_field(
+                        src,
+                        wide,
+                        precision.unwrap_or(remaining).min(remaining),
+                        single,
+                    )
+                }
             }
             Ok(c @ (b'd' | b'i' | b'u' | b'x' | b'X' | b'p')) => {
                 let raw = args.next_u64();
