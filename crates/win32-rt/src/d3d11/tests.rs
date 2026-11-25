@@ -4037,6 +4037,38 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
             std::mem::transmute(vtbl_slot(ctx, 83));
 
         let fls = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        // D3D10 emulated interfaces must be rejected honestly until ID3D10Device/1 are implemented.
+        let mut d3d10_state: *mut c_void = 0x1 as *mut c_void;
+        assert_eq!(
+            create_dcs(
+                dev,
+                0,
+                fls.as_ptr(),
+                2,
+                D3D11_SDK_VERSION,
+                &crate::dxgi::adapter::IID_ID3D10Device,
+                std::ptr::null_mut(),
+                &mut d3d10_state,
+            ),
+            DXGI_ERROR_UNSUPPORTED
+        );
+        assert!(d3d10_state.is_null());
+        d3d10_state = 0x1 as *mut c_void;
+        assert_eq!(
+            create_dcs(
+                dev,
+                0,
+                fls.as_ptr(),
+                2,
+                D3D11_SDK_VERSION,
+                &IID_ID3D10Device1,
+                std::ptr::null_mut(),
+                &mut d3d10_state,
+            ),
+            DXGI_ERROR_UNSUPPORTED
+        );
+        assert!(d3d10_state.is_null());
+
         let mut chosen_fl = 0u32;
         let mut state_b: *mut c_void = std::ptr::null_mut();
         assert_eq!(

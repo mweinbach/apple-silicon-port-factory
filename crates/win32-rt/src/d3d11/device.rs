@@ -1089,14 +1089,15 @@ unsafe extern "win64" fn create_device_context_state(
     let Some(emulated) = Guid::read(iface) else {
         return E_INVALIDARG;
     };
-    if !matches!(
-        emulated,
-        IID_ID3D11Device
-            | IID_ID3D11Device1
-            | crate::dxgi::adapter::IID_ID3D10Device
-            | IID_ID3D10Device1
-    ) {
-        return E_INVALIDARG;
+    match emulated {
+        IID_ID3D11Device | IID_ID3D11Device1 => {}
+        crate::dxgi::adapter::IID_ID3D10Device | IID_ID3D10Device1 => {
+            return d11_failed!(
+                DXGI_ERROR_UNSUPPORTED,
+                "ID3D11Device1::CreateDeviceContextState: D3D10 emulated interface is unsupported"
+            );
+        }
+        _ => return E_INVALIDARG,
     }
     let core = &Obj::get(this).core;
     let selected_level = if n == 0 {
