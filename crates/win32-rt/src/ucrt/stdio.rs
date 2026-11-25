@@ -752,11 +752,22 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
 }
 
 unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, track_pos: bool) -> (isize, Vec<i64>) {
+    read_fd_tracked_inner_with(fd, info, buf, n, track_pos, |f, b, l| unsafe { raw_read_retry(f, b, l) })
+}
+
+unsafe fn read_fd_tracked_inner_with(
+    fd: i32,
+    info: FdInfo,
+    buf: *mut u8,
+    n: usize,
+    track_pos: bool,
+    mut read_raw: impl FnMut(i32, *mut u8, usize) -> isize,
+) -> (isize, Vec<i64>) {
     match info.mode {
         TextMode::Binary => {
             let mut pend = take_u8_pending(fd);
             if pend.raw.is_empty() {
-                return (raw_read_retry(fd, buf, n), Vec::new());
+                return (read_raw(fd, buf, n), Vec::new());
             }
             let take = pend.raw.len().min(n);
             std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
@@ -768,7 +779,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
             let mut pend = take_u8_pending(fd);
             if info.raw {
                 if pend.raw.is_empty() {
-                    return (raw_read_retry(fd, buf, n), Vec::new());
+                    return (read_raw(fd, buf, n), Vec::new());
                 }
                 let take = pend.raw.len().min(n);
                 std::ptr::copy_nonoverlapping(pend.raw.as_ptr(), buf, take);
@@ -784,7 +795,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                 pend.raw.drain(..take);
                 take
             } else {
-                let r = raw_read_retry(fd, buf, n);
+                let r = read_raw(fd, buf, n);
                 if r <= 0 {
                     store_u8_pending(fd, pend);
                     return (r, Vec::new());
@@ -822,7 +833,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                         }
                     } else {
                         let mut nb = 0u8;
-                        let k = raw_read_retry(fd, &mut nb, 1);
+                        let k = read_raw(fd, &mut nb, 1);
                         if k == 1 {
                             if nb == b'\n' {
                                 if start_pos >= 0 {
@@ -873,8 +884,9 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                 total = take;
             }
             if total == 0 || (total < n && total % 2 == 1) {
-                let r = raw_read_retry(fd, buf.add(total), n - total);
+                let r = read_raw(fd, buf.add(total), n - total);
                 if r < 0 {
+                    let saved_err = errno::get();
                     if total > 0 {
                         let mut restored = Vec::with_capacity(total + pend.raw.len());
                         restored.extend_from_slice(std::slice::from_raw_parts(buf, total));
@@ -882,6 +894,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                         pend.raw = restored;
                     }
                     store_u8_pending(fd, pend);
+                    errno::set(saved_err);
                     return (-1, Vec::new());
                 }
                 total += r as usize;
@@ -891,16 +904,27 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                 return (0, Vec::new());
             }
             // If an odd byte arrived, read 1 more byte to complete the UTF-16LE code unit;
-            // if EOF/short, preserve the stray partial byte in per-fd pending state.
+            // on error with no complete code units yet, preserve the partial byte and propagate -1
+            // so callers see an error rather than false EOF.
             if total % 2 == 1 {
                 let mut extra = 0u8;
-                if total < n && raw_read_retry(fd, &mut extra, 1) == 1 {
+                let k = if total < n { read_raw(fd, &mut extra, 1) } else { 0 };
+                if k == 1 {
                     *buf.add(total) = extra;
                     total += 1;
                 } else {
+                    let saved_err = errno::get();
                     let stray = *buf.add(total - 1);
                     pend.raw.insert(0, stray);
                     total -= 1;
+                    if k < 0 && total == 0 {
+                        store_u8_pending(fd, pend);
+                        errno::set(saved_err);
+                        return (-1, Vec::new());
+                    }
+                    if k < 0 {
+                        errno::set(saved_err);
+                    }
                 }
             }
             if info.raw {
@@ -954,7 +978,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                         let mut have = pre;
                         let mut pk_total = 0usize;
                         while have < 2 {
-                            let pk = raw_read_retry(fd, peek.as_mut_ptr().add(have), 2 - have);
+                            let pk = read_raw(fd, peek.as_mut_ptr().add(have), 2 - have);
                             if pk <= 0 {
                                 break;
                             }
@@ -1026,7 +1050,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
             let mut raw_buf = std::mem::take(&mut pend.raw);
             if out_u16.len() < max_u16 && raw_buf.is_empty() {
                 let mut tmp = vec![0u8; max_u16.max(4)];
-                let r = raw_read_retry(fd, tmp.as_mut_ptr(), tmp.len());
+                let r = read_raw(fd, tmp.as_mut_ptr(), tmp.len());
                 if r < 0 {
                     store_u8_pending(fd, U8Pending { raw: raw_buf, low_surrogate: None });
                     return if out_u16.is_empty() {
@@ -1062,7 +1086,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                         }
                     } else {
                         let mut nb = 0u8;
-                        let pk = raw_read_retry(fd, &mut nb, 1);
+                        let pk = read_raw(fd, &mut nb, 1);
                         if pk == 1 {
                             if nb == b'\n' {
                                 out_u16.push(b'\n' as u16);
@@ -1110,7 +1134,7 @@ unsafe fn read_fd_tracked_inner(fd: i32, info: FdInfo, buf: *mut u8, n: usize, t
                                     // decodes cleanly.
                                     let want = 4usize.saturating_sub(rem.len()).max(1);
                                     let mut more = [0u8; 4];
-                                    let k = raw_read_retry(fd, more.as_mut_ptr(), want);
+                                    let k = read_raw(fd, more.as_mut_ptr(), want);
                                     if k > 0 {
                                         raw_buf.extend_from_slice(&more[..k as usize]);
                                         continue;
@@ -3793,6 +3817,99 @@ mod tests {
             assert_eq!(got_big, 131072);
             assert!(big_out.iter().all(|&u| u == b'Z' as u16));
             assert_eq!(_close(fd_big), 0);
+
+            // 19. UTF-16LE odd-byte completion read error propagates -1 + errno and preserves
+            //     the partial byte instead of reporting 0 (false EOF).
+            let synth_fd = 999_991;
+            clear_u8_pending(synth_fd);
+            let u16_info = FdInfo {
+                mode: TextMode::Utf16Le,
+                win_mode: O_U16TEXT,
+                raw: false,
+                temporary: false,
+                osf_handle: None,
+            };
+            let mut out16 = [0u8; 8];
+            let mut step = 0usize;
+            errno::set(0);
+            let (rc_err, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    step += 1;
+                    if step == 1 {
+                        *dst = b'A';
+                        1
+                    } else {
+                        errno::set(errno::EIO);
+                        -1
+                    }
+                },
+            );
+            assert_eq!(rc_err, -1);
+            assert_eq!(errno::get(), errno::EIO);
+            assert_eq!(take_u8_pending(synth_fd).raw, vec![b'A']);
+
+            // Recovery after transient error: re-seed the preserved byte and supply high byte 0x00.
+            store_u8_pending(synth_fd, U8Pending { raw: vec![b'A'], low_surrogate: None });
+            let (rc_ok, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    *dst = 0x00;
+                    1
+                },
+            );
+            assert_eq!(rc_ok, 2);
+            assert_eq!(&out16[..2], &[b'A', 0x00]);
+            assert!(take_u8_pending(synth_fd).raw.is_empty());
+
+            // Partial complete unit + stray byte followed by EIO returns the complete unit first,
+            // preserves the stray byte, and surfaces EIO on the next read.
+            let mut step2 = 0usize;
+            let (rc_part, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, dst, _len| {
+                    step2 += 1;
+                    if step2 == 1 {
+                        *dst.add(0) = b'B';
+                        *dst.add(1) = 0x00;
+                        *dst.add(2) = b'C';
+                        3
+                    } else {
+                        errno::set(errno::EIO);
+                        -1
+                    }
+                },
+            );
+            assert_eq!(rc_part, 2);
+            assert_eq!(&out16[..2], &[b'B', 0x00]);
+            errno::set(0);
+            let (rc_next_err, _) = read_fd_tracked_inner_with(
+                synth_fd,
+                u16_info,
+                out16.as_mut_ptr(),
+                out16.len(),
+                false,
+                |_fd, _dst, _len| {
+                    errno::set(errno::EIO);
+                    -1
+                },
+            );
+            assert_eq!(rc_next_err, -1);
+            assert_eq!(errno::get(), errno::EIO);
+            assert_eq!(take_u8_pending(synth_fd).raw, vec![b'C']);
+            clear_u8_pending(synth_fd);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
