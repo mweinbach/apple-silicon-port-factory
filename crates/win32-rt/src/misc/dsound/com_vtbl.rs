@@ -1439,7 +1439,7 @@ unsafe extern "win64" fn dsb_restore(this: *mut DsBufferCom) -> HRESULT {
 
 #[repr(C)]
 pub(super) struct DsFxCom {
-    vtbl: *const Vtable<5>,
+    vtbl: *const crate::Ptr,
     refs: AtomicU32,
     effect: Arc<Mutex<BufferEffect>>,
 }
@@ -1504,6 +1504,49 @@ unsafe extern "win64" fn dsfx_get_all_parameters(this: *mut DsFxCom, params: *mu
     DS_OK
 }
 
+unsafe extern "win64" fn dsfx_i3dl2_set_preset(this: *mut DsFxCom, dw_preset: u32) -> HRESULT {
+    if this.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let Some(params) = super::buffer::i3dl2_preset_params(dw_preset) else {
+        return DSERR_INVALIDPARAM;
+    };
+    let mut fx = (*this).effect.lock().unwrap();
+    fx.params = params;
+    fx.i3dl2_preset = dw_preset;
+    DS_OK
+}
+
+unsafe extern "win64" fn dsfx_i3dl2_get_preset(this: *mut DsFxCom, pdw_preset: *mut u32) -> HRESULT {
+    if this.is_null() || pdw_preset.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let fx = (*this).effect.lock().unwrap();
+    wr(pdw_preset, fx.i3dl2_preset);
+    DS_OK
+}
+
+unsafe extern "win64" fn dsfx_i3dl2_set_quality(this: *mut DsFxCom, l_quality: i32) -> HRESULT {
+    if this.is_null()
+        || !(super::buffer::DSFX_I3DL2REVERB_QUALITY_MIN..=super::buffer::DSFX_I3DL2REVERB_QUALITY_MAX)
+            .contains(&l_quality)
+    {
+        return DSERR_INVALIDPARAM;
+    }
+    let mut fx = (*this).effect.lock().unwrap();
+    fx.i3dl2_quality = l_quality;
+    DS_OK
+}
+
+unsafe extern "win64" fn dsfx_i3dl2_get_quality(this: *mut DsFxCom, pl_quality: *mut i32) -> HRESULT {
+    if this.is_null() || pl_quality.is_null() {
+        return DSERR_INVALIDPARAM;
+    }
+    let fx = (*this).effect.lock().unwrap();
+    wr(pl_quality, fx.i3dl2_quality);
+    DS_OK
+}
+
 static DSFX_VTBL: Vtable<5> = Vtable([
     crate::Ptr(dsfx_qi as *const ()),
     crate::Ptr(dsfx_add_ref as *const ()),
@@ -1512,12 +1555,33 @@ static DSFX_VTBL: Vtable<5> = Vtable([
     crate::Ptr(dsfx_get_all_parameters as *const ()),
 ]);
 
+static DSFX_I3DL2REVERB_VTBL: Vtable<9> = Vtable([
+    crate::Ptr(dsfx_qi as *const ()),                 // 0: QueryInterface
+    crate::Ptr(dsfx_add_ref as *const ()),            // 1: AddRef
+    crate::Ptr(dsfx_release as *const ()),            // 2: Release
+    crate::Ptr(dsfx_set_all_parameters as *const ()), // 3: SetAllParameters
+    crate::Ptr(dsfx_get_all_parameters as *const ()), // 4: GetAllParameters
+    crate::Ptr(dsfx_i3dl2_set_preset as *const ()),   // 5: SetPreset
+    crate::Ptr(dsfx_i3dl2_get_preset as *const ()),   // 6: GetPreset
+    crate::Ptr(dsfx_i3dl2_set_quality as *const ()),  // 7: SetQuality
+    crate::Ptr(dsfx_i3dl2_get_quality as *const ()),  // 8: GetQuality
+]);
+
 fn create_dsfx_com(effect: Arc<Mutex<BufferEffect>>) -> *mut DsFxCom {
     static REG: Once = Once::new();
-    REG.call_once(|| register_static_ptr_slice(&DSFX_VTBL.0));
+    REG.call_once(|| {
+        register_static_ptr_slice(&DSFX_VTBL.0);
+        register_static_ptr_slice(&DSFX_I3DL2REVERB_VTBL.0);
+    });
+    let is_i3dl2 = effect.lock().unwrap().kind == DsFxKind::I3dl2Reverb;
+    let vtbl = if is_i3dl2 {
+        DSFX_I3DL2REVERB_VTBL.0.as_ptr()
+    } else {
+        DSFX_VTBL.0.as_ptr()
+    };
     ACTIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
     Box::into_raw(Box::new(DsFxCom {
-        vtbl: &DSFX_VTBL,
+        vtbl,
         refs: AtomicU32::new(1),
         effect,
     }))

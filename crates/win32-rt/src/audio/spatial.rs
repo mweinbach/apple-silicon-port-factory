@@ -1215,7 +1215,7 @@ mod render_stream {
                 pair[1] = if r.is_finite() { r.clamp(-1.0, 1.0) } else { 0.0 };
             }
             core.shared.ring.push(mix_buf);
-            push_loopback_frames(&core.ep.id, mix_buf, 2);
+            push_loopback_frames(&core.ep.id, mix_buf, SPATIAL_SAMPLE_RATE, 2);
             last_mixed.clear();
             last_mixed.extend_from_slice(mix_buf);
             *quanta_mixed += 1;

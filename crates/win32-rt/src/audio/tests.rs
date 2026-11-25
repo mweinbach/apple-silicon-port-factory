@@ -2116,3 +2116,129 @@ fn endpoint_channel_volume_attenuates_playback_and_tap_converter_normalizes_form
     assert_eq!(mono_44k.len(), 441);
     assert!(mono_44k.iter().all(|&s| (s - 0.4).abs() < 1e-5));
 }
+
+#[test]
+fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
+    let _f = Fixture::null();
+    unsafe {
+        let e = enumerator();
+        let d = default_device(e);
+
+        // 1. Create a 44.1 kHz mono loopback capture client (differs from 48 kHz stereo render).
+        let lb_c = activate_client(d);
+        let mono_44k = WAVEFORMATEX {
+            wFormatTag: super::format::WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: 1,
+            nSamplesPerSec: 44_100,
+            nAvgBytesPerSec: 44_100 * 4,
+            nBlockAlign: 4,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        assert_eq!(
+            call!(
+                lb_c,
+                AC_INIT,
+                (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT;
+                SHARED,
+                super::audioclient::AUDCLNT_STREAMFLAGS_LOOPBACK | super::audioclient::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                1_000_000,
+                0,
+                &mono_44k,
+                std::ptr::null()
+            ),
+            S_OK
+        );
+        let mut cc: P = std::ptr::null_mut();
+        assert_eq!(call!(lb_c, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioCaptureClient, &mut cc), S_OK);
+        assert_eq!(call!(lb_c, AC_START, () -> HRESULT;), S_OK);
+
+        // 2. Push 480 frames @ 48 kHz stereo from two concurrent render threads into the same endpoint.
+        let render_c1 = activate_client(d);
+        let render_c2 = activate_client(d);
+        let mut mix: *mut WAVEFORMATEX = std::ptr::null_mut();
+        assert_eq!(call!(render_c1, AC_MIXFMT, (*mut *mut WAVEFORMATEX) -> HRESULT; &mut mix), S_OK);
+        assert_eq!(
+            call!(render_c1, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 1_000_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        assert_eq!(
+            call!(render_c2, AC_INIT, (u32, u32, i64, i64, *const WAVEFORMATEX, *const GUID) -> HRESULT; SHARED, 0, 1_000_000, 0, mix, std::ptr::null()),
+            S_OK
+        );
+        let mut rc1: P = std::ptr::null_mut();
+        let mut rc2: P = std::ptr::null_mut();
+        assert_eq!(call!(render_c1, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc1), S_OK);
+        assert_eq!(call!(render_c2, AC_SERVICE, (*const GUID, *mut P) -> HRESULT; &IID_IAudioRenderClient, &mut rc2), S_OK);
+        assert_eq!(call!(render_c1, AC_START, () -> HRESULT;), S_OK);
+        assert_eq!(call!(render_c2, AC_START, () -> HRESULT;), S_OK);
+
+        let rc1_addr = rc1 as usize;
+        let rc2_addr = rc2 as usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            let rc = rc1_addr as P;
+            b1.wait();
+            for _ in 0..4 {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 480, &mut ptr), S_OK);
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut f32, 480 * 2);
+                slice.fill(0.5);
+                assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 480, 0), S_OK);
+            }
+        });
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            let rc = rc2_addr as P;
+            b2.wait();
+            for _ in 0..4 {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                assert_eq!(call!(rc, RC_GET, (u32, *mut *mut u8) -> HRESULT; 480, &mut ptr), S_OK);
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut f32, 480 * 2);
+                slice.fill(0.5);
+                assert_eq!(call!(rc, RC_RELEASE, (u32, u32) -> HRESULT; 480, 0), S_OK);
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Drain all resampled 44.1 kHz mono packets: 8 * 480 frames @ 48 kHz = 80 ms -> 3528 frames @ 44.1 kHz.
+        let mut total_frames = 0u32;
+        let mut samples = Vec::new();
+        loop {
+            let mut next = 0u32;
+            assert_eq!(call!(cc, 5 /* GetNextPacketSize */, (*mut u32) -> HRESULT; &mut next), S_OK);
+            if next == 0 {
+                break;
+            }
+            let mut p: *mut u8 = std::ptr::null_mut();
+            let mut nf = 0u32;
+            let mut fl = 0u32;
+            let mut dp = 0u64;
+            let mut qpc = 0u64;
+            let hr = call!(cc, CC_GET, (*mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT; &mut p, &mut nf, &mut fl, &mut dp, &mut qpc);
+            assert_eq!(hr, S_OK);
+            assert_eq!(fl & super::audioclient::AUDCLNT_BUFFERFLAGS_SILENT, 0);
+            let s = std::slice::from_raw_parts(p as *const f32, nf as usize);
+            samples.extend_from_slice(s);
+            total_frames += nf;
+            assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; nf), S_OK);
+        }
+        assert_eq!(
+            total_frames, 3528,
+            "8 * 480 frames @ 48 kHz must resample cleanly to 3528 frames @ 44.1 kHz under concurrent producers"
+        );
+        assert!(samples.iter().all(|&v| (v - 0.5).abs() < 1e-4));
+
+        CoTaskMemFree(mix as P);
+        assert_eq!(release(cc), 0);
+        assert_eq!(release(lb_c), 0);
+        assert_eq!(release(rc1), 0);
+        assert_eq!(release(rc2), 0);
+        assert_eq!(release(render_c1), 0);
+        assert_eq!(release(render_c2), 0);
+        assert_eq!(release(d), 0);
+        assert_eq!(release(e), 0);
+    }
+}

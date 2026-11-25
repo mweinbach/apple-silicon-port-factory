@@ -1097,3 +1097,61 @@ fn easy_httpauth_mask_rejects_unsupported_and_gates_credentials() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn easy_redirect_enforces_overall_protocols_allowlist() {
+    use super::easy::{
+        CURLE_UNSUPPORTED_PROTOCOL, CURLPROTO_HTTP, CURLPROTO_HTTPS, CURLOPT_PROTOCOLS,
+        CURLOPT_REDIR_PROTOCOLS,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        // 1. Redirect from http -> https (must be blocked when CURLOPT_PROTOCOLS = HTTP only,
+        // even though default CURLOPT_REDIR_PROTOCOLS allows HTTPS).
+        let (mut s1, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s1);
+        let resp1 = format!(
+            "HTTP/1.1 302 Found\r\nLocation: https://{addr}/tls-only\r\nContent-Length: 0\r\n\r\n"
+        );
+        s1.write_all(resp1.as_bytes()).unwrap();
+        drop(s1);
+
+        // 2. Redirect from http -> http (must be blocked when CURLOPT_REDIR_PROTOCOLS = HTTPS only,
+        // even though CURLOPT_PROTOCOLS allows HTTP).
+        let (mut s2, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut s2);
+        let resp2 = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{addr}/plain\r\nContent-Length: 0\r\n\r\n"
+        );
+        s2.write_all(resp2.as_bytes()).unwrap();
+    });
+
+    unsafe {
+        let easy = curl_easy_init();
+        let url = format!("http://{addr}/start\0");
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_URL, url.as_ptr() as usize), CURLE_OK);
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1), CURLE_OK);
+
+        // Restrict overall protocols to HTTP only; default redir_protocols includes HTTPS.
+        assert_eq!(curl_easy_setopt(easy, CURLOPT_PROTOCOLS, CURLPROTO_HTTP as usize), CURLE_OK);
+        assert_eq!(curl_easy_perform(easy), CURLE_UNSUPPORTED_PROTOCOL);
+
+        // Allow both HTTP and HTTPS overall, but restrict redirect protocols to HTTPS only.
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_PROTOCOLS, (CURLPROTO_HTTP | CURLPROTO_HTTPS) as usize),
+            CURLE_OK
+        );
+        assert_eq!(
+            curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS as usize),
+            CURLE_OK
+        );
+        assert_eq!(curl_easy_perform(easy), CURLE_UNSUPPORTED_PROTOCOL);
+
+        curl_easy_cleanup(easy);
+    }
+
+    server.join().unwrap();
+}

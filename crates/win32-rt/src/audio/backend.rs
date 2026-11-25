@@ -342,10 +342,9 @@ pub fn device_volume_range_db(dev: &DeviceInfo, is_capture: bool) -> Option<(f32
     }
 }
 
-/// Real-time safe channel-layout converter + linear resampler for ProcessTap loopback audio.
+/// Real-time safe channel-layout converter + linear resampler for loopback audio.
 /// Converts interleaved float32 input `(src_rate, src_channels)` into `(dst_rate, dst_channels)`
 /// using preallocated buffers so the CoreAudio IOProc never allocates on the realtime thread.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) struct TapFormatConverter {
     src_rate: u32,
     src_channels: usize,
@@ -363,7 +362,6 @@ pub(crate) struct TapFormatConverter {
     has_prev: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl TapFormatConverter {
     pub(crate) fn new(src_rate: u32, src_channels: u32, dst_rate: u32, dst_channels: u32) -> Self {
         let sc = src_channels.clamp(1, 8) as usize;
@@ -379,6 +377,11 @@ impl TapFormatConverter {
             prev_frame: [0.0; 8],
             has_prev: false,
         }
+    }
+
+    #[inline]
+    pub(crate) fn matches_src(&self, src_rate: u32, src_channels: u32) -> bool {
+        self.src_rate == src_rate.max(1) && self.src_channels == src_channels.clamp(1, 8) as usize
     }
 
     #[inline]

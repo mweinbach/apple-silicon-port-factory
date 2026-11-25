@@ -128,7 +128,11 @@ pub const MAX_BUFFER_DURATION_HNS: i64 = 20_000_000;
 /// Per-endpoint in-process render loopback subscriber (for `AUDCLNT_STREAMFLAGS_LOOPBACK`).
 struct LoopbackSub {
     ring: Arc<Ring>,
+    rate: u32,
     channels: u16,
+    /// Serializes concurrent render producers pushing into `ring` (`Ring` is single-producer /
+    /// single-consumer) and owns the per-subscriber format/sample-rate converter for fallback feeds.
+    producer: Mutex<Option<super::backend::TapFormatConverter>>,
 }
 
 static LOOPBACK_SUB_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -140,10 +144,12 @@ impl Drop for LoopbackSub {
     }
 }
 
-fn register_loopback_sub(ep_id: &str, cap_frames: usize, channels: u16) -> Arc<LoopbackSub> {
+fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u16) -> Arc<LoopbackSub> {
     let sub = Arc::new(LoopbackSub {
         ring: Arc::new(Ring::new(cap_frames.max(4096), channels.max(1) as usize)),
+        rate: rate.max(1),
         channels: channels.max(1),
+        producer: Mutex::new(None),
     });
     LOOPBACK_SUB_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut bus = LOOPBACK_BUS.lock().unwrap();
@@ -153,7 +159,9 @@ fn register_loopback_sub(ep_id: &str, cap_frames: usize, channels: u16) -> Arc<L
 }
 
 /// Fast-path render tee: zero lock overhead when no loopback capture client is active.
-pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_channels: u16) {
+/// Serializes multi-thread render producers per subscriber and normalizes sample rate +
+/// channel layout to each loopback capture client's format.
+pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_rate: u32, src_channels: u16) {
     if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 || samples_f32.is_empty() || src_channels == 0 {
         return;
     }
@@ -166,25 +174,33 @@ pub(super) fn push_loopback_frames(ep_id: &str, samples_f32: &[f32], src_channel
             .collect()
     };
     let src_ch = src_channels as usize;
+    let src_rate = src_rate.max(1);
     let frames = samples_f32.len() / src_ch;
+    if frames == 0 {
+        return;
+    }
+    let input = &samples_f32[..frames * src_ch];
     for sub in subs {
-        let dst_ch = sub.channels as usize;
-        if dst_ch == src_ch {
-            sub.ring.push(&samples_f32[..frames * src_ch]);
+        let mut conv_guard = sub.producer.lock().unwrap();
+        if sub.rate == src_rate && sub.channels == src_channels {
+            sub.ring.push(input);
         } else {
-            let mut conv = vec![0.0f32; frames * dst_ch];
-            for f in 0..frames {
-                for c in 0..dst_ch {
-                    conv[f * dst_ch + c] = if c < src_ch {
-                        samples_f32[f * src_ch + c]
-                    } else if src_ch == 1 {
-                        samples_f32[f]
-                    } else {
-                        0.0
-                    };
-                }
+            let needs_new = match conv_guard.as_ref() {
+                Some(c) => !c.matches_src(src_rate, src_channels as u32),
+                None => true,
+            };
+            if needs_new {
+                *conv_guard = Some(super::backend::TapFormatConverter::new(
+                    src_rate,
+                    src_channels as u32,
+                    sub.rate,
+                    sub.channels as u32,
+                ));
             }
-            sub.ring.push(&conv);
+            let out = conv_guard.as_mut().unwrap().convert(input);
+            if !out.is_empty() {
+                sub.ring.push(out);
+            }
         }
     }
 }
@@ -655,7 +671,7 @@ pub fn initialize(core: &ClientCore, mode: u32, flags: u32, dur: i64, periodicit
             None
         };
         let loopback = if is_loopback {
-            let sub = register_loopback_sub(&core.ep.id, buffer_frames as usize * 2, f.channels);
+            let sub = register_loopback_sub(&core.ep.id, buffer_frames as usize * 2, f.rate, f.channels);
             let ca_ring = Arc::new(Ring::new(buffer_frames as usize * 2, f.channels.max(1) as usize));
             let ca_tap = LoopbackTap::try_open(&core.ep.info, ca_ring.clone(), f.rate, f.channels as u32);
             let ca_ring_opt = ca_tap.as_ref().map(|_| ca_ring);
@@ -1317,7 +1333,7 @@ fn submit(s: &mut Stream, ep_id: &str, master_gain: f32, ch_gains: &[f32], frame
             }
         };
         s.shared.ring.push(pushed);
-        push_loopback_frames(ep_id, pushed, r.out_channels);
+        push_loopback_frames(ep_id, pushed, fmt.rate, r.out_channels);
     }
     s.frames_written += frames as u64;
 }

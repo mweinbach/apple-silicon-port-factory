@@ -1131,18 +1131,28 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
         }
     }
 
-    // Gather thread entries: primary/crashing thread + any other tracked Win32 threads.
-    let mut thread_entries: Vec<(u32, u64, Context)> = Vec::new();
+    // Gather thread entries: primary/crashing thread + any other live tracked Win32 threads.
+    // For additional threads, capture real CPU context + stack via SIGUSR2 / Mach thread_get_state;
+    // never fabricate a zeroed CONTEXT_FULL if a thread's state cannot be captured.
+    let mut thread_entries: Vec<(u32, u64, Option<(Context, Vec<u8>)>)> = Vec::new();
     let main_tid = exc_thread_id.unwrap_or(current_tid);
     let main_teb = crate::teb::current() as u64;
-    thread_entries.push((main_tid, main_teb, active_ctx));
+    let main_stack = safe_read_range(active_ctx.gpr[RSP], 64 * 1024);
+    thread_entries.push((main_tid, main_teb, Some((active_ctx, main_stack))));
     for t in crate::thread::all_threads() {
         let tid = t.tid.load(Ordering::Relaxed) as u32;
         if tid != 0 && tid != main_tid && t.exit_code().is_none() {
             let teb = t.teb.load(Ordering::Relaxed) as u64;
-            let mut c = Context::zeroed();
-            c.context_flags = crate::unwind::CONTEXT_FULL;
-            thread_entries.push((tid, teb, c));
+            let pthread = t.pthread.load(Ordering::Relaxed);
+            let mach_port = t.mach_port();
+            let kernel_suspended = t.is_kernel_suspended();
+            let captured = crate::crash::capture_thread_context_and_stack(
+                pthread,
+                mach_port,
+                kernel_suspended,
+                64 * 1024,
+            );
+            thread_entries.push((tid, teb, captured));
         }
     }
 
@@ -1265,25 +1275,30 @@ pub unsafe extern "win64" fn MiniDumpWriteDump(
     let mut thread_locs: Vec<(u32, u64, (u64, u32, u32), (u32, u32))> =
         Vec::with_capacity(thread_entries.len());
     let mut primary_ctx_loc = (0u32, 0u32);
-    for (idx, (tid, teb, ctx)) in thread_entries.iter().enumerate() {
-        md.align4();
-        let ctx_bytes = std::slice::from_raw_parts(
-            ctx as *const Context as *const u8,
-            std::mem::size_of::<Context>(),
-        );
-        let ctx_loc = md.push_bytes(ctx_bytes);
-        if idx == 0 {
-            primary_ctx_loc = ctx_loc;
-        }
-        let stack_start = ctx.gpr[RSP];
-        let stack_bytes = safe_read_range(stack_start, 64 * 1024);
-        let stack_loc = if !stack_bytes.is_empty() {
-            md.align4();
-            let (sz, rva) = md.push_bytes(&stack_bytes);
-            mem_ranges.push((stack_start, sz, rva));
-            (stack_start, sz, rva)
-        } else {
-            (0, 0, 0)
+    for (idx, (tid, teb, captured)) in thread_entries.iter().enumerate() {
+        let (stack_loc, ctx_loc) = match captured {
+            Some((ctx, stack_bytes)) => {
+                md.align4();
+                let ctx_bytes = std::slice::from_raw_parts(
+                    ctx as *const Context as *const u8,
+                    std::mem::size_of::<Context>(),
+                );
+                let ctx_loc = md.push_bytes(ctx_bytes);
+                if idx == 0 {
+                    primary_ctx_loc = ctx_loc;
+                }
+                let stack_start = ctx.gpr[RSP];
+                let stack_loc = if !stack_bytes.is_empty() {
+                    md.align4();
+                    let (sz, rva) = md.push_bytes(stack_bytes);
+                    mem_ranges.push((stack_start, sz, rva));
+                    (stack_start, sz, rva)
+                } else {
+                    (0, 0, 0)
+                };
+                (stack_loc, ctx_loc)
+            }
+            None => ((0, 0, 0), (0, 0)),
         };
         thread_locs.push((*tid, *teb, stack_loc, ctx_loc));
     }
@@ -2310,6 +2325,143 @@ mod tests {
             assert_eq!(SymCleanup(proc), TRUE);
             let _ = std::fs::remove_file(&pdb_path);
             let _ = std::fs::remove_dir(&dir);
+        }
+    }
+
+    #[test]
+    fn minidump_write_dump_captures_real_context_and_stack_for_worker_thread() {
+        unsafe extern "win64" fn worker_proc(param: *mut c_void) -> u32 {
+            let pair = &*(param as *const (HANDLE, HANDLE));
+            // Signal ready, then block on release event while MiniDumpWriteDump inspects us.
+            crate::kernel32::threads::SetEvent(pair.0);
+            crate::kernel32::threads::WaitForSingleObject(pair.1, 10_000);
+            0
+        }
+
+        unsafe {
+            let ev_ready = crate::kernel32::threads::CreateEventW(
+                std::ptr::null_mut(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+            );
+            let ev_done = crate::kernel32::threads::CreateEventW(
+                std::ptr::null_mut(),
+                TRUE,
+                FALSE,
+                std::ptr::null(),
+            );
+            assert!(!ev_ready.is_null() && !ev_done.is_null());
+
+            let pair = Box::new((ev_ready, ev_done));
+            let mut worker_tid = 0u32;
+            let h_worker = crate::kernel32::threads::CreateThread(
+                std::ptr::null_mut(),
+                0,
+                Some(worker_proc),
+                &*pair as *const (HANDLE, HANDLE) as *mut c_void,
+                0,
+                &mut worker_tid,
+            );
+            assert!(!h_worker.is_null());
+            assert_ne!(worker_tid, 0);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(ev_ready, 5_000), 0);
+
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "port_factory_mdmp_worker_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            crate::path::add_mount("N:\\", &tmp_dir);
+            let wpath = crate::strings::to_wide_z("N:\\worker.dmp");
+            let h_file = crate::kernel32::file::CreateFileW(
+                wpath.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(h_file, INVALID_HANDLE_VALUE);
+
+            let ok = MiniDumpWriteDump(
+                (-1isize) as HANDLE,
+                std::process::id(),
+                h_file,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert_eq!(ok, TRUE);
+
+            // Release worker thread cleanly before parsing dump.
+            crate::kernel32::threads::SetEvent(ev_done);
+            assert_eq!(crate::kernel32::threads::WaitForSingleObject(h_worker, 5_000), 0);
+            crate::kernel32::threads::CloseHandle(h_worker);
+            crate::kernel32::threads::CloseHandle(ev_ready);
+            crate::kernel32::threads::CloseHandle(ev_done);
+            drop(pair);
+
+            let mut fsize: i64 = 0;
+            assert_eq!(crate::kernel32::file::GetFileSizeEx(h_file, &mut fsize), TRUE);
+            let mut new_pos: i64 = 0;
+            assert_eq!(crate::kernel32::file::SetFilePointerEx(h_file, 0, &mut new_pos, 0), TRUE);
+            let mut bytes = vec![0u8; fsize as usize];
+            let mut got = 0u32;
+            assert_eq!(
+                crate::kernel32::file::ReadFile(
+                    h_file,
+                    bytes.as_mut_ptr() as *mut c_void,
+                    bytes.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            bytes.truncate(got as usize);
+            crate::kernel32::threads::CloseHandle(h_file);
+            let _ = crate::kernel32::file::DeleteFileW(wpath.as_ptr());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+
+            // Locate ThreadListStream (3) and locate our worker_tid entry.
+            let num_streams = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let dir_rva = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+            let mut thr_rva = None;
+            for i in 0..num_streams {
+                let off = dir_rva + i * 12;
+                let stype = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                if stype == MINIDUMP_THREAD_LIST_STREAM {
+                    thr_rva = Some(u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap()) as usize);
+                }
+            }
+            let rva = thr_rva.expect("ThreadListStream missing");
+            let count = u32::from_le_bytes(bytes[rva..rva + 4].try_into().unwrap()) as usize;
+            let mut found = false;
+            for i in 0..count {
+                let off = rva + 4 + i * 48;
+                let tid = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                if tid == worker_tid {
+                    let stack_start = u64::from_le_bytes(bytes[off + 24..off + 32].try_into().unwrap());
+                    let stack_sz = u32::from_le_bytes(bytes[off + 32..off + 36].try_into().unwrap());
+                    let ctx_sz = u32::from_le_bytes(bytes[off + 40..off + 44].try_into().unwrap()) as usize;
+                    let ctx_rva = u32::from_le_bytes(bytes[off + 44..off + 48].try_into().unwrap()) as usize;
+                    assert_eq!(ctx_sz, std::mem::size_of::<Context>());
+                    let ctx: Context = std::ptr::read_unaligned(bytes[ctx_rva..ctx_rva + ctx_sz].as_ptr() as *const Context);
+                    assert_ne!(ctx.rip, 0, "worker thread RIP must be real, not zero");
+                    assert_ne!(ctx.gpr[RSP], 0, "worker thread RSP must be real, not zero");
+                    assert_eq!(stack_start, ctx.gpr[RSP]);
+                    assert!(stack_sz > 0, "worker thread stack must be captured");
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "worker thread {worker_tid} missing from ThreadListStream");
         }
     }
 }

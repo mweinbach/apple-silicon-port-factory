@@ -308,9 +308,85 @@ impl DsFxKind {
     }
 }
 
+pub(super) const DSFX_I3DL2REVERB_QUALITY_MIN: i32 = 0;
+pub(super) const DSFX_I3DL2REVERB_QUALITY_MAX: i32 = 3;
+pub(super) const DSFX_I3DL2REVERB_QUALITY_DEFAULT: i32 = 2;
+
+/// Encode a 48-byte `DSFXI3DL2Reverb` parameter block from its 12 documented fields.
+fn encode_i3dl2_params(
+    room: i32,
+    room_hf: i32,
+    room_rolloff: f32,
+    decay_time: f32,
+    decay_hf_ratio: f32,
+    reflections: i32,
+    reflections_delay: f32,
+    reverb: i32,
+    reverb_delay: f32,
+    diffusion: f32,
+    density: f32,
+    hf_reference: f32,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(48);
+    v.extend_from_slice(&room.to_le_bytes());
+    v.extend_from_slice(&room_hf.to_le_bytes());
+    v.extend_from_slice(&room_rolloff.to_le_bytes());
+    v.extend_from_slice(&decay_time.to_le_bytes());
+    v.extend_from_slice(&decay_hf_ratio.to_le_bytes());
+    v.extend_from_slice(&reflections.to_le_bytes());
+    v.extend_from_slice(&reflections_delay.to_le_bytes());
+    v.extend_from_slice(&reverb.to_le_bytes());
+    v.extend_from_slice(&reverb_delay.to_le_bytes());
+    v.extend_from_slice(&diffusion.to_le_bytes());
+    v.extend_from_slice(&density.to_le_bytes());
+    v.extend_from_slice(&hf_reference.to_le_bytes());
+    v
+}
+
+/// Standard DirectSound 8 I3DL2 environment presets (`DSFX_I3DL2_ENVIRONMENT_PRESET_*`, 0..=29)
+/// matching `dsound.h` / Microsoft Learn `IDirectSoundFXI3DL2Reverb::SetPreset`.
+pub(super) fn i3dl2_preset_params(preset: u32) -> Option<Vec<u8>> {
+    let p = match preset {
+        0 => (-1000, -100, 0.0, 1.49, 0.83, -2602, 0.007, 200, 0.011, 100.0, 100.0, 5000.0), // DEFAULT
+        1 => (-1000, -100, 0.0, 1.49, 0.83, -2602, 0.007, 200, 0.011, 100.0, 100.0, 5000.0), // GENERIC
+        2 => (-1000, -6000, 0.0, 0.17, 0.10, -1204, 0.001, 207, 0.002, 100.0, 100.0, 5000.0), // PADDEDCELL
+        3 => (-1000, -454, 0.0, 0.40, 0.83, -1646, 0.002, 53, 0.003, 100.0, 100.0, 5000.0), // ROOM
+        4 => (-1000, -1200, 0.0, 1.49, 0.54, -370, 0.007, 1030, 0.011, 100.0, 60.0, 5000.0), // BATHROOM
+        5 => (-1000, -6000, 0.0, 0.50, 0.10, -1376, 0.003, -1104, 0.004, 100.0, 100.0, 5000.0), // LIVINGROOM
+        6 => (-1000, -300, 0.0, 2.31, 0.64, -711, 0.012, 83, 0.017, 100.0, 100.0, 5000.0), // STONEROOM
+        7 => (-1000, -476, 0.0, 4.32, 0.59, -789, 0.020, -289, 0.030, 100.0, 100.0, 5000.0), // AUDITORIUM
+        8 => (-1000, -500, 0.0, 3.92, 0.70, -1230, 0.020, -2, 0.029, 100.0, 100.0, 5000.0), // CONCERTHALL
+        9 => (-1000, 0, 0.0, 2.91, 1.30, -602, 0.015, -302, 0.022, 100.0, 100.0, 5000.0), // CAVE
+        10 => (-1000, -698, 0.0, 7.24, 0.33, -1166, 0.020, 16, 0.030, 100.0, 100.0, 5000.0), // ARENA
+        11 => (-1000, -1000, 0.0, 10.05, 0.23, -602, 0.020, 198, 0.030, 100.0, 100.0, 5000.0), // HANGAR
+        12 => (-1000, -4000, 0.0, 0.30, 0.10, -1831, 0.002, -1630, 0.030, 100.0, 100.0, 5000.0), // CARPETEDHALLWAY
+        13 => (-1000, -300, 0.0, 1.49, 0.59, -1219, 0.007, 441, 0.011, 100.0, 100.0, 5000.0), // HALLWAY
+        14 => (-1000, -237, 0.0, 2.70, 0.79, -1214, 0.013, 395, 0.020, 100.0, 100.0, 5000.0), // STONECORRIDOR
+        15 => (-1000, -270, 0.0, 1.49, 0.86, -1204, 0.007, -4, 0.011, 100.0, 100.0, 5000.0), // ALLEY
+        16 => (-1000, -3300, 0.0, 1.49, 0.54, -2560, 0.162, -613, 0.088, 79.0, 100.0, 5000.0), // FOREST
+        17 => (-1000, -800, 0.0, 1.49, 0.67, -2273, 0.007, -2217, 0.011, 50.0, 100.0, 5000.0), // CITY
+        18 => (-1000, -2500, 0.0, 1.49, 0.21, -2780, 0.300, -2014, 0.100, 27.0, 100.0, 5000.0), // MOUNTAINS
+        19 => (-1000, -1000, 0.0, 1.49, 0.83, -10000, 0.061, 500, 0.025, 100.0, 100.0, 5000.0), // QUARRY
+        20 => (-1000, -2000, 0.0, 1.49, 0.50, -2466, 0.179, -2514, 0.100, 21.0, 100.0, 5000.0), // PLAIN
+        21 => (-1000, 0, 0.0, 1.65, 1.50, -1363, 0.008, -1153, 0.012, 100.0, 100.0, 5000.0), // PARKINGLOT
+        22 => (-1000, -1000, 0.0, 2.81, 0.14, 429, 0.014, 648, 0.021, 80.0, 60.0, 5000.0), // SEWERPIPE
+        23 => (-1000, -4000, 0.0, 1.49, 0.10, -449, 0.007, 1700, 0.011, 100.0, 100.0, 5000.0), // UNDERWATER
+        24 => (-1000, -600, 0.0, 1.10, 0.83, -400, 0.005, 500, 0.010, 100.0, 100.0, 5000.0), // SMALLROOM
+        25 => (-1000, -600, 0.0, 1.30, 0.83, -1000, 0.010, -200, 0.020, 100.0, 100.0, 5000.0), // MEDIUMROOM
+        26 => (-1000, -600, 0.0, 1.50, 0.83, -1600, 0.020, -1000, 0.040, 100.0, 100.0, 5000.0), // LARGEROOM
+        27 => (-1000, -600, 0.0, 1.80, 0.70, -1300, 0.015, -800, 0.030, 100.0, 100.0, 5000.0), // MEDIUMHALL
+        28 => (-1000, -600, 0.0, 1.80, 0.70, -2000, 0.030, -1400, 0.060, 100.0, 100.0, 5000.0), // LARGEHALL
+        29 => (-1000, -200, 0.0, 1.30, 0.90, 0, 0.002, 0, 0.010, 100.0, 75.0, 5000.0), // PLATE
+        _ => return None,
+    };
+    Some(encode_i3dl2_params(p.0, p.1, p.2, p.3, p.4, p.5, p.6, p.7, p.8, p.9, p.10, p.11))
+}
+
 pub(super) struct BufferEffect {
     pub(super) kind: DsFxKind,
     pub(super) params: Vec<u8>,
+    pub(super) i3dl2_preset: u32,
+    pub(super) i3dl2_quality: i32,
     delay_l: Vec<f32>,
     delay_r: Vec<f32>,
     delay_pos: usize,
@@ -332,6 +408,8 @@ impl BufferEffect {
         Self {
             kind,
             params: kind.default_params(),
+            i3dl2_preset: 0,
+            i3dl2_quality: DSFX_I3DL2REVERB_QUALITY_DEFAULT,
             delay_l: vec![0.0; cap],
             delay_r: vec![0.0; cap],
             delay_pos: 0,

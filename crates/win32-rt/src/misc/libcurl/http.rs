@@ -1325,11 +1325,14 @@ pub(super) fn execute_http_transfer(
                         };
                     }
                 };
-                if (req.redir_protocols & scheme_proto_bit(&next_url.scheme)) == 0 {
+                let next_proto_bit = scheme_proto_bit(&next_url.scheme);
+                if (req.allowed_protocols & next_proto_bit) == 0
+                    || (req.redir_protocols & next_proto_bit) == 0
+                {
                     return TransferOutcome {
                         code: CURLE_UNSUPPORTED_PROTOCOL,
                         error_msg: Some(format!(
-                            "Redirect protocol {:?} disabled by CURLOPT_REDIR_PROTOCOLS",
+                            "Redirect protocol {:?} disabled by CURLOPT_PROTOCOLS / CURLOPT_REDIR_PROTOCOLS",
                             next_url.scheme
                         )),
                         size_download: total_size_download,

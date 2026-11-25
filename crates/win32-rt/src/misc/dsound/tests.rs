@@ -1479,3 +1479,113 @@ fn dsound8_set_fx_get_object_in_path_and_dsp_processing() {
         assert_eq!(ds_release(ds), 0);
     }
 }
+
+#[test]
+fn dsound8_i3dl2_reverb_full_vtable_preset_and_quality() {
+    let _audio_guard = crate::audio::audio_test_lock();
+    backend::force_backend(Some(Backend::Null));
+
+    unsafe {
+        let ds = make_paused_ds8();
+        let wfx = float_wfx(2, 48_000);
+        let desc = make_desc(
+            DSBCAPS_CTRLFX | DSBCAPS_CTRLVOLUME,
+            1024 * 8,
+            &wfx as *const WAVEFORMATEX as *const u8,
+        );
+        let mut raw_buf: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            ds_create_sound_buffer(
+                ds,
+                &desc as *const DsBufferDesc as *const c_void,
+                &mut raw_buf,
+                std::ptr::null_mut(),
+            ),
+            DS_OK
+        );
+        let buf = raw_buf as *mut DsBufferCom;
+
+        let fx_reverb = DsEffectDesc {
+            dw_size: std::mem::size_of::<DsEffectDesc>() as u32,
+            dw_flags: 0,
+            guid_dsfx_class: GUID_DSFX_STANDARD_I3DL2REVERB,
+            dw_reserved1: 0,
+            dw_reserved2: 0,
+        };
+        let mut res = 0u32;
+        assert_eq!(
+            dsb_set_fx(buf, 1, &fx_reverb as *const DsEffectDesc as *const c_void, &mut res),
+            DS_OK
+        );
+        assert_eq!(res, DSFXR_LOCSOFTWARE);
+
+        let mut fx_obj: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            dsb_get_object_in_path(
+                buf,
+                &GUID_DSFX_STANDARD_I3DL2REVERB,
+                0,
+                &IID_IDIRECTSOUNDFXI3DL2REVERB,
+                &mut fx_obj,
+            ),
+            DS_OK
+        );
+        assert!(!fx_obj.is_null());
+
+        let vtbl = *(fx_obj as *const *const usize);
+        let qi_fn: unsafe extern "win64" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(*vtbl.add(0));
+        let rel_fn: unsafe extern "win64" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        let get_all_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void) -> HRESULT =
+            std::mem::transmute(*vtbl.add(4));
+        let set_preset_fn: unsafe extern "win64" fn(*mut c_void, u32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(5));
+        let get_preset_fn: unsafe extern "win64" fn(*mut c_void, *mut u32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(6));
+        let set_quality_fn: unsafe extern "win64" fn(*mut c_void, i32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(7));
+        let get_quality_fn: unsafe extern "win64" fn(*mut c_void, *mut i32) -> HRESULT =
+            std::mem::transmute(*vtbl.add(8));
+
+        // QI for IID_IDIRECTSOUNDFXI3DL2REVERB succeeds.
+        let mut qi_out: *mut c_void = std::ptr::null_mut();
+        assert_eq!(qi_fn(fx_obj, &IID_IDIRECTSOUNDFXI3DL2REVERB, &mut qi_out), DS_OK);
+        assert_eq!(qi_out, fx_obj);
+        assert_eq!(rel_fn(qi_out), 1);
+
+        // Default preset (0 = DEFAULT) and default quality (2).
+        let mut preset = 99u32;
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 0);
+        let mut quality = -1i32;
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, DSFX_I3DL2REVERB_QUALITY_DEFAULT);
+
+        // SetPreset(9 = CAVE) updates both GetPreset and the 48-byte DSFXI3DL2Reverb struct.
+        assert_eq!(set_preset_fn(fx_obj, 9), DS_OK);
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 9);
+        let mut raw_params = [0u8; 48];
+        assert_eq!(get_all_fn(fx_obj, raw_params.as_mut_ptr() as *mut c_void), DS_OK);
+        let decay_time = f32::from_le_bytes(raw_params[12..16].try_into().unwrap());
+        assert!((decay_time - 2.91).abs() < 1e-4, "CAVE preset decay_time={decay_time}");
+
+        // Out-of-range preset -> DSERR_INVALIDPARAM; preset unchanged.
+        assert_eq!(set_preset_fn(fx_obj, 30), DSERR_INVALIDPARAM);
+        assert_eq!(get_preset_fn(fx_obj, &mut preset), DS_OK);
+        assert_eq!(preset, 9);
+
+        // SetQuality / GetQuality bounds (0..=3).
+        assert_eq!(set_quality_fn(fx_obj, 3), DS_OK);
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, 3);
+        assert_eq!(set_quality_fn(fx_obj, -1), DSERR_INVALIDPARAM);
+        assert_eq!(set_quality_fn(fx_obj, 4), DSERR_INVALIDPARAM);
+        assert_eq!(get_quality_fn(fx_obj, &mut quality), DS_OK);
+        assert_eq!(quality, 3);
+
+        assert_eq!(rel_fn(fx_obj), 0);
+        assert_eq!(dsb_release(buf), 0);
+        assert_eq!(ds_release(ds), 0);
+    }
+}
