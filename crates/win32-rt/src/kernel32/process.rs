@@ -2765,7 +2765,17 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 set_err(err::ERROR_INVALID_HANDLE);
                 return FALSE;
             };
-            st.completion_port = Some((key, iocp));
+            let cp = (key, iocp);
+            // Per Microsoft Learn (JOBOBJECT_ASSOCIATE_COMPLETION_PORT): associating a
+            // completion port immediately posts JOB_OBJECT_MSG_NEW_PROCESS for every active
+            // process already in the job (synchronized under `j.state` against concurrent
+            // assignments and exits).
+            for m in &st.members {
+                if m.is_active() {
+                    post_job_iocp_msg(&cp, JOB_OBJECT_MSG_NEW_PROCESS, m.pid() as usize);
+                }
+            }
+            st.completion_port = Some(cp);
             TRUE
         }
         9 => {
@@ -5208,6 +5218,35 @@ pub(crate) mod tests {
 
                 assert_eq!(crate::kernel32::threads::CloseHandle(child_h), TRUE);
                 assert_eq!(crate::kernel32::threads::CloseHandle(cjob), TRUE);
+
+                // Associating a completion port AFTER processes are already assigned must
+                // immediately post JOB_OBJECT_MSG_NEW_PROCESS for each existing active member.
+                let cjob2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!cjob2.is_null());
+                let pre_child = Arc::new(ChildProcessObj {
+                    pid: 77778,
+                    exe_win: "C:\\Games\\PreAssigned.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                let pre_h = handles::insert(Arc::clone(&pre_child) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(cjob2, pre_h), TRUE);
+                let mut assoc2 = [0u8; 16];
+                std::ptr::write_unaligned(assoc2.as_mut_ptr() as *mut usize, 0xBEEF_5678usize);
+                std::ptr::write_unaligned(assoc2.as_mut_ptr().add(8) as *mut HANDLE, iocp);
+                assert_eq!(SetInformationJobObject(cjob2, 7, assoc2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_NEW_PROCESS);
+                assert_eq!(key, 0xBEEF_5678);
+                assert_eq!(ov as usize, 77778);
+                pre_child.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_EXIT_PROCESS);
+                assert_eq!(crate::kernel32::file::GetQueuedCompletionStatus(iocp, &mut msg, &mut key, &mut ov, 1000), TRUE);
+                assert_eq!(msg, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO);
+                assert_eq!(crate::kernel32::threads::CloseHandle(pre_h), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(cjob2), TRUE);
 
                 // A job with a live child stays alive after its last handle closes until the child exits
                 // (delivering IOCP exit/zero notifications and then releasing cleanly).
