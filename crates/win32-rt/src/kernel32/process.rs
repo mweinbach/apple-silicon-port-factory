@@ -503,8 +503,13 @@ pub fn current_process_affinity_mask() -> usize {
 }
 
 pub unsafe extern "win64" fn GetProcessAffinityMask(h: HANDLE, proc_mask: *mut usize, sys_mask: *mut usize) -> BOOL {
-    if !is_self(h) && handles::get_as::<ChildProcessObj>(h).is_none() {
-        set_err(err::ERROR_INVALID_HANDLE);
+    if !is_self(h) {
+        if handles::get_as::<ChildProcessObj>(h).is_some() {
+            log::warn!("GetProcessAffinityMask: querying affinity mask of a child process is not supported");
+            set_err(err::ERROR_NOT_SUPPORTED);
+        } else {
+            set_err(err::ERROR_INVALID_HANDLE);
+        }
         return FALSE;
     }
     let sm = system_affinity_mask();
@@ -1840,32 +1845,81 @@ fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobO
     Ok(())
 }
 
+/// Serializes cross-job affinity validation and updates for the current process so two
+/// concurrent assignments or limit updates cannot accept incompatible affinity masks.
+/// Lock order: `job_affinity_lock() -> all_jobs() -> JobObj::state`.
+fn job_affinity_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Intersect two optional job affinity constraints `(mask, allow_subset)`.
+/// Returns `Err(())` when no non-empty process affinity mask can simultaneously satisfy both
+/// constraints (either disjoint masks or a stricter mask conflicting with `!allow_subset`).
+fn combine_affinity_constraints(
+    a: Option<(usize, bool)>,
+    b: Option<(usize, bool)>,
+) -> Result<Option<(usize, bool)>, ()> {
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some((m1, s1)), Some((m2, s2))) => {
+            let inter = m1 & m2;
+            if inter == 0 || (!s1 && inter != m1) || (!s2 && inter != m2) {
+                Err(())
+            } else {
+                Ok(Some((inter, s1 && s2)))
+            }
+        }
+    }
+}
+
+/// Combined affinity constraint of all live jobs containing the current process other than `exclude`.
+/// Returns `Err(())` if existing memberships already conflict (fail closed).
+fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(usize, bool)>, ()> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut combined: Option<(usize, bool)> = None;
+    for jo in jobs {
+        if Arc::ptr_eq(&jo, exclude) {
+            continue;
+        }
+        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        if let Some(aff) = st.effective_affinity() {
+            combined = combine_affinity_constraints(combined, Some(aff))?;
+        }
+    }
+    Ok(combined)
+}
+
 /// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
 /// job with `JOB_OBJECT_LIMIT_AFFINITY` or `JobObjectGroupInformationEx` affinity set.
+/// Never treats an empty intersection as unconstrained (fail closed with `Some((0, false))`).
 fn job_affinity_constraint() -> Option<(usize, bool)> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
         let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
-    let mut combined: Option<usize> = None;
-    let mut allow_subset = true;
+    let mut combined: Option<(usize, bool)> = None;
     for jo in jobs {
         let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.contains_pid(my_pid) {
             continue;
         }
-        if let Some((aff, job_subset)) = st.effective_affinity() {
-            combined = Some(match combined {
-                Some(cur) => cur & aff,
-                None => aff,
-            });
-            if !job_subset {
-                allow_subset = false;
+        if let Some(aff) = st.effective_affinity() {
+            match combine_affinity_constraints(combined, Some(aff)) {
+                Ok(next) => combined = next,
+                Err(()) => return Some((0, false)),
             }
         }
     }
-    combined.filter(|&m| m != 0).map(|m| (m, allow_subset))
+    combined
 }
 
 /// Clamp every live thread's non-zero affinity mask to `proc_mask` so threads cannot remain
@@ -2325,6 +2379,19 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
         return FALSE;
     };
     let pid = member.pid();
+    let is_self_member = matches!(member, JobMember::SelfProc(_));
+    let _aff_guard = is_self_member.then(|| job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner()));
+    let other_aff = if is_self_member {
+        match other_self_jobs_affinity_constraint(&j) {
+            Ok(a) => a,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+    } else {
+        None
+    };
     let mut st = j.state.lock().unwrap();
     if st.contains_pid(pid) {
         return TRUE;
@@ -2343,17 +2410,23 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
         set_err(err::ERROR_NOT_SUPPORTED);
         return FALSE;
     }
-    if (st.limit_flags() & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && pid == std::process::id() {
+    let apply_aff = if is_self_member {
+        match combine_affinity_constraints(other_aff, st.effective_affinity()) {
+            Ok(combined) => combined,
+            Err(()) => {
+                set_err(err::ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+    } else {
+        None
+    };
+    if (st.limit_flags() & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && is_self_member {
         let prio = u32::from_le_bytes(st.basic_limits[56..60].try_into().unwrap());
         if prio != 0 {
             PRIORITY_CLASS.store(prio, Ordering::Relaxed);
         }
     }
-    let apply_aff = if pid == std::process::id() {
-        st.effective_affinity()
-    } else {
-        None
-    };
     if matches!(member, JobMember::SelfProc(_)) {
         let snap = self_rusage_snapshot();
         st.self_assign_rusage = Some(snap);
@@ -2400,6 +2473,13 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
         return FALSE;
     }
     let bytes = info as *const u8;
+    let updates_affinity = matches!(class, 2 | 9 | 14);
+    let _aff_guard = updates_affinity.then(|| job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner()));
+    let other_aff = if updates_affinity {
+        other_self_jobs_affinity_constraint(&j)
+    } else {
+        Ok(None)
+    };
     let mut st = j.state.lock().unwrap();
     match class {
         2 => {
@@ -2436,15 +2516,30 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 set_err(err::ERROR_NOT_SUPPORTED);
                 return FALSE;
             }
-            st.basic_limits = buf;
             let contains_self = st.contains_pid(std::process::id());
+            let apply_aff = if contains_self {
+                let Ok(other) = other_aff else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&buf, &st.group_affinities);
+                match combine_affinity_constraints(other, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                }
+            } else {
+                None
+            };
+            st.basic_limits = buf;
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
                 let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
                 if prio != 0 {
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
             }
-            let apply_aff = if contains_self { st.effective_affinity() } else { None };
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
                 apply_job_affinity_limit(aff, allow_subset);
@@ -2534,15 +2629,30 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 set_err(err::ERROR_NOT_SUPPORTED);
                 return FALSE;
             }
-            st.basic_limits = basic;
             let contains_self = st.contains_pid(std::process::id());
+            let apply_aff = if contains_self {
+                let Ok(other) = other_aff else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&basic, &st.group_affinities);
+                match combine_affinity_constraints(other, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                }
+            } else {
+                None
+            };
+            st.basic_limits = basic;
             if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
                 let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
                 if prio != 0 {
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
             }
-            let apply_aff = if contains_self { st.effective_affinity() } else { None };
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
                 apply_job_affinity_limit(aff, allow_subset);
@@ -2615,12 +2725,23 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 set_err(err::ERROR_NOT_SUPPORTED);
                 return FALSE;
             }
-            st.group_affinities = out;
             let apply_aff = if st.contains_pid(std::process::id()) {
-                st.effective_affinity()
+                let Ok(other) = other_aff else {
+                    set_err(err::ERROR_INVALID_PARAMETER);
+                    return FALSE;
+                };
+                let new_aff = JobState::effective_affinity_from(&st.basic_limits, &out);
+                match combine_affinity_constraints(other, new_aff) {
+                    Ok(combined) => combined,
+                    Err(()) => {
+                        set_err(err::ERROR_INVALID_PARAMETER);
+                        return FALSE;
+                    }
+                }
             } else {
                 None
             };
+            st.group_affinities = out;
             drop(st);
             if let Some((aff, allow_subset)) = apply_aff {
                 apply_job_affinity_limit(aff, allow_subset);
@@ -4526,6 +4647,49 @@ pub(crate) mod tests {
                 assert_eq!(pm_now, 0x1);
                 assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+
+                // Cross-job affinity compatibility: assigning self to a second job with a disjoint
+                // mask (0x2 vs existing 0x1) must fail instead of clearing the combined constraint,
+                // and updating a second assigned job to a disjoint mask must likewise be rejected.
+                let job2 = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                assert!(!job2.is_null());
+                let mut ga2 = [0u8; 16];
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(AssignProcessToJobObject(job2, handles::CURRENT_PROCESS), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Compatible wider mask (0x3) succeeds while preserving the intersected 0x1 restriction.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x3usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                assert_eq!(AssignProcessToJobObject(job2, handles::CURRENT_PROCESS), TRUE);
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                // Updating job2 to disjoint mask 0x2 (via class 14 or class 2) must fail.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, 0x2usize);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetInformationJobObject(job2, 2, aff_basic.as_ptr() as *const c_void, 64), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                // Restore job2 to unrestricted full mask + SILENT_BREAKAWAY_OK before closing so it
+                // never constrains subsequent tests in this binary.
+                std::ptr::write_unaligned(ga2.as_mut_ptr() as *mut usize, orig_sm);
+                assert_eq!(SetInformationJobObject(job2, 14, ga2.as_ptr() as *const c_void, 16), TRUE);
+                let mut job2_clear = [0u8; 64];
+                std::ptr::write_unaligned(
+                    job2_clear.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+                );
+                assert_eq!(SetInformationJobObject(job2, 2, job2_clear.as_ptr() as *const c_void, 64), TRUE);
+                assert_eq!(crate::kernel32::threads::CloseHandle(job2), TRUE);
+
+                // GetProcessAffinityMask on a child handle fails honestly with ERROR_NOT_SUPPORTED
+                // rather than leaking the parent's restricted affinity mask.
+                let child_probe = make_test_child_handle(99990, "C:\\Games\\AffinityProbe.exe");
+                let mut child_pm = 0usize;
+                let mut child_sm = 0usize;
+                assert_eq!(GetProcessAffinityMask(child_probe, &mut child_pm, &mut child_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
+                assert_eq!(crate::kernel32::threads::CloseHandle(child_probe), TRUE);
 
                 // Restore full group-0 affinity mask before continuing.
                 std::ptr::write_unaligned(ga.as_mut_ptr() as *mut usize, orig_sm);
