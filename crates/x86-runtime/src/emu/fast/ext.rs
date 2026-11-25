@@ -678,7 +678,7 @@ pub(super) fn lower_more(ins: &Instruction, mut f: FastOp) -> Option<FastOp> {
     Some(f)
 }
 
-pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
+pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) -> bool {
     let w = op.w;
     match op.kind {
         K_VBROADCAST => {
@@ -1145,9 +1145,10 @@ pub(super) unsafe fn exec_ext_more(cpu: &mut Cpu, op: &FastOp) {
                 cpu.rip = op.imm;
             }
         }
-        K_VAES_RR..=K_VVNNI_RM => exec_ext_all_remaining(cpu, op),
+        K_VAES_RR..=K_VVNNI_RM => return exec_ext_all_remaining(cpu, op),
         _ => {}
     }
+    false
 }
 
 /// Packed single-precision FMA on one 128-bit lane.

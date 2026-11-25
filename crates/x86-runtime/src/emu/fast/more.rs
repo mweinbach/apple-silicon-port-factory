@@ -434,8 +434,10 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
             f.kind = K_NOP;
         }
         M::Lahf | M::Sahf | M::Pushf | M::Pushfq | M::Popf | M::Popfq | M::Stmxcsr
-        | M::Vstmxcsr | M::Xlatb
-        | M::Rdtsc | M::Rdtscp | M::Cpuid => {
+        | M::Vstmxcsr | M::Ldmxcsr | M::Vldmxcsr | M::Fnstcw | M::Fstcw | M::Fldcw | M::Xlatb
+        | M::Rdtsc | M::Rdtscp | M::Cpuid | M::Xgetbv | M::Fxsave | M::Fxsave64 | M::Fxrstor
+        | M::Fxrstor64 | M::Xsave | M::Xsave64 | M::Xsaveopt | M::Xsaveopt64 | M::Xsavec
+        | M::Xsavec64 | M::Xrstor | M::Xrstor64 => {
             f.kind = K_SYS_MISC;
             match mn {
                 M::Lahf => f.x = 0,
@@ -460,7 +462,15 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
                     f.x = 4;
                     put_mem(ins, &mut f)?;
                 }
+                M::Ldmxcsr | M::Vldmxcsr => {
+                    f.x = 5;
+                    put_mem(ins, &mut f)?;
+                }
                 M::Xlatb => f.x = 6,
+                M::Fnstcw | M::Fstcw => {
+                    f.x = 7;
+                    put_mem(ins, &mut f)?;
+                }
                 M::Rdtsc => {
                     f.x = 8;
                     f.w = 0;
@@ -469,7 +479,41 @@ pub(super) fn lower_all_remaining(ins: &Instruction, mut f: FastOp) -> Option<Fa
                     f.x = 8;
                     f.w = 1;
                 }
-                _ => f.x = 9, // Cpuid
+                M::Cpuid => f.x = 9,
+                M::Fldcw => {
+                    f.x = 14;
+                    put_mem(ins, &mut f)?;
+                }
+                M::Xgetbv => f.x = 15,
+                _ => {
+                    use crate::emu::xstate::{
+                        XS_FLAG_COMPACT, XS_FLAG_LEGACY, XS_FLAG_RESTORE, XS_FLAG_WIDE,
+                    };
+                    f.x = 16;
+                    let mut flags = 0u8;
+                    if matches!(mn, M::Fxsave | M::Fxsave64 | M::Fxrstor | M::Fxrstor64) {
+                        flags |= XS_FLAG_LEGACY;
+                    }
+                    if matches!(
+                        mn,
+                        M::Fxsave64
+                            | M::Fxrstor64
+                            | M::Xsave64
+                            | M::Xsaveopt64
+                            | M::Xsavec64
+                            | M::Xrstor64
+                    ) {
+                        flags |= XS_FLAG_WIDE;
+                    }
+                    if matches!(mn, M::Fxrstor | M::Fxrstor64 | M::Xrstor | M::Xrstor64) {
+                        flags |= XS_FLAG_RESTORE;
+                    }
+                    if matches!(mn, M::Xsavec | M::Xsavec64) {
+                        flags |= XS_FLAG_COMPACT;
+                    }
+                    f.w = flags;
+                    put_mem(ins, &mut f)?;
+                }
             }
         }
         M::Push | M::Pop => {
@@ -1126,7 +1170,7 @@ unsafe fn exec_string_op(cpu: &mut Cpu, op: &FastOp) {
 }
 
 #[inline(never)]
-pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
+pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) -> bool {
     match op.kind {
         K_VAES_RR | K_VAES_RM => {
             let d = op.r0 as usize & 15;
@@ -1286,10 +1330,34 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                     cpu.of = fl & 0x800 != 0;
                 }
                 4 => cpu.write_mem(cpu.faddr(op), 32, cpu.jx.mxcsr as u64), // Stmxcsr / Vstmxcsr
+                5 => {
+                    // Ldmxcsr / Vldmxcsr
+                    let m = cpu.read_mem(cpu.faddr(op), 32) as u32;
+                    if m >> 16 != 0 {
+                        cpu.rip = op.ip;
+                        crate::emu::xstate::Fault::gp().dispatch(cpu, op.ip);
+                        return true;
+                    }
+                    if !crate::emu::precise_faults()
+                        || crate::emu::FAULT_PENDING.with(|p| p.get().is_none())
+                    {
+                        cpu.jx.mxcsr = m;
+                        crate::emu::apply_guest_mxcsr_hw(m);
+                        if crate::emu::denorm::software_mode(m) {
+                            cpu.rip = op.ip.wrapping_add(op.len as u64);
+                            return true;
+                        }
+                    }
+                }
                 6 => {
                     // Xlatb
                     let v = cpu.read_mem(cpu.gpr[3].wrapping_add(cpu.gpr[0] & 0xFF), 8);
                     cpu.rset(0, 8, v);
+                }
+                7 => {
+                    // Fnstcw / Fstcw
+                    let a = cpu.faddr(op);
+                    cpu.write_mem(a, 16, crate::emu::regfile_ext::x87_snapshot().cw.into());
                 }
                 8 => cpu.read_timestamp(op.w != 0), // RDTSC / RDTSCP
                 9 => cpu.cpuid(),
@@ -1326,6 +1394,44 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
                 13 => {
                     // Rdrand / Rdseed
                     cpu.exec_entropy(op.r0, op.w);
+                }
+                14 => {
+                    // Fldcw
+                    let cw = cpu.read_mem(cpu.faddr(op), 16) as u16;
+                    if !crate::emu::precise_faults()
+                        || crate::emu::FAULT_PENDING.with(|p| p.get().is_none())
+                    {
+                        crate::emu::regfile_ext::with_x87_mut(|st| {
+                            st.cw = crate::emu::xstate::control_word(cw);
+                        });
+                    }
+                }
+                15 => {
+                    // Xgetbv
+                    if cpu.gpr[1] as u32 != 0 {
+                        cpu.rip = op.ip;
+                        crate::emu::xstate::Fault::gp().dispatch(cpu, op.ip);
+                        return true;
+                    }
+                    cpu.gpr[0] = crate::emu::cpuid::XCR0.into();
+                    cpu.gpr[2] = 0;
+                    cpu.last_bits[0] = 64;
+                    cpu.last_bits[2] = 64;
+                }
+                16 => {
+                    // FXSAVE*/FXRSTOR*/XSAVE*/XRSTOR*
+                    let addr = cpu.faddr(op);
+                    if let Err(fault) = cpu.exec_xstate_mem(addr, op.w) {
+                        cpu.rip = op.ip;
+                        fault.dispatch(cpu, op.ip);
+                        return true;
+                    }
+                    if op.w & crate::emu::xstate::XS_FLAG_RESTORE != 0
+                        && crate::emu::denorm::software_mode(cpu.jx.mxcsr)
+                    {
+                        cpu.rip = op.ip.wrapping_add(op.len as u64);
+                        return true;
+                    }
                 }
 
                 _ => {}
@@ -1806,4 +1912,5 @@ pub(super) unsafe fn exec_ext_all_remaining(cpu: &mut Cpu, op: &FastOp) {
         }
         _ => {}
     }
+    false
 }
