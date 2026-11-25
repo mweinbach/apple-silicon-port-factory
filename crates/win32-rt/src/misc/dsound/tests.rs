@@ -1693,6 +1693,19 @@ fn dsound8_compressor_honors_attack_release_predelay_and_sample_rate() {
         (delayed - 0.05).abs() < 1e-4,
         "impulse should emerge after 48 samples (1 ms @ 48 kHz), got {delayed}"
     );
+
+    // 5. Default compressor (-20 dB threshold, 3:1 ratio, 0 dB gain) compresses sustained
+    //    0 dBFS input in the dB domain to -13.3333 dBFS (~0.21544 linear).
+    let mut fx_db = BufferEffect::new(DsFxKind::Compressor);
+    let mut settled = 0.0f32;
+    for _ in 0..8000 {
+        settled = fx_db.process_sample(1.0, 1.0, 48_000.0).0;
+    }
+    let expected_linear = 10.0f32.powf((-20.0 + 20.0 / 3.0) / 20.0);
+    assert!(
+        (settled - expected_linear).abs() < 1e-3,
+        "settled 3:1 compression at -20 dB threshold should be {expected_linear} (-13.33 dBFS), got {settled}"
+    );
 }
 
 #[test]
@@ -1784,4 +1797,28 @@ fn dsound8_echo_pan_delay_and_remaining_fx_parameters() {
         rms_hi > rms_lo * 5.0,
         "4 kHz tone should pass 4 kHz post-EQ/8 kHz pre-LP ({rms_hi}) much stronger than 300 Hz ({rms_lo})"
     );
+
+    // 4. Echo delay line dynamically resizes for mixer sample rates > 48 kHz:
+    //    a 2,000 ms delay at 96 kHz must produce its echo at exact frame 192,000 (not 95,999).
+    let mut echo_96k = BufferEffect::new(DsFxKind::Echo);
+    let mut raw_2s = Vec::with_capacity(20);
+    for f in [50.0f32, 0.0, 2000.0, 2000.0] {
+        raw_2s.extend_from_slice(&f.to_le_bytes());
+    }
+    raw_2s.extend_from_slice(&0i32.to_le_bytes());
+    echo_96k.params = raw_2s;
+    let mut at_95999 = 0.0f32;
+    let mut at_192000 = 0.0f32;
+    for i in 0..=192_000 {
+        let x = if i == 0 { 1.0 } else { 0.0 };
+        let (y, _) = echo_96k.process_sample(x, 0.0, 96_000.0);
+        if i == 95_999 {
+            at_95999 = y;
+        }
+        if i == 192_000 {
+            at_192000 = y;
+        }
+    }
+    assert!(at_95999.abs() < 1e-6, "echo at 96 kHz must not truncate at frame 95,999 (got {at_95999})");
+    assert!((at_192000 - 0.5).abs() < 1e-4, "2000 ms echo at 96 kHz must emerge at frame 192,000 (got {at_192000})");
 }

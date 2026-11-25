@@ -408,7 +408,7 @@ pub(super) struct BufferEffect {
 impl BufferEffect {
     pub(super) fn new(kind: DsFxKind) -> Self {
         let cap = match kind {
-            DsFxKind::Echo | DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => 96_000,
+            DsFxKind::Echo | DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => 96_001,
             DsFxKind::Chorus | DsFxKind::Flanger => 4_096,
             DsFxKind::Compressor => 1_024,
             _ => 0,
@@ -453,6 +453,29 @@ impl BufferEffect {
         self.param_u32(off) as i32
     }
 
+    /// Ensure the stereo delay ring holds at least `max_delay_samples` of history
+    /// (capacity >= `max_delay_samples + 1`), unwrapping existing circular history
+    /// cleanly when growing for higher primary sample rates.
+    fn ensure_delay_capacity(&mut self, max_delay_samples: usize) {
+        let needed = max_delay_samples.saturating_add(1);
+        let old_cap = self.delay_l.len();
+        if needed <= old_cap {
+            return;
+        }
+        let mut new_l = vec![0.0; needed];
+        let mut new_r = vec![0.0; needed];
+        if old_cap > 0 {
+            let tail = old_cap - self.delay_pos;
+            new_l[..tail].copy_from_slice(&self.delay_l[self.delay_pos..old_cap]);
+            new_l[tail..old_cap].copy_from_slice(&self.delay_l[..self.delay_pos]);
+            new_r[..tail].copy_from_slice(&self.delay_r[self.delay_pos..old_cap]);
+            new_r[tail..old_cap].copy_from_slice(&self.delay_r[..self.delay_pos]);
+        }
+        self.delay_l = new_l;
+        self.delay_r = new_r;
+        self.delay_pos = old_cap;
+    }
+
     /// Process one stereo sample through this DirectSound 8 software DSP effect.
     pub(super) fn process_sample(&mut self, l: f32, r: f32, sample_rate: f32) -> (f32, f32) {
         let sr = sample_rate.max(8_000.0);
@@ -460,10 +483,9 @@ impl BufferEffect {
             DsFxKind::Echo => {
                 let wet = (self.param_f32(0).clamp(0.0, 100.0)) * 0.01;
                 let fb = (self.param_f32(4).clamp(0.0, 99.0)) * 0.01;
-                let dl = ((self.param_f32(8).clamp(1.0, 2000.0) * 0.001 * sr) as usize)
-                    .clamp(1, self.delay_l.len().saturating_sub(1));
-                let dr = ((self.param_f32(12).clamp(1.0, 2000.0) * 0.001 * sr) as usize)
-                    .clamp(1, self.delay_r.len().saturating_sub(1));
+                let dl = ((self.param_f32(8).clamp(1.0, 2000.0) * 0.001 * sr).round() as usize).max(1);
+                let dr = ((self.param_f32(12).clamp(1.0, 2000.0) * 0.001 * sr).round() as usize).max(1);
+                self.ensure_delay_capacity(dl.max(dr));
                 let pan_delay = self.param_i32(16) != 0;
                 let cap = self.delay_l.len();
                 let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
@@ -496,14 +518,13 @@ impl BufferEffect {
                         (p * std::f32::consts::TAU).sin() * 0.5 + 0.5
                     }
                 };
-                let cap = self.delay_l.len();
                 let lfo_l = eval_lfo(self.phase);
                 let lfo_r = eval_lfo((self.phase + phase_diff).fract());
                 self.phase = (self.phase + freq / sr).fract();
-                let d_samp_l = ((base_ms * (0.5 + 0.5 * depth * lfo_l) * 0.001 * sr) as usize)
-                    .clamp(1, cap - 1);
-                let d_samp_r = ((base_ms * (0.5 + 0.5 * depth * lfo_r) * 0.001 * sr) as usize)
-                    .clamp(1, cap - 1);
+                let d_samp_l = ((base_ms * (0.5 + 0.5 * depth * lfo_l) * 0.001 * sr) as usize).max(1);
+                let d_samp_r = ((base_ms * (0.5 + 0.5 * depth * lfo_r) * 0.001 * sr) as usize).max(1);
+                self.ensure_delay_capacity(d_samp_l.max(d_samp_r));
+                let cap = self.delay_l.len();
                 let rl = self.delay_l[(self.delay_pos + cap - d_samp_l) % cap];
                 let rr = self.delay_r[(self.delay_pos + cap - d_samp_r) % cap];
                 self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
@@ -563,7 +584,7 @@ impl BufferEffect {
                 let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 60.0) / 20.0);
                 let attack_s = self.param_f32(4).clamp(0.01, 500.0) * 0.001;
                 let release_s = self.param_f32(8).clamp(50.0, 3000.0) * 0.001;
-                let thresh = 10.0f32.powf(self.param_f32(12).clamp(-60.0, 0.0) / 20.0);
+                let thresh_db = self.param_f32(12).clamp(-60.0, 0.0);
                 let ratio = self.param_f32(16).clamp(1.0, 100.0);
                 let predelay_ms = self.param_f32(20).clamp(0.0, 4.0);
                 let attack_coeff = (1.0 - (-1.0 / (attack_s * sr)).exp()).clamp(0.0, 1.0);
@@ -571,17 +592,23 @@ impl BufferEffect {
                 let peak = l.abs().max(r.abs());
                 let coeff = if peak > self.env { attack_coeff } else { release_coeff };
                 self.env += coeff * (peak - self.env);
-                let comp = if self.env > thresh && self.env > 1e-6 {
-                    (thresh + (self.env - thresh) / ratio) / self.env
+                // Apply compression ratio in the decibel domain per DirectSound DSFXCompressor.
+                let comp = if self.env > 1e-6 {
+                    let env_db = 20.0 * self.env.log10();
+                    if env_db > thresh_db {
+                        let out_db = thresh_db + (env_db - thresh_db) / ratio;
+                        10.0f32.powf((out_db - env_db) / 20.0)
+                    } else {
+                        1.0
+                    }
                 } else {
                     1.0
                 };
+                let predelay_samples = (predelay_ms * 0.001 * sr).round() as usize;
+                if predelay_samples > 0 {
+                    self.ensure_delay_capacity(predelay_samples);
+                }
                 let cap = self.delay_l.len();
-                let predelay_samples = if cap > 1 {
-                    ((predelay_ms * 0.001 * sr).round() as usize).min(cap - 1)
-                } else {
-                    0
-                };
                 let (sig_l, sig_r) = if predelay_samples > 0 {
                     let read_pos = (self.delay_pos + cap - predelay_samples) % cap;
                     let dl = self.delay_l[read_pos];
@@ -633,9 +660,10 @@ impl BufferEffect {
                 let wet = 10.0f32.powf(self.param_f32(4).clamp(-96.0, 0.0) / 20.0).min(1.0) * 0.5;
                 let decay_ms = self.param_f32(8).clamp(0.001, 3000.0);
                 let hf_ratio = self.param_f32(12).clamp(0.001, 0.999);
+                let dl = ((0.037 * sr).round() as usize).max(1);
+                let dr = ((0.041 * sr).round() as usize).max(1);
+                self.ensure_delay_capacity(dl.max(dr));
                 let cap = self.delay_l.len();
-                let dl = ((0.037 * sr) as usize).clamp(1, cap - 1);
-                let dr = ((0.041 * sr) as usize).clamp(1, cap - 1);
                 let fb = 10.0f32.powf((-3.0 * 37.0) / decay_ms.max(40.0)).clamp(0.0, 0.92);
                 let damp = (0.08 + 0.87 * hf_ratio).clamp(0.05, 0.98);
                 let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
@@ -662,11 +690,12 @@ impl BufferEffect {
                 let density = self.param_f32(40).clamp(0.0, 100.0) * 0.01;
                 let hf_ref = self.param_f32(44).clamp(20.0, 20_000.0);
 
-                let cap = self.delay_l.len();
-                let d_refl = ((refl_delay_s * sr).round() as usize).clamp(1, cap - 1);
+                let d_refl = ((refl_delay_s * sr).round() as usize).max(1);
                 let late_base_s = (refl_delay_s + reverb_delay_s + 0.025 + 0.012 * density).min(0.95);
-                let dl = ((late_base_s * sr).round() as usize).clamp(1, cap - 1);
-                let dr = (((late_base_s + 0.004) * sr).round() as usize).clamp(1, cap - 1);
+                let dl = ((late_base_s * sr).round() as usize).max(1);
+                let dr = (((late_base_s + 0.004) * sr).round() as usize).max(1);
+                self.ensure_delay_capacity(d_refl.max(dl).max(dr));
+                let cap = self.delay_l.len();
                 let fb = 10.0f32
                     .powf((-3.0 * (late_base_s * 1000.0)) / decay_ms.max(100.0))
                     .clamp(0.0, 0.92);
