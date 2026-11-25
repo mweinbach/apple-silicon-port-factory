@@ -2393,7 +2393,24 @@ pub unsafe extern "win64" fn GetLocaleInfoA(lcid: u32, lctype: u32, out: *mut u8
         set_err(err::ERROR_INVALID_FLAGS);
         return 0;
     };
-    let need = v.len() as i32 + 1;
+    const LOCALE_USE_CP_ACP: u32 = 0x4000_0000;
+    let cp = if (lctype & LOCALE_USE_CP_ACP) != 0 {
+        ACP
+    } else {
+        locale_info_for(&loc, 0x1004)
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&c| c != 0 && valid_cp(c))
+            .unwrap_or(ACP)
+    };
+    let encoded: Vec<u8> = if cp == 65001 {
+        v.into_bytes()
+    } else {
+        let units = to_wide(&v);
+        encode_utf16_to_cp(cp, &units, Some(b'?'))
+            .map(|(b, _)| b)
+            .unwrap_or_else(|_| v.into_bytes())
+    };
+    let need = encoded.len() as i32 + 1;
     if cap == 0 {
         return need;
     }
@@ -2401,7 +2418,10 @@ pub unsafe extern "win64" fn GetLocaleInfoA(lcid: u32, lctype: u32, out: *mut u8
         set_err(err::ERROR_INSUFFICIENT_BUFFER);
         return 0;
     }
-    write_ansi_buf(&v, out, cap as usize);
+    if !encoded.is_empty() {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), out, encoded.len());
+    }
+    *out.add(encoded.len()) = 0;
     need
 }
 
@@ -3265,12 +3285,23 @@ pub unsafe extern "win64" fn GetCalendarInfoEx(
         set_err(err::ERROR_INVALID_PARAMETER);
         return 0;
     };
-    let cal_id = if cal == 0 { 1 } else { cal }; // 1 = CAL_GREGORIAN
+    // Only Gregorian calendars (`CAL_GREGORIAN = 1`, `CAL_GREGORIAN_US = 2`) are backed here;
+    // reject non-Gregorian or unknown calendar IDs (e.g. `CAL_JAPAN = 3`) honestly with
+    // `ERROR_INVALID_PARAMETER` rather than returning fabricated Gregorian data.
+    let cal_loc: ResolvedLocale = match cal {
+        1 => loc,
+        2 => ResolvedLocale::en_us(),
+        _ => {
+            set_err(err::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    };
+    let cal_id = cal;
     let return_num = (ty & CAL_RETURN_NUMBER) != 0;
     let base = ty & 0xFFFF;
     let era_str = || -> String {
         if let Some(a) = icu::api() {
-            let cloc = icu::c_str(if loc.invariant { "en_US" } else { &loc.icu_id });
+            let cloc = icu::c_str(if cal_loc.invariant { "en_US" } else { &cal_loc.icu_id });
             let mut st = 0i32;
             let df = (a.udat_open)(icu::UDAT_NONE, icu::UDAT_SHORT, cloc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0, &mut st);
             if !df.is_null() && st <= 0 {
@@ -3289,20 +3320,20 @@ pub unsafe extern "win64" fn GetCalendarInfoEx(
         0x02 => "Gregorian Calendar".into(),                             // CAL_SCALNAME
         0x03 => "0".into(),                                              // CAL_IYEAROFFSETRANGE
         0x04 => era_str(),                                               // CAL_SERASTRING
-        0x05 => locale_info_for(&loc, 0x1F).unwrap_or_else(|| "M/d/yyyy".into()), // CAL_SSHORTDATE
-        0x06 => locale_info_for(&loc, 0x20).unwrap_or_else(|| "dddd, MMMM d, yyyy".into()), // CAL_SLONGDATE
-        0x07..=0x0D => locale_info_for(&loc, 0x2A + (base - 0x07)).unwrap_or_default(), // CAL_SDAYNAME1..7
-        0x0E..=0x14 => locale_info_for(&loc, 0x31 + (base - 0x0E)).unwrap_or_default(), // CAL_SABBREVDAYNAME1..7
-        0x15..=0x20 => locale_info_for(&loc, 0x38 + (base - 0x15)).unwrap_or_default(), // CAL_SMONTHNAME1..12
+        0x05 => locale_info_for(&cal_loc, 0x1F).unwrap_or_else(|| "M/d/yyyy".into()), // CAL_SSHORTDATE
+        0x06 => locale_info_for(&cal_loc, 0x20).unwrap_or_else(|| "dddd, MMMM d, yyyy".into()), // CAL_SLONGDATE
+        0x07..=0x0D => locale_info_for(&cal_loc, 0x2A + (base - 0x07)).unwrap_or_default(), // CAL_SDAYNAME1..7
+        0x0E..=0x14 => locale_info_for(&cal_loc, 0x31 + (base - 0x0E)).unwrap_or_default(), // CAL_SABBREVDAYNAME1..7
+        0x15..=0x20 => locale_info_for(&cal_loc, 0x38 + (base - 0x15)).unwrap_or_default(), // CAL_SMONTHNAME1..12
         0x21 => String::new(),                                           // CAL_SMONTHNAME13 (Gregorian has 12)
-        0x22..=0x2D => locale_info_for(&loc, 0x44 + (base - 0x22)).unwrap_or_default(), // CAL_SABBREVMONTHNAME1..12
+        0x22..=0x2D => locale_info_for(&cal_loc, 0x44 + (base - 0x22)).unwrap_or_default(), // CAL_SABBREVMONTHNAME1..12
         0x2E => String::new(),                                           // CAL_SABBREVMONTHNAME13
-        0x2F => locale_info_for(&loc, 0x1006).unwrap_or_else(|| "MMMM yyyy".into()), // CAL_SYEARMONTH
+        0x2F => locale_info_for(&cal_loc, 0x1006).unwrap_or_else(|| "MMMM yyyy".into()), // CAL_SYEARMONTH
         0x30 => "2049".into(),                                           // CAL_ITWODIGITYEARMAX
-        0x31..=0x37 => locale_info_for(&loc, 0x60 + (base - 0x31)).unwrap_or_default(), // CAL_SSHORTESTDAYNAME1..7
-        0x38 => locale_info_for(&loc, 0x78).unwrap_or_else(|| "MMMM d".into()), // CAL_SMONTHDAY
+        0x31..=0x37 => locale_info_for(&cal_loc, 0x60 + (base - 0x31)).unwrap_or_default(), // CAL_SSHORTESTDAYNAME1..7
+        0x38 => locale_info_for(&cal_loc, 0x78).unwrap_or_else(|| "MMMM d".into()), // CAL_SMONTHDAY
         0x39 => era_str(),                                               // CAL_SABBREVERASTRING
-        0x3A => locale_info_for(&loc, 0x7C).unwrap_or_else(|| "MMMM d, yyyy".into()), // CAL_SRELATIVELONGDATE
+        0x3A => locale_info_for(&cal_loc, 0x7C).unwrap_or_else(|| "MMMM d, yyyy".into()), // CAL_SRELATIVELONGDATE
         0x3B => "A.D.".into(),                                           // CAL_SENGLISHERANAME
         0x3C => "AD".into(),                                             // CAL_SENGLISHABBREVERANAME
         _ => {
@@ -4079,6 +4110,16 @@ mod tests {
 
             // LOCALE_FONTSIGNATURE (0x58) returns 16 WCHARs
             assert_eq!(GetLocaleInfoW(0x0409, 0x58, buf.as_mut_ptr(), 128), 16);
+
+            // GetLocaleInfoA encodes with the locale's default ANSI code page unless LOCALE_USE_CP_ACP.
+            let mut abuf = [0u8; 8];
+            assert_eq!(GetLocaleInfoA(0x0407, 0x14, std::ptr::null_mut(), 0), 2); // CP1252 "€\0"
+            assert_eq!(GetLocaleInfoA(0x0407, 0x14, abuf.as_mut_ptr(), 2), 2);
+            assert_eq!(&abuf[..2], &[0x80, 0x00]);
+            // With LOCALE_USE_CP_ACP (0x4000_0000), uses ACP (UTF-8 = 4 bytes "E2 82 AC 00").
+            assert_eq!(GetLocaleInfoA(0x0407, 0x14 | 0x4000_0000, std::ptr::null_mut(), 0), 4);
+            assert_eq!(GetLocaleInfoA(0x0407, 0x14 | 0x4000_0000, abuf.as_mut_ptr(), 4), 4);
+            assert_eq!(&abuf[..4], &[0xE2, 0x82, 0xAC, 0x00]);
         }
     }
 
@@ -4185,6 +4226,17 @@ mod tests {
             // Invalid CALTYPE returns 0 + ERROR_INVALID_FLAGS
             assert_eq!(GetCalendarInfoEx(de.as_ptr(), 1, std::ptr::null(), 0x999, buf.as_mut_ptr(), 128, std::ptr::null_mut()), 0);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_FLAGS);
+
+            // CAL_GREGORIAN_US (2) returns US English Gregorian names.
+            assert!(GetCalendarInfoEx(de.as_ptr(), 2, std::ptr::null(), 0x07, buf.as_mut_ptr(), 128, std::ptr::null_mut()) > 0);
+            assert_eq!(from_wide(buf.as_ptr()), "Monday");
+
+            // Non-Gregorian calendars (e.g. CAL_JAPAN = 3) are rejected honestly with ERROR_INVALID_PARAMETER.
+            let ja = to_wide_z("ja-JP");
+            assert_eq!(GetCalendarInfoEx(ja.as_ptr(), 3, std::ptr::null(), 0x02, buf.as_mut_ptr(), 128, std::ptr::null_mut()), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
+            assert_eq!(GetCalendarInfoEx(de.as_ptr(), 0, std::ptr::null(), 0x02, buf.as_mut_ptr(), 128, std::ptr::null_mut()), 0);
+            assert_eq!(teb::last_error(), err::ERROR_INVALID_PARAMETER);
         }
     }
 
