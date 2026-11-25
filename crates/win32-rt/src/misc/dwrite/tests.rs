@@ -3041,3 +3041,227 @@ fn text_analyzer_forwards_locale_to_coretext_shaping() {
         release_com(fac);
     }
 }
+
+#[test]
+fn gdi_compatible_glyph_placements_honors_transform() {
+    use super::analysis::{ta_get_gdi_compatible_glyph_placements, ta_get_glyphs, PTextAnalyzer};
+
+    unsafe {
+        let ttf_bytes = build_synthetic_ttf();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "win32_rt_dwrite_gdi_xform_{}.ttf",
+            std::process::id()
+        ));
+        fs::write(&tmp_path, &ttf_bytes).expect("write synthetic ttf");
+
+        let mut fac: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED,
+                &IID_IDWRITE_FACTORY as *const GUID as *const u8,
+                &mut fac,
+            ),
+            S_OK
+        );
+        let mut ffile: *mut c_void = std::ptr::null_mut();
+        let wpath = wide(&tmp_path.to_string_lossy());
+        assert_eq!(
+            fac_create_font_file_reference(fac as PFactory, wpath.as_ptr(), std::ptr::null(), &mut ffile),
+            S_OK
+        );
+        let mut face: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            fac_create_font_face(
+                fac as PFactory,
+                DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                1,
+                &ffile,
+                0,
+                DWRITE_FONT_SIMULATIONS_NONE,
+                &mut face,
+            ),
+            S_OK
+        );
+        let mut ta: *mut c_void = std::ptr::null_mut();
+        assert_eq!(fac_create_text_analyzer(fac as PFactory, &mut ta), S_OK);
+
+        // Synthetic 'A' (gid 1) has advanceWidth = 720 / 1000 upem -> 14.4 DIPs at em_size = 20.0.
+        let text = [b'A' as u16];
+        let gids = [1u16];
+        let cm = [0u16];
+        let tp = [DWRITE_SHAPING_TEXT_PROPERTIES::default()];
+        let gp = [DWRITE_SHAPING_GLYPH_PROPERTIES::default()];
+
+        let measure = |use_text: bool, xform: Option<DWRITE_MATRIX>| -> (HRESULT, f32) {
+            let mut adv = [0.0f32; 1];
+            let mut off = [DWRITE_GLYPH_OFFSET::default(); 1];
+            let xform_ptr = xform
+                .as_ref()
+                .map_or(std::ptr::null(), |m| m as *const DWRITE_MATRIX);
+            let hr = ta_get_gdi_compatible_glyph_placements(
+                ta as PTextAnalyzer,
+                if use_text { text.as_ptr() } else { std::ptr::null() },
+                cm.as_ptr(),
+                tp.as_ptr(),
+                if use_text { 1 } else { 0 },
+                gids.as_ptr(),
+                gp.as_ptr(),
+                1,
+                face,
+                20.0f32.to_bits(),
+                1.0f32.to_bits(),
+                xform_ptr,
+                FALSE, // GDI classic
+                FALSE,
+                FALSE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                adv.as_mut_ptr(),
+                off.as_mut_ptr(),
+            );
+            (hr, adv[0])
+        };
+
+        // Test both the CoreText path (`use_text = true`) and the nominal-metrics fallback (`use_text = false`).
+        for use_text in [true, false] {
+            // 1. Identity / NULL transform: round(14.4 * 1.0) / 1.0 = 14.0 DIPs.
+            let (hr, adv_id) = measure(use_text, None);
+            assert_eq!(hr, S_OK);
+            assert!((adv_id - 14.0).abs() < 1e-4, "use_text={use_text}: expected 14.0, got {adv_id}");
+
+            // 2. 2x scaling transform: round(14.4 * 2.0) / 2.0 = 29.0 / 2.0 = 14.5 DIPs (= 29.0 dev px).
+            let scale2 = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_2x) = measure(use_text, Some(scale2));
+            assert_eq!(hr, S_OK);
+            assert!((adv_2x - 14.5).abs() < 1e-4, "use_text={use_text}: expected 14.5, got {adv_2x}");
+
+            // 3. Non-uniform 1.5x X scaling: round(14.4 * 1.5) / 1.5 = 22.0 / 1.5 DIPs (= 22.0 dev px).
+            let scale_nonunif = DWRITE_MATRIX { m11: 1.5, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_15x) = measure(use_text, Some(scale_nonunif));
+            assert_eq!(hr, S_OK);
+            assert!(
+                (adv_15x * 1.5 - 22.0).abs() < 1e-4,
+                "use_text={use_text}: expected adv*1.5 == 22.0, got {}",
+                adv_15x * 1.5
+            );
+
+            // 4. 90-degree rotation + 2x scale: advance-axis scale hypot(0, 2) = 2.0 -> 14.5 DIPs.
+            let rot2 = DWRITE_MATRIX { m11: 0.0, m12: 2.0, m21: -2.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+            let (hr, adv_rot2) = measure(use_text, Some(rot2));
+            assert_eq!(hr, S_OK);
+            assert!((adv_rot2 - 14.5).abs() < 1e-4, "use_text={use_text}: expected 14.5, got {adv_rot2}");
+        }
+
+        // 5. Invalid (NaN) and singular (zero determinant) transforms are rejected with E_INVALIDARG.
+        let nan_m = DWRITE_MATRIX { m11: f32::NAN, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 };
+        assert_eq!(measure(true, Some(nan_m)).0, E_INVALIDARG);
+        let zero_m = DWRITE_MATRIX { m11: 0.0, m12: 0.0, m21: 0.0, m22: 0.0, dx: 0.0, dy: 0.0 };
+        assert_eq!(measure(true, Some(zero_m)).0, E_INVALIDARG);
+
+        // 6. Real system font through CoreText: 2x transform snaps to 0.5-DIP (1-device-px) increments.
+        let sfns_path = "/System/Library/Fonts/SFNS.ttf";
+        if std::path::Path::new(sfns_path).exists() {
+            let mut sfile: *mut c_void = std::ptr::null_mut();
+            let sw = wide(sfns_path);
+            assert_eq!(
+                fac_create_font_file_reference(fac as PFactory, sw.as_ptr(), std::ptr::null(), &mut sfile),
+                S_OK
+            );
+            let mut sface: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                fac_create_font_face(
+                    fac as PFactory,
+                    DWRITE_FONT_FACE_TYPE_TRUETYPE,
+                    1,
+                    &sfile,
+                    0,
+                    DWRITE_FONT_SIMULATIONS_NONE,
+                    &mut sface,
+                ),
+                S_OK
+            );
+            let sample: Vec<u16> = "Hello, world! 0123456789".encode_utf16().collect();
+            let mut scm = vec![0u16; sample.len()];
+            let mut stp = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); sample.len()];
+            let mut sgi = vec![0u16; sample.len() * 2];
+            let mut sgp = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); sample.len() * 2];
+            let mut sactual = 0u32;
+            assert_eq!(
+                ta_get_glyphs(
+                    ta as PTextAnalyzer,
+                    sample.as_ptr(),
+                    sample.len() as u32,
+                    sface,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    sgi.len() as u32,
+                    scm.as_mut_ptr(),
+                    stp.as_mut_ptr(),
+                    sgi.as_mut_ptr(),
+                    sgp.as_mut_ptr(),
+                    &mut sactual,
+                ),
+                S_OK
+            );
+            let n = sactual as usize;
+            let mut sadv = vec![0.0f32; n];
+            let mut soff = vec![DWRITE_GLYPH_OFFSET::default(); n];
+            let scale2 = DWRITE_MATRIX { m11: 2.0, m12: 0.0, m21: 0.0, m22: 2.0, dx: 0.0, dy: 0.0 };
+            assert_eq!(
+                ta_get_gdi_compatible_glyph_placements(
+                    ta as PTextAnalyzer,
+                    sample.as_ptr(),
+                    scm.as_ptr(),
+                    stp.as_ptr(),
+                    sample.len() as u32,
+                    sgi.as_ptr(),
+                    sgp.as_ptr(),
+                    sactual,
+                    sface,
+                    17.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    &scale2,
+                    FALSE,
+                    FALSE,
+                    FALSE,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    sadv.as_mut_ptr(),
+                    soff.as_mut_ptr(),
+                ),
+                S_OK
+            );
+            for &a in &sadv {
+                assert!(
+                    (a * 2.0 - (a * 2.0).round()).abs() < 1e-4,
+                    "expected transformed device-pixel integer advance, got {a} (a*2={})",
+                    a * 2.0
+                );
+            }
+            assert!(
+                sadv.iter().any(|&a| (a - a.round()).abs() > 0.25),
+                "expected at least one 0.5-DIP glyph advance under 2x transform in {sadv:?}"
+            );
+            release_com(sface);
+            release_com(sfile);
+        }
+
+        release_com(ta);
+        release_com(face);
+        release_com(ffile);
+        release_com(fac);
+        let _ = fs::remove_file(&tmp_path);
+    }
+}

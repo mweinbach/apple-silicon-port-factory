@@ -1363,7 +1363,7 @@ unsafe fn try_position_glyphs_platform(
     features: *const *const c_void,
     feature_range_lengths: *const u32,
     feature_ranges: u32,
-    snap_ppd: Option<f32>,
+    gdi_snap: Option<(f32, f32)>,
     glyph_advances: *mut f32,
     glyph_offsets: *mut DWRITE_GLYPH_OFFSET,
 ) -> Option<HRESULT> {
@@ -1412,11 +1412,14 @@ unsafe fn try_position_glyphs_platform(
         {
             for (i, g) in shaped.glyphs.iter().enumerate() {
                 let mut adv = g.advance;
-                if let Some(ppd) = snap_ppd {
-                    adv = (adv * ppd).round() / ppd;
+                let mut off = g.offset;
+                if let Some((snap_x, snap_y)) = gdi_snap {
+                    adv = (adv * snap_x).round() / snap_x;
+                    off.advanceOffset = (off.advanceOffset * snap_x).round() / snap_x;
+                    off.ascenderOffset = (off.ascenderOffset * snap_y).round() / snap_y;
                 }
                 glyph_advances.add(i).write_unaligned(adv);
-                glyph_offsets.add(i).write_unaligned(g.offset);
+                glyph_offsets.add(i).write_unaligned(off);
             }
             return Some(S_OK);
         }
@@ -1521,7 +1524,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     font_face: *mut c_void,
     font_em_size_bits: u32,
     pixels_per_dip_bits: u32,
-    _transform: *const DWRITE_MATRIX,
+    transform: *const DWRITE_MATRIX,
     use_gdi_natural: BOOL,
     is_sideways: BOOL,
     is_rtl: BOOL,
@@ -1547,10 +1550,35 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
     if !em_size.is_finite() || em_size < 0.0 || !ppd.is_finite() || ppd <= 0.0 {
         return E_INVALIDARG;
     }
+    // `transform` applies after font-size and `pixelsPerDip` scaling: a local displacement
+    // `(adv, 0)` along the run's advance axis maps to `(adv * m11 * ppd, adv * m12 * ppd)`
+    // in device pixels (scale `hypot(m11, m12)`), and `(0, asc)` along the ascender axis
+    // maps with scale `hypot(m21, m22)`.
+    let m = if transform.is_null() {
+        DWRITE_MATRIX::default()
+    } else {
+        let m = transform.read_unaligned();
+        if !m.m11.is_finite() || !m.m12.is_finite() || !m.m21.is_finite() || !m.m22.is_finite() {
+            return E_INVALIDARG;
+        }
+        m
+    };
+    let det = (m.m11 as f64) * (m.m22 as f64) - (m.m12 as f64) * (m.m21 as f64);
+    let eff_ppd_x = ppd * m.m11.hypot(m.m12);
+    let eff_ppd_y = ppd * m.m21.hypot(m.m22);
+    if !det.is_finite()
+        || det == 0.0
+        || !eff_ppd_x.is_finite()
+        || eff_ppd_x <= 0.0
+        || !eff_ppd_y.is_finite()
+        || eff_ppd_y <= 0.0
+    {
+        return E_INVALIDARG;
+    }
+    let gdi_snap = (use_gdi_natural == FALSE).then_some((eff_ppd_x, eff_ppd_y));
     let no_visual = !script_analysis.is_null() && (script_analysis.read_unaligned().shapes & 1) != 0;
     let sideways = is_sideways != FALSE;
     if !sideways {
-        let snap_ppd = (use_gdi_natural == FALSE).then_some(ppd);
         if let Some(hr) = try_position_glyphs_platform(
             &face,
             text_string,
@@ -1564,7 +1592,7 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
             features,
             feature_range_lengths,
             feature_ranges,
-            snap_ppd,
+            gdi_snap,
             glyph_advances,
             glyph_offsets,
         ) {
@@ -1580,8 +1608,8 @@ pub(super) unsafe extern "win64" fn ta_get_gdi_compatible_glyph_placements(
         } else {
             face.scaled_advance(gid, em_size)
         };
-        if use_gdi_natural == FALSE {
-            adv = (adv * ppd).round() / ppd;
+        if let Some((snap_x, _)) = gdi_snap {
+            adv = (adv * snap_x).round() / snap_x;
         }
         glyph_advances.add(i).write_unaligned(adv);
         glyph_offsets.add(i).write_unaligned(DWRITE_GLYPH_OFFSET::default());
