@@ -563,7 +563,13 @@ fn open_named_system_store(store_name: &str) -> *mut c_void {
                 }
             }
         }
+        let excluded_spkis = super::chain::macos_excluded_root_spkis();
         for der in WEBPKI_ROOT_CERTS_DER.iter() {
+            if super::asn1::parse_cert_der_parts(der)
+                .is_some_and(|p| super::chain::spki_is_excluded(p.spki_inner, excluded_spkis))
+            {
+                continue;
+            }
             if let Some(owned) = wintrust::build_owned_cert_context(der, id as *mut c_void) {
                 let key = owned.spki_raw_der().to_vec();
                 if seen_subjects.insert(key) {

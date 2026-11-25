@@ -816,22 +816,32 @@ pub(super) fn macos_system_roots_der() -> &'static [Vec<u8>] {
     &macos_roots_and_exclusions().0
 }
 
+pub(super) fn macos_excluded_root_spkis() -> &'static [Vec<u8>] {
+    static EXCLUDED_SPKIS: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
+        macos_roots_and_exclusions()
+            .1
+            .iter()
+            .filter_map(|der| parse_cert_der_parts(der).map(|p| p.spki_inner.to_vec()))
+            .collect()
+    });
+    &EXCLUDED_SPKIS
+}
+
+#[inline]
+pub(super) fn spki_is_excluded(spki_inner: &[u8], excluded_spkis: &[Vec<u8>]) -> bool {
+    !excluded_spkis.is_empty()
+        && excluded_spkis
+            .iter()
+            .any(|spki| spki.as_slice() == spki_inner)
+}
+
 fn combined_default_root_store() -> Arc<rustls::RootCertStore> {
     static COMBINED: LazyLock<Arc<rustls::RootCertStore>> = LazyLock::new(|| {
-        let (macos_roots, excluded_der) = macos_roots_and_exclusions();
-        let excluded_spkis: Vec<Vec<u8>> = excluded_der
-            .iter()
-            .filter_map(|der| {
-                parse_cert_der_parts(der).map(|p| p.spki_inner.to_vec())
-            })
-            .collect();
+        let macos_roots = macos_system_roots_der();
+        let excluded_spkis = macos_excluded_root_spkis();
         let mut s = rustls::RootCertStore::empty();
         for ta in webpki_roots::TLS_SERVER_ROOTS.iter() {
-            if !excluded_spkis.is_empty()
-                && excluded_spkis
-                    .iter()
-                    .any(|spki| spki.as_slice() == ta.subject_public_key_info.as_ref())
-            {
+            if spki_is_excluded(ta.subject_public_key_info.as_ref(), excluded_spkis) {
                 continue;
             }
             s.roots.push(ta.clone());
@@ -1058,7 +1068,7 @@ pub(super) fn verify_cert_sig_with_spki(
 /// without requiring TLS `serverAuth` EKU (used by `CERT_CHAIN_POLICY_BASE` and
 /// `CERT_CHAIN_POLICY_AUTHENTICODE`).
 /// Verified cryptographic chain endpoints returned by `verify_chain_to_root`.
-struct VerifiedChainEndpoints {
+pub(super) struct VerifiedChainEndpoints {
     /// Inner DER bytes of the terminating trusted root's `SubjectPublicKeyInfo` (without outer 0x30 tag/len).
     root_spki_inner: Vec<u8>,
     /// Inner DER bytes of the issuing CA's `SubjectPublicKeyInfo` that cryptographically signed
@@ -1220,15 +1230,36 @@ fn verify_chain_to_root_with_eku(
     extra_roots_der: &[Vec<u8>],
     required_eku: Option<&[u8]>,
 ) -> Option<VerifiedChainEndpoints> {
+    verify_chain_to_root_with_eku_and_exclusions(
+        chain_der,
+        exclusive_roots_der,
+        extra_roots_der,
+        required_eku,
+        macos_excluded_root_spkis(),
+    )
+}
+
+pub(super) fn verify_chain_to_root_with_eku_and_exclusions(
+    chain_der: &[Vec<u8>],
+    exclusive_roots_der: Option<&[Vec<u8>]>,
+    extra_roots_der: &[Vec<u8>],
+    required_eku: Option<&[u8]>,
+    excluded_spkis: &[Vec<u8>],
+) -> Option<VerifiedChainEndpoints> {
     if chain_der.is_empty() {
         return None;
     }
     // Collect candidate trust anchors as (subject_inner, spki_inner, spki_alg_inner, spki_key_bits).
     let mut root_parts: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
-    let push_root_der = |dst: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>, der: &[u8]| {
+    let push_root_der = |dst: &mut Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
+                         der: &[u8],
+                         filter_excluded: bool| {
         if let Some(p) = parse_cert_der_parts(der) {
             // Do not bypass NameConstraints or unknown critical extensions on trust anchors.
             if cert_has_unhandled_constraints(&p) {
+                return;
+            }
+            if filter_excluded && spki_is_excluded(p.spki_inner, excluded_spkis) {
                 return;
             }
             dst.push((
@@ -1241,17 +1272,19 @@ fn verify_chain_to_root_with_eku(
     };
     if let Some(excl) = exclusive_roots_der {
         for der in excl {
-            push_root_der(&mut root_parts, der);
+            push_root_der(&mut root_parts, der, false);
         }
     } else {
         for der in extra_roots_der {
-            push_root_der(&mut root_parts, der);
+            push_root_der(&mut root_parts, der, false);
         }
         for der in macos_system_roots_der() {
-            push_root_der(&mut root_parts, der);
+            push_root_der(&mut root_parts, der, true);
         }
         for ta in webpki_roots::TLS_SERVER_ROOTS {
-            if ta.name_constraints.is_some() {
+            if ta.name_constraints.is_some()
+                || spki_is_excluded(ta.subject_public_key_info.as_ref(), excluded_spkis)
+            {
                 continue;
             }
             if let Ok(kids) = der_item_children(ta.subject_public_key_info.as_ref()).ok_or(()) {

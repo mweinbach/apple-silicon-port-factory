@@ -6598,3 +6598,67 @@ fn pkcs_attributes_encoder_canonically_sorts_attribute_and_value_sets() {
         );
     }
 }
+
+#[test]
+fn verify_chain_to_root_respects_macos_trust_exclusions() {
+    let tlv = super::asn1::encode_der_tlv;
+    let ta = webpki_roots::TLS_SERVER_ROOTS
+        .iter()
+        .find(|t| {
+            t.name_constraints.is_none()
+                && !super::chain::spki_is_excluded(
+                    t.subject_public_key_info.as_ref(),
+                    super::chain::macos_excluded_root_spkis(),
+                )
+        })
+        .expect("at least one unconstrained non-excluded webpki root");
+
+    // Synthesize a minimal DER certificate carrying the exact Subject DN and SPKI of `ta`.
+    let alg = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+    let dn = tlv(0x30, ta.subject.as_ref());
+    let validity = tlv(
+        0x30,
+        &[tlv(0x17, b"200101000000Z"), tlv(0x17, b"400101000000Z")].concat(),
+    );
+    let spki = tlv(0x30, ta.subject_public_key_info.as_ref());
+    let mut tbs = Vec::new();
+    tbs.extend_from_slice(&tlv(0xA0, &tlv(0x02, &[0x02])));
+    tbs.extend_from_slice(&tlv(0x02, &[0x01]));
+    tbs.extend_from_slice(&alg);
+    tbs.extend_from_slice(&dn);
+    tbs.extend_from_slice(&validity);
+    tbs.extend_from_slice(&dn);
+    tbs.extend_from_slice(&spki);
+    let root_der = tlv(
+        0x30,
+        &[tlv(0x30, &tbs), alg, tlv(0x03, &[0x00, 0x01])].concat(),
+    );
+
+    // Without exclusion, the signature-chain fallback accepts the webpki root anchor.
+    assert!(
+        super::chain::verify_chain_to_root_with_eku_and_exclusions(
+            std::slice::from_ref(&root_der),
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .is_some(),
+        "unexcluded webpki root must match default signature-chain fallback"
+    );
+
+    // When macOS user/admin trust settings deny or restrict that root's SPKI, the fallback
+    // MUST exclude it instead of re-adding it from webpki_roots::TLS_SERVER_ROOTS.
+    let excluded = vec![ta.subject_public_key_info.as_ref().to_vec()];
+    assert!(
+        super::chain::verify_chain_to_root_with_eku_and_exclusions(
+            std::slice::from_ref(&root_der),
+            None,
+            &[],
+            None,
+            &excluded,
+        )
+        .is_none(),
+        "excluded webpki root SPKI must not be re-admitted by verify_chain_to_root fallback"
+    );
+}
