@@ -1622,7 +1622,7 @@ pub(super) unsafe extern "win64" fn sv_submit_source_buffer(
         (Vec::new(), 0usize)
     } else {
         let raw = std::slice::from_raw_parts(b.audio_data, b.audio_bytes as usize);
-        decode_pcm_to_f32(fmt, raw)
+        decode_pcm_to_f32(&fmt, raw)
     };
 
     let play_begin = (b.play_begin as usize).min(total_frames);

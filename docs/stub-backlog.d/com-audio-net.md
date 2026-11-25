@@ -1,0 +1,54 @@
+# Stubs 7: COM/OLE, Audio, Winsock, libcurl and DbgHelp (`stubs/com-audio-net`)
+
+Scope: **37** stub sites across 7 DLLs (`ole32.dll`, `dbghelp.dll`, `mmdevapi.dll`, `dsound.dll`, `xaudio2_9redist.dll`, `ws2_32.dll`, `libcurl.dll`) reduced from **37 → 0** (**34 made real**, **3 native-unsupported matching Windows without the feature**, **0 leftovers**).
+
+## Made Real (34 sites)
+
+| DLL!API | File | Implementation Summary |
+|---|---|---|
+| `ole32.dll!IPropertyValue::GetDateTime` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.DateTime` (`i64` UniversalTime). |
+| `ole32.dll!IPropertyValue::GetTimeSpan` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.TimeSpan` (`i64` Duration). |
+| `ole32.dll!IPropertyValue::GetPoint` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Point` (`{ f32, f32 }`). |
+| `ole32.dll!IPropertyValue::GetSize` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Size` (`{ f32, f32 }`). |
+| `ole32.dll!IPropertyValue::GetRect` | `crates/win32-rt/src/misc/ole32.rs` | Stores and returns WinRT `Windows.Foundation.Rect` (`{ f32, f32, f32, f32 }`). |
+| `ole32.dll!IPropertyValue::Get*Array` (19 types) | `crates/win32-rt/src/misc/ole32.rs` | CoTaskMem-allocated array getters for all 19 WinRT `PropertyType` array variants (`UInt8Array`..`RectArray`), duplicating `HSTRING`s and `AddRef`ing `IInspectable*` elements. |
+| `ole32.dll!IPropertyValueStatics::CreateDateTime` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::DateTime`. |
+| `ole32.dll!IPropertyValueStatics::CreateTimeSpan` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::TimeSpan`. |
+| `ole32.dll!IPropertyValueStatics::CreatePoint` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Point` (with Win64 XMM ABI bridge). |
+| `ole32.dll!IPropertyValueStatics::CreateSize` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Size` (with Win64 XMM ABI bridge). |
+| `ole32.dll!IPropertyValueStatics::CreateRect` | `crates/win32-rt/src/misc/ole32.rs` | Constructs `IPropertyValue` with `PropertyType::Rect`. |
+| `ole32.dll!IPropertyValueStatics::Create*Array` (19 types) | `crates/win32-rt/src/misc/ole32.rs` | Copies input slices into retained `PropertyValue` array variants (`BooleanArray` normalized, `StringArray` duplicated, `InspectableArray` `AddRef`/`Release`-managed). |
+| `dbghelp.dll!StackWalk64` | `crates/win32-rt/src/misc/dbghelp.rs` | Unwinds x64 frames via `crate::unwind::safe_virtual_unwind` (`.pdata`), supporting `ReadMemoryRoutine`, `FunctionTableAccessRoutine`, `GetModuleBaseRoutine`, and leaf-frame `[RSP]` fallback. |
+| `dbghelp.dll!MiniDumpWriteDump` | `crates/win32-rt/src/misc/dbghelp.rs` | Emits valid Microsoft `MDMP` (`0x504D444D`) files via `WriteFile` with `SystemInfoStream`, `MiscInfoStream`, `ModuleListStream` (PE timestamp/checksum/RSDS CodeView), `ThreadListStream`, `MemoryListStream`, optional `ExceptionStream`, and user streams. |
+| `dbghelp.dll!SymGetLineFromAddr64` | `crates/win32-rt/src/misc/dbghelp.rs` | Pure-Rust MSF 7.0 + `/names` + DBI + CodeView C13 (`DEBUG_S_FILECHKSMS` / `DEBUG_S_LINES`) PDB reader; returns `ERROR_MOD_NOT_FOUND` (126) / `ERROR_INVALID_ADDRESS` (487) when absent. |
+| `dbghelp.dll!SymGetLineFromAddrW64` | `crates/win32-rt/src/misc/dbghelp.rs` | Wide UTF-16 wrapper backed by the same MSF 7.0 / C13 PDB reader. |
+| `mmdevapi.dll!IMMDevice::Activate` | `crates/win32-rt/src/audio/mmdevapi.rs` | Implemented `IAudioEndpointVolume` (21-slot COM vtable backed by CoreAudio HAL `VirtualMainVolume`/`VolumeScalar`/`Mute`/`VolumeRangeDecibels` on macOS, atomic fallback on Null/iOS); unknown IIDs return standard COM `E_NOINTERFACE`. |
+| `mmdevapi.dll!IAudioClient::GetService` | `crates/win32-rt/src/audio/audioclient.rs` | Implemented `IAudioClock2`, `ISimpleAudioVolume`, `IAudioStreamVolume` (per-channel gain applied live in `submit()`), and `IAudioSessionControl`/`2`; unknown IIDs return `E_NOINTERFACE`. |
+| `mmdevapi.dll!IAudioClient2::GetBufferSizeLimits` | `crates/win32-rt/src/audio/audioclient.rs` | Validates format and out-pointers and computes real shared-mode min/max buffer duration bounds (`MIN_PERIOD_HNS` / `DEFAULT_PERIOD_HNS` to `20_000_000` hns). |
+| `mmdevapi.dll!IAudioClient::Initialize(LOOPBACK)` | `crates/win32-rt/src/audio/audioclient.rs` | Real loopback capture via macOS 14.2+ CoreAudio Process Tap (`AudioHardwareCreateProcessTap` + private aggregate device + `IOProc`, dynamically resolved) with automatic fallback to an in-process per-endpoint WASAPI render loopback bus. |
+| `mmdevapi.dll!ISpatialAudioObjectRenderStream::GetService` | `crates/win32-rt/src/audio/spatial.rs` | Implemented `IAudioClock`, `IAudioClock2`, `ISimpleAudioVolume`, `IAudioStreamVolume` (applied live in `EndUpdatingAudioObjects`), and `IAudioSessionControl`/`2`; unknown IIDs return `E_NOINTERFACE`. |
+| `dsound.dll!IDirectSoundBuffer8::SetFX` | `crates/win32-rt/src/misc/dsound/com_vtbl.rs` | Full DirectSound 8 software DSP chain (`SetFX`, `AcquireResources`, `GetObjectInPath`) for all 9 standard effects (`Gargle`, `Chorus`, `Flanger`, `Echo`, `Distortion`, `Compressor`, `ParamEq`, `I3DL2Reverb`, `WavesReverb`) with live stereo DSP in `mix_dsound_frames` and real `IDirectSoundFX*` COM objects. |
+| `xaudio2_9redist.dll!parse_wave_format` (Extensible SubFormat) | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs` | Decodes `KSDATAFORMAT_SUBTYPE_{ADPCM,ALAW,MULAW}` in addition to PCM/IEEE_FLOAT; rejects invalid/unsupported subtypes with `XAUDIO2_E_INVALID_CALL` matching desktop Windows `xaudio2_9redist.dll`. |
+| `xaudio2_9redist.dll!parse_wave_format` (Format Tag) | `crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs` | Real block/sample decoders for MS-ADPCM (`0x0002`), IMA/DVI ADPCM (`0x0011`), ITU G.711 A-law (`0x0006`), and μ-law (`0x0007`); rejects invalid tags and Xbox-only XMA2 with `XAUDIO2_E_INVALID_CALL`. |
+| `ws2_32.dll!WSAAsyncSelect` | `crates/win32-rt/src/misc/ws2_32.rs` | Reuses the background `poll(2)` reactor to post real Win32 window messages (`PostMessageW(hwnd, wmsg, sock, WSAMAKESELECTREPLY(ev, err))`), sets guest nonblocking mode, and inherits across `accept`. |
+| `ws2_32.dll!WSACancelAsyncRequest` | `crates/win32-rt/src/misc/ws2_32.rs` | Backed by an async-task state registry returning `0` on pending cancellation, `WSAEALREADY` on completed tasks, and `WSAEINVAL` on invalid/null handles. |
+| `ws2_32.dll!WSAConnectByNameA` | `crates/win32-rt/src/misc/ws2_32.rs` | Resolves host/service via `getaddrinfo` (including dual-stack IPv4-mapped IPv6), connects with `WinTimeVal` timeout, populates `LocalAddress`/`RemoteAddress`, and returns `BOOL`. |
+| `ws2_32.dll!WSAConnectByNameW` | `crates/win32-rt/src/misc/ws2_32.rs` | UTF-16 variant sharing `connect_by_name_impl`. |
+| `ws2_32.dll!WSAJoinLeaf` | `crates/win32-rt/src/misc/ws2_32.rs` | Real IPv4 (`IP_ADD_MEMBERSHIP`) and IPv6 (`IPV6_JOIN_GROUP`) multicast group membership join plus optional `connect` for `JL_SENDER_ONLY`/`JL_BOTH`. |
+| `ws2_32.dll!WSARecvMsg` | `crates/win32-rt/src/misc/ws2_32.rs` | Real POSIX `recvmsg(2)` with Win64 `WSAMSG`/`WSACMSGHDR` ↔ Darwin `cmsghdr` translation (`IP_PKTINFO`, `IPV6_PKTINFO`, `IP_TTL`, `IP_TOS`, `IPV6_HOPLIMIT`, `IPV6_TCLASS`), sync + overlapped `ASYNC_IO` reactor support, and `WSAID_WSARECVMSG` extension thunk. |
+| `ws2_32.dll!WSASendMsg` | `crates/win32-rt/src/misc/ws2_32.rs` | Real POSIX `sendmsg(2)` with Win64 `WSAMSG`/`WSACMSGHDR` translation, sync + overlapped `ASYNC_IO` reactor support, and `WSAID_WSASENDMSG` extension thunk. |
+| `ws2_32.dll!WSAIoctl` | `crates/win32-rt/src/misc/ws2_32.rs` | Implemented `SIOCATMARK`, `SIO_KEEPALIVE_VALS`, `SIO_GET_INTERFACE_LIST`, `SIO_ADDRESS_LIST_QUERY`, `SIO_ROUTING_INTERFACE_QUERY`, plus `WSAID_WSARECVMSG`/`WSAID_WSASENDMSG`; unknown IOCTLs return standard `WSAEOPNOTSUPP`. |
+| `libcurl.dll!curl_easy_setopt` | `crates/win32-rt/src/misc/libcurl/easy.rs` | Wired `CURLOPT_IPRESOLVE`, `CURLOPT_PROTOCOLS`/`_REDIR_PROTOCOLS`/`_STR`, `CURLOPT_RESOLVE`, `CURLOPT_XOAUTH2_BEARER`, `CURLOPT_UNRESTRICTED_AUTH`, `CURLOPT_RESUME_FROM`/`_LARGE`, `CURLOPT_MAXFILESIZE`/`_LARGE`, `CURLOPT_DEFAULT_PROTOCOL`, `CURLOPT_REQUEST_TARGET`, `CURLOPT_TCP_KEEPALIVE`/`_KEEPIDLE`/`_KEEPINTVL`, `CURLOPT_BUFFERSIZE`, and `CURLOPT_XFERINFOFUNCTION`/`_NOPROGRESS`; disabled protocols return `CURLE_NOT_BUILT_IN` and unknown options return `CURLE_UNKNOWN_OPTION`. |
+| `libcurl.dll!curl_easy_getinfo` | `crates/win32-rt/src/misc/libcurl/easy.rs` | Implemented full HTTP/HTTPS timing (`APPCONNECT`/`PRETRANSFER`/`STARTTRANSFER`/`REDIRECT`/`NAMELOOKUP`/`CONNECT` double and `_T`), `PRIMARY_PORT`, `LOCAL_IP`, `LOCAL_PORT`, `SCHEME`, `PROTOCOL`, `EFFECTIVE_METHOD`, `FILETIME`/`_T`, `CONDITION_UNMET`, `HTTPAUTH_AVAIL`, `PROXYAUTH_AVAIL`, `RETRY_AFTER`, `ACTIVESOCKET`/`LASTSOCKET`; unknown info IDs return `CURLE_UNKNOWN_OPTION`. |
+
+## Native-unsupported (matches Windows without the feature) (3 sites)
+
+| DLL!API | Returned Code | Windows Behavior & Documentation Citation |
+|---|---|---|
+| `mmdevapi.dll!IAudioClient::Initialize` (`AUDCLNT_SHAREMODE_EXCLUSIVE`) | `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` (`0x8889000E`) | Matches [Microsoft Learn `IAudioClient::Initialize`](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize): when an audio endpoint does not allow exclusive-mode hardware takeover (Windows sound setting "Allow applications to take exclusive control of this device" unchecked, Bluetooth/virtual endpoints, or macOS/iOS shared CoreAudio/`AVAudioSession` routing), Windows returns `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` so callers fall back to `AUDCLNT_SHAREMODE_SHARED`. |
+| `ws2_32.dll!WSADuplicateSocketA` / `WSADuplicateSocketW` (cross-process `pid != current_pid`) | `SOCKET_ERROR` with `WSAEOPNOTSUPP` (`10045`) | Matches [Microsoft Learn `WSADuplicateSocketW`](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaduplicatesocketw): same-process duplication works via `dup(2)` + protocol-info token; cross-process fd injection into an external macOS process we do not host cannot exist natively, so the provider returns `WSAEOPNOTSUPP`. |
+| `ws2_32.dll!WSAGetQOSByName` | `FALSE` with `WSAEOPNOTSUPP` (`10045`) | Matches [Microsoft Learn `WSAGetQOSByName`](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsagetqosbyname): Winsock2 RSVP/QOS templates were deprecated in Windows Vista and the built-in Windows TCP/IP service provider (`MSAFD Tcpip`) does not advertise `XP1_QOS_SUPPORTED`, returning `FALSE` with `WSAEOPNOTSUPP` after parameter validation. |
+
+## Leftovers
+
+None — **0** remaining stub sites in scope.

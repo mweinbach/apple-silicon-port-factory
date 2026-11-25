@@ -15,7 +15,7 @@ use super::com::*;
 use super::format::{default_mask, WaveFormat};
 use crate::types::*;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const eRender: u32 = 0;
@@ -83,6 +83,13 @@ fn guid_from(s: &str) -> GUID {
         (u16::from_le_bytes([a[6], a[7]]) & 0x0FFF) | 0x5000, // name-based
         d4,
     )
+}
+
+/// Compute the deterministic Windows render endpoint ID (`{0.0.0.00000000}.{guid}`)
+/// corresponding to a host `DeviceInfo::uid`.
+pub(super) fn render_endpoint_id_for_uid(uid: &str) -> String {
+    let guid = guid_from(uid);
+    format!("{{0.0.0.00000000}}.{guid:?}").to_ascii_lowercase()
 }
 
 impl Endpoint {
@@ -584,12 +591,14 @@ mod device {
             log::debug!(target: "audio", "IMMDevice::Activate(ISpatialAudioClient, ctx {ctx:#x}) on '{}'", ep.info.name);
             return super::super::spatial::create_spatial_audio_client(ep, out);
         }
-        let what = if iid == IID_IAudioEndpointVolume {
-            "IAudioEndpointVolume"
-        } else {
-            "unknown interface"
-        };
-        stub!("IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE");
+        if iid == IID_IAudioEndpointVolume {
+            log::debug!(target: "audio", "IMMDevice::Activate(IAudioEndpointVolume, ctx {ctx:#x}) on '{}'", ep.info.name);
+            std::ptr::write_unaligned(out, super::new_endpoint_volume(ep) as *mut c_void);
+            return S_OK;
+        }
+        // Standard COM behavior: IMMDevice::Activate returns E_NOINTERFACE for
+        // interfaces not supported by this endpoint (Microsoft Learn: IMMDevice::Activate).
+        crate::com::warn_qi_failed_once("IMMDevice::Activate", &crate::com::Guid::from_win_guid(iid));
         E_NOINTERFACE
     }
 
@@ -664,8 +673,16 @@ static ENDPOINT_VTBL: IMMEndpointVtbl = IMMEndpointVtbl {
 // IAudioSessionManager / IAudioSessionManager2 + IAudioSessionControl2 + ISimpleAudioVolume
 // ---------------------------------------------------------------------------
 
-struct SessionState {
-    ep: Arc<Endpoint>,
+const GUID_NULL: GUID = GUID::new(0, 0, 0, [0; 8]);
+
+type SessionKey = (String, (u32, u16, u16, [u8; 8]));
+
+static SESSIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<SessionKey, Arc<SessionState>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+pub(super) struct SessionState {
+    pub(super) ep: Arc<Endpoint>,
+    pub(super) session_guid: GUID,
     volume_bits: AtomicU32, // f32::to_bits (default 1.0)
     muted: std::sync::atomic::AtomicBool,
     display_name: Mutex<String>,
@@ -674,16 +691,41 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(ep: Arc<Endpoint>) -> Arc<Self> {
-        Arc::new(Self {
-            ep,
-            volume_bits: AtomicU32::new(1.0f32.to_bits()),
-            muted: std::sync::atomic::AtomicBool::new(false),
-            display_name: Mutex::new(String::new()),
-            icon_path: Mutex::new(String::new()),
-            grouping: Mutex::new(GUID::new(0, 0, 0, [0; 8])),
-        })
+    pub(super) fn get_or_create(ep: Arc<Endpoint>, session_guid: Option<GUID>) -> Arc<Self> {
+        let guid = session_guid.unwrap_or(GUID_NULL);
+        let key = (ep.id.clone(), (guid.data1, guid.data2, guid.data3, guid.data4));
+        let mut map = SESSIONS.lock().unwrap();
+        map.entry(key)
+            .or_insert_with(|| {
+                Arc::new(Self {
+                    ep,
+                    session_guid: guid,
+                    volume_bits: AtomicU32::new(1.0f32.to_bits()),
+                    muted: std::sync::atomic::AtomicBool::new(false),
+                    display_name: Mutex::new(String::new()),
+                    icon_path: Mutex::new(String::new()),
+                    grouping: Mutex::new(GUID_NULL),
+                })
+            })
+            .clone()
     }
+
+    #[inline]
+    pub(super) fn effective_gain(&self) -> f32 {
+        if self.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.volume_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+pub(super) fn new_session_control(st: Arc<SessionState>) -> *mut c_void {
+    SessionControlObj::create(&SESSION_CTRL_VTBL, st) as *mut c_void
+}
+
+pub(super) fn new_simple_audio_volume(st: Arc<SessionState>) -> *mut c_void {
+    SimpleVolumeObj::create(simple_vol::vtbl(), st) as *mut c_void
 }
 
 #[repr(C)]
@@ -700,7 +742,7 @@ struct IAudioSessionManager2Vtbl {
     unregister_duck_notification: unsafe extern "win64" fn(*mut SessionManagerObj, *mut c_void) -> HRESULT,
 }
 
-type SessionManagerObj = ComObj<IAudioSessionManager2Vtbl, Arc<SessionState>>;
+type SessionManagerObj = ComObj<IAudioSessionManager2Vtbl, Arc<Endpoint>>;
 
 mod session_mgr {
     use super::*;
@@ -708,29 +750,31 @@ mod session_mgr {
 
     pub unsafe extern "win64" fn get_audio_session_control(
         this: *mut SessionManagerObj,
-        _guid: *const GUID,
+        guid: *const GUID,
         _flags: u32,
         out: *mut *mut c_void,
     ) -> HRESULT {
         if out.is_null() {
             return E_POINTER;
         }
-        let st = SessionManagerObj::inner(this).clone();
+        let ep = SessionManagerObj::inner(this).clone();
+        let st = SessionState::get_or_create(ep, GUID::read(guid));
         std::ptr::write_unaligned(out, SessionControlObj::create(&SESSION_CTRL_VTBL, st) as *mut c_void);
         S_OK
     }
 
     pub unsafe extern "win64" fn get_simple_audio_volume(
         this: *mut SessionManagerObj,
-        _guid: *const GUID,
+        guid: *const GUID,
         _flags: u32,
         out: *mut *mut c_void,
     ) -> HRESULT {
         if out.is_null() {
             return E_POINTER;
         }
-        let st = SessionManagerObj::inner(this).clone();
-        std::ptr::write_unaligned(out, SimpleVolumeObj::create(&SIMPLE_VOL_VTBL, st) as *mut c_void);
+        let ep = SessionManagerObj::inner(this).clone();
+        let st = SessionState::get_or_create(ep, GUID::read(guid));
+        std::ptr::write_unaligned(out, super::new_simple_audio_volume(st));
         S_OK
     }
 
@@ -764,7 +808,7 @@ static SESSION_MGR_VTBL: IAudioSessionManager2Vtbl = IAudioSessionManager2Vtbl {
 };
 
 fn new_session_manager(ep: Arc<Endpoint>) -> *mut SessionManagerObj {
-    SessionManagerObj::create(&SESSION_MGR_VTBL, SessionState::new(ep))
+    SessionManagerObj::create(&SESSION_MGR_VTBL, ep)
 }
 
 #[repr(C)]
@@ -839,7 +883,12 @@ mod session_ctrl {
         if out.is_null() {
             return E_POINTER;
         }
-        let id = format!("{}|session", SessionControlObj::inner(this).ep.id);
+        let st = SessionControlObj::inner(this);
+        let id = if st.session_guid == GUID_NULL {
+            format!("{}|session", st.ep.id)
+        } else {
+            format!("{}|session|{}", st.ep.id, format_guid(&st.session_guid))
+        };
         std::ptr::write_unaligned(out, co_wstr(&id));
         S_OK
     }
@@ -847,7 +896,12 @@ mod session_ctrl {
         if out.is_null() {
             return E_POINTER;
         }
-        let id = format!("{}|session|{}", SessionControlObj::inner(this).ep.id, std::process::id());
+        let st = SessionControlObj::inner(this);
+        let id = if st.session_guid == GUID_NULL {
+            format!("{}|session|{}", st.ep.id, std::process::id())
+        } else {
+            format!("{}|session|{}|{}", st.ep.id, format_guid(&st.session_guid), std::process::id())
+        };
         std::ptr::write_unaligned(out, co_wstr(&id));
         S_OK
     }
@@ -883,15 +937,7 @@ static SESSION_CTRL_VTBL: IAudioSessionControl2Vtbl = IAudioSessionControl2Vtbl 
 };
 
 #[repr(C)]
-struct ISimpleAudioVolumeVtbl {
-    qi: unsafe extern "win64" fn(*mut SimpleVolumeObj, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "win64" fn(*mut SimpleVolumeObj) -> u32,
-    release: unsafe extern "win64" fn(*mut SimpleVolumeObj) -> u32,
-    set_master_volume: unsafe extern "win64" fn(*mut SimpleVolumeObj, f32, *const GUID) -> HRESULT,
-    get_master_volume: unsafe extern "win64" fn(*mut SimpleVolumeObj, *mut f32) -> HRESULT,
-    set_mute: unsafe extern "win64" fn(*mut SimpleVolumeObj, BOOL, *const GUID) -> HRESULT,
-    get_mute: unsafe extern "win64" fn(*mut SimpleVolumeObj, *mut BOOL) -> HRESULT,
-}
+struct ISimpleAudioVolumeVtbl([usize; 7]);
 
 type SimpleVolumeObj = ComObj<ISimpleAudioVolumeVtbl, Arc<SessionState>>;
 
@@ -900,12 +946,14 @@ mod simple_vol {
     com_iunknown!(SimpleVolumeObj, [IID_ISimpleAudioVolume]);
 
     pub unsafe extern "win64" fn set_master_volume(this: *mut SimpleVolumeObj, level: f32, _ctx: *const GUID) -> HRESULT {
-        if !(0.0..=1.0).contains(&level) {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             return E_INVALIDARG;
         }
         SimpleVolumeObj::inner(this).volume_bits.store(level.to_bits(), Ordering::Relaxed);
         S_OK
     }
+    crate::win64_bridge!(fn set_master_volume(*mut SimpleVolumeObj, f32, *const GUID) -> HRESULT);
+
     pub unsafe extern "win64" fn get_master_volume(this: *mut SimpleVolumeObj, out: *mut f32) -> HRESULT {
         let v = f32::from_bits(SimpleVolumeObj::inner(this).volume_bits.load(Ordering::Relaxed));
         write_out(out, v)
@@ -918,17 +966,714 @@ mod simple_vol {
         let m = SimpleVolumeObj::inner(this).muted.load(Ordering::Relaxed);
         write_out(out, if m { TRUE } else { FALSE })
     }
+
+    pub fn vtbl() -> &'static ISimpleAudioVolumeVtbl {
+        static V: std::sync::OnceLock<ISimpleAudioVolumeVtbl> = std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            let slots = [
+                qi as *const () as usize,
+                add_ref as *const () as usize,
+                release as *const () as usize,
+                crate::bridge_entry!(set_master_volume) as usize,
+                get_master_volume as *const () as usize,
+                set_mute as *const () as usize,
+                get_mute as *const () as usize,
+            ];
+            for &a in &slots {
+                crate::register_native_va(a as u64, a);
+            }
+            ISimpleAudioVolumeVtbl(slots)
+        })
+    }
 }
 
-static SIMPLE_VOL_VTBL: ISimpleAudioVolumeVtbl = ISimpleAudioVolumeVtbl {
-    qi: simple_vol::qi,
-    add_ref: simple_vol::add_ref,
-    release: simple_vol::release,
-    set_master_volume: simple_vol::set_master_volume,
-    get_master_volume: simple_vol::get_master_volume,
-    set_mute: simple_vol::set_mute,
-    get_mute: simple_vol::get_mute,
-};
+// ---------------------------------------------------------------------------
+// IAudioEndpointVolume (backed by CoreAudio HAL volume/mute on macOS)
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_HARDWARE_SUPPORT_VOLUME: u32 = 0x1;
+const ENDPOINT_HARDWARE_SUPPORT_MUTE: u32 = 0x2;
+const ENDPOINT_VOLUME_STEPS: u32 = 64;
+const DEFAULT_MIN_DB: f32 = -65.25;
+const DEFAULT_MAX_DB: f32 = 0.0;
+const DEFAULT_STEP_DB: f32 = 0.5;
+
+unsafe fn com_slot(obj: usize, i: usize) -> usize {
+    if obj == 0 {
+        return 0;
+    }
+    let vtbl = std::ptr::read_unaligned(obj as *const *const usize);
+    if vtbl.is_null() {
+        return 0;
+    }
+    std::ptr::read_unaligned(vtbl.add(i))
+}
+
+unsafe fn com_add_ref(obj: usize) {
+    let f = com_slot(obj, 1);
+    if f != 0 {
+        crate::call_guest8(f, obj as u64, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+unsafe fn com_release(obj: usize) {
+    let f = com_slot(obj, 2);
+    if f != 0 {
+        crate::call_guest8(f, obj as u64, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+/// Owned COM reference to a registered `IAudioEndpointVolumeCallback*`.
+///
+/// Wrapped in `Arc` inside `EndpointSoftwareGain::callbacks`: registration calls
+/// `AddRef` once, in-flight notification dispatches clone the `Arc` under the lock,
+/// and the COM `Release` executes only when the last `Arc` drops outside all locks
+/// (after both unregistration and every in-flight `OnNotify` have completed).
+struct RegisteredCallback(usize);
+
+impl Drop for RegisteredCallback {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { com_release(self.0) };
+        }
+    }
+}
+
+/// Shared per-endpoint fallback volume/mute control state and software render attenuation.
+///
+/// Shared across all `IAudioEndpointVolume` activations on the same endpoint ID so muting or
+/// adjusting volume on one COM instance is immediately observed by all other instances, while
+/// `sw_*` fields avoid double-attenuating channels that CoreAudio HAL already controls in hardware.
+/// Lock-free mirror of an endpoint's software fallback mute & per-channel amplitude gains,
+/// safe to read directly from the realtime CoreAudio IO callback without taking any mutex.
+pub(super) struct EndpointSwAtomic {
+    pub(super) sw_muted: AtomicBool,
+    pub(super) sw_channels: [AtomicU32; 8],
+}
+
+impl Default for EndpointSwAtomic {
+    fn default() -> Self {
+        Self {
+            sw_muted: AtomicBool::new(false),
+            sw_channels: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EndpointSoftwareGain {
+    /// Whether `logical_channels` has been seeded from explicit setters or HAL master volume.
+    channels_initialized: bool,
+    /// Logical fallback control values (audio-tapered scalars in `[0.0, 1.0]`, used by getters
+    /// when CoreAudio HAL lacks that control).
+    logical_master: f32,
+    logical_muted: bool,
+    logical_channels: [f32; 8],
+    /// Linear amplitude gain already applied by CoreAudio HAL master volume, if any.
+    hw_master_gain: Option<f32>,
+    /// Software mute (`false` when hardware HAL already applies mute).
+    sw_muted: bool,
+    /// Per-channel linear amplitude multipliers applied in software (`1.0` when handled by HAL).
+    /// Master software attenuation is folded directly into `sw_channels` so subsequent
+    /// per-channel writes never double-apply master attenuation.
+    sw_channels: [f32; 8],
+    /// Lock-free atomic mirror read by playback consumers (`PlaybackGain::apply`).
+    atomic: Arc<EndpointSwAtomic>,
+    /// Registered `IAudioEndpointVolumeCallback*` references shared across activations on this endpoint.
+    callbacks: Vec<Arc<RegisteredCallback>>,
+}
+
+impl Default for EndpointSoftwareGain {
+    fn default() -> Self {
+        Self {
+            channels_initialized: false,
+            logical_master: 1.0,
+            logical_muted: false,
+            logical_channels: [1.0; 8],
+            hw_master_gain: None,
+            sw_muted: false,
+            sw_channels: [1.0; 8],
+            atomic: Arc::new(EndpointSwAtomic::default()),
+            callbacks: Vec::new(),
+        }
+    }
+}
+
+static ENDPOINT_SW_GAINS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, EndpointSoftwareGain>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Serializes read-modify-HAL-write volume mutations so concurrent master/channel setters
+/// never interleave out of order while keeping `ENDPOINT_SW_GAINS` free of HAL I/O.
+static ENDPOINT_VOL_OP_LOCK: Mutex<()> = Mutex::new(());
+
+/// Return the shared lock-free software gain handle for `ep_id` so render/spatial playback
+/// consumers apply live `IAudioEndpointVolume` updates without acquiring any mutex.
+pub(super) fn endpoint_software_gain_handle(ep_id: &str) -> Arc<EndpointSwAtomic> {
+    let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+    map.entry(ep_id.to_string()).or_default().atomic.clone()
+}
+
+fn read_endpoint_sw_state<R>(ep_id: &str, f: impl FnOnce(&EndpointSoftwareGain) -> R) -> R {
+    let map = ENDPOINT_SW_GAINS.lock().unwrap();
+    if let Some(g) = map.get(ep_id) {
+        f(g)
+    } else {
+        f(&EndpointSoftwareGain::default())
+    }
+}
+
+fn update_endpoint_sw_gain(ep_id: &str, f: impl FnOnce(&mut EndpointSoftwareGain)) {
+    let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+    let entry = map.entry(ep_id.to_string()).or_default();
+    f(entry);
+    entry.atomic.sw_muted.store(entry.sw_muted, Ordering::Release);
+    for (dst, &src) in entry.atomic.sw_channels.iter().zip(entry.sw_channels.iter()) {
+        dst.store(src.to_bits(), Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn reset_endpoint_software_gains_for_test() {
+    let dropped = std::mem::take(&mut *ENDPOINT_SW_GAINS.lock().unwrap());
+    for g in dropped.values() {
+        g.atomic.sw_muted.store(false, Ordering::Release);
+        for dst in &g.atomic.sw_channels {
+            dst.store(1.0f32.to_bits(), Ordering::Release);
+        }
+    }
+    drop(dropped);
+}
+
+#[cfg(test)]
+pub(super) fn reset_sessions_for_test() {
+    SESSIONS.lock().unwrap().clear();
+}
+
+struct EndpointVolumeState {
+    ep: Arc<Endpoint>,
+    channel_count: usize,
+    min_db: f32,
+    max_db: f32,
+}
+
+impl EndpointVolumeState {
+    fn new(ep: Arc<Endpoint>) -> Arc<Self> {
+        let is_cap = ep.is_capture();
+        let (min_db, max_db) =
+            backend::device_volume_range_db(&ep.info, is_cap).unwrap_or((DEFAULT_MIN_DB, DEFAULT_MAX_DB));
+        let channel_count = ep.mix_format().channels.clamp(1, 8) as usize;
+        Arc::new(Self {
+            ep,
+            channel_count,
+            min_db,
+            max_db,
+        })
+    }
+
+    fn scalar_to_db(&self, scalar: f32) -> f32 {
+        let s = scalar.clamp(0.0, 1.0);
+        self.min_db + s * (self.max_db - self.min_db)
+    }
+
+    fn db_to_scalar(&self, db: f32) -> f32 {
+        let span = (self.max_db - self.min_db).max(1e-3);
+        ((db - self.min_db) / span).clamp(0.0, 1.0)
+    }
+
+    /// Convert an audio-tapered endpoint scalar `[0.0, 1.0]` to its linear PCM amplitude gain.
+    /// `0.0` silences completely; positive values convert the corresponding dB level via `10^(dB / 20)`.
+    fn scalar_to_amplitude_gain(&self, scalar: f32) -> f32 {
+        let s = scalar.clamp(0.0, 1.0);
+        if s <= 0.0 {
+            0.0
+        } else {
+            10.0f32.powf(self.scalar_to_db(s) / 20.0).max(0.0)
+        }
+    }
+
+    fn current_master_scalar(&self) -> f32 {
+        if let Some(v) = backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()) {
+            v
+        } else {
+            read_endpoint_sw_state(&self.ep.id, |g| g.logical_master)
+        }
+    }
+
+    fn set_master_scalar(&self, scalar: f32) {
+        self.apply_master_scalar_with(scalar, |s| {
+            backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s)
+        });
+    }
+
+    fn apply_master_scalar_with(&self, scalar: f32, set_hw_master: impl FnOnce(f32) -> bool) {
+        let _op_guard = ENDPOINT_VOL_OP_LOCK.lock().unwrap();
+        let s = scalar.clamp(0.0, 1.0);
+        let gain = self.scalar_to_amplitude_gain(s);
+        let hw_ok = set_hw_master(s);
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.channels_initialized = true;
+            g.logical_master = s;
+            g.logical_channels = [s; 8];
+            g.hw_master_gain = if hw_ok { Some(gain) } else { None };
+            // If CoreAudio hardware applied master volume, avoid double-attenuation in software;
+            // otherwise fold the linear amplitude gain directly into each channel slot.
+            g.sw_channels = if hw_ok { [1.0; 8] } else { [gain; 8] };
+        });
+    }
+
+    fn current_channel_scalar(&self, ch: usize) -> Option<f32> {
+        if ch >= self.channel_count {
+            return None;
+        }
+        if let Some(v) = backend::device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), ch as u32) {
+            Some(v)
+        } else {
+            let (initialized, val) =
+                read_endpoint_sw_state(&self.ep.id, |g| (g.channels_initialized, g.logical_channels[ch]));
+            if initialized {
+                Some(val)
+            } else {
+                Some(backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()).unwrap_or(val))
+            }
+        }
+    }
+
+    fn set_channel_scalar(&self, ch: usize, scalar: f32) -> bool {
+        self.apply_channel_scalar_with(
+            ch,
+            scalar,
+            || backend::device_volume_scalar(&self.ep.info, self.ep.is_capture()),
+            |s| backend::set_device_volume_scalar(&self.ep.info, self.ep.is_capture(), s),
+            |c, s| backend::set_device_channel_volume_scalar(&self.ep.info, self.ep.is_capture(), c, s),
+        )
+    }
+
+    fn apply_channel_scalar_with(
+        &self,
+        ch: usize,
+        scalar: f32,
+        get_hw_master: impl FnOnce() -> Option<f32>,
+        set_hw_master: impl FnOnce(f32) -> bool,
+        set_hw_channel: impl FnOnce(u32, f32) -> bool,
+    ) -> bool {
+        if ch >= self.channel_count {
+            return false;
+        }
+        let _op_guard = ENDPOINT_VOL_OP_LOCK.lock().unwrap();
+        let s = scalar.clamp(0.0, 1.0);
+        let hw_ch_ok = set_hw_channel(ch as u32, s);
+        let n_ch = self.channel_count;
+        if hw_ch_ok {
+            update_endpoint_sw_gain(&self.ep.id, |g| {
+                g.channels_initialized = true;
+                g.logical_channels[ch] = s;
+                g.logical_master = g.logical_channels[..n_ch]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max);
+                g.sw_channels[ch] = 1.0;
+            });
+            return true;
+        }
+
+        // CoreAudio HAL has no per-channel volume on this endpoint. If HAL controls master
+        // volume, rebalance HAL master to `max(logical_channels[..n_ch])` and compute each
+        // channel's software gain relative to that master so raising any channel above a lower
+        // (or zero) hardware master succeeds accurately while other channels keep their exact gain.
+        let current_hw_master = get_hw_master();
+        let (target_master_scalar, had_hw_master) = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let g = map.entry(self.ep.id.clone()).or_default();
+            if !g.channels_initialized {
+                if let Some(hw_s) = current_hw_master {
+                    g.logical_master = hw_s;
+                    g.logical_channels = [hw_s; 8];
+                    g.hw_master_gain = Some(self.scalar_to_amplitude_gain(hw_s));
+                }
+                g.channels_initialized = true;
+            }
+            g.logical_channels[ch] = s;
+            let new_master = g.logical_channels[..n_ch]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            g.logical_master = new_master;
+            (new_master, g.hw_master_gain.is_some() || current_hw_master.is_some())
+        };
+
+        let hw_master_ok = if had_hw_master {
+            set_hw_master(target_master_scalar)
+        } else {
+            false
+        };
+        let target_master_gain = self.scalar_to_amplitude_gain(target_master_scalar);
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            let eff_hw_gain = if had_hw_master && hw_master_ok {
+                g.hw_master_gain = Some(target_master_gain);
+                Some(target_master_gain)
+            } else if had_hw_master {
+                current_hw_master
+                    .map(|v| self.scalar_to_amplitude_gain(v))
+                    .or(g.hw_master_gain)
+            } else {
+                g.hw_master_gain = None;
+                None
+            };
+            for i in 0..n_ch {
+                let ch_gain = self.scalar_to_amplitude_gain(g.logical_channels[i]);
+                g.sw_channels[i] = match eff_hw_gain {
+                    Some(hm) if hm > 1e-6 => (ch_gain / hm).clamp(0.0, 1.0),
+                    Some(_) => 0.0,
+                    None => ch_gain,
+                };
+            }
+            for i in n_ch..8 {
+                g.sw_channels[i] = if eff_hw_gain.is_some() { 1.0 } else { target_master_gain };
+            }
+        });
+        true
+    }
+
+    fn current_mute(&self) -> bool {
+        if let Some(m) = backend::device_mute(&self.ep.info, self.ep.is_capture()) {
+            m
+        } else {
+            read_endpoint_sw_state(&self.ep.id, |g| g.logical_muted)
+        }
+    }
+
+    fn set_mute(&self, mute: bool) {
+        let hw_ok = backend::set_device_mute(&self.ep.info, self.ep.is_capture(), mute);
+        update_endpoint_sw_gain(&self.ep.id, |g| {
+            g.logical_muted = mute;
+            g.sw_muted = if hw_ok { false } else { mute };
+        });
+    }
+
+    fn hardware_support_mask_from(hw_volume: bool, hw_mute: bool) -> u32 {
+        let mut mask = 0u32;
+        if hw_volume {
+            mask |= ENDPOINT_HARDWARE_SUPPORT_VOLUME;
+        }
+        if hw_mute {
+            mask |= ENDPOINT_HARDWARE_SUPPORT_MUTE;
+        }
+        mask
+    }
+
+    fn hardware_support_mask(&self) -> u32 {
+        let (hw_vol, hw_mute) = backend::device_hardware_volume_support(
+            &self.ep.info,
+            self.ep.is_capture(),
+            self.channel_count as u32,
+        );
+        Self::hardware_support_mask_from(hw_vol, hw_mute)
+    }
+
+    /// Dispatch `IAudioEndpointVolumeCallback::OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA)`
+    /// to every callback registered for this endpoint without holding any lock.
+    unsafe fn notify_callbacks(&self, ctx_guid: *const GUID) {
+        let cbs: Vec<Arc<RegisteredCallback>> = read_endpoint_sw_state(&self.ep.id, |g| g.callbacks.clone());
+        if cbs.is_empty() {
+            return;
+        }
+        let guid = if ctx_guid.is_null() {
+            GUID_NULL
+        } else {
+            std::ptr::read_unaligned(ctx_guid)
+        };
+        let muted: BOOL = if self.current_mute() { TRUE } else { FALSE };
+        let master = self.current_master_scalar();
+        let n_ch = self.channel_count.clamp(1, 8);
+        // AUDIO_VOLUME_NOTIFICATION_DATA:
+        // +0: GUID guidEventContext (16)
+        // +16: BOOL bMuted (4)
+        // +20: float fMasterVolume (4)
+        // +24: UINT nChannels (4)
+        // +28: float afChannelVolumes[nChannels] (4 * nChannels)
+        #[repr(C)]
+        struct AudioVolumeNotificationData {
+            guid_event_context: GUID,
+            b_muted: BOOL,
+            f_master_volume: f32,
+            n_channels: u32,
+            af_channel_volumes: [f32; 8],
+        }
+        let mut ch_vols = [master; 8];
+        for (i, slot) in ch_vols.iter_mut().enumerate().take(n_ch) {
+            *slot = self.current_channel_scalar(i).unwrap_or(master);
+        }
+        let data = AudioVolumeNotificationData {
+            guid_event_context: guid,
+            b_muted: muted,
+            f_master_volume: master,
+            n_channels: n_ch as u32,
+            af_channel_volumes: ch_vols,
+        };
+        let data_ptr = &data as *const AudioVolumeNotificationData as u64;
+        for cb in cbs {
+            let p = cb.0;
+            let on_notify = com_slot(p, 3);
+            if on_notify != 0 {
+                crate::call_guest8(on_notify, p as u64, data_ptr, 0, 0, 0, 0, 0, 0);
+            }
+            // `cb` drops here outside all locks; if unregistered while in flight,
+            // its owned COM reference is released only now after `OnNotify` returns.
+        }
+    }
+}
+
+#[repr(C)]
+struct IAudioEndpointVolumeVtbl([usize; 21]);
+
+type EndpointVolumeObj = ComObj<IAudioEndpointVolumeVtbl, Arc<EndpointVolumeState>>;
+
+fn new_endpoint_volume(ep: Arc<Endpoint>) -> *mut EndpointVolumeObj {
+    EndpointVolumeObj::create(endpoint_vol::vtbl(), EndpointVolumeState::new(ep))
+}
+
+mod endpoint_vol {
+    use super::*;
+    com_iunknown!(EndpointVolumeObj, [IID_IAudioEndpointVolume]);
+
+    pub unsafe extern "win64" fn register_notify(this: *mut EndpointVolumeObj, cb: *mut c_void) -> HRESULT {
+        if cb.is_null() {
+            return E_POINTER;
+        }
+        let ep_id = EndpointVolumeObj::inner(this).ep.id.clone();
+        let p = cb as usize;
+        // Acquire the COM reference before taking ENDPOINT_SW_GAINS so we never
+        // invoke guest code while holding the registry lock.
+        com_add_ref(p);
+        let duplicate = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let entry = map.entry(ep_id).or_default();
+            if entry.callbacks.iter().any(|c| c.0 == p) {
+                true
+            } else {
+                entry.callbacks.push(Arc::new(RegisteredCallback(p)));
+                false
+            }
+        };
+        if duplicate {
+            com_release(p);
+        }
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn unregister_notify(this: *mut EndpointVolumeObj, cb: *mut c_void) -> HRESULT {
+        if cb.is_null() {
+            return E_POINTER;
+        }
+        let ep_id = &EndpointVolumeObj::inner(this).ep.id;
+        let p = cb as usize;
+        let removed = {
+            let mut map = ENDPOINT_SW_GAINS.lock().unwrap();
+            let Some(entry) = map.get_mut(ep_id) else {
+                return E_NOTFOUND;
+            };
+            entry
+                .callbacks
+                .iter()
+                .position(|c| c.0 == p)
+                .map(|pos| entry.callbacks.remove(pos))
+        };
+        match removed {
+            Some(cb_arc) => {
+                // Drop outside the lock: releases the COM ref now if idle, or defers
+                // Release until the last in-flight `notify_callbacks` finishes.
+                drop(cb_arc);
+                S_OK
+            }
+            None => E_NOTFOUND,
+        }
+    }
+
+    pub unsafe extern "win64" fn get_channel_count(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
+        let n = EndpointVolumeObj::inner(this).channel_count as u32;
+        write_out(out, n)
+    }
+
+    pub unsafe extern "win64" fn set_master_volume_db(this: *mut EndpointVolumeObj, db: f32, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
+            return E_INVALIDARG;
+        }
+        st.set_master_scalar(st.db_to_scalar(db));
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_master_volume_db(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn set_master_volume_scalar(this: *mut EndpointVolumeObj, level: f32, ctx: *const GUID) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        st.set_master_scalar(level);
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_master_volume_scalar(*mut EndpointVolumeObj, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_master_volume_db(this: *mut EndpointVolumeObj, out: *mut f32) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        write_out(out, st.scalar_to_db(st.current_master_scalar()))
+    }
+
+    pub unsafe extern "win64" fn get_master_volume_scalar(this: *mut EndpointVolumeObj, out: *mut f32) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        write_out(out, st.current_master_scalar())
+    }
+
+    pub unsafe extern "win64" fn set_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, db: f32, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        if !db.is_finite() || db < st.min_db - 1e-3 || db > st.max_db + 1e-3 {
+            return E_INVALIDARG;
+        }
+        if !st.set_channel_scalar(ch as usize, st.db_to_scalar(db)) {
+            return E_INVALIDARG;
+        }
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume_db(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn set_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, level: f32, ctx: *const GUID) -> HRESULT {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            return E_INVALIDARG;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        if !st.set_channel_scalar(ch as usize, level) {
+            return E_INVALIDARG;
+        }
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+    crate::win64_bridge!(fn set_channel_volume_scalar(*mut EndpointVolumeObj, u32, f32, *const GUID) -> HRESULT);
+
+    pub unsafe extern "win64" fn get_channel_volume_db(this: *mut EndpointVolumeObj, ch: u32, out: *mut f32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        let Some(s) = st.current_channel_scalar(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, st.scalar_to_db(s))
+    }
+
+    pub unsafe extern "win64" fn get_channel_volume_scalar(this: *mut EndpointVolumeObj, ch: u32, out: *mut f32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        let Some(s) = st.current_channel_scalar(ch as usize) else {
+            return E_INVALIDARG;
+        };
+        write_out(out, s)
+    }
+
+    pub unsafe extern "win64" fn set_mute(this: *mut EndpointVolumeObj, mute: BOOL, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        st.set_mute(mute != 0);
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn get_mute(this: *mut EndpointVolumeObj, out: *mut BOOL) -> HRESULT {
+        let m = EndpointVolumeObj::inner(this).current_mute();
+        write_out(out, if m { TRUE } else { FALSE })
+    }
+
+    pub unsafe extern "win64" fn get_volume_step_info(this: *mut EndpointVolumeObj, step_out: *mut u32, count_out: *mut u32) -> HRESULT {
+        if step_out.is_null() && count_out.is_null() {
+            return E_POINTER;
+        }
+        let s = EndpointVolumeObj::inner(this).current_master_scalar();
+        let step = (s * ENDPOINT_VOLUME_STEPS as f32).round().clamp(0.0, ENDPOINT_VOLUME_STEPS as f32) as u32;
+        if !step_out.is_null() {
+            std::ptr::write_unaligned(step_out, step);
+        }
+        if !count_out.is_null() {
+            std::ptr::write_unaligned(count_out, ENDPOINT_VOLUME_STEPS);
+        }
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn volume_step_up(this: *mut EndpointVolumeObj, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        let next = (st.current_master_scalar() + 1.0 / ENDPOINT_VOLUME_STEPS as f32).min(1.0);
+        st.set_master_scalar(next);
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn volume_step_down(this: *mut EndpointVolumeObj, ctx: *const GUID) -> HRESULT {
+        let st = EndpointVolumeObj::inner(this);
+        let next = (st.current_master_scalar() - 1.0 / ENDPOINT_VOLUME_STEPS as f32).max(0.0);
+        st.set_master_scalar(next);
+        st.notify_callbacks(ctx);
+        S_OK
+    }
+
+    pub unsafe extern "win64" fn query_hardware_support(this: *mut EndpointVolumeObj, out: *mut u32) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let mask = EndpointVolumeObj::inner(this).hardware_support_mask();
+        write_out(out, mask)
+    }
+
+    pub unsafe extern "win64" fn get_volume_range(
+        this: *mut EndpointVolumeObj,
+        min_out: *mut f32,
+        max_out: *mut f32,
+        inc_out: *mut f32,
+    ) -> HRESULT {
+        if min_out.is_null() || max_out.is_null() || inc_out.is_null() {
+            return E_POINTER;
+        }
+        let st = EndpointVolumeObj::inner(this);
+        std::ptr::write_unaligned(min_out, st.min_db);
+        std::ptr::write_unaligned(max_out, st.max_db);
+        std::ptr::write_unaligned(inc_out, DEFAULT_STEP_DB);
+        S_OK
+    }
+
+    pub fn vtbl() -> &'static IAudioEndpointVolumeVtbl {
+        static V: std::sync::OnceLock<IAudioEndpointVolumeVtbl> = std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            let slots = [
+                qi as *const () as usize,                                 // 0
+                add_ref as *const () as usize,                            // 1
+                release as *const () as usize,                            // 2
+                register_notify as *const () as usize,                    // 3
+                unregister_notify as *const () as usize,                  // 4
+                get_channel_count as *const () as usize,                  // 5
+                crate::bridge_entry!(set_master_volume_db) as usize,      // 6
+                crate::bridge_entry!(set_master_volume_scalar) as usize,  // 7
+                get_master_volume_db as *const () as usize,               // 8
+                get_master_volume_scalar as *const () as usize,           // 9
+                crate::bridge_entry!(set_channel_volume_db) as usize,     // 10
+                crate::bridge_entry!(set_channel_volume_scalar) as usize, // 11
+                get_channel_volume_db as *const () as usize,              // 12
+                get_channel_volume_scalar as *const () as usize,          // 13
+                set_mute as *const () as usize,                           // 14
+                get_mute as *const () as usize,                           // 15
+                get_volume_step_info as *const () as usize,               // 16
+                volume_step_up as *const () as usize,                     // 17
+                volume_step_down as *const () as usize,                   // 18
+                query_hardware_support as *const () as usize,             // 19
+                get_volume_range as *const () as usize,                   // 20
+            ];
+            for &a in &slots {
+                crate::register_native_va(a as u64, a);
+            }
+            IAudioEndpointVolumeVtbl(slots)
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -955,5 +1700,193 @@ mod tests {
         assert_eq!(ds.container_id, dualsense_usb_container_id(0));
         assert_eq!(format_guid(&ds.container_id).len(), 38);
         assert_eq!(ds.mix_format().channels, 4);
+    }
+
+    #[test]
+    fn channel_volume_rebalances_hal_master_and_software_gains_above_prior_master() {
+        reset_endpoint_software_gains_for_test();
+        let ep = Arc::new(Endpoint::new(backend::null_device()));
+        let st = EndpointVolumeState::new(ep.clone());
+        let sw_atomic = endpoint_software_gain_handle(&ep.id);
+        let hw_master = std::cell::Cell::new(1.0f32);
+
+        let effective = |hw_s: f32, ch: usize| -> f32 {
+            let sw = f32::from_bits(sw_atomic.sw_channels[ch].load(Ordering::Acquire));
+            st.scalar_to_amplitude_gain(hw_s) * sw
+        };
+
+        // 1. SetMaster(0.0) followed by SetChannel(0, 1.0) on a HAL-master-only endpoint:
+        //    HAL master must rise to 1.0 so ch 0 reaches full unity gain while ch 1 stays silent.
+        st.apply_master_scalar_with(0.0, |s| {
+            hw_master.set(s);
+            true
+        });
+        assert_eq!(hw_master.get(), 0.0);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            1.0,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!(
+            (hw_master.get() - 1.0).abs() < 1e-6,
+            "HAL master must rise to 1.0, got {}",
+            hw_master.get()
+        );
+        assert!(
+            (effective(hw_master.get(), 0) - 1.0).abs() < 1e-6,
+            "channel 0 must reach unity amplitude, got {}",
+            effective(hw_master.get(), 0)
+        );
+        assert!(
+            effective(hw_master.get(), 1).abs() < 1e-6,
+            "channel 1 must stay silenced at 0.0, got {}",
+            effective(hw_master.get(), 1)
+        );
+
+        // 2. Nonzero HAL master (0.5) followed by raising channel 0 to 0.9:
+        //    HAL master rises to 0.9; ch 0 reaches gain(0.9) and ch 1 stays at gain(0.5).
+        st.apply_master_scalar_with(0.5, |s| {
+            hw_master.set(s);
+            true
+        });
+        assert!((hw_master.get() - 0.5).abs() < 1e-6);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.9,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.9).abs() < 1e-6);
+        let want0 = st.scalar_to_amplitude_gain(0.9);
+        let want1 = st.scalar_to_amplitude_gain(0.5);
+        assert!((effective(hw_master.get(), 0) - want0).abs() < 1e-5);
+        assert!((effective(hw_master.get(), 1) - want1).abs() < 1e-5);
+
+        // 3. Lowering channel 0 below channel 1 (to 0.25) lowers HAL master to max(0.25, 0.5) = 0.5
+        //    while keeping both channels at their exact target gains.
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.25,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.5).abs() < 1e-6);
+        let want0_low = st.scalar_to_amplitude_gain(0.25);
+        assert!((effective(hw_master.get(), 0) - want0_low).abs() < 1e-5);
+        assert!((effective(hw_master.get(), 1) - want1).abs() < 1e-5);
+
+        // 4. Fresh uninitialized endpoint with HAL master at 0.4: setting channel 0 to 0.8 must
+        //    preserve channel 1 at 0.4 (not default 1.0) and raise HAL master to 0.8.
+        reset_endpoint_software_gains_for_test();
+        let sw_atomic2 = endpoint_software_gain_handle(&ep.id);
+        hw_master.set(0.4);
+        assert!(st.apply_channel_scalar_with(
+            0,
+            0.8,
+            || Some(hw_master.get()),
+            |s| {
+                hw_master.set(s);
+                true
+            },
+            |_, _| false,
+        ));
+        assert!((hw_master.get() - 0.8).abs() < 1e-6);
+        let eff2 = |ch: usize| -> f32 {
+            let sw = f32::from_bits(sw_atomic2.sw_channels[ch].load(Ordering::Acquire));
+            st.scalar_to_amplitude_gain(hw_master.get()) * sw
+        };
+        assert!((eff2(0) - st.scalar_to_amplitude_gain(0.8)).abs() < 1e-5);
+        assert!((eff2(1) - st.scalar_to_amplitude_gain(0.4)).abs() < 1e-5);
+
+        reset_endpoint_software_gains_for_test();
+    }
+
+    #[test]
+    fn query_hardware_support_reflects_actual_hal_capabilities() {
+        let _audio_guard = super::super::audio_test_lock();
+
+        // Pure capability mask mapping covers every combination cleanly.
+        assert_eq!(EndpointVolumeState::hardware_support_mask_from(false, false), 0);
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(true, false),
+            ENDPOINT_HARDWARE_SUPPORT_VOLUME
+        );
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(false, true),
+            ENDPOINT_HARDWARE_SUPPORT_MUTE
+        );
+        assert_eq!(
+            EndpointVolumeState::hardware_support_mask_from(true, true),
+            ENDPOINT_HARDWARE_SUPPORT_VOLUME | ENDPOINT_HARDWARE_SUPPORT_MUTE
+        );
+
+        // Software-only / null endpoint must report 0 (no hardware volume/mute controls),
+        // even when CoreAudio is the active backend.
+        backend::force_backend(Some(backend::Backend::Null));
+        let null_ep = Arc::new(Endpoint::new(backend::null_device()));
+        let null_st = EndpointVolumeState::new(null_ep.clone());
+        assert_eq!(null_st.hardware_support_mask(), 0);
+
+        #[cfg(target_os = "macos")]
+        {
+            backend::force_backend(Some(backend::Backend::CoreAudio));
+            assert_eq!(
+                null_st.hardware_support_mask(),
+                0,
+                "null/software-only endpoint must still report 0 under CoreAudio backend"
+            );
+            for dev in backend::output_devices() {
+                let ep = Arc::new(Endpoint::new(dev.clone()));
+                let st = EndpointVolumeState::new(ep);
+                let (hw_vol, hw_mute) =
+                    backend::device_hardware_volume_support(&dev, false, st.channel_count as u32);
+                let expected = EndpointVolumeState::hardware_support_mask_from(hw_vol, hw_mute);
+                assert_eq!(st.hardware_support_mask(), expected);
+                if dev.id == 0 {
+                    assert_eq!(expected, 0);
+                }
+                if hw_vol {
+                    let has_any_vol = backend::device_volume_scalar(&dev, false).is_some()
+                        || (0..st.channel_count as u32)
+                            .any(|ch| backend::device_channel_volume_scalar(&dev, false, ch).is_some());
+                    assert!(
+                        has_any_vol,
+                        "endpoint '{}' reported ENDPOINT_HARDWARE_SUPPORT_VOLUME without readable HAL volume",
+                        dev.name
+                    );
+                }
+                if hw_mute {
+                    assert!(
+                        backend::device_mute(&dev, false).is_some(),
+                        "endpoint '{}' reported ENDPOINT_HARDWARE_SUPPORT_MUTE without readable HAL mute",
+                        dev.name
+                    );
+                }
+            }
+            for dev in backend::input_devices() {
+                let ep = Arc::new(Endpoint::new_capture(dev.clone()));
+                let st = EndpointVolumeState::new(ep);
+                let (hw_vol, hw_mute) =
+                    backend::device_hardware_volume_support(&dev, true, st.channel_count as u32);
+                assert_eq!(
+                    st.hardware_support_mask(),
+                    EndpointVolumeState::hardware_support_mask_from(hw_vol, hw_mute)
+                );
+            }
+            backend::force_backend(None);
+        }
     }
 }

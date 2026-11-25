@@ -475,13 +475,13 @@ impl WsaExtension {
 
     pub const fn symbol_name(self) -> &'static str {
         match self {
-            WsaExtension::RecvMsg => "ws2_32!WSARecvMsg",
-            WsaExtension::SendMsg => "ws2_32!WSASendMsg",
             WsaExtension::AcceptEx => "ws2_32!AcceptEx",
             WsaExtension::ConnectEx => "ws2_32!ConnectEx",
             WsaExtension::DisconnectEx => "ws2_32!DisconnectEx",
             WsaExtension::TransmitFile => "ws2_32!TransmitFile",
             WsaExtension::GetAcceptExSockaddrs => "ws2_32!GetAcceptExSockaddrs",
+            WsaExtension::RecvMsg => "ws2_32!WSARecvMsg",
+            WsaExtension::SendMsg => "ws2_32!WSASendMsg",
         }
     }
 }

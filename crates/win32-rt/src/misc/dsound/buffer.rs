@@ -112,6 +112,7 @@ pub(super) const DSBCAPS_CTRLFREQUENCY: u32 = 0x0000_0020;
 pub(super) const DSBCAPS_CTRLPAN: u32 = 0x0000_0040;
 pub(super) const DSBCAPS_CTRLVOLUME: u32 = 0x0000_0080;
 pub(super) const DSBCAPS_CTRLPOSITIONNOTIFY: u32 = 0x0000_0100;
+pub(super) const DSBCAPS_CTRLFX: u32 = 0x0000_0200;
 pub(super) const DSBCAPS_MUTE3DATMAXDISTANCE: u32 = 0x0002_0000;
 
 // DSBPLAY / DSBSTATUS / DSBLOCK flags
@@ -133,7 +134,660 @@ pub(super) const DSBVOLUME_MAX: i32 = 0;
 pub(super) const DSBSIZE_MIN: u32 = 4;
 pub(super) const DSBSIZE_MAX: u32 = 0x0FFF_FFFF;
 pub(super) const DSBPN_OFFSETSTOP: u32 = 0xFFFF_FFFF;
+pub(super) const DSFX_LOCHARDWARE: u32 = 1;
+pub(super) const DSFXR_LOCSOFTWARE: u32 = 2;
 pub(super) const DSFXR_FAILED: u32 = 4;
+pub(super) const DSFXR_UNKNOWN: u32 = 5;
+
+// Wildcard object GUID for IDirectSoundBuffer8::GetObjectInPath (<dsound.h>: GUID_All_Objects)
+// {aa114de5-c262-4169-a1c8-23d698cc73b5}
+pub(super) const GUID_ALL_OBJECTS: GUID =
+    GUID::new(0xAA11_4DE5, 0xC262, 0x4169, [0xA1, 0xC8, 0x23, 0xD6, 0x98, 0xCC, 0x73, 0xB5]);
+
+// Standard DirectSound 8 FX CLSIDs (<dsound.h>)
+pub(super) const GUID_DSFX_STANDARD_GARGLE: GUID =
+    GUID::new(0xDAFD_8210, 0x5711, 0x4B91, [0x9F, 0xE3, 0xF7, 0x5B, 0x7A, 0xE2, 0x79, 0xBF]);
+pub(super) const GUID_DSFX_STANDARD_CHORUS: GUID =
+    GUID::new(0xEFE6_629C, 0x81F7, 0x4281, [0xBD, 0x91, 0xC9, 0xD6, 0x04, 0xA9, 0x5A, 0xF6]);
+pub(super) const GUID_DSFX_STANDARD_FLANGER: GUID =
+    GUID::new(0xEFCA_3D92, 0xDFD8, 0x4672, [0xA6, 0x03, 0x74, 0x20, 0x89, 0x4B, 0xAD, 0x98]);
+pub(super) const GUID_DSFX_STANDARD_ECHO: GUID =
+    GUID::new(0xEF3E_932C, 0xD40B, 0x4F51, [0x8C, 0xCF, 0x3F, 0x98, 0xF1, 0xB2, 0x9D, 0x5D]);
+pub(super) const GUID_DSFX_STANDARD_DISTORTION: GUID =
+    GUID::new(0xEF11_4C90, 0xCD1D, 0x484E, [0x96, 0xE5, 0x09, 0xCF, 0xAF, 0x91, 0x2A, 0x21]);
+pub(super) const GUID_DSFX_STANDARD_COMPRESSOR: GUID =
+    GUID::new(0xEF01_1F79, 0x4000, 0x406D, [0x87, 0xAF, 0xBF, 0xFB, 0x3F, 0xC3, 0x9D, 0x57]);
+pub(super) const GUID_DSFX_STANDARD_PARAMEQ: GUID =
+    GUID::new(0x120C_ED89, 0x3BF4, 0x4173, [0xA1, 0x32, 0x3C, 0xB4, 0x06, 0xCF, 0x32, 0x31]);
+pub(super) const GUID_DSFX_STANDARD_I3DL2REVERB: GUID =
+    GUID::new(0xEF98_5E71, 0xD5C7, 0x42D4, [0xBA, 0x4D, 0x2D, 0x07, 0x3E, 0x2E, 0x96, 0xF4]);
+pub(super) const GUID_DSFX_WAVES_REVERB: GUID =
+    GUID::new(0x87FC_0268, 0x9A55, 0x4360, [0x95, 0xAA, 0x00, 0x4A, 0x1D, 0x9D, 0xE2, 0x6C]);
+
+// DirectSound 8 FX parameter interface IIDs (<dsound.h>)
+pub(super) const IID_IDIRECTSOUNDFXGARGLE: GUID =
+    GUID::new(0xD616_F352, 0xD622, 0x11CE, [0xAA, 0xC5, 0x00, 0x20, 0xAF, 0x0B, 0x99, 0xA3]);
+pub(super) const IID_IDIRECTSOUNDFXCHORUS: GUID =
+    GUID::new(0x8808_42E3, 0x145F, 0x43E6, [0xA9, 0x34, 0xA7, 0x18, 0x06, 0xE5, 0x05, 0x47]);
+pub(super) const IID_IDIRECTSOUNDFXFLANGER: GUID =
+    GUID::new(0x903E_9878, 0x2C92, 0x4072, [0x9B, 0x2C, 0xEA, 0x68, 0xF5, 0x39, 0x67, 0x83]);
+pub(super) const IID_IDIRECTSOUNDFXECHO: GUID =
+    GUID::new(0x8BD2_8EDF, 0x50DB, 0x4E92, [0xA2, 0xBD, 0x44, 0x54, 0x88, 0xD1, 0xED, 0x42]);
+pub(super) const IID_IDIRECTSOUNDFXDISTORTION: GUID =
+    GUID::new(0x8ECF_4326, 0x455F, 0x4D8B, [0xBD, 0xA9, 0x8D, 0x5D, 0x3E, 0x9E, 0x3E, 0x0B]);
+pub(super) const IID_IDIRECTSOUNDFXCOMPRESSOR: GUID =
+    GUID::new(0x4BBD_1154, 0x62F6, 0x4E2C, [0xA1, 0x5C, 0xD3, 0xB6, 0xC4, 0x17, 0xF7, 0xA0]);
+pub(super) const IID_IDIRECTSOUNDFXPARAMEQ: GUID =
+    GUID::new(0xC03C_A9FE, 0xFE90, 0x4204, [0x80, 0x78, 0x82, 0x33, 0x4C, 0xD1, 0x77, 0xDA]);
+pub(super) const IID_IDIRECTSOUNDFXI3DL2REVERB: GUID =
+    GUID::new(0x4B16_6A6A, 0x0D66, 0x43F3, [0x80, 0xE3, 0xEE, 0x62, 0x80, 0xDE, 0xE1, 0xA4]);
+pub(super) const IID_IDIRECTSOUNDFXWAVESREVERB: GUID =
+    GUID::new(0x4685_8C3A, 0x0DC6, 0x45E3, [0xB7, 0x60, 0xD4, 0xEE, 0xF1, 0x6C, 0xB3, 0x25]);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct DsEffectDesc {
+    pub(super) dw_size: u32,
+    pub(super) dw_flags: u32,
+    pub(super) guid_dsfx_class: GUID,
+    pub(super) dw_reserved1: usize,
+    pub(super) dw_reserved2: usize,
+}
+const _: () = assert!(std::mem::size_of::<DsEffectDesc>() == 40);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DsFxKind {
+    Gargle,
+    Chorus,
+    Flanger,
+    Echo,
+    Distortion,
+    Compressor,
+    ParamEq,
+    I3dl2Reverb,
+    WavesReverb,
+}
+
+impl DsFxKind {
+    pub(super) fn from_clsid(g: GUID) -> Option<Self> {
+        if g == GUID_DSFX_STANDARD_GARGLE { Some(Self::Gargle) }
+        else if g == GUID_DSFX_STANDARD_CHORUS { Some(Self::Chorus) }
+        else if g == GUID_DSFX_STANDARD_FLANGER { Some(Self::Flanger) }
+        else if g == GUID_DSFX_STANDARD_ECHO { Some(Self::Echo) }
+        else if g == GUID_DSFX_STANDARD_DISTORTION { Some(Self::Distortion) }
+        else if g == GUID_DSFX_STANDARD_COMPRESSOR { Some(Self::Compressor) }
+        else if g == GUID_DSFX_STANDARD_PARAMEQ { Some(Self::ParamEq) }
+        else if g == GUID_DSFX_STANDARD_I3DL2REVERB { Some(Self::I3dl2Reverb) }
+        else if g == GUID_DSFX_WAVES_REVERB { Some(Self::WavesReverb) }
+        else { None }
+    }
+
+    pub(super) fn clsid(self) -> GUID {
+        match self {
+            Self::Gargle => GUID_DSFX_STANDARD_GARGLE,
+            Self::Chorus => GUID_DSFX_STANDARD_CHORUS,
+            Self::Flanger => GUID_DSFX_STANDARD_FLANGER,
+            Self::Echo => GUID_DSFX_STANDARD_ECHO,
+            Self::Distortion => GUID_DSFX_STANDARD_DISTORTION,
+            Self::Compressor => GUID_DSFX_STANDARD_COMPRESSOR,
+            Self::ParamEq => GUID_DSFX_STANDARD_PARAMEQ,
+            Self::I3dl2Reverb => GUID_DSFX_STANDARD_I3DL2REVERB,
+            Self::WavesReverb => GUID_DSFX_WAVES_REVERB,
+        }
+    }
+
+    pub(super) fn param_iid(self) -> GUID {
+        match self {
+            Self::Gargle => IID_IDIRECTSOUNDFXGARGLE,
+            Self::Chorus => IID_IDIRECTSOUNDFXCHORUS,
+            Self::Flanger => IID_IDIRECTSOUNDFXFLANGER,
+            Self::Echo => IID_IDIRECTSOUNDFXECHO,
+            Self::Distortion => IID_IDIRECTSOUNDFXDISTORTION,
+            Self::Compressor => IID_IDIRECTSOUNDFXCOMPRESSOR,
+            Self::ParamEq => IID_IDIRECTSOUNDFXPARAMEQ,
+            Self::I3dl2Reverb => IID_IDIRECTSOUNDFXI3DL2REVERB,
+            Self::WavesReverb => IID_IDIRECTSOUNDFXWAVESREVERB,
+        }
+    }
+
+    pub(super) fn default_params(self) -> Vec<u8> {
+        let mut v = Vec::new();
+        match self {
+            Self::Gargle => {
+                // DSFXGargle: dwRateHz(20), dwWaveShape(0=TRIANGLE)
+                v.extend_from_slice(&20u32.to_le_bytes());
+                v.extend_from_slice(&0u32.to_le_bytes());
+            }
+            Self::Chorus => {
+                // DSFXChorus (28 bytes): fWetDryMix(50), fDepth(10), fFeedback(25), fFrequency(1.1), lWaveform(1), fDelay(16), lPhase(3)
+                for f in [50.0f32, 10.0, 25.0, 1.1] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&1i32.to_le_bytes());
+                v.extend_from_slice(&16.0f32.to_le_bytes());
+                v.extend_from_slice(&3i32.to_le_bytes());
+            }
+            Self::Flanger => {
+                // DSFXFlanger (28 bytes): fWetDryMix(50), fDepth(100), fFeedback(-50), fFrequency(0.25), lWaveform(1), fDelay(2), lPhase(2)
+                for f in [50.0f32, 100.0, -50.0, 0.25] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&1i32.to_le_bytes());
+                v.extend_from_slice(&2.0f32.to_le_bytes());
+                v.extend_from_slice(&2i32.to_le_bytes());
+            }
+            Self::Echo => {
+                // DSFXEcho (20 bytes): fWetDryMix(50), fFeedback(50), fLeftDelay(500), fRightDelay(500), lPanDelay(0)
+                for f in [50.0f32, 50.0, 500.0, 500.0] { v.extend_from_slice(&f.to_le_bytes()); }
+                v.extend_from_slice(&0i32.to_le_bytes());
+            }
+            Self::Distortion => {
+                // DSFXDistortion (20 bytes): fGain(-18), fEdge(15), fPostEQCenterFrequency(2400), fPostEQBandwidth(2400), fPreLowpassCutoff(8000)
+                for f in [-18.0f32, 15.0, 2400.0, 2400.0, 8000.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::Compressor => {
+                // DSFXCompressor (24 bytes): fGain(0), fAttack(10), fRelease(200), fThreshold(-20), fRatio(3), fPredelay(4)
+                for f in [0.0f32, 10.0, 200.0, -20.0, 3.0, 4.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::ParamEq => {
+                // DSFXParamEq (12 bytes): fCenter(8000), fBandwidth(12), fGain(0)
+                for f in [8000.0f32, 12.0, 0.0] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+            Self::I3dl2Reverb => {
+                // DSFXI3DL2Reverb (48 bytes)
+                v.extend_from_slice(&(-1000i32).to_le_bytes()); // lRoom
+                v.extend_from_slice(&(-100i32).to_le_bytes()); // lRoomHF
+                v.extend_from_slice(&0.0f32.to_le_bytes()); // flRoomRolloffFactor
+                v.extend_from_slice(&1.49f32.to_le_bytes()); // flDecayTime
+                v.extend_from_slice(&0.83f32.to_le_bytes()); // flDecayHFRatio
+                v.extend_from_slice(&(-2602i32).to_le_bytes()); // lReflections
+                v.extend_from_slice(&0.007f32.to_le_bytes()); // flReflectionsDelay
+                v.extend_from_slice(&200i32.to_le_bytes()); // lReverb
+                v.extend_from_slice(&0.011f32.to_le_bytes()); // flReverbDelay
+                v.extend_from_slice(&100.0f32.to_le_bytes()); // flDiffusion
+                v.extend_from_slice(&100.0f32.to_le_bytes()); // flDensity
+                v.extend_from_slice(&5000.0f32.to_le_bytes()); // flHFReference
+            }
+            Self::WavesReverb => {
+                // DSFXWavesReverb (16 bytes): fInGain(0), fReverbMix(0), fReverbTime(1000), fHighFreqRTRatio(0.001)
+                for f in [0.0f32, 0.0, 1000.0, 0.001] { v.extend_from_slice(&f.to_le_bytes()); }
+            }
+        }
+        v
+    }
+}
+
+pub(super) const DSFX_I3DL2REVERB_QUALITY_MIN: i32 = 0;
+pub(super) const DSFX_I3DL2REVERB_QUALITY_MAX: i32 = 3;
+pub(super) const DSFX_I3DL2REVERB_QUALITY_DEFAULT: i32 = 2;
+
+/// Encode a 48-byte `DSFXI3DL2Reverb` parameter block from its 12 documented fields.
+fn encode_i3dl2_params(
+    room: i32,
+    room_hf: i32,
+    room_rolloff: f32,
+    decay_time: f32,
+    decay_hf_ratio: f32,
+    reflections: i32,
+    reflections_delay: f32,
+    reverb: i32,
+    reverb_delay: f32,
+    diffusion: f32,
+    density: f32,
+    hf_reference: f32,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(48);
+    v.extend_from_slice(&room.to_le_bytes());
+    v.extend_from_slice(&room_hf.to_le_bytes());
+    v.extend_from_slice(&room_rolloff.to_le_bytes());
+    v.extend_from_slice(&decay_time.to_le_bytes());
+    v.extend_from_slice(&decay_hf_ratio.to_le_bytes());
+    v.extend_from_slice(&reflections.to_le_bytes());
+    v.extend_from_slice(&reflections_delay.to_le_bytes());
+    v.extend_from_slice(&reverb.to_le_bytes());
+    v.extend_from_slice(&reverb_delay.to_le_bytes());
+    v.extend_from_slice(&diffusion.to_le_bytes());
+    v.extend_from_slice(&density.to_le_bytes());
+    v.extend_from_slice(&hf_reference.to_le_bytes());
+    v
+}
+
+/// Standard DirectSound 8 I3DL2 environment presets (`DSFX_I3DL2_ENVIRONMENT_PRESET_*`, 0..=29)
+/// matching `dsound.h` / Microsoft Learn `IDirectSoundFXI3DL2Reverb::SetPreset`.
+pub(super) fn i3dl2_preset_params(preset: u32) -> Option<Vec<u8>> {
+    let p = match preset {
+        0 => (-1000, -100, 0.0, 1.49, 0.83, -2602, 0.007, 200, 0.011, 100.0, 100.0, 5000.0), // DEFAULT
+        1 => (-1000, -100, 0.0, 1.49, 0.83, -2602, 0.007, 200, 0.011, 100.0, 100.0, 5000.0), // GENERIC
+        2 => (-1000, -6000, 0.0, 0.17, 0.10, -1204, 0.001, 207, 0.002, 100.0, 100.0, 5000.0), // PADDEDCELL
+        3 => (-1000, -454, 0.0, 0.40, 0.83, -1646, 0.002, 53, 0.003, 100.0, 100.0, 5000.0), // ROOM
+        4 => (-1000, -1200, 0.0, 1.49, 0.54, -370, 0.007, 1030, 0.011, 100.0, 60.0, 5000.0), // BATHROOM
+        5 => (-1000, -6000, 0.0, 0.50, 0.10, -1376, 0.003, -1104, 0.004, 100.0, 100.0, 5000.0), // LIVINGROOM
+        6 => (-1000, -300, 0.0, 2.31, 0.64, -711, 0.012, 83, 0.017, 100.0, 100.0, 5000.0), // STONEROOM
+        7 => (-1000, -476, 0.0, 4.32, 0.59, -789, 0.020, -289, 0.030, 100.0, 100.0, 5000.0), // AUDITORIUM
+        8 => (-1000, -500, 0.0, 3.92, 0.70, -1230, 0.020, -2, 0.029, 100.0, 100.0, 5000.0), // CONCERTHALL
+        9 => (-1000, 0, 0.0, 2.91, 1.30, -602, 0.015, -302, 0.022, 100.0, 100.0, 5000.0), // CAVE
+        10 => (-1000, -698, 0.0, 7.24, 0.33, -1166, 0.020, 16, 0.030, 100.0, 100.0, 5000.0), // ARENA
+        11 => (-1000, -1000, 0.0, 10.05, 0.23, -602, 0.020, 198, 0.030, 100.0, 100.0, 5000.0), // HANGAR
+        12 => (-1000, -4000, 0.0, 0.30, 0.10, -1831, 0.002, -1630, 0.030, 100.0, 100.0, 5000.0), // CARPETEDHALLWAY
+        13 => (-1000, -300, 0.0, 1.49, 0.59, -1219, 0.007, 441, 0.011, 100.0, 100.0, 5000.0), // HALLWAY
+        14 => (-1000, -237, 0.0, 2.70, 0.79, -1214, 0.013, 395, 0.020, 100.0, 100.0, 5000.0), // STONECORRIDOR
+        15 => (-1000, -270, 0.0, 1.49, 0.86, -1204, 0.007, -4, 0.011, 100.0, 100.0, 5000.0), // ALLEY
+        16 => (-1000, -3300, 0.0, 1.49, 0.54, -2560, 0.162, -613, 0.088, 79.0, 100.0, 5000.0), // FOREST
+        17 => (-1000, -800, 0.0, 1.49, 0.67, -2273, 0.007, -2217, 0.011, 50.0, 100.0, 5000.0), // CITY
+        18 => (-1000, -2500, 0.0, 1.49, 0.21, -2780, 0.300, -2014, 0.100, 27.0, 100.0, 5000.0), // MOUNTAINS
+        19 => (-1000, -1000, 0.0, 1.49, 0.83, -10000, 0.061, 500, 0.025, 100.0, 100.0, 5000.0), // QUARRY
+        20 => (-1000, -2000, 0.0, 1.49, 0.50, -2466, 0.179, -2514, 0.100, 21.0, 100.0, 5000.0), // PLAIN
+        21 => (-1000, 0, 0.0, 1.65, 1.50, -1363, 0.008, -1153, 0.012, 100.0, 100.0, 5000.0), // PARKINGLOT
+        22 => (-1000, -1000, 0.0, 2.81, 0.14, 429, 0.014, 648, 0.021, 80.0, 60.0, 5000.0), // SEWERPIPE
+        23 => (-1000, -4000, 0.0, 1.49, 0.10, -449, 0.007, 1700, 0.011, 100.0, 100.0, 5000.0), // UNDERWATER
+        24 => (-1000, -600, 0.0, 1.10, 0.83, -400, 0.005, 500, 0.010, 100.0, 100.0, 5000.0), // SMALLROOM
+        25 => (-1000, -600, 0.0, 1.30, 0.83, -1000, 0.010, -200, 0.020, 100.0, 100.0, 5000.0), // MEDIUMROOM
+        26 => (-1000, -600, 0.0, 1.50, 0.83, -1600, 0.020, -1000, 0.040, 100.0, 100.0, 5000.0), // LARGEROOM
+        27 => (-1000, -600, 0.0, 1.80, 0.70, -1300, 0.015, -800, 0.030, 100.0, 100.0, 5000.0), // MEDIUMHALL
+        28 => (-1000, -600, 0.0, 1.80, 0.70, -2000, 0.030, -1400, 0.060, 100.0, 100.0, 5000.0), // LARGEHALL
+        29 => (-1000, -200, 0.0, 1.30, 0.90, 0, 0.002, 0, 0.010, 100.0, 75.0, 5000.0), // PLATE
+        _ => return None,
+    };
+    Some(encode_i3dl2_params(p.0, p.1, p.2, p.3, p.4, p.5, p.6, p.7, p.8, p.9, p.10, p.11))
+}
+
+pub(super) struct BufferEffect {
+    pub(super) kind: DsFxKind,
+    pub(super) params: Vec<u8>,
+    pub(super) i3dl2_preset: u32,
+    pub(super) i3dl2_quality: i32,
+    delay_l: Vec<f32>,
+    delay_r: Vec<f32>,
+    delay_pos: usize,
+    phase: f32,
+    env: f32,
+    lp_l: f32,
+    lp_r: f32,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl BufferEffect {
+    pub(super) fn new(kind: DsFxKind) -> Self {
+        let cap = match kind {
+            DsFxKind::Echo | DsFxKind::WavesReverb | DsFxKind::I3dl2Reverb => 96_001,
+            DsFxKind::Chorus | DsFxKind::Flanger => 4_096,
+            DsFxKind::Compressor => 1_024,
+            _ => 0,
+        };
+        Self {
+            kind,
+            params: kind.default_params(),
+            i3dl2_preset: 0,
+            i3dl2_quality: DSFX_I3DL2REVERB_QUALITY_DEFAULT,
+            delay_l: vec![0.0; cap],
+            delay_r: vec![0.0; cap],
+            delay_pos: 0,
+            phase: 0.0,
+            env: 0.0,
+            lp_l: 0.0,
+            lp_r: 0.0,
+            z1_l: 0.0,
+            z2_l: 0.0,
+            z1_r: 0.0,
+            z2_r: 0.0,
+        }
+    }
+
+    #[inline]
+    fn param_f32(&self, off: usize) -> f32 {
+        self.params
+            .get(off..off + 4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0.0)
+    }
+
+    #[inline]
+    fn param_u32(&self, off: usize) -> u32 {
+        self.params
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    fn param_i32(&self, off: usize) -> i32 {
+        self.param_u32(off) as i32
+    }
+
+    /// Ensure the stereo delay ring holds at least `max_delay_samples` of history
+    /// (capacity >= `max_delay_samples + 1`), unwrapping existing circular history
+    /// cleanly when growing for higher primary sample rates.
+    fn ensure_delay_capacity(&mut self, max_delay_samples: usize) {
+        let needed = max_delay_samples.saturating_add(1);
+        let old_cap = self.delay_l.len();
+        if needed <= old_cap {
+            return;
+        }
+        let mut new_l = vec![0.0; needed];
+        let mut new_r = vec![0.0; needed];
+        if old_cap > 0 {
+            let tail = old_cap - self.delay_pos;
+            new_l[..tail].copy_from_slice(&self.delay_l[self.delay_pos..old_cap]);
+            new_l[tail..old_cap].copy_from_slice(&self.delay_l[..self.delay_pos]);
+            new_r[..tail].copy_from_slice(&self.delay_r[self.delay_pos..old_cap]);
+            new_r[tail..old_cap].copy_from_slice(&self.delay_r[..self.delay_pos]);
+        }
+        self.delay_l = new_l;
+        self.delay_r = new_r;
+        self.delay_pos = old_cap;
+    }
+
+    /// Process one stereo sample through this DirectSound 8 software DSP effect.
+    pub(super) fn process_sample(&mut self, l: f32, r: f32, sample_rate: f32) -> (f32, f32) {
+        let sr = sample_rate.max(8_000.0);
+        match self.kind {
+            DsFxKind::Echo => {
+                let wet = (self.param_f32(0).clamp(0.0, 100.0)) * 0.01;
+                let fb = (self.param_f32(4).clamp(0.0, 99.0)) * 0.01;
+                let dl = ((self.param_f32(8).clamp(1.0, 2000.0) * 0.001 * sr).round() as usize).max(1);
+                let dr = ((self.param_f32(12).clamp(1.0, 2000.0) * 0.001 * sr).round() as usize).max(1);
+                self.ensure_delay_capacity(dl.max(dr));
+                let pan_delay = self.param_i32(16) != 0;
+                let cap = self.delay_l.len();
+                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                let (fb_l, fb_r) = if pan_delay { (rr, rl) } else { (rl, rr) };
+                self.delay_l[self.delay_pos] = (l + fb_l * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + fb_r * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * (1.0 - wet) + rl * wet, r * (1.0 - wet) + rr * wet)
+            }
+            DsFxKind::Chorus | DsFxKind::Flanger => {
+                let wet = (self.param_f32(0).clamp(0.0, 100.0)) * 0.01;
+                let depth = (self.param_f32(4).clamp(0.0, 100.0)) * 0.01;
+                let fb = (self.param_f32(8).clamp(-99.0, 99.0)) * 0.01;
+                let freq = self.param_f32(12).clamp(0.0, 10.0);
+                let waveform = self.param_i32(16); // 0 = TRIANGLE, 1 = SIN
+                let max_delay_ms = if self.kind == DsFxKind::Flanger { 4.0 } else { 20.0 };
+                let base_ms = self.param_f32(20).clamp(0.0, max_delay_ms);
+                let phase_diff = match self.param_i32(24) {
+                    0 => 0.5,  // -180 deg
+                    1 => 0.75, // -90 deg
+                    2 => 0.0,  // 0 deg
+                    3 => 0.25, // +90 deg
+                    4 => 0.5,  // +180 deg
+                    _ => 0.0,
+                };
+                // Bipolar LFO in [-1.0, +1.0] centered around 0 so depth=0 preserves exact fDelay.
+                let eval_lfo = |p: f32| -> f32 {
+                    if waveform == 0 {
+                        if p < 0.5 { p * 4.0 - 1.0 } else { 3.0 - p * 4.0 }
+                    } else {
+                        (p * std::f32::consts::TAU).sin()
+                    }
+                };
+                let lfo_l = eval_lfo(self.phase);
+                let lfo_r = eval_lfo((self.phase + phase_diff).fract());
+                self.phase = (self.phase + freq / sr).fract();
+                let delay_ms_l = (base_ms * (1.0 + 0.5 * depth * lfo_l)).max(0.0);
+                let delay_ms_r = (base_ms * (1.0 + 0.5 * depth * lfo_r)).max(0.0);
+                let d_samp_l = (delay_ms_l * 0.001 * sr).round() as usize;
+                let d_samp_r = (delay_ms_r * 0.001 * sr).round() as usize;
+                if d_samp_l > 0 || d_samp_r > 0 {
+                    self.ensure_delay_capacity(d_samp_l.max(d_samp_r));
+                }
+                let cap = self.delay_l.len();
+                let rl = if d_samp_l == 0 {
+                    l
+                } else {
+                    self.delay_l[(self.delay_pos + cap - d_samp_l) % cap]
+                };
+                let rr = if d_samp_r == 0 {
+                    r
+                } else {
+                    self.delay_r[(self.delay_pos + cap - d_samp_r) % cap]
+                };
+                self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * (1.0 - wet) + rl * wet, r * (1.0 - wet) + rr * wet)
+            }
+            DsFxKind::Distortion => {
+                let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 0.0) / 20.0);
+                let edge = 1.0 + (self.param_f32(4).clamp(0.0, 100.0) * 0.1);
+                let post_fc = self.param_f32(8).clamp(100.0, (sr * 0.45).min(8_000.0));
+                let post_bw = self.param_f32(12).clamp(100.0, 8_000.0);
+                let pre_lp_fc = self.param_f32(16).clamp(100.0, (sr * 0.45).min(8_000.0));
+
+                // 1-pole pre-lowpass filter (fPreLowpassCutoff) before nonlinear waveshaping.
+                let lp_alpha = (1.0 - (-std::f32::consts::TAU * pre_lp_fc / sr).exp()).clamp(0.0, 1.0);
+                self.lp_l += lp_alpha * (l - self.lp_l);
+                self.lp_r += lp_alpha * (r - self.lp_r);
+                let dl = (self.lp_l * edge).tanh();
+                let dr = (self.lp_r * edge).tanh();
+
+                // 2-pole RBJ constant-0dB-peak bandpass post-EQ (fPostEQCenterFrequency / fPostEQBandwidth).
+                let w0 = std::f32::consts::TAU * post_fc / sr;
+                let cos_w0 = w0.cos();
+                let sin_w0 = w0.sin();
+                let q = (post_fc / post_bw).clamp(0.25, 10.0);
+                let alpha = sin_w0 / (2.0 * q);
+                let b0 = alpha;
+                let b2 = -alpha;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+                let inv_a0 = 1.0 / a0;
+                let yl = (b0 * dl + self.z1_l) * inv_a0;
+                self.z1_l = -a1 * yl + self.z2_l;
+                self.z2_l = b2 * dl - a2 * yl;
+                let yr = (b0 * dr + self.z1_r) * inv_a0;
+                self.z1_r = -a1 * yr + self.z2_r;
+                self.z2_r = b2 * dr - a2 * yr;
+                (yl * gain, yr * gain)
+            }
+            DsFxKind::Gargle => {
+                let rate_hz = self.param_u32(0).clamp(1, 1000) as f32;
+                let shape = self.param_u32(4);
+                let p = self.phase;
+                self.phase = (self.phase + rate_hz / sr).fract();
+                let mod_gain = if shape == 1 {
+                    if p < 0.5 { 1.0 } else { 0.0 }
+                } else if p < 0.5 {
+                    p * 2.0
+                } else {
+                    (1.0 - p) * 2.0
+                };
+                (l * mod_gain, r * mod_gain)
+            }
+            DsFxKind::Compressor => {
+                let gain = 10.0f32.powf(self.param_f32(0).clamp(-60.0, 60.0) / 20.0);
+                let attack_s = self.param_f32(4).clamp(0.01, 500.0) * 0.001;
+                let release_s = self.param_f32(8).clamp(50.0, 3000.0) * 0.001;
+                let thresh_db = self.param_f32(12).clamp(-60.0, 0.0);
+                let ratio = self.param_f32(16).clamp(1.0, 100.0);
+                let predelay_ms = self.param_f32(20).clamp(0.0, 4.0);
+                let attack_coeff = (1.0 - (-1.0 / (attack_s * sr)).exp()).clamp(0.0, 1.0);
+                let release_coeff = (1.0 - (-1.0 / (release_s * sr)).exp()).clamp(0.0, 1.0);
+                let peak = l.abs().max(r.abs());
+                let coeff = if peak > self.env { attack_coeff } else { release_coeff };
+                self.env += coeff * (peak - self.env);
+                // Apply compression ratio in the decibel domain per DirectSound DSFXCompressor.
+                let comp = if self.env > 1e-6 {
+                    let env_db = 20.0 * self.env.log10();
+                    if env_db > thresh_db {
+                        let out_db = thresh_db + (env_db - thresh_db) / ratio;
+                        10.0f32.powf((out_db - env_db) / 20.0)
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
+                let predelay_samples = (predelay_ms * 0.001 * sr).round() as usize;
+                if predelay_samples > 0 {
+                    self.ensure_delay_capacity(predelay_samples);
+                }
+                let cap = self.delay_l.len();
+                let (sig_l, sig_r) = if predelay_samples > 0 {
+                    let read_pos = (self.delay_pos + cap - predelay_samples) % cap;
+                    let dl = self.delay_l[read_pos];
+                    let dr = self.delay_r[read_pos];
+                    self.delay_l[self.delay_pos] = l;
+                    self.delay_r[self.delay_pos] = r;
+                    self.delay_pos = (self.delay_pos + 1) % cap;
+                    (dl, dr)
+                } else {
+                    if cap > 0 {
+                        self.delay_l[self.delay_pos] = l;
+                        self.delay_r[self.delay_pos] = r;
+                        self.delay_pos = (self.delay_pos + 1) % cap;
+                    }
+                    (l, r)
+                };
+                (sig_l * comp * gain, sig_r * comp * gain)
+            }
+            DsFxKind::ParamEq => {
+                let fc = self.param_f32(0).clamp(80.0, (sr * 0.45).min(16_000.0));
+                let bw_semi = self.param_f32(4).clamp(1.0, 36.0);
+                let gain_db = self.param_f32(8).clamp(-15.0, 15.0);
+                if gain_db.abs() < 1e-4 {
+                    return (l, r);
+                }
+                let a = 10.0f32.powf(gain_db / 40.0);
+                let w0 = std::f32::consts::TAU * fc / sr;
+                let cos_w0 = w0.cos();
+                let sin_w0 = w0.sin();
+                let q = (1.0 / (2.0 * (bw_semi * 0.0833333 * 0.693147 * 0.5).sinh())).clamp(0.1, 20.0);
+                let alpha = sin_w0 / (2.0 * q);
+                let b0 = 1.0 + alpha * a;
+                let b1 = -2.0 * cos_w0;
+                let b2 = 1.0 - alpha * a;
+                let a0 = 1.0 + alpha / a;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha / a;
+                let inv_a0 = 1.0 / a0;
+                let yl = (b0 * l + self.z1_l) * inv_a0;
+                self.z1_l = b1 * l - a1 * yl + self.z2_l;
+                self.z2_l = b2 * l - a2 * yl;
+                let yr = (b0 * r + self.z1_r) * inv_a0;
+                self.z1_r = b1 * r - a1 * yr + self.z2_r;
+                self.z2_r = b2 * r - a2 * yr;
+                (yl, yr)
+            }
+            DsFxKind::WavesReverb => {
+                let in_gain = 10.0f32.powf(self.param_f32(0).clamp(-96.0, 0.0) / 20.0);
+                let wet = 10.0f32.powf(self.param_f32(4).clamp(-96.0, 0.0) / 20.0).min(1.0) * 0.5;
+                let decay_ms = self.param_f32(8).clamp(0.001, 3000.0);
+                let hf_ratio = self.param_f32(12).clamp(0.001, 0.999);
+                let dl = ((0.037 * sr).round() as usize).max(1);
+                let dr = ((0.041 * sr).round() as usize).max(1);
+                self.ensure_delay_capacity(dl.max(dr));
+                let cap = self.delay_l.len();
+                let fb = 10.0f32.powf((-3.0 * 37.0) / decay_ms.max(40.0)).clamp(0.0, 0.92);
+                let damp = (0.08 + 0.87 * hf_ratio).clamp(0.05, 0.98);
+                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
+                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                self.z1_l += damp * (rl - self.z1_l);
+                self.z1_r += damp * (rr - self.z1_r);
+                self.delay_l[self.delay_pos] = (l * in_gain + self.z1_r * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r * in_gain + self.z1_l * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (l * in_gain + self.z1_l * wet, r * in_gain + self.z1_r * wet)
+            }
+            DsFxKind::I3dl2Reverb => {
+                let quality = self.i3dl2_quality.clamp(DSFX_I3DL2REVERB_QUALITY_MIN, DSFX_I3DL2REVERB_QUALITY_MAX);
+                let room = 10.0f32.powf(self.param_i32(0).clamp(-10_000, 0) as f32 / 2000.0);
+                let room_hf = 10.0f32.powf(self.param_i32(4).clamp(-10_000, 0) as f32 / 2000.0);
+                let decay_ms = self.param_f32(12).clamp(0.1, 20.0) * 1000.0;
+                let decay_hf = self.param_f32(16).clamp(0.1, 2.0);
+                let refl_gain = (room * 10.0f32.powf(self.param_i32(20).clamp(-10_000, 1000) as f32 / 2000.0))
+                    .min(1.0);
+                let refl_delay_s = self.param_f32(24).clamp(0.0, 0.3);
+                let late_gain = (room * 10.0f32.powf(self.param_i32(28).clamp(-10_000, 2000) as f32 / 2000.0))
+                    .min(1.0);
+                let reverb_delay_s = self.param_f32(32).clamp(0.0, 0.1);
+                let diffusion = self.param_f32(36).clamp(0.0, 100.0) * 0.01;
+                let density = self.param_f32(40).clamp(0.0, 100.0) * 0.01;
+                let hf_ref = self.param_f32(44).clamp(20.0, 20_000.0);
+
+                let d_refl = ((refl_delay_s * sr).round() as usize).max(1);
+                let d_refl2 = (((refl_delay_s + 0.0053) * sr).round() as usize).max(d_refl + 1);
+                let late_base_s = (refl_delay_s + reverb_delay_s + 0.025 + 0.012 * density).min(0.92);
+                let dl = ((late_base_s * sr).round() as usize).max(1);
+                let dr = (((late_base_s + 0.0041) * sr).round() as usize).max(1);
+                let dl2 = (((late_base_s + 0.0113) * sr).round() as usize).max(1);
+                let dr2 = (((late_base_s + 0.0149) * sr).round() as usize).max(1);
+                let dl3 = (((late_base_s + 0.0227) * sr).round() as usize).max(1);
+                let dr3 = (((late_base_s + 0.0271) * sr).round() as usize).max(1);
+                let max_tap = match quality {
+                    0 => dl.max(dr),
+                    1 => d_refl.max(dl).max(dr),
+                    2 => d_refl.max(dl2).max(dr2),
+                    _ => d_refl2.max(dl3).max(dr3),
+                };
+                self.ensure_delay_capacity(max_tap);
+                let cap = self.delay_l.len();
+                let fb = 10.0f32
+                    .powf((-3.0 * (late_base_s * 1000.0)) / decay_ms.max(100.0))
+                    .clamp(0.0, 0.92);
+                let hf_cutoff = (hf_ref * decay_hf * (0.15 + 0.85 * room_hf)).clamp(20.0, sr * 0.45);
+                let damp = (1.0 - (-std::f32::consts::TAU * hf_cutoff / sr).exp()).clamp(0.02, 0.98);
+
+                // Quality 0: single late tap per channel (lowest CPU, no early reflections).
+                // Quality 1: early reflection tap + single late tap.
+                // Quality 2 (default): early reflection + 2-tap dense late reverb.
+                // Quality 3 (highest): 2-tap early reflections + 3-tap late reverb + 2-stage HF damping.
+                let (er_l, er_r) = match quality {
+                    0 => (0.0, 0.0),
+                    1 | 2 => (
+                        self.delay_l[(self.delay_pos + cap - d_refl) % cap],
+                        self.delay_r[(self.delay_pos + cap - d_refl) % cap],
+                    ),
+                    _ => (
+                        0.65 * self.delay_l[(self.delay_pos + cap - d_refl) % cap]
+                            + 0.35 * self.delay_r[(self.delay_pos + cap - d_refl2) % cap],
+                        0.65 * self.delay_r[(self.delay_pos + cap - d_refl) % cap]
+                            + 0.35 * self.delay_l[(self.delay_pos + cap - d_refl2) % cap],
+                    ),
+                };
+                let (rl, rr) = match quality {
+                    0 | 1 => (
+                        self.delay_l[(self.delay_pos + cap - dl) % cap],
+                        self.delay_r[(self.delay_pos + cap - dr) % cap],
+                    ),
+                    2 => (
+                        0.6 * self.delay_l[(self.delay_pos + cap - dl) % cap]
+                            + 0.4 * self.delay_l[(self.delay_pos + cap - dl2) % cap],
+                        0.6 * self.delay_r[(self.delay_pos + cap - dr) % cap]
+                            + 0.4 * self.delay_r[(self.delay_pos + cap - dr2) % cap],
+                    ),
+                    _ => (
+                        0.45 * self.delay_l[(self.delay_pos + cap - dl) % cap]
+                            + 0.32 * self.delay_l[(self.delay_pos + cap - dl2) % cap]
+                            + 0.23 * self.delay_l[(self.delay_pos + cap - dl3) % cap],
+                        0.45 * self.delay_r[(self.delay_pos + cap - dr) % cap]
+                            + 0.32 * self.delay_r[(self.delay_pos + cap - dr2) % cap]
+                            + 0.23 * self.delay_r[(self.delay_pos + cap - dr3) % cap],
+                    ),
+                };
+                self.z1_l += damp * (rl - self.z1_l);
+                self.z1_r += damp * (rr - self.z1_r);
+                let (tail_l, tail_r) = if quality >= 3 {
+                    self.z2_l += damp * (self.z1_l - self.z2_l);
+                    self.z2_r += damp * (self.z1_r - self.z2_r);
+                    (self.z2_l, self.z2_r)
+                } else {
+                    (self.z1_l, self.z1_r)
+                };
+                let cross = 0.5 * diffusion;
+                let fb_l = tail_l * (1.0 - cross) + tail_r * cross;
+                let fb_r = tail_r * (1.0 - cross) + tail_l * cross;
+                self.delay_l[self.delay_pos] = (l + fb_l * fb).clamp(-4.0, 4.0);
+                self.delay_r[self.delay_pos] = (r + fb_r * fb).clamp(-4.0, 4.0);
+                self.delay_pos = (self.delay_pos + 1) % cap;
+                (
+                    l + er_l * refl_gain + tail_l * late_gain,
+                    r + er_r * refl_gain + tail_r * late_gain,
+                )
+            }
+        }
+    }
+}
 
 // 3D constants
 pub(super) const DS3DMODE_NORMAL: u32 = 0;
@@ -834,6 +1488,7 @@ pub(super) struct SecondaryBufferState {
     pub(super) d3d_deferred: Buffer3dParams,
     pub(super) locks: Vec<ActiveLock>,
     pub(super) notifies: Vec<NotifyEntry>,
+    pub(super) effects: Vec<Arc<std::sync::Mutex<BufferEffect>>>,
 }
 
 impl SecondaryBufferState {
@@ -852,6 +1507,7 @@ impl SecondaryBufferState {
             d3d_deferred: Buffer3dParams::default(),
             locks: Vec::new(),
             notifies: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
