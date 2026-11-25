@@ -2133,6 +2133,48 @@ fn cert_str_to_name_roundtrip_and_errors() {
         let rev_str = wintrust::format_dn(&der_w).unwrap();
         assert_eq!(rev_str, "O=Root, CN=Leaf");
 
+        // 2b. Multi-valued RDN attributes must be DER-sorted (X.690 §11.6):
+        //     "OU=B+CN=A" and "CN=A+OU=B" must yield byte-for-byte identical DER.
+        let enc_dn = |s: &[u8]| -> Vec<u8> {
+            let mut n = 0u32;
+            assert_eq!(
+                CertStrToNameA(
+                    X509_ASN_ENCODING,
+                    s.as_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut n,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            let mut buf = vec![0u8; n as usize];
+            assert_eq!(
+                CertStrToNameA(
+                    X509_ASN_ENCODING,
+                    s.as_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr(),
+                    &mut n,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+            buf
+        };
+        let mv1 = enc_dn(b"OU=B+CN=A\0");
+        let mv2 = enc_dn(b"CN=A+OU=B\0");
+        assert_eq!(mv1, mv2, "DER multi-valued RDN SET elements must be canonically sorted");
+        // Verify the inner SET elements are indeed in ascending lexicographic byte order.
+        let (dn_seq, _) = super::asn1::parse_der_item(&mv1).unwrap();
+        let (rdn_set, _) = super::asn1::parse_der_item(dn_seq.val).unwrap();
+        assert_eq!(rdn_set.tag, 0x31);
+        let atvs = super::asn1::der_item_children(rdn_set.val).unwrap();
+        assert_eq!(atvs.len(), 2);
+        assert!(atvs[0].raw < atvs[1].raw, "SET OF elements must be sorted ascending");
+
         // 3. Syntax error reports exact ppszError pointer + CRYPT_E_INVALID_X500_STRING
         let bad = b"CN=Ok, BADKEY=foo\0";
         let mut err_ptr: LPCSTR = std::ptr::null();
@@ -4235,6 +4277,157 @@ fn macos_trust_store_and_extended_chain_policies() {
         assert_eq!(status.l_element_index, 1);
         CertFreeCertificateChain(non_ca_chain);
         CertCloseStore(non_ca_extra, 0);
+
+        // RFC 5280 §4.2.1.9: self-issued rollover CA intermediates (subject == issuer) MUST NOT
+        // count against an ancestor CA's pathLenConstraint, whereas non-self-issued intermediates
+        // MUST count and fail with TRUST_E_BASIC_CONSTRAINTS.
+        let make_synth_cert = |serial: u8, subj_cn: &str, iss_cn: &str, bc_ext_val: Option<&[u8]>| -> Vec<u8> {
+            let tlv = super::asn1::encode_der_tlv;
+            let mk_dn = |cn: &str| {
+                let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+                atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+                tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+            };
+            let mut alg = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]);
+            alg = tlv(0x30, &alg);
+            let mut val = tlv(0x17, b"200101000000Z");
+            val.extend_from_slice(&tlv(0x17, b"950101000000Z"));
+            let mut spki = tlv(0x30, &tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]));
+            spki.extend_from_slice(&tlv(0x03, &[0x00, 0x04, serial]));
+            let mut tbs = tlv(0xA0, &tlv(0x02, &[0x02])); // v3
+            tbs.extend_from_slice(&tlv(0x02, &[serial]));
+            tbs.extend_from_slice(&alg);
+            tbs.extend_from_slice(&mk_dn(iss_cn));
+            tbs.extend_from_slice(&tlv(0x30, &val));
+            tbs.extend_from_slice(&mk_dn(subj_cn));
+            tbs.extend_from_slice(&tlv(0x30, &spki));
+            if let Some(bc_der) = bc_ext_val {
+                let mut ext = tlv(0x06, &[0x55, 0x1D, 0x13]);
+                ext.extend_from_slice(&tlv(0x01, &[0xFF]));
+                ext.extend_from_slice(&tlv(0x04, bc_der));
+                tbs.extend_from_slice(&tlv(0xA3, &tlv(0x30, &tlv(0x30, &ext))));
+            }
+            let mut cert_body = tlv(0x30, &tbs);
+            cert_body.extend_from_slice(&alg);
+            cert_body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+            tlv(0x30, &cert_body)
+        };
+        let bc_ca_true = super::asn1::encode_der_tlv(0x30, &super::asn1::encode_der_tlv(0x01, &[0xFF]));
+        let mut bc_pathlen0_inner = super::asn1::encode_der_tlv(0x01, &[0xFF]);
+        bc_pathlen0_inner.extend_from_slice(&super::asn1::encode_der_tlv(0x02, &[0x00]));
+        let bc_pathlen0 = super::asn1::encode_der_tlv(0x30, &bc_pathlen0_inner);
+
+        let self_issued_rollover = make_synth_cert(2, "RolloverCA", "RolloverCA", Some(&bc_ca_true));
+        let non_self_sub_ca = make_synth_cert(3, "SubCA", "ParentCA", Some(&bc_ca_true));
+        let pathlen0_issuer = make_synth_cert(4, "ParentCA", "RootCA", Some(&bc_pathlen0));
+
+        // Chain [leaf, self_issued_rollover, pathlen0_issuer]: 0 non-self-issued intermediates
+        // below pathlen0_issuer -> MUST PASS!
+        let rollover_store = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                rollover_store,
+                X509_ASN_ENCODING,
+                self_issued_rollover.as_ptr(),
+                self_issued_rollover.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                rollover_store,
+                X509_ASN_ENCODING,
+                pathlen0_issuer.as_ptr(),
+                pathlen0_issuer.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut rollover_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                legacy_leaf_ctx,
+                std::ptr::null(),
+                rollover_store,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut rollover_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                rollover_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "self-issued rollover CA must NOT count against pathLenConstraint=0"
+        );
+        CertFreeCertificateChain(rollover_chain);
+        CertCloseStore(rollover_store, 0);
+
+        // Chain [leaf, non_self_sub_ca, pathlen0_issuer]: 1 non-self-issued intermediate
+        // below pathlen0_issuer -> MUST FAIL with TRUST_E_BASIC_CONSTRAINTS at index 2!
+        let sub_store = CertOpenStore(super::store::CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                sub_store,
+                X509_ASN_ENCODING,
+                non_self_sub_ca.as_ptr(),
+                non_self_sub_ca.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                sub_store,
+                X509_ASN_ENCODING,
+                pathlen0_issuer.as_ptr(),
+                pathlen0_issuer.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut sub_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                legacy_leaf_ctx,
+                std::ptr::null(),
+                sub_store,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut sub_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                sub_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6019); // TRUST_E_BASIC_CONSTRAINTS
+        assert_eq!(status.l_element_index, 2);
+        CertFreeCertificateChain(sub_chain);
+        CertCloseStore(sub_store, 0);
         CertFreeCertificateContext(legacy_leaf_ctx);
 
         // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert even when trusted

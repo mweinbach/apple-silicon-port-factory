@@ -833,15 +833,18 @@ pub(crate) const CERT_E_REVOKED: u32 = 0x800B_010C;
 pub(crate) const CERT_E_CN_NO_MATCH: u32 = 0x800B_010F;
 pub(crate) const CERT_E_WRONG_USAGE: u32 = 0x800B_0110;
 pub(crate) const CERT_E_UNTRUSTEDCA: u32 = 0x800B_0112;
+pub(crate) const CERT_E_INVALID_POLICY: u32 = 0x800B_0113;
 pub(crate) const CRYPT_E_NO_REVOCATION_CHECK: u32 = 0x8009_2012;
 pub(crate) const CRYPT_E_REVOCATION_OFFLINE: u32 = 0x8009_2013;
 
 // CERT_TRUST_STATUS.dwErrorStatus bits
 const CERT_TRUST_IS_NOT_TIME_VALID: u32 = 0x0000_0001;
 const CERT_TRUST_IS_REVOKED: u32 = 0x0000_0004;
+const CERT_TRUST_IS_NOT_SIGNATURE_VALID: u32 = 0x0000_0008;
 const CERT_TRUST_IS_NOT_VALID_FOR_USAGE: u32 = 0x0000_0010;
 const CERT_TRUST_IS_UNTRUSTED_ROOT: u32 = 0x0000_0020;
 const CERT_TRUST_REVOCATION_STATUS_UNKNOWN: u32 = 0x0000_0040;
+const CERT_TRUST_INVALID_POLICY_CONSTRAINTS: u32 = 0x0000_0400;
 const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
 const CERT_TRUST_IS_OFFLINE_REVOCATION: u32 = 0x0100_0000;
 
@@ -870,6 +873,7 @@ struct RegisteredChain {
     default_chain_error: u32,
     revocation_flags: u32,
     revocation_error: u32,
+    chain_para_error: u32,
 }
 
 unsafe impl Send for RegisteredChain {}
@@ -1242,8 +1246,11 @@ fn verify_chain_to_root_with_eku(
     let mut issuing_ca_spki: Option<Vec<u8>> = None;
 
     // Walk up to 16 chain links looking for a trusted root.
+    // Track non-self-issued intermediates separately per RFC 5280 §4.2.1.9 & §6.1.4(l)
+    // so self-issued CA rollover certificates do not consume pathLenConstraint.
     let mut visited = vec![false; chain_der.len()];
     visited[0] = true;
+    let mut non_self_issued_intermediates = 0usize;
     for step in 0..16 {
         // Direct match: cur itself is a trusted root (same subject + SPKI).
         if let Some((_, spki, _, _)) = root_parts.iter().find(|(subj, spki, _, _)| {
@@ -1277,7 +1284,11 @@ fn verify_chain_to_root_with_eku(
             }
             if let Some(p) = cand.as_ref() {
                 if p.subject_inner == cur.issuer_inner
-                    && intermediate_is_valid_ca(&chain_der[i], step, required_eku)
+                    && intermediate_is_valid_ca(
+                        &chain_der[i],
+                        non_self_issued_intermediates,
+                        required_eku,
+                    )
                     && verify_cert_sig_with_spki(cur, p.spki_alg_inner, p.spki_key_bits)
                 {
                     next_idx = Some(i);
@@ -1289,6 +1300,9 @@ fn verify_chain_to_root_with_eku(
         let next_cert = parsed[ni].as_ref().unwrap();
         if step == 0 {
             issuing_ca_spki = Some(next_cert.spki_inner.to_vec());
+        }
+        if next_cert.subject_inner != next_cert.issuer_inner {
+            non_self_issued_intermediates += 1;
         }
         visited[ni] = true;
         cur = next_cert;
@@ -1696,11 +1710,202 @@ pub(crate) fn check_chain_revocation_error(
     }
 }
 
+/// Extract Certificate Policies extension (`2.5.29.32`) OID strings from a DER certificate.
+fn cert_policy_oids(der: &[u8]) -> Vec<String> {
+    const OID_CERT_POLICIES: &[u8] = &[0x55, 0x1D, 0x20];
+    let Some(parts) = parse_cert_der_parts(der) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (oid, _, val) in &parts.extensions {
+        if *oid != OID_CERT_POLICIES {
+            continue;
+        }
+        if let Some((seq, _)) = parse_der_item(val) {
+            if let Some(items) = der_item_children(seq.val) {
+                for pi in items {
+                    if pi.tag == 0x30 {
+                        if let Some(kids) = der_item_children(pi.val) {
+                            if let Some(first) = kids.first() {
+                                if first.tag == 0x06 {
+                                    out.push(wintrust::decode_oid_str(first.val));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Returns true if the certificate uses a legacy weak signature hash (MD2, MD5, or SHA-1).
+fn cert_uses_weak_signature_hash(der: &[u8]) -> bool {
+    let Some(parts) = parse_cert_der_parts(der) else {
+        return true;
+    };
+    let Some((sig_oid, _)) = parse_der_item(parts.sig_alg_inner) else {
+        return true;
+    };
+    if sig_oid.tag != 0x06 {
+        return true;
+    }
+    matches!(
+        sig_oid.val,
+        [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x02] // md2WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04] // md5WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05] // sha1WithRSAEncryption
+            | [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01] // ecdsa-with-SHA1
+            | [0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x03] // dsa-with-SHA1
+    )
+}
+
+/// Evaluate `CERT_CHAIN_PARA` (`RequestedUsage`, `RequestedIssuancePolicy`, and `pStrongSignPara`)
+/// against `chain_der`. Returns `Ok((trust_status_bits, chain_para_error))` or `Err(win32_err)`.
+unsafe fn evaluate_cert_chain_para(
+    p_chain_para: *const c_void,
+    chain_der: &[Vec<u8>],
+) -> Result<(u32, u32), u32> {
+    if p_chain_para.is_null() {
+        return Ok((0, 0));
+    }
+    let base = p_chain_para as *const u8;
+    let cb_size = std::ptr::read_unaligned(base as *const u32);
+    if cb_size < 0x20 {
+        return Err(err::ERROR_INVALID_PARAMETER);
+    }
+
+    let read_usage_match = |off: usize| -> Result<Option<(u32, Vec<String>)>, u32> {
+        let dw_type = std::ptr::read_unaligned(base.add(off) as *const u32);
+        let c_usage = std::ptr::read_unaligned(base.add(off + 0x08) as *const u32) as usize;
+        let rgpsz = std::ptr::read_unaligned(base.add(off + 0x10) as *const *const *const u8);
+        if c_usage == 0 {
+            return Ok(None);
+        }
+        if (dw_type != 0 && dw_type != 1) || rgpsz.is_null() {
+            return Err(err::ERROR_INVALID_PARAMETER);
+        }
+        let mut oids = Vec::with_capacity(c_usage.min(64));
+        for i in 0..c_usage {
+            let p_oid = std::ptr::read_unaligned(rgpsz.add(i));
+            if p_oid.is_null() {
+                return Err(err::ERROR_INVALID_PARAMETER);
+            }
+            oids.push(crate::strings::from_ansi(p_oid));
+        }
+        Ok(Some((dw_type, oids)))
+    };
+
+    let mut trust_bits = 0u32;
+    let mut para_err = 0u32;
+
+    // 1. RequestedUsage (CERT_USAGE_MATCH @ +0x08)
+    if let Some((match_type, req_ekus)) = read_usage_match(0x08)? {
+        for der in chain_der {
+            if let Some(raw_oids) = cert_eku_oids(der) {
+                if !raw_oids.is_empty() {
+                    let oids: Vec<String> = raw_oids
+                        .iter()
+                        .map(|o| wintrust::decode_oid_str(o))
+                        .collect();
+                    let has_any = oids.iter().any(|o| o == "2.5.29.37.0");
+                    if !has_any {
+                        let ok = if match_type == 0 {
+                            // USAGE_MATCH_TYPE_AND
+                            req_ekus.iter().all(|r| oids.iter().any(|o| o == r))
+                        } else {
+                            // USAGE_MATCH_TYPE_OR
+                            req_ekus.iter().any(|r| oids.iter().any(|o| o == r))
+                        };
+                        if !ok {
+                            trust_bits |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+                            para_err = CERT_E_WRONG_USAGE;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. RequestedIssuancePolicy (CERT_USAGE_MATCH @ +0x20 when cbSize >= 0x38)
+    if cb_size >= 0x38 {
+        if let Some((match_type, req_policies)) = read_usage_match(0x20)? {
+            let leaf_policies = chain_der
+                .first()
+                .map(|d| cert_policy_oids(d))
+                .unwrap_or_default();
+            let has_any_policy = leaf_policies.iter().any(|o| o == "2.5.29.32.0");
+            let ok = has_any_policy
+                || if match_type == 0 {
+                    req_policies
+                        .iter()
+                        .all(|r| leaf_policies.iter().any(|o| o == r))
+                } else {
+                    req_policies
+                        .iter()
+                        .any(|r| leaf_policies.iter().any(|o| o == r))
+                };
+            if !ok {
+                trust_bits |=
+                    CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_POLICY_CONSTRAINTS;
+                if para_err == 0 {
+                    para_err = CERT_E_INVALID_POLICY;
+                }
+            }
+        }
+    }
+
+    // 3. pStrongSignPara (@ +0x50 when cbSize >= 0x58)
+    if cb_size >= 0x58 {
+        let p_strong = std::ptr::read_unaligned(base.add(0x50) as *const *const u8);
+        if !p_strong.is_null() {
+            let cb_ss = std::ptr::read_unaligned(p_strong as *const u32);
+            let dw_choice = std::ptr::read_unaligned(p_strong.add(4) as *const u32);
+            if cb_ss < 0x10 {
+                return Err(err::ERROR_INVALID_PARAMETER);
+            }
+            // CERT_STRONG_SIGN_OID_INFO_CHOICE == 1 with standard strong-sign OIDs:
+            // enforce non-MD2/MD5/SHA-1 signatures across the chain; fail closed on custom rules.
+            let recognized_strong_oid = if dw_choice == 1 {
+                let psz_oid = std::ptr::read_unaligned(p_strong.add(8) as *const *const u8);
+                if psz_oid.is_null() {
+                    false
+                } else {
+                    let s = crate::strings::from_ansi(psz_oid);
+                    matches!(
+                        s.as_str(),
+                        "1.3.6.1.5.5.7.6.30"
+                            | "1.3.6.1.4.1.311.72.1.1"
+                            | "1.3.6.1.4.1.311.72.1.2"
+                            | "1.3.6.1.4.1.311.72.1.3"
+                    )
+                }
+            } else {
+                false
+            };
+            if !recognized_strong_oid {
+                return Err(err::ERROR_NOT_SUPPORTED);
+            }
+            if chain_der.iter().any(|d| cert_uses_weak_signature_hash(d)) {
+                trust_bits |= CERT_TRUST_IS_NOT_SIGNATURE_VALID;
+                if para_err == 0 {
+                    para_err = CERT_E_WRONG_USAGE;
+                }
+            }
+        }
+    }
+
+    Ok((trust_bits, para_err))
+}
+
 pub(super) unsafe fn cert_get_certificate_chain_impl(
     h_chain_engine: *mut c_void,
     p_cert_context: *const c_void,
     p_time: *const c_void,
     h_additional_store: *mut c_void,
+    p_chain_para: *const c_void,
     dw_flags: u32,
     pp_chain_context: *mut *mut c_void,
 ) -> BOOL {
@@ -1813,8 +2018,18 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
         revocation_flags,
     );
 
-    let mut trust_err_bits =
-        cert_error_to_trust_status(default_chain_error) | cert_error_to_trust_status(revocation_error);
+    let (para_trust_bits, chain_para_error) = match evaluate_cert_chain_para(p_chain_para, &chain_der)
+    {
+        Ok(pair) => pair,
+        Err(le) => {
+            crate::teb::set_last_error(le);
+            return FALSE;
+        }
+    };
+
+    let mut trust_err_bits = cert_error_to_trust_status(default_chain_error)
+        | cert_error_to_trust_status(revocation_error)
+        | para_trust_bits;
     let mut elements = Vec::with_capacity(owned_certs.len());
     let mut element_ptrs = Vec::with_capacity(owned_certs.len());
     for (idx, cert) in owned_certs.iter().enumerate() {
@@ -1895,6 +2110,7 @@ pub(super) unsafe fn cert_get_certificate_chain_impl(
             default_chain_error,
             revocation_flags,
             revocation_error,
+            chain_para_error,
         },
     );
     std::ptr::write_unaligned(pp_chain_context, ctx_ptr as *mut c_void);
@@ -1973,6 +2189,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         default_chain_error,
         revocation_flags,
         revocation_error,
+        chain_para_error,
     ) = if let Some(found) = CHAINS.with(p_chain_context as usize, |c| {
         (
             c.chain_der.clone(),
@@ -1983,6 +2200,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             c.default_chain_error,
             c.revocation_flags,
             c.revocation_error,
+            c.chain_para_error,
         )
     }) {
         found
@@ -1995,7 +2213,21 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             CERT_E_REVOKED | CRYPT_E_REVOCATION_OFFLINE | CRYPT_E_NO_REVOCATION_CHECK => ext_err,
             _ => 0,
         };
-        (ders, times, None, None, Vec::new(), ext_err, 0, ext_rev_err)
+        let ext_para_err = match ext_err {
+            CERT_E_WRONG_USAGE | CERT_E_INVALID_POLICY => ext_err,
+            _ => 0,
+        };
+        (
+            ders,
+            times,
+            None,
+            None,
+            Vec::new(),
+            ext_err,
+            0,
+            ext_rev_err,
+            ext_para_err,
+        )
     };
 
     let (dw_flags, extra_ptr) = if !p_policy_para.is_null() {
@@ -2261,10 +2493,12 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             let require_ee_leaf =
                 (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
             let mut violation: Option<(u32, i32)> = None;
+            let mut non_self_issued_below = 0usize;
             for (idx, der) in chain_der.iter().enumerate() {
                 let Some(parts) = parse_cert_der_parts(der) else {
                     continue;
                 };
+                let is_self_issued = parts.subject_inner == parts.issuer_inner;
                 let mut has_bc = false;
                 let mut is_ca = false;
                 let mut is_ee = false;
@@ -2311,30 +2545,33 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                         }
                     }
                 }
-                if !has_bc {
-                    continue;
-                }
-                if idx == 0 {
-                    if require_ca_leaf && !is_ca {
-                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
-                        break;
-                    }
-                    if require_ee_leaf && !is_ee {
-                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
-                        break;
-                    }
-                } else {
-                    if !is_ca {
-                        violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
-                        break;
-                    }
-                    // Number of non-self-issued intermediate CA certs below this CA is (idx - 1).
-                    if let Some(max_inter) = path_len {
-                        if idx.saturating_sub(1) > max_inter {
+                if has_bc {
+                    if idx == 0 {
+                        if require_ca_leaf && !is_ca {
+                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                            break;
+                        }
+                        if require_ee_leaf && !is_ee {
+                            violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
+                            break;
+                        }
+                    } else {
+                        if !is_ca {
                             violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
                             break;
                         }
+                        // RFC 5280 §4.2.1.9: pathLenConstraint counts only non-self-issued
+                        // intermediate certificates subordinate to this CA.
+                        if let Some(max_inter) = path_len {
+                            if non_self_issued_below > max_inter {
+                                violation = Some((TRUST_E_BASIC_CONSTRAINTS, idx as i32));
+                                break;
+                            }
+                        }
                     }
+                }
+                if idx > 0 && !is_self_issued {
+                    non_self_issued_below += 1;
                 }
             }
             violation.unwrap_or((0, -1))
@@ -2475,6 +2712,16 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         }
         _ => unreachable!(),
     };
+
+    // Propagate CERT_CHAIN_PARA RequestedUsage / RequestedIssuancePolicy / StrongSign errors
+    // into policy verification unless explicitly ignored.
+    if policy_id != CERT_CHAIN_POLICY_BASIC_CONSTRAINTS && chain_para_error != 0 && err_code == 0 {
+        let ignored = chain_para_error == CERT_E_WRONG_USAGE && ignore_usage;
+        if !ignored {
+            err_code = chain_para_error;
+            elem_idx = 0;
+        }
+    }
 
     // Confirmed revocation (CERT_E_REVOKED) always takes precedence across trust policies;
     // un-ignored offline/unknown revocation errors fail closed whenever other checks pass.

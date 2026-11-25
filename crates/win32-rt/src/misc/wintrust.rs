@@ -3220,6 +3220,127 @@ mod tests {
                 ERROR_SUCCESS,
                 "pSignerChainInfo revocation flags must fail closed when callback is NULL"
             );
+            // With an exclusive-root hChainEngine trusting TEST_CA_DER (so the chain itself is
+            // trusted), pSignerChainInfo->pChainPara MUST still enforce RequestedUsage,
+            // RequestedIssuancePolicy, and pStrongSignPara!
+            let excl_root_st = crate::misc::crypt32::CertOpenStore(2 as *const u8, 0, 0, 0, std::ptr::null());
+            assert_eq!(
+                crate::misc::crypt32::CertAddEncodedCertificateToStore(
+                    excl_root_st,
+                    X509_ASN_ENCODING,
+                    crate::misc::secur32::tests::TEST_CA_DER.as_ptr(),
+                    crate::misc::secur32::tests::TEST_CA_DER.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            let mut eng_cfg = [0u8; 0x60];
+            std::ptr::write_unaligned(eng_cfg.as_mut_ptr() as *mut u32, eng_cfg.len() as u32);
+            std::ptr::write_unaligned(
+                eng_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void,
+                excl_root_st,
+            );
+            let mut excl_eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::misc::crypt32::CertCreateCertificateChainEngine(
+                    eng_cfg.as_ptr() as *const c_void,
+                    &mut excl_eng,
+                ),
+                1
+            );
+            std::ptr::write_unaligned(
+                signer_chain_info.as_mut_ptr().add(0x08) as *mut *mut c_void,
+                excl_eng,
+            );
+            std::ptr::write_unaligned(signer_chain_info.as_mut_ptr().add(0x18) as *mut u32, 0u32);
+            // Baseline without pChainPara passes via exclusive-root hChainEngine.
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+            // 1. RequestedUsage requiring codeSigning (1.3.6.1.5.5.7.3.3) on serverAuth-only
+            //    TEST_LEAF_DER MUST fail with CERT_E_WRONG_USAGE.
+            let code_sign_oid = b"1.3.6.1.5.5.7.3.3\0";
+            let usage_ptrs = [code_sign_oid.as_ptr()];
+            let mut chain_para = [0u8; 0x60];
+            std::ptr::write_unaligned(chain_para.as_mut_ptr() as *mut u32, 0x60u32);
+            std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x08) as *mut u32, 0u32); // AND
+            std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x10) as *mut u32, 1u32);
+            std::ptr::write_unaligned(
+                chain_para.as_mut_ptr().add(0x18) as *mut *const *const u8,
+                usage_ptrs.as_ptr(),
+            );
+            std::ptr::write_unaligned(
+                signer_chain_info.as_mut_ptr().add(0x10) as *mut *const u8,
+                chain_para.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                crate::misc::crypt32::CERT_E_WRONG_USAGE as i32,
+                "pChainPara RequestedUsage must reject disallowed EKU"
+            );
+            // Matching RequestedUsage (serverAuth 1.3.6.1.5.5.7.3.1) passes.
+            let srv_auth_oid = b"1.3.6.1.5.5.7.3.1\0";
+            let srv_usage_ptrs = [srv_auth_oid.as_ptr()];
+            std::ptr::write_unaligned(
+                chain_para.as_mut_ptr().add(0x18) as *mut *const *const u8,
+                srv_usage_ptrs.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                ERROR_SUCCESS
+            );
+            // 2. RequestedIssuancePolicy missing on leaf MUST fail with CERT_E_INVALID_POLICY.
+            let req_pol_oid = b"1.2.3.4.5.6\0";
+            let pol_ptrs = [req_pol_oid.as_ptr()];
+            std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x20) as *mut u32, 0u32);
+            std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x28) as *mut u32, 1u32);
+            std::ptr::write_unaligned(
+                chain_para.as_mut_ptr().add(0x30) as *mut *const *const u8,
+                pol_ptrs.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                crate::misc::crypt32::CERT_E_INVALID_POLICY as i32,
+                "pChainPara RequestedIssuancePolicy must reject missing policy"
+            );
+            // 3. Unsupported custom pStrongSignPara MUST fail closed (CERT_E_CHAINING).
+            std::ptr::write_unaligned(chain_para.as_mut_ptr().add(0x28) as *mut u32, 0u32);
+            let mut custom_ss = [0u8; 0x18];
+            std::ptr::write_unaligned(custom_ss.as_mut_ptr() as *mut u32, 0x18u32);
+            std::ptr::write_unaligned(custom_ss.as_mut_ptr().add(4) as *mut u32, 2u32); // SERIALIZED_INFO
+            std::ptr::write_unaligned(
+                chain_para.as_mut_ptr().add(0x50) as *mut *const u8,
+                custom_ss.as_ptr(),
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_CHAIN_VERIFY.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                CERT_E_CHAINING,
+                "unsupported custom pStrongSignPara must fail closed"
+            );
+            crate::misc::crypt32::CertFreeCertificateChainEngine(excl_eng);
+            crate::misc::crypt32::CertCloseStore(excl_root_st, 0);
             // Undersized pSignerChainInfo (< 0x28) returns E_INVALIDARG.
             std::ptr::write_unaligned(signer_chain_info.as_mut_ptr() as *mut u32, 0x10u32);
             assert_eq!(

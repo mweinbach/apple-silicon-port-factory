@@ -23,8 +23,9 @@ pub(crate) use chain::{check_chain_revocation_error, verify_peer_chain_error};
 pub(crate) use pkcs::verify_cmsg_signer_info_signature;
 #[allow(unused_imports)]
 pub(crate) use chain::{
-    map_rustls_cert_error, CERT_E_CHAINING, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED, CERT_E_REVOKED,
-    CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE,
+    map_rustls_cert_error, CERT_E_CHAINING, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED,
+    CERT_E_INVALID_POLICY, CERT_E_REVOKED, CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE,
+    CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE,
 };
 #[allow(unused_imports)]
 pub(crate) use store::{
@@ -171,7 +172,7 @@ pub unsafe extern "win64" fn CertGetCertificateChain(
     p_cert_context: *const c_void,
     p_time: *const c_void,
     h_additional_store: *mut c_void,
-    _p_chain_para: *const c_void,
+    p_chain_para: *const c_void,
     dw_flags: u32,
     _pv_reserved: *mut c_void,
     pp_chain_context: *mut *mut c_void,
@@ -181,6 +182,7 @@ pub unsafe extern "win64" fn CertGetCertificateChain(
         p_cert_context,
         p_time,
         h_additional_store,
+        p_chain_para,
         dw_flags,
         pp_chain_context,
     )

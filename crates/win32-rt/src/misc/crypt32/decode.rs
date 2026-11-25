@@ -2139,11 +2139,17 @@ fn parse_x500_name_to_der(input: &str, dw_str_type: u32) -> Result<Vec<u8>, usiz
 
     let mut seq_inner = Vec::new();
     for rdn in rdns {
-        let mut set_inner = Vec::new();
+        let mut encoded_atvs: Vec<Vec<u8>> = Vec::with_capacity(rdn.len());
         for (oid_bytes, val_der) in rdn {
             let mut atv = encode_der_tlv(0x06, &oid_bytes);
             atv.extend_from_slice(&val_der);
-            set_inner.extend_from_slice(&encode_der_tlv(0x30, &atv));
+            encoded_atvs.push(encode_der_tlv(0x30, &atv));
+        }
+        // X.690 §11.6: DER SET OF components must be sorted in ascending lexicographic byte order.
+        encoded_atvs.sort();
+        let mut set_inner = Vec::new();
+        for atv_seq in encoded_atvs {
+            set_inner.extend_from_slice(&atv_seq);
         }
         seq_inner.extend_from_slice(&encode_der_tlv(0x31, &set_inner));
     }
