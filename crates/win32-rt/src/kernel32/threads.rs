@@ -95,9 +95,9 @@ pub unsafe extern "win64" fn GetCurrentProcessorNumberEx(out: *mut u8) {
     *out.add(3) = 0;
 }
 
-fn thread_obj(h: HANDLE) -> Option<Arc<ThreadObj>> {
+pub(crate) fn thread_obj(h: HANDLE) -> Option<Arc<ThreadObj>> {
     if h == handles::CURRENT_THREAD {
-        return thread::current_thread_object();
+        return Some(thread::ensure_current_thread_object());
     }
     handles::get_as::<ThreadObj>(h)
 }
@@ -292,7 +292,12 @@ pub unsafe extern "win64" fn SetThreadGroupAffinity(h: HANDLE, group_affinity: *
     let ga = group_affinity as *const u8;
     let mask = std::ptr::read_unaligned(ga as *const usize);
     let group = std::ptr::read_unaligned(ga.add(8) as *const u16);
-    if group != 0 || mask == 0 || (mask & !proc_mask) != 0 {
+    let reserved = [
+        std::ptr::read_unaligned(ga.add(10) as *const u16),
+        std::ptr::read_unaligned(ga.add(12) as *const u16),
+        std::ptr::read_unaligned(ga.add(14) as *const u16),
+    ];
+    if group != 0 || reserved != [0; 3] || mask == 0 || (mask & !proc_mask) != 0 {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }

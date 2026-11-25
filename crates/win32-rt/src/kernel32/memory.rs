@@ -816,7 +816,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         }
         return Ok(addr);
     }
-    if ty & (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER) != 0 {
+    if ty & (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER) != 0 || (addr == 0 && ty & MEM_COMMIT != 0) {
         let a = addr & !(GRANULARITY - 1);
         let sz = ((addr + size + PAGE - 1) & !(PAGE - 1)) - if addr != 0 { a } else { 0 };
         let base = reserve_aligned(a, sz, align).ok_or(if addr != 0 { err::ERROR_INVALID_ADDRESS } else { err::ERROR_NOT_ENOUGH_MEMORY })?;
@@ -1201,7 +1201,7 @@ pub fn hpage_had_prot_change(hpage: usize) -> bool {
 }
 
 pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot: u32, old: *mut u32) -> BOOL {
-    if size == 0 {
+    if old.is_null() || size == 0 {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
@@ -1210,17 +1210,30 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
         return FALSE;
     }
     let start = addr as usize & !(PAGE - 1);
-    let end = (addr as usize + size + PAGE - 1) & !(PAGE - 1);
-    let prev = query(start).map(|i| i.protect).unwrap_or(PAGE_READWRITE);
+    let Some(last) = (addr as usize).checked_add(size - 1).filter(|&v| v <= usize::MAX - HOST_PAGE) else {
+        crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
+        return FALSE;
+    };
+    let end = (last & !(PAGE - 1)) + PAGE;
+    let mut prev = query(start).map(|i| i.protect).unwrap_or(PAGE_READWRITE);
     if memdiag() && (prot | prev) & 0xF0 != 0 {
         memdiag_log(format_args!("VirtualProtect({addr:p}, {size:#x}, {prot:#x}) prev={prev:#x}"));
     }
     let mut deferred_noaccess_sibling = false;
     let mprotect_rc = {
         let mut vm = VM.lock().unwrap();
-        let write_watch = vm.alloc_containing(start).is_some_and(|(_, a)| a.write_watch);
-        if vm.alloc_containing(start).is_some() {
-            vm.set_range(start, end, MEM_COMMIT, prot);
+        let tracked = vm.alloc_containing(start);
+        let write_watch = tracked.is_some_and(|(_, a)| a.write_watch);
+        if let Some((base, alloc)) = tracked {
+            let first = vm.segs.range(..=start).next_back().map(|(_, s)| s);
+            if end > base + alloc.size
+                || !first.is_some_and(|s| s.end > start && s.state == MEM_COMMIT)
+                || vm.segs.range(start..end).any(|(_, s)| s.state != MEM_COMMIT)
+            {
+                crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
+                return FALSE;
+            }
+            prev = first.unwrap().prot;
         }
         // On 16 KiB host pages (Apple Silicon), if a sub-host-page non-writable
         // VirtualProtect (e.g. PAGE_EXECUTE_READ after decrypting one 4 KiB page)
@@ -1233,7 +1246,7 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
             let mut sub = hbase;
             while sub < hbase + HOST_PAGE {
                 if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
-                    if sub < seg.end && seg.state == MEM_COMMIT && (seg.prot == PAGE_NOACCESS || (seg.prot & PAGE_GUARD) != 0) {
+                    if !(start..end).contains(&sub) && sub < seg.end && seg.state == MEM_COMMIT && (seg.prot == PAGE_NOACCESS || (seg.prot & PAGE_GUARD) != 0) {
                         deferred_noaccess_sibling = true;
                         break;
                     }
@@ -1251,19 +1264,21 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
         }
         // Keep `host_mprotect` serialized under `VM` so concurrent VirtualProtect calls
         // on sibling 4 KiB sub-pages within one 16 KiB host page cannot apply out of order.
-        if deferred_noaccess_sibling {
+        let rc = if deferred_noaccess_sibling {
             host_mprotect(start, end - start, libc::PROT_NONE)
         } else {
             apply_range_host_prot(&vm, start, end, prot, write_watch)
+        };
+        if rc == 0 && tracked.is_some() {
+            vm.set_range(start, end, MEM_COMMIT, prot);
         }
+        rc
     };
     if mprotect_rc != 0 {
         crate::teb::set_last_error(err::ERROR_INVALID_ADDRESS);
         return FALSE;
     }
-    if !old.is_null() {
-        std::ptr::write_unaligned(old, if prev == 0 { PAGE_NOACCESS } else { prev });
-    }
+    old.write_unaligned(if prev == 0 { PAGE_NOACCESS } else { prev });
     if is_exec(prot) || is_exec(prev) {
         note_code_region(start, end);
     }

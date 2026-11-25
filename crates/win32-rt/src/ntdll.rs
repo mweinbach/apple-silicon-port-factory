@@ -161,7 +161,11 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             std::ptr::write_unaligned(out.add(8) as *mut usize, if is_self { teb::peb() as usize } else { 0 });
             std::ptr::write_unaligned(
                 out.add(16) as *mut usize,
-                crate::kernel32::process::current_process_affinity_mask(),
+                if is_self {
+                    crate::kernel32::process::current_process_affinity_mask()
+                } else {
+                    0
+                },
             );
             std::ptr::write_unaligned(out.add(24) as *mut i32, 8); // BasePriority
             std::ptr::write_unaligned(out.add(32) as *mut usize, pid as usize);
@@ -326,8 +330,12 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             std::ptr::write_unaligned(out as *mut usize, 0);
             STATUS_SUCCESS
         }
-        0x1B | 0x2B => {
-            // ProcessImageFileName (0x1B) / ProcessImageFileNameWin32 (0x2B)
+        0x1B | 0x2B | 60 => {
+            // ProcessImageFileName (0x1B) / ProcessImageFileNameWin32 (0x2B) / ProcessCommandLineInformation (60)
+            if class == 60 && !is_self {
+                put_ret(0);
+                return STATUS_ACCESS_DENIED;
+            }
             let win_exe = if let Some(ref c) = child {
                 c.exe_win.clone()
             } else {
@@ -338,6 +346,13 @@ pub unsafe extern "win64" fn NtQueryInformationProcess(h: HANDLE, class: u32, ou
             };
             let path = if class == 0x1B {
                 crate::path::win32_to_nt_device_path(&win_exe)
+            } else if class == 60 {
+                // ProcessCommandLineInformation
+                if crate::process::try_config().is_some() {
+                    from_wide(crate::process::cmdline_w())
+                } else {
+                    win_exe
+                }
             } else {
                 win_exe
             };
@@ -3568,8 +3583,9 @@ mod tests {
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x4B, buf.as_mut_ptr(), 4, &mut ret), STATUS_SUCCESS);
             assert_eq!(ret, 4);
             assert_eq!(std::ptr::read_unaligned(buf.as_ptr() as *const u32), 0);
-            // ProcessCommandLineInformation (0x3C) and ProcessTelemetryIdInformation (0x40) are not misrouted.
-            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3C, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
+            // ProcessCommandLineInformation (0x3C) returns a UNICODE_STRING for self; ProcessTelemetryIdInformation (0x40) is unsupported.
+            assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x3C, buf.as_mut_ptr(), buf.len() as u32, &mut ret), STATUS_SUCCESS);
+            assert!(ret >= 18);
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 0x40, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);
             assert_eq!(NtQueryInformationProcess(0xDEADusize as HANDLE, 0, buf.as_mut_ptr(), 48, &mut ret), STATUS_INVALID_HANDLE);
             assert_eq!(NtQueryInformationProcess(crate::handles::CURRENT_PROCESS, 9999, buf.as_mut_ptr(), 64, &mut ret), STATUS_INVALID_INFO_CLASS);

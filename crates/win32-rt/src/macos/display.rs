@@ -64,6 +64,8 @@ pub struct ScreenDesc {
 
 #[derive(Clone, Debug)]
 pub struct Displays {
+    /// Physical primary display dimensions from CoreGraphics, when available.
+    pub primary_mm: Option<(i32, i32)>,
     pub monitors: Vec<Monitor>,
     /// Primary display backing scale (Win32 pixels per point on primary, or 1.0).
     pub scale: f64,
@@ -77,6 +79,7 @@ impl Displays {
     fn headless() -> Displays {
         let r = RECT::new(0, 0, 1920, 1080);
         Displays {
+            primary_mm: None,
             monitors: vec![Monitor {
                 id: 1,
                 primary: true,
@@ -161,6 +164,7 @@ pub fn build_displays(screens: &[ScreenDesc], titlebar_pt: f64, retina: bool) ->
     }
 
     Displays {
+        primary_mm: None,
         monitors,
         scale: primary_scale,
         primary_h_pt,
@@ -364,7 +368,13 @@ pub(super) fn refresh(mtm: objc2_foundation::MainThreadMarker) {
     let probe = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
     let framed = NSWindow::frameRectForContentRect_styleMask(probe, NSWindowStyleMask::Titled, mtm);
     let titlebar_pt = (framed.size.height - probe.size.height).max(0.0);
-    let d = build_displays(&descs, titlebar_pt, retina_enabled());
+    let mut d = build_displays(&descs, titlebar_pt, retina_enabled());
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" { fn CGDisplayScreenSize(display: u32) -> objc2_core_foundation::CGSize; }
+    let mm = unsafe { CGDisplayScreenSize(descs[0].id) };
+    if mm.width > 0.0 && mm.height > 0.0 {
+        d.primary_mm = Some((mm.width.round() as i32, mm.height.round() as i32));
+    }
     let changed = CACHE
         .read()
         .unwrap()

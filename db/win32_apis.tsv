@@ -4265,11 +4265,11 @@ ws2_32.dll	WSAPoll	-	NET_RPC	real	win32_rt::misc::ws2_32::WSAPoll	crates/win32-r
 ws2_32.dll	WSARecv	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecv	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSARecvDisconnect	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvDisconnect	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSARecvFrom	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvFrom	crates/win32-rt/src/misc/ws2_32.rs
-ws2_32.dll	WSARecvMsg	-	NET_RPC	failing	win32_rt::misc::ws2_32::WSARecvMsg	crates/win32-rt/src/misc/ws2_32.rs
+ws2_32.dll	WSARecvMsg	-	NET_RPC	real	win32_rt::misc::ws2_32::WSARecvMsg	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSAResetEvent	-	NET_RPC	real	win32_rt::misc::ws2_32::WSAResetEvent	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASend	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASend	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASendDisconnect	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendDisconnect	crates/win32-rt/src/misc/ws2_32.rs
-ws2_32.dll	WSASendMsg	-	NET_RPC	failing	win32_rt::misc::ws2_32::WSASendMsg	crates/win32-rt/src/misc/ws2_32.rs
+ws2_32.dll	WSASendMsg	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendMsg	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASendTo	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASendTo	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASetEvent	-	NET_RPC	real	win32_rt::misc::ws2_32::WSASetEvent	crates/win32-rt/src/misc/ws2_32.rs
 ws2_32.dll	WSASetLastError	112	NET_RPC	real	win32_rt::misc::ws2_32::WSASetLastError	crates/win32-rt/src/misc/ws2_32.rs
