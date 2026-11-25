@@ -95,20 +95,20 @@ fn locate(ev: &NSEvent, mtm: MainThreadMarker) -> (usize, Option<POINT>, POINT) 
         None => (loc.x, loc.y),
     };
     let screen = display::cocoa_point_to_px(sx, sy);
+    let s = display::scale_for_cocoa_point(sx, sy);
     let Some(hwnd) = win.as_deref().and_then(hwnd_for_window) else {
-        super::appkit::refresh_cursor_for_client(false);
+        super::appkit::refresh_cursor_for_client(false, s);
         return (0, None, screen);
     };
     let Some(cr) = content_rect(hwnd) else {
-        super::appkit::refresh_cursor_for_client(false);
+        super::appkit::refresh_cursor_for_client(false, s);
         return (0, None, screen);
     };
     let inside = sx >= cr.origin.x && sx < cr.origin.x + cr.size.width && sy > cr.origin.y && sy <= cr.origin.y + cr.size.height;
-    super::appkit::refresh_cursor_for_client(inside);
+    super::appkit::refresh_cursor_for_client(inside, s);
     if !inside {
         return (0, None, screen);
     }
-    let s = display::scale_for_cocoa_point(sx, sy);
     let client = POINT { x: ((sx - cr.origin.x) * s).floor() as i32, y: ((cr.origin.y + cr.size.height - sy) * s).floor() as i32 };
     (hwnd, Some(client), screen)
 }

@@ -12,7 +12,7 @@ use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationPresentationOptions, NSApplicationTerminateReply, NSBackingStoreType, NSButton,
-    NSColor, NSCursor, NSEventMask, NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard,
+    NSColor, NSCursor, NSEvent, NSEventMask, NSFont, NSImage, NSMenu, NSMenuItem, NSPasteboard,
     NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField,
     NSView, NSWindow, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowStyleMask,
 };
@@ -41,6 +41,16 @@ struct CGRect {
     y: f64,
     w: f64,
     h: f64,
+}
+
+#[repr(C)]
+struct CGImageOpaque {
+    _private: [u8; 0],
+}
+
+unsafe impl objc2::RefEncode for CGImageOpaque {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGImage", &[]));
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -952,6 +962,7 @@ fn update_presentation() {
 thread_local! {
     static CURSOR_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static CURSOR_RELATIVE: Cell<bool> = const { Cell::new(false) };
+    static LAST_CURSOR_SCALE: Cell<f64> = const { Cell::new(1.0) };
     static LAST_CURSOR: RefCell<CursorState> = const {
         RefCell::new(CursorState {
             hidden: false,
@@ -961,29 +972,61 @@ thread_local! {
     };
 }
 
-pub(super) fn cursor_update(s: CursorState) {
-    LAST_CURSOR.with(|last| *last.borrow_mut() = s.clone());
-    apply_cursor(s);
-}
-
-/// Called from `events::locate` when the pointer enters or leaves the client area
-/// so moving onto the macOS title bar or outside the window immediately restores
-/// the visible arrow cursor.
-pub(super) fn refresh_cursor_for_client(inside: bool) {
-    let prev = super::mouse_in_client();
-    if prev != inside {
-        super::set_mouse_in_client(inside);
-        let s = LAST_CURSOR.with(|last| last.borrow().clone());
-        apply_cursor(s);
+fn active_cursor_scale() -> f64 {
+    let loc = NSEvent::mouseLocation();
+    let s = display::scale_for_cocoa_point(loc.x, loc.y);
+    if s.is_finite() && s > 0.0 {
+        s
+    } else {
+        display::scale().max(1.0)
     }
 }
 
-fn custom_ns_cursor(img: &CustomCursorImage) -> Option<Retained<NSCursor>> {
+pub(super) fn cursor_update(s: CursorState) {
+    LAST_CURSOR.with(|last| *last.borrow_mut() = s.clone());
+    apply_cursor(s, active_cursor_scale());
+}
+
+/// Called from `events::locate` when the pointer moves so moving onto the macOS
+/// title bar or outside the window immediately restores the visible arrow cursor,
+/// and moving a custom cursor across mixed-DPI screens updates its point size.
+pub(super) fn refresh_cursor_for_client(inside: bool, scale: f64) {
+    let prev = super::mouse_in_client();
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let scale_changed = LAST_CURSOR_SCALE.with(|c| (c.get() - scale).abs() > 1e-6);
+    if prev != inside {
+        super::set_mouse_in_client(inside);
+        let s = LAST_CURSOR.with(|last| last.borrow().clone());
+        apply_cursor(s, scale);
+    } else if inside && scale_changed {
+        let s = LAST_CURSOR.with(|last| last.borrow().clone());
+        if matches!(s.shape, Shape::Custom(_)) {
+            apply_cursor(s, scale);
+        } else {
+            LAST_CURSOR_SCALE.with(|c| c.set(scale));
+        }
+    }
+}
+
+/// Convert Win32 pixel dimensions and hotspot of a custom cursor into Cocoa
+/// logical points for a display with backing scale `scale`, while keeping the
+/// underlying CGImage at full native pixel resolution.
+fn custom_cursor_metrics(img: &CustomCursorImage, scale: f64) -> (NSSize, NSPoint) {
+    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let size = NSSize::new((img.width as f64) / s, (img.height as f64) / s);
+    let hot_x_px = (img.hotspot_x as f64).clamp(0.0, img.width.saturating_sub(1) as f64);
+    let hot_y_px = (img.hotspot_y as f64).clamp(0.0, img.height.saturating_sub(1) as f64);
+    let hot = NSPoint::new(hot_x_px / s, hot_y_px / s);
+    (size, hot)
+}
+
+fn custom_ns_cursor(img: &CustomCursorImage, scale: f64) -> Option<Retained<NSCursor>> {
     let w = img.width as usize;
     let h = img.height as usize;
     if w == 0 || h == 0 || img.rgba.len() < w.saturating_mul(h).saturating_mul(4) {
         return None;
     }
+    let (size, hot) = custom_cursor_metrics(img, scale);
     unsafe {
         let cf_data = CFDataCreate(std::ptr::null(), img.rgba.as_ptr(), (w * h * 4) as isize);
         if cf_data.is_null() {
@@ -1006,31 +1049,28 @@ fn custom_ns_cursor(img: &CustomCursorImage) -> Option<Retained<NSCursor>> {
         if cg_img.is_null() {
             return None;
         }
-        let size = NSSize::new(img.width as f64, img.height as f64);
         let Some(cls) = objc2::runtime::AnyClass::get(c"NSImage") else {
             CGImageRelease(cg_img);
             return None;
         };
         let alloc: *mut AnyObject = msg_send![cls, alloc];
-        let ns_img_raw: *mut AnyObject = msg_send![alloc, initWithCGImage: cg_img, size: size];
+        let ns_img_raw: *mut AnyObject =
+            msg_send![alloc, initWithCGImage: cg_img.cast::<CGImageOpaque>(), size: size];
         CGImageRelease(cg_img);
         if ns_img_raw.is_null() {
             return None;
         }
         let ns_img = Retained::<NSImage>::from_raw(ns_img_raw.cast())?;
-        let hot = NSPoint::new(
-            (img.hotspot_x as f64).clamp(0.0, img.width.saturating_sub(1) as f64),
-            (img.hotspot_y as f64).clamp(0.0, img.height.saturating_sub(1) as f64),
-        );
         Some(NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &ns_img, hot))
     }
 }
 
-fn apply_cursor(s: CursorState) {
+fn apply_cursor(s: CursorState, scale: f64) {
     let mtm = mtm();
     let in_client = super::fullscreen_takeover() || super::mouse_in_client();
     let relative = s.relative && super::lock_cursor_allowed() && in_client;
     let hidden = s.hidden && in_client;
+    LAST_CURSOR_SCALE.with(|c| c.set(scale));
 
     if CURSOR_RELATIVE.with(|c| c.replace(relative)) != relative {
         unsafe { CGAssociateMouseAndMouseCursorPosition(!relative as i32) };
@@ -1064,7 +1104,7 @@ fn apply_cursor(s: CursorState) {
             Shape::SizeNS => NSCursor::resizeUpDownCursor(),
             Shape::SizeAll => NSCursor::openHandCursor(),
             Shape::No => NSCursor::operationNotAllowedCursor(),
-            Shape::Custom(img) => custom_ns_cursor(img).unwrap_or_else(NSCursor::arrowCursor),
+            Shape::Custom(img) => custom_ns_cursor(img, scale).unwrap_or_else(NSCursor::arrowCursor),
             _ => NSCursor::arrowCursor(),
         };
         c.set();
@@ -2131,5 +2171,56 @@ mod tests {
         drop(disp);
         let _ = shutdown_tx.send(());
         rl_thread.join().unwrap();
+    }
+
+    #[test]
+    fn custom_cursor_scales_logical_size_and_hotspot_preserving_bitmap_pixels() {
+        let img = CustomCursorImage {
+            width: 32,
+            height: 32,
+            hotspot_x: 10,
+            hotspot_y: 6,
+            rgba: vec![0xFF; 32 * 32 * 4].into(),
+        };
+
+        // 1x display (or PORT_RETINA=0): 1 Win32 pixel == 1 Cocoa point.
+        let (sz1, hot1) = custom_cursor_metrics(&img, 1.0);
+        assert_eq!((sz1.width, sz1.height), (32.0, 32.0));
+        assert_eq!((hot1.x, hot1.y), (10.0, 6.0));
+
+        // 2x Retina display: 32x32 Win32 pixels -> 16x16 Cocoa points, hotspot halved.
+        let (sz2, hot2) = custom_cursor_metrics(&img, 2.0);
+        assert_eq!((sz2.width, sz2.height), (16.0, 16.0));
+        assert_eq!((hot2.x, hot2.y), (5.0, 3.0));
+
+        // Out-of-range hotspot clamps in pixel space before scaling to points.
+        let clamped_img = CustomCursorImage {
+            width: 32,
+            height: 16,
+            hotspot_x: 100,
+            hotspot_y: 50,
+            rgba: vec![0xFF; 32 * 16 * 4].into(),
+        };
+        let (sz_c, hot_c) = custom_cursor_metrics(&clamped_img, 2.0);
+        assert_eq!((sz_c.width, sz_c.height), (16.0, 8.0));
+        assert_eq!((hot_c.x, hot_c.y), (15.5, 7.5));
+
+        // Full NSCursor + NSImage construction on 2x Retina keeps the 32x32 backing
+        // bitmap resolution while exposing 16x16 pt logical size and (5, 3) pt hotspot.
+        let cursor = custom_ns_cursor(&img, 2.0).expect("custom NSCursor at 2x");
+        let cur_img = cursor.image();
+        assert_eq!(cur_img.size(), NSSize::new(16.0, 16.0));
+        assert_eq!(cursor.hotSpot(), NSPoint::new(5.0, 3.0));
+        unsafe {
+            let cg: *mut CGImageOpaque = msg_send![
+                &*cur_img,
+                CGImageForProposedRect: std::ptr::null_mut::<NSRect>(),
+                context: std::ptr::null::<AnyObject>(),
+                hints: std::ptr::null::<AnyObject>()
+            ];
+            assert!(!cg.is_null(), "expected backing CGImage on custom cursor NSImage");
+            assert_eq!(CGImageGetWidth(cg.cast()), 32);
+            assert_eq!(CGImageGetHeight(cg.cast()), 32);
+        }
     }
 }
