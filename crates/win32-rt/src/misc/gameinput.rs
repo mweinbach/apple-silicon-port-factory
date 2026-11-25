@@ -870,6 +870,29 @@ impl RuntimeState {
         }
     }
 
+    fn newest_for(&self, device_kind: DeviceKind, input_kind: u32) -> Option<&ReadingSnapshot> {
+        let latest_hist = self
+            .history
+            .iter()
+            .rev()
+            .find(|e| e.device_kind == device_kind && e.input_kind == input_kind);
+        let latest_base = self
+            .baseline(device_kind)
+            .filter(|b| b.input_kind == input_kind);
+        match (latest_hist, latest_base) {
+            (Some(h), Some(b)) => {
+                if (b.timestamp_us, b.sequence_number) > (h.timestamp_us, h.sequence_number) {
+                    Some(b)
+                } else {
+                    Some(h)
+                }
+            }
+            (Some(h), None) => Some(h),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     fn record_or_reuse(
         &mut self,
         device_kind: DeviceKind,
@@ -886,12 +909,7 @@ impl RuntimeState {
         payload: ReadingPayload,
         timestamp_us: u64,
     ) -> ReadingSnapshot {
-        if let Some(latest) = self
-            .history
-            .iter()
-            .rev()
-            .find(|e| e.device_kind == device_kind && e.input_kind == input_kind)
-        {
+        if let Some(latest) = self.newest_for(device_kind, input_kind) {
             if latest.payload == payload {
                 return latest.clone();
             }
@@ -2042,14 +2060,9 @@ unsafe extern "win64" fn gi_get_next_reading(
     // At the newest boundary: check once if live input changed since the latest recorded snapshot.
     if let Some((dev_kind, actual_kind, live_payload)) = poll_matching_live(input_kind, device_filter) {
         let mut st = runtime_state().lock().unwrap();
-        let latest_payload = st
-            .history
-            .iter()
-            .rev()
-            .find(|e| e.device_kind == dev_kind && e.input_kind == actual_kind)
-            .map(|e| &e.payload)
-            .or_else(|| st.baseline(dev_kind).map(|b| &b.payload));
-        let unchanged = latest_payload.is_some_and(|p| *p == live_payload);
+        let unchanged = st
+            .newest_for(dev_kind, actual_kind)
+            .is_some_and(|latest| latest.payload == live_payload);
         if !unchanged {
             let snap = st.push_snapshot(dev_kind, actual_kind, live_payload);
             if snap.history_id > ref_id {
@@ -2135,15 +2148,18 @@ unsafe extern "win64" fn gi_get_temporal_reading(
             best = Some(entry);
         }
     }
+    if let Some(base) = st.baseline(dev_kind) {
+        if base.timestamp_us <= timestamp
+            && best.map_or(true, |h| {
+                (base.timestamp_us, base.sequence_number) > (h.timestamp_us, h.sequence_number)
+            })
+        {
+            best = Some(base);
+        }
+    }
     if let Some(found) = best {
         std::ptr::write_unaligned(reading_out, ReadingObj::create(found.clone()));
         return S_OK;
-    }
-    if let Some(base) = st.baseline(dev_kind) {
-        if base.timestamp_us <= timestamp {
-            std::ptr::write_unaligned(reading_out, ReadingObj::create(base.clone()));
-            return S_OK;
-        }
     }
     GAMEINPUT_E_READING_NOT_FOUND
 }
@@ -3371,6 +3387,45 @@ mod tests {
             assert_eq!(gi_get_temporal_reading(gi, t_after_virt_idle, dev0, &mut out), S_OK);
             assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
             assert_eq!(gs.buttons, 0, "disconnecting virtual pad over idle physical pad must record idle");
+            assert_eq!(rd_release(out), 0);
+
+            // 4. Full disconnect while holding a button followed by idle reconnect in the same
+            //    slot must not resurrect the stale pre-disconnect press, and pressing the same
+            //    button again afterwards must record a fresh transition.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_before_full_disc = gi_get_current_timestamp(gi);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_disconnect(0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            let t_reconnected_idle = gi_get_current_timestamp(gi);
+            assert!(t_reconnected_idle > t_before_full_disc);
+            assert_eq!(gi_get_temporal_reading(gi, t_reconnected_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "idle reconnect must override older pressed history");
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_repressed_a = gi_get_current_timestamp(gi);
+            assert!(t_repressed_a > t_reconnected_idle);
+            assert_eq!(gi_get_temporal_reading(gi, t_repressed_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A, "re-pressing A after idle reconnect must record a fresh reading");
+            assert_eq!(rd_release(out), 0);
+
+            // Historical lookup at reconnect still sees idle, and pre-disconnect still sees A.
+            assert_eq!(gi_get_temporal_reading(gi, t_reconnected_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0);
+            assert_eq!(rd_release(out), 0);
+            assert_eq!(gi_get_temporal_reading(gi, t_before_full_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
             assert_eq!(rd_release(out), 0);
 
             assert_eq!(gi_release(gi), 0);
