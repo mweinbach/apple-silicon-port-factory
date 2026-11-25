@@ -1933,7 +1933,8 @@ pub(super) unsafe fn cert_create_crl_context_impl(
                 super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
                 tbs.raw.as_ptr(),
                 tbs.raw.len() as u32,
-                0x8000, // CRYPT_DECODE_ALLOC_FLAG
+                0x8000 | super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
+                std::ptr::null(),
                 &mut info_ptr as *mut *mut c_void as *mut c_void,
                 &mut info_sz,
             );

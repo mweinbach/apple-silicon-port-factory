@@ -255,7 +255,7 @@ pub unsafe extern "win64" fn CryptDecodeObjectEx(
     pb_encoded: *const u8,
     cb_encoded: u32,
     dw_flags: u32,
-    _p_decode_para: *const c_void,
+    p_decode_para: *const c_void,
     pv_struct_info: *mut c_void,
     pcb_struct_info: *mut u32,
 ) -> BOOL {
@@ -265,6 +265,7 @@ pub unsafe extern "win64" fn CryptDecodeObjectEx(
         pb_encoded,
         cb_encoded,
         dw_flags,
+        p_decode_para,
         pv_struct_info,
         pcb_struct_info,
     )

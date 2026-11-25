@@ -38,6 +38,7 @@ pub(super) const PKCS7_SIGNER_INFO: usize = 500;
 pub(super) const PKCS_ATTRIBUTES: usize = 502;
 const X509_CRL_DIST_POINTS_INTERNAL: usize = 0x1_0001;
 
+pub(super) const CRYPT_DECODE_TO_BE_SIGNED_FLAG: u32 = 0x0000_0002;
 const CRYPT_DECODE_ALLOC_FLAG: u32 = 0x0000_8000;
 const CRYPT_E_ASN1_BADTAG: u32 = 0x8009_310B;
 const CRYPT_E_INVALID_X500_STRING: u32 = 0x8009_2023;
@@ -154,6 +155,7 @@ impl DecodeArena {
     unsafe fn finish(
         &self,
         dw_flags: u32,
+        p_decode_para: *const c_void,
         pv_struct_info: *mut c_void,
         pcb_struct_info: *mut u32,
     ) -> BOOL {
@@ -163,7 +165,23 @@ impl DecodeArena {
                 crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-            let mem = crate::kernel32::memory::LocalAlloc(0, self.buf.len().max(1)) as *mut u8;
+            // Per MSDN CryptDecodeObjectEx: when pDecodePara->pfnAlloc is supplied, allocate
+            // through that callback so the caller's matching pfnFree releases it properly.
+            // CRYPT_DECODE_PARA (Win64): cbSize @ +0x00 (u32), pfnAlloc @ +0x08 (usize), pfnFree @ +0x10 (usize)
+            let mut custom_alloc: usize = 0;
+            if !p_decode_para.is_null() {
+                let para_base = p_decode_para as *const u8;
+                let cb_para = std::ptr::read_unaligned(para_base as *const u32);
+                if cb_para >= 16 {
+                    custom_alloc = std::ptr::read_unaligned(para_base.add(8) as *const usize);
+                }
+            }
+            let alloc_sz = self.buf.len().max(1);
+            let mem = if custom_alloc != 0 {
+                crate::call_guest8(custom_alloc, alloc_sz as u64, 0, 0, 0, 0, 0, 0, 0) as *mut u8
+            } else {
+                crate::kernel32::memory::LocalAlloc(0, alloc_sz) as *mut u8
+            };
             if mem.is_null() {
                 crate::teb::set_last_error(err::ERROR_NOT_ENOUGH_MEMORY);
                 return FALSE;
@@ -488,7 +506,7 @@ fn decode_attributes_list_into(arena: &mut DecodeArena, base_off: usize, elems: 
     true
 }
 
-fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8]) -> Result<DecodeArena, u32> {
+fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8], dw_flags: u32) -> Result<DecodeArena, u32> {
     let raw_stype = lpsz_struct_type as usize;
     let stype: usize = if raw_stype <= 0xFFFF {
         raw_stype
@@ -1155,11 +1173,24 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8]) -> Result<DecodeA
             Ok(arena)
         }
         X509_CERT_TO_BE_SIGNED => {
-            // CERT_INFO (208B, matches wintrust::CertInfo exactly)
+            // CERT_INFO (208B, matches wintrust::CertInfo exactly).
+            // Per MSDN CryptDecodeObjectEx: by default (dwFlags without CRYPT_DECODE_TO_BE_SIGNED_FLAG)
+            // pbEncoded is a signed Certificate wrapper SEQUENCE { tbsCertificate, sigAlg, sigVal };
+            // unwrap tbsCertificate unless CRYPT_DECODE_TO_BE_SIGNED_FLAG indicates unsigned TBS input.
             if root.tag != 0x30 {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
-            let kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            let outer_kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            let kids = if (dw_flags & CRYPT_DECODE_TO_BE_SIGNED_FLAG) == 0
+                && outer_kids.len() == 3
+                && outer_kids[0].tag == 0x30
+                && outer_kids[1].tag == 0x30
+                && outer_kids[2].tag == 0x03
+            {
+                der_item_children(outer_kids[0].val).ok_or(CRYPT_E_ASN1_BADTAG)?
+            } else {
+                outer_kids
+            };
             let off = arena.alloc_aligned(std::mem::size_of::<CertInfo>(), 8);
             let mut idx = 0usize;
             let mut ver = 0u32;
@@ -1221,10 +1252,21 @@ fn decode_x509_object(lpsz_struct_type: *const u8, der: &[u8]) -> Result<DecodeA
             // CRL_INFO (96B): dwVersion(u32 @ 0), SignatureAlgorithm(24B @ 8), Issuer(16B @ 32),
             // ThisUpdate(u64 @ 48), NextUpdate(u64 @ 56), cCRLEntry(u32 @ 64), rgCRLEntry(*mut CRL_ENTRY @ 72),
             // cExtension(u32 @ 80), rgExtension(*mut CERT_EXTENSION @ 88)
+            // Unwrap signed CertificateList wrapper unless CRYPT_DECODE_TO_BE_SIGNED_FLAG is set.
             if root.tag != 0x30 {
                 return Err(CRYPT_E_ASN1_BADTAG);
             }
-            let kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            let outer_kids = der_item_children(root.val).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            let kids = if (dw_flags & CRYPT_DECODE_TO_BE_SIGNED_FLAG) == 0
+                && outer_kids.len() == 3
+                && outer_kids[0].tag == 0x30
+                && outer_kids[1].tag == 0x30
+                && outer_kids[2].tag == 0x03
+            {
+                der_item_children(outer_kids[0].val).ok_or(CRYPT_E_ASN1_BADTAG)?
+            } else {
+                outer_kids
+            };
             let off = arena.alloc_aligned(96, 8);
             let mut idx = 0usize;
             let mut ver = 0u32;
@@ -1357,6 +1399,7 @@ pub(super) unsafe fn crypt_decode_object_ex_impl(
     pb_encoded: *const u8,
     cb_encoded: u32,
     dw_flags: u32,
+    p_decode_para: *const c_void,
     pv_struct_info: *mut c_void,
     pcb_struct_info: *mut u32,
 ) -> BOOL {
@@ -1369,14 +1412,14 @@ pub(super) unsafe fn crypt_decode_object_ex_impl(
         return FALSE;
     }
     let der = std::slice::from_raw_parts(pb_encoded, cb_encoded as usize);
-    let arena = match decode_x509_object(lpsz_struct_type, der) {
+    let arena = match decode_x509_object(lpsz_struct_type, der, dw_flags) {
         Ok(a) => a,
         Err(code) => {
             crate::teb::set_last_error(code);
             return FALSE;
         }
     };
-    arena.finish(dw_flags, pv_struct_info, pcb_struct_info)
+    arena.finish(dw_flags, p_decode_para, pv_struct_info, pcb_struct_info)
 }
 
 pub(super) unsafe fn crypt_decode_object_impl(
@@ -1394,6 +1437,7 @@ pub(super) unsafe fn crypt_decode_object_impl(
         pb_encoded,
         cb_encoded,
         dw_flags & !CRYPT_DECODE_ALLOC_FLAG,
+        std::ptr::null(),
         pv_struct_info,
         pcb_struct_info,
     )
@@ -1426,7 +1470,7 @@ pub(crate) unsafe fn spki_to_capi_public_key_blob(p_info: *const c_void) -> Resu
         return Err(err::ERROR_NOT_SUPPORTED);
     }
     let key_der = std::slice::from_raw_parts(spki.public_key.pb_data, spki.public_key.cb_data as usize);
-    let arena = decode_x509_object(RSA_CSP_PUBLICKEYBLOB as *const u8, key_der)?;
+    let arena = decode_x509_object(RSA_CSP_PUBLICKEYBLOB as *const u8, key_der, 0)?;
     Ok(arena.buf)
 }
 

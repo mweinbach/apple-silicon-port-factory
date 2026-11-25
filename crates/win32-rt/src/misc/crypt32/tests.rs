@@ -1925,6 +1925,207 @@ fn crypt_decode_object_and_ex_roundtrip_all_types() {
         );
         crate::kernel32::memory::LocalFree(eku_dec as *mut c_void);
 
+        // CryptDecodeObjectEx with CRYPT_DECODE_ALLOC_FLAG + custom CRYPT_DECODE_PARA.pfnAlloc
+        static CUSTOM_ALLOC_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static CUSTOM_ALLOC_LAST_PTR: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn custom_crypt_alloc(cb: usize) -> *mut c_void {
+            CUSTOM_ALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let p = crate::heap::alloc(cb, true);
+            CUSTOM_ALLOC_LAST_PTR.store(p as usize, std::sync::atomic::Ordering::SeqCst);
+            p
+        }
+        #[repr(C)]
+        struct CryptDecodePara {
+            cb_size: u32,
+            _pad: u32,
+            pfn_alloc: usize,
+            pfn_free: usize,
+        }
+        let decode_para = CryptDecodePara {
+            cb_size: std::mem::size_of::<CryptDecodePara>() as u32,
+            _pad: 0,
+            pfn_alloc: custom_crypt_alloc as *const () as usize,
+            pfn_free: 0,
+        };
+        let before_calls = CUSTOM_ALLOC_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let mut custom_eku: *mut CertEnhkeyUsage = std::ptr::null_mut();
+        let mut custom_eku_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                b"2.5.29.37\0".as_ptr(),
+                eku_der.as_ptr(),
+                eku_der_len,
+                0x8000,
+                &decode_para as *const _ as *const c_void,
+                &mut custom_eku as *mut _ as *mut c_void,
+                &mut custom_eku_len,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CUSTOM_ALLOC_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before_calls + 1
+        );
+        assert_eq!(
+            custom_eku as usize,
+            CUSTOM_ALLOC_LAST_PTR.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!((*custom_eku).c_usage_identifier, 2);
+        assert_eq!(
+            crate::strings::from_ansi(*(*custom_eku).rgpsz_usage_identifier),
+            "1.3.6.1.5.5.7.3.1"
+        );
+        crate::heap::free(custom_eku as *mut c_void);
+
+        // X509_CERT_TO_BE_SIGNED: unwraps full signed certificate by default (dwFlags = 0),
+        // and rejects signed wrapper / decodes raw TBS when CRYPT_DECODE_TO_BE_SIGNED_FLAG is set.
+        let pfx_blob_dec = CryptDataBlob {
+            cb_data: self::test_vectors::PFX_PBES2_AES256.len() as u32,
+            pb_data: self::test_vectors::PFX_PBES2_AES256.as_ptr(),
+        };
+        let pfx_pw = crate::strings::to_wide_z("testpass123");
+        let pfx_st = PFXImportCertStore(&pfx_blob_dec as *const _ as *const c_void, pfx_pw.as_ptr(), 0);
+        let pfx_cert = CertEnumCertificatesInStore(pfx_st, std::ptr::null_mut());
+        let pfx_cc = std::ptr::read_unaligned(pfx_cert as *const crate::misc::wintrust::CertContext);
+        let signed_cert_der = std::slice::from_raw_parts(pfx_cc.pb_cert_encoded, pfx_cc.cb_cert_encoded as usize);
+
+        let mut ci_ptr: *mut crate::misc::wintrust::CertInfo = std::ptr::null_mut();
+        let mut ci_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::asn1::X509_CERT_TO_BE_SIGNED as *const u8,
+                signed_cert_der.as_ptr(),
+                signed_cert_der.len() as u32,
+                0x8000, // CRYPT_DECODE_ALLOC_FLAG only (dwFlags without CRYPT_DECODE_TO_BE_SIGNED_FLAG)
+                std::ptr::null(),
+                &mut ci_ptr as *mut _ as *mut c_void,
+                &mut ci_len,
+            ),
+            TRUE
+        );
+        assert!(!ci_ptr.is_null());
+        assert_eq!((*ci_ptr).dw_version, 2); // X.509 v3
+        assert!((*ci_ptr).serial_number.cb_data > 0);
+        assert!((*ci_ptr).subject.cb_data > 0);
+        assert!((*ci_ptr).subject_public_key_info.public_key.cb_data > 0);
+        crate::kernel32::memory::LocalFree(ci_ptr as *mut c_void);
+
+        // Passing signed cert with CRYPT_DECODE_TO_BE_SIGNED_FLAG (0x2) must NOT unwrap it -> fails
+        let mut bad_ci_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::asn1::X509_CERT_TO_BE_SIGNED as *const u8,
+                signed_cert_der.as_ptr(),
+                signed_cert_der.len() as u32,
+                super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut bad_ci_len,
+            ),
+            FALSE
+        );
+
+        // Extract raw TBS from signed cert via X509_CERT and decode it with CRYPT_DECODE_TO_BE_SIGNED_FLAG
+        let mut signed_info_ptr: *mut u8 = std::ptr::null_mut();
+        let mut signed_info_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::asn1::X509_CERT as *const u8,
+                signed_cert_der.as_ptr(),
+                signed_cert_der.len() as u32,
+                0x8000,
+                std::ptr::null(),
+                &mut signed_info_ptr as *mut _ as *mut c_void,
+                &mut signed_info_len,
+            ),
+            TRUE
+        );
+        let tbs_blob = std::ptr::read_unaligned(signed_info_ptr as *const CryptDataBlob);
+        let mut ci_tbs_ptr: *mut crate::misc::wintrust::CertInfo = std::ptr::null_mut();
+        let mut ci_tbs_len = 0u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::asn1::X509_CERT_TO_BE_SIGNED as *const u8,
+                tbs_blob.pb_data,
+                tbs_blob.cb_data,
+                0x8000 | super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
+                std::ptr::null(),
+                &mut ci_tbs_ptr as *mut _ as *mut c_void,
+                &mut ci_tbs_len,
+            ),
+            TRUE
+        );
+        assert_eq!((*ci_tbs_ptr).dw_version, 2);
+        crate::kernel32::memory::LocalFree(ci_tbs_ptr as *mut c_void);
+        crate::kernel32::memory::LocalFree(signed_info_ptr as *mut c_void);
+        CertFreeCertificateContext(pfx_cert);
+        CertCloseStore(pfx_st, 0);
+
+        // X509_CERT_CRL_TO_BE_SIGNED: unwraps signed CertificateList by default and supports CRYPT_DECODE_TO_BE_SIGNED_FLAG
+        let sha256_rsa_alg = encode_der_tlv(
+            0x30,
+            &[
+                0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00,
+            ],
+        );
+        let crl_issuer = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x31,
+                &encode_der_tlv(0x30, &[0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x02, b'C', b'A']),
+            ),
+        );
+        let mut tbs_crl_body = Vec::new();
+        tbs_crl_body.extend_from_slice(&encode_der_tlv(0x02, &[0x01])); // version v2
+        tbs_crl_body.extend_from_slice(&sha256_rsa_alg);
+        tbs_crl_body.extend_from_slice(&crl_issuer);
+        tbs_crl_body.extend_from_slice(&encode_der_tlv(0x17, b"260101000000Z"));
+        let tbs_crl = encode_der_tlv(0x30, &tbs_crl_body);
+        let mut signed_crl_body = Vec::new();
+        signed_crl_body.extend_from_slice(&tbs_crl);
+        signed_crl_body.extend_from_slice(&sha256_rsa_alg);
+        signed_crl_body.extend_from_slice(&encode_der_tlv(0x03, &[0x00, 0xAA, 0xBB]));
+        let signed_crl = encode_der_tlv(0x30, &signed_crl_body);
+
+        let mut crl_info_buf = [0u8; 256];
+        let mut crl_info_len = crl_info_buf.len() as u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                signed_crl.as_ptr(),
+                signed_crl.len() as u32,
+                0,
+                std::ptr::null(),
+                crl_info_buf.as_mut_ptr() as *mut c_void,
+                &mut crl_info_len,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned(crl_info_buf.as_ptr() as *const u32), 1);
+        let mut crl_tbs_len = crl_info_buf.len() as u32;
+        assert_eq!(
+            CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                super::decode::X509_CERT_CRL_TO_BE_SIGNED as *const u8,
+                tbs_crl.as_ptr(),
+                tbs_crl.len() as u32,
+                super::decode::CRYPT_DECODE_TO_BE_SIGNED_FLAG,
+                std::ptr::null(),
+                crl_info_buf.as_mut_ptr() as *mut c_void,
+                &mut crl_tbs_len,
+            ),
+            TRUE
+        );
+        assert_eq!(std::ptr::read_unaligned(crl_info_buf.as_ptr() as *const u32), 1);
+
         // X509_ENUMERATED & X509_INTEGER
         let enum_in = 5i32;
         let mut enum_der = [0u8; 16];

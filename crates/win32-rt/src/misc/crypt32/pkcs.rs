@@ -829,6 +829,7 @@ pub(super) unsafe fn try_get_decode_msg_param(
                     raw.as_ptr(),
                     raw.len() as u32,
                     0,
+                    std::ptr::null(),
                     pv_data,
                     pcb_data,
                 )

@@ -64,6 +64,7 @@ pub(super) const ISC_REQ_MANUAL_CRED_VALIDATION: u32 = 0x0008_0000;
 
 // Server-side AcceptSecurityContext request/return flags (sspi.h).
 // Note: ASC_REQ_EXTENDED_ERROR (0x8000) and ASC_REQ_STREAM (0x10000) differ from ISC_REQ_*!
+pub(super) const ASC_REQ_MUTUAL_AUTH: u32 = 0x0000_0002;
 pub(super) const ASC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
 pub(super) const ASC_REQ_SEQUENCE_DETECT: u32 = 0x0000_0008;
 pub(super) const ASC_REQ_CONFIDENTIALITY: u32 = 0x0000_0010;
@@ -447,9 +448,17 @@ fn build_schannel_tls_config(
 ) -> Result<Arc<ClientConfig>, i32> {
     let policy = TlsVerifyPolicy::from_schannel(manual_validation, no_servername_check);
 
+    let has_client_cert =
+        !cred.server_cert_chain.is_empty() && cred.server_private_key_pkcs8.is_some();
+
     // Fast path onto shared cached `crate::net_tls::build_tls_config` when using
-    // default roots, both TLS 1.2 + 1.3, and standard SNI.
-    if cred.extra_roots_der.is_empty() && cred.enable_tls12 && cred.enable_tls13 && enable_sni {
+    // default roots, both TLS 1.2 + 1.3, standard SNI, and no client cert.
+    if cred.extra_roots_der.is_empty()
+        && cred.enable_tls12
+        && cred.enable_tls13
+        && enable_sni
+        && !has_client_cert
+    {
         let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
         return Ok(net_tls::build_tls_config(policy, &alpn_refs));
     }
@@ -479,17 +488,40 @@ fn build_schannel_tls_config(
         .with_protocol_versions(&versions)
         .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
 
+    let client_auth_pair = if has_client_cert {
+        let chain: Vec<CertificateDer<'static>> = cred
+            .server_cert_chain
+            .iter()
+            .map(|d| CertificateDer::from(d.clone()))
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(cred.server_private_key_pkcs8.clone().unwrap().into());
+        Some((chain, key))
+    } else {
+        None
+    };
+
     let mut config = if policy.is_strict() {
-        builder.with_root_certificates(roots).with_no_client_auth()
+        let wants_auth = builder.with_root_certificates(roots);
+        if let Some((chain, key)) = client_auth_pair {
+            wants_auth
+                .with_client_auth_cert(chain, key)
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?
+        } else {
+            wants_auth.with_no_client_auth()
+        }
     } else {
         let verifier = Arc::new(
             SelectiveCertVerifier::with_roots(roots, policy)
                 .map_err(|_| SEC_E_INTERNAL_ERROR)?,
         );
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth()
+        let wants_auth = builder.dangerous().with_custom_certificate_verifier(verifier);
+        if let Some((chain, key)) = client_auth_pair {
+            wants_auth
+                .with_client_auth_cert(chain, key)
+                .map_err(|_| SEC_E_NO_CREDENTIALS)?
+        } else {
+            wants_auth.with_no_client_auth()
+        }
     };
     config.enable_sni = enable_sni;
     if !alpn.is_empty() {
@@ -512,11 +544,13 @@ fn map_rustls_error_to_sec(err: &rustls::Error) -> i32 {
             | rustls::CertificateError::UnknownRevocationStatus => SEC_E_UNTRUSTED_ROOT,
             _ => SEC_E_CERT_UNKNOWN,
         },
+        rustls::Error::NoCertificatesPresented => SEC_E_NO_CREDENTIALS,
         rustls::Error::AlertReceived(alert) => match alert {
             rustls::AlertDescription::HandshakeFailure
             | rustls::AlertDescription::ProtocolVersion
             | rustls::AlertDescription::InsufficientSecurity => SEC_E_ALGORITHM_MISMATCH,
             rustls::AlertDescription::CertificateExpired => SEC_E_CERT_EXPIRED,
+            rustls::AlertDescription::CertificateRequired => SEC_E_NO_CREDENTIALS,
             rustls::AlertDescription::UnknownCA
             | rustls::AlertDescription::BadCertificate
             | rustls::AlertDescription::UnsupportedCertificate => SEC_E_UNTRUSTED_ROOT,
@@ -567,6 +601,7 @@ fn drain_tls_out(conn: &mut Connection) -> Vec<u8> {
 fn build_schannel_server_config(
     cred: &SchannelCred,
     alpn: Vec<Vec<u8>>,
+    require_client_auth: bool,
 ) -> Result<Arc<ServerConfig>, i32> {
     let Some(ref key_pkcs8) = cred.server_private_key_pkcs8 else {
         return Err(SEC_E_NO_CREDENTIALS);
@@ -590,12 +625,33 @@ fn build_schannel_server_config(
         .map(|d| CertificateDer::from(d.clone()))
         .collect();
     let key = PrivateKeyDer::Pkcs8(key_pkcs8.clone().into());
-    let mut cfg = ServerConfig::builder_with_provider(net_tls::crypto_provider())
+    let provider = net_tls::crypto_provider();
+    let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&versions)
-        .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|_| SEC_E_NO_CREDENTIALS)?;
+        .map_err(|_| SEC_E_ALGORITHM_MISMATCH)?;
+    let mut cfg = if require_client_auth {
+        let roots = if cred.extra_roots_der.is_empty() {
+            net_tls::root_cert_store()
+        } else {
+            let mut s = (*net_tls::root_cert_store()).clone();
+            for der in &cred.extra_roots_der {
+                let _ = s.add(CertificateDer::from(der.as_slice()));
+            }
+            Arc::new(s)
+        };
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider)
+            .build()
+            .map_err(|_| SEC_E_INTERNAL_ERROR)?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain, key)
+            .map_err(|_| SEC_E_NO_CREDENTIALS)?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .map_err(|_| SEC_E_NO_CREDENTIALS)?
+    };
     if !alpn.is_empty() {
         cfg.alpn_protocols = alpn;
     }
@@ -1217,6 +1273,7 @@ pub(super) unsafe fn accept_security_context_impl(
     pts_expiry: *mut i64,
 ) -> i32 {
     let allocate_mem = (f_context_req & ASC_REQ_ALLOCATE_MEMORY) != 0;
+    let require_client_auth = (f_context_req & ASC_REQ_MUTUAL_AUTH) != 0;
     if !pts_expiry.is_null() {
         std::ptr::write_unaligned(pts_expiry, i64::MAX);
     }
@@ -1224,7 +1281,7 @@ pub(super) unsafe fn accept_security_context_impl(
         | ASC_REQ_SEQUENCE_DETECT
         | ASC_REQ_CONFIDENTIALITY
         | ASC_REQ_STREAM
-        | (f_context_req & (ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_EXTENDED_ERROR));
+        | (f_context_req & (ASC_REQ_MUTUAL_AUTH | ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_EXTENDED_ERROR));
 
     // Create a fresh server context on initial call (ph_context == NULL).
     let (ctx_id, created_new) = if ph_context.is_null() {
@@ -1241,7 +1298,7 @@ pub(super) unsafe fn accept_security_context_impl(
             return SEC_E_INVALID_HANDLE;
         }
         let alpn = parse_alpn_protocols(p_input);
-        let cfg = match build_schannel_server_config(&cred, alpn) {
+        let cfg = match build_schannel_server_config(&cred, alpn, require_client_auth) {
             Ok(c) => c,
             Err(code) => return code,
         };
