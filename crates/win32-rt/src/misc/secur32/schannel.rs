@@ -404,6 +404,7 @@ struct SchannelContext {
     shutdown_pending: bool,
     shutdown_sent: bool,
     pending_shutdown_bytes: Vec<u8>,
+    pending_handshake_out: Vec<u8>,
     pending_eof: bool,
     pending_plaintext: Vec<u8>,
 }
@@ -1085,6 +1086,7 @@ pub(super) unsafe fn initialize_security_context_impl(
             shutdown_pending: false,
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
+            pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
         });
@@ -1132,6 +1134,25 @@ pub(super) unsafe fn initialize_security_context_impl(
                 return SEC_E_OK;
             }
 
+            // Flush any previously drained handshake flight that failed to fit in an earlier
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input.
+            if !ctx.pending_handshake_out.is_empty() {
+                if let Err(code) =
+                    unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
+                {
+                    return code;
+                }
+                ctx.pending_handshake_out.clear();
+                if !pf_context_attr.is_null() {
+                    unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+                }
+                return if ctx.conn.is_handshaking() {
+                    SEC_I_CONTINUE_NEEDED
+                } else {
+                    SEC_E_OK
+                };
+            }
+
             // Find SECBUFFER_TOKEN in p_input.
             let mut token_ptr: *const u8 = std::ptr::null();
             let mut token_len: usize = 0;
@@ -1158,6 +1179,7 @@ pub(super) unsafe fn initialize_security_context_impl(
                 let out = drain_tls_out(&mut ctx.conn);
                 if !out.is_empty() {
                     if let Err(code) = unsafe { emit_token_output(p_output, &out, allocate_mem) } {
+                        ctx.pending_handshake_out = out;
                         return code;
                     }
                     if !pf_context_attr.is_null() {
@@ -1233,6 +1255,9 @@ pub(super) unsafe fn initialize_security_context_impl(
 
             let out_bytes = drain_tls_out(&mut ctx.conn);
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
+                if !out_bytes.is_empty() {
+                    ctx.pending_handshake_out = out_bytes;
+                }
                 return code;
             }
 
@@ -1325,6 +1350,7 @@ pub(super) unsafe fn accept_security_context_impl(
             shutdown_pending: false,
             shutdown_sent: false,
             pending_shutdown_bytes: Vec::new(),
+            pending_handshake_out: Vec::new(),
             pending_eof: false,
             pending_plaintext: Vec::new(),
         });
@@ -1355,6 +1381,25 @@ pub(super) unsafe fn accept_security_context_impl(
                     unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
                 }
                 return SEC_E_OK;
+            }
+
+            // Flush any previously drained server handshake flight that did not fit in an earlier
+            // caller-provided output buffer (SEC_E_BUFFER_TOO_SMALL) before reading new input.
+            if !ctx.pending_handshake_out.is_empty() {
+                if let Err(code) =
+                    unsafe { emit_token_output(p_output, &ctx.pending_handshake_out, allocate_mem) }
+                {
+                    return code;
+                }
+                ctx.pending_handshake_out.clear();
+                if !pf_context_attr.is_null() {
+                    unsafe { std::ptr::write_unaligned(pf_context_attr, ret_attr) };
+                }
+                return if ctx.conn.is_handshaking() {
+                    SEC_I_CONTINUE_NEEDED
+                } else {
+                    SEC_E_OK
+                };
             }
 
             let mut token_ptr: *const u8 = std::ptr::null();
@@ -1443,6 +1488,9 @@ pub(super) unsafe fn accept_security_context_impl(
 
             let out_bytes = drain_tls_out(&mut ctx.conn);
             if let Err(code) = unsafe { emit_token_output(p_output, &out_bytes, allocate_mem) } {
+                if !out_bytes.is_empty() {
+                    ctx.pending_handshake_out = out_bytes;
+                }
                 return code;
             }
             if consumed < input.len() {

@@ -2327,3 +2327,240 @@ fn schannel_server_mutual_auth_rejects_unauthenticated_and_verifies_client_cert(
         crypt32::CertCloseStore(srv_ca_store, 0);
     }
 }
+
+#[test]
+fn schannel_server_preserves_handshake_output_on_buffer_too_small() {
+    use super::schannel::{
+        ASC_REQ_CONFIDENTIALITY, ASC_REQ_STREAM, SECPKG_CRED_INBOUND, SEC_E_BUFFER_TOO_SMALL,
+        SP_PROT_TLS1_2_CLIENT, SP_PROT_TLS1_2_SERVER,
+    };
+
+    unsafe {
+        let pkg = b"Schannel\0";
+        let srv_cert = crypt32::CertCreateCertificateContext(
+            1,
+            TEST_LEAF_DER.as_ptr(),
+            TEST_LEAF_DER.len() as u32,
+        );
+        assert!(crypt32::attach_cert_private_key_pkcs8(
+            srv_cert,
+            TEST_LEAF_KEY_PKCS8_DER.to_vec()
+        ));
+        let mut srv_cred_cfg = [0u8; 0x50];
+        std::ptr::write_unaligned(srv_cred_cfg.as_mut_ptr() as *mut u32, SCHANNEL_CRED_VERSION);
+        std::ptr::write_unaligned(srv_cred_cfg.as_mut_ptr().add(0x04) as *mut u32, 1u32);
+        let pa_cred = [srv_cert as *const c_void];
+        std::ptr::write_unaligned(
+            srv_cred_cfg.as_mut_ptr().add(0x08) as *mut *const *const c_void,
+            pa_cred.as_ptr(),
+        );
+        std::ptr::write_unaligned(
+            srv_cred_cfg.as_mut_ptr().add(0x38) as *mut u32,
+            SP_PROT_TLS1_2_SERVER,
+        );
+        let mut srv_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_INBOUND,
+                std::ptr::null_mut(),
+                srv_cred_cfg.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut srv_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        let ca_store = make_ca_memory_store();
+        let mut cli_cred_cfg = [0u8; 0x50];
+        std::ptr::write_unaligned(cli_cred_cfg.as_mut_ptr() as *mut u32, SCHANNEL_CRED_VERSION);
+        std::ptr::write_unaligned(
+            cli_cred_cfg.as_mut_ptr().add(0x10) as *mut *mut c_void,
+            ca_store,
+        );
+        std::ptr::write_unaligned(
+            cli_cred_cfg.as_mut_ptr().add(0x38) as *mut u32,
+            SP_PROT_TLS1_2_CLIENT,
+        );
+        let mut cli_cred = SecHandle::default();
+        assert_eq!(
+            AcquireCredentialsHandleA(
+                std::ptr::null(),
+                pkg.as_ptr(),
+                SECPKG_CRED_OUTBOUND,
+                std::ptr::null_mut(),
+                cli_cred_cfg.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut cli_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+
+        // Flight 1: ClientHello
+        let target = b"test.example.com\0";
+        let cli_req = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM | ISC_REQ_CONFIDENTIALITY;
+        let srv_req = ASC_REQ_STREAM | ASC_REQ_CONFIDENTIALITY; // caller-managed output buffer (no ALLOCATE_MEMORY)
+        let mut cli_ctx = SecHandle::default();
+        let mut ob0 = SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_TOKEN, pv_buffer: std::ptr::null_mut() };
+        let mut od0 = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut ob0 };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cli_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                target.as_ptr(),
+                cli_req,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut od0 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_I_CONTINUE_NEEDED
+        );
+        let client_hello = std::slice::from_raw_parts(ob0.pv_buffer as *const u8, ob0.cb_buffer as usize).to_vec();
+        FreeContextBuffer(ob0.pv_buffer);
+
+        // Flight 2: ServerHello + Cert + ServerKeyExchange + ServerHelloDone (fits in 8 KiB)
+        let mut srv_ctx = SecHandle::default();
+        let mut srv_out1 = vec![0u8; 8192];
+        let mut ib1 = [
+            SecBuffer { cb_buffer: client_hello.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: client_hello.as_ptr() as *mut c_void },
+            SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_EMPTY, pv_buffer: std::ptr::null_mut() },
+        ];
+        let mut id1 = SecBufferDesc { ul_version: 0, c_buffers: 2, p_buffers: ib1.as_mut_ptr() };
+        let mut sob1 = SecBuffer { cb_buffer: srv_out1.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: srv_out1.as_mut_ptr() as *mut c_void };
+        let mut sod1 = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sob1 };
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                &mut id1 as *mut _ as *mut c_void,
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sod1 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_I_CONTINUE_NEEDED
+        );
+        let srv_flight1 = srv_out1[..sob1.cb_buffer as usize].to_vec();
+
+        // Flight 3: ClientKeyExchange + CCS + Finished
+        let mut cib2 = [
+            SecBuffer { cb_buffer: srv_flight1.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: srv_flight1.as_ptr() as *mut c_void },
+            SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_EMPTY, pv_buffer: std::ptr::null_mut() },
+        ];
+        let mut cid2 = SecBufferDesc { ul_version: 0, c_buffers: 2, p_buffers: cib2.as_mut_ptr() };
+        let mut cob2 = SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_TOKEN, pv_buffer: std::ptr::null_mut() };
+        let mut cod2 = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut cob2 };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cli_cred as *mut _ as *mut c_void,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                target.as_ptr(),
+                cli_req,
+                0,
+                0,
+                &mut cid2 as *mut _ as *mut c_void,
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut cod2 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_I_CONTINUE_NEEDED
+        );
+        let cli_flight2 = std::slice::from_raw_parts(cob2.pv_buffer as *const u8, cob2.cb_buffer as usize).to_vec();
+        FreeContextBuffer(cob2.pv_buffer);
+
+        // Flight 4a: Continuing server handshake with UNDERSIZED 4-byte output buffer -> SEC_E_BUFFER_TOO_SMALL
+        let mut tiny_out = [0u8; 4];
+        let mut sib2 = [
+            SecBuffer { cb_buffer: cli_flight2.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: cli_flight2.as_ptr() as *mut c_void },
+            SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_EMPTY, pv_buffer: std::ptr::null_mut() },
+        ];
+        let mut sid2 = SecBufferDesc { ul_version: 0, c_buffers: 2, p_buffers: sib2.as_mut_ptr() };
+        let mut sob_tiny = SecBuffer { cb_buffer: tiny_out.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: tiny_out.as_mut_ptr() as *mut c_void };
+        let mut sod_tiny = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sob_tiny };
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sid2 as *mut _ as *mut c_void,
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sod_tiny as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_E_BUFFER_TOO_SMALL
+        );
+
+        // Flight 4b: Retry with larger buffer -> MUST recover the preserved TLS 1.2 Server Finished flight!
+        let mut srv_out2 = vec![0u8; 8192];
+        let mut sob2 = SecBuffer { cb_buffer: srv_out2.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: srv_out2.as_mut_ptr() as *mut c_void };
+        let mut sod2 = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut sob2 };
+        assert_eq!(
+            AcceptSecurityContext(
+                &mut srv_cred as *mut _ as *mut c_void,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                srv_req,
+                0,
+                &mut srv_ctx as *mut _ as *mut c_void,
+                &mut sod2 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        assert!(sob2.cb_buffer > 4, "preserved server Finished flight must be delivered on retry");
+        let srv_finished = srv_out2[..sob2.cb_buffer as usize].to_vec();
+
+        // Client consumes preserved Server Finished and reaches SEC_E_OK!
+        let mut cib3 = [
+            SecBuffer { cb_buffer: srv_finished.len() as u32, buffer_type: SECBUFFER_TOKEN, pv_buffer: srv_finished.as_ptr() as *mut c_void },
+            SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_EMPTY, pv_buffer: std::ptr::null_mut() },
+        ];
+        let mut cid3 = SecBufferDesc { ul_version: 0, c_buffers: 2, p_buffers: cib3.as_mut_ptr() };
+        let mut cob3 = SecBuffer { cb_buffer: 0, buffer_type: SECBUFFER_TOKEN, pv_buffer: std::ptr::null_mut() };
+        let mut cod3 = SecBufferDesc { ul_version: 0, c_buffers: 1, p_buffers: &mut cob3 };
+        assert_eq!(
+            InitializeSecurityContextA(
+                &mut cli_cred as *mut _ as *mut c_void,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                target.as_ptr(),
+                cli_req,
+                0,
+                0,
+                &mut cid3 as *mut _ as *mut c_void,
+                0,
+                &mut cli_ctx as *mut _ as *mut c_void,
+                &mut cod3 as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            SEC_E_OK
+        );
+        if !cob3.pv_buffer.is_null() {
+            FreeContextBuffer(cob3.pv_buffer);
+        }
+
+        DeleteSecurityContext(&mut cli_ctx as *mut _ as *mut c_void);
+        DeleteSecurityContext(&mut srv_ctx as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut cli_cred as *mut _ as *mut c_void);
+        FreeCredentialsHandle(&mut srv_cred as *mut _ as *mut c_void);
+        crypt32::CertFreeCertificateContext(srv_cert);
+        crypt32::CertCloseStore(ca_store, 0);
+    }
+}

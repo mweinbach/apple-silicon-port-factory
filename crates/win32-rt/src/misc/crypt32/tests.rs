@@ -2906,6 +2906,51 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert_eq!(crate::teb::last_error(), 0x8009_0020);
         assert_eq!(CryptMsgClose(h_fmsg), TRUE);
 
+        // 3c. Headerless SignedData decoding when caller supplies dwMsgType = CMSG_SIGNED (2)
+        let (ci_item, _) = super::asn1::parse_der_item(PKCS7_SIGNED_DER).unwrap();
+        let ci_kids = super::asn1::der_item_children(ci_item.val).unwrap();
+        let (bare_sd, _) = super::asn1::parse_der_item(ci_kids[1].val).unwrap();
+        let h_bare = CryptMsgOpenToDecode(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            2, // CMSG_SIGNED
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!h_bare.is_null());
+        assert_eq!(
+            CryptMsgUpdate(h_bare, bare_sd.raw.as_ptr(), bare_sd.raw.len() as u32, TRUE),
+            TRUE
+        );
+        let mut bare_type = 0u32;
+        let mut bare_type_len = 4u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                h_bare,
+                CMSG_TYPE_PARAM,
+                0,
+                &mut bare_type as *mut _ as *mut c_void,
+                &mut bare_type_len,
+            ),
+            TRUE
+        );
+        assert_eq!(bare_type, 2);
+        let mut bare_content = [0u8; 64];
+        let mut bare_clen = 64u32;
+        assert_eq!(
+            CryptMsgGetParam(
+                h_bare,
+                CMSG_CONTENT_PARAM,
+                0,
+                bare_content.as_mut_ptr() as *mut c_void,
+                &mut bare_clen,
+            ),
+            TRUE
+        );
+        assert_eq!(&bare_content[..bare_clen as usize], b"Hello PKCS7 Signed World!");
+        assert_eq!(CryptMsgClose(h_bare), TRUE);
+
         // 4. CryptVerifyMessageSignature (valid + tampered rejection)
         #[repr(C)]
         struct VerifyPara {

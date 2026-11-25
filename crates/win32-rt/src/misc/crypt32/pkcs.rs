@@ -209,52 +209,7 @@ pub(super) struct CmsSignedMessage {
     pub signers: Vec<CmsSigner>,
 }
 
-pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
-    let (ci, _) = parse_der_item(der)?;
-    if ci.tag != 0x30 {
-        return None;
-    }
-    let ci_kids = der_item_children(ci.val)?;
-    if ci_kids.is_empty() || ci_kids[0].tag != 0x06 {
-        return None;
-    }
-    let ctype = ci_kids[0].val;
-    if ctype == OID_DATA {
-        let data = if let Some(c) = ci_kids.get(1).filter(|e| e.tag == 0xA0) {
-            let (inner, _) = parse_der_item(c.val)?;
-            extract_octet_string(inner)?
-        } else {
-            Vec::new()
-        };
-        return Some(CmsSignedMessage {
-            msg_type: CMSG_DATA,
-            version: 1,
-            raw_encoded: ci.raw.to_vec(),
-            inner_content_type_oid: wintrust::decode_oid_str(OID_DATA),
-            inner_content_type_oid_der: OID_DATA.to_vec(),
-            bare_content: data.clone(),
-            content: data,
-            certs_der: Vec::new(),
-            signers: Vec::new(),
-        });
-    }
-    if ctype == OID_ENVELOPED_DATA {
-        return Some(CmsSignedMessage {
-            msg_type: CMSG_ENVELOPED,
-            version: 0,
-            raw_encoded: ci.raw.to_vec(),
-            inner_content_type_oid: wintrust::decode_oid_str(OID_ENVELOPED_DATA),
-            inner_content_type_oid_der: OID_ENVELOPED_DATA.to_vec(),
-            bare_content: Vec::new(),
-            content: Vec::new(),
-            certs_der: Vec::new(),
-            signers: Vec::new(),
-        });
-    }
-    if ctype != OID_SIGNED_DATA || ci_kids.len() < 2 || ci_kids[1].tag != 0xA0 {
-        return None;
-    }
-    let (sd_seq, _) = parse_der_item(ci_kids[1].val)?;
+fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsSignedMessage> {
     if sd_seq.tag != 0x30 {
         return None;
     }
@@ -370,7 +325,7 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
     Some(CmsSignedMessage {
         msg_type: CMSG_SIGNED,
         version,
-        raw_encoded: ci.raw.to_vec(),
+        raw_encoded: raw_encoded.to_vec(),
         inner_content_type_oid,
         inner_content_type_oid_der: inner_oid.to_vec(),
         bare_content,
@@ -378,6 +333,113 @@ pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
         certs_der,
         signers,
     })
+}
+
+pub(super) fn parse_cms_content_info(der: &[u8]) -> Option<CmsSignedMessage> {
+    let (ci, _) = parse_der_item(der)?;
+    if ci.tag != 0x30 {
+        return None;
+    }
+    let ci_kids = der_item_children(ci.val)?;
+    if ci_kids.is_empty() || ci_kids[0].tag != 0x06 {
+        return None;
+    }
+    let ctype = ci_kids[0].val;
+    if ctype == OID_DATA {
+        let data = if let Some(c) = ci_kids.get(1).filter(|e| e.tag == 0xA0) {
+            let (inner, _) = parse_der_item(c.val)?;
+            extract_octet_string(inner)?
+        } else {
+            Vec::new()
+        };
+        return Some(CmsSignedMessage {
+            msg_type: CMSG_DATA,
+            version: 1,
+            raw_encoded: ci.raw.to_vec(),
+            inner_content_type_oid: wintrust::decode_oid_str(OID_DATA),
+            inner_content_type_oid_der: OID_DATA.to_vec(),
+            bare_content: data.clone(),
+            content: data,
+            certs_der: Vec::new(),
+            signers: Vec::new(),
+        });
+    }
+    if ctype == OID_ENVELOPED_DATA {
+        return Some(CmsSignedMessage {
+            msg_type: CMSG_ENVELOPED,
+            version: 0,
+            raw_encoded: ci.raw.to_vec(),
+            inner_content_type_oid: wintrust::decode_oid_str(OID_ENVELOPED_DATA),
+            inner_content_type_oid_der: OID_ENVELOPED_DATA.to_vec(),
+            bare_content: Vec::new(),
+            content: Vec::new(),
+            certs_der: Vec::new(),
+            signers: Vec::new(),
+        });
+    }
+    if ctype != OID_SIGNED_DATA || ci_kids.len() < 2 || ci_kids[1].tag != 0xA0 {
+        return None;
+    }
+    let (sd_seq, _) = parse_der_item(ci_kids[1].val)?;
+    parse_cms_signed_data(sd_seq, ci.raw)
+}
+
+/// Decode either a full PKCS#7/CMS `ContentInfo` or, when `expected_msg_type != 0`, a headerless
+/// bare message of that type (`CMSG_SIGNED`, `CMSG_DATA`, `CMSG_ENVELOPED`) per MSDN
+/// `CryptMsgOpenToDecode`.
+fn parse_cms_message(der: &[u8], expected_msg_type: u32) -> Result<CmsSignedMessage, u32> {
+    if let Some(parsed) = parse_cms_content_info(der) {
+        if expected_msg_type != 0 && parsed.msg_type != expected_msg_type {
+            return Err(CRYPT_E_INVALID_MSG_TYPE);
+        }
+        return Ok(parsed);
+    }
+    match expected_msg_type {
+        CMSG_SIGNED => {
+            let (sd_seq, _) = parse_der_item(der).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            parse_cms_signed_data(sd_seq, sd_seq.raw).ok_or(CRYPT_E_ASN1_BADTAG)
+        }
+        CMSG_DATA => {
+            let data = if let Some((item, _)) = parse_der_item(der) {
+                if item.tag == 0x04 || item.tag == 0x24 {
+                    extract_octet_string(item).unwrap_or_else(|| der.to_vec())
+                } else {
+                    der.to_vec()
+                }
+            } else {
+                der.to_vec()
+            };
+            Ok(CmsSignedMessage {
+                msg_type: CMSG_DATA,
+                version: 1,
+                raw_encoded: der.to_vec(),
+                inner_content_type_oid: wintrust::decode_oid_str(OID_DATA),
+                inner_content_type_oid_der: OID_DATA.to_vec(),
+                bare_content: data.clone(),
+                content: data,
+                certs_der: Vec::new(),
+                signers: Vec::new(),
+            })
+        }
+        CMSG_ENVELOPED => {
+            let (seq, _) = parse_der_item(der).ok_or(CRYPT_E_ASN1_BADTAG)?;
+            if seq.tag != 0x30 {
+                return Err(CRYPT_E_ASN1_BADTAG);
+            }
+            Ok(CmsSignedMessage {
+                msg_type: CMSG_ENVELOPED,
+                version: 0,
+                raw_encoded: seq.raw.to_vec(),
+                inner_content_type_oid: wintrust::decode_oid_str(OID_ENVELOPED_DATA),
+                inner_content_type_oid_der: OID_ENVELOPED_DATA.to_vec(),
+                bare_content: Vec::new(),
+                content: Vec::new(),
+                certs_der: Vec::new(),
+                signers: Vec::new(),
+            })
+        }
+        _ => Err(CRYPT_E_ASN1_BADTAG),
+    }
 }
 
 /// Extract issuer raw DER and serial value bytes from a DER X.509 certificate.
@@ -612,12 +674,7 @@ pub(super) unsafe fn crypt_msg_update_impl(
         }
         m.buf.extend_from_slice(chunk);
         if f_final != 0 {
-            let Some(parsed) = parse_cms_content_info(&m.buf) else {
-                return Err(CRYPT_E_ASN1_BADTAG);
-            };
-            if m.expected_msg_type != 0 && parsed.msg_type != m.expected_msg_type {
-                return Err(CRYPT_E_INVALID_MSG_TYPE);
-            }
+            let parsed = parse_cms_message(&m.buf, m.expected_msg_type)?;
             let deliver = if (m.flags & CMSG_DETACHED_FLAG) == 0 {
                 m.stream_output.map(|cb| (cb, parsed.content.clone()))
             } else {
