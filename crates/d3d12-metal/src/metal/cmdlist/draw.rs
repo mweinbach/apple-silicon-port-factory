@@ -549,7 +549,7 @@ impl CommandList {
         Ok((e, size))
     }
 
-    fn apply_dynamic(
+    pub(super) fn apply_dynamic(
         &mut self,
         e: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
         p: &GraphicsPipeline,

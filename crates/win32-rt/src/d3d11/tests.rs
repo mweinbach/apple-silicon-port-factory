@@ -4393,6 +4393,69 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         assert_eq!(stats.VSInvocations, 3);
         assert_eq!(stats.HSInvocations, 1);
 
+        // Regression test: D3D11 DrawInstancedIndirect and DrawIndexedInstancedIndirect with
+        // bound Hull + Domain shaders must route through tessellation mesh emulation on Metal 4.
+        let draw_ind: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 40));
+        let draw_idx_ind: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 39));
+        let ia_set_ib: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 19));
+
+        let indices: [u16; 3] = [0, 1, 2];
+        let ib_init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: indices.as_ptr() as *const c_void,
+            SysMemPitch: 6,
+            SysMemSlicePitch: 6,
+        };
+        let ib_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::INDEX_BUFFER,
+            ..Default::default()
+        };
+        // Offset 0: DrawInstancedIndirect args (3 vertices, 1 instance, 0 startVertex, 0 startInstance)
+        // Offset 32: DrawIndexedInstancedIndirect args (3 indices, 1 instance, 0 startIndex, 0 baseVertex, 0 startInstance)
+        let ind_words: [u32; 16] = [
+            3, 1, 0, 0, 0, 0, 0, 0,
+            3, 1, 0, 0, 0, 0, 0, 0,
+        ];
+        let ind_init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: ind_words.as_ptr() as *const c_void,
+            SysMemPitch: 64,
+            SysMemSlicePitch: 64,
+        };
+        let ind_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 64,
+            Usage: usage::DEFAULT,
+            MiscFlags: misc_flag::DRAWINDIRECT_ARGS,
+            ..Default::default()
+        };
+        let (mut ib, mut ind_buf) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(create_buf(dev, &ib_desc, &ib_init, &mut ib), S_OK);
+        assert_eq!(create_buf(dev, &ind_desc, &ind_init, &mut ind_buf), S_OK);
+
+        // Non-indexed DrawInstancedIndirect with HS+DS.
+        clear_rtv(ctx, rtv, &black);
+        draw_ind(ctx, ind_buf, 0);
+        copy_res(ctx, stg, rt);
+        assert_eq!(map_fn(ctx, stg, 0, map_type::READ, 0, &mut mapped), S_OK);
+        let px_ind = std::ptr::read_unaligned(mapped.pData as *const u32);
+        assert_eq!(px_ind, 0xFFFF_00FF, "HS+DS DrawInstancedIndirect must render magenta, got {px_ind:#010x}");
+        unmap_fn(ctx, stg, 0);
+
+        // Indexed DrawIndexedInstancedIndirect with HS+DS.
+        clear_rtv(ctx, rtv, &black);
+        ia_set_ib(ctx, ib, 57, 0); // DXGI_FORMAT_R16_UINT
+        draw_idx_ind(ctx, ind_buf, 32);
+        copy_res(ctx, stg, rt);
+        assert_eq!(map_fn(ctx, stg, 0, map_type::READ, 0, &mut mapped), S_OK);
+        let px_idx_ind = std::ptr::read_unaligned(mapped.pData as *const u32);
+        assert_eq!(px_idx_ind, 0xFFFF_00FF, "HS+DS DrawIndexedInstancedIndirect must render magenta, got {px_idx_ind:#010x}");
+        unmap_fn(ctx, stg, 0);
+
+        com_release(ind_buf);
+        com_release(ib);
         com_release(q_stats);
         com_release(rs);
         com_release(il);
@@ -4487,6 +4550,18 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
         let ib = mk_buf(ib_bytes, heap_type::UPLOAD, "pred_tess_ib");
         let pred_zero = mk_buf(&0u64.to_le_bytes(), heap_type::UPLOAD, "pred_zero");
         let pred_one = mk_buf(&1u64.to_le_bytes(), heap_type::UPLOAD, "pred_one");
+        let draw_args: [u32; 4] = [3, 1, 0, 0];
+        let draw_args_buf = mk_buf(
+            unsafe { std::slice::from_raw_parts(draw_args.as_ptr() as *const u8, 16) },
+            heap_type::UPLOAD,
+            "pred_tess_ind_draw",
+        );
+        let draw_idx_args: [u32; 5] = [3, 1, 0, 0, 0];
+        let draw_idx_args_buf = mk_buf(
+            unsafe { std::slice::from_raw_parts(draw_idx_args.as_ptr() as *const u8, 20) },
+            heap_type::UPLOAD,
+            "pred_tess_ind_draw_idx",
+        );
         let rb = mk_buf(&[0u8; 256 * 8], heap_type::READBACK, "pred_tess_rb");
 
         let rt_desc = ResourceDesc {
@@ -4517,15 +4592,17 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
             _pad: 0,
         };
 
-        let cases: [(&str, bool, u64, u32, u32); 4] = [
-            // (label, indexed, pred_va, pred_op, expected_pixel)
-            ("non-indexed EQUAL_ZERO pred=0 suppresses", false, pred_zero.gpu_va, 0, 0x0000_0000),
-            ("non-indexed EQUAL_ZERO pred=1 allows",     false, pred_one.gpu_va,  0, 0xFFFF_00FF),
-            ("indexed NOT_EQUAL_ZERO pred=1 suppresses", true,  pred_one.gpu_va,  1, 0x0000_0000),
-            ("indexed NOT_EQUAL_ZERO pred=0 allows",     true,  pred_zero.gpu_va, 1, 0xFFFF_00FF),
+        let cases: [(&str, bool, bool, u64, u32, u32); 6] = [
+            // (label, indirect, indexed, pred_va, pred_op, expected_pixel)
+            ("non-indexed EQUAL_ZERO pred=0 suppresses",          false, false, pred_zero.gpu_va, 0, 0x0000_0000),
+            ("non-indexed EQUAL_ZERO pred=1 allows",              false, false, pred_one.gpu_va,  0, 0xFFFF_00FF),
+            ("indexed NOT_EQUAL_ZERO pred=1 suppresses",          false, true,  pred_one.gpu_va,  1, 0x0000_0000),
+            ("indexed NOT_EQUAL_ZERO pred=0 allows",              false, true,  pred_zero.gpu_va, 1, 0xFFFF_00FF),
+            ("indirect non-indexed EQUAL_ZERO pred=0 suppresses", true,  false, pred_zero.gpu_va, 0, 0x0000_0000),
+            ("indirect indexed NOT_EQUAL_ZERO pred=0 allows",     true,  true,  pred_zero.gpu_va, 1, 0xFFFF_00FF),
         ];
 
-        for (label, indexed, pred_va, pred_op, expected) in cases {
+        for (label, indirect, indexed, pred_va, pred_op, expected) in cases {
             alloc.reset();
             cl.begin(&alloc).expect("begin");
             unsafe { cl.clear_rtv(&tv, [0.0; 4], &[]).expect("clear") };
@@ -4537,7 +4614,22 @@ fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
             cl.gfx.vbs[0] = (vb.gpu_va, 48, 16);
             cl.gfx.ib = Some((ib.gpu_va, 12, 42)); // DXGI_FORMAT_R32_UINT
             cl.set_predication(Some((pred_va, pred_op)));
-            if indexed {
+            if indirect {
+                let layout = d3d12_metal::metal::indirect::IndirectLayout {
+                    stride: if indexed { 20 } else { 16 },
+                    work: if indexed {
+                        d3d12_metal::metal::indirect::Work::DrawIndexed
+                    } else {
+                        d3d12_metal::metal::indirect::Work::Draw
+                    },
+                    work_offset: 0,
+                    patches: Vec::new(),
+                    vb_offsets: Vec::new(),
+                    ib_offset: None,
+                };
+                let args_va = if indexed { draw_idx_args_buf.gpu_va } else { draw_args_buf.gpu_va };
+                cl.execute_indirect(&layout, 1, args_va, None, None).expect("execute_indirect");
+            } else if indexed {
                 cl.draw_indexed(3, 1, 0, 0, 0).expect("draw_indexed");
             } else {
                 cl.draw(3, 1, 0, 0).expect("draw");

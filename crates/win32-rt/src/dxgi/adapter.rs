@@ -436,10 +436,9 @@ unsafe impl Sync for Output {}
 
 impl Drop for Output {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.owned_device.lock() {
-            if let Some(dev) = guard.take() {
-                release_monitor_ownership(self.monitor_id, dev);
-            }
+        let dev = self.owned_device.lock().ok().and_then(|mut g| g.take());
+        if let Some(dev) = dev {
+            release_monitor_ownership(self.monitor_id, dev);
         }
         unsafe { Obj::release(self.adapter) };
     }
@@ -917,8 +916,13 @@ unsafe extern "win64" fn take_ownership(this: PO, dev: *mut c_void, excl: BOOL) 
 
 unsafe extern "win64" fn release_ownership(this: PO) {
     let out = Obj::get(this);
+    // Acquire `output_owners()` before `out.owned_device` (same lock order as `take_ownership`)
+    // so concurrent TakeOwnership/ReleaseOwnership calls on the same output cannot deadlock.
+    let mut map = output_owners().lock().unwrap();
     if let Some(dev) = out.owned_device.lock().unwrap().take() {
-        release_monitor_ownership(out.monitor_id, dev);
+        if map.get(&out.monitor_id).is_some_and(|&(owner, _)| owner == dev) {
+            map.remove(&out.monitor_id);
+        }
     }
 }
 
@@ -1174,6 +1178,34 @@ mod tests {
 
             // WaitForVBlank returns S_OK synchronized to display VBlank (CVDisplayLink on macOS).
             assert_eq!(wait_for_vblank(o1_ptr as PO), S_OK);
+
+            // Concurrent TakeOwnership / ReleaseOwnership on the same output must never deadlock.
+            let o1_raw = o1_ptr as usize;
+            let dev_a_raw = dev_a as usize;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let mut threads = Vec::new();
+            for tid in 0..4usize {
+                let b = barrier.clone();
+                threads.push(std::thread::spawn(move || {
+                    let o = o1_raw as PO;
+                    let dev = dev_a_raw as *mut c_void;
+                    b.wait();
+                    for _ in 0..500 {
+                        if tid % 2 == 0 {
+                            let _ = take_ownership(o, dev, TRUE);
+                        } else {
+                            release_ownership(o);
+                        }
+                    }
+                }));
+            }
+            for t in threads {
+                t.join().expect("concurrent TakeOwnership/ReleaseOwnership thread panicked");
+            }
+            release_ownership(o1_ptr as PO);
+            // After all threads finish and ownership is released, another device can take ownership.
+            assert_eq!(take_ownership(o2_ptr as PO, dev_b, TRUE), S_OK);
+            release_ownership(o2_ptr as PO);
 
             com_release(o2_ptr);
             com_release(o1_ptr);
