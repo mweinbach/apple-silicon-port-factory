@@ -1271,6 +1271,7 @@ fn spawn_and_verify_suspended_child(
     envs: &[(std::ffi::OsString, std::ffi::OsString)],
     stdio: &ChildStdioPlan,
     inherit_fd: Option<i32>,
+    resume_immediately: bool,
 ) -> Result<libc::pid_t, u32> {
     use std::ffi::CString;
 
@@ -1397,7 +1398,7 @@ fn spawn_and_verify_suspended_child(
             return Err(err::ERROR_ACCESS_DENIED);
         }
 
-        if libc::kill(pid, libc::SIGCONT) != 0 {
+        if resume_immediately && libc::kill(pid, libc::SIGCONT) != 0 {
             let e = last_errno();
             pr::kill_and_reap_pid(pid);
             return Err(errno_to_win32(e));
@@ -1653,15 +1654,14 @@ pub unsafe extern "win64" fn CreateProcessW(
             std::ffi::OsString::from(child_exit_wfd.to_string()),
         ));
 
-        // Enforce parent job breakaway / active-process limits BEFORE spawning the child.
-        let inherited_jobs = match collect_inherited_jobs_for_child(flags) {
-            Ok(j) => j,
-            Err(e) => {
-                set_err(e);
-                return FALSE;
-            }
-        };
+        // Enforce parent job breakaway / quota / inheritance rules BEFORE spawning the child.
+        if let Err(e) = check_parent_jobs_for_child_spawn(flags) {
+            set_err(e);
+            return FALSE;
+        }
 
+        // Keep the child suspended until post-spawn parent-job revalidation completes so a
+        // rejected spawn can never execute guest instructions or cause side effects.
         let raw_pid = match spawn_and_verify_suspended_child(
             &trusted_runner.exe_path,
             &trusted_runner.identity,
@@ -1669,6 +1669,7 @@ pub unsafe extern "win64" fn CreateProcessW(
             &envs,
             &stdio_plan,
             Some(child_exit_wfd),
+            false,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -1681,6 +1682,15 @@ pub unsafe extern "win64" fn CreateProcessW(
         drop(exit_write_fd);
         drop(stdio_plan);
 
+        // Re-check parent job rules while the child is still suspended at dyld entry in case
+        // another thread assigned the current process to a non-breakaway job concurrently.
+        if let Err(e) = check_parent_jobs_for_child_spawn(flags) {
+            pr::kill_and_reap_pid(raw_pid);
+            drop(exit_read_fd);
+            set_err(e);
+            return FALSE;
+        }
+
         let pid = raw_pid as u32;
         let proc_obj = Arc::new(ChildProcessObj {
             pid,
@@ -1689,18 +1699,18 @@ pub unsafe extern "win64" fn CreateProcessW(
             terminated_code: handles::Guarded::new(None),
             os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
         });
-        if let Err(e) = attach_child_to_inherited_jobs(&proc_obj, &inherited_jobs) {
-            let _ = libc::kill(raw_pid, libc::SIGKILL);
-            let mut st: libc::c_int = 0;
-            let _ = libc::waitpid(raw_pid, &mut st, 0);
-            drop(exit_read_fd);
-            set_err(e);
-            return FALSE;
-        }
         child_processes()
             .lock()
             .unwrap()
             .insert(pid, Arc::downgrade(&proc_obj));
+        if libc::kill(raw_pid, libc::SIGCONT) != 0 {
+            let e = last_errno();
+            child_processes().lock().unwrap().remove(&pid);
+            pr::kill_and_reap_pid(raw_pid);
+            drop(exit_read_fd);
+            set_err(errno_to_win32(e));
+            return FALSE;
+        }
         let thread_obj = Arc::new(ChildThreadObj {
             tid: pid,
             process: Arc::clone(&proc_obj),
@@ -1822,18 +1832,22 @@ const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
     | JOB_OBJECT_LIMIT_PROCESS_MEMORY
     | JOB_OBJECT_LIMIT_JOB_MEMORY;
 
-/// Collect live parent jobs that a newly created child process must inherit under Windows
-/// job-inheritance rules, enforcing `CREATE_BREAKAWAY_FROM_JOB` permissions and
-/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` quotas before spawning.
+/// Check live parent jobs when spawning a child process under Windows job-inheritance rules.
+///
+/// Permits spawns that cleanly break away from every parent job (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`,
+/// or `CREATE_BREAKAWAY_FROM_JOB` with `JOB_OBJECT_LIMIT_BREAKAWAY_OK`). Rejects unauthorized
+/// breakaway with `ERROR_ACCESS_DENIED`, saturated `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` quotas with
+/// `ERROR_NOT_ENOUGH_QUOTA`, and non-breakaway cross-process job inheritance with
+/// `ERROR_NOT_SUPPORTED` (child runner processes do not share parent `JobState`, so descendants
+/// would otherwise escape `IsProcessInJob`, active-process quotas, and job termination).
 #[cfg(not(target_os = "ios"))]
-fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobObj>>, u32> {
+fn check_parent_jobs_for_child_spawn(creation_flags: u32) -> Result<(), u32> {
     let my_pid = std::process::id();
     let parent_jobs: Vec<Arc<JobObj>> = {
         let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let wants_breakaway = (creation_flags & CREATE_BREAKAWAY_FROM_JOB) != 0;
-    let mut inherited = Vec::new();
     for jo in parent_jobs {
         let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.contains_pid(my_pid) {
@@ -1852,60 +1866,10 @@ fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobOb
         if (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 && st.active_count() >= st.active_process_limit() {
             return Err(err::ERROR_NOT_ENOUGH_QUOTA);
         }
-        if st.has_unenforced_child_limits() {
-            log::warn!(
-                "CreateProcess: parent job has affinity/priority limits that cannot be enforced on child processes"
-            );
-            return Err(err::ERROR_NOT_SUPPORTED);
-        }
-        drop(st);
-        inherited.push(jo);
-    }
-    Ok(inherited)
-}
-
-/// Attach a newly spawned `ChildProcessObj` to every inherited parent job, re-checking
-/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` and child-limit enforceability under each job's lock
-/// and posting `JOB_OBJECT_MSG_NEW_PROCESS`.
-#[cfg(not(target_os = "ios"))]
-fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobObj>]) -> Result<(), u32> {
-    let pid = child.pid;
-    let mut attached: Vec<Arc<JobObj>> = Vec::with_capacity(jobs.len());
-    for jo in jobs {
-        let mut st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.contains_pid(pid) {
-            continue;
-        }
-        let fail_err = if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0
-            && st.active_count() >= st.active_process_limit()
-        {
-            Some(err::ERROR_NOT_ENOUGH_QUOTA)
-        } else if st.has_unenforced_child_limits() {
-            log::warn!(
-                "CreateProcess: parent job has affinity/priority limits that cannot be enforced on child processes"
-            );
-            Some(err::ERROR_NOT_SUPPORTED)
-        } else {
-            None
-        };
-        if let Some(code) = fail_err {
-            drop(st);
-            // Roll back earlier attachments in this batch before failing.
-            for prev in attached {
-                let mut pst = prev.state.lock().unwrap_or_else(|e| e.into_inner());
-                pst.members.retain(|m| m.pid() != pid);
-                pst.total_processes = pst.total_processes.saturating_sub(1);
-            }
-            return Err(code);
-        }
-        st.members.push(JobMember::Child(Arc::clone(child)));
-        st.total_processes = st.total_processes.saturating_add(1);
-        if let Some(ref cp) = st.completion_port {
-            post_job_iocp_msg(cp, JOB_OBJECT_MSG_NEW_PROCESS, pid as usize);
-        }
-        drop(st);
-        retain_active_job(jo);
-        attached.push(Arc::clone(jo));
+        log::warn!(
+            "CreateProcess: cross-process job inheritance into child/grandchild runtimes is not supported (configure JOB_OBJECT_LIMIT_BREAKAWAY_OK or JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)"
+        );
+        return Err(err::ERROR_NOT_SUPPORTED);
     }
     Ok(())
 }
@@ -4448,6 +4412,7 @@ pub(crate) mod tests {
             &[],
             &stdio1,
             None,
+            true,
         );
         drop(stdio1);
         assert_eq!(
@@ -4475,6 +4440,7 @@ pub(crate) mod tests {
             &[],
             &stdio2,
             None,
+            true,
         )
         .expect("matching kernel CDHash must resume and succeed");
         drop(stdio2);
@@ -4484,6 +4450,31 @@ pub(crate) mod tests {
         assert_eq!(waited, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         assert_eq!(out, b"verified-ok\n");
+
+        // 3. With resume_immediately=false, a verified child remains suspended until explicitly
+        //    resumed or killed, producing zero side effects if aborted before SIGCONT.
+        let (r3, w3) = make_pipe();
+        let stdio3 = ChildStdioPlan {
+            stdin: ChildStdioTarget::DevNull,
+            stdout: ChildStdioTarget::DupFd(w3),
+            stderr: ChildStdioTarget::DevNull,
+        };
+        let suspended_pid = spawn_and_verify_suspended_child(
+            echo_path,
+            &echo_trusted.identity,
+            &[std::ffi::OsString::from("MUST_STAY_SUSPENDED")],
+            &[],
+            &stdio3,
+            None,
+            false,
+        )
+        .expect("matching kernel CDHash must return suspended pid");
+        drop(stdio3);
+        pr::kill_and_reap_pid(suspended_pid);
+        assert!(
+            read_all(&r3).is_empty(),
+            "child killed while suspended before SIGCONT must never execute userspace code"
+        );
     }
 
     #[cfg(not(target_os = "ios"))]
@@ -4957,15 +4948,6 @@ pub(crate) mod tests {
                 let zero_child_h = make_test_child_handle(99990, "C:\\Games\\ZeroQuota.exe");
                 assert_eq!(AssignProcessToJobObject(zero_job, zero_child_h), FALSE);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOT_ENOUGH_QUOTA);
-                #[cfg(not(target_os = "ios"))]
-                {
-                    let zj_arc = handles::get_as::<JobObj>(zero_job).unwrap();
-                    let zc_arc = handles::get_as::<ChildProcessObj>(zero_child_h).unwrap();
-                    assert_eq!(
-                        attach_child_to_inherited_jobs(&zc_arc, &[zj_arc]),
-                        Err(err::ERROR_NOT_ENOUGH_QUOTA)
-                    );
-                }
                 assert_eq!(crate::kernel32::threads::CloseHandle(zero_child_h), TRUE);
                 assert_eq!(crate::kernel32::threads::CloseHandle(zero_job), TRUE);
             }
@@ -5005,30 +4987,31 @@ pub(crate) mod tests {
                 assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), TRUE);
             }
 
-            // Child creation inherits the current process's job by default, respects
-            // ActiveProcessLimit and CREATE_BREAKAWAY_FROM_JOB / SILENT_BREAKAWAY_OK.
+            // Child creation enforces ActiveProcessLimit, CREATE_BREAKAWAY_FROM_JOB /
+            // SILENT_BREAKAWAY_OK, and honestly rejects unsupported cross-process job inheritance.
             #[cfg(not(target_os = "ios"))]
             {
-                // ActiveProcessLimit == 0 on a job containing self also rejects child inheritance.
+                // ActiveProcessLimit == 0 on a job containing self rejects child spawn with ERROR_NOT_ENOUGH_QUOTA.
                 let mut zero_inh = [0u8; 64];
                 std::ptr::write_unaligned(
                     zero_inh.as_mut_ptr().add(16) as *mut u32,
                     JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
                 );
                 assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
-                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
                 std::ptr::write_unaligned(zero_inh.as_mut_ptr().add(40) as *mut u32, 1u32);
                 assert_eq!(SetInformationJobObject(job, 2, zero_inh.as_ptr() as *const c_void, 64), TRUE);
 
                 // ActiveProcessLimit == 1 is already saturated by CURRENT_PROCESS -> ERROR_NOT_ENOUGH_QUOTA.
-                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
                 // CREATE_BREAKAWAY_FROM_JOB without BREAKAWAY_OK -> ERROR_ACCESS_DENIED.
                 assert_eq!(
-                    collect_inherited_jobs_for_child(CREATE_BREAKAWAY_FROM_JOB).err(),
-                    Some(err::ERROR_ACCESS_DENIED)
+                    check_parent_jobs_for_child_spawn(CREATE_BREAKAWAY_FROM_JOB),
+                    Err(err::ERROR_ACCESS_DENIED)
                 );
 
-                // Allow 2 active processes + BREAKAWAY_OK: default spawn inherits `job`, breakaway skips it.
+                // Allow 2 active processes + BREAKAWAY_OK: explicit breakaway succeeds, while
+                // non-breakaway child inheritance fails honestly with ERROR_NOT_SUPPORTED.
                 std::ptr::write_unaligned(
                     ext.as_mut_ptr().add(16) as *mut u32,
                     JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
@@ -5036,20 +5019,20 @@ pub(crate) mod tests {
                 std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 2u32);
                 assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
 
-                let breakaway_jobs = collect_inherited_jobs_for_child(CREATE_BREAKAWAY_FROM_JOB).unwrap();
-                assert!(breakaway_jobs.is_empty());
+                assert_eq!(check_parent_jobs_for_child_spawn(CREATE_BREAKAWAY_FROM_JOB), Ok(()));
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_SUPPORTED));
 
-                let inherited = collect_inherited_jobs_for_child(0).unwrap();
-                assert_eq!(inherited.len(), 1);
+                // Direct AssignProcessToJobObject attaches a child to `job` for parent-side
+                // quota/termination/IOCP tracking, enforces class-9/affinity child guards.
                 let inh_child = Arc::new(ChildProcessObj {
                     pid: 99991,
-                    exe_win: "C:\\Games\\InheritedChild.exe".to_string(),
+                    exe_win: "C:\\Games\\AssignedChild.exe".to_string(),
                     exit_code: handles::Guarded::new(None),
                     terminated_code: handles::Guarded::new(None),
                     os_pid: std::sync::atomic::AtomicI32::new(0),
                 });
-                assert_eq!(attach_child_to_inherited_jobs(&inh_child, &inherited), Ok(()));
                 let inh_h = handles::insert(Arc::clone(&inh_child) as Arc<dyn KObject>);
+                assert_eq!(AssignProcessToJobObject(job, inh_h), TRUE);
                 let mut inh_in_job: BOOL = FALSE;
                 assert_eq!(IsProcessInJob(inh_h, job, &mut inh_in_job), TRUE);
                 assert_eq!(inh_in_job, TRUE);
@@ -5059,8 +5042,8 @@ pub(crate) mod tests {
                 assert_eq!(QueryInformationJobObject(job, 9, child_ext.as_mut_ptr() as *mut c_void, 144, &mut ret_len), FALSE);
                 assert_eq!(ret_len, 0);
                 assert_eq!(crate::teb::last_error(), err::ERROR_NOT_SUPPORTED);
-                // ActiveProcessLimit == 2 is now saturated (self + inherited child).
-                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                // ActiveProcessLimit == 2 is now saturated (self + assigned child).
+                assert_eq!(check_parent_jobs_for_child_spawn(0), Err(err::ERROR_NOT_ENOUGH_QUOTA));
                 // While a live child belongs to the job, setting restricted affinity (class 2/9/14)
                 // or priority class fails honestly with ERROR_NOT_SUPPORTED.
                 if orig_sm >= 0x3 {
@@ -5127,7 +5110,7 @@ pub(crate) mod tests {
                 JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
             );
             #[cfg(not(target_os = "ios"))]
-            assert!(collect_inherited_jobs_for_child(0).unwrap().is_empty());
+            assert_eq!(check_parent_jobs_for_child_spawn(0), Ok(()));
 
             // Named job objects release namespace ownership when the last handle closes.
             let jname = to_wide_z("Local\\KernelCoreNamedJobTest");
