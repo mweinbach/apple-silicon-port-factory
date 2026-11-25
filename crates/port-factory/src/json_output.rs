@@ -1360,7 +1360,8 @@ pub fn doctor_data_json(
     let drifted_count = db.drifted_items().len();
     JsonObj::new()
         .str("mode", if fix_mode { "fix" } else { "check" })
-        .bool("db_clean", drifted_count == 0)
+        .bool("db_clean", !db.has_drift())
+        .str_array("catalog_errors", db.catalog_errors.iter().cloned())
         .usize("drifted_count", drifted_count)
         .val(
             "databases",

@@ -184,6 +184,20 @@ pub struct RectClearParams {
     pub _pad: [u32; 3],
 }
 
+/// Parameters for FidelityFX FSR3 autogen reactive mask pass (matches MSL `FfxReactiveParams`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FfxReactiveParams {
+    pub width: u32,
+    pub height: u32,
+    pub flags: u32,
+    pub _pad0: u32,
+    pub scale: f32,
+    pub cutoff_threshold: f32,
+    pub binary_value: f32,
+    pub _pad1: f32,
+}
+
 pub fn bytes_of<T: Copy>(t: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(t as *const T as *const u8, std::mem::size_of::<T>()) }
 }
@@ -233,8 +247,46 @@ kernel void port_upscale_2d_f(texture2d<float, access::sample> src [[texture(0)]
     if (g.x >= p.w || g.y >= p.h) return;
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
     float2 src_sz = float2(p.x0 > 0 ? p.x0 : src.get_width(), p.y0 > 0 ? p.y0 : src.get_height());
-    float2 uv = (float2(g.xy) + 0.5) * (src_sz / float2(p.w, p.h));
-    dst.write(src.sample(s, uv), g.xy);
+    float2 src_off = float2(p.u.x, p.u.y);
+    float2 uv = src_off + (float2(g.xy) + 0.5) * (src_sz / float2(p.w, p.h));
+    uv = clamp(uv, src_off + 0.5, src_off + max(src_sz - 0.5, 0.5));
+    dst.write(src.sample(s, uv), g.xy + uint2(p.u.z, p.u.w));
+}
+
+struct FfxReactiveParams { uint width; uint height; uint flags; uint pad0; float scale; float cutoff_threshold; float binary_value; float pad1; };
+inline float3 port_ffx_tonemap(float3 rgb) {
+    return rgb / (max(max(0.0f, rgb.r), max(rgb.g, rgb.b)) + 1.0f);
+}
+inline float3 port_ffx_inv_tonemap(float3 rgb) {
+    return rgb / max(1e-6f, 1.0f - max(rgb.r, max(rgb.g, rgb.b)));
+}
+kernel void port_ffx_gen_reactive_2d(
+    texture2d<float, access::read> opaque_tex [[texture(0)]],
+    texture2d<float, access::read> pre_upscale_tex [[texture(1)]],
+    texture2d<float, access::write> out_reactive [[texture(2)]],
+    constant FfxReactiveParams& p [[buffer(0)]],
+    uint2 g [[thread_position_in_grid]])
+{
+    if (g.x >= p.width || g.y >= p.height) return;
+    float3 c_opaque = opaque_tex.read(g).rgb;
+    float3 c_pre = pre_upscale_tex.read(g).rgb;
+    if ((p.flags & 1u) != 0u) {
+        c_opaque = port_ffx_tonemap(c_opaque);
+        c_pre = port_ffx_tonemap(c_pre);
+    }
+    if ((p.flags & 2u) != 0u) {
+        c_opaque = port_ffx_inv_tonemap(c_opaque);
+        c_pre = port_ffx_inv_tonemap(c_pre);
+    }
+    float3 delta = abs(c_pre - c_opaque);
+    float val = ((p.flags & 8u) != 0u)
+        ? max(delta.x, max(delta.y, delta.z))
+        : length(delta);
+    val *= p.scale;
+    if ((p.flags & 4u) != 0u) {
+        val = (val < p.cutoff_threshold) ? 0.0f : p.binary_value;
+    }
+    out_reactive.write(float4(val, val, val, val), g);
 }
 
 kernel void port_present_copy_2d(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
@@ -413,6 +465,7 @@ fn kernels() -> &'static Kernels {
                 "port_fill".to_string(),
                 "port_fill_v4".to_string(),
                 "port_upscale_2d_f".to_string(),
+                "port_ffx_gen_reactive_2d".to_string(),
                 "port_present_copy_2d".to_string(),
                 "port_present_scale_2d".to_string(),
                 "port_diag_tex_scan_2d".to_string(),
