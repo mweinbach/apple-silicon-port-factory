@@ -478,13 +478,27 @@ pub enum TaskDialogEvent {
     ButtonClicked(TaskDialogAlertResult),
 }
 
-/// Live content/selection/enabled/hyperlink/dismissal update pushed from a
-/// Win32 TaskDialog callback back to the currently open native `NSAlert`.
+/// Progress bar state for `TaskDialogIndirect` (`TDF_SHOW_PROGRESS_BAR` /
+/// `TDF_SHOW_MARQUEE_PROGRESS_BAR` and `TDM_SET_PROGRESS_BAR_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskDialogProgressState {
+    pub marquee: bool,
+    pub marquee_running: bool,
+    pub min: u16,
+    pub max: u16,
+    pub pos: i32,
+    /// `PBST_NORMAL` (1), `PBST_ERROR` (2), or `PBST_PAUSED` (3).
+    pub state: u32,
+}
+
+/// Live content/selection/enabled/hyperlink/progress/dismissal update pushed
+/// from a Win32 TaskDialog callback back to the currently open native `NSAlert`.
 #[derive(Clone, Debug)]
 pub struct TaskDialogLiveUpdate {
     pub caption: String,
     pub text: String,
     pub links: Vec<(String, String)>,
+    pub progress: Option<TaskDialogProgressState>,
     pub button_enabled: Vec<bool>,
     pub radio_enabled: Vec<bool>,
     pub selected_radio_idx: Option<usize>,
@@ -606,6 +620,7 @@ pub fn task_dialog_alert<F, T>(
     caption: String,
     text: String,
     links: Vec<(String, String)>,
+    progress: Option<TaskDialogProgressState>,
     buttons: Vec<String>,
     button_enabled: Vec<bool>,
     default_button_idx: Option<usize>,
@@ -633,6 +648,7 @@ where
             &caption,
             &text,
             &links,
+            progress,
             &buttons,
             &button_enabled,
             default_button_idx,
@@ -657,6 +673,7 @@ where
                 &caption,
                 &text,
                 &links,
+                progress,
                 &buttons,
                 &button_enabled,
                 default_button_idx,
@@ -684,6 +701,7 @@ where
                 &caption,
                 &text,
                 &links,
+                progress,
                 &buttons,
                 &button_enabled,
                 default_button_idx,
@@ -721,6 +739,7 @@ where
             caption,
             text,
             links,
+            progress,
             buttons,
             button_enabled,
             default_button_idx,
@@ -903,6 +922,7 @@ pub(crate) type TestTaskDialogPresenter = Box<
         &str,
         &str,
         &[(String, String)],
+        Option<TaskDialogProgressState>,
         &[String],
         &[bool],
         Option<usize>,
@@ -942,6 +962,7 @@ fn invoke_test_task_dialog_presenter(
     caption: &str,
     text: &str,
     links: &[(String, String)],
+    progress: Option<TaskDialogProgressState>,
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -958,6 +979,7 @@ fn invoke_test_task_dialog_presenter(
                 caption,
                 text,
                 links,
+                progress,
                 buttons,
                 button_enabled,
                 default_button_idx,

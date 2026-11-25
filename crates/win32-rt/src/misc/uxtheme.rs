@@ -235,6 +235,8 @@ const TDCBF_CLOSE_BUTTON: u32 = 0x0020;
 
 const TDF_ENABLE_HYPERLINKS: u32 = 0x0001;
 const TDF_VERIFICATION_FLAG_CHECKED: u32 = 0x0100;
+const TDF_SHOW_PROGRESS_BAR: u32 = 0x0200;
+const TDF_SHOW_MARQUEE_PROGRESS_BAR: u32 = 0x0400;
 const TDF_CALLBACK_TIMER: u32 = 0x0800;
 const TDF_NO_DEFAULT_RADIO_BUTTON: u32 = 0x4000;
 
@@ -251,12 +253,21 @@ const TDN_VERIFICATION_CLICKED: u32 = 8;
 const TASK_DIALOG_TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 const TDM_CLICK_BUTTON: u32 = crate::user32::wm::USER + 102;
+const TDM_SET_MARQUEE_PROGRESS_BAR: u32 = crate::user32::wm::USER + 103;
+const TDM_SET_PROGRESS_BAR_STATE: u32 = crate::user32::wm::USER + 104;
+const TDM_SET_PROGRESS_BAR_RANGE: u32 = crate::user32::wm::USER + 105;
+const TDM_SET_PROGRESS_BAR_POS: u32 = crate::user32::wm::USER + 106;
+const TDM_SET_PROGRESS_BAR_MARQUEE: u32 = crate::user32::wm::USER + 107;
 const TDM_SET_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 108;
 const TDM_CLICK_RADIO_BUTTON: u32 = crate::user32::wm::USER + 110;
 const TDM_ENABLE_BUTTON: u32 = crate::user32::wm::USER + 111;
 const TDM_ENABLE_RADIO_BUTTON: u32 = crate::user32::wm::USER + 112;
 const TDM_CLICK_VERIFICATION: u32 = crate::user32::wm::USER + 113;
 const TDM_UPDATE_ELEMENT_TEXT: u32 = crate::user32::wm::USER + 114;
+
+const PBST_NORMAL: u32 = 1;
+const PBST_ERROR: u32 = 2;
+const PBST_PAUSED: u32 = 3;
 
 const TDE_CONTENT: usize = 0;
 const TDE_EXPANDED_INFORMATION: usize = 1;
@@ -273,6 +284,7 @@ struct ActiveTaskDialog {
     session_id: u64,
     modal_open: bool,
     enable_hyperlinks: bool,
+    progress: Option<crate::macos::TaskDialogProgressState>,
     hinst: usize,
     pf_callback: usize,
     lp_callback_data: isize,
@@ -448,6 +460,7 @@ impl ActiveTaskDialog {
                     caption: self.caption.clone(),
                     text,
                     links,
+                    progress: self.progress,
                     button_enabled: self.button_enabled.clone(),
                     radio_enabled: self.radio_enabled.clone(),
                     selected_radio_idx: self.selected_radio_idx,
@@ -529,6 +542,115 @@ unsafe extern "win64" fn task_dialog_wndproc(
                     dlg.pending_click_button = Some(bid);
                     let bidx = dlg.buttons.iter().position(|(id, _)| *id == bid);
                     dlg.live_update(bidx)
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            0
+        }
+        TDM_SET_MARQUEE_PROGRESS_BAR => {
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    if let Some(ref mut p) = dlg.progress {
+                        p.marquee = w_param != 0;
+                        if !p.marquee {
+                            p.marquee_running = false;
+                        }
+                        dlg.live_update(None)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            0
+        }
+        TDM_SET_PROGRESS_BAR_STATE => {
+            let (prev, push) = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h)
+                    .map(|dlg| {
+                        if let Some(ref mut p) = dlg.progress {
+                            let st = w_param as u32;
+                            if matches!(st, PBST_NORMAL | PBST_ERROR | PBST_PAUSED) {
+                                let old = p.state as isize;
+                                p.state = st;
+                                (old, dlg.live_update(None))
+                            } else {
+                                (0, None)
+                            }
+                        } else {
+                            (0, None)
+                        }
+                    })
+                    .unwrap_or((0, None))
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            prev
+        }
+        TDM_SET_PROGRESS_BAR_RANGE => {
+            let (prev, push) = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h)
+                    .map(|dlg| {
+                        if let Some(ref mut p) = dlg.progress {
+                            let old = ((p.min as usize) | ((p.max as usize) << 16)) as isize;
+                            let raw = l_param as usize;
+                            let lo = (raw & 0xFFFF) as u16;
+                            let hi = ((raw >> 16) & 0xFFFF) as u16;
+                            p.min = lo;
+                            p.max = hi;
+                            p.pos = p.pos.clamp(lo as i32, hi.max(lo) as i32);
+                            (old, dlg.live_update(None))
+                        } else {
+                            (0, None)
+                        }
+                    })
+                    .unwrap_or((0, None))
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            prev
+        }
+        TDM_SET_PROGRESS_BAR_POS => {
+            let (prev, push) = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h)
+                    .map(|dlg| {
+                        if let Some(ref mut p) = dlg.progress {
+                            let old = p.pos as isize;
+                            let hi = p.max.max(p.min) as i32;
+                            p.pos = (w_param as i32).clamp(p.min as i32, hi);
+                            (old, dlg.live_update(None))
+                        } else {
+                            (0, None)
+                        }
+                    })
+                    .unwrap_or((0, None))
+            };
+            if let Some((sid, upd)) = push {
+                crate::macos::task_dialog_alert_update(sid, upd);
+            }
+            prev
+        }
+        TDM_SET_PROGRESS_BAR_MARQUEE => {
+            let push = {
+                let mut map = active_task_dialogs().lock().unwrap_or_else(|e| e.into_inner());
+                map.get_mut(&h).and_then(|dlg| {
+                    if let Some(ref mut p) = dlg.progress {
+                        p.marquee = true;
+                        p.marquee_running = w_param != 0;
+                        dlg.live_update(None)
+                    } else {
+                        None
+                    }
                 })
             };
             if let Some((sid, upd)) = push {
@@ -831,6 +953,16 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
         task_dialog_wndproc_va(),
     );
     let enable_hyperlinks = (cfg.dw_flags & TDF_ENABLE_HYPERLINKS) != 0;
+    let show_progress =
+        (cfg.dw_flags & (TDF_SHOW_PROGRESS_BAR | TDF_SHOW_MARQUEE_PROGRESS_BAR)) != 0;
+    let initial_progress = show_progress.then(|| crate::macos::TaskDialogProgressState {
+        marquee: (cfg.dw_flags & TDF_SHOW_MARQUEE_PROGRESS_BAR) != 0,
+        marquee_running: false,
+        min: 0,
+        max: 100,
+        pos: 0,
+        state: PBST_NORMAL,
+    });
     active_task_dialogs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -840,6 +972,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 session_id,
                 modal_open: false,
                 enable_hyperlinks,
+                progress: initial_progress,
                 hinst: hinst as usize,
                 pf_callback: cfg.pf_callback,
                 lp_callback_data: cfg.lp_callback_data,
@@ -891,6 +1024,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             cur_caption,
             cur_body,
             cur_links,
+            cur_progress,
             cur_button_enabled,
             cur_radio_enabled,
             cur_radio_idx,
@@ -904,13 +1038,14 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                 dlg.caption.clone(),
                 body,
                 links,
+                dlg.progress,
                 dlg.button_enabled.clone(),
                 dlg.radio_enabled.clone(),
                 dlg.selected_radio_idx,
                 dlg.verified,
                 dlg.pending_click_button.take(),
             );
-            if snap.7.is_none() {
+            if snap.8.is_none() {
                 dlg.modal_open = true;
             }
             snap
@@ -930,6 +1065,7 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
             cur_caption,
             cur_body,
             cur_links.clone(),
+            cur_progress,
             labels.clone(),
             cur_button_enabled.clone(),
             default_button_idx,
@@ -1015,16 +1151,17 @@ pub unsafe extern "win64" fn TaskDialogIndirect(
                     && !has_selection_controls
                     && !callback_timer
                     && cur_links.is_empty()
+                    && cur_progress.is_none()
                     && single_enabled
                 {
                     // Pure single-button informational dialog with an enabled button and no
-                    // selection controls, hyperlinks, or timer can dismiss in headless mode
-                    // (matching MessageBox MB_OK).
+                    // selection controls, hyperlinks, progress bar, or timer can dismiss in
+                    // headless mode (matching MessageBox MB_OK).
                     (buttons[0].0, false)
                 } else {
                     // Multi-button prompts or dialogs with radio buttons / verification checkboxes /
-                    // clickable hyperlinks / TDF_CALLBACK_TIMER require an interactive desktop so we
-                    // never fabricate user selections or silently skip callbacks.
+                    // clickable hyperlinks / progress bars / TDF_CALLBACK_TIMER require an interactive
+                    // desktop so we never fabricate user selections or silently skip live UI updates.
                     if callback_timer {
                         log::warn!("uxtheme: TaskDialogIndirect with TDF_CALLBACK_TIMER requires interactive desktop");
                     }
@@ -1564,7 +1701,7 @@ mod tests {
 
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, body, _links, btns, _btn_en, def_btn, rads, _rad_en, def_rad, ver_txt, ver_chk, emit| {
+                move |_cap, body, _links, _prog, btns, _btn_en, def_btn, rads, _rad_en, def_rad, ver_txt, ver_chk, emit| {
                     step += 1;
                     assert_eq!(btns, &["Yes", "No"]);
                     assert_eq!(def_btn, Some(1)); // n_default_button == IDNO (7)
@@ -1789,7 +1926,7 @@ mod tests {
             SEEN_NOTIFS.lock().unwrap().clear();
             SUB_PINGS.store(0, std::sync::atomic::Ordering::SeqCst);
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |cap, body, _links, _btns, _btn_en, _def_btn, _rads, _rad_en, def_rad, _ver_txt, ver_chk, _emit| {
+                |cap, body, _links, _prog, _btns, _btn_en, _def_btn, _rads, _rad_en, def_rad, _ver_txt, ver_chk, _emit| {
                     assert_eq!(cap, "Callback Title");
                     assert_eq!(body, "Updated Body");
                     assert_eq!(def_rad, Some(0)); // updated via TDM_CLICK_RADIO_BUTTON(201)
@@ -1921,7 +2058,7 @@ mod tests {
             VETO_FIRST.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut step = 0usize;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, _links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                move |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
                     step += 1;
                     if step == 1 {
                         // Triggers TDM_CLICK_BUTTON(6) while modal_open == true.
@@ -1977,6 +2114,7 @@ mod tests {
                         session_id: sid,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        progress: None,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,
@@ -2067,6 +2205,7 @@ mod tests {
                         session_id: timer_sid,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        progress: None,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,
@@ -2236,7 +2375,7 @@ mod tests {
             quit_cfg.pf_callback = quit_td_cb as *const () as usize;
 
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                |_cap, _body, _links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
+                |_cap, _body, _links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
                     crate::user32::message::PostQuitMessage(77);
                     crate::macos::TaskDialogOutcome::Quit
                 },
@@ -2321,7 +2460,7 @@ mod tests {
             })));
 
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, _body, _links, btns, btn_en, _db, rads, rad_en, _dr, _vt, _vc, emit| {
+                move |_cap, _body, _links, _prog, btns, btn_en, _db, rads, rad_en, _dr, _vt, _vc, emit| {
                     assert_eq!(btns, &["OK", "Cancel"]);
                     assert_eq!(rads, &["R1", "R2"]);
                     // Pre-presentation TDM_ENABLE_BUTTON(1, FALSE) and TDM_ENABLE_RADIO_BUTTON(202, FALSE)
@@ -2480,7 +2619,7 @@ mod tests {
                 live_links_hook.lock().unwrap().push(upd.links.clone());
             })));
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, body, links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                move |_cap, body, links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
                     assert_eq!(
                         body,
                         "Heading <a href=\"ignored\">Raw</a>\n\nRead Documentation.\n\nExtra FAQ.\n\nSupport: Contact"
@@ -2548,7 +2687,7 @@ mod tests {
             // 4. Without TDF_ENABLE_HYPERLINKS, anchor tags remain literal and no links are extracted.
             cfg.dw_flags = 0;
             crate::macos::set_test_task_dialog_presenter(Some(Box::new(
-                move |_cap, body, links, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
+                move |_cap, body, links, _prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, _emit| {
                     assert!(body.contains("<A HREF=\"https://example.com/docs\">Documentation</A>"));
                     assert!(links.is_empty());
                     crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
@@ -2568,6 +2707,140 @@ mod tests {
                 S_OK
             );
             crate::macos::set_test_task_dialog_presenter(None);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn task_dialog_progress_bar_updates_and_headless_refusal() {
+        let _g = crate::user32::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| unsafe {
+            // 1. Determinate progress bar: TDN_CREATED sets range/pos/state (verifying previous
+            //    return values), and live interaction switches to marquee and animates it.
+            unsafe extern "win64" fn prog_cb(
+                hwnd: HWND,
+                msg: u32,
+                wp: usize,
+                _lp: isize,
+                _ref_data: isize,
+            ) -> HRESULT {
+                if msg == TDN_CREATED {
+                    let prev_range = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_PROGRESS_BAR_RANGE,
+                        0,
+                        ((10usize) | (200usize << 16)) as isize,
+                    );
+                    assert_eq!(prev_range as usize, 100usize << 16); // default [0, 100]
+                    let prev_pos = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_PROGRESS_BAR_POS,
+                        75,
+                        0,
+                    );
+                    assert_eq!(prev_pos, 10); // clamped from 0 -> 10 when range changed to [10, 200]
+                    let prev_state = crate::user32::message::SendMessageW(
+                        hwnd,
+                        TDM_SET_PROGRESS_BAR_STATE,
+                        PBST_PAUSED as usize,
+                        0,
+                    );
+                    assert_eq!(prev_state, PBST_NORMAL as isize);
+                } else if msg == TDN_VERIFICATION_CLICKED && wp != 0 {
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_SET_MARQUEE_PROGRESS_BAR, 1, 0);
+                    let _ = crate::user32::message::SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_MARQUEE, 1, 30);
+                }
+                S_OK
+            }
+
+            let title_w = crate::strings::to_wide_z("Downloading");
+            let ver_w = crate::strings::to_wide_z("Switch to marquee");
+            let mut cfg: TaskDialogConfig = std::mem::zeroed();
+            cfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+            cfg.dw_flags = TDF_SHOW_PROGRESS_BAR;
+            cfg.dw_common_buttons = TDCBF_CANCEL_BUTTON;
+            cfg.psz_window_title = title_w.as_ptr();
+            cfg.psz_verification_text = ver_w.as_ptr();
+            cfg.pf_callback = prog_cb as *const () as usize;
+
+            let live_progs: std::sync::Arc<Mutex<Vec<Option<crate::macos::TaskDialogProgressState>>>> =
+                std::sync::Arc::new(Mutex::new(Vec::new()));
+            let live_progs_hook = live_progs.clone();
+            crate::macos::set_test_task_dialog_updater(Some(Box::new(move |_sid, upd| {
+                live_progs_hook.lock().unwrap().push(upd.progress);
+            })));
+            crate::macos::set_test_task_dialog_presenter(Some(Box::new(
+                move |_cap, _body, _links, prog, _btns, _btn_en, _db, _rads, _rad_en, _dr, _vt, _vc, emit| {
+                    assert_eq!(
+                        prog,
+                        Some(crate::macos::TaskDialogProgressState {
+                            marquee: false,
+                            marquee_running: false,
+                            min: 10,
+                            max: 200,
+                            pos: 75,
+                            state: PBST_PAUSED,
+                        })
+                    );
+                    emit(crate::macos::TaskDialogEvent::VerificationToggled(true));
+                    crate::macos::TaskDialogOutcome::Completed(crate::macos::TaskDialogAlertResult {
+                        button_index: 0,
+                        radio_index: None,
+                        verified: true,
+                    })
+                },
+            )));
+
+            let mut btn = 0;
+            let mut ver = FALSE;
+            assert_eq!(
+                TaskDialogIndirect(
+                    &cfg as *const TaskDialogConfig as *const u8,
+                    &mut btn,
+                    std::ptr::null_mut(),
+                    &mut ver,
+                ),
+                S_OK
+            );
+            crate::macos::set_test_task_dialog_presenter(None);
+            crate::macos::set_test_task_dialog_updater(None);
+            assert_eq!(btn, 2); // IDCANCEL
+            assert_eq!(ver, TRUE);
+            let pushed = live_progs.lock().unwrap().clone();
+            assert!(
+                pushed.iter().any(|p| *p == Some(crate::macos::TaskDialogProgressState {
+                    marquee: true,
+                    marquee_running: true,
+                    min: 10,
+                    max: 200,
+                    pos: 75,
+                    state: PBST_PAUSED,
+                })),
+                "live TDM_SET_MARQUEE_PROGRESS_BAR/TDM_SET_PROGRESS_BAR_MARQUEE must push marquee state: {pushed:?}"
+            );
+
+            // 2. Headless single-button dialog with TDF_SHOW_PROGRESS_BAR or
+            //    TDF_SHOW_MARQUEE_PROGRESS_BAR (without TDF_CALLBACK_TIMER) must NOT
+            //    auto-dismiss — returns HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION.
+            for flag in [TDF_SHOW_PROGRESS_BAR, TDF_SHOW_MARQUEE_PROGRESS_BAR] {
+                let mut hcfg: TaskDialogConfig = std::mem::zeroed();
+                hcfg.cb_size = std::mem::size_of::<TaskDialogConfig>() as u32;
+                hcfg.dw_flags = flag;
+                hcfg.dw_common_buttons = TDCBF_CANCEL_BUTTON;
+                hcfg.psz_window_title = title_w.as_ptr();
+                let mut hbtn = 99;
+                assert_eq!(
+                    TaskDialogIndirect(
+                        &hcfg as *const TaskDialogConfig as *const u8,
+                        &mut hbtn,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    ),
+                    HRESULT_REQUIRES_INTERACTIVE_WINDOWSTATION
+                );
+                assert_eq!(hbtn, 0);
+            }
         })
         .join()
         .unwrap();
@@ -2661,6 +2934,7 @@ mod tests {
                         session_id: sid,
                         modal_open: true,
                         enable_hyperlinks: false,
+                        progress: None,
                         hinst: 0,
                         pf_callback: 0,
                         lp_callback_data: 0,

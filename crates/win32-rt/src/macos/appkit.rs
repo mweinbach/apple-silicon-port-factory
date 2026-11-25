@@ -1392,6 +1392,7 @@ struct ActiveTaskDialogAlert {
     action_buttons: Vec<Retained<NSButton>>,
     radio_buttons: Vec<Retained<NSButton>>,
     link_buttons: Vec<Retained<NSButton>>,
+    progress_bar: Option<Retained<NSProgressIndicator>>,
     links: Vec<(String, String)>,
     sink: TaskDialogEventSink,
     /// Deferred programmatic dismissal or `WM_QUIT` abort received while a nested
@@ -1505,6 +1506,7 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
         caption,
         text,
         &[],
+        None,
         buttons,
         &[],
         None,
@@ -1523,14 +1525,39 @@ pub(super) fn alert(caption: &str, text: &str, buttons: &[String], critical: boo
     .unwrap_or(0)
 }
 
+fn apply_progress_state_to_indicator(
+    bar: &NSProgressIndicator,
+    progress: super::TaskDialogProgressState,
+) {
+    bar.setIndeterminate(progress.marquee);
+    if progress.marquee {
+        if progress.marquee_running {
+            unsafe { bar.startAnimation(None) };
+        } else {
+            unsafe { bar.stopAnimation(None) };
+        }
+    } else {
+        unsafe { bar.stopAnimation(None) };
+        let lo = progress.min as f64;
+        let hi = (progress.max as f64).max(lo);
+        bar.setMinValue(lo);
+        bar.setMaxValue(hi);
+        bar.setDoubleValue((progress.pos as f64).clamp(lo, hi));
+    }
+}
+
 fn rebuild_task_dialog_accessory_view(
     mtm: MainThreadMarker,
     alert: &NSAlert,
     target: &TaskDialogRadioTarget,
+    progress_bar: Option<&Retained<NSProgressIndicator>>,
     radio_buttons: &[Retained<NSButton>],
     link_buttons: &mut Vec<Retained<NSButton>>,
     links: &[(String, String)],
 ) {
+    if let Some(bar) = progress_bar {
+        bar.removeFromSuperview();
+    }
     for b in link_buttons.drain(..) {
         b.removeFromSuperview();
     }
@@ -1538,25 +1565,34 @@ fn rebuild_task_dialog_accessory_view(
         b.removeFromSuperview();
     }
     let total_rows = radio_buttons.len() + links.len();
-    if total_rows == 0 {
+    if progress_bar.is_none() && total_rows == 0 {
         alert.setAccessoryView(None);
         return;
     }
+    let bar_h = if progress_bar.is_some() { 18.0f64 } else { 0.0f64 };
+    let bar_gap = if progress_bar.is_some() && total_rows > 0 { 8.0f64 } else { 0.0f64 };
     let row_h = 24.0f64;
     let width = 320.0f64;
-    let gap = if !radio_buttons.is_empty() && !links.is_empty() { 6.0f64 } else { 0.0f64 };
-    let total_h = row_h * (total_rows as f64) + gap + 4.0;
+    let link_gap = if !radio_buttons.is_empty() && !links.is_empty() { 6.0f64 } else { 0.0f64 };
+    let total_h = bar_h + bar_gap + row_h * (total_rows as f64) + link_gap + 4.0;
     let container = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, total_h)),
     );
-    for (idx, btn) in radio_buttons.iter().enumerate() {
+    let mut cursor_top = total_h;
+    if let Some(bar) = progress_bar {
+        cursor_top -= bar_h;
+        bar.setFrame(NSRect::new(NSPoint::new(0.0, cursor_top), NSSize::new(width, bar_h)));
+        container.addSubview(bar);
+        cursor_top -= bar_gap;
+    }
+    for btn in radio_buttons {
         // Position top-to-bottom in AppKit's bottom-up coordinate system.
-        let y = total_h - ((idx + 1) as f64) * row_h;
-        btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
+        cursor_top -= row_h;
+        btn.setFrame(NSRect::new(NSPoint::new(0.0, cursor_top), NSSize::new(width, row_h)));
         container.addSubview(btn);
     }
-    let link_top = total_h - (radio_buttons.len() as f64) * row_h - gap;
+    cursor_top -= link_gap;
     for (idx, (label, _href)) in links.iter().enumerate() {
         let btn = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -1570,18 +1606,20 @@ fn rebuild_task_dialog_accessory_view(
         btn.setContentTintColor(Some(&NSColor::linkColor()));
         let _: () = unsafe { msg_send![&*btn, setAlignment: 0isize] };
         let _: () = unsafe { msg_send![&*btn, setTag: idx as isize] };
-        let y = link_top - ((idx + 1) as f64) * row_h;
-        btn.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, row_h)));
+        cursor_top -= row_h;
+        btn.setFrame(NSRect::new(NSPoint::new(0.0, cursor_top), NSSize::new(width, row_h)));
         container.addSubview(&btn);
         link_buttons.push(btn);
     }
     alert.setAccessoryView(Some(&container));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_live_update_to_alert(
     mtm: MainThreadMarker,
     alert: &NSAlert,
     target: &TaskDialogRadioTarget,
+    progress_bar: Option<&Retained<NSProgressIndicator>>,
     action_buttons: &[Retained<NSButton>],
     radio_buttons: &[Retained<NSButton>],
     link_buttons: &mut Vec<Retained<NSButton>>,
@@ -1590,6 +1628,9 @@ fn apply_live_update_to_alert(
 ) {
     alert.setMessageText(&NSString::from_str(&update.caption));
     alert.setInformativeText(&NSString::from_str(&update.text));
+    if let (Some(bar), Some(progress)) = (progress_bar, update.progress) {
+        apply_progress_state_to_indicator(bar, progress);
+    }
     *links_slot = update.links.clone();
     if update.links.len() == link_buttons.len() {
         for (i, b) in link_buttons.iter().enumerate() {
@@ -1602,6 +1643,7 @@ fn apply_live_update_to_alert(
             mtm,
             alert,
             target,
+            progress_bar,
             radio_buttons,
             link_buttons,
             &update.links,
@@ -1645,6 +1687,7 @@ pub(super) fn task_dialog_alert_update(session_id: u64, update: &super::TaskDial
             mtm,
             &active.alert,
             &active.target,
+            active.progress_bar.as_ref(),
             &active.action_buttons,
             &active.radio_buttons,
             &mut active.link_buttons,
@@ -1707,6 +1750,7 @@ fn run_task_dialog_alert(
     caption: &str,
     text: &str,
     links: &[(String, String)],
+    progress: Option<super::TaskDialogProgressState>,
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -1779,11 +1823,21 @@ fn run_task_dialog_alert(
         btn.setEnabled(radio_enabled.get(idx).copied().unwrap_or(true));
         radio_buttons.push(btn);
     }
+    let progress_bar: Option<Retained<NSProgressIndicator>> = progress.map(|p| {
+        let bar = NSProgressIndicator::initWithFrame(
+            NSProgressIndicator::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 18.0)),
+        );
+        bar.setStyle(NSProgressIndicatorStyle::Bar);
+        apply_progress_state_to_indicator(&bar, p);
+        bar
+    });
     let mut link_buttons: Vec<Retained<NSButton>> = Vec::with_capacity(links.len());
     rebuild_task_dialog_accessory_view(
         mtm,
         &a,
         &target,
+        progress_bar.as_ref(),
         &radio_buttons,
         &mut link_buttons,
         links,
@@ -1826,6 +1880,7 @@ fn run_task_dialog_alert(
             action_buttons: action_buttons.clone(),
             radio_buttons: radio_buttons.clone(),
             link_buttons,
+            progress_bar,
             links: links.to_vec(),
             sink,
             deferred_stop: None,
@@ -1845,6 +1900,7 @@ fn run_task_dialog_alert(
                             mtm,
                             &entry.alert,
                             &entry.target,
+                            entry.progress_bar.as_ref(),
                             &entry.action_buttons,
                             &entry.radio_buttons,
                             &mut entry.link_buttons,
@@ -1904,6 +1960,7 @@ pub(super) fn task_dialog_alert_channel(
     caption: &str,
     text: &str,
     links: &[(String, String)],
+    progress: Option<super::TaskDialogProgressState>,
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -1921,6 +1978,7 @@ pub(super) fn task_dialog_alert_channel(
         caption,
         text,
         links,
+        progress,
         buttons,
         button_enabled,
         default_button_idx,
@@ -1991,6 +2049,7 @@ pub(super) fn task_dialog_alert_inline(
     caption: &str,
     text: &str,
     links: &[(String, String)],
+    progress: Option<super::TaskDialogProgressState>,
     buttons: &[String],
     button_enabled: &[bool],
     default_button_idx: Option<usize>,
@@ -2055,6 +2114,7 @@ pub(super) fn task_dialog_alert_inline(
         caption,
         text,
         links,
+        progress,
         buttons,
         button_enabled,
         default_button_idx,
