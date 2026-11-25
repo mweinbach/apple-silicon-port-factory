@@ -1731,6 +1731,17 @@ fn text_analyzer_shapes_complex_arabic_and_combining_marks_and_rejects_unshapeab
             if actual == 3 {
                 assert_eq!(cmap[1], cmap[2], "Lam+Alef ligature should share one cluster: {cmap:?}");
             }
+            // Contextually joined Arabic characters must not be marked isShapedAlone (bit 0);
+            // cluster starts are represented in clusterMap and glyphProperties.isClusterStart (bit 4).
+            assert!(
+                tprops.iter().all(|tp| (tp.bits & 1) == 0),
+                "contextually shaped Arabic run must not set isShapedAlone: {tprops:?}"
+            );
+            assert_ne!(
+                gprops[0].bits & (1 << 4),
+                0,
+                "first glyph of shaped run must still set isClusterStart"
+            );
 
             let mut adv = [0.0f32; 16];
             let mut offs = [DWRITE_GLYPH_OFFSET::default(); 16];

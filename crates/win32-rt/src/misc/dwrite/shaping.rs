@@ -777,8 +777,11 @@ mod coretext {
             }
 
             // Build monotonic logical clusterMap and shaping properties.
+            // CoreText does not expose per-character independent-shaping provenance, so keep
+            // `DWRITE_SHAPING_TEXT_PROPERTIES::isShapedAlone` conservatively clear rather than
+            // conflating it with cluster starts (which live in `cluster_map` and `gprops`).
             let mut cluster_map = vec![0u16; units.len()];
-            let mut text_props = vec![DWRITE_SHAPING_TEXT_PROPERTIES { bits: 0 }; units.len()];
+            let text_props = vec![DWRITE_SHAPING_TEXT_PROPERTIES { bits: 0 }; units.len()];
             let mut glyphs = Vec::with_capacity(flat.len());
 
             // Identify cluster boundaries (first glyph for each distinct str_idx).
@@ -816,9 +819,6 @@ mod coretext {
                 let fill_from = if ci == 0 { 0 } else { start_u16 };
                 for u in fill_from..end_u16.min(units.len()) {
                     cluster_map[u] = first_gi as u16;
-                }
-                if start_u16 < text_props.len() {
-                    text_props[start_u16] = DWRITE_SHAPING_TEXT_PROPERTIES { bits: 1 }; // isShapedAlone/cluster start bit
                 }
             }
 
