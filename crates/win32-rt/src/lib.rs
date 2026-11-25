@@ -100,11 +100,13 @@ pub fn register_export_override(dll: impl AsRef<str>, name: impl Into<String>, p
 type GuestDispatcherFn = unsafe fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
 type NativeVaRegistrarFn = fn(u64, usize);
 type IncomingRspReaderFn = fn() -> (u64, u64);
+type UnregisteredHostTextCheckerFn = fn(usize) -> bool;
 type BoundaryNanHookFn = fn(&str, usize, usize, &str);
 
 static GUEST_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_VA_REGISTRAR: AtomicUsize = AtomicUsize::new(0);
 static INCOMING_RSP_READER: AtomicUsize = AtomicUsize::new(0);
+static UNREGISTERED_HOST_TEXT_CHECKER: AtomicUsize = AtomicUsize::new(0);
 static BOUNDARY_NAN_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register a universal diagnostic hook called when a Win32/middleware boundary receives
@@ -139,10 +141,33 @@ pub fn has_guest_dispatcher() -> bool {
     GUEST_DISPATCHER.load(Ordering::Acquire) != 0
 }
 
-/// Register the `VA_DISPATCH` registrar (`aw2_game::exe::register_native_va`) so COM
-/// vtable method pointers and dynamically resolved builtins are known to `emu_run`.
+/// Register the `VA_DISPATCH` registrar (`x86_runtime::exe::register_native_va`) so COM
+/// vtable method pointers, internal host thunks, and dynamically resolved builtins are known
+/// to `emu_run` / `call_va8`.
 pub fn set_native_va_registrar(f: NativeVaRegistrarFn) {
     NATIVE_VA_REGISTRAR.store(f as usize, Ordering::Release);
+    register_internal_host_thunks();
+}
+
+/// Returns `true` when a `VA_DISPATCH` registrar has been installed via
+/// [`set_native_va_registrar`].
+#[inline]
+pub fn has_native_va_registrar() -> bool {
+    NATIVE_VA_REGISTRAR.load(Ordering::Acquire) != 0
+}
+
+/// Register internal Rust host thunks and static data-exported vtables with `VA_DISPATCH`.
+///
+/// Called automatically by [`set_native_va_registrar`], and each site also registers lazily
+/// when invoked, so host pointers returned through static data exports (`msvcp140`
+/// `cout`/`cerr`, `MediaDecoders` base vtables) or passed through Win32 callback APIs
+/// (`_beginthread`'s trampoline) are never refused as unregistered host `__TEXT`.
+pub fn register_internal_host_thunks() {
+    ucrt::runtime::register_host_thunks();
+    misc::msvcp140::register_static_vtables();
+    misc::mediadecoders_windowsdesktop::register_static_vtables();
+    #[cfg(feature = "wwise-bridge")]
+    audio::akrec::register_static_vtables();
 }
 
 /// Register a native host function pointer `ptr` in `VA_DISPATCH`.
@@ -172,6 +197,55 @@ pub fn incoming_rsp() -> (u64, u64) {
         f()
     } else {
         (0, 0)
+    }
+}
+
+/// Install a diagnostic predicate returning `true` when `addr` lies inside host `__TEXT`
+/// and is NOT registered in `VA_DISPATCH` (e.g. `x86_runtime::exe::is_unregistered_host_text`).
+pub fn set_unregistered_host_text_checker(f: UnregisteredHostTextCheckerFn) {
+    UNREGISTERED_HOST_TEXT_CHECKER.store(f as usize, Ordering::Release);
+}
+
+/// Clear the diagnostic unregistered host `__TEXT` checker (for tests).
+pub fn clear_unregistered_host_text_checker() {
+    UNREGISTERED_HOST_TEXT_CHECKER.store(0, Ordering::Release);
+}
+
+/// Returns `true` if the installed host-text checker reports `addr` as an unregistered host
+/// `__TEXT` address.
+#[inline]
+pub fn is_unregistered_host_text(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let f = UNREGISTERED_HOST_TEXT_CHECKER.load(Ordering::Acquire);
+    if f != 0 {
+        let checker: UnregisteredHostTextCheckerFn = unsafe { std::mem::transmute(f) };
+        return checker(addr);
+    }
+    false
+}
+
+/// Audit helper: returns `Err` when `addr` is an unregistered host `__TEXT` address about to
+/// escape to guest code or guest callback dispatch (`call_guest8`).
+#[inline]
+pub fn audit_guest_callable(addr: usize, context: &str) -> Result<(), String> {
+    if is_unregistered_host_text(addr) {
+        return Err(format!(
+            "unregistered host __TEXT address {addr:#x} escaped via {context} ({})",
+            symbolize(addr)
+        ));
+    }
+    Ok(())
+}
+
+/// Debug-mode guard verifying that a host function pointer handed out to guest code or
+/// callback dispatch is registered in `VA_DISPATCH` (never raw unregistered host `__TEXT`).
+#[inline]
+pub fn debug_assert_guest_callable(addr: usize, context: &str) {
+    if let Err(msg) = audit_guest_callable(addr, context) {
+        log::error!("win32-rt: {msg}");
+        debug_assert!(false, "win32-rt: {msg}");
     }
 }
 
@@ -1172,5 +1246,46 @@ mod tests {
     pub(crate) fn enable_test_wsa_ext_thunks() -> ScopedTestWsaExtGuard {
         let prev = TEST_WSA_EXT_ENABLED.swap(true, Ordering::AcqRel);
         ScopedTestWsaExtGuard { prev }
+    }
+
+    #[test]
+    fn audit_guest_callable_detects_unregistered_and_accepts_registered_host_thunks() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static REG: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+        fn test_register(va: u64, ptr: usize) {
+            assert_eq!(va as usize, ptr);
+            let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_or_insert_with(HashSet::new).insert(ptr);
+        }
+        fn test_is_unregistered(addr: usize) -> bool {
+            let g = REG.lock().unwrap_or_else(|e| e.into_inner());
+            !g.as_ref().is_some_and(|s| s.contains(&addr))
+        }
+
+        let prev_reg = NATIVE_VA_REGISTRAR.load(Ordering::Acquire);
+        let prev_chk = UNREGISTERED_HOST_TEXT_CHECKER.load(Ordering::Acquire);
+        set_native_va_registrar(test_register);
+        set_unregistered_host_text_checker(test_is_unregistered);
+
+        // An unregistered address fails the audit helper cleanly.
+        let fake_unregistered = 0x0000_0001_0000_BEEFusize;
+        assert!(audit_guest_callable(fake_unregistered, "unit_test").is_err());
+
+        // Static data-exported vtable slots (msvcp140::COUT) are registered by set_native_va_registrar.
+        let cout_slot0 = unsafe { *misc::msvcp140::COUT.ios.vtable }.0 as usize;
+        assert!(
+            audit_guest_callable(cout_slot0, "msvcp140::COUT").is_ok(),
+            "COUT vtable slot must be registered by set_native_va_registrar"
+        );
+
+        // nvapi_QueryInterface registers every function pointer it returns.
+        let nvapi_unload = misc::nvapi64::nvapi_QueryInterface(misc::nvapi64::ID_NVAPI_UNLOAD);
+        assert_ne!(nvapi_unload, 0);
+        assert!(audit_guest_callable(nvapi_unload, "nvapi_QueryInterface").is_ok());
+
+        // Restore previous globals so other serial tests stay isolated.
+        UNREGISTERED_HOST_TEXT_CHECKER.store(prev_chk, Ordering::Release);
+        NATIVE_VA_REGISTRAR.store(prev_reg, Ordering::Release);
     }
 }

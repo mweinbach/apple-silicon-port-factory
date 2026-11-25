@@ -529,12 +529,12 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `_getch` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:940` | `"_getch returns EOF"` |
+| `_getch` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:953` | `"_getch returns EOF"` |
 | `_setmbcp` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:274` | `"_setmbcp({cp}) unsupported"` |
 | `open_host_path` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:210` | `"Unicode text modes (0x{oflag:x}) treated as plain text mode"` |
 | `parse_mode` | `stub` | `crates/win32-rt/src/ucrt/stdio.rs:1097` | `"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"` |
 | `setlocale` | `stub` | `crates/win32-rt/src/ucrt/locale.rs:64` | `"setlocale({cat}, {n:?}): locale not available"` |
-| `system` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:952` | `"system({:?}) refused", from_ansi(cmd)` |
+| `system` | `stub` | `crates/win32-rt/src/ucrt/runtime.rs:965` | `"system({:?}) refused", from_ansi(cmd)` |
 
 ### `d3d11.dll` (4)
 

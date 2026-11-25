@@ -82,12 +82,12 @@ secur32.dll	apply_control_token_impl	stub	crates/win32-rt/src/misc/secur32/schan
 secur32.dll	query_context_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1787	"QueryContextAttributes(ctx={ctx_id}, attr={other:#x}) -> SEC_E_UNSUPPORTED_FUNCTION"
 secur32.dll	query_credentials_attributes_impl	stub	crates/win32-rt/src/misc/secur32/schannel.rs	1849	"QueryCredentialsAttributes{}(attr={ul_attribute:#x}) -> SEC_E_UNSUPPORTED_FUNCTION", if wide { "W" } else { "A" }
 shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1863	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
-ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
+ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	953	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
 ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1097	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
-ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
+ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	965	"system({:?}) refused", from_ansi(cmd)
 wintrust.dll	Tbsip_Context_Close	stub	crates/win32-rt/src/misc/wintrust.rs	1644	"Tbsip_Context_Close({h_context:p}) -> TBS_E_INVALID_CONTEXT"
 wintrust.dll	Tbsip_Submit_Command	stub	crates/win32-rt/src/misc/wintrust.rs	1661	"Tbsip_Submit_Command -> TBS_E_TPM_NOT_FOUND"
 wintrust.dll	WinVerifyTrust	stub	crates/win32-rt/src/misc/wintrust.rs	1415	"WinVerifyTrust(action={a}) -> TRUST_E_ACTION_UNKNOWN"

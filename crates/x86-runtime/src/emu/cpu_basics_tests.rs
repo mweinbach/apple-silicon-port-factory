@@ -452,26 +452,27 @@ fn cpuid_subleaves_and_feature_fallbacks() {
             assert_eq!(b >> 16 & 0xff, cores);
             assert_eq!(d >> 23 & 15, 15); // MMX, FXSR, SSE, SSE2
             assert_eq!(
-                c & ((1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)),
-                (1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
-            ); // FMA, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C
-            assert_eq!(c & ((1 << 5) | (1 << 30)), 0); // VMX, RDRAND
+                c & ((1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 30)),
+                (1 << 12) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 30)
+            ); // FMA, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND
+            assert_eq!(c & (1 << 5), 0); // No VMX
             assert_eq!(c >> 25 & 1, u32::from(features::host().has(H::AES)));
             assert_eq!(c >> 1 & 1, u32::from(features::host().has(H::PMULL)));
             assert_eq!(c >> 20 & 1, u32::from(features::host().has(H::CRC32)));
-            let leaf7_ebx = cpuid::query(7, 0)[1];
+            let [leaf7_eax, leaf7_ebx, leaf7_ecx, leaf7_edx] = cpuid::query(7, 0);
+            assert_eq!(leaf7_eax, 1);
             assert_eq!(leaf7_ebx >> 29 & 1, u32::from(features::host().has(H::SHA1 | H::SHA256)));
             assert_eq!(
-                leaf7_ebx & ((1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 19)),
-                (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 19)
-            ); // BMI1, AVX2, BMI2, ERMS, ADX
+                leaf7_ebx & ((1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 18) | (1 << 19)),
+                (1 << 3) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 18) | (1 << 19)
+            ); // BMI1, AVX2, BMI2, ERMS, RDSEED, ADX
             assert_eq!(
                 leaf7_ebx
-                    & ((1 << 7)
+                    & ((1 << 0)
+                        | (1 << 7)
                         | (1 << 10)
                         | (1 << 16)
                         | (1 << 17)
-                        | (1 << 18)
                         | (1 << 21)
                         | (1 << 26)
                         | (1 << 27)
@@ -479,8 +480,13 @@ fn cpuid_subleaves_and_feature_fallbacks() {
                         | (1 << 30)
                         | (1 << 31)),
                 0
-            ); // No SMEP, INVPCID, RDSEED, or AVX-512
-            assert_eq!(cpuid::query(7, 1), [0; 4]);
+            ); // No FSGSBASE, SMEP, INVPCID, or AVX-512
+            assert_eq!(leaf7_ecx & (1 << 8), 1 << 8); // GFNI
+            assert_eq!(leaf7_ecx >> 9 & 1, u32::from(features::host().has(H::AES))); // VAES
+            assert_eq!(leaf7_ecx >> 10 & 1, u32::from(features::host().has(H::PMULL))); // VPCLMULQDQ
+            assert_eq!(leaf7_ecx & ((1 << 3) | (1 << 4) | (1 << 5)), 0); // No PKU, OSPKE, WAITPKG
+            assert_eq!(leaf7_edx, 1 << 14); // SERIALIZE
+            assert_eq!(cpuid::query(7, 1), [1 << 4, 0, 0, 0]); // AVX-VNNI only (no AVX-IFMA/VNNI-INT8/NE-CONVERT)
             assert_eq!(cpuid::query(0x8000_0001, 0)[2] & (1 << 5), 1 << 5); // LZCNT
             assert_eq!(cpuid::query(0x8000_0001, 0)[2] & (1 << 6), 0);
             assert_eq!(unsafe { win32_rt::kernel32::sysinfo::GetEnabledXStateFeatures() }, 7);

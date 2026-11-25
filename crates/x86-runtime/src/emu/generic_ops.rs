@@ -25,7 +25,12 @@ impl Cpu {
             Mnemonic::Mfence | Mnemonic::Sfence | Mnemonic::Lfence => {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
-            Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
+            Mnemonic::Serialize => {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+            }
+            Mnemonic::Nop | Mnemonic::Reservednop | Mnemonic::Pause | Mnemonic::Fnop | Mnemonic::Endbr64 | Mnemonic::Endbr32
             | Mnemonic::Clflush | Mnemonic::Prefetch | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1
             | Mnemonic::Prefetcht2 | Mnemonic::Prefetchnta | Mnemonic::Prefetchw | Mnemonic::Prefetchwt1
             | Mnemonic::Wait | Mnemonic::Rdsspd | Mnemonic::Rdsspq => {}
@@ -706,6 +711,11 @@ impl Cpu {
                 }
             }
             Mnemonic::Rdtsc | Mnemonic::Rdtscp => cpu.read_timestamp(mn == Mnemonic::Rdtscp),
+            Mnemonic::Rdrand | Mnemonic::Rdseed => {
+                if let Some((idx, bits, false)) = Cpu::reg_idx(ins.op_register(0)) {
+                    cpu.exec_entropy(idx as u8, bits as u8);
+                }
+            }
             // Unprivileged x86-64 system-table / machine-status store instructions
             // (used by OS runtimes and integrity probes; legal in ring 3 when UMIP=0).
             Mnemonic::Sidt => {
