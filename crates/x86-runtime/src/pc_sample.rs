@@ -329,7 +329,7 @@ fn demangle_v0(r: &str) -> String {
 }
 
 /// Crude Rust (legacy + v0) / Itanium demangling for the report (hashes dropped).
-fn demangle(s: &str) -> String {
+pub(crate) fn demangle(s: &str) -> String {
     let t = s.strip_prefix('_').unwrap_or(s);
     if let Some(r) = t.strip_prefix("_R").or_else(|| t.strip_prefix('R').filter(|r| r.starts_with('N'))) {
         return demangle_v0(r);

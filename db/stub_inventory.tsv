@@ -77,12 +77,12 @@ powrprof.dll	CallNtPowerInformation	stub	crates/win32-rt/src/misc/powrprof.rs	46
 powrprof.dll	PowerRegisterSuspendResumeNotification	stub	crates/win32-rt/src/misc/powrprof.rs	533	"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"
 powrprof.dll	PowerSettingRegisterNotification	stub	crates/win32-rt/src/misc/powrprof.rs	604	"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"
 shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs	1748	"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"
-ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
+ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	953	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
 ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1097	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
-ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
+ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	965	"system({:?}) refused", from_ansi(cmd)
 user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	1024	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
 user32.dll	DisplayConfigGetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	684	"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"
 user32.dll	DisplayConfigSetDeviceInfo	stub	crates/win32-rt/src/user32/monitor.rs	692	"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"

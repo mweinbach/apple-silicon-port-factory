@@ -14,7 +14,6 @@ use super::mediadecoders::{
     store_allocator_and_logger, AllocatorAndLoggerConfig, VpxInfo,
 };
 use std::ffi::c_void;
-use std::sync::Once;
 
 pub static ORDINALS: &[(u16, &str)] = &[];
 
@@ -37,15 +36,22 @@ static BASE_VTBL: [crate::Ptr; 16] = [
     crate::Ptr(dtor_noop as *const ()),
 ];
 
-static REGISTER_BASE_VTBL: Once = Once::new();
+pub(crate) fn register_static_vtables() {
+    let dtor_addr = dtor_noop as *const () as usize;
+    let ctor_addr = ctor_self as *const () as usize;
+    crate::register_native_va(dtor_addr as u64, dtor_addr);
+    crate::register_native_va(ctor_addr as u64, ctor_addr);
+}
 
 fn ensure_base_vtbl_registered() {
-    REGISTER_BASE_VTBL.call_once(|| {
-        let dtor_addr = dtor_noop as *const () as usize;
-        let ctor_addr = ctor_self as *const () as usize;
-        crate::register_native_va(dtor_addr as u64, dtor_addr);
-        crate::register_native_va(ctor_addr as u64, ctor_addr);
-    });
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if crate::has_native_va_registrar() {
+        register_static_vtables();
+        REGISTERED.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub static EXTRA_EXPORTS: &[crate::Export] = &[

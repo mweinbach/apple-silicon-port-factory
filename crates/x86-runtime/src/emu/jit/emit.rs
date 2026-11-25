@@ -377,6 +377,9 @@ impl Asm {
     pub(super) fn dmb_ishst(&mut self) {
         self.emit(0xD503_3ABF);
     }
+    pub(super) fn dsb_ish(&mut self) {
+        self.emit(0xD503_3B9F);
+    }
     pub(super) fn dsb_ishld(&mut self) {
         self.emit(0xD503_399F);
     }

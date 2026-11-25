@@ -880,7 +880,20 @@ unsafe extern "win64" fn begin_thread_tramp(p: *mut c_void) -> u32 {
     0
 }
 
+/// Register internal `ucrt::runtime` host trampolines in `VA_DISPATCH` so `CreateThread` ->
+/// `call_guest8` -> `emu::call_va8` dispatches them natively instead of refusing host `__TEXT`.
+pub(crate) fn register_host_thunks() {
+    let addr = begin_thread_tramp as *const () as usize;
+    crate::register_native_va(addr as u64, addr);
+}
+
 pub unsafe extern "win64" fn _beginthread(f: unsafe extern "win64" fn(*mut c_void), stack: u32, arg: *mut c_void) -> usize {
+    if (f as usize) == 0 {
+        errno::set(EINVAL);
+        return usize::MAX;
+    }
+    register_host_thunks();
+    crate::debug_assert_guest_callable(begin_thread_tramp as *const () as usize, "ucrt::_beginthread");
     let p = Box::into_raw(Box::new(BeginThread { f, arg })) as *mut c_void;
     let h = crate::kernel32::threads::CreateThread(std::ptr::null_mut(), stack as usize, Some(begin_thread_tramp), p, 0, std::ptr::null_mut());
     if h.is_null() {
