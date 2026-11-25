@@ -1023,6 +1023,7 @@ fn native_key_with_target(k: NativeKey, target_override: Option<usize>) {
         false
     };
     set_async_key(key, k.down);
+    crate::misc::gameinput::on_keyboard_changed();
     let alt = async_down(VK_MENU);
     // Registered hotkeys (RegisterHotKey) intercept keydown before WM_KEYDOWN,
     // posting WM_HOTKEY to the registering window/thread — unless the foreground
@@ -1297,6 +1298,7 @@ pub fn native_mouse(ev: NativeMouse) {
             }
             if !relative {
                 super::cursor::set_cached_pos(screen);
+                crate::misc::gameinput::on_mouse_changed();
             }
             if nsevent_raw_active(time) {
                 if let Some((x, y)) = accumulate(&RAW_ACC, dx, dy) {
@@ -1358,6 +1360,7 @@ pub fn native_mouse(ev: NativeMouse) {
             if !super::cursor::relative_mode() {
                 super::cursor::set_cached_pos(screen);
             }
+            crate::misc::gameinput::on_mouse_changed();
             if raw_nolegacy_active(1, 2) {
                 if !ll_checked {
                     defer_mouse_ll_hook(hwnd, ll_msg, screen, ll_mouse_data, time);
@@ -1420,6 +1423,10 @@ pub fn native_mouse(ev: NativeMouse) {
                 false
             };
             raw_mouse(0, 0, if horizontal { 0x800 } else { 0x400 }, delta as i16 as u16);
+            crate::misc::gameinput::record_mouse_wheel(
+                if horizontal { delta as i64 } else { 0 },
+                if horizontal { 0 } else { delta as i64 },
+            );
             let target = FOCUS.load(Ordering::Acquire);
             if raw_nolegacy_active(1, 2) {
                 if !ll_checked {

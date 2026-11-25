@@ -449,12 +449,13 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
+    crate::misc::gameinput::on_gamepad_connected(user);
     crate::user32::misc::notify_device_change(true);
 }
 
 pub fn backend_disconnect(user: usize) {
     log::info!("xinput: user {user} disconnected");
-    let was_connected = if user == 0 {
+    let (was_connected, still_connected) = if user == 0 {
         let now = Instant::now();
         let mut slots = SLOTS.lock().unwrap();
         let slot = slots[0].get_or_insert_with(Slot::default);
@@ -466,7 +467,7 @@ pub fn backend_disconnect(user: usize) {
         slot.held_vks.clear();
         let mut v = VIRTUAL_PAD.lock().unwrap();
         sync_slot0_keystrokes(&slots, &mut v, now);
-        was
+        (was, v.merged_connected)
     } else {
         with_slot(user, |s| {
             let was = s.connected;
@@ -475,9 +476,12 @@ pub fn backend_disconnect(user: usize) {
             s.vibration = (0, 0);
             s.keystrokes.clear();
             s.held_vks.clear();
-            was
+            (was, false)
         })
     };
+    if !still_connected {
+        crate::misc::gameinput::on_gamepad_disconnected(user);
+    }
     if was_connected {
         crate::user32::misc::notify_device_change(false);
     }
@@ -486,7 +490,7 @@ pub fn backend_disconnect(user: usize) {
 /// New input state. `dwPacketNumber` only changes when the state did.
 pub fn backend_update(user: usize, pad: Gamepad) {
     let now = Instant::now();
-    if user == 0 {
+    let updated_pad = if user == 0 {
         let mut slots = SLOTS.lock().unwrap();
         let slot = slots[0].get_or_insert_with(Slot::default);
         if slot.connected && slot.pad != pad {
@@ -494,6 +498,9 @@ pub fn backend_update(user: usize, pad: Gamepad) {
             slot.packet = slot.packet.wrapping_add(1);
             let mut v = VIRTUAL_PAD.lock().unwrap();
             sync_slot0_keystrokes(&slots, &mut v, now);
+            Some(v.merged_pad)
+        } else {
+            None
         }
     } else {
         with_slot(user, |s| {
@@ -502,8 +509,14 @@ pub fn backend_update(user: usize, pad: Gamepad) {
                 s.pad = pad;
                 s.packet = s.packet.wrapping_add(1);
                 diff_gamepad_keystrokes(user as u8, prev, pad, now, &mut s.keystrokes, &mut s.held_vks);
+                Some(pad)
+            } else {
+                None
             }
-        });
+        })
+    };
+    if let Some(effective) = updated_pad {
+        crate::misc::gameinput::on_gamepad_state_changed(user, &effective);
     }
 }
 
@@ -536,7 +549,7 @@ pub fn slot_state(user: usize) -> Option<(Gamepad, u32)> {
 /// Exposed on XInput user slot 0 when no physical controller occupies slot 0,
 /// and seamlessly merged onto slot 0 whenever virtual touch controls are active.
 pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
-    let (conn_changed, stop_phone) = {
+    let (conn_changed, stop_phone, merged_connected, updated_pad) = {
         let now = Instant::now();
         let slots = SLOTS.lock().unwrap();
         let mut v = VIRTUAL_PAD.lock().unwrap();
@@ -559,13 +572,28 @@ pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
         } else {
             false
         };
-        (conn_changed, stop_phone)
+        let updated = if changed && v.merged_connected && !conn_changed {
+            Some(v.merged_pad)
+        } else if changed && connected && pad != Gamepad::default() {
+            Some(v.merged_pad)
+        } else {
+            None
+        };
+        (conn_changed, stop_phone, v.merged_connected, updated)
     };
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
     if conn_changed {
+        if merged_connected {
+            crate::misc::gameinput::on_gamepad_connected(0);
+        } else {
+            crate::misc::gameinput::on_gamepad_disconnected(0);
+        }
         crate::user32::misc::notify_device_change(connected);
+    }
+    if let Some(effective) = updated_pad {
+        crate::misc::gameinput::on_gamepad_state_changed(0, &effective);
     }
 }
 
