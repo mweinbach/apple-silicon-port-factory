@@ -270,13 +270,20 @@ pub unsafe extern "win64" fn GetSystemMetrics(index: i32) -> i32 {
 }
 
 pub unsafe extern "win64" fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32 {
+    if index == 4 {
+        // SM_CYCAPTION: derive from the 96-DPI baseline rather than the primary
+        // display's already device-scaled caption inset so Retina displays do not
+        // double-scale when queried at high DPI.
+        let base_96 = window::nc_insets_for_scale(ws::CAPTION, 0, 1.0).1;
+        return if dpi >= 48 { scale_dpi(base_96, dpi) } else { base_96 };
+    }
     let base = GetSystemMetrics(index);
     if dpi < 48 || dpi == 96 {
         return base;
     }
     // Scale UI element dimensions linearly with DPI; screen pixel metrics stay unscaled.
     match index {
-        2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 28 | 29 | 30
+        2 | 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 28 | 29 | 30
         | 31 | 32 | 33 | 34 | 35 | 36 | 37 | 38 | 39 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52
         | 53 | 54 | 55 | 57 | 58 | 71 | 72 | 83 | 84 | 92 => {
             let scaled = (base as i64 * dpi as i64 + 48) / 96;
@@ -616,7 +623,8 @@ fn scale_dpi(val: i32, dpi: u32) -> i32 {
     }
 }
 
-unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi: u32) -> BOOL {
+unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi_override: Option<u32>) -> BOOL {
+    let dpi = dpi_override.unwrap_or(96);
     let put_u32 = |v: u32| {
         if pv.is_null() {
             set_error(e::INVALID_PARAMETER);
@@ -936,7 +944,13 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi: u32) -> BO
                 return FALSE;
             }
             let write_len = cb.min(padded_sz);
-            let cap = super::window::nc_insets(ws::CAPTION, 0).1;
+            let cap = if dpi_override.is_some() {
+                // SystemParametersInfoForDpi expects a 96-DPI baseline before scaling
+                // to the requested DPI so Retina displays are not double-scaled.
+                super::window::nc_insets_for_scale(ws::CAPTION, 0, 1.0).1
+            } else {
+                super::window::nc_insets(ws::CAPTION, 0).1
+            };
             if wide {
                 let mut ncm = NonClientMetricsW::windows_default(cb as u32, cap);
                 if dpi >= 48 && dpi != 96 {
@@ -982,15 +996,15 @@ unsafe fn spi(action: u32, uparam: u32, pv: *mut u8, wide: bool, dpi: u32) -> BO
 }
 
 pub unsafe extern "win64" fn SystemParametersInfoA(action: u32, uparam: u32, pv: *mut u8, _winini: u32) -> BOOL {
-    spi(action, uparam, pv, false, 96)
+    spi(action, uparam, pv, false, None)
 }
 
 pub unsafe extern "win64" fn SystemParametersInfoW(action: u32, uparam: u32, pv: *mut u8, _winini: u32) -> BOOL {
-    spi(action, uparam, pv, true, 96)
+    spi(action, uparam, pv, true, None)
 }
 
 pub unsafe extern "win64" fn SystemParametersInfoForDpi(action: u32, uparam: u32, pv: *mut u8, _winini: u32, dpi: u32) -> BOOL {
-    spi(action, uparam, pv, true, dpi)
+    spi(action, uparam, pv, true, Some(dpi))
 }
 
 // ---------------------------------------------------------------------------
@@ -3584,6 +3598,51 @@ mod tests {
             );
             assert_eq!(ncm.i_scroll_width, 34); // 17 * 2
             assert_eq!(ncm.lf_caption_font.lf_height, -24); // -12 * 2
+
+            // On a 2x Retina display (28 pt title bar -> 56 px primary inset), DPI-explicit
+            // queries must scale from the 96-DPI baseline (28) rather than double-scaling 56 -> 112.
+            let retina_displays = crate::macos::display::build_displays(
+                &[crate::macos::display::ScreenDesc {
+                    id: 1,
+                    frame_pt: (0.0, 0.0, 1440.0, 900.0),
+                    visible_pt: (0.0, 0.0, 1440.0, 875.0),
+                    backing_scale: 2.0,
+                    refresh_hz: 60,
+                    name: "Retina".to_string(),
+                }],
+                28.0,
+                true,
+            );
+            crate::macos::display::with_test_displays(retina_displays, || {
+                assert_eq!(GetSystemMetrics(4 /* SM_CYCAPTION */), 56);
+                assert_eq!(GetSystemMetricsForDpi(4, 96), 28);
+                assert_eq!(GetSystemMetricsForDpi(4, 144), 42);
+                assert_eq!(GetSystemMetricsForDpi(4, 192), 56);
+
+                let mut ncm_sys = std::mem::zeroed::<NonClientMetricsW>();
+                ncm_sys.cb_size = std::mem::size_of::<NonClientMetricsW>() as u32;
+                assert_eq!(
+                    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm_sys.cb_size, &mut ncm_sys as *mut _ as *mut u8, 0),
+                    TRUE
+                );
+                assert_eq!(ncm_sys.i_caption_height, 56);
+
+                let mut ncm_96 = std::mem::zeroed::<NonClientMetricsW>();
+                ncm_96.cb_size = std::mem::size_of::<NonClientMetricsW>() as u32;
+                assert_eq!(
+                    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, ncm_96.cb_size, &mut ncm_96 as *mut _ as *mut u8, 0, 96),
+                    TRUE
+                );
+                assert_eq!(ncm_96.i_caption_height, 28);
+
+                let mut ncm_192 = std::mem::zeroed::<NonClientMetricsW>();
+                ncm_192.cb_size = std::mem::size_of::<NonClientMetricsW>() as u32;
+                assert_eq!(
+                    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, ncm_192.cb_size, &mut ncm_192 as *mut _ as *mut u8, 0, 192),
+                    TRUE
+                );
+                assert_eq!(ncm_192.i_caption_height, 56);
+            });
 
             // Unknown SPI action returns FALSE + ERROR_INVALID_PARAMETER.
             assert_eq!(SystemParametersInfoW(0xDEAD, 0, std::ptr::null_mut(), 0), FALSE);
