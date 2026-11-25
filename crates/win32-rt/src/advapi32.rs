@@ -3248,7 +3248,7 @@ const NTE_FAIL: u32 = 0x8009_0020;
 
 const CAPI_STORE_MAGIC_V1: &[u8; 8] = b"PFCAPI01";
 const CAPI_STORE_MAGIC_V2: &[u8; 8] = b"PFCAPI02";
-const CAPI_STORE_ENTROPY: &[u8] = b"advapi32-capi-containers-v1";
+const CAPI_ENVELOPE_MAGIC: &[u8; 8] = b"PFCAPIE1";
 
 type CapiDiskKey = (u32, String, String);
 type CapiCacheKey = (bool, u32, String, String);
@@ -3638,23 +3638,255 @@ fn acquire_capi_store_lock(machine_keyset: bool) -> std::io::Result<CapiStoreGua
     Ok(CapiStoreGuard { _mem: mem, flock_file: file })
 }
 
-fn capi_store_path(machine_keyset: bool) -> std::path::PathBuf {
-    let root = crate::path::default_translator_root();
-    if machine_keyset {
-        root.join("ProgramData")
-            .join("Microsoft")
-            .join("Crypto")
-            .join("RSA")
-            .join("MachineKeys")
-            .join("containers.bin")
+fn capi_store_user() -> String {
+    let raw = crate::process::get_env("USERNAME")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "player".to_string());
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "player".to_string()
     } else {
-        root.join("AppData")
-            .join("Roaming")
-            .join("Microsoft")
-            .join("Crypto")
-            .join("RSA")
-            .join("containers.bin")
+        clean
     }
+}
+
+fn capi_store_path(machine_keyset: bool) -> std::path::PathBuf {
+    let dir = crate::path::capi_keystore_dir();
+    if machine_keyset {
+        dir.join("machine_containers.bin")
+    } else {
+        let user = capi_store_user();
+        dir.join(format!("user_{user}_containers.bin"))
+    }
+}
+
+fn capi_secret_path(machine_keyset: bool) -> std::path::PathBuf {
+    let dir = crate::path::capi_keystore_dir();
+    if machine_keyset {
+        dir.join("machine.key")
+    } else {
+        let user = capi_store_user();
+        dir.join(format!("user_{user}.key"))
+    }
+}
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Load or atomically generate a 32-byte provider-only host secret stored with
+/// `0600` permissions in the host-private `.capi-keystore` directory (outside
+/// all guest `C:\` mounts and unreachable from guest-callable `CryptUnprotectData`).
+fn load_or_create_capi_secret(machine_keyset: bool) -> std::io::Result<[u8; 32]> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = capi_secret_path(machine_keyset);
+    if let Ok(mut bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            zeroize_bytes(&mut bytes);
+            return Ok(key);
+        }
+        zeroize_bytes(&mut bytes);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CAPI provider host secret has invalid length",
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "CAPI secret path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let mut secret = [0u8; 32];
+    unsafe {
+        libc::arc4random_buf(secret.as_mut_ptr() as *mut c_void, secret.len());
+    }
+    let mut rnd = [0u8; 8];
+    unsafe {
+        libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    }
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{suffix:016x}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("capi.key"),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&secret)?;
+        f.sync_all()?;
+    }
+
+    // Use hard_link so racing processes never overwrite an already-created secret.
+    match std::fs::hard_link(&tmp_path, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            Ok(secret)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_path);
+            zeroize_bytes(&mut secret);
+            let mut bytes = std::fs::read(&path)?;
+            if bytes.len() != 32 {
+                zeroize_bytes(&mut bytes);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "CAPI provider host secret has invalid length",
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            zeroize_bytes(&mut bytes);
+            Ok(key)
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(&secret)?;
+                    f.sync_all()?;
+                    Ok(secret)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    zeroize_bytes(&mut secret);
+                    let mut bytes = std::fs::read(&path)?;
+                    if bytes.len() != 32 {
+                        zeroize_bytes(&mut bytes);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CAPI provider host secret has invalid length",
+                        ));
+                    }
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    zeroize_bytes(&mut bytes);
+                    Ok(key)
+                }
+                Err(e) => {
+                    zeroize_bytes(&mut secret);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+fn capi_hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = IncrementalDigest::new(BcDigest::Sha256);
+    inner.update(&ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize_clone();
+    let mut outer = IncrementalDigest::new(BcDigest::Sha256);
+    outer.update(&opad);
+    outer.update(&inner_digest);
+    let out_vec = outer.finalize_clone();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&out_vec[..32]);
+    zeroize_bytes(&mut ipad);
+    zeroize_bytes(&mut opad);
+    out
+}
+
+fn capi_store_aad(machine_keyset: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(48);
+    aad.extend_from_slice(CAPI_ENVELOPE_MAGIC);
+    aad.push(machine_keyset as u8);
+    if machine_keyset {
+        aad.extend_from_slice(b"machine");
+    } else {
+        aad.extend_from_slice(b"user:");
+        aad.extend_from_slice(capi_store_user().as_bytes());
+    }
+    aad
+}
+
+fn derive_capi_store_key(machine_keyset: bool, aad: &[u8]) -> std::io::Result<[u8; 32]> {
+    let mut master = load_or_create_capi_secret(machine_keyset)?;
+    let mut info = Vec::with_capacity(32 + aad.len());
+    info.extend_from_slice(b"port-factory-capi-keystore-v1:");
+    info.extend_from_slice(aad);
+    let key = capi_hmac_sha256(&master, &info);
+    zeroize_bytes(&mut master);
+    Ok(key)
+}
+
+fn seal_capi_store(machine_keyset: bool, plain: &[u8]) -> std::io::Result<Vec<u8>> {
+    let aad = capi_store_aad(machine_keyset);
+    let mut key = derive_capi_store_key(machine_keyset, &aad)?;
+    let mut nonce = [0u8; 12];
+    unsafe {
+        libc::arc4random_buf(nonce.as_mut_ptr() as *mut c_void, nonce.len());
+    }
+    let res = crate::misc::bcrypt::aes_gcm_crypt(true, &key, &nonce, &aad, plain, 16, None);
+    zeroize_bytes(&mut key);
+    let (ct, tag) = res.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "AES-GCM protection of CAPI key store failed")
+    })?;
+    let mut env = Vec::with_capacity(8 + 1 + 12 + ct.len() + 16);
+    env.extend_from_slice(CAPI_ENVELOPE_MAGIC);
+    env.push(machine_keyset as u8);
+    env.extend_from_slice(&nonce);
+    env.extend_from_slice(&ct);
+    env.extend_from_slice(&tag);
+    Ok(env)
+}
+
+fn unseal_capi_store(machine_keyset: bool, env: &[u8]) -> std::io::Result<Vec<u8>> {
+    const HDR_LEN: usize = 8 + 1 + 12;
+    const TAG_LEN: usize = 16;
+    if env.len() < HDR_LEN + TAG_LEN || &env[..8] != CAPI_ENVELOPE_MAGIC || env[8] != (machine_keyset as u8) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid CAPI provider keystore envelope",
+        ));
+    }
+    let nonce = &env[9..21];
+    let ct = &env[HDR_LEN..env.len() - TAG_LEN];
+    let tag = &env[env.len() - TAG_LEN..];
+    let aad = capi_store_aad(machine_keyset);
+    let mut key = derive_capi_store_key(machine_keyset, &aad)?;
+    let res = crate::misc::bcrypt::aes_gcm_crypt(false, &key, nonce, &aad, ct, TAG_LEN, Some(tag));
+    zeroize_bytes(&mut key);
+    let (plain, _) = res.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to authenticate CAPI key store")
+    })?;
+    Ok(plain)
 }
 
 fn encode_capi_containers(map: &std::collections::HashMap<CapiDiskKey, CapiContainerKeys>) -> Vec<u8> {
@@ -3759,10 +3991,10 @@ unsafe fn load_persisted_capi_containers(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
         Err(e) => return Err(e),
     };
-    let (_, plain) = crate::misc::crypt32::dpapi_unprotect_bytes(CAPI_STORE_ENTROPY, &enc)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to decrypt CAPI key store"))?;
-    decode_capi_containers(&plain)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt CAPI key store"))
+    let mut plain = unseal_capi_store(machine_keyset, &enc)?;
+    let decoded = decode_capi_containers(&plain);
+    zeroize_bytes(&mut plain);
+    decoded.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt CAPI key store"))
 }
 
 unsafe fn save_persisted_capi_containers(
@@ -3777,10 +4009,10 @@ unsafe fn save_persisted_capi_containers(
     std::fs::create_dir_all(parent)?;
     let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
-    let raw = encode_capi_containers(map);
-    let descr = if machine_keyset { "CapiMachineKeyStore" } else { "CapiKeyStore" };
-    let enc = crate::misc::crypt32::dpapi_protect_bytes(machine_keyset, descr, CAPI_STORE_ENTROPY, &raw)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DPAPI protection of CAPI key store failed"))?;
+    let mut raw = encode_capi_containers(map);
+    let enc = seal_capi_store(machine_keyset, &raw);
+    zeroize_bytes(&mut raw);
+    let enc = enc?;
 
     let mut rnd = [0u8; 8];
     libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
@@ -7538,12 +7770,33 @@ mod tests {
             assert_eq!(CryptDestroyKey(hk_noexp), TRUE);
             assert_eq!(CryptReleaseContext(hp, 0), TRUE);
 
-            // Verify DPAPI-encrypted container store exists on disk with 0600 permissions
+            // Verify provider-encrypted container store and secret live in host-private .capi-keystore
+            // (0700 dir, 0600 files), outside guest mounts, and are NOT decryptable via guest CryptUnprotectData.
             {
                 use std::os::unix::fs::PermissionsExt;
                 let store_p = capi_store_path(false);
-                let meta = std::fs::metadata(&store_p).expect("persisted CAPI store must exist");
-                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                let secret_p = capi_secret_path(false);
+                let ks_dir = crate::path::capi_keystore_dir();
+                assert_eq!(std::fs::metadata(&ks_dir).unwrap().permissions().mode() & 0o777, 0o700);
+                assert_eq!(std::fs::metadata(&store_p).expect("persisted CAPI store must exist").permissions().mode() & 0o777, 0o600);
+                assert_eq!(std::fs::metadata(&secret_p).expect("CAPI provider secret must exist").permissions().mode() & 0o777, 0o600);
+                assert!(!store_p.to_string_lossy().contains("AppData"));
+                assert!(!store_p.to_string_lossy().contains("ProgramData"));
+
+                // Even if a drive letter mounts the translator root, guest VFS path resolution must refuse host-private keystore paths
+                assert!(crate::path::is_host_private_keystore_path(&store_p));
+                assert!(crate::path::is_host_private_keystore_path(&secret_p));
+                crate::path::add_mount("K:\\", &tmp_root);
+                let store_name = store_p.file_name().unwrap().to_string_lossy();
+                let secret_name = secret_p.file_name().unwrap().to_string_lossy();
+                assert!(crate::path::to_host(&format!("K:\\.capi-keystore\\{store_name}")).is_none(), "guest VFS must not resolve CAPI store");
+                assert!(crate::path::to_host(&format!("K:\\.capi-keystore\\{secret_name}")).is_none(), "guest VFS must not resolve CAPI secret");
+                assert!(crate::path::to_host("K:\\AppData").is_some(), "sibling guest mounts still resolve");
+
+                // Even if given the raw ciphertext bytes, guest-callable CryptUnprotectData must reject them
+                let enc_bytes = std::fs::read(&store_p).unwrap();
+                assert!(crate::misc::crypt32::dpapi_unprotect_bytes(b"", &enc_bytes).is_none());
+                assert!(crate::misc::crypt32::dpapi_unprotect_bytes(b"advapi32-capi-containers-v1", &enc_bytes).is_none());
             }
 
             // Machine keyset delete with the same container name MUST NOT touch the user container

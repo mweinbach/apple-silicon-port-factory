@@ -421,12 +421,36 @@ fn ci_resolve(base: &Path, rest: &[&str]) -> PathBuf {
     cur
 }
 
+/// Host-only directory for CAPI provider keystore files (secrets and persisted
+/// key containers). Kept outside every guest `C:\` mount and excluded from
+/// guest VFS path resolution (`to_host`) so guests cannot read or tamper with
+/// non-exportable private keys.
+pub fn capi_keystore_dir() -> PathBuf {
+    default_translator_root().join(".capi-keystore")
+}
+
+/// True if `host` (canonically or via its canonical parent) refers to the
+/// host-private CAPI keystore directory or anything inside it.
+pub fn is_host_private_keystore_path(host: &Path) -> bool {
+    let ks_root = resolve_canonical_host(&capi_keystore_dir());
+    let canon = resolve_canonical_host(host);
+    if path_eq_or_under_ci(&canon, &ks_root) {
+        return true;
+    }
+    let parent_join = resolve_parent_canonical_host(host);
+    path_eq_or_under_ci(&parent_join, &ks_root)
+}
+
 /// Map a Windows path to a host path. Returns `None` for paths outside every
-/// mount (e.g. a drive letter we do not provide) and for device paths.
+/// mount (e.g. a drive letter we do not provide), for device paths, and for
+/// host-private keystore paths.
 pub fn to_host(win: &str) -> Option<PathBuf> {
     let full = absolute(win);
     let up = full.to_ascii_uppercase();
     if let Some(cached) = path_cache().read().unwrap().get(&up) {
+        if is_host_private_keystore_path(cached) {
+            return None;
+        }
         return Some(cached.clone());
     }
     let mounts = MOUNTS.read().unwrap();
@@ -437,11 +461,17 @@ pub fn to_host(win: &str) -> Option<PathBuf> {
             let direct = comps.iter().fold(m.host.clone(), |acc, c| acc.join(c));
             if direct.exists() {
                 drop(mounts);
+                if is_host_private_keystore_path(&direct) {
+                    return None;
+                }
                 path_cache().write().unwrap().insert(up, direct.clone());
                 return Some(direct);
             }
             let resolved = ci_resolve(&m.host, &comps);
             drop(mounts);
+            if is_host_private_keystore_path(&resolved) {
+                return None;
+            }
             if resolved.exists() {
                 path_cache().write().unwrap().insert(up, resolved.clone());
             }
@@ -709,6 +739,9 @@ pub fn protect_native_subtree(dir: &Path) {
 /// protected native runner file or protected bundle subtree that guest VFS operations must
 /// not create, write, truncate, modify attributes on, or overwrite.
 pub fn is_protected_host_write(host: &Path) -> bool {
+    if is_host_private_keystore_path(host) {
+        return true;
+    }
     let set = protected_native().read().unwrap_or_else(|e| e.into_inner());
     if set.files.is_empty() && set.subtrees.is_empty() && set.inodes.is_empty() {
         return false;
@@ -746,12 +779,18 @@ pub fn is_protected_host_remove_or_rename(host: &Path) -> bool {
     if is_protected_host_write(host) {
         return true;
     }
+    let canon = resolve_canonical_host(host);
+    let parent_join = resolve_parent_canonical_host(host);
+    let ks_root = resolve_canonical_host(&capi_keystore_dir());
+    for cand in [&canon, &parent_join] {
+        if path_is_ancestor_of_ci(cand, &ks_root) {
+            return true;
+        }
+    }
     let set = protected_native().read().unwrap_or_else(|e| e.into_inner());
     if set.files.is_empty() && set.subtrees.is_empty() {
         return false;
     }
-    let canon = resolve_canonical_host(host);
-    let parent_join = resolve_parent_canonical_host(host);
     for cand in [&canon, &parent_join] {
         if set.files.iter().any(|f| path_is_ancestor_of_ci(cand, f)) {
             return true;

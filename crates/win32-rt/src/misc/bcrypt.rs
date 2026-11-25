@@ -2757,7 +2757,7 @@ fn gcm_inc32(ctr: &mut [u8; 16]) {
     ctr[12..16].copy_from_slice(&n.to_be_bytes());
 }
 
-fn aes_gcm_crypt(
+pub(crate) fn aes_gcm_crypt(
     encrypt: bool,
     key: &[u8],
     nonce: &[u8],
