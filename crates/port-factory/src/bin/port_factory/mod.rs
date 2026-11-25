@@ -55,6 +55,7 @@ pub fn usage() -> ! {
            stats [--json]                       Print summary statistics of the x86-64 -> ARM64 database\n\
            list [--category CAT] [--search STR] List translated op families and their ARM64 patterns\n\
            explain <MNEMONIC_OR_ID>             Show full x86-64 -> ARM64 translation recipe & semantics\n\
+           readiness <PE_OR_GAME_DIR> [--json]  Rank x86 dispatch gaps and Win32 imports per PE\n\
            scan <PE_FILE_OR_DIR...> [--record] [--top N] [--json]\n\
                                                 Scan .exe/.dll binaries for ARM64 coverage & op mix\n\
          \n\

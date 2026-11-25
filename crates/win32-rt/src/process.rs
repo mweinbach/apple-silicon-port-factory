@@ -866,6 +866,10 @@ pub fn num_cpus() -> u32 {
     })
 }
 
+pub fn active_processor_mask() -> usize {
+    usize::MAX >> (usize::BITS - num_cpus().min(usize::BITS))
+}
+
 pub fn physical_memory() -> u64 {
     let mut v: u64 = 0;
     let mut sz = std::mem::size_of::<u64>();

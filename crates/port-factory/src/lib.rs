@@ -36,6 +36,8 @@ pub mod ios_bundle;
 pub mod json_output;
 pub mod launcher;
 pub mod ops_db;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod readiness;
 pub mod report_diff;
 pub mod scaffold;
 pub mod scanner;
