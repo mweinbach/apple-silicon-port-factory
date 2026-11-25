@@ -3,6 +3,8 @@
 mod cpu;
 mod imports;
 
+pub(crate) use cpu::advertised as cpuid_advertised;
+
 use crate::json_output::{exit_codes, JsonObj, JsonValue};
 use anyhow::{ensure, Context, Result};
 use cpu::CpuScan;

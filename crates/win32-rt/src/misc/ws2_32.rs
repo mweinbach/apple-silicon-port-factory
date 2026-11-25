@@ -2159,18 +2159,32 @@ pub unsafe extern "win64" fn send(s: usize, buf: *const u8, len: i32, flags: i32
     };
     let fd = meta.fd;
     let mcast_dest = if !meta.connected { meta.mcast_dest } else { None };
+    let want = len.max(0) as usize;
+    let mut mcast_staging = Vec::new();
+    let mcast_io_ptr = if mcast_dest.is_some()
+        && want > 0
+        && crate::kernel32::memory::needs_io_read_staging(buf as usize, want)
+    {
+        mcast_staging.resize(want, 0);
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf, &mut mcast_staging) {
+            return err(errno_to_wsa(e), SOCKET_ERROR);
+        }
+        mcast_staging.as_ptr() as *const c_void
+    } else {
+        buf as *const c_void
+    };
     loop {
         let n = if let Some((ref dst, dlen)) = mcast_dest {
             libc::sendto(
                 fd,
-                buf as *const c_void,
-                len.max(0) as usize,
+                mcast_io_ptr,
+                want,
                 flags,
                 dst as *const libc::sockaddr_storage as *const libc::sockaddr,
                 dlen,
             )
         } else {
-            libc::send(fd, buf as *const c_void, len.max(0) as usize, flags)
+            send_from_guest(fd, buf, want, flags)
         };
         if n >= 0 {
             return n as i32;
@@ -2204,11 +2218,21 @@ pub unsafe extern "win64" fn sendto(s: usize, buf: *const u8, len: i32, flags: i
         Ok(v) => v,
         Err(e) => return err(e, SOCKET_ERROR),
     };
+    let want = len.max(0) as usize;
+    let needs_stage = want > 0 && crate::kernel32::memory::needs_io_read_staging(buf as usize, want);
+    let mut staging = Vec::new();
+    if needs_stage {
+        staging.resize(want, 0);
+        if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(buf, &mut staging) {
+            return err(errno_to_wsa(e), SOCKET_ERROR);
+        }
+    }
+    let io_ptr = if needs_stage { staging.as_ptr() as *const c_void } else { buf as *const c_void };
     loop {
         let n = libc::sendto(
             fd,
-            buf as *const c_void,
-            len.max(0) as usize,
+            io_ptr,
+            want,
             flags,
             &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
             plen,
@@ -2272,9 +2296,9 @@ pub unsafe extern "win64" fn recv(s: usize, buf: *mut u8, len: i32, flags: i32) 
     let deadline = socket_timeout_duration(fd, libc::SO_RCVTIMEO).map(|d| std::time::Instant::now() + d);
     let mut got_total = 0usize;
     loop {
-        let ptr = buf.add(got_total) as *mut c_void;
+        let ptr = buf.add(got_total);
         let rem = total_want - got_total;
-        let n = libc::recv(fd, ptr, rem, call_flags);
+        let n = recv_into_guest(fd, ptr, rem, call_flags);
         if n >= 0 {
             let k = n as usize;
             got_total += k;
@@ -2331,15 +2355,34 @@ pub unsafe extern "win64" fn recvfrom(
         if capture_from {
             slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         }
+        let dst_ptr = buf.add(got_total);
+        let rem = total_want - got_total;
+        let stage_len = if crate::kernel32::memory::needs_io_write_staging(dst_ptr as usize, rem) {
+            rem.min(1024 * 1024)
+        } else {
+            0
+        };
+        let mut staging = if stage_len > 0 { vec![0u8; stage_len] } else { Vec::new() };
+        let (io_ptr, io_len) = if stage_len > 0 {
+            (staging.as_mut_ptr() as *mut c_void, stage_len)
+        } else {
+            (dst_ptr as *mut c_void, rem)
+        };
         let r = libc::recvfrom(
             fd,
-            buf.add(got_total) as *mut c_void,
-            total_want - got_total,
+            io_ptr,
+            io_len,
             call_flags,
             if capture_from { &mut storage as *mut libc::sockaddr_storage as *mut libc::sockaddr } else { std::ptr::null_mut() },
             if capture_from { &mut slen } else { std::ptr::null_mut() },
         );
         if r >= 0 {
+            if stage_len > 0 && r > 0 {
+                if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(dst_ptr, &staging[..r as usize]) {
+                    event_select_rearm_read(s, (pflags & libc::MSG_OOB) != 0);
+                    return err(errno_to_wsa(e), SOCKET_ERROR);
+                }
+            }
             if capture_from {
                 got_from = true;
             }
@@ -2438,9 +2481,49 @@ unsafe fn sendmsg_bufs_from(
         msg.msg_name = storage as *const libc::sockaddr_storage as *mut c_void;
         msg.msg_namelen = *plen;
     }
-    msg.msg_iov = iovecs.as_mut_ptr();
-    msg.msg_iovlen = iovecs.len() as libc::c_int;
+    let needs_stage = iovecs
+        .iter()
+        .any(|iv| crate::kernel32::memory::needs_io_read_staging(iv.iov_base as usize, iv.iov_len));
+    let mut staging = Vec::new();
+    let mut stage_iov;
+    if needs_stage {
+        let total: usize = iovecs.iter().map(|iv| iv.iov_len).sum();
+        staging.resize(total, 0);
+        let mut off = 0usize;
+        for iv in &iovecs {
+            if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(
+                iv.iov_base as *const u8,
+                &mut staging[off..off + iv.iov_len],
+            ) {
+                *libc::__error() = e;
+                return -1;
+            }
+            off += iv.iov_len;
+        }
+        stage_iov = libc::iovec {
+            iov_base: staging.as_mut_ptr() as *mut c_void,
+            iov_len: staging.len(),
+        };
+        msg.msg_iov = &mut stage_iov;
+        msg.msg_iovlen = 1;
+    } else {
+        msg.msg_iov = iovecs.as_mut_ptr();
+        msg.msg_iovlen = iovecs.len() as libc::c_int;
+    }
     libc::sendmsg(fd, &msg, pflags)
+}
+
+unsafe fn send_from_guest(fd: i32, src: *const u8, len: usize, flags: i32) -> isize {
+    if len == 0 || !crate::kernel32::memory::needs_io_read_staging(src as usize, len) {
+        return libc::send(fd, src as *const c_void, len, flags);
+    }
+    let cap = len.min(1024 * 1024);
+    let mut tmp = vec![0u8; cap];
+    if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(src, &mut tmp) {
+        *libc::__error() = e;
+        return -1;
+    }
+    libc::send(fd, tmp.as_ptr() as *const c_void, cap, flags)
 }
 
 enum OverlappedSendStep {
@@ -2548,12 +2631,59 @@ unsafe fn recvmsg_bufs_from(
         msg.msg_name = (*storage) as *mut libc::sockaddr_storage as *mut c_void;
         msg.msg_namelen = **plen;
     }
-    msg.msg_iov = iovecs.as_mut_ptr();
-    msg.msg_iovlen = iovecs.len() as libc::c_int;
+    let needs_stage = iovecs
+        .iter()
+        .any(|iv| crate::kernel32::memory::needs_io_write_staging(iv.iov_base as usize, iv.iov_len));
+    let mut staging = Vec::new();
+    let mut stage_iov;
+    if needs_stage {
+        let total_rem: usize = iovecs.iter().map(|iv| iv.iov_len).sum();
+        staging.resize(total_rem, 0);
+        stage_iov = libc::iovec {
+            iov_base: staging.as_mut_ptr() as *mut c_void,
+            iov_len: staging.len(),
+        };
+        msg.msg_iov = &mut stage_iov;
+        msg.msg_iovlen = 1;
+    } else {
+        msg.msg_iov = iovecs.as_mut_ptr();
+        msg.msg_iovlen = iovecs.len() as libc::c_int;
+    }
     let n = libc::recvmsg(fd, &mut msg, pflags);
+    if needs_stage && n > 0 {
+        let mut off = 0usize;
+        let got = n as usize;
+        for iv in &iovecs {
+            if off >= got {
+                break;
+            }
+            let take = iv.iov_len.min(got - off);
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(iv.iov_base as *mut u8, &staging[off..off + take]) {
+                *libc::__error() = e;
+                return -1;
+            }
+            off += take;
+        }
+    }
     *msg_flags_out = msg.msg_flags;
     if let Some((_, plen)) = from {
         *plen = msg.msg_namelen;
+    }
+    n
+}
+
+unsafe fn recv_into_guest(fd: i32, dst: *mut u8, len: usize, flags: i32) -> isize {
+    if len == 0 || !crate::kernel32::memory::needs_io_write_staging(dst as usize, len) {
+        return libc::recv(fd, dst as *mut c_void, len, flags);
+    }
+    let cap = len.min(1024 * 1024);
+    let mut tmp = vec![0u8; cap];
+    let n = libc::recv(fd, tmp.as_mut_ptr() as *mut c_void, cap, flags);
+    if n > 0 {
+        if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(dst, &tmp[..n as usize]) {
+            *libc::__error() = e;
+            return -1;
+        }
     }
     n
 }
@@ -3989,8 +4119,24 @@ unsafe fn try_wsa_recvmsg_once(
         pmsg.msg_name = &mut storage as *mut _ as *mut c_void;
         pmsg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     }
-    pmsg.msg_iov = iovecs.as_mut_ptr();
-    pmsg.msg_iovlen = iovecs.len() as libc::c_int;
+    let needs_stage = iovecs
+        .iter()
+        .any(|iv| crate::kernel32::memory::needs_io_write_staging(iv.iov_base as usize, iv.iov_len));
+    let mut staging = Vec::new();
+    let mut stage_iov;
+    if needs_stage {
+        let total_rem: usize = iovecs.iter().map(|iv| iv.iov_len).sum();
+        staging.resize(total_rem, 0);
+        stage_iov = libc::iovec {
+            iov_base: staging.as_mut_ptr() as *mut c_void,
+            iov_len: staging.len(),
+        };
+        pmsg.msg_iov = &mut stage_iov;
+        pmsg.msg_iovlen = 1;
+    } else {
+        pmsg.msg_iov = iovecs.as_mut_ptr();
+        pmsg.msg_iovlen = iovecs.len() as libc::c_int;
+    }
     if want_ctrl {
         pmsg.msg_control = ctrl_buf.as_mut_ptr() as *mut c_void;
         pmsg.msg_controllen = ctrl_buf.len() as libc::socklen_t;
@@ -4010,6 +4156,22 @@ unsafe fn try_wsa_recvmsg_once(
         }
         return Err(e);
     };
+    if needs_stage && n > 0 {
+        let mut off = 0usize;
+        for iv in &iovecs {
+            if off >= n {
+                break;
+            }
+            let take = iv.iov_len.min(n - off);
+            if let Err(e) = crate::kernel32::memory::write_guest_io_bytes(
+                iv.iov_base as *mut u8,
+                &staging[off..off + take],
+            ) {
+                return Err(e);
+            }
+            off += take;
+        }
+    }
 
     let mut name_err: Option<u32> = None;
     if want_name && pmsg.msg_namelen > 0 {
@@ -4078,8 +4240,34 @@ unsafe fn try_wsa_sendmsg_once(
         pmsg.msg_name = storage as *const _ as *mut c_void;
         pmsg.msg_namelen = *plen;
     }
-    pmsg.msg_iov = iovecs.as_mut_ptr();
-    pmsg.msg_iovlen = iovecs.len() as libc::c_int;
+    let needs_stage = iovecs
+        .iter()
+        .any(|iv| crate::kernel32::memory::needs_io_read_staging(iv.iov_base as usize, iv.iov_len));
+    let mut staging = Vec::new();
+    let mut stage_iov;
+    if needs_stage {
+        let total: usize = iovecs.iter().map(|iv| iv.iov_len).sum();
+        staging.resize(total, 0);
+        let mut off = 0usize;
+        for iv in &iovecs {
+            if let Err(e) = crate::kernel32::memory::read_guest_io_bytes(
+                iv.iov_base as *const u8,
+                &mut staging[off..off + iv.iov_len],
+            ) {
+                return Err(e);
+            }
+            off += iv.iov_len;
+        }
+        stage_iov = libc::iovec {
+            iov_base: staging.as_mut_ptr() as *mut c_void,
+            iov_len: staging.len(),
+        };
+        pmsg.msg_iov = &mut stage_iov;
+        pmsg.msg_iovlen = 1;
+    } else {
+        pmsg.msg_iov = iovecs.as_mut_ptr();
+        pmsg.msg_iovlen = iovecs.len() as libc::c_int;
+    }
     if !ctrl.is_empty() {
         pmsg.msg_control = ctrl.as_ptr() as *mut c_void;
         pmsg.msg_controllen = ctrl.len() as libc::socklen_t;
@@ -6235,7 +6423,7 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
                             bytes: 0,
                         };
                     }
-                    let n = libc::recv(accept_fd, buf_ptr as *mut c_void, rlen as usize, libc::MSG_DONTWAIT);
+                    let n = recv_into_guest(accept_fd, buf_ptr, rlen as usize, libc::MSG_DONTWAIT);
                     if n >= 0 {
                         OpStep::Complete {
                             nt_status: STATUS_SUCCESS,
@@ -6270,9 +6458,9 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
             out_buf,
             recv_data_len,
         } => {
-            let n = libc::recv(
+            let n = recv_into_guest(
                 op.poll_fd,
-                *out_buf as *mut c_void,
+                *out_buf as *mut u8,
                 *recv_data_len as usize,
                 libc::MSG_DONTWAIT,
             );
@@ -6326,7 +6514,7 @@ unsafe fn drive_pending_op(op: &mut PendingSocketOp, revents: i16) -> OpStep {
             loop {
                 let rem = (*send_len - *sent_so_far) as usize;
                 let ptr = (*send_buf as *const u8).add(*sent_so_far as usize);
-                let n = libc::send(op.poll_fd, ptr as *const c_void, rem, libc::MSG_DONTWAIT);
+                let n = send_from_guest(op.poll_fd, ptr, rem, libc::MSG_DONTWAIT);
                 if n > 0 {
                     *sent_so_far += n as u32;
                     if *sent_so_far >= *send_len {
@@ -6797,9 +6985,9 @@ unsafe extern "win64" fn ext_accept_ex(
                 complete_overlapped_io(s_listen as HANDLE, ov, STATUS_SUCCESS, 0, true);
                 return TRUE;
             }
-            let n = libc::recv(
+            let n = recv_into_guest(
                 accept_fd,
-                out_buf as *mut c_void,
+                out_buf,
                 recv_data_len as usize,
                 libc::MSG_DONTWAIT,
             );
@@ -6942,9 +7130,9 @@ unsafe extern "win64" fn ext_connect_ex(
         }
         let mut sent_so_far = 0u32;
         while sent_so_far < send_len {
-            let n = libc::send(
+            let n = send_from_guest(
                 meta.fd,
-                send_buf.add(sent_so_far as usize) as *const c_void,
+                send_buf.add(sent_so_far as usize),
                 (send_len - sent_so_far) as usize,
                 libc::MSG_DONTWAIT,
             );

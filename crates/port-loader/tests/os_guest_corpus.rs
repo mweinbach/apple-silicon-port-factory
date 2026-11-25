@@ -1627,6 +1627,356 @@ int main(void) {
 "##;
 
 // ---------------------------------------------------------------------------
+// Kernel-core VM guard pages, MEM_WRITE_WATCH, affinity, job objects & InitOnce async
+// ---------------------------------------------------------------------------
+
+#[test]
+fn guest_kernel_core_guard_page_and_write_watch() {
+    let Some(zig) = find_zig() else {
+        eprintln!("skipping guest_kernel_core_guard_page_and_write_watch: zig not found");
+        return;
+    };
+    let tmp = TempDir::new("kernel-core-vm");
+    let exe = compile_c_guest(
+        &zig,
+        tmp.path(),
+        "kernel_core_vm",
+        KERNEL_CORE_VM_C,
+        &["kernel32"],
+    );
+    run_guest_both_modes(
+        "kernel_core_vm",
+        &exe,
+        tmp.path(),
+        &[
+            "CORPUS_KCORE: page_guard_oneshot ok",
+            "CORPUS_KCORE: write_watch_hw ok",
+            "CORPUS_KCORE: mem_large_pages_and_reset_undo ok",
+            "CORPUS_KCORE: affinity_and_flush ok",
+            "CORPUS_KCORE: PASS ALL",
+        ],
+        DEFAULT_TIMEOUT,
+    );
+}
+
+const KERNEL_CORE_VM_C: &str = r##"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <emmintrin.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL: %s (line %d, err=%lu)\n", (msg), __LINE__, (unsigned long)GetLastError()); \
+        fflush(stderr); \
+        ExitProcess(1); \
+    } \
+} while (0)
+
+static volatile LONG g_guard_hits = 0;
+static volatile ULONG_PTR g_guard_addr = 0;
+static volatile ULONG_PTR g_guard_kind = 99;
+static volatile DWORD g_guard_prot_in_veh = 0;
+
+static volatile uint32_t g_guard_val_in_veh = 0;
+static volatile LONG g_emul_stop = 0;
+
+struct EmulWorkerArg {
+    uint8_t *base;
+    HANDLE ready_ev;
+};
+
+static DWORD WINAPI sibling_emul_worker(LPVOID param) {
+    struct EmulWorkerArg *arg = (struct EmulWorkerArg *)param;
+    uint8_t *p = arg->base;
+    SetEvent(arg->ready_ev);
+    uint32_t iter = 0;
+    while (InterlockedCompareExchange(&g_emul_stop, 0, 0) == 0) {
+        *(volatile uint32_t *)(p + 0x80) = 0xA0000000u ^ iter;
+        uint32_t r = *(volatile uint32_t *)(p + 0x80);
+        if (r != (0xA0000000u ^ iter)) {
+            return 2;
+        }
+        __m128i v = _mm_set_epi32((int)(iter + 3), (int)(iter + 2), (int)(iter + 1), (int)iter);
+        _mm_storeu_si128((__m128i *)(p + 0x100), v);
+        __m128i got = _mm_loadu_si128((const __m128i *)(p + 0x100));
+        uint32_t lanes[4];
+        _mm_storeu_si128((__m128i *)lanes, got);
+        if (lanes[0] != iter || lanes[3] != iter + 3) {
+            return 3;
+        }
+        iter++;
+    }
+    return 0;
+}
+
+static LONG CALLBACK guard_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+        InterlockedIncrement(&g_guard_hits);
+        g_guard_kind = ep->ExceptionRecord->ExceptionInformation[0];
+        g_guard_addr = ep->ExceptionRecord->ExceptionInformation[1];
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)g_guard_addr, &mbi, sizeof(mbi)) != 0) {
+            g_guard_prot_in_veh = mbi.Protect;
+        }
+        /* Reading the just-consumed 4 KiB page from inside the VEH while sibling 4 KiB
+           subpages remain PAGE_GUARD must succeed without deadlocking HPAGE_LOCKS! */
+        g_guard_val_in_veh = *(volatile uint32_t *)g_guard_addr;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int main(void) {
+    /* 1. Real one-shot PAGE_GUARD via VirtualProtect + VEH STATUS_GUARD_PAGE_VIOLATION */
+    PVOID veh = AddVectoredExceptionHandler(1, guard_veh);
+    CHECK(veh != NULL, "AddVectoredExceptionHandler");
+
+    uint8_t *gp = (uint8_t *)VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(gp != NULL, "VirtualAlloc guard region");
+    *(volatile uint32_t *)(gp + 0x40) = 0x11223344u;
+    DWORD old_prot = 0;
+    CHECK(VirtualProtect(gp, 0x4000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "VirtualProtect PAGE_GUARD");
+    CHECK(old_prot == PAGE_READWRITE, "old prot was PAGE_READWRITE");
+
+    /* First write to 4 KiB subpage 0 triggers STATUS_GUARD_PAGE_VIOLATION once; guard clears
+       before handler runs while sibling 4 KiB subpages 1..3 remain guarded! */
+    *(volatile uint32_t *)(gp + 0x40) = 0x13572468u;
+    CHECK(g_guard_hits == 1, "guard page 0 fired exactly once");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x40), "guard fault address matches");
+    CHECK(g_guard_kind == 1, "guard fault kind is write (1)");
+    CHECK(g_guard_prot_in_veh == PAGE_READWRITE, "PAGE_GUARD already cleared on subpage 0 inside VEH");
+    CHECK(g_guard_val_in_veh == 0x11223344u, "VEH read just-consumed subpage 0 without deadlock");
+    CHECK(*(volatile uint32_t *)(gp + 0x40) == 0x13572468u, "write completed after VEH continue");
+
+    MEMORY_BASIC_INFORMATION mbi_sib;
+    CHECK(VirtualQuery(gp + 0x1000, &mbi_sib, sizeof(mbi_sib)) != 0, "VirtualQuery sibling subpage 1");
+    CHECK(mbi_sib.Protect == (PAGE_READWRITE | PAGE_GUARD), "sibling subpage 1 still PAGE_GUARD");
+
+    /* Second access to subpage 0 (both scalar AND 128-bit SIMD!) must NOT fault again,
+       even while subpages 1..3 remain guarded on the same 16 KiB host page! */
+    *(volatile uint32_t *)(gp + 0x44) = 0x24681357u;
+    CHECK(g_guard_hits == 1, "subpage 0 did not fire a second time");
+    CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write to subpage 0 succeeded");
+
+    __m128i simd_in = _mm_set_epi32(0x11223344, 0x55667788, (int)0x99AABBCCu, (int)0xDDEEFF01u);
+    _mm_storeu_si128((__m128i *)(gp + 0x60), simd_in);
+    __m128i simd_out = _mm_loadu_si128((const __m128i *)(gp + 0x60));
+    uint32_t simd_lanes[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)simd_lanes, simd_out);
+    CHECK(g_guard_hits == 1, "128-bit SIMD store+load on subpage 0 did not trip sibling guards");
+    CHECK(simd_lanes[0] == 0xDDEEFF01u && simd_lanes[1] == 0x99AABBCCu
+          && simd_lanes[2] == 0x55667788u && simd_lanes[3] == 0x11223344u,
+          "128-bit SIMD store+load round-trip matched on shared host page");
+
+    /* Atomic LOCK operations (`InterlockedIncrement`, `InterlockedExchangeAdd`, `InterlockedExchange`,
+       `InterlockedCompareExchange`, `InterlockedOr`, `InterlockedAnd`, `InterlockedXor`) on accessible
+       subpage 0 while sibling subpages 1..3 remain PAGE_GUARD MUST complete atomically! */
+    volatile LONG *atm = (volatile LONG *)(gp + 0xA0);
+    *atm = 10;
+    CHECK(InterlockedIncrement(atm) == 11, "LOCK INC on shared guarded host page");
+    CHECK(InterlockedExchangeAdd(atm, 5) == 11 && *atm == 16, "LOCK XADD on shared guarded host page");
+    CHECK(InterlockedCompareExchange(atm, 42, 16) == 16 && *atm == 42, "LOCK CMPXCHG match on shared guarded host page");
+    CHECK(InterlockedCompareExchange(atm, 99, 16) == 42 && *atm == 42, "LOCK CMPXCHG mismatch on shared guarded host page");
+    CHECK(InterlockedExchange(atm, 0x0F) == 42 && *atm == 0x0F, "XCHG on shared guarded host page");
+    InterlockedOr(atm, 0xF0);
+    CHECK(*atm == 0xFF, "LOCK OR on shared guarded host page");
+    InterlockedAnd(atm, 0x3C);
+    CHECK(*atm == 0x3C, "LOCK AND on shared guarded host page");
+    InterlockedXor(atm, 0x0F);
+    CHECK(*atm == 0x33, "LOCK XOR on shared guarded host page");
+    CHECK(g_guard_hits == 1, "atomic ops on subpage 0 did not trip sibling guards");
+
+    /* Unaligned 16-byte SIMD store at offset 0xFF8 (spanning accessible subpage 0 and
+       guarded subpage 1) MUST fire STATUS_GUARD_PAGE_VIOLATION at gp + 0x1000 and then
+       complete all 16 bytes across the boundary! */
+    __m128i straddle_v = _mm_set_epi32(0xCAFE0004, 0xCAFE0003, 0xCAFE0002, 0xCAFE0001);
+    _mm_storeu_si128((__m128i *)(gp + 0x0FF8), straddle_v);
+    CHECK(g_guard_hits == 2, "straddling 16-byte SIMD store at 0xFF8 fired guard violation on subpage 1");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1000), "straddling SIMD guard fault reported subpage 1 boundary");
+    __m128i straddle_got = _mm_loadu_si128((const __m128i *)(gp + 0x0FF8));
+    uint32_t sl[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)sl, straddle_got);
+    CHECK(sl[0] == 0xCAFE0001u && sl[1] == 0xCAFE0002u && sl[2] == 0xCAFE0003u && sl[3] == 0xCAFE0004u,
+          "straddling 16-byte SIMD store+load landed across 0xFF8..0x1007");
+
+    /* Sibling 4 KiB subpage 2 MUST still be independently guarded! */
+    *(volatile uint32_t *)(gp + 0x2040) = 0x89ABCDEFu;
+    CHECK(g_guard_hits == 3, "sibling subpage 2 fired its own guard violation");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x2040), "sibling subpage 2 fault address matches");
+    CHECK(*(volatile uint32_t *)(gp + 0x2040) == 0x89ABCDEFu, "sibling subpage 2 write completed");
+
+    /* Concurrent 2-thread isolation test: while worker thread hammers scalar + SIMD
+       emulations on subpage 0, main thread repeatedly arms PAGE_GUARD on subpage 2 and
+       reads it; EVERY single read must fire STATUS_GUARD_PAGE_VIOLATION (proving the
+       guest VA is never transiently unprotected during emulation). */
+    HANDLE ready_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(ready_ev != NULL, "CreateEventW ready_ev");
+    struct EmulWorkerArg warg = { gp, ready_ev };
+    InterlockedExchange(&g_emul_stop, 0);
+    HANDLE worker = CreateThread(NULL, 0, sibling_emul_worker, &warg, 0, NULL);
+    CHECK(worker != NULL, "CreateThread sibling_emul_worker");
+    CHECK(WaitForSingleObject(ready_ev, 5000) == WAIT_OBJECT_0, "worker ready");
+    for (int i = 0; i < 40; ++i) {
+        CHECK(VirtualProtect(gp + 0x2000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "re-arm subpage 2");
+        LONG before = InterlockedCompareExchange(&g_guard_hits, 0, 0);
+        volatile uint32_t v = *(volatile uint32_t *)(gp + 0x2040);
+        CHECK(v == 0x89ABCDEFu, "guarded sibling value intact under concurrency");
+        LONG after = InterlockedCompareExchange(&g_guard_hits, 0, 0);
+        CHECK(after == before + 1, "sibling guard MUST fire 100% of the time under concurrent emulation");
+    }
+    InterlockedExchange(&g_emul_stop, 1);
+    CHECK(WaitForSingleObject(worker, 5000) == WAIT_OBJECT_0, "worker joined");
+    DWORD wcode = 99;
+    CHECK(GetExitCodeThread(worker, &wcode) && wcode == 0, "worker exited cleanly with 0");
+    CloseHandle(worker);
+    CloseHandle(ready_ev);
+    /* Unaligned 16-byte SIMD load/store crossing a 16 KiB host-page boundary (0x3FF8..0x4007):
+       host page 0 (0x0000..0x3FFF) is fully readable/writable, while host page 1 (0x4000..0x7FFF)
+       has accessible subpage 0 (0x4000..0x4FFF) + PAGE_GUARD sibling subpage 1 (0x5000..0x5FFF).
+       Hardware FAR reports 0x4000, so signals.rs must recover the true starting EA 0x3FF8! */
+    uint8_t *hp2 = (uint8_t *)VirtualAlloc(NULL, 0x8000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(hp2 != NULL, "VirtualAlloc 32 KiB cross-host-page region");
+    CHECK(VirtualProtect(hp2 + 0x5000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "guard hp2+0x5000");
+    LONG hits_before_hp2 = g_guard_hits;
+    __m128i xhp_in = _mm_set_epi32(0x44444444, 0x33333333, 0x22222222, 0x11111111);
+    _mm_storeu_si128((__m128i *)(hp2 + 0x3FF8), xhp_in);
+    __m128i xhp_out = _mm_loadu_si128((const __m128i *)(hp2 + 0x3FF8));
+    uint32_t xhp_lanes[4] = {0, 0, 0, 0};
+    _mm_storeu_si128((__m128i *)xhp_lanes, xhp_out);
+    CHECK(g_guard_hits == hits_before_hp2, "cross-16KiB-boundary SIMD did not trip distant guard at 0x5000");
+    CHECK(xhp_lanes[0] == 0x11111111u && xhp_lanes[1] == 0x22222222u
+          && xhp_lanes[2] == 0x33333333u && xhp_lanes[3] == 0x44444444u,
+          "cross-16KiB-boundary 16-byte SIMD store+load recovered exact EA 0x3FF8");
+    CHECK(*(volatile uint32_t *)(hp2 + 0x3FF8) == 0x11111111u
+          && *(volatile uint32_t *)(hp2 + 0x3FFC) == 0x22222222u
+          && *(volatile uint32_t *)(hp2 + 0x4000) == 0x33333333u
+          && *(volatile uint32_t *)(hp2 + 0x4004) == 0x44444444u,
+          "cross-16KiB-boundary bytes landed at exact offsets 0x3FF8..0x4007");
+    CHECK(VirtualFree(hp2, 0, MEM_RELEASE), "VirtualFree hp2");
+
+    CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
+    printf("CORPUS_KCORE: page_guard_oneshot ok\n");
+
+    /* 2. Real hardware MEM_WRITE_WATCH + GetWriteWatch + ResetWriteWatch */
+    SIZE_T ww_size = 0x40000; /* 256 KiB */
+    uint8_t *ww = (uint8_t *)VirtualAlloc(NULL, ww_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    CHECK(ww != NULL, "VirtualAlloc MEM_WRITE_WATCH");
+
+    PVOID addrs[32];
+    ULONG_PTR count = 32;
+    DWORD gran = 0;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "initial GetWriteWatch");
+    CHECK(count == 0, "initially 0 dirty pages");
+    CHECK(gran >= 4096 && (gran & (gran - 1)) == 0, "valid power-of-2 granularity");
+
+    /* Touch page 1 and page 3 (at granularity stride). */
+    *(volatile uint32_t *)(ww + gran * 1 + 8) = 0xAA55AA55u;
+    *(volatile uint32_t *)(ww + gran * 3 + 16) = 0x55AA55AAu;
+
+    /* Output buffers on a SEPARATE clean MEM_WRITE_WATCH allocation must not deadlock VM lock! */
+    uint8_t *ww_out = (uint8_t *)VirtualAlloc(NULL, gran, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    CHECK(ww_out != NULL, "VirtualAlloc separate clean write-watch output buffer");
+    PVOID *out_addrs = (PVOID *)ww_out;
+    ULONG_PTR *out_count = (ULONG_PTR *)(ww_out + 256);
+    DWORD *out_gran = (DWORD *)(ww_out + 264);
+    *out_count = 32;
+    /* Re-reset ww_out so its page is CLEAN when GetWriteWatch writes to it! */
+    CHECK(ResetWriteWatch(ww_out, gran) == 0, "ResetWriteWatch(ww_out)");
+    CHECK(GetWriteWatch(0, ww, ww_size, out_addrs, out_count, out_gran) == 0, "GetWriteWatch into clean write-watch buffer");
+    CHECK(*out_count == 2, "2 pages recorded dirty via ww_out");
+    CHECK(out_addrs[0] == (PVOID)(ww + gran * 1), "dirty page 0 == gran*1");
+    CHECK(out_addrs[1] == (PVOID)(ww + gran * 3), "dirty page 1 == gran*3");
+    CHECK(*out_gran == gran, "granularity matches");
+    CHECK(VirtualFree(ww_out, 0, MEM_RELEASE), "VirtualFree ww_out");
+
+    /* Write-watch + PAGE_GUARD sibling on the same 16 KiB host page: writing writable
+       subpage 0 must record dirty WITHOUT exposing guarded sibling subpage 1! */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch before sibling guard test");
+    g_guard_hits = 0;
+    CHECK(VirtualProtect(ww + 0x1000, 0x1000, PAGE_READWRITE | PAGE_GUARD, &old_prot), "guard subpage 1 in write-watch page");
+    *(volatile uint32_t *)(ww + 0x20) = 0xDEADC0DEu;
+    CHECK(g_guard_hits == 0, "writing subpage 0 did not trigger sibling guard");
+    CHECK(*(volatile uint32_t *)(ww + 0x20) == 0xDEADC0DEu, "write to subpage 0 landed");
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch after shared-page write");
+    CHECK(count == 1 && addrs[0] == (PVOID)ww, "emulated write-watch store recorded dirty page 0");
+    /* Now touching guarded sibling subpage 1 MUST still fire STATUS_GUARD_PAGE_VIOLATION! */
+    *(volatile uint32_t *)(ww + 0x1020) = 0x12345678u;
+    CHECK(g_guard_hits == 1, "sibling subpage 1 in write-watch page remained guarded");
+    CHECK(*(volatile uint32_t *)(ww + 0x1020) == 0x12345678u, "sibling write landed after guard");
+    RemoveVectoredExceptionHandler(veh);
+
+    /* Write-watch with PAGE_READONLY on subpage 0 and PAGE_READWRITE on subpage 1:
+       ResetWriteWatch and GetWriteWatch(WRITE_WATCH_FLAG_RESET) MUST strip host write
+       permission even though subpage 0 is read-only so subsequent writes to subpage 1
+       are still recorded dirty! */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch before mixed-RO test");
+    CHECK(VirtualProtect(ww + gran * 1, 0x1000, PAGE_READONLY, &old_prot), "subpage 0 PAGE_READONLY in write-watch page");
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1020) = 0x11112222u;
+    count = 32;
+    CHECK(GetWriteWatch(WRITE_WATCH_FLAG_RESET, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch RESET mixed-RO #1");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #1 recorded dirty");
+    /* Second write to writable sibling subpage 1 after RESET MUST trap again! */
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1024) = 0x33334444u;
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch mixed-RO #2");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #2 recorded dirty after GetWriteWatch RESET");
+    /* Same check via ResetWriteWatch! */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch mixed-RO");
+    *(volatile uint32_t *)(ww + gran * 1 + 0x1028) = 0x55556666u;
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch mixed-RO #3");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 1), "mixed-RO write #3 recorded dirty after ResetWriteWatch");
+    CHECK(VirtualProtect(ww + gran * 1, 0x1000, PAGE_READWRITE, &old_prot), "restore subpage 0 PAGE_READWRITE");
+
+    /* ResetWriteWatch clears dirty state and re-arms write traps. */
+    CHECK(ResetWriteWatch(ww, ww_size) == 0, "ResetWriteWatch");
+    count = 32;
+    CHECK(GetWriteWatch(0, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch after reset");
+    CHECK(count == 0, "0 dirty pages after ResetWriteWatch");
+
+    /* Writing page 2 after reset triggers a fresh write-watch record. */
+    *(volatile uint32_t *)(ww + gran * 2) = 0xCAFEBABEu;
+    count = 32;
+    CHECK(GetWriteWatch(WRITE_WATCH_FLAG_RESET, ww, ww_size, addrs, &count, &gran) == 0, "GetWriteWatch RESET");
+    CHECK(count == 1 && addrs[0] == (PVOID)(ww + gran * 2), "re-armed dirty page 2 recorded");
+    CHECK(VirtualFree(ww, 0, MEM_RELEASE), "VirtualFree write-watch region");
+    printf("CORPUS_KCORE: write_watch_hw ok\n");
+
+    /* 3. MEM_LARGE_PAGES without SeLockMemoryPrivilege + MEM_RESET/MEM_RESET_UNDO */
+    PVOID lp = VirtualAlloc(NULL, 2 * 1024 * 1024, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    CHECK(lp == NULL && GetLastError() == ERROR_PRIVILEGE_NOT_HELD, "MEM_LARGE_PAGES -> ERROR_PRIVILEGE_NOT_HELD");
+
+    uint8_t *rp = (uint8_t *)VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(rp != NULL, "VirtualAlloc reset region");
+    *(volatile uint64_t *)rp = 0x0123456789ABCDEFull;
+    CHECK(VirtualAlloc(rp, 0x10000, MEM_RESET, PAGE_READWRITE) == rp, "MEM_RESET");
+    PVOID undo = VirtualAlloc(rp, 0x10000, MEM_RESET_UNDO, PAGE_READWRITE);
+    if (undo != NULL) {
+        CHECK(*(volatile uint64_t *)rp == 0x0123456789ABCDEFull, "MEM_RESET_UNDO data intact");
+    }
+    CHECK(VirtualFree(rp, 0, MEM_RELEASE), "VirtualFree reset region");
+    printf("CORPUS_KCORE: mem_large_pages_and_reset_undo ok\n");
+
+    /* 4. SetThreadAffinityMask returns previous mask + FlushProcessWriteBuffers */
+    DWORD_PTR pm = 0, sm = 0;
+    CHECK(GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm != 0, "GetProcessAffinityMask");
+    DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), 1);
+    CHECK(prev == pm, "first SetThreadAffinityMask returns process mask");
+    DWORD_PTR prev2 = SetThreadAffinityMask(GetCurrentThread(), pm);
+    CHECK(prev2 == 1, "second SetThreadAffinityMask returns previous 1");
+    FlushProcessWriteBuffers();
+    printf("CORPUS_KCORE: affinity_and_flush ok\n");
+
+    printf("CORPUS_KCORE: PASS ALL\n");
+    fflush(stdout);
+    return 0;
+}
+"##;
+
+// ---------------------------------------------------------------------------
 // Backlog expected failure: user32.dll!wsprintfW / wsprintfA
 // ---------------------------------------------------------------------------
 
