@@ -157,8 +157,8 @@ fn create_device_qi_dxgi_and_unsupported_stages() {
         com_release(adp);
         com_release(dxgi_dev);
 
-        // CreateGeometryShader validates bytecode (E_INVALIDARG on null/empty);
-        // Hull / Domain shaders remain honest E_NOTIMPL.
+        // Geometry, Hull, and Domain shaders validate bytecode (E_INVALIDARG on null/empty);
+        // CreateGeometryShaderWithStreamOutput remains honest E_NOTIMPL.
         let create_gs: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
             std::mem::transmute(vtbl_slot(dev, 13));
         let mut gs: *mut c_void = std::ptr::null_mut();
@@ -168,8 +168,24 @@ fn create_device_qi_dxgi_and_unsupported_stages() {
         let create_hs: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
             std::mem::transmute(vtbl_slot(dev, 16));
         let mut hs: *mut c_void = std::ptr::null_mut();
-        assert_eq!(create_hs(dev, std::ptr::null(), 0, std::ptr::null_mut(), &mut hs), E_NOTIMPL);
+        assert_eq!(create_hs(dev, std::ptr::null(), 0, std::ptr::null_mut(), &mut hs), E_INVALIDARG);
         assert!(hs.is_null());
+
+        let create_ds: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 17));
+        let mut ds: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_ds(dev, std::ptr::null(), 0, std::ptr::null_mut(), &mut ds), E_INVALIDARG);
+        assert!(ds.is_null());
+
+        let create_gs_so: unsafe extern "win64" fn(
+            *mut c_void, *const c_void, usize, *const c_void, u32, *const u32, u32, u32, *mut c_void, *mut *mut c_void,
+        ) -> HRESULT = std::mem::transmute(vtbl_slot(dev, 14));
+        let mut gso: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            create_gs_so(dev, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0, 0, std::ptr::null_mut(), &mut gso),
+            E_NOTIMPL
+        );
+        assert!(gso.is_null());
 
         com_release(ctx);
         com_release(dev);
@@ -4100,6 +4116,339 @@ fn d3d11_device_context_state_class_linkage_and_counters() {
         com_release(prev_b);
         com_release(state_a);
         com_release(state_b);
+        com_release(ctx);
+        com_release(dev);
+    }
+}
+
+#[test]
+fn sm5_hull_domain_tessellation_draw_and_pipeline_stats_on_metal() {
+    if d3d12_metal::metal::device().is_none()
+        || !dxil_metal::converter_available()
+        || !dxil_metal::dxilconv::available()
+    {
+        return;
+    }
+    let words = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    const EMPTY_SIG: [u8; 8] = [0, 0, 0, 0, 8, 0, 0, 0];
+
+    // vs_5_0: pass-through POSITION control point (o0 = v0)
+    #[rustfmt::skip]
+    let vs_shex = words(&[
+        0x0001_0050, 14,
+        0x0300_005f, 0x0010_10f2, 0,          // dcl_input v0.xyzw
+        0x0300_0065, 0x0010_20f2, 0,          // dcl_output o0.xyzw
+        0x0500_0036, 0x0010_20f2, 0, 0x0010_1e46, 0, // mov o0.xyzw, v0.xyzw
+        0x0100_003e,                          // ret
+    ]);
+    let mut pos_isgn = words(&[1, 8, 32, 0, 0, 3, 0]);
+    pos_isgn.extend_from_slice(&[0x0f, 0x0f, 0, 0]);
+    pos_isgn.extend_from_slice(b"POSITION\0\0\0\0");
+    let mut pos_osgn = words(&[1, 8, 32, 0, 0, 3, 0]);
+    pos_osgn.extend_from_slice(&[0x0f, 0x00, 0, 0]);
+    pos_osgn.extend_from_slice(b"POSITION\0\0\0\0");
+    let vs_dxbc = dxil_metal::dxbc::build_container(&[
+        (*b"ISGN", &pos_isgn),
+        (*b"OSGN", &pos_osgn),
+        (*b"SHEX", &vs_shex),
+    ]);
+
+    // hs_5_0: 3-control-point triangle domain pass-through hull shader, tess factor = 2.0
+    #[rustfmt::skip]
+    let hs_shex = words(&[
+        0x0003_0050, 47,
+        0x0100_0071,                          // hs_decls
+        0x0100_1893,                          // dcl_input_control_point_count 3
+        0x0100_1894,                          // dcl_output_control_point_count 3
+        0x0100_1095,                          // dcl_tessellator_domain domain_tri
+        0x0100_0896,                          // dcl_tessellator_partitioning partitioning_integer
+        0x0100_1897,                          // dcl_tessellator_output_primitive output_triangle_cw
+        0x0200_0098, 0x4000_0000,             // dcl_hs_max_tessfactor l(2.0)
+        0x0100_0073,                          // hs_fork_phase
+        0x0400_0067, 0x0010_2012, 0, 13,      // dcl_output_siv o0.x, finalTriUeq0EdgeTessFactor
+        0x0400_0067, 0x0010_2012, 1, 13,      // dcl_output_siv o1.x, finalTriVeq0EdgeTessFactor
+        0x0400_0067, 0x0010_2012, 2, 13,      // dcl_output_siv o2.x, finalTriWeq0EdgeTessFactor
+        0x0400_0067, 0x0010_2012, 3, 14,      // dcl_output_siv o3.x, finalTriInsideTessFactor
+        0x0500_0036, 0x0010_2012, 0, 0x0000_4001, 0x4000_0000, // mov o0.x, l(2.0)
+        0x0500_0036, 0x0010_2012, 1, 0x0000_4001, 0x4000_0000, // mov o1.x, l(2.0)
+        0x0500_0036, 0x0010_2012, 2, 0x0000_4001, 0x4000_0000, // mov o2.x, l(2.0)
+        0x0500_0036, 0x0010_2012, 3, 0x0000_4001, 0x4000_0000, // mov o3.x, l(2.0)
+        0x0100_003e,                          // ret
+    ]);
+    // PCSG with 4 elements: 3x SV_TessFactor (sysval 13) + 1x SV_InsideTessFactor (sysval 14).
+    // Header: 8 bytes + 4 * 24 bytes = 104 bytes; string table starts at 104.
+    let mut pcsg = words(&[
+        4, 8,
+        104, 0, 13, 3, 0, 0x0000_0001, // SV_TessFactor[0], reg 0, mask x, rw_mask 0
+        104, 1, 13, 3, 1, 0x0000_0001, // SV_TessFactor[1], reg 1, mask x
+        104, 2, 13, 3, 2, 0x0000_0001, // SV_TessFactor[2], reg 2, mask x
+        120, 0, 14, 3, 3, 0x0000_0001, // SV_InsideTessFactor[0], reg 3, mask x
+    ]);
+    pcsg.extend_from_slice(b"SV_TessFactor\0\0\0");        // 16 bytes -> offset 104
+    pcsg.extend_from_slice(b"SV_InsideTessFactor\0");      // 20 bytes -> offset 120
+    let hs_dxbc = dxil_metal::dxbc::build_container(&[
+        (*b"ISGN", &pos_isgn),
+        (*b"OSGN", &pos_osgn),
+        (*b"PCSG", &pcsg),
+        (*b"SHEX", &hs_shex),
+    ]);
+
+    // ds_5_0: barycentric evaluation o0 = vDomain.x*vicp[0][0] + vDomain.y*vicp[1][0] + vDomain.z*vicp[2][0]
+    #[rustfmt::skip]
+    let ds_shex = words(&[
+        0x0004_0050, 42,
+        0x0100_1893,                          // dcl_input_control_point_count 3
+        0x0100_1095,                          // dcl_tessellator_domain domain_tri
+        0x0200_005f, 0x0001_c072,             // dcl_input vDomain.xyz
+        0x0400_005f, 0x0021_90f2, 3, 0,       // dcl_input vicp[3][0].xyzw
+        0x0400_0067, 0x0010_20f2, 0, 1,       // dcl_output_siv o0.xyzw, position
+        0x0200_0068, 1,                       // dcl_temps 1
+        0x0700_0038, 0x0010_00f2, 0, 0x0001_c006, 0x0021_9e46, 0, 0, // mul r0, vDomain.xxxx, vicp[0][0]
+        0x0900_0032, 0x0010_00f2, 0, 0x0001_c556, 0x0021_9e46, 1, 0, 0x0010_0e46, 0, // mad r0, vDomain.yyyy, vicp[1][0], r0
+        0x0900_0032, 0x0010_20f2, 0, 0x0001_caa6, 0x0021_9e46, 2, 0, 0x0010_0e46, 0, // mad o0, vDomain.zzzz, vicp[2][0], r0
+        0x0100_003e,                          // ret
+    ]);
+    let mut sv_pos_osgn = words(&[1, 8, 32, 0, 1, 3, 0]);
+    sv_pos_osgn.extend_from_slice(&[0x0f, 0x00, 0, 0]);
+    sv_pos_osgn.extend_from_slice(b"SV_Position\0");
+    let ds_dxbc = dxil_metal::dxbc::build_container(&[
+        (*b"ISGN", &pos_isgn),
+        (*b"OSGN", &sv_pos_osgn),
+        (*b"PCSG", &pcsg),
+        (*b"SHEX", &ds_shex),
+    ]);
+
+    // ps_5_0: output solid magenta (1.0, 0.0, 1.0, 1.0)
+    #[rustfmt::skip]
+    let ps_shex = words(&[
+        0x0000_0050, 14,
+        0x0300_0065, 0x0010_20f2, 0,
+        0x0800_0036, 0x0010_20f2, 0, 0x0000_4002, 0x3f80_0000, 0x0000_0000, 0x3f80_0000, 0x3f80_0000,
+        0x0100_003e,
+    ]);
+    let mut ps_osgn = words(&[1, 8, 32, 0, 0, 3, 0]);
+    ps_osgn.extend_from_slice(&[0x0f, 0x00, 0, 0]);
+    ps_osgn.extend_from_slice(b"SV_Target\0\0\0");
+    let ps_dxbc = dxil_metal::dxbc::build_container(&[
+        (*b"ISGN", &EMPTY_SIG),
+        (*b"OSGN", &ps_osgn),
+        (*b"SHEX", &ps_shex),
+    ]);
+
+    unsafe {
+        let mut dev: *mut c_void = std::ptr::null_mut();
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            D3D11CreateDevice(
+                std::ptr::null_mut(),
+                driver_type::HARDWARE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut dev,
+                std::ptr::null_mut(),
+                &mut ctx,
+            ),
+            S_OK
+        );
+
+        let create_buf: unsafe extern "win64" fn(*mut c_void, *const D3D11_BUFFER_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 3));
+        let create_tex2d: unsafe extern "win64" fn(*mut c_void, *const D3D11_TEXTURE2D_DESC, *const D3D11_SUBRESOURCE_DATA, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 5));
+        let create_rtv_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const D3D11_RENDER_TARGET_VIEW_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 9));
+        let create_il: unsafe extern "win64" fn(*mut c_void, *const D3D11_INPUT_ELEMENT_DESC, u32, *const c_void, usize, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 11));
+        let create_vs: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 12));
+        let create_ps: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 15));
+        let create_hs: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 16));
+        let create_ds: unsafe extern "win64" fn(*mut c_void, *const c_void, usize, *mut c_void, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 17));
+        let create_rs: unsafe extern "win64" fn(*mut c_void, *const D3D11_RASTERIZER_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 22));
+        let create_query: unsafe extern "win64" fn(*mut c_void, *const D3D11_QUERY_DESC, *mut *mut c_void) -> HRESULT =
+            std::mem::transmute(vtbl_slot(dev, 24));
+
+        let ps_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 9));
+        let vs_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 11));
+        let draw_fn: unsafe extern "win64" fn(*mut c_void, u32, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 13));
+        let map_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut D3D11_MAPPED_SUBRESOURCE) -> HRESULT =
+            std::mem::transmute(vtbl_slot(ctx, 14));
+        let unmap_fn: unsafe extern "win64" fn(*mut c_void, *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 15));
+        let ia_set_il: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 17));
+        let ia_set_vbs: unsafe extern "win64" fn(*mut c_void, u32, u32, *const *mut c_void, *const u32, *const u32) =
+            std::mem::transmute(vtbl_slot(ctx, 18));
+        let ia_set_topo: unsafe extern "win64" fn(*mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 24));
+        let begin_q: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 27));
+        let end_q: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 28));
+        let get_data: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> HRESULT =
+            std::mem::transmute(vtbl_slot(ctx, 29));
+        let om_set_rts: unsafe extern "win64" fn(*mut c_void, u32, *const *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 33));
+        let rs_set_st: unsafe extern "win64" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 43));
+        let rs_set_vp: unsafe extern "win64" fn(*mut c_void, u32, *const D3D11_VIEWPORT) =
+            std::mem::transmute(vtbl_slot(ctx, 44));
+        let copy_res: unsafe extern "win64" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(vtbl_slot(ctx, 47));
+        let clear_rtv: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const [f32; 4]) =
+            std::mem::transmute(vtbl_slot(ctx, 50));
+        let hs_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 60));
+        let ds_set: unsafe extern "win64" fn(*mut c_void, *mut c_void, *const *mut c_void, u32) =
+            std::mem::transmute(vtbl_slot(ctx, 64));
+        let hs_get: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32) =
+            std::mem::transmute(vtbl_slot(ctx, 98));
+        let ds_get: unsafe extern "win64" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32) =
+            std::mem::transmute(vtbl_slot(ctx, 102));
+
+        // 3 control points forming a fullscreen triangle patch.
+        let verts: [[f32; 4]; 3] = [
+            [-1.0, -1.0, 0.0, 1.0],
+            [-1.0,  3.0, 0.0, 1.0],
+            [ 3.0, -1.0, 0.0, 1.0],
+        ];
+        let vb_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 48,
+            Usage: usage::IMMUTABLE,
+            BindFlags: bind_flag::VERTEX_BUFFER,
+            ..Default::default()
+        };
+        let vb_init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: verts.as_ptr() as *const c_void,
+            SysMemPitch: 48,
+            SysMemSlicePitch: 48,
+        };
+        let td = D3D11_TEXTURE2D_DESC {
+            Width: 8,
+            Height: 8,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: usage::DEFAULT,
+            BindFlags: bind_flag::RENDER_TARGET,
+            ..Default::default()
+        };
+        let stg_td = D3D11_TEXTURE2D_DESC {
+            Usage: usage::STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: cpu_access::READ,
+            ..td
+        };
+
+        let (mut vb, mut rt, mut stg, mut rtv) = (
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+        );
+        let (mut vs, mut hs, mut ds, mut ps, mut il, mut rs, mut q_stats) = (
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(create_buf(dev, &vb_desc, &vb_init, &mut vb), S_OK);
+        assert_eq!(create_tex2d(dev, &td, std::ptr::null(), &mut rt), S_OK);
+        assert_eq!(create_tex2d(dev, &stg_td, std::ptr::null(), &mut stg), S_OK);
+        assert_eq!(create_rtv_fn(dev, rt, std::ptr::null(), &mut rtv), S_OK);
+        assert_eq!(create_vs(dev, vs_dxbc.as_ptr() as *const c_void, vs_dxbc.len(), std::ptr::null_mut(), &mut vs), S_OK);
+        assert_eq!(create_hs(dev, hs_dxbc.as_ptr() as *const c_void, hs_dxbc.len(), std::ptr::null_mut(), &mut hs), S_OK);
+        assert_eq!(create_ds(dev, ds_dxbc.as_ptr() as *const c_void, ds_dxbc.len(), std::ptr::null_mut(), &mut ds), S_OK);
+        assert_eq!(create_ps(dev, ps_dxbc.as_ptr() as *const c_void, ps_dxbc.len(), std::ptr::null_mut(), &mut ps), S_OK);
+        let ie = D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: b"POSITION\0".as_ptr(),
+            SemanticIndex: 0,
+            Format: 2,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: 0,
+            InstanceDataStepRate: 0,
+        };
+        assert_eq!(create_il(dev, &ie, 1, vs_dxbc.as_ptr() as *const c_void, vs_dxbc.len(), &mut il), S_OK);
+        let mut rdesc = D3D11_RASTERIZER_DESC::default_d3d11();
+        rdesc.CullMode = 1; // CULL_NONE
+        assert_eq!(create_rs(dev, &rdesc, &mut rs), S_OK);
+        let qd = D3D11_QUERY_DESC { Query: query_kind::PIPELINE_STATISTICS, MiscFlags: 0 };
+        assert_eq!(create_query(dev, &qd, &mut q_stats), S_OK);
+
+        let black = [0.0f32; 4];
+        clear_rtv(ctx, rtv, &black);
+        om_set_rts(ctx, 1, &rtv, std::ptr::null_mut());
+        let vp = D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: 8.0, Height: 8.0, MinDepth: 0.0, MaxDepth: 1.0 };
+        rs_set_vp(ctx, 1, &vp);
+        rs_set_st(ctx, rs);
+        ia_set_il(ctx, il);
+        let stride = 16u32;
+        let offset = 0u32;
+        ia_set_vbs(ctx, 0, 1, &vb, &stride, &offset);
+        ia_set_topo(ctx, topology::PATCHLIST_3);
+        vs_set(ctx, vs, std::ptr::null(), 0);
+        hs_set(ctx, hs, std::ptr::null(), 0);
+        ds_set(ctx, ds, std::ptr::null(), 0);
+        ps_set(ctx, ps, std::ptr::null(), 0);
+
+        // Verify HSGetShader and DSGetShader round-trip.
+        let mut got_hs: *mut c_void = std::ptr::null_mut();
+        let mut got_ds: *mut c_void = std::ptr::null_mut();
+        let mut nci = 0u32;
+        hs_get(ctx, &mut got_hs, std::ptr::null_mut(), &mut nci);
+        ds_get(ctx, &mut got_ds, std::ptr::null_mut(), &mut nci);
+        assert_eq!(got_hs, hs);
+        assert_eq!(got_ds, ds);
+        com_release(got_hs);
+        com_release(got_ds);
+
+        begin_q(ctx, q_stats);
+        draw_fn(ctx, 3, 0);
+        end_q(ctx, q_stats);
+
+        copy_res(ctx, stg, rt);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE { pData: std::ptr::null_mut(), RowPitch: 0, DepthPitch: 0 };
+        assert_eq!(map_fn(ctx, stg, 0, map_type::READ, 0, &mut mapped), S_OK);
+        // Solid magenta (255, 0, 255, 255) = 0xFFFF_00FF in RGBA8_UNORM.
+        let px0 = std::ptr::read_unaligned(mapped.pData as *const u32);
+        assert_eq!(px0, 0xFFFF_00FF, "HS+DS tessellated triangle patch must render magenta, got {px0:#010x}");
+        unmap_fn(ctx, stg, 0);
+
+        let mut stats = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+        assert_eq!(
+            get_data(
+                ctx,
+                q_stats,
+                &mut stats as *mut D3D11_QUERY_DATA_PIPELINE_STATISTICS as *mut c_void,
+                std::mem::size_of::<D3D11_QUERY_DATA_PIPELINE_STATISTICS>() as u32,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(stats.IAVertices, 3);
+        assert_eq!(stats.IAPrimitives, 1);
+        assert_eq!(stats.VSInvocations, 3);
+        assert_eq!(stats.HSInvocations, 1);
+
+        com_release(q_stats);
+        com_release(rs);
+        com_release(il);
+        com_release(ps);
+        com_release(ds);
+        com_release(hs);
+        com_release(vs);
+        com_release(rtv);
+        com_release(stg);
+        com_release(rt);
+        com_release(vb);
         com_release(ctx);
         com_release(dev);
     }

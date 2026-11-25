@@ -257,6 +257,10 @@ pub mod topology {
     pub const LINESTRIP_ADJ: u32 = 11;
     pub const TRIANGLELIST_ADJ: u32 = 12;
     pub const TRIANGLESTRIP_ADJ: u32 = 13;
+    pub const PATCHLIST_1: u32 = 33;
+    pub const PATCHLIST_3: u32 = 35;
+    pub const PATCHLIST_4: u32 = 36;
+    pub const PATCHLIST_32: u32 = 64;
 }
 
 // ---------------------------------------------------------------------------

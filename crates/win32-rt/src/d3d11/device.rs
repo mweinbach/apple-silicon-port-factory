@@ -729,19 +729,41 @@ unsafe extern "win64" fn create_geometry_shader_so(
 }
 
 unsafe extern "win64" fn create_hull_shader(
-    _this: PDev, _bc: *const c_void, _len: usize, _linkage: *mut c_void, out: *mut *mut c_void,
+    this: PDev,
+    bytecode: *const c_void,
+    len: usize,
+    _linkage: *mut c_void,
+    out: *mut *mut c_void,
 ) -> HRESULT {
     if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("ID3D11Device::CreateHullShader -> E_NOTIMPL");
-    E_NOTIMPL
+    let bytes = match validate_dxbc(bytecode, len, "Hull") {
+        Ok(b) => b,
+        Err(hr) => return hr,
+    };
+    if out.is_null() { return S_FALSE; }
+    let hash = dxil_metal::hash::hash128(&bytes);
+    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    std::ptr::write_unaligned(out, Obj::new(D3d11HullShader { inner }) as *mut c_void);
+    S_OK
 }
 
 unsafe extern "win64" fn create_domain_shader(
-    _this: PDev, _bc: *const c_void, _len: usize, _linkage: *mut c_void, out: *mut *mut c_void,
+    this: PDev,
+    bytecode: *const c_void,
+    len: usize,
+    _linkage: *mut c_void,
+    out: *mut *mut c_void,
 ) -> HRESULT {
     if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    stub!("ID3D11Device::CreateDomainShader -> E_NOTIMPL");
-    E_NOTIMPL
+    let bytes = match validate_dxbc(bytecode, len, "Domain") {
+        Ok(b) => b,
+        Err(hr) => return hr,
+    };
+    if out.is_null() { return S_FALSE; }
+    let hash = dxil_metal::hash::hash128(&bytes);
+    let inner = Arc::new(ShaderBlob { device: Obj::get(this).core.clone(), bytecode: bytes, hash });
+    std::ptr::write_unaligned(out, Obj::new(D3d11DomainShader { inner }) as *mut c_void);
+    S_OK
 }
 
 unsafe extern "win64" fn create_class_linkage(this: PDev, out: *mut *mut c_void) -> HRESULT {
@@ -927,6 +949,7 @@ unsafe fn create_query_inner(
             heap,
             slot,
             readback,
+            pipeline_stats: D3D11_QUERY_DATA_PIPELINE_STATISTICS::default(),
         }),
     });
     std::ptr::write_unaligned(out, Obj::new(D3d11Query { inner }) as *mut c_void);

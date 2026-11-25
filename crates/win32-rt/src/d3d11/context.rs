@@ -113,6 +113,23 @@ fn d3d11_topology_to_type(topo: u32) -> u32 {
     }
 }
 
+fn d3d11_primitives_per_instance(topo: u32, count: u64) -> u64 {
+    use d3d12_metal::topology::d3d;
+    match topo {
+        d3d::POINTLIST => count,
+        d3d::LINELIST => count / 2,
+        d3d::LINESTRIP => count.saturating_sub(1),
+        d3d::TRIANGLELIST => count / 3,
+        d3d::TRIANGLESTRIP | 6 /* TRIANGLEFAN */ => count.saturating_sub(2),
+        d3d::LINELIST_ADJ => count / 4,
+        d3d::LINESTRIP_ADJ => count.saturating_sub(3),
+        d3d::TRIANGLELIST_ADJ => count / 6,
+        d3d::TRIANGLESTRIP_ADJ => count.saturating_sub(4) / 2,
+        d3d::PATCHLIST_1..=d3d::PATCHLIST_32 => count / (topo - d3d::PATCHLIST_1 + 1) as u64,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Immediate Metal 4 execution backend (owned by DeviceCore)
 // ---------------------------------------------------------------------------
@@ -139,6 +156,7 @@ pub struct ImmediateExec {
     samp_cursor: u32,
     keep_alive: Vec<Box<dyn Send>>,
     pending_queries: Vec<Arc<QueryInner>>,
+    active_pipeline_stats: Vec<Arc<QueryInner>>,
 }
 unsafe impl Send for ImmediateExec {}
 
@@ -175,6 +193,7 @@ impl ImmediateExec {
             samp_cursor: 0,
             keep_alive: Vec::new(),
             pending_queries: Vec::new(),
+            active_pipeline_stats: Vec::new(),
         })
     }
 
@@ -338,6 +357,12 @@ pub struct ContextState {
     pub vs_com: ComRef,
     pub vs: Option<Arc<ShaderBlob>>,
     pub vs_ci: Vec<ComRef>,
+    pub hs_com: ComRef,
+    pub hs: Option<Arc<ShaderBlob>>,
+    pub hs_ci: Vec<ComRef>,
+    pub ds_com: ComRef,
+    pub ds: Option<Arc<ShaderBlob>>,
+    pub ds_ci: Vec<ComRef>,
     pub gs_com: ComRef,
     pub gs: Option<Arc<ShaderBlob>>,
     pub gs_ci: Vec<ComRef>,
@@ -395,6 +420,12 @@ impl Default for ContextState {
             vs_com: ComRef::default(),
             vs: None,
             vs_ci: Vec::new(),
+            hs_com: ComRef::default(),
+            hs: None,
+            hs_ci: Vec::new(),
+            ds_com: ComRef::default(),
+            ds: None,
+            ds_ci: Vec::new(),
             gs_com: ComRef::default(),
             gs: None,
             gs_ci: Vec::new(),
@@ -585,6 +616,8 @@ fn get_or_build_gfx_pso(
     indexed: bool,
 ) -> Result<Arc<GraphicsPipeline>, String> {
     let vs = st.vs.as_ref().ok_or("no vertex shader bound")?;
+    let hs = st.hs.as_ref();
+    let ds = st.ds.as_ref();
     let gs = st.gs.as_ref();
     let ps = st.ps.as_ref();
 
@@ -641,6 +674,8 @@ fn get_or_build_gfx_pso(
 
     let key = GraphicsPsoKey {
         vs_hash: vs.hash,
+        hs_hash: hs.map_or(0, |h| h.hash),
+        ds_hash: ds.map_or(0, |d| d.hash),
         gs_hash: gs.map_or(0, |g| g.hash),
         ps_hash: ps.map_or(0, |p| p.hash),
         il_hash: st.input_layout.as_ref().map_or(0, |il| il.hash),
@@ -675,9 +710,22 @@ fn get_or_build_gfx_pso(
         sample_count,
     };
     let label = format!("d3d11_gfx_{:016x}", vs.hash as u64);
-    let pso = Arc::new(match gs {
-        Some(g) => GraphicsPipeline::new_with_geometry(device.gfx_rs.clone(), &gdesc, &g.bytecode, &label)?,
-        None => GraphicsPipeline::new(device.gfx_rs.clone(), &gdesc, &label)?,
+    let pso = Arc::new(match (hs, ds, gs) {
+        (Some(h), Some(d), g) => GraphicsPipeline::new_with_tessellation(
+            device.gfx_rs.clone(),
+            &gdesc,
+            &h.bytecode,
+            &d.bytecode,
+            g.map(|gs| gs.bytecode.as_slice()),
+            &label,
+        )?,
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err("D3D11 tessellation requires both Hull and Domain shaders to be bound".into());
+        }
+        (None, None, Some(g)) => {
+            GraphicsPipeline::new_with_geometry(device.gfx_rs.clone(), &gdesc, &g.bytecode, &label)?
+        }
+        (None, None, None) => GraphicsPipeline::new(device.gfx_rs.clone(), &gdesc, &label)?,
     });
     device.gfx_psos.lock().unwrap().insert(key, pso.clone());
     Ok(pso)
@@ -698,6 +746,8 @@ fn sync_stage_shared(device: &DeviceCore, bind: &StageBindings) {
 
 fn sync_state_shared(device: &DeviceCore, st: &ContextState) {
     sync_stage_shared(device, &st.vs_bind);
+    sync_stage_shared(device, &st.hs_bind);
+    sync_stage_shared(device, &st.ds_bind);
     sync_stage_shared(device, &st.gs_bind);
     sync_stage_shared(device, &st.ps_bind);
     sync_stage_shared(device, &st.cs_bind);
@@ -961,7 +1011,13 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
             let mut rt = q.rt.lock().unwrap();
             rt.ended = false;
             rt.submitted = false;
-            if matches!(q.desc.Query, query_kind::OCCLUSION | query_kind::OCCLUSION_PREDICATE) {
+            if q.desc.Query == query_kind::PIPELINE_STATISTICS {
+                rt.pipeline_stats = D3D11_QUERY_DATA_PIPELINE_STATISTICS::default();
+                drop(rt);
+                if !exec.active_pipeline_stats.iter().any(|existing| Arc::ptr_eq(existing, q)) {
+                    exec.active_pipeline_stats.push(q.clone());
+                }
+            } else if matches!(q.desc.Query, query_kind::OCCLUSION | query_kind::OCCLUSION_PREDICATE) {
                 if let Some(heap) = rt.heap.clone() {
                     let binary = q.desc.Query == query_kind::OCCLUSION_PREDICATE;
                     if let Err(e) = exec.cl.begin_occlusion(&heap, 0, binary) {
@@ -978,6 +1034,9 @@ unsafe fn exec_recorded_cmd(device: &DeviceCore, cmd: &RecordedCmd) {
             rt.ended = true;
             rt.submitted = false;
             match q.desc.Query {
+                query_kind::PIPELINE_STATISTICS => {
+                    exec.active_pipeline_stats.retain(|existing| !Arc::ptr_eq(existing, q));
+                }
                 query_kind::TIMESTAMP => {
                     if let (Some(heap), Some(rb)) = (rt.heap.clone(), rt.readback.clone()) {
                         let slot = rt.slot;
@@ -1139,7 +1198,7 @@ unsafe fn prepare_gfx_draw(
 ) -> Result<(), String> {
     let pso = get_or_build_gfx_pso(device, st, indexed)?;
 
-    // Allocate VS + PS (+ optional GS) resource & sampler descriptor tables.
+    // Allocate VS + PS (+ optional GS / HS / DS) resource & sampler descriptor tables.
     let (vs_res_cpu, vs_res_gpu) = exec.alloc_res_slots(VS_RES_TABLE_LEN)?;
     let (ps_res_cpu, ps_res_gpu) = exec.alloc_res_slots(PS_RES_TABLE_LEN)?;
     let (vs_samp_cpu, vs_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
@@ -1150,6 +1209,24 @@ unsafe fn prepare_gfx_draw(
         populate_stage_table(exec, gs_res_cpu, &st.gs_bind, None);
         populate_sampler_table(gs_samp_cpu, &st.gs_bind);
         Some((gs_res_gpu, gs_samp_gpu))
+    } else {
+        None
+    };
+    let hs_tables = if st.hs.is_some() {
+        let (hs_res_cpu, hs_res_gpu) = exec.alloc_res_slots(HS_RES_TABLE_LEN)?;
+        let (hs_samp_cpu, hs_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
+        populate_stage_table(exec, hs_res_cpu, &st.hs_bind, None);
+        populate_sampler_table(hs_samp_cpu, &st.hs_bind);
+        Some((hs_res_gpu, hs_samp_gpu))
+    } else {
+        None
+    };
+    let ds_tables = if st.ds.is_some() {
+        let (ds_res_cpu, ds_res_gpu) = exec.alloc_res_slots(DS_RES_TABLE_LEN)?;
+        let (ds_samp_cpu, ds_samp_gpu) = exec.alloc_samp_slots(RS_SAMPLER_COUNT)?;
+        populate_stage_table(exec, ds_res_cpu, &st.ds_bind, None);
+        populate_sampler_table(ds_samp_cpu, &st.ds_bind);
+        Some((ds_res_gpu, ds_samp_gpu))
     } else {
         None
     };
@@ -1192,7 +1269,15 @@ unsafe fn prepare_gfx_draw(
     // Implicit D3D11 resource hazard barriers: prior render/copy/compute writes to
     // bound SRVs, OM UAVs, or indirect argument buffers must complete before this draw.
     let mut barriers = Vec::new();
-    for slot in st.vs_bind.srvs.iter().chain(st.gs_bind.srvs.iter()).chain(st.ps_bind.srvs.iter()) {
+    for slot in st
+        .vs_bind
+        .srvs
+        .iter()
+        .chain(st.hs_bind.srvs.iter())
+        .chain(st.ds_bind.srvs.iter())
+        .chain(st.gs_bind.srvs.iter())
+        .chain(st.ps_bind.srvs.iter())
+    {
         if let Some(srv) = &slot.srv {
             let mtl = srv.resource.current_mtl();
             let ptr = Arc::as_ptr(&mtl) as usize;
@@ -1231,6 +1316,14 @@ unsafe fn prepare_gfx_draw(
     if let Some((gs_res_gpu, gs_samp_gpu)) = gs_tables {
         exec.cl.gfx_root.set_table(4, gs_res_gpu)?;
         exec.cl.gfx_root.set_table(5, gs_samp_gpu)?;
+    }
+    if let Some((hs_res_gpu, hs_samp_gpu)) = hs_tables {
+        exec.cl.gfx_root.set_table(6, hs_res_gpu)?;
+        exec.cl.gfx_root.set_table(7, hs_samp_gpu)?;
+    }
+    if let Some((ds_res_gpu, ds_samp_gpu)) = ds_tables {
+        exec.cl.gfx_root.set_table(8, ds_res_gpu)?;
+        exec.cl.gfx_root.set_table(9, ds_samp_gpu)?;
     }
 
     exec.cl.set_render_targets(rtv_views, dsv_view);
@@ -1297,6 +1390,23 @@ unsafe fn exec_draw(
         exec.cl.draw_indexed(count, instances, start_index, base_vertex, start_instance)?;
     } else {
         exec.cl.draw(count, instances, start_vertex, start_instance)?;
+    }
+    if !exec.active_pipeline_stats.is_empty() {
+        let verts = (count as u64).saturating_mul(instances as u64);
+        let prims = d3d11_primitives_per_instance(st.topology, count as u64)
+            .saturating_mul(instances as u64);
+        for q in &exec.active_pipeline_stats {
+            let mut rt = q.rt.lock().unwrap();
+            rt.pipeline_stats.IAVertices = rt.pipeline_stats.IAVertices.saturating_add(verts);
+            rt.pipeline_stats.IAPrimitives = rt.pipeline_stats.IAPrimitives.saturating_add(prims);
+            rt.pipeline_stats.VSInvocations = rt.pipeline_stats.VSInvocations.saturating_add(verts);
+            if st.gs.is_some() {
+                rt.pipeline_stats.GSInvocations = rt.pipeline_stats.GSInvocations.saturating_add(prims);
+            }
+            if st.hs.is_some() {
+                rt.pipeline_stats.HSInvocations = rt.pipeline_stats.HSInvocations.saturating_add(prims);
+            }
+        }
     }
     exec.has_work = true;
     Ok(())
@@ -1377,6 +1487,24 @@ unsafe fn exec_dispatch(
     exec.cl.barrier();
     exec.cl.dispatch(x, y, z)?;
     exec.cl.barrier();
+    if !exec.active_pipeline_stats.is_empty() {
+        let tg = st
+            .cs
+            .as_ref()
+            .and_then(|cs| cs.pipeline().ok())
+            .map(|p| p.threadgroup)
+            .unwrap_or([1, 1, 1]);
+        let threads = (x as u64)
+            .saturating_mul(y as u64)
+            .saturating_mul(z as u64)
+            .saturating_mul(tg[0].max(1) as u64)
+            .saturating_mul(tg[1].max(1) as u64)
+            .saturating_mul(tg[2].max(1) as u64);
+        for q in &exec.active_pipeline_stats {
+            let mut rt = q.rt.lock().unwrap();
+            rt.pipeline_stats.CSInvocations = rt.pipeline_stats.CSInvocations.saturating_add(threads);
+        }
+    }
     exec.has_work = true;
     Ok(())
 }
@@ -2008,11 +2136,17 @@ unsafe extern "win64" fn gs_set_shader(this: PCtx, shader: *mut c_void, ci: *con
     st.gs = gs_from_ptr(shader);
     st.gs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn hs_set_shader(_this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
-    if !shader.is_null() { stub!("HSSetShader(non-null) ignored"); }
+unsafe extern "win64" fn hs_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+    let mut st = Obj::get(this).state.lock().unwrap();
+    st.hs_com = ComRef::from_borrowed(shader);
+    st.hs = hs_from_ptr(shader);
+    st.hs_ci = capture_class_instances(ci, nci);
 }
-unsafe extern "win64" fn ds_set_shader(_this: PCtx, shader: *mut c_void, _ci: *const *mut c_void, _nci: u32) {
-    if !shader.is_null() { stub!("DSSetShader(non-null) ignored"); }
+unsafe extern "win64" fn ds_set_shader(this: PCtx, shader: *mut c_void, ci: *const *mut c_void, nci: u32) {
+    let mut st = Obj::get(this).state.lock().unwrap();
+    st.ds_com = ComRef::from_borrowed(shader);
+    st.ds = domain_shader_from_ptr(shader);
+    st.ds_ci = capture_class_instances(ci, nci);
 }
 
 unsafe extern "win64" fn vs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
@@ -2035,13 +2169,15 @@ unsafe extern "win64" fn gs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *m
     st.gs_com.copy_out(out);
     copy_class_instances_out(&st.gs_ci, ci, nci);
 }
-unsafe extern "win64" fn hs_get_shader(_this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn hs_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.hs_com.copy_out(out);
+    copy_class_instances_out(&st.hs_ci, ci, nci);
 }
-unsafe extern "win64" fn ds_get_shader(_this: PCtx, out: *mut *mut c_void, _ci: *mut *mut c_void, nci: *mut u32) {
-    if !out.is_null() { std::ptr::write_unaligned(out, std::ptr::null_mut()); }
-    if !nci.is_null() { std::ptr::write_unaligned(nci, 0); }
+unsafe extern "win64" fn ds_get_shader(this: PCtx, out: *mut *mut c_void, ci: *mut *mut c_void, nci: *mut u32) {
+    let st = Obj::get(this).state.lock().unwrap();
+    st.ds_com.copy_out(out);
+    copy_class_instances_out(&st.ds_ci, ci, nci);
 }
 
 // ---------------------------------------------------------------------------
@@ -2952,8 +3088,14 @@ unsafe extern "win64" fn get_data(
                 std::ptr::write_unaligned(data as *mut BOOL, if samples != 0 { TRUE } else { FALSE });
             }
             query_kind::PIPELINE_STATISTICS => {
-                stub!("GetData(PIPELINE_STATISTICS) returning zeroes");
-                std::ptr::write_bytes(data as *mut u8, 0, need as usize);
+                // CPU-submitted counters (IAVertices, IAPrimitives, VS/GS/HS/CSInvocations)
+                // are accumulated during Begin..End, while GPU-side counters (CInvocations,
+                // CPrimitives, PSInvocations, GSPrimitives, DSInvocations, and indirect draw
+                // counts) cannot be sampled on Apple Silicon because Metal 4's
+                // MTL4CounterHeapType only provides timestamps (no MTLCommonCounterSetStatistic).
+                stub!("GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon");
+                let stats = q.rt.lock().unwrap().pipeline_stats;
+                std::ptr::write_unaligned(data as *mut D3D11_QUERY_DATA_PIPELINE_STATISTICS, stats);
             }
             _ => {
                 std::ptr::write_bytes(data as *mut u8, 0, need as usize);

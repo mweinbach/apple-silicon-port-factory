@@ -32,6 +32,8 @@ pub const RS_SAMPLER_COUNT: u32 = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT as u32; 
 pub const VS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT; // 142
 pub const PS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT + RS_UAV_COUNT; // 150
 pub const GS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT; // 142
+pub const HS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT; // 142
+pub const DS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT; // 142
 pub const CS_RES_TABLE_LEN: u32 = RS_CBV_COUNT + RS_SRV_COUNT + RS_UAV_COUNT; // 150
 
 fn range(ty: DescriptorRangeType, n: u32) -> DescriptorRange {
@@ -56,6 +58,10 @@ fn range(ty: DescriptorRangeType, n: u32) -> DescriptorRange {
 /// - Param 3 (PS): `[Sampler s0..15]`
 /// - Param 4 (GS): `[CBV b0..13, SRV t0..127]`
 /// - Param 5 (GS): `[Sampler s0..15]`
+/// - Param 6 (HS): `[CBV b0..13, SRV t0..127]`
+/// - Param 7 (HS): `[Sampler s0..15]`
+/// - Param 8 (DS): `[CBV b0..13, SRV t0..127]`
+/// - Param 9 (DS): `[Sampler s0..15]`
 pub fn build_graphics_root_signature() -> Arc<RootSignature> {
     let desc = RootSignatureDesc {
         version: RootSignatureVersion::V1_1,
@@ -93,6 +99,28 @@ pub fn build_graphics_root_signature() -> Arc<RootSignature> {
             RootParameter {
                 kind: RootParameterKind::DescriptorTable(vec![range(DescriptorRangeType::Sampler, RS_SAMPLER_COUNT)]),
                 visibility: 4, // GEOMETRY
+            },
+            RootParameter {
+                kind: RootParameterKind::DescriptorTable(vec![
+                    range(DescriptorRangeType::Cbv, RS_CBV_COUNT),
+                    range(DescriptorRangeType::Srv, RS_SRV_COUNT),
+                ]),
+                visibility: 2, // HULL
+            },
+            RootParameter {
+                kind: RootParameterKind::DescriptorTable(vec![range(DescriptorRangeType::Sampler, RS_SAMPLER_COUNT)]),
+                visibility: 2, // HULL
+            },
+            RootParameter {
+                kind: RootParameterKind::DescriptorTable(vec![
+                    range(DescriptorRangeType::Cbv, RS_CBV_COUNT),
+                    range(DescriptorRangeType::Srv, RS_SRV_COUNT),
+                ]),
+                visibility: 3, // DOMAIN
+            },
+            RootParameter {
+                kind: RootParameterKind::DescriptorTable(vec![range(DescriptorRangeType::Sampler, RS_SAMPLER_COUNT)]),
+                visibility: 3, // DOMAIN
             },
         ],
         static_samplers: Vec::new(),
@@ -175,6 +203,12 @@ impl ComputeShaderInner {
 pub struct D3d11VertexShader {
     pub inner: Arc<ShaderBlob>,
 }
+pub struct D3d11HullShader {
+    pub inner: Arc<ShaderBlob>,
+}
+pub struct D3d11DomainShader {
+    pub inner: Arc<ShaderBlob>,
+}
 pub struct D3d11GeometryShader {
     pub inner: Arc<ShaderBlob>,
 }
@@ -188,6 +222,12 @@ pub struct D3d11ComputeShader {
 impl HasDeviceCore for D3d11VertexShader {
     fn device_core(&self) -> &Arc<DeviceCore> { &self.inner.device }
 }
+impl HasDeviceCore for D3d11HullShader {
+    fn device_core(&self) -> &Arc<DeviceCore> { &self.inner.device }
+}
+impl HasDeviceCore for D3d11DomainShader {
+    fn device_core(&self) -> &Arc<DeviceCore> { &self.inner.device }
+}
 impl HasDeviceCore for D3d11GeometryShader {
     fn device_core(&self) -> &Arc<DeviceCore> { &self.inner.device }
 }
@@ -199,6 +239,8 @@ impl HasDeviceCore for D3d11ComputeShader {
 }
 
 static VS_CLASS: OnceLock<Class> = OnceLock::new();
+static HS_CLASS: OnceLock<Class> = OnceLock::new();
+static DOMAIN_SHADER_CLASS: OnceLock<Class> = OnceLock::new();
 static GS_CLASS: OnceLock<Class> = OnceLock::new();
 static PS_CLASS: OnceLock<Class> = OnceLock::new();
 static CS_CLASS: OnceLock<Class> = OnceLock::new();
@@ -213,6 +255,36 @@ impl ComClass for D3d11VertexShader {
                 name: "ID3D11VertexShader",
                 vtbl: build_vtable("ID3D11VertexShader", &s),
                 iids: &[IID_ID3D11DeviceChild, IID_ID3D11VertexShader],
+            }
+        })
+    }
+}
+
+impl ComClass for D3d11HullShader {
+    const TRACE_RELEASE: bool = false;
+    fn class() -> &'static Class {
+        class_once(&HS_CLASS, || {
+            let s = child_slots::<D3d11HullShader>();
+            debug_assert_eq!(s.len(), 7);
+            Class {
+                name: "ID3D11HullShader",
+                vtbl: build_vtable("ID3D11HullShader", &s),
+                iids: &[IID_ID3D11DeviceChild, IID_ID3D11HullShader],
+            }
+        })
+    }
+}
+
+impl ComClass for D3d11DomainShader {
+    const TRACE_RELEASE: bool = false;
+    fn class() -> &'static Class {
+        class_once(&DOMAIN_SHADER_CLASS, || {
+            let s = child_slots::<D3d11DomainShader>();
+            debug_assert_eq!(s.len(), 7);
+            Class {
+                name: "ID3D11DomainShader",
+                vtbl: build_vtable("ID3D11DomainShader", &s),
+                iids: &[IID_ID3D11DeviceChild, IID_ID3D11DomainShader],
             }
         })
     }
@@ -493,6 +565,7 @@ pub struct QueryRuntime {
     pub heap: Option<Arc<QueryHeap>>,
     pub slot: u32,
     pub readback: Option<Arc<MtlResource>>,
+    pub pipeline_stats: D3D11_QUERY_DATA_PIPELINE_STATISTICS,
 }
 
 pub struct QueryInner {
@@ -611,6 +684,8 @@ impl ComClass for D3d11CommandList {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct GraphicsPsoKey {
     pub vs_hash: u128,
+    pub hs_hash: u128,
+    pub ds_hash: u128,
     pub gs_hash: u128,
     pub ps_hash: u128,
     pub il_hash: u128,
@@ -649,6 +724,12 @@ pub fn hash_raster_desc(d: &D3D11_RASTERIZER_DESC1) -> u64 {
 /// Extract `Arc` helpers from COM pointers.
 pub unsafe fn vs_from_ptr(p: *mut c_void) -> Option<Arc<ShaderBlob>> {
     Obj::<D3d11VertexShader>::from_iface(p).map(|o| Obj::get(o).inner.clone())
+}
+pub unsafe fn hs_from_ptr(p: *mut c_void) -> Option<Arc<ShaderBlob>> {
+    Obj::<D3d11HullShader>::from_iface(p).map(|o| Obj::get(o).inner.clone())
+}
+pub unsafe fn domain_shader_from_ptr(p: *mut c_void) -> Option<Arc<ShaderBlob>> {
+    Obj::<D3d11DomainShader>::from_iface(p).map(|o| Obj::get(o).inner.clone())
 }
 pub unsafe fn gs_from_ptr(p: *mut c_void) -> Option<Arc<ShaderBlob>> {
     Obj::<D3d11GeometryShader>::from_iface(p).map(|o| Obj::get(o).inner.clone())
