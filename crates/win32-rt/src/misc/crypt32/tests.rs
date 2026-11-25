@@ -3490,6 +3490,7 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert_eq!(CryptMsgClose(h_bare), TRUE);
 
         // 4. CryptVerifyMessageSignature (valid + tampered rejection)
+        // 4a. RFC 5652 v3 SignerInfo using subjectKeyIdentifier (tag 0x80)
         #[repr(C)]
         struct VerifyPara {
             cb_size: u32,
@@ -3505,6 +3506,55 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
             pfn: 0,
             arg: std::ptr::null_mut(),
         };
+        let ski_cms = self::test_vectors::CMS_SIGNED_SKI_DER;
+        let mut ski_dec = [0u8; 64];
+        let mut ski_dec_len = 64u32;
+        let mut ski_signer_cert: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                ski_cms.as_ptr(),
+                ski_cms.len() as u32,
+                ski_dec.as_mut_ptr(),
+                &mut ski_dec_len,
+                &mut ski_signer_cert,
+            ),
+            TRUE,
+            "CMS v3 subjectKeyIdentifier SignerInfo must verify against embedded cert"
+        );
+        assert_eq!(&ski_dec[..ski_dec_len as usize], b"Hello CMS SKI World!");
+        assert!(!ski_signer_cert.is_null());
+        let mut ski_cn = [0u8; 64];
+        CertGetNameStringA(
+            ski_signer_cert,
+            4,
+            0,
+            std::ptr::null_mut(),
+            ski_cn.as_mut_ptr(),
+            ski_cn.len() as u32,
+        );
+        assert_eq!(crate::strings::from_ansi(ski_cn.as_ptr()), "CmsSkiTest");
+        assert_eq!(CertFreeCertificateContext(ski_signer_cert), TRUE);
+
+        // Tampering 1 byte of the v3 SKI CMS signature must fail with NTE_BAD_SIGNATURE
+        let mut bad_ski_cms = ski_cms.to_vec();
+        let last = bad_ski_cms.len() - 1;
+        bad_ski_cms[last] ^= 0x01;
+        assert_eq!(
+            CryptVerifyMessageSignature(
+                &vp as *const _ as *const c_void,
+                0,
+                bad_ski_cms.as_ptr(),
+                bad_ski_cms.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            FALSE
+        );
+        assert_eq!(crate::teb::last_error(), 0x8009_0006); // NTE_BAD_SIGNATURE
+
         let mut dec = [0u8; 64];
         let mut dec_len = 64u32;
         let mut signer_cert: *mut c_void = std::ptr::null_mut();
@@ -3968,6 +4018,191 @@ fn macos_trust_store_and_extended_chain_policies() {
             TRUE
         );
         assert_eq!(status.dw_error, 0);
+
+        // BASIC_CONSTRAINTS distinguishes an issuer/legacy root with NO Basic Constraints
+        // extension (valid per MSDN) from an issuer carrying explicit BasicConstraints(cA=FALSE)
+        // (rejected with TRUST_E_BASIC_CONSTRAINTS).
+        let legacy_leaf_der = build_synthetic_cert(
+            "legacy-leaf.example",
+            "Legacy Root No BC",
+            b"200101000000Z",
+            b"400101000000Z",
+            None,
+            &[],
+        );
+        let legacy_root_no_bc = build_synthetic_cert(
+            "Legacy Root No BC",
+            "Legacy Root No BC",
+            b"200101000000Z",
+            b"400101000000Z",
+            None,
+            &[],
+        );
+        let legacy_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            legacy_leaf_der.as_ptr(),
+            legacy_leaf_der.len() as u32,
+        );
+        let legacy_extra = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                legacy_extra,
+                X509_ASN_ENCODING,
+                legacy_root_no_bc.as_ptr(),
+                legacy_root_no_bc.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut legacy_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                legacy_leaf_ctx,
+                std::ptr::null(),
+                legacy_extra,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut legacy_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                legacy_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            status.dw_error, 0,
+            "issuer/legacy root without Basic Constraints extension must pass BASIC_CONSTRAINTS policy"
+        );
+        CertFreeCertificateChain(legacy_chain);
+        CertCloseStore(legacy_extra, 0);
+
+        // Issuer with explicit BasicConstraints(cA=FALSE) (empty SEQUENCE {} -> cA defaults FALSE)
+        // MUST fail with TRUST_E_BASIC_CONSTRAINTS at element index 1.
+        let bc_false_ext = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x55, 0x1D, 0x13]), // 2.5.29.19 Basic Constraints
+                encode_der_tlv(0x04, &encode_der_tlv(0x30, &[])), // SEQUENCE { } -> cA=FALSE
+            ]
+            .concat(),
+        );
+        let non_ca_issuer_dn = encode_der_tlv(
+            0x30,
+            &encode_der_tlv(
+                0x31,
+                &encode_der_tlv(
+                    0x30,
+                    &[encode_der_tlv(0x06, &[0x55, 0x04, 0x03]), encode_der_tlv(0x0C, b"Explicit NonCA")]
+                        .concat(),
+                ),
+            ),
+        );
+        let non_ca_alg = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B]),
+                encode_der_tlv(0x05, &[]),
+            ]
+            .concat(),
+        );
+        let non_ca_spki = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(
+                    0x30,
+                    &[
+                        encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]),
+                        encode_der_tlv(0x05, &[]),
+                    ]
+                    .concat(),
+                ),
+                encode_der_tlv(0x03, &[0x00, 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x03]),
+            ]
+            .concat(),
+        );
+        let non_ca_tbs = encode_der_tlv(
+            0x30,
+            &[
+                encode_der_tlv(0xA0, &encode_der_tlv(0x02, &[0x02])),
+                encode_der_tlv(0x02, &[0x07]),
+                non_ca_alg.clone(),
+                non_ca_issuer_dn.clone(),
+                encode_der_tlv(
+                    0x30,
+                    &[encode_der_tlv(0x17, b"200101000000Z"), encode_der_tlv(0x17, b"400101000000Z")]
+                        .concat(),
+                ),
+                non_ca_issuer_dn,
+                non_ca_spki,
+                encode_der_tlv(0xA3, &encode_der_tlv(0x30, &bc_false_ext)),
+            ]
+            .concat(),
+        );
+        let non_ca_issuer_der = encode_der_tlv(
+            0x30,
+            &[non_ca_tbs, non_ca_alg, encode_der_tlv(0x03, &[0x00, 0x01, 0x02])].concat(),
+        );
+        let non_ca_extra = CertOpenStore(
+            super::store::CERT_STORE_PROV_MEMORY as *const u8,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CertAddEncodedCertificateToStore(
+                non_ca_extra,
+                X509_ASN_ENCODING,
+                non_ca_issuer_der.as_ptr(),
+                non_ca_issuer_der.len() as u32,
+                4,
+                std::ptr::null_mut(),
+            ),
+            TRUE
+        );
+        let mut non_ca_chain: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                std::ptr::null_mut(),
+                legacy_leaf_ctx,
+                std::ptr::null(),
+                non_ca_extra,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut non_ca_chain,
+            ),
+            TRUE
+        );
+        assert_eq!(
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASIC_CONSTRAINTS as *const u8,
+                non_ca_chain,
+                std::ptr::null(),
+                &mut status as *mut _ as *mut c_void,
+            ),
+            TRUE
+        );
+        assert_eq!(status.dw_error, 0x8009_6019); // TRUST_E_BASIC_CONSTRAINTS
+        assert_eq!(status.l_element_index, 1);
+        CertFreeCertificateChain(non_ca_chain);
+        CertCloseStore(non_ca_extra, 0);
+        CertFreeCertificateContext(legacy_leaf_ctx);
 
         // MICROSOFT_ROOT fails with CERT_E_UNTRUSTEDROOT on non-Microsoft cert even when trusted
         // by an exclusive root engine, AND NT_AUTH enforces Enterprise NTAuth issuer authorization

@@ -2107,8 +2107,12 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             }
         }
         CERT_CHAIN_POLICY_BASIC_CONSTRAINTS => {
-            // Check Basic Constraints extension (2.5.29.19) across the chain.
-            const OID_BC: &[u8] = &[0x55, 0x1D, 0x13];
+            // Check Basic Constraints extension (2.5.29.19 / legacy 2.5.29.10) across the chain.
+            // Per MSDN CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_BASIC_CONSTRAINTS):
+            // if a certificate has neither Basic Constraints extension, it is considered valid
+            // (legacy roots/issuers without Basic Constraints are not treated as explicit non-CAs).
+            const OID_BC2: &[u8] = &[0x55, 0x1D, 0x13];
+            const OID_BC1: &[u8] = &[0x55, 0x1D, 0x0A];
             let require_ca_leaf = (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG) != 0;
             let require_ee_leaf =
                 (dw_flags & BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_END_ENTITY_FLAG) != 0;
@@ -2117,15 +2121,40 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 let Some(parts) = parse_cert_der_parts(der) else {
                     continue;
                 };
+                let mut has_bc = false;
                 let mut is_ca = false;
+                let mut is_ee = false;
                 let mut path_len: Option<usize> = None;
                 for (oid, _, val) in &parts.extensions {
-                    if *oid == OID_BC {
+                    if *oid == OID_BC2 {
+                        has_bc = true;
+                        let mut ca_flag = false;
                         if let Some((seq, _)) = parse_der_item(val) {
                             if let Some(kids) = der_item_children(seq.val) {
                                 for k in kids {
                                     if k.tag == 0x01 {
-                                        is_ca = k.val.first().copied().unwrap_or(0) != 0;
+                                        ca_flag = k.val.first().copied().unwrap_or(0) != 0;
+                                    } else if k.tag == 0x02 && !k.val.is_empty() {
+                                        let mut v = 0usize;
+                                        for &b in k.val {
+                                            v = (v << 8) | (b as usize);
+                                        }
+                                        path_len = Some(v);
+                                    }
+                                }
+                            }
+                        }
+                        is_ca = ca_flag;
+                        is_ee = !ca_flag;
+                    } else if *oid == OID_BC1 && !has_bc {
+                        has_bc = true;
+                        if let Some((seq, _)) = parse_der_item(val) {
+                            if let Some(kids) = der_item_children(seq.val) {
+                                for k in kids {
+                                    if k.tag == 0x03 && k.val.len() >= 2 {
+                                        let bits = k.val[1];
+                                        is_ca = (bits & 0x80) != 0;
+                                        is_ee = (bits & 0x40) != 0;
                                     } else if k.tag == 0x02 && !k.val.is_empty() {
                                         let mut v = 0usize;
                                         for &b in k.val {
@@ -2138,12 +2167,15 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                         }
                     }
                 }
+                if !has_bc {
+                    continue;
+                }
                 if idx == 0 {
                     if require_ca_leaf && !is_ca {
                         violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
                         break;
                     }
-                    if require_ee_leaf && is_ca {
+                    if require_ee_leaf && !is_ee {
                         violation = Some((TRUST_E_BASIC_CONSTRAINTS, 0));
                         break;
                     }

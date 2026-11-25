@@ -190,6 +190,7 @@ pub(super) struct CmsSigner {
     pub signer_info_raw: Vec<u8>,
     pub issuer_raw: Vec<u8>,
     pub serial_be: Vec<u8>,
+    pub subject_key_id: Option<Vec<u8>>,
     pub hash_alg_oid: Vec<u8>,
     pub auth_attrs_raw: Option<Vec<u8>>,
     pub unauth_attrs_raw: Option<Vec<u8>>,
@@ -275,16 +276,20 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
                         continue;
                     }
                     let _si_ver = parse_der_u32_val(kids[0].val).unwrap_or(1);
-                    let (issuer_raw, serial_be) = if kids[1].tag == 0x30 {
+                    let (issuer_raw, serial_be, subject_key_id) = if kids[1].tag == 0x30 {
                         let Some(ias) = der_item_children(kids[1].val) else {
                             continue;
                         };
                         if ias.len() < 2 || ias[0].tag != 0x30 || ias[1].tag != 0x02 {
                             continue;
                         }
-                        (ias[0].raw.to_vec(), ias[1].val.to_vec())
+                        (ias[0].raw.to_vec(), ias[1].val.to_vec(), None)
+                    } else if kids[1].tag == 0x80 && !kids[1].val.is_empty() {
+                        // RFC 5652 §5.3: SignerIdentifier ::= CHOICE {
+                        //   issuerAndSerialNumber, subjectKeyIdentifier [0] IMPLICIT OCTET STRING }
+                        (Vec::new(), Vec::new(), Some(kids[1].val.to_vec()))
                     } else {
-                        (Vec::new(), Vec::new())
+                        continue;
                     };
                     let Some((hash_oid, _)) = parse_alg_id(kids[2]) else {
                         continue;
@@ -317,6 +322,7 @@ fn parse_cms_signed_data(sd_seq: DerItem<'_>, raw_encoded: &[u8]) -> Option<CmsS
                         signer_info_raw: si.raw.to_vec(),
                         issuer_raw,
                         serial_be,
+                        subject_key_id,
                         hash_alg_oid: hash_oid.to_vec(),
                         auth_attrs_raw,
                         unauth_attrs_raw,
@@ -470,6 +476,21 @@ fn cert_issuer_and_serial(cert_der: &[u8]) -> Option<(&[u8], &[u8])> {
     let serial = *kids.get(idx)?;
     let issuer = *kids.get(idx + 2)?;
     (serial.tag == 0x02 && issuer.tag == 0x30).then_some((issuer.raw, serial.val))
+}
+
+fn cert_subject_key_id(cert_der: &[u8]) -> Option<Vec<u8>> {
+    const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E];
+    let parts = parse_cert_der_parts(cert_der)?;
+    for &(oid, _, val) in &parts.extensions {
+        if oid == OID_SKI {
+            if let Some((oct, _)) = parse_der_item(val) {
+                if oct.tag == 0x04 {
+                    return Some(oct.val.to_vec());
+                }
+            }
+        }
+    }
+    Some(Digest::Sha1.hash(parts.spki_key_bits))
 }
 
 fn verify_signed_bytes_with_cert_der(
@@ -1103,13 +1124,21 @@ pub(super) unsafe fn crypt_verify_message_signature_impl(
                 std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize).to_vec();
             (der, ctx)
         } else {
-            // Default lookup: match signer certificate in embedded certificates by IssuerAndSerialNumber.
-            let signer_cert_der = msg.certs_der.iter().find(|der| {
-                cert_issuer_and_serial(der).is_some_and(|(iss, ser)| {
-                    iss == signer.issuer_raw.as_slice()
-                        && strip_leading_zero(ser) == strip_leading_zero(&signer.serial_be)
+            // Default lookup: match signer certificate in embedded certificates by
+            // SubjectKeyIdentifier (RFC 5652 v3 sid) or IssuerAndSerialNumber (v1 sid).
+            let signer_cert_der = if let Some(ref want_ski) = signer.subject_key_id {
+                msg.certs_der
+                    .iter()
+                    .find(|der| cert_subject_key_id(der).as_deref() == Some(want_ski.as_slice()))
+            } else {
+                msg.certs_der.iter().find(|der| {
+                    !signer.issuer_raw.is_empty()
+                        && cert_issuer_and_serial(der).is_some_and(|(iss, ser)| {
+                            iss == signer.issuer_raw.as_slice()
+                                && strip_leading_zero(ser) == strip_leading_zero(&signer.serial_be)
+                        })
                 })
-            });
+            };
             let Some(signer_der) = signer_cert_der else {
                 crate::teb::set_last_error(CRYPT_E_SIGNER_NOT_FOUND);
                 return FALSE;
