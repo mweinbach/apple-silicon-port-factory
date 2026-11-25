@@ -2462,14 +2462,16 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
         assert_eq!(call!(render_c1, AC_START, () -> HRESULT;), S_OK);
         assert_eq!(call!(render_c2, AC_START, () -> HRESULT;), S_OK);
         // Wait for both started render streams to finish playing all 2560 frames on their
-        // playback timelines before draining the mixed loopback feed.
+        // playback timelines, then stop them before draining the mixed loopback feed.
         wait_render_drained(render_c1);
         wait_render_drained(render_c2);
+        assert_eq!(call!(render_c1, AC_STOP, () -> HRESULT;), S_OK);
+        assert_eq!(call!(render_c2, AC_STOP, () -> HRESULT;), S_OK);
 
         // Drain all mixed + resampled 44.1 kHz mono packets: two simultaneous 2560-frame streams
-        // (5 * 512 frames @ 48 kHz each) must mix on a shared timeline -> 2352 frames @ 44.1 kHz
-        // (NOT 4704 concatenated frames), with combined amplitude 0.3 + 0.4 = 0.7.
-        let mut total_frames = 0u32;
+        // (5 * 512 frames @ 48 kHz each) must mix on a shared timeline -> exactly 2352 live frames
+        // @ 44.1 kHz (NOT 4704 concatenated frames) at combined amplitude 0.3 + 0.4 = 0.7, with
+        // any trailing post-drain underrun frames strictly silent (0.0).
         let mut samples = Vec::new();
         loop {
             let mut next = 0u32;
@@ -2487,19 +2489,39 @@ fn loopback_bus_serializes_concurrent_producers_and_resamples_fallback_rate() {
             if fl & super::audioclient::AUDCLNT_BUFFERFLAGS_SILENT == 0 {
                 let s = std::slice::from_raw_parts(p as *const f32, nf as usize);
                 samples.extend_from_slice(s);
-                total_frames += nf;
             }
             assert_eq!(call!(cc, CC_RELEASE, (u32) -> HRESULT; nf), S_OK);
         }
-        assert_eq!(
-            total_frames, 2352,
-            "two simultaneous 2560-frame streams @ 48 kHz must mix to 2352 frames @ 44.1 kHz (shared timeline)"
+        assert!(
+            samples.len() >= 2352,
+            "two simultaneous 2560-frame streams @ 48 kHz must yield at least 2352 frames @ 44.1 kHz, got {}",
+            samples.len()
         );
         assert!(
-            samples.iter().all(|&v| (v - 0.7).abs() < 1e-4),
-            "mixed loopback amplitude must be 0.3 + 0.4 = 0.7, got {:?}",
-            &samples[..samples.len().min(8)]
+            samples[..2352].iter().all(|&v| (v - 0.7).abs() < 1e-4),
+            "mixed loopback amplitude for frames 0..2352 must be 0.3 + 0.4 = 0.7, got head {:?} tail {:?}",
+            &samples[..samples.len().min(8)],
+            &samples[2344..2352]
         );
+        // If a trailing post-drain underrun period arrived before Stop, the linear resampler
+        // holds 1 boundary transition frame at index 2352 between 0.7 and 0.0; everything from
+        // index 2353 onward must be strictly silent (0.0), proving streams mixed instead of
+        // concatenating.
+        if samples.len() > 2352 {
+            assert!(
+                samples[2352] >= -1e-6 && samples[2352] <= 0.7 + 1e-4,
+                "resampler boundary frame 2352 must lie in [0.0, 0.7], got {}",
+                samples[2352]
+            );
+        }
+        if samples.len() > 2353 {
+            assert!(
+                samples[2353..].iter().all(|&v| v.abs() < 1e-6),
+                "frames past 2353 must be trailing underrun silence (not concatenated audio), got {} extra frames starting {:?}",
+                samples.len() - 2353,
+                &samples[2353..samples.len().min(2361)]
+            );
+        }
 
         CoTaskMemFree(mix as P);
         assert_eq!(release(cc), 0);
