@@ -486,6 +486,7 @@ impl Tr<'_> {
                 let is_max = sub == 5 || sub == 11;
                 self.a.fcmp(is_sd, va, vb);
                 self.a.s_fcsel(is_sd, dst_v, va, vb, if is_max { GT } else { MI });
+                self.flush_minmax_result(dst_v, is_sd);
                 if is_sd { 3 } else { 2 }
             }
             VF_SQRTSS | VF_SQRTSD => {
@@ -542,6 +543,7 @@ impl Tr<'_> {
                     self.a.v_fcmgt(is_pd, dst, vb, va);
                 }
                 self.a.v_bsl(dst, va, vb);
+                self.flush_minmax_result(dst, is_pd);
                 if dst != vd {
                     self.a.v_mov(vd, dst);
                 }
