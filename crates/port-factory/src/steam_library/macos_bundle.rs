@@ -939,7 +939,8 @@ fn package_macos_game_bundle(
     } else {
         entry.install_dir.as_path()
     };
-    match Command::new(&loader_bin)
+    let mut prewarm_cmd = Command::new(&loader_bin);
+    prewarm_cmd
         .arg("--manifest")
         .arg(&manifest_path)
         .arg("--game-dir")
@@ -948,9 +949,18 @@ fn package_macos_game_bundle(
         .arg(prewarm_pe)
         .arg("--prewarm-aot")
         .arg("--aot-dir")
-        .arg(&aot_cache_dir)
-        .output()
-    {
+        .arg(&aot_cache_dir);
+    // Feed any fingerprint-verified runtime callbacks & profiles from the host's default AOT
+    // cache directory into the bundle's `Contents/Resources/AotCache` prewarm.
+    if std::env::var_os("PORT_AOT_FALLBACK_DIR").is_none() {
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            let host_aot = PathBuf::from(home).join("Library/Caches/port-factory/aot");
+            if host_aot.is_dir() {
+                prewarm_cmd.env("PORT_AOT_FALLBACK_DIR", &host_aot);
+            }
+        }
+    }
+    match prewarm_cmd.output() {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if !stdout.trim().is_empty() {

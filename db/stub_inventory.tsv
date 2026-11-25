@@ -24,35 +24,20 @@ gameinput.dll	gi_get_temporal_reading	stub	crates/win32-rt/src/misc/gameinput.rs
 gdi32.dll	GetDeviceCaps	stub	crates/win32-rt/src/misc/gdi32.rs	910	"GetDeviceCaps({index}) -> 0"
 hid.dll	HidD_SetNumInputBuffers	stub	crates/win32-rt/src/misc/hid.rs	887	"ring size stays {INPUT_BUFFERS} (asked {n})"
 kernel32.dll	AllocConsole	stub	crates/win32-rt/src/kernel32/file.rs	477	"no separate console window; stdout/stderr of the loader act as the console"
-kernel32.dll	AssignProcessToJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1655	"job objects have no effect"
-kernel32.dll	CreateProcessW	stub	crates/win32-rt/src/kernel32/process.rs	1283	"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)
-kernel32.dll	CreateRemoteThread	stub	crates/win32-rt/src/kernel32/threads.rs	60	"CreateRemoteThread into another process"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7135	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
-kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7163	"DeviceIoControl code {code:#x} unsupported"
-kernel32.dll	FlushProcessWriteBuffers	stub	crates/win32-rt/src/kernel32/memory.rs	1045	"FlushProcessWriteBuffers approximated by a local fence"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7291	"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"
+kernel32.dll	DeviceIoControl	stub	crates/win32-rt/src/kernel32/file.rs	7319	"DeviceIoControl code {code:#x} unsupported"
 kernel32.dll	GetCalendarInfoEx	stub	crates/win32-rt/src/kernel32/string.rs	1354	"GetCalendarInfoEx type {ty:#x}"
-kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2137	"GetFileInformationByHandleEx class {class} not supported"
+kernel32.dll	GetFileInformationByHandleEx	stub	crates/win32-rt/src/kernel32/file.rs	2287	"GetFileInformationByHandleEx class {class} not supported"
 kernel32.dll	GetGeoInfoW	stub	crates/win32-rt/src/kernel32/string.rs	1125	"GetGeoInfo for geo id {geo} answered with US data"
 kernel32.dll	GetLocaleInfoW	stub	crates/win32-rt/src/kernel32/string.rs	918	"locale {lcid:#x} not available; answering with en-US data"
 kernel32.dll	GetNumberFormatEx	stub	crates/win32-rt/src/kernel32/string.rs	1323	"custom NUMBERFMT ignored"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	552	"LCMAP_HASH unsupported"
 kernel32.dll	LCMapStringEx	stub	crates/win32-rt/src/kernel32/string.rs	578	"LCMapString flags {flags:#x} partially honoured"
-kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	6926	"MapViewOfFile3 on another process"
-kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2596	"MoveFileExA delete-on-reboot ignored"
-kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2589	"MoveFileExW delete-on-reboot ignored"
-kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2268	"SetFileInformationByHandle class {class} not supported"
-kernel32.dll	SetInformationJobObject	stub	crates/win32-rt/src/kernel32/process.rs	1659	"SetInformationJobObject class {class} ignored"
-kernel32.dll	TerminateThread	stub	crates/win32-rt/src/kernel32/threads.rs	173	"TerminateThread unsupported"
-kernel32.dll	VirtualAlloc2	stub	crates/win32-rt/src/kernel32/memory.rs	577	"VirtualAlloc2 on another process"
-kernel32.dll	VirtualAllocEx	stub	crates/win32-rt/src/kernel32/memory.rs	568	"VirtualAllocEx on another process"
-kernel32.dll	VirtualProtect	stub	crates/win32-rt/src/kernel32/memory.rs	684	"PAGE_GUARD not emulated"
-kernel32.dll	format_message	stub	crates/win32-rt/src/kernel32/process.rs	2180	"message tables in modules are not supported (id {id:#x})"
-kernel32.dll	format_message	stub	crates/win32-rt/src/kernel32/process.rs	2189	"FormatMessage from module message table (id {id:#x})"
+kernel32.dll	MapViewOfFile3	stub	crates/win32-rt/src/kernel32/file.rs	7082	"MapViewOfFile3 on another process"
+kernel32.dll	MoveFileExA	stub	crates/win32-rt/src/kernel32/file.rs	2746	"MoveFileExA delete-on-reboot ignored"
+kernel32.dll	MoveFileExW	stub	crates/win32-rt/src/kernel32/file.rs	2739	"MoveFileExW delete-on-reboot ignored"
+kernel32.dll	SetFileInformationByHandle	stub	crates/win32-rt/src/kernel32/file.rs	2418	"SetFileInformationByHandle class {class} not supported"
 kernel32.dll	get_locale_info	stub	crates/win32-rt/src/kernel32/string.rs	865	"GetLocaleInfo LCTYPE {lctype:#x} unknown"
-kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	362	"MEM_LARGE_PAGES ignored"
-kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	365	"MEM_WRITE_WATCH not tracked"
-kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	369	"PAGE_GUARD not emulated"
-kernel32.dll	virtual_alloc_aligned_impl	stub	crates/win32-rt/src/kernel32/memory.rs	377	"MEM_RESET_UNDO: contents may have been discarded"
 libcurl.dll	easy_getinfo	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1344	"libcurl: unsupported curl_easy_getinfo(info={other:#x})"
 libcurl.dll	easy_setopt	middleware_stub	crates/win32-rt/src/misc/libcurl/easy.rs	1158	"libcurl: unsupported curl_easy_setopt(option={other}, param={param:#x})"
 mmdevapi.dll	activate	stub	crates/win32-rt/src/audio/mmdevapi.rs	592	"IMMDevice::Activate({iid:?} = {what}) -> E_NOINTERFACE"
@@ -64,15 +49,6 @@ mmdevapi.dll	initialize	stub	crates/win32-rt/src/audio/audioclient.rs	440	"IAudi
 msctf.dll	ctx_track_properties	stub	crates/win32-rt/src/misc/msctf/context.rs	809	"ITfContext::TrackProperties -> E_NOTIMPL"
 nri.dll	core_cmd_set_sample_positions	middleware_stub	crates/win32-rt/src/misc/nri/cmdlist.rs	965	"CmdSetSamplePositions: programmable sample positions not supported on Metal"
 nri.dll	core_create_query_pool	middleware_stub	crates/win32-rt/src/misc/nri/device.rs	1383	"CreateQueryPool: queryType {} is not supported on Metal", qd.query_type
-ntdll.dll	KiUserApcDispatcher	stub	crates/win32-rt/src/ntdll.rs	1678	"KiUserApcDispatcher called directly"
-ntdll.dll	KiUserCallbackDispatcher	stub	crates/win32-rt/src/ntdll.rs	1682	"KiUserCallbackDispatcher called directly"
-ntdll.dll	KiUserExceptionDispatcher	stub	crates/win32-rt/src/ntdll.rs	1674	"KiUserExceptionDispatcher called directly"
-ntdll.dll	LdrInitializeThunk	stub	crates/win32-rt/src/ntdll.rs	2420	"LdrInitializeThunk called directly"
-ntdll.dll	NtCommitTransaction	stub	crates/win32-rt/src/ntdll.rs	747	"NtCommitTransaction -> STATUS_NOT_IMPLEMENTED"
-ntdll.dll	NtCreateTransaction	stub	crates/win32-rt/src/ntdll.rs	742	"NtCreateTransaction -> STATUS_NOT_IMPLEMENTED"
-ntdll.dll	NtQueryInformationProcess	stub	crates/win32-rt/src/ntdll.rs	241	"NtQueryInformationProcess class {class}"
-ntdll.dll	NtQueryInformationThread	stub	crates/win32-rt/src/ntdll.rs	313	"NtQueryInformationThread class {class}"
-ntdll.dll	NtQuerySystemInformation	stub	crates/win32-rt/src/ntdll.rs	438	"NtQuerySystemInformation class {class}"
 ole32.dll	pv_get_date_time	stub	crates/win32-rt/src/misc/ole32.rs	2167	"IPropertyValue::GetDateTime -> E_NOTIMPL"
 ole32.dll	pv_get_point	stub	crates/win32-rt/src/misc/ole32.rs	2185	"IPropertyValue::GetPoint -> E_NOTIMPL"
 ole32.dll	pv_get_rect	stub	crates/win32-rt/src/misc/ole32.rs	2203	"IPropertyValue::GetRect -> E_NOTIMPL"
@@ -104,7 +80,7 @@ shell32.dll	SHCreateItemFromParsingName	stub	crates/win32-rt/src/misc/shell32.rs
 ucrtbase.dll	_getch	stub	crates/win32-rt/src/ucrt/runtime.rs	940	"_getch returns EOF"
 ucrtbase.dll	_setmbcp	stub	crates/win32-rt/src/ucrt/locale.rs	274	"_setmbcp({cp}) unsupported"
 ucrtbase.dll	open_host_path	stub	crates/win32-rt/src/ucrt/stdio.rs	210	"Unicode text modes (0x{oflag:x}) treated as plain text mode"
-ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1062	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
+ucrtbase.dll	parse_mode	stub	crates/win32-rt/src/ucrt/stdio.rs	1097	"fopen ccs={c}: UTF-16 stream encoding not implemented; byte stream instead"
 ucrtbase.dll	setlocale	stub	crates/win32-rt/src/ucrt/locale.rs	64	"setlocale({cat}, {n:?}): locale not available"
 ucrtbase.dll	system	stub	crates/win32-rt/src/ucrt/runtime.rs	952	"system({:?}) refused", from_ansi(cmd)
 user32.dll	CreateCursor	stub	crates/win32-rt/src/user32/cursor.rs	1024	"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"
@@ -122,13 +98,13 @@ user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	611	"GetUser
 user32.dll	user_object_info	stub	crates/win32-rt/src/user32/misc.rs	633	"GetUserObjectInformation index {index} not supported"
 uxtheme.dll	DrawThemeBackground	stub	crates/win32-rt/src/misc/uxtheme.rs	111	"DrawThemeBackground(htheme={htheme:#x}) -> E_NOTIMPL"
 uxtheme.dll	TaskDialogIndirect	stub	crates/win32-rt/src/misc/uxtheme.rs	203	"TaskDialogIndirect -> E_NOTIMPL (native task dialogs not implemented)"
-ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
-ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAAsyncSelect	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSACancelAsyncRequest	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameA	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAConnectByNameW	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAGetQOSByName	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
 ws2_32.dll	WSAIoctl	stub	crates/win32-rt/src/misc/ws2_32.rs	1802	"WSAIoctl(code={io_control_code:#x}) -> WSAEOPNOTSUPP"
-ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3357	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
+ws2_32.dll	WSAJoinLeaf	failing	crates/win32-rt/src/misc/ws2_32.rs	3474	i32 = SOCKET_ERROR, err WSAEOPNOTSUPP
 ws2_32.dll	duplicate_socket_into_info	stub	crates/win32-rt/src/misc/ws2_32.rs	1322	"WSADuplicateSocket cross-process target pid={pid} unsupported"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	216	"XAudio2 CreateSourceVoice: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat {sub:?}"
 xaudio2_9redist.dll	parse_wave_format	middleware_stub	crates/win32-rt/src/misc/xaudio2_9redist/mixer.rs	233	"XAudio2 CreateSourceVoice: unsupported format tag {tag:#x} bits {bits}"

@@ -109,10 +109,16 @@ impl Parker {
                 }
             }
         }
+        if crate::thread::is_current_terminate_requested() {
+            return;
+        }
         if self.word.compare_exchange(IDLE, SLEEPING, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return; // already notified
         }
         loop {
+            if crate::thread::is_current_terminate_requested() {
+                break;
+            }
             let timeout_us = match deadline {
                 None => 0, // infinite
                 Some(d) => {
@@ -131,7 +137,7 @@ impl Parker {
                 return;
             }
         }
-        // Timed out: stop advertising SLEEPING so later notifiers skip the syscall.
+        // Timed out or interrupted for termination: stop advertising SLEEPING so later notifiers skip the syscall.
         let _ = self.word.compare_exchange(SLEEPING, IDLE, Ordering::AcqRel, Ordering::Acquire);
     }
 
@@ -172,6 +178,7 @@ impl WordLock {
 
     #[inline]
     pub fn lock(&self) {
+        crate::thread::defer_terminate_enter();
         if self.word.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             self.lock_slow();
         }
@@ -199,6 +206,7 @@ impl WordLock {
         if self.word.swap(0, Ordering::Release) == 2 {
             unsafe { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, self.word.as_ptr() as *mut c_void, 0) };
         }
+        crate::thread::defer_terminate_leave();
     }
 }
 

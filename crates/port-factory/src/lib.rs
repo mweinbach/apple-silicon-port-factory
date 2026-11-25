@@ -33,6 +33,8 @@ pub mod dotnet;
 pub mod game_profiles;
 pub mod gpu_shaders;
 pub mod ios_bundle;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod isa_coverage;
 pub mod json_output;
 pub mod launcher;
 pub mod ops_db;
