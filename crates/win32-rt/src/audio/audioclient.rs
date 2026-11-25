@@ -140,18 +140,44 @@ pub(super) fn alloc_loopback_source_id() -> u64 {
     NEXT_LOOPBACK_SOURCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Maximum window to wait for another active started render source to publish
+/// for the current common playback interval before advancing without it.
+const LOOPBACK_MIX_SYNC_WAIT: Duration = Duration::from_millis(25);
+
 struct LoopbackSourceQueue {
     converter: Option<super::backend::TapFormatConverter>,
+    /// Common playback timeline frame index of `buf[0]` (at `dst_rate`).
+    buf_start: u64,
     /// Converted interleaved float32 samples at `(dst_rate, dst_channels)`.
     buf: VecDeque<f32>,
+    /// True while the owning render stream is started (`Start`..`Stop`).
+    started: bool,
     /// Set when the owning render stream drops; entry is pruned once `buf` drains.
     retired: bool,
+    /// Last push or start timestamp (used to bound multi-source sync wait for silent sources).
+    last_activity: Instant,
+}
+
+impl LoopbackSourceQueue {
+    #[inline]
+    fn buf_frames(&self, ch: usize) -> u64 {
+        (self.buf.len() / ch) as u64
+    }
+
+    #[inline]
+    fn end_frame(&self, ch: usize) -> u64 {
+        self.buf_start + self.buf_frames(ch)
+    }
 }
 
 struct LoopbackMixer {
     dst_rate: u32,
     dst_channels: usize,
     cap_samples: usize,
+    /// Common timeline epoch anchored on first publication or activation.
+    origin: Option<Instant>,
+    /// Next common playback timeline frame index to drain.
+    read_frame: u64,
     sources: std::collections::HashMap<u64, LoopbackSourceQueue>,
 }
 
@@ -162,11 +188,47 @@ impl LoopbackMixer {
             dst_rate: dst_rate.max(1),
             dst_channels: ch,
             cap_samples: cap_frames.max(4096) * ch,
+            origin: None,
+            read_frame: 0,
             sources: std::collections::HashMap::new(),
         }
     }
 
+    fn set_source_started_at(&mut self, source_id: u64, started: bool, now: Instant) {
+        if started {
+            let start_frame = self.read_frame;
+            let entry = self.sources.entry(source_id).or_insert_with(|| LoopbackSourceQueue {
+                converter: None,
+                buf_start: start_frame,
+                buf: VecDeque::new(),
+                started: true,
+                retired: false,
+                last_activity: now,
+            });
+            entry.started = true;
+            entry.retired = false;
+            entry.last_activity = now;
+            if entry.buf.is_empty() && entry.buf_start < self.read_frame {
+                entry.buf_start = self.read_frame;
+            }
+        } else if let Some(q) = self.sources.get_mut(&source_id) {
+            q.started = false;
+        }
+    }
+
     fn push_source(&mut self, source_id: u64, samples_f32: &[f32], src_rate: u32, src_channels: u16) {
+        self.push_source_internal(source_id, None, samples_f32, src_rate, src_channels, Instant::now());
+    }
+
+    fn push_source_internal(
+        &mut self,
+        source_id: u64,
+        explicit_start: Option<u64>,
+        samples_f32: &[f32],
+        src_rate: u32,
+        src_channels: u16,
+        now: Instant,
+    ) {
         let src_ch = src_channels.max(1) as usize;
         let src_rate = src_rate.max(1);
         let frames = samples_f32.len() / src_ch;
@@ -178,12 +240,31 @@ impl LoopbackMixer {
         let dst_ch = self.dst_channels;
         let cap_samples = self.cap_samples;
 
-        let entry = self.sources.entry(source_id).or_insert_with(|| LoopbackSourceQueue {
-            converter: None,
-            buf: VecDeque::new(),
-            retired: false,
+        let origin = *self.origin.get_or_insert(now);
+        let elapsed_frames =
+            (now.saturating_duration_since(origin).as_secs_f64() * dst_rate as f64).round() as u64;
+        let read_frame = self.read_frame;
+
+        let entry = self.sources.entry(source_id).or_insert_with(|| {
+            // Anchor newly-seen sources onto the common playback timeline instead of appending
+            // blindly behind already-drained frames from another stream in the same interval.
+            let start = explicit_start.unwrap_or_else(|| elapsed_frames.min(read_frame));
+            LoopbackSourceQueue {
+                converter: None,
+                buf_start: start,
+                buf: VecDeque::new(),
+                started: false,
+                retired: false,
+                last_activity: now,
+            }
         });
         entry.retired = false;
+        entry.last_activity = now;
+        if let Some(start) = explicit_start {
+            if entry.buf.is_empty() {
+                entry.buf_start = start;
+            }
+        }
 
         let converted: &[f32] = if src_rate == dst_rate && src_ch == dst_ch {
             input
@@ -202,22 +283,43 @@ impl LoopbackMixer {
             }
             entry.converter.as_mut().unwrap().convert(input)
         };
-        if converted.is_empty() {
+        let new_frames = (converted.len() / dst_ch) as u64;
+        if new_frames == 0 {
             return;
         }
-        entry.buf.extend(converted.iter().copied());
+
+        // Clip any frames whose timeline position is already behind `read_frame` so late
+        // arrivals never inflate total captured duration or turn simultaneous audio consecutive.
+        let chunk_start = entry.buf_start + (entry.buf.len() / dst_ch) as u64;
+        if chunk_start < read_frame {
+            let skip_frames = (read_frame - chunk_start).min(new_frames);
+            let keep_from = (skip_frames as usize) * dst_ch;
+            if entry.buf.is_empty() {
+                entry.buf_start = chunk_start + skip_frames;
+            }
+            if keep_from < converted.len() {
+                entry.buf.extend(converted[keep_from..].iter().copied());
+            }
+        } else {
+            entry.buf.extend(converted.iter().copied());
+        }
+
         if entry.buf.len() > cap_samples {
-            let drop_samples = ((entry.buf.len() - cap_samples) / dst_ch) * dst_ch;
-            entry.buf.drain(..drop_samples);
+            let drop_frames = (entry.buf.len() - cap_samples) / dst_ch;
+            entry.buf.drain(..drop_frames * dst_ch);
+            entry.buf_start += drop_frames as u64;
         }
     }
 
     fn clear(&mut self) {
         self.sources.clear();
+        self.origin = None;
+        self.read_frame = 0;
     }
 
     fn retire_source(&mut self, source_id: u64) {
         if let Some(q) = self.sources.get_mut(&source_id) {
+            q.started = false;
             q.retired = true;
             if q.buf.is_empty() {
                 self.sources.remove(&source_id);
@@ -225,46 +327,86 @@ impl LoopbackMixer {
         }
     }
 
-    /// Mix up to `max_frames` frames across all buffered render sources on a shared timeline
-    /// into `out` (interleaved float32 at `(dst_rate, dst_channels)`), returning frames written.
+    /// Mix up to `max_frames` frames across all buffered render sources aligned on the common
+    /// playback timeline into `out` (interleaved float32 at `(dst_rate, dst_channels)`).
     fn drain_mixed(&mut self, max_frames: usize, out: &mut Vec<f32>) -> usize {
+        self.drain_mixed_at(max_frames, out, Instant::now())
+    }
+
+    fn drain_mixed_at(&mut self, max_frames: usize, out: &mut Vec<f32>, now: Instant) -> usize {
         if max_frames == 0 {
             return 0;
         }
         let ch = self.dst_channels;
-        let max_avail_frames = self
+        let max_end = self
             .sources
             .values()
-            .map(|q| q.buf.len() / ch)
+            .filter(|q| !q.buf.is_empty())
+            .map(|q| q.end_frame(ch))
             .max()
-            .unwrap_or(0);
-        let take = max_avail_frames.min(max_frames);
-        if take == 0 {
+            .unwrap_or(self.read_frame);
+        if max_end <= self.read_frame {
             self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
             return 0;
         }
+
+        // Hold advancement to the earliest timeline frontier across actively started sources
+        // whose callbacks are still within the short sync window, so polling between independent
+        // render callbacks mixes simultaneous streams instead of splitting them consecutively.
+        let sync_limit = self
+            .sources
+            .values()
+            .filter(|q| q.started && now.saturating_duration_since(q.last_activity) < LOOPBACK_MIX_SYNC_WAIT)
+            .map(|q| q.end_frame(ch))
+            .min();
+        let target_end = match sync_limit {
+            Some(lim) => max_end.min(lim),
+            None => max_end,
+        };
+        if target_end <= self.read_frame {
+            self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
+            return 0;
+        }
+
+        let take = ((target_end - self.read_frame) as usize).min(max_frames);
+        let drain_start = self.read_frame;
+        let drain_end = drain_start + take as u64;
         let n_samples = take * ch;
         out.clear();
         out.resize(n_samples, 0.0);
+
         let mut active_count = 0usize;
         for q in self.sources.values_mut() {
-            let src_frames = (q.buf.len() / ch).min(take);
+            // Trim any stale samples preceding `drain_start`.
+            if q.buf_start < drain_start && !q.buf.is_empty() {
+                let skip = ((drain_start - q.buf_start) as usize).min(q.buf.len() / ch);
+                q.buf.drain(..skip * ch);
+                q.buf_start += skip as u64;
+            }
+            if q.buf.is_empty() || q.buf_start >= drain_end {
+                continue;
+            }
+            let out_frame_off = (q.buf_start - drain_start) as usize;
+            let src_frames = ((drain_end - q.buf_start) as usize).min(q.buf.len() / ch);
             if src_frames == 0 {
                 continue;
             }
             active_count += 1;
-            let src_samples = src_frames * ch;
-            for dst in &mut out[..src_samples] {
+            let dst_start = out_frame_off * ch;
+            let dst_end = dst_start + src_frames * ch;
+            for dst in &mut out[dst_start..dst_end] {
                 if let Some(s) = q.buf.pop_front() {
                     *dst += s;
                 }
             }
+            q.buf_start += src_frames as u64;
         }
         if active_count > 1 {
             for s in &mut out[..n_samples] {
                 *s = s.clamp(-1.0, 1.0);
             }
         }
+        self.read_frame = drain_end;
         self.sources.retain(|_, q| !q.retired || !q.buf.is_empty());
         take
     }
@@ -281,6 +423,8 @@ struct LoopbackSub {
 
 static LOOPBACK_SUB_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LOOPBACK_BUS: Mutex<Vec<(String, Weak<LoopbackSub>)>> = Mutex::new(Vec::new());
+static STARTED_RENDER_SOURCES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Vec<u64>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 impl Drop for LoopbackSub {
     fn drop(&mut self) {
@@ -304,7 +448,57 @@ fn register_loopback_sub(ep_id: &str, cap_frames: usize, rate: u32, channels: u1
     sub
 }
 
+fn started_sources_for_endpoint(ep_id: &str) -> Vec<u64> {
+    STARTED_RENDER_SOURCES
+        .lock()
+        .unwrap()
+        .get(ep_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(super) fn set_loopback_source_started(ep_id: &str, source_id: u64, started: bool) {
+    {
+        let mut map = STARTED_RENDER_SOURCES.lock().unwrap();
+        let list = map.entry(ep_id.to_string()).or_default();
+        if started {
+            if !list.contains(&source_id) {
+                list.push(source_id);
+            }
+        } else {
+            list.retain(|&id| id != source_id);
+            if list.is_empty() {
+                map.remove(ep_id);
+            }
+        }
+    }
+    if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let subs: Vec<Arc<LoopbackSub>> = {
+        let mut bus = LOOPBACK_BUS.lock().unwrap();
+        bus.retain(|(_, w)| w.strong_count() > 0);
+        bus.iter()
+            .filter(|(id, _)| id == ep_id)
+            .filter_map(|(_, w)| w.upgrade())
+            .collect()
+    };
+    let now = Instant::now();
+    for sub in subs {
+        sub.mixer.lock().unwrap().set_source_started_at(source_id, started, now);
+    }
+}
+
 pub(super) fn unregister_loopback_source(ep_id: &str, source_id: u64) {
+    {
+        let mut map = STARTED_RENDER_SOURCES.lock().unwrap();
+        if let Some(list) = map.get_mut(ep_id) {
+            list.retain(|&id| id != source_id);
+            if list.is_empty() {
+                map.remove(ep_id);
+            }
+        }
+    }
     if LOOPBACK_SUB_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -1120,14 +1314,27 @@ mod client {
             }
             s.started = true;
             match &mut s.io {
-                StreamIo::Render(r) => Some((r.out.control(), s.padding())),
+                StreamIo::Render(r) => {
+                    let ctrl = r.out.control();
+                    let ep_id = r.ep_id.clone();
+                    let source_id = r.source_id;
+                    Some((ctrl, s.padding(), ep_id, source_id))
+                }
                 StreamIo::Capture(c) => {
-                    // Discard any loopback audio accumulated while stopped, then enable live capture.
+                    // Discard any loopback audio accumulated while stopped, seed currently
+                    // started render sources on this endpoint, then enable live capture.
                     if let Some(lb) = &mut c.loopback {
                         match &lb.source {
                             LoopbackSource::CoreAudioTap { ring, .. } => ring.clear(),
                             LoopbackSource::InProcessBus(sub) => {
-                                sub.mixer.lock().unwrap().clear();
+                                let active_srcs = started_sources_for_endpoint(&core(this).ep.id);
+                                let now = Instant::now();
+                                let mut m = sub.mixer.lock().unwrap();
+                                m.clear();
+                                for sid in active_srcs {
+                                    m.set_source_started_at(sid, true, now);
+                                }
+                                drop(m);
                                 sub.active.store(true, Ordering::Release);
                             }
                         }
@@ -1140,9 +1347,10 @@ mod client {
             }
         };
         // Never hold `core.st` across `AudioOutputUnitStart`.
-        if let Some((ctrl, pad)) = render_ctrl {
+        if let Some((ctrl, pad, ep_id, source_id)) = render_ctrl {
             match ctrl.start() {
                 Ok(()) => {
+                    set_loopback_source_started(&ep_id, source_id, true);
                     log::debug!(target: "audio", "IAudioClient::Start (padding {pad})");
                     S_OK
                 }
@@ -1172,7 +1380,7 @@ mod client {
                 let fmt = s.fmt;
                 let buf = s.buffer_frames;
                 match &mut s.io {
-                    StreamIo::Render(r) => Some(r.out.control()),
+                    StreamIo::Render(r) => Some((r.out.control(), r.ep_id.clone(), r.source_id)),
                     StreamIo::Capture(c) => {
                         c.advance(&fmt, buf);
                         if let Some(lb) = &mut c.loopback {
@@ -1191,8 +1399,9 @@ mod client {
             (was, invalid, ctrl)
         };
         // Never hold `core.st` across `AudioOutputUnitStop`.
-        if let Some(ctrl) = render_ctrl {
+        if let Some((ctrl, ep_id, source_id)) = render_ctrl {
             ctrl.stop();
+            set_loopback_source_started(&ep_id, source_id, false);
         }
         if invalid {
             AUDCLNT_E_DEVICE_INVALIDATED
@@ -1953,5 +2162,66 @@ mod stream_vol {
             }
             IAudioStreamVolumeVtbl(slots)
         })
+    }
+}
+
+#[cfg(test)]
+mod mixer_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_mixer_aligns_sources_to_common_timeline_when_drained_between_publications() {
+        let t0 = Instant::now();
+        let mut out1 = Vec::new();
+        let mut out2 = Vec::new();
+
+        // 1. Two started render streams: polling between source 1 and source 2's callbacks
+        //    holds the interval within the sync window and emits one 480-frame mixed packet (0.7).
+        let mut m_sync = LoopbackMixer::new(4096, 48_000, 2);
+        m_sync.set_source_started_at(1, true, t0);
+        m_sync.set_source_started_at(2, true, t0);
+        m_sync.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_sync.drain_mixed_at(480, &mut out1, t0 + Duration::from_millis(2)), 0);
+        m_sync.push_source_internal(2, None, &vec![0.4f32; 480 * 2], 48_000, 2, t0 + Duration::from_millis(3));
+        let n = m_sync.drain_mixed_at(480, &mut out2, t0 + Duration::from_millis(4));
+        assert_eq!(n, 480);
+        assert!(out2.iter().all(|&v| (v - 0.7).abs() < 1e-5), "expected mixed 0.7, got {:?}", &out2[..4]);
+
+        // 2. Unregistered late source arriving after drain for the same playback interval [0..480)
+        //    must NOT append consecutively as [480..960) (total remains 480, not 960).
+        let mut m_late = LoopbackMixer::new(4096, 48_000, 2);
+        m_late.push_source_internal(1, None, &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_late.drain_mixed_at(480, &mut out1, t0), 480);
+        m_late.push_source_internal(2, None, &vec![0.4f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_late.drain_mixed_at(480, &mut out2, t0), 0);
+
+        // 3. Partial timeline overlap ([0..480) + [240..720)) mixes exact overlapping range
+        //    and preserves exact 720-frame duration whether drained between or after publications.
+        let mut m_overlap = LoopbackMixer::new(4096, 48_000, 2);
+        m_overlap.push_source_internal(1, Some(0), &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        m_overlap.push_source_internal(2, Some(240), &vec![0.4f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_overlap.drain_mixed_at(720, &mut out1, t0), 720);
+        assert!((out1[0] - 0.3).abs() < 1e-5);
+        assert!((out1[240 * 2] - 0.7).abs() < 1e-5);
+        assert!((out1[480 * 2] - 0.4).abs() < 1e-5);
+
+        let mut m_overlap_split = LoopbackMixer::new(4096, 48_000, 2);
+        m_overlap_split.push_source_internal(1, Some(0), &vec![0.3f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_overlap_split.drain_mixed_at(480, &mut out1, t0), 480);
+        m_overlap_split.push_source_internal(2, Some(240), &vec![0.4f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_overlap_split.drain_mixed_at(480, &mut out2, t0), 240);
+        assert!(out2.iter().all(|&v| (v - 0.4).abs() < 1e-5));
+
+        // 4. A silent second started source does not stall capture beyond LOOPBACK_MIX_SYNC_WAIT.
+        let mut m_silent = LoopbackMixer::new(4096, 48_000, 2);
+        m_silent.set_source_started_at(1, true, t0);
+        m_silent.set_source_started_at(2, true, t0);
+        m_silent.push_source_internal(1, None, &vec![0.5f32; 480 * 2], 48_000, 2, t0);
+        assert_eq!(m_silent.drain_mixed_at(480, &mut out1, t0 + Duration::from_millis(5)), 0);
+        assert_eq!(
+            m_silent.drain_mixed_at(480, &mut out1, t0 + LOOPBACK_MIX_SYNC_WAIT + Duration::from_millis(1)),
+            480
+        );
+        assert!(out1.iter().all(|&v| (v - 0.5).abs() < 1e-5));
     }
 }

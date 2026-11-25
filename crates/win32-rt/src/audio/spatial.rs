@@ -19,7 +19,7 @@
 //! Win32 `EventHandle` on each 480-frame (10 ms @ 48 kHz) audio quantum.
 
 use super::audioclient::{
-    alloc_loopback_source_id, unregister_loopback_source,
+    alloc_loopback_source_id, set_loopback_source_started, unregister_loopback_source,
 };
 use super::backend::{self, Backend, OutputStream, StreamControl, StreamShared};
 use super::com::*;
@@ -1097,6 +1097,7 @@ mod render_stream {
             core.st.lock().unwrap().started = false;
             return AUDCLNT_E_DEVICE_INVALIDATED;
         }
+        set_loopback_source_started(&core.ep.id, core.loopback_source_id, true);
         // Signal the caller's EventHandle immediately so the first quantum is requested.
         core.shared.signal_event();
         log::debug!(target: "audio", "ISpatialAudioObjectRenderStream::Start on '{}'", core.ep.info.name);
@@ -1113,6 +1114,7 @@ mod render_stream {
         };
         if let Some(ctrl) = ctrl {
             ctrl.stop();
+            set_loopback_source_started(&core.ep.id, core.loopback_source_id, false);
         }
         if core.is_invalid() {
             AUDCLNT_E_DEVICE_INVALIDATED
