@@ -5,10 +5,8 @@
 //! `setlocale(LC_ALL, "")` Unicode rules apply (see [`super::locale`]).
 
 use super::errno::{self, EINVAL, ERANGE, STRUNCATE};
-use super::locale::c_locale_active;
 use super::runtime::invalid_parameter;
 use crate::heap;
-use crate::strings::{wlower, wupper};
 use std::ffi::c_void;
 
 // ---------------------------------------------------------------------------
@@ -69,9 +67,13 @@ const fn build_ctype() -> [u16; 257] {
 pub static CTYPE: [u16; 257] = build_ctype();
 
 struct LocaleCaseTables {
+    is_c: bool,
+    icu_locale: &'static str,
     ctype: [u16; 257],
     lower: [u8; 256],
     upper: [u8; 256],
+    wlower_latin1: [u16; 256],
+    wupper_latin1: [u16; 256],
 }
 
 const fn build_ascii_lower() -> [u8; 256] {
@@ -94,17 +96,42 @@ const fn build_ascii_upper() -> [u8; 256] {
     t
 }
 
+const fn build_ascii_wlower() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= b'A' as usize && i <= b'Z' as usize { (i + 32) as u16 } else { i as u16 };
+        i += 1;
+    }
+    t
+}
+
+const fn build_ascii_wupper() -> [u16; 256] {
+    let mut t = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= b'a' as usize && i <= b'z' as usize { (i - 32) as u16 } else { i as u16 };
+        i += 1;
+    }
+    t
+}
+
 static C_TABLES: LocaleCaseTables = LocaleCaseTables {
+    is_c: true,
+    icu_locale: "",
     ctype: build_ctype(),
     lower: build_ascii_lower(),
     upper: build_ascii_upper(),
+    wlower_latin1: build_ascii_wlower(),
+    wupper_latin1: build_ascii_wupper(),
 };
 
 static ACTIVE_TABLES: std::sync::atomic::AtomicPtr<LocaleCaseTables> =
     std::sync::atomic::AtomicPtr::new(&C_TABLES as *const LocaleCaseTables as *mut LocaleCaseTables);
 
-/// Build and cache the 257-entry MSVC `__pctype_func` classification table (`index 0 = EOF`)
-/// and 256-entry `tolower`/`toupper` tables for `(cp, icu_locale)`.
+/// Build and cache the 257-entry MSVC `__pctype_func` classification table (`index 0 = EOF`),
+/// 256-entry narrow `tolower`/`toupper` tables, and 256-entry Latin-1 wide `towlower`/`towupper`
+/// tables for `(cp, icu_locale)`.
 fn tables_for_locale(cp: u32, icu_locale: &str) -> &'static LocaleCaseTables {
     if cp == 0 {
         return &C_TABLES;
@@ -121,6 +148,12 @@ fn tables_for_locale(cp: u32, icu_locale: &str) -> &'static LocaleCaseTables {
     let mut ctype = CTYPE;
     let mut lower = C_TABLES.lower;
     let mut upper = C_TABLES.upper;
+    let mut wlower_latin1 = [0u16; 256];
+    let mut wupper_latin1 = [0u16; 256];
+    for u in 0u16..256 {
+        wlower_latin1[u as usize] = crate::kernel32::string::case_map_unit_icu(icu_locale, u, false);
+        wupper_latin1[u as usize] = crate::kernel32::string::case_map_unit_icu(icu_locale, u, true);
+    }
     for b in 0u8..=0xFF {
         if cp == 65001 && b >= 0x80 {
             continue;
@@ -171,13 +204,23 @@ fn tables_for_locale(cp: u32, icu_locale: &str) -> &'static LocaleCaseTables {
                 .unwrap_or(b)
         };
     }
-    let leaked: &'static LocaleCaseTables = Box::leak(Box::new(LocaleCaseTables { ctype, lower, upper }));
+    let leaked_loc: &'static str = Box::leak(icu_locale.to_string().into_boxed_str());
+    let leaked: &'static LocaleCaseTables = Box::leak(Box::new(LocaleCaseTables {
+        is_c: false,
+        icu_locale: leaked_loc,
+        ctype,
+        lower,
+        upper,
+        wlower_latin1,
+        wupper_latin1,
+    }));
     g.insert(key, leaked);
     leaked
 }
 
 /// Called by `ucrt::locale` whenever global `LC_CTYPE` changes so `__pctype_func`, `is*`,
-/// `tolower`, and `toupper` observe the new tables lock-free.
+/// `tolower`/`toupper`, `towlower`/`towupper`, and case-insensitive compares observe the new
+/// tables lock-free.
 pub(super) fn refresh_global_ctype_tables(cp: u32, icu_locale: &str) {
     let tbl = tables_for_locale(cp, icu_locale);
     ACTIVE_TABLES.store(tbl as *const LocaleCaseTables as *mut LocaleCaseTables, std::sync::atomic::Ordering::Release);
@@ -186,6 +229,15 @@ pub(super) fn refresh_global_ctype_tables(cp: u32, icu_locale: &str) {
 #[inline]
 fn active_tables() -> &'static LocaleCaseTables {
     unsafe { &*ACTIVE_TABLES.load(std::sync::atomic::Ordering::Acquire) }
+}
+
+unsafe fn tables_for_opt_locale(l: *mut c_void) -> &'static LocaleCaseTables {
+    if l.is_null() {
+        active_tables()
+    } else {
+        let (cp, icu_loc) = super::locale::ctype_cp_and_icu(l);
+        tables_for_locale(cp, &icu_loc)
+    }
 }
 
 pub unsafe extern "win64" fn __pctype_func() -> *const u16 {
@@ -310,27 +362,33 @@ fn wch(c: u16) -> Option<char> {
     char::from_u32(c as u32)
 }
 
-fn wlow(c: u16) -> u16 {
-    if c_locale_active() {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        }
+#[inline]
+fn wlow_with(tbl: &LocaleCaseTables, c: u16) -> u16 {
+    if c < 256 {
+        tbl.wlower_latin1[c as usize]
+    } else if tbl.is_c {
+        c
     } else {
-        wlower(c)
+        crate::kernel32::string::case_map_unit_icu(tbl.icu_locale, c, false)
     }
 }
-fn wup(c: u16) -> u16 {
-    if c_locale_active() {
-        if (b'a' as u16..=b'z' as u16).contains(&c) {
-            c - 32
-        } else {
-            c
-        }
+
+#[inline]
+fn wup_with(tbl: &LocaleCaseTables, c: u16) -> u16 {
+    if c < 256 {
+        tbl.wupper_latin1[c as usize]
+    } else if tbl.is_c {
+        c
     } else {
-        wupper(c)
+        crate::kernel32::string::case_map_unit_icu(tbl.icu_locale, c, true)
     }
+}
+
+fn wlow(c: u16) -> u16 {
+    wlow_with(active_tables(), c)
+}
+fn wup(c: u16) -> u16 {
+    wup_with(active_tables(), c)
 }
 
 pub unsafe extern "win64" fn towlower(c: u16) -> u16 {
@@ -339,11 +397,11 @@ pub unsafe extern "win64" fn towlower(c: u16) -> u16 {
 pub unsafe extern "win64" fn towupper(c: u16) -> u16 {
     wup(c)
 }
-pub unsafe extern "win64" fn _towlower_l(c: u16, _l: *mut c_void) -> u16 {
-    wlow(c)
+pub unsafe extern "win64" fn _towlower_l(c: u16, l: *mut c_void) -> u16 {
+    wlow_with(tables_for_opt_locale(l), c)
 }
-pub unsafe extern "win64" fn _towupper_l(c: u16, _l: *mut c_void) -> u16 {
-    wup(c)
+pub unsafe extern "win64" fn _towupper_l(c: u16, l: *mut c_void) -> u16 {
+    wup_with(tables_for_opt_locale(l), c)
 }
 
 /// Wide ctype bits (same encoding as `_pctype`), Unicode-aware for c >= 0x80.
@@ -432,17 +490,14 @@ pub unsafe extern "win64" fn strncmp(a: *const u8, b: *const u8, n: usize) -> i3
     }
     0
 }
-pub unsafe extern "win64" fn _stricmp(a: *const u8, b: *const u8) -> i32 {
-    _strnicmp(a, b, usize::MAX)
-}
-pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+unsafe fn strnicmp_with(a: *const u8, b: *const u8, n: usize, tbl: &LocaleCaseTables) -> i32 {
     if a.is_null() || b.is_null() {
         errno::set(EINVAL);
         invalid_parameter("_strnicmp");
         return i32::MAX;
     }
     for i in 0..n {
-        let (x, y) = ((*a.add(i)).to_ascii_lowercase(), (*b.add(i)).to_ascii_lowercase());
+        let (x, y) = (tbl.lower[*a.add(i) as usize], tbl.lower[*b.add(i) as usize]);
         if x != y {
             return x as i32 - y as i32;
         }
@@ -452,11 +507,18 @@ pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> 
     }
     0
 }
-pub unsafe extern "win64" fn _stricmp_l(a: *const u8, b: *const u8, _l: *mut c_void) -> i32 {
-    _stricmp(a, b)
+
+pub unsafe extern "win64" fn _stricmp(a: *const u8, b: *const u8) -> i32 {
+    strnicmp_with(a, b, usize::MAX, active_tables())
 }
-pub unsafe extern "win64" fn _strnicmp_l(a: *const u8, b: *const u8, n: usize, _l: *mut c_void) -> i32 {
-    _strnicmp(a, b, n)
+pub unsafe extern "win64" fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    strnicmp_with(a, b, n, active_tables())
+}
+pub unsafe extern "win64" fn _stricmp_l(a: *const u8, b: *const u8, l: *mut c_void) -> i32 {
+    strnicmp_with(a, b, usize::MAX, tables_for_opt_locale(l))
+}
+pub unsafe extern "win64" fn _strnicmp_l(a: *const u8, b: *const u8, n: usize, l: *mut c_void) -> i32 {
+    strnicmp_with(a, b, n, tables_for_opt_locale(l))
 }
 pub unsafe extern "win64" fn _strcmpi(a: *const u8, b: *const u8) -> i32 {
     _stricmp(a, b)
@@ -802,17 +864,19 @@ pub unsafe extern "win64" fn __strncnt(s: *const u8, n: usize) -> usize {
 }
 
 pub unsafe extern "win64" fn _strlwr(s: *mut u8) -> *mut u8 {
+    let tbl = active_tables();
     let mut p = s;
     while *p != 0 {
-        *p = (*p).to_ascii_lowercase();
+        *p = tbl.lower[*p as usize];
         p = p.add(1);
     }
     s
 }
 pub unsafe extern "win64" fn _strupr(s: *mut u8) -> *mut u8 {
+    let tbl = active_tables();
     let mut p = s;
     while *p != 0 {
-        *p = (*p).to_ascii_uppercase();
+        *p = tbl.upper[*p as usize];
         p = p.add(1);
     }
     s
@@ -932,17 +996,16 @@ pub unsafe extern "win64" fn wcsncmp(a: *const u16, b: *const u16, n: usize) -> 
     }
     0
 }
-pub unsafe extern "win64" fn _wcsicmp(a: *const u16, b: *const u16) -> i32 {
-    _wcsnicmp(a, b, usize::MAX)
-}
-pub unsafe extern "win64" fn _wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+unsafe fn wcsnicmp_with(a: *const u16, b: *const u16, n: usize, tbl: &LocaleCaseTables) -> i32 {
     if a.is_null() || b.is_null() {
         errno::set(EINVAL);
         invalid_parameter("_wcsnicmp");
         return i32::MAX;
     }
     for i in 0..n {
-        let (x, y) = (wlow(*a.add(i)), wlow(*b.add(i)));
+        let ca = std::ptr::read_unaligned(a.add(i));
+        let cb = std::ptr::read_unaligned(b.add(i));
+        let (x, y) = (wlow_with(tbl, ca), wlow_with(tbl, cb));
         if x != y {
             return x as i32 - y as i32;
         }
@@ -952,11 +1015,18 @@ pub unsafe extern "win64" fn _wcsnicmp(a: *const u16, b: *const u16, n: usize) -
     }
     0
 }
-pub unsafe extern "win64" fn _wcsicmp_l(a: *const u16, b: *const u16, _l: *mut c_void) -> i32 {
-    _wcsicmp(a, b)
+
+pub unsafe extern "win64" fn _wcsicmp(a: *const u16, b: *const u16) -> i32 {
+    wcsnicmp_with(a, b, usize::MAX, active_tables())
 }
-pub unsafe extern "win64" fn _wcsnicmp_l(a: *const u16, b: *const u16, n: usize, _l: *mut c_void) -> i32 {
-    _wcsnicmp(a, b, n)
+pub unsafe extern "win64" fn _wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    wcsnicmp_with(a, b, n, active_tables())
+}
+pub unsafe extern "win64" fn _wcsicmp_l(a: *const u16, b: *const u16, l: *mut c_void) -> i32 {
+    wcsnicmp_with(a, b, usize::MAX, tables_for_opt_locale(l))
+}
+pub unsafe extern "win64" fn _wcsnicmp_l(a: *const u16, b: *const u16, n: usize, l: *mut c_void) -> i32 {
+    wcsnicmp_with(a, b, n, tables_for_opt_locale(l))
 }
 unsafe fn wide_coll_impl(a: *const u16, b: *const u16, max: Option<usize>, ignore_case: bool) -> i32 {
     let (is_c, _, bcp47) = super::locale::collate_cp_and_bcp47(std::ptr::null_mut());
@@ -1284,17 +1354,27 @@ pub unsafe extern "win64" fn _wcstok(s: *mut u16, delim: *const u16) -> *mut u16
 }
 
 pub unsafe extern "win64" fn _wcslwr(s: *mut u16) -> *mut u16 {
+    let tbl = active_tables();
     let mut p = s;
-    while *p != 0 {
-        *p = wlow(*p);
+    loop {
+        let c = std::ptr::read_unaligned(p);
+        if c == 0 {
+            break;
+        }
+        std::ptr::write_unaligned(p, wlow_with(tbl, c));
         p = p.add(1);
     }
     s
 }
 pub unsafe extern "win64" fn _wcsupr(s: *mut u16) -> *mut u16 {
+    let tbl = active_tables();
     let mut p = s;
-    while *p != 0 {
-        *p = wup(*p);
+    loop {
+        let c = std::ptr::read_unaligned(p);
+        if c == 0 {
+            break;
+        }
+        std::ptr::write_unaligned(p, wup_with(tbl, c));
         p = p.add(1);
     }
     s
@@ -1372,13 +1452,41 @@ mod tests {
             assert!(!crate::ucrt::locale::setlocale(0, b"en-US.utf8\0".as_ptr()).is_null());
             assert_eq!(isalpha(0xE4), 0);
             assert_eq!(isprint(0xE4), 0);
-            // Explicit _locale_t honors tr-TR casing even while global locale is "C".
+            // Explicit _locale_t honors tr-TR narrow + wide casing even while global locale is "C".
             assert!(!crate::ucrt::locale::setlocale(0, b"C\0".as_ptr()).is_null());
             let l_tr = crate::ucrt::locale::_create_locale(0, b"tr-TR\0".as_ptr());
             assert!(!l_tr.is_null());
             assert_eq!(_toupper_l(b'i' as i32, l_tr), 0xDD);
             assert_eq!(_tolower_l(b'I' as i32, l_tr), 0xFD);
-            assert_eq!(toupper(b'i' as i32), b'I' as i32); // global "C" unchanged
+            assert_eq!(_towupper_l(b'i' as u16, l_tr), 0x0130); // 'İ'
+            assert_eq!(_towlower_l(b'I' as u16, l_tr), 0x0131); // 'ı'
+            assert_eq!(_towlower_l(0x0130, l_tr), b'i' as u16);
+            assert_eq!(_towupper_l(0x0131, l_tr), b'I' as u16);
+            let wi_up = [b'I' as u16, 0];
+            let wi_lo = [b'i' as u16, 0];
+            let wi_dotless = [0x0131u16, 0];
+            let wi_dotted = [0x0130u16, 0];
+            assert_ne!(_wcsicmp_l(wi_up.as_ptr(), wi_lo.as_ptr(), l_tr), 0);
+            assert_eq!(_wcsicmp_l(wi_up.as_ptr(), wi_dotless.as_ptr(), l_tr), 0);
+            assert_eq!(_wcsicmp_l(wi_dotted.as_ptr(), wi_lo.as_ptr(), l_tr), 0);
+            assert_ne!(_stricmp_l(b"I\0".as_ptr(), b"i\0".as_ptr(), l_tr), 0);
+            assert_eq!(_stricmp_l(b"I\0".as_ptr(), b"\xFD\0".as_ptr(), l_tr), 0);
+            // Global "C" still folds ASCII I/i normally.
+            assert_eq!(toupper(b'i' as i32), b'I' as i32);
+            assert_eq!(towupper(b'i' as u16), b'I' as u16);
+            assert_eq!(_wcsicmp(wi_up.as_ptr(), wi_lo.as_ptr()), 0);
+            // Global tr-TR applies to towupper/towlower/_wcsicmp/_wcsupr/_wcslwr.
+            assert!(!crate::ucrt::locale::setlocale(2 /* LC_CTYPE */, b"tr-TR\0".as_ptr()).is_null());
+            assert_eq!(towupper(b'i' as u16), 0x0130);
+            assert_eq!(towlower(b'I' as u16), 0x0131);
+            assert_ne!(_wcsicmp(wi_up.as_ptr(), wi_lo.as_ptr()), 0);
+            assert_eq!(_wcsicmp(wi_up.as_ptr(), wi_dotless.as_ptr()), 0);
+            let mut wmut = [b'I' as u16, b'i' as u16, 0];
+            _wcslwr(wmut.as_mut_ptr());
+            assert_eq!(wmut, [0x0131, b'i' as u16, 0]);
+            _wcsupr(wmut.as_mut_ptr());
+            assert_eq!(wmut, [b'I' as u16, 0x0130, 0]);
+            assert!(!crate::ucrt::locale::setlocale(2, b"C\0".as_ptr()).is_null());
             crate::ucrt::locale::_free_locale(l_tr);
 
             // LC_COLLATE = de-DE sorts 'ä' (CP1252 0xE4) before 'b' (whereas C byte order puts 0xE4 > 'b').
