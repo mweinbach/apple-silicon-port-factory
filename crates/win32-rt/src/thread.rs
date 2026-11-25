@@ -466,16 +466,41 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
         }
     };
 
-    if !was_starting && pthread != 0 {
-        unsafe {
-            let _ = libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1);
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while !obj.terminated_ack.load(Ordering::Acquire)
-            && obj.exit_code().is_none()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_micros(200));
+    if !was_starting {
+        if pthread == 0 {
+            if obj.exit_code().is_none() {
+                obj.terminate_requested.store(false, Ordering::Release);
+                return false;
+            }
+        } else {
+            let kill_rc = unsafe { libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1) };
+            let confirmed = if kill_rc == libc::ESRCH {
+                true
+            } else if kill_rc == 0 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                while !obj.terminated_ack.load(Ordering::Acquire)
+                    && obj.exit_code().is_none()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                obj.terminated_ack.load(Ordering::Acquire)
+                    || obj.exit_code().is_some()
+                    || unsafe { libc::pthread_kill(pthread as libc::pthread_t, 0) } == libc::ESRCH
+            } else {
+                false
+            };
+            if !confirmed {
+                // Do not publish an exit code or signal waiters when the target thread
+                // has not confirmed termination (e.g. SIGUSR1 blocked or signal delivery
+                // failed) — otherwise callers waiting on the handle could free resources
+                // still in use by the running thread.
+                obj.terminate_requested.store(false, Ordering::Release);
+                log::warn!(
+                    "TerminateThread: target thread did not confirm termination (pthread_kill rc={kill_rc})"
+                );
+                return false;
+            }
         }
     }
 
@@ -668,6 +693,14 @@ pub fn spawn(
 
 extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
     let info = unsafe { Box::from_raw(arg as *mut StartInfo) };
+    // Ensure SIGUSR1 is unblocked on every spawned guest thread so TerminateThread
+    // does not inherit a blocked signal mask from an embedding host process.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
     STACK_ALLOC.with(|c| c.set(Some((info.stack_mem, info.stack_total))));
     if let Some(h) = THREAD_START_HOOK.get() {
         h();

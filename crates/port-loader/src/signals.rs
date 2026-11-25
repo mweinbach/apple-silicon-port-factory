@@ -524,31 +524,97 @@ fn decode_arm64_store(insn: u32) -> Option<(usize, usize)> {
     None
 }
 
-/// Emulate one AArch64 GPR load or store against a logically accessible 4 KiB subpage
-/// inside a 16 KiB host page that is kept `PROT_NONE` because a sibling 4 KiB subpage
-/// is still `PAGE_GUARD` or `PAGE_NOACCESS`. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+/// Decode the byte width (1/2/4/8) of an AArch64 GPR load or store at `pc`.
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u64, logical_prot: u32) -> bool {
+unsafe fn decoded_access_bytes(pc: u64, is_write: bool) -> Option<usize> {
+    if pc < 0x10000 || (pc & 3) != 0 {
+        return None;
+    }
+    let insn = std::ptr::read_unaligned(pc as *const u32);
+    if is_write {
+        decode_arm64_store(insn).map(|(_, bytes)| bytes)
+    } else {
+        decode_arm64_load(insn).map(|ld| ld.bytes)
+    }
+}
+
+/// Returns `true` iff the 4 KiB page containing `addr` is logically committed and
+/// permits the requested access (`read` or `write`) without `PAGE_NOACCESS`/`PAGE_GUARD`.
+#[cfg(target_arch = "aarch64")]
+fn subpage_allows_access(addr: usize, is_write: bool) -> bool {
     use win32_rt::kernel32::memory::{
-        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+        self, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+        PAGE_READWRITE, PAGE_WRITECOPY,
     };
-    if (logical_prot & 0xFF) == PAGE_NOACCESS || (logical_prot & PAGE_GUARD) != 0 {
+    let Some(mbi) = memory::query(addr) else {
+        return false;
+    };
+    if mbi.state != MEM_COMMIT || (mbi.protect & 0xFF) == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0 {
         return false;
     }
-    let writable = matches!(
-        logical_prot & 0xFF,
-        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
-    );
-    if is_write && !writable {
-        return false;
+    if is_write {
+        matches!(
+            mbi.protect & 0xFF,
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        )
+    } else {
+        true
     }
+}
+
+/// Emulate one AArch64 GPR load or store against logically accessible 4 KiB subpage(s)
+/// inside a 16 KiB host page that is kept `PROT_NONE` because a sibling 4 KiB subpage
+/// is still `PAGE_GUARD` or `PAGE_NOACCESS`. Validates EVERY 4 KiB subpage touched by
+/// the decoded access `[fault_addr, fault_addr + bytes)`. Caller MUST hold `HPAGE_LOCKS[hpage]`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u64) -> bool {
     let pc = *ss.add(32) & 0x0000_FFFF_FFFF_FFFF;
     if pc < 0x10000 || (pc & 3) != 0 {
         return false;
     }
     let insn = std::ptr::read_unaligned(pc as *const u32);
-    let hpage = (fault_addr as usize) & !0x3FFF;
-    let p = fault_addr as usize as *mut u8;
+    let bytes = if is_write {
+        let Some((_, b)) = decode_arm64_store(insn) else {
+            return false;
+        };
+        b
+    } else {
+        let Some(ld) = decode_arm64_load(insn) else {
+            return false;
+        };
+        ld.bytes
+    };
+    let start_addr = fault_addr as usize;
+    let Some(end_addr) = start_addr.checked_add(bytes - 1) else {
+        return false;
+    };
+    let p0 = start_addr & !0xFFF;
+    let p1 = end_addr & !0xFFF;
+    let hpage = start_addr & !0x3FFF;
+    let hpage1 = end_addr & !0x3FFF;
+    if !subpage_allows_access(p0, is_write) {
+        return false;
+    }
+    if p1 != p0 {
+        if !subpage_allows_access(p1, is_write) {
+            return false;
+        }
+        // If the unaligned access straddles into a second 16 KiB host page that also
+        // contains a protected sibling (and is therefore PROT_NONE), we do not hold
+        // its HPAGE_LOCKS slot here.
+        if hpage1 != hpage {
+            use win32_rt::kernel32::memory::{self, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+            let next_has_prot = (0..4).any(|i| {
+                memory::query(hpage1 + i * 0x1000).is_some_and(|m| {
+                    m.state == MEM_COMMIT && (m.protect == PAGE_NOACCESS || (m.protect & PAGE_GUARD) != 0)
+                })
+            });
+            if next_has_prot {
+                return false;
+            }
+        }
+    }
+    let p = start_addr as *mut u8;
     if is_write {
         let Some((rt, bytes)) = decode_arm64_store(insn) else {
             return false;
@@ -569,7 +635,10 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, is_write: bool, ss: *mut u
             }
         }
         let _ = libc::mprotect(hpage as *mut libc::c_void, 0x4000, libc::PROT_NONE);
-        win32_rt::kernel32::memory::mark_write_watch_dirty(fault_addr as usize);
+        win32_rt::kernel32::memory::mark_write_watch_dirty(start_addr);
+        if hpage1 != hpage {
+            win32_rt::kernel32::memory::mark_write_watch_dirty(end_addr);
+        }
     } else {
         let Some(ld) = decode_arm64_load(insn) else {
             return false;
@@ -748,27 +817,42 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         return false;
     }
     let addr = fault_addr as usize;
-    let hpage = addr & !0x3FFF;
+    let access_bytes = decoded_access_bytes(pc, is_write).unwrap_or(1);
+    let p0 = addr & !0xFFF;
+    let p1 = addr.saturating_add(access_bytes - 1) & !0xFFF;
+    // If an unaligned multi-byte access starts on an accessible 4 KiB subpage (`p0`)
+    // and spans into a protected or non-writable sibling 4 KiB subpage (`p1`), report
+    // and handle the fault at `p1` (matching x86-64 hardware CR2 on straddling faults).
+    let eff_fault_addr = if subpage_allows_access(p0, is_write) && p1 != p0 && !subpage_allows_access(p1, is_write) {
+        p1 as u64
+    } else {
+        fault_addr
+    };
+    let eff_addr = eff_fault_addr as usize;
+    let hpage = eff_addr & !0x3FFF;
     let sub_is_protected = |p: usize| -> bool {
         memory::query(p).is_some_and(|m| {
             m.state == MEM_COMMIT && (m.protect == PAGE_NOACCESS || (m.protect & PAGE_GUARD) != 0)
         })
     };
-    let Some(initial_mbi) = memory::query(addr) else {
+    let Some(initial_mbi) = memory::query(eff_addr) else {
         return false;
     };
     if initial_mbi.state != MEM_COMMIT {
         return false;
     }
-    let initial_fault_prot = initial_mbi.protect == PAGE_NOACCESS || (initial_mbi.protect & PAGE_GUARD) != 0;
+    let initial_fault_prot =
+        !subpage_allows_access(eff_addr, is_write) || initial_mbi.protect == PAGE_NOACCESS || (initial_mbi.protect & PAGE_GUARD) != 0;
     let initial_any_sibling_prot = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
-    // If the faulting 4 KiB subpage is logically accessible but shares a `PROT_NONE` 16 KiB
-    // host page with a `PAGE_GUARD` or non-guest `PAGE_NOACCESS` sibling, emulate the access
-    // transparently (even if no VEH handler is currently registered) so sibling protections stay intact.
+    // If every 4 KiB subpage touched by the access is logically accessible but shares a
+    // `PROT_NONE` 16 KiB host page with a `PAGE_GUARD` or non-guest `PAGE_NOACCESS` sibling,
+    // emulate the access transparently (even if no VEH handler is currently registered) so
+    // sibling protections stay intact.
     if !initial_fault_prot && initial_any_sibling_prot {
         let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
-        if let Some(mbi) = memory::query(addr) {
-            let now_fault_prot = mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0;
+        if let Some(mbi) = memory::query(eff_addr) {
+            let now_fault_prot =
+                !subpage_allows_access(eff_addr, is_write) || mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0;
             let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
             if mbi.state == MEM_COMMIT && !now_fault_prot {
                 if !now_any_sibling {
@@ -784,7 +868,7 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
                         && memory::query(sub).is_some_and(|m| m.state == MEM_COMMIT && m.protect == PAGE_NOACCESS)
                 });
                 if (any_sibling_guard || !any_guest_pe_noaccess_sibling || !unwind::has_guest_exception_handler())
-                    && try_emulate_subpage_access(fault_addr, is_write, ss, mbi.protect)
+                    && try_emulate_subpage_access(fault_addr, is_write, ss)
                 {
                     return true;
                 }
@@ -806,15 +890,15 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         // VirtualProtect while our read fault was already in flight to the kernel.
         // Retry once if the page is now logically readable and recently transitioned.
         if !is_write && memory::hpage_had_prot_change(hpage) {
-            let key = (pc, fault_addr);
+            let key = (pc, eff_fault_addr);
             if LAST_RACE_RETRY.with(|c| c.get()) != key {
                 let _hpage_guard = HPAGE_LOCKS[(hpage >> 14) & 63].lock().unwrap();
-                if let Some(mbi) = memory::query(addr) {
+                if let Some(mbi) = memory::query(eff_addr) {
                     let still_prot = mbi.protect == PAGE_NOACCESS
                         || (mbi.protect & PAGE_GUARD) != 0
                         || (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
                     if mbi.state == MEM_COMMIT && !still_prot {
-                        memory::ensure_host_page_readable(addr);
+                        memory::ensure_host_page_readable(eff_addr);
                         LAST_RACE_RETRY.with(|c| c.set(key));
                         return true;
                     }
@@ -827,14 +911,14 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
 
     let hpage_lock = &HPAGE_LOCKS[(hpage >> 14) & 63];
     let mut hpage_guard = Some(hpage_lock.lock().unwrap());
-    let Some(mbi) = memory::query(addr) else {
+    let Some(mbi) = memory::query(eff_addr) else {
         return false;
     };
     if mbi.state != MEM_COMMIT {
         return false;
     }
     let is_guard = (mbi.protect & PAGE_GUARD) != 0;
-    let fault_protected = mbi.protect == PAGE_NOACCESS || is_guard;
+    let fault_protected = !subpage_allows_access(eff_addr, is_write) || mbi.protect == PAGE_NOACCESS || is_guard;
     let any_sibling_protected = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
     if !fault_protected && !any_sibling_protected {
         // Another thread finished unlocking this 16 KiB host page while we waited.
@@ -847,36 +931,28 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
         // Windows clears PAGE_GUARD atomically BEFORE delivering STATUS_GUARD_PAGE_VIOLATION
         // so that VirtualQuery inside the handler observes the underlying protection and
         // returning EXCEPTION_CONTINUE_EXECUTION completes the faulting access once.
-        let _consumed = memory::consume_guard_page(addr);
+        let _consumed = memory::consume_guard_page(eff_addr);
         // Release HPAGE_LOCKS before dispatching the VEH on `PageFaultHelper` (a separate
         // OS thread). If the VEH accesses the just-consumed 4 KiB page while a sibling 4 KiB
         // subpage keeps the 16 KiB host page PROT_NONE, the helper thread faults and acquires
         // this same lock to emulate that access; holding it across dispatch would deadlock.
         drop(hpage_guard.take());
-        handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, fault_addr, is_write);
+        handled = deliver_page_fault(unwind::STATUS_GUARD_PAGE_VIOLATION, eff_fault_addr, is_write);
         if handled {
             let _emul_guard = hpage_lock.lock().unwrap();
-            if let Some(now_mbi) = memory::query(addr) {
-                let now_fault_prot =
-                    now_mbi.protect == PAGE_NOACCESS || (now_mbi.protect & PAGE_GUARD) != 0;
-                let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
-                if now_mbi.state == MEM_COMMIT && !now_fault_prot && now_any_sibling {
-                    // Sibling 4 KiB subpages remain guarded/noaccess (host page stays PROT_NONE):
-                    // emulate this single faulting instruction without exposing sibling subpages.
-                    handled = try_emulate_subpage_access(
-                        fault_addr,
-                        is_write,
-                        ss,
-                        now_mbi.protect,
-                    );
-                }
+            let now_any_sibling = (0..4).any(|i| sub_is_protected(hpage + i * 0x1000));
+            if now_any_sibling && subpage_allows_access(p0, is_write) && subpage_allows_access(p1, is_write) {
+                // Sibling 4 KiB subpages remain guarded/noaccess (host page stays PROT_NONE):
+                // emulate this single faulting instruction without exposing sibling subpages.
+                handled = try_emulate_subpage_access(fault_addr, is_write, ss);
             }
         }
         IN_FAULT.with(|f| f.set(false));
         return handled;
     }
     if fault_protected {
-        handled = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, fault_addr, false);
+        let av_write = if in_guest(eff_addr) { false } else { is_write };
+        handled = deliver_page_fault(unwind::STATUS_ACCESS_VIOLATION, eff_fault_addr, av_write);
         if !handled {
             IN_FAULT.with(|f| f.set(false));
             return false;
@@ -884,7 +960,7 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
     }
     // Unlock any sibling 4 KiB encrypted PAGE_NOACCESS sub-pages sharing this 16 KiB host page
     // (never eagerly consume sibling PAGE_GUARD pages).
-    let fault_page4 = addr & !0xFFF;
+    let fault_page4 = eff_addr & !0xFFF;
     for i in 0..4 {
         let sub = hpage + i * 0x1000;
         if sub == fault_page4 {
@@ -911,8 +987,8 @@ unsafe fn try_dispatch_guest_page_fault(fault_addr: u64, pc: u64, is_write: bool
                 handled = true;
             }
         }
-    } else if still_prot {
-        memory::ensure_host_page_readable(addr);
+    } else if still_prot && in_guest(eff_addr) {
+        memory::ensure_host_page_readable(eff_addr);
     }
     IN_FAULT.with(|f| f.set(false));
     handled

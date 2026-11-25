@@ -178,7 +178,11 @@ pub unsafe extern "win64" fn SuspendThread(h: HANDLE) -> u32 {
 
 pub unsafe extern "win64" fn TerminateThread(h: HANDLE, code: u32) -> BOOL {
     if let Some(t) = thread_obj(h) {
-        return thread::terminate_thread(&t, code) as BOOL;
+        if thread::terminate_thread(&t, code) {
+            return TRUE;
+        }
+        set_err(err::ERROR_ACCESS_DENIED);
+        return FALSE;
     }
     if handles::get_as::<crate::kernel32::process::ChildThreadObj>(h).is_some() {
         set_err(err::ERROR_ACCESS_DENIED);
@@ -1921,7 +1925,45 @@ mod tests {
             assert_eq!(CloseHandle(h_live), TRUE);
             assert_eq!(CloseHandle(ready), TRUE);
 
-            // 3. Invalid handle -> ERROR_INVALID_HANDLE.
+            // 3. Live thread with SIGUSR1 explicitly blocked must NOT be reported terminated.
+            let ready_blk = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let release_blk = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let rb_u = ready_blk as usize;
+            let rel_u = release_blk as usize;
+            let obj_blk = thread::spawn(
+                Box::new(move || {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGUSR1);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    SetEvent(rb_u as HANDLE);
+                    WaitForSingleObject(rel_u as HANDLE, 5_000);
+                    0x77u32
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn sigusr1-blocked thread");
+            let h_blk = handles::insert(obj_blk);
+            assert_eq!(WaitForSingleObject(ready_blk, 5_000), WAIT_OBJECT_0);
+            assert_eq!(TerminateThread(h_blk, 0xBAD0_0001), FALSE);
+            assert_eq!(teb::last_error(), err::ERROR_ACCESS_DENIED);
+            // Thread handle must remain unsignaled and STILL_ACTIVE while the thread runs.
+            assert_eq!(WaitForSingleObject(h_blk, 0), WAIT_TIMEOUT);
+            let mut blk_code = 0u32;
+            assert_eq!(GetExitCodeThread(h_blk, &mut blk_code), TRUE);
+            assert_eq!(blk_code, STILL_ACTIVE);
+            // Release it cleanly and confirm normal exit code is observed.
+            SetEvent(release_blk);
+            assert_eq!(WaitForSingleObject(h_blk, 5_000), WAIT_OBJECT_0);
+            assert_eq!(GetExitCodeThread(h_blk, &mut blk_code), TRUE);
+            assert_eq!(blk_code, 0x77);
+            assert_eq!(CloseHandle(h_blk), TRUE);
+            assert_eq!(CloseHandle(ready_blk), TRUE);
+            assert_eq!(CloseHandle(release_blk), TRUE);
+
+            // 4. Invalid handle -> ERROR_INVALID_HANDLE.
             assert_eq!(TerminateThread(0x1234usize as HANDLE, 1), FALSE);
             assert_eq!(teb::last_error(), err::ERROR_INVALID_HANDLE);
 

@@ -1747,11 +1747,19 @@ int main(void) {
     CHECK(g_guard_hits == 1, "subpage 0 did not fire a second time");
     CHECK(*(volatile uint32_t *)(gp + 0x44) == 0x24681357u, "second write to subpage 0 succeeded");
 
-    /* First write to sibling 4 KiB subpage 1 MUST fire STATUS_GUARD_PAGE_VIOLATION independently. */
-    *(volatile uint32_t *)(gp + 0x1040) = 0x89ABCDEFu;
-    CHECK(g_guard_hits == 2, "sibling subpage 1 fired its own guard violation");
-    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1040), "sibling guard fault address matches");
-    CHECK(*(volatile uint32_t *)(gp + 0x1040) == 0x89ABCDEFu, "sibling write completed");
+    /* First write to sibling 4 KiB subpage 1 via an unaligned 2-byte store at offset 0xFFF
+       (spanning accessible subpage 0 and guarded subpage 1) MUST fire STATUS_GUARD_PAGE_VIOLATION
+       for subpage 1 (at gp + 0x1000) rather than silently writing across the boundary! */
+    *(volatile uint16_t *)(gp + 0x0FFF) = 0xCAFEu;
+    CHECK(g_guard_hits == 2, "straddling write at 0xFFF fired guard violation on subpage 1");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x1000), "straddling guard fault reported subpage 1 boundary");
+    CHECK(*(volatile uint16_t *)(gp + 0x0FFF) == 0xCAFEu, "straddling 2-byte write landed across 0xFFF..0x1000");
+
+    /* Sibling 4 KiB subpage 2 MUST still be independently guarded! */
+    *(volatile uint32_t *)(gp + 0x2040) = 0x89ABCDEFu;
+    CHECK(g_guard_hits == 3, "sibling subpage 2 fired its own guard violation");
+    CHECK(g_guard_addr == (ULONG_PTR)(gp + 0x2040), "sibling subpage 2 fault address matches");
+    CHECK(*(volatile uint32_t *)(gp + 0x2040) == 0x89ABCDEFu, "sibling subpage 2 write completed");
     CHECK(VirtualFree(gp, 0, MEM_RELEASE), "VirtualFree guard region");
     printf("CORPUS_KCORE: page_guard_oneshot ok\n");
 
