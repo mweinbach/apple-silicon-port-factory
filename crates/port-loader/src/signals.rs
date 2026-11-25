@@ -505,6 +505,15 @@ enum AtomicRmwOp {
     Swp, // SWP{,A,L,AL}
 }
 
+/// Addressing mode for AArch64 `LDP`/`STP` pair instructions.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairIndexMode {
+    SignedOffset,
+    PostIndex,
+    PreIndex,
+}
+
 /// Decoded AArch64 memory load, store, or LSE atomic RMW/CAS instruction for subpage
 /// access emulation on 16 KiB Apple Silicon pages.
 #[cfg(target_arch = "aarch64")]
@@ -514,10 +523,10 @@ enum Arm64MemOp {
     GprStore { rt: usize, bytes: usize },
     SimdLoad { vt: usize, bytes: usize },
     SimdStore { vt: usize, bytes: usize },
-    GprPairLoad { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize, signed_64: bool },
-    GprPairStore { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize },
-    SimdPairLoad { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
-    SimdPairStore { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize },
+    GprPairLoad { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize, signed_64: bool, mode: PairIndexMode },
+    GprPairStore { rt1: usize, rt2: usize, rn: usize, imm: i64, elem_bytes: usize, mode: PairIndexMode },
+    SimdPairLoad { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize, mode: PairIndexMode },
+    SimdPairStore { vt1: usize, vt2: usize, rn: usize, imm: i64, elem_bytes: usize, mode: PairIndexMode },
     /// LSE `LDADD`/`LDCLR`/`LDEOR`/`LDSET`/`SWP` (`rs` = operand, `rt` = old-value dest).
     AtomicRmw { op: AtomicRmwOp, rs: usize, rt: usize, bytes: usize },
     /// LSE `CAS{,A,L,AL}` (`rs` = expected in / old out, `rt` = replacement in).
@@ -569,25 +578,33 @@ impl Arm64MemOp {
             | Self::AtomicCasp { elem_bytes, .. } => elem_bytes * 2,
         }
     }
-    /// Recover the instruction's exact starting effective address from `insn` and `ss`,
-    /// verifying that `fault_addr` (`FAR_EL1`) falls within `[ea, ea + total_bytes)`.
+    /// Recover the instruction's exact starting effective address and optional base-register
+    /// writeback `(rn, new_base)` from `insn` and `ss`, verifying that `fault_addr` (`FAR_EL1`)
+    /// falls within `[ea, ea + total_bytes)`.
     ///
-    /// This handles Apple Silicon reporting `FAR_EL1` at the second 16 KiB host-page
-    /// boundary when an unaligned single-register or pair access starts on an accessible
-    /// host page and crosses into an adjacent host page kept `PROT_NONE` for a sibling.
-    unsafe fn effective_addr(self, insn: u32, fault_addr: u64, ss: *const u64) -> Option<usize> {
+    /// Handles Apple Silicon reporting `FAR_EL1` at the second 16 KiB host-page boundary
+    /// when an unaligned single-register or pair access starts on an accessible host page
+    /// and crosses into an adjacent host page kept `PROT_NONE` for a sibling, as well as
+    /// pre-indexed and post-indexed writeback addressing forms emitted for guest stack ops.
+    unsafe fn effective_addr_and_wb(self, insn: u32, fault_addr: u64, ss: *const u64) -> Option<(usize, Option<(usize, u64)>)> {
         let total = self.total_bytes();
-        let ea: usize = match self {
-            Self::GprPairLoad { rn, imm, .. }
-            | Self::GprPairStore { rn, imm, .. }
-            | Self::SimdPairLoad { rn, imm, .. }
-            | Self::SimdPairStore { rn, imm, .. } => {
+        let (ea, wb): (usize, Option<(usize, u64)>) = match self {
+            Self::GprPairLoad { rn, imm, mode, .. }
+            | Self::GprPairStore { rn, imm, mode, .. }
+            | Self::SimdPairLoad { rn, imm, mode, .. }
+            | Self::SimdPairStore { rn, imm, mode, .. } => {
                 // `ss[0..=30]` are X0..X30, `ss[31]` is SP.
-                (*ss.add(rn)).wrapping_add(imm as u64) as usize
+                let base = *ss.add(rn);
+                let updated = base.wrapping_add(imm as u64);
+                match mode {
+                    PairIndexMode::SignedOffset => (updated as usize, None),
+                    PairIndexMode::PostIndex => (base as usize, Some((rn, updated))),
+                    PairIndexMode::PreIndex => (updated as usize, Some((rn, updated))),
+                }
             }
             Self::AtomicRmw { .. } | Self::AtomicCas { .. } | Self::AtomicCasp { .. } => {
                 let rn = ((insn >> 5) & 0x1F) as usize;
-                *ss.add(rn) as usize
+                (*ss.add(rn) as usize, None)
             }
             Self::GprLoad { bytes, .. }
             | Self::GprStore { bytes, .. }
@@ -598,7 +615,7 @@ impl Arm64MemOp {
                 // 1. Unsigned 12-bit scaled offset: LDR/STR GPR (0x39) or SIMD&FP (0x3D).
                 if (insn & 0x3B00_0000) == 0x3900_0000 {
                     let imm12 = ((insn >> 10) & 0xFFF) as u64;
-                    base.wrapping_add(imm12 * (bytes as u64)) as usize
+                    (base.wrapping_add(imm12 * (bytes as u64)) as usize, None)
                 }
                 // 2. Register-offset: LDR/STR GPR (0x3820_0800) or SIMD&FP (0x3C20_0800).
                 else if (insn & 0x3B20_0C00) == 0x3820_0800 {
@@ -616,19 +633,31 @@ impl Arm64MemOp {
                     } else {
                         0
                     };
-                    base.wrapping_add(ext.wrapping_shl(shift)) as usize
+                    (base.wrapping_add(ext.wrapping_shl(shift)) as usize, None)
                 }
                 // 3. Unscaled 9-bit signed offset: LDUR/STUR GPR/SIMD (0x38/0x3C) or LDAPUR/STLUR (0x19).
                 else if (insn & 0x3B20_0C00) == 0x3800_0000 || (insn & 0x3F20_0C00) == 0x1900_0000 {
                     let simm9 = (((insn >> 12) & 0x1FF) as i32) << 23 >> 23;
-                    base.wrapping_add(simm9 as i64 as u64) as usize
+                    (base.wrapping_add(simm9 as i64 as u64) as usize, None)
                 }
-                // 4. Plain [Xn] base register: LDAR/LDAPR/STLR.
+                // 4. Post-index 9-bit signed offset: LDR/STR GPR/SIMD [Xn], #simm9.
+                else if (insn & 0x3B20_0C00) == 0x3800_0400 {
+                    let simm9 = (((insn >> 12) & 0x1FF) as i32) << 23 >> 23;
+                    let updated = base.wrapping_add(simm9 as i64 as u64);
+                    (base as usize, Some((rn, updated)))
+                }
+                // 5. Pre-index 9-bit signed offset: LDR/STR GPR/SIMD [Xn, #simm9]!.
+                else if (insn & 0x3B20_0C00) == 0x3800_0C00 {
+                    let simm9 = (((insn >> 12) & 0x1FF) as i32) << 23 >> 23;
+                    let updated = base.wrapping_add(simm9 as i64 as u64);
+                    (updated as usize, Some((rn, updated)))
+                }
+                // 6. Plain [Xn] base register: LDAR/LDAPR/STLR.
                 else if (insn & 0x3FFF_FC00) == 0x08DF_FC00
                     || (insn & 0x3FFF_FC00) == 0x38BF_C000
                     || (insn & 0x3FFF_FC00) == 0x089F_FC00
                 {
-                    base as usize
+                    (base as usize, None)
                 } else {
                     return None;
                 }
@@ -636,10 +665,14 @@ impl Arm64MemOp {
         };
         let f = fault_addr as usize;
         if f >= ea && f < ea.saturating_add(total) {
-            Some(ea)
+            Some((ea, wb))
         } else {
             None
         }
+    }
+
+    unsafe fn effective_addr(self, insn: u32, fault_addr: u64, ss: *const u64) -> Option<usize> {
+        self.effective_addr_and_wb(insn, fault_addr, ss).map(|(ea, _)| ea)
     }
 }
 
@@ -662,27 +695,30 @@ fn decode_arm64_store(insn: u32) -> Option<(usize, usize)> {
     if (insn & 0x3FC0_0000) == 0x3900_0000 {
         return Some((rt, bytes));
     }
-    // Unscaled STUR or register-offset STR (no writeback): xx11_1000_00...
+    // Unscaled STUR, register-offset STR, or pre/post-indexed STR: xx11_1000_00...
     if (insn & 0x3FC0_0000) == 0x3800_0000 {
-        let is_stur = (insn & 0x0020_0C00) == 0x0000_0000;
-        let is_reg = (insn & 0x0020_0C00) == 0x0020_0800;
-        if is_stur || is_reg {
+        let mode = insn & 0x0020_0C00;
+        if mode == 0x0000_0000 || mode == 0x0020_0800 || mode == 0x0000_0400 || mode == 0x0000_0C00 {
             return Some((rt, bytes));
         }
     }
     None
 }
 
-/// Decode an AArch64 scalar GPR, SIMD&FP (`B`/`H`/`S`/`D`/`Q`), or non-writeback
-/// pair (`LDP`/`STP`) load or store instruction.
+/// Decode an AArch64 scalar GPR, SIMD&FP (`B`/`H`/`S`/`D`/`Q`), pair (`LDP`/`STP`
+/// signed-offset, pre-index, or post-index), or ARMv8.1 LSE atomic instruction.
 #[cfg(target_arch = "aarch64")]
 fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
-    // 1. SIMD&FP single-register unsigned-offset (`LDR`/`STR {B,H,S,D,Q}t, [Xn, #pimm]`)
-    //    or unscaled/register-offset without writeback (`LDUR`/`STUR`, `LDR`/`STR [Xn, Xm]`).
+    // 1. SIMD&FP single-register unsigned-offset (`LDR`/`STR {B,H,S,D,Q}t, [Xn, #pimm]`),
+    //    unscaled/register-offset (`LDUR`/`STUR`, `LDR`/`STR [Xn, Xm]`), or pre/post-index.
     let is_simd_ui = (insn & 0x3F00_0000) == 0x3D00_0000;
-    let is_simd_ur_or_reg = (insn & 0x3F00_0000) == 0x3C00_0000
-        && ((insn & 0x0020_0C00) == 0x0000_0000 || (insn & 0x0020_0C00) == 0x0020_0800);
-    if is_simd_ui || is_simd_ur_or_reg {
+    let simd_mode = insn & 0x0020_0C00;
+    let is_simd_imm_or_reg = (insn & 0x3F00_0000) == 0x3C00_0000
+        && (simd_mode == 0x0000_0000
+            || simd_mode == 0x0020_0800
+            || simd_mode == 0x0000_0400
+            || simd_mode == 0x0000_0C00);
+    if is_simd_ui || is_simd_imm_or_reg {
         let size = (insn >> 30) & 3;
         let opc = (insn >> 22) & 3;
         let vt = (insn & 0x1F) as usize;
@@ -701,8 +737,14 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
         };
     }
 
-    // 2. Non-writeback SIMD&FP signed-offset pair `LDP`/`STP {S,D,Q}t1, t2, [Xn, #imm]`.
-    if (insn & 0x3F80_0000) == 0x2D00_0000 {
+    // 2. SIMD&FP pair `LDP`/`STP {S,D,Q}t1, t2, [Xn, #imm]` (signed-offset, post-index, pre-index).
+    let simd_pair_mode = match insn & 0x3F80_0000 {
+        0x2D00_0000 => Some(PairIndexMode::SignedOffset),
+        0x2C80_0000 => Some(PairIndexMode::PostIndex),
+        0x2D80_0000 => Some(PairIndexMode::PreIndex),
+        _ => None,
+    };
+    if let Some(mode) = simd_pair_mode {
         let opc = (insn >> 30) & 3;
         let elem_bytes = match opc {
             0 => 4usize,
@@ -717,14 +759,20 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
         let rn = ((insn >> 5) & 0x1F) as usize;
         let vt1 = (insn & 0x1F) as usize;
         return Some(if is_load {
-            Arm64MemOp::SimdPairLoad { vt1, vt2, rn, imm, elem_bytes }
+            Arm64MemOp::SimdPairLoad { vt1, vt2, rn, imm, elem_bytes, mode }
         } else {
-            Arm64MemOp::SimdPairStore { vt1, vt2, rn, imm, elem_bytes }
+            Arm64MemOp::SimdPairStore { vt1, vt2, rn, imm, elem_bytes, mode }
         });
     }
 
-    // 3. Non-writeback GPR signed-offset pair `LDP`/`STP`/`LDPSW {W,X}t1, t2, [Xn, #imm]`.
-    if (insn & 0x3F80_0000) == 0x2900_0000 {
+    // 3. GPR pair `LDP`/`STP`/`LDPSW {W,X}t1, t2, [Xn, #imm]` (signed-offset, post-index, pre-index).
+    let gpr_pair_mode = match insn & 0x3F80_0000 {
+        0x2900_0000 => Some(PairIndexMode::SignedOffset),
+        0x2880_0000 => Some(PairIndexMode::PostIndex),
+        0x2980_0000 => Some(PairIndexMode::PreIndex),
+        _ => None,
+    };
+    if let Some(mode) = gpr_pair_mode {
         let opc = (insn >> 30) & 3;
         let is_load = ((insn >> 22) & 1) != 0;
         let (elem_bytes, signed_64) = match (opc, is_load) {
@@ -739,9 +787,9 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
         let rn = ((insn >> 5) & 0x1F) as usize;
         let rt1 = (insn & 0x1F) as usize;
         return Some(if is_load {
-            Arm64MemOp::GprPairLoad { rt1, rt2, rn, imm, elem_bytes, signed_64 }
+            Arm64MemOp::GprPairLoad { rt1, rt2, rn, imm, elem_bytes, signed_64, mode }
         } else {
-            Arm64MemOp::GprPairStore { rt1, rt2, rn, imm, elem_bytes }
+            Arm64MemOp::GprPairStore { rt1, rt2, rn, imm, elem_bytes, mode }
         });
     }
 
@@ -779,7 +827,7 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
         }
     }
 
-    // 5. Scalar GPR load or store.
+    // 5. Scalar GPR load or store (including pre-indexed and post-indexed GPR loads).
     if let Some((rt, bytes)) = decode_arm64_store(insn) {
         return Some(Arm64MemOp::GprStore { rt, bytes });
     }
@@ -790,6 +838,19 @@ fn decode_arm64_mem_op(insn: u32) -> Option<Arm64MemOp> {
             signed_64: ld.signed_64,
             signed_32: ld.signed_32,
         });
+    }
+    if (insn & 0x3F00_0000) == 0x3800_0000 {
+        let mode = insn & 0x0020_0C00;
+        if mode == 0x0000_0400 || mode == 0x0000_0C00 {
+            let rt = (insn & 0x1F) as usize;
+            let bytes = 1usize << (((insn >> 30) & 3) as usize);
+            return match (insn >> 22) & 3 {
+                1 => Some(Arm64MemOp::GprLoad { rt, bytes, signed_64: false, signed_32: false }),
+                2 => Some(Arm64MemOp::GprLoad { rt, bytes, signed_64: true, signed_32: false }),
+                3 => Some(Arm64MemOp::GprLoad { rt, bytes, signed_64: false, signed_32: true }),
+                _ => None,
+            };
+        }
     }
     None
 }
@@ -1242,7 +1303,7 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, esr_is_write: bool, mc: *m
         return false;
     }
     let is_write = op.requires_write();
-    let Some(start_addr) = op.effective_addr(insn, fault_addr, ss) else {
+    let Some((start_addr, writeback)) = op.effective_addr_and_wb(insn, fault_addr, ss) else {
         return false;
     };
     let total_bytes = op.total_bytes();
@@ -1356,6 +1417,10 @@ unsafe fn try_emulate_subpage_access(fault_addr: u64, esr_is_write: bool, mc: *m
             }
             _ => return false,
         }
+    }
+    if let Some((rn, new_base)) = writeback {
+        // `ss[0..=30]` are X0..X30, `ss[31]` is SP.
+        *ss.add(rn) = new_base;
     }
     *ss.add(32) = (*ss.add(32) & !0x0000_FFFF_FFFF_FFFF) | pc.wrapping_add(4);
     true
@@ -1957,6 +2022,104 @@ mod tests {
             assert_eq!(op_reg.effective_addr(ldr_reg, far_boundary, ss.as_ptr()), Some(0x1000_3FFC));
             // Reject FAR outside [ea, ea + total_bytes)
             assert_eq!(op_q.effective_addr(0x3DC0_0041, 0x1000_4010, ss.as_ptr()), None);
+
+            // Verify pre/post-indexed stack writeback forms emitted by JIT `pushpop_enabled()`:
+            // 1. `str x3, [x7, #-8]!` (pre-index: 0xF800_0C00 | ((-8 & 0x1FF) << 12) | (7 << 5) | 3)
+            ss[7] = 0x1000_2000;
+            let str_pre = 0xF800_0C00u32 | (((-8i32 as u32) & 0x1FF) << 12) | (7 << 5) | 3;
+            let op_sp = decode_arm64_mem_op(str_pre).expect("decode str_pre");
+            assert!(matches!(op_sp, Arm64MemOp::GprStore { rt: 3, bytes: 8 }));
+            assert_eq!(
+                op_sp.effective_addr_and_wb(str_pre, 0x1000_1FF8, ss.as_ptr()),
+                Some((0x1000_1FF8, Some((7, 0x1000_1FF8))))
+            );
+
+            // 2. `ldr x3, [x7], #8` (post-index: 0xF840_0400 | (8 << 12) | (7 << 5) | 3)
+            let ldr_post = 0xF840_0400u32 | (8 << 12) | (7 << 5) | 3;
+            let op_lp = decode_arm64_mem_op(ldr_post).expect("decode ldr_post");
+            assert!(matches!(op_lp, Arm64MemOp::GprLoad { rt: 3, bytes: 8, .. }));
+            assert_eq!(
+                op_lp.effective_addr_and_wb(ldr_post, 0x1000_2000, ss.as_ptr()),
+                Some((0x1000_2000, Some((7, 0x1000_2008))))
+            );
+
+            // 3. `stp x5, x6, [x7, #-16]!` (pre-index: 0xA980_0000 | (((-2) & 0x7F) << 15) | (6 << 10) | (7 << 5) | 5)
+            let stp_pre = 0xA980_0000u32 | (((-2i32 as u32) & 0x7F) << 15) | (6 << 10) | (7 << 5) | 5;
+            let op_stp = decode_arm64_mem_op(stp_pre).expect("decode stp_pre");
+            assert!(matches!(
+                op_stp,
+                Arm64MemOp::GprPairStore { rt1: 5, rt2: 6, rn: 7, imm: -16, elem_bytes: 8, mode: PairIndexMode::PreIndex }
+            ));
+            assert_eq!(
+                op_stp.effective_addr_and_wb(stp_pre, 0x1000_1FF0, ss.as_ptr()),
+                Some((0x1000_1FF0, Some((7, 0x1000_1FF0))))
+            );
+
+            // 4. `ldp x5, x6, [x7], #16` (post-index: 0xA8C0_0000 | (2 << 15) | (6 << 10) | (7 << 5) | 5)
+            let ldp_post = 0xA8C0_0000u32 | (2 << 15) | (6 << 10) | (7 << 5) | 5;
+            let op_ldp = decode_arm64_mem_op(ldp_post).expect("decode ldp_post");
+            assert!(matches!(
+                op_ldp,
+                Arm64MemOp::GprPairLoad { rt1: 5, rt2: 6, rn: 7, imm: 16, elem_bytes: 8, mode: PairIndexMode::PostIndex, .. }
+            ));
+            assert_eq!(
+                op_ldp.effective_addr_and_wb(ldp_post, 0x1000_2000, ss.as_ptr()),
+                Some((0x1000_2000, Some((7, 0x1000_2010))))
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn subpage_emulation_executes_writeback_stack_ops_and_updates_base() {
+        use win32_rt::kernel32::memory::{self, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE};
+        unsafe {
+            let p = memory::VirtualAlloc(std::ptr::null_mut(), 0x4000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let base = p as usize;
+            // Guard subpage 0 so the entire 16 KiB host page stays PROT_NONE while subpage 1 is writable.
+            let mut old = 0u32;
+            assert_eq!(memory::VirtualProtect(p, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 1);
+
+            let code: [u32; 4] = [
+                0xF800_0C00u32 | (((-8i32 as u32) & 0x1FF) << 12) | (7 << 5) | 3,  // str x3, [x7, #-8]!
+                0xF840_0400u32 | (8 << 12) | (7 << 5) | 4,                           // ldr x4, [x7], #8
+                0xA980_0000u32 | (((-2i32 as u32) & 0x7F) << 15) | (6 << 10) | (7 << 5) | 5, // stp x5, x6, [x7, #-16]!
+                0xA8C0_0000u32 | (2 << 15) | (9 << 10) | (7 << 5) | 8,               // ldp x8, x9, [x7], #16
+            ];
+            let mut mc = [0u8; 832];
+            let mut ss = [0u64; 33];
+            let sp0 = (base + 0x1800) as u64;
+            ss[7] = sp0;
+            ss[3] = 0x1122_3344_5566_7788;
+            ss[5] = 0xAAAA_BBBB_CCCC_DDDD;
+            ss[6] = 0x0123_4567_89AB_CDEF;
+
+            // 1. str x3, [x7, #-8]!
+            ss[32] = code.as_ptr() as u64;
+            assert!(try_emulate_subpage_access(sp0 - 8, true, mc.as_mut_ptr(), ss.as_mut_ptr()));
+            assert_eq!(ss[7], sp0 - 8);
+            assert_eq!(ss[32], code.as_ptr() as u64 + 4);
+
+            // 2. ldr x4, [x7], #8
+            assert!(try_emulate_subpage_access(sp0 - 8, false, mc.as_mut_ptr(), ss.as_mut_ptr()));
+            assert_eq!(ss[4], 0x1122_3344_5566_7788);
+            assert_eq!(ss[7], sp0);
+            assert_eq!(ss[32], code.as_ptr() as u64 + 8);
+
+            // 3. stp x5, x6, [x7, #-16]!
+            assert!(try_emulate_subpage_access(sp0 - 16, true, mc.as_mut_ptr(), ss.as_mut_ptr()));
+            assert_eq!(ss[7], sp0 - 16);
+            assert_eq!(ss[32], code.as_ptr() as u64 + 12);
+
+            // 4. ldp x8, x9, [x7], #16
+            assert!(try_emulate_subpage_access(sp0 - 16, false, mc.as_mut_ptr(), ss.as_mut_ptr()));
+            assert_eq!(ss[8], 0xAAAA_BBBB_CCCC_DDDD);
+            assert_eq!(ss[9], 0x0123_4567_89AB_CDEF);
+            assert_eq!(ss[7], sp0);
+            assert_eq!(ss[32], code.as_ptr() as u64 + 16);
+
+            assert_eq!(memory::VirtualFree(p, 0, MEM_RELEASE), 1);
         }
     }
 

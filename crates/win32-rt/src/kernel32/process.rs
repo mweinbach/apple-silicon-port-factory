@@ -532,7 +532,14 @@ pub unsafe extern "win64" fn SetProcessAffinityMask(h: HANDLE, mask: usize) -> B
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    if let Some((job_mask, allow_subset)) = job_affinity_constraint() {
+        if (mask & !job_mask) != 0 || (!allow_subset && mask != job_mask) {
+            set_err(err::ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+    }
     PROCESS_AFFINITY_MASK.store(mask, Ordering::Release);
+    clamp_live_thread_affinities(mask);
     TRUE
 }
 
@@ -1710,12 +1717,68 @@ const JOB_OBJECT_LIMIT_SCHEDULING_CLASS: u32 = 0x0000_0080;
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
 const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const JOB_OBJECT_LIMIT_SUBSET_AFFINITY: u32 = 0x0000_4000;
 const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
     | JOB_OBJECT_LIMIT_PROCESS_TIME
     | JOB_OBJECT_LIMIT_JOB_TIME
     | JOB_OBJECT_LIMIT_SCHEDULING_CLASS
     | JOB_OBJECT_LIMIT_PROCESS_MEMORY
     | JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+/// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
+/// job with `JOB_OBJECT_LIMIT_AFFINITY` set.
+fn job_affinity_constraint() -> Option<(usize, bool)> {
+    let my_pid = std::process::id();
+    let jobs: Vec<Arc<JobObj>> = {
+        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut combined: Option<usize> = None;
+    let mut allow_subset = true;
+    for jo in jobs {
+        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let flags = st.limit_flags();
+        if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && st.contains_pid(my_pid) {
+            let aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
+            if aff != 0 {
+                combined = Some(match combined {
+                    Some(cur) => cur & aff,
+                    None => aff,
+                });
+                if (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) == 0 {
+                    allow_subset = false;
+                }
+            }
+        }
+    }
+    combined.filter(|&m| m != 0).map(|m| (m, allow_subset))
+}
+
+/// Clamp every live thread's non-zero affinity mask to `proc_mask` so threads cannot remain
+/// bound to CPUs disallowed by the process or job affinity mask.
+fn clamp_live_thread_affinities(proc_mask: usize) {
+    for t in crate::thread::all_threads() {
+        let cur = t.affinity_mask.load(Ordering::Acquire);
+        if cur != 0 && (cur & !proc_mask) != 0 {
+            let next = if (cur & proc_mask) != 0 { cur & proc_mask } else { proc_mask };
+            t.affinity_mask.store(next, Ordering::Release);
+            crate::thread::sched::apply_affinity_mask(&t, next, proc_mask);
+        }
+    }
+}
+
+/// Apply a job's `JOB_OBJECT_LIMIT_AFFINITY` restriction to the current process and live threads.
+fn apply_job_affinity_limit(aff: usize, allow_subset: bool) {
+    let sm = system_affinity_mask();
+    let eff = aff & sm;
+    if eff == 0 {
+        return;
+    }
+    let cur = current_process_affinity_mask();
+    let next = if allow_subset && (cur & eff) != 0 { cur & eff } else { eff };
+    PROCESS_AFFINITY_MASK.store(next, Ordering::Release);
+    clamp_live_thread_affinities(next);
+}
 
 enum JobMember {
     SelfProc(u32),
@@ -2098,6 +2161,13 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
             PRIORITY_CLASS.store(prio, Ordering::Relaxed);
         }
     }
+    let apply_aff = if (st.limit_flags() & JOB_OBJECT_LIMIT_AFFINITY) != 0 && pid == std::process::id() {
+        let aff = usize::from_le_bytes(st.basic_limits[48..56].try_into().unwrap());
+        let allow_subset = (st.limit_flags() & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0;
+        (aff != 0).then_some((aff, allow_subset))
+    } else {
+        None
+    };
     if matches!(member, JobMember::SelfProc(_)) {
         let snap = self_rusage_snapshot();
         st.self_assign_rusage = Some(snap);
@@ -2125,6 +2195,9 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
         }
     }
     drop(st);
+    if let Some((aff, allow_subset)) = apply_aff {
+        apply_job_affinity_limit(aff, allow_subset);
+    }
     if keep_alive {
         retain_active_job(&j);
     }
@@ -2168,11 +2241,22 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = buf;
-            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
+            let contains_self = st.contains_pid(std::process::id());
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
                 let prio = u32::from_le_bytes(buf[56..60].try_into().unwrap());
                 if prio != 0 {
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
+            }
+            let apply_aff = if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && contains_self {
+                let aff = usize::from_le_bytes(buf[48..56].try_into().unwrap());
+                Some((aff, (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0))
+            } else {
+                None
+            };
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
             }
             TRUE
         }
@@ -2250,11 +2334,22 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
                 }
             }
             st.basic_limits = basic;
-            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && st.contains_pid(std::process::id()) {
+            let contains_self = st.contains_pid(std::process::id());
+            if (flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) != 0 && contains_self {
                 let prio = u32::from_le_bytes(basic[56..60].try_into().unwrap());
                 if prio != 0 {
                     PRIORITY_CLASS.store(prio, Ordering::Relaxed);
                 }
+            }
+            let apply_aff = if (flags & JOB_OBJECT_LIMIT_AFFINITY) != 0 && contains_self {
+                let aff = usize::from_le_bytes(basic[48..56].try_into().unwrap());
+                Some((aff, (flags & JOB_OBJECT_LIMIT_SUBSET_AFFINITY) != 0))
+            } else {
+                None
+            };
+            drop(st);
+            if let Some((aff, allow_subset)) = apply_aff {
+                apply_job_affinity_limit(aff, allow_subset);
             }
             TRUE
         }
@@ -4142,10 +4237,37 @@ pub(crate) mod tests {
             assert_eq!(SetInformationJobObject(job, 999, ext.as_ptr() as *const c_void, 4), FALSE);
             assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
 
-            // Clear KILL_ON_JOB_CLOSE before closing in-process so the test runner continues
-            // (self-termination on KILL_ON_JOB_CLOSE is tested in the subprocess test below).
+            // JOB_OBJECT_LIMIT_AFFINITY restricts GetProcessAffinityMask, SetProcessAffinityMask,
+            // and SetThreadAffinityMask for assigned processes.
+            let mut orig_pm = 0usize;
+            let mut orig_sm = 0usize;
+            assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut orig_pm, &mut orig_sm), TRUE);
+            if orig_sm >= 0x3 {
+                let mut aff_basic = [0u8; 64];
+                std::ptr::write_unaligned(
+                    aff_basic.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_AFFINITY,
+                );
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(40) as *mut u32, 1u32);
+                std::ptr::write_unaligned(aff_basic.as_mut_ptr().add(48) as *mut usize, 0x1usize);
+                assert_eq!(SetInformationJobObject(job, 2, aff_basic.as_ptr() as *const c_void, 64), TRUE);
+
+                let mut pm_now = 0usize;
+                let mut sm_now = 0usize;
+                assert_eq!(GetProcessAffinityMask(handles::CURRENT_PROCESS, &mut pm_now, &mut sm_now), TRUE);
+                assert_eq!(pm_now, 0x1);
+                // Disallowed CPU bit 1 rejected by both SetThreadAffinityMask and SetProcessAffinityMask.
+                assert_eq!(crate::kernel32::threads::SetThreadAffinityMask(handles::CURRENT_THREAD, 0x2), 0);
+                assert_eq!(crate::teb::last_error(), err::ERROR_INVALID_PARAMETER);
+                assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_sm), FALSE);
+                assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
+            }
+
+            // Clear KILL_ON_JOB_CLOSE and JOB_OBJECT_LIMIT_AFFINITY before closing in-process so
+            // subsequent tests keep unrestricted affinity and the test runner continues.
             std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
             assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+            assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_pm), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
 
             // Closing the last job handle without KILL_ON_JOB_CLOSE retains the job while
