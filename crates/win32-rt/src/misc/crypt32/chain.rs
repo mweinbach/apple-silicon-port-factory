@@ -2076,6 +2076,8 @@ fn resolve_verified_issuer_path_status(
         true
     }
 
+    const MAX_CHAIN_DFS_WORK: usize = 512;
+
     #[allow(clippy::too_many_arguments)]
     fn dfs_trusted<'a>(
         cur_der: &[u8],
@@ -2088,8 +2090,15 @@ fn resolve_verified_issuer_path_status(
         allow_default_macos: bool,
         excluded_spkis: &[Vec<u8>],
         visited: &mut [bool],
+        best_failed_below: &mut [usize],
+        budget: &mut usize,
         path: &mut Vec<Vec<u8>>,
     ) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+
         // Direct exact match or authenticated self-signed match against a trust-store root.
         if trusted_roots.iter().any(|(root_der, root_parts)| {
             *root_der == cur_der
@@ -2117,22 +2126,38 @@ fn resolve_verified_issuer_path_status(
             return false;
         }
         for (i, cand_der) in cands.iter().enumerate() {
+            if *budget == 0 {
+                return false;
+            }
             if visited[i] || cand_der.as_slice() == cur_der {
                 continue;
             }
             let Some(cp) = cand_parts[i].as_ref() else {
                 continue;
             };
+            // Never hop between distinct certificates sharing the exact same (Subject, SPKI):
+            // a reissued self-signed cert with the same key adds no new issuer capability
+            // (self-issued key-rollover CAs have distinct SPKIs and are still allowed).
+            if cp.subject_inner == cur_parts.subject_inner && cp.spki_inner == cur_parts.spki_inner
+            {
+                continue;
+            }
+            let next_non_self =
+                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
+            if next_non_self >= best_failed_below[i] {
+                continue;
+            }
             if cp.subject_inner != cur_parts.issuer_inner
                 || !intermediate_bc_ok(cand_der, non_self_issued_below)
-                || !cert_signed_by_parts(cur_parts, cp)
             {
+                continue;
+            }
+            *budget -= 1;
+            if !cert_signed_by_parts(cur_parts, cp) {
                 continue;
             }
             visited[i] = true;
             path.push(cand_der.clone());
-            let next_non_self =
-                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
             if dfs_trusted(
                 cand_der,
                 cp,
@@ -2144,18 +2169,25 @@ fn resolve_verified_issuer_path_status(
                 allow_default_macos,
                 excluded_spkis,
                 visited,
+                best_failed_below,
+                budget,
                 path,
             ) {
                 return true;
             }
             path.pop();
             visited[i] = false;
+            if *budget > 0 && next_non_self < best_failed_below[i] {
+                best_failed_below[i] = next_non_self;
+            }
         }
         false
     }
 
     let mut path = vec![leaf.clone()];
     let mut visited = vec![false; cands.len()];
+    let mut best_failed_below = vec![usize::MAX; cands.len()];
+    let mut budget = MAX_CHAIN_DFS_WORK;
     if dfs_trusted(
         leaf,
         &leaf_parts,
@@ -2167,6 +2199,8 @@ fn resolve_verified_issuer_path_status(
         allow_default_macos,
         excluded_spkis,
         &mut visited,
+        &mut best_failed_below,
+        &mut budget,
         &mut path,
     ) {
         return (path, true);
@@ -2174,6 +2208,7 @@ fn resolve_verified_issuer_path_status(
 
     // Untrusted fallback: only emit issuers that chain cryptographically to a genuinely
     // self-signed root (so same-SPKI forgeries without the issuer's private key are rejected).
+    #[allow(clippy::too_many_arguments)]
     fn dfs_self_signed<'a>(
         cur_der: &[u8],
         cur_parts: &CertDerParts<'_>,
@@ -2182,8 +2217,15 @@ fn resolve_verified_issuer_path_status(
         cands: &'a [Vec<u8>],
         cand_parts: &[Option<CertDerParts<'a>>],
         visited: &mut [bool],
+        best_failed_below: &mut [usize],
+        budget: &mut usize,
         path: &mut Vec<Vec<u8>>,
     ) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+
         if cur_parts.subject_inner == cur_parts.issuer_inner
             && cert_signed_by_parts(cur_parts, cur_parts)
         {
@@ -2193,13 +2235,29 @@ fn resolve_verified_issuer_path_status(
             return false;
         }
         for (i, cand_der) in cands.iter().enumerate() {
+            if *budget == 0 {
+                return false;
+            }
             if visited[i] || cand_der.as_slice() == cur_der {
                 continue;
             }
             let Some(cp) = cand_parts[i].as_ref() else {
                 continue;
             };
-            if cp.subject_inner != cur_parts.issuer_inner || !cert_signed_by_parts(cur_parts, cp) {
+            if cp.subject_inner == cur_parts.subject_inner && cp.spki_inner == cur_parts.spki_inner
+            {
+                continue;
+            }
+            let next_non_self =
+                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
+            if next_non_self >= best_failed_below[i] {
+                continue;
+            }
+            if cp.subject_inner != cur_parts.issuer_inner {
+                continue;
+            }
+            *budget -= 1;
+            if !cert_signed_by_parts(cur_parts, cp) {
                 continue;
             }
             let is_self_signed =
@@ -2209,8 +2267,6 @@ fn resolve_verified_issuer_path_status(
             }
             visited[i] = true;
             path.push(cand_der.clone());
-            let next_non_self =
-                non_self_issued_below + usize::from(cp.subject_inner != cp.issuer_inner);
             if dfs_self_signed(
                 cand_der,
                 cp,
@@ -2219,18 +2275,25 @@ fn resolve_verified_issuer_path_status(
                 cands,
                 cand_parts,
                 visited,
+                best_failed_below,
+                budget,
                 path,
             ) {
                 return true;
             }
             path.pop();
             visited[i] = false;
+            if *budget > 0 && next_non_self < best_failed_below[i] {
+                best_failed_below[i] = next_non_self;
+            }
         }
         false
     }
 
     path.truncate(1);
     visited.fill(false);
+    best_failed_below.fill(usize::MAX);
+    let mut fallback_budget = MAX_CHAIN_DFS_WORK;
     if dfs_self_signed(
         leaf,
         &leaf_parts,
@@ -2239,6 +2302,8 @@ fn resolve_verified_issuer_path_status(
         cands,
         &cand_parts,
         &mut visited,
+        &mut best_failed_below,
+        &mut fallback_budget,
         &mut path,
     ) {
         return (path, true);

@@ -8240,5 +8240,130 @@ fn chain_para_authenticates_multi_level_issuers_against_same_spki_clone() {
         CertFreeCertificateChainEngine(eng);
         CertCloseStore(root_st, 0);
         CertCloseStore(add_st, 0);
+
+        // 3. Adversarial permutation DoS check: 12 distinct, validly self-signed CA certificates
+        //    sharing the exact same Subject DN and Ed25519 SPKI (varying serials 1..=12) plus a
+        //    leaf signed by that key, evaluated against an empty exclusive root store. Without
+        //    same-(subject, SPKI) pruning, dead-end memoization, and the shared DFS work budget,
+        //    12! = 479,001,600 permutations would hang certificate validation.
+        let pk_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(
+                crate::misc::secur32::tests::TEST_LEAF_KEY_PKCS8_DER.to_vec(),
+            ),
+        );
+        let signing_key = crate::net_tls::crypto_provider()
+            .key_provider
+            .load_private_key(pk_der)
+            .expect("load Ed25519 key");
+        let spki_der = signing_key.public_key().expect("extract SPKI").as_ref().to_vec();
+        let ed25519_alg = tlv(0x30, &tlv(0x06, &[0x2B, 0x65, 0x70]));
+        let mk_dn = |cn: &str| {
+            let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+            tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+        };
+        let ca_dn = mk_dn("Permutation Test CA");
+        let leaf_dn = mk_dn("Permutation Test Leaf");
+        let mut validity = tlv(0x17, b"260101000000Z");
+        validity.extend_from_slice(&tlv(0x17, b"360101000000Z"));
+        let validity_seq = tlv(0x30, &validity);
+        let mut bc_ca = tlv(0x06, &[0x55, 0x1D, 0x13]);
+        bc_ca.extend_from_slice(&tlv(0x01, &[0xFF]));
+        bc_ca.extend_from_slice(&tlv(0x04, &tlv(0x30, &tlv(0x01, &[0xFF]))));
+        let ca_exts = tlv(0xA3, &tlv(0x30, &tlv(0x30, &bc_ca)));
+
+        let sign_cert = |serial: u8, subj_dn: &[u8], is_ca: bool| -> Vec<u8> {
+            let mut tbs_body = Vec::new();
+            tbs_body.extend_from_slice(&tlv(0xA0, &tlv(0x02, &[0x02]))); // v3
+            tbs_body.extend_from_slice(&tlv(0x02, &[serial]));
+            tbs_body.extend_from_slice(&ed25519_alg);
+            tbs_body.extend_from_slice(&ca_dn); // issuer
+            tbs_body.extend_from_slice(&validity_seq);
+            tbs_body.extend_from_slice(subj_dn);
+            tbs_body.extend_from_slice(&spki_der);
+            if is_ca {
+                tbs_body.extend_from_slice(&ca_exts);
+            }
+            let tbs = tlv(0x30, &tbs_body);
+            let signer = signing_key
+                .choose_scheme(&[rustls::SignatureScheme::ED25519])
+                .expect("Ed25519 signer");
+            let sig = signer.sign(&tbs).expect("sign cert");
+            let mut sig_bits = Vec::with_capacity(1 + sig.len());
+            sig_bits.push(0);
+            sig_bits.extend_from_slice(&sig);
+            let mut cert_body = tbs;
+            cert_body.extend_from_slice(&ed25519_alg);
+            cert_body.extend_from_slice(&tlv(0x03, &sig_bits));
+            tlv(0x30, &cert_body)
+        };
+
+        let perm_add_st =
+            CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        for serial in 1u8..=12 {
+            let ca = sign_cert(serial, &ca_dn, true);
+            assert_eq!(
+                CertAddEncodedCertificateToStore(
+                    perm_add_st,
+                    X509_ASN_ENCODING,
+                    ca.as_ptr(),
+                    ca.len() as u32,
+                    4,
+                    std::ptr::null_mut(),
+                ),
+                TRUE
+            );
+        }
+        let perm_leaf = sign_cert(99, &leaf_dn, false);
+        let perm_leaf_ctx = CertCreateCertificateContext(
+            X509_ASN_ENCODING,
+            perm_leaf.as_ptr(),
+            perm_leaf.len() as u32,
+        );
+        assert!(!perm_leaf_ctx.is_null());
+
+        let empty_root_st =
+            CertOpenStore(CERT_STORE_PROV_MEMORY as *const u8, 0, 0, 0, std::ptr::null());
+        let mut empty_cfg = [0u8; 0x60];
+        std::ptr::write_unaligned(empty_cfg.as_mut_ptr() as *mut u32, empty_cfg.len() as u32);
+        std::ptr::write_unaligned(
+            empty_cfg.as_mut_ptr().add(0x40) as *mut *mut c_void,
+            empty_root_st,
+        );
+        let mut empty_eng: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertCreateCertificateChainEngine(empty_cfg.as_ptr() as *const c_void, &mut empty_eng),
+            TRUE
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut perm_ch: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            CertGetCertificateChain(
+                empty_eng,
+                perm_leaf_ctx,
+                &verify_ft as *const u64 as *const c_void,
+                perm_add_st,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut perm_ch,
+            ),
+            TRUE
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "12 same-key self-signed CAs must not trigger factorial DFS blowup (took {:?})",
+            t0.elapsed()
+        );
+        let perm_cc = &*(perm_ch as *const crate::misc::wintrust::CertChainContext);
+        let perm_simple = &*(*perm_cc.rgp_chain);
+        assert_eq!(perm_simple.c_element, 2, "self-signed fallback must resolve [leaf, self-signed CA]");
+
+        CertFreeCertificateChain(perm_ch);
+        CertFreeCertificateChainEngine(empty_eng);
+        CertCloseStore(empty_root_st, 0);
+        CertFreeCertificateContext(perm_leaf_ctx);
+        CertCloseStore(perm_add_st, 0);
     }
 }
