@@ -20,6 +20,7 @@ use store::ERROR_CALL_NOT_IMPLEMENTED;
 
 pub(crate) use asn1::{dpapi_protect_bytes, dpapi_unprotect_bytes};
 pub(crate) use chain::verify_peer_chain_error;
+pub(crate) use pkcs::verify_cmsg_signer_info_signature;
 #[allow(unused_imports)]
 pub(crate) use chain::{
     map_rustls_cert_error, CERT_E_CHAINING, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED, CERT_E_REVOKED,

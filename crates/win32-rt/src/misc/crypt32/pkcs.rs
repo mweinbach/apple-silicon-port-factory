@@ -457,6 +457,176 @@ fn cert_issuer_and_serial(cert_der: &[u8]) -> Option<(&[u8], &[u8])> {
     (serial.tag == 0x02 && issuer.tag == 0x30).then_some((issuer.raw, serial.val))
 }
 
+fn verify_signed_bytes_with_cert_der(
+    signer_cert_der: &[u8],
+    si_digest: Digest,
+    to_verify: &[u8],
+    signature: &[u8],
+) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    let Some(parts) = parse_cert_der_parts(signer_cert_der) else {
+        return false;
+    };
+    let Some((spki_alg_oid_item, _)) = parse_der_item(parts.spki_alg_inner) else {
+        return false;
+    };
+    let spki_alg_oid = if spki_alg_oid_item.tag == 0x06 {
+        spki_alg_oid_item.val
+    } else {
+        return false;
+    };
+
+    // 1. RSA PKCS#1 v1.5 verification
+    if spki_alg_oid == OID_RSA_ENCRYPTION {
+        let Some((pub_seq, _)) = parse_der_item(parts.spki_key_bits) else {
+            return false;
+        };
+        if pub_seq.tag != 0x30 {
+            return false;
+        }
+        let Some(pk) = der_item_children(pub_seq.val) else {
+            return false;
+        };
+        if pk.len() < 2 || pk[0].tag != 0x02 || pk[1].tag != 0x02 {
+            return false;
+        }
+        let rsa = RsaPublicKey {
+            n: strip_leading_zero(pk[0].val).to_vec(),
+            e: strip_leading_zero(pk[1].val).to_vec(),
+        };
+        let hash = si_digest.hash(to_verify);
+        return rsa.verify_pkcs1(Some(si_digest), &hash, signature);
+    }
+
+    // 2. ECDSA / Ed25519 verification via rustls::crypto::ring verification algorithms
+    let sig_alg_der = match (spki_alg_oid, si_digest) {
+        // EC public key (1.2.840.10045.2.1)
+        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha256) => {
+            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]))
+        }
+        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha384) => {
+            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]))
+        }
+        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha512) => {
+            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]))
+        }
+        // Ed25519 (1.3.101.112)
+        (&[0x2B, 0x65, 0x70], _) => Some(encode_der_tlv(0x06, &[0x2B, 0x65, 0x70])),
+        _ => None,
+    };
+    if let Some(sig_alg_inner) = sig_alg_der {
+        let provider = crate::net_tls::crypto_provider();
+        for alg in provider.signature_verification_algorithms.all {
+            if alg.public_key_alg_id().as_ref() == parts.spki_alg_inner
+                && alg.signature_alg_id().as_ref() == sig_alg_inner.as_slice()
+                && alg
+                    .verify_signature(parts.spki_key_bits, to_verify, signature)
+                    .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Cryptographically verify a Win32 `CMSG_SIGNER_INFO` (used by `WinVerifyTrust(WTD_CHOICE_SIGNER)`)
+/// against its matched signer certificate DER. Requires a non-empty `EncryptedHash`, recognized
+/// `HashAlgorithm`, and `AuthAttrs` whose DER `SET OF Attribute` verifies under the certificate key.
+pub(crate) unsafe fn verify_cmsg_signer_info_signature(
+    si: &wintrust::CmsgSignerInfo,
+    signer_cert_der: &[u8],
+) -> bool {
+    if si.encrypted_hash.pb_data.is_null()
+        || si.encrypted_hash.cb_data == 0
+        || si.hash_algorithm.psz_obj_id.is_null()
+        || si.auth_attrs_count == 0
+        || si.auth_attrs_ptr.is_null()
+    {
+        return false;
+    }
+    let digest = match crate::strings::from_ansi(si.hash_algorithm.psz_obj_id).as_str() {
+        "1.2.840.113549.2.5" => Digest::Md5,
+        "1.3.14.3.2.26" => Digest::Sha1,
+        "2.16.840.1.101.3.4.2.1" => Digest::Sha256,
+        "2.16.840.1.101.3.4.2.2" => Digest::Sha384,
+        "2.16.840.1.101.3.4.2.3" => Digest::Sha512,
+        _ => return false,
+    };
+    let sig = std::slice::from_raw_parts(
+        si.encrypted_hash.pb_data,
+        si.encrypted_hash.cb_data as usize,
+    );
+    #[repr(C)]
+    struct CryptAttrs {
+        c_attr: u32,
+        rg_attr: *mut c_void,
+    }
+    let attrs = CryptAttrs {
+        c_attr: si.auth_attrs_count,
+        rg_attr: si.auth_attrs_ptr,
+    };
+    let mut enc_len = 0u32;
+    if super::asn1::crypt_encode_object_ex_impl(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        super::decode::PKCS_ATTRIBUTES as *const u8,
+        &attrs as *const CryptAttrs as *const c_void,
+        0,
+        std::ptr::null_mut(),
+        &mut enc_len,
+    ) == FALSE
+        || enc_len == 0
+    {
+        return false;
+    }
+    let mut set_der = vec![0u8; enc_len as usize];
+    if super::asn1::crypt_encode_object_ex_impl(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        super::decode::PKCS_ATTRIBUTES as *const u8,
+        &attrs as *const CryptAttrs as *const c_void,
+        0,
+        set_der.as_mut_ptr() as *mut c_void,
+        &mut enc_len,
+    ) == FALSE
+    {
+        return false;
+    }
+    set_der.truncate(enc_len as usize);
+    if verify_signed_bytes_with_cert_der(signer_cert_der, digest, &set_der, sig) {
+        return true;
+    }
+    // RFC 5652 §5.4 / X.690 §11.6: retry with lexicographically DER-sorted SET OF attributes
+    // in case caller supplied AuthAttrs in unsorted order.
+    if let Some((set_item, _)) = parse_der_item(&set_der) {
+        if set_item.tag == 0x31 {
+            if let Some(kids) = der_item_children(set_item.val) {
+                if kids.len() > 1 {
+                    let mut sorted: Vec<&[u8]> = kids.iter().map(|k| k.raw).collect();
+                    sorted.sort();
+                    let mut inner = Vec::with_capacity(set_item.val.len());
+                    for k in sorted {
+                        inner.extend_from_slice(k);
+                    }
+                    let canonical_der = encode_der_tlv(0x31, &inner);
+                    if canonical_der != set_der
+                        && verify_signed_bytes_with_cert_der(
+                            signer_cert_der,
+                            digest,
+                            &canonical_der,
+                            sig,
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Verify a CMS `SignerInfo` signature against `signer_cert_der`, `content_bytes`, and
 /// `expected_content_type_oid_der` (enforcing RFC 5652 §5.6 signed `content-type` + `message-digest`).
 pub(super) fn verify_cms_signer_signature(
@@ -466,9 +636,6 @@ pub(super) fn verify_cms_signer_signature(
     expected_content_type_oid_der: &[u8],
 ) -> bool {
     let Some(si_digest) = digest_from_oid(&signer.hash_alg_oid) else {
-        return false;
-    };
-    let Some(parts) = parse_cert_der_parts(signer_cert_der) else {
         return false;
     };
 
@@ -527,68 +694,7 @@ pub(super) fn verify_cms_signer_signature(
         content_bytes.to_vec()
     };
 
-    // Determine public key algorithm from cert SPKI.
-    let Some((spki_alg_oid_item, _)) = parse_der_item(parts.spki_alg_inner) else {
-        return false;
-    };
-    let spki_alg_oid = if spki_alg_oid_item.tag == 0x06 {
-        spki_alg_oid_item.val
-    } else {
-        return false;
-    };
-
-    // 1. RSA PKCS#1 v1.5 verification
-    if spki_alg_oid == OID_RSA_ENCRYPTION {
-        let Some((pub_seq, _)) = parse_der_item(parts.spki_key_bits) else {
-            return false;
-        };
-        if pub_seq.tag != 0x30 {
-            return false;
-        }
-        let Some(pk) = der_item_children(pub_seq.val) else {
-            return false;
-        };
-        if pk.len() < 2 || pk[0].tag != 0x02 || pk[1].tag != 0x02 {
-            return false;
-        }
-        let rsa = RsaPublicKey {
-            n: strip_leading_zero(pk[0].val).to_vec(),
-            e: strip_leading_zero(pk[1].val).to_vec(),
-        };
-        let hash = si_digest.hash(&to_verify);
-        return rsa.verify_pkcs1(Some(si_digest), &hash, &signer.encrypted_hash);
-    }
-
-    // 2. ECDSA / Ed25519 verification via rustls::crypto::ring verification algorithms
-    let sig_alg_der = match (spki_alg_oid, si_digest) {
-        // EC public key (1.2.840.10045.2.1)
-        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha256) => {
-            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]))
-        }
-        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha384) => {
-            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03]))
-        }
-        (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], Digest::Sha512) => {
-            Some(encode_der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04]))
-        }
-        // Ed25519 (1.3.101.112)
-        (&[0x2B, 0x65, 0x70], _) => Some(encode_der_tlv(0x06, &[0x2B, 0x65, 0x70])),
-        _ => None,
-    };
-    if let Some(sig_alg_inner) = sig_alg_der {
-        let provider = crate::net_tls::crypto_provider();
-        for alg in provider.signature_verification_algorithms.all {
-            if alg.public_key_alg_id().as_ref() == parts.spki_alg_inner
-                && alg.signature_alg_id().as_ref() == sig_alg_inner.as_slice()
-                && alg
-                    .verify_signature(parts.spki_key_bits, &to_verify, &signer.encrypted_hash)
-                    .is_ok()
-            {
-                return true;
-            }
-        }
-    }
-    false
+    verify_signed_bytes_with_cert_der(signer_cert_der, si_digest, &to_verify, &signer.encrypted_hash)
 }
 
 // ---------------------------------------------------------------------------

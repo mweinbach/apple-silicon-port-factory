@@ -3575,6 +3575,22 @@ fn macos_trust_store_and_extended_chain_policies() {
             &[],
         ));
 
+        // Unsupported specialized policies (SSL_F12=9, HPKP=10, THIRD_PARTY_ROOT=11, KEY_PIN=12)
+        // must fail explicitly with FALSE + ERROR_FILE_NOT_FOUND rather than mis-casting parameters
+        // or approving ordinary private-root trust.
+        for unsupported_oid in [9usize, 10, 11, 12] {
+            assert_eq!(
+                CertVerifyCertificateChainPolicy(
+                    unsupported_oid as *const u8,
+                    trusted_chain,
+                    std::ptr::null(),
+                    &mut status as *mut _ as *mut c_void,
+                ),
+                FALSE
+            );
+            assert_eq!(crate::teb::last_error(), err::ERROR_FILE_NOT_FOUND);
+        }
+
         // Trusted non-Microsoft root MUST still fail MICROSOFT_ROOT (checked by SPKI key, not name)
         assert_eq!(
             CertVerifyCertificateChainPolicy(

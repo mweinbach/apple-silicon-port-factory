@@ -2385,8 +2385,14 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             }
             let si = std::ptr::read_unaligned(ps_signer);
             let mut query_ci: CertInfo = std::mem::zeroed();
-            query_ci.issuer = si.issuer;
-            query_ci.serial_number = si.serial_number;
+            query_ci.issuer = CryptDataBlob {
+                cb_data: si.issuer.cb_data,
+                pb_data: si.issuer.pb_data,
+            };
+            query_ci.serial_number = CryptDataBlob {
+                cb_data: si.serial_number.cb_data,
+                pb_data: si.serial_number.pb_data,
+            };
             let mut found_cert: *mut c_void = std::ptr::null_mut();
             for i in 0..ch_stores as usize {
                 let st = std::ptr::read_unaligned(pah_stores.add(i));
@@ -2402,6 +2408,20 @@ pub unsafe extern "win64" fn WinVerifyTrust(_hwnd: *mut c_void, action: *const u
             }
             if found_cert.is_null() {
                 return TRUST_E_NOSIGNATURE;
+            }
+            // Cryptographically verify the supplied CMSG_SIGNER_INFO signature against the
+            // matched signer certificate before evaluating its chain policy (fail closed on
+            // empty, forged, or unverifiable signatures).
+            let cc = std::ptr::read_unaligned(found_cert as *const CertContext);
+            let sig_ok = !cc.pb_cert_encoded.is_null()
+                && cc.cb_cert_encoded > 0
+                && super::crypt32::verify_cmsg_signer_info_signature(
+                    &si,
+                    std::slice::from_raw_parts(cc.pb_cert_encoded, cc.cb_cert_encoded as usize),
+                );
+            if !sig_ok {
+                super::crypt32::CertFreeCertificateContext(found_cert);
+                return TRUST_E_BAD_DIGEST;
             }
             let rc = verify_cert_via_chain_policy(
                 found_cert,
@@ -2884,16 +2904,18 @@ mod tests {
             std::ptr::write_unaligned(cert_info.as_mut_ptr().add(0x10) as *mut *const c_void, cert);
             crate::misc::crypt32::CertFreeCertificateContext(tls_cert);
 
-            // WTD_CHOICE_SIGNER with real CMSG_SIGNER_INFO matching the cert in `st`
+            // WTD_CHOICE_SIGNER: an unsigned/forged CMSG_SIGNER_INFO (only issuer + serial,
+            // empty EncryptedHash) MUST fail cryptographically with TRUST_E_BAD_DIGEST before
+            // reaching chain-policy evaluation.
             let cctx = std::ptr::read_unaligned(cert as *const CertContext);
             let ci = std::ptr::read_unaligned(cctx.p_cert_info);
-            let mut si: CmsgSignerInfo = std::mem::zeroed();
-            si.issuer = ci.issuer;
-            si.serial_number = ci.serial_number;
+            let mut forged_si: CmsgSignerInfo = std::mem::zeroed();
+            forged_si.issuer = ci.issuer;
+            forged_si.serial_number = ci.serial_number;
             let stores = [st];
             let mut sgnr_info = [0u8; 0x28];
             std::ptr::write_unaligned(sgnr_info.as_mut_ptr() as *mut u32, sgnr_info.len() as u32);
-            std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x10) as *mut *const CmsgSignerInfo, &si);
+            std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x10) as *mut *const CmsgSignerInfo, &forged_si);
             std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x18) as *mut u32, 1);
             std::ptr::write_unaligned(sgnr_info.as_mut_ptr().add(0x20) as *mut *const *mut c_void, stores.as_ptr());
             std::ptr::write_unaligned(wtd.as_mut_ptr().add(0x20) as *mut u32, WTD_CHOICE_SIGNER);
@@ -2904,8 +2926,66 @@ mod tests {
                     WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
                     wtd.as_mut_ptr() as *mut c_void,
                 ),
+                TRUST_E_BAD_DIGEST
+            );
+
+            // Real cryptographically signed CMSG_SIGNER_INFO extracted from PKCS7_SIGNED_DER
+            // passes signature verification and reaches chain-policy check (CERT_E_UNTRUSTEDROOT),
+            // while flipping a bit in its EncryptedHash fails earlier with TRUST_E_BAD_DIGEST.
+            let h_si_msg = crate::misc::crypt32::CryptMsgOpenToDecode(
+                X509_ASN_ENCODING | 0x0001_0000,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!h_si_msg.is_null());
+            assert_eq!(
+                crate::misc::crypt32::CryptMsgUpdate(h_si_msg, pkcs7.as_ptr(), pkcs7.len() as u32, 1),
+                1
+            );
+            let mut si_sz = 0u32;
+            assert_eq!(
+                crate::misc::crypt32::CryptMsgGetParam(h_si_msg, 6, 0, std::ptr::null_mut(), &mut si_sz),
+                1
+            );
+            let mut real_si_buf = vec![0u8; si_sz as usize];
+            assert_eq!(
+                crate::misc::crypt32::CryptMsgGetParam(
+                    h_si_msg,
+                    6,
+                    0,
+                    real_si_buf.as_mut_ptr() as *mut c_void,
+                    &mut si_sz,
+                ),
+                1
+            );
+            std::ptr::write_unaligned(
+                sgnr_info.as_mut_ptr().add(0x10) as *mut *const CmsgSignerInfo,
+                real_si_buf.as_ptr() as *const CmsgSignerInfo,
+            );
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
                 crate::misc::crypt32::CERT_E_UNTRUSTEDROOT as i32
             );
+            // Flip 1 byte in real EncryptedHash -> TRUST_E_BAD_DIGEST
+            let real_si_hdr = std::ptr::read_unaligned(real_si_buf.as_ptr() as *const CmsgSignerInfo);
+            let hash_off = (real_si_hdr.encrypted_hash.pb_data as usize) - (real_si_buf.as_ptr() as usize);
+            real_si_buf[hash_off] ^= 0x01;
+            assert_eq!(
+                WinVerifyTrust(
+                    std::ptr::null_mut(),
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.as_ptr(),
+                    wtd.as_mut_ptr() as *mut c_void,
+                ),
+                TRUST_E_BAD_DIGEST
+            );
+            crate::misc::crypt32::CryptMsgClose(h_si_msg);
 
             // WTD_CHOICE_CATALOG: validates CTL structure, member tag & member digest, AND signer chain
             let tmp_dir = std::env::temp_dir().join(format!("wintrust_cat_{}", std::process::id()));

@@ -27,7 +27,7 @@ bcrypt.dll	BCryptSetProperty	stub	crates/win32-rt/src/misc/bcrypt.rs	2756	"BCryp
 bcrypt.dll	BCryptSignHash	stub	crates/win32-rt/src/misc/bcrypt.rs	2057	"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"
 bcrypt.dll	BCryptVerifySignature	stub	crates/win32-rt/src/misc/bcrypt.rs	2122	"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"
 bcrypt.dll	bcrypt_aes_crypt	stub	crates/win32-rt/src/misc/bcrypt.rs	2173	"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }
-crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	51	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
+crypt32.dll	CryptImportPublicKeyInfo	failing	crates/win32-rt/src/misc/crypt32.rs	52	BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED
 d2d1.dll	geom_tessellate	stub	crates/win32-rt/src/misc/d2d1/geometry.rs	1038	"ID2D1Geometry::Tessellate -> E_NOTIMPL"
 d3d11.dll	check_counter	stub	crates/win32-rt/src/d3d11/device.rs	1074	"ID3D11Device::CheckCounter -> DXGI_ERROR_UNSUPPORTED"
 d3d11.dll	create_class_linkage	stub	crates/win32-rt/src/d3d11/device.rs	749	"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"

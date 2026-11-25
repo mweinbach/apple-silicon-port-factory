@@ -28,10 +28,6 @@ pub(super) const CERT_CHAIN_POLICY_BASIC_CONSTRAINTS: usize = 5;
 pub(super) const CERT_CHAIN_POLICY_NT_AUTH: usize = 6;
 pub(super) const CERT_CHAIN_POLICY_MICROSOFT_ROOT: usize = 7;
 pub(super) const CERT_CHAIN_POLICY_EV: usize = 8;
-pub(super) const CERT_CHAIN_POLICY_SSL_F12: usize = 9;
-pub(super) const CERT_CHAIN_POLICY_SSL_HPKP_HEADER: usize = 10;
-pub(super) const CERT_CHAIN_POLICY_THIRD_PARTY_ROOT: usize = 11;
-pub(super) const CERT_CHAIN_POLICY_SSL_KEY_PIN: usize = 12;
 
 const TRUST_E_BASIC_CONSTRAINTS: u32 = 0x8009_6019;
 const BASIC_CONSTRAINTS_CERT_CHAIN_POLICY_CA_FLAG: u32 = 0x8000_0000;
@@ -1587,10 +1583,6 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
             | CERT_CHAIN_POLICY_NT_AUTH
             | CERT_CHAIN_POLICY_MICROSOFT_ROOT
             | CERT_CHAIN_POLICY_EV
-            | CERT_CHAIN_POLICY_SSL_F12
-            | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
-            | CERT_CHAIN_POLICY_THIRD_PARTY_ROOT
-            | CERT_CHAIN_POLICY_SSL_KEY_PIN
     ) {
         // Per MSDN/Wine: unknown chain policy OID returns FALSE with ERROR_FILE_NOT_FOUND.
         log::debug!("CertVerifyCertificateChainPolicy: unknown policy oid={policy_id:#x}");
@@ -1627,14 +1619,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
 
     let mut fdw_checks = 0u32;
     let mut server_name: Option<String> = None;
-    if matches!(
-        policy_id,
-        CERT_CHAIN_POLICY_SSL
-            | CERT_CHAIN_POLICY_SSL_F12
-            | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
-            | CERT_CHAIN_POLICY_SSL_KEY_PIN
-    ) && !extra_ptr.is_null()
-    {
+    if policy_id == CERT_CHAIN_POLICY_SSL && !extra_ptr.is_null() {
         let ssl = std::ptr::read_unaligned(extra_ptr as *const SslExtraCertChainPolicyPara);
         fdw_checks = ssl.fdw_checks;
         if ssl.cb_size >= 0x18 && !ssl.pwsz_server_name.is_null() {
@@ -1664,10 +1649,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
         .position(|&(nb, na)| (nb > 0 && check_ft < nb) || (na > 0 && check_ft > na));
 
     let (err_code, elem_idx): (u32, i32) = match policy_id {
-        CERT_CHAIN_POLICY_SSL
-        | CERT_CHAIN_POLICY_SSL_F12
-        | CERT_CHAIN_POLICY_SSL_HPKP_HEADER
-        | CERT_CHAIN_POLICY_SSL_KEY_PIN => {
+        CERT_CHAIN_POLICY_SSL => {
             let mut raw = verify_chain_webpki_at(
                 &chain_der,
                 server_name.as_deref(),
@@ -1954,7 +1936,7 @@ pub(super) unsafe fn cert_verify_certificate_chain_policy_impl(
                 (0, -1)
             }
         }
-        CERT_CHAIN_POLICY_BASE | CERT_CHAIN_POLICY_THIRD_PARTY_ROOT => {
+        CERT_CHAIN_POLICY_BASE => {
             let mut trust_ok = default_chain_error == 0
                 || verify_chain_signatures_to_roots(
                     &chain_der,
