@@ -10,7 +10,7 @@ use super::schannel::{
     SECPKGCONTEXT_CIPHERINFO_V1, SECPKG_ATTR_APPLICATION_PROTOCOL, SECPKG_ATTR_CIPHER_INFO,
     SECPKG_ATTR_CONNECTION_INFO, SECPKG_ATTR_ISSUER_LIST_EX, SECPKG_ATTR_NAMES,
     SECPKG_ATTR_REMOTE_CERT_CONTEXT, SECPKG_ATTR_SIZES, SECPKG_ATTR_STREAM_SIZES,
-    SECPKG_CRED_ATTR_NAMES, SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS, SECPKG_CRED_OUTBOUND,
+    SECPKG_CRED_ATTR_NAMES, SECPKG_CRED_OUTBOUND,
     SECURITY_SUPPORT_PROVIDER_INTERFACE_VERSION, SEC_E_BUFFER_TOO_SMALL, SEC_E_INCOMPLETE_MESSAGE,
     SEC_E_OK, SEC_E_UNTRUSTED_ROOT, SEC_I_CONTEXT_EXPIRED, SEC_I_CONTINUE_NEEDED,
     SP_PROT_TLS1_2_CLIENT, SP_PROT_TLS1_3_CLIENT, STREAM_HEADER_SIZE, STREAM_MAX_MESSAGE,
@@ -1271,7 +1271,7 @@ fn query_context_cipher_info_names_creds_and_shutdown_close_notify() {
         assert_eq!(
             QueryCredentialsAttributesA(
                 &mut cred as *mut _ as *mut c_void,
-                SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS,
+                0x58, // SECPKG_ATTR_SUPPORTED_PROTOCOLS (minschannel.h)
                 &mut sup_prot as *mut _ as *mut c_void,
             ),
             SEC_E_OK
@@ -1552,8 +1552,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         SECPKG_ATTR_KEY_INFO, SECPKG_ATTR_LIFESPAN, SECPKG_ATTR_LOCAL_CERT_CONTEXT,
         SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_PROTO_INFO, SECPKG_ATTR_ROOT_STORE,
         SECPKG_ATTR_SESSION_INFO, SECPKG_ATTR_SUPPORTED_ALGS, SECPKG_ATTR_SUPPORTED_PROTOCOLS,
-        SECPKG_ATTR_UNIQUE_BINDINGS, SECPKG_CRED_ATTR_CIPHER_STRENGTHS,
-        SECPKG_CRED_ATTR_SUPPORTED_ALGS, SECPKG_CRED_INBOUND, SEC_E_NO_CREDENTIALS,
+        SECPKG_ATTR_UNIQUE_BINDINGS, SECPKG_CRED_INBOUND, SEC_E_NO_CREDENTIALS,
         SP_PROT_TLS1_2_SERVER, SP_PROT_TLS1_3_SERVER,
     };
 
@@ -1617,6 +1616,10 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         );
 
         // QueryCredentialsAttributes on server cred: SUPPORTED_ALGS, CIPHER_STRENGTHS, SUPPORTED_PROTOCOLS
+        // QueryCredentialsAttributes with exact minschannel.h SDK IDs (0x56, 0x57, 0x58).
+        assert_eq!(SECPKG_ATTR_SUPPORTED_ALGS, 0x56);
+        assert_eq!(SECPKG_ATTR_CIPHER_STRENGTHS, 0x57);
+        assert_eq!(SECPKG_ATTR_SUPPORTED_PROTOCOLS, 0x58);
         let mut algs = SecPkgCredSupportedAlgs {
             c_supported_algs: 0,
             palg_supported_algs: std::ptr::null_mut(),
@@ -1624,7 +1627,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(
             QueryCredentialsAttributesA(
                 &mut srv_cred as *mut _ as *mut c_void,
-                SECPKG_CRED_ATTR_SUPPORTED_ALGS,
+                0x56, // SECPKG_ATTR_SUPPORTED_ALGS
                 &mut algs as *mut _ as *mut c_void,
             ),
             SEC_E_OK
@@ -1639,7 +1642,7 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(
             QueryCredentialsAttributesA(
                 &mut srv_cred as *mut _ as *mut c_void,
-                SECPKG_CRED_ATTR_CIPHER_STRENGTHS,
+                0x57, // SECPKG_ATTR_CIPHER_STRENGTHS
                 &mut strengths as *mut _ as *mut c_void,
             ),
             SEC_E_OK
@@ -1651,12 +1654,23 @@ fn schannel_server_inbound_accept_security_context_and_all_attributes() {
         assert_eq!(
             QueryCredentialsAttributesA(
                 &mut srv_cred as *mut _ as *mut c_void,
-                SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS,
+                0x58, // SECPKG_ATTR_SUPPORTED_PROTOCOLS
                 &mut prots as *mut _ as *mut c_void,
             ),
             SEC_E_OK
         );
         assert_eq!(prots.grbit_protocol, SP_PROT_TLS1_2_SERVER | SP_PROT_TLS1_3_SERVER);
+        // Non-SDK attribute IDs 0x0F/0x10/0x11 must not be accepted.
+        for bad_attr in [0x0Fu32, 0x10, 0x11] {
+            assert_eq!(
+                QueryCredentialsAttributesA(
+                    &mut srv_cred as *mut _ as *mut c_void,
+                    bad_attr,
+                    &mut prots as *mut _ as *mut c_void,
+                ),
+                SEC_E_UNSUPPORTED_FUNCTION
+            );
+        }
 
         // Client credential trusting TEST_CA_DER
         let ca_store = make_ca_memory_store();
@@ -3453,13 +3467,13 @@ fn schannel_both_cred_enforces_independent_client_and_server_protocols() {
             SEC_E_OK
         );
 
-        // QueryCredentialsAttributesA(SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS) must report
+        // QueryCredentialsAttributesA(SECPKG_ATTR_SUPPORTED_PROTOCOLS = 0x58) must report
         // TLS 1.2 client + TLS 1.3 server ONLY.
         let mut prot = SecPkgCredSupportedProtocols { grbit_protocol: 0 };
         assert_eq!(
             QueryCredentialsAttributesA(
                 &mut both_cred as *mut _ as *mut c_void,
-                SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS,
+                0x58, // SECPKG_ATTR_SUPPORTED_PROTOCOLS
                 &mut prot as *mut _ as *mut c_void,
             ),
             SEC_E_OK

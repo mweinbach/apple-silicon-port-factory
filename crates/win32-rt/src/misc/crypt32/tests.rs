@@ -3633,12 +3633,25 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
             TRUE
         );
         assert!(sci_len >= std::mem::size_of::<CertInfo>() as u32);
+        // Windows SDK wincrypt.h: CMSG_SIGNER_AUTH_ATTR_PARAM == 9, CMSG_SIGNER_UNAUTH_ATTR_PARAM == 10
+        // (15 is CMSG_ENVELOPE_ALGORITHM_PARAM, 16 is CMSG_RECIPIENT_COUNT_PARAM — must NOT return signer attrs).
+        assert_eq!(CMSG_SIGNER_AUTH_ATTR_PARAM, 9);
+        assert_eq!(super::pkcs::CMSG_SIGNER_UNAUTH_ATTR_PARAM, 10);
         let mut aa_len = 0u32;
         assert_eq!(
-            CryptMsgGetParam(h_msg, CMSG_SIGNER_AUTH_ATTR_PARAM, 0, std::ptr::null_mut(), &mut aa_len),
+            CryptMsgGetParam(h_msg, 9 /* CMSG_SIGNER_AUTH_ATTR_PARAM */, 0, std::ptr::null_mut(), &mut aa_len),
             TRUE
         );
         assert!(aa_len > 16);
+        let mut bogus_len = 0u32;
+        assert_eq!(
+            CryptMsgGetParam(h_msg, 15, 0, std::ptr::null_mut(), &mut bogus_len),
+            FALSE
+        );
+        assert_eq!(
+            CryptMsgGetParam(h_msg, 16, 0, std::ptr::null_mut(), &mut bogus_len),
+            FALSE
+        );
         assert_eq!(CryptMsgClose(h_msg), TRUE);
 
         // Verify CMSG_SIGNER_INFO_PARAM and CMSG_SIGNER_UNAUTH_ATTR_PARAM preserve unauthenticated
@@ -3754,7 +3767,7 @@ fn pfx_import_crypt_msg_verify_properties_and_crl_ctl() {
         assert_eq!(
             CryptMsgGetParam(
                 h_umsg,
-                super::pkcs::CMSG_SIGNER_UNAUTH_ATTR_PARAM,
+                10, // CMSG_SIGNER_UNAUTH_ATTR_PARAM (wincrypt.h)
                 0,
                 std::ptr::null_mut(),
                 &mut ua_len,

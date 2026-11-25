@@ -34,10 +34,10 @@ pub(super) const CMSG_INNER_CONTENT_TYPE_PARAM: u32 = 4;
 pub(super) const CMSG_SIGNER_COUNT_PARAM: u32 = 5;
 pub(super) const CMSG_SIGNER_INFO_PARAM: u32 = 6;
 pub(super) const CMSG_SIGNER_CERT_INFO_PARAM: u32 = 7;
+pub(super) const CMSG_SIGNER_AUTH_ATTR_PARAM: u32 = 9;
+pub(super) const CMSG_SIGNER_UNAUTH_ATTR_PARAM: u32 = 10;
 pub(super) const CMSG_CERT_COUNT_PARAM: u32 = 11;
 pub(super) const CMSG_CERT_PARAM: u32 = 12;
-pub(super) const CMSG_SIGNER_AUTH_ATTR_PARAM: u32 = 15;
-pub(super) const CMSG_SIGNER_UNAUTH_ATTR_PARAM: u32 = 16;
 pub(super) const CMSG_ENCODED_MESSAGE: u32 = 29;
 pub(super) const CMSG_VERSION_PARAM: u32 = 30;
 

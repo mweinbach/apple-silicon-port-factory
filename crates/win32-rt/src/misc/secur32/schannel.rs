@@ -119,9 +119,6 @@ pub(super) const SECPKG_ATTR_CIPHER_INFO: u32 = 0x64;
 pub(super) const SECPKG_ATTR_REMOTE_CERT_CHAIN: u32 = 0x67;
 
 pub(super) const SECPKG_CRED_ATTR_NAMES: u32 = 1;
-pub(super) const SECPKG_CRED_ATTR_SUPPORTED_ALGS: u32 = 0x0F;
-pub(super) const SECPKG_CRED_ATTR_CIPHER_STRENGTHS: u32 = 0x10;
-pub(super) const SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS: u32 = 0x11;
 
 pub(super) const SECPKGCONTEXT_CIPHERINFO_V1: u32 = 1;
 pub(super) const SZ_ALG_MAX_SIZE: usize = 64;
@@ -3593,7 +3590,7 @@ pub(super) unsafe fn query_credentials_attributes_impl(
             }
             SEC_E_OK
         }
-        SECPKG_CRED_ATTR_SUPPORTED_ALGS => {
+        SECPKG_ATTR_SUPPORTED_ALGS => {
             let bytes = SUPPORTED_SCHANNEL_ALGS.len() * 4;
             let mem = crate::heap::alloc(bytes, false) as *mut u32;
             if mem.is_null() {
@@ -3611,7 +3608,7 @@ pub(super) unsafe fn query_credentials_attributes_impl(
             );
             SEC_E_OK
         }
-        SECPKG_CRED_ATTR_CIPHER_STRENGTHS => {
+        SECPKG_ATTR_CIPHER_STRENGTHS => {
             std::ptr::write_unaligned(
                 p_buffer as *mut SecPkgCredCipherStrengths,
                 SecPkgCredCipherStrengths {
@@ -3621,7 +3618,7 @@ pub(super) unsafe fn query_credentials_attributes_impl(
             );
             SEC_E_OK
         }
-        SECPKG_CRED_ATTR_SUPPORTED_PROTOCOLS => {
+        SECPKG_ATTR_SUPPORTED_PROTOCOLS => {
             let mut prot = 0u32;
             if (cred.cred_use & SECPKG_CRED_OUTBOUND) != 0 {
                 if cred.client_enable_tls12 {
