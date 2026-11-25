@@ -676,6 +676,7 @@ impl BufferEffect {
                 (l * in_gain + self.z1_l * wet, r * in_gain + self.z1_r * wet)
             }
             DsFxKind::I3dl2Reverb => {
+                let quality = self.i3dl2_quality.clamp(DSFX_I3DL2REVERB_QUALITY_MIN, DSFX_I3DL2REVERB_QUALITY_MAX);
                 let room = 10.0f32.powf(self.param_i32(0).clamp(-10_000, 0) as f32 / 2000.0);
                 let room_hf = 10.0f32.powf(self.param_i32(4).clamp(-10_000, 0) as f32 / 2000.0);
                 let decay_ms = self.param_f32(12).clamp(0.1, 20.0) * 1000.0;
@@ -691,10 +692,21 @@ impl BufferEffect {
                 let hf_ref = self.param_f32(44).clamp(20.0, 20_000.0);
 
                 let d_refl = ((refl_delay_s * sr).round() as usize).max(1);
-                let late_base_s = (refl_delay_s + reverb_delay_s + 0.025 + 0.012 * density).min(0.95);
+                let d_refl2 = (((refl_delay_s + 0.0053) * sr).round() as usize).max(d_refl + 1);
+                let late_base_s = (refl_delay_s + reverb_delay_s + 0.025 + 0.012 * density).min(0.92);
                 let dl = ((late_base_s * sr).round() as usize).max(1);
-                let dr = (((late_base_s + 0.004) * sr).round() as usize).max(1);
-                self.ensure_delay_capacity(d_refl.max(dl).max(dr));
+                let dr = (((late_base_s + 0.0041) * sr).round() as usize).max(1);
+                let dl2 = (((late_base_s + 0.0113) * sr).round() as usize).max(1);
+                let dr2 = (((late_base_s + 0.0149) * sr).round() as usize).max(1);
+                let dl3 = (((late_base_s + 0.0227) * sr).round() as usize).max(1);
+                let dr3 = (((late_base_s + 0.0271) * sr).round() as usize).max(1);
+                let max_tap = match quality {
+                    0 => dl.max(dr),
+                    1 => d_refl.max(dl).max(dr),
+                    2 => d_refl.max(dl2).max(dr2),
+                    _ => d_refl2.max(dl3).max(dr3),
+                };
+                self.ensure_delay_capacity(max_tap);
                 let cap = self.delay_l.len();
                 let fb = 10.0f32
                     .powf((-3.0 * (late_base_s * 1000.0)) / decay_ms.max(100.0))
@@ -702,21 +714,61 @@ impl BufferEffect {
                 let hf_cutoff = (hf_ref * decay_hf * (0.15 + 0.85 * room_hf)).clamp(20.0, sr * 0.45);
                 let damp = (1.0 - (-std::f32::consts::TAU * hf_cutoff / sr).exp()).clamp(0.02, 0.98);
 
-                let er_l = self.delay_l[(self.delay_pos + cap - d_refl) % cap];
-                let er_r = self.delay_r[(self.delay_pos + cap - d_refl) % cap];
-                let rl = self.delay_l[(self.delay_pos + cap - dl) % cap];
-                let rr = self.delay_r[(self.delay_pos + cap - dr) % cap];
+                // Quality 0: single late tap per channel (lowest CPU, no early reflections).
+                // Quality 1: early reflection tap + single late tap.
+                // Quality 2 (default): early reflection + 2-tap dense late reverb.
+                // Quality 3 (highest): 2-tap early reflections + 3-tap late reverb + 2-stage HF damping.
+                let (er_l, er_r) = match quality {
+                    0 => (0.0, 0.0),
+                    1 | 2 => (
+                        self.delay_l[(self.delay_pos + cap - d_refl) % cap],
+                        self.delay_r[(self.delay_pos + cap - d_refl) % cap],
+                    ),
+                    _ => (
+                        0.65 * self.delay_l[(self.delay_pos + cap - d_refl) % cap]
+                            + 0.35 * self.delay_r[(self.delay_pos + cap - d_refl2) % cap],
+                        0.65 * self.delay_r[(self.delay_pos + cap - d_refl) % cap]
+                            + 0.35 * self.delay_l[(self.delay_pos + cap - d_refl2) % cap],
+                    ),
+                };
+                let (rl, rr) = match quality {
+                    0 | 1 => (
+                        self.delay_l[(self.delay_pos + cap - dl) % cap],
+                        self.delay_r[(self.delay_pos + cap - dr) % cap],
+                    ),
+                    2 => (
+                        0.6 * self.delay_l[(self.delay_pos + cap - dl) % cap]
+                            + 0.4 * self.delay_l[(self.delay_pos + cap - dl2) % cap],
+                        0.6 * self.delay_r[(self.delay_pos + cap - dr) % cap]
+                            + 0.4 * self.delay_r[(self.delay_pos + cap - dr2) % cap],
+                    ),
+                    _ => (
+                        0.45 * self.delay_l[(self.delay_pos + cap - dl) % cap]
+                            + 0.32 * self.delay_l[(self.delay_pos + cap - dl2) % cap]
+                            + 0.23 * self.delay_l[(self.delay_pos + cap - dl3) % cap],
+                        0.45 * self.delay_r[(self.delay_pos + cap - dr) % cap]
+                            + 0.32 * self.delay_r[(self.delay_pos + cap - dr2) % cap]
+                            + 0.23 * self.delay_r[(self.delay_pos + cap - dr3) % cap],
+                    ),
+                };
                 self.z1_l += damp * (rl - self.z1_l);
                 self.z1_r += damp * (rr - self.z1_r);
+                let (tail_l, tail_r) = if quality >= 3 {
+                    self.z2_l += damp * (self.z1_l - self.z2_l);
+                    self.z2_r += damp * (self.z1_r - self.z2_r);
+                    (self.z2_l, self.z2_r)
+                } else {
+                    (self.z1_l, self.z1_r)
+                };
                 let cross = 0.5 * diffusion;
-                let fb_l = self.z1_l * (1.0 - cross) + self.z1_r * cross;
-                let fb_r = self.z1_r * (1.0 - cross) + self.z1_l * cross;
+                let fb_l = tail_l * (1.0 - cross) + tail_r * cross;
+                let fb_r = tail_r * (1.0 - cross) + tail_l * cross;
                 self.delay_l[self.delay_pos] = (l + fb_l * fb).clamp(-4.0, 4.0);
                 self.delay_r[self.delay_pos] = (r + fb_r * fb).clamp(-4.0, 4.0);
                 self.delay_pos = (self.delay_pos + 1) % cap;
                 (
-                    l + er_l * refl_gain + self.z1_l * late_gain,
-                    r + er_r * refl_gain + self.z1_r * late_gain,
+                    l + er_l * refl_gain + tail_l * late_gain,
+                    r + er_r * refl_gain + tail_r * late_gain,
                 )
             }
         }

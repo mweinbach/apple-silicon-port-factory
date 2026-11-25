@@ -1618,6 +1618,38 @@ fn dsound8_i3dl2_reverb_full_vtable_preset_and_quality() {
         assert_eq!(dsb_release(buf), 0);
         assert_eq!(ds_release(ds), 0);
     }
+
+    // Verify I3DL2 quality settings (0..=3) produce genuinely distinct DSP impulse responses.
+    let render_i3dl2_ir = |quality: i32| -> Vec<f32> {
+        let mut fx = BufferEffect::new(DsFxKind::I3dl2Reverb);
+        fx.params = i3dl2_preset_params(9).unwrap(); // CAVE preset (strong early + late reverb)
+        fx.i3dl2_quality = quality;
+        let mut out = Vec::with_capacity(4800);
+        for i in 0..4800 {
+            let x = if i == 0 { 1.0 } else { 0.0 };
+            out.push(fx.process_sample(x, 0.0, 48_000.0).0);
+        }
+        out
+    };
+    let irs: Vec<Vec<f32>> = (0..=3).map(render_i3dl2_ir).collect();
+    // Quality 0 omits early reflection at flReflectionsDelay (0.015 s = 720 samples @ 48 kHz),
+    // whereas Quality 1..=3 emit it.
+    assert!(irs[0][720].abs() < 1e-6, "quality 0 skips early reflections, got {}", irs[0][720]);
+    assert!(irs[1][720].abs() > 0.1, "quality 1 emits early reflection tap, got {}", irs[1][720]);
+    // Every pair of quality tiers (0, 1, 2, 3) produces measurably distinct reverb output.
+    for a in 0..4 {
+        for b in (a + 1)..4 {
+            let max_diff = irs[a]
+                .iter()
+                .zip(irs[b].iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff > 1e-3,
+                "I3DL2 quality {a} and quality {b} must produce distinct DSP responses (max_diff={max_diff})"
+            );
+        }
+    }
 }
 
 #[test]
