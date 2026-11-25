@@ -1579,6 +1579,15 @@ pub unsafe extern "win64" fn CreateProcessW(
             std::ffi::OsString::from(child_exit_wfd.to_string()),
         ));
 
+        // Enforce parent job breakaway / active-process limits BEFORE spawning the child.
+        let inherited_jobs = match collect_inherited_jobs_for_child(flags) {
+            Ok(j) => j,
+            Err(e) => {
+                set_err(e);
+                return FALSE;
+            }
+        };
+
         let raw_pid = match spawn_and_verify_suspended_child(
             &trusted_runner.exe_path,
             &trusted_runner.identity,
@@ -1606,6 +1615,14 @@ pub unsafe extern "win64" fn CreateProcessW(
             terminated_code: handles::Guarded::new(None),
             os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
         });
+        if let Err(e) = attach_child_to_inherited_jobs(&proc_obj, &inherited_jobs) {
+            let _ = libc::kill(raw_pid, libc::SIGKILL);
+            let mut st: libc::c_int = 0;
+            let _ = libc::waitpid(raw_pid, &mut st, 0);
+            drop(exit_read_fd);
+            set_err(e);
+            return FALSE;
+        }
         child_processes()
             .lock()
             .unwrap()
@@ -1716,14 +1733,95 @@ const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x0000_0020;
 const JOB_OBJECT_LIMIT_SCHEDULING_CLASS: u32 = 0x0000_0080;
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
 const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
+#[cfg(not(target_os = "ios"))]
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+#[cfg(any(not(target_os = "ios"), test))]
+const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 const JOB_OBJECT_LIMIT_SUBSET_AFFINITY: u32 = 0x0000_4000;
+#[cfg(not(target_os = "ios"))]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
     | JOB_OBJECT_LIMIT_PROCESS_TIME
     | JOB_OBJECT_LIMIT_JOB_TIME
     | JOB_OBJECT_LIMIT_SCHEDULING_CLASS
     | JOB_OBJECT_LIMIT_PROCESS_MEMORY
     | JOB_OBJECT_LIMIT_JOB_MEMORY;
+
+/// Collect live parent jobs that a newly created child process must inherit under Windows
+/// job-inheritance rules, enforcing `CREATE_BREAKAWAY_FROM_JOB` permissions and
+/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` quotas before spawning.
+#[cfg(not(target_os = "ios"))]
+fn collect_inherited_jobs_for_child(creation_flags: u32) -> Result<Vec<Arc<JobObj>>, u32> {
+    let my_pid = std::process::id();
+    let parent_jobs: Vec<Arc<JobObj>> = {
+        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let wants_breakaway = (creation_flags & CREATE_BREAKAWAY_FROM_JOB) != 0;
+    let mut inherited = Vec::new();
+    for jo in parent_jobs {
+        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.contains_pid(my_pid) {
+            continue;
+        }
+        let flags = st.limit_flags();
+        if (flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) != 0 {
+            continue;
+        }
+        if wants_breakaway {
+            if (flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK) != 0 {
+                continue;
+            }
+            return Err(err::ERROR_ACCESS_DENIED);
+        }
+        if (flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 {
+            let limit = st.active_process_limit();
+            if limit > 0 && st.active_count() >= limit {
+                return Err(err::ERROR_NOT_ENOUGH_QUOTA);
+            }
+        }
+        drop(st);
+        inherited.push(jo);
+    }
+    Ok(inherited)
+}
+
+/// Attach a newly spawned `ChildProcessObj` to every inherited parent job, re-checking
+/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` under each job's lock and posting `JOB_OBJECT_MSG_NEW_PROCESS`.
+#[cfg(not(target_os = "ios"))]
+fn attach_child_to_inherited_jobs(child: &Arc<ChildProcessObj>, jobs: &[Arc<JobObj>]) -> Result<(), u32> {
+    let pid = child.pid;
+    let mut attached: Vec<Arc<JobObj>> = Vec::with_capacity(jobs.len());
+    for jo in jobs {
+        let mut st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.contains_pid(pid) {
+            continue;
+        }
+        if (st.limit_flags() & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) != 0 {
+            let limit = st.active_process_limit();
+            if limit > 0 && st.active_count() >= limit {
+                drop(st);
+                // Roll back earlier attachments in this batch before failing.
+                for prev in attached {
+                    let mut pst = prev.state.lock().unwrap_or_else(|e| e.into_inner());
+                    pst.members.retain(|m| m.pid() != pid);
+                    pst.total_processes = pst.total_processes.saturating_sub(1);
+                }
+                return Err(err::ERROR_NOT_ENOUGH_QUOTA);
+            }
+        }
+        st.members.push(JobMember::Child(Arc::clone(child)));
+        st.total_processes = st.total_processes.saturating_add(1);
+        if let Some(ref cp) = st.completion_port {
+            post_job_iocp_msg(cp, JOB_OBJECT_MSG_NEW_PROCESS, pid as usize);
+        }
+        drop(st);
+        retain_active_job(jo);
+        attached.push(Arc::clone(jo));
+    }
+    Ok(())
+}
 
 /// Return `Some((effective_mask, allow_subset))` if the current process belongs to any live
 /// job with `JOB_OBJECT_LIMIT_AFFINITY` set.
@@ -4263,9 +4361,54 @@ pub(crate) mod tests {
                 assert_eq!(crate::teb::last_error(), err::ERROR_ACCESS_DENIED);
             }
 
-            // Clear KILL_ON_JOB_CLOSE and JOB_OBJECT_LIMIT_AFFINITY before closing in-process so
-            // subsequent tests keep unrestricted affinity and the test runner continues.
-            std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_ACTIVE_PROCESS);
+            // Child creation inherits the current process's job by default, respects
+            // ActiveProcessLimit and CREATE_BREAKAWAY_FROM_JOB / SILENT_BREAKAWAY_OK.
+            #[cfg(not(target_os = "ios"))]
+            {
+                // ActiveProcessLimit == 1 is already saturated by CURRENT_PROCESS -> ERROR_NOT_ENOUGH_QUOTA.
+                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                // CREATE_BREAKAWAY_FROM_JOB without BREAKAWAY_OK -> ERROR_ACCESS_DENIED.
+                assert_eq!(
+                    collect_inherited_jobs_for_child(CREATE_BREAKAWAY_FROM_JOB).err(),
+                    Some(err::ERROR_ACCESS_DENIED)
+                );
+
+                // Allow 2 active processes + BREAKAWAY_OK: default spawn inherits `job`, breakaway skips it.
+                std::ptr::write_unaligned(
+                    ext.as_mut_ptr().add(16) as *mut u32,
+                    JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                );
+                std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 2u32);
+                assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
+
+                let breakaway_jobs = collect_inherited_jobs_for_child(CREATE_BREAKAWAY_FROM_JOB).unwrap();
+                assert!(breakaway_jobs.is_empty());
+
+                let inherited = collect_inherited_jobs_for_child(0).unwrap();
+                assert_eq!(inherited.len(), 1);
+                let inh_child = Arc::new(ChildProcessObj {
+                    pid: 99991,
+                    exe_win: "C:\\Games\\InheritedChild.exe".to_string(),
+                    exit_code: handles::Guarded::new(None),
+                    terminated_code: handles::Guarded::new(None),
+                    os_pid: std::sync::atomic::AtomicI32::new(0),
+                });
+                assert_eq!(attach_child_to_inherited_jobs(&inh_child, &inherited), Ok(()));
+                let inh_h = handles::insert(Arc::clone(&inh_child) as Arc<dyn KObject>);
+                let mut inh_in_job: BOOL = FALSE;
+                assert_eq!(IsProcessInJob(inh_h, job, &mut inh_in_job), TRUE);
+                assert_eq!(inh_in_job, TRUE);
+                // ActiveProcessLimit == 2 is now saturated (self + inherited child).
+                assert_eq!(collect_inherited_jobs_for_child(0).err(), Some(err::ERROR_NOT_ENOUGH_QUOTA));
+                inh_child.finish_reaped(Some(0), 0);
+                assert_eq!(crate::kernel32::threads::CloseHandle(inh_h), TRUE);
+            }
+
+            // Switch to SILENT_BREAKAWAY_OK (clearing KILL_ON_JOB_CLOSE, ACTIVE_PROCESS, and AFFINITY)
+            // before closing in-process so subsequent tests in this binary can still spawn children
+            // freely and keep unrestricted affinity while this retained job remains queryable.
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(16) as *mut u32, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK);
+            std::ptr::write_unaligned(ext.as_mut_ptr().add(40) as *mut u32, 0u32);
             assert_eq!(SetInformationJobObject(job, 9, ext.as_ptr() as *const c_void, 144), TRUE);
             assert_eq!(SetProcessAffinityMask(handles::CURRENT_PROCESS, orig_pm), TRUE);
             assert_eq!(crate::kernel32::threads::CloseHandle(job), TRUE);
@@ -4289,12 +4432,10 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 std::ptr::read_unaligned(out_basic_after_close.as_ptr().add(16) as *const u32),
-                JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
             );
-            assert_eq!(
-                std::ptr::read_unaligned(out_basic_after_close.as_ptr().add(40) as *const u32),
-                1
-            );
+            #[cfg(not(target_os = "ios"))]
+            assert!(collect_inherited_jobs_for_child(0).unwrap().is_empty());
 
             // Named job objects release namespace ownership when the last handle closes.
             let jname = to_wide_z("Local\\KernelCoreNamedJobTest");

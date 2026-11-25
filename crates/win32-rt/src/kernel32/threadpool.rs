@@ -538,6 +538,10 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
         if !st.1 || e.timer.generation.load(Ordering::Acquire) != e.generation {
             return;
         }
+        // Register the in-flight firing under `e.timer.state` BEFORE releasing the lock so
+        // `CloseThreadpoolCleanupGroupMembers` / `WaitForThreadpoolTimerCallbacks` cannot
+        // disarm the timer and observe `pending == 0` while this firing is being submitted.
+        e.timer.pending.inc();
         let period = st.0;
         if period > 0 {
             Some((e.due + Duration::from_millis(period as u64)).max(Instant::now()))
@@ -549,7 +553,6 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
     let t_arc = Arc::clone(&e.timer);
     let raw = Arc::as_ptr(&t_arc) as u64;
     let gen = e.generation;
-    t_arc.pending.inc();
     submit(Box::new(move || {
         if t_arc.generation.load(Ordering::Acquire) == gen {
             unsafe {
@@ -561,9 +564,9 @@ fn fire_timer(tq: &TimerQueue, e: TimerEntry) {
         t_arc.pending.dec();
     }));
     if let Some(due) = next_due {
-        if e.timer.generation.load(Ordering::Acquire) == e.generation {
+        if !e.timer.closed.load(Ordering::Acquire) && e.timer.generation.load(Ordering::Acquire) == e.generation {
             let mut h = tq.heap.lock().unwrap();
-            if e.timer.generation.load(Ordering::Acquire) == e.generation {
+            if !e.timer.closed.load(Ordering::Acquire) && e.timer.generation.load(Ordering::Acquire) == e.generation {
                 h.push(TimerEntry { due, timer: e.timer, generation: e.generation });
             }
         }
@@ -2271,6 +2274,50 @@ mod tests {
             assert_eq!(CloseHandle(signaled_ev), TRUE);
             assert_eq!(CloseHandle(started_ev), TRUE);
             assert_eq!(CloseHandle(release_ev), TRUE);
+        }
+    }
+
+    #[test]
+    fn threadpool_cleanup_group_drains_concurrently_firing_timers_before_return() {
+        use std::sync::atomic::AtomicBool;
+        struct TimerRaceCtx {
+            cleaned: AtomicBool,
+            ran_after_cleanup: AtomicBool,
+        }
+        unsafe extern "win64" fn timer_cb(_inst: *mut c_void, ctx: *mut c_void, _t: *mut c_void) {
+            let c = &*(ctx as *const TimerRaceCtx);
+            std::thread::sleep(Duration::from_micros(300));
+            if c.cleaned.load(Ordering::Acquire) {
+                c.ran_after_cleanup.store(true, Ordering::Release);
+            }
+        }
+        unsafe {
+            let ctx = Box::new(TimerRaceCtx {
+                cleaned: AtomicBool::new(false),
+                ran_after_cleanup: AtomicBool::new(false),
+            });
+            let ctx_ptr = &*ctx as *const TimerRaceCtx as *mut c_void;
+            for _ in 0..32 {
+                ctx.cleaned.store(false, Ordering::Release);
+                let cg = CreateThreadpoolCleanupGroup();
+                assert!(!cg.is_null());
+                let mut env = [0u8; 72];
+                std::ptr::write_unaligned(env.as_mut_ptr() as *mut u32, 3u32);
+                std::ptr::write_unaligned(env.as_mut_ptr().add(0x10) as *mut *mut c_void, cg);
+                let t = CreateThreadpoolTimer(timer_cb, ctx_ptr, env.as_mut_ptr() as *mut c_void);
+                assert!(!t.is_null());
+                let due = FILETIME::from_u64((-1_000i64) as u64); // 100 us
+                SetThreadpoolTimer(t, &due, 1, 0);
+                std::thread::sleep(Duration::from_micros(150));
+                CloseThreadpoolCleanupGroupMembers(cg, FALSE, std::ptr::null_mut());
+                ctx.cleaned.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(2));
+                assert!(
+                    !ctx.ran_after_cleanup.load(Ordering::Acquire),
+                    "timer callback must never execute after CloseThreadpoolCleanupGroupMembers returns"
+                );
+                CloseThreadpoolCleanupGroup(cg);
+            }
         }
     }
 }
