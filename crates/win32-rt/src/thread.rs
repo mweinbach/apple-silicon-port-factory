@@ -6,8 +6,13 @@ use crate::teb;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+const TERM_NONE: u8 = 0;
+const TERM_REQUESTED: u8 = 1;
+const TERM_ACKED: u8 = 2;
 
 pub type ThreadProc = unsafe extern "win64" fn(*mut c_void) -> u32;
 pub type ApcProc = unsafe extern "win64" fn(usize);
@@ -80,10 +85,13 @@ pub struct ThreadObj {
     pub final_user_time: AtomicU64,
     /// Set by `NtSetInformationThread(ThreadHideFromDebugger)`.
     pub hide_from_debugger: AtomicBool,
-    /// Set by `TerminateThread` to request asynchronous thread termination via `SIGUSR1`.
-    terminate_requested: AtomicBool,
-    /// Set by the `SIGUSR1` handler right before calling `pthread_exit`.
-    terminated_ack: AtomicBool,
+    /// Asynchronous termination state (`TERM_NONE`, `TERM_REQUESTED`, `TERM_ACKED`).
+    terminate_state: AtomicU8,
+    /// Per-thread nesting depth of runtime critical sections where `SIGUSR1` must defer
+    /// calling `pthread_exit` until all internal locks have been released. Mutated only
+    /// by the owning thread and synchronized with `sigusr1_terminate_handler` via
+    /// `compiler_fence(Ordering::SeqCst)`.
+    defer_terminate: AtomicU32,
     /// Custom mmap stack allocation `(base_ptr, total_len)` owned by a `spawn`ed thread.
     /// Taken once by whichever exit path reaps it first (`finish_current_thread` or `terminate_thread`).
     stack_alloc: Mutex<Option<(usize, usize)>>,
@@ -122,8 +130,8 @@ impl ThreadObj {
             final_kernel_time: AtomicU64::new(0),
             final_user_time: AtomicU64::new(0),
             hide_from_debugger: AtomicBool::new(false),
-            terminate_requested: AtomicBool::new(false),
-            terminated_ack: AtomicBool::new(false),
+            terminate_state: AtomicU8::new(TERM_NONE),
+            defer_terminate: AtomicU32::new(0),
             stack_alloc: Mutex::new(None),
             act_kind: AtomicU8::new(0),
             act_start_ns: AtomicU64::new(0),
@@ -138,7 +146,7 @@ impl ThreadObj {
 
     /// Return this thread's live Darwin Mach port (`0` if not yet started or already exiting).
     pub fn mach_port(&self) -> u32 {
-        let s = self.suspend.lock().unwrap_or_else(|e| e.into_inner());
+        let s = defer_lock(&self.suspend);
         if s.phase == ThreadPhase::Live {
             s.mach_port
         } else {
@@ -170,6 +178,7 @@ impl ThreadObj {
     ///   `self.suspend`); it parks on `resume_cv`, releasing the mutex so another thread can
     ///   resume it cleanly.
     pub fn suspend(&self) -> Result<u32, u32> {
+        let _defer = TerminateDeferGuard::enter();
         let mut s = self.suspend.lock().unwrap();
         if s.phase == ThreadPhase::Exiting {
             return Err(crate::types::err::ERROR_ACCESS_DENIED);
@@ -183,7 +192,10 @@ impl ThreadObj {
             let prev = s.count;
             s.count += 1;
             s.self_suspended = true;
-            while s.count > 0 && s.phase != ThreadPhase::Exiting {
+            while s.count > 0
+                && s.phase != ThreadPhase::Exiting
+                && self.terminate_state.load(Ordering::Acquire) == TERM_NONE
+            {
                 s = self.resume_cv.wait(s).unwrap();
             }
             s.self_suspended = false;
@@ -221,7 +233,7 @@ impl ThreadObj {
     /// Decrements the suspend count and resumes execution when transitioning `1 -> 0`.
     /// Returns the previous suspend count, or a Win32 error code if Mach resume fails.
     pub fn resume_checked(&self) -> Result<u32, u32> {
-        let mut s = self.suspend.lock().unwrap();
+        let mut s = defer_lock(&self.suspend);
         let prev = s.count;
         if prev == 0 {
             return Ok(0);
@@ -265,7 +277,7 @@ impl ThreadObj {
     /// return the terminal snapshot captured before clearing the Mach port.
     pub fn times_100ns(&self) -> (u64, u64, u64, u64) {
         let created = self.creation_time.load(Ordering::Relaxed);
-        let s = self.suspend.lock().unwrap_or_else(|e| e.into_inner());
+        let s = defer_lock(&self.suspend);
         match s.phase {
             ThreadPhase::Exiting => (
                 created,
@@ -292,11 +304,12 @@ impl ThreadObj {
     }
 
     fn wait_resumed(&self) -> bool {
+        let _defer = TerminateDeferGuard::enter();
         let mut s = self.suspend.lock().unwrap();
-        while s.count > 0 && !self.terminate_requested.load(Ordering::Acquire) {
+        while s.count > 0 && self.terminate_state.load(Ordering::Acquire) == TERM_NONE {
             s = self.resume_cv.wait(s).unwrap();
         }
-        if self.terminate_requested.load(Ordering::Acquire) {
+        if self.terminate_state.load(Ordering::Acquire) != TERM_NONE {
             let _ = self.exit_time.compare_exchange(
                 0,
                 crate::types::now_filetime(),
@@ -304,6 +317,10 @@ impl ThreadObj {
                 Ordering::Acquire,
             );
             s.phase = ThreadPhase::Exiting;
+            // Clear ACT_SLOT before `_defer` drops so `thread_main` runs its normal
+            // `CREATE_SUSPENDED` teardown (freeing TEB + reaping stack) instead of
+            // short-circuiting through `pthread_exit`.
+            ACT_SLOT.with(|c| c.set(std::ptr::null()));
             return false;
         }
         s.phase = ThreadPhase::Live;
@@ -315,7 +332,7 @@ impl ThreadObj {
     }
 
     fn mark_exiting(&self) {
-        let mut s = self.suspend.lock().unwrap();
+        let mut s = defer_lock(&self.suspend);
         if s.phase == ThreadPhase::Exiting {
             return;
         }
@@ -426,8 +443,8 @@ fn enqueue_stack_reap_for(obj: &ThreadObj, pthread: usize) {
     if pthread == 0 {
         return;
     }
-    if let Some((mem, len)) = obj.stack_alloc.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = stack_reaper_tx().lock().unwrap().send(ReapReq { pthread, mem, len });
+    if let Some((mem, len)) = defer_lock(&obj.stack_alloc).take() {
+        let _ = defer_lock(stack_reaper_tx()).send(ReapReq { pthread, mem, len });
     }
 }
 
@@ -437,18 +454,155 @@ fn enqueue_current_stack_reap() {
         enqueue_stack_reap_for(&obj, pthread);
     }
     if let Some((mem, len)) = STACK_ALLOC.with(|c| c.take()) {
-        let _ = stack_reaper_tx().lock().unwrap().send(ReapReq { pthread, mem, len });
+        let _ = defer_lock(stack_reaper_tx()).send(ReapReq { pthread, mem, len });
     }
+}
+
+#[inline(always)]
+unsafe fn try_exit_if_terminated(obj: *const ThreadObj) {
+    if (*obj).terminate_state.load(Ordering::Acquire) == TERM_REQUESTED
+        && (*obj)
+            .terminate_state
+            .compare_exchange(TERM_REQUESTED, TERM_ACKED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        libc::pthread_exit(std::ptr::null_mut());
+    }
+}
+
+/// Returns `true` if `TerminateThread` has requested termination of the current thread.
+#[inline(always)]
+pub(crate) fn is_current_terminate_requested() -> bool {
+    let p = ACT_SLOT.with(|c| c.get());
+    !p.is_null() && unsafe { (*p).terminate_state.load(Ordering::Acquire) != TERM_NONE }
+}
+
+/// Increment the current thread's termination-deferral nesting depth.
+/// Must be paired 1-for-1 with [`defer_terminate_leave`].
+#[inline(always)]
+pub(crate) fn defer_terminate_enter() {
+    let p = ACT_SLOT.with(|c| c.get());
+    if !p.is_null() {
+        unsafe {
+            let d = (*p).defer_terminate.load(Ordering::Relaxed);
+            (*p).defer_terminate.store(d.wrapping_add(1), Ordering::Relaxed);
+        }
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Decrement the current thread's termination-deferral nesting depth, exiting cleanly
+/// at the outermost safe point if `TerminateThread` requested termination while deferred.
+#[inline(always)]
+pub(crate) fn defer_terminate_leave() {
+    let p = ACT_SLOT.with(|c| c.get());
+    if !p.is_null() {
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        unsafe {
+            let prev = (*p).defer_terminate.load(Ordering::Relaxed);
+            let next = prev.saturating_sub(1);
+            (*p).defer_terminate.store(next, Ordering::Relaxed);
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+            if next == 0 {
+                try_exit_if_terminated(p);
+            }
+        }
+    }
+}
+
+/// RAII guard that defers asynchronous `SIGUSR1` termination while a runtime lock
+/// or critical section is held. `!Send` by virtue of holding `*const ThreadObj`.
+pub(crate) struct TerminateDeferGuard {
+    obj: *const ThreadObj,
+}
+
+impl TerminateDeferGuard {
+    #[inline(always)]
+    pub(crate) fn enter() -> Self {
+        let p = ACT_SLOT.with(|c| c.get());
+        if !p.is_null() {
+            unsafe {
+                let d = (*p).defer_terminate.load(Ordering::Relaxed);
+                (*p).defer_terminate.store(d.wrapping_add(1), Ordering::Relaxed);
+            }
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        }
+        TerminateDeferGuard { obj: p }
+    }
+}
+
+impl Drop for TerminateDeferGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let p = self.obj;
+        if !p.is_null() {
+            std::sync::atomic::compiler_fence(Ordering::SeqCst);
+            unsafe {
+                let prev = (*p).defer_terminate.load(Ordering::Relaxed);
+                let next = prev.saturating_sub(1);
+                (*p).defer_terminate.store(next, Ordering::Relaxed);
+                std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                if next == 0 && !ACT_SLOT.with(|c| c.get()).is_null() {
+                    try_exit_if_terminated(p);
+                }
+            }
+        }
+    }
+}
+
+/// Wraps a lock guard so `TerminateDeferGuard` is entered BEFORE acquiring the lock
+/// and dropped AFTER the lock guard unlocks (struct fields drop in declaration order).
+pub(crate) struct DeferLockGuard<G> {
+    guard: G,
+    _defer: TerminateDeferGuard,
+}
+
+impl<G: Deref> Deref for DeferLockGuard<G> {
+    type Target = G::Target;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &*self.guard
+    }
+}
+
+impl<G: DerefMut> DerefMut for DeferLockGuard<G> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.guard
+    }
+}
+
+#[inline]
+pub(crate) fn defer_lock<T>(m: &Mutex<T>) -> DeferLockGuard<MutexGuard<'_, T>> {
+    let _defer = TerminateDeferGuard::enter();
+    let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    DeferLockGuard { guard, _defer }
+}
+
+#[inline]
+pub(crate) fn defer_read<T>(rw: &RwLock<T>) -> DeferLockGuard<RwLockReadGuard<'_, T>> {
+    let _defer = TerminateDeferGuard::enter();
+    let guard = rw.read().unwrap_or_else(|e| e.into_inner());
+    DeferLockGuard { guard, _defer }
+}
+
+#[inline]
+pub(crate) fn defer_write<T>(rw: &RwLock<T>) -> DeferLockGuard<RwLockWriteGuard<'_, T>> {
+    let _defer = TerminateDeferGuard::enter();
+    let guard = rw.write().unwrap_or_else(|e| e.into_inner());
+    DeferLockGuard { guard, _defer }
 }
 
 extern "C" fn sigusr1_terminate_handler(_sig: libc::c_int) {
     // Async-signal-safe: reads only thread-local Cell pointer and atomics, zero mutexes.
+    // While inside a runtime critical section (`defer_terminate > 0`), return without
+    // calling `pthread_exit` (interrupting blocking syscalls with EINTR) so the thread
+    // exits cleanly once all internal locks have been released.
     let p = ACT_SLOT.with(|c| c.get());
     if !p.is_null() {
         unsafe {
-            if (*p).terminate_requested.load(Ordering::Acquire) {
-                (*p).terminated_ack.store(true, Ordering::Release);
-                libc::pthread_exit(std::ptr::null_mut());
+            if (*p).defer_terminate.load(Ordering::Relaxed) == 0 {
+                try_exit_if_terminated(p);
             }
         }
     }
@@ -469,15 +623,16 @@ fn install_terminate_signal_handler() {
 /// - Already-exited threads succeed without altering their exit code.
 /// - Self-termination records `code`, signals waiters, skips `DLL_THREAD_DETACH`, and exits.
 /// - `CREATE_SUSPENDED` threads abort before running their guest entry point.
-/// - Live other threads are interrupted via `SIGUSR1` -> `pthread_exit`, signaled with `code`,
-///   and their custom mmap stack is safely reclaimed after `pthread_join`.
+/// - Live other threads are interrupted via `SIGUSR1` -> `pthread_exit` (deferred cleanly
+///   past any held runtime locks), signaled with `code`, and their custom mmap stack is
+///   safely reclaimed after `pthread_join`.
 pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
     if obj.exit_code().is_some() {
         return true;
     }
     if obj.is_current_thread(obj.mach_port()) {
-        obj.mark_exiting();
         ACT_SLOT.with(|c| c.set(std::ptr::null()));
+        obj.mark_exiting();
         let t = teb::current_raw();
         let pthread = unsafe { libc::pthread_self() as usize };
         obj.pthread.store(0, Ordering::Release);
@@ -490,7 +645,7 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
         }
         handles::notify_object_key(&**obj as *const ThreadObj as usize, usize::MAX);
         obj.teb.store(0, Ordering::Relaxed);
-        THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, obj));
+        defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, obj));
         CURRENT.with(|c| *c.borrow_mut() = None);
         unsafe {
             teb::uninstall();
@@ -505,11 +660,16 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
 
     install_terminate_signal_handler();
     let (was_starting, pthread) = {
-        let mut s = obj.suspend.lock().unwrap();
+        let mut s = defer_lock(&obj.suspend);
         if s.phase == ThreadPhase::Exiting {
             return true;
         }
-        obj.terminate_requested.store(true, Ordering::Release);
+        let _ = obj.terminate_state.compare_exchange(
+            TERM_NONE,
+            TERM_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         if s.phase == ThreadPhase::Starting {
             let _ = obj.exit_time.compare_exchange(
                 0,
@@ -539,39 +699,59 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
 
     if !was_starting {
         if pthread == 0 {
-            if obj.exit_code().is_none() {
-                obj.terminate_requested.store(false, Ordering::Release);
+            if obj.exit_code().is_none()
+                && obj
+                    .terminate_state
+                    .compare_exchange(TERM_REQUESTED, TERM_NONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 return false;
             }
         } else {
             let kill_rc = unsafe { libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1) };
-            let confirmed = if kill_rc == libc::ESRCH {
+            let mut confirmed = if kill_rc == libc::ESRCH {
                 true
             } else if kill_rc == 0 {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-                while !obj.terminated_ack.load(Ordering::Acquire)
+                let mut last_signal = std::time::Instant::now();
+                while obj.terminate_state.load(Ordering::Acquire) != TERM_ACKED
                     && obj.exit_code().is_none()
                     && std::time::Instant::now() < deadline
                 {
                     std::thread::sleep(std::time::Duration::from_micros(200));
+                    if last_signal.elapsed() >= std::time::Duration::from_millis(2) {
+                        let rc = unsafe { libc::pthread_kill(pthread as libc::pthread_t, libc::SIGUSR1) };
+                        if rc == libc::ESRCH {
+                            break;
+                        }
+                        last_signal = std::time::Instant::now();
+                    }
                 }
-                obj.terminated_ack.load(Ordering::Acquire)
+                obj.terminate_state.load(Ordering::Acquire) == TERM_ACKED
                     || obj.exit_code().is_some()
                     || unsafe { libc::pthread_kill(pthread as libc::pthread_t, 0) } == libc::ESRCH
             } else {
                 false
             };
             if !confirmed {
-                // Do not publish an exit code or signal waiters when the target thread
-                // has not confirmed termination (e.g. SIGUSR1 blocked or signal delivery
-                // failed) — otherwise callers waiting on the handle could free resources
-                // still in use by the running thread.
-                obj.terminate_requested.store(false, Ordering::Release);
-                log::warn!(
-                    "TerminateThread: target thread did not confirm termination (pthread_kill rc={kill_rc})"
-                );
-                return false;
+                // Atomically cancel only if the target did not just commit to exiting.
+                if obj
+                    .terminate_state
+                    .compare_exchange(TERM_REQUESTED, TERM_NONE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Do not publish an exit code or signal waiters when the target thread
+                    // has not confirmed termination (e.g. SIGUSR1 blocked or signal delivery
+                    // failed) — otherwise callers waiting on the handle could free resources
+                    // still in use by the running thread.
+                    log::warn!(
+                        "TerminateThread: target thread did not confirm termination (pthread_kill rc={kill_rc})"
+                    );
+                    return false;
+                }
+                confirmed = true;
             }
+            let _ = confirmed;
         }
     }
 
@@ -584,8 +764,8 @@ pub fn terminate_thread(obj: &Arc<ThreadObj>, code: u32) -> bool {
         }
     }
     handles::notify_object_key(&**obj as *const ThreadObj as usize, usize::MAX);
-    THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, obj));
-    if !was_starting && obj.terminated_ack.load(Ordering::Acquire) {
+    defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, obj));
+    if !was_starting && obj.terminate_state.load(Ordering::Acquire) == TERM_ACKED {
         let p = obj.pthread.swap(0, Ordering::AcqRel);
         enqueue_stack_reap_for(obj, p);
     }
@@ -645,7 +825,7 @@ pub fn ensure_current_thread_object() -> Arc<ThreadObj> {
     obj.teb.store(teb_ptr as usize, Ordering::Relaxed);
     obj.pthread.store(unsafe { libc::pthread_self() as usize }, Ordering::Relaxed);
     {
-        let mut s = obj.suspend.lock().unwrap();
+        let mut s = defer_lock(&obj.suspend);
         s.phase = ThreadPhase::Live;
         #[cfg(target_vendor = "apple")]
         {
@@ -657,20 +837,18 @@ pub fn ensure_current_thread_object() -> Arc<ThreadObj> {
 }
 
 pub fn find_by_tid(tid: u32) -> Option<Arc<ThreadObj>> {
-    THREADS.lock().unwrap().iter().find(|t| t.tid.load(Ordering::Relaxed) as u32 == tid).cloned()
+    defer_lock(&THREADS).iter().find(|t| t.tid.load(Ordering::Relaxed) as u32 == tid).cloned()
 }
 
 /// Snapshot of all live Windows thread objects.
 pub fn all_threads() -> Vec<Arc<ThreadObj>> {
-    THREADS.lock().unwrap().clone()
+    defer_lock(&THREADS).clone()
 }
 
 /// All live TEBs (the loader extends static TLS of every thread when a DLL
 /// with a TLS directory is loaded at runtime).
 pub fn all_tebs() -> Vec<*mut u8> {
-    THREADS
-        .lock()
-        .unwrap()
+    defer_lock(&THREADS)
         .iter()
         .map(|t| t.teb.load(Ordering::Relaxed) as *mut u8)
         .filter(|t| !t.is_null())
@@ -744,7 +922,7 @@ pub fn spawn_with_start_address(
         let obj = ThreadObj::new(suspended);
         obj.tid.store(teb::alloc_tid() as usize, Ordering::Relaxed);
         obj.start_address.store(start_address, Ordering::Release);
-        THREADS.lock().unwrap().push(obj.clone());
+        defer_lock(&THREADS).push(obj.clone());
         let info = Box::new(StartInfo {
             obj: obj.clone(),
             body,
@@ -767,7 +945,7 @@ pub fn spawn_with_start_address(
         if rc != 0 {
             drop(Box::from_raw(info_ptr));
             libc::munmap(mem, total);
-            THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, &obj));
+            defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, &obj));
             obj.mark_exiting();
             return Err(std::io::Error::from_raw_os_error(rc));
         }
@@ -836,10 +1014,10 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
 /// Thread teardown: FLS callbacks, DLL_THREAD_DETACH, signal waiters, release
 /// the borrowed TSD slots, and schedule custom stack reclamation.
 pub fn finish_current_thread(code: u32) {
+    ACT_SLOT.with(|c| c.set(std::ptr::null()));
     if let Some(obj) = current_thread_object() {
         obj.mark_exiting();
     }
-    ACT_SLOT.with(|c| c.set(std::ptr::null()));
     run_fls_callbacks();
     let t = teb::current_raw();
     if !t.is_null() {
@@ -855,7 +1033,7 @@ pub fn finish_current_thread(code: u32) {
         }
         handles::notify_object_key(&*obj as *const ThreadObj as usize, usize::MAX);
         obj.teb.store(0, Ordering::Relaxed);
-        THREADS.lock().unwrap().retain(|o| !Arc::ptr_eq(o, &obj));
+        defer_lock(&THREADS).retain(|o| !Arc::ptr_eq(o, &obj));
     }
     CURRENT.with(|c| *c.borrow_mut() = None);
     unsafe {
@@ -886,7 +1064,7 @@ pub fn run_pending_apcs() {
     if let Some(t) = current_thread_object() {
         loop {
             let next = {
-                let mut q = t.apcs.lock().unwrap();
+                let mut q = defer_lock(&t.apcs);
                 if q.is_empty() {
                     t.has_apc.store(false, Ordering::Release);
                     None
@@ -923,7 +1101,7 @@ pub fn run_pending_apcs() {
 
 pub fn queue_apc(t: &ThreadObj, f: ApcProc, param: usize) {
     {
-        let mut q = t.apcs.lock().unwrap();
+        let mut q = defer_lock(&t.apcs);
         q.push(ApcItem::User { func: f, param });
         t.has_apc.store(true, Ordering::Release);
     }
@@ -947,7 +1125,7 @@ pub fn queue_io_completion_apc_with_flags(
     flags: u32,
 ) {
     {
-        let mut q = t.apcs.lock().unwrap();
+        let mut q = defer_lock(&t.apcs);
         q.push(ApcItem::IoCompletion { func, err_code, bytes, overlapped, flags });
         t.has_apc.store(true, Ordering::Release);
     }
@@ -964,7 +1142,7 @@ static TLS_BITMAP: Mutex<[bool; teb::TLS_MINIMUM_AVAILABLE + teb::TLS_EXPANSION_
 pub const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
 
 pub fn tls_alloc() -> u32 {
-    let mut b = TLS_BITMAP.lock().unwrap();
+    let mut b = defer_lock(&TLS_BITMAP);
     match b.iter().position(|x| !*x) {
         Some(i) => {
             b[i] = true;
@@ -979,7 +1157,7 @@ pub fn tls_alloc() -> u32 {
 }
 
 pub fn tls_free(i: u32) -> bool {
-    let mut b = TLS_BITMAP.lock().unwrap();
+    let mut b = defer_lock(&TLS_BITMAP);
     match b.get_mut(i as usize) {
         Some(x) if *x => {
             *x = false;
@@ -990,7 +1168,7 @@ pub fn tls_free(i: u32) -> bool {
 }
 
 pub fn tls_valid(i: u32) -> bool {
-    TLS_BITMAP.lock().unwrap().get(i as usize).copied().unwrap_or(false)
+    defer_lock(&TLS_BITMAP).get(i as usize).copied().unwrap_or(false)
 }
 
 /// Pointer to slot `i` in `teb` (allocating the expansion array if `create`).
@@ -1026,7 +1204,7 @@ static FLS_CALLBACKS: [AtomicUsize; MAX_FLS_SLOTS] = [const { AtomicUsize::new(0
 pub const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
 
 pub fn fls_alloc(cb: Option<FlsCallback>) -> u32 {
-    let _g = FLS_ALLOC_LOCK.lock().unwrap();
+    let _g = defer_lock(&FLS_ALLOC_LOCK);
     for i in 0..MAX_FLS_SLOTS {
         if !FLS_ALLOCATED[i].load(Ordering::Relaxed) {
             FLS_CALLBACKS[i].store(cb.map_or(0, |f| f as usize), Ordering::Relaxed);
@@ -1043,7 +1221,7 @@ pub fn fls_free(i: u32) -> bool {
         return false;
     }
     let cb = {
-        let _g = FLS_ALLOC_LOCK.lock().unwrap();
+        let _g = defer_lock(&FLS_ALLOC_LOCK);
         if !FLS_ALLOCATED[idx].load(Ordering::Relaxed) {
             return false;
         }
@@ -1256,7 +1434,7 @@ pub mod sched {
             return Some(current_port());
         }
         {
-            let s = t.suspend.lock().unwrap();
+            let s = super::defer_lock(&t.suspend);
             if s.phase == super::ThreadPhase::Exiting {
                 return None;
             }

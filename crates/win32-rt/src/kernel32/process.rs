@@ -310,7 +310,7 @@ pub unsafe extern "win64" fn OpenProcess(_access: u32, inherit: BOOL, pid: u32) 
         return std::ptr::null_mut();
     }
     let found = {
-        let mut m = child_processes().lock().unwrap();
+        let mut m = crate::thread::defer_lock(child_processes());
         let obj = m.get(&pid).and_then(|w| w.upgrade());
         if obj.is_none() {
             m.remove(&pid);
@@ -537,7 +537,7 @@ pub unsafe extern "win64" fn SetProcessAffinityMask(h: HANDLE, mask: usize) -> B
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let _aff_guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _aff_guard = crate::thread::defer_lock(job_affinity_lock());
     if let Some((job_mask, allow_subset)) = job_affinity_constraint() {
         if (mask & !job_mask) != 0 || (!allow_subset && mask != job_mask) {
             set_err(err::ERROR_ACCESS_DENIED);
@@ -614,7 +614,7 @@ pub unsafe extern "win64" fn SetPriorityClass(h: HANDLE, c: u32) -> BOOL {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    let _aff_guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _aff_guard = crate::thread::defer_lock(job_affinity_lock());
     if let Some(job_prio) = job_priority_class_constraint() {
         if c != job_prio {
             set_err(err::ERROR_ACCESS_DENIED);
@@ -1699,13 +1699,11 @@ pub unsafe extern "win64" fn CreateProcessW(
             terminated_code: handles::Guarded::new(None),
             os_pid: std::sync::atomic::AtomicI32::new(raw_pid),
         });
-        child_processes()
-            .lock()
-            .unwrap()
+        crate::thread::defer_lock(child_processes())
             .insert(pid, Arc::downgrade(&proc_obj));
         if libc::kill(raw_pid, libc::SIGCONT) != 0 {
             let e = last_errno();
-            child_processes().lock().unwrap().remove(&pid);
+            crate::thread::defer_lock(child_processes()).remove(&pid);
             pr::kill_and_reap_pid(raw_pid);
             drop(exit_read_fd);
             set_err(errno_to_win32(e));
@@ -1844,12 +1842,12 @@ const UNENFORCED_JOB_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_WORKINGSET
 fn check_parent_jobs_for_child_spawn(creation_flags: u32) -> Result<(), u32> {
     let my_pid = std::process::id();
     let parent_jobs: Vec<Arc<JobObj>> = {
-        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let all = crate::thread::defer_lock(all_jobs());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let wants_breakaway = (creation_flags & CREATE_BREAKAWAY_FROM_JOB) != 0;
     for jo in parent_jobs {
-        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = crate::thread::defer_lock(&jo.state);
         if !st.contains_pid(my_pid) {
             continue;
         }
@@ -1883,7 +1881,7 @@ fn job_affinity_lock() -> &'static std::sync::Mutex<()> {
 }
 
 pub(crate) fn with_affinity_lock<R>(f: impl FnOnce() -> R) -> R {
-    let _guard = job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::thread::defer_lock(job_affinity_lock());
     f()
 }
 
@@ -1912,7 +1910,7 @@ fn combine_affinity_constraints(
 fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(usize, bool)>, ()> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
-        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let all = crate::thread::defer_lock(all_jobs());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let mut combined: Option<(usize, bool)> = None;
@@ -1920,7 +1918,7 @@ fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(
         if Arc::ptr_eq(&jo, exclude) {
             continue;
         }
-        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = crate::thread::defer_lock(&jo.state);
         if !st.contains_pid(my_pid) {
             continue;
         }
@@ -1936,12 +1934,12 @@ fn other_self_jobs_affinity_constraint(exclude: &Arc<JobObj>) -> Result<Option<(
 fn job_priority_class_constraint() -> Option<u32> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
-        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let all = crate::thread::defer_lock(all_jobs());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let mut locked: Option<u32> = None;
     for jo in jobs {
-        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = crate::thread::defer_lock(&jo.state);
         if !st.contains_pid(my_pid) {
             continue;
         }
@@ -1960,7 +1958,7 @@ fn job_priority_class_constraint() -> Option<u32> {
 fn other_self_jobs_priority_constraint(exclude: &Arc<JobObj>) -> Result<Option<u32>, ()> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
-        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let all = crate::thread::defer_lock(all_jobs());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let mut locked: Option<u32> = None;
@@ -1968,7 +1966,7 @@ fn other_self_jobs_priority_constraint(exclude: &Arc<JobObj>) -> Result<Option<u
         if Arc::ptr_eq(&jo, exclude) {
             continue;
         }
-        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = crate::thread::defer_lock(&jo.state);
         if !st.contains_pid(my_pid) {
             continue;
         }
@@ -1997,12 +1995,12 @@ fn combine_priority_constraints(a: Option<u32>, b: Option<u32>) -> Result<Option
 fn job_affinity_constraint() -> Option<(usize, bool)> {
     let my_pid = std::process::id();
     let jobs: Vec<Arc<JobObj>> = {
-        let all = all_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let all = crate::thread::defer_lock(all_jobs());
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
     let mut combined: Option<(usize, bool)> = None;
     for jo in jobs {
-        let st = jo.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = crate::thread::defer_lock(&jo.state);
         if !st.contains_pid(my_pid) {
             continue;
         }
@@ -2079,7 +2077,7 @@ fn post_job_iocp_msg(cp: &(usize, Arc<crate::kernel32::file::IoCompletionPort>),
 #[cfg(not(target_os = "ios"))]
 fn notify_jobs_of_child_exit(pid: u32, exit_code: u32) {
     let jobs: Vec<Arc<JobObj>> = {
-        let mut all = all_jobs().lock().unwrap();
+        let mut all = crate::thread::defer_lock(all_jobs());
         all.retain(|w| w.strong_count() > 0);
         all.iter().filter_map(|w| w.upgrade()).collect()
     };
@@ -2089,7 +2087,7 @@ fn notify_jobs_of_child_exit(pid: u32, exit_code: u32) {
         JOB_OBJECT_MSG_EXIT_PROCESS
     };
     for jo in jobs {
-        let st = jo.state.lock().unwrap();
+        let st = crate::thread::defer_lock(&jo.state);
         if st.contains_pid(pid) {
             if let Some(ref cp) = st.completion_port {
                 post_job_iocp_msg(cp, exit_msg, pid as usize);
@@ -2263,7 +2261,7 @@ impl JobObj {
             state: std::sync::Mutex::new(JobState::new(name)),
             open_handles: AtomicUsize::new(0),
         });
-        let mut all = all_jobs().lock().unwrap();
+        let mut all = crate::thread::defer_lock(all_jobs());
         all.retain(|w| w.strong_count() > 0);
         all.push(Arc::downgrade(&obj));
         obj
@@ -2271,7 +2269,7 @@ impl JobObj {
 
     fn terminate_children(&self, exit_code: u32) -> bool {
         let children: Vec<Arc<ChildProcessObj>> = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = crate::thread::defer_lock(&self.state);
             let mut out = Vec::new();
             for m in &st.members {
                 if let JobMember::Child(c) = m {
@@ -2308,7 +2306,7 @@ impl JobObj {
         }
         #[cfg(target_os = "ios")]
         let _ = (children, exit_code);
-        let st = self.state.lock().unwrap();
+        let st = crate::thread::defer_lock(&self.state);
         st.contains_pid(std::process::id())
     }
 }
@@ -2317,7 +2315,7 @@ impl Drop for JobObj {
     fn drop(&mut self) {
         let name = self.state.get_mut().unwrap_or_else(|e| e.into_inner()).name.take();
         if let Some(n) = name {
-            let mut jobs = named_jobs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut jobs = crate::thread::defer_lock(named_jobs());
             if jobs.get(&n).is_some_and(|w| w.strong_count() == 0) {
                 jobs.remove(&n);
             }
@@ -2340,12 +2338,12 @@ impl KObject for JobObj {
             return;
         }
         // Re-check under named_jobs() in case a concurrent Create/OpenJobObject just opened a handle.
-        let mut jobs = named_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut jobs = crate::thread::defer_lock(named_jobs());
         if self.open_handles.load(Ordering::Acquire) != 0 {
             return;
         }
         let (kill_on_close, name) = {
-            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = crate::thread::defer_lock(&self.state);
             (
                 (st.limit_flags() & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) != 0,
                 st.name.clone(),
@@ -2385,7 +2383,7 @@ fn active_jobs() -> &'static std::sync::Mutex<Vec<Arc<JobObj>>> {
 }
 
 fn retain_active_job(j: &Arc<JobObj>) {
-    let mut active = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    let mut active = crate::thread::defer_lock(active_jobs());
     if !active.iter().any(|x| Arc::ptr_eq(x, j)) {
         active.push(Arc::clone(j));
     }
@@ -2393,8 +2391,8 @@ fn retain_active_job(j: &Arc<JobObj>) {
 
 #[cfg(not(target_os = "ios"))]
 fn release_inactive_jobs() {
-    let mut active = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
-    active.retain(|j| j.state.lock().unwrap_or_else(|e| e.into_inner()).active_count() > 0);
+    let mut active = crate::thread::defer_lock(active_jobs());
+    active.retain(|j| crate::thread::defer_lock(&j.state).active_count() > 0);
 }
 
 /// Weak namespace for named job objects; entries are unlinked when the last open handle
@@ -2411,13 +2409,13 @@ fn create_job_object_impl(name: Option<String>) -> HANDLE {
         return handles::insert(JobObj::new(None));
     };
     {
-        let other = handles::named_objects().lock().unwrap();
+        let other = crate::thread::defer_lock(handles::named_objects());
         if other.contains_key(&n) {
             set_err(err::ERROR_INVALID_HANDLE);
             return std::ptr::null_mut();
         }
     }
-    let mut jobs = named_jobs().lock().unwrap();
+    let mut jobs = crate::thread::defer_lock(named_jobs());
     if let Some(existing) = jobs
         .get(&n)
         .and_then(|w| w.upgrade())
@@ -2449,7 +2447,7 @@ pub unsafe extern "win64" fn OpenJobObjectW(_access: u32, inherit: BOOL, name: L
         return std::ptr::null_mut();
     };
     let flags = if inherit != 0 { handles::HANDLE_FLAG_INHERIT } else { 0 };
-    let mut jobs = named_jobs().lock().unwrap();
+    let mut jobs = crate::thread::defer_lock(named_jobs());
     if let Some(existing) = jobs
         .get(&n)
         .and_then(|w| w.upgrade())
@@ -2486,7 +2484,7 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     };
     let pid = member.pid();
     let is_self_member = matches!(member, JobMember::SelfProc(_));
-    let _aff_guard = is_self_member.then(|| job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner()));
+    let _aff_guard = is_self_member.then(|| crate::thread::defer_lock(job_affinity_lock()));
     let (other_aff, other_prio) = if is_self_member {
         let a = match other_self_jobs_affinity_constraint(&j) {
             Ok(a) => a,
@@ -2506,7 +2504,7 @@ pub unsafe extern "win64" fn AssignProcessToJobObject(job: HANDLE, p: HANDLE) ->
     } else {
         (None, None)
     };
-    let mut st = j.state.lock().unwrap();
+    let mut st = crate::thread::defer_lock(&j.state);
     if st.contains_pid(pid) {
         return TRUE;
     }
@@ -2593,7 +2591,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
     }
     let bytes = info as *const u8;
     let updates_affinity = matches!(class, 2 | 9 | 14);
-    let _aff_guard = updates_affinity.then(|| job_affinity_lock().lock().unwrap_or_else(|e| e.into_inner()));
+    let _aff_guard = updates_affinity.then(|| crate::thread::defer_lock(job_affinity_lock()));
     let other_aff = if updates_affinity {
         other_self_jobs_affinity_constraint(&j)
     } else {
@@ -2604,7 +2602,7 @@ pub unsafe extern "win64" fn SetInformationJobObject(job: HANDLE, class: u32, in
     } else {
         Ok(None)
     };
-    let mut st = j.state.lock().unwrap();
+    let mut st = crate::thread::defer_lock(&j.state);
     match class {
         2 => {
             // JobObjectBasicLimitInformation (64 bytes on x64)
@@ -2949,10 +2947,10 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         // Per Microsoft Learn: NULL queries the job associated with the current process.
         let my_pid = std::process::id();
         let found = {
-            let jobs = all_jobs().lock().unwrap();
+            let jobs = crate::thread::defer_lock(all_jobs());
             jobs.iter()
                 .filter_map(|w| w.upgrade())
-                .find(|jo| jo.state.lock().unwrap().contains_pid(my_pid))
+                .find(|jo| crate::thread::defer_lock(&jo.state).contains_pid(my_pid))
         };
         match found {
             Some(jo) => jo,
@@ -2977,7 +2975,7 @@ pub unsafe extern "win64" fn QueryInformationJobObject(
         }
     };
     let out = info as *mut u8;
-    let st = j.state.lock().unwrap();
+    let st = crate::thread::defer_lock(&j.state);
     match class {
         1 => {
             // JobObjectBasicAccountingInformation (48 bytes):
@@ -3174,16 +3172,16 @@ pub unsafe extern "win64" fn IsProcessInJob(p: HANDLE, job: HANDLE, out: *mut BO
         return FALSE;
     };
     let in_job = if job.is_null() {
-        let jobs = all_jobs().lock().unwrap();
+        let jobs = crate::thread::defer_lock(all_jobs());
         jobs.iter()
             .filter_map(|w| w.upgrade())
-            .any(|jo| jo.state.lock().unwrap().contains_pid(pid))
+            .any(|jo| crate::thread::defer_lock(&jo.state).contains_pid(pid))
     } else {
         let Some(jo) = handles::get_as::<JobObj>(job) else {
             set_err(err::ERROR_INVALID_HANDLE);
             return FALSE;
         };
-        let found = jo.state.lock().unwrap().contains_pid(pid);
+        let found = crate::thread::defer_lock(&jo.state).contains_pid(pid);
         found
     };
     std::ptr::write_unaligned(out, if in_job { TRUE } else { FALSE });
@@ -3901,7 +3899,7 @@ static NEXT_ATOM: AtomicUsize = AtomicUsize::new(0xC000);
 
 fn add_atom(s: String) -> u16 {
     static ATOMS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u16>>> = OnceLock::new();
-    let mut map = ATOMS.get_or_init(Default::default).lock().unwrap();
+    let mut map = crate::thread::defer_lock(ATOMS.get_or_init(Default::default));
     let key = s.to_ascii_lowercase();
     if let Some(&a) = map.get(&key) {
         return a;

@@ -558,12 +558,12 @@ pub fn insert(obj: Arc<dyn KObject>) -> HANDLE {
 
 /// Number of currently open kernel handles in the process handle table.
 pub fn live_count() -> u32 {
-    table().read().unwrap().map.len() as u32
+    crate::thread::defer_read(table()).map.len() as u32
 }
 
 pub fn insert_with_flags(obj: Arc<dyn KObject>, flags: u32) -> HANDLE {
     obj.on_handle_open();
-    let mut t = table().write().unwrap();
+    let mut t = crate::thread::defer_write(table());
     let h = t.next;
     t.next += 4;
     t.map.insert(h, obj);
@@ -577,7 +577,7 @@ pub fn get_flags(h: HANDLE) -> Option<u32> {
     if h == CURRENT_PROCESS || h == CURRENT_THREAD {
         return Some(0);
     }
-    let t = table().read().unwrap();
+    let t = crate::thread::defer_read(table());
     if !t.map.contains_key(&(h as usize)) {
         return None;
     }
@@ -588,7 +588,7 @@ pub fn set_flags(h: HANDLE, mask: u32, flags: u32) -> bool {
     if h == CURRENT_PROCESS || h == CURRENT_THREAD {
         return true;
     }
-    let mut t = table().write().unwrap();
+    let mut t = crate::thread::defer_write(table());
     if !t.map.contains_key(&(h as usize)) {
         return false;
     }
@@ -633,7 +633,7 @@ pub fn get(h: HANDLE) -> Option<Arc<dyn KObject>> {
     }) {
         return Some(o);
     }
-    let o = table().read().unwrap().map.get(&hv).cloned()?;
+    let o = crate::thread::defer_read(table()).map.get(&hv).cloned()?;
     // Only synchronization objects (trivial Drop: a cached reference may
     // outlive CloseHandle until the entry is next touched).
     if is_hcache_type(&*o) {
@@ -681,7 +681,7 @@ pub fn close(h: HANDLE) -> bool {
     }
     // Drop the object (arbitrary Drop code) after releasing the table write lock.
     let removed = {
-        let mut t = table().write().unwrap();
+        let mut t = crate::thread::defer_write(table());
         if t.flags.get(&(h as usize)).is_some_and(|&f| (f & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0) {
             return false;
         }
@@ -753,6 +753,7 @@ fn wait_single_lockfree(obj: &Arc<dyn KObject>, timeout: Option<Duration>) -> Op
 
     let deadline = timeout.map(|d| Instant::now() + d);
     let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, 1);
+    let _term_defer = crate::thread::TerminateDeferGuard::enter();
     let mut reg = Registration::new(std::slice::from_ref(obj), false, false, 0);
     loop {
         reg.arm();
@@ -765,10 +766,16 @@ fn wait_single_lockfree(obj: &Arc<dyn KObject>, timeout: Option<Duration>) -> Op
             }
             return Some(WaitResult::Object(0));
         }
+        if crate::thread::is_current_terminate_requested() {
+            return Some(WaitResult::Timeout);
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Some(WaitResult::Timeout);
         }
         reg.waiter.park.park(deadline);
+        if crate::thread::is_current_terminate_requested() {
+            return Some(WaitResult::Timeout);
+        }
     }
 }
 
@@ -890,6 +897,7 @@ pub fn wait_for_duration(
 
     let deadline = timeout.map(|d| Instant::now() + d);
     let _wait_scope = crate::hitch::Scope::enter(crate::hitch::ActKind::HandleWait, objs.len() as u64);
+    let _term_defer = crate::thread::TerminateDeferGuard::enter();
     let mut reg = Registration::new(objs, wait_all, alertable, tid);
     loop {
         // Arm BEFORE re-checking state so lock-free notifiers (Event::set,
@@ -898,6 +906,7 @@ pub fn wait_for_duration(
         if alertable && crate::thread::has_pending_apc() {
             drop(reg);
             drop(g);
+            drop(_term_defer);
             crate::thread::run_pending_apcs();
             return WaitResult::IoCompletion;
         }
@@ -910,12 +919,18 @@ pub fn wait_for_duration(
             }
             return res;
         }
+        if crate::thread::is_current_terminate_requested() {
+            return WaitResult::Timeout;
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return WaitResult::Timeout;
         }
         let park = Arc::clone(&reg.waiter);
         drop(g);
         park.park.park(deadline);
+        if crate::thread::is_current_terminate_requested() {
+            return WaitResult::Timeout;
+        }
         g = wait_lock();
     }
 }
@@ -943,18 +958,26 @@ pub fn alertable_sleep_duration(timeout: Option<Duration>) -> bool {
     }
     let tid = crate::teb::thread_id();
     let deadline = timeout.map(|d| Instant::now() + d);
+    let _term_defer = crate::thread::TerminateDeferGuard::enter();
     let reg = Registration::new(&[], false, true, tid);
     loop {
         reg.arm();
         if crate::thread::has_pending_apc() {
             drop(reg);
+            drop(_term_defer);
             crate::thread::run_pending_apcs();
             return true;
+        }
+        if crate::thread::is_current_terminate_requested() {
+            return false;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return false;
         }
         reg.waiter.park.park(deadline);
+        if crate::thread::is_current_terminate_requested() {
+            return false;
+        }
     }
 }
 
@@ -1313,14 +1336,14 @@ impl<T> HandleTable<T> {
     /// Insert `val` under a freshly allocated handle ID and return the ID.
     pub(crate) fn insert(&self, val: T) -> usize {
         let id = self.alloc_id();
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = crate::thread::defer_lock(&self.map);
         g.get_or_insert_with(HashMap::new).insert(id, val);
         id
     }
 
     /// Insert `val` at a caller-chosen key, returning any previously stored value.
     pub(crate) fn insert_at(&self, id: usize, val: T) -> Option<T> {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = crate::thread::defer_lock(&self.map);
         g.get_or_insert_with(HashMap::new).insert(id, val)
     }
 
@@ -1329,34 +1352,34 @@ impl<T> HandleTable<T> {
     where
         T: Clone,
     {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::thread::defer_lock(&self.map);
         g.as_ref()?.get(&id).cloned()
     }
 
     /// Borrow the value stored at `id` while holding the table lock.
     pub(crate) fn with<R>(&self, id: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::thread::defer_lock(&self.map);
         let val = g.as_ref()?.get(&id)?;
         Some(f(val))
     }
 
     /// Mutably borrow the value stored at `id` while holding the table lock.
     pub(crate) fn with_mut<R>(&self, id: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = crate::thread::defer_lock(&self.map);
         let val = g.as_mut()?.get_mut(&id)?;
         Some(f(val))
     }
 
     /// Remove and return the value stored at `id` (dropped outside the table lock).
     pub(crate) fn remove(&self, id: usize) -> Option<T> {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = crate::thread::defer_lock(&self.map);
         g.as_mut()?.remove(&id)
     }
 
     /// Remove all entries from the table, dropping them outside the table lock.
     pub(crate) fn clear(&self) {
         let old = {
-            let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = crate::thread::defer_lock(&self.map);
             g.take()
         };
         drop(old);
@@ -1364,7 +1387,7 @@ impl<T> HandleTable<T> {
 
     /// Retain only entries satisfying `predicate`.
     pub(crate) fn retain(&self, mut predicate: impl FnMut(&usize, &mut T) -> bool) {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = crate::thread::defer_lock(&self.map);
         if let Some(m) = g.as_mut() {
             m.retain(|k, v| predicate(k, v));
         }
@@ -1372,13 +1395,13 @@ impl<T> HandleTable<T> {
 
     /// True if `id` is currently present in the table.
     pub(crate) fn contains(&self, id: usize) -> bool {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::thread::defer_lock(&self.map);
         g.as_ref().is_some_and(|m| m.contains_key(&id))
     }
 
     /// Number of live entries currently in the table.
     pub(crate) fn len(&self) -> usize {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::thread::defer_lock(&self.map);
         g.as_ref().map_or(0, HashMap::len)
     }
 
@@ -1389,7 +1412,7 @@ impl<T> HandleTable<T> {
 
     /// Snapshot all currently live handle IDs.
     pub(crate) fn keys(&self) -> Vec<usize> {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::thread::defer_lock(&self.map);
         g.as_ref()
             .map(|m| m.keys().copied().collect())
             .unwrap_or_default()

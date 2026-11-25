@@ -127,6 +127,7 @@ pub unsafe extern "win64" fn OpenThread(_access: u32, _inherit: BOOL, tid: u32) 
 }
 
 pub unsafe extern "win64" fn GetExitCodeThread(h: HANDLE, code: *mut u32) -> BOOL {
+    let _defer = thread::TerminateDeferGuard::enter();
     if code.is_null() {
         set_err(err::ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -363,13 +364,13 @@ pub unsafe extern "win64" fn SetThreadDescription(h: HANDLE, name: LPCWSTR) -> H
                 libc::pthread_setname_np(c.as_ptr());
             }
         }
-        *t.name.lock().unwrap() = n;
+        *thread::defer_lock(&t.name) = n;
     }
     S_OK
 }
 
 pub unsafe extern "win64" fn GetThreadDescription(h: HANDLE, out: *mut *mut u16) -> HRESULT {
-    let n = thread_obj(h).map(|t| t.name.lock().unwrap().clone()).unwrap_or_default();
+    let n = thread_obj(h).map(|t| thread::defer_lock(&t.name).clone()).unwrap_or_default();
     let w = to_wide_z(&n);
     let p = crate::heap::alloc(w.len() * 2, false) as *mut u16;
     std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
@@ -848,7 +849,7 @@ fn named_create<T: KObject>(name: Option<String>, make: impl FnOnce() -> Arc<T>)
     let Some(n) = name else {
         return handles::insert(make());
     };
-    let mut names = handles::named_objects().lock().unwrap();
+    let mut names = thread::defer_lock(handles::named_objects());
     if let Some(existing) = names.get(&n) {
         if existing.as_any().is::<T>() {
             let h = handles::insert(existing.clone());
@@ -872,7 +873,7 @@ fn named_open<T: KObject>(name: Option<String>) -> HANDLE {
         set_err(err::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     };
-    let names = handles::named_objects().lock().unwrap();
+    let names = thread::defer_lock(handles::named_objects());
     match names.get(&n) {
         Some(o) if o.as_any().is::<T>() => handles::insert(o.clone()),
         _ => {
@@ -1189,7 +1190,7 @@ pub unsafe extern "win64" fn SetWaitableTimer(
     }
     let period_dur = (period > 0).then(|| std::time::Duration::from_millis(period as u64));
     let s = waitable_timer_sched();
-    let mut heap = s.heap.lock().unwrap();
+    let mut heap = thread::defer_lock(&s.heap);
     heap.retain(|e| e.timer_ptr != timer_ptr);
     heap.push(ScheduledWaitableTimer {
         due: std::time::Instant::now() + delay,
@@ -1224,7 +1225,7 @@ pub unsafe extern "win64" fn CancelWaitableTimer(h: HANDLE) -> BOOL {
     timer.cancel();
     let timer_ptr = Arc::as_ptr(&timer) as usize;
     let s = waitable_timer_sched();
-    s.heap.lock().unwrap().retain(|e| e.timer_ptr != timer_ptr);
+    thread::defer_lock(&s.heap).retain(|e| e.timer_ptr != timer_ptr);
     TRUE
 }
 
@@ -2024,6 +2025,160 @@ mod tests {
             assert_eq!(WaitForSingleObject(h_start, 5_000), WAIT_OBJECT_0);
             assert_eq!(observed.load(Ordering::Acquire), query_own_start as *const () as usize);
             assert_eq!(CloseHandle(h_start), TRUE);
+        }
+    }
+
+    #[test]
+    fn terminate_thread_defers_across_runtime_locks_and_waits() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        unsafe {
+            // 1. Deterministic deferral: hold TerminateDeferGuard + an internal lock while
+            //    TerminateThread delivers SIGUSR1. Wait inside the critical section until
+            //    `is_current_terminate_requested()` flips true (proving SIGUSR1 fired and was
+            //    deferred), acquire & release `WAIT_LOCK`, mark completion, then drop `_defer`.
+            //    The thread must exit on guard drop without deadlocking or running past it.
+            let in_cs = Arc::new(AtomicBool::new(false));
+            let released_before_exit = Arc::new(AtomicBool::new(false));
+            let ran_past_defer = Arc::new(AtomicBool::new(false));
+            let in_cs_w = Arc::clone(&in_cs);
+            let rel_w = Arc::clone(&released_before_exit);
+            let past_w = Arc::clone(&ran_past_defer);
+            let obj_cs = thread::spawn(
+                Box::new(move || {
+                    {
+                        let _defer = thread::TerminateDeferGuard::enter();
+                        in_cs_w.store(true, Ordering::Release);
+                        let dl = std::time::Instant::now() + Duration::from_secs(2);
+                        while !thread::is_current_terminate_requested()
+                            && std::time::Instant::now() < dl
+                        {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        // Exercise WAIT_LOCK while deferred, then release it cleanly before
+                        // dropping `_defer`.
+                        let _wg = handles::wait_lock();
+                        std::thread::sleep(Duration::from_millis(5));
+                        rel_w.store(true, Ordering::Release);
+                        // `_wg` drops first (unlocking WAIT_LOCK), then `_defer` drops and exits.
+                    }
+                    past_w.store(true, Ordering::Release);
+                    0x9999_9999u32
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn critical-section thread");
+            let h_cs = handles::insert(obj_cs);
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !in_cs.load(Ordering::Acquire) {
+                assert!(std::time::Instant::now() < wait_deadline, "worker did not enter critical section");
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            assert_eq!(TerminateThread(h_cs, 0x1122_3344), TRUE);
+            assert!(
+                released_before_exit.load(Ordering::Acquire),
+                "SIGUSR1 must defer pthread_exit until critical section releases internal locks"
+            );
+            assert!(
+                !ran_past_defer.load(Ordering::Acquire),
+                "thread must exit immediately when outermost TerminateDeferGuard drops"
+            );
+            assert_eq!(WaitForSingleObject(h_cs, 5_000), WAIT_OBJECT_0);
+            let mut code_cs = 0u32;
+            assert_eq!(GetExitCodeThread(h_cs, &mut code_cs), TRUE);
+            assert_eq!(code_cs, 0x1122_3344);
+            assert_eq!(CloseHandle(h_cs), TRUE);
+
+            // 2. Tight-loop GetExitCodeThread + handle lookup stress: terminating a worker that
+            //    hammered WAIT_LOCK & handle table must never deadlock TerminateThread.
+            for i in 0u32..20 {
+                let started = Arc::new(AtomicBool::new(false));
+                let started_w = Arc::clone(&started);
+                let obj = thread::spawn(
+                    Box::new(move || {
+                        started_w.store(true, Ordering::Release);
+                        let mut c = 0u32;
+                        loop {
+                            let _ = GetExitCodeThread(handles::CURRENT_THREAD, &mut c);
+                        }
+                    }),
+                    64 * 1024,
+                    false,
+                    false,
+                )
+                .expect("spawn GetExitCodeThread stress worker");
+                let h = handles::insert(obj);
+                let dl = std::time::Instant::now() + Duration::from_secs(2);
+                while !started.load(Ordering::Acquire) {
+                    assert!(std::time::Instant::now() < dl, "stress worker {i} did not start");
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_micros(200));
+                let want = 0xCAFE_0000 + i;
+                assert_eq!(TerminateThread(h, want), TRUE, "stress iteration {i}");
+                assert_eq!(WaitForSingleObject(h, 5_000), WAIT_OBJECT_0);
+                let mut got = 0u32;
+                assert_eq!(GetExitCodeThread(h, &mut got), TRUE);
+                assert_eq!(got, want);
+                assert_eq!(CloseHandle(h), TRUE);
+            }
+
+            // 3. Terminating a thread blocked indefinitely in WaitForSingleObject(INFINITE)
+            //    unregisters its Waiter cleanly so subsequent auto-reset event wakes are not stolen.
+            let ev = CreateEventW(std::ptr::null_mut(), FALSE, FALSE, std::ptr::null());
+            let ready = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            assert!(!ev.is_null() && !ready.is_null());
+            let ev_u = ev as usize;
+            let ready_u = ready as usize;
+            let obj_wait = thread::spawn(
+                Box::new(move || {
+                    SetEvent(ready_u as HANDLE);
+                    WaitForSingleObject(ev_u as HANDLE, INFINITE);
+                    0
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn waiting worker");
+            let h_wait = handles::insert(obj_wait);
+            assert_eq!(WaitForSingleObject(ready, 5_000), WAIT_OBJECT_0);
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(TerminateThread(h_wait, 0x5566_7788), TRUE);
+            assert_eq!(WaitForSingleObject(h_wait, 5_000), WAIT_OBJECT_0);
+            let mut wait_code = 0u32;
+            assert_eq!(GetExitCodeThread(h_wait, &mut wait_code), TRUE);
+            assert_eq!(wait_code, 0x5566_7788);
+            assert_eq!(CloseHandle(h_wait), TRUE);
+
+            // Second waiter on the same auto-reset event must receive a single SetEvent wake.
+            let ready2 = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+            let ready2_u = ready2 as usize;
+            let obj_wait2 = thread::spawn(
+                Box::new(move || {
+                    SetEvent(ready2_u as HANDLE);
+                    WaitForSingleObject(ev_u as HANDLE, 5_000)
+                }),
+                64 * 1024,
+                false,
+                false,
+            )
+            .expect("spawn second waiter");
+            let h_wait2 = handles::insert(obj_wait2);
+            assert_eq!(WaitForSingleObject(ready2, 5_000), WAIT_OBJECT_0);
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(SetEvent(ev), TRUE);
+            assert_eq!(WaitForSingleObject(h_wait2, 5_000), WAIT_OBJECT_0);
+            let mut w2_code = u32::MAX;
+            assert_eq!(GetExitCodeThread(h_wait2, &mut w2_code), TRUE);
+            assert_eq!(w2_code, WAIT_OBJECT_0);
+            assert_eq!(CloseHandle(h_wait2), TRUE);
+            assert_eq!(CloseHandle(ready2), TRUE);
+            assert_eq!(CloseHandle(ready), TRUE);
+            assert_eq!(CloseHandle(ev), TRUE);
         }
     }
 }

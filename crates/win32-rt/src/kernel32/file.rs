@@ -6903,7 +6903,7 @@ pub fn mapping_size(h: HANDLE) -> Option<u64> {
 
 pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<String>) -> HANDLE {
     if let Some(n) = &name {
-        if let Some(o) = handles::named_objects().lock().unwrap().get(n).cloned() {
+        if let Some(o) = crate::thread::defer_lock(handles::named_objects()).get(n).cloned() {
             if o.as_any().is::<MappingObj>() {
                 set_err(err::ERROR_ALREADY_EXISTS);
                 return handles::insert(o);
@@ -6956,7 +6956,7 @@ pub unsafe fn create_mapping(h: HANDLE, protect: u32, size: u64, name: Option<St
     }
     let obj: Arc<dyn KObject> = Arc::new(MappingObj { file, size, writable, exec, name: name.clone(), win_path });
     if let Some(n) = name {
-        handles::named_objects().lock().unwrap().insert(n, obj.clone());
+        crate::thread::defer_lock(handles::named_objects()).insert(n, obj.clone());
     }
     set_err(0);
     handles::insert(obj)
@@ -6992,7 +6992,7 @@ pub unsafe extern "win64" fn CreateFileMappingFromApp(
 }
 pub unsafe extern "win64" fn OpenFileMappingW(_access: u32, _inherit: BOOL, name: LPCWSTR) -> HANDLE {
     let n = from_wide(name);
-    match handles::named_objects().lock().unwrap().get(&n).cloned() {
+    match crate::thread::defer_lock(handles::named_objects()).get(&n).cloned() {
         Some(o) if o.as_any().is::<MappingObj>() => handles::insert(o),
         _ => {
             set_err(err::ERROR_FILE_NOT_FOUND);

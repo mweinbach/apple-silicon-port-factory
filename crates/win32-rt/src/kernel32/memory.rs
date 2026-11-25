@@ -189,6 +189,11 @@ static VM: Mutex<VmState> = Mutex::new(VmState {
     write_watch_dirty: BTreeSet::new(),
     reset_discardable: BTreeSet::new(),
 });
+
+#[inline]
+fn vm_lock() -> crate::thread::DeferLockGuard<std::sync::MutexGuard<'static, VmState>> {
+    crate::thread::defer_lock(&VM)
+}
 /// Set once any committed page in `VM` is marked `PAGE_NOACCESS` or `PAGE_GUARD`
 /// (e.g. packed executables using demand-decryption). Lets speculative JIT code
 /// readers avoid taking `VM.lock()` on normal games and multi-threaded `.aot` prewarm.
@@ -488,7 +493,7 @@ pub fn needs_io_write_staging(addr: usize, len: usize) -> bool {
     let start_hp = addr & !(HOST_PAGE - 1);
     let end = addr.saturating_add(len);
     let end_hp = end.saturating_add(HOST_PAGE - 1) & !(HOST_PAGE - 1);
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let mut hp = start_hp;
     while hp < end_hp {
         let is_dirty = vm.write_watch_dirty.contains(&hp);
@@ -689,7 +694,7 @@ pub fn needs_io_read_staging(addr: usize, len: usize) -> bool {
     let start_hp = addr & !(HOST_PAGE - 1);
     let end = addr.saturating_add(len);
     let end_hp = end.saturating_add(HOST_PAGE - 1) & !(HOST_PAGE - 1);
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let mut hp = start_hp;
     while hp < end_hp {
         if vm.has_protected_subpage(hp, None) {
@@ -738,7 +743,7 @@ pub unsafe fn read_guest_io_bytes(src: *const u8, dst: &mut [u8]) -> Result<(), 
     let Some(src_end) = src_addr.checked_add(dst.len()) else {
         return Err(libc::EFAULT);
     };
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let mut p = src_addr & !(PAGE - 1);
     let p_end = src_end.saturating_add(PAGE - 1) & !(PAGE - 1);
     while p < p_end {
@@ -800,7 +805,7 @@ pub unsafe fn write_guest_io_bytes(dst: *mut u8, src: &[u8]) -> Result<(), i32> 
     let Some(dst_end) = dst_addr.checked_add(src.len()) else {
         return Err(libc::EFAULT);
     };
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     // 1. Validate every touched VM-tracked 4 KiB subpage up front before mutating anything.
     let mut p = dst_addr & !(PAGE - 1);
     let p_end = dst_end.saturating_add(PAGE - 1) & !(PAGE - 1);
@@ -872,7 +877,7 @@ pub fn mark_write_watch_dirty(addr: usize) {
     }
     let page = addr & !(PAGE - 1);
     let hpage = addr & !(HOST_PAGE - 1);
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     if vm.alloc_containing(page).is_some_and(|(_, a)| a.write_watch) {
         vm.write_watch_dirty.insert(hpage);
     }
@@ -895,7 +900,7 @@ pub unsafe fn try_handle_write_watch_fault(fault_addr: usize, is_write: bool) ->
     }
     let page = fault_addr & !(PAGE - 1);
     let hpage = fault_addr & !(HOST_PAGE - 1);
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     let Some((_, alloc)) = vm.alloc_containing(page) else {
         return false;
     };
@@ -942,7 +947,7 @@ pub struct GuardConsumeResult {
 pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult> {
     let page = fault_addr & !(PAGE - 1);
     let hpage = fault_addr & !(HOST_PAGE - 1);
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     let (&_s, &seg) = vm.segs.range(..=page).next_back()?;
     if page >= seg.end || seg.state != MEM_COMMIT || (seg.prot & PAGE_GUARD) == 0 {
         return None;
@@ -966,7 +971,7 @@ pub unsafe fn consume_guard_page(fault_addr: usize) -> Option<GuardConsumeResult
 /// Register a PE image (or other host-managed range) so VirtualQuery
 /// reports it as MEM_IMAGE with the given per-range protections.
 pub fn register_image(base: usize, size: usize, ranges: &[(usize, usize, u32)]) {
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     vm.allocs.insert(base, Alloc { size, prot: PAGE_EXECUTE_WRITECOPY, kind: MEM_IMAGE, write_watch: false });
     vm.set_range(base, base + size, MEM_COMMIT, PAGE_READONLY);
     for &(s, e, p) in ranges {
@@ -978,7 +983,7 @@ pub fn register_image(base: usize, size: usize, ranges: &[(usize, usize, u32)]) 
 /// (registered PE image, `VirtualAlloc`, or `MapViewOfFile` — never host Mach-O code).
 pub fn is_guest_vm_addr(addr: usize) -> bool {
     let page = addr & !(PAGE - 1);
-    VM.lock().unwrap().alloc_containing(page).is_some()
+    vm_lock().alloc_containing(page).is_some()
 }
 
 /// Returns `true` strictly if `addr` lies inside a committed, executable guest-owned
@@ -990,7 +995,7 @@ pub fn is_guest_exec_vm_addr(addr: usize) -> bool {
         return false;
     }
     let page = addr & !(PAGE - 1);
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let Some((_, alloc)) = vm.alloc_containing(page) else {
         return false;
     };
@@ -1020,7 +1025,7 @@ pub fn is_speculative_read_safe(addr: usize, len: usize) -> bool {
     };
     let hstart = addr & !(HOST_PAGE - 1);
     let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let mut sub = hstart;
     while sub < hend {
         if let Some((&_s, seg)) = vm.segs.range(..=sub).next_back() {
@@ -1039,14 +1044,14 @@ pub fn is_speculative_read_safe(addr: usize, len: usize) -> bool {
 }
 
 pub fn update_protection(start: usize, end: usize, prot: u32) {
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     vm.set_range(start, end, MEM_COMMIT, prot);
 }
 
 /// Record a mapped view at `[base, base + size)` in VM tracking (used by MapViewOfFile / MapViewOfFile3).
 pub fn register_mapped_view(base: usize, size: usize, prot: u32) {
     {
-        let mut vm = VM.lock().unwrap();
+        let mut vm = vm_lock();
         vm.allocs.insert(base, Alloc { size, prot, kind: MEM_MAPPED, write_watch: false });
         vm.set_range(base, base + size, MEM_COMMIT, prot);
     }
@@ -1056,14 +1061,14 @@ pub fn register_mapped_view(base: usize, size: usize, prot: u32) {
 }
 
 pub fn unregister_mapped_view(base: usize, size: usize) {
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     vm.allocs.remove(&base);
     vm.remove_range(base, base + size);
 }
 
 /// Total bytes currently `MEM_COMMIT` inside guest `MEM_PRIVATE` `VirtualAlloc` regions.
 pub fn committed_private_bytes() -> u64 {
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     let mut total = 0u64;
     for (&start, seg) in &vm.segs {
         if seg.state == MEM_COMMIT {
@@ -1164,7 +1169,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         }
         let start = addr & !(PAGE - 1);
         let end = (addr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
-        let mut vm = VM.lock().unwrap();
+        let mut vm = vm_lock();
         let Some((b, a)) = vm.alloc_containing(start) else {
             return Err(err::ERROR_INVALID_ADDRESS);
         };
@@ -1193,7 +1198,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
         }
         let start = addr & !(PAGE - 1);
         let end = (addr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
-        let mut vm = VM.lock().unwrap();
+        let mut vm = vm_lock();
         let Some((b, a)) = vm.alloc_containing(start) else {
             return Err(err::ERROR_INVALID_ADDRESS);
         };
@@ -1227,7 +1232,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
     if write_watch {
         HAS_WRITE_WATCH_PAGES.store(true, std::sync::atomic::Ordering::Release);
     }
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     if ty & MEM_RESERVE != 0 && ty & MEM_REPLACE_PLACEHOLDER != 0 {
         // Replace an existing placeholder at `addr` of `size`.
         if addr == 0 {
@@ -1289,7 +1294,7 @@ unsafe fn virtual_alloc_aligned_impl(addr: usize, size: usize, ty: u32, prot: u3
 }
 
 pub unsafe fn virtual_free(addr: usize, size: usize, ty: u32) -> Result<(), u32> {
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     if ty & MEM_RELEASE != 0 && ty & MEM_PRESERVE_PLACEHOLDER != 0 {
         // Split placeholder at [addr, addr + size).
         if size == 0 {
@@ -1521,7 +1526,7 @@ pub unsafe extern "win64" fn GetWriteWatch(
     let start_page = start & !(PAGE - 1);
     let end_page = (end + PAGE - 1) & !(PAGE - 1);
     let dirty: Vec<usize> = {
-        let mut vm = VM.lock().unwrap();
+        let mut vm = vm_lock();
         let Some((alloc_base, alloc)) = vm.alloc_containing(start_page) else {
             crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
             return u32::MAX;
@@ -1574,7 +1579,7 @@ pub unsafe extern "win64" fn ResetWriteWatch(base: *mut c_void, region_size: usi
     let end_page = (end + PAGE - 1) & !(PAGE - 1);
     let hstart = start & !(HOST_PAGE - 1);
     let hend = (end + HOST_PAGE - 1) & !(HOST_PAGE - 1);
-    let mut vm = VM.lock().unwrap();
+    let mut vm = vm_lock();
     let Some((alloc_base, alloc)) = vm.alloc_containing(start_page) else {
         crate::teb::set_last_error(err::ERROR_INVALID_PARAMETER);
         return u32::MAX;
@@ -1672,7 +1677,7 @@ pub unsafe extern "win64" fn VirtualProtect(addr: *mut c_void, size: usize, prot
     }
     let mut deferred_noaccess_sibling = false;
     let mprotect_rc = {
-        let mut vm = VM.lock().unwrap();
+        let mut vm = vm_lock();
         let tracked = vm.alloc_containing(start);
         let write_watch = tracked.is_some_and(|(_, a)| a.write_watch);
         if let Some((base, alloc)) = tracked {
@@ -1746,7 +1751,7 @@ pub unsafe fn ensure_host_page_readable(addr: usize) {
 /// `VirtualAlloc` / `VirtualFree` / `consume_guard_page` calls cannot race with
 /// temporary host-page freezing during cross-page atomic emulation.
 pub unsafe fn with_vm_lock<R>(f: impl FnOnce() -> R) -> R {
-    let _vm = VM.lock().unwrap_or_else(|e| e.into_inner());
+    let _vm = vm_lock();
     f()
 }
 
@@ -1771,7 +1776,7 @@ pub struct MemoryBasicInformation {
 
 pub fn query(addr: usize) -> Option<MemoryBasicInformation> {
     let page = addr & !(PAGE - 1);
-    let vm = VM.lock().unwrap();
+    let vm = vm_lock();
     if let Some((b, a)) = vm.alloc_containing(page) {
         let (&s, seg) = vm.segs.range(..=page).next_back()?;
         let _ = s;
@@ -2042,7 +2047,7 @@ pub unsafe extern "win64" fn FlushProcessWriteBuffers() {
     #[cfg(target_vendor = "apple")]
     {
         static FLUSH_LOCK: Mutex<()> = Mutex::new(());
-        let _g = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::thread::defer_lock(&FLUSH_LOCK);
         extern "C" {
             static mach_task_self_: libc::mach_port_t;
             fn mach_thread_self() -> libc::mach_port_t;

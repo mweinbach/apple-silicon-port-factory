@@ -631,7 +631,7 @@ pub unsafe extern "win64" fn NtQueryInformationThread(h: HANDLE, class: u32, out
                 put_ret(0);
                 return STATUS_NOT_SUPPORTED;
             };
-            let name = t.name.lock().unwrap().clone();
+            let name = crate::thread::defer_lock(&t.name).clone();
             let wide: Vec<u16> = name.encode_utf16().collect();
             let byte_len = wide.len() * 2;
             let needed = (16 + byte_len + 2) as u32;
