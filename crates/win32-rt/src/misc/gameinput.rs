@@ -3176,4 +3176,100 @@ mod tests {
 
         reset_test_state();
     }
+
+    #[test]
+    fn temporal_reading_records_merged_slot0_disconnect_transitions() {
+        let _g = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_test_state();
+
+        unsafe {
+            let mut gi_raw = 0usize;
+            assert_eq!(GameInputCreate(&mut gi_raw), S_OK);
+            let gi = gi_raw as *mut GameInputObj;
+            let dev0 = device_ptr(DeviceKind::Gamepad(0));
+            let mut out: *mut ReadingObj = std::ptr::null_mut();
+            let mut gs = GameInputGamepadState::default();
+
+            // 1. Physical slot 0 holds A while virtual touch pad is connected and idle.
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad::default());
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            let t_phys_a = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_phys_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            // Disconnecting the physical controller while the virtual pad remains connected & idle
+            // must immediately record the merged release transition at event time.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_disconnect(0);
+            let t_after_phys_disc = gi_get_current_timestamp(gi);
+            assert!(t_after_phys_disc > t_phys_a);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_phys_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "disconnecting physical pad must record release of A");
+            assert_eq!(rd_release(out), 0);
+            // Historical timestamp still sees A held.
+            assert_eq!(gi_get_temporal_reading(gi, t_phys_a, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A);
+            assert_eq!(rd_release(out), 0);
+
+            // 2. Physical slot 0 holds A while virtual pad holds B; disconnecting virtual pad
+            // must immediately transition merged state from A|B to A.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_connect(
+                0,
+                xinput1_4::DeviceInfo { name: "PhysPad".into(), wireless: false, rumble: false, battery: None },
+            );
+            xinput1_4::backend_update(0, xinput1_4::Gamepad { buttons: xinput1_4::btn::A, ..Default::default() });
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let t_merged_ab = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_merged_ab, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A | GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::set_virtual_gamepad(false, xinput1_4::Gamepad::default());
+            let t_after_virt_disc = gi_get_current_timestamp(gi);
+            assert!(t_after_virt_disc > t_merged_ab);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_virt_disc, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A, "disconnecting virtual pad must record release of B");
+            assert_eq!(rd_release(out), 0);
+
+            // Historical timestamp still sees A|B held.
+            assert_eq!(gi_get_temporal_reading(gi, t_merged_ab, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_A | GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            // 3. Physical idle + virtual holding B -> disconnecting virtual pad transitions to idle.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::backend_update(0, xinput1_4::Gamepad::default());
+            xinput1_4::set_virtual_gamepad(true, xinput1_4::Gamepad { buttons: xinput1_4::btn::B, ..Default::default() });
+            let t_virt_b = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_virt_b, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, GAME_INPUT_GAMEPAD_B);
+            assert_eq!(rd_release(out), 0);
+
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            xinput1_4::set_virtual_gamepad(false, xinput1_4::Gamepad::default());
+            let t_after_virt_idle = gi_get_current_timestamp(gi);
+            assert_eq!(gi_get_temporal_reading(gi, t_after_virt_idle, dev0, &mut out), S_OK);
+            assert_eq!(rd_get_gamepad_state(out, &mut gs), 1);
+            assert_eq!(gs.buttons, 0, "disconnecting virtual pad over idle physical pad must record idle");
+            assert_eq!(rd_release(out), 0);
+
+            assert_eq!(gi_release(gi), 0);
+        }
+
+        reset_test_state();
+    }
 }

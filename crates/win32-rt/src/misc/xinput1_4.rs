@@ -383,14 +383,43 @@ fn with_slot<R>(user: usize, f: impl FnOnce(&mut Slot) -> R) -> R {
     f(s[user].get_or_insert_with(Slot::default))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot0Transition {
+    None,
+    Connected(Option<Gamepad>),
+    Disconnected,
+    StateChanged(Gamepad),
+}
+
+fn emit_slot0_transition(transition: Slot0Transition) {
+    match transition {
+        Slot0Transition::None => {}
+        Slot0Transition::Connected(initial_pad) => {
+            crate::misc::gameinput::on_gamepad_connected(0);
+            if let Some(pad) = initial_pad {
+                crate::misc::gameinput::on_gamepad_state_changed(0, &pad);
+            }
+        }
+        Slot0Transition::Disconnected => {
+            crate::misc::gameinput::on_gamepad_disconnected(0);
+        }
+        Slot0Transition::StateChanged(pad) => {
+            crate::misc::gameinput::on_gamepad_state_changed(0, &pad);
+        }
+    }
+}
+
 /// Recompute the merged slot-0 controller state from physical `slots[0]` and `virt`,
-/// generating keystroke transitions and repeat tracking exclusively from the merged state.
+/// generating keystroke transitions and repeat tracking exclusively from the merged state,
+/// and return the resulting GameInput transition to emit after releasing locks.
 /// Caller MUST hold `SLOTS` first, then `VIRTUAL_PAD` (global lock ordering).
 fn sync_slot0_keystrokes(
     slots: &[Option<Slot>; XUSER_MAX_COUNT],
     virt: &mut VirtualPadState,
     now: Instant,
-) {
+) -> Slot0Transition {
+    let prev_connected = virt.merged_connected;
+    let prev_pad = virt.merged_pad;
     let phys = slots[0].as_ref().filter(|s| s.connected).map(|s| s.pad);
     let merged = match (phys, virt.connected) {
         (Some(p), true) => Some(if virt.pad != Gamepad::default() { merge_gamepad(p, virt.pad) } else { p }),
@@ -400,13 +429,20 @@ fn sync_slot0_keystrokes(
     };
     match merged {
         Some(next_pad) => {
-            let prev = if virt.merged_connected { virt.merged_pad } else { Gamepad::default() };
-            let changed = !virt.merged_connected || prev != next_pad;
+            let prev = if prev_connected { prev_pad } else { Gamepad::default() };
+            let changed = !prev_connected || prev != next_pad;
             virt.merged_connected = true;
             virt.merged_pad = next_pad;
             if changed {
                 let VirtualPadState { keystrokes, held_vks, .. } = virt;
                 diff_gamepad_keystrokes(0, prev, next_pad, now, keystrokes, held_vks);
+            }
+            if !prev_connected {
+                Slot0Transition::Connected((next_pad != Gamepad::default()).then_some(next_pad))
+            } else if prev_pad != next_pad {
+                Slot0Transition::StateChanged(next_pad)
+            } else {
+                Slot0Transition::None
             }
         }
         None => {
@@ -414,6 +450,11 @@ fn sync_slot0_keystrokes(
             virt.merged_pad = Gamepad::default();
             virt.keystrokes.clear();
             virt.held_vks.clear();
+            if prev_connected {
+                Slot0Transition::Disconnected
+            } else {
+                Slot0Transition::None
+            }
         }
     }
 }
@@ -425,7 +466,7 @@ fn sync_slot0_keystrokes(
 pub fn backend_connect(user: usize, info: DeviceInfo) {
     log::info!("xinput: user {user} connected: {} (wireless={}, rumble={})", info.name, info.wireless, info.rumble);
     let phys_rumble = info.rumble;
-    let stop_phone = if user == 0 {
+    let (stop_phone, transition) = if user == 0 {
         let now = Instant::now();
         let mut slots = SLOTS.lock().unwrap();
         let slot = slots[0].get_or_insert_with(Slot::default);
@@ -438,24 +479,41 @@ pub fn backend_connect(user: usize, info: DeviceInfo) {
         } else {
             false
         };
-        sync_slot0_keystrokes(&slots, &mut v, now);
-        had
+        let transition = sync_slot0_keystrokes(&slots, &mut v, now);
+        (had, transition)
     } else {
-        with_slot(user, |s| {
+        let transition = with_slot(user, |s| {
+            let was_connected = s.connected;
+            let prev_pad = s.pad;
             *s = Slot { connected: true, info, packet: s.packet.wrapping_add(1), ..Default::default() };
+            if !was_connected {
+                Slot0Transition::Connected(None)
+            } else if prev_pad != Gamepad::default() {
+                Slot0Transition::StateChanged(Gamepad::default())
+            } else {
+                Slot0Transition::None
+            }
         });
-        false
+        (false, transition)
     };
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
-    crate::misc::gameinput::on_gamepad_connected(user);
+    if user == 0 {
+        emit_slot0_transition(transition);
+    } else {
+        match transition {
+            Slot0Transition::Connected(_) => crate::misc::gameinput::on_gamepad_connected(user),
+            Slot0Transition::StateChanged(pad) => crate::misc::gameinput::on_gamepad_state_changed(user, &pad),
+            Slot0Transition::Disconnected | Slot0Transition::None => {}
+        }
+    }
     crate::user32::misc::notify_device_change(true);
 }
 
 pub fn backend_disconnect(user: usize) {
     log::info!("xinput: user {user} disconnected");
-    let (was_connected, still_connected) = if user == 0 {
+    let (was_connected, transition) = if user == 0 {
         let now = Instant::now();
         let mut slots = SLOTS.lock().unwrap();
         let slot = slots[0].get_or_insert_with(Slot::default);
@@ -466,8 +524,8 @@ pub fn backend_disconnect(user: usize) {
         slot.keystrokes.clear();
         slot.held_vks.clear();
         let mut v = VIRTUAL_PAD.lock().unwrap();
-        sync_slot0_keystrokes(&slots, &mut v, now);
-        (was, v.merged_connected)
+        let transition = sync_slot0_keystrokes(&slots, &mut v, now);
+        (was, transition)
     } else {
         with_slot(user, |s| {
             let was = s.connected;
@@ -476,10 +534,12 @@ pub fn backend_disconnect(user: usize) {
             s.vibration = (0, 0);
             s.keystrokes.clear();
             s.held_vks.clear();
-            (was, false)
+            (was, Slot0Transition::Disconnected)
         })
     };
-    if !still_connected {
+    if user == 0 {
+        emit_slot0_transition(transition);
+    } else {
         crate::misc::gameinput::on_gamepad_disconnected(user);
     }
     if was_connected {
@@ -490,20 +550,22 @@ pub fn backend_disconnect(user: usize) {
 /// New input state. `dwPacketNumber` only changes when the state did.
 pub fn backend_update(user: usize, pad: Gamepad) {
     let now = Instant::now();
-    let updated_pad = if user == 0 {
-        let mut slots = SLOTS.lock().unwrap();
-        let slot = slots[0].get_or_insert_with(Slot::default);
-        if slot.connected && slot.pad != pad {
-            slot.pad = pad;
-            slot.packet = slot.packet.wrapping_add(1);
-            let mut v = VIRTUAL_PAD.lock().unwrap();
-            sync_slot0_keystrokes(&slots, &mut v, now);
-            Some(v.merged_pad)
-        } else {
-            None
-        }
+    if user == 0 {
+        let transition = {
+            let mut slots = SLOTS.lock().unwrap();
+            let slot = slots[0].get_or_insert_with(Slot::default);
+            if slot.connected && slot.pad != pad {
+                slot.pad = pad;
+                slot.packet = slot.packet.wrapping_add(1);
+                let mut v = VIRTUAL_PAD.lock().unwrap();
+                sync_slot0_keystrokes(&slots, &mut v, now)
+            } else {
+                Slot0Transition::None
+            }
+        };
+        emit_slot0_transition(transition);
     } else {
-        with_slot(user, |s| {
+        let updated_pad = with_slot(user, |s| {
             if s.connected && s.pad != pad {
                 let prev = s.pad;
                 s.pad = pad;
@@ -513,10 +575,10 @@ pub fn backend_update(user: usize, pad: Gamepad) {
             } else {
                 None
             }
-        })
-    };
-    if let Some(effective) = updated_pad {
-        crate::misc::gameinput::on_gamepad_state_changed(user, &effective);
+        });
+        if let Some(effective) = updated_pad {
+            crate::misc::gameinput::on_gamepad_state_changed(user, &effective);
+        }
     }
 }
 
@@ -549,7 +611,7 @@ pub fn slot_state(user: usize) -> Option<(Gamepad, u32)> {
 /// Exposed on XInput user slot 0 when no physical controller occupies slot 0,
 /// and seamlessly merged onto slot 0 whenever virtual touch controls are active.
 pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
-    let (conn_changed, stop_phone, merged_connected, updated_pad) = {
+    let (conn_changed, stop_phone, transition) = {
         let now = Instant::now();
         let slots = SLOTS.lock().unwrap();
         let mut v = VIRTUAL_PAD.lock().unwrap();
@@ -562,38 +624,26 @@ pub fn set_virtual_gamepad(connected: bool, pad: Gamepad) {
         }
         v.connected = connected;
         v.pad = if connected { pad } else { Gamepad::default() };
-        if changed {
+        let transition = if changed {
             v.packet = v.packet.wrapping_add(1);
-            sync_slot0_keystrokes(&slots, &mut v, now);
-        }
+            sync_slot0_keystrokes(&slots, &mut v, now)
+        } else {
+            Slot0Transition::None
+        };
         let stop_phone = if !connected && v.vibration != (0, 0) {
             v.vibration = (0, 0);
             true
         } else {
             false
         };
-        let updated = if changed && v.merged_connected && !conn_changed {
-            Some(v.merged_pad)
-        } else if changed && connected && pad != Gamepad::default() {
-            Some(v.merged_pad)
-        } else {
-            None
-        };
-        (conn_changed, stop_phone, v.merged_connected, updated)
+        (conn_changed, stop_phone, transition)
     };
     if stop_phone {
         crate::macos::uikit::dispatch_host_rumble(0, 0);
     }
+    emit_slot0_transition(transition);
     if conn_changed {
-        if merged_connected {
-            crate::misc::gameinput::on_gamepad_connected(0);
-        } else {
-            crate::misc::gameinput::on_gamepad_disconnected(0);
-        }
         crate::user32::misc::notify_device_change(connected);
-    }
-    if let Some(effective) = updated_pad {
-        crate::misc::gameinput::on_gamepad_state_changed(0, &effective);
     }
 }
 
