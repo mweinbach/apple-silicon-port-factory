@@ -267,6 +267,62 @@ impl Digest {
     }
 }
 
+/// Constant-space incremental CommonCrypto digest context (512 bytes) for streaming callers.
+#[derive(Clone)]
+pub(crate) struct IncrementalDigest {
+    digest: Digest,
+    ctx: [u64; 64],
+}
+
+impl IncrementalDigest {
+    fn ops(
+        d: Digest,
+    ) -> (
+        unsafe extern "C" fn(*mut c_void) -> i32,
+        unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32,
+        unsafe extern "C" fn(*mut u8, *mut c_void) -> i32,
+    ) {
+        match d {
+            Digest::Md2 => (CC_MD2_Init, CC_MD2_Update, CC_MD2_Final),
+            Digest::Md4 => (CC_MD4_Init, CC_MD4_Update, CC_MD4_Final),
+            Digest::Md5 => (CC_MD5_Init, CC_MD5_Update, CC_MD5_Final),
+            Digest::Sha1 => (CC_SHA1_Init, CC_SHA1_Update, CC_SHA1_Final),
+            Digest::Sha256 => (CC_SHA256_Init, CC_SHA256_Update, CC_SHA256_Final),
+            Digest::Sha384 => (CC_SHA384_Init, CC_SHA384_Update, CC_SHA384_Final),
+            Digest::Sha512 => (CC_SHA512_Init, CC_SHA512_Update, CC_SHA512_Final),
+        }
+    }
+
+    pub(crate) fn new(digest: Digest) -> Self {
+        let (init, _, _) = Self::ops(digest);
+        let mut ctx = [0u64; 64];
+        unsafe {
+            init(ctx.as_mut_ptr() as *mut c_void);
+        }
+        Self { digest, ctx }
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let (_, update, _) = Self::ops(self.digest);
+        let ctx_p = self.ctx.as_mut_ptr() as *mut c_void;
+        for chunk in data.chunks(16 * 1024 * 1024) {
+            unsafe {
+                update(ctx_p, chunk.as_ptr() as *const c_void, chunk.len() as u32);
+            }
+        }
+    }
+
+    pub(crate) fn finalize_clone(&self) -> Vec<u8> {
+        let (_, _, fin) = Self::ops(self.digest);
+        let mut tmp = self.ctx;
+        let mut out = vec![0u8; self.digest.len()];
+        unsafe {
+            fin(out.as_mut_ptr(), tmp.as_mut_ptr() as *mut c_void);
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Big integers (little-endian u32 limbs) for RSA public operations
 // ---------------------------------------------------------------------------

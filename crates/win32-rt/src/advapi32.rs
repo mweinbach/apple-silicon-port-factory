@@ -3074,7 +3074,7 @@ pub unsafe extern "win64" fn StartServiceCtrlDispatcherA(
 
 // ------------------------------------------------------- CAPI / Cred*
 
-use crate::misc::bcrypt::{CipherMode as BcCipherMode, Digest as BcDigest, Rc4State, RsaKey, SymAlg};
+use crate::misc::bcrypt::{CipherMode as BcCipherMode, Digest as BcDigest, IncrementalDigest, Rc4State, RsaKey, SymAlg};
 
 const CALG_MD2: u32 = 0x0000_8001;
 const CALG_MD4: u32 = 0x0000_8002;
@@ -3153,11 +3153,21 @@ const NTE_BAD_KEY_STATE: u32 = 0x8009_000B;
 const NTE_NO_KEY: u32 = 0x8009_000D;
 const NTE_EXISTS: u32 = 0x8009_000F;
 const NTE_BAD_KEYSET: u32 = 0x8009_0016;
+const NTE_FAIL: u32 = 0x8009_0020;
+
+const CAPI_STORE_MAGIC: &[u8; 8] = b"PFCAPI01";
+const CAPI_STORE_ENTROPY: &[u8] = b"advapi32-capi-containers-v1";
+
+#[derive(Clone)]
+struct StoredUserKey {
+    key: RsaKey,
+    exportable: bool,
+}
 
 #[derive(Clone, Default)]
 struct CapiContainerKeys {
-    keyx: Option<RsaKey>,
-    sign: Option<RsaKey>,
+    keyx: Option<StoredUserKey>,
+    sign: Option<StoredUserKey>,
 }
 
 struct CapiProvider {
@@ -3173,7 +3183,7 @@ struct CapiHash {
     h_prov: usize,
     alg_id: u32,
     digest: BcDigest,
-    data: Vec<u8>,
+    state: IncrementalDigest,
     override_val: Option<Vec<u8>>,
 }
 
@@ -3280,31 +3290,177 @@ fn capi_sym_key(alg_id: u32, alg: SymAlg, key: Vec<u8>, exportable: bool) -> Cap
     }
 }
 
-fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey) {
-    let mut provs = capi_providers().lock().unwrap();
-    let Some(prov) = provs.get_mut(&h_prov) else {
-        return;
-    };
-    if prov.ephemeral {
-        if key_spec == AT_SIGNATURE {
-            prov.ephemeral_keys.sign = Some(rsa);
-        } else {
-            prov.ephemeral_keys.keyx = Some(rsa);
-        }
-    } else {
-        let map_key = (prov.prov_type, prov.container.clone());
-        drop(provs);
-        let mut containers = capi_containers().lock().unwrap();
-        let entry = containers.entry(map_key).or_default();
-        if key_spec == AT_SIGNATURE {
-            entry.sign = Some(rsa);
-        } else {
-            entry.keyx = Some(rsa);
-        }
-    }
+fn capi_store_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option<RsaKey>, u32> {
+fn capi_store_path() -> std::path::PathBuf {
+    crate::path::default_translator_root()
+        .join("AppData")
+        .join("Roaming")
+        .join("Microsoft")
+        .join("Crypto")
+        .join("RSA")
+        .join("containers.bin")
+}
+
+fn encode_capi_containers(map: &std::collections::HashMap<(u32, String), CapiContainerKeys>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(CAPI_STORE_MAGIC);
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    let push_opt_key = |out: &mut Vec<u8>, opt: &Option<StoredUserKey>, alg_id: u32| {
+        if let Some(sk) = opt {
+            if let Some(blob) = sk.key.to_capi_private_blob(alg_id) {
+                out.push(1);
+                out.push(sk.exportable as u8);
+                out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                out.extend_from_slice(&blob);
+                return;
+            }
+        }
+        out.push(0);
+    };
+    for ((prov_type, name), keys) in map {
+        out.extend_from_slice(&prov_type.to_le_bytes());
+        let nb = name.as_bytes();
+        out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+        out.extend_from_slice(nb);
+        push_opt_key(&mut out, &keys.keyx, CALG_RSA_KEYX);
+        push_opt_key(&mut out, &keys.sign, CALG_RSA_SIGN);
+    }
+    out
+}
+
+fn decode_capi_containers(data: &[u8]) -> Option<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
+    if data.len() < 12 || &data[..8] != CAPI_STORE_MAGIC {
+        return None;
+    }
+    let mut pos = 8usize;
+    let read_u32 = |pos: &mut usize| -> Option<u32> {
+        let end = pos.checked_add(4)?;
+        let v = u32::from_le_bytes(data.get(*pos..end)?.try_into().ok()?);
+        *pos = end;
+        Some(v)
+    };
+    let read_opt_key = |pos: &mut usize| -> Option<Option<StoredUserKey>> {
+        let tag = *data.get(*pos)?;
+        *pos += 1;
+        match tag {
+            0 => Some(None),
+            1 => {
+                let exp = *data.get(*pos)? != 0;
+                *pos += 1;
+                let len = read_u32(pos)? as usize;
+                let end = pos.checked_add(len)?;
+                let blob = data.get(*pos..end)?;
+                *pos = end;
+                let (rsa, _, is_priv) = RsaKey::from_capi_blob(blob)?;
+                if !is_priv {
+                    return None;
+                }
+                Some(Some(StoredUserKey { key: rsa, exportable: exp }))
+            }
+            _ => None,
+        }
+    };
+    let count = read_u32(&mut pos)? as usize;
+    let mut map = std::collections::HashMap::with_capacity(count.min(256));
+    for _ in 0..count {
+        let prov_type = read_u32(&mut pos)?;
+        let nlen = read_u32(&mut pos)? as usize;
+        let end = pos.checked_add(nlen)?;
+        let name = String::from_utf8(data.get(pos..end)?.to_vec()).ok()?;
+        pos = end;
+        let keyx = read_opt_key(&mut pos)?;
+        let sign = read_opt_key(&mut pos)?;
+        map.insert((prov_type, name), CapiContainerKeys { keyx, sign });
+    }
+    Some(map)
+}
+
+unsafe fn load_persisted_capi_containers() -> std::io::Result<std::collections::HashMap<(u32, String), CapiContainerKeys>> {
+    let path = capi_store_path();
+    let enc = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let (_, plain) = crate::misc::crypt32::dpapi_unprotect_bytes(CAPI_STORE_ENTROPY, &enc)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to decrypt CAPI key store"))?;
+    decode_capi_containers(&plain)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt CAPI key store"))
+}
+
+unsafe fn save_persisted_capi_containers(
+    map: &std::collections::HashMap<(u32, String), CapiContainerKeys>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = capi_store_path();
+    let parent = path.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+    let raw = encode_capi_containers(map);
+    let enc = crate::misc::crypt32::dpapi_protect_bytes(false, "CapiKeyStore", CAPI_STORE_ENTROPY, &raw)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "DPAPI protection of CAPI key store failed"))?;
+
+    let mut rnd = [0u8; 8];
+    libc::arc4random_buf(rnd.as_mut_ptr() as *mut c_void, rnd.len());
+    let suffix = u64::from_le_bytes(rnd);
+    let tmp_path = parent.join(format!(".containers.bin.tmp.{}.{suffix:016x}", std::process::id()));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(&enc)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+unsafe fn store_container_user_key(h_prov: usize, key_spec: u32, rsa: RsaKey, exportable: bool) -> Result<(), u32> {
+    let mut provs = capi_providers().lock().unwrap();
+    let Some(prov) = provs.get_mut(&h_prov) else {
+        return Err(NTE_BAD_UID);
+    };
+    let stored = StoredUserKey { key: rsa, exportable };
+    if prov.ephemeral {
+        if key_spec == AT_SIGNATURE {
+            prov.ephemeral_keys.sign = Some(stored);
+        } else {
+            prov.ephemeral_keys.keyx = Some(stored);
+        }
+        return Ok(());
+    }
+    let map_key = (prov.prov_type, prov.container.clone());
+    drop(provs);
+    let _guard = capi_store_lock().lock().unwrap();
+    let mut disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
+    let entry = disk.entry(map_key.clone()).or_default();
+    if key_spec == AT_SIGNATURE {
+        entry.sign = Some(stored.clone());
+    } else {
+        entry.keyx = Some(stored.clone());
+    }
+    save_persisted_capi_containers(&disk).map_err(|_| NTE_FAIL)?;
+    let mut mem = capi_containers().lock().unwrap();
+    let mem_entry = mem.entry(map_key).or_default();
+    if key_spec == AT_SIGNATURE {
+        mem_entry.sign = Some(stored);
+    } else {
+        mem_entry.keyx = Some(stored);
+    }
+    Ok(())
+}
+
+unsafe fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option<StoredUserKey>, u32> {
     let provs = capi_providers().lock().unwrap();
     let Some(prov) = provs.get(&h_prov) else {
         return Err(NTE_BAD_UID);
@@ -3319,21 +3475,30 @@ fn load_container_user_key(h_prov: usize, key_spec: u32) -> Result<Option<RsaKey
     }
     let map_key = (prov.prov_type, prov.container.clone());
     drop(provs);
-    let containers = capi_containers().lock().unwrap();
-    Ok(containers.get(&map_key).and_then(|c| {
-        if key_spec == AT_SIGNATURE {
-            c.sign.clone()
-        } else {
-            c.keyx.clone()
+    {
+        let containers = capi_containers().lock().unwrap();
+        if let Some(c) = containers.get(&map_key) {
+            let k = if key_spec == AT_SIGNATURE { c.sign.clone() } else { c.keyx.clone() };
+            if k.is_some() {
+                return Ok(k);
+            }
         }
-    }))
+    }
+    // Load from persisted DPAPI-encrypted store (handles cross-process / post-restart access).
+    let _guard = capi_store_lock().lock().unwrap();
+    let disk = load_persisted_capi_containers().map_err(|_| NTE_FAIL)?;
+    let found = disk.get(&map_key).cloned();
+    if let Some(ref c) = found {
+        capi_containers().lock().unwrap().insert(map_key, c.clone());
+    }
+    Ok(found.and_then(|c| if key_spec == AT_SIGNATURE { c.sign } else { c.keyx }))
 }
 
 fn capi_hash_value(h: &CapiHash) -> Vec<u8> {
     if let Some(ref ov) = h.override_val {
         ov.clone()
     } else {
-        h.digest.hash(&h.data)
+        h.state.finalize_clone()
     }
 }
 
@@ -3346,26 +3511,49 @@ unsafe fn crypt_acquire_context_impl(
 ) -> BOOL {
     let cname = container.unwrap_or_default();
     if (dw_flags & CRYPT_DELETEKEYSET) != 0 {
-        let removed = capi_containers().lock().unwrap().remove(&(dw_prov_type, cname)).is_some();
+        let map_key = (dw_prov_type, cname);
+        let _guard = capi_store_lock().lock().unwrap();
+        let mut disk = match load_persisted_capi_containers() {
+            Ok(d) => d,
+            Err(_) => return err(NTE_FAIL, FALSE),
+        };
+        let removed_disk = disk.remove(&map_key).is_some();
+        let removed_mem = capi_containers().lock().unwrap().remove(&map_key).is_some();
+        if removed_disk && save_persisted_capi_containers(&disk).is_err() {
+            return err(NTE_FAIL, FALSE);
+        }
         if !ph_prov.is_null() {
             std::ptr::write_unaligned(ph_prov, 0);
         }
-        return if removed { TRUE } else { err(NTE_BAD_KEYSET, FALSE) };
+        return if removed_disk || removed_mem { TRUE } else { err(NTE_BAD_KEYSET, FALSE) };
     }
     if ph_prov.is_null() {
         return err(ERROR_INVALID_PARAMETER, FALSE);
     }
     let ephemeral = (dw_flags & CRYPT_VERIFYCONTEXT) != 0;
     if !ephemeral {
-        let mut containers = capi_containers().lock().unwrap();
         let key = (dw_prov_type, cname.clone());
+        let _guard = capi_store_lock().lock().unwrap();
+        let mut disk = match load_persisted_capi_containers() {
+            Ok(d) => d,
+            Err(_) => return err(NTE_FAIL, FALSE),
+        };
         if (dw_flags & CRYPT_NEWKEYSET) != 0 {
-            if containers.contains_key(&key) {
+            if disk.contains_key(&key) {
                 return err(NTE_EXISTS, FALSE);
             }
-            containers.insert(key, CapiContainerKeys::default());
+            disk.insert(key.clone(), CapiContainerKeys::default());
+            if save_persisted_capi_containers(&disk).is_err() {
+                return err(NTE_FAIL, FALSE);
+            }
+            capi_containers().lock().unwrap().insert(key, CapiContainerKeys::default());
         } else {
-            containers.entry(key).or_default();
+            let existed = disk.contains_key(&key);
+            let entry = disk.entry(key.clone()).or_default().clone();
+            if !existed && save_persisted_capi_containers(&disk).is_err() {
+                return err(NTE_FAIL, FALSE);
+            }
+            capi_containers().lock().unwrap().insert(key, entry);
         }
     }
     let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
@@ -3488,7 +3676,7 @@ pub unsafe extern "win64" fn CryptCreateHash(
             h_prov,
             alg_id,
             digest,
-            data: Vec::new(),
+            state: IncrementalDigest::new(digest),
             override_val: None,
         },
     );
@@ -3530,7 +3718,7 @@ pub unsafe extern "win64" fn CryptHashData(
     };
     if dw_data_len > 0 {
         let slice = std::slice::from_raw_parts(pb_data, dw_data_len as usize);
-        h.data.extend_from_slice(slice);
+        h.state.update(slice);
         h.override_val = None;
     }
     TRUE
@@ -3629,7 +3817,9 @@ pub unsafe extern "win64" fn CryptGenKey(
         } else {
             (AT_KEYEXCHANGE, CALG_RSA_KEYX)
         };
-        store_container_user_key(h_prov, key_spec, rsa.clone());
+        if let Err(e) = store_container_user_key(h_prov, key_spec, rsa.clone(), exportable) {
+            return err(e, FALSE);
+        }
         let h = NEXT_CAPI_HANDLE.fetch_add(1, Ordering::Relaxed) as usize;
         capi_keys().lock().unwrap().insert(
             h,
@@ -3790,7 +3980,7 @@ pub unsafe extern "win64" fn CryptGetUserKey(
     if !matches!(dw_key_spec, AT_KEYEXCHANGE | AT_SIGNATURE) {
         return err(NTE_BAD_TYPE, FALSE);
     }
-    let rsa = match load_container_user_key(h_prov, dw_key_spec) {
+    let stored = match load_container_user_key(h_prov, dw_key_spec) {
         Ok(Some(k)) => k,
         Ok(None) => return err(NTE_NO_KEY, FALSE),
         Err(e) => return err(e, FALSE),
@@ -3801,9 +3991,9 @@ pub unsafe extern "win64" fn CryptGetUserKey(
         h,
         CapiKey {
             alg_id,
-            exportable: true,
+            exportable: stored.exportable,
             permissions: 0x3F,
-            material: CapiKeyMaterial::Rsa { key: rsa },
+            material: CapiKeyMaterial::Rsa { key: stored.key },
         },
     );
     std::ptr::write_unaligned(ph_user_key, h);
@@ -4090,7 +4280,9 @@ pub unsafe extern "win64" fn CryptImportKey(
             };
             let key_spec = if blob_alg == CALG_RSA_SIGN { AT_SIGNATURE } else { AT_KEYEXCHANGE };
             if is_priv {
-                store_container_user_key(h_prov, key_spec, rsa.clone());
+                if let Err(e) = store_container_user_key(h_prov, key_spec, rsa.clone(), exportable) {
+            return err(e, FALSE);
+        }
             }
             CapiKey {
                 alg_id: if blob_alg != 0 { blob_alg } else { CALG_RSA_KEYX },
@@ -4435,11 +4627,12 @@ unsafe fn crypt_sign_hash_impl(
         };
         (h.h_prov, h.digest, capi_hash_value(h))
     };
-    let rsa = match load_container_user_key(h_prov, dw_key_spec) {
+    let stored = match load_container_user_key(h_prov, dw_key_spec) {
         Ok(Some(k)) => k,
         Ok(None) => return err(NTE_NO_KEY, FALSE),
         Err(e) => return err(e, FALSE),
     };
+    let rsa = stored.key;
     let sig_len = rsa.k() as u32;
     if pb_signature.is_null() {
         std::ptr::write_unaligned(pdw_sig_len, sig_len);
@@ -6308,6 +6501,15 @@ mod tests {
     #[test]
     fn capi_keys_blobs_encrypt_decrypt_sign_verify_and_windows_vectors() {
         unsafe {
+            let tmp_root = std::env::temp_dir().join(format!("pf_capi_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp_root);
+            std::fs::create_dir_all(&tmp_root).unwrap();
+            let prev_home = std::env::var_os("TRANSLATOR_HOME");
+            let prev_drive = std::env::var_os("AW2_DRIVE_C");
+            std::env::set_var("TRANSLATOR_HOME", &tmp_root);
+            std::env::remove_var("AW2_DRIVE_C");
+            capi_containers().lock().unwrap().clear();
+
             let hex = |s: &str| -> Vec<u8> {
                 (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
             };
@@ -6495,6 +6697,78 @@ mod tests {
             assert_eq!(CryptReleaseContext(hprov2, 0), TRUE);
             assert_eq!(CryptReleaseContext(hprov, 0), TRUE);
             assert_eq!(CryptAcquireContextW(&mut hprov, cname.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET), TRUE);
+
+            // 7. Persisted container survives simulated restart + preserves non-exportable policy
+            let persist_name = crate::strings::to_wide_z("PortFactoryPersistedNoExport");
+            let mut hp = 0usize;
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_NEWKEYSET), TRUE);
+            let mut hk_noexp = 0usize;
+            // Generate WITHOUT CRYPT_EXPORTABLE
+            assert_eq!(CryptGenKey(hp, AT_KEYEXCHANGE, 2048 << 16, &mut hk_noexp), TRUE);
+            let mut ct = vec![0u8; 256];
+            let secret_msg = b"survives restart";
+            ct[..secret_msg.len()].copy_from_slice(secret_msg);
+            let mut ct_len = secret_msg.len() as u32;
+            assert_eq!(CryptEncrypt(hk_noexp, 0, TRUE, 0, ct.as_mut_ptr(), &mut ct_len, 256), TRUE);
+            assert_eq!(CryptDestroyKey(hk_noexp), TRUE);
+            assert_eq!(CryptReleaseContext(hp, 0), TRUE);
+
+            // Verify DPAPI-encrypted container store exists on disk with 0600 permissions
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let store_p = capi_store_path();
+                let meta = std::fs::metadata(&store_p).expect("persisted CAPI store must exist");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            }
+
+            // Simulate process restart by clearing in-memory container cache
+            capi_containers().lock().unwrap().clear();
+
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, 0), TRUE);
+            let mut hk_reloaded = 0usize;
+            assert_eq!(CryptGetUserKey(hp, AT_KEYEXCHANGE, &mut hk_reloaded), TRUE);
+
+            // Exportability policy MUST be preserved: PRIVATEKEYBLOB rejected, PUBLICKEYBLOB allowed
+            let mut pl = 0u32;
+            assert_eq!(CryptExportKey(hk_reloaded, 0, PRIVATEKEYBLOB, 0, std::ptr::null_mut(), &mut pl), FALSE);
+            assert_eq!(crate::teb::last_error(), NTE_BAD_KEY_STATE);
+            assert_eq!(CryptExportKey(hk_reloaded, 0, PUBLICKEYBLOB, 0, std::ptr::null_mut(), &mut pl), TRUE);
+
+            // Decrypt ciphertext encrypted before the simulated restart
+            assert_eq!(CryptDecrypt(hk_reloaded, 0, TRUE, 0, ct.as_mut_ptr(), &mut ct_len), TRUE);
+            assert_eq!(&ct[..ct_len as usize], secret_msg);
+
+            // Incremental CryptHashData + CryptDuplicateHash diverges cleanly without full-input buffering
+            let mut hh1 = 0usize;
+            let mut hh2 = 0usize;
+            assert_eq!(CryptCreateHash(hp, CALG_SHA_256, 0, 0, &mut hh1), TRUE);
+            assert_eq!(CryptHashData(hh1, b"ab".as_ptr(), 2, 0), TRUE);
+            assert_eq!(CryptDuplicateHash(hh1, std::ptr::null(), 0, &mut hh2), TRUE);
+            assert_eq!(CryptHashData(hh1, b"c".as_ptr(), 1, 0), TRUE);
+            assert_eq!(CryptHashData(hh2, b"d".as_ptr(), 1, 0), TRUE);
+            let mut d1 = [0u8; 32];
+            let mut d2 = [0u8; 32];
+            let mut dl = 32u32;
+            assert_eq!(CryptGetHashParam(hh1, HP_HASHVAL, d1.as_mut_ptr(), &mut dl, 0), TRUE);
+            assert_eq!(CryptGetHashParam(hh2, HP_HASHVAL, d2.as_mut_ptr(), &mut dl, 0), TRUE);
+            assert_eq!(d1.as_slice(), BcDigest::Sha256.hash(b"abc").as_slice());
+            assert_eq!(d2.as_slice(), BcDigest::Sha256.hash(b"abd").as_slice());
+            assert_eq!(CryptDestroyHash(hh1), TRUE);
+            assert_eq!(CryptDestroyHash(hh2), TRUE);
+
+            assert_eq!(CryptDestroyKey(hk_reloaded), TRUE);
+            assert_eq!(CryptReleaseContext(hp, 0), TRUE);
+            assert_eq!(CryptAcquireContextW(&mut hp, persist_name.as_ptr(), std::ptr::null(), 24, CRYPT_DELETEKEYSET), TRUE);
+
+            match prev_home {
+                Some(v) => std::env::set_var("TRANSLATOR_HOME", v),
+                None => std::env::remove_var("TRANSLATOR_HOME"),
+            }
+            match prev_drive {
+                Some(v) => std::env::set_var("AW2_DRIVE_C", v),
+                None => std::env::remove_var("AW2_DRIVE_C"),
+            }
+            let _ = std::fs::remove_dir_all(&tmp_root);
         }
     }
 }
