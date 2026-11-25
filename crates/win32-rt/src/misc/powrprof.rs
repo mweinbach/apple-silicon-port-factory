@@ -1037,10 +1037,14 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             STATUS_SUCCESS
         }
         SYSTEM_EXECUTION_STATE => {
+            if !in_buf.is_null() || in_len != 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
             if out_buf.is_null() || out_len < 4 {
                 return STATUS_BUFFER_TOO_SMALL;
             }
-            std::ptr::write_unaligned(out_buf as *mut u32, 0);
+            let state = crate::kernel32::process::current_system_execution_state();
+            std::ptr::write_unaligned(out_buf as *mut u32, state);
             STATUS_SUCCESS
         }
         PROCESSOR_POWER_POLICY_AC | PROCESSOR_POWER_POLICY_DC => {
@@ -1074,11 +1078,10 @@ pub unsafe extern "win64" fn CallNtPowerInformation(
             STATUS_NOT_IMPLEMENTED
         }
         SYSTEM_WAKE_SOURCE | SYSTEM_HIBER_FILE_SIZE | SYSTEM_HIBER_FILE_INFORMATION => {
-            if out_buf.is_null() || out_len < 4 {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            std::ptr::write_unaligned(out_buf as *mut u32, 0);
-            STATUS_SUCCESS
+            log::warn!(
+                "powrprof: CallNtPowerInformation(level={info_level}) is unsupported on host OS"
+            );
+            STATUS_NOT_IMPLEMENTED
         }
         SYSTEM_POWER_STATE_HANDLER
         | PROCESSOR_STATE_HANDLER
@@ -1779,6 +1782,116 @@ mod tests {
                     verify_out.iter().all(|&b| b == 0x77),
                     "unsupported VerifyProcessorPolicy level {lvl} must not echo input into out_buf"
                 );
+            }
+
+            // SystemExecutionState must reflect live continuous SetThreadExecutionState flags
+            // across threads and clear them on release or thread exit.
+            const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+            const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+            const ES_CONTINUOUS: u32 = 0x8000_0000;
+            let mut exec_state = 0xFFFF_FFFFu32;
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+            let prev = crate::kernel32::process::SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
+            );
+            assert_eq!(prev, ES_CONTINUOUS);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            // A non-continuous call must not clear the thread's continuous state.
+            let prev2 = crate::kernel32::process::SetThreadExecutionState(ES_SYSTEM_REQUIRED);
+            assert_eq!(prev2, ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            // Clearing continuous flags restores SystemExecutionState to 0.
+            let prev3 = crate::kernel32::process::SetThreadExecutionState(ES_CONTINUOUS);
+            assert_eq!(prev3, ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+            // Flags set on a worker thread are aggregated while alive and cleared on exit.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                crate::kernel32::process::SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+                let _ = tx.send(());
+                let _ = done_rx.recv();
+            });
+            rx.recv().unwrap();
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, ES_DISPLAY_REQUIRED);
+            let _ = done_tx.send(());
+            worker.join().unwrap();
+            assert_eq!(
+                CallNtPowerInformation(
+                    SYSTEM_EXECUTION_STATE,
+                    std::ptr::null(),
+                    0,
+                    &mut exec_state as *mut u32 as *mut c_void,
+                    4,
+                ),
+                STATUS_SUCCESS
+            );
+            assert_eq!(exec_state, 0);
+
+            // Unsupported wake-source / hiberfile levels must report STATUS_NOT_IMPLEMENTED.
+            for lvl in [SYSTEM_WAKE_SOURCE, SYSTEM_HIBER_FILE_SIZE, SYSTEM_HIBER_FILE_INFORMATION] {
+                let mut sentinel = 0x5A5A_5A5Au32;
+                assert_eq!(
+                    CallNtPowerInformation(
+                        lvl,
+                        std::ptr::null(),
+                        0,
+                        &mut sentinel as *mut u32 as *mut c_void,
+                        4,
+                    ),
+                    STATUS_NOT_IMPLEMENTED
+                );
+                assert_eq!(sentinel, 0x5A5A_5A5A);
             }
 
             // Privileged admin-only level returns STATUS_ACCESS_DENIED; unknown returns STATUS_INVALID_PARAMETER.
