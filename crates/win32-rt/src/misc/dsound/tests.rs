@@ -1802,6 +1802,40 @@ fn dsound8_echo_pan_delay_and_remaining_fx_parameters() {
     assert!(max_diff_inphase < 1e-6, "lPhase=0deg must keep L==R");
     assert!(max_diff_quad > 0.05, "lPhase=90deg must produce stereo modulation diff ({max_diff_quad})");
 
+    // 2b. Zero modulation depth preserves exact configured fDelay for both Chorus (16 ms -> frame 768)
+    //     and Flanger (2 ms -> frame 96) at 48 kHz.
+    for (kind, delay_ms, want_frame) in [
+        (DsFxKind::Chorus, 16.0f32, 768usize),
+        (DsFxKind::Flanger, 2.0f32, 96usize),
+    ] {
+        let mut fx = BufferEffect::new(kind);
+        let mut raw = Vec::with_capacity(28);
+        for f in [100.0f32, 0.0, 0.0, 1.0] {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+        raw.extend_from_slice(&1i32.to_le_bytes()); // sin
+        raw.extend_from_slice(&delay_ms.to_le_bytes());
+        raw.extend_from_slice(&2i32.to_le_bytes()); // 0 deg
+        fx.params = raw;
+        let mut impulse_frame = None;
+        for frame in 0..=want_frame + 16 {
+            let inp = if frame == 0 { 1.0 } else { 0.0 };
+            let (ol, or) = fx.process_sample(inp, inp, 48_000.0);
+            if ol.abs() > 0.5 || or.abs() > 0.5 {
+                assert!(
+                    impulse_frame.is_none(),
+                    "{kind:?} unexpected duplicate impulse at frame {frame}"
+                );
+                impulse_frame = Some(frame);
+            }
+        }
+        assert_eq!(
+            impulse_frame,
+            Some(want_frame),
+            "{kind:?} with depth=0 and fDelay={delay_ms}ms must output impulse at frame {want_frame}"
+        );
+    }
+
     // 3. DSFXDistortion honors fPreLowpassCutoff / fPostEQCenterFrequency.
     let make_dist = |post_fc: f32, pre_lp: f32| -> BufferEffect {
         let mut fx = BufferEffect::new(DsFxKind::Distortion);

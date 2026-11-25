@@ -502,7 +502,8 @@ impl BufferEffect {
                 let fb = (self.param_f32(8).clamp(-99.0, 99.0)) * 0.01;
                 let freq = self.param_f32(12).clamp(0.0, 10.0);
                 let waveform = self.param_i32(16); // 0 = TRIANGLE, 1 = SIN
-                let base_ms = self.param_f32(20).clamp(0.0, 20.0);
+                let max_delay_ms = if self.kind == DsFxKind::Flanger { 4.0 } else { 20.0 };
+                let base_ms = self.param_f32(20).clamp(0.0, max_delay_ms);
                 let phase_diff = match self.param_i32(24) {
                     0 => 0.5,  // -180 deg
                     1 => 0.75, // -90 deg
@@ -511,22 +512,35 @@ impl BufferEffect {
                     4 => 0.5,  // +180 deg
                     _ => 0.0,
                 };
+                // Bipolar LFO in [-1.0, +1.0] centered around 0 so depth=0 preserves exact fDelay.
                 let eval_lfo = |p: f32| -> f32 {
                     if waveform == 0 {
-                        if p < 0.5 { p * 2.0 } else { (1.0 - p) * 2.0 }
+                        if p < 0.5 { p * 4.0 - 1.0 } else { 3.0 - p * 4.0 }
                     } else {
-                        (p * std::f32::consts::TAU).sin() * 0.5 + 0.5
+                        (p * std::f32::consts::TAU).sin()
                     }
                 };
                 let lfo_l = eval_lfo(self.phase);
                 let lfo_r = eval_lfo((self.phase + phase_diff).fract());
                 self.phase = (self.phase + freq / sr).fract();
-                let d_samp_l = ((base_ms * (0.5 + 0.5 * depth * lfo_l) * 0.001 * sr) as usize).max(1);
-                let d_samp_r = ((base_ms * (0.5 + 0.5 * depth * lfo_r) * 0.001 * sr) as usize).max(1);
-                self.ensure_delay_capacity(d_samp_l.max(d_samp_r));
+                let delay_ms_l = (base_ms * (1.0 + 0.5 * depth * lfo_l)).max(0.0);
+                let delay_ms_r = (base_ms * (1.0 + 0.5 * depth * lfo_r)).max(0.0);
+                let d_samp_l = (delay_ms_l * 0.001 * sr).round() as usize;
+                let d_samp_r = (delay_ms_r * 0.001 * sr).round() as usize;
+                if d_samp_l > 0 || d_samp_r > 0 {
+                    self.ensure_delay_capacity(d_samp_l.max(d_samp_r));
+                }
                 let cap = self.delay_l.len();
-                let rl = self.delay_l[(self.delay_pos + cap - d_samp_l) % cap];
-                let rr = self.delay_r[(self.delay_pos + cap - d_samp_r) % cap];
+                let rl = if d_samp_l == 0 {
+                    l
+                } else {
+                    self.delay_l[(self.delay_pos + cap - d_samp_l) % cap]
+                };
+                let rr = if d_samp_r == 0 {
+                    r
+                } else {
+                    self.delay_r[(self.delay_pos + cap - d_samp_r) % cap]
+                };
                 self.delay_l[self.delay_pos] = (l + rl * fb).clamp(-4.0, 4.0);
                 self.delay_r[self.delay_pos] = (r + rr * fb).clamp(-4.0, 4.0);
                 self.delay_pos = (self.delay_pos + 1) % cap;
