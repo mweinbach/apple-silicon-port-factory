@@ -507,17 +507,17 @@ unsafe fn format_with_locale(
                         _ => null_u,
                     }
                 } else if is_wide {
-                    let n = if out.wide {
-                        match sp.prec {
-                            Some(pr) => (0..pr).take_while(|&k| *((p as *const u16).add(k)) != 0).count(),
-                            None => wcslen(p as *const u16),
-                        }
-                    } else if sp.prec == Some(0) {
-                        0
+                    let res = if out.wide {
+                        let wp = p as *const u16;
+                        let n = match sp.prec {
+                            Some(pr) => (0..pr).take_while(|&k| wp.add(k).read_unaligned() != 0).count(),
+                            None => wcslen(wp),
+                        };
+                        Ok((0..n).map(|k| wp.add(k).read_unaligned() as u32).collect())
                     } else {
-                        wcslen(p as *const u16)
+                        conv_wide_ptr(p as *const u16, cp, sp.prec)
                     };
-                    match conv_wide(std::slice::from_raw_parts(p as *const u16, n), out.wide, cp, sp.prec) {
+                    match res {
                         Ok(u) => u,
                         Err(()) => {
                             super::errno::set(super::errno::EILSEQ);
@@ -525,17 +525,17 @@ unsafe fn format_with_locale(
                         }
                     }
                 } else {
-                    let n = if !out.wide {
-                        match sp.prec {
-                            Some(pr) => (0..pr).take_while(|&k| *((p as *const u8).add(k)) != 0).count(),
-                            None => strlen(p as *const u8),
-                        }
-                    } else if sp.prec == Some(0) {
-                        0
+                    let res = if !out.wide {
+                        let np = p as *const u8;
+                        let n = match sp.prec {
+                            Some(pr) => (0..pr).take_while(|&k| *np.add(k) != 0).count(),
+                            None => strlen(np),
+                        };
+                        Ok(std::slice::from_raw_parts(np, n).iter().map(|&b| b as u32).collect())
                     } else {
-                        strlen(p as *const u8)
+                        conv_narrow_ptr(p as *const u8, cp, sp.prec)
                     };
-                    match conv_narrow(std::slice::from_raw_parts(p as *const u8, n), out.wide, cp, sp.prec) {
+                    match res {
                         Ok(u) => u,
                         Err(()) => {
                             super::errno::set(super::errno::EILSEQ);
@@ -563,6 +563,94 @@ unsafe fn format_with_locale(
         }
     }
     Some(out.units)
+}
+
+/// Incrementally convert a wide string pointer to narrow bytes under `cp`, stopping on NUL or
+/// as soon as `max_out` output bytes are satisfied without reading past the precision boundary.
+unsafe fn conv_wide_ptr(p: *const u16, cp: u32, max_out: Option<usize>) -> Result<Vec<u32>, ()> {
+    if max_out == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        if max_out.is_some_and(|lim| out.len() >= lim) {
+            break;
+        }
+        let u0 = p.add(idx).read_unaligned();
+        if u0 == 0 {
+            break;
+        }
+        let (bytes, step) = if (0xD800..=0xDBFF).contains(&u0) {
+            let u1 = p.add(idx + 1).read_unaligned();
+            if (0xDC00..=0xDFFF).contains(&u1) {
+                (super::convert::wc_encode_slice_cp(cp, &[u0, u1])?, 2)
+            } else {
+                (super::convert::wc_encode_cp(cp, u0)?, 1)
+            }
+        } else {
+            (super::convert::wc_encode_cp(cp, u0)?, 1)
+        };
+        if max_out.is_some_and(|lim| out.len() + bytes.len() > lim) {
+            break;
+        }
+        out.extend(bytes.into_iter().map(|b| b as u32));
+        idx += step;
+    }
+    Ok(out)
+}
+
+/// Incrementally convert a narrow string pointer to wide UTF-16 units under `cp`, stopping on NUL
+/// or as soon as `max_out` output UTF-16 units are satisfied without reading past the boundary.
+unsafe fn conv_narrow_ptr(p: *const u8, cp: u32, max_out: Option<usize>) -> Result<Vec<u32>, ()> {
+    if max_out == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if max_out.is_some_and(|lim| out.len() >= lim) {
+            break;
+        }
+        let b0 = *p.add(pos);
+        if b0 == 0 {
+            break;
+        }
+        let mut seq = [b0, 0, 0, 0];
+        let need = if cp == 0 {
+            1usize
+        } else if cp == 65001 {
+            match b0 {
+                0x00..=0x7F => 1,
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => return Err(()),
+            }
+        } else if crate::kernel32::string::IsDBCSLeadByteEx(cp, b0) != 0 {
+            2
+        } else {
+            1
+        };
+        for k in 1..need {
+            let bk = *p.add(pos + k);
+            if bk == 0 {
+                return Err(());
+            }
+            seq[k] = bk;
+        }
+        match super::convert::mb_decode_cp(cp, &seq[..need]) {
+            Ok(Some((w, used))) => {
+                if max_out.is_some_and(|lim| out.len() + w.len() > lim) {
+                    break;
+                }
+                out.extend(w.into_iter().map(|u| u as u32));
+                pos += used;
+            }
+            Ok(None) | Err(()) => return Err(()),
+        }
+    }
+    Ok(out)
 }
 
 fn conv_wide(s: &[u16], out_wide: bool, cp: u32, max_out: Option<usize>) -> Result<Vec<u32>, ()> {
@@ -1119,6 +1207,117 @@ mod tests {
             assert_eq!(n, 2);
             assert_eq!(&wbuf[..2], &[0x00E4, 0x00E4]);
             crate::ucrt::locale::_free_locale(loc_u8);
+
+            // Precision-bounded cross-width reads must stop before touching a protected guard page
+            // when the input buffer is not NUL-terminated.
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let mem = libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(mem, libc::MAP_FAILED);
+            let guard = (mem as *mut u8).add(page);
+            assert_eq!(libc::mprotect(guard as *mut libc::c_void, page, libc::PROT_NONE), 0);
+
+            // 1. Non-NUL-terminated 1-char wide array immediately before guard page with "%.1ls".
+            let w_edge = guard.sub(2) as *mut u16;
+            w_edge.write_unaligned(b'A' as u16);
+            let args_edge_w = [w_edge as u64];
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%.1ls\0".as_ptr(),
+                std::ptr::null_mut(),
+                args_edge_w.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 1);
+            assert_eq!(nbuf[0], b'A');
+
+            // 2. Non-NUL-terminated 1-byte CP1252 array immediately before guard page with L"%.1hs".
+            let loc_de2 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE\0".as_ptr());
+            assert!(!loc_de2.is_null());
+            let n_edge = guard.sub(1);
+            *n_edge = 0xE4;
+            let fmt_prec1_hs: Vec<u16> = "%.1hs\0".encode_utf16().collect();
+            let args_edge_n = [n_edge as u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_prec1_hs.as_ptr(),
+                loc_de2,
+                args_edge_n.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 1);
+            assert_eq!(wbuf[0], 0x00E4);
+            crate::ucrt::locale::_free_locale(loc_de2);
+
+            // 3. Non-NUL-terminated 4-byte UTF-8 array ("ää") immediately before guard page with L"%.2hs".
+            let loc_u8_2 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"de-DE.utf8\0".as_ptr());
+            assert!(!loc_u8_2.is_null());
+            let u8_edge = guard.sub(4);
+            std::ptr::copy_nonoverlapping("ää".as_ptr(), u8_edge, 4);
+            let args_edge_u8 = [u8_edge as u64];
+            let n = __stdio_common_vswprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                wbuf.as_mut_ptr(),
+                wbuf.len(),
+                fmt_prec_hs.as_ptr(),
+                loc_u8_2,
+                args_edge_u8.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&wbuf[..2], &[0x00E4, 0x00E4]);
+            crate::ucrt::locale::_free_locale(loc_u8_2);
+
+            // 4. Non-NUL-terminated 1-char wide array ('あ') immediately before guard page with CP932 "%.2ls".
+            let loc_ja2 = crate::ucrt::locale::_create_locale(2 /* LC_CTYPE */, b"ja-JP\0".as_ptr());
+            assert!(!loc_ja2.is_null());
+            w_edge.write_unaligned(0x3042);
+            let n = __stdio_common_vsprintf(
+                STANDARD_SNPRINTF_BEHAVIOR,
+                nbuf.as_mut_ptr(),
+                nbuf.len(),
+                b"%.2ls\0".as_ptr(),
+                loc_ja2,
+                args_edge_w.as_ptr() as *const u8,
+            );
+            assert_eq!(n, 2);
+            assert_eq!(&nbuf[..2], &[0x82, 0xA0]);
+            crate::ucrt::locale::_free_locale(loc_ja2);
+
+            // 5. Precision 0 never dereferences the guard page pointer.
+            let args_guard = [guard as u64];
+            let fmt_prec0_hs: Vec<u16> = "%.0hs\0".encode_utf16().collect();
+            assert_eq!(
+                __stdio_common_vsprintf(
+                    STANDARD_SNPRINTF_BEHAVIOR,
+                    nbuf.as_mut_ptr(),
+                    nbuf.len(),
+                    b"%.0ls\0".as_ptr(),
+                    std::ptr::null_mut(),
+                    args_guard.as_ptr() as *const u8,
+                ),
+                0
+            );
+            assert_eq!(
+                __stdio_common_vswprintf(
+                    STANDARD_SNPRINTF_BEHAVIOR,
+                    wbuf.as_mut_ptr(),
+                    wbuf.len(),
+                    fmt_prec0_hs.as_ptr(),
+                    std::ptr::null_mut(),
+                    args_guard.as_ptr() as *const u8,
+                ),
+                0
+            );
+
+            assert_eq!(libc::munmap(mem, page * 2), 0);
         }
     }
 }
