@@ -1060,40 +1060,62 @@ unsafe fn read_fd_tracked(fd: i32, buf: *mut u8, n: usize, track_pos: bool) -> (
                         }
                     }
                 }
-                let (ch, step) = match std::str::from_utf8(rem) {
-                    Ok(s) => {
-                        let c = s.chars().next().unwrap();
-                        (c, c.len_utf8())
-                    }
-                    Err(e) if e.valid_up_to() > 0 => {
-                        let s = std::str::from_utf8(&rem[..e.valid_up_to()]).unwrap();
-                        let c = s.chars().next().unwrap();
-                        (c, c.len_utf8())
-                    }
-                    Err(e) => match e.error_len() {
-                        Some(bad_len) => ('\u{FFFD}', bad_len),
-                        None => {
-                            if out_u16.is_empty() {
-                                // Incomplete UTF-8 sequence at end of buffer: fetch up to 4 - rem.len()
-                                // more bytes so a valid sequence spanning reads decodes cleanly.
-                                let want = 4usize.saturating_sub(rem.len()).max(1);
-                                let mut more = [0u8; 4];
-                                let k = raw_read_retry(fd, more.as_mut_ptr(), want);
-                                if k > 0 {
-                                    raw_buf.extend_from_slice(&more[..k as usize]);
-                                    continue;
-                                }
-                                // EOF mid-sequence: emit replacement char and consume truncated bytes.
-                                out_u16.push(0xFFFD);
-                                if start_pos >= 0 {
-                                    src_pos.push(char_phys);
-                                    src_pos.push(char_phys);
-                                }
-                                consumed = raw_buf.len();
-                            }
-                            break;
+                let (ch, step) = if rem[0] < 0x80 {
+                    (rem[0] as char, 1)
+                } else {
+                    // Validate at most 4 bytes per iteration (O(1) per character) so decoding
+                    // stays linear on large `_read`/`fread` buffers.
+                    let win = &rem[..rem.len().min(4)];
+                    match std::str::from_utf8(win) {
+                        Ok(s) => {
+                            let c = s.chars().next().unwrap();
+                            (c, c.len_utf8())
                         }
-                    },
+                        Err(e) if e.valid_up_to() > 0 => {
+                            let s = std::str::from_utf8(&win[..e.valid_up_to()]).unwrap();
+                            let c = s.chars().next().unwrap();
+                            (c, c.len_utf8())
+                        }
+                        Err(e) => match e.error_len() {
+                            Some(bad_len) => ('\u{FFFD}', bad_len),
+                            None => {
+                                if out_u16.is_empty() {
+                                    // Incomplete UTF-8 sequence at end of buffer: fetch up to
+                                    // 4 - rem.len() more bytes so a valid sequence spanning reads
+                                    // decodes cleanly.
+                                    let want = 4usize.saturating_sub(rem.len()).max(1);
+                                    let mut more = [0u8; 4];
+                                    let k = raw_read_retry(fd, more.as_mut_ptr(), want);
+                                    if k > 0 {
+                                        raw_buf.extend_from_slice(&more[..k as usize]);
+                                        continue;
+                                    }
+                                    if k < 0 {
+                                        // Propagate read error (preserving the unread incomplete
+                                        // UTF-8 prefix so retries can complete it cleanly).
+                                        let saved_err = errno::get();
+                                        let left = raw_buf.len() - consumed;
+                                        if pend.low_surrogate.is_some()
+                                            || libc::lseek(fd, -(left as i64), libc::SEEK_CUR) < 0
+                                        {
+                                            pend.raw = raw_buf[consumed..].to_vec();
+                                        }
+                                        store_u8_pending(fd, pend);
+                                        errno::set(saved_err);
+                                        return (-1, Vec::new());
+                                    }
+                                    // True EOF mid-sequence: emit replacement char and consume truncated bytes.
+                                    out_u16.push(0xFFFD);
+                                    if start_pos >= 0 {
+                                        src_pos.push(char_phys);
+                                        src_pos.push(char_phys);
+                                    }
+                                    consumed = raw_buf.len();
+                                }
+                                break;
+                            }
+                        },
+                    }
                 };
                 let mut tmp = [0u16; 2];
                 let enc = ch.encode_utf16(&mut tmp);
@@ -3708,6 +3730,34 @@ mod tests {
             assert_eq!(got, 12);
             assert_eq!(&u16_out[..6], &[0xFFFD, b'A' as u16, b'B' as u16, b'C' as u16, 0xFFFD, b'D' as u16]);
             assert_eq!(_close(fd_bad), 0);
+
+            // 17. Incomplete UTF-8 refill error (EBADF on O_WRONLY fd with a pending leading byte)
+            //     propagates -1 + EBADF and retains the leading byte instead of emitting U+FFFD.
+            let err_u8 = dir.join("incomplete_err_u8.txt");
+            std::fs::write(&err_u8, b"").unwrap();
+            let c_err_u8 = std::ffi::CString::new(err_u8.as_os_str().as_encoded_bytes()).unwrap();
+            let wo_u8_fd = libc::open(c_err_u8.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            assert!(wo_u8_fd >= 0);
+            assert_eq!(_setmode(wo_u8_fd, O_U8TEXT), O_TEXT);
+            store_u8_pending(wo_u8_fd, U8Pending { raw: vec![0xE2], low_surrogate: None });
+            errno::set(0);
+            let mut u16_p = [0u16; 4];
+            assert_eq!(_read(wo_u8_fd, u16_p.as_mut_ptr() as *mut c_void, 8), -1);
+            assert_eq!(errno::get(), EBADF);
+            assert_eq!(take_u8_pending(wo_u8_fd).raw, vec![0xE2]);
+            assert_eq!(_close(wo_u8_fd), 0);
+
+            // 18. Large 64 KiB ASCII read in _O_U8TEXT stays O(n) and decodes accurately.
+            let big_u8 = dir.join("big_ascii_u8.txt");
+            let big_data = vec![b'Z'; 65536];
+            std::fs::write(&big_u8, &big_data).unwrap();
+            let fd_big = _open(b"U:\\big_ascii_u8.txt\0".as_ptr(), O_RDONLY | O_U8TEXT, 0);
+            assert!(fd_big >= 0);
+            let mut big_out = vec![0u16; 65536];
+            let got_big = _read(fd_big, big_out.as_mut_ptr() as *mut c_void, 131072);
+            assert_eq!(got_big, 131072);
+            assert!(big_out.iter().all(|&u| u == b'Z' as u16));
+            assert_eq!(_close(fd_big), 0);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
