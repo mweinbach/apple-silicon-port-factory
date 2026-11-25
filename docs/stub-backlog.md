@@ -11,18 +11,126 @@ and aggregates every per-thread backlog file placed in [`docs/stub-backlog.d/`](
 
 | Metric | Count |
 |---|---:|
-| Total remaining stub sites | **210** |
-| `stub` (partial Win32/OS/D3D/UCRT branches) | 162 |
-| `failing` (honest-failing macro exports) | 29 |
+| Total remaining stub sites | **160** |
+| `stub` (partial Win32/OS/D3D/UCRT branches) | 119 |
+| `failing` (honest-failing macro exports) | 22 |
 | `middleware_stub` (third-party/engine middleware fallbacks) | 19 |
-| DLLs with remaining stubs | 33 |
+| DLLs with remaining stubs | 29 |
 
 ## Per-Thread Backlog Notes (`docs/stub-backlog.d/`)
 
 | File | Summary |
 |---|---|
+| [`crypto-cng-capi.md`](stub-backlog.d/crypto-cng-capi.md) | Stub & API Gap Backlog — `stubs/crypto-cng-capi` |
+| [`graphics.md`](stub-backlog.d/graphics.md) | Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`) |
 | [`guest-corpus-bench.md`](stub-backlog.d/guest-corpus-bench.md) | Stub & API Gap Backlog — `toolkit/guest-corpus-bench` |
 | [`middleware.md`](stub-backlog.d/middleware.md) | Stub & API Gap Backlog — `stubs/middleware` (Vendor Middleware & Vulkan Extensions) |
+
+### From `docs/stub-backlog.d/crypto-cng-capi.md`
+
+# Stub & API Gap Backlog — `stubs/crypto-cng-capi`
+
+Scope: 28 stub sites across `crates/win32-rt/src/misc/bcrypt.rs` (20) and `crates/win32-rt/src/advapi32.rs` (8).
+
+- **Sites in scope before:** 28
+- **Sites in scope after:** 0
+- **Made real:** 28
+- **Native-unsupported (matches Windows without the feature):** 0
+- **Leftovers:** 0
+
+## Sites Removed
+
+| DLL!API | Outcome | Notes |
+|---|---|---|
+| `bcrypt.dll!BCryptOpenAlgorithmProvider` | Made real | Added MD2, MD4, AES-CMAC, AES-GMAC, 3DES, 3DES_112, DES, RC2, RC4, ECDH (`ECDH`, `ECDH_P256`, `ECDH_P384`, `ECDH_P521`), `FIPS186DSARNG`, KDF identifiers, and `BCRYPT_HASH_REUSABLE_FLAG`; unrecognized algorithm names return `STATUS_NOT_FOUND` per Windows CNG. |
+| `bcrypt.dll!BCryptGetProperty` (alg) | Made real | Added `PrimitiveType`, `IsKeyedHash`, `IsReusableHash`, `MultiObjectLength`, `EffectiveKeyLength`, `ECCCurveNameList`, CCM/GCM `AuthTagLength`, full RSA `PaddingSchemes` (`0x1E`), and all new symmetric/ECDH/MAC properties. |
+| `bcrypt.dll!BCryptGetProperty` (hash) | Made real | Added `IsKeyedHash`, `IsReusableHash`, `PrimitiveType`, and `AES-CMAC` / `AES-GMAC` digest & block lengths. |
+| `bcrypt.dll!BCryptGetProperty` (key) | Made real | Added 3DES/3DES_112/DES/RC2/RC4 properties, `IV`, `EffectiveKeyLength`, `PaddingSchemes`, `PublicKeyLength`, `PrimitiveType`, and ECDH key properties. |
+| `bcrypt.dll!BCryptImportKeyPair` (wrapped `hImportKey`) | Made real | Per Microsoft Learn (`BCryptImportKeyPair`), `hImportKey` *"is not currently used and should be NULL"*; non-null handles return `STATUS_NOT_SUPPORTED` matching Windows. |
+| `bcrypt.dll!BCryptImportKeyPair` (RSA blobs) | Made real | Added `CAPIPUBLICBLOB` / `CAPIPRIVATEBLOB` (little-endian legacy CAPI RSA blobs) alongside CNG RSA blobs. |
+| `bcrypt.dll!BCryptImportKeyPair` (ECC blobs) | Made real | Generalized to support both ECDSA and ECDH (`ECK1`..`ECK6`) plus generic ECC blob magics (`ECDP`/`ECDV`/`ECKP`/`ECKV`). |
+| `bcrypt.dll!BCryptImportKeyPair` (other alg) | Made real | All CNG asymmetric algorithms (RSA, ECDSA, ECDH) are supported; non-asymmetric algorithms return `STATUS_NOT_SUPPORTED` matching Windows. |
+| `bcrypt.dll!BCryptSignHash` (RSA padding) | Made real | Added MD2/MD4 DigestInfo OIDs and strict validation of `BCRYPT_PAD_PKCS1` / `BCRYPT_PAD_PSS` (invalid padding flags return `STATUS_INVALID_PARAMETER` matching Windows). |
+| `bcrypt.dll!BCryptVerifySignature` (RSA padding) | Made real | Added `BCRYPT_PAD_PKCS1_OPTIONAL_HASH_OID` (0x10) and MD2/MD4 DigestInfo OIDs alongside PKCS#1 v1.5 and PSS. |
+| `bcrypt.dll!bcrypt_aes_crypt` (`BCryptEncrypt`/`BCryptDecrypt`) | Made real | Generalized to `bcrypt_crypt`: added AES-CCM (NIST SP 800-38C), DES/3DES/3DES_112 (CommonCrypto), RC2 (RFC 2268), RC4 stream cipher, and RSA encryption/decryption (`BCRYPT_PAD_OAEP` with arbitrary hash & label, `BCRYPT_PAD_PKCS1`, `BCRYPT_PAD_NONE`). |
+| `bcrypt.dll!BCryptImportKey` (wrapped `hImportKey`) | Made real | Implemented RFC 3394 / RFC 3565 AES Key Unwrap for `Rfc3565KeyWrapBlob` (`BCRYPT_AES_WRAP_KEY_BLOB`). |
+| `bcrypt.dll!BCryptImportKey` (blob types) | Made real | Extended `KeyDataBlob` and `OpaqueKeyBlob` (v1/v2) across all symmetric ciphers (AES, 3DES, 3DES_112, DES, RC2, RC4). |
+| `bcrypt.dll!BCryptExportKey` (wrapped `hExportKey`) | Made real | Implemented RFC 3394 / RFC 3565 AES Key Wrap for `Rfc3565KeyWrapBlob`. |
+| `bcrypt.dll!BCryptExportKey` (blob types) | Made real | Extended `KeyDataBlob`, `OpaqueKeyBlob`, `CAPIPUBLICBLOB`, `CAPIPRIVATEBLOB`, and ECDH `ECCPUBLICBLOB`/`ECCPRIVATEBLOB`. |
+| `bcrypt.dll!BCryptGenerateSymmetricKey` | Made real | Extended to AES, 3DES, 3DES_112, DES, RC2, and RC4. |
+| `bcrypt.dll!BCryptGenerateKeyPair` | Made real | Extended to ECDH (`ECDH`, `ECDH_P256`, `ECDH_P384`, `ECDH_P521`) plus companion `BCryptSecretAgreement`, `BCryptDeriveKey` (`TRUNCATE`/`HASH`/`HMAC`/`TLS_PRF`/`SP800_56A_CONCAT`), and `BCryptDestroySecret`. |
+| `bcrypt.dll!BCryptSetProperty` (`ChainingMode`) | Made real | Added `ChainingModeCCM` and `ChainingModeN/A` and validated per-cipher chaining mode support across all block/stream ciphers. |
+| `bcrypt.dll!BCryptSetProperty` (`ECCCurveName`) | Made real | Extended to generic `ECDH` algorithm and pending key handles alongside `ECDSA`. |
+| `bcrypt.dll!BCryptSetProperty` (other properties) | Made real | Added `IV` (symmetric keys & `AES-GMAC` hashes), `EffectiveKeyLength` (RC2), `KeyLength` (pending ECC & RSA keys), and per-cipher `MessageBlockLength`. |
+| `advapi32.dll!CryptDecrypt` | Made real | Implemented CAPI AES/3DES/3DES_112/DES/RC2 (ECB/CBC/CFB + PKCS#5 padding + running IV), RC4, RSA (PKCS#1 v1.5 & `CRYPT_OAEP`, little-endian ciphertext), and optional `hHash`. |
+| `advapi32.dll!CryptEncrypt` | Made real | Implemented CAPI symmetric & RSA encryption with size query (`pbData == NULL`), `ERROR_MORE_DATA`, PKCS#5 padding on `Final`, little-endian RSA ciphertext, and optional `hHash`. |
+| `advapi32.dll!CryptDestroyKey` | Made real | Releases CAPI key handles and returns `NTE_BAD_KEY` on invalid handles. |
+| `advapi32.dll!CryptExportKey` | Made real | Implemented `PUBLICKEYBLOB`, `PRIVATEKEYBLOB`, `PLAINTEXTKEYBLOB`, and `SIMPLEBLOB` (RSA PKCS#1 v1.5 / `CRYPT_OAEP` little-endian wrapped session key) with `CRYPT_EXPORTABLE` enforcement. |
+| `advapi32.dll!CryptImportKey` | Made real | Implemented `PUBLICKEYBLOB`, `PRIVATEKEYBLOB`, `PLAINTEXTKEYBLOB`, and `SIMPLEBLOB` (unwrapping with RSA private key), updating container user keys on private-key import. |
+| `advapi32.dll!CryptGetUserKey` | Made real | Retrieves `AT_KEYEXCHANGE` / `AT_SIGNATURE` RSA keys from ephemeral or named persistent containers, returning `NTE_NO_KEY` when absent. |
+| `advapi32.dll!CryptSignHashW` | Made real | Implemented RSA PKCS#1 v1.5 signing (little-endian signature, optional `CRYPT_NOHASHOID`), plus companion `CryptSignHashA`, `CryptVerifySignatureW/A`, `CryptGenKey`, `CryptDeriveKey`, `CryptDuplicateKey`, `CryptDuplicateHash`, `CryptGetKeyParam`, `CryptSetKeyParam`. |
+| `advapi32.dll!GetTokenInformation` | Made real | Implemented `TOKEN_INFORMATION_CLASS` 1..=48 with real `TokenObj` handles, Windows 8+ pseudo-handles (`-4`/`-5`/`-6`), impersonation vs primary semantics (`TokenImpersonationLevel`), and documented error codes for restricted/absent classes (`TokenSessionReference` -> `ERROR_INVALID_PARAMETER`, `TokenAuditPolicy` -> `ERROR_PRIVILEGE_NOT_HELD`, `TokenLinkedToken` -> `ERROR_NO_SUCH_LOGON_SESSION`). |
+
+## Native-unsupported (matches Windows without the feature)
+
+None — all 28 sites in scope are natively implemented on Apple CommonCrypto, `Security.framework` (`SecKey`), and POSIX primitives.
+
+## Leftovers
+
+None — 0 stub sites remain in `crates/win32-rt/src/misc/bcrypt.rs` or `crates/win32-rt/src/advapi32.rs`.
+
+### From `docs/stub-backlog.d/graphics.md`
+
+# Stub Backlog — D3D11, D3D12 and DXGI (`stubs/graphics`)
+
+Scope: 26 stub sites across `d3d12/mod.rs` (2), `dxgi/mod.rs` (7), `dxgi/adapter.rs` (3),
+`d3d11/device.rs` (8), `d3d11/context.rs` (5), and `d3d11/resources.rs` (1).
+
+- **Before:** 26 sites
+- **Made real:** 16 sites
+- **Native-unsupported (matches Windows without the hardware/OS feature):** 6 sites
+- **Honest leftovers remaining in `db/stub_inventory.tsv`:** 4 sites
+
+## Remaining Leftovers in Scope (4 sites)
+
+| DLL!API | Location | Why Not Implemented Yet | Next Step |
+|---|---|---|---|
+| `d3d11.dll!ID3D11Device::CreateClassLinkage` | `crates/win32-rt/src/d3d11/device.rs` | Returning `S_OK` without implementing dynamic shader interface dispatch (`SHEX` `IFCE` / `dcl_interface` / `dcl_function_table` / `fcall`) would let apps pass feature detection and then execute the wrong shader implementations. | Parse DXBC `IFCE` interface/type/instance tables, wire `pClassLinkage` at `Create*Shader` and `ppClassInstances` at `{VS,HS,DS,GS,PS,CS}SetShader` into PSO specialization or `dxilconv`/`dxil-metal` `fcall` lowering, then return `S_OK` with an end-to-end GPU test verifying distinct class instances produce distinct shader output. |
+| `d3d11.dll!ID3D11Device::CreateGeometryShaderWithStreamOutput` | `crates/win32-rt/src/d3d11/device.rs` | Apple Metal Shader Converter does not expose stream-out synthesis in its public C header (`metal_irconverter.h`; `IRCompilerSetStreamOutEnabled` / `IRCreateStreamOutFunction` are private undocumented C++ symbols that must not be called). Lowering arbitrary DXBC/DXIL stream-out shaders cleanly requires a DXIL LLVM 3.7 bitcode rewriter that translates `dx.op.storeOutput` / `dx.op.emitStream` into `RWByteAddressBuffer` UAV writes with per-stream atomic vertex counters according to `D3D11_SO_DECLARATION_ENTRY` strides. | Implement a clean-room DXIL stream-out bitcode lowering pass in `crates/dxil-metal` (rewriting stream-out outputs to internal UAV slots + atomic counter buffers), bind `so_targets` UAVs in `d3d11/context.rs`, and verify with a Metal 4 GPU E2E readback test. |
+| `d3d11.dll!ID3D11DeviceContext::DrawAuto` | `crates/win32-rt/src/d3d11/context.rs` | Depends on `CreateGeometryShaderWithStreamOutput` populating per-stream GPU vertex-count atomic buffers for bound `SOSetTargets` buffers. | Once stream-out writes atomic vertex counts per SO target buffer, dispatch a tiny compute helper (or copy directly into a 16-byte `DrawInstancedIndirect` argument buffer `{vertexCount, 1, 0, 0}`) and execute via `CommandList::execute_indirect`. |
+| `d3d11.dll!ID3D11DeviceContext::GetData` (`D3D11_QUERY_PIPELINE_STATISTICS`) | `crates/win32-rt/src/d3d11/context.rs` | CPU-submitted counts (`IAVertices`, `IAPrimitives`, `VSInvocations`, `GSInvocations`, `HSInvocations`, `CSInvocations`) are now accurately accumulated between `Begin` and `End`, but GPU-side counters (`CInvocations`, `CPrimitives`, `PSInvocations`, `GSPrimitives`, `DSInvocations`, and indirect draw counts) cannot be sampled on Apple Silicon because `MTLDevice.counterSets` only exposes `timestamp` (`GPUTimestamp`) and `MTL4CounterHeapType` only defines `Invalid` and `Timestamp` (no `MTLCommonCounterSetStatistic`). The `stub!` stays in place so GPU-side zeroes are never reported silently. | When Apple Metal exposes stage-invocation/clipper hardware counter sets on Apple Silicon, wire them through `d3d12-metal::metal::query` (`MTL4CounterHeap`), or add an opt-in shader-instrumentation pass for `PSInvocations`/`GSPrimitives`/`DSInvocations`. |
+
+## Native-Unsupported (Matches Windows Without the Feature — 6 sites)
+
+| DLL!API | Location | Return Code & Behavior | Microsoft Learn Reference |
+|---|---|---|---|
+| `dxgi.dll!DXGIGetDebugInterface1` | `crates/win32-rt/src/dxgi/mod.rs` | Validates `ppDebug` (`E_INVALIDARG` if null; zeroes `*ppDebug`) and returns `E_NOINTERFACE` because Windows Graphics Tools (`dxgidebug.dll` / `IDXGIDebug` / `IDXGIInfoQueue`) is not installed. | [DXGIGetDebugInterface1 function](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-dxgigetdebuginterface1) ("If the Graphics Tools optional feature is not installed, `DXGIGetDebugInterface1` returns `E_NOINTERFACE`") |
+| `dxgi.dll!IDXGIFactory4::EnumWarpAdapter` | `crates/win32-rt/src/dxgi/mod.rs` | Validates `ppvAdapter` (`E_INVALIDARG` if null; zeroes `*ppvAdapter`) and returns `DXGI_ERROR_NOT_FOUND` because Microsoft's WARP (`d3d10warp.dll`) software rasterizer is not installed. | [IDXGIFactory4::EnumWarpAdapter method](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgifactory4-enumwarpadapter) & [DXGI_ERROR](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-error) |
+| `dxgi.dll!IDXGIFactory::CreateSoftwareAdapter` | `crates/win32-rt/src/dxgi/mod.rs` | Validates `Module` and `ppAdapter` (`E_INVALIDARG` if null; zeroes `*ppAdapter`) and returns `DXGI_ERROR_UNSUPPORTED` because Windows user-mode software display driver DLLs cannot execute as native Metal adapters. | [IDXGIFactory::CreateSoftwareAdapter method](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgifactory-createsoftwareadapter) |
+| `dxgi.dll!IDXGIFactory2::CreateSwapChainForCoreWindow` & `CreateSwapChainForComposition` | `crates/win32-rt/src/dxgi/mod.rs` | Split into distinct Win64 methods validating `pDevice`/`pWindow`/`pDesc`/`ppSwapChain` (`E_INVALIDARG` on null, zeroes `*ppSwapChain`) and returning `DXGI_ERROR_UNSUPPORTED` because UWP `CoreWindow` and DirectComposition swap chains do not exist outside WinRT/DComp. | [IDXGIFactory2::CreateSwapChainForCoreWindow](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-createswapchainforcorewindow) & [CreateSwapChainForComposition](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-createswapchainforcomposition) |
+| `d3d11.dll!ID3D11Device::CheckCounter` | `crates/win32-rt/src/d3d11/device.rs` | Validates `pDesc` (`E_INVALIDARG` if null) and returns `DXGI_ERROR_UNSUPPORTED`, matching Windows D3D11 drivers whose `CheckCounterInfo` reports `LastDeviceDependentCounter == 0` (Apple Silicon exposes no device-dependent performance counters). | [ID3D11Device::CheckCounter method](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-checkcounter) & [ID3D11Device::CheckCounterInfo](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-checkcounterinfo) |
+| `d3d11.dll!ID3D11Device::CreateCounter` | `crates/win32-rt/src/d3d11/device.rs` | Zeroes `*ppCounter`, validates `pCounterDesc` (`E_INVALIDARG` if null), and returns `DXGI_ERROR_UNSUPPORTED`, matching Windows D3D11 drivers that expose zero device-dependent counters. | [ID3D11Device::CreateCounter method](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createcounter) |
+
+## Resolved Sites — Made Real (16 sites)
+
+| DLL!API | Location | Implementation Summary |
+|---|---|---|
+| `d3d12.dll!D3D12CreateRootSignatureDeserializer` | `crates/win32-rt/src/d3d12/mod.rs` | Parses DXBC/`RTS0` blobs via `dxil_metal::root_signature::RootSignatureDesc::from_blob` and returns a heap-stable `ID3D12RootSignatureDeserializer` COM object exposing `GetRootSignatureDesc` in exact Windows x64 ABI layout. |
+| `d3d12.dll!D3D12CreateVersionedRootSignatureDeserializer` | `crates/win32-rt/src/d3d12/mod.rs` | Returns a real `ID3D12VersionedRootSignatureDeserializer` supporting `GetUnconvertedRootSignatureDesc` and `GetRootSignatureDescAtVersion` with lossless v1.0 ↔ v1.1 ↔ v1.2 conversion (rejecting lossy v1.2 static-sampler-flag down-conversions with `E_INVALIDARG`). |
+| `dxgi.dll!IDXGIFactory2::GetSharedResourceAdapterLuid` | `crates/win32-rt/src/dxgi/mod.rs` | Resolves live D3D11 NT shared handles and legacy KMT handles in `d3d11::resources` and writes the active adapter LUID (`DXGI_ERROR_INVALID_CALL` / `E_INVALIDARG` on invalid/null inputs). |
+| `dxgi.dll!IDXGIFactory2::Register{Occlusion,Stereo}StatusWindow` | `crates/win32-rt/src/dxgi/mod.rs` | Real cookie-keyed window notification registries wired to AppKit `windowDidChangeOcclusionState:` (`PostMessageW(hwnd, wMsg, 0, 0)`) with matching `Unregister*Status`. |
+| `dxgi.dll!IDXGIFactory2::Register{Occlusion,Stereo}StatusEvent` & `IDXGIFactory7::RegisterAdaptersChangedEvent` | `crates/win32-rt/src/dxgi/mod.rs` | Real cookie-keyed Win32 `HANDLE` event notification registries wired to AppKit `windowDidChangeOcclusionState:` and `applicationDidChangeScreenParameters:` (`SetEvent`) with matching `Unregister*`. |
+| `dxgi.dll!IDXGIAdapter3::RegisterHardwareContentProtectionTeardownStatusEvent` | `crates/win32-rt/src/dxgi/adapter.rs` | Real cookie-keyed HCP teardown event registry with `UnregisterHardwareContentProtectionTeardownStatusEvent` and `notify_hcp_teardown()`. |
+| `dxgi.dll!IDXGIOutput::WaitForVBlank` | `crates/win32-rt/src/dxgi/adapter.rs` | Synchronizes to the macOS display refresh via CoreVideo `CVDisplayLink` (`CVDisplayLinkCreateWithCGDisplay` + callback condvar wake + headless/timeout monotonic fallback; iOS-safe cfg gating). |
+| `dxgi.dll!IDXGIOutput::TakeOwnership` / `ReleaseOwnership` | `crates/win32-rt/src/dxgi/adapter.rs` | Per-output exclusive ownership tracking with `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` conflict reporting, `E_INVALIDARG` on null device, and automatic cleanup on `Drop`. |
+| `d3d11.dll!IDXGIDevice::CreateSurface` | `crates/win32-rt/src/d3d11/device.rs` | Creates `NumSurfaces` real Metal-backed `IDXGISurface2` objects translating `DXGI_USAGE_*` flags into `D3D11_BIND_*` / `D3D11_CPU_ACCESS_*` flags, with rollback on failure. |
+| `d3d11.dll!IDXGISurface1::GetDC` / `ReleaseDC` | `crates/win32-rt/src/d3d11/resources.rs` | Validates `D3D11_RESOURCE_MISC_GDI_COMPATIBLE`, non-MSAA, and `B8G8R8A8_UNORM(_SRGB)`; optionally reads back GPU texture when `Discard == FALSE`; creates a real `gdi32` top-down 32bpp BGRA `HDC` backed by staging memory; uploads dirty rect or full surface to Metal on `ReleaseDC`. |
+| `d3d11.dll!ID3D11Device1::CreateDeviceContextState` | `crates/win32-rt/src/d3d11/device.rs` | Validates flags, feature-level array, SDK version, and emulated interface IID (`ID3D10Device` / `ID3D10Device1` / `ID3D11Device` / `ID3D11Device1`), selects the highest supported feature level, and creates a real `ID3DDeviceContextState` holding full `ContextState`. |
+| `d3d11.dll!ID3D11DeviceContext1::SwapDeviceContextState` | `crates/win32-rt/src/d3d11/context.rs` | Lazily materializes the initial context state, swaps the entire immediate `ContextState` atomically with the target `ID3DDeviceContextState`, and returns the previous state in `ppPreviousState`. |
+| `d3d11.dll!ID3D11Device::CreateHullShader` | `crates/win32-rt/src/d3d11/device.rs` | Validates DXBC container bytecode (`E_INVALIDARG` on invalid input, `S_FALSE` when `ppHullShader == NULL`) and creates a real `ID3D11HullShader` COM object. |
+| `d3d11.dll!ID3D11Device::CreateDomainShader` | `crates/win32-rt/src/d3d11/device.rs` | Validates DXBC container bytecode (`E_INVALIDARG` on invalid input, `S_FALSE` when `ppDomainShader == NULL`) and creates a real `ID3D11DomainShader` COM object. |
+| `d3d11.dll!ID3D11DeviceContext::HSSetShader` | `crates/win32-rt/src/d3d11/context.rs` | Binds `ID3D11HullShader` + class instances onto context state (round-tripped via `HSGetShader`), populates HS CBV/SRV/Sampler root tables (params 6 & 7), and compiles Metal 4 object+mesh tessellation emulation pipelines via `GraphicsPipeline::new_with_tessellation` (with MSC Apache-2.0 tessellator lookup tables at bind point 7). |
+| `d3d11.dll!ID3D11DeviceContext::DSSetShader` | `crates/win32-rt/src/d3d11/context.rs` | Binds `ID3D11DomainShader` + class instances onto context state (round-tripped via `DSGetShader`), populates DS CBV/SRV/Sampler root tables (params 8 & 9), and executes full VS+HS+DS(+optional GS)+PS tessellation draws on Metal 4. |
 
 ### From `docs/stub-backlog.d/guest-corpus-bench.md`
 
@@ -140,25 +248,21 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | DLL | Count | Reason | Next Step |
 |---|---:|---|---|
 | `kernel32.dll` | 30 | Partial Windows kernel/file/memory/locale/job/threadpool sub-feature | Implement missing info classes, PAGE_GUARD/MEM_WRITE_WATCH fault tracking, and threadpool cleanup-group tracking on macOS primitives. |
-| `bcrypt.dll` | 20 | Unimplemented CNG algorithm, key-wrap blob, or padding mode | Add remaining CNG algorithms/padding modes (OAEP/PSS/ECDH/3DES) backed by CommonCrypto/ring as games import them. |
 | `crypt32.dll` | 19 | Unimplemented CryptoAPI ASN.1 decode, PKCS#7/PFX, or certificate store property | Implement remaining DER/ASN.1 object decoders, PFX import, and CryptMsg verification on top of rustls/ring. |
-| `d3d11.dll` | 14 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
 | `user32.dll` | 13 | Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature | Fill in remaining GetSystemMetrics / SystemParametersInfo / DisplayConfig cases and custom bitmap NSCursor creation. |
 | `ole32.dll` | 12 | Unimplemented WinRT IPropertyValue scalar/array type or VARIANT/SAFEARRAY coercion | Implement remaining IPropertyValue* types and VariantChangeType/SafeArrayDestroy coercions. |
 | `physx3common_x64.dll` | 12 | PhysX 3.4 geometry/mesh query path without cooked mesh payload | Prefer shipping PhysX3*.dll under ARM64 JIT, or decode cooked BVH/triangle mesh payloads in physx3common_x64. |
-| `dxgi.dll` | 10 | Unsupported Windows-only DXGI path (WARP software rasterizer, UWP CoreWindow, exclusive fullscreen ownership, event notifications) | Implement VSync-synchronized WaitForVBlank via CVDisplayLink/CADisplayLink and shared-handle LUID lookup; keep WARP/CoreWindow honestly unsupported. |
 | `ntdll.dll` | 9 | Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export | Add missing Process/Thread/System information classes on demand; TxF transactions and direct KiUser* calls remain honestly unsupported. |
-| `advapi32.dll` | 8 | Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class | Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants. |
 | `ws2_32.dll` | 8 | Uncommon Winsock2 async/QOS/control-message API or cross-process socket duplication | Implement WSARecvMsg/WSASendMsg via POSIX recvmsg/sendmsg and remaining WSAIoctl codes as games use them. |
 | `mmdevapi.dll` | 6 | Optional WASAPI mode/service (exclusive mode, loopback capture, hardware offload, unknown COM IID) | Add CoreAudio loopback capture / tap support when a game requests AUDCLNT_STREAMFLAGS_LOOPBACK; keep exclusive/offload honestly rejected. |
 | `ucrtbase.dll` | 6 | Uncommon CRT locale, multibyte codepage, UTF-16 stream encoding, or interactive console/shell call | Add UTF-16 FILE stream translation and locale/codepage tables; keep system() safely sandboxed/refused. |
 | `dinput8.dll` | 5 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
+| `d3d11.dll` | 4 | Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop) | Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them. |
 | `dbghelp.dll` | 4 | Unimplemented DbgHelp stack walk or minidump writer | Wire StackWalk64 to win32-rt's .pdata unwinder and write valid MDMP headers for MiniDumpWriteDump. |
 | `dwrite.dll` | 4 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `secur32.dll` | 4 | Server-side Schannel (INBOUND) or uncommon context/credential attribute | Add server-side TLS or missing SECPKG_ATTR_* queries if a game hosts local TLS sockets. |
 | `wintrust.dll` | 4 | Unimplemented WinVerifyTrust action/choice or TPM Base Services (TBS) | Keep TPM TBS returning TBS_E_TPM_NOT_FOUND honestly; extend WinVerifyTrust for additional catalog/blob choices as needed. |
 | `powrprof.dll` | 3 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
-| `d3d12.dll` | 2 | D3D12 root-signature deserializer COM object not yet implemented | Parse DXBC/RTS0 root-signature blobs in win32-rt/src/d3d12 and expose ID3D12RootSignatureDeserializer / VersionedDeserializer. |
 | `libcurl.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `nri.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
 | `uxtheme.dll` | 2 | Partial or unimplemented Windows/middleware sub-feature | Replace with real macOS/Metal/CoreAudio implementation plus unit or zig-cc guest test. |
@@ -184,8 +288,8 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `AssignProcessToJobObject` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1655` | `"job objects have no effect"` |
 | `CreateProcessW` | `stub` | `crates/win32-rt/src/kernel32/process.rs:1283` | `"CreateProcessW unavailable on iOS: app={:?} cmd={:?}", from_wide_opt(app), from_wide_opt(cmd)` |
 | `CreateRemoteThread` | `stub` | `crates/win32-rt/src/kernel32/threads.rs:60` | `"CreateRemoteThread into another process"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7127` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
-| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7155` | `"DeviceIoControl code {code:#x} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7135` | `"IOCTL_STORAGE_QUERY_PROPERTY property {prop} unsupported"` |
+| `DeviceIoControl` | `stub` | `crates/win32-rt/src/kernel32/file.rs:7163` | `"DeviceIoControl code {code:#x} unsupported"` |
 | `FlushProcessWriteBuffers` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:1045` | `"FlushProcessWriteBuffers approximated by a local fence"` |
 | `GetCalendarInfoEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1354` | `"GetCalendarInfoEx type {ty:#x}"` |
 | `GetFileInformationByHandleEx` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2137` | `"GetFileInformationByHandleEx class {class} not supported"` |
@@ -194,7 +298,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `GetNumberFormatEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:1323` | `"custom NUMBERFMT ignored"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:552` | `"LCMAP_HASH unsupported"` |
 | `LCMapStringEx` | `stub` | `crates/win32-rt/src/kernel32/string.rs:578` | `"LCMapString flags {flags:#x} partially honoured"` |
-| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6918` | `"MapViewOfFile3 on another process"` |
+| `MapViewOfFile3` | `stub` | `crates/win32-rt/src/kernel32/file.rs:6926` | `"MapViewOfFile3 on another process"` |
 | `MoveFileExA` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2596` | `"MoveFileExA delete-on-reboot ignored"` |
 | `MoveFileExW` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2589` | `"MoveFileExW delete-on-reboot ignored"` |
 | `SetFileInformationByHandle` | `stub` | `crates/win32-rt/src/kernel32/file.rs:2268` | `"SetFileInformationByHandle class {class} not supported"` |
@@ -210,34 +314,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:365` | `"MEM_WRITE_WATCH not tracked"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:369` | `"PAGE_GUARD not emulated"` |
 | `virtual_alloc_aligned_impl` | `stub` | `crates/win32-rt/src/kernel32/memory.rs:377` | `"MEM_RESET_UNDO: contents may have been discarded"` |
-
-### `bcrypt.dll` (20)
-
-- **Reason:** Unimplemented CNG algorithm, key-wrap blob, or padding mode
-- **Next step:** Add remaining CNG algorithms/padding modes (OAEP/PSS/ECDH/3DES) backed by CommonCrypto/ring as games import them.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `BCryptExportKey` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2447` | `"BCryptExportKey(wrapped h_export_key) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptExportKey` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2505` | `"BCryptExportKey({t:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptGenerateKeyPair` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2614` | `"BCryptGenerateKeyPair({}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptGenerateSymmetricKey` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2528` | `"BCryptGenerateSymmetricKey({}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptGetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1810` | `"BCryptGetProperty(alg={}, {p:?}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptGetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1824` | `"BCryptGetProperty(hash, {p:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptGetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1859` | `"BCryptGetProperty(key, {p:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptImportKey` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2372` | `"BCryptImportKey({}, wrapped h_import_key) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptImportKey` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2429` | `"BCryptImportKey({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptImportKeyPair` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1941` | `"BCryptImportKeyPair({}, wrapped import_key) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptImportKeyPair` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1949` | `"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptImportKeyPair` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1964` | `"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptImportKeyPair` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1979` | `"BCryptImportKeyPair({}, {t:?}) -> STATUS_NOT_SUPPORTED", a.name` |
-| `BCryptOpenAlgorithmProvider` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:1720` | `"BCryptOpenAlgorithmProvider({name:?}, flags 0x{flags:x}) -> STATUS_NOT_FOUND (algorithm not implemented)"` |
-| `BCryptSetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2670` | `"BCryptSetProperty(ChainingMode={mode_str:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptSetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2718` | `"BCryptSetProperty(ECCCurveName={curve_str:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptSetProperty` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2756` | `"BCryptSetProperty({p:?}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptSignHash` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2057` | `"BCryptSignHash(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED"` |
-| `BCryptVerifySignature` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2122` | `"BCryptVerifySignature(RSA, flags 0x{flags:x}) -> STATUS_NOT_SUPPORTED (padding)"` |
-| `bcrypt_aes_crypt` | `stub` | `crates/win32-rt/src/misc/bcrypt.rs:2173` | `"BCrypt{} on non-AES key -> STATUS_NOT_SUPPORTED", if encrypt { "Encrypt" } else { "Decrypt" }` |
 
 ### `crypt32.dll` (19)
 
@@ -266,28 +342,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `crypt_string_to_binary_impl` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:1276` | `"CryptStringToBinary unsupported flags {flags:#x}"` |
 | `encode_x509_object` | `stub` | `crates/win32-rt/src/misc/crypt32/asn1.rs:941` | `"CryptEncodeObjectEx(struct_type={raw_stype:#x}) -> FALSE"` |
 
-### `d3d11.dll` (14)
-
-- **Reason:** Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop)
-- **Next step:** Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `check_counter` | `stub` | `crates/win32-rt/src/d3d11/device.rs:1074` | `"ID3D11Device::CheckCounter -> DXGI_ERROR_UNSUPPORTED"` |
-| `create_class_linkage` | `stub` | `crates/win32-rt/src/d3d11/device.rs:749` | `"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"` |
-| `create_counter` | `stub` | `crates/win32-rt/src/d3d11/device.rs:958` | `"ID3D11Device::CreateCounter -> DXGI_ERROR_UNSUPPORTED"` |
-| `create_device_context_state` | `stub` | `crates/win32-rt/src/d3d11/device.rs:1038` | `"ID3D11Device1::CreateDeviceContextState -> E_NOTIMPL"` |
-| `create_domain_shader` | `stub` | `crates/win32-rt/src/d3d11/device.rs:743` | `"ID3D11Device::CreateDomainShader -> E_NOTIMPL"` |
-| `create_geometry_shader_so` | `stub` | `crates/win32-rt/src/d3d11/device.rs:727` | `"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"` |
-| `create_hull_shader` | `stub` | `crates/win32-rt/src/d3d11/device.rs:735` | `"ID3D11Device::CreateHullShader -> E_NOTIMPL"` |
-| `draw_auto` | `stub` | `crates/win32-rt/src/d3d11/context.rs:2732` | `"ID3D11DeviceContext::DrawAuto not implemented"` |
-| `ds_set_shader` | `stub` | `crates/win32-rt/src/d3d11/context.rs:1972` | `"DSSetShader(non-null) ignored"` |
-| `dxgi_dev_create_surface` | `stub` | `crates/win32-rt/src/d3d11/device.rs:1308` | `"IDXGIDevice::CreateSurface -> E_NOTIMPL"` |
-| `get_data` | `stub` | `crates/win32-rt/src/d3d11/context.rs:2908` | `"GetData(PIPELINE_STATISTICS) returning zeroes"` |
-| `hs_set_shader` | `stub` | `crates/win32-rt/src/d3d11/context.rs:1969` | `"HSSetShader(non-null) ignored"` |
-| `surf_get_dc` | `stub` | `crates/win32-rt/src/d3d11/resources.rs:1308` | `"IDXGISurface1::GetDC -> E_NOTIMPL"` |
-| `swap_device_context_state` | `stub` | `crates/win32-rt/src/d3d11/context.rs:3013` | `"ID3D11DeviceContext1::SwapDeviceContextState not implemented"` |
-
 ### `user32.dll` (13)
 
 - **Reason:** Uncommon Win32 window/metric/SPI/hotkey/cursor/display-config sub-feature
@@ -295,13 +349,13 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:987` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
+| `CreateCursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:1024` | `"CreateCursor {w}x{h}: custom bitmap cursors are shown as the arrow"` |
 | `DisplayConfigGetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:684` | `"DisplayConfigGetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
 | `DisplayConfigSetDeviceInfo` | `stub` | `crates/win32-rt/src/user32/monitor.rs:692` | `"DisplayConfigSetDeviceInfo(type {ty}) -> ERROR_NOT_SUPPORTED"` |
 | `GetSystemMetrics` | `stub` | `crates/win32-rt/src/user32/misc.rs:239` | `"GetSystemMetrics({index}) -> 0"` |
 | `RegisterHotKey` | `stub` | `crates/win32-rt/src/user32/misc.rs:770` | `"RegisterHotKey(hwnd {:#x}, id {id}, mods {mods:#x}, vk {vk:#x}): never fires", hwnd as usize` |
-| `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1363` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
-| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:883` | `"ReplyMessage: early reply not supported"` |
+| `RegisterRawInputDevices` | `stub` | `crates/win32-rt/src/user32/input.rs:1442` | `"RegisterRawInputDevices: RIDEV_NOLEGACY ignored (legacy messages still sent)"` |
+| `ReplyMessage` | `stub` | `crates/win32-rt/src/user32/message.rs:897` | `"ReplyMessage: early reply not supported"` |
 | `def_window_proc` | `stub` | `crates/win32-rt/src/user32/defproc.rs:154` | `"DefWindowProc(WM_SYSCOMMAND {other:#x}) ignored"` |
 | `load_cursor` | `stub` | `crates/win32-rt/src/user32/cursor.rs:87` | `"LoadCursor({inst:#x}, {n:?}): cursor resources not supported -> NULL"` |
 | `message_box` | `stub` | `crates/win32-rt/src/user32/misc.rs:1887` | `"MessageBox type {ty:#x}: headless, cannot ask the user -> 0 (failure)"` |
@@ -349,24 +403,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `mesh_get_triangle` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2629` | `"PxMeshQuery::getTriangle without cooked triangle mesh payload"` |
 | `mesh_sweep` | `middleware_stub` | `crates/win32-rt/src/misc/physx3common_x64.rs:2642` | `"PxMeshQuery::sweep without cooked triangle mesh payload"` |
 
-### `dxgi.dll` (10)
-
-- **Reason:** Unsupported Windows-only DXGI path (WARP software rasterizer, UWP CoreWindow, exclusive fullscreen ownership, event notifications)
-- **Next step:** Implement VSync-synchronized WaitForVBlank via CVDisplayLink/CADisplayLink and shared-handle LUID lookup; keep WARP/CoreWindow honestly unsupported.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `DXGIGetDebugInterface1` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:114` | `"DXGIGetDebugInterface1({:?}) -> E_NOINTERFACE (no debug layer)", Guid::read(riid).unwrap_or_default()` |
-| `create_software_adapter` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:248` | `"CreateSoftwareAdapter -> DXGI_ERROR_UNSUPPORTED"` |
-| `create_swap_chain_unsupported` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:275` | `"CreateSwapChainForCoreWindow/Composition -> DXGI_ERROR_UNSUPPORTED"` |
-| `enum_warp_adapter` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:240` | `"EnumWarpAdapter: no WARP software rasterizer -> DXGI_ERROR_NOT_FOUND"` |
-| `get_shared_resource_adapter_luid` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:283` | `"GetSharedResourceAdapterLuid: no shared handles -> E_INVALIDARG"` |
-| `register_event_stub` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:298` | `"IDXGIAdapter3 notification event registered; it is never signaled"` |
-| `register_status_event` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:298` | `"Register*Event (stereo/occlusion/adapters-changed): the event is never signaled"` |
-| `register_status_window` | `stub` | `crates/win32-rt/src/dxgi/mod.rs:290` | `"Register{{Stereo,Occlusion}}StatusWindow: status changes are never posted"` |
-| `take_ownership` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:669` | `"TakeOwnership: exclusive fullscreen is not supported"` |
-| `wait_for_vblank` | `stub` | `crates/win32-rt/src/dxgi/adapter.rs:663` | `"WaitForVBlank: sleeps one refresh period ({hz} Hz), not synchronized to the display"` |
-
 ### `ntdll.dll` (9)
 
 - **Reason:** Unimplemented NT info class, TxF transaction API, or direct kernel-to-user dispatcher export
@@ -383,22 +419,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `NtQueryInformationProcess` | `stub` | `crates/win32-rt/src/ntdll.rs:241` | `"NtQueryInformationProcess class {class}"` |
 | `NtQueryInformationThread` | `stub` | `crates/win32-rt/src/ntdll.rs:313` | `"NtQueryInformationThread class {class}"` |
 | `NtQuerySystemInformation` | `stub` | `crates/win32-rt/src/ntdll.rs:438` | `"NtQuerySystemInformation class {class}"` |
-
-### `advapi32.dll` (8)
-
-- **Reason:** Legacy CryptoAPI (CAPI) key/sign/encrypt or uncommon token information class
-- **Next step:** Back remaining CAPI key/cipher calls with CommonCrypto/ring and implement missing TOKEN_INFORMATION_CLASS variants.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `CryptDecrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptDestroyKey` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptEncrypt` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptExportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptGetUserKey` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptImportKey` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `CryptSignHashW` | `failing` | `crates/win32-rt/src/advapi32.rs:3010` | `BOOL = FALSE, err ERROR_CALL_NOT_IMPLEMENTED` |
-| `GetTokenInformation` | `stub` | `crates/win32-rt/src/advapi32.rs:1380` | `"GetTokenInformation(class={info_class}) -> ERROR_CALL_NOT_IMPLEMENTED"` |
 
 ### `ws2_32.dll` (8)
 
@@ -456,6 +476,18 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `dev_run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1557` | `"IDirectInputDevice8::RunControlPanel -> DIERR_UNSUPPORTED"` |
 | `dev_set_property` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1331` | `"IDirectInputDevice8::SetProperty({other:#x}) -> DIERR_UNSUPPORTED"` |
 | `run_control_panel` | `stub` | `crates/win32-rt/src/misc/dinput8.rs:1822` | `"IDirectInput8::RunControlPanel -> DIERR_UNSUPPORTED"` |
+
+### `d3d11.dll` (4)
+
+- **Reason:** Unimplemented D3D11 pipeline stage or optional diagnostic interface (tessellation, stream-out, counters, GDI interop)
+- **Next step:** Implement hull/domain tessellation and stream-out lowering in dxil-metal + d3d12-metal; wire real MTL4CounterHeap pipeline stats where Metal exposes them.
+
+| API | Kind | Location | Detail |
+|---|---|---|---|
+| `create_class_linkage` | `stub` | `crates/win32-rt/src/d3d11/device.rs:794` | `"ID3D11Device::CreateClassLinkage -> E_NOTIMPL"` |
+| `create_geometry_shader_so` | `stub` | `crates/win32-rt/src/d3d11/device.rs:748` | `"ID3D11Device::CreateGeometryShaderWithStreamOutput -> E_NOTIMPL"` |
+| `draw_auto` | `stub` | `crates/win32-rt/src/d3d11/context.rs:2913` | `"ID3D11DeviceContext::DrawAuto not implemented"` |
+| `get_data` | `stub` | `crates/win32-rt/src/d3d11/context.rs:3094` | `"GetData(PIPELINE_STATISTICS): GPU-side counters (PS/Clipper/GSPrimitives/DS/indirect) unavailable on Apple Silicon"` |
 
 ### `dbghelp.dll` (4)
 
@@ -515,16 +547,6 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 | `CallNtPowerInformation` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:468` | `"CallNtPowerInformation(level={info_level}) -> STATUS_NOT_IMPLEMENTED"` |
 | `PowerRegisterSuspendResumeNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:533` | `"PowerRegisterSuspendResumeNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS wake callback not armed)"` |
 | `PowerSettingRegisterNotification` | `stub` | `crates/win32-rt/src/misc/powrprof.rs:604` | `"PowerSettingRegisterNotification(flags={flags:#x}) -> {handle:#x} (handle tracked; OS setting callback not armed)"` |
-
-### `d3d12.dll` (2)
-
-- **Reason:** D3D12 root-signature deserializer COM object not yet implemented
-- **Next step:** Parse DXBC/RTS0 root-signature blobs in win32-rt/src/d3d12 and expose ID3D12RootSignatureDeserializer / VersionedDeserializer.
-
-| API | Kind | Location | Detail |
-|---|---|---|---|
-| `D3D12CreateRootSignatureDeserializer` | `stub` | `crates/win32-rt/src/d3d12/mod.rs:191` | `"D3D12CreateRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()` |
-| `D3D12CreateVersionedRootSignatureDeserializer` | `stub` | `crates/win32-rt/src/d3d12/mod.rs:199` | `"D3D12CreateVersionedRootSignatureDeserializer({size} bytes, {:?}) -> E_NOTIMPL", Guid::read(riid).unwrap_or_default()` |
 
 ### `libcurl.dll` (2)
 
@@ -609,7 +631,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `GetDeviceCaps` | `stub` | `crates/win32-rt/src/misc/gdi32.rs:866` | `"GetDeviceCaps({index}) -> 0"` |
+| `GetDeviceCaps` | `stub` | `crates/win32-rt/src/misc/gdi32.rs:910` | `"GetDeviceCaps({index}) -> 0"` |
 
 ### `hid.dll` (1)
 
@@ -636,7 +658,7 @@ These modules wrap proprietary third-party SDKs or GPU-vendor-specific extension
 
 | API | Kind | Location | Detail |
 |---|---|---|---|
-| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1733` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
+| `SHCreateItemFromParsingName` | `stub` | `crates/win32-rt/src/misc/shell32.rs:1748` | `"SHCreateItemFromParsingName: unsupported shell namespace {raw:?}"` |
 
 ### `xinput1_4.dll` (1)
 
